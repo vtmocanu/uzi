@@ -101,7 +101,7 @@ test("claim wire contract: worker parses the server's skill shape", () => {
   assert.ok(Array.isArray(claim.skills));
   assert.deepEqual(
     claim.skills!.map((s) => s.name),
-    ["ci-cd-norms", "team-kb"],
+    ["team-runbook", "team-kb"],
   );
   for (const s of claim.skills!) {
     assert.equal(typeof s.name, "string");
@@ -111,12 +111,12 @@ test("claim wire contract: worker parses the server's skill shape", () => {
 
   // Dropped-skill log: name + reason code.
   assert.ok(Array.isArray(claim.skills_dropped));
-  assert.deepEqual(claim.skills_dropped, [{ name: "ci-cd-norms", reason: "shadowed" }]);
+  assert.deepEqual(claim.skills_dropped, [{ name: "team-runbook", reason: "shadowed" }]);
 
   // Per-template scoping: coder carries its allocation, reviewer an explicit empty
   // list (never undefined — the worker always passes an explicit skills list).
   const coder = claim.agents.find((a) => a.name === "coder");
   const reviewer = claim.agents.find((a) => a.name === "reviewer");
-  assert.deepEqual(coder?.skills, ["ci-cd-norms", "team-kb"]);
+  assert.deepEqual(coder?.skills, ["team-runbook", "team-kb"]);
   assert.deepEqual(reviewer?.skills, []);
 });

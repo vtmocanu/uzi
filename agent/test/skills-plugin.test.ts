@@ -110,7 +110,7 @@ describe("yamlQuote escapes Unicode line breaks", () => {
 
 describe("qualifiedSkillName + skillsPluginDir", () => {
   it("qualifies to the plugin:skill form", () => {
-    assert.equal(qualifiedSkillName("ci-cd-norms"), "uzi:ci-cd-norms");
+    assert.equal(qualifiedSkillName("team-runbook"), "uzi:team-runbook");
   });
 
   it("places the plugin dir as a SIBLING of the worktree, never inside it", () => {
@@ -135,21 +135,21 @@ describe("materializeSkillsPlugin", () => {
   it("writes plugin.json + one SKILL.md per skill and REBUILDS from scratch", async () => {
     const target = path.join(dir, "plugin");
     await materializeSkillsPlugin(target, [
-      { name: "ci-cd-norms", description: "cicd norms.", body: "# CICD\n" },
+      { name: "team-runbook", description: "cicd norms.", body: "# CICD\n" },
       { name: "team-kb", description: "kb.", body: "# KB\n" },
     ]);
 
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(target, ".claude-plugin", "plugin.json"), "utf8")), {
       name: "uzi",
     });
-    const cicd = fs.readFileSync(path.join(target, "skills", "ci-cd-norms", "SKILL.md"), "utf8");
-    assert.ok(cicd.startsWith('---\nname: "ci-cd-norms"\ndescription: "cicd norms."\n---\n\n# CICD\n'));
+    const cicd = fs.readFileSync(path.join(target, "skills", "team-runbook", "SKILL.md"), "utf8");
+    assert.ok(cicd.startsWith('---\nname: "team-runbook"\ndescription: "cicd norms."\n---\n\n# CICD\n'));
     assert.ok(fs.existsSync(path.join(target, "skills", "team-kb", "SKILL.md")));
 
     // Rebuild with a different set: the old skill dir must be gone (deleted skill
     // between claim and resume disappears).
     await materializeSkillsPlugin(target, [{ name: "team-kb", description: "kb.", body: "# KB\n" }]);
-    assert.ok(!fs.existsSync(path.join(target, "skills", "ci-cd-norms")), "stale skill removed on rebuild");
+    assert.ok(!fs.existsSync(path.join(target, "skills", "team-runbook")), "stale skill removed on rebuild");
     assert.ok(fs.existsSync(path.join(target, "skills", "team-kb", "SKILL.md")));
   });
 

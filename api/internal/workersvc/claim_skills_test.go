@@ -146,7 +146,7 @@ func TestClaimDeliversSkills(t *testing.T) {
 			{Name: "reviewer", Description: "reviews", PromptBody: "you review"},
 		},
 		skillAllocations: []store.ListRunSkillAllocationsRow{
-			skillRow("coder", "ci-cd-norms", "builtin", kbID, "CICD BODY"),
+			skillRow("coder", "team-runbook", "builtin", kbID, "CICD BODY"),
 		},
 	}
 
@@ -154,8 +154,8 @@ func TestClaimDeliversSkills(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
-	if names := unionNames(payload.Skills); !reflect.DeepEqual(names, []string{"ci-cd-norms"}) {
-		t.Fatalf("payload.Skills = %v, want [ci-cd-norms]", names)
+	if names := unionNames(payload.Skills); !reflect.DeepEqual(names, []string{"team-runbook"}) {
+		t.Fatalf("payload.Skills = %v, want [team-runbook]", names)
 	}
 	if payload.Skills[0].Body != "CICD BODY" {
 		t.Errorf("skill body not carried: %q", payload.Skills[0].Body)
@@ -179,8 +179,8 @@ func TestClaimDeliversSkills(t *testing.T) {
 			reviewer = &payload.Agents[i]
 		}
 	}
-	if coder == nil || !reflect.DeepEqual(coder.Skills, []string{"ci-cd-norms"}) {
-		t.Errorf("coder.Skills = %v, want [ci-cd-norms]", coder)
+	if coder == nil || !reflect.DeepEqual(coder.Skills, []string{"team-runbook"}) {
+		t.Errorf("coder.Skills = %v, want [team-runbook]", coder)
 	}
 	if reviewer == nil || reviewer.Skills == nil || len(reviewer.Skills) != 0 {
 		t.Errorf("reviewer.Skills should be an explicit empty list, got %v", reviewer)

@@ -1339,10 +1339,10 @@ describe("SdkExecutor override_subagent_model (PRD #305 M4)", () => {
 // skill body — is covered by a documented manual/opt-in live check (see the M4
 // report); the residual is accepted, not silent.
 describe("SdkExecutor skill delivery (PRD #16)", () => {
-  const coderS: AgentTemplate = { ...coder, skills: ["ci-cd-norms"] };
+  const coderS: AgentTemplate = { ...coder, skills: ["team-runbook"] };
   const reviewerS: AgentTemplate = { ...reviewer, skills: ["team-kb"] }; // tools-restricted: ["Read","Grep"]
   const union: ClaimSkill[] = [
-    { name: "ci-cd-norms", description: "cicd norms.", body: "# CICD\n" },
+    { name: "team-runbook", description: "cicd norms.", body: "# CICD\n" },
     { name: "team-kb", description: "kb.", body: "# KB\n" },
   ];
 
@@ -1374,8 +1374,8 @@ describe("SdkExecutor skill delivery (PRD #16)", () => {
     const { turns, run } = runWithSkills();
     await run;
     const o = turns[0]!.options;
-    assert.deepStrictEqual(o.skills, ["uzi:ci-cd-norms", "uzi:team-kb"], "top-level = full qualified union");
-    assert.deepStrictEqual((o.agents!["coder"] as { skills?: string[] }).skills, ["uzi:ci-cd-norms"]);
+    assert.deepStrictEqual(o.skills, ["uzi:team-runbook", "uzi:team-kb"], "top-level = full qualified union");
+    assert.deepStrictEqual((o.agents!["coder"] as { skills?: string[] }).skills, ["uzi:team-runbook"]);
     assert.deepStrictEqual((o.agents!["reviewer"] as { skills?: string[] }).skills, ["uzi:team-kb"]);
   });
 
@@ -1386,8 +1386,8 @@ describe("SdkExecutor skill delivery (PRD #16)", () => {
     assert.deepStrictEqual(o.settingSources, [], "isolation stays on");
     assert.deepStrictEqual(o.plugins, [{ type: "local", path: skillsPluginDir(worktree), skipMcpDiscovery: true }]);
     // The plugin dir was materialized OUTSIDE the clone with the skill files.
-    const md = fs.readFileSync(path.join(skillsPluginDir(worktree), "skills", "ci-cd-norms", "SKILL.md"), "utf8");
-    assert.ok(md.includes('name: "ci-cd-norms"'));
+    const md = fs.readFileSync(path.join(skillsPluginDir(worktree), "skills", "team-runbook", "SKILL.md"), "utf8");
+    assert.ok(md.includes('name: "team-runbook"'));
   });
 
   it("3) a tools-restricted subagent gets its skill WITHOUT a deprecated 'Skill' tool grant", async () => {
@@ -1707,10 +1707,10 @@ describe("SdkExecutor repo instructions (PRD #246 M2)", () => {
 // that a repo roster has no template rows, so `t.skills` is absent on every repo
 // agent and per-template scoping delivered nothing at all.
 describe("SdkExecutor delivered skills on a repo-source run (PRD #72 M1)", () => {
-  const coderS: AgentTemplate = { ...coder, skills: ["ci-cd-norms"] };
+  const coderS: AgentTemplate = { ...coder, skills: ["team-runbook"] };
   const reviewerS: AgentTemplate = { ...reviewer, skills: ["prd-lifecycle"] };
   const delivered: ClaimSkill[] = [
-    { name: "ci-cd-norms", description: "cicd norms.", body: "# CICD\n" },
+    { name: "team-runbook", description: "cicd norms.", body: "# CICD\n" },
     { name: "prd-lifecycle", description: "prd playbook.", body: "# PRD\n" },
   ];
 
@@ -1752,7 +1752,7 @@ describe("SdkExecutor delivered skills on a repo-source run (PRD #72 M1)", () =>
     // sees only its own allocation. If M1 had been applied run-wide, these two
     // would both list both skills and the admin's scoping surface would be gone.
     const plan = turns[0]!.options;
-    assert.deepStrictEqual(subagent(plan, "coder").skills, ["uzi:ci-cd-norms"]);
+    assert.deepStrictEqual(subagent(plan, "coder").skills, ["uzi:team-runbook"]);
     assert.deepStrictEqual(subagent(plan, "reviewer").skills, ["uzi:prd-lifecycle"]);
 
     // The IMPLEMENT turn runs the repo roster — neither repo agent carries any
@@ -1762,7 +1762,7 @@ describe("SdkExecutor delivered skills on a repo-source run (PRD #72 M1)", () =>
     for (const name of ["coder", "auditor"]) {
       assert.deepStrictEqual(
         subagent(impl, name).skills,
-        ["uzi:ci-cd-norms", "uzi:prd-lifecycle"],
+        ["uzi:team-runbook", "uzi:prd-lifecycle"],
         `repo subagent ${name} must receive the delivered skills its owner allocated`,
       );
     }
@@ -1774,23 +1774,23 @@ describe("SdkExecutor delivered skills on a repo-source run (PRD #72 M1)", () =>
   it("own source: the implement turn keeps per-template scoping (Decision 6 leaves it alone)", async () => {
     const { turns } = await runSourced(approveWith("own"));
     const impl = turns[1]!.options;
-    assert.deepStrictEqual(subagent(impl, "coder").skills, ["uzi:ci-cd-norms"]);
+    assert.deepStrictEqual(subagent(impl, "coder").skills, ["uzi:team-runbook"]);
     assert.deepStrictEqual(subagent(impl, "reviewer").skills, ["uzi:prd-lifecycle"]);
   });
 
   it("a delivered skill evicted by the per-run cap reaches NEITHER roster", async () => {
-    // maxPerRun=1 keeps ci-cd-norms and evicts prd-lifecycle worker-side. The
+    // maxPerRun=1 keeps team-runbook and evicts prd-lifecycle worker-side. The
     // repo path must be filtered to the SURVIVORS, not to the claim's delivered
     // list — hand it the unfiltered set and this reddens.
     const { turns } = await runSourced(approveWith("repo"), { config: { skill_max_bytes: 65536, skills_max_per_run: 1 } });
 
     const plan = turns[0]!.options;
-    assert.deepStrictEqual(plan.skills, ["uzi:ci-cd-norms"], "top-level union carries the survivor only");
+    assert.deepStrictEqual(plan.skills, ["uzi:team-runbook"], "top-level union carries the survivor only");
     assert.deepStrictEqual(subagent(plan, "reviewer").skills, [], "own reviewer's evicted allocation is gone");
 
     const impl = turns[1]!.options;
     for (const name of ["coder", "auditor"]) {
-      assert.deepStrictEqual(subagent(impl, name).skills, ["uzi:ci-cd-norms"], `${name} must not list the evicted skill`);
+      assert.deepStrictEqual(subagent(impl, name).skills, ["uzi:team-runbook"], `${name} must not list the evicted skill`);
     }
   });
 
@@ -1805,7 +1805,7 @@ describe("SdkExecutor delivered skills on a repo-source run (PRD #72 M1)", () =>
       fs.writeFileSync(path.join(skillsDir, dir, "SKILL.md"), body);
     };
     mkskill("deploy-notes", "---\nname: deploy-notes\ndescription: repo deploy.\n---\n\nrepo body\n");
-    mkskill("collide", "---\nname: ci-cd-norms\ndescription: repo shadow attempt.\n---\n\nshadow body\n");
+    mkskill("collide", "---\nname: team-runbook\ndescription: repo shadow attempt.\n---\n\nshadow body\n");
 
     const { turns } = await runSourced(approveWith("repo"), { repoSkillsEnabled: true });
     const impl = turns[1]!.options;
@@ -1813,7 +1813,7 @@ describe("SdkExecutor delivered skills on a repo-source run (PRD #72 M1)", () =>
       const skills = subagent(impl, name).skills!;
       assert.deepStrictEqual(
         skills,
-        ["uzi:ci-cd-norms", "uzi:prd-lifecycle", "uzi:deploy-notes"],
+        ["uzi:team-runbook", "uzi:prd-lifecycle", "uzi:deploy-notes"],
         `${name}: delivered survivors first, repo survivor last, each exactly once`,
       );
     }

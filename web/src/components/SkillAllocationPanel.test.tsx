@@ -31,13 +31,13 @@ function skill(over: Partial<Skill> & Pick<Skill, "id" | "name" | "scope">): Ski
 }
 
 const SKILLS: Skill[] = [
-  skill({ id: "s-builtin", name: "ci-cd-norms", scope: "builtin" }),
+  skill({ id: "s-builtin", name: "prd-lifecycle", scope: "builtin" }),
   skill({ id: "s-global", name: "argocd-debugging", scope: "global" }),
   skill({ id: "s-mine", name: "qdrant-kb", scope: "user", user_id: "u-mira" }),
 ];
 
 const ALLOC: TemplateSkills = {
-  shared: [{ skill_id: "s-builtin", name: "ci-cd-norms", description: "d", scope: "builtin" }],
+  shared: [{ skill_id: "s-builtin", name: "prd-lifecycle", description: "d", scope: "builtin" }],
   mine: [],
 };
 
@@ -59,9 +59,9 @@ describe("SkillAllocationPanel", () => {
   it("renders the union of shared + mine as what the runs get", async () => {
     renderPanel(false);
     expect(await screen.findByText(/Your runs get \(1\)/)).toBeTruthy();
-    // The shared ci-cd-norms shows in the union even for a non-admin.
+    // The shared prd-lifecycle shows in the union even for a non-admin.
     const union = within(screen.getByRole("list", { name: /Skills your runs get/i }));
-    expect(union.getByText("ci-cd-norms")).toBeTruthy();
+    expect(union.getByText("prd-lifecycle")).toBeTruthy();
   });
 
   it("admin sees both the shared and mine checklists", async () => {
@@ -95,7 +95,7 @@ describe("SkillAllocationPanel", () => {
     mockApi.setTemplateSkills.mockResolvedValue({
       allocations: {
         shared: [
-          { skill_id: "s-builtin", name: "ci-cd-norms", description: "d", scope: "builtin" },
+          { skill_id: "s-builtin", name: "prd-lifecycle", description: "d", scope: "builtin" },
           { skill_id: "s-global", name: "argocd-debugging", description: "d", scope: "global" },
         ],
         mine: [],

@@ -12,7 +12,7 @@ import {
 
 describe("skillNameError", () => {
   it("accepts kebab-case names", () => {
-    for (const n of ["ci-cd-norms", "a", "a1", "qdrant-kb", "x".repeat(64)]) {
+    for (const n of ["team-runbook", "a", "a1", "qdrant-kb", "x".repeat(64)]) {
       expect(skillNameError(n)).toBeNull();
       expect(SKILL_NAME_RE.test(n)).toBe(true);
     }

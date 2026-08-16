@@ -1987,22 +1987,22 @@ export const mockTemplateDriftCases: Record<string, string> = {
 // seed body as its reset target.
 export const mockSkills: Skill[] = [
   {
-    id: "skill-mm-cicd",
-    name: "ci-cd-norms",
+    id: "skill-prd-lifecycle",
+    name: "prd-lifecycle",
     description:
-      "How CI/CD works at example: myorg/pipelines includes, Harbor registry, ArgoCD GitOps, and how to spot an exception repo.",
+      "The end-of-run PRD checklist: tick only what the branch's evidence supports, and move the file to prds/done/ when every item is complete.",
     body: [
-      "# ci-cd-norms",
+      "# prd-lifecycle",
       "",
-      "The default norm: a thin `.gitlab-ci.yml` that includes a bundle from the",
-      "private `myorg/pipelines` project (lint → build → audit → push → cleanup).",
-      "Images and OCI charts go to Harbor (`harbor.example.com`). **CI never",
-      "deploys** — the ArgoCD app-of-apps in `myorg/k8s/argo-apps` does.",
+      "At the end of an issue run, scan every unchecked item in the issue's",
+      "linked `prds/*.md` file and tick only the ones direct evidence supports.",
+      "Move the file to `prds/done/` when (and only when) every item is",
+      "complete; a partly-done PRD keeps its ticks and stays where it is.",
       "",
-      "## Spotting an exception",
+      "## Reviewer half",
       "",
-      "No `include:` of `myorg/pipelines` means the repo is an exception. Follow its",
-      "local convention; never \"normalize\" it unasked.",
+      "Check the PRD diff against what the branch actually changed, and send",
+      "back an unsupported completion claim.",
     ].join("\n"),
     scope: "builtin",
     user_id: null,
@@ -2049,10 +2049,10 @@ export const mockSkills: Skill[] = [
   },
 ];
 
-// Seed allocation: the builtin ci-cd-norms is shared onto the coder template
+// Seed allocation: the builtin prd-lifecycle is shared onto the coder template
 // so the allocation panel shows a populated union out of the box.
 export const mockAllocations: Record<string, { shared: string[]; mine: string[] }> = {
-  "t-coder": { shared: ["skill-mm-cicd"], mine: [] },
+  "t-coder": { shared: ["skill-prd-lifecycle"], mine: [] },
 };
 
 // ── Runs ─────────────────────────────────────────────────────────────────────

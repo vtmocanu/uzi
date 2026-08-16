@@ -2700,12 +2700,12 @@ pass "manual drag wins: card #$IID stayed in Later despite the MR reopening"
 # delivery is observable without a live Anthropic session.
 say "PRD #16: skill delivery (builtin allocated → claim → synthesized plugin dir)"
 
-# Allocate the builtin ci-cd-norms (shared) to a template. Claim assembly unions
+# Allocate the builtin prd-lifecycle (shared) to a template. Claim assembly unions
 # every template's allocations for the run's user, so this reaches every run.
-SKILL_CICD_ID="$(apiget /api/skills | jq -r '.skills[] | select(.name=="ci-cd-norms") | .id')"
-[ -n "$SKILL_CICD_ID" ] && [ "$SKILL_CICD_ID" != null ] || fail "builtin ci-cd-norms skill was not seeded"
-apiput "/api/agent-templates/$TID/skills" "{\"shared_skill_ids\":[\"$SKILL_CICD_ID\"]}" >/dev/null
-pass "allocated builtin ci-cd-norms (shared) to template $TID"
+SKILL_BUILTIN_ID="$(apiget /api/skills | jq -r '.skills[] | select(.name=="prd-lifecycle") | .id')"
+[ -n "$SKILL_BUILTIN_ID" ] && [ "$SKILL_BUILTIN_ID" != null ] || fail "builtin prd-lifecycle skill was not seeded"
+apiput "/api/agent-templates/$TID/skills" "{\"shared_skill_ids\":[\"$SKILL_BUILTIN_ID\"]}" >/dev/null
+pass "allocated builtin prd-lifecycle (shared) to template $TID"
 
 # plugin_skills RUN — the flattened plugin_skills arrays the stub reported (exactly
 # the skill dirs materialized under the synthesized plugin dir).
@@ -2725,13 +2725,13 @@ skill_run() {
 # (seeded in the clone's .claude/skills) is NOT.
 RUN_S1="$(skill_run 'E2E skill delivery (repo off)')"
 PS1="$(plugin_skills "$RUN_S1")"
-echo "$PS1" | jq -e 'index("ci-cd-norms") != null' >/dev/null \
+echo "$PS1" | jq -e 'index("prd-lifecycle") != null' >/dev/null \
   || fail "delivered builtin absent from the synthesized plugin dir: $PS1"
 echo "$PS1" | jq -e 'index("e2e-repo-skill") == null' >/dev/null \
   || fail "repo skill loaded while the opt-in flag is OFF: $PS1"
 apipost "/api/runs/$RUN_S1/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
 wait_status "$RUN_S1" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
-pass "flag OFF: plugin dir has ci-cd-norms, NOT the repo skill ($PS1)"
+pass "flag OFF: plugin dir has prd-lifecycle, NOT the repo skill ($PS1)"
 
 # Flip the repo-skills opt-in ON (repo owner = the seed admin) and confirm it stuck.
 apipatch "/api/repos/$REPO_ID" '{"repo_skills_enabled":true}' | jq -e '.repo.repo_skills_enabled == true' >/dev/null \
@@ -2742,11 +2742,11 @@ pass "repo owner enabled repo skills"
 # delivered builtin.
 RUN_S2="$(skill_run 'E2E skill delivery (repo on)')"
 PS2="$(plugin_skills "$RUN_S2")"
-echo "$PS2" | jq -e '(index("ci-cd-norms") != null) and (index("e2e-repo-skill") != null)' >/dev/null \
+echo "$PS2" | jq -e '(index("prd-lifecycle") != null) and (index("e2e-repo-skill") != null)' >/dev/null \
   || fail "repo skill not loaded at lowest precedence after opt-in: $PS2"
 apipost "/api/runs/$RUN_S2/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
 wait_status "$RUN_S2" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
-pass "flag ON: plugin dir has BOTH ci-cd-norms and e2e-repo-skill ($PS2)"
+pass "flag ON: plugin dir has BOTH prd-lifecycle and e2e-repo-skill ($PS2)"
 
 # =============================================================================
 # PRD #18 — agent template scopes/allocation + tier-1 tool provisioning, end to
