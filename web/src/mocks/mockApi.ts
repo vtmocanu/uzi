@@ -2806,7 +2806,13 @@ export const mockApi = {
     startNewRun(run.id);
     return delay({ run: { ...run } }, 350);
   },
-  listRuns: async (params?: { repoId?: string; issueIid?: number }) =>
+  listRuns: async (params?: {
+    repoId?: string;
+    issueIid?: number;
+    // Mirrors the real client's passive-poll flag (#331); the mock does no real
+    // fetch, so the marker has no effect here beyond keeping the types compatible.
+    passive?: boolean;
+  }) =>
     delay({
       runs: listRunsFor()
         // Chat conversations ride runs but have their own page (PRD #39), and judge
