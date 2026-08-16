@@ -77,8 +77,13 @@ function runtimeBindingsOf(clause: string): string[] {
   const wholeStatementType = /^type\b/.test(prefix);
 
   // Anything before the brace that isn't the `type` keyword is a default,
-  // namespace, or `export *` binding, which is always a runtime value.
-  const prefixRemainder = prefix.replace(/^type\b/, "").trim();
+  // namespace, or `export *` binding, which is always a runtime value. Drop a
+  // trailing comma so a default+named form (`Foo, { … }`) reports `Foo`, not
+  // `Foo,`.
+  const prefixRemainder = prefix
+    .replace(/^type\b/, "")
+    .replace(/,\s*$/, "")
+    .trim();
   if (!wholeStatementType && prefixRemainder.length > 0) {
     runtime.push(prefixRemainder);
   }
@@ -101,34 +106,50 @@ function runtimeBindingsOf(clause: string): string[] {
 
 // Scan a mock source for every RUNTIME edge to the api barrel across three
 // shapes: `import … from`, bare side-effect `import "…"`, and `export … from`.
+//
+// The scan is STATEMENT-ANCHORED: comments are stripped, then the source is
+// split on `;` so each fragment is a single statement. This is what keeps the
+// non-greedy `… from "…"` match from crossing a statement boundary — otherwise
+// an unrelated `export const X = …` sitting above a legit `export type { … }
+// from "../lib/api"` would pair its keyword with the later `from` and
+// false-flag a type-only re-export. The repo enforces semicolons (prettier), so
+// every import/export-from statement is exactly one `;`-delimited fragment.
 function barrelOffenders(source: string): Offender[] {
   const offenders: Offender[] = [];
 
-  // `import … from "spec"` and `export … from "spec"` (both multi-line aware).
-  const importFrom = /import\s+([\s\S]*?)\s+from\s+["']([^"']+)["']/g;
-  const exportFrom = /export\s+([\s\S]*?)\s+from\s+["']([^"']+)["']/g;
+  // Anchored to the whole (trimmed) fragment via ^…$ so nothing outside the one
+  // statement can be swallowed. `[\s\S]*?` still handles multi-line brace lists.
+  const importFrom = /^import\s+([\s\S]*?)\s+from\s+["']([^"']+)["']$/;
+  const exportFrom = /^export\s+([\s\S]*?)\s+from\s+["']([^"']+)["']$/;
   // Bare side-effect `import "spec"` — no clause, no `from`. Evaluates the
   // barrel eagerly, so it is always a runtime edge. (The `["']` right after the
   // whitespace is what distinguishes it from an `import … from` statement.)
-  const sideEffect = /import\s+["']([^"']+)["']/g;
+  const sideEffect = /^import\s+["']([^"']+)["']$/;
 
-  let match: RegExpExecArray | null;
+  for (const fragment of stripComments(source).split(";")) {
+    const stmt = fragment.trim();
+    if (stmt.length === 0) continue;
 
-  for (const [re, kind] of [
-    [importFrom, "import"],
-    [exportFrom, "re-export"],
-  ] as const) {
-    while ((match = re.exec(source)) !== null) {
-      if (!isApiBarrel(match[2])) continue;
-      for (const binding of runtimeBindingsOf(match[1])) {
-        offenders.push({ kind, binding });
+    const side = sideEffect.exec(stmt);
+    if (side) {
+      if (isApiBarrel(side[1])) {
+        offenders.push({ kind: "side-effect import", binding: side[1] });
       }
+      continue;
     }
-  }
 
-  while ((match = sideEffect.exec(source)) !== null) {
-    if (isApiBarrel(match[1])) {
-      offenders.push({ kind: "side-effect import", binding: match[1] });
+    for (const [re, kind] of [
+      [importFrom, "import"],
+      [exportFrom, "re-export"],
+    ] as const) {
+      const match = re.exec(stmt);
+      if (!match) continue;
+      if (isApiBarrel(match[2])) {
+        for (const binding of runtimeBindingsOf(match[1])) {
+          offenders.push({ kind, binding });
+        }
+      }
+      break;
     }
   }
 
