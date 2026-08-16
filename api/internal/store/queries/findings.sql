@@ -68,6 +68,7 @@ SET status = 'open',
     last_title = @last_title,
     resolved_at = NULL,
     filed_issue_iid = NULL,
+    filed_issue_url = '',
     filing_since = NULL
 WHERE user_id = @user_id AND repo_id = @repo_id AND location = @location
   AND status IN ('filed', 'dismissed')
@@ -92,6 +93,7 @@ WHERE user_id = @user_id AND repo_id = @repo_id AND location = @location
 UPDATE finding_dispositions
 SET status = 'filed',
     filed_issue_iid = @filed_issue_iid,
+    filed_issue_url = @filed_issue_url,
     filing_since = NULL,
     resolved_at = now()
 WHERE user_id = @user_id AND repo_id = @repo_id AND location = @location
@@ -200,6 +202,7 @@ SELECT
     d.status                         AS status,
     d.last_title                     AS last_title,
     d.filed_issue_iid                AS filed_issue_iid,
+    d.filed_issue_url                AS filed_issue_url,
     d.resolved_at                    AS resolved_at,
     count(DISTINCT f.run_id)         AS seen_in_runs,
     latest.id                        AS latest_finding_id

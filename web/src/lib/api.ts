@@ -1935,6 +1935,11 @@ export interface IncidentalFinding {
   last_title: string;
   seen_in_runs: number;
   filed_issue_iid?: number;
+  // filed_issue_url is the stored forge URL a filed coordinate produced (stamped at settle
+  // time). It is the DTO-carried source the backlog links "Filed #<iid>" through — present for a
+  // backlog-loaded filed row too, not just one filed this session — and is undefined until
+  // filed. Rendered as a link only when it is a real https URL.
+  filed_issue_url?: string;
   resolved_at?: string;
 }
 

@@ -138,6 +138,7 @@ type FindingDisposition struct {
 	Location      string             `json:"location"`
 	Status        string             `json:"status"`
 	FiledIssueIid pgtype.Int8        `json:"filed_issue_iid"`
+	FiledIssueUrl string             `json:"filed_issue_url"`
 	FilingSince   pgtype.Timestamptz `json:"filing_since"`
 	DismissReason pgtype.Text        `json:"dismiss_reason"`
 	ContentHash   string             `json:"content_hash"`

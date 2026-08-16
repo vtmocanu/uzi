@@ -120,8 +120,9 @@ func TestFindingsBacklogLiveDB(t *testing.T) {
 	// appear, disposition-driven, with last_title shown and finding_id=nil.
 	insFinding(runA1, repoA, locFiled, "n+1 in serve")
 	openDisp(repoA, locFiled, "h-filed", "n+1 in serve")
-	exec(`UPDATE finding_dispositions SET status='filed', filed_issue_iid=4242, resolved_at=now()
-	      WHERE user_id=$1 AND repo_id=$2 AND location=$3`, userA, repoA, locFiled)
+	const filedURL = "https://forge.e2e/g/a/-/issues/4242"
+	exec(`UPDATE finding_dispositions SET status='filed', filed_issue_iid=4242, filed_issue_url=$4, resolved_at=now()
+	      WHERE user_id=$1 AND repo_id=$2 AND location=$3`, userA, repoA, locFiled, filedURL)
 	exec(`DELETE FROM findings WHERE user_id=$1 AND repo_id=$2 AND location=$3`, userA, repoA, locFiled)
 
 	// (b): a DISMISSED coordinate in repoA.
@@ -170,6 +171,11 @@ func TestFindingsBacklogLiveDB(t *testing.T) {
 	}
 	if filed.FiledIssueIID == nil || *filed.FiledIssueIID != 4242 {
 		t.Errorf("filed coordinate filed_issue_iid = %v, want 4242", filed.FiledIssueIID)
+	}
+	// (h): the filed coordinate carries its stored forge URL end to end (FIX 1) — this is what
+	// lets the web link "Filed #<iid>" for a backlog-loaded row, not just a session-filed one.
+	if filed.FiledIssueURL != filedURL {
+		t.Errorf("filed coordinate filed_issue_url = %q, want %q", filed.FiledIssueURL, filedURL)
 	}
 
 	// ── (b) buckets by disposition status ──

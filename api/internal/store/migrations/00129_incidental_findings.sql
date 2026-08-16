@@ -81,6 +81,12 @@ CREATE TABLE finding_dispositions (
     location        text NOT NULL,
     status          text NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'filing', 'filed', 'dismissed')),
     filed_issue_iid bigint,
+    -- The forge issue's web URL, stamped alongside filed_issue_iid at settle time (mirrors
+    -- recommendation_filed_issues.filed_issue_url). It lets the backlog render a filed
+    -- coordinate as a click-through link — including a coordinate filed from the CLI or
+    -- revisited in a later session, where the web has no session-local file result to link
+    -- from. '' until filed (and on a coordinate re-opened by a hash mismatch).
+    filed_issue_url text NOT NULL DEFAULT '',
     filing_since    timestamptz,
     dismiss_reason  text CHECK (dismiss_reason IN ('wont_do', 'not_an_issue')),
     -- A reason is present IFF the disposition is a dismissal.

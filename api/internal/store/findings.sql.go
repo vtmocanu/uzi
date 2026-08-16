@@ -207,6 +207,7 @@ SELECT
     d.status                         AS status,
     d.last_title                     AS last_title,
     d.filed_issue_iid                AS filed_issue_iid,
+    d.filed_issue_url                AS filed_issue_url,
     d.resolved_at                    AS resolved_at,
     count(DISTINCT f.run_id)         AS seen_in_runs,
     latest.id                        AS latest_finding_id
@@ -253,6 +254,7 @@ type ListFindingsBacklogRow struct {
 	Status          string             `json:"status"`
 	LastTitle       string             `json:"last_title"`
 	FiledIssueIid   pgtype.Int8        `json:"filed_issue_iid"`
+	FiledIssueUrl   string             `json:"filed_issue_url"`
 	ResolvedAt      pgtype.Timestamptz `json:"resolved_at"`
 	SeenInRuns      int64              `json:"seen_in_runs"`
 	LatestFindingID pgtype.UUID        `json:"latest_finding_id"`
@@ -314,6 +316,7 @@ func (q *Queries) ListFindingsBacklog(ctx context.Context, arg ListFindingsBackl
 			&i.Status,
 			&i.LastTitle,
 			&i.FiledIssueIid,
+			&i.FiledIssueUrl,
 			&i.ResolvedAt,
 			&i.SeenInRuns,
 			&i.LatestFindingID,
@@ -336,6 +339,7 @@ SET status = 'open',
     last_title = $2,
     resolved_at = NULL,
     filed_issue_iid = NULL,
+    filed_issue_url = '',
     filing_since = NULL
 WHERE user_id = $3 AND repo_id = $4 AND location = $5
   AND status IN ('filed', 'dismissed')
@@ -402,14 +406,16 @@ const settleFindingFiled = `-- name: SettleFindingFiled :execrows
 UPDATE finding_dispositions
 SET status = 'filed',
     filed_issue_iid = $1,
+    filed_issue_url = $2,
     filing_since = NULL,
     resolved_at = now()
-WHERE user_id = $2 AND repo_id = $3 AND location = $4
+WHERE user_id = $3 AND repo_id = $4 AND location = $5
   AND status = 'filing'
 `
 
 type SettleFindingFiledParams struct {
 	FiledIssueIid pgtype.Int8 `json:"filed_issue_iid"`
+	FiledIssueUrl string      `json:"filed_issue_url"`
 	UserID        uuid.UUID   `json:"user_id"`
 	RepoID        uuid.UUID   `json:"repo_id"`
 	Location      string      `json:"location"`
@@ -421,6 +427,7 @@ type SettleFindingFiledParams struct {
 func (q *Queries) SettleFindingFiled(ctx context.Context, arg SettleFindingFiledParams) (int64, error) {
 	result, err := q.db.Exec(ctx, settleFindingFiled,
 		arg.FiledIssueIid,
+		arg.FiledIssueUrl,
 		arg.UserID,
 		arg.RepoID,
 		arg.Location,
@@ -501,7 +508,7 @@ const upsertOpenDisposition = `-- name: UpsertOpenDisposition :one
 INSERT INTO finding_dispositions (user_id, repo_id, location, status, content_hash, last_title)
 VALUES ($1, $2, $3, 'open', $4, $5)
 ON CONFLICT (user_id, repo_id, location) DO NOTHING
-RETURNING id, user_id, repo_id, location, status, filed_issue_iid, filing_since, dismiss_reason, content_hash, last_title, created_at, resolved_at
+RETURNING id, user_id, repo_id, location, status, filed_issue_iid, filed_issue_url, filing_since, dismiss_reason, content_hash, last_title, created_at, resolved_at
 `
 
 type UpsertOpenDispositionParams struct {
@@ -537,6 +544,7 @@ func (q *Queries) UpsertOpenDisposition(ctx context.Context, arg UpsertOpenDispo
 		&i.Location,
 		&i.Status,
 		&i.FiledIssueIid,
+		&i.FiledIssueUrl,
 		&i.FilingSince,
 		&i.DismissReason,
 		&i.ContentHash,

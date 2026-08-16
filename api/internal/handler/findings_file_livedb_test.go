@@ -253,19 +253,28 @@ func dismissFindingReq(user store.User, findingID uuid.UUID, body map[string]any
 
 func dispositionStatus(ctx context.Context, t *testing.T, pool *pgxpool.Pool, userID, repoID uuid.UUID, location string) (string, *int64) {
 	t.Helper()
-	var status string
+	status, iid, _ := dispositionRow(ctx, t, pool, userID, repoID, location)
+	return status, iid
+}
+
+// dispositionRow reads the settle-visible columns of one coordinate: its status, the stamped
+// forge iid (nil when unfiled), and the stamped forge web URL (” when unfiled). It is the
+// superset dispositionStatus wraps, used where the test also asserts filed_issue_url round-trips.
+func dispositionRow(ctx context.Context, t *testing.T, pool *pgxpool.Pool, userID, repoID uuid.UUID, location string) (string, *int64, string) {
+	t.Helper()
+	var status, url string
 	var iid pgtype.Int8
 	err := pool.QueryRow(ctx,
-		`SELECT status, filed_issue_iid FROM finding_dispositions WHERE user_id = $1 AND repo_id = $2 AND location = $3`,
-		userID, repoID, location).Scan(&status, &iid)
+		`SELECT status, filed_issue_iid, filed_issue_url FROM finding_dispositions WHERE user_id = $1 AND repo_id = $2 AND location = $3`,
+		userID, repoID, location).Scan(&status, &iid, &url)
 	if err != nil {
 		t.Fatalf("read disposition: %v", err)
 	}
 	if iid.Valid {
 		v := iid.Int64
-		return status, &v
+		return status, &v, url
 	}
-	return status, nil
+	return status, nil, url
 }
 
 // ── Happy path: filing ensures the marker BEFORE CreateIssue, files it with the marker in the
@@ -318,10 +327,14 @@ func TestFileFindingHappyPathLiveDB(t *testing.T) {
 	if !containsStr(labels, "needs-triage") {
 		t.Errorf("filed labels %v must include the sanitised user selection", labels)
 	}
-	// The coordinate settled to filed with the iid stamped.
-	status, iid := dispositionStatus(ctx, t, pool, f.owner.ID, f.repoID, f.location)
+	// The coordinate settled to filed with the iid AND the forge web URL stamped (FIX 1: the
+	// backlog links a filed coordinate through filed_issue_url, so the settle must record it).
+	status, iid, url := dispositionRow(ctx, t, pool, f.owner.ID, f.repoID, f.location)
 	if status != "filed" || iid == nil || *iid != resp.Issue.IID {
 		t.Fatalf("disposition not settled: status=%s iid=%v (issue %d)", status, iid, resp.Issue.IID)
+	}
+	if url == "" || url != resp.Issue.WebURL {
+		t.Fatalf("settle must stamp filed_issue_url; got %q, want the created issue web_url %q", url, resp.Issue.WebURL)
 	}
 	_ = q
 }

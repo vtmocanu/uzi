@@ -189,7 +189,7 @@ func (h *Handler) FileFinding(w http.ResponseWriter, r *http.Request) {
 	// Forge-first done. Settle the coordinate (filing→filed, stamp the iid). A settle failure or
 	// 0-rows AFTER a successful CreateIssue is created-with-warning — the real issue exists, so
 	// NEVER revert (would orphan it) and NEVER retry (mirrors settleFiledIssue).
-	warning := h.settleFiledFinding(ctx, finding, created.IID)
+	warning := h.settleFiledFinding(ctx, finding, created.IID, created.WebURL)
 
 	httpx.JSON(w, http.StatusCreated, fileFindingResponse{
 		Issue:   createdIssueDTO{IID: created.IID, WebURL: created.WebURL, Title: created.Title},
@@ -263,10 +263,11 @@ func (h *Handler) revertFindingClaim(ctx context.Context, finding store.Incident
 // IssueFilingStuckTimeout to >= 2x ForgeHTTPTimeout) is what recovers it: on a later tick it
 // resets the coordinate to `open` so the user can re-file — accepting the rare duplicate that a
 // re-file of an already-created issue produces (documented on SweepStrandedFilingFindings).
-func (h *Handler) settleFiledFinding(ctx context.Context, finding store.IncidentalFinding, iid int64) string {
+func (h *Handler) settleFiledFinding(ctx context.Context, finding store.IncidentalFinding, iid int64, webURL string) string {
 	const warnUnlinked = "The issue was created on the forge, but recording it in uzi failed; the finding may still show as unfiled until it reconciles."
 	rows, err := h.q.SettleFindingFiled(ctx, store.SettleFindingFiledParams{
 		FiledIssueIid: pgtype.Int8{Int64: iid, Valid: true},
+		FiledIssueUrl: webURL,
 		UserID:        finding.UserID,
 		RepoID:        finding.RepoID,
 		Location:      finding.Location,

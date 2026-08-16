@@ -97,12 +97,13 @@ func (s *Service) FindingsBacklog(ctx context.Context, ownerUserID uuid.UUID, bu
 // filed/resolved.
 func mapIncidentalFindingRow(r store.ListFindingsBacklogRow) apitypes.IncidentalFindingDTO {
 	dto := apitypes.IncidentalFindingDTO{
-		Location:   r.Location,
-		RepoID:     r.RepoID.String(),
-		RepoPath:   r.RepoPath,
-		Status:     r.Status,
-		LastTitle:  r.LastTitle,
-		SeenInRuns: int(r.SeenInRuns),
+		Location:      r.Location,
+		RepoID:        r.RepoID.String(),
+		RepoPath:      r.RepoPath,
+		Status:        r.Status,
+		LastTitle:     r.LastTitle,
+		SeenInRuns:    int(r.SeenInRuns),
+		FiledIssueURL: r.FiledIssueUrl,
 	}
 	if r.LatestFindingID.Valid {
 		id := uuid.UUID(r.LatestFindingID.Bytes).String()

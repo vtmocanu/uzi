@@ -42,6 +42,10 @@ export function FindingCard({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [issue, setIssue] = useState<IncidentalFindingFiledIssue | null>(null);
+  // Created-with-warning note (the forge issue WAS created but its local disposition could not
+  // settle): a success, not a retry signal, so the card shows filed and surfaces the note inline,
+  // mirroring what the CLI prints.
+  const [warning, setWarning] = useState("");
   // Reason picker toggle (mirrors Judge's Dismiss ▾): closed until the user starts a dismiss.
   const [dismissing, setDismissing] = useState(false);
   // Edit-and-file draft, loaded lazily from findingIssueDraft on the first Edit click.
@@ -65,6 +69,7 @@ export function FindingCard({
     try {
       const res = await api.fileFinding(id, edits);
       setIssue(res.issue);
+      setWarning(res.warning ?? "");
       setState("filed");
     } catch (e) {
       handleFileError(e);
@@ -130,7 +135,7 @@ export function FindingCard({
             escaping does not touch a bidi override (issue #124). Display only. */}
         <div className="space-y-1">
           {location && (
-            <p className="font-mono text-[11px] text-faint">{stripUnsafeChars(location)}</p>
+            <p className="break-all font-mono text-[11px] text-faint">{stripUnsafeChars(location)}</p>
           )}
           <p className="text-sm font-semibold text-fg">{stripUnsafeChars(title)}</p>
         </div>
@@ -236,6 +241,8 @@ export function FindingCard({
             ) : (
               issue && <span className="font-medium">#{issue.iid}</span>
             )}
+            {/* warning is a server-authored constant (created-with-warning), not model text. */}
+            {warning && <p className="mt-1 text-xs text-muted">· {warning}</p>}
           </div>
         )}
 

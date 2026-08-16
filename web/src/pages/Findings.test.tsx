@@ -130,6 +130,72 @@ describe("Findings page — file + stale-card 409", () => {
     await waitFor(() => expect(screen.getByText("already resolved")).toBeTruthy());
   });
 
+  it("links a backlog-loaded filed row through its filed_issue_url (not just a session file)", async () => {
+    // A row loaded from the backlog in the filed state carries filed_issue_url from the DTO — no
+    // File click this session — and must still render "Filed #<iid>" as a click-through anchor.
+    mockApi.listFindings.mockResolvedValue(
+      backlog({
+        bucket: "filed",
+        findings: [
+          finding({
+            finding_id: "f-filed",
+            status: "filed",
+            filed_issue_iid: 777,
+            filed_issue_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/777",
+            last_title: "already filed elsewhere",
+          }),
+        ],
+      }),
+    );
+    renderFindings(["/findings?bucket=filed"]);
+    await waitFor(() => expect(screen.getByText("already filed elsewhere")).toBeTruthy());
+    const link = screen.getByRole("link", { name: /Filed #777/ });
+    expect(link.getAttribute("href")).toBe("https://gitlab.example.com/vtmocanu/uzi/-/issues/777");
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toContain("noopener");
+  });
+
+  it("renders a filed backlog row with no filed_issue_url as inert text (not a link)", async () => {
+    mockApi.listFindings.mockResolvedValue(
+      backlog({
+        bucket: "filed",
+        findings: [finding({ finding_id: "f-nolink", status: "filed", filed_issue_iid: 99, last_title: "filed no url" })],
+      }),
+    );
+    renderFindings(["/findings?bucket=filed"]);
+    await waitFor(() => expect(screen.getByText("filed no url")).toBeTruthy());
+    expect(screen.queryByRole("link", { name: /Filed #99/ })).toBeNull();
+    expect(screen.getByText("Filed #99")).toBeTruthy();
+  });
+
+  it("surfaces a created-with-warning note on the filed row", async () => {
+    mockApi.fileFinding.mockResolvedValue({
+      issue: { iid: 601, web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/601", title: "Leaked ticker" },
+      warning: "The issue was created on the forge, but recording it in uzi failed.",
+    });
+    renderFindings();
+    await waitFor(() => expect(screen.getByText("Leaked ticker in sweepLoop")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "File" }));
+
+    await waitFor(() => expect(screen.getByRole("link", { name: /Filed #601/ })).toBeTruthy());
+    expect(screen.getByText(/recording it in uzi failed/)).toBeTruthy();
+  });
+
+  it("suppresses the run count on a coordinate seen in 0 runs", async () => {
+    mockApi.listFindings.mockResolvedValue(
+      backlog({
+        bucket: "filed",
+        findings: [
+          finding({ finding_id: undefined, status: "filed", filed_issue_iid: 12, seen_in_runs: 0, last_title: "evidence gone" }),
+        ],
+      }),
+    );
+    renderFindings(["/findings?bucket=filed"]);
+    await waitFor(() => expect(screen.getByText("evidence gone")).toBeTruthy());
+    expect(screen.queryByText(/seen in 0 runs/)).toBeNull();
+  });
+
   it("renders a null finding_id row display-only, with no File/Dismiss actions", async () => {
     mockApi.listFindings.mockResolvedValue(
       backlog({

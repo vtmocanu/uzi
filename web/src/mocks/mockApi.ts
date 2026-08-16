@@ -285,6 +285,7 @@ function findingDTO(f: MockFinding): IncidentalFinding {
     last_title: f.last_title,
     seen_in_runs: f.seen_in_runs,
     ...(f.filed_issue_iid != null ? { filed_issue_iid: f.filed_issue_iid } : {}),
+    ...(f.filed_issue_url ? { filed_issue_url: f.filed_issue_url } : {}),
     ...(f.resolved_at ? { resolved_at: f.resolved_at } : {}),
   };
 }

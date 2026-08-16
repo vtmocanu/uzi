@@ -18,6 +18,12 @@ import "time"
 // rest); like the judge's rationale_preview every consumer renders it as escaped text, never
 // markdown/HTML. FiledIssueIID/ResolvedAt are omitempty — present only on a filed/resolved
 // coordinate.
+//
+// FiledIssueURL is the stored web URL of the forge issue a filed coordinate produced (D12),
+// stamped at settle time alongside FiledIssueIID. It is omitempty — empty until filed — and is
+// what lets the backlog render a filed coordinate as a click-through link even for a coordinate
+// filed from the CLI or revisited in a later session (no session-local file result to link
+// from). It is a forge-produced URL, not agent text; the web renders it only when it is https.
 type IncidentalFindingDTO struct {
 	FindingID     *string    `json:"finding_id,omitempty"`
 	Location      string     `json:"location"`
@@ -27,6 +33,7 @@ type IncidentalFindingDTO struct {
 	LastTitle     string     `json:"last_title"`
 	SeenInRuns    int        `json:"seen_in_runs"`
 	FiledIssueIID *int64     `json:"filed_issue_iid,omitempty"`
+	FiledIssueURL string     `json:"filed_issue_url,omitempty"`
 	ResolvedAt    *time.Time `json:"resolved_at,omitempty"`
 }
 

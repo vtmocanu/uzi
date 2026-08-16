@@ -332,21 +332,21 @@ func TestPendingJudgeDTOTags(t *testing.T) {
 }
 
 // TestIncidentalFindingDTOTags pins the PRD #333 M4 backlog-row shape. finding_id,
-// filed_issue_iid and resolved_at are all omitempty (nil-optional): a display-only
+// filed_issue_iid, filed_issue_url and resolved_at are all omitempty: a display-only
 // coordinate whose evidence was cascaded away carries no finding_id, and an OPEN coordinate
-// carries neither a filed iid nor a resolved_at. The zero-value pin asserts the always-present
-// key set (mirroring how runDTOKeys excludes the omitempty Usage), and the populated pin
-// asserts the three optional keys surface when set.
+// carries neither a filed iid, a filed url, nor a resolved_at. The zero-value pin asserts the
+// always-present key set (mirroring how runDTOKeys excludes the omitempty Usage), and the
+// populated pin asserts the four optional keys surface when set.
 func TestIncidentalFindingDTOTags(t *testing.T) {
 	assertTags(t, "IncidentalFindingDTO", IncidentalFindingDTO{},
 		"location", "repo_id", "repo_path", "status", "last_title", "seen_in_runs")
 	id := "f1"
 	iid := int64(7)
 	now := time.Unix(0, 0)
-	full := IncidentalFindingDTO{FindingID: &id, FiledIssueIID: &iid, ResolvedAt: &now}
+	full := IncidentalFindingDTO{FindingID: &id, FiledIssueIID: &iid, FiledIssueURL: "https://forge.example/g/a/-/issues/7", ResolvedAt: &now}
 	assertTags(t, "IncidentalFindingDTO(full)", full,
 		"finding_id", "location", "repo_id", "repo_path", "status", "last_title",
-		"seen_in_runs", "filed_issue_iid", "resolved_at")
+		"seen_in_runs", "filed_issue_iid", "filed_issue_url", "resolved_at")
 }
 
 func TestIncidentalFindingBacklogDTOTags(t *testing.T) {

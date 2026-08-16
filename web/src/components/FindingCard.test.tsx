@@ -93,6 +93,20 @@ describe("FindingCard (PRD #333 M7)", () => {
     expect(link.getAttribute("href")).toBe("https://gitlab.example.com/vtmocanu/uzi/-/issues/512");
   });
 
+  it("surfaces a created-with-warning note on the filed card", async () => {
+    mockApi.fileFinding.mockResolvedValue({
+      issue: { iid: 512, web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/512", title: "Leaked ticker" },
+      warning: "The issue was created on the forge, but recording it in uzi failed.",
+    });
+    render(<FindingCard id="find-1" title="Leaked ticker" location="a.go#loop" labels={[]} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "File" }));
+
+    // A warning is a success (the issue exists), so the card still shows filed AND the note.
+    await waitFor(() => expect(screen.getByText("Issue filed.")).toBeTruthy());
+    expect(screen.getByText(/recording it in uzi failed/)).toBeTruthy();
+  });
+
   it("a stale File that 409s shows the friendly 'already filed / resolved' state, never a crash", async () => {
     mockApi.fileFinding.mockRejectedValue(new ApiError(409, "this finding is already filed or being filed"));
     const { container } = render(<FindingCard id="find-1" title="Leaked ticker" location="a.go#loop" labels={[]} />);

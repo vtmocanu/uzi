@@ -443,6 +443,7 @@ export interface MockFinding {
   labels: string[];
   seen_in_runs: number;
   filed_issue_iid: number | null;
+  filed_issue_url: string | null;
   resolved_at: string | null;
   run_ids: string[];
 }
@@ -461,6 +462,7 @@ export const mockFindings: MockFinding[] = [
     labels: ["bug"],
     seen_in_runs: 2,
     filed_issue_iid: null,
+    filed_issue_url: null,
     resolved_at: null,
     run_ids: ["run-live", "run-done"],
   },
@@ -477,6 +479,7 @@ export const mockFindings: MockFinding[] = [
     labels: ["bug", "reliability"],
     seen_in_runs: 1,
     filed_issue_iid: null,
+    filed_issue_url: null,
     resolved_at: null,
     run_ids: ["run-live"],
   },
@@ -492,6 +495,7 @@ export const mockFindings: MockFinding[] = [
     labels: ["security"],
     seen_in_runs: 3,
     filed_issue_iid: 512,
+    filed_issue_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/512",
     resolved_at: minsAgo(200),
     run_ids: ["run-done"],
   },
@@ -507,6 +511,7 @@ export const mockFindings: MockFinding[] = [
     labels: ["security"],
     seen_in_runs: 1,
     filed_issue_iid: null,
+    filed_issue_url: null,
     resolved_at: null,
     run_ids: ["run-live"],
   },
@@ -522,6 +527,7 @@ export const mockFindings: MockFinding[] = [
     labels: [],
     seen_in_runs: 1,
     filed_issue_iid: null,
+    filed_issue_url: null,
     resolved_at: minsAgo(300),
     run_ids: ["run-done"],
   },
@@ -540,6 +546,7 @@ export const mockFindings: MockFinding[] = [
     labels: [],
     seen_in_runs: 0,
     filed_issue_iid: 488,
+    filed_issue_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/488",
     resolved_at: minsAgo(4000),
     run_ids: [],
   },

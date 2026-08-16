@@ -244,13 +244,27 @@ func TestIncidentalFindingsLiveDB(t *testing.T) {
 		if got := claim(loc); got != 1 {
 			t.Fatalf("re-claim after revert should affect 1 row, got %d", got)
 		}
+		const settledURL = "https://forge.example/g/a/-/issues/4242"
 		if n, err := q.SettleFindingFiled(ctx, store.SettleFindingFiledParams{
-			UserID: u, RepoID: r, Location: l, FiledIssueIid: pgtype.Int8{Int64: 4242, Valid: true},
+			UserID: u, RepoID: r, Location: l,
+			FiledIssueIid: pgtype.Int8{Int64: 4242, Valid: true}, FiledIssueUrl: settledURL,
 		}); err != nil || n != 1 {
 			t.Fatalf("SettleFindingFiled = %d, %v; want 1", n, err)
 		}
 		if s := dispStatus(ctx, t, pool, userID, repoA, loc); s != "filed" {
 			t.Fatalf("status after settle = %q, want filed", s)
+		}
+		// The settle stamps both the iid AND the forge web URL (FIX 1) — the URL is what lets the
+		// backlog render a filed coordinate as a click-through link.
+		var settledIID pgtype.Int8
+		var settledURLGot string
+		if err := pool.QueryRow(ctx,
+			`SELECT filed_issue_iid, filed_issue_url FROM finding_dispositions WHERE user_id=$1 AND repo_id=$2 AND location=$3`,
+			userID, repoA, loc).Scan(&settledIID, &settledURLGot); err != nil {
+			t.Fatalf("read settled row: %v", err)
+		}
+		if !settledIID.Valid || settledIID.Int64 != 4242 || settledURLGot != settledURL {
+			t.Fatalf("settle stamped (iid=%v url=%q), want (4242, %q)", settledIID, settledURLGot, settledURL)
 		}
 		// A revert on a settled row is guarded to status='filing' → 0 rows, no resurrection.
 		if n, err := q.RevertFindingFiling(ctx, store.RevertFindingFilingParams{UserID: u, RepoID: r, Location: l}); err != nil || n != 0 {
@@ -286,18 +300,20 @@ func TestIncidentalFindingsLiveDB(t *testing.T) {
 		}); err != nil || n != 1 {
 			t.Fatalf("re-open with a DIFFERENT hash must affect 1 row, got %d, %v", n, err)
 		}
-		var status, lastTitle string
+		var status, lastTitle, filedURL string
 		var filedIID pgtype.Int8
 		var resolvedAt pgtype.Timestamptz
 		if err := pool.QueryRow(ctx,
-			`SELECT status, last_title, filed_issue_iid, resolved_at FROM finding_dispositions
+			`SELECT status, last_title, filed_issue_iid, filed_issue_url, resolved_at FROM finding_dispositions
 			 WHERE user_id=$1 AND repo_id=$2 AND location=$3`, userID, repoA, loc).
-			Scan(&status, &lastTitle, &filedIID, &resolvedAt); err != nil {
+			Scan(&status, &lastTitle, &filedIID, &filedURL, &resolvedAt); err != nil {
 			t.Fatalf("read re-opened row: %v", err)
 		}
-		if status != "open" || lastTitle != "materially different bug" || filedIID.Valid || resolvedAt.Valid {
-			t.Fatalf("re-opened row = (status=%q last_title=%q filed_iid_valid=%v resolved_valid=%v); "+
-				"want open, refreshed title, cleared iid + resolved_at", status, lastTitle, filedIID.Valid, resolvedAt.Valid)
+		// A re-open clears the whole resolved state, including filed_issue_url (so a re-opened
+		// coordinate never carries a stale link to the old issue, FIX 1).
+		if status != "open" || lastTitle != "materially different bug" || filedIID.Valid || filedURL != "" || resolvedAt.Valid {
+			t.Fatalf("re-opened row = (status=%q last_title=%q filed_iid_valid=%v filed_url=%q resolved_valid=%v); "+
+				"want open, refreshed title, cleared iid + url + resolved_at", status, lastTitle, filedIID.Valid, filedURL, resolvedAt.Valid)
 		}
 	})
 

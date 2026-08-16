@@ -43,7 +43,11 @@ const TAB_LABEL: Record<FindingsTab, string> = {
   dismissed: "Dismissed",
 };
 
+// seenInRunsLabel renders the occurrence count, or "" for a coordinate whose evidence was all
+// cascaded away with deleted runs (seen_in_runs 0): "seen in 0 runs" reads wrong on a
+// filed/dismissed row that outlived its evidence, so the count is suppressed there (D12).
 function seenInRunsLabel(n: number): string {
+  if (n <= 0) return "";
   return `seen in ${n} ${n === 1 ? "run" : "runs"}`;
 }
 
@@ -59,9 +63,10 @@ export function Findings() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [actionErr, setActionErr] = useState("");
-  // Local, per-coordinate result of the just-clicked File (its issue link) so a filed row can
-  // render its live link even in the to_file view before the next reload reconciles.
-  const [filedLinks, setFiledLinks] = useState<Record<string, { iid: number; web_url: string }>>({});
+  // Per-coordinate created-with-warning note from the just-clicked File (the forge issue WAS
+  // created but its local disposition could not settle): kept so the filed row can surface the
+  // warning inline, mirroring what the CLI prints. Keyed by finding_id, cleared on reload.
+  const [filedWarnings, setFiledWarnings] = useState<Record<string, string>>({});
   // Coordinates that came back 409 (already filed/dismissed from elsewhere): best-effort, the
   // backlog is the source of truth, so the row shows a friendly note and a reload reconciles.
   const [resolvedIds, setResolvedIds] = useState<Set<string>>(new Set());
@@ -84,7 +89,7 @@ export function Findings() {
   }, [bucket, repoFilter, runAnchor]);
 
   useEffect(() => {
-    setFiledLinks({});
+    setFiledWarnings({});
     setResolvedIds(new Set());
     load();
   }, [load]);
@@ -141,8 +146,15 @@ export function Findings() {
       setActionErr("");
       try {
         const res = await api.fileFinding(findingID);
-        setFiledLinks((m) => ({ ...m, [findingID]: { iid: res.issue.iid, web_url: res.issue.web_url } }));
-        patchRow(findingID, { status: "filed", filed_issue_iid: res.issue.iid });
+        // Patch the row to its filed rollup with the DTO's link fields (filed_issue_url is now the
+        // single source the status badge links through — no session-local link map). A non-empty
+        // warning is created-with-warning: the issue exists, so keep the note beside the filed row.
+        patchRow(findingID, {
+          status: "filed",
+          filed_issue_iid: res.issue.iid,
+          filed_issue_url: res.issue.web_url,
+        });
+        setFiledWarnings((m) => ({ ...m, [findingID]: res.warning ?? "" }));
       } catch (e) {
         // A stale File on an already-resolved coordinate is the M5 409 (the guarded claim). It
         // is best-effort, not an error: show the friendly "already filed" note and reload so the
@@ -269,8 +281,7 @@ export function Findings() {
               <FindingRow
                 key={rowKey(f)}
                 finding={f}
-                showRepo={false}
-                filedLink={f.finding_id ? filedLinks[f.finding_id] : undefined}
+                warning={f.finding_id ? filedWarnings[f.finding_id] : undefined}
                 resolved={f.finding_id ? resolvedIds.has(f.finding_id) : false}
                 onFile={fileFinding}
                 onDismiss={dismissFinding}
@@ -287,8 +298,7 @@ export function Findings() {
                     <FindingRow
                       key={rowKey(f)}
                       finding={f}
-                      showRepo={false}
-                      filedLink={f.finding_id ? filedLinks[f.finding_id] : undefined}
+                      warning={f.finding_id ? filedWarnings[f.finding_id] : undefined}
                       resolved={f.finding_id ? resolvedIds.has(f.finding_id) : false}
                       onFile={fileFinding}
                       onDismiss={dismissFinding}
@@ -335,25 +345,25 @@ function groupByRepo(findings: IncidentalFinding[]): RepoGroup[] {
 
 // FindingRow is one coordinate: the inert last_title, "seen in N runs", the status, and the
 // File/Dismiss actions when the coordinate is open and actionable. A null finding_id row is
-// display-only (no actions); a filed row shows its issue iid (a live link when the File click
-// just produced one this session).
+// display-only (no actions); a filed row links its issue through the DTO's filed_issue_url. A
+// non-empty `warning` is the created-with-warning note (the issue was created but the local
+// disposition could not settle), surfaced inline beneath the row, mirroring the CLI.
 function FindingRow({
   finding,
-  showRepo,
-  filedLink,
+  warning,
   resolved,
   onFile,
   onDismiss,
 }: {
   finding: IncidentalFinding;
-  showRepo: boolean;
-  filedLink?: { iid: number; web_url: string };
+  warning?: string;
   resolved: boolean;
   onFile: (id: string) => void;
   onDismiss: (id: string, reason: "wont_do" | "not_an_issue") => void;
 }) {
   const [dismissing, setDismissing] = useState(false);
   const actionable = !!finding.finding_id && finding.status === "open" && !resolved;
+  const seen = seenInRunsLabel(finding.seen_in_runs);
 
   return (
     <li className="rounded-lg border border-edge bg-raised/40">
@@ -363,11 +373,14 @@ function FindingRow({
             {stripUnsafeChars(finding.last_title) || "Untitled finding"}
           </p>
           <div className="mt-1 flex flex-wrap items-center gap-2 text-xs">
-            {showRepo && <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-fg">{stripUnsafeChars(finding.repo_path)}</code>}
-            <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-faint">{stripUnsafeChars(finding.location)}</code>
-            <span className="text-faint">{seenInRunsLabel(finding.seen_in_runs)}</span>
-            <FindingStatusBadge finding={finding} filedLink={filedLink} resolved={resolved} />
+            <code className="max-w-full break-all rounded bg-raised px-1.5 py-0.5 font-mono text-faint">{stripUnsafeChars(finding.location)}</code>
+            {seen && <span className="text-faint">{seen}</span>}
+            <FindingStatusBadge finding={finding} resolved={resolved} />
           </div>
+          {finding.status === "filed" && warning && (
+            // warning is a server-authored constant (created-with-warning), not model text.
+            <p className="mt-1 text-xs text-muted">· {warning}</p>
+          )}
         </div>
 
         {actionable && !dismissing && (
@@ -400,11 +413,9 @@ function FindingRow({
 
 function FindingStatusBadge({
   finding,
-  filedLink,
   resolved,
 }: {
   finding: IncidentalFinding;
-  filedLink?: { iid: number; web_url: string };
   resolved: boolean;
 }) {
   if (resolved && finding.status === "open") {
@@ -412,18 +423,20 @@ function FindingStatusBadge({
   }
   switch (finding.status) {
     case "filed": {
-      const iid = filedLink?.iid ?? finding.filed_issue_iid;
-      // A live https link only when the File click just produced one this session; otherwise the
-      // backlog carries only the iid (no web_url), so it renders as inert text.
-      if (filedLink && isHttps(filedLink.web_url)) {
+      const iid = finding.filed_issue_iid;
+      // Link "Filed #<iid>" through the DTO's filed_issue_url whenever it is a real https URL —
+      // for a backlog-loaded filed row as well as one just filed this session (patchRow stamps
+      // filed_issue_url from the file result). Inert text when the url is absent/empty.
+      const url = finding.filed_issue_url;
+      if (url && isHttps(url)) {
         return (
           <a
-            href={filedLink.web_url}
+            href={url}
             target="_blank"
             rel="noopener noreferrer"
             className="inline-flex items-center gap-1 font-medium text-info underline underline-offset-2 hover:text-info"
           >
-            Filed #{iid}
+            {iid != null ? `Filed #${iid}` : "Filed"}
           </a>
         );
       }
