@@ -27,6 +27,15 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   read-only `web-ux` validator. It runs on `opus` and inherits the full
   toolset. Boot-seeded via `ReconcileBuiltinTemplates`; existing installs pick
   it up on the next boot. (#314)
+- **Role-aware in-app docs: admins now see the operator setup guides (#75).**
+  The in-app `/docs` section gains an "Admin / operator" area alongside the
+  existing user howtos, surfacing installation, configuration, OIDC/Keycloak,
+  and vault threat-model pages — routable, indexed, and searchable — to any
+  admin (`me.is_admin`). It's presentation-only: every `docs/*.md` file was
+  already bundled to every browser, so this gates the index/routing/search on
+  admin status rather than introducing a new access boundary, and operator
+  pages carry no secrets.
+
 ### Fixed
 
 - **A completed run with an opened MR is no longer recorded as a total loss

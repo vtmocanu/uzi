@@ -1206,14 +1206,28 @@ Serves human: "howtos … include screenshots" (which pages appear in-app); self
 describing docs (adding a page never touches web code).
 
 - Every `docs/*.md` carries minimal YAML frontmatter `title` / `order` / `audience`
-  where `audience ∈ {user, operator, design, contributor}`. **Only `audience: user`
-  pages** are listed and routable in-app, ordered by `order` (integer, unique among
-  user pages). Slug = filename (`gitlab-bot-setup.md` → `/docs/gitlab-bot-setup`).
-  `docs/README.md` is excluded from the glob and from validation.
+  where `audience ∈ {user, operator, design, contributor}`. **`audience: user`
+  pages** are listed and routable in-app for everyone; **`audience: operator` pages
+  are additionally listed/routable in-app for admins** (`me.is_admin`, issue #75),
+  shown in an "Admin / operator" section. Each audience is ordered by `order`
+  (integer, unique *within its own audience namespace* — operator `order` 10 never
+  collides with user `order` 10). Slug = filename (`gitlab-bot-setup.md` →
+  `/docs/gitlab-bot-setup`). `docs/README.md` is excluded from the glob and from
+  validation.
 - **`audience` over a hardcoded page list in web code**: docs stay self-describing;
-  `operator`/`design`/`contributor` pages (installation, configuration, auth-design,
-  proc-hardening, dev-conventions) stay repo-only because the in-app audience already
-  has a running instance.
+  `operator` pages (installation, configuration, oidc, vault-threat-model) are
+  admin-visible in-app (issue #75), while `design`/`contributor` pages (auth-design,
+  proc-hardening, dev-conventions) stay fully repo-only because the in-app audience
+  already has a running instance.
+- **Issue #75 is presentation-only, explicitly NOT a security boundary** (option A).
+  All `docs/*.md` are still eagerly bundled into the JS shipped to every browser
+  (the `import.meta.glob(..., {eager:true})` is unchanged); the `is_admin` gate is
+  client-side filtering of what is *listed/routed/searched*, not access control — a
+  non-admin can still read operator markdown out of the bundle. Acceptable because
+  operator docs carry no secrets (only env-var names, flow descriptions, "copy your
+  own IdP secret into your own config"). Option B (server-served docs behind an
+  `IsAdmin` check — a true boundary) is the deferred alternative; it would break the
+  offline-bundle / no-runtime-docs-service design (§54, PRD #7).
 - **Hand-rolled ~15-line parser** (`parseFrontmatter`), not `gray-matter` (which
   drags Buffer polyfills into the browser bundle). It consumes **only a leading
   `---\n` fence at byte 0**; a `---` later in a body (e.g. inside agent-templates.md's
@@ -1230,7 +1244,8 @@ describing docs (adding a page never touches web code).
 Serves human: "docs section on uzi" (in the webui, where users hit the moments that
 need it); best-practice (safe rendering of repo content).
 
-- **Routes**: `/docs` (index — user pages only, one-line auto-summary each via
+- **Routes**: `/docs` (index — user pages for everyone, plus an admin-only
+  "Admin / operator" operator section (issue #75); one-line auto-summary each via
   `summarize()`, the first paragraph after the H1 stripped of markdown) and
   `/docs/:slug` (`web/src/pages/Docs.tsx`, `DocPage.tsx`). An unknown slug renders a
   not-found state **inside the docs shell** with a link back to `/docs`, not the
@@ -1245,10 +1260,14 @@ need it); best-practice (safe rendering of repo content).
   sanitizer — the smallest safe pipeline (multica's `rehype-raw`+sanitize is for
   untrusted LLM output; dead weight here). No nginx CSP change needed (same-origin
   `img-src 'self'`, class-based Tailwind, no inline scripts).
-- **Link rewriting** (`resolveHref`, pure + unit-tested by injecting the is-user-page
-  predicate): a relative `*.md` resolving to a bundled **user** page → the in-app
-  `/docs/:slug` route (react-router `<Link>`); any other relative target (repo-only
-  doc, `../plan.md`, `auth-design.md`) → the **pinned GitLab blob base**
+- **Link rewriting** (`resolveHref`, pure + unit-tested by injecting the
+  `isRoutablePage` predicate): the injected predicate is now the role-aware
+  `isRoutableDoc(slug, isAdmin)` (user for everyone, operator too for admins), bound
+  by `rewriteHref(href, isAdmin)`. A relative `*.md` resolving to an in-app-routable
+  page → the in-app `/docs/:slug` route (react-router `<Link>`); so an operator-doc
+  link routes in-app for an admin but resolves to the GitLab blob for a non-admin.
+  Any other relative target (repo-only doc, `../plan.md`, `auth-design.md`) → the
+  **pinned GitLab blob base**
   `https://gitlab.example.com/vtmocanu/uzi/-/blob/main/` + repo-relative path.
   `#anchor` fragments are preserved in both cases (existing docs lean on them).
   External `http(s)` links get `target=_blank` + `rel="noopener noreferrer"`.
@@ -1289,8 +1308,10 @@ the only gate).
 - Runs standalone (`npm run check-docs`) and as the **first step of `npm run build`**
   (so it also runs inside the web image build). Its frontmatter parser **mirrors**
   the viewer's so the gate accepts exactly what the viewer parses.
-- **Fails the build** on: missing/invalid frontmatter (README exempt); a `user` page
-  missing/duplicate/non-numeric `order`; **reference-style links** (`[label]: url`,
+- **Fails the build** on: missing/invalid frontmatter (README exempt); a `user` OR
+  `operator` page missing/non-numeric/duplicate `order`, with duplicate detection
+  **per-audience** (separate namespaces, so a user and an operator page may share the
+  same `order`); **reference-style links** (`[label]: url`,
   `[text][ref]`) — invisible to the existence check and easy to break, so the
   convention is inline-links-only; broken relative doc→doc / doc→img links; any
   `docs/img/*` over the **300 KB** per-image budget (ships to every visitor).
@@ -3565,10 +3586,11 @@ library swap contained if the corpus outgrows substring search.
   Fumadocs/Orama search (uzi has no docs backend by design; PRD #7 rejected a docs
   service/framework). The corpus is already fully in the browser as raw strings, so
   search needs no network at all.
-- **Corpus = `audience: user` pages only** (`listUserDocs()` — exactly what the index
-  lists). Same pure/bound split as §54's docs.ts: `buildIndex` + `searchIndex` are
-  fixture-testable; `searchDocs()` binds them to the real corpus, memoized once (the
-  bundle's corpus is fixed).
+- **Corpus = the viewer's visible set** (`docsForIndex(isAdmin)` — exactly what the
+  index lists): user pages for everyone, plus operator pages for admins (issue #75).
+  Same pure/bound split as §54's docs.ts: `buildIndex` + `searchIndex` are
+  fixture-testable; `searchDocs(query, isAdmin)` binds them to the real corpus,
+  memoized in **two built-once slots** (user / admin — each bundle corpus is fixed).
 - **Matching**: case-insensitive, multi-token AND — every whitespace token must appear
   as a substring in title, headings, or body. Matching/counting use **`indexOf` loops,
   never `new RegExp(token)`** — query tokens are user input full of regex metacharacters
