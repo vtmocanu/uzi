@@ -260,7 +260,7 @@ export function AdminBlockedRepos() {
                 />
               </label>
             </div>
-            <div className="flex items-center justify-end gap-2 border-t border-edge bg-bg/40 px-5 py-3.5">
+            <div className="flex items-center justify-end gap-2 border-t border-edge bg-ink/40 px-5 py-3.5">
               <Button variant="ghost" size="sm" disabled={allowBusy} onClick={closeAllow}>
                 Cancel
               </Button>

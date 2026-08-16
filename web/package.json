@@ -6,9 +6,10 @@
   "scripts": {
     "dev": "vite",
     "check-docs": "node scripts/check-docs.mjs",
+    "check-styles": "node scripts/check-styles.mjs",
     "lint": "oxlint --config .oxlintrc.json -D correctness --report-unused-disable-directives-severity=error src",
     "knip": "knip",
-    "build": "npm run check-docs && tsc --noEmit && vite build",
+    "build": "npm run check-docs && npm run check-styles && tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --coverage",
     "preview": "vite preview",
