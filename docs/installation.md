@@ -1,5 +1,6 @@
 ---
 title: Installation
+order: 10
 audience: operator
 ---
 

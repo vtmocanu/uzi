@@ -1,10 +1,13 @@
 import { describe, it, expect } from "vitest";
 import {
   GITLAB_BLOB_BASE,
+  isRoutableDoc,
+  listOperatorDocs,
   parseFrontmatter,
   resolveFromDocs,
   resolveHref,
   resolveImageSrc,
+  rewriteHref,
   sortDocsForIndex,
   summarize,
   type Audience,
@@ -15,7 +18,7 @@ function doc(slug: string, order: number | null, audience: Audience = "user"): D
   return { slug, meta: { title: slug, order, audience }, body: "", summary: "" };
 }
 
-// These tests use inline-string fixtures and a fake `isUserPage` predicate, so
+// These tests use inline-string fixtures and a fake `isRoutablePage` predicate, so
 // they are decoupled from the real docs/ content (M2 can rewrite every page
 // without touching them).
 
@@ -176,6 +179,63 @@ describe("sortDocsForIndex", () => {
     const input = [doc("b", 20), doc("a", 10)];
     sortDocsForIndex(input);
     expect(input.map((d) => d.slug)).toEqual(["b", "a"]);
+  });
+});
+
+// These drive the role-aware bindings against the REAL bundled docs/ corpus
+// (operator slugs: configuration, oidc, installation, vault-threat-model; a
+// user slug: board). issue #75 M1.
+describe("isRoutableDoc (real bundled corpus)", () => {
+  it("routes a user doc for everyone", () => {
+    expect(isRoutableDoc("board", false)).toBe(true);
+    expect(isRoutableDoc("board", true)).toBe(true);
+  });
+
+  it("routes an operator doc only for an admin", () => {
+    expect(isRoutableDoc("configuration", false)).toBe(false);
+    expect(isRoutableDoc("configuration", true)).toBe(true);
+    expect(isRoutableDoc("oidc", false)).toBe(false);
+    expect(isRoutableDoc("oidc", true)).toBe(true);
+  });
+
+  it("never routes an unknown slug", () => {
+    expect(isRoutableDoc("definitely-not-a-real-doc", false)).toBe(false);
+    expect(isRoutableDoc("definitely-not-a-real-doc", true)).toBe(false);
+  });
+});
+
+describe("listOperatorDocs (real bundled corpus)", () => {
+  it("returns exactly the operator set (excludes user/design docs)", () => {
+    const slugs = listOperatorDocs().map((d) => d.slug);
+    for (const s of ["configuration", "installation", "oidc", "vault-threat-model"]) {
+      expect(slugs).toContain(s);
+    }
+    // No user or design doc leaks in.
+    expect(slugs).not.toContain("board");
+    expect(listOperatorDocs().every((d) => d.meta.audience === "operator")).toBe(true);
+  });
+});
+
+describe("rewriteHref (real bundled corpus, role-aware)", () => {
+  it("routes an operator-doc link in-app for an admin", () => {
+    expect(rewriteHref("configuration.md", true)).toEqual({
+      href: "/docs/configuration",
+      external: false,
+      internal: true,
+    });
+  });
+
+  it("sends the same operator-doc link to the GitLab blob for a non-admin", () => {
+    expect(rewriteHref("configuration.md", false)).toEqual({
+      href: `${GITLAB_BLOB_BASE}docs/configuration.md`,
+      external: true,
+      internal: false,
+    });
+  });
+
+  it("routes a user-doc link in-app regardless of role", () => {
+    expect(rewriteHref("board.md", false).href).toBe("/docs/board");
+    expect(rewriteHref("board.md", true).href).toBe("/docs/board");
   });
 });
 

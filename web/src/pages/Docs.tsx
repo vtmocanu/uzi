@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
-import { listUserDocs } from "../lib/docs";
+import { listUserDocs, listOperatorDocs } from "../lib/docs";
 import { searchDocs, MIN_QUERY_LENGTH, type SearchResult } from "../lib/docsearch";
+import { useAuth } from "../auth/AuthContext";
 import { Card, Input } from "../components/ui";
 import { SearchIcon } from "../components/icons";
 
@@ -28,11 +29,28 @@ function Highlighted({ text, ranges }: { text: string; ranges: [number, number][
   return <>{parts}</>;
 }
 
-function DocCard({ title, slug, children }: { title: string; slug: string; children?: ReactNode }) {
+function DocCard({
+  title,
+  slug,
+  operator = false,
+  children,
+}: {
+  title: string;
+  slug: string;
+  operator?: boolean;
+  children?: ReactNode;
+}) {
   return (
     <Link to={`/docs/${slug}`} className="block">
       <Card className="transition-colors hover:border-edge-strong">
-        <h2 className="font-medium text-fg">{title}</h2>
+        <h2 className="flex items-center gap-2 font-medium text-fg">
+          {title}
+          {operator && (
+            <span className="rounded border border-edge px-1.5 text-xs font-normal text-muted">
+              Operator
+            </span>
+          )}
+        </h2>
         {children}
       </Card>
     </Link>
@@ -44,10 +62,15 @@ function DocCard({ title, slug, children }: { title: string; slug: string; child
 // touches this file — both the list and the search corpus are driven by the
 // bundled docs' frontmatter.
 export function Docs() {
+  const isAdmin = useAuth().user?.is_admin ?? false;
   const docs = listUserDocs();
+  const operatorDocs = isAdmin ? listOperatorDocs() : [];
   const [query, setQuery] = useState("");
   const searching = query.trim().length >= MIN_QUERY_LENGTH;
-  const results = useMemo<SearchResult[]>(() => (searching ? searchDocs(query) : []), [query, searching]);
+  const results = useMemo<SearchResult[]>(
+    () => (searching ? searchDocs(query, isAdmin) : []),
+    [query, searching, isAdmin],
+  );
 
   // `/` focuses the box from anywhere on the index (unless already typing in a
   // field); `Escape` clears the query.
@@ -119,7 +142,11 @@ export function Docs() {
               <ul className="space-y-3">
                 {results.map(({ doc, snippet, ranges }) => (
                   <li key={doc.slug}>
-                    <DocCard title={doc.meta.title || doc.slug} slug={doc.slug}>
+                    <DocCard
+                      title={doc.meta.title || doc.slug}
+                      slug={doc.slug}
+                      operator={doc.meta.audience === "operator"}
+                    >
                       {snippet && (
                         <p className="mt-1 text-sm text-muted">
                           <Highlighted text={snippet} ranges={ranges} />
@@ -137,15 +164,37 @@ export function Docs() {
           <p className="text-sm text-faint">No howtos published yet.</p>
         </Card>
       ) : (
-        <ul className="space-y-3">
-          {docs.map((doc) => (
-            <li key={doc.slug}>
-              <DocCard title={doc.meta.title || doc.slug} slug={doc.slug}>
-                {doc.summary && <p className="mt-1 text-sm text-muted">{doc.summary}</p>}
-              </DocCard>
-            </li>
-          ))}
-        </ul>
+        <>
+          <ul className="space-y-3">
+            {docs.map((doc) => (
+              <li key={doc.slug}>
+                <DocCard title={doc.meta.title || doc.slug} slug={doc.slug}>
+                  {doc.summary && <p className="mt-1 text-sm text-muted">{doc.summary}</p>}
+                </DocCard>
+              </li>
+            ))}
+          </ul>
+
+          {operatorDocs.length > 0 && (
+            <section className="space-y-3">
+              <div>
+                <h2 className="text-lg font-semibold">Admin / operator</h2>
+                <p className="mt-1 text-sm text-muted">
+                  Operator setup guides — visible to admins.
+                </p>
+              </div>
+              <ul className="space-y-3">
+                {operatorDocs.map((doc) => (
+                  <li key={doc.slug}>
+                    <DocCard title={doc.meta.title || doc.slug} slug={doc.slug} operator>
+                      {doc.summary && <p className="mt-1 text-sm text-muted">{doc.summary}</p>}
+                    </DocCard>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+        </>
       )}
     </div>
   );

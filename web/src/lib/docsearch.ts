@@ -1,14 +1,16 @@
-// Client-side full-text search over the bundled `audience: user` docs. The
-// docs viewer already ships every page body as a raw string (see docs.ts), so
-// search needs no API, no service, and no new dependency — 11 short pages held
-// in memory, scanned with plain substring loops.
+// Client-side full-text search over the bundled in-app docs. The docs viewer
+// already ships every page body as a raw string (see docs.ts), so search needs
+// no API, no service, and no new dependency — a handful of short pages held in
+// memory, scanned with plain substring loops. The corpus is role-aware
+// (issue #75 M1): a non-admin searches the `audience: user` pages, an admin
+// searches the operator pages too (`docsForIndex`).
 //
 // The pure core (`buildIndex` + `searchIndex`) is decoupled from the real corpus
 // the same way docs.ts splits `resolveHref` (pure) from `rewriteHref` (bound):
 // tests drive `searchIndex` with synthetic fixtures, `searchDocs` binds it to
-// `listUserDocs()`.
+// `docsForIndex(isAdmin)`.
 
-import { listUserDocs, type Doc } from "./docs";
+import { docsForIndex, type Doc } from "./docs";
 
 // A query shorter than this shows the normal index instead of searching — a
 // single character matches almost everything and is never a real query. Applied
@@ -217,12 +219,20 @@ export function searchIndex(index: IndexedDoc[], query: string): SearchResult[] 
   });
 }
 
-// Built once — the corpus is fixed for the life of the bundle.
-let cachedIndex: IndexedDoc[] | null = null;
+// Built once per role — each corpus is fixed for the life of the bundle, so a
+// user session and an admin session each build their index a single time. The
+// admin corpus adds the operator pages the non-admin corpus omits.
+let cachedUserIndex: IndexedDoc[] | null = null;
+let cachedAdminIndex: IndexedDoc[] | null = null;
 
-// Bound to the docs actually bundled in this build (the same `audience: user`
-// pages the index lists).
-export function searchDocs(query: string): SearchResult[] {
-  if (!cachedIndex) cachedIndex = buildIndex(listUserDocs());
-  return searchIndex(cachedIndex, query);
+// Bound to the docs actually bundled in this build: the same pages the index
+// lists for this viewer (user pages for everyone, operator pages too for an
+// admin).
+export function searchDocs(query: string, isAdmin: boolean): SearchResult[] {
+  if (isAdmin) {
+    if (!cachedAdminIndex) cachedAdminIndex = buildIndex(docsForIndex(true));
+    return searchIndex(cachedAdminIndex, query);
+  }
+  if (!cachedUserIndex) cachedUserIndex = buildIndex(docsForIndex(false));
+  return searchIndex(cachedUserIndex, query);
 }

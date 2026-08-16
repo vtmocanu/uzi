@@ -1,5 +1,6 @@
 ---
 title: OIDC single sign-on
+order: 30
 audience: operator
 ---
 

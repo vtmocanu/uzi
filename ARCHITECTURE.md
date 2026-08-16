@@ -992,25 +992,32 @@ add a page, and the PRD (`prds/done/7-docs-section-webui.md`) for the design
 rationale.
 
 - **Audience-gated visibility.** Every doc carries a leading-fence
-  frontmatter block (`title`, `order`, `audience`); only `audience: user`
-  pages are listed and routable at `/docs/:slug`, ordered by `order`.
-  `operator`/`design`/`contributor` pages (and anything with missing or
-  malformed frontmatter) stay repo-only, so adding a page is self-describing
-  and never touches `web/` code.
+  frontmatter block (`title`, `order`, `audience`); `audience` decides where a
+  page appears (see the role-aware index below), ordered by `order`.
+  `design`/`contributor` pages (and anything with missing or malformed
+  frontmatter) stay repo-only, so adding a page is self-describing and never
+  touches `web/` code.
 - **No new trust boundary.** `/docs` is public (no auth) — the content is
   non-secret and already world-readable in the repo, and onboarding docs are
   needed before a user can do anything else. `react-markdown` renders
   without `rehype-raw`, so raw HTML in a doc stays inert rather than needing
   a sanitizer; content is repo-reviewed, not user- or model-supplied.
-- **Link rewriting.** A relative link to another bundled `user` page becomes
-  an in-app route (`/docs/:slug`); a link to a repo-only file (`../plan.md`,
-  a `design`/`operator` doc) rewrites to the pinned GitLab blob URL instead.
+- **Role-aware index (issue #75).** `audience: user` pages are listed, routed
+  and searched for everyone; `audience: operator` pages additionally for admins
+  (`me.is_admin`), in an "Admin / operator" section. Presentation-only, not a
+  trust boundary: every `docs/*.md` is already eager-bundled to every browser, so
+  the `is_admin` gate filters the index/routing/search, not what is downloaded.
+- **Link rewriting.** A relative link to another in-app-routable page becomes an
+  in-app route (`/docs/:slug`) — `user` pages for everyone, `operator` pages for
+  admins (`rewriteHref(href, isAdmin)`); a link to a repo-only file (`../plan.md`,
+  a `design`/`contributor` doc) rewrites to the pinned GitLab blob URL instead.
   `#anchor` fragments are preserved either way.
 - **Build-time validation gate.** `web/scripts/check-docs.mjs` runs ahead of
-  `npm run build` and fails on missing/invalid frontmatter, a duplicate
-  `order` among `user` pages, a broken relative link (doc→doc or doc→img),
-  reference-style links, or an oversized `docs/img/*` file; it warns
-  (without failing) on a `user` page over the 60-line house-style budget.
+  `npm run build` and fails on missing/invalid frontmatter, a missing or
+  duplicate `order` among `user` or `operator` pages (each its own namespace), a
+  broken relative link (doc→doc or doc→img), reference-style links, or an
+  oversized `docs/img/*` file; it warns (without failing) on a `user` page over
+  the 60-line house-style budget.
   It runs both locally (ahead of `npm run build`) and in CI (`validate:web`
   runs `npm run check-docs` too, PRD #52), so a broken doc fails the pipeline as
   well as the local build.
