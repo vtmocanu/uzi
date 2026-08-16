@@ -137,6 +137,20 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   hostile response degrades to skipping that repo's sync rather than crashing
   the api. (#74)
 
+- **Forge-driver pagination is now backstopped against an unbounded-loop DoS
+  (#338).** A semi-trusted (compromised or buggy) connected forge could return a
+  perpetually non-zero next page and drive any driver's paginating list call
+  (projects, labels, issues, label events, pipeline jobs) forever — either
+  growing the accumulator until the shared api OOMs, or spinning on empty pages
+  that never grow it. Every accumulating loop in the gitlab, forgejo and github
+  drivers now enforces two backstops: an item cap (bounds the memory-growth
+  vector) and a page cap (bounds the empty-page spin the item cap would miss).
+  On exceed the driver returns an ERROR, never a truncated slice — a partial
+  fetch that looked complete would let `forgesvc.FullSync` treat it as
+  authoritative and evict cached issues. Both caps are sized far above any real
+  forge list, so only a misbehaving forge hits them. Mirrors the CLI's existing
+  `RunLogs` / `maxLogsMessages` backstop. (#338)
+
 ## [0.39.0] - 2026-08-16
 
 ### Added

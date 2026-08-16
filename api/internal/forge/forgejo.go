@@ -194,7 +194,9 @@ func (f *forgejo) ListProjects(ctx context.Context) ([]Project, error) {
 	// client-side: the picker only offers repos the bot can actually push to.
 	opt := gitea.ListReposOptions{ListOptions: gitea.ListOptions{Page: 1, PageSize: forgejoPerPage}}
 	var out []Project
+	page := 0
 	for {
+		page++
 		repos, resp, err := c.ListMyRepos(opt)
 		if err != nil {
 			return nil, f.redact.error(fmt.Errorf("forgejo: list projects: %w", err))
@@ -210,8 +212,14 @@ func (f *forgejo) ListProjects(ctx context.Context) ([]Project, error) {
 				DefaultBranch:     r.DefaultBranch,
 			})
 		}
+		if len(out) > maxForgeItems {
+			return nil, f.redact.error(fmt.Errorf("forgejo: list projects: %w", forgePaginationCapErr("item", maxForgeItems)))
+		}
 		if resp.NextPage == 0 {
 			break
+		}
+		if page >= maxForgePages {
+			return nil, f.redact.error(fmt.Errorf("forgejo: list projects: %w", forgePaginationCapErr("page", maxForgePages)))
 		}
 		opt.Page = resp.NextPage
 	}
@@ -244,14 +252,22 @@ func (f *forgejo) ListLabels(ctx context.Context, projectID int64) ([]Label, err
 func (f *forgejo) listRepoLabels(c *gitea.Client, slug repoSlug) ([]*gitea.Label, error) {
 	opt := gitea.ListLabelsOptions{ListOptions: gitea.ListOptions{Page: 1, PageSize: forgejoPerPage}}
 	var out []*gitea.Label
+	page := 0
 	for {
+		page++
 		labels, resp, err := c.ListRepoLabels(slug.owner, slug.repo, opt)
 		if err != nil {
 			return nil, f.redact.error(fmt.Errorf("forgejo: list labels: %w", err))
 		}
 		out = append(out, labels...)
+		if len(out) > maxForgeItems {
+			return nil, f.redact.error(fmt.Errorf("forgejo: list labels: %w", forgePaginationCapErr("item", maxForgeItems)))
+		}
 		if resp.NextPage == 0 {
 			break
+		}
+		if page >= maxForgePages {
+			return nil, f.redact.error(fmt.Errorf("forgejo: list labels: %w", forgePaginationCapErr("page", maxForgePages)))
 		}
 		opt.Page = resp.NextPage
 	}
@@ -324,7 +340,9 @@ func (f *forgejo) ListIssues(ctx context.Context, projectID int64, opts ListIssu
 		opt.Since = *opts.UpdatedAfter
 	}
 	var out []Issue
+	page := 0
 	for {
+		page++
 		issues, resp, err := c.ListRepoIssues(slug.owner, slug.repo, opt)
 		if err != nil {
 			return nil, f.redact.error(fmt.Errorf("forgejo: list issues: %w", err))
@@ -340,8 +358,14 @@ func (f *forgejo) ListIssues(ctx context.Context, projectID int64, opts ListIssu
 				return out, nil
 			}
 		}
+		if len(out) > maxForgeItems {
+			return nil, f.redact.error(fmt.Errorf("forgejo: list issues: %w", forgePaginationCapErr("item", maxForgeItems)))
+		}
 		if resp.NextPage == 0 {
 			break
+		}
+		if page >= maxForgePages {
+			return nil, f.redact.error(fmt.Errorf("forgejo: list issues: %w", forgePaginationCapErr("page", maxForgePages)))
 		}
 		opt.Page = resp.NextPage
 	}
@@ -489,7 +513,9 @@ func (f *forgejo) issueLabelNames(c *gitea.Client, slug repoSlug, issueIID int64
 	opt := gitea.ListLabelsOptions{ListOptions: gitea.ListOptions{Page: 1, PageSize: forgejoPerPage}}
 	names := map[string]struct{}{}
 	ids := map[string]int64{}
+	page := 0
 	for {
+		page++
 		labels, resp, err := c.GetIssueLabels(slug.owner, slug.repo, issueIID, opt)
 		if err != nil {
 			return nil, nil, f.redact.error(fmt.Errorf("forgejo: list issue labels: %w", err))
@@ -498,8 +524,14 @@ func (f *forgejo) issueLabelNames(c *gitea.Client, slug repoSlug, issueIID int64
 			names[l.Name] = struct{}{}
 			ids[l.Name] = l.ID
 		}
+		if len(names) > maxForgeItems {
+			return nil, nil, f.redact.error(fmt.Errorf("forgejo: list issue labels: %w", forgePaginationCapErr("item", maxForgeItems)))
+		}
 		if resp.NextPage == 0 {
 			break
+		}
+		if page >= maxForgePages {
+			return nil, nil, f.redact.error(fmt.Errorf("forgejo: list issue labels: %w", forgePaginationCapErr("page", maxForgePages)))
 		}
 		opt.Page = resp.NextPage
 	}
@@ -854,9 +886,15 @@ func (f *forgejo) ListIssueLabelEvents(ctx context.Context, projectID, issueIID 
 			}
 			out = append(out, ev)
 		}
+		if len(out) > maxForgeItems {
+			return nil, f.redact.error(fmt.Errorf("forgejo: list issue label events: %w", forgePaginationCapErr("item", maxForgeItems)))
+		}
 		// The timeline is chronological (oldest first), matching the GitLab driver.
 		if len(entries) < forgejoPerPage {
 			break
+		}
+		if page >= maxForgePages {
+			return nil, f.redact.error(fmt.Errorf("forgejo: list issue label events: %w", forgePaginationCapErr("page", maxForgePages)))
 		}
 	}
 	return out, nil
@@ -947,6 +985,9 @@ func (f *forgejo) TokenInfo(ctx context.Context) (TokenInfo, error) {
 		}
 		if len(tokens) < forgejoPerPage {
 			break
+		}
+		if page >= maxForgePages {
+			return TokenInfo{}, f.redact.error(fmt.Errorf("forgejo: token info: %w", forgePaginationCapErr("page", maxForgePages)))
 		}
 	}
 	if matches == 1 {
