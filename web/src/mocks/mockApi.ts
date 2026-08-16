@@ -1000,17 +1000,19 @@ const slackSecrets: Record<string, boolean> = { slack_bot_token: false, slack_ap
 // The current user's Slack linking state (PRD #25 M3). The demo starts unlinked;
 // setting an override moves it to "pending" (a real deployment would then DM the
 // target a Confirm card), and there is no inbound socket here to confirm it.
-let slackLink: Omit<SlackLink, "state"> = { member_id: null, notify: true, resolved_id: null, confirmed: false };
+let slackLink: Omit<SlackLink, "state" | "workspace"> = { member_id: null, notify: true, resolved_id: null, confirmed: false };
 
 // slackLinkResponse derives the state field the real API returns, so the mock and
 // the server never disagree on how member_id/resolved_id/confirmed map to a state.
+// workspace mirrors the admin slack_status: the demo has no real socket, so Slack
+// is always "disabled" (see settingsResponse), which maps to "unconfigured" here.
 function slackLinkResponse(): { slack: SlackLink } {
   const state: SlackLink["state"] = !slackLink.resolved_id
     ? "unlinked"
     : slackLink.confirmed
       ? "confirmed"
       : "pending";
-  return { slack: { ...slackLink, state } };
+  return { slack: { ...slackLink, state, workspace: "unconfigured" } };
 }
 
 // settingsResponse builds the admin SettingsResponse from the mock's current

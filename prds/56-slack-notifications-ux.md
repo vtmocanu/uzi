@@ -145,19 +145,19 @@ said why.
 
 ## Milestones
 
-- [ ] **M1 — API: `workspace` on the link DTO**: `publicSlackState()` helper +
+- [x] **M1 — API: `workspace` on the link DTO**: `publicSlackState()` helper +
   DTO field + wiring in `writeSlackLink`; table test over all five manager
   states (incl. nil manager → `unconfigured`); existing slack handler tests
   extended. Validation: `curl /api/me/slack` on a token-less stack returns
   `"workspace":"unconfigured"`.
-- [ ] **M2 — Web: self-explaining card states**: Decision 3 rendering,
+- [x] **M2 — Web: self-explaining card states**: Decision 3 rendering,
   `mockApi.ts` type + injection update (Decision 5), vitest via per-test
   `vi.mock` stubs for the state branches (alert shown; controls disabled only
   in `unconfigured`; workspace alert composes above the link-state helper;
   hint under disabled test-DM; pending helper; test-DM during `error`
   surfaces the 502 message); `npm run typecheck` green. Validation: the
   mock's four rendered states reproduced in demo mode / tests.
-- [ ] **M3 — Docs + specs**: `docs/slack.md` paragraph (check-docs green),
+- [x] **M3 — Docs + specs**: `docs/slack.md` paragraph (check-docs green),
   `specs/ai.md` decisions + residual. Validation: `/docs/slack` renders the
   new paragraph in-app.
 - [ ] **M4 — Release: version bump + tag + argo deploy + verify on

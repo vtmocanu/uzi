@@ -20822,7 +20822,67 @@ See [prds/325-tui-redesign.md](../prds/325-tui-redesign.md) for the milestone/de
 the review-wave amendments; §368-§372 for the PRD #112 base this builds on (D7 §371, D8 ownership
 §372, package layout §370).
 
-## 542. PRD #318 — the COLUMNS editor reorders by grip-drag, and the ↑/↓ arrows are DROPPED (owner override), taking the keyboard/touch path with them
+## 542. PRD #56 — Slack workspace state surfaced on the self-service `/me/slack` DTO: a four-value public collapse, alert-first UI, zero contract change
+
+Extends the PRD #25 Slack integration (§142-§149) so a non-admin user can see *why* DMs can't
+send. Before this, the Settings → Notifications card rendered identically whether the instance had
+Slack configured or not; the manager connection state (`slacksvc.Manager.State()`, §142) was exposed
+only on admin surfaces. Blast radius: one added DTO field + card rendering; no migration, no query,
+no new route, no notification-path change.
+
+- **`workspace` rides the existing `/me/slack` link DTO — no new endpoint, no polling.** A
+  server-derived non-secret string is added to the GET and both PUT responses through the single
+  renderer `writeSlackLink` ("the GET and the PUTs never drift"). `writeSlackLink` has no receiver,
+  so the value is threaded as a new `workspace string` parameter at its three call sites, each
+  passing the collapsed state. It stays a pure computed field — no DB or network read, recomputed
+  each request from in-memory manager state. The card reads it once on mount; PUT responses carry it
+  for free (the component replaces the whole link object on write). A per-user poll or WS push was
+  rejected as disproportionate — workspace state changes rarely, and an admin fixing Slack is
+  noticed on the next page view. The admin chip's dedicated `GET /api/admin/slack/status` poll is
+  unaffected.
+- **Five live manager states collapse to four public values; error CLASS never leaks to
+  non-admins.** `publicSlackState` maps: `disabled`→`unconfigured`, `connecting`→`connecting`,
+  `connected`→`connected`, `error:auth`/`error:connection`→`error`. Unknown/empty fails safe to
+  `unconfigured`. Whether the admin's token was rejected vs. a network drop is an admin-only
+  diagnostic that stays on the admin DTO; non-admins see only "Slack isn't available right now".
+  Built on the existing nil-manager-safe `h.slackState()` (returns `disabled` when Slack was never
+  wired). Table-tested over all five states plus nil manager.
+- **UI is derived from `workspace × link.state`, alert-first and COMPOSING (the two axes do not
+  replace each other).** The workspace alert renders *above* whatever link-state helper applies (a
+  confirmed user during a reconnect sees the reconnecting alert over an otherwise-normal card).
+  `unconfigured` disables all card controls (notify toggle, override input, both buttons) and shows
+  an ask-an-admin info alert — the card stays visible because hiding it would make the feature
+  undiscoverable. `connecting`/`error` show softer copy but keep controls ENABLED: the backend
+  accepts writes regardless, so a transient socket blip must not lock a user out of flipping their
+  toggle. `connected`+unlinked/pending keep the current layout plus a why-disabled / check-Slack
+  hint line. `connected`+confirmed is byte-identical to before. Reuses the existing `Alert`
+  component and muted text classes — no new components.
+- **Disabling in `unconfigured` is UI-only; the API contract is untouched.** `PUT /me/slack/notify`
+  and `/me/slack/override` keep accepting writes on an unconfigured instance (plain DB writes; the
+  confirmation-DM send is already best-effort, §146). No new server-side coupling between the
+  settings write path and socket state — a pre-set override simply activates when an admin later
+  connects Slack. The UI disables the controls anyway because inviting input that can have no
+  visible effect for possibly weeks is worse UX than a clear "not available yet".
+- **Test surface: extend, don't fork.** Go handler tests assert individual DTO fields (not exact
+  JSON), so the added field is non-breaking; they gain `workspace` assertions. `mockApi.ts` (the
+  demo backend, not the test harness) persists `Omit<SlackLink, "state" | "workspace">` — workspace
+  is server-derived, never persisted — and injects it in `slackLinkResponse()` consistently with its
+  admin-side `slack_status: "disabled"`, so demo mode shows `unconfigured`. Web state branches are
+  exercised via per-test `vi.mock` stubs.
+
+**Accepted residual — coarse health oracle for non-admins.** This is the first non-admin exposure of
+any derivative of the live Slack socket state: an authenticated user can poll `GET /api/me/slack` and
+observe `connected → error → connecting` transitions. It exposes four values only — no token/URL, no
+auth-vs-network class — consistent with the trusted-team posture already recorded for this route
+(§145). Deliberate and accepted. (Two further deliberate residuals — UI copy naming "Admin Settings →
+Slack" to non-admins, and the test-DM button staying clickable during `error` and surfacing a
+backend 502 — are recorded in the PRD.)
+
+See [prds/56-slack-notifications-ux.md](../prds/56-slack-notifications-ux.md) for the milestone/
+decision/residual record; §142-§149 for the PRD #25 Slack base this extends (manager/state §142,
+identity-authz §145, notifier §146).
+
+## 543. PRD #318 — the COLUMNS editor reorders by grip-drag, and the ↑/↓ arrows are DROPPED (owner override), taking the keyboard/touch path with them
 
 The board Settings → **COLUMNS** editor (`ColumnSettings` in `web/src/pages/Board.tsx`)
 reorders by dragging a **6-dot grip handle**, replacing the per-row **↑/↓ arrow buttons**.
