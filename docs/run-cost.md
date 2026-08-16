@@ -18,7 +18,7 @@ names them, then asks the harder question: is the cheaper run as good?
 `override_subagent_model` (added by migration `00119_schedule_run_override_subagent_model.sql`,
 PRD #305) defaults to `false` on both `run_schedules` and `runs`, meaning a
 subagent's own pinned model wins unless a schedule opts in to overriding it.
-Ten of the eleven builtin role templates under `api/internal/agenttmpl/builtins/`
+Eleven of the twelve builtin role templates under `api/internal/agenttmpl/builtins/`
 pin `model: opus`; only `documenter` pins `sonnet`. A local agent-team session
 run against the same repo, on a subscription defaulted to Opus, is spending
 the same tier for the same role. If a hosted run reads cheaper, it is not

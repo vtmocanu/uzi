@@ -60,7 +60,7 @@ import (
 // THE METRIC IS RECORDED HERE BECAUSE RE-DERIVING IT COST MORE THAN UPDATING IT.
 // It is occurrences of the literal "SendMessage to `main`", counted with line
 // wrapping normalized away, over `builtins/*.md`. That is NOT what the loop below
-// iterates — that one counts FILES mentioning SendMessage (10 of 11) — and it is
+// iterates — that one counts FILES mentioning SendMessage (11 of 12) — and it is
 // not a raw `SendMessage` grep either, which returns 32 at `86c43fcd` where this
 // paragraph says 23. Both plausible readings give the wrong number, and a reader
 // who picks one concludes the paragraph is simply wrong rather than that they
@@ -367,7 +367,7 @@ func TestBuiltinsNameTheRecipientTheyCanActuallyReach(t *testing.T) {
 	//
 	// The bar is DERIVED from the roster rather than hardcoded, and that was
 	// measured: a literal floor of 5 left half the roster of headroom, so
-	// stripping five builtins kept this control silent. Ten of the eleven mention
+	// stripping five builtins kept this control silent. Eleven of the twelve mention
 	// SendMessage today — `lead` is the exception, because it runs on the main
 	// thread and has nobody to report to — so a floor of len-2 leaves exactly one
 	// role of slack for a future role that legitimately never reports, and grows

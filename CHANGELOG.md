@@ -4,6 +4,18 @@ Notable changes to uzi, loosely following [Keep a Changelog](https://keepachange
 Versions are release git tags (`deploy/chart/Chart.yaml`'s `version`/`appVersion`, Model B) — this
 file is not bumped per-commit; `[Unreleased]` collects everything since the last tag.
 
+## [Unreleased]
+
+### Added
+
+- **`ux-designer` builtin agent template (#314).** uzi now ships a twelfth
+  builtin role: a build-capable UX/UI design lead that sets opinionated visual
+  and information-architecture direction, implements the frontend/UI (including
+  mock/demo state), and validates it in a real browser — distinct from the
+  read-only `web-ux` validator. It runs on `opus` and inherits the full
+  toolset. Boot-seeded via `ReconcileBuiltinTemplates`; existing installs pick
+  it up on the next boot. (#314)
+
 ## [0.39.0] - 2026-08-16
 
 ### Added

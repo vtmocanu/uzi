@@ -27,7 +27,7 @@ additionally publish a **Global** one for everyone. `lead` and
 
 ## Builtin roles
 
-uzi seeds eleven builtin templates:
+uzi seeds twelve builtin templates:
 
 | Name | What it does |
 |---|---|
@@ -42,6 +42,7 @@ uzi seeds eleven builtin templates:
 | `spec-keeper` | Keeps `specs/` in sync with implementation work. |
 | `researcher` | Investigates the codebase or external sources to gather context; reports findings only. |
 | `web-ux` | Validates web interfaces in a real browser (agent-browser), reviewing UX, accessibility, and visual consistency; reports findings only. |
+| `ux-designer` | Sets opinionated visual and information-architecture direction, then builds and browser-validates the frontend/UI; owns the design layer and defers backend logic to the coder. |
 
 The `lead` is the orchestrator: the main agent thread. It runs on `opus`
 by default unless you set a personal override in
