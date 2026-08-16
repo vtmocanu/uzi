@@ -17008,15 +17008,23 @@ its own header rather than deferring to a doc.
   agent test: on an empty `sent` the optional chain threw a `TypeError` instead of failing an
   assertion. Same coverage, readable failure. The rule's advice to *read it before fixing it*
   is the durable half — a lint sweep is the wrong place to change behaviour by accident.
-- **🔴 Two `react-hooks/exhaustive-deps` findings are SUPPRESSED rather than fixed, and the
-  ruling is a CONSISTENCY argument, not a convenience.** Adding a dependency changes identity
-  churn and therefore when downstream effects re-run — on a first-load effect that is a
-  behavioural change to page load, not a lint fix. **That is the same argument M3's scope
-  ruling uses to exclude the 119 type-aware `onClick={asyncHandler}` findings**, and admitting
-  these two while excluding those would be inconsistent. Both carry the reason at the site and
-  a pointer to issue #200 for the behavioural review. The general form: **a tooling milestone
-  may not change runtime behaviour under cover of a lint fix**, which is also why type-aware
-  linting (`oxlint-tsgolint`) and the React Compiler rule family are out of scope here — the
+- **🔴 M3 SUPPRESSED two `react-hooks/exhaustive-deps` findings on a CONSISTENCY argument, and
+  issue #200 then RESOLVED both as fixes once each was examined on its own.** M3's reasoning was
+  that adding a dependency changes identity churn and therefore when downstream effects re-run —
+  on a first-load effect that is a behavioural change to page load, not a lint fix — **the same
+  argument M3's scope ruling uses to exclude the 119 type-aware `onClick={asyncHandler}`
+  findings**; admitting these two while excluding those would have been inconsistent, so M3
+  deferred them to #200 rather than deciding under a tooling milestone. #200's finding: at both
+  sites the dependency the rule actually wants is INERT, so the fix carries no behavioural
+  change. Dashboard's first-load effect lists `user?.is_admin` (a stable *boolean*, not the
+  `user` object — `ProtectedRoute` renders the page only after auth resolves, so is_admin holds
+  its final value at mount; adding the whole `user` object WOULD have churned on every refresh,
+  which is the behavioural change M3 was right to refuse). WorkersSettings' `rebind` lists
+  `announce`, a stable `useCallback([])` wrapper whose identity never changes. Both disable
+  directives are removed. So the general form still holds — **a tooling milestone may not change
+  runtime behaviour under cover of a lint fix** — but a follow-up issue with room to reason
+  per-site could show the requested dependency was inert all along; that is also why type-aware
+  linting (`oxlint-tsgolint`) and the React Compiler rule family stayed out of M3's scope — the
   latter because this repo is on React 18.3.1 and does not run the compiler.
 
 ## 470. PRD #103 M3 — where the checks are WIRED: an asymmetric CI shape, gate ordering that differs by component, and two anchor lists that turned out not to be a membership rule

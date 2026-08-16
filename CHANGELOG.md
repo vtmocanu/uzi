@@ -29,6 +29,15 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   it up on the next boot. (#314)
 ### Fixed
 
+- **The two `react-hooks/exhaustive-deps` suppressions PRD #103 M3 deferred are
+  resolved as fixes, not baselined (#200).** Dashboard's first-load effect now
+  lists `user?.is_admin` and WorkersSettings' `rebind` callback now lists
+  `announce`; both `// eslint-disable-next-line` directives are removed. Each
+  added dependency is inert — `announce` is a stable `useCallback([])` wrapper,
+  and `user?.is_admin` is a stable boolean because `ProtectedRoute` renders the
+  page only after auth resolves — so neither changes runtime behaviour, which is
+  why the fix (rather than a permanent suppression) was the honest outcome. (#200)
+
 - **A completed run with an opened MR is no longer recorded as a total loss
   (#329).** The run-timeout sweeper and the worker's completion report could
   race: when the sweeper's `RUN_TIMEOUT` write landed first, it clobbered the
