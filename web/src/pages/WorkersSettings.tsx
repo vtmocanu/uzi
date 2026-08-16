@@ -222,7 +222,7 @@ export function WorkersSettings() {
       // announcement is feedback AFTER the act, not friction before it, so it costs no
       // clicks and takes nothing back from the asymmetry the confirmation buys. A row
       // that silently vanishes is poor feedback whichever kind it was.
-      announce(`Deleted ${name ?? "worker"}.`);
+      announce(`Deleted ${stripUnsafeChars(name ?? "worker")}.`);
       await load();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to delete worker");
@@ -306,7 +306,14 @@ export function WorkersSettings() {
               with no cross-tenant path and nothing stored-then-surprising. The worker
               LIST renders names created at any time, and the admin view renders other
               people's. Fixed anyway because it is the same class and the same one-word
-              fix. */}
+              fix.
+
+              The announce() strings are escaped and injection-free; the
+              rebind/provisioning ones lean on their visible list counterpart being
+              sanitized. The delete-success announcement (#173) was the ONE where that
+              lean did not hold — by construction, the row it names is already deleted, so
+              no visible counterpart survives — so it is now itself passed through
+              stripUnsafeChars (remove(), above). Recorded so nobody re-derives it. */}
           <SectionTitle className="text-ok">Join token for “{stripUnsafeChars(newToken.worker)}”</SectionTitle>
           <p className="text-sm text-muted">
             Copy it now — it is shown once and never again (only its hash is stored). Set it as{" "}

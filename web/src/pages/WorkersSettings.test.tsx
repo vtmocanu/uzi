@@ -576,6 +576,27 @@ describe("WorkersSettings announces what just happened (PRD #58 findings 10 + 11
     await waitFor(() => expect(document.activeElement).toBe(msg.parentElement));
   });
 
+  it("strips bidi/zero-width characters out of the delete announcement (#173)", async () => {
+    // The delete-success live region is the ONLY channel confirming the destructive act
+    // to a screen-reader user, and the row it names is already gone — so unlike the list
+    // name there is no surviving visible counterpart to sanitize against. A self-authored
+    // name carrying U+202E/U+200B must land in the announcement already cleaned.
+    const spoofed = aWorker({ id: "w-spoof", name: "base \u202E(M)\u200B", kind: "hosted", hosted_size: "m" });
+    mockApi.listWorkers.mockResolvedValue({ workers: [spoofed] });
+    mockApi.deleteWorker.mockResolvedValue(null);
+    const { container } = renderPage();
+    await screen.findByRole("button", { name: "Delete" });
+
+    mockApi.listWorkers.mockResolvedValue({ workers: [] }); // gone after the delete
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete anyway" }));
+
+    // The readable name survives with the control chars removed (fails on the raw
+    // interpolation, which would announce "Deleted base \u202E(M)\u200B.").
+    expect(await screen.findByText("Deleted base (M).")).toBeTruthy();
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+  });
+
   it("re-announces when two identically-named workers are deleted in turn", async () => {
     // Derived names are NOT unique — "base (S)" twice is exactly what a quota of 2
     // produces. The slot holds an OBJECT, so every announcement is a value the focus
