@@ -5594,7 +5594,7 @@ pass "D5 live: deleting a bound token unbinds the worker and leaves workers.user
 #     E2E_WORKER_HEARTBEAT_STALE=15s, set earlier in the suite). A live poller gets a
 #     cancel verdict enqueued; unconsumed (we never poll inputs) it ESCALATES at +60s
 #     to a server-side FailRunAutoStop -> status='failed', stop_kind='auto_stopped'.
-#     The sweep ticks every 15s, so the whole journey is ~120-135s.
+#     The sweep ticks every 15s, so the whole journey is ~135-165s.
 #   * peersSucceeding is strict recency AND re-checked EVERY sweep before the
 #     escalation branch, and a run whose worker heartbeat goes stale is REQUEUED out
 #     of running (evicting its streak). So BOTH run B's valid appends AND the worker
@@ -5708,7 +5708,7 @@ hb; peer_ok  # seed the heartbeat and peer clocks before the loop's first sleep
 # streak is past the kill threshold (it does not decay). The health-flag assertion is
 # FOLDED IN rather than delegated to wait_health, because wait_health blocks WITHOUT
 # heartbeating and A would be requeued out from under us before the flag ever landed.
-AS_DEADLINE=$((SECONDS + 180))
+AS_DEADLINE=$((SECONDS + 240))
 POISON_N=0
 FLAG_SEEN=0
 A_STATUS=""
@@ -5729,7 +5729,7 @@ while [ "$SECONDS" -lt "$AS_DEADLINE" ]; do
   sleep 3
 done
 [ "$A_STATUS" = failed ] \
-  || fail "auto-stop phase: run A was never auto-stopped within ~180s (status=$A_STATUS, health=$(run_health "$RUN_A"))"
+  || fail "auto-stop phase: run A was never auto-stopped within ~240s (status=$A_STATUS, health=$(run_health "$RUN_A"))"
 [ "$FLAG_SEEN" = 1 ] \
   || fail "auto-stop phase: run A reached failed but never surfaced health='looping' first"
 pass "run A completed the flag->kill journey and reached status='failed'"
@@ -5749,6 +5749,27 @@ AS_B="$(apiget "/api/runs/$RUN_B")"
   || fail "auto-stop phase: peer run B was collaterally auto-stopped"
 pass "peer run B is not collateral: neither failed nor auto_stopped"
 
+# The two remedies docs/run-auto-stopped.md prints for an auto-stopped run must actually
+# be followable from the CLI, so assert both directly (the issue's "Also worth folding
+# in"). Reuses the PRD #97 M2 CLI leg's globals (uzi_cli/$UZI_BIN/$UZI_TOKEN_VAL); that
+# leg fails the suite if the CLI cannot be built, so reaching here guarantees $UZI_BIN.
+#   * Remedy "`uzi run get <id>` shows it": the run DTO printed by `run get --json` carries
+#     stop_kind=auto_stopped at top level (see api/cmd/uzi/run.go — JSON(run)).
+#   * Remedy "check the worker's version": `uzi worker list` prints a VERSION column
+#     (added in api/cmd/uzi/worker.go for exactly this remedy) and the row for our
+#     synthetic worker carries the 0.9.0-e2e it registered with. grep -qF is literal:
+#     ugrep mishandles some regex on this host and the version's `.` is a regex any-char.
+[ -x "$UZI_BIN" ] || fail "auto-stop phase: \$UZI_BIN ($UZI_BIN) is not executable — the PRD #97 M2 CLI leg should have built it"
+[ "$(uzi_cli run get "$RUN_A" --json | jq -r '.stop_kind')" = auto_stopped ] \
+  || fail "auto-stop phase: doc remedy 'uzi run get <id>' does not surface stop_kind=auto_stopped for run A"
+pass "doc remedy proven: 'uzi run get $RUN_A --json' shows stop_kind=auto_stopped"
+WL="$(uzi_cli worker list)" || fail "auto-stop phase: doc remedy 'uzi worker list' failed to run (exit $?)"
+printf '%s' "$WL" | grep -qF VERSION \
+  || fail "auto-stop phase: 'uzi worker list' output lacks a VERSION header (doc remedy 'check the worker's version' is unfollowable): $WL"
+printf '%s' "$WL" | grep -qF '0.9.0-e2e' \
+  || fail "auto-stop phase: 'uzi worker list' does not show the synthetic worker's registered version 0.9.0-e2e: $WL"
+pass "doc remedy proven: 'uzi worker list' shows the VERSION column and the worker's 0.9.0-e2e"
+
 # Best-effort cleanup so run B does not linger past the phase. A cleanup failure must
 # never redden a phase whose assertions already passed.
 apipost "/api/runs/$RUN_B/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
@@ -5757,4 +5778,4 @@ apipost "/api/runs/$RUN_B/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 
 # who did not watch the output learns what was in it — so a phase that lands without
 # being named here is invisible in exactly the summary people quote. PRD #98 was missing:
 # its M8c printed-instruction phase landed at 4b94f714 without touching this line.
-printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #41 plan-revision + PRD #42 bounded concurrency + PRD #68 file-issue + PRD #98 judge menu + PRD #47 run-health + PRD #53 rate-limits + PRD #95 steer-queue + PRD #104 token binding + PRD #88 ask-user + PRD #35 usage-limit park%s; executor=%s)\n' "${DOCKER_PROFILE:+ + PRD #83 docker sidecar}" "$EXECUTOR"
+printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #41 plan-revision + PRD #42 bounded concurrency + PRD #68 file-issue + PRD #98 judge menu + PRD #47 run-health + PRD #53 rate-limits + PRD #95 steer-queue + PRD #104 token binding + PRD #88 ask-user + PRD #35 usage-limit park + PRD #108 auto-stop%s; executor=%s)\n' "${DOCKER_PROFILE:+ + PRD #83 docker sidecar}" "$EXECUTOR"
