@@ -21019,4 +21019,6 @@ Builds on §534's `fail_origin`. A genuine completion (the worker opened the MR)
   that opened an MR never reports "MR: none" regardless of its final status. Previously `mr_iid` was
   written only by `SetRunCompleted` (completed-only).
 - **Consequence guarded.** Because a `cancelled` run can now carry `mr_iid`, `ListCIAutofixCandidateRefs`
-  gains a `status <> 'cancelled'` exclusion (§517) so auto-fix never acts on a human-cancelled branch.
+  gains a `status <> 'cancelled'` exclusion (§517) so a human-cancelled run never itself seeds auto-fix
+  (it excludes cancelled *runs*, not branches — an older non-cancelled run on the same branch can still
+  surface via DISTINCT ON).

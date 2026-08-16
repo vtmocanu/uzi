@@ -121,7 +121,7 @@ WITH per_branch AS (
       -- written only by SetRunCompleted (completed-only), so a cancelled run never had
       -- one and was excluded here by construction. ReconcileRunMR now records mr_iid on
       -- a run regardless of terminal status (so the run never reports "MR: none"), which
-      -- would otherwise make a human-cancelled branch an autofix candidate. Excluding
+      -- would otherwise make a human-cancelled run an autofix candidate. Excluding
       -- cancelled here lets DISTINCT ON fall through to an older non-cancelled completed
       -- run on the same branch (the pre-#329 behavior), or yield no candidate.
       AND r.status <> 'cancelled'
@@ -170,9 +170,11 @@ type ListCIAutofixCandidateRefsRow struct {
 //     NEWEST run per branch (DISTINCT ON (r.branch) … ORDER BY r.branch,
 //     r.created_at DESC, mirroring ListWatchedRunRefsForRepo). A branch with no
 //     such run produces no candidate — autofix never acts on a branch uzi does not
-//     own by construction. Cancelled runs are also excluded here (issue #329) so
-//     autofix never acts on a branch a human explicitly cancelled — see the
-//     `r.status <> 'cancelled'` guard in the CTE.
+//     own by construction. Cancelled runs are also excluded here (issue #329) so a
+//     human-cancelled run never itself seeds autofix — see the `r.status <>
+//     'cancelled'` guard in the CTE. (This excludes cancelled RUNS, not branches:
+//     if an older non-cancelled run on the same branch still qualifies, DISTINCT ON
+//     falls through to it and the branch can still surface.)
 //  2. THE DEFAULT-BRANCH / mr_iid GUARD. Autofix must never touch a protected
 //     branch. There is no protected-branch table, so the guard is: the branch is
 //     NOT the repo's default_branch, AND the run carries an mr_iid. Agent MR
