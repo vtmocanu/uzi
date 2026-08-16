@@ -331,6 +331,34 @@ func TestPendingJudgeDTOTags(t *testing.T) {
 	assertTags(t, "PendingJudgeDTO", PendingJudgeDTO{}, "state", "enqueued_at")
 }
 
+// TestIncidentalFindingDTOTags pins the PRD #333 M4 backlog-row shape. finding_id,
+// filed_issue_iid and resolved_at are all omitempty (nil-optional): a display-only
+// coordinate whose evidence was cascaded away carries no finding_id, and an OPEN coordinate
+// carries neither a filed iid nor a resolved_at. The zero-value pin asserts the always-present
+// key set (mirroring how runDTOKeys excludes the omitempty Usage), and the populated pin
+// asserts the three optional keys surface when set.
+func TestIncidentalFindingDTOTags(t *testing.T) {
+	assertTags(t, "IncidentalFindingDTO", IncidentalFindingDTO{},
+		"location", "repo_id", "repo_path", "status", "last_title", "seen_in_runs")
+	id := "f1"
+	iid := int64(7)
+	now := time.Unix(0, 0)
+	full := IncidentalFindingDTO{FindingID: &id, FiledIssueIID: &iid, ResolvedAt: &now}
+	assertTags(t, "IncidentalFindingDTO(full)", full,
+		"finding_id", "location", "repo_id", "repo_path", "status", "last_title",
+		"seen_in_runs", "filed_issue_iid", "resolved_at")
+}
+
+func TestIncidentalFindingBacklogDTOTags(t *testing.T) {
+	assertTags(t, "IncidentalFindingBacklogDTO", IncidentalFindingBacklogDTO{},
+		"bucket", "repo", "run", "open_count", "findings")
+}
+
+func TestIncidentalFindingIssueDraftDTOTags(t *testing.T) {
+	assertTags(t, "IncidentalFindingIssueDraftDTO", IncidentalFindingIssueDraftDTO{},
+		"title", "description", "location", "labels", "provenance")
+}
+
 // TestReviewNullEnvelope pins the GET /api/runs/{id}/review contract that a
 // visible-but-unjudged run returns 200 with BOTH envelope keys present and null, and
 // that a null on either is a valid decode — the CLI/SPA must model review AND

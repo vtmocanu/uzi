@@ -187,6 +187,10 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/auth/oidc/login", noLimiter},
 	{"GET", "/api/chats/", noLimiter},
 	{"GET", "/api/controller/poll", noLimiter},
+	// PRD #333 M4: the Findings backlog read + the issue-draft read. Both are RequireUser
+	// reads with no per-user limiter — owner-scoped, no forge call, no spend → noLimiter.
+	{"GET", "/api/findings/", noLimiter},
+	{"GET", "/api/findings/{id}/issue-draft", noLimiter},
 	{"GET", "/api/forge/config", noLimiter},
 	{"GET", "/api/forge/connections/", noLimiter},
 	{"GET", "/api/forge/connections/{id}/projects", limForge},

@@ -202,15 +202,25 @@ const listFindingsBacklog = `-- name: ListFindingsBacklog :many
 SELECT
     d.user_id                        AS user_id,
     d.repo_id                        AS repo_id,
+    r.path_with_namespace            AS repo_path,
     d.location                       AS location,
     d.status                         AS status,
     d.last_title                     AS last_title,
     d.filed_issue_iid                AS filed_issue_iid,
     d.resolved_at                    AS resolved_at,
-    count(DISTINCT f.run_id)         AS seen_in_runs
+    count(DISTINCT f.run_id)         AS seen_in_runs,
+    latest.id                        AS latest_finding_id
 FROM finding_dispositions d
+JOIN repos r ON r.id = d.repo_id
 LEFT JOIN findings f
     ON f.user_id = d.user_id AND f.repo_id = d.repo_id AND f.location = d.location
+LEFT JOIN findings latest
+    ON latest.user_id = d.user_id AND latest.repo_id = d.repo_id AND latest.location = d.location
+    AND NOT EXISTS (
+        SELECT 1 FROM findings f3
+        WHERE f3.user_id = d.user_id AND f3.repo_id = d.repo_id AND f3.location = d.location
+          AND (f3.created_at, f3.id) > (latest.created_at, latest.id)
+    )
 WHERE d.user_id = $1
   AND ($2::text IS NULL OR d.status = $2::text)
   AND ($3::uuid IS NULL OR d.repo_id = $3::uuid)
@@ -224,7 +234,7 @@ WHERE d.user_id = $1
             AND f2.run_id = $4::uuid
       )
   )
-GROUP BY d.id
+GROUP BY d.id, r.path_with_namespace, latest.id
 ORDER BY d.created_at DESC, d.id DESC
 `
 
@@ -236,14 +246,16 @@ type ListFindingsBacklogParams struct {
 }
 
 type ListFindingsBacklogRow struct {
-	UserID        uuid.UUID          `json:"user_id"`
-	RepoID        uuid.UUID          `json:"repo_id"`
-	Location      string             `json:"location"`
-	Status        string             `json:"status"`
-	LastTitle     string             `json:"last_title"`
-	FiledIssueIid pgtype.Int8        `json:"filed_issue_iid"`
-	ResolvedAt    pgtype.Timestamptz `json:"resolved_at"`
-	SeenInRuns    int64              `json:"seen_in_runs"`
+	UserID          uuid.UUID          `json:"user_id"`
+	RepoID          uuid.UUID          `json:"repo_id"`
+	RepoPath        string             `json:"repo_path"`
+	Location        string             `json:"location"`
+	Status          string             `json:"status"`
+	LastTitle       string             `json:"last_title"`
+	FiledIssueIid   pgtype.Int8        `json:"filed_issue_iid"`
+	ResolvedAt      pgtype.Timestamptz `json:"resolved_at"`
+	SeenInRuns      int64              `json:"seen_in_runs"`
+	LatestFindingID pgtype.UUID        `json:"latest_finding_id"`
 }
 
 // The per-repo Findings backlog (D7, M4), DISPOSITION-DRIVEN so a filed/dismissed
@@ -262,6 +274,24 @@ type ListFindingsBacklogRow struct {
 // by coordinate repo. ?run= is a SEMI-JOIN (EXISTS), not a WHERE on the joined evidence, so
 // anchoring to a run does NOT shrink seen_in_runs — a coordinate arrived at from a run's
 // notification still shows every run it recurs in (the judge run-anchor pattern).
+//
+// repo_path (r.path_with_namespace via an INNER JOIN on repos): the coordinate's repo is
+// rendered/grouped-by everywhere a finding is shown (D3/D8), so the backlog carries the
+// human path, not just the id. repos.repo_id is an FK with ON DELETE CASCADE, so a live
+// disposition always has its repo — the inner JOIN cannot drop a row. It is in the GROUP BY
+// because it is a non-aggregated projection.
+//
+// latest_finding_id: the id of the NEWEST evidence row at the coordinate — the actionable id
+// the web/CLI drive POST /findings/{id}/issue|dismiss on (M5). It MUST type NULLABLE: it is
+// NULL for a filed/dismissed coordinate whose evidence was cascaded away with a deleted run
+// (a display-only, non-actionable row) — which is fine, last_title keeps it legible (D12).
+// sqlc v1.30.0 infers a scalar subquery / derived-table column on findings.id (a NOT NULL
+// PK) as NON-null and emits a bare uuid.UUID that panics scanning that NULL; only a column
+// of a LEFT-JOINED BASE TABLE is inferred nullable. So `latest` is the findings table itself,
+// LEFT JOINed and constrained by a NOT EXISTS to the single newest evidence row per
+// coordinate: no evidence row is strictly greater than the max on (created_at, id) — a total
+// order because id is a unique PK — so exactly one (or, with no evidence, none) matches.
+// latest.id is constant per d.id, so it joins the GROUP BY unchanged.
 func (q *Queries) ListFindingsBacklog(ctx context.Context, arg ListFindingsBacklogParams) ([]ListFindingsBacklogRow, error) {
 	rows, err := q.db.Query(ctx, listFindingsBacklog,
 		arg.UserID,
@@ -279,12 +309,14 @@ func (q *Queries) ListFindingsBacklog(ctx context.Context, arg ListFindingsBackl
 		if err := rows.Scan(
 			&i.UserID,
 			&i.RepoID,
+			&i.RepoPath,
 			&i.Location,
 			&i.Status,
 			&i.LastTitle,
 			&i.FiledIssueIid,
 			&i.ResolvedAt,
 			&i.SeenInRuns,
+			&i.LatestFindingID,
 		); err != nil {
 			return nil, err
 		}

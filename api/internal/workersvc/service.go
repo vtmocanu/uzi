@@ -350,6 +350,11 @@ type Store interface {
 	// row's last_title/hash). CreateFinding derives (user_id, repo_id) from the claimed
 	// run and canonicalises + sanitises the text before any of these run.
 	CountFindingsForRun(ctx context.Context, runID uuid.UUID) (int64, error)
+	// The Findings backlog read (PRD #333 M4, D7/D8): the disposition-driven,
+	// coordinate-deduped backlog and the D8 open-findings meta count. FindingsBacklog
+	// assembles the DTO from these.
+	ListFindingsBacklog(ctx context.Context, arg store.ListFindingsBacklogParams) ([]store.ListFindingsBacklogRow, error)
+	CountOpenFindingsForUser(ctx context.Context, arg store.CountOpenFindingsForUserParams) (int64, error)
 	InsertFinding(ctx context.Context, arg store.InsertFindingParams) (store.IncidentalFinding, error)
 	UpsertOpenDisposition(ctx context.Context, arg store.UpsertOpenDispositionParams) (store.FindingDisposition, error)
 	ReopenDispositionOnHashMismatch(ctx context.Context, arg store.ReopenDispositionOnHashMismatchParams) (int64, error)
