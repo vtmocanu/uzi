@@ -5,7 +5,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // TestRunToDTOMilestones pins how runToDTO surfaces PRD #122 M1's FROZEN list: the

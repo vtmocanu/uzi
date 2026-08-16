@@ -12,8 +12,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
-	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // fakeCountDB is a store.DBTX whose QueryRow scans a fixed int64 — enough to drive
@@ -26,7 +26,7 @@ func (fakeCountDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, err
 func (fakeCountDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
 	return nil, errors.New("fakeCountDB: Query not used")
 }
-func (f fakeCountDB) QueryRow(context.Context, string, ...any) pgx.Row { return fakeCountRow{f.count} }
+func (f fakeCountDB) QueryRow(context.Context, string, ...any) pgx.Row { return fakeCountRow(f) }
 
 type fakeCountRow struct{ count int64 }
 

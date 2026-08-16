@@ -12,7 +12,7 @@ import (
 
 	"github.com/coder/websocket"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
 // The CLOSED frame-type set the hub emits (apitypes.RunEventDTO.Type), plus the

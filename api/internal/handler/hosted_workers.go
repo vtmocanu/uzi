@@ -14,14 +14,14 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/hostedsvc"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/jointoken"
-	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/termsafe"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/workersize"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/workertmpl"
+	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
+	"github.com/vtmocanu/uzi/api/internal/httpx"
+	"github.com/vtmocanu/uzi/api/internal/jointoken"
+	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/termsafe"
+	"github.com/vtmocanu/uzi/api/internal/workersize"
+	"github.com/vtmocanu/uzi/api/internal/workertmpl"
 )
 
 // Hosted worker provisioning (PRD #58 M2).

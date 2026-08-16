@@ -10,8 +10,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselect"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
+	"github.com/vtmocanu/uzi/api/internal/autoselect"
+	"github.com/vtmocanu/uzi/api/internal/config"
 )
 
 // PRD #111 M2 — the auto-selection pool toggle and the live eligibility it feeds.

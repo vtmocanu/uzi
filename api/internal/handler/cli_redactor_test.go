@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/slacksvc"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
+	"github.com/vtmocanu/uzi/api/internal/slacksvc"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // Risk 14 (PRD #64 M5): a uzc_/uza_ CLI token this API mints must never survive into

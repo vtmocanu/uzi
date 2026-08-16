@@ -3,8 +3,8 @@ package handler
 import (
 	"testing"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/selfimprove"
+	"github.com/vtmocanu/uzi/api/internal/forgesvc"
+	"github.com/vtmocanu/uzi/api/internal/selfimprove"
 )
 
 // Promote's eligibility (PRD #102 Decisions 13a and 15).

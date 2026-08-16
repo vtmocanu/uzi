@@ -6,7 +6,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // PRD #69 M7a Pass B: the judge CONSUMES runs.fail_origin. Two consumers are pinned

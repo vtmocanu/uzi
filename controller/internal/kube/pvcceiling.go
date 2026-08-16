@@ -8,8 +8,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/preset"
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/protocol"
+	"github.com/vtmocanu/uzi/controller/internal/preset"
+	"github.com/vtmocanu/uzi/controller/internal/protocol"
 )
 
 // ceilingProbeID names the throwaway worker this check renders to enumerate the PVCs.

@@ -3,8 +3,8 @@ package skilltmpl_test
 import (
 	"testing"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/agenttmpl"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/skilltmpl"
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
+	"github.com/vtmocanu/uzi/api/internal/skilltmpl"
 )
 
 // The default-allocation map is keyed by skill name and valued by AGENT TEMPLATE

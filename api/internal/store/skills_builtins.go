@@ -7,7 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/skilltmpl"
+	"github.com/vtmocanu/uzi/api/internal/skilltmpl"
 )
 
 // builtinSkillReconcilerQueries is the query subset ReconcileBuiltinSkills needs.

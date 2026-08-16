@@ -9,7 +9,7 @@ import (
 	"os/exec"
 	"runtime"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
 // The client side of the browser-brokered `uzi login` flow (PRD #64 M5/M8). The

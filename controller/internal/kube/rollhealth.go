@@ -5,8 +5,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/protocol"
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/reconcile"
+	"github.com/vtmocanu/uzi/controller/internal/protocol"
+	"github.com/vtmocanu/uzi/controller/internal/reconcile"
 )
 
 // Roll-health derivation (PRD #113 M3, design §B-4). Stateless: every value comes

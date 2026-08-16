@@ -10,9 +10,9 @@ import (
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
-	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
+	"github.com/vtmocanu/uzi/api/internal/httpx"
+	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // wsWriteTimeout bounds a single frame write; a browser that stalls this long is
@@ -108,7 +108,7 @@ func (h *Handler) ServeWS(w http.ResponseWriter, r *http.Request) {
 		slog.Debug("ws accept", "error", err)
 		return
 	}
-	defer conn.CloseNow()
+	defer func() { _ = conn.CloseNow() }()
 
 	sub := h.hub.Subscribe(runID)
 	defer sub.Close()

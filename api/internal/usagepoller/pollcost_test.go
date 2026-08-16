@@ -10,8 +10,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/anthropic"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/anthropic"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // TestPollCostScalesWithTokenCount is R3's measurement, made a test rather than a

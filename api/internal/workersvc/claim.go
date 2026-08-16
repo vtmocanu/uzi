@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"log/slog"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // ClaimPayload is the complete, self-contained handoff a worker receives when it

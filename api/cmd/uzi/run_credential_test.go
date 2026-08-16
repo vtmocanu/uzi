@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselect"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/autoselect"
 )
 
 // PRD #111 M5 — the CLI half of D20: the run view names the MODE, not just the token.
@@ -186,10 +186,10 @@ func TestCredentialCellDeletedToken(t *testing.T) {
 func TestCredentialCellSanitizesTheLabel(t *testing.T) {
 	got := credentialCell(apitypes.RunDTO{
 		AnthropicSecretID:     sptr("11111111-1111-4111-8111-111111111111"),
-		AnthropicSecretLabel:  sptr("safe‮dnetsop\x1b[31m\nnext\tcell"),
+		AnthropicSecretLabel:  sptr("safe\u202ednetsop\x1b[31m\nnext\tcell"),
 		AnthropicSelectReason: sptr("default"),
 	})
-	for _, bad := range []string{"‮", "\x1b", "\nnext", "\tcell"} {
+	for _, bad := range []string{"\u202e", "\x1b", "\nnext", "\tcell"} {
 		if strings.Contains(got, bad) {
 			t.Errorf("hostile label reached the terminal carrying %q: %q", bad, got)
 		}

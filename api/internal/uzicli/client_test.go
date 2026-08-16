@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
 // --- FakeClient ---

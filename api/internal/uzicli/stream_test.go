@@ -17,7 +17,7 @@ import (
 
 	"github.com/coder/websocket"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
 // PRD #112 M2: StreamRun's decode boundary and recovery contract, against a real

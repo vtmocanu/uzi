@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // fakeStore is an in-memory Store: it returns a fixed row set and counts calls

@@ -7,9 +7,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/prdpath"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/prdpath"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // PRDLinkPatchBatch bounds one repo's candidates per tick, mirroring

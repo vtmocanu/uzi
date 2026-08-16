@@ -11,7 +11,7 @@ import (
 // PRD #58 Decision 1: the api gets ZERO kube-apiserver access, and
 // `automountServiceAccountToken: false` stays. The primary enforcement is
 // structural — the controller is a separate Go module
-// (gitlab.example.com/vtmocanu/uzi/controller), so no package under api/ can
+// (github.com/vtmocanu/uzi/controller), so no package under api/ can
 // import a kube client without someone first adding it to api/go.mod, which fails
 // the build until they do and shows up as a reviewable go.mod/go.sum diff when
 // they try.

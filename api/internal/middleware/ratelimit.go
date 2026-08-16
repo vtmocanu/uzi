@@ -12,7 +12,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
+	"github.com/vtmocanu/uzi/api/internal/httpx"
 )
 
 // Limiter is an in-process, per-IP fixed-window rate limiter. It intentionally

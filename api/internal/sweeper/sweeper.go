@@ -10,7 +10,7 @@ import (
 	"log/slog"
 	"time"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // defaultInterval is the sweep cadence. Not a PRD env var: it only bounds how

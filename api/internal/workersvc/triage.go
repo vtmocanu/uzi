@@ -1,6 +1,6 @@
 package workersvc
 
-import "gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
+import "github.com/vtmocanu/uzi/api/internal/apitypes"
 
 // TriageRow is one recommendation's two triage facts — its coordinate's disposition
 // (Status/Reason, both "" when undisposed) and whether it has a SETTLED filed link

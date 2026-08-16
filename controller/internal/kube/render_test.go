@@ -12,8 +12,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"sigs.k8s.io/yaml"
 
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/preset"
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/protocol"
+	"github.com/vtmocanu/uzi/controller/internal/preset"
+	"github.com/vtmocanu/uzi/controller/internal/protocol"
 )
 
 func testConfig() RenderConfig {

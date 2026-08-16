@@ -20,7 +20,7 @@ import (
 	"log/slog"
 	"time"
 
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/protocol"
+	"github.com/vtmocanu/uzi/controller/internal/protocol"
 )
 
 // Poller fetches desired state. *apiclient.Client satisfies it; tests substitute a

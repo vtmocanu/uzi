@@ -4,9 +4,9 @@ import (
 	"log/slog"
 	"net/http"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
-	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
+	"github.com/vtmocanu/uzi/api/internal/httpx"
+	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // WorkerUpgradeSummary serves the count behind the Workers nav badge (PRD #113 M6).

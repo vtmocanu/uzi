@@ -1,8 +1,8 @@
 package schedsvc
 
 import (
-	"gitlab.example.com/vtmocanu/uzi/api/internal/poller"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
+	"github.com/vtmocanu/uzi/api/internal/poller"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // PRD #274 M1 structural guarantee: widening the scheduler's run-creation seam with

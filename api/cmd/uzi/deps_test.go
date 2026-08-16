@@ -37,7 +37,7 @@ func TestNoServerDeps(t *testing.T) {
 	for _, banned := range []string{
 		"github.com/jackc/pgx",
 		"github.com/go-chi/chi",
-		"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc",
+		"github.com/vtmocanu/uzi/api/internal/workersvc",
 	} {
 		if strings.Contains(string(out), banned) {
 			t.Errorf("cmd/uzi must not depend on %s — it drags the server stack into the CLI binary (import internal/apitypes for DTOs, never internal/handler or internal/workersvc)", banned)

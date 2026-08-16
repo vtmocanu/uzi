@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
+	"github.com/vtmocanu/uzi/api/internal/secretbox"
 )
 
 func TestValidateSecretRejectsUnsafe(t *testing.T) {

@@ -3,7 +3,7 @@ package schedsvc
 import (
 	"errors"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // SkipReason is the authoritative, closed set of reasons a schedule fire started no

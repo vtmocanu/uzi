@@ -15,7 +15,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // The printed-instruction backstop (PRD #98, seam 5; reworked by the M8 Part C design).

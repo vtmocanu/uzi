@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/workertmpl"
+	"github.com/vtmocanu/uzi/api/internal/workertmpl"
 )
 
 // The cross-module TEMPLATE golden (PRD #58 M3), the exact analogue of

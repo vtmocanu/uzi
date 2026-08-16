@@ -16,7 +16,7 @@
 //
 // Stdlib only, and worth keeping that way: this module's whole job is one HTTP
 // poll and (from M3) one kube client.
-module gitlab.example.com/vtmocanu/uzi/controller
+module github.com/vtmocanu/uzi/controller
 
 go 1.26.4
 

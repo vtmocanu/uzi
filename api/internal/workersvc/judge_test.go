@@ -9,7 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // judgeRun is a claimed judge run row as ClaimRun would return it: repo-less,

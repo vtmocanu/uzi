@@ -10,8 +10,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/secretbox"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // tokenRow models a hosted_worker_tokens ROW, not just a ciphertext.
@@ -110,7 +110,7 @@ func (f *fakeStore) MarkHostedWorkerTokenDelivered(_ context.Context, arg store.
 	if !ok {
 		return 0, nil // no row
 	}
-	if !(row.ciphertext != nil || !row.delivered) {
+	if row.ciphertext == nil && row.delivered {
 		return 0, nil // already delivered: the guard excludes it (idempotence)
 	}
 	row.ciphertext = nil

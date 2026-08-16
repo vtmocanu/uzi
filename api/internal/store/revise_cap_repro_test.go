@@ -78,7 +78,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 const repro106Cap = 3
@@ -213,7 +213,7 @@ func TestReviseCapForcedInterleaveLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	defer tx.Rollback(ctx) //nolint // no-op after Commit
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
 	if _, err := q.WithTx(tx).CreateRunReviseInputIfUnderCap(ctx, repro106Params(runID, "A")); err != nil {
 		t.Fatalf("A's submit should have landed (it was at cap-1): %v", err)
 	}

@@ -18,8 +18,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/oidc"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/oidc"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // OIDC state-cookie parameters (PRD #45, Decision 3). The cookie is HttpOnly,
@@ -289,7 +289,7 @@ func (h *Handler) oidcResolveUser(r *http.Request, identity oidc.Identity) (stor
 	// pass the top gate). The top gate already rejected present-and-no-intersection;
 	// this closes the absent-claim case for new users.
 	if len(h.cfg.OIDCAllowedGroups) > 0 &&
-		!(identity.GroupsClaimPresent && groupsIntersect(h.cfg.OIDCAllowedGroups, identity.Groups)) {
+		(!identity.GroupsClaimPresent || !groupsIntersect(h.cfg.OIDCAllowedGroups, identity.Groups)) {
 		slog.Warn("oidc resolve: JIT blocked, not in an allowed group (or groups claim absent/unparseable)", "subject", identity.Subject)
 		return store.User{}, oidcErrForbidden
 	}

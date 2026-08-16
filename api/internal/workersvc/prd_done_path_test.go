@@ -6,7 +6,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 func issueRun() store.Run { return store.Run{ID: uuid.New(), Kind: "issue"} }

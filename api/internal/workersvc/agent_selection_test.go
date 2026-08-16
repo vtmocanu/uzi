@@ -10,7 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // The roster a healthy worker reports for a repo shipping two agents.
@@ -99,14 +99,14 @@ func TestValidateRepoAgents(t *testing.T) {
 			// IsControl misses it: this is the gap the stricter untrusted-repo rule
 			// closes. A bidi override can visually reorder text in the approval panel.
 			name:    "bidirectional override in description",
-			agents:  []RepoAgent{{Name: "coder", Description: "safe‮dnammoc"}},
+			agents:  []RepoAgent{{Name: "coder", Description: "safe\u202ednammoc"}},
 			wantErr: true,
 		},
 		{
 			// A zero-width joiner (also Cf) is likewise rejected for these one-line
 			// untrusted fields.
 			name:    "zero-width format character in description",
-			agents:  []RepoAgent{{Name: "coder", Description: "a‍b"}},
+			agents:  []RepoAgent{{Name: "coder", Description: "a\u200db"}},
 			wantErr: true,
 		},
 	}

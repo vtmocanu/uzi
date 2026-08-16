@@ -5,7 +5,7 @@ import (
 
 	"github.com/slack-go/slack/slackutilsx"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/secretscrub"
+	"github.com/vtmocanu/uzi/api/internal/secretscrub"
 )
 
 // EscapeMrkdwn neutralizes the Slack mrkdwn control characters (& < >) in an

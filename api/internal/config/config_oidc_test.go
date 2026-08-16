@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
+	"github.com/vtmocanu/uzi/api/internal/secretbox"
 )
 
 // oidcBaseEnv sets a syntactically valid non-OIDC environment so each subtest can

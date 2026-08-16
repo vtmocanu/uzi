@@ -1,6 +1,6 @@
 package uzicli
 
-import "gitlab.example.com/vtmocanu/uzi/api/internal/termsafe"
+import "github.com/vtmocanu/uzi/api/internal/termsafe"
 
 // This file used to HOLD the CLI's terminal-safety predicate (#180). It now delegates:
 // the predicate, both renderers and their reasoning moved to api/internal/termsafe when

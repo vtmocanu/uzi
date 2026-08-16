@@ -9,9 +9,9 @@ import (
 	"sort"
 	"strings"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/pipelinestatus"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/pipelinestatus"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // snapshotSecretPatterns is the dedicated log-tail scrubber for the failure

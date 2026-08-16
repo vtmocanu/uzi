@@ -18,8 +18,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/preset"
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/protocol"
+	"github.com/vtmocanu/uzi/controller/internal/preset"
+	"github.com/vtmocanu/uzi/controller/internal/protocol"
 )
 
 // Object naming. <id> is the worker's uuid and NOTHING else: the poll query

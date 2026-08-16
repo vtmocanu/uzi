@@ -10,9 +10,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/anthropic"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/secretopen"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/anthropic"
+	"github.com/vtmocanu/uzi/api/internal/secretopen"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // --- fakes ---

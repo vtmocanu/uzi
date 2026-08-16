@@ -4,7 +4,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/slack-go/slack"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // Run-health flag values (PRD #47), mirrored here so slacksvc keys its own Slack

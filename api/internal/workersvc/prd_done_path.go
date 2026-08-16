@@ -5,8 +5,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/prdpath"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/prdpath"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // clampWirePRDDonePath narrows a worker's declared PRD path to what may be stored

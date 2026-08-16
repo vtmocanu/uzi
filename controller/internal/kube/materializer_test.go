@@ -16,8 +16,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/protocol"
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/reconcile"
+	"github.com/vtmocanu/uzi/controller/internal/protocol"
+	"github.com/vtmocanu/uzi/controller/internal/reconcile"
 )
 
 func newMat(t *testing.T, objs ...runtime.Object) (*Materializer, *fake.Clientset) {

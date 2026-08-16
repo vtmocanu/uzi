@@ -19,8 +19,8 @@ package autoselectrow
 import (
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselect"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/autoselect"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // FromRateLimitRow lifts one per-user rate-limit row (GET /api/me/rate-limits) into

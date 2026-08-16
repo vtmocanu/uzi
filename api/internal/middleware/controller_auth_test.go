@@ -5,7 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/jointoken"
+	"github.com/vtmocanu/uzi/api/internal/jointoken"
 )
 
 func TestRequireControllerAcceptsTheConfiguredToken(t *testing.T) {

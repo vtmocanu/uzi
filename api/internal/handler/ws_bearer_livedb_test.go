@@ -13,9 +13,9 @@ import (
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/auth"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/clitoken"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/hub"
+	"github.com/vtmocanu/uzi/api/internal/auth"
+	"github.com/vtmocanu/uzi/api/internal/clitoken"
+	"github.com/vtmocanu/uzi/api/internal/hub"
 )
 
 // PRD #112 M1: /api/ws moved out of the cookie-only tail into a RequireUser mount,

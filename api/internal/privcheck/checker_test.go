@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forge"
 )
 
 // roleResult / protResult script the per-project forge answers.
