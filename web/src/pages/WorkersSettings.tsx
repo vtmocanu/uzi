@@ -6,7 +6,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
 
-import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { api, ApiError, type BindMode, type SecretMeta, type Worker } from "../lib/api";
 import { Alert, Badge, Button, Card, EmptyState, Field, Input, PageHeader, SectionTitle, Select, Skeleton } from "../components/ui";
 import { FleetUpgradePanel, WorkerUpgradeBadge, WorkerUpgradeDetail } from "../components/WorkerUpgradeBadge";
@@ -300,23 +299,15 @@ export function WorkersSettings() {
 
       {newToken && (
         <Card className="space-y-3 border-ok/40">
-          {/* sanitizeLabel here too, and the reason it is LOW rather than the same
-              severity as the list: this name is the one the user typed into the create
-              form seconds ago, in the same session — a user can only spoof their own
-              immediate echo, with no cross-tenant path and nothing stored-then-
-              surprising. The worker LIST renders names created at any time, and the
-              admin view renders other people's. Fixed anyway because it is the same
-              class and the same one-word fix.
-
-              This paragraph used to add that the aria-labels were CONSIDERED and left
-              raw. Issue #124 has since stripped both of them (stripUnsafeChars, below),
-              and the delete confirm's own comment gives the reason this one under-rated:
-              a live region is the ONLY thing a screen-reader user gets before a
-              destructive choice, so reordering it is not cosmetic. What is still raw is
-              the announce() strings; the argument holds there — escaped, no injection,
-              and every visible counterpart is sanitized — but it is a smaller claim than
-              the one this comment used to make. Recorded so nobody re-derives it. */}
-          <SectionTitle className="text-ok">Join token for “{sanitizeLabel(newToken.worker)}”</SectionTitle>
+          {/* stripUnsafeChars here too, converged with the other three worker.name
+              sites in this file; the reason it is LOW rather than the same severity as
+              the list: this name is the one the user typed into the create form seconds
+              ago, in the same session — a user can only spoof their own immediate echo,
+              with no cross-tenant path and nothing stored-then-surprising. The worker
+              LIST renders names created at any time, and the admin view renders other
+              people's. Fixed anyway because it is the same class and the same one-word
+              fix. */}
+          <SectionTitle className="text-ok">Join token for “{stripUnsafeChars(newToken.worker)}”</SectionTitle>
           <p className="text-sm text-muted">
             Copy it now — it is shown once and never again (only its hash is stored). Set it as{" "}
             <code className="rounded bg-raised px-1 py-0.5 text-fg">UZI_WORKER_TOKEN</code> on the

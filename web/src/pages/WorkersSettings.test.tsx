@@ -934,31 +934,34 @@ describe("WorkersSettings sanitizes worker names (PRD #111 pre-PR)", () => {
   // cannot tell them apart — the reason to prefer the superset is the bare ESC a name
   // can also carry, which only stripUnsafeChars removes.
   //
-  // The join-token echo below still calls sanitizeLabel, so the two name cells in this
-  // file now disagree about the helper. Left as-is deliberately in the merge that
-  // caused it — the echo was not part of the conflict — and recorded here rather than
-  // fixed silently, because the argument above applies to it too.
+  // The join-token echo below has converged onto stripUnsafeChars like the other
+  // worker.name cells in this file, so every site now agrees on the helper. The
+  // argument above applies to it too, which is why it uses the same superset.
   //
   // The join-token echo. LOW severity and fixed anyway: the name here is the one the
   // user typed seconds ago in the same session, so a user can only spoof their own
   // immediate echo — no cross-tenant path, nothing stored-then-surprising, unlike the
   // list (any age) and the admin view (other people's). Same class, same one-word fix.
   //
-  // MUTATION THIS CATCHES: reverting the echo to `{newToken.worker}`. Measured — the
-  // suite passed against the raw form until this test existed.
+  // MUTATION THIS CATCHES: reverting the echo to `{newToken.worker}`, AND reverting it
+  // to sanitizeLabel. The fixture plants a bare ESC (U+001B, a Cc char) alongside the
+  // bidi override (U+202E, a Cf char): both helpers strip the override, but only
+  // stripUnsafeChars removes the ESC, so the ESC assertion goes red on a revert to the
+  // Cf-only sanitizeLabel.
   it("strips invisible formatting characters from the join-token echo", async () => {
     mockApi.listWorkers.mockResolvedValue({ workers: [] });
     mockApi.createWorker.mockResolvedValue({
-      worker: aWorker({ id: "w-new", name: "safe\u202Edrowssap" }),
+      worker: aWorker({ id: "w-new", name: "safe\u001B\u202Edrowssap" }),
       token: "uzi_wk_deadbeef",
     });
     const { container } = renderPage();
     fireEvent.change(await screen.findByPlaceholderText(/laptop, ci-runner-1/), {
-      target: { value: "safe\u202Edrowssap" },
+      target: { value: "safe\u001B\u202Edrowssap" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Generate join token" }));
     await screen.findByText("uzi_wk_deadbeef");
     expect(container.textContent).not.toContain("\u202E");
+    expect(container.textContent).not.toContain("\u001B");
     expect(container.textContent).toContain("safe");
   });
 

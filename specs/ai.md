@@ -13804,6 +13804,14 @@ have ONE answer per language, and a second helper is justified only by a predica
 deliberately mirroring** — otherwise the site that picked the narrower one is a hole nobody sees,
 because both spellings look sanitized.
 
+**Outcome (issue #172).** The fourth `worker.name` render site — the join-token echo in
+`WorkersSettings.tsx` — has since converged onto `stripUnsafeChars`, so all four worker-name sites
+now use the one superset helper and none is left on the narrower `sanitizeLabel`. `sanitizeLabel` is
+deliberately RETAINED, not merged away: it still has genuine token-label call sites —
+`web/src/components/AnthropicTokens.tsx` (`secret.label`) and `web/src/components/RunCredential.tsx`
+(`run.anthropic_secret_label`) — that mirror the Go `validateSecretLabel` predicate, which is the
+constraint that justifies a second helper; merging the two would lose that.
+
 ## 432. PRD #35 — the park is a STATUS the server times and clamps; the worker asks, it never decides
 
 Serves human: "when a run hits the Anthropic usage limit, retry after a delay — back off until the
