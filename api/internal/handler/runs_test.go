@@ -1,10 +1,15 @@
 package handler
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -13,8 +18,11 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/auth"
+	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/hub"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
@@ -299,6 +307,132 @@ func TestListRunMessagesViewerAuthz(t *testing.T) {
 	h.ListRunMessages(rec, runReq(admin, runID))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("admin messages = %d, want 200", rec.Code)
+	}
+}
+
+// gzipAuthDB is a store.DBTX that lets a request clear RequireUser's cookie branch
+// without a live database: it answers getUserByID ("FROM users") with a single active
+// user and returns no rows for anything else. It exists so TestListRunMessagesGzip can
+// drive its request through the REAL h.Routes() router — including the Compress
+// middleware handler.go mounts on /runs/{id}/messages — rather than a hand-built one.
+type gzipAuthDB struct{ user store.User }
+
+func (gzipAuthDB) Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, nil
+}
+func (gzipAuthDB) Query(context.Context, string, ...interface{}) (pgx.Rows, error) {
+	return nil, pgx.ErrNoRows
+}
+func (d gzipAuthDB) QueryRow(_ context.Context, sql string, _ ...interface{}) pgx.Row {
+	if strings.Contains(sql, "FROM users") {
+		return gzipUserRow{u: d.user}
+	}
+	return gzipNoRow{}
+}
+
+type gzipNoRow struct{}
+
+func (gzipNoRow) Scan(...any) error { return pgx.ErrNoRows }
+
+// gzipUserRow scans the stored user positionally into getUserByID's destinations.
+// sqlc generates the Scan targets in User's field-declaration order, so a positional
+// copy is faithful; the field-count guard reddens loudly if that ceases to hold.
+type gzipUserRow struct{ u store.User }
+
+func (r gzipUserRow) Scan(dest ...any) error {
+	v := reflect.ValueOf(r.u)
+	if v.NumField() != len(dest) {
+		return fmt.Errorf("gzipUserRow: user has %d fields but scan wants %d", v.NumField(), len(dest))
+	}
+	for i, d := range dest {
+		reflect.ValueOf(d).Elem().Set(v.Field(i))
+	}
+	return nil
+}
+
+// TestListRunMessagesGzip proves the run-messages route is wired through chi's
+// Compress middleware (handler.go:1097): a request advertising `Accept-Encoding: gzip`
+// gets a `Content-Encoding: gzip` body that, once inflated, is byte-identical to the
+// uncompressed response. It drives the request through the REAL h.Routes() router, so
+// deleting `r.With(chimw.Compress(5))` in handler.go makes this test fail — a
+// hand-built router registering the middleware itself could not catch that regression.
+//
+// chi v5's Compress negotiates on Accept-Encoding and Content-Type only (there is no
+// size threshold), so a one-message fixture would already exercise it; the larger,
+// repetitive fixture just makes the inflate-equals-plain assertion cover a body big
+// enough that compression is non-degenerate.
+func TestListRunMessagesGzip(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	msgs := make([]store.RunMessage, 0, 200)
+	for i := 0; i < 200; i++ {
+		msgs = append(msgs, store.RunMessage{
+			Seq:     int32(i + 1),
+			Kind:    "text",
+			Payload: []byte(`{"role":"assistant","content":"a repetitive message body that compresses well"}`),
+		})
+	}
+	st := &runsStore{
+		ownerID: owner.ID,
+		run:     store.Run{ID: runID, UserID: owner.ID, Status: "running"},
+		msgs:    msgs,
+	}
+
+	// Real router, real RequireUser: authenticate over the cookie branch as the owner,
+	// backed by gzipAuthDB so getUserByID resolves without a live database.
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	h := &Handler{
+		q:    store.New(gzipAuthDB{user: store.User{ID: owner.ID, IsActive: true}}),
+		cfg:  config.Config{JWTSecret: secret, AuthTokenTTL: time.Hour},
+		wsvc: workersvc.New(st, newHandlerTestBox(t), workersvc.Params{}),
+		hub:  hub.New(),
+	}
+	noLimit := mw.NewLimiter(100000, time.Minute, nil)
+	router := h.Routes(noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit)
+
+	jwt, err := auth.IssueToken(secret, owner.ID.String(), 0, time.Hour)
+	if err != nil {
+		t.Fatalf("IssueToken: %v", err)
+	}
+	newReq := func(acceptGzip bool) *http.Request {
+		req := httptest.NewRequest(http.MethodGet, "/api/runs/"+runID.String()+"/messages", nil)
+		req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt})
+		if acceptGzip {
+			req.Header.Set("Accept-Encoding", "gzip")
+		}
+		return req
+	}
+
+	// Uncompressed baseline.
+	plainRec := httptest.NewRecorder()
+	router.ServeHTTP(plainRec, newReq(false))
+	if plainRec.Code != http.StatusOK {
+		t.Fatalf("plain messages = %d, want 200", plainRec.Code)
+	}
+	if ce := plainRec.Header().Get("Content-Encoding"); ce != "" {
+		t.Fatalf("plain request must not be gzip-encoded, got Content-Encoding %q", ce)
+	}
+
+	// gzip-negotiated request.
+	gzRec := httptest.NewRecorder()
+	router.ServeHTTP(gzRec, newReq(true))
+	if gzRec.Code != http.StatusOK {
+		t.Fatalf("gzip messages = %d, want 200", gzRec.Code)
+	}
+	if ce := gzRec.Header().Get("Content-Encoding"); ce != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip (Compress middleware must wrap this route)", ce)
+	}
+
+	gr, err := gzip.NewReader(bytes.NewReader(gzRec.Body.Bytes()))
+	if err != nil {
+		t.Fatalf("gzip reader: %v", err)
+	}
+	inflated, err := io.ReadAll(gr)
+	if err != nil {
+		t.Fatalf("gzip inflate: %v", err)
+	}
+	if !bytes.Equal(inflated, plainRec.Body.Bytes()) {
+		t.Fatalf("inflated gzip body differs from uncompressed body:\ngot  %q\nwant %q", inflated, plainRec.Body.Bytes())
 	}
 }
 
