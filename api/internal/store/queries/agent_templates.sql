@@ -46,17 +46,22 @@ RETURNING *;
 
 -- name: UpdateAgentTemplate :one
 -- Edits the mutable fields. name, scope, user_id and is_builtin are immutable and
--- never touched here. This is the admin-edit path: any write here marks the row
--- customized (PRD #275), which opts a builtin out of the boot-time pristine
--- refresh until it is Reset. The reset path uses ResetBuiltinAgentTemplate instead
--- so a reset returns to pristine (customized=false) rather than marking it.
+-- never touched here. This is the admin-edit path (PRD #275): the handler now
+-- passes @customized explicitly rather than the query hardcoding it. A builtin
+-- whose submitted content is byte-identical (per agenttmpl.SameContent) to the
+-- shipped builtin is stored customized=false, so saving the shipped body is
+-- idempotent with Reset (issue #339) and the row keeps tracking future shipped
+-- changes via the boot-time pristine refresh; every other write passes
+-- customized=true, opting a builtin out of that refresh until it is Reset. The
+-- reset path uses ResetBuiltinAgentTemplate instead so a reset returns to
+-- pristine (customized=false) rather than marking it.
 UPDATE agent_templates
 SET description = @description,
     model = @model,
     tools = @tools,
     prompt_body = @prompt_body,
     updated_by = @updated_by,
-    customized = true,
+    customized = @customized,
     updated_at = now()
 WHERE id = @id
 RETURNING *;
