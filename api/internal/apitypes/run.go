@@ -139,13 +139,22 @@ type RunDTO struct {
 	// not a code change. False for a normal MR completion and every pre-feature run
 	// (the column is NOT NULL DEFAULT false). ReportMd is the lead's persisted findings
 	// summary, already scrubbed server-side; nil unless report_only.
-	ReportOnly bool       `json:"report_only"`
-	ReportMd   *string    `json:"report_md"`
-	ClaimedAt  *time.Time `json:"claimed_at"`
-	StartedAt  *time.Time `json:"started_at"`
-	FinishedAt *time.Time `json:"finished_at"`
-	CreatedAt  time.Time  `json:"created_at"`
-	UpdatedAt  time.Time  `json:"updated_at"`
+	ReportOnly bool    `json:"report_only"`
+	ReportMd   *string `json:"report_md"`
+	// PrdDonePath is the repo-relative path the run declared it moved a PRD to when it
+	// archived a completed PRD (e.g. prds/done/72-x.md), null for a run that moved none.
+	// Read-only surfacing of the runs.prd_done_path column so the issue's PRD link can be
+	// reconciled after the run's merge request lands.
+	PrdDonePath *string `json:"prd_done_path"`
+	// PrdPatchSettledAt is when the PRD-link patch lifecycle settled (patched, no-match,
+	// MR closed unmerged, or superseded); null while the patch is still pending — which,
+	// with prd_done_path set, is the "declared a move, not yet reconciled" state.
+	PrdPatchSettledAt *time.Time `json:"prd_patch_settled_at"`
+	ClaimedAt         *time.Time `json:"claimed_at"`
+	StartedAt         *time.Time `json:"started_at"`
+	FinishedAt        *time.Time `json:"finished_at"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
 	// Per-run agent selection (PRD #37). RepoAgents is the roster the worker
 	// detected in the clone's .claude/agents/: null when no worker ever reported
 	// (a pre-feature run), `[]` when detection ran and found none. The plan gate

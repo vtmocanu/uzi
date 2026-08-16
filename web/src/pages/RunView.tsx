@@ -1394,6 +1394,14 @@ export function RunCompletedLine({
             Branch <code className="rounded bg-raised px-1 py-0.5 text-fg">{stripUnsafeChars(run.branch)}</code>
             {run.mr_iid != null &&
               ` — ${forgeNounLower(run.forge_type)} ${mrState === "merged" ? "merged" : mrState === "closed" ? "closed" : "opened"}.`}
+            {/* issue #150: the run's declared PRD-completion move. WORKER-DECLARED untrusted
+                text, so it goes through stripUnsafeChars exactly like run.branch above. */}
+            {run.prd_done_path && (
+              <>
+                {" · "}PRD moved to{" "}
+                <code className="rounded bg-raised px-1 py-0.5 text-fg">{stripUnsafeChars(run.prd_done_path)}</code>
+              </>
+            )}
           </>
         )
       )}

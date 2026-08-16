@@ -1264,6 +1264,15 @@ export interface Run {
    *  report_only completion; rides the same embed (rendered only on the detail run view).
    *  UNTRUSTED — render as escaped plain text, never <Markdown>. */
   report_md?: string | null;
+  /** issue #150: the repo-relative path the run declared it moved a completed PRD to
+   *  (e.g. `prds/done/72-x.md`), and the RFC3339 instant its PRD-completion patch settled.
+   *  Both null on a run that moved no PRD. OPTIONAL for the SAME api/web rollout skew as
+   *  plan_source/milestones — a mid-deploy api pod that predates these fields omits the keys.
+   *  `prd_done_path` is WORKER-DECLARED untrusted text: render as escaped plain text through
+   *  stripUnsafeChars, never <Markdown> or into a URL sink. `prd_patch_settled_at` is
+   *  API/CLI audit metadata and is not rendered in the web UI. */
+  prd_done_path?: string | null;
+  prd_patch_settled_at?: string | null;
   plan_md: string | null;
   /** PRD #209: where plan_md came from — `"agent"` for a normal run whose worker wrote
    *  the plan at the gate, `"seeded"` for a run created WITH a user-authored plan that

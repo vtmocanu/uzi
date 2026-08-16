@@ -11510,7 +11510,7 @@ the file went and the api decides what to do with it.
   `done`. A second extraction point anywhere would re-open that threat model from inside
   the run. A non-string or absent value leaves the field undefined, never throws, and
   never affects `done` — a malformed declaration still means the run finished.
-- Both columns land in **one migration** (`00084`): the declared path and the pending
+- Both columns land in **one migration** (`00085`): the declared path and the pending
   marker are the same fact. No `CHECK` constraint on the path — a file path is not a
   closed domain like `stop_kind`, so a CHECK could only restate the grammar in a second,
   drifting place.
@@ -11554,6 +11554,18 @@ the file went and the api decides what to do with it.
     checkpoint-ref deletion capability was added (the push broker is non-forced-push-only; a
     delete-ref RPC would be a new trust-boundary crossing) — refusing loudly is the
     proportionate fix. See [ADR-0279](../adr/0279-report-only-completion.md).
+
+- **Issue #150 — both columns are now surfaced READ-ONLY on `RunDTO`, closing the audit
+  gap where a run's declared PRD move was visible nowhere outside the process.** Until now
+  the only evidence a run declared *no* move was the agent's own testimony. `prd_done_path`
+  and `prd_patch_settled_at` were already persisted (migration `00085`) but read nowhere;
+  the DTO now carries both via `GetRunForViewer` (owner/admin-scoped, non-owner →
+  not-found) — no migration, no query change. CLI `uzi run get` renders both (human
+  `PRD_MOVE` + `PRD_PATCH_SETTLED_AT` rows; `--json`/`--field` already carried them, the
+  worker-declared path sanitized through `sanitizeTTY`). The web run completed footer
+  (`RunCompletedLine`, via `stripUnsafeChars`) renders `prd_done_path` ONLY —
+  `prd_patch_settled_at` stays CLI/API-only as audit metadata. Same owner/admin read-only
+  exposure as the `report_only`/`report_md` sibling above.
 
 ## 386. M5 — the post-merge patch is EDGE-triggered, BOUND to the run's queue-time issue snapshot, and deliberately not `mr_watch`
 

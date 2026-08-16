@@ -1134,6 +1134,18 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	if r.ReportOnly {
 		rows = append(rows, []string{"REPORT_ONLY", "yes"})
 	}
+	// PRD-link lifecycle (#150), the CLI twin of the fields exposed on the DTO in the
+	// prior commit. Both rows are emit-only-when-set: a run that moved no PRD, or one
+	// predating the feature, must not print a blank row. PRD_MOVE carries the run's own
+	// worker-declared path, so it is untrusted text and goes through sanitizeTTY like the
+	// free-text rows above; PRD_PATCH_SETTLED_AT is a server timestamp rendered exactly
+	// like LIMIT_RESETS_AT below.
+	if r.PrdDonePath != nil {
+		rows = append(rows, []string{"PRD_MOVE", sanitizeTTY(*r.PrdDonePath)})
+	}
+	if r.PrdPatchSettledAt != nil {
+		rows = append(rows, []string{"PRD_PATCH_SETTLED_AT", r.PrdPatchSettledAt.UTC().Format(time.RFC3339)})
+	}
 	// Milestone progress + effective budget (PRD #122 M5), the CLI twin of the web's
 	// MilestoneChecklist / MilestoneBadge. Both blocks are conditional so a run with no
 	// frozen milestone list and a global-default budget is byte-for-byte unchanged — the
