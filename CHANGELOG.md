@@ -4,6 +4,60 @@ Notable changes to uzi, loosely following [Keep a Changelog](https://keepachange
 Versions are release git tags (`deploy/chart/Chart.yaml`'s `version`/`appVersion`, Model B) — this
 file is not bumped per-commit; `[Unreleased]` collects everything since the last tag.
 
+## [0.39.0] - 2026-08-16
+
+### Added
+
+- **Board columns reorder by a drag-and-drop grip handle (#318).** The board
+  Settings > COLUMNS editor now reorders columns by dragging a 6-dot grip
+  handle, replacing the per-row up/down arrow buttons. It reuses the board
+  cards' existing hand-rolled drag idiom (no new dependency) and still persists
+  only on Save columns. The arrows were dropped entirely at the owner's
+  direction, so column reordering is now pointer-only: a recorded,
+  owner-accepted WCAG 2.1.1 keyboard/touch residual scoped to this editor (the
+  board cards keep their keyboard fallback). (#318)
+- **Slack workspace state on the self-service notifications card (#56).** A
+  non-admin user can now see why Slack DMs cannot send. The `/me/slack` link
+  response carries a new server-derived `workspace` field that collapses the
+  five manager connection states to four public values (unconfigured,
+  connecting, connected, error) without leaking the error class. The Settings
+  notifications card renders an alert above the link-state helpers and disables
+  its controls when Slack is unconfigured. No new endpoint, no migration, and no
+  change to the notification path. (#56)
+
+### Fixed
+
+- **rollhealth names the flapping container on the flapping path (#159).** On a
+  Ready-but-flapping rollout the stuck verdict and its named subject were
+  computed from two different containers, so the reason, restart count, and exit
+  code could describe a container other than the one that caused the verdict.
+  Subject selection now prefers the flapping container (preserving init-first
+  ordering), so every operator-facing field describes the same container. No
+  behavior change on the not-Ready or blocking-container paths. (#159)
+
+### Changed
+
+- **Mock/demo mode is guarded against drift (#311).** A CI mock-image build, a
+  mock-mode route smoke test, and a realism guard over the demo usage fixtures
+  keep the demo build in step with the real product, so a stale mock is caught
+  in CI rather than in a live demo. Web and CI only, no product behavior change.
+  One consequence: the Slack controls are disabled in demo mode, since the mock
+  reports an unconfigured workspace. (#311)
+
+### Dependencies
+
+- Bump `github.com/pressly/goose/v3` to 3.27.3, refreshing the api module's
+  `golang.org/x/{crypto,sync,net,sys,text}` and `sethvargo/go-retry` in lockstep
+  (c02c9910).
+- Bump `github.com/go-chi/chi/v5` to 5.3.1 (6f197399).
+- Bump the Kubernetes client libraries (`k8s.io/api`, `apimachinery`,
+  `client-go`) to 0.36.3 in the controller (c5f9488f).
+- Bump `@anthropic-ai/claude-agent-sdk` to 0.3.226 in the agent worker, with the
+  lockfile regenerated to match (24a1a9b8).
+- Re-pin the `golang:1.26` build-image digest (844a3855) and the
+  `gcr.io/distroless/static-debian12:nonroot` runtime-image digest (6cc344cb) to
+  current.
+
 ## [0.38.1] - 2026-08-15
 
 ### Fixed
