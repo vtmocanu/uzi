@@ -21002,3 +21002,21 @@ where amber was intended and survived several reviews. `web/scripts/check-styles
 - **The gate surfaced six real latent offenders, fixed in the same change:** `bg-bg` →
   `bg-ink` (the page-background token is `ink: token("bg")`) in `ScheduleModal`, `Repos`,
   `AdminBlockedRepos`; `border-line` → `border-edge` in `RateLimitMeters`.
+## 545. Issue #329 — a worker `completed` supersedes a `run_timeout` sweep, and MR reconciliation is decoupled from the terminal status
+
+Builds on §534's `fail_origin`. A genuine completion (the worker opened the MR) and a wall-clock
+`RUN_TIMEOUT` guess race on one row; the completion is the more authoritative event and must win.
+
+- **Terminal-status precedence at the state machine (`SetRunCompleted`, `api/internal/store/queries/runtime.sql`).**
+  A worker's `completed` report OVERRIDES a run the sweeper failed with `status='failed' AND
+  fail_origin='run_timeout'` — that pair is the ONLY overridable terminal state. A human `cancelled`,
+  and a worker's own `failed`/`worker_lost` (or NULL `fail_origin`), are NEVER overridden. Safe because
+  `SweepRunningTimeout` leaves `worker_id` intact and `SetRunCompleted` is `worker_id`-scoped, so only
+  the still-owning worker can supersede; the supersede clears the now-stale `failure_reason`/`fail_origin`.
+- **MR reconciliation is decoupled from the terminal status label (`ReconcileRunMR`, same file).** A
+  non-clobbering COALESCE write, no status predicate, `worker_id`-scoped, records the
+  `mr_iid`/`mr_web_url`/`branch` the worker actually opened whenever a report carries an MR — so a run
+  that opened an MR never reports "MR: none" regardless of its final status. Previously `mr_iid` was
+  written only by `SetRunCompleted` (completed-only).
+- **Consequence guarded.** Because a `cancelled` run can now carry `mr_iid`, `ListCIAutofixCandidateRefs`
+  gains a `status <> 'cancelled'` exclusion (§517) so auto-fix never acts on a human-cancelled branch.
