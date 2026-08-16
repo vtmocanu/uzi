@@ -8,6 +8,49 @@ import type { IssueProposal, RunInputKind } from "../lib/api";
 import { HEARTBEAT_MILESTONES, SAMPLE_PLAN } from "./data";
 import { appendMessage, getRun, listMessages, nextProposalId, patchRun, putProposal } from "./store";
 
+// ── Result frames (extracted, single source) ─────────────────────────────────
+// PRD #311: the plan-turn and implement-turn `result` frames are the cost/usage
+// surfaces' input, so they are module-level consts with ONE definition each —
+// the script references them and the realism guard (data.realism.test.ts)
+// imports them, so a drift back to an unrealistic split reddens a test rather
+// than passing silently. issue #195: a real result frame spans MULTIPLE models,
+// and the per-model `modelUsage` sums ABOVE the frame's top-level `usage` — the
+// top-level under-reads (measured 2.5x–229x low on run 84b6a933, see
+// web/src/lib/runUsage.ts:19-27), which is exactly why every surface folds
+// `modelUsage` and the run view never reads top-level.
+//
+// PLAN_RESULT_FRAME: the plan TURN's own cumulative-usage frame (a distinct
+// "Plan" per-phase row).
+export const PLAN_RESULT_FRAME = {
+  event: "result",
+  subtype: "success",
+  duration_ms: 5 * 60_000,
+  num_turns: 9,
+  total_cost_usd: 0.24,
+  usage: { input_tokens: 21_400, cache_read_input_tokens: 188_000, cache_creation_input_tokens: 0, output_tokens: 6_100 },
+  modelUsage: {
+    "claude-sonnet-4-6": { inputTokens: 8_100, outputTokens: 3_400, cacheReadInputTokens: 121_000, cacheCreationInputTokens: 0, costUSD: 0.05 },
+    "claude-sonnet-5": { inputTokens: 26_600, outputTokens: 11_400, cacheReadInputTokens: 399_000, cacheCreationInputTokens: 0, costUSD: 0.19 },
+  },
+} as const;
+
+// RUN_RESULT_FRAME: the implement TURN's cumulative run-usage frame. It DROPS
+// sonnet-4-6 and ADDS opus-4-8 versus the plan frame — deliberately demonstrating
+// the issue #195 "a model present in one frame drops in another" property.
+export const RUN_RESULT_FRAME = {
+  event: "result",
+  subtype: "success",
+  duration_ms: 21 * 60_000 + 44_000,
+  num_turns: 61,
+  total_cost_usd: 1.87,
+  // PRD #40: cumulative run usage (the strip/per-phase table fold from here).
+  usage: { input_tokens: 114_400, cache_read_input_tokens: 1_170_000, cache_creation_input_tokens: 0, output_tokens: 48_200 },
+  modelUsage: {
+    "claude-sonnet-5": { inputTokens: 140_000, outputTokens: 93_000, cacheReadInputTokens: 3_050_000, cacheCreationInputTokens: 0, costUSD: 1.21 },
+    "claude-opus-4-8": { inputTokens: 44_000, outputTokens: 26_000, cacheReadInputTokens: 690_000, cacheCreationInputTokens: 0, costUSD: 0.66 },
+  },
+} as const;
+
 type Step = () => void;
 interface Timed {
   delay: number; // ms after the previous step
@@ -135,15 +178,8 @@ function planningScript(runId: string): Timed[] {
         appendMessage(runId, "plan", "lead", { text: SAMPLE_PLAN() });
         // PRD #40: the plan TURN ends with its own result frame (cumulative usage so
         // far), so the per-phase table shows a "Plan" phase distinct from implement.
-        appendMessage(runId, "status", null, {
-          event: "result",
-          subtype: "success",
-          duration_ms: 5 * 60_000,
-          num_turns: 9,
-          total_cost_usd: 0.24,
-          usage: { input_tokens: 21_400, cache_read_input_tokens: 188_000, cache_creation_input_tokens: 0, output_tokens: 6_100 },
-          modelUsage: { "claude-sonnet-5": { inputTokens: 21_400, outputTokens: 6_100, cacheReadInputTokens: 188_000, cacheCreationInputTokens: 0, costUSD: 0.24 } },
-        });
+        // PRD #311: the frame is PLAN_RESULT_FRAME (module-level, guarded).
+        appendMessage(runId, "status", null, PLAN_RESULT_FRAME);
         appendMessage(runId, "status", null, { text: "plan submitted — awaiting approval" });
         // PRD #122: at the gate the milestones are PRE-APPROVAL candidates, not yet
         // frozen. Clear any frozen state so the gate shows the candidate list cleanly;
@@ -234,29 +270,8 @@ function implementScript(runId: string): Timed[] {
     {
       delay: 1600,
       step: () => {
-        appendMessage(runId, "status", null, {
-          event: "result",
-          subtype: "success",
-          duration_ms: 21 * 60_000 + 44_000,
-          num_turns: 61,
-          total_cost_usd: 1.87,
-          // PRD #40: cumulative run usage (the strip/per-phase table fold from here).
-          usage: {
-            input_tokens: 114_400,
-            cache_read_input_tokens: 1_170_000,
-            cache_creation_input_tokens: 0,
-            output_tokens: 48_200,
-          },
-          modelUsage: {
-            "claude-sonnet-5": {
-              inputTokens: 114_400,
-              outputTokens: 48_200,
-              cacheReadInputTokens: 1_170_000,
-              cacheCreationInputTokens: 0,
-              costUSD: 1.87,
-            },
-          },
-        });
+        // PRD #311: the frame is RUN_RESULT_FRAME (module-level, guarded).
+        appendMessage(runId, "status", null, RUN_RESULT_FRAME);
         patchRun(runId, {
           status: "completed",
           mr_iid: 57,

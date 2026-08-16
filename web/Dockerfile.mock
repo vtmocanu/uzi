@@ -13,7 +13,12 @@ FROM node:24-alpine@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a5
 WORKDIR /app/web
 
 COPY web/package.json web/package-lock.json ./
-RUN npm ci
+# --ignore-scripts: same supply-chain control as web/Dockerfile (see the long note
+# there). This stage installs the identical web/package-lock.json, and PRD #311 M1
+# is what first builds this Dockerfile in CI — including the protected-ref path
+# where Harbor cache creds sit on the kaniko fs — so a dependency postinstall must
+# not execute here any more than it does in the production build.
+RUN npm ci --ignore-scripts
 
 COPY web/ ./
 COPY docs/ /app/docs/

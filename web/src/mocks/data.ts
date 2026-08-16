@@ -3327,7 +3327,10 @@ export const mockDoneMessages: RunMessage[] = [
     num_turns: 9,
     total_cost_usd: 0.24,
     usage: { input_tokens: 21_400, cache_read_input_tokens: 188_000, cache_creation_input_tokens: 0, output_tokens: 6_100 },
-    modelUsage: { "claude-sonnet-5": { inputTokens: 21_400, outputTokens: 6_100, cacheReadInputTokens: 188_000, cacheCreationInputTokens: 0, costUSD: 0.24 } },
+    modelUsage: {
+      "claude-sonnet-5": { inputTokens: 27_100, outputTokens: 11_600, cacheReadInputTokens: 402_000, cacheCreationInputTokens: 0, costUSD: 0.19 },
+      "claude-sonnet-4-6": { inputTokens: 7_600, outputTokens: 3_200, cacheReadInputTokens: 118_000, cacheCreationInputTokens: 0, costUSD: 0.05 },
+    },
   }, 216),
   dm("status", null, { text: "plan submitted — awaiting approval" }, 216),
   dm("status", null, { text: "plan approved by vlad@uzi.local" }, 205),
@@ -3355,7 +3358,10 @@ export const mockDoneMessages: RunMessage[] = [
     num_turns: 38,
     total_cost_usd: 1.87,
     usage: { input_tokens: 114_400, cache_read_input_tokens: 1_170_000, cache_creation_input_tokens: 0, output_tokens: 48_200 },
-    modelUsage: { "claude-sonnet-5": { inputTokens: 114_400, outputTokens: 48_200, cacheReadInputTokens: 1_170_000, cacheCreationInputTokens: 0, costUSD: 1.87 } },
+    modelUsage: {
+      "claude-sonnet-5": { inputTokens: 138_000, outputTokens: 92_000, cacheReadInputTokens: 3_100_000, cacheCreationInputTokens: 0, costUSD: 1.19 },
+      "claude-opus-4-8": { inputTokens: 46_000, outputTokens: 27_000, cacheReadInputTokens: 640_000, cacheCreationInputTokens: 0, costUSD: 0.68 },
+    },
   }, 184),
 ];
 
@@ -3438,7 +3444,10 @@ export const mockFailedMessages: RunMessage[] = [
     duration_ms: 2 * 60 * 60_000,
     total_cost_usd: 0.11,
     usage: { input_tokens: 8_200, cache_read_input_tokens: 42_000, cache_creation_input_tokens: 0, output_tokens: 1_900 },
-    modelUsage: { "claude-sonnet-5": { inputTokens: 8_200, outputTokens: 1_900, cacheReadInputTokens: 42_000, cacheCreationInputTokens: 0, costUSD: 0.11 } },
+    modelUsage: {
+      "claude-sonnet-5": { inputTokens: 10_400, outputTokens: 3_100, cacheReadInputTokens: 96_000, cacheCreationInputTokens: 0, costUSD: 0.09 },
+      "claude-sonnet-4-6": { inputTokens: 3_200, outputTokens: 900, cacheReadInputTokens: 27_000, cacheCreationInputTokens: 0, costUSD: 0.02 },
+    },
   }),
 ];
 

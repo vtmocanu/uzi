@@ -2,7 +2,7 @@
 
 **Issue**: [#311](https://gitlab.example.com/vtmocanu/uzi/-/issues/311)
 **Priority**: Medium
-**Status**: Draft
+**Status**: Complete (2026-08-16)
 **Labels**: PRD, Night-Shift (nightly 02:00 sweep)
 
 ## Problem
@@ -118,7 +118,7 @@ is given, treat the **invariant** as authoritative and re-locate the line.
 ## Milestones
 
 ### M1 — CI validation build of the mock image
-- [ ] Add a `build:web-mock` job to `.gitlab-ci.yml` that `extends: .kaniko_build`, sets
+- [x] Add a `build:web-mock` job to `.gitlab-ci.yml` that `extends: .kaniko_build`, sets
       `UZI_BUILD_CONTEXT: $CI_PROJECT_DIR` and `UZI_DOCKERFILE: $CI_PROJECT_DIR/web/Dockerfile.mock`,
       `needs: [validate:web, test:web]`, and mirrors `build:web`'s rules (gate on `web/**/*` +
       `docs/**/*` on MRs; always on protected refs). Validation only: `--no-push`, **no**
@@ -128,9 +128,16 @@ is given, treat the **invariant** as authoritative and re-locate the line.
   in a mock-only file), then reverted. A green `build:web-mock` means `VITE_UZI_MOCK=1 npm run build`
   succeeds and the static image assembles. The RED proof requires a CI round-trip (push +
   watch the pipeline); a local `VITE_UZI_MOCK=1 npm run build` is the fast pre-check.
+- **Landed (2026-08-16)**: `build:web-mock` added (`.gitlab-ci.yml`), a faithful mirror of
+  `build:web` pointing at `web/Dockerfile.mock`; verified structurally (reviewer + auditor)
+  and by a green local `VITE_UZI_MOCK=1 npm run build`. Also hardened `web/Dockerfile.mock`'s
+  `npm ci` with `--ignore-scripts` to match `web/Dockerfile`, since this job is what first
+  builds that Dockerfile in CI (including the protected-ref Harbor-cache path). The
+  live-pipeline **red/green proof runs on this branch's MR pipeline** — it cannot be
+  reproduced pre-merge (no push in-run).
 
 ### M2 — Mock-mode route smoke test
-- [ ] Add a vitest (jsdom) that forces mock mode **for this file only** — either
+- [x] Add a vitest (jsdom) that forces mock mode **for this file only** — either
       `vi.mock("../lib/api")` returning the mock `api`/socket, or `vi.stubEnv("VITE_UZI_MOCK","1")`
       + `vi.resetModules()` + dynamic `import()` — so the rest of `test:web` stays on `realApi`.
       Mount each top-level route from `web/src/App.tsx` and assert it renders **without throwing**.
@@ -147,7 +154,7 @@ is given, treat the **invariant** as authoritative and re-locate the line.
   appear). Runs inside `test:web`.
 
 ### M3 — Correct the divergent frames + data-realism guard
-- [ ] **Own the fixture correction** (do not defer it — see Decision D5). Correct the five
+- [x] **Own the fixture correction** (do not defer it — see Decision D5). Correct the five
       divergent result frames (`data.ts` ×3, `engine.ts` ×2) so a frame that a cost/usage
       surface consumes carries **more than one** model key and top-level `usage` that diverges
       from `modelUsage`, matching how real frames behave. Then add a guard test asserting that
@@ -160,7 +167,7 @@ is given, treat the **invariant** as authoritative and re-locate the line.
   usage assertions (UsageCards / run-view) — update those in the same milestone. Runs in `test:web`.
 
 ### M4 — Convention doc + the honest ceiling
-- [ ] Document the enforcement in `docs/dev-conventions.md` (the existing "## The mock/demo
+- [x] Document the enforcement in `docs/dev-conventions.md` (the existing "## The mock/demo
       build" section, ~line 551 — this is an *extend*, not a new page) and, where it is a working
       rule for contributors, in `.claude/rules/web.md`: what is now enforced (endpoint parity via
       types, the mock image build, the route smoke test = *routes mount without throwing in mock
@@ -168,7 +175,7 @@ is given, treat the **invariant** as authoritative and re-locate the line.
       the one thing that is NOT gate-able and stays convention — **"a new user-facing feature must
       add or extend a mock scenario so the state is reachable in the demo, not only covered by a
       unit test"** — referencing the `truncated-backlog` pattern as the worked example.
-- [ ] **Correct the stale fixture line-number citations in `.claude/rules/web.md`** (the
+- [x] **Correct the stale fixture line-number citations in `.claude/rules/web.md`** (the
       `data.ts:2291…` refs) while the doc is open, and note the frames now span `data.ts` +
       `engine.ts` (fix-the-doc rule).
 - **Acceptance**: `web/scripts/check-docs.mjs` passes (frontmatter, order, links); the doc states
