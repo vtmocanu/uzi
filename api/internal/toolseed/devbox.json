@@ -334,6 +334,30 @@
   // by hand-editing this file + the sibling devbox.lock entry (never `devbox add`, which pins each
   // to its own nixpkgs rev and writes a fat `systems:` block); both lock as `source: "nixpkg"` at
   // 20535e48…, matching every entry above.
+  //
+  // `yamllint` (2026-08-16) closes the open `install_worker_tool` judge rec for `yamllint`
+  // (target `yamllint`, issue #330). Same "every worker should have it, in ANY repo" class as
+  // shellcheck above — a general YAML linter that restores fidelity of uzi's OWN gate, NOT a
+  // repo-specific tier-2 extra like the root devbox.json's `ruby` (which is tier-2 only because
+  // uzi ships a Homebrew formula). The concrete gap it fills: uzi's own `lint:yaml` gate. CI runs
+  // `yamllint` for real (armed via `UZI_LINT_YAML_REQUIRED`), but a worker without it makes
+  // `task lint:yaml` FAIL OPEN / print SKIPPED — a skipped and a passing gate must never look
+  // alike, exactly the shellcheck/lint:shell situation resolved just above.
+  //
+  // yamllint is SINGLE-output at this rev — MEASURED not assumed (outputs [out dist],
+  // meta.outputsToInstall [out]) — with the CLI in the default `out` output, so it does NOT hit
+  // the openssl.bin/file.out/shellcheck.bin split-output trap: a BARE `yamllint` carries the CLI
+  // and no `.bin`/`.out` selector is needed or correct (contrast openssl.bin/file.out/
+  // shellcheck.bin, whose CLI-bearing output is not `out`). mainProgram `yamllint`, so it lands
+  // bin/yamllint (the guard row is `yamllint  yamllint  yamllint --version`). This rev carries
+  // yamllint 1.37.1; its out-output narinfo (7indfvjgpj47yrjbn3zgnczgr4f5h8yz) is HTTP 200 on
+  // cache.nixos.org for x86_64-linux, so CI's amd64-only kaniko build SUBSTITUTES it rather than
+  // compiling from source — the non-negotiable condition for baking a tool in. Verified against
+  // the realized PROFILE (`ls bin/` of the out output → bin/yamllint present, `yamllint --version`
+  // → 1.37.1), never `command -v` inside `devbox run` — the check that would have caught the
+  // `file` regression. Written BARE of any version/`@latest` suffix and added by hand-editing this
+  // file + the sibling devbox.lock entry (never `devbox add`, which pins its own rev and writes a
+  // fat `systems:` block); locks as `source: "nixpkg"` at 20535e48….
   "packages": [
     "go",
     "gcc",
@@ -355,6 +379,7 @@
     "yq-go",
     "gnumake",
     "ripgrep",
-    "opentofu"
+    "opentofu",
+    "yamllint"
   ]
 }
