@@ -352,6 +352,7 @@ type Store interface {
 	SetRunAwaitingInput(ctx context.Context, arg store.SetRunAwaitingInputParams) (int64, error)
 	SetRunCompleted(ctx context.Context, arg store.SetRunCompletedParams) (int64, error)
 	SetRunFailed(ctx context.Context, arg store.SetRunFailedParams) (int64, error)
+	ReconcileRunMR(ctx context.Context, arg store.ReconcileRunMRParams) (int64, error)
 	// SetRunLimitWait parks a run until the owner's Anthropic usage window reopens
 	// (PRD #35); PromoteLimitWaitRuns is the sweeper pass that brings it back. The
 	// park's source guard is POSITIVE (status = 'running'), unlike every sibling
@@ -2968,9 +2969,23 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	if err != nil {
 		return store.Run{}, false, err
 	}
+	// issue #329: record the MR the worker opened INDEPENDENT of the terminal status
+	// the switch above wrote. If SetRunCompleted applied, ReconcileRunMR is a COALESCE
+	// no-op; if the status transition no-oped (e.g. the run was cancelled or already
+	// terminal), this still captures the MR so the run never reports "MR: none".
+	// Best-effort: a failure here must not fail the worker's terminal report.
+	if req.MrIID != nil {
+		if _, mrErr := s.q.ReconcileRunMR(ctx, store.ReconcileRunMRParams{
+			MrIid: int8Param(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), Branch: stripNULParam(req.Branch),
+			ID: runID, WorkerID: pgUUID(wkr.ID),
+		}); mrErr != nil {
+			slog.Warn("reconcile run mr", "run", runID, "error", mrErr)
+		}
+	}
 	// Re-read so the worker sees the authoritative status. Ownership already
-	// held above, so 0 rows means the run was terminal (the only other WHERE
-	// guard) → not applied.
+	// held above, so 0 rows means the transition was not applied under either branch
+	// of SetRunCompleted's now-two-branch guard (terminal, unless a superseded
+	// run_timeout) → not applied.
 	run, err = s.runOwnedByWorker(ctx, runID, wkr)
 	if err == nil && rows > 0 {
 		if s.bcast != nil {

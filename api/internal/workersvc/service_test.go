@@ -148,8 +148,10 @@ type fakeStore struct {
 	setAwaiting      *store.SetRunAwaitingApprovalParams
 	setCompleted     *store.SetRunCompletedParams
 	setFailed        *store.SetRunFailedParams
+	reconciledMR     *store.ReconcileRunMRParams
 	setRunningRows   int64
 	setCompletedRows int64
+	reconcileMRRows  int64
 	consumeRows      []store.ConsumeRunInputsRow
 
 	// Register + heartbeat.
@@ -616,6 +618,10 @@ func (f *fakeStore) SetRunCompleted(_ context.Context, arg store.SetRunCompleted
 func (f *fakeStore) SetRunFailed(_ context.Context, arg store.SetRunFailedParams) (int64, error) {
 	f.setFailed = &arg
 	return 1, nil
+}
+func (f *fakeStore) ReconcileRunMR(_ context.Context, arg store.ReconcileRunMRParams) (int64, error) {
+	f.reconciledMR = &arg
+	return f.reconcileMRRows, nil
 }
 
 // PRD #35. setLimitWaitRows defaults to 0, which is the SQL guard refusing — so a
