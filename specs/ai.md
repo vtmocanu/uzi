@@ -21117,8 +21117,8 @@ paying for #332's deferred Option B (a `lineage_epoch` schema+protocol change).
 - **Two surfaces, both pre-existing emissions on that path (no new message, no noise):** the run-feed
   `status` message payload carries `payload.event = "resume_lineage_break"` (free-form JSONB, per-run
   queryable and cross-run aggregatable: `select count(*) from run_messages where payload->>'event' =
-  'resume_lineage_break'`), and the worker `slog` warning line gets the same stable key for worker-log
-  aggregation.
+  'resume_lineage_break'`), and the worker's structured warning log line (`agent/src/log.ts`, a
+  JSON-fields logger — not Go `slog`) gets the same stable key for worker-log aggregation.
 - **Why a payload field, not a new surface.** Chosen over (a) a new `MessageKind` — which would need an
   API allowlist + web-renderer change — and over (b) any `run_usage`/fold/`run_usage_totals`-view/
   `lineage_epoch` change, which IS #332 Option B. It rides the existing join-token AppendMessages POST,
