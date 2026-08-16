@@ -26,6 +26,10 @@ let App: () => ReactElement;
 let APP_ROUTES: typeof import("./App").APP_ROUTES;
 let AuthProvider: typeof import("./auth/AuthContext").AuthProvider;
 let mockApi: typeof import("./mocks/mockApi").mockApi;
+// getDoc is the SYNC lib/docs resolver /docs/:slug uses (not a mockApi method);
+// populated from the same mock-mode graph in beforeAll so the build flag is never
+// captured early. See the "fixture id resolution" block below.
+let getDoc: typeof import("./lib/docs").getDoc;
 
 // The placeholder RouteGuards render while AuthProvider resolves the session.
 // Matched exactly (real ellipsis glyph) — the settle waits for it to disappear
@@ -62,6 +66,10 @@ beforeAll(async () => {
   APP_ROUTES = appMod.APP_ROUTES;
   ({ AuthProvider } = await import("./auth/AuthContext"));
   ({ mockApi } = await import("./mocks/mockApi"));
+  // lib/docs imports only markdown/parsing helpers (no ../lib/api), but import it
+  // here anyway so it comes from the mock-mode graph, consistent with the file's
+  // "never capture the build flag early" discipline.
+  ({ getDoc } = await import("./lib/docs"));
 });
 
 afterAll(() => {
@@ -161,5 +169,103 @@ describe("mock-mode route smoke", () => {
     expectRenderedCleanly("catch-all /no-such-page", holder, container);
     unmount();
     cleanup();
+  });
+});
+
+// The route smoke test above mounts each param route at its `sample` and only
+// checks it renders SOMETHING — but a stale/renamed sample 404s and STILL renders
+// the page's not-found empty state, so that smoke would keep passing while no
+// longer exercising the data-loaded path. This block closes that gap: it derives
+// each id from APP_ROUTES via extractParams and resolves it against the SAME data
+// source the page uses, so a fixture rename fails loudly here.
+
+// extractParams zips the pattern's segments against the sample's and captures a
+// value for every ":name" segment. Ids are DERIVED this way, never hardcoded, so a
+// renamed sample flows through to the resolver automatically.
+function extractParams(pathPattern: string, sample: string): Record<string, string> {
+  const patternSegs = pathPattern.split("/");
+  const sampleSegs = sample.split("/");
+  const params: Record<string, string> = {};
+  patternSegs.forEach((seg, i) => {
+    if (seg.startsWith(":")) params[seg.slice(1)] = sampleSegs[i];
+  });
+  return params;
+}
+
+// One resolver per sampled param-route `path`, each mirroring exactly how that
+// page resolves its id. The getters that THROW ApiError(404,…) on a miss reject;
+// getDoc and the chat find() return undefined on a miss (see inline notes) — the
+// negative control below handles both shapes.
+const paramResolvers: Record<
+  string,
+  (params: Record<string, string>) => Promise<unknown>
+> = {
+  "/runs/:id": async (params) => mockApi.getRun(params.id),
+  // AgentDetail: getAgentTemplate, then fall back to getBuiltinAgentTemplate.
+  "/agents/:id": async (params) =>
+    mockApi.getAgentTemplate(params.id).catch(() => mockApi.getBuiltinAgentTemplate(params.id)),
+  "/repos/:id/board": async (params) => mockApi.getBoard(params.id),
+  "/repos/:repoId/issues/:iid": async (params) =>
+    mockApi.getIssue(params.repoId, Number(params.iid)),
+  // /docs/:slug resolves via lib/docs.getDoc (SYNC, returns Doc|undefined, does NOT
+  // throw) — it is NOT a mockApi method. Wrapped in this async fn for a uniform shape.
+  "/docs/:slug": async (params) => getDoc(params.slug),
+  // There is no getChat: ChatConversation resolves via listChats().chats.find(...),
+  // which returns undefined (does NOT throw) on a miss.
+  "/chat/:id": async (params) =>
+    (await mockApi.listChats()).chats.find((c) => c.id === params.id),
+};
+
+// awaitsTruthy folds both miss shapes (reject OR falsy resolve) into a boolean, so
+// the negative control can assert "did NOT resolve truthy" uniformly.
+async function awaitsTruthy(p: Promise<unknown>): Promise<boolean> {
+  try {
+    return Boolean(await p);
+  } catch {
+    return false;
+  }
+}
+
+describe("fixture id resolution for sampled param routes", () => {
+  // Coverage guard: the resolver keys and the current sampled route paths must be
+  // the SAME set. A new param route with a sample but no resolver, or a resolver
+  // whose route lost its sample / was renamed, fails here loudly.
+  it("has a resolver for exactly the sampled param routes", () => {
+    const sampledPaths = APP_ROUTES.filter((r) => r.sample).map((r) => r.path);
+    for (const path of sampledPaths) {
+      expect(Object.keys(paramResolvers), `no resolver for sampled route ${path}`).toContain(path);
+    }
+    for (const key of Object.keys(paramResolvers)) {
+      expect(sampledPaths, `stale resolver key ${key}`).toContain(key);
+    }
+  });
+
+  it("resolves every sampled fixture id against the page's real data source", async () => {
+    for (const route of APP_ROUTES.filter((r) => r.sample)) {
+      const resolve = paramResolvers[route.path];
+      const params = extractParams(route.path, route.sample!);
+      await expect(
+        resolve(params),
+        `${route.path} sample ${route.sample} did not resolve`,
+      ).resolves.toBeTruthy();
+    }
+  });
+
+  // Non-vacuity control: with every id replaced by a value no fixture uses, every
+  // resolver must MISS (reject or resolve falsy). Number("__nonexistent__") is NaN,
+  // so getIssue misses too. If a resolver resolved truthy on bogus ids the positive
+  // test above would be meaningless.
+  it("does not resolve truthy for bogus ids", async () => {
+    for (const route of APP_ROUTES.filter((r) => r.sample)) {
+      const resolve = paramResolvers[route.path];
+      const bogus: Record<string, string> = {};
+      for (const name of Object.keys(extractParams(route.path, route.sample!))) {
+        bogus[name] = "__nonexistent__";
+      }
+      expect(
+        await awaitsTruthy(resolve(bogus)),
+        `${route.path} unexpectedly resolved truthy for bogus ids`,
+      ).toBe(false);
+    }
   });
 });
