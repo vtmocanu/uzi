@@ -38,7 +38,9 @@ header).
 Findings dedupe on **where** they are, not **which run** found them: the same
 bug seen in five different runs is one row reading **"seen in 5 runs"**, not
 five things to triage. Three buckets — **To file**, **Filed**, **Dismissed** —
-plus **All**.
+each a tab on the page; there's no "All" tab here, since the backlog is a
+triage queue, not an archive browser (the CLI's `uzi findings list --bucket
+all` covers that — see [docs/cli.md](./cli.md)).
 
 ## Filing a finding
 

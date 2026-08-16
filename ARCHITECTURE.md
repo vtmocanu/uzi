@@ -888,7 +888,9 @@ MCP tool on the existing run lane (issue/ci_fix/prompt/self_improve), sitting
 beside `signals.ts` as a second, distinct in-process MCP server so the finding
 tool can never be mistaken for (or promoted into) a turn-ending signal. Full
 design rationale is in the PRD (`prds/done/333-incidental-findings.md`, especially
-its Decision Log); user-facing usage is [docs/findings.md](docs/findings.md).
+its Decision Log); the durable seams are in
+[adr/0333-incidental-findings.md](adr/0333-incidental-findings.md); user-facing
+usage is [docs/findings.md](docs/findings.md).
 
 - **Capture is worker→api, never worker→forge.** The tool posts to a
   `RequireWorker` endpoint the same way a chat proposal does; the worker holds
