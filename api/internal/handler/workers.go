@@ -956,9 +956,16 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"run": dto})
 }
 
+// maxRunMessagesPage caps the ?limit= page size on ListRunMessages so a single
+// bounded response can never be unbounded; a caller asking for more is clamped
+// down to this. Unset limit keeps the legacy unbounded path (non-breaking).
+const maxRunMessagesPage = 1000
+
 // ListRunMessages returns a run's persisted messages after ?after=<seq> (default
 // 0), the replay source a reconnecting browser reads before going live. Visible
-// to the run's owner or an admin.
+// to the run's owner or an admin. With ?limit=<n> (n >= 1) it returns a bounded
+// page of at most n (clamped to maxRunMessagesPage) for the CLI's paging; absent
+// limit is the unbounded legacy path the web SPA relies on.
 func (h *Handler) ListRunMessages(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -979,7 +986,26 @@ func (h *Handler) ListRunMessages(w http.ResponseWriter, r *http.Request) {
 		}
 		after = int32(n)
 	}
-	msgs, err := h.wsvc.ListRunMessagesForViewer(r.Context(), user.ID, user.IsAdmin, id, after)
+	limit := int32(0)
+	bounded := false
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 32)
+		if err != nil || n < 1 {
+			httpx.Error(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		if n > maxRunMessagesPage {
+			n = maxRunMessagesPage
+		}
+		limit = int32(n)
+		bounded = true
+	}
+	var msgs []store.RunMessage
+	if bounded {
+		msgs, err = h.wsvc.ListRunMessagesForViewerPage(r.Context(), user.ID, user.IsAdmin, id, after, limit)
+	} else {
+		msgs, err = h.wsvc.ListRunMessagesForViewer(r.Context(), user.ID, user.IsAdmin, id, after)
+	}
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotFound) {
 			httpx.Error(w, http.StatusNotFound, "run not found")

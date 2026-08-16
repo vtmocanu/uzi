@@ -40,9 +40,14 @@ type runsStore struct {
 	judgeTriageRunErr  error
 
 	workersvc.Store
-	ownerID     uuid.UUID
-	run         store.Run
-	msgs        []store.RunMessage
+	ownerID uuid.UUID
+	run     store.Run
+	msgs    []store.RunMessage
+	// lastPageLim records the Lim (page size) the handler passed through to
+	// ListRunMessagesAfterPage on the bounded ?limit= path, so TestListRunMessagesLimit
+	// can assert the handler clamped/forwarded the requested size BEFORE the store call —
+	// the fixture size alone can't distinguish a clamped page from an unclamped one.
+	lastPageLim int32
 	userRuns    []store.ListRunsForUserRow
 	lastRunsArg *store.ListRunsForUserParams
 	allWorkers  []store.ListAllWorkersRow
@@ -81,6 +86,14 @@ func (s *runsStore) GetRunByID(_ context.Context, id uuid.UUID) (store.Run, erro
 }
 func (s *runsStore) ListRunMessagesAfter(context.Context, store.ListRunMessagesAfterParams) ([]store.RunMessage, error) {
 	return s.msgs, nil
+}
+func (s *runsStore) ListRunMessagesAfterPage(_ context.Context, arg store.ListRunMessagesAfterPageParams) ([]store.RunMessage, error) {
+	s.lastPageLim = arg.Lim
+	out := s.msgs
+	if arg.Lim >= 0 && int(arg.Lim) < len(out) {
+		out = out[:arg.Lim]
+	}
+	return out, nil
 }
 func (s *runsStore) ListClaimAgentTemplates(context.Context, pgtype.UUID) ([]store.AgentTemplate, error) {
 	return s.claimTemplates, nil
@@ -307,6 +320,142 @@ func TestListRunMessagesViewerAuthz(t *testing.T) {
 	h.ListRunMessages(rec, runReq(admin, runID))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("admin messages = %d, want 200", rec.Code)
+	}
+}
+
+// TestListRunMessagesPagedViewerAuthz is the ?limit= twin of TestListRunMessagesViewerAuthz:
+// it proves the owner-or-admin gate holds on the BOUNDED path too, so a future edit that
+// forgets the GetRunForViewer check on ListRunMessagesForViewerPage is caught. Modeled on
+// the unbounded authz test's harness (same runsStore fake, same three viewers), but every
+// request carries ?limit=5 so it drives the paged service method.
+func TestListRunMessagesPagedViewerAuthz(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	st := &runsStore{
+		ownerID: owner.ID,
+		run:     store.Run{ID: runID, UserID: owner.ID, Status: "running"},
+		msgs:    []store.RunMessage{{Seq: 1, Kind: "text", Payload: []byte(`{}`)}},
+	}
+	h := newRunsHandler(t, st)
+
+	// Owner sees the bounded page.
+	rec := httptest.NewRecorder()
+	h.ListRunMessages(rec, runReqQuery(owner, runID, "limit=5"))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"seq":1`) {
+		t.Fatalf("owner paged messages = %d %q, want 200 with seq 1", rec.Code, rec.Body.String())
+	}
+
+	// A non-owner is denied the SAME way as on the unbounded path: 404, no messages.
+	other := store.User{ID: uuid.New()}
+	rec = httptest.NewRecorder()
+	h.ListRunMessages(rec, runReqQuery(other, runID, "limit=5"))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("non-owner paged messages = %d, want 404", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), `"seq"`) {
+		t.Fatalf("non-owner paged messages must leak nothing, got %q", rec.Body.String())
+	}
+
+	// An admin sees any run through the bounded path.
+	admin := store.User{ID: uuid.New(), IsAdmin: true}
+	rec = httptest.NewRecorder()
+	h.ListRunMessages(rec, runReqQuery(admin, runID, "limit=5"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin paged messages = %d, want 200", rec.Code)
+	}
+}
+
+// runReqQuery is runReq with a raw query string (e.g. "limit=2") on the URL so the
+// ListRunMessages handler's ?limit=/?after= parsing is exercised.
+func runReqQuery(user store.User, runID uuid.UUID, rawQuery string) *http.Request {
+	req := runReq(user, runID)
+	req.URL.RawQuery = rawQuery
+	return req
+}
+
+// TestListRunMessagesLimit covers the opt-in bounded ?limit= page (issue #160 M2):
+// a valid limit returns a bounded slice, invalid limits are 400, an absent limit
+// stays on the unbounded legacy path, and an over-max limit is clamped down.
+func TestListRunMessagesLimit(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	msgs := make([]store.RunMessage, 0, 5)
+	for i := 0; i < 5; i++ {
+		msgs = append(msgs, store.RunMessage{Seq: int32(i + 1), Kind: "text", Payload: []byte(`{}`)})
+	}
+	st := &runsStore{
+		ownerID: owner.ID,
+		run:     store.Run{ID: runID, UserID: owner.ID, Status: "running"},
+		msgs:    msgs,
+	}
+	h := newRunsHandler(t, st)
+
+	decodeSeqs := func(t *testing.T, body string) []int32 {
+		t.Helper()
+		var env struct {
+			Messages []struct {
+				Seq int32 `json:"seq"`
+			} `json:"messages"`
+		}
+		if err := json.Unmarshal([]byte(body), &env); err != nil {
+			t.Fatalf("decode messages: %v (body %q)", err, body)
+		}
+		seqs := make([]int32, 0, len(env.Messages))
+		for _, m := range env.Messages {
+			seqs = append(seqs, m.Seq)
+		}
+		return seqs
+	}
+
+	// (a) ?limit=2 returns exactly the first 2 of 5 messages, in seq order.
+	rec := httptest.NewRecorder()
+	h.ListRunMessages(rec, runReqQuery(owner, runID, "limit=2"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("limit=2 status = %d, want 200", rec.Code)
+	}
+	if got := decodeSeqs(t, rec.Body.String()); len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		t.Fatalf("limit=2 seqs = %v, want [1 2]", got)
+	}
+	// The handler must forward the exact requested page size on the non-clamped path.
+	if st.lastPageLim != 2 {
+		t.Fatalf("limit=2 forwarded Lim = %d, want 2", st.lastPageLim)
+	}
+
+	// (b) invalid limits are rejected with 400.
+	for _, raw := range []string{"limit=0", "limit=-1", "limit=abc"} {
+		rec = httptest.NewRecorder()
+		h.ListRunMessages(rec, runReqQuery(owner, runID, raw))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want 400", raw, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "limit must be a positive integer") {
+			t.Fatalf("%s body = %q, want positive-integer error", raw, rec.Body.String())
+		}
+	}
+
+	// (c) absent limit stays on the unbounded path: all 5 messages come back.
+	rec = httptest.NewRecorder()
+	h.ListRunMessages(rec, runReq(owner, runID))
+	if got := decodeSeqs(t, rec.Body.String()); len(got) != 5 {
+		t.Fatalf("no-limit seqs = %v, want all 5", got)
+	}
+
+	// (d) a limit above maxRunMessagesPage is clamped down to it BEFORE the store call.
+	// The 5-message fixture can't distinguish clamped from unclamped by response size, so
+	// this asserts on the Lim the handler actually forwarded to the store: the handler
+	// must have reduced maxRunMessagesPage+50 to exactly maxRunMessagesPage. Deleting the
+	// clamp block in workers.go reddens this assertion (the fake would record the raw
+	// over-max Lim), which is what gives the subcase its gating power.
+	rec = httptest.NewRecorder()
+	h.ListRunMessages(rec, runReqQuery(owner, runID, fmt.Sprintf("limit=%d", maxRunMessagesPage+50)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("over-max limit status = %d, want 200", rec.Code)
+	}
+	if st.lastPageLim != maxRunMessagesPage {
+		t.Fatalf("over-max limit forwarded Lim = %d, want it clamped to %d", st.lastPageLim, maxRunMessagesPage)
+	}
+	if got := decodeSeqs(t, rec.Body.String()); len(got) > maxRunMessagesPage {
+		t.Fatalf("over-max limit returned %d messages, want <= %d", len(got), maxRunMessagesPage)
 	}
 }
 
