@@ -1033,7 +1033,7 @@ the design rationale (Decision Log, the compose→chart adaptations) is
   Ingress) + `api` (Deployment/Service/NetworkPolicy) + a **CloudNativePG
   `Cluster`** (the upstream `cluster` chart as the `postgres` subchart) in place
   of the `db` container + `InfisicalSecret`s for runtime secrets and the Harbor
-  pull secret. Per-cluster values (`deploy/values/dev-cluster.yaml`) carry the
+  pull secret. Per-cluster values (`argo-apps:apps/uzi/values/dev-cluster.yaml`) carry the
   public host, `FRONTEND_ORIGIN`, `TRUSTED_PROXIES`, and the CNPG image/storage,
   layered over the cluster-agnostic `deploy/chart/values.yaml`. ArgoCD deploys a
   **multi-source** app (`argo-apps` `apps/uzi/`): the released chart from
