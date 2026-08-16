@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"unicode/utf8"
 )
@@ -111,6 +113,41 @@ func TestLatestMRPipelineNoPipelineMapsToErrNoPipeline(t *testing.T) {
 	}
 }
 
+// TestLatestPipelineNilElementMapsToErrNoPipeline is the issue-74 M2 pin: a hostile
+// forge returning a one-element list whose single entry is JSON null decodes to a
+// slice with a nil *PipelineInfo, which passes the len==0 guard. Without the
+// nil-element guard the toPipeline deref panics; with it the driver returns
+// ErrNoPipeline.
+func TestLatestPipelineNilElementMapsToErrNoPipeline(t *testing.T) {
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/pipelines": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode([]any{nil}) // body: [null]
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	if _, err := d.LatestPipeline(context.Background(), 7, "main"); !errors.Is(err, ErrNoPipeline) {
+		t.Fatalf("a one-element list with a null entry must map to ErrNoPipeline (no panic), got %v", err)
+	}
+}
+
+// TestLatestMRPipelineNilElementMapsToErrNoPipeline is the issue-74 M2 pin for the
+// MR-pipelines max-by-id scan: a null entry decodes to a nil *PipelineInfo whose
+// .ID deref would panic. The nil-skipping scan drops it and, with no other rows,
+// returns ErrNoPipeline.
+func TestLatestMRPipelineNilElementMapsToErrNoPipeline(t *testing.T) {
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/merge_requests/13/pipelines": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode([]any{nil}) // body: [null]
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	if _, err := d.LatestMRPipeline(context.Background(), 7, 13); !errors.Is(err, ErrNoPipeline) {
+		t.Fatalf("a one-element MR-pipeline list with a null entry must map to ErrNoPipeline (no panic), got %v", err)
+	}
+}
+
 func TestListPipelineJobsPaginates(t *testing.T) {
 	m := newMockGitLab(t, map[string]http.HandlerFunc{
 		"/api/v4/projects/7/pipelines/99/jobs": func(w http.ResponseWriter, r *http.Request) {
@@ -190,6 +227,30 @@ func TestJobLogTailReturnsFullTraceUnderCap(t *testing.T) {
 	}
 }
 
+// TestJobLogTailByteBoundsOversizedTrace is the issue-74 M1 regression pin: a
+// hostile forge streaming a trace LARGER than maxTraceBytes (16 MiB) must trip the
+// fail-closed ceiling and return an error with an empty tail, never buffer the whole
+// body. The driver now reads the raw trace endpoint through an io.LimitReader, so the
+// transfer stops at maxTraceBytes+1 bytes rather than OOMing on a multi-GB body.
+func TestJobLogTailByteBoundsOversizedTrace(t *testing.T) {
+	var wrote int
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/jobs/500/trace": func(w http.ResponseWriter, _ *http.Request) {
+			n, _ := w.Write([]byte(strings.Repeat("A", maxTraceBytes+1024)))
+			wrote = n
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	tail, err := d.JobLogTail(context.Background(), 7, 500, 32*1024)
+	if err == nil {
+		t.Fatalf("an oversized trace must trip the ceiling error, got nil (wrote %d bytes)", wrote)
+	}
+	if tail != "" {
+		t.Fatalf("the ceiling error must return an empty tail, got %d bytes", len(tail))
+	}
+}
+
 func TestJobLogTailKeepsValidUTF8AfterCut(t *testing.T) {
 	// The byte-boundary cut can land mid-rune; the driver drops leading continuation
 	// bytes so the tail is valid UTF-8. Build a trace whose last maxBytes would start
@@ -211,6 +272,52 @@ func TestJobLogTailKeepsValidUTF8AfterCut(t *testing.T) {
 	}
 	if !utf8.ValidString(tail) {
 		t.Fatalf("tail must be valid UTF-8 after the byte-boundary cut, got bytes %x", tail)
+	}
+}
+
+// TestJobLogTailRefusesCrossHostRedirect proves the trace GET never follows a
+// redirect: a hostile-but-allowlisted forge that answers the trace request with a
+// cross-host 302 must NOT have the bot PAT replayed to the redirect target. Go does
+// not strip the PRIVATE-TOKEN header on a cross-host redirect, so the dedicated
+// logClient refuses redirects entirely — the 302 surfaces as a non-2xx and errors
+// before any body read, and the sink server must receive ZERO requests.
+func TestJobLogTailRefusesCrossHostRedirect(t *testing.T) {
+	const token = "glpat-redirect-target-must-never-see-this" //gitleaks:allow // fake PAT fixture: proves the token is not replayed on a redirect
+	// The sink is the redirect target. It records any request it receives (and whether
+	// that request carried the PRIVATE-TOKEN header); it must be hit ZERO times.
+	var sinkHits int32
+	var sinkSawToken int32
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&sinkHits, 1)
+		if r.Header.Get("PRIVATE-TOKEN") != "" {
+			atomic.AddInt32(&sinkSawToken, 1)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("attacker payload"))
+	}))
+	defer sink.Close()
+
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/jobs/500/trace": func(w http.ResponseWriter, _ *http.Request) {
+			// Answer the trace request with a cross-host 302 pointing at the sink.
+			w.Header().Set("Location", sink.URL)
+			w.WriteHeader(http.StatusFound)
+		},
+	})
+	d := newTestDriver(t, m, token)
+
+	tail, err := d.JobLogTail(context.Background(), 7, 500, 32*1024)
+	if err == nil {
+		t.Fatalf("a cross-host redirect must be refused with an error, got nil (tail %q)", tail)
+	}
+	if tail != "" {
+		t.Fatalf("a refused redirect must return an empty tail, got %q", tail)
+	}
+	if hits := atomic.LoadInt32(&sinkHits); hits != 0 {
+		t.Fatalf("the redirect target was hit %d time(s); the PAT must never be replayed to it", hits)
+	}
+	if saw := atomic.LoadInt32(&sinkSawToken); saw != 0 {
+		t.Fatalf("the redirect target received the PRIVATE-TOKEN header %d time(s); it must never be forwarded", saw)
 	}
 }
 

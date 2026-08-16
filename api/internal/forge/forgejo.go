@@ -1002,3 +1002,30 @@ func (f *forgejo) rawGet(ctx context.Context, path string) ([]byte, error) {
 	}
 	return body, nil
 }
+
+// rawGetLimited is rawGet's byte-bounded sibling: the response body is read through
+// an io.LimitReader(resp.Body, limit) so the TRANSFER itself is capped, for the job
+// log endpoint whose gitea SDK method (GetRepoActionJobLogs) buffers the whole body
+// into memory with an unbounded io.ReadAll before the driver sees its size. A
+// hostile forge streaming a multi-GB log body therefore cannot OOM the api: the read
+// stops at limit bytes. Auth, non-2xx handling and PAT redaction match rawGet.
+func (f *forgejo) rawGetLimited(ctx context.Context, path string, limit int64) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.baseURL+"/api/v1"+path, nil)
+	if err != nil {
+		return nil, f.redact.error(fmt.Errorf("forgejo: build request: %w", err))
+	}
+	req.Header.Set("Authorization", "token "+f.token)
+	resp, err := f.client.Do(req)
+	if err != nil {
+		return nil, f.redact.error(fmt.Errorf("forgejo: request %s: %w", path, err))
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit))
+	if err != nil {
+		return nil, f.redact.error(fmt.Errorf("forgejo: read response: %w", err))
+	}
+	if resp.StatusCode/100 != 2 {
+		return body, f.redact.error(fmt.Errorf("forgejo: GET %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(body))))
+	}
+	return body, nil
+}

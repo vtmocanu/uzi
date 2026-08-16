@@ -36,6 +36,23 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   run-timeout failure, and the merge-request link is recorded independently
   of the final run status, so a run that opened an MR never displays
   "MR: none". (#329)
+### Security
+
+- **Both hostile-forge DoS vectors closed across all three forge drivers
+  (#74).** A semi-trusted (compromised) connected forge could crash the shared,
+  multi-tenant api two ways, both symmetric across the gitlab, forgejo and
+  github drivers. First, a job-log fetch buffered the entire response body in
+  memory (inside the SDK) before the 16 MiB ceiling was evaluated, so a forge
+  streaming a multi-GB log body could OOM the process; the gitlab and forgejo
+  drivers now issue a raw request read through an `io.LimitReader` so the
+  transfer itself is byte-bounded (github was already bounded), and the gitlab
+  trace request additionally refuses redirects so a hostile 302 cannot replay
+  the bot PAT cross-host. Second, a forge returning a one-element pipeline/run
+  list whose single entry was JSON `null` dereferenced a nil pointer and
+  panicked the poller's pipeline-sync tick; all three drivers now guard the nil
+  element, and the poller's per-repo goroutine recovers any panic so one repo's
+  hostile response degrades to skipping that repo's sync rather than crashing
+  the api. (#74)
 
 ## [0.39.0] - 2026-08-16
 
