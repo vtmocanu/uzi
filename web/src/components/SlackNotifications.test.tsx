@@ -143,4 +143,19 @@ describe("SlackNotifications (PRD #25 M3)", () => {
     expect(container.textContent).toContain("Slack is reconnecting");
     expect(notifyToggle().disabled).toBe(false);
   });
+
+  // The test DM stays clickable outside `unconfigured`, so a resolved user on an
+  // `error` workspace can still fire one and must see the backend failure. Guards
+  // the PRD #56 M2 claim that the test-DM error path surfaces the 502.
+  it("surfaces the 502 when a test DM fails during an error workspace (PRD #56 M2)", async () => {
+    mockApi.getMySlack.mockResolvedValue({
+      slack: link({ workspace: "error", resolved_id: "U9", state: "pending" }),
+    });
+    mockApi.testMySlackDM.mockRejectedValue(new ApiError(502, "Slack is unavailable right now (502)"));
+    render(<SlackNotifications />);
+    await waitFor(() => expect(testButton().disabled).toBe(false));
+    fireEvent.click(testButton());
+    await waitFor(() => expect(mockApi.testMySlackDM).toHaveBeenCalled());
+    expect(await screen.findByText(/502/)).toBeTruthy();
+  });
 });
