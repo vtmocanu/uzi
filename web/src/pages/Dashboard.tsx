@@ -126,15 +126,19 @@ export function Dashboard() {
     return () => {
       cancelled = true;
     };
-    // SUPPRESSED, NOT FIXED, and deliberately (PRD #103 M3). The rule wants
-    // `user.is_admin` in the deps. Adding it would make this FIRST-LOAD effect
-    // re-run whenever the auth context re-resolves — a behavioural change to page
-    // load, not a lint fix. That is the same argument M3's scope ruling uses to
-    // keep 119 `onClick={asyncHandler}` type-aware findings out of a tooling MR,
-    // and admitting this one while excluding those would be inconsistent.
-    // Reviewed under issue #200; fix or justify permanently there.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    // Deps list `user?.is_admin` (the value the effect branches on at the
+    // getAdminUsage call above), NOT the whole `user` object. ProtectedRoute renders
+    // this page only once auth has resolved to a non-null user, so is_admin holds its
+    // final value at mount. On the ordinary focus/vault-lock refresh path it does not
+    // flip: those replace the user object but re-read the same is_admin. React compares
+    // deps with Object.is per element, so listing the boolean means the effect re-runs
+    // ONLY if is_admin actually changes value — which on the normal path is never, so
+    // it still runs exactly once. (The one case it would change — an admin grant/revoke
+    // by another admin, then a refresh — correctly re-loads the dashboard rather than
+    // showing stale admin/non-admin data, so the fix is safe there too.) Listing the
+    // whole `user` object instead WOULD churn on every refresh; that is why it is the
+    // boolean, not the object. Resolved #200 (the M3 exhaustive-deps review).
+  }, [user?.is_admin]);
 
   // Liveness: re-fetch only the volatile endpoints (runs, workers) every 10s while
   // the tab is visible, so a run moving to awaiting_approval or a worker dropping

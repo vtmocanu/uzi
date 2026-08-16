@@ -145,7 +145,8 @@ export function WorkersSettings() {
         setTokenBusy("");
       }
     },
-    // announce is stable (a setState wrapper). pooledCount is NOT — it is derived from
+    // `announce` is listed but stable (a setState wrapper, useCallback([]) above), so
+    // it never re-creates this callback. pooledCount is NOT — it is derived from
     // `tokens` on every render — and it MUST be in the deps.
     //
     // 🔴 THIS GUARDS A LIVE BUG ON THE ORDINARY PATH, not a future landmine, and the
@@ -164,15 +165,12 @@ export function WorkersSettings() {
     // the 10s poll re-reads workers only), and inferred the fix was merely defensive.
     // The initial [] → fetched transition is the change, and it happens every time.
     //
-    // SUPPRESSED, NOT FIXED (PRD #103 M3). The rule wants `announce` listed. The
-    // paragraph above already records why it is not: it is a setState wrapper and
-    // is stable. What M3 adds is the suppression that makes that reasoning survive
-    // the gate, rather than a dependency whose only effect would be to re-create
-    // this callback on churn the paragraph argues cannot happen. Same treatment
-    // and same reason as Dashboard.tsx's first-load effect. Reviewed under issue
-    // #200; fix or justify permanently there.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [pooledCount],
+    // Resolved #200 (the M3 exhaustive-deps review): `announce` is now listed rather
+    // than suppressed. Because it is stable its only effect is lint compliance — no
+    // added churn, so the M3 concern (a dep re-creating this callback on churn the
+    // paragraph argues cannot happen) does not arise. Same treatment as Dashboard's
+    // first-load effect; the exhaustive-deps disable directive is gone.
+    [pooledCount, announce],
   );
 
   useEffect(() => {
