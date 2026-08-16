@@ -30,16 +30,23 @@ const maxTraceBytes = 16 << 20 // 16 MiB
 // gitLab is the GitLab REST driver. The embedded redactor scrubs the PAT out of
 // every error the underlying client hands back before it leaves this package.
 //
-// baseURL/token/httpClient are retained alongside the SDK client so JobLogTail
+// baseURL/token/logClient are retained alongside the SDK client so JobLogTail
 // can bypass the SDK and stream the job trace under an io.LimitReader: client-go's
 // GetTraceFile buffers the whole trace into memory before returning it, so a raw
 // bounded GET is the only way to cap the TRANSFER rather than a post-buffer copy.
+//
+// logClient is a dedicated client for that raw trace GET that REFUSES to follow
+// redirects (CheckRedirect → http.ErrUseLastResponse). The SDK's own client
+// follows up to 10 redirects, and Go does NOT strip the PRIVATE-TOKEN header on a
+// cross-host redirect (only Authorization/Cookie/WWW-Authenticate), so a
+// hostile-but-allowlisted forge answering the trace request with a cross-host 302
+// would otherwise replay the bot PAT to the redirect target.
 type gitLab struct {
-	client     *gitlab.Client
-	redact     redactor
-	baseURL    string
-	token      string
-	httpClient *http.Client
+	client    *gitlab.Client
+	redact    redactor
+	baseURL   string
+	token     string
+	logClient *http.Client
 }
 
 // newGitLab builds a GitLab driver against baseURL using token, with a bounded
@@ -58,12 +65,19 @@ func newGitLab(baseURL, token string, timeout time.Duration) (*gitLab, error) {
 		// it through a redactor in case the token ever appears.
 		return nil, newRedactor(token).error(fmt.Errorf("gitlab: new client: %w", err))
 	}
+	// logClient is a separate client for JobLogTail's raw trace GET: it shares the
+	// per-call timeout but REFUSES every redirect, so a cross-host 302 cannot replay
+	// the PAT header to the redirect target (mirrors the GitHub driver's logClient).
+	logClient := &http.Client{
+		Timeout:       hc.Timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 	return &gitLab{
-		client:     client,
-		redact:     newRedactor(token),
-		baseURL:    strings.TrimSuffix(baseURL, "/"),
-		token:      token,
-		httpClient: hc,
+		client:    client,
+		redact:    newRedactor(token),
+		baseURL:   strings.TrimSuffix(baseURL, "/"),
+		token:     token,
+		logClient: logClient,
 	}, nil
 }
 
@@ -478,16 +492,19 @@ func (g *gitLab) JobLogTail(ctx context.Context, projectID, jobID int64, maxByte
 	// which buffers the entire trace into memory before returning it: a raw GET read
 	// through an io.LimitReader byte-bounds the TRANSFER itself, so a hostile forge
 	// streaming a multi-GB body cannot OOM the api before the ceiling check fires.
-	// text/plain, no redirect — a plain bounded GET is correct. The tail runs through
-	// the PAT redactor: a hostile pipeline could echo the bot's own token into its
-	// log, and it must not survive into a snapshot.
+	// The request goes through g.logClient, which REFUSES redirects: Go does not
+	// strip the PRIVATE-TOKEN header on a cross-host redirect, so a hostile forge
+	// answering with a 302 to another host would otherwise replay the bot PAT there;
+	// with http.ErrUseLastResponse the 302 surfaces here as a non-2xx and is refused
+	// before any body read. The tail runs through the PAT redactor: a hostile pipeline
+	// could echo the bot's own token into its log, and it must not survive into a snapshot.
 	url := g.baseURL + "/api/v4/projects/" + strconv.FormatInt(projectID, 10) + "/jobs/" + strconv.FormatInt(jobID, 10) + "/trace"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", g.redact.error(fmt.Errorf("gitlab: job log tail: build request: %w", err))
 	}
 	req.Header.Set("PRIVATE-TOKEN", g.token)
-	resp, err := g.httpClient.Do(req)
+	resp, err := g.logClient.Do(req)
 	if err != nil {
 		return "", g.redact.error(fmt.Errorf("gitlab: job log tail: %w", err))
 	}
