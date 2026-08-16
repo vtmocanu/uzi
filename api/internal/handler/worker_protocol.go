@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
@@ -21,6 +20,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/termsafe"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 	"github.com/vtmocanu/uzi/api/internal/workertmpl"
 )
@@ -63,7 +63,7 @@ func sanitizeSelfReported(s string, max int) string {
 	s = strings.TrimSpace(s)
 	var b strings.Builder
 	for _, r := range s {
-		if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
+		if termsafe.Unsafe(r) {
 			continue
 		}
 		b.WriteRune(r)

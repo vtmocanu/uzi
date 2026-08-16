@@ -1,7 +1,10 @@
 package termsafe
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode"
@@ -386,4 +389,49 @@ func describe(s string) string {
 		fmt.Fprintf(&b, "U+%04X", r)
 	}
 	return b.String()
+}
+
+// TestUnsafeMatchesSharedCorpus pins Unsafe to the SHARED golden corpus that
+// web/src/lib/safeText.test.ts also loads (issue #161), so the Go answer and the JS
+// stripUnsafeChars answer cannot silently drift: a change to either predicate that
+// disagrees with a listed code point reds that side. Read at test time via a relative
+// path (NOT go:embed, which cannot reach outside the package dir) — which is why both Go
+// gates mandate -count=1.
+func TestUnsafeMatchesSharedCorpus(t *testing.T) {
+	data, err := os.ReadFile("../../../fixtures/termsafe/corpus.json")
+	if err != nil {
+		t.Fatalf("read shared corpus: %v", err)
+	}
+	var corpus struct {
+		Codepoints []struct {
+			CP     string `json:"cp"`
+			Name   string `json:"name"`
+			Unsafe bool   `json:"unsafe"`
+		} `json:"codepoints"`
+	}
+	if err := json.Unmarshal(data, &corpus); err != nil {
+		t.Fatalf("parse shared corpus: %v", err)
+	}
+	const wantCount = 36 // keep in sync with EXPECTED in web/src/lib/safeText.test.ts; reds on add/remove so a corpus change is deliberate on both sides
+	if len(corpus.Codepoints) != wantCount {
+		t.Fatalf("shared corpus has %d code points, want %d (bump wantCount here and EXPECTED in safeText.test.ts when you intentionally add/remove one)", len(corpus.Codepoints), wantCount)
+	}
+	var sawUnsafe, sawSafe bool
+	for _, e := range corpus.Codepoints {
+		n, err := strconv.ParseInt(e.CP, 16, 32)
+		if err != nil {
+			t.Fatalf("bad cp %q (%s): %v", e.CP, e.Name, err)
+		}
+		if got := Unsafe(rune(n)); got != e.Unsafe {
+			t.Errorf("Unsafe(U+%s %s) = %v, want %v (shared corpus)", e.CP, e.Name, got, e.Unsafe)
+		}
+		if e.Unsafe {
+			sawUnsafe = true
+		} else {
+			sawSafe = true
+		}
+	}
+	if !sawUnsafe || !sawSafe {
+		t.Fatalf("shared corpus must cover both classes: sawUnsafe=%v sawSafe=%v", sawUnsafe, sawSafe)
+	}
 }

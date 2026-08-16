@@ -87,15 +87,18 @@
 // CATEGORY predicates over runes, so accented Latin, CJK and emoji pass through
 // byte-identical (measured). The one real casualty is stated on Unsafe itself.
 //
-// NOT YET THE MODULE'S ONLY SPELLING, and saying so is the point of this paragraph —
-// a comment claiming a closed hazard is how the next reader skips checking.
-// workersvc.hasUnsafeChar, handler.sanitizeSelfReported, handler.validateSecretLabel
-// and workersvc.sanitizeMemoryField each still carry their own copy of some part of
-// this rule, for their own reasons (different whitespace policy, different action on a
-// hit, an extra U+FFFD test). Converging them is worth doing and was out of scope for
-// #169, which is a two-consumer change. What this package guarantees today is that the
-// CLI renderer and the name validators cannot disagree — not that nothing else in the
-// module spells it a fourth way.
+// THE PREDICATE IS NOW SHARED, THE BEHAVIOUR AROUND IT IS NOT — and saying so is the
+// point of this paragraph, because a comment claiming more convergence than landed is
+// how the next reader skips checking. As of issue #161, workersvc.hasUnsafeChar,
+// handler.sanitizeSelfReported, handler.validateSecretLabel and
+// workersvc.sanitizeMemoryField all route their unsafe-rune PREDICATE through Unsafe
+// rather than re-spelling IsControl-or-Cf. What still differs per site is only the
+// behaviour AROUND that predicate: the action on a hit (strip vs reject), the
+// whitespace policy (a \n/\t exception, or none), the byte cap, the trim posture, and
+// validateSecretLabel's extra U+FFFD test. What this package guarantees is that the CLI
+// renderer, the name validators and those four sites cannot disagree about WHICH runes
+// are unsafe — not that they all treat an unsafe rune the same way, which they
+// deliberately do not.
 package termsafe
 
 import (
