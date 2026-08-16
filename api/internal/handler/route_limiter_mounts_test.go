@@ -294,6 +294,13 @@ var wantRouteMounts = []routeMount{
 	// trusted proxy by construction. The real bounds on this endpoint are the ones that
 	// fit it — a 1 MiB body cap and an explicit 512-entry cap — not a request rate.
 	// Same reasoning, same answer as GET /api/controller/poll above.
+	// PRD #333 M5: filing a forge issue from a finding is a forge WRITE on the caller's
+	// connection, so it carries the per-user forge budget, mirroring the recommendation
+	// file route below.
+	{"POST", "/api/findings/{id}/issue", limForge},
+	// PRD #333 M5: dismissing a finding is a LOCAL write — no forge call, no spend — so it
+	// carries no per-user limiter, like the recommendation disposition write.
+	{"POST", "/api/findings/{id}/dismiss", noLimiter},
 	{"POST", "/api/controller/status", noLimiter},
 	{"POST", "/api/chats/{id}/proposals/{pid}/confirm", limForge},
 	{"POST", "/api/chats/{id}/proposals/{pid}/dismiss", noLimiter},

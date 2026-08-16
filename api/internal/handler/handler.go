@@ -672,16 +672,27 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Put("/recommendations/disposition", h.BulkSetDispositions)
 		})
 
-		// Incidental Findings backlog (PRD #333 M4, D7/D8): the per-repo, owner-scoped,
-		// coordinate-deduped backlog of off-task bugs the worker flagged mid-run, plus the
-		// deterministic issue-draft for filing one. Both are READS on RequireUser (so
-		// `uzi findings list` works from a CLI token); owner-scoped by the query's user_id
-		// filter, read-only — no forge write, no token spend. The file/dismiss WRITES (M5)
-		// mount separately on the cookie+CSRF RequireAuth + forge-limiter path.
+		// Incidental Findings backlog (PRD #333 M4/M5, D7/D8): the per-repo, owner-scoped,
+		// coordinate-deduped backlog of off-task bugs the worker flagged mid-run, its issue
+		// draft, and the human-gated file/dismiss WRITES. Two sibling groups (the runs
+		// pattern): the READS are RequireUser (so `uzi findings list` works from a CLI token)
+		// and the WRITES are the stricter cookie+CSRF RequireAuth — a CLI token cannot drive a
+		// forge write.
 		r.Route("/findings", func(r chi.Router) {
-			r.Use(mw.RequireUser(h.q, h.cfg))
-			r.Get("/", h.ListFindings)
-			r.Get("/{id}/issue-draft", h.GetFindingIssueDraft)
+			// Reads: owner-scoped by the query's user_id filter, no forge write, no spend.
+			r.Group(func(r chi.Router) {
+				r.Use(mw.RequireUser(h.q, h.cfg))
+				r.Get("/", h.ListFindings)
+				r.Get("/{id}/issue-draft", h.GetFindingIssueDraft)
+			})
+			// Writes (M5): cookie+CSRF RequireAuth. Filing is a forge write, so it rides the
+			// per-user forge limiter (mirroring FileIssue); dismiss is a LOCAL write (no forge
+			// call, no spend) and carries no limiter, beside the reads.
+			r.Group(func(r chi.Router) {
+				r.Use(mw.RequireAuth(h.q, h.cfg))
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issue", h.FileFinding)
+				r.Post("/{id}/dismiss", h.DismissFinding)
+			})
 		})
 
 		// Per-user vault (PRD #32): unlock/lock/status for the password-wrapped

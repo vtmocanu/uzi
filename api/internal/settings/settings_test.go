@@ -67,6 +67,54 @@ func TestAccessorsFallBackToDefaults(t *testing.T) {
 	}
 }
 
+// TestFindingLabelAccessor pins the PRD #333 D5 marker accessor: a stored value wins,
+// an empty table falls back to DefaultFindingLabel, and a present-but-empty row is
+// treated as missing — the same read semantics as PRDLabel.
+func TestFindingLabelAccessor(t *testing.T) {
+	// Stored value wins.
+	c := New(&fakeStore{rows: []store.AppSetting{row(KeyFindingLabel, "bug-radar")}}, time.Minute)
+	if got, err := c.FindingLabel(context.Background()); err != nil || got != "bug-radar" {
+		t.Fatalf("FindingLabel = %q, %v; want bug-radar", got, err)
+	}
+	// Empty table → compiled-in default.
+	c = New(&fakeStore{}, time.Minute)
+	if got, err := c.FindingLabel(context.Background()); err != nil || got != DefaultFindingLabel {
+		t.Fatalf("FindingLabel = %q, %v; want default %q", got, err, DefaultFindingLabel)
+	}
+	// A present-but-empty value falls back too.
+	c = New(&fakeStore{rows: []store.AppSetting{row(KeyFindingLabel, "")}}, time.Minute)
+	if got, _ := c.FindingLabel(context.Background()); got != DefaultFindingLabel {
+		t.Fatalf("empty stored value: FindingLabel = %q; want default", got)
+	}
+}
+
+// TestFindingLabelValidationAndShape pins that finding_label is a KNOWN key that goes
+// through All/defaults and that its write validation is the single-label rule prd_label
+// uses (Validate's default branch → ValidateLabel): non-empty, ≤64 bytes, no comma.
+func TestFindingLabelValidationAndShape(t *testing.T) {
+	if !Known(KeyFindingLabel) {
+		t.Fatal("finding_label is not Known — a settings PUT would reject it")
+	}
+	all, err := New(&fakeStore{}, time.Minute).All(context.Background())
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if all[KeyFindingLabel] != DefaultFindingLabel {
+		t.Errorf("All[finding_label] = %q, want default %q", all[KeyFindingLabel], DefaultFindingLabel)
+	}
+	// A valid label saves.
+	if err := Validate(KeyFindingLabel, "agent-found"); err != nil {
+		t.Errorf("Validate(finding_label, valid) = %v, want nil", err)
+	}
+	// The single-label rules apply: empty/whitespace, a comma, and an over-64-char value
+	// are each rejected (mirroring prd_label).
+	for _, bad := range []string{"", "   ", "a,b", strings.Repeat("x", maxLabelLen+1)} {
+		if err := Validate(KeyFindingLabel, bad); err == nil {
+			t.Errorf("Validate(finding_label, %q) = nil, want a label rejection", bad)
+		}
+	}
+}
+
 func TestPrdlessAccessors(t *testing.T) {
 	// Empty table → compiled-in defaults: enabled (true) + "PRDLESS".
 	c := New(&fakeStore{}, time.Minute)
