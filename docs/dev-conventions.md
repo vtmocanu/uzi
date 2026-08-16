@@ -589,3 +589,50 @@ scenarios are mutually exclusive by construction. Known values:
   truthful throughout — so the screen's own inconsistency between a group's
   count and the tallies above it is visible in one view, not just asserted
   in a warning banner. (PRD #98.)
+
+### What keeps the mock build current
+
+Nothing forces a new feature into the demo. What exists is a small stack of
+mechanical checks, each narrower than it sounds — worded here exactly so
+"enforced" isn't read as "the demo is good":
+
+- **Endpoint parity — type system.** `web/src/lib/api.ts` exports
+  `api: typeof realApi`, so `mockApi` is type-checked against the real
+  client: a new or changed *endpoint* fails `tsc` (in `task gate:web`)
+  until it is mocked. This forces a mock *implementation* to exist, not a
+  realistic *scenario* — it says nothing about whether the mocked data
+  looks like production. Oldest and strongest layer.
+- **The image builds — CI (PRD #311 M1).** The `build:web-mock` job runs
+  `VITE_UZI_MOCK=1 npm run build` against `web/Dockerfile.mock` on
+  `web/**`/`docs/**` merge requests and on protected refs, `--no-push`
+  with no artifact. So a broken fixture or a mock-only import error can
+  no longer silently stop the demo image from building — it only proves
+  the build succeeds, not that the result is a good demo.
+- **Every route mounts without throwing — a test (PRD #311 M2).**
+  `web/src/App.routes.test.tsx` forces mock mode and mounts every route
+  in the `App.tsx` `APP_ROUTES` table. The router and the test consume
+  the SAME table, so a route added *to the table* is smoke-tested
+  automatically. (The honest limit: a bare `<Route>` written directly in
+  `App.tsx` outside the table — as the `*` catch-all is — would bypass it,
+  so keeping routes in the table is the convention that makes the guard
+  hold.) It asserts only that each page renders without throwing on the
+  mock fixtures — not that the page is correct or complete.
+- **The issue #195 divergence invariant — a test on named fixtures
+  (PRD #311 M3).** `web/src/mocks/data.realism.test.ts` pins that the
+  result frames the cost/usage surfaces actually read
+  (`mockDoneMessages`, `mockFailedMessages` in `src/mocks/data.ts`, and
+  `PLAN_RESULT_FRAME` / `RUN_RESULT_FRAME` in `src/mocks/engine.ts`)
+  carry more than one model key and a `modelUsage` that diverges from
+  the frame's top-level `usage`, in the real under-reading direction.
+  It guards only those named fixtures, and only that one invariant —
+  it is not a general realism check.
+
+What none of the above gates: whether a new user-facing feature shows up
+in the demo at all. There is no mechanical signal for "this is a new
+feature that needs a scenario," so the standing convention is: **a new
+user-facing feature must add or extend a mock scenario so its state is
+reachable in the demo, not merely covered by a unit test** —
+`truncated-backlog` above is the worked example. Likewise "the mock data
+is realistic" in general is still a convention to uphold by hand, not a
+gate to rely on: the PRD #311 M3 guard covers one specific invariant on
+five named fixtures, nothing broader.
