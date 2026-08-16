@@ -27,6 +27,15 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   read-only `web-ux` validator. It runs on `opus` and inherits the full
   toolset. Boot-seeded via `ReconcileBuiltinTemplates`; existing installs pick
   it up on the next boot. (#314)
+### Fixed
+
+- **A completed run with an opened MR is no longer recorded as a total loss
+  (#329).** The run-timeout sweeper and the worker's completion report could
+  race: when the sweeper's `RUN_TIMEOUT` write landed first, it clobbered the
+  worker's later completion. A genuine completion now supersedes a
+  run-timeout failure, and the merge-request link is recorded independently
+  of the final run status, so a run that opened an MR never displays
+  "MR: none". (#329)
 
 ## [0.39.0] - 2026-08-16
 

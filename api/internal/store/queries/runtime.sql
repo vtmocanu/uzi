@@ -1187,13 +1187,39 @@ UPDATE runs SET
     -- because SetRunCompleted can in principle run on a row that already carries a
     -- stamp from an earlier terminal transition.
     prd_patch_settled_at = NULL,
+    -- issue #329: a completion that supersedes a run_timeout failure must clear the
+    -- stale timeout classification. No-op on a normal completion (both already NULL).
+    failure_reason     = NULL,
+    fail_origin        = NULL,
     move_pending_since = now(),
     finished_at        = now(),
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id
-  AND status NOT IN ('completed', 'failed', 'cancelled');
+  -- issue #329: a genuine worker completion (it opened the MR) supersedes a
+  -- wall-clock RUN_TIMEOUT failure. Scoped to fail_origin='run_timeout' ONLY: a
+  -- human 'cancelled' still wins, and a worker's own 'failed'/'worker_lost' is never
+  -- overridden. worker_id=@worker_id (SweepRunningTimeout leaves it intact) keeps
+  -- this safe — only the still-owning worker can supersede.
+  AND (status NOT IN ('completed', 'failed', 'cancelled')
+       OR (status = 'failed' AND fail_origin = 'run_timeout'));
+
+-- name: ReconcileRunMR :execrows
+-- issue #329: record the MR the worker actually opened, INDEPENDENT of the terminal
+-- status label, so a run that opened an MR never reports "MR: none". Non-clobbering
+-- (COALESCE keeps an already-recorded value, e.g. the authoritative SetRunCompleted
+-- write) and status-agnostic (no status predicate) — it heals a run whose terminal
+-- transition landed 'failed'/'cancelled' while the worker still opened an MR. Scoped
+-- by worker_id like the terminal writers. Deliberately does NOT touch the watcher-owned
+-- MR-state column (the SetRunMRState invariant guarded by TestMRStateIsWatcherOwned);
+-- naming that column literally here would itself trip that substring guard.
+UPDATE runs SET
+    mr_iid     = COALESCE(mr_iid, @mr_iid),
+    mr_web_url = COALESCE(mr_web_url, @mr_web_url),
+    branch     = COALESCE(branch, @branch),
+    updated_at = now()
+WHERE id = @id AND worker_id = @worker_id;
 
 -- name: SetRunFailed :execrows
 -- failed restores the origin column → move_pending_since stamped in the same
