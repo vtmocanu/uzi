@@ -431,6 +431,36 @@ func (q *Queries) SettleFindingFiled(ctx context.Context, arg SettleFindingFiled
 	return result.RowsAffected(), nil
 }
 
+const sweepStrandedFilingFindings = `-- name: SweepStrandedFilingFindings :execrows
+UPDATE finding_dispositions
+SET status = 'open',
+    filing_since = NULL
+WHERE status = 'filing' AND filing_since IS NOT NULL AND filing_since < $1
+`
+
+// Boot/interval reaper for filing claims stranded by a crash (M5 review, mirror of
+// review_issues.sql SweepStrandedRecommendationClaims). A FileFinding killed AFTER
+// ClaimFindingForFiling (status='filing', filing_since set) but before SettleFindingFiled /
+// RevertFindingFiling leaves the coordinate `filing` forever — ClaimFindingForFiling and
+// DismissFinding both guard status='open', so nothing else can ever move it. This resets it
+// to `open` (clearing filing_since) so the user can re-file. @cutoff MUST be clamped
+// >= 2x ForgeHTTPTimeout by the caller (cfg.IssueFilingStuckTimeout, config.go clamp) so a
+// slow-but-alive CreateIssue is never reset mid-flight.
+//
+// ACCEPTED TRADEOFF, stated explicitly (the same one the judge reaper accepts): a coordinate
+// whose CreateIssue actually SUCCEEDED but whose settle failed is also reset to `open`, so a
+// later re-file creates a SECOND forge issue. That rare duplicate is chosen deliberately over
+// a permanent dead-end coordinate — the 2x-timeout clamp makes it require a crash between a
+// succeeded forge write and its settle, and re-opening a re-fileable coordinate is strictly
+// better than stranding it. Returns rows affected (for the sweeper log).
+func (q *Queries) SweepStrandedFilingFindings(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error) {
+	result, err := q.db.Exec(ctx, sweepStrandedFilingFindings, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const updateDispositionLastTitle = `-- name: UpdateDispositionLastTitle :execrows
 UPDATE finding_dispositions
 SET last_title = $1,

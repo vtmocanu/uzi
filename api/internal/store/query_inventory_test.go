@@ -876,6 +876,12 @@ var queryInventory = []queryPin{
 			"filters by ?repo= and by ?run= (a SEMI-JOIN that does NOT shrink seen_in_runs), excludes " +
 			"an evidence row with no disposition (disposition-driven, D7), and returns nothing for a " +
 			"foreign user"},
+	{"SweepStrandedFilingFindings", "findings.sql", "TestSweepStrandedFilingFindingsLiveDB",
+		"direct call, both directions and fixture-scoped: a `filing` coordinate whose filing_since " +
+			"is older than the cutoff is reset to `open` (n>=1, read back as open with filing_since " +
+			"NULL, and it reappears in the to_file bucket / open_count) while a `filing` coordinate " +
+			"with a FRESH filing_since (within the cutoff) is NOT reset — the clamp that protects a " +
+			"slow-but-alive CreateIssue mid-flight (M5 review reaper)"},
 
 	// ── notifications.sql — the PRD #333 D6 coalescing plumbing (M1 lands the queries; M3 uses them) ──
 	{"FindUnreadNotificationForRunKind", "notifications.sql", unpinnedPin,

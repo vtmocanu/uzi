@@ -108,6 +108,27 @@ SET status = 'open',
 WHERE user_id = @user_id AND repo_id = @repo_id AND location = @location
   AND status = 'filing';
 
+-- name: SweepStrandedFilingFindings :execrows
+-- Boot/interval reaper for filing claims stranded by a crash (M5 review, mirror of
+-- review_issues.sql SweepStrandedRecommendationClaims). A FileFinding killed AFTER
+-- ClaimFindingForFiling (status='filing', filing_since set) but before SettleFindingFiled /
+-- RevertFindingFiling leaves the coordinate `filing` forever — ClaimFindingForFiling and
+-- DismissFinding both guard status='open', so nothing else can ever move it. This resets it
+-- to `open` (clearing filing_since) so the user can re-file. @cutoff MUST be clamped
+-- >= 2x ForgeHTTPTimeout by the caller (cfg.IssueFilingStuckTimeout, config.go clamp) so a
+-- slow-but-alive CreateIssue is never reset mid-flight.
+--
+-- ACCEPTED TRADEOFF, stated explicitly (the same one the judge reaper accepts): a coordinate
+-- whose CreateIssue actually SUCCEEDED but whose settle failed is also reset to `open`, so a
+-- later re-file creates a SECOND forge issue. That rare duplicate is chosen deliberately over
+-- a permanent dead-end coordinate — the 2x-timeout clamp makes it require a crash between a
+-- succeeded forge write and its settle, and re-opening a re-fileable coordinate is strictly
+-- better than stranding it. Returns rows affected (for the sweeper log).
+UPDATE finding_dispositions
+SET status = 'open',
+    filing_since = NULL
+WHERE status = 'filing' AND filing_since IS NOT NULL AND filing_since < @cutoff;
+
 -- name: DismissFinding :execrows
 -- The user's triage: dismiss a coordinate with a reason (M5), open → dismissed. Guarded
 -- to status='open' by design (documented): a coordinate mid-filing or already filed is not

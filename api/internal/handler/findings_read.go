@@ -12,7 +12,6 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
-	"github.com/vtmocanu/uzi/api/internal/issuedraft"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -107,32 +106,12 @@ func (h *Handler) GetFindingIssueDraft(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The reporting run supplies the provenance footer (kind + issue iid). Owner-scoped by
-	// (run_id, user_id); display-only, so a lookup miss just drops the kind/iid, never fails
-	// the draft. The repo path is resolved owner-scoped from the finding's repo (the finding
-	// owner always owns its repo); a miss drops the Repo line.
-	var runKind string
-	var issueIID int64
-	if run, rerr := h.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: finding.RunID, UserID: user.ID}); rerr == nil {
-		runKind = run.Kind
-		if run.IssueIid.Valid {
-			issueIID = run.IssueIid.Int64
-		}
-	}
-	repoPath := ""
-	if repo, rerr := h.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: finding.RepoID, UserID: finding.UserID}); rerr == nil {
-		repoPath = repo.PathWithNamespace
-	}
-
-	draft := issuedraft.RenderFinding(issuedraft.FindingDraftInput{
-		Title:       finding.Title,
-		Description: finding.DescriptionMd,
-		Location:    finding.Location,
-		RepoPath:    repoPath,
-		RunShortID:  shortID(finding.RunID),
-		RunKind:     runKind,
-		IssueIID:    issueIID,
-	})
+	// The draft is built by the SAME buildFindingDraft that FileFinding (M5) uses for its
+	// default filed text, so this preview is byte-identical to what an omitted body files.
+	// The reporting run supplies the provenance footer (kind + issue iid) and the repo path,
+	// both owner-scoped and display-only — a lookup miss just drops that line, never fails the
+	// draft.
+	draft := h.buildFindingDraft(ctx, finding)
 
 	httpx.JSON(w, http.StatusOK, apitypes.IncidentalFindingIssueDraftDTO{
 		Title:       draft.Title,

@@ -106,8 +106,10 @@ func (h *Handler) FileFinding(w http.ResponseWriter, r *http.Request) {
 	// (3) Resolve the filed title/description (D4). The default is the deterministic template
 	// over the STORED row (agent text never rides in raw — RenderFinding routes each field
 	// through the matching sanitiser). A body field is a user EDIT: re-run it through the same
-	// write-boundary sanitiser, never trust it to be inert.
-	draft := h.renderFindingDraft(ctx, user.ID, finding, repo)
+	// write-boundary sanitiser, never trust it to be inert. The draft is built by the SAME
+	// buildFindingDraft the M4 preview (GetFindingIssueDraft) uses, so what the user previewed
+	// is byte-identical to what an omitted body files.
+	draft := h.buildFindingDraft(ctx, finding)
 
 	title := draft.Title
 	if req.Title != nil {
@@ -130,6 +132,13 @@ func (h *Handler) FileFinding(w http.ResponseWriter, r *http.Request) {
 	// (4) Labels are assembled server-side (D5): the config-overridable marker unioned with the
 	// user's sanitised, capped selection, marker ALWAYS first and present. The API gives the
 	// client no way to attach a trigger label that skips the marker.
+	//
+	// LABEL POSTURE (auditor question, confirmed): the ONLY inputs are the server marker and the
+	// human's req.Labels. The agent-authored suggestions stored on finding.Labels are NOT read
+	// here, so they never auto-attach — they are surfaced only as an editable seed in the M4
+	// draft (GetFindingIssueDraft), and attach solely when the repo owner explicitly keeps them
+	// in the body. A user-chosen run-eligible label is therefore the owner's own deliberate
+	// action, not an agent-injected one.
 	marker, _ := h.settings.FindingLabel(ctx)
 	filedLabels := assembleFindingLabels(marker, req.Labels)
 
@@ -196,24 +205,32 @@ type fileFindingResponse struct {
 	Warning string          `json:"warning,omitempty"`
 }
 
-// renderFindingDraft builds the deterministic finding issue draft (D4) over the STORED row,
-// resolving the provenance footer's run kind / issue iid (owner-scoped, display-only — a lookup
-// miss just drops them) and the repo path from the already-loaded repo. It is the default filed
-// text; a body edit replaces title/description before either is written.
-func (h *Handler) renderFindingDraft(ctx context.Context, userID uuid.UUID, finding store.IncidentalFinding, repo store.GetRepoForUserRow) issuedraft.FindingDraft {
+// buildFindingDraft builds the deterministic finding issue draft (D4) over the STORED row. It is
+// the ONE shared draft path used by BOTH the M4 preview (GetFindingIssueDraft) and the M5 default
+// filed text (FileFinding), so what the user previews is byte-identical to what an omitted body
+// files. Everything is resolved OWNER-SCOPED by finding.UserID (which is the authenticated user at
+// both call sites — the finding was loaded via the (id, user_id) owner-scoped GetIncidentalFinding):
+// the provenance footer's run kind / issue iid, and the repo path. Both lookups are display-only —
+// a miss just drops the corresponding line, never fails the draft. A body edit replaces
+// title/description before either is written.
+func (h *Handler) buildFindingDraft(ctx context.Context, finding store.IncidentalFinding) issuedraft.FindingDraft {
 	var runKind string
 	var issueIID int64
-	if run, rerr := h.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: finding.RunID, UserID: userID}); rerr == nil {
+	if run, rerr := h.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: finding.RunID, UserID: finding.UserID}); rerr == nil {
 		runKind = run.Kind
 		if run.IssueIid.Valid {
 			issueIID = run.IssueIid.Int64
 		}
 	}
+	repoPath := ""
+	if repo, rerr := h.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: finding.RepoID, UserID: finding.UserID}); rerr == nil {
+		repoPath = repo.PathWithNamespace
+	}
 	return issuedraft.RenderFinding(issuedraft.FindingDraftInput{
 		Title:       finding.Title,
 		Description: finding.DescriptionMd,
 		Location:    finding.Location,
-		RepoPath:    repo.PathWithNamespace,
+		RepoPath:    repoPath,
 		RunShortID:  shortID(finding.RunID),
 		RunKind:     runKind,
 		IssueIID:    issueIID,
@@ -237,8 +254,15 @@ func (h *Handler) revertFindingClaim(ctx context.Context, finding store.Incident
 // settleFiledFinding closes a won claim with the created issue iid (filing→filed). It runs only
 // AFTER a successful CreateIssue, so a non-empty return is created-with-warning: the forge issue
 // is real, and the caller NEVER reverts or retries on it. Empty on a clean settle; a warning when
-// the settle errored or matched 0 rows (the claim was swept mid-flight — the issue exists, only
-// the local disposition is unlinked, and a sweeper/next report reconciles it).
+// the settle errored or matched 0 rows.
+//
+// On a settle failure the coordinate is LEFT `filing` (never reverted — that would orphan the
+// real forge issue). It does NOT self-heal on the next report: ReopenDispositionOnHashMismatch
+// guards status IN ('filed','dismissed'), so a re-report of a `filing` coordinate is a no-op. The
+// stranded-filing sweeper (main.go `finding_filing_claims_stranded`, clamped by
+// IssueFilingStuckTimeout to >= 2x ForgeHTTPTimeout) is what recovers it: on a later tick it
+// resets the coordinate to `open` so the user can re-file — accepting the rare duplicate that a
+// re-file of an already-created issue produces (documented on SweepStrandedFilingFindings).
 func (h *Handler) settleFiledFinding(ctx context.Context, finding store.IncidentalFinding, iid int64) string {
 	const warnUnlinked = "The issue was created on the forge, but recording it in uzi failed; the finding may still show as unfiled until it reconciles."
 	rows, err := h.q.SettleFindingFiled(ctx, store.SettleFindingFiledParams{
@@ -363,7 +387,9 @@ func (h *Handler) DismissFinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if rows == 0 {
-		httpx.Error(w, http.StatusConflict, "cannot dismiss (already filed or being filed)")
+		// The guard is status='open', so a 0-row result is any non-open state: filed, mid-filing,
+		// or already dismissed. All three are named so the message is accurate for each.
+		httpx.Error(w, http.StatusConflict, "cannot dismiss (already filed, being filed, or already dismissed)")
 		return
 	}
 

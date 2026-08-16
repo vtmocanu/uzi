@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -372,6 +373,112 @@ func TestIncidentalFindingsLiveDB(t *testing.T) {
 			t.Fatalf("a foreign user's backlog must be empty, got %d rows", len(got))
 		}
 	})
+}
+
+// TestSweepStrandedFilingFindingsLiveDB pins the M5-review stranded-filing reaper against a real
+// Postgres. A FileFinding killed AFTER ClaimFindingForFiling but before it settled/reverted leaves
+// the coordinate `filing` forever (ClaimFindingForFiling and DismissFinding both guard
+// status='open'), so SweepStrandedFilingFindings resets a stale claim to `open` on a later tick.
+//
+// Two fixture-scoped, opposing facts (the judge reaper's shape): a `filing` coordinate whose
+// filing_since predates the cutoff is reset to `open` (and reappears in the to_file bucket /
+// open_count); a `filing` coordinate with a FRESH filing_since (within the cutoff) is NOT reset —
+// the clamp that protects a slow-but-alive CreateIssue mid-flight. Statuses are asserted
+// per-coordinate, never via a table-wide swept count (that would flake on the shared live-DB, the
+// documented lesson on SweepStrandedRecommendationClaims).
+//
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres (e2e/run-store-it.sh).
+func TestSweepStrandedFilingFindingsLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	userID, connID, repoID, runID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		userID, fmt.Sprintf("sweep-findings-%s@e2e", userID))
+	mustExec(ctx, t, pool,
+		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})
+	mustExec(ctx, t, pool,
+		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		 VALUES ($1, $2, 3, 'g/sweep', 'https://forge.e2e/g/sweep', 'main', true)`, repoID, connID)
+	mustExec(ctx, t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind)
+		 VALUES ($1, $2, $3, 31, 'Do X', 'desc', 'completed', 'issue')`, runID, userID, repoID)
+
+	// Two coordinates, both driven into `filing` via the real claim query.
+	const stale = "internal/a.go#stranded"
+	const fresh = "internal/b.go#live"
+	toFiling := func(location string) {
+		t.Helper()
+		if _, err := q.InsertFinding(ctx, store.InsertFindingParams{
+			RunID: runID, UserID: userID, RepoID: repoID, Location: location,
+			Title: "bug", DescriptionMd: "d", Labels: []byte(`["bug"]`), Confidence: "high",
+		}); err != nil {
+			t.Fatalf("InsertFinding(%s): %v", location, err)
+		}
+		if _, err := q.UpsertOpenDisposition(ctx, store.UpsertOpenDispositionParams{
+			UserID: userID, RepoID: repoID, Location: location, ContentHash: "h", LastTitle: "bug",
+		}); err != nil {
+			t.Fatalf("UpsertOpenDisposition(%s): %v", location, err)
+		}
+		if n, err := q.ClaimFindingForFiling(ctx, store.ClaimFindingForFilingParams{
+			UserID: userID, RepoID: repoID, Location: location,
+		}); err != nil || n != 1 {
+			t.Fatalf("ClaimFindingForFiling(%s) = %d, %v; want 1", location, n, err)
+		}
+	}
+	toFiling(stale)
+	toFiling(fresh)
+
+	// Strand the first claim: age its filing_since well past the cutoff. The second keeps the
+	// fresh now() that ClaimFindingForFiling stamped.
+	mustExec(ctx, t, pool,
+		`UPDATE finding_dispositions SET filing_since = now() - interval '1 hour'
+		 WHERE user_id=$1 AND repo_id=$2 AND location=$3`, userID, repoID, stale)
+
+	// Sweep with a cutoff 1 minute in the past: the hour-old claim is < cutoff (reaped), the
+	// fresh now()-stamped claim is > cutoff (protected).
+	if _, err := q.SweepStrandedFilingFindings(ctx, pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true}); err != nil {
+		t.Fatalf("SweepStrandedFilingFindings: %v", err)
+	}
+
+	// (1) the stranded coordinate is reset to open with filing_since cleared.
+	var status string
+	var filingSince pgtype.Timestamptz
+	if err := pool.QueryRow(ctx,
+		`SELECT status, filing_since FROM finding_dispositions WHERE user_id=$1 AND repo_id=$2 AND location=$3`,
+		userID, repoID, stale).Scan(&status, &filingSince); err != nil {
+		t.Fatalf("read stranded row: %v", err)
+	}
+	if status != "open" || filingSince.Valid {
+		t.Fatalf("stranded coordinate after sweep = (status=%q filing_since_valid=%v); want open with filing_since NULL", status, filingSince.Valid)
+	}
+
+	// (2) the fresh claim is NOT reset — still filing (protects a slow-but-alive CreateIssue).
+	if s := dispStatus(ctx, t, pool, userID, repoID, fresh); s != "filing" {
+		t.Fatalf("fresh coordinate after sweep = %q, want filing (within cutoff, protected)", s)
+	}
+
+	// (3) the reset coordinate reappears in the open count and the to_file bucket.
+	if n, err := q.CountOpenFindingsForUser(ctx, store.CountOpenFindingsForUserParams{UserID: userID}); err != nil || n != 1 {
+		t.Fatalf("CountOpenFindingsForUser after sweep = %d, %v; want 1 (only the reset coordinate)", n, err)
+	}
+	open := backlog(ctx, t, q, store.ListFindingsBacklogParams{UserID: userID, Status: pgtype.Text{String: "open", Valid: true}})
+	if len(open) != 1 || open[0].Location != stale {
+		t.Fatalf("to_file bucket after sweep = %+v, want exactly the reset (stale) coordinate", open)
+	}
 }
 
 func backlog(ctx context.Context, t *testing.T, q *store.Queries, p store.ListFindingsBacklogParams) []store.ListFindingsBacklogRow {
