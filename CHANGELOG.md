@@ -38,6 +38,16 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Fixed
 
+- **`uzi run logs` no longer dies mid-body on a large run and prints an empty
+  result that looks like "no messages" (#160).** The viewer messages endpoint
+  (`GET /api/runs/{id}/messages`) now gzips its response and gained an opt-in
+  `?limit=` (clamped to 1000; omitting it is unchanged and unbounded, so the
+  web SPA sees no behavior change). `uzi run logs` fetches a run's history in
+  bounded `?after=&limit=` pages internally and reassembles them, and it is
+  now all-or-nothing: it prints the complete history or nothing at all, exiting
+  non-zero on any page failure — a failed fetch can no longer be mistaken for
+  a run with an empty log. Paging is entirely transparent; callers still pass
+  only `--after`/`--follow`, not a page size. (#160)
 - **`e2e/run-store-it.sh` no longer masquerades a Postgres-readiness timeout as
   a passing/skipped test run (#171).** The throwaway-Postgres wait was a
   hard-coded 30s; on a daemon busy with mutation containers it timed out and the

@@ -213,6 +213,19 @@ uzi version
   rewrite an unrecognised status to `unknown`, but plain `run get`/`run list
   --json` pass it through verbatim, so this nine-value list is what you branch
   on.)
+
+  **Paging is internal and transparent; treat it as all-or-nothing.** A large
+  run's history is fetched in bounded pages under the hood (and gzipped on
+  the wire) and reassembled before anything is printed — you never pass a
+  page flag, and `--after` still just sets the starting sequence, not a page
+  boundary. If any page fetch fails, a one-shot `run logs` prints **nothing**
+  and exits non-zero instead of emitting a partial transcript (the guarantee
+  is per fetch; under `--follow`, batches already streamed stay printed, but a
+  failed poll still exits non-zero). So **empty stdout means "no messages" only
+  when the exit code is 0**; a non-zero exit means the fetch failed, and stdout
+  at that point is not a complete (or trustworthy) log. Gate on the exit code
+  before parsing NDJSON — do not infer "run has no messages" from empty output
+  alone.
 - `uzi run wait <run-id>` — block until the run reaches a state you can act on,
   the primitive for driving a gated run headless. With no `--until` it stops on
   any **actionable or terminal** state — `awaiting_approval` (the plan gate),

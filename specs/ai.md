@@ -923,8 +923,8 @@ messages / correct them" (the SPA consuming these is M5, but the endpoints ship 
 - **Runs**: `POST /api/repos/{id}/runs` (queue a run — repo owned + issue is a cached
   PRD issue **with a PRD link**; title snapshotted from cache, description from the
   request; duplicate active run → 409 via the unique index), `GET /api/runs/{id}`,
-  `GET /api/runs/{id}/messages` (replay after a seq), `POST /api/runs/{id}/inputs`
-  (submit steering).
+  `GET /api/runs/{id}/messages` (replay after a seq; gzip'd + opt-in bounded
+  `?limit=` — see §547), `POST /api/runs/{id}/inputs` (submit steering).
 - **No-live-poller server-side transition**: a `cancel` or `reject_plan` for a run
   with no live poller (still `queued`, or its worker gone stale) is applied
   **server-side** directly to `cancelled`/`failed` — the input is never stranded
@@ -21090,3 +21090,20 @@ moves the file. Serves the same doc-integrity intent as the `check-docs` gate.
 - **Guard test.** `TestPRDLifecycleBodyCarriesTheLoadBearingRules` in
   `api/internal/skilltmpl/prd_lifecycle_test.go` pins that the sweep instruction stays present in the
   embedded skill body, so a future edit cannot silently drop it.
+
+## 547. Issue #160 — large run history fetches whole-or-fails: gzip + opt-in bounded page + all-or-nothing CLI paging
+
+A large run's message history could not be fetched in one request, and the failure was silent (a
+truncated/failed fetch looked like an empty run). Fixed on `GET /api/runs/{id}/messages` (§42) plus the
+`uzi run logs` CLI, in three layers.
+
+- **Server gzip.** The endpoint is now gzip-compressed (chi `Compress` scoped to that route). Transparent
+  to the CLI and browsers via `Accept-Encoding` negotiation — no client change required.
+- **Opt-in bounded page.** The endpoint accepts an OPT-IN `?limit=<n>` returning a bounded page, clamped
+  to a server max of 1000; backed by a new `ListRunMessagesAfterPage` sqlc query. Absent `limit` keeps
+  the unbounded legacy path — the web SPA/replay relies on it, so this is non-breaking.
+- **All-or-nothing CLI paging.** `uzi run logs` (`HTTPClient.RunLogs`) fetches the history in bounded
+  `?after=&limit=` pages internally and reassembles them, returning the COMPLETE history or an error —
+  NEVER a partial. It terminates on an empty page (robust to server-side clamping) with a hostile-server
+  backstop cap, so a failed fetch prints nothing and exits non-zero and cannot be mistaken for an empty
+  run. The `run answer` path inherits this via the same client.
