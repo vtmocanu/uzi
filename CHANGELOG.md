@@ -44,6 +44,24 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   admin status rather than introducing a new access boundary, and operator
   pages carry no secrets.
 
+- **Incidental findings: a worker can flag an off-task bug without stopping
+  its run, and you file it later on your own schedule (#333).** A new
+  `report_incidental_issue` tool on the run lane (issue/ci_fix/prompt/
+  self_improve) lets an agent record a bug it noticed outside its current
+  task and keep working — no blocking, no forge write. It surfaces as a blue
+  card in the run's stream and a coalesced inbox + Slack notification (one
+  DM per run, however many findings it flags), and collects into a per-repo
+  **Findings** backlog (`/findings`) deduped on `(repo, location)` across
+  every run, so a bug five runs independently trip over is one row reading
+  "seen in 5 runs." Filing opens a real issue on your own forge connection
+  with a server-assigned marker label; dismissing a finding keeps it gone —
+  a later run re-reporting the identical bug does not re-notify you or
+  reappear in the backlog, only a materially different finding at the same
+  spot does. The worker never holds a forge credential at any point; you
+  gate every filing, same as every other forge write in uzi. New CLI verbs:
+  `uzi findings list/file/dismiss`. See [docs/findings.md](docs/findings.md).
+  (#333)
+
 ### Fixed
 
 - **An idle backgrounded tab no longer keeps its session alive forever via the

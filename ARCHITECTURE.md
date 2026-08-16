@@ -880,6 +880,37 @@ The breaker trips immediately on a fatal verdict (401/403/404 — every message 
 - **This is the fourth reason `api` is a hard singleton, and the one that fails silently.** The streak counters and the "other runs are succeeding" comparison set are in-process. Split across replicas, neither pod's streak reaches the threshold and each pod's comparison set is a fraction of reality, so auto-stop simply stops firing rather than misfiring — a guard that quietly disarms looks exactly like a healthy fleet. `deploy/chart/values.yaml`'s `api.replicaCount` comment says so at the place someone would change it.
 - **Honest scope, which review must not oversell: this would not have fired on the incident that motivated it.** There was one active run, so there was no comparison set, so the rule degrades to flag-and-notify permanently — the correct behaviour on insufficient evidence, and tested as such rather than as a limitation. On a single-active-run deployment the *flag* is the value and the kill is insurance for multi-run instances and for pre-0.10.1 workers. There is also no metrics surface in `api` (no `promhttp`, no `/metrics`, no dependency), so the structured log lines named in [docs/run-auto-stopped.md](docs/run-auto-stopped.md) are the operator's interface, not a dashboard — and because every terminal path clears run health per PRD #47's exit contract, an auto-stopped run carries no flag afterwards, making those lines and that page the only durable record of why.
 
+### Incidental findings (PRD #333)
+
+A worker mid-run can flag a bug **outside** its current task without ending
+its turn: this adds **no new service and no new run kind** — it's a plain
+MCP tool on the existing run lane (issue/ci_fix/prompt/self_improve), sitting
+beside `signals.ts` as a second, distinct in-process MCP server so the finding
+tool can never be mistaken for (or promoted into) a turn-ending signal. Full
+design rationale is in the PRD (`prds/done/333-incidental-findings.md`, especially
+its Decision Log); user-facing usage is [docs/findings.md](docs/findings.md).
+
+- **Capture is worker→api, never worker→forge.** The tool posts to a
+  `RequireWorker` endpoint the same way a chat proposal does; the worker holds
+  no forge credential at any point, so a finding cannot reach the forge by
+  itself — only a subsequent, human-clicked file action can.
+- **A coordinate-keyed two-table store, reusing the judge backlog's *shape*,
+  not its producer.** `findings` is per-run evidence (one row per report,
+  mirroring `review_recommendations`); `finding_dispositions` is the
+  cross-run lifecycle, keyed on a stable `(user_id, repo_id, location)`
+  coordinate rather than a churning row id — the same judge-backlog pattern
+  of separating "what was observed" from "what's been done about it," applied
+  to a different, independent producer (findings are about the user's code;
+  the judge grades the agent's own performance). A `content_hash` on the
+  disposition lets a materially different finding re-open an otherwise
+  resolved coordinate, so a dismissed bug stays dismissed unless the report
+  itself changes.
+- **Filing is human-gated on the user's own forge connection**, the same
+  claim-first write pattern `ConfirmProposalForUser` uses for chat: a
+  disposition is claimed (`open` → `filing`) before the forge call, so a
+  double-click can't file twice, and the filed text is resolved from the
+  stored, sanitised row — never from whatever a client happens to send.
+
 ## Slack integration (outbound-only)
 
 uzi's fourth surface is a Slack bot, owned entirely by `api` (`api/internal/slacksvc`, PRD #25): per-user run DMs, plan-approval buttons, reply-from-Slack steering, and — since PRD #191 — a conversational chat surface (a top-level DM to the bot opens a `kind='chat'` run streamed back into a thread, with a `start_run` tool and issue-proposal cards). It adds no new service and no new inbound port — the trust posture below is why. Full design rationale lives in the PRD (`prds/done/25-slack-integration.md`, especially its Security posture and Decision Log; the conversational surface in `prds/done/191-slack-chat-surface.md`); user-facing setup is [docs/slack.md](docs/slack.md).
