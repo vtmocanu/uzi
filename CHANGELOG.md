@@ -58,6 +58,17 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Fixed
 
+- **Resetting a builtin agent template to default and saving no longer
+  re-marks it customized (#339).** Pressing **Reset to default** and then
+  **Save changes** on a builtin agent template re-marked the row
+  `customized=true` even when the saved content was byte-for-byte the shipped
+  builtin, silently opting it out of the boot-time shipped-body auto-refresh
+  (`RefreshPristineBuiltin`), with no drift badge to reveal it (the badge
+  reflects content, not the flag). `UpdateAgentTemplate` now content-derives
+  the `customized` flag — a builtin whose submitted content matches the
+  shipped definition (per `agenttmpl.SameContent`) is stored
+  `customized=false`, making "save the shipped body" idempotent with Reset so
+  the row keeps tracking future shipped changes. (#339)
 - **The worker's message batcher no longer re-enters the PRD #108 no-backoff
   retry storm when bisection abandons its first probe.** When the api
   permanently rejected a batch (4xx poison) and the very first bisection probe

@@ -402,9 +402,9 @@ SET description = $1,
     tools = $3,
     prompt_body = $4,
     updated_by = $5,
-    customized = true,
+    customized = $6,
     updated_at = now()
-WHERE id = $6
+WHERE id = $7
 RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized
 `
 
@@ -414,14 +414,20 @@ type UpdateAgentTemplateParams struct {
 	Tools       []byte      `json:"tools"`
 	PromptBody  string      `json:"prompt_body"`
 	UpdatedBy   pgtype.UUID `json:"updated_by"`
+	Customized  bool        `json:"customized"`
 	ID          uuid.UUID   `json:"id"`
 }
 
 // Edits the mutable fields. name, scope, user_id and is_builtin are immutable and
-// never touched here. This is the admin-edit path: any write here marks the row
-// customized (PRD #275), which opts a builtin out of the boot-time pristine
-// refresh until it is Reset. The reset path uses ResetBuiltinAgentTemplate instead
-// so a reset returns to pristine (customized=false) rather than marking it.
+// never touched here. This is the admin-edit path (PRD #275): the handler now
+// passes @customized explicitly rather than the query hardcoding it. A builtin
+// whose submitted content is byte-identical (per agenttmpl.SameContent) to the
+// shipped builtin is stored customized=false, so saving the shipped body is
+// idempotent with Reset (issue #339) and the row keeps tracking future shipped
+// changes via the boot-time pristine refresh; every other write passes
+// customized=true, opting a builtin out of that refresh until it is Reset. The
+// reset path uses ResetBuiltinAgentTemplate instead so a reset returns to
+// pristine (customized=false) rather than marking it.
 func (q *Queries) UpdateAgentTemplate(ctx context.Context, arg UpdateAgentTemplateParams) (AgentTemplate, error) {
 	row := q.db.QueryRow(ctx, updateAgentTemplate,
 		arg.Description,
@@ -429,6 +435,7 @@ func (q *Queries) UpdateAgentTemplate(ctx context.Context, arg UpdateAgentTempla
 		arg.Tools,
 		arg.PromptBody,
 		arg.UpdatedBy,
+		arg.Customized,
 		arg.ID,
 	)
 	var i AgentTemplate

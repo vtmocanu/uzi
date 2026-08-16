@@ -652,6 +652,14 @@ themselves sit with code)".
 - **Builtin lifecycle**: editable; **not deletable** (`DELETE` → 409); **Reset**
   (`POST /:id/reset`, builtins only, 400 on non-builtin) re-applies the embedded
   definition. Guarantees the core roles always exist for PRD #4.
+  - **Content-derived `customized` flag** (#339): `UpdateAgentTemplate` sets
+    `customized` from the submitted content, not a hardcoded `true` — a builtin row
+    whose body is byte-identical (`agenttmpl.SameContent`) to the shipped definition
+    is stored `customized=false`. Makes "save the shipped body" idempotent with
+    Reset, so `Reset → Save` no longer silently re-pins a builtin out of the
+    boot-time pristine refresh (`RefreshPristineBuiltin`). Every other write (a
+    genuine edit, or a non-builtin row with no shipped definition) still marks it
+    `customized=true`.
 
 ## 32. Renderer (template → Claude Code subagent Markdown)
 

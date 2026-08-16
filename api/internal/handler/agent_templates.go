@@ -131,6 +131,44 @@ func templateToDefinition(t store.AgentTemplate) agenttmpl.Definition {
 	return d
 }
 
+// fieldsToDefinition builds a comparison Definition from a validated write,
+// mirroring templateToDefinition so the customized-flag decision uses the same
+// normalization the drift badge does (decodeTools canonicalizes tools; a blank
+// model is inherit).
+func fieldsToDefinition(name string, f validatedFields) agenttmpl.Definition {
+	d := agenttmpl.Definition{
+		Name:        name,
+		Description: f.description,
+		Tools:       decodeTools(f.tools),
+		PromptBody:  f.promptBody,
+	}
+	if f.model.Valid {
+		d.Model = f.model.String
+	}
+	return d
+}
+
+// updateMarksCustomized reports the customized flag an UpdateAgentTemplate write
+// should persist (issue #339). A builtin row whose submitted content matches the
+// shipped definition byte-for-byte (per agenttmpl.SameContent) is stored
+// customized=false, so "save the shipped body" is idempotent with Reset and the
+// row keeps tracking future shipped changes via RefreshPristineBuiltin (PRD #275,
+// issue #201). Every other write — a genuine edit, a non-builtin row (no shipped
+// definition to track), or a removed builtin (no embedded def) — marks it
+// customized. This is the logical complement of differsFromBuiltin for a builtin
+// that ships a definition; a removed builtin (no embedded def) is the one case
+// where the two agree rather than invert (both leave the row marked customized).
+func updateMarksCustomized(t store.AgentTemplate, f validatedFields) bool {
+	if t.Scope != "builtin" {
+		return true
+	}
+	def, ok := agenttmpl.BuiltinByName(t.Name)
+	if !ok {
+		return true
+	}
+	return !agenttmpl.SameContent(fieldsToDefinition(t.Name, f), def)
+}
+
 // differsFromBuiltin reports whether a stored row's content has drifted from the
 // definition THIS BINARY ships under the same name (issue #201 M4a). It is
 // computed on every read and stored nowhere: there is no column, no hash and no
@@ -478,6 +516,7 @@ func (h *Handler) UpdateAgentTemplate(w http.ResponseWriter, r *http.Request) {
 		Tools:       fields.tools,
 		PromptBody:  fields.promptBody,
 		UpdatedBy:   pgUUID(actor.ID),
+		Customized:  updateMarksCustomized(t, fields),
 	})
 	if err != nil {
 		slog.Error("update agent template", "error", err)

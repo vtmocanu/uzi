@@ -108,7 +108,7 @@ func TestPristineBuiltinRefreshLiveDB(t *testing.T) {
 	n3 := "lead-" + suffix
 	row3 := seedBuiltin(n3, "d1", "v1\n")
 	if _, err := q.UpdateAgentTemplate(ctx, store.UpdateAgentTemplateParams{
-		ID: row3.ID, Description: "admin-desc", PromptBody: "admin edit\n", UpdatedBy: pgUUID(admin),
+		ID: row3.ID, Description: "admin-desc", PromptBody: "admin edit\n", UpdatedBy: pgUUID(admin), Customized: true,
 	}); err != nil {
 		t.Fatalf("admin edit: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestPristineBuiltinRefreshLiveDB(t *testing.T) {
 	n4 := "reviewer-" + suffix
 	row4 := seedBuiltin(n4, "d1", "v1\n")
 	if _, err := q.UpdateAgentTemplate(ctx, store.UpdateAgentTemplateParams{
-		ID: row4.ID, Description: "admin-desc", PromptBody: "admin edit\n", UpdatedBy: pgUUID(adminDel),
+		ID: row4.ID, Description: "admin-desc", PromptBody: "admin edit\n", UpdatedBy: pgUUID(adminDel), Customized: true,
 	}); err != nil {
 		t.Fatalf("admin edit (deletable admin): %v", err)
 	}
@@ -151,7 +151,7 @@ func TestPristineBuiltinRefreshLiveDB(t *testing.T) {
 	n5 := "tester-" + suffix
 	row5 := seedBuiltin(n5, "d1", "v1\n")
 	if _, err := q.UpdateAgentTemplate(ctx, store.UpdateAgentTemplateParams{
-		ID: row5.ID, Description: "admin-desc", PromptBody: "admin edit\n", UpdatedBy: pgUUID(admin),
+		ID: row5.ID, Description: "admin-desc", PromptBody: "admin edit\n", UpdatedBy: pgUUID(admin), Customized: true,
 	}); err != nil {
 		t.Fatalf("admin edit before reset: %v", err)
 	}
