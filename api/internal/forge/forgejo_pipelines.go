@@ -125,7 +125,9 @@ func (f *forgejo) ListPipelineJobs(ctx context.Context, projectID, pipelineID in
 	}
 	opt := gitea.ListRepoActionJobsOptions{ListOptions: gitea.ListOptions{Page: 1, PageSize: forgejoPerPage}}
 	var out []Job
+	page := 0
 	for {
+		page++
 		jobs, resp, err := c.ListRepoActionRunJobs(slug.owner, slug.repo, pipelineID, opt)
 		if err != nil {
 			return nil, f.redact.error(fmt.Errorf("forgejo: list pipeline jobs: %w", err))
@@ -138,8 +140,14 @@ func (f *forgejo) ListPipelineJobs(ctx context.Context, projectID, pipelineID in
 				out = append(out, toForgejoJob(j))
 			}
 		}
+		if len(out) > maxForgeItems {
+			return nil, f.redact.error(fmt.Errorf("forgejo: list pipeline jobs: %w", forgePaginationCapErr("item", maxForgeItems)))
+		}
 		if resp == nil || resp.NextPage == 0 {
 			break
+		}
+		if page >= maxForgePages {
+			return nil, f.redact.error(fmt.Errorf("forgejo: list pipeline jobs: %w", forgePaginationCapErr("page", maxForgePages)))
 		}
 		opt.Page = resp.NextPage
 	}

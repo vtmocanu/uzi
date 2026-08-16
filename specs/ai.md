@@ -263,6 +263,15 @@ issues the bot has rights to".
   (`redact.go`) scrubs the PAT and any `Authorization`/`PRIVATE-TOKEN` value from
   every returned error before it can reach a log or response (redaction unit test
   required and present).
+- **Pagination backstop** (`pagination.go`, PRD #338): every accumulating list
+  loop across all three drivers is bounded against a compromised/buggy forge that
+  returns a perpetually non-zero next page. Two caps — an **item cap** (bounds the
+  memory-growth vector) and a **page cap** (bounds the empty-page spin the item
+  cap would miss) — both **test-lowerable vars**, sized far above any real list.
+  On exceed the driver returns an **ERROR, not a partial slice**: a truncated
+  fetch with a nil error would let `forgesvc.FullSync` (§) treat it as an
+  authoritative short read and evict cached issues. Mirrors the CLI's `RunLogs` /
+  `maxLogsMessages` backstop.
 - **Forgejo** is now a **shipped second driver** (`forgejo.go`, PRD #65 — full
   detail §276), at full parity behind this same interface; no call site changed.
   - **CORRECTION (2026-07-17, PRD #65).** The note that stood here for months —

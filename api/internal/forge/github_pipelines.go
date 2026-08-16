@@ -94,7 +94,9 @@ func (g *github) ListPipelineJobs(ctx context.Context, projectID, pipelineID int
 	}
 	opt := &gh.ListWorkflowJobsOptions{ListOptions: gh.ListOptions{PerPage: githubPerPage}}
 	var out []Job
+	page := 0
 	for {
+		page++
 		jobs, resp, err := g.client.Actions.ListWorkflowJobs(ctx, slug.owner, slug.repo, pipelineID, opt)
 		if err != nil {
 			return nil, g.wrapErr("list pipeline jobs", err)
@@ -107,8 +109,14 @@ func (g *github) ListPipelineJobs(ctx context.Context, projectID, pipelineID int
 				out = append(out, toGitHubJob(j))
 			}
 		}
+		if len(out) > maxForgeItems {
+			return nil, g.wrapErr("list pipeline jobs", forgePaginationCapErr("item", maxForgeItems))
+		}
 		if resp == nil || resp.NextPage == 0 {
 			break
+		}
+		if page >= maxForgePages {
+			return nil, g.wrapErr("list pipeline jobs", forgePaginationCapErr("page", maxForgePages))
 		}
 		opt.Page = resp.NextPage
 	}
