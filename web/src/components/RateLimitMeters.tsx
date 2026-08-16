@@ -134,7 +134,7 @@ function TokenMeters({
   if (limits.status !== "ok") {
     // A token with no reading yet (fresh save, polling off, refused credential).
     return (
-      <div className="border-t border-line pt-4 first:border-t-0 first:pt-0">
+      <div className="border-t border-edge pt-4 first:border-t-0 first:pt-0">
         {heading}
         <div className={showLabel ? "mt-2" : ""}>
           <UnavailableWindowRow label="5-hour window" />
@@ -156,7 +156,7 @@ function TokenMeters({
   // resets_at is null (formatResetLabel returns null).
   const resetLabel = formatResetLabel(limits.seven_day.resets_at);
   return (
-    <div className="border-t border-line pt-4 first:border-t-0 first:pt-0">
+    <div className="border-t border-edge pt-4 first:border-t-0 first:pt-0">
       {heading}
       {resetLabel && <div className="mt-0.5 text-xs text-faint">{resetLabel}</div>}
       <div className={showLabel ? "mt-2" : ""}>

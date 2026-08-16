@@ -757,7 +757,7 @@ export function ScheduleModal({
           </div>
 
           {/* Next fires preview */}
-          <div className="rounded-lg border border-edge bg-bg/50 px-3 py-2.5">
+          <div className="rounded-lg border border-edge bg-ink/50 px-3 py-2.5">
             <p className="mb-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-muted">
               Next fires
             </p>
@@ -782,7 +782,7 @@ export function ScheduleModal({
         </div>
 
         {/* Footer */}
-        <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-t border-edge bg-bg/40 px-5 py-3.5">
+        <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-t border-edge bg-ink/40 px-5 py-3.5">
           <span className="hidden truncate text-[11px] text-faint sm:inline">{footerSummary}</span>
           <div className="flex flex-1 items-center justify-end gap-2">
             {isEdit && (

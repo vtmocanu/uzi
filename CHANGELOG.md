@@ -8,6 +8,18 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Added
 
+- **`check-styles` build gate for unresolved Tailwind classes (#170).** A
+  Tailwind utility whose stem is not in `tailwind.config.js` fails completely
+  silently — no error, no build warning; the element just inherits (a shipped
+  `text-warning`, where the token is `warn`, rendered grey instead of amber).
+  `web/scripts/check-styles.mjs` now extracts class tokens from the TypeScript
+  AST (`className` attributes and `cx()` args only, so comments and prose can
+  never be mistaken for classes) and asks the project's own postcss+tailwind
+  engine whether each color-family utility resolves, failing the build on any
+  that do not. Runs in `npm run build` and in `task gate:web` / CI
+  `validate:web`, alongside `check-docs`. Fixed the six latent offenders it
+  surfaced (`bg-bg` → `bg-ink`, `border-line` → `border-edge`). (#170)
+
 - **`ux-designer` builtin agent template (#314).** uzi now ships a twelfth
   builtin role: a build-capable UX/UI design lead that sets opinionated visual
   and information-architecture direction, implements the frontend/UI (including

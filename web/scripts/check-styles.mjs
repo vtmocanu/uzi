@@ -1,0 +1,192 @@
+#!/usr/bin/env node
+// Build-time guard against SILENTLY-DEAD Tailwind classes (issue #170). Runs
+// standalone (`npm run check-styles`) and as a step of `npm run build`, so a
+// mistyped color stem fails the web image build the same way check-docs does.
+//
+// THE MECHANISM IT CATCHES. A Tailwind utility whose stem is not in the config
+// fails COMPLETELY silently: no error, no build warning, no console noise — the
+// class simply generates no CSS and the element inherits. `text-warning` shipped
+// where the semantic token is `warn` (tailwind.config.js) and rendered grey
+// instead of amber; `bg-bg` (the page-background token is `ink: token("bg")`,
+// so the class is `bg-ink`, never `bg-bg`) rendered transparent; `border-line`
+// (the token is `edge`) rendered borderless. None of these are typos a compiler
+// or the bundler can see — the string is a valid string, just not a valid class.
+//
+// HOW IT DECIDES MEMBERSHIP: the project's OWN engine, not a hand-kept allowlist.
+// We run the real postcss + tailwindcss over `@tailwind utilities;` with the
+// collected tokens as raw content and ask whether each token's escaped selector
+// appears in the generated CSS. So the check tracks tailwind.config.js exactly:
+// add a color token and its classes become "known" with no edit here.
+//
+// WHY AST, NOT REGEX (load-bearing). Candidate classes are extracted from the
+// TypeScript AST — only from JSX `className` attribute values and `cx(...)` call
+// arguments (cx is the repo's sole class helper, src/components/ui.tsx). A naive
+// regex over source text false-positives on prose: Board.tsx carries a comment
+// that literally contains `bg-bg` while EXPLAINING this very bug, and a regex
+// would flag the comment. Extracting only from real className/cx subtrees means
+// comments and prose can never be mistaken for classes.
+//
+// SCOPE (deliberately narrow for a false-positive-free first landing). Only
+// tokens whose bare form starts with a COLOR-CONSUMING prefix (text-/bg-/border-/
+// …, see COLOR_PREFIXES) are flagged — that is where silent color failures live
+// and matches issue #170's stated scope. Because membership already uses the real
+// engine, widening to ALL utilities is just widening that one constant later.
+import { readFileSync, readdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+import ts from "typescript";
+import postcss from "postcss";
+import tailwind from "tailwindcss";
+import cfg from "../tailwind.config.js";
+
+const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const webRoot = path.resolve(scriptDir, "..");
+const srcDir = path.join(webRoot, "src");
+
+// Prefixes for the utilities that consume a color token. A token flagged here is
+// only an ERROR when the real engine did not generate it (see below). Membership
+// runs through the engine, so broadening the check to every utility family is a
+// one-line edit to this list — deferred to keep this first landing free of false
+// positives and matched to issue #170's text-/bg-/border- scope.
+const COLOR_PREFIXES = [
+  "text-", "bg-", "border-", "ring-", "fill-", "stroke-", "decoration-",
+  "divide-", "from-", "via-", "to-", "accent-", "caret-", "placeholder-",
+  "outline-", "shadow-",
+];
+
+// ── 1. Collect source files (mirrors tailwind.config.js `content`) ─────────────
+const tsFiles = [];
+const walkSrc = (dir) => {
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    const abs = path.join(dir, e.name);
+    if (e.isDirectory()) walkSrc(abs);
+    else if (/\.(ts|tsx)$/.test(e.name) && !/\.test\.(ts|tsx)$/.test(e.name)) tsFiles.push(abs);
+  }
+};
+walkSrc(srcDir);
+tsFiles.sort();
+
+// ── 2. Extract candidate class tokens ──────────────────────────────────────────
+// usages: { file, line, token }. Recorded per occurrence, deduped by
+// file:line:token afterwards (a `cx(...)` nested inside a `className` is reached
+// by both collectors below, which is fine — the dedup collapses it).
+const usages = [];
+const push = (rawTokens, file, line) => {
+  for (const tok of rawTokens) {
+    if (!tok || tok.includes("${")) continue; // drop dynamic fragments defensively
+    usages.push({ file, line, token: tok });
+  }
+};
+
+// Split a static quasi/literal into whitespace tokens, dropping the fragment that
+// abuts a `${…}` interpolation. `hasBefore`/`hasAfter` say whether an
+// interpolation sits immediately before/after this piece of text; if the text
+// does not START with whitespace its first token is a continuation of the prior
+// `${…}` (e.g. the `red` in `text-${x}red`) and if it does not END with
+// whitespace its last token is a prefix for the next `${…}` (e.g. `text-` before
+// `${tone}`). Those are never complete class names, so they are dropped.
+const quasiTokens = (text, hasBefore, hasAfter) => {
+  const startsWs = /^\s/.test(text);
+  const endsWs = /\s$/.test(text);
+  const toks = text.split(/\s+/).filter(Boolean);
+  if (hasBefore && !startsWs && toks.length) toks.shift();
+  if (hasAfter && !endsWs && toks.length) toks.pop();
+  return toks;
+};
+
+for (const abs of tsFiles) {
+  const rel = path.relative(webRoot, abs);
+  const src = readFileSync(abs, "utf8");
+  const sf = ts.createSourceFile(rel, src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const lineOf = (node) => sf.getLineAndCharacterOfPosition(node.getStart()).line + 1;
+
+  // Collect every string/template literal inside a known className/cx subtree,
+  // recursing through ternaries, logical `&&`, arrays and nested cx() to reach
+  // them. TemplateExpression quasis get the abutting-fragment drop; interpolated
+  // expressions are recursed so `${cond ? "text-danger" : ""}` is still seen.
+  const collect = (node) => {
+    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+      push(quasiTokens(node.text, false, false), rel, lineOf(node));
+      return;
+    }
+    if (ts.isTemplateExpression(node)) {
+      push(quasiTokens(node.head.text, false, true), rel, lineOf(node.head));
+      const spans = node.templateSpans;
+      spans.forEach((span, i) => {
+        const isLast = i === spans.length - 1;
+        push(quasiTokens(span.literal.text, true, !isLast), rel, lineOf(span.literal));
+        collect(span.expression);
+      });
+      return;
+    }
+    ts.forEachChild(node, collect);
+  };
+
+  const walk = (node) => {
+    if (ts.isJsxAttribute(node) && node.name.getText(sf) === "className" && node.initializer) {
+      collect(node.initializer);
+    } else if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "cx") {
+      node.arguments.forEach(collect);
+    }
+    ts.forEachChild(node, walk);
+  };
+  walk(sf);
+}
+
+// index.html carries only the static app shell (no JSX/cx), so its classes come
+// from `class="…"` attributes. Comments are blanked first (offsets preserved for
+// line numbers) so prose can never be read as classes — same rule as the AST path.
+const htmlPath = path.join(webRoot, "index.html");
+const html = readFileSync(htmlPath, "utf8").replace(/<!--[\s\S]*?-->/g, (m) => m.replace(/[^\n]/g, " "));
+const attrRe = /\bclass(?:Name)?\s*=\s*("([^"]*)"|'([^']*)')/g;
+let hm;
+while ((hm = attrRe.exec(html)) !== null) {
+  const value = hm[2] !== undefined ? hm[2] : hm[3];
+  const line = html.slice(0, hm.index).split("\n").length;
+  push(value.split(/\s+/).filter(Boolean), "index.html", line);
+}
+
+// Dedup by file:line:token (collapses the className/cx double-walk).
+const seen = new Set();
+const dedup = [];
+for (const u of usages) {
+  const key = `${u.file}\t${u.line}\t${u.token}`;
+  if (seen.has(key)) continue;
+  seen.add(key);
+  dedup.push(u);
+}
+
+// ── 3. Membership via the real engine ──────────────────────────────────────────
+const uniqueTokens = [...new Set(dedup.map((u) => u.token))];
+const config = { ...cfg, content: [{ raw: uniqueTokens.join("\n"), extension: "html" }] };
+const css = (await postcss([tailwind(config)]).process("@tailwind utilities;", { from: undefined })).css;
+
+// Escape-tolerant selector test: matches `.<token>` allowing tailwind's optional
+// backslash escapes for `/` (opacity), `[]` (arbitrary values) and `:` (variants),
+// with a trailing boundary so `text-x` does not match `.text-xs`.
+const esc = (t) => "\\." + [...t].map((c) => (/[a-zA-Z0-9-]/.test(c) ? c : "\\\\?" + c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))).join("") + "(?![\\w-])";
+const knownCache = new Map();
+const known = (t) => {
+  if (!knownCache.has(t)) knownCache.set(t, new RegExp(esc(t)).test(css));
+  return knownCache.get(t);
+};
+
+// Strip leading variant segments (`hover:`, `md:`, `group-hover:`, …) and a
+// leading `-` (negative utilities) to reach the bare stem we prefix-match.
+const bareForm = (token) => token.replace(/^(-)?([a-z][a-z0-9-]*:)+/, "").replace(/^-/, "");
+
+// ── 4. Scope + report ──────────────────────────────────────────────────────────
+const errors = [];
+for (const u of dedup) {
+  const bare = bareForm(u.token);
+  if (COLOR_PREFIXES.some((p) => bare.startsWith(p)) && !known(u.token)) {
+    errors.push(`${u.file}:${u.line}: unknown Tailwind class "${u.token}" — its stem is not in tailwind.config.js (it renders silently as no style)`);
+  }
+}
+
+if (errors.length > 0) {
+  for (const e of errors) console.error(`ERROR ${e}`);
+  console.error(`\ncheck-styles: FAILED with ${errors.length} error(s)`);
+  process.exit(1);
+}
+console.log(`check-styles: OK — ${dedup.length} class usages validated`);
