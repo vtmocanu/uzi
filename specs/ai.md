@@ -21107,3 +21107,21 @@ truncated/failed fetch looked like an empty run). Fixed on `GET /api/runs/{id}/m
   NEVER a partial. It terminates on an empty page (robust to server-side clamping) with a hostile-server
   backstop cap, so a failed fetch prints nothing and exits non-zero and cannot be mistaken for an empty
   run. The `run answer` path inherits this via the same client.
+## 550. Issue #334 — `resume_lineage_break` counter measures the run_usage resume-lineage undercount before committing to #332 Option B
+
+The dropped-resume → fresh-SDK-session path in `agent/src/runner.ts` (the ONLY path that breaks the
+§222/§223 `run_usage` resume lineage — a resolved resume never enters it) now tags a stable,
+low-cardinality signal `resume_lineage_break`, so the undercount's real firing rate is measured before
+paying for #332's deferred Option B (a `lineage_epoch` schema+protocol change).
+
+- **Two surfaces, both pre-existing emissions on that path (no new message, no noise):** the run-feed
+  `status` message payload carries `payload.event = "resume_lineage_break"` (free-form JSONB, per-run
+  queryable and cross-run aggregatable: `select count(*) from run_messages where payload->>'event' =
+  'resume_lineage_break'`), and the worker `slog` warning line gets the same stable key for worker-log
+  aggregation.
+- **Why a payload field, not a new surface.** Chosen over (a) a new `MessageKind` — which would need an
+  API allowlist + web-renderer change — and over (b) any `run_usage`/fold/`run_usage_totals`-view/
+  `lineage_epoch` change, which IS #332 Option B. It rides the existing join-token AppendMessages POST,
+  so no new inbound endpoint. The signal doubles as a resume-reliability indicator (a high rate means
+  work-recovery fails more often than PRD #122 M8 intends). #332 Option B stays deferred until this
+  counter shows the lineage break is material.

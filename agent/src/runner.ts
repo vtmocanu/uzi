@@ -577,6 +577,7 @@ export class RunRunner {
           "resume session transcript is not resolvable here; starting a fresh SDK session",
           {
             run_home: runHome,
+            event: RESUME_LINEAGE_BREAK_EVENT,
           },
         );
         batcher.emit({
@@ -590,6 +591,7 @@ export class RunRunner {
             text:
               "this run was picked up again, but its earlier session could not be found on this worker — " +
               "continuing WITHOUT its earlier context, so some work may be repeated",
+            event: RESUME_LINEAGE_BREAK_EVENT,
           },
         });
       }
@@ -2150,6 +2152,15 @@ export class RunRunner {
     }
   }
 }
+
+/** PRD #332 / issue #334 — the `run_usage` lineage-break marker. Tagged onto the
+ *  worker slog line AND the run-feed status payload emitted when a resume is DROPPED
+ *  and the runner starts a FRESH SDK session (the ONLY path that breaks run_usage
+ *  resume-lineage). Low-cardinality and stable so a maintainer can aggregate its
+ *  frequency — e.g. `count(*) from run_messages where payload->>'event' =
+ *  'resume_lineage_break'` — to decide whether #332's deferred Option B is worth a
+ *  schema+protocol change. Renaming this literal silently breaks that aggregation. */
+export const RESUME_LINEAGE_BREAK_EVENT = "resume_lineage_break";
 
 /** The answer an AUTOPILOT run receives instead of parking (PRD #88 Decision 8).
  *  Frozen wording: M5's test asserts it byte-exactly, and the lead is told to record

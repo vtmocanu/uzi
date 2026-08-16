@@ -5,7 +5,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { type RunContext, type ExecutorResult } from "../src/executor.js";
-import { type ExecutorFactory } from "../src/runner.js";
+import {
+  type ExecutorFactory,
+  RESUME_LINEAGE_BREAK_EVENT,
+} from "../src/runner.js";
 import {
   api,
   fakeGitlab,
@@ -86,6 +89,16 @@ describe("RunRunner — resume preflight (issue #105)", () => {
       // is why the agent may re-tread ground. A bare "session not found" is not enough.
       assert.match(notice, /WITHOUT its earlier context/);
       assert.match(notice, /work may be repeated/);
+      // The same dropped-resume path also carries a stable, low-cardinality tag so a
+      // maintainer can aggregate lineage-break frequency from the run feed (issue #334).
+      const events = api
+        .messages(claim.run_id)
+        .filter((m) => m.kind === "status")
+        .map((m) => m.payload.event);
+      assert.ok(
+        events.includes(RESUME_LINEAGE_BREAK_EVENT),
+        `expected a queryable ${RESUME_LINEAGE_BREAK_EVENT} status event, got ${JSON.stringify(events)}`,
+      );
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
@@ -111,6 +124,12 @@ describe("RunRunner — resume preflight (issue #105)", () => {
       assert.ok(
         !texts.some((t) => /earlier session could not be found/.test(t)),
         "must not cry wolf",
+      );
+      assert.ok(
+        !api
+          .messages(claim.run_id)
+          .some((m) => m.payload.event === RESUME_LINEAGE_BREAK_EVENT),
+        "a resolved resume must record no lineage-break event",
       );
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
@@ -207,5 +226,11 @@ describe("RunRunner — resume preflight (issue #105)", () => {
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
+  });
+
+  it("pins the lineage-break event key", () => {
+    // The literal is an aggregation key a maintainer queries by; a silent rename would
+    // break `payload->>'event' = 'resume_lineage_break'` counts (issue #334).
+    assert.strictEqual(RESUME_LINEAGE_BREAK_EVENT, "resume_lineage_break");
   });
 });
