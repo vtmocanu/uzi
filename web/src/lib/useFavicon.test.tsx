@@ -20,7 +20,7 @@ vi.mock("./favicon", async () => {
 
 // Controllable listRuns: each call resolves with whatever `nextRuns` currently holds.
 let nextRuns: FaviconRun[] = [];
-vi.mock("./api", () => ({ api: { listRuns: () => listRuns() } }));
+vi.mock("./api", () => ({ api: { listRuns: (...args: unknown[]) => listRuns(...args) } }));
 
 // notifications: capture the subscriber but we don't need to drive it here.
 vi.mock("./notifications", () => ({ onNotificationsChanged: () => () => {} }));
@@ -116,5 +116,11 @@ describe("useFavicon", () => {
     renderHook(() => useFavicon({ unread: 0, enabled: true }));
     await flush();
     expect(applyFavicon).toHaveBeenCalledWith("running");
+  });
+
+  it("#331: marks the favicon poll passive so the server skips the rolling refresh", async () => {
+    renderHook(() => useFavicon({ unread: 0, enabled: true }));
+    await flush(); // immediate seed poll
+    expect(listRuns).toHaveBeenCalledWith({ passive: true });
   });
 });

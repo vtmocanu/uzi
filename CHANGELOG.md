@@ -20,6 +20,14 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   `validate:web`, alongside `check-docs`. Fixed the six latent offenders it
   surfaced (`bg-bg` → `bg-ink`, `border-line` → `border-edge`). (#170)
 
+- **`yamllint` is now baked into the default worker toolchain (#330).** Every
+  worker image ships `yamllint` through the pinned devbox-global toolchain
+  (1.37.1), restoring local fidelity of uzi's own `lint:yaml` gate on the
+  worker: `task lint:yaml` previously failed open and printed SKIPPED because
+  `yamllint` was absent, so a worker could not exercise that gate the way CI
+  does. Same "every worker should have it" class as the already-baked
+  `shellcheck`. (#330)
+
 - **`ux-designer` builtin agent template (#314).** uzi now ships a twelfth
   builtin role: a build-capable UX/UI design lead that sets opinionated visual
   and information-architecture direction, implements the frontend/UI (including
@@ -38,6 +46,16 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Fixed
 
+- **An idle backgrounded tab no longer keeps its session alive forever via the
+  favicon poll (#331).** The tab-icon poll (`useFavicon`) fetches `listRuns`
+  every ~20s even while hidden, and `RequireAuth`'s rolling refresh re-minted the
+  session on every authed request past half its TTL — so a backgrounded idle tab
+  slid its own expiry forward indefinitely and never reached `AUTH_TOKEN_TTL`
+  idle expiry. The favicon poll now marks its request passive (`X-Uzi-Passive:
+  1`), and the middleware skips ONLY the rolling-refresh side-effect for passive
+  requests; auth validation and CSRF are unchanged. Suppressing refresh can only
+  make a session expire sooner, never later, so the client-sent marker is safe.
+  (#331)
 - **`uzi run logs` no longer dies mid-body on a large run and prints an empty
   result that looks like "no messages" (#160).** The viewer messages endpoint
   (`GET /api/runs/{id}/messages`) now gzips its response and gained an opt-in
@@ -80,6 +98,14 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   PRD-link patch lifecycle settled, null while still pending); the web run
   footer surfaces `prd_done_path` alone. All read-only and emitted only when
   set, so a run predating the feature is unchanged. (#150)
+- **Archiving a PRD to `prds/done/` no longer leaves broken inbound doc links
+  (#257).** The `prd-lifecycle` skill now tells a run that performs
+  `git mv prds/<file>.md prds/done/` to sweep the tree (`git grep -lF`) for
+  relative links to the old path and repoint them to the new location in the
+  same commit — so the archiving run fixes the links in files it never
+  otherwise touches, instead of failing the `check-docs` gate at merge time.
+  (`web/scripts/check-docs.mjs` already reports every broken link in one pass,
+  so the surviving gap was the repoint, not the reporting.) (#257)
 
 ### Security
 
@@ -98,15 +124,6 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   element, and the poller's per-repo goroutine recovers any panic so one repo's
   hostile response degrades to skipping that repo's sync rather than crashing
   the api. (#74)
-
-- **Archiving a PRD to `prds/done/` no longer leaves broken inbound doc links
-  (#257).** The `prd-lifecycle` skill now tells a run that performs
-  `git mv prds/<file>.md prds/done/` to sweep the tree (`git grep -lF`) for
-  relative links to the old path and repoint them to the new location in the
-  same commit — so the archiving run fixes the links in files it never
-  otherwise touches, instead of failing the `check-docs` gate at merge time.
-  (`web/scripts/check-docs.mjs` already reports every broken link in one pass,
-  so the surviving gap was the repoint, not the reporting.) (#257)
 
 ## [0.39.0] - 2026-08-16
 

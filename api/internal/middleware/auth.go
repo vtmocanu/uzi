@@ -17,6 +17,11 @@ type ctxKey int
 
 const userKey ctxKey = iota
 
+// passiveHeader marks a request as a passive poll — the hidden-tab favicon poll
+// (#331) — which authenticates normally but must not slide the session forward
+// via rolling refresh.
+const passiveHeader = "X-Uzi-Passive"
+
 // UserFromContext returns the authenticated user set by RequireAuth.
 func UserFromContext(ctx context.Context) (store.User, bool) {
 	u, ok := ctx.Value(userKey).(store.User)
@@ -38,7 +43,9 @@ func ContextWithUser(ctx context.Context, user store.User) context.Context {
 //   - rejects tokens whose token_version is stale (logout / password change /
 //     deactivation bumped it), giving real revocation;
 //   - performs a rolling refresh, re-issuing the cookie so active sessions
-//     never expire mid-use.
+//     never expire mid-use — EXCEPT for passive requests (X-Uzi-Passive: 1),
+//     which authenticate normally but are exempt from the refresh so an idle
+//     backgrounded tab's poll cannot keep the session alive forever.
 func RequireAuth(q *store.Queries, cfg config.Config) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -79,26 +86,35 @@ func RequireAuth(q *store.Queries, cfg config.Config) func(http.Handler) http.Ha
 				return
 			}
 
-			// Rolling refresh: once the token is past the halfway point of its
-			// TTL, mint a fresh token at the current version and slide the
-			// cookie expiry, re-issuing BOTH cookies together (the CSRF cookie
-			// is HMAC-bound to the JWT). Refreshing only past half-life (rather
-			// than every request) keeps active sessions alive while shrinking
-			// the window in which concurrent requests could see mismatched
-			// cookie pairs. If a bump happens later in this same request
-			// (logout / password change), the token minted here carries the
-			// pre-bump version and is rejected on next use, so revocation holds.
-			if shouldRefresh(claims, cfg.AuthTokenTTL) {
-				if token, err := auth.IssueToken(cfg.JWTSecret, claims.UserID, user.TokenVersion, cfg.AuthTokenTTL); err == nil {
-					if err := auth.SetAuthCookies(w, token, auth.CookieOptions{Secure: cfg.CookieSecure, TTL: cfg.AuthTokenTTL}); err != nil {
-						slog.Warn("rolling refresh: set cookies", "error", err)
-					}
-				}
-			}
+			rollingRefresh(w, r, claims, user.TokenVersion, cfg)
 
 			ctx := ContextWithUser(r.Context(), user)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
+	}
+}
+
+// rollingRefresh re-mints the session cookie once the token is past half its TTL,
+// UNLESS the request is a passive poll (X-Uzi-Passive: 1) — e.g. the hidden-tab
+// favicon poll (#331) — which authenticates normally but must not slide the session
+// forward, so an idle backgrounded tab still reaches AUTH_TOKEN_TTL idle expiry.
+//
+// Refreshing only past half-life (rather than every request) keeps active sessions
+// alive while shrinking the window in which concurrent requests could see mismatched
+// cookie pairs; both cookies are re-issued together (the CSRF cookie is HMAC-bound to
+// the JWT). If a version bump happens later in this same request (logout / password
+// change), the token minted here carries the pre-bump version and is rejected on next
+// use, so revocation holds.
+func rollingRefresh(w http.ResponseWriter, r *http.Request, claims *auth.Claims, tokenVersion int32, cfg config.Config) {
+	if r.Header.Get(passiveHeader) == "1" {
+		return
+	}
+	if shouldRefresh(claims, cfg.AuthTokenTTL) {
+		if token, err := auth.IssueToken(cfg.JWTSecret, claims.UserID, tokenVersion, cfg.AuthTokenTTL); err == nil {
+			if err := auth.SetAuthCookies(w, token, auth.CookieOptions{Secure: cfg.CookieSecure, TTL: cfg.AuthTokenTTL}); err != nil {
+				slog.Warn("rolling refresh: set cookies", "error", err)
+			}
+		}
 	}
 }
 
