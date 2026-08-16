@@ -564,7 +564,7 @@ workers:
     #
     # Default enabled:false so it renders nothing when the docker tier is off. It MUST
     # be set true, with the cluster's REAL CIDRs, BEFORE enabling docker workers live —
-    # deploy/values/dev-cluster.yaml pre-stages dev-cluster's CIDRs + enables it.
+    # argo-apps:apps/uzi/values/dev-cluster.yaml pre-stages dev-cluster's CIDRs + enables it.
     networkPolicy:
       enabled: false
       # The escape hatch for the fail-guard (worker-invariants.yaml): with docker on and
@@ -747,7 +747,7 @@ workers:
   # Off is FAIL-CLOSED, not fail-open — the k8s floor still denies everything but DNS
   # and the api, so a worker without this simply cannot reach its forge.
   #
-  # dev-cluster turns it on (deploy/values/dev-cluster.yaml); the KinD smoke leaves it
+  # dev-cluster turns it on (argo-apps:apps/uzi/values/dev-cluster.yaml); the KinD smoke leaves it
   # off (no Antrea there, and kindnet enforces no NetworkPolicy whatsoever).
   fqdnEgress:
     enabled: false
@@ -764,7 +764,7 @@ workers:
     # a missing name does not need a code change and a release to fix.
     #
     # NOTE: this list is REPLACED, not merged, by any per-cluster values that define
-    # their own `allowFQDNs` (deploy/values/dev-cluster.yaml does). Helm does not merge
+    # their own `allowFQDNs` (argo-apps:apps/uzi/values/dev-cluster.yaml does). Helm does not merge
     # arrays — an entry added here alone reaches no cluster that overrides the list.
     # Add to BOTH.
     allowFQDNs:
@@ -1043,6 +1043,6 @@ postgres:
       owner: uzi
   # Backups OFF by default (M5 open question: confirm the s3://postgres-<cluster>
   # bucket exists + wire the barman S3 creds from Infisical before enabling). The
-  # per-cluster values decide; see deploy/values/dev-cluster.yaml.
+  # per-cluster values decide; see argo-apps:apps/uzi/values/dev-cluster.yaml.
   backups:
     enabled: false

@@ -10,8 +10,10 @@ The release + deploy runbook for uzi (PRD #52). Two deploy topologies:
   that path: cutting a release and getting it live.
 
 The chart is `chart/` (an umbrella chart: web + api + the CloudNativePG `cluster`
-subchart), with per-cluster values in `values/<cluster>.yaml` (today only
-`values/dev-cluster.yaml`). CI (`../.gitlab-ci.yml`) builds + publishes; ArgoCD
+subchart). Per-cluster values live in the private GitOps repo, not this repo:
+`argo-apps:apps/uzi/values/dev-cluster.yaml`. The in-repo `values/` holds
+only `ci-render.yaml` (sanitized CI render stand-in) and `kind-smoke.yaml` (KinD
+smoke). CI (`../.gitlab-ci.yml`) builds + publishes; ArgoCD
 (`myorg/k8s/argo-apps`, `apps/uzi/`) deploys. example-app's `deploy/README.md` is
 the sibling reference — uzi follows its Model-B release shape.
 
@@ -28,9 +30,9 @@ the sibling reference — uzi follows its Model-B release shape.
 | Worker | `docker compose --profile agent` | laptop workers unchanged; **hosted workers ship but are OFF** — see [Hosted workers](#hosted-workers-prd-58) |
 
 The ArgoCD `Application` is **multi-source** (example-app precedent): the released
-chart from Harbor OCI + the per-cluster values from the uzi git repo, so
-operational config (`values/dev-cluster.yaml`) can change on `main` without
-cutting a new chart release — that path is proven: the M6 Infisical-scope fix
+chart from Harbor OCI + the per-cluster values from the argo-apps GitOps
+repo, so operational config (`apps/uzi/values/dev-cluster.yaml` there) can change
+without cutting a new chart release — that path is proven: the M6 Infisical-scope fix
 reached the running deploy through it, with no chart release. Wiring lives in
 `argo-apps` `apps/uzi/{prj.uzi.yaml,app.uzi.yaml}`, delivered by MR !294
 (**merged 2026-07-16**; first live deploy = uzi `0.2.0`).
@@ -279,7 +281,7 @@ before the first deploy. Each mirrors an existing example-app step.
 The chart renders and lints today (CI `helm_chart` job). A live deploy to
 dev-cluster also rests on cluster facts the render cannot check; these were
 **confirmed on-cluster 2026-07-15** and the resulting values are already baked
-into `values/dev-cluster.yaml` (re-verify if the cluster changes):
+into `argo-apps:apps/uzi/values/dev-cluster.yaml` (re-verify if the cluster changes):
 
 - **`api.networkPolicy.probeCIDRs` = `192.0.2.0/24`** — the dev-cluster node
   InternalIP CIDR (all nodes observed on `192.0.2.x`). The api NetworkPolicy is
@@ -344,7 +346,7 @@ shown once at issuance. See `docs/worker-setup.md` for the full procedure and
 
 **Shipped and OFF.** The chart carries the whole feature — the worker namespace and
 its RBAC/quotas/policies, the controller Deployment, the api's hosting switch — and
-`deploy/values/dev-cluster.yaml` still sets `workers.enabled: false`. Nothing about
+`argo-apps:apps/uzi/values/dev-cluster.yaml` still sets `workers.enabled: false`. Nothing about
 hosted workers renders until that flips. Compose is untouched either way.
 
 **What runs.** A `uzi-controller` Deployment in the release namespace: the only
@@ -387,7 +389,7 @@ which takes uzi down. It fails closed, but the blast radius is the whole product
    > created, rolled or torn down — existing ones keep running on their own join
    > tokens — so the cost is an outage of the feature, never a bypass.
 
-2. **Flip both flags in `deploy/values/dev-cluster.yaml`:**
+2. **Flip both flags in `argo-apps:apps/uzi/values/dev-cluster.yaml`:**
 
    ```yaml
    api:
@@ -527,7 +529,7 @@ on the node kernel (`kernel.unprivileged_userns_clone=1`) — a **node-scoped**
 sysctl, not settable per-pod. dev-cluster's nodes are vendor Linux OS (kernel
 6.1.83), which ships this **off** as a hardening default, so the rootless sidecar
 crash-loops there (`need 'kernel.unprivileged_userns_clone' … set to 1`).
-`deploy/values/dev-cluster.yaml` therefore sets `rootless: false`.
+`argo-apps:apps/uzi/values/dev-cluster.yaml` therefore sets `rootless: false`.
 
 **Reduced-capability dead end.** Before accepting non-rootless, a `privileged:
 false` variant with a curated capability set (`SYS_ADMIN`, `NET_ADMIN`, `MKNOD`, …)
