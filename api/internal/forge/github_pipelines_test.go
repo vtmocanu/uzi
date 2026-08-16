@@ -80,9 +80,11 @@ func TestGitHubLatestMRPipelineNoHeadIsError(t *testing.T) {
 
 // TestGitHubLatestPipelineNilRunMapsToErrNoPipeline is the issue-74 M2 pin: a
 // hostile forge returning {"workflow_runs":[null],"total_count":1} decodes to a
-// slice with a nil *WorkflowRun, which passes the len==0 guard. Without the
-// nil-element guard the toGitHubPipeline deref panics; with it the driver returns
-// ErrNoPipeline.
+// slice with a nil *WorkflowRun, which passes the len==0 guard. go-github's Get*
+// accessors are nil-safe, so without the guard toGitHubPipeline would not panic
+// (unlike gitlab/forgejo) — it would return a phantom zero-ID Pipeline with a nil
+// error, which this test catches as the errors.Is check failing. With the guard the
+// driver returns ErrNoPipeline.
 func TestGitHubLatestPipelineNilRunMapsToErrNoPipeline(t *testing.T) {
 	m := newMockGitHub(t, map[string]http.HandlerFunc{
 		"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, _ *http.Request) {
@@ -97,7 +99,9 @@ func TestGitHubLatestPipelineNilRunMapsToErrNoPipeline(t *testing.T) {
 
 // TestGitHubLatestMRPipelineNilRunMapsToErrNoPipeline is the issue-74 M2 pin for the
 // MR path: the PR resolves with a head sha, then the runs endpoint returns a null
-// entry. The nil-element guard returns ErrNoPipeline rather than panicking.
+// entry. The nil-element guard returns ErrNoPipeline rather than a phantom zero-ID
+// pipeline (go-github's Get* accessors are nil-safe, so this path returns a bad
+// value rather than panicking as gitlab/forgejo would).
 func TestGitHubLatestMRPipelineNilRunMapsToErrNoPipeline(t *testing.T) {
 	m := newMockGitHub(t, map[string]http.HandlerFunc{
 		"/repos/acme/widgets/pulls/4": func(w http.ResponseWriter, _ *http.Request) {
