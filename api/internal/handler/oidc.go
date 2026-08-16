@@ -289,7 +289,7 @@ func (h *Handler) oidcResolveUser(r *http.Request, identity oidc.Identity) (stor
 	// pass the top gate). The top gate already rejected present-and-no-intersection;
 	// this closes the absent-claim case for new users.
 	if len(h.cfg.OIDCAllowedGroups) > 0 &&
-		!(identity.GroupsClaimPresent && groupsIntersect(h.cfg.OIDCAllowedGroups, identity.Groups)) {
+		(!identity.GroupsClaimPresent || !groupsIntersect(h.cfg.OIDCAllowedGroups, identity.Groups)) {
 		slog.Warn("oidc resolve: JIT blocked, not in an allowed group (or groups claim absent/unparseable)", "subject", identity.Subject)
 		return store.User{}, oidcErrForbidden
 	}

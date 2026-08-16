@@ -70,7 +70,7 @@ func newSkillCmd(env Env, gf *globalFlags) *cobra.Command {
 				return p.JSON(res)
 			}
 			if res.BackedUp {
-				fmt.Fprintf(env.Stderr, "your edited %s was preserved as %s\n", res.Path, res.BackupPath)
+				_, _ = fmt.Fprintf(env.Stderr, "your edited %s was preserved as %s\n", res.Path, res.BackupPath)
 			}
 			if !gf.quiet {
 				switch {
@@ -108,7 +108,7 @@ func newSkillCmd(env Env, gf *globalFlags) *cobra.Command {
 				return p.JSON(res)
 			}
 			if res.BackedUp {
-				fmt.Fprintf(env.Stderr, "your %s was backed up to %s\n", res.Path, res.BackupPath)
+				_, _ = fmt.Fprintf(env.Stderr, "your %s was backed up to %s\n", res.Path, res.BackupPath)
 			}
 			if !gf.quiet {
 				switch {
@@ -142,7 +142,7 @@ func newSkillCmd(env Env, gf *globalFlags) *cobra.Command {
 				return p.JSON(res)
 			}
 			if res.BackedUp {
-				fmt.Fprintf(env.Stderr, "your %s was backed up to %s\n", res.Path, res.BackupPath)
+				_, _ = fmt.Fprintf(env.Stderr, "your %s was backed up to %s\n", res.Path, res.BackupPath)
 			}
 			if !gf.quiet {
 				if res.Changed {
@@ -211,10 +211,10 @@ func maybeAutoUpgradeSkill(env Env) {
 	}
 	res, err := inst.Install(false)
 	if err != nil {
-		fmt.Fprintf(env.Stderr, "uzi: skill auto-upgrade skipped: %v\n", err)
+		_, _ = fmt.Fprintf(env.Stderr, "uzi: skill auto-upgrade skipped: %v\n", err)
 		return
 	}
 	if res.BackedUp {
-		fmt.Fprintf(env.Stderr, "uzi: your edited %s was preserved as %s and the bundled skill was reinstalled\n", res.Path, res.BackupPath)
+		_, _ = fmt.Fprintf(env.Stderr, "uzi: your edited %s was preserved as %s and the bundled skill was reinstalled\n", res.Path, res.BackupPath)
 	}
 }

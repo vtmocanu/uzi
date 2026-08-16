@@ -91,7 +91,7 @@ func (c *Client) Poll(ctx context.Context) (protocol.PollResponse, error) {
 		// header, so there is no credential to scrub here.
 		return protocol.PollResponse{}, fmt.Errorf("apiclient: poll: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
@@ -143,7 +143,7 @@ func (c *Client) Report(ctx context.Context, report protocol.StatusReport) error
 	if err != nil {
 		return fmt.Errorf("apiclient: status report: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusNotFound {
 		c.noStatusEndpoint.Do(func() {

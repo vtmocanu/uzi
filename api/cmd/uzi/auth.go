@@ -50,7 +50,7 @@ func newAuthCmd(env Env, gf *globalFlags) *cobra.Command {
 				return uzicli.Exitf(uzicli.ExitGeneric, "%v", err)
 			}
 			if !gf.quiet {
-				fmt.Fprintf(env.Stdout, "Stored token %s for context default.\n", maskToken(tok))
+				_, _ = fmt.Fprintf(env.Stdout, "Stored token %s for context default.\n", maskToken(tok))
 			}
 			return nil
 		},
@@ -94,7 +94,7 @@ func newAuthCmd(env Env, gf *globalFlags) *cobra.Command {
 // taken and surrounding whitespace is trimmed.
 func readToken(env Env, withToken bool) (string, error) {
 	if env.StdinTTY && !withToken {
-		fmt.Fprint(env.Stderr, "Paste your uzi token: ")
+		_, _ = fmt.Fprint(env.Stderr, "Paste your uzi token: ")
 	}
 	line, err := bufio.NewReader(env.Stdin).ReadString('\n')
 	if err != nil && err != io.EOF {

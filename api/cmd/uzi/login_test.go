@@ -58,14 +58,14 @@ func TestLoginFlow(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/auth/cli/start":
 			w.WriteHeader(http.StatusCreated)
-			io.WriteString(w, `{"request_id":"req-1","user_code":"WXYZ-7788","expires_in":300,"interval":5}`)
+			_, _ = io.WriteString(w, `{"request_id":"req-1","user_code":"WXYZ-7788","expires_in":300,"interval":5}`)
 		case "/api/auth/cli/poll":
 			if atomic.AddInt32(&polls, 1) == 1 {
 				w.WriteHeader(http.StatusAccepted)
-				io.WriteString(w, `{"status":"pending"}`)
+				_, _ = io.WriteString(w, `{"status":"pending"}`)
 				return
 			}
-			io.WriteString(w, `{"token":"uzc_minted_secret","user":{"id":"u1","email":"vlad@x.io"}}`)
+			_, _ = io.WriteString(w, `{"token":"uzc_minted_secret","user":{"id":"u1","email":"vlad@x.io"}}`)
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)
 		}
@@ -120,9 +120,9 @@ func TestLoginHeadlessBrowserFailure(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/auth/cli/start":
 			w.WriteHeader(http.StatusCreated)
-			io.WriteString(w, `{"request_id":"req-2","user_code":"AAAA-BBBB","expires_in":300,"interval":5}`)
+			_, _ = io.WriteString(w, `{"request_id":"req-2","user_code":"AAAA-BBBB","expires_in":300,"interval":5}`)
 		case "/api/auth/cli/poll":
-			io.WriteString(w, `{"token":"uzc_headless","user":{"id":"u1","email":"h@x.io"}}`)
+			_, _ = io.WriteString(w, `{"token":"uzc_headless","user":{"id":"u1","email":"h@x.io"}}`)
 		}
 	}))
 	defer srv.Close()
@@ -151,10 +151,10 @@ func TestLoginDeniedStops(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/auth/cli/start":
 			w.WriteHeader(http.StatusCreated)
-			io.WriteString(w, `{"request_id":"req-3","user_code":"CCCC-DDDD","expires_in":300,"interval":5}`)
+			_, _ = io.WriteString(w, `{"request_id":"req-3","user_code":"CCCC-DDDD","expires_in":300,"interval":5}`)
 		case "/api/auth/cli/poll":
 			w.WriteHeader(http.StatusGone)
-			io.WriteString(w, `{"status":"denied"}`)
+			_, _ = io.WriteString(w, `{"status":"denied"}`)
 		}
 	}))
 	defer srv.Close()

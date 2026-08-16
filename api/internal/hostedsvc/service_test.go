@@ -110,7 +110,7 @@ func (f *fakeStore) MarkHostedWorkerTokenDelivered(_ context.Context, arg store.
 	if !ok {
 		return 0, nil // no row
 	}
-	if !(row.ciphertext != nil || !row.delivered) {
+	if row.ciphertext == nil && row.delivered {
 		return 0, nil // already delivered: the guard excludes it (idempotence)
 	}
 	row.ciphertext = nil

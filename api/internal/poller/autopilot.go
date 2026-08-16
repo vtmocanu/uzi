@@ -175,7 +175,7 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 		return
 	}
 	if active {
-		a.record(ctx, r, iid, eventID)
+		_ = a.record(ctx, r, iid, eventID)
 		return
 	}
 
@@ -213,7 +213,7 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 		// Create-then-record: a crash before recording leaves the created run active,
 		// so the next tick's active-run check swallows the re-detection (no double run)
 		// and records the event id then.
-		a.record(ctx, r, iid, eventID)
+		_ = a.record(ctx, r, iid, eventID)
 	case errors.Is(err, workersvc.ErrDescriptionTooLarge):
 		// The shared createRun cap (unified in M5): the description is too large to
 		// snapshot onto an unattended run — explain it instead of running.
@@ -224,7 +224,7 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 		a.recordThenComment(ctx, r, f, iid, eventID, noPRDLinkComment(label))
 	case errors.Is(err, workersvc.ErrActiveRunExists):
 		// A run appeared between the pre-check and here: swallow, same as an active run.
-		a.record(ctx, r, iid, eventID)
+		_ = a.record(ctx, r, iid, eventID)
 	case errors.Is(err, workersvc.ErrNotPRDIssue):
 		// The run gate says this issue is not uzi's (PRD #102 Decision 14). The
 		// candidate query already filters on the PRD label, so reaching here means the
@@ -238,7 +238,7 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 		// never uzi's, which is the outcome the whole decision exists to prevent. The
 		// person who added the autopilot label sees nothing, and that is correct — uzi
 		// has no standing on that issue to explain itself.
-		a.record(ctx, r, iid, eventID)
+		_ = a.record(ctx, r, iid, eventID)
 	default:
 		// ErrRepoNotFound/ErrIssueNotFound should not happen (the owner owns the repo
 		// and the issue is cached) and a transient DB error should retry: leave the

@@ -82,6 +82,7 @@ func TestPollTakesNoControllerAssertion(t *testing.T) {
 	if p.calls != 1 {
 		t.Fatalf("poll calls = %d, want 1", p.calls)
 	}
+	//nolint:staticcheck // QF1011: the explicit type is the signature assertion this line makes
 	var _ func(context.Context) (protocol.PollResponse, error) = p.Poll
 }
 

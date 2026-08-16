@@ -108,7 +108,7 @@ func (h *Handler) ServeWS(w http.ResponseWriter, r *http.Request) {
 		slog.Debug("ws accept", "error", err)
 		return
 	}
-	defer conn.CloseNow()
+	defer func() { _ = conn.CloseNow() }()
 
 	sub := h.hub.Subscribe(runID)
 	defer sub.Close()
