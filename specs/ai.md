@@ -1285,7 +1285,7 @@ need it); best-practice (safe rendering of repo content).
   link routes in-app for an admin but resolves to the GitLab blob for a non-admin.
   Any other relative target (repo-only doc, `../plan.md`, `auth-design.md`) → the
   **pinned GitLab blob base**
-  `https://gitlab.example.com/vtmocanu/uzi/-/blob/main/` + repo-relative path.
+  `https://github.com/vtmocanu/uzi/-/blob/main/` + repo-relative path.
   `#anchor` fragments are preserved in both cases (existing docs lean on them).
   External `http(s)` links get `target=_blank` + `rel="noopener noreferrer"`.
 - **Defense-in-depth XSS**: `javascript:`/`vbscript:`/`data:`/`file:` schemes are
@@ -3027,28 +3027,29 @@ Serves human: "users allocate global or their own skills to each agent"; skills 
 
 ## 109. First builtin skill: `ci-cd-norms`
 
-Serves human: "the first builtin skill is ci-cd-norms, researched from internal-kb
-and the example-app repos, covering the example CI/CD norm and example-app as the worked exception".
+Serves human: "the first builtin skill is ci-cd-norms, researched from an internal
+knowledge base and the org's repos, covering an organization's CI/CD norm and a reference
+app as the worked exception".
 
 *(Title kept as history: this was the first, and for a long time the only, builtin skill.
 A **second** shipped with PRD #72 — `prd-lifecycle`, §384 — and builtins now carry default
 allocations, §383. Read this section as "what PRD #16 shipped", not as "the builtin skill
-inventory".)*
+inventory"; the skill itself was later removed from the product, so what follows is a
+design record, not a description of a shipped skill.)*
 
-- Authored at `api/internal/skilltmpl/builtins/ci-cd-norms/SKILL.md` (researched from
-  internal-kb `shared/infrastructure/ci-pipeline.md`, `organizations/myorg/infrastructure/
-  deployments.md`, and the example-app + `argo-apps` repos). Structure: the **default
-  norm** (thin `.gitlab-ci.yml` including a bundle from private `myorg/pipelines`;
-  lint→build→audit→push→cleanup with `SKIP_*` toggles; Harbor `harbor.example.com` for
-  images + OCI charts; **CI never deploys** — ArgoCD app-of-apps in `myorg/k8s/argo-apps`
-  does; secrets via Infisical), an **exception-detection rule** (no `include:` of
-  `myorg/pipelines` ⇒ exception; follow its local convention, never "normalize" unasked),
-  **example-app as the worked exception** (hand-rolled DAG pipeline, kaniko with
-  protected-ref-only cache writes, tag-only 4-artifact publish, chart-in-repo consumed as
-  Harbor OCI via multi-source ArgoCD app, manual `targetRevision` release ritual), and a
+- Authored at `api/internal/skilltmpl/builtins/ci-cd-norms/SKILL.md` (researched from an
+  internal knowledge base and the org's deployment repos). Structure: the **default
+  norm** (thin `.gitlab-ci.yml` including a bundle from a shared pipelines repo;
+  lint→build→audit→push→cleanup with `SKIP_*` toggles; a container registry for
+  images + OCI charts; **CI never deploys** — an ArgoCD app-of-apps
+  does; secrets via a secrets manager), an **exception-detection rule** (no `include:` of
+  the shared bundle ⇒ exception; follow its local convention, never "normalize" unasked),
+  **a reference app as the worked exception** (hand-rolled DAG pipeline, kaniko with
+  protected-ref-only cache writes, tag-only multi-artifact publish, chart-in-repo consumed as
+  registry OCI via multi-source ArgoCD app, manual `targetRevision` release ritual), and a
   **verify-live section** for facts the KB doesn't pin (bundle contents, pinned tool
   versions, push-credential var names).
-- **No invented facts**: every claim traces to a internal-kb page or the repos; volatile
+- **No invented facts**: every claim traces to a KB page or the repos; volatile
   items sit in verify-live. Editable in place by admins (so infra drift is fixed without a
   uzi release).
 
@@ -6260,7 +6261,7 @@ Serves human: Feature #53 + the testing-credentials policy (no live Anthropic in
 Serves the human requirement: real CI/CD (pipeline, tag-driven versioning, ArgoCD deploy to
 dev-cluster), the ArgoCD wiring landing via an MR to `argo-apps` (never a direct push), and
 uzi's own dummy CI staying demonstrable against real pipelines. Full Decision Log in
-`prds/done/52-cicd-argocd-deploy.md`. Reference implementation is **example-app** (same `vtmocanu` group), copied
+`prds/done/52-cicd-argocd-deploy.md`. Reference implementation is **example-app** (a sibling app in the same group), copied
 nearly verbatim and adapted to uzi's three-toolchain monorepo (Go `api`, Vite/React `web`, Node
 `agent`), two images, compose-first architecture. This run delivered M1–M5 + M7 (the uzi MR plus a
 SEPARATE Draft MR to `argo-apps`); M6 (cut a real tag, live-deploy, verify) and all
@@ -6268,7 +6269,7 @@ platform-admin execution are OUT of scope and only documented. The load-bearing 
 
 ## 244. Bespoke `.gitlab-ci.yml`, four stages, demo trigger preserved (Decision 1, M1)
 
-- **Bespoke pipeline, not the `myorg/pipelines` `simple-app.yml` include.** That include assumes one
+- **Bespoke pipeline, not the `shared-pipelines` `simple-app.yml` include.** That include assumes one
   image, docker-build-as-artifact, a fixed check set; uzi needs three toolchains, two images (one with
   a repo-root build context), sqlc-drift checks, and kaniko (no docker daemon). example-app went bespoke in
   the same group for the same reasons. Cost (we own the pipeline) is mitigated by copying example-app's
@@ -6305,7 +6306,7 @@ platform-admin execution are OUT of scope and only documented. The load-bearing 
   never`, then `$CI_COMMIT_TAG` (publish) / `$CI_COMMIT_REF_PROTECTED == "true"` (cache-warming build).
 - **Auth is a single toggle `KANIKO_AUTH`, set `"true"` only by the protected-ref rule** (`"false"`
   otherwise). The `.kaniko` `before_script` writes `config.json` and passes `--cache=true` +
-  `--cache-repo .../gitlab/vtmocanu/uzi/cache` ONLY when `KANIKO_AUTH=true`; MR builds run anonymous,
+  `--cache-repo .../uzi/cache` ONLY when `KANIKO_AUTH=true`; MR builds run anonymous,
   cache-less, `--no-push`. example-app's unconditional per-pipeline auth is deliberately NOT inherited.
   Consequence accepted: MR validation builds are slower (no shared layer cache); only protected refs
   authenticate, warm the cache, and (tags only) push. GitLab `cache:` keys are not protected-ref
@@ -6318,8 +6319,8 @@ platform-admin execution are OUT of scope and only documented. The load-bearing 
   must both equal the tag with the `v` stripped (`VERSION="${CI_COMMIT_TAG#v}"`). `publish:assert-version`
   is a first, blocking publish-stage job that fails the whole release on any mismatch — a lagging
   Chart.yaml can never publish a half-versioned release.
-- **Images land at `harbor.example.com/gitlab/vtmocanu/uzi/{api,web}:<tag>` (+ a `<short-sha>` tag);
-  the chart at `oci://harbor.example.com/gitlab/vtmocanu/uzi/uzi:<version>`.** Both image tags default
+- **Images land at `registry.example.com/uzi/{api,web}:<tag>` (+ a `<short-sha>` tag);
+  the chart at `oci://registry.example.com/uzi/uzi:<version>`.** Both image tags default
   to the chart appVersion in the templates (`.Values.{api,web}.image.tag | default .Chart.AppVersion`)
   — example-app's single-image Model B mechanism, doubled. ArgoCD's `targetRevision` is that chart version,
   bumped per release via an MR to `argo-apps` (§251) — explicit reviewable deploy over
@@ -6332,14 +6333,14 @@ platform-admin execution are OUT of scope and only documented. The load-bearing 
 - **Postgres is a CNPG `Cluster`, not the compose `postgres:17` container** — org standard, operator
   already on dev-cluster (in the `appset.cloudnative-pg.yaml` generator). Realized as the CNPG
   `cluster` subchart **0.6.1**, pinned in `Chart.lock` (version + digest) and re-fetched via
-  `helm dependency build`; the `.tgz` is gitignored, not committed (chart-parity). Compatible with
+  `helm dependency build`; the `.tgz` is gitignored, not committed (example-app-parity). Compatible with
   dev-cluster's CNPG operator **1.23.5**.
 - **In-tree `barmanObjectStore`, not the barman-cloud plugin** — the plugin appset has dev-cluster
-  commented out. Dev sizing: `instances: 1`, storageClass `storage-class`. **Backups default OFF**; enabling
+  commented out. Dev sizing: `instances: 1`, storageClass `standard`. **Backups default OFF**; enabling
   is a documented toggle (S3 creds InfisicalSecret + the `barmanObjectStore` block, bucket convention
-  `s3://postgres-dev-cluster`) deferred, not wired, this run.
-- **Postgres image `cloudnative-pg/postgresql:16.4`.** The MM CNPG fleet standardizes on 16.x
-  (16.2 most common; example-app-2 on dev-02 uses 16.4) with no single dev-02 convention; the real goal is
+  `s3://postgres-example`) deferred, not wired, this run.
+- **Postgres image `cloudnative-pg/postgresql:16.4`.** The CNPG fleet standardizes on 16.x
+  (16.2 most common; a sibling app on the cluster uses 16.4) with no single cluster convention; the real goal is
   a Harbor-mirrored tag. 16.4 is pinned because it is confirmed present in `cloudnative-pg`
   (`crane ls`, pre-M6 check 2026-07-15; 16.10 also available, **16.3 is NOT mirrored**). The
   `cluster.postgresql: "16"` major matches. (An earlier draft pinned 16.3 on the assumption it was
@@ -6376,7 +6377,7 @@ runner; per-package tests + `helm template` are the CI gate; M8 stretch revisits
   identically (same-origin, no CORS). A `dynamicResolution` knob (default off) enables an nginx
   `resolver` + variable upstream for runtime re-resolution, documenting the Service-recreate wrinkle.
 - **Secrets via Infisical only** (`InfisicalSecret`): `JWT_SECRET`, `UZI_SECRET_KEY`, CNPG `-app`
-  DB creds, optional `UZI_SEED_*`; Harbor pull secret from the existing `/k8s-registry-robot` path.
+  DB creds, optional `UZI_SEED_*`; Harbor pull secret from the existing `/registry-robot` path.
   Project slug `example-project`, envSlug `prod`, path `/uzi`. NO plaintext secret values anywhere in
   repo/chart/values; the api's refuse-to-start-on-placeholder-key check is the safety net.
 - **Ingress `uzi.example.com`, `ingressClassName: nginx`, no per-host TLS block** — dev-cluster
@@ -6396,12 +6397,12 @@ runner; per-package tests + `helm template` are the CI gate; M8 stretch revisits
   by the pre-M6 check 2026-07-15) — dropped the blanket `10/8,172.16/12`. With the NetworkPolicy in
   place only the web pod can deliver XFF anyway.
 - **`api.networkPolicy.probeCIDRs` knob (chart default `[]`).** A default-deny ingress policy also
-  drops KUBELET health probes (node IP / host-network, unmatchable by podSelector); on platform/Antrea
+  drops KUBELET health probes (node IP / host-network, unmatchable by podSelector); on Antrea
   that drops the api startupProbe → never Ready → CrashLoop. The dev-cluster values SET it to the node
   InternalIP CIDR (`192.0.2.0/24`, all nodes confirmed on-cluster 2026-07-15). That node CIDR is kept
   OUT of TRUSTED_PROXIES so a host-network probe source can't spoof XFF. Enforcement is CNI-dependent
-  (Antrea enforces by default on platform — verify at M6 live-deploy); if ingress-nginx runs host-network
-  its node IP is the rightmost XFF hop and, being outside `192.168/16`, would collapse rate-limit
+  (Antrea enforces by default — verify at M6 live-deploy); if ingress-nginx runs host-network
+  its node IP is the rightmost XFF hop and, being outside `10.244/16`, would collapse rate-limit
   buckets (over-throttle, fails closed) — add the ingress node CIDR to TRUSTED_PROXIES if so.
 - **LOW hardenings applied:** CNPG `enableSuperuserAccess: false` (app uses `-app` role),
   `enablePDB: false` (single-instance dev — a PDB can wedge node drains), `automountServiceAccountToken:
@@ -6415,15 +6416,15 @@ M6):
 
 - **Harbor CI creds protected + masked** on `vtmocanu/uzi` (robot injected by the GitLab↔Harbor
   integration) — the runtime side of Decision 2 (§245). **Scope the Harbor robot push-only on
-  `gitlab/vtmocanu/uzi/*`** (no delete, no cross-project) to contain the accepted protected-ref residual.
+  `uzi/*`** (no delete, no cross-project) to contain the accepted protected-ref residual.
 - **Protected `v*` tags = MAINTAINER-create-only (exclude Developers).** The agent/worker PAT has
   Developer role; creating a `v*` tag is the one path by which it could reach the tag-pipeline push
   creds. Maintainer-only tag CREATE + main protected closes the agent-authored-MR loop.
 - **Infisical `/uzi` folder is NEW** (slug `example-project`, envSlug `prod`) — must be created before
-  deploy; the operator, universal-auth creds, and `/k8s-registry-robot` pull-secret path are already live
+  deploy; the operator, universal-auth creds, and `/registry-robot` pull-secret path are already live
   on dev-cluster.
-- **DNS + ArgoCD OCI repo cred** for `harbor.example.com/gitlab/vtmocanu/uzi`; git access via the
-  existing `vtmocanu-repo-creds` group-prefix template (verify, no new token).
+- **DNS + ArgoCD OCI repo cred** for `registry.example.com/uzi`; git access via the
+  existing `repo-creds` group-prefix template (verify, no new token).
 - **Release runbook ordering:** bump `Chart.yaml` version/appVersion in an MR → merge → tag THAT
   (already-merged) commit, so its default-branch pipeline warmed the Harbor layer cache (cold cache =
   slower publish, not a failure) and `assert-version` (§246) holds. Rollback = revert the argo
@@ -6440,11 +6441,11 @@ M6):
 - **`argo-apps/apps/uzi/{prj.uzi.yaml,app.uzi.yaml}`**, delivered as a SEPARATE Draft MR
   (`!294`) to the argo repo — the user's explicit "for ArgoCD we do an MR, not a push to main". These
   files live in the argo repo, not the uzi worktree.
-- **`app.uzi.yaml` is multi-source** (chart-parity): the released chart from Harbor OCI +
+- **`app.uzi.yaml` is multi-source** (example-app-parity): the released chart from Harbor OCI +
   per-cluster values from `vtmocanu/uzi.git` (`ref: values`, `$values/deploy/values/dev-cluster.yaml`),
   so operational config can change without cutting a release. Destination `dev-cluster` / namespace
   `uzi`; automated sync with prune + selfHeal + `CreateNamespace`; explicit `sourceRepos` in
-  `prj.uzi.yaml`; the OCI `repoURL` omits the `oci://` scheme (chart-parity).
+  `prj.uzi.yaml`; the OCI `repoURL` omits the `oci://` scheme (example-app-parity).
 
 ## 252. Pre-M6 status — on-cluster fact-checks DONE; live deploy + admin steps REMAIN
 
@@ -7441,7 +7442,7 @@ Serves human: as §264. Recorded because the honest inventory is part of the con
     **silent**: `producer | consumer` under `set -eu` with **no pipefail** would write the "seeded"
     sentinel over a **partial store**, and every later boot would skip seeding forever.
   - **The `lost+found` sentinel trap is closed by a UNIT test, deliberately**: kind's local-path makes a
-    plain directory, so a fresh PVC there really is empty, while dev-cluster's hypervisor CSI formats ext4
+    plain directory, so a fresh PVC there really is empty, while dev-cluster's CSI driver formats ext4
     and a fresh PVC carries `lost+found`. It is a property of the check, so it needs no kubelet.
 - **Deliberately v2, recorded so it is not re-litigated**: no docker-compose hosting (laptop users keep
   the manual flow); no autoscaling / scale-to-zero / spawn-on-demand; no preset CRUD; no restart
@@ -8448,7 +8449,7 @@ docker posture. Extends #58's controller (§264–275), does not fork it.
 - **Q-B RESOLVED (owner decision, recorded as a deviation from PRD Decision 7).** Original intent was
   a `baseline` namespace + a flagless rootless sidecar (no `privileged`, `/dev/fuse` device plugin,
   `hostUsers:false`). Live dev-cluster evidence killed it: **k8s 1.29.4 + containerd 1.6.31**
-  (Linux OS kernel 6.1.83, FIPS platform), both BELOW the k8s ≥1.30 / containerd ≥2.0.5 that pod user
+  both BELOW the k8s ≥1.30 / containerd ≥2.0.5 that pod user
   namespaces (`hostUsers:false`) need — so baseline+flagless is INFEASIBLE on this cluster. Owner's
   choice (Option 1): a **privileged rootless-DinD sidecar in a dedicated `enforce: privileged`
   namespace `uzi-workers-docker`**, same posture as compose. Decision 7's REAL goal — a separate,
@@ -8780,7 +8781,7 @@ viewer" — the first path that writes judge text to a forge issue.
 # PRD #89 — Optional non-rootless Docker-in-Docker tier for hosted workers (per-cluster toggle)
 
 A scoped fallback on PRD #83's rootless docker-worker tier (§297–305), added because the live
-dev-cluster nodes (vendor Linux OS, kernel 6.1.83) ship unprivileged user namespaces DISABLED, so
+dev-cluster nodes ship unprivileged user namespaces DISABLED, so
 rootless dockerd crash-loops there and #83's k8s definition of done is unreachable on this cluster.
 Owner decisions are recorded in `prds/89-optional-nonrootless-dind.md`'s Decision Log and are NOT
 duplicated into `specs/human.md` (they are #83 owner overrides, not new user-binding requirements);
@@ -8837,7 +8838,7 @@ Serves human Feature #4 (workers run docker) on a cluster that cannot do rootles
 Serves human Feature #4; the client transport for the non-rootless daemon. PRD #89 M1. AMENDS §301.
 
 - **Under `rootless:false` a pod-local loopback TCP listener now exists.** The non-root worker (uid
-  10001) reaches the root daemon over `DOCKER_HOST=tcp://127.0.0.1:2375` (matching the coder prior art
+  10001) reaches the root daemon over `DOCKER_HOST=tcp://127.0.0.1:2375` (matching prior art
   on the same cluster infra). This is why the non-rootless posture needs NO agent change: the resolver
   §298 takes branch 1 (explicit `DOCKER_HOST` → use verbatim; `agent/src/docker-wiring.ts` already
   parses `tcp://` targets) and the guardrail §300 keys only on `DOCKER_HOST` being set — the tcp host
@@ -12118,8 +12119,8 @@ keeping beside what was measured. All three were stated as fact; all three now h
 **§389's "the value is reasoned, not measured" about `MaxUpgradingWindow` stands and must stay.**
 Live validation produced n=1 (87s, of which **70.7s was a cold image pull** — the window sizes pull
 latency, not the `/nix` reseed the incident makes you expect). The cold-reseed tail is still
-unmeasured because a fresh 4 Gi `storage-class` PVC never bound (`ExternalProvisioning` x26 over 10m on
-hypervisor CSI). Replacing an honest placeholder with a number derived from one sample would be a
+unmeasured because a fresh 4 Gi `standard` PVC never bound (`ExternalProvisioning` x26 over 10m on
+the CSI driver). Replacing an honest placeholder with a number derived from one sample would be a
 regression, not progress. The enforced floor is `ControllerStuckAge + 1m` = 11m and is real.
 
 **What live validation CONFIRMED in those sections:** `pods: list` only with no `get`/`watch`
