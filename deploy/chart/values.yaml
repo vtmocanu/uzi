@@ -18,28 +18,33 @@ nameOverride: ""
 fullnameOverride: "uzi"
 
 # How the runtime Secrets are provided.
-#   infisical (default): the chart creates the InfisicalSecret CRs below, and the
-#     cluster's Infisical operator syncs `uzi-secrets` + the Harbor pull secret.
-#   existing: SKIP the InfisicalSecret templates entirely and assume `uzi-secrets`
-#     (+ any pull secret) are PRE-CREATED as plain k8s Secrets. Used by the KinD
-#     smoke (deploy/values/kind-smoke.yaml), which has no Infisical operator. The
-#     api still reads `uzi-secrets` by secretKeyRef either way, so nothing else
-#     changes. The CNPG `-app` DB secret is operator-generated in both modes.
+#   existing (default): the chart creates NO secret-management CRs; it assumes
+#     `uzi-secrets` (and, for a private image registry, a pull secret) already exist
+#     as plain k8s Secrets. Provide them however you like — `kubectl create secret`,
+#     External Secrets Operator, Sealed Secrets, SOPS, or your CD tool. The api reads
+#     `uzi-secrets` by secretKeyRef. Turnkey for a public install: the GHCR images
+#     need no pull secret, so you only supply `uzi-secrets` (JWT_SECRET, UZI_SECRET_KEY,
+#     plus any optional Slack/OIDC/seed keys).
+#   infisical: ALSO create the InfisicalSecret CRs from `infisicalList` below so a
+#     cluster running the Infisical operator syncs `uzi-secrets` + any pull secret.
+#     Opt-in; a per-cluster values file selects it. The KinD smoke uses `existing`.
+# The CNPG `-app` DB secret is operator-generated in both modes.
 secrets:
-  mode: infisical
+  mode: existing
 
-# Harbor pull secret (dockerconfigjson), synced from Infisical (/k8s-registry-robot)
-# by the infisicalList entry below. Both the api and web pods pull PRIVATE images
-# from harbor.example.com/gitlab/vtmocanu/uzi/*, and the CNPG pod pulls the
-# postgres image from the cloudnative-pg mirror, so all three reference it.
+# Image pull secret (dockerconfigjson) for a PRIVATE image registry. EMPTY by default:
+# the public images (`ghcr.io/vtmocanu/uzi/*`) are anonymous-pullable and need none, and
+# the api/web/controller pod specs omit `imagePullSecrets` when this is empty. Set it to
+# the NAME of a pre-created dockerconfigjson Secret (or, under secrets.mode: infisical, a
+# name an infisicalList entry syncs) when the images live in a private registry.
 imagePullSecret:
-  name: registry-robot-secret-uzi
+  name: ""
 
 # --- api: the Go backend (sole holder of secrets/keys, the DB client) -----------
 api:
   enabled: true
   image:
-    repository: harbor.example.com/gitlab/vtmocanu/uzi/api
+    repository: ghcr.io/vtmocanu/uzi/api
     # Unset => follows Chart.appVersion (Model B). Pin only to override per-cluster.
     tag: ""
     pullPolicy: IfNotPresent
@@ -221,7 +226,7 @@ api:
     enabled: true
     # kubelet liveness/readiness/startup probes originate from the NODE IP (host
     # network), which no podSelector can match. On CNIs that subject probe traffic
-    # to NetworkPolicy (platform/Antrea, Calico), the node CIDR must be allowed here or
+    # to NetworkPolicy (Antrea, Calico), the node CIDR must be allowed here or
     # the api never goes Ready (startup probe dropped -> CrashLoop). Set per-cluster
     # to the dev-cluster node InternalIP CIDR(s). Empty = rely on the CNI exempting
     # host->pod probe traffic; CONFIRM at M6 before trusting empty.
@@ -285,7 +290,7 @@ workers:
     # image nor a controller token.
     enabled: true
     image:
-      repository: harbor.example.com/gitlab/vtmocanu/uzi/controller
+      repository: ghcr.io/vtmocanu/uzi/controller
       # Unset => follows Chart.appVersion (Model B), exactly like api/web.
       tag: ""
       pullPolicy: IfNotPresent
@@ -348,7 +353,7 @@ workers:
   # only as a worker that never comes online. The two lists are kept equal by review,
   # not by a gate.
   image:
-    repository: harbor.example.com/gitlab/vtmocanu/uzi
+    repository: ghcr.io/vtmocanu/uzi
     # Unset => Chart.appVersion (Model B). Changing the tag is what rolls every hosted
     # worker onto a new release (Decision 9) — the controller stamps it into the pod
     # spec hash, so a release rolls the fleet as its workers finish their runs.
@@ -359,19 +364,19 @@ workers:
   # is kind-loaded). Materialized by worker-pull-secret.yaml — deliberately its own
   # template rather than an infisicalList entry, since its lifecycle is workers.enabled
   # and not the release's.
-  imagePullSecretName: registry-robot-secret-uzi-workers
+  imagePullSecretName: ""
   # Where that robot comes from. The SHARED k8s-clusters project, exactly like the
-  # release namespace's copy (uzi's own runtime secrets live in the vtmocanu project;
+  # release namespace's copy (uzi's own runtime secrets live in the app-secrets project;
   # only the Harbor robot is shared — the same split infisicalList already makes).
   pullSecretSource:
-    projectSlug: example-project
+    projectSlug: your-infisical-project
     envSlug: prod
-    secretsPath: /k8s-registry-robot
+    secretsPath: /registry-robot
   # StorageClass for the worker PVCs. Empty = the cluster default.
   #
-  # Worth a moment at rollout: dev-cluster's storage-class is volumeBindingMode Immediate,
-  # while storage-class-latebinding (WaitForFirstConsumer) is safer for a 2-PVC pod. uzi's
-  # own CNPG already runs on storage-class here, so this is a default worth thinking about,
+  # Worth a moment at rollout: dev-cluster's standard is volumeBindingMode Immediate,
+  # while standard-latebinding (WaitForFirstConsumer) is safer for a 2-PVC pod. uzi's
+  # own CNPG already runs on standard here, so this is a default worth thinking about,
   # not a blocker.
   storageClass: ""
   # The per-hosted-worker run-slot cap (→ UZI_WORKER_MAX_CONCURRENT_RUNS → the pod's
@@ -507,7 +512,7 @@ workers:
   #     nodes with unprivileged userns (kernel.unprivileged_userns_clone=1).
   #   - rootless:false — a NON-ROOTLESS privileged sidecar (dockerd as REAL ROOT on
   #     pod-loopback TCP), for clusters whose nodes cannot do rootless. dev-cluster
-  #     (vendor Linux, userns off) is one, so it sets rootless:false. Its residual is
+  #     (unprivileged userns off at the node kernel) is one, so it sets rootless:false. Its residual is
   #     node root, gated behind acknowledgeNonRootlessNodeRoot (see below).
   # sysbox (runtimeClassName: sysbox-runc) remains the documented path to a
   # non-privileged tier once a cluster can run it; it is NOT installed and NOT required.
@@ -525,7 +530,7 @@ workers:
     #
     # Default ROOTLESS (the safe, recommended stance — PRD #83). Set false ONLY on
     # clusters whose nodes cannot run rootless dockerd (no unprivileged userns, e.g.
-    # dev-cluster / vendor Linux, kernel default off): the controller then renders a
+    # dev-cluster (unprivileged userns off at the node kernel): the controller then renders a
     # NON-ROOTLESS privileged DinD sidecar — dockerd as REAL ROOT bound to pod-loopback
     # TCP (127.0.0.1:2375). Nothing changes on any cluster that keeps rootless.
     #
@@ -806,7 +811,7 @@ workers:
 web:
   enabled: true
   image:
-    repository: harbor.example.com/gitlab/vtmocanu/uzi/web
+    repository: ghcr.io/vtmocanu/uzi/web
     tag: ""
     pullPolicy: IfNotPresent
   # Stateless (SPA + reverse proxy): safe to run >1 for availability. 2 gives a
@@ -865,10 +870,10 @@ web:
       enabled: false
       secretName: uzi-tls
 
-# --- Runtime secrets via Infisical ---------------------------------------------
-# Synced from infisical.example.com into k8s Secrets by the cluster's Infisical
-# operator. Shared host/auth config here; each infisicalList entry supplies its
-# own scope (projectSlug/envSlug/secretsPath) + the managed k8s Secret it creates.
+# --- Runtime secrets via Infisical (opt-in; used only when secrets.mode: infisical) ---
+# When selected, the chart renders InfisicalSecret CRs (from infisicalList) so a cluster
+# running the Infisical operator syncs `uzi-secrets` + any pull secret. Dormant under the
+# default secrets.mode: existing. Point hostAPI at your own Infisical instance.
 infisical:
   enabled: true
   hostAPI: https://infisical.example.com/api
@@ -880,41 +885,25 @@ infisical:
   app:
     managedSecretName: uzi-secrets
 
-# One InfisicalSecret per entry (the list pattern the other MM apps use). To add a
+# One InfisicalSecret per entry (rendered only under secrets.mode: infisical). To add a
 # secret, append an entry — no new template. `secretName` values MUST match what the
-# workloads reference: `uzi-secrets` == infisical.app.managedSecretName (api env);
-# `registry-robot-secret-uzi` == imagePullSecret.name.
+# workloads reference: `uzi-secrets` == infisical.app.managedSecretName (the api's secret
+# env); a pull-secret entry's `secretName` == imagePullSecret.name.
 #
-# CONFIRMED (M6 first sync, 2026-07-16 — this replaces the M5 assumption, which was
-# WRONG): uzi's own runtime secrets live at /uzi in the **vtmocanu** Infisical project
-# (slug example-project, envSlug dev), matching the sibling vtmocanu apps —
-# example-app -> example-project/dev:/example-app, dot-ai -> example-project/dev:/dot-ai. Only the
-# SHARED Harbor robot pull secret comes from the k8s-clusters project
-# (example-project, envSlug prod), so the two entries below intentionally differ.
-# The M5 draft assumed BOTH lived in example-project/prod; that 404'd on first sync
-# ("Folder with path '/uzi' in environment 'prod' was not found") and CrashLooped the
-# api on an empty JWT_SECRET. NOTE: a cluster's operator identity needs membership on
-# the vtmocanu project (per-project grant — auth succeeds then 403s without it);
-# dev-cluster's was granted 2026-07-16.
-# syncWave: "-10" applies both InfisicalSecrets before the workloads (and before
-# the CNPG cluster at -5), so the api's `uzi-secrets` and the Harbor pull secret
-# `registry-robot-secret-uzi` exist on first deploy instead of causing a transient
-# ImagePullBackOff / api CrashLoop until the operator catches up (self-heal is the
-# real recovery; this just cuts the churn).
+# This is an EXAMPLE — a per-cluster values file typically REPLACES the whole list (Helm
+# does not merge lists) with its own project/env/path scopes. The example syncs the api's
+# runtime secrets from `/uzi`; a cluster using a private image registry adds a second
+# dockerconfigjson entry whose secretName it sets as imagePullSecret.name. syncWave "-10"
+# applies the InfisicalSecrets before the workloads so `uzi-secrets` exists on first
+# deploy instead of a transient api CrashLoop (self-heal is the real recovery; this just
+# cuts the churn).
 infisicalList:
   - name: infsec-uzi
-    projectSlug: example-project
-    envSlug: dev
+    projectSlug: your-infisical-project
+    envSlug: prod
     secretsPath: /uzi
     secretName: uzi-secrets
     secretType: Opaque
-    syncWave: "-10"
-  - name: infsec-harbor-robot-uzi
-    projectSlug: example-project
-    envSlug: prod
-    secretsPath: /k8s-registry-robot
-    secretName: registry-robot-secret-uzi
-    secretType: kubernetes.io/dockerconfigjson
     syncWave: "-10"
 
 # Restricted-PodSecurity contexts (satisfy the `restricted` standard everywhere;
@@ -1009,7 +998,7 @@ postgres:
     imagePullSecrets: []
     storage:
       size: 5Gi
-      storageClass: ""        # per-cluster (e.g. storage-class)
+      storageClass: ""        # per-cluster (e.g. standard)
     walStorage:
       enabled: true
       size: 5Gi

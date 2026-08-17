@@ -13,6 +13,12 @@
 # a property of the templates and independent of these string values. Keep the toggles in
 # lockstep with the real per-cluster values so this stays a faithful stand-in.
 
+# The chart default is now secrets.mode: existing (plain k8s Secrets). This stand-in
+# pins infisical so the helm_chart job keeps rendering the InfisicalSecret objects its
+# assertions depend on — matching the real per-cluster values, which also pin infisical.
+secrets:
+  mode: infisical
+
 api:
   config:
     FRONTEND_ORIGIN: https://uzi.example.com
