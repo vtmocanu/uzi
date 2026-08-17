@@ -1,0 +1,373 @@
+# uzi CI gate (ported from the retired GitLab pipeline, PRD #103 / #230).
+#
+# THIS WORKFLOW IS GATE-ONLY: validate + lint + test across the four toolchains
+# (Go api, Go controller, Vite/React web, Node agent) plus repo-wide checks and a
+# Helm lint/template. It builds NO images, uses NO secrets, and runs NO release
+# logic -- image builds and publishing land in later workflows.
+#
+# R1 TRUST BOUNDARY: these jobs must run clean on an untrusted (fork) PR with zero
+# secret exposure. Hence top-level `permissions: contents: read` (a read-only
+# GITHUB_TOKEN), no `secrets:`, no `environment:`, and no `pull_request_target`.
+#
+# Each job runs the SAME leaf `task` targets the GitLab gate jobs ran -- one job
+# per gate, flat parallelism (no `needs:` between them), mirroring GitLab's
+# `needs: []`. The recipes live in Taskfile.yml so local and CI cannot diverge;
+# `lint-repo` invokes the composed `task gate:repo` because its members are
+# repo-wide checks with no component of their own.
+
+name: CI
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+
+# Read-only token. Do not add scopes here: a gate needs none.
+permissions:
+  contents: read
+
+# Cancel a superseded run's still-running jobs when a newer commit lands on the
+# same ref -- mirrors GitLab's workflow.auto_cancel over interruptible gate jobs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------- Go api ----
+  validate-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: api/go.mod
+          cache-dependency-path: api/go.sum
+      - uses: ./.github/actions/setup-task
+      - name: go mod download
+        working-directory: api
+        run: go mod download
+      - name: fmt-check + vet + build
+        run: |
+          task fmt-check:api
+          task vet:api
+          task build:api
+      - name: sqlc drift (regenerate must be a no-op)
+        working-directory: api
+        run: |
+          go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0 generate
+          git diff --exit-code -- internal/store
+
+  lint-api:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth 0 + an explicit fetch of origin/main: the golangci ratchet
+      # (.golangci.yml `new-from-merge-base: origin/main`) needs a reachable common
+      # ancestor. If origin/main does not resolve, the target's pre-flight exits 2
+      # rather than reporting the whole unfiltered backlog as this branch's findings.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: api/go.mod
+          cache-dependency-path: api/go.sum
+      - uses: ./.github/actions/setup-task
+      - name: go mod download
+        working-directory: api
+        run: go mod download
+      - name: Fetch origin/main for the ratchet
+        run: git fetch --quiet origin +refs/heads/main:refs/remotes/origin/main
+      - name: lint + deadcode + vulncheck
+        run: |
+          task lint:api
+          task deadcode:api
+          task vulncheck:api
+
+  test-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: api/go.mod
+          cache-dependency-path: api/go.sum
+      - uses: ./.github/actions/setup-task
+      - name: go mod download
+        working-directory: api
+        run: go mod download
+      - name: test:api (-race -count=1)
+        run: task test:api
+      - name: coverage-xml:api
+        run: task coverage-xml:api
+
+  # The live-DB gate. The *LiveDB tests self-skip unless UZI_TEST_DATABASE_URL is
+  # set, so `go test` above prints a green `ok` while every one of them is skipped.
+  # This job runs them against a real Postgres and asserts they actually ran.
+  test-api-store-it:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # Same digest docker-compose.yml pins, so CI tests the engine the stack
+        # runs. GitHub service containers cannot override the image command, so the
+        # GitLab job's fsync=off/full_page_writes=off/synchronous_commit=off perf
+        # tuning is dropped -- those are crash-recovery knobs, behaviour-identical.
+        image: postgres:17@sha256:5c855ad7b85e68e48a62f34662853f38b57c1c1d80f3a927ab58034fd6d31c5e
+        env:
+          POSTGRES_USER: uzi
+          POSTGRES_DB: uzi
+          # Throwaway per-job database, reachable only from this job -- never a credential.
+          POSTGRES_PASSWORD: uzi-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U uzi -d uzi"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      UZI_TEST_DATABASE_URL: postgres://uzi:uzi-ci@localhost:5432/uzi?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: api/go.mod
+          cache-dependency-path: api/go.sum
+      - name: go mod download
+        working-directory: api
+        run: go mod download
+      - name: LiveDB tests (gate on the gate)
+        working-directory: api
+        run: |
+          set -euo pipefail
+          # -run filters to the *LiveDB tests; -p 1 is load-bearing (the two packages
+          # share one database and race goose without it). The trailing check is the
+          # gate on the gate: a rename, a lost DSN or an unreachable service silently
+          # turns this back into a green no-op.
+          go test -count=1 -v -race -p 1 -run 'LiveDB$' ./internal/store/... ./internal/handler/... 2>&1 | tee livedb.log
+          ran=$(grep -c '^--- PASS' livedb.log || true)
+          skipped=$(grep -c '^--- SKIP' livedb.log || true)
+          echo "LiveDB: $ran passed, $skipped skipped"
+          if [ "$ran" -eq 0 ] || [ "$skipped" -gt 0 ]; then
+            echo "FAIL: the live-DB tests did not actually run against Postgres. They skip when"
+            echo "UZI_TEST_DATABASE_URL is unset or the service is unreachable, and 'go test' still"
+            echo "prints ok -- so this job would be green while testing nothing."
+            exit 1
+          fi
+
+  # --------------------------------------------------------- Go controller ----
+  validate-controller:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: controller/go.mod
+          cache-dependency-path: controller/go.sum
+      - uses: ./.github/actions/setup-task
+      - name: go mod download
+        working-directory: controller
+        run: go mod download
+      - name: fmt-check + vet + build
+        run: |
+          task fmt-check:controller
+          task vet:controller
+          task build:controller
+
+  lint-controller:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: controller/go.mod
+          cache-dependency-path: controller/go.sum
+      - uses: ./.github/actions/setup-task
+      - name: go mod download
+        working-directory: controller
+        run: go mod download
+      - name: Fetch origin/main for the ratchet
+        run: git fetch --quiet origin +refs/heads/main:refs/remotes/origin/main
+      - name: lint + deadcode + vulncheck
+        run: |
+          task lint:controller
+          task deadcode:controller
+          task vulncheck:controller
+
+  test-controller:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: controller/go.mod
+          cache-dependency-path: controller/go.sum
+      - uses: ./.github/actions/setup-task
+      - name: go mod download
+        working-directory: controller
+        run: go mod download
+      - name: test:controller (-race -count=1)
+        run: task test:controller
+      - name: coverage-xml:controller
+        run: task coverage-xml:controller
+
+  # ---------------------------------------------------------- Vite/React web ----
+  validate-web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: ./.github/actions/setup-task
+      - name: npm ci
+        working-directory: web
+        run: npm ci
+      - name: lint + deadcode + vulncheck + check-docs + check-styles + typecheck
+        env:
+          # Turns the deadcode wrapper's loud-SKIP (when knip is absent) into exit 2:
+          # CI always installs knip, so a skip here means the image regressed.
+          UZI_DEADCODE_WEB_REQUIRED: "1"
+        run: |
+          task lint:web
+          task deadcode:web
+          task vulncheck:web
+          task check-docs:web
+          task check-styles:web
+          task typecheck:web
+
+  test-web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: ./.github/actions/setup-task
+      - name: npm ci
+        working-directory: web
+        run: npm ci
+      - name: test:web (vitest --coverage)
+        run: task test:web
+
+  # -------------------------------------------------------------- Node agent ----
+  validate-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: agent/package-lock.json
+      - uses: ./.github/actions/setup-task
+      - name: npm ci
+        working-directory: agent
+        run: npm ci
+      - name: lint + deadcode + vulncheck + typecheck
+        env:
+          UZI_DEADCODE_AGENT_REQUIRED: "1"
+        run: |
+          task lint:agent
+          task deadcode:agent
+          task vulncheck:agent
+          task typecheck:agent
+
+  test-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: agent/package-lock.json
+      - uses: ./.github/actions/setup-task
+      - name: npm ci
+        working-directory: agent
+        run: npm ci
+      # The agent tests shell out to `git init`/clone and bash; ubuntu-latest ships
+      # both (the GitLab alpine job had to `apk add git bash`).
+      - name: test:agent
+        run: task test:agent
+
+  # ------------------------------------------------------------- repo-wide ----
+  # shellcheck (pinned 0.11.0) + yamllint + ruby formula syntax + gitleaks. Invokes
+  # the composed `task gate:repo`; the *_REQUIRED flags turn each check's fail-open
+  # SKIP into exit 2 so a missing tool in CI cannot pass silently.
+  lint-repo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Go is needed for scan:secrets (gitleaks via `go run pkg@version`).
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: api/go.mod
+          cache-dependency-path: api/go.sum
+      - uses: ./.github/actions/setup-task
+      - name: Install shellcheck 0.11.0 (pinned, sha256-verified)
+        run: |
+          set -euo pipefail
+          # 0.11.0 exactly: lint:shell passes this version to lint-shell.sh, which
+          # asserts it and exits 2 on any other. 0.10.0 and 0.11.0 are different
+          # gates (0.10.0 does not emit SC3067 at all). linux.x86_64 tarball.
+          curl -fsSLo /tmp/shellcheck.tar.gz \
+            "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.gz"
+          echo "b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6  /tmp/shellcheck.tar.gz" | sha256sum -c -
+          mkdir -p "${HOME}/.local/bin"
+          tar -xzf /tmp/shellcheck.tar.gz -C /tmp shellcheck-v0.11.0/shellcheck
+          install -m 0755 /tmp/shellcheck-v0.11.0/shellcheck "${HOME}/.local/bin/shellcheck"
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+          "${HOME}/.local/bin/shellcheck" --version
+      - name: Install yamllint
+        # lint-yaml.sh carries no version pin (1.37.1 and 1.38.0 both measured
+        # clean), so a current yamllint is fine. Ruby (for the formula syntax lint)
+        # ships preinstalled on ubuntu-latest at >= 3.1.
+        run: pipx install yamllint
+      - name: gate:repo (shell + yaml + formula + secrets)
+        env:
+          UZI_LINT_SHELL_REQUIRED: "1"
+          UZI_LINT_YAML_REQUIRED: "1"
+          UZI_LINT_FORMULA_REQUIRED: "1"
+        run: task gate:repo
+
+  # ------------------------------------------------------------- Helm chart ----
+  helm-chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.21.3
+      - name: helm dependency build
+        # Bundles the CNPG `cluster` subchart (oci://ghcr.io/cloudnative-pg/charts,
+        # public) per Chart.lock, so the render below is self-contained.
+        run: helm dependency build deploy/chart
+      - name: helm lint
+        run: helm lint deploy/chart
+      - name: Render and assert chart well-formedness
+        run: |
+          helm template uzi deploy/chart -f deploy/values/ci-render.yaml --namespace uzi > /tmp/uzi-rendered.yaml
+          sh scripts/assert-chart-render.sh /tmp/uzi-rendered.yaml
+      - name: Render and assert controller strategy
+        run: |
+          helm template uzi deploy/chart -f deploy/values/ci-render.yaml --namespace uzi \
+            --show-only templates/controller-deployment.yaml > /tmp/uzi-controller.yaml
+          sh scripts/assert-controller-strategy.sh /tmp/uzi-controller.yaml
+      - name: Docker-tier fail-guards
+        run: |
+          # (1) docker on + NetworkPolicy off + no acknowledge -> MUST refuse to render.
+          if helm template uzi deploy/chart --set workers.enabled=true --set api.tls.enabled=true --set workers.docker.enabled=true >/dev/null 2>/tmp/guard.err; then
+            echo "FAIL: the docker tier rendered UNFENCED (NetworkPolicy off, no acknowledgeUnfenced) -- the fail-guard did not fire"; exit 1
+          fi
+          grep -q "workers.docker.networkPolicy.enabled" /tmp/guard.err || { echo "FAIL: render aborted but NOT with the docker fail-guard message:"; cat /tmp/guard.err; exit 1; }
+          echo "OK: docker fail-guard fires when the tier would be unfenced"
+          # (2) docker on + NetworkPolicy on -> renders fine.
+          helm template uzi deploy/chart --set workers.enabled=true --set api.tls.enabled=true --set workers.docker.enabled=true --set workers.docker.networkPolicy.enabled=true >/dev/null
+          # (3) docker on + explicit acknowledgeUnfenced opt-out -> renders fine.
+          helm template uzi deploy/chart --set workers.enabled=true --set api.tls.enabled=true --set workers.docker.enabled=true --set workers.docker.networkPolicy.acknowledgeUnfenced=true >/dev/null
