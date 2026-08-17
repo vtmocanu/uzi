@@ -1055,12 +1055,12 @@ rationale.
   runs `npm run check-docs` too, PRD #52), so a broken doc fails the pipeline as
   well as the local build.
 
-## Deployment: compose (laptop) and k8s (dev-cluster)
+## Deployment: compose (laptop) and k8s
 
 uzi has two deploy topologies for the **same** services and trust boundaries. The
-compose stack above is the laptop MVP; PRD #52 adds a k8s deployment to the
-**dev-cluster** platform dev cluster via **ArgoCD** GitOps, the way MM deploys
-everything else. The release/deploy runbook is [deploy/README.md](deploy/README.md);
+compose stack above is the laptop MVP; PRD #52 adds a k8s deployment to a
+**dev cluster** via **ArgoCD** GitOps, the way the rest of the
+platform is deployed. The release/deploy runbook is [deploy/README.md](deploy/README.md);
 the design rationale (Decision Log, the compose→chart adaptations) is
 `prds/done/52-cicd-argocd-deploy.md` — this section is the map, not a duplicate of it.
 
@@ -1071,13 +1071,12 @@ the design rationale (Decision Log, the compose→chart adaptations) is
   Ingress) + `api` (Deployment/Service/NetworkPolicy) + a **CloudNativePG
   `Cluster`** (the upstream `cluster` chart as the `postgres` subchart) in place
   of the `db` container + `InfisicalSecret`s for runtime secrets and the Harbor
-  pull secret. Per-cluster values (`argo-apps:apps/uzi/values/dev-cluster.yaml`) carry the
+  pull secret. Per-cluster values (in a private GitOps repo, `apps/uzi/values/<cluster>.yaml`) carry the
   public host, `FRONTEND_ORIGIN`, `TRUSTED_PROXIES`, and the CNPG image/storage,
   layered over the cluster-agnostic `deploy/chart/values.yaml`. ArgoCD deploys a
-  **multi-source** app (`argo-apps` `apps/uzi/`): the released chart from
-  Harbor OCI + these values from the uzi git repo. Public URL
-  `https://uzi.example.com` behind ingress-nginx (`*.example.com`
-  wildcard TLS). Images + chart are versioned Model B (chart `version` ==
+  **multi-source** app (the private GitOps repo's `apps/uzi/`): the released chart
+  from an OCI registry + these values from that GitOps repo. Public URL
+  `https://uzi.example.com` behind ingress-nginx (a wildcard-TLS domain). Images + chart are versioned Model B (chart `version` ==
   `appVersion` == the release git tag; see the runbook). **Optionally** (PRD
   #58, off by default — `workers.enabled: false`) a `uzi-controller`
   Deployment and a dedicated `uzi-workers` namespace it renders hosted worker
@@ -1102,17 +1101,17 @@ Two adaptations are load-bearing and worth stating here (full detail in the PRD'
   nginx **appends** (`$proxy_add_x_forwarded_for`) with ingress-nginx as the
   outermost overwriting hop — overwriting there would collapse every user into
   one per-IP auth rate-limit bucket and lose client IPs in audit logs.
-  `TRUSTED_PROXIES` is the pod CIDR (`100.64.0.0/10` on dev-cluster) so the api
+  `TRUSTED_PROXIES` is the pod CIDR (e.g. `10.244.0.0/16`) so the api
   reads the real client IP from the appended chain. The compose behavior stays
   overwrite; the chart toggles this per-deployment.
-- **api NetworkPolicy (default-deny ingress, web pods only).** dev-cluster is a
-  **shared** cluster — `coder.example.com` runs arbitrary dev code on it —
+- **api NetworkPolicy (default-deny ingress, web pods only).** The cluster is a
+  **shared** one — other tenants run arbitrary dev code on it —
   so a per-IP rate limit that trusts XFF from the pod CIDR is only safe if a rogue
   pod cannot reach the api directly to forge `X-Forwarded-For`. The chart's api
   NetworkPolicy allows ingress **only from the web pods** on `:8080` (an L3
   connectivity control, distinct from the XFF-trust value above), closing the
-  direct-to-api spoofing path. example-app has no such policy (it runs on the
-  non-shared mgmt cluster); uzi needs it. Its one operational wrinkle —
+  direct-to-api spoofing path. A sibling app on a non-shared mgmt cluster has no
+  such policy; uzi needs it. Its one operational wrinkle —
   default-deny also drops kubelet probes, so `api.networkPolicy.probeCIDRs` must
   be set to the node CIDR on Antrea — is documented in the runbook and values.
 
@@ -1154,7 +1153,7 @@ on.
   dedicated `uzi-workers-docker` namespace running
   `pod-security.kubernetes.io/enforce: privileged` (PRD #83 M3). The
   privileged tier is a recorded deviation from the PRD's original
-  `baseline`-namespace intent: dev-cluster's k8s 1.29.4 + containerd 1.6.31
+  `baseline`-namespace intent: the cluster's k8s and containerd versions
   are below what pod user namespaces need, so a flagless-rootless DinD
   sidecar is infeasible there, and the userns remap inside the
   `docker:dind-rootless` image is the security property instead. Isolating
