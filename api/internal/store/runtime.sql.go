@@ -2165,7 +2165,11 @@ func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessagePara
 
 const listActiveRunsAll = `-- name: ListActiveRunsAll :many
 SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, r.revise_count, r.plan_source, r.planned_base_commit, r.require_base_match, r.milestones_candidate, r.milestones_frozen, r.milestones_completed, r.milestones_in_progress, r.budget_max_iterations, r.budget_wall_seconds, r.schedule_id, r.limit_dead_secret_id, r.report_only, r.report_md, r.ci_config_paths, r.model, r.override_subagent_model, r.fail_origin, r.priority, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
-       c.forge_type
+       c.forge_type,
+       -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function (same as
+       -- ListRunsForUser), so the admin overview pill and the claim order agree.
+       -- @background_grace_cutoff (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag.
+       fn_run_priority_class(r.kind, r.priority, r.created_at < $1) AS priority_class
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2)
@@ -2180,17 +2184,18 @@ LIMIT 500
 `
 
 type ListActiveRunsAllRow struct {
-	Run        Run         `json:"run"`
-	RepoPath   string      `json:"repo_path"`
-	WorkerName pgtype.Text `json:"worker_name"`
-	OwnerEmail string      `json:"owner_email"`
-	ForgeType  string      `json:"forge_type"`
+	Run           Run         `json:"run"`
+	RepoPath      string      `json:"repo_path"`
+	WorkerName    pgtype.Text `json:"worker_name"`
+	OwnerEmail    string      `json:"owner_email"`
+	ForgeType     string      `json:"forge_type"`
+	PriorityClass string      `json:"priority_class"`
 }
 
 // Admin Agents-status: every non-terminal run across all users, with repo path,
 // worker name, and owner email for the admin overview.
-func (q *Queries) ListActiveRunsAll(ctx context.Context) ([]ListActiveRunsAllRow, error) {
-	rows, err := q.db.Query(ctx, listActiveRunsAll)
+func (q *Queries) ListActiveRunsAll(ctx context.Context, backgroundGraceCutoff pgtype.Timestamptz) ([]ListActiveRunsAllRow, error) {
+	rows, err := q.db.Query(ctx, listActiveRunsAll, backgroundGraceCutoff)
 	if err != nil {
 		return nil, err
 	}
@@ -2279,6 +2284,7 @@ func (q *Queries) ListActiveRunsAll(ctx context.Context) ([]ListActiveRunsAllRow
 			&i.WorkerName,
 			&i.OwnerEmail,
 			&i.ForgeType,
+			&i.PriorityClass,
 		); err != nil {
 			return nil, err
 		}
@@ -2780,6 +2786,11 @@ func (q *Queries) ListRunToolWindow(ctx context.Context, arg ListRunToolWindowPa
 const listRunsForUser = `-- name: ListRunsForUser :many
 SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, r.revise_count, r.plan_source, r.planned_base_commit, r.require_base_match, r.milestones_candidate, r.milestones_frozen, r.milestones_completed, r.milestones_in_progress, r.budget_max_iterations, r.budget_wall_seconds, r.schedule_id, r.limit_dead_secret_id, r.report_only, r.report_md, r.ci_config_paths, r.model, r.override_subagent_model, r.fail_origin, r.priority, rp.path_with_namespace AS repo_path, w.name AS worker_name,
        c.forge_type,
+       -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function, so the
+       -- Runs-list pill and ClaimRun's ORDER BY are the same decision. @background_grace_cutoff
+       -- (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag: a demoted run created
+       -- before it reads as stale → class ` + "`" + `restored` + "`" + ` (past grace) rather than ` + "`" + `background` + "`" + `.
+       fn_run_priority_class(r.kind, r.priority, r.created_at < $1) AS priority_class,
        rv.verdict                AS judge_verdict,
        ru.input_tokens          AS usage_input_tokens,
        ru.cache_read_tokens      AS usage_cache_read_tokens,
@@ -2794,22 +2805,23 @@ LEFT JOIN run_reviews rv
        ON rv.target_run_id = r.id      -- UNIQUE target_run_id → at most one row (PRD #98 M4)
       AND rv.user_id = r.user_id       -- self-standing owner scope; see the note above
 LEFT JOIN run_usage_totals ru ON ru.run_id = r.id
-WHERE r.user_id = $1
+WHERE r.user_id = $2
   -- Exclude chat AND judge (PRD #46): both are repo-less meta-runs the general Runs
   -- list never shows. self_improve has a real repo and stays visible. The repos
   -- INNER JOIN already drops the repo-less kinds; this predicate is the explicit,
   -- refactor-proof guard (a future LEFT JOIN must not leak judge runs here).
   AND r.kind NOT IN ('chat', 'judge')
-  AND ($2::uuid IS NULL OR r.repo_id = $2)
-  AND ($3::bigint IS NULL OR r.issue_iid = $3)
+  AND ($3::uuid IS NULL OR r.repo_id = $3)
+  AND ($4::bigint IS NULL OR r.issue_iid = $4)
 ORDER BY r.created_at DESC
 LIMIT 200
 `
 
 type ListRunsForUserParams struct {
-	UserID   uuid.UUID   `json:"user_id"`
-	RepoID   pgtype.UUID `json:"repo_id"`
-	IssueIid pgtype.Int8 `json:"issue_iid"`
+	BackgroundGraceCutoff pgtype.Timestamptz `json:"background_grace_cutoff"`
+	UserID                uuid.UUID          `json:"user_id"`
+	RepoID                pgtype.UUID        `json:"repo_id"`
+	IssueIid              pgtype.Int8        `json:"issue_iid"`
 }
 
 type ListRunsForUserRow struct {
@@ -2817,6 +2829,7 @@ type ListRunsForUserRow struct {
 	RepoPath                 string         `json:"repo_path"`
 	WorkerName               pgtype.Text    `json:"worker_name"`
 	ForgeType                string         `json:"forge_type"`
+	PriorityClass            string         `json:"priority_class"`
 	JudgeVerdict             pgtype.Text    `json:"judge_verdict"`
 	UsageInputTokens         pgtype.Int8    `json:"usage_input_tokens"`
 	UsageCacheReadTokens     pgtype.Int8    `json:"usage_cache_read_tokens"`
@@ -2860,7 +2873,12 @@ type ListRunsForUserRow struct {
 // (PRD #98 M4). A SQL literal is not importable, so the two are coupled by comment only —
 // raise this without raising that and the badge counts start truncating silently.
 func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams) ([]ListRunsForUserRow, error) {
-	rows, err := q.db.Query(ctx, listRunsForUser, arg.UserID, arg.RepoID, arg.IssueIid)
+	rows, err := q.db.Query(ctx, listRunsForUser,
+		arg.BackgroundGraceCutoff,
+		arg.UserID,
+		arg.RepoID,
+		arg.IssueIid,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -2948,6 +2966,7 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 			&i.RepoPath,
 			&i.WorkerName,
 			&i.ForgeType,
+			&i.PriorityClass,
 			&i.JudgeVerdict,
 			&i.UsageInputTokens,
 			&i.UsageCacheReadTokens,
@@ -3810,6 +3829,26 @@ func (q *Queries) RunHasVerdictSinceGateOpened(ctx context.Context, arg RunHasVe
 	return has_verdict, err
 }
 
+const runPriorityClass = `-- name: RunPriorityClass :one
+SELECT fn_run_priority_class($1::text, $2::smallint, $3::boolean)
+`
+
+type RunPriorityClassParams struct {
+	RunKind  string      `json:"run_kind"`
+	Priority pgtype.Int2 `json:"priority"`
+	IsStale  bool        `json:"is_stale"`
+}
+
+// Pure scalar eval of fn_run_priority_class (PRD #320 D8) for a single run whose
+// row is already in hand: the display class from the SAME SQL function ClaimRun's
+// ORDER BY ranks by, so pill and claim order can never disagree. No table access.
+func (q *Queries) RunPriorityClass(ctx context.Context, arg RunPriorityClassParams) (string, error) {
+	row := q.db.QueryRow(ctx, runPriorityClass, arg.RunKind, arg.Priority, arg.IsStale)
+	var fn_run_priority_class string
+	err := row.Scan(&fn_run_priority_class)
+	return fn_run_priority_class, err
+}
+
 const selfUsage = `-- name: SelfUsage :one
 WITH scoped AS (
     SELECT r.created_at,
@@ -4464,6 +4503,33 @@ type SetRunMRStateParams struct {
 // updated_at) only.
 func (q *Queries) SetRunMRState(ctx context.Context, arg SetRunMRStateParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setRunMRState, arg.MrState, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setRunPriority = `-- name: SetRunPriority :execrows
+UPDATE runs SET priority = $1::smallint
+WHERE id = $2 AND user_id = $3 AND status = 'queued'
+`
+
+type SetRunPriorityParams struct {
+	Priority pgtype.Int2 `json:"priority"`
+	ID       uuid.UUID   `json:"id"`
+	UserID   uuid.UUID   `json:"user_id"`
+}
+
+// Expedite/undo one queued run's manual priority override (PRD #320 D6/D7). Owner-
+// scoped: a foreign run returns 0 rows -> handler 404 (never 403). QUEUED-ONLY:
+// ordering only matters before a run is claimed, so a non-queued run returns 0 rows
+// -> handler 409. Sets ONLY priority (expedite=2, undo=NULL); it deliberately does
+// NOT touch status, and it does NOT bump updated_at, because the #216 fleet-spread
+// and the resume-affinity grace are both keyed on updated_at — bumping it would
+// reset those age clocks and could re-defer the very run being expedited. The D4
+// fail-open is keyed on created_at, so priority is orthogonal to the age clocks.
+func (q *Queries) SetRunPriority(ctx context.Context, arg SetRunPriorityParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setRunPriority, arg.Priority, arg.ID, arg.UserID)
 	if err != nil {
 		return 0, err
 	}

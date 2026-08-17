@@ -110,5 +110,5 @@ func (h *Handler) CreateCIFixRun(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run)})
+	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run))})
 }

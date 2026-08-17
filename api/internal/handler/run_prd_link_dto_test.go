@@ -23,7 +23,7 @@ func TestRunToDTOPrdLink(t *testing.T) {
 			ID:                uuid.New(),
 			PrdDonePath:       pgtype.Text{String: "prds/done/72-x.md", Valid: true},
 			PrdPatchSettledAt: pgtype.Timestamptz{Time: settled, Valid: true},
-		})
+		}, "normal")
 		if dto.PrdDonePath == nil || *dto.PrdDonePath != "prds/done/72-x.md" {
 			t.Fatalf("prd_done_path = %v, want prds/done/72-x.md", dto.PrdDonePath)
 		}
@@ -33,7 +33,7 @@ func TestRunToDTOPrdLink(t *testing.T) {
 	})
 
 	t.Run("neither set: both nil", func(t *testing.T) {
-		dto := runToDTO(store.Run{ID: uuid.New()})
+		dto := runToDTO(store.Run{ID: uuid.New()}, "normal")
 		if dto.PrdDonePath != nil {
 			t.Fatalf("prd_done_path = %v, want nil — a run that moved no PRD must not fabricate a path", *dto.PrdDonePath)
 		}

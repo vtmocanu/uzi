@@ -105,7 +105,7 @@ func (s *runsStore) ListRunsForUser(_ context.Context, arg store.ListRunsForUser
 func (s *runsStore) ListAllWorkers(context.Context) ([]store.ListAllWorkersRow, error) {
 	return s.allWorkers, nil
 }
-func (s *runsStore) ListActiveRunsAll(context.Context) ([]store.ListActiveRunsAllRow, error) {
+func (s *runsStore) ListActiveRunsAll(context.Context, pgtype.Timestamptz) ([]store.ListActiveRunsAllRow, error) {
 	return s.activeRuns, nil
 }
 func (s *runsStore) CreateRunInput(context.Context, store.CreateRunInputParams) (store.RunUserInput, error) {
@@ -195,7 +195,7 @@ func TestRunToDTOStopKind(t *testing.T) {
 	stamped := runToDTO(store.Run{
 		Status:   "failed",
 		StopKind: pgtype.Text{String: "plan_rejected", Valid: true},
-	})
+	}, "normal")
 	if stamped.StopKind == nil {
 		t.Fatal("a stamped stop_kind must reach the RunDTO, got nil")
 	}
@@ -204,7 +204,7 @@ func TestRunToDTOStopKind(t *testing.T) {
 	}
 
 	// NULL column ⇒ nil pointer (omitted from JSON), never "".
-	unstamped := runToDTO(store.Run{Status: "completed"})
+	unstamped := runToDTO(store.Run{Status: "completed"}, "normal")
 	if unstamped.StopKind != nil {
 		t.Errorf("an unstamped stop_kind must map to nil, got %q", *unstamped.StopKind)
 	}

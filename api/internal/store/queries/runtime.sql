@@ -347,6 +347,12 @@ RETURNING *;
 -- name: GetRunByIDForUser :one
 SELECT * FROM runs WHERE id = @id AND user_id = @user_id;
 
+-- name: RunPriorityClass :one
+-- Pure scalar eval of fn_run_priority_class (PRD #320 D8) for a single run whose
+-- row is already in hand: the display class from the SAME SQL function ClaimRun's
+-- ORDER BY ranks by, so pill and claim order can never disagree. No table access.
+SELECT fn_run_priority_class(@run_kind::text, sqlc.narg('priority')::smallint, @is_stale::boolean);
+
 -- name: GetRunByID :one
 -- Admin viewer path: fetch any run regardless of owner. The per-run authz check
 -- lives in the service, which only reaches this after confirming the viewer is an
@@ -397,6 +403,11 @@ WHERE r.id = @repo_id;
 -- and buckets them in Go (ListJudgeTriageRowsForRuns).
 SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name,
        c.forge_type,
+       -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function, so the
+       -- Runs-list pill and ClaimRun's ORDER BY are the same decision. @background_grace_cutoff
+       -- (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag: a demoted run created
+       -- before it reads as stale → class `restored` (past grace) rather than `background`.
+       fn_run_priority_class(r.kind, r.priority, r.created_at < @background_grace_cutoff) AS priority_class,
        rv.verdict                AS judge_verdict,
        ru.input_tokens          AS usage_input_tokens,
        ru.cache_read_tokens      AS usage_cache_read_tokens,
@@ -429,7 +440,11 @@ LIMIT 200;
 -- Admin Agents-status: every non-terminal run across all users, with repo path,
 -- worker name, and owner email for the admin overview.
 SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
-       c.forge_type
+       c.forge_type,
+       -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function (same as
+       -- ListRunsForUser), so the admin overview pill and the claim order agree.
+       -- @background_grace_cutoff (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag.
+       fn_run_priority_class(r.kind, r.priority, r.created_at < @background_grace_cutoff) AS priority_class
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2)
@@ -2253,3 +2268,15 @@ SELECT (EXISTS (
 UPDATE runs SET wait_on_limit = @wait_on_limit, updated_at = now()
 WHERE id = @id AND user_id = @user_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
+
+-- name: SetRunPriority :execrows
+-- Expedite/undo one queued run's manual priority override (PRD #320 D6/D7). Owner-
+-- scoped: a foreign run returns 0 rows -> handler 404 (never 403). QUEUED-ONLY:
+-- ordering only matters before a run is claimed, so a non-queued run returns 0 rows
+-- -> handler 409. Sets ONLY priority (expedite=2, undo=NULL); it deliberately does
+-- NOT touch status, and it does NOT bump updated_at, because the #216 fleet-spread
+-- and the resume-affinity grace are both keyed on updated_at — bumping it would
+-- reset those age clocks and could re-defer the very run being expedited. The D4
+-- fail-open is keyed on created_at, so priority is orthogonal to the age clocks.
+UPDATE runs SET priority = sqlc.narg('priority')::smallint
+WHERE id = @id AND user_id = @user_id AND status = 'queued';

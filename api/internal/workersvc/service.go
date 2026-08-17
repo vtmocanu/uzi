@@ -277,7 +277,7 @@ type Store interface {
 	GetRunByIDForUser(ctx context.Context, arg store.GetRunByIDForUserParams) (store.Run, error)
 	GetRunByID(ctx context.Context, id uuid.UUID) (store.Run, error)
 	ListRunsForUser(ctx context.Context, arg store.ListRunsForUserParams) ([]store.ListRunsForUserRow, error)
-	ListActiveRunsAll(ctx context.Context) ([]store.ListActiveRunsAllRow, error)
+	ListActiveRunsAll(ctx context.Context, backgroundGraceCutoff pgtype.Timestamptz) ([]store.ListActiveRunsAllRow, error)
 	ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow, error)
 	GetRunOwnedByWorker(ctx context.Context, arg store.GetRunOwnedByWorkerParams) (store.Run, error)
 	// GetRunForgeConnForWorker returns the forge connection facts for a run the
@@ -1968,7 +1968,7 @@ const maxInflightLineLen = 300
 // picker might overlap, which the human MR review still catches. Reusing the existing
 // query is the deliberate trade for no new query and no migration (D5).
 func (s *Service) inflightTargets(ctx context.Context, run store.Run) []string {
-	rows, err := s.q.ListActiveRunsAll(ctx)
+	rows, err := s.q.ListActiveRunsAll(ctx, s.activeRunsPriorityCutoff())
 	if err != nil {
 		slog.Warn("self_improve claim: list active runs for in-flight set", "run", run.ID.String(), "error", err)
 		return nil
@@ -4243,7 +4243,13 @@ func (s *Service) ListRunMessagesForViewerPage(ctx context.Context, userID uuid.
 // (nil = no filter): repo scope backs the board attention strip, repo+issue backs
 // the in-app issue history.
 func (s *Service) ListRunsForUser(ctx context.Context, userID uuid.UUID, repoID *uuid.UUID, issueIID *int64) ([]store.ListRunsForUserRow, error) {
-	arg := store.ListRunsForUserParams{UserID: userID}
+	arg := store.ListRunsForUserParams{
+		UserID: userID,
+		// PRD #320 D8: the D4 fail-open cutoff for the row's priority_class column, built
+		// the same way as ClaimRun's BackgroundGraceCutoff so the pill and the claim order
+		// are one decision. A demoted run created before it reads `restored`, not stuck.
+		BackgroundGraceCutoff: pgTime(s.now().Add(-s.p.WorkerBackgroundGrace)),
+	}
 	if repoID != nil {
 		arg.RepoID = pgUUID(*repoID)
 	}
@@ -4260,7 +4266,14 @@ func (s *Service) ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow
 
 // ListActiveRunsAll returns every non-terminal run across all users (admin).
 func (s *Service) ListActiveRunsAll(ctx context.Context) ([]store.ListActiveRunsAllRow, error) {
-	return s.q.ListActiveRunsAll(ctx)
+	return s.q.ListActiveRunsAll(ctx, s.activeRunsPriorityCutoff())
+}
+
+// activeRunsPriorityCutoff builds the ListActiveRunsAll @background_grace_cutoff param
+// (PRD #320 D8 fail-open flag for the row's priority_class), shared by both callers of
+// the query (the admin DTO path and the self_improve in-flight avoid-set).
+func (s *Service) activeRunsPriorityCutoff() pgtype.Timestamptz {
+	return pgTime(s.now().Add(-s.p.WorkerBackgroundGrace))
 }
 
 // RunUsageTotal returns one run's rolled-up token/cost totals (PRD #40 M3). Returns

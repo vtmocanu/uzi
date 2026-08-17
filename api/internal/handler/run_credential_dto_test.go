@@ -26,7 +26,7 @@ func TestRunToDTOAnthropicCredential(t *testing.T) {
 			ID:                   uuid.New(),
 			AnthropicSecretID:    pgtype.UUID{Bytes: secretID, Valid: true},
 			AnthropicSecretLabel: pgtype.Text{String: "console-key", Valid: true},
-		})
+		}, "normal")
 		if dto.AnthropicSecretID == nil || *dto.AnthropicSecretID != secretID.String() {
 			t.Fatalf("id = %v, want %v", dto.AnthropicSecretID, secretID)
 		}
@@ -40,7 +40,7 @@ func TestRunToDTOAnthropicCredential(t *testing.T) {
 			ID:                   uuid.New(),
 			AnthropicSecretID:    pgtype.UUID{}, // the FK nulled it
 			AnthropicSecretLabel: pgtype.Text{String: "retired-key", Valid: true},
-		})
+		}, "normal")
 		if dto.AnthropicSecretID != nil {
 			t.Fatalf("id = %v, want nil", *dto.AnthropicSecretID)
 		}
@@ -50,7 +50,7 @@ func TestRunToDTOAnthropicCredential(t *testing.T) {
 	})
 
 	t.Run("pre-feature or unclaimed run: both null", func(t *testing.T) {
-		dto := runToDTO(store.Run{ID: uuid.New()})
+		dto := runToDTO(store.Run{ID: uuid.New()}, "normal")
 		if dto.AnthropicSecretID != nil || dto.AnthropicSecretLabel != nil {
 			t.Fatalf("id=%v label=%v, want both nil — a run with nothing recorded must not fabricate an account",
 				dto.AnthropicSecretID, dto.AnthropicSecretLabel)

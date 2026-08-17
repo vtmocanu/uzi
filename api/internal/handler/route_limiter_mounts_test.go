@@ -265,6 +265,9 @@ var wantRouteMounts = []routeMount{
 	// unlimited.
 	{"PATCH", "/api/me/secrets/anthropic_token/{id}/auto-eligible", noLimiter},
 	{"PATCH", "/api/repos/{id}", noLimiter},
+	// Expedite/undo a queued run's priority (PRD #320 M3): one owner-scoped, queued-only
+	// UPDATE of runs.priority, no token spend, no forge write, no status touch → noLimiter.
+	{"PATCH", "/api/runs/{id}/priority", noLimiter},
 	// Schedule edit (PRD #241 M4): owner-scoped DB update, no forge → noLimiter.
 	{"PATCH", "/api/schedules/{id}", noLimiter},
 	{"PATCH", "/api/workers/{id}", noLimiter},

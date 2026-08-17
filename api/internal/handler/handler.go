@@ -1141,6 +1141,12 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// (which keeps IsAdmin) is refused on another user's review, like CreateRunInput.
 				r.Put("/{id}/review/recommendations/{recID}/disposition", h.SetDisposition)
 				r.Delete("/{id}/review/recommendations/{recID}/disposition", h.DeleteDisposition)
+				// Expedite / undo one queued run's manual priority override (PRD #320 D6/D7).
+				// RequireUser so the M5 `uzi run expedite` CLI verb (a CLI token) can reach it —
+				// NOT the cookie+CSRF RequireAuth group where wait-on-limit sits. Owner-scoped
+				// (foreign run → 404) and QUEUED-ONLY (non-queued → 409); no token spend, no
+				// forge write, no status touch.
+				r.Patch("/{id}/priority", h.SetRunPriority)
 			})
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))
