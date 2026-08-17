@@ -15,7 +15,8 @@ same worker that executes your runs.
 The Chat page is not the only way in: if you have [Slack](./slack.md) linked, a
 direct message to the uzi bot opens the **same** conversation, streamed back
 into a thread. Everything below applies to both — same worker, same token, same
-human-confirmed cards for filing an issue or starting a run.
+human-confirmed cards for filing an issue, starting a run, cancelling a run, or
+steering one.
 
 Specifically, chat always spends your **default** token, even on a worker you
 have bound to a different one: the binding covers that worker's *runs*, not
@@ -35,6 +36,15 @@ a meter against what you expected to spend.
   **Create** / **Dismiss** buttons. Nothing is written to GitLab until *you*
   click Create — the agent can draft, only your click files. Dismiss writes
   nothing at all.
+- **Start, cancel, or steer a run.** Ask it to start a run on an existing
+  issue, stop a run that's going the wrong way, or send a follow-up
+  instruction to one that's live, and it shows you a card instead of acting:
+  a **Start** card, a danger **Cancel run** card (with a confirm), or a
+  **steer** card with an editable text box prefilled with its proposed
+  instruction. Nothing happens on the run until *you* click — Start / Cancel
+  run / Send — and any model text on the card renders inert, never Markdown.
+  Steering only applies to issue runs; ask it to steer a chat and it tells
+  you so, since a chat's own follow-ups go through the conversation itself.
 
 ## What it can never do
 
