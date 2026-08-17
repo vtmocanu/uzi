@@ -308,6 +308,7 @@ type Config struct {
 	WorkerPollInterval      time.Duration // worker claim-poll cadence
 	WorkerAffinityGrace     time.Duration // a re-queued run waits this long for its prior worker
 	WorkerSpreadGrace       time.Duration // PRD #216: a queued run older than this is exempt from the fleet-aware spread
+	WorkerBackgroundGrace   time.Duration // PRD #320: a demoted (judge/self_improve) run older than this fails open to normal priority so background work never starves
 
 	// Anthropic usage-limit park (PRD #35). Both are server-side bounds on a
 	// WORKER-REPORTED event, which is why they are here and not in the claim payload:
@@ -690,6 +691,12 @@ func Load() (Config, error) {
 	// PRD #216: a queued run older than this grace is exempt from the fleet-aware
 	// spread (fail-open, D4). Tracks the poll interval so the two stay related.
 	cfg.WorkerSpreadGrace = parseDuration("WORKER_SPREAD_GRACE", 3*cfg.WorkerPollInterval)
+	// PRD #320 D4: a demoted (judge/self_improve) run older than this collapses to
+	// normal priority so background work can never starve. The default is
+	// deliberately minutes-scale — it measures run-age starvation, NOT the
+	// sub-minute poll-cadence timescale of the sibling graces (WorkerSpreadGrace,
+	// WorkerAffinityGrace) — so it does NOT track WorkerPollInterval.
+	cfg.WorkerBackgroundGrace = parseDuration("RUN_BACKGROUND_GRACE", 15*time.Minute)
 
 	// PRD #35. parseNonNegInt, so RUN_LIMIT_MAX_WAITS=0 is legal and means "never
 	// park" — the deliberate off switch for an operator who wants today's

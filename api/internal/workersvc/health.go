@@ -92,6 +92,18 @@ const (
 	// or "revision" so one string covers all four verdict kinds without leaking which
 	// decision the owner made.
 	reasonVerdictUndelivered = "the worker hasn't picked up your response yet"
+	// reasonDeprioritized / reasonRestored are PRD #320 D9's queued reasons for a run
+	// the kind-derived priority DEMOTED (kind ∈ {judge, self_improve}, no manual
+	// override, not yet past the background grace): to its owner it must read as
+	// deliberately YIELDING to interactive work, not as stuck. Once the run ages past
+	// the grace (D4 fail-open), fn_run_priority_class flips it to `restored` and the
+	// reason says it is no longer yielding. Same contract as the siblings — fixed,
+	// server-controlled, no tool name, no repo content, no live duration — and both map
+	// to the SAME healthWaitingWorker enum so the "stuck for Xm" health_since logic and
+	// everything downstream (slacksvc, web badge, CLI) keep their shape; only the
+	// owner-visible reason string differs.
+	reasonDeprioritized = "deprioritized — yields to interactive work"
+	reasonRestored      = "priority restored — no longer yielding"
 )
 
 // Persistence-failure FLAG thresholds (PRD #108 M4), code constants for the same
@@ -215,6 +227,22 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 		// transition into queued (updated_at).
 		if th.queued == 0 || !olderThan(now, r.UpdatedAt, th.queued) {
 			return healthOK, ""
+		}
+		// A queued run the kind-derived priority DEMOTED (PRD #320 D9) is not stuck —
+		// it is yielding to interactive work — so its owner gets a reason that says so
+		// rather than the generic wait. The class comes from the SAME SQL function
+		// ClaimRun's ORDER BY ranks by (fn_run_priority_class), so the reason and the
+		// claim order can never disagree. This per-run lookup is affordable for exactly
+		// verdictUndelivered's reason: it sits BEHIND the queued-threshold guard above,
+		// so it runs for approximately zero runs per tick. The FLAG stays
+		// healthWaitingWorker in every branch (only the reason differs), so
+		// healthSince's "stuck for Xm" preservation keeps working; on `normal`/
+		// `expedited` and on a read error we fall through to the generic queuedReason.
+		switch s.queuedPriorityClass(ctx, now, r) {
+		case "background":
+			return healthWaitingWorker, reasonDeprioritized
+		case "restored":
+			return healthWaitingWorker, reasonRestored
 		}
 		return healthWaitingWorker, s.queuedReason(ctx, r.UserID)
 	case "awaiting_approval":
@@ -494,6 +522,30 @@ func (s *Service) verdictUndelivered(ctx context.Context, r store.ListActiveRuns
 		return false
 	}
 	return ok
+}
+
+// queuedPriorityClass resolves the display priority class of a queued run past its
+// threshold (PRD #320 D9) from the ONE SQL function ClaimRun's ORDER BY ranks by, so a
+// deprioritized/restored reason can never contradict the claim order. The cutoff is
+// built the SAME way service.go builds ClaimRun's — now minus WorkerBackgroundGrace —
+// so the D4 fail-open (a demoted run older than the grace collapses to `restored`)
+// agrees on both sides.
+//
+// A read error degrades to "" — an unclassed run — so the caller falls through to the
+// generic queuedReason rather than failing the sweep. Same conservative shape as
+// verdictUndelivered's degrade-to-false and toolWindow's degrade-to-zero-value: a
+// missed pill is noise, never a lost health signal. Affordable behind the
+// queued-threshold guard for the same reason verdictUndelivered is behind its own.
+func (s *Service) queuedPriorityClass(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow) string {
+	class, err := s.q.RunPriorityClassForRun(ctx, store.RunPriorityClassForRunParams{
+		RunID:                 r.ID,
+		BackgroundGraceCutoff: pgTime(now.Add(-s.p.WorkerBackgroundGrace)),
+	})
+	if err != nil {
+		slog.Error("health: read run priority class", "run_id", r.ID, "error", err)
+		return ""
+	}
+	return class
 }
 
 // healthThresholds reads all thresholds once per tick (the settings cache is a 5s

@@ -16,6 +16,7 @@ import {
   mrChipSuffix,
   mrChipTitle,
   needsHumanAttention,
+  priorityBadge,
   retryHint,
   runBadge,
   runStatusTone,
@@ -515,6 +516,37 @@ describe("milestoneBadgeText (not-reported vs 0/N, PRD #265 M2)", () => {
     expect(t.label).toBe("M–/4");
     expect(t.label).not.toContain("0");
     expect(t.title).toBe("No milestone completion reported for this run");
+  });
+});
+
+describe("priorityBadge (queue priority → pill, PRD #320 D8)", () => {
+  it("background → a neutral 'Deprioritized' pill explaining it yields", () => {
+    const b = priorityBadge("background");
+    expect(b).toMatchObject({ label: "Deprioritized", tone: "neutral" });
+    expect(b?.title).toMatch(/yield/i);
+  });
+
+  it("expedited → an info 'Expedited' pill (bumped to the front)", () => {
+    const b = priorityBadge("expedited");
+    expect(b).toMatchObject({ label: "Expedited", tone: "info" });
+    expect(b?.title).toMatch(/front of the queue/i);
+  });
+
+  it("restored → a warning-toned 'Restored' pill (past the grace)", () => {
+    const b = priorityBadge("restored");
+    expect(b).toMatchObject({ label: "Restored", tone: "warning" });
+    expect(b?.title).toMatch(/no longer yielding/i);
+  });
+
+  // A normal run stays quiet — and, crucially, so does an ABSENT value: a pre-#320 api
+  // omits the field, and api.ts pins "absent ⇒ normal", so both must map to no pill or a
+  // rollout-skew row would sprout a spurious badge.
+  it("normal → null (a normal row shows no pill)", () => {
+    expect(priorityBadge("normal")).toBeNull();
+  });
+
+  it("undefined (absent ⇒ normal) → null", () => {
+    expect(priorityBadge(undefined)).toBeNull();
   });
 });
 

@@ -48,6 +48,7 @@ import {
   type PrivilegeReport,
   type RecommendationCategory,
   type Run,
+  type RunPriority,
   type Schedule,
   type ScheduleInput,
   type SchedulePreviewInput,
@@ -2928,6 +2929,22 @@ export const mockApi = {
     if (!run) throw new ApiError(404, "run not found");
     if (isTerminalRun(run.status)) throw new ApiError(409, "this run has already finished");
     patchRun(id, { wait_on_limit: enabled });
+    return delay({ run: { ...getRun(id)! } }, 80);
+  },
+
+  // PRD #320 M6: bump this run to the front of the queue, or clear that override.
+  // Mirrors the server: owner-scoped (the demo caller owns every non-other-user run)
+  // and QUEUED-ONLY (409 on a non-queued run, exactly like the real endpoint). Clearing
+  // the override returns the run to its NATURAL class — "background" for the kinds that
+  // demote (judge/self_improve), "normal" otherwise — since the mock has no live rank
+  // machinery; the "restored" grace state is a seed, not something undo produces here.
+  expediteRun: async (id: string, expedite: boolean) => {
+    const run = getRun(id);
+    if (!run) throw new ApiError(404, "run not found");
+    if (run.status !== "queued") throw new ApiError(409, "run is not queued");
+    const natural: RunPriority =
+      run.kind === "self_improve" || run.kind === "judge" ? "background" : "normal";
+    patchRun(id, { priority: expedite ? "expedited" : natural });
     return delay({ run: { ...getRun(id)! } }, 80);
   },
 

@@ -47,6 +47,18 @@ type healthFakeStore struct {
 	// asks about THIS gate (GateOpenedAt == the run's updated_at) and that the three
 	// guards ahead of it short-circuit before any query is issued at all.
 	verdictCalls []store.RunHasVerdictSinceGateOpenedParams
+	// priorityClass is the canned RunPriorityClassForRun answer per run id (PRD #320
+	// D9: normal|background|expedited|restored), and priorityErr forces the read to
+	// fail. The demotion predicate is NOT reimplemented here on purpose — the same
+	// reasoning as verdictSince above: a fake that re-derives the class would only test
+	// the fake. fn_run_priority_class itself is pinned against a real Postgres by the
+	// store package's M1 tests; this side pins the ARM (class → reason mapping).
+	priorityClass map[uuid.UUID]string
+	priorityErr   error
+	// priorityCalls records every lookup's params, so a test can prove the arm builds
+	// the cutoff from WorkerBackgroundGrace and that the queued-threshold guard
+	// short-circuits ahead of it (no query for a freshly-queued run).
+	priorityCalls []store.RunPriorityClassForRunParams
 }
 
 func (f *healthFakeStore) ListActiveRunsForHealth(context.Context) ([]store.ListActiveRunsForHealthRow, error) {
@@ -71,6 +83,13 @@ func (f *healthFakeStore) RunHasVerdictSinceGateOpened(_ context.Context, arg st
 		return false, f.verdictErr
 	}
 	return f.verdictSince[arg.RunID], nil
+}
+func (f *healthFakeStore) RunPriorityClassForRun(_ context.Context, arg store.RunPriorityClassForRunParams) (string, error) {
+	f.priorityCalls = append(f.priorityCalls, arg)
+	if f.priorityErr != nil {
+		return "", f.priorityErr
+	}
+	return f.priorityClass[arg.RunID], nil
 }
 func (f *healthFakeStore) SetRunHealth(_ context.Context, arg store.SetRunHealthParams) (int64, error) {
 	f.writes = append(f.writes, arg)

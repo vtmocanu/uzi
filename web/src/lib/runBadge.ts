@@ -8,6 +8,7 @@ import {
   type LatestRun,
   type Milestone,
   type RunHealth,
+  type RunPriority,
   type StopKind,
 } from "./api";
 import { forgeNounSentence, forgeNounLower, forgePlatform } from "./forgeNoun";
@@ -108,6 +109,51 @@ export function isStoppedRun(
   if (status === "failed" && stopKind != null && HUMAN_STOP_KINDS.has(stopKind))
     return true;
   return false;
+}
+
+// priorityBadge is the pure class→pill map for a run's queue priority (PRD #320 D8),
+// the single source both the Runs list and the run view render from — the same split
+// runStatusTone/healthBadge use, so the wording and tone live in one place. Tones come
+// from the BadgeTone union above and follow its taxonomy: `background` is neutral (a
+// run stepping back, muted grey), `expedited` is info (an emphasis pill for a run that
+// jumped ahead), `restored` is warning (the fail-open rescued it from starvation — a
+// "this waited past the grace" attention state). `restored` deliberately does NOT reuse
+// `queue`: in the default (ember) theme --queue-* and --neutral-* alias the same
+// muted/edge/raised tokens, so a queue-toned Restored pill would be pixel-identical to
+// the neutral Deprioritized pill AND to the adjacent queued status pill — the three-way
+// distinction only materialized in the mission theme. `warning` is a tinted tone,
+// distinct from both in every theme.
+//
+// Returns null for `normal` AND for an ABSENT value (a pre-#320 api omits the field —
+// api.ts: absent MUST read as normal), so an ordinary queued row stays quiet and no
+// pill renders. The caller additionally gates on `status === "queued"`, since only a
+// queued run ever carries a non-normal class.
+export function priorityBadge(
+  priority: RunPriority | undefined,
+): { label: string; tone: BadgeTone; title: string } | null {
+  switch (priority) {
+    case "background":
+      return {
+        label: "Deprioritized",
+        tone: "neutral",
+        title: "Yielding to interactive runs — it waits while interactive work is queued.",
+      };
+    case "expedited":
+      return {
+        label: "Expedited",
+        tone: "info",
+        title: "Bumped to the front of the queue.",
+      };
+    case "restored":
+      return {
+        label: "Restored",
+        tone: "warning",
+        title: "No longer yielding — it waited past the background grace.",
+      };
+    default:
+      // "normal" and undefined (absent → normal, api.ts): no pill.
+      return null;
+  }
 }
 
 // runStatusTone maps a run status to a list-row badge tone (a simpler view than

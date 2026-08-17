@@ -123,6 +123,7 @@ uzi run cancel <run-id>
 uzi run follow-up <run-id> [--message <text>]
 uzi run answer <run-id> [--message <text>]
 uzi run inputs <run-id>
+uzi run expedite <run-id> [--clear]
 uzi schedule create --repo <repo-id> (--issue <iid> | --sweep [--label <l>]... | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--auto-approve[=false]] [--wait-on-limit]
 uzi schedule list
 uzi schedule get <schedule-id>
@@ -350,6 +351,13 @@ uzi version
   consumed_at}` list (derive the state yourself: `consumed_at` null = queued,
   set = delivered). Only `follow_up` inputs appear; a **chat** run seeds every
   chat turn as a follow-up, so its queue lists them all (issue runs start empty).
+- `uzi run expedite <run-id>` — bump a **queued** run to the front of the claim
+  queue so a worker picks it up before the rest (PRD #320). It only matters before
+  a run is claimed — ordering is fixed once a worker takes it — so a non-queued run
+  is a 409 (exit 5), and a foreign/unknown run is a 404 (exit 4). `--clear` undoes
+  the bump: it removes the manual override and returns the run to its kind default
+  priority (it does **not** demote it below normal). Prints the updated run; `--json`
+  emits the run object, whose `priority` pill reads `expedited` after a bump.
 
 ### Schedules — time-driven runs
 

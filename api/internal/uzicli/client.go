@@ -85,6 +85,11 @@ type Client interface {
 	// caller's OWN tokens the pool may spend. An unknown label is a usage error
 	// resolved client-side (exit 3); an unknown id is a 404 (exit 4).
 	SetTokenAutoEligible(ctx context.Context, id string, eligible bool) (apitypes.SecretDTO, error)
+	// SetRunPriority expedites (expedite=true → priority bumped to the front) or clears
+	// (expedite=false → manual override removed, back to the kind default) ONE queued run:
+	// PATCH /api/runs/{id}/priority (PRD #320 D6/D7), RequireUser so a CLI token can reach
+	// it. A non-queued run is a 409 → ExitConflict (5); a foreign/absent run is 404 → 4.
+	SetRunPriority(ctx context.Context, id string, expedite bool) (apitypes.RunDTO, error)
 	// SelfRateLimits returns the caller's OWN per-token rate-limit meters, each
 	// carrying the server-computed auto-selection status: GET /api/me/rate-limits.
 	//
@@ -750,6 +755,19 @@ func (c *HTTPClient) SetTokenAutoEligible(ctx context.Context, id string, eligib
 		return apitypes.SecretDTO{}, err
 	}
 	return env.Secret, nil
+}
+
+func (c *HTTPClient) SetRunPriority(ctx context.Context, id string, expedite bool) (apitypes.RunDTO, error) {
+	body := struct {
+		Expedite bool `json:"expedite"`
+	}{Expedite: expedite}
+	var env struct {
+		Run apitypes.RunDTO `json:"run"`
+	}
+	if err := c.patch(ctx, "/api/runs/"+url.PathEscape(id)+"/priority", body, &env); err != nil {
+		return apitypes.RunDTO{}, err
+	}
+	return env.Run, nil
 }
 
 func (c *HTTPClient) SelfRateLimits(ctx context.Context) ([]apitypes.TokenRateLimitDTO, error) {

@@ -16,6 +16,9 @@ vi.mock("../lib/api", async (importOriginal) => {
       listRuns: vi.fn(),
       adminListRuns: vi.fn(),
       adminListWorkers: vi.fn(),
+      // PRD #320 M6: the Expedite/undo mutation on a queued row. Defaulted to resolve so
+      // a click + the layout reload settle; the priority cases assert the call args.
+      expediteRun: vi.fn().mockResolvedValue({ run: null }),
       // PRD #295: RunsList.load() now fetches the viewer's secrets to compute the
       // ">1 Anthropic token" gate. Default to no tokens so every pre-#295 test keeps
       // its no-badge expectation; the #295 cases override it per test. vi.clearAllMocks
@@ -730,5 +733,123 @@ describe("RunsList — credential badge gate (PRD #295)", () => {
     expect(screen.getByText("their-key")).toBeTruthy();
     // …but its /settings link is stripped. The row's own /runs/:id link is unaffected.
     expect(container.querySelector('a[href="/settings"]')).toBeNull();
+  });
+});
+
+// PRD #320 M6: the queue-priority pill + the owner's Expedite/undo control on the Runs
+// list. The pill is queued-only and class-driven; the action is owner-scoped (the
+// personal Active list is all the viewer's own runs) and queued-only.
+describe("RunsList — queue priority pill + Expedite action (PRD #320 M6)", () => {
+  beforeEach(() => {
+    // vaultUnlocked TRUE so a queued row renders its badge cluster (a locked vault would
+    // hijack it with the waiting-for-unlock badge instead — PRD #32).
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: false },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+  });
+
+  it("a queued demoted run shows the Deprioritized pill and an Expedite control", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "bg", issue_title: "Background run", status: "queued", priority: "background" })],
+    });
+
+    renderRuns();
+
+    await waitFor(() => expect(screen.getByText("Background run")).toBeTruthy());
+    expect(screen.getByText("Deprioritized")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Expedite" })).toBeTruthy();
+  });
+
+  it("a normal queued run shows no priority pill (but still offers Expedite)", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      // priority absent ⇒ normal ⇒ no pill.
+      runs: [aRun({ id: "n", issue_title: "Plain queued", status: "queued" })],
+    });
+
+    renderRuns();
+
+    await waitFor(() => expect(screen.getByText("Plain queued")).toBeTruthy());
+    expect(screen.queryByText("Deprioritized")).toBeNull();
+    expect(screen.queryByText("Expedited")).toBeNull();
+    // The owner can still bump a normal queued run to the front.
+    expect(screen.getByRole("button", { name: "Expedite" })).toBeTruthy();
+  });
+
+  it("clicking Expedite calls api.expediteRun(id, true) and does not navigate", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "bg", issue_title: "Background run", status: "queued", priority: "background" })],
+    });
+    mockApi.expediteRun.mockResolvedValue({
+      run: aRun({ id: "bg", status: "queued", priority: "expedited" }),
+    });
+
+    renderRuns();
+
+    await waitFor(() => expect(screen.getByText("Background run")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Expedite" }));
+    await waitFor(() => expect(mockApi.expediteRun).toHaveBeenCalledWith("bg", true));
+    // The click must not follow the row's <Link> (preventDefault/stopPropagation): we are
+    // still on the Runs list, so the row is still there.
+    expect(screen.getByText("Background run")).toBeTruthy();
+  });
+
+  it("an expedited run offers Undo, which calls api.expediteRun(id, false)", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "ex", issue_title: "Expedited run", status: "queued", priority: "expedited" })],
+    });
+    mockApi.expediteRun.mockResolvedValue({
+      run: aRun({ id: "ex", status: "queued", priority: "normal" }),
+    });
+
+    renderRuns();
+
+    await waitFor(() => expect(screen.getByText("Expedited run")).toBeTruthy());
+    expect(screen.getByText("Expedited")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    await waitFor(() => expect(mockApi.expediteRun).toHaveBeenCalledWith("ex", false));
+  });
+
+  it("hides the Expedite action for a NON-OWNER (admin factory row) but still shows the pill", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: true, email: "me@uzi.test" },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListWorkers.mockResolvedValue({ workers: [] });
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "theirs",
+          issue_title: "Another user's queued run",
+          status: "queued",
+          priority: "background",
+          owner_email: "other@uzi.test",
+        }),
+      ],
+    });
+
+    renderRuns();
+
+    await waitFor(() => expect(screen.getByText("Another user's queued run")).toBeTruthy());
+    // The pill is not owner-gated — an admin still sees the class…
+    expect(screen.getByText("Deprioritized")).toBeTruthy();
+    // …but the action is: no Expedite/Undo button on a run the viewer does not own.
+    expect(screen.queryByRole("button", { name: "Expedite" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
+  });
+
+  it("shows no priority pill and no action on a non-queued (running) run", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      // A running run carrying a stale priority must never render the pill or the control.
+      runs: [aRun({ id: "r", issue_title: "Running run", status: "running", priority: "expedited" })],
+    });
+
+    renderRuns();
+
+    await waitFor(() => expect(screen.getByText("Running run")).toBeTruthy());
+    expect(screen.queryByText("Expedited")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Expedite" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
   });
 });

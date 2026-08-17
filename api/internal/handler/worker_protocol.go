@@ -601,10 +601,10 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// run opted out) are server-side FAILURES delivered as 200s with
 		// status: "failed", where applied is TRUE. An applied-keyed branch leaks the
 		// disk on exactly those.
-		httpx.JSON(w, http.StatusConflict, map[string]any{"run": runToDTO(run)})
+		httpx.JSON(w, http.StatusConflict, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run))})
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run))})
 }
 
 // WorkerRunInputs consumes and returns any pending steering inputs, FIFO.

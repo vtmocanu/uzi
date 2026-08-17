@@ -46,7 +46,7 @@ func (h *Handler) CreateChat(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run)})
+	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run))})
 }
 
 // chatListDTO is one conversation in the Chat page's list: the display + activity
@@ -174,7 +174,7 @@ func (h *Handler) ContinueChat(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run)})
+	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run))})
 }
 
 // startChatRunRequest is the body of the chat start-run card's Start click (PRD #191
@@ -212,7 +212,7 @@ func (h *Handler) StartChatRun(w http.ResponseWriter, r *http.Request) {
 		h.writeStartRunError(w, r, err)
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run)})
+	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run))})
 }
 
 // cancelChatRunRequest is the body of the chat cancel card's Cancel click (PRD #322):
