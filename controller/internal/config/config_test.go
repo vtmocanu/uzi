@@ -257,7 +257,7 @@ func TestLoadReadsTheWorkerSettings(t *testing.T) {
 	setWorkerEnv(t)
 	t.Setenv("UZI_API_URL", "https://uzi.example.com")
 	t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
-	t.Setenv("UZI_WORKER_STORAGE_CLASS", "storage-class")
+	t.Setenv("UZI_WORKER_STORAGE_CLASS", "standard")
 
 	cfg, err := Load()
 	if err != nil {
@@ -272,7 +272,7 @@ func TestLoadReadsTheWorkerSettings(t *testing.T) {
 	if cfg.WorkerAPIURL != "https://api.uzi.svc.cluster.local:8443" {
 		t.Errorf("WorkerAPIURL = %q", cfg.WorkerAPIURL)
 	}
-	if cfg.WorkerStorageClass != "storage-class" {
+	if cfg.WorkerStorageClass != "standard" {
 		t.Errorf("WorkerStorageClass = %q", cfg.WorkerStorageClass)
 	}
 }

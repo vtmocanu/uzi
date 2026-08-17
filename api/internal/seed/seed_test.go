@@ -151,7 +151,7 @@ func TestForgeConnectionHappyPath(t *testing.T) {
 		identity: forge.BotIdentity{ForgeUserID: 42, Username: "uzi-bot"},
 		projects: []forge.Project{
 			{ForgeProjectID: 1, PathWithNamespace: "vtmocanu/uzi", WebURL: "https://github.com/vtmocanu/uzi", DefaultBranch: "main"},
-			{ForgeProjectID: 2, PathWithNamespace: "vtmocanu/other", WebURL: "https://gitlab.example.com/vtmocanu/other"},
+			{ForgeProjectID: 2, PathWithNamespace: "myorg/other", WebURL: "https://gitlab.example.com/myorg/other"},
 		},
 	}
 	svc := &fakeSvc{forge: ff}

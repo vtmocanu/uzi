@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  GITLAB_BLOB_BASE,
+  REPO_BLOB_BASE,
   isRoutableDoc,
   listOperatorDocs,
   parseFrontmatter,
@@ -86,7 +86,7 @@ describe("resolveHref", () => {
 
   it("sends a repo-only doc (not a user page) to the pinned GitLab blob base", () => {
     expect(resolveHref("configuration.md", isUser)).toEqual({
-      href: `${GITLAB_BLOB_BASE}docs/configuration.md`,
+      href: `${REPO_BLOB_BASE}docs/configuration.md`,
       external: true,
       internal: false,
     });
@@ -94,9 +94,9 @@ describe("resolveHref", () => {
 
   it("sends a repo-root file to GitLab, preserving the anchor", () => {
     expect(resolveHref("../ARCHITECTURE.md#forge-integration", isUser).href).toBe(
-      `${GITLAB_BLOB_BASE}ARCHITECTURE.md#forge-integration`,
+      `${REPO_BLOB_BASE}ARCHITECTURE.md#forge-integration`,
     );
-    expect(resolveHref("../plan.md", isUser).href).toBe(`${GITLAB_BLOB_BASE}plan.md`);
+    expect(resolveHref("../plan.md", isUser).href).toBe(`${REPO_BLOB_BASE}plan.md`);
   });
 
   it("passes anchors, root-absolute, external and non-http scheme links through", () => {
@@ -227,7 +227,7 @@ describe("rewriteHref (real bundled corpus, role-aware)", () => {
 
   it("sends the same operator-doc link to the GitLab blob for a non-admin", () => {
     expect(rewriteHref("configuration.md", false)).toEqual({
-      href: `${GITLAB_BLOB_BASE}docs/configuration.md`,
+      href: `${REPO_BLOB_BASE}docs/configuration.md`,
       external: true,
       internal: false,
     });

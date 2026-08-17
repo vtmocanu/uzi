@@ -145,7 +145,7 @@ func TestResolveReturnsATypedMissForUnknownNames(t *testing.T) {
 func TestResolveBuildsTheImageReferenceFromConfig(t *testing.T) {
 	// A trailing slash on the repo is the kind of thing a values file grows; it must
 	// not produce a double slash in an image reference.
-	r, err := NewResolver("harbor.example.com/gitlab/vtmocanu/uzi/", "v0.4.0")
+	r, err := NewResolver("harbor.example.com/uzi/", "v0.4.0")
 	if err != nil {
 		t.Fatalf("NewResolver: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestResolveBuildsTheImageReferenceFromConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if want := "harbor.example.com/gitlab/vtmocanu/uzi/agent-jvm:v0.4.0"; spec.Image != want {
+	if want := "harbor.example.com/uzi/agent-jvm:v0.4.0"; spec.Image != want {
 		t.Errorf("Image = %q, want %q", spec.Image, want)
 	}
 	if spec.Size.CPULimit.String() != "4" || spec.Size.MemoryLimit.String() != "8Gi" {

@@ -2821,7 +2821,7 @@ export const mockApi = {
       health_reason: null,
       health_since: null,
       pipeline_ref: ref,
-      pipeline_web_url: `https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4242`,
+      pipeline_web_url: `https://gitlab.example.com/myorg/uzi/-/pipelines/4242`,
       fix_verdict: null,
       plan_md: null,
       repo_agents: null,

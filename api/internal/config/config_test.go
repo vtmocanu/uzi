@@ -240,8 +240,8 @@ func TestNormalizeForgeBaseURL(t *testing.T) {
 		"https://gitlab.example.com/":     "https://gitlab.example.com",
 		"https://gitlab.example.com/path": "https://gitlab.example.com",
 		"https://GitLab.Example.com":      "https://gitlab.example.com",
-		"https://host:8443/x?y=1#z":         "https://host:8443",
-		"  https://spaced.example.com  ":    "https://spaced.example.com",
+		"https://host:8443/x?y=1#z":       "https://host:8443",
+		"  https://spaced.example.com  ":  "https://spaced.example.com",
 	}
 	for in, want := range ok {
 		got, err := NormalizeForgeBaseURL(in)
@@ -258,7 +258,7 @@ func TestNormalizeForgeBaseURL(t *testing.T) {
 		"http://gitlab.example.com", // plain http rejected (SSRF/credential-leak guard)
 		"ftp://x",
 		"gitlab.example.com", // no scheme
-		"https://",             // no host
+		"https://",           // no host
 		"",
 	}
 	for _, in := range bad {
@@ -419,7 +419,7 @@ func TestParseEmailDomains(t *testing.T) {
 		{"", nil},
 		{"   ", nil},
 		{"example.com", []string{"example.com"}},
-		{"Example.COM", []string{"example.com"}},      // lowercased
+		{"Example.COM", []string{"example.com"}},          // lowercased
 		{" a.com , b.com ", []string{"a.com", "b.com"}},   // trimmed
 		{"a.com,a.com,b.com", []string{"a.com", "b.com"}}, // deduped
 		{"a.com,,b.com,", []string{"a.com", "b.com"}},     // empty entries dropped

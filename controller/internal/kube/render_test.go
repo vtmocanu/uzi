@@ -21,7 +21,7 @@ func testConfig() RenderConfig {
 		Namespace:          "uzi-workers",
 		ServiceAccountName: "uzi-hosted-worker",
 		APIURL:             "https://api.uzi.svc.cluster.local:8443",
-		StorageClass:       "storage-class",
+		StorageClass:       "standard",
 	}
 }
 
@@ -313,7 +313,7 @@ func TestPVCsSizeFromThePresetAndNixIsFlat(t *testing.T) {
 			if p.Spec.AccessModes[0] != corev1.ReadWriteOnce {
 				t.Errorf("%s: must be RWO", p.Name)
 			}
-			if p.Spec.StorageClassName == nil || *p.Spec.StorageClassName != "storage-class" {
+			if p.Spec.StorageClassName == nil || *p.Spec.StorageClassName != "standard" {
 				t.Errorf("%s: storageClass not applied", p.Name)
 			}
 		}
@@ -703,7 +703,7 @@ func TestDinDDataPVCIsRenderedForDockerWorkersOnly(t *testing.T) {
 		if dind.Spec.AccessModes[0] != corev1.ReadWriteOnce {
 			t.Errorf("[%s] dind-data must be RWO", p.name)
 		}
-		if dind.Spec.StorageClassName == nil || *dind.Spec.StorageClassName != "storage-class" {
+		if dind.Spec.StorageClassName == nil || *dind.Spec.StorageClassName != "standard" {
 			t.Errorf("[%s] dind-data: storageClass not applied", p.name)
 		}
 		if dind.Namespace != "uzi-workers-docker" {
@@ -1553,8 +1553,8 @@ func containerByName(t *testing.T, cs []corev1.Container, name string) corev1.Co
 //
 // These close, locally and with no cluster, the one thing the kind run CANNOT
 // prove: kind's local-path-provisioner makes a plain directory on the node
-// filesystem, so a fresh PVC there really IS empty — while dev-cluster's hypervisor
-// CSI formats ext4 and a fresh PVC arrives carrying `lost+found`. An emptiness
+// filesystem, so a fresh PVC there really IS empty — while dev-cluster's
+// CSI driver formats ext4 and a fresh PVC arrives carrying `lost+found`. An emptiness
 // check therefore passes on kind and strands every worker on dev-cluster. It is a
 // property of the check, so it needs no kubelet.
 
@@ -1642,7 +1642,7 @@ func TestSeedScriptStillSeedsAVolumeThatCameWithLostAndFound(t *testing.T) {
 	if !seeded(t, dst) {
 		t.Fatal("a volume containing only lost+found is a FRESH volume and must still seed. " +
 			"This is the ext4 trap: an emptiness check passes on kind's local-path provisioner " +
-			"and strands every worker on dev-cluster's hypervisor CSI.")
+			"and strands every worker on dev-cluster's CSI volumes.")
 	}
 }
 

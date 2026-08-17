@@ -479,7 +479,7 @@ func TestOIDCCallbackDomainRejectedLiveDB(t *testing.T) {
 	h := oidcLiveHandlerWith(t, pool, f, cfg)
 
 	f.sub = "sub-domain-" + oidcUniq(t)
-	f.email = "outsider-" + oidcUniq(t) + "@example.com" // not example.com
+	f.email = "outsider-" + oidcUniq(t) + "@outsider.test" // not in the allowlist (example.com)
 	f.emailVerified = true
 
 	rec := callbackFor(t, h, f, true)

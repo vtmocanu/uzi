@@ -626,7 +626,7 @@ export const mockReviews: MockReview[] = [
       "- the same search re-ran three times before finding the handler\n\n" +
       "The failing lookup that cost the most time:\n\n" +
       "```sh\ngrep -rn 'handleReview' api/internal/handler\n```\n\n" +
-      "See the [run timeline](https://gitlab.example.com/vtmocanu/uzi/-/issues/71) for the full trace.",
+      "See the [run timeline](https://gitlab.example.com/myorg/uzi/-/issues/71) for the full trace.",
     judge_model: "haiku",
     status: "complete",
     created_at: minsAgo(6),
@@ -641,7 +641,7 @@ export const mockReviews: MockReview[] = [
           "- first on the pre-commit hook\n" +
           "- then on the manual lint pass\n\n" +
           "```sh\nshellcheck scripts/*.sh\n```\n\n" +
-          "Installing it in the worker image would save the fallback. See the [worker image spec](https://gitlab.example.com/vtmocanu/uzi/-/blob/main/docs/judge.md).",
+          "Installing it in the worker image would save the fallback. See the [worker image spec](https://gitlab.example.com/myorg/uzi/-/blob/main/docs/judge.md).",
         confidence: "high",
         created_at: minsAgo(6),
       },
@@ -696,14 +696,14 @@ export const mockReviews: MockReview[] = [
         category: "install_worker_tool",
         target: "shellcheck",
         issue_iid: 71,
-        issue_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/71",
+        issue_url: "https://gitlab.example.com/myorg/uzi/-/issues/71",
         filed_at: minsAgo(20),
       },
       {
         category: "add_agent",
         target: "deploy-agent",
         issue_iid: 72,
-        issue_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/72",
+        issue_url: "https://gitlab.example.com/myorg/uzi/-/issues/72",
         filed_at: minsAgo(2),
       },
     ],
@@ -805,7 +805,7 @@ export const mockReviews: MockReview[] = [
         category: "enable_tool",
         target: "ripgrep",
         issue_iid: 91,
-        issue_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/91",
+        issue_url: "https://gitlab.example.com/myorg/uzi/-/issues/91",
         filed_at: minsAgo(90),
       },
     ],
@@ -880,7 +880,7 @@ export const mockReviews: MockReview[] = [
         category: "add_agent",
         target: "deploy-agent",
         issue_iid: 88,
-        issue_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/88",
+        issue_url: "https://gitlab.example.com/myorg/uzi/-/issues/88",
         filed_at: daysAgo(3),
       },
     ],
@@ -1062,7 +1062,7 @@ export const mockRepos: Repo[] = [
     connection_id: "conn-1",
     forge_project_id: 118,
     path_with_namespace: "vtmocanu/uzi",
-    web_url: "https://gitlab.example.com/vtmocanu/uzi",
+    web_url: "https://gitlab.example.com/myorg/uzi",
     default_branch: "main",
     enabled: true,
     repo_skills_enabled: true,
@@ -1072,7 +1072,7 @@ export const mockRepos: Repo[] = [
     repo_devbox_opt_in: true,
     pipeline: {
       status: "failed",
-      web_url: "https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4242",
+      web_url: "https://gitlab.example.com/myorg/uzi/-/pipelines/4242",
       ref: "main",
       pipeline_id: 4242,
       synced_at: minsAgo(1),
@@ -1087,7 +1087,7 @@ export const mockRepos: Repo[] = [
     connection_id: "conn-1",
     forge_project_id: 204,
     path_with_namespace: "vtmocanu/atlas-api",
-    web_url: "https://gitlab.example.com/vtmocanu/atlas-api",
+    web_url: "https://gitlab.example.com/myorg/atlas-api",
     default_branch: "main",
     enabled: true,
     repo_skills_enabled: false,
@@ -1095,7 +1095,7 @@ export const mockRepos: Repo[] = [
     repo_devbox_opt_in: false,
     pipeline: {
       status: "success",
-      web_url: "https://gitlab.example.com/vtmocanu/atlas-api/-/pipelines/3311",
+      web_url: "https://gitlab.example.com/myorg/atlas-api/-/pipelines/3311",
       ref: "main",
       pipeline_id: 3311,
       synced_at: minsAgo(2),
@@ -1194,8 +1194,8 @@ export const mockBlockedRepoMeta: Record<string, MockBlockedRepoMeta> = {
 // Declared here (above the boards) because a card's latest_run references it.
 export const LIVE_RUN_ID = "run-live";
 
-const uziUrl = (iid: number) => `https://gitlab.example.com/vtmocanu/uzi/-/issues/${iid}`;
-const atlasUrl = (iid: number) => `https://gitlab.example.com/vtmocanu/atlas-api/-/issues/${iid}`;
+const uziUrl = (iid: number) => `https://gitlab.example.com/myorg/uzi/-/issues/${iid}`;
+const atlasUrl = (iid: number) => `https://gitlab.example.com/myorg/atlas-api/-/issues/${iid}`;
 
 // latestRun builds a card's latest_run snapshot (PRD #12 M2). Kept as inline
 // literals per card so the seed stays declarative; every id matches a real run
@@ -1228,7 +1228,7 @@ const boardFixtures: Record<string, Board> = {
     repo_id: "repo-uzi",
     path_with_namespace: "vtmocanu/uzi",
     forge_type: "gitlab",
-    web_url: "https://gitlab.example.com/vtmocanu/uzi",
+    web_url: "https://gitlab.example.com/myorg/uzi",
     columns: [
       { label_name: "Ready", position: 0 },
       { label_name: "In progress", position: 1 },
@@ -1269,7 +1269,7 @@ const boardFixtures: Record<string, Board> = {
         pipeline: {
           ref: "agent/issue-29",
           status: "canceled",
-          web_url: "https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4188",
+          web_url: "https://gitlab.example.com/myorg/uzi/-/pipelines/4188",
           pipeline_id: 4188,
           synced_at: minsAgo(6),
         },
@@ -1297,7 +1297,7 @@ const boardFixtures: Record<string, Board> = {
         pipeline: {
           ref: "agent/issue-27",
           status: "manual",
-          web_url: "https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4190",
+          web_url: "https://gitlab.example.com/myorg/uzi/-/pipelines/4190",
           pipeline_id: 4190,
           synced_at: minsAgo(4),
         },
@@ -1351,7 +1351,7 @@ const boardFixtures: Record<string, Board> = {
         // The agent branch's MR pipeline is still running.
         pipeline: {
           status: "running",
-          web_url: "https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4239",
+          web_url: "https://gitlab.example.com/myorg/uzi/-/pipelines/4239",
           ref: "agent/issue-24",
           pipeline_id: 4239,
           synced_at: minsAgo(1),
@@ -1374,7 +1374,7 @@ const boardFixtures: Record<string, Board> = {
         // A red per-card pipeline: the Fix CI affordance (M6) will hang off this.
         pipeline: {
           status: "failed",
-          web_url: "https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4201",
+          web_url: "https://gitlab.example.com/myorg/uzi/-/pipelines/4201",
           ref: "agent/issue-22",
           pipeline_id: 4201,
           synced_at: minsAgo(3),
@@ -1451,7 +1451,7 @@ const boardFixtures: Record<string, Board> = {
           id: "run-done",
           status: "completed",
           mr_iid: 42,
-          mr_web_url: "https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/42",
+          mr_web_url: "https://gitlab.example.com/myorg/uzi/-/merge_requests/42",
           mr_state: "merged",
           worker_name: "laptop",
           created_at: minsAgo(225),
@@ -1506,7 +1506,7 @@ const boardFixtures: Record<string, Board> = {
           id: "run-unjudged",
           status: "completed",
           mr_iid: 39,
-          mr_web_url: "https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/39",
+          mr_web_url: "https://gitlab.example.com/myorg/uzi/-/merge_requests/39",
           mr_state: "merged",
           worker_name: "laptop",
           created_at: minsAgo(520),
@@ -1598,7 +1598,7 @@ const boardFixtures: Record<string, Board> = {
     ],
     pipeline: {
       status: "failed",
-      web_url: "https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4242",
+      web_url: "https://gitlab.example.com/myorg/uzi/-/pipelines/4242",
       ref: "main",
       pipeline_id: 4242,
       synced_at: minsAgo(1),
@@ -1608,7 +1608,7 @@ const boardFixtures: Record<string, Board> = {
     repo_id: "repo-atlas",
     path_with_namespace: "vtmocanu/atlas-api",
     forge_type: "gitlab",
-    web_url: "https://gitlab.example.com/vtmocanu/atlas-api",
+    web_url: "https://gitlab.example.com/myorg/atlas-api",
     columns: [
       { label_name: "Ready", position: 0 },
       { label_name: "Doing", position: 1 },
@@ -2756,7 +2756,7 @@ export const mockRuns: Run[] = [
     model: "fable",
     override_subagent_model: true,
     forge_type: "gitlab",
-    mr_web_url: "https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/42",
+    mr_web_url: "https://gitlab.example.com/myorg/uzi/-/merge_requests/42",
     mr_iid: 42,
     mr_state: "merged",
     failure_reason: null,
@@ -2906,7 +2906,7 @@ export const mockRuns: Run[] = [
     model: null,
     override_subagent_model: false,
     forge_type: "gitlab",
-    mr_web_url: "https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/39",
+    mr_web_url: "https://gitlab.example.com/myorg/uzi/-/merge_requests/39",
     mr_iid: 39,
     mr_state: "merged",
     failure_reason: null,
@@ -3948,7 +3948,7 @@ export const mockLaneMessages: RunMessage[] = [
   // The same instance speaking again, several frames later: it folds back into its
   // OWN lane instead of opening a fresh near-empty bar (Problem 1's fix).
   nm("tool_use", "coder", "toolu_01coderA", "API wiring", { id: "ln-6", name: "Bash", input: { command: "cd api && go test ./internal/store/..." } }, 3),
-  nm("tool_result", "coder", "toolu_01coderA", "API wiring", { tool_use_id: "ln-6", content: "ok  gitlab.example.com/vtmocanu/uzi/api/internal/store  0.42s" }, 2),
+  nm("tool_result", "coder", "toolu_01coderA", "API wiring", { tool_use_id: "ln-6", content: "ok  gitlab.example.com/myorg/uzi/api/internal/store  0.42s" }, 2),
   nm("tool_use", "coder", "toolu_01coderB", "web gate UX", { id: "ln-7", name: "Bash", input: { command: "cd web && npx vitest run src/components/ActivityFeed.test.tsx" } }, 0.3),
 ];
 

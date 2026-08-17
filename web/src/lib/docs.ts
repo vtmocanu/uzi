@@ -19,9 +19,9 @@ const rawAssets = import.meta.glob("../../../docs/img/*", {
   eager: true,
 }) as Record<string, string>;
 
-// Pinned GitLab blob base for links to repo-only files (design/operator docs,
+// Pinned repo blob base for links to repo-only files (design/operator docs,
 // ../plan.md, etc.) that are not bundled as in-app pages.
-export const GITLAB_BLOB_BASE = "https://gitlab.example.com/vtmocanu/uzi/-/blob/main/";
+export const REPO_BLOB_BASE = "https://github.com/vtmocanu/uzi/blob/main/";
 
 const DOCS_GLOB_PREFIX = "../../../docs/";
 
@@ -203,7 +203,7 @@ export function schemeIsDangerous(url: string): boolean {
 //   - a relative `*.md` that resolves to an in-app-routable page -> `/docs/:slug`
 //     (in-app route), preserving any `#anchor`.
 //   - any other relative path (non-routable doc, ../plan.md, ...) -> the pinned
-//     GitLab blob URL, preserving any `#anchor`.
+//     repo blob URL, preserving any `#anchor`.
 export function resolveHref(href: string, isRoutablePage: (slug: string) => boolean): RewrittenHref {
   // Protocol-relative (`//host`, and the `/\` variant browsers also treat as
   // such) is an off-app URL, not an in-app route — classify before the
@@ -237,13 +237,13 @@ export function resolveHref(href: string, isRoutablePage: (slug: string) => bool
       return { href: `/docs/${slug}${anchor}`, external: false, internal: true };
     }
   }
-  return { href: `${GITLAB_BLOB_BASE}${repoPath}${anchor}`, external: true, internal: false };
+  return { href: `${REPO_BLOB_BASE}${repoPath}${anchor}`, external: true, internal: false };
 }
 
 // Bound to the docs actually bundled in this build. A relative `*.md` link
 // routes in-app when its target is routable for this viewer — user pages for
 // everyone, and operator pages too for an admin (issue #75 M1); anything else
-// resolves to the pinned GitLab blob URL.
+// resolves to the pinned repo blob URL.
 export function rewriteHref(href: string, isAdmin: boolean): RewrittenHref {
   return resolveHref(href, (slug) => isRoutableDoc(slug, isAdmin));
 }

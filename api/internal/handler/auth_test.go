@@ -127,7 +127,7 @@ func TestEmailDomainExtraction(t *testing.T) {
 	cases := map[string]string{
 		"alice@example.com":         "example.com",
 		"Alice <alice@example.com>": "example.com", // display-name form
-		"  bob@example.COM  ":       "example.com", // padded + mixed case
+		"  bob@Example.COM  ":       "example.com", // padded + mixed case
 		`"weird@local"@example.com`: "example.com", // quoted local part containing '@'
 		"carol@sub.example.com":     "sub.example.com",
 	}
@@ -146,13 +146,13 @@ func TestEmailDomainAllowed(t *testing.T) {
 		allowed []string
 		want    bool
 	}{
-		{"alice@example.com", nil, true},            // empty allowlist ⇒ all allowed
-		{"alice@gmail.com", nil, true},                // empty allowlist ⇒ all allowed
+		{"alice@example.com", nil, true},          // empty allowlist ⇒ all allowed
+		{"alice@gmail.com", nil, true},            // empty allowlist ⇒ all allowed
 		{"alice@example.com", example, true},      // exact
-		{"alice@gmail.com", example, false},         // not on list
+		{"alice@gmail.com", example, false},       // not on list
 		{"alice@sub.example.com", example, false}, // no subdomain wildcard
-		{"alice@example.org", multi, true},            // second entry
-		{"alice@example.com", multi, false},           // neither
+		{"alice@example.org", multi, true},        // second entry
+		{"alice@gmail.com", multi, false},         // neither
 	}
 	for _, tc := range cases {
 		if got := emailDomainAllowed(tc.addr, tc.allowed); got != tc.want {
@@ -200,7 +200,7 @@ func TestRegisterDomainRejectedReturns403(t *testing.T) {
 // matching is covered by the mixed-case address.
 func TestRegisterDomainAllowedPassesPolicy(t *testing.T) {
 	cfg := config.Config{RegistrationEnabled: true, PasswordLoginEnabled: true, AllowedEmailDomains: []string{"example.com"}}
-	rec := postRegister(cfg, `{"email":"Alice@example.com","password":"short"}`)
+	rec := postRegister(cfg, `{"email":"Alice@EXAMPLE.com","password":"short"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (past the domain gate, failing on password)", rec.Code)
 	}

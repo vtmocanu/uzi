@@ -126,7 +126,7 @@ const (
 // emptiness check.
 //
 // This is not defensive style, it is the difference between a working fleet and a
-// stranded one. dev-cluster's storage is hypervisor CSI (storage-class), which formats
+// stranded one. dev-cluster's storage is a CSI driver, which formats
 // ext4, so a freshly provisioned PVC arrives already containing `lost+found`. An
 // `[ -z "$(ls -A /nix-seed)" ]` guard is therefore FALSE on a brand-new volume: the
 // store never seeds, /nix mounts empty and masks the image's baked store — nix
@@ -486,7 +486,7 @@ type RenderConfig struct {
 	// ZERO VALUE (false) is ROOTLESS — the safe default — so an unset posture renders
 	// exactly PRD #83's rootless sidecar and no caller that omits it can accidentally
 	// get node root. Set true ONLY for clusters whose nodes cannot run rootless dockerd
-	// (no unprivileged userns — dev-cluster/Linux): the daemon then runs as real root
+	// (no unprivileged userns — dev-cluster): the daemon then runs as real root
 	// (uid 0) in the already-privileged, already-fenced docker namespace and the worker
 	// reaches it over pod-loopback TCP (dindLoopbackTCP) instead of a shared unix
 	// socket. Pure operator config gated by workers.docker.rootless + the
@@ -1098,7 +1098,7 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 //
 //   - NON-ROOTLESS (PRD #89): runs as REAL ROOT (uid 0), no userns, so a breakout
 //     lands as node root — the owner-accepted residual on nodes without unprivileged
-//     userns (dev-cluster/Linux). RunAsNonRoot MUST be false at CONTAINER scope: the
+//     userns (dev-cluster). RunAsNonRoot MUST be false at CONTAINER scope: the
 //     pod is RunAsNonRoot:true, so a uid-0 container is rejected at admission without
 //     this override (the same override dindInitContainer uses). The dockerd command is
 //     OVERRIDDEN to bind ONLY dindLoopbackTCP (`--tls=false`) — THE control that

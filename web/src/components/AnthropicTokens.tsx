@@ -15,7 +15,7 @@ import { isShownInSidebar } from "../lib/sidebarTokens";
 import { Badge, Button, Card, Field, Input, SectionTitle, Skeleton } from "./ui";
 
 const DOC_URL =
-  "https://gitlab.example.com/vtmocanu/uzi/-/blob/main/docs/anthropic-token.md";
+  "https://github.com/vtmocanu/uzi/blob/main/docs/anthropic-token.md";
 
 // vaultLockedMessage is the shared copy for a 409 vault_locked: the global handler
 // has already refreshed the session, so the unlock banner is showing above.
