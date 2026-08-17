@@ -15,23 +15,20 @@ manage workers and repos, and (read-only) admin state. Built for humans
 ## 1. Install
 
 ```sh
-brew tap vtmocanu/tap git@github.com:vtmocanu/homebrew-tap.git
-brew trust --tap vtmocanu/tap   # one-time: Homebrew 6+ requires trusting third-party taps
+brew tap vtmocanu/tap
+brew trust vtmocanu/tap   # one-time: Homebrew 6+ requires trusting third-party taps
 brew install vtmocanu/tap/uzi-cli
 uzi version
 ```
 
-The tap lives on **gitlab.example.com**, not GitHub, so the `vtmocanu/tap`
-shorthand cannot be used on its own: Homebrew resolves a bare `user/repo` tap
-name to `github.com/user/homebrew-repo`, so you must add the tap once with its
-explicit GitLab remote (the SSH URL above). After that one-time `brew tap`,
-`brew install vtmocanu/tap/uzi-cli` uses the recorded remote. `brew trust` is
-also a one-time step: Homebrew 6+ refuses to load formulae from a third-party
-tap until it is trusted.
+`vtmocanu/tap` resolves to `github.com/vtmocanu/homebrew-tap` on its own (Homebrew maps
+a bare `user/repo` tap name to `github.com/user/homebrew-repo`), so no explicit remote
+is needed. `brew trust` is a one-time step: Homebrew 6+ refuses to load formulae from a
+third-party tap until it is trusted.
 
-The formula builds from source (`vtmocanu/uzi` is a private repo), so you need
-**group-read on `vtmocanu/uzi`**: unlike a public tap, `brew install` clones
-the product repo over git-over-SSH using your own key.
+The formula builds `uzi` from source: `brew install` downloads the release source
+tarball and runs `go build` (Homebrew installs Go as a build dependency). No access to
+the product repo is required.
 
 On first run the CLI also drops a Claude Code skill at
 `~/.claude/skills/uzi-cli/SKILL.md` (generated from the binary's own command
@@ -73,7 +70,8 @@ uzi run list --json
 ```
 
 `UZI_URL`/`UZI_TOKEN` need no `$HOME`, no browser, no cookie — the whole
-headless path. **In GitLab CI, `UZI_TOKEN` must be a masked variable.**
+headless path. **In CI, keep `UZI_TOKEN` in a secret (e.g. a GitHub Actions
+secret), never a plain variable.**
 
 ## Commands
 

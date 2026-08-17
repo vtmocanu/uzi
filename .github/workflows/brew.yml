@@ -1,0 +1,83 @@
+# Regenerate Formula/uzi-cli.rb for a v* tag and push it to vtmocanu/homebrew-tap.
+#
+# Mirrors the sibling formulae (cc-statusline, fj-queue): `task brew:formula` computes
+# the tag tarball's sha256 and renders Formula/uzi-cli.rb (its url/sha256 placeholders),
+# then `task brew:publish` pushes the rendered copy into the tap. The mechanics live in
+# the reusable homebrew-tap.yml from github.com/vtmocanu/task, included by uzi's
+# Taskfile.yml under `brew:` (the one sanctioned remote include, SHA-pinned; see that
+# file's rule 3).
+#
+# 🔴 workflow_dispatch ONLY while the repo is PRIVATE. brew:formula fetches the ANONYMOUS
+# auto-archive (https://github.com/vtmocanu/uzi/archive/refs/tags/<tag>.tar.gz), which
+# 404s for a private repo -- so it cannot compute a real sha256 and refuses to render
+# (the reusable task guards the empty-input digest). The first REAL tap publish happens
+# AFTER the repo is public; add
+#
+#   push:
+#     tags: ["v*"]
+#
+# to the triggers below in the SAME change that flips the repo public. The images + chart
+# already publish on tags via release.yml; brew is decoupled because it needs the public
+# archive. Dispatch lets you (re)publish the formula for any existing tag once public.
+#
+# The default GITHUB_TOKEN cannot write to a second repo, so the cross-repo push uses
+# HOMEBREW_TAP_TOKEN (a fine-grained PAT scoped to vtmocanu/homebrew-tap, contents:write),
+# from the `release` environment. No GitHub Release is created (the auto-archive needs
+# none), so permissions stay read-only -- matching cc-statusline.
+
+name: Brew
+
+# Quoted so yamllint's `truthy` rule does not read the key as the boolean `on`.
+"on":
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish the uzi-cli formula for (e.g. v0.42.1)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: brew-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish-formula:
+    runs-on: ubuntu-latest
+    environment: release
+    env:
+      # Passed via env, never string-interpolated into a run script: a workflow_dispatch
+      # input is untrusted, and git ref names allow shell metacharacters.
+      INPUT_TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only strict SemVer tags may proceed. $INPUT_TAG flows into a URL + Task template
+      # substitution where quoting cannot be relied on; the guard is injection-safe
+      # because $INPUT_TAG is shell-expanded from env, never a GH expression.
+      - name: Validate tag format
+        id: tag
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$INPUT_TAG" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "refusing to publish: tag '$INPUT_TAG' is not vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: arduino/setup-task@v3
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Renders dist/uzi-cli.rb (auto-archive url + computed sha256). Fails loudly on the
+      # empty-input digest, i.e. while the repo is still private.
+      - name: Render formula
+        run: task --yes brew:formula VERSION="${{ steps.tag.outputs.tag }}"
+
+      # Clones the tap with HOMEBREW_TAP_TOKEN, copies the rendered formula, commits + pushes.
+      - name: Publish to tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: task --yes brew:publish VERSION="${{ steps.tag.outputs.tag }}" HOMEBREW_TAP_TOKEN="$HOMEBREW_TAP_TOKEN"

@@ -24,10 +24,11 @@
 # Chart.version. The chart publishes LAST, after every image, so ArgoCD (tracking the
 # chart) never rolls a workload to an image tag that does not exist yet.
 #
-# NOT YET HERE: the Homebrew `publish_brew` job. It is coupled to the Formula tarball
-# rework (release-asset url + sha256) that is the next migration step, and today's
-# Formula/uzi-cli.rb still carries a placeholder git source -- so brew publishing lands
-# with that rework rather than pushing a non-installable formula now.
+# Homebrew publishing is a SEPARATE workflow (.github/workflows/brew.yml), not a job
+# here: it renders + pushes the formula from the tag's public auto-archive, which 404s
+# while the repo is private, so it is workflow_dispatch-only until the public flip and
+# must not redden this image+chart release. It reuses vtmocanu/task's homebrew-tap.yml
+# via `task brew:formula` / `brew:publish`, the same mechanic the sibling formulae use.
 
 name: Release
 

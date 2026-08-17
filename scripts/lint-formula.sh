@@ -7,11 +7,12 @@
 # A SCRIPT, NOT AN INLINE `cmds:` LINE -- see scripts/lint-shell.sh for the reason.
 #
 # 🔴 WHY THIS FILE IS WORTH A GATE AT ALL, since it is "just a formula": the
-# tag-only `publish_brew` job is in `*publish_needs` and copies Formula/uzi-cli.rb
-# VERBATIM into vtmocanu/homebrew-tap on every `v*` tag. A syntax error here is
-# discovered by a teammate running `brew install`, after the release is out. The
-# formula is also the SOURCE OF TRUTH for the tap copy, which is fully generated
-# from it, so there is no second place the mistake gets caught.
+# .github/workflows/brew.yml job renders Formula/uzi-cli.rb (via `task brew:formula`,
+# substituting its url/sha256 placeholders) and pushes the result into
+# vtmocanu/homebrew-tap on every `v*` tag. A syntax error here is discovered by a
+# teammate running `brew install`, after the release is out. The formula is also the
+# SOURCE OF TRUTH for the tap copy, which is fully generated from it, so there is no
+# second place the mistake gets caught.
 #
 # 🔴 THREE THINGS THIS CHECK CANNOT DO, stated here because each is a plausible
 # reading of "the formula is linted" and none of them is true:
@@ -21,12 +22,13 @@
 #      that could never pass -- is perfectly valid Ruby and passes here. `brew audit`
 #      is the tool that sees those, and it needs a Homebrew installation, which no
 #      image in this pipeline has.
-#   2. IT VALIDATES THE PRE-SED SOURCE, NOT THE SHIPPED ARTIFACT. `publish_brew`
-#      `sed -i`s the `tag:` line to the release tag before pushing to the tap, so
-#      the file this script parses and the file consumers install from are not the
-#      same bytes. The sed is a single quoted-string substitution and cannot plausibly
-#      break the parse, but "the formula is syntax-checked in CI" is a claim about
-#      this file only.
+#   2. IT VALIDATES THE TEMPLATE, NOT THE SHIPPED ARTIFACT. `task brew:formula`
+#      substitutes the url/sha256 placeholder strings for the release tarball before
+#      pushing to the tap, so the file this script parses and the file consumers install
+#      from are not the same bytes. The substitution replaces two quoted-string values
+#      with a github URL and a hex digest (neither carries sed-special chars) and cannot
+#      plausibly break the parse, but "the formula is syntax-checked in CI" is a claim
+#      about this template only.
 #   3. IT CANNOT DISTINGUISH A BAD FILE FROM A MISSING ONE. Measured 2026-08-03:
 #      `ruby -c` on a nonexistent path also exits 1, with "No such file or directory
 #      -- x (LoadError)". That is why the existence assertion below is a SEPARATE

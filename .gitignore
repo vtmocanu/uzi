@@ -20,6 +20,8 @@ web/node_modules
 agent/node_modules
 node_modules
 web/dist/
+# Rendered Homebrew formula output (task brew:formula); the template is Formula/uzi-cli.rb
+/dist/
 
 # Prior-art corpus (bottega, multica, dot-agent-deck). Vendored as git submodules
 # under inspiration/ until 2026-08-03, now kept as ordinary clones OUTSIDE the repo
