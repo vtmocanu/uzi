@@ -63,7 +63,7 @@ const (
 // PublishMessage enqueues only those (Decision 6: thinking/tool frames never post).
 func chatRelevantKind(kind string) bool {
 	switch kind {
-	case "user_message", "text", "status", "error", "proposal", "run_request":
+	case "user_message", "text", "status", "error", "proposal", "run_request", "cancel_request":
 		return true
 	default:
 		return false
@@ -158,6 +158,11 @@ func (n *Notifier) applyChatFrame(ctx context.Context, convo *chatConvo, ev chat
 		n.postRunRequestCard(ctx, convo, ev.payload)
 		return
 	}
+	if ev.kind == "cancel_request" {
+		// A cancel-run card, standalone like the start-run card (PRD #322).
+		n.postCancelRequestCard(ctx, convo, ev.payload)
+		return
+	}
 
 	if err := json.Unmarshal(ev.payload, &p); err != nil {
 		// A payload we can't parse: ignore it rather than let a malformed status frame
@@ -243,6 +248,28 @@ func (n *Notifier) postRunRequestCard(ctx context.Context, convo *chatConvo, pay
 	blocks := runRequestCardBlocks(rr.RepoPath, rr.IssueIID, rr.Title)
 	if _, err := n.poster.PostBlocks(ctx, convo.channel, convo.rootTS, "Start-run request from uzi chat", blocks); err != nil {
 		n.logf("post run_request card", err)
+	}
+}
+
+// postCancelRequestCard renders a chat agent's cancel_run request as a Block Kit card
+// with a danger Cancel / Dismiss in the conversation thread (PRD #322). Payload is the
+// tool's {run_id}; the press is handled by ChatActions (slack_chat_*).
+func (n *Notifier) postCancelRequestCard(ctx context.Context, convo *chatConvo, payload []byte) {
+	var cr struct {
+		RunID string `json:"run_id"`
+	}
+	if err := json.Unmarshal(payload, &cr); err != nil {
+		n.logf("parse cancel_request payload", err)
+		return
+	}
+	runID, err := uuid.Parse(strings.TrimSpace(cr.RunID))
+	if err != nil {
+		n.logf("cancel_request payload", errors.New("missing or invalid run_id"))
+		return
+	}
+	blocks := cancelRequestCardBlocks(runID)
+	if _, err := n.poster.PostBlocks(ctx, convo.channel, convo.rootTS, "Cancel-run request from uzi chat", blocks); err != nil {
+		n.logf("post cancel_request card", err)
 	}
 }
 

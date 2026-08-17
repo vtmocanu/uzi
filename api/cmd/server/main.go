@@ -1069,6 +1069,39 @@ func (g gateSubmitter) StartRunFromCard(ctx context.Context, userID uuid.UUID, r
 	return uuid.Nil, errors.New(startRunCardMessage(err))
 }
 
+// CancelRunFromCard adapts the Slack cancel-run card (PRD #322): the owner-only
+// SubmitInput(cancel). On refusal it returns an error whose MESSAGE is user-safe (built
+// from the run sentinels, mirroring StartRunFromCard), so slacksvc surfaces a helpful
+// line without importing workersvc. run_id is untrusted → SubmitInput re-resolves it.
+func (g gateSubmitter) CancelRunFromCard(ctx context.Context, userID, runID uuid.UUID) error {
+	_, err := g.svc.SubmitInput(ctx, userID, runID, "cancel", "", nil)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, workersvc.ErrRunNotFound):
+		return errors.New(cancelRunCardMessage(err))
+	case errors.Is(err, workersvc.ErrRunTerminal):
+		return errors.New(cancelRunCardMessage(err))
+	default:
+		slog.Error("slack cancel-run card", "run_id", runID, "error", err)
+		return errors.New(cancelRunCardMessage(err))
+	}
+}
+
+// cancelRunCardMessage maps a SubmitInput(cancel) error to a user-safe Slack message,
+// mirroring startRunCardMessage: the string is built here (not a literal in errors.New)
+// so the message can carry user-facing punctuation without tripping ST1005.
+func cancelRunCardMessage(err error) string {
+	switch {
+	case errors.Is(err, workersvc.ErrRunNotFound):
+		return "That run isn't yours, or it no longer exists."
+	case errors.Is(err, workersvc.ErrRunTerminal):
+		return "That run has already finished."
+	default:
+		return "Couldn't cancel that run right now — try again, or cancel it in uzi."
+	}
+}
+
 // isInternalStartRunErr reports whether a StartRun error is an unexpected/internal
 // failure worth logging (vs a user-actionable gate refusal).
 func isInternalStartRunErr(err error) bool {

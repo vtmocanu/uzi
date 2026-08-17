@@ -34,6 +34,10 @@ const (
 	// chat; Continue mints a new chat resuming the ended one. Value = the run id.
 	ActionChatEnd      = "slack_chat_end"
 	ActionChatContinue = "slack_chat_continue"
+	// Cancel-run card (PRD #322): a danger Cancel button that stops a live issue run via
+	// SubmitInput(cancel), gated by a confirm dialog + the human press. Value = the run id.
+	ActionChatRunCancel        = "slack_chat_run_cancel"
+	ActionChatRunCancelDismiss = "slack_chat_run_cancel_dismiss"
 )
 
 // isChatAction reports whether an action id is a chat-card action ChatActions owns.
@@ -85,6 +89,11 @@ type ChatActionSubmitter interface {
 	// id on success; on refusal the error's message is USER-SAFE (the adapter builds it
 	// from the gate sentinels and logs the raw cause), so ChatActions can surface it.
 	StartRunFromCard(ctx context.Context, userID uuid.UUID, repoPath string, issueIID int64) (uuid.UUID, error)
+	// CancelRunFromCard cancels a live run from the chat cancel card (PRD #322) via the
+	// owner-only SubmitInput(cancel). run_id is untrusted → re-resolved server-side. On
+	// refusal it returns an error whose MESSAGE is user-safe (built from the run sentinels
+	// in main, mirroring StartRunFromCard), so ChatActions can surface it.
+	CancelRunFromCard(ctx context.Context, userID, runID uuid.UUID) error
 	// EndChat ends a live chat (PRD #191 M6). Translated: ErrChatEnded (already
 	// terminal), ErrChatGone (not yours / gone).
 	EndChat(ctx context.Context, userID, runID uuid.UUID) error
@@ -145,7 +154,7 @@ func (c *ChatActions) HandleBlockAction(ctx context.Context, a BlockAction) {
 	// returns before the confirmed-user DB lookup.
 	switch a.ActionID {
 	case ActionChatProposalCreate, ActionChatProposalDismiss, ActionChatRunStart, ActionChatRunDismiss,
-		ActionChatEnd, ActionChatContinue:
+		ActionChatEnd, ActionChatContinue, ActionChatRunCancel, ActionChatRunCancelDismiss:
 	default:
 		return
 	}
@@ -193,6 +202,17 @@ func (c *ChatActions) HandleBlockAction(ctx context.Context, a BlockAction) {
 			c.endChat(ctx, a, user.ID, runID)
 		} else {
 			c.continueChat(ctx, a, user.ID, runID)
+		}
+	case ActionChatRunCancel, ActionChatRunCancelDismiss:
+		runID, err := uuid.Parse(strings.TrimSpace(a.Value))
+		if err != nil {
+			c.logf("parse cancel action value", err)
+			return
+		}
+		if a.ActionID == ActionChatRunCancel {
+			c.cancelRun(ctx, a, user.ID, runID)
+		} else {
+			c.editCardLinked(ctx, a, "Dismissed — the run was not cancelled.", "", "")
 		}
 	}
 }
@@ -284,6 +304,19 @@ func (c *ChatActions) startRun(ctx context.Context, a BlockAction, userID uuid.U
 	}
 	base, _ := c.baseURL(ctx)
 	c.editCardLinked(ctx, a, "▶️ Run started.", runURL(base, runID), "View the run")
+}
+
+// cancelRun cancels the card's target run via the owner-only SubmitInput(cancel) and
+// edits the card to the outcome. A refusal (foreign/terminal run) is surfaced with a
+// user-safe reason from the adapter. The run_id is untrusted — SubmitInput re-resolves
+// ownership + terminality, so a forged value cancels nothing the presser can't cancel.
+func (c *ChatActions) cancelRun(ctx context.Context, a BlockAction, userID, runID uuid.UUID) {
+	if err := c.svc.CancelRunFromCard(ctx, userID, runID); err != nil {
+		c.ephemeral(ctx, a, err.Error())
+		return
+	}
+	base, _ := c.baseURL(ctx)
+	c.editCardLinked(ctx, a, "🛑 Run cancelled.", runURL(base, runID), "View the run")
 }
 
 // createProposal files the proposed issue and edits the card to its outcome. A
@@ -564,4 +597,27 @@ func runRequestCardBlocks(repoPath string, issueIID int64, note string) []slack.
 		slack.NewTextBlockObject(slack.PlainTextType, "Dismiss", false, false))
 
 	return []slack.Block{section, slack.NewActionBlock("slack_chat_run", start, dismiss)}
+}
+
+// cancelRequestCardBlocks builds the cancel-run card (PRD #322): a danger Cancel button
+// (confirm-gated) + Dismiss. Cancelling a run is human-confirmed exactly like Start: a
+// run's activity feed that says "cancel run X" must at most produce a card. The run id
+// is untrusted → scrubbed + escaped + inert.
+func cancelRequestCardBlocks(runID uuid.UUID) []slack.Block {
+	section := slack.NewSectionBlock(
+		slack.NewTextBlockObject(slack.MarkdownType,
+			truncateForSlackSection("*🛑 Cancel this run?*\nRun `"+cardField(runID.String())+"` will be stopped."), false, false), nil, nil)
+	val := runID.String()
+	cancel := slack.NewButtonBlockElement(ActionChatRunCancel, val,
+		slack.NewTextBlockObject(slack.PlainTextType, "Cancel run", false, false))
+	cancel.Style = slack.StyleDanger
+	cancel.Confirm = slack.NewConfirmationBlockObject(
+		slack.NewTextBlockObject(slack.PlainTextType, "Cancel this run?", false, false),
+		slack.NewTextBlockObject(slack.PlainTextType, "The run will stop as soon as the worker sees the cancel. This can't be undone.", false, false),
+		slack.NewTextBlockObject(slack.PlainTextType, "Cancel run", false, false),
+		slack.NewTextBlockObject(slack.PlainTextType, "Keep running", false, false),
+	)
+	dismiss := slack.NewButtonBlockElement(ActionChatRunCancelDismiss, val,
+		slack.NewTextBlockObject(slack.PlainTextType, "Dismiss", false, false))
+	return []slack.Block{section, slack.NewActionBlock("slack_chat_run_cancel", cancel, dismiss)}
 }

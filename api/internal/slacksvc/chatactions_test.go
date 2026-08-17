@@ -41,6 +41,9 @@ type fakeChatActionSubmitter struct {
 	startedRun uuid.UUID
 	startErr   error
 
+	cancels   []endCall
+	cancelErr error
+
 	ends         []endCall
 	endErr       error
 	continues    []endCall
@@ -73,6 +76,10 @@ func (f *fakeChatActionSubmitter) DismissProposalForUser(_ context.Context, user
 func (f *fakeChatActionSubmitter) StartRunFromCard(_ context.Context, userID uuid.UUID, repoPath string, issueIID int64) (uuid.UUID, error) {
 	f.starts = append(f.starts, startCall{userID, repoPath, issueIID})
 	return f.startedRun, f.startErr
+}
+func (f *fakeChatActionSubmitter) CancelRunFromCard(_ context.Context, userID, runID uuid.UUID) error {
+	f.cancels = append(f.cancels, endCall{userID, runID})
+	return f.cancelErr
 }
 func (f *fakeChatActionSubmitter) EndChat(_ context.Context, userID, runID uuid.UUID) error {
 	f.ends = append(f.ends, endCall{userID, runID})
@@ -317,6 +324,46 @@ func TestRunRequestFrameMalformedPostsNothing(t *testing.T) {
 	}
 }
 
+// A cancel_request run message posts a Cancel/Dismiss card, threaded in the conversation,
+// carrying the target run id (PRD #322).
+func TestCancelRequestFramePostsCard(t *testing.T) {
+	runID := uuid.New()
+	targetRun := uuid.New()
+	fp := &fakePoster{}
+	n := NewNotifier(chatMsgStore(runID), fp, fixedBase, nil)
+
+	feed(n, runID, frame("cancel_request", `{"run_id":"`+targetRun.String()+`"}`))
+
+	if len(fp.blocks) != 1 {
+		t.Fatalf("want one card, got %+v", fp.blocks)
+	}
+	card := fp.blocks[0]
+	if card.thread != "user1" {
+		t.Errorf("card must thread on root_ts, got %q", card.thread)
+	}
+	ids := strings.Join(card.actionIDs, ",")
+	if !strings.Contains(ids, ActionChatRunCancel) || !strings.Contains(ids, ActionChatRunCancelDismiss) {
+		t.Errorf("card must carry Cancel + Dismiss, got %v", card.actionIDs)
+	}
+	if !strings.Contains(card.sectionText, targetRun.String()) {
+		t.Errorf("card should name the target run id: %q", card.sectionText)
+	}
+}
+
+// A malformed cancel_request (missing/invalid run_id) posts no card.
+func TestCancelRequestFrameMalformedPostsNothing(t *testing.T) {
+	runID := uuid.New()
+	fp := &fakePoster{}
+	n := NewNotifier(chatMsgStore(runID), fp, fixedBase, nil)
+
+	feed(n, runID, frame("cancel_request", `{"run_id":"not-a-uuid"}`))
+	feed(n, runID, frame("cancel_request", `{}`))
+
+	if len(fp.blocks) != 0 {
+		t.Fatalf("a malformed cancel_request must post no card, got %+v", fp.blocks)
+	}
+}
+
 // Start routes to the ownership-scoped StartRunFromCard and, on success, edits the card
 // to "run started" with the run link. The value carries (repo_path, issue_iid).
 func TestChatActionStartRun(t *testing.T) {
@@ -373,6 +420,84 @@ func TestChatActionRunDismiss(t *testing.T) {
 
 func lifecyclePress(actionID string, runID uuid.UUID) BlockAction {
 	return BlockAction{SlackUserID: "Uauth", ActionID: actionID, Value: runID.String(), ChannelID: "D1", MessageTS: "status1"}
+}
+
+// cancelCardPress builds a cancel-run card press: the value is the bare run id (PRD #322).
+func cancelCardPress(actionID string, runID uuid.UUID) BlockAction {
+	return BlockAction{SlackUserID: "Uauth", ActionID: actionID, Value: runID.String(), ChannelID: "D1", MessageTS: "card1"}
+}
+
+// A Cancel press routes to the ownership-scoped CancelRunFromCard and, on success, edits
+// the card button-free to the cancelled outcome. The value carries the bare run id.
+func TestChatActionCancelRun(t *testing.T) {
+	user := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	sub := &fakeChatActionSubmitter{}
+	fp := &fakePoster{}
+	c := NewChatActions(&fakeChatActionStore{user: user}, sub, fp, fixedBase, nil)
+
+	c.HandleBlockAction(context.Background(), cancelCardPress(ActionChatRunCancel, runID))
+
+	if len(sub.cancels) != 1 || sub.cancels[0].runID != runID || sub.cancels[0].userID != user.ID {
+		t.Fatalf("cancel mis-routed: %+v", sub.cancels)
+	}
+	if len(fp.updateBlocks) != 1 || len(fp.updateBlocks[0].actionIDs) != 0 {
+		t.Fatalf("card should be edited button-free on cancel, got %+v", fp.updateBlocks)
+	}
+	if !strings.Contains(strings.ToLower(fp.updateBlocks[0].sectionText), "run cancelled") {
+		t.Errorf("resolved card should say the run was cancelled: %q", fp.updateBlocks[0].sectionText)
+	}
+}
+
+// A refused Cancel (a foreign/terminal run) surfaces the user-safe message as an
+// ephemeral and leaves the card pressable.
+func TestChatActionCancelRunRefused(t *testing.T) {
+	sub := &fakeChatActionSubmitter{cancelErr: errors.New("That run has already finished.")}
+	fp := &fakePoster{}
+	c := NewChatActions(&fakeChatActionStore{user: store.User{ID: uuid.New()}}, sub, fp, fixedBase, nil)
+
+	c.HandleBlockAction(context.Background(), cancelCardPress(ActionChatRunCancel, uuid.New()))
+
+	if len(fp.updateBlocks) != 0 {
+		t.Errorf("a refused cancel must not edit the card, got %+v", fp.updateBlocks)
+	}
+	if len(fp.ephemerals) != 1 || !strings.Contains(fp.ephemerals[0].text, "already finished") {
+		t.Fatalf("want the refusal reason as an ephemeral, got %+v", fp.ephemerals)
+	}
+}
+
+// A malformed (non-UUID) cancel value calls nothing and posts nothing.
+func TestChatActionCancelRunMalformedValue(t *testing.T) {
+	sub := &fakeChatActionSubmitter{}
+	fp := &fakePoster{}
+	c := NewChatActions(&fakeChatActionStore{user: store.User{ID: uuid.New()}}, sub, fp, fixedBase, nil)
+
+	c.HandleBlockAction(context.Background(), BlockAction{
+		SlackUserID: "Uauth", ActionID: ActionChatRunCancel, Value: "not-a-uuid", ChannelID: "D1", MessageTS: "card1",
+	})
+
+	if len(sub.cancels) != 0 {
+		t.Errorf("a malformed value must reach no submitter call, got %+v", sub.cancels)
+	}
+	if len(fp.updateBlocks) != 0 || len(fp.ephemerals) != 0 {
+		t.Fatalf("a malformed value must post nothing: edits=%v eph=%v", fp.updateBlocks, fp.ephemerals)
+	}
+}
+
+// Dismiss on a cancel card cancels nothing and just edits the card away.
+func TestChatActionCancelRunDismiss(t *testing.T) {
+	sub := &fakeChatActionSubmitter{}
+	fp := &fakePoster{}
+	c := NewChatActions(&fakeChatActionStore{user: store.User{ID: uuid.New()}}, sub, fp, fixedBase, nil)
+
+	c.HandleBlockAction(context.Background(), cancelCardPress(ActionChatRunCancelDismiss, uuid.New()))
+
+	if len(sub.cancels) != 0 {
+		t.Errorf("dismiss must cancel no run, got %+v", sub.cancels)
+	}
+	if len(fp.updateBlocks) != 1 {
+		t.Fatalf("dismiss should edit the card, got %+v", fp.updateBlocks)
+	}
 }
 
 // End routes to EndChat and edits the status message to an "ending" state.
