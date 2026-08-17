@@ -6,7 +6,27 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-08-17
+
 ### Added
+
+- **Run queue priority: interactive runs claim ahead of background
+  retrospection, with a manual expedite (PRD #320).** On a saturated worker pool,
+  interactive runs (issue, ci_fix) are now claimed before background runs (judge,
+  self_improve), and any queued run can be bumped to the front with a new
+  owner-only **Expedite** action (`uzi run expedite <id>`, or the button on the
+  Runs list and run page). An age-based fail-open (`RUN_BACKGROUND_GRACE`, default
+  15m) guarantees a demoted run can never starve: once it has waited past the
+  grace it is restored to normal priority. This is ordering only, never
+  eligibility, and the Kanban board is unchanged. Adds migration
+  `00130_run_priority.sql`. (PRD #320)
+
+- **A run's planning phase is now visually distinct from its running phase
+  (#321).** Before a plan is approved a run showed the same "running" badge it
+  shows while implementing; it now reads "planning" (a new indigo tone) until the
+  implement loop begins. The distinction is derived server-side from existing
+  columns (no new status value, no migration) and renders consistently on the
+  board, the Runs list, the run view, and the CLI. (#321)
 
 - **Cancel and steer a run from Chat and Slack, human-gated (#322).** Both chat
   surfaces can now stop a live run or send it a follow-up instruction without
@@ -23,6 +43,15 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   message explaining that a chat's follow-ups go through the conversation
   itself.
 
+### Changed
+
+- **Routine dependency and CI-image bumps.** The `alpine` (to 3.24) and
+  `alpine/helm` (to 3.21.3) CI base images, and the `tsx`, `postcss`, and
+  `autoprefixer` dev dependencies, were bumped to their current releases.
+- **Doc-link hygiene in archived PRDs.** Repaired broken relative links (mockup
+  and ADR references) across 16 `prds/done/*.md` files, left dangling when those
+  PRDs were moved a directory deeper.
+
 ### Fixed
 
 - **Intermittent `test:web` failure `No "ApiError" export is defined on the
@@ -38,6 +67,13 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   mock client imports the two runtime values from the leaves, making the graph
   acyclic. A deterministic guard test (`mocks/api-acyclic.test.ts`) fails if any
   mock-graph file reintroduces a runtime edge to the barrel.
+
+- **Flaky agent wall-clock tests under CI load (#162).** Two agent tests
+  (batcher-poison backoff, steering epoch) depended on real elapsed time and
+  failed under runner CPU contention. They now drive a deterministic timer pump
+  and event-driven waits instead of wall-clock deadlines, exercising the same
+  batcher-backoff and steering-epoch behavior without the timing sensitivity.
+  (#162)
 
 ## [0.41.0] - 2026-08-16
 
