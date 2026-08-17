@@ -33,6 +33,9 @@ inspiration
 api/server
 api/uzi
 *.test
+# golangci-lint on-disk cache — regenerated on every lint run; was accidentally
+# tracked (4757 blobs) until the public-migration hygiene pass removed it.
+.golangci-cache/
 
 # Editor / OS
 .DS_Store
