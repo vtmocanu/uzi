@@ -42,7 +42,7 @@ const PrdLabelColor = "#2da160"
 
 // DefaultColumns are the kanban columns seeded on the forge (as labels) the
 // first time a repo's board is opened, in board order. Colors are required by
-// GitLab's label create API. In Progress / Later come from the common-board
+// GitLab's label create API. In Progress / Later come from a common board
 // reference set; Human Review (PRD #12) is where the automation parks a card when
 // its run COMPLETES, and sits directly after In Progress.
 //
