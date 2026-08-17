@@ -22,7 +22,7 @@
 #
 #   includes:
 #     brew:
-#       taskfile: "{{if .CI}}https://raw.githubusercontent.com/vtmocanu/task/main/homebrew-tap.yml{{else}}~/repos/gh/vtmocanu/task/homebrew-tap.yml{{end}}"
+#       taskfile: "{{if .CI}}https://raw.githubusercontent.com/vtmocanu/task/main/homebrew-tap.yml{{else}}/path/to/task/homebrew-tap.yml{{end}}"
 #       vars:
 #         NAME: my-tool                    # binary / formula file name
 #         GH_REPO: youruser/my-tool        # owner/repo the release tarball comes from

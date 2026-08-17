@@ -86,7 +86,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the system shape, [prds/](prds/) for 
 
 ## Contributing
 
-Internal project; see [plan.md](plan.md) for direction and `prds/` for active work.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines, [plan.md](plan.md) for direction, and `prds/` for active work.
 
 ## License
 

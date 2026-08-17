@@ -12915,8 +12915,8 @@ migration.
   ```
   kube-system/kube-controller-manager-…-lkzzq      1 restart     Ready = finishedAt + 23s
   kube-system/kube-controller-manager-…-vvmxm      1 restart     Ready = finishedAt + 13s
-  prod-apps/legacy-web-app-…      115 restarts  Ready = finishedAt +  2s
-  cloud-provider-system/guest-cluster-…     1 restart     Ready = finishedAt +  1s
+  prod-apps/legacy-web-app-…                       115 restarts  Ready = finishedAt +  2s
+  cloud-provider-system/guest-cluster-…            1 restart     Ready = finishedAt +  1s
   ```
 
   In all four the transition sits 1 to 23 seconds after `lastState.terminated.finishedAt` and never
