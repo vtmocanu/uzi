@@ -532,9 +532,9 @@ describe("priorityBadge (queue priority → pill, PRD #320 D8)", () => {
     expect(b?.title).toMatch(/front of the queue/i);
   });
 
-  it("restored → a queue-toned 'Restored' pill (past the grace)", () => {
+  it("restored → a warning-toned 'Restored' pill (past the grace)", () => {
     const b = priorityBadge("restored");
-    expect(b).toMatchObject({ label: "Restored", tone: "queue" });
+    expect(b).toMatchObject({ label: "Restored", tone: "warning" });
     expect(b?.title).toMatch(/no longer yielding/i);
   });
 

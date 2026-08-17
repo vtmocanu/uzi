@@ -116,7 +116,13 @@ export function isStoppedRun(
 // runStatusTone/healthBadge use, so the wording and tone live in one place. Tones come
 // from the BadgeTone union above and follow its taxonomy: `background` is neutral (a
 // run stepping back, muted grey), `expedited` is info (an emphasis pill for a run that
-// jumped ahead), `restored` is queue (it is back competing in the queued family).
+// jumped ahead), `restored` is warning (the fail-open rescued it from starvation — a
+// "this waited past the grace" attention state). `restored` deliberately does NOT reuse
+// `queue`: in the default (ember) theme --queue-* and --neutral-* alias the same
+// muted/edge/raised tokens, so a queue-toned Restored pill would be pixel-identical to
+// the neutral Deprioritized pill AND to the adjacent queued status pill — the three-way
+// distinction only materialized in the mission theme. `warning` is a tinted tone,
+// distinct from both in every theme.
 //
 // Returns null for `normal` AND for an ABSENT value (a pre-#320 api omits the field —
 // api.ts: absent MUST read as normal), so an ordinary queued row stays quiet and no
@@ -141,7 +147,7 @@ export function priorityBadge(
     case "restored":
       return {
         label: "Restored",
-        tone: "queue",
+        tone: "warning",
         title: "No longer yielding — it waited past the background grace.",
       };
     default:
