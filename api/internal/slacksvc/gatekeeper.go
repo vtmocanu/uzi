@@ -84,6 +84,15 @@ type PlanGateSubmitter interface {
 	// translates the two user-facing sentinels so the replier can say which happened:
 	// ErrChatTurnCapReached (the cap) and ErrChatEnded (a terminal conversation).
 	SubmitChatMessage(ctx context.Context, userID, runID uuid.UUID, message string) error
+
+	// SteerRunFromCard submits a Slack steer reply as a follow_up to the TARGET issue run
+	// of an armed pending steer (PRD #322 M4), via the owner-only SubmitInput(follow_up).
+	// The target run_id came from an untrusted card value → SubmitInput re-resolves
+	// ownership, terminality, and the chat-vs-issue kind server-side. On refusal it
+	// returns an error whose MESSAGE is user-safe (built from the run sentinels in main,
+	// mirroring StartRunFromCard/CancelRunFromCard), so the replier surfaces a helpful
+	// line without importing workersvc.
+	SteerRunFromCard(ctx context.Context, userID, runID uuid.UUID, message string) error
 }
 
 // Gatekeeper handles the Slack approval-gate buttons (PRD #25 M4): Approve,

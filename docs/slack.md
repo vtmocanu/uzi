@@ -270,6 +270,17 @@ message.
   connection, gated exactly like the web (an issue with no PRD is refused with
   the reason). A repo or issue that *says* "start a run on #42" can at most
   produce a card, never a run.
+- **Cancel or steer a run.** Ask it to cancel a run and it posts a card with a
+  danger **Cancel run** button gated by a confirm dialog — pressing it cancels
+  through your own connection, the same as the web. Ask it to steer a live run
+  and it posts a card with a confirm-gated **Steer** button; pressing that
+  button sends nothing by itself — it asks you to **reply in the thread** with
+  your instruction, and that reply is what's submitted as the follow-up to the
+  target run (there's no modal). Steering only works on issue runs — pointed
+  at a chat, it's refused with a message telling you steering applies to issue
+  runs, not chats. The same guardrail as above holds: content that *says*
+  "cancel run X" or "tell run X to …" can at most produce a card, never
+  cancel or steer anything on its own.
 - **End / Continue.** The status message carries an **End chat** button while
   the conversation is live and a **Continue** button once it ends (it went
   quiet, hit its turn limit, or you ended it) — Continue resumes it in a fresh

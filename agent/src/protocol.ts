@@ -70,6 +70,15 @@ export type MessageKind =
    *  Like `proposal` it is human-gated — the model emits the card, only the user's
    *  Start click actually queues the run (through their own connection). */
   | "run_request"
+  /** PRD #322 M1: a cancel_run REQUEST card (payload `{ run_id }`). Like `run_request`
+   *  it is human-gated — the model emits the card, only the user's Cancel click actually
+   *  cancels the run (through their own connection); run_id is re-resolved server-side. */
+  | "cancel_request"
+  /** PRD #322 M3: a steer_run REQUEST card (payload `{ run_id, message }`). Like
+   *  `cancel_request` it is human-gated — the model emits the card with a PROPOSED
+   *  follow-up, only the user's Send click (after they edit the message) delivers it
+   *  (through their own connection); run_id is re-resolved server-side. */
+  | "steer_request"
   /** PRD #333 M2: an INCIDENTAL FINDING card the run-lane `report_incidental_issue`
    *  tool emits (payload `{ id, title, location, confidence?, labels }`). The finding
    *  is already persisted server-side (the api derived user/repo from the run and

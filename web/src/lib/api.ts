@@ -2178,6 +2178,22 @@ export interface RunRequest {
   title?: string;
 }
 
+// CancelRequest is the payload of a `cancel_request`-kind run message (PRD #322): the
+// chat agent's REQUEST to cancel a live run. run_id is UNTRUSTED and re-resolved
+// server-side; nothing is cancelled until the human's Cancel click.
+export interface CancelRequest {
+  run_id: string;
+}
+
+// SteerRequest is the payload of a `steer_request`-kind run message (PRD #322): the
+// chat agent's PROPOSED follow-up to steer a live issue run. run_id + message are
+// untrusted; nothing is sent until the human reviews/edits the message and clicks Send,
+// which routes to SubmitInput(follow_up) server-side.
+export interface SteerRequest {
+  run_id: string;
+  message: string;
+}
+
 // runSocketUrl builds the same-origin WebSocket URL for a run. The HttpOnly auth
 // cookie rides along automatically (same origin through nginx); Origin==Host is
 // enforced server-side against cross-site hijacking.
@@ -3060,6 +3076,14 @@ const realApi = {
       repo_path: repoPath,
       issue_iid: issueIid,
     }),
+  // Cancel a run from a chat's cancel card (PRD #322). 202: SubmitInput(cancel),
+  // owner-scoped and terminality-guarded server-side. run_id is untrusted.
+  cancelRunFromChat: (runId: string) =>
+    request<{ server_side: boolean }>("POST", "/chats/cancel-requests", { run_id: runId }),
+  // Steer a run from a chat's steer card (PRD #322). 202: SubmitInput(follow_up),
+  // owner-scoped + terminality-guarded server-side; a chat-run target is refused 409.
+  steerRunFromChat: (runId: string, message: string) =>
+    request<{ server_side: boolean }>("POST", "/chats/steer-requests", { run_id: runId, message }),
 
   adminListWorkers: () =>
     request<{ workers: AdminWorker[] }>("GET", "/admin/workers"),

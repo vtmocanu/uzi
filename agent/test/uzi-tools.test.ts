@@ -263,6 +263,111 @@ describe("uzi tool — start_run (PRD #191 M5)", () => {
   });
 });
 
+describe("uzi tool — cancel_run (PRD #322 M1)", () => {
+  it("emits a cancel_request CARD and cancels nothing (no server round-trip, no write)", async () => {
+    const { client, calls } = fakeClient();
+    const { h, emits } = handlersWith(client, "chat-current");
+    const res = await h.cancelRun({ run_id: "run-42" });
+
+    assert.strictEqual(calls.createProposal.length, 0, "cancel_run makes no mutating call — the click does");
+    assert.deepStrictEqual(calls.getChatRun, [], "cancel_run makes no server round-trip at all");
+    assert.strictEqual(emits.length, 1, "exactly one card emitted");
+    const card = emits[0]!;
+    assert.strictEqual(card.kind, "cancel_request");
+    assert.deepStrictEqual(card.payload, { run_id: "run-42" });
+    assert.match(bodyText(res), /NOT cancelled yet/);
+    assert.match(bodyText(res), /click Cancel run/);
+  });
+
+  it("trims the run id before emitting", async () => {
+    const { client } = fakeClient();
+    const { h, emits } = handlersWith(client);
+    await h.cancelRun({ run_id: "  run-7  " });
+    assert.strictEqual(emits.length, 1);
+    assert.deepStrictEqual(emits[0]!.payload, { run_id: "run-7" });
+  });
+
+  it("asks for the run id instead of guessing when it is blank (no card)", async () => {
+    const { client } = fakeClient();
+    const { h, emits } = handlersWith(client);
+    const res = await h.cancelRun({ run_id: "   " });
+    assert.strictEqual(emits.length, 0, "no card without a run id");
+    assert.strictEqual(res.isError, true);
+    assert.match(bodyText(res), /needs its run id/);
+  });
+});
+
+describe("uzi tool — steer_run (PRD #322 M3)", () => {
+  it("emits a steer_request CARD carrying run_id AND message, and steers nothing (no server round-trip, no write)", async () => {
+    const { client, calls } = fakeClient();
+    const { h, emits } = handlersWith(client, "chat-current");
+    const res = await h.steerRun({ run_id: "run-42", message: "focus on the auth path" });
+
+    assert.strictEqual(calls.createProposal.length, 0, "steer_run makes no mutating call — the Send click does");
+    assert.deepStrictEqual(calls.getChatRun, [], "steer_run makes no server round-trip at all");
+    assert.strictEqual(emits.length, 1, "exactly one card emitted");
+    const card = emits[0]!;
+    assert.strictEqual(card.kind, "steer_request");
+    assert.deepStrictEqual(card.payload, { run_id: "run-42", message: "focus on the auth path" });
+    assert.match(bodyText(res), /NOT sent yet/);
+    assert.match(bodyText(res), /click Send/);
+  });
+
+  it("trims the run id and message before emitting", async () => {
+    const { client } = fakeClient();
+    const { h, emits } = handlersWith(client);
+    await h.steerRun({ run_id: "  run-7  ", message: "  do the thing  " });
+    assert.strictEqual(emits.length, 1);
+    assert.deepStrictEqual(emits[0]!.payload, { run_id: "run-7", message: "do the thing" });
+  });
+
+  it("asks for the run id and message instead of guessing when either is blank (no card)", async () => {
+    const { client } = fakeClient();
+    const { h, emits } = handlersWith(client);
+
+    const noMsg = await h.steerRun({ run_id: "run-9", message: "   " });
+    assert.strictEqual(emits.length, 0, "no card without a message");
+    assert.strictEqual(noMsg.isError, true);
+    assert.match(bodyText(noMsg), /needs its run id and a follow-up message/);
+
+    const noRun = await h.steerRun({ run_id: "  ", message: "keep going" });
+    assert.strictEqual(emits.length, 0, "no card without a run id");
+    assert.strictEqual(noRun.isError, true);
+    assert.match(bodyText(noRun), /needs its run id and a follow-up message/);
+  });
+});
+
+describe("human-gating guarantee — every run-write tool only PROPOSES (PRD #322 M5)", () => {
+  // The load-bearing prompt-injection defense (Decision D2/D5): the chat agent reads
+  // untrusted run output (get_run_messages), so a run-affecting WRITE it could perform
+  // directly would be an injection vector. `start_run`, `cancel_run` and `steer_run`
+  // must therefore be structurally unable to write — they emit a card and the human's
+  // click performs the state change (re-resolved server-side). This locks that guarantee
+  // as ONE regression across all three tools together.
+  //
+  // The assertion is on the WRITE method (`createProposal`, the only mutating handler on
+  // the tool client), NOT on "no server call": cancel_run/steer_run are explicitly
+  // ALLOWED to do a read (get_run) for card copy in future, which is a read-only server
+  // call. What must never happen is a mutating call from the tool handler itself.
+  const runWriteTools: Array<{ name: string; kind: string; invoke: (h: ReturnType<typeof makeUziToolHandlers>) => Promise<unknown> }> = [
+    { name: "start_run", kind: "run_request", invoke: (h) => h.startRun({ repo_path: "group/project", issue_iid: 42 }) },
+    { name: "cancel_run", kind: "cancel_request", invoke: (h) => h.cancelRun({ run_id: "run-42" }) },
+    { name: "steer_run", kind: "steer_request", invoke: (h) => h.steerRun({ run_id: "run-42", message: "focus on the auth path" }) },
+  ];
+
+  for (const tool of runWriteTools) {
+    it(`${tool.name} emits a ${tool.kind} card and makes NO mutating call`, async () => {
+      const { client, calls } = fakeClient();
+      const { h, emits } = handlersWith(client, "chat-current");
+      await tool.invoke(h);
+
+      assert.strictEqual(calls.createProposal.length, 0, `${tool.name} must never write — the human click does`);
+      assert.strictEqual(emits.length, 1, `${tool.name} emits exactly one proposal card`);
+      assert.strictEqual((emits[0] as EmittedMessage).kind, tool.kind);
+    });
+  }
+});
+
 describe("uzi tool wiring", () => {
   it("exposes the qualified tool names under the `uzi` server", () => {
     assert.strictEqual(UZI_TOOLS_SERVER_NAME, "uzi");
@@ -272,6 +377,8 @@ describe("uzi tool wiring", () => {
       "mcp__uzi__get_run_messages",
       "mcp__uzi__propose_issue",
       "mcp__uzi__start_run",
+      "mcp__uzi__cancel_run",
+      "mcp__uzi__steer_run",
     ]);
   });
 });
