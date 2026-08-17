@@ -239,12 +239,9 @@ the run touched — and the repo you're filing into may not be the one the text
 came from. Before filing, uzi fences the untrusted text, strips anything that
 looks like a GitLab quick-action, and scans for known secret shapes (GitLab
 tokens, AWS keys, PEM private keys, and more). That scan is best-effort
-defense-in-depth, not a guarantee: reading the draft is still the real
-control. Known gaps that survive the scan un-redacted today include npm
-tokens (`npm_…`), Stripe-style secret keys (`sk_live_…`), GCP service-account
-JSON, SSH public keys, userinfo-style basic-auth in a URL, and a bare
-40-character AWS secret key. Read the draft before you click Create; don't
-file text you haven't looked at.
+defense-in-depth, not a guarantee: it recognizes common token shapes but is
+not exhaustive, so reading the draft is still the real control. Read the
+draft before you click Create; don't file text you haven't looked at.
 
 Re-running the judge on an already-filed recommendation doesn't refile it —
 the existing link is kept, and if the new verdict changed the recommendation,
