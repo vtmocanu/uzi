@@ -1,13 +1,17 @@
 # uzi CI gate (ported from the retired GitLab pipeline, PRD #103 / #230).
 #
-# THIS WORKFLOW IS GATE-ONLY: validate + lint + test across the four toolchains
-# (Go api, Go controller, Vite/React web, Node agent) plus repo-wide checks and a
-# Helm lint/template. It builds NO images, uses NO secrets, and runs NO release
-# logic -- image builds and publishing land in later workflows.
+# THIS WORKFLOW IS THE PR/main GATE: validate + lint + test across the four
+# toolchains (Go api, Go controller, Vite/React web, Node agent), repo-wide checks,
+# a Helm lint/template, and -- on pull requests, path-filtered -- `push:false` image
+# VALIDATION builds (does each Dockerfile still build?). It pushes NO images, uses
+# NO secrets, and runs NO release logic: image publishing + the chart/brew release
+# land in release.yml, and the KinD smoke in e2e.yml.
 #
 # R1 TRUST BOUNDARY: these jobs must run clean on an untrusted (fork) PR with zero
 # secret exposure. Hence top-level `permissions: contents: read` (a read-only
-# GITHUB_TOKEN), no `secrets:`, no `environment:`, and no `pull_request_target`.
+# GITHUB_TOKEN), no `secrets:`, no `environment:`, and no `pull_request_target`. The
+# image-validation builds are `push:false` and touch no registry, so they add no
+# secret and no write scope -- the boundary is unchanged.
 #
 # Each job runs the SAME leaf `task` targets the GitLab gate jobs ran -- one job
 # per gate, flat parallelism (no `needs:` between them), mirroring GitLab's
@@ -388,3 +392,131 @@ jobs:
           helm template uzi deploy/chart --set workers.enabled=true --set api.tls.enabled=true --set workers.docker.enabled=true --set workers.docker.networkPolicy.enabled=true >/dev/null
           # (3) docker on + explicit acknowledgeUnfenced opt-out -> renders fine.
           helm template uzi deploy/chart --set workers.enabled=true --set api.tls.enabled=true --set workers.docker.enabled=true --set workers.docker.networkPolicy.acknowledgeUnfenced=true >/dev/null
+
+  # ------------------------------------------------ PR image validation ----
+  # `push:false` buildx builds proving each Dockerfile still builds (the retired
+  # kaniko `--no-push` jobs, PRD #230). PULL-REQUEST ONLY and path-filtered: the
+  # heavy builds (agent especially) run only when their inputs change. They touch NO
+  # registry and NO secrets, so the R1 trust boundary is unchanged. On push to main
+  # the real images are built by e2e.yml (api/web) and by release.yml (tags); this
+  # section is pure pre-merge validation.
+  #
+  # `changes` runs on PRs and exposes one boolean per component; each build job gates
+  # on its own flag AND on that component's validate/test/lint gates, so a broken
+  # source never reaches a (slow) image build.
+  changes:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      api: ${{ steps.filter.outputs.api }}
+      web: ${{ steps.filter.outputs.web }}
+      controller: ${{ steps.filter.outputs.controller }}
+      agent: ${{ steps.filter.outputs.agent }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            api:
+              - 'api/**'
+            web:
+              - 'web/**'
+              - 'docs/**'
+            controller:
+              - 'controller/**'
+            agent:
+              - 'agent/**'
+              - '.dockerignore'
+              - '.github/workflows/ci.yml'
+
+  build-api:
+    runs-on: ubuntu-latest
+    needs: [changes, validate-api, test-api, lint-api]
+    if: needs.changes.outputs.api == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: api
+          file: api/Dockerfile
+          push: false
+          platforms: linux/amd64
+          tags: uzi-api:pr
+
+  # Context is the repo ROOT: web/Dockerfile COPYs both web/ and docs/.
+  build-web:
+    runs-on: ubuntu-latest
+    needs: [changes, validate-web, test-web]
+    if: needs.changes.outputs.web == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: web/Dockerfile
+          push: false
+          platforms: linux/amd64
+          tags: uzi-web:pr
+
+  # The backend-free demo/mock SPA image (web/Dockerfile.mock, PRD #311 M1). Same
+  # inputs as build-web; validation-only, never published.
+  build-web-mock:
+    runs-on: ubuntu-latest
+    needs: [changes, validate-web, test-web]
+    if: needs.changes.outputs.web == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: web/Dockerfile.mock
+          push: false
+          platforms: linux/amd64
+          tags: uzi-web-mock:pr
+
+  build-controller:
+    runs-on: ubuntu-latest
+    needs: [changes, validate-controller, test-controller, lint-controller]
+    if: needs.changes.outputs.controller == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: controller
+          file: controller/Dockerfile
+          push: false
+          platforms: linux/amd64
+          tags: uzi-controller:pr
+
+  # One job per template (base, jvm). Context is the repo ROOT (the image bakes uzi's
+  # own source at /opt/uzi-src); buildx honours the per-Dockerfile
+  # agent/templates/<t>/Dockerfile.dockerignore and auto-populates TARGETARCH, so
+  # unlike the retired kaniko jobs no --build-arg TARGETARCH is needed.
+  build-agent:
+    runs-on: ubuntu-latest
+    needs: [changes, validate-agent, test-agent]
+    if: needs.changes.outputs.agent == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        template: [base, jvm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: agent/templates/${{ matrix.template }}/Dockerfile
+          push: false
+          platforms: linux/amd64
+          build-args: |
+            UZI_SRC_SHA=${{ github.sha }}
+          tags: uzi-agent-${{ matrix.template }}:pr

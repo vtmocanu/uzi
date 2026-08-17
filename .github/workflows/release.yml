@@ -1,0 +1,290 @@
+# uzi release: build + push the images and the Helm chart to GHCR on a `v*` tag
+# (ported from the retired GitLab `publish:*` jobs, PRD #58 / #113 / #175 / #230).
+#
+# TRIGGER: `v*` tags only. A release is cut by tagging a commit already on main (which
+# ci.yml gated). release.yml re-runs the two RELEASE-SPECIFIC gates -- assert-version
+# and assert-changelog -- before any push; a mismatch there blocks every publish.
+#
+#   ATOMICITY NOTE (differs from GitLab). The GitLab pipeline ran the full lint/test
+#   gate set IN THE SAME tag pipeline, so a failing test blocked the push. GitHub does
+#   not run ci.yml on tags and cannot `needs:` another workflow's jobs, so the heavy
+#   gates are NOT re-run here -- they are assumed green on the main commit being
+#   tagged. If we ever want true single-pipeline atomicity, make ci.yml
+#   `workflow_call`-able and add it as a `needs:` job below.
+#
+# TRUST BOUNDARY: read-only default token; the only writes are `packages: write`
+# (GHCR, via the built-in GITHUB_TOKEN) granted per-job. Every publish job declares
+# `environment: release`, so once the repo can carry environment protection rules
+# (blocked on the current Free/private plan) a required-reviewer / `v*`-only rule gates
+# all publishing at once. No `pull_request` job reads these scopes; never
+# `pull_request_target`.
+#
+# Model B: the git tag `vX.Y.Z` normalizes to `X.Y.Z` (== chart version/appVersion,
+# asserted below); images push at `:X.Y.Z` and `:<short-sha>`; the chart pushes at its
+# Chart.version. The chart publishes LAST, after every image, so ArgoCD (tracking the
+# chart) never rolls a workload to an image tag that does not exist yet.
+#
+# NOT YET HERE: the Homebrew `publish_brew` job. It is coupled to the Formula tarball
+# rework (release-asset url + sha256) that is the next migration step, and today's
+# Formula/uzi-cli.rb still carries a placeholder git source -- so brew publishing lands
+# with that rework rather than pushing a non-installable formula now.
+
+name: Release
+
+# Quoted so yamllint's `truthy` rule does not read the key as the boolean `on`.
+"on":
+  push:
+    tags: ["v*"]
+
+# Read-only by default; publish jobs widen to `packages: write` themselves.
+permissions:
+  contents: read
+
+# Never cancel a release mid-push.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Normalized version + short sha + an RFC3339 build timestamp, computed once and
+  # consumed by every image job.
+  prep:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      short_sha: ${{ steps.v.outputs.short_sha }}
+      built_at: ${{ steps.v.outputs.built_at }}
+    steps:
+      - id: v
+        run: |
+          set -euo pipefail
+          {
+            echo "version=${GITHUB_REF_NAME#v}"
+            echo "short_sha=${GITHUB_SHA:0:7}"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+
+  # Reject a tag that is not clean SemVer, and require Chart.yaml version/appVersion to
+  # equal it (Model B). Every publish job `needs` this, so a bad tag blocks all pushes.
+  assert-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate SemVer tag + Chart.yaml match
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          # Official SemVer BNF for the parts validated: no leading zeros, no fourth
+          # .component, no +build (an OCI tag may not contain '+'). Same pattern the
+          # GitLab assert-version used; GNU grep here, so -E behaves.
+          if ! printf '%s' "$TAG" | grep -Eq '^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$'; then
+            echo "ERROR: release tag '$TAG' is not valid SemVer (expected vX.Y.Z or X.Y.Z, optional -prerelease; no leading zeros, no fourth .component, no +build)." >&2
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          CHART_VERSION="$(awk '/^version:/{gsub(/"/,"",$2); print $2}' deploy/chart/Chart.yaml)"
+          CHART_APPVERSION="$(awk '/^appVersion:/{gsub(/"/,"",$2); print $2}' deploy/chart/Chart.yaml)"
+          echo "git tag=$TAG  normalized VERSION=$VERSION  Chart.version=$CHART_VERSION  Chart.appVersion=$CHART_APPVERSION"
+          if [ "$CHART_VERSION" != "$VERSION" ] || [ "$CHART_APPVERSION" != "$VERSION" ]; then
+            echo "ERROR (Model B): deploy/chart/Chart.yaml version/appVersion must equal the release tag ($VERSION). Bump Chart.yaml and re-tag that commit." >&2
+            exit 1
+          fi
+
+  # The CHANGELOG must describe the release; also computes the build-info counts the
+  # api image stamps into GET /api/version (commit count + prds done/open).
+  assert-changelog:
+    runs-on: ubuntu-latest
+    outputs:
+      commit_count: ${{ steps.counts.outputs.commit_count }}
+      prds_done: ${{ steps.counts.outputs.prds_done }}
+      prds_open: ${{ steps.counts.outputs.prds_open }}
+    steps:
+      # Full history + tags: the script compares the release window against the
+      # previous `v*` tag, and the commit count is over all of history.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Changelog covers release
+        run: bash scripts/assert-changelog-covers-release.sh "${GITHUB_REF_NAME}"
+      - name: Compute build-info counts
+        id: counts
+        run: |
+          set -euo pipefail
+          # Each value is shape-guarded numeric before it becomes a build-arg (it is
+          # expanded into an -ldflags string; a non-numeric would corrupt the build).
+          N="$(git rev-list --count HEAD)"
+          case "$N" in ''|*[!0-9]*) echo "ERROR: commit count '$N' is not numeric" >&2; exit 1;; esac
+          DONE="$(find prds/done -maxdepth 1 -name '*.md' | wc -l | tr -d ' ')"
+          OPEN="$(find prds -maxdepth 1 -name '*.md' | wc -l | tr -d ' ')"
+          case "$DONE" in ''|*[!0-9]*) echo "ERROR: PRD done count '$DONE' is not numeric" >&2; exit 1;; esac
+          case "$OPEN" in ''|*[!0-9]*) echo "ERROR: PRD open count '$OPEN' is not numeric" >&2; exit 1;; esac
+          {
+            echo "commit_count=$N"
+            echo "prds_done=$DONE"
+            echo "prds_open=$OPEN"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------- images ----
+  # buildx builds on the runner and pushes to GHCR. provenance:false keeps the pushed
+  # tag a single plain image manifest (no attestation index), matching the chart's
+  # simple {repo}:{tag} image references. platforms: linux/amd64 -- amd64-only for now.
+
+  publish-api:
+    runs-on: ubuntu-latest
+    needs: [prep, assert-version, assert-changelog]
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: api
+          file: api/Dockerfile
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          tags: |
+            ghcr.io/vtmocanu/uzi/api:${{ needs.prep.outputs.version }}
+            ghcr.io/vtmocanu/uzi/api:${{ needs.prep.outputs.short_sha }}
+          # main.version/commit/builtAt/commits/prdsDone/prdsOpen (PRD #175). The
+          # Dockerfile strips a leading v from UZI_VERSION; every other stamp degrades
+          # to absent (server-side gated) if unset.
+          build-args: |
+            UZI_VERSION=${{ github.ref_name }}
+            UZI_COMMIT=${{ github.sha }}
+            UZI_BUILT_AT=${{ needs.prep.outputs.built_at }}
+            UZI_COMMIT_COUNT=${{ needs.assert-changelog.outputs.commit_count }}
+            UZI_PRDS_DONE=${{ needs.assert-changelog.outputs.prds_done }}
+            UZI_PRDS_OPEN=${{ needs.assert-changelog.outputs.prds_open }}
+
+  publish-web:
+    runs-on: ubuntu-latest
+    needs: [prep, assert-version, assert-changelog]
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Context is the repo ROOT: web/Dockerfile COPYs both web/ and docs/.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: web/Dockerfile
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          tags: |
+            ghcr.io/vtmocanu/uzi/web:${{ needs.prep.outputs.version }}
+            ghcr.io/vtmocanu/uzi/web:${{ needs.prep.outputs.short_sha }}
+
+  publish-controller:
+    runs-on: ubuntu-latest
+    needs: [prep, assert-version, assert-changelog]
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: controller
+          file: controller/Dockerfile
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          tags: |
+            ghcr.io/vtmocanu/uzi/controller:${{ needs.prep.outputs.version }}
+            ghcr.io/vtmocanu/uzi/controller:${{ needs.prep.outputs.short_sha }}
+
+  # Per-template worker images. Destination is <prefix>/agent-<template>, which is what
+  # makes the chart's workers.image.repository (ghcr.io/vtmocanu/uzi) + the controller's
+  # "/agent-<template>:<tag>" resolve to a real GHCR repo. Keep the matrix equal to
+  # api/internal/workertmpl.Names.
+  publish-agent:
+    runs-on: ubuntu-latest
+    needs: [prep, assert-version, assert-changelog]
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        template: [base, jvm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Context is the repo ROOT (the image bakes uzi's source at /opt/uzi-src);
+      # buildx honours agent/templates/<t>/Dockerfile.dockerignore. UZI_AGENT_VERSION
+      # keeps the leading v (the Dockerfile strips it) and carries +g<short-sha> build
+      # metadata; SemVer excludes build metadata from precedence, so the reported
+      # version still classifies as the release.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: agent/templates/${{ matrix.template }}/Dockerfile
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          tags: |
+            ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:${{ needs.prep.outputs.version }}
+            ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:${{ needs.prep.outputs.short_sha }}
+          build-args: |
+            UZI_SRC_SHA=${{ github.sha }}
+            UZI_AGENT_VERSION=${{ github.ref_name }}+g${{ needs.prep.outputs.short_sha }}
+
+  # ----------------------------------------------------------------- chart ----
+  # Package + push the Helm chart as an OCI artifact, LAST (after every image), so
+  # ArgoCD never rolls a workload to a not-yet-pushed image tag. Lands at
+  # oci://ghcr.io/vtmocanu/uzi/uzi:<Chart.version>.
+  publish-chart:
+    runs-on: ubuntu-latest
+    needs: [assert-version, assert-changelog, publish-api, publish-web, publish-controller, publish-agent]
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.21.3
+      - name: helm registry login (GHCR)
+        # --password-stdin keeps the token out of the process argv.
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Package + push chart
+        run: |
+          set -euo pipefail
+          # helm dependency build vendors the CNPG `cluster` subchart (Chart.lock) into
+          # the package, so the published OCI artifact is self-contained for ArgoCD.
+          helm dependency build deploy/chart
+          helm package deploy/chart -d /tmp/chart
+          helm push /tmp/chart/uzi-*.tgz oci://ghcr.io/vtmocanu/uzi
