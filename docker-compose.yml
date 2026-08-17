@@ -411,7 +411,7 @@ services:
   #      (Decision 3) — not the socket mode — is the containment, so 0666 is acceptable.
   #   The loop re-applies 0666 so a `dind` restart (new socket inode) stays reachable.
   dind-init:
-    image: alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+    image: alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
     profiles: ["agent-docker"]
     # Runs as root (default) — the chown/chmod of a root-owned volume needs it.
     # SECURITY (auditor LOW): `0711` on /run/dind is deliberate, not lax — others get
