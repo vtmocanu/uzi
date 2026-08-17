@@ -3,7 +3,7 @@
 **Issue**: [#244](https://gitlab.example.com/vtmocanu/uzi/-/issues/244) · **Label**: PRD · **Priority**: Medium
 **Parent**: [#235](https://gitlab.example.com/vtmocanu/uzi/-/issues/235) (the label filter itself) — this is the follow-up its Decision 6 named.
 **Area**: a new `/me/judge/category-stats` aggregate — `api/internal/store/queries/dispositions.sql` (a sibling of `ListJudgeTriageRowsForUser`), `api/internal/workersvc/judge_disposition.go` (a `JudgeCategoryStats` method beside `JudgeTriageStats`), `api/internal/handler/judge_stats.go` (a sibling handler) + route (`handler.go` `/me/judge` group), `api/internal/apitypes/review.go` (a new DTO) + `api/internal/apitypes/wire_test.go` (its pinned tag test) · `web/src/lib/api.ts` (`getJudgeCategoryStats` + TS type), `web/src/pages/Judge.tsx` (render the count on each chip), `web/src/mocks/mockApi.ts` (parity).
-**Mockup**: [`prds/mockups/235-judge-label-filter-mock.html`](mockups/235-judge-label-filter-mock.html) — the parent's mockup already draws the count badge (`.chip .n`, `countFor(cat)` at `:275`). This PRD ships what that badge illustrated.
+**Mockup**: [`prds/mockups/235-judge-label-filter-mock.html`](../mockups/235-judge-label-filter-mock.html) — the parent's mockup already draws the count badge (`.chip .n`, `countFor(cat)` at `:275`). This PRD ships what that badge illustrated.
 **Line references** are against `f9306c8e`.
 **Status**: done — implemented 2026-08-08 (#244, all milestones M1–M3 complete). Design reviewed 2026-08-08 (see [Review findings](#review-findings)); verdict sound-with-fixes, fixes folded in.
 

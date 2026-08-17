@@ -11,7 +11,7 @@
 >
 > **Two findings were split out rather than fixed here**: [#180](https://gitlab.example.com/vtmocanu/uzi/-/issues/180) (the CLI renders server-supplied strings raw, ESC sequences included — house-wide, `uzi version` was only the command under review) and [#181](https://gitlab.example.com/vtmocanu/uzi/-/issues/181) (`specs/ai.md` has §403-§416 buried mid-file, invisible to the tail-based sweep its own numbering rule prescribes).
 **Priority**: Low — nothing is broken. `GET /api/version` works and the footer renders it. This buys instance-debuggability ("what exactly is deployed on dev-cluster right now") and a small amount of project identity.
-**Mockup**: [`prds/mockups/175-build-info-popover-mock.html`](mockups/175-build-info-popover-mock.html) — four surfaces mocked in uzi's own `ember`/`mission` chrome. Variant A (badge popover) is the one this PRD implements; the other three are kept in the file deliberately, as the record of what was rejected and why.
+**Mockup**: [`prds/mockups/175-build-info-popover-mock.html`](../mockups/175-build-info-popover-mock.html) — four surfaces mocked in uzi's own `ember`/`mission` chrome. Variant A (badge popover) is the one this PRD implements; the other three are kept in the file deliberately, as the record of what was rejected and why.
 
 > Reviewed against `7bb07572` on 2026-07-27 by a fact-checker and an architect before first commit. Between them they refuted five factual claims and reshaped the milestone graph. Corrections are folded in; the ones that changed a *decision* rather than a sentence are marked **(revised)** in the Decision Log.
 

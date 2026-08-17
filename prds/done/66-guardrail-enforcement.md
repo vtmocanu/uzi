@@ -1,7 +1,7 @@
 # PRD #66: Refuse runs when the bot can push or merge to the default branch
 
 **GitLab Issue**: [#66](https://gitlab.example.com/vtmocanu/uzi/-/issues/66)
-**Status**: **Done** (created 2026-07-17; split out of [PRD #65](done/65-forgejo-support.md) mid-session, on the architect's escalation, once it was clear this is a GitLab behaviour change with no Forgejo content in it; extended 2026-08-12 at the user's direction with the admin per-repo override — D8, M8–M9; all nine milestones landed and reviewed 2026-08-13)
+**Status**: **Done** (created 2026-07-17; split out of [PRD #65](65-forgejo-support.md) mid-session, on the architect's escalation, once it was clear this is a GitLab behaviour change with no Forgejo content in it; extended 2026-08-12 at the user's direction with the admin per-repo override — D8, M8–M9; all nine milestones landed and reviewed 2026-08-13)
 
 **As-built close-out (2026-08-13).** All milestones shipped. One operational item is
 NOT a code deliverable and remains for the operator at rollout: M3's *impact count* —

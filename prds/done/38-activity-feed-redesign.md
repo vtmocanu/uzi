@@ -4,7 +4,7 @@
 **Status**: Implemented on `feature/prd-38-activity-feed-redesign` (2026-07-10) — all 7 milestones done; per-milestone review + audit + web-ux browser pass complete, findings resolved. Design-review provenance: reviewed by 2 agents pre-implementation (↳review marks where the design changed).
 **Priority**: Medium
 **Created**: 2026-07-10
-**Mockup**: [prds/mockups/38-activity-feed-mock.html](mockups/38-activity-feed-mock.html) — approved by the user; the implemented UI must be visually compared against it (M6). Interactive: result chips expand/collapse, long commands clamp with "Show full command", agent blocks collapse from the header chevron.
+**Mockup**: [prds/mockups/38-activity-feed-mock.html](../mockups/38-activity-feed-mock.html) — approved by the user; the implemented UI must be visually compared against it (M6). Interactive: result chips expand/collapse, long commands clamp with "Show full command", agent blocks collapse from the header chevron.
 **Origin**: UX review (web-ux agent, 2026-07-10) of a real run's activity feed; all findings below verified against source at review time, re-verified in M-level tests.
 
 ## Problem

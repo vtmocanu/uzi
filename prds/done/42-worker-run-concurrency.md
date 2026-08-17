@@ -5,7 +5,7 @@
 **Priority**: Medium
 **Created**: 2026-07-10
 **Depends on**: PRD #4 (worker runtime + run machinery, done). **Coupled to**: PRD #39 (chat agent) — its Decision 4 requires exactly the concurrency substrate this PRD builds; M1/M2 here are prerequisites of #39's chat lane and must not be duplicated there.
-**Research inputs**: three-agent investigation 2026-07-10 — codebase assumption map, prior-art sweep (multica, bottega, dot-agent-deck), industry-practice survey (CI runners, queue workers, AI coding-agent platforms). Findings folded into [ADR-42](../adr/0042-worker-run-concurrency.md).
+**Research inputs**: three-agent investigation 2026-07-10 — codebase assumption map, prior-art sweep (multica, bottega, dot-agent-deck), industry-practice survey (CI runners, queue workers, AI coding-agent platforms). Findings folded into [ADR-42](../../adr/0042-worker-run-concurrency.md).
 
 ## Problem
 
@@ -23,13 +23,13 @@ We need to decide, on purpose: may a worker execute multiple runs concurrently, 
 
 **A worker may execute multiple runs concurrently, bounded by a slot semaphore with a low default cap of 1 (`WORKER_MAX_CONCURRENT_RUNS`), after the per-run isolation gaps in the worker process are closed. The server deliberately does NOT enforce 1:1 worker:run, but the worker advertises its cap at registration for observability (↳review). Scale-out (more workers per user) remains the primary parallelism mechanism; scale-up (N slots per worker) is a supported, opt-in configuration whose intra-user security residuals are documented honestly below — the full isolation story (uid-split / container-per-run) belongs to the future k8s-operator deployment, where each ephemeral pod is a single-slot worker.**
 
-The full reasoning, alternatives, and evidence are in [ADR-42](../adr/0042-worker-run-concurrency.md) (summarized below).
+The full reasoning, alternatives, and evidence are in [ADR-42](../../adr/0042-worker-run-concurrency.md) (summarized below).
 
 ---
 
 ## Architecture Decision Record
 
-The full ADR — context (codebase assumption map, prior-art table, industry survey), the reconciling argument and its honest limits, options A/A′/B/C/D with rationale, decision, and consequences — lives at **[adr/0042-worker-run-concurrency.md](../adr/0042-worker-run-concurrency.md)** (ADR-42). The short version:
+The full ADR — context (codebase assumption map, prior-art table, industry survey), the reconciling argument and its honest limits, options A/A′/B/C/D with rationale, decision, and consequences — lives at **[adr/0042-worker-run-concurrency.md](../../adr/0042-worker-run-concurrency.md)** (ADR-42). The short version:
 
 - **Chosen (Option A)**: bounded N-per-worker via a worker-side slot semaphore, default cap 1, cap advertised at registration for observability (never enforced server-side).
 - **Rejected**: Option A′ (no cap advertisement — kills the saturation-visibility story), Option B (server-enforced 1:1 — blocks PRD #39, contradicts all prior art, encodes scaling policy in the schema), Option D (unbounded — bottega's model, no backpressure).
