@@ -1,6 +1,6 @@
 # PRD #316: UX tweaks — sidebar collapse toggle, schedules caret, runs search/grouping/paging
 
-**GitLab Issue**: [#316](https://gitlab.example.com/vtmocanu/uzi/-/issues/316)
+**GitLab Issue**: [#316](https://github.com/vtmocanu/uzi/-/issues/316)
 **Status**: DONE — merged to `main` (merge commit `d0375a0b`, 2026-08-14) and released as `v0.37.0`. M1–M8 complete: reviewed (reviewer + auditor + web-ux, no blockers; 5 non-blocking fixes applied), specs synced (`specs/ai.md` §490/§504/§531 + `specs/human.md`), merged, deployed via ArgoCD to dev-cluster.
 **Priority**: Medium
 **Branch / worktree**: `feature/ux-tweaks` @ `302ca7c1` (base `main` @ `cf312c33`, 0.36.0), 6 commits, +1176/-235 across 11 files. Worktree `/home/user/repos/myorg/uzi-ux-tweaks`.
@@ -44,7 +44,7 @@ Three UX rough edges flagged from the live UI (`uzi.example.com`):
 
 ## Current status (end of session 2026-08-14)
 
-The build milestones (M1–M6) are **built and verified in the mock**, and M7 (enhancements) is **decided** (E1/E2/E3/E4/E6 kept, E5 dropped). Nothing is on `main` except this PRD. The implementation is on `feature/ux-tweaks` @ `302ca7c1`, open as **Draft MR !293** (`https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/293`). `task gate:web` on the tip shows exactly 2 failed / 2032 passed — both the pre-existing `AuthContext.test.tsx:55` failures (see below), no others. What remains is review, a `specs/ai.md` sync, merge, and deploy — all for the next session. The `ux-designer` mock server (`:5197`) is stopped; a new session restarts it (see Live review below).
+The build milestones (M1–M6) are **built and verified in the mock**, and M7 (enhancements) is **decided** (E1/E2/E3/E4/E6 kept, E5 dropped). Nothing is on `main` except this PRD. The implementation is on `feature/ux-tweaks` @ `302ca7c1`, open as **Draft MR !293** (`https://github.com/vtmocanu/uzi/-/merge_requests/293`). `task gate:web` on the tip shows exactly 2 failed / 2032 passed — both the pre-existing `AuthContext.test.tsx:55` failures (see below), no others. What remains is review, a `specs/ai.md` sync, merge, and deploy — all for the next session. The `ux-designer` mock server (`:5197`) is stopped; a new session restarts it (see Live review below).
 
 ## Next steps (next-session playbook)
 

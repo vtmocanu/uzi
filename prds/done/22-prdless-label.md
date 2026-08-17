@@ -1,6 +1,6 @@
 # PRD #22: PRDLESS Label — Run Issues Without a PRD Link
 
-**GitLab Issue**: [#22](https://gitlab.example.com/vtmocanu/uzi/-/issues/22)
+**GitLab Issue**: [#22](https://github.com/vtmocanu/uzi/-/issues/22)
 **Status**: Complete (merged to main 2026-07-06, MR !24)
 **Priority**: Medium
 **Created**: 2026-07-05

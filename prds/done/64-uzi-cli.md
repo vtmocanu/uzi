@@ -1,6 +1,6 @@
 # PRD #64: uzi CLI — terminal control of the factory for humans and agents
 
-**GitLab Issue**: [#64](https://gitlab.example.com/vtmocanu/uzi/-/issues/64)
+**GitLab Issue**: [#64](https://github.com/vtmocanu/uzi/-/issues/64)
 **Status**: Complete (implemented 2026-07-17, merged to main 2026-07-18 via MR !67; all 11 milestones landed, reviewed, and live-validated)
 **Priority**: Medium
 **Created**: 2026-07-17
@@ -570,7 +570,7 @@ path anyway, so it would be a second mechanism, not a replacement.
 - **Cannot clobber `~/.claude/commands/`**: the write path is a compile-time constant joined to
   `os.UserHomeDir()` with **no user-supplied component**, so no traversal is expressible; it never
   enumerates or writes `commands/`. Measured: the two trees are disjoint on a real machine
-  (skills → `find-skills`; commands → the dot-ai set).
+  (skills → `find-skills`; commands → the sibling-app set).
 - **Drift control**: a test asserts every command/flag the SKILL.md documents exists in the cobra
   tree. This is multica's `references/*-source-map.md` idea done **mechanically** instead of by
   hand — possible for us precisely because our skill documents our own CLI.
@@ -890,7 +890,7 @@ M5; M8 is the join, since `uzi login` needs M5's endpoints and M7's client.)
 2. **Consumers need read access to `vtmocanu/uzi`, and installing clones the whole product source.**
    This **knowingly departs** from example-app's documented property (*"consumers need NO credentials …
    and no access to the private example-app repo"* — it vendors its script into the tap). Accepted by the
-   user: everyone in `vtmocanu` has group read. Homebrew does not fetch submodules unless asked, so
+   user: everyone in `myorg` has group read. Homebrew does not fetch submodules unless asked, so
    `inspiration/` stays out. The `uzi-cli-<version>` tap tag is **informational only** — the
    download pin is uzi's `v*` tag. The tap README must say this, since it contradicts the model it
    documents for example-app.

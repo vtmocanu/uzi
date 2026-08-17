@@ -1,6 +1,6 @@
 # PRD #293: Gate honesty — a run must not red a gate it never touched, green a gate it never ran, or read a failed shell command as success
 
-**GitLab Issue**: [vtmocanu/uzi#293](https://gitlab.example.com/vtmocanu/uzi/-/issues/293)
+**GitLab Issue**: [vtmocanu/uzi#293](https://github.com/vtmocanu/uzi/-/issues/293)
 **Status**: Partially implemented on branch `agent/issue-293` (2026-08-10) — M1 (documented boundary + passthrough test), M3 (graceful-skip), M4 (tests) and M5 (docs) are done; M2 shipped as annotate-on-`js_deps` (the approved narrowed scope), with declared-gate reconciliation deferred, so this PRD stays open. See **Delivery status** below. (Originally: Draft, reviewed 2026-08-10; two independent code-verified reviews folded in.)
 **Priority**: Medium (recurring run-quality tax; one member seen in 3 runs, two at `confidence: medium`)
 **Created**: 2026-08-10

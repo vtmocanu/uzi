@@ -1,6 +1,6 @@
 # PRD #28: Docs Search — Client-side Full-text Search on /docs
 
-**GitLab Issue**: [vtmocanu/uzi#28](https://gitlab.example.com/vtmocanu/uzi/-/issues/28)
+**GitLab Issue**: [vtmocanu/uzi#28](https://github.com/vtmocanu/uzi/-/issues/28)
 **Status**: Complete (2026-07-09). All milestones done; review + audit + web-ux browser validation clean; specs synced (ai.md a564c97, human.md 62e3238, user-approved); merged to main via MR !30.
 **Priority**: Medium
 **Created**: 2026-07-09

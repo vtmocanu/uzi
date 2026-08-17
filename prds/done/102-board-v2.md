@@ -1,6 +1,6 @@
 # PRD #102: Board v2 — column rename, label chips, sorting + manual ordering, non-PRD issues
 
-**GitLab Issue**: [#102](https://gitlab.example.com/vtmocanu/uzi/-/issues/102)
+**GitLab Issue**: [#102](https://github.com/vtmocanu/uzi/-/issues/102)
 **Status**: Complete (merged 2026-07-28 via MR !142, `7b02b1a0`; released as `v0.12.0` and deployed to dev-cluster. M7's interactive board walkthrough deferred to the user.)
 **Priority**: Medium
 

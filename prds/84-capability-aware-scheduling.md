@@ -1,6 +1,6 @@
 # PRD #84: Capability-aware run scheduling & plan-gate — match runs to workers that can run them
 
-**GitLab Issue**: [#84](https://gitlab.example.com/vtmocanu/uzi/-/issues/84)
+**GitLab Issue**: [#84](https://github.com/vtmocanu/uzi/-/issues/84)
 **Status**: Draft (created 2026-07-18)
 **Priority**: Medium
 **Depends on**: PRD #4 (run state machine + claim protocol — `queued → claimed → running → awaiting_approval → running`, and the `FOR UPDATE SKIP LOCKED` claim this PRD adds a predicate to); PRD #18 (worker templates + the declared/reported self-report this PRD promotes from observability to a scheduling input, and the devbox tool tiers whose "provisionable" set the gate must subtract); PRD #41 (plan-revision gate — the approval surface this PRD extends).

@@ -1,11 +1,11 @@
 # PRD #50: LLM egress proxy — per-run opaque credential, Anthropic token never leaves the api
 
-**GitLab Issue**: [#50](https://gitlab.example.com/vtmocanu/uzi/-/issues/50)
+**GitLab Issue**: [#50](https://github.com/vtmocanu/uzi/-/issues/50)
 **Status**: Draft — reviewed 2026-07-12 by 3 agents (design, security, fact-check); all blocking/major findings folded in below (marked ↳review where the design changed). Fact-check: 25/25 claims verified.
 **Priority**: Medium (k8s/remote-worker phase; see #36 "Later")
 **Created**: 2026-07-12
 **Depends on**: PRD #32 (vault, done), PRD #4 (runs/claim/sweeper, done). Synergy: PRD #40 (token usage reporting — the proxy sees every usage block on the wire).
-**Umbrella**: issue [#36](https://gitlab.example.com/vtmocanu/uzi/-/issues/36) (protect worker credentials in use on k8s), option B. This PRD is the only control in #36 that protects the Anthropic token; the uid-split pod (option A) covers join token + PAT but explicitly not this credential.
+**Umbrella**: issue [#36](https://github.com/vtmocanu/uzi/-/issues/36) (protect worker credentials in use on k8s), option B. This PRD is the only control in #36 that protects the Anthropic token; the uid-split pod (option A) covers join token + PAT but explicitly not this credential.
 
 ## Problem
 

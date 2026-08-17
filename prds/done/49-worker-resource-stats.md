@@ -1,6 +1,6 @@
 # PRD #49: Worker resource stats — live CPU/memory per worker, portable across compose and k8s
 
-**GitLab Issue**: [#49](https://gitlab.example.com/vtmocanu/uzi/-/issues/49)
+**GitLab Issue**: [#49](https://github.com/vtmocanu/uzi/-/issues/49)
 **Status**: In progress — M1–M3 + M5 implemented & validated, M4 (docs/specs)
 pending; 2026-07-14. Reviewed 2026-07-12 by 3 agents (design, security, fact-check);
 all blocking/major findings folded in below (marked ↳review where the design

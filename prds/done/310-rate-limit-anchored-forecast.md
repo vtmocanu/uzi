@@ -1,6 +1,6 @@
 # PRD #310 — Rate-limit forecast: anchored always-on model + reset-time label
 
-**Issue**: [#310](https://gitlab.example.com/vtmocanu/uzi/-/issues/310)
+**Issue**: [#310](https://github.com/vtmocanu/uzi/-/issues/310)
 **Priority**: Medium (operability improvement to an existing surface; no correctness or security impact; web-only)
 **Supersedes**: the window-model decision of PRD #309 (`prds/done/309-rate-limit-forecast.md`) and its record in `specs/ai.md §523`.
 **Design reference**: the #309 forecast mock (the "resets <Day HH:MM>" line under each token name and the "Utilization & Forecast" column come from it).

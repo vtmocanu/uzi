@@ -1,6 +1,6 @@
 # PRD #315: Web UX information-architecture restructure — Workers as a first-class page, tabbed Admin, split Settings, chosen sidebar meters
 
-**GitLab Issue**: [vtmocanu/uzi#315](https://gitlab.example.com/vtmocanu/uzi/-/issues/315)
+**GitLab Issue**: [vtmocanu/uzi#315](https://github.com/vtmocanu/uzi/-/issues/315)
 **Status**: Complete (2026-08-14) — retroactive PRD; the work shipped on branch `feature/ux-ia-restructure` (see the feature branch tip) and is documented here as implemented.
 **Priority**: Medium
 **Created**: 2026-08-14

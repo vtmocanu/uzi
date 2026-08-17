@@ -1,7 +1,7 @@
 # Issue #201 — M4a: the builtin drift signal
 
 **Status:** design-critique wave, not yet implemented.
-**Branch:** `fix/201-builtin-drift`, worktree `/home/user/repos/myorg/vtmocanu/uzi/prd-201`. **Was** based on origin/main `25ebcd39`; merged `origin/main` at `c3704d25`, and is now **0 behind** (`git rev-list --count HEAD..origin/main` = 0). Citations below are at `25ebcd39` unless stated.
+**Branch:** `fix/201-builtin-drift`, worktree `/home/user/repos/vtmocanu/uzi/prd-201`. **Was** based on origin/main `25ebcd39`; merged `origin/main` at `c3704d25`, and is now **0 behind** (`git rev-list --count HEAD..origin/main` = 0). Citations below are at `25ebcd39` unless stated.
 **Spec of record:** this file. Issue #201's body states the problem; its newest comment
 (note_22449, 2026-08-03) is the settled design for the whole of #201. **This file scopes
 M4a only.** Corrections amend this file with a dated entry under `## Amendments`; messages

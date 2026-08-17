@@ -1,6 +1,6 @@
 # PRD #51: Worker/agent uid-split — contain the same-uid token-file read
 
-**GitLab Issue**: [#51](https://gitlab.example.com/vtmocanu/uzi/-/issues/51)
+**GitLab Issue**: [#51](https://github.com/vtmocanu/uzi/-/issues/51)
 **Status**: Draft (created 2026-07-13 as the containment follow-up to PRD #46; revised after design review + security audit + fact-check the same day; re-reviewed 2026-07-16 by parallel design / security-audit / fact-check agents — the mechanism-feasibility, bare-cache-ownership, and hardened-git findings below are folded in and **must be resolved at the M1 gate**)
 **Priority**: Medium
 **Depends on**: PRD #46 (surfaced/documented this residual), PRD #18 (worker image / devbox provisioning), `docs/proc-hardening.md` (the remote-worker/uid-split design this implements).

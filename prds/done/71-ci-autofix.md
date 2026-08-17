@@ -1,6 +1,6 @@
 # PRD #71: Automatic CI-fix for failed pipelines (opt-in, loop-guarded)
 
-**GitLab Issue**: [vtmocanu/uzi#71](https://gitlab.example.com/vtmocanu/uzi/-/issues/71)
+**GitLab Issue**: [vtmocanu/uzi#71](https://github.com/vtmocanu/uzi/-/issues/71)
 **Status**: **Implemented — 2026-08-10** (all seven milestones M1–M7 landed on branch `agent/issue-71`; moved to `prds/done/`). Prior: Draft (reviewed — Opus architecture + fact-check pass, 2026-07-17; drift review 2026-08-10 — two-agent fact-check/research pass re-verified all extension points live and folded staleness fixes below: migration head, forge-driver fan-out, `notifysvc` spelling, PRD #70/#158 landings)
 **Priority**: Medium
 **Created**: 2026-07-17

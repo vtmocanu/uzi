@@ -1,6 +1,6 @@
 # PRD #218 — A usage-limit park loses the agent's work
 
-**Issue**: [#218](https://gitlab.example.com/vtmocanu/uzi/-/issues/218) · **Label**: PRD · **Priority**: High
+**Issue**: [#218](https://github.com/vtmocanu/uzi/-/issues/218) · **Label**: PRD · **Priority**: High
 **Area**: `agent/src/runner.ts` (the park path and the cleanup carve-out) · `agent/src/git.ts` (`runnerCloneForBranch`, `fetchAgentBranch`) · `specs/ai.md` + `prds/done/35-run-limit-retry.md` (M5) · `adr/0035-run-limit-retry.md` (**M6 only** — see M5 for why it is not an M5 site).
 **Line references** are against `136d976a`.
 **Status**: COMPLETE. M1-M5 shipped in 0.15.0 (MR1, branch `218`: commits
@@ -73,7 +73,7 @@ seq 2589/2590: the new clone's reflog holds exactly two entries (`clone:` then
 `fatal: Not a valid object name`. The objects are **gone from the store**, not
 merely unreferenced.
 
-`glab api projects/vtmocanu%2Fexample-app/repository/branches?search=agent/issue-78`
+`glab api projects/myorg%2Fexample-app/repository/branches?search=agent/issue-78`
 returns nothing, and the run row carries `branch: null`, `mr_iid: null`. So the
 reseed took the default-branch leg, which is also why the roster moved from 8 to
 10: the run resumed onto two hours of newer `main` it had never seen.
@@ -163,7 +163,7 @@ query nobody will be able to run in a month: `.claude/agents/` holds exactly **8
 files at `a38f7421` and exactly **10** at `65496d0e` (the additions are
 `release.md` and `researcher.md`, named in `65496d0e`'s own commit message), which
 corroborates the feed's 8→10 roster and "a different, newer `main`" from a primary
-source. `glab api projects/vtmocanu%2Fexample-app/repository/commits/65496d0e` and
+source. `glab api projects/myorg%2Fexample-app/repository/commits/65496d0e` and
 `…/branches?search=agent/issue-78` (which returns `[]`) are the two calls.
 
 **M3 — say it either way.** A resume that recovers prior work should say how much;
@@ -222,7 +222,7 @@ clone was destroyed, recreated at the same path, and the session still resolved
       on the re-claim. `requeue_count` went to 1 while `limit_wait_count` stayed
       at 1 — so this was a total loss with **no usage limit involved at all**, on
       a run whose credential had 85% headroom. Filed as
-      [#224](https://gitlab.example.com/vtmocanu/uzi/-/issues/224).
+      [#224](https://github.com/vtmocanu/uzi/-/issues/224).
 
       Three facts make this tractable rather than a separate design problem, and
       each was checked rather than assumed:
@@ -423,7 +423,7 @@ clone was destroyed, recreated at the same path, and the session still resolved
   and are independent: #217 is about *which token* the resume spends, this is
   about *what tree* it resumes onto. Neither blocks the other.
 - **Steering-channel staleness — real, measured, and NOT a risk of this fix.**
-  Tracked as [#222](https://gitlab.example.com/vtmocanu/uzi/-/issues/222); this
+  Tracked as [#222](https://github.com/vtmocanu/uzi/-/issues/222); this
   bullet stays the canonical write-up and that issue points back at it. A
   follow-up queued while a run is parked is drained by `pullFollowUp`
   (`sdk-executor.ts:1048`) inside the implement loop, after the reseed's `fs.rm`,

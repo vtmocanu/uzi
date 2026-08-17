@@ -1,6 +1,6 @@
 # PRD #307: Flip run status back to `running` after a plan-phase clarification is answered
 
-**Issue**: [#307](https://gitlab.example.com/vtmocanu/uzi/-/issues/307)
+**Issue**: [#307](https://github.com/vtmocanu/uzi/-/issues/307)
 **Priority**: High (parked runs report a false state to every surface; the web page actively advises cancelling a healthy run)
 **Status**: Planned
 **Anchor**: root-cause references below are against `main` @ `ce654073`.

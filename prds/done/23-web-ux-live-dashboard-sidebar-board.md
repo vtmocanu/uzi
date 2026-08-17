@@ -1,6 +1,6 @@
 # PRD #23: Web UX polish — live dashboard, collapsible sidebar, hide empty board columns
 
-**GitLab Issue**: [vtmocanu/uzi#23](https://gitlab.example.com/vtmocanu/uzi/-/issues/23)
+**GitLab Issue**: [vtmocanu/uzi#23](https://github.com/vtmocanu/uzi/-/issues/23)
 **Status**: Complete (2026-07-05, MR !16)
 **Priority**: Medium
 **Created**: 2026-07-05

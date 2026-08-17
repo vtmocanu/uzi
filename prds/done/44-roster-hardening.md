@@ -1,6 +1,6 @@
 # PRD #44: Harden the repo-agent roster report
 
-**GitLab Issue**: [#44](https://gitlab.example.com/vtmocanu/uzi/-/issues/44)
+**GitLab Issue**: [#44](https://github.com/vtmocanu/uzi/-/issues/44)
 **Status**: Complete (2026-07-16; MR !59 merged, issue #44 closed)
 **Priority**: Low (follow-up; three minor robustness gaps from the MR !37 whole-diff review)
 **Depends on**: nothing. PRD #37 (per-run agent selection) is merged.

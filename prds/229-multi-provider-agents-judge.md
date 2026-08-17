@@ -1,6 +1,6 @@
 # PRD #229 — Multi-provider agents + judge (Anthropic, OpenAI/Codex, OpenAI-compatible, self-hosted)
 
-**Issue**: [#229](https://gitlab.example.com/vtmocanu/uzi/-/issues/229) · **Label**: PRD · **Priority**: Medium (strategic, multi-phase)
+**Issue**: [#229](https://github.com/vtmocanu/uzi/-/issues/229) · **Label**: PRD · **Priority**: Medium (strategic, multi-phase)
 **Area**: `agent/src/` (the worker runtime, sole holder of the model harness) · `agent/src/sdk-env.ts` (per-provider credential sandbox) · `agent/src/guardrails.ts` (the deny policy, to be lifted into a provider-neutral contract) · `agent/src/judge-runner.ts` (the judge lane) · `api/internal/workersvc` (claim + sub-run dispatch) · `api/internal/store` (typed secret kinds, provider on runs) · `api/internal/secretbox`/`vault` (per-provider credentials) · `controller/` (provider-pinned pools) · `adr/0229-multi-provider.md` (M0) · `deploy/chart/` + `docs/` (M6).
 **Line references** are against `660c26c0`.
 **Status**: not started. Architectural review complete (see `## Review findings`); user decisions folded into the body below — a **native chat-completions executor is added** (three harnesses, not two — finding 1), **Codex seats are assumed permitted** and the design proceeds with them primary (finding 2, R1), and the **existing Claude path is preserved unchanged** (D0). Findings 3–5 and the missing decisions are settled in M0 before any code.

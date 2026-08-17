@@ -1,6 +1,6 @@
 # PRD #215 — Pipeline the lead's review lane and overlap its integration gate
 
-**Issue**: [#215](https://gitlab.example.com/vtmocanu/uzi/-/issues/215) · **Label**: PRD · **Priority**: High
+**Issue**: [#215](https://github.com/vtmocanu/uzi/-/issues/215) · **Label**: PRD · **Priority**: High
 **Area**: `api/internal/agenttmpl/builtins/lead.md` (the prompt change) · **`api/internal/agenttmpl/render_test.go` (the pins M1/M2 retire — not optional, see M2)** · `api/internal/store/agent_templates_builtins.go` + `api/internal/handler/agent_templates.go` + `api/internal/store/skills_builtins.go` (delivery, M6) · `probes/` + `scripts/` (M0 artifacts) · `docs/` (M8).
 **Line references** are against `d367653b`. `lead.md` was last touched by `6814a174` (2026-08-02).
 **Status**: in progress — the prompt change (M1–M5) and its docs (M8) shipped and

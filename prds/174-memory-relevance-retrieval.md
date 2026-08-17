@@ -1,6 +1,6 @@
 # PRD #174: Relevance-ranked cross-run memory — the READ path stops being "newest 20" (FTS now, pgvector behind it)
 
-**GitLab Issue**: [#174](https://gitlab.example.com/vtmocanu/uzi/-/issues/174)
+**GitLab Issue**: [#174](https://github.com/vtmocanu/uzi/-/issues/174)
 **Status**: Not started (Later). Created 2026-07-27.
 **Priority**: Low — a quality improvement on a shipped capability (PRD #90), not a gap and not a bug. Labelled `Later` deliberately: nothing is broken, the store just gets less useful as it fills.
 **Depends on**: PRD #90 (the store, the write path, the inert nonce-fenced read path, the visibility/purge surfaces). This PRD changes **which** entries get injected and **how they are ranked**; it changes nothing about the trust model.

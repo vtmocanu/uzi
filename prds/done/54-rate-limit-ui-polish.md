@@ -1,6 +1,6 @@
 # PRD #54: Rate-limit meters UI polish (badge escalation, aria-live, --faint contrast)
 
-**GitLab Issue**: [#54](https://gitlab.example.com/vtmocanu/uzi/-/issues/54)
+**GitLab Issue**: [#54](https://github.com/vtmocanu/uzi/-/issues/54)
 **Status**: Done (2026-07-16) — implemented on `feature/prd-54-ui-polish` (`fd81ce8` M1, `d36b997` M2, `6bbd5d4` M3, `e56f109` specs); reviewed clean (reviewer/auditor/fact-checker/web-ux).
 **Priority**: Low
 **Created**: 2026-07-16

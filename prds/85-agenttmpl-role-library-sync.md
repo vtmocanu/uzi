@@ -1,6 +1,6 @@
 # PRD #85: Version-stamp the builtin roles and make library drift detectable
 
-**GitLab Issue**: [#85](https://gitlab.example.com/vtmocanu/uzi/-/issues/85)
+**GitLab Issue**: [#85](https://github.com/vtmocanu/uzi/-/issues/85)
 **Status**: Draft (created 2026-07-21)
 **Priority**: Medium
 **Related**:

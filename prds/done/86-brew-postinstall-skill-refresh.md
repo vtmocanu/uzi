@@ -1,6 +1,6 @@
 # PRD #86: keep the uzi-cli Claude Code skill fresh via an opt-in SessionStart hook
 
-**GitLab Issue**: [#86](https://gitlab.example.com/vtmocanu/uzi/-/issues/86)
+**GitLab Issue**: [#86](https://github.com/vtmocanu/uzi/-/issues/86)
 **Status**: Complete (implemented via MR !76, merged to `main` 2026-07-19 as `85b6895`; all 6 milestones landed; the M1/M6 empirical gate was validated 2026-07-19 — see Validation Results). Scope pivoted 2026-07-19 — see Change History.
 **Priority**: Medium
 **Created**: 2026-07-19
@@ -35,7 +35,7 @@ version bump).
 The only place that can close it is something that runs **in the user's real `$HOME`, at session
 start, before the model reads `SKILL.md`.** The Homebrew formula is not that place (v1, above).
 A **Claude Code `SessionStart` hook** is — it runs in the real session environment before the
-turn begins. (Precedent: this environment already runs a `dot-ai skills generate` SessionStart
+turn begins. (Precedent: this environment already runs a `sibling-app skills generate` SessionStart
 hook whose freshly-generated skills are usable in the same session.)
 
 ## Solution Overview
@@ -69,7 +69,7 @@ v1 — nothing in the brew lifecycle can reach the real `~/.claude` to do it any
 2. **Opt-in via a CLI subcommand.** The user runs `uzi skill install-hook` once; brew only *nudges*
    via `caveats`. We never mutate `settings.json` without an explicit user action.
 3. **Non-clobbering, idempotent `settings.json` merge, with backup.** The file is shared with many
-   unrelated hooks (dot-ai, others). The command parses → merges our single entry → writes, backs
+   unrelated hooks (sibling-app, others). The command parses → merges our single entry → writes, backs
    up to `settings.json.bak` first, identifies our entry by a **stable command string** (settings.json
    is strict JSON, so no marker comment is possible), and **aborts on malformed JSON** instead of
    overwriting. Re-run = no-op.
@@ -102,7 +102,7 @@ v1 — nothing in the brew lifecycle can reach the real `~/.claude` to do it any
   4 matchers (`startup`/`resume`/`clear`/`compact`), 10-min default timeout, and non-zero-exit is
   non-blocking. **Undocumented and load-bearing:** whether a `SessionStart` hook that rewrites
   `~/.claude/skills/uzi-cli/SKILL.md` is picked up **in the same session** before the model reads it.
-  The `dot-ai` precedent generates `~/.claude/commands/*` (slash commands), a *different* surface from
+  The `sibling-app` precedent generates `~/.claude/commands/*` (slash commands), a *different* surface from
   a Skill-tool `SKILL.md`, so it is suggestive, not proof. **Spike:** wire the hook, bump the skill
   version, open a fresh session, observe whether the model sees the new skill. **Go** → build M2–M6 as
   the same-session window-closer. **No-go** (hot-load is next-session-only) → the hook still guarantees
@@ -144,7 +144,7 @@ v1 — nothing in the brew lifecycle can reach the real `~/.claude` to do it any
 - **R2 — Same-session hot-load is undocumented (the v1-shaped risk).** If a hook-refreshed
   `SKILL.md` is only visible next session, the feature does not close the same-session window it
   exists for — it degrades to "guarantees next-session freshness without a `uzi` run," barely above
-  today's self-heal. The docs do not state the ordering, and the `dot-ai` precedent is a *different*
+  today's self-heal. The docs do not state the ordering, and the `sibling-app` precedent is a *different*
   surface (`commands/` vs `skills/`). Mitigation: **M1 is an empirical hard gate with an explicit
   no-go path back to the user** — we do not build on this assumption, we test it first.
   **RESOLVED 2026-07-19** — the M1 spike confirmed same-session hot-load works (see Validation Results).
@@ -178,7 +178,7 @@ to behave identically, since it is the same SessionStart→skill-load ordering.)
 
 **M6 — live merge against a real `settings.json`: PASS.** `uzi skill install-hook` (built from
 `85b6895`, `HOME` pointed at a *copy* of the real 15-event / 4-`SessionStart`-entry `settings.json`)
-added our entry (SessionStart 4→5), preserved every dot-ai / zellaude / clawd / dot-agent-deck hook
+added our entry (SessionStart 4→5), preserved every sibling-app / zellaude / clawd / dot-agent-deck hook
 and every other event, kept the file valid JSON, and wrote a byte-identical `.bak`. `uzi skill status`
 reported `HOOK_INSTALLED true / HOOK_CURRENT true`; a re-run was idempotent ("already present"); and
 `uzi skill uninstall-hook` removed exactly our entry, leaving the document **semantically identical**

@@ -1,6 +1,6 @@
 # PRD #17: Builtin Lead Template (opus) + Worker Model Selection from UI
 
-**GitLab Issue**: [vtmocanu/uzi#17](https://gitlab.example.com/vtmocanu/uzi/-/issues/17)
+**GitLab Issue**: [vtmocanu/uzi#17](https://github.com/vtmocanu/uzi/-/issues/17)
 **Status**: Complete (2026-07-05)
 **Priority**: High
 **Created**: 2026-07-05

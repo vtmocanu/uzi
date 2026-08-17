@@ -1,6 +1,6 @@
 # PRD #158: Forge read tools — let a run check a claim against the forge instead of against the repo's copy of it
 
-**GitLab Issue**: [#158](https://gitlab.example.com/vtmocanu/uzi/-/issues/158)
+**GitLab Issue**: [#158](https://github.com/vtmocanu/uzi/-/issues/158)
 **Status**: Implemented on branch `agent/issue-158` (M0 spike PASS 2026-08-10; **M1–M5 built, tested, and reviewed 2026-08-10; M6 docs done**). The only remaining item is M6's live **acceptance run**, which cannot be performed from the implementation worktree — it is deferred to post-deploy, so this PRD stays here (not moved to `prds/done/`) until that run has happened and been cited. See the milestones and the Decision Log.
 **Priority**: Medium
 

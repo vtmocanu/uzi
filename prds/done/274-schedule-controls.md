@@ -1,9 +1,9 @@
 # PRD #274: Scheduled runs — safer defaults and controls
 
-**GitLab Issue**: [#274](https://gitlab.example.com/vtmocanu/uzi/-/issues/274)
+**GitLab Issue**: [#274](https://github.com/vtmocanu/uzi/-/issues/274)
 **Status**: **Complete** (created 2026-08-09; architect-reviewed 2026-08-09 — blocker + should-fixes folded in; owner resolved both open decisions 2026-08-09: Decision 1 = **1a** (thread + default on), sweep default = **bounded 10**; implemented and landed 2026-08-09, all milestones M1–M5 done)
 **Priority**: Medium
-**Consolidates**: [#271](https://gitlab.example.com/vtmocanu/uzi/-/issues/271) (wait-on-limit default), [#272](https://gitlab.example.com/vtmocanu/uzi/-/issues/272) (sweep cap), [#273](https://gitlab.example.com/vtmocanu/uzi/-/issues/273) (guiding prompt). Those three are closed in favour of this PRD; their full content is captured below.
+**Consolidates**: [#271](https://github.com/vtmocanu/uzi/-/issues/271) (wait-on-limit default), [#272](https://github.com/vtmocanu/uzi/-/issues/272) (sweep cap), [#273](https://github.com/vtmocanu/uzi/-/issues/273) (guiding prompt). Those three are closed in favour of this PRD; their full content is captured below.
 
 ## Problem
 

@@ -1,6 +1,6 @@
 # PRD #116 — Distinguish handled guardrail denials from errors in the activity feed
 
-**Issue**: [#116](https://gitlab.example.com/vtmocanu/uzi/-/issues/116) · **Label**: PRD · **Priority**: Low
+**Issue**: [#116](https://github.com/vtmocanu/uzi/-/issues/116) · **Label**: PRD · **Priority**: Low
 **Status**: **DONE** — M1–M3 complete on branch `agent/issue-116`. Closed 2026-07-27. See
 "As built" below for the five departures from this document.
 

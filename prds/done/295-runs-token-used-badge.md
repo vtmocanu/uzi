@@ -1,6 +1,6 @@
 # PRD #295: Show which token a run used, on the Runs list
 
-**GitLab Issue**: [vtmocanu/uzi#295](https://gitlab.example.com/vtmocanu/uzi/-/issues/295)
+**GitLab Issue**: [vtmocanu/uzi#295](https://github.com/vtmocanu/uzi/-/issues/295)
 **Status**: Complete (shipped on `agent/issue-295`)
 **Priority**: Medium
 **Created**: 2026-08-10

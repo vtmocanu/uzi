@@ -1,7 +1,7 @@
 # PRD #97: e2e suite hardening & speedup
 
-**GitLab Issue**: [#97](https://gitlab.example.com/vtmocanu/uzi/-/issues/97)
-**Status**: **COMPLETE** (2026-07-20, MR !86 merged). Follow-ups tracked in #101. All shipped milestones validated: M1/M2/M3/M5/M8 closed earlier; **M4+M9** gate-passed (173 PASS / 0 FAIL) with reviewer APPROVE + auditor PASS and both owed mutation tests proven RED; **M9b** re-gated (173/0 unchanged, 113 instrumented waits, up from 92) and APPROVED; **M9c** closed a live authz coverage gap the review wave surfaced, with six parameter-construction mutations going from 10-of-11 surviving to all killed. M6 deferred to [#100](https://gitlab.example.com/vtmocanu/uzi/-/issues/100); M7 optional, never started. **Out-of-scope follow-ups needing their own issue are listed under "Follow-up found by M9c".** See RESUME HERE below.
+**GitLab Issue**: [#97](https://github.com/vtmocanu/uzi/-/issues/97)
+**Status**: **COMPLETE** (2026-07-20, MR !86 merged). Follow-ups tracked in #101. All shipped milestones validated: M1/M2/M3/M5/M8 closed earlier; **M4+M9** gate-passed (173 PASS / 0 FAIL) with reviewer APPROVE + auditor PASS and both owed mutation tests proven RED; **M9b** re-gated (173/0 unchanged, 113 instrumented waits, up from 92) and APPROVED; **M9c** closed a live authz coverage gap the review wave surfaced, with six parameter-construction mutations going from 10-of-11 surviving to all killed. M6 deferred to [#100](https://github.com/vtmocanu/uzi/-/issues/100); M7 optional, never started. **Out-of-scope follow-ups needing their own issue are listed under "Follow-up found by M9c".** See RESUME HERE below.
 **Priority**: Medium
 **Origin**: Three-agent read-only review of the e2e suite (2026-07-20) — coverage (add/drop), speed, and harness-structure passes. Two independent agents flagged the git Basic-auth default as the single highest-value gap.
 **Review**: fable adversarial pass folded in (2026-07-20). Load-bearing corrections: M1's "flip the happy-path leg to smart-HTTP" is **not** viable (forge-fake routes every repo path to one bare, breaking the PRD #42 two-repo phase) — only the second-push-pass option survives, and the existing `E2E_GIT_SMART_HTTP=1` full run is likely already broken at #42; dropping #46 Phase B (M4) **breaks the downstream #68 phase** that reads the planted `jq` rec; the #16 collapse must **keep** the non-owner repo-PATCH→404 leg (no handler test covers it); M5's healthcheck saving is ~30-40s (not 55-80s — `start_interval` helps only the two `--wait` boots, not the `--force-recreate` api recreates) and its `assert_no_run_for_issue` default change is a no-op (all call sites pass explicit args). The #94/#53/#33/#40/#46-fallback drops were independently re-verified safe.
@@ -18,7 +18,7 @@
 | **M4** (drops) | ✅ **DONE** — `aad3c201`; 173/0 gate, reviewer APPROVE, auditor PASS |
 | **M9** (timing hardening) | ✅ **DONE** — `859a8066`; same gate, reviewer APPROVE, auditor PASS |
 | **M9b** (instrumentation completion) | 🔄 **IN FLIGHT** — see below |
-| **M6** (speedups) | ⏸ DEFERRED → [issue #100](https://gitlab.example.com/vtmocanu/uzi/-/issues/100) |
+| **M6** (speedups) | ⏸ DEFERRED → [issue #100](https://github.com/vtmocanu/uzi/-/issues/100) |
 | **M7** (refactor) | ⏸ optional, never started |
 
 **The review wave's verdict (2026-07-20).** Both validators cleared the code, and both re-derived the
@@ -551,7 +551,7 @@ carry explicit author sign-off:
       `assert_no_run_for_issue` "default `:434` 6→4s" is a no-op** (fable review): the
       `:434` default is never used — every call site passes an explicit arg (`:1663`=6,
       `:1700`=6, `:1678`=0); change the explicit `6`s at `:1663`/`:1700`, leave `:1678`.
-- [~] **M6 — DEFERRED to [issue #100](https://gitlab.example.com/vtmocanu/uzi/-/issues/100)**
+- [~] **M6 — DEFERRED to [issue #100](https://github.com/vtmocanu/uzi/-/issues/100)**
       (2026-07-20, user's direction, so PRD #97 can land). Not dropped — it is the single
       largest remaining wall-clock win, but it is also the riskiest milestone (it
       parallelises a phase and moves three timing knobs in a suite this PRD has just
@@ -931,9 +931,9 @@ carry explicit author sign-off:
       **against a param that was never captured**. A test that passes because nothing was recorded
       is the same failure class the commit exists to fix.
 
-### ⚠️ Follow-up found by M9c — OUT OF SCOPE for this PRD → tracked in [issue #101](https://gitlab.example.com/vtmocanu/uzi/-/issues/101)
+### ⚠️ Follow-up found by M9c — OUT OF SCOPE for this PRD → tracked in [issue #101](https://github.com/vtmocanu/uzi/-/issues/101)
 
-**All four follow-ups below are filed as [#101](https://gitlab.example.com/vtmocanu/uzi/-/issues/101)**
+**All four follow-ups below are filed as [#101](https://github.com/vtmocanu/uzi/-/issues/101)**
 (viewer-identity call sites, the remaining `GetSkill` properties, the repo-wide gofmt drift, and
 homing the AST comment-inertness checker), together with the methodology rules. They must **not** be
 folded into this branch. Detail retained here because it is the evidence, and #101 is the tracker.

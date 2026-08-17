@@ -1,6 +1,6 @@
 # PRD #90: Cross-run agent memory — a sanctioned, inert, per-user+per-repo store (the READ path is the new surface)
 
-**GitLab Issue**: [#90](https://gitlab.example.com/vtmocanu/uzi/-/issues/90)
+**GitLab Issue**: [#90](https://github.com/vtmocanu/uzi/-/issues/90)
 **Status**: Complete (2026-07-20). Shipped via MR !78 (uzi-authored, human-reviewed + merged); all six milestones landed — DB store + server-derived identity, `save_memory` custom tool with the file-guard regression test, inert nonce-fenced read path, server-enforced caps, deterministic mechanism + live-DB tests, and the web + `uzi memory` visibility/purge surfaces. Design/decision record in `specs/ai.md` §317–322. Issue #90 auto-closed on merge.
 **Priority**: Medium (a capability gap + a small trust-boundary change on the READ path; not a bug or an active security hole).
 **Depends on**: PRD #51 (worker/runner uid split; the file-tool path guard this PRD does NOT change). PRD #42/#58 (the per-run SDK `$HOME = agent-home/<runId>` model + the accepted out-of-worktree-Bash residual). Surfaced by the judge on run `e2d7427b` (PRD #86).

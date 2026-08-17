@@ -1,10 +1,10 @@
 # PRD #72: PRD lifecycle inside the run — progress updates, move-to-done, and the issue link that follows
 
-**GitLab Issue**: [#72](https://gitlab.example.com/vtmocanu/uzi/-/issues/72)
+**GitLab Issue**: [#72](https://github.com/vtmocanu/uzi/-/issues/72)
 **Status**: Complete (2026-07-26). All six milestones landed, reviewed, audited and scenario-validated, and the "Manual, and required" acceptance run in the Validation section has now been performed — see the Decision Log entry for 2026-07-26.
 
 **Priority**: Medium
-**Related**: [#96](https://gitlab.example.com/vtmocanu/uzi/-/issues/96) (mid-run restart discards un-pushed commits — the durability bug this PRD deliberately does NOT try to fix), [#110](https://gitlab.example.com/vtmocanu/uzi/-/issues/110) (checkpoint agent work — closed will-not-implement; the reason "update the PRD and push mid-run" is not on the table), [#122](https://gitlab.example.com/vtmocanu/uzi/-/issues/122) (milestone-structured runs — the DB-side progress record this PRD's file-side record must not contradict), [#16](https://gitlab.example.com/vtmocanu/uzi/-/issues/16) (skills), [#37](https://gitlab.example.com/vtmocanu/uzi/-/issues/37) (repo-sourced agents — whose skill gap M1 closes and whose trust model Decision 6 must argue against), [#46](https://gitlab.example.com/vtmocanu/uzi/-/issues/46) (self-improvement runs — excluded by Decision 13), [#24](https://gitlab.example.com/vtmocanu/uzi/-/issues/24) (MR-state watcher, whose candidate prefilter M5 must not reuse)
+**Related**: [#96](https://github.com/vtmocanu/uzi/-/issues/96) (mid-run restart discards un-pushed commits — the durability bug this PRD deliberately does NOT try to fix), [#110](https://github.com/vtmocanu/uzi/-/issues/110) (checkpoint agent work — closed will-not-implement; the reason "update the PRD and push mid-run" is not on the table), [#122](https://github.com/vtmocanu/uzi/-/issues/122) (milestone-structured runs — the DB-side progress record this PRD's file-side record must not contradict), [#16](https://github.com/vtmocanu/uzi/-/issues/16) (skills), [#37](https://github.com/vtmocanu/uzi/-/issues/37) (repo-sourced agents — whose skill gap M1 closes and whose trust model Decision 6 must argue against), [#46](https://github.com/vtmocanu/uzi/-/issues/46) (self-improvement runs — excluded by Decision 13), [#24](https://github.com/vtmocanu/uzi/-/issues/24) (MR-state watcher, whose candidate prefilter M5 must not reuse)
 
 **What the acceptance run established, and what it did not.** A real `issue` run
 (`c13cff61`, one iteration, on a throwaway PRD created for the purpose) ticked the
@@ -57,7 +57,7 @@ that the run itself was in the best position to do.
 The interesting part of a PRD progress update is not the `git mv`. It is the
 judgment: scan every unchecked item, categorize it, and mark complete only on
 direct evidence. That discipline exists and is written down — in the
-`dot-ai` `prd-update-progress` / `prd-done` prompts the team uses locally — but
+`sibling-app` `prd-update-progress` / `prd-done` prompts the team uses locally — but
 it is not available to a uzi run.
 
 ### 3. A skill cannot reliably reach the agents that would use it
@@ -164,7 +164,7 @@ says so, and M4's validator accepts a path already under `done/`.
 
 The agent marking its own work complete is the obvious failure mode: a PRD that
 claims done because the agent said so is worse than no update, because it is
-believed. The `dot-ai` source prompts carry a whole "conservative completion
+believed. The `sibling-app` source prompts carry a whole "conservative completion
 policy / evidence-based criteria" section for exactly this reason, and that
 section is the part worth keeping.
 
@@ -185,7 +185,7 @@ review, not the reviewer subagent (Decision 14).
 This is a prompt-level control either way. It raises the floor; it does not make
 a false claim impossible.
 
-### Decision 4 — Adapt two of the eight `dot-ai` prompts, and only two
+### Decision 4 — Adapt two of the eight `sibling-app` prompts, and only two
 
 `prd-update-progress` and the `git mv` half of `prd-done`. The rest are
 human-loop or pre-run and would fight uzi's own machinery:
@@ -268,8 +268,8 @@ currently the *only* way a subagent can read a delivered skill body — and repo
 subagents do not have it.
 
 M1 grants it, for every delivered skill. Those can be admin-authored
-org-internal playbooks: `ci-cd-norms` documents `harbor.example.com`,
-`myorg/pipelines`, `argo-apps`, the Infisical operator, and ArgoCD's
+org-internal playbooks: `ci-cd-norms` documents `registry.example.com`,
+`shared-pipelines`, `argo-apps`, the Infisical operator, and ArgoCD's
 group-scoped deploy-token model. A repo-authored subagent can be written to
 expand a skill and write its contents into the worktree, which the worker then
 commits and pushes to a branch the repo's author can read.
@@ -661,7 +661,7 @@ M1 and M3 are independently useful and can ship separately if the rest stalls.
   builtin ever ships, that is the follow-up.
 - **A per-run skill picker.** Allocation stays template-scoped.
 - **PRD handling for `self_improve` / `ci_fix`** (Decision 13).
-- **Authoring PRDs in a run** (`prd-create`), and the remaining `dot-ai` prompts.
+- **Authoring PRDs in a run** (`prd-create`), and the remaining `sibling-app` prompts.
 - **Backfilling PRDs that earlier runs left un-updated.**
 
 ## Risks

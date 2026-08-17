@@ -1,6 +1,6 @@
 # PRD #42: Worker run concurrency — bounded multi-run workers
 
-**GitLab Issue**: [vtmocanu/uzi#42](https://gitlab.example.com/vtmocanu/uzi/-/issues/42)
+**GitLab Issue**: [vtmocanu/uzi#42](https://github.com/vtmocanu/uzi/-/issues/42)
 **Status**: Draft — reviewed 2026-07-10 by 3 agents (design, security, fact-check); no blocking findings; all major/medium findings folded in below (marked ↳review where the design changed). Done — merged to main via MR !42 (2026-07-12); all six milestones implemented, reviewed, and audited.
 **Priority**: Medium
 **Created**: 2026-07-10

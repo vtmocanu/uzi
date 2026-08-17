@@ -1,6 +1,6 @@
 # PRD #46: Run retrospective (LLM judge) + self-improvement job
 
-**GitLab Issue**: [#46](https://gitlab.example.com/vtmocanu/uzi/-/issues/46)
+**GitLab Issue**: [#46](https://github.com/vtmocanu/uzi/-/issues/46)
 **Status**: Complete (merged via MR !48, 2026-07-13). M1-M10 landed + validator-cleared; M8 live-validation capstone (real LLM verdict + live self-improve tick on a scratch repo) deferred to operator. Follow-up: PRD #51 (worker/agent uid-split) for the documented same-uid residual.
 **Priority**: Medium
 **Created**: 2026-07-12

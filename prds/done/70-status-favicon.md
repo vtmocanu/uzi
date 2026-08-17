@@ -1,6 +1,6 @@
 # PRD #70: Status favicon (GitLab-style) + brand favicon
 
-**GitLab Issue**: [#70](https://gitlab.example.com/vtmocanu/uzi/-/issues/70)
+**GitLab Issue**: [#70](https://github.com/vtmocanu/uzi/-/issues/70)
 **Status**: Complete (2026-07-17, MR !66)
 **Priority**: Low
 **Related**: PRD #46 (run judge + notifications — introduced `unreadNotificationCount`, the "attention" signal this favicon reuses). PRD #21 (theme system + `theme-preinit.js` — the CSP-vs-`<head>`-asset precedent this PRD follows). PRD #33 (`stop_kind` — how a deliberate stop is told apart from a genuine `failed`, so the favicon never reddens on a cancel).

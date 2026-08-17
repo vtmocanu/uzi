@@ -1,6 +1,6 @@
 # PRD #292: Slack styling — render Markdown as Slack mrkdwn across bot DMs
 
-**GitLab Issue**: [vtmocanu/uzi#292](https://gitlab.example.com/vtmocanu/uzi/-/issues/292)
+**GitLab Issue**: [vtmocanu/uzi#292](https://github.com/vtmocanu/uzi/-/issues/292)
 **Status**: Complete (delivered 2026-08-10, commits `b4f6f3c1`..`445d376a`; architect-reviewed, all BLOCKER/MAJOR findings folded in)
 **Priority**: Medium (high-visibility: it affects every model-authored DM)
 **Created**: 2026-08-10

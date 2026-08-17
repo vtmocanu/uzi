@@ -1,6 +1,6 @@
 # PRD #194 — Live cost estimate on the run page (cost is frozen between SDK phases)
 
-**Issue**: [#194](https://gitlab.example.com/vtmocanu/uzi/-/issues/194) · **Label**: PRD · **Priority**: Medium
+**Issue**: [#194](https://github.com/vtmocanu/uzi/-/issues/194) · **Label**: PRD · **Priority**: Medium
 **Area**: `web/src/lib/runUsage.ts` + `web/src/components/RunUsage.tsx` + `web/src/pages/RunView.tsx` (client-derived, PRD #40 lineage) + a new price table module + one nullable `bills_usage` column on the Anthropic token row (M2, open question 1).
 **Line references** are against `28d7238e`.
 **Status**: **M0 is a go/no-go gate**, and it reduces to one question: can
@@ -10,7 +10,7 @@ in public (estimated tokens-out for the whole run reads lower than confirmed
 tokens-out for one phase). Both [open questions](#open-questions) are now
 answered: the headline estimate is approved, and uzi cannot distinguish a
 subscription token today, so M2 gains one storage change to remember it.
-~~**M3 is blocked on [#195](https://gitlab.example.com/vtmocanu/uzi/-/issues/195).**~~
+~~**M3 is blocked on [#195](https://github.com/vtmocanu/uzi/-/issues/195).**~~
 **UNBLOCKED 2026-08-02**: #195 landed. The strip and the per-phase table now fold
 `modelUsage` per model, pinned to the server's `run_usage` rollup from both sides by a
 recorded fixture (`fixtures/run-usage/`, `adr/0195-run-usage-per-model-fold.md`). The
@@ -528,7 +528,7 @@ above).
   passes against a split-blind implementation; (d) two models sum per-model and
   per-agent correctly; (e) an unpriced model yields a partial total plus a
   populated `unpricedModels` rather than a silently low number.
-- [ ] **M3 — Run-page panel. ~~BLOCKED ON [#195](https://gitlab.example.com/vtmocanu/uzi/-/issues/195)~~ — UNBLOCKED 2026-08-02, #195 landed.**
+- [ ] **M3 — Run-page panel. ~~BLOCKED ON [#195](https://github.com/vtmocanu/uzi/-/issues/195)~~ — UNBLOCKED 2026-08-02, #195 landed.**
   That issue found, during this PRD's review, that the run page's existing token
   columns already read a different population from every rollup surface: the
   client read the result frame's top-level `usage` while the

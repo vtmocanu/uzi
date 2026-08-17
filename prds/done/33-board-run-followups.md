@@ -1,6 +1,6 @@
 # PRD #33: Board–Run Follow-ups — MR-State Surfacing, Deliberate-Stop Signal, Multi-User Board Hardening, e2e Guard
 
-**GitLab Issue**: [vtmocanu/uzi#33](https://gitlab.example.com/vtmocanu/uzi/-/issues/33)
+**GitLab Issue**: [vtmocanu/uzi#33](https://github.com/vtmocanu/uzi/-/issues/33)
 **Status**: Complete (2026-07-10) — all 5 milestones done. MR !33 merged to main (merge commit 99f00eb); issue #33 closed; supersedes issue #15 (closed). Migration renumbered 00045→00050 at landing (main's head had moved to 00049). Validation: pre-implementation review by 2 agents (design + fact-check); per-milestone reviewer+auditor rounds all clean; tester drove every success criterion live; web-ux browser pass with findings fixed and re-verified. Specs: ai.md §160-164.
 **Priority**: Medium
 **Created**: 2026-07-10

@@ -1,6 +1,6 @@
 # PRD #115 — Meter color thresholds: warn ≥40%, danger ≥85%
 
-**Issue**: [#115](https://gitlab.example.com/vtmocanu/uzi/-/issues/115) · **Label**: PRD · **Priority**: Medium
+**Issue**: [#115](https://github.com/vtmocanu/uzi/-/issues/115) · **Label**: PRD · **Priority**: Medium
 **Supersedes the thresholds set by**: PRD #49 / #53 Decision 6 (unified `toneFor` at 80/95).
 **Status**: **DONE** — merged `c33211bd` + `10707d7a` via `4ffb80c2`, released in **v0.11.2**. Closed 2026-07-25.
 

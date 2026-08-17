@@ -1,6 +1,6 @@
 # PRD #305: Apply a schedule's model to subagents, not just the lead
 
-**GitLab Issue**: [#305](https://gitlab.example.com/vtmocanu/uzi/-/issues/305)
+**GitLab Issue**: [#305](https://github.com/vtmocanu/uzi/-/issues/305)
 **Status**: Complete (2026-08-12)
 **Priority**: Medium
 **Design mock**: [interactive ScheduleModal mock](https://claude.ai/code/artifact/d25daba5-aed2-4264-94c6-33ee37027dac) (the new checkbox + the Lead / All subagents summary)

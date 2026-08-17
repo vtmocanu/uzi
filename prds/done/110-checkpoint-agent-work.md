@@ -1,9 +1,9 @@
 # PRD #110: Checkpoint agent work mid-run — CLOSED (will not implement: unsafe on the primary runtime)
 
-**GitLab Issue**: [#110](https://gitlab.example.com/vtmocanu/uzi/-/issues/110) — **closed 2026-07-22, will not implement**
+**GitLab Issue**: [#110](https://github.com/vtmocanu/uzi/-/issues/110) — **closed 2026-07-22, will not implement**
 **Status**: 🔴 **Closed — will not implement.** Nothing was built. This file is the decision record for *why*, and the condition under which it could be revisited.
 **Review**: adversarial review by a Fable agent, 2026-07-22, verified against `main`. It caught the load-bearing fact that reverses the whole proposal — the primary k8s runtime is **single-uid**, not uid-split — which is exactly why this is closed.
-**Related**: [#105](https://gitlab.example.com/vtmocanu/uzi/-/issues/105) (session lost on a different-worker requeue — the loss this would have reduced), [#51](https://gitlab.example.com/vtmocanu/uzi/-/issues/51) (worker-uid split — compose-only, the safety lever that does **not** cover k8s), [#58](https://gitlab.example.com/vtmocanu/uzi/-/issues/58) (single-uid non-root start — the k8s posture), [#42](https://gitlab.example.com/vtmocanu/uzi/-/issues/42) (bounded concurrency — whose credential-exposure analysis this extends)
+**Related**: [#105](https://github.com/vtmocanu/uzi/-/issues/105) (session lost on a different-worker requeue — the loss this would have reduced), [#51](https://github.com/vtmocanu/uzi/-/issues/51) (worker-uid split — compose-only, the safety lever that does **not** cover k8s), [#58](https://github.com/vtmocanu/uzi/-/issues/58) (single-uid non-root start — the k8s posture), [#42](https://github.com/vtmocanu/uzi/-/issues/42) (bounded concurrency — whose credential-exposure analysis this extends)
 
 ## Resolution
 

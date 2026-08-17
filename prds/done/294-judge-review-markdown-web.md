@@ -1,6 +1,6 @@
 # PRD #294: Render judge review markdown in the web run-review panel
 
-**GitLab Issue**: [vtmocanu/uzi#294](https://gitlab.example.com/vtmocanu/uzi/-/issues/294)
+**GitLab Issue**: [vtmocanu/uzi#294](https://github.com/vtmocanu/uzi/-/issues/294)
 **Status**: Done
 **Priority**: Medium
 **Created**: 2026-08-10

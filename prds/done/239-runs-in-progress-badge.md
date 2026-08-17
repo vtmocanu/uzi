@@ -1,6 +1,6 @@
 # PRD #239: Runs-in-progress count badge on the Runs menu item
 
-**GitLab Issue**: [#239](https://gitlab.example.com/vtmocanu/uzi/-/issues/239)
+**GitLab Issue**: [#239](https://github.com/vtmocanu/uzi/-/issues/239)
 **Status**: Done (implemented 2026-08-07 on branch `agent/issue-239`; all three milestones complete and reviewed — reviewer/auditor/web-ux clean, no blockers. Created same day; reviewed by an architect agent against the codebase — 5 documentation-accuracy fixes applied, no blockers: `ListRunsForUser` rename, kind-set pinned, "same scope predicate" not "to the digit", `unread_count` is `RequireAuth` not `RequireUser`, favicon's third status idiom surfaced. See the Decision Log.)
 **Priority**: Low
 **Mock**: `prds/mockups/239-runs-in-progress-badge-mock.html` (shown to owner 2026-08-07)

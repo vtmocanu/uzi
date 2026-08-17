@@ -1,6 +1,6 @@
 # PRD #5: Access Control & PAT Least-Privilege Hardening
 
-**GitLab Issue**: [vtmocanu/uzi#5](https://gitlab.example.com/vtmocanu/uzi/-/issues/5)
+**GitLab Issue**: [vtmocanu/uzi#5](https://github.com/vtmocanu/uzi/-/issues/5)
 **Status**: Draft
 **Priority**: High
 **Created**: 2026-07-04

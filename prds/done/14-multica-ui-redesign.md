@@ -1,6 +1,6 @@
 # PRD #14: Adopt the Multica-inspired UI Redesign (ember)
 
-**GitLab Issue**: [vtmocanu/uzi#14](https://gitlab.example.com/vtmocanu/uzi/-/issues/14)
+**GitLab Issue**: [vtmocanu/uzi#14](https://github.com/vtmocanu/uzi/-/issues/14)
 **Status**: Complete (2026-07-05) — merged to main via MR !14 (`2efd83b`), issue #14 closed, specs synced, prototypes cleaned up. Implementation by agent team: every milestone reviewed (reviewer 5 passes, all APPROVE) + audited (2 passes, clean) + browser-validated (web-ux, 8 flows, no blockers) + tested (M4 all green incl. real-GitLab scratch leg + 401-interceptor fix at 62f102d). Post-review additions, user-approved: unified run status colors across surfaces (runBadge info/ok tones), auth-page redirect guard, live-pill gating, themed focus-visible ring. M4 also surfaced a compose-isolation footgun (shell env overrides --env-file) — recorded in CLAUDE.md. 2026-07-05 earlier: PRD #12 landed on `main` before this PRD started, inverting Decision 6's planned merge order — Decision 6 and the Port plan rewritten accordingly (see below).
 **Priority**: High
 **Created**: 2026-07-04

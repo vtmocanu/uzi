@@ -1,6 +1,6 @@
 # PRD #267: Time-based checkpoints — bound data-loss exposure between milestone boundaries
 
-**GitLab Issue**: [vtmocanu/uzi#267](https://gitlab.example.com/vtmocanu/uzi/-/issues/267)
+**GitLab Issue**: [vtmocanu/uzi#267](https://github.com/vtmocanu/uzi/-/issues/267)
 **Status**: Complete — implemented and reviewed 2026-08-09 (all milestones M1–M4 shipped on `agent/issue-267`; auditor CONFIRMED the credential-safety invariant on the new `reap:false` publish path; the shipped env is `CHECKPOINT_INTERVAL`, a Go-style duration string). Originally architect-reviewed 2026-08-09 (crux CONFIRMED GO via PRD #122 Decisions 10b/14).
 **Priority**: High (top priority)
 **Created**: 2026-08-09

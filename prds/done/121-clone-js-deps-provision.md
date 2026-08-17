@@ -1,6 +1,6 @@
 # PRD #121: Pre-provision cloned-repo JS deps before the agent works (+ pre-scan accuracy + gate honesty)
 
-**GitLab Issue**: [#121](https://gitlab.example.com/vtmocanu/uzi/-/issues/121)
+**GitLab Issue**: [#121](https://github.com/vtmocanu/uzi/-/issues/121)
 **Status**: **COMPLETE (2026-07-27).** M1, M2, M3 and M6 shipped in v0.11.9; **M5, the acceptance run, is satisfied** on run `71d83432` against a worker verified to be running this code (see its milestone entry for the measured evidence). **M4 is SPLIT OUT** into its own increment and is deliberately not delivered here.
 
 *It took two acceptance runs, and the first is the more instructive: every mechanism worked and the benefit was still lost, because nothing told the agent its dependencies already existed. Fixed by issue #157 and shipped in v0.11.11.*

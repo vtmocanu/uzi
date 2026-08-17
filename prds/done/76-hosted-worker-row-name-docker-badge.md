@@ -1,6 +1,6 @@
 # PRD #76: Hosted worker row — AWS-style derived name + docker badge
 
-**GitLab Issue**: [#76](https://gitlab.example.com/vtmocanu/uzi/-/issues/76)
+**GitLab Issue**: [#76](https://github.com/vtmocanu/uzi/-/issues/76)
 **Status**: Draft (created 2026-07-20)
 **Priority**: Low
 **Related**:

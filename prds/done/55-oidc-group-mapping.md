@@ -1,6 +1,6 @@
 # PRD #55: OIDC group → role/access mapping (Keycloak / Pocket ID)
 
-**GitLab Issue**: [#55](https://gitlab.example.com/vtmocanu/uzi/-/issues/55)
+**GitLab Issue**: [#55](https://github.com/vtmocanu/uzi/-/issues/55)
 **Status**: Implemented (M1–M5) — awaiting PR review. Real-IdP e2e (live Keycloak / Pocket ID) is a manual verify item (see M5).
 **Priority**: Medium
 **Created**: 2026-07-16

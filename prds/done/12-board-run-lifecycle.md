@@ -1,6 +1,6 @@
 # PRD #12: Board–Run Lifecycle Integration — Auto Column Moves, Run-aware Cards, In-app Issue View
 
-**GitLab Issue**: [vtmocanu/uzi#12](https://gitlab.example.com/vtmocanu/uzi/-/issues/12)
+**GitLab Issue**: [vtmocanu/uzi#12](https://github.com/vtmocanu/uzi/-/issues/12)
 **Status**: Complete (2026-07-05) — all 5 milestones done. MR !12 merged to main (merge commit 9d35080); issue #12 closed. Live validation performed by the user on the rebuilt stack (migration 00021 applied to the live DB). Follow-up candidates tracked in issue #15. (Spec history: reviewed by 2 agents pre-implementation; move-retry reconciliation added by user review, hardened by a second agent round; see Design Decisions.)
 **Priority**: High
 **Created**: 2026-07-04

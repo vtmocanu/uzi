@@ -1,6 +1,6 @@
 # PRD #58: Hosted k8s workers — self-service worker provisioning
 
-**GitLab Issue**: [#58](https://gitlab.example.com/vtmocanu/uzi/-/issues/58)
+**GitLab Issue**: [#58](https://github.com/vtmocanu/uzi/-/issues/58)
 **Status**: DONE — **released in v0.3.0**, hosted workers live on dev-cluster (feature merge `6098104`, release `3da61c3`). M1–M7 all landed; GitLab issue #58 closed. Moved to `done/` 2026-07-25.
 
 > **The two "open residuals" that held this file in `prds/` for a week were both misfiled, and the audit that moved it is worth recording because the status line itself was the misleading artifact.**
@@ -671,7 +671,7 @@ Non-goals (v1):
     reaches the children, which is why the first attempt at the wipe silently did nothing.
   - **The `lost+found` sentinel trap is closed by a UNIT test, deliberately**, because
     kind cannot catch it: local-path makes a plain directory, so a fresh PVC there really
-    IS empty and an emptiness check passes — while dev-cluster's hypervisor CSI formats ext4
+    IS empty and an emptiness check passes — while dev-cluster's CSI driver formats ext4
     and a fresh PVC carries `lost+found`. It is a property of the check, so it needs no
     kubelet.
   - **The size/template goldens are gates only with `-count=1`, and CI now passes it.**

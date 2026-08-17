@@ -1,6 +1,6 @@
 # PRD #69: Judge mode (off / optional / enforced) + per-user judge model + opus default + spend guards + judge run cost/time visibility + judge accuracy (deterministic signals + pre-start gating)
 
-**GitLab Issue**: [#69](https://gitlab.example.com/vtmocanu/uzi/-/issues/69)
+**GitLab Issue**: [#69](https://github.com/vtmocanu/uzi/-/issues/69)
 **Status**: Draft (created 2026-07-17; revised 2026-07-17 after fact-check + architecture + risk review, then spend guards folded in per user request, then judge run cost/time visibility (M6) folded in per user request; then judge-accuracy work (M7: deterministic env/failure-class signals + gate off pre-start infra failures) folded in 2026-07-18 per user request — from issue #81, surfaced by the #78 provisioning misjudgment)
 **Priority**: Medium
 **Supersedes**: PRD #59 (default judge model → sonnet). #59's single change (flip the compiled-in default) is folded in here, but the value is **opus**, not sonnet — see Decision 1, which reverses #59's Decision 1. #59 is closed as superseded.

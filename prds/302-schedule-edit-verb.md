@@ -1,6 +1,6 @@
 # PRD #302: `uzi schedule edit` verb (CLI patch for schedules)
 
-**GitLab Issue**: [#302](https://gitlab.example.com/vtmocanu/uzi/-/issues/302)
+**GitLab Issue**: [#302](https://github.com/vtmocanu/uzi/-/issues/302)
 **Status**: M1/M2/M4/M5 landed 2026-08-10; M3 (`--model`) deferred until PRD #300 adds `run_schedules.model` (Decision 4)
 **Priority**: Medium
 **Related**: PRD #241 (run schedules — the `PATCH /api/schedules/{id}` endpoint this verb finally exposes in full). PRD #274 (`MaxIssues`/`Guidance` — the nullable config fields whose replace-semantics dictate this verb's fetch-merge-send design). PRD #300 (per-schedule model — supplies the `model` field this verb's `--model` flag edits; the two are otherwise independent, see Decision 4). This verb is the general form of the CLI-parity gap #300's fable review surfaced.

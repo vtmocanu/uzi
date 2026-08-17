@@ -1,11 +1,11 @@
 # PRD #103: Dev-loop quality gates — task runner, linters, dead code, formatting, coverage
 
-**GitLab Issue**: [#103](https://gitlab.example.com/vtmocanu/uzi/-/issues/103)
-**Status**: ✅ COMPLETE (2026-08-04). Created 2026-07-21. — **M1 merged 2026-08-02** (MR !154), **M2 merged 2026-08-02** (MR !155), **M3 and M4 merged 2026-08-03** (MR !157, merge commit `4ebfb572`, one MR carrying both; main pipeline 20285 green 18/18). **M5's MR-A and MR-B merged 2026-08-03** (MR [!175](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/175), merge commit `d77e651b`, one MR carrying both; pipeline 20333 green 18/18 at `f0e3c438`). Shell, YAML, formula and secret scanning. **M5's MR-C and M6 merged 2026-08-04** (MR [!179](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/179), merge commit on `main`, pipeline green). `govulncheck` + `npm audit` gating at zero, the agent lockfile's five advisories cleared, vitest 2.1.9→4.1.10 exact-pinned, a `deps-check` staleness slot, and `-race` on `test:controller` pulled forward from M6. **Two CVEs the new gates caught during CI were fixed in the same MR**: the Go toolchain 1.26.4→1.26.5 (called stdlib `GO-2026-4970`, root escape via symlink in `os`) and `golang.org/x/net` v0.55.0→v0.56.0 (`GO-2026-5942`) — the remote-mutable-advisory-DB property §482 predicts, arriving on schedule. **M5 is now ticked**; Success Criterion 5 was amended (see its entry — its text never named the three tools, and its literal predicate had been met since MR-B). **M6 merged in the same MR !179** (coverage visible on every MR for api/controller/web, the vitest-4 jsdom `test.projects` split, `-race` on `test:controller`). The integrated validation pass (reviewer + auditor + fact-checker over the shipped diff) ran clean, and `specs/ai.md` §482-484 were synced. **Two deferrals, both filed rather than absorbed**: react-router 6→7 (no patched 6.x exists, so `web` keeps two ungating *moderate* advisories in a runtime dependency; reachability audited and small) and the `RunView.test.tsx` per-test cap. **Before the MR: the branch tip must be checked for the CI-skip marker**, since most commits here are docs-only and correctly carry it, while GitLab reads it from the MR's HEAD commit and a `skipped` pipeline still reports mergeable. M2 closed Success Criterion 7 and took the exclusive lock on `api/**/*.go`, so M5 and M6 are freely parallel (modulo the `web/package.json` contention in Parallelization, now a two-way between M6 and nothing else, since M3 and M4 have taken their share).
+**GitLab Issue**: [#103](https://github.com/vtmocanu/uzi/-/issues/103)
+**Status**: ✅ COMPLETE (2026-08-04). Created 2026-07-21. — **M1 merged 2026-08-02** (MR !154), **M2 merged 2026-08-02** (MR !155), **M3 and M4 merged 2026-08-03** (MR !157, merge commit `4ebfb572`, one MR carrying both; main pipeline 20285 green 18/18). **M5's MR-A and MR-B merged 2026-08-03** (MR [!175](https://github.com/vtmocanu/uzi/-/merge_requests/175), merge commit `d77e651b`, one MR carrying both; pipeline 20333 green 18/18 at `f0e3c438`). Shell, YAML, formula and secret scanning. **M5's MR-C and M6 merged 2026-08-04** (MR [!179](https://github.com/vtmocanu/uzi/-/merge_requests/179), merge commit on `main`, pipeline green). `govulncheck` + `npm audit` gating at zero, the agent lockfile's five advisories cleared, vitest 2.1.9→4.1.10 exact-pinned, a `deps-check` staleness slot, and `-race` on `test:controller` pulled forward from M6. **Two CVEs the new gates caught during CI were fixed in the same MR**: the Go toolchain 1.26.4→1.26.5 (called stdlib `GO-2026-4970`, root escape via symlink in `os`) and `golang.org/x/net` v0.55.0→v0.56.0 (`GO-2026-5942`) — the remote-mutable-advisory-DB property §482 predicts, arriving on schedule. **M5 is now ticked**; Success Criterion 5 was amended (see its entry — its text never named the three tools, and its literal predicate had been met since MR-B). **M6 merged in the same MR !179** (coverage visible on every MR for api/controller/web, the vitest-4 jsdom `test.projects` split, `-race` on `test:controller`). The integrated validation pass (reviewer + auditor + fact-checker over the shipped diff) ran clean, and `specs/ai.md` §482-484 were synced. **Two deferrals, both filed rather than absorbed**: react-router 6→7 (no patched 6.x exists, so `web` keeps two ungating *moderate* advisories in a runtime dependency; reachability audited and small) and the `RunView.test.tsx` per-test cap. **Before the MR: the branch tip must be checked for the CI-skip marker**, since most commits here are docs-only and correctly carry it, while GitLab reads it from the MR's HEAD commit and a `skipped` pipeline still reports mergeable. M2 closed Success Criterion 7 and took the exclusive lock on `api/**/*.go`, so M5 and M6 are freely parallel (modulo the `web/package.json` contention in Parallelization, now a two-way between M6 and nothing else, since M3 and M4 have taken their share).
 
 *(M4's box was ticked only after its interrupted validation wave was re-run: four validators against `bb3de70b` plus a delta review at `88f0bde7`. The pre-merge blocks for both milestones are kept verbatim under the merged notes, because M4's warning that the two blocks were **not the same kind of claim** is what caused the re-run, and deleting it would erase the reason.)*
 **Priority**: Medium
-**Absorbs**: [#101](https://gitlab.example.com/vtmocanu/uzi/-/issues/101) item 3 (26-file gofmt drift)
+**Absorbs**: [#101](https://github.com/vtmocanu/uzi/-/issues/101) item 3 (26-file gofmt drift)
 **Review**: adversarial review 2026-07-21 (every repo claim re-checked against `main`). It caught a load-bearing factual error — Decision 4 originally specified a "committed baseline" for all four ratcheted tools, and only ESLint has one. Rewritten with per-tool mechanisms, verified against upstream docs. Also corrected: line/size counts, a wrong `-buildvcs=false` citation, M4's calibration symbol (undetectable by the tools M4 adds), Success Criterion 1's scope, and the `stages:` conflict M1 now pre-empts.
 
 **Second review 2026-08-02** (every repo claim re-checked against `e0472a88`; the PRD was last edited 2026-07-21 in `8679e37a` and the tree moved under it within hours). Three blockers, all premise rot rather than design error:
@@ -15,7 +15,7 @@
 - **`-race` was already on `test:api`** (the `test:api` job, `go test -race -count=1 ./...`). M6's "riskiest single change" was already done; rescoped to `controller` only. *(Provenance corrected 2026-08-02 during M1 — see Decision 11. This bullet read "`.gitlab-ci.yml:178`, landed `224b5349` for PRD #108 M4", and all three parts were wrong or imprecise: the line number has since moved twice, `224b5349` is a branch merge rather than the introduction, and the combined line is two PRDs' work, not one.)*
 
 Plus: every numeric count in the document *had* drifted and *was* struck (Decision 10 — narrowed rather than deleted, since the count ban is on an undated tally of a moving population, and the counts since re-added each carry a date, a tool version and an invocation), `check-docs.mjs` had grown to cover three of the four files Problem #4 claimed were uncovered, Decision 7 repeated a clause `devbox.json` itself corrects as false, and only M4 had a calibration step (now all of M2–M6 do).
-**Related**: [#85](https://gitlab.example.com/vtmocanu/uzi/-/issues/85) (agenttmpl builtins drifted from the versioned role library)
+**Related**: [#85](https://github.com/vtmocanu/uzi/-/issues/85) (agenttmpl builtins drifted from the versioned role library)
 
 Six milestones, phased so the enabling work (M1) unblocks five independent
 tracks. M2 must land as one MR (see Decision 5); M2–M6 can ship in any order
@@ -159,7 +159,7 @@ Two things are adapted rather than copied:
 
 A single self-contained `Taskfile.yml` at the repo root, with per-component
 namespaces. Matches git-manager and the wider org convention (there is a
-`dot-ai-taskfile` skill), gives `deps:` for free, and handles `dir:` per
+`sibling-app-taskfile` skill), gives `deps:` for free, and handles `dir:` per
 component cleanly — which matters when the four gates run in `api/`,
 `controller/`, `web/` and `agent/`.
 
@@ -857,7 +857,7 @@ which previously prescribed only the fail-open form.
 - [x] **M1 — `Taskfile.yml` is the single source of truth for the gate**:
 
       > **STATUS 2026-08-02: MERGED.** MR
-      > [!154](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/154),
+      > [!154](https://github.com/vtmocanu/uzi/-/merge_requests/154),
       > merge commit `d4c6ac8a` on `main`. The box is now ticked for the reason it
       > was previously left unticked: this landed.
       >
@@ -1111,7 +1111,7 @@ which previously prescribed only the fail-open form.
 - [x] **M2 — Formatting: drift cleared and gated, one MR**:
 
       > **STATUS 2026-08-02: MERGED.** MR
-      > [!155](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/155),
+      > [!155](https://github.com/vtmocanu/uzi/-/merge_requests/155),
       > merge commit `3824e89d`. **`gofmt -l ./api ./controller` on `main` is now
       > empty — Success Criterion 7 is met**, and it is the first criterion in this
       > PRD to close.
@@ -1230,7 +1230,7 @@ which previously prescribed only the fail-open form.
 - [x] **M3 — Linting: golangci-lint + oxlint, each ratcheted its own way**:
 
       > **STATUS 2026-08-03: MERGED.** MR
-      > [!157](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/157),
+      > [!157](https://github.com/vtmocanu/uzi/-/merge_requests/157),
       > merge commit `4ebfb572` (shared with M4 — one MR carried both). Main
       > pipeline **20285: 18 of 18 green**, `lint:api` and `lint:controller`
       > included.
@@ -1565,7 +1565,7 @@ which previously prescribed only the fail-open form.
 - [x] **M4 — Dead code detection**:
 
       > **STATUS 2026-08-03: MERGED, AND THE INTERRUPTED WAVE WAS RE-RUN.** MR
-      > [!157](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/157),
+      > [!157](https://github.com/vtmocanu/uzi/-/merge_requests/157),
       > merge commit `4ebfb572`. Main pipeline **20285: 18 of 18 green**.
       >
       > **The block below refused to tick this box because every acceptance
@@ -1851,7 +1851,7 @@ which previously prescribed only the fail-open form.
       > Full record: `.claude/agent-team-tasks/prd-103-mrc-m6.md`, twelve amendments plus two end-of-session handovers. It is gitignored-but-tracked, so `git grep` or open it by path — `grep -r` cannot see it.
 
       > **STATUS 2026-08-03: MR-A AND MR-B MERGED, M5 NOT COMPLETE.** MR
-      > [!175](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/175),
+      > [!175](https://github.com/vtmocanu/uzi/-/merge_requests/175),
       > merge commit `d77e651b`, pipeline 20333 green 18/18 at `f0e3c438`.
       >
       > **The first pipeline found a real defect on its first run, which is
@@ -2153,7 +2153,7 @@ which previously prescribed only the fail-open form.
 ## ✅ SHIPPED 2026-08-04 — the three steps below are DONE (kept for the record).
 
 **RESOLVED**: M5 MR-C + M6 merged to `main` via MR
-[!179](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/179) on 2026-08-04,
+[!179](https://github.com/vtmocanu/uzi/-/merge_requests/179) on 2026-08-04,
 pipeline green. All three steps completed: (1) integrated pass — reviewer + auditor +
 fact-checker over `origin/main...HEAD`, clean (one HIGH, a `scan:secrets` red on this
 very brief's prose, caught by the full-tip gate and fixed before push); (2) spec sync —

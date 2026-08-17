@@ -1,6 +1,6 @@
 # PRD #256: Run duration on runs — Runs page + board + CLI
 
-**GitLab Issue**: [#256](https://gitlab.example.com/vtmocanu/uzi/-/issues/256)
+**GitLab Issue**: [#256](https://github.com/vtmocanu/uzi/-/issues/256)
 **Status**: ✅ Done — implemented 2026-08-09 (M1–M6); web + CLI, display-only, no API/DTO/schema change
 **Priority**: High — top priority, do next (owner, 2026-08-09). Deferred only to avoid a Board.tsx collision with the in-flight #196; send the full gated PRD once #196 lands.
 **Mock**: `prds/mockups/256-run-duration-mock.html` (the Runs page with the duration token added; shown to owner 2026-08-08)

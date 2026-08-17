@@ -1,6 +1,6 @@
 # PRD #265: Milestone-completion fidelity — a completed run should not show 0/N
 
-**GitLab Issue**: [#265](https://gitlab.example.com/vtmocanu/uzi/-/issues/265)
+**GitLab Issue**: [#265](https://github.com/vtmocanu/uzi/-/issues/265)
 **Status**: Draft (created 2026-08-09)
 **Priority**: Medium
 

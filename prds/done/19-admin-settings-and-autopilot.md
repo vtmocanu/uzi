@@ -1,6 +1,6 @@
 # PRD #19: Admin Settings (app_settings) + Autopilot Label
 
-**GitLab Issue**: [#19](https://gitlab.example.com/vtmocanu/uzi/-/issues/19)
+**GitLab Issue**: [#19](https://github.com/vtmocanu/uzi/-/issues/19)
 **Status**: Complete (landed 2026-07-05, MR !21, merge 58041ab)
 **Priority**: Medium
 **Created**: 2026-07-05

@@ -1,6 +1,6 @@
 # PRD #38: Run Activity Feed Redesign — Command Fidelity, Hierarchy, Collapsible Agents
 
-**GitLab Issue**: [vtmocanu/uzi#38](https://gitlab.example.com/vtmocanu/uzi/-/issues/38)
+**GitLab Issue**: [vtmocanu/uzi#38](https://github.com/vtmocanu/uzi/-/issues/38)
 **Status**: Implemented on `feature/prd-38-activity-feed-redesign` (2026-07-10) — all 7 milestones done; per-milestone review + audit + web-ux browser pass complete, findings resolved. Design-review provenance: reviewed by 2 agents pre-implementation (↳review marks where the design changed).
 **Priority**: Medium
 **Created**: 2026-07-10

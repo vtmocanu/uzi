@@ -1,6 +1,6 @@
 # PRD #119 — Show pending-judge state on the run page (stop the redundant "Run judge" click)
 
-**Issue**: [#119](https://gitlab.example.com/vtmocanu/uzi/-/issues/119) · **Label**: PRD · **Priority**: Medium
+**Issue**: [#119](https://github.com/vtmocanu/uzi/-/issues/119) · **Label**: PRD · **Priority**: Medium
 **Area**: `api/internal/{store,workersvc,handler}` (read-side) + `web/` run-page **Run review** panel + `api/cmd/uzi` review output. PRD #46 lineage (the run judge).
 
 ## Problem

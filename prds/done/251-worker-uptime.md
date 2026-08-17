@@ -1,6 +1,6 @@
 # PRD #251: Worker uptime — show how long each worker has been online
 
-**GitLab Issue**: [#251](https://gitlab.example.com/vtmocanu/uzi/-/issues/251)
+**GitLab Issue**: [#251](https://github.com/vtmocanu/uzi/-/issues/251)
 **Status**: ✅ Complete — merged to `main` via MR !211 (squash `59a9452d`, 2026-08-08); issue
 auto-closed. Both previously-open items resolved: (1) M1 `task gate:api` — the `lint:api` red was
 a real `staticcheck ST1018` finding (raw U+0085 / U+202E in the CLI sanitization test fixtures,

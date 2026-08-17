@@ -1,6 +1,6 @@
 # PRD #196 — Configurable board membership and run-eligible labels
 
-**Issue**: [#196](https://gitlab.example.com/vtmocanu/uzi/-/issues/196) · **Label**: PRD · **Priority**: Medium
+**Issue**: [#196](https://github.com/vtmocanu/uzi/-/issues/196) · **Label**: PRD · **Priority**: Medium
 **Area**: `web/src/lib/boardCards.ts` + `web/src/pages/Board.tsx` + `web/src/pages/IssueView.tsx` (render filter and card affordances) · `api/internal/settings` (three new keys) · a new per-user board-preference table · `api/internal/workersvc/service.go` (the run-eligibility gate) · `web/src/pages/AdminSettings.tsx`.
 **Mockup**: [`prds/mockups/196-board-membership-labels-mock.html`](../mockups/196-board-membership-labels-mock.html) — seven sections, reviewed and approved 2026-08-02.
 **Line references** are against `a87fd521`.

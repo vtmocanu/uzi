@@ -1,6 +1,6 @@
 # PRD #304: Board search + per-lane show-more paging
 
-**GitLab Issue**: [#304](https://gitlab.example.com/vtmocanu/uzi/-/issues/304)
+**GitLab Issue**: [#304](https://github.com/vtmocanu/uzi/-/issues/304)
 **Status**: Complete (2026-08-10) — all seven milestones implemented, tested
 (1940 web tests green), and documented in `docs/board.md`.
 **Priority**: Medium

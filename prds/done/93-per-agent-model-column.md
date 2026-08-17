@@ -1,6 +1,6 @@
 # PRD #93: Per-agent Model column in the run-view usage table
 
-**GitLab Issue**: [#93](https://gitlab.example.com/vtmocanu/uzi/-/issues/93)
+**GitLab Issue**: [#93](https://github.com/vtmocanu/uzi/-/issues/93)
 **Status**: ✅ Complete (created 2026-07-20, shipped 2026-07-26)
 **Priority**: Low
 **Mockup**: [`prds/mockups/93-per-agent-model-column-mock.html`](../mockups/93-per-agent-model-column-mock.html) (approved 2026-07-20)
@@ -211,7 +211,7 @@ here**: `Td`'s `cx("text-muted", left && "text-fg")` emits both classes, and
 the panel — Agent and Phase included, both predating this PRD — renders muted
 where the mock has them at `fg`. Fixing it would change the per-phase table,
 which this PRD explicitly leaves untouched. Filed as
-[#152](https://gitlab.example.com/vtmocanu/uzi/-/issues/152), with the cascade
+[#152](https://github.com/vtmocanu/uzi/-/issues/152), with the cascade
 order measured against the built stylesheet (`.text-fg` at offset 24294,
 `.text-muted` at 24536 in `dist/assets/index-CyMus4EH.css` on `b9d85633`) rather
 than inferred from the class list.

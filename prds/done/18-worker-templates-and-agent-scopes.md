@@ -1,6 +1,6 @@
 # PRD #18: Worker Templates (git-curated) + Devbox Tool Tiers + Agent Template Scopes
 
-**GitLab Issue**: [#18](https://gitlab.example.com/vtmocanu/uzi/-/issues/18)
+**GitLab Issue**: [#18](https://github.com/vtmocanu/uzi/-/issues/18)
 **Status**: Complete (2026-07-10, MR !32)
 **Priority**: Medium
 **Created**: 2026-07-05
@@ -17,7 +17,7 @@ Three related gaps, all instances of "one size fits all":
 
 ## Inspiration check
 
-| Aspect | bottega | multica | dot-agent-deck | coder (+ myorg/k8s/coder) | uzi (this PRD) |
+| Aspect | bottega | multica | dot-agent-deck | coder (+ myorg/coder) | uzi (this PRD) |
 |---|---|---|---|---|---|
 | Per-user/task tooling | None — fixed worker deps | None — host tools assumed | Ships its own `devbox.json` + `devbox.lock`/`flake.nix` for repo-local pinned tooling (prior art for the engine, not a product feature) | Whole product model: admin-curated **templates** (Terraform) provision full workspace images/VMs; user picks a template | Both: curated image templates in git (the coder-validated shape, minus Terraform) for heavy/system deps + devbox per-repo provisioning for CLI tools |
 | Trust posture for repo-borne config | n/a | Materializes into workdir with native discovery ON (the weakness PRD #16 avoids) | Trusted-by-definition dev repo | Templates are admin-only; workspaces run arbitrary user code by design | Repo manifest is packages-only extraction, opt-in, provisioned in a secret-scrubbed env (Decision 3) |

@@ -1,6 +1,6 @@
 # PRD #322: Cancel and steer runs from Chat and Slack
 
-**Issue**: [#322](https://gitlab.example.com/vtmocanu/uzi/-/issues/322)
+**Issue**: [#322](https://github.com/vtmocanu/uzi/-/issues/322)
 **Priority**: Medium (a run-control gap, not a broken run: both chat surfaces can start a run but neither can stop or steer one)
 **Status**: Implemented (M1–M6 complete; M7 in-worker gates green — `task gate` all slices pass. The one remaining item is the k8s end-to-end acceptance run, which this worker cannot perform (no cluster access); it is left as the operator step, so this PRD stays here rather than moving to `prds/done/`.)
 **Anchor**: all code references below are against `main` @ `e438b44d`.

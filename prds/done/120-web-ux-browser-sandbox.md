@@ -1,6 +1,6 @@
 # PRD #120: web-ux browser reliability — stop runs fighting the SUID sandbox & SPA navigation after PRD #87
 
-**GitLab Issue**: [#120](https://gitlab.example.com/vtmocanu/uzi/-/issues/120)
+**GitLab Issue**: [#120](https://github.com/vtmocanu/uzi/-/issues/120)
 **Status**: **DONE — M5 PASSED on a live worker 2026-07-26.** Fix merged as `6cac089c` (MR !109), released in **v0.11.7**, and verified by run `b64b98f3` (issue #140) on `agent-base:0.11.7`. Hypothesis B confirmed and closed.
 
 > **The measurement.** `web-ux`, dispatched **uncoached** (no mention of the shim, `--no-sandbox`, or PATH — matching the baseline's protocol exactly, or the number would not be comparable):

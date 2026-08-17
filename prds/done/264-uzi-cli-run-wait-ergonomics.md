@@ -1,6 +1,6 @@
 # PRD #264: uzi CLI run-watching & agent-driving ergonomics (`uzi run wait`)
 
-**GitLab Issue**: [#264](https://gitlab.example.com/vtmocanu/uzi/-/issues/264)
+**GitLab Issue**: [#264](https://github.com/vtmocanu/uzi/-/issues/264)
 **Status**: Draft (created 2026-08-09)
 **Priority**: Medium
 

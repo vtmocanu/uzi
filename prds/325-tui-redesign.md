@@ -1,6 +1,6 @@
 # PRD #325: TUI redesign — factory shift board
 
-**GitLab Issue**: [vtmocanu/uzi#325](https://gitlab.example.com/vtmocanu/uzi/-/issues/325)
+**GitLab Issue**: [vtmocanu/uzi#325](https://github.com/vtmocanu/uzi/-/issues/325)
 **Status**: Draft, 2026-08-15. Design validated interactively by the user against a runnable prototype (see **Design reference**); this PRD ports that prototype into the shipped TUI. **Three independent code-verified reviews (architect + reviewer + fact-checker) folded in 2026-08-15** — 2 blocking security/correctness findings and 2 refuted factual claims corrected below; see the review-derived items marked `[review]`.
 **Priority**: Medium (developer-facing polish; the TUI is the primary local driver of runs alongside the web UI)
 **Created**: 2026-08-15

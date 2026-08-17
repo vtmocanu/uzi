@@ -261,7 +261,7 @@
       rationale: "Four runs needed to verify a UI change but had no browser. Enabling the Playwright MCP would let workers self-verify frontend work end to end." },
     { cat: "add_agent", target: "security-auditor", runs: 2, rollup: "filed",
       rationale: "No agent owns dependency CVE triage; two runs shipped with a known-vulnerable transitive dep. A dedicated security-auditor would gate this." },
-    { cat: "enable_tool", target: "skill: dot-ai-taskfile", runs: 2, rollup: "done",
+    { cat: "enable_tool", target: "skill: sibling-app-taskfile", runs: 2, rollup: "done",
       rationale: "Workers hand-wrote Taskfiles that drifted from the org convention. Enabling the taskfile skill gives them the house patterns for free." },
   ];
 

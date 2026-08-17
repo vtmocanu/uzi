@@ -1,6 +1,6 @@
 # PRD #216 — Spread runs across idle workers automatically
 
-**Issue**: [#216](https://gitlab.example.com/vtmocanu/uzi/-/issues/216) · **Label**: PRD · **Priority**: High
+**Issue**: [#216](https://github.com/vtmocanu/uzi/-/issues/216) · **Label**: PRD · **Priority**: High
 **Area**: `api/internal/store/queries/runtime.sql` (`ClaimRun` — the whole feature) · `api/internal/workersvc/service.go:824-830` (the sole caller, gains params) · one migration (the partial index, D11) · `adr/0216-fleet-aware-claim.md` (M0) · `deploy/chart/` + `docs/` (M7-M8).
 **Line references** are against `d367653b`.
 **Status**: in progress (2026-08-09) — M0–M4, M6, M7 landed on `agent/issue-216`; M5 (real-fleet end-to-end + the pre-change control) is owed and unmet, so this PRD stays open. See `adr/0216-fleet-aware-claim.md`.

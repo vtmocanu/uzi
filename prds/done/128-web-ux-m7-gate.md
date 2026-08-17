@@ -1,6 +1,6 @@
 # PRD #128 — M7 gate: prove `web-ux` drives the uzi web UI from a hosted worker
 
-**Issue**: [#128](https://gitlab.example.com/vtmocanu/uzi/-/issues/128) · **Label**: PRD · **Priority**: Medium
+**Issue**: [#128](https://github.com/vtmocanu/uzi/-/issues/128) · **Label**: PRD · **Priority**: Medium
 **Exists to close**: [PRD #87](87-prebake-browser-web-ux.md) M7, its headline DoD gate. This PRD is the gate, not a feature — it ships **no code** and closes the moment the run produces its evidence.
 
 **Status**: **DONE** — closed 2026-07-25. Run `1dfc65b4` delivered every piece of evidence this gate existed to produce.

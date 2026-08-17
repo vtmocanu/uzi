@@ -1,6 +1,6 @@
 # PRD #57: Contextual docs links — UI surfaces link to their in-app guide
 
-**GitLab Issue**: [vtmocanu/uzi#57](https://gitlab.example.com/vtmocanu/uzi/-/issues/57)
+**GitLab Issue**: [vtmocanu/uzi#57](https://github.com/vtmocanu/uzi/-/issues/57)
 **Status**: Draft
 **Priority**: Low
 **Created**: 2026-07-16

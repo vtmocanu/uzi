@@ -1,6 +1,6 @@
 # PRD #56: Slack notifications UX — surface workspace state so users know why DMs can't send
 
-**GitLab Issue**: [vtmocanu/uzi#56](https://gitlab.example.com/vtmocanu/uzi/-/issues/56)
+**GitLab Issue**: [vtmocanu/uzi#56](https://github.com/vtmocanu/uzi/-/issues/56)
 **Status**: Draft — reviewed 2026-07-16, 3 agents (design, security, fact-check), all findings applied (marked ↳review). Design: 1 MAJOR (M4 missed the argo `targetRevision` MR) + wiring precision; security: neutral, health-oracle residual recorded; fact-check: 12/13 claims verified, 1 fixed (mockApi's actual role).
 **Priority**: Medium
 **Created**: 2026-07-16

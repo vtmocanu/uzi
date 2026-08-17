@@ -1,6 +1,6 @@
 # PRD #37: Per-Run Agent Selection — Repo `.claude/agents` Detection with Plan-Gate Choice
 
-**GitLab Issue**: [vtmocanu/uzi#37](https://gitlab.example.com/vtmocanu/uzi/-/issues/37)
+**GitLab Issue**: [vtmocanu/uzi#37](https://github.com/vtmocanu/uzi/-/issues/37)
 **Status**: DONE — **MR !37 merged to main 2026-07-11; issue #37 closed.** All milestones landed, reviewed, and gated. Migration `00052` (cleared main's `00051` head). Milestones: M1 `ed69b54`, M1-fix `1436a3d`, M2 `174bf4c`+`9ce3a79`, M3 `82404d1`, M4 `6959486`, M4-fix `093a160`, M7 `fc49175`, M6 `421ff65`; M5 visual-parity passed. Reviewed clean per-milestone (design + security + fact-check, mostly empirical) plus a whole-diff final review; the must-verify-live SDK-resume property is closed by the M6 capstone. specs/human.md Feature #37 user-approved. A post-merge whole-diff code review ran; any findings are tracked as follow-up issues, not merge blockers (user direction).
 **Priority**: Medium
 **Created**: 2026-07-10

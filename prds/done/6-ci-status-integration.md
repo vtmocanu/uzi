@@ -1,6 +1,6 @@
 # PRD #6: CI Status Integration & CI-Fix Agent
 
-**GitLab Issue**: [vtmocanu/uzi#6](https://gitlab.example.com/vtmocanu/uzi/-/issues/6)
+**GitLab Issue**: [vtmocanu/uzi#6](https://github.com/vtmocanu/uzi/-/issues/6)
 **Status**: Complete (2026-07-06, MR !29)
 **Priority**: Medium
 **Created**: 2026-07-04

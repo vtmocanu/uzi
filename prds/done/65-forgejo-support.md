@@ -1,6 +1,6 @@
 # PRD #65: Forgejo support — the second forge driver
 
-**GitLab Issue**: [#65](https://gitlab.example.com/vtmocanu/uzi/-/issues/65)
+**GitLab Issue**: [#65](https://github.com/vtmocanu/uzi/-/issues/65)
 **Status**: **Complete (2026-07-18, merged as MR !68)** — all 12 milestones landed, the go-live gate flip is live, and the team caught ~14 PRD claims/gaps with evidence along the way (incl. two functional bugs the e2e surfaced: the CI-fix loop broken for Forgejo's `"failure"` status, and `CreateIssue` 502'ing on the trigger label). Cross-driver DoS hardening spun out to #74. Created 2026-07-17; designed by the architect agent, then revised twice the same day across two review waves — reviewer + security audit + fact-check, then a second wave on the revision. The security audit invalidated D6's original mapping; the fact-checks refuted 8 claims, two of which the PRD author had personally asserted as verified; the guardrail-enforcement work was split out to #66 mid-session.
 **Priority**: Medium
 **Depends on**: no uzi PRD, and — as of D10 (2026-07-17) — **no human-owned dependency either**. ~~One external, human-owned dependency: the self-hosted validation instance must be upgraded to Forgejo ≥16.0.0 (currently 15.0.4) before M9 can validate live — see R2.~~ M9 validates against a **pinned ephemeral `forgejo/forgejo:16.0.0` container**; the self-hosted upgrade is still wanted for dogfooding but gates nothing. See D10/R2.

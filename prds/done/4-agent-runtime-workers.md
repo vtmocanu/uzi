@@ -1,6 +1,6 @@
 # PRD #4: Agent Runtime — Workers, Job Queue & Live Run View
 
-**GitLab Issue**: [vtmocanu/uzi#4](https://gitlab.example.com/vtmocanu/uzi/-/issues/4)
+**GitLab Issue**: [vtmocanu/uzi#4](https://github.com/vtmocanu/uzi/-/issues/4)
 **Status**: COMPLETE — all seven milestones reviewed, audited, fixed, and merged to `prd-4-agent-runtime` (M1+M2 @ 11501cb; M3 @ 89a175a; M4 @ 8f1d50f; M5 @ d3e67e4; M6 E2E+hardening @ 07c6589; M7 docs @ 4ae0006; plus a compose config-passthrough fix @ de3b0a1 and the optional `UZI_SEED_ANTHROPIC_TOKEN` boot-seed). **A real user-authorized live run (2026-07-04) validated the headline Success Criteria end-to-end** (see decision log): a PRD issue created from uzi web ran through the plan gate, user approval, subagent implement/review, and a real worker-opened MR on `vtmocanu/uzi` — no CLI interaction after worker setup, primary directive held organically, zero secrets leaked. **Merged to `main` via MR !6 on 2026-07-04** (a second user-driven live run confirmed the multi-agent delegation fix and caught + fixed a live-view WebSocket bug — see decision log); archived to `prds/done/`.
 **Priority**: High
 **Created**: 2026-07-03

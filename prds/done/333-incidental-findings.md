@@ -1,6 +1,6 @@
 # PRD #333 — Incidental Findings: agents surface off-task bugs for one-click filing
 
-- **Issue**: https://gitlab.example.com/vtmocanu/uzi/-/issues/333
+- **Issue**: https://github.com/vtmocanu/uzi/-/issues/333
 - **Mock**: interactive UI mock (run-stream card, inbox ping, review-and-file editor, per-repo Findings backlog) built during PRD authoring — https://claude.ai/code/artifact/6a1d59ec-d754-4583-b4e3-1a71fc52c300
 - **Status**: Implemented (all eight milestones landed on `agent/issue-333`, 2026-08-16)
 - **Priority**: Medium

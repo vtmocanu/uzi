@@ -1,6 +1,6 @@
 # PRD #268: Slack DM UX — deliver chat answers to the thread, and give every DM real Slack formatting
 
-**GitLab Issue**: [vtmocanu/uzi#268](https://gitlab.example.com/vtmocanu/uzi/-/issues/268)
+**GitLab Issue**: [vtmocanu/uzi#268](https://github.com/vtmocanu/uzi/-/issues/268)
 **Status**: Done (2026-08-09)
 **Priority**: High
 **Created**: 2026-08-09

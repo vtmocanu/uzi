@@ -1,6 +1,6 @@
 # PRD #300: Per-schedule model override for scheduled runs
 
-**GitLab Issue**: [#300](https://gitlab.example.com/vtmocanu/uzi/-/issues/300)
+**GitLab Issue**: [#300](https://github.com/vtmocanu/uzi/-/issues/300)
 **Status**: Done (2026-08-11) — implemented on branch agent/issue-300 (M1–M7)
 **Priority**: Medium
 **Related**: PRD #17 (per-user `default_model` + the shared `agenttmpl.ValidateModel` gate this PRD reuses — `api/internal/agenttmpl/model.go:27`). PRD #69 (per-user judge model — the same "layer a nullable model override above a lower default" pattern, one layer up). PRD #241 (run schedules — the `ScheduleRequest`/`ScheduleDTO`/`schedsvc` surface this extends). PRD #274 (scheduled sweep guidance + `MaxIssues` — the "present, even to clear" tri-state pointer semantics this PRD copies for the new field). PRD #46 (self-improvement — the scheduled scan → auto-approved run → open-MR terminal that the motivating "bingo" scenario reuses wholesale). PRD #302 (the general `uzi schedule edit` CLI verb, split out of this PRD's M5; this PRD ships only `create --model` plus read-only exposure of the frozen run model).

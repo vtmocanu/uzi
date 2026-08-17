@@ -1,6 +1,6 @@
 # PRD #45: OIDC SSO login — Keycloak / Pocket ID
 
-**GitLab Issue**: [#45](https://gitlab.example.com/vtmocanu/uzi/-/issues/45)
+**GitLab Issue**: [#45](https://github.com/vtmocanu/uzi/-/issues/45)
 **Status**: Complete (2026-07-12, MR !44 merged). Keycloak verified against a real instance; Pocket ID walkthrough verification remains a manual user step (passkey bootstrap).
 **Priority**: Medium
 **Created**: 2026-07-12

@@ -1,6 +1,6 @@
 # PRD #117 — Your-usage card orphans the "see per-run detail →" arrow
 
-**Issue**: [#117](https://gitlab.example.com/vtmocanu/uzi/-/issues/117) · **Label**: PRD · **Priority**: Low
+**Issue**: [#117](https://github.com/vtmocanu/uzi/-/issues/117) · **Label**: PRD · **Priority**: Low
 **Area**: `web/` dashboard usage cards (PRD #40 lineage).
 **Status**: **DONE** — merged `f5d26658` via `95dfb5e3`, released in **v0.11.3**. Closed 2026-07-25.
 

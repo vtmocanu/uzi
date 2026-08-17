@@ -1,6 +1,6 @@
 # PRD #47: Loop/hang detection — flag slow, stalled, or looping runs in UI and Slack
 
-**GitLab Issue**: [#47](https://gitlab.example.com/vtmocanu/uzi/-/issues/47)
+**GitLab Issue**: [#47](https://github.com/vtmocanu/uzi/-/issues/47)
 **Status**: Complete — merged 2026-07-13 via MR !46 (all 6 milestones; 4 review waves + audit + web-ux + fact-check clean)
 **Priority**: High (plan.md line 68)
 **Created**: 2026-07-12

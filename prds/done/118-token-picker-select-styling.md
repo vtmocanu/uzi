@@ -1,6 +1,6 @@
 # PRD #118 — Per-worker token picker renders as an unstyled native select
 
-**Issue**: [#118](https://gitlab.example.com/vtmocanu/uzi/-/issues/118) · **Label**: PRD · **Priority**: Low
+**Issue**: [#118](https://github.com/vtmocanu/uzi/-/issues/118) · **Label**: PRD · **Priority**: Low
 **Area**: `web/` — the `Select` UI primitive (`web/src/components/ui.tsx`) and its one styled-override caller, the Workers page token picker (PRD #104 lineage).
 **Status**: **DONE** — merged `cbc660e7` via `f8b79b9f`, released in **v0.11.3**. Closed 2026-07-25.
 

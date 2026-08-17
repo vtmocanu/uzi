@@ -1,6 +1,6 @@
 # PRD #270: Judge filter-chip counts scope to the selected triage tab
 
-**GitLab Issue**: [#270](https://gitlab.example.com/vtmocanu/uzi/-/issues/270)
+**GitLab Issue**: [#270](https://github.com/vtmocanu/uzi/-/issues/270)
 **Status**: ✅ Done — implemented 2026-08-09 (all milestones M1–M6 landed and reviewed on branch `agent/issue-270`; backend matrix + uncapped SQL, frontend tab-scoped refetch, mock parity + differential test, docs + specs §506)
 **Priority**: Medium
 

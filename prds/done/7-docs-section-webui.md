@@ -1,6 +1,6 @@
 # PRD #7: In-app Docs Section — Terse Howtos with Screenshots
 
-**GitLab Issue**: [vtmocanu/uzi#7](https://gitlab.example.com/vtmocanu/uzi/-/issues/7)
+**GitLab Issue**: [vtmocanu/uzi#7](https://github.com/vtmocanu/uzi/-/issues/7)
 **Status**: Complete (2026-07-04). M1-M5 done; 4-agent review wave passed, all findings fixed; specs synced; merged to main via MR !9. GitLab-side screenshot real, uzi-UI shots stay placeholders by decision until the UI stabilizes.
 **Priority**: Medium
 **Created**: 2026-07-04
@@ -51,7 +51,7 @@ Only `audience: user` pages are listed and routable in-app, ordered by `order`. 
 
 - Routes: `/docs` (index: title list with one-line summaries) and `/docs/:slug`. **Public, no auth** — bot setup and token howtos are exactly what a user needs *before* they can do anything in uzi, and nothing in `docs/` is secret (the stack is loopback-only; the same files are world-readable in the repo). An unknown slug renders a not-found state inside the docs shell (with a link back to `/docs`), not the App-level catch-all redirect to `/`.
 - Renderer: `react-markdown` + `remark-gfm` — two new deps, added (with lockfile) as an explicit M1 step. The existing docs use GFM tables. Raw HTML is not rendered (no `rehype-raw`) — inert by default. External links get `rel="noopener noreferrer"`. No nginx CSP change needed (same-origin `img-src 'self'`, class-based Tailwind, no inline scripts — verified against current `web/nginx.conf`).
-- Link rewriting: relative `*.md` links between docs resolve to `/docs/:slug` when the target is a bundled `user` page; links to repo-only files (`../plan.md`, `auth-design.md`) rewrite to the pinned GitLab blob base `https://gitlab.example.com/vtmocanu/uzi/-/blob/main/` + repo-relative path. `#anchor` fragments are preserved in both cases (the existing docs lean on them, e.g. `ARCHITECTURE.md#forge-integration`). Relative `img/*` sources resolve through the asset-URL map.
+- Link rewriting: relative `*.md` links between docs resolve to `/docs/:slug` when the target is a bundled `user` page; links to repo-only files (`../plan.md`, `auth-design.md`) rewrite to the pinned GitLab blob base `https://github.com/vtmocanu/uzi/blob/main/` + repo-relative path. `#anchor` fragments are preserved in both cases (the existing docs lean on them, e.g. `ARCHITECTURE.md#forge-integration`). Relative `img/*` sources resolve through the asset-URL map.
 - Styling: Tailwind prose-style rules consistent with the existing dark theme; responsive (mobile-first, per plan.md's adaptive-width requirement). Nav gets a "Docs" link in both authenticated and logged-out states (`web/src/components/Layout.tsx`).
 
 ### Content plan — terse or it didn't happen

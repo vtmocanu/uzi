@@ -1,6 +1,6 @@
 # PRD #313: Worker lint ratchet clamps to the true branch base
 
-**Issue**: https://gitlab.example.com/vtmocanu/uzi/-/issues/313
+**Issue**: https://github.com/vtmocanu/uzi/-/issues/313
 **Priority**: Medium
 **Status**: Complete (2026-08-14)
 

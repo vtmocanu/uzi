@@ -1,6 +1,6 @@
 # PRD #39: In-App uzi Chat Agent — chat with uzi about itself, its runs, and its work
 
-**GitLab Issue**: [vtmocanu/uzi#39](https://gitlab.example.com/vtmocanu/uzi/-/issues/39)
+**GitLab Issue**: [vtmocanu/uzi#39](https://github.com/vtmocanu/uzi/-/issues/39)
 **Status**: Draft — reviewed 2026-07-10 by 3 agents (design, security, fact-check); all blocking/major findings folded in below (marked ↳review where the design changed).
 **Priority**: Medium
 **Created**: 2026-07-10

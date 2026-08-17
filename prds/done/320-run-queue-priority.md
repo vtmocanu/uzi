@@ -1,6 +1,6 @@
 # PRD #320 — Run queue priority: background runs yield to interactive work, with a manual expedite
 
-- **Issue**: https://gitlab.example.com/vtmocanu/uzi/-/issues/320
+- **Issue**: https://github.com/vtmocanu/uzi/-/issues/320
 - **Source idea**: `ideas/bingo/2026-08-11-run-queue-priority.md` (feature-bingo run, 2026-08-11)
 - **Mock**: interactive mock of the Runs page with the feature (priority pills, Expedite, fail-open) built during PRD authoring
 - **Status**: Done — all milestones M1–M7 landed on `agent/issue-320` (2026-08-17)

@@ -1,6 +1,6 @@
 # PRD #43: Intra-run parallel subagents — parallel validators and disjoint-scope parallel coders
 
-**GitLab Issue**: [vtmocanu/uzi#43](https://gitlab.example.com/vtmocanu/uzi/-/issues/43)
+**GitLab Issue**: [vtmocanu/uzi#43](https://github.com/vtmocanu/uzi/-/issues/43)
 **Status**: Complete (2026-07-12) — M0 ✅ (verdict: **OVERLAP**), M2 ✅, M1 ✅, M5 ✅, M4 ✅ landed on `feature/prd-43-intra-run-parallel-subagents`; **M3 waived by user decision 2026-07-12 (no human-driven tests for this PRD)** — the parallel path's live behavior is validated by the M0 probe + unit/e2e guards only; Decision 6's feed-legibility question stays open until a real parallel run happens organically. Draft was reviewed 2026-07-10/11 by 3 agents (fact-check, security, design); all blocking/major findings folded in (marked ↳review where the design changed). The headline sequencing change: **the SDK-concurrency premise is proven first (M0) before any template prose ships.**
 **Priority**: Medium
 **Created**: 2026-07-10

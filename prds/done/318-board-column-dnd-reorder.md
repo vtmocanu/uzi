@@ -1,6 +1,6 @@
 # PRD #318: Board columns — grip-handle drag-and-drop reorder (replace ↑/↓ arrows)
 
-**GitLab Issue**: [vtmocanu/uzi#318](https://gitlab.example.com/vtmocanu/uzi/-/issues/318)
+**GitLab Issue**: [vtmocanu/uzi#318](https://github.com/vtmocanu/uzi/-/issues/318)
 **Status**: Draft — created 2026-08-15. Design analysis by a `ux-designer` agent (recommendation was a *hybrid* keeping the arrows; the owner overrode it to **drop the arrows entirely**, accepting the a11y residual below). An interactive mock was built and reviewed in-browser before this PRD (Claude artifact "Column Grip"; illustrative only — the full interaction is specified in text here, since a uzi worker cannot fetch it).
 **Priority**: Medium
 **Depends on**: nothing new. Reuses the board cards' existing native-HTML5 DnD pattern already in `web/src/pages/Board.tsx`.

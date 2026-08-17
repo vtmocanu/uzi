@@ -1,6 +1,6 @@
 # PRD #321: Distinguish a run's planning phase from its running phase
 
-**Issue**: [#321](https://gitlab.example.com/vtmocanu/uzi/-/issues/321)
+**Issue**: [#321](https://github.com/vtmocanu/uzi/-/issues/321)
 **Priority**: Medium (a correctness-of-communication gap, not a broken run: every surface reports "running" for two visibly different things)
 **Status**: Planned
 **Anchor**: all code references below are against `main` @ `b0b659b6`.

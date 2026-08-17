@@ -1,6 +1,6 @@
 # PRD #217 — Don't re-pick the just-exhausted Anthropic token after a usage-limit park
 
-**Issue**: [#217](https://gitlab.example.com/vtmocanu/uzi/-/issues/217) · **Label**: PRD · **Priority**: Medium
+**Issue**: [#217](https://github.com/vtmocanu/uzi/-/issues/217) · **Label**: PRD · **Priority**: Medium
 **Area**: `api/internal/workersvc/limitwait.go` (the park, M1) · `api/internal/store/queries/anthropic_rate_limits.sql` + a migration (M1) · `api/internal/autoselect/select.go` + `api/internal/workersvc/service.go` (the claim, M2) · `api/internal/anthropic/client.go` + `web/src/lib/api.ts` + the meter rendering (M3) · `docs/` (M5).
 **Line references** are against `d367653b`.
 **Status**: M1–M6 implemented, tested and reviewed (branch `agent/issue-217`). M7 (validate on dev-cluster) is not done — it needs a hosted k8s deploy outside this change's scope.

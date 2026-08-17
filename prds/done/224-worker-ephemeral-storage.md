@@ -96,7 +96,7 @@ nothing defaults the missing value in.
   **WITHDRAWN — see Amendment A3/§1. Do not act on this bullet.**
 
 **Deliverable for the design wave: settle this with a citation, not an argument.** The live values
-are in the ArgoCD repo (`~/repos/myorg/myorg/k8s/argo-apps/`, per the user's global
+are in the ArgoCD repo (`~/repos/argo-apps/`, per the user's global
 CLAUDE.md) and the live cluster is `dev-cluster`. A rendered `helm template` with the shipped
 defaults plus a `kubectl get resourcequota -n uzi-workers-docker -o yaml` settles it outright.
 
@@ -646,7 +646,7 @@ exact-names rule arriving from a second direction.
 quota/LimitRange reads are what the cluster holds now, not proof of what the chart renders (the
 auditor covers that half). It did not check whether non-uzi workloads on those nodes declare
 ephemeral requests, so A3.5's headroom is a node ceiling rather than a free remainder. **And every
-source citation is upstream `release-1.29` while this is a vendor/platform FIPS build
+source citation is upstream `release-1.29` while this is a vendor FIPS build
 (`v1.29.4+vendor.3-fips.1`) whose patch set it did not diff** — a vendor deviation in the eviction
 manager would have been invisible to it. The live message rendering byte-matches the upstream format
 string, which is a positive control on that one path and not on the others.
@@ -841,7 +841,7 @@ clamp is a **floor**). No preStop hooks exist, so nothing subtracts from it. **T
   shutdown is DISABLED on these kubelets.** On an ungraceful node power-off or machine replacement,
   pods get **no SIGTERM window at all**. `kubectl drain` is unaffected (it goes through the same
   `CheckGracefulDelete`, so 30s). **If the fleet is ever rolled by replacing NODES rather than by
-  patching Deployments, none of the 30s reasoning applies** — and this fleet sits on a platform node
+  patching Deployments, none of the 30s reasoning applies** — and this fleet sits on a hardened node
   pool, so that is not hypothetical.
 - **30s being AVAILABLE is not the fetch-back FITTING in it.** A `git fetch` against
   `gitlab.example.com` from a worker holding an arbitrary repo is unmeasured. Note the asymmetry
@@ -946,7 +946,7 @@ evidence the current default is too small — it is evidence that **one worker p
 bump**, and newly-provisioned workers sit at 14.2% with 15.7 GiB free. **n=1 affected worker**, and
 `nixSize`'s own comment already prescribes the remedy: *"v1's remedy is delete + reprovision"*.
 
-*And the expansion path has ZERO headroom:* `allowVolumeExpansion: true` on `storage-class` (resizer runs
+*And the expansion path has ZERO headroom:* `allowVolumeExpansion: true` on `standard` (resizer runs
 `--handle-volume-inuse-error=false`, so online-capable), **but the LimitRange PVC `max` is 20Gi and
 `nixSize` is already 20Gi.** The limitranger validates PVC **updates** (only *Pod* updates are
 exempt, `admission.go:427-429`), so a patch beyond 20Gi is rejected at admission. M-c can take the
@@ -1016,7 +1016,7 @@ for the third PVC's create-gate; and the A8.8 ownership check on a real cluster.
 materializer test that `desired < observed` issues **no** patch — the case that would otherwise
 produce a rejected update every tick.
 
-**A8.13 — issue #225 FILED** (`https://gitlab.example.com/vtmocanu/uzi/-/issues/225`) for A7.3's
+**A8.13 — issue #225 FILED** (`https://github.com/vtmocanu/uzi/-/issues/225`) for A7.3's
 imagefs/image-accumulation defect, per the user's decision to file rather than fix.
 
 ### A9 — 2026-08-04, USER DECISIONS. **THE DESIGN IS NOW FROZEN. The coder builds exactly this.**
@@ -1177,7 +1177,7 @@ real pipeline.
 ### A12 — 2026-08-04, AUDIT of M-a at `35ef2996`. Verdict sound; one Medium to fix before merge.
 
 Read from a detached worktree. **The cluster went unreachable partway through** (`dial tcp
-192.0.2.25:6443: i/o timeout`, 4 attempts over ~10 min), so the live quota `used` after the raise
+192.0.2.1:6443: i/o timeout`, 4 attempts over ~10 min), so the live quota `used` after the raise
 was **not** re-verified and the auditor says so rather than inferring it. See A12.6.
 
 **A12.1 — 🔴 MEDIUM: `dindDataSize` is DOCUMENTED IN THREE PLACES AND GUARDED IN NONE, and the
@@ -1358,11 +1358,11 @@ After M-a the k8s equivalent is a persistent PVC with no GC. One sentence naming
 prune` and delete+reprovision. **→ documenter (task #6).**
 
 **A13.11 — N8, UNRESOLVED, cluster down: PV reclaim policy is now a 1.5x'd exposure.** Teardown
-deletes the PVC; whether the backing PV and datastore disk are freed depends on `storage-class`'s
+deletes the PVC; whether the backing PV and datastore disk are freed depends on `standard`'s
 `reclaimPolicy`. **Under `Retain` the storage leaks per torn-down worker and the quota cannot see
 it**, because a quota counts PVCs, not orphaned PVs. Pre-existing for `/data` and `/nix`; three
 claims per docker worker now. One command answers it:
-`kubectl get sc storage-class -o jsonpath='{.reclaimPolicy}'`. **Reported unresolved rather than
+`kubectl get sc standard -o jsonpath='{.reclaimPolicy}'`. **Reported unresolved rather than
 guessed** — the apiserver went unreachable for the reviewer too, independently of the auditor.
 
 **A13.12 — the fsGroup scoping nit AGREES WITH A12.5, reached independently.** Both flag that
@@ -2093,7 +2093,7 @@ unreachable from here). Three design choices make it evidence rather than theatr
   (`apps/uzi/app.uzi.yaml` → `$values/deploy/values/dev-cluster.yaml`) **does not override**
   `workers.quota`, `workers.limitRange`, `workers.docker.quota` or `workers.docker.limitRange`, so
   A9.2's chart-default raise reaches the cluster unchanged. It *does* set `rootless: false`,
-  `dindResources: 500m/2Gi req, 4/6Gi lim`, `storageClass: storage-class`, `maxConcurrentRuns: 2` — all
+  `dindResources: 500m/2Gi req, 4/6Gi lim`, `storageClass: standard`, `maxConcurrentRuns: 2` — all
   fed in.
 
 Both tiers, every preset size: **rc=0**, all three PVCs plus Deployment plus bare Pod "created
@@ -2159,7 +2159,7 @@ group 0, not 10001, so the fsGroup chown never happened.** A control pod with **
 and an unrelated uid 4242** wrote just as happily. Both PVs are hostPath (`rancher.io/local-path`),
 which kubelet **excludes** from fsGroup ownership management and which hands out a world-writable
 root. ***"The green came from mode 0777, not from `fsGroup`. Reporting the green would have been a
-false all-clear."*** dev-cluster's `storage-class` has a `fsGroupPolicy` unreadable from here, and
+false all-clear."*** dev-cluster's `standard` has a `fsGroupPolicy` unreadable from here, and
 `fsGroupPolicy: None` is exactly the case where kubelet skips the chown. **Stays on the rollout, for
 the rootless posture only.**
 

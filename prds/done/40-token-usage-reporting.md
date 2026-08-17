@@ -1,6 +1,6 @@
 # PRD #40: Token Usage & Cost Reporting — Per Run, Per User, Factory-Wide
 
-**GitLab Issue**: [vtmocanu/uzi#40](https://gitlab.example.com/vtmocanu/uzi/-/issues/40)
+**GitLab Issue**: [vtmocanu/uzi#40](https://github.com/vtmocanu/uzi/-/issues/40)
 **Status**: Complete (merged via MR !45, 2026-07-13). M1-M6 landed; deferred residual: live-credential verdict-(b) firm-up (two-phase run across a requeue boundary reconciling totals + strip==list-row check). Originally: Draft — reviewed 2026-07-10 by 2 agents (design review, fact-check); all blocking/major findings folded in below (marked ↳review where the design changed). Decision 11 (per-agent attribution) added 2026-07-12 on user request and reviewed the same day by 2 agents (design review, fact-check); all findings folded in (major: usage attach moved executor-side past the signal filter).
 **Priority**: Medium
 **Created**: 2026-07-10

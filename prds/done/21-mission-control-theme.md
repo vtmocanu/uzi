@@ -1,6 +1,6 @@
 # PRD #21: Mission-Control Theme — data-theme Port of the Ops-Console Identity
 
-**GitLab Issue**: [vtmocanu/uzi#21](https://gitlab.example.com/vtmocanu/uzi/-/issues/21)
+**GitLab Issue**: [vtmocanu/uzi#21](https://github.com/vtmocanu/uzi/-/issues/21)
 **Status**: Complete (merged to main 2026-07-05, MR !23, 149e3a3). Previously: Ready, gated on PRD #19 M1 (2026-07-05: reviewed by 2 agents — adversarial fact-check + design review; all findings incorporated: ember slot inventory corrected, expectations reframed to what tokens deliver, queue-tone slot added per user decision, minimal branch named, M0 preservation split out, SC2 made satisfiable. Later same day: standalone `instance_settings` design replaced — the instance default now tenants into PRD #19's `app_settings`, since #19 is in flight and builds the identical infra; see Decision 2. Post-rework review wave — fact-check + design review — applied: `/me` carries resolved + override + default theme, since resolved-only broke the "Use default (<name>)" picker; user pref tenants into #17's `/api/me/settings` instead of a new `/me/prefs` route; canonical Go theme registry shared by both write surfaces; per-key-dispatch constraint stated for #19's PUT; admin-side mock parity made explicit; SC5 edit count corrected; docs/specs coordinated with #19 M6)
 **Priority**: Medium
 **Created**: 2026-07-05

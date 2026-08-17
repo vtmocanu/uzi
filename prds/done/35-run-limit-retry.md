@@ -1,7 +1,7 @@
 # PRD #35: Retry after Anthropic usage limit — park runs until the limit resets
 
-**GitLab Issue**: [vtmocanu/uzi#35](https://gitlab.example.com/vtmocanu/uzi/-/issues/35)
-**Status**: **COMPLETE** (created 2026-07-12; completed 2026-07-28) — MR [!143](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/143), 49 commits from `2c93a4af`. All milestones landed (M0, M-SEAM, M1-M6, M-CLI), built across five file-disjoint worktrees that merged with zero conflicts; every code milestone reviewed and security-audited; full `run-e2e.sh` green (210 PASS) including four new PRD #35 scenarios.
+**GitLab Issue**: [vtmocanu/uzi#35](https://github.com/vtmocanu/uzi/-/issues/35)
+**Status**: **COMPLETE** (created 2026-07-12; completed 2026-07-28) — MR [!143](https://github.com/vtmocanu/uzi/-/merge_requests/143), 49 commits from `2c93a4af`. All milestones landed (M0, M-SEAM, M1-M6, M-CLI), built across five file-disjoint worktrees that merged with zero conflicts; every code milestone reviewed and security-audited; full `run-e2e.sh` green (210 PASS) including four new PRD #35 scenarios.
 Re-verified 2026-07-27 against HEAD `ca597779` before implementation began (1343 commits after authoring) — citations refreshed, six claims refuted, four prescriptions dropped as already-satisfied (marked ↳2026-07-27). The original header claimed "Fact-check: every claim verified"; that was not true of the prior-art paragraph, which was wrong at authoring time against a submodule pointer that never moved — see the Prior-art note below.
 **Priority**: Medium
 **Created**: 2026-07-12

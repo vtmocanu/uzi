@@ -1,6 +1,6 @@
 # PRD #68: File a forge issue from a judge recommendation
 
-**GitLab Issue**: [#68](https://gitlab.example.com/vtmocanu/uzi/-/issues/68)
+**GitLab Issue**: [#68](https://github.com/vtmocanu/uzi/-/issues/68)
 **Status**: Complete (2026-07-19) — merged to main via MR !71. Migration landed as `00071` (`00070` was taken by PRD #83's `worker_docker_enabled` on the landing rebase).
 **Priority**: Medium
 **Mockup**: [`prds/mockups/68-judge-file-issue-mock.html`](../mockups/68-judge-file-issue-mock.html) (5 states)

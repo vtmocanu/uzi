@@ -1,6 +1,6 @@
 # PRD #59: Default judge model → sonnet
 
-**GitLab Issue**: [#59](https://gitlab.example.com/vtmocanu/uzi/-/issues/59)
+**GitLab Issue**: [#59](https://github.com/vtmocanu/uzi/-/issues/59)
 **Status**: Draft (created 2026-07-16)
 **Priority**: Low
 **Related**: PRD #46 (run judge + self-improvement — introduced `judge_model` with the haiku default this PRD flips; Decision 7 there stays as the historical record).

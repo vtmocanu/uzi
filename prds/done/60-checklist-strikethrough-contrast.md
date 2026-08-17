@@ -1,6 +1,6 @@
 # PRD #60: Legible strikethrough on completed checklist steps
 
-**GitLab Issue**: [#60](https://gitlab.example.com/vtmocanu/uzi/-/issues/60)
+**GitLab Issue**: [#60](https://github.com/vtmocanu/uzi/-/issues/60)
 **Status**: Complete (created 2026-07-16, shipped 2026-07-27)
 **Priority**: Low
 **Mock**: https://claude.ai/code/artifact/2347a25a-a83c-48cb-9a0a-a460eff1c2fa

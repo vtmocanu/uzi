@@ -1,6 +1,6 @@
 # PRD #88: Ask-user clarification — agent-initiated questions before & during a run
 
-**GitLab Issue**: [vtmocanu/uzi#88](https://gitlab.example.com/vtmocanu/uzi/-/issues/88)
+**GitLab Issue**: [vtmocanu/uzi#88](https://github.com/vtmocanu/uzi/-/issues/88)
 **Status**: Complete (created 2026-07-19, shipped 2026-07-29)
 **Priority**: Medium
 

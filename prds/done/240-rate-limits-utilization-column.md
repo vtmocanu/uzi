@@ -1,6 +1,6 @@
 # PRD #240: Rate limits table — stack the two windows into one "Utilization" column
 
-**GitLab Issue**: [#240](https://gitlab.example.com/vtmocanu/uzi/-/issues/240)
+**GitLab Issue**: [#240](https://github.com/vtmocanu/uzi/-/issues/240)
 **Status**: Complete (created 2026-08-07; shipped 2026-08-09) — all milestones done, archived to `prds/done/`
 **Priority**: Low
 **Mock**: `prds/mockups/240-rate-limits-utilization-mock.html` (Option A of three; shown to owner 2026-08-07, chosen)

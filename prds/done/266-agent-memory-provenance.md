@@ -1,6 +1,6 @@
 # PRD #266: Trustworthy agent memory — evidence-gated `save_memory` and roster tool-awareness
 
-**GitLab Issue**: [vtmocanu/uzi#266](https://gitlab.example.com/vtmocanu/uzi/-/issues/266)
+**GitLab Issue**: [vtmocanu/uzi#266](https://github.com/vtmocanu/uzi/-/issues/266)
 **Status**: Complete — implemented and reviewed 2026-08-09 (M1–M5 landed on `agent/issue-266`; roster tool-awareness, evidence-gated `save_memory`, provenance persistence + per-entry read-side marker, config-claim nudge, and docs; each milestone reviewed and its gate green).
 **Priority**: High
 **Created**: 2026-08-09

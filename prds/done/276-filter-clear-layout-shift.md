@@ -1,6 +1,6 @@
 # PRD #276: Filter-by-label "Clear" — no layout shift, button-not-link styling
 
-**GitLab Issue**: [#276](https://gitlab.example.com/vtmocanu/uzi/-/issues/276)
+**GitLab Issue**: [#276](https://github.com/vtmocanu/uzi/-/issues/276)
 **Status**: ✅ Done — 2026-08-09 (implemented via Option B: always-mounted, visibility-
 toggled Clear; three link-styled actions restyled as on-token ghost buttons with
 `min-h-[24px]` meeting WCAG 2.5.8; `task gate:web` green; browser-verified no shift in

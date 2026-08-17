@@ -1,6 +1,6 @@
 # PRD #237 — Live token counts on the run page from the first model call
 
-**Issue**: [#237](https://gitlab.example.com/vtmocanu/uzi/-/issues/237) · **Label**: PRD · **Priority**: Medium
+**Issue**: [#237](https://github.com/vtmocanu/uzi/-/issues/237) · **Label**: PRD · **Priority**: Medium
 **Area**: `web/src/lib/runUsage.ts` + `web/src/components/RunUsage.tsx` + `web/src/pages/RunView.tsx` + `web/src/mocks/{data,engine}.ts` (client-derived, PRD #40 / #195 lineage). No API, no schema, no worker change.
 **Line references** are against `f05e97c8` (== `origin/main` at authoring).
 **Status**: Not started as a milestone checklist. A **seeded run** (`40299b06-3e10-4153-ac9a-030b6ee9d1a9`) is implementing M1, M1b and M2 from a plan; M3 is a human live-verify. This PRD is the durable design record; the seed plan is the worker's instruction and is consistent with it.

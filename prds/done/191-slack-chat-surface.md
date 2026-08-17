@@ -1,6 +1,6 @@
 # PRD #191: Slack as a conversational surface — chat, run control, and status from a DM
 
-**GitLab Issue**: [vtmocanu/uzi#191](https://gitlab.example.com/vtmocanu/uzi/-/issues/191)
+**GitLab Issue**: [vtmocanu/uzi#191](https://github.com/vtmocanu/uzi/-/issues/191)
 **Status**: Complete (2026-08-09) — all milestones M1–M7 implemented and reviewed; retired to `prds/done/`. History below is preserved as the drafting/review record.
 **Status (drafting)**: Draft — reviewed 2026-07-29 by two agents, all findings applied.
 Architect: 2 BLOCKER + 6 MAJOR + 6 MINOR (marked ↳review) — changed the milestone
@@ -240,7 +240,7 @@ with real Create / Dismiss buttons.
    **accepted**, bypassing `SubmitChatMessage`'s turn cap — the CLI refused to *offer*
    the affordance (`tui_steer.go:85-90`) but the API accepted the call. A pre-existing
    spend-cap-bypass defect, filed separately rather than smuggled into a Slack
-   milestone: **[vtmocanu/uzi#192](https://gitlab.example.com/vtmocanu/uzi/-/issues/192)**.
+   milestone: **[vtmocanu/uzi#192](https://github.com/vtmocanu/uzi/-/issues/192)**.
    **↳update 2026-08-09 — #192 is now CLOSED** (`fix(258): reject follow_up on chat
    runs at the SubmitInput boundary`, `32e91f99`): the guard sits at the service
    boundary and covers HTTP, CLI and future Slack. Decision 5 no longer *keeps Slack out
@@ -631,7 +631,7 @@ calls "worse than no guard, because the surface *looks* protected".
   chat-injection hole (Decision 5) was real, verified at `f25eff39`, and predated this
   work. Folding it into a Slack milestone would have hidden a spend-cap bypass inside a
   feature MR and left it unfixed for as long as this PRD takes. Filed as
-  [#192](https://gitlab.example.com/vtmocanu/uzi/-/issues/192). **↳update 2026-08-09 —
+  [#192](https://github.com/vtmocanu/uzi/-/issues/192). **↳update 2026-08-09 —
   #192 landed independently** (`fix(258)`, `32e91f99`), which is the outcome
   filing-not-absorbing exists to enable: the fix shipped on its own timeline instead of
   waiting on this PRD. Decision 5 updated to match.

@@ -31,8 +31,8 @@
   "dispatch_gap_between_guard_fires_sec": 0.259,
   "total_probe_wall_sec": 37.278,
   "artifacts": {
-    "transcript": "/private/tmp/claude-1542763654/-Users-vmocanu-stuff-gitrepos-mm-vtmocanu-uzi/c23a0da5-7605-490a-bb77-7f5ad292c11f/scratchpad/m0-probe/out/run-2-transcript.jsonl",
-    "markers": "/private/tmp/claude-1542763654/-Users-vmocanu-stuff-gitrepos-mm-vtmocanu-uzi/c23a0da5-7605-490a-bb77-7f5ad292c11f/scratchpad/m0-probe/out/run-2-markers.log",
-    "hookfires": "/private/tmp/claude-1542763654/-Users-vmocanu-stuff-gitrepos-mm-vtmocanu-uzi/c23a0da5-7605-490a-bb77-7f5ad292c11f/scratchpad/m0-probe/out/run-2-hookfires.jsonl"
+    "transcript": "/private/tmp/claude-1542763654/-Users-vmocanu-stuff-gitrepos-orca-uzi/c23a0da5-7605-490a-bb77-7f5ad292c11f/scratchpad/m0-probe/out/run-2-transcript.jsonl",
+    "markers": "/private/tmp/claude-1542763654/-Users-vmocanu-stuff-gitrepos-orca-uzi/c23a0da5-7605-490a-bb77-7f5ad292c11f/scratchpad/m0-probe/out/run-2-markers.log",
+    "hookfires": "/private/tmp/claude-1542763654/-Users-vmocanu-stuff-gitrepos-orca-uzi/c23a0da5-7605-490a-bb77-7f5ad292c11f/scratchpad/m0-probe/out/run-2-hookfires.jsonl"
   }
 }

@@ -1,6 +1,6 @@
 # PRD #309: Rate-limit burn-rate forecast on the utilization meters
 
-**Issue**: [#309](https://gitlab.example.com/vtmocanu/uzi/-/issues/309)
+**Issue**: [#309](https://github.com/vtmocanu/uzi/-/issues/309)
 **Priority**: Medium (an operability improvement to an existing surface; no correctness or security impact)
 **Status**: Done (implemented as the model-agnostic trailing-burn variant — see Resolution)
 **Anchor**: file references below are against `main` @ `cd0d6cf7`.

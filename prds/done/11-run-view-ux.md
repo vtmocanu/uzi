@@ -1,6 +1,6 @@
 # PRD #11: Run View UX — Markdown Plan, Boxed Auto-scroll Activity, Terse Events
 
-**GitLab Issue**: [vtmocanu/uzi#11](https://gitlab.example.com/vtmocanu/uzi/-/issues/11)
+**GitLab Issue**: [vtmocanu/uzi#11](https://github.com/vtmocanu/uzi/-/issues/11)
 **Status**: Complete (2026-07-04, merged as MR !10: M0-M5 done on `prd-11-run-view-ux`; reviewer APPROVE + auditor clean + tester 6/6 success criteria PASS incl. docker debug-log e2e; specs synced. Remaining manual items: real-browser live-streaming feel pass; live-SDK tool-frame capstone.)
 **Priority**: Medium
 **Created**: 2026-07-04

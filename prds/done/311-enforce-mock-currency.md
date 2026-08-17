@@ -1,6 +1,6 @@
 # PRD #311: Enforce mock/demo currency
 
-**Issue**: [#311](https://gitlab.example.com/vtmocanu/uzi/-/issues/311)
+**Issue**: [#311](https://github.com/vtmocanu/uzi/-/issues/311)
 **Priority**: Medium
 **Status**: Complete (2026-08-16)
 **Labels**: PRD, Night-Shift (nightly 02:00 sweep)

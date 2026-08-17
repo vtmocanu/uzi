@@ -1,6 +1,6 @@
 # PRD #306: Demo — uzi self-test doc
 
-**Issue**: [#306](https://gitlab.example.com/vtmocanu/uzi/-/issues/306)
+**Issue**: [#306](https://github.com/vtmocanu/uzi/-/issues/306)
 **Priority**: Low
 **Status**: Draft
 

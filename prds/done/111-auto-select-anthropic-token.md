@@ -1,6 +1,6 @@
 # PRD #111: Auto-select the Anthropic token per run by rate-limit headroom, and record which token each run used
 
-**GitLab Issue**: [#111](https://gitlab.example.com/vtmocanu/uzi/-/issues/111)
+**GitLab Issue**: [#111](https://github.com/vtmocanu/uzi/-/issues/111)
 **Status**: **DONE — merged 2026-07-27 (MR !139), with one success criterion UNMET** (created
 2026-07-22; implemented 2026-07-27 on `feature/prd-111-auto-select-token`). The unmet criterion is
 the dev-cluster k8s validation, deferred by user decision and tracked as **issue #168** — see
@@ -8,7 +8,7 @@ the dev-cluster k8s validation, deferred by user decision and tracked as **issue
 Other follow-ups from this PRD: **#169** (user-authored names in admin terminals), **#170**
 (`check-styles`), **#171** (the live-DB harness's Postgres wait).
 **Priority**: Medium
-**Related**: [#104](https://gitlab.example.com/vtmocanu/uzi/-/issues/104) (named tokens — this builds directly on its per-token rate-limit gauge and its single credential-resolution seam), [#53](https://gitlab.example.com/vtmocanu/uzi/-/issues/53) (rate limits — the gauge this PRD reads to choose), [#40](https://gitlab.example.com/vtmocanu/uzi/-/issues/40) (token usage reporting — the per-run token record this PRD adds is the attribution join #40 could not make)
+**Related**: [#104](https://github.com/vtmocanu/uzi/-/issues/104) (named tokens — this builds directly on its per-token rate-limit gauge and its single credential-resolution seam), [#53](https://github.com/vtmocanu/uzi/-/issues/53) (rate limits — the gauge this PRD reads to choose), [#40](https://github.com/vtmocanu/uzi/-/issues/40) (token usage reporting — the per-run token record this PRD adds is the attribution join #40 could not make)
 
 Seven milestones. M1 (record token per run) and M2 (opt-in pool) are
 file-disjoint and land in parallel; M3 (worker `auto` mode) needs M2; M4 (the

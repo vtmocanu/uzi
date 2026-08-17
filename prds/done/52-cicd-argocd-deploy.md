@@ -1,6 +1,6 @@
 # PRD #52: CI/CD — real pipeline, tag releases, ArgoCD deploy to dev-cluster
 
-**GitLab Issue**: [#52](https://gitlab.example.com/vtmocanu/uzi/-/issues/52)
+**GitLab Issue**: [#52](https://github.com/vtmocanu/uzi/-/issues/52)
 **Status**: Complete (created 2026-07-13, completed 2026-07-16)
 **Priority**: High
 **Depends on**: nothing in-repo. Platform prerequisites (Harbor, ArgoCD, dev-cluster cluster services) are listed per milestone.
@@ -20,13 +20,13 @@ uzi has no real CI/CD:
   are production-shaped (distroless api, nginx-unprivileged web) but are only
   ever built by docker-compose locally.
 - There is **no deployment**: the stack runs exclusively via docker-compose on
-  a laptop. We want uzi running on the **dev-cluster** platform cluster, deployed
+  a laptop. We want uzi running on the **dev-cluster** Kubernetes cluster, deployed
   the way example deploys everything else: GitOps via ArgoCD from
   `argo-apps`.
 
 ## Prior art (what we copy)
 
-**example-app** (same `vtmocanu` group) is the reference implementation, and internal-kb
+**example-app** (same `myorg` group) is the reference implementation, and the internal KB
 records the org conventions:
 
 - **CI**: example-app ships a bespoke `.gitlab-ci.yml` (stages
@@ -41,24 +41,24 @@ records the org conventions:
   publishes images tagged `<tag>` + `<short-sha>` and the chart as an OCI
   artifact at the same version. ArgoCD's `targetRevision` is the chart version,
   bumped per release in `argo-apps`.
-- **ArgoCD** (internal-kb `organizations/myorg/infrastructure/deployments.md`):
-  app-of-apps root `myorg/k8s/argo-apps`; everything under `apps/` is
+- **ArgoCD** (the internal KB `deployments.md`):
+  app-of-apps root `argo-apps`; everything under `apps/` is
   auto-synced. Per-app wiring is `app.<name>.yaml`/`appset.<name>.yaml` +
   `prj.<name>.yaml`. example-app's `app.example-app.yaml` is a **multi-source** app: the
   released chart from Harbor OCI + per-cluster values from the app repo
   (`ref: values`, `$values/deploy/values/<cluster>.yaml`), so operational
   config can change without cutting a release.
-- **The shared `myorg/pipelines` include** (internal-kb
-  `shared/infrastructure/ci-pipeline.md`) is the org's other CI pattern
-  (`include: myorg/pipelines simple-app.yml`). See Decision 1 for why we don't
+- **The shared `shared-pipelines` include** (the internal KB
+  `ci-pipeline.md`) is the org's other CI pattern
+  (`include: shared-pipelines simple-app.yml`). See Decision 1 for why we don't
   use it.
-- **CNPG** (internal-kb `organizations/myorg/infrastructure/cnpg.md`): operator per
+- **CNPG** (the internal KB `cnpg.md`): operator per
   cluster in `cnpg-system` (the `appset.cloudnative-pg.yaml` list generator
   **already includes `dev-cluster`**), app DBs as CNPG `Cluster` resources,
-  storageClass `storage-class`, backups via `barmanObjectStore` to
+  storageClass `standard`, backups via `barmanObjectStore` to
   `s3://postgres-<cluster>` on `https://s3.example.com`, secrets via the
   **Infisical operator** (`InfisicalSecret`, project slug `example-project`,
-  Harbor pull secret from `/k8s-registry-robot`).
+  Harbor pull secret from `/registry-robot`).
 
 Verified cluster facts: `dev-cluster` is already in the ArgoCD cluster list and
 is opted into both `appset.cloudnative-pg.yaml` and `appset.ingress-nginx.yaml`
@@ -78,8 +78,8 @@ Adopt the example-app pattern end to end, adapted to uzi's three-toolchain monor
 2. **Versioning**: Model B. Release = push git tag `vX.Y.Z`; chart
    `version`/`appVersion` in `deploy/chart/Chart.yaml` must equal it (CI
    asserts this on tag pipelines). Images land at
-   `harbor.example.com/gitlab/vtmocanu/uzi/{api,web}:<tag>` (+ short-sha
-   tag); chart at `oci://harbor.example.com/gitlab/vtmocanu/uzi/uzi:<version>`.
+   `registry.example.com/uzi/{api,web}:<tag>` (+ short-sha
+   tag); chart at `oci://registry.example.com/uzi/uzi:<version>`.
 3. **Helm chart** (`deploy/chart/`) for the k8s topology: `web`
    (Deployment/Service/Ingress), `api` (Deployment/Service), **CNPG `Cluster`**
    for Postgres, `InfisicalSecret`s for runtime secrets and the Harbor pull
@@ -159,7 +159,7 @@ M2:
 
 ### Decision Log
 
-- **Decision 1 — bespoke `.gitlab-ci.yml`, not the `myorg/pipelines` include.**
+- **Decision 1 — bespoke `.gitlab-ci.yml`, not the `shared-pipelines` include.**
   `simple-app.yml` assumes one image, docker-build-as-artifact, and a fixed
   check set; uzi needs three toolchains, two images (one with a repo-root
   build context), sqlc drift checks, and kaniko (no docker daemon). example-app, in
@@ -185,7 +185,7 @@ M2:
   one release mechanism for all future clusters (stage/prod later).
 - **Decision 4 — CNPG for Postgres, not the compose `postgres:17` container.**
   Org standard; operator already on dev-cluster. Dev sizing: `instances: 1`,
-  `storage-class` storage; backups to `s3://postgres-dev-cluster` per convention
+  `standard` storage; backups to `s3://postgres-example` per convention
   (M5 decides enable-now vs later; the bucket convention exists — confirm the
   bucket before enabling). Version constraint: dev-cluster runs CNPG operator
   **1.23.5** (older than prod) and the barman-cloud *plugin* appset has
@@ -197,7 +197,7 @@ M2:
   concern. Running workers server-side is a separate PRD (it interacts with
   PRD #51 uid-split and proc-hardening).
 - **Decision 6 — e2e stays out of the pipeline initially.**
-  `./e2e/run-e2e.sh` needs docker compose on the runner; the MM runners run
+  `./e2e/run-e2e.sh` needs docker compose on the runner; the CI runners run
   kaniko-style jobs, and example-app doesn't run compose in CI either. Per-package
   tests + helm template are the CI gate; e2e remains the documented local
   pre-merge gate. Stretch milestone M8 revisits (compose-capable runner or
@@ -212,17 +212,17 @@ Tracked in M5; each mirrors an existing example-app step:
    integration (robot `gitlab-robot`) into every pipeline of the project.
    Enable the same for `vtmocanu/uzi`, **but protected + masked only**
    (Decision 2: uzi MR pipelines run agent-authored CI and must never see
-   push-capable Harbor creds). Harbor auto-creates `gitlab/vtmocanu/uzi/*`
+   push-capable Harbor creds). Harbor auto-creates `uzi/*`
    repos on first push.
 2. **ArgoCD Helm OCI repo credential** for
-   `harbor.example.com/gitlab/vtmocanu/uzi` (`argocd repo add ... --type helm
+   `registry.example.com/uzi` (`argocd repo add ... --type helm
    --enable-oci=true`), same as example-app's chart repo credential.
 3. **ArgoCD git access to `vtmocanu/uzi`**: already covered — the
-   `vtmocanu-repo-creds` group-prefix template exists (used by example-app for
+   `repo-creds` group-prefix template exists (used by example-app for
    `ref: values`). Verify, no new token expected.
 4. **Infisical**: create the `/uzi` secret folder for the k8s-clusters
    project. The operator, `universal-auth-credentials`, and the
-   `/k8s-registry-robot` pull-secret path are **already live on dev-cluster**
+   `/registry-robot` pull-secret path are **already live on dev-cluster**
    (referenced by its ingress-nginx and cnpg values) — only the `/uzi`
    folder is new.
 5. **Ingress hostname + TLS on dev-cluster** — *resolved during review*:
@@ -267,7 +267,7 @@ Phase 2 (sequential — depends on M1+M2):
   comment) built `--no-push` on MRs/main. Per Decision 2: MR pipelines build
   **cache-less and credential-less** (no Harbor auth on unprotected refs);
   main (protected) authenticates and reads+writes the shared cache repo
-  `.../gitlab/vtmocanu/uzi/cache`. Helm chart job wired into `needs`.
+  `.../uzi/cache`. Helm chart job wired into `needs`.
   Requires admin step 1. Success: MR pipeline proves both images build with
   no Harbor secrets available to it; main warms the cache.
 - [x] **M4: Tag release pipeline** (publish stage). On `v*` tags: assert chart
@@ -372,7 +372,7 @@ dev-cluster `*.example.com` default wildcard, no TLS block.)
 ## Work Log
 
 - 2026-07-13: PRD created after surveying example-app's `.gitlab-ci.yml`, chart, and
-  ArgoCD wiring, internal-kb (`ci-pipeline.md`, `deployments.md`, `cnpg.md`,
+  ArgoCD wiring, the internal KB (`ci-pipeline.md`, `deployments.md`, `cnpg.md`,
   `kubernetes.md`, `service-exposure.md`), and `argo-apps` (confirmed
   dev-cluster in cloudnative-pg + ingress-nginx appsets).
 - 2026-07-13: Revised after two-agent review. Fact-check: 0 wrong claims (5
@@ -422,7 +422,7 @@ dev-cluster `*.example.com` default wildcard, no TLS block.)
   Gated to **protected refs only** (privileged DinD must not be reachable from
   untrusted agent MRs — Decision 2's reasoning on the execution axis); binaries
   checksum-pinned; credential-less. Runner-side CI execution is unverified (no
-  MM-runner access) — the chart+smoke flow is locally proven.
+  CI-runner access) — the chart+smoke flow is locally proven.
 - 2026-07-15: Post-open hardening driven by the FIRST real CI runs on the MR
   (the whole point of this PRD): `test:agent` failed on the node-22 runner where
   local (node 26) passed — fixed `apk add bash` (git-secret spawns bash), a
@@ -439,10 +439,10 @@ dev-cluster `*.example.com` default wildcard, no TLS block.)
   - [x] Infisical `/uzi` folder minted (JWT_SECRET, UZI_SECRET_KEY + optional seeds)
   - [x] Harbor CI creds for `vtmocanu/uzi` — **protected + masked** (Decision 2)
   - [x] `v*` **protected tags, Maintainer-create-only** (Decision 2, execution axis)
-  - [x] Harbor robot **push-only** scope on `gitlab/vtmocanu/uzi/*`
+  - [x] Harbor robot **push-only** scope on `uzi/*`
   - [x] ArgoCD Helm **OCI repo cred** — no action needed: `oci-helm-creds`
-        repo-creds at the `harbor.example.com` root already cover
-        `gitlab/vtmocanu/uzi` by URL-prefix match (same cred example-app pulls through;
+        repo-creds at the `registry.example.com` root already cover
+        `uzi` by URL-prefix match (same cred example-app pulls through;
         see `5695af9`)
   - [x] DNS `uzi.example.com` (live; carries the deployed SPA + OIDC redirect)
   - [x] Merge argo MR `argo-apps!294` (merged 2026-07-16), cut release,
@@ -452,10 +452,10 @@ dev-cluster `*.example.com` default wildcard, no TLS block.)
   robot, and protected `v*` tags work); argo MR !294 merged and carried the
   first live deploy (uzi `0.2.0` Synced/Healthy on dev-cluster). The first
   deploy caught one real breakage — the Infisical `/uzi` folder actually lives
-  in the **vtmocanu project (`example-project`, envSlug `dev`)**, not
+  in the **myorg project (`app-secrets`, envSlug `dev`)**, not
   `example-project/prod` as the runbook claimed, so `uzi-secrets` was never
   created and the api CrashLooped on an empty `JWT_SECRET`; fixed by granting
-  dev-cluster's machine identity access to vtmocanu + pointing the
+  dev-cluster's machine identity access to myorg + pointing the
   InfisicalSecret at the right scope (`37b6ad3`), and the runbook's four
   disproved claims were corrected in `5695af9`. Post-M6 work already builds on
   the live instance: Keycloak OIDC SSO (`a2a070b`) and weekly CNPG S3 backups

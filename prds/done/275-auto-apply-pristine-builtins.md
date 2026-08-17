@@ -1,13 +1,13 @@
 # PRD #275: Auto-apply pristine builtin templates on boot (M4b)
 
-**GitLab Issue**: [#275](https://gitlab.example.com/vtmocanu/uzi/-/issues/275)
+**GitLab Issue**: [#275](https://github.com/vtmocanu/uzi/-/issues/275)
 **Status**: Implemented (created 2026-08-09; revised after architect review; delivered 2026-08-09)
 **Priority**: Medium
 **Related**:
-- [#201](https://gitlab.example.com/vtmocanu/uzi/-/issues/201) — the builtin drift **signal** (M4a: badge + diff UI). This PRD is the pristine-only delivery half of #201's explicitly-deferred **M4b**. See `prds/201-builtin-drift-signal.md`, "Out, and deliberately: … no boot-path change … no auto-update … All of those are M4b."
-- [#85](https://gitlab.example.com/vtmocanu/uzi/-/issues/85) — consume the versioned role library from the skills repo. Separate: that is library/git sync; this re-applies the `go:embed`'d builtins already inside the binary.
-- [#208](https://gitlab.example.com/vtmocanu/uzi/-/issues/208) — worker sandbox friction. A **consumer**: its builtin-prompt fixes (B web-ux `--no-sandbox`, E BusyBox note) are inert on seeded installs until this ships.
-- [#210](https://gitlab.example.com/vtmocanu/uzi/-/issues/210) — the recipient fix. A stranded example: ten builtin templates fixed, none reaching dev-cluster.
+- [#201](https://github.com/vtmocanu/uzi/-/issues/201) — the builtin drift **signal** (M4a: badge + diff UI). This PRD is the pristine-only delivery half of #201's explicitly-deferred **M4b**. See `prds/201-builtin-drift-signal.md`, "Out, and deliberately: … no boot-path change … no auto-update … All of those are M4b."
+- [#85](https://github.com/vtmocanu/uzi/-/issues/85) — consume the versioned role library from the skills repo. Separate: that is library/git sync; this re-applies the `go:embed`'d builtins already inside the binary.
+- [#208](https://github.com/vtmocanu/uzi/-/issues/208) — worker sandbox friction. A **consumer**: its builtin-prompt fixes (B web-ux `--no-sandbox`, E BusyBox note) are inert on seeded installs until this ships.
+- [#210](https://github.com/vtmocanu/uzi/-/issues/210) — the recipient fix. A stranded example: ten builtin templates fixed, none reaching dev-cluster.
 
 ## Problem
 
