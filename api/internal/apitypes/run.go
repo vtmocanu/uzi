@@ -45,7 +45,12 @@ type RunDTO struct {
 	Status         string  `json:"status"`
 	RequeueCount   int32   `json:"requeue_count"`
 	IterationCount int32   `json:"iteration_count"`
-	AutoApprove    bool    `json:"auto_approve"`
+	// IsPlanning is a server-computed display predicate (issue #321): true only while a
+	// run is in its pre-approval PLANNING turn (status running, iteration_count 0, no
+	// persisted plan yet; chat/judge excluded). Derived, not stored — no new column or
+	// status value. A pre-feature api pod omits it; absent reads as not-planning.
+	IsPlanning  bool `json:"is_planning"`
+	AutoApprove bool `json:"auto_approve"`
 	// Milestones is the run's FROZEN, human-approved milestone list (PRD #122 M1),
 	// decoded from runs.milestones_frozen. A nil slice marshals to JSON null, which is
 	// the back-compat contract: a run with no milestones (every pre-feature run, and

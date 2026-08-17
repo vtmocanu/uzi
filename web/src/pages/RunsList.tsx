@@ -23,7 +23,7 @@ import { Alert, Badge, Card, EmptyState, Input, ListSkeleton, PageHeader, Sectio
 import { ActivityIcon } from "../components/icons";
 import { MrChip } from "../components/MrChip";
 import { mrAbbrev } from "../lib/forgeNoun";
-import { isStoppedRun, milestoneBadge, milestoneBadgeText, mrChipState } from "../lib/runBadge";
+import { effectiveRunStatus, isStoppedRun, milestoneBadge, milestoneBadgeText, mrChipState } from "../lib/runBadge";
 import { RunPriorityBadge } from "../components/RunPriorityBadge";
 import { formatTokens, formatCost } from "../lib/formatTokens";
 import { runDurationLabel } from "../lib/runDuration";
@@ -203,7 +203,7 @@ function RunRow({
   // A deliberate human stop (cancelled, or failed carrying a server-stamped
   // stop_kind — PRD #33) reads "stopped" / neutral, never "failed" / danger. Fold
   // that into the pill's status so the shared StatusPill palette renders it calm.
-  const pillStatus = isStoppedRun(run.status, run.stop_kind) ? "stopped" : run.status;
+  const pillStatus = isStoppedRun(run.status, run.stop_kind) ? "stopped" : effectiveRunStatus(run);
   // MR chip state (PRD #33): open renders exactly as before; merged/closed get a
   // label and closed is muted + struck. This is a per-run frozen hint.
   const mrState = mrChipState(run.mr_state);

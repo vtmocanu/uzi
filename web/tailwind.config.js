@@ -25,6 +25,7 @@ export default {
         warn: token("warn"),
         danger: token("danger"),
         info: token("info"),
+        plan: token("plan"),
         // Queue + idle/stopped tones carry border/surface/fg triples (not the
         // single-hue opacity pattern of the four above) so ember reproduces its
         // solid neutral pill exactly while a theme can retint them (index.css).

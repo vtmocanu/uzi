@@ -51,6 +51,18 @@ const (
 // terminal would make `--follow` exit on a run that is about to produce more messages.
 const statusLimitWait = "limit_wait"
 
+// effectiveRunStatus is the status a run should RENDER as: "planning" while it is in its
+// pre-approval planning phase (issue #321), else its raw status. is_planning is a server-
+// computed display predicate meaningful only while running (chat/judge excluded server-
+// side), so this only maps the running→planning case. Mirrors the web helper of the same
+// name so the CLI and SPA name the phase identically.
+func effectiveRunStatus(status string, isPlanning bool) string {
+	if isPlanning && status == "running" {
+		return "planning"
+	}
+	return status
+}
+
 // logsPollInterval is how often `uzi run logs --follow` re-polls
 // /api/runs/{id}/messages?after=<seq>. REST polling ships instead of a WebSocket
 // (PRD #64 Out of scope). A var, not a const, only so tests can shrink the wait;
@@ -194,7 +206,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 			rows := make([][]string, 0, len(runs))
 			now := time.Now()
 			for _, r := range runs {
-				rows = append(rows, []string{r.ID, r.Kind, r.Status, runAgeCell(r.RunDTO, now), runTitle(r.RunDTO)})
+				rows = append(rows, []string{r.ID, r.Kind, effectiveRunStatus(r.Status, r.IsPlanning), runAgeCell(r.RunDTO, now), runTitle(r.RunDTO)})
 			}
 			return p.Table([]string{"ID", "KIND", "STATUS", "AGE", "TITLE"}, rows)
 		},
@@ -1169,7 +1181,7 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	rows := [][]string{
 		{"ID", r.ID},
 		{"KIND", r.Kind},
-		{"STATUS", r.Status},
+		{"STATUS", effectiveRunStatus(r.Status, r.IsPlanning)},
 		{"TITLE", runTitle(r)},
 		{"BRANCH", strOr(r.Branch, "-")},
 		{mrAbbrev(r.ForgeType), int64Or(r.MrIID, "-")},

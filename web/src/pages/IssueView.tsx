@@ -3,7 +3,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, ApiError, isHttpsUrl, preferForgeUrl, type IssueDetail, type RunListItem } from "../lib/api";
 import { hasAnthropicToken } from "../lib/hasToken";
 import { startRunGate } from "../lib/runStream";
-import { activeRunInHistory, isStoppedRun, mrChipState, runStatusTone } from "../lib/runBadge";
+import { activeRunInHistory, effectiveRunStatus, isStoppedRun, mrChipState, runStatusTone } from "../lib/runBadge";
 import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
 import { chipLabels } from "../lib/labelChips";
 import { canPromote, isEligibleCard } from "../lib/boardCards";
@@ -444,8 +444,8 @@ function RunHistoryRow({ run, projectWebUrl }: { run: RunListItem; projectWebUrl
         </div>
       </div>
       <div className="flex items-center gap-2">
-        <Badge tone={runStatusTone(run.status, run.stop_kind)}>
-          {stopped ? "stopped" : run.status.replace("_", " ")}
+        <Badge tone={runStatusTone(effectiveRunStatus(run), run.stop_kind)}>
+          {stopped ? "stopped" : effectiveRunStatus(run).replace("_", " ")}
         </Badge>
         {/* Every run here is the viewer's own (the endpoint is owner-scoped), so
             the run view is always reachable — no is_mine gate needed. */}

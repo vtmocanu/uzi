@@ -69,6 +69,9 @@ func TestAgentSelectionTags(t *testing.T) {
 var runDTOKeys = []string{
 	"id", "repo_id", "forge_type", "kind", "issue_iid", "issue_title", "issue_description",
 	"title", "resume_of_run_id", "status", "requeue_count", "iteration_count",
+	// issue #321: server-computed planning-phase display flag, always on the wire (bool,
+	// false for every non-planning and pre-feature run). Derived, not stored.
+	"is_planning",
 	// PRD #122 M1: the FROZEN milestone list, always on the wire (nil ⇒ null ⇒ a run
 	// with no milestones, which is every pre-feature run).
 	"auto_approve", "milestones",

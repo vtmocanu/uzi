@@ -248,7 +248,7 @@ export function Alert({
 }
 
 export type BadgeTone =
-  "neutral" | "queue" | "warning" | "danger" | "ok" | "info" | "brand";
+  "neutral" | "queue" | "warning" | "danger" | "ok" | "info" | "brand" | "plan";
 
 // neutral and queue carry a border/surface/fg triple (theme tokens set all
 // three), so ember renders its solid gray pill while a theme can retint just
@@ -261,6 +261,7 @@ const BADGE_TONES: Record<BadgeTone, string> = {
   ok: "border-ok/40 bg-ok/10 text-ok",
   info: "border-info/40 bg-info/10 text-info",
   brand: "border-brand/40 bg-brand/10 text-brand",
+  plan: "border-plan/40 bg-plan/10 text-plan",
 };
 
 export function Badge({
@@ -326,6 +327,11 @@ export const RUN_STATUS_TONES: Record<
   queued: { tone: "queue" },
   claimed: { tone: "info" },
   running: { tone: "info", pulse: true },
+  // issue #321: the pre-approval planning phase, a derived effective status (not a real
+  // runs.status value). Indigo `plan` tone, pulsing like `running` — it IS live work,
+  // just pre-approval. StatusPill's default label `status.replace(/_/g," ")` already
+  // yields "planning", so no RUN_STATUS_LABELS entry is needed.
+  planning: { tone: "plan", pulse: true },
   awaiting_approval: { tone: "warning", pulse: true },
   // PRD #88: parked on a clarification question. Deliberately IDENTICAL to
   // awaiting_approval — same shape of debt (a human owes the run an action while a

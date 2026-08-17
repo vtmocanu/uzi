@@ -57,6 +57,18 @@ describe("StatusPill", () => {
     expect(gatedPill.textContent).toContain("awaiting approval");
   });
 
+  it("renders the derived 'planning' status with the indigo plan tone (issue #321)", () => {
+    // planning is not a real runs.status value — it is the effective status
+    // effectiveRunStatus derives from is_planning, wired onto every surface in M3. The
+    // default label fallback yields "planning", and RUN_STATUS_TONES maps it to `plan`.
+    const { container } = render(<StatusPill status="planning" />);
+    const pill = container.firstElementChild as HTMLElement;
+    expect(container.textContent).toContain("planning");
+    expect(pill.className).toContain("text-plan");
+    // It pulses like running — it IS live work, just pre-approval.
+    expect(pill.querySelector(".animate-pulse")).not.toBeNull();
+  });
+
   it("still falls back to neutral for a genuinely unknown status", () => {
     const { container } = render(<StatusPill status="future_status" />);
     expect(container.textContent).toContain("future status");

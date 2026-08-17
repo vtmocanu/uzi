@@ -355,6 +355,11 @@ WHERE repo_id = @repo_id
 -- display fields — never session_id, plan_md, or any secret.
 SELECT DISTINCT ON (r.issue_iid)
        r.issue_iid, r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_reason, r.stop_kind,
+       -- has_plan_md is the presence flag feeding is_planning (issue #321). It trims the
+       -- ASCII whitespace class (E' \t\n\r\f\v') so it agrees with the Go path's
+       -- strings.TrimSpace in runToDTO — a plan_md of only newlines/tabs reads as absent on
+       -- BOTH the board card and the run read, keeping the one derived rule consistent.
+       r.kind, r.iteration_count, (r.plan_md IS NOT NULL AND btrim(r.plan_md, E' \t\n\r\f\v') <> '') AS has_plan_md,
        r.health, r.health_reason, r.health_since,
        r.created_at, r.updated_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
@@ -374,6 +379,9 @@ ORDER BY r.issue_iid, r.created_at DESC;
 -- issue-scoped across all users by design — Decision 6) so the "×N" retry hint
 -- survives a drag. Returns no rows when the issue has never run.
 SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_reason, r.stop_kind,
+       -- has_plan_md: ASCII-whitespace-trimmed presence flag matching runToDTO's TrimSpace
+       -- so the board card and run read agree on is_planning (issue #321).
+       r.kind, r.iteration_count, (r.plan_md IS NOT NULL AND btrim(r.plan_md, E' \t\n\r\f\v') <> '') AS has_plan_md,
        r.health, r.health_reason, r.health_since, r.created_at, r.updated_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER () AS run_count

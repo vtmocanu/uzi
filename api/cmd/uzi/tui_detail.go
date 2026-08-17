@@ -250,7 +250,8 @@ func (m tuiModel) renderDetail() string {
 		if d.run.Kind != "" {
 			head += "  " + m.pal.chip(m.renderer.Plain(d.run.Kind, 10), m.pal.title.GetForeground())
 		}
-		head += "  " + m.pal.chip(m.renderer.Plain(d.run.Status, 18), m.pal.statusColor(d.run.Status, d.run.Health))
+		es := effectiveRunStatus(d.run.Status, d.run.IsPlanning)
+		head += "  " + m.pal.chip(m.renderer.Plain(es, 18), m.pal.statusColor(es, d.run.Health))
 		if h := d.run.Health; h != "" && h != "ok" {
 			// A NO_COLOR-safe health cue (M4 review nit): without it a stalled run's only
 			// header signal is the orange chip colour, which vanishes under an Ascii

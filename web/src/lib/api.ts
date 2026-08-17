@@ -460,6 +460,12 @@ export interface LatestRun {
   // non-stop run. Read by isStoppedRun, which renders the two HUMAN kinds as a calm
   // "stopped" and deliberately leaves "auto_stopped" looking like the breakage it is.
   stop_kind: StopKind | null;
+  // issue #321: server-computed planning-phase display flag (true only while a run is
+  // in its pre-approval PLANNING turn — running, iteration 0, no persisted plan yet).
+  // OPTIONAL for the SAME api/web rollout skew as plan_source: a mid-deploy api pod that
+  // predates the field omits the key, and an absent value reads as not-planning
+  // (isPlanningRun requires `=== true`). Derived, not a real runs.status value.
+  is_planning?: boolean;
   // Run-health flag (PRD #47). health + health_since are non-sensitive (like
   // stop_kind) and always present. health_reason can name owner state ("your vault
   // is locked"), so the server sends it only to the run's owner (is_mine); a
@@ -1227,6 +1233,13 @@ export interface Run {
   status: RunStatus;
   requeue_count: number;
   iteration_count: number;
+  /** issue #321: server-computed planning-phase display flag — true only while a run is
+   *  in its pre-approval PLANNING turn (running, iteration 0, no persisted plan yet;
+   *  chat/judge excluded). Derived, not a real runs.status value. OPTIONAL for the SAME
+   *  api/web rollout skew as plan_source: a mid-deploy api pod that predates the field
+   *  omits the key, and an absent value reads as not-planning (isPlanningRun requires
+   *  `=== true`). RunListItem extends Run, so list rows inherit it. */
+  is_planning?: boolean;
   /** PRD #19: an autopilot run (poller-started, plan auto-approved). Drives the
    *  "autopilot" badge; a manually-started run is false. */
   auto_approve: boolean;

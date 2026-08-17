@@ -81,7 +81,9 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"board-empty":              boardEmpty,
 		"board-admin":              boardAdmin,
 		"board-filter":             func(d bool) string { return boardFilter(d, now) },
+		"board-planning":           func(d bool) string { return boardPlanning(d, now) },
 		"detail-running":           func(d bool) string { return detailRunning(d, now) },
+		"detail-planning":          func(d bool) string { return detailPlanning(d, now) },
 		"detail-focus-transcript":  func(d bool) string { return detailFocusTranscript(d, now) },
 		"detail-paused":            func(d bool) string { return detailPaused(d, now) },
 		"detail-stalled":           func(d bool) string { return detailStalled(d, now) },
@@ -187,6 +189,20 @@ func boardFilter(dark bool, now time.Time) string {
 	return m.View().Content
 }
 
+// boardPlanning renders a board carrying a planning run (running + IsPlanning) beside a
+// plain running run and a stalled run, so the indigo "planning" chip and its hollow spine
+// glyph can be compared against running's green/filled dot offline.
+func boardPlanning(dark bool, now time.Time) string {
+	fake := &uzicli.FakeClient{}
+	m := uxModel(fake, "", dark)
+	m = step(m, boardRunsMsg{runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "d0e1f2a3-1111-2222-3333-444444444444", Kind: "issue", Status: "running", IsPlanning: true, IssueTitle: "Draft the plan for webhook delivery retries", CreatedAt: now.Add(-90 * time.Second)}},
+		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111-2222-3333-444444444444", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll", CreatedAt: now.Add(-4 * time.Minute)}},
+		{RunDTO: apitypes.RunDTO{ID: "c3d4e5f6-1111-2222-3333-444444444444", Kind: "issue", Status: "running", Health: "stalled", IssueTitle: "Refactor the forge sync loop for the GitHub driver", CreatedAt: now.Add(-51 * time.Minute)}},
+	}})
+	return m.View().Content
+}
+
 // ---- detail fixtures ------------------------------------------------------
 
 const detailRunID = "a1b2c3d4-1111-2222-3333-444444444444"
@@ -219,6 +235,16 @@ func withLiveStream(m tuiModel) tuiModel {
 func detailRunning(dark bool, now time.Time) string {
 	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "running", Health: "ok",
 		IssueTitle: "Add rate-limit headroom to the scheduler poll"}
+	m := detailBase(dark, run, now, true)
+	m = withLiveStream(m)
+	return m.View().Content
+}
+
+// detailPlanning mirrors detailRunning but with IsPlanning set, so the detail header
+// renders the indigo "planning" chip rather than the running one.
+func detailPlanning(dark bool, now time.Time) string {
+	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "running", IsPlanning: true, Health: "ok",
+		IssueTitle: "Draft the plan for webhook delivery retries"}
 	m := detailBase(dark, run, now, true)
 	m = withLiveStream(m)
 	return m.View().Content
