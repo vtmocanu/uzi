@@ -3,8 +3,20 @@
 - **Issue**: https://gitlab.example.com/vtmocanu/uzi/-/issues/320
 - **Source idea**: `ideas/bingo/2026-08-11-run-queue-priority.md` (feature-bingo run, 2026-08-11)
 - **Mock**: interactive mock of the Runs page with the feature (priority pills, Expedite, fail-open) built during PRD authoring
-- **Status**: Draft
+- **Status**: Done — all milestones M1–M7 landed on `agent/issue-320` (2026-08-17)
 - **Priority**: Medium
+
+## Completion (2026-08-17)
+
+All seven milestones are implemented, tested, and reviewed on branch `agent/issue-320`:
+
+- **M1 — Schema + priority functions.** Migration `00130_run_priority.sql` adds `runs.priority SMALLINT NULL` and the two `IMMUTABLE` SQL functions `fn_run_priority` (rank) and `fn_run_priority_class` (class); pure-SQL/live-DB truth-table test asserts rank and class side by side.
+- **M2 — Claim ordering + background-grace fail-open.** The `fn_run_priority` term slots into `ClaimRun`'s ORDER BY between affinity and `created_at`; `RUN_BACKGROUND_GRACE` (default `15m`) is parsed in `config.go` and threaded as `@background_grace_cutoff` in `workersvc`; knob added to `docker-compose.yml` + `.env.example`; live-DB claim tests cover interactive-beats-background, expedite-beats-all, fail-open, affinity-still-wins, FIFO-within-level, and #216 spread unchanged.
+- **M3 — Expedite endpoint + DTO class.** `SetRunPriority` store query + `PATCH /api/runs/{id}/priority` handler (owner-scoped, `queued`-only, RequireUser group); `apitypes.RunDTO.priority` (wire-test key updated); `runToDTO` takes the class from `fn_run_priority_class` (list reads embed it, single-run reads via the scalar helper).
+- **M4 — Queued-reason wording.** The run-health detector maps a demoted queued run to "deprioritized — yields to interactive work" (and "priority restored — no longer yielding" past the grace) via `RunPriorityClassForRun`, behind the queued-threshold guard; the health flag stays `waiting for worker`.
+- **M5 — CLI `uzi run expedite`.** `uzi run expedite <run-id>` (`--clear` to undo) via a new `Client.SetRunPriority`; exit 5 on a non-queued run; `SKILL.md` and `docs/cli.md` document it; `commands_test.go` enumerates the verb.
+- **M6 — Web priority pill + Expedite action.** `priorityBadge` (single class→pill map) drives a pill + owner-only Expedite/undo on the Runs list and run page; `Run.priority` optional for api/web rollout skew; the Kanban board is intentionally untouched. Browser-validated in mock mode.
+- **M7 — Integration, docs, specs.** M2's live-DB suite covers the end-to-end ordering scenario; `docs/run-health.md` gains a "Queue priority" section; `specs/ai.md` §553 records the design decision.
 
 ## Problem
 
