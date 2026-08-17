@@ -58,7 +58,7 @@ func TestCommandTree(t *testing.T) {
 	}
 
 	subWant := map[string][]string{
-		"run": {"list", "get", "logs", "wait", "review", "create", "approve", "reject", "revise", "cancel", "follow-up", "answer", "inputs"},
+		"run": {"list", "get", "logs", "wait", "review", "create", "approve", "reject", "revise", "cancel", "follow-up", "answer", "inputs", "expedite"},
 		// backlog is the PRD #98 M7 read; there is deliberately no `file` verb —
 		// filing stays browser-only (#68's stance, Decision 10).
 		"review": {"show", "backlog", "resolve", "dismiss", "undo", "stats"},
@@ -1430,5 +1430,62 @@ func TestRunCreateWaitOnLimitSpaceFormIsAUsageError(t *testing.T) {
 	}
 	if fc.LastCreateRepoID != "" {
 		t.Error("a usage error still created a run; the command must refuse before calling the API")
+	}
+}
+
+// PRD #320 M5: `uzi run expedite <id>` bumps a queued run to the front — it sends
+// expedite=true and renders the returned run (now priority "expedited").
+func TestRunExpedite(t *testing.T) {
+	fc := &uzicli.FakeClient{PriorityRun: apitypes.RunDTO{ID: "r1", Status: "queued", Kind: "issue", Priority: "expedited"}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "expedite", "r1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc.LastPriorityRunID != "r1" {
+		t.Errorf("targeted run %q, want r1", fc.LastPriorityRunID)
+	}
+	if !fc.LastPriorityExpedite {
+		t.Errorf("sent expedite=%v, want true", fc.LastPriorityExpedite)
+	}
+	if !strings.Contains(out, "r1") {
+		t.Errorf("output missing run id:\n%s", out)
+	}
+}
+
+// `--clear` undoes the manual bump: it sends expedite=false so the server clears the
+// override back to the run's kind default.
+func TestRunExpediteClear(t *testing.T) {
+	fc := &uzicli.FakeClient{PriorityRun: apitypes.RunDTO{ID: "r1", Status: "queued", Kind: "issue", Priority: "normal"}}
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "expedite", "r1", "--clear")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc.LastPriorityExpedite {
+		t.Errorf("sent expedite=%v, want false (--clear)", fc.LastPriorityExpedite)
+	}
+}
+
+// A non-queued run is a 409 → ExitConflict (5); the CLI must propagate it, not swallow it.
+func TestRunExpediteConflict(t *testing.T) {
+	fc := &uzicli.FakeClient{SetRunPriorityErr: uzicli.Exitf(uzicli.ExitConflict, "run is not queued")}
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "expedite", "r1")
+	if code != uzicli.ExitConflict {
+		t.Fatalf("exit = %d, want %d (conflict)", code, uzicli.ExitConflict)
+	}
+	// The write must still have been REACHED with the right id.
+	if fc.LastPriorityRunID != "r1" {
+		t.Errorf("targeted run %q, want r1", fc.LastPriorityRunID)
+	}
+}
+
+// --json emits the RunDTO (with its priority pill) for agents.
+func TestRunExpediteJSON(t *testing.T) {
+	fc := &uzicli.FakeClient{PriorityRun: apitypes.RunDTO{ID: "r1", Status: "queued", Kind: "issue", Priority: "expedited"}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "expedite", "r1", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, `"priority": "expedited"`) {
+		t.Errorf("--json output = %q, want priority expedited", out)
 	}
 }

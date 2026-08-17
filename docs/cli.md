@@ -91,6 +91,7 @@ uzi run cancel <id>
 uzi run follow-up <id> [--message <text>]
 uzi run answer <id> [--message <text> ...]
 uzi run inputs <id> [--json]
+uzi run expedite <id> [--clear]
 uzi schedule create --repo <id> (--issue <iid> | --sweep [--label <l> ...] | --prompt <text>)
                     (--at <rfc3339> | --cron <expr>) [--tz <iana>]
                     [--auto-approve[=false]] [--wait-on-limit[=false]]
@@ -257,6 +258,14 @@ A few worth knowing:
   row, so `run inputs` against a chat run lists the whole conversation, not
   just steering messages; an issue or CI-fix run's queue starts empty and
   only ever holds what you actually sent mid-run.
+- **`run expedite <id>`** bumps a **queued** run to the front of the claim
+  queue, so a worker picks it up ahead of the rest. It only matters before a
+  run is claimed — ordering is fixed once a worker takes it — so a non-queued
+  run is a conflict (exit 5) and a foreign/unknown run is not found (exit 4).
+  `--clear` undoes the bump: it removes the manual override and returns the run
+  to its kind default priority (it does **not** demote it below normal). It
+  prints the updated run; `--json` emits the run object, whose `priority` reads
+  `expedited` after a bump.
 - **`run logs <id>` names the invocation, not just the role.** The actor
   column reads `role[/<short id>][ · <task label>]`, so two `coder`
   subagents running in parallel are distinguishable instead of being two

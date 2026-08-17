@@ -95,6 +95,16 @@ type FakeClient struct {
 	LastPoolValue    bool
 	PoolSecret       apitypes.SecretDTO
 
+	// SetRunPriority capture (PRD #320 M5): the run id the command targeted and the
+	// expedite bool it sent (true = `uzi run expedite`, false = `--clear`). PriorityRun
+	// is the canned success reply. SetRunPriorityErr wins over the blanket Err so a test
+	// can model the non-queued 409 (ExitConflict) precisely while the capture still proves
+	// the write was reached.
+	LastPriorityRunID    string
+	LastPriorityExpedite bool
+	PriorityRun          apitypes.RunDTO
+	SetRunPriorityErr    error
+
 	// SelfMeters drives SelfRateLimits (PRD #111 D23): the caller's own per-token
 	// meters, each carrying the server-computed auto-selection status.
 	SelfMeters []apitypes.TokenRateLimitDTO
@@ -315,6 +325,22 @@ func (f *FakeClient) SetTokenAutoEligible(_ context.Context, id string, eligible
 		return apitypes.SecretDTO{}, f.Err
 	}
 	return f.PoolSecret, nil
+}
+
+// SetRunPriority records the (run id, expedite) it was called with and returns the
+// canned run. SetRunPriorityErr wins over the blanket Err — mirroring SetDispositionErr
+// — so a test can model the non-queued 409 on the WRITE while the capture still proves
+// the write was REACHED with the right args.
+func (f *FakeClient) SetRunPriority(_ context.Context, id string, expedite bool) (apitypes.RunDTO, error) {
+	f.LastPriorityRunID = id
+	f.LastPriorityExpedite = expedite
+	if f.SetRunPriorityErr != nil {
+		return apitypes.RunDTO{}, f.SetRunPriorityErr
+	}
+	if f.Err != nil {
+		return apitypes.RunDTO{}, f.Err
+	}
+	return f.PriorityRun, nil
 }
 
 func (f *FakeClient) SelfRateLimits(context.Context) ([]apitypes.TokenRateLimitDTO, error) {
