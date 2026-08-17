@@ -111,3 +111,46 @@ func TestRunListPlanningStatus(t *testing.T) {
 		t.Errorf("run list must still render \"running\" for a plain running run, got:\n%s", out)
 	}
 }
+
+// TestAdminRunsPlanningStatus proves the `uzi admin runs` STATUS column renders the
+// effective word: a planning run reads "planning" and a normal running run reads
+// "running", so the admin table agrees with `run list` and the board.
+func TestAdminRunsPlanningStatus(t *testing.T) {
+	fc := &uzicli.FakeClient{AdminRuns: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "plan-1", Kind: "issue", Status: "running", IsPlanning: true, IssueTitle: "planning one"}, OwnerEmail: sp("a@example.com")},
+		{RunDTO: apitypes.RunDTO{ID: "run-2", Kind: "issue", Status: "running", IssueTitle: "running two"}, OwnerEmail: sp("b@example.com")},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "admin", "runs")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "planning") {
+		t.Errorf("admin runs must render \"planning\" for a running+is_planning run, got:\n%s", out)
+	}
+	if !strings.Contains(out, "running") {
+		t.Errorf("admin runs must still render \"running\" for a plain running run, got:\n%s", out)
+	}
+}
+
+// TestBoardFilterMatchesPlanning proves the board `/` filter matches the RENDERED status:
+// a planning run (running + is_planning) matches the query "planning" and no longer
+// matches "running", so the filter matches the word the user actually sees.
+func TestBoardFilterMatchesPlanning(t *testing.T) {
+	b := newBoardState()
+	b.runs = []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "plan-1", Kind: "issue", Status: "running", IsPlanning: true, IssueTitle: "planning one"}},
+		{RunDTO: apitypes.RunDTO{ID: "run-2", Kind: "issue", Status: "running", IssueTitle: "running two"}},
+	}
+
+	b.filter = "planning"
+	planned := b.visible()
+	if len(planned) != 1 || planned[0].ID != "plan-1" {
+		t.Errorf("filter \"planning\" must match only the planning run, got %d rows: %+v", len(planned), planned)
+	}
+
+	b.filter = "running"
+	runningOnly := b.visible()
+	if len(runningOnly) != 1 || runningOnly[0].ID != "run-2" {
+		t.Errorf("filter \"running\" must match only the plain running run (the planning run's haystack no longer holds \"running\"), got %d rows: %+v", len(runningOnly), runningOnly)
+	}
+}

@@ -71,7 +71,7 @@ func (b *boardState) visible() []apitypes.RunListItemDTO {
 	out := make([]apitypes.RunListItemDTO, 0, len(b.runs))
 	for _, r := range b.runs {
 		hay := strings.ToLower(strings.Join([]string{
-			r.ID, r.Kind, r.Status, cellText(runTitle(r.RunDTO)),
+			r.ID, r.Kind, effectiveRunStatus(r.Status, r.IsPlanning), cellText(runTitle(r.RunDTO)),
 		}, " "))
 		if strings.Contains(hay, q) {
 			out = append(out, r)
