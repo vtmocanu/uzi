@@ -6,6 +6,20 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.42.2] - 2026-08-17
+
+### Added
+
+- **Homebrew install for the `uzi` CLI.** The `uzi-cli` formula now publishes to the
+  public tap `vtmocanu/homebrew-tap`, so `brew install vtmocanu/tap/uzi-cli` builds the
+  CLI from the tag's public source tarball with no product-repo access (PRD #64).
+  Reworked the formula to the shared public-tap shape the sibling formulae use and added
+  the tap-publish workflow (bfffb8d6).
+
+### Changed
+
+- Final pre-public scrub of internal literals in net-new CI/chart/brew files (940082fa).
+
 ## [0.42.1] - 2026-08-17
 
 ### Changed
