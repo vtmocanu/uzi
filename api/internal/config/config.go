@@ -555,8 +555,9 @@ func placeholderControllerToken(sum []byte) (string, bool) {
 // permissive enough for hand-set values in local demos.
 const minSecretLen = 16
 
-// defaultForgeBaseURL is the single allowlisted forge for the example demo.
-const defaultForgeBaseURL = "https://gitlab.example.com"
+// defaultForgeBaseURL is the single allowlisted forge by default, overridable via
+// FORGE_ALLOWED_BASE_URLS.
+const defaultForgeBaseURL = "https://github.com"
 
 // Load reads configuration from the environment and validates it. It returns
 // an error (rather than exiting) so the caller controls the failure path.

@@ -239,7 +239,7 @@ func TestNormalizeForgeBaseURL(t *testing.T) {
 		"https://gitlab.example.com":      "https://gitlab.example.com",
 		"https://gitlab.example.com/":     "https://gitlab.example.com",
 		"https://gitlab.example.com/path": "https://gitlab.example.com",
-		"https://GitLab.example.com":      "https://gitlab.example.com",
+		"https://GitLab.Example.com":      "https://gitlab.example.com",
 		"https://host:8443/x?y=1#z":         "https://host:8443",
 		"  https://spaced.example.com  ":    "https://spaced.example.com",
 	}
@@ -419,7 +419,7 @@ func TestParseEmailDomains(t *testing.T) {
 		{"", nil},
 		{"   ", nil},
 		{"example.com", []string{"example.com"}},
-		{"example.COM", []string{"example.com"}},      // lowercased
+		{"Example.COM", []string{"example.com"}},      // lowercased
 		{" a.com , b.com ", []string{"a.com", "b.com"}},   // trimmed
 		{"a.com,a.com,b.com", []string{"a.com", "b.com"}}, // deduped
 		{"a.com,,b.com,", []string{"a.com", "b.com"}},     // empty entries dropped
@@ -492,7 +492,7 @@ func TestLoadRegistrationPolicy(t *testing.T) {
 	t.Run("explicit disable + allowlist", func(t *testing.T) {
 		setBase(t)
 		t.Setenv("UZI_REGISTRATION_ENABLED", "false")
-		t.Setenv("UZI_ALLOWED_EMAIL_DOMAINS", "example.com, example.org")
+		t.Setenv("UZI_ALLOWED_EMAIL_DOMAINS", "Example.com, example.org")
 		cfg, err := Load()
 		if err != nil {
 			t.Fatalf("Load: %v", err)
