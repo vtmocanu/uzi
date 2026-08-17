@@ -60,13 +60,18 @@ Do not merge anything until every verdict is MERGE or MERGE-WITH-NOTES. Surface 
 
 After all merges, `git pull --ff-only origin main` and confirm migrations are distinct (`ls api/internal/store/migrations/ | sort | tail`).
 
-## 4. Watch CI at job level (~2-min cadence)
-Poll the pipeline and list any non-green job so a failure is caught mid-run, not at the end:
+## 4. Watch CI at JOB level (~2-min cadence) — act on a failed job immediately, do NOT wait for the pipeline
+Poll the pipeline's **jobs** every ~2 min and surface any failed one the moment a tick sees it. A job is a terminal unit: once it is `failed`, the rest of the pipeline still running tells you nothing new about that job, and waiting for the whole pipeline to reach `success`/`failed` before reacting just wastes minutes on a slow, contended runner. So **diagnose and fix/retry a failed job as soon as it appears**, in parallel with the pipeline's other jobs finishing — that is the whole reason this poll is job-level, not pipeline-level.
 ```sh
 env -u GITLAB_TOKEN glab api "projects/$enc/pipelines/<id>/jobs?per_page=100" \
-  | python3 -c "import sys,json;[print(j['status'].upper().ljust(9),j['stage'].ljust(10),j['name']) for j in json.load(sys.stdin)]"
+  | jq -r '.[]|select(.status=="failed")|"FAILED \(.stage)/\(.name) job=\(.id)"'
+# and a one-line status summary so you see progress without the full list:
+env -u GITLAB_TOKEN glab api "projects/$enc/pipelines/<id>/jobs?per_page=100" \
+  | jq -r 'group_by(.status)|map("\(.[0].status)=\(length)")|join("  ")'
 ```
-Run the poll as a background command (loop until the pipeline status is terminal). If a job fails, read its log (`env -u GITLAB_TOKEN glab ci trace <job-id>` or the job web_url), fix, and re-push.
+Run it as a background command that loops on a **120s** sleep, prints the failed-job lines at each tick, and exits when the pipeline status is terminal. Do not block a foreground turn on it. When the user asks to "check CI every 2m for failed jobs", this is the loop they mean. If a job fails, read its log (`env -u GITLAB_TOKEN glab ci trace <job-id>` or the job web_url) right then; if it's a real defect, fix and re-push; if it's a flake/infra failure, retry the single job (below) without touching the branch. **A pipeline showing `running` with one job already `failed` is a pipeline you should already be acting on** — the merge gate needs every job green, so that one failure is going to block regardless of what the others do.
+
+> **Infra note seen live (2026-08-17 release):** shared runners can run out of disk (`No space left on device` in kaniko snapshot, nix install, or Postgres `could not extend file … SQLSTATE 53100`). This hits a SUBSET of runners, so some jobs on the same pipeline pass while others fail, and it is **not** the MR's fault — it is the job-level, retry-not-repush case par excellence. Retry each disk-failed job (`.../jobs/<id>/retry`); they land on a healthy runner and pass. Because it is per-runner, a pipeline can show more failed jobs on a second look than the first (jobs that were still `running`/`created` fail later), so keep polling until terminal even after you have retried the ones you saw.
 
 **Real failure vs flake.** A timing/resource-sensitive test failing under CI CPU contention is a flake, not a defect — confirm it (assertion is timing-based, failing test unrelated to the diff, same job passed on another pipeline off the same base), then **retry the single job** instead of re-pushing: `env -u GITLAB_TOKEN glab api --method POST "projects/$enc/jobs/<job-id>/retry"`. File the flake as a `bug` issue. The **tag pipeline re-runs the full gate**, so a flake can block the `publish:*` stage even after every MR merged green — retry the job, do not re-tag. Cancel a redundant `main` pipeline to free runners for the tag: `... --method POST "projects/$enc/pipelines/<id>/cancel"`.
 
