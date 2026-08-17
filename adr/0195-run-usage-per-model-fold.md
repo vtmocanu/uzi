@@ -3,7 +3,7 @@
 **Status**: Accepted (implemented, issue #195)
 **Date**: 2026-08-02
 **Deciders**: team lead (investigation + design), coder (implementation), reviewer, auditor, tester (three independent validation passes, no blocking findings). Vlad approved the strict no-fallback rule and the recorded-fixture approach.
-**Issue**: GitLab issue [vtmocanu/uzi#195](https://gitlab.example.com/vtmocanu/uzi/-/issues/195) — there is no PRD. The issue carries the original measurement; this ADR carries the invariant, the mechanism that makes it hold, and the alternatives, because two of the alternatives are the first thing a competent reader reaches for and one of them is what the issue itself proposed.
+**Issue**: GitLab issue [vtmocanu/uzi#195](https://github.com/vtmocanu/uzi/issues/195) — there is no PRD. The issue carries the original measurement; this ADR carries the invariant, the mechanism that makes it hold, and the alternatives, because two of the alternatives are the first thing a competent reader reaches for and one of them is what the issue itself proposed.
 **Numbering**: `0195` is an **issue** number, like `0106`. `0035`, `0042` and `0065` are PRD numbers. See ADR-106's numbering note.
 
 ## Decision (summary)
@@ -115,7 +115,7 @@ the client read only top-level `usage`. PRD #40 Decision 3 asserted the two surf
 `agent/package.json` now pins `0.3.219`, eighteen patch versions on, and they did not
 agree.
 
-Measured on dev-cluster, run `84b6a933` seq 173:
+Measured on the cluster, run `84b6a933` seq 173:
 
 | | input | output | cache_read | cache_write |
 |---|---|---|---|---|

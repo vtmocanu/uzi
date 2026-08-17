@@ -3,7 +3,7 @@
 **Status**: Accepted
 **Date**: 2026-08-10
 **Deciders**: architect, coders, reviewers
-**Issue**: GitLab issue [vtmocanu/uzi#279](https://gitlab.example.com/vtmocanu/uzi/-/issues/279)
+**Issue**: GitLab issue [vtmocanu/uzi#279](https://github.com/vtmocanu/uzi/issues/279)
 
 ## Decision (summary)
 

@@ -52,9 +52,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md#ci-status--fix-agent-prd-6) and [configura
 `uzi`, a CLI installed via Homebrew, gives humans and agents the same control without a browser tab: list, inspect, approve, and steer runs, read the judge's review, and manage workers and repos — human-readable tables on a TTY, `--json` plus documented exit codes for scripts and agents.
 
 ```sh
-brew tap vtmocanu/tap git@gitlab.example.com:vtmocanu/homebrew-tap.git  # GitLab-hosted; the shorthand alone would resolve to GitHub
+brew tap vtmocanu/tap               # GitHub-hosted; the shorthand resolves to github.com/vtmocanu/homebrew-tap
 brew trust --tap vtmocanu/tap       # one-time: Homebrew 6+ requires trusting third-party taps
-brew install vtmocanu/tap/uzi-cli   # vtmocanu group access; builds from source
+brew install vtmocanu/tap/uzi-cli   # builds from source
 uzi skill install-hook             # Claude Code users: refresh the skill at each session start
 uzi login                          # humans; or set UZI_TOKEN from Settings -> Access
 uzi run list

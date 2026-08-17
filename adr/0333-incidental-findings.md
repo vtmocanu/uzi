@@ -3,7 +3,7 @@
 **Status**: Accepted (PRD #333 implemented)
 **Date**: 2026-08-16
 **Deciders**: Vlad + agent team (architect, coders, three PRD-review waves)
-**PRD**: [prds/done/333-incidental-findings.md](../prds/done/333-incidental-findings.md) (GitLab issue [vtmocanu/uzi#333](https://gitlab.example.com/vtmocanu/uzi/-/issues/333)) — the PRD carries the eight milestones, the full evidence base, and the Decision Log (D1–D12); this ADR carries only the durable seams a future change must respect, and the alternatives that were rejected, so a reader rebuilding from specs need not reread it.
+**PRD**: [prds/done/333-incidental-findings.md](../prds/done/333-incidental-findings.md) (GitLab issue [vtmocanu/uzi#333](https://github.com/vtmocanu/uzi/issues/333)) — the PRD carries the eight milestones, the full evidence base, and the Decision Log (D1–D12); this ADR carries only the durable seams a future change must respect, and the alternatives that were rejected, so a reader rebuilding from specs need not reread it.
 **Numbering**: `0333` is the **PRD / issue** number, like `0065` and `0238`; it is not an ADR sequence number. A reader who assumes "ADR number == ADR count" will miscount.
 
 ## Decision (summary)

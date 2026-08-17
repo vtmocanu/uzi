@@ -3,7 +3,7 @@
 **Status**: Accepted
 **Date**: 2026-08-09
 **Deciders**: Vlad + agent team (architect, coders, review waves — reviewer, auditor, tester, web-ux)
-**PRD**: [prds/done/246-trusted-repo-instructions.md](../prds/done/246-trusted-repo-instructions.md) (GitLab issue [vtmocanu/uzi#246](https://gitlab.example.com/vtmocanu/uzi/-/issues/246)) — the PRD carries the milestones, the full evidence base, and the decision log; this ADR carries the durable design shape and its rationale.
+**PRD**: [prds/done/246-trusted-repo-instructions.md](../prds/done/246-trusted-repo-instructions.md) (GitLab issue [vtmocanu/uzi#246](https://github.com/vtmocanu/uzi/issues/246)) — the PRD carries the milestones, the full evidence base, and the decision log; this ADR carries the durable design shape and its rationale.
 
 ## Decision (summary)
 

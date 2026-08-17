@@ -3,7 +3,7 @@
 **Status**: Accepted (issue #290 — worker-only "Layer A"; a sustained-outage "Layer B" requeue/park is a deferred follow-up, see Consequences)
 **Date**: 2026-08-10
 **Deciders**: architect, coders, reviewers
-**Issue**: GitLab issue [vtmocanu/uzi#290](https://gitlab.example.com/vtmocanu/uzi/-/issues/290)
+**Issue**: GitLab issue [vtmocanu/uzi#290](https://github.com/vtmocanu/uzi/issues/290)
 
 This is the provisioning twin of [ADR-0284](0284-forge-push-retry-classifier.md): the same permanent-first, fail-closed retry shape, applied to the worker's run-time `devbox install` instead of its final push/MR-create.
 

@@ -95,10 +95,10 @@ rather than a reuse of that check.
   its targets outright, but it is never a substitute for it, and a plan that
   says nothing about a target it will still try to reach is not caught here.
 - Accepted false-positive: this repo's own egress-policy manifests legitimately
-  contain these literals — `deploy/values/dev-cluster.yaml` carries both the
-  metadata IP and the apiserver ClusterIP as `cidr:` deny entries, and
-  `deploy/chart/templates/worker-fqdn-egress.yaml` names the metadata IP in its
-  deny-list rationale. A *seeded* plan that
+  contain these literals — `deploy/chart/templates/worker-fqdn-egress.yaml` names
+  the metadata IP in its deny-list rationale, and the per-cluster values file (in
+  the private GitOps repo) carries the metadata IP and the apiserver ClusterIP as
+  `cidr:` deny entries. A *seeded* plan that
   edits that feature will be refused the fast-path and fall back to the
   ordinary gated run flow — which is unscreened — losing nothing but the
   ungated shortcut. That trade is accepted by design: a plan naming a

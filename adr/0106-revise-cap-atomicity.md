@@ -3,7 +3,7 @@
 **Status**: Accepted (implemented, issue #106)
 **Date**: 2026-07-29
 **Deciders**: architect (design), team lead, Vlad — who **requested this ADR over the architect's recorded recommendation not to write one** (the convention is one ADR per PRD, and this is an issue). The objection is recorded, not dropped; see the numbering note below. Implementation and the validation runs quoted throughout: coder, on branch `fix/106-revise-cap-atomic`.
-**Issue**: GitLab issue [vtmocanu/uzi#106](https://gitlab.example.com/vtmocanu/uzi/-/issues/106) — there is no PRD. The issue carries the reproduction, the file map and the test plan; this ADR carries **only** the decision and the alternatives, because each alternative will look attractive again to someone who has not measured, and three of them are the first thing a competent reader reaches for.
+**Issue**: GitLab issue [vtmocanu/uzi#106](https://github.com/vtmocanu/uzi/issues/106) — there is no PRD. The issue carries the reproduction, the file map and the test plan; this ADR carries **only** the decision and the alternatives, because each alternative will look attractive again to someone who has not measured, and three of them are the first thing a competent reader reaches for.
 **Numbering**: `0035`, `0042` and `0065` are PRD numbers; `0106` is an **issue** number. ADRs are numbered by their tracking item, whichever kind it is. Noted because a reader who assumes "ADR number == PRD number" will go looking for `prds/106-*.md` and find nothing.
 
 ## Decision (summary)

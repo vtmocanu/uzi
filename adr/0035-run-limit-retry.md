@@ -3,7 +3,7 @@
 **Status**: Accepted (PRD #35 in flight — this ADR records the M0 design gate, not a merged implementation)
 **Date**: 2026-07-27
 **Deciders**: architect (M0 design gate), team lead, Vlad (open questions 1 and 2)
-**PRD**: [prds/done/35-run-limit-retry.md](../prds/done/35-run-limit-retry.md) (GitLab issue [vtmocanu/uzi#35](https://gitlab.example.com/vtmocanu/uzi/-/issues/35)) — the PRD carries the milestones, the fourteen decisions and the decision log; this ADR carries **one** decision, because it is the one most likely to be re-litigated by someone reading the PRD's original three options and wondering why the recommended one was not built.
+**PRD**: [prds/done/35-run-limit-retry.md](../prds/done/35-run-limit-retry.md) (GitLab issue [vtmocanu/uzi#35](https://github.com/vtmocanu/uzi/issues/35)) — the PRD carries the milestones, the fourteen decisions and the decision log; this ADR carries **one** decision, because it is the one most likely to be re-litigated by someone reading the PRD's original three options and wondering why the recommended one was not built.
 
 ## Decision (summary)
 
@@ -288,7 +288,7 @@ own decisions, and duplicating them here would create two records to keep in ste
   a silent unbounded disk leak, so read it before touching either side.
   (PRD #218 M6, 2026-08-04: dropped from three cleanups to two — the runner-clone leg
   was removed once PRD #218 M1/M2 made a parked run's committed work durable via a
-  fetch-back into the worker bare's tracking ref, validated live on dev-cluster. Only
+  fetch-back into the worker bare's tracking ref, validated live on the cluster. Only
   the sibling skills plugin dir and the per-run HOME are now skipped on a park.)
 - **The four independent guardrail layers** are untouched by this PRD. Nothing here
   changes what a worker may do, only which credential it is handed and when.

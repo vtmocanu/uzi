@@ -3,7 +3,7 @@
 **Status**: Proposed (the PRD is not fully complete — M5's real-fleet validation is still owed; see Consequences)
 **Date**: 2026-08-09
 **Deciders**: architect (M0 design gate); the 2026-08-03 one-pass architectural review recorded in the PRD (five blocking findings, all applied — two established against a real `postgres:17`); user decision of 2026-08-03 on the #216/#84 ordering (D5)
-**PRD**: [prds/216-worker-load-balancing.md](../prds/216-worker-load-balancing.md) (GitLab issue [vtmocanu/uzi#216](https://gitlab.example.com/vtmocanu/uzi/-/issues/216)) — the PRD carries the twelve decisions, the milestones and the correction record; this ADR carries the placement decision and the seam it establishes, because both outlive #216: the seam is consumed by PRD #84, and the placement/enforcement boundary is the one most likely to be read as a contradiction of ADR-42.
+**PRD**: [prds/216-worker-load-balancing.md](../prds/216-worker-load-balancing.md) (GitLab issue [vtmocanu/uzi#216](https://github.com/vtmocanu/uzi/issues/216)) — the PRD carries the twelve decisions, the milestones and the correction record; this ADR carries the placement decision and the seam it establishes, because both outlive #216: the seam is consumed by PRD #84, and the placement/enforcement boundary is the one most likely to be read as a contradiction of ADR-42.
 **Related**: refines [ADR-42](0042-worker-run-concurrency.md) (run PLACEMENT, not cap enforcement — see Decision 4). Establishes the eligibility seam consumed by **PRD #84** (capability-aware scheduling, GitLab issue #84).
 
 ## Decision (summary)

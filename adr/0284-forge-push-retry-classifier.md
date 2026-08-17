@@ -3,7 +3,7 @@
 **Status**: Accepted (PRD #284 M1/M2 merged — Layer A only; Layer B is a deferred follow-up, see Consequences)
 **Date**: 2026-08-09
 **Deciders**: architect (design review that scoped the PRD to Layer A), coders, reviewers
-**PRD**: [prds/284-forge-push-retry.md](../prds/284-forge-push-retry.md) (GitLab issue [vtmocanu/uzi#284](https://gitlab.example.com/vtmocanu/uzi/-/issues/284)) — the PRD carries the milestones, the two-layer split, and the decision log; this ADR carries the one invariant a future edit to the pattern list could silently break.
+**PRD**: [prds/284-forge-push-retry.md](../prds/284-forge-push-retry.md) (GitLab issue [vtmocanu/uzi#284](https://github.com/vtmocanu/uzi/issues/284)) — the PRD carries the milestones, the two-layer split, and the decision log; this ADR carries the one invariant a future edit to the pattern list could silently break.
 
 ## Decision (summary)
 
@@ -27,7 +27,7 @@ owner's Anthropic budget from scratch:
 
 ```
 git push origin refs/uzi-runner/agent/issue-216:refs/heads/agent/issue-216 failed:
-fatal: unable to access 'https://gitlab.example.com/vtmocanu/uzi.git/':
+fatal: unable to access 'https://github.com/vtmocanu/uzi.git/':
 HTTP/2 stream 1 reset by server (error 0x2 INTERNAL_ERROR)
 ```
 

@@ -116,7 +116,7 @@ therefore strictly stronger.
   trigger on `refs/heads/*`/tags/PRs, not arbitrary refs, so CI fires on **no** forge
   and only the end-of-run push to `refs/heads/<branch>` triggers a pipeline — no
   push-option and no marker needed anywhere. **CHOSEN 2026-08-08 (PRD #122 Decision
-  15), validated on GitLab by probe:** `gitlab.example.com` accepts a
+  15), validated on GitLab by probe:** GitLab accepts a
   `refs/uzi-checkpoints/*` ref and fires zero pipelines for it (vs one for
   `refs/heads/main`), and a pure-Go go-git v5.19.2 smart-HTTP send-pack over HTTPS to
   the same forge round-trips. Residual on the push-permission question: the probe
@@ -125,7 +125,7 @@ therefore strictly stronger.
   worker with the bot PAT; Forgejo/GitHub still to check. Belongs at the driver/broker
   layer.
   **Consequence for M8's own validation plan:** a real send-pack against
-  `gitlab.example.com` cannot catch this — GitLab is the one forge where `ci.skip`
+  GitLab cannot catch this — it is the one forge where `ci.skip`
   works — so M8 must additionally validate the suppression against a Forgejo (and
   later GitHub) target, or ship the marker-based path from the start.
 - **`main` is still never touched**, the bot's Developer role is unchanged (it can
