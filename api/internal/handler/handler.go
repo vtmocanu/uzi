@@ -1141,6 +1141,12 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// (which keeps IsAdmin) is refused on another user's review, like CreateRunInput.
 				r.Put("/{id}/review/recommendations/{recID}/disposition", h.SetDisposition)
 				r.Delete("/{id}/review/recommendations/{recID}/disposition", h.DeleteDisposition)
+				// Expedite / undo one queued run's manual priority override (PRD #320 D6/D7).
+				// RequireUser so the M5 `uzi run expedite` CLI verb (a CLI token) can reach it —
+				// NOT the cookie+CSRF RequireAuth group where wait-on-limit sits. Owner-scoped
+				// (foreign run → 404) and QUEUED-ONLY (non-queued → 409); no token spend, no
+				// forge write, no status touch.
+				r.Patch("/{id}/priority", h.SetRunPriority)
 			})
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))
@@ -1201,6 +1207,14 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// GetIssue + the PRD gate, so it rides the per-user forge limiter like the
 				// proposal confirm below.
 				r.With(forgeLimiter.PerUserMiddleware).Post("/run-requests", h.StartChatRun)
+				// Cancel a run from a chat's cancel card (PRD #322 M1): no forge call, and an
+				// emergency stop that must NOT be throttled by an unrelated budget, so it wears
+				// NO limiter — mounted like /{id}/end below, not the forge-limited start above.
+				r.Post("/cancel-requests", h.CancelChatRun)
+				// Steer a run from a chat's steer card (PRD #322 M3): enqueues a follow_up the
+				// worker consumes, so it induces agent spend and rides the per-user chat limiter,
+				// mirroring /{id}/messages below — not the forge budget, not unlimited.
+				r.With(chatLimiter.PerUserMiddleware).Post("/steer-requests", h.SteerChatRun)
 				r.With(chatLimiter.PerUserMiddleware).Post("/{id}/messages", h.PostChatMessage)
 				r.Post("/{id}/end", h.EndChat)
 				// Continue mints a NEW queued chat run, so it rides the same per-user chat

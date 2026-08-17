@@ -255,12 +255,12 @@ describe("SteeringChannel — plan revision (PRD #41)", () => {
 
   it("cancel is epoch-exempt: it applies even when stamped at an older epoch", async () => {
     const cancel = new AbortController();
-    const { client, push } = pushableClient();
+    const { client, push, consumed } = pushableClient();
     const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel);
     ch.bumpEpoch(); // epoch 1
     ch.start();
     push([inp("cancel")]); // seen at epoch 1
-    await tick();
+    await consumed(); // deterministically wait until the cancel is routed at epoch 1 (no wall-clock tick; issue #242)
     ch.bumpEpoch(); // epoch 2 — a stale approve would be dropped here, but cancel is exempt
     assert.deepStrictEqual(await ch.awaitGateEvent(2), { kind: "cancel" } satisfies PlanVerdict);
     assert.strictEqual(cancel.signal.aborted, true);

@@ -34,6 +34,16 @@ const (
 	// chat; Continue mints a new chat resuming the ended one. Value = the run id.
 	ActionChatEnd      = "slack_chat_end"
 	ActionChatContinue = "slack_chat_continue"
+	// Cancel-run card (PRD #322): a danger Cancel button that stops a live issue run via
+	// SubmitInput(cancel), gated by a confirm dialog + the human press. Value = the run id.
+	ActionChatRunCancel        = "slack_chat_run_cancel"
+	ActionChatRunCancelDismiss = "slack_chat_run_cancel_dismiss"
+	// Steer-run card (PRD #322 M4): a primary Steer button that ARMS a one-shot pending
+	// steer for this chat thread; the presser's next in-thread reply is submitted as a
+	// follow_up to the target issue run. Gated by a confirm dialog + the human press.
+	// Value = the encoded {run_id, root_ts} (the thread root is the pending's key).
+	ActionChatRunSteer        = "slack_chat_run_steer"
+	ActionChatRunSteerDismiss = "slack_chat_run_steer_dismiss"
 )
 
 // isChatAction reports whether an action id is a chat-card action ChatActions owns.
@@ -85,6 +95,11 @@ type ChatActionSubmitter interface {
 	// id on success; on refusal the error's message is USER-SAFE (the adapter builds it
 	// from the gate sentinels and logs the raw cause), so ChatActions can surface it.
 	StartRunFromCard(ctx context.Context, userID uuid.UUID, repoPath string, issueIID int64) (uuid.UUID, error)
+	// CancelRunFromCard cancels a live run from the chat cancel card (PRD #322) via the
+	// owner-only SubmitInput(cancel). run_id is untrusted → re-resolved server-side. On
+	// refusal it returns an error whose MESSAGE is user-safe (built from the run sentinels
+	// in main, mirroring StartRunFromCard), so ChatActions can surface it.
+	CancelRunFromCard(ctx context.Context, userID, runID uuid.UUID) error
 	// EndChat ends a live chat (PRD #191 M6). Translated: ErrChatEnded (already
 	// terminal), ErrChatGone (not yours / gone).
 	EndChat(ctx context.Context, userID, runID uuid.UUID) error
@@ -113,6 +128,12 @@ type ChatActions struct {
 	// budget the opener/web-create use (PRD #191 M6): Continue mints a run and spends
 	// the owner's token, so it must not bypass the guard. Nil (tests) is open.
 	chatAllow func(userID uuid.UUID) bool
+	// steer is the shared pending-steer registry (PRD #322 M4): pressing Steer arms a
+	// one-shot pending here, keyed by the chat thread root, that the Replier consumes on
+	// the next in-thread reply. Nil (tests, or a deployment that never wires it) means
+	// steering is unavailable — steerRun then posts an ephemeral rather than arming a
+	// pending the Replier will never see.
+	steer *SteerPendings
 }
 
 // NewChatActions builds a ChatActions. poster is the shared bot-token Slack surface;
@@ -128,6 +149,11 @@ func NewChatActions(s ChatActionStore, svc ChatActionSubmitter, poster Poster, b
 // #191 M6). Pass the SAME closure the opener uses so Slack opens and continues share
 // one budget.
 func (c *ChatActions) SetChatSpendGuard(allow func(userID uuid.UUID) bool) { c.chatAllow = allow }
+
+// SetSteerPending wires the shared pending-steer registry for the Steer button (PRD
+// #322 M4). Pass the SAME *SteerPendings the Replier consumes, so a press here arms a
+// pending the reply path takes.
+func (c *ChatActions) SetSteerPending(s *SteerPendings) { c.steer = s }
 
 // HandleBlockAction routes a chat-card press. The actor is the Slack-authenticated
 // envelope user ONLY; the value blob carries (run, proposal) and is authorized through
@@ -145,7 +171,8 @@ func (c *ChatActions) HandleBlockAction(ctx context.Context, a BlockAction) {
 	// returns before the confirmed-user DB lookup.
 	switch a.ActionID {
 	case ActionChatProposalCreate, ActionChatProposalDismiss, ActionChatRunStart, ActionChatRunDismiss,
-		ActionChatEnd, ActionChatContinue:
+		ActionChatEnd, ActionChatContinue, ActionChatRunCancel, ActionChatRunCancelDismiss,
+		ActionChatRunSteer, ActionChatRunSteerDismiss:
 	default:
 		return
 	}
@@ -193,6 +220,28 @@ func (c *ChatActions) HandleBlockAction(ctx context.Context, a BlockAction) {
 			c.endChat(ctx, a, user.ID, runID)
 		} else {
 			c.continueChat(ctx, a, user.ID, runID)
+		}
+	case ActionChatRunCancel, ActionChatRunCancelDismiss:
+		runID, err := uuid.Parse(strings.TrimSpace(a.Value))
+		if err != nil {
+			c.logf("parse cancel action value", err)
+			return
+		}
+		if a.ActionID == ActionChatRunCancel {
+			c.cancelRun(ctx, a, user.ID, runID)
+		} else {
+			c.editCardLinked(ctx, a, "Dismissed — the run was not cancelled.", "", "")
+		}
+	case ActionChatRunSteer, ActionChatRunSteerDismiss:
+		runID, rootTS, ok := decodeSteerReqValue(a.Value)
+		if !ok {
+			c.logf("parse steer action value", errors.New("malformed value"))
+			return
+		}
+		if a.ActionID == ActionChatRunSteer {
+			c.steerRun(ctx, a, user.ID, runID, rootTS)
+		} else {
+			c.editCardLinked(ctx, a, "Dismissed — the run was not steered.", "", "")
 		}
 	}
 }
@@ -284,6 +333,36 @@ func (c *ChatActions) startRun(ctx context.Context, a BlockAction, userID uuid.U
 	}
 	base, _ := c.baseURL(ctx)
 	c.editCardLinked(ctx, a, "▶️ Run started.", runURL(base, runID), "View the run")
+}
+
+// cancelRun cancels the card's target run via the owner-only SubmitInput(cancel) and
+// edits the card to the outcome. A refusal (foreign/terminal run) is surfaced with a
+// user-safe reason from the adapter. The run_id is untrusted — SubmitInput re-resolves
+// ownership + terminality, so a forged value cancels nothing the presser can't cancel.
+func (c *ChatActions) cancelRun(ctx context.Context, a BlockAction, userID, runID uuid.UUID) {
+	if err := c.svc.CancelRunFromCard(ctx, userID, runID); err != nil {
+		c.ephemeral(ctx, a, err.Error())
+		return
+	}
+	base, _ := c.baseURL(ctx)
+	c.editCardLinked(ctx, a, "🛑 Run cancelled.", runURL(base, runID), "View the run")
+}
+
+// steerRun arms a one-shot pending steer for this chat thread and edits the card to
+// prompt the presser for their steering instruction. The write itself does not happen
+// here: the presser's NEXT in-thread reply is what the Replier submits as a follow_up
+// to the target run (via the ownership-scoped SubmitInput), so the run_id is re-resolved
+// server-side and an injected "steer run X" can at most produce this card. rootTS is the
+// chat thread root the reply will carry as thread_ts — the pending's key. When the
+// registry is unwired (nil) steering is unavailable, so post an ephemeral and arm
+// nothing, mirroring the nil chatAllow guard style.
+func (c *ChatActions) steerRun(ctx context.Context, a BlockAction, userID, runID uuid.UUID, rootTS string) {
+	if c.steer == nil {
+		c.ephemeral(ctx, a, "Steering isn't available right now.")
+		return
+	}
+	c.steer.Arm(a.ChannelID, rootTS, runID, userID)
+	c.editCardLinked(ctx, a, "✍️ Reply in this thread with your steering instruction — your next reply is sent to the run.", "", "")
 }
 
 // createProposal files the proposed issue and edits the card to its outcome. A
@@ -564,4 +643,89 @@ func runRequestCardBlocks(repoPath string, issueIID int64, note string) []slack.
 		slack.NewTextBlockObject(slack.PlainTextType, "Dismiss", false, false))
 
 	return []slack.Block{section, slack.NewActionBlock("slack_chat_run", start, dismiss)}
+}
+
+// cancelRequestCardBlocks builds the cancel-run card (PRD #322): a danger Cancel button
+// (confirm-gated) + Dismiss. Cancelling a run is human-confirmed exactly like Start: a
+// run's activity feed that says "cancel run X" must at most produce a card. The run id
+// is untrusted → scrubbed + escaped + inert.
+func cancelRequestCardBlocks(runID uuid.UUID) []slack.Block {
+	section := slack.NewSectionBlock(
+		slack.NewTextBlockObject(slack.MarkdownType,
+			truncateForSlackSection("*🛑 Cancel this run?*\nRun `"+cardField(runID.String())+"` will be stopped."), false, false), nil, nil)
+	val := runID.String()
+	cancel := slack.NewButtonBlockElement(ActionChatRunCancel, val,
+		slack.NewTextBlockObject(slack.PlainTextType, "Cancel run", false, false))
+	cancel.Style = slack.StyleDanger
+	cancel.Confirm = slack.NewConfirmationBlockObject(
+		slack.NewTextBlockObject(slack.PlainTextType, "Cancel this run?", false, false),
+		slack.NewTextBlockObject(slack.PlainTextType, "The run will stop as soon as the worker sees the cancel. This can't be undone.", false, false),
+		slack.NewTextBlockObject(slack.PlainTextType, "Cancel run", false, false),
+		slack.NewTextBlockObject(slack.PlainTextType, "Keep running", false, false),
+	)
+	dismiss := slack.NewButtonBlockElement(ActionChatRunCancelDismiss, val,
+		slack.NewTextBlockObject(slack.PlainTextType, "Dismiss", false, false))
+	return []slack.Block{section, slack.NewActionBlock("slack_chat_run_cancel", cancel, dismiss)}
+}
+
+// steerReqValue is the steer-run card's button value (PRD #322 M4): the untrusted target
+// run id plus the chat thread ROOT ts. JSON (not the bare run id the cancel card uses)
+// because the reply-side pending is keyed by the thread root — which BlockAction does
+// NOT carry (it exposes only the card's own message ts) — so the builder, which has
+// convo.rootTS, encodes it here. Untrusted on the way back: SubmitInput re-resolves the
+// run id server-side, and root_ts only names which thread the pending is armed for.
+type steerReqValue struct {
+	RunID  string `json:"rid"`
+	RootTS string `json:"rt"`
+}
+
+func encodeSteerReqValue(runID uuid.UUID, rootTS string) string {
+	b, _ := json.Marshal(steerReqValue{RunID: runID.String(), RootTS: rootTS})
+	return string(b)
+}
+
+func decodeSteerReqValue(v string) (runID uuid.UUID, rootTS string, ok bool) {
+	var x steerReqValue
+	if err := json.Unmarshal([]byte(v), &x); err != nil {
+		return uuid.Nil, "", false
+	}
+	rid, err := uuid.Parse(strings.TrimSpace(x.RunID))
+	if err != nil || strings.TrimSpace(x.RootTS) == "" {
+		return uuid.Nil, "", false
+	}
+	return rid, x.RootTS, true
+}
+
+// steerRequestCardBlocks builds the steer-run card (PRD #322 M4): the target run id, the
+// agent's PROPOSED steering instruction, a primary Steer button (confirm-gated) and a
+// Dismiss. Steering a run is human-confirmed exactly like Start/Cancel: a run's activity
+// feed that says "tell run X to …" must at most produce this card, never a follow_up.
+// The proposed message is model-authored (untrusted) → scrubbed + escaped + inert; the
+// run id is escaped. The pressed Steer only ARMS a pending — the instruction actually
+// sent is the presser's own next reply, not this proposed text.
+func steerRequestCardBlocks(runID uuid.UUID, rootTS string, proposedMessage string) []slack.Block {
+	var b strings.Builder
+	b.WriteString("*✍️ Steer this run?*")
+	if rid := cardField(runID.String()); rid != "" {
+		b.WriteString("\nRun `" + rid + "`")
+	}
+	if m := renderChatBody(proposedMessage); m != "" {
+		b.WriteString("\n" + m)
+	}
+	section := slack.NewSectionBlock(
+		slack.NewTextBlockObject(slack.MarkdownType, truncateForSlackSection(b.String()), false, false), nil, nil)
+
+	val := encodeSteerReqValue(runID, rootTS)
+	steer := slack.NewButtonBlockElement(ActionChatRunSteer, val,
+		slack.NewTextBlockObject(slack.PlainTextType, "Steer", false, false))
+	steer.Style = slack.StylePrimary
+	steer.Confirm = slack.NewConfirmationBlockObject(
+		slack.NewTextBlockObject(slack.PlainTextType, "Steer this run?", false, false),
+		slack.NewTextBlockObject(slack.PlainTextType, "Your next reply in this thread is sent to the run as a follow-up instruction.", false, false),
+		slack.NewTextBlockObject(slack.PlainTextType, "Steer", false, false),
+		slack.NewTextBlockObject(slack.PlainTextType, "Cancel", false, false),
+	)
+	dismiss := slack.NewButtonBlockElement(ActionChatRunSteerDismiss, val,
+		slack.NewTextBlockObject(slack.PlainTextType, "Dismiss", false, false))
+	return []slack.Block{section, slack.NewActionBlock("slack_chat_run_steer", steer, dismiss)}
 }

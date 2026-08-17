@@ -3,7 +3,7 @@
 **GitLab Issue**: [#94](https://gitlab.example.com/vtmocanu/uzi/-/issues/94)
 **Status**: Complete (2026-07-20; merged via MR [!81](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/81))
 **Priority**: Medium
-**Mockup**: [`prds/mockups/94-judge-triage-mock.html`](mockups/94-judge-triage-mock.html) (global strip + per-review triage bar + row states + CLI)
+**Mockup**: [`prds/mockups/94-judge-triage-mock.html`](../mockups/94-judge-triage-mock.html) (global strip + per-review triage bar + row states + CLI)
 **Depends on**: PRD #46 (the judge, `run_reviews` + `review_recommendations`), PRD #68 (`recommendation_filed_issues`, the coordinate-keyed side-table pattern this reuses verbatim, and the `improve_uzi` backlog `NOT EXISTS` this extends). Related: PRD #64 (the `uzi` CLI, second consumer), PRD #19 (`selfimprove` engine backlog).
 **Review**: fable adversarial pass folded in (2026-07-20). Load-bearing corrections: owner-**only** authz (a uza_ `admin_ro` token keeps `IsAdmin` on `RequireUser`, so owner-or-admin would break the read-only ceiling); the ladder is computed **once in Go** for both counters (a Go helper cannot back a SQL `CASE`); "filed" means a **settled** link (`filed_at IS NOT NULL`), since claim rows are nullable/in-flight; the stale flag keys on a **rationale hash**, not `set_at < updated_at` (which fires on every re-judge). The CSRF worry on the `RequireUser` mount was checked and is a non-issue (presence-dispatch: a Bearer request never reads the cookie; the cookie path is the unmodified CSRF-enforcing `RequireAuth`).
 

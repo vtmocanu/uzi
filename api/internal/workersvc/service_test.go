@@ -439,7 +439,7 @@ func (f *fakeStore) GetRunClaimContext(context.Context, uuid.UUID) (store.GetRun
 // ListActiveRunsAll is the in-flight avoid-set source a self_improve claim reads
 // (issue #297). The zero value is an empty set, so every pre-#297 claim fixture — which
 // stages nothing here — takes the nil/empty path and never panics on the embedded Store.
-func (f *fakeStore) ListActiveRunsAll(context.Context) ([]store.ListActiveRunsAllRow, error) {
+func (f *fakeStore) ListActiveRunsAll(context.Context, pgtype.Timestamptz) ([]store.ListActiveRunsAllRow, error) {
 	return f.activeRunsAll, f.activeRunsAllErr
 }
 func (f *fakeStore) GetUserSecretCiphertext(context.Context, store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error) {
@@ -885,6 +885,7 @@ func testParams() Params {
 		WorkerHeartbeatStale:   45 * time.Second,
 		WorkerAffinityGrace:    2 * time.Minute,
 		WorkerSpreadGrace:      9 * time.Second,
+		WorkerBackgroundGrace:  15 * time.Minute,
 		ClaimGrace:             5 * time.Minute,
 		SkillMaxBytes:          65536,
 		SkillsMaxPerRun:        32,

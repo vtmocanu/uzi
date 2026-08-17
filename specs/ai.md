@@ -21247,7 +21247,44 @@ design shape, not the code.
   exactly what an auto-file mode would drive; adding it later is a create-time branch (insert straight to
   `filing`), not a schema change.
 
-## 553. Issue #321 — planning vs running: a derived `is_planning` display predicate, no new status/column
+## 553. PRD #320 — Run queue priority: interactive runs claim ahead of background retrospection, with a manual expedite
+
+Serves the PRD #320 goal: on a saturated worker, interactive runs (issue, ci_fix) are claimed before
+background runs (judge, self_improve), with a per-run manual expedite and an age-based fail-open so
+background work never starves. Full rationale in the Decision Log of `prds/done/320-run-queue-priority.md`
+(D1–D10) — this section records only the durable design shape, not the code. Migration
+`00130_run_priority.sql` (number assigned at landing).
+
+- **Two co-located `IMMUTABLE` SQL functions are the single source of truth (D1).** `fn_run_priority(run_kind, priority, is_stale)`
+  returns the ordering **rank** (called by `ClaimRun`'s ORDER BY); `fn_run_priority_class(run_kind, priority, is_stale)`
+  returns the display **class** in `{normal, background, expedited, restored}` (called by the read queries,
+  the CLI DTO, the health queued-reason, and the web pill). Both share one demotion predicate, so claim
+  order and every label/pill can never disagree. No demotion logic is written in Go; adding a kind to the
+  demotion set later edits only these two functions. Mirrors the `fn_worker_can_claim` reused-expression
+  idiom (`00113_fleet_aware_claim.sql`). The class exists separately because rank cannot carry the
+  `restored` distinction — a `restored` run and a `normal` run both rank `1`.
+- **Nullable manual-override column; kind default lives in the function (D2).** `runs.priority SMALLINT NULL`:
+  `NULL` = use the kind default computed in the function. Expedite writes `2` (above normal), undo writes
+  `NULL`. Because the default is computed, the seven `INSERT INTO runs` sites are untouched and no backfill
+  runs.
+- **Ordering only, never eligibility (D1, non-goals).** The priority term slots into `ClaimRun`'s ORDER BY
+  *between* worker affinity and `created_at` FIFO. The WHERE / `fn_worker_can_claim` / the PRD #216
+  fleet-spread clause are untouched. So expedite orders one claiming worker's own eligible candidate set,
+  exactly as affinity/FIFO do — not a global cross-fleet or cross-user guarantee.
+- **Demotion set is `{judge, self_improve}` only.** Scheduled `prompt` runs stay normal; chat runs are on
+  a separate lane (`ClaimChatRun`) and out of scope by construction.
+- **Fail-open by run age (D4).** `is_stale = created_at < now() - RUN_BACKGROUND_GRACE` (new config knob,
+  default 15m, wired like `WORKER_SPREAD_GRACE`/`WORKER_AFFINITY_GRACE`: parse in config, build a cutoff in
+  `workersvc`). A demoted run older than the grace collapses to normal rank with class `restored`, so
+  background work can never starve.
+- **Surfaces derive from the class, never re-derived per surface.** The class drives the DTO `priority`
+  field (`runToDTO`, with the `apitypes/wire_test.go` exact-key contract updated), a queued-reason wording
+  in the run-health detector ("deprioritized — yields to interactive work" / "priority restored — no longer
+  yielding"), a `uzi run expedite` CLI verb (owner-scoped mutation, precedent `SetRunWaitOnLimit`), and a
+  priority pill + owner-only Expedite action on the Runs list (`RunsList.tsx`) and run page
+  (`RunView.tsx`). The Kanban board is intentionally NOT changed.
+
+## 554. Issue #321 — planning vs running: a derived `is_planning` display predicate, no new status/column
 
 Serves issue #321: distinguish a run's pre-approval PLANNING phase from its post-approval implementing
 phase, which previously both rendered an identical "running" badge. Full rationale in the Decision Log of

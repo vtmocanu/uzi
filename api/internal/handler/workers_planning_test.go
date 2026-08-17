@@ -82,7 +82,7 @@ func TestRunToDTOIsPlanning(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := runToDTO(tc.run).IsPlanning; got != tc.want {
+			if got := runToDTO(tc.run, "normal").IsPlanning; got != tc.want {
 				t.Fatalf("runToDTO(%+v).IsPlanning = %v, want %v", tc.run, got, tc.want)
 			}
 		})

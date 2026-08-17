@@ -1,7 +1,7 @@
 # PRD #308 — Schedule fire outcomes: surface why a fire started nothing (UI + CLI)
 
 **Issue**: [#308](https://gitlab.example.com/vtmocanu/uzi/-/issues/308)
-**Mock**: [`prds/mockups/308-schedule-fire-outcome-mock.html`](mockups/308-schedule-fire-outcome-mock.html)
+**Mock**: [`prds/mockups/308-schedule-fire-outcome-mock.html`](../mockups/308-schedule-fire-outcome-mock.html)
 **Priority**: Medium
 **Status**: Done
 

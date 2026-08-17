@@ -24,6 +24,7 @@ import { ActivityIcon } from "../components/icons";
 import { MrChip } from "../components/MrChip";
 import { mrAbbrev } from "../lib/forgeNoun";
 import { effectiveRunStatus, isStoppedRun, milestoneBadge, milestoneBadgeText, mrChipState } from "../lib/runBadge";
+import { RunPriorityBadge } from "../components/RunPriorityBadge";
 import { formatTokens, formatCost } from "../lib/formatTokens";
 import { runDurationLabel } from "../lib/runDuration";
 import { useNow } from "../lib/rateLimits";
@@ -76,6 +77,10 @@ interface RunsData {
   loading: boolean;
   error: string;
   tokenCount: number;
+  // PRD #320 M6: re-run the layout's one runs fetch, so an Expedite/undo on a queued
+  // row can refresh the priority pill + queue ordering the way RunView's refreshRun
+  // does — the list otherwise loads once with no poll.
+  reload: () => void;
 }
 
 function useRunsData(): RunsData {
@@ -97,30 +102,36 @@ export function RunsLayout() {
   // computed once from the viewer's secrets. A single-token user sees no badge.
   const [tokenCount, setTokenCount] = useState(0);
 
+  // The one runs fetch, extracted so an Expedite/undo can re-run it (reload below). The
+  // isAlive guard defaults to always-true for a reload (the component is mounted when the
+  // user clicks) and is a mount-scoped flag for the initial load, so an in-flight first
+  // fetch never setStates after unmount.
+  const load = useCallback(async (isAlive: () => boolean = () => true) => {
+    try {
+      const [{ runs }, { secrets }] = await Promise.all([
+        api.listRuns(),
+        // Best-effort (like Dashboard's usage calls): the secrets fetch only powers
+        // the cosmetic ">1 token" credential-badge gate, so a secrets-endpoint
+        // failure must not blank the whole Runs area. Fall back to no badge.
+        api.listSecrets().catch(() => ({ secrets: [] })),
+      ]);
+      if (!isAlive()) return;
+      setRuns(runs);
+      setTokenCount(anthropicTokenCount(secrets));
+    } catch (err) {
+      if (isAlive()) setError(err instanceof ApiError ? err.message : "Failed to load runs");
+    } finally {
+      if (isAlive()) setLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     let alive = true;
-    (async () => {
-      try {
-        const [{ runs }, { secrets }] = await Promise.all([
-          api.listRuns(),
-          // Best-effort (like Dashboard's usage calls): the secrets fetch only powers
-          // the cosmetic ">1 token" credential-badge gate, so a secrets-endpoint
-          // failure must not blank the whole Runs area. Fall back to no badge.
-          api.listSecrets().catch(() => ({ secrets: [] })),
-        ]);
-        if (!alive) return;
-        setRuns(runs);
-        setTokenCount(anthropicTokenCount(secrets));
-      } catch (err) {
-        if (alive) setError(err instanceof ApiError ? err.message : "Failed to load runs");
-      } finally {
-        if (alive) setLoading(false);
-      }
-    })();
+    void load(() => alive);
     return () => {
       alive = false;
     };
-  }, []);
+  }, [load]);
 
   const pastCount = loading ? null : runs.filter((r) => isTerminalRun(r.status)).length;
   const tabs = [
@@ -149,7 +160,7 @@ export function RunsLayout() {
           </NavLink>
         ))}
       </div>
-      <Outlet context={{ runs, loading, error, tokenCount } satisfies RunsData} />
+      <Outlet context={{ runs, loading, error, tokenCount, reload: () => void load() } satisfies RunsData} />
     </div>
   );
 }
@@ -160,6 +171,8 @@ function RunRow({
   showOwner,
   waitingForVault = false,
   showCredential = false,
+  owned = false,
+  onExpedited,
 }: {
   run: RunListItem;
   // now (issue #256 M3): a Date.now()-style clock, ticked by useNow in the parent, so
@@ -177,6 +190,15 @@ function RunRow({
   // compact badge is inherently non-linked (it lives inside this row's own <Link>),
   // so there is no linkable flag to thread through.
   showCredential?: boolean;
+  // owned (PRD #320 M6): the viewer owns this run, so the Expedite/undo action may show.
+  // RunListItem carries no per-row is_mine, so ownership is threaded from the caller: the
+  // personal Active list is all the viewer's own runs (owned), the admin factory list is
+  // OTHER users' runs (not owned). The queued gate + the server's owner-scoped 404 are
+  // the backstop, but this keeps a non-owner from ever seeing a control that 404s.
+  owned?: boolean;
+  // onExpedited (PRD #320 M6): re-run the list fetch after a successful Expedite/undo so
+  // the priority pill + queue ordering refresh. Wired to the layout's reload.
+  onExpedited?: () => void;
 }) {
   // A deliberate human stop (cancelled, or failed carrying a server-stamped
   // stop_kind — PRD #33) reads "stopped" / neutral, never "failed" / danger. Fold
@@ -192,6 +214,27 @@ function RunRow({
   // Issue #256 M3: a live, per-state duration token ("running 1h 30m", "ran 42m", …);
   // "" for a pre-feature/no-anchor run, which then adds nothing to the meta line.
   const duration = runDurationLabel(run, now);
+  // PRD #320 M6: the owner's Expedite/undo action on a queued row. Owner-scoped +
+  // queued-only, matching the server; a background/restored/normal row offers "Expedite",
+  // an already-expedited row offers "Undo". The action lives INSIDE the row's <Link>, so
+  // the click handler must preventDefault + stopPropagation or it navigates instead of
+  // firing the mutation (the row-Link trap the credential badge also had to dodge).
+  const [expediting, setExpediting] = useState(false);
+  const canExpedite = owned && run.status === "queued" && !waitingForVault;
+  const isExpedited = run.priority === "expedited";
+  const doExpedite = async () => {
+    if (expediting) return;
+    setExpediting(true);
+    try {
+      await api.expediteRun(run.id, !isExpedited);
+      onExpedited?.();
+    } catch {
+      // Best-effort: a 409 (raced out of queued) or 404 (not the owner) backstops a
+      // stale gate; the row simply stays as it was and the next load reconciles it.
+    } finally {
+      setExpediting(false);
+    }
+  };
   return (
     <li>
       <Link
@@ -267,7 +310,32 @@ function RunRow({
               {/* The judge verdict (PRD #98 M4) sits with the other per-run pills;
                   absent entirely on an unjudged run. */}
               <JudgeRunBadge run={run} />
+              {/* PRD #320 M6: the queue-priority pill (Deprioritized/Expedited/Restored),
+                  self-hiding on a normal or non-queued run. */}
+              <RunPriorityBadge priority={run.priority} status={run.status} />
               <StatusPill status={pillStatus} />
+              {/* PRD #320 M6: the owner-only Expedite/undo control, queued rows only. It
+                  lives inside the row <Link>, so it preventDefaults + stopPropagates before
+                  firing the mutation; a non-owner never reaches this branch (owned gate). */}
+              {canExpedite && (
+                <button
+                  type="button"
+                  disabled={expediting}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    void doExpedite();
+                  }}
+                  title={
+                    isExpedited
+                      ? "Return this run to its natural queue position."
+                      : "Bump this run to the front of the queue."
+                  }
+                  className="rounded-md border border-edge bg-raised px-2 py-1 text-xs font-medium text-muted transition-colors hover:border-edge-strong hover:text-fg disabled:opacity-50"
+                >
+                  {isExpedited ? "Undo" : "Expedite"}
+                </button>
+              )}
               {/* PRD #295: which Anthropic token this run's claim billed. Gated by
                   the caller (personal list: viewer holds >1 token) and self-hiding
                   on a run with no recorded label. */}
@@ -291,7 +359,7 @@ export function RunsList() {
   // otherwise loads once (no poll), so the token would freeze without this clock.
   const now = useNow(1000);
 
-  const { runs, loading, error, tokenCount } = useRunsData();
+  const { runs, loading, error, tokenCount, reload } = useRunsData();
   const [adminRuns, setAdminRuns] = useState<RunListItem[]>([]);
   const [adminWorkers, setAdminWorkers] = useState<AdminWorker[]>([]);
   const [adminError, setAdminError] = useState("");
@@ -359,6 +427,11 @@ export function RunsList() {
                       now={now}
                       waitingForVault={!vaultUnlocked && r.status === "queued"}
                       showCredential={tokenCount > 1}
+                      // The personal Active list is all the viewer's own runs, so the
+                      // Expedite/undo action is offered here (PRD #320 M6); reload
+                      // refreshes the pill + ordering after the mutation.
+                      owned
+                      onExpedited={reload}
                     />
                   ))}
                 </ul>

@@ -46,7 +46,7 @@ func (h *Handler) CreateChat(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run)})
+	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run))})
 }
 
 // chatListDTO is one conversation in the Chat page's list: the display + activity
@@ -174,7 +174,7 @@ func (h *Handler) ContinueChat(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run)})
+	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run))})
 }
 
 // startChatRunRequest is the body of the chat start-run card's Start click (PRD #191
@@ -212,7 +212,104 @@ func (h *Handler) StartChatRun(w http.ResponseWriter, r *http.Request) {
 		h.writeStartRunError(w, r, err)
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run)})
+	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run))})
+}
+
+// cancelChatRunRequest is the body of the chat cancel card's Cancel click (PRD #322):
+// the target run id. The run is re-resolved and terminality-guarded server-side by
+// SubmitInput; the card value is untrusted, exactly like the start-run card.
+type cancelChatRunRequest struct {
+	RunID string `json:"run_id"`
+}
+
+// CancelChatRun cancels a live run from a chat's cancel card (PRD #322). Owner-scoped
+// and terminality-guarded through workersvc.SubmitInput(cancel); the card's run_id is
+// untrusted. No forge call, so it wears no limiter (mounted like /{id}/end).
+func (h *Handler) CancelChatRun(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var req cancelChatRunRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	runID, err := uuid.Parse(strings.TrimSpace(req.RunID))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "run_id is required")
+		return
+	}
+	// Map errors like CreateRunInput (workers.go), NOT writeStartRunError: a stale/forged
+	// card must degrade to a clear 404/409, never a 500.
+	res, err := h.wsvc.SubmitInput(r.Context(), user.ID, runID, "cancel", "", nil)
+	if err != nil {
+		switch {
+		case errors.Is(err, workersvc.ErrRunNotFound):
+			httpx.Error(w, http.StatusNotFound, "run not found")
+		case errors.Is(err, workersvc.ErrRunTerminal):
+			httpx.Error(w, http.StatusConflict, "run has already finished")
+		default:
+			slog.Error("cancel chat run", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+	httpx.JSON(w, http.StatusAccepted, map[string]any{"server_side": res.ServerSide})
+}
+
+// steerChatRunRequest is the body of the chat steer card's Send click (PRD #322): the
+// target run id and the (human-edited) follow-up message. The run is re-resolved and
+// terminality-guarded server-side by SubmitInput(follow_up); the card values are
+// untrusted. A chat-run target is refused (steering is for issue runs).
+type steerChatRunRequest struct {
+	RunID   string `json:"run_id"`
+	Message string `json:"message"`
+}
+
+// SteerChatRun sends a follow-up to steer a live issue run from a chat's steer card
+// (PRD #322). Owner-scoped + terminality-guarded through SubmitInput(follow_up); a chat
+// run is refused with an issue-runs-only message. Under chatLimiter (it induces agent
+// spend), mirroring the chat message endpoint.
+func (h *Handler) SteerChatRun(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var req steerChatRunRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	runID, err := uuid.Parse(strings.TrimSpace(req.RunID))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "run_id is required")
+		return
+	}
+	if strings.TrimSpace(req.Message) == "" {
+		httpx.Error(w, http.StatusBadRequest, "message must not be empty")
+		return
+	}
+	// Map errors like CreateRunInput (workers.go), NOT writeStartRunError: a stale/forged
+	// card or a chat-run target must degrade to a clear 404/409, never a 500.
+	res, err := h.wsvc.SubmitInput(r.Context(), user.ID, runID, "follow_up", req.Message, nil)
+	if err != nil {
+		switch {
+		case errors.Is(err, workersvc.ErrRunNotFound):
+			httpx.Error(w, http.StatusNotFound, "run not found")
+		case errors.Is(err, workersvc.ErrRunTerminal):
+			httpx.Error(w, http.StatusConflict, "run has already finished")
+		case errors.Is(err, workersvc.ErrChatInputNotAllowed):
+			httpx.Error(w, http.StatusConflict, "steering applies to issue runs, not chats")
+		default:
+			slog.Error("steer chat run", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+	httpx.JSON(w, http.StatusAccepted, map[string]any{"server_side": res.ServerSide})
 }
 
 // createdIssueDTO is the confirm response: the real forge issue the click created.

@@ -378,6 +378,7 @@ type Run struct {
 	Model                 pgtype.Text        `json:"model"`
 	OverrideSubagentModel bool               `json:"override_subagent_model"`
 	FailOrigin            pgtype.Text        `json:"fail_origin"`
+	Priority              pgtype.Int2        `json:"priority"`
 }
 
 type RunMessage struct {

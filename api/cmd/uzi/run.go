@@ -645,7 +645,37 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(list, get, logs, wait, review, create, approve, reject, revise, cancel, followUp, answer, inputs)
+	expedite := &cobra.Command{
+		Use:   "expedite <run-id>",
+		Short: "Bump a queued run to the front of the claim queue (or --clear to undo)",
+		Long: "Bump ONE queued run to the front of the claim queue so a worker picks it up before " +
+			"the rest (PRD #320). It matters only before a run is claimed: ordering is fixed once a " +
+			"worker takes the run, so a non-queued run is a 409 (exit 5). A foreign or unknown run is " +
+			"a 404 (exit 4).\n\n" +
+			"`--clear` undoes it — it removes the manual override and returns the run to its kind " +
+			"default priority (it does NOT demote the run below normal).",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			// --clear removes the manual override (expedite=false); its absence expedites.
+			clear, _ := cmd.Flags().GetBool("clear")
+			run, err := c.SetRunPriority(cmd.Context(), args[0], !clear)
+			if err != nil {
+				return err
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(run)
+			}
+			return renderRunDetail(p, run)
+		},
+	}
+	expedite.Flags().Bool("clear", false, "clear the manual expedite (undo), returning the run to its kind default priority")
+
+	cmd.AddCommand(list, get, logs, wait, review, create, approve, reject, revise, cancel, followUp, answer, inputs, expedite)
 	return cmd
 }
 

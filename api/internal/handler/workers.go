@@ -317,7 +317,35 @@ func isPlanningPhase(kind, status string, iterationCount int32, planMdPresent bo
 	return status == "running" && iterationCount == 0 && !planMdPresent
 }
 
-func runToDTO(r store.Run) apitypes.RunDTO {
+// runPriorityClass resolves a run's display class via the ONE SQL function (D8),
+// never re-deriving the demotion predicate in Go. is_stale is the D4 fail-open flag
+// (created before now-RUN_BACKGROUND_GRACE). Best-effort: on error, the display
+// defaults to "normal" (a read must not fail because the pill class couldn't be
+// computed).
+func (h *Handler) runPriorityClass(ctx context.Context, r store.Run) string {
+	// Best-effort: a Handler assembled without a direct store (the wsvc-routed fake
+	// used by the runs handler tests) has no query surface here, so default to the
+	// safe class rather than dereferencing a nil store — the same "on error → normal"
+	// contract this helper already promises.
+	if h.q == nil {
+		return "normal"
+	}
+	cutoff := h.clock().Add(-h.cfg.WorkerBackgroundGrace)
+	isStale := r.CreatedAt.Valid && r.CreatedAt.Time.Before(cutoff)
+	class, err := h.q.RunPriorityClass(ctx, store.RunPriorityClassParams{
+		RunKind: r.Kind, Priority: r.Priority, IsStale: isStale,
+	})
+	if err != nil {
+		return "normal"
+	}
+	return class
+}
+
+// runToDTO maps a bare run row to its wire DTO. priorityClass is the D8 display class
+// (from fn_run_priority_class via a list column or h.runPriorityClass), passed in
+// explicitly so this mapper stays a PURE function of its inputs — no now()/config
+// reaches into it.
+func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
 	dto := apitypes.RunDTO{
 		ID:               r.ID.String(),
 		Kind:             r.Kind,
@@ -368,6 +396,9 @@ func runToDTO(r store.Run) apitypes.RunDTO {
 		// PRD #305: the frozen "apply model also to agents" flag; false for every run
 		// that did not opt in (the default).
 		OverrideSubagentModel: r.OverrideSubagentModel,
+		// PRD #320 D8: the display priority class, supplied by the caller (a list-query
+		// column or h.runPriorityClass) so this mapper stays pure.
+		Priority: priorityClass,
 	}
 	if r.RepoID.Valid {
 		s := uuid.UUID(r.RepoID.Bytes).String()
@@ -836,7 +867,7 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		h.writeStartRunError(w, r, err)
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run)})
+	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run))})
 }
 
 // writeStartRunError maps the StartRunForUser* sentinels to an HTTP status + message.
@@ -932,7 +963,7 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	dto := runToDTO(run)
+	dto := runToDTO(run, h.runPriorityClass(r.Context(), run))
 	// PRD #65 D2: stamp the run's forge for the run-view MR/PR noun. Best-effort and
 	// only for a repo-ful run (chat runs have no repo, hence no MR affordance): a
 	// lookup error leaves forge_type "" (the web defaults to GitLab's noun), never

@@ -305,6 +305,16 @@ type RunDTO struct {
 	// was applied to every subagent (overriding pins), false is today's default. Surfaced
 	// read-only so a scheduled run's fleet-wide model choice is confirmable.
 	OverrideSubagentModel bool `json:"override_subagent_model"`
+	// Priority is the run's DISPLAY priority class (PRD #320 D8), a non-empty enum in
+	// {normal, background, expedited, restored}, computed by the ONE SQL function
+	// fn_run_priority_class from the same demotion predicate ClaimRun's ORDER BY ranks
+	// by — so the pill and the claim order can never disagree. NOT omitempty: it is
+	// always a real value (never ""), so a client reads it unconditionally. `background`
+	// is a demoted judge/self_improve run still yielding; `restored` the same run past
+	// RUN_BACKGROUND_GRACE (fails open to normal rank); `expedited` a manual bump;
+	// `normal` everything else. runToDTO takes it as an explicit param and stays pure —
+	// no now()/config reaches into the mapper (D8).
+	Priority string `json:"priority"`
 }
 
 // RunListItemDTO is a run row for the Runs index and the admin Agents-status
