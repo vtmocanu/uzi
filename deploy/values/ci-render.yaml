@@ -97,6 +97,9 @@ web:
   ingress:
     host: uzi.example.com
 
+# CNPG operator path (asserts the InfisicalSecret + CNPG Cluster render).
+database:
+  mode: cnpg
 postgres:
   enabled: true
   cluster:

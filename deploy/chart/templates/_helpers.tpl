@@ -26,6 +26,71 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{- /*
+  Database backend selection (database.mode: simple | cnpg | external).
+  All three converge on ONE seam: the api reads DATABASE_URL from a Secret via the
+  two helpers below, so api-deployment.yaml is identical across modes and only the
+  Secret's producer changes.
+    simple   -> the chart's own <fullname>-postgres Secret, key `uri`
+    cnpg     -> the CNPG-generated api.database.secretName, key api.database.secretKey
+    external -> the user-supplied api.database.secretName / secretKey
+*/ -}}
+{{- define "uzi.database.simple.name" -}}
+{{- printf "%s-postgres" (include "uzi.fullname" .) -}}
+{{- end -}}
+
+{{- define "uzi.database.secretName" -}}
+{{- if eq .Values.database.mode "simple" -}}
+{{- include "uzi.database.simple.name" . -}}
+{{- else -}}
+{{- .Values.api.database.secretName -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "uzi.database.secretKey" -}}
+{{- if eq .Values.database.mode "simple" -}}uri{{- else -}}{{ .Values.api.database.secretKey }}{{- end -}}
+{{- end -}}
+
+{{- /*
+  uzi.database.simple.password: the bundled-postgres password. Explicit override wins;
+  otherwise reuse the value already stored in the applied Secret (a bare `helm upgrade`
+  never rotates it); otherwise generate a fresh URL-safe 32-char password. NOTE: lookup
+  returns empty under `helm template` / server-side dry-run, which is fine — the simple
+  mode is for `helm install` (the CNPG path serves the ArgoCD/GitOps installs).
+*/ -}}
+{{- define "uzi.database.simple.password" -}}
+{{- if .Values.database.simple.password -}}
+{{- .Values.database.simple.password -}}
+{{- else -}}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace (include "uzi.database.simple.name" .) -}}
+{{- if and $existing (hasKey ($existing.data | default dict) "POSTGRES_PASSWORD") -}}
+{{- index $existing.data "POSTGRES_PASSWORD" | b64dec -}}
+{{- else -}}
+{{- randAlphaNum 32 -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+  uzi.validateDatabaseMode: fail fast on an invalid mode or a mode/postgres.enabled
+  mismatch, so the two knobs can never silently diverge (two DBs, or none).
+*/ -}}
+{{- define "uzi.validateDatabaseMode" -}}
+{{- $m := .Values.database.mode -}}
+{{- if not (has $m (list "simple" "cnpg" "external")) -}}
+{{- fail (printf "database.mode must be one of simple|cnpg|external, got %q" $m) -}}
+{{- end -}}
+{{- if and (eq $m "simple") .Values.postgres.enabled -}}
+{{- fail "database.mode: simple bundles a plain Postgres, but postgres.enabled is true (that is the CNPG operator path). Set postgres.enabled: false, or use database.mode: cnpg." -}}
+{{- end -}}
+{{- if and (eq $m "cnpg") (not .Values.postgres.enabled) -}}
+{{- fail "database.mode: cnpg needs the CloudNativePG subchart. Set postgres.enabled: true." -}}
+{{- end -}}
+{{- if and (eq $m "external") .Values.postgres.enabled -}}
+{{- fail "database.mode: external expects an out-of-chart DB via api.database.secretName. Set postgres.enabled: false." -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
   uzi.apiServiceName: the in-cluster name of the api Service. LOAD-BEARING: the web
   nginx reverse-proxies `/api/*` to this exact name (same-origin, no CORS), so it
   MUST resolve to the api pods in the release namespace. Defaults to "api" (what the

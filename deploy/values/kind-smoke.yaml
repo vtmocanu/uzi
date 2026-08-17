@@ -120,6 +120,9 @@ workers:
   fqdnEgress:
     enabled: false
 
+# The existing smoke exercises the CNPG operator path (operator applied by the harness).
+database:
+  mode: cnpg
 postgres:
   enabled: true
   cluster:

@@ -1,0 +1,159 @@
+{{- /*
+  database.mode: simple — a single plain postgres:17 StatefulSet + headless Service +
+  password Secret, in-namespace, no operator. The public/self-host default. NOT HA.
+  The api reads its DSN from this Secret's `uri` key (see uzi.database.secretName).
+  Gotchas handled (per the Harbor internal-DB pattern): PGDATA is a SUBDIR of the mount
+  with a chmod-700 initContainer (fsGroup footgun), /dev/shm is a memory emptyDir, and
+  the pod runs as the restricted uid/gid 999.
+*/ -}}
+{{- if eq .Values.database.mode "simple" }}
+{{- $name := include "uzi.database.simple.name" . }}
+{{- $simple := .Values.database.simple }}
+{{- $user := $simple.user }}
+{{- $db := $simple.database }}
+{{- $pw := include "uzi.database.simple.password" . }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+  annotations:
+    # Pair the password's lifetime with the retained PVC: the volumeClaimTemplates PVC
+    # survives a StatefulSet delete, so a reinstall must reuse THIS password or the
+    # existing data would reject auth. `keep` stops uninstall/failed-upgrade from
+    # deleting it; the password helper reuses the stored value across upgrades.
+    helm.sh/resource-policy: keep
+type: Opaque
+stringData:
+  POSTGRES_USER: {{ $user | quote }}
+  POSTGRES_PASSWORD: {{ $pw | quote }}
+  POSTGRES_DB: {{ $db | quote }}
+  # The DSN the api consumes as DATABASE_URL (api.database secretKey resolves to `uri`).
+  uri: {{ printf "postgres://%s:%s@%s:5432/%s?sslmode=disable" $user $pw $name $db | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  # Headless: governs the StatefulSet AND resolves `{{ $name }}:5432` to the single pod.
+  clusterIP: None
+  selector:
+    {{- include "uzi.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  serviceName: {{ $name }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "uzi.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: postgres
+  template:
+    metadata:
+      labels:
+        {{- include "uzi.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: postgres
+    spec:
+      # The DB never calls the k8s API; drop the auto-mounted SA token.
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecret.name }}
+      imagePullSecrets:
+        - name: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml $simple.podSecurityContext | nindent 8 }}
+      initContainers:
+        # Postgres refuses to start when its data dir is group/world-accessible, which
+        # fsGroup can cause on some CSIs. PGDATA is a subdir of the mount; tighten it to
+        # 700 before the server boots. (mkdir first so first-install chmod has a target.)
+        - name: init-pgdata-perms
+          image: "{{ $simple.image.repository }}:{{ $simple.image.tag }}"
+          imagePullPolicy: {{ $simple.image.pullPolicy }}
+          command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data/pgdata && chmod 700 /var/lib/postgresql/data/pgdata"]
+          securityContext:
+            {{- toYaml $simple.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      containers:
+        - name: postgres
+          image: "{{ $simple.image.repository }}:{{ $simple.image.tag }}"
+          imagePullPolicy: {{ $simple.image.pullPolicy }}
+          securityContext:
+            {{- toYaml $simple.containerSecurityContext | nindent 12 }}
+          env:
+            # PGDATA as a subdir of the mount (see the initContainer note above).
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $name }}
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $name }}
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $name }}
+                  key: POSTGRES_DB
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U {{ $user }} -d {{ $db }}"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U {{ $user }} -d {{ $db }}"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 3
+          resources:
+            {{- toYaml $simple.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ $simple.shmSize }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with $simple.storage.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $simple.storage.size | quote }}
+{{- end }}

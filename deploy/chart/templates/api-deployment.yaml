@@ -1,3 +1,4 @@
+{{- include "uzi.validateDatabaseMode" . }}
 {{- if .Values.api.enabled }}
 apiVersion: apps/v1
 kind: Deployment
@@ -72,14 +73,16 @@ spec:
             - name: API_TLS_KEY
               value: {{ printf "%s/tls.key" (include "uzi.apiTLSDir" .) | quote }}
             {{- end }}
-            # DATABASE_URL from the CNPG-generated <cluster>-app Secret's `uri` key.
-            # Required at boot (config.Load errors on empty), so NOT optional: the
-            # pod waits for the secret (CNPG creates it at sync-wave -5).
+            # DATABASE_URL DSN, from the Secret the selected database.mode produces
+            # (simple: the chart's <fullname>-postgres/`uri`; cnpg: the CNPG-generated
+            # <cluster>-app/`uri`; external: the user-supplied api.database.*). Required
+            # at boot (config.Load errors on empty), so NOT optional: the pod waits for
+            # the secret (under cnpg, CNPG creates it at sync-wave -5).
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.api.database.secretName | quote }}
-                  key: {{ .Values.api.database.secretKey | quote }}
+                  name: {{ include "uzi.database.secretName" . | quote }}
+                  key: {{ include "uzi.database.secretKey" . | quote }}
             {{- range $envName, $secretKey := .Values.api.secretEnv }}
             # {{ $envName }} <- Infisical key "{{ $secretKey }}"
             - name: {{ $envName }}

@@ -90,4 +90,4 @@ Internal project; see [plan.md](plan.md) for direction and `prds/` for active wo
 
 ## License
 
-Unlicensed, internal use only.
+[MIT](LICENSE) © 2026 Vlad Mocanu

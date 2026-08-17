@@ -1,11 +1,11 @@
 # uzi Helm chart — GENERIC defaults (cluster-agnostic).
 #
 # Per-cluster values (image registry overrides, the public host, FRONTEND_ORIGIN,
-# TRUSTED_PROXIES, the CNPG image/storageClass/backup target) live in
-# deploy/values/<cluster>.yaml and are layered on top by BOTH deploy paths:
-#   - the ArgoCD Application in myorg/k8s/argo-apps (multi-source: the Harbor
-#     OCI chart + $values/deploy/values/<cluster>.yaml from the uzi repo)
-#   - a manual `helm upgrade -f deploy/values/<cluster>.yaml`
+# TRUSTED_PROXIES, the CNPG image/storageClass/backup target) live in a
+# per-cluster values file in your own GitOps repo, layered on top by BOTH deploy paths:
+#   - an ArgoCD Application (multi-source: the OCI chart + a $values ref to that
+#     per-cluster values file in your GitOps repo)
+#   - a manual `helm upgrade -f <cluster-values>.yaml`
 # So this file MUST stay deployable to any cluster: do NOT put a concrete host /
 # endpoint / storageClass / image tag here.
 #
@@ -84,12 +84,13 @@ api:
   service:
     name: api
     port: 8080
-  # DB connection string. Sourced from the CNPG-generated <cluster>-app Secret's
-  # `uri` key (the model the other MM CNPG apps use). secretName follows the CNPG
-  # cluster's fullnameOverride (postgres-uzi-cluster) + "-app". Point database.*
-  # elsewhere to use a DB outside this chart. REQUIRED at boot (config.Load errors
-  # on an empty DATABASE_URL), so it is NOT optional: the pod waits for the secret
-  # (created by the CNPG cluster at sync-wave -5, before the api at wave 0).
+  # DB connection Secret for database.mode cnpg / external (IGNORED under simple, which
+  # points the api at its own generated <fullname>-postgres Secret — see database.mode).
+  # Under cnpg this is the CNPG-generated <cluster>-app Secret's `uri` key: secretName
+  # follows the CNPG cluster's fullnameOverride (postgres-uzi-cluster) + "-app". Under
+  # external, set these to your own pre-created Secret + DSN key. REQUIRED at boot
+  # (config.Load errors on an empty DATABASE_URL), so it is NOT optional: the pod waits
+  # for the secret (under cnpg, created at sync-wave -5, before the api at wave 0).
   database:
     secretName: postgres-uzi-cluster-app
     secretKey: uri
@@ -960,8 +961,63 @@ web_containerSecurityContext:
   capabilities:
     drop: ["ALL"]
 
+# --- Database backend selector --------------------------------------------------
+# uzi REQUIRES Postgres. Choose exactly ONE backend with database.mode; all three
+# converge on the api's single DATABASE_URL secret ref (api.database), so the api
+# Deployment is identical across modes.
+#   simple   (DEFAULT — public / self-host): the chart runs a single plain
+#            postgres:17 StatefulSet + PVC in-namespace and auto-generates the
+#            password, so a stranger's `helm install` just works with no operator and
+#            no external deps. NOT highly available (one replica).
+#   cnpg     (production): the CloudNativePG operator subchart (postgres.* below).
+#            Requires the CNPG operator in the cluster; set postgres.enabled: true.
+#            The internal per-cluster values use this.
+#   external (bring your own): pre-create a Secret holding a DATABASE_URL DSN and point
+#            api.database.secretName / secretKey at it; the chart runs no DB of its own.
+# A mode/postgres.enabled mismatch fails the render (see uzi.validateDatabaseMode).
+database:
+  mode: simple
+  simple:
+    image:
+      repository: postgres
+      tag: "17"
+      pullPolicy: IfNotPresent
+    # DB name + owning role, created on first boot by the postgres image entrypoint.
+    user: uzi
+    database: uzi
+    # Empty => a random 32-char alphanumeric password is generated on first install and
+    # PRESERVED across `helm upgrade` (via a lookup of the existing Secret). Set a value
+    # for GitOps / reproducible installs — it MUST be URL-safe (it is embedded in the DSN).
+    password: ""
+    storage:
+      size: 8Gi
+      # "" => the cluster's default StorageClass. On a multi-node cluster prefer a
+      # WaitForFirstConsumer class so the PVC binds to the pod's node.
+      storageClass: ""
+    # /dev/shm size (k8s defaults it to 64Mi; postgres parallel query / large sorts want more).
+    shmSize: 256Mi
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 1Gi
+    # Stock postgres runs as uid/gid 999; match the restricted PodSecurity standard.
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 999
+      runAsGroup: 999
+      fsGroup: 999
+      seccompProfile:
+        type: RuntimeDefault
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      privileged: false
+      capabilities:
+        drop: ["ALL"]
+
 # --- CloudNativePG Postgres (subchart, aliased `postgres`) ----------------------
-# uzi REQUIRES a database (unlike example-app, which wired CNPG for a future feature).
+# Used ONLY with database.mode: cnpg. uzi REQUIRES a database (unlike example-app, which wired CNPG for a future feature).
 # SHIPS DISABLED here (generic default, so the chart stays cluster-agnostic — no
 # concrete image/storageClass/S3 target); every cluster that deploys uzi turns it on
 # in deploy/values/<cluster>.yaml and supplies those. The api's DATABASE_URL is
