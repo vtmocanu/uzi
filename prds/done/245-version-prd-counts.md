@@ -3,7 +3,7 @@
 **Issue**: [#245](https://gitlab.example.com/vtmocanu/uzi/-/issues/245) · **Label**: PRD · **Priority**: Low
 **Parent**: [#175](https://gitlab.example.com/vtmocanu/uzi/-/issues/175) (the build-info endpoint + popover this extends).
 **Area**: a fourth stamped coordinate pair on `GET /api/version` — `api/internal/apitypes/buildinfo.go` (two new DTO fields) + `api/internal/apitypes/wire_test.go` (its tag test), `api/internal/handler/handler.go` (`BuildStamp`, `SetBuildInfo`, `Version`, the handler fields) + `api/internal/handler/version_test.go` (parse/omit + the closed-key-set trust test), `api/cmd/server/main.go` (two ldflags vars + wiring), `api/Dockerfile` (two ARGs + the ldflags line), `.gitlab-ci.yml` (`publish:assert-changelog` computes the counts, delivers them by dotenv, `publish:api` passes them as build-args) · `web/src/lib/api.ts` (`BuildInfo` type), `web/src/components/BuildInfoPopover.tsx` (the new row), `web/src/mocks/data.ts` (fixture parity) · `api/cmd/uzi/` (the `uzi version` consumer of the same DTO).
-**Mockup**: [`prds/mockups/245-version-prd-counts-mock.html`](mockups/245-version-prd-counts-mock.html) — approved **Variant A** (a `PRDs` row reading `N done · M open`).
+**Mockup**: [`prds/mockups/245-version-prd-counts-mock.html`](../mockups/245-version-prd-counts-mock.html) — approved **Variant A** (a `PRDs` row reading `N done · M open`).
 **Line references** are against `ab2d033`.
 **Status**: complete — shipped 2026-08-08 (M1–M3 all landed on branch `agent/issue-245`).
 
