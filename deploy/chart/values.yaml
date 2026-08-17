@@ -967,7 +967,7 @@ web_containerSecurityContext:
 # in deploy/values/<cluster>.yaml and supplies those. The api's DATABASE_URL is
 # wired to the CNPG-generated postgres-uzi-cluster-app Secret (api.database above).
 #
-# Postgres image: the per-cluster values pin a specific tag from the MM Harbor
+# Postgres image: the per-cluster values pin a specific tag from a private registry
 # mirror (cloudnative-pg). dev-cluster standardizes on 16.x (fleet-consistent
 # + confirmed mirrored); do NOT copy example-app's PG18 image here. (dev-cluster's CNPG
 # operator 1.23.5 supports up to PG17, so 16.x is a fleet-convention choice, not an
@@ -993,7 +993,7 @@ postgres:
       argocd.argoproj.io/sync-options: Prune=false
     # Dev sizing: single instance (no HA). Raise per-cluster for stage/prod.
     instances: 1
-    # Cluster-specific (the MM Harbor mirror) -> set in deploy/values/<cluster>.yaml.
+    # Cluster-specific (a private registry mirror) -> set in deploy/values/<cluster>.yaml.
     imageName: ""
     imagePullSecrets: []
     storage:

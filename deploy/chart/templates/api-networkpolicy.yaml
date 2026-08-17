@@ -55,7 +55,7 @@ spec:
     #
     # Both dial the port uzi.workerAPIPort selects — the TLS listener once
     # api.tls.enabled is on, since a claim response carries the user's decrypted
-    # forge PAT and Anthropic token and dev-cluster is a shared cluster running
+    # forge PAT and Anthropic token and the cluster is shared, running
     # arbitrary dev pods. Neither is admitted to any other port.
 
     # 1. The controller (this namespace) -> api. It polls for desired state.

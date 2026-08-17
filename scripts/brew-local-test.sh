@@ -6,7 +6,7 @@
 # throwaway local git repo holding the CURRENT source (the api/ module), point the
 # formula's `url` at it (file:// git url) at a matching tag, drop the formula into a
 # throwaway local tap, then install / run / assert / test / uninstall. Cleaned up
-# on exit. Unlike example-app's harness this COMPILES the CLI, so it is the M4 spike that
+# on exit. Unlike the reference harness this COMPILES the CLI, so it is the M4 spike that
 # settles whether a from-source Go formula installs under Homebrew's sandbox.
 set -euo pipefail
 export HOMEBREW_NO_AUTO_UPDATE=1

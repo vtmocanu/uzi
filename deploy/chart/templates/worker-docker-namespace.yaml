@@ -8,7 +8,7 @@
   the PodSecurity tier — and that one difference is the whole reason it is a separate
   namespace rather than a relaxation of the restricted default.
 
-  WHY PRIVILEGED, AND WHY IT IS STILL BOUNDED (Q-B). dev-cluster is k8s 1.29.4 +
+  WHY PRIVILEGED, AND WHY IT IS STILL BOUNDED (Q-B). The cluster is k8s 1.29.4 +
   containerd 1.6.31, below the k8s >=1.30 / containerd >=2.0.5 that pod user
   namespaces (`hostUsers: false`) need — so the flagless-rootless design is infeasible
   here and the tier is `privileged: true` rootless-DinD, the same posture the compose

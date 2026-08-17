@@ -15,7 +15,7 @@
   else falls through to THIS policy's default-deny.
 
   ENFORCEMENT IS UNPROVEN. Antrea's CAPABILITY to express these rules was verified
-  against dev-cluster (feature gate, CRDs, server-side dry-run, the admission
+  against the cluster (feature gate, CRDs, server-side dry-run, the admission
   webhook) and its BEHAVIOUR from the v1.13 source — but no packet has crossed. And
   kind cannot close it: kindnet implements NO NetworkPolicy at all, not even this
   default-deny floor, so on kind these objects are created and silently never

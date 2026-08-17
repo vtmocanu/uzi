@@ -9,7 +9,7 @@
 #
 # The separator is destroyed, so two objects merge into ONE YAML document with
 # duplicate keys -- and every YAML parser silently keeps the LAST one. On
-# dev-cluster that deleted the `uzi-workers` ServiceAccount and its pull-secret
+# the cluster that deleted the `uzi-workers` ServiceAccount and its pull-secret
 # InfisicalSecret from the manifest, which made restricted-tier hosted workers
 # unprovisionable for days while ArgoCD correctly reported Synced/Healthy: it was
 # in sync with what the manifest actually declared.

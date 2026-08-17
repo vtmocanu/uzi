@@ -60,7 +60,7 @@
 
   The escape hatch is EXPLICIT and VISIBLE: acknowledgeUnfenced=true opts out in the
   values file that chose it (a throwaway cluster with no CNI NetworkPolicy support, say
-  kind), rather than an unfenced tier being an inherited default. dev-cluster sets
+  kind), rather than an unfenced tier being an inherited default. The production cluster sets
   networkPolicy.enabled=true with real CIDRs, so it never trips this.
 */ -}}
 {{- if and .Values.workers.docker.enabled (not .Values.workers.docker.networkPolicy.enabled) (not .Values.workers.docker.networkPolicy.acknowledgeUnfenced) }}
@@ -88,7 +88,7 @@
 {{- if .Values.workers.docker.enabled }}
 {{- $rootless := .Values.workers.docker.rootless }}
 {{- if and (not $rootless) (not .Values.workers.docker.acknowledgeNonRootlessNodeRoot) }}
-{{- fail "workers.docker.rootless=false renders a NON-ROOTLESS privileged DinD daemon (dockerd as real root on the node): a prompt-injectable agent reaching it can obtain NODE ROOT and read every co-scheduled pod's secrets, including the api's UZI_SECRET_KEY (which decrypts all users' forge PATs + Anthropic tokens). This is the owner-accepted residual on nodes without unprivileged userns (dev-cluster/Linux), but it must be an explicit choice: set workers.docker.acknowledgeNonRootlessNodeRoot=true to accept it, or keep workers.docker.rootless=true (the default, safe posture)." }}
+{{- fail "workers.docker.rootless=false renders a NON-ROOTLESS privileged DinD daemon (dockerd as real root on the node): a prompt-injectable agent reaching it can obtain NODE ROOT and read every co-scheduled pod's secrets, including the api's UZI_SECRET_KEY (which decrypts all users' forge PATs + Anthropic tokens). This is the owner-accepted residual on nodes without unprivileged userns, but it must be an explicit choice: set workers.docker.acknowledgeNonRootlessNodeRoot=true to accept it, or keep workers.docker.rootless=true (the default, safe posture)." }}
 {{- end }}
 {{- $img := include "uzi.workerDinDImage" . }}
 {{- $imgIsRootless := contains "-dind-rootless" $img }}

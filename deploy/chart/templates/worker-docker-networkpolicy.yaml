@@ -25,7 +25,7 @@
   (worker-fqdn-egress.yaml), and this floor is CNI-independent vanilla NetworkPolicy.
 
   ENFORCEMENT is CNI-dependent, same caveat as the restricted floor: kindnet enforces
-  no NetworkPolicy at all, so a green kind run says nothing about this file. dev-cluster
+  no NetworkPolicy at all, so a green kind run says nothing about this file. The cluster
   (Antrea) enforces it; that is where the first real docker worker either stays fenced
   or does not.
 */ -}}

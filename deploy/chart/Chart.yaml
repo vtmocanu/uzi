@@ -1,31 +1,31 @@
 apiVersion: v2
 name: uzi
-description: uzi (Uzinele Întunecate) — AI dark factory. web (SPA + reverse proxy) + api (Go) + CloudNativePG, for dev-cluster.
+description: uzi (Uzinele Întunecate) — AI dark factory. web (SPA + reverse proxy) + api (Go) + CloudNativePG, for Kubernetes.
 type: application
 # Release coupling (Model B): version == appVersion == the release git tag. A tag
-# pipeline (.gitlab-ci.yml) publishes the images (api/web:<tag>) AND this chart
-# (oci://harbor.example.com/gitlab/vtmocanu/uzi/uzi:<version>); ArgoCD deploys that
+# pipeline publishes the images (api/web:<tag>) AND this chart
+# (oci://ghcr.io/vtmocanu/uzi/uzi:<version>); ArgoCD deploys that
 # version. api.image.tag / web.image.tag are left unset in values so the pod image
-# follows appVersion. Bump both per release; dev-cluster's ArgoCD auto-tracks the chart
+# follows appVersion. Bump both per release; the cluster's ArgoCD auto-tracks the chart
 # (targetRevision `0.*`), so no per-release argo bump there (see deploy/README.md).
 version: 0.42.0
 appVersion: "0.42.0"
 
-# Umbrella chart (same pattern example-app uses): the CloudNativePG upstream `cluster`
+# Umbrella chart (same umbrella-chart pattern): the CloudNativePG upstream `cluster`
 # chart ships as a subchart (aliased `postgres`) so one release brings up the api,
 # the web SPA, and the Postgres cluster in one namespace. CI bundles the subchart
 # into the published OCI artifact (`helm dependency build` at package time), so
 # ArgoCD pulls a self-contained chart and never fetches it at render time. The
-# postgres CONTAINER image is overridden to the MM Harbor mirror in the per-cluster
-# values. Gated on `postgres.enabled` (chart default OFF; the dev-cluster values
-# turn it on). NO qdrant, NO agent/worker, NO MCP-http (uzi is not example-app).
+# postgres CONTAINER image is overridden to a private registry mirror in the per-cluster
+# values. Gated on `postgres.enabled` (chart default OFF; the per-cluster values
+# turn it on). NO qdrant, NO agent/worker, NO MCP-http (uzi is not a full platform).
 dependencies:
   - name: cluster
     alias: postgres
-    # Pinned to the same `cluster` chart version the argo-cluster CNPG apps use
-    # (example-app, harbor, the-wiki, ...) for fleet consistency, NOT the latest 0.7.x. Its
+    # Pinned to the same `cluster` chart version the fleet's other CNPG apps use
+    # for fleet consistency, NOT the latest 0.7.x. Its
     # rendered `postgresql.cnpg.io/v1 Cluster` uses only fields present in the CRD the
-    # dev-cluster operator (1.23.5) ships. Bump together with the fleet.
+    # cluster operator (1.23.5) ships. Bump together with the fleet.
     version: "0.6.1"
     repository: "oci://ghcr.io/cloudnative-pg/charts"
     condition: postgres.enabled

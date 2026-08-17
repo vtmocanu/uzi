@@ -63,12 +63,12 @@ web:
 #  2. THE fsGroup PIN IS INVISIBLE. local-path-provisioner's setup script is
 #     `mkdir -m 0777`, and the PV is a Local/hostPath source — so uid 10001 writes the
 #     volume regardless of fsGroup, and a test would pass for a reason that does not
-#     exist on dev-cluster (where an RWO ext4 volume mounts root:root 0755 and fsGroup
+#     exist on the production cluster (where an RWO ext4 volume mounts root:root 0755 and fsGroup
 #     is the ONLY thing making it writable). Assert the OBSERVABLE (stat the mount for
 #     gid 10001 + setgid), never writability.
 #  3. THE lost+found SENTINEL TRAP IS INVISIBLE. local-path makes a plain directory,
 #     so a fresh PVC here really IS empty and an emptiness check passes — while
-#     dev-cluster's hypervisor CSI formats ext4 and a fresh PVC carries lost+found. That
+#     the production cluster's CSI driver formats ext4 and a fresh PVC carries lost+found. That
 #     is closed by a UNIT test instead (controller/internal/kube/render_test.go): it is
 #     a property of the check and needs no kubelet.
 #

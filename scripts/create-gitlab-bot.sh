@@ -26,8 +26,8 @@
 #                instance may enforce a shorter admin-configured max PAT
 #                lifetime, which silently clamps a longer request)
 #
-# Requires: glab, authenticated against HOSTNAME as an instance admin. On
-# gitlab.example.com an exported GITLAB_TOKEN overrides glab's stored
+# Requires: glab, authenticated against HOSTNAME as an instance admin. On some
+# GitLab instances an exported GITLAB_TOKEN overrides glab's stored
 # credentials and 401s the admin API, so every call here runs via
 # `env -u GITLAB_TOKEN glab ...` regardless of your shell's environment.
 set -euo pipefail

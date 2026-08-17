@@ -1,6 +1,6 @@
 # Agent team workflow for uzi
 
-Generated 2026-07-03 by the `agent-team` skill (roster adapted from the example-app team).
+Generated 2026-07-03 by the `agent-team` skill (roster adapted from an internal team).
 
 > **🔴 HOW TO ADD TO THIS FILE, because its growth rate is now the thing most likely
 > to make it useless.** Measured by SHA, so it stays true: **782 lines at

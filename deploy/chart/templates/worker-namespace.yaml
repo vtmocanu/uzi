@@ -76,7 +76,7 @@ metadata:
 
   Sized against the fleet at its WORST CASE: 20 workers = 10 CPU / 40Gi requested, and
   20 x (20Gi data + 20Gi nix) = 800Gi of PVC. Storage is the binding constraint, not
-  CPU or memory. dev-cluster's real budget is M6's rollout conversation.
+  CPU or memory. The cluster's real budget is M6's rollout conversation.
 
   The data term is `l`'s 20Gi, not `m`'s 10Gi, and the nix term is 20Gi, not the 4Gi
   this comment carried until issue #224. Nothing scopes a size to a tier, so any of

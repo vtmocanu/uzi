@@ -63,7 +63,7 @@ CLAUDE.local.md
 juster
 task-repo
 # Helm — vendored subcharts are re-fetched via `helm dependency build` (Chart.lock
-# pins the version + digest); only Chart.lock is committed (chart-parity).
+# pins the version + digest); only Chart.lock is committed (umbrella-chart parity).
 helm/charts/*.tgz
 charts/*.tgz
 deploy/chart/charts/*.tgz

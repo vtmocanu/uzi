@@ -3,7 +3,7 @@
 # Chart-owned issuing chain: selfSigned Issuer -> CA Certificate -> CA Issuer.
 #
 # WHY the chart ships its own CA instead of using a cluster ClusterIssuer: the only
-# ClusterIssuer on dev-cluster is `letsencrypt-prod`, an ACME issuer whose DNS-01
+# ClusterIssuer on the cluster is `letsencrypt-prod`, an ACME issuer whose DNS-01
 # solver is scoped to the dev.example.com zone (verified 2026-07-17). ACME can
 # only issue for publicly resolvable names, and the name on this certificate is
 # `api.<ns>.svc.cluster.local` — a cluster-internal Service name that no public

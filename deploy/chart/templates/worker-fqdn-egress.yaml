@@ -6,7 +6,7 @@
   express a NAME — only CIDRs. The worker legitimately needs gitlab.example.com,
   the Anthropic API and the nix substituters, and their addresses are neither stable
   nor ours. The PRD's documented fallback was a maintained CIDR allowlist; it is not
-  needed, because dev-cluster CAN express FQDN egress (verified 2026-07-17: Antrea
+  needed, because the cluster CAN express FQDN egress (verified 2026-07-17: Antrea
   v1.13.3, the AntreaPolicy feature gate true on both agent and controller, the CRDs
   present, and a server-side dry-run of exactly this shape ACCEPTED by the
   annpvalidator webhook).
