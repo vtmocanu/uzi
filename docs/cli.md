@@ -819,6 +819,12 @@ than this binary — upgrade rather than trusting it to mean "active". (The live
 `/api/ws` stream and `uzi tui` rewrite an unrecognised status to `unknown`; plain
 `run get`/`run list --json` pass it through as-is.)
 
+A `running` run whose agent is still drafting its plan, pre-approval, reads
+**planning** instead — in the STATUS column of `run list`/`run get`, in the
+TUI board and detail header's status chip, and on `admin runs` — so you can
+tell "still proposing work" apart from "actively implementing" at a glance.
+It's still the same `running` value underneath, not a tenth status.
+
 ### Waiting for a state: `uzi run wait`
 
 `uzi run wait <id>` blocks until the run reaches a state you can act on — the

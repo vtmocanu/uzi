@@ -193,8 +193,13 @@ unstick; automation keeps it in sync from then on.
 ## Run badges
 
 Each card shows its latest run at a glance: **queued**/**claimed** while
-waiting for a worker, **running Nm** (pulsing, worker name below), amber
-**awaiting approval** or amber **needs your answer** (a run parked on a
+waiting for a worker, an indigo **planning** badge (pulsing) while the agent
+drafts its plan and nothing is committed yet, the cyan **running Nm** badge
+(pulsing, worker name below) once the plan is approved and it starts
+implementing — both are the run's `running` state under the hood, and
+planning is a display-only distinction that tells "still proposing work"
+apart from "actively writing code" — amber **awaiting approval** or amber
+**needs your answer** (a run parked on a
 clarifying question — see [Answering a question](./run-activity.md#answering-a-question);
 both get the loudest treatment — see Attention strip), rose
 **failed** with the reason on hover, and neutral **stopped** for a

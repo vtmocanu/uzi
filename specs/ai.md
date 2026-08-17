@@ -21246,3 +21246,31 @@ design shape, not the code.
 - **Auto-file deferred but schema-ready (D9).** The status set and server-assembled-label path are
   exactly what an auto-file mode would drive; adding it later is a create-time branch (insert straight to
   `filing`), not a schema change.
+
+## 553. Issue #321 — planning vs running: a derived `is_planning` display predicate, no new status/column
+
+Serves issue #321: distinguish a run's pre-approval PLANNING phase from its post-approval implementing
+phase, which previously both rendered an identical "running" badge. Full rationale in the Decision Log of
+`prds/done/321-run-planning-phase-indicator.md` (D1–D7) — this section records only the durable design shape.
+
+- **`is_planning` is a DERIVED display predicate, not a state.** No DB migration, no new `runs.status`
+  enum value: it is computed server-side from existing columns and is meaningful only while
+  `status=='running'`. Rejected a new `planning` status (would break the state machine and every `status`
+  consumer) and a `runs.phase` column (a migration for something exactly derivable).
+- **One shared Go helper.** `isPlanningPhase(kind, status string, iterationCount int32, planMdPresent bool)`
+  in the handler package: `kind ∉ {chat,judge} AND status=='running' AND iteration_count==0 AND plan_md
+  empty`. All four terms are load-bearing — `iteration_count==0` alone misclassifies a SEEDED run's
+  startup; `plan_md`-empty alone misclassifies AUTOPILOT implementing (autopilot never persists plan_md);
+  the `kind` guard (mirroring `ListRunsForUser`'s `NOT IN ('chat','judge')`) stops chat/judge runs — which
+  sit at running/iter0/null-plan for life — reading as planning forever.
+- **Computed once, server-side, so the surfaces cannot drift.** The rule needs three fields and only the
+  full `RunDTO` carries all three, so `is_planning` is set on `apitypes.RunDTO` and the board
+  `latestRunDTO`. The board's narrow `LatestRun` projection computes a `has_plan_md` boolean IN SQL (never
+  carrying raw `plan_md` onto the shared card) and calls the same helper. `is_planning` is OPTIONAL on the
+  wire — rollout skew: absent ⇒ not-planning.
+- **Surfaces treat it as an effective status.** Web maps `is_planning` to an effective status `"planning"`
+  flowing through the existing one-tone-per-status taxonomy (new indigo `plan` tone). CLI renders it on the
+  run-status colour axis (PRD #325 M2), deliberately NOT on the per-agent crew-lane ladder — a planning
+  agent is still "working".
+- **One accepted cosmetic transient.** An autopilot/self_improve run reads "planning" for the single turn
+  between auto-approve and its first iteration report, then self-corrects.
