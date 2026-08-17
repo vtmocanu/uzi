@@ -1563,7 +1563,12 @@ func containerByName(t *testing.T, cs []corev1.Container, name string) corev1.Co
 // analogue); dataDir is the reseed's data-clear target ("" to not exercise it).
 func runSeed(t *testing.T, src, dst, markerFile, dataDir string) (string, error) {
 	t.Helper()
-	cmd := exec.Command("/bin/sh", "-c", nixSeedScript(src, dst, markerFile, dataDir))
+	// bash, not /bin/sh: the seed script uses `set -o pipefail` (load-bearing, see
+	// render.go), which the production busybox ash supports but dash does not. On a
+	// host where /bin/sh is dash (Linux CI runners) the script aborts with "Illegal
+	// option -o pipefail"; it only ran before where /bin/sh happened to be bash
+	// (macOS). bash is the portable pipefail-capable shell present on every host we run.
+	cmd := exec.Command("/bin/bash", "-c", nixSeedScript(src, dst, markerFile, dataDir))
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }

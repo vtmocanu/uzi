@@ -17,7 +17,9 @@
 
 name: CI
 
-on:
+# Quoted so yamllint's `truthy` rule does not read the key as the boolean `on`
+# (GitHub Actions treats "on" and on identically).
+"on":
   pull_request: {}
   push:
     branches: [main]
@@ -40,7 +42,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: api/go.mod
+          # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
+          # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
+          # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
+          go-version: "1.26"
           cache-dependency-path: api/go.sum
       - uses: ./.github/actions/setup-task
       - name: go mod download
@@ -69,7 +74,10 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
-          go-version-file: api/go.mod
+          # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
+          # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
+          # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
+          go-version: "1.26"
           cache-dependency-path: api/go.sum
       - uses: ./.github/actions/setup-task
       - name: go mod download
@@ -89,7 +97,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: api/go.mod
+          # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
+          # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
+          # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
+          go-version: "1.26"
           cache-dependency-path: api/go.sum
       - uses: ./.github/actions/setup-task
       - name: go mod download
@@ -130,7 +141,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: api/go.mod
+          # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
+          # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
+          # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
+          go-version: "1.26"
           cache-dependency-path: api/go.sum
       - name: go mod download
         working-directory: api
@@ -161,7 +175,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: controller/go.mod
+          go-version: "1.26"
           cache-dependency-path: controller/go.sum
       - uses: ./.github/actions/setup-task
       - name: go mod download
@@ -181,7 +195,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
-          go-version-file: controller/go.mod
+          go-version: "1.26"
           cache-dependency-path: controller/go.sum
       - uses: ./.github/actions/setup-task
       - name: go mod download
@@ -201,7 +215,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: controller/go.mod
+          go-version: "1.26"
           cache-dependency-path: controller/go.sum
       - uses: ./.github/actions/setup-task
       - name: go mod download
@@ -307,7 +321,10 @@ jobs:
       # Go is needed for scan:secrets (gitleaks via `go run pkg@version`).
       - uses: actions/setup-go@v5
         with:
-          go-version-file: api/go.mod
+          # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
+          # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
+          # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
+          go-version: "1.26"
           cache-dependency-path: api/go.sum
       - uses: ./.github/actions/setup-task
       - name: Install shellcheck 0.11.0 (pinned, sha256-verified)
