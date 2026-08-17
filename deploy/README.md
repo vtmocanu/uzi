@@ -5,8 +5,8 @@ The release + deploy runbook for uzi (PRD #52). Two deploy topologies:
 - **compose (laptop)** — the MVP path, unchanged. `docker compose up` on
   `127.0.0.1:8080`, real `./.env` secrets. See the repo `README.md` /
   `ARCHITECTURE.md`. Workers still run here (`docker compose --profile agent`).
-- **k8s (dev-cluster)** — uzi deployed to the **dev-cluster** platform dev cluster
-  via **ArgoCD**, GitOps, the way MM deploys everything else. This file is about
+- **k8s (dev-cluster)** — uzi deployed to the **dev-cluster** Kubernetes cluster
+  via **ArgoCD**, GitOps, the way the rest of the platform deploys. This file is about
   that path: cutting a release and getting it live.
 
 The chart is `chart/` (an umbrella chart: web + api + the CloudNativePG `cluster`
@@ -14,7 +14,7 @@ subchart). Per-cluster values live in the private GitOps repo, not this repo:
 `argo-apps:apps/uzi/values/dev-cluster.yaml`. The in-repo `values/` holds
 only `ci-render.yaml` (sanitized CI render stand-in) and `kind-smoke.yaml` (KinD
 smoke). CI (`../.gitlab-ci.yml`) builds + publishes; ArgoCD
-(`myorg/k8s/argo-apps`, `apps/uzi/`) deploys. example-app's `deploy/README.md` is
+(`argo-apps`, `apps/uzi/`) deploys. example-app's `deploy/README.md` is
 the sibling reference — uzi follows its Model-B release shape.
 
 ## What deploys where
@@ -22,9 +22,9 @@ the sibling reference — uzi follows its Model-B release shape.
 | | compose (laptop) | k8s (dev-cluster) |
 | --- | --- | --- |
 | Brought up by | `docker compose up` | ArgoCD (auto-sync) from `argo-apps` `apps/uzi/` |
-| web / api images | built locally | `harbor.example.com/gitlab/vtmocanu/uzi/{web,api}:<tag>` |
+| web / api images | built locally | `registry.example.com/uzi/{web,api}:<tag>` |
 | controller / agent images | n/a (compose runs no controller) | `.../uzi/controller:<tag>`, `.../uzi/agent-{base,jvm}:<tag>` (PRD #58 M6) |
-| Postgres | `postgres:17` container | CNPG `Cluster` (`postgres-uzi-cluster`, 1 instance, `storage-class`) |
+| Postgres | `postgres:17` container | CNPG `Cluster` (`postgres-uzi-cluster`, 1 instance, `standard`) |
 | Secrets | `./.env` | Infisical (`/uzi` folder) + CNPG-generated `-app` creds |
 | Public URL | `http://127.0.0.1:8080` | `https://uzi.example.com` (ingress-nginx, `*.example.com` wildcard TLS) |
 | Worker | `docker compose --profile agent` | laptop workers unchanged; **hosted workers ship but are OFF** — see [Hosted workers](#hosted-workers-prd-58) |
@@ -56,7 +56,7 @@ advisory lock).
 Both images follow `appVersion` (the chart leaves `api.image.tag`/`web.image.tag`
 unset), so one version is the whole release coordinate: images at
 `.../uzi/{api,web}:<version>` and the chart at
-`oci://harbor.example.com/gitlab/vtmocanu/uzi/uzi:<version>`. The tag pipeline
+`oci://registry.example.com/uzi/uzi:<version>`. The tag pipeline
 **asserts** `version == appVersion == tag` (`publish:assert-version`) and fails
 the whole publish stage on a mismatch — a lagging `Chart.yaml` blocks the release
 atomically, it does not ship a half-version.
@@ -222,7 +222,7 @@ before the first deploy. Each mirrors an existing example-app step.
    creds. Combined with `main` being protected (poisoned CI needs human review to
    land), this closes the agent-MR loop.
 
-3. **Harbor robot scoped push-only on `gitlab/vtmocanu/uzi/*`.** No delete, no
+3. **Harbor robot scoped push-only on `uzi/*`.** No delete, no
    cross-project. Contains the accepted Decision-2 residual: on a protected ref,
    a reviewed-but-malicious Dockerfile could still read `config.json`; a
    tightly-scoped robot bounds the blast radius to uzi's own repos.
@@ -230,45 +230,45 @@ before the first deploy. Each mirrors an existing example-app step.
 4. **ArgoCD Helm OCI repo credential** — **already covered, no action taken**
    (confirmed at M6, 2026-07-16). ArgoCD repo-creds match by **URL prefix**, and
    argo-cluster already carries `oci-helm-creds` registered at the
-   `harbor.example.com` root with `type: helm` + `enableOCI: "true"`, which
-   covers `harbor.example.com/gitlab/vtmocanu/uzi` — the same credential example-app
+   `registry.example.com` root with `type: helm` + `enableOCI: "true"`, which
+   covers `registry.example.com/uzi` — the same credential example-app
    pulls its chart through. uzi's first sync pulled `uzi:0.2.0` with no new cred.
    Only if that prefix cred is ever removed/narrowed would you need a per-repo
-   one: `argocd repo add harbor.example.com/gitlab/vtmocanu/uzi --type helm
+   one: `argocd repo add registry.example.com/uzi --type helm
    --enable-oci=true …`, or the equivalent `repo`/`repo-creds` Secret with
    `enableOCI: "true"` + `type: helm`. Without some covering cred ArgoCD cannot
    pull the chart.
 
 5. **ArgoCD git access to `vtmocanu/uzi`** (for the `$values` source): already
-   covered by the existing **`vtmocanu-repo-creds`** group-prefix repo-creds
+   covered by the existing **`repo-creds`** group-prefix repo-creds
    template (the same one example-app uses for its `ref: values` source). Verify, no
    new token expected.
 
-6. **Infisical `/uzi` folder + an operator grant on the vtmocanu project.**
-   uzi's own runtime secrets live at `/uzi` in the **vtmocanu** project (slug
-   **`example-project`**, envSlug **`dev`**) — the convention every vtmocanu app
-   follows (`example-app` → `example-project`/`dev`:`/example-app`, `dot-ai` →
-   `example-project`/`dev`:`/dot-ai`). Populate `JWT_SECRET`, `UZI_SECRET_KEY`
+6. **Infisical `/uzi` folder + an operator grant on the app-secrets project.**
+   uzi's own runtime secrets live at `/uzi` in the **app-secrets** project (slug
+   **`app-secrets`**, envSlug **`dev`**) — the convention every app in that project
+   follows (`example-app` → `app-secrets`/`dev`:`/example-app`, `sibling-app` →
+   `app-secrets`/`dev`:`/sibling-app`). Populate `JWT_SECRET`, `UZI_SECRET_KEY`
    (required; the api refuses to boot without them) plus any optional
    `UZI_SEED_*` / Slack / OIDC keys the chart maps (`chart/values.yaml`
    `api.secretEnv`). Only the **shared Harbor robot pull secret** comes from the
-   k8s-clusters project (`example-project`, envSlug `prod`, `/k8s-registry-robot`),
+   k8s-clusters project (`example-project`, envSlug `prod`, `/registry-robot`),
    which is why `chart/values.yaml` `infisicalList` intentionally has two
    different scopes.
 
-   > **The cluster's operator identity needs membership on the `vtmocanu` project.**
+   > **The cluster's operator identity needs membership on the `app-secrets` project.**
    > Infisical MI permissions are **per-project**: without the grant, auth succeeds
-   > and the sync then 403s. `universal-auth-credentials` on dev-cluster already
+   > and the sync then 403s. The cluster's machine identity on dev-cluster already
    > had `example-project` (its ingress-nginx/cnpg values use it) but **not**
-   > `vtmocanu` — granted 2026-07-16 (example-app/dot-ai run on argo-cluster, whose
-   > MI already had it). Add it under **vtmocanu → Access Control → Identities**.
+   > the app-secrets project — granted 2026-07-16 (example-app/sibling-app run on argo-cluster, whose
+   > MI already had it). Add it under **app-secrets → Access Control → Identities**.
 
    > **History (M5→M6, 2026-07-16).** The M5 draft of this step asserted `/uzi`
    > lived in `example-project`/`prod` and that "no new operator grant is needed".
    > **Both were wrong.** First sync 404'd (`Folder with path '/uzi' in
    > environment 'prod' was not found`), so `uzi-secrets` was never created and the
    > api CrashLooped on an empty `JWT_SECRET`. Fixed by pointing `infsec-uzi` at
-   > `example-project`/`dev`. Verify the project slug + folder before a first sync on
+   > `app-secrets`/`dev`. Verify the project slug + folder before a first sync on
    > any new cluster — a wrong scope 403/404s the InfisicalSecret.
 
 7. **DNS `uzi.example.com`.** dev-cluster's ingress-nginx serves a
@@ -309,8 +309,8 @@ into `argo-apps:apps/uzi/values/dev-cluster.yaml` (re-verify if the cluster chan
 
 - **`postgresql:16.4` present in `cloudnative-pg`** — confirmed via `crane ls`
   (`16.10` also mirrored; `16.3` is **not**). The CNPG cluster pins
-  `harbor.example.com/cloudnative-pg/postgresql:16.4` (also what example-app-2
-  uses on dev-02). PG16 is a fleet-consistency choice, not an operator ceiling — the
+  `registry.example.com/cloudnative-pg/postgresql:16.4` (also what a sibling app
+  uses on the cluster). PG16 is a fleet-consistency choice, not an operator ceiling — the
   dev-cluster CNPG operator 1.23.5 supports up to PG17.
 
 - **Forge egress.** The api dials `gitlab.example.com` from the cluster (issue
@@ -363,7 +363,7 @@ controller token does not merely break hosted workers — the api refuses to boo
 which takes uzi down. It fails closed, but the blast radius is the whole product.
 
 1. **Generate the controller's bearer token and put BOTH halves in Infisical**
-   (`example-project` / `dev` / `/uzi`, the same folder `JWT_SECRET` lives in):
+   (`app-secrets` / `dev` / `/uzi`, the same folder `JWT_SECRET` lives in):
 
    ```sh
    TOKEN=$(openssl rand -base64 32)
@@ -416,9 +416,9 @@ which takes uzi down. It fails closed, but the blast radius is the whole product
 |---|---|---|
 | `workers.enabled` | `false` | The envelope + (with the controller) the whole feature. |
 | `workers.controller.enabled` | `true` | `false` = M3's envelope-only shape: namespace/RBAC/quotas/policies with nothing running. Also turns the api's hosting switch off — the two are one flag (`uzi.apiHostingEnabled`), because hosting with no controller means users provision workers nothing ever materializes. Only `kind-smoke.yaml` sets it. |
-| `workers.image.repository` | `.../gitlab/vtmocanu/uzi` | The **prefix**; the controller appends `/agent-<template>:<tag>`. Must match CI's `HARBOR_AGENT_IMAGE_PREFIX` minus `-agent`. |
+| `workers.image.repository` | `.../uzi` | The **prefix**; the controller appends `/agent-<template>:<tag>`. Must match CI's `HARBOR_AGENT_IMAGE_PREFIX` minus `-agent`. |
 | `workers.image.tag` | `""` → `appVersion` | Changing it **rolls the whole fleet** (Decision 9), each worker once it holds no non-terminal run. |
-| `workers.storageClass` | `""` (cluster default) | `storage-class` on dev-cluster. |
+| `workers.storageClass` | `""` (cluster default) | `standard` on dev-cluster. |
 
 ### Not proven until the first real rollout
 
@@ -526,8 +526,8 @@ escape hatch, not a new default.
 
 **Node prerequisite.** Rootless dockerd needs unprivileged user namespaces enabled
 on the node kernel (`kernel.unprivileged_userns_clone=1`) — a **node-scoped**
-sysctl, not settable per-pod. dev-cluster's nodes are vendor Linux OS (kernel
-6.1.83), which ships this **off** as a hardening default, so the rootless sidecar
+sysctl, not settable per-pod. dev-cluster's nodes ship this **off** as a hardening
+default (unprivileged userns disabled at the node kernel), so the rootless sidecar
 crash-loops there (`need 'kernel.unprivileged_userns_clone' … set to 1`).
 `argo-apps:apps/uzi/values/dev-cluster.yaml` therefore sets `rootless: false`.
 

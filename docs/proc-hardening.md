@@ -28,13 +28,13 @@ must not share the worker's uid.
 ## The mechanism, as built (mechanism A1)
 
 Two OS uids are baked into the worker image
-([`agent/templates/base/Dockerfile`](https://gitlab.example.com/vtmocanu/uzi/-/blob/main/agent/templates/base/Dockerfile)):
+([`agent/templates/base/Dockerfile`](https://github.com/vtmocanu/uzi/blob/main/agent/templates/base/Dockerfile)):
 **`worker`** (uid 10001, the credential custodian) and **`runner`** (uid 10002,
 cap-less, runs the untrusted surfaces). `worker` is a member of group `runner` so
 it can reach runner-group trees; `runner` is **not** in group `worker`.
 
 - **Root entrypoint, then a setuid drop.**
-  [`agent/templates/entrypoint.sh`](https://gitlab.example.com/vtmocanu/uzi/-/blob/main/agent/templates/entrypoint.sh)
+  [`agent/templates/entrypoint.sh`](https://github.com/vtmocanu/uzi/blob/main/agent/templates/entrypoint.sh)
   starts as root (compose grants `cap_add: [SETUID, SETGID, SETPCAP, CHOWN,
   DAC_OVERRIDE]`), runs a minimal startup window (volume-ownership migration,
   token hardening, per-uid tmp + `/data` carve-out), then `setpriv`-drops to
@@ -43,7 +43,7 @@ it can reach runner-group trees; `runner` is **not** in group `worker`.
   children per run; `no-new-privileges: true` stays on (it blocks a privilege
   *gain* on execve, not a root→lower drop).
 - **Per-spawn drop to the cap-less runner.**
-  [`agent/src/runner-uid.ts`](https://gitlab.example.com/vtmocanu/uzi/-/blob/main/agent/src/runner-uid.ts)
+  [`agent/src/runner-uid.ts`](https://github.com/vtmocanu/uzi/blob/main/agent/src/runner-uid.ts)
   wraps every untrusted spawn (SDK CLI, checks + `npm ci`, provision hooks, the
   runner-clone seed clone/checkout) in `setpriv --reuid runner --regid runner
   --init-groups --bounding-set -all --inh-caps -all --ambient-caps -all` (the
@@ -65,7 +65,7 @@ it can reach runner-group trees; `runner` is **not** in group `worker`.
   `/run/secrets/worker_token` to `0400 worker:worker`, so the `runner` uid
   **cannot read it** — the file is **persisted, not unlinked** (a read-only
   secret mount cannot be unlinked anyway; the uid boundary, not removal, is the
-  close). See [`agent/src/config.ts`](https://gitlab.example.com/vtmocanu/uzi/-/blob/main/agent/src/config.ts)
+  close). See [`agent/src/config.ts`](https://github.com/vtmocanu/uzi/blob/main/agent/src/config.ts)
   `resolveWorkerToken` and the `secrets:` block in `docker-compose.yml`.
 - **Bot PAT (push-window race).** The PAT enters a git **child's** env only during
   the worker's push/MR. That git child runs as `worker`, so its
@@ -78,7 +78,7 @@ it can reach runner-group trees; `runner` is **not** in group `worker`.
   `credential.helper`, `core.askpass`, …). The worker pins every fixed-name one
   via inline `GIT_CONFIG_*` (highest precedence), sets `GIT_CONFIG_NOSYSTEM`, and
   defaults `GIT_CONFIG_GLOBAL` to `/dev/null` (PRD #51 M0,
-  [`agent/src/git.ts`](https://gitlab.example.com/vtmocanu/uzi/-/blob/main/agent/src/git.ts)
+  [`agent/src/git.ts`](https://github.com/vtmocanu/uzi/blob/main/agent/src/git.ts)
   `gitEnv`). The arbitrary-name class (`filter.<name>.*`, `uploadpack.packObjectsHook`,
   a `commondir`/`gitdir` rewrite) is closed by **config-source ownership**: under
   the `(b)` topology the worker is **bare-only** — it never runs `git` with a

@@ -15,7 +15,7 @@ manage workers and repos, and (read-only) admin state. Built for humans
 ## 1. Install
 
 ```sh
-brew tap vtmocanu/tap git@gitlab.example.com:vtmocanu/homebrew-tap.git
+brew tap vtmocanu/tap git@github.com:vtmocanu/homebrew-tap.git
 brew trust --tap vtmocanu/tap   # one-time: Homebrew 6+ requires trusting third-party taps
 brew install vtmocanu/tap/uzi-cli
 uzi version

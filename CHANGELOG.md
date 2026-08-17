@@ -766,7 +766,7 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 - **CLI install docs now include the tap step.** The README quick-start and
   `docs/cli.md` were missing the one-time `brew tap vtmocanu/tap
-  git@gitlab.example.com:vtmocanu/homebrew-tap.git` and `brew trust --tap
+  git@github.com:vtmocanu/homebrew-tap.git` and `brew trust --tap
   vtmocanu/tap` commands, so a fresh install could not resolve the GitLab-hosted
   tap from the `vtmocanu/tap` shorthand (which Homebrew otherwise reads as a
   GitHub tap).
