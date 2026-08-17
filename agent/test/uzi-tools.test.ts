@@ -297,6 +297,46 @@ describe("uzi tool — cancel_run (PRD #322 M1)", () => {
   });
 });
 
+describe("uzi tool — steer_run (PRD #322 M3)", () => {
+  it("emits a steer_request CARD carrying run_id AND message, and steers nothing (no server round-trip, no write)", async () => {
+    const { client, calls } = fakeClient();
+    const { h, emits } = handlersWith(client, "chat-current");
+    const res = await h.steerRun({ run_id: "run-42", message: "focus on the auth path" });
+
+    assert.strictEqual(calls.createProposal.length, 0, "steer_run makes no mutating call — the Send click does");
+    assert.deepStrictEqual(calls.getChatRun, [], "steer_run makes no server round-trip at all");
+    assert.strictEqual(emits.length, 1, "exactly one card emitted");
+    const card = emits[0]!;
+    assert.strictEqual(card.kind, "steer_request");
+    assert.deepStrictEqual(card.payload, { run_id: "run-42", message: "focus on the auth path" });
+    assert.match(bodyText(res), /NOT sent yet/);
+    assert.match(bodyText(res), /click Send/);
+  });
+
+  it("trims the run id and message before emitting", async () => {
+    const { client } = fakeClient();
+    const { h, emits } = handlersWith(client);
+    await h.steerRun({ run_id: "  run-7  ", message: "  do the thing  " });
+    assert.strictEqual(emits.length, 1);
+    assert.deepStrictEqual(emits[0]!.payload, { run_id: "run-7", message: "do the thing" });
+  });
+
+  it("asks for the run id and message instead of guessing when either is blank (no card)", async () => {
+    const { client } = fakeClient();
+    const { h, emits } = handlersWith(client);
+
+    const noMsg = await h.steerRun({ run_id: "run-9", message: "   " });
+    assert.strictEqual(emits.length, 0, "no card without a message");
+    assert.strictEqual(noMsg.isError, true);
+    assert.match(bodyText(noMsg), /needs its run id and a follow-up message/);
+
+    const noRun = await h.steerRun({ run_id: "  ", message: "keep going" });
+    assert.strictEqual(emits.length, 0, "no card without a run id");
+    assert.strictEqual(noRun.isError, true);
+    assert.match(bodyText(noRun), /needs its run id and a follow-up message/);
+  });
+});
+
 describe("uzi tool wiring", () => {
   it("exposes the qualified tool names under the `uzi` server", () => {
     assert.strictEqual(UZI_TOOLS_SERVER_NAME, "uzi");
@@ -307,6 +347,7 @@ describe("uzi tool wiring", () => {
       "mcp__uzi__propose_issue",
       "mcp__uzi__start_run",
       "mcp__uzi__cancel_run",
+      "mcp__uzi__steer_run",
     ]);
   });
 });

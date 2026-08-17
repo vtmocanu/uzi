@@ -31,6 +31,8 @@ type chatStore struct {
 	propID    uuid.UUID
 	dismissed *uuid.UUID
 	cancelled *uuid.UUID // the run id a server-side cancel flipped (nil until CancelRunServerSide runs)
+	inputKind string     // the kind of the last enqueued run input (follow_up steer records here)
+	inputBody string     // the body of the last enqueued run input (the steered follow-up message)
 }
 
 func (s *chatStore) GetRunByIDForUser(_ context.Context, arg store.GetRunByIDForUserParams) (store.Run, error) {
@@ -46,6 +48,10 @@ func (s *chatStore) CountChatFollowUps(context.Context, uuid.UUID) (int64, error
 	return s.followUps, nil
 }
 func (s *chatStore) CreateRunInput(_ context.Context, arg store.CreateRunInputParams) (store.RunUserInput, error) {
+	// A follow_up steer (PRD #322 M3) enqueues here — record kind+body as the observable
+	// that proves SubmitInput(follow_up) ran through with the human-edited message.
+	s.inputKind = arg.Kind
+	s.inputBody = arg.Body.String
 	return store.RunUserInput{ID: 1, RunID: arg.RunID, Kind: arg.Kind}, nil
 }
 
@@ -356,5 +362,122 @@ func TestCancelChatRunBadRequestAndAuth(t *testing.T) {
 	h.CancelChatRun(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated CancelChatRun = %d, want 401", rec.Code)
+	}
+}
+
+// TestSteerChatRunOwnerSteers asserts the happy path (PRD #322 M3): the owner steers
+// their own live issue run → 202, and SubmitInput enqueued a follow_up carrying the
+// human-edited message (the observable that proves it ran through).
+func TestSteerChatRunOwnerSteers(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: workersvc.RunKindIssue, Status: "running"}}
+	h := newChatHandler(st)
+
+	rec := httptest.NewRecorder()
+	body := `{"run_id":"` + runID.String() + `","message":"focus on the auth path"}`
+	h.SteerChatRun(rec, chatReq(http.MethodPost, owner, uuid.Nil, uuid.Nil, body))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("owner SteerChatRun = %d, want 202; body=%s", rec.Code, rec.Body.String())
+	}
+	if st.inputKind != "follow_up" {
+		t.Fatalf("SteerChatRun must enqueue a follow_up via SubmitInput; inputKind=%q", st.inputKind)
+	}
+	if st.inputBody != "focus on the auth path" {
+		t.Fatalf("SteerChatRun must carry the edited message; inputBody=%q", st.inputBody)
+	}
+}
+
+// TestSteerChatRunChatTarget asserts a follow_up against a CHAT run is refused 409 with
+// the issue-runs-only copy — the ErrChatInputNotAllowed guard surfaces on the card.
+func TestSteerChatRunChatTarget(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: workersvc.RunKindChat, Status: "running"}}
+	h := newChatHandler(st)
+
+	rec := httptest.NewRecorder()
+	body := `{"run_id":"` + runID.String() + `","message":"steer me"}`
+	h.SteerChatRun(rec, chatReq(http.MethodPost, owner, uuid.Nil, uuid.Nil, body))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("chat-run SteerChatRun = %d, want 409", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "issue runs") {
+		t.Fatalf("chat-run SteerChatRun must carry the issue-runs-only copy; body=%s", rec.Body.String())
+	}
+	if st.inputKind != "" {
+		t.Fatal("a refused steer must not enqueue any input")
+	}
+}
+
+// TestSteerChatRunForeignRun asserts a forged/foreign run_id is refused 404 —
+// SubmitInput re-resolves ownership server-side.
+func TestSteerChatRunForeignRun(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: workersvc.RunKindIssue, Status: "running"}}
+	h := newChatHandler(st)
+
+	foreign := uuid.New()
+	rec := httptest.NewRecorder()
+	body := `{"run_id":"` + foreign.String() + `","message":"steer me"}`
+	h.SteerChatRun(rec, chatReq(http.MethodPost, owner, uuid.Nil, uuid.Nil, body))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("foreign-run SteerChatRun = %d, want 404", rec.Code)
+	}
+	if st.inputKind != "" {
+		t.Fatal("a refused steer must not enqueue any input")
+	}
+}
+
+// TestSteerChatRunTerminalRun asserts an already-terminal run is refused 409.
+func TestSteerChatRunTerminalRun(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: workersvc.RunKindIssue, Status: "completed"}}
+	h := newChatHandler(st)
+
+	rec := httptest.NewRecorder()
+	body := `{"run_id":"` + runID.String() + `","message":"steer me"}`
+	h.SteerChatRun(rec, chatReq(http.MethodPost, owner, uuid.Nil, uuid.Nil, body))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("terminal-run SteerChatRun = %d, want 409", rec.Code)
+	}
+	if st.inputKind != "" {
+		t.Fatal("a terminal run must not be steered")
+	}
+}
+
+// TestSteerChatRunBadRequestAndAuth asserts a blank message → 400 (no SubmitInput call),
+// a missing/blank run_id → 400, and an unauthenticated caller → 401.
+func TestSteerChatRunBadRequestAndAuth(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: workersvc.RunKindIssue, Status: "running"}}
+	h := newChatHandler(st)
+
+	// Blank message → 400, before any SubmitInput call.
+	rec := httptest.NewRecorder()
+	h.SteerChatRun(rec, chatReq(http.MethodPost, owner, uuid.Nil, uuid.Nil, `{"run_id":"`+runID.String()+`","message":"   "}`))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("blank-message SteerChatRun = %d, want 400", rec.Code)
+	}
+	if st.inputKind != "" {
+		t.Fatal("a blank-message steer must not enqueue any input")
+	}
+
+	// Blank run_id → 400 (uuid.Parse fails).
+	rec = httptest.NewRecorder()
+	h.SteerChatRun(rec, chatReq(http.MethodPost, owner, uuid.Nil, uuid.Nil, `{"run_id":"   ","message":"go"}`))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("blank run_id SteerChatRun = %d, want 400", rec.Code)
+	}
+
+	// Unauthenticated → 401.
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/chats/steer-requests", strings.NewReader(`{"run_id":"x","message":"go"}`))
+	h.SteerChatRun(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated SteerChatRun = %d, want 401", rec.Code)
 	}
 }

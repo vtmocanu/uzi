@@ -1,11 +1,12 @@
 import { useMemo } from "react";
-import type { CancelRequest, IssueProposal, RunMessage, RunRequest } from "../lib/api";
+import type { CancelRequest, IssueProposal, RunMessage, RunRequest, SteerRequest } from "../lib/api";
 import { useFollowScroll, useReconnectingBanner } from "../lib/useFollowScroll";
 import { buildToolIndex, RunEventRow } from "./RunEvent";
 import { Markdown } from "./Markdown";
 import { ProposalCard } from "./ProposalCard";
 import { RunRequestCard } from "./RunRequestCard";
 import { CancelRequestCard } from "./CancelRequestCard";
+import { SteerRequestCard } from "./SteerRequestCard";
 import { cx } from "./ui";
 
 // ChatMessages renders a chat conversation as bubbles over the SAME persisted,
@@ -159,6 +160,17 @@ function ChatRow({
       <div className="flex justify-start">
         <div className="w-full max-w-[92%]">
           <CancelRequestCard request={request} />
+        </div>
+      </div>
+    );
+  }
+
+  if (msg.kind === "steer_request") {
+    const request = msg.payload as SteerRequest;
+    return (
+      <div className="flex justify-start">
+        <div className="w-full max-w-[92%]">
+          <SteerRequestCard request={request} />
         </div>
       </div>
     );

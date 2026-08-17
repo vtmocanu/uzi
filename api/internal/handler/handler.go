@@ -1205,6 +1205,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// emergency stop that must NOT be throttled by an unrelated budget, so it wears
 				// NO limiter — mounted like /{id}/end below, not the forge-limited start above.
 				r.Post("/cancel-requests", h.CancelChatRun)
+				// Steer a run from a chat's steer card (PRD #322 M3): enqueues a follow_up the
+				// worker consumes, so it induces agent spend and rides the per-user chat limiter,
+				// mirroring /{id}/messages below — not the forge budget, not unlimited.
+				r.With(chatLimiter.PerUserMiddleware).Post("/steer-requests", h.SteerChatRun)
 				r.With(chatLimiter.PerUserMiddleware).Post("/{id}/messages", h.PostChatMessage)
 				r.Post("/{id}/end", h.EndChat)
 				// Continue mints a NEW queued chat run, so it rides the same per-user chat

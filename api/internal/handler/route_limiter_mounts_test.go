@@ -286,6 +286,10 @@ var wantRouteMounts = []routeMount{
 	// start-run card carries.
 	{"POST", "/api/chats/cancel-requests", noLimiter},
 	{"POST", "/api/chats/run-requests", limForge},
+	// PRD #322 M3: steer from a chat card enqueues a follow_up the worker consumes, so it
+	// induces agent spend and rides the per-user chat limiter (like /{id}/messages), NOT
+	// the forge budget the start-run card carries and NOT unlimited like cancel.
+	{"POST", "/api/chats/steer-requests", limChat},
 	{"POST", "/api/chats/{id}/continue", limChat},
 	{"POST", "/api/chats/{id}/end", noLimiter},
 	{"POST", "/api/chats/{id}/messages", limChat},

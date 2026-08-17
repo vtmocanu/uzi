@@ -3477,6 +3477,24 @@ export const mockApi = {
     return delay({ server_side: true }, 150);
   },
 
+  // PRD #322 M3: steer a run from a chat's steer card with a human-edited follow-up.
+  // run_id + message are untrusted; the real endpoint re-resolves ownership/terminality
+  // via SubmitInput(follow_up), which additionally refuses a CHAT run (issue-runs-only),
+  // so the mock reproduces its refusals — a missing run is 404, a terminal one 409, and a
+  // chat-run target 409 — a follow_up on an issue run succeeds.
+  steerRunFromChat: async (runId: string, message: string) => {
+    const run = getRun(runId);
+    if (!run) throw new ApiError(404, "run not found");
+    if (["completed", "failed", "cancelled"].includes(run.status)) {
+      throw new ApiError(409, "run has already finished");
+    }
+    if (run.kind === "chat") {
+      throw new ApiError(409, "steering applies to issue runs, not chats");
+    }
+    handleInput(runId, "follow_up", message);
+    return delay({ server_side: true }, 150);
+  },
+
   // ── CLI tokens (PRD #64 M6) ────────────────────────────────────────────────
   // Mirrors the cookie-only CRUD: list carries no value, mint returns the
   // plaintext once, admin_ro is admin-only, revoked rows stay (the incident

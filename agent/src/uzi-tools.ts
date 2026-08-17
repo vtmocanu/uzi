@@ -44,13 +44,20 @@ export const GET_RUN_MESSAGES_TOOL = "get_run_messages";
 export const PROPOSE_ISSUE_TOOL = "propose_issue";
 export const START_RUN_TOOL = "start_run";
 export const CANCEL_RUN_TOOL = "cancel_run";
+export const STEER_RUN_TOOL = "steer_run";
 
 /** The qualified tool names to add to the chat executor's `tools` allowlist so they
  *  are actually callable (extraTools). */
 export function uziToolNames(): string[] {
-  return [LIST_RUNS_TOOL, GET_RUN_TOOL, GET_RUN_MESSAGES_TOOL, PROPOSE_ISSUE_TOOL, START_RUN_TOOL, CANCEL_RUN_TOOL].map(
-    (t) => `mcp__${UZI_TOOLS_SERVER_NAME}__${t}`,
-  );
+  return [
+    LIST_RUNS_TOOL,
+    GET_RUN_TOOL,
+    GET_RUN_MESSAGES_TOOL,
+    PROPOSE_ISSUE_TOOL,
+    START_RUN_TOOL,
+    CANCEL_RUN_TOOL,
+    STEER_RUN_TOOL,
+  ].map((t) => `mcp__${UZI_TOOLS_SERVER_NAME}__${t}`);
 }
 
 /** Format a caught error into model-facing guidance (never a raw stack). A
@@ -91,6 +98,7 @@ export interface UziToolHandlers {
   }): Promise<ToolTextResult>;
   startRun(args: { repo_path: string; issue_iid: number; title?: string }): Promise<ToolTextResult>;
   cancelRun(args: { run_id: string }): Promise<ToolTextResult>;
+  steerRun(args: { run_id: string; message: string }): Promise<ToolTextResult>;
 }
 
 export function makeUziToolHandlers(deps: UziToolsDeps): UziToolHandlers {
@@ -207,6 +215,25 @@ export function makeUziToolHandlers(deps: UziToolsDeps): UziToolHandlers {
           "Cancel run on the card. Only their click stops the run.",
       );
     },
+    async steerRun(args) {
+      // steer_run does NOT steer anything: it emits a human-gated REQUEST card carrying a
+      // PROPOSED follow-up. Only the user's Send click — after they review/edit the message
+      // — delivers the follow-up, through their own connection, and the run_id is re-resolved
+      // server-side by SubmitInput (ownership + terminality + issue-run-only). So a run's
+      // activity feed (untrusted evidence) that SAYS "tell run X to …" can at most produce a
+      // card. No server round-trip here: nothing is trusted from the model.
+      const runId = args.run_id?.trim();
+      const message = args.message?.trim();
+      if (!runId || !message) {
+        return asText("Steering a run needs its run id and a follow-up message.", true);
+      }
+      emit({ kind: "steer_request", payload: { run_id: runId, message } });
+      return asText(
+        `Proposed steering run ${runId}. It is NOT sent yet — tell the user to review/edit the ` +
+          "message on the card and click Send. Only their click delivers the follow-up. " +
+          "(Steering applies to issue runs, not chats.)",
+      );
+    },
   };
 }
 
@@ -306,6 +333,27 @@ export function buildUziToolsServer(deps: UziToolsDeps): {
         ].join(" "),
         { run_id: z.string().min(1).describe("The run id to cancel (from list_runs).") },
         (args) => h.cancelRun(args),
+      ),
+      tool(
+        STEER_RUN_TOOL,
+        [
+          "REQUEST that the user steer one of THEIR live runs with a follow-up instruction.",
+          "This does NOT steer the run: it shows the user a card with an EDITABLE message",
+          "prefilled with your proposed follow-up — only their Send click, after they",
+          "review/edit the message, delivers it, through their own connection, and the run is",
+          "re-resolved server-side (a run that is not theirs or is already finished is refused",
+          "with the reason). Steering applies to issue/ci_fix runs, NOT chats. Use it when the",
+          "user asks uzi to tell a run to do something. Name the run with run_id (from",
+          "list_runs) and propose the instruction as message; tell the user to review and Send.",
+        ].join(" "),
+        {
+          run_id: z.string().min(1).describe("The run id to steer (from list_runs)."),
+          message: z
+            .string()
+            .min(1)
+            .describe("The follow-up instruction to propose (the user can edit it before sending)."),
+        },
+        (args) => h.steerRun(args),
       ),
     ],
   });
