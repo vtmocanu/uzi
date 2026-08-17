@@ -6,6 +6,23 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.42.1] - 2026-08-17
+
+### Changed
+
+- **Public-GitHub migration groundwork: internal-data scrub + CI/registry rehome
+  to GitHub Actions and GHCR.** Generalized internal hosts, cluster names, org
+  identifiers, CIDRs, and PII across the app code, tests, fixtures, specs, docs,
+  PRDs, and the Helm chart, and flipped the chart's default image references to
+  `ghcr.io/vtmocanu/uzi/*` with public-friendly defaults (plain-Secret mode, no
+  required pull secret, bundled simple-postgres). Ported the remaining CI from
+  the retired GitLab pipeline to GitHub Actions: PR image-validation builds, a
+  KinD chart-install smoke, and the `v*`-tag release that publishes the images and
+  the OCI Helm chart to GHCR. Pinned the go1.26.6 toolchain so the vulncheck gate
+  tracks patched stdlib. No behavior change to the shipping app. Commits:
+  5e856d71, ad04c450, 779cd0b8, 53021eee, e8a054e6, 3eaab75f, f8258b9e, bf9e72bd,
+  39eb9419, b180ec8b.
+
 ## [0.42.0] - 2026-08-17
 
 ### Added
