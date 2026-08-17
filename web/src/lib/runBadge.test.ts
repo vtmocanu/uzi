@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   activeRunInHistory,
   canOpenRunView,
+  effectiveRunStatus,
   formatElapsed,
   hasActiveRun,
   healthBadge,
@@ -9,6 +10,7 @@ import {
   isAwaitingApproval,
   isAwaitingInput,
   isHealthFlaggableStatus,
+  isPlanningRun,
   isStoppedRun,
   milestoneBadge,
   milestoneBadgeText,
@@ -172,6 +174,57 @@ describe("runBadge taxonomy", () => {
     expect(b).toMatchObject({ kind: "badge", label: "limit wait", tone: "warning" });
     expect(isHealthFlaggableStatus("limit_wait")).toBe(false);
     expect(shouldShowHealthFlag("stalled", "limit_wait")).toBe(false);
+  });
+});
+
+// issue #321 M3. The pre-approval PLANNING phase is wired onto every status surface via
+// one effective-status seam. The web TRUSTS the server's is_planning boolean and never
+// re-derives it — these pin that trust, and that planning is meaningful only while running.
+describe("planning phase (issue #321)", () => {
+  it("isPlanningRun: running + is_planning true ⇒ planning", () => {
+    expect(isPlanningRun({ status: "running", is_planning: true })).toBe(true);
+  });
+
+  it("isPlanningRun: is_planning true but no longer running ⇒ NOT planning", () => {
+    // is_planning is only meaningful while running: a completed run carrying a stale
+    // true must not read as planning.
+    expect(isPlanningRun({ status: "completed", is_planning: true })).toBe(false);
+  });
+
+  it("isPlanningRun: running but is_planning false/absent ⇒ NOT planning", () => {
+    expect(isPlanningRun({ status: "running", is_planning: false })).toBe(false);
+    // Absent (rollout skew) reads as not-planning — the `=== true` guard.
+    expect(isPlanningRun({ status: "running" })).toBe(false);
+  });
+
+  it("effectiveRunStatus: 'planning' while planning, else the raw status", () => {
+    expect(effectiveRunStatus({ status: "running", is_planning: true })).toBe("planning");
+    // is_planning true but completed → its raw status, never "planning".
+    expect(effectiveRunStatus({ status: "completed", is_planning: true })).toBe("completed");
+    expect(effectiveRunStatus({ status: "running", is_planning: false })).toBe("running");
+    expect(effectiveRunStatus({ status: "running" })).toBe("running");
+  });
+
+  it("runBadge: a running run with is_planning true → pulsing indigo 'planning' badge", () => {
+    expect(runBadge(run({ status: "running", is_planning: true }), NOW)).toEqual({
+      kind: "badge",
+      label: "planning",
+      tone: "plan",
+      pulse: true,
+    });
+  });
+
+  it("runBadge: the SAME run without is_planning still reads as 'running' (unchanged)", () => {
+    // The planning wiring must not disturb an ordinary running run — is_planning
+    // false OR absent both fall through to the existing running badge.
+    const off = runBadge(run({ status: "running", is_planning: false }), NOW);
+    expect(off).toMatchObject({ kind: "badge", label: "running", tone: "info", pulse: true });
+    const absent = runBadge(run({ status: "running" }), NOW);
+    expect(absent).toMatchObject({ kind: "badge", label: "running", tone: "info", pulse: true });
+  });
+
+  it("runStatusTone maps the effective 'planning' status to the indigo plan tone", () => {
+    expect(runStatusTone("planning", null)).toBe("plan");
   });
 });
 

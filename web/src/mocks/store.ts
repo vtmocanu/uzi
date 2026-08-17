@@ -193,6 +193,9 @@ export function appendMessage(
 // clobber, and Run carries a great deal a card has no business holding.
 const CARD_MIRRORED_FIELDS = [
   "status",
+  // issue #321: the server-derived planning flag rides the card the same way status does,
+  // so a scripted transition out of planning is reflected on the board card too.
+  "is_planning",
   "mr_iid",
   "mr_web_url",
   "mr_state",

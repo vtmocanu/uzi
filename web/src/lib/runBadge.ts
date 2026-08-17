@@ -110,6 +110,22 @@ export function isStoppedRun(
   return false;
 }
 
+// isPlanningRun reports whether a run is in its pre-approval PLANNING phase (issue
+// #321). It trusts the server-computed is_planning boolean and only treats it as
+// planning while the run is still `running` (is_planning is meaningful only then;
+// an absent value — rollout skew — reads as not-planning).
+export function isPlanningRun(run: { status: string; is_planning?: boolean }): boolean {
+  return run.status === "running" && run.is_planning === true;
+}
+
+// effectiveRunStatus is the status a run should RENDER as: "planning" while it is in
+// its planning phase, else its raw status. This is the single seam every status
+// surface flows through so the planning phase renders consistently (board card,
+// StatusPill, list rows, issue-view history) without any surface re-deriving.
+export function effectiveRunStatus(run: { status: string; is_planning?: boolean }): string {
+  return isPlanningRun(run) ? "planning" : run.status;
+}
+
 // runStatusTone maps a run status to a list-row badge tone (a simpler view than
 // runBadge, which also carries label/pulse/MR-chip). Same taxonomy as StatusPill
 // and the board badge so one status is one color everywhere: a deliberate stop is
@@ -119,6 +135,7 @@ export function runStatusTone(
   status: string,
   stopKind: StopKind | null | undefined,
 ): BadgeTone {
+  if (status === "planning") return "plan";
   if (status === "awaiting_approval" || status === "awaiting_input")
     return "warning";
   // PRD #35: a run parked on the owner's Anthropic usage limit. Warn, like the
@@ -281,11 +298,16 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
   // slow/stuck/looping (PRD #47). Only ever fires for a flaggable status.
   const flagged = healthBadge(run, nowMs);
   if (flagged) return flagged;
-  switch (run.status) {
+  switch (effectiveRunStatus(run)) {
     case "queued":
       return { kind: "badge", label: "queued", tone: "queue", pulse: false };
     case "claimed":
       return { kind: "badge", label: "claimed", tone: "info", pulse: false };
+    // issue #321: the pre-approval planning phase, derived by effectiveRunStatus
+    // from the server's is_planning flag. Pulses like `running` — it IS live work,
+    // just pre-approval — in the indigo `plan` tone.
+    case "planning":
+      return { kind: "badge", label: "planning", tone: "plan", pulse: true };
     case "running":
       // The running elapsed moved OUT of the badge to the uniform per-card duration
       // token (issue #256 M4, Decision 4) — the board now renders `running <elapsed>`

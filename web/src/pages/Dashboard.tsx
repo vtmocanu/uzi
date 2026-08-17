@@ -9,7 +9,7 @@ import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, isTerminalRun, type AdminUsage, type RunListItem, type SelfUsage, type Worker } from "../lib/api";
 import { hasAnthropicToken } from "../lib/hasToken";
-import { milestoneBadge, milestoneBadgeText, mrChipState } from "../lib/runBadge";
+import { effectiveRunStatus, milestoneBadge, milestoneBadgeText, mrChipState } from "../lib/runBadge";
 import { MrChip } from "../components/MrChip";
 import { mrAbbrev } from "../lib/forgeNoun";
 import { YourUsageCard, FactoryTotalCard, PerUserUsageTable } from "../components/UsageCards";
@@ -373,7 +373,7 @@ export function Dashboard() {
                     </Badge>
                   )}
                   <RunHealthBadge run={r} />
-                  <StatusPill status={r.status} />
+                  <StatusPill status={effectiveRunStatus(r)} />
                 </Link>
               </li>
               );

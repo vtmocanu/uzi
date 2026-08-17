@@ -327,6 +327,11 @@ export const RUN_STATUS_TONES: Record<
   queued: { tone: "queue" },
   claimed: { tone: "info" },
   running: { tone: "info", pulse: true },
+  // issue #321: the pre-approval planning phase, a derived effective status (not a real
+  // runs.status value). Indigo `plan` tone, pulsing like `running` — it IS live work,
+  // just pre-approval. StatusPill's default label `status.replace(/_/g," ")` already
+  // yields "planning", so no RUN_STATUS_LABELS entry is needed.
+  planning: { tone: "plan", pulse: true },
   awaiting_approval: { tone: "warning", pulse: true },
   // PRD #88: parked on a clarification question. Deliberately IDENTICAL to
   // awaiting_approval — same shape of debt (a human owes the run an action while a

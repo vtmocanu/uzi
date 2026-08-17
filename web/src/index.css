@@ -40,8 +40,11 @@
   --warn: 251 191 36;
   --danger: 251 113 133;
   --info: 56 189 248;
-  /* issue #321: planning-phase badge, indigo — distinct from sky info and violet queue */
-  --plan: 79 70 229;
+  /* issue #321: planning-phase badge, indigo-400 — a bright status tone like the sky
+     --info / emerald --ok siblings so text-plan clears WCAG AA on the near-black card
+     (~6.3:1; the darker indigo-600 first tried here measured only ~3:1), while staying a
+     distinct hue from sky --info and the gray --queue triple. */
+  --plan: 129 140 248;
 
   /* Queue + idle/stopped status tones. Unlike the four tinted tones above
      (a single hue at low opacity for border/bg/text), these reproduce ember's

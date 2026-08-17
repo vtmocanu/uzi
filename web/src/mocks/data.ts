@@ -1341,6 +1341,9 @@ const boardFixtures: Record<string, Board> = {
         latest_run: latestRun({
           id: LIVE_RUN_ID,
           status: "running",
+          // issue #321: this run is running at iteration 0 with no persisted plan, so the
+          // server derives is_planning — the board card shows the indigo "planning" badge.
+          is_planning: true,
           worker_name: "laptop",
           created_at: minsAgo(2),
           updated_at: minsAgo(1),
@@ -2368,6 +2371,12 @@ export const mockRuns: Run[] = [
     status: "running",
     requeue_count: 0,
     iteration_count: 0,
+    // NB: run-live is overloaded as the live-stream + milestone-progress demo (frozen
+    // milestones below, advanced by engine.ts), so it does NOT carry is_planning here —
+    // a planning run is pre-approval and has no frozen milestones. The planning badge is
+    // demonstrated on the milestone-free board card projection for iid 24 (see latestRun
+    // above), the primary surface for the phase (issue #321). List/pill rendering of the
+    // phase is covered by the ui.test.tsx / runBadge.test.ts unit tests.
     auto_approve: false,
     worker_id: "w-laptop",
     branch: "agent/issue-24",

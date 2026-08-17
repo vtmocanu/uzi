@@ -31,6 +31,7 @@ import { canToggleWaitOnLimit, formatCountdown, runWindowLabel } from "../lib/li
 import { stripUnsafeChars } from "../lib/safeText";
 import { AgentPicker, selectionLabel, type OwnTemplate } from "../components/AgentPicker";
 import {
+  effectiveRunStatus,
   formatElapsed,
   healthFlagLabel,
   isStoppedRun,
@@ -595,7 +596,7 @@ export function RunView() {
               {/* A stopped run (cancel or stop-shaped failure) reads as a neutral
                   "stopped" pill — StatusPill's default tone — so it stays calm and
                   agrees with the board/RunsList. */}
-              <StatusPill status={stopped ? "stopped" : run.status} />
+              <StatusPill status={stopped ? "stopped" : effectiveRunStatus(run)} />
               {run.auto_approve && (
                 <Badge tone="brand" title="Autopilot: started from the label, plan auto-approved">
                   autopilot
