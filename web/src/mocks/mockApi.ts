@@ -4,8 +4,6 @@
 // moves, template CRUD, worker tokens, run inputs — all work locally.
 
 import {
-  ApiError,
-  isTerminalRun,
   type AdminBlockedRepos,
   type AutoStatus,
   type BindMode,
@@ -73,6 +71,11 @@ import {
   type UserSettings,
   type UserSettingsPatch,
 } from "../lib/api";
+// ApiError / isTerminalRun are imported from their own leaf modules (not the
+// `../lib/api` barrel) so this mock-mode client introduces no runtime import
+// edge back to lib/api.ts — the api → mockApi → api cycle behind issue #165.
+import { ApiError } from "../lib/apiError";
+import { isTerminalRun } from "../lib/runStatus";
 import { isTheme, resolveTheme } from "../lib/theme";
 import { coordKey, recommendationLabel, verdictLabel } from "../lib/judge";
 import { bodyError, descriptionError, SKILL_NAME_RE } from "../lib/skills";

@@ -9,6 +9,10 @@
 
 import { mockApi } from "../mocks/mockApi";
 import { MockRunSocket } from "../mocks/socket";
+// ApiError moved to its own leaf module to break the api → mockApi → api
+// runtime import cycle (issue #165); imported here for api.ts's own internal
+// uses. TypeScript permits importing a name this module also re-exports below.
+import { ApiError } from "./apiError";
 
 export const MOCK_MODE = import.meta.env.VITE_UZI_MOCK === "1";
 
@@ -1135,16 +1139,10 @@ export type RunStatus =
   | "failed"
   | "cancelled";
 
-// TERMINAL_RUN_STATUSES mirrors the DB CHECK: a run in any of these is finished.
-export const TERMINAL_RUN_STATUSES: RunStatus[] = [
-  "completed",
-  "failed",
-  "cancelled",
-];
-
-export function isTerminalRun(status: string): boolean {
-  return (TERMINAL_RUN_STATUSES as string[]).includes(status);
-}
+// TERMINAL_RUN_STATUSES / isTerminalRun moved to the ./runStatus leaf module to
+// break the api → mockApi → api runtime import cycle (issue #165). Re-exported
+// here so the barrel's public surface is unchanged.
+export { TERMINAL_RUN_STATUSES, isTerminalRun } from "./runStatus";
 
 // StopKind is the server-stamped stop signal (PRD #33, widened by PRD #108 M5):
 // "cancelled" or "plan_rejected" for a deliberate HUMAN stop, "auto_stopped" when
@@ -2263,18 +2261,10 @@ export function preferForgeUrl(
   return isHttpsUrl(persisted) ? persisted! : legacy;
 }
 
-export class ApiError extends Error {
-  status: number;
-  // body is the full parsed error payload, so a caller can read structured
-  // fields beyond the message (e.g. a 422's `violations` array).
-  body: unknown;
-  constructor(status: number, message: string, body: unknown = null) {
-    super(message);
-    this.status = status;
-    this.body = body;
-    this.name = "ApiError";
-  }
-}
+// ApiError moved to the ./apiError leaf module to break the api → mockApi → api
+// runtime import cycle (issue #165). Re-exported here so the barrel's public
+// surface is unchanged; api.ts's own internal uses come from the top import.
+export { ApiError } from "./apiError";
 
 function readCookie(name: string): string | null {
   const match = document.cookie.match(

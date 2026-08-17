@@ -23,6 +23,22 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   message explaining that a chat's follow-ups go through the conversation
   itself.
 
+### Fixed
+
+- **Intermittent `test:web` failure `No "ApiError" export is defined on the
+  "../lib/api" mock` (#165).** Four error-path tests would fail in CI and pass
+  on retry at the same SHA. Root cause was a runtime import cycle: `lib/api.ts`
+  imports `mockApi` at module top (for the MOCK_MODE `api` swap) and
+  `mocks/mockApi.ts` imported the runtime values `ApiError` / `isTerminalRun`
+  back from the `../lib/api` barrel, so under parallel first-load vitest's
+  `importActual("../lib/api")` could observe the barrel before its deferred
+  `ApiError` binding populated. `ApiError` moved to `lib/apiError.ts` and
+  `TERMINAL_RUN_STATUSES` / `isTerminalRun` to `lib/runStatus.ts` (leaf modules,
+  re-exported from the barrel so the public import surface is unchanged); the
+  mock client imports the two runtime values from the leaves, making the graph
+  acyclic. A deterministic guard test (`mocks/api-acyclic.test.ts`) fails if any
+  mock-graph file reintroduces a runtime edge to the barrel.
+
 ## [0.41.0] - 2026-08-16
 
 ### Changed
