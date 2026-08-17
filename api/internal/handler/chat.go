@@ -215,6 +215,50 @@ func (h *Handler) StartChatRun(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run)})
 }
 
+// cancelChatRunRequest is the body of the chat cancel card's Cancel click (PRD #322):
+// the target run id. The run is re-resolved and terminality-guarded server-side by
+// SubmitInput; the card value is untrusted, exactly like the start-run card.
+type cancelChatRunRequest struct {
+	RunID string `json:"run_id"`
+}
+
+// CancelChatRun cancels a live run from a chat's cancel card (PRD #322). Owner-scoped
+// and terminality-guarded through workersvc.SubmitInput(cancel); the card's run_id is
+// untrusted. No forge call, so it wears no limiter (mounted like /{id}/end).
+func (h *Handler) CancelChatRun(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var req cancelChatRunRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	runID, err := uuid.Parse(strings.TrimSpace(req.RunID))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "run_id is required")
+		return
+	}
+	// Map errors like CreateRunInput (workers.go), NOT writeStartRunError: a stale/forged
+	// card must degrade to a clear 404/409, never a 500.
+	res, err := h.wsvc.SubmitInput(r.Context(), user.ID, runID, "cancel", "", nil)
+	if err != nil {
+		switch {
+		case errors.Is(err, workersvc.ErrRunNotFound):
+			httpx.Error(w, http.StatusNotFound, "run not found")
+		case errors.Is(err, workersvc.ErrRunTerminal):
+			httpx.Error(w, http.StatusConflict, "run has already finished")
+		default:
+			slog.Error("cancel chat run", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+	httpx.JSON(w, http.StatusAccepted, map[string]any{"server_side": res.ServerSide})
+}
+
 // createdIssueDTO is the confirm response: the real forge issue the click created.
 type createdIssueDTO struct {
 	IID    int64  `json:"iid"`

@@ -1201,6 +1201,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// GetIssue + the PRD gate, so it rides the per-user forge limiter like the
 				// proposal confirm below.
 				r.With(forgeLimiter.PerUserMiddleware).Post("/run-requests", h.StartChatRun)
+				// Cancel a run from a chat's cancel card (PRD #322 M1): no forge call, and an
+				// emergency stop that must NOT be throttled by an unrelated budget, so it wears
+				// NO limiter — mounted like /{id}/end below, not the forge-limited start above.
+				r.Post("/cancel-requests", h.CancelChatRun)
 				r.With(chatLimiter.PerUserMiddleware).Post("/{id}/messages", h.PostChatMessage)
 				r.Post("/{id}/end", h.EndChat)
 				// Continue mints a NEW queued chat run, so it rides the same per-user chat

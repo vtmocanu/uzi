@@ -281,6 +281,10 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/auth/logout", noLimiter},
 	{"POST", "/api/auth/register", noLimiter},
 	{"POST", "/api/chats/", limChat},
+	// PRD #322 M1: cancel from a chat card is an emergency stop with no forge call, so it
+	// carries NO per-user limiter (mounted like /{id}/end), NOT the forge budget the
+	// start-run card carries.
+	{"POST", "/api/chats/cancel-requests", noLimiter},
 	{"POST", "/api/chats/run-requests", limForge},
 	{"POST", "/api/chats/{id}/continue", limChat},
 	{"POST", "/api/chats/{id}/end", noLimiter},

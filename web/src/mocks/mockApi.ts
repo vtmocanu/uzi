@@ -3463,6 +3463,20 @@ export const mockApi = {
     return mockApi.createRun(repoId, card.iid);
   },
 
+  // PRD #322 M1: cancel a run from a chat's cancel card. run_id is untrusted; the real
+  // endpoint re-resolves ownership/terminality server-side via SubmitInput(cancel), so
+  // the mock reproduces its refusals — a missing run is 404, an already-terminal one 409
+  // — rather than resolving 202 over a no-op.
+  cancelRunFromChat: async (runId: string) => {
+    const run = getRun(runId);
+    if (!run) throw new ApiError(404, "run not found");
+    if (["completed", "failed", "cancelled"].includes(run.status)) {
+      throw new ApiError(409, "run has already finished");
+    }
+    handleInput(runId, "cancel", "");
+    return delay({ server_side: true }, 150);
+  },
+
   // ── CLI tokens (PRD #64 M6) ────────────────────────────────────────────────
   // Mirrors the cookie-only CRUD: list carries no value, mint returns the
   // plaintext once, admin_ro is admin-only, revoked rows stay (the incident

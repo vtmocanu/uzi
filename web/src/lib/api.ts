@@ -2178,6 +2178,13 @@ export interface RunRequest {
   title?: string;
 }
 
+// CancelRequest is the payload of a `cancel_request`-kind run message (PRD #322): the
+// chat agent's REQUEST to cancel a live run. run_id is UNTRUSTED and re-resolved
+// server-side; nothing is cancelled until the human's Cancel click.
+export interface CancelRequest {
+  run_id: string;
+}
+
 // runSocketUrl builds the same-origin WebSocket URL for a run. The HttpOnly auth
 // cookie rides along automatically (same origin through nginx); Origin==Host is
 // enforced server-side against cross-site hijacking.
@@ -3060,6 +3067,10 @@ const realApi = {
       repo_path: repoPath,
       issue_iid: issueIid,
     }),
+  // Cancel a run from a chat's cancel card (PRD #322). 202: SubmitInput(cancel),
+  // owner-scoped and terminality-guarded server-side. run_id is untrusted.
+  cancelRunFromChat: (runId: string) =>
+    request<{ server_side: boolean }>("POST", "/chats/cancel-requests", { run_id: runId }),
 
   adminListWorkers: () =>
     request<{ workers: AdminWorker[] }>("GET", "/admin/workers"),

@@ -263,6 +263,40 @@ describe("uzi tool — start_run (PRD #191 M5)", () => {
   });
 });
 
+describe("uzi tool — cancel_run (PRD #322 M1)", () => {
+  it("emits a cancel_request CARD and cancels nothing (no server round-trip, no write)", async () => {
+    const { client, calls } = fakeClient();
+    const { h, emits } = handlersWith(client, "chat-current");
+    const res = await h.cancelRun({ run_id: "run-42" });
+
+    assert.strictEqual(calls.createProposal.length, 0, "cancel_run makes no mutating call — the click does");
+    assert.deepStrictEqual(calls.getChatRun, [], "cancel_run makes no server round-trip at all");
+    assert.strictEqual(emits.length, 1, "exactly one card emitted");
+    const card = emits[0]!;
+    assert.strictEqual(card.kind, "cancel_request");
+    assert.deepStrictEqual(card.payload, { run_id: "run-42" });
+    assert.match(bodyText(res), /NOT cancelled yet/);
+    assert.match(bodyText(res), /click Cancel run/);
+  });
+
+  it("trims the run id before emitting", async () => {
+    const { client } = fakeClient();
+    const { h, emits } = handlersWith(client);
+    await h.cancelRun({ run_id: "  run-7  " });
+    assert.strictEqual(emits.length, 1);
+    assert.deepStrictEqual(emits[0]!.payload, { run_id: "run-7" });
+  });
+
+  it("asks for the run id instead of guessing when it is blank (no card)", async () => {
+    const { client } = fakeClient();
+    const { h, emits } = handlersWith(client);
+    const res = await h.cancelRun({ run_id: "   " });
+    assert.strictEqual(emits.length, 0, "no card without a run id");
+    assert.strictEqual(res.isError, true);
+    assert.match(bodyText(res), /needs its run id/);
+  });
+});
+
 describe("uzi tool wiring", () => {
   it("exposes the qualified tool names under the `uzi` server", () => {
     assert.strictEqual(UZI_TOOLS_SERVER_NAME, "uzi");
@@ -272,6 +306,7 @@ describe("uzi tool wiring", () => {
       "mcp__uzi__get_run_messages",
       "mcp__uzi__propose_issue",
       "mcp__uzi__start_run",
+      "mcp__uzi__cancel_run",
     ]);
   });
 });
