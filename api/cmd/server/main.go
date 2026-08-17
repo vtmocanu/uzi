@@ -305,6 +305,15 @@ func run() error {
 		return chatLimiter.Allow(handler.ChatCreateRoutePattern + "|" + userID.String())
 	})
 
+	// Shared pending-steer registry (PRD #322 M4): the Steer button (ChatActions) arms a
+	// one-shot pending here, and the next in-thread reply (Replier) consumes it as a
+	// follow_up to the target run. In-memory, no migration — the api is single-replica
+	// (deploy/chart/values.yaml replicaCount: 1), so the same process handles both the
+	// press and the reply. Both surfaces MUST share ONE instance.
+	steerPending := slacksvc.NewSteerPendings()
+	slackChatActions.SetSteerPending(steerPending)
+	slackReplier.SetSteerPending(steerPending)
+
 	// Slack Socket Mode manager (PRD #25 M2). Supervises the single outbound
 	// connection: it polls the settings cache and, while Slack is enabled with both
 	// tokens present, keeps a socket up (backoff reconnect, hot-restart on a
@@ -1099,6 +1108,44 @@ func cancelRunCardMessage(err error) string {
 		return "That run has already finished."
 	default:
 		return "Couldn't cancel that run right now — try again, or cancel it in uzi."
+	}
+}
+
+// SteerRunFromCard adapts a Slack steer reply to the run service (PRD #322 M4): the
+// owner-only SubmitInput(follow_up) on the pending's TARGET issue run. On refusal it
+// returns an error whose MESSAGE is user-safe (built from the run sentinels, mirroring
+// CancelRunFromCard), so slacksvc surfaces a helpful line without importing workersvc.
+// run_id is untrusted → SubmitInput re-resolves ownership, terminality, and the
+// chat-vs-issue kind (a chat target returns ErrChatInputNotAllowed).
+func (g gateSubmitter) SteerRunFromCard(ctx context.Context, userID, runID uuid.UUID, message string) error {
+	_, err := g.svc.SubmitInput(ctx, userID, runID, "follow_up", message, nil)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, workersvc.ErrChatInputNotAllowed),
+		errors.Is(err, workersvc.ErrRunNotFound),
+		errors.Is(err, workersvc.ErrRunTerminal):
+		return errors.New(steerRunCardMessage(err))
+	default:
+		slog.Error("slack steer-run card", "run_id", runID, "error", err)
+		return errors.New(steerRunCardMessage(err))
+	}
+}
+
+// steerRunCardMessage maps a SubmitInput(follow_up) error to a user-safe Slack message,
+// mirroring cancelRunCardMessage. A chat-run target is the steer-specific case: follow_up
+// is rejected for a chat run (ErrChatInputNotAllowed), and the message points the user at
+// the chat itself rather than leaving them confused.
+func steerRunCardMessage(err error) string {
+	switch {
+	case errors.Is(err, workersvc.ErrChatInputNotAllowed):
+		return "Steering applies to issue runs, not chats — reply in the chat itself to continue it."
+	case errors.Is(err, workersvc.ErrRunNotFound):
+		return "That run isn't yours, or it no longer exists."
+	case errors.Is(err, workersvc.ErrRunTerminal):
+		return "That run has already finished."
+	default:
+		return "Couldn't steer that run right now — try again, or steer it in uzi."
 	}
 }
 

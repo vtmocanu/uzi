@@ -364,6 +364,76 @@ func TestCancelRequestFrameMalformedPostsNothing(t *testing.T) {
 	}
 }
 
+// A steer_request run message posts a Steer/Dismiss card, threaded in the conversation,
+// naming the target run id and carrying the proposed instruction (PRD #322 M4).
+func TestSteerRequestFramePostsCard(t *testing.T) {
+	runID := uuid.New()
+	targetRun := uuid.New()
+	fp := &fakePoster{}
+	n := NewNotifier(chatMsgStore(runID), fp, fixedBase, nil)
+
+	feed(n, runID, frame("steer_request", `{"run_id":"`+targetRun.String()+`","message":"add error handling"}`))
+
+	if len(fp.blocks) != 1 {
+		t.Fatalf("want one card, got %+v", fp.blocks)
+	}
+	card := fp.blocks[0]
+	if card.thread != "user1" {
+		t.Errorf("card must thread on root_ts, got %q", card.thread)
+	}
+	ids := strings.Join(card.actionIDs, ",")
+	if !strings.Contains(ids, ActionChatRunSteer) || !strings.Contains(ids, ActionChatRunSteerDismiss) {
+		t.Errorf("card must carry Steer + Dismiss, got %v", card.actionIDs)
+	}
+	if !strings.Contains(card.sectionText, targetRun.String()) {
+		t.Errorf("card should name the target run id: %q", card.sectionText)
+	}
+	if !strings.Contains(card.sectionText, "add error handling") {
+		t.Errorf("card should show the proposed instruction: %q", card.sectionText)
+	}
+}
+
+// A malformed steer_request (missing/invalid run_id) posts no card.
+func TestSteerRequestFrameMalformedPostsNothing(t *testing.T) {
+	runID := uuid.New()
+	fp := &fakePoster{}
+	n := NewNotifier(chatMsgStore(runID), fp, fixedBase, nil)
+
+	feed(n, runID, frame("steer_request", `{"run_id":"not-a-uuid","message":"x"}`))
+	feed(n, runID, frame("steer_request", `{"message":"x"}`))
+
+	if len(fp.blocks) != 0 {
+		t.Fatalf("a malformed steer_request must post no card, got %+v", fp.blocks)
+	}
+}
+
+// The steer card's proposed message is model-authored → rendered inert: a credential is
+// scrubbed and an injected mention/link is neutralized (renderChatBody, PRD #292).
+func TestSteerRequestFrameMessageInert(t *testing.T) {
+	runID := uuid.New()
+	targetRun := uuid.New()
+	fp := &fakePoster{}
+	n := NewNotifier(chatMsgStore(runID), fp, fixedBase, nil)
+
+	feed(n, runID, frame("steer_request",
+		`{"run_id":"`+targetRun.String()+`",`+
+			`"message":"tok glpat-ABCDEF1234567890abcd ping <@U9> see <https://evil|Open>"}`)) //gitleaks:allow // fake PAT fixture: asserts a credential-shaped message is scrubbed, never a real secret
+
+	if len(fp.blocks) != 1 {
+		t.Fatalf("want one card, got %+v", fp.blocks)
+	}
+	body := fp.blocks[0].sectionText
+	if strings.Contains(body, "glpat-ABCDEF1234567890abcd") { //gitleaks:allow // fake PAT fixture: asserts the credential-shaped message is scrubbed, never a real secret
+		t.Errorf("a credential in the proposed message must be scrubbed: %q", body)
+	}
+	if strings.Contains(body, "<@U9>") {
+		t.Errorf("a mention in the proposed message must be neutralized: %q", body)
+	}
+	if strings.Contains(body, "<https://evil|Open>") {
+		t.Errorf("an injected link in the proposed message must be neutralized: %q", body)
+	}
+}
+
 // Start routes to the ownership-scoped StartRunFromCard and, on success, edits the card
 // to "run started" with the run link. The value carries (repo_path, issue_iid).
 func TestChatActionStartRun(t *testing.T) {
@@ -497,6 +567,97 @@ func TestChatActionCancelRunDismiss(t *testing.T) {
 	}
 	if len(fp.updateBlocks) != 1 {
 		t.Fatalf("dismiss should edit the card, got %+v", fp.updateBlocks)
+	}
+}
+
+// steerCardPress builds a steer-run card press: the value encodes {run_id, root_ts}
+// (PRD #322 M4). The pending is keyed by root_ts, the chat thread the reply lands in.
+func steerCardPress(actionID string, runID uuid.UUID, rootTS string) BlockAction {
+	return BlockAction{
+		SlackUserID: "Uauth", ActionID: actionID,
+		Value: encodeSteerReqValue(runID, rootTS), ChannelID: "D1", MessageTS: "card1",
+	}
+}
+
+// A Steer press ARMS a one-shot pending keyed by the chat thread (channel + root_ts) for
+// the pressing user, and edits the card to prompt for the reply. It performs NO write —
+// the follow_up happens when the reply consumes the pending.
+func TestChatActionSteerRunArms(t *testing.T) {
+	user := store.User{ID: uuid.New()}
+	targetRun := uuid.New()
+	steer := NewSteerPendings()
+	fp := &fakePoster{}
+	c := NewChatActions(&fakeChatActionStore{user: user}, &fakeChatActionSubmitter{}, fp, fixedBase, nil)
+	c.SetSteerPending(steer)
+
+	c.HandleBlockAction(context.Background(), steerCardPress(ActionChatRunSteer, targetRun, "root1"))
+
+	got, ok := steer.Take("D1", "root1", user.ID)
+	if !ok || got != targetRun {
+		t.Fatalf("Steer must arm a pending for (channel, root_ts, user) → target run: got=%v ok=%v", got, ok)
+	}
+	if len(fp.updateBlocks) != 1 || len(fp.updateBlocks[0].actionIDs) != 0 {
+		t.Fatalf("Steer should edit the card button-free to prompt for the reply, got %+v", fp.updateBlocks)
+	}
+	if !strings.Contains(strings.ToLower(fp.updateBlocks[0].sectionText), "reply in this thread") {
+		t.Errorf("the edited card should prompt for a thread reply: %q", fp.updateBlocks[0].sectionText)
+	}
+}
+
+// With no registry wired, Steer arms nothing and surfaces an ephemeral rather than
+// arming a pending the Replier will never consume.
+func TestChatActionSteerRunUnavailable(t *testing.T) {
+	fp := &fakePoster{}
+	c := NewChatActions(&fakeChatActionStore{user: store.User{ID: uuid.New()}}, &fakeChatActionSubmitter{}, fp, fixedBase, nil)
+
+	c.HandleBlockAction(context.Background(), steerCardPress(ActionChatRunSteer, uuid.New(), "root1"))
+
+	if len(fp.updateBlocks) != 0 {
+		t.Errorf("with no registry, Steer must not edit the card, got %+v", fp.updateBlocks)
+	}
+	if len(fp.ephemerals) != 1 || !strings.Contains(strings.ToLower(fp.ephemerals[0].text), "isn't available") {
+		t.Fatalf("want a 'steering isn't available' ephemeral, got %+v", fp.ephemerals)
+	}
+}
+
+// A malformed (non-JSON / bad run_id) steer value arms nothing and posts nothing.
+func TestChatActionSteerRunMalformedValue(t *testing.T) {
+	steer := NewSteerPendings()
+	fp := &fakePoster{}
+	user := store.User{ID: uuid.New()}
+	c := NewChatActions(&fakeChatActionStore{user: user}, &fakeChatActionSubmitter{}, fp, fixedBase, nil)
+	c.SetSteerPending(steer)
+
+	c.HandleBlockAction(context.Background(), BlockAction{
+		SlackUserID: "Uauth", ActionID: ActionChatRunSteer, Value: "not-json", ChannelID: "D1", MessageTS: "card1",
+	})
+
+	if _, ok := steer.Take("D1", "root1", user.ID); ok {
+		t.Errorf("a malformed value must arm no pending")
+	}
+	if len(fp.updateBlocks) != 0 || len(fp.ephemerals) != 0 {
+		t.Fatalf("a malformed value must post nothing: edits=%v eph=%v", fp.updateBlocks, fp.ephemerals)
+	}
+}
+
+// Dismiss on a steer card arms nothing and edits the card to the dismissed copy.
+func TestChatActionSteerRunDismiss(t *testing.T) {
+	steer := NewSteerPendings()
+	fp := &fakePoster{}
+	user := store.User{ID: uuid.New()}
+	c := NewChatActions(&fakeChatActionStore{user: user}, &fakeChatActionSubmitter{}, fp, fixedBase, nil)
+	c.SetSteerPending(steer)
+
+	c.HandleBlockAction(context.Background(), steerCardPress(ActionChatRunSteerDismiss, uuid.New(), "root1"))
+
+	if _, ok := steer.Take("D1", "root1", user.ID); ok {
+		t.Errorf("dismiss must arm no pending")
+	}
+	if len(fp.updateBlocks) != 1 {
+		t.Fatalf("dismiss should edit the card, got %+v", fp.updateBlocks)
+	}
+	if !strings.Contains(strings.ToLower(fp.updateBlocks[0].sectionText), "not steered") {
+		t.Errorf("dismiss should edit to the dismissed copy: %q", fp.updateBlocks[0].sectionText)
 	}
 }
 

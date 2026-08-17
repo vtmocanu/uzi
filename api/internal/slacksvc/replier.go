@@ -97,6 +97,13 @@ type Replier struct {
 	// versa. Nil (tests, or a deployment that never wires it) means unlimited — the
 	// opener never blocks on a missing guard.
 	chatAllow func(userID uuid.UUID) bool
+
+	// steer is the shared pending-steer registry (PRD #322 M4). A reply in a chat thread
+	// with a live pending armed by the SAME user is submitted as a follow_up to the
+	// pending's TARGET issue run — NOT treated as a chat turn — so a steer card posted in
+	// the chat thread routes its reply to a different run. Nil (tests, or a deployment
+	// that never wires it) means no steer interception; replies fall through unchanged.
+	steer *SteerPendings
 }
 
 // SetChatSpendGuard wires the per-user chat spend guard for the top-level-DM opener
@@ -104,6 +111,11 @@ type Replier struct {
 // pass a closure over the SAME chatLimiter the web /chats route mounts, keyed
 // identically, so web and Slack share one budget.
 func (r *Replier) SetChatSpendGuard(allow func(userID uuid.UUID) bool) { r.chatAllow = allow }
+
+// SetSteerPending wires the shared pending-steer registry for the steer-reply
+// interception (PRD #322 M4). Pass the SAME *SteerPendings the ChatActions Steer button
+// arms, so a reply here consumes a pending that press created.
+func (r *Replier) SetSteerPending(s *SteerPendings) { r.steer = s }
 
 type floodWindow struct {
 	count int
@@ -156,6 +168,28 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 	if strings.TrimSpace(m.ThreadTS) == "" {
 		r.openChat(ctx, m, user)
 		return
+	}
+
+	// Steer interception (PRD #322 M4): a Steer button pressed on a chat card arms a
+	// one-shot pending keyed by this chat thread. This MUST run before the chat-turn arm
+	// below — the steer card lives in the CHAT thread, so its reply would otherwise become
+	// a chat turn and the target run_id would be lost. Take is user-scoped and one-shot, so
+	// only the requester's reply consumes it; a wrong-user reply leaves it armed. Guarding
+	// on text != "" means a scrub-to-empty reply does NOT consume the pending (it stays
+	// armed for the real instruction), satisfying "an empty reply is a no-op". An empty
+	// ev.Text never reaches here — routeMessage drops it (socket.go).
+	if r.steer != nil {
+		if text := boundReply(m.Text); text != "" {
+			if targetRunID, ok := r.steer.Take(m.ChannelID, m.ThreadTS, user.ID); ok {
+				if err := r.svc.SteerRunFromCard(ctx, user.ID, targetRunID, text); err != nil {
+					// The adapter built a user-safe message (chat-run target, foreign/terminal run).
+					r.ephemeral(ctx, m, err.Error())
+					return
+				}
+				r.ack(ctx, m)
+				return
+			}
+		}
 	}
 
 	// Resolve the run anchored at this thread (thread_ts == root_ts). No anchor →

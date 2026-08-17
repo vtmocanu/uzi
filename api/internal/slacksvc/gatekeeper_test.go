@@ -87,6 +87,16 @@ type fakeSubmitter struct {
 	chatTurnErr     error
 	workerOnline    bool // PRD #191 M6: HasOnlineWorker (default false)
 	workerOnlineErr error
+
+	// PRD #322 M4 steer.
+	steers   []submittedSteer
+	steerErr error
+}
+
+// submittedSteer records a PRD #322 M4 steer follow_up submitted for a TARGET run.
+type submittedSteer struct {
+	userID, runID uuid.UUID
+	message       string
 }
 
 type createdChat struct {
@@ -138,6 +148,14 @@ func (f *fakeSubmitter) CreateChatRun(_ context.Context, userID uuid.UUID, messa
 func (f *fakeSubmitter) SubmitChatMessage(_ context.Context, userID, runID uuid.UUID, message string) error {
 	f.chatTurns = append(f.chatTurns, submittedChatTurn{userID, runID, message})
 	return f.chatTurnErr
+}
+
+// SteerRunFromCard records the steer follow_up and returns a configurable error (PRD
+// #322 M4): the adapter in main builds a user-safe message, so a test stages steerErr as
+// the already-translated string.
+func (f *fakeSubmitter) SteerRunFromCard(_ context.Context, userID, runID uuid.UUID, message string) error {
+	f.steers = append(f.steers, submittedSteer{userID, runID, message})
+	return f.steerErr
 }
 
 func gateAction(actionID string, runID uuid.UUID) BlockAction {
