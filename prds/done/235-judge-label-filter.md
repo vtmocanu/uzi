@@ -2,7 +2,7 @@
 
 **Issue**: [#235](https://gitlab.example.com/vtmocanu/uzi/-/issues/235) · **Label**: PRD · **Priority**: Medium
 **Area**: `web/src/pages/Judge.tsx` (the chip row + the `?category=` URL param) · `web/src/lib/api.ts` (`getJudgeBacklog` gains a categories arg) · `web/src/mocks/mockApi.ts` (mock-mode parity) · `api/internal/handler/judge_recommendations.go` (param parse + validation) · `api/internal/workersvc/judge_backlog.go` (signature + a `ValidRecommendationCategory` helper) · `api/internal/store/queries/judge_recommendations.sql` (one optional predicate) · `api/cmd/uzi/review.go` (`--category` on `uzi review backlog`).
-**Mockup**: [`prds/mockups/235-judge-label-filter-mock.html`](mockups/235-judge-label-filter-mock.html) — interactive; the label chips filter a sample backlog live.
+**Mockup**: [`prds/mockups/235-judge-label-filter-mock.html`](../mockups/235-judge-label-filter-mock.html) — interactive; the label chips filter a sample backlog live.
 **Line references** are against `dd342cb7`.
 **Status**: complete (2026-08-07) — all four milestones implemented, tested, and reviewed on branch `agent/issue-235`.
 

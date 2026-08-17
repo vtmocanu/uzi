@@ -1254,7 +1254,7 @@ this PRD supersedes that stance for sustained limits.
   toggle, endpoint shape, terminal-run inertness) is ours and belongs in `specs/ai.md`.
   Q2 is a user ruling on a knob's default, not a requirement change.
 
-  **ADR filed**: [`adr/0035-run-limit-retry.md`](../adr/0035-run-limit-retry.md)
+  **ADR filed**: [`adr/0035-run-limit-retry.md`](../../adr/0035-run-limit-retry.md)
   records Decision 6e — the ruling, the two rejected options, and specifically the
   "unbuildable as written" reasoning (promotion is strictly upstream of the claim
   where re-selection happens), which is the part not recoverable from the outcome. It

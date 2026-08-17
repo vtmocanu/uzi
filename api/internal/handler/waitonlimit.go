@@ -118,5 +118,5 @@ func (h *Handler) SetRunWaitOnLimit(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusNotFound, "run not found")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run))})
 }

@@ -6,6 +6,23 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Added
+
+- **Cancel and steer a run from Chat and Slack, human-gated (#322).** Both chat
+  surfaces can now stop a live run or send it a follow-up instruction without
+  leaving the conversation. The chat agent gained two tools, `cancel_run` and
+  `steer_run`, each of which only proposes a card — a danger **Cancel run**
+  card (web) or button-plus-confirm (Slack), and a **steer** card with an
+  editable follow-up (web) or a **Steer** button that asks you to reply in the
+  thread with your instruction (Slack, no modal). The human's click or reply
+  is what performs the write, and it funnels to the same owner-only
+  `SubmitInput` endpoint the web run view and CLI already use (`cancel` /
+  `follow_up` kinds), so a forged or foreign run is refused with 404 and an
+  already-terminal one with 409, and no new endpoint or migration was added.
+  Steering only applies to issue runs — pointed at a chat, it's refused with a
+  message explaining that a chat's follow-ups go through the conversation
+  itself.
+
 ### Fixed
 
 - **Intermittent `test:web` failure `No "ApiError" export is defined on the

@@ -265,6 +265,9 @@ var wantRouteMounts = []routeMount{
 	// unlimited.
 	{"PATCH", "/api/me/secrets/anthropic_token/{id}/auto-eligible", noLimiter},
 	{"PATCH", "/api/repos/{id}", noLimiter},
+	// Expedite/undo a queued run's priority (PRD #320 M3): one owner-scoped, queued-only
+	// UPDATE of runs.priority, no token spend, no forge write, no status touch → noLimiter.
+	{"PATCH", "/api/runs/{id}/priority", noLimiter},
 	// Schedule edit (PRD #241 M4): owner-scoped DB update, no forge → noLimiter.
 	{"PATCH", "/api/schedules/{id}", noLimiter},
 	{"PATCH", "/api/workers/{id}", noLimiter},
@@ -281,7 +284,15 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/auth/logout", noLimiter},
 	{"POST", "/api/auth/register", noLimiter},
 	{"POST", "/api/chats/", limChat},
+	// PRD #322 M1: cancel from a chat card is an emergency stop with no forge call, so it
+	// carries NO per-user limiter (mounted like /{id}/end), NOT the forge budget the
+	// start-run card carries.
+	{"POST", "/api/chats/cancel-requests", noLimiter},
 	{"POST", "/api/chats/run-requests", limForge},
+	// PRD #322 M3: steer from a chat card enqueues a follow_up the worker consumes, so it
+	// induces agent spend and rides the per-user chat limiter (like /{id}/messages), NOT
+	// the forge budget the start-run card carries and NOT unlimited like cancel.
+	{"POST", "/api/chats/steer-requests", limChat},
 	{"POST", "/api/chats/{id}/continue", limChat},
 	{"POST", "/api/chats/{id}/end", noLimiter},
 	{"POST", "/api/chats/{id}/messages", limChat},

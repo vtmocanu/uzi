@@ -1175,6 +1175,18 @@ export type RunHealth =
 // problem" verdict; null means the fix is not yet verified.
 export type FixVerdict = "verified" | "fix_failed" | "not_code";
 
+// RunPriority is the run's queue-priority CLASS (PRD #320 D8), computed server-side
+// from the runs.priority rank + the run's kind + its demotion/grace state — never a
+// raw column the web sets. "normal" is an interactive run at normal rank; "background"
+// is a judge/self_improve run currently DEMOTED so it yields to interactive work;
+// "expedited" is a run the owner bumped to the FRONT of the queue; "restored" is a
+// demoted run that aged past the background grace and no longer yields. It is
+// orthogonal to RunStatus (only a QUEUED run carries a non-normal class), and like
+// StopKind it crosses a JSON decode boundary, so an unlisted member is a silent lie a
+// test catches, not a type error. priorityBadge (lib/runBadge.ts) is the single map to
+// its pill; "normal"/absent renders no pill.
+export type RunPriority = "normal" | "background" | "expedited" | "restored";
+
 // PRD #209: how a run's plan_md was produced. "agent" — the worker planned it at the
 // gate (every pre-feature run, via the server's NOT NULL DEFAULT). "seeded" — the user
 // supplied the plan at create time; the run skips planning and the approval gate. Not
@@ -1247,6 +1259,14 @@ export interface Run {
   health: RunHealth;
   health_reason: string | null;
   health_since: string | null;
+  /** PRD #320 D8: the run's queue-priority CLASS, computed server-side (see RunPriority).
+   *  Only a QUEUED run is ever non-"normal"; a running/terminal run renders no pill. It
+   *  rides the shared run embed (RunListItemDTO embeds RunDTO), so it is present on BOTH
+   *  the list and detail reads, like fix_verdict/report_only. OPTIONAL only for the SAME
+   *  api/web rollout skew as report_only/plan_source/prd_done_path — a pre-#320 api pod
+   *  omits the key, and an ABSENT value MUST be treated as "normal" (priorityBadge maps
+   *  both to null, so a normal row stays quiet). */
+  priority?: RunPriority;
   /** ci_fix (PRD #6): the failing ref, the failing pipeline's web URL (from the
    *  snapshot), and the fix verdict. All null on an issue run. */
   pipeline_ref: string | null;
@@ -2176,6 +2196,22 @@ export interface RunRequest {
   title?: string;
 }
 
+// CancelRequest is the payload of a `cancel_request`-kind run message (PRD #322): the
+// chat agent's REQUEST to cancel a live run. run_id is UNTRUSTED and re-resolved
+// server-side; nothing is cancelled until the human's Cancel click.
+export interface CancelRequest {
+  run_id: string;
+}
+
+// SteerRequest is the payload of a `steer_request`-kind run message (PRD #322): the
+// chat agent's PROPOSED follow-up to steer a live issue run. run_id + message are
+// untrusted; nothing is sent until the human reviews/edits the message and clicks Send,
+// which routes to SubmitInput(follow_up) server-side.
+export interface SteerRequest {
+  run_id: string;
+  message: string;
+}
+
 // runSocketUrl builds the same-origin WebSocket URL for a run. The HttpOnly auth
 // cookie rides along automatically (same origin through nginx); Origin==Host is
 // enforced server-side against cross-site hijacking.
@@ -2849,6 +2885,17 @@ const realApi = {
   setRunWaitOnLimit: (id: string, enabled: boolean) =>
     request<{ run: Run }>("PUT", `/runs/${id}/wait-on-limit`, { enabled }),
 
+  /**
+   * PRD #320 M6: bump THIS run to the front of the queue (`expedite: true`) or clear
+   * that override (`expedite: false`), returning the updated run with its recomputed
+   * `priority` class. Owner-scoped (the server 404s a non-owner) and QUEUED-ONLY (409 on
+   * a non-queued run), so callers gate the control on `status === "queued"` + ownership;
+   * the 404/409 are the backstop, not the affordance. Clearing the override does NOT
+   * cancel or restart the run — it only returns it to its natural rank.
+   */
+  expediteRun: (id: string, expedite: boolean) =>
+    request<{ run: Run }>("PATCH", `/runs/${id}/priority`, { expedite }),
+
   // ── Run judge review (PRD #46 M4, PRD #119) ────────────────────────────────
   // getRunReview reads the verdict + recommendations for the run page (owner-or-
   // admin scoped server-side) PLUS the active judge run for the target. BOTH keys are
@@ -3050,6 +3097,14 @@ const realApi = {
       repo_path: repoPath,
       issue_iid: issueIid,
     }),
+  // Cancel a run from a chat's cancel card (PRD #322). 202: SubmitInput(cancel),
+  // owner-scoped and terminality-guarded server-side. run_id is untrusted.
+  cancelRunFromChat: (runId: string) =>
+    request<{ server_side: boolean }>("POST", "/chats/cancel-requests", { run_id: runId }),
+  // Steer a run from a chat's steer card (PRD #322). 202: SubmitInput(follow_up),
+  // owner-scoped + terminality-guarded server-side; a chat-run target is refused 409.
+  steerRunFromChat: (runId: string, message: string) =>
+    request<{ server_side: boolean }>("POST", "/chats/steer-requests", { run_id: runId, message }),
 
   adminListWorkers: () =>
     request<{ workers: AdminWorker[] }>("GET", "/admin/workers"),

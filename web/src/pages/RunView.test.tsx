@@ -60,6 +60,9 @@ vi.mock("../lib/api", async (importOriginal) => {
       // PRD #94 M3: triage mutations. Defaulted to resolve so a click + refetch settles.
       setDisposition: vi.fn().mockResolvedValue(null),
       deleteDisposition: vi.fn().mockResolvedValue(null),
+      // PRD #320 M6: the Expedite/undo mutation. Defaulted to resolve so a click +
+      // refreshRun settles; the priority cases assert the call args.
+      expediteRun: vi.fn().mockResolvedValue({ run: null }),
     },
   };
 });
@@ -633,6 +636,79 @@ describe("RunView header — the frozen per-schedule model badge (PRD #300)", ()
     renderPage({ status: "failed", model: "fable", override_subagent_model: false });
     await screen.findByText("Add rate limiting");
     expect(screen.queryByTitle(OVERRIDE_BADGE_TITLE)).toBeNull();
+  });
+});
+
+// PRD #320 M6: the queue-priority pill + the owner's Expedite/undo action in the run
+// header. These render the whole page (useRunStream mocked) so the control is exercised
+// where it lives — gated on run.status === "queued" and, for the action, on canSteer.
+describe("RunView — queue priority pill + Expedite action (PRD #320 M6)", () => {
+  function renderPage(over: Partial<Run>, canSteer: boolean) {
+    const refreshRun = vi.fn();
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun,
+      inputs: [],
+      canSteer,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    const utils = render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+    return { ...utils, refreshRun };
+  }
+
+  it("shows the Deprioritized pill and an Expedite button for an owner's queued demoted run", async () => {
+    renderPage({ status: "queued", priority: "background" }, true);
+    await screen.findByText("Add rate limiting");
+    expect(screen.getByText("Deprioritized")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Expedite" })).toBeTruthy();
+  });
+
+  it("clicking Expedite calls api.expediteRun(id, true) then refreshRun", async () => {
+    mockApi.expediteRun.mockResolvedValue({ run: run({ status: "queued", priority: "expedited" }) });
+    const { refreshRun } = renderPage({ status: "queued", priority: "background" }, true);
+    await screen.findByText("Add rate limiting");
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Expedite" }));
+    });
+    await waitFor(() => expect(mockApi.expediteRun).toHaveBeenCalledWith("r1", true));
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+  });
+
+  it("an expedited run offers Undo expedite, which calls api.expediteRun(id, false)", async () => {
+    mockApi.expediteRun.mockResolvedValue({ run: run({ status: "queued", priority: "normal" }) });
+    renderPage({ status: "queued", priority: "expedited" }, true);
+    await screen.findByText("Add rate limiting");
+    expect(screen.getByText("Expedited")).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Undo expedite" }));
+    });
+    await waitFor(() => expect(mockApi.expediteRun).toHaveBeenCalledWith("r1", false));
+  });
+
+  it("a NON-OWNER (canSteer=false) sees the pill and inert text, never a button", async () => {
+    renderPage({ status: "queued", priority: "background" }, false);
+    await screen.findByText("Add rate limiting");
+    // The pill is not owner-gated…
+    expect(screen.getByText("Deprioritized")).toBeTruthy();
+    // …but the action is inert text, not a button that would 404 (LimitWaitPanel's rule).
+    expect(screen.getByText(/only the run's owner can expedite it/i)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Expedite" })).toBeNull();
+  });
+
+  it("renders no pill and no action on a non-queued run carrying a stale priority", async () => {
+    renderPage({ status: "running", priority: "expedited" }, true);
+    await screen.findByText("Add rate limiting");
+    expect(screen.queryByText("Expedited")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Expedite" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Undo expedite" })).toBeNull();
   });
 });
 

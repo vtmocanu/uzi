@@ -58,3 +58,43 @@ describe("ChatMessages tool rows (PRD #116)", () => {
     expect(container.querySelector("pre")?.hasAttribute("hidden")).toBe(false);
   });
 });
+
+// A cancel_request run message is a human-gated card (PRD #322 M1): the chat surface
+// must render the CancelRequestCard, whose run_id is inert model text (never a link).
+describe("ChatMessages cancel_request card (PRD #322 M1)", () => {
+  it("renders a cancel_request message as the CancelRequestCard with an inert run_id", () => {
+    const { container, getByRole, getByText } = render(
+      <ChatMessages
+        chatId="c1"
+        messages={[msg({ seq: 1, kind: "cancel_request", payload: { run_id: "run-77" } })]}
+        connected={true}
+        live={false}
+      />,
+    );
+    expect(getByRole("button", { name: "Cancel run" })).toBeTruthy();
+    expect(getByText("run-77")).toBeTruthy();
+    // The card carries no clickable model-authored link.
+    expect(container.querySelector("a")).toBeNull();
+  });
+});
+
+// A steer_request run message is a human-gated card (PRD #322 M3): the chat surface
+// must render the SteerRequestCard, whose run_id is inert and whose proposed message is
+// an editable textarea (never Markdown, never a link).
+describe("ChatMessages steer_request card (PRD #322 M3)", () => {
+  it("renders a steer_request message as the SteerRequestCard with an editable proposed message", () => {
+    const { container, getByRole, getByText } = render(
+      <ChatMessages
+        chatId="c1"
+        messages={[msg({ seq: 1, kind: "steer_request", payload: { run_id: "run-77", message: "keep going" } })]}
+        connected={true}
+        live={false}
+      />,
+    );
+    expect(getByRole("button", { name: "Send" })).toBeTruthy();
+    expect((getByRole("textbox") as HTMLTextAreaElement).value).toBe("keep going");
+    expect(getByText("run-77")).toBeTruthy();
+    // The card carries no clickable model-authored link.
+    expect(container.querySelector("a")).toBeNull();
+  });
+});

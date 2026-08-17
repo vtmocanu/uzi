@@ -119,6 +119,10 @@ var runDTOKeys = []string{
 	// PRD #305: the frozen "apply model also to agents" flag (bool NOT NULL ⇒ always
 	// present; false is the default for a run that did not opt in).
 	"override_subagent_model",
+	// PRD #320 D8: the DISPLAY priority class ({normal, background, expedited,
+	// restored}), computed by fn_run_priority_class. NOT omitempty — always a real
+	// value on the wire, so it is asserted on the zero value here.
+	"priority",
 }
 
 func TestRunDTOTags(t *testing.T) {

@@ -46,6 +46,7 @@ import { useRunStream } from "../lib/useRunStream";
 import { deriveRunUsage } from "../lib/runUsage";
 import { CIFixRunHeader } from "../components/CIFixRunHeader";
 import { RunCredential } from "../components/RunCredential";
+import { RunPriorityBadge } from "../components/RunPriorityBadge";
 import { formatDuration } from "../components/RunEvent";
 import { RunUsagePanel } from "../components/RunUsage";
 import { formatTokens, formatCost } from "../lib/formatTokens";
@@ -596,6 +597,37 @@ export function RunView() {
                   "stopped" pill — StatusPill's default tone — so it stays calm and
                   agrees with the board/RunsList. */}
               <StatusPill status={stopped ? "stopped" : run.status} />
+              {/* PRD #320 M6: the queue-priority pill + the owner's Expedite/undo action.
+                  Both are QUEUED-ONLY (the pill self-hides on any other status; the action
+                  is wrapped in the status guard) — the server is queued-only too (409). */}
+              <RunPriorityBadge priority={run.priority} status={run.status} />
+              {run.status === "queued" &&
+                (canSteer ? (
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={busy}
+                    // Modelled on the wait-on-limit toggle: act() runs the owner-scoped
+                    // mutation, then refreshRun() re-reads the run so the recomputed
+                    // priority pill lands (no WS frame announces a priority change).
+                    onClick={() =>
+                      act(async () => {
+                        await api.expediteRun(run.id, run.priority !== "expedited");
+                        await refreshRun();
+                      })
+                    }
+                  >
+                    {run.priority === "expedited" ? "Undo expedite" : "Expedite"}
+                  </Button>
+                ) : (
+                  // Non-owner (mirrors LimitWaitPanel's inert branch): show the state, no
+                  // button that would 404 — expediting is the owner's to do.
+                  <span className="text-xs text-muted">
+                    {run.priority === "expedited"
+                      ? "Expedited — only its owner can change this."
+                      : "Only the run's owner can expedite it."}
+                  </span>
+                ))}
               {run.auto_approve && (
                 <Badge tone="brand" title="Autopilot: started from the label, plan auto-approved">
                   autopilot

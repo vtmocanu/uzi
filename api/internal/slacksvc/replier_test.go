@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -180,6 +181,167 @@ func TestReplierLiveRunSubmitsFollowUp(t *testing.T) {
 	}
 	if len(fp.ephemerals) != 0 || len(fs.gateSet) != 0 {
 		t.Fatalf("a live-run reply must not ephemeral or touch the gate: eph=%v gate=%v", fp.ephemerals, fs.gateSet)
+	}
+}
+
+// With a pending steer armed for (channel, thread, user), a thread reply is submitted as
+// a follow_up to the pending's TARGET run via SteerRunFromCard — NOT as a chat turn on
+// the anchored chat run, and NOT as a follow_up on the anchored run. The reply is acked.
+func TestReplierSteerPendingSubmitsToTarget(t *testing.T) {
+	user := store.User{ID: uuid.New()}
+	targetRun := uuid.New()
+	// The anchor at this thread is the CHAT run (the steer card lives in the chat thread);
+	// the interception must beat the chat-turn arm and route to the target instead.
+	chatRun := uuid.New()
+	fs := &fakeReplierStore{
+		user:   user,
+		anchor: store.SlackRunMessage{RunID: chatRun, ChannelID: "D1", RootTs: "root1"},
+	}
+	sub := &fakeSubmitter{run: store.Run{ID: chatRun, UserID: user.ID, Kind: runKindChat, Status: "running"}}
+	fp := &fakePoster{}
+	r := NewReplier(fs, sub, fp, nil)
+	steer := NewSteerPendings()
+	steer.Arm("D1", "root1", targetRun, user.ID)
+	r.SetSteerPending(steer)
+
+	r.HandleMessage(context.Background(), reply("focus on the auth path"))
+
+	if len(sub.steers) != 1 || sub.steers[0].runID != targetRun || sub.steers[0].message != "focus on the auth path" || sub.steers[0].userID != user.ID {
+		t.Fatalf("the reply must steer the TARGET run: %+v", sub.steers)
+	}
+	if len(sub.chatTurns) != 0 {
+		t.Errorf("a steer reply must NOT become a chat turn, got %+v", sub.chatTurns)
+	}
+	if len(sub.submitted) != 0 {
+		t.Errorf("a steer reply must NOT submit a follow_up on the anchor, got %+v", sub.submitted)
+	}
+	if len(fp.reactions) != 1 {
+		t.Fatalf("a consumed steer must get a ✅ ack: %+v", fp.reactions)
+	}
+	if _, ok := steer.Take("D1", "root1", user.ID); ok {
+		t.Errorf("the pending must have been consumed (one-shot)")
+	}
+}
+
+// A steer whose target is a chat run is refused by the service (ErrChatInputNotAllowed →
+// the adapter's "issue runs" message); the replier surfaces it as an ephemeral, no ack.
+func TestReplierSteerChatTargetSurfacesMessage(t *testing.T) {
+	user := store.User{ID: uuid.New()}
+	targetRun := uuid.New()
+	fs := &fakeReplierStore{user: user, anchor: store.SlackRunMessage{RunID: uuid.New(), ChannelID: "D1", RootTs: "root1"}}
+	sub := &fakeSubmitter{
+		run:      store.Run{ID: targetRun, UserID: user.ID, Kind: runKindChat, Status: "running"},
+		steerErr: errors.New("Steering applies to issue runs, not chats — reply in the chat itself to continue it."),
+	}
+	fp := &fakePoster{}
+	r := NewReplier(fs, sub, fp, nil)
+	steer := NewSteerPendings()
+	steer.Arm("D1", "root1", targetRun, user.ID)
+	r.SetSteerPending(steer)
+
+	r.HandleMessage(context.Background(), reply("do the thing"))
+
+	if len(fp.reactions) != 0 {
+		t.Errorf("a refused steer must not be acked, got %+v", fp.reactions)
+	}
+	if len(fp.ephemerals) != 1 || !strings.Contains(fp.ephemerals[0].text, "issue runs") {
+		t.Fatalf("want the 'issue runs' message as an ephemeral, got %+v", fp.ephemerals)
+	}
+}
+
+// With no live pending, a reply falls through to normal handling (a live-run follow_up on
+// the anchor), untouched by the steer path.
+func TestReplierNoPendingFallsThrough(t *testing.T) {
+	runID, user := uuid.New(), store.User{ID: uuid.New()}
+	fs := &fakeReplierStore{user: user, anchor: anchorRow(runID, "")}
+	sub := &fakeSubmitter{run: liveRun(runID, user.ID, "running")}
+	fp := &fakePoster{}
+	r := NewReplier(fs, sub, fp, nil)
+	r.SetSteerPending(NewSteerPendings()) // empty registry
+
+	r.HandleMessage(context.Background(), reply("also update the docs"))
+
+	if len(sub.steers) != 0 {
+		t.Errorf("no pending must mean no steer submission, got %+v", sub.steers)
+	}
+	if len(sub.submitted) != 1 || sub.submitted[0].kind != "follow_up" {
+		t.Fatalf("the reply must fall through to a normal follow_up: %+v", sub.submitted)
+	}
+}
+
+// An expired pending is not consumed — the reply falls through to normal handling.
+func TestReplierExpiredPendingFallsThrough(t *testing.T) {
+	runID, user := uuid.New(), store.User{ID: uuid.New()}
+	fs := &fakeReplierStore{user: user, anchor: anchorRow(runID, "")}
+	sub := &fakeSubmitter{run: liveRun(runID, user.ID, "running")}
+	fp := &fakePoster{}
+	r := NewReplier(fs, sub, fp, nil)
+	now := time.Now()
+	steer := NewSteerPendings()
+	steer.now = func() time.Time { return now }
+	steer.Arm("D1", "root1", uuid.New(), user.ID)
+	now = now.Add(steerPendingTTL + time.Second) // the pending has since expired
+	r.SetSteerPending(steer)
+
+	r.HandleMessage(context.Background(), reply("late instruction"))
+
+	if len(sub.steers) != 0 {
+		t.Errorf("an expired pending must not steer, got %+v", sub.steers)
+	}
+	if len(sub.submitted) != 1 || sub.submitted[0].kind != "follow_up" {
+		t.Fatalf("an expired pending must fall through to a normal follow_up: %+v", sub.submitted)
+	}
+}
+
+// A pending armed for a DIFFERENT user is not consumed by this user's reply — it falls
+// through, and the pending stays armed for its real requester.
+func TestReplierSteerWrongUserDoesNotConsume(t *testing.T) {
+	runID, user := uuid.New(), store.User{ID: uuid.New()}
+	fs := &fakeReplierStore{user: user, anchor: anchorRow(runID, "")}
+	sub := &fakeSubmitter{run: liveRun(runID, user.ID, "running")}
+	fp := &fakePoster{}
+	r := NewReplier(fs, sub, fp, nil)
+	steer := NewSteerPendings()
+	other := uuid.New()
+	steer.Arm("D1", "root1", uuid.New(), other) // armed for someone else
+	r.SetSteerPending(steer)
+
+	r.HandleMessage(context.Background(), reply("not mine to steer"))
+
+	if len(sub.steers) != 0 {
+		t.Errorf("a wrong-user reply must not steer, got %+v", sub.steers)
+	}
+	if len(sub.submitted) != 1 || sub.submitted[0].kind != "follow_up" {
+		t.Fatalf("a wrong-user reply must fall through to a normal follow_up: %+v", sub.submitted)
+	}
+	if _, ok := steer.Take("D1", "root1", other); !ok {
+		t.Errorf("the pending must remain armed for its real requester")
+	}
+}
+
+// A scrub-to-empty reply does NOT consume the pending — it stays armed for the real
+// instruction (PRD "an empty reply is a no-op").
+func TestReplierEmptySteerReplyLeavesPendingArmed(t *testing.T) {
+	user := store.User{ID: uuid.New()}
+	targetRun := uuid.New()
+	// No anchor at this thread, so once the empty reply skips the steer branch it resolves
+	// to nothing and returns — isolating the "pending untouched" assertion.
+	fs := &fakeReplierStore{user: user, anchorErr: pgx.ErrNoRows}
+	sub := &fakeSubmitter{}
+	fp := &fakePoster{}
+	r := NewReplier(fs, sub, fp, nil)
+	steer := NewSteerPendings()
+	steer.Arm("D1", "root1", targetRun, user.ID)
+	r.SetSteerPending(steer)
+
+	r.HandleMessage(context.Background(), reply("   ")) // whitespace → boundReply ""
+
+	if len(sub.steers) != 0 {
+		t.Errorf("an empty reply must not steer, got %+v", sub.steers)
+	}
+	got, ok := steer.Take("D1", "root1", user.ID)
+	if !ok || got != targetRun {
+		t.Fatalf("an empty reply must leave the pending armed: got=%v ok=%v", got, ok)
 	}
 }
 

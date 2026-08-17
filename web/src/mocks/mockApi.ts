@@ -46,6 +46,7 @@ import {
   type PrivilegeReport,
   type RecommendationCategory,
   type Run,
+  type RunPriority,
   type Schedule,
   type ScheduleInput,
   type SchedulePreviewInput,
@@ -2934,6 +2935,22 @@ export const mockApi = {
     return delay({ run: { ...getRun(id)! } }, 80);
   },
 
+  // PRD #320 M6: bump this run to the front of the queue, or clear that override.
+  // Mirrors the server: owner-scoped (the demo caller owns every non-other-user run)
+  // and QUEUED-ONLY (409 on a non-queued run, exactly like the real endpoint). Clearing
+  // the override returns the run to its NATURAL class — "background" for the kinds that
+  // demote (judge/self_improve), "normal" otherwise — since the mock has no live rank
+  // machinery; the "restored" grace state is a seed, not something undo produces here.
+  expediteRun: async (id: string, expedite: boolean) => {
+    const run = getRun(id);
+    if (!run) throw new ApiError(404, "run not found");
+    if (run.status !== "queued") throw new ApiError(409, "run is not queued");
+    const natural: RunPriority =
+      run.kind === "self_improve" || run.kind === "judge" ? "background" : "normal";
+    patchRun(id, { priority: expedite ? "expedited" : natural });
+    return delay({ run: { ...getRun(id)! } }, 80);
+  },
+
   // ── Run judge review (PRD #46 M4, PRD #119) ────────────────────────────────
   // The two-key envelope the server emits: BOTH keys always present, either nullable
   // and independent of the other. A pending judge over no review is the auto-judge
@@ -3464,6 +3481,38 @@ export const mockApi = {
     const card = repoId ? state.boards.get(repoId)?.cards[0] : undefined;
     if (!repoId || !card) throw new ApiError(404, `repo ${repoPath} not found`);
     return mockApi.createRun(repoId, card.iid);
+  },
+
+  // PRD #322 M1: cancel a run from a chat's cancel card. run_id is untrusted; the real
+  // endpoint re-resolves ownership/terminality server-side via SubmitInput(cancel), so
+  // the mock reproduces its refusals — a missing run is 404, an already-terminal one 409
+  // — rather than resolving 202 over a no-op.
+  cancelRunFromChat: async (runId: string) => {
+    const run = getRun(runId);
+    if (!run) throw new ApiError(404, "run not found");
+    if (["completed", "failed", "cancelled"].includes(run.status)) {
+      throw new ApiError(409, "run has already finished");
+    }
+    handleInput(runId, "cancel", "");
+    return delay({ server_side: true }, 150);
+  },
+
+  // PRD #322 M3: steer a run from a chat's steer card with a human-edited follow-up.
+  // run_id + message are untrusted; the real endpoint re-resolves ownership/terminality
+  // via SubmitInput(follow_up), which additionally refuses a CHAT run (issue-runs-only),
+  // so the mock reproduces its refusals — a missing run is 404, a terminal one 409, and a
+  // chat-run target 409 — a follow_up on an issue run succeeds.
+  steerRunFromChat: async (runId: string, message: string) => {
+    const run = getRun(runId);
+    if (!run) throw new ApiError(404, "run not found");
+    if (["completed", "failed", "cancelled"].includes(run.status)) {
+      throw new ApiError(409, "run has already finished");
+    }
+    if (run.kind === "chat") {
+      throw new ApiError(409, "steering applies to issue runs, not chats");
+    }
+    handleInput(runId, "follow_up", message);
+    return delay({ server_side: true }, 150);
   },
 
   // ── CLI tokens (PRD #64 M6) ────────────────────────────────────────────────
