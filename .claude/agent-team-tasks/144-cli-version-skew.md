@@ -1,6 +1,6 @@
 # Task brief — issue #144 item 1: warn when the CLI is behind the server
 
-**Worktree**: `/home/user/repos/myorg/vtmocanu/uzi/fix-144-cli-skew`
+**Worktree**: `/home/user/repos/myorg/uzi/fix-144-cli-skew`
 **Branch**: `fix/144-cli-version-skew`
 **Tip when this brief was written**: `2d60c573d9b554618784f99058a8be2a8b986649` (== `main`).
 Take the live tip if it has moved past this, and say so rather than guessing.

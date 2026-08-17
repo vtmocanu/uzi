@@ -1,7 +1,7 @@
 # Issue #205 — region-scope the lead.md phrase pins
 
 Brief for the agent-team run. Branch `fix/205-region-scoped-pins`, worktree
-`/home/user/repos/myorg/vtmocanu/uzi/fix-205`, cut from `main` at `cb14a835`
+`/home/user/repos/myorg/uzi/fix-205`, cut from `main` at `cb14a835`
 (which includes #197, merged as `cb14a835`).
 
 **Force-added to git** (`.gitignore:44` ignores `.claude/agent-team-tasks/`). Two
@@ -73,7 +73,7 @@ as "regions closed the problem".
 
 ## The prototype
 
-`/private/tmp/claude-1542763654/-Users-vmocanu-stuff-gitrepos-mm-vtmocanu-uzi/054a9d40-be99-489e-b412-d4d02e98f40e/scratchpad/tester-region_proto_test.go.candidate`
+`/private/tmp/claude-1542763654/-Users-vmocanu-stuff-gitrepos-orca-uzi/054a9d40-be99-489e-b412-d4d02e98f40e/scratchpad/tester-region_proto_test.go.candidate`
 
 **Evaluation code, guard included, NOT merge-ready.** It lives in a session scratchpad and
 may not survive. **Re-derive from the issue rather than assuming it is still there or

@@ -1,7 +1,7 @@
 # Issue #197 — lead.md dispatches validators only after implementation lands
 
 Brief for the agent-team run. Branch `fix/197-lead-design-critique-wave`, worktree
-`/home/user/repos/myorg/vtmocanu/uzi/fix-197`, cut from `main` at `31a36412`.
+`/home/user/repos/myorg/uzi/fix-197`, cut from `main` at `31a36412`.
 
 **This file is force-added to git** (`.gitignore:44` ignores `.claude/agent-team-tasks/`),
 so it is tracked and survives the worktree. Two consequences, both documented in
