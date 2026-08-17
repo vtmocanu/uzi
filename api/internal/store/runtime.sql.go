@@ -3849,6 +3849,33 @@ func (q *Queries) RunPriorityClass(ctx context.Context, arg RunPriorityClassPara
 	return fn_run_priority_class, err
 }
 
+const runPriorityClassForRun = `-- name: RunPriorityClassForRun :one
+SELECT fn_run_priority_class(kind, priority, created_at < $1)
+FROM runs WHERE id = $2
+`
+
+type RunPriorityClassForRunParams struct {
+	BackgroundGraceCutoff pgtype.Timestamptz `json:"background_grace_cutoff"`
+	RunID                 uuid.UUID          `json:"run_id"`
+}
+
+// Display priority class (PRD #320 D9) for ONE queued run by id, from the SAME SQL
+// function ClaimRun's ORDER BY ranks by, so the queued reason the owner sees and the
+// claim order never disagree. Unlike RunPriorityClass (a pure scalar eval for a row
+// already in hand), the health projection ListActiveRunsForHealth carries none of
+// kind/priority/created_at, so this reads them by id — a per-run lookup like
+// RunHasVerdictSinceGateOpened, affordable for the same reason: it runs only behind
+// healthTargetFor's queued-threshold guard, i.e. for ~zero runs per tick.
+// @background_grace_cutoff is the D4 fail-open cutoff (now() - RUN_BACKGROUND_GRACE),
+// built the SAME way service.go builds ClaimRun's cutoff: a demoted run created before
+// it reads as stale -> class `restored` (past grace) rather than `background`.
+func (q *Queries) RunPriorityClassForRun(ctx context.Context, arg RunPriorityClassForRunParams) (string, error) {
+	row := q.db.QueryRow(ctx, runPriorityClassForRun, arg.BackgroundGraceCutoff, arg.RunID)
+	var fn_run_priority_class string
+	err := row.Scan(&fn_run_priority_class)
+	return fn_run_priority_class, err
+}
+
 const selfUsage = `-- name: SelfUsage :one
 WITH scoped AS (
     SELECT r.created_at,

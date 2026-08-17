@@ -353,6 +353,20 @@ SELECT * FROM runs WHERE id = @id AND user_id = @user_id;
 -- ORDER BY ranks by, so pill and claim order can never disagree. No table access.
 SELECT fn_run_priority_class(@run_kind::text, sqlc.narg('priority')::smallint, @is_stale::boolean);
 
+-- name: RunPriorityClassForRun :one
+-- Display priority class (PRD #320 D9) for ONE queued run by id, from the SAME SQL
+-- function ClaimRun's ORDER BY ranks by, so the queued reason the owner sees and the
+-- claim order never disagree. Unlike RunPriorityClass (a pure scalar eval for a row
+-- already in hand), the health projection ListActiveRunsForHealth carries none of
+-- kind/priority/created_at, so this reads them by id — a per-run lookup like
+-- RunHasVerdictSinceGateOpened, affordable for the same reason: it runs only behind
+-- healthTargetFor's queued-threshold guard, i.e. for ~zero runs per tick.
+-- @background_grace_cutoff is the D4 fail-open cutoff (now() - RUN_BACKGROUND_GRACE),
+-- built the SAME way service.go builds ClaimRun's cutoff: a demoted run created before
+-- it reads as stale -> class `restored` (past grace) rather than `background`.
+SELECT fn_run_priority_class(kind, priority, created_at < @background_grace_cutoff)
+FROM runs WHERE id = @run_id;
+
 -- name: GetRunByID :one
 -- Admin viewer path: fetch any run regardless of owner. The per-run authz check
 -- lives in the service, which only reaches this after confirming the viewer is an

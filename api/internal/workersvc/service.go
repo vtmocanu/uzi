@@ -408,6 +408,11 @@ type Store interface {
 	// approval_idle. A per-run lookup like ListRunToolWindow above, and for the same
 	// reason — it runs only for runs already past the approval threshold.
 	RunHasVerdictSinceGateOpened(ctx context.Context, arg store.RunHasVerdictSinceGateOpenedParams) (bool, error)
+	// RunPriorityClassForRun backs PRD #320 D9: a queued run demoted by the
+	// kind-derived priority reports a deprioritized/restored reason instead of the
+	// generic wait. A per-run lookup like RunHasVerdictSinceGateOpened above, and for
+	// the same reason — it runs only for runs already past the queued threshold.
+	RunPriorityClassForRun(ctx context.Context, arg store.RunPriorityClassForRunParams) (string, error)
 
 	// Messages + inputs.
 	InsertRunMessage(ctx context.Context, arg store.InsertRunMessageParams) (int64, error)
