@@ -1,0 +1,113 @@
+package main
+
+import (
+	"bytes"
+	"strings"
+	"testing"
+
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
+)
+
+// TestEffectiveRunStatus pins the running→planning mapping (issue #321 M4): only a
+// running run whose server-computed is_planning is set renders as "planning". Every
+// other status is passed through unchanged, and is_planning on a non-running status is
+// ignored (the predicate is meaningful only while running).
+func TestEffectiveRunStatus(t *testing.T) {
+	for _, tc := range []struct {
+		status     string
+		isPlanning bool
+		want       string
+	}{
+		{"running", true, "planning"},
+		{"running", false, "running"},
+		{"completed", true, "completed"}, // only running maps
+		{"queued", false, "queued"},
+	} {
+		if got := effectiveRunStatus(tc.status, tc.isPlanning); got != tc.want {
+			t.Errorf("effectiveRunStatus(%q, %v) = %q, want %q", tc.status, tc.isPlanning, got, tc.want)
+		}
+	}
+}
+
+// TestPlanningStatusColour pins the M4 palette bucket: "planning" is a distinct colour,
+// not a fall-through to the default grey nor a reuse of the running green. The stalled
+// health override still wins over the planning bucket (health precedence unchanged).
+func TestPlanningStatusColour(t *testing.T) {
+	p := newPalette(true)
+
+	if _, ok := p.statuses["planning"]; !ok {
+		t.Fatal("palette has no \"planning\" status bucket")
+	}
+	planning := p.statusColor("planning", "")
+	running := p.statusColor("running", "")
+	if bgFillSGR(planning) == bgFillSGR(running) {
+		t.Error("planning and running resolve to the same colour; the planning phase is not visually distinct")
+	}
+	if bgFillSGR(planning) == bgFillSGR(p.statusDefault) {
+		t.Error("planning resolved to the default grey bucket; its own colour entry is not being read")
+	}
+	// Health precedence: a stalled planning run is still orange (triage wins).
+	if bgFillSGR(p.statusColor("planning", "stalled")) != bgFillSGR(p.statusStalled) {
+		t.Error("stalled health no longer overrides the planning bucket; the precedence rule regressed")
+	}
+}
+
+// TestStatusGlyphPlanning pins the NO_COLOR-safe spine glyph (D3): planning is a hollow
+// circle ("nothing committed yet"), distinct from running's filled dot.
+func TestStatusGlyphPlanning(t *testing.T) {
+	if got := statusGlyph("planning"); got != "○" {
+		t.Errorf("statusGlyph(\"planning\") = %q, want %q", got, "○")
+	}
+	if got := statusGlyph("running"); got != "●" {
+		t.Errorf("statusGlyph(\"running\") = %q, want %q", got, "●")
+	}
+}
+
+// TestRenderRunDetailPlanningStatus proves `uzi run get` renders the effective word in
+// its STATUS row: a running+is_planning run reads "planning", while a plain running run
+// still reads "running". The raw status is not surfaced to a human here (issue #321 M4).
+func TestRenderRunDetailPlanningStatus(t *testing.T) {
+	render := func(isPlanning bool) string {
+		var buf bytes.Buffer
+		p := uzicli.NewPrinter(&buf, false, false, true, false) // non-tty, non-json, no colour
+		r := apitypes.RunDTO{
+			ID:         "run-1",
+			Kind:       "issue",
+			Status:     "running",
+			IsPlanning: isPlanning,
+			IssueTitle: "do the thing",
+			Health:     "ok",
+		}
+		if err := renderRunDetail(p, r); err != nil {
+			t.Fatalf("renderRunDetail(isPlanning=%v): %v", isPlanning, err)
+		}
+		return buf.String()
+	}
+
+	if out := render(true); !strings.Contains(out, "planning") {
+		t.Errorf("a running+is_planning run must render STATUS \"planning\", got:\n%s", out)
+	}
+	if out := render(false); !strings.Contains(out, "running") {
+		t.Errorf("a plain running run must render STATUS \"running\", got:\n%s", out)
+	}
+}
+
+// TestRunListPlanningStatus proves the `uzi run list` table column renders the effective
+// word: a planning run reads "planning" and a normal running run reads "running".
+func TestRunListPlanningStatus(t *testing.T) {
+	fc := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "plan-1", Kind: "issue", Status: "running", IsPlanning: true, IssueTitle: "planning one"}},
+		{RunDTO: apitypes.RunDTO{ID: "run-2", Kind: "issue", Status: "running", IssueTitle: "running two"}},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "list")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "planning") {
+		t.Errorf("run list must render \"planning\" for a running+is_planning run, got:\n%s", out)
+	}
+	if !strings.Contains(out, "running") {
+		t.Errorf("run list must still render \"running\" for a plain running run, got:\n%s", out)
+	}
+}

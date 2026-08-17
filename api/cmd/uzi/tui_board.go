@@ -251,12 +251,13 @@ func (m tuiModel) boardEmptyState() string {
 // OWNER on the admin board, a status chip, a health marker, AGE, and the title with an
 // own-board-only judge marker.
 func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool) string {
-	sc := m.pal.statusColor(r.Status, r.Health)
+	es := effectiveRunStatus(r.Status, r.IsPlanning)
+	sc := m.pal.statusColor(es, r.Health)
 
 	// The spine carries the status GLYPH in the chip foreground on the status-colour
 	// background. Under NO_COLOR / an Ascii profile the fill is stripped but the glyph
 	// survives, so the spine's signal (D3) does not depend on colour.
-	spine := lipgloss.NewStyle().Background(sc).Foreground(m.pal.chipFg).Render(statusGlyph(r.Status))
+	spine := lipgloss.NewStyle().Background(sc).Foreground(m.pal.chipFg).Render(statusGlyph(es))
 	gutter := " "
 	id := m.pal.faint.Render(padCell(shortRunID(r.ID), 9))
 	if sel {
@@ -273,7 +274,7 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool) string {
 		owner = "  " + m.pal.faint.Render(padCell(m.renderer.Plain(strOr(r.OwnerEmail, ""), boardOwnerWidth), boardOwnerWidth))
 	}
 
-	statusCell := padVisual(m.pal.chip(m.renderer.Plain(r.Status, boardStatusWidth-2), sc), boardStatusWidth)
+	statusCell := padVisual(m.pal.chip(m.renderer.Plain(es, boardStatusWidth-2), sc), boardStatusWidth)
 
 	// F4: the judge marker carries the todo count when > 0 ("⚖ issues · N"), own board only
 	// (AdminListRuns carries no JudgeVerdict).
@@ -343,6 +344,8 @@ func statusGlyph(status string) string {
 	switch status {
 	case "running":
 		return "●"
+	case "planning":
+		return "○"
 	case "awaiting_approval":
 		return "!"
 	case "awaiting_input":

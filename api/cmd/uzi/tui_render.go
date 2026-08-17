@@ -162,7 +162,11 @@ func newPalette(dark bool) palette {
 	// Run-status colour buckets (PRD #325 M2). Light value first (dark bg gets the
 	// brighter second value), matching the `ld(light, dark)` convention above.
 	p.statuses = map[string]color.Color{
-		"running":           ld(lipgloss.Color("#1a7f4b"), lipgloss.Color("#4ade80")),
+		"running": ld(lipgloss.Color("#1a7f4b"), lipgloss.Color("#4ade80")),
+		// issue #321: the pre-approval planning phase, a DERIVED effective status (not a
+		// runs.status value). Indigo, matching the web `plan` badge tone — distinct from
+		// the green `running` bucket. Light indigo-600 / dark indigo-400.
+		"planning":          ld(lipgloss.Color("#4f46e5"), lipgloss.Color("#818cf8")),
 		"queued":            ld(lipgloss.Color("#6b7280"), lipgloss.Color("#7c8698")),
 		"claimed":           ld(lipgloss.Color("#6b7280"), lipgloss.Color("#7c8698")),
 		"awaiting_approval": ld(lipgloss.Color("#b45309"), lipgloss.Color("#fbbf24")),
