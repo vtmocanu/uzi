@@ -337,6 +337,37 @@ describe("uzi tool — steer_run (PRD #322 M3)", () => {
   });
 });
 
+describe("human-gating guarantee — every run-write tool only PROPOSES (PRD #322 M5)", () => {
+  // The load-bearing prompt-injection defense (Decision D2/D5): the chat agent reads
+  // untrusted run output (get_run_messages), so a run-affecting WRITE it could perform
+  // directly would be an injection vector. `start_run`, `cancel_run` and `steer_run`
+  // must therefore be structurally unable to write — they emit a card and the human's
+  // click performs the state change (re-resolved server-side). This locks that guarantee
+  // as ONE regression across all three tools together.
+  //
+  // The assertion is on the WRITE method (`createProposal`, the only mutating handler on
+  // the tool client), NOT on "no server call": cancel_run/steer_run are explicitly
+  // ALLOWED to do a read (get_run) for card copy in future, which is a read-only server
+  // call. What must never happen is a mutating call from the tool handler itself.
+  const runWriteTools: Array<{ name: string; kind: string; invoke: (h: ReturnType<typeof makeUziToolHandlers>) => Promise<unknown> }> = [
+    { name: "start_run", kind: "run_request", invoke: (h) => h.startRun({ repo_path: "group/project", issue_iid: 42 }) },
+    { name: "cancel_run", kind: "cancel_request", invoke: (h) => h.cancelRun({ run_id: "run-42" }) },
+    { name: "steer_run", kind: "steer_request", invoke: (h) => h.steerRun({ run_id: "run-42", message: "focus on the auth path" }) },
+  ];
+
+  for (const tool of runWriteTools) {
+    it(`${tool.name} emits a ${tool.kind} card and makes NO mutating call`, async () => {
+      const { client, calls } = fakeClient();
+      const { h, emits } = handlersWith(client, "chat-current");
+      await tool.invoke(h);
+
+      assert.strictEqual(calls.createProposal.length, 0, `${tool.name} must never write — the human click does`);
+      assert.strictEqual(emits.length, 1, `${tool.name} emits exactly one proposal card`);
+      assert.strictEqual((emits[0] as EmittedMessage).kind, tool.kind);
+    });
+  }
+});
+
 describe("uzi tool wiring", () => {
   it("exposes the qualified tool names under the `uzi` server", () => {
     assert.strictEqual(UZI_TOOLS_SERVER_NAME, "uzi");
