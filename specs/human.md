@@ -46,7 +46,7 @@ Tracked as GitLab issue vtmocanu/uzi#2; PRD at `prds/2-forge-integration-kanban.
 - uzi only sees issues the bot has rights to — no shared/ambient identity.
 - Repo list + picker in the UI.
 - Per-repo kanban board, columns = GitLab labels, kept in two-way sync between uzi and GitLab.
-  - Reference: example-app board (label-as-column example); kan.bn (UI style).
+  - Reference: an internal board (label-as-column example); kan.bn (UI style).
 - Board/agents work only issues carrying the `PRD` label, sanity-checked to contain a link to the PRD file.
 
 ## Feature #3 — Agent templates & per-user Anthropic token
