@@ -159,7 +159,7 @@ Tracked as GitLab issue vtmocanu/uzi#16; PRD at `prds/16-agent-skills.md`.
 
 - Skills exist at global scope and per-user scope (plan.md line 44).
 - Users allocate global skills or their own skills to each agent.
-- First builtin skill: `ci-cd-norms`, researched from internal-kb and the example-app repos — the example CI/CD norm, with example-app as the worked exception.
+- First builtin skill: `ci-cd-norms`, researched from an internal knowledge base and reference repos — an organization's CI/CD norm, with a reference app as the worked exception.
 - Repos may carry skills the worker detects. Per-repo opt-in, default off. [capability: user; opt-in/default-off shape AI-proposed, user-accepted]
 - Builtin skills ship with uzi; editable and resettable like builtin agent templates.
 
@@ -411,7 +411,7 @@ Tracked as GitLab issue vtmocanu/uzi#49; PRD at `prds/49-worker-resource-stats.m
 
 Tracked as GitLab issue vtmocanu/uzi#52; PRD at `prds/done/52-cicd-argocd-deploy.md`.
 
-- Real CI/CD: a working pipeline, tag-driven versioning, and ArgoCD deploy to the dev-cluster cluster. [user 2026-07-13]
+- Real CI/CD: a working pipeline, tag-driven versioning, and ArgoCD deploy to the dev cluster. [user 2026-07-13]
 - The ArgoCD wiring lands via an MR to the `argo-apps` repo — never a direct push to that repo's main. [user]
 
 ## Feature #53 — Per-user Claude rate-limit visibility
