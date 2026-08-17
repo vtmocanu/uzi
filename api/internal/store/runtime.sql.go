@@ -249,7 +249,17 @@ WHERE id = (
                       * p.max_concurrent_runs
           )
       )
-    ORDER BY COALESCE(r.worker_id = $1, false) DESC, r.created_at ASC
+    -- Three-level sort (PRD #320 D3): (1) resume affinity — a re-queued run
+    -- prefers its prior worker, exactly as before; (2) priority rank —
+    -- fn_run_priority slots BETWEEN affinity and FIFO, so an interactive run
+    -- (rank 1) beats an earlier-created background judge/self_improve run
+    -- (rank 0) and an expedited run (rank 2) beats both; (3) FIFO within a
+    -- level. @background_grace_cutoff (now − RUN_BACKGROUND_GRACE) is the D4
+    -- fail-open: a demoted run created before it reads as stale, so
+    -- fn_run_priority returns normal and background work never starves.
+    ORDER BY COALESCE(r.worker_id = $1, false) DESC,
+             fn_run_priority(r.kind, r.priority, r.created_at < $8) DESC,
+             r.created_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 )
@@ -257,13 +267,14 @@ RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, statu
 `
 
 type ClaimRunParams struct {
-	WorkerID            pgtype.UUID        `json:"worker_id"`
-	UserID              uuid.UUID          `json:"user_id"`
-	AffinityCutoff      pgtype.Timestamptz `json:"affinity_cutoff"`
-	IsDockerWorker      bool               `json:"is_docker_worker"`
-	DockerRepoAllowlist []uuid.UUID        `json:"docker_repo_allowlist"`
-	SpreadCutoff        pgtype.Timestamptz `json:"spread_cutoff"`
-	HeartbeatCutoff     pgtype.Timestamptz `json:"heartbeat_cutoff"`
+	WorkerID              pgtype.UUID        `json:"worker_id"`
+	UserID                uuid.UUID          `json:"user_id"`
+	AffinityCutoff        pgtype.Timestamptz `json:"affinity_cutoff"`
+	IsDockerWorker        bool               `json:"is_docker_worker"`
+	DockerRepoAllowlist   []uuid.UUID        `json:"docker_repo_allowlist"`
+	SpreadCutoff          pgtype.Timestamptz `json:"spread_cutoff"`
+	HeartbeatCutoff       pgtype.Timestamptz `json:"heartbeat_cutoff"`
+	BackgroundGraceCutoff pgtype.Timestamptz `json:"background_grace_cutoff"`
 }
 
 // The RUN claim lane (Decision 4): atomic claim of the oldest claimable queued run
@@ -301,6 +312,7 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		arg.DockerRepoAllowlist,
 		arg.SpreadCutoff,
 		arg.HeartbeatCutoff,
+		arg.BackgroundGraceCutoff,
 	)
 	var i Run
 	err := row.Scan(

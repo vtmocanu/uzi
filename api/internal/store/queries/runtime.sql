@@ -558,7 +558,17 @@ WHERE id = (
                       * p.max_concurrent_runs
           )
       )
-    ORDER BY COALESCE(r.worker_id = @worker_id, false) DESC, r.created_at ASC
+    -- Three-level sort (PRD #320 D3): (1) resume affinity — a re-queued run
+    -- prefers its prior worker, exactly as before; (2) priority rank —
+    -- fn_run_priority slots BETWEEN affinity and FIFO, so an interactive run
+    -- (rank 1) beats an earlier-created background judge/self_improve run
+    -- (rank 0) and an expedited run (rank 2) beats both; (3) FIFO within a
+    -- level. @background_grace_cutoff (now − RUN_BACKGROUND_GRACE) is the D4
+    -- fail-open: a demoted run created before it reads as stale, so
+    -- fn_run_priority returns normal and background work never starves.
+    ORDER BY COALESCE(r.worker_id = @worker_id, false) DESC,
+             fn_run_priority(r.kind, r.priority, r.created_at < @background_grace_cutoff) DESC,
+             r.created_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 )

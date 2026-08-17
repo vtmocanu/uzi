@@ -156,7 +156,10 @@ services:
       # Agent-runtime knobs (PRD #4), read by the API's config.Load (server side).
       # RUN_TIMEOUT and RUN_MAX_REQUEUES drive the run sweeper; WORKER_HEARTBEAT_STALE
       # WORKER_AFFINITY_GRACE and WORKER_SPREAD_GRACE drive worker liveness + claim
-      # affinity + fleet-aware run spread (PRD #216); RUN_IDLE_TIMEOUT
+      # affinity + fleet-aware run spread (PRD #216); RUN_BACKGROUND_GRACE
+      # (PRD #320) is the run-age fail-open — a demoted judge/self_improve run older
+      # than it collapses to normal priority so background work never starves;
+      # RUN_IDLE_TIMEOUT
       # and RUN_MAX_ITERATIONS are read here and shipped to the worker in the claim
       # payload (enforced worker-side); PLAN_MAX_REVISIONS (PRD #41) likewise rides
       # the claim config and is enforced both server-side and worker-side. Without
@@ -207,6 +210,7 @@ services:
       WORKER_HEARTBEAT_STALE: ${WORKER_HEARTBEAT_STALE:-45s}
       WORKER_AFFINITY_GRACE: ${WORKER_AFFINITY_GRACE:-2m}
       WORKER_SPREAD_GRACE: ${WORKER_SPREAD_GRACE:-9s}
+      RUN_BACKGROUND_GRACE: ${RUN_BACKGROUND_GRACE:-15m}
     # Not published to the host: reached only by web over the compose network.
     depends_on:
       db:

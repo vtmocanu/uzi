@@ -552,6 +552,10 @@ type Params struct {
 	// WorkerSpreadGrace (PRD #216): a queued run older than this is exempt from the
 	// fleet-aware spread (fail-open), so a run can never be stranded by deferral.
 	WorkerSpreadGrace time.Duration
+	// WorkerBackgroundGrace (PRD #320): a demoted (judge/self_improve) run older than
+	// this fails open to normal priority in ClaimRun's ORDER BY, so background work
+	// can never be starved by interactive runs (minutes-scale run-age fail-open).
+	WorkerBackgroundGrace time.Duration
 	// ClaimGrace is the claimed-but-never-started reclaim window. It is not a
 	// PRD env var (the PRD fixes it at 5m in prose); defaulted in New.
 	ClaimGrace time.Duration
@@ -1068,13 +1072,14 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 	}
 
 	run, err := s.q.ClaimRun(ctx, store.ClaimRunParams{
-		WorkerID:            pgUUID(wkr.ID),
-		UserID:              wkr.UserID,
-		AffinityCutoff:      pgTime(s.now().Add(-s.p.WorkerAffinityGrace)),
-		IsDockerWorker:      isDocker,
-		DockerRepoAllowlist: allowlist,
-		SpreadCutoff:        pgTime(s.now().Add(-s.p.WorkerSpreadGrace)),
-		HeartbeatCutoff:     pgTime(s.now().Add(-s.p.WorkerHeartbeatStale)),
+		WorkerID:              pgUUID(wkr.ID),
+		UserID:                wkr.UserID,
+		AffinityCutoff:        pgTime(s.now().Add(-s.p.WorkerAffinityGrace)),
+		IsDockerWorker:        isDocker,
+		DockerRepoAllowlist:   allowlist,
+		SpreadCutoff:          pgTime(s.now().Add(-s.p.WorkerSpreadGrace)),
+		BackgroundGraceCutoff: pgTime(s.now().Add(-s.p.WorkerBackgroundGrace)),
+		HeartbeatCutoff:       pgTime(s.now().Add(-s.p.WorkerHeartbeatStale)),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

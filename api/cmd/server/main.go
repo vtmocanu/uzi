@@ -252,6 +252,7 @@ func run() error {
 		WorkerHeartbeatStale:        cfg.WorkerHeartbeatStale,
 		WorkerAffinityGrace:         cfg.WorkerAffinityGrace,
 		WorkerSpreadGrace:           cfg.WorkerSpreadGrace,
+		WorkerBackgroundGrace:       cfg.WorkerBackgroundGrace,
 		SkillMaxBytes:               cfg.SkillMaxBytes,
 		SkillsMaxPerRun:             cfg.SkillsMaxPerRun,
 		ChatIdleTimeout:             cfg.ChatIdleTimeout,
