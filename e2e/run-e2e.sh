@@ -244,7 +244,14 @@ cleanup() {
   fi
   say "tearing down (down -v)"
   "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
-  [ -n "$KEEP" ] || rm -rf "$RUNROOT"
+  # The scratch removal MUST NOT flip a passed run to red. Containers write into the
+  # bind-mounted fakeremote/ as uids other than the host user — forge-fake's receive-pack
+  # as root, the worker as its own in-image uid — so on a CI runner the non-root runner
+  # user cannot rm those ref files and `rm -rf` returns non-zero. Under `set -e` that
+  # would become the script's exit status, overriding `exit $code` below and failing a
+  # green run at teardown. Locally the files are user-owned, so this still cleans fully;
+  # on CI the runner is ephemeral and any leftover scratch is discarded with the VM.
+  [ -n "$KEEP" ] || rm -rf "$RUNROOT" || true
   exit $code
 }
 trap cleanup EXIT
@@ -489,8 +496,11 @@ report_margins() {
   say "PRD #97 M9 — wait_* margin report (tightest first; headroom = ceiling - actual)"
   # Emit "<headroom>\t<line>", numeric-sort on the leading key, then strip it — sorting
   # the rendered text directly does not work (the number is not at a field boundary).
+  # Truncate with `sed -n '1,20p'`, NOT `head -20`: head closes the pipe after 20 lines,
+  # sending SIGPIPE upstream to cut ("cut: write error: Broken pipe" in the log). sed drains
+  # the whole stream (no early exit without `q`), so nothing upstream gets a broken pipe.
   awk -F'\t' '{ printf "%d\t  %-46s waited %3ss of %3ss ceiling (headroom %3ss)\n", $2-$1, substr($3,1,46), $1, $2, $2-$1 }' \
-    "$MARGINS_FILE" | sort -n -k1,1 | cut -f2- | head -20
+    "$MARGINS_FILE" | sort -n -k1,1 | cut -f2- | sed -n '1,20p'
   printf '  (%s instrumented waits this run; whole-second resolution)\n' "$(wc -l < "$MARGINS_FILE" | tr -d ' ')"
 }
 
