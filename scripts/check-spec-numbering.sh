@@ -82,7 +82,11 @@ extract() {
       if ($0 ~ /^## [0-9]+\./) {
         s = substr($0, 4)          # strip the "## " prefix
         i = index(s, ".")
-        print NR "\t" substr(s, 1, i - 1)
+        # `+ 0` canonicalises the digits to their NUMERIC value so `## 07.` and
+        # `## 7.` collide as the one section §7 they both read as -- a duplicate
+        # detector must not go blind on a leading-zero spelling. No-op on the
+        # plain integers this file actually uses.
+        print NR "\t" (substr(s, 1, i - 1) + 0)
       }
     }
   ' "$1"
