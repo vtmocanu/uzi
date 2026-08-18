@@ -17,8 +17,8 @@ approval gate → implement ⇄ review → branch + merge request), never touchi
 
 ## Which forges does uzi support?
 
-GitLab, GitHub, and Forgejo/Gitea — one forge driver each. You connect one
-forge per account.
+GitLab, GitHub, and Forgejo/Gitea — one forge driver each. You can connect
+more than one forge to a single account.
 
 ## Does uzi ever push to `main`?
 
