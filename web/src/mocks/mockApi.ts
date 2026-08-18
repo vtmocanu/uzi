@@ -3703,6 +3703,17 @@ export const mockApi = {
     if (input.override_subagent_model !== undefined)
       m.override_subagent_model = input.override_subagent_model;
     if (input.enabled !== undefined) m.enabled = input.enabled;
+    // PRD #344 Feature A: a non-empty repo_id that differs from the current one repoints the
+    // schedule. Mirror the server: an issue-target schedule is rejected (422, D4 restrict);
+    // an unknown/unowned repo is a 404; otherwise move repo_id and refresh repo_path.
+    if (input.repo_id !== undefined && input.repo_id !== "" && input.repo_id !== cur.repo_id) {
+      if (m.target === "issue")
+        throw new ApiError(422, "repointing an issue-target schedule is not supported; delete and recreate it against the new repo");
+      const repo = repos.find((r) => r.id === input.repo_id);
+      if (!repo) throw new ApiError(404, "repo not found");
+      m.repo_id = repo.id;
+      m.repo_path = repo.path_with_namespace;
+    }
     // Re-null the fields the (possibly changed) target/timing does not use, so the
     // stored shape matches the DB's field-presence CHECK.
     m.issue_iid = m.target === "issue" ? m.issue_iid : null;

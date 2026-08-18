@@ -957,7 +957,7 @@ export interface Schedule {
 
 // ScheduleInput is the create/patch body (apitypes.ScheduleRequest). On create,
 // omitted flags take their server defaults (auto_approve=true per Decision 4,
-// wait_on_limit=false, enabled=true). On PATCH a field present is applied and an
+// wait_on_limit=true, enabled=true). On PATCH a field present is applied and an
 // absent one is left unchanged, so a per-row enable toggle sends just { enabled }.
 export interface ScheduleInput {
   target?: ScheduleTarget;
@@ -981,6 +981,10 @@ export interface ScheduleInput {
   // PRD #305 opt-in; omitted ≡ false (server replace-semantics). The modal always sends it.
   override_subagent_model?: boolean;
   enabled?: boolean;
+  // Repoint the schedule to another repo (PATCH only, PRD #344). A non-empty value moves
+  // the schedule to that repo; the create path ignores it (repo comes from the URL). An
+  // issue-target schedule cannot be repointed (server 422).
+  repo_id?: string;
 }
 
 // SchedulePreviewInput asks for a live "next fires" preview from a timing spec
