@@ -1,129 +1,86 @@
-# uzi e2e: KinD chart-install smoke (ported from the retired GitLab `e2e:kind-smoke`,
-# PRD #52 M8). Installs the uzi Helm chart into an ephemeral KinD cluster and runs
-# scripts/smoke.sh through the web nginx -> api reverse proxy, catching chart / CRD /
-# wiring / boot breaks that `helm template` cannot.
+# uzi nightly compose E2E: runs e2e/run-e2e.sh, the full agent-runtime end-to-end
+# harness (isolated compose stack, DUMMY credentials, STUB executor) that NO other
+# CI job runs. ci.yml only builds the images --no-push and exercises store SQL;
+# kind-smoke.yml is a KinD chart-install smoke through nginx -> api. Neither drives the run
+# lifecycle (worker join -> plan gate -> approve -> stub implement -> MR open ->
+# restart-resilience/SIGKILL -> cancel -> MR-close watcher -> bounded concurrency),
+# which is exactly the path this harness covers. Since the team went k8s-first
+# (2026-07-18) the compose path is exercised less by hand, so a nightly guards it
+# against silent bit-rot.
 #
-# FULLY CREDENTIAL-LESS: no secrets, no registry. The api + web images are built
-# locally and `kind load`ed; the CNPG operator + postgres image are public. Hence
-# top-level `permissions: contents: read`, no `secrets:`, no `environment:`.
+# FULLY CREDENTIAL-LESS: the stub executor needs no Anthropic token and no real
+# forge (forge-fake stands in), so no `secrets:` beyond the built-in GITHUB_TOKEN,
+# which is used ONLY to open/update a single failure-tracking issue (issues: write).
+# The optional live `sdk` capstone (UZI_E2E_EXECUTOR=sdk) stays manual.
 #
-# PROTECTED-REF EQUIVALENT: runs on push to main and on `v*` tags (the refs the
-# GitLab job's `CI_COMMIT_REF_PROTECTED` gate covered), plus manual dispatch to smoke
-# a branch on demand. Deliberately NOT on pull_request: a KinD smoke is heavy and the
-# PR gate (ci.yml) already builds the images `--no-push`, so PR coverage is the build,
-# not the deploy. On GitHub-hosted runners kind runs on the runner's own Docker (no
-# privileged DinD service), so the GitLab job's DinD host-rewrite is not needed.
-#
-# The GitLab job had a tar-artifact fast path (build:api/web published kind-loadable
-# tars on main; e2e loaded them). GitHub runs each workflow in its own VM, so there is
-# no cross-workflow artifact to reuse here without extra plumbing -- this job builds
-# both images itself, which is exactly what the GitLab job's tag/local FALLBACK did.
+# Scheduled (deep night, Europe/Bucharest) plus manual dispatch. Deliberately NOT on
+# push/pull_request: the harness builds four images and runs a multi-phase suite, far
+# too heavy for a per-change gate.
 
 name: E2E
 
 # Quoted so yamllint's `truthy` rule does not read the key as the boolean `on`.
 "on":
-  push:
-    branches: [main]
-    tags: ["v*"]
+  schedule:
+    # 01:17 UTC == 03:17 EET / 04:17 EEST. Off the top of the hour to avoid the
+    # scheduler's high-load contention. Adjust freely.
+    - cron: "17 1 * * *"
   workflow_dispatch: {}
 
 permissions:
   contents: read
+  issues: write
 
 concurrency:
-  group: e2e-${{ github.ref }}
-  cancel-in-progress: true
+  group: e2e-nightly
+  cancel-in-progress: false
 
 jobs:
-  kind-smoke:
+  compose-e2e:
     runs-on: ubuntu-latest
+    # A hung stack must not burn the runner budget; a healthy run is well under this.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
-      # Build the api + web images the chart runs. api context is api/ (its own
-      # .dockerignore); web context is the repo ROOT so the Dockerfile can bundle
-      # docs/ (the root .dockerignore applies). Both tagged :kind, which
-      # deploy/values/kind-smoke.yaml pins with imagePullPolicy: IfNotPresent so no
-      # registry is ever consulted.
-      - name: Build api + web images for kind
-        run: |
-          set -euo pipefail
-          docker build -t uzi-api:kind ./api
-          docker build -t uzi-web:kind -f web/Dockerfile .
-
-      # kind cluster on the runner's Docker. node_image is digest-pinned to the same
-      # v1.34.0 node the GitLab job used.
-      - name: Create KinD cluster
-        uses: helm/kind-action@v1
+      # run-e2e.sh's PRD #97 M2 CLI leg builds api/cmd/uzi on the host, so `go` must
+      # be on PATH. Pinned to the same toolchain ci.yml uses. node/docker/compose/jq/
+      # curl/openssl are all preinstalled on ubuntu-latest.
+      - uses: actions/setup-go@v5
         with:
-          cluster_name: uzi-e2e
-          node_image: kindest/node:v1.34.0@sha256:7416a61b42b1662ca6ca89f02028ac133a309a2a30ba309614e8ec94d976dc5a
-          wait: 150s
+          go-version: "1.26"
 
-      - name: Load images into kind
-        run: |
-          set -euo pipefail
-          kind load docker-image uzi-api:kind --name uzi-e2e
-          kind load docker-image uzi-web:kind --name uzi-e2e
+      - name: Run compose E2E (stub executor)
+        run: ./e2e/run-e2e.sh
 
-      - name: Setup Helm
-        uses: azure/setup-helm@v4
-        with:
-          version: v3.21.3
-
-      # Public CNPG operator, the SAME minor dev-cluster runs, pinned to a fixed
-      # release-asset URL (not a moving branch). Wait for the controller before the
-      # chart creates the Cluster CR.
-      - name: Install CNPG operator
-        run: |
-          set -euo pipefail
-          kubectl apply --server-side -f \
-            "https://github.com/cloudnative-pg/cloudnative-pg/releases/download/v1.23.5/cnpg-1.23.5.yaml"
-          kubectl -n cnpg-system rollout status deploy/cnpg-controller-manager --timeout=180s
-
-      # existing-secrets mode: pre-create uzi-secrets with RANDOM valid keys (the api
-      # refuses placeholder keys). The CNPG operator generates the -app DB secret.
-      - name: Create namespace + secrets
-        run: |
-          set -euo pipefail
-          kubectl create namespace uzi
-          kubectl -n uzi create secret generic uzi-secrets \
-            --from-literal=UZI_SECRET_KEY="$(openssl rand -base64 32)" \
-            --from-literal=JWT_SECRET="$(openssl rand -hex 64)"
-
-      - name: helm install
-        run: |
-          set -euo pipefail
-          # Vendor the CNPG subchart (gitignored; Chart.lock pins it) before install.
-          helm dependency build deploy/chart
-          helm install uzi deploy/chart -n uzi -f deploy/values/kind-smoke.yaml
-
-      - name: Wait for workloads
-        run: |
-          set -euo pipefail
-          kubectl -n uzi wait --for=condition=Ready cluster/postgres-uzi-cluster --timeout=300s
-          kubectl -n uzi wait --for=condition=Available deploy/uzi-api --timeout=300s
-          kubectl -n uzi wait --for=condition=Available deploy/uzi-web --timeout=180s
-
-      # Smoke through the web nginx -> api reverse proxy (validates the k8s nginx.conf).
-      - name: Smoke
-        run: |
-          set -euo pipefail
-          kubectl -n uzi port-forward svc/uzi-web 8088:80 >/tmp/pf.log 2>&1 &
-          for _ in $(seq 1 40); do
-            curl -fsS http://127.0.0.1:8088/api/health >/dev/null 2>&1 && break
-            sleep 1
-          done
-          BASE=http://127.0.0.1:8088 bash scripts/smoke.sh
-
-      # On failure, dump what the cluster looked like -- there is no interactive
-      # kubeconfig to poke at after the job ends.
-      - name: Diagnostics (on failure)
+      # On failure, keep exactly ONE open issue: comment on the existing one, else open
+      # it. Uses the built-in GITHUB_TOKEN (no PAT). The label is upserted first so the
+      # `gh issue list --label` lookup cannot error on a missing label.
+      - name: Open or update failure issue
         if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          kubectl -n uzi get pods -o wide || true
-          kubectl -n uzi describe pods || true
-          kubectl -n uzi get events --sort-by=.lastTimestamp || true
-          kubectl -n uzi logs -l app.kubernetes.io/name=uzi --all-containers --tail=200 || true
-          cat /tmp/pf.log || true
+          set -euo pipefail
+          LABEL="nightly-e2e"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          gh label create "$LABEL" \
+            --description "Nightly compose E2E (e2e/run-e2e.sh) failures" \
+            --color B60205 --force
+
+          existing="$(gh issue list --state open --label "$LABEL" \
+            --json number --jq '.[0].number // empty')"
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" \
+              --body "Nightly compose E2E failed again on \`${GITHUB_SHA}\`. Run: ${RUN_URL}"
+          else
+            gh issue create \
+              --title "Nightly compose E2E (run-e2e.sh) failing" \
+              --label "$LABEL" \
+              --body "$(printf '%s\n\n%s\n%s\n' \
+                'The nightly compose E2E harness (e2e/run-e2e.sh) failed. This path is not covered by any per-change CI job (see the workflow header).' \
+                "First failing run: ${RUN_URL}" \
+                "Commit: ${GITHUB_SHA}")"
+          fi
