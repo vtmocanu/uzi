@@ -2008,7 +2008,14 @@ pass "the Bearer-WS-triggered approve drove RUN_WSB to completed"
 # #42 stays on insteadOf. We restore insteadOf before any later phase, which all rely on
 # the local bare.
 say "PRD #97 M1: worker pushes the agent branch over git-over-HTTPS Basic auth (default coverage)"
-: > "$RUNROOT/agent-gitconfig/gitconfig"   # drop insteadOf ⇒ the worker's git speaks smart-HTTP to forge-fake
+# Drop insteadOf ⇒ the worker's git speaks smart-HTTP to forge-fake. Keep safe.directory:
+# this file is the worker's GIT_CONFIG_GLOBAL, and the worker runs with GIT_CONFIG_NOSYSTEM=1
+# (agent/src/git.ts), so global scope here is the ONLY place git will honour safe.directory
+# for the local-bare pushes the later phases do — every rewrite of this file must re-carry it.
+cat > "$RUNROOT/agent-gitconfig/gitconfig" <<'EOF'
+[safe]
+	directory = *
+EOF
 # POSITIVE transport control: forge-fake's git bare (/gitroot/repo.git) is the SAME host
 # dir as the local-path bare (/fakeremote/repo.git), so "branch present" alone cannot tell
 # a smart-HTTP push from a local one. Snapshot forge-fake's authenticated-push counter
@@ -2052,10 +2059,18 @@ pass "git smart-HTTP auth gate is real: no credential -> 401, correct Basic -> 2
 # smart-HTTP, so leave it empty — restoring insteadOf here would silently flip the rest of
 # that run back to local, breaking its intent (and the #42 shared-bare assertion).
 if [ -n "${E2E_GIT_SMART_HTTP:-}" ]; then
-  : > "$RUNROOT/agent-gitconfig/gitconfig"
+  cat > "$RUNROOT/agent-gitconfig/gitconfig" <<'EOF'
+[safe]
+	directory = *
+EOF
   pass "kept the smart-HTTP remote (E2E_GIT_SMART_HTTP: the whole suite stays on smart-HTTP)"
 else
+  # safe.directory MUST be re-carried here (see the M1 rewrite note above): the remaining
+  # phases push to the local bare, and the worker's GIT_CONFIG_NOSYSTEM=1 means this global
+  # file is the only scope git honours safe.directory from for the dubious-ownership check.
   cat > "$RUNROOT/agent-gitconfig/gitconfig" <<'EOF'
+[safe]
+	directory = *
 [url "/fakeremote/repo.git"]
 	insteadOf = https://forge-fake.e2e/group/repo.git
 [url "/fakeremote/repo2.git"]
