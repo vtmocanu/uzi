@@ -813,12 +813,32 @@ if [ -n "${E2E_GIT_SMART_HTTP:-}" ]; then
   # Fidelity variant: leave the clone/push URL pointing at forge-fake's git
   # smart-HTTP endpoint (no insteadOf), so the worker's git-over-HTTPS Basic auth
   # is genuinely exercised (forge-fake 401s without a valid Authorization: Basic).
-  : > "$RUNROOT/agent-gitconfig/gitconfig"
+  # safe.directory=* is carried even here: this file is the worker's
+  # GIT_CONFIG_GLOBAL (a global-scope config FILE), the ONLY scope git honours
+  # safe.directory from — gitEnv()'s inline `-c`-scope pin is ignored by design.
+  # See the default-branch note below for why the file (not the pin) is load-bearing.
+  cat > "$RUNROOT/agent-gitconfig/gitconfig" <<'EOF'
+[safe]
+	directory = *
+EOF
   GIT_MODE="smart-HTTP (Basic auth exercised)"
 else
   # Default: rewrite the https clone/push URL to the local bare remote (fast,
   # hermetic; does NOT exercise git-over-HTTPS auth — see README).
+  #
+  # safe.directory=* is REQUIRED here, not optional: the worker pushes to the local
+  # bare /fakeremote/repo.git, whose bind-mounted host dir has an owner uid that
+  # differs from the in-container uid on a CI runner (they happen to match on a dev
+  # laptop, which is why this passed locally for a long time). git then trips
+  # `detected dubious ownership` on the bare and refuses the push. gitEnv() DOES pin
+  # safe.directory=* inline, but git honours safe.directory ONLY from system/global
+  # config scope and ignores it at `-c`/GIT_CONFIG_COUNT scope by design — so the pin
+  # is a no-op for the ownership check and the trust MUST live in this file, which is
+  # the worker's GIT_CONFIG_GLOBAL (a global-scope file). This mirrors exactly what
+  # the `neutral` config below already does for the harness's own git probes.
   cat > "$RUNROOT/agent-gitconfig/gitconfig" <<'EOF'
+[safe]
+	directory = *
 [url "/fakeremote/repo.git"]
 	insteadOf = https://forge-fake.e2e/group/repo.git
 [url "/fakeremote/repo2.git"]
