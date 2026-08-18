@@ -11,5 +11,15 @@ WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+# The bind-mounted bare under /gitroot is owned by the host/runner uid, which
+# differs from this container's (root) uid on a CI runner (they match on a dev
+# laptop, which is why the smart-HTTP git phase passed locally but 500s in CI).
+# git-http-backend's upload-pack/receive-pack then trips 'detected dubious
+# ownership' on /gitroot/repo.git and returns 500. Trust it at SYSTEM scope --
+# the only scope besides global that git honours safe.directory from, and
+# GIT_CONFIG_NOSYSTEM is never set here so /etc/gitconfig is read. This is a
+# throwaway test image, so a blanket '*' is fine; it mirrors the client-side
+# safe.directory fix in run-e2e.sh's worker GIT_CONFIG_GLOBAL.
+RUN git config --system --add safe.directory '*'
 COPY forge-fake.mjs ./
 ENTRYPOINT ["node", "forge-fake.mjs"]
