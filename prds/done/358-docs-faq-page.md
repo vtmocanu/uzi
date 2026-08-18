@@ -53,7 +53,7 @@ exactly these answers (light wording polish is fine).
 
 ### M1 — Create the FAQ page with its first entry (~2 min)
 
-- [ ] Create `docs/faq.md` starting with this exact frontmatter:
+- [x] Create `docs/faq.md` starting with this exact frontmatter:
   ```
   ---
   title: FAQ
@@ -61,16 +61,16 @@ exactly these answers (light wording polish is fine).
   audience: user
   ---
   ```
-- [ ] Add a short intro line and the first Q&A:
+- [x] Add a short intro line and the first Q&A:
   - **What is uzi?** uzi ("Uzinele Întunecate") is an AI dark factory: agents pick
     up `PRD`-labeled issues on your connected forge and work them end to end (plan →
     approval gate → implement ⇄ review → branch + merge request), never touching
     `main`.
-- [ ] Run `node web/scripts/check-docs.mjs`; it must exit 0.
+- [x] Run `node web/scripts/check-docs.mjs`; it must exit 0.
 
 ### M2 — Add two more Q&As (~2 min)
 
-- [ ] Append two more Q&As to `docs/faq.md`, keeping the body ≤ 60 lines:
+- [x] Append two more Q&As to `docs/faq.md`, keeping the body ≤ 60 lines:
   - **Which forges does uzi support?** GitLab, GitHub, and Forgejo/Gitea — one forge
     driver each. You connect one forge per account.
   - **Does uzi ever push to `main`?** No. Four independent guardrail layers keep
@@ -78,15 +78,15 @@ exactly these answers (light wording polish is fine).
     the agent) holding the PAT, an SDK deny-hook that blocks `git push` and history
     rewrites, and `settingSources: []` so a cloned repo's own `.claude/` is never
     loaded. Agents only open merge requests from `agent/*` branches.
-- [ ] Re-run `node web/scripts/check-docs.mjs`; it must exit 0.
+- [x] Re-run `node web/scripts/check-docs.mjs`; it must exit 0.
 
 ### M3 — Link the FAQ from Getting started (~2 min)
 
-- [ ] In `docs/getting-started.md`, add one inline doc-to-doc link to the new page,
+- [x] In `docs/getting-started.md`, add one inline doc-to-doc link to the new page,
   e.g. a short line such as: `See the [FAQ](./faq.md) for quick answers.` Place it
   where it reads naturally (a "Next steps" / closing spot is fine); do not restructure
   the page.
-- [ ] Re-run `node web/scripts/check-docs.mjs`; it must exit 0 (this proves the
+- [x] Re-run `node web/scripts/check-docs.mjs`; it must exit 0 (this proves the
   doc-to-doc link resolves).
 
 ## Success criteria
