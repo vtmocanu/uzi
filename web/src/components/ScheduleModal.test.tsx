@@ -224,6 +224,92 @@ describe('the "apply model also to agents" toggle (PRD #305)', () => {
   });
 });
 
+describe("the create-only Enabled toggle (PRD #344 Feature B)", () => {
+  it("renders the Enabled toggle in create mode", () => {
+    renderModal();
+    const toggle = screen.getByRole("switch", { name: "Enabled" });
+    expect(toggle).toBeTruthy();
+    // Default is on (a schedule is created active unless the user turns it off).
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("does NOT render the Enabled toggle in edit mode", () => {
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture()} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    // Edit-mode enable/disable is the job of pause/resume, so the toggle is absent.
+    expect(screen.queryByRole("switch", { name: "Enabled" })).toBeNull();
+  });
+
+  it("toggling it off and submitting a create sends enabled: false", async () => {
+    mockApi.listRepos.mockResolvedValue({
+      repos: [{ id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" }] as unknown as Awaited<
+        ReturnType<typeof api.listRepos>
+      >["repos"],
+    });
+    mockApi.createSchedule.mockResolvedValue(schedFixture({ enabled: false }));
+    renderModal();
+
+    // Wait for the repo picker to seed repoId from the loaded repos.
+    await waitFor(() => expect(mockApi.listRepos).toHaveBeenCalled());
+
+    // Default target = issue: give it a valid issue number so the form can submit.
+    fireEvent.change(screen.getByLabelText("Issue number"), { target: { value: "142" } });
+
+    // Turn Enabled off, then create.
+    fireEvent.click(screen.getByRole("switch", { name: "Enabled" }));
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: "Enabled" }).getAttribute("aria-checked")).toBe("false"),
+    );
+
+    const createBtn = screen.getByRole("button", { name: "Create schedule" });
+    await waitFor(() => expect(createBtn.hasAttribute("disabled")).toBe(false));
+    fireEvent.click(createBtn);
+
+    await waitFor(() => expect(mockApi.createSchedule).toHaveBeenCalled());
+    // createSchedule(repoId, input): the input is the second arg.
+    expect(mockApi.createSchedule.mock.calls[0]?.[1]?.enabled).toBe(false);
+  });
+
+  it("leaves enabled default (true) in the created input when untouched", async () => {
+    mockApi.listRepos.mockResolvedValue({
+      repos: [{ id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" }] as unknown as Awaited<
+        ReturnType<typeof api.listRepos>
+      >["repos"],
+    });
+    mockApi.createSchedule.mockResolvedValue(schedFixture());
+    renderModal();
+
+    await waitFor(() => expect(mockApi.listRepos).toHaveBeenCalled());
+    fireEvent.change(screen.getByLabelText("Issue number"), { target: { value: "142" } });
+
+    const createBtn = screen.getByRole("button", { name: "Create schedule" });
+    await waitFor(() => expect(createBtn.hasAttribute("disabled")).toBe(false));
+    fireEvent.click(createBtn);
+
+    await waitFor(() => expect(mockApi.createSchedule).toHaveBeenCalled());
+    expect(mockApi.createSchedule.mock.calls[0]?.[1]?.enabled).toBe(true);
+  });
+
+  it("an EDIT submit never sends enabled (enable/disable stays pause/resume)", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture());
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture({ auto_approve: true })} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    // Make a config change (flip a run option) so this is a real edit submit.
+    fireEvent.click(screen.getByRole("switch", { name: "Auto-approve the plan" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    // buildInput guards enabled to create-only, so an edit leaves it absent (undefined).
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.enabled).toBeUndefined();
+  });
+});
+
 describe("the Next fires preview renders from the mocked endpoint", () => {
   it("shows the server-computed fires, not a client guess", async () => {
     const future = new Date(Date.now() + 2 * 86_400_000 + 3 * 3_600_000).toISOString();

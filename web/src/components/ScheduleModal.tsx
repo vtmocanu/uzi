@@ -195,6 +195,10 @@ export function ScheduleModal({
 
   const [waitOnLimit, setWaitOnLimit] = useState<boolean>(editing?.wait_on_limit ?? true);
   const [autoApprove, setAutoApprove] = useState<boolean>(editing?.auto_approve ?? true);
+  // Create-only enabled/disabled toggle (PRD #344 Feature B): lets a schedule be created
+  // already paused. Edit-mode enable/disable stays the job of pause/resume, so this state
+  // seeds from editing but is only ever SENT on create (see buildInput).
+  const [enabled, setEnabled] = useState<boolean>(editing?.enabled ?? true);
   // Sweep-only cap on issues per fire; null = unlimited. New sweeps default to 10
   // (agreeing with the server), an edit reflects the stored value (null included).
   const [maxIssues, setMaxIssues] = useState<number | null>(editing ? editing.max_issues : 10);
@@ -401,6 +405,9 @@ export function ScheduleModal({
     model: model.trim() === "" ? null : model,
     // PRD #305: apply the run model to every subagent. Always sent (replace-semantics).
     override_subagent_model: overrideSubagentModel,
+    // Sent only on create; on edit, enable/disable is pause/resume, so leave it absent
+    // (undefined) here to avoid re-flipping enabled during a config edit.
+    enabled: isEdit ? undefined : enabled,
   });
 
   const submit = async (e: React.FormEvent) => {
@@ -754,6 +761,17 @@ export function ScheduleModal({
                 </span>
               </span>
             </div>
+            {!isEdit && (
+              <div className="flex items-start gap-3">
+                <Toggle checked={enabled} onChange={setEnabled} label="Enabled" />
+                <span className="text-[13px] text-fg">
+                  Enabled
+                  <span className="block text-[11px] text-faint">
+                    Off = create the schedule paused; it won't fire until you resume it.
+                  </span>
+                </span>
+              </div>
+            )}
           </div>
 
           {/* Next fires preview */}
