@@ -21315,3 +21315,35 @@ phase, which previously both rendered an identical "running" badge. Full rationa
   agent is still "working".
 - **One accepted cosmetic transient.** An autopilot/self_improve run reads "planning" for the single turn
   between auto-approve and its first iteration report, then self-corrects.
+
+# PRD #344 — Schedule repo repoint + create enabled/disabled control
+
+Extends the PRD #241 schedule model (§496–501): let `PATCH /api/schedules/{id}` change a schedule's
+`repo_id` (previously never touched), and let create start a schedule already-paused. Full rationale
+in the Decision Log of `prds/done/344-schedule-repo-repoint-enabled.md` (D1–D7, risks S1/S3) — this
+section records only the durable design shape.
+
+## 555. PRD #344 — repoint eligibility mirrors create (ownership-only), but an issue-target schedule is restricted (422)
+
+- **Repoint validates like create: owner-scoped, nothing more.** A `repo_id` change is accepted iff the
+  new repo passes `GetRepoForUser` (owner-scoped) → 404 on a foreign/absent repo, the same check create
+  uses. No `enabled`/guardrail/blocked-repo gate is added at repoint; those run at FIRE time (§497), so
+  repointing never re-litigates fire eligibility. This keeps §496's "`PATCH` with only `enabled` set is a
+  pure pause/resume" claim intact — a repoint is a distinct PATCH that carries `repo_id`.
+- **`mergeSchedule` seeds `repo_id` keep-on-empty, NOT replace-semantics.** Unlike `max_issues`/`guidance`/
+  `model` (which a PATCH clears when omitted), an omitted `repo_id` retains the current row's value because
+  the column is NOT NULL + FK. Do not "unify" it with the replace fields.
+- **An issue-target schedule CANNOT be repointed — 422 restrict (D4).** When the merged `target=issue` and
+  `repo_id` changes, the server returns 422. `issue_iid` is repo-relative and forge IIDs are small
+  sequential per-project integers, so a repoint would very likely resolve a *different, unrelated* issue at
+  the same IID and, under `auto_approve` (default true), run it to an MR — silent wrong work. The CLI
+  surfaces the 422; the web disables the repo selector for issue targets and gates the request field so the
+  UI never provokes it. Decided on best judgment following the PRD's own recommendation, the human being
+  unavailable at the approval gate.
+
+## 556. PRD #344 — create can start a schedule paused (`enabled` control on CLI + web)
+
+`uzi schedule create` gained `--enabled` and the web create form gained an enabled/disabled toggle, so a
+schedule can be created already-paused; `uzi schedule edit` gained `--repo` for the repoint above. The
+server already honored a supplied `Enabled` on create — this exposed it on the two clients, no API/schema
+change.

@@ -378,6 +378,35 @@ func TestScheduleCreateNoApplyModelToAgents(t *testing.T) {
 	}
 }
 
+// TestScheduleCreateEnabledFalse (PRD #344 Feature B): --enabled=false is forwarded as a
+// non-nil false so the schedule is created already paused.
+func TestScheduleCreateEnabledFalse(t *testing.T) {
+	fc := &uzicli.FakeClient{CreatedSchedule: apitypes.ScheduleDTO{ID: "sch_ef"}}
+	_, _, code := runCLI(t, fakeEnv(fc),
+		"schedule", "create", "--repo", "r1", "--issue", "158", "--enabled=false",
+		"--at", "2026-08-08T09:00:00Z")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if req := fc.LastCreateSchedReq; req.Enabled == nil || *req.Enabled {
+		t.Errorf("enabled = %v, want a non-nil false", req.Enabled)
+	}
+}
+
+// TestScheduleCreateNoEnabled: an omitted --enabled stays absent (nil), so the server's
+// create default (enabled=true) governs rather than a client-forced value.
+func TestScheduleCreateNoEnabled(t *testing.T) {
+	fc := &uzicli.FakeClient{CreatedSchedule: apitypes.ScheduleDTO{ID: "sch_ne"}}
+	_, _, code := runCLI(t, fakeEnv(fc),
+		"schedule", "create", "--repo", "r1", "--issue", "158", "--at", "2026-08-08T09:00:00Z")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if req := fc.LastCreateSchedReq; req.Enabled != nil {
+		t.Errorf("enabled = %v, want nil (omitted flag stays absent)", req.Enabled)
+	}
+}
+
 // TestScheduleGetDetailShowsApplyModelToAgents: the detail block carries an
 // APPLY_MODEL_TO_AGENTS row rendered from the *bool (true when set-and-on, false otherwise).
 func TestScheduleGetDetailShowsApplyModelToAgents(t *testing.T) {
@@ -564,6 +593,7 @@ func editSweepFixture(id string) *uzicli.FakeClient {
 		ScheduleByID: map[string]apitypes.ScheduleDTO{
 			id: {
 				ID:          id,
+				RepoID:      "11111111-1111-1111-1111-111111111111",
 				Target:      "sweep",
 				Labels:      []string{"bug", "p1"},
 				Timing:      "recurring",
@@ -661,6 +691,33 @@ func TestScheduleEditSurvivesUntouched(t *testing.T) {
 	}
 	if req.Enabled != nil {
 		t.Errorf("enabled = %v, want nil (pause flag untouched)", req.Enabled)
+	}
+}
+
+// TestScheduleEditRepo: --repo repoints the schedule (its id lands in the patched
+// RepoID), while omitting --repo leaves RepoID empty so the keep-on-empty server merge
+// preserves the stored repo — the rebuild never restates s.RepoID.
+func TestScheduleEditRepo(t *testing.T) {
+	const newRepo = "22222222-2222-2222-2222-222222222222"
+
+	// --repo present: the value lands in the patched request.
+	fc := editSweepFixture("sch_e")
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_e", "--repo", newRepo)
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	if fc.LastPatchSchedReq.RepoID != newRepo {
+		t.Errorf("repo_id = %q, want %q", fc.LastPatchSchedReq.RepoID, newRepo)
+	}
+
+	// --repo omitted: RepoID stays empty (keep-on-empty preserves the stored repo).
+	fc2 := editSweepFixture("sch_e")
+	_, errOut2, code2 := runCLI(t, fakeEnv(fc2), "schedule", "edit", "sch_e", "--cron", "0 4 * * 2")
+	if code2 != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code2, errOut2)
+	}
+	if fc2.LastPatchSchedReq.RepoID != "" {
+		t.Errorf("repo_id = %q, want empty when --repo is not passed", fc2.LastPatchSchedReq.RepoID)
 	}
 }
 

@@ -10,6 +10,11 @@ import { MemoryRouter } from "react-router-dom";
 import { ScheduleModal } from "./ScheduleModal";
 import { api, type Schedule } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
+// The REAL mock (distinct from the vi.mock'd `api` above) — used to exercise the mock's
+// own updateSchedule repoint branch directly. It ships seeded schedules/repos and starts
+// signed in as admin, so no session setup is needed. ApiError survives the api vi.mock
+// (importOriginal spreads the real one), so its 422/404 rejections match by `status`.
+import { mockApi as realMockApi } from "../mocks/mockApi";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
@@ -221,6 +226,241 @@ describe('the "apply model also to agents" toggle (PRD #305)', () => {
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
     await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
     expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.override_subagent_model).toBe(true);
+  });
+});
+
+describe("the create-only Enabled toggle (PRD #344 Feature B)", () => {
+  it("renders the Enabled toggle in create mode", () => {
+    renderModal();
+    const toggle = screen.getByRole("switch", { name: "Enabled" });
+    expect(toggle).toBeTruthy();
+    // Default is on (a schedule is created active unless the user turns it off).
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("does NOT render the Enabled toggle in edit mode", () => {
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture()} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    // Edit-mode enable/disable is the job of pause/resume, so the toggle is absent.
+    expect(screen.queryByRole("switch", { name: "Enabled" })).toBeNull();
+  });
+
+  it("toggling it off and submitting a create sends enabled: false", async () => {
+    mockApi.listRepos.mockResolvedValue({
+      repos: [{ id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" }] as unknown as Awaited<
+        ReturnType<typeof api.listRepos>
+      >["repos"],
+    });
+    mockApi.createSchedule.mockResolvedValue(schedFixture({ enabled: false }));
+    renderModal();
+
+    // Wait for the repo picker to seed repoId from the loaded repos.
+    await waitFor(() => expect(mockApi.listRepos).toHaveBeenCalled());
+
+    // Default target = issue: give it a valid issue number so the form can submit.
+    fireEvent.change(screen.getByLabelText("Issue number"), { target: { value: "142" } });
+
+    // Turn Enabled off, then create.
+    fireEvent.click(screen.getByRole("switch", { name: "Enabled" }));
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: "Enabled" }).getAttribute("aria-checked")).toBe("false"),
+    );
+
+    const createBtn = screen.getByRole("button", { name: "Create schedule" });
+    await waitFor(() => expect(createBtn.hasAttribute("disabled")).toBe(false));
+    fireEvent.click(createBtn);
+
+    await waitFor(() => expect(mockApi.createSchedule).toHaveBeenCalled());
+    // createSchedule(repoId, input): the input is the second arg.
+    expect(mockApi.createSchedule.mock.calls[0]?.[1]?.enabled).toBe(false);
+  });
+
+  it("leaves enabled default (true) in the created input when untouched", async () => {
+    mockApi.listRepos.mockResolvedValue({
+      repos: [{ id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" }] as unknown as Awaited<
+        ReturnType<typeof api.listRepos>
+      >["repos"],
+    });
+    mockApi.createSchedule.mockResolvedValue(schedFixture());
+    renderModal();
+
+    await waitFor(() => expect(mockApi.listRepos).toHaveBeenCalled());
+    fireEvent.change(screen.getByLabelText("Issue number"), { target: { value: "142" } });
+
+    const createBtn = screen.getByRole("button", { name: "Create schedule" });
+    await waitFor(() => expect(createBtn.hasAttribute("disabled")).toBe(false));
+    fireEvent.click(createBtn);
+
+    await waitFor(() => expect(mockApi.createSchedule).toHaveBeenCalled());
+    expect(mockApi.createSchedule.mock.calls[0]?.[1]?.enabled).toBe(true);
+  });
+
+  it("an EDIT submit never sends enabled (enable/disable stays pause/resume)", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture());
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture({ auto_approve: true })} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    // Make a config change (flip a run option) so this is a real edit submit.
+    fireEvent.click(screen.getByRole("switch", { name: "Auto-approve the plan" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    // buildInput guards enabled to create-only, so an edit leaves it absent (undefined).
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.enabled).toBeUndefined();
+  });
+});
+
+describe("the edit-mode repo selector (PRD #344 Feature A)", () => {
+  // Two repos so an edit can pick a different one than the schedule's current repo.
+  function twoRepos() {
+    return {
+      repos: [
+        { id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" },
+        { id: "repo-other", path_with_namespace: "vtmocanu/other" },
+      ] as unknown as Awaited<ReturnType<typeof api.listRepos>>["repos"],
+    };
+  }
+
+  it("renders an enabled Repo select when editing a sweep-target schedule", async () => {
+    mockApi.listRepos.mockResolvedValue(twoRepos());
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture()} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    // Repos load in edit mode now, so the picker seeds with both options.
+    await waitFor(() => expect(mockApi.listRepos).toHaveBeenCalled());
+    const select = screen.getByLabelText("Repo") as HTMLSelectElement;
+    expect(select).toBeTruthy();
+    // A sweep schedule can be repointed, so the control is interactive.
+    expect(select.hasAttribute("disabled")).toBe(false);
+    // It prefills the schedule's current repo.
+    await waitFor(() => expect(select.value).toBe("repo-uzi"));
+  });
+
+  it("disables the Repo select and shows a hint for an issue-target schedule", async () => {
+    mockApi.listRepos.mockResolvedValue(twoRepos());
+    render(
+      <MemoryRouter>
+        <ScheduleModal
+          editing={schedFixture({ target: "issue", issue_iid: 142, labels: null })}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(mockApi.listRepos).toHaveBeenCalled());
+    const select = screen.getByLabelText("Repo") as HTMLSelectElement;
+    // An issue target is repo-relative and cannot be repointed (server 422).
+    expect(select.hasAttribute("disabled")).toBe(true);
+    expect(screen.getByText(/can't be repointed/i)).toBeTruthy();
+  });
+
+  it("flows a changed repo selection into repo_id on an edit submit", async () => {
+    mockApi.listRepos.mockResolvedValue(twoRepos());
+    mockApi.updateSchedule.mockResolvedValue(schedFixture({ repo_id: "repo-other", repo_path: "vtmocanu/other" }));
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture()} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(mockApi.listRepos).toHaveBeenCalled());
+    const select = screen.getByLabelText("Repo") as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "repo-other" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.repo_id).toBe("repo-other");
+  });
+
+  it("does NOT send repo_id on create (the repo comes from the URL)", async () => {
+    mockApi.listRepos.mockResolvedValue(twoRepos());
+    mockApi.createSchedule.mockResolvedValue(schedFixture());
+    renderModal();
+
+    await waitFor(() => expect(mockApi.listRepos).toHaveBeenCalled());
+    fireEvent.change(screen.getByLabelText("Issue number"), { target: { value: "142" } });
+
+    const createBtn = screen.getByRole("button", { name: "Create schedule" });
+    await waitFor(() => expect(createBtn.hasAttribute("disabled")).toBe(false));
+    fireEvent.click(createBtn);
+
+    await waitFor(() => expect(mockApi.createSchedule).toHaveBeenCalled());
+    expect(mockApi.createSchedule.mock.calls[0]?.[1]?.repo_id).toBeUndefined();
+  });
+
+  it("does NOT send repo_id when editing an issue-target schedule (target-gate)", async () => {
+    mockApi.listRepos.mockResolvedValue(twoRepos());
+    mockApi.updateSchedule.mockResolvedValue(
+      schedFixture({ target: "issue", issue_iid: 142, labels: null }),
+    );
+    render(
+      <MemoryRouter>
+        <ScheduleModal
+          editing={schedFixture({ target: "issue", issue_iid: 142, labels: null })}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(mockApi.listRepos).toHaveBeenCalled());
+    // An innocuous config change so the edit is a genuine submit.
+    fireEvent.click(screen.getByRole("switch", { name: "Auto-approve the plan" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    // buildInput gates repo_id to non-issue targets, so an issue-target edit never sends
+    // it — closing the path where a user picks a new repo then switches target to issue
+    // and provokes a server 422.
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.repo_id).toBeUndefined();
+  });
+});
+
+describe("the mock updateSchedule repoint branch (PRD #344 Feature A)", () => {
+  // Exercises the REAL mock's repoint logic directly. The component tests above stub
+  // updateSchedule via mockResolvedValue, so the mock's own 422/404/move branch is
+  // otherwise uncovered. Seeded ids: sch-7kd2 (sweep, repo-uzi), sch-3bf1 (issue,
+  // repo-uzi); repos repo-uzi (vtmocanu/uzi) and repo-atlas (vtmocanu/atlas-api).
+  it("moves repo_path for a sweep schedule, and rejects issue-target (422) + unknown repo (404)", async () => {
+    // An issue-target schedule is repo-relative and cannot be repointed.
+    await expect(
+      realMockApi.updateSchedule("sch-3bf1", {
+        target: "issue",
+        timing: "recurring",
+        cron_expr: "0 3 * * *",
+        repo_id: "repo-atlas",
+      }),
+    ).rejects.toMatchObject({ status: 422 });
+
+    // An unknown/unowned repo on a repointable (sweep) schedule is a 404, checked before
+    // the move so the schedule is left untouched.
+    await expect(
+      realMockApi.updateSchedule("sch-7kd2", {
+        target: "sweep",
+        timing: "recurring",
+        cron_expr: "0 9 * * 1",
+        repo_id: "repo-does-not-exist",
+      }),
+    ).rejects.toMatchObject({ status: 404 });
+
+    // A valid repoint moves repo_id and refreshes repo_path (mirrors the server).
+    const moved = await realMockApi.updateSchedule("sch-7kd2", {
+      target: "sweep",
+      timing: "recurring",
+      cron_expr: "0 9 * * 1",
+      repo_id: "repo-atlas",
+    });
+    expect(moved.repo_id).toBe("repo-atlas");
+    expect(moved.repo_path).toBe("vtmocanu/atlas-api");
   });
 });
 

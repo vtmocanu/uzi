@@ -195,6 +195,10 @@ export function ScheduleModal({
 
   const [waitOnLimit, setWaitOnLimit] = useState<boolean>(editing?.wait_on_limit ?? true);
   const [autoApprove, setAutoApprove] = useState<boolean>(editing?.auto_approve ?? true);
+  // Create-only enabled/disabled toggle (PRD #344 Feature B): lets a schedule be created
+  // already paused. Edit-mode enable/disable stays the job of pause/resume, so this state
+  // seeds from editing but is only ever SENT on create (see buildInput).
+  const [enabled, setEnabled] = useState<boolean>(editing?.enabled ?? true);
   // Sweep-only cap on issues per fire; null = unlimited. New sweeps default to 10
   // (agreeing with the server), an edit reflects the stored value (null included).
   const [maxIssues, setMaxIssues] = useState<number | null>(editing ? editing.max_issues : 10);
@@ -265,9 +269,10 @@ export function ScheduleModal({
     }
   };
 
-  // Load repos for the picker (create mode, not pinned). Failure is non-fatal.
+  // Load repos for the picker (create and edit; not pinned). Failure is non-fatal.
+  // In edit mode the `cur ||` below preserves the edit-seeded current repo.
   useEffect(() => {
-    if (isEdit || pinned) return;
+    if (pinned) return;
     let alive = true;
     api
       .listRepos()
@@ -280,7 +285,7 @@ export function ScheduleModal({
     return () => {
       alive = false;
     };
-  }, [isEdit, pinned]);
+  }, [pinned]);
 
   // ── Preset ↔ cron keep-in-sync (Decision 6) ────────────────────────────────
   const applyPreset = useCallback((next: PresetState) => {
@@ -401,6 +406,16 @@ export function ScheduleModal({
     model: model.trim() === "" ? null : model,
     // PRD #305: apply the run model to every subagent. Always sent (replace-semantics).
     override_subagent_model: overrideSubagentModel,
+    // Sent only on create; on edit, enable/disable is pause/resume, so leave it absent
+    // (undefined) here to avoid re-flipping enabled during a config edit.
+    enabled: isEdit ? undefined : enabled,
+    // Repoint (edit only): send the selected repo so a changed selection moves the
+    // schedule. Omitted on create (repo comes from the URL) AND on an issue-target edit —
+    // an issue schedule is repo-relative and the server 422s a repoint, so gate on `target`
+    // (which is editable in edit mode) rather than only the selector's disabled state, or a
+    // user who picks a repo then switches target to issue would provoke that 422. Omitting
+    // it is safe: the server re-seeds repo_id from the current row (keep-on-empty).
+    repo_id: isEdit && target !== "issue" ? repoId : undefined,
   });
 
   const submit = async (e: React.FormEvent) => {
@@ -500,10 +515,16 @@ export function ScheduleModal({
         <div className="max-h-[70vh] space-y-5 overflow-y-auto px-5 py-5">
           {error && <Alert message={error} />}
 
-          {/* Repo picker (create, non-pinned only) */}
-          {!isEdit && !pinned && (
+          {/* Repo picker (non-pinned). In edit mode this repoints the schedule (PRD #344),
+              except for an issue target, which is repo-relative and cannot move. */}
+          {!pinned && (
             <Field label="Repo" htmlFor="sched-repo">
-              <Select id="sched-repo" value={repoId} onChange={(e) => setRepoId(e.target.value)}>
+              <Select
+                id="sched-repo"
+                value={repoId}
+                onChange={(e) => setRepoId(e.target.value)}
+                disabled={isEdit && target === "issue"}
+              >
                 {repos.length === 0 && <option value="">No repos available</option>}
                 {repos.map((r) => (
                   <option key={r.id} value={r.id}>
@@ -511,6 +532,12 @@ export function ScheduleModal({
                   </option>
                 ))}
               </Select>
+              {isEdit && target === "issue" && (
+                <p className="mt-1 text-[11px] text-faint">
+                  An issue-target schedule can't be repointed — its issue number is
+                  repo-specific. Delete and recreate it on the new repo.
+                </p>
+              )}
             </Field>
           )}
 
@@ -754,6 +781,17 @@ export function ScheduleModal({
                 </span>
               </span>
             </div>
+            {!isEdit && (
+              <div className="flex items-start gap-3">
+                <Toggle checked={enabled} onChange={setEnabled} label="Enabled" />
+                <span className="text-[13px] text-fg">
+                  Enabled
+                  <span className="block text-[11px] text-faint">
+                    Off = create the schedule paused; it won't fire until you resume it.
+                  </span>
+                </span>
+              </div>
+            )}
           </div>
 
           {/* Next fires preview */}

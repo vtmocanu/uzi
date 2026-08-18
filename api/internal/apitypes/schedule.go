@@ -5,7 +5,7 @@ import "time"
 // ScheduleRequest is the create/patch input for a run schedule (PRD #241 M4).
 //
 // On CREATE, omitted pointer fields take their documented defaults (auto_approve=true
-// per Decision 4, wait_on_limit=false, enabled=true). On PATCH the pointers carry
+// per Decision 4, wait_on_limit=true, enabled=true). On PATCH the pointers carry
 // "omitted = keep the current value" semantics: a nil AutoApprove/WaitOnLimit/Enabled
 // leaves that flag untouched, so a caller can toggle one field without restating the
 // rest. Timing/target-specific fields (CronExpr, RunAt, Timezone, IssueIID, Labels,
@@ -29,7 +29,12 @@ import "time"
 // inherit the owner default (NULL in the DB). Validated later via agenttmpl.ValidateModel;
 // it carries the same "present, even to clear" replace-semantics on PATCH (see mergeSchedule).
 type ScheduleRequest struct {
-	Target      string     `json:"target"`
+	Target string `json:"target"`
+	// RepoID repoints a schedule to another repo on PATCH (Feature A, PRD #344). It is
+	// honored ONLY on PATCH: CreateSchedule takes the repo from the URL and ignores a
+	// body repo_id, so a create caller has no reason to send it. Empty = keep the current
+	// repo (keep-on-empty in mergeSchedule), NOT replace-semantics.
+	RepoID      string     `json:"repo_id"`
 	IssueIID    *int64     `json:"issue_iid"`
 	Labels      []string   `json:"labels"`
 	Prompt      string     `json:"prompt"`

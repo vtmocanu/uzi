@@ -124,10 +124,10 @@ uzi run follow-up <run-id> [--message <text>]
 uzi run answer <run-id> [--message <text>]
 uzi run inputs <run-id>
 uzi run expedite <run-id> [--clear]
-uzi schedule create --repo <repo-id> (--issue <iid> | --sweep [--label <l>]... | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--auto-approve[=false]] [--wait-on-limit]
+uzi schedule create --repo <repo-id> (--issue <iid> | --sweep [--label <l>]... | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit]
 uzi schedule list
 uzi schedule get <schedule-id>
-uzi schedule edit <schedule-id> [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--auto-approve[=false]] [--wait-on-limit[=false]]
+uzi schedule edit <schedule-id> [--repo <repo-id>] [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--auto-approve[=false]] [--wait-on-limit[=false]]
 uzi schedule pause <schedule-id>
 uzi schedule resume <schedule-id>
 uzi schedule run-now <schedule-id>
@@ -387,6 +387,9 @@ nothing a manual start cannot.
     point of an off-hours schedule); pass `--auto-approve=false` to keep the gate.
     `--wait-on-limit` parks a fired run until the Anthropic usage window reopens instead
     of failing it.
+  - `--enabled` defaults **on**; pass `--enabled=false` to create the schedule already
+    paused (no separate `schedule pause` step, avoiding a brief window where a due schedule
+    could fire).
   - `--max-issues <n>` caps how many issues one `--sweep` fire starts, oldest (lowest
     number) first; defaults to 10, ignored for non-sweep targets. `--max-issues 1` is
     "one issue per fire".
@@ -419,6 +422,10 @@ nothing a manual start cannot.
   model override). At least one field is required. `edit` does NOT change the model
   itself, but it now preserves the stored `--model` and `--apply-model-to-agents` across
   any partial edit (previously a plain retime silently wiped the stored model).
+  `--repo <repo-id>` repoints the schedule to another repo (validated: you must own it,
+  otherwise `404`), preserving the schedule's id and run history; an **issue-target**
+  schedule cannot be repointed (the server rejects it with `422` — delete and recreate
+  for that).
 - `uzi schedule pause <schedule-id>` / `uzi schedule resume <schedule-id>` — stop or
   restart firing without deleting (a `PATCH` of just `enabled`).
 - `uzi schedule run-now <schedule-id>` — fire immediately without disturbing the cadence.
