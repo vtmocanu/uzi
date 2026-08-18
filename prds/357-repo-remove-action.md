@@ -82,10 +82,10 @@ Add an explicit, owner-scoped **remove** action across all three consumers of th
 - Any schema/migration change, and any change to `UpsertRepo` or the repos uniqueness key.
 - The optional stale-flag surface (M5) unless the owner opts in.
 
-## Open decisions (for the user)
+## Resolved decisions
 
-1. **Disabled-only guard (D2) vs allow-delete-with-confirm?** Recommend D2 (safer for CLI/automation). Say if you'd rather allow removing an enabled repo directly.
-2. **Include the optional stale-flag milestone (M5)?** Recommend deferring; the explicit remove solves the reported pain.
+1. **Disabled-only guard (D2): KEEP.** Removal is reachable only from the disabled state — a disabled repo shows a **Remove** button in its row and is deleted in one click (confirm → gone from the list and the DB). An *enabled* repo is not directly removable (409); disable it first. Chosen over allow-delete-enabled-with-confirm because two of the three callers are non-interactive (CLI, auto-approving sweep worker), so a server-side state precondition is the real safety, not a dialog — and the motivating case (a stale duplicate) is already disabled, so the guard adds zero friction there.
+2. **Stale-flag milestone (M5): DEFERRED.** The explicit Remove action solves the reported pain. M5 would need a schema change (record "seen in last fetch") and would touch `ListProjects` — the path D1 deliberately keeps non-pruning — so it is a separate follow-up only if stale rows keep accumulating, not part of this PRD.
 
 ---
 
