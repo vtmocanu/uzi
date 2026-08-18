@@ -19,7 +19,12 @@ runs:
         # honest failure mode; adding arm64 needs a SECOND checksum literal.
         TASK_VERSION="3.51.1"
         TASK_SHA256="da7e92f0ff961ef2aae7cfecbad8d1fd2a08d7b09ba968673adf7ff389b243b5"
+        # Retry transient network failures (e.g. `curl: (35) Connection reset by
+        # peer` mid-download). --retry-all-errors (curl >= 7.71, ubuntu-latest has
+        # >= 7.81) covers connection resets that plain --retry does not; the sha256
+        # check below is unchanged, so resilience never weakens the integrity gate.
         curl -fsSLo /tmp/task.tar.gz \
+          --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 15 \
           "https://github.com/go-task/task/releases/download/v${TASK_VERSION}/task_linux_amd64.tar.gz"
         echo "${TASK_SHA256}  /tmp/task.tar.gz" | sha256sum -c -
         mkdir -p "${HOME}/.task-bin"

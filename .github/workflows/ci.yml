@@ -337,7 +337,11 @@ jobs:
           # 0.11.0 exactly: lint:shell passes this version to lint-shell.sh, which
           # asserts it and exits 2 on any other. 0.10.0 and 0.11.0 are different
           # gates (0.10.0 does not emit SC3067 at all). linux.x86_64 tarball.
+          # Retry transient network failures (connection reset mid-download);
+          # --retry-all-errors covers resets plain --retry does not. The sha256
+          # check below is unchanged, so integrity is unaffected.
           curl -fsSLo /tmp/shellcheck.tar.gz \
+            --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 15 \
             "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.gz"
           echo "b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6  /tmp/shellcheck.tar.gz" | sha256sum -c -
           mkdir -p "${HOME}/.local/bin"
