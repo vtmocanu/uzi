@@ -47,3 +47,5 @@ Register a worker and start a run from a board card: see
   issue run end to end unattended, on your own opt-in.
 - [uzi CLI](./cli.md): drive uzi from the terminal or from an agent/CI job
   instead of the browser.
+- [FAQ](./faq.md): quick, plain-language answers to the questions new readers
+  ask most.
