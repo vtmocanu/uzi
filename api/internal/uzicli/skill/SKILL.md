@@ -127,7 +127,7 @@ uzi run expedite <run-id> [--clear]
 uzi schedule create --repo <repo-id> (--issue <iid> | --sweep [--label <l>]... | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit]
 uzi schedule list
 uzi schedule get <schedule-id>
-uzi schedule edit <schedule-id> [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--auto-approve[=false]] [--wait-on-limit[=false]]
+uzi schedule edit <schedule-id> [--repo <repo-id>] [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--auto-approve[=false]] [--wait-on-limit[=false]]
 uzi schedule pause <schedule-id>
 uzi schedule resume <schedule-id>
 uzi schedule run-now <schedule-id>
@@ -422,6 +422,10 @@ nothing a manual start cannot.
   model override). At least one field is required. `edit` does NOT change the model
   itself, but it now preserves the stored `--model` and `--apply-model-to-agents` across
   any partial edit (previously a plain retime silently wiped the stored model).
+  `--repo <repo-id>` repoints the schedule to another repo (validated: you must own it,
+  otherwise `404`), preserving the schedule's id and run history; an **issue-target**
+  schedule cannot be repointed (the server rejects it with `422` — delete and recreate
+  for that).
 - `uzi schedule pause <schedule-id>` / `uzi schedule resume <schedule-id>` — stop or
   restart firing without deleting (a `PATCH` of just `enabled`).
 - `uzi schedule run-now <schedule-id>` — fire immediately without disturbing the cadence.

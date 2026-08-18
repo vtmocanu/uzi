@@ -349,6 +349,7 @@ func newScheduleEditCmd(env Env, gf *globalFlags) *cobra.Command {
 	edit.Flags().Bool("clear-guidance", false, "clear stored guidance back to none (issue/sweep targets only)")
 	edit.Flags().Bool("clear-max-issues", false, "clear the sweep cap back to unlimited (sweep target only)")
 	edit.Flags().Bool("apply-model-to-agents", false, "set whether the schedule's model also overrides every subagent's model pin")
+	edit.Flags().String("repo", "", "repoint the schedule to another repo by id (sweep/prompt targets; an issue-target schedule cannot be repointed)")
 	return edit
 }
 
@@ -402,6 +403,7 @@ func buildScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO) (apity
 	maxIssuesSet := f.Changed("max-issues")
 	clearGuidance := f.Changed("clear-guidance")
 	clearMaxIssues := f.Changed("clear-max-issues")
+	repoSet := f.Changed("repo")
 
 	// --cron and --at both restate TIMING; at most one may win.
 	if cronSet && atSet {
@@ -492,6 +494,13 @@ func buildScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO) (apity
 	if f.Changed("apply-model-to-agents") {
 		v, _ := f.GetBool("apply-model-to-agents")
 		req.OverrideSubagentModel = &v
+		changed = true
+	}
+	if repoSet {
+		v, _ := f.GetString("repo")
+		// Keep-on-empty in the server merge: only a non-empty value repoints. Trim so a
+		// stray space does not reach the server's uuid.Parse as a malformed id.
+		req.RepoID = strings.TrimSpace(v)
 		changed = true
 	}
 	if !changed {

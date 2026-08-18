@@ -593,6 +593,7 @@ func editSweepFixture(id string) *uzicli.FakeClient {
 		ScheduleByID: map[string]apitypes.ScheduleDTO{
 			id: {
 				ID:          id,
+				RepoID:      "11111111-1111-1111-1111-111111111111",
 				Target:      "sweep",
 				Labels:      []string{"bug", "p1"},
 				Timing:      "recurring",
@@ -690,6 +691,33 @@ func TestScheduleEditSurvivesUntouched(t *testing.T) {
 	}
 	if req.Enabled != nil {
 		t.Errorf("enabled = %v, want nil (pause flag untouched)", req.Enabled)
+	}
+}
+
+// TestScheduleEditRepo: --repo repoints the schedule (its id lands in the patched
+// RepoID), while omitting --repo leaves RepoID empty so the keep-on-empty server merge
+// preserves the stored repo — the rebuild never restates s.RepoID.
+func TestScheduleEditRepo(t *testing.T) {
+	const newRepo = "22222222-2222-2222-2222-222222222222"
+
+	// --repo present: the value lands in the patched request.
+	fc := editSweepFixture("sch_e")
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_e", "--repo", newRepo)
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	if fc.LastPatchSchedReq.RepoID != newRepo {
+		t.Errorf("repo_id = %q, want %q", fc.LastPatchSchedReq.RepoID, newRepo)
+	}
+
+	// --repo omitted: RepoID stays empty (keep-on-empty preserves the stored repo).
+	fc2 := editSweepFixture("sch_e")
+	_, errOut2, code2 := runCLI(t, fakeEnv(fc2), "schedule", "edit", "sch_e", "--cron", "0 4 * * 2")
+	if code2 != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code2, errOut2)
+	}
+	if fc2.LastPatchSchedReq.RepoID != "" {
+		t.Errorf("repo_id = %q, want empty when --repo is not passed", fc2.LastPatchSchedReq.RepoID)
 	}
 }
 
