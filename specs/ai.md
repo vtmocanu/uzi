@@ -15114,7 +15114,10 @@ cannot express by adjacency. *(Deliberately not "across N sections". That count 
 tally over a population this file exists to grow, and the first draft of this sentence
 said **five** where the answer was **eight** — caught by re-checking a number the
 author had carried from their own previous commit rather than derived. The immutable
-version is in `88f0bde7`'s merge message; this is the correction it points to.)*
+version is in `88f0bde7`'s merge message; this is the correction it points to.)* Duplicate
+section numbers are now caught whole-file by `scripts/check-spec-numbering.sh` (run via `task
+gate:repo`), so when you allocate a new number read the highest across the *entire* file rather
+than the tail — the tail is not the maximum, and this gate asserts uniqueness only, never order.
 
 ## 455. PRD #88 — `awaiting_input` is a FIRST-CLASS run status, and `awaiting_approval` could not be reused
 
