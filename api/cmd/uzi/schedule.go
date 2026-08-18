@@ -93,6 +93,7 @@ func newScheduleCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 	create.Flags().String("tz", "UTC", "IANA timezone the --cron expression is interpreted in")
 	create.Flags().Bool("auto-approve", true, "proceed past the plan gate unattended; pass --auto-approve=false to keep the gate")
 	create.Flags().Bool("wait-on-limit", true, "park a fired run until the Anthropic usage window reopens instead of failing it; pass --wait-on-limit=false to fail on limit")
+	create.Flags().Bool("enabled", true, "create the schedule enabled; pass --enabled=false to create it paused")
 	return create
 }
 
@@ -214,6 +215,14 @@ func buildScheduleRequest(cmd *cobra.Command) (apitypes.ScheduleRequest, string,
 	waitOnLimit, _ := cmd.Flags().GetBool("wait-on-limit")
 	req.AutoApprove = &autoApprove
 	req.WaitOnLimit = &waitOnLimit
+
+	// --enabled is only sent when the caller passed it, so an omitted flag stays nil and
+	// the server's create default (enabled=true) applies. Use Changed() rather than the
+	// always-send pointer pattern of --auto-approve so today's default behavior is byte-identical.
+	if cmd.Flags().Changed("enabled") {
+		enabled, _ := cmd.Flags().GetBool("enabled")
+		req.Enabled = &enabled
+	}
 	return req, repoID, nil
 }
 

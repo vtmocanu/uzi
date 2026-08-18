@@ -203,6 +203,14 @@ func TestApplyCreateDefaults(t *testing.T) {
 	if req.AutoApprove == nil || *req.AutoApprove {
 		t.Fatalf("explicit auto_approve=false must be respected, got %v", req.AutoApprove)
 	}
+
+	// Explicit enabled=false (create the schedule paused) is respected, not overwritten
+	// by the ON default (PRD #344 Feature B).
+	req = apitypes.ScheduleRequest{Enabled: &no}
+	applyCreateDefaults(&req)
+	if req.Enabled == nil || *req.Enabled {
+		t.Fatalf("explicit enabled=false must be respected, got %v", req.Enabled)
+	}
 }
 
 // TestApplyCreateDefaultsMaxIssues pins PRD #274 M2: a new SWEEP with no explicit

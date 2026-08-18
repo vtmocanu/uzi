@@ -124,7 +124,7 @@ uzi run follow-up <run-id> [--message <text>]
 uzi run answer <run-id> [--message <text>]
 uzi run inputs <run-id>
 uzi run expedite <run-id> [--clear]
-uzi schedule create --repo <repo-id> (--issue <iid> | --sweep [--label <l>]... | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--auto-approve[=false]] [--wait-on-limit]
+uzi schedule create --repo <repo-id> (--issue <iid> | --sweep [--label <l>]... | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit]
 uzi schedule list
 uzi schedule get <schedule-id>
 uzi schedule edit <schedule-id> [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--auto-approve[=false]] [--wait-on-limit[=false]]
@@ -387,6 +387,9 @@ nothing a manual start cannot.
     point of an off-hours schedule); pass `--auto-approve=false` to keep the gate.
     `--wait-on-limit` parks a fired run until the Anthropic usage window reopens instead
     of failing it.
+  - `--enabled` defaults **on**; pass `--enabled=false` to create the schedule already
+    paused (no separate `schedule pause` step, avoiding a brief window where a due schedule
+    could fire).
   - `--max-issues <n>` caps how many issues one `--sweep` fire starts, oldest (lowest
     number) first; defaults to 10, ignored for non-sweep targets. `--max-issues 1` is
     "one issue per fire".
