@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -267,6 +268,64 @@ func TestMergeScheduleMaxIssuesClears(t *testing.T) {
 	}
 }
 
+// TestMergeScheduleRepoID pins Feature A (PRD #344) keep-on-empty for repo_id: a config
+// PATCH WITHOUT repo_id keeps the current row's repo (the S1 case — an omitted repo must
+// never fall to uuid.Nil and break the FK), while a PATCH WITH repo_id takes the request
+// value. This is deliberately NOT the replace-semantics of max_issues/guidance/model.
+func TestMergeScheduleRepoID(t *testing.T) {
+	repo := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+	cur := store.RunSchedule{
+		Target:   "sweep",
+		Timing:   "recurring",
+		CronExpr: pgtype.Text{String: "0 9 * * 1", Valid: true},
+		Timezone: "UTC",
+		RepoID:   repo,
+	}
+
+	// A config PATCH that omits repo_id must KEEP the current repo (keep-on-empty).
+	kept := mergeSchedule(cur, apitypes.ScheduleRequest{Target: "sweep", Timing: "recurring", CronExpr: "0 9 * * 1"})
+	if kept.RepoID != repo.String() {
+		t.Fatalf("merged repo_id = %q, want %q (keep-on-empty)", kept.RepoID, repo.String())
+	}
+
+	// A config PATCH that sets repo_id takes the request value.
+	newID := "22222222-2222-2222-2222-222222222222"
+	set := mergeSchedule(cur, apitypes.ScheduleRequest{Target: "sweep", Timing: "recurring", CronExpr: "0 9 * * 1", RepoID: newID})
+	if set.RepoID != newID {
+		t.Fatalf("merged repo_id = %q, want %q", set.RepoID, newID)
+	}
+}
+
+// TestScheduleRepoChange pins the pure repoint classifier (Feature A, PRD #344): an
+// unchanged repo is not a repoint (status 0), a malformed id is a 400, a repoint of an
+// issue-target schedule is a 422 (repo-relative issue_iid), and a repoint of a sweep is
+// allowed (repoint=true, the resolved id returned for the store ownership check).
+func TestScheduleRepoChange(t *testing.T) {
+	repo := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+	cur := store.RunSchedule{RepoID: repo}
+
+	// (i) merged repo_id == cur repo → not a repoint.
+	if id, repoint, status, _ := scheduleRepoChange(cur, apitypes.ScheduleRequest{Target: "sweep", RepoID: repo.String()}); repoint || status != 0 || id != repo {
+		t.Fatalf("same repo: id=%v repoint=%v status=%d, want id=%v repoint=false status=0", id, repoint, status, repo)
+	}
+
+	// (ii) malformed repo_id → 400.
+	if _, repoint, status, _ := scheduleRepoChange(cur, apitypes.ScheduleRequest{Target: "sweep", RepoID: "not-a-uuid"}); repoint || status != http.StatusBadRequest {
+		t.Fatalf("malformed repo_id: repoint=%v status=%d, want repoint=false status=400", repoint, status)
+	}
+
+	// (iii) a new valid repo on an issue-target schedule → 422.
+	newID := "22222222-2222-2222-2222-222222222222"
+	if _, repoint, status, _ := scheduleRepoChange(cur, apitypes.ScheduleRequest{Target: "issue", RepoID: newID}); repoint || status != http.StatusUnprocessableEntity {
+		t.Fatalf("issue repoint: repoint=%v status=%d, want repoint=false status=422", repoint, status)
+	}
+
+	// (iv) a new valid repo on a sweep-target schedule → allowed repoint.
+	if id, repoint, status, _ := scheduleRepoChange(cur, apitypes.ScheduleRequest{Target: "sweep", RepoID: newID}); !repoint || status != 0 || id != uuid.MustParse(newID) {
+		t.Fatalf("sweep repoint: id=%v repoint=%v status=%d, want id=%s repoint=true status=0", id, repoint, status, newID)
+	}
+}
+
 func TestOnlyEnabled(t *testing.T) {
 	yes := true
 	if !onlyEnabled(apitypes.ScheduleRequest{Enabled: &yes}) {
@@ -285,6 +344,11 @@ func TestOnlyEnabled(t *testing.T) {
 	// for model — PRD #305 M2).
 	if onlyEnabled(apitypes.ScheduleRequest{Enabled: &yes, OverrideSubagentModel: &yes}) {
 		t.Fatalf("enabled + override_subagent_model is NOT onlyEnabled (else the flag is dropped)")
+	}
+	// enabled + repo_id is a config PATCH (a repoint), not enabled-only: it must NOT
+	// short-circuit, or the repoint's repo_id would be silently dropped (Feature A, PRD #344).
+	if onlyEnabled(apitypes.ScheduleRequest{Enabled: &yes, RepoID: "some-id"}) {
+		t.Fatalf("enabled + repo_id is NOT onlyEnabled (else the repoint is dropped)")
 	}
 	if onlyEnabled(apitypes.ScheduleRequest{}) {
 		t.Fatalf("a patch with no enabled is not onlyEnabled")

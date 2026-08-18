@@ -44,6 +44,7 @@ SELECT * FROM run_schedules WHERE user_id = @user_id ORDER BY created_at DESC;
 -- state; enabled (the pause flag) is orthogonal and untouched here.
 UPDATE run_schedules
 SET target        = @target,
+    repo_id       = @repo_id,
     issue_iid     = sqlc.narg('issue_iid'),
     labels        = sqlc.narg('labels'),
     prompt        = sqlc.narg('prompt'),

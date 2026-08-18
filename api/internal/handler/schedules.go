@@ -269,6 +269,19 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 	final := cur
 	if !onlyEnabled(req) {
 		merged := mergeSchedule(cur, req)
+		repoID, repoint, status, msg := scheduleRepoChange(cur, merged)
+		if status != 0 {
+			httpx.Error(w, status, msg)
+			return
+		}
+		if repoint {
+			// Ownership mirror (create parity, PRD #344 D3): 404 on a foreign/absent repo.
+			// No enabled/guardrail/blocked gate is added here — those run at fire time.
+			if _, rerr := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: repoID, UserID: user.ID}); rerr != nil {
+				httpx.Error(w, http.StatusNotFound, "repo not found")
+				return
+			}
+		}
 		m, status, msg := validateScheduleConfig(merged, h.clock())
 		if status != 0 {
 			httpx.Error(w, status, msg)
@@ -282,6 +295,7 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 		issueIID, labels, prompt, cronExpr, runAt := scheduleColumns(m)
 		final, err = h.q.UpdateRunSchedule(r.Context(), store.UpdateRunScheduleParams{
 			Target:                m.Target,
+			RepoID:                repoID,
 			IssueIid:              issueIID,
 			Labels:                labels,
 			Prompt:                prompt,
@@ -497,6 +511,7 @@ func applyCreateDefaults(req *apitypes.ScheduleRequest) {
 func onlyEnabled(req apitypes.ScheduleRequest) bool {
 	return req.Enabled != nil &&
 		req.Target == "" && req.Timing == "" &&
+		req.RepoID == "" &&
 		req.IssueIID == nil && req.Labels == nil && req.Prompt == "" &&
 		req.CronExpr == "" && req.RunAt == nil && req.Timezone == "" &&
 		req.AutoApprove == nil && req.WaitOnLimit == nil && req.MaxIssues == nil &&
@@ -592,7 +607,39 @@ func mergeSchedule(cur store.RunSchedule, req apitypes.ScheduleRequest) apitypes
 	// whole row (enabled-only is short-circuited by onlyEnabled), so nil ≡ false (Decision 5)
 	// means an omitted value turns it off — which the web avoids by sending the full config.
 	m.OverrideSubagentModel = req.OverrideSubagentModel
+	// repo_id (Feature A, PRD #344) is seeded from the CURRENT row and overridden only by
+	// a non-empty request value — keep-on-empty, deliberately NOT the replace-semantics of
+	// max_issues/guidance/model above. RATIONALE: run_schedules.repo_id is NOT NULL + FK, and
+	// every config edit flows through UpdateRunSchedule. If a config PATCH that omits --repo
+	// let repo_id fall to "" -> uuid.Nil, the UPDATE would SET repo_id = '00000000-...' and
+	// violate the FK -> 500 on EVERY config edit, not just repoints (S1). So keep the stored id.
+	m.RepoID = cur.RepoID.String()
+	if req.RepoID != "" {
+		m.RepoID = req.RepoID
+	}
 	return m
+}
+
+// scheduleRepoChange classifies the merged PATCH's repo_id against the current row's repo.
+// It is PURE (no store) so it unit-tests the 400/422 grounds directly; the caller performs
+// the store-backed ownership check (404) only when repoint is true. merged.RepoID is always
+// non-empty (mergeSchedule seeds it from cur), so uuid.Parse fails only when the caller sent
+// a malformed repo_id -> 400. A parsed id equal to the current repo is not a repoint. A repoint
+// of an issue-target schedule is REJECTED 422 (PRD #344 D4): issue_iid is repo-relative, so the
+// same IID in the new repo is a different, unrelated issue that auto_approve would run to an MR.
+func scheduleRepoChange(cur store.RunSchedule, merged apitypes.ScheduleRequest) (repoID uuid.UUID, repoint bool, status int, msg string) {
+	id, err := uuid.Parse(merged.RepoID)
+	if err != nil {
+		return uuid.Nil, false, http.StatusBadRequest, "invalid repo id"
+	}
+	if id == cur.RepoID {
+		return id, false, 0, ""
+	}
+	if merged.Target == "issue" {
+		return uuid.Nil, false, http.StatusUnprocessableEntity,
+			"repointing an issue-target schedule is not supported; delete and recreate it against the new repo"
+	}
+	return id, true, 0, ""
 }
 
 // scheduleColumns maps a normalized request to the per-target nullable store columns.

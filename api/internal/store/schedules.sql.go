@@ -693,28 +693,30 @@ func (q *Queries) SetRunScheduleStatus(ctx context.Context, arg SetRunScheduleSt
 const updateRunSchedule = `-- name: UpdateRunSchedule :one
 UPDATE run_schedules
 SET target        = $1,
-    issue_iid     = $2,
-    labels        = $3,
-    prompt        = $4,
-    timing        = $5,
-    cron_expr     = $6,
-    run_at        = $7,
-    timezone      = $8,
-    next_fire_at  = $9,
-    auto_approve  = $10,
-    wait_on_limit = $11,
-    max_issues    = $12,
-    guidance      = $13,
-    model         = $14,
-    override_subagent_model = $15,
+    repo_id       = $2,
+    issue_iid     = $3,
+    labels        = $4,
+    prompt        = $5,
+    timing        = $6,
+    cron_expr     = $7,
+    run_at        = $8,
+    timezone      = $9,
+    next_fire_at  = $10,
+    auto_approve  = $11,
+    wait_on_limit = $12,
+    max_issues    = $13,
+    guidance      = $14,
+    model         = $15,
+    override_subagent_model = $16,
     status        = 'active',
     updated_at    = now()
-WHERE id = $16 AND user_id = $17
+WHERE id = $17 AND user_id = $18
 RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire
 `
 
 type UpdateRunScheduleParams struct {
 	Target                string             `json:"target"`
+	RepoID                uuid.UUID          `json:"repo_id"`
 	IssueIid              pgtype.Int8        `json:"issue_iid"`
 	Labels                []byte             `json:"labels"`
 	Prompt                pgtype.Text        `json:"prompt"`
@@ -746,6 +748,7 @@ type UpdateRunScheduleParams struct {
 func (q *Queries) UpdateRunSchedule(ctx context.Context, arg UpdateRunScheduleParams) (RunSchedule, error) {
 	row := q.db.QueryRow(ctx, updateRunSchedule,
 		arg.Target,
+		arg.RepoID,
 		arg.IssueIid,
 		arg.Labels,
 		arg.Prompt,
