@@ -81,6 +81,7 @@ browsable in-app under **Docs**:
 - [Proc hardening](docs/proc-hardening.md)
 - [Developer conventions](docs/dev-conventions.md)
 - [Why a hosted run costs less](docs/run-cost.md)
+- [Demo](docs/demo.md)
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the system shape, [prds/](prds/) for product specs, and [specs/](specs/) for the requirements contract ([human.md](specs/human.md)) and design decisions ([ai.md](specs/ai.md)).
 
