@@ -2,7 +2,7 @@
 
 **Issue**: [#368](https://github.com/vtmocanu/uzi/issues/368)
 **Priority**: Low
-**Status**: Not started
+**Status**: Done
 
 ## Problem
 
@@ -106,12 +106,14 @@ Confirm `docs/demo.md`'s body stays ≤ 60 lines (it will).
 
 ## Success criteria
 
-1. `docs/demo.md` exists, `audience: user`, `order: 108`, valid frontmatter.
-2. The page has a body section with one working inline relative link.
-3. `README.md` links to the page.
-4. `node web/scripts/check-docs.mjs` exits 0 (equivalently, the web gate / `npm run
+1. [x] `docs/demo.md` exists, `audience: user`, `order: 108`, valid frontmatter.
+2. [x] The page has a body section with one working inline relative link
+   (`[Getting started](getting-started.md)`).
+3. [x] `README.md` links to the page.
+4. [x] `node web/scripts/check-docs.mjs` exits 0 (equivalently, the web gate / `npm run
    build` docs check passes). No other gate is touched because no code changed.
-5. An MR is open against a branch; `main` is untouched.
+5. An MR is open against a branch; `main` is untouched. *(Completed by the worker at
+   run finalization, not asserted here.)*
 
 ## Risks & mitigations
 
