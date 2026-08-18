@@ -6,6 +6,31 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.43.0] - 2026-08-18
+
+### Added
+
+- **Schedule repo repoint, and an enabled/disabled control on create.** `PATCH
+  /api/schedules/{id}` can now change a schedule's `repo_id` (`uzi schedule edit --repo`,
+  plus a repo selector in the web edit form), and both `uzi schedule create --enabled` and
+  the web create form can start a schedule already paused. A repoint validates owner-scoped
+  exactly like create; an issue-target schedule refuses a repoint with 422, because forge
+  issue IIDs are repo-relative and a repoint would very likely resolve a different,
+  unrelated issue at the same IID (issue #344).
+- **specs/ai.md section-number uniqueness gate.** `task gate:repo` now runs
+  `scripts/check-spec-numbering.sh`, a whole-file duplicate-section-number check with a
+  liveness canary, so a colliding section number is caught in CI instead of slipping past a
+  tail-only read. Uniqueness only, never order or gaps: the file is append-numbered by
+  design (issue #181).
+
+### Fixed
+
+- **Board card and run view now agree on the planning phase for all whitespace.** The
+  board's `has_plan_md` SQL predicate widened its `btrim` set from ASCII-only whitespace to
+  Go's full `unicode.IsSpace` set, so a plan made entirely of Unicode whitespace (NBSP, em
+  space, ideographic space) reads as absent on both the board card and the run DTO, matching
+  the Go-side `strings.TrimSpace` (issue #342).
+
 ## [0.42.2] - 2026-08-17
 
 ### Added
