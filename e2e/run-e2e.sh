@@ -823,9 +823,9 @@ if [ -n "${E2E_GIT_SMART_HTTP:-}" ]; then
   # Fidelity variant: leave the clone/push URL pointing at forge-fake's git
   # smart-HTTP endpoint (no insteadOf), so the worker's git-over-HTTPS Basic auth
   # is genuinely exercised (forge-fake 401s without a valid Authorization: Basic).
-  # safe.directory=* is carried even here: this file is the worker's
-  # GIT_CONFIG_GLOBAL (a global-scope config FILE), the ONLY scope git honours
-  # safe.directory from — gitEnv()'s inline `-c`-scope pin is ignored by design.
+  # safe.directory=* is carried even here: this file is the worker's GIT_CONFIG_GLOBAL,
+  # a config FILE, which is what an ownership check in a spawned receive-pack actually
+  # reads — gitEnv()'s inline command-scope pin gets stripped before that child.
   # See the default-branch note below for why the file (not the pin) is load-bearing.
   cat > "$RUNROOT/agent-gitconfig/gitconfig" <<'EOF'
 [safe]
@@ -841,11 +841,13 @@ else
   # differs from the in-container uid on a CI runner (they happen to match on a dev
   # laptop, which is why this passed locally for a long time). git then trips
   # `detected dubious ownership` on the bare and refuses the push. gitEnv() DOES pin
-  # safe.directory=* inline, but git honours safe.directory ONLY from system/global
-  # config scope and ignores it at `-c`/GIT_CONFIG_COUNT scope by design — so the pin
-  # is a no-op for the ownership check and the trust MUST live in this file, which is
-  # the worker's GIT_CONFIG_GLOBAL (a global-scope file). This mirrors exactly what
-  # the `neutral` config below already does for the harness's own git probes.
+  # safe.directory=* — but only at COMMAND scope (GIT_CONFIG_COUNT/KEY/VALUE), and git
+  # STRIPS those vars from the environment when it spawns the local `receive-pack`, so
+  # the pin never reaches the ownership check, which runs in that child (verified on
+  # git 2.55: the child sees GIT_CONFIG_COUNT unset and no safe.directory; a global
+  # config FILE, by contrast, receive-pack reads on its own). So the trust MUST live in
+  # this file, which is the worker's GIT_CONFIG_GLOBAL. This mirrors exactly what the
+  # `neutral` config below already does for the harness's own git probes.
   cat > "$RUNROOT/agent-gitconfig/gitconfig" <<'EOF'
 [safe]
 	directory = *
@@ -2019,9 +2021,12 @@ pass "the Bearer-WS-triggered approve drove RUN_WSB to completed"
 # the local bare.
 say "PRD #97 M1: worker pushes the agent branch over git-over-HTTPS Basic auth (default coverage)"
 # Drop insteadOf ⇒ the worker's git speaks smart-HTTP to forge-fake. Keep safe.directory:
-# this file is the worker's GIT_CONFIG_GLOBAL, and the worker runs with GIT_CONFIG_NOSYSTEM=1
-# (agent/src/git.ts), so global scope here is the ONLY place git will honour safe.directory
-# for the local-bare pushes the later phases do — every rewrite of this file must re-carry it.
+# this file is the worker's GIT_CONFIG_GLOBAL, and it is the trust the LATER local-bare
+# phases need. gitEnv()'s inline pin cannot serve them (it is command scope, which git
+# strips before the local receive-pack child that checks ownership); the worker also runs
+# GIT_CONFIG_NOSYSTEM=1 (agent/src/git.ts), ruling out /etc/gitconfig — so this global file
+# is the one scope that both survives to the child AND this env allows. Every rewrite of
+# this file must re-carry it.
 cat > "$RUNROOT/agent-gitconfig/gitconfig" <<'EOF'
 [safe]
 	directory = *
@@ -2076,8 +2081,9 @@ EOF
   pass "kept the smart-HTTP remote (E2E_GIT_SMART_HTTP: the whole suite stays on smart-HTTP)"
 else
   # safe.directory MUST be re-carried here (see the M1 rewrite note above): the remaining
-  # phases push to the local bare, and the worker's GIT_CONFIG_NOSYSTEM=1 means this global
-  # file is the only scope git honours safe.directory from for the dubious-ownership check.
+  # phases push to the local bare, and gitEnv()'s command-scope pin is stripped before the
+  # receive-pack child that checks ownership, while GIT_CONFIG_NOSYSTEM=1 rules out system
+  # scope — so this global file is the only trust that reaches that child in this env.
   cat > "$RUNROOT/agent-gitconfig/gitconfig" <<'EOF'
 [safe]
 	directory = *
