@@ -7,18 +7,16 @@
 # Taskfile.yml under `brew:` (the one sanctioned remote include, SHA-pinned; see that
 # file's rule 3).
 #
-# 🔴 workflow_dispatch ONLY while the repo is PRIVATE. brew:formula fetches the ANONYMOUS
-# auto-archive (https://github.com/vtmocanu/uzi/archive/refs/tags/<tag>.tar.gz), which
-# 404s for a private repo -- so it cannot compute a real sha256 and refuses to render
-# (the reusable task guards the empty-input digest). The first REAL tap publish happens
-# AFTER the repo is public; add
-#
-#   push:
-#     tags: ["v*"]
-#
-# to the triggers below in the SAME change that flips the repo public. The images + chart
-# already publish on tags via release.yml; brew is decoupled because it needs the public
-# archive. Dispatch lets you (re)publish the formula for any existing tag once public.
+# TRIGGERS: a `v*` tag push (auto-publish the formula on release, matching release.yml)
+# AND workflow_dispatch (re-publish for any existing tag by hand). Both feed the same job
+# through INPUT_TAG below. brew:formula fetches the ANONYMOUS auto-archive
+# (https://github.com/vtmocanu/uzi/archive/refs/tags/<tag>.tar.gz), which 404s while the
+# repo is private -- so the tag trigger was intentionally withheld until the public flip
+# (the reusable task guards the empty-input digest and refuses to render on a 404). The
+# repo is public now and the tag trigger is live: a release tags vX.Y.Z, release.yml
+# publishes the images + chart, and this publishes the matching formula. brew stays a
+# SEPARATE workflow from release.yml because it needs that public archive, and a failed
+# tap push must not redden the image+chart release.
 #
 # The default GITHUB_TOKEN cannot write to a second repo, so the cross-repo push uses
 # HOMEBREW_TAP_TOKEN (a fine-grained PAT scoped to vtmocanu/homebrew-tap, contents:write),
@@ -29,6 +27,8 @@ name: Brew
 
 # Quoted so yamllint's `truthy` rule does not read the key as the boolean `on`.
 "on":
+  push:
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
@@ -48,8 +48,10 @@ jobs:
     environment: release
     env:
       # Passed via env, never string-interpolated into a run script: a workflow_dispatch
-      # input is untrusted, and git ref names allow shell metacharacters.
-      INPUT_TAG: ${{ inputs.tag }}
+      # input is untrusted, and git ref names allow shell metacharacters. On a v* tag push
+      # inputs.tag is empty, so fall back to the tag ref name; the Validate step below
+      # rejects anything that is not strict SemVer either way.
+      INPUT_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
 
