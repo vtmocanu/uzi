@@ -245,6 +245,7 @@ func TestRunScheduleModelRoundTripLiveDB(t *testing.T) {
 	// Update clearing the model to NULL (inherit the owner default).
 	updated, err := q.UpdateRunSchedule(ctx, store.UpdateRunScheduleParams{
 		Target:      "prompt",
+		RepoID:      repoID, // PRD #344 M3: repo_id is now a required UpdateRunSchedule param (NOT NULL + FK)
 		Prompt:      pgtype.Text{String: "do the thing", Valid: true},
 		Timing:      "once",
 		RunAt:       tsPast(),
@@ -422,6 +423,7 @@ func TestRunScheduleOverrideSubagentModelRoundTripLiveDB(t *testing.T) {
 	// not just the DB default).
 	updated, err := q.UpdateRunSchedule(ctx, store.UpdateRunScheduleParams{
 		Target:                "prompt",
+		RepoID:                repoID, // PRD #344 M3: repo_id is now a required UpdateRunSchedule param (NOT NULL + FK)
 		Prompt:                pgtype.Text{String: "do the thing", Valid: true},
 		Timing:                "once",
 		RunAt:                 tsPast(),
