@@ -247,6 +247,9 @@ tasks:
       - task: lint:shell
       - task: lint:yaml
       - task: lint:formula
+      # cheapest-first: this whole-file duplicate check is sub-second, so it runs
+      # before `scan:secrets`, which is deliberately last because it dominates.
+      - task: check:spec-numbering
       - task: scan:secrets
 
   gate:api:
@@ -690,6 +693,14 @@ tasks:
       # elsewhere, so the distinction is live -- and copies this file VERBATIM
       # into vtmocanu/homebrew-tap on every v* tag.
       - ./scripts/lint-formula.sh Formula/uzi-cli.rb
+
+  check:spec-numbering:
+    desc: specs/ai.md section numbers are unique (whole-file), with a canary proving the detector fired
+    cmds:
+      # Uniqueness ONLY -- never order/gaps/contiguity (specs/ai.md is appended at
+      # the tail, not sorted). The canary carries a planted duplicate the check must
+      # detect, or it exits 2 (instrument broken). See the script header.
+      - ./scripts/check-spec-numbering.sh specs/ai.md scripts/spec-numbering-canary.md
 
   scan:secrets:
     desc: gitleaks over every tracked file, with a canary proving the scanner ran
