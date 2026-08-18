@@ -51,6 +51,9 @@ type boardWriterStub struct {
 	createLabels []string
 	// labelCreates is every label NAME EnsureLabels auto-created (Promote writer).
 	labelCreates []string
+	// labelColors records the colour each created label carried across the wire
+	// (name → colour), for the seedBoard colour contract.
+	labelColors map[string]string
 	// issueUpdateAdds is the add_labels of the last UpdateIssue (Promote writer).
 	issueUpdateAdds []string
 	nextIID         int64
@@ -92,8 +95,13 @@ func newBoardWriterServer(t *testing.T, s *boardWriterStub) *httptest.Server {
 			_, _ = w.Write([]byte(`[]`))
 		case r.Method == http.MethodPost && strings.HasSuffix(path, "/labels"):
 			name, _ := m["name"].(string)
+			color, _ := m["color"].(string)
 			s.mu.Lock()
 			s.labelCreates = append(s.labelCreates, name)
+			if s.labelColors == nil {
+				s.labelColors = map[string]string{}
+			}
+			s.labelColors[name] = color
 			s.mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
