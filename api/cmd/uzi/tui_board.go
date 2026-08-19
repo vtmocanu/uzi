@@ -1,7 +1,7 @@
 package main
 
 import (
-	"fmt"
+	"image/color"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -70,9 +70,12 @@ func (b *boardState) clampCursor() {
 	}
 }
 
-// visible applies the `/` filter over the fields a human would search by. The filter
-// is the user's own text, matched against sanitized cell text so a control byte in a
-// title cannot affect what matches.
+// visible applies the `/` filter, then orders the survivors into the three triage bands
+// (NEEDS YOU → ON THE FLOOR → DONE). The cursor indexes this list, so the selectable order
+// IS the visual order and navigation walks the bands top to bottom. The filter is the
+// user's own text, matched against sanitized cell text so a control byte in a title cannot
+// affect what matches — and against BOTH the raw status and the human status word, so a
+// user can filter by either "awaiting_approval" or "plan gate".
 func (b *boardState) visible() []apitypes.RunListItemDTO {
 	base := b.runs
 	if b.hideDone {
@@ -85,18 +88,61 @@ func (b *boardState) visible() []apitypes.RunListItemDTO {
 		}
 		base = kept
 	}
-	if strings.TrimSpace(b.filter) == "" {
-		return base
-	}
-	q := strings.ToLower(strings.TrimSpace(b.filter))
-	out := make([]apitypes.RunListItemDTO, 0, len(base))
-	for _, r := range base {
-		hay := strings.ToLower(strings.Join([]string{
-			r.ID, r.Kind, effectiveRunStatus(r.Status, r.IsPlanning), cellText(runTitle(r.RunDTO)),
-		}, " "))
-		if strings.Contains(hay, q) {
-			out = append(out, r)
+	if strings.TrimSpace(b.filter) != "" {
+		q := strings.ToLower(strings.TrimSpace(b.filter))
+		out := make([]apitypes.RunListItemDTO, 0, len(base))
+		for _, r := range base {
+			// The effective status (the enum the user sees — "planning", not the raw "running"
+			// #321 hides) plus the human word, so a user can filter by either "awaiting_approval"
+			// or "plan gate". The truly-raw r.Status is deliberately NOT included: it would let
+			// "running" match a planning run again, the exact thing #321 fixed.
+			_, word := stateGlyphWord(r.Status, r.Health, r.IsPlanning)
+			hay := strings.ToLower(strings.Join([]string{
+				r.ID, r.Kind, effectiveRunStatus(r.Status, r.IsPlanning),
+				word, r.Health, cellText(runTitle(r.RunDTO)),
+			}, " "))
+			if strings.Contains(hay, q) {
+				out = append(out, r)
+			}
 		}
+		base = out
+	}
+	return bandOrder(base)
+}
+
+// The three triage bands, in fixed top-to-bottom order.
+const (
+	bandNeedsYou = iota // awaiting_approval + awaiting_input — the only rows a human must act on
+	bandFloor           // everything non-terminal not in NEEDS YOU (running/claimed/queued/planning/limit_wait, stalled)
+	bandDone            // terminal: completed/failed/cancelled
+	numBands
+)
+
+var bandNames = [numBands]string{"NEEDS YOU", "ON THE FLOOR", "DONE"}
+
+// runBand places a run in its triage band from its status alone.
+func runBand(status string) int {
+	switch status {
+	case "awaiting_approval", "awaiting_input":
+		return bandNeedsYou
+	}
+	if terminalRunStatuses[status] {
+		return bandDone
+	}
+	return bandFloor
+}
+
+// bandOrder partitions runs into the three bands, preserving each band's internal order
+// (the server's), and concatenates them NEEDS YOU → ON THE FLOOR → DONE.
+func bandOrder(runs []apitypes.RunListItemDTO) []apitypes.RunListItemDTO {
+	var buckets [numBands][]apitypes.RunListItemDTO
+	for _, r := range runs {
+		b := runBand(r.Status)
+		buckets[b] = append(buckets[b], r)
+	}
+	out := make([]apitypes.RunListItemDTO, 0, len(runs))
+	for b := 0; b < numBands; b++ {
+		out = append(out, buckets[b]...)
 	}
 	return out
 }
@@ -187,60 +233,48 @@ func (m tuiModel) renderBoard() string {
 	var sb strings.Builder
 	rows := m.board.visible()
 
-	title := "factory floor"
+	// The wordmark, dark and quiet: ▚▚ uzi · <where>. The admin board stays labelled "active
+	// runs" — AdminListRuns returns non-terminal runs only, so promising completed rows would
+	// be a claim the API cannot satisfy.
+	where := "floor"
 	if m.board.admin {
-		// The admin view is NOT symmetric with own-runs: AdminListRuns returns
-		// non-terminal runs only, capped, with no judge/usage columns. Labelling it
-		// "active runs (factory-wide)" is the honest header — promising completed rows,
-		// or calling it "all crews", is a claim the API cannot satisfy.
-		title = "active runs (factory-wide)"
+		where = "active runs"
 	}
-	// Wordmark + a summary bar that answers "does anything need me?" before the eye
-	// reaches a row (PRD #325 M2). The summary is over the WHOLE board, not the filtered
-	// view, so it stays a stable factory read while you filter.
-	brand := m.pal.title.Render("▚ uzi") + m.pal.faint.Render("  "+title)
+	brand := m.pal.title.Render("▚▚ uzi") + m.pal.faint.Render(" · "+where)
 	if m.board.hideDone && !m.board.admin {
 		brand += m.pal.faint.Render("   active only")
 	}
 	if m.board.filter != "" || m.board.filtering {
 		brand += m.pal.faint.Render("   /" + cellText(m.board.filter))
 		if m.board.filtering {
-			brand += m.pal.faint.Render("▌")
+			brand += m.pal.title.Render("▌")
 		}
 	}
-	// Window the run list to the terminal height so the header and footer stay on screen
-	// no matter how many runs there are. capacity is how many run rows fit; start is the
-	// first visible row, scrolled to keep the cursor in view.
-	capacity := m.boardCapacity()
-	start, end := boardWindow(m.board.cursor, m.board.scroll, len(rows), capacity)
 
+	// The display list injects non-selectable eyebrow + spacer lines around the run rows; the
+	// cursor still indexes RUN rows only (via visible()), so selection/enter/clamp are unchanged.
+	// The window keeps the selected run row on screen so the wordmark and footer never scroll off.
+	items := m.buildBoardItems(rows)
+	capacity := m.boardCapacity()
+	selItem := selectedBoardItem(items, m.board.cursor)
+	start, end := boardWindow(selItem, m.board.scroll, len(items), capacity)
+
+	// Summary glyph cluster + position readout, pinned top-right. Over the WHOLE board (not the
+	// filtered view) so it stays a stable factory read while you filter.
 	summary := m.boardSummary()
-	if len(rows) > capacity {
-		// Position readout so a windowed board says where you are in it (top-right, beside
-		// the run counts), since the list no longer shows every row at once.
-		summary = m.pal.faint.Render(fmt.Sprintf("%d–%d of %d   ", start+1, end, len(rows))) + summary
+	if len(rows) > 0 {
+		lo, hi := windowRunSpan(items, start, end)
+		summary += m.pal.faint.Render(" · " + itoa(lo) + "–" + itoa(hi))
 	}
-	sb.WriteString(padVisual(brand, m.width-visualWidth(summary)-1) + summary + "\n")
-	sb.WriteString(m.pal.faint.Render(strings.Repeat("─", boardRuleWidth(m.width))) + "\n")
+	sb.WriteString(clampVisual(padVisual(" "+brand, m.width-visualWidth(summary)-1)+summary, m.width) + "\n")
+	sb.WriteString("\n")
 
 	if m.board.adminDenied {
-		sb.WriteString(m.pal.faint.Render("the factory-wide board needs an admin (uza_) token — showing your runs") + "\n")
+		sb.WriteString(clampVisual(m.pal.faint.Render(" the factory-wide board needs an admin (uza_) token — showing your runs"), m.width) + "\n")
 	}
 	if m.board.err != nil {
-		sb.WriteString(m.pal.faint.Render("could not refresh: "+fmtErr(m.board.err)) + "\n")
+		sb.WriteString(clampVisual(m.pal.faint.Render(" could not refresh: "+fmtErr(m.board.err)), m.width) + "\n")
 	}
-
-	// Column header. The 3-space prefix aligns RUN with the data rows, whose spine (1) +
-	// gutter (1) + space (1) also occupy 3 cols; every column below uses two-space gaps.
-	ownerHdr := ""
-	if m.board.admin {
-		ownerHdr = "  " + padCell("OWNER", boardOwnerWidth)
-	}
-	mileHdr := ""
-	if m.boardShowMile() {
-		mileHdr = "  " + padCell("MILE", boardMileWidth)
-	}
-	sb.WriteString("   " + m.pal.faint.Render(padCell("RUN", 9)+ownerHdr+"  "+padCell("STATUS", boardStatusWidth)+"  "+padCell("HEALTH", boardHealthWidth)+"  "+padCell("AGE", 5)+mileHdr+"  TITLE") + "\n")
 
 	if len(rows) == 0 {
 		sb.WriteString(m.boardEmptyState())
@@ -250,48 +284,136 @@ func (m tuiModel) renderBoard() string {
 		// board's right edge.
 		mc := m.boardMarkerCols(rows)
 		for i := start; i < end; i++ {
-			sb.WriteString(m.boardRow(rows[i], i == m.board.cursor, mc) + "\n")
+			switch it := items[i]; it.kind {
+			case biEyebrow:
+				sb.WriteString(m.boardEyebrow(it) + "\n")
+			case biRow:
+				sb.WriteString(m.boardRow(rows[it.runIdx], it.runIdx == m.board.cursor, mc) + "\n")
+			default:
+				sb.WriteString("\n")
+			}
 		}
 	}
 
-	sb.WriteString(m.pal.faint.Render(strings.Repeat("─", boardRuleWidth(m.width))) + "\n")
-	// The hide-done toggle is meaningless on the admin board (non-terminal runs only), so its
-	// key hint is dropped there rather than offering a no-op.
-	hideHint := ""
-	if !m.board.admin {
-		if m.board.hideDone {
-			hideHint = "h show done · "
-		} else {
-			hideHint = "h hide done · "
-		}
-	}
-	sb.WriteString(m.pal.faint.Render("enter open · / filter · a admin · " + hideHint + "r refresh · ? keys · q quit"))
+	sb.WriteString(clampVisual(m.boardFooter(), m.width))
 	return sb.String()
 }
 
+// boardItem is one line of the board's display list: a band eyebrow, a run row, or a blank
+// spacer between bands. Only biRow lines are selectable; runIdx indexes visible().
+type boardItem struct {
+	kind   int
+	band   int // biEyebrow: which band
+	count  int // biEyebrow: how many runs in it
+	runIdx int // biRow: index into visible()
+}
+
 const (
-	boardStatusWidth = 19 // status chip cell (fits the longest status, "awaiting_approval" + chip padding)
-	boardHealthWidth = 10 // HEALTH cell (stalled ▲, or a non-stalled health word, truncated)
-	boardOwnerWidth  = 18 // admin OWNER cell
-	boardMileWidth   = 6  // MILE cell — fits the "MILE" header and M{done}/{total} up to two digits each (e.g. M12/34)
-	boardTitleMax    = 60 // TITLE cap: long titles are trimmed to a tidy column instead of running the width of a wide terminal
-	// boardMileMinWidth is the narrowest board that shows the MILE column. The column adds 8
-	// cols to the fixed prefix (6 + a 2-space gap); below this the prefix would squeeze the
-	// title so hard that a marker row overflows the terminal edge and the judge marker clips
-	// with no ellipsis (issue #379 tui-ux finding). Below it the column is dropped and the
-	// board reverts to the pre-#379 layout — milestone progress is still on the run detail
-	// view. 90 clears the marker-row overflow point (prefix 62 + widest marker 14 + a 10-col
-	// title floor = 86, so width ≥ 87 fits; 90 is a small safety margin).
+	biEyebrow = iota
+	biRow
+	biSpacer
+)
+
+// buildBoardItems turns the (already band-ordered) visible run list into the flat display
+// list: an eyebrow at each band boundary, a spacer between bands, one row per run. Cheap
+// (no styling), so both the renderer and the key handler's syncedScroll can call it and agree
+// on line positions.
+func (m tuiModel) buildBoardItems(rows []apitypes.RunListItemDTO) []boardItem {
+	var counts [numBands]int
+	for _, r := range rows {
+		counts[runBand(r.Status)]++
+	}
+	items := make([]boardItem, 0, len(rows)+numBands*2)
+	prevBand := -1
+	for i, r := range rows {
+		if b := runBand(r.Status); b != prevBand {
+			if prevBand != -1 {
+				items = append(items, boardItem{kind: biSpacer})
+			}
+			items = append(items, boardItem{kind: biEyebrow, band: b, count: counts[b]})
+			prevBand = b
+		}
+		items = append(items, boardItem{kind: biRow, runIdx: i})
+	}
+	return items
+}
+
+// selectedBoardItem is the display index of the row the cursor is on (0 if none).
+func selectedBoardItem(items []boardItem, cursor int) int {
+	for i, it := range items {
+		if it.kind == biRow && it.runIdx == cursor {
+			return i
+		}
+	}
+	return 0
+}
+
+// windowRunSpan is the 1-based run position range [lo, hi] visible in items[start:end].
+func windowRunSpan(items []boardItem, start, end int) (lo, hi int) {
+	for i := start; i < end && i < len(items); i++ {
+		if items[i].kind != biRow {
+			continue
+		}
+		pos := items[i].runIdx + 1
+		if lo == 0 || pos < lo {
+			lo = pos
+		}
+		if pos > hi {
+			hi = pos
+		}
+	}
+	if lo == 0 {
+		lo = 1
+	}
+	return lo, hi
+}
+
+// boardEyebrow is a faint CAPS band label + count; NEEDS YOU is amber, because it is the one
+// band a human must act on.
+func (m tuiModel) boardEyebrow(it boardItem) string {
+	name := bandNames[it.band]
+	if it.band == bandNeedsYou {
+		return " " + lipgloss.NewStyle().Foreground(m.pal.amber).Bold(true).Render(name) + m.pal.faint.Render(" · "+itoa(it.count))
+	}
+	return " " + m.pal.faint.Render(name+" · "+itoa(it.count))
+}
+
+// boardFooter is the one-line key legend; key letters are tungsten (keyHint), labels faint.
+func (m tuiModel) boardFooter() string {
+	parts := []string{m.keyHint("enter", "open"), m.keyHint("/", "filter")}
+	if m.board.admin {
+		parts = append(parts, m.keyHint("a", "my runs"))
+	} else {
+		parts = append(parts, m.keyHint("a", "factory"))
+		// The fold-done toggle is meaningless on the admin board (non-terminal runs only), so
+		// its hint is dropped there rather than offering a no-op.
+		if m.board.hideDone {
+			parts = append(parts, m.keyHint("h", "show done"))
+		} else {
+			parts = append(parts, m.keyHint("h", "fold done"))
+		}
+	}
+	parts = append(parts, m.keyHint("r", "refresh"), m.keyHint("?", "keys"), m.keyHint("q", "quit"))
+	return " " + strings.Join(parts, m.pal.faint.Render(" · "))
+}
+
+const (
+	boardIDWidth         = 8  // short run id (first 8 of the UUID)
+	boardStatusWordWidth = 12 // status word cell (fits the longest word, "rate-limited")
+	boardAgeWidth        = 4  // AGE cell (relAge, single-unit)
+	boardMileWidth       = 8  // milestone micro-bar cell (up to boardMileCap ▰/▱ cells, or –/N text)
+	boardMileCap         = 8  // above this many milestones the micro-bar falls back to N/M text
+	boardOwnerWidth      = 20 // admin owner-email cell
+	boardTitleMax        = 60 // TITLE cap: long titles trim to a tidy column instead of running a wide terminal
+	// boardMileMinWidth is the narrowest own board that shows the milestone micro-bar. Below it
+	// the column is dropped (milestone progress is still on the run-detail view) so the fixed
+	// prefix does not squeeze the title into an overflowing marker row (issue #379).
 	boardMileMinWidth = 90
 )
 
-// boardShowMile reports whether the terminal is wide enough for the MILE column (issue #379).
-//
-// boardMileMinWidth is calibrated against the NON-admin row prefix. The admin board carries an
-// extra OWNER column, so its prefix is boardOwnerWidth+2 cols wider and the same MILE tax
-// overflows the floored title at widths 90-91 (#380 review). Shift the admin threshold up by
-// exactly that extra prefix so the column drops on a narrow admin board instead of clipping —
-// milestone progress is still on the run-detail view.
+// boardShowMile reports whether the terminal is wide enough for the milestone micro-bar column.
+// The admin board carries an extra owner cell, so its prefix is wider and the threshold shifts
+// up by exactly that extra prefix — the column drops on a narrow admin board instead of clipping.
 func (m tuiModel) boardShowMile() bool {
 	min := boardMileMinWidth
 	if m.board.admin {
@@ -300,19 +422,12 @@ func (m tuiModel) boardShowMile() bool {
 	return m.width >= min
 }
 
-func boardRuleWidth(w int) int {
-	if w < 2 {
-		return 1
-	}
-	return w - 1
-}
-
-// boardCapacity is how many run rows fit between the header block and the footer at the
-// current terminal height. It must count the same chrome lines renderBoard draws: brand +
-// rule + column header (3) and the closing rule + footer (2), plus the optional adminDenied
-// and error lines. At least one row is always shown.
+// boardCapacity is how many display lines fit between the wordmark block and the footer at the
+// current terminal height. It counts the same chrome renderBoard draws: the wordmark line, the
+// blank below it, the footer (3), plus the optional adminDenied and error lines. At least one
+// line is always shown.
 func (m tuiModel) boardCapacity() int {
-	chrome := 5
+	chrome := 3
 	if m.board.adminDenied {
 		chrome++
 	}
@@ -326,10 +441,9 @@ func (m tuiModel) boardCapacity() int {
 	return c
 }
 
-// boardWindow is the [start, end) slice of the visible run list to draw, scrolled so the
-// cursor stays on screen. Stateless: it takes the last scroll offset and returns a corrected
-// one via start, so it is safe to call from both the key handler (to persist) and the
-// renderer (to self-correct after a height or list change).
+// boardWindow is the [start, end) slice of the display list to draw, scrolled so the selected
+// line stays on screen. Stateless: it takes the last scroll offset and returns a corrected one
+// via start, so it is safe to call from both the key handler (to persist) and the renderer.
 func boardWindow(cursor, scroll, n, capacity int) (int, int) {
 	if capacity < 1 {
 		capacity = 1
@@ -356,34 +470,43 @@ func boardWindow(cursor, scroll, n, capacity int) (int, int) {
 	return start, start + capacity
 }
 
-// syncedScroll returns the scroll offset that keeps the cursor visible, for the key handler
-// to persist so in-window navigation does not shift the viewport on every keystroke.
+// syncedScroll returns the scroll offset that keeps the selected row visible, for the key
+// handler to persist so in-window navigation does not shift the viewport on every keystroke.
 func (m tuiModel) syncedScroll() int {
-	start, _ := boardWindow(m.board.cursor, m.board.scroll, len(m.board.visible()), m.boardCapacity())
+	items := m.buildBoardItems(m.board.visible())
+	sel := selectedBoardItem(items, m.board.cursor)
+	start, _ := boardWindow(sel, m.board.scroll, len(items), m.boardCapacity())
 	return start
 }
 
-// boardSummary is the "N runs · N needs you · N stalled" bar. Predicates (PRD #325 M2):
-// needs you = awaiting_approval + awaiting_input; stalled = health "stalled"; N runs =
-// the whole board. Computed over m.board.runs so it does not shrink under a filter.
+// boardSummary is the top-right glyph cluster: ⚑ N · ✎ N · ▲ N · <total> runs. Zero-count
+// segments are dropped, so a healthy factory reads simply "N runs". Computed over m.board.runs
+// so it does not shrink under a filter.
 func (m tuiModel) boardSummary() string {
-	needs, stalled := 0, 0
+	approvals, inputs, warn := 0, 0, 0
 	for _, r := range m.board.runs {
-		if r.Status == "awaiting_approval" || r.Status == "awaiting_input" {
-			needs++
+		switch r.Status {
+		case "awaiting_approval":
+			approvals++
+		case "awaiting_input":
+			inputs++
 		}
-		if r.Health == "stalled" {
-			stalled++
+		if stalledHealth[r.Health] {
+			warn++
 		}
 	}
-	s := m.pal.faint.Render(fmt.Sprintf("%d runs", len(m.board.runs)))
-	if needs > 0 {
-		s += m.pal.faint.Render(" · ") + m.pal.chip(fmt.Sprintf("%d needs you", needs), m.pal.statusColor("awaiting_approval", ""))
+	var segs []string
+	if approvals > 0 {
+		segs = append(segs, paintSeg(m.pal.amber, nil, false, "⚑ "+itoa(approvals)))
 	}
-	if stalled > 0 {
-		s += m.pal.faint.Render(" · ") + lipgloss.NewStyle().Foreground(m.pal.statusStalled).Render(fmt.Sprintf("%d stalled", stalled))
+	if inputs > 0 {
+		segs = append(segs, paintSeg(m.pal.amber, nil, false, "✎ "+itoa(inputs)))
 	}
-	return s
+	if warn > 0 {
+		segs = append(segs, paintSeg(m.pal.stall, nil, false, "▲ "+itoa(warn)))
+	}
+	segs = append(segs, m.pal.faint.Render(itoa(len(m.board.runs))+" runs"))
+	return strings.Join(segs, m.pal.faint.Render(" · "))
 }
 
 // boardEmptyState replaces the old dead-end "no runs to show": it keeps the footer (added
@@ -397,93 +520,137 @@ func (m tuiModel) boardEmptyState() string {
 	if m.board.hideDone && strings.TrimSpace(m.board.filter) == "" {
 		for _, r := range m.board.runs {
 			if terminalRunStatuses[r.Status] {
-				return m.pal.faint.Render("No active runs — finished runs are hidden (h to show).") + "\n"
+				return m.pal.faint.Render(" No active runs — finished runs are folded (h to show).") + "\n"
 			}
 		}
 	}
 	if m.board.admin {
-		return m.pal.faint.Render("No active runs across the factory right now.") + "\n"
+		return m.pal.faint.Render(" No active runs across the factory right now.") + "\n"
 	}
-	return m.pal.faint.Render("No runs yet. Start one from the web board or the command line.") + "\n"
+	return m.pal.faint.Render(" No runs yet. Start one from the web board or the command line.") + "\n"
 }
 
-// boardRow renders one run: a status-coloured spine (with a NO_COLOR-safe glyph), the id,
-// OWNER on the admin board, a status chip, a health marker, AGE, and the title with an
-// own-board-only judge marker.
+// paintSeg styles one row segment with an optional foreground and (for a selected row) the warm
+// selection background. Applying the bg to EVERY segment — text and padding alike — is what
+// keeps it continuous across the row: wrapping pre-styled fg spans in an outer bg would be
+// dropped by their inner resets (the documented lipgloss gotcha), so each span carries its own.
+func paintSeg(fg, bg color.Color, bold bool, s string) string {
+	st := lipgloss.NewStyle()
+	if fg != nil {
+		st = st.Foreground(fg)
+	}
+	if bg != nil {
+		st = st.Background(bg)
+	}
+	if bold {
+		st = st.Bold(true)
+	}
+	return st.Render(s)
+}
+
+// padSeg right-pads s to n visual columns with background-carrying spaces, so a selected row's
+// warm bar reaches the padded width rather than stopping at the last glyph.
+func padSeg(s string, n int, bg color.Color) string {
+	if w := visualWidth(s); w < n {
+		return s + paintSeg(nil, bg, false, strings.Repeat(" ", n-w))
+	}
+	return s
+}
+
+// boardRow renders one run: the per-row ▌ andon strip and state glyph (state colour), the id,
+// the owner on the admin board, the status WORD (state colour, not a filled chip), AGE, the
+// milestone micro-bar, and the title, with an own-board-only judge marker flushed right. A
+// selected row rides the full-width warm selection bar with a ▸ cursor; a DONE-band row is
+// faint end to end.
 func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCols) string {
-	es := effectiveRunStatus(r.Status, r.IsPlanning)
-	sc := m.pal.statusColor(es, r.Health)
+	band := runBand(r.Status)
+	terminal := band == bandDone
+	tok := m.pal.stateToken(r.Status, r.Health, r.IsPlanning)
 
-	// The spine carries the status GLYPH in the chip foreground on the status-colour
-	// background. Under NO_COLOR / an Ascii profile the fill is stripped but the glyph
-	// survives, so the spine's signal (D3) does not depend on colour.
-	spine := lipgloss.NewStyle().Background(sc).Foreground(m.pal.chipFg).Render(statusGlyph(es))
-	gutter := " "
-	id := m.pal.faint.Render(padCell(shortRunID(r.ID), 9))
+	var bg color.Color
 	if sel {
-		gutter = m.pal.sel.Render("▸")
-		id = m.pal.sel.Render(padCell(shortRunID(r.ID), 9))
+		bg = m.pal.selBg
 	}
 
-	owner := ""
+	// A DONE row drops to faint even for a failed run — the ✗ glyph plus faint says "finished,
+	// and it failed" without lighting an alarm the board can no longer act on (the detail
+	// header keeps the red). The judge marker keeps its own severity colour regardless.
+	stateC := tok.color
+	if terminal {
+		stateC = m.pal.faintC
+	}
+	// Title colour by band: NEEDS YOU rows are amber (the one lit thing), the floor is default
+	// ink, DONE is faint.
+	var titleC color.Color
+	switch band {
+	case bandNeedsYou:
+		titleC = m.pal.amber
+	case bandDone:
+		titleC = m.pal.faintC
+	}
+	idC := m.pal.faintC
+	if sel {
+		idC = m.pal.tungsten
+	}
+
+	cursor := paintSeg(nil, bg, false, " ")
+	if sel {
+		cursor = paintSeg(m.pal.tungsten, bg, true, "▸")
+	}
+	gap := paintSeg(nil, bg, false, "  ")
+	row := cursor +
+		paintSeg(stateC, bg, false, "▌") +
+		paintSeg(stateC, bg, false, tok.glyph) +
+		paintSeg(nil, bg, false, " ") +
+		paintSeg(idC, bg, sel, padCell(shortRunID(r.ID), boardIDWidth)) +
+		gap
+
 	if m.board.admin {
-		// D7 (PRD #325 M2, B1): OwnerEmail is forge-authored untrusted text — route it
-		// through renderer.Plain (= capCell(cellText(...))); bare capCell would not strip
-		// control bytes. OwnerEmail is in d7UntrustedFields. F1: pad to the column so the
-		// admin rows and header align (Plain truncates but does not pad).
-		owner = "  " + m.pal.faint.Render(padCell(m.renderer.Plain(strOr(r.OwnerEmail, ""), boardOwnerWidth), boardOwnerWidth))
+		// D7 (B1): OwnerEmail is forge-authored untrusted text — route it through renderer.Plain
+		// (= capCell(cellText(...))); a bare capCell would not strip control bytes. OwnerEmail is
+		// in d7UntrustedFields.
+		row += paintSeg(m.pal.faintC, bg, false, padCell(m.renderer.Plain(strOr(r.OwnerEmail, ""), boardOwnerWidth), boardOwnerWidth)) + gap
 	}
 
-	statusCell := padVisual(m.pal.chip(m.renderer.Plain(es, boardStatusWidth-2), sc), boardStatusWidth)
+	row += paintSeg(stateC, bg, false, padCell(tok.word, boardStatusWordWidth)) + gap +
+		paintSeg(m.pal.faintC, bg, false, padCell(relAge(r.CreatedAt), boardAgeWidth)) + gap
 
-	// MILE: the compact milestone badge (M{done}/{total}) in its own fixed column between AGE
-	// and TITLE, blank for a run with no frozen list. A fixed column (not a float after the
-	// title) keeps the badge in one place down BOTH boards — milestones are informational,
-	// unlike the own-board judge marker that trails the title. padVisual holds the column
-	// width even when the badge is empty, so TITLE stays aligned across rows. Dropped entirely
-	// on a narrow terminal (boardShowMile), where its 8-col tax would clip the judge marker.
-	mileCell := ""
 	if m.boardShowMile() {
-		mileCell = padVisual(m.milestoneMarker(r), boardMileWidth) + "  "
+		row += padSeg(m.milestoneMarker(r, terminal, bg), boardMileWidth, bg) + gap
 	}
 
-	// F2 + title trim: cap the title to the remaining width (so no row exceeds boardRuleWidth
-	// and a narrow terminal does not wrap) AND to boardTitleMax (so a very long title is
-	// trimmed to a tidy column rather than running the full width of a wide terminal). The
-	// marker column allowance (its full width + a 2-col minimum gap) is reserved for EVERY row
-	// so the title column keeps a single width down the board.
+	// Title: capped to the remaining width AND to boardTitleMax. The marker column allowance is
+	// reserved for every row so the title keeps one width down the board; markers then align by
+	// flushing the whole row to width-fullW below.
 	markerAllow := 0
 	if mc.fullW > 0 {
 		markerAllow = mc.fullW + 2
 	}
-	avail := boardRuleWidth(m.width) - boardRowPrefixWidth(m.board.admin, m.boardShowMile()) - markerAllow
+	avail := m.width - boardRowPrefixWidth(m.board.admin, m.boardShowMile()) - markerAllow
 	if avail < 10 {
 		avail = 10
 	}
 	if avail > boardTitleMax {
 		avail = boardTitleMax
 	}
-	titleStr := padVisual(m.renderer.Plain(runTitle(r.RunDTO), avail), avail)
+	row += paintSeg(titleC, bg, false, clampVisual(m.renderer.Plain(runTitle(r.RunDTO), avail), avail))
 
-	row := spine + gutter + " " + id + owner + "  " + statusCell + "  " + m.boardHealthCell(r) + "  " +
-		m.pal.faint.Render(padCell(relAge(r.CreatedAt), 5)) + "  " + mileCell + titleStr
-
-	// F4: the judge marker (own board only; AdminListRuns carries no JudgeVerdict) is a
-	// fixed-width block flushed to the board's RIGHT EDGE, so the ⚖ icon and the count align
-	// down the board, in a column with the summary bar above. Every marker is mc.fullW wide, so
-	// flushing the row to boardRuleWidth-fullW lands them all in the same columns.
+	// Judge marker (own board only; AdminListRuns carries no JudgeVerdict), flushed to the right
+	// edge so the ⚖ icon and count align down the board.
 	if mc.fullW > 0 && !m.board.admin && r.JudgeVerdict != nil {
-		marker := m.verdictMarker(*r.JudgeVerdict, r.JudgeTodoCount, mc.verdictW, mc.countW)
-		row = padVisual(row, boardRuleWidth(m.width)-mc.fullW) + marker
+		row = padSeg(row, m.width-mc.fullW, bg) + m.verdictMarker(*r.JudgeVerdict, r.JudgeTodoCount, mc.verdictW, mc.countW, bg)
+	} else if sel {
+		// Keep the warm selection bar spanning the full width even with no trailing marker.
+		row = padSeg(row, m.width, bg)
 	}
 	return row
 }
 
-// boardRowPrefixWidth is the visual width of every column before TITLE, so F2 can size the
-// title to what remains. spine(1)+gutter(1)+space(1)+id(9), then two-space gaps around the
-// STATUS, HEALTH and AGE cells, the MILE cell when shown, plus the admin OWNER cell.
+// boardRowPrefixWidth is the visual width of every column before TITLE, so the title can be
+// sized to what remains. cursor(1)+strip(1)+glyph(1)+space(1)+id, then two-space gaps around
+// the status-word and AGE cells, the micro-bar cell when shown, plus the admin owner cell.
 func boardRowPrefixWidth(admin, mile bool) int {
-	w := 3 + 9 + 2 + boardStatusWidth + 2 + boardHealthWidth + 2 + 5 + 2
+	w := 4 + boardIDWidth + 2 + boardStatusWordWidth + 2 + boardAgeWidth + 2
 	if mile {
 		w += boardMileWidth + 2
 	}
@@ -493,30 +660,12 @@ func boardRowPrefixWidth(admin, mile bool) int {
 	return w
 }
 
-// boardHealthCell is the HEALTH column. "stalled" (which also turns the spine/chip orange
-// via statusColor and is counted in the summary) keeps its ▲ glyph; every other non-ok
-// health (slow / looping / waiting_worker) shows its WORD, as the pre-redesign board did,
-// truncated to the column. ok/empty is blank. The cell is always boardHealthWidth wide so
-// AGE and TITLE stay aligned.
-func (m tuiModel) boardHealthCell(r apitypes.RunListItemDTO) string {
-	switch h := boardHealth(r); h {
-	case "":
-		return strings.Repeat(" ", boardHealthWidth)
-	case "stalled":
-		return padVisual(lipgloss.NewStyle().Foreground(m.pal.statusStalled).Render("▲"), boardHealthWidth)
-	default:
-		// The word, sanitized + capped (Health is server-controlled, but drawn defensively
-		// like every other cell), in the default colour — visible, not faint.
-		return padCell(m.renderer.Plain(h, boardHealthWidth), boardHealthWidth)
-	}
-}
-
 // boardMarkerCols are the fixed sub-column widths of the judge marker across the visible rows:
 // verdictW for the variable-length verdict WORD (ideal/ok/issues) and countW for the "· N"
 // recommendation count. fullW is the whole marker's width. Splitting the marker into fixed
 // sub-columns is what keeps the ⚖ icon and the count in stable columns while only the verdict
-// word moves within its own slot (the count is short and fixed, the verdict is not). All zero
-// on the admin board (no verdicts) or when no visible row carries a verdict.
+// word moves within its own slot. All zero on the admin board (no verdicts) or when no visible
+// row carries a verdict.
 type boardMarkerCols struct{ verdictW, countW, fullW int }
 
 func (m tuiModel) boardMarkerCols(rows []apitypes.RunListItemDTO) boardMarkerCols {
@@ -540,19 +689,18 @@ func (m tuiModel) boardMarkerCols(rows []apitypes.RunListItemDTO) boardMarkerCol
 	if mc.verdictW > 0 {
 		// The empty-verdict/zero-count marker has the full fixed width, and visualWidth accounts
 		// for the ⚖ glyph's own cell count.
-		mc.fullW = visualWidth(m.verdictMarker("", 0, mc.verdictW, mc.countW))
+		mc.fullW = visualWidth(m.verdictMarker("", 0, mc.verdictW, mc.countW, nil))
 	}
 	return mc
 }
 
-// verdictMarker is the own-board ⚖ judge badge, coloured by severity (issues → red, ideal/ok →
-// teal). It lays the verdict WORD out LEFT-aligned in a fixed verdictW slot and the "· N"
-// recommendation count in a fixed countW slot after it, so down the board the ⚖ icon and the
-// count align and only the verdict word shifts within its slot. The verdict is a closed enum
-// but rendered through Plain so an unrecognised value from a newer server cannot inject control
-// bytes. A run with no open recommendations (JudgeTodoCount 0) leaves the count slot blank.
-func (m tuiModel) verdictMarker(verdict string, todo, verdictW, countW int) string {
-	c := m.pal.verdictColor(verdict)
+// verdictMarker is the own-board ⚖ judge badge, coloured by severity (issues → alarm red,
+// everything else → faint) via the shared verdictColor. It lays the verdict WORD out in a fixed
+// verdictW slot and the "· N" count in a fixed countW slot after it, so down the board the ⚖
+// icon and the count align and only the verdict word shifts. The verdict is a closed enum but
+// rendered through Plain so an unrecognised value from a newer server cannot inject control
+// bytes. bg carries the selection bar behind the marker on a selected row.
+func (m tuiModel) verdictMarker(verdict string, todo, verdictW, countW int, bg color.Color) string {
 	label := "⚖ " + padVisual(m.renderer.Plain(verdict, 8), verdictW)
 	if countW > 0 {
 		count := ""
@@ -561,52 +709,32 @@ func (m tuiModel) verdictMarker(verdict string, todo, verdictW, countW int) stri
 		}
 		label += " " + padVisual(count, countW)
 	}
-	return lipgloss.NewStyle().Foreground(c).Render(label)
+	return paintSeg(m.pal.verdictColor(verdict), bg, false, label)
 }
 
-// milestoneMarker is the board's compact milestone badge — `M{done}/{total}` (or `M–/{total}`
-// when nothing was reported), the TUI twin of the web's MilestoneBadge. Empty for a run with
-// no frozen milestone list, so a non-milestone row is byte-for-byte unchanged. It carries no
-// untrusted text (only counts), so it needs no D7 sanitizing. Drawn faint: milestones are an
-// at-a-glance progress read, not an attention signal like the judge marker or a stalled row.
-func (m tuiModel) milestoneMarker(r apitypes.RunListItemDTO) string {
+// milestoneMarker is the board's compact milestone micro-bar — one cell per frozen milestone,
+// done ▰ (tungsten, or faint on a DONE row) ahead of remaining ▱ (faint) — the TUI twin of the
+// web's MilestoneBadge. It keeps the –/N TEXT when nothing was reported (never a bar that looks
+// like failure) and falls back to N/M text when the list is longer than boardMileCap. Empty for
+// a run with no frozen list, so a non-milestone row draws nothing. Carries only counts, so it
+// needs no D7 sanitizing. bg carries the selection bar behind it on a selected row.
+func (m tuiModel) milestoneMarker(r apitypes.RunListItemDTO, dim bool, bg color.Color) string {
 	done, total, reported := milestoneProgress(r.RunDTO)
 	if total == 0 {
 		return ""
 	}
-	return m.pal.faint.Render("M" + milestoneCount(done, total, reported))
-}
-
-// statusGlyph is the per-status spine marker. It is the NO_COLOR fallback (D3), so it must
-// read without colour and be a single terminal cell wide.
-func statusGlyph(status string) string {
-	switch status {
-	case "running":
-		return "●"
-	case "planning":
-		return "○"
-	case "awaiting_approval":
-		return "!"
-	case "awaiting_input":
-		return "?"
-	case "limit_wait":
-		return "~"
-	case "completed":
-		return "✓"
-	case "failed":
-		return "✗"
-	default: // queued, claimed, cancelled, unknown
-		return "·"
+	if !reported {
+		return paintSeg(m.pal.faintC, bg, false, "–/"+itoa(total))
 	}
-}
-
-// boardHealth renders the PRD #47 health flag, blank when healthy so the column is
-// quiet in the normal case and an anomaly stands out.
-func boardHealth(r apitypes.RunListItemDTO) string {
-	if r.Health == "" || r.Health == "ok" {
-		return ""
+	if total > boardMileCap {
+		return paintSeg(m.pal.faintC, bg, false, itoa(done)+"/"+itoa(total))
 	}
-	return r.Health
+	fillC := m.pal.tungsten
+	if dim {
+		fillC = m.pal.faintC
+	}
+	return paintSeg(fillC, bg, false, strings.Repeat("▰", done)) +
+		paintSeg(m.pal.faintC, bg, false, strings.Repeat("▱", total-done))
 }
 
 // shortRunID is the board's id cell: the first 8 of a UUID, which is the rule

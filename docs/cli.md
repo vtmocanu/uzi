@@ -379,17 +379,24 @@ also the TUI's own fallback when the live channel is unreachable (below).
   `uza_` token; a `uzc_` token gets refused inline and stays on your own
   runs, never a crash). **The admin board isn't your own-runs list widened —
   it's a different shape**: active runs only (nothing completed), capped at
-  500, no judge-verdict or usage columns, titled "active runs (factory-wide)"
-  on screen so it never promises a row it can't show. A milestone-structured
-  run (one planned from a `PRD`-labelled issue) carries a compact `MILE` column
-  between AGE and TITLE showing `M{done}/{total}` (or `M–/N` when nothing has
-  been reported complete yet); the column is hidden on a narrow terminal, and
-  the full breakdown is on the run detail view. `[h]` hides finished runs
-  (completed/failed/cancelled), leaving the active and needs-you runs. The list
-  windows to the terminal height so the header and key legend stay on screen
-  however many runs there are, with a position readout (`N–M of T`) top-right;
-  the whole board refreshes on the poll, so STATUS, HEALTH, MILE, AGE and the
-  judge verdict stay live.
+  500, no judge-verdict or usage columns, titled `▚▚ uzi · active runs` on
+  screen so it never promises a row it can't show. A milestone-structured
+  run (one planned from a `PRD`-labelled issue) shows a compact `▰▱` milestone
+  micro-bar between AGE and TITLE (one `▰` per reported-complete milestone, `▱`
+  for the rest, or `–/N` text when nothing has been reported complete yet); the
+  micro-bar is hidden on a narrow terminal, and the full breakdown is on the run
+  detail view. `[h]` hides finished runs (completed/failed/cancelled), leaving
+  the active and needs-you runs. The rows are grouped into three triage bands
+  (NEEDS YOU, then ON THE FLOOR, then DONE) rather than one flat table, and each
+  row reads left to right as a `▌` andon strip and status glyph, the run id, the
+  status WORD in its own colour (a stalled run reads `▲ stalled`, because health
+  folds into the status token rather than a separate column), the AGE, the
+  milestone micro-bar, and the TITLE; there are no STATUS/HEALTH/MILE column
+  headers or full-width rules. The list windows to the terminal height so the
+  wordmark and key legend stay on screen however many runs there are, with the
+  visible run span (`lo–hi`) shown in the top-right summary cluster
+  (`⚑ N · ✎ N · ▲ N · T runs`); the whole board refreshes on the poll, so
+  status, health, milestones, age and the judge verdict stay live.
 - **Run detail** (`[enter]` from the board, or `uzi tui <run-id>` directly).
   A left rail of agent lanes — the lead plus each live subagent, one lane per
   invocation, each with a status dot — beside the selected lane's transcript,
@@ -432,8 +439,8 @@ focused pane — moving the agent selection when the rail is focused, scrolling
 the transcript when it is. A run opens focused on the crew rail.
 
 The transcript **follows live** (tail -f): while a run is producing output the
-transcript auto-tails the newest frame and shows a `● FOLLOWING` badge.
-Scrolling up detaches it — the badge becomes `⏸ PAUSED ↓N new` (N is how many
+transcript auto-tails the newest frame and shows a `⇣ following` badge.
+Scrolling up detaches it — the badge becomes `⏸ N new · g ⇣` (N is how many
 lines are below the fold) and the view holds still so you can read — and `g`
 (or scrolling back to the bottom) re-attaches and jumps to the newest output.
 Only a live run follows; a finished run's transcript is static.

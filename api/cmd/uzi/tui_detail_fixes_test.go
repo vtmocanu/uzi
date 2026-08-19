@@ -152,30 +152,52 @@ func TestTransportChrome(t *testing.T) {
 
 // The header is clamped to the terminal width, so the duration and folded "● live" tag on a long
 // title cannot wrap the header into a second physical row — which would make transcriptViewport
-// under-count and push the footer off the bottom (the #379 invariant). The duration still shows.
+// under-count and push the footer off the bottom (the #379 invariant). The status WORD and the
+// elapsed duration ride line 2's RIGHT edge and must NEVER be the field that truncates — the title
+// truncates with … instead. B1 regression: before the title was capped to leave room for `right`,
+// padVisual (which never truncates) let a long title fill the left and the final clampVisual cut
+// `right` off the end, so at width 80 the status word vanished entirely. Exercised at 70/80/90/100.
 func TestDetailHeaderFitsWidthWithDuration(t *testing.T) {
 	now := time.Now()
 	runID := "abcdabcd-1111"
 	started := now.Add(-2*time.Hour - 13*time.Minute)
 	run := apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running", StartedAt: &started,
 		IssueTitle: strings.Repeat("Refactor the forge sync loop for the GitHub driver ", 3)}
-	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
-	m.width, m.height = 100, 34
-	next, _ := m.Update(detailLoadedMsg{run: run,
-		msgs: []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)}})
-	m = next.(tuiModel)
-	m.detail.stream = &uzicli.RunStream{} // live socket → the "● live" tag is folded into the header too
 
-	content := m.View().Content
-	rows := strings.Split(content, "\n")
-	if len(rows) != 34 {
-		t.Fatalf("detail rendered %d rows, want the terminal height 34\n%s", len(rows), content)
+	render := func(w int) []string {
+		m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+		m.width, m.height = w, 34
+		next, _ := m.Update(detailLoadedMsg{run: run,
+			msgs: []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)}})
+		m = next.(tuiModel)
+		m.detail.stream = &uzicli.RunStream{} // live socket → the "● live" tag is folded into the header too
+		return strings.Split(m.View().Content, "\n")
 	}
-	if w := visualWidth(rows[0]); w > 100 {
-		t.Errorf("header is %d cols at width 100 (must clamp, else it wraps and clips the footer): %q", w, rows[0])
-	}
-	if !strings.Contains(rows[0], "2h13m") {
-		t.Errorf("header missing run duration 2h13m: %q", rows[0])
+
+	for _, w := range []int{70, 80, 90, 100} {
+		rows := render(w)
+		if len(rows) != 34 {
+			t.Fatalf("width %d: detail rendered %d rows, want the terminal height 34\n%s", w, len(rows), strings.Join(rows, "\n"))
+		}
+		// The two-line header: neither physical row may exceed the width (a wrap would clip the footer).
+		if vw := visualWidth(rows[0]); vw > w {
+			t.Errorf("width %d: header line 1 is %d cols (must clamp, else it wraps and clips the footer): %q", w, vw, rows[0])
+		}
+		if vw := visualWidth(rows[1]); vw > w {
+			t.Errorf("width %d: header line 2 is %d cols (must clamp): %q", w, vw, rows[1])
+		}
+		// The status WORD and the "· <dur>" segment both render in FULL on line 2, at every width —
+		// the title is what truncates, never `right`.
+		if !strings.Contains(rows[1], "running") {
+			t.Errorf("width %d: header line 2 missing the status word 'running' (it must never be the field that truncates): %q", w, rows[1])
+		}
+		if !strings.Contains(rows[1], "· 2h13m") {
+			t.Errorf("width %d: header line 2 missing the elapsed duration '· 2h13m': %q", w, rows[1])
+		}
+		// "● live" keeps its own reserved slot on line 1, so it never clips either.
+		if !strings.Contains(rows[0], "live") {
+			t.Errorf("width %d: header line 1 missing the ● live transport tag: %q", w, rows[0])
+		}
 	}
 }
 
@@ -256,11 +278,11 @@ func TestTUIAdminBoardRowsFitNarrowWidth(t *testing.T) {
 				t.Errorf("admin board row is %d cols at width %d (overflows the edge): %q", vw, w, r)
 			}
 		}
-		if strings.Contains(out, "MILE") {
-			t.Errorf("MILE column should be hidden on the narrow admin board at width %d\n%s", w, out)
+		if strings.Contains(out, "▰") {
+			t.Errorf("milestone micro-bar should be hidden on the narrow admin board at width %d\n%s", w, out)
 		}
 	}
-	if wide := render(120); !strings.Contains(wide, "MILE") {
-		t.Errorf("MILE column should return on a wide admin board\n%s", wide)
+	if wide := stripANSI(render(120)); !strings.Contains(wide, "▰▰▱▱") {
+		t.Errorf("milestone micro-bar should return on a wide admin board\n%s", wide)
 	}
 }

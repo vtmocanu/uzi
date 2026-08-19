@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+	lipgloss "charm.land/lipgloss/v2"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
@@ -150,6 +151,20 @@ func (m tuiModel) reviewKey(k string) (tuiModel, tea.Cmd, bool) {
 	return m, nil, true // the overlay swallows everything else while open
 }
 
+// severityMark maps a recommendation's confidence to a ranking mark: high → ▲ alarm-red bold,
+// medium → ■ amber, low → · faint. The glyph is the NO_COLOR twin, so the ordering survives a
+// colour strip.
+func (m tuiModel) severityMark(confidence string) (string, lipgloss.Style) {
+	switch confidence {
+	case "high":
+		return "▲", lipgloss.NewStyle().Foreground(m.pal.alarm).Bold(true)
+	case "medium":
+		return "■", lipgloss.NewStyle().Foreground(m.pal.amber)
+	default: // low / unknown
+		return "·", m.pal.faint
+	}
+}
+
 func (m tuiModel) renderReviewOverlay() string {
 	r := &m.detail.review
 	var sb strings.Builder
@@ -174,11 +189,12 @@ func (m tuiModel) renderReviewOverlay() string {
 	}
 
 	rv := r.review
-	// verdict is a CLOSED enum, so it is safe to branch on and safe to render as a chip.
-	// PRD #325 M6: the chip is coloured by SEVERITY (issues → red, ideal/ok → teal) via the
-	// shared verdictColor, so it no longer reads in the same brand-blue as everything else.
-	// triageLine is the shared tally renderer (also used by `uzi review show`).
-	sb.WriteString(m.pal.faint.Render("verdict ") + m.pal.chip(m.renderer.Plain(rv.Verdict, 16), m.pal.verdictColor(rv.Verdict)) +
+	// verdict is a CLOSED enum, so it is safe to branch on. It is a bold word coloured by
+	// SEVERITY (issues → alarm red, else faint) via the shared verdictColor — no chip fill, in
+	// keeping with the one-filled-surface rule. triageLine is the shared tally renderer (also
+	// used by `uzi review show`).
+	verdictWord := lipgloss.NewStyle().Foreground(m.pal.verdictColor(rv.Verdict)).Bold(true).Render(m.renderer.Plain(rv.Verdict, 16))
+	sb.WriteString(m.pal.faint.Render("verdict ") + verdictWord +
 		"   " + m.pal.faint.Render(cellText(triageLine(rv.Triage))) + "\n\n")
 
 	if rv.SummaryMd != "" {
@@ -196,9 +212,12 @@ func (m tuiModel) renderReviewOverlay() string {
 
 	byCoord := dispositionsByCoord(rv.Dispositions)
 	for i, rec := range rv.Recommendations {
-		// category and confidence are closed enums; target is FREE TEXT and goes
-		// through the cell path.
-		head := m.renderer.Plain(rec.Category, 20) + " · " + m.renderer.Plain(rec.Target, 48) +
+		// category and confidence are closed enums; target is FREE TEXT and goes through the
+		// cell path. Each finding leads with a severity mark (glyph + colour + weight) keyed on
+		// confidence, so high findings read first — the glyph twin keeps the ranking under
+		// NO_COLOR.
+		glyph, sevStyle := m.severityMark(rec.Confidence)
+		head := sevStyle.Render(glyph+" "+m.renderer.Plain(rec.Category, 20)) + m.pal.faint.Render(" · ") + m.renderer.Plain(rec.Target, 48) +
 			" " + m.pal.faint.Render("("+m.renderer.Plain(rec.Confidence, 10)+" · "+shortRecID(rec.ID)+")")
 		if d, ok := byCoord[coordKey(rec.Category, rec.Target)]; ok {
 			head += m.pal.faint.Render(dispositionSuffix(d))
