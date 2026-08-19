@@ -52,20 +52,26 @@ export const MEMORY_EVIDENCE_MAX_BYTES = 200;
 
 /**
  * Obvious "volatile snapshot" shapes a durable memory should NOT be built around:
- * a test-pass/fail count ("1156 pass"), a ratio ("1156/1157"), or an "N of M"
- * tally. A match appends a NON-FATAL nudge to the (already-successful) save — it
- * NEVER rejects, because a legitimate numeric fact can wear the same shape; the
- * memory is stored either way. Complements the tool-description/prompt guidance.
+ * a test-pass/fail count ("1156 pass"), a ratio ("1156/1157"), an "N of M" tally,
+ * or a structural count ("24-column SELECT", "12 rows", "3 fields") — a
+ * schema/result-shape figure that decays as the schema or query changes. A match
+ * appends a NON-FATAL nudge to the (already-successful) save — it NEVER rejects,
+ * because a legitimate numeric fact can wear the same shape; the memory is stored
+ * either way. Complements the tool-description/prompt guidance.
  *
  * COST COUPLING: this alternation backtracks superlinearly on an adversarial digit
  * run, so its cost is bounded ONLY by the input length. The `bytes >
  * MEMORY_BODY_MAX_BYTES` early-return in saveMemory runs BEFORE this regex is ever
  * tested, so `body` here is always ≤ MEMORY_BODY_MAX_BYTES (2048) — that cap is the
- * bound (auditor measured ~48ms worst case at 2048 bytes, ~0.8s at 8192). Raising
- * MEMORY_BODY_MAX_BYTES therefore raises this per-call worst case: revisit this
- * regex (anchor it, or drop the superlinear `\d+\s*` prefixes) if the cap grows.
+ * bound (auditor measured ~48ms worst case at 2048 bytes, ~0.8s at 8192). The
+ * structural-noun branch is the same shape as the other three — a `\d+` prefix and
+ * a single BOUNDED `[\s-]*` char class (no nested unbounded quantifier) — so it does
+ * not worsen that order. Raising MEMORY_BODY_MAX_BYTES therefore raises this
+ * per-call worst case: revisit this regex (anchor it, or drop the superlinear
+ * `\d+\s*` prefixes) if the cap grows.
  */
-const VOLATILE_SNAPSHOT_RE = /\d+\s*(?:pass|fail)|\d+\s*\/\s*\d+|\bof\s+\d+\b/i;
+const VOLATILE_SNAPSHOT_RE =
+  /\d+\s*(?:pass|fail)|\d+\s*\/\s*\d+|\bof\s+\d+\b|\d+[\s-]*(?:columns?|rows?|fields?|tables?)\b/i;
 
 /**
  * A "config claim" is a memory that asserts THIS run's OWN roster/tool/runtime
@@ -122,6 +128,41 @@ const CONFIG_CLAIM_RE = new RegExp(
     "\\b[\\s\\S]{0,40}\\b" +
     CONFIG_POSS +
     "\\b))",
+  "i",
+);
+
+/**
+ * An "environment-capability" claim asserts that a tool/binary is PRESENT or ABSENT
+ * in the worker environment ("`openssl` is absent", "jq is not installed"). That
+ * class of fact decays as the image/toolchain changes, so it should be re-verified
+ * (or read live) rather than remembered. A match appends a NON-FATAL nudge to the
+ * (already-successful) save — never a rejection, exactly like the other two nudges;
+ * the memory is stored either way and isError stays false.
+ *
+ * The discriminator (mirrors CONFIG_CLAIM_RE's discipline): fire ONLY when a
+ * tool-ish token (ENV_TOOL) co-occurs with a presence/absence predicate
+ * (ENV_PRESENCE) within a BOUNDED window — so bare tool-name prose ("openssl signs
+ * the smoke-test cert") stays quiet. Like the other two nudges it is deliberately
+ * warn-only/over-broad: plain prose such as "the feature is available" can trip it,
+ * and that is acceptable — it never rejects.
+ *
+ * COST COUPLING (same discipline as the other two): `body` is ≤ MEMORY_BODY_MAX_BYTES
+ * (2048) by the early-return before this regex runs. The inter-token gap is a
+ * BOUNDED `[\s\S]{0,20}` with no nested unbounded quantifier — the only `*` is the
+ * simple char-class star in ENV_TOOL, linear in input — so the worst case is bounded
+ * by the cap. Revisit if MEMORY_BODY_MAX_BYTES grows.
+ */
+// A tool-ish token: a backtick-wrapped identifier, or a bare lowercase
+// command-like word (openssl, jq, pg_isready).
+const ENV_TOOL = "(?:`[a-z][\\w.+-]*`|\\b[a-z][a-z0-9_+-]*\\b)";
+// Presence/absence predicate; negation ("not"/"isn't") and copula ("is")
+// live in the bounded gap, so the base word set stays small.
+const ENV_PRESENCE = "(?:absent|missing|unavailable|installed|available|present|on (?:the )?PATH)";
+const ENV_CAPABILITY_RE = new RegExp(
+  "(?:" +
+    ENV_TOOL + "[\\s\\S]{0,20}\\b" + ENV_PRESENCE + "\\b" +
+    "|\\b" + ENV_PRESENCE + "\\b[\\s\\S]{0,20}" + ENV_TOOL +
+  ")",
   "i",
 );
 
@@ -218,8 +259,14 @@ export function makeMemoryToolHandlers(deps: MemoryToolsDeps): MemoryToolHandler
         const configClaimNudge = CONFIG_CLAIM_RE.test(body)
           ? " Note: this asserts your run's own subagent tool/roster configuration (which role can Edit/Write, is read-only, or inherits tools). It is saved, but READ that live from the per-turn roster rather than remembering it — such config changes as the product evolves, so a remembered version can be wrong."
           : "";
+        // Independent of the other two nudges (any combination may append): flag a
+        // claim that a tool/binary is present or absent in the worker environment,
+        // which decays as the image/toolchain changes. Append-only — never rejects.
+        const envCapabilityNudge = ENV_CAPABILITY_RE.test(body)
+          ? " Note: this asserts a tool/binary is present or absent in the worker environment. It is saved, but environment-capability facts change as the image/toolchain changes — prefer basis: observed with evidence and re-verify before relying on it (or read it live)."
+          : "";
         return asText(
-          `Saved cross-run memory "${entry.title}" (id ${entry.id}). Future runs on this repository will see it as advisory context — it is NOT authoritative and will never override the current task.${snapshotNudge}${configClaimNudge}`,
+          `Saved cross-run memory "${entry.title}" (id ${entry.id}). Future runs on this repository will see it as advisory context — it is NOT authoritative and will never override the current task.${snapshotNudge}${configClaimNudge}${envCapabilityNudge}`,
         );
       } catch (err) {
         log.warn("save_memory tool failed", { run_id: runId, error: errMessage(err) });
@@ -255,8 +302,9 @@ export function buildMemoryServer(deps: MemoryToolsDeps): {
           "or anything sensitive. The per-run home/memory directory is ephemeral and file",
           "writes outside the worktree are denied — this tool is the ONLY sanctioned way to",
           "persist a note. Record the DURABLE fact, not a volatile snapshot: prefer a mechanism",
-          "or command over today's number (a test-pass count, a version tally, an \"N of M\" ratio",
-          "all decay and mislead a later run). Keep the title short and the body a couple of sentences.",
+          "or command over today's number (a test-pass count, a version tally, an \"N of M\" ratio,",
+          "a structural count like a column/row/field tally, or a tool's presence/absence in the",
+          "environment all decay and should be read live). Keep the title short and the body a couple of sentences.",
           "Set basis to \"observed\" ONLY when the claim is backed by something you can name — a",
           "tool result, command output, or a file:line — and put that pointer in evidence; otherwise",
           "leave basis \"inferred\". A later run is told which, and re-verifies an inferred claim before",

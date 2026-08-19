@@ -108,7 +108,17 @@ describe("save_memory handler (PRD #90 M2)", () => {
   });
 
   it("appends a NON-FATAL nudge when the body reads like a volatile snapshot (still saves)", async () => {
-    for (const body of ["1156 pass, 0 fail", "1156/1157 green", "1 of 227 suites failed", "3 fail after the fix"]) {
+    for (const body of [
+      "1156 pass, 0 fail",
+      "1156/1157 green",
+      "1 of 227 suites failed",
+      "3 fail after the fix",
+      // Structural counts (schema/result-shape figures) trip the fourth branch.
+      "a 24-column SELECT",
+      "GetUserByID returns 12 rows",
+      "the migration adds 3 fields",
+      "the schema spans 5 tables",
+    ]) {
       const { client, calls } = fakeClient();
       const res = await handlers(client).saveMemory({ title: "t", body });
       assert.strictEqual(calls.saveMemory.length, 1, `${body} must still be POSTed`);
@@ -118,8 +128,16 @@ describe("save_memory handler (PRD #90 M2)", () => {
     }
   });
 
-  it("does NOT nudge a DIGIT-FREE durable fact (nothing that looks like a snapshot)", async () => {
-    for (const body of ["gcc is baked in; no build-essential needed", "set GOFLAGS=-buildvcs=false in linked worktrees"]) {
+  it("does NOT nudge a durable fact that is digit-free or wears no snapshot shape", async () => {
+    for (const body of [
+      "gcc is baked in; no build-essential needed",
+      "set GOFLAGS=-buildvcs=false in linked worktrees",
+      // Structural noun with NO digit prefix — the \d+ requirement keeps it quiet.
+      "the users table lists columns and rows for each record",
+      // Digit + "field"-prefixed word but no word boundary after "field": the
+      // trailing \b guards against "3 fieldwork".
+      "3 fieldwork sessions were completed on site",
+    ]) {
       const { client } = fakeClient();
       const res = await handlers(client).saveMemory({ title: "t", body });
       assert.notStrictEqual(res.isError, true);
@@ -189,6 +207,42 @@ describe("save_memory handler (PRD #90 M2)", () => {
     }
   });
 
+  it("appends a NON-FATAL env-capability nudge when the body asserts a tool is present/absent (still saves)", async () => {
+    // Each body pairs a tool-ish token with a presence/absence predicate — an
+    // environment-capability fact that decays as the image/toolchain changes.
+    const positives = [
+      "e2e cannot run because `openssl` is absent",
+      "openssl is absent",
+      "jq is not installed",
+      "pg_isready is not available",
+      "openssl is not on PATH",
+      // Presence-FIRST ordering (predicate before the tool token) also fires.
+      "absent: openssl in the base image",
+    ];
+    for (const body of positives) {
+      const { client, calls } = fakeClient();
+      const res = await handlers(client).saveMemory({ title: "t", body });
+      assert.strictEqual(calls.saveMemory.length, 1, `${body} must still be POSTed`);
+      assert.notStrictEqual(res.isError, true, `${body} must NOT be rejected — advisory only`);
+      assert.match(bodyText(res), /Saved cross-run memory/);
+      assert.match(bodyText(res), /environment-capability facts change/i, `${body} should trigger the env-capability nudge`);
+    }
+  });
+
+  it("does NOT nudge tool-name-only prose with no presence/absence predicate (env-capability)", async () => {
+    const negatives = [
+      "openssl signs the smoke-test cert during e2e setup",
+      "jq parses the API response in the smoke script",
+    ];
+    for (const body of negatives) {
+      const { client, calls } = fakeClient();
+      const res = await handlers(client).saveMemory({ title: "t", body });
+      assert.strictEqual(calls.saveMemory.length, 1, `${body} must still be POSTed`);
+      assert.notStrictEqual(res.isError, true);
+      assert.doesNotMatch(bodyText(res), /environment-capability facts change/i, `${body} must not trigger the env-capability nudge`);
+    }
+  });
+
   it("appends BOTH nudges when a body matches the snapshot AND the config-claim shapes (PRD #266 M4)", async () => {
     const { client, calls } = fakeClient();
     // "3 of 5" trips the snapshot regex; "coder ... has no Edit/Write" trips the config regex.
@@ -198,6 +252,18 @@ describe("save_memory handler (PRD #90 M2)", () => {
     assert.notStrictEqual(res.isError, true, "neither nudge is a rejection");
     assert.match(bodyText(res), /volatile snapshot/i, "the snapshot nudge appears");
     assert.match(bodyText(res), /read that live from the per-turn roster/i, "the config-claim nudge appears too — one must not clobber the other");
+  });
+
+  it("appends ALL THREE nudges when a body trips the snapshot, config-claim, AND env-capability shapes", async () => {
+    const { client, calls } = fakeClient();
+    // "3 of 5" trips snapshot; "coder ... is read-only" trips config; "`jq` is absent" trips env.
+    const body = "3 of 5 turns the coder subagent is read-only and `jq` is absent";
+    const res = await handlers(client).saveMemory({ title: "t", body });
+    assert.strictEqual(calls.saveMemory.length, 1, "the memory is still saved");
+    assert.notStrictEqual(res.isError, true, "no nudge is a rejection");
+    assert.match(bodyText(res), /volatile snapshot/i, "the snapshot nudge appears");
+    assert.match(bodyText(res), /read that live from the per-turn roster/i, "the config-claim nudge appears");
+    assert.match(bodyText(res), /environment-capability facts change/i, "the env-capability nudge appears");
   });
 
   it("rejects an empty title/body client-side with a tool error and NO network call", async () => {
