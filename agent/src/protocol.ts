@@ -532,6 +532,15 @@ export interface ClaimResponse {
   /** The model a judge run runs on (PRD #46), resolved from the judge_model setting.
    *  Present only for kind="judge". */
   judge_model?: string | null;
+  /** The model the inline run-summary generator runs on (PRD #362), resolved
+   *  user-value-wins from users.summary_model over the instance summary_model at
+   *  ISSUE-run claim assembly. Rides the issue-run claim (unlike judge_model, which
+   *  is judge-only); absent on older servers. */
+  summary_model?: string | null;
+  /** True when the run's INTENT summary is already set (PRD #362 M3c, Decision 3):
+   *  the executor then skips intent generation on a resume/re-claim so the owner's
+   *  token is not re-spent. Absent/false on a fresh run and on older servers. */
+  summary_intent_present?: boolean;
   /** The API's deterministic command-not-found pre-scan of the reviewed run's tool
    *  output (PRD #46 Decision 4). Present only for kind="judge" (omitted when empty).
    *  The judge interprets it; if the model call fails it is the fallback. */

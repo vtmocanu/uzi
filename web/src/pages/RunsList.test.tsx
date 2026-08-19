@@ -194,6 +194,46 @@ describe("RunsList — the run title carries no format characters (#124)", () =>
   });
 });
 
+// PRD #362 M4: a one-line intent preview under the title, shown once the worker posts the
+// intent summary. Absent (pre-feature / early run) leaves only the title.
+describe("RunsList — intent preview (PRD #362 M4)", () => {
+  beforeEach(() => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: false },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+  });
+
+  it("shows the intent preview when summary_intent is present", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "r", issue_title: "Add rate limiting", summary_intent: "Throttle the API with a token bucket." })],
+    });
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("Add rate limiting")).toBeTruthy());
+    expect(screen.getByText("Throttle the API with a token bucket.")).toBeTruthy();
+  });
+
+  it("shows no preview when summary_intent is absent (only the title)", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "r", issue_title: "Add rate limiting", summary_intent: null })],
+    });
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("Add rate limiting")).toBeTruthy());
+    // The title is the only text row for this run; no second preview line.
+    expect(screen.queryByText("Throttle the API with a token bucket.")).toBeNull();
+  });
+
+  it("strips bidi/format characters out of the untrusted intent preview", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "r", issue_title: "Add rate limiting", summary_intent: "Throttle ‮the API​" })],
+    });
+    const { container } = renderRuns();
+    await waitFor(() => expect(screen.getByText("Add rate limiting")).toBeTruthy());
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(screen.getByText("Throttle the API")).toBeTruthy();
+  });
+});
+
 describe("RunsList — waiting for vault unlock (PRD #32)", () => {
   it("renders own queued runs as waiting for vault unlock while locked", async () => {
     vi.mocked(useAuth).mockReturnValue({

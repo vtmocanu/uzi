@@ -29,6 +29,11 @@ type fakeSettings struct {
 	dailyBudget     int
 	spendGuardErr   error // read error for the PRD #69 M5 spend-guard accessors (fail-open)
 	model           string
+	// summaryModel is the instance-default run-summary model (PRD #362 M2); the zero
+	// value ("") reads as "no instance model", so an issue-run claim leaves SummaryModel
+	// nil unless a test sets it. summaryModelErr models a settings read fault.
+	summaryModel    string
+	summaryModelErr error
 	prdLabel        string
 	eligibleLabels  []string
 	waivesPRDLink   bool
@@ -46,7 +51,10 @@ func (f fakeSettings) JudgeDailyBudget(context.Context) (int, error) {
 	return f.dailyBudget, f.spendGuardErr
 }
 func (f fakeSettings) JudgeModel(context.Context) (string, error) { return f.model, f.err }
-func (f fakeSettings) PRDLabel(context.Context) (string, error)   { return f.prdLabel, f.err }
+func (f fakeSettings) SummaryModel(context.Context) (string, error) {
+	return f.summaryModel, f.summaryModelErr
+}
+func (f fakeSettings) PRDLabel(context.Context) (string, error) { return f.prdLabel, f.err }
 func (f fakeSettings) RunEligibleLabels(context.Context) ([]string, error) {
 	return f.eligibleLabels, f.err
 }

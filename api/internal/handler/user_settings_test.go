@@ -20,15 +20,18 @@ import (
 )
 
 // fakeSettingsDB is a store.DBTX holding one user's default_model, judge_model,
-// theme, and sidebar token set, so the GetMySettings/PutMySettings handlers run
-// end to end (decode -> validate -> store -> respond) without a real database. The
-// SetUserDefaultModel/SetUserJudgeModel/SetUserTheme UPDATEs QueryRow a single Text
-// RETURNING column and SetUserSidebarTokens a uuid[] one; GetUserSettings QueryRows
-// four (default_model, judge_model, theme, sidebar_token_ids). The UPDATE paths
+// summary_model, theme, and sidebar token set, so the GetMySettings/PutMySettings
+// handlers run end to end (decode -> validate -> store -> respond) without a real
+// database. The SetUserDefaultModel/SetUserJudgeModel/SetUserSummaryModel/SetUserTheme
+// UPDATEs QueryRow a single Text RETURNING column and SetUserSidebarTokens a uuid[]
+// one; GetUserSettings QueryRows four (default_model, judge_model, theme,
+// sidebar_token_ids) and GetUserSummaryModel one (summary_model, read on its own
+// column query — it is not part of GetUserSettings' narrow read). The UPDATE paths
 // record the written value so the round-trip is observable.
 type fakeSettingsDB struct {
 	model      pgtype.Text
 	judge      pgtype.Text
+	summary    pgtype.Text
 	theme      pgtype.Text
 	sidebarIDs []uuid.UUID
 }
@@ -51,6 +54,10 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		if j, ok := args[0].(pgtype.Text); ok {
 			f.judge = j // SetUserJudgeModel: $1 = judge_model
 		}
+	case strings.Contains(sql, "UPDATE users SET summary_model") && len(args) >= 1:
+		if s, ok := args[0].(pgtype.Text); ok {
+			f.summary = s // SetUserSummaryModel: $1 = summary_model
+		}
 	case strings.Contains(sql, "UPDATE users SET theme") && len(args) >= 1:
 		if t, ok := args[0].(pgtype.Text); ok {
 			f.theme = t // SetUserTheme: $1 = theme
@@ -60,23 +67,41 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 			f.sidebarIDs = ids // SetUserSidebarTokens: $1 = sidebar_token_ids
 		}
 	}
-	return fakeSettingsRow{model: f.model, judge: f.judge, theme: f.theme, sidebarIDs: f.sidebarIDs}
+	// GetUserSummaryModel is a single-column SELECT the handler actually reads, so the
+	// row must return summary_model (not model) for its 1-dest Scan; the write-path
+	// RETURNINGs are also 1-dest but discarded, so routing on the SQL disambiguates.
+	wantSummary := strings.Contains(sql, "SELECT summary_model FROM users")
+	return fakeSettingsRow{
+		model:       f.model,
+		judge:       f.judge,
+		summary:     f.summary,
+		theme:       f.theme,
+		sidebarIDs:  f.sidebarIDs,
+		wantSummary: wantSummary,
+	}
 }
 
 type fakeSettingsRow struct {
-	model      pgtype.Text
-	judge      pgtype.Text
-	theme      pgtype.Text
-	sidebarIDs []uuid.UUID
+	model       pgtype.Text
+	judge       pgtype.Text
+	summary     pgtype.Text
+	theme       pgtype.Text
+	sidebarIDs  []uuid.UUID
+	wantSummary bool
 }
 
 func (r fakeSettingsRow) Scan(dest ...any) error {
 	switch len(dest) {
 	case 1:
-		// A single-column RETURNING (SetUserDefaultModel / SetUserTheme); the
-		// handler discards it, so any Text value suffices.
+		// A single-column read: either GetUserSummaryModel (which the handler reads,
+		// so it must get summary_model) or a write-path RETURNING (discarded, so any
+		// Text suffices). wantSummary, set from the SQL, tells them apart.
 		if p, ok := dest[0].(*pgtype.Text); ok {
-			*p = r.model
+			if r.wantSummary {
+				*p = r.summary
+			} else {
+				*p = r.model
+			}
 		}
 	case 4:
 		// GetUserSettings: SELECT default_model, judge_model, theme, sidebar_token_ids.
@@ -313,6 +338,117 @@ func TestPutMySettingsJudgeModelOnlyLeavesDefaultModelUntouched(t *testing.T) {
 	}
 	if got := decodeSettings(t, rec.Body.Bytes()); got == nil || *got != "sonnet" {
 		t.Fatalf("response default_model = %v, want the untouched \"sonnet\"", got)
+	}
+}
+
+// decodeSummaryModel pulls the summary_model field out of a /me/settings response.
+func decodeSummaryModel(t *testing.T, body []byte) *string {
+	t.Helper()
+	var resp struct {
+		Settings struct {
+			SummaryModel *string `json:"summary_model"`
+		} `json:"settings"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode settings response %s: %v", body, err)
+	}
+	return resp.Settings.SummaryModel
+}
+
+// PRD #362 M2: the per-user summary_model mirrors judge_model — set, clear (blank
+// ⇒ NULL/inherit), reject an invalid model, and GET reflects the stored value. This
+// is the write path that gives SetUserSummaryModel a production caller.
+
+func TestGetMySettingsReturnsStoredSummaryModel(t *testing.T) {
+	h := &Handler{q: store.New(&fakeSettingsDB{summary: pgtype.Text{String: "haiku", Valid: true}})}
+	rec := httptest.NewRecorder()
+	h.GetMySettings(rec, authed(httptest.NewRequest(http.MethodGet, "/api/me/settings", nil)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := decodeSummaryModel(t, rec.Body.Bytes()); got == nil || *got != "haiku" {
+		t.Fatalf("summary_model = %v, want \"haiku\"", got)
+	}
+}
+
+func TestGetMySettingsNullSummaryModelSerializesAsNull(t *testing.T) {
+	h := &Handler{q: store.New(&fakeSettingsDB{})} // summary zero ⇒ NULL
+	rec := httptest.NewRecorder()
+	h.GetMySettings(rec, authed(httptest.NewRequest(http.MethodGet, "/api/me/settings", nil)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := decodeSummaryModel(t, rec.Body.Bytes()); got != nil {
+		t.Fatalf("summary_model = %q, want null (inherit)", *got)
+	}
+}
+
+func TestPutMySettingsSummaryModelRoundTrip(t *testing.T) {
+	db := &fakeSettingsDB{}
+	h := &Handler{q: store.New(db)}
+	rec := httptest.NewRecorder()
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"summary_model":"haiku"}`))))
+	h.PutMySettings(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := decodeSummaryModel(t, rec.Body.Bytes()); got == nil || *got != "haiku" {
+		t.Fatalf("response summary_model = %v, want \"haiku\"", got)
+	}
+	if !db.summary.Valid || db.summary.String != "haiku" {
+		t.Fatalf("stored summary_model = %+v, want haiku", db.summary)
+	}
+}
+
+func TestPutMySettingsBlankSummaryModelClearsToInherit(t *testing.T) {
+	db := &fakeSettingsDB{summary: pgtype.Text{String: "haiku", Valid: true}}
+	h := &Handler{q: store.New(db)}
+	rec := httptest.NewRecorder()
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"summary_model":""}`))))
+	h.PutMySettings(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := decodeSummaryModel(t, rec.Body.Bytes()); got != nil {
+		t.Fatalf("response summary_model = %q, want null after clearing", *got)
+	}
+	if db.summary.Valid {
+		t.Fatalf("stored summary_model should be NULL after a blank clear, got %+v", db.summary)
+	}
+}
+
+func TestPutMySettingsRejectsInvalidSummaryModel(t *testing.T) {
+	h := &Handler{q: store.New(&fakeSettingsDB{})}
+	rec := httptest.NewRecorder()
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"summary_model":"claude 3"}`))))
+	h.PutMySettings(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a model with interior whitespace; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// A summary-model-only PUT must not clobber the stored judge_model: the model
+// controls save independently over the one endpoint (PATCH-like semantics).
+func TestPutMySettingsSummaryModelOnlyLeavesJudgeModelUntouched(t *testing.T) {
+	db := &fakeSettingsDB{judge: pgtype.Text{String: "opus", Valid: true}}
+	h := &Handler{q: store.New(db)}
+	rec := httptest.NewRecorder()
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"summary_model":"haiku"}`))))
+	h.PutMySettings(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !db.judge.Valid || db.judge.String != "opus" {
+		t.Fatalf("judge_model must be untouched by a summary-model-only PUT, got %+v", db.judge)
+	}
+	if got := decodeJudgeModel(t, rec.Body.Bytes()); got == nil || *got != "opus" {
+		t.Fatalf("response judge_model = %v, want the untouched \"opus\"", got)
 	}
 }
 

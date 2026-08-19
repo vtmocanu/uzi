@@ -1007,6 +1007,34 @@ WHERE id = @id AND worker_id = @worker_id
   -- permanently. Do not add it.
   AND status <> 'limit_wait';
 
+-- name: SetRunIntentSummary :execrows
+-- PRD #362 M1: persist a run's plain-English INTENT summary ("what this run will
+-- implement"), posted by the worker after the clone is provisioned and before it
+-- plans. A PLAIN UPDATE by run id: the idempotent-on-set decision (skip when
+-- summary_intent is already set, so a re-claim/resume does not re-spend the owner's
+-- token — Decision 3) lives in the service, which reads the run first for its
+-- owner/repo/non-terminal guards anyway. :execrows so the caller can confirm the row
+-- exists (a foreign/deleted run updates 0 rows), never for a stale-write guard.
+UPDATE runs SET
+    summary_intent = @summary_intent,
+    updated_at     = now()
+WHERE id = @id;
+
+-- name: SetRunPlanSummary :execrows
+-- PRD #362 M1: persist a run's PLAN summary + deltas with the Decision 3 stale-write
+-- guard. The worker sends the plan_md the summary was generated from; this writes
+-- summary_plan/summary_deltas ONLY IF that still matches runs.plan_md, so a slower
+-- earlier generation cannot overwrite the summary of a newer, revised plan
+-- (last-write-wins by PLAN VERSION, not by completion time — no extra hash column).
+-- :execrows returns the rows-affected count so the service detects a stale (0-row)
+-- write and rejects it as a conflict, distinct from a run-not-found. Matching on the
+-- full plan_md text is intentional (simplest correct guard).
+UPDATE runs SET
+    summary_plan   = @summary_plan,
+    summary_deltas = @summary_deltas::jsonb,
+    updated_at     = now()
+WHERE id = @id AND plan_md = @expected_plan_md;
+
 -- name: SetRunLimitWait :execrows
 -- Park a run until the owner's exhausted Anthropic usage window reopens (PRD #35
 -- M2). running → limit_wait, non-terminal: the run keeps its issue, its session,

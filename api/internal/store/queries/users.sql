@@ -120,6 +120,21 @@ SELECT judge_model FROM users WHERE id = $1;
 UPDATE users SET judge_model = @judge_model WHERE id = @id
 RETURNING judge_model;
 
+-- name: GetUserSummaryModel :one
+-- The current user's per-user run-summary model override (PRD #362 M2); NULL =
+-- inherit the instance summary_model. Read at ISSUE-run claim assembly, keyed on
+-- the run owner. Selects only the column: the claim needs no other user field, and
+-- a narrow read keeps resolution self-contained and cheap (Decision 8). Mirrors
+-- GetUserJudgeModel but rides the issue-run claim rather than the judge claim.
+SELECT summary_model FROM users WHERE id = $1;
+
+-- name: SetUserSummaryModel :one
+-- Sets (or clears, when @summary_model is NULL) the current user's per-user
+-- run-summary model. NULL inherits the instance summary_model. Own-user only;
+-- caller passes the session user's id.
+UPDATE users SET summary_model = @summary_model WHERE id = @id
+RETURNING summary_model;
+
 -- name: GetUserSettings :one
 -- The current user's own (non-secret) settings surface: default worker model
 -- (PRD #17), per-user judge model override (PRD #69), UI theme override

@@ -19,6 +19,16 @@ type Milestone struct {
 	Title string `json:"title"`
 }
 
+// RunSummaryDelta is one entry of a run's plan-summary deltas list (PRD #362): how
+// the proposed plan diverged from the original ask. Kind is a closed enum
+// {added, changed, dropped} (validated-and-rejected on persist, Decision 6); Text is
+// UNTRUSTED, model-authored display text a consumer writing it to a terminal must
+// sanitize — the deltas are advisory and the human still reads the real plan.
+type RunSummaryDelta struct {
+	Kind string `json:"kind"`
+	Text string `json:"text"`
+}
+
 // RunDTO is the web view of a run. session_id and last_seq are intentionally
 // omitted — they are worker-internal (resume plumbing), not browser state.
 type RunDTO struct {
@@ -133,6 +143,18 @@ type RunDTO struct {
 	// pointer — a pre-feature run reads "agent". The SPA's SeededPlanPanel keys on it to
 	// surface a seeded run's plan, which the approval UI would otherwise never render.
 	PlanSource string `json:"plan_source"`
+	// Plain-English run summaries (PRD #362), all null until the worker generates and
+	// posts them (and null forever on any generation failure — summaries are advisory
+	// and never block a run). SummaryIntent ("what this run will implement") lands early
+	// in `running`; SummaryPlan ("what the proposed plan will do") + SummaryDeltas (how
+	// the plan diverged from the ask) land at the plan gate. SummaryDeltas is
+	// tolerated-with-fallback on READ (Decision 6): a malformed stored value renders as
+	// nil ("no deltas"), never a crash — runToDTO logs and drops it. A nil slice
+	// marshals to JSON null, the back-compat contract for every pre-feature run. The
+	// delta Text is UNTRUSTED display text (see RunSummaryDelta).
+	SummaryIntent *string           `json:"summary_intent"`
+	SummaryPlan   *string           `json:"summary_plan"`
+	SummaryDeltas []RunSummaryDelta `json:"summary_deltas"`
 	// ci_fix context (PRD #6), all null for an issue run: the failing ref, the
 	// failing pipeline's web URL (from the frozen snapshot), and the fix verdict
 	// (verified|fix_failed|not_code|null-while-unverified).

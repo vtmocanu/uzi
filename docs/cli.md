@@ -821,6 +821,16 @@ pending). Both are emit-only-when-set on the human view too — `run get`
 prints them as `PRD_MOVE` and `PRD_PATCH_SETTLED_AT` rows only when the run
 has declared a move — and appear the same way under `--json`.
 
+`run get` also prints the [run summaries](./run-summaries.md), when they've
+landed: an `INTENT` row (what the run will implement), a `PLAN SUMMARY` row
+(what the proposed or approved plan will do), and one `DELTA` row per way
+the plan diverged from the original ask. All three are emit-only-when-set —
+a pre-feature run or one still queued prints none of them, and a seeded run
+(one that skipped planning) prints its `INTENT` row but no `PLAN SUMMARY` or
+`DELTA` rows. The scalar two are readable individually with
+`--field summary_intent` / `--field summary_plan`; `summary_deltas` is an
+array, so read it with `--json` instead.
+
 ### Run status, and what `--follow` waits for
 
 A run's `status` (on `run get` and `run list`) is one of exactly **nine** values:

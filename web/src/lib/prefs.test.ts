@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { prefs } from "./prefs";
+import { prefs, summaryCollapse } from "./prefs";
 
 // This jsdom build does not expose window.localStorage (Node warns "localStorage
 // is not available because --localstorage-file was not provided"), so back it with
@@ -64,5 +64,58 @@ describe("prefs", () => {
       throw new Error("access denied");
     });
     expect(prefs.get("uzi.k", "fallback")).toBe("fallback");
+  });
+});
+
+// PRD #362 Decision 9: the per-run summary-collapse preference. The 7-day expiry is
+// exercised via the injected `now` param rather than the system clock — cleaner and not
+// dependent on fake-timer interaction with Date.
+describe("summaryCollapse (PRD #362 Decision 9)", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const t0 = 1_700_000_000_000;
+
+  it("defaults to expanded when the run has no stored choice", () => {
+    expect(summaryCollapse.getCollapsed("run-1")).toBe(false);
+  });
+
+  it("persists a collapse choice and reads it back after a reload (fresh read, no state)", () => {
+    summaryCollapse.setCollapsed("run-1", true);
+    expect(summaryCollapse.getCollapsed("run-1")).toBe(true);
+    // Per-run: a different run is unaffected.
+    expect(summaryCollapse.getCollapsed("run-2")).toBe(false);
+  });
+
+  it("can be toggled back to expanded", () => {
+    summaryCollapse.setCollapsed("run-1", true);
+    summaryCollapse.setCollapsed("run-1", false);
+    expect(summaryCollapse.getCollapsed("run-1")).toBe(false);
+  });
+
+  it("drops an entry older than 7 days on read (GC) while keeping a fresh sibling", () => {
+    summaryCollapse.setCollapsed("stale", true, t0);
+    // Re-touch a second run 8 days later; that write GCs 'stale' and re-stamps 'fresh'.
+    summaryCollapse.setCollapsed("fresh", true, t0 + 8 * DAY);
+    expect(summaryCollapse.getCollapsed("stale", t0 + 8 * DAY)).toBe(false); // expired → default
+    expect(summaryCollapse.getCollapsed("fresh", t0 + 8 * DAY)).toBe(true); // still fresh
+  });
+
+  it("keeps an entry that is exactly under the 7-day boundary", () => {
+    summaryCollapse.setCollapsed("edge", true, t0);
+    // Just under 7 days: still valid.
+    expect(summaryCollapse.getCollapsed("edge", t0 + 7 * DAY - 1)).toBe(true);
+  });
+
+  it("removes the expired key from storage, not just from the returned value", () => {
+    summaryCollapse.setCollapsed("stale", true, t0);
+    summaryCollapse.getCollapsed("stale", t0 + 8 * DAY); // read triggers GC-writeback
+    const raw = window.localStorage.getItem("uzi.summaryCollapse");
+    expect(raw).not.toBeNull();
+    expect(JSON.parse(raw!)).not.toHaveProperty("stale");
+  });
+
+  it("returns the default when the stored map is corrupt, without throwing", () => {
+    window.localStorage.setItem("uzi.summaryCollapse", "{not json");
+    expect(() => summaryCollapse.getCollapsed("run-1")).not.toThrow();
+    expect(summaryCollapse.getCollapsed("run-1")).toBe(false);
   });
 });

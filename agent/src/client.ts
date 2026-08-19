@@ -328,6 +328,31 @@ export class WorkerClient {
     return res.id;
   }
 
+  // ── Inline run summaries (PRD #362 M3c) ────────────────────────────────────
+  // Two thin POSTs mirroring reportFinding/saveMemory: the api derives (user, repo)
+  // from the CLAIMED run and re-validates + sanitises everything (it, not the worker,
+  // is the security boundary). Both throw RequestError on >=400 (the executor hook
+  // wraps them in try/catch — a 409 stale-plan and a 400 bad-deltas are expected-
+  // benign, and a summary is ADVISORY so it must NEVER fail the run).
+
+  /** Persist the run's INTENT summary (POST /worker/runs/:id/summary/intent). The
+   *  server is idempotent-on-set: a second post for a run that already has one is a
+   *  no-op success (Decision 3). Throws RequestError on non-2xx. */
+  async postIntentSummary(runId: string, summary: string): Promise<void> {
+    await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/summary/intent`, { summary });
+  }
+
+  /** Persist the run's PLAN summary + deltas (POST /worker/runs/:id/summary/plan).
+   *  `plan_md` is the stale-write guard value (Decision 3): the server writes ONLY if
+   *  it still matches runs.plan_md, else 409 (a superseded plan, not a run failure).
+   *  Invalid deltas are a 400. Throws RequestError on non-2xx. */
+  async postPlanSummary(
+    runId: string,
+    body: { summary: string; deltas: { kind: "added" | "changed" | "dropped"; text: string }[]; plan_md: string },
+  ): Promise<void> {
+    await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/summary/plan`, body);
+  }
+
   // ── Cross-run agent memory (PRD #90) ───────────────────────────────────────
   // Per-(user, repo), server-derived from the run claim. The worker NEVER sends
   // user/repo ids (its join token is not user-scoped). save_memory is the WRITE

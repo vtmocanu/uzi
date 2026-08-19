@@ -1340,6 +1340,13 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// reuses the per-worker proposal limiter to bound mass-creation; the per-run
 		// MaxFindingsPerRun cap is the other half.
 		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/findings", h.WorkerCreateFinding)
+		// Plain-English run summaries (PRD #362 M1): the run-lane executor posts the
+		// intent summary (idempotent-on-set) and the plan summary + deltas (stale-write
+		// guarded) back to the api, which persists them and emits a live-update WS frame.
+		// Both are worker→api writes scoped to the worker's own run; advisory, never a
+		// control (the generator is tool-less, the text renders inert).
+		r.Post("/runs/{id}/summary/intent", h.WorkerSetIntentSummary)
+		r.Post("/runs/{id}/summary/plan", h.WorkerSetPlanSummary)
 	})
 }
 

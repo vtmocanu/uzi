@@ -250,6 +250,14 @@ function RunRow({
               can open an issue on the target repo, so it is untrusted free text on the same
               footing as judge output. Display-only here; the raw value stays the identity. */}
           <p className="truncate text-sm font-medium text-fg">{stripUnsafeChars(run.issue_title)}</p>
+          {/* PRD #362 M4: a one-line intent preview ("what this run will implement"),
+              shown once the summary lands. UNTRUSTED model output over an
+              attacker-influenceable issue/PRD, so it goes through stripUnsafeChars and is
+              truncated to one line like the title — never <Markdown>. Absent until the
+              worker posts the intent summary, so a pre-feature/early run shows only the title. */}
+          {run.summary_intent && run.summary_intent.trim() !== "" && (
+            <p className="mt-0.5 truncate text-xs text-muted">{stripUnsafeChars(run.summary_intent)}</p>
+          )}
           <p className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint">
             <span>
               {run.repo_path} #{run.issue_iid}

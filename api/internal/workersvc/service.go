@@ -361,6 +361,12 @@ type Store interface {
 	UpdateDispositionLastTitle(ctx context.Context, arg store.UpdateDispositionLastTitleParams) (int64, error)
 	SetRunRunning(ctx context.Context, arg store.SetRunRunningParams) (int64, error)
 	SetRunAwaitingApproval(ctx context.Context, arg store.SetRunAwaitingApprovalParams) (int64, error)
+	// Plain-English run summaries (PRD #362 M1). Intent is a plain UPDATE (the
+	// idempotent-on-set decision lives in the service); the plan write carries the
+	// Decision 3 stale-write guard (updates only if plan_md still matches), returning
+	// rows-affected so the service detects a stale (0-row) write.
+	SetRunIntentSummary(ctx context.Context, arg store.SetRunIntentSummaryParams) (int64, error)
+	SetRunPlanSummary(ctx context.Context, arg store.SetRunPlanSummaryParams) (int64, error)
 	// SetRunAwaitingInput parks a run on a clarification question (PRD #88 M1) and
 	// stamps the question's identity. It clears health on entry, which is what makes
 	// leaving `awaiting_input` out of ListActiveRunsForHealth safe — see the query.
@@ -523,6 +529,9 @@ type Store interface {
 	// Per-user judge model override (PRD #69 M2): read at judge-claim assembly,
 	// keyed on the run owner. NULL ⇒ inherit the instance judge_model.
 	GetUserJudgeModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
+	// Per-user run-summary model override (PRD #362 M2): read at ISSUE-run claim
+	// assembly, keyed on the run owner. NULL ⇒ inherit the instance summary_model.
+	GetUserSummaryModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	// ListClaimAgentTemplates resolves template allocations for the run owner
 	// (PRD #18 M7): only the builtin/global defaults ± the owner's overlay + the
 	// owner's own allocated user templates ride the claim, not every template.
@@ -717,6 +726,10 @@ type SettingsReader interface {
 	JudgeCooldownSeconds(ctx context.Context) (int, error)
 	JudgeDailyBudget(ctx context.Context) (int, error)
 	JudgeModel(ctx context.Context) (string, error)
+	// SummaryModel is the instance-default model the inline run-summary generator
+	// runs on (PRD #362 Decision 8), the fallback when the run owner has no per-user
+	// summary_model override. Falls back to the compiled-in default ("haiku").
+	SummaryModel(ctx context.Context) (string, error)
 	// PRDLabel is the label an issue must carry to be runnable (PRD #102 Decision
 	// 14). It is read here rather than passed in by each caller because the gate is
 	// shared: the board handler and the poller's autopilot must be answering the same
@@ -1830,6 +1843,28 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		milestones = nil
 	}
 
+	// Run-summary model resolution is user-value-wins (PRD #362 Decision 8), the same
+	// shape as the judge model in assembleJudgeClaim but delivered on this ISSUE-run
+	// claim: the run owner's per-user summary_model overrides the instance
+	// summary_model; NULL/blank inherits the instance value. Guarded by s.settings !=
+	// nil — a nil-settings deployment leaves it nil (the summary generator is advisory
+	// and skips when no model rides). On a user-row read error we fall back to the
+	// instance value best-effort with a log; we never send an empty model.
+	var summaryModel *string
+	if s.settings != nil {
+		if um, uerr := s.q.GetUserSummaryModel(ctx, run.UserID); uerr != nil {
+			slog.Warn("issue claim: read user summary model", "user", run.UserID.String(), "error", uerr)
+		} else if um.Valid && strings.TrimSpace(um.String) != "" {
+			m := um.String
+			summaryModel = &m
+		}
+		if summaryModel == nil {
+			if m, merr := s.settings.SummaryModel(ctx); merr == nil && strings.TrimSpace(m) != "" {
+				summaryModel = &m
+			}
+		}
+	}
+
 	payload := &ClaimPayload{
 		RunID:            run.ID.String(),
 		Kind:             run.Kind,
@@ -1892,6 +1927,14 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// PRD #122 M1: the frozen milestone list, decoded above. omitempty keeps a
 		// milestone-less run's claim byte-identical to today's.
 		Milestones: milestones,
+		// PRD #362 Decision 8: the model the inline run-summary generator runs on,
+		// resolved user-value-wins above. nil (omitted) when settings are unwired, so
+		// an old worker's wire shape is unchanged.
+		SummaryModel: summaryModel,
+		// PRD #362 M3c (Decision 3): tell the worker whether the intent summary is
+		// already set, so a resume/re-claim skips INTENT generation rather than
+		// re-spending the owner's token. Derived straight off the run row.
+		SummaryIntentPresent: run.SummaryIntent.Valid,
 		Repo: ClaimRepo{
 			ID:              uuid.UUID(run.RepoID.Bytes).String(),
 			URL:             rc.RepoWebUrl,
