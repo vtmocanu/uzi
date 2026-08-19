@@ -92,9 +92,9 @@ cited files.
   runs.
 - **The predicate needs no API call.** `forge_type` is on the claim
   (`ClaimRepo.ForgeType`, `workersvc/claim.go:224`; read at `runner.ts:1259-1264`).
-  For the classic `repo`-only token privcheck guarantees, `forge_type === "github"`
-  alone is sufficient for "a `.github/workflows/**` change in this branch will be
-  rejected" (see D4 for the fine-grained-token caveat).
+  Every connected GitHub token is a classic `repo`-only PAT (fine-grained tokens are
+  refused at connect, `github.go:169`; see D4), so `forge_type === "github"` alone is
+  sufficient for "a `.github/workflows/**` change in this branch will be rejected".
 - **`fail_origin` is a closed enum; `failure_reason` is free text.** Enum members
   in `api/internal/workersvc/failorigin.go:35-45`, CHECK in
   `api/internal/store/migrations/00126_run_fail_origin.sql`. **`00126` is already
@@ -274,12 +274,16 @@ and validate it.
   `report_md` would entangle the report-only semantics ("committed nothing",
   issue-gated) with a failed run that did commit. A dedicated nullable column keeps
   both clean; it rides the same failed report and render path.
-- **D4 (decided, with caveat) — predicate is `forge_type === "github"`.** Sufficient
-  for the classic `repo`-only tokens privcheck guarantees. If a fine-grained GitHub
-  token with Workflows: write is accepted by connect (a doc/code question outside
-  this PRD), the predicate over-blocks it — but harmlessly: the diff is preserved
-  and the run simply asks for a human. Graceful degradation, never a destructive
-  failure, so the cheap connection-level predicate is correct.
+- **D4 (decided) — predicate is `forge_type === "github"`, and it is exact.** Every
+  connected GitHub token is a classic `repo`-only PAT, so there is no connected-token
+  shape that is both GitHub and able to push `.github/workflows/**`. Fine-grained
+  tokens (`github_pat_`) cannot be connected at all: `VerifyToken` rejects them up
+  front (`api/internal/forge/github.go:169`) and the connect handler aborts the save
+  on that error before the scope gate runs (`api/internal/handler/forge.go:219-224`);
+  privcheck then forbids `{repo, workflow}` for the classic tokens that do connect.
+  (An earlier draft carried a "fine-grained tokens might be accepted, so the predicate
+  over-blocks harmlessly" caveat — that was wrong; they are refused at connect, so no
+  caveat is needed and `docs/github-bot-setup.md` is correct as written.)
 - **D5 (decided) — detection point is finalize, not edit-time.** The finalize diff
   is the only point that both sees the committed result (regardless of Bash vs.
   file-tool writes) and can preserve it. Edit-time guardrail detection is an
