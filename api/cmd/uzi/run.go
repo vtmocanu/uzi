@@ -1406,16 +1406,12 @@ func summaryRows(r apitypes.RunDTO) [][]string {
 		// The whole line (glyph, kind and text) is sanitized together: kind is a
 		// server-validated enum today, but "tolerated on read" means the CLI must not
 		// trust it, and cellText over the composed line caps and folds the untrusted
-		// text in one pass. An entry that sanitizes to just its label (empty text) is
-		// dropped rather than rendered as a bare "+ added:".
-		if strings.TrimSpace(d.Text) == "" {
+		// text in one pass. Drop an entry whose text SANITIZES to empty (whitespace, or
+		// a control/bidi rune that cellText strips) rather than render a bare "+ added:".
+		if cellText(d.Text) == "" {
 			continue
 		}
-		line := cellText(deltaGlyph(d.Kind) + " " + d.Kind + ": " + d.Text)
-		if line == "" {
-			continue
-		}
-		rows = append(rows, []string{"DELTA", line})
+		rows = append(rows, []string{"DELTA", cellText(deltaGlyph(d.Kind) + " " + d.Kind + ": " + d.Text)})
 	}
 	return rows
 }

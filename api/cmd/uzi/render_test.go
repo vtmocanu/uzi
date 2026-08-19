@@ -441,15 +441,21 @@ func TestRenderRunDetailSummaries(t *testing.T) {
 		}
 	}
 
-	// Empty (non-nil) strings and a blank-text delta are the same as absent: no bare rows,
-	// no `+ added:` with nothing after it. Empty is reachable through the API as `""`.
+	// Empty (non-nil) strings and a delta whose text is blank OR sanitizes to empty are
+	// the same as absent: no bare rows, no `+ added:` with nothing after it. The second
+	// delta's text is a lone bidi override — non-whitespace, so it must be dropped on the
+	// SANITIZED text (cellText), not on raw TrimSpace which would leak a bare-label row.
+	// Empty is reachable through the API as `""`.
 	empty := ""
 	edge := apitypes.RunDTO{
 		ID: "run-3", Kind: "issue", Status: "awaiting_approval",
 		IssueTitle: "do the thing", ForgeType: "gitlab", Health: "ok",
 		SummaryIntent: &empty,
 		SummaryPlan:   &empty,
-		SummaryDeltas: []apitypes.RunSummaryDelta{{Kind: "added", Text: "   "}},
+		SummaryDeltas: []apitypes.RunSummaryDelta{
+			{Kind: "added", Text: "   "},
+			{Kind: "changed", Text: "‮"},
+		},
 	}
 	edgeOut := renderDetail(t, edge)
 	for _, unwanted := range []string{"INTENT", "PLAN SUMMARY", "DELTA"} {
