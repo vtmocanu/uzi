@@ -103,6 +103,8 @@ uzi review undo <id> <rec> | stats [--json]
 uzi findings list [--repo <id>] [--bucket to_file|filed|dismissed|all] [--run <id>]
 uzi findings file <finding-id>
 uzi findings dismiss <finding-id> --reason wont-do|not-an-issue
+uzi handoff -m <text> | -f <path> [--base <ref>] [--mr] [--review] [--then-fix] [--repo <id>]
+uzi handoff rm <run-id> | review <run-id>
 uzi token list
 uzi worker list | rm <id> | set-token <worker-id> <label> | set-token <worker-id> --default
 uzi repo list
@@ -351,6 +353,101 @@ A few worth knowing:
 - **`uzi logout` is local-only.** It removes the stored credential; it does
   **not** revoke it server-side (see [Managing tokens](#managing-tokens)
   below).
+
+## uzi handoff: ephemeral branch-scoped task runs
+
+```sh
+uzi handoff -m "<context>" [--file <path>] [--base <ref>] [--mr]
+            [--review] [--then-fix] [--repo <repo-id>]
+uzi handoff rm <run-id>
+uzi handoff review <run-id>
+```
+
+`uzi handoff` (alias `uzi task`) hands a throwaway task to a worker without a
+forge issue and without a PRD: no plan gate, no issue to file, no MR to
+review, unless you ask for one. Think of it as renting a remote worktree —
+you push it some work, watch it, pull the result, and throw the branch away.
+See [Handoff: renting a remote worktree](./handoff.md) for the full mental
+model; this section is the flag reference.
+
+Run from inside a checkout with an `origin` remote:
+
+```sh
+uzi handoff -m "add input validation to the signup form"
+```
+
+This does three things, in order, and stops before the third if either of the
+first two fails:
+
+1. **Create** — a new `task` run, on the repo matched from your `origin`
+   remote (`--repo <id>` overrides the auto-detection, see `uzi repo list`).
+   The server names the branch: `uzi/task/<run-id>`.
+2. **Push** — your local HEAD (or `--base <ref>`, if given) to that branch,
+   with **your own** git credentials — the same push you'd type by hand.
+   `--base` seeds the branch from a named ref instead of local HEAD.
+3. **Dispatch** — only now can a worker claim the run. If the push in step 2
+   fails, the run is left created but never dispatched — it has no seed
+   content, so nothing will claim it — and the error tells you to clean it up
+   with `uzi handoff rm <id>`.
+
+The worker clones `uzi/task/<id>`, works your inline context (from `-m`, or
+`-f <file>`/`-f -` for stdin, or piped bare stdin), commits, and pushes back
+to the same branch. There's no forge issue and no MR by default — pull the
+result yourself:
+
+```sh
+git fetch origin uzi/task/<run-id> && git switch uzi/task/<run-id>
+```
+
+Continuation is the same `uzi run follow-up <id>` you'd use on any other run;
+watch it with `uzi run get`/`uzi run logs --follow`, or drop into
+[`uzi tui`](#watching-runs-live-uzi-tui).
+
+A few things worth knowing before you rely on this:
+
+- **The push is non-forced, deliberately.** After your seed push, the worker
+  is the sole writer to the branch. If you push more local commits to a
+  *live* task branch mid-run, they're rejected non-fast-forward rather than
+  clobbering the worker's history — a mid-run user push is out of scope for
+  v1; use `uzi run follow-up <id>` to send the worker more context instead.
+- **A raw handoff has no forge record.** With no issue and no MR (no `--mr`),
+  there's nothing durable on the forge — the run transcript and your inline
+  context are still persisted in uzi (`uzi run get`/`uzi run logs`), but if
+  you want a forge-visible artifact, pass `--mr` or escalate later by opening
+  one yourself from the pulled branch.
+- **`--mr`** has the worker open an MR for the branch once it finishes, the
+  escalation path for a throwaway task that turns out to be keeper work. An
+  MR-opened branch is exempt from `uzi handoff rm` — delete it via the MR
+  instead.
+- **`--review`** runs a diff-review once the task completes: a fresh review of
+  `uzi/task/<id>` against its base, producing structured findings (file,
+  symbol, line, severity, summary, rationale). Fetch them with:
+
+  ```sh
+  uzi handoff review <run-id>          # human table: [severity] file:line — summary
+  uzi handoff review <run-id> --json   # the review DTO
+  ```
+
+  The findings are never committed to the branch — they're metadata you read,
+  not a diff the worker writes. If the task hasn't finished yet, or wasn't
+  launched with `--review`, this prints a hint instead of an error.
+- **`--then-fix`** implies `--review`: once the review's findings land, a
+  follow-on fix run auto-applies fixes for them and pushes to the same
+  `uzi/task/<id>` branch. Use it when you want the whole loop — task, review,
+  fix — without a manual step in between.
+
+Cleaning up:
+
+```sh
+uzi handoff rm <run-id>
+```
+
+Deletes the remote `uzi/task/<id>` branch with your own git credentials
+(`git push origin --delete`). It only ever deletes inside the `uzi/task/*`
+namespace, and refuses a run that opened an MR (delete it via the MR
+instead) or one that isn't a `task` run at all. There's no server-side
+auto-prune of stale task branches yet — `rm` is the v1 cleanup story; run it
+once you've pulled what you need.
 
 ## Watching runs live: `uzi tui`
 

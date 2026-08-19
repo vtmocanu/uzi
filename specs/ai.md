@@ -21454,3 +21454,69 @@ it. #379 adds it to both TUI surfaces and fixes an unrelated layout gap the work
 
 No server or DTO change: `ListRuns`/`AdminListRuns` already decode the milestone fields via
 `runToDTO`. Read-only presentation; no change to how milestones are created, frozen, or reported.
+
+## 560. PRD #400 — `uzi handoff`: the `task` run kind (ephemeral, branch-scoped, MR-less), plus `--review` / `--then-fix`
+
+Handoff is the CLI-native dev loop: a "rented remote worktree" you push work to, watch, and
+pull commits from — no forge issue, no PRD, no MR by default. It ships as one new run kind,
+`task`, modeled on `prompt` rather than as a family of new kinds; a review and a fix are both
+`task` runs, distinguished by provenance columns, not by kind. Serves human.md's handoff
+requirement; the `main`-never-touched invariant is unchanged.
+
+- **`task` is the SEVENTH `runs.kind`, modeled on `prompt`.** Repo-ful and issue-less, reusing
+  the existing `issue_description` column for its inline context (inheriting the 256 KiB cap +
+  sanitization) — no new context column, exactly as `prompt`/`self_improve` do. `chat` was the
+  wrong model (repo-less, branch-less). A review is NOT a new kind and neither is a fix: both
+  are `task` runs, a review distinguished by `review_target_run_id`, a fix by `then_fix_of_run_id`.
+  Kind domain and per-kind shape widen the same drop/re-add way `00104`/`00058` did
+  (`00134_run_task_kind.sql`); the stale `issue|ci_fix|chat` doc comment in `apitypes/run.go` is fixed.
+
+- **Branch known at CREATE (the first such kind).** The task shape clause in `runs_kind_shape`
+  is `kind='task' AND repo_id IS NOT NULL AND issue_iid IS NULL AND branch IS NOT NULL` — the
+  first kind requiring `branch NOT NULL` at INSERT, where every existing kind writes `branch`
+  only at completion. The destination is server-named `uzi/task/<run-id>`, never caller-controlled
+  (safe by construction: it can never be a protected/default branch). Non-circular because the run
+  id is minted in Go first (`uuid.New()` in `workersvc/task.go`) and the branch derived from it,
+  then both handed to a caller-supplied-id insert (the `CreateChatRun` precedent). `base_branch`
+  (source ref, nullable) and `open_mr` are the only other new columns on `runs`.
+
+- **The dispatch gate (`dispatched_at`).** A task is created NOT-yet-claimable; `ClaimRun`'s task
+  predicate requires `dispatched_at IS NOT NULL`, so a worker never claims a task before the CLI
+  has seeded its branch. Decision-6 ordering: CLI creates the run → CLI pushes local HEAD to
+  `uzi/task/<id>` with the USER's own credentials → CLI stamps `dispatched_at` (dispatch) → worker
+  claims, clones, works, pushes back with the single PAT git path. `dispatched_at` is only ever set
+  on task runs, so other kinds are unaffected.
+
+- **No MR by default.** `open_mr` gates MR-open in the worker exactly as `chat`/`judge` already
+  skip it; the deliverable is commits on `uzi/task/<id>` that the user pulls. A task always pushes
+  its branch with the existing NON-FORCED `pushBranch` (a divergent mid-run user push is rejected
+  non-fast-forward — fail-closed, out of scope for v1). `--mr` is the escalation bridge and exempts
+  the branch from cleanup.
+
+- **`--review`: a diff-review `task` run.** Set on a plain task at create (`review_requested`);
+  at the reviewed task's terminal `completed` transition, `maybeEnqueueTaskReview` auto-creates a
+  review run (`review_target_run_id` → the target), placed beside `maybeEnqueueJudge` in
+  `judge_enqueue.go` inside the rows>0 block; a partial unique index enforces one active review per
+  target. The worker's ReviewRunner (`agent/src/review-runner.ts`) clones the branch, diffs it
+  against `base_branch`, and feeds the diff TEXT to a text-only reviewer model (no repo tools) —
+  the difference from the judge, whose input is a trace and which never clones. It POSTs structured
+  findings to new tables `task_reviews` / `task_review_findings` (file/symbol/line/severity/summary/
+  rationale), fetched as JSON via the CLI and NEVER committed to the branch. The `line`-bearing
+  schema is deliberate: a single-diff review does not have the judge's cross-run line-drift problem,
+  so it carries a line (`0` = whole-file), unlike the judge's line-less symbol-anchored recommendations.
+
+- **`--then-fix` implies `--review`.** Set on the original task (`then_fix_requested`); when the
+  review run completes with findings, `maybeEnqueueThenFix` (beside `maybeEnqueueTaskReview`) reads
+  the original's flag and composes the findings — untrusted framing, the `selfimprove` precedent —
+  into a NORMAL, auto-approved task (`then_fix_of_run_id` → the original) on the SAME `uzi/task/<id>`
+  branch, implemented by the ordinary worker path (no new kind, no new worker code). The chain
+  provably terminates: a fix run has `review_target_run_id` NULL (so it triggers no review hook) and
+  is not itself a review (so it triggers no fix hook).
+
+- **Guardrails.** The `main`-never-touched invariant is unchanged and defended in depth: a task
+  targets `uzi/task/*` (safe by construction, Decision 4), plus a create-time namespace +
+  default-branch assertion (reusing `guardDefaultBranch`), plus the forge's own protected-ref
+  rejection backed by the non-forced push (no history rewrite possible). Cleanup is client-side:
+  `uzi handoff rm <id>` deletes only within the `uzi/task/*` namespace (a CLI-side guard refuses any
+  other branch), with the user's own credentials, exempting an `--mr`-opened branch. Server-side
+  auto-prune (a new `Forge.DeleteBranch`) is deferred to Later.

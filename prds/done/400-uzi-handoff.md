@@ -1,7 +1,7 @@
 # PRD #400: uzi handoff (ephemeral branch-scoped task runs)
 
 **Issue**: [#400](https://github.com/vtmocanu/uzi/issues/400)
-**Status**: Draft
+**Status**: Complete (2026-08-19) — all milestones landed on `agent/issue-400`.
 **Priority**: Medium
 
 ## Problem
@@ -50,14 +50,14 @@ Every fact below is readable in the cloned repository; this feature adds no exte
 
 ## Milestones
 
-- [ ] **M1 - Data model + `CreateTaskRun`.** `task` added to both `runs_kind_check` and `runs_kind_shape` (novel shape); `issue_description` reused for inline context (256 KiB cap + sanitization inherited); `base_branch` + `open_mr` added; `branch` settable at create. `CreateTaskRun` (modeled on `CreatePromptRun`) creates a server-named `uzi/task/<id>` run, calls `guardDefaultBranch`, and asserts the branch is namespaced and not the default branch.
-- [ ] **M2 - Worker task execution.** A task run clones the seeded `uzi/task/<id>`, runs the agent over the inline context, commits, and pushes back (no MR by default), reusing the non-forced `pushBranch`; MR-open is skipped unless `open_mr`.
-- [ ] **M3 - `uzi handoff` CLI.** Create-then-push-then-dispatch ordering (Decision 6): create the run, push local HEAD to the server-named branch with the user's creds, dispatch. `-m`/`-f`/stdin context, `--base`, `--mr`; `uzi handoff rm <id>` (client-side delete); continuation via `uzi run follow-up`. Watchable via the existing `uzi run get/logs --follow` and `uzi tui`.
-- [ ] **M4 - Review handoff (`--review`).** A new clone-and-diff review run over `uzi/task/<id>` vs its base, emitting structured findings (file + symbol + line + severity + summary + rationale), persisted and fetched as JSON via the CLI, never committed to the branch. Reuses the judge's JSON plumbing only.
-- [ ] **M5 - Chained fix (`--then-fix`).** On `--review --then-fix`, a follow-on task run seeded with M4's findings pushes fixes to the same branch (precedent: `selfimprove` consuming judge recs).
-- [ ] **M6 - Temp-branch lifecycle.** `uzi/task/*` namespace; `uzi handoff rm <id>` deletes the remote branch client-side; an `--mr` branch is exempt. (Server-side auto-prune deferred to Later, stated in docs.)
-- [ ] **M7 - Tests + guardrail verification.** Unit + live-DB coverage for `CreateTaskRun` and the migration shape, the worker push path, the CLI (including `--json`/exit-code/NO_COLOR render), the review JSON contract, and `rm`. Explicitly verify the branch is always namespaced and a task can never resolve to the default/a protected branch, and that the worker push is non-forced. Run through the repo's `task gate:*` targets.
-- [ ] **M8 - Docs.** `docs/cli.md` (the `uzi handoff` section) and the embedded CLI skill source (`api/internal/uzicli/skill/SKILL.md`); a feature doc under `docs/`; an `ARCHITECTURE.md` pointer describing `task` as the **seventh** run kind; a `specs/ai.md` decision record; and fix the stale kind list in `api/internal/apitypes/run.go`.
+- [x] **M1 - Data model + `CreateTaskRun`.** `task` added to both `runs_kind_check` and `runs_kind_shape` (novel shape); `issue_description` reused for inline context (256 KiB cap + sanitization inherited); `base_branch` + `open_mr` added; `branch` settable at create. `CreateTaskRun` (modeled on `CreatePromptRun`) creates a server-named `uzi/task/<id>` run, calls `guardDefaultBranch`, and asserts the branch is namespaced and not the default branch.
+- [x] **M2 - Worker task execution.** A task run clones the seeded `uzi/task/<id>`, runs the agent over the inline context, commits, and pushes back (no MR by default), reusing the non-forced `pushBranch`; MR-open is skipped unless `open_mr`.
+- [x] **M3 - `uzi handoff` CLI.** Create-then-push-then-dispatch ordering (Decision 6): create the run, push local HEAD to the server-named branch with the user's creds, dispatch. `-m`/`-f`/stdin context, `--base`, `--mr`; `uzi handoff rm <id>` (client-side delete); continuation via `uzi run follow-up`. Watchable via the existing `uzi run get/logs --follow` and `uzi tui`.
+- [x] **M4 - Review handoff (`--review`).** A new clone-and-diff review run over `uzi/task/<id>` vs its base, emitting structured findings (file + symbol + line + severity + summary + rationale), persisted and fetched as JSON via the CLI, never committed to the branch. Reuses the judge's JSON plumbing only.
+- [x] **M5 - Chained fix (`--then-fix`).** On `--review --then-fix`, a follow-on task run seeded with M4's findings pushes fixes to the same branch (precedent: `selfimprove` consuming judge recs).
+- [x] **M6 - Temp-branch lifecycle.** `uzi/task/*` namespace; `uzi handoff rm <id>` deletes the remote branch client-side; an `--mr` branch is exempt. (Server-side auto-prune deferred to Later, stated in docs.)
+- [x] **M7 - Tests + guardrail verification.** Unit + live-DB coverage for `CreateTaskRun` and the migration shape, the worker push path, the CLI (including `--json`/exit-code/NO_COLOR render), the review JSON contract, and `rm`. Explicitly verify the branch is always namespaced and a task can never resolve to the default/a protected branch, and that the worker push is non-forced. Run through the repo's `task gate:*` targets. *(Landed: live-DB shape + dispatch-gate + task-review round-trip + then-fix enqueue tests, a behavioural non-forced-push proof, `rm` namespace/MR/non-task guards, and handoff `--json`/exit-code coverage; `gate:api`/`gate:agent` green. Minor gap: NO_COLOR is not separately asserted for the handoff verb specifically — handoff renders through the shared `env.printer`, whose NO_COLOR behaviour is covered generally.)*
+- [x] **M8 - Docs.** `docs/cli.md` (the `uzi handoff` section) and the embedded CLI skill source (`api/internal/uzicli/skill/SKILL.md`); a feature doc under `docs/`; an `ARCHITECTURE.md` pointer describing `task` as the **seventh** run kind; a `specs/ai.md` decision record; and fix the stale kind list in `api/internal/apitypes/run.go`.
 
 ## Parallelization / phase plan
 
