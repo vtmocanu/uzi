@@ -116,18 +116,17 @@ export class ReviewRunner {
     // Compute the review. Any failure BEFORE the post falls back to a `failed` review so
     // the reviewed run still receives a (report-only) result rather than nothing.
     let review: TaskReviewRequest;
-    let clonePath: string | undefined;
     try {
       await this.client.reportState(reviewRunId, { status: "running" });
+      // ensureClone mirrors every origin head into refs/remotes/origin/* (a bare
+      // clone-or-fetch), so both the reviewed branch and its base resolve locally for the
+      // diff below — no working-tree checkout is needed (reviewDiff reads the bare's
+      // remote-tracking refs, never a checkout). A review pushes NOTHING.
       const barePath = await this.git.ensureClone(
         claim.repo.clone_url,
         claim.secrets.forge_pat,
         claim.secrets.forge_username,
       );
-      // Clone the reviewed branch so its content is present (mirrors RunRunner's clone).
-      // We push NOTHING from it — the clone exists only so the diff resolves locally.
-      const runnerClone = await this.git.runnerCloneForBranch(barePath, branch, "review-" + reviewRunId, reviewRunId);
-      clonePath = runnerClone.path;
       const base =
         claim.base_branch?.trim() ||
         claim.repo.default_branch?.trim() ||
@@ -152,15 +151,6 @@ export class ReviewRunner {
         error: errMessage(err),
       });
       review = { status: "failed", summary: `Review could not be produced: ${errMessage(err)}`.slice(0, 500), findings: [] };
-    } finally {
-      // Best-effort clone cleanup: a review clone is a standalone clone (no bare
-      // interaction), and leaking one per review run would fill the runner volume. Never
-      // fails the run.
-      if (clonePath) {
-        await this.git.removeRunnerClone(clonePath).catch((e) =>
-          this.log.warn("review clone cleanup failed", { path: clonePath, error: errMessage(e) }),
-        );
-      }
     }
 
     try {

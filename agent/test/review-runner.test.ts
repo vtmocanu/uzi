@@ -121,9 +121,11 @@ describe("ReviewRunner", () => {
     const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson) });
     await runner.execute(reviewClaim());
 
-    // (a) the reviewed branch was cloned and the diff was taken against base_branch.
+    // (a) the bare was ensured and the diff was taken against base_branch — NO working-tree
+    // checkout: reviewDiff reads the bare's remote-tracking refs, so a review does no
+    // runnerCloneForBranch (that would be per-run disk/IO for nothing).
     assert.equal(gitCalls.ensureClone, 1);
-    assert.deepEqual(gitCalls.runnerCloneForBranch, [{ branch: "uzi/task/target-1", key: "review-review-1", runId: "review-1" }]);
+    assert.deepEqual(gitCalls.runnerCloneForBranch, [], "a review does no working-tree checkout");
     assert.deepEqual(gitCalls.reviewDiff, [{ base: "develop", branch: "uzi/task/target-1" }]);
 
     // (b) the parsed findings were POSTed to the reviewed run, status complete.
@@ -141,11 +143,11 @@ describe("ReviewRunner", () => {
     assert.equal(last?.body.status, "completed");
     assert.ok(calls.states.some((s) => s.body.status === "running"), "reported running first");
 
-    // (c) NON-VACUOUS no-push/no-MR proof: neither the push nor the fetch-back ran, and
-    // the clone was cleaned up.
+    // (c) NON-VACUOUS no-push/no-MR proof: neither the push nor the fetch-back ran, and no
+    // working-tree clone was made (so none to clean up).
     assert.equal(gitCalls.pushBranch, 0, "a review pushes nothing");
     assert.equal(gitCalls.fetchAgentBranch, 0, "a review fetches nothing back");
-    assert.equal(gitCalls.removeRunnerClone, 1, "the review clone was cleaned up");
+    assert.equal(gitCalls.removeRunnerClone, 0, "a review makes no working-tree clone");
   });
 
   it("posts zero findings WITHOUT calling the model on an empty diff", async () => {
