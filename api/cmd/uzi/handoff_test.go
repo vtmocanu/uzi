@@ -403,6 +403,26 @@ func TestHandoffBaseLeadingDashRejected(t *testing.T) {
 	}
 }
 
+// rm refuses to delete a branch outside the uzi/task/* namespace even for a task run
+// (a corrupted/unexpected DTO): the lifecycle guardrail never runs `git push --delete`
+// against an arbitrary ref.
+func TestHandoffRmRefusesNonNamespacedBranch(t *testing.T) {
+	rogue := "main"
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{
+		"r8b": {ID: "r8b", Kind: "task", Branch: &rogue},
+	}}
+	rec := &handoffRecorder{}
+	env, _ := handoffEnv(fc, rec)
+
+	_, _, code := runCLI(t, env, "handoff", "rm", "r8b")
+	if code == uzicli.ExitOK {
+		t.Fatalf("rm of a non-uzi/task branch must be refused, got exit 0")
+	}
+	if len(rec.gitCalls) != 0 {
+		t.Errorf("a namespace-guard refusal must not run git: %v", rec.gitCalls)
+	}
+}
+
 // rm on a non-task run is refused.
 func TestHandoffRmNonTaskRefused(t *testing.T) {
 	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{

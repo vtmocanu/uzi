@@ -12,6 +12,11 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
+// taskBranchNamespace is the server-owned prefix every handoff task branch lives in
+// (PRD #400 Decision 4). The server mints uzi/task/<run-id>; the CLI treats it as the
+// only namespace `uzi handoff rm` will delete within (a lifecycle guardrail).
+const taskBranchNamespace = "uzi/task/"
+
 // newHandoffCmd builds `uzi handoff` (alias `task`): the CLI half of PRD #400's
 // ephemeral, MR-less task runs. The parent command's RunE is the CREATE action and
 // implements Decision 6's explicit, non-circular ordering:
@@ -350,7 +355,15 @@ func runHandoffRm(env Env, gf *globalFlags, cmd *cobra.Command, id string) error
 	if run.Branch == nil || strings.TrimSpace(*run.Branch) == "" {
 		return uzicli.Exitf(uzicli.ExitGeneric, "task %s has no branch to delete", id)
 	}
-	branch := *run.Branch
+	branch := strings.TrimSpace(*run.Branch)
+	// Lifecycle guardrail (PRD #400 M6): rm only ever deletes inside the server-owned
+	// uzi/task/* namespace. A task's branch is minted server-side in that namespace, so
+	// this can only fail on a corrupted/unexpected DTO — refuse rather than run
+	// `git push --delete` against whatever the field happens to hold.
+	if !strings.HasPrefix(branch, taskBranchNamespace) {
+		return uzicli.Exitf(uzicli.ExitGeneric,
+			"task %s branch %q is not in the %s namespace; refusing to delete it", id, branch, taskBranchNamespace)
+	}
 	if _, err := env.Git(".", "push", "origin", "--delete", branch); err != nil {
 		return uzicli.Exitf(uzicli.ExitGeneric, "deleting %s failed: %v", branch, err)
 	}
