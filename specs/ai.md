@@ -10942,9 +10942,9 @@ shipped as `[y]`/`[n]`, not `[a]`/`[r]`: `[a]` doubling as the board's admin tog
 *and* approve would put "approve a plan" one keystroke from `[x]` cancel-a-live-run,
 and `[r]` is refresh everywhere else in the app. Both destructive verbs (`cancel`,
 `reject_plan`) require the affirmative key — "not escape" is not consent — while
-approve is unconfirmed and offered only while the run is actually at its gate. Quit is
-confirmed for both `[q]` and `ctrl+c`, with a second `ctrl+c` as the escape hatch for a
-stuck confirm prompt; a stray keystroke must not drop a watched run.
+approve is unconfirmed and offered only while the run is actually at its gate. `[q]` quits
+immediately (user preference); `ctrl+c` is confirmed, with a second `ctrl+c` as the escape
+hatch for a stuck confirm prompt, so a stray `ctrl+c` cannot drop a watched run.
 
 See [prds/done/112-uzi-tui.md](../prds/done/112-uzi-tui.md) D4/D5/D8, R2, and the M3/M4
 milestone corrections.

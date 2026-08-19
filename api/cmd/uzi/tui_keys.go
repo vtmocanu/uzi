@@ -20,6 +20,7 @@ const (
 	keyFilter       = "/"
 	keyHelp         = "?"
 	keyAdmin        = "a"
+	keyHideDone     = "h" // board: hide terminal (completed/failed/cancelled) runs, keeping active + needs-you
 	keyRefresh      = "r"
 	keyConfirmY     = "y"
 	keyConfirmN     = "n"
@@ -67,7 +68,7 @@ func helpLines(inDetail bool) []string {
 		"/          filter",
 		"r          refresh",
 		"?          this help",
-		"q          quit (asks to confirm; ctrl+c twice quits at once)",
+		"q          quit immediately (ctrl+c asks to confirm; twice quits at once)",
 	}
 	if inDetail {
 		return append([]string{
@@ -80,5 +81,6 @@ func helpLines(inDetail bool) []string {
 	}
 	return append([]string{
 		"a          toggle the factory-wide admin board (needs a uza_ token)",
+		"h          hide finished runs (completed/failed/cancelled); keeps active + needs-you",
 	}, common...)
 }

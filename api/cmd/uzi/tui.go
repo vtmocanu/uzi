@@ -101,9 +101,9 @@ type tuiModel struct {
 	board  boardState
 	detail detailState
 
-	// quitting is the confirm modal (both q and ctrl+c route through it); ctrlCSeen
-	// makes a second ctrl+c quit immediately, which is the escape hatch a user reaches
-	// for when the modal itself is what is wrong.
+	// quitting is the ctrl+c confirm modal (q quits immediately and does NOT route through
+	// it); ctrlCSeen makes a second ctrl+c quit immediately, which is the escape hatch a user
+	// reaches for when the modal itself is what is wrong.
 	quitting  bool
 	ctrlCSeen bool
 	showHelp  bool
@@ -357,9 +357,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m tuiModel) handleKey(k string) (tea.Model, tea.Cmd) {
-	// Quit routes through a confirm modal for BOTH q and ctrl+c, so a stray keystroke
-	// cannot drop a watched run. A second ctrl+c quits at once — the escape hatch for
-	// when the modal is what is broken.
+	// q quits immediately (user preference). ctrl+c still routes through a confirm modal so a
+	// stray ctrl+c cannot drop a watched run; a second ctrl+c quits at once.
 	if k == keyCtrlC {
 		if m.ctrlCSeen || m.quitting {
 			return m, tea.Quit
@@ -382,8 +381,7 @@ func (m tuiModel) handleKey(k string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if k == keyQuit && !m.filtering() {
-		m.quitting = true
-		return m, nil
+		return m, tea.Quit
 	}
 	if k == keyHelp && !m.filtering() {
 		m.showHelp = true
