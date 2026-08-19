@@ -751,6 +751,126 @@ func TestNewMethodErrorsAreRedacted(t *testing.T) {
 	}
 }
 
+// TestGitLabListMethodsSkipNullElements pins the nil-element guards on the five
+// list loops. A GitLab REST response is a JSON array, and a hostile or buggy
+// forge can put a `null` where an object is expected: `[null, {...}]` decodes to
+// a slice whose first element is a nil pointer. Before the guards, the list loops
+// dereferenced every element unconditionally, so the nil-first array panicked on
+// the very first iteration.
+//
+// Each sub-test installs a route returning exactly `[null, {<one valid object>}]`
+// and asserts the method (1) does not panic and returns no error, and (2) returns
+// exactly the one valid element — proving the null was skipped, not that the whole
+// page was dropped. Remove any of the five `if x == nil { continue }` guards in
+// gitlab.go and the matching sub-test panics (a nil-pointer dereference surfaced by
+// the test runner as a failed test), which is what makes this a regression test and
+// not just a happy-path parse.
+func TestGitLabListMethodsSkipNullElements(t *testing.T) {
+	const projectID, issueIID, pipelineID = 7, 11, 55
+
+	tests := []struct {
+		name string
+		path string
+		body string
+		// invoke calls the driver method and returns the number of elements it
+		// yielded plus a distinguishing field of the (expected single) survivor.
+		invoke func(ctx context.Context, d Forge) (n int, got string, err error)
+		want   string
+	}{
+		{
+			name: "ListProjects",
+			path: "/api/v4/projects",
+			body: `[null, {"id": 1, "path_with_namespace": "grp/a", "web_url": "https://gl/grp/a", "default_branch": "main"}]`,
+			invoke: func(ctx context.Context, d Forge) (int, string, error) {
+				ps, err := d.ListProjects(ctx)
+				if err != nil || len(ps) != 1 {
+					return len(ps), "", err
+				}
+				return len(ps), ps[0].PathWithNamespace, nil
+			},
+			want: "grp/a",
+		},
+		{
+			name: "ListLabels",
+			path: "/api/v4/projects/7/labels",
+			body: `[null, {"name": "PRD", "color": "#112233"}]`,
+			invoke: func(ctx context.Context, d Forge) (int, string, error) {
+				ls, err := d.ListLabels(ctx, projectID)
+				if err != nil || len(ls) != 1 {
+					return len(ls), "", err
+				}
+				return len(ls), ls[0].Name, nil
+			},
+			want: "PRD",
+		},
+		{
+			name: "ListIssues",
+			path: "/api/v4/projects/7/issues",
+			body: `[null, {"id": 1001, "iid": 11, "title": "Do the thing", "state": "opened", "author": {"username": "alice"}}]`,
+			invoke: func(ctx context.Context, d Forge) (int, string, error) {
+				is, err := d.ListIssues(ctx, projectID, ListIssuesOptions{})
+				if err != nil || len(is) != 1 {
+					return len(is), "", err
+				}
+				return len(is), is[0].Title, nil
+			},
+			want: "Do the thing",
+		},
+		{
+			name: "ListIssueLabelEvents",
+			path: "/api/v4/projects/7/issues/11/resource_label_events",
+			body: `[null, {"id": 501, "action": "add", "created_at": "2026-07-04T09:00:00Z", "user": {"id": 42, "username": "carol"}, "label": {"id": 9, "name": "autopilot"}}]`,
+			invoke: func(ctx context.Context, d Forge) (int, string, error) {
+				es, err := d.ListIssueLabelEvents(ctx, projectID, issueIID)
+				if err != nil || len(es) != 1 {
+					return len(es), "", err
+				}
+				return len(es), es[0].LabelName, nil
+			},
+			want: "autopilot",
+		},
+		{
+			name: "ListPipelineJobs",
+			path: "/api/v4/projects/7/pipelines/55/jobs",
+			body: `[null, {"id": 9, "name": "build", "stage": "build", "status": "success", "web_url": "https://gl/grp/a/-/jobs/9"}]`,
+			invoke: func(ctx context.Context, d Forge) (int, string, error) {
+				js, err := d.ListPipelineJobs(ctx, projectID, pipelineID)
+				if err != nil || len(js) != 1 {
+					return len(js), "", err
+				}
+				return len(js), js[0].Name, nil
+			},
+			want: "build",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := tc.body
+			m := newMockGitLab(t, map[string]http.HandlerFunc{
+				tc.path: func(w http.ResponseWriter, _ *http.Request) {
+					// Empty X-Next-Page → resp.NextPage == 0, so the paginating loop
+					// stops after this single page.
+					w.Header().Set("X-Next-Page", "")
+					_, _ = w.Write([]byte(body))
+				},
+			})
+			d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+			n, got, err := tc.invoke(context.Background(), d)
+			if err != nil {
+				t.Fatalf("%s returned an error on a [null, {...}] page: %v", tc.name, err)
+			}
+			if n != 1 {
+				t.Fatalf("%s: expected exactly the one valid element (null skipped), got %d", tc.name, n)
+			}
+			if got != tc.want {
+				t.Fatalf("%s: expected the surviving element's field %q, got %q", tc.name, tc.want, got)
+			}
+		})
+	}
+}
+
 func TestErrorsAreRedacted(t *testing.T) {
 	const token = "glpat-supersecret-eviltoken-XYZ" //gitleaks:allow // fake PAT fixture: the mock server echoes it back so the driver's redactor is proven to strip it, never a real secret
 	m := newMockGitLab(t, map[string]http.HandlerFunc{
