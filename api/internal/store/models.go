@@ -383,6 +383,8 @@ type Run struct {
 	SummaryPlan           pgtype.Text        `json:"summary_plan"`
 	SummaryDeltas         []byte             `json:"summary_deltas"`
 	IssueComments         []byte             `json:"issue_comments"`
+	BaseBranch            pgtype.Text        `json:"base_branch"`
+	OpenMr                bool               `json:"open_mr"`
 }
 
 type RunMessage struct {

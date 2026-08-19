@@ -1065,6 +1065,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// Queue a CI-fix run for a failed pipeline (PRD #6). Snapshots the
 				// failed pipeline's jobs + logs from the forge → per-user budget.
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/ci-fix-runs", h.CreateCIFixRun)
+				// Queue a task/handoff run (PRD #400): ephemeral, branch-scoped,
+				// issue-less. Same per-user forge budget as the other run creators.
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/task-runs", h.CreateTaskRun)
 			})
 		})
 

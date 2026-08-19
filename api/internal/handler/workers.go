@@ -359,6 +359,8 @@ func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
 			r.PlanMd.Valid && strings.TrimSpace(r.PlanMd.String) != ""),
 		AutoApprove:   r.AutoApprove,
 		Branch:        textPtrValue(r.Branch.Valid, r.Branch.String),
+		BaseBranch:    textPtrValue(r.BaseBranch.Valid, r.BaseBranch.String),
+		OpenMr:        r.OpenMr,
 		MrWebURL:      textPtrValue(r.MrWebUrl.Valid, r.MrWebUrl.String),
 		MrState:       textPtrValue(r.MrState.Valid, r.MrState.String),
 		FailureReason: textPtrValue(r.FailureReason.Valid, r.FailureReason.String),
@@ -883,6 +885,44 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run))})
 }
 
+// CreateTaskRunRequest is the POST /repos/{id}/task-runs body (PRD #400): the inline
+// handoff context (reused as the run's issue_description), an optional source ref to
+// branch from, and whether the worker should open an MR at the end. Context is
+// required; the other two default to "branch from local HEAD" and "no MR".
+type CreateTaskRunRequest struct {
+	Context    string `json:"context"`
+	BaseBranch string `json:"base_branch"`
+	OpenMr     bool   `json:"open_mr"`
+}
+
+// CreateTaskRun queues a task/handoff run (PRD #400). Unlike CreateRun it takes no
+// forge issue: a task is issue-less and repo-ful, carrying its inline instruction
+// directly. The server names the branch (uzi/task/<run-id>) and the created-run
+// response carries it (runToDTO maps Branch), which is exactly what the CLI needs to
+// push local HEAD to the seeded branch.
+func (h *Handler) CreateTaskRun(w http.ResponseWriter, r *http.Request) {
+	repo, ok := h.repoForRequest(w, r)
+	if !ok {
+		return
+	}
+	user, _ := mw.UserFromContext(r.Context())
+	var req CreateTaskRunRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if strings.TrimSpace(req.Context) == "" {
+		httpx.Error(w, http.StatusBadRequest, "context is required")
+		return
+	}
+	run, err := h.wsvc.CreateTaskRun(r.Context(), user.ID, repo.ID, req.Context, req.BaseBranch, req.OpenMr)
+	if err != nil {
+		h.writeStartRunError(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run))})
+}
+
 // writeStartRunError maps the StartRunForUser* sentinels to an HTTP status + message.
 // Shared by the board start button (CreateRun) and the chat start-run card
 // (StartChatRun, PRD #191 M5) so both surfaces refuse an issue for the SAME reason with
@@ -944,6 +984,12 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 			msg = fmt.Sprintf("issue has no PRD link; add a prds/*.md link (or the %s label) before starting a run", prdlessLabel)
 		}
 		httpx.Error(w, http.StatusUnprocessableEntity, msg)
+	case errors.Is(err, workersvc.ErrTaskBranchUnsafe):
+		// PRD #400 Decision 8: the create-time namespace/default-branch assertion
+		// failed. The server names the branch uzi/task/<uuid> itself, so this is an
+		// internal invariant violation, never a caller error — 500, logged.
+		slog.Error("create task run: branch-safety assertion failed", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
 	case errors.Is(err, workersvc.ErrActiveRunExists):
 		httpx.Error(w, http.StatusConflict, "a run is already in progress for this issue")
 	case errors.Is(err, workersvc.ErrBranchInUse):

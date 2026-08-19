@@ -340,6 +340,9 @@ var wantRouteMounts = []routeMount{
 	// per-user forge limiter, matching CreateRun's posture.
 	{"POST", "/api/schedules/{id}/run-now", limForge},
 	{"POST", "/api/repos/{id}/sync", limForge},
+	// Task/handoff run (PRD #400): the create path pushes the same per-user forge
+	// budget as the other run creators (runs, ci-fix-runs).
+	{"POST", "/api/repos/{id}/task-runs", limForge},
 	{"POST", "/api/runs/{id}/inputs", noLimiter},
 	{"POST", "/api/runs/{id}/rejudge", limJudge},
 	{"POST", "/api/runs/{id}/review/recommendations/{recID}/issue", limForge},

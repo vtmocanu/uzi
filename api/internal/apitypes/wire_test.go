@@ -82,7 +82,12 @@ var runDTOKeys = []string{
 	// budget (nil ⇒ null ⇒ the global default). All four always present; a client
 	// branches per field. budget_* are load-bearing on the state-ack, not just display.
 	"milestones_completed", "milestones_in_progress", "budget_max_iterations", "budget_wall_seconds",
-	"worker_id", "branch", "mr_iid", "mr_web_url", "mr_state", "failure_reason",
+	"worker_id", "branch",
+	// PRD #400 (uzi handoff): the task/handoff columns, meaningful only on a
+	// kind='task' run. base_branch is null on every non-task run; open_mr is false by
+	// default and on every non-task run. Always on the wire.
+	"base_branch", "open_mr",
+	"mr_iid", "mr_web_url", "mr_state", "failure_reason",
 	"stop_kind", "health", "health_reason", "health_since", "plan_md",
 	// PRD #209: plan_md's provenance ("agent"|"seeded"), NOT NULL so always on the wire.
 	"plan_source",

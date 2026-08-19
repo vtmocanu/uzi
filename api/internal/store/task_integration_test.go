@@ -1,0 +1,141 @@
+package store_test
+
+// PRD #400 M1 — the parts of the 'task' run kind that only a real Postgres can
+// answer: whether CreateTaskRun's caller-supplied id + branch actually persist a
+// kind='task' row with the novel shape, and whether the two CHECK constraints
+// (runs_kind_check widened to seven, runs_kind_shape's task clause) actually FIRE.
+// The shape clause is the novel one — 'task' is the first kind that requires
+// `branch IS NOT NULL` at insert — so a vacuous clause (one that accepts a NULL
+// branch, or a task carrying an issue_iid) is exactly what this pins against.
+//
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; run via
+// e2e/run-store-it.sh. A package that prints `ok` with PASS=0 is INVALID, not green.
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/vtmocanu/uzi/api/internal/store"
+)
+
+func TestCreateTaskRunLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	userID, connID, repoID := uuid.New(), uuid.New(), uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		userID, fmt.Sprintf("task-%s@e2e", userID))
+	mustExec(ctx, t, pool,
+		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})
+	mustExec(ctx, t, pool,
+		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		 VALUES ($1, $2, 1, 'g/r', 'https://forge.e2e/g/r', 'main', true)`, repoID, connID)
+
+	// ── The happy path: a caller-supplied id + uzi/task/<id> branch persists a
+	//    kind='task' row with the novel shape (repo-ful, issue-less, branch set). ──
+	id := uuid.New()
+	branch := "uzi/task/" + id.String()
+	run, err := q.CreateTaskRun(ctx, store.CreateTaskRunParams{
+		RunID:            id,
+		UserID:           userID,
+		RepoID:           repoID,
+		Branch:           pgtype.Text{String: branch, Valid: true},
+		BaseBranch:       pgtype.Text{String: "develop", Valid: true},
+		OpenMr:           false,
+		IssueTitle:       "handoff title",
+		IssueDescription: "do the thing",
+	})
+	if err != nil {
+		t.Fatalf("CreateTaskRun: %v", err)
+	}
+	if run.ID != id {
+		t.Errorf("run.ID = %v, want the caller-supplied %v", run.ID, id)
+	}
+	if run.Kind != "task" {
+		t.Errorf("kind = %q, want task", run.Kind)
+	}
+	if !run.Branch.Valid || run.Branch.String != branch {
+		t.Errorf("branch = %v, want %q set at create (task is the first kind to require it)", run.Branch, branch)
+	}
+	if !run.RepoID.Valid || run.RepoID.Bytes != repoID {
+		t.Errorf("repo_id = %v, want %v (task is repo-ful)", run.RepoID, repoID)
+	}
+	if run.IssueIid.Valid {
+		t.Errorf("issue_iid = %v, want NULL (task is issue-less)", run.IssueIid)
+	}
+	if run.OpenMr {
+		t.Error("open_mr = true, want false by default (a plain handoff opens no MR)")
+	}
+	if !run.AutoApprove {
+		t.Error("auto_approve = false, want true (handoff is the no-plan-gate mode, baked in the SQL)")
+	}
+	if !run.BaseBranch.Valid || run.BaseBranch.String != "develop" {
+		t.Errorf("base_branch = %v, want develop", run.BaseBranch)
+	}
+
+	// ── open_mr rides straight from the caller: true when passed. ──
+	id2 := uuid.New()
+	run2, err := q.CreateTaskRun(ctx, store.CreateTaskRunParams{
+		RunID:            id2,
+		UserID:           userID,
+		RepoID:           repoID,
+		Branch:           pgtype.Text{String: "uzi/task/" + id2.String(), Valid: true},
+		OpenMr:           true,
+		IssueTitle:       "with mr",
+		IssueDescription: "escalate to an MR",
+	})
+	if err != nil {
+		t.Fatalf("CreateTaskRun (open_mr): %v", err)
+	}
+	if !run2.OpenMr {
+		t.Error("open_mr = false, want true when passed")
+	}
+	if run2.BaseBranch.Valid {
+		t.Errorf("base_branch = %v, want NULL when omitted", run2.BaseBranch)
+	}
+
+	// ── The shape CHECK must FIRE: a kind='task' row with branch = NULL is rejected
+	//    by runs_kind_shape. This proves the `branch IS NOT NULL` clause is real. ──
+	badID := uuid.New()
+	_, err = pool.Exec(ctx,
+		`INSERT INTO runs (id, user_id, repo_id, kind, issue_title, issue_description, auto_approve)
+		 VALUES ($1, $2, $3, 'task', 't', 'd', true)`, badID, userID, repoID)
+	if err == nil {
+		t.Fatal("a kind='task' row with branch=NULL was ACCEPTED: runs_kind_shape's `branch IS NOT NULL` clause is vacuous")
+	}
+	if !strings.Contains(err.Error(), "runs_kind_shape") {
+		t.Errorf("branch=NULL task rejected by %v, want the runs_kind_shape CHECK", err)
+	}
+
+	// ── And a kind='task' row that carries an issue_iid is rejected too (task is
+	//    issue-less: the shape clause requires issue_iid IS NULL). ──
+	badID2 := uuid.New()
+	_, err = pool.Exec(ctx,
+		`INSERT INTO runs (id, user_id, repo_id, kind, branch, issue_iid, issue_title, issue_description, auto_approve)
+		 VALUES ($1, $2, $3, 'task', $4, 7, 't', 'd', true)`, badID2, userID, repoID, "uzi/task/"+badID2.String())
+	if err == nil {
+		t.Fatal("a kind='task' row carrying issue_iid was ACCEPTED: runs_kind_shape's `issue_iid IS NULL` clause is vacuous")
+	}
+	if !strings.Contains(err.Error(), "runs_kind_shape") {
+		t.Errorf("issue-bearing task rejected by %v, want the runs_kind_shape CHECK", err)
+	}
+}

@@ -101,7 +101,14 @@ type RunDTO struct {
 	BudgetWallSeconds   *int    `json:"budget_wall_seconds"`
 	WorkerID            *string `json:"worker_id"`
 	Branch              *string `json:"branch"`
-	MrIID               *int64  `json:"mr_iid"`
+	// BaseBranch and OpenMr are the task/handoff columns (PRD #400), meaningful only
+	// for a kind='task' run. BaseBranch is the source ref the task branched from (null
+	// when it inherited the caller's local HEAD, and on every non-task run); OpenMr is
+	// whether the worker opens an MR at the end (false by default and for every
+	// non-task run — a plain handoff produces commits on the branch, not an MR).
+	BaseBranch *string `json:"base_branch"`
+	OpenMr     bool    `json:"open_mr"`
+	MrIID      *int64  `json:"mr_iid"`
 	// MrWebURL is the forge-supplied MR/PR web URL persisted by the worker at MR
 	// creation (PRD #65 D8), null on runs created before it landed. The web renders
 	// it directly through isHttpsUrl and only falls back to the legacy GitLab URL
