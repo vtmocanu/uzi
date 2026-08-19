@@ -63,38 +63,70 @@ release role.)
 
 ## For this repo (uzi)
 
-Release is a `v*` tag (Model B: chart `version`/`appVersion` == the tag). Pushing the tag
-makes CI (`.gitlab-ci.yml`) publish the api/web images + the OCI Helm chart to Harbor;
-k8s deploy is GitOps via ArgoCD to dev-cluster — follow `deploy/README.md` (the chart +
-release runbook). Remote is GitLab `gitlab.example.com:vtmocanu/uzi` — use
-`env -u GITLAB_TOKEN glab`, never `gh`/`tea` (an exported `GITLAB_TOKEN` 401s on this host).
-**`CHANGELOG.md` EXISTS and CI gates the tag on it describing the release** (`c2847d82`):
-fold `[Unreleased]` into the version being cut, with its date, BEFORE tagging, and confirm
-the published release carries those notes rather than an auto-generated commit list.
-*(Corrected 2026-07-27: this line read "There is no `CHANGELOG.md`; the release notes are
-the tag/MR summary" — flagged by the judge, and false since the coverage gate landed. The
-same claim was in `.claude/agents/documenter.md`.)* The version bump (`deploy/README.md` step 1) and the ArgoCD
-`targetRevision` bump (step 3) each land **two ways**: **direct-to-`main` (the DEFAULT,
-preferred at this early dev stage) or an MR when review is wanted.** Both `vtmocanu/uzi` and
-`argo-apps` allow direct pushes to `main`. Direct-to-`main` is preferred because it
-skips the separate MR pipeline — one full gate cycle instead of two (MR gate, then the tag's
-re-gate) and one fewer roll against flaky tests; the release commit is only `Chart.yaml` +
-CHANGELOG on already-gated code and the tag pipeline re-gates as the safety net. Ask the lead
-which if unspecified; default to direct-to-`main`. Re-verify `main`
-mergeability IMMEDIATELY before tagging (bots + sibling PRD merges drift it); reconcile with
-a plain `git merge origin/main` (never force-push), renumber any append-numbered artifacts
-(goose migrations, `specs/ai.md` sections) above the merged head, re-run the gate on the
-merged tip, then tag **directly — do NOT wait for the release commit's `main`-branch CI
-pipeline to go green first.** The tag pipeline re-runs the full gate AND publishes (a strict
-superset, verified live: it carries every `test`/`lint`/`validate`/`build`/`e2e` stage plus
-the `publish:*` jobs), so tagging concurrently loses no gate coverage and saves a whole serial
-CI cycle. Cancel the now-redundant `main` pipeline
-(`glab api --method POST projects/vtmocanu%2Fuzi/pipelines/<id>/cancel`) to free runners for
-the tag pipeline; a cold Harbor cache just means a slower publish (never a failure), and a
-flaky tag pipeline re-runs with `glab ci run --branch v<X.Y.Z>`, tag left in place. Confirm with the lead before pushing any tag. **Never
-`[skip ci]` the commit you tag** — the marker skips the tag's *publish* pipeline
-too (push-triggered, same as the branch pipeline), so `git push origin vX.Y.Z`
-reports `* [new tag]` and publishes NOTHING; recovery is `glab ci run --branch
-vX.Y.Z` (a manually-created pipeline ignores the marker), tag left in place. The
-full trap + recovery is in `deploy/README.md`'s release procedure — read it before
-tagging, not after (this bit me on 0.20.0).
+Remote is **GitHub** (`github.com/vtmocanu/uzi`) as of 2026-08-18 — use **`gh`**, never
+`glab`/`tea`. *(This whole section described the retired GitLab flow — `.gitlab-ci.yml`,
+Harbor, `glab ci`, pipeline-cancel — until 2026-08-19, when a live release rewrote it. All of
+that is gone. `deploy/README.md` is STILL GitLab-worded (Harbor, `argo-apps`, `glab`) and needs
+the same GitLab→GitHub correction — trust `.github/workflows/release.yml` over that runbook for
+the publish mechanics.)*
+
+Release is a `v*` tag (Model B: chart `version`/`appVersion` == the normalized tag). Pushing the
+tag triggers **`.github/workflows/release.yml`** (GitHub Actions, `push: tags: ["v*"]`), which:
+
+1. re-runs ONLY the two release-specific gates — `assert-version` (chart `version`/`appVersion`
+   == the tag) and `assert-changelog` (every shipping first-parent merge since the previous
+   `v*` tag is cited, by issue number or short SHA, in the tag's `## [X.Y.Z]` CHANGELOG
+   section). **It does NOT re-run the full test/lint/build gate** — those are ASSUMED green on
+   the tagged commit (unlike the old GitLab tag pipeline, which re-ran everything). So the
+   commit you tag must already be gated: confirm `main`'s CI (`ci.yml`) is green on it first.
+2. publishes to **GHCR**: `ghcr.io/vtmocanu/uzi/{api,web,controller,agent-base,agent-jvm}:<version>`
+   (+ `:<short-sha>`) and the chart `oci://ghcr.io/vtmocanu/uzi/uzi:<version>` (chart LAST, after
+   every image). Homebrew is a SEPARATE tag-triggered workflow (`brew.yml`), not a job here.
+
+**🔴 THE PUBLISH JOBS GATE ON A MANUAL APPROVAL, AND `git push origin vX.Y.Z` DOES NOT TELL YOU.**
+Every `publish-*` job declares `environment: release`, and since the repo went public that
+environment carries a required-reviewer rule. So after the tag pushes, the run sits in
+`status: waiting` with every publish job `waiting` and NOTHING builds until a listed reviewer
+approves — `git push` still printed `* [new tag]`, so the release LOOKS launched. You are a
+listed reviewer; approve it:
+
+```sh
+RUN=$(gh run list --workflow release.yml --branch vX.Y.Z --limit 1 --json databaseId --jq '.[0].databaseId')
+ENV=$(gh api repos/vtmocanu/uzi/actions/runs/$RUN/pending_deployments --jq '.[0].environment.id')
+printf '{"environment_ids":[%s],"state":"approved","comment":"release vX.Y.Z"}' "$ENV" \
+  | gh api --method POST repos/vtmocanu/uzi/actions/runs/$RUN/pending_deployments --input -
+```
+
+**The approval GATES MORE THAN ONCE — do not walk away after the first one.** `publish-chart`
+`needs:` every image job, so its own `environment: release` gate only goes pending AFTER the
+images finish; the run returns to `status: waiting` a SECOND time and you must re-run the
+approval above for it (re-read `pending_deployments` once the images are green). `brew.yml` is a
+separate tag-triggered run with its OWN `release`-environment gate, so that is a THIRD approval.
+Every one of them sits silent until approved.
+
+**WATCH THE RELEASE RUN IN THE BACKGROUND, never the foreground.** It blocks first on the
+approval above, then on the multi-arch image builds, then on the second (chart) approval, so a
+foreground `gh run watch` just pins the turn (this is what prompted the rewrite). Background it (`run_in_background`, or
+`gh run watch "$RUN" --exit-status &`) and, after it finishes, PROVE the publish: `gh run view
+"$RUN"` all-green AND the GHCR packages carry the new tag (`gh api
+'/users/vtmocanu/packages/container/uzi%2Fapi/versions' --jq '.[].metadata.container.tags'`).
+
+The CHANGELOG coverage gate runs `scripts/assert-changelog-covers-release.sh`. Fold
+`[Unreleased]` into a `## [X.Y.Z] - <date>` section citing each shipping merge's issue number or
+short SHA BEFORE tagging, and run it locally against your release commit first:
+`bash scripts/assert-changelog-covers-release.sh HEAD v<prev> X.Y.Z`.
+
+The version bump (`CHANGELOG.md` + `deploy/chart/Chart.yaml`) lands **direct-to-`main`** (the
+DEFAULT at this dev stage — an admin push bypasses branch protection, verified live 2026-08-19)
+or via an MR when review is wanted; ask the lead if unspecified. Re-verify `main` IMMEDIATELY
+before tagging (bots + sibling merges drift it), reconcile with a plain `git merge origin/main`
+(never force-push), renumber any append-numbered artifacts (goose migrations, `specs/ai.md`
+sections) above the merged head, re-run the gate on the merged tip, and confirm `main`'s CI is
+green (see gate note in step 1). Confirm with the lead before pushing any tag. **Never `[skip
+ci]` the commit you tag.** k8s deploy is GitOps via ArgoCD — follow `deploy/README.md` for the
+deploy step (bearing its staleness caveat above in mind).
+
+Once the release (and its sibling `brew.yml`) have published, keep the LOCAL CLI current so it
+matches what just shipped: `brew update && brew upgrade uzi-cli`. The Homebrew formula is pushed
+by `brew.yml` to `vtmocanu/task`'s tap, so give that workflow time to finish before upgrading, or
+the tap still points at the previous version.
