@@ -73,8 +73,15 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 		RequeueCount:   0,
 		PlanMd:         strptr("# Plan\n"),
 		AutoApprove:    true, // PRD #19 autopilot; part of the same claim shape
-		WaitOnLimit:    true, // PRD #35 Decision 7: the run's usage-limit opt-in
-		PlanApproved:   true,
+		// PRD #400 M2: the task-run MR gate + source ref ride every claim. Both are
+		// NON-DEFAULT here (open_mr true, base_branch non-nil) for the same "wired vs
+		// present-and-zero" reason the flags above carry non-default — even though they
+		// are only meaningful for kind='task'. open_mr has no omitempty (always present,
+		// like auto_approve); base_branch is a pointer (nil ⇒ absent).
+		OpenMr:       true,
+		BaseBranch:   strptr("develop"),
+		WaitOnLimit:  true, // PRD #35 Decision 7: the run's usage-limit opt-in
+		PlanApproved: true,
 		// PRD #209: plan_source rides every claim (NOT NULL, no omitempty). "seeded"
 		// here makes this a coherent seeded-run claim — approved, no session — and is a
 		// NON-DEFAULT value for the same "wired vs present-and-zero" reason the booleans
@@ -205,6 +212,34 @@ func TestClaimRepoCarriesForgeType(t *testing.T) {
 	}
 	if got, ok := m["forge_type"]; !ok || got != "gitlab" {
 		t.Errorf("claim repo must carry forge_type=\"gitlab\" (R8); got %v (present=%v)", got, ok)
+	}
+}
+
+// TestClaimCarriesTaskMrFields pins PRD #400 M2's two additions: open_mr and
+// base_branch ride every claim. open_mr has no omitempty (always present, like
+// auto_approve); base_branch is a pointer that is present when non-nil. Both are
+// meaningful only for a task run, but the wire always carries the key so a worker
+// never has to guess. Additive — an old worker ignores both keys.
+func TestClaimCarriesTaskMrFields(t *testing.T) {
+	b, err := json.Marshal(sampleClaimPayloadWithSkills())
+	if err != nil {
+		t.Fatalf("marshal claim: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal claim: %v", err)
+	}
+	got, ok := m["open_mr"]
+	if !ok {
+		t.Error("claim must carry open_mr (PRD #400 M2); key absent")
+	} else if got != true {
+		t.Errorf("open_mr = %v, want true", got)
+	}
+	base, ok := m["base_branch"]
+	if !ok {
+		t.Error("claim must carry base_branch (PRD #400 M2); key absent")
+	} else if base != "develop" {
+		t.Errorf("base_branch = %v, want develop", base)
 	}
 }
 

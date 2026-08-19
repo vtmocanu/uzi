@@ -1039,6 +1039,56 @@ func TestClaimAssemblesPayloadWithDecryptedSecrets(t *testing.T) {
 	}
 }
 
+// TestClaimCarriesTaskOpenMrAndBaseBranch proves assembleClaim copies a task run's
+// runs.open_mr and runs.base_branch onto the claim payload (PRD #400 M2), so the
+// worker can gate MR-open and name the source ref. Constructs a task run row shaped
+// like CreateTaskRun leaves it (server-named uzi/task/<id> branch, issue-less,
+// open_mr=true, a base_branch set) and asserts both ride the payload.
+func TestClaimCarriesTaskOpenMrAndBaseBranch(t *testing.T) {
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-TASKTEST-abcdef1234567890"))
+	sealedTok, _ := box.Seal([]byte("anthropic-TASKTEST-abcdef1234567890"))
+
+	runID := uuid.New()
+	taskBranch := "uzi/task/" + runID.String()
+	fs := &fakeStore{
+		claimRun: store.Run{
+			ID: runID, Kind: "task", Status: "claimed",
+			IssueTitle: "Do the handoff", IssueDescription: "take this and run",
+			Branch:     pgText(taskBranch),
+			BaseBranch: pgText("develop"),
+			OpenMr:     true,
+		},
+		claimCtx: store.GetRunClaimContextRow{
+			RepoWebUrl: "https://gitlab.example.com/grp/proj", RepoPath: "grp/proj",
+			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
+		},
+		anthropic: sealedTok,
+	}
+
+	svc := New(fs, box, testParams())
+	payload, err := svc.Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload == nil {
+		t.Fatal("expected a payload, got idle")
+	}
+	if payload.Kind != "task" {
+		t.Fatalf("kind = %q, want task", payload.Kind)
+	}
+	if !payload.OpenMr {
+		t.Error("open_mr not carried onto the task claim payload")
+	}
+	if payload.BaseBranch == nil || *payload.BaseBranch != "develop" {
+		t.Errorf("base_branch = %v, want develop", payload.BaseBranch)
+	}
+	if payload.Branch == nil || *payload.Branch != taskBranch {
+		t.Errorf("branch = %v, want %s", payload.Branch, taskBranch)
+	}
+}
+
 func TestClaimOmitsDefaultModelWhenOwnerHasNone(t *testing.T) {
 	box := newBox(t)
 	sealedPAT, _ := box.Seal([]byte("bot-pat-OMITTEST-abcdef1234567890"))

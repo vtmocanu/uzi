@@ -194,9 +194,15 @@ export interface AnswerBody {
  *  `repo` is set, and `issue_description` carries the schedule's stored task
  *  text; it opens a repo→MR run with no issue to close.
  *
+ *  "task" (PRD #400) is the handoff kind: repo-ful and ISSUE-LESS like "prompt",
+ *  carrying its inline context in `issue_description`, but it works a PRE-SEEDED,
+ *  server-named `uzi/task/<run-id>` branch (on `branch`) and, by default, opens NO
+ *  merge request — the deliverable is commits the user pulls. It opens one only when
+ *  `open_mr` is true (`uzi handoff --mr`).
+ *
  *  RUN_KINDS is mirrored from the DB `runs_kind_check` constraint (in DB CHECK
  *  order); agent/test/run-kind-db-parity.test.ts keeps the two in sync. */
-export const RUN_KINDS = ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt"] as const;
+export const RUN_KINDS = ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt", "task"] as const;
 export type RunKind = (typeof RUN_KINDS)[number];
 
 /** How a run's plan_md was produced (PRD #209 D4). "agent": the worker's own Phase-1
@@ -544,6 +550,17 @@ export interface ClaimResponse {
    *  fact. Re-delivered on every resume/requeue of the same run (the server reads
    *  it from the row), so an unattended resume never hangs at the gate. */
   auto_approve?: boolean;
+  /** PRD #400 M2: gates whether a TASK run opens a merge request. Meaningful only for
+   *  kind="task": a task ALWAYS pushes its branch back (the deliverable is commits the
+   *  user pulls), but opens an MR only when this is true (`uzi handoff --mr`). Every
+   *  other kind ignores it. Read from the runs row, so re-delivered on every resume like
+   *  auto_approve. Absent on an older server ⇒ treat as false (no MR for a task). */
+  open_mr?: boolean;
+  /** PRD #400 M2: the source ref a task run was branched from, for context/review.
+   *  Meaningful only for kind="task" — the worker works the pre-seeded, server-named
+   *  `branch` (uzi/task/<run-id>), not this ref; it is carried so an MR/review can name
+   *  what the task diverged from. Null/absent for a run that has none. */
+  base_branch?: string | null;
   /** PRD #88: the clarification question this run is ALREADY parked on, read from the
    *  runs row and so re-delivered on every resume — the same shape as auto_approve and
    *  for the same reason. A resumed worker re-parks with this SAME id rather than

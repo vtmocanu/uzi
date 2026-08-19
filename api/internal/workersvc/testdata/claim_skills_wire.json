@@ -23,6 +23,8 @@
   "requeue_count": 0,
   "plan_md": "# Plan\n",
   "auto_approve": true,
+  "open_mr": true,
+  "base_branch": "develop",
   "wait_on_limit": true,
   "plan_approved": true,
   "plan_source": "seeded",

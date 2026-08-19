@@ -12,6 +12,8 @@
   "requeue_count": 0,
   "plan_md": null,
   "auto_approve": false,
+  "open_mr": false,
+  "base_branch": null,
   "wait_on_limit": false,
   "plan_approved": false,
   "plan_source": "agent",

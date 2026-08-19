@@ -1902,6 +1902,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		RequeueCount:   run.RequeueCount,
 		PlanMd:         textPtr(run.PlanMd),
 		AutoApprove:    run.AutoApprove,
+		// PRD #400 M2: task-run MR gate + source ref. open_mr is a plain bool (false
+		// for every non-task run); base_branch is pgtype.Text (nil for a run that has
+		// none). Both re-read from the row on every claim, like AutoApprove above.
+		OpenMr:         run.OpenMr,
+		BaseBranch:     textPtr(run.BaseBranch),
 		OpenQuestionID: textPtr(run.OpenQuestionID),
 		// PRD #35. Re-read from the row on EVERY claim, like AutoApprove above: a
 		// park-resume-park cycle must keep asking the row rather than remembering what
