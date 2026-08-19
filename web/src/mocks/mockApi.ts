@@ -162,6 +162,8 @@ const SEED_APP_SETTINGS: AppSettings = {
   judge_enforce_all: "false",
   judge_cooldown_seconds: "60",
   judge_daily_budget: "0",
+  // PRD #362 Decision 8: the run-summary generator model, haiku by default.
+  summary_model: "haiku",
   health_enabled: "true",
   health_stall_seconds: "300",
   health_slow_seconds: "2700",
@@ -225,6 +227,9 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     typeof a.judge_enforce_all === "string" &&
     typeof a.judge_cooldown_seconds === "string" &&
     typeof a.judge_daily_budget === "string" &&
+    // Optional so a pre-#362 blob stays valid; a missing summary_model is filled
+    // from the seed default ("haiku") on load.
+    (a.summary_model === undefined || typeof a.summary_model === "string") &&
     typeof a.health_enabled === "string" &&
     typeof a.health_stall_seconds === "string" &&
     typeof a.health_slow_seconds === "string" &&
@@ -246,7 +251,9 @@ function loadSettings(): { userSettings: UserSettings; appSettings: AppSettings 
       if (isPersistedSettings(parsed)) {
         return {
           userSettings: { ...parsed.userSettings },
-          appSettings: { ...parsed.appSettings },
+          // Merge over the seed so a pre-#362 blob (no summary_model) still yields a
+          // complete AppSettings shape; the persisted values win where present.
+          appSettings: { ...SEED_APP_SETTINGS, ...parsed.appSettings },
         };
       }
     }
@@ -1533,12 +1540,12 @@ export const mockApi = {
         (nonSecret as Record<string, string>)[key] = tokens.join(",");
         continue;
       }
-      // judge_model is a model alias (PRD #46): non-empty single token, mirroring the
-      // server's PRD #17 ValidateModel rules.
-      if (key === "judge_model") {
-        if (value.trim() === "") throw new ApiError(400, "judge_model: must not be empty");
-        if (/\s/.test(value)) throw new ApiError(400, "judge_model: must be a single token with no spaces");
-        nonSecret.judge_model = value;
+      // judge_model (PRD #46) and summary_model (PRD #362) are model aliases: non-empty
+      // single token, mirroring the server's PRD #17 ValidateModel rules.
+      if (key === "judge_model" || key === "summary_model") {
+        if (value.trim() === "") throw new ApiError(400, `${key}: must not be empty`);
+        if (/\s/.test(value)) throw new ApiError(400, `${key}: must be a single token with no spaces`);
+        (nonSecret as Record<string, string>)[key] = value;
         continue;
       }
       // public_base_url must be http(s) (PRD #25).

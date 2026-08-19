@@ -600,6 +600,10 @@ export interface AppSettings {
   judge_enforce_all: string;
   judge_cooldown_seconds: string;
   judge_daily_budget: string;
+  // Run-summary model (PRD #362 Decision 8): the model alias the inline run-summary
+  // generator runs on (haiku by default), served as a raw string like every other
+  // setting. Mirrors judge_model's admin machinery but delivers on the issue-run claim.
+  summary_model: string;
   // Run-health detector keys (PRD #47). health_enabled is the text "true"/"false";
   // the rest are integer seconds as strings (the API serves every setting as a
   // string). 0 disables that one signal.

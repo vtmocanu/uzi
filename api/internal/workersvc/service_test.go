@@ -112,8 +112,14 @@ type fakeStore struct {
 	// the zero value is NULL/inherit, so existing judge fixtures resolve the
 	// instance value unchanged. judgeModelErr models a user-row read fault, which
 	// must fall back to the instance value best-effort (never an empty model).
-	judgeModel          pgtype.Text
-	judgeModelErr       error
+	judgeModel    pgtype.Text
+	judgeModelErr error
+	// summaryModel is the run owner's per-user summary_model override (PRD #362 M2);
+	// the zero value is NULL/inherit, so existing issue-run fixtures resolve the
+	// instance value unchanged. summaryModelErr models a user-row read fault, which
+	// must fall back to the instance value best-effort (never an empty model).
+	summaryModel        pgtype.Text
+	summaryModelErr     error
 	templates           []store.AgentTemplate
 	skillAllocations    []store.ListRunSkillAllocationsRow
 	skillAllocationsErr error
@@ -552,6 +558,9 @@ func (f *fakeStore) GetUserDefaultModel(context.Context, uuid.UUID) (pgtype.Text
 }
 func (f *fakeStore) GetUserJudgeModel(context.Context, uuid.UUID) (pgtype.Text, error) {
 	return f.judgeModel, f.judgeModelErr
+}
+func (f *fakeStore) GetUserSummaryModel(context.Context, uuid.UUID) (pgtype.Text, error) {
+	return f.summaryModel, f.summaryModelErr
 }
 func (f *fakeStore) ListClaimAgentTemplates(context.Context, pgtype.UUID) ([]store.AgentTemplate, error) {
 	return f.templates, nil
@@ -1174,6 +1183,62 @@ func TestClaimNoScheduleModelUsesUserDefault(t *testing.T) {
 	}
 	if !strings.Contains(string(b), `"default_model":"sonnet"`) {
 		t.Fatalf("null run.model should leave the owner default untouched on the wire; got %s", b)
+	}
+}
+
+// PRD #362 M2: an ISSUE-run claim carries SummaryModel resolved from the instance
+// summary_model setting when the owner has no per-user override. Unlike judge_model,
+// this rides the issue-run claim (not the judge claim).
+func TestClaimCarriesSummaryModelFromInstanceDefault(t *testing.T) {
+	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
+	// summaryModel left NULL ⇒ inherit the instance value.
+	svc := New(fs, newBox(t), testParams())
+	svc.SetSettings(fakeSettings{summaryModel: "haiku"})
+
+	payload, err := svc.Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload.SummaryModel == nil || *payload.SummaryModel != "haiku" {
+		t.Fatalf("issue claim should carry the instance summary_model; got %+v", payload.SummaryModel)
+	}
+}
+
+// PRD #362 M2: the run owner's per-user summary_model override wins over the instance
+// default at issue-run claim assembly (user-value-wins, Decision 8).
+func TestClaimSummaryModelUserOverrideWins(t *testing.T) {
+	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
+	fs.summaryModel = pgText("opus") // per-user override
+	svc := New(fs, newBox(t), testParams())
+	svc.SetSettings(fakeSettings{summaryModel: "haiku"})
+
+	payload, err := svc.Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload.SummaryModel == nil || *payload.SummaryModel != "opus" {
+		t.Fatalf("per-user summary_model must beat the instance default; got %+v", payload.SummaryModel)
+	}
+}
+
+// PRD #362 M2: with no settings wired the issue claim omits summary_model entirely —
+// omitempty keeps the wire byte-identical for a deployment that has not wired settings.
+func TestClaimOmitsSummaryModelWhenNoSettings(t *testing.T) {
+	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
+	// New(...) leaves s.settings nil unless SetSettings is called.
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload.SummaryModel != nil {
+		t.Fatalf("no settings wired should leave SummaryModel nil; got %+v", payload.SummaryModel)
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if strings.Contains(string(b), "summary_model") {
+		t.Fatalf("unset summary_model must be omitted from the wire; got %s", b)
 	}
 }
 

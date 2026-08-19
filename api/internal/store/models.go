@@ -528,6 +528,7 @@ type User struct {
 	CiAutofixEnabled       bool               `json:"ci_autofix_enabled"`
 	SidebarTokenIds        []uuid.UUID        `json:"sidebar_token_ids"`
 	JudgeModel             pgtype.Text        `json:"judge_model"`
+	SummaryModel           pgtype.Text        `json:"summary_model"`
 }
 
 type UserSecret struct {

@@ -40,6 +40,7 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   judge_enforce_all: "false",
   judge_cooldown_seconds: "60",
   judge_daily_budget: "0",
+  summary_model: "haiku",
   health_enabled: "true",
   health_stall_seconds: "300",
   health_slow_seconds: "2700",
@@ -416,6 +417,33 @@ describe("AdminSettings — run judge (PRD #46)", () => {
     fireEvent.change(screen.getByLabelText("Judge model"), { target: { value: "  " } });
     fireEvent.click(screen.getByRole("button", { name: /save run judge settings/i }));
     expect(await screen.findByText(/judge model must not be empty/i)).toBeTruthy();
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+  });
+});
+
+describe("AdminSettings — run summaries (PRD #362)", () => {
+  it("loads the current summary model", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ summary_model: "sonnet" }));
+    renderPage();
+    expect((await screen.findByLabelText("Summary model") as HTMLInputElement).value).toBe("sonnet");
+  });
+
+  it("saves the summary model through the settings update path", async () => {
+    mockApi.updateSettings.mockResolvedValue(response({ summary_model: "opus" }));
+    renderPage();
+    fireEvent.change(await screen.findByLabelText("Summary model"), { target: { value: "opus" } });
+    const btn = screen.getByRole("button", { name: /save run summary settings/i }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+    fireEvent.click(btn);
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ summary_model: "opus" }));
+  });
+
+  it("blocks an empty summary model client-side without calling the API", async () => {
+    renderPage();
+    await screen.findByLabelText("Summary model");
+    fireEvent.change(screen.getByLabelText("Summary model"), { target: { value: "  " } });
+    fireEvent.click(screen.getByRole("button", { name: /save run summary settings/i }));
+    expect(await screen.findByText(/summary model must not be empty/i)).toBeTruthy();
     expect(mockApi.updateSettings).not.toHaveBeenCalled();
   });
 });

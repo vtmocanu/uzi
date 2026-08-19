@@ -129,6 +129,12 @@ type ClaimPayload struct {
 	// JudgeModel is the model alias a JUDGE run runs on (PRD #46 Decision 7), resolved
 	// from the judge_model setting at claim assembly. Present only for kind=judge.
 	JudgeModel *string `json:"judge_model,omitempty"`
+	// SummaryModel is the model alias the inline run-summary generator runs on (PRD
+	// #362 Decision 8), resolved user-value-wins from users.summary_model over the
+	// instance summary_model at ISSUE-run claim assembly. Unlike JudgeModel it rides
+	// the issue-run claim, not the judge claim; nil (omitted) when unresolved so an
+	// old worker's wire shape is unchanged.
+	SummaryModel *string `json:"summary_model,omitempty"`
 	// JudgeSignal is the API-side deterministic command-not-found pre-scan of the
 	// reviewed run's tool output (PRD #46 Decision 4). Present only for kind=judge (and
 	// omitted when the scan found nothing). The judge interprets it; if the model call
