@@ -20893,23 +20893,25 @@ colour-coded status board. TUI/CLI-only — no API, DB, worker or web change; bl
   clean-fixture screenshots pass whether or not the sanitization survives the port (golden-fixture
   trap), so the hostile-`OwnerEmail` admin-board render test is the only guard, not the PNGs. The ⚖
   judge-verdict marker shows on the **own-runs board only** (admin rows carry no `JudgeVerdict`);
-  the admin board keeps its honest "active runs (factory-wide)" label rather than being relabelled.
+  the admin board keeps its honest `▚▚ uzi · active runs` label rather than being relabelled.
 - **Two distinct gate banners (M3).** `awaiting_approval` → amber `PLAN GATE` banner with promoted
   `[y]`/`[n]` keycaps; `awaiting_input` (PRD #88 clarification park) → a distinct follow-up banner
   with **no** y/n. factoryui conflated them (`needsHuman = approval || input`), which would tell
   `awaiting_input` users to press inert keys. The banner is informational and shows regardless of
   ownership; the promoted keycaps are owner-gated (`steerAccess`, defense-in-depth with the
   `steerKey` gate so leaked keycaps are inert anyway).
-- **NO_COLOR fallback is scope, not polish (D3).** The spine and the plan-gate banner carry
+- **NO_COLOR fallback is scope, not polish (D3).** The status token and the plan-gate band carry
   colour-only fill that lipgloss strips under `NO_COLOR`/an Ascii profile. Fallbacks:
-  `statusGlyph(status)` puts a per-status marker in the spine column, and the banner is bordered
-  independent of fill; chip *text* survives on its own. The success criteria "the spine is
-  scannable in one pass" and "the gate is unmissable" depend on these, so `NO_COLOR` is honoured.
-  The detail header also keeps a stalled **word** cue (folded from an M3 nit), matching the board
-  keeping the health words.
+  `stateToken(status, health, isPlanning)` pairs each colour with a per-state **glyph** (● running,
+  ⚑ plan gate, ▲ stalled, ✓ done, …), so the state survives a colour strip on the board's `▌` andon
+  strip and the detail header's status word alike; and the one-row amber attention band keeps its
+  `▌` cap and bold-CAPS head independent of fill. The success criteria "the status is scannable in
+  one pass" and "the gate is unmissable" depend on these, so `NO_COLOR` is honoured. The detail
+  header also keeps a stalled **word** cue (folded from an M3 nit), matching the board keeping the
+  health words.
 - **Follow-live windowing inverted (M5).** The transcript went from top-anchored (`out[scroll:]`)
-  to bottom-anchored + follow, mirroring the web's `useFollowScroll`: `● FOLLOWING` auto-tail,
-  `⏸ PAUSED ↓N new` on scroll-up (N = `maxTop − top`, exactly the lines below the fold), `g`
+  to bottom-anchored + follow, mirroring the web's `useFollowScroll`: `⇣ following` auto-tail,
+  `⏸ N new · g ⇣` on scroll-up (N = `maxTop − top`, exactly the lines below the fold), `g`
   re-attaches and jumps to newest (`g` chosen because `f` is already follow-up), scroll-to-bottom
   also re-attaches, and only live runs follow. Render and the key-handler clamp share ONE layout
   (`buildTranscriptLines` + `transcriptViewport`) so a stale scroll can't blank the view; the

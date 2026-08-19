@@ -254,6 +254,7 @@ func detailRunning(dark bool, now time.Time) string {
 	// with the board's M2/4 for the same run id.
 	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "running", Health: "ok",
 		IssueTitle:          "Add rate-limit headroom to the scheduler poll",
+		StartedAt:           tp(now.Add(-4 * time.Minute)), // header elapsed WORK time (`● running · 4m`)
 		Milestones:          milestoneList,
 		MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3"}}
 	m := detailBase(dark, run, now, true)
@@ -273,7 +274,8 @@ func detailPlanning(dark bool, now time.Time) string {
 
 func detailFocusTranscript(dark bool, now time.Time) string {
 	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "running", Health: "ok",
-		IssueTitle: "Add rate-limit headroom to the scheduler poll"}
+		IssueTitle: "Add rate-limit headroom to the scheduler poll",
+		StartedAt:  tp(now.Add(-4 * time.Minute))} // header elapsed WORK time (`● running · 4m`)
 	m := detailBase(dark, run, now, true)
 	m = withLiveStream(m)
 	m = key(m, "l") // focus the transcript pane
@@ -282,7 +284,8 @@ func detailFocusTranscript(dark bool, now time.Time) string {
 
 func detailPaused(dark bool, now time.Time) string {
 	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "running", Health: "ok",
-		IssueTitle: "Add rate-limit headroom to the scheduler poll"}
+		IssueTitle: "Add rate-limit headroom to the scheduler poll",
+		StartedAt:  tp(now.Add(-4 * time.Minute))} // header elapsed WORK time (`● running · 4m`)
 	lines := []string{
 		"Planning the change: a scheduler backoff plus a near-cap test.",
 		"Dispatched a coder and a tester; watching for the first diff.",
@@ -312,7 +315,8 @@ func detailPaused(dark bool, now time.Time) string {
 
 func detailStalled(dark bool, now time.Time) string {
 	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "running", Health: "stalled",
-		IssueTitle: "Refactor the forge sync loop for the GitHub driver"}
+		IssueTitle: "Refactor the forge sync loop for the GitHub driver",
+		StartedAt:  tp(now.Add(-51 * time.Minute))} // header elapsed WORK time (`▲ stalled · 51m`)
 	m := detailBase(dark, run, now, true)
 	m = withLiveStream(m)
 	return m.View().Content
@@ -320,7 +324,8 @@ func detailStalled(dark bool, now time.Time) string {
 
 func detailAwaitingApproval(dark bool, now time.Time) string {
 	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "awaiting_approval", Health: "ok",
-		IssueTitle: "Add rate-limit headroom to the scheduler poll"}
+		IssueTitle: "Add rate-limit headroom to the scheduler poll",
+		StartedAt:  tp(now.Add(-2 * time.Minute))} // header elapsed WORK time beside the ⚑ token
 	msgs := []apitypes.MessageDTO{
 		msgDTO(1, "text", "lead", "", "", "## Plan\n\n1. Back off `pollInterval` when the usage window is within 10% of the cap.\n2. Add a unit test for the near-cap case.\n3. Open an MR against a feature branch.\n\nReady for approval.", now.Add(-2*time.Minute)),
 	}
@@ -334,7 +339,8 @@ func detailAwaitingApproval(dark bool, now time.Time) string {
 
 func detailAwaitingInput(dark bool, now time.Time) string {
 	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "awaiting_input", Health: "ok",
-		IssueTitle: "Clarify the target branch for the fix"}
+		IssueTitle: "Clarify the target branch for the fix",
+		StartedAt:  tp(now.Add(-1 * time.Minute))} // header elapsed WORK time beside the ✎ token
 	msgs := []apitypes.MessageDTO{
 		msgDTO(1, "text", "lead", "", "", "Which branch should the MR target: the default branch, or a release branch? I'll wait for your answer before opening it.", now.Add(-1*time.Minute)),
 	}
@@ -349,6 +355,7 @@ func detailAwaitingInput(dark bool, now time.Time) string {
 func detailLimitWait(dark bool, now time.Time) string {
 	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "limit_wait", Health: "ok",
 		IssueTitle:    "Port the judge to per-model usage folding",
+		StartedAt:     tp(now.Add(-22 * time.Minute)), // header elapsed WORK time beside the ~ token
 		RateLimitType: sp("five_hour"), RetryNotBefore: tp(now.Add(42 * time.Minute)), LimitWaitCount: 2}
 	m := detailBase(dark, run, now, true)
 	m = withLiveStream(m)
@@ -357,7 +364,8 @@ func detailLimitWait(dark bool, now time.Time) string {
 
 func detailDegraded(dark bool, now time.Time) string {
 	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "running", Health: "ok",
-		IssueTitle: "Add rate-limit headroom to the scheduler poll"}
+		IssueTitle: "Add rate-limit headroom to the scheduler poll",
+		StartedAt:  tp(now.Add(-4 * time.Minute))} // header elapsed WORK time (`● running · 4m`)
 	m := detailBase(dark, run, now, true)
 	m = step(m, streamReadyMsg{runID: detailRunID, err: uzicli.Exitf(uzicli.ExitUnreachable, "dial tcp: connection refused")})
 	return m.View().Content
@@ -365,7 +373,8 @@ func detailDegraded(dark bool, now time.Time) string {
 
 func detailSteerTyping(dark bool, now time.Time) string {
 	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "running", Health: "ok",
-		IssueTitle: "Add rate-limit headroom to the scheduler poll"}
+		IssueTitle: "Add rate-limit headroom to the scheduler poll",
+		StartedAt:  tp(now.Add(-4 * time.Minute))} // header elapsed WORK time (`● running · 4m`)
 	m := detailBase(dark, run, now, true)
 	m = withLiveStream(m)
 	m = key(m, "f")
@@ -381,7 +390,8 @@ func detailSteerTyping(dark bool, now time.Time) string {
 
 func detailSteerConfirm(dark bool, now time.Time) string {
 	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "running", Health: "ok",
-		IssueTitle: "Add rate-limit headroom to the scheduler poll"}
+		IssueTitle: "Add rate-limit headroom to the scheduler poll",
+		StartedAt:  tp(now.Add(-4 * time.Minute))} // header elapsed WORK time (`● running · 4m`)
 	m := detailBase(dark, run, now, true)
 	m = withLiveStream(m)
 	m = key(m, "x")
@@ -390,7 +400,8 @@ func detailSteerConfirm(dark bool, now time.Time) string {
 
 func detailSteerQueue(dark bool, now time.Time) string {
 	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "running", Health: "ok",
-		IssueTitle: "Add rate-limit headroom to the scheduler poll"}
+		IssueTitle: "Add rate-limit headroom to the scheduler poll",
+		StartedAt:  tp(now.Add(-4 * time.Minute))} // header elapsed WORK time (`● running · 4m`)
 	m := detailBase(dark, run, now, false)
 	m = step(m, runInputsMsg{runID: detailRunID, err: nil, inputs: []apitypes.SteerInputDTO{
 		{ID: 1, Body: sp("prefer table-driven tests here"), CreatedAt: now.Add(-3 * time.Minute), ConsumedAt: tp(now.Add(-2 * time.Minute))},

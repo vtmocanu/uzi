@@ -11,10 +11,16 @@ import (
 	"unicode"
 
 	tea "charm.land/bubbletea/v2"
+	lipgloss "charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
+
+// stripANSI removes SGR escapes so a test can assert on visual text that the renderer splits
+// across colour spans (e.g. the milestone micro-bar's tungsten ▰ and faint ▱).
+func stripANSI(s string) string { return ansi.Strip(s) }
 
 // The model is driven IN PROCESS, with no PTY: Update takes a message and returns a
 // model, and View returns a string. That is a design constraint, not a testing
@@ -59,6 +65,21 @@ func quoteJSON(s string) string {
 	return string(b)
 }
 
+// toolUseMsg builds a tool_use MessageDTO whose payload carries a (possibly hostile) tool `name`,
+// for the transcript's `⚙ <name>` path (toolFrameName → buildTranscriptLines). msgDTO only builds
+// a {"text":…} payload, which never reaches that branch.
+func toolUseMsg(seq int32, agent, instance, name string, at time.Time) apitypes.MessageDTO {
+	m := apitypes.MessageDTO{Seq: seq, Kind: "tool_use", CreatedAt: at,
+		Payload: json.RawMessage(`{"name":` + quoteJSON(name) + `}`)}
+	if agent != "" {
+		m.Agent = &agent
+	}
+	if instance != "" {
+		m.AgentInstance = &instance
+	}
+	return m
+}
+
 func TestTUIBoardRendersRunsAndMoves(t *testing.T) {
 	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1111-2222-3333-444444444444", Kind: "issue", Status: "running", IssueTitle: "first issue"}},
@@ -69,7 +90,8 @@ func TestTUIBoardRendersRunsAndMoves(t *testing.T) {
 	m = next.(tuiModel)
 
 	out := m.View().Content
-	for _, want := range []string{"aaaaaaaa", "bbbbbbbb", "first issue", "second issue", "running", "completed"} {
+	// Status renders as the human word now: completed → "done".
+	for _, want := range []string{"aaaaaaaa", "bbbbbbbb", "first issue", "second issue", "running", "done"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("board does not render %q\n%s", want, out)
 		}
@@ -277,9 +299,9 @@ func TestTUIDetailPlanGateBannerNonOwnerHasNoKeys(t *testing.T) {
 	}
 }
 
-// M6: the review overlay colours the verdict chip by SEVERITY (issues red, ideal teal) via
-// the shared verdictColor, not the old uniform brand-blue. Asserted through the chip's
-// background-fill SGR, and that the two verdicts resolve to different colours.
+// M6: the review overlay colours the verdict WORD by SEVERITY (issues → alarm red, ideal →
+// faint) via the shared verdictColor. No chip fill now — it is a bold coloured word — so this
+// asserts through the foreground SGR, and that the two verdicts resolve to different colours.
 func TestTUIReviewVerdictSeverityColour(t *testing.T) {
 	render := func(verdict string) string {
 		runID := "rv-" + verdict
@@ -292,23 +314,35 @@ func TestTUIReviewVerdictSeverityColour(t *testing.T) {
 		return m.View().Content
 	}
 	pal := newPalette(true)
-	issuesBg := bgFillSGR(pal.verdictColor("issues"))
-	idealBg := bgFillSGR(pal.verdictColor("ideal"))
-	if issuesBg == idealBg {
+	issuesFg := fgSGR(pal.verdictColor("issues"))
+	idealFg := fgSGR(pal.verdictColor("ideal"))
+	if issuesFg == idealFg {
 		t.Fatal("issues and ideal resolve to the same colour; the severity test cannot distinguish them")
 	}
-	if out := render("issues"); !strings.Contains(out, issuesBg) {
-		t.Errorf("the issues verdict chip is not the failed (red) colour %q\n%s", issuesBg, out)
+	// Assert on the verdict WORD's OWN rendered span (bold + its severity colour on the literal
+	// word), NOT on a bare foreground SGR. faint (verdictColor's ideal/default) is the ubiquitous
+	// chrome colour, so Contains(out, idealFg) is trivially true regardless of the verdict colour —
+	// it proved nothing. The overlay renders the word as Foreground(verdictColor).Bold(true), so
+	// reconstruct exactly that span here.
+	issuesWord := lipgloss.NewStyle().Foreground(pal.verdictColor("issues")).Bold(true).Render("issues")
+	idealWord := lipgloss.NewStyle().Foreground(pal.verdictColor("ideal")).Bold(true).Render("ideal")
+	if out := render("issues"); !strings.Contains(out, issuesWord) {
+		t.Errorf("the issues verdict word is not rendered bold in the alarm (red) severity colour %q\n%s", issuesFg, out)
 	}
-	if out := render("ideal"); !strings.Contains(out, idealBg) {
-		t.Errorf("the ideal verdict chip is not the completed (teal) colour %q\n%s", idealBg, out)
+	if out := render("ideal"); !strings.Contains(out, idealWord) {
+		t.Errorf("the ideal verdict word is not rendered bold in the faint severity colour %q\n%s", idealFg, out)
 	}
 }
 
-// bgFillSGR is the truecolor background SGR lipgloss emits for a chip's fill.
+// bgFillSGR / fgSGR are the truecolor background / foreground SGR lipgloss emits for a colour.
 func bgFillSGR(c color.Color) string {
 	r, g, b, _ := c.RGBA()
 	return fmt.Sprintf("48;2;%d;%d;%d", r>>8, g>>8, b>>8)
+}
+
+func fgSGR(c color.Color) string {
+	r, g, b, _ := c.RGBA()
+	return fmt.Sprintf("38;2;%d;%d;%d", r>>8, g>>8, b>>8)
 }
 
 // The detail view: replay builds lanes, and a live frame extends them.
@@ -532,8 +566,8 @@ func TestTUIDetailFooterIsOneLine(t *testing.T) {
 	}
 }
 
-// M5: a live run's transcript follows (tail -f, bottom-anchored) with ● FOLLOWING; a new
-// frame auto-tails; scrolling up detaches to ⏸ PAUSED with a "↓N new" count; g re-attaches.
+// M5: a live run's transcript follows (tail -f, bottom-anchored) with ⇣ following; a new
+// frame auto-tails; scrolling up detaches to ⏸ with an "N new" count; g re-attaches.
 func TestTUIDetailFollowLive(t *testing.T) {
 	now := time.Now()
 	runID := "live-1"
@@ -548,13 +582,13 @@ func TestTUIDetailFollowLive(t *testing.T) {
 	m = next.(tuiModel)
 	m = press(t, m, keyRight) // focus the transcript so ↑/↓ scroll it
 
-	// A live run opens FOLLOWING, bottom-anchored: the newest frame shows, the oldest does not.
+	// A live run opens following, bottom-anchored: the newest frame shows, the oldest does not.
 	if !m.detail.follow {
 		t.Fatal("a live run should open following")
 	}
 	out := m.View().Content
-	if !strings.Contains(out, "FOLLOWING") {
-		t.Errorf("the FOLLOWING indicator is not shown while tailing\n%s", out)
+	if !strings.Contains(out, "following") {
+		t.Errorf("the following indicator is not shown while tailing\n%s", out)
 	}
 	if !strings.Contains(out, "frame 8") || strings.Contains(out, "frame 1 body") {
 		t.Errorf("following is not bottom-anchored (newest visible, oldest hidden)\n%s", out)
@@ -577,17 +611,17 @@ func TestTUIDetailFollowLive(t *testing.T) {
 		t.Error("a new frame while following did not auto-tail to the newest")
 	}
 
-	// Scrolling up detaches to PAUSED, reporting the lines below the fold.
+	// Scrolling up detaches to the paused badge (⏸), reporting the lines below the fold.
 	m = press(t, m, "k")
 	if m.detail.follow {
 		t.Error("scrolling up did not detach follow")
 	}
 	paused := m.View().Content
-	if !strings.Contains(paused, "PAUSED") {
-		t.Errorf("the PAUSED indicator is not shown after scrolling up\n%s", paused)
+	if !strings.Contains(paused, "⏸") {
+		t.Errorf("the paused indicator (⏸) is not shown after scrolling up\n%s", paused)
 	}
-	if !strings.Contains(paused, "↓1 new") {
-		t.Errorf("PAUSED does not report one line below the fold\n%s", paused)
+	if !strings.Contains(paused, "1 new") {
+		t.Errorf("the paused badge does not report one line below the fold\n%s", paused)
 	}
 
 	// g re-attaches follow and jumps to the newest.
@@ -595,8 +629,8 @@ func TestTUIDetailFollowLive(t *testing.T) {
 	if !m.detail.follow {
 		t.Error("g did not re-attach follow")
 	}
-	if !strings.Contains(m.View().Content, "FOLLOWING") {
-		t.Error("g did not restore the FOLLOWING indicator")
+	if !strings.Contains(m.View().Content, "following") {
+		t.Error("g did not restore the following indicator")
 	}
 }
 
@@ -701,10 +735,47 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	next, _ = adm.Update(boardRunsMsg{admin: true, runs: adminRuns})
 	adm = next.(tuiModel)
 	admOut := adm.View().Content
-	if !strings.Contains(admOut, "OWNER") {
-		t.Fatalf("the admin board is not showing the OWNER column, so this test is not exercising the OwnerEmail render path\n%s", admOut)
+	// The hostile OwnerEmail is nasty + "safe"; after sanitizing, "safe" survives. Its presence
+	// proves the OwnerEmail render path ran (the redesign dropped the column HEADER, so there is
+	// no "OWNER" label to look for — the email cell itself is the signal).
+	if !strings.Contains(admOut, "safe") {
+		t.Fatalf("the admin board is not drawing OwnerEmail, so this test is not exercising that render path\n%s", admOut)
 	}
 	assertNoRawControls(t, "admin board", admOut)
+}
+
+// D7 regression guard for the transcript's TOOL-FRAME path. buildTranscriptLines → toolFrameName
+// pulls a tool_use frame's `name` from its (SDK/agent-authored, untrusted) payload and draws
+// `⚙ <name>`. It is routed through renderer.Plain today, but the hostile-render test above drives
+// only a Kind:"text" frame, so this branch is never exercised — a regression to a raw draw of the
+// tool name would pass every clean-fixture screenshot AND that test. This drives a tool_use frame
+// with control bytes in `name` and asserts the rendered transcript carries none.
+func TestTUITranscriptStripsControlBytesFromToolName(t *testing.T) {
+	now := time.Now()
+	// Hostile bytes at the FRONT, so Plain's 24-rune truncation cannot produce a false green by
+	// cutting them off the tail.
+	const nasty = "\x1b[2J\u202E\x07\x01safe"
+	runID := "77777777-2222"
+
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	next, _ := m.Update(detailLoadedMsg{
+		run: apitypes.RunDTO{ID: runID, Status: "running"},
+		msgs: []apitypes.MessageDTO{
+			// A benign text frame opens the lane; the tool_use frame (same instance) is what the
+			// toolFrameName path compresses to `⚙ <name>`.
+			msgDTO(1, "text", "coder", "toolu_aaa111", "impl", "hello", now),
+			toolUseMsg(2, "coder", "toolu_aaa111", nasty, now),
+		},
+	})
+	m = next.(tuiModel)
+
+	out := m.View().Content
+	// The sanitized tool name's "safe" tail proves the `⚙ <name>` path ran — otherwise this test
+	// would assert cleanliness over a render that never drew the field.
+	if !strings.Contains(out, "safe") {
+		t.Fatalf("the transcript is not drawing the tool-frame name, so this test is not exercising toolFrameName\n%s", out)
+	}
+	assertNoRawControls(t, "transcript tool frame", out)
 }
 
 // The crew rail draws a milestone-structured run's progress (renderMilestones): the
@@ -781,7 +852,7 @@ func TestTUIDetailFillsHeight(t *testing.T) {
 	}
 	div := 0
 	for _, r := range rows {
-		if strings.Contains(r, "│") {
+		if strings.Contains(r, "▏") {
 			div++
 		}
 	}
@@ -822,9 +893,9 @@ func TestTUIDetailFooterSurvivesTallRail(t *testing.T) {
 	}
 }
 
-// At a narrow board width the MILE column is dropped and no row overflows the terminal edge,
-// so the trailing judge marker keeps its full text instead of being clipped (issue #379 tui-ux
-// finding 2: the 8-col MILE tax pushed marker rows past the edge at 80 cols).
+// At a narrow board width the milestone micro-bar column is dropped and no row overflows the
+// terminal edge, so the trailing judge marker keeps its full text instead of being clipped
+// (issue #379 tui-ux finding 2: the micro-bar tax pushed marker rows past the edge at 80 cols).
 func TestTUIBoardRowsFitNarrowWidth(t *testing.T) {
 	issues := "issues"
 	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
@@ -848,22 +919,22 @@ func TestTUIBoardRowsFitNarrowWidth(t *testing.T) {
 	if !strings.Contains(out, "issues · 3") {
 		t.Errorf("judge marker 'issues · 3' was clipped at width 80\n%s", out)
 	}
-	if strings.Contains(out, "MILE") {
-		t.Errorf("MILE column should be hidden below boardMileMinWidth (width 80)\n%s", out)
+	if strings.Contains(out, "▰") {
+		t.Errorf("milestone micro-bar should be hidden below boardMileMinWidth (width 80)\n%s", out)
 	}
-	// At a wide width the column returns.
+	// At a wide width the micro-bar returns.
 	m.width = 120
 	if wide := func() string {
 		next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
-		return next.(tuiModel).View().Content
-	}(); !strings.Contains(wide, "MILE") || !strings.Contains(wide, "M2/4") {
-		t.Errorf("MILE column should show at width 120\n%s", wide)
+		return stripANSI(next.(tuiModel).View().Content)
+	}(); !strings.Contains(wide, "▰▰▱▱") {
+		t.Errorf("milestone micro-bar should show at width 120\n%s", wide)
 	}
 }
 
-// The factory floor shows a compact M{done}/{total} badge on a milestone-structured run
-// (milestoneMarker, the web MilestoneBadge twin) and NOTHING on a run with no frozen list.
-// A run that reported nothing shows M–/N rather than M0/N.
+// The factory floor shows a milestone micro-bar on a milestone-structured run (milestoneMarker,
+// the web MilestoneBadge twin) — ▰ per done, ▱ per remaining — and NOTHING on a run with no
+// frozen list. A run that reported nothing shows –/N text rather than a bar that looks empty.
 func TestTUIBoardMilestoneBadge(t *testing.T) {
 	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "running", IssueTitle: "structured",
@@ -875,18 +946,18 @@ func TestTUIBoardMilestoneBadge(t *testing.T) {
 	}}
 	m := tuiTestModel(t, fake, "")
 	next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
-	out := next.(tuiModel).View().Content
+	out := stripANSI(next.(tuiModel).View().Content) // the ▰/▱ split across colour spans
 
-	for _, want := range []string{"M2/4", "M–/2"} {
+	// 2 of 4 done → ▰▰▱▱; nothing reported → –/2 text (never a bar that reads as failure).
+	for _, want := range []string{"▰▰▱▱", "–/2"} {
 		if !strings.Contains(out, want) {
-			t.Errorf("board missing milestone badge %q\n%s", want, out)
+			t.Errorf("board missing milestone micro-bar %q\n%s", want, out)
 		}
 	}
-	// The plain run's row must carry no badge. It is the only row whose title is "plain",
-	// so assert no "M" pill is glued to it — a crude but sufficient check is that the badge
-	// count for a 0-milestone run never appears.
-	if strings.Contains(out, "M0/") {
-		t.Errorf("a run with no milestones should show no badge, not M0/*\n%s", out)
+	// A run with no frozen list draws no micro-bar cell at all: the only micro-bar is
+	// aaaaaaaa-1's, so exactly one ▰▰▱▱ pattern exists (the plain run carries none).
+	if strings.Count(out, "▰▰▱▱") != 1 {
+		t.Errorf("expected exactly one ▰▰▱▱ micro-bar (the plain run must carry none)\n%s", out)
 	}
 }
 
@@ -906,22 +977,23 @@ func TestTUIBoardSemanticStatusAndSummary(t *testing.T) {
 	m = next.(tuiModel)
 	out := m.View().Content
 
-	// "looping" is NOT stalled, so it is not counted as stalled — but its WORD must show in
-	// the HEALTH column (restored, not reduced to a faint marker). F4: the judge marker
-	// carries the todo count ("issues · 2") when JudgeTodoCount > 0.
-	for _, want := range []string{"5 runs", "1 needs you", "1 stalled", "looping", "issues · 2"} {
+	// The summary cluster: ⚑ N (awaiting_approval) and ▲ N (warn health — stalled AND looping
+	// both fold into the ▲ axis via the health override), plus "N runs". A looping run's WORD
+	// also surfaces in its status slot (the health override renders ▲ + the word). The judge
+	// marker carries the todo count ("issues · 2") when JudgeTodoCount > 0.
+	for _, want := range []string{"5 runs", "⚑ 1", "▲ 2", "looping", "issues · 2"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("board missing %q\n%s", want, out)
 		}
 	}
-	// The status chip + spine are solid colour fills: a truecolor background SGR (48;2;…).
-	// Plain status text alone (the old board) would carry no background fill.
+	// The one filled surface on the board — the warm selection bar on the cursor row — is a
+	// truecolor background SGR (48;2;…). Everything else is foreground ink.
 	if !strings.Contains(out, "\x1b[48;2;") {
-		t.Errorf("board has no background-fill SGR; the status chip/spine colour is missing\n%s", out)
+		t.Errorf("board has no background-fill SGR; the warm selection bar is missing\n%s", out)
 	}
-	// The NO_COLOR-safe spine glyph for a running run survives independent of colour.
-	if !strings.Contains(out, statusGlyph("running")) {
-		t.Errorf("running spine glyph %q absent from the board\n%s", statusGlyph("running"), out)
+	// The NO_COLOR-safe state glyph for a running run survives independent of colour.
+	if g, _ := stateGlyphWord("running", "", false); !strings.Contains(out, g) {
+		t.Errorf("running state glyph %q absent from the board\n%s", g, out)
 	}
 }
 
@@ -1095,8 +1167,8 @@ func TestTUIBoardHideDoneToggle(t *testing.T) {
 	if m.board.hideDone || len(m.board.visible()) != 5 {
 		t.Errorf("second h did not restore the full board (hideDone=%v, %d visible)", m.board.hideDone, len(m.board.visible()))
 	}
-	if !strings.Contains(m.View().Content, "hide done") {
-		t.Errorf("footer did not return to 'hide done'\n%s", m.View().Content)
+	if !strings.Contains(m.View().Content, "fold done") {
+		t.Errorf("footer did not return to 'fold done'\n%s", m.View().Content)
 	}
 }
 
@@ -1111,8 +1183,8 @@ func TestTUIBoardHideDoneInertOnAdminBoard(t *testing.T) {
 	}})
 	m = next.(tuiModel)
 
-	if strings.Contains(m.View().Content, "hide done") {
-		t.Error("admin board footer should not offer the hide-done toggle")
+	if strings.Contains(m.View().Content, "fold done") {
+		t.Error("admin board footer should not offer the fold-done toggle")
 	}
 	m = press(t, m, keyHideDone)
 	out := m.View().Content
@@ -1139,8 +1211,8 @@ func TestTUIBoardHideDoneEmptyState(t *testing.T) {
 	if strings.Contains(out, "No runs yet") {
 		t.Errorf("all-terminal board under hideDone shows the misleading 'No runs yet'\n%s", out)
 	}
-	if !strings.Contains(out, "finished runs are hidden") {
-		t.Errorf("empty state should explain the hidden finished runs\n%s", out)
+	if !strings.Contains(out, "finished runs are folded") {
+		t.Errorf("empty state should explain the folded finished runs\n%s", out)
 	}
 }
 
@@ -1195,7 +1267,9 @@ func TestTUIBoardWindowsToHeightAndKeepsFooter(t *testing.T) {
 	}
 	footerShown := func(out string) {
 		t.Helper()
-		if !strings.Contains(out, "q quit") {
+		// The key letters are tungsten and the labels faint, so "q" and "quit" sit in separate
+		// SGR spans — assert on the label alone.
+		if !strings.Contains(out, "quit") {
 			t.Errorf("footer key legend missing — it scrolled off the bottom\n%s", out)
 		}
 	}
@@ -1203,8 +1277,11 @@ func TestTUIBoardWindowsToHeightAndKeepsFooter(t *testing.T) {
 	out := m.View().Content
 	linesFit(out)
 	footerShown(out)
-	if !strings.Contains(out, "of 100") {
-		t.Errorf("windowed board should show a position readout (\"…of 100\")\n%s", out)
+	if !strings.Contains(out, "100 runs") {
+		t.Errorf("windowed board should show the total in the summary cluster (\"100 runs\")\n%s", out)
+	}
+	if !strings.Contains(out, "–") {
+		t.Errorf("windowed board should show a position readout (lo–hi)\n%s", out)
 	}
 
 	// Drive the cursor far down; the footer and height cap must still hold, and the selected

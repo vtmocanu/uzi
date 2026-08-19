@@ -114,7 +114,11 @@ func provenanceBox(title, body string, width int, pal palette) string {
 	return pal.box.Width(inner).Render(label + "\n" + body)
 }
 
-// palette is the TUI's colour set, resolved once from the terminal background.
+// palette is the TUI's ANDON colour set ("the factory at night"), resolved once from the
+// terminal background. The board is dark and quiet when the factory is healthy and exactly
+// ONE thing on screen is ever a filled surface — the amber band/row that needs a human.
+// Everything else is foreground ink over one warm material at two intensities: tungsten
+// (chrome) and andon amber (attention).
 //
 // It is built with lipgloss.LightDark and NOT with AdaptiveColor: in lipgloss v2
 // AdaptiveColor survives only in the compat shim, driven by a package-level
@@ -123,63 +127,63 @@ func provenanceBox(title, body string, width int, pal palette) string {
 // BackgroundColorMsg) and it fires a terminal query even when there is no TTY.
 type palette struct {
 	dark     bool
-	title    lipgloss.Style
-	faint    lipgloss.Style
-	sel      lipgloss.Style
-	box      lipgloss.Style
-	boxTitle lipgloss.Style
+	title    lipgloss.Style // tungsten bold: wordmark, eyebrows, key-hint letters, pane focus bar
+	faint    lipgloss.Style // ids, ages, chrome, whole done rows
+	sel      lipgloss.Style // tungsten accent: the ▸ cursor and the selected id
+	box      lipgloss.Style // structural boxes (quit modal, confirm) — bordered, never filled
+	boxTitle lipgloss.Style // tungsten bold box label
 	states   map[crewState]lipgloss.Style
 
-	// The RUN-STATUS colour axis (PRD #325 M2), a SEPARATE axis from the crew-lane
-	// `states` dots above. statuses maps a run status to its bucket colour; statusStalled
-	// is the health override; statusDefault covers unrecognised statuses; chipFg is the
-	// text drawn on a solid status chip. Read (never re-populated) by M3's detail header
-	// chips and M6's verdict severity via statusColor/chip.
-	statuses      map[string]color.Color
-	statusStalled color.Color
-	statusDefault color.Color
-	chipFg        color.Color
+	// The ANDON semantic colours, held as raw color.Color so a caller can compose a
+	// foreground word, a spine glyph or (for the amber band alone) a fill on the fly.
+	// stateColor/stateToken resolve a run's colour from these; nothing else maps a status
+	// to a colour, so the board row, the board strip and the detail header cannot disagree.
+	tungsten color.Color // chrome / selection accent / eyebrows
+	amber    color.Color // andon attention: needs-you, the gate band, ⚑ ✎
+	alarm    color.Color // failed, judge "issues", high severity
+	stall    color.Color // stalled / looping / slow health
+	sage     color.Color // running (deliberately dimmer — running is normal)
+	indigo   color.Color // planning
+	wait     color.Color // rate-limited, crew-waiting, reconnecting
+	faintC   color.Color // ids, ages, done, unknown states
+	selBg    color.Color // warm-tinted full-row cursor bar
+	bandFg   color.Color // near-bg ink drawn on the one filled surface (the amber band)
 }
 
 func newPalette(dark bool) palette {
 	ld := lipgloss.LightDark(dark)
-	p := palette{dark: dark}
-	p.title = lipgloss.NewStyle().Bold(true).Foreground(ld(lipgloss.Color("#005f87"), lipgloss.Color("#7fd6ff")))
-	p.faint = lipgloss.NewStyle().Foreground(ld(lipgloss.Color("#6c6c6c"), lipgloss.Color("#8a8a8a")))
-	p.sel = lipgloss.NewStyle().Bold(true).Foreground(ld(lipgloss.Color("#000000"), lipgloss.Color("#ffffff")))
+	// The ANDON tokens. Light value first, dark second, matching ld(light, dark).
+	tungsten := ld(lipgloss.Color("#7c5200"), lipgloss.Color("#c9a061"))
+	amber := ld(lipgloss.Color("#b45309"), lipgloss.Color("#ffb454"))
+	alarm := ld(lipgloss.Color("#b91c1c"), lipgloss.Color("#f87171"))
+	stall := ld(lipgloss.Color("#c2410c"), lipgloss.Color("#fb923c"))
+	sage := ld(lipgloss.Color("#2f7d4f"), lipgloss.Color("#6fbf8f"))
+	indigo := ld(lipgloss.Color("#4f46e5"), lipgloss.Color("#818cf8"))
+	wait := ld(lipgloss.Color("#0369a1"), lipgloss.Color("#38bdf8"))
+	faintC := ld(lipgloss.Color("#6c6c6c"), lipgloss.Color("#8a8a8a"))
+	selBg := ld(lipgloss.Color("#f3ead8"), lipgloss.Color("#33302a"))
+	// Near-bg ink for the amber band: light amber is dark, so white reads on it; dark amber
+	// is light, so near-black reads on it.
+	bandFg := ld(lipgloss.Color("#ffffff"), lipgloss.Color("#0e1016"))
+
+	p := palette{
+		dark:     dark,
+		tungsten: tungsten, amber: amber, alarm: alarm, stall: stall, sage: sage,
+		indigo: indigo, wait: wait, faintC: faintC, selBg: selBg, bandFg: bandFg,
+	}
+	p.title = lipgloss.NewStyle().Bold(true).Foreground(tungsten)
+	p.faint = lipgloss.NewStyle().Foreground(faintC)
+	p.sel = lipgloss.NewStyle().Bold(true).Foreground(tungsten)
 	p.box = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).
-		BorderForeground(ld(lipgloss.Color("#9e9e9e"), lipgloss.Color("#585858"))).Padding(0, 1)
-	p.boxTitle = lipgloss.NewStyle().Bold(true).
-		Foreground(ld(lipgloss.Color("#8700af"), lipgloss.Color("#d7afff")))
+		BorderForeground(tungsten).Padding(0, 1)
+	p.boxTitle = lipgloss.NewStyle().Bold(true).Foreground(tungsten)
 	p.states = map[crewState]lipgloss.Style{
-		crewWorking: lipgloss.NewStyle().Foreground(ld(lipgloss.Color("#00875f"), lipgloss.Color("#5fd7a7"))),
-		crewStalled: lipgloss.NewStyle().Foreground(ld(lipgloss.Color("#af5f00"), lipgloss.Color("#ffaf5f"))),
-		crewWaiting: lipgloss.NewStyle().Foreground(ld(lipgloss.Color("#005faf"), lipgloss.Color("#87d7ff"))),
+		crewWorking: lipgloss.NewStyle().Foreground(sage),
+		crewStalled: lipgloss.NewStyle().Foreground(stall),
+		crewWaiting: lipgloss.NewStyle().Foreground(wait),
 		crewIdle:    p.faint,
 		crewDone:    p.faint,
 	}
-
-	// Run-status colour buckets (PRD #325 M2). Light value first (dark bg gets the
-	// brighter second value), matching the `ld(light, dark)` convention above.
-	p.statuses = map[string]color.Color{
-		"running": ld(lipgloss.Color("#1a7f4b"), lipgloss.Color("#4ade80")),
-		// issue #321: the pre-approval planning phase, a DERIVED effective status (not a
-		// runs.status value). Indigo, matching the web `plan` badge tone — distinct from
-		// the green `running` bucket. Light indigo-600 / dark indigo-400.
-		"planning":          ld(lipgloss.Color("#4f46e5"), lipgloss.Color("#818cf8")),
-		"queued":            ld(lipgloss.Color("#6b7280"), lipgloss.Color("#7c8698")),
-		"claimed":           ld(lipgloss.Color("#6b7280"), lipgloss.Color("#7c8698")),
-		"awaiting_approval": ld(lipgloss.Color("#b45309"), lipgloss.Color("#fbbf24")),
-		"awaiting_input":    ld(lipgloss.Color("#b45309"), lipgloss.Color("#fbbf24")),
-		"limit_wait":        ld(lipgloss.Color("#0369a1"), lipgloss.Color("#38bdf8")),
-		"completed":         ld(lipgloss.Color("#0f766e"), lipgloss.Color("#5eead4")),
-		"failed":            ld(lipgloss.Color("#b91c1c"), lipgloss.Color("#f87171")),
-		"cancelled":         ld(lipgloss.Color("#6b7280"), lipgloss.Color("#7c8698")),
-	}
-	p.statusStalled = ld(lipgloss.Color("#c2410c"), lipgloss.Color("#fb923c"))
-	p.statusDefault = ld(lipgloss.Color("#6c6c6c"), lipgloss.Color("#8a8a8a"))
-	p.chipFg = ld(lipgloss.Color("#ffffff"), lipgloss.Color("#0e1016"))
-
 	return p
 }
 
@@ -190,41 +194,85 @@ func (p palette) state(s crewState) lipgloss.Style {
 	return p.faint
 }
 
-// statusColor resolves a run's spine/chip colour (PRD #325 M2 seam), applying the
-// status→bucket map and the status-vs-health precedence: health "stalled" overrides the
-// status bucket (a stalled run is what triage is FOR), so it wins → orange. Non-stalled
-// health does not override. An unrecognised status falls to the default grey bucket, per
-// the forward-compat note in docs/cli.md (a newer server may ship a status this CLI has
-// no colour for).
-func (p palette) statusColor(status, health string) color.Color {
-	if health == "stalled" {
-		return p.statusStalled
+// stateGlyphWord is the DISPLAY vocabulary for a run's state — a single-cell glyph and a
+// human word — shared by the board row, the board strip and the detail header so they can
+// never disagree (the baseline rendered `stalled` differently on the board and the header;
+// this is the single source that fixes that class of drift). The underlying status/health
+// strings still drive all logic, filtering and sorting; this only changes what is shown.
+//
+// HEALTH OVERRIDE: a WARN health flag (stalled/looping/slow) replaces the status token
+// entirely with ▲ + the health word, because a run that needs attention is what the board
+// is FOR. ok/empty health shows the status token.
+func stateGlyphWord(status, health string, isPlanning bool) (glyph, word string) {
+	if stalledHealth[health] {
+		return "▲", health
 	}
-	if c, ok := p.statuses[status]; ok {
-		return c
+	switch effectiveRunStatus(status, isPlanning) {
+	case "running":
+		return "●", "running"
+	case "planning":
+		return "○", "planning"
+	case "awaiting_approval":
+		return "⚑", "plan gate"
+	case "awaiting_input":
+		return "✎", "needs input"
+	case statusLimitWait:
+		return "~", "rate-limited"
+	case "completed":
+		return "✓", "done"
+	case "failed":
+		return "✗", "failed"
+	default: // queued, claimed, cancelled, unknown
+		// Status is a uzi-controlled closed enum (not a D7 hole), but keep the defensive posture
+		// the old code had: strip any control bytes rather than drawing the raw status here.
+		return "·", cellText(strings.ToLower(status))
 	}
-	return p.statusDefault
 }
 
-// verdictColor maps a judge verdict to a severity colour (PRD #325 M6): issues → red,
-// ideal/ok → the completed teal, anything else → the default grey. Shared by the board's
-// ⚖ marker and the review overlay's verdict chip so the two cannot disagree.
+// stateColor is the colour half of the state token, resolved from the same ANDON tokens.
+// Health warn wins (→ stall orange); otherwise the status maps to its material.
+func (p palette) stateColor(status, health string, isPlanning bool) color.Color {
+	if stalledHealth[health] {
+		return p.stall
+	}
+	switch effectiveRunStatus(status, isPlanning) {
+	case "running":
+		return p.sage
+	case "planning":
+		return p.indigo
+	case "awaiting_approval", "awaiting_input":
+		return p.amber
+	case statusLimitWait:
+		return p.wait
+	case "failed":
+		return p.alarm
+	default: // completed, queued, claimed, cancelled, unknown
+		return p.faintC
+	}
+}
+
+// runToken is the whole state token: glyph + human word + colour.
+type runToken struct {
+	glyph string
+	word  string
+	color color.Color
+}
+
+// stateToken is the ONE shared helper the design mandates: (glyph, colour, word) from a
+// run's status/health/planning, used on the board row, the board strip and the detail
+// header so they cannot render one run three ways.
+func (p palette) stateToken(status, health string, isPlanning bool) runToken {
+	g, w := stateGlyphWord(status, health, isPlanning)
+	return runToken{glyph: g, word: w, color: p.stateColor(status, health, isPlanning)}
+}
+
+// verdictColor maps a judge verdict to a severity colour: issues → alarm red, everything
+// else (ideal/ok/unknown) → faint. The old completed-teal is retired — a ✓ plus faint
+// already says "done" — so good news no longer competes for attention with a real alarm.
+// Shared by the board's ⚖ marker and the review overlay's verdict word.
 func (p palette) verdictColor(verdict string) color.Color {
-	switch verdict {
-	case "ideal", "ok":
-		return p.statusColor("completed", "")
-	case "issues":
-		return p.statusColor("failed", "")
-	default:
-		return p.statusDefault
+	if verdict == "issues" {
+		return p.alarm
 	}
-}
-
-// chip renders text as a solid status tag: a filled block of bg with near-background
-// text on it, so a status reads as a physical tag rather than coloured prose. Under
-// NO_COLOR / an Ascii profile lipgloss strips the fill and the chip degrades to its bold
-// text (still legible) — the caller supplies the NO_COLOR-independent signal (the spine
-// glyph, a bordered banner) separately.
-func (p palette) chip(text string, bg color.Color) string {
-	return lipgloss.NewStyle().Background(bg).Foreground(p.chipFg).Bold(true).Padding(0, 1).Render(text)
+	return p.faintC
 }

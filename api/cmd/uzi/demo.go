@@ -32,7 +32,7 @@ func runTUIDemo(ctx context.Context, env Env) error {
 // demoModel wraps the shipped tuiModel and adds a live ticker. It forwards every message to
 // the real model (re-wrapping the result), and on each tick injects one synthetic frame into
 // the currently-open LIVE run via the same streamEventsMsg a real socket would deliver — so
-// the transcript grows under the reader and follow-live (● FOLLOWING / ⏸ PAUSED ↓N new) is
+// the transcript grows under the reader and follow-live (⇣ following / ⏸ N new · g ⇣) is
 // actually drivable.
 type demoModel struct {
 	tuiModel
@@ -121,11 +121,25 @@ func newDemoClient() *uzicli.FakeClient {
 func demoRuns(now time.Time) []apitypes.RunListItemDTO {
 	sp := func(s string) *string { return &s }
 	mk := func(id, kind, status, title, health string, verdict *string, todo int, age time.Duration) apitypes.RunListItemDTO {
-		return apitypes.RunListItemDTO{
+		created := now.Add(-age)
+		r := apitypes.RunListItemDTO{
 			RunDTO: apitypes.RunDTO{ID: id, Kind: kind, Status: status, IssueTitle: title, Health: health,
-				CreatedAt: now.Add(-age)},
+				CreatedAt: created},
 			JudgeVerdict: verdict, JudgeTodoCount: todo,
 		}
+		// Give every mk-built run a start stamp so the detail header shows elapsed WORK time
+		// (`● running · 4m`): runDuration deliberately won't derive it from CreatedAt, which is
+		// queue-wait age, not work time. A terminal run also gets a FinishedAt, so its header
+		// shows a total wall time (`✓ done · 3h`) rather than a still-ticking clock. The
+		// pre-approval planning run below is built inline WITHOUT a start — its honest state, it
+		// has not begun implementing.
+		started := created
+		r.StartedAt = &started
+		if terminalRunStatuses[status] {
+			finished := now
+			r.FinishedAt = &finished
+		}
+		return r
 	}
 	// A milestone-structured run (PRD #122) so `tui --demo` exercises the crew rail's
 	// milestone block: 2 of 4 frozen milestones reported complete, one in progress.

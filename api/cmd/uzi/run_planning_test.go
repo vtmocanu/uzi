@@ -30,37 +30,34 @@ func TestEffectiveRunStatus(t *testing.T) {
 	}
 }
 
-// TestPlanningStatusColour pins the M4 palette bucket: "planning" is a distinct colour,
-// not a fall-through to the default grey nor a reuse of the running green. The stalled
-// health override still wins over the planning bucket (health precedence unchanged).
+// TestPlanningStatusColour pins the ANDON planning colour: "planning" (running + is_planning)
+// is a distinct indigo, not a fall-through to the faint default nor a reuse of the running sage.
+// The stalled health override still wins over the planning bucket (health precedence unchanged).
 func TestPlanningStatusColour(t *testing.T) {
 	p := newPalette(true)
 
-	if _, ok := p.statuses["planning"]; !ok {
-		t.Fatal("palette has no \"planning\" status bucket")
-	}
-	planning := p.statusColor("planning", "")
-	running := p.statusColor("running", "")
+	planning := p.stateColor("running", "", true) // running + is_planning → planning
+	running := p.stateColor("running", "", false)
 	if bgFillSGR(planning) == bgFillSGR(running) {
 		t.Error("planning and running resolve to the same colour; the planning phase is not visually distinct")
 	}
-	if bgFillSGR(planning) == bgFillSGR(p.statusDefault) {
-		t.Error("planning resolved to the default grey bucket; its own colour entry is not being read")
+	if bgFillSGR(planning) == bgFillSGR(p.faintC) {
+		t.Error("planning resolved to the faint default; its own indigo entry is not being read")
 	}
-	// Health precedence: a stalled planning run is still orange (triage wins).
-	if bgFillSGR(p.statusColor("planning", "stalled")) != bgFillSGR(p.statusStalled) {
+	// Health precedence: a stalled planning run is still the stall colour (triage wins).
+	if bgFillSGR(p.stateColor("running", "stalled", true)) != bgFillSGR(p.stall) {
 		t.Error("stalled health no longer overrides the planning bucket; the precedence rule regressed")
 	}
 }
 
-// TestStatusGlyphPlanning pins the NO_COLOR-safe spine glyph (D3): planning is a hollow
-// circle ("nothing committed yet"), distinct from running's filled dot.
+// TestStatusGlyphPlanning pins the NO_COLOR-safe state glyph (D3): planning is a hollow circle
+// ("nothing committed yet"), distinct from running's filled dot.
 func TestStatusGlyphPlanning(t *testing.T) {
-	if got := statusGlyph("planning"); got != "○" {
-		t.Errorf("statusGlyph(\"planning\") = %q, want %q", got, "○")
+	if got, _ := stateGlyphWord("running", "", true); got != "○" {
+		t.Errorf("planning glyph = %q, want %q", got, "○")
 	}
-	if got := statusGlyph("running"); got != "●" {
-		t.Errorf("statusGlyph(\"running\") = %q, want %q", got, "●")
+	if got, _ := stateGlyphWord("running", "", false); got != "●" {
+		t.Errorf("running glyph = %q, want %q", got, "●")
 	}
 }
 
