@@ -55,6 +55,24 @@ definitions. This is a chosen CI-integrity boundary, not a bug: an agent cannot
 tamper with the workflows that guard `main`. If you need agents to edit workflow
 files, uzi cannot support that on GitHub today.
 
+**Symptom, and the fix that is NOT the fix.** When a run's work touches a
+`.github/workflows/*` file, the run gets all the way to done and then fails at the
+final push with:
+
+```
+! [remote rejected] ... (refusing to allow a Personal Access Token to create or
+update workflow `.github/workflows/<name>.yml` without `workflow` scope)
+```
+
+This is expected, not a broken connection. **Do not resolve it by adding
+`workflow` scope to the bot token:** that makes the token `{repo, workflow}`, which
+uzi's least-privilege check treats as a save-blocking over-privilege violation, so
+the periodic privilege sweep will flag the connection and refuse to start or claim
+runs on those repos (see [Least privilege](#least-privilege-what-uzi-verifies)).
+The correct resolution is to land the workflow change **as a human**: commit the
+file yourself on a branch, with a personal token that carries `workflow` scope, and
+open a normal pull request. Keep the uzi bot token at exactly `repo`.
+
 ## 4. Add the bot to your repo
 
 Repository → **Settings → Collaborators**, add the bot with role **Write** (not
