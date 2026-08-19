@@ -507,7 +507,7 @@ the user's own HEAD to a server-named `uzi/task/<run-id>` branch with the
 user's own git credentials, then dispatches the run so the worker can clone
 that branch, work the inline context, and push its commits back to it, with
 no forge issue and no merge request unless `--mr` is passed. See
-[prds/400-uzi-handoff.md](prds/400-uzi-handoff.md) for the full design and
+[prds/done/400-uzi-handoff.md](prds/done/400-uzi-handoff.md) for the full design and
 [docs/handoff.md](docs/handoff.md) / [docs/cli.md](docs/cli.md#uzi-handoff-ephemeral-branch-scoped-task-runs)
 for usage. Status is a linear state machine:
 
