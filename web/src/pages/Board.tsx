@@ -8,7 +8,7 @@
 // meta, badges. Live behavior (latest_run badges, 10s visibility-gated polling,
 // auto-move toasts, the attention strip, in-app issue links) is PRD #12 M2/M3.
 
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, Link, useNavigate } from "react-router-dom";
 import {
   api,
@@ -190,30 +190,6 @@ export function Board() {
   const [issuesOpen, setIssuesOpen] = useState(false);
   const issuesPopRef = useRef<HTMLDivElement>(null);
   const issuesTriggerRef = useRef<HTMLButtonElement>(null);
-  // Issue #367: the lane headers pin BELOW the sticky toolbar as a tall column
-  // scrolls past. The toolbar's height is dynamic — PageHeader + a wrapping
-  // description + the controls row + the (conditional) search-result count — and
-  // grows taller on narrow screens where the controls wrap. So we measure it live
-  // with a ResizeObserver and publish it as the `--board-head-top` CSS custom
-  // property on the board root; each lane header's `top` reads that var (plus the
-  // 49px mobile shell bar on small screens, 0 on lg). A callback ref wires the
-  // observer only once the toolbar actually mounts — it lives behind the `loading`
-  // early return, so an effect with an empty dep array would see a null node.
-  const [toolbarHeight, setToolbarHeight] = useState(0);
-  const toolbarObserver = useRef<ResizeObserver | null>(null);
-  const setToolbarNode = useCallback((node: HTMLDivElement | null) => {
-    toolbarObserver.current?.disconnect();
-    toolbarObserver.current = null;
-    if (!node) return;
-    const measure = () => setToolbarHeight(node.offsetHeight);
-    measure();
-    // jsdom (the unit-test env) has no ResizeObserver; the pin still renders, it just
-    // does not re-measure on resize there. The browser path below is the real one.
-    if (typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(measure);
-    ro.observe(node);
-    toolbarObserver.current = ro;
-  }, []);
   // Dismiss on Escape or an outside click, the BuildInfoPopover pattern. Listeners
   // are attached only while open, so a closed popover costs nothing.
   useEffect(() => {
@@ -1058,13 +1034,7 @@ export function Board() {
     `use "Issues" to bring other labels onto the board alongside them.`;
 
   return (
-    <div
-      className="space-y-5"
-      // Issue #367: publish the live toolbar height so lane headers can pin exactly
-      // below its bottom edge (see setToolbarNode). CSS custom properties are not in
-      // React's CSSProperties type, hence the cast.
-      style={{ "--board-head-top": `${toolbarHeight}px` } as CSSProperties}
-    >
+    <div className="space-y-5">
       {/* M3: the toolbar pins so search stays reachable while a long lane scrolls. The
           app shell scrolls the WINDOW and neither <main> owns an overflow ancestor
           (AppShell.tsx), so plain `sticky top-0` is expected to hold; z-10 sits below
@@ -1074,7 +1044,7 @@ export function Board() {
           transparent). On mobile the shell's own bar is a 49px-tall sticky top-0 z-20
           strip, so offset below it; on lg the shell bar is hidden and we pin at 0.
           Verified in a browser pass. */}
-      <div ref={setToolbarNode} className="sticky top-[49px] z-10 bg-ink lg:top-0">
+      <div className="sticky top-[49px] z-10 bg-ink lg:top-0">
       <PageHeader
         backTo="/repos"
         backLabel="Boards"
@@ -1277,9 +1247,11 @@ export function Board() {
         />
       )}
 
-      {/* Issue #367: full-page vertical scroll, no per-column overflow box. Columns
-          wrap to full width instead of scrolling horizontally (Decision 2 = Option A). */}
-      <div className="flex flex-wrap items-start gap-4 pb-4">
+      {/* Issue #367 → #373: columns scroll HORIZONTALLY in one row (overflow-x-auto)
+          again; the page still scrolls vertically for tall columns. Reverts the
+          flex-wrap of Decision 2 (Option A), which stacked columns onto new rows when
+          they exceeded the width and killed horizontal card scroll. */}
+      <div className="flex items-start gap-4 overflow-x-auto pb-4">
         {visible.map((col) => {
           const cards = cardsByColumn.get(col.key) ?? [];
           // Per-lane paging (PRD #304 M1/M2). `cards` stays FULL — it drives the count
@@ -1319,12 +1291,9 @@ export function Board() {
                 if (iid) applyDrop(iid, col.key, null);
               }}
               className={cx(
-                // Issue #367: grow-and-wrap sizing. `basis-72` keeps a column near its
-                // old 18rem width; `flex-1` lets a row of columns fill the width evenly
-                // and `flex-wrap` (on the row) drops a column to a new full-width line
-                // rather than opening a horizontal scroller. `min-w-0` lets a column
-                // shrink below its content's intrinsic width so no overflow appears.
-                "flex min-w-0 flex-1 basis-72 flex-col rounded-xl border p-2.5 transition-colors",
+                // Fixed-width, non-shrinking columns in one row; the row's overflow-x-auto
+                // gives back horizontal card scroll (#373, reverting Decision 2's grow-wrap).
+                "flex w-72 shrink-0 flex-col rounded-xl border p-2.5 transition-colors",
                 dragRevealed && "opacity-60",
                 isTarget
                   ? "border-brand/70 bg-brand/5 ring-1 ring-brand/40"
@@ -1333,17 +1302,11 @@ export function Board() {
                     : "border-edge bg-surface/60",
               )}
             >
-              {/* Issue #367: the lane header pins below the toolbar as the column's
-                  cards scroll past it. `top` reads the live toolbar height published on
-                  the board root (--board-head-top) plus the 49px mobile shell bar; on lg
-                  the shell bar is hidden so it pins at the toolbar's bottom edge exactly.
-                  z-[5] sits below the toolbar's z-10 so a taller (wrapped) toolbar paints
-                  over the header rather than the reverse. bg-surface is opaque (the lane's
-                  own bg-surface/60 is translucent) so cards scroll cleanly under it; the
-                  negative -mx-2.5 lets that opaque backing span the full lane width across
-                  the lane's p-2.5, and pb-2.5 (replacing the old mb-2.5 gap) keeps the
-                  band just under the header opaque so no card bleeds through there. */}
-              <div className="sticky top-[calc(var(--board-head-top)_+_49px)] z-[5] -mx-2.5 -mt-2.5 flex items-center gap-2 rounded-t-xl bg-surface px-3.5 pt-2.5 pb-2.5 lg:top-[var(--board-head-top)]">
+              {/* Static header (#373): sticky pinning is incompatible with the row's
+                  overflow-x-auto (a non-visible overflow-x forces overflow-y:auto, which
+                  makes the row — not the viewport — the sticky scroll context). We chose
+                  horizontal card scroll over pinned headers, so the header is plain again. */}
+              <div className="mb-2.5 flex items-center gap-2 px-1">
                 <span aria-hidden="true" className={cx("h-2 w-2 rounded-full", col.accent)} />
                 <span className={cx("text-sm font-semibold", closedCol ? "text-faint" : "text-fg")}>
                   {col.label}

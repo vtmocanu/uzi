@@ -331,16 +331,27 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 	}
 
 	// slow: wall clock since start, regardless of activity or in-flight state. The RAW
-	// threshold (th.slow) is clamped PER-RUN against this run's EFFECTIVE timeout (PRD
-	// #122 M2, Decision 5b): the global RUN_TIMEOUT unless the run froze a scaled budget,
-	// in which case its persisted budget_wall_seconds. Without this a scaled run would
-	// render "slow" for its whole extended life (the global-clamped threshold fires ~2h
-	// into an 8h run). Byte-for-byte today for an unscaled run (NULL budget → eff = global).
+	// threshold (th.slow) is first SCALED to the run's budget, then clamped PER-RUN
+	// against this run's EFFECTIVE timeout (PRD #122 M2, Decision 5b): the global
+	// RUN_TIMEOUT unless the run froze a scaled budget, in which case its persisted
+	// budget_wall_seconds.
 	effTimeout := s.p.RunTimeout
 	if r.BudgetWallSeconds.Valid && r.BudgetWallSeconds.Int32 > 0 {
 		effTimeout = time.Duration(r.BudgetWallSeconds.Int32) * time.Second
 	}
-	if slow := clampSlow(th.slow, effTimeout); slow > 0 && r.StartedAt.Valid && now.Sub(r.StartedAt.Time) >= slow {
+	// issue #323: a run that froze a scaled budget lives far longer than the global
+	// RUN_TIMEOUT, so a flat health_slow_seconds wears "slow" for most of that life even
+	// while actively emitting. Scale the raw threshold by the run's budget ratio so
+	// "slow" means the same fraction-of-budget for a scaled run as it does for a default
+	// run — respecting the admin's configured health_slow_seconds rather than ignoring
+	// it. Only ever RAISES the threshold (effTimeout > RunTimeout guard), so an unscaled
+	// run is byte-for-byte unchanged, and the per-run clampSlow below still keeps the
+	// flag firing before the run's own timeout.
+	rawSlow := th.slow
+	if s.p.RunTimeout > 0 && effTimeout > s.p.RunTimeout {
+		rawSlow = time.Duration(float64(th.slow) * float64(effTimeout) / float64(s.p.RunTimeout))
+	}
+	if slow := clampSlow(rawSlow, effTimeout); slow > 0 && r.StartedAt.Valid && now.Sub(r.StartedAt.Time) >= slow {
 		return healthSlow, reasonSlow
 	}
 

@@ -72,24 +72,58 @@ const SecretMutationLockClass int32 = 0x757A736B // "uzsk"
 // retries the initial connection so the API can start slightly ahead of
 // Postgres becoming ready.
 func Migrate(ctx context.Context, dsn string) error {
-	db, err := sql.Open("pgx", dsn)
+	db, err := openForMigrate(ctx, dsn)
 	if err != nil {
-		return fmt.Errorf("open sql db: %w", err)
-	}
-	defer db.Close()
-
-	if err := waitForDB(ctx, db); err != nil {
 		return err
 	}
+	defer func() { _ = db.Close() }()
 
-	goose.SetBaseFS(migrationFS)
-	if err := goose.SetDialect("postgres"); err != nil {
-		return fmt.Errorf("set goose dialect: %w", err)
-	}
 	if err := goose.UpContext(ctx, db, "migrations"); err != nil {
 		return fmt.Errorf("run migrations: %w", err)
 	}
 	return nil
+}
+
+// MigrateTo runs the embedded goose migrations up to and including version,
+// where version is the numeric migration filename prefix with leading zeros
+// stripped (e.g. 00093 -> 93). Like Migrate, it retries the initial connection.
+//
+// It exists so a test can stand a database at a chosen version and observe what
+// a data migration's one-shot backfill actually did — a blind spot every data
+// migration shares (issue #187).
+func MigrateTo(ctx context.Context, dsn string, version int64) error {
+	db, err := openForMigrate(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := goose.UpToContext(ctx, db, "migrations", version); err != nil {
+		return fmt.Errorf("run migrations to %d: %w", version, err)
+	}
+	return nil
+}
+
+// openForMigrate opens the sql.DB at dsn, waits for it to become reachable, and
+// prepares goose (base FS + dialect). The caller owns the returned db and must
+// Close it.
+func openForMigrate(ctx context.Context, dsn string) (*sql.DB, error) {
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open sql db: %w", err)
+	}
+
+	if err := waitForDB(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
+	goose.SetBaseFS(migrationFS)
+	if err := goose.SetDialect("postgres"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("set goose dialect: %w", err)
+	}
+	return db, nil
 }
 
 func waitForDB(ctx context.Context, db *sql.DB) error {

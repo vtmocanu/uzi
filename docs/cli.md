@@ -380,14 +380,22 @@ also the TUI's own fallback when the live channel is unreachable (below).
   runs, never a crash). **The admin board isn't your own-runs list widened —
   it's a different shape**: active runs only (nothing completed), capped at
   500, no judge-verdict or usage columns, titled "active runs (factory-wide)"
-  on screen so it never promises a row it can't show.
+  on screen so it never promises a row it can't show. A milestone-structured
+  run (one planned from a `PRD`-labelled issue) carries a compact `MILE` column
+  between AGE and TITLE showing `M{done}/{total}` (or `M–/N` when nothing has
+  been reported complete yet); the column is hidden on a narrow terminal, and
+  the full breakdown is on the run detail view.
 - **Run detail** (`[enter]` from the board, or `uzi tui <run-id>` directly).
   A left rail of agent lanes — the lead plus each live subagent, one lane per
   invocation, each with a status dot — beside the selected lane's transcript,
   rendered as markdown. Lanes are built from the same per-invocation
   `agent`/`agent_instance`/`agent_label` attribution `run logs` prints; see
   [Run activity pane](./run-activity.md#lanes-one-per-actor-not-one-per-turn)
-  for what a lane's dot means.
+  for what a lane's dot means. For a milestone-structured run the rail also
+  shows a `MILESTONES {done}/{total}` block below the lanes, one row per
+  approved milestone in order, marked `✓` reported complete, `◐` in progress,
+  or `○` not started. The count reads "reported complete", not verified: uzi
+  shows what the run reported and does not itself check the work.
 - **Review overlay** (`[v]` from run detail). The judge's verdict, summary,
   and recommendations, with the same resolve/dismiss/undo triage described
   under [Reviewing and triaging from the CLI](#reviewing-and-triaging-from-the-cli).

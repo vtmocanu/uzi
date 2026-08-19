@@ -41,13 +41,17 @@ type detailState struct {
 	// is true the window is pinned to the bottom (auto-tail) and scroll is recomputed on
 	// render; when paused, scroll is the fixed top so the view does not jump as frames
 	// arrive below it.
-	scroll    int
-	focus     int  // focusRail | focusTranscript — which pane ↑/↓ drives (M4)
-	follow    bool // M5: auto-tail the transcript (tail -f). Reset true on open / lane switch.
-	loaded    bool
-	loadErr   error
-	stream    *uzicli.RunStream
-	streamErr error
+	scroll int
+	focus  int  // focusRail | focusTranscript — which pane ↑/↓ drives (M4)
+	follow bool // M5: auto-tail the transcript (tail -f). Reset true on open / lane switch.
+	// railCollapsed folds the crew list to a one-line summary + the selected lane (`c`), so a
+	// tall roster cannot push the milestone block below the fold — the rail does not scroll,
+	// it is clamped to the transcript height (issue #379).
+	railCollapsed bool
+	loaded        bool
+	loadErr       error
+	stream        *uzicli.RunStream
+	streamErr     error
 	// polling is the D8 fallback: the socket is unusable, so the view re-reads over
 	// REST on the same 2s cadence `uzi run logs --follow` uses.
 	polling bool
@@ -75,6 +79,28 @@ func (d *detailState) applyLoaded(msg detailLoadedMsg) {
 	}
 	d.loaded = true
 	d.rebuild()
+}
+
+// applyMeta refreshes the run DTO from a periodic GetRun poll WITHOUT touching the frame
+// log — the transcript is fed by the stream/replay, this only refreshes the non-streamed
+// fields (milestones, health, kind, title, lifecycle stamps). Ignored until the initial
+// load has set the baseline, so a poll racing the first full load cannot flip `loaded`.
+//
+// Status is DELIBERATELY preserved rather than overwritten: the live stream owns it
+// (applyEvents sets it from authoritative `state` frames, including StreamRun's reconcile),
+// and applyMeta only runs while the stream is healthy (the dispatch guards on !polling).
+// Overwriting it would let a GetRun response that was in flight across a status transition
+// revert the status for up to one 2s tick — e.g. dropping the plan-gate banner and its owner
+// keys the instant a run enters awaiting_approval, or flipping a just-finished run back to
+// running. When the stream is down the poll-fallback path (loadDetailCmd/applyLoaded) owns
+// status instead, so nothing goes stale.
+func (d *detailState) applyMeta(run apitypes.RunDTO) {
+	if !d.loaded {
+		return
+	}
+	status := d.run.Status
+	d.run = run
+	d.run.Status = status
 }
 
 // applyEvents folds a batch in and reports whether the steer queue was signalled
@@ -161,6 +187,15 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 		return m, m.fetchRunsCmd(m.board.admin)
 	case keyRefresh:
 		return m, m.loadDetailCmd(m.detail.runID)
+	case keyCollapseCrew:
+		// Fold / unfold the crew list so the milestone block below it is always reachable
+		// (the rail is height-clamped and does not scroll). No-op with no lanes: there is
+		// nothing to fold and the caret/hint are hidden, so toggling would only leave a run
+		// that later gains lanes silently opening collapsed.
+		if len(m.detail.lanes) > 0 {
+			m.detail.railCollapsed = !m.detail.railCollapsed
+		}
+		return m, nil
 	case keyTab:
 		// tab cycles focus between the two panes.
 		m.detail.focus = 1 - m.detail.focus
@@ -263,9 +298,24 @@ func (m tuiModel) renderDetail() string {
 				head += "  " + m.renderer.Plain(h, 14)
 			}
 		}
+		// Elapsed time: how long a live run has been going, or a terminal run's total wall
+		// time. Sits before the title so a narrow terminal that truncates the (capped) title
+		// still shows the duration.
+		if dur := runDuration(d.run, time.Now()); dur != "" {
+			head += "  " + m.pal.faint.Render(dur)
+		}
 		head += "  " + m.pal.faint.Render(m.renderer.Plain(runTitle(d.run), 60))
 	}
-	sb.WriteString(head + "\n")
+	// The healthy/transient transport state folds into the header (see transportHeaderTag) so
+	// it does not cost its own row; a degradation gets a full line below instead.
+	if tag := m.transportHeaderTag(); tag != "" {
+		head += "  " + tag
+	}
+	// Clamp to the terminal width so the header is always exactly ONE physical row. It is
+	// otherwise unbounded (a long title, plus the duration and the folded transport tag), and
+	// a wrap would make transcriptViewport — which counts the header as one row — under-count
+	// and push the footer off the bottom, the #379 invariant this view protects.
+	sb.WriteString(clampVisual(head, m.width) + "\n")
 
 	// The park line (PRD #35). The status word alone is already in the header, and it
 	// is not enough: "limit_wait" tells a user their run stopped and nothing about
@@ -282,19 +332,13 @@ func (m tuiModel) renderDetail() string {
 		sb.WriteString(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 120)) + "\n")
 	}
 
-	// The transport line is never silent about a degradation: a user watching a stale
-	// pane must be able to see WHY it is stale.
-	switch {
-	case d.streamErr != nil && d.polling:
-		sb.WriteString(m.pal.faint.Render("live stream unavailable (" + fmtErr(d.streamErr) + ") — falling back to a 2s refresh"))
-	case d.polling:
-		sb.WriteString(m.pal.faint.Render("reconnecting — refreshing every 2s"))
-	case d.stream != nil:
-		sb.WriteString(m.pal.faint.Render("live"))
-	default:
-		sb.WriteString(m.pal.faint.Render("connecting…"))
+	// The transport line is never silent about a degradation: a user watching a stale pane
+	// must see WHY it is stale. The healthy/transient states ("live", "connecting…") are the
+	// header tag above; only a degradation takes a full row here, where its longer text fits.
+	if tline := m.transportLine(); tline != "" {
+		sb.WriteString(clampVisual(tline, m.width) + "\n") // one physical row (a long streamErr must not wrap)
 	}
-	sb.WriteString("\n\n")
+	sb.WriteString("\n")
 
 	if d.loadErr != nil {
 		sb.WriteString(m.pal.faint.Render("could not load this run: " + fmtErr(d.loadErr)))
@@ -324,9 +368,54 @@ func (m tuiModel) renderDetail() string {
 		sb.WriteString(steer + "\n")
 	}
 	if m.detail.steer.mode == steerIdle {
-		sb.WriteString(m.detailFooter())
+		sb.WriteString(clampVisual(m.detailFooter(), m.width)) // one physical row on a narrow terminal
 	}
 	return sb.String()
+}
+
+// transportHeaderTag is the compact connection tag folded into the header for the healthy
+// and transient states ("● live", "connecting…"), so the steady case does not cost a whole
+// row. Empty in a degraded state — transportLine draws that on its own line instead, and the
+// two are mutually exclusive, so exactly one of them is non-empty for any transport state.
+func (m tuiModel) transportHeaderTag() string {
+	d := &m.detail
+	// A terminal run will never produce more output, so it carries no transport chrome at all
+	// (neither this tag nor transportLine): "connecting…"/"reconnecting…" on a completed run is
+	// noise. The stream still opens to replay history, then closes — that close must not read as
+	// a degradation here.
+	if isTerminalRunStatus(d.run.Status) {
+		return ""
+	}
+	switch {
+	case d.streamErr != nil && d.polling, d.polling:
+		return "" // degraded: shown on its own line by transportLine
+	case d.stream != nil:
+		return m.pal.state(crewWorking).Render("● live")
+	default:
+		return m.pal.faint.Render("connecting…")
+	}
+}
+
+// transportLine is the full-width transport line, drawn ONLY for a degradation (the socket
+// is unusable and the view fell back to REST polling): the healthy/transient states fold
+// into transportHeaderTag. Kept as its own line because the explanation is long and a user
+// watching a stale pane must be able to read WHY it is stale. Pure — transcriptViewport
+// calls it to keep the chrome accounting and the render in lockstep.
+func (m tuiModel) transportLine() string {
+	d := &m.detail
+	// A terminal run shows no transport chrome (see transportHeaderTag): its stream closing is
+	// expected, not a degradation to reconnect from.
+	if isTerminalRunStatus(d.run.Status) {
+		return ""
+	}
+	switch {
+	case d.streamErr != nil && d.polling:
+		return m.pal.faint.Render("live stream unavailable (" + fmtErr(d.streamErr) + ") — falling back to a 2s refresh")
+	case d.polling:
+		return m.pal.faint.Render("reconnecting — refreshing every 2s")
+	default:
+		return ""
+	}
 }
 
 // detailFooter is the single-line keymap (PRD #325 M4): pane/scroll navigation combined
@@ -341,6 +430,9 @@ func (m tuiModel) detailFooter() string {
 			m.keyHint("←→", "pane"), m.keyHint("↑↓", "move"))
 	} else {
 		parts = append(parts, m.keyHint("←→", "pane"), m.keyHint("↑↓", "move"))
+		if len(m.detail.lanes) > 0 {
+			parts = append(parts, m.keyHint("c", "crew"))
+		}
 		if isLiveRunStatus(m.detail.run.Status) {
 			// g re-attaches the transcript follow (M5); it is a view affordance, so it shows
 			// for owner and non-owner alike, but only when there is live output to follow.
@@ -402,35 +494,164 @@ func (m tuiModel) renderLaneRail() string {
 	active := activeLaneKey(d.run.Status, d.frames)
 
 	var sb strings.Builder
-	sb.WriteString(m.paneTitle("crew", d.focus == focusRail) + "\n")
+	// A caret advertises the collapse state (`c`) once there is a roster to collapse: ▾ open,
+	// ▸ with the lane count when folded to a summary + the selected lane.
+	title := m.paneTitle("crew", d.focus == focusRail)
+	if len(d.lanes) > 0 {
+		if d.railCollapsed {
+			title += m.pal.faint.Render("  " + itoa(len(d.lanes)) + " ▸")
+		} else {
+			title += m.pal.faint.Render("  ▾")
+		}
+	}
+	sb.WriteString(title + "\n")
+
 	if len(d.lanes) == 0 {
 		sb.WriteString(m.pal.faint.Render("(no activity yet)"))
+		// A milestone-structured run has a frozen list before any frame arrives (queued /
+		// just-claimed), so the block must show even with no lanes yet.
+		if block := m.renderMilestones(); block != "" {
+			sb.WriteString("\n\n" + block)
+		}
 		return sb.String()
 	}
-	for i, l := range d.lanes {
-		st := crewStateFor(d.run.Status, d.run.Health, l.Key, active, l.LastActivity, now)
-		// Role and label are model-authored: plain, clamped, never markdown.
-		name := m.renderer.Plain(l.Role, 14)
-		if l.Key != l.Role {
-			// The instance id is UNTRUSTED like everything else on this rail: it is the
-			// SDK's parent_tool_use_id, forwarded verbatim. shortInstanceID only takes a
-			// tail — it does not sanitize — so the result goes through Plain like every
-			// other cell. Rendering it raw was a real hole, caught by
-			// TestTUIViewsStripControlBytesFromUntrustedText.
-			name += m.pal.faint.Render("·" + m.renderer.Plain(shortInstanceID(l.Key), 8))
+
+	if d.railCollapsed {
+		// Just the selected lane, so the reader still knows whose transcript is on screen while
+		// the milestones get the rest of the column.
+		if l, ok := d.selectedLane(); ok {
+			st := crewStateFor(d.run.Status, d.run.Health, l.Key, active, l.LastActivity, now)
+			sb.WriteString(m.laneRow(l, true, st))
 		}
-		row := m.pal.state(st).Render(laneDot(st)) + " " + name
-		if i == d.laneIdx {
-			sb.WriteString(m.pal.sel.Render("▸" + row))
-		} else {
-			sb.WriteString(" " + row)
-		}
-		sb.WriteString("\n")
-		if l.Label != "" {
-			sb.WriteString("   " + m.pal.faint.Render(m.renderer.Plain(l.Label, laneLabelCap)) + "\n")
+	} else {
+		for i, l := range d.lanes {
+			st := crewStateFor(d.run.Status, d.run.Health, l.Key, active, l.LastActivity, now)
+			sb.WriteString(m.laneRow(l, i == d.laneIdx, st))
 		}
 	}
+	if block := m.renderMilestones(); block != "" {
+		sb.WriteString("\n" + block)
+	}
 	return sb.String()
+}
+
+// laneRow renders one crew-rail row: the status dot, the model-authored role and (untrusted)
+// instance id, and the optional label line beneath it. `selected` adds the ▸ marker. The
+// role, id and label are all UNTRUSTED and go through renderer.Plain (D7) — keeping every
+// cell's sanitizing in this one helper is why the collapsed and expanded paths share it.
+func (m tuiModel) laneRow(l agentLane, selected bool, st crewState) string {
+	name := m.renderer.Plain(l.Role, 14)
+	if l.Key != l.Role {
+		// The instance id is UNTRUSTED like everything else on this rail: it is the SDK's
+		// parent_tool_use_id, forwarded verbatim. shortInstanceID only takes a tail — it does
+		// not sanitize — so the result goes through Plain like every other cell. Rendering it
+		// raw was a real hole, caught by TestTUIViewsStripControlBytesFromUntrustedText.
+		name += m.pal.faint.Render("·" + m.renderer.Plain(shortInstanceID(l.Key), 8))
+	}
+	row := m.pal.state(st).Render(laneDot(st)) + " " + name
+	var sb strings.Builder
+	if selected {
+		sb.WriteString(m.pal.sel.Render("▸" + row))
+	} else {
+		sb.WriteString(" " + row)
+	}
+	sb.WriteString("\n")
+	if l.Label != "" {
+		sb.WriteString("   " + m.pal.faint.Render(m.renderer.Plain(l.Label, laneLabelCap)) + "\n")
+	}
+	return sb.String()
+}
+
+// milestoneTitleCap is the per-row title budget in the crew rail (laneRailWidth 26 minus
+// the " ✓ " glyph prefix). joinColumns clamps the whole left column anyway, but Plain must
+// cap the UNTRUSTED title itself (D7), so it caps at the width the rail can actually show.
+const milestoneTitleCap = 22
+
+// milestoneProgress folds a run's frozen milestone list into (done, total, reported) — the
+// TUI twin of the web's milestoneBadge, shared by the crew-rail block and the board badge so
+// the two surfaces cannot disagree. `done` counts frozen MEMBERS present in the completed
+// set (immune to a duplicate id and to a completed id naming a milestone dropped after it
+// was ticked). `reported` is whether ANY completion was ever reported: a nil completed slice
+// (JSON null) means never, so an unreported run reads `–/N` rather than a `0/N` that looks
+// like failure. total is 0 for a run with no frozen list — the caller renders nothing.
+func milestoneProgress(run apitypes.RunDTO) (done, total int, reported bool) {
+	total = len(run.Milestones)
+	if total == 0 {
+		return 0, 0, false
+	}
+	completed := make(map[string]bool, len(run.MilestonesCompleted))
+	for _, id := range run.MilestonesCompleted {
+		completed[id] = true
+	}
+	for _, mi := range run.Milestones {
+		if completed[mi.ID] {
+			done++
+		}
+	}
+	return done, total, run.MilestonesCompleted != nil
+}
+
+// milestoneCount is the compact `2/4` (or `–/4` when nothing was reported) shared by the
+// crew-rail block's summary and the board's `M…` badge.
+func milestoneCount(done, total int, reported bool) string {
+	if !reported {
+		return "–/" + itoa(total)
+	}
+	return itoa(done) + "/" + itoa(total)
+}
+
+// renderMilestones is the crew rail's milestone progress block (the TUI twin of the web's
+// MilestoneChecklist and the CLI `uzi run get` milestoneRows): a compact `{done}/{total}`
+// summary and one glyph-marked row per milestone in FROZEN order — done ✓, in progress ◐,
+// not started ○.
+//
+// Empty for a run with no frozen milestone list, so a pre-#122 (or non-milestone) run's
+// rail is byte-for-byte unchanged — the same back-compat contract the nil Milestones slice
+// carries elsewhere.
+//
+// The count says neither "verified" nor "complete" (PRD #122 Decision 6): the worker only
+// REPORTS a milestone done and nothing in uzi has verified it, so the bare N/M and the ✓
+// glyph must not imply verification. A run that has reported nothing shows `–/N`, not a
+// `0/N` that reads as failure (matching the web's `–/N` treatment). `done` counts frozen
+// members present in the completed set, immune to a duplicate id and to a completed id
+// that names a milestone dropped after it was ticked — the same rule milestoneBadge uses.
+//
+// Titles are UNTRUSTED repo/agent-authored text (apitypes.Milestone.Title), so each goes
+// through renderer.Plain — the D7 obligation the lane rail's Role/Label already carry, and
+// why "Title" is in d7UntrustedFields.
+func (m tuiModel) renderMilestones() string {
+	ms := m.detail.run.Milestones
+	if len(ms) == 0 {
+		return ""
+	}
+	completed := make(map[string]bool, len(m.detail.run.MilestonesCompleted))
+	for _, id := range m.detail.run.MilestonesCompleted {
+		completed[id] = true
+	}
+	inProgress := make(map[string]bool, len(m.detail.run.MilestonesInProgress))
+	for _, id := range m.detail.run.MilestonesInProgress {
+		inProgress[id] = true
+	}
+	done, total, reported := milestoneProgress(m.detail.run)
+
+	var sb strings.Builder
+	sb.WriteString(m.pal.title.Render("MILESTONES") + " " + m.pal.faint.Render(milestoneCount(done, total, reported)) + "\n")
+	for _, mi := range ms {
+		glyph := m.pal.faint.Render("○") // not started
+		style := m.pal.faint
+		switch {
+		case completed[mi.ID]:
+			glyph = m.pal.state(crewWorking).Render("✓")
+			// done → muted, like the web's text-muted; the ✓ glyph carries completion, so no
+			// strikethrough (which lipgloss emits per-rune, bloating the frame for no signal).
+			style = m.pal.faint
+		case inProgress[mi.ID]:
+			glyph = m.pal.state(crewWaiting).Render("◐")
+			style = lipgloss.NewStyle() // current — plain terminal fg, like the web's text-fg
+		}
+		sb.WriteString(" " + glyph + " " + style.Render(m.renderer.Plain(mi.Title, milestoneTitleCap)) + "\n")
+	}
+	return strings.TrimRight(sb.String(), "\n")
 }
 
 // buildTranscriptLines renders the selected lane's frames to display lines (no windowing),
@@ -446,11 +667,52 @@ func (m tuiModel) buildTranscriptLines(lane agentLane) []string {
 
 // transcriptViewport is the transcript's visible line budget (the pane title is a fixed
 // header above it, so it is one row shorter than the pane).
+//
+// The budget is the terminal height minus every OTHER row the detail view draws, so the
+// two-pane body fills the screen down to the footer (issue #379) rather than stopping at the
+// last line of content and leaving a tall terminal with dead space below the footer. It
+// counts the SAME chrome renderDetail emits — header, optional park line, an optional degraded
+// transport line (a healthy "live"/"connecting…" folds into the header), the blank separator,
+// the pane title row, an optional attention banner, an optional steer bar, and the footer — so
+// this and the render cannot disagree; both the window render and the scroll clamp read it.
+// renderSteerBar/detailBanner/transportLine are pure and never call back here (no recursion).
 func (m tuiModel) transcriptViewport() int {
-	if h := m.height - 11; h > 3 {
+	lineCount := func(s string) int {
+		if s == "" {
+			return 0
+		}
+		return strings.Count(s, "\n") + 1
+	}
+	chrome := 1 // header line (run id + chips)
+	if limitWaitLine(m.detail.run, time.Now()) != "" {
+		chrome++ // the park / limit-wait line
+	}
+	if m.transportLine() != "" {
+		chrome++ // the degraded transport line (a healthy "live"/"connecting…" folds into the header)
+	}
+	chrome++ // the blank separator line before the body
+	chrome++ // the transcript pane's own title row (the first line of the body column)
+	chrome += lineCount(m.detailBanner())
+	chrome += lineCount(m.renderSteerBar())
+	if m.detail.steer.mode == steerIdle {
+		chrome++ // the footer (suppressed while the steer bar owns the key hints)
+	}
+	if h := m.height - chrome; h > 3 {
 		return h
 	}
 	return 3
+}
+
+// padLinesToViewport joins lines and pads with blank lines to exactly vp rows, so the
+// transcript column always fills the viewport height and the pane divider joinColumns draws
+// beside it reaches the footer even when the run has fewer lines than the viewport (#379).
+func padLinesToViewport(lines []string, vp int) string {
+	out := make([]string, 0, vp)
+	out = append(out, lines...)
+	for len(out) < vp {
+		out = append(out, "")
+	}
+	return strings.Join(out, "\n")
 }
 
 // transcriptExtent gives the selected lane's total line count and the viewport, so the key
@@ -467,7 +729,8 @@ func (m tuiModel) renderTranscript() string {
 	focused := m.detail.focus == focusTranscript
 	lane, ok := m.detail.selectedLane()
 	if !ok {
-		return m.paneTitleBadge("transcript", focused, "") + "\n" + m.pal.faint.Render("no lane selected")
+		return m.paneTitleBadge("transcript", focused, "") + "\n" +
+			padLinesToViewport([]string{m.pal.faint.Render("no lane selected")}, m.transcriptViewport())
 	}
 	lines := m.buildTranscriptLines(lane)
 	vp := m.transcriptViewport()
@@ -490,7 +753,9 @@ func (m tuiModel) renderTranscript() string {
 	if end > len(lines) {
 		end = len(lines)
 	}
-	window := strings.Join(lines[top:end], "\n")
+	// Pad to the full viewport so the transcript column, and the pane divider beside it,
+	// reach the bottom of the screen even when the content is shorter than the viewport (#379).
+	window := padLinesToViewport(lines[top:end], vp)
 
 	return m.paneTitleBadge("transcript", focused, m.followBadge(top, maxTop)) + "\n" + window
 }
@@ -552,14 +817,17 @@ func transcriptText(f laneFrame) string {
 	return compactText(string(f.Payload))
 }
 
-// joinColumns places the rail beside the body at a fixed gutter.
+// joinColumns places the rail beside the body at a fixed gutter. The row count is the RIGHT
+// (transcript) column's height, NOT max(left, right): the transcript is padded to exactly the
+// viewport (padLinesToViewport), so it is the height budget for the whole two-pane body. A
+// rail TALLER than that — a run with many lanes plus a long milestone block — is truncated to
+// it rather than pushing the total past the terminal height and clipping the footer below the
+// body (issue #379: the footer carries pane nav / esc / ? and must always render). A shorter
+// rail is padded, which is what fills the divider to the bottom.
 func joinColumns(left, right string, width int) string {
 	l := strings.Split(left, "\n")
 	r := strings.Split(right, "\n")
-	n := len(l)
-	if len(r) > n {
-		n = len(r)
-	}
+	n := len(r)
 	var sb strings.Builder
 	for i := 0; i < n; i++ {
 		var lv, rv string
@@ -605,6 +873,57 @@ func padVisual(s string, n int) string {
 // already a direct dependency — the correct implementation was linked into the binary
 // the whole time.
 func visualWidth(s string) int { return lipgloss.Width(s) }
+
+// runDuration is the run's elapsed WORK time for the header: a live run's time since it
+// started, or a terminal run's total from start to finish. Start is StartedAt, or ClaimedAt
+// during the brief claimed-but-not-started window; end is FinishedAt when set, else now.
+//
+// CreatedAt is deliberately NOT a fallback: it would turn a queued run's header into its
+// queue-WAIT age dressed up as run-elapsed time (and a just-created run into a literal "0s"),
+// conflating two different clocks. A run with no start stamp yet (queued) shows nothing.
+func runDuration(run apitypes.RunDTO, now time.Time) string {
+	var start time.Time
+	switch {
+	case run.StartedAt != nil && !run.StartedAt.IsZero():
+		start = *run.StartedAt
+	case run.ClaimedAt != nil && !run.ClaimedAt.IsZero():
+		start = *run.ClaimedAt
+	default:
+		return "" // not started yet: no work-elapsed time to show
+	}
+	end := now
+	if run.FinishedAt != nil && !run.FinishedAt.IsZero() {
+		end = *run.FinishedAt
+	}
+	return shortDuration(end.Sub(start))
+}
+
+// shortDuration formats an elapsed duration compactly for the header: "45s", "12m", "3h4m",
+// "2d5h". Negative clamps to "0s". It carries the second unit (unlike relAge, which is
+// single-unit for the queue-age column) because a run's total reads better as "3h4m" than "3h".
+func shortDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	switch {
+	case d < time.Minute:
+		return itoa(int(d.Seconds())) + "s"
+	case d < time.Hour:
+		return itoa(int(d.Minutes())) + "m"
+	case d < 24*time.Hour:
+		h := int(d.Hours())
+		if mins := int(d.Minutes()) % 60; mins != 0 {
+			return itoa(h) + "h" + itoa(mins) + "m"
+		}
+		return itoa(h) + "h"
+	default:
+		days := int(d.Hours()) / 24
+		if h := int(d.Hours()) % 24; h != 0 {
+			return itoa(days) + "d" + itoa(h) + "h"
+		}
+		return itoa(days) + "d"
+	}
+}
 
 func itoa(n int) string {
 	if n == 0 {

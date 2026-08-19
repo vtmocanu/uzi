@@ -671,7 +671,11 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 
 	detail := tuiTestModel(t, fake, runID)
 	next, _ = detail.Update(detailLoadedMsg{
-		run: apitypes.RunDTO{ID: runID, Status: "running", IssueTitle: nasty},
+		// A hostile milestone title exercises renderMilestones' crew-rail draw (D7): the
+		// in-progress id makes the row render its title through renderer.Plain.
+		run: apitypes.RunDTO{ID: runID, Status: "running", IssueTitle: nasty,
+			Milestones:           []apitypes.Milestone{{ID: "m1", Title: nasty}},
+			MilestonesInProgress: []string{"m1"}},
 		msgs: []apitypes.MessageDTO{
 			msgDTO(1, "text", nasty, "toolu_"+nasty, nasty, nasty, now),
 		},
@@ -695,6 +699,189 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 		t.Fatalf("the admin board is not showing the OWNER column, so this test is not exercising the OwnerEmail render path\n%s", admOut)
 	}
 	assertNoRawControls(t, "admin board", admOut)
+}
+
+// The crew rail draws a milestone-structured run's progress (renderMilestones): the
+// `{done}/{total}` summary, a per-milestone glyph (✓ done, ◐ in progress, ○ not started),
+// and the titles. A run with no frozen milestone list must draw NO milestone block, and a
+// run that has reported nothing shows `–/N` rather than `0/N`. Driven through the real
+// Update/View seam so it gates the wiring, not just the helper.
+func TestTUIDetailMilestoneBlock(t *testing.T) {
+	now := time.Now()
+	milestoneRun := apitypes.RunDTO{ID: "77777777-1111", Status: "running",
+		IssueTitle: "structured run",
+		Milestones: []apitypes.Milestone{
+			{ID: "m1", Title: "Alpha"}, {ID: "m2", Title: "Beta"},
+			{ID: "m3", Title: "Gamma"}, {ID: "m4", Title: "Delta"},
+		},
+		MilestonesCompleted:  []string{"m1", "m2"},
+		MilestonesInProgress: []string{"m3"},
+	}
+	load := func(run apitypes.RunDTO) string {
+		m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+		next, _ := m.Update(detailLoadedMsg{run: run,
+			msgs: []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)}})
+		return next.(tuiModel).View().Content
+	}
+
+	out := load(milestoneRun)
+	for _, want := range []string{"MILESTONES", "2/4", "✓", "◐", "○", "Alpha", "Gamma"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("milestone block missing %q\n%s", want, out)
+		}
+	}
+
+	// A run with no frozen list draws no block at all (back-compat: pre-#122 runs unchanged).
+	plain := load(apitypes.RunDTO{ID: "66666666-1111", Status: "running", IssueTitle: "no milestones"})
+	if strings.Contains(plain, "MILESTONES") {
+		t.Errorf("a non-milestone run drew a MILESTONES block\n%s", plain)
+	}
+
+	// Nothing reported → "–/N", never "0/N" (which reads as failure).
+	fresh := milestoneRun
+	fresh.MilestonesCompleted, fresh.MilestonesInProgress = nil, nil
+	if got := load(fresh); !strings.Contains(got, "–/4") {
+		t.Errorf("a run that reported nothing should show –/4, not 0/4\n%s", got)
+	}
+
+	// A milestone run with NO activity yet (queued / just-claimed → no lanes) must STILL show
+	// the block: the crew rail's no-lanes path appends it too. Regression guard — a duplicated
+	// early return once made that branch dead, so a milestone run showed no block before its
+	// first frame. `load` seeds a frame, so this case loads with none.
+	noAct := tuiTestModel(t, &uzicli.FakeClient{}, milestoneRun.ID)
+	nextNA, _ := noAct.Update(detailLoadedMsg{run: milestoneRun})
+	na := nextNA.(tuiModel).View().Content
+	if !strings.Contains(na, "MILESTONES") || !strings.Contains(na, "no activity yet") {
+		t.Errorf("a milestone run with no activity yet should show the block AND '(no activity yet)'\n%s", na)
+	}
+}
+
+// The run viewer fills the full terminal height (issue #379): the two-pane body and the pane
+// divider beside it reach the footer even when the transcript is shorter than the viewport, so
+// a tall terminal shows no dead space below the content. Rendered rows == the terminal height,
+// and the divider extends down most of the frame rather than stopping at the last content line.
+func TestTUIDetailFillsHeight(t *testing.T) {
+	now := time.Now()
+	runID := "55555555-1111"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	m.width, m.height = 100, 40
+	next, _ := m.Update(detailLoadedMsg{
+		run:  apitypes.RunDTO{ID: runID, Status: "running", IssueTitle: "short"},
+		msgs: []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "one short line", now)},
+	})
+	rows := strings.Split(next.(tuiModel).View().Content, "\n")
+	if len(rows) != 40 {
+		t.Fatalf("detail view rendered %d rows, want exactly the terminal height 40\n%s", len(rows), strings.Join(rows, "\n"))
+	}
+	div := 0
+	for _, r := range rows {
+		if strings.Contains(r, "│") {
+			div++
+		}
+	}
+	if div < 25 {
+		t.Errorf("pane divider on only %d rows; it should extend down the full body, not stop at the content\n%s", div, strings.Join(rows, "\n"))
+	}
+}
+
+// A tall crew rail (many lanes + the milestone block) must NOT push the footer off-screen
+// (issue #379 tui-ux finding 1): the two-pane body is clamped to the viewport, so the rail
+// truncates rather than overflowing past the footer, which carries the pane/esc/? controls.
+func TestTUIDetailFooterSurvivesTallRail(t *testing.T) {
+	now := time.Now()
+	runID := "44444444-1111"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	m.width, m.height = 100, 20
+	next, _ := m.Update(detailLoadedMsg{
+		run: apitypes.RunDTO{ID: runID, Status: "running", IssueTitle: "many lanes",
+			Milestones: []apitypes.Milestone{{ID: "m1", Title: "a"}, {ID: "m2", Title: "b"},
+				{ID: "m3", Title: "c"}, {ID: "m4", Title: "d"}},
+			MilestonesCompleted: []string{"m1"}, MilestonesInProgress: []string{"m2"}},
+		msgs: []apitypes.MessageDTO{
+			msgDTO(1, "text", "lead", "", "", "planning", now),
+			msgDTO(2, "text", "coder", "toolu_a", "impl", "a", now),
+			msgDTO(3, "text", "tester", "toolu_b", "sweep", "b", now),
+			msgDTO(4, "text", "reviewer", "toolu_c", "review", "c", now),
+			msgDTO(5, "text", "auditor", "toolu_d", "audit", "d", now),
+		},
+	})
+	out := next.(tuiModel).View().Content
+	if rows := strings.Split(out, "\n"); len(rows) > 20 {
+		t.Fatalf("detail rendered %d rows at height 20; a tall rail must clamp, not overflow\n%s", len(rows), out)
+	}
+	// The footer labels are per-token SGR spans, so "esc back" is not one substring; " back"
+	// and " keys" each sit inside a single faint span and are footer-only here.
+	if !strings.Contains(out, "back") || !strings.Contains(out, "keys") {
+		t.Errorf("footer (esc back / ? keys) missing — a tall crew rail pushed it off-screen\n%s", out)
+	}
+}
+
+// At a narrow board width the MILE column is dropped and no row overflows the terminal edge,
+// so the trailing judge marker keeps its full text instead of being clipped (issue #379 tui-ux
+// finding 2: the 8-col MILE tax pushed marker rows past the edge at 80 cols).
+func TestTUIBoardRowsFitNarrowWidth(t *testing.T) {
+	issues := "issues"
+	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "completed",
+			IssueTitle: "Migrate per-user secrets into the vault hierarchy"}, JudgeVerdict: &issues, JudgeTodoCount: 3},
+		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "running", IssueTitle: "structured",
+			Milestones:          []apitypes.Milestone{{ID: "m1"}, {ID: "m2"}, {ID: "m3"}, {ID: "m4"}},
+			MilestonesCompleted: []string{"m1", "m2"}}},
+	}}
+	m := tuiTestModel(t, fake, "")
+	m.width, m.height = 80, 34
+	out := func() string {
+		next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
+		return next.(tuiModel).View().Content
+	}()
+	for _, r := range strings.Split(out, "\n") {
+		if w := visualWidth(r); w > 80 {
+			t.Errorf("board row %d cols wide at width 80 (overflows the edge): %q", w, r)
+		}
+	}
+	if !strings.Contains(out, "issues · 3") {
+		t.Errorf("judge marker 'issues · 3' was clipped at width 80\n%s", out)
+	}
+	if strings.Contains(out, "MILE") {
+		t.Errorf("MILE column should be hidden below boardMileMinWidth (width 80)\n%s", out)
+	}
+	// At a wide width the column returns.
+	m.width = 120
+	if wide := func() string {
+		next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
+		return next.(tuiModel).View().Content
+	}(); !strings.Contains(wide, "MILE") || !strings.Contains(wide, "M2/4") {
+		t.Errorf("MILE column should show at width 120\n%s", wide)
+	}
+}
+
+// The factory floor shows a compact M{done}/{total} badge on a milestone-structured run
+// (milestoneMarker, the web MilestoneBadge twin) and NOTHING on a run with no frozen list.
+// A run that reported nothing shows M–/N rather than M0/N.
+func TestTUIBoardMilestoneBadge(t *testing.T) {
+	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "running", IssueTitle: "structured",
+			Milestones:          []apitypes.Milestone{{ID: "m1"}, {ID: "m2"}, {ID: "m3"}, {ID: "m4"}},
+			MilestonesCompleted: []string{"m1", "m2"}}},
+		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "running", IssueTitle: "plain"}},
+		{RunDTO: apitypes.RunDTO{ID: "cccccccc-3", Kind: "issue", Status: "running", IssueTitle: "unreported",
+			Milestones: []apitypes.Milestone{{ID: "m1"}, {ID: "m2"}}}}, // nil completed ⇒ never reported
+	}}
+	m := tuiTestModel(t, fake, "")
+	next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
+	out := next.(tuiModel).View().Content
+
+	for _, want := range []string{"M2/4", "M–/2"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("board missing milestone badge %q\n%s", want, out)
+		}
+	}
+	// The plain run's row must carry no badge. It is the only row whose title is "plain",
+	// so assert no "M" pill is glued to it — a crude but sufficient check is that the badge
+	// count for a 0-milestone run never appears.
+	if strings.Contains(out, "M0/") {
+		t.Errorf("a run with no milestones should show no badge, not M0/*\n%s", out)
+	}
 }
 
 // M2: the board encodes run status as a colour chip + spine and a summary bar. Automatable

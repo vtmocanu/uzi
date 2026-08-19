@@ -97,6 +97,10 @@ var d7UntrustedFields = []string{
 	"AgentLabel",
 	"HealthReason",
 	"FailureReason",
+	// Milestone titles are repo/agent-authored free text drawn in the crew rail's
+	// milestone block (renderMilestones). apitypes.Milestone.Title is the wire field;
+	// the rail draws it through renderer.Plain.
+	"Title",
 	// OwnerEmail is forge-authored and shown on the admin board (PRD #325 M2, B1). It
 	// must be drawn only through a sanitizer (renderer.Plain); the clean-fixture
 	// screenshots cannot catch a raw draw, so this guard + the hostile-OwnerEmail render
