@@ -751,7 +751,18 @@ chmod 0755 "$RUNROOT/fake-devbox"
 # dormant for every other phase (the seed enables only group/repo, and no phase
 # clones repo2 until M5 enables the repo).
 for r in repo repo2; do
-  git init --bare -q "$RUNROOT/fakeremote/$r.git"
+  # --shared=0777 is LOAD-BEARING, not tidiness: this one bind-mounted bare is written
+  # by MORE THAN ONE uid (forge-fake's receive-pack as root over smart-HTTP, the worker
+  # as its own in-image uid over the local-path insteadOf push — the same multi-uid fact
+  # the teardown-rm comment above records). Without it, whichever uid first creates an
+  # objects/xx/ dir owns it 0755, and a later push by the OTHER uid whose object sha lands
+  # in that same dir fails: "unable to write file ./objects/xx/...: Permission denied ->
+  # unable to migrate objects to permanent storage", failing the push and the run. It is
+  # sha-prefix-dependent, so it flakes (green until a collision hits). sharedRepository
+  # makes every receive-pack create objects/ and refs/ dirs 0777, so any uid can add into
+  # a dir another uid created (object files stay 0444, but they are immutable and never
+  # rewritten, only added). Set at init so it governs the seed push and every push after.
+  git init --bare -q --shared=0777 "$RUNROOT/fakeremote/$r.git"
   git -C "$RUNROOT/fakeremote/$r.git" symbolic-ref HEAD refs/heads/main
   # Allow pushes over git smart-HTTP (the E2E_GIT_SMART_HTTP variant); a no-op for
   # the default local-path remote.
