@@ -153,9 +153,9 @@ issue onto the board first if you need it to be findable.
 
 A column with more cards than its cap renders only the cap; the rest sit
 behind a **`Show N more · N left`** button at the bottom of the column.
-Each click reveals one more page (up to 50) of cards, and an expanded
-column scrolls internally instead of growing the page. **Collapse** puts
-it back to the cap. The cap applies to every column, including **Closed**.
+Each click reveals one more page (up to 50) of cards; the column grows to
+fit and the whole page scrolls, rather than the column scrolling inside a
+fixed box. **Collapse** puts it back to the cap. The cap applies to every column, including **Closed**.
 Past a couple of pages of hidden remainder, a nudge suggests searching
 instead of paging through everything (the **Show more** button stays, so
 you can still page if you prefer).
