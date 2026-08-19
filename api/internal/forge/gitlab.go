@@ -455,6 +455,54 @@ func (g *gitLab) ListIssueLabelEvents(ctx context.Context, projectID, issueIID i
 	return out, nil
 }
 
+// ListIssueComments returns an issue's human comments, oldest-first (PRD #381).
+// GitLab's ListIssueNotes returns comments AND system notes in one list and
+// defaults to created_at DESC, so the driver asks for ascending order (OrderBy/
+// Sort) and filters out System notes (D2) — leaving only human comments in
+// oldest-first order (D8).
+func (g *gitLab) ListIssueComments(ctx context.Context, projectID, issueIID int64) ([]IssueComment, error) {
+	opt := &gitlab.ListIssueNotesOptions{
+		ListOptions: gitlab.ListOptions{Page: 1, PerPage: perPage},
+		OrderBy:     gitlab.Ptr("created_at"),
+		Sort:        gitlab.Ptr("asc"),
+	}
+	var out []IssueComment
+	page := 0
+	for {
+		page++
+		notes, resp, err := g.client.Notes.ListIssueNotes(projectID, issueIID, opt, gitlab.WithContext(ctx))
+		if err != nil {
+			return nil, g.redact.error(fmt.Errorf("gitlab: list issue comments: %w", err))
+		}
+		for _, n := range notes {
+			if n == nil || n.System {
+				continue
+			}
+			var createdAt time.Time
+			if n.CreatedAt != nil {
+				createdAt = *n.CreatedAt
+			}
+			out = append(out, IssueComment{
+				AuthorForgeUserID: n.Author.ID,
+				AuthorUsername:    n.Author.Username,
+				Body:              n.Body,
+				CreatedAt:         createdAt,
+			})
+		}
+		if len(out) > maxForgeItems {
+			return nil, g.redact.error(fmt.Errorf("gitlab: list issue comments: %w", forgePaginationCapErr("item", maxForgeItems)))
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		if page >= maxForgePages {
+			return nil, g.redact.error(fmt.Errorf("gitlab: list issue comments: %w", forgePaginationCapErr("page", maxForgePages)))
+		}
+		opt.Page = resp.NextPage
+	}
+	return out, nil
+}
+
 func (g *gitLab) CreateIssueNote(ctx context.Context, projectID, issueIID int64, body string) (IssueNote, error) {
 	note, _, err := g.client.Notes.CreateIssueNote(projectID, issueIID, &gitlab.CreateIssueNoteOptions{
 		Body: gitlab.Ptr(body),

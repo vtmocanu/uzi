@@ -242,6 +242,20 @@ type IssueNote struct {
 	Body string
 }
 
+// IssueComment is one human-authored comment on an issue, returned by
+// ListIssueComments oldest-first. It deliberately carries NO System/type field:
+// the GitLab driver drops system notes (D2), and the Forgejo/GitHub drivers read
+// human-only comment endpoints (their timeline/event notes live behind separate
+// endpoints uzi never calls), so the neutral type only ever represents a human
+// comment. Bodies are attacker-influenceable free text (same untrusted class as
+// Issue.Description).
+type IssueComment struct {
+	AuthorForgeUserID int64  // stable forge user id of the comment author
+	AuthorUsername    string // author login, may be empty
+	Body              string // comment body (untrusted)
+	CreatedAt         time.Time
+}
+
 // MR states as GitLab reports them on the single-MR GET. The MR-close watcher
 // (PRD #24) only acts on the opened↔closed edges; merged and locked are recorded
 // but never move a card (a merge closes the issue via `Closes #N`, which the
@@ -404,6 +418,14 @@ type Forge interface {
 	// uses it to attribute the autopilot label to the human who added it (PRD #19
 	// Decision 3). No caller until the autopilot-trigger milestone.
 	ListIssueLabelEvents(ctx context.Context, projectID, issueIID int64) ([]LabelEvent, error)
+	// ListIssueComments returns the issue's HUMAN comments, oldest first,
+	// paginated internally and bounded by the shared forge sanity ceilings
+	// (maxForgeItems/maxForgePages) — no per-call limit (PRD #381 D4; the size
+	// bound is an assembly concern, not the driver's). Each driver filters out
+	// forge system/timeline notes (D2) and normalizes ordering to oldest-first
+	// (D8). Bodies are untrusted free text. AuthorForgeUserID lets the caller drop
+	// uzi's own bot-authored comments (D1). No caller until PRD #381's plumbing.
+	ListIssueComments(ctx context.Context, projectID, issueIID int64) ([]IssueComment, error)
 	// CreateIssueNote posts a comment on an issue and returns it. Autopilot uses
 	// it to surface an outcome — no eligible user, a run failure, or the success MR
 	// link — back on the forge so a forge-only user is never left waiting (PRD #19

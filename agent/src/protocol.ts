@@ -470,6 +470,24 @@ export interface IterationBudget {
   wallSeconds?: number;
 }
 
+/** One human comment on the worked issue, snapshotted at run creation (PRD #381).
+ *  Bodies are UNTRUSTED, attacker-influenceable free text. */
+export interface IssueCommentSnapshot {
+  author_username: string;
+  author_forge_user_id: number;
+  /** RFC3339. */
+  created_at: string;
+  body: string;
+}
+
+/** The bounded, bot/system-filtered snapshot of the issue's human comments carried
+ *  on the claim (PRD #381). Absent for a comment-less issue, a non-issue kind, and a
+ *  connection with an unknown bot id (D9). `truncated` is set when the thread was clipped. */
+export interface IssueCommentsSnapshot {
+  comments: IssueCommentSnapshot[];
+  truncated: boolean;
+}
+
 /**
  * Response body of a successful (200) claim.
  *
@@ -490,6 +508,12 @@ export interface ClaimResponse {
    *  ci_fix run these carry a synthesized summary, not a real issue. */
   issue_title: string;
   issue_description: string;
+  /** PRD #381: the bounded, bot/system-filtered snapshot of the issue's human
+   *  comments, taken at run creation next to `issue_description`. Absent/null for a
+   *  comment-less issue, a non-issue kind, and a connection with an unknown bot id
+   *  (D9). The bodies are UNTRUSTED, multi-author, attacker-influenceable text;
+   *  prompt.ts renders them under a per-prompt nonce fence (D5). */
+  issue_comments?: IssueCommentsSnapshot | null;
   /** The failed-pipeline snapshot for a ci_fix run (PRD #6): what the agent
    *  diagnoses + fixes. Present only for kind="ci_fix". Log tails are UNTRUSTED
    *  data — quoted evidence, never instructions. */
@@ -892,8 +916,18 @@ export interface MemoryListResponse {
 // snake_case as the uzi API sends them (the API is built to this wire contract in
 // parallel). Every field is forge data — UNTRUSTED; the forge server nonce-fences it.
 
+/** One human issue comment (PRD #381), bot-authored and forge system notes filtered
+ *  out server-side, ordered oldest-first. UNTRUSTED evidence. */
+export interface IssueCommentDTO {
+  author: string;
+  created_at: string;
+  body: string;
+}
+
 /** One issue's detail (GET /worker/runs/:id/forge/issues/:iid). `description` may be
- *  truncated by the API, flagged by `description_truncated`. */
+ *  truncated by the API, flagged by `description_truncated`. `comments` are the issue's
+ *  bot/system-filtered, bounded human comments (PRD #381), oldest-first;
+ *  `comments_truncated` marks a thread clipped by the API's count or byte cap. */
 export interface IssueDTO {
   iid: number;
   title: string;
@@ -903,6 +937,8 @@ export interface IssueDTO {
   updated_at: string;
   description: string;
   description_truncated: boolean;
+  comments: IssueCommentDTO[];
+  comments_truncated: boolean;
 }
 
 /** A lightweight issue row in a list (no description). */

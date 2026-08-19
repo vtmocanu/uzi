@@ -633,6 +633,179 @@ func TestWorkerForgeGetIssueDescriptionUnderCapUnchanged(t *testing.T) {
 	}
 }
 
+// ── PRD #381 M4: get_issue includes bot/system-filtered, bounded comments ────
+
+// forgeMockHandlerBot is forgeMockHandler with the connection's bot_forge_user_id
+// set, so the get_issue route can apply the D1 self-filter (a bot id of 0 exercises
+// the D9 fail-safe path instead).
+func forgeMockHandlerBot(t *testing.T, botForgeUserID int64, routes map[string]http.HandlerFunc) (*Handler, *httptest.Server) {
+	t.Helper()
+	box := newForgeBox(t)
+	mux := http.NewServeMux()
+	for pattern, h := range routes {
+		mux.HandleFunc(pattern, h)
+	}
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	sealed, err := box.Seal([]byte("glpat-fake-forge-token-abcdef123456")) //gitleaks:allow fake fixture PAT (literal "fake"), sealed into a throwaway test secretbox; never a real credential
+	if err != nil {
+		t.Fatalf("seal token: %v", err)
+	}
+	st := &forgeHandlerStore{
+		ownedRun: store.Run{ID: uuid.New(), UserID: uuid.New(), RepoID: pgtype.UUID{Bytes: uuid.New(), Valid: true}},
+		connRow: store.GetRunForgeConnForWorkerRow{
+			ForgeProjectID:  forgeTestProjectID,
+			ForgeType:       "gitlab",
+			BaseUrl:         srv.URL,
+			TokenCiphertext: sealed,
+			BotForgeUserID:  botForgeUserID,
+		},
+	}
+	return newForgeHandler(t, st, box), srv
+}
+
+// noteJSON builds one GitLab issue-note object (the shape ListIssueNotes returns).
+func noteJSON(authorID int64, username, body, createdAt string, system bool) map[string]any {
+	return map[string]any{
+		"id":         authorID*10 + 1,
+		"body":       body,
+		"system":     system,
+		"created_at": createdAt,
+		"author":     map[string]any{"id": authorID, "username": username},
+	}
+}
+
+// issueAndNotesRoutes serves the get_issue endpoint plus its notes list for iid 11.
+func issueAndNotesRoutes(notes []map[string]any) map[string]http.HandlerFunc {
+	return map[string]http.HandlerFunc{
+		"/api/v4/projects/4242/issues/11": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": 1001, "iid": 11, "title": "t", "state": "opened",
+				"labels": []string{"PRD"}, "description": "d", "author": map[string]any{"username": "alice"},
+				"web_url": "https://gitlab.example.com/grp/repo/-/issues/11",
+			})
+		},
+		"/api/v4/projects/4242/issues/11/notes": func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("X-Next-Page", "")
+			_ = json.NewEncoder(w).Encode(notes)
+		},
+	}
+}
+
+func getIssueDTO(t *testing.T, h *Handler) apitypes.ForgeIssueDTO {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	h.WorkerForgeGetIssue(rec, forgeReq(http.MethodGet, "/x", true,
+		map[string]string{"id": uuid.New().String(), "iid": "11"}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body %q", rec.Code, rec.Body.String())
+	}
+	var dto apitypes.ForgeIssueDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &dto); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return dto
+}
+
+// TestWorkerForgeGetIssueCommentsFilteredAndOrdered proves the get_issue route drops
+// uzi's own bot comment (D1, author id == the connection's bot id), keeps human ones
+// oldest-first (D8, driver-guaranteed), and — since the GitLab driver filters System
+// notes (D2) — a system note never reaches the DTO.
+func TestWorkerForgeGetIssueCommentsFilteredAndOrdered(t *testing.T) {
+	const botID = 777
+	h, _ := forgeMockHandlerBot(t, botID, issueAndNotesRoutes([]map[string]any{
+		noteJSON(10, "alice", "first human", "2026-07-01T09:00:00Z", false),
+		noteJSON(botID, "uzi-bot", "uzi status note", "2026-07-01T09:05:00Z", false),
+		noteJSON(0, "system", "changed the milestone", "2026-07-01T09:06:00Z", true),
+		noteJSON(20, "bob", "second human", "2026-07-01T09:10:00Z", false),
+	}))
+	dto := getIssueDTO(t, h)
+	if dto.CommentsTruncated {
+		t.Error("a short thread must not report comments_truncated")
+	}
+	if len(dto.Comments) != 2 {
+		t.Fatalf("want 2 human comments (bot + system dropped), got %d: %+v", len(dto.Comments), dto.Comments)
+	}
+	if dto.Comments[0].Body != "first human" || dto.Comments[1].Body != "second human" {
+		t.Errorf("comments must stay oldest-first human-only, got %+v", dto.Comments)
+	}
+	if dto.Comments[0].Author != "alice" || dto.Comments[1].Author != "bob" {
+		t.Errorf("comment authors = %q,%q, want alice,bob", dto.Comments[0].Author, dto.Comments[1].Author)
+	}
+	for _, c := range dto.Comments {
+		if c.Body == "uzi status note" {
+			t.Error("uzi's own bot comment leaked into the DTO (D1 filter failed)")
+		}
+	}
+}
+
+// TestWorkerForgeGetIssueCommentsZeroBotIDOmits proves D9: a connection with an
+// unknown (zero) bot id yields no comments at all rather than risk leaking uzi's own.
+func TestWorkerForgeGetIssueCommentsZeroBotIDOmits(t *testing.T) {
+	h, _ := forgeMockHandlerBot(t, 0, issueAndNotesRoutes([]map[string]any{
+		noteJSON(10, "alice", "a human comment", "2026-07-01T09:00:00Z", false),
+	}))
+	dto := getIssueDTO(t, h)
+	if len(dto.Comments) != 0 {
+		t.Fatalf("D9: a zero bot id must yield no comments, got %+v", dto.Comments)
+	}
+	if dto.CommentsTruncated {
+		t.Error("D9 omission is not a truncation")
+	}
+	// The empty slice must marshal as [] not null.
+	if !strings.Contains(getIssueRawBody(t, h), `"comments":[]`) {
+		t.Error("comments must marshal as [] when empty, not null")
+	}
+}
+
+func getIssueRawBody(t *testing.T, h *Handler) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	h.WorkerForgeGetIssue(rec, forgeReq(http.MethodGet, "/x", true,
+		map[string]string{"id": uuid.New().String(), "iid": "11"}))
+	return rec.Body.String()
+}
+
+// TestWorkerForgeGetIssueCommentsByteCapTruncates proves the get_issue route applies
+// its OWN byte cap: an over-cap thread keeps the newest content and sets
+// comments_truncated, dropping the oldest.
+func TestWorkerForgeGetIssueCommentsByteCapTruncates(t *testing.T) {
+	const botID = 777
+	big := strings.Repeat("x", MaxForgeBodyBytes)
+	h, _ := forgeMockHandlerBot(t, botID, issueAndNotesRoutes([]map[string]any{
+		noteJSON(10, "alice", "OLDEST-dropped-"+big, "2026-07-01T09:00:00Z", false),
+		noteJSON(20, "bob", "NEWEST-kept", "2026-07-01T09:10:00Z", false),
+	}))
+	dto := getIssueDTO(t, h)
+	if !dto.CommentsTruncated {
+		t.Fatal("an over-cap thread must set comments_truncated=true")
+	}
+	if len(dto.Comments) != 1 || dto.Comments[0].Body != "NEWEST-kept" {
+		t.Fatalf("byte cap must keep the newest comment only, got %+v", dto.Comments)
+	}
+}
+
+// TestWorkerForgeGetIssueCommentsReadFailureIsBestEffort proves a comments read
+// failure does NOT fail get_issue: the description still reaches the agent and the
+// comment list is empty. The notes route 500s; the issue route succeeds.
+func TestWorkerForgeGetIssueCommentsReadFailureIsBestEffort(t *testing.T) {
+	const botID = 777
+	routes := issueAndNotesRoutes(nil)
+	routes["/api/v4/projects/4242/issues/11/notes"] = func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{"message": "boom"})
+	}
+	h, _ := forgeMockHandlerBot(t, botID, routes)
+	dto := getIssueDTO(t, h)
+	if dto.Description != "d" {
+		t.Errorf("description must still reach the agent on a comments read failure, got %q", dto.Description)
+	}
+	if len(dto.Comments) != 0 || dto.CommentsTruncated {
+		t.Errorf("a comments read failure returns an empty, non-truncated comment list, got %+v tr=%v", dto.Comments, dto.CommentsTruncated)
+	}
+}
+
 // ── Item 9: DTOs carry no forge coordinates (SC-3) ───────────────────────────
 
 // TestWorkerForgeDTOsHaveNoCoordinates asserts get_issue, get_merge_request, and

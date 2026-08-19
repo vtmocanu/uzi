@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // wireContractFixture is the single shared golden file both sides validate
@@ -47,16 +48,33 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 		IssueIID:         i64ptr(42),
 		IssueTitle:       "Extend the pipeline",
 		IssueDescription: "PRD: add a job",
-		Status:           "claimed",
-		Branch:           strptr("agent/issue-42"),
-		SessionID:        strptr("sess-abc"),
-		LastSeq:          7,
-		IterationCount:   1,
-		RequeueCount:     0,
-		PlanMd:           strptr("# Plan\n"),
-		AutoApprove:      true, // PRD #19 autopilot; part of the same claim shape
-		WaitOnLimit:      true, // PRD #35 Decision 7: the run's usage-limit opt-in
-		PlanApproved:     true,
+		// PRD #381: the bounded, bot-filtered snapshot of the issue's HUMAN comments
+		// rides the claim so the worker sees the discussion, not just the description.
+		// NON-EMPTY on purpose (Truncated:true, one real comment) — an empty/absent
+		// snapshot here would agree with a producer that dropped the field, the same
+		// "wired vs present-and-nil" reason the values above carry non-default. The
+		// timestamp is FIXED so the golden stays byte-stable.
+		IssueComments: &IssueCommentsSnapshot{
+			Comments: []IssueCommentSnapshot{
+				{
+					AuthorUsername:    "carol",
+					AuthorForgeUserID: 42,
+					CreatedAt:         time.Date(2026, 7, 4, 9, 0, 0, 0, time.UTC),
+					Body:              "please guard on Valid",
+				},
+			},
+			Truncated: true,
+		},
+		Status:         "claimed",
+		Branch:         strptr("agent/issue-42"),
+		SessionID:      strptr("sess-abc"),
+		LastSeq:        7,
+		IterationCount: 1,
+		RequeueCount:   0,
+		PlanMd:         strptr("# Plan\n"),
+		AutoApprove:    true, // PRD #19 autopilot; part of the same claim shape
+		WaitOnLimit:    true, // PRD #35 Decision 7: the run's usage-limit opt-in
+		PlanApproved:   true,
 		// PRD #209: plan_source rides every claim (NOT NULL, no omitempty). "seeded"
 		// here makes this a coherent seeded-run claim — approved, no session — and is a
 		// NON-DEFAULT value for the same "wired vs present-and-zero" reason the booleans

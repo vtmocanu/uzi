@@ -376,6 +376,43 @@ func TestGitHubListIssueLabelEvents(t *testing.T) {
 	}
 }
 
+// TestGitHubListIssueComments pins PRD #381 M1 for GitHub: a two-comment response
+// maps to two neutral IssueComments in oldest-first order (GitHub's issue-comments
+// endpoint is human-only and created-ASC by default) with author id/login/body.
+func TestGitHubListIssueComments(t *testing.T) {
+	older := time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC)
+	newer := time.Date(2026, 8, 1, 11, 0, 0, 0, time.UTC)
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/issues/8/comments": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"id": 601, "body": "please guard on Valid", "created_at": older.Format(time.RFC3339), "user": map[string]any{"id": 42, "login": "carol"}},
+				{"id": 602, "body": "and revise the existing test", "created_at": newer.Format(time.RFC3339), "user": map[string]any{"id": 43, "login": "dave"}},
+			})
+		},
+	})
+	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+
+	comments, err := d.ListIssueComments(context.Background(), 7, 8)
+	if err != nil {
+		t.Fatalf("ListIssueComments: %v", err)
+	}
+	if len(comments) != 2 {
+		t.Fatalf("expected 2 comments, got %d: %+v", len(comments), comments)
+	}
+	if comments[0].AuthorForgeUserID != 42 || comments[0].AuthorUsername != "carol" || comments[0].Body != "please guard on Valid" {
+		t.Fatalf("unexpected first comment: %+v", comments[0])
+	}
+	if !comments[0].CreatedAt.Equal(older) {
+		t.Errorf("created_at not carried: %v", comments[0].CreatedAt)
+	}
+	if comments[1].AuthorUsername != "dave" || comments[1].Body != "and revise the existing test" {
+		t.Fatalf("unexpected second comment: %+v", comments[1])
+	}
+	if !comments[0].CreatedAt.Before(comments[1].CreatedAt) {
+		t.Errorf("comments not oldest-first: %v then %v", comments[0].CreatedAt, comments[1].CreatedAt)
+	}
+}
+
 // TestGitHubProjectRole pins item-6: repo permissions → Role, and the member
 // derivation.
 func TestGitHubProjectRole(t *testing.T) {

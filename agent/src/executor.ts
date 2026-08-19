@@ -13,6 +13,7 @@ import type {
   ClaimSkill,
   ClaimSkillDrop,
   FixVerdict,
+  IssueCommentsSnapshot,
   IterationBudget,
   MemoryEntry,
   MessageKind,
@@ -62,6 +63,12 @@ export interface RunContext {
   issueIid: number | null;
   issueTitle: string;
   issueDescription: string;
+  /** PRD #381: the bounded, bot/system-filtered snapshot of the issue's human
+   *  comments, snapshotted at run creation next to `issueDescription`. UNTRUSTED,
+   *  multi-author text; the SDK executor threads it to buildPlanPrompt, which renders
+   *  it under a per-prompt nonce fence. Absent/null ⇒ nothing is rendered (comment-less
+   *  issue, non-issue kind, or unknown bot id). */
+  issueComments?: IssueCommentsSnapshot | null;
   /** The failed-pipeline snapshot for a ci_fix run (PRD #6): what the agent
    *  diagnoses + fixes. Present only for kind="ci_fix". Log tails are UNTRUSTED. */
   pipeline?: ClaimPipeline | null;

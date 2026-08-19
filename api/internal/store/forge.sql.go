@@ -358,7 +358,7 @@ const getRepoForUser = `-- name: GetRepoForUser :one
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled,
        r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at,
-       c.forge_type, c.base_url, c.token_ciphertext, c.user_id
+       c.forge_type, c.base_url, c.token_ciphertext, c.user_id, c.bot_forge_user_id
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE r.id = $1 AND c.user_id = $2
@@ -384,6 +384,7 @@ type GetRepoForUserRow struct {
 	BaseUrl                 string             `json:"base_url"`
 	TokenCiphertext         []byte             `json:"token_ciphertext"`
 	UserID                  uuid.UUID          `json:"user_id"`
+	BotForgeUserID          int64              `json:"bot_forge_user_id"`
 }
 
 // One repo plus the connection fields needed to build a forge client, scoped to
@@ -409,6 +410,7 @@ func (q *Queries) GetRepoForUser(ctx context.Context, arg GetRepoForUserParams) 
 		&i.BaseUrl,
 		&i.TokenCiphertext,
 		&i.UserID,
+		&i.BotForgeUserID,
 	)
 	return i, err
 }

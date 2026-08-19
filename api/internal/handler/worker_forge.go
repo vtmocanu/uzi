@@ -133,6 +133,17 @@ func (h *Handler) WorkerForgeGetIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	desc, truncated := truncateForgeBody(issue.Description)
+	// Fetch the issue's comments best-effort: a comments read failure must NOT fail
+	// the whole get_issue (D3 freshness is a bonus over the description). Log the
+	// (already PAT-redacted) driver error and return an empty comment list so the
+	// description still reaches the agent.
+	var comments []apitypes.ForgeIssueCommentDTO
+	var commentsTruncated bool
+	if raw, cerr := f.ListIssueComments(r.Context(), conn.ForgeProjectID, iid); cerr != nil {
+		slog.Error("worker forge list issue comments", "error", cerr) // already PAT-redacted by the driver
+	} else {
+		comments, commentsTruncated = assembleForgeIssueComments(raw, conn.BotForgeUserID)
+	}
 	httpx.JSON(w, http.StatusOK, apitypes.ForgeIssueDTO{
 		IID:                  issue.IID,
 		Title:                issue.Title,
@@ -142,7 +153,96 @@ func (h *Handler) WorkerForgeGetIssue(w http.ResponseWriter, r *http.Request) {
 		UpdatedAt:            rfc3339(issue.UpdatedAt),
 		Description:          desc,
 		DescriptionTruncated: truncated,
+		Comments:             nonNilForgeComments(comments),
+		CommentsTruncated:    commentsTruncated,
 	})
+}
+
+// maxForgeCommentItems bounds the number of comments the single-issue GET returns,
+// independent of the byte cap — a flood of tiny comments must not blow up the payload.
+const maxForgeCommentItems = 200
+
+// nonNilForgeComments returns c, or an empty non-nil slice when c is nil, so the
+// comments field marshals as [] rather than null (matching the nonNilStrings
+// convention).
+func nonNilForgeComments(c []apitypes.ForgeIssueCommentDTO) []apitypes.ForgeIssueCommentDTO {
+	if c == nil {
+		return []apitypes.ForgeIssueCommentDTO{}
+	}
+	return c
+}
+
+// assembleForgeIssueComments applies the get_issue route's OWN bound to the driver's
+// complete, oldest-first, system-free comment list: D1 drop uzi's own bot comments
+// (author id == botForgeUserID), D9 fail-safe (botForgeUserID==0 ⇒ return none rather
+// than risk leaking uzi's own comments), then keep the NEWEST maxForgeCommentItems and
+// cap total body bytes at MaxForgeBodyBytes over that tail, setting truncated when it
+// clips. Output stays oldest-first. Mirrors workersvc's M2b cap semantics but is kept
+// self-contained in the handler package (no workersvc import).
+func assembleForgeIssueComments(in []forge.IssueComment, botForgeUserID int64) ([]apitypes.ForgeIssueCommentDTO, bool) {
+	// D9 fail-safe: an unknown/zero bot id cannot power the D1 self-filter, so omit
+	// comments entirely rather than risk exposing uzi's own comments.
+	if botForgeUserID == 0 {
+		return nil, false
+	}
+
+	// D1 self-filter: drop every comment uzi's own bot authored, preserving order.
+	kept := make([]forge.IssueComment, 0, len(in))
+	for _, c := range in {
+		if c.AuthorForgeUserID == botForgeUserID {
+			continue
+		}
+		kept = append(kept, c)
+	}
+	if len(kept) == 0 {
+		return nil, false
+	}
+
+	truncated := false
+
+	// Count cap over the NEWEST tail, applied before the byte cap so a flood of tiny
+	// comments cannot retain an unbounded number of entries (metadata amplification).
+	if len(kept) > maxForgeCommentItems {
+		kept = kept[len(kept)-maxForgeCommentItems:]
+		truncated = true
+	}
+
+	// Byte cap over the NEWEST tail. Sum the kept bodies; if they fit, keep all.
+	total := 0
+	for _, c := range kept {
+		total += len(c.Body)
+	}
+	if total > MaxForgeBodyBytes {
+		truncated = true
+		// Walk from the newest (last) backward, accumulating until adding the
+		// next-older body would exceed the cap; the retained window is [start:].
+		// Always keep at least the single newest comment.
+		start := len(kept) - 1
+		sum := len(kept[start].Body)
+		for i := len(kept) - 2; i >= 0; i-- {
+			if sum+len(kept[i].Body) > MaxForgeBodyBytes {
+				break
+			}
+			sum += len(kept[i].Body)
+			start = i
+		}
+		kept = kept[start:]
+		// If the single newest comment's body alone exceeds the cap, truncate it
+		// byte-safe on a UTF-8 rune boundary (mirroring truncateForgeBody).
+		if len(kept) == 1 && len(kept[0].Body) > MaxForgeBodyBytes {
+			kept[0].Body, _ = truncateForgeBody(kept[0].Body)
+		}
+	}
+
+	out := make([]apitypes.ForgeIssueCommentDTO, 0, len(kept))
+	for _, c := range kept {
+		out = append(out, apitypes.ForgeIssueCommentDTO{
+			Author:    c.AuthorUsername,
+			CreatedAt: rfc3339(c.CreatedAt),
+			Body:      c.Body,
+		})
+	}
+	return out, truncated
 }
 
 // WorkerForgeListIssues reads a capped, filtered issue list from the run's forge.

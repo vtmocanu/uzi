@@ -340,8 +340,14 @@ WHERE status = 'online'
 -- omitted param silently opts OUT of the fail-on-divergence behaviour — the exact
 -- go-build-green trap the block above describes. planned_base_commit is nullable
 -- (sqlc.narg): a run with no planned commit stores NULL and the worker proceeds silently.
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model)
+--
+-- 🔴 issue_comments (PRD #381 D7) is named here for the SAME reason: it is another
+-- silently-omittable snapshot param. It is sqlc.narg (nullable jsonb) — an
+-- issue-less kind, a comment-less issue, and a connection with an unknown bot id
+-- (D9) all store NULL — so an omitted Go struct field would compile green and
+-- silently ship NULL for every run. The fetch is centralized in createRun.
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb)
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -2045,7 +2051,7 @@ WHERE r.id = @run_id;
 -- repo-less run has no repos row and returns no row too; the service checks repo_id
 -- off the owned run FIRST so it can tell that apart and answer 409.
 SELECT rp.forge_project_id,
-       c.forge_type, c.base_url, c.token_ciphertext
+       c.forge_type, c.base_url, c.token_ciphertext, c.bot_forge_user_id
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id

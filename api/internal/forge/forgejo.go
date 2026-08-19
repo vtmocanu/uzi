@@ -900,6 +900,54 @@ func (f *forgejo) ListIssueLabelEvents(ctx context.Context, projectID, issueIID 
 	return out, nil
 }
 
+// ListIssueComments returns an issue's human comments, oldest-first (PRD #381).
+// Gitea's ListIssueComments endpoint returns human comments only — system/timeline
+// events live on a separate endpoint — so no in-SDK System filter exists or is
+// needed (D2), and the list is already oldest-first (D8). Poster can be nil for a
+// comment imported without a mapped user; guard it.
+func (f *forgejo) ListIssueComments(ctx context.Context, projectID, issueIID int64) ([]IssueComment, error) {
+	c, err := f.newClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	slug, err := f.repoSlugFor(c, projectID)
+	if err != nil {
+		return nil, err
+	}
+	opt := gitea.ListIssueCommentOptions{ListOptions: gitea.ListOptions{Page: 1, PageSize: forgejoPerPage}}
+	var out []IssueComment
+	page := 0
+	for {
+		page++
+		comments, resp, err := c.ListIssueComments(slug.owner, slug.repo, issueIID, opt)
+		if err != nil {
+			return nil, f.redact.error(fmt.Errorf("forgejo: list issue comments: %w", err))
+		}
+		for _, cm := range comments {
+			if cm == nil {
+				continue
+			}
+			ic := IssueComment{Body: cm.Body, CreatedAt: cm.Created}
+			if cm.Poster != nil {
+				ic.AuthorForgeUserID = cm.Poster.ID
+				ic.AuthorUsername = cm.Poster.UserName
+			}
+			out = append(out, ic)
+		}
+		if len(out) > maxForgeItems {
+			return nil, f.redact.error(fmt.Errorf("forgejo: list issue comments: %w", forgePaginationCapErr("item", maxForgeItems)))
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		if page >= maxForgePages {
+			return nil, f.redact.error(fmt.Errorf("forgejo: list issue comments: %w", forgePaginationCapErr("page", maxForgePages)))
+		}
+		opt.Page = resp.NextPage
+	}
+	return out, nil
+}
+
 // forgejoLabelAction decodes Forgejo's UNDOCUMENTED label-event convention (R6):
 // a label add records body == "1" (issue_label.go: Content "1"), a remove records
 // body == "" (deleteIssueLabel omits Content). Both verified live on 16.0.0. This

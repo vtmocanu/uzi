@@ -382,6 +382,7 @@ type Run struct {
 	SummaryIntent         pgtype.Text        `json:"summary_intent"`
 	SummaryPlan           pgtype.Text        `json:"summary_plan"`
 	SummaryDeltas         []byte             `json:"summary_deltas"`
+	IssueComments         []byte             `json:"issue_comments"`
 }
 
 type RunMessage struct {

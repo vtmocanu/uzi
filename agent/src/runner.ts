@@ -701,6 +701,10 @@ export class RunRunner {
         issueIid: claim.issue_iid,
         issueTitle: claim.issue_title,
         issueDescription: claim.issue_description,
+        // PRD #381: carry the snapshotted issue-comment set onto the ctx; the SDK
+        // executor threads it to buildPlanPrompt for nonce-fenced rendering. Absent/
+        // null ⇒ nothing is rendered.
+        issueComments: claim.issue_comments,
         pipeline: claim.pipeline,
         worktreePath: runnerClone.path,
         branch: runnerClone.branch,
