@@ -449,7 +449,7 @@ jobs:
       agent: ${{ steps.filter.outputs.agent }}
     steps:
       - uses: actions/checkout@v5
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@v4
         id: filter
         with:
           filters: |
@@ -471,8 +471,8 @@ jobs:
     if: needs.changes.outputs.api == 'true'
     steps:
       - uses: actions/checkout@v5
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
         with:
           context: api
           file: api/Dockerfile
@@ -487,8 +487,8 @@ jobs:
     if: needs.changes.outputs.web == 'true'
     steps:
       - uses: actions/checkout@v5
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
         with:
           context: .
           file: web/Dockerfile
@@ -504,8 +504,8 @@ jobs:
     if: needs.changes.outputs.web == 'true'
     steps:
       - uses: actions/checkout@v5
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
         with:
           context: .
           file: web/Dockerfile.mock
@@ -519,8 +519,8 @@ jobs:
     if: needs.changes.outputs.controller == 'true'
     steps:
       - uses: actions/checkout@v5
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
         with:
           context: controller
           file: controller/Dockerfile
@@ -542,8 +542,8 @@ jobs:
         template: [base, jvm]
     steps:
       - uses: actions/checkout@v5
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
         with:
           context: .
           file: agent/templates/${{ matrix.template }}/Dockerfile
