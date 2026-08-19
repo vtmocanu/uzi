@@ -13,7 +13,7 @@ require (
 	charm.land/lipgloss/v2 v2.0.5
 	code.gitea.io/sdk/gitea v0.25.1
 	github.com/BurntSushi/toml v1.6.0
-	github.com/charmbracelet/x/ansi v0.11.7
+	github.com/charmbracelet/x/ansi v0.11.8
 	github.com/coder/websocket v1.8.15
 	github.com/coreos/go-oidc/v3 v3.14.1
 	github.com/go-chi/chi/v5 v5.3.1
