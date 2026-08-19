@@ -9,10 +9,10 @@
 // (`api/internal/forgesvc/service.go`), then adds two defense-in-depth
 // containment checks (prefix + realpath) on top of the ported validator.
 //
-// Design mirrors Go's `prdpath.Links`: DETECT a candidate span liberally in
-// prose, EXTRACT the `prds/…*.md` core (strip the optional blob-URL prefix and
-// the `#`/`?` suffix), then VALIDATE the whole core. The detector alone is NOT a
-// validator — `[\w.-]` matches `..`, so validation is what rejects traversal.
+// Design mirrors Go's `prdpath.Links`: DETECT the `prds/…*.md` core directly in
+// prose (a blob-URL prefix or `#`/`?` suffix falls outside the match by
+// construction), then VALIDATE the whole core. The detector alone is NOT a
+// validator — its charset matches `..`, so validation is what rejects traversal.
 //
 // `resolvePrdInput` NEVER throws: every failure path returns the nulls fallback
 // so the caller falls back to issue title + body. Dependency-light: node
@@ -31,6 +31,14 @@ const EXT = ".md";
 /** Cap on bytes read from a resolved PRD file — a PRD is small; this stops a
  *  huge/hostile file from blowing the prompt or memory. */
 const MAX_PRD_BYTES = 256 * 1024;
+
+/** Cap on characters the PRD-link detector scans in the untrusted issue
+ *  description. A real issue's PRD link appears well within this, so bounding
+ *  the scan costs nothing real. Defense-in-depth: the core pattern is already
+ *  linear (no nested straddling quantifiers — see `PRD_LINK_RE`), so an attacker
+ *  cannot make the scan pathological, and this cap bounds cost even under a
+ *  future regex change. */
+const MAX_DESC_SCAN = 100_000;
 
 /** Minimal warn sink so this module stays dependency-light and testable; the
  *  real caller (M3c) passes the run's structured logger. */
@@ -99,27 +107,37 @@ export function validatePrdPath(p: string): boolean {
   return true;
 }
 
-// Detector for a PRD-path span in prose. Ported from `forgesvc.prdLinkRe`, made
-// tolerant of BOTH the GitLab `/-/blob/<ref>/` infix and the GitHub `/blob/<ref>/`
-// shape (this repo's canonical remote is GitHub). Shape:
-//   optional blob-URL prefix  (https://…/[-/]blob/<ref>/)
-//   then the core             (prds/…*.md)  -- captured in group 1
-//   then optional suffix      (#… or ?…)
-// `[\w.-]` matches `..`; detection is liberal, `validatePrdPath` is strict.
-const PRD_LINK_RE =
-  /(?:https?:\/\/\S+\/(?:-\/)?blob\/[^\s)]+\/)?(prds\/(?:[\w.-]+\/)*[\w.-]+\.md)(?:[#?][^\s)]*)?/gi;
+// Detector for a PRD-path core in prose. We match the `prds/…*.md` core
+// DIRECTLY rather than the blob URL around it: the core appears literally in the
+// text whether bare or inside a GitHub `/blob/<ref>/` or GitLab `/-/blob/<ref>/`
+// URL (`…/blob/main/prds/362-x.md` literally contains `prds/362-x.md`), and any
+// `#`/`?` suffix falls outside the match by construction — so no prefix/suffix
+// stripping is needed. Matching the core directly avoids the nested straddling
+// greedy classes the old blob-prefix pattern carried (`\S+` … `blob/` …
+// `[^\s)]+`), which backtracked O(n²) on hostile input — a worker-DoS ReDoS on
+// this exact untrusted path (~1.1s blocked at 65k chars, ~64s at 500k). This
+// pattern has no quantifiers straddling a literal: `/`-delimited segments (`/`
+// is outside the charset) anchored by the `prds/` literal, so it scans
+// effectively linearly. The charset is `[A-Za-z0-9._-]` — the SAME per-segment
+// set `validatePrdPath` enforces (not `\w`, which is Unicode-wide) — so a
+// detected core aligns with the validator. Detection is still liberal (the
+// charset matches `..`); `validatePrdPath` is what rejects traversal.
+const PRD_LINK_RE = /prds\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.md/g;
 
 /**
- * Finds the first VALID `prds/…*.md` core in `text`. Detects candidate spans
- * liberally, extracts the core (group 1 — the blob-URL prefix and `#`/`?` suffix
- * are outside it by construction), and returns the first core that passes
+ * Finds the first VALID `prds/…*.md` core in `text`. Matches candidate cores
+ * directly (the whole match IS the core — a blob-URL prefix and `#`/`?` suffix
+ * fall outside it by construction), scanning at most {@link MAX_DESC_SCAN}
+ * characters of the untrusted input, and returns the first core that passes
  * `validatePrdPath`. Returns null when none is valid.
  */
 export function findValidPrdCore(text: string): string | null {
+  // Bound the untrusted scan (defense-in-depth; see MAX_DESC_SCAN).
+  const scanned = (text ?? "").slice(0, MAX_DESC_SCAN);
   // Fresh regex state per call (the shared literal carries the `g` flag).
   const re = new RegExp(PRD_LINK_RE.source, PRD_LINK_RE.flags);
-  for (const m of text.matchAll(re)) {
-    const core = m[1];
+  for (const m of scanned.matchAll(re)) {
+    const core = m[0];
     if (core && validatePrdPath(core)) return core;
   }
   return null;
