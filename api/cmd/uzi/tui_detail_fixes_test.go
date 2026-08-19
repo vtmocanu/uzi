@@ -239,8 +239,9 @@ func TestDetailCollapsibleCrewRevealsMilestones(t *testing.T) {
 	if !strings.Contains(collapsed, "MILESTONES") {
 		t.Errorf("collapsing the crew should reveal the MILESTONES block\n%s", collapsed)
 	}
-	if !strings.Contains(collapsed, "8 ▸") {
-		t.Errorf("collapsed rail should show the closed caret with the lane count (8 ▸)\n%s", collapsed)
+	// 8 real lanes plus the aggregated "all agents" lane the rail prepends = 9 rows.
+	if !strings.Contains(collapsed, "9 ▸") {
+		t.Errorf("collapsed rail should show the closed caret with the lane count (9 ▸)\n%s", collapsed)
 	}
 	if !strings.Contains(collapsed, "crew") {
 		t.Errorf("footer should carry the 'c crew' hint\n%s", collapsed)

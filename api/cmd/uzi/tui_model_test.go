@@ -361,8 +361,9 @@ func TestTUIDetailBuildsLanesFromReplayThenLiveFrames(t *testing.T) {
 	})
 	m = next.(tuiModel)
 
-	if len(m.detail.lanes) != 2 {
-		t.Fatalf("replay produced %d lanes, want 2", len(m.detail.lanes))
+	// 2 real lanes (lead, coder) plus the prepended aggregated "all agents" lane = 3.
+	if len(m.detail.lanes) != 3 {
+		t.Fatalf("replay produced %d lanes, want 3", len(m.detail.lanes))
 	}
 	out := m.View().Content
 	for _, want := range []string{"lead", "coder", "write the tests"} {
@@ -380,8 +381,9 @@ func TestTUIDetailBuildsLanesFromReplayThenLiveFrames(t *testing.T) {
 		Payload: json.RawMessage(`{"text":"testing"}`),
 	}}})
 	m = next.(tuiModel)
-	if len(m.detail.lanes) != 3 {
-		t.Fatalf("a live frame for a new invocation produced %d lanes, want 3", len(m.detail.lanes))
+	// 3 real lanes now (lead, coder, tester) plus the aggregated "all agents" lane = 4.
+	if len(m.detail.lanes) != 4 {
+		t.Fatalf("a live frame for a new invocation produced %d lanes, want 4", len(m.detail.lanes))
 	}
 }
 
@@ -532,7 +534,8 @@ func TestTUIDetailFocusPaneNavigation(t *testing.T) {
 		t.Error("moving agents did not reset the scroll")
 	}
 	m = press(t, m, "k") // wrap backwards past the first lane
-	if m.detail.laneIdx != 2 {
+	// 4 lanes now: the prepended "all agents" lane at 0, then lead/coder/tester, so the last is 3.
+	if m.detail.laneIdx != 3 {
 		t.Errorf("k did not wrap to the last lane, got %d", m.detail.laneIdx)
 	}
 
