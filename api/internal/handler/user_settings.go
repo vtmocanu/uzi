@@ -35,8 +35,9 @@ type userSettingsDTO struct {
 	SidebarTokenIds []string `json:"sidebar_token_ids"`
 }
 
-// userSettingsResponse reads both columns and writes the settings body, shared by
-// the GET and PUT handlers so the two responses never drift.
+// userSettingsResponse reads the user's settings row (one GetUserSettings query,
+// summary_model folded in) and writes the settings body, shared by the GET and PUT
+// handlers so the two responses never drift.
 func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, userID uuid.UUID) {
 	s, err := h.q.GetUserSettings(r.Context(), userID)
 	if err != nil {

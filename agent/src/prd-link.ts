@@ -146,6 +146,12 @@ function prdCoreNumber(core: string): number | null {
  * prds/100-old.md") BEFORE its own would otherwise resolve to the wrong PRD. With no
  * iid match (or no `preferIid`), it falls back to the FIRST valid core, so the common
  * single-link case and any non-conventional numbering are unchanged.
+ *
+ * This assumes the repo convention `prds/<iid>-slug.md`. In the narrow case where the
+ * issue's OWN PRD is misnamed (number != iid) AND another mentioned link's number
+ * coincidentally equals the iid, the preference resolves to that other link — a wrong
+ * pick the old first-valid pass avoided. Accepted: it is advisory-only (summary text,
+ * never implemented code), and the convention holds for essentially every real issue.
  */
 export function findValidPrdCore(
   text: string,
@@ -159,7 +165,8 @@ export function findValidPrdCore(
   for (const m of scanned.matchAll(re)) {
     const core = m[0];
     if (!core || !validatePrdPath(core)) continue;
-    // `!= null` covers both null (a non-issue run) and undefined (no hint).
+    // `!= null` covers both undefined (no hint) and null (an issue/undefined run whose
+    // issueIid is null); either way, no preference is applied.
     if (preferIid != null && prdCoreNumber(core) === preferIid) return core;
     if (firstValid === null) firstValid = core;
   }
