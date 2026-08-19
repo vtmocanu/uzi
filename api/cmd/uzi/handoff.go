@@ -1,0 +1,268 @@
+package main
+
+import (
+	"context"
+	"net/url"
+	"strings"
+
+	"github.com/spf13/cobra"
+
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
+)
+
+// newHandoffCmd builds `uzi handoff` (alias `task`): the CLI half of PRD #400's
+// ephemeral, MR-less task runs. The parent command's RunE is the CREATE action and
+// implements Decision 6's explicit, non-circular ordering:
+//
+//	(1) create the task run  -> receive its id and the server-named uzi/task/<id> branch
+//	(2) push local HEAD      -> to that branch, with the USER's own git credentials
+//	(3) dispatch the run     -> the moment the worker may claim it
+//
+// The push sits BETWEEN create and dispatch on purpose: the run is not claimable
+// until dispatch, so if the push fails we stop and never dispatch — the branch has no
+// seed content and the worker must not start. `uzi handoff rm <id>` deletes the
+// remote branch client-side (an --mr branch is exempt). Continuation is the EXISTING
+// `uzi run follow-up <id>`; watching is `uzi run get/logs --follow` and `uzi tui`.
+func newHandoffCmd(env Env, gf *globalFlags) *cobra.Command {
+	handoff := &cobra.Command{
+		Use:     "handoff",
+		Aliases: []string{"task"},
+		Short:   "Hand a throwaway task to uzi: push local HEAD, let the worker take it, pull the result",
+		Long: "Hand off a long-running, throwaway task to a uzi worker, agent-style. This command\n" +
+			"creates a task run, pushes your current HEAD to a server-named uzi/task/<id> branch\n" +
+			"with your own git credentials, and dispatches it; the worker commits onto that same\n" +
+			"branch, which you pull. No forge issue, no merge request (pass --mr to open one).\n\n" +
+			"Context comes from -m, or -f <file> ('-' for stdin), or piped stdin. The repo is\n" +
+			"auto-detected from the origin remote; pass --repo to override.\n\n" +
+			"The dispatch confirmation prints how to pull, watch, continue, and clean up the run.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runHandoffCreate(env, gf, cmd)
+		},
+	}
+	handoff.Flags().StringP("message", "m", "", "the task context/instruction (or use -f, or pipe it on stdin)")
+	handoff.Flags().StringP("file", "f", "", "read the task context from a file (or '-' for stdin)")
+	handoff.Flags().String("base", "", "branch the task from this ref instead of local HEAD (pushes <ref> as the seed)")
+	handoff.Flags().Bool("mr", false, "have the worker open a merge request for the branch (exempts it from 'uzi handoff rm')")
+	handoff.Flags().String("repo", "", "repo id to run against (overrides origin auto-detection; see 'uzi repo list')")
+
+	handoff.AddCommand(newHandoffRmCmd(env, gf))
+	return handoff
+}
+
+func runHandoffCreate(env Env, gf *globalFlags, cmd *cobra.Command) error {
+	msg, _ := cmd.Flags().GetString("message")
+	file, _ := cmd.Flags().GetString("file")
+	base, _ := cmd.Flags().GetString("base")
+	mr, _ := cmd.Flags().GetBool("mr")
+	repoFlag, _ := cmd.Flags().GetString("repo")
+
+	// Context: -m > -f (file, or '-' for stdin) > bare stdin (non-TTY).
+	context, err := resolveHandoffContext(env, msg, file)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(context) == "" {
+		return uzicli.Exitf(uzicli.ExitUsage, "a handoff needs context: pass -m <text>, -f <file>, or pipe it on stdin")
+	}
+
+	c, err := env.client(gf)
+	if err != nil {
+		return err
+	}
+
+	// Repo: --repo wins; otherwise auto-detect from origin. Resolving the repo can need
+	// a git call and an API call, so it happens before the create.
+	repoID, err := resolveHandoffRepo(env, cmd.Context(), c, repoFlag)
+	if err != nil {
+		return err
+	}
+
+	// (1) Create — receive the id and the server-named uzi/task/<id> branch.
+	run, err := c.CreateTaskRun(cmd.Context(), repoID, context, strings.TrimSpace(base), mr)
+	if err != nil {
+		return err
+	}
+	if run.Branch == nil || strings.TrimSpace(*run.Branch) == "" {
+		return uzicli.Exitf(uzicli.ExitGeneric, "task run %s was created without a branch (server contract error); nothing was pushed", run.ID)
+	}
+	branch := *run.Branch
+
+	// (2) Push — local HEAD (or --base) to the server-named branch, user's creds. The
+	// source ref is `base` when --base is set, else HEAD.
+	srcRef := "HEAD"
+	if b := strings.TrimSpace(base); b != "" {
+		srcRef = b
+	}
+	if _, err := env.Git(".", "push", "origin", srcRef+":refs/heads/"+branch); err != nil {
+		return uzicli.Exitf(uzicli.ExitGeneric,
+			"pushing %s to %s failed: %v\nthe task run %s was created but NOT dispatched, so no worker will claim it; clean it up with 'uzi handoff rm %s'",
+			srcRef, branch, err, run.ID, run.ID)
+	}
+
+	// (3) Dispatch — only now may the worker claim it.
+	dispatched, err := c.DispatchTaskRun(cmd.Context(), run.ID)
+	if err != nil {
+		return uzicli.Exitf(uzicli.ExitGeneric,
+			"dispatching task %s failed: %v\nlocal HEAD was pushed to %s but the run was not dispatched, so no worker will claim it; clean it up with 'uzi handoff rm %s'",
+			run.ID, err, branch, run.ID)
+	}
+
+	return renderHandoff(env, gf, dispatched, branch)
+}
+
+// resolveHandoffContext applies the -m > -f > bare-stdin precedence, reusing the
+// run.go helpers: readPlanFile for -f (file or '-'), resolveMessage for the bare
+// non-TTY stdin fallback.
+func resolveHandoffContext(env Env, msg, file string) (string, error) {
+	if strings.TrimSpace(msg) != "" {
+		return msg, nil
+	}
+	if strings.TrimSpace(file) != "" {
+		return readPlanFile(env, file)
+	}
+	return resolveMessage(env, ""), nil
+}
+
+// resolveHandoffRepo returns the repo id for the handoff. --repo takes precedence;
+// otherwise the origin remote URL is parsed to owner/namespace and matched against the
+// caller's repos by PathWithNamespace. Exactly one match resolves; zero or many is a
+// usage error naming --repo as the escape hatch.
+func resolveHandoffRepo(env Env, ctx context.Context, c uzicli.Client, repoFlag string) (string, error) {
+	if strings.TrimSpace(repoFlag) != "" {
+		return strings.TrimSpace(repoFlag), nil
+	}
+	origin, err := env.Git(".", "remote", "get-url", "origin")
+	if err != nil {
+		return "", uzicli.Exitf(uzicli.ExitUsage,
+			"not in a git repo with an 'origin' remote (%v); run from a checkout or pass --repo <id> (see 'uzi repo list')", err)
+	}
+	path := parseRepoPath(origin)
+	if path == "" {
+		return "", uzicli.Exitf(uzicli.ExitUsage,
+			"could not parse origin %q into an owner/repo path; pass --repo <id> (see 'uzi repo list')", origin)
+	}
+	repos, err := c.ListRepos(ctx)
+	if err != nil {
+		return "", err
+	}
+	var matches []apitypes.RepoDTO
+	for _, r := range repos {
+		if r.PathWithNamespace == path {
+			matches = append(matches, r)
+		}
+	}
+	switch len(matches) {
+	case 1:
+		return matches[0].ID, nil
+	case 0:
+		return "", uzicli.Exitf(uzicli.ExitUsage,
+			"could not match origin %s to a uzi repo; pass --repo <id> (see 'uzi repo list')", path)
+	default:
+		return "", uzicli.Exitf(uzicli.ExitUsage,
+			"origin %s is ambiguous — it matches %d uzi repos; pass --repo <id> to pick one (see 'uzi repo list')", path, len(matches))
+	}
+}
+
+// parseRepoPath extracts the owner/namespace/repo path from a git remote URL,
+// handling both the https form (`https://host/owner/repo(.git)`, including nested
+// groups) and the scp-like SSH form (`git@host:owner/repo(.git)`). The `.git` suffix
+// and any leading/trailing slashes are stripped. Returns "" if it cannot find a path.
+func parseRepoPath(remote string) string {
+	s := strings.TrimSpace(remote)
+	s = strings.TrimSuffix(s, ".git")
+	if s == "" {
+		return ""
+	}
+	if strings.Contains(s, "://") {
+		// URL form: scheme://[user@]host[:port]/owner/repo
+		if u, err := url.Parse(s); err == nil && u.Host != "" {
+			return strings.Trim(u.Path, "/")
+		}
+		return ""
+	}
+	// scp-like form: [user@]host:owner/repo — the path is everything after the FIRST
+	// colon (the host/port separator does not appear in this syntax).
+	if i := strings.Index(s, ":"); i >= 0 {
+		return strings.Trim(s[i+1:], "/")
+	}
+	return strings.Trim(s, "/")
+}
+
+// renderHandoff prints the dispatched task run. --json emits the run DTO (the agent
+// contract); the human render leads with the id and branch, then the pull hint and how
+// to watch/continue.
+func renderHandoff(env Env, gf *globalFlags, run apitypes.RunDTO, branch string) error {
+	p := env.printer(gf)
+	if p.Format == uzicli.FormatJSON {
+		return p.JSON(run)
+	}
+	if gf.quiet {
+		return nil
+	}
+	p.Printf("handoff dispatched: run %s on %s\n", run.ID, branch)
+	p.Printf("  pull it with:  git fetch origin %s && git switch %s\n", branch, branch)
+	p.Printf("  watch it with: uzi run get %s   (or: uzi run logs %s --follow, or: uzi tui)\n", run.ID, run.ID)
+	p.Printf("  send more:     uzi run follow-up %s -m \"...\"\n", run.ID)
+	if run.OpenMr {
+		p.Printf("  an MR will be opened for this branch; it is exempt from 'uzi handoff rm'\n")
+	} else {
+		p.Printf("  clean up with: uzi handoff rm %s\n", run.ID)
+	}
+	return nil
+}
+
+// newHandoffRmCmd builds `uzi handoff rm <id>`: delete the task's remote uzi/task/<id>
+// branch client-side, with the user's own credentials (`git push origin --delete`).
+// A non-task run, or a task that opened an MR (the MR needs its source branch), is
+// refused.
+func newHandoffRmCmd(env Env, gf *globalFlags) *cobra.Command {
+	rm := &cobra.Command{
+		Use:   "rm <run-id>",
+		Short: "Delete a finished no-MR handoff's remote branch",
+		Long: "Delete the remote uzi/task/<id> branch of a handoff task, with your own git\n" +
+			"credentials. A task that opened a merge request (--mr) is exempt — delete it via\n" +
+			"the merge request instead.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runHandoffRm(env, gf, cmd, args[0])
+		},
+	}
+	return rm
+}
+
+func runHandoffRm(env Env, gf *globalFlags, cmd *cobra.Command, id string) error {
+	c, err := env.client(gf)
+	if err != nil {
+		return err
+	}
+	run, err := c.GetRun(cmd.Context(), id)
+	if err != nil {
+		return err
+	}
+	if run.Kind != "task" {
+		return uzicli.Exitf(uzicli.ExitUsage, "run %s is not a handoff task (kind=%s)", id, run.Kind)
+	}
+	// An --mr branch is the source of a live merge request; deleting it would break the
+	// MR. MrWebURL (set once the worker opens it) OR the OpenMr request flag both mark it.
+	if run.MrWebURL != nil || run.OpenMr {
+		return uzicli.Exitf(uzicli.ExitGeneric,
+			"task %s opened a merge request; its branch is exempt from rm — delete it via the merge request", id)
+	}
+	if run.Branch == nil || strings.TrimSpace(*run.Branch) == "" {
+		return uzicli.Exitf(uzicli.ExitGeneric, "task %s has no branch to delete", id)
+	}
+	branch := *run.Branch
+	if _, err := env.Git(".", "push", "origin", "--delete", branch); err != nil {
+		return uzicli.Exitf(uzicli.ExitGeneric, "deleting %s failed: %v", branch, err)
+	}
+	p := env.printer(gf)
+	if p.Format == uzicli.FormatJSON {
+		return p.JSON(map[string]string{"deleted": branch})
+	}
+	if !gf.quiet {
+		p.Printf("deleted %s\n", branch)
+	}
+	return nil
+}
