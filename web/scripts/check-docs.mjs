@@ -296,14 +296,19 @@ function checkBacktickArtifactPaths(rel, raw) {
     }
     if (inFence || line.includes(OPT_OUT_MARKER)) return;
     for (const m of line.matchAll(/`([^`\n]+?)`/g)) {
-      const pm = /^(?:prds|adr)\/\S+?\.md/.exec(m[1]);
-      if (!pm) continue;
-      const p = pm[0];
-      if (PLACEHOLDER_META.test(p) || !ARTIFACT_SHAPE.test(p)) continue;
-      if (existsSync(path.join(repoRoot, p))) continue;
-      const base = path.basename(p);
-      const moved = !p.includes("/done/") && existsSync(path.join(repoRoot, "prds", "done", base));
-      fail(rel, `stale backticked artifact path \`${p}\` (line ${i + 1}) — file not found${moved ? ` (moved to prds/done/${base}?)` : ""}`);
+      // Match a path token ANYWHERE in the inline span, not just at its start, so
+      // `see prds/72-x.md` is caught as well as a bare `prds/72-x.md`. The lookbehind
+      // excludes a token that is a suffix of a longer word or a `../`-relative form;
+      // the strict shape + metacharacter filter below (not the position) is what
+      // keeps legitimate globs/regex/placeholders from being flagged.
+      for (const tm of m[1].matchAll(/(?<![\w./-])((?:prds|adr)\/[^\s`]+?\.md)/g)) {
+        const p = tm[1];
+        if (PLACEHOLDER_META.test(p) || !ARTIFACT_SHAPE.test(p)) continue;
+        if (existsSync(path.join(repoRoot, p))) continue;
+        const base = path.basename(p);
+        const moved = !p.includes("/done/") && existsSync(path.join(repoRoot, "prds", "done", base));
+        fail(rel, `stale backticked artifact path \`${p}\` (line ${i + 1}) — file not found${moved ? ` (moved to prds/done/${base}?)` : ""}`);
+      }
     }
   });
 }
