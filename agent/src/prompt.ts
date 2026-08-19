@@ -339,9 +339,12 @@ function issueCommentsFrame(openTag: string, closeTag: string): string {
  * is absent/empty, so a comment-less run's prompt is byte-for-byte unchanged. Pure +
  * unit-testable, mirroring buildMemoryContext.
  *
- * Each comment renders as a UZI-OWNED header line (`[n] author (@username, forge id N)
- * at <created_at>:`) followed by the raw body — the body is DATA rendered inside the
+ * Each comment renders as a UZI-OWNED header line (`[n] @username at <created_at>:`)
+ * followed by the raw body — the body is DATA rendered inside the
  * fence, NOT statically defanged (exactly as buildMemoryContext renders `e.body` raw).
+ * The header carries the author's login only — the numeric forge user id is used
+ * server-side for the bot self-filter (D1) and deliberately NOT surfaced here, matching
+ * the get_issue DTO's coordinate-drop posture (M4).
  * The nonce fence is the breakout defense: a body cannot predict the CSPRNG nonce, so a
  * literal </issue_comments_…> in a body cannot forge the real closing delimiter. When
  * the snapshot was clipped to fit a size limit, a uzi-owned marker line says so.
@@ -357,9 +360,7 @@ export function buildIssueCommentsContext(
   const closeTag = `</issue_comments_${nonce}>`;
   const rendered = snapshot.comments
     .map((c, i) => {
-      const header =
-        `[${i + 1}] ${c.author_username} (@${c.author_username}, forge id ` +
-        `${c.author_forge_user_id}) at ${c.created_at}:`;
+      const header = `[${i + 1}] @${c.author_username} at ${c.created_at}:`;
       return [header, c.body].join("\n");
     })
     .join("\n\n");
