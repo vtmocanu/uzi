@@ -131,6 +131,44 @@ func TestHandoffBaseRef(t *testing.T) {
 	}
 }
 
+// --review requests a diff-review; --then-fix additionally requests a chained fix AND
+// implies --review (a fix consumes a review's findings). This pins the load-bearing
+// `reviewRequested = review || thenFix` wiring in the CLI.
+func TestHandoffReviewAndThenFixFlags(t *testing.T) {
+	cases := []struct {
+		name        string
+		args        []string
+		wantReview  bool
+		wantThenFix bool
+	}{
+		{"neither", []string{"handoff", "--repo", "p1", "-m", "x"}, false, false},
+		{"review only", []string{"handoff", "--repo", "p1", "-m", "x", "--review"}, true, false},
+		{"then-fix implies review", []string{"handoff", "--repo", "p1", "-m", "x", "--then-fix"}, true, true},
+		{"both explicit", []string{"handoff", "--repo", "p1", "-m", "x", "--review", "--then-fix"}, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := &uzicli.FakeClient{
+				CreatedTaskRun: taskRun("rt", "uzi/task/rt"),
+				DispatchedRun:  taskRun("rt", "uzi/task/rt"),
+			}
+			rec := &handoffRecorder{}
+			env, _ := handoffEnv(fc, rec)
+
+			_, _, code := runCLI(t, env, tc.args...)
+			if code != uzicli.ExitOK {
+				t.Fatalf("exit = %d, want 0", code)
+			}
+			if fc.LastCreateTaskReview != tc.wantReview {
+				t.Errorf("review_requested = %v, want %v", fc.LastCreateTaskReview, tc.wantReview)
+			}
+			if fc.LastCreateTaskThenFix != tc.wantThenFix {
+				t.Errorf("then_fix_requested = %v, want %v", fc.LastCreateTaskThenFix, tc.wantThenFix)
+			}
+		})
+	}
+}
+
 // --mr sets open_mr=true in the create call and the human output states the branch is
 // MR-exempt.
 func TestHandoffMR(t *testing.T) {
