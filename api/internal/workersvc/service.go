@@ -3368,6 +3368,10 @@ type ForgeConn struct {
 	BaseUrl         string
 	TokenCiphertext []byte
 	ForgeProjectID  int64
+	// BotForgeUserID is the connection's stored bot user id, used by the get_issue
+	// route to drop uzi's own bot-authored comments (PRD #381 M4, D1). Zero when the
+	// legacy connection never recorded one, in which case comments are omitted (D9).
+	BotForgeUserID int64
 }
 
 // ForgeConnForRun authorizes a worker's forge read against a run it holds and returns
@@ -3400,6 +3404,7 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 		BaseUrl:         row.BaseUrl,
 		TokenCiphertext: row.TokenCiphertext,
 		ForgeProjectID:  row.ForgeProjectID,
+		BotForgeUserID:  row.BotForgeUserID,
 	}, nil
 }
 

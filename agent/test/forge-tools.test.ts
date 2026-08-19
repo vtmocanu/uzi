@@ -62,6 +62,8 @@ const issue = (over: Partial<IssueDTO> = {}): IssueDTO => ({
   updated_at: "2026-08-01T00:00:00Z",
   description: "read-only forge access for the fact-checker",
   description_truncated: false,
+  comments: [],
+  comments_truncated: false,
   ...over,
 });
 const issueList = (): IssueListDTO => ({
@@ -141,6 +143,24 @@ describe("forge tools — success path wraps every payload as evidence (PRD #158
     assert.match(t, /"title": "Worker-mediated forge read tools"/);
   });
 
+  it("get_issue carries the issue's human comments (PRD #381) inside the evidence fence", async () => {
+    const withComments = issue({
+      comments: [
+        { author: "alice", created_at: "2026-08-01T09:00:00Z", body: "please guard on Valid" },
+        { author: "bob", created_at: "2026-08-01T09:10:00Z", body: "revise the existing test" },
+      ],
+      comments_truncated: true,
+    });
+    const { client } = fakeClient({ issue: withComments });
+    const res = await buildHandlers(client).get_issue!({ iid: 158 });
+    assert.notStrictEqual(res.isError, true);
+    const t = bodyText(res);
+    assert.match(t, /<uzi_evidence_[0-9a-f]+>/, "comments ride inside the same nonce fence");
+    assert.match(t, /"please guard on Valid"/, "the first comment body is in the payload");
+    assert.match(t, /"revise the existing test"/, "the second comment body is in the payload");
+    assert.match(t, /"comments_truncated": true/, "the truncation flag rides through");
+  });
+
   it("list_issues, get_merge_request, get_pipeline_jobs, latest_pipeline, list_issue_label_events all wrap their payload", async () => {
     // Each tool with valid args, a distinct fixture value asserted so a green cannot be
     // vacuous. latest_pipeline is driven with exactly one selector.
@@ -163,6 +183,15 @@ describe("forge tools — success path wraps every payload as evidence (PRD #158
 
   it("exposes the `forge` server name", () => {
     assert.strictEqual(FORGE_SERVER_NAME, "forge");
+  });
+
+  it("get_issue's description advertises that it now also returns the issue's comments (PRD #381)", () => {
+    const { server } = buildForgeToolsServer({ client: fakeClient().client, runId: "run-current", log: nullLogger() });
+    const registered = (server as unknown as { instance: { _registeredTools: Record<string, { description: string }> } })
+      .instance._registeredTools;
+    const desc = registered.get_issue!.description;
+    assert.match(desc, /comment/i, "the get_issue description mentions comments");
+    assert.match(desc, /untrusted evidence/i, "comment bodies are framed as untrusted evidence");
   });
 });
 

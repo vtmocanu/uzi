@@ -907,8 +907,18 @@ export interface MemoryListResponse {
 // snake_case as the uzi API sends them (the API is built to this wire contract in
 // parallel). Every field is forge data — UNTRUSTED; the forge server nonce-fences it.
 
+/** One human issue comment (PRD #381), bot-authored and forge system notes filtered
+ *  out server-side, ordered oldest-first. UNTRUSTED evidence. */
+export interface IssueCommentDTO {
+  author: string;
+  created_at: string;
+  body: string;
+}
+
 /** One issue's detail (GET /worker/runs/:id/forge/issues/:iid). `description` may be
- *  truncated by the API, flagged by `description_truncated`. */
+ *  truncated by the API, flagged by `description_truncated`. `comments` are the issue's
+ *  bot/system-filtered, bounded human comments (PRD #381), oldest-first;
+ *  `comments_truncated` marks a thread clipped by the API's count or byte cap. */
 export interface IssueDTO {
   iid: number;
   title: string;
@@ -918,6 +928,8 @@ export interface IssueDTO {
   updated_at: string;
   description: string;
   description_truncated: boolean;
+  comments: IssueCommentDTO[];
+  comments_truncated: boolean;
 }
 
 /** A lightweight issue row in a list (no description). */

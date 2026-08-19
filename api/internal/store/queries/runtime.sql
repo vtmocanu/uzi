@@ -2023,7 +2023,7 @@ WHERE r.id = @run_id;
 -- repo-less run has no repos row and returns no row too; the service checks repo_id
 -- off the owned run FIRST so it can tell that apart and answer 409.
 SELECT rp.forge_project_id,
-       c.forge_type, c.base_url, c.token_ciphertext
+       c.forge_type, c.base_url, c.token_ciphertext, c.bot_forge_user_id
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id

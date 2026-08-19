@@ -1730,7 +1730,7 @@ func (q *Queries) GetRunForWorkerUser(ctx context.Context, arg GetRunForWorkerUs
 
 const getRunForgeConnForWorker = `-- name: GetRunForgeConnForWorker :one
 SELECT rp.forge_project_id,
-       c.forge_type, c.base_url, c.token_ciphertext
+       c.forge_type, c.base_url, c.token_ciphertext, c.bot_forge_user_id
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id
@@ -1747,6 +1747,7 @@ type GetRunForgeConnForWorkerRow struct {
 	ForgeType       string `json:"forge_type"`
 	BaseUrl         string `json:"base_url"`
 	TokenCiphertext []byte `json:"token_ciphertext"`
+	BotForgeUserID  int64  `json:"bot_forge_user_id"`
 }
 
 // The forge connection facts a WORKER-authenticated run needs to build a driver and
@@ -1765,6 +1766,7 @@ func (q *Queries) GetRunForgeConnForWorker(ctx context.Context, arg GetRunForgeC
 		&i.ForgeType,
 		&i.BaseUrl,
 		&i.TokenCiphertext,
+		&i.BotForgeUserID,
 	)
 	return i, err
 }
