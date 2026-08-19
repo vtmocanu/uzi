@@ -6,6 +6,54 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.46.0] - 2026-08-19
+
+### Added
+
+- **Aggregated "all agents" lane and readable run transcript (#402).** The TUI
+  run view gains a synthetic "all agents" lane, prepended and default-selected
+  once a run has two or more actors, that interleaves every actor's frames in seq
+  order with per-line speaker attribution. The transcript itself is rewritten for
+  a person rather than a log reader: speaker and tool markers, a compact arg
+  preview per tool call, and one-line result summaries. Follow-up fixes on the
+  same PR pair each tool result with its own call by id (so parallel calls no
+  longer render under the wrong tool), surface a failed call with a ✗ marker (a
+  glyph, so it survives NO_COLOR), mark `thinking` frames so the model's internal
+  reasoning is not read as its output, and preserve the selected lane across a
+  rebuild so a run growing past one actor does not swap the view out from under
+  you.
+- **uzi handoff: ephemeral, branch-scoped task runs (PRD #400, #401).** A new
+  `task` run kind and a `uzi handoff` CLI for ephemeral, branch-scoped runs that
+  never open an MR, for driving a scoped change on an existing branch.
+- **Memory-save nudges for structural counts and environment capability (#395).**
+  `save_memory`'s volatile-snapshot nudge now also catches structural counts (row
+  and column totals, field counts) and adds a nudge for claims that a tool or
+  binary is present or absent in the worker environment. Both stay append-only
+  advisory prose on an already-successful save (never an error), matching the
+  existing nudges.
+
+### Changed
+
+- **ANDON terminal-UI redesign (#399).** The TUI is refreshed into a quiet, warm
+  board where the only lit surface is whatever needs a human: tungsten chrome and
+  andon amber attention replace the cyan brand and the solid status chips. The
+  board gains NEEDS YOU / ON THE FLOOR / DONE triage bands, a per-row andon strip,
+  colored status words, a milestone micro-bar, and a full-row selection highlight;
+  the run-detail view gains a two-line priority header (so the live tag no longer
+  clips), a one-row amber plan-gate band with inline approve/reject, and a
+  hairline divider. NO_COLOR twins, light and dark, the D7 injection guards, and
+  the transcript viewport invariant are all preserved.
+
+### Fixed
+
+- **Recurring schedules no longer replay the missed window on resume (#396,
+  #397).** Pausing a recurring schedule and resuming it later immediately fired
+  the window missed while paused, because pause/resume flipped only `enabled` and
+  left `next_fire_at` frozen in the past. Resume now recomputes `next_fire_at` to
+  the next future cron occurrence in the same write that flips `enabled`. A parked
+  (`status='error'`) schedule stays parked on resume, and `once` resume is
+  unchanged.
+
 ## [0.45.0] - 2026-08-19
 
 ### Added
