@@ -5,7 +5,7 @@
 # a Helm lint/template, and -- on pull requests, path-filtered -- `push:false` image
 # VALIDATION builds (does each Dockerfile still build?). It pushes NO images, uses
 # NO secrets, and runs NO release logic: image publishing + the chart/brew release
-# land in release.yml, and the KinD smoke in e2e.yml.
+# land in release.yml, and the KinD smoke in kind-smoke.yml.
 #
 # R1 TRUST BOUNDARY: these jobs must run clean on an untrusted (fork) PR with zero
 # secret exposure. Hence top-level `permissions: contents: read` (a read-only
@@ -402,7 +402,7 @@ jobs:
   # kaniko `--no-push` jobs, PRD #230). PULL-REQUEST ONLY and path-filtered: the
   # heavy builds (agent especially) run only when their inputs change. They touch NO
   # registry and NO secrets, so the R1 trust boundary is unchanged. On push to main
-  # the real images are built by e2e.yml (api/web) and by release.yml (tags); this
+  # the real images are built by kind-smoke.yml (api/web) and by release.yml (tags); this
   # section is pure pre-merge validation.
   #
   # `changes` runs on PRs and exposes one boolean per component; each build job gates

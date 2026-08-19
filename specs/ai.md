@@ -20304,10 +20304,13 @@ filters — instant view state, not a sync setting a poll-cycle away.
   lanes show `N/M`, and a board-level result count renders through the EXISTING `sr-only role=status`
   live region (debounced, last-writer-wins — it is the single-string channel `pushToast` shares).
 - **Paged reveal, never "show all" (Decision 3).** A page is 50; the expander advances `shownCount`
-  by one page and an expanded lane scrolls within a bounded height, so a 900-deep lane never lands
-  hundreds of nodes in the DOM at once. Past two pages of remainder the lane nudges toward search
-  instead of a "show all" that would rebuild the wall. Virtualization (react-window / IO sentinel) is
-  deferred behind the same `shownCount` affordance — an implementation swap, not a UX change.
+  by one page, so a 900-deep lane never lands hundreds of nodes in the DOM at once. Past two pages of
+  remainder the lane nudges toward search instead of a "show all" that would rebuild the wall.
+  Virtualization (react-window / IO sentinel) is deferred behind the same `shownCount` affordance — an
+  implementation swap, not a UX change. **Issue #367 (2026-08-18) removed the "expanded lane scrolls
+  within a bounded height" clause this bullet used to carry** — see §557.
+- **Board scrolls as one page with pinned column headers (issue #367, supersedes PRD #304 Decision 3's
+  bounded-scroll half).** §557.
 - **Per-lane default (10) is a per-browser, per-repo VIEW preference**, stored in `prefs` as
   `uzi.board.${repoId}.perLane` beside `hideEmpty`/`sortMode` (§87/§88/§443) — density, not
   admin/server policy. It re-reads on `repoId` change via `useEffect` (the route swaps `:id` without
@@ -21347,3 +21350,59 @@ section records only the durable design shape.
 schedule can be created already-paused; `uzi schedule edit` gained `--repo` for the repoint above. The
 server already honored a supplied `Enabled` on create — this exposed it on the two clients, no API/schema
 change.
+
+## 557. Issue #367 — board switches from per-column scroll to full-page scroll with pinned column headers (supersedes PRD #304 Decision 3's bounded-scroll half)
+
+> **Superseded in part by §558 (issue #373, 2026-08-19):** Decision 2 (Option A / `flex-wrap`)
+> and the sticky-header mechanism below were reverted — horizontal column scroll is restored and
+> the lane headers are static again. Decision 1 (no bounded box, page scrolls vertically) stays.
+
+Single-file UI change in `web/src/pages/Board.tsx`; no API/DTO/DB change and the paging layer
+(`lanePaging` in `boardColumns.ts`, the cap-10/page-50 model, Show-more/Collapse, the `N/M` count
+pill) is untouched. Two required decisions, both recorded in the issue and the PRD #304 Decision Log:
+
+- **Decision 1 — the per-lane `max-h-[70vh] overflow-y-auto` box is removed on purpose (reverses PRD
+  #304 §521 Decision 3's bounded-scroll clause).** Lists grow to fit their cards; the page scrolls as
+  one plane; an expanded lane ("Show 50 more") grows the page rather than filling an inner scroll box.
+  The tall "wall" is now intended, not an accident. The paged-reveal half of Decision 3 is unchanged.
+- **Decision 2 = Option A — columns fit the width, no horizontal scroller.** The board row dropped
+  `overflow-x-auto` (a non-`visible` `overflow-x` silently forces `overflow-y:auto`, which would make
+  the row — not the viewport — the sticky scroll context and defeat the pin) and gained `flex-wrap`;
+  lanes went from `w-72 shrink-0` to `flex-1 basis-72 min-w-0`, so columns fill each row evenly and
+  wrap to full width on narrow screens instead of scrolling horizontally. Option B (keep the horizontal
+  strip) was rejected: pinning inside a horizontal scroller needs a bounded height again — the design
+  being removed.
+- **Headers pin to the viewport under the dynamic-height toolbar.** Each lane header is `position:
+  sticky`; its `top` reads a `--board-head-top` CSS custom property published on the board root from
+  the toolbar's live height (measured by a `ResizeObserver` wired through a callback ref, because the
+  toolbar mounts behind the `loading` early return). On mobile the offset adds the 49px shell bar
+  (`calc(var(--board-head-top) + 49px)`); on `lg` it pins at the toolbar's bottom edge exactly. The
+  header carries an opaque `bg-surface` (the lane's own `bg-surface/60` is translucent) with negative
+  `-mx-2.5`/`-mt-2.5` so the backing spans the lane's `p-2.5` padding, and `z-[5]` sits below the
+  toolbar's `z-10` so a taller wrapped toolbar paints over it. Browser-validated at narrow (toolbar
+  332px tall) and wide (220px) widths: headers pin at the toolbar's exact bottom edge, one scroll
+  plane, no horizontal scrollbar, cards scroll cleanly under the header.
+
+## 558. Issue #373 — board restores horizontal column scroll, drops the pinned headers (reverts §557's Decision 2 + sticky-header half; keeps Decision 1)
+
+#367 (§557) shipped in v0.44.0 and regressed the board: with `flex-wrap` + `flex-1 basis-72
+min-w-0` columns, more columns than fit the width wrapped onto new rows and horizontal card scroll
+was gone entirely (a broken multi-row grid with ragged gaps). #373 reverts that half while keeping
+the page-scroll behavior:
+
+- **Board row** back to `flex items-start gap-4 overflow-x-auto pb-4` — columns in one row with
+  horizontal scroll — and **lanes** back to `w-72 shrink-0` (fixed width, non-shrinking).
+- **Lane header is static again** (`mb-2.5 flex items-center gap-2 px-1`); the `--board-head-top`
+  CSS var + `ResizeObserver` toolbar-measuring machinery from #367 is removed.
+- **Decision 1 stays:** the per-lane `max-h-[70vh] overflow-y-auto` box is still gone, so the page
+  still scrolls vertically for tall columns and the paging layer (`lanePaging`, cap-10/page-50,
+  Show-more/Collapse, the `N/M` pill) is still untouched.
+
+Why not keep both: `overflow-x` on the row forces `overflow-y:auto` (CSS spec), making the row —
+not the viewport — the sticky scroll context, so in-board horizontal scroll and viewport-pinned
+headers are mutually exclusive without a larger change (page-level horizontal scroll, or JS-pinned
+headers). We chose horizontal scroll over pinned headers. Accepted trade-off: the row's horizontal
+scrollbar sits below the fold when a column is taller than the viewport, so a mouse-only user must
+scroll the page down to reach it; two-finger/shift-scroll and the partially-cut right column
+mitigate it. Browser-validated in mock mode (columns one row, horizontal scroll works, page scrolls
+vertically, headers static).

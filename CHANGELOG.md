@@ -19,6 +19,18 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   (`docker image inspect` is a local no-op, no registry call); this does not change
   the readiness-wait timeout behavior.
 
+## [0.44.0] - 2026-08-18
+
+### Changed
+
+- **Board scrolls as one page with pinned column headers (#370, issue #367).** The
+  per-column bounded scroll box (`max-h-[70vh] overflow-y-auto`) is gone: columns now grow
+  to fit their cards, the whole page scrolls vertically, and each column header pins under
+  the sticky toolbar as you scroll past its cards. Columns fit the width and wrap to full
+  width on narrow screens instead of opening a horizontal scroller. This supersedes PRD
+  #304 Decision 3's bounded-scroll clause; the paged reveal (Show more / Collapse, page of
+  50) is unchanged.
+
 ## [0.43.0] - 2026-08-18
 
 ### Added

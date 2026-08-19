@@ -209,8 +209,8 @@ describe("IssueCard label chips (PRD #102 M4)", () => {
   });
 
   it("caps the visible chips and reports the rest as +N rather than dropping them", () => {
-    // The lane is a fixed w-72; an issue wearing eight labels must not push the card
-    // several rows taller than its neighbours.
+    // The lane is a fixed w-72 (issue #373 reverted #367's flex-1 basis-72); an issue
+    // wearing eight labels must not push the card several rows taller than its neighbours.
     renderCard({}, ["a", "b", "c", "d", "e", "f"]);
     expect(screen.getByText("+2")).toBeTruthy();
     expect(screen.queryByText("e")).toBeNull();

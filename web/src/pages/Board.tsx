@@ -1247,6 +1247,10 @@ export function Board() {
         />
       )}
 
+      {/* Issue #367 → #373: columns scroll HORIZONTALLY in one row (overflow-x-auto)
+          again; the page still scrolls vertically for tall columns. Reverts the
+          flex-wrap of Decision 2 (Option A), which stacked columns onto new rows when
+          they exceeded the width and killed horizontal card scroll. */}
       <div className="flex items-start gap-4 overflow-x-auto pb-4">
         {visible.map((col) => {
           const cards = cardsByColumn.get(col.key) ?? [];
@@ -1287,6 +1291,8 @@ export function Board() {
                 if (iid) applyDrop(iid, col.key, null);
               }}
               className={cx(
+                // Fixed-width, non-shrinking columns in one row; the row's overflow-x-auto
+                // gives back horizontal card scroll (#373, reverting Decision 2's grow-wrap).
                 "flex w-72 shrink-0 flex-col rounded-xl border p-2.5 transition-colors",
                 dragRevealed && "opacity-60",
                 isTarget
@@ -1296,6 +1302,10 @@ export function Board() {
                     : "border-edge bg-surface/60",
               )}
             >
+              {/* Static header (#373): sticky pinning is incompatible with the row's
+                  overflow-x-auto (a non-visible overflow-x forces overflow-y:auto, which
+                  makes the row — not the viewport — the sticky scroll context). We chose
+                  horizontal card scroll over pinned headers, so the header is plain again. */}
               <div className="mb-2.5 flex items-center gap-2 px-1">
                 <span aria-hidden="true" className={cx("h-2 w-2 rounded-full", col.accent)} />
                 <span className={cx("text-sm font-semibold", closedCol ? "text-faint" : "text-fg")}>
@@ -1307,10 +1317,12 @@ export function Board() {
                   {paging.countLabel || String(cards.length)}
                 </span>
               </div>
-              {/* When expanded past its baseline the lane scrolls INTERNALLY within a
-                  bounded height, so clicking Show more on a huge lane cannot grow the
-                  page to hundreds of rows tall (Decision 3). */}
-              <div className={cx("flex flex-col gap-2", paging.canCollapse && "max-h-[70vh] overflow-y-auto")}>
+              {/* Issue #367 (Decision 1): the per-lane max-h/overflow box is gone —
+                  the lane grows to fit its cards and the page scrolls as one plane, so
+                  an expanded lane ("Show N more") grows the page rather than opening an
+                  inner scrollbar. `paging.canCollapse` still drives the Show-more/Collapse
+                  controls; it just no longer gates a scroll box. */}
+              <div className="flex flex-col gap-2">
                 {shown.map((card, i) => {
                   // The extras this card carries are the "why this card is here"
                   // chips (PRD #196): hoisted ahead of MAX_CARD_CHIPS (Decision 11) so

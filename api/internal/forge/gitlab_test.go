@@ -649,6 +649,59 @@ func TestDefaultBranchProtectionParsesMergeLevels(t *testing.T) {
 	}
 }
 
+// TestGitLabDefaultBranchProtectionSkipsNullAccessLevels is the regression test for
+// the nil-pointer panic that a null array element in push_access_levels or
+// merge_access_levels used to trigger. GitLab's REST API can return a JSON
+// `null` in these arrays; go-gitlab decodes that to a nil
+// *BranchAccessDescription, and DefaultBranchProtection dereferenced it without
+// a guard. Without the `if pl == nil { continue }` / `if ml == nil { continue }`
+// guards in gitlab.go this panics; with them the null is skipped and the valid
+// entry alongside it is still processed.
+func TestGitLabDefaultBranchProtectionSkipsNullAccessLevels(t *testing.T) {
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/protected_branches/main": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": 1, "name": "main",
+				// A nil map encodes as JSON `null`, reproducing the mixed
+				// [null, {...}] array the live API can send. The valid element
+				// names the bot at Developer level, so it must still be processed.
+				"push_access_levels": []map[string]any{
+					nil,
+					{"access_level": 30, "user_id": 4242},
+				},
+				"merge_access_levels": []map[string]any{
+					nil,
+					{"access_level": 30, "user_id": 4242},
+				},
+			})
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	// A missing guard makes DefaultBranchProtection panic here rather than return.
+	bp, err := d.DefaultBranchProtection(context.Background(), 7, "main", 4242)
+	if err != nil {
+		t.Fatalf("DefaultBranchProtection: %v", err)
+	}
+	if !bp.Protected {
+		t.Fatal("expected Protected")
+	}
+	// The valid element survives the null: level 30 (Developer) sets the write
+	// role flags, and user_id 4242 matching the bot sets the per-user flags.
+	if !bp.WriteRoleCanPush {
+		t.Fatal("the level-30 push entry after the null must set WriteRoleCanPush")
+	}
+	if !bp.BotCanPush {
+		t.Fatal("the per-user (user_id=4242) push entry after the null must set BotCanPush")
+	}
+	if !bp.WriteRoleCanMerge {
+		t.Fatal("the level-30 merge entry after the null must set WriteRoleCanMerge")
+	}
+	if !bp.BotCanMerge {
+		t.Fatal("the per-user (user_id=4242) merge entry after the null must set BotCanMerge")
+	}
+}
+
 func TestDefaultBranchProtectionCleanBranch(t *testing.T) {
 	m := newMockGitLab(t, map[string]http.HandlerFunc{
 		"/api/v4/projects/7/protected_branches/main": func(w http.ResponseWriter, _ *http.Request) {
@@ -748,6 +801,126 @@ func TestNewMethodErrorsAreRedacted(t *testing.T) {
 		if strings.Contains(c.err.Error(), token) {
 			t.Errorf("%s leaked the PAT: %q", c.name, c.err.Error())
 		}
+	}
+}
+
+// TestGitLabListMethodsSkipNullElements pins the nil-element guards on the five
+// list loops. A GitLab REST response is a JSON array, and a hostile or buggy
+// forge can put a `null` where an object is expected: `[null, {...}]` decodes to
+// a slice whose first element is a nil pointer. Before the guards, the list loops
+// dereferenced every element unconditionally, so the nil-first array panicked on
+// the very first iteration.
+//
+// Each sub-test installs a route returning exactly `[null, {<one valid object>}]`
+// and asserts the method (1) does not panic and returns no error, and (2) returns
+// exactly the one valid element — proving the null was skipped, not that the whole
+// page was dropped. Remove any of the five `if x == nil { continue }` guards in
+// gitlab.go and the matching sub-test panics (a nil-pointer dereference surfaced by
+// the test runner as a failed test), which is what makes this a regression test and
+// not just a happy-path parse.
+func TestGitLabListMethodsSkipNullElements(t *testing.T) {
+	const projectID, issueIID, pipelineID = 7, 11, 55
+
+	tests := []struct {
+		name string
+		path string
+		body string
+		// invoke calls the driver method and returns the number of elements it
+		// yielded plus a distinguishing field of the (expected single) survivor.
+		invoke func(ctx context.Context, d Forge) (n int, got string, err error)
+		want   string
+	}{
+		{
+			name: "ListProjects",
+			path: "/api/v4/projects",
+			body: `[null, {"id": 1, "path_with_namespace": "grp/a", "web_url": "https://gl/grp/a", "default_branch": "main"}]`,
+			invoke: func(ctx context.Context, d Forge) (int, string, error) {
+				ps, err := d.ListProjects(ctx)
+				if err != nil || len(ps) != 1 {
+					return len(ps), "", err
+				}
+				return len(ps), ps[0].PathWithNamespace, nil
+			},
+			want: "grp/a",
+		},
+		{
+			name: "ListLabels",
+			path: "/api/v4/projects/7/labels",
+			body: `[null, {"name": "PRD", "color": "#112233"}]`,
+			invoke: func(ctx context.Context, d Forge) (int, string, error) {
+				ls, err := d.ListLabels(ctx, projectID)
+				if err != nil || len(ls) != 1 {
+					return len(ls), "", err
+				}
+				return len(ls), ls[0].Name, nil
+			},
+			want: "PRD",
+		},
+		{
+			name: "ListIssues",
+			path: "/api/v4/projects/7/issues",
+			body: `[null, {"id": 1001, "iid": 11, "title": "Do the thing", "state": "opened", "author": {"username": "alice"}}]`,
+			invoke: func(ctx context.Context, d Forge) (int, string, error) {
+				is, err := d.ListIssues(ctx, projectID, ListIssuesOptions{})
+				if err != nil || len(is) != 1 {
+					return len(is), "", err
+				}
+				return len(is), is[0].Title, nil
+			},
+			want: "Do the thing",
+		},
+		{
+			name: "ListIssueLabelEvents",
+			path: "/api/v4/projects/7/issues/11/resource_label_events",
+			body: `[null, {"id": 501, "action": "add", "created_at": "2026-07-04T09:00:00Z", "user": {"id": 42, "username": "carol"}, "label": {"id": 9, "name": "autopilot"}}]`,
+			invoke: func(ctx context.Context, d Forge) (int, string, error) {
+				es, err := d.ListIssueLabelEvents(ctx, projectID, issueIID)
+				if err != nil || len(es) != 1 {
+					return len(es), "", err
+				}
+				return len(es), es[0].LabelName, nil
+			},
+			want: "autopilot",
+		},
+		{
+			name: "ListPipelineJobs",
+			path: "/api/v4/projects/7/pipelines/55/jobs",
+			body: `[null, {"id": 9, "name": "build", "stage": "build", "status": "success", "web_url": "https://gl/grp/a/-/jobs/9"}]`,
+			invoke: func(ctx context.Context, d Forge) (int, string, error) {
+				js, err := d.ListPipelineJobs(ctx, projectID, pipelineID)
+				if err != nil || len(js) != 1 {
+					return len(js), "", err
+				}
+				return len(js), js[0].Name, nil
+			},
+			want: "build",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := tc.body
+			m := newMockGitLab(t, map[string]http.HandlerFunc{
+				tc.path: func(w http.ResponseWriter, _ *http.Request) {
+					// Empty X-Next-Page → resp.NextPage == 0, so the paginating loop
+					// stops after this single page.
+					w.Header().Set("X-Next-Page", "")
+					_, _ = w.Write([]byte(body))
+				},
+			})
+			d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+			n, got, err := tc.invoke(context.Background(), d)
+			if err != nil {
+				t.Fatalf("%s returned an error on a [null, {...}] page: %v", tc.name, err)
+			}
+			if n != 1 {
+				t.Fatalf("%s: expected exactly the one valid element (null skipped), got %d", tc.name, n)
+			}
+			if got != tc.want {
+				t.Fatalf("%s: expected the surviving element's field %q, got %q", tc.name, tc.want, got)
+			}
+		})
 	}
 }
 
