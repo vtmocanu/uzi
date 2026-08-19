@@ -943,7 +943,7 @@ export class SdkExecutor implements Executor {
         !!oauthToken &&
         !!this.client;
       const prdInputP: Promise<PrdInput> | undefined = summariesOn
-        ? resolvePrdInput(ctx.issueDescription, ctx.worktreePath, this.log)
+        ? resolvePrdInput(ctx.issueDescription, ctx.worktreePath, ctx.issueIid, this.log)
         : undefined;
 
       // INTENT hook (Decision 5: BOTH the seeded/pre-approved AND planning paths get

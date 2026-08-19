@@ -23,11 +23,11 @@ import (
 // summary_model, theme, and sidebar token set, so the GetMySettings/PutMySettings
 // handlers run end to end (decode -> validate -> store -> respond) without a real
 // database. The SetUserDefaultModel/SetUserJudgeModel/SetUserSummaryModel/SetUserTheme
-// UPDATEs QueryRow a single Text RETURNING column and SetUserSidebarTokens a uuid[]
-// one; GetUserSettings QueryRows four (default_model, judge_model, theme,
-// sidebar_token_ids) and GetUserSummaryModel one (summary_model, read on its own
-// column query — it is not part of GetUserSettings' narrow read). The UPDATE paths
-// record the written value so the round-trip is observable.
+// UPDATEs QueryRow a single Text RETURNING column (discarded by the handler) and
+// SetUserSidebarTokens a uuid[] one; GetUserSettings QueryRows five (default_model,
+// judge_model, summary_model, theme, sidebar_token_ids) — summary_model rides that
+// one-row read, so the settings handler makes no separate GetUserSummaryModel call.
+// The UPDATE paths record the written value so the round-trip is observable.
 type fakeSettingsDB struct {
 	model      pgtype.Text
 	judge      pgtype.Text
@@ -67,44 +67,34 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 			f.sidebarIDs = ids // SetUserSidebarTokens: $1 = sidebar_token_ids
 		}
 	}
-	// GetUserSummaryModel is a single-column SELECT the handler actually reads, so the
-	// row must return summary_model (not model) for its 1-dest Scan; the write-path
-	// RETURNINGs are also 1-dest but discarded, so routing on the SQL disambiguates.
-	wantSummary := strings.Contains(sql, "SELECT summary_model FROM users")
 	return fakeSettingsRow{
-		model:       f.model,
-		judge:       f.judge,
-		summary:     f.summary,
-		theme:       f.theme,
-		sidebarIDs:  f.sidebarIDs,
-		wantSummary: wantSummary,
+		model:      f.model,
+		judge:      f.judge,
+		summary:    f.summary,
+		theme:      f.theme,
+		sidebarIDs: f.sidebarIDs,
 	}
 }
 
 type fakeSettingsRow struct {
-	model       pgtype.Text
-	judge       pgtype.Text
-	summary     pgtype.Text
-	theme       pgtype.Text
-	sidebarIDs  []uuid.UUID
-	wantSummary bool
+	model      pgtype.Text
+	judge      pgtype.Text
+	summary    pgtype.Text
+	theme      pgtype.Text
+	sidebarIDs []uuid.UUID
 }
 
 func (r fakeSettingsRow) Scan(dest ...any) error {
 	switch len(dest) {
 	case 1:
-		// A single-column read: either GetUserSummaryModel (which the handler reads,
-		// so it must get summary_model) or a write-path RETURNING (discarded, so any
-		// Text suffices). wantSummary, set from the SQL, tells them apart.
+		// The only single-column reads left are write-path RETURNINGs (SetUser*),
+		// which the handler discards, so any Text suffices.
 		if p, ok := dest[0].(*pgtype.Text); ok {
-			if r.wantSummary {
-				*p = r.summary
-			} else {
-				*p = r.model
-			}
+			*p = r.model
 		}
-	case 4:
-		// GetUserSettings: SELECT default_model, judge_model, theme, sidebar_token_ids.
+	case 5:
+		// GetUserSettings: SELECT default_model, judge_model, summary_model, theme,
+		// sidebar_token_ids.
 		if p, ok := dest[0].(*pgtype.Text); ok {
 			*p = r.model
 		}
@@ -112,9 +102,12 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 			*p = r.judge
 		}
 		if p, ok := dest[2].(*pgtype.Text); ok {
+			*p = r.summary
+		}
+		if p, ok := dest[3].(*pgtype.Text); ok {
 			*p = r.theme
 		}
-		if p, ok := dest[3].(*[]uuid.UUID); ok {
+		if p, ok := dest[4].(*[]uuid.UUID); ok {
 			*p = r.sidebarIDs
 		}
 	}

@@ -126,6 +126,39 @@ describe("findValidPrdCore (detect span → extract core → validate)", () => {
     );
   });
 
+  // Code review PR #387, finding 7: a body that mentions another PRD before its own.
+  it("prefers the core whose number matches preferIid over document order", () => {
+    const body = "Unlike prds/100-old.md, this implements prds/362-new.md";
+    // Without the hint, the first valid core wins (unchanged behavior).
+    assert.equal(findValidPrdCore(body), "prds/100-old.md");
+    // With the issue iid, the matching PRD wins even though it appears second.
+    assert.equal(findValidPrdCore(body, 362), "prds/362-new.md");
+  });
+
+  it("matches preferIid against a done/ archived core, and falls back on no match", () => {
+    const body = "see prds/done/362-x.md and prds/401-y.md";
+    assert.equal(findValidPrdCore(body, 362), "prds/done/362-x.md");
+    // No core matches iid 999 → first valid core (document order) is returned.
+    assert.equal(findValidPrdCore(body, 999), "prds/done/362-x.md");
+  });
+
+  it("ignores preferIid when the only link is a different PRD (single-link case)", () => {
+    // A lone link resolves the same with or without a mismatching hint.
+    assert.equal(findValidPrdCore("see prds/362-x.md", 5), "prds/362-x.md");
+  });
+
+  it("falls back to first-valid when a core's basename has no number (prdCoreNumber null)", () => {
+    // prds/readme.md has no leading integer → prdCoreNumber is null, never equals an
+    // iid, so the preference never fires and first-valid wins.
+    assert.equal(findValidPrdCore("see prds/readme.md", 5), "prds/readme.md");
+    // Mixed: a non-numeric core first, then a numeric one that matches the iid → the
+    // numeric match still wins over document order.
+    assert.equal(
+      findValidPrdCore("prds/readme.md then prds/5-real.md", 5),
+      "prds/5-real.md",
+    );
+  });
+
   it("returns null FAST on hostile blob-like input (ReDoS guard)", () => {
     // The old blob-prefix regex straddled two greedy classes across the `blob/`
     // literal and backtracked O(n²) on this shape (~64s at 500k chars). The
@@ -165,6 +198,27 @@ describe("resolvePrdInput", () => {
     assert.equal(r.prdText, PRD_BODY);
   });
 
+  // Code review PR #387, finding 7: with two PRD links, the issue iid picks the right
+  // file to READ, not just the right core to name.
+  it("reads the iid-matching PRD when the body mentions another PRD first", async () => {
+    await fs.writeFile(path.join(clone, "prds", "100-old.md"), "OLD PRD BODY", "utf8");
+    try {
+      const desc = "Supersedes prds/100-old.md; implements prds/362-x.md";
+      // Issue #362 → reads 362-x.md despite 100-old.md appearing first.
+      const matched = await resolvePrdInput(desc, clone, 362);
+      assert.equal(matched.prdPath, "prds/362-x.md");
+      assert.equal(matched.prdText, PRD_BODY);
+      // No iid hint → first valid core (100-old.md), the pre-#7 behavior.
+      const firstWins = await resolvePrdInput(desc, clone);
+      assert.equal(firstWins.prdPath, "prds/100-old.md");
+      assert.equal(firstWins.prdText, "OLD PRD BODY");
+    } finally {
+      // Clean up even if an assertion above throws, so the file never leaks into the
+      // shared clone dir for the rest of the block.
+      await fs.rm(path.join(clone, "prds", "100-old.md"), { force: true });
+    }
+  });
+
   it("resolves the same core from GitHub and GitLab blob URLs (+ suffix)", async () => {
     for (const desc of [
       "https://github.com/vtmocanu/uzi/blob/main/prds/362-x.md",
@@ -188,7 +242,7 @@ describe("resolvePrdInput", () => {
     ];
     for (const desc of attempts) {
       const log = capturingLogger();
-      const r = await resolvePrdInput(desc, clone, log);
+      const r = await resolvePrdInput(desc, clone, undefined, log);
       assert.deepEqual(r, { prdPath: null, prdText: null }, desc);
       assert.notEqual(r.prdText, "TOP SECRET must never be read", desc);
     }
@@ -216,7 +270,7 @@ describe("resolvePrdInput", () => {
     }
     try {
       const log = capturingLogger();
-      const r = await resolvePrdInput("see prds/evil.md", clone, log);
+      const r = await resolvePrdInput("see prds/evil.md", clone, undefined, log);
       assert.deepEqual(r, { prdPath: null, prdText: null });
       assert.ok(log.calls.some((m) => m.includes("symlink") || m.includes("escape")));
     } finally {
@@ -226,7 +280,7 @@ describe("resolvePrdInput", () => {
 
   it("falls back to nulls for a valid-looking but missing file", async () => {
     const log = capturingLogger();
-    const r = await resolvePrdInput("see prds/nope.md", clone, log);
+    const r = await resolvePrdInput("see prds/nope.md", clone, undefined, log);
     assert.deepEqual(r, { prdPath: null, prdText: null });
     assert.ok(log.calls.length > 0);
   });
