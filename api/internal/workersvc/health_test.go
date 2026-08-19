@@ -531,8 +531,10 @@ func TestClampSlow(t *testing.T) {
 // NULL budget (global 2h) started the same 3h ago IS slow.
 func TestHealthSlowClampsPerRunBudget(t *testing.T) {
 	// Raw slow = 4h: above the global 2h RUN_TIMEOUT (misconfig path exercised) and above
-	// the 3h elapsed, but below the 8h scaled ceiling — so the scaled run's clamped
-	// threshold (4h) has not fired at 3h, while the unscaled run's (clamped to ~2h) has.
+	// the 3h elapsed. For the scaled run (8h budget) issue #323 first scales the raw
+	// threshold by the budget ratio (4h × 8h/2h = 16h), which clampSlow then pulls to the
+	// 8h ceiling (~8h after scaling) — so it has not fired at 3h, while the unscaled run's
+	// (clamped to ~2h) has.
 	settings := fakeHealthSettings{enabled: true, slow: 4 * 60 * 60}
 
 	scaled := runRow("running")
@@ -556,6 +558,52 @@ func TestHealthSlowClampsPerRunBudget(t *testing.T) {
 		t.Fatalf("changed = %d, want 1 (an unscaled run 3h in is slow)", n)
 	}
 	if w := lastWrite(t, fs2, unscaled.ID); w.Health != healthSlow {
+		t.Fatalf("health = %q, want slow for the NULL-budget run", w.Health)
+	}
+}
+
+// TestHealthSlowScalesWithBudget (issue #323): the raw health_slow_seconds threshold is
+// scaled UP by a run's budget ratio (effTimeout / RUN_TIMEOUT) before the per-run clamp,
+// so a milestone-scaled run is not flagged "slow" at the flat default while it is still
+// working. testParams RunTimeout is 2h; an 8h budget → scaled slow = 2700 × 8h/2h = 3h.
+func TestHealthSlowScalesWithBudget(t *testing.T) {
+	// 1. A scaled run active 90m in — well past the flat 45m default, but under the 3h
+	//    scaled threshold — must NOT flag. Fails before the ratio scaling.
+	scaledOK := runRow("running")
+	scaledOK.BudgetWallSeconds = pgtype.Int4{Int32: 8 * 60 * 60, Valid: true}
+	scaledOK.StartedAt = ago(90 * time.Minute)
+	scaledOK.LastActivityAt = ago(1 * time.Minute) // recent → not stalled
+	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{scaledOK}}
+	svc := healthSvc(fs, defaultHealthSettings())
+	if n := svc.detectRunHealth(context.Background(), t0); n != 0 {
+		w := lastWrite(t, fs, scaledOK.ID)
+		t.Fatalf("a scaled run 90m into an 8h budget must not flag; wrote %q", w.Health)
+	}
+
+	// 2. The same scaled run past the 3h scaled threshold IS slow.
+	scaledSlow := runRow("running")
+	scaledSlow.BudgetWallSeconds = pgtype.Int4{Int32: 8 * 60 * 60, Valid: true}
+	scaledSlow.StartedAt = ago(5 * time.Hour)        // past the 3h scaled threshold
+	scaledSlow.LastActivityAt = ago(1 * time.Minute) // recent → not stalled
+	fs2 := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{scaledSlow}}
+	svc2 := healthSvc(fs2, defaultHealthSettings())
+	if n := svc2.detectRunHealth(context.Background(), t0); n != 1 {
+		t.Fatalf("changed = %d, want 1 (a scaled run 5h in is slow)", n)
+	}
+	if w := lastWrite(t, fs2, scaledSlow.ID); w.Health != healthSlow {
+		t.Fatalf("health = %q, want slow for the scaled run past 3h", w.Health)
+	}
+
+	// 3. An unscaled (NULL budget) run is unchanged: flagged slow at the flat 45m.
+	unscaled := runRow("running")
+	unscaled.StartedAt = ago(50 * time.Minute) // > 45m flat default
+	unscaled.LastActivityAt = ago(1 * time.Minute)
+	fs3 := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{unscaled}}
+	svc3 := healthSvc(fs3, defaultHealthSettings())
+	if n := svc3.detectRunHealth(context.Background(), t0); n != 1 {
+		t.Fatalf("changed = %d, want 1 (an unscaled run 50m in is slow)", n)
+	}
+	if w := lastWrite(t, fs3, unscaled.ID); w.Health != healthSlow {
 		t.Fatalf("health = %q, want slow for the NULL-budget run", w.Health)
 	}
 }

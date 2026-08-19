@@ -177,7 +177,7 @@ signal off, from **Admin → Instance settings → Run health**:
 |---|---|---|
 | Enable run-health detection | on | Turns the whole detector on or off. |
 | Stalled after | 300s (5m) | Seconds of silence, with no tool call in flight, before a running run is flagged stalled. |
-| Slow after | 2700s (45m) | Wall-clock seconds since start before a running run is flagged slow. |
+| Slow after | 2700s (45m) | Wall-clock seconds since start before a running run is flagged slow. For a milestone-scaled run (frozen `budget_wall_seconds`, PRD #122) this threshold scales up with the run's budget, so a long-budget run isn't flagged at the flat default while it is still working. |
 | Stuck queued after | 600s (10m) | Seconds a run may sit queued before it's flagged waiting for worker. |
 | Awaiting approval after | 3600s (1h) | Seconds a run may sit awaiting approval before it's flagged; skipped for autopilot runs. |
 | Slack nudge cooldown | 1800s (30m) | Minimum time between Slack DMs about the same run's flag — see [Slack notifications](./slack.md). |
