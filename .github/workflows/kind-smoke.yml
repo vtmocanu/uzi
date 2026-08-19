@@ -39,7 +39,7 @@ jobs:
   kind-smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Build the api + web images the chart runs. api context is api/ (its own
       # .dockerignore); web context is the repo ROOT so the Dockerfile can bundle
@@ -68,7 +68,7 @@ jobs:
           kind load docker-image uzi-web:kind --name uzi-e2e
 
       - name: Setup Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
           version: v3.21.3
 

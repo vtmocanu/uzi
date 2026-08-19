@@ -53,7 +53,7 @@ jobs:
       # rejects anything that is not strict SemVer either way.
       INPUT_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Only strict SemVer tags may proceed. $INPUT_TAG flows into a URL + Task template
       # substitution where quoting cannot be relied on; the guard is injection-safe
