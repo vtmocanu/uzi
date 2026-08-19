@@ -144,6 +144,7 @@ const MOCK_SETTINGS_KEY = "uzi.mock.v3";
 const SEED_USER_SETTINGS: UserSettings = {
   default_model: null,
   judge_model: null,
+  summary_model: null,
   theme: null,
   sidebar_token_ids: [],
 };
@@ -209,6 +210,8 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     (u.default_model === null || typeof u.default_model === "string") &&
     // Optional so a pre-#69 blob stays valid; absent reads as inherit.
     (u.judge_model === undefined || u.judge_model === null || typeof u.judge_model === "string") &&
+    // Optional so a pre-#362 blob stays valid; absent reads as inherit.
+    (u.summary_model === undefined || u.summary_model === null || typeof u.summary_model === "string") &&
     (u.theme === null || typeof u.theme === "string") &&
     // Optional so a pre-feature blob stays valid; absent reads as default-only.
     (u.sidebar_token_ids === undefined ||
@@ -250,9 +253,9 @@ function loadSettings(): { userSettings: UserSettings; appSettings: AppSettings 
       const parsed: unknown = JSON.parse(raw);
       if (isPersistedSettings(parsed)) {
         return {
-          userSettings: { ...parsed.userSettings },
-          // Merge over the seed so a pre-#362 blob (no summary_model) still yields a
-          // complete AppSettings shape; the persisted values win where present.
+          // Merge over the seed so a pre-#362 blob (no summary_model on either
+          // side) still yields a complete shape; the persisted values win where present.
+          userSettings: { ...SEED_USER_SETTINGS, ...parsed.userSettings },
           appSettings: { ...SEED_APP_SETTINGS, ...parsed.appSettings },
         };
       }
@@ -1920,6 +1923,15 @@ export const mockApi = {
         throw new ApiError(400, "judge_model must be a single token with no spaces");
       }
       userSettings = { ...userSettings, judge_model: trimmed === "" ? null : trimmed };
+    }
+    if (patch.summary_model !== undefined) {
+      // Same rules as judge_model (PRD #362 M2): blank clears to inherit, a value with
+      // internal whitespace is rejected, mirroring the server's ValidateModel.
+      const trimmed = patch.summary_model?.trim() ?? "";
+      if (trimmed !== "" && /\s/.test(trimmed)) {
+        throw new ApiError(400, "summary_model must be a single token with no spaces");
+      }
+      userSettings = { ...userSettings, summary_model: trimmed === "" ? null : trimmed };
     }
     if (patch.theme !== undefined) {
       const t = patch.theme?.trim() ?? "";

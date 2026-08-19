@@ -83,6 +83,10 @@ export interface UserSettings {
    *  judge_model (which itself falls back to opus). Written through PUT /me/settings
    *  alongside default_model, validated by the same model rules. */
   judge_model: string | null;
+  /** Per-user run-summary model override (PRD #362 M2); null means inherit the
+   *  instance summary_model (which itself falls back to haiku). Written through
+   *  PUT /me/settings alongside judge_model, validated by the same model rules. */
+  summary_model: string | null;
   theme: string | null;
   /** Ids of NON-default tokens whose rate meters the user also wants on the
    *  sidebar rail. The default token always shows and is never listed here.
@@ -97,6 +101,8 @@ export interface UserSettingsPatch {
   default_model?: string | null;
   /** Per-user judge model (PRD #69 M2); present-null clears back to inherit. */
   judge_model?: string | null;
+  /** Per-user run-summary model (PRD #362 M2); present-null clears back to inherit. */
+  summary_model?: string | null;
   theme?: string | null;
   /** Replaces the whole sidebar-token set (null clears it); absent leaves it. */
   sidebar_token_ids?: string[] | null;
