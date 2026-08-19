@@ -432,7 +432,11 @@ export class SdkExecutor implements Executor {
         await this.client.postPlanSummary(ctx.runId, {
           summary: r.summary,
           deltas: r.deltas,
-          plan_md: approvedPlan,
+          // Mirror the server's NUL-strip (SetRunAwaitingApproval stores
+          // stripNULParam(plan_md)) so the stale-write guard's `plan_md = @expected`
+          // matches the stored column even for a NUL-bearing plan — otherwise a lone
+          // 0x00 in the plan text would silently 409 every plan-summary write.
+          plan_md: approvedPlan.replaceAll("\u0000", ""),
         });
       }
     } catch (err) {
