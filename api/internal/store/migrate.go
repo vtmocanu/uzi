@@ -76,7 +76,7 @@ func Migrate(ctx context.Context, dsn string) error {
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := goose.UpContext(ctx, db, "migrations"); err != nil {
 		return fmt.Errorf("run migrations: %w", err)
@@ -96,7 +96,7 @@ func MigrateTo(ctx context.Context, dsn string, version int64) error {
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := goose.UpToContext(ctx, db, "migrations", version); err != nil {
 		return fmt.Errorf("run migrations to %d: %w", version, err)
@@ -114,13 +114,13 @@ func openForMigrate(ctx context.Context, dsn string) (*sql.DB, error) {
 	}
 
 	if err := waitForDB(ctx, db); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 
 	goose.SetBaseFS(migrationFS)
 	if err := goose.SetDialect("postgres"); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("set goose dialect: %w", err)
 	}
 	return db, nil
