@@ -167,26 +167,26 @@ func TestTUIBoardFilter(t *testing.T) {
 	}
 }
 
-// Quit is confirmed, and BOTH q and ctrl+c route through the modal — a stray key must
-// not drop a watched run. A second ctrl+c is the escape hatch.
-func TestTUIQuitIsConfirmed(t *testing.T) {
+// q quits immediately (user preference), while ctrl+c still routes through the confirm modal
+// so a stray ctrl+c cannot drop a watched run; a second ctrl+c is the escape hatch.
+func TestTUIQuitKeys(t *testing.T) {
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
 
-	m = press(t, m, keyQuit)
-	if !m.quitting {
-		t.Fatal("q did not open the quit confirmation")
+	// q quits at once: it returns the quit command and never opens the modal.
+	next, cmd := m.handleKey(keyQuit)
+	m = next.(tuiModel)
+	if cmd == nil {
+		t.Error("q did not return a quit command")
 	}
-	if !strings.Contains(m.View().Content, "Quit") {
-		t.Error("the quit confirmation is not rendered")
-	}
-	// Any other key cancels.
-	m = press(t, m, "x")
 	if m.quitting {
-		t.Error("a non-confirming key did not dismiss the quit modal")
+		t.Error("q opened the confirm modal; it should quit immediately")
+	}
+	if strings.Contains(m.View().Content, "Quit uzi tui?") {
+		t.Error("q rendered the quit confirmation; it should quit immediately")
 	}
 
-	// ctrl+c opens the same modal rather than quitting outright.
-	next, cmd := m.handleKey(keyCtrlC)
+	// ctrl+c opens the confirm modal rather than quitting outright.
+	next, cmd = m.handleKey(keyCtrlC)
 	m = next.(tuiModel)
 	if !m.quitting {
 		t.Error("ctrl+c did not route through the confirm modal")
@@ -194,7 +194,13 @@ func TestTUIQuitIsConfirmed(t *testing.T) {
 	if cmd != nil {
 		t.Error("the first ctrl+c returned a command; it must only open the modal")
 	}
+	// Any other key cancels the modal.
+	m = press(t, m, "x")
+	if m.quitting {
+		t.Error("a non-confirming key did not dismiss the quit modal")
+	}
 	// The second ctrl+c quits immediately — the way out when the modal is the problem.
+	m = press(t, m, keyCtrlC)
 	if _, cmd = m.handleKey(keyCtrlC); cmd == nil {
 		t.Error("a second ctrl+c did not quit; there must be an escape hatch that does not depend on the modal")
 	}
@@ -1043,6 +1049,175 @@ func TestReadStreamCmdBatchesQueuedEvents(t *testing.T) {
 		if seq != int32(i+1) {
 			t.Fatalf("events arrived out of order: %v", got)
 		}
+	}
+}
+
+// The [h] toggle hides terminal runs (completed/failed/cancelled) and keeps the active +
+// needs-you set, without a refetch. The header shows the mode and the footer key flips
+// label; pressing h again restores the full board.
+func TestTUIBoardHideDoneToggle(t *testing.T) {
+	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "running", IssueTitle: "live one"}},
+		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "awaiting_approval", IssueTitle: "needs you"}},
+		{RunDTO: apitypes.RunDTO{ID: "cccccccc-3", Kind: "issue", Status: "completed", IssueTitle: "done one"}},
+		{RunDTO: apitypes.RunDTO{ID: "dddddddd-4", Kind: "issue", Status: "failed", IssueTitle: "done two"}},
+		{RunDTO: apitypes.RunDTO{ID: "eeeeeeee-5", Kind: "issue", Status: "cancelled", IssueTitle: "done three"}},
+	}}
+	m := tuiTestModel(t, fake, "")
+	next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
+	m = next.(tuiModel)
+
+	if n := len(m.board.visible()); n != 5 {
+		t.Fatalf("expected 5 runs visible before the toggle, got %d", n)
+	}
+
+	m = press(t, m, keyHideDone)
+	if !m.board.hideDone {
+		t.Fatal("h did not set hideDone")
+	}
+	vis := m.board.visible()
+	if len(vis) != 2 {
+		t.Fatalf("hideDone should keep 2 (running + awaiting_approval), got %d", len(vis))
+	}
+	for _, r := range vis {
+		if terminalRunStatuses[r.Status] {
+			t.Errorf("terminal run %s (%s) still visible under hideDone", r.ID, r.Status)
+		}
+	}
+	out := m.View().Content
+	for _, want := range []string{"active only", "show done"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("board view missing %q under hideDone\n%s", want, out)
+		}
+	}
+
+	m = press(t, m, keyHideDone)
+	if m.board.hideDone || len(m.board.visible()) != 5 {
+		t.Errorf("second h did not restore the full board (hideDone=%v, %d visible)", m.board.hideDone, len(m.board.visible()))
+	}
+	if !strings.Contains(m.View().Content, "hide done") {
+		t.Errorf("footer did not return to 'hide done'\n%s", m.View().Content)
+	}
+}
+
+// On the admin board [h] is a no-op — AdminListRuns returns non-terminal runs only — so it
+// must not flip the header label or the footer hint (a visible change with no row change
+// reads as a broken toggle). The "hide done" key hint is dropped there entirely.
+func TestTUIBoardHideDoneInertOnAdminBoard(t *testing.T) {
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+	m = press(t, m, keyAdmin)
+	next, _ := m.Update(boardRunsMsg{admin: true, runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "cccccccc-1", Kind: "issue", Status: "running", IssueTitle: "live"}},
+	}})
+	m = next.(tuiModel)
+
+	if strings.Contains(m.View().Content, "hide done") {
+		t.Error("admin board footer should not offer the hide-done toggle")
+	}
+	m = press(t, m, keyHideDone)
+	out := m.View().Content
+	if strings.Contains(out, "active only") {
+		t.Errorf("h flipped the header label on the admin board, where it is a no-op\n%s", out)
+	}
+	if strings.Contains(out, "show done") {
+		t.Errorf("h flipped the footer hint on the admin board, where it is a no-op\n%s", out)
+	}
+}
+
+// When [h] hides every run because they are all terminal, the empty state says so rather
+// than the misleading "No runs yet".
+func TestTUIBoardHideDoneEmptyState(t *testing.T) {
+	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "completed", IssueTitle: "done one"}},
+		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "failed", IssueTitle: "done two"}},
+	}}
+	m := tuiTestModel(t, fake, "")
+	next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
+	m = press(t, next.(tuiModel), keyHideDone)
+
+	out := m.View().Content
+	if strings.Contains(out, "No runs yet") {
+		t.Errorf("all-terminal board under hideDone shows the misleading 'No runs yet'\n%s", out)
+	}
+	if !strings.Contains(out, "finished runs are hidden") {
+		t.Errorf("empty state should explain the hidden finished runs\n%s", out)
+	}
+}
+
+// The judge marker is a right-aligned column: markers of different widths end at the same
+// column, so every verdict-carrying row has the same total visual width. The pre-fix board
+// trailed the marker straight after the title, so a shorter marker produced a narrower row.
+func TestTUIBoardJudgeMarkerRightAligned(t *testing.T) {
+	issues, okVerdict := "issues", "ok"
+	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "completed", IssueTitle: "alpha"}, JudgeVerdict: &issues, JudgeTodoCount: 2}, // "⚖ issues · 2" — widest
+		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "completed", IssueTitle: "beta"}, JudgeVerdict: &okVerdict},                  // "⚖ ok" — narrowest, no count
+	}}
+	m := tuiTestModel(t, fake, "")
+	next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
+	out := next.(tuiModel).View().Content
+
+	var widths []int
+	for _, r := range strings.Split(out, "\n") {
+		if strings.Contains(r, "⚖") {
+			widths = append(widths, visualWidth(r))
+		}
+	}
+	if len(widths) != 2 {
+		t.Fatalf("expected 2 judge-marker rows, got %d\n%s", len(widths), out)
+	}
+	if widths[0] != widths[1] {
+		t.Errorf("judge markers not right-aligned: verdict rows have unequal width %d vs %d\n%s", widths[0], widths[1], out)
+	}
+}
+
+// With more runs than fit the terminal height, the board windows the list so the header and
+// footer stay on screen (the footer carries the key legend — it must never scroll off), a
+// position readout shows where you are, and scrolling keeps the cursor in view.
+func TestTUIBoardWindowsToHeightAndKeepsFooter(t *testing.T) {
+	runs := make([]apitypes.RunListItemDTO, 0, 100)
+	for i := 0; i < 100; i++ {
+		runs = append(runs, apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{
+			ID: fmt.Sprintf("%08d-1111-2222-3333-444444444444", i), Kind: "issue", Status: "running",
+			IssueTitle: fmt.Sprintf("run %d", i)}})
+	}
+	fake := &uzicli.FakeClient{Runs: runs}
+	m := tuiTestModel(t, fake, "")
+	m.width, m.height = 120, 24
+	next, _ := m.Update(boardRunsMsg{runs: runs})
+	m = next.(tuiModel)
+
+	linesFit := func(out string) {
+		t.Helper()
+		if n := len(strings.Split(out, "\n")); n > m.height {
+			t.Errorf("board rendered %d lines at height %d — it must window to fit", n, m.height)
+		}
+	}
+	footerShown := func(out string) {
+		t.Helper()
+		if !strings.Contains(out, "q quit") {
+			t.Errorf("footer key legend missing — it scrolled off the bottom\n%s", out)
+		}
+	}
+
+	out := m.View().Content
+	linesFit(out)
+	footerShown(out)
+	if !strings.Contains(out, "of 100") {
+		t.Errorf("windowed board should show a position readout (\"…of 100\")\n%s", out)
+	}
+
+	// Drive the cursor far down; the footer and height cap must still hold, and the selected
+	// run must be on screen.
+	for i := 0; i < 60; i++ {
+		m = press(t, m, "j")
+	}
+	out = m.View().Content
+	linesFit(out)
+	footerShown(out)
+	sel, _ := m.board.selected()
+	if !strings.Contains(out, shortRunID(sel.ID)) {
+		t.Errorf("cursor scrolled out of the window: selected %s not rendered\n%s", sel.ID, out)
 	}
 }
 
