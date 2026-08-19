@@ -8,27 +8,28 @@ import tea "charm.land/bubbletea/v2"
 // owns the actions; the binding is settled here so it never moves), `a` is the admin
 // toggle only, `r` is refresh only.
 const (
-	keyQuit      = "q"
-	keyCtrlC     = "ctrl+c"
-	keyEnter     = "enter"
-	keyEsc       = "esc"
-	keyUp        = "up"
-	keyDown      = "down"
-	keyLeft      = "left"
-	keyRight     = "right"
-	keyTab       = "tab"
-	keyFilter    = "/"
-	keyHelp      = "?"
-	keyAdmin     = "a"
-	keyRefresh   = "r"
-	keyConfirmY  = "y"
-	keyConfirmN  = "n"
-	keyGoLive    = "g" // M5: re-attach the transcript follow (f is already follow-up)
-	keyPageUp    = "pgup"
-	keyPageDown  = "pgdown"
-	keyHome      = "home"
-	keyEnd       = "end"
-	keySpaceName = "space" // v2 names the space key "space", never " "
+	keyQuit         = "q"
+	keyCtrlC        = "ctrl+c"
+	keyEnter        = "enter"
+	keyEsc          = "esc"
+	keyUp           = "up"
+	keyDown         = "down"
+	keyLeft         = "left"
+	keyRight        = "right"
+	keyTab          = "tab"
+	keyFilter       = "/"
+	keyHelp         = "?"
+	keyAdmin        = "a"
+	keyRefresh      = "r"
+	keyConfirmY     = "y"
+	keyConfirmN     = "n"
+	keyGoLive       = "g" // M5: re-attach the transcript follow (f is already follow-up)
+	keyCollapseCrew = "c" // fold the crew list to a summary so the milestone block is reachable
+	keyPageUp       = "pgup"
+	keyPageDown     = "pgdown"
+	keyHome         = "home"
+	keyEnd          = "end"
+	keySpaceName    = "space" // v2 names the space key "space", never " "
 )
 
 // keyString normalizes a v2 key press to the string form the switches below compare
@@ -74,6 +75,7 @@ func helpLines(inDetail bool) []string {
 			"tab        cycle the focused pane",
 			"↑ / ↓      move within the focused pane (agents · scroll)",
 			"g          follow live: re-attach and jump to newest (live runs)",
+			"c          collapse the crew list (keeps the milestone block in view)",
 		}, common...)
 	}
 	return append([]string{
