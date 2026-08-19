@@ -55,8 +55,8 @@ jobs:
     steps:
       # No `ref:` -- a scheduled run checks out the default branch (main) HEAD,
       # which is exactly the tree a skipped commit may have left broken.
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: "24"
           cache: npm
