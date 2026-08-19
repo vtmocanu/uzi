@@ -249,13 +249,10 @@ func laneSuffixes(lanes []agentLane) map[string]string {
 // transcript is the whole run in seq order. It reuses the merged, deduped frame log the
 // per-lane view is filtered from — no second stream, no second follow path.
 func allLane(frames []laneFrame) agentLane {
-	var last time.Time
-	for _, f := range frames {
-		if f.CreatedAt.After(last) {
-			last = f.CreatedAt
-		}
-	}
-	return agentLane{Key: laneAllKey, Role: laneAllRole, Frames: frames, LastActivity: last}
+	// No LastActivity scan: the ALL row wears a fixed neutral ◉ (laneRow), so its crew state — and
+	// the LastActivity that would feed crewStateFor — is never read. Frames stay in seq order for
+	// the aggregated transcript.
+	return agentLane{Key: laneAllKey, Role: laneAllRole, Frames: frames}
 }
 
 // frameAgentTag names the actor a single frame belongs to, for the per-line attribution the

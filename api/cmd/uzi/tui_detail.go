@@ -144,11 +144,29 @@ func (d *detailState) addFrame(f laneFrame) {
 }
 
 func (d *detailState) rebuild() {
+	// The user's selection is tracked by lane KEY, not index: prepending the aggregated lane at
+	// index 0 (below) shifts every real lane down one the instant a run grows from 1 to ≥2 lanes,
+	// and re-pinning the same index would silently swap the transcript the user is reading for the
+	// firehose. Capture the selected key before the rebuild and restore it after.
+	var selKey string
+	if d.laneIdx >= 0 && d.laneIdx < len(d.lanes) {
+		selKey = d.lanes[d.laneIdx].Key
+	}
 	d.lanes = buildLanes(d.frames)
-	// Prepend the aggregated "all agents" lane once a run has ≥2 real lanes, so index 0 is
-	// the firehose (the default landing) and the individual lanes follow for isolating one.
+	// Prepend the aggregated "all agents" lane once a run has ≥2 real lanes, so index 0 is the
+	// firehose and the individual lanes follow for isolating one. On the FIRST build there is no
+	// prior selection (selKey ""), so the restore below is skipped and the default index 0 lands on
+	// the firehose — the intended opening view for a multi-lane run.
 	if len(d.lanes) >= 2 {
 		d.lanes = append([]agentLane{allLane(d.frames)}, d.lanes...)
+	}
+	if selKey != "" {
+		for i, l := range d.lanes {
+			if l.Key == selKey {
+				d.laneIdx = i
+				break
+			}
+		}
 	}
 	if d.laneIdx >= len(d.lanes) {
 		d.laneIdx = len(d.lanes) - 1
@@ -532,9 +550,13 @@ func (m tuiModel) renderLaneRail() string {
 	}
 
 	suffixes := laneSuffixes(d.lanes)
-	// The ALL row ignores this state (laneRow paints it a neutral ◉), so a plain per-key ladder
-	// is fine for every row — no rollup.
+	// The ALL row wears a fixed neutral ◉ (laneRow ignores the state it is handed), so short-circuit
+	// it here rather than computing a crew state nothing reads. Every real row is a plain per-key
+	// ladder — no rollup.
 	st := func(l agentLane) crewState {
+		if l.Key == laneAllKey {
+			return crewIdle
+		}
 		return crewStateFor(d.run.Status, d.run.Health, l.Key, active, l.LastActivity, now)
 	}
 	if d.railCollapsed {
@@ -723,13 +745,16 @@ func (m tuiModel) renderMilestones() string {
 // buildTranscriptLines renders a lane's frames to human-readable display lines (no windowing),
 // so the follow/scroll windowing and the line-count extent share one layout. The presentation
 // is written for a person, not a log reader:
-//   - text/thinking  the message body (markdown), with NO "text #123" header — the body is the
+//   - text           the message body (markdown), with NO "text #123" header — the body is the
 //     message. In the aggregated lane it gets a tungsten "▪ <who>" speaker line so interleaved
 //     turns stay attributable; a single-lane view needs none (the pane title names the lane).
+//   - thinking       the same, but marked "thinking" (faint) so the model's INTERNAL reasoning is
+//     never read as its output.
 //   - tool_use       "⚙ <Tool>  <what it ran>" — the tool plus a compact arg preview (the
 //     command / path / pattern), never the internal seq.
-//   - tool_result    a faint "  ↳ <summary>" folded UNDER its call, the escaped-newline JSON
-//     dump flattened to one readable line (resultSummary) instead of raw "{"content":"…\n…"}".
+//   - tool_result    a faint "  ↳ <summary>" folded UNDER its own call (paired by id), flattened
+//     to one readable line (resultSummary). A failed call (is_error) gets a ✗; an ORPHAN result —
+//     a parallel call's result seq-interleaved away from its use — names its own tool + actor.
 //   - anything else  a humanized "▪ <kind>" header (no seq) over its body.
 //
 // Every model-authored string is UNTRUSTED and passes through Plain/Markdown (D7); the whole
@@ -753,6 +778,31 @@ func (m tuiModel) buildTranscriptLines(lane agentLane) []string {
 			id = m.renderer.Plain(frameAgentTag(f), 16)
 		}
 		return id
+	}
+	// tightNext[i] is true when frame i is a tool_use IMMEDIATELY followed by ITS OWN result
+	// (matched by id, not merely by the next frame being a tool_result). A single assistant turn
+	// with parallel tool calls persists as [use A, use B, result A, result B]; keying the pair off
+	// the next frame's kind alone would fold result A under call B and mis-title it. names resolves
+	// a result's tool by its use id, so an ORPHAN result (its call not directly above it) can still
+	// name the tool it belongs to.
+	tightNext := make([]bool, len(lane.Frames))
+	names := map[string]string{}
+	for i, f := range lane.Frames {
+		if f.Kind != "tool_use" {
+			continue
+		}
+		id := toolUseID(f)
+		if id == "" {
+			continue
+		}
+		if n, ok := toolFrameName(f); ok {
+			names[id] = n
+		}
+		if i+1 < len(lane.Frames) {
+			if nx := lane.Frames[i+1]; nx.Kind == "tool_result" && resultUseID(nx) == id {
+				tightNext[i] = true
+			}
+		}
 	}
 	var sb strings.Builder
 	for i, f := range lane.Frames {
@@ -781,13 +831,57 @@ func (m tuiModel) buildTranscriptLines(lane agentLane) []string {
 			if sum == "" {
 				sum = "(no output)"
 			}
-			block = clampVisual(m.pal.faint.Render("  ↳ "+m.renderer.Plain(sum, 200)), width)
+			// ✗ marks a FAILED tool call (is_error) — a glyph, not just a colour, so the failure
+			// survives a NO_COLOR/Ascii profile the way the header's ▲ does; the alarm colour rides
+			// on top for a colour terminal. The web shows the same signal as a red "✗ error" chip
+			// (PRD #116 classifyResultState), and dropping it made a failing run read like a passing
+			// one.
+			line := m.pal.faint.Render("  ↳ ")
+			if resultIsError(f.Payload) {
+				line += lipgloss.NewStyle().Foreground(m.pal.alarm).Render("✗ ")
+			}
+			// A result folded UNDER its own call (tightNext[i-1]) inherits that call's
+			// "⚙ <Tool> · <who>" line, so it repeats nothing. An ORPHAN result — a parallel call's
+			// result seq-separated from its use, or a result whose use is missing — carries its own
+			// tool name + actor so it stays attributable (the aggregated lane's whole purpose).
+			if i == 0 || !tightNext[i-1] {
+				seg := ""
+				if name := names[resultUseID(f)]; name != "" {
+					seg = tungstenB.Render(m.renderer.Plain(name, 24))
+				}
+				if w := who(f); w != "" {
+					if seg != "" {
+						seg += m.pal.faint.Render(" · ")
+					}
+					seg += tungsten.Render(w)
+				}
+				if seg != "" {
+					line += seg + m.pal.faint.Render("  ")
+				}
+			}
+			line += m.pal.faint.Render(m.renderer.Plain(sum, 200))
+			block = clampVisual(line, width)
 		case "text", "thinking":
 			// TrimLeft drops Glamour's document top-margin so the body sits directly under the
 			// "▪ <who>" speaker line instead of a blank line below it.
 			body := strings.TrimLeft(m.renderer.Markdown(transcriptText(f)), "\n")
+			head := ""
 			if w := who(f); w != "" {
-				block = tungsten.Render("▪ "+w) + "\n"
+				head = tungsten.Render("▪ " + w)
+			}
+			if f.Kind == "thinking" {
+				// The model's INTERNAL reasoning, not its output: mark it so a reader never mistakes
+				// a private deliberation for something the agent "said". Faint, riding the speaker
+				// header when aggregated, else a lone faint eyebrow (text keeps none — the pane title
+				// names the lane).
+				if head != "" {
+					head += m.pal.faint.Render(" · thinking")
+				} else {
+					head = m.pal.faint.Render("▪ thinking")
+				}
+			}
+			if head != "" {
+				block = head + "\n"
 			}
 			block += body
 		default:
@@ -797,10 +891,10 @@ func (m tuiModel) buildTranscriptLines(lane agentLane) []string {
 			}
 			block = clampVisual(head, width) + "\n" + strings.TrimLeft(m.renderer.Markdown(transcriptText(f)), "\n")
 		}
-		// Blocks are blank-line separated, EXCEPT a tool_use and the tool_result that follows it
-		// pair tight (a single newline), so a call and its output read as one unit.
+		// Blocks are blank-line separated, EXCEPT a tool_use and ITS OWN result (tightNext, matched
+		// by id) pair tight (a single newline), so a call and its output read as one unit.
 		sep := "\n\n"
-		if f.Kind == "tool_use" && i+1 < len(lane.Frames) && lane.Frames[i+1].Kind == "tool_result" {
+		if tightNext[i] {
 			sep = "\n"
 		}
 		sb.WriteString(block + sep)
@@ -821,6 +915,22 @@ func toolFrameName(f laneFrame) (string, bool) {
 		return p.Name, true
 	}
 	return "", false
+}
+
+// toolUseID pulls a tool_use frame's SDK id ("id"), the key a tool_result references back via
+// "tool_use_id". Empty for a non-tool_use frame or one carrying no id — in which case the pairing
+// falls back to unpaired (blank-line separated) rather than guessing.
+func toolUseID(f laneFrame) string {
+	if f.Kind != "tool_use" || len(f.Payload) == 0 {
+		return ""
+	}
+	var p struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(f.Payload, &p) == nil {
+		return p.ID
+	}
+	return ""
 }
 
 // toolArgPreview renders a tool_use's arguments as a compact one-liner for the transcript, so a
@@ -876,6 +986,35 @@ func resultSummary(payload json.RawMessage) string {
 		return compactText(strings.Join(parts, " "))
 	}
 	return ""
+}
+
+// resultUseID pulls a tool_result frame's "tool_use_id" — the id of the tool_use it answers, used
+// to pair a result with its own call (buildTranscriptLines) instead of with whatever frame happens
+// to sit above it in seq order.
+func resultUseID(f laneFrame) string {
+	if f.Kind != "tool_result" || len(f.Payload) == 0 {
+		return ""
+	}
+	var p struct {
+		ToolUseID string `json:"tool_use_id"`
+	}
+	if json.Unmarshal(f.Payload, &p) == nil {
+		return p.ToolUseID
+	}
+	return ""
+}
+
+// resultIsError reports whether a tool_result payload carries is_error:true — a failed (or
+// guardrail-denied) tool call. The flag is passed through verbatim from the upstream SDK
+// (agent/src/sdk-messages.ts); a malformed or absent flag reads as not-an-error.
+func resultIsError(payload json.RawMessage) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	var p struct {
+		IsError bool `json:"is_error"`
+	}
+	return json.Unmarshal(payload, &p) == nil && p.IsError
 }
 
 // transcriptViewport is the transcript's visible line budget (the pane title is a fixed
