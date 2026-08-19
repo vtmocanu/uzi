@@ -299,6 +299,26 @@ func TestHandoffRmDeletesBranch(t *testing.T) {
 	}
 }
 
+// rm on a --mr task that has NOT actually opened an MR yet (OpenMr intent set, but
+// MrWebURL still nil — e.g. a --mr handoff that failed at push/dispatch) PROCEEDS:
+// the exemption keys on an actually-opened MR, so an orphaned branch stays deletable.
+func TestHandoffRmOpenMrIntentWithoutMRProceeds(t *testing.T) {
+	run := taskRun("r7b", "uzi/task/r7b")
+	run.OpenMr = true // intent only; MrWebURL stays nil (no MR opened)
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r7b": run}}
+	rec := &handoffRecorder{}
+	env, _ := handoffEnv(fc, rec)
+
+	_, _, code := runCLI(t, env, "handoff", "rm", "r7b")
+	if code != uzicli.ExitOK {
+		t.Fatalf("rm of a --mr task with no opened MR must proceed, got exit %d", code)
+	}
+	wantDelete := []string{"push", "origin", "--delete", "uzi/task/r7b"}
+	if !hasGitCall(rec, wantDelete) {
+		t.Errorf("rm should delete the orphaned branch; git calls %v", rec.gitCalls)
+	}
+}
+
 // rm on a task that opened an MR is refused, and does NOT delete the branch.
 func TestHandoffRmMRExempt(t *testing.T) {
 	mrURL := "https://forge/mr/1"
@@ -314,6 +334,34 @@ func TestHandoffRmMRExempt(t *testing.T) {
 	}
 	if len(rec.gitCalls) != 0 {
 		t.Errorf("an MR-exempt rm must not run git: %v", rec.gitCalls)
+	}
+}
+
+// A --base that starts with '-' is rejected (it would be misparsed by git push as an
+// option in the refspec argv element): usage error, and nothing is pushed or dispatched.
+func TestHandoffBaseLeadingDashRejected(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		CreatedTaskRun: taskRun("r9", "uzi/task/r9"),
+		DispatchedRun:  taskRun("r9", "uzi/task/r9"),
+	}
+	rec := &handoffRecorder{}
+	env, _ := handoffEnv(fc, rec)
+
+	_, _, code := runCLI(t, env, "handoff", "--repo", "p1", "-m", "x", "--base", "--receive-pack=evil")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage)", code, uzicli.ExitUsage)
+	}
+	// Rejected BEFORE create, so no orphaned run and nothing pushed/dispatched.
+	if fc.LastCreateTaskRepoID != "" {
+		t.Errorf("a leading-dash --base must be rejected before create, but create ran (repo=%q)", fc.LastCreateTaskRepoID)
+	}
+	for _, g := range rec.gitCalls {
+		if len(g) > 0 && g[0] == "push" {
+			t.Errorf("a leading-dash --base must not reach a git push: %v", rec.gitCalls)
+		}
+	}
+	if fc.LastDispatchRunID != "" {
+		t.Errorf("dispatch must not run after a rejected --base, got %q", fc.LastDispatchRunID)
 	}
 }
 

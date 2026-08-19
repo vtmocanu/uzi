@@ -66,6 +66,13 @@ func runHandoffCreate(env Env, gf *globalFlags, cmd *cobra.Command) error {
 	if strings.TrimSpace(context) == "" {
 		return uzicli.Exitf(uzicli.ExitUsage, "a handoff needs context: pass -m <text>, -f <file>, or pipe it on stdin")
 	}
+	// Validate --base BEFORE creating the run, so a bad ref never leaves an orphaned
+	// task run behind. A git refname cannot begin with '-', and a leading-dash srcRef
+	// would be misparsed by `git push` as an option (e.g. --receive-pack=...) inside the
+	// refspec argv element rather than as a ref.
+	if b := strings.TrimSpace(base); strings.HasPrefix(b, "-") {
+		return uzicli.Exitf(uzicli.ExitUsage, "--base %q is not a valid ref (a ref cannot start with '-')", b)
+	}
 
 	c, err := env.client(gf)
 	if err != nil {
@@ -93,7 +100,7 @@ func runHandoffCreate(env Env, gf *globalFlags, cmd *cobra.Command) error {
 	// source ref is `base` when --base is set, else HEAD.
 	srcRef := "HEAD"
 	if b := strings.TrimSpace(base); b != "" {
-		srcRef = b
+		srcRef = b // validated non-leading-dash above, before the run was created
 	}
 	if _, err := env.Git(".", "push", "origin", srcRef+":refs/heads/"+branch); err != nil {
 		return uzicli.Exitf(uzicli.ExitGeneric,
@@ -244,9 +251,13 @@ func runHandoffRm(env Env, gf *globalFlags, cmd *cobra.Command, id string) error
 	if run.Kind != "task" {
 		return uzicli.Exitf(uzicli.ExitUsage, "run %s is not a handoff task (kind=%s)", id, run.Kind)
 	}
-	// An --mr branch is the source of a live merge request; deleting it would break the
-	// MR. MrWebURL (set once the worker opens it) OR the OpenMr request flag both mark it.
-	if run.MrWebURL != nil || run.OpenMr {
+	// An open merge request needs its source branch, so a task that ACTUALLY opened one
+	// (MrWebURL set once the worker opens it) is exempt. Keying on MrWebURL, not the
+	// OpenMr *intent* flag: a --mr handoff that failed at push/dispatch before the worker
+	// ever opened an MR carries OpenMr=true but has no MR — its branch would otherwise be
+	// orphaned with no CLI path to delete it (and the create-time failure hints recommend
+	// exactly this command).
+	if run.MrWebURL != nil {
 		return uzicli.Exitf(uzicli.ExitGeneric,
 			"task %s opened a merge request; its branch is exempt from rm — delete it via the merge request", id)
 	}
