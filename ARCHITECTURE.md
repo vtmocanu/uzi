@@ -602,7 +602,7 @@ chain in the diagram above, with no intervening `running`.
   user-facing actions. The worker also generates a short plain-English intent
   summary before planning and a plan summary + deltas at this gate, both
   advisory (skipped on any failure, never blocking the run) and spent on the
-  run owner's own token — see [PRD #362](prds/362-run-summaries.md) and
+  run owner's own token — see [PRD #362](prds/done/362-run-summaries.md) and
   [docs/run-summaries.md](docs/run-summaries.md).
 - **running ⇄ awaiting_input — the run's third human-in-the-loop channel**
   ([PRD #88](prds/done/88-ask-user-clarification.md)), beside the plan gate above
