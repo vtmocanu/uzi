@@ -137,11 +137,13 @@ RETURNING summary_model;
 
 -- name: GetUserSettings :one
 -- The current user's own (non-secret) settings surface: default worker model
--- (PRD #17), per-user judge model override (PRD #69), UI theme override
--- (PRD #21), and the sidebar token-meter choice (00123). NULL = inherit / use
--- the instance default / default-token-only. Own-user only; the caller passes
--- the session user's id.
-SELECT default_model, judge_model, theme, sidebar_token_ids FROM users WHERE id = $1;
+-- (PRD #17), per-user judge model override (PRD #69), per-user run-summary model
+-- override (PRD #362 M2), UI theme override (PRD #21), and the sidebar token-meter
+-- choice (00123). NULL = inherit / use the instance default / default-token-only.
+-- Own-user only; the caller passes the session user's id. summary_model rides this
+-- one-row read for the settings surface (GetUserSummaryModel stays the narrow read
+-- for issue-run claim assembly), so the settings response needs no second query.
+SELECT default_model, judge_model, summary_model, theme, sidebar_token_ids FROM users WHERE id = $1;
 
 -- name: SetUserTheme :one
 -- Sets (or clears, when @theme is NULL) the current user's theme override.

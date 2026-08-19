@@ -44,20 +44,15 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	// summary_model is not part of GetUserSettings' narrow read (it rides the
-	// issue-run claim, not the settings surface), so fetch it on its own column
-	// query — mirrors judge_model's own-column read at claim assembly (PRD #362 M2).
-	summaryModel, err := h.q.GetUserSummaryModel(r.Context(), userID)
-	if err != nil {
-		slog.Error("get user summary model", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
-	}
+	// summary_model rides the GetUserSettings one-row read (it is the same users row),
+	// so the settings surface reads it from `s` — no separate query. GetUserSummaryModel
+	// stays the narrow read for issue-run claim assembly, where no other user field is
+	// needed (PRD #362 M2).
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"settings": userSettingsDTO{
 			DefaultModel:    textPtrValue(s.DefaultModel.Valid, s.DefaultModel.String),
 			JudgeModel:      textPtrValue(s.JudgeModel.Valid, s.JudgeModel.String),
-			SummaryModel:    textPtrValue(summaryModel.Valid, summaryModel.String),
+			SummaryModel:    textPtrValue(s.SummaryModel.Valid, s.SummaryModel.String),
 			Theme:           textPtrValue(s.Theme.Valid, s.Theme.String),
 			SidebarTokenIds: uuidStrings(s.SidebarTokenIds),
 		},

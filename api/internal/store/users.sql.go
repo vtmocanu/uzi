@@ -302,27 +302,31 @@ func (q *Queries) GetUserJudgeModel(ctx context.Context, id uuid.UUID) (pgtype.T
 }
 
 const getUserSettings = `-- name: GetUserSettings :one
-SELECT default_model, judge_model, theme, sidebar_token_ids FROM users WHERE id = $1
+SELECT default_model, judge_model, summary_model, theme, sidebar_token_ids FROM users WHERE id = $1
 `
 
 type GetUserSettingsRow struct {
 	DefaultModel    pgtype.Text `json:"default_model"`
 	JudgeModel      pgtype.Text `json:"judge_model"`
+	SummaryModel    pgtype.Text `json:"summary_model"`
 	Theme           pgtype.Text `json:"theme"`
 	SidebarTokenIds []uuid.UUID `json:"sidebar_token_ids"`
 }
 
 // The current user's own (non-secret) settings surface: default worker model
-// (PRD #17), per-user judge model override (PRD #69), UI theme override
-// (PRD #21), and the sidebar token-meter choice (00123). NULL = inherit / use
-// the instance default / default-token-only. Own-user only; the caller passes
-// the session user's id.
+// (PRD #17), per-user judge model override (PRD #69), per-user run-summary model
+// override (PRD #362 M2), UI theme override (PRD #21), and the sidebar token-meter
+// choice (00123). NULL = inherit / use the instance default / default-token-only.
+// Own-user only; the caller passes the session user's id. summary_model rides this
+// one-row read for the settings surface (GetUserSummaryModel stays the narrow read
+// for issue-run claim assembly), so the settings response needs no second query.
 func (q *Queries) GetUserSettings(ctx context.Context, id uuid.UUID) (GetUserSettingsRow, error) {
 	row := q.db.QueryRow(ctx, getUserSettings, id)
 	var i GetUserSettingsRow
 	err := row.Scan(
 		&i.DefaultModel,
 		&i.JudgeModel,
+		&i.SummaryModel,
 		&i.Theme,
 		&i.SidebarTokenIds,
 	)

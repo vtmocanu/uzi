@@ -124,23 +124,46 @@ export function validatePrdPath(p: string): boolean {
 // charset matches `..`); `validatePrdPath` is what rejects traversal.
 const PRD_LINK_RE = /prds\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.md/g;
 
+// The PRD number encoded in a core's filename basename: both `prds/362-x.md` and
+// `prds/done/362-x.md` yield 362. Null when the basename has no leading integer. Used
+// to prefer the PRD whose number matches the run's issue iid (the repo convention is
+// `prds/<issue-number>-slug.md`).
+function prdCoreNumber(core: string): number | null {
+  const base = core.slice(core.lastIndexOf("/") + 1);
+  const m = /^(\d+)/.exec(base);
+  return m ? Number.parseInt(m[1]!, 10) : null;
+}
+
 /**
- * Finds the first VALID `prds/…*.md` core in `text`. Matches candidate cores
- * directly (the whole match IS the core — a blob-URL prefix and `#`/`?` suffix
- * fall outside it by construction), scanning at most {@link MAX_DESC_SCAN}
- * characters of the untrusted input, and returns the first core that passes
- * `validatePrdPath`. Returns null when none is valid.
+ * Finds a VALID `prds/…*.md` core in `text`. Matches candidate cores directly (the
+ * whole match IS the core — a blob-URL prefix and `#`/`?` suffix fall outside it by
+ * construction), scanning at most {@link MAX_DESC_SCAN} characters of the untrusted
+ * input, and returns a core that passes `validatePrdPath`. Returns null when none is
+ * valid.
+ *
+ * When `preferIid` is given, a valid core whose filename number equals it wins over
+ * document order — an issue body that mentions another PRD ("supersedes
+ * prds/100-old.md") BEFORE its own would otherwise resolve to the wrong PRD. With no
+ * iid match (or no `preferIid`), it falls back to the FIRST valid core, so the common
+ * single-link case and any non-conventional numbering are unchanged.
  */
-export function findValidPrdCore(text: string): string | null {
+export function findValidPrdCore(
+  text: string,
+  preferIid?: number | null,
+): string | null {
   // Bound the untrusted scan (defense-in-depth; see MAX_DESC_SCAN).
   const scanned = (text ?? "").slice(0, MAX_DESC_SCAN);
   // Fresh regex state per call (the shared literal carries the `g` flag).
   const re = new RegExp(PRD_LINK_RE.source, PRD_LINK_RE.flags);
+  let firstValid: string | null = null;
   for (const m of scanned.matchAll(re)) {
     const core = m[0];
-    if (core && validatePrdPath(core)) return core;
+    if (!core || !validatePrdPath(core)) continue;
+    // `!= null` covers both null (a non-issue run) and undefined (no hint).
+    if (preferIid != null && prdCoreNumber(core) === preferIid) return core;
+    if (firstValid === null) firstValid = core;
   }
-  return null;
+  return firstValid;
 }
 
 export interface PrdInput {
@@ -157,19 +180,21 @@ function contained(abs: string, root: string): boolean {
 
 /**
  * Resolves a run's PRD input from an untrusted `issueDescription` against a
- * `cloneDir`. Finds the first valid `prds/*.md` core, guards path traversal
- * (ported validator) plus two defense-in-depth containment checks (resolved
- * prefix, then realpath to catch a symlink escape), and reads the file bounded
- * to {@link MAX_PRD_BYTES}. NEVER throws — every failure returns the nulls
+ * `cloneDir`. Finds a valid `prds/*.md` core — preferring the one whose number
+ * matches `issueIid` when given (see {@link findValidPrdCore}) — guards path
+ * traversal (ported validator) plus two defense-in-depth containment checks
+ * (resolved prefix, then realpath to catch a symlink escape), and reads the file
+ * bounded to {@link MAX_PRD_BYTES}. NEVER throws — every failure returns the nulls
  * fallback so the caller uses title + body only.
  */
 export async function resolvePrdInput(
   issueDescription: string,
   cloneDir: string,
+  issueIid?: number | null,
   log: WarnLogger = NOOP_LOG,
 ): Promise<PrdInput> {
   try {
-    const core = findValidPrdCore(issueDescription ?? "");
+    const core = findValidPrdCore(issueDescription ?? "", issueIid);
     if (!core) return NO_PRD;
 
     // Defense-in-depth #1: resolve and require containment in the clone root.
