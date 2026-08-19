@@ -108,6 +108,8 @@ import {
 } from "./sdk-messages.js";
 import { PlanRejectedError } from "./executor.js";
 import { clampToDirCharset, errMessage } from "./util.js";
+import { SummaryRunner } from "./summary-runner.js";
+import { resolvePrdInput, type PrdInput } from "./prd-link.js";
 
 // Fallbacks used only when the claim omits `config`. Wire units are SECONDS
 // (PRD §Configuration); converted to ms at the timer.
@@ -197,6 +199,11 @@ export interface SdkExecutorOptions {
    *  Injected in tests so no package manager is ever spawned and the kick-off/join
    *  ordering is drivable. */
   installDeps?: typeof installJsDeps;
+  /** The inline run-summary generator (PRD #362 M3c); default = a real SummaryRunner
+   *  rooted at the SHARED provisioning HOME (a writable data-volume path, never the
+   *  clone). Injected in tests so the advisory hooks are drivable with a fake that
+   *  records calls and can throw, proving failure isolation with no live SDK. */
+  summaryRunner?: SummaryRunner;
 }
 
 /** What one turn observed: the session id, and any workflow signals. */
@@ -304,6 +311,10 @@ export class SdkExecutor implements Executor {
   /** The worker→API client for the lead's save_memory tool (PRD #90); undefined in
    *  tests/stubs that never register it. */
   private readonly client?: WorkerClient;
+  /** The inline run-summary generator (PRD #362 M3c). Real by default (rooted at the
+   *  shared provisioning HOME, a writable data-volume path — never the clone); tests
+   *  inject a fake. Only used by the advisory summary hooks. */
+  private readonly summaryRunner: SummaryRunner;
   /** Every pid spawned across the current run's turns, for the done-path reap.
    *  Private to THIS instance — one SdkExecutor is built per run (PRD #42 Decision
    *  4), so two concurrent runs can never wipe/kill each other's set. */
@@ -342,6 +353,11 @@ export class SdkExecutor implements Executor {
     this.dockerHost = opts.dockerWiring?.dockerHost;
     this.dockerWired = this.dockerHost !== undefined;
     this.client = opts.client;
+    // PRD #362 M3c: default the summary runner to the SHARED provisioning HOME
+    // (Decision 1 needs an ephemeral SDK home on the writable data volume; that root
+    // is where the judge/run put theirs — NOT the clone). Tests inject a fake.
+    this.summaryRunner =
+      opts.summaryRunner ?? new SummaryRunner(this.log, { homeRoot: this.provisionHomeDir });
   }
 
   /**
@@ -375,6 +391,54 @@ export class SdkExecutor implements Executor {
         kind: "status",
         agent: "worker",
         payload: { text: describeSkillDrop(d.name, d.reason) },
+      });
+    }
+  }
+
+  /**
+   * PRD #362 M3c PLAN-summary hook. AWAITS a plan summary + deltas for `approvedPlan`
+   * (blocking, up to the model timeout INTERNAL to generatePlanSummary — Decision 2:
+   * it blocks gate ENTRY, never the terminal outcome), then posts it carrying
+   * `plan_md: approvedPlan` as the Decision 3 stale-write guard value. That value must
+   * be the EXACT text the gate persists to runs.plan_md: `ctx.gatePlan(approvedPlan)`
+   * reports awaiting_approval with the SAME `approvedPlan`, which SetRunAwaitingApproval
+   * writes verbatim (NUL-stripped) to plan_md — so the guard matches and the server
+   * accepts the write (a superseded plan → 409, dropped).
+   *
+   * ADVISORY: issue runs only, token + client + resolved-PRD present, and EVERYTHING is
+   * wrapped — a null (timeout / model error / unusable output), a 409 stale, a 400 bad
+   * deltas, or any throw is logged and swallowed so a summary failure NEVER blocks the
+   * gate or changes the run's outcome.
+   */
+  private async generateAndPostPlanSummary(
+    ctx: RunContext,
+    approvedPlan: string,
+    prdInputP: Promise<PrdInput> | undefined,
+  ): Promise<void> {
+    const token = ctx.oauthToken?.trim();
+    const isIssue = ctx.kind === "issue" || ctx.kind === undefined;
+    if (!isIssue || !token || !this.client || !prdInputP) return;
+    try {
+      const prd = await prdInputP;
+      const r = await this.summaryRunner.generatePlanSummary({
+        token,
+        model: ctx.summaryModel ?? "",
+        issueTitle: ctx.issueTitle,
+        issueBody: ctx.issueDescription,
+        prdText: prd.prdText,
+        planMd: approvedPlan,
+      });
+      if (r) {
+        await this.client.postPlanSummary(ctx.runId, {
+          summary: r.summary,
+          deltas: r.deltas,
+          plan_md: approvedPlan,
+        });
+      }
+    } catch (err) {
+      this.log.warn("plan summary hook failed", {
+        run_id: ctx.runId,
+        error: errMessage(err),
       });
     }
   }
@@ -861,6 +925,48 @@ export class SdkExecutor implements Executor {
        *  infers the cap has none. */
       const budget = { asked: 0 };
 
+      // --- PRD #362 M3c: inline run-summary hooks (advisory, issue runs only) ---
+      // Guard ALL summary work: issue runs only (kind "issue" or undefined), an OAuth
+      // token, and a client to POST to — a stub/e2e run without a token or client is
+      // unaffected. resolvePrdInput is memoized ONCE per run (a single file read) and
+      // reused by BOTH hooks; it never throws.
+      const summariesOn =
+        (ctx.kind === "issue" || ctx.kind === undefined) &&
+        !!oauthToken &&
+        !!this.client;
+      const prdInputP: Promise<PrdInput> | undefined = summariesOn
+        ? resolvePrdInput(ctx.issueDescription, ctx.worktreePath, this.log)
+        : undefined;
+
+      // INTENT hook (Decision 5: BOTH the seeded/pre-approved AND planning paths get
+      // an intent summary, so it sits BEFORE the preApproved branch). FIRE-AND-FORGET
+      // (Decision 2: intent is async/non-blocking — planning must proceed immediately,
+      // so this is deliberately NOT awaited). Skipped when the intent summary is
+      // already set (Decision 3: a resume/re-claim must not re-spend the owner's
+      // token). Every failure is swallowed to a warn, and the trailing `.catch`
+      // guarantees a late rejection can never surface as an unhandledRejection — the
+      // run lives through planning+implement, so the promise has time to settle.
+      if (summariesOn && !ctx.summaryIntentPresent) {
+        void (async () => {
+          try {
+            const prd = await prdInputP!;
+            const summary = await this.summaryRunner.generateIntentSummary({
+              token: oauthToken,
+              model: ctx.summaryModel ?? "",
+              issueTitle: ctx.issueTitle,
+              issueBody: ctx.issueDescription,
+              prdText: prd.prdText,
+            });
+            if (summary) await this.client!.postIntentSummary(ctx.runId, summary);
+          } catch (err) {
+            this.log.warn("intent summary hook failed", {
+              run_id: ctx.runId,
+              error: errMessage(err),
+            });
+          }
+        })().catch(() => {});
+      }
+
       if (preApproved) {
         // PRD #209: distinguish an externally-supplied (seeded) plan from a PRD #35
         // resume so the transcript records the provenance rather than leaving it
@@ -980,6 +1086,10 @@ export class SdkExecutor implements Executor {
         // approves the breakdown. It is REPLACED on each revision round (Decision 2),
         // tracked alongside approvedPlan.
         let candidateMilestones = plan.milestones;
+        // PRD #362 M3c PLAN hook (Decision 2): generate + post the plan summary BEFORE
+        // entering the gate, blocking gate ENTRY up to the model timeout but NEVER the
+        // terminal outcome. Advisory — the helper swallows every failure.
+        await this.generateAndPostPlanSummary(ctx, approvedPlan, prdInputP);
         let verdict = await ctx.gatePlan(approvedPlan, candidateMilestones);
         let revisions = 0;
         while (verdict.kind === "revise") {
@@ -1033,6 +1143,9 @@ export class SdkExecutor implements Executor {
           approvedPlan = turn.plan;
           // Decision 2: the candidate is REPLACED across a revision round.
           candidateMilestones = turn.milestones;
+          // PRD #362 M3c: a re-plan REGENERATES the plan summary (Decision 2), sent
+          // with the NEW approvedPlan as the stale-write guard value.
+          await this.generateAndPostPlanSummary(ctx, approvedPlan, prdInputP);
           verdict = await ctx.gatePlan(approvedPlan, candidateMilestones);
         }
         if (verdict.kind === "reject")

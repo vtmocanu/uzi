@@ -710,6 +710,13 @@ export class RunRunner {
         defaultBranchCommit: runnerClone.defaultBranchCommit,
         emit: (m) => batcher.emit(m),
         oauthToken: claim.secrets.anthropic_oauth_token,
+        // PRD #362 M3c: the run-summary model resolved server-side (user-value-wins),
+        // and whether the intent summary is already set so the executor skips
+        // re-generating it on a resume/re-claim (Decision 3). Both absent on older
+        // servers, which the summary hooks tolerate (undefined model → account default,
+        // false present → generate).
+        summaryModel: claim.summary_model ?? undefined,
+        summaryIntentPresent: claim.summary_intent_present ?? false,
         agents: claim.agents,
         repoAgents,
         skills: claim.skills,

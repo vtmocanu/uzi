@@ -1931,6 +1931,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// resolved user-value-wins above. nil (omitted) when settings are unwired, so
 		// an old worker's wire shape is unchanged.
 		SummaryModel: summaryModel,
+		// PRD #362 M3c (Decision 3): tell the worker whether the intent summary is
+		// already set, so a resume/re-claim skips INTENT generation rather than
+		// re-spending the owner's token. Derived straight off the run row.
+		SummaryIntentPresent: run.SummaryIntent.Valid,
 		Repo: ClaimRepo{
 			ID:              uuid.UUID(run.RepoID.Bytes).String(),
 			URL:             rc.RepoWebUrl,

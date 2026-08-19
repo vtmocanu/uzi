@@ -82,6 +82,15 @@ export interface RunContext {
   emit(msg: EmittedMessage): void;
   /** Anthropic subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN) for the SDK. */
   oauthToken?: string;
+  /** PRD #362 M3c: the model the inline run-summary generator runs on, resolved
+   *  user-value-wins from users.summary_model over the instance summary_model at
+   *  issue-run claim assembly. Absent ⇒ the generator uses the SDK/account default
+   *  model. Only the SDK executor's summary hooks read it; the stub ignores it. */
+  summaryModel?: string;
+  /** PRD #362 M3c (Decision 3): the run's INTENT summary is already set, so the
+   *  executor skips intent generation on a resume/re-claim rather than re-spending
+   *  the owner's token. Absent/false ⇒ generate the intent summary. */
+  summaryIntentPresent?: boolean;
   /** PRD #3 templates (lead + subagents) mapped to SDK AgentDefinitions. */
   agents?: AgentTemplate[];
   /** PRD #37: the roster the worker parsed out of the clone's `.claude/agents/`,
