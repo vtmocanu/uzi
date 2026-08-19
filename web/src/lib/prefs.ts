@@ -28,3 +28,59 @@ export const prefs = {
     }
   },
 };
+
+// PRD #362 Decision 9: the per-run collapse preference for the run-summary cards.
+// Client-side only (the pref is not worth a server round-trip and per-browser is
+// acceptable), keyed by run id under ONE localStorage object so the whole map GCs in a
+// single read. Each entry carries a savedAt; entries older than the TTL are dropped on
+// read, so the store does not grow without bound as runs come and go. DEFAULT EXPANDED:
+// an absent (or GC'd) entry reads as not-collapsed.
+const SUMMARY_COLLAPSE_KEY = "uzi.summaryCollapse";
+const SUMMARY_COLLAPSE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+interface CollapseEntry {
+  collapsed: boolean;
+  savedAt: number;
+}
+type CollapseStore = Record<string, CollapseEntry>;
+
+// pruneCollapse returns the store with expired / malformed entries removed, plus whether
+// anything was dropped (so a read writes the pruned store back only when it changed).
+// `now` is injected (default Date.now()) so the 7-day expiry is testable without touching
+// the system clock.
+function pruneCollapse(store: CollapseStore, now: number): { pruned: CollapseStore; changed: boolean } {
+  const pruned: CollapseStore = {};
+  let changed = false;
+  for (const [id, entry] of Object.entries(store ?? {})) {
+    if (
+      entry != null &&
+      typeof entry.savedAt === "number" &&
+      typeof entry.collapsed === "boolean" &&
+      now - entry.savedAt < SUMMARY_COLLAPSE_TTL_MS
+    ) {
+      pruned[id] = entry;
+    } else {
+      changed = true; // expired, or a shape we did not write — drop it
+    }
+  }
+  return { pruned, changed };
+}
+
+export const summaryCollapse = {
+  // getCollapsed reads the per-run choice, GC-ing the store as a side effect. Absent =
+  // expanded (false), which is the PRD default.
+  getCollapsed(runId: string, now: number = Date.now()): boolean {
+    const store = prefs.get<CollapseStore>(SUMMARY_COLLAPSE_KEY, {});
+    const { pruned, changed } = pruneCollapse(store, now);
+    if (changed) prefs.set(SUMMARY_COLLAPSE_KEY, pruned);
+    return pruned[runId]?.collapsed ?? false;
+  },
+  // setCollapsed records the choice with a fresh savedAt, pruning expired siblings in the
+  // same write so a long-lived browser never accumulates dead entries.
+  setCollapsed(runId: string, collapsed: boolean, now: number = Date.now()): void {
+    const store = prefs.get<CollapseStore>(SUMMARY_COLLAPSE_KEY, {});
+    const { pruned } = pruneCollapse(store, now);
+    pruned[runId] = { collapsed, savedAt: now };
+    prefs.set(SUMMARY_COLLAPSE_KEY, pruned);
+  },
+};

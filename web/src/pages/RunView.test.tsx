@@ -22,6 +22,7 @@ import {
   HealthFlag,
   LimitWaitPanel,
   RunView,
+  RunSummary,
   derivePlanRevision,
 } from "./RunView";
 import { useRunStream } from "../lib/useRunStream";
@@ -254,6 +255,119 @@ describe("PlanPanel agent picker (PRD #37 M4)", () => {
       />,
     );
     expect(await screen.findByText("step one")).toBeTruthy();
+  });
+});
+
+// PRD #362 M4: the run-summary cards (intent / proposed-approved plan / deltas) and their
+// per-run collapse. Rendered directly (RunView needs a live stream + a dozen mocks); a
+// Map-backed localStorage stub backs the collapse pref, since this jsdom build ships none.
+describe("RunSummary (PRD #362 M4)", () => {
+  function makeStorage(): Storage {
+    const m = new Map<string, string>();
+    return {
+      getItem: (k: string) => (m.has(k) ? m.get(k)! : null),
+      setItem: (k: string, v: string) => void m.set(k, String(v)),
+      removeItem: (k: string) => void m.delete(k),
+      clear: () => m.clear(),
+      key: (i: number) => [...m.keys()][i] ?? null,
+      get length() {
+        return m.size;
+      },
+    } as Storage;
+  }
+  beforeEach(() => {
+    Object.defineProperty(window, "localStorage", { configurable: true, value: makeStorage() });
+  });
+
+  it("renders nothing when the run carries no summary (issue-title header stands)", () => {
+    const { container } = render(<RunSummary run={run({})} />);
+    expect(container.innerHTML).toBe("");
+  });
+
+  it("shows the intent card when summary_intent is present", () => {
+    render(<RunSummary run={run({ summary_intent: "Add a token-bucket rate limiter to the API." })} />);
+    expect(screen.getByText("What this run will implement")).toBeTruthy();
+    expect(screen.getByText("Add a token-bucket rate limiter to the API.")).toBeTruthy();
+  });
+
+  it("labels the plan 'Proposed plan' while awaiting_approval", () => {
+    render(
+      <RunSummary
+        run={run({ status: "awaiting_approval", summary_plan: "Introduce middleware and a store.", summary_deltas: [] })}
+      />,
+    );
+    expect(screen.getByText("Proposed plan")).toBeTruthy();
+    expect(screen.queryByText("Approved plan")).toBeNull();
+  });
+
+  it("labels the plan 'Approved plan' once past the gate (e.g. running/completed)", () => {
+    render(<RunSummary run={run({ status: "running", summary_plan: "Introduce middleware and a store." })} />);
+    expect(screen.getByText("Approved plan")).toBeTruthy();
+    expect(screen.queryByText("Proposed plan")).toBeNull();
+  });
+
+  it("renders deltas tagged by kind", () => {
+    render(
+      <RunSummary
+        run={run({
+          status: "awaiting_approval",
+          summary_plan: "A plan.",
+          summary_deltas: [
+            { kind: "added", text: "Add a metrics endpoint." },
+            { kind: "changed", text: "Use Redis instead of in-memory." },
+            { kind: "dropped", text: "Skip the admin dashboard." },
+          ],
+        })}
+      />,
+    );
+    expect(screen.getByText("added")).toBeTruthy();
+    expect(screen.getByText("changed")).toBeTruthy();
+    expect(screen.getByText("dropped")).toBeTruthy();
+    expect(screen.getByText("Add a metrics endpoint.")).toBeTruthy();
+    expect(screen.getByText("Use Redis instead of in-memory.")).toBeTruthy();
+    expect(screen.getByText("Skip the admin dashboard.")).toBeTruthy();
+  });
+
+  it("shows the no-deviations line for an empty deltas array", () => {
+    render(<RunSummary run={run({ status: "awaiting_approval", summary_plan: "A plan.", summary_deltas: [] })} />);
+    expect(screen.getByText("No deviations — the plan matches the original ask")).toBeTruthy();
+  });
+
+  it("shows the no-deviations line for null deltas", () => {
+    render(<RunSummary run={run({ status: "running", summary_plan: "A plan.", summary_deltas: null })} />);
+    expect(screen.getByText("No deviations — the plan matches the original ask")).toBeTruthy();
+  });
+
+  it("tolerates a non-array summary_deltas without crashing (renders no-deviations)", () => {
+    // Server coerces malformed jsonb to null (M1); this is the defensive second line for a
+    // value that somehow reaches the renderer as a non-array.
+    const bad = { kind: "added", text: "not a list" } as unknown as Run["summary_deltas"];
+    render(<RunSummary run={run({ status: "running", summary_plan: "A plan.", summary_deltas: bad })} />);
+    expect(screen.getByText("No deviations — the plan matches the original ask")).toBeTruthy();
+  });
+
+  it("renders summary text as escaped plain text, stripping bidi/format chars (Decision 10)", () => {
+    const RLO = String.fromCodePoint(0x202e);
+    const { container } = render(
+      <RunSummary run={run({ summary_intent: `Implement ${RLO}rate limiting` })} />,
+    );
+    // No <Markdown> sink and no format characters survive to the DOM.
+    expect(container.querySelector("script")).toBeNull();
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+  });
+
+  it("collapses on toggle and remembers the choice per run across a remount", () => {
+    const r = run({ id: "run-collapse", summary_intent: "Some intent." });
+    const { unmount } = render(<RunSummary run={r} />);
+    // Expanded by default: the intent text is visible.
+    expect(screen.getByText("Some intent.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Collapse" }));
+    expect(screen.queryByText("Some intent.")).toBeNull();
+    unmount();
+    // A fresh mount reads the persisted per-run choice → still collapsed.
+    render(<RunSummary run={r} />);
+    expect(screen.queryByText("Some intent.")).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand" })).toBeTruthy();
   });
 });
 
