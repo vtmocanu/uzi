@@ -692,14 +692,17 @@ func transcriptText(f laneFrame) string {
 	return compactText(string(f.Payload))
 }
 
-// joinColumns places the rail beside the body at a fixed gutter.
+// joinColumns places the rail beside the body at a fixed gutter. The row count is the RIGHT
+// (transcript) column's height, NOT max(left, right): the transcript is padded to exactly the
+// viewport (padLinesToViewport), so it is the height budget for the whole two-pane body. A
+// rail TALLER than that — a run with many lanes plus a long milestone block — is truncated to
+// it rather than pushing the total past the terminal height and clipping the footer below the
+// body (issue #379: the footer carries pane nav / esc / ? and must always render). A shorter
+// rail is padded, which is what fills the divider to the bottom.
 func joinColumns(left, right string, width int) string {
 	l := strings.Split(left, "\n")
 	r := strings.Split(right, "\n")
-	n := len(l)
-	if len(r) > n {
-		n = len(r)
-	}
+	n := len(r)
 	var sb strings.Builder
 	for i := 0; i < n; i++ {
 		var lv, rv string

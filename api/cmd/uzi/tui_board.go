@@ -184,7 +184,11 @@ func (m tuiModel) renderBoard() string {
 	if m.board.admin {
 		ownerHdr = "  " + padCell("OWNER", boardOwnerWidth)
 	}
-	sb.WriteString("   " + m.pal.faint.Render(padCell("RUN", 9)+ownerHdr+"  "+padCell("STATUS", boardStatusWidth)+"  "+padCell("HEALTH", boardHealthWidth)+"  "+padCell("AGE", 5)+"  "+padCell("MILE", boardMileWidth)+"  TITLE") + "\n")
+	mileHdr := ""
+	if m.boardShowMile() {
+		mileHdr = "  " + padCell("MILE", boardMileWidth)
+	}
+	sb.WriteString("   " + m.pal.faint.Render(padCell("RUN", 9)+ownerHdr+"  "+padCell("STATUS", boardStatusWidth)+"  "+padCell("HEALTH", boardHealthWidth)+"  "+padCell("AGE", 5)+mileHdr+"  TITLE") + "\n")
 
 	if len(rows) == 0 {
 		sb.WriteString(m.boardEmptyState())
@@ -205,7 +209,18 @@ const (
 	boardOwnerWidth  = 18 // admin OWNER cell
 	boardMileWidth   = 6  // MILE cell — fits the "MILE" header and M{done}/{total} up to two digits each (e.g. M12/34)
 	boardTitleMax    = 60 // TITLE cap: long titles are trimmed to a tidy column instead of running the width of a wide terminal
+	// boardMileMinWidth is the narrowest board that shows the MILE column. The column adds 8
+	// cols to the fixed prefix (6 + a 2-space gap); below this the prefix would squeeze the
+	// title so hard that a marker row overflows the terminal edge and the judge marker clips
+	// with no ellipsis (issue #379 tui-ux finding). Below it the column is dropped and the
+	// board reverts to the pre-#379 layout — milestone progress is still on the run detail
+	// view. 90 clears the marker-row overflow point (prefix 62 + widest marker 14 + a 10-col
+	// title floor = 86, so width ≥ 87 fits; 90 is a small safety margin).
+	boardMileMinWidth = 90
 )
+
+// boardShowMile reports whether the terminal is wide enough for the MILE column (issue #379).
+func (m tuiModel) boardShowMile() bool { return m.width >= boardMileMinWidth }
 
 func boardRuleWidth(w int) int {
 	if w < 2 {
@@ -282,8 +297,12 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool) string {
 	// and TITLE, blank for a run with no frozen list. A fixed column (not a float after the
 	// title) keeps the badge in one place down BOTH boards — milestones are informational,
 	// unlike the own-board judge marker that trails the title. padVisual holds the column
-	// width even when the badge is empty, so TITLE stays aligned across rows.
-	mileCell := padVisual(m.milestoneMarker(r), boardMileWidth)
+	// width even when the badge is empty, so TITLE stays aligned across rows. Dropped entirely
+	// on a narrow terminal (boardShowMile), where its 8-col tax would clip the judge marker.
+	mileCell := ""
+	if m.boardShowMile() {
+		mileCell = padVisual(m.milestoneMarker(r), boardMileWidth) + "  "
+	}
 
 	// F4: the judge marker carries the todo count when > 0 ("⚖ issues · N"), own board only
 	// (AdminListRuns carries no JudgeVerdict). It trails the title.
@@ -296,7 +315,7 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool) string {
 	// trimmed to a tidy column rather than running the full width of a wide terminal). Pad to
 	// that width so the trailing judge marker lines up into a column instead of floating after
 	// each ragged title end.
-	avail := boardRuleWidth(m.width) - boardRowPrefixWidth(m.board.admin) - visualWidth(marker)
+	avail := boardRuleWidth(m.width) - boardRowPrefixWidth(m.board.admin, m.boardShowMile()) - visualWidth(marker)
 	if avail < 10 {
 		avail = 10
 	}
@@ -306,14 +325,17 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool) string {
 	title := padVisual(m.renderer.Plain(runTitle(r.RunDTO), avail), avail) + marker
 
 	return spine + gutter + " " + id + owner + "  " + statusCell + "  " + m.boardHealthCell(r) + "  " +
-		m.pal.faint.Render(padCell(relAge(r.CreatedAt), 5)) + "  " + mileCell + "  " + title
+		m.pal.faint.Render(padCell(relAge(r.CreatedAt), 5)) + "  " + mileCell + title
 }
 
 // boardRowPrefixWidth is the visual width of every column before TITLE, so F2 can size the
 // title to what remains. spine(1)+gutter(1)+space(1)+id(9), then two-space gaps around the
-// STATUS, HEALTH, AGE and MILE cells, plus the admin OWNER cell.
-func boardRowPrefixWidth(admin bool) int {
-	w := 3 + 9 + 2 + boardStatusWidth + 2 + boardHealthWidth + 2 + 5 + 2 + boardMileWidth + 2
+// STATUS, HEALTH and AGE cells, the MILE cell when shown, plus the admin OWNER cell.
+func boardRowPrefixWidth(admin, mile bool) int {
+	w := 3 + 9 + 2 + boardStatusWidth + 2 + boardHealthWidth + 2 + 5 + 2
+	if mile {
+		w += boardMileWidth + 2
+	}
 	if admin {
 		w += 2 + boardOwnerWidth
 	}

@@ -784,6 +784,77 @@ func TestTUIDetailFillsHeight(t *testing.T) {
 	}
 }
 
+// A tall crew rail (many lanes + the milestone block) must NOT push the footer off-screen
+// (issue #379 tui-ux finding 1): the two-pane body is clamped to the viewport, so the rail
+// truncates rather than overflowing past the footer, which carries the pane/esc/? controls.
+func TestTUIDetailFooterSurvivesTallRail(t *testing.T) {
+	now := time.Now()
+	runID := "44444444-1111"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	m.width, m.height = 100, 20
+	next, _ := m.Update(detailLoadedMsg{
+		run: apitypes.RunDTO{ID: runID, Status: "running", IssueTitle: "many lanes",
+			Milestones: []apitypes.Milestone{{ID: "m1", Title: "a"}, {ID: "m2", Title: "b"},
+				{ID: "m3", Title: "c"}, {ID: "m4", Title: "d"}},
+			MilestonesCompleted: []string{"m1"}, MilestonesInProgress: []string{"m2"}},
+		msgs: []apitypes.MessageDTO{
+			msgDTO(1, "text", "lead", "", "", "planning", now),
+			msgDTO(2, "text", "coder", "toolu_a", "impl", "a", now),
+			msgDTO(3, "text", "tester", "toolu_b", "sweep", "b", now),
+			msgDTO(4, "text", "reviewer", "toolu_c", "review", "c", now),
+			msgDTO(5, "text", "auditor", "toolu_d", "audit", "d", now),
+		},
+	})
+	out := next.(tuiModel).View().Content
+	if rows := strings.Split(out, "\n"); len(rows) > 20 {
+		t.Fatalf("detail rendered %d rows at height 20; a tall rail must clamp, not overflow\n%s", len(rows), out)
+	}
+	// The footer labels are per-token SGR spans, so "esc back" is not one substring; " back"
+	// and " keys" each sit inside a single faint span and are footer-only here.
+	if !strings.Contains(out, "back") || !strings.Contains(out, "keys") {
+		t.Errorf("footer (esc back / ? keys) missing — a tall crew rail pushed it off-screen\n%s", out)
+	}
+}
+
+// At a narrow board width the MILE column is dropped and no row overflows the terminal edge,
+// so the trailing judge marker keeps its full text instead of being clipped (issue #379 tui-ux
+// finding 2: the 8-col MILE tax pushed marker rows past the edge at 80 cols).
+func TestTUIBoardRowsFitNarrowWidth(t *testing.T) {
+	issues := "issues"
+	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "completed",
+			IssueTitle: "Migrate per-user secrets into the vault hierarchy"}, JudgeVerdict: &issues, JudgeTodoCount: 3},
+		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "running", IssueTitle: "structured",
+			Milestones:          []apitypes.Milestone{{ID: "m1"}, {ID: "m2"}, {ID: "m3"}, {ID: "m4"}},
+			MilestonesCompleted: []string{"m1", "m2"}}},
+	}}
+	m := tuiTestModel(t, fake, "")
+	m.width, m.height = 80, 34
+	out := func() string {
+		next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
+		return next.(tuiModel).View().Content
+	}()
+	for _, r := range strings.Split(out, "\n") {
+		if w := visualWidth(r); w > 80 {
+			t.Errorf("board row %d cols wide at width 80 (overflows the edge): %q", w, r)
+		}
+	}
+	if !strings.Contains(out, "issues · 3") {
+		t.Errorf("judge marker 'issues · 3' was clipped at width 80\n%s", out)
+	}
+	if strings.Contains(out, "MILE") {
+		t.Errorf("MILE column should be hidden below boardMileMinWidth (width 80)\n%s", out)
+	}
+	// At a wide width the column returns.
+	m.width = 120
+	if wide := func() string {
+		next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
+		return next.(tuiModel).View().Content
+	}(); !strings.Contains(wide, "MILE") || !strings.Contains(wide, "M2/4") {
+		t.Errorf("MILE column should show at width 120\n%s", wide)
+	}
+}
+
 // The factory floor shows a compact M{done}/{total} badge on a milestone-structured run
 // (milestoneMarker, the web MilestoneBadge twin) and NOTHING on a run with no frozen list.
 // A run that reported nothing shows M–/N rather than M0/N.

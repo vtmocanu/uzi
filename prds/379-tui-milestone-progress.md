@@ -131,11 +131,18 @@ list DTO already carried everything the badge needs.
   the actual chrome and `padLinesToViewport` pads the window, so the two-pane body and its
   divider fill the terminal to the footer. Guarded by `TestTUIDetailFillsHeight` (rendered
   rows == terminal height; divider extends down the body).
-- [ ] **M7 — Visual review.** Regenerate the uxlab screenshots
-  (`cd api/cmd/uzi/uxlab && devbox run build`, confirm PNG mtimes are newer than the
-  frames) and dispatch the `tui-ux` agent to review status legibility, NO_COLOR
-  fallback (glyphs must carry state without colour), the new column's width/alignment at
-  narrow and wide terminals, and the full-height fill at several terminal sizes.
+- [x] **M7 — Visual review.** uxlab fixtures seeded with a milestone run and screenshots
+  regenerated; `tui-ux` reviewed via the PNGs, a real `NO_COLOR=1` PTY run, and seven
+  terminal sizes. Milestone block, MILE column, `M–/N`, NO_COLOR fallback and the full-height
+  fill all passed. Two edge-of-envelope regressions were found and **fixed**:
+  - **Footer clipped when the rail is taller than the viewport** (a milestone run's rail can
+    exceed the transcript budget): `joinColumns` now clamps the two-pane body to the transcript
+    (viewport) height, so the rail truncates rather than pushing the footer off-screen. Guard:
+    `TestTUIDetailFooterSurvivesTallRail`.
+  - **Judge marker clipped on the board at ~80 cols** (the MILE column's 8-col prefix tax
+    squeezed marker rows past the edge): the MILE column is now dropped below
+    `boardMileMinWidth` (90 cols), reverting to the pre-#379 board layout on narrow terminals;
+    milestone progress stays on the detail view. Guard: `TestTUIBoardRowsFitNarrowWidth`.
 - [ ] **M8 — Docs + spec note.** If `docs/cli.md` documents the TUI board columns or
   the detail view, add `MILE`, the milestone block, and the full-height body; record the
   design decisions (fixed column over float, `–/N` semantics, `boardTitleMax`, dynamic
@@ -156,8 +163,12 @@ list DTO already carried everything the badge needs.
    (`TestTUIDetailFillsHeight`).
 7. A milestone run with no activity yet still shows the block (regression guard in
    `TestTUIDetailMilestoneBlock`).
-8. `uzi tui --demo` demonstrates all of the above with no server.
-9. `task lint:api`, `task deadcode:api`, `go test ./cmd/uzi` all green.
+8. A tall crew rail (many lanes + the milestone block) never pushes the footer off-screen;
+   the body clamps to the viewport (`TestTUIDetailFooterSurvivesTallRail`).
+9. No board row overflows the terminal edge at a narrow width, and the judge marker keeps its
+   full text (`TestTUIBoardRowsFitNarrowWidth`); the MILE column is dropped below 90 cols.
+10. `uzi tui --demo` demonstrates all of the above with no server.
+11. `task lint:api`, `task deadcode:api`, `go test ./cmd/uzi` all green.
 
 ## Decisions
 
@@ -191,6 +202,16 @@ list DTO already carried everything the badge needs.
    so the body fills exactly to the footer. One value feeds both the render and the scroll
    clamp, so they cannot disagree. The alternative (pad the whole frame below the footer) was
    rejected: it moves the footer, not the divider, so it would not close the gap the user saw.
+9. **Body clamps to the transcript height, rail truncates** (tui-ux finding 1). `joinColumns`
+   uses the transcript column's height, not `max(rail, transcript)`, so a rail taller than the
+   viewport (a milestone run with many lanes) can never push the total past the terminal and
+   clip the footer. The footer carries the only navigation keys, so keeping it always beats
+   showing every rail line; rail scrolling is a possible later refinement.
+10. **MILE column is width-conditional** (tui-ux finding 2). It adds 8 cols to the fixed
+    prefix, which at ~80 cols squeezed marker rows past the edge and clipped the judge marker.
+    Below `boardMileMinWidth` (90) the column is dropped and the board is the pre-#379 layout;
+    milestone progress is still on the detail view. Chosen over shrinking the title below its
+    floor (which would give a 3-char title) or abbreviating the marker.
 
 ## Risks and mitigations
 
@@ -220,7 +241,9 @@ list DTO already carried everything the badge needs.
   shows `–/4`, and a milestone run with no activity yet still shows the block);
   `TestTUIBoardMilestoneBadge` (`M2/4`, `M–/2`, no badge for a milestone-less run);
   `TestTUIDetailFillsHeight` (rendered rows == terminal height; divider extends down the
-  body).
+  body); `TestTUIDetailFooterSurvivesTallRail` (a tall rail does not clip the footer);
+  `TestTUIBoardRowsFitNarrowWidth` (no row overflow + full judge marker at 80 cols, MILE
+  dropped below 90 cols and back at 120).
 - **Guard** (`tui_d7_guard_test.go`): `"Title"` in `d7UntrustedFields`, enforced by
   `TestD7UntrustedFieldsNeverReachAWriterUnsanitized`; hostile milestone title in
   `TestTUIViewsStripControlBytesFromUntrustedText`.
