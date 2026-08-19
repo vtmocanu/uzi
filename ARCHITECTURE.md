@@ -473,7 +473,7 @@ provably the opened one. The label is snapshotted rather than joined because
 the composite FK nulls the id when a token is deleted — the run still names
 the account it billed afterwards. That record is the attribution join
 `run_usage` (PRD #40) could never make; see
-`prds/111-auto-select-anthropic-token.md` for the ranking's rationale.
+`prds/done/111-auto-select-anthropic-token.md` for the ranking's rationale.
 
 ### Run lifecycle
 

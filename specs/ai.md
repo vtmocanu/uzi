@@ -737,7 +737,7 @@ Sections below cover only what ships in M1 (server: schema, join tokens, worker
 protocol, sweeper, web-facing run/worker API) and M2 (worker: TS skeleton, git
 worktree lifecycle, run state machine driven by a stub executor). The SDK
 executor, plan-gate/MR workflow, live web UI, E2E, and docs (M3–M7) are designed
-in the PRD (`prds/4-agent-runtime-workers.md`) but are **not** realized in code
+in the PRD (`prds/done/4-agent-runtime-workers.md`) but are **not** realized in code
 yet; where a decision here anticipates them it says so.
 
 Two moving parts split along plan.md's server/client trust boundary: the **api**
@@ -1564,7 +1564,7 @@ Serves human Feature #12 — wires the PRD #2 board and the PRD #4 runtime toget
 the board reflects run state without hand-dragging. **Status: M1–M4 built, reviewed,
 audited APPROVED (2026-07-04/05); M5 (docs + live validation + spec sync + MR) in
 progress.** Adds one migration (`00021`) and one leaf package; no new
-services/containers/env vars. Full rationale + Decision Log: `prds/12-board-run-lifecycle.md`.
+services/containers/env vars. Full rationale + Decision Log: `prds/done/12-board-run-lifecycle.md`.
 
 ## 67. Lifecycle notifier + column automation
 
@@ -1786,7 +1786,7 @@ start-run action); GitLab reachable via an explicit icon".
 Serves human Feature #14 — reskins the whole web UI to the selected "ember" design.
 **Status: M1–M5 built, reviewed, audited, browser- and real-stack-validated; M6
 (review gate + merge) landed on `main` as `2efd83b`.** `web/` + docs only; no
-backend/schema/env changes. Full rationale + milestone log: `prds/14-multica-ui-redesign.md`.
+backend/schema/env changes. Full rationale + milestone log: `prds/done/14-multica-ui-redesign.md`.
 
 ## 76. Ember design tokens (CSS-variable theme layer)
 
@@ -1916,7 +1916,7 @@ Serves human Feature #23 (the three UX gaps observed during the issue-#20 smoke 
 human.md entry pending user confirmation). **Status: M1–M4 built, reviewed, audited,
 and browser-validated on branch `prd-23-web-ux-polish`.** `web/` + `docs/` only — no
 API, schema, agent, env, or Go change anywhere. Full rationale + Decision Log:
-`prds/23-web-ux-live-dashboard-sidebar-board.md`.
+`prds/done/23-web-ux-live-dashboard-sidebar-board.md`.
 
 ## 85. Shared visibility-aware poll hook + live dashboard
 
@@ -2034,7 +2034,7 @@ adds an edge-triggered MR-state watcher that moves the card back to In Progress 
 close, and symmetrically restores it on reopen. Merged MRs trigger nothing — the
 existing `Closes #N` → issue-close → sync path (§22) owns that outcome. Section
 numbers continue past PRD #23's #88; the numbered decisions below realize the PRD's
-Decision Log (`prds/24-mr-close-rework.md`).
+Decision Log (`prds/done/24-mr-close-rework.md`).
 
 ## 89. Detection: poller-based, edge-triggered on `runs.mr_state`
 
@@ -2173,7 +2173,7 @@ failure-comment wording were **approved by the user (2026-07-05)** and are recor
 settings store whose first two tenants are the configurable `prd_label` and
 `autopilot_label`, and an autopilot path where adding a label in GitLab runs a PRD
 issue end to end with zero uzi interaction. Section numbers continue past PRD #24's
-#92. Full rationale + Decision Log: `prds/19-admin-settings-and-autopilot.md`.
+#92. Full rationale + Decision Log: `prds/done/19-admin-settings-and-autopilot.md`.
 
 ## 93. app_settings: generic KV store + cached accessor (`api/internal/settings`)
 
@@ -2480,7 +2480,7 @@ tighten who registers, and verify the bot PAT can do no more than open MRs — m
 PRD #4's "GitLab-side bot = Developer + protected main" guardrail (§50) *checked*
 instead of hoped. Sections are **§403-§408**; they were authored as 93-98 "continuing past
 PRD #24's #92" and renumbered by issue #156 — see the numbering note above. Realizes
-`prds/5-access-control-pat-hardening.md`.
+`prds/done/5-access-control-pat-hardening.md`.
 
 ## 403. Registration controls (server)
 
@@ -2636,7 +2636,7 @@ they were authored as 93-100 "continuing past PRD #24's #92" and renumbered by i
 (see the numbering note above) — §409-§414 are this PRD, §415-§416 begin PRD #16's skills
 work and used to run straight into §101-§104, which they no longer do.
 The decisions below realize the PRD's Design Decisions
-(`prds/17-lead-template-and-model-selection.md`), whose per-decision attributions
+(`prds/done/17-lead-template-and-model-selection.md`), whose per-decision attributions
 carry provenance. Builds on PRD #3 (agent templates) and PRD #4 (runtime/claim).
 
 ## 409. Decouple builtins from `.claude/agents/`; lead is the eighth builtin
@@ -2790,7 +2790,7 @@ only `name`+`description` sit in context always, the body loads on demand
 PRD #3 (agent-template store + reconciler), PRD #4 (claim payload, SDK executor,
 guardrail layers), and PRD #17 (decoupled-builtins convention, `lead` as an
 existing builtin routed to the main thread). Full rationale in
-`prds/16-agent-skills.md` (Decision Log); user-facing guide in `docs/skills.md`;
+`prds/done/16-agent-skills.md` (Decision Log); user-facing guide in `docs/skills.md`;
 cross-service map in ARCHITECTURE.md "Agent skills".
 
 ## 415. Skill scopes + storage schema (`skills`, `agent_skill_allocations`)
@@ -3070,7 +3070,7 @@ ember as the sole theme with all look-and-feel in CSS variables precisely so
 alternate identities could ship later as `data-theme` overrides; this PRD builds
 the switching mechanism and ports the mission-control prototype onto ember's token
 slots. Section numbers continue past PRD #16's #110. Realizes
-`prds/21-mission-control-theme.md` (its Decision Log carries build-time provenance);
+`prds/done/21-mission-control-theme.md` (its Decision Log carries build-time provenance);
 builds on PRD #14 (tokens), PRD #17 (`/api/me/settings`), and PRD #19 (`app_settings`).
 
 ## 111. Theme = tokens only; the no-branch rule; base-selector hardening
@@ -3251,7 +3251,7 @@ Serves human Feature #22 (an admin-controlled escape-hatch label that lets an is
 without a `prds/*.md` link — configurable name, feature on/off, both in admin settings;
 enabled out of the box; default name `PRDLESS`; the label can be added/removed directly
 from the uzi web UI). User-stated 2026-07-05. Section numbers continue past PRD #21's
-#118. Full rationale + Decision Log: `prds/22-prdless-label.md`.
+#118. Full rationale + Decision Log: `prds/done/22-prdless-label.md`.
 
 **Status (branch `prd-22-prdless-label`):** prd-21 landed on main and is merged into this
 branch. M1 (strict per-key validation + admin-settings toggle/name UI), M2 (gate bypass,
@@ -3384,7 +3384,7 @@ Serves human Feature #6 (CI status visible in uzi + an agent that fixes broken C
 and uzi verifies the fix) and the "uzi keeps its own dummy CI" item. Two halves along
 the PRD #4 dependency boundary: a display half on PRD #2 machinery only (M1–M3), and a
 fix-agent half riding PRD #4's run machinery (M4–M7). Section numbers continue past PRD
-#22's #122. Realizes `prds/6-ci-status-integration.md` (its Decision Log carries the
+#22's #122. Realizes `prds/done/6-ci-status-integration.md` (its Decision Log carries the
 user-vs-AI provenance and full rationale); builds on PRD #2 (forge layer + poller), PRD
 #4 (runs, worker protocol, plan gate, MR flow), and PRD #12 (`runs.mr_iid`/`mr_state`).
 
@@ -3687,7 +3687,7 @@ Serves human Feature #32 (an operator with the DB + env/Infisical/etcd master ke
 not recover any user's Anthropic token; each user's secrets keyed by their own login
 password; auto-unlock at login with the key in server memory until restart/lock; locked
 runs queue; forgotten password ⇒ unrecoverable). **Status: built (PRD #32,
-`prds/32-user-vault-password-wrapped-secrets.md` carries the full Decision Log +
+`prds/done/32-user-vault-password-wrapped-secrets.md` carries the full Decision Log +
 user-vs-AI provenance). These sections record the as-built system; where implementation
 diverged from the design, the as-built decision and its reason are called out inline
 ("as-built").** Builds on PRD #3 (`user_secrets` + `secretbox`, §29–30) and gates PRD #19
@@ -3968,7 +3968,7 @@ Serves human: "Users only learn that an agent run finished, failed, or is parked
 plan-approval gate by keeping the webui open... There is no push channel of any kind"
 (PRD #25 Problem statement, no dedicated human.md Feature entry yet — this PRD originated
 directly from GitLab issue vtmocanu/uzi#25, reviewed by a 3-agent design/fact-check/security
-pass before build). Realizes `prds/25-slack-integration.md` (its Decision Log carries the
+pass before build). Realizes `prds/done/25-slack-integration.md` (its Decision Log carries the
 full user-vs-AI provenance); builds on PRD #4 (runs, steering inputs), PRD #19
 (`app_settings`), and `secretbox`. Section numbers continue past PRD #6's #132.
 
@@ -4284,7 +4284,7 @@ in git, per-repo devbox tool tiers, and agent-template scopes+allocation. Sectio
 numbers continue past PRD #25's #153. Builds on PRD #4 (worker runtime, claim
 payload, guardrails), #16 (skills scope+allocation shapes reused here), and #17
 (claim plumbing, decoupled builtins). Migrations landed `00045`–`00049` (renumbered above main's `00044_slack`; prior live head
-was `00043`). Full rationale in `prds/18-worker-templates-and-agent-scopes.md`;
+was `00043`). Full rationale in `prds/done/18-worker-templates-and-agent-scopes.md`;
 user guides in `docs/worker-setup.md` + `docs/worker-tools.md` + `docs/agent-templates.md`.
 
 ## 154. Worker image templates in git (agent + compose)
@@ -4769,7 +4769,7 @@ inherits the decision.
 Serves human Feature #11 (run-view UX) and the PRD #38 additions (feed redesigned to
 the approved mock, bash as highlighted code, per-agent collapse). Web-only: no API,
 schema, agent, or message-shape change — a pure `web/src` render refactor. Full
-rationale + Decision Log: `prds/38-activity-feed-redesign.md`; the design contract is
+rationale + Decision Log: `prds/done/38-activity-feed-redesign.md`; the design contract is
 `prds/mockups/38-activity-feed-mock.html`.
 
 - **Full command is the source of truth; truncation is display-only** (`RunEvent.tsx`):
@@ -4834,7 +4834,7 @@ rationale + Decision Log: `prds/38-activity-feed-redesign.md`; the design contra
 
 Serves the primary safety posture: tool commands and results are attacker-influenced LLM
 output rendered verbatim, so the render path is bounded against DoS. All in
-`prds/38-activity-feed-redesign.md`.
+`prds/done/38-activity-feed-redesign.md`.
 
 - **Tokenizer fan-out cap** (`highlightShell`, `RunEvent.tsx`): stops at
   `HIGHLIGHT_MAX_CHARS` (8 KB) or `HIGHLIGHT_MAX_NODES` (2000) and appends the exact
@@ -4851,7 +4851,7 @@ output rendered verbatim, so the render path is bounded against DoS. All in
 ## 171. Feed accessibility (WCAG pass)
 
 Serves human Feature #11's usability intent, extended to a11y. See
-`prds/38-activity-feed-redesign.md` (M4).
+`prds/done/38-activity-feed-redesign.md` (M4).
 
 - **Scoped live region** (`ActivityFeed.tsx`): the scroll container keeps `role="log"` but
   is forced `aria-live="off"` — `role="log"` carries an implicit `aria-live="polite"`, so
@@ -4878,7 +4878,7 @@ Serves human Feature #11's usability intent, extended to a11y. See
 
 ## 172. PRD #38 scope boundaries, mock-as-contract & recorded deferrals
 
-See `prds/38-activity-feed-redesign.md` (Out of Scope, Decisions 11/13).
+See `prds/done/38-activity-feed-redesign.md` (Out of Scope, Decisions 11/13).
 
 - **The mock is the contract, with named illustrative exceptions** (M6, web-ux browser
   pass): structure/color/interaction are contractual; literal string formatting follows the
@@ -4896,7 +4896,7 @@ See `prds/38-activity-feed-redesign.md` (Out of Scope, Decisions 11/13).
 ## 173. Worker ↔ run concurrency model — ADR-42 (decided; implementation via PRD #42)
 
 See `adr/0042-worker-run-concurrency.md` (the full ADR: research context, options, residuals)
-and `prds/42-worker-run-concurrency.md` (implementation design + milestones).
+and `prds/done/42-worker-run-concurrency.md` (implementation design + milestones).
 
 - **Decision**: a worker may execute multiple runs concurrently, bounded by a worker-side
   slot semaphore (`WORKER_MAX_CONCURRENT_RUNS`, default 1 — default behavior unchanged);
@@ -4924,7 +4924,7 @@ lead-only stays approvable), and Decision 10 (Slack two-button source picker) �
 `specs/human.md` gains one requirement (choose agents at the gate; repo default; own
 fallback; Slack source choice), recorded there pending user ratification. Migration
 `00052` (nullable `runs.agent_source`/`agent_exclusions`/`repo_agents`; renumber at
-land). PRD `prds/37-run-agent-selection.md` is the full decision log.
+land). PRD `prds/done/37-run-agent-selection.md` is the full decision log.
 
 ## 174. Repo agents are worker-parsed, never SDK-loaded; capped worker-side AND API-validated
 
@@ -5105,7 +5105,7 @@ no fake can make is proven empirically.
 Serves human: user-requested (2026-07-10) — a conversational surface where a user chats
 with uzi in the web UI (on their own Anthropic token, worker invisible to them), the agent
 knows uzi's own code, can investigate the user's runs, and can create GitLab issues on
-request via the user's bot credentials. Full rationale + Decision Log: `prds/39-chat-agent.md`
+request via the user's bot credentials. Full rationale + Decision Log: `prds/done/39-chat-agent.md`
 (3-agent-reviewed; the `↳review` decisions are binding). Architecture map: ARCHITECTURE.md
 "Chat with uzi (the fifth surface)". This section records the load-bearing AI decisions; the
 PRD carries the complete set (1–15) and the review corrections.
@@ -5243,7 +5243,7 @@ PRD carries the complete set (1–15) and the review corrections.
   knob in `docs/worker-setup.md`); the real fix is the k8s uid-split/container-per-run
   era (§168), where each operator-spawned pod is a single-slot worker and this design
   composes unchanged. Full research, options, and rationale: `adr/0042-worker-run-concurrency.md`;
-  implementation design and milestones: `prds/42-worker-run-concurrency.md`.
+  implementation design and milestones: `prds/done/42-worker-run-concurrency.md`.
 - **Per-run `HOME` cleanup residual**: cleanup runs whenever `execute()` reaches a local
   terminal outcome, even if the terminal `/state` report itself failed to reach the
   server (`runner.ts`'s `finally`, logged not thrown) — so a run stuck `running`
@@ -5258,7 +5258,7 @@ Serves human: the primary directive (agents never touch `main`) — the M2 signa
 closes a real serial-flow hole in it; the parallelism is a wall-clock/throughput improvement
 strictly within existing constraints (PRD #3 templates §29, PRD #4 runtime §40–§53) and adds
 **no new user-stated requirement** (human.md unchanged). All decisions here are AI design
-within the pre-reviewed PRD (`prds/43-intra-run-parallel-subagents.md`, drafted 2026-07-10,
+within the pre-reviewed PRD (`prds/done/43-intra-run-parallel-subagents.md`, drafted 2026-07-10,
 3-agent-reviewed on 2026-07-10/11; the `↳review` decisions are binding). The user's only input
 to the 2026-07-12 build session was "work on PRD #43, worktree mode, with the agent team." Full
 Decision Log (1–8) + residuals live in the PRD; this section records the load-bearing decisions
@@ -5553,7 +5553,7 @@ and fact-check findings.
 Serves human: Feature #47 — detect too-slow / stuck runs and flag them in the web UI
 and on Slack (plan.md line 68), as a non-terminal, self-clearing signal that never kills
 a run (user-ratified surface). Full decision log + review/audit trail:
-`prds/47-loop-hang-detection.md`. Migration landed as `00057_run_health.sql` (PRD draft
+`prds/done/47-loop-hang-detection.md`. Migration landed as `00057_run_health.sql` (PRD draft
 said 00054; the live head had moved — renumber again if main moved at land). This section
 records the load-bearing AI decisions; the PRD carries the complete set (Decisions 1-11)
 with the review/audit findings folded in.
@@ -5906,7 +5906,7 @@ with the review/audit findings folded in.
 
 # PRD #40 — Token usage & cost reporting (per run / per user / factory-wide)
 
-Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisions:
+Full Decision Log in `prds/done/40-token-usage-reporting.md`. The load-bearing decisions:
 
 ## 222. Result-frame usage is CUMULATIVE-across-resume (M1 verdict b)
 
@@ -6009,7 +6009,7 @@ Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisi
 
 Serves the human requirement: live per-worker CPU/memory visibility in the web UI, per-worker
 granularity (no per-run attribution), working identically under docker-compose today and k8s later.
-Full Decision Log in `prds/49-worker-resource-stats.md`. The load-bearing decisions:
+Full Decision Log in `prds/done/49-worker-resource-stats.md`. The load-bearing decisions:
 
 ## 228. Self-reported cgroup v2 on the existing heartbeat — never pulled from outside
 
@@ -6464,7 +6464,7 @@ Serves human Feature #55: the IdP owns who is admin (and optionally who may log 
 deployment, replacing the first-login-race / env-seed model; authoritative grant-and-demote sync on
 every OIDC login; fail-safe on an absent claim; OIDC-only scope; works with Keycloak and Pocket ID.
 Extends PRD #45 (§195-201); no schema migration (a query-only change). Full decision log +
-review/audit trail: `prds/55-oidc-group-mapping.md` (Design Decisions there TAG provenance). This
+review/audit trail: `prds/done/55-oidc-group-mapping.md` (Design Decisions there TAG provenance). This
 block records the load-bearing AI decisions.
 
 ## 253. Groups from the verified ID token only; `GroupsClaimPresent` as the fail-safe discriminator
@@ -7508,7 +7508,7 @@ favicon and was deliberately NOT touched. Full decision log: [prds/done/70-statu
 ## 277. uzi CLI — in the api module at `api/cmd/uzi/`, importing only stdlib-leaf `apitypes`
 
 Serves human: Feature #64 (uzi CLI) — a terminal control surface for the factory, driven identically
-by humans and headless agents. Design record: `prds/64-uzi-cli.md` (Decisions 1, 11, 12; Success
+by humans and headless agents. Design record: `prds/done/64-uzi-cli.md` (Decisions 1, 11, 12; Success
 Criteria 1, 8). Supersedes PRD #4's "no CLI after worker setup" for the *control plane* (not for the
 worker-execution protocol, which stays `/api/worker/*`).
 
@@ -8000,7 +8000,7 @@ guardrail" posture for forensic controls.
 # PRD #65 — Forgejo support (the second forge driver)
 
 Serves human Feature #2 ("forge-generic design, GitLab first, Forgejo later"). PRD at
-`prds/65-forgejo-support.md` (Decision Log D1–D11 is the provenance record). This PRD
+`prds/done/65-forgejo-support.md` (Decision Log D1–D11 is the provenance record). This PRD
 lands the second driver at full parity and corrects the false blocker that deferred it
 (see §16/§15). **Every milestone lands dark**: until M6b flips the handler gate, a
 `forgejo` connection is unreachable, and **no run is refused and no save is rejected**
@@ -8226,7 +8226,7 @@ Serves human Feature #2 (connect a forge) and the testing-credentials policy.
 Serves human Feature #4 (the worker runs the agent) + the user requirement that workers be
 able to run Docker/Compose projects — uzi's own `./e2e/run-e2e.sh` / `./scripts/smoke.sh`
 need `docker compose up`, so a worker that cannot run containers cannot dogfood uzi. PRD at
-`prds/83-docker-capable-worker.md` (Decision Log D1–D9 + resolved questions Q-A…Q-D). Design
+`prds/done/83-docker-capable-worker.md` (Decision Log D1–D9 + resolved questions Q-A…Q-D). Design
 grounding: the architecture note was written to `.claude/agent-team-tasks/`, which `.gitignore`'s
 `.claude/agent-team-tasks/` entry deliberately excludes, so it did not survive its worktree — `prds/done/83-docker-capable-worker.md`
 is the surviving design record (corrected 2026-07-21; this line used to cite the dead path as if
@@ -8555,7 +8555,7 @@ Serves human Feature #49-adjacent (worker sizing) + the docs requirement.
 Serves human: the judge's recommendations must be **fileable as forge issues, the human choosing
 which to file** (GitLab issue #68). *(The user-stated requirement line is proposed for human.md's
 "Run retrospective (LLM judge)" feature and is pending approval; this section records the mechanism
-the AI chose to satisfy it.)* Design record: `prds/68-judge-file-issue.md`.
+the AI chose to satisfy it.)* Design record: `prds/done/68-judge-file-issue.md`.
 
 - **The issue body is templated server-side from rows already stored; the click spends no Anthropic
   token.** Everything a useful issue needs is on hand: `category`, `target`, `rationale_md`,
@@ -8933,7 +8933,7 @@ A durable, per-(user, repo) store the lead writes a bounded learning into and a
 FUTURE run on the same repo reads back — sanctioned, structured, and user-visible,
 where prior runs had no such mechanism (a stray cross-run Bash write, the accepted
 PRD #42 residual, was never re-read into context). Owner decisions are recorded in
-`prds/90-agent-memory-persistence.md`'s Decision Log and are NOT duplicated into
+`prds/done/90-agent-memory-persistence.md`'s Decision Log and are NOT duplicated into
 `specs/human.md` (an implementation/design record, not a new user-binding
 requirement, per the PRD #89 precedent). The independent fable-model review that
 shaped this PRD is summarized there too; what follows is the AI/implementation
@@ -9304,7 +9304,7 @@ rule (Feature #64). PRD #95 Decisions 9 + 10, chat caveat N3.
 Serves human: extends the Run retrospective (LLM judge) feature
 (`specs/human.md:280`) — a judged recommendation reached only one settled
 state ("filed", PRD #68) and had no way to record "handled", "won't do", or
-"the judge is wrong here". Design record: `prds/94-judge-triage.md`.
+"the judge is wrong here". Design record: `prds/done/94-judge-triage.md`.
 
 ## 331. New coordinate-keyed side-table, not columns on either existing recommendation row (D1)
 
@@ -9566,7 +9566,7 @@ steering wire), PRD #33 (`stop_kind` semantics), and rides §51's SDK session re
 The single user decision is Decision 10 (Slack gets full gate parity — see and steer
 the plan from Slack — a deliberate, user-approved 2026-07-10 reversal of PRD #25's
 plan-content minimization); the rest is AI design within the "steer, don't kill"
-constraint. Full rationale + accepted residuals: `prds/41-plan-revision-gate.md`.
+constraint. Full rationale + accepted residuals: `prds/done/41-plan-revision-gate.md`.
 Migration is draft `00070` — renumber above the merged head at landing (live head
 `00051`, PRD #37 holds `00061`, PRD #39 holds `00065`).
 
@@ -16268,7 +16268,7 @@ is one new read plus one normalization, and each has exactly one correctness pro
 Serves human: the best-practice bar, plus Feature #52's "real CI/CD: a working pipeline" —
 the toolchain gate jobs M1 rewires live in that pipeline. **`human.md` untouched and no entry
 proposed**: this is contributor tooling and nothing about the product changes — no API, no
-schema, no worker behaviour, no UI. Design record: `prds/103-dev-loop-quality-gates.md`
+schema, no worker behaviour, no UI. Design record: `prds/done/103-dev-loop-quality-gates.md`
 (Decisions 1–11).
 
 **Numbering note.** These start at 464, not 461, because 461–463 were reserved by the then-unmerged
@@ -18898,7 +18898,7 @@ Serves human.md: reduce CI wall-clock **without weakening any gate/test/coverage
 local==CI byte-identical recipes (§464, PRD #103 SC-1), release atomicity — a red gate blocks every
 publish (SC-5) — and the MR trust boundary (§245). Pure dev-CI infrastructure: **no product-behavior
 or user-contract change**, which is why `human.md` is untouched. Full rationale, review findings and
-measured deltas live in `prds/230-ci-pipeline-speedup.md` (Decision log D0-D7); this is the terse
+measured deltas live in `prds/done/230-ci-pipeline-speedup.md` (Decision log D0-D7); this is the terse
 contract, not a duplicate of it. All six landed milestones are CI-orchestration-only **except M5**,
 which is the sole `Taskfile.yml` change (SC-1's one exception).
 
@@ -19036,7 +19036,7 @@ auto-expands a terminal or single-actor run so reading a done N-agent run is not
 
 Serves human.md Feature #46 (the judge-recommendation backlog: "Recommendations land in an
 inbox/notifications surface", §358's cross-run worklist) and the verdict taxonomy enumerated at
-`specs/human.md:300-303`. Design record: `prds/235-judge-label-filter.md`. Adds a `?category=` /
+`specs/human.md:300-303`. Design record: `prds/done/235-judge-label-filter.md`. Adds a `?category=` /
 `--category` filter over the same six-label taxonomy already rendered on every group's badge
 (`web/src/lib/judge.ts`), with no new product contract — the taxonomy and the group shape are
 unchanged; this only adds a way to narrow which groups come back.
@@ -19088,7 +19088,7 @@ unchanged; this only adds a way to narrow which groups come back.
 
 Serves the live-run-visibility surface of human.md Feature #4 ("which agents are live/idle") as
 ambient navigation, alongside the existing Judge (§482) and Workers (§Feature #113 M6) nav badges.
-Design record: `prds/239-runs-in-progress-badge.md`. Adds an at-a-glance count of the caller's
+Design record: `prds/done/239-runs-in-progress-badge.md`. Adds an at-a-glance count of the caller's
 in-flight runs on the Runs `NavItem`; no new product contract beyond one owner-scoped count endpoint.
 
 - **"In progress" = every NON-terminal status, not the narrower "actively working" set (Decision 1).**
@@ -20460,7 +20460,7 @@ marker — to the three Claude rate-limit meter surfaces: admin table (`web/src/
 
 # PRD #308 — Schedule fire outcomes (surface why a fire started nothing)
 
-Decision Log with the richer rationale: `prds/308-schedule-fire-outcome.md`.
+Decision Log with the richer rationale: `prds/done/308-schedule-fire-outcome.md`.
 
 ## 524. PRD #308 Decision 1 — last fire only, a single JSONB column, not a history table
 
