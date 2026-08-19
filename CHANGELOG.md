@@ -6,8 +6,67 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.45.0] - 2026-08-19
+
+### Added
+
+- **Plain-English run summaries (PRD #362, #387).** The worker now persists a
+  short intent/plan/deltas summary per run, produced on a dedicated summary model:
+  a new admin `summary_model` setting (default haiku) with a per-user override,
+  wired through the issue-run claim end to end. Two review followups landed on top
+  (#392): `summary_model` folds into the single `GetUserSettings` read instead of a
+  second query, and the summary PRD-link resolver now prefers the `prds/*.md` core
+  whose number matches the run's issue id (falling back to first-valid) so a body
+  mentioning another PRD first summarizes against the right one.
+- **Workers now see issue comments (#381).** A bounded, bot/system-filtered,
+  nonce-fenced comment feed is added to the initial run instruction and to the live
+  `get_issue` tool, so review guidance that lands in comments is no longer invisible
+  to the agent. Backed by a new `Forge.ListIssueComments` across all three drivers
+  and a `runs.issue_comments` snapshot captured at run creation (bot-self-filtered,
+  fail-safe to omit when the bot user is unknown).
+- **TUI milestone progress and full-height run viewer (#380).** A compact
+  `M{done}/{total}` badge in a new MILE column on the board (the web `MilestoneBadge`
+  twin), a per-milestone checklist in the run-detail crew rail, and a run-detail body
+  that now fills the terminal height.
+- **TUI live milestone refresh and collapsible crew (#383).** Milestone counts
+  refresh live on the 2s board tick, the crew rail is collapsible (`c`) so a tall
+  roster cannot hide the milestone block, the header shows run duration, and the
+  steady-state live indicator folds into the header.
+- **TUI board: hide finished runs and windowed scrolling (#389).** `[h]` hides
+  finished runs (client-side, no refetch), the run list is windowed to terminal
+  height with an N-M of T readout and cursor-following scroll that survives
+  auto-refresh, judge markers lay out in fixed sub-columns, and `q` quits instantly.
+- **Scheduled main-guard workflow (#376).** A scheduled and dispatchable
+  re-validation of `main` that `[skip ci]` markers cannot suppress, plus a docs note
+  that workflow-scope push rejections are expected by design and workflow files must
+  be landed by a human.
+
+### Changed
+
+- **Run-health slow threshold scales to a run's frozen budget (#323).** A
+  milestone-scaled run (frozen `budget_wall_seconds`, PRD #122) lives far longer than
+  the global `RUN_TIMEOUT`, so the flat 45m `health_slow_seconds` flagged it slow for
+  most of its life while it was actively working. The raw threshold now scales by the
+  run's budget ratio before the per-run clamp (raised only when a scaled budget is
+  frozen), so an 8h run flags at ~3h instead of 45m and unscaled runs are unchanged.
+  Fixes the Slack nudge, web badge, and CLI surfaces at once.
+- **00092 revise backfill gains live-DB coverage (#187).** The one divergence path
+  no existing test could structurally see is now covered by a live-DB test, with a
+  small refactor to `migrate.go` to make the backfill exercisable.
+
 ### Fixed
 
+- **GitLab driver: guard nil elements in branch-protection loops (#378).**
+  `DefaultBranchProtection` dereferenced each element of the push/merge access-level
+  slices, so a forge returning a null array element (e.g.
+  `{"push_access_levels":[null]}`) decoded to a nil pointer and panicked on the
+  security-sensitive privcheck path against an allowlisted-but-untrusted forge. Both
+  loops now skip nil elements, completing the nil-element hardening for this driver.
+- **Board: restore horizontal column scroll, drop pinned headers (#375).** #367
+  (shipped in v0.44.0) regressed the board: flex-wrap columns wrapped onto new rows
+  and horizontal card scroll was gone. The board row is back to one horizontally
+  scrolling row with fixed-width, non-shrinking lanes, and the ResizeObserver
+  toolbar-measuring machinery is removed.
 - **`e2e/run-store-it.sh` reports an unavailable throwaway-Postgres image as a
   framed infrastructure fault, not an opaque `docker run` error.** The script now
   checks for the image (`docker image inspect`) and, only if it is absent, pulls it
