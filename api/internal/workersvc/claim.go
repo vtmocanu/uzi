@@ -26,16 +26,21 @@ type ClaimPayload struct {
 	// IssueIID is the worked issue for an issue run, null for a ci_fix run (which
 	// has no issue). IssueTitle/IssueDescription always carry a human summary (for
 	// ci_fix, a synthesized one) so the run stays displayable and self-contained.
-	IssueIID         *int64  `json:"issue_iid"`
-	IssueTitle       string  `json:"issue_title"`
-	IssueDescription string  `json:"issue_description"`
-	Status           string  `json:"status"`
-	Branch           *string `json:"branch"`     // resume: attach existing branch
-	SessionID        *string `json:"session_id"` // resume: continue SDK session
-	LastSeq          int32   `json:"last_seq"`   // resume: continue message numbering
-	IterationCount   int32   `json:"iteration_count"`
-	RequeueCount     int32   `json:"requeue_count"`
-	PlanMd           *string `json:"plan_md"` // resume: plan already captured
+	IssueIID         *int64 `json:"issue_iid"`
+	IssueTitle       string `json:"issue_title"`
+	IssueDescription string `json:"issue_description"`
+	// IssueComments is the structured, bot/system-filtered, bounded snapshot of the
+	// issue's HUMAN comments captured at run creation (PRD #381). nil for every
+	// non-issue kind, a comment-less issue, and a connection with an unknown bot id
+	// (D9). The agent renders it under a per-prompt nonce fence (M3).
+	IssueComments  *IssueCommentsSnapshot `json:"issue_comments,omitempty"`
+	Status         string                 `json:"status"`
+	Branch         *string                `json:"branch"`     // resume: attach existing branch
+	SessionID      *string                `json:"session_id"` // resume: continue SDK session
+	LastSeq        int32                  `json:"last_seq"`   // resume: continue message numbering
+	IterationCount int32                  `json:"iteration_count"`
+	RequeueCount   int32                  `json:"requeue_count"`
+	PlanMd         *string                `json:"plan_md"` // resume: plan already captured
 	// AutoApprove flags an autopilot run (PRD #19): the worker resolves the plan
 	// gate with an approve verdict instead of parking at awaiting_approval. It is
 	// top-level (read from the runs row), NOT in ClaimConfig — ClaimConfig is

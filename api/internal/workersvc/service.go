@@ -1830,22 +1830,39 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		milestones = nil
 	}
 
+	// PRD #381: replay the structured issue-comments snapshot captured at run
+	// creation. A malformed column degrades to nil-and-log rather than failing the
+	// claim, matching the milestone decode above — the column is data a prior write
+	// left, not an invariant of this claim.
+	var issueComments *IssueCommentsSnapshot
+	if len(run.IssueComments) > 0 {
+		var snap IssueCommentsSnapshot
+		if err := json.Unmarshal(run.IssueComments, &snap); err != nil {
+			slog.Error("workersvc: decode run issue comments", "run_id", run.ID, "error", err)
+		} else {
+			issueComments = &snap
+		}
+	}
+
 	payload := &ClaimPayload{
 		RunID:            run.ID.String(),
 		Kind:             run.Kind,
 		IssueIID:         issueIID,
 		IssueTitle:       run.IssueTitle,
 		IssueDescription: run.IssueDescription,
-		Status:           run.Status,
-		Pipeline:         pipeline,
-		Branch:           textPtr(run.Branch),
-		SessionID:        textPtr(run.SessionID),
-		LastSeq:          run.LastSeq,
-		IterationCount:   run.IterationCount,
-		RequeueCount:     run.RequeueCount,
-		PlanMd:           textPtr(run.PlanMd),
-		AutoApprove:      run.AutoApprove,
-		OpenQuestionID:   textPtr(run.OpenQuestionID),
+		// PRD #381: the structured comments snapshot, decoded above. omitempty keeps a
+		// comment-less run's claim byte-identical to today's.
+		IssueComments:  issueComments,
+		Status:         run.Status,
+		Pipeline:       pipeline,
+		Branch:         textPtr(run.Branch),
+		SessionID:      textPtr(run.SessionID),
+		LastSeq:        run.LastSeq,
+		IterationCount: run.IterationCount,
+		RequeueCount:   run.RequeueCount,
+		PlanMd:         textPtr(run.PlanMd),
+		AutoApprove:    run.AutoApprove,
+		OpenQuestionID: textPtr(run.OpenQuestionID),
 		// PRD #35. Re-read from the row on EVERY claim, like AutoApprove above: a
 		// park-resume-park cycle must keep asking the row rather than remembering what
 		// the first claim said, so a per-run toggle flipped mid-flight takes effect on
@@ -3997,6 +4014,21 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	if fixing > 0 {
 		return store.Run{}, ErrBranchInUse
 	}
+	// PRD #381: snapshot the issue's human comments alongside the description. One
+	// extra forge round-trip, centralized here so every issue-backed origin (manual,
+	// autopilot, scheduled) captures it (D6) without rippling the Create*Run seam.
+	// Best-effort: a forge glitch, a nil forge builder (tests), or an unknown bot id
+	// (D9) all degrade to a NULL snapshot rather than failing run creation.
+	var issueCommentsJSON []byte
+	if s.forges != nil {
+		if snap := s.fetchIssueCommentsSnapshot(ctx, row, issueIID); snap != nil {
+			if b, err := json.Marshal(snap); err != nil {
+				slog.Error("workersvc: marshal issue comments snapshot", "issue_iid", issueIID, "error", err)
+			} else {
+				issueCommentsJSON = b
+			}
+		}
+	}
 	run, err := s.q.CreateRun(ctx, store.CreateRunParams{
 		UserID:           userID,
 		RepoID:           repoID,
@@ -4030,6 +4062,10 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		// label-poller autopilot) → the default lane where subagent pins win. M1 stores
 		// it only; claim delivery (M3) and worker behaviour (M4) are separate milestones.
 		OverrideSubagentModel: overrideSubagentModel,
+		// PRD #381: the structured human-comments snapshot, fetched best-effort above.
+		// nil (→ NULL) for a non-issue kind, a comment-less issue, an unknown bot id
+		// (D9), or when no forge builder is wired (tests).
+		IssueComments: issueCommentsJSON,
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -4041,6 +4077,24 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// in the CreateRun statement; Notify performs the move.
 	s.notify(run.ID, "queued")
 	return run, nil
+}
+
+// fetchIssueCommentsSnapshot builds a forge driver from the run's repo connection,
+// reads the issue's comments, and returns the filtered/capped snapshot (PRD #381).
+// Returns nil (→ NULL) on any error or when the D1/D9 filter leaves nothing — a
+// comment snapshot is best-effort run CONTEXT, never a reason to fail creation.
+func (s *Service) fetchIssueCommentsSnapshot(ctx context.Context, row store.GetRepoForUserRow, issueIID int64) *IssueCommentsSnapshot {
+	f, err := s.forges.ForgeForConnection(row.ForgeType, row.BaseUrl, row.TokenCiphertext)
+	if err != nil {
+		slog.Error("workersvc: build forge for issue comments", "issue_iid", issueIID, "error", err)
+		return nil
+	}
+	comments, err := f.ListIssueComments(ctx, row.ForgeProjectID, issueIID)
+	if err != nil {
+		slog.Error("workersvc: list issue comments", "issue_iid", issueIID, "error", err) // err is PAT-redacted by the driver
+		return nil
+	}
+	return buildIssueCommentsSnapshot(comments, row.BotForgeUserID)
 }
 
 // prdLabel resolves the configured PRD label for the run-eligibility gate,
