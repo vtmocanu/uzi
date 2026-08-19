@@ -344,6 +344,9 @@ var wantRouteMounts = []routeMount{
 	// budget as the other run creators (runs, ci-fix-runs).
 	{"POST", "/api/repos/{id}/task-runs", limForge},
 	{"POST", "/api/runs/{id}/inputs", noLimiter},
+	// PRD #400 Decision 6: the task dispatch gate. No limiter — no token spend, no
+	// forge write, mirroring CreateRunInput's posture.
+	{"POST", "/api/runs/{id}/dispatch", noLimiter},
 	{"POST", "/api/runs/{id}/rejudge", limJudge},
 	{"POST", "/api/runs/{id}/review/recommendations/{recID}/issue", limForge},
 	{"POST", "/api/skills/", noLimiter},

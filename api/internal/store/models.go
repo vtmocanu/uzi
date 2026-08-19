@@ -385,6 +385,7 @@ type Run struct {
 	IssueComments         []byte             `json:"issue_comments"`
 	BaseBranch            pgtype.Text        `json:"base_branch"`
 	OpenMr                bool               `json:"open_mr"`
+	DispatchedAt          pgtype.Timestamptz `json:"dispatched_at"`
 }
 
 type RunMessage struct {

@@ -297,11 +297,17 @@ type fakeStore struct {
 	promptRunParams *store.CreatePromptRunParams
 	// Task/handoff (PRD #400). taskRunParams stays nil until CreateTaskRun's insert
 	// runs, so a #66 guardrail test can assert the gate blocked before the insert.
-	taskRunResult    store.Run
-	taskRunErr       error
-	taskRunParams    *store.CreateTaskRunParams
-	activeBranchRuns int64 // CountActiveRunsWithBranch
-	activeCIFixRuns  int64 // CountActiveCIFixForRef
+	taskRunResult store.Run
+	taskRunErr    error
+	taskRunParams *store.CreateTaskRunParams
+	// DispatchTaskRun (PRD #400 Decision 6): dispatchTaskParams stays nil until the
+	// stamp query runs; dispatchTaskErr = pgx.ErrNoRows models the idempotency/ownership
+	// guard matching 0 rows.
+	dispatchTaskResult store.Run
+	dispatchTaskErr    error
+	dispatchTaskParams *store.DispatchTaskRunParams
+	activeBranchRuns   int64 // CountActiveRunsWithBranch
+	activeCIFixRuns    int64 // CountActiveCIFixForRef
 
 	// Create worker.
 	createWorkerResult store.Worker
@@ -864,6 +870,10 @@ func (f *fakeStore) CreatePromptRun(_ context.Context, arg store.CreatePromptRun
 func (f *fakeStore) CreateTaskRun(_ context.Context, arg store.CreateTaskRunParams) (store.Run, error) {
 	f.taskRunParams = &arg
 	return f.taskRunResult, f.taskRunErr
+}
+func (f *fakeStore) DispatchTaskRun(_ context.Context, arg store.DispatchTaskRunParams) (store.Run, error) {
+	f.dispatchTaskParams = &arg
+	return f.dispatchTaskResult, f.dispatchTaskErr
 }
 func (f *fakeStore) CountActiveRunsWithBranch(context.Context, store.CountActiveRunsWithBranchParams) (int64, error) {
 	return f.activeBranchRuns, nil

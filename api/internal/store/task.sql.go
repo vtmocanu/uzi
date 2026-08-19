@@ -16,7 +16,7 @@ const createTaskRun = `-- name: CreateTaskRun :one
 
 INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, open_mr, issue_title, issue_description, auto_approve)
 VALUES ($1, $2, $3::uuid, 'task', $4, $5, $6, $7, $8, true)
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at
 `
 
 type CreateTaskRunParams struct {
@@ -136,6 +136,118 @@ func (q *Queries) CreateTaskRun(ctx context.Context, arg CreateTaskRunParams) (R
 		&i.IssueComments,
 		&i.BaseBranch,
 		&i.OpenMr,
+		&i.DispatchedAt,
+	)
+	return i, err
+}
+
+const dispatchTaskRun = `-- name: DispatchTaskRun :one
+UPDATE runs
+SET dispatched_at = now(), updated_at = now()
+WHERE id = $1 AND user_id = $2 AND kind = 'task' AND dispatched_at IS NULL
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at
+`
+
+type DispatchTaskRunParams struct {
+	RunID  uuid.UUID `json:"run_id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// Stamp the dispatch gate for a task run (PRD #400 Decision 6): the CLI calls this
+// AFTER it has pushed local HEAD to the run's uzi/task/<id> branch, which is the moment
+// the run becomes genuinely claimable (ClaimRun gates task claimability on
+// dispatched_at). Owner-scoped (@user_id) so a caller holding a foreign run id stamps
+// nothing and matches 0 rows — the handler turns that into the same 404 an unknown run
+// gets. kind='task' is a guard against dispatching any other kind. dispatched_at IS NULL
+// makes the stamp idempotent: a second dispatch matches 0 rows and the caller reads it
+// as not-found rather than re-broadcasting a claimable signal.
+func (q *Queries) DispatchTaskRun(ctx context.Context, arg DispatchTaskRunParams) (Run, error) {
+	row := q.db.QueryRow(ctx, dispatchTaskRun, arg.RunID, arg.UserID)
+	var i Run
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.RepoID,
+		&i.IssueIid,
+		&i.IssueTitle,
+		&i.IssueDescription,
+		&i.Status,
+		&i.RequeueCount,
+		&i.WorkerID,
+		&i.SessionID,
+		&i.LastSeq,
+		&i.Branch,
+		&i.MrIid,
+		&i.FailureReason,
+		&i.PlanMd,
+		&i.IterationCount,
+		&i.ClaimedAt,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.OriginColumn,
+		&i.BoardColumn,
+		&i.MovePendingSince,
+		&i.MrState,
+		&i.AutoApprove,
+		&i.AutopilotCommentedAt,
+		&i.Kind,
+		&i.PipelineID,
+		&i.PipelineRef,
+		&i.FailureSnapshot,
+		&i.FixVerdict,
+		&i.StopKind,
+		&i.AgentSource,
+		&i.AgentExclusions,
+		&i.RepoAgents,
+		&i.Title,
+		&i.ResumeOfRunID,
+		&i.LastActivityAt,
+		&i.Health,
+		&i.HealthReason,
+		&i.HealthSince,
+		&i.HealthNotifiedAt,
+		&i.TargetRunID,
+		&i.MrWebUrl,
+		&i.PrdDonePath,
+		&i.PrdPatchSettledAt,
+		&i.AnthropicSecretID,
+		&i.AnthropicSecretLabel,
+		&i.AnthropicSelectReason,
+		&i.AnthropicHeadroomPct,
+		&i.WaitOnLimit,
+		&i.LimitResetsAt,
+		&i.RetryNotBefore,
+		&i.LimitWaitCount,
+		&i.RateLimitType,
+		&i.OpenQuestionID,
+		&i.ReviseCount,
+		&i.PlanSource,
+		&i.PlannedBaseCommit,
+		&i.RequireBaseMatch,
+		&i.MilestonesCandidate,
+		&i.MilestonesFrozen,
+		&i.MilestonesCompleted,
+		&i.MilestonesInProgress,
+		&i.BudgetMaxIterations,
+		&i.BudgetWallSeconds,
+		&i.ScheduleID,
+		&i.LimitDeadSecretID,
+		&i.ReportOnly,
+		&i.ReportMd,
+		&i.CiConfigPaths,
+		&i.Model,
+		&i.OverrideSubagentModel,
+		&i.FailOrigin,
+		&i.Priority,
+		&i.SummaryIntent,
+		&i.SummaryPlan,
+		&i.SummaryDeltas,
+		&i.IssueComments,
+		&i.BaseBranch,
+		&i.OpenMr,
+		&i.DispatchedAt,
 	)
 	return i, err
 }

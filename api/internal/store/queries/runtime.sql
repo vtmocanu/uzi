@@ -544,6 +544,11 @@ WHERE id = (
     SELECT r.id FROM runs r
     WHERE r.user_id = @user_id
       AND r.kind <> 'chat'
+      -- PRD #400 Decision 6: a task run is claimable ONLY after the CLI has seeded its
+      -- uzi/task/<id> branch and stamped dispatched_at — otherwise a worker could claim
+      -- it before the branch exists (the claim-before-seed race). Every non-task kind is
+      -- unaffected (dispatched_at is only ever set on a task run).
+      AND (r.kind <> 'task' OR r.dispatched_at IS NOT NULL)
       AND r.status = 'queued'
       AND (r.worker_id IS NULL
            OR r.worker_id = @worker_id

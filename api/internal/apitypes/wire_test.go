@@ -87,6 +87,9 @@ var runDTOKeys = []string{
 	// kind='task' run. base_branch is null on every non-task run; open_mr is false by
 	// default and on every non-task run. Always on the wire.
 	"base_branch", "open_mr",
+	// PRD #400 Decision 6: when a task run's dispatch gate was stamped (null on every
+	// non-task run and on a task run not yet dispatched). Always on the wire.
+	"dispatched_at",
 	"mr_iid", "mr_web_url", "mr_state", "failure_reason",
 	"stop_kind", "health", "health_reason", "health_since", "plan_md",
 	// PRD #209: plan_md's provenance ("agent"|"seeded"), NOT NULL so always on the wire.

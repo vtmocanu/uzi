@@ -274,6 +274,9 @@ type Store interface {
 	CreatePromptRun(ctx context.Context, arg store.CreatePromptRunParams) (store.Run, error)
 	// Task/handoff runs (PRD #400).
 	CreateTaskRun(ctx context.Context, arg store.CreateTaskRunParams) (store.Run, error)
+	// DispatchTaskRun stamps a task run's dispatch gate after the CLI seeds its branch
+	// (PRD #400 Decision 6), making it claimable; 0 rows → pgx.ErrNoRows.
+	DispatchTaskRun(ctx context.Context, arg store.DispatchTaskRunParams) (store.Run, error)
 	CountActiveRunsWithBranch(ctx context.Context, arg store.CountActiveRunsWithBranchParams) (int64, error)
 	CountActiveCIFixForRef(ctx context.Context, arg store.CountActiveCIFixForRefParams) (int64, error)
 	GetRunByIDForUser(ctx context.Context, arg store.GetRunByIDForUserParams) (store.Run, error)

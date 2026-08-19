@@ -11,8 +11,16 @@
 -- and open_mr (whether the worker opens an MR at the end — off by default; a plain
 -- handoff produces commits on the branch, not an MR). The kind domain and per-kind
 -- shape widen the same drop/re-add way 00104/00058 did.
+--
+-- dispatched_at is the DISPATCH GATE (PRD #400 Decision 6): a task run is created
+-- NOT-yet-claimable and becomes claimable only once the CLI stamps this column, which
+-- it does AFTER it seeds the run's uzi/task/<id> branch. The ordering is CLI creates
+-- run → CLI pushes local HEAD to uzi/task/<id> → CLI dispatches → worker claims, so
+-- the stamp closes the claim-before-seed race (a queued task claimed before its branch
+-- exists). Nullable; only ever set for task runs (see ClaimRun's task predicate).
 ALTER TABLE runs ADD COLUMN base_branch text;
 ALTER TABLE runs ADD COLUMN open_mr boolean NOT NULL DEFAULT false;
+ALTER TABLE runs ADD COLUMN dispatched_at timestamptz;
 
 ALTER TABLE runs DROP CONSTRAINT runs_kind_check;
 ALTER TABLE runs ADD CONSTRAINT runs_kind_check
@@ -40,5 +48,6 @@ ALTER TABLE runs ADD CONSTRAINT runs_kind_shape CHECK (
 ALTER TABLE runs DROP CONSTRAINT runs_kind_check;
 ALTER TABLE runs ADD CONSTRAINT runs_kind_check
     CHECK (kind IN ('issue', 'ci_fix', 'chat', 'judge', 'self_improve', 'prompt'));
+ALTER TABLE runs DROP COLUMN dispatched_at;
 ALTER TABLE runs DROP COLUMN open_mr;
 ALTER TABLE runs DROP COLUMN base_branch;

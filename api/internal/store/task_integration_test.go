@@ -17,8 +17,10 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -137,5 +139,111 @@ func TestCreateTaskRunLiveDB(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "runs_kind_shape") {
 		t.Errorf("issue-bearing task rejected by %v, want the runs_kind_shape CHECK", err)
+	}
+}
+
+// TestTaskRunDispatchGateLiveDB proves the claim-before-seed gate (PRD #400 Decision 6)
+// against a real Postgres, non-vacuously: a freshly-created task run (dispatched_at
+// NULL) is NOT claimable, and only AFTER DispatchTaskRun stamps the gate does ClaimRun
+// claim it. A ClaimRun predicate that ignored dispatched_at would claim the task on the
+// first call, so the first assertion is what makes the gate real.
+//
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; run via
+// e2e/run-store-it.sh.
+func TestTaskRunDispatchGateLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	userID, connID, repoID := uuid.New(), uuid.New(), uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		userID, fmt.Sprintf("dispatch-%s@e2e", userID))
+	mustExec(ctx, t, pool,
+		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})
+	mustExec(ctx, t, pool,
+		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		 VALUES ($1, $2, 1, 'g/r', 'https://forge.e2e/g/r', 'main', true)`, repoID, connID)
+	worker := createWorker(ctx, t, pool, userID)
+
+	// A freshly-created task run: dispatched_at is NULL (the CLI has not seeded its
+	// branch yet), so it is NOT-yet-claimable.
+	id := uuid.New()
+	task, err := q.CreateTaskRun(ctx, store.CreateTaskRunParams{
+		RunID:            id,
+		UserID:           userID,
+		RepoID:           repoID,
+		Branch:           pgtype.Text{String: "uzi/task/" + id.String(), Valid: true},
+		OpenMr:           false,
+		IssueTitle:       "handoff",
+		IssueDescription: "do the thing",
+	})
+	if err != nil {
+		t.Fatalf("CreateTaskRun: %v", err)
+	}
+	if task.DispatchedAt.Valid {
+		t.Fatalf("a fresh task run must have dispatched_at NULL, got %+v", task.DispatchedAt)
+	}
+
+	claimParams := func() store.ClaimRunParams {
+		return store.ClaimRunParams{
+			WorkerID:       pgtype.UUID{Bytes: worker, Valid: true},
+			UserID:         userID,
+			AffinityCutoff: pgtype.Timestamptz{Time: time.Now().Add(-2 * time.Minute), Valid: true},
+		}
+	}
+
+	// ── The gate: an UNDISPATCHED task run is not claimable. The only queued run is this
+	//    task, so ClaimRun must find nothing (pgx.ErrNoRows). ──
+	if _, err := q.ClaimRun(ctx, claimParams()); err != pgx.ErrNoRows {
+		claimed, _ := q.ClaimRun(ctx, claimParams())
+		t.Fatalf("ClaimRun claimed an UNDISPATCHED task (err=%v, run=%+v): the dispatched_at gate is vacuous", err, claimed)
+	}
+
+	// ── Stamp the dispatch gate (what the CLI does after seeding the branch). ──
+	dispatched, err := q.DispatchTaskRun(ctx, store.DispatchTaskRunParams{RunID: id, UserID: userID})
+	if err != nil {
+		t.Fatalf("DispatchTaskRun: %v", err)
+	}
+	if !dispatched.DispatchedAt.Valid {
+		t.Fatalf("DispatchTaskRun must stamp dispatched_at, got %+v", dispatched.DispatchedAt)
+	}
+
+	// ── Now the task IS claimable. ──
+	claimed, err := q.ClaimRun(ctx, claimParams())
+	if err != nil {
+		t.Fatalf("ClaimRun after dispatch: %v (a dispatched task must be claimable)", err)
+	}
+	if claimed.ID != id || claimed.Kind != "task" {
+		t.Fatalf("run lane claimed %s (kind %q), want the dispatched task %s", claimed.ID, claimed.Kind, id)
+	}
+
+	// ── Idempotency + ownership: a SECOND dispatch matches 0 rows (already stamped), and
+	//    a foreign user's dispatch matches 0 rows too. ──
+	if _, err := q.DispatchTaskRun(ctx, store.DispatchTaskRunParams{RunID: id, UserID: userID}); err != pgx.ErrNoRows {
+		t.Fatalf("a second dispatch must match 0 rows (idempotency guard), got %v", err)
+	}
+	id2 := uuid.New()
+	task2, err := q.CreateTaskRun(ctx, store.CreateTaskRunParams{
+		RunID: id2, UserID: userID, RepoID: repoID,
+		Branch:     pgtype.Text{String: "uzi/task/" + id2.String(), Valid: true},
+		IssueTitle: "t2", IssueDescription: "d2",
+	})
+	if err != nil {
+		t.Fatalf("CreateTaskRun (2): %v", err)
+	}
+	if _, err := q.DispatchTaskRun(ctx, store.DispatchTaskRunParams{RunID: task2.ID, UserID: uuid.New()}); err != pgx.ErrNoRows {
+		t.Fatalf("a foreign user's dispatch must match 0 rows (ownership guard), got %v", err)
 	}
 }

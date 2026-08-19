@@ -1122,6 +1122,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// Accept-Encoding and transparently decompress, so no caller changes.
 				r.With(chimw.Compress(5)).Get("/{id}/messages", h.ListRunMessages)
 				r.Post("/{id}/inputs", h.CreateRunInput)
+				// Dispatch a task run (PRD #400 Decision 6): the CLI calls this after it
+				// pushes local HEAD to the run's uzi/task/<id> branch, which is what makes
+				// the run claimable. RequireUser + owner-scoped in the service, mirroring
+				// CreateRunInput's auth — no token spend, no forge write.
+				r.Post("/{id}/dispatch", h.DispatchTaskRun)
 				// Steer queue (PRD #95): the run's follow_up inputs with delivery status.
 				// Owner-only (GetRunByIDForUser) — a non-owner, incl. admin_ro, gets 404,
 				// closing a leak (follow-ups are never in run_messages). RequireUser so

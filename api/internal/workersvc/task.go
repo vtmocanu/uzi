@@ -26,6 +26,15 @@ const taskBranchPrefix = "uzi/task/"
 // must stay real, so it maps to an error rather than being elided.
 var ErrTaskBranchUnsafe = errors.New("task branch is not in the uzi/task/* namespace or resolves to the default branch")
 
+// maxTaskBaseBranchBytes bounds the optional base_branch (the source ref a task
+// branches from). A git ref cannot legitimately approach this, so it is a cheap
+// dedicated cap on top of the request-body limit rather than a semantic constraint.
+const maxTaskBaseBranchBytes = 512
+
+// ErrTaskBaseBranchTooLong is returned when the trimmed base_branch exceeds
+// maxTaskBaseBranchBytes (PRD #400) → 400. Mapped in writeStartRunError.
+var ErrTaskBaseBranchTooLong = errors.New("base branch is too long")
+
 // CreateTaskRun queues a kind='task' run for a uzi handoff (PRD #400). It is shaped
 // like CreatePromptRun, deliberately NOT createRun: a task run is repo-ful but
 // ISSUE-LESS (no forge issue, no PRD link), so the normal path's cached-PRD-issue and
@@ -45,19 +54,15 @@ var ErrTaskBranchUnsafe = errors.New("task branch is not in the uzi/task/* names
 // cheap branch-safety assertion (Decision 8) confirms the resolved branch is namespaced
 // and is not the repo's default branch — belt-and-suspenders behind the server-named
 // branch being safe by construction.
-func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, context, baseBranch string, openMR bool) (store.Run, error) {
+func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, inlineContext, baseBranch string, openMR bool) (store.Run, error) {
 	id := uuid.New()
 	branch := taskBranchPrefix + id.String()
 
-	// Cap the inline context the same way the seeded/prompt paths cap issue_description,
-	// then NUL-strip it (and base_branch) — both are untrusted caller input reused as
-	// TEXT columns.
-	if len(context) > MaxIssueDescriptionBytes {
-		return store.Run{}, ErrDescriptionTooLarge
-	}
-	context, _ = stripNUL(context)
-	baseBranch, _ = stripNUL(baseBranch)
-
+	// Ownership FIRST, before the input caps below — the same ordering CreatePromptRun's
+	// model states. Resolving the repo up front means an over-cap request to a repo the
+	// caller does not own returns repo-not-found (404) rather than too-large (422), so a
+	// stranger cannot use the cap error to probe which repos exist. This also replicates
+	// the consent check createRun would otherwise run (this path bypasses createRun).
 	row, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -65,6 +70,22 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, c
 		}
 		return store.Run{}, err
 	}
+
+	// Cap the inline context the same way the seeded/prompt paths cap issue_description,
+	// then NUL-strip it (and base_branch) — both are untrusted caller input reused as
+	// TEXT columns.
+	if len(inlineContext) > MaxIssueDescriptionBytes {
+		return store.Run{}, ErrDescriptionTooLarge
+	}
+	inlineContext, _ = stripNUL(inlineContext)
+	baseBranch, _ = stripNUL(baseBranch)
+	// A git ref cannot legitimately exceed maxTaskBaseBranchBytes; cap it with a small
+	// dedicated bound rather than relying only on the 1 MiB request-body cap. Checked on
+	// the trimmed value (pgTextTrimNarg trims again before persisting).
+	if len(strings.TrimSpace(baseBranch)) > maxTaskBaseBranchBytes {
+		return store.Run{}, ErrTaskBaseBranchTooLong
+	}
+
 	// #66 D1 layer 2: the shared service-layer guardrail, same as the other PAT-bearing
 	// inserts. A refused repo never gets a run.
 	if err := s.guardDefaultBranch(ctx, row); err != nil {
@@ -83,13 +104,36 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, c
 		Branch:           pgText(branch),
 		BaseBranch:       pgTextTrimNarg(baseBranch),
 		OpenMr:           openMR,
-		IssueTitle:       deriveTaskTitle(context),
-		IssueDescription: context,
+		IssueTitle:       deriveTaskTitle(inlineContext),
+		IssueDescription: inlineContext,
 	})
 	if err != nil {
 		return store.Run{}, err
 	}
-	// queued keeps the live status broadcast consistent with other run kinds.
+	// A task run is created NOT-yet-claimable (dispatched_at NULL); the live status
+	// broadcast stays consistent with other kinds, but the worker cannot claim it until
+	// DispatchTaskRun stamps the gate (PRD #400 Decision 6).
+	s.notify(run.ID, "queued")
+	return run, nil
+}
+
+// DispatchTaskRun stamps the dispatch gate for a task run (PRD #400 Decision 6),
+// making it genuinely claimable. The CLI calls this AFTER it has pushed local HEAD to
+// the run's uzi/task/<id> branch — that push is what the ClaimRun gate
+// (dispatched_at IS NOT NULL) waits for, closing the claim-before-seed race. The query
+// is owner-scoped and guarded on kind='task' AND dispatched_at IS NULL, so a foreign
+// run id, a non-task run, and an already-dispatched run all match 0 rows and surface as
+// ErrRunNotFound (mapped to 404) rather than re-broadcasting a claimable signal.
+func (s *Service) DispatchTaskRun(ctx context.Context, userID, runID uuid.UUID) (store.Run, error) {
+	run, err := s.q.DispatchTaskRun(ctx, store.DispatchTaskRunParams{RunID: runID, UserID: userID})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return store.Run{}, ErrRunNotFound
+		}
+		return store.Run{}, err
+	}
+	// The run is now claimable; broadcast queued so any live view re-reads it (the status
+	// is unchanged, but the run's claimability just changed).
 	s.notify(run.ID, "queued")
 	return run, nil
 }

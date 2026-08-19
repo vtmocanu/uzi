@@ -108,7 +108,12 @@ type RunDTO struct {
 	// non-task run — a plain handoff produces commits on the branch, not an MR).
 	BaseBranch *string `json:"base_branch"`
 	OpenMr     bool    `json:"open_mr"`
-	MrIID      *int64  `json:"mr_iid"`
+	// DispatchedAt is when the CLI stamped a task run's dispatch gate (PRD #400
+	// Decision 6) — the moment it became claimable, after its uzi/task/<id> branch was
+	// seeded. Null on every non-task run and on a task run not yet dispatched. Mapped
+	// like ClaimedAt (a nullable timestamp), read-only.
+	DispatchedAt *time.Time `json:"dispatched_at"`
+	MrIID        *int64     `json:"mr_iid"`
 	// MrWebURL is the forge-supplied MR/PR web URL persisted by the worker at MR
 	// creation (PRD #65 D8), null on runs created before it landed. The web renders
 	// it directly through isHttpsUrl and only falls back to the legacy GitLab URL

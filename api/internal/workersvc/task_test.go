@@ -120,6 +120,63 @@ func TestCreateTaskRunRepoNotOwned(t *testing.T) {
 	}
 }
 
+// TestCreateTaskRunBaseBranchTooLong: a base_branch over the dedicated cap is rejected
+// with ErrTaskBaseBranchTooLong before any insert.
+func TestCreateTaskRunBaseBranchTooLong(t *testing.T) {
+	fs := &fakeStore{repoRow: aValidRepoRow()}
+	svc := New(fs, newBox(t), testParams())
+	svc.SetRepoGuard(&fakeGuard{res: privcheck.GuardResult{Blocked: false}})
+	long := strings.Repeat("b", maxTaskBaseBranchBytes+1)
+	if _, err := svc.CreateTaskRun(context.Background(), uuid.New(), uuid.New(), "do it", long, false); !errors.Is(err, ErrTaskBaseBranchTooLong) {
+		t.Fatalf("err = %v, want ErrTaskBaseBranchTooLong", err)
+	}
+	if fs.taskRunParams != nil {
+		t.Fatal("insert must not run when base_branch is over the cap")
+	}
+}
+
+// TestCreateTaskRunRepoNotOwnedBeforeCap: an over-cap request to a repo the caller does
+// NOT own returns repo-not-found (ownership resolved first), not too-large — the
+// ordering nit that mirrors CreatePromptRun.
+func TestCreateTaskRunRepoNotOwnedBeforeCap(t *testing.T) {
+	fs := &fakeStore{repoErr: pgx.ErrNoRows}
+	svc := New(fs, newBox(t), testParams())
+	svc.SetRepoGuard(&fakeGuard{res: privcheck.GuardResult{Blocked: false}})
+	big := strings.Repeat("a", MaxIssueDescriptionBytes+1)
+	if _, err := svc.CreateTaskRun(context.Background(), uuid.New(), uuid.New(), big, "", false); !errors.Is(err, ErrRepoNotFound) {
+		t.Fatalf("err = %v, want ErrRepoNotFound (ownership resolved before the cap)", err)
+	}
+}
+
+// TestDispatchTaskRunSuccess: a stamped run is returned and the dispatch query saw the
+// caller's (run, user) pair.
+func TestDispatchTaskRunSuccess(t *testing.T) {
+	user, run := uuid.New(), uuid.New()
+	fs := &fakeStore{dispatchTaskResult: store.Run{ID: run}}
+	svc := New(fs, newBox(t), testParams())
+	got, err := svc.DispatchTaskRun(context.Background(), user, run)
+	if err != nil {
+		t.Fatalf("DispatchTaskRun: %v", err)
+	}
+	if got.ID != run {
+		t.Errorf("returned run %v, want %v", got.ID, run)
+	}
+	if fs.dispatchTaskParams == nil || fs.dispatchTaskParams.RunID != run || fs.dispatchTaskParams.UserID != user {
+		t.Errorf("dispatch params = %+v, want run=%v user=%v", fs.dispatchTaskParams, run, user)
+	}
+}
+
+// TestDispatchTaskRunIdempotencyGuard: the query's ownership+idempotency guard matches
+// 0 rows (pgx.ErrNoRows) for a foreign/non-task/already-dispatched run, which the
+// service maps to ErrRunNotFound — so a SECOND dispatch is a 404, not a re-broadcast.
+func TestDispatchTaskRunIdempotencyGuard(t *testing.T) {
+	fs := &fakeStore{dispatchTaskErr: pgx.ErrNoRows}
+	svc := New(fs, newBox(t), testParams())
+	if _, err := svc.DispatchTaskRun(context.Background(), uuid.New(), uuid.New()); !errors.Is(err, ErrRunNotFound) {
+		t.Fatalf("err = %v, want ErrRunNotFound for a 0-row dispatch", err)
+	}
+}
+
 // TestDeriveTaskTitle covers the first-non-empty-line pick, rune truncation, and the
 // blank-context fallback.
 func TestDeriveTaskTitle(t *testing.T) {
