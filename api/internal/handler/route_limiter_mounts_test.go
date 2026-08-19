@@ -231,6 +231,9 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/runs/{id}/inputs", noLimiter},
 	{"GET", "/api/runs/{id}/messages", noLimiter},
 	{"GET", "/api/runs/{id}/review", noLimiter},
+	// PRD #400 M4a: the handoff task diff-review read. No limiter — a plain owner-or-admin
+	// read, no forge write, no token spend, matching the /review read above it.
+	{"GET", "/api/runs/{id}/task-review", noLimiter},
 	{"GET", "/api/runs/{id}/review/recommendations/{recID}/issue-draft", noLimiter},
 	{"GET", "/api/skills/", noLimiter},
 	{"GET", "/api/skills/{id}", noLimiter},
@@ -340,7 +343,13 @@ var wantRouteMounts = []routeMount{
 	// per-user forge limiter, matching CreateRun's posture.
 	{"POST", "/api/schedules/{id}/run-now", limForge},
 	{"POST", "/api/repos/{id}/sync", limForge},
+	// Task/handoff run (PRD #400): the create path pushes the same per-user forge
+	// budget as the other run creators (runs, ci-fix-runs).
+	{"POST", "/api/repos/{id}/task-runs", limForge},
 	{"POST", "/api/runs/{id}/inputs", noLimiter},
+	// PRD #400 Decision 6: the task dispatch gate. No limiter — no token spend, no
+	// forge write, mirroring CreateRunInput's posture.
+	{"POST", "/api/runs/{id}/dispatch", noLimiter},
 	{"POST", "/api/runs/{id}/rejudge", limJudge},
 	{"POST", "/api/runs/{id}/review/recommendations/{recID}/issue", limForge},
 	{"POST", "/api/skills/", noLimiter},
@@ -361,6 +370,9 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/proposals", noLimiter},
 	{"POST", "/api/worker/runs/{id}/publish", noLimiter},
 	{"POST", "/api/worker/runs/{id}/review", noLimiter},
+	// PRD #400 M4a: the review run's diff-findings POST. Worker-authenticated, no per-user
+	// limiter, matching the judge's worker review POST above it.
+	{"POST", "/api/worker/runs/{id}/task-review", noLimiter},
 	{"POST", "/api/worker/runs/{id}/state", noLimiter},
 	// PRD #362 M1: the run-lane executor posts its intent/plan summaries back. Worker
 	// writes scoped to the worker's own run, no forge call → noLimiter. Bounded by the

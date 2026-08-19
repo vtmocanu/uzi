@@ -41,8 +41,11 @@ type RunDTO struct {
 	// DTO paths, which never render the MR affordance in a browser; set on the
 	// list/detail reads (ListRuns/AdminListRuns/GetRun) from the run's connection.
 	ForgeType string `json:"forge_type"`
-	// Kind is issue|ci_fix|chat. IssueIID is null for ci_fix (no issue) and chat
-	// runs; the ci_fix fields below carry pipeline context, chat carries Title.
+	// Kind is issue|ci_fix|chat|judge|self_improve|prompt|task (PRD #400 added the
+	// seventh, task). IssueIID is null for the issue-less kinds (ci_fix, chat, judge,
+	// prompt, task) and set for the issue-shaped kinds (issue, self_improve); the ci_fix
+	// fields below carry pipeline context, chat carries Title, and a task (uzi handoff)
+	// carries Branch/BaseBranch/OpenMr set at create.
 	Kind             string `json:"kind"`
 	IssueIID         *int64 `json:"issue_iid"`
 	IssueTitle       string `json:"issue_title"`
@@ -101,7 +104,19 @@ type RunDTO struct {
 	BudgetWallSeconds   *int    `json:"budget_wall_seconds"`
 	WorkerID            *string `json:"worker_id"`
 	Branch              *string `json:"branch"`
-	MrIID               *int64  `json:"mr_iid"`
+	// BaseBranch and OpenMr are the task/handoff columns (PRD #400), meaningful only
+	// for a kind='task' run. BaseBranch is the source ref the task branched from (null
+	// when it inherited the caller's local HEAD, and on every non-task run); OpenMr is
+	// whether the worker opens an MR at the end (false by default and for every
+	// non-task run — a plain handoff produces commits on the branch, not an MR).
+	BaseBranch *string `json:"base_branch"`
+	OpenMr     bool    `json:"open_mr"`
+	// DispatchedAt is when the CLI stamped a task run's dispatch gate (PRD #400
+	// Decision 6) — the moment it became claimable, after its uzi/task/<id> branch was
+	// seeded. Null on every non-task run and on a task run not yet dispatched. Mapped
+	// like ClaimedAt (a nullable timestamp), read-only.
+	DispatchedAt *time.Time `json:"dispatched_at"`
+	MrIID        *int64     `json:"mr_iid"`
 	// MrWebURL is the forge-supplied MR/PR web URL persisted by the worker at MR
 	// creation (PRD #65 D8), null on runs created before it landed. The web renders
 	// it directly through isHttpsUrl and only falls back to the legacy GitLab URL

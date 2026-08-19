@@ -11,6 +11,7 @@ import { Worker } from "../src/worker.js";
 import type { Config } from "../src/config.js";
 import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
+import type { ReviewRunner } from "../src/review-runner.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { LimitReachedError } from "../src/limit.js";
 import { nullLogger } from "./helpers.js";
@@ -109,7 +110,8 @@ function buildWorker(runner: RunRunner): Worker {
   } as unknown as Config;
   const noChat = { execute: async () => {} } as unknown as ChatRunner;
   const noJudge = { execute: async () => {} } as unknown as JudgeRunner;
-  return new Worker(config, client, runner, noChat, noJudge, nullLogger(), () => ({
+  const noReview = { execute: async () => {} } as unknown as ReviewRunner;
+  return new Worker(config, client, runner, noChat, noJudge, noReview, nullLogger(), () => ({
     ok: true,
     missing: [],
   }));

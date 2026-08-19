@@ -156,6 +156,30 @@ type Client interface {
 	// selection with no plan). The plan's size cap and empty-plan rejection are the
 	// SERVER's (422) — the client forwards the bytes so those rules live in one place.
 	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, seed *CreateRunSeed) (apitypes.RunDTO, error)
+	// CreateTaskRun queues an issue-less handoff/task run on a repo (PRD #400 M3):
+	// POST /api/repos/{id}/task-runs {context, base_branch?, open_mr}. The server
+	// names the branch (uzi/task/<run-id>) and the created-run response carries it in
+	// Branch — which is what the CLI then pushes local HEAD to. context is the inline
+	// instruction (reused as issue_description, so its 256 KiB cap + sanitization are
+	// the server's); baseBranch is the source ref to branch from, OMITTED when empty
+	// so the worker branches from the caller's seeded HEAD; openMR asks the worker to
+	// open an MR at the end (a branch exempt from `uzi handoff rm`); reviewRequested
+	// (--review) asks that a diff-review run be auto-created when the task completes,
+	// producing structured findings fetched via GetTaskReview; thenFixRequested
+	// (--then-fix) asks that, after that review, a chained fix run push fixes for its
+	// findings to the same branch (--then-fix implies --review).
+	CreateTaskRun(ctx context.Context, repoID, context, baseBranch string, openMR, reviewRequested, thenFixRequested bool) (apitypes.RunDTO, error)
+	// GetTaskReview fetches a handoff task's diff-review (PRD #400 M4a): GET
+	// /api/runs/{id}/task-review, whose envelope is {"task_review": <dto>|null}. A visible
+	// task with no review yet returns a nil DTO (the CLI prints "no review available yet");
+	// a run the caller can't see is a 404 (exit 4). id is the TARGET (task) run id.
+	GetTaskReview(ctx context.Context, id string) (*apitypes.TaskReviewDTO, error)
+	// DispatchTaskRun stamps a task run's dispatch gate (PRD #400 Decision 6): POST
+	// /api/runs/{id}/dispatch, empty body. The CLI calls it LAST — after the run is
+	// created and local HEAD has been pushed to uzi/task/<id> — which is the moment
+	// the worker may claim the run. Owner-scoped server-side: a foreign/absent run, a
+	// non-task run, or an already-dispatched one is a 404 (exit 4).
+	DispatchTaskRun(ctx context.Context, runID string) (apitypes.RunDTO, error)
 	// SubmitRunInput submits a steering input: POST /api/runs/{id}/inputs
 	// {kind, body, selection}. kind ∈ {approve_plan, reject_plan, cancel, follow_up}.
 	// sel is legal only with approve_plan; the server validates it against the run's
@@ -1142,6 +1166,51 @@ func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int6
 		reqBody.RequireBase = seed.RequireBase
 	}
 	if err := c.postJSON(ctx, "/api/repos/"+url.PathEscape(repoID)+"/runs", reqBody, &env); err != nil {
+		return apitypes.RunDTO{}, err
+	}
+	return env.Run, nil
+}
+
+func (c *HTTPClient) CreateTaskRun(ctx context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested, thenFixRequested bool) (apitypes.RunDTO, error) {
+	var env struct {
+		Run apitypes.RunDTO `json:"run"`
+	}
+	// base_branch is `omitempty` so an unset --base sends no key and the worker
+	// branches from the caller's seeded HEAD — the CreateRun tri-state convention: an
+	// omitted field means "use the default", present means "this, explicitly". open_mr,
+	// review_requested and then_fix_requested are plain bools (a task defaults to no MR,
+	// no review, no fix; false is the common, correct value to send).
+	reqBody := struct {
+		Context          string `json:"context"`
+		BaseBranch       string `json:"base_branch,omitempty"`
+		OpenMr           bool   `json:"open_mr"`
+		ReviewRequested  bool   `json:"review_requested"`
+		ThenFixRequested bool   `json:"then_fix_requested"`
+	}{Context: taskContext, BaseBranch: baseBranch, OpenMr: openMR, ReviewRequested: reviewRequested, ThenFixRequested: thenFixRequested}
+	if err := c.postJSON(ctx, "/api/repos/"+url.PathEscape(repoID)+"/task-runs", reqBody, &env); err != nil {
+		return apitypes.RunDTO{}, err
+	}
+	return env.Run, nil
+}
+
+func (c *HTTPClient) GetTaskReview(ctx context.Context, id string) (*apitypes.TaskReviewDTO, error) {
+	// The envelope is {"task_review": <dto>|null} — a 200 with task_review:null is a
+	// visible-but-unreviewed task, so a nil DTO is returned (the command exits 0 and
+	// prints the "no review yet" hint); a 404 arrives as *ExitError{ExitNotFound} from get.
+	var env struct {
+		TaskReview *apitypes.TaskReviewDTO `json:"task_review"`
+	}
+	if err := c.get(ctx, "/api/runs/"+url.PathEscape(id)+"/task-review", &env); err != nil {
+		return nil, err
+	}
+	return env.TaskReview, nil
+}
+
+func (c *HTTPClient) DispatchTaskRun(ctx context.Context, runID string) (apitypes.RunDTO, error) {
+	var env struct {
+		Run apitypes.RunDTO `json:"run"`
+	}
+	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(runID)+"/dispatch", nil, &env); err != nil {
 		return apitypes.RunDTO{}, err
 	}
 	return env.Run, nil

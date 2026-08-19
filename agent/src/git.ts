@@ -115,6 +115,12 @@ const GIT_CODE_EXEC_KEY_PINS: ReadonlyArray<readonly [key: string, value: string
 
 const GIT_TIMEOUT_MS = 10 * 60_000; // 10m — clones can be large on cold caches.
 
+// PRD #400 M4b — byte cap on the review diff a ReviewRunner feeds the reviewer model.
+// A huge diff must not blow the model's context window or the worker's memory, so the
+// diff is truncated at this size with a marker. 512 KiB is generous for a task-run diff
+// while staying an order of magnitude under runGit's 64 MiB maxBuffer.
+const REVIEW_DIFF_MAX_BYTES = 512 * 1024;
+
 // PRD #51 M3 — (b) separate-runner-clone: the worker-side tracking-ref namespace the
 // worker's fetch-back writes the agent branch into. Deliberately NOT refs/heads/* (B2
 // invariant 2: the runner's branch is admitted only into a demarcated worker-side
@@ -782,6 +788,33 @@ export class GitCache {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * The unified diff of the reviewed `branch` against `base` (three-dot: the changes on
+   * `branch` since it diverged from `base`), for a PRD #400 M4b diff-review run. Both refs
+   * are resolved as the bare's remote-tracking refs (`refs/remotes/origin/<name>`, which
+   * every fetch updates — the same namespace `changedFiles` reads), so the caller must have
+   * fetched the bare (ensureClone) first; the reviewed task branch and its base are both
+   * pushed to origin (M2), so both exist there.
+   *
+   * The result is CAPPED at REVIEW_DIFF_MAX_BYTES with a truncation marker: a pathological
+   * diff must not blow the reviewer model's context or the worker's memory. `--no-color`
+   * keeps the text plain for the model, and `--no-ext-diff` is LOAD-BEARING: gitEnv pins
+   * `diff.external=true` (a code-exec-key neutralization), so a plain `git diff` would run
+   * that no-op external driver and emit NOTHING — `changedFiles` sidesteps it with
+   * `--name-only`; a real patch must disable it explicitly.
+   */
+  async reviewDiff(barePath: string, base: string, branch: string): Promise<string> {
+    const baseRef = `refs/remotes/origin/${base}`;
+    const branchRef = `refs/remotes/origin/${branch}`;
+    const out = await this.runGit(barePath, ["diff", "--no-color", "--no-ext-diff", `${baseRef}...${branchRef}`]);
+    const buf = Buffer.from(out, "utf8");
+    if (buf.byteLength <= REVIEW_DIFF_MAX_BYTES) return out;
+    const marker = `\n… diff truncated at ${REVIEW_DIFF_MAX_BYTES} bytes (${buf.byteLength} total) …\n`;
+    // Slice on a byte boundary so a giant diff cannot balloon the string we keep. A cut
+    // through a multi-byte rune yields at most one U+FFFD; harmless for review text.
+    return buf.subarray(0, REVIEW_DIFF_MAX_BYTES).toString("utf8") + marker;
   }
 
   private async cloneBare(repoUrl: string, dest: string, pat?: string, scope?: string, username?: string): Promise<void> {

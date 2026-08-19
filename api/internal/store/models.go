@@ -383,6 +383,13 @@ type Run struct {
 	SummaryPlan           pgtype.Text        `json:"summary_plan"`
 	SummaryDeltas         []byte             `json:"summary_deltas"`
 	IssueComments         []byte             `json:"issue_comments"`
+	BaseBranch            pgtype.Text        `json:"base_branch"`
+	OpenMr                bool               `json:"open_mr"`
+	DispatchedAt          pgtype.Timestamptz `json:"dispatched_at"`
+	ReviewTargetRunID     pgtype.UUID        `json:"review_target_run_id"`
+	ReviewRequested       bool               `json:"review_requested"`
+	ThenFixRequested      bool               `json:"then_fix_requested"`
+	ThenFixOfRunID        pgtype.UUID        `json:"then_fix_of_run_id"`
 }
 
 type RunMessage struct {
@@ -492,6 +499,29 @@ type SlackRunMessage struct {
 	QuestionTs                  pgtype.Text        `json:"question_ts"`
 	MilestonesNotifiedCompleted pgtype.Int4        `json:"milestones_notified_completed"`
 	StatusTs                    pgtype.Text        `json:"status_ts"`
+}
+
+type TaskReview struct {
+	ID          uuid.UUID          `json:"id"`
+	TargetRunID uuid.UUID          `json:"target_run_id"`
+	ReviewRunID pgtype.UUID        `json:"review_run_id"`
+	UserID      uuid.UUID          `json:"user_id"`
+	Status      string             `json:"status"`
+	SummaryMd   string             `json:"summary_md"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+}
+
+type TaskReviewFinding struct {
+	ID          uuid.UUID          `json:"id"`
+	ReviewID    uuid.UUID          `json:"review_id"`
+	File        string             `json:"file"`
+	Symbol      string             `json:"symbol"`
+	Line        int32              `json:"line"`
+	Severity    string             `json:"severity"`
+	SummaryMd   string             `json:"summary_md"`
+	RationaleMd string             `json:"rationale_md"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 }
 
 type ToolAllowlist struct {

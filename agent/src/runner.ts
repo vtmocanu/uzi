@@ -1229,13 +1229,23 @@ export class RunRunner {
         }
       }
 
+      // PRD #400 M2: a TASK run always pushes its branch back (the deliverable is the
+      // commits the user pulls from uzi/task/<id>) but opens a merge request only when
+      // it opted in (`uzi handoff --mr` → runs.open_mr → claim.open_mr). Every non-task
+      // kind keeps its current MR behaviour unconditionally. This is a distinct
+      // kind+flag gate on MR-OPEN only — a no-MR task still pushes, so it does NOT take
+      // the report_only path above (which pushes nothing).
+      const openMr = claim.kind !== "task" || claim.open_mr === true;
+
       // The agent signalled done. The WORKER now performs the authenticated push
-      // + MR with the PAT — the agent never had a credential.
+      // (+ MR when openMr) with the PAT — the agent never had a credential.
       batcher.emit({
         kind: "status",
         agent: "worker",
         payload: {
-          text: "work complete; pushing branch and opening merge request",
+          text: openMr
+            ? "work complete; pushing branch and opening merge request"
+            : "work complete; pushing branch (no merge request — pull the branch)",
         },
       });
       // PRD #284 Layer A: a transient push failure (a dropped HTTP/2 stream, a 5xx,
@@ -1257,6 +1267,31 @@ export class RunRunner {
           ),
         { log: runLog },
       );
+
+      // PRD #400 M2: a no-MR task completes HERE — the branch is pushed, there is
+      // nothing more to open. Report the branch on the completion payload (the same
+      // `branch: result.branch` the MR path reports below) so runs.branch carries
+      // uzi/task/<id> and the user knows exactly what to pull. No mr_iid/mr_web_url:
+      // there is no merge request.
+      if (!openMr) {
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: `task complete; pushed ${result.branch} (no merge request — pull the branch)`,
+          },
+        });
+        await batcher.close();
+        await reportState({
+          status: "completed",
+          branch: result.branch,
+          prd_done_path: result.prdDonePath,
+          milestones_completed: result.milestonesCompleted,
+        });
+        runLog.info("task run completed (no MR)", { branch: result.branch });
+        return;
+      }
+
       const targetBranch =
         claim.repo.default_branch?.trim() ||
         (await this.git.defaultBranchName(barePath)) ||
@@ -1852,6 +1887,26 @@ export class RunRunner {
         runId,
       );
     }
+    if (claim.kind === "task") {
+      // PRD #400 M2: a handoff task works a PRE-SEEDED, server-named branch. The CLI
+      // (M3) created the run, received the server-assigned `uzi/task/<run-id>` name,
+      // and pushed the user's local HEAD to it with the user's own credentials BEFORE
+      // this claim — so `claim.branch` is authoritative and already exists on origin.
+      // runnerCloneForBranch seeds off `refs/remotes/origin/<branch>` when that ref
+      // exists, so the pre-seeded content is picked up automatically. A task MUST carry
+      // its branch (the destination is never worker-derived, unlike prompt above); a
+      // missing/empty branch is a create-time bug, so fail loudly rather than inventing
+      // a name that would push somewhere the user is not watching.
+      const taskBranch = claim.branch?.trim();
+      if (!taskBranch)
+        throw new Error("task run claim is missing its branch (uzi/task/<run-id>)");
+      return this.git.runnerCloneForBranch(
+        barePath,
+        taskBranch,
+        "task-" + claim.run_id,
+        runId,
+      );
+    }
     if (claim.issue_iid == null)
       throw new Error("issue run claim is missing issue_iid");
     return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId);
@@ -2236,6 +2291,10 @@ function mrTitle(claim: ClaimResponse): string {
   // the trimmed-title branch above almost always wins; this is the empty-title
   // fallback.
   if (claim.kind === "prompt") return "Scheduled prompt run";
+  // A handoff task (PRD #400) is ISSUE-LESS: its issue_title is derived from the
+  // inline context's first line, so the trimmed-title branch above almost always
+  // wins; this is the empty-context fallback, never `Resolve issue #null`.
+  if (claim.kind === "task") return "Handoff task";
   return `Resolve issue #${claim.issue_iid}`;
 }
 
@@ -2301,6 +2360,23 @@ function mrDescription(
       "this MR references the task but closes nothing.",
       ...repoMarker,
       promptGuardSection ?? "",
+      "",
+      "---",
+      footer,
+    ].join("\n");
+  }
+  if (claim.kind === "task") {
+    // A handoff task (PRD #400) opens an MR only when the caller passed --mr
+    // (open_mr). Like the prompt/self_improve arms above it is ISSUE-LESS, so it
+    // references the task and `Closes` nothing — the issue fallback below would render
+    // `#null`. When present, base_branch names the source ref the task diverged from,
+    // for the reviewer's context.
+    const base = claim.base_branch?.trim();
+    return [
+      "Handoff task (PRD #400). This run worked inline context on the server-named",
+      `\`${branch}\` branch${base ? ` (branched from \`${base}\`)` : ""} and opened this merge request because it was created with \`--mr\`.`,
+      "There is no tracking issue, so this MR closes nothing.",
+      ...repoMarker,
       "",
       "---",
       footer,

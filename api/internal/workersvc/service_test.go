@@ -292,11 +292,42 @@ type fakeStore struct {
 
 	// Scheduled prompt (PRD #241). promptRunParams stays nil until CreatePromptRun's
 	// insert runs, so a #66 guardrail test can assert the gate blocked before the insert.
-	promptRunResult  store.Run
-	promptRunErr     error
-	promptRunParams  *store.CreatePromptRunParams
-	activeBranchRuns int64 // CountActiveRunsWithBranch
-	activeCIFixRuns  int64 // CountActiveCIFixForRef
+	promptRunResult store.Run
+	promptRunErr    error
+	promptRunParams *store.CreatePromptRunParams
+	// Task/handoff (PRD #400). taskRunParams stays nil until CreateTaskRun's insert
+	// runs, so a #66 guardrail test can assert the gate blocked before the insert.
+	taskRunResult store.Run
+	taskRunErr    error
+	taskRunParams *store.CreateTaskRunParams
+	// DispatchTaskRun (PRD #400 Decision 6): dispatchTaskParams stays nil until the
+	// stamp query runs; dispatchTaskErr = pgx.ErrNoRows models the idempotency/ownership
+	// guard matching 0 rows.
+	dispatchTaskResult store.Run
+	dispatchTaskErr    error
+	dispatchTaskParams *store.DispatchTaskRunParams
+	// Task diff-review (PRD #400 M4a). taskReviewRunParams stays nil until the review-run
+	// insert runs; the active-review + upsert + read fakes back PostTaskReview /
+	// GetTaskReviewPanel.
+	taskReviewRunResult store.Run
+	taskReviewRunErr    error
+	taskReviewRunParams *store.CreateTaskReviewRunParams
+	// Chained fix (PRD #400 M5). thenFixRunParams stays nil until CreateThenFixRun's insert
+	// runs; thenFixRunErr = a 23505 pgconn.PgError models the one-active-fix dedup.
+	thenFixRunResult       store.Run
+	thenFixRunErr          error
+	thenFixRunParams       *store.CreateThenFixRunParams
+	activeTaskReviewRun    store.Run
+	activeTaskReviewRunErr error
+	upsertTaskReviewID     uuid.UUID
+	upsertTaskReviewErr    error
+	upsertTaskReviewParams *store.UpsertTaskReviewWithFindingsParams
+	taskReviewForTarget    store.TaskReview
+	taskReviewForTargetErr error
+	taskReviewFindings     []store.TaskReviewFinding
+	taskReviewFindingsErr  error
+	activeBranchRuns       int64 // CountActiveRunsWithBranch
+	activeCIFixRuns        int64 // CountActiveCIFixForRef
 
 	// Create worker.
 	createWorkerResult store.Worker
@@ -856,6 +887,35 @@ func (f *fakeStore) CreatePromptRun(_ context.Context, arg store.CreatePromptRun
 	f.promptRunParams = &arg
 	return f.promptRunResult, f.promptRunErr
 }
+func (f *fakeStore) CreateTaskRun(_ context.Context, arg store.CreateTaskRunParams) (store.Run, error) {
+	f.taskRunParams = &arg
+	return f.taskRunResult, f.taskRunErr
+}
+func (f *fakeStore) DispatchTaskRun(_ context.Context, arg store.DispatchTaskRunParams) (store.Run, error) {
+	f.dispatchTaskParams = &arg
+	return f.dispatchTaskResult, f.dispatchTaskErr
+}
+func (f *fakeStore) CreateTaskReviewRun(_ context.Context, arg store.CreateTaskReviewRunParams) (store.Run, error) {
+	f.taskReviewRunParams = &arg
+	return f.taskReviewRunResult, f.taskReviewRunErr
+}
+func (f *fakeStore) CreateThenFixRun(_ context.Context, arg store.CreateThenFixRunParams) (store.Run, error) {
+	f.thenFixRunParams = &arg
+	return f.thenFixRunResult, f.thenFixRunErr
+}
+func (f *fakeStore) GetActiveTaskReviewRunForWorkerTarget(context.Context, store.GetActiveTaskReviewRunForWorkerTargetParams) (store.Run, error) {
+	return f.activeTaskReviewRun, f.activeTaskReviewRunErr
+}
+func (f *fakeStore) UpsertTaskReviewWithFindings(_ context.Context, arg store.UpsertTaskReviewWithFindingsParams) (uuid.UUID, error) {
+	f.upsertTaskReviewParams = &arg
+	return f.upsertTaskReviewID, f.upsertTaskReviewErr
+}
+func (f *fakeStore) GetTaskReviewForTarget(context.Context, uuid.UUID) (store.TaskReview, error) {
+	return f.taskReviewForTarget, f.taskReviewForTargetErr
+}
+func (f *fakeStore) ListTaskReviewFindings(context.Context, uuid.UUID) ([]store.TaskReviewFinding, error) {
+	return f.taskReviewFindings, f.taskReviewFindingsErr
+}
 func (f *fakeStore) CountActiveRunsWithBranch(context.Context, store.CountActiveRunsWithBranchParams) (int64, error) {
 	return f.activeBranchRuns, nil
 }
@@ -1017,6 +1077,56 @@ func TestClaimAssemblesPayloadWithDecryptedSecrets(t *testing.T) {
 	// The plaintext secrets must not appear in any log line.
 	if strings.Contains(logs.String(), pat) || strings.Contains(logs.String(), token) {
 		t.Fatal("a log line leaked a decrypted secret")
+	}
+}
+
+// TestClaimCarriesTaskOpenMrAndBaseBranch proves assembleClaim copies a task run's
+// runs.open_mr and runs.base_branch onto the claim payload (PRD #400 M2), so the
+// worker can gate MR-open and name the source ref. Constructs a task run row shaped
+// like CreateTaskRun leaves it (server-named uzi/task/<id> branch, issue-less,
+// open_mr=true, a base_branch set) and asserts both ride the payload.
+func TestClaimCarriesTaskOpenMrAndBaseBranch(t *testing.T) {
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-TASKTEST-abcdef1234567890"))
+	sealedTok, _ := box.Seal([]byte("anthropic-TASKTEST-abcdef1234567890"))
+
+	runID := uuid.New()
+	taskBranch := "uzi/task/" + runID.String()
+	fs := &fakeStore{
+		claimRun: store.Run{
+			ID: runID, Kind: "task", Status: "claimed",
+			IssueTitle: "Do the handoff", IssueDescription: "take this and run",
+			Branch:     pgText(taskBranch),
+			BaseBranch: pgText("develop"),
+			OpenMr:     true,
+		},
+		claimCtx: store.GetRunClaimContextRow{
+			RepoWebUrl: "https://gitlab.example.com/grp/proj", RepoPath: "grp/proj",
+			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
+		},
+		anthropic: sealedTok,
+	}
+
+	svc := New(fs, box, testParams())
+	payload, err := svc.Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload == nil {
+		t.Fatal("expected a payload, got idle")
+	}
+	if payload.Kind != "task" {
+		t.Fatalf("kind = %q, want task", payload.Kind)
+	}
+	if !payload.OpenMr {
+		t.Error("open_mr not carried onto the task claim payload")
+	}
+	if payload.BaseBranch == nil || *payload.BaseBranch != "develop" {
+		t.Errorf("base_branch = %v, want develop", payload.BaseBranch)
+	}
+	if payload.Branch == nil || *payload.Branch != taskBranch {
+		t.Errorf("branch = %v, want %s", payload.Branch, taskBranch)
 	}
 }
 

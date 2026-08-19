@@ -357,8 +357,13 @@ func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
 		IterationCount:   r.IterationCount,
 		IsPlanning: isPlanningPhase(r.Kind, r.Status, r.IterationCount,
 			r.PlanMd.Valid && strings.TrimSpace(r.PlanMd.String) != ""),
-		AutoApprove:   r.AutoApprove,
-		Branch:        textPtrValue(r.Branch.Valid, r.Branch.String),
+		AutoApprove: r.AutoApprove,
+		Branch:      textPtrValue(r.Branch.Valid, r.Branch.String),
+		BaseBranch:  textPtrValue(r.BaseBranch.Valid, r.BaseBranch.String),
+		OpenMr:      r.OpenMr,
+		// PRD #400 Decision 6: when the task run's dispatch gate was stamped (null until
+		// then, and on every non-task run). Mapped like ClaimedAt.
+		DispatchedAt:  timePtr(r.DispatchedAt.Valid, r.DispatchedAt.Time),
 		MrWebURL:      textPtrValue(r.MrWebUrl.Valid, r.MrWebUrl.String),
 		MrState:       textPtrValue(r.MrState.Valid, r.MrState.String),
 		FailureReason: textPtrValue(r.FailureReason.Valid, r.FailureReason.String),
@@ -883,6 +888,82 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run))})
 }
 
+// CreateTaskRunRequest is the POST /repos/{id}/task-runs body (PRD #400): the inline
+// handoff context (reused as the run's issue_description), an optional source ref to
+// branch from, and whether the worker should open an MR at the end. Context is
+// required; the other two default to "branch from local HEAD" and "no MR".
+type CreateTaskRunRequest struct {
+	Context    string `json:"context"`
+	BaseBranch string `json:"base_branch"`
+	OpenMr     bool   `json:"open_mr"`
+	// ReviewRequested asks that a diff-review run be auto-created when this task completes
+	// (--review, PRD #400 M4a): the review clones the finished branch, diffs it, and posts
+	// structured findings the CLI fetches. Defaults false (a plain handoff).
+	ReviewRequested bool `json:"review_requested"`
+	// ThenFixRequested asks that, after the auto-review completes with findings, a chained
+	// fix run push fixes to the same branch (--then-fix, PRD #400 M5). It implies a review;
+	// the CLI sends both flags. Defaults false.
+	ThenFixRequested bool `json:"then_fix_requested"`
+}
+
+// CreateTaskRun queues a task/handoff run (PRD #400). Unlike CreateRun it takes no
+// forge issue: a task is issue-less and repo-ful, carrying its inline instruction
+// directly. The server names the branch (uzi/task/<run-id>) and the created-run
+// response carries it (runToDTO maps Branch), which is exactly what the CLI needs to
+// push local HEAD to the seeded branch.
+func (h *Handler) CreateTaskRun(w http.ResponseWriter, r *http.Request) {
+	repo, ok := h.repoForRequest(w, r)
+	if !ok {
+		return
+	}
+	user, _ := mw.UserFromContext(r.Context())
+	var req CreateTaskRunRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if strings.TrimSpace(req.Context) == "" {
+		httpx.Error(w, http.StatusBadRequest, "context is required")
+		return
+	}
+	run, err := h.wsvc.CreateTaskRun(r.Context(), user.ID, repo.ID, req.Context, req.BaseBranch, req.OpenMr, req.ReviewRequested, req.ThenFixRequested)
+	if err != nil {
+		h.writeStartRunError(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run))})
+}
+
+// DispatchTaskRun stamps a task run's dispatch gate (PRD #400 Decision 6): the CLI
+// calls this AFTER it has pushed local HEAD to the run's uzi/task/<id> branch, which is
+// the moment the run becomes claimable (ClaimRun gates task claimability on
+// dispatched_at). Owner-scoped in the service; a run the caller does not own, a
+// non-task run, or an already-dispatched run all map to 404 rather than confirming the
+// run exists or re-broadcasting a claimable signal.
+func (h *Handler) DispatchTaskRun(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+		return
+	}
+	run, err := h.wsvc.DispatchTaskRun(r.Context(), user.ID, id)
+	if err != nil {
+		if errors.Is(err, workersvc.ErrRunNotFound) {
+			httpx.Error(w, http.StatusNotFound, "run not found")
+			return
+		}
+		slog.Error("dispatch task run", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run))})
+}
+
 // writeStartRunError maps the StartRunForUser* sentinels to an HTTP status + message.
 // Shared by the board start button (CreateRun) and the chat start-run card
 // (StartChatRun, PRD #191 M5) so both surfaces refuse an issue for the SAME reason with
@@ -944,6 +1025,16 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 			msg = fmt.Sprintf("issue has no PRD link; add a prds/*.md link (or the %s label) before starting a run", prdlessLabel)
 		}
 		httpx.Error(w, http.StatusUnprocessableEntity, msg)
+	case errors.Is(err, workersvc.ErrTaskBaseBranchTooLong):
+		// PRD #400: the optional base_branch exceeded its dedicated cap. A caller error
+		// (a git ref cannot legitimately be this long) → 400.
+		httpx.Error(w, http.StatusBadRequest, "base branch is too long")
+	case errors.Is(err, workersvc.ErrTaskBranchUnsafe):
+		// PRD #400 Decision 8: the create-time namespace/default-branch assertion
+		// failed. The server names the branch uzi/task/<uuid> itself, so this is an
+		// internal invariant violation, never a caller error — 500, logged.
+		slog.Error("create task run: branch-safety assertion failed", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
 	case errors.Is(err, workersvc.ErrActiveRunExists):
 		httpx.Error(w, http.StatusConflict, "a run is already in progress for this issue")
 	case errors.Is(err, workersvc.ErrBranchInUse):

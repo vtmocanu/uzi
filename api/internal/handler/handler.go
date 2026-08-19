@@ -1065,6 +1065,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// Queue a CI-fix run for a failed pipeline (PRD #6). Snapshots the
 				// failed pipeline's jobs + logs from the forge → per-user budget.
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/ci-fix-runs", h.CreateCIFixRun)
+				// Queue a task/handoff run (PRD #400): ephemeral, branch-scoped,
+				// issue-less. Same per-user forge budget as the other run creators.
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/task-runs", h.CreateTaskRun)
 			})
 		})
 
@@ -1119,6 +1122,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// Accept-Encoding and transparently decompress, so no caller changes.
 				r.With(chimw.Compress(5)).Get("/{id}/messages", h.ListRunMessages)
 				r.Post("/{id}/inputs", h.CreateRunInput)
+				// Dispatch a task run (PRD #400 Decision 6): the CLI calls this after it
+				// pushes local HEAD to the run's uzi/task/<id> branch, which is what makes
+				// the run claimable. RequireUser + owner-scoped in the service, mirroring
+				// CreateRunInput's auth — no token spend, no forge write.
+				r.Post("/{id}/dispatch", h.DispatchTaskRun)
 				// Steer queue (PRD #95): the run's follow_up inputs with delivery status.
 				// Owner-only (GetRunByIDForUser) — a non-owner, incl. admin_ro, gets 404,
 				// closing a leak (follow-ups are never in run_messages). RequireUser so
@@ -1129,6 +1137,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// GetRunReviewPanel → GetRunForViewer-scoped, capped by the same
 				// RequireUser masking as GetRun.
 				r.Get("/{id}/review", h.GetRunReview)
+				// Task diff-review read (PRD #400 M4a): the handoff task's structured
+				// findings as JSON, for `uzi handoff review <id>`. Owner-or-admin, same
+				// GetRunForViewer scoping as the review read; no forge write, no token spend.
+				r.Get("/{id}/task-review", h.GetTaskReview)
 				// Issue-draft (PRD #68 M2): the templated, human-editable draft for
 				// filing a forge issue from one recommendation. A READ (owner-or-admin,
 				// same scoping as the review read); no forge write, no token spend. The
@@ -1323,6 +1335,12 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// run reviewing {id}); {id} is the TARGET run, not the judge run.
 		r.Get("/runs/{id}/trace", h.WorkerRunTrace)
 		r.Post("/runs/{id}/review", h.WorkerRunReview)
+
+		// Task diff-review (PRD #400 M4a): a review run (a task carrying
+		// review_target_run_id) posts its structured findings for the reviewed task.
+		// Review-run-scoped (the worker must own the active review run reviewing {id});
+		// {id} is the TARGET run, not the review run.
+		r.Post("/runs/{id}/task-review", h.WorkerTaskReview)
 
 		// Chat-agent read surface (PRD #39 M3, Decision 7): the chat agent
 		// investigates its OWNER'S runs. Every query is scoped to the worker's

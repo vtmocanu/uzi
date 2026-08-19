@@ -497,7 +497,19 @@ seam through, so it lands via a dedicated INSERT as a new `prompt` run kind
 repo-ful, issue-less, `schedule_id`-keyed for dedup (no issue to key
 `HasActiveRunForIssue` on), and MR-opening on the `ci_fix` shape. See
 [docs/scheduling.md](docs/scheduling.md) and
-`prds/done/241-schedule-runs.md`. Status is a linear state machine:
+`prds/done/241-schedule-runs.md`.
+
+`task` (PRD #400, `uzi handoff`/`uzi task`) is the **seventh** `runs.kind`,
+alongside `issue`/`ci_fix`/`chat`/`judge`/`self_improve`/`prompt` above. Like
+`prompt` it adds no new service — it rides the same worker/run machinery —
+but it is CLI-only and MR-less by default: the CLI (not the worker) pushes
+the user's own HEAD to a server-named `uzi/task/<run-id>` branch with the
+user's own git credentials, then dispatches the run so the worker can clone
+that branch, work the inline context, and push its commits back to it, with
+no forge issue and no merge request unless `--mr` is passed. See
+[prds/done/400-uzi-handoff.md](prds/done/400-uzi-handoff.md) for the full design and
+[docs/handoff.md](docs/handoff.md) / [docs/cli.md](docs/cli.md#uzi-handoff-ephemeral-branch-scoped-task-runs)
+for usage. Status is a linear state machine:
 
 ```
 queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiting_approval ⟲ (revise, PRD #41) → running → completed

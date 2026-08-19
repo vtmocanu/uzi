@@ -82,7 +82,15 @@ var runDTOKeys = []string{
 	// budget (nil ⇒ null ⇒ the global default). All four always present; a client
 	// branches per field. budget_* are load-bearing on the state-ack, not just display.
 	"milestones_completed", "milestones_in_progress", "budget_max_iterations", "budget_wall_seconds",
-	"worker_id", "branch", "mr_iid", "mr_web_url", "mr_state", "failure_reason",
+	"worker_id", "branch",
+	// PRD #400 (uzi handoff): the task/handoff columns, meaningful only on a
+	// kind='task' run. base_branch is null on every non-task run; open_mr is false by
+	// default and on every non-task run. Always on the wire.
+	"base_branch", "open_mr",
+	// PRD #400 Decision 6: when a task run's dispatch gate was stamped (null on every
+	// non-task run and on a task run not yet dispatched). Always on the wire.
+	"dispatched_at",
+	"mr_iid", "mr_web_url", "mr_state", "failure_reason",
 	"stop_kind", "health", "health_reason", "health_since", "plan_md",
 	// PRD #209: plan_md's provenance ("agent"|"seeded"), NOT NULL so always on the wire.
 	"plan_source",
@@ -196,6 +204,18 @@ func TestReviewDTOTags(t *testing.T) {
 		"id", "target_run_id", "verdict", "summary_md", "judge_model", "status",
 		"created_at", "updated_at", "recommendations", "filed_issues",
 		"dispositions", "triage", "judge_run")
+}
+
+func TestTaskReviewDTOTags(t *testing.T) {
+	// PRD #400 M4a: review_run_id is a *string present-with-null (nil when the review run
+	// was deleted), so it is NOT omitempty — every key is always on the wire.
+	assertTags(t, "TaskReviewDTO", TaskReviewDTO{},
+		"target_run_id", "review_run_id", "status", "summary_md", "findings", "created_at")
+}
+
+func TestTaskReviewFindingDTOTags(t *testing.T) {
+	assertTags(t, "TaskReviewFindingDTO", TaskReviewFindingDTO{},
+		"file", "symbol", "line", "severity", "summary", "rationale")
 }
 
 func TestJudgeRunDTOTags(t *testing.T) {

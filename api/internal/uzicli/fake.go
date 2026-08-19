@@ -84,6 +84,36 @@ type FakeClient struct {
 	LastInputBody      string
 	LastInputSelection *apitypes.AgentSelection
 
+	// CreateTaskRun / DispatchTaskRun capture (PRD #400 M3). CreatedTaskRun is the
+	// canned create reply (its Branch is what the handoff command pushes to);
+	// DispatchedRun is the canned dispatch reply. The Last* fields record the exact
+	// wire args so a test can assert repo/context/base/mr and the dispatched run id.
+	// TaskCalls records the ORDERED sequence of these two verbs (and can be shared
+	// with the fake Git recorder) so a test can prove create → push → dispatch
+	// ordering, which a per-verb capture alone cannot show. CreateTaskRunErr /
+	// DispatchTaskRunErr win over the blanket Err so a test can model a create 422 or
+	// a dispatch 404 on the specific verb while the capture still proves it was
+	// reached.
+	CreatedTaskRun           apitypes.RunDTO
+	LastCreateTaskRepoID     string
+	LastCreateTaskContext    string
+	LastCreateTaskBaseBranch string
+	LastCreateTaskOpenMr     bool
+	LastCreateTaskReview     bool
+	LastCreateTaskThenFix    bool
+	CreateTaskRunErr         error
+	DispatchedRun            apitypes.RunDTO
+	LastDispatchRunID        string
+	DispatchTaskRunErr       error
+	TaskCalls                []string
+
+	// GetTaskReview capture (PRD #400 M4a). TaskReview is the canned reply (nil ⇒ the
+	// task has no review yet); GetTaskReviewErr wins over Err so a 404 can be modelled on
+	// this verb; LastTaskReviewID records the requested target run id.
+	TaskReview       *apitypes.TaskReviewDTO
+	GetTaskReviewErr error
+	LastTaskReviewID string
+
 	// DeleteWorker capture: records the id it was asked to delete.
 	LastDeletedWorkerID string
 
@@ -545,6 +575,58 @@ func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64,
 		return apitypes.RunDTO{}, f.Err
 	}
 	return f.CreatedRun, nil
+}
+
+// CreateTaskRun records the handoff-create args and returns CreatedTaskRun. It
+// captures BEFORE the error branch (mirroring CreateRun) so a test asserting a
+// refusal still proves the write was reached; CreateTaskRunErr wins over Err so a
+// 422 can be modelled on this verb alone. It appends "create" to TaskCalls so the
+// create → push → dispatch ordering is observable.
+func (f *FakeClient) CreateTaskRun(_ context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested, thenFixRequested bool) (apitypes.RunDTO, error) {
+	f.LastCreateTaskRepoID = repoID
+	f.LastCreateTaskContext = taskContext
+	f.LastCreateTaskBaseBranch = baseBranch
+	f.LastCreateTaskOpenMr = openMR
+	f.LastCreateTaskReview = reviewRequested
+	f.LastCreateTaskThenFix = thenFixRequested
+	f.TaskCalls = append(f.TaskCalls, "create")
+	if f.CreateTaskRunErr != nil {
+		return apitypes.RunDTO{}, f.CreateTaskRunErr
+	}
+	if f.Err != nil {
+		return apitypes.RunDTO{}, f.Err
+	}
+	return f.CreatedTaskRun, nil
+}
+
+// GetTaskReview returns the canned TaskReview (nil ⇒ "no review yet"). GetTaskReviewErr
+// wins over Err so a 404 can be modelled on this verb alone; LastTaskReviewID records the
+// requested target run id.
+func (f *FakeClient) GetTaskReview(_ context.Context, id string) (*apitypes.TaskReviewDTO, error) {
+	f.LastTaskReviewID = id
+	if f.GetTaskReviewErr != nil {
+		return nil, f.GetTaskReviewErr
+	}
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return f.TaskReview, nil
+}
+
+// DispatchTaskRun records the run id it was asked to dispatch and returns
+// DispatchedRun. DispatchTaskRunErr wins over Err so a 404 can be modelled on this
+// verb alone; it appends "dispatch" to TaskCalls (after the create and any push)
+// so a test can assert the Decision-6 ordering.
+func (f *FakeClient) DispatchTaskRun(_ context.Context, runID string) (apitypes.RunDTO, error) {
+	f.LastDispatchRunID = runID
+	f.TaskCalls = append(f.TaskCalls, "dispatch")
+	if f.DispatchTaskRunErr != nil {
+		return apitypes.RunDTO{}, f.DispatchTaskRunErr
+	}
+	if f.Err != nil {
+		return apitypes.RunDTO{}, f.Err
+	}
+	return f.DispatchedRun, nil
 }
 
 func (f *FakeClient) SubmitRunInput(_ context.Context, runID, kind, body string, sel *apitypes.AgentSelection) (apitypes.RunInputResponse, error) {

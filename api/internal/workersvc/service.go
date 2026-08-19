@@ -272,6 +272,23 @@ type Store interface {
 	CreateSelfImproveRun(ctx context.Context, arg store.CreateSelfImproveRunParams) (store.Run, error)
 	// Scheduled prompt runs (PRD #241).
 	CreatePromptRun(ctx context.Context, arg store.CreatePromptRunParams) (store.Run, error)
+	// Task/handoff runs (PRD #400).
+	CreateTaskRun(ctx context.Context, arg store.CreateTaskRunParams) (store.Run, error)
+	// DispatchTaskRun stamps a task run's dispatch gate after the CLI seeds its branch
+	// (PRD #400 Decision 6), making it claimable; 0 rows → pgx.ErrNoRows.
+	DispatchTaskRun(ctx context.Context, arg store.DispatchTaskRunParams) (store.Run, error)
+	// Task-review runs + their persisted findings (PRD #400 M4a): the auto-enqueued
+	// diff-review run, its review-run-scoped POST authz, the atomic header+findings
+	// upsert, and the CLI/panel read side.
+	CreateTaskReviewRun(ctx context.Context, arg store.CreateTaskReviewRunParams) (store.Run, error)
+	// CreateThenFixRun inserts the chained fix run for a --then-fix handoff (PRD #400 M5):
+	// a NORMAL task (review_target_run_id NULL) on the original's branch; 23505 → the
+	// one-active-fix-per-target index tripped.
+	CreateThenFixRun(ctx context.Context, arg store.CreateThenFixRunParams) (store.Run, error)
+	GetActiveTaskReviewRunForWorkerTarget(ctx context.Context, arg store.GetActiveTaskReviewRunForWorkerTargetParams) (store.Run, error)
+	UpsertTaskReviewWithFindings(ctx context.Context, arg store.UpsertTaskReviewWithFindingsParams) (uuid.UUID, error)
+	GetTaskReviewForTarget(ctx context.Context, targetRunID uuid.UUID) (store.TaskReview, error)
+	ListTaskReviewFindings(ctx context.Context, reviewID uuid.UUID) ([]store.TaskReviewFinding, error)
 	CountActiveRunsWithBranch(ctx context.Context, arg store.CountActiveRunsWithBranchParams) (int64, error)
 	CountActiveCIFixForRef(ctx context.Context, arg store.CountActiveCIFixForRefParams) (int64, error)
 	GetRunByIDForUser(ctx context.Context, arg store.GetRunByIDForUserParams) (store.Run, error)
@@ -1897,7 +1914,15 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		RequeueCount:   run.RequeueCount,
 		PlanMd:         textPtr(run.PlanMd),
 		AutoApprove:    run.AutoApprove,
-		OpenQuestionID: textPtr(run.OpenQuestionID),
+		// PRD #400 M2: task-run MR gate + source ref. open_mr is a plain bool (false
+		// for every non-task run); base_branch is pgtype.Text (nil for a run that has
+		// none). Both re-read from the row on every claim, like AutoApprove above.
+		OpenMr:     run.OpenMr,
+		BaseBranch: textPtr(run.BaseBranch),
+		// PRD #400 M4a: when set, this task run is a diff-review of that target task, and
+		// the worker (M4b) routes on it. nil for a plain handoff and every non-task run.
+		ReviewTargetRunID: uuidPtr(run.ReviewTargetRunID),
+		OpenQuestionID:    textPtr(run.OpenQuestionID),
 		// PRD #35. Re-read from the row on EVERY claim, like AutoApprove above: a
 		// park-resume-park cycle must keep asking the row rather than remembering what
 		// the first claim said, so a per-run toggle flipped mid-flight takes effect on
@@ -3083,6 +3108,14 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// PRD #46 Decision 2: enqueue a judge on the COMMITTED terminal transition
 		// (rows>0), not the lossy notify seam. Best-effort — never fails the report.
 		s.maybeEnqueueJudge(ctx, run)
+		// PRD #400 M4a: auto-create a diff-review run for a just-completed --review task,
+		// on the SAME committed transition. Best-effort — never fails the report.
+		s.maybeEnqueueTaskReview(ctx, run)
+		// PRD #400 M5: auto-create a chained fix run when a --then-fix handoff's review
+		// completes with findings. Its gates fire ONLY for a completed review run, and
+		// maybeEnqueueTaskReview's review_target_run_id-null gate makes the two mutually
+		// exclusive. Best-effort — never fails the report.
+		s.maybeEnqueueThenFix(ctx, run)
 	}
 	return run, rows > 0, err
 }

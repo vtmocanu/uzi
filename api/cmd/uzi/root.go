@@ -1,14 +1,41 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
+
+// realGit is the production Env.Git: it runs `git <args>` in dir, returning the
+// trimmed stdout on success. On failure the returned error carries git's stderr
+// so the caller can report a clean, actionable message. Stdin and stderr are
+// connected to the process so an interactive credential helper can prompt on a
+// push/delete (the user's own creds — PRD #400 Decision 6); stdout is captured so
+// a value read like `git remote get-url origin` is returned rather than printed.
+// stderr is BOTH streamed (so the prompt is visible) and captured (so the error
+// message is clean) via an io.MultiWriter.
+func realGit(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = io.MultiWriter(&stderr, os.Stderr)
+	cmd.Stdin = os.Stdin
+	if err := cmd.Run(); err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return "", fmt.Errorf("git %s: %w: %s", args[0], err, msg)
+		}
+		return "", fmt.Errorf("git %s: %w", args[0], err)
+	}
+	return strings.TrimSpace(stdout.String()), nil
+}
 
 // version is stamped at build time via -ldflags "-X main.version=vX.Y.Z"
 // (the brew formula does this). It equals the uzi v* tag the binary was built
@@ -32,6 +59,16 @@ type Env struct {
 	// real-client stub; tests inject a fake; M7 replaces the default with the
 	// live HTTP client.
 	NewClient func(uzicli.Settings) uzicli.Client
+
+	// Git runs `git <args>` in dir and returns its trimmed stdout, or an error
+	// whose message includes git's stderr on failure. It is the CLI's one
+	// shell-out seam (PRD #400 M3): `uzi handoff` uses it to detect the repo's
+	// origin and to push local HEAD to the server-named uzi/task/<id> branch with
+	// the USER's own credentials. DefaultEnv wires the real exec.Command (with
+	// stdin/stderr connected so a credential helper can prompt); tests inject a
+	// fake that records calls and returns canned output/errors, so no command test
+	// forks git. Same injection-seam contract as NewClient above.
+	Git func(dir string, args ...string) (string, error)
 
 	// Store reads config/credentials. May be nil (e.g. no home dir), in which
 	// case only env/flags supply settings.
@@ -70,6 +107,7 @@ func DefaultEnv() Env {
 		StdoutTTY:          uzicli.IsTerminal(os.Stdout),
 		StdinTTY:           uzicli.IsTerminal(os.Stdin),
 		NewClient:          func(s uzicli.Settings) uzicli.Client { return uzicli.NewHTTPClient(s) },
+		Git:                realGit,
 		Store:              store,
 		AutoUpgradeSkill:   true,
 		CheckServerVersion: true,
@@ -174,6 +212,7 @@ func newRootCmd(env Env) *cobra.Command {
 		newTokenCmd(env, gf),
 		newMemoryCmd(env, gf),
 		newRepoCmd(env, gf),
+		newHandoffCmd(env, gf),
 		newAdminCmd(env, gf),
 		newSkillCmd(env, gf),
 		newVersionCmd(env, gf),
