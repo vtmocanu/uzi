@@ -78,8 +78,13 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 		// present-and-zero" reason the flags above carry non-default — even though they
 		// are only meaningful for kind='task'. open_mr has no omitempty (always present,
 		// like auto_approve); base_branch is a pointer (nil ⇒ absent).
-		OpenMr:       true,
-		BaseBranch:   strptr("develop"),
+		OpenMr:     true,
+		BaseBranch: strptr("develop"),
+		// PRD #400 M4a: review_target_run_id rides every claim (a *string, no omitempty, so
+		// always present — null for a non-review run). This sample is NOT a review run, so it
+		// is left nil/null here; the non-null delivery for an actual review run is pinned in
+		// TestClaimCarriesReviewTargetRunID (service_test.go), not by mutating this shared
+		// golden into a semantically-incoherent review-of-itself.
 		WaitOnLimit:  true, // PRD #35 Decision 7: the run's usage-limit opt-in
 		PlanApproved: true,
 		// PRD #209: plan_source rides every claim (NOT NULL, no omitempty). "seeded"
@@ -240,6 +245,44 @@ func TestClaimCarriesTaskMrFields(t *testing.T) {
 		t.Error("claim must carry base_branch (PRD #400 M2); key absent")
 	} else if base != "develop" {
 		t.Errorf("base_branch = %v, want develop", base)
+	}
+}
+
+// TestClaimCarriesReviewTargetRunID pins PRD #400 M4a's claim addition: review_target_run_id
+// rides every claim (a *string, no omitempty) — null for a non-review run, and the reviewed
+// task's id for a review run, which is how the worker (M4b) routes a claim to its diff-review
+// executor. The sample (a non-review run) carries the key as null; a review-run payload carries
+// the target id as a string. Additive — an old worker ignores the key.
+func TestClaimCarriesReviewTargetRunID(t *testing.T) {
+	// Non-review run: key present, null.
+	b, err := json.Marshal(sampleClaimPayloadWithSkills())
+	if err != nil {
+		t.Fatalf("marshal claim: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal claim: %v", err)
+	}
+	if got, ok := m["review_target_run_id"]; !ok {
+		t.Error("claim must carry review_target_run_id (PRD #400 M4a); key absent")
+	} else if got != nil {
+		t.Errorf("review_target_run_id = %v, want null for a non-review run", got)
+	}
+
+	// Review run: the reviewed task's id rides the claim as a string.
+	const targetID = "33333333-3333-3333-3333-333333333333"
+	rev := sampleClaimPayloadWithSkills()
+	rev.ReviewTargetRunID = strPtr(targetID)
+	b2, err := json.Marshal(rev)
+	if err != nil {
+		t.Fatalf("marshal review claim: %v", err)
+	}
+	var m2 map[string]any
+	if err := json.Unmarshal(b2, &m2); err != nil {
+		t.Fatalf("unmarshal review claim: %v", err)
+	}
+	if got := m2["review_target_run_id"]; got != targetID {
+		t.Errorf("review_target_run_id = %v, want %s", got, targetID)
 	}
 }
 

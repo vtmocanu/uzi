@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -54,7 +55,7 @@ var ErrTaskBaseBranchTooLong = errors.New("base branch is too long")
 // cheap branch-safety assertion (Decision 8) confirms the resolved branch is namespaced
 // and is not the repo's default branch — belt-and-suspenders behind the server-named
 // branch being safe by construction.
-func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, inlineContext, baseBranch string, openMR bool) (store.Run, error) {
+func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, inlineContext, baseBranch string, openMR, reviewRequested bool) (store.Run, error) {
 	id := uuid.New()
 	branch := taskBranchPrefix + id.String()
 
@@ -104,6 +105,7 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 		Branch:           pgText(branch),
 		BaseBranch:       pgTextTrimNarg(baseBranch),
 		OpenMr:           openMR,
+		ReviewRequested:  reviewRequested,
 		IssueTitle:       deriveTaskTitle(inlineContext),
 		IssueDescription: inlineContext,
 	})
@@ -136,6 +138,55 @@ func (s *Service) DispatchTaskRun(ctx context.Context, userID, runID uuid.UUID) 
 	// is unchanged, but the run's claimability just changed).
 	s.notify(run.ID, "queued")
 	return run, nil
+}
+
+// ErrTaskReviewAlreadyActive is returned when a review run already exists for a target
+// (the uq_one_active_task_review_per_target partial unique index raised 23505). The
+// auto-enqueue hook treats it as a no-op ("already being reviewed"); an explicit caller
+// can surface it. PRD #400 M4a.
+var ErrTaskReviewAlreadyActive = errors.New("a review run is already active for this task")
+
+// CreateTaskReviewRun mints a REVIEW run for a completed task (PRD #400 M4a): a task run
+// that IS a review of targetRunID, distinguished by a non-null review_target_run_id. It
+// reuses the reviewed task's own branch (the review clones and diffs it against
+// baseBranch) and is dispatched immediately (the query stamps dispatched_at = now()) — a
+// review needs no CLI seed push because the target branch is already pushed. The worker
+// (M4b) routes such a claim to a diff-review executor. A concurrent duplicate trips the
+// partial unique index (23505 → ErrTaskReviewAlreadyActive). The id is minted here so the
+// server-named uzi/task/<id> title/provenance stays consistent with CreateTaskRun, but the
+// review's WORKING branch is the target's, not a fresh one.
+func (s *Service) CreateTaskReviewRun(ctx context.Context, userID, repoID, targetRunID uuid.UUID, branch, baseBranch string) (store.Run, error) {
+	id := uuid.New()
+	run, err := s.q.CreateTaskReviewRun(ctx, store.CreateTaskReviewRunParams{
+		RunID:       id,
+		UserID:      userID,
+		RepoID:      repoID,
+		Branch:      pgText(branch),
+		BaseBranch:  pgTextTrimNarg(baseBranch),
+		TargetRunID: pgUUID(targetRunID),
+		IssueTitle:  deriveTaskReviewTitle(branch),
+	})
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return store.Run{}, ErrTaskReviewAlreadyActive
+		}
+		return store.Run{}, err
+	}
+	// The review run is already claimable (dispatched_at stamped in SQL); broadcast queued
+	// so any live view re-reads it, exactly like DispatchTaskRun does for a plain handoff.
+	s.notify(run.ID, "queued")
+	return run, nil
+}
+
+// deriveTaskReviewTitle synthesizes the display title for a review run (it has no issue
+// and its inline context is empty). The branch is the server-named uzi/task/<id>, safe
+// display text.
+func deriveTaskReviewTitle(branch string) string {
+	if strings.TrimSpace(branch) == "" {
+		return "Review of handoff task"
+	}
+	return "Review of " + branch
 }
 
 // maxTaskTitleRunes bounds the derived task title. issue_title is display text, not a

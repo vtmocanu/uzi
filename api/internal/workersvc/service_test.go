@@ -306,8 +306,23 @@ type fakeStore struct {
 	dispatchTaskResult store.Run
 	dispatchTaskErr    error
 	dispatchTaskParams *store.DispatchTaskRunParams
-	activeBranchRuns   int64 // CountActiveRunsWithBranch
-	activeCIFixRuns    int64 // CountActiveCIFixForRef
+	// Task diff-review (PRD #400 M4a). taskReviewRunParams stays nil until the review-run
+	// insert runs; the active-review + upsert + read fakes back PostTaskReview /
+	// GetTaskReviewPanel.
+	taskReviewRunResult    store.Run
+	taskReviewRunErr       error
+	taskReviewRunParams    *store.CreateTaskReviewRunParams
+	activeTaskReviewRun    store.Run
+	activeTaskReviewRunErr error
+	upsertTaskReviewID     uuid.UUID
+	upsertTaskReviewErr    error
+	upsertTaskReviewParams *store.UpsertTaskReviewWithFindingsParams
+	taskReviewForTarget    store.TaskReview
+	taskReviewForTargetErr error
+	taskReviewFindings     []store.TaskReviewFinding
+	taskReviewFindingsErr  error
+	activeBranchRuns       int64 // CountActiveRunsWithBranch
+	activeCIFixRuns        int64 // CountActiveCIFixForRef
 
 	// Create worker.
 	createWorkerResult store.Worker
@@ -874,6 +889,23 @@ func (f *fakeStore) CreateTaskRun(_ context.Context, arg store.CreateTaskRunPara
 func (f *fakeStore) DispatchTaskRun(_ context.Context, arg store.DispatchTaskRunParams) (store.Run, error) {
 	f.dispatchTaskParams = &arg
 	return f.dispatchTaskResult, f.dispatchTaskErr
+}
+func (f *fakeStore) CreateTaskReviewRun(_ context.Context, arg store.CreateTaskReviewRunParams) (store.Run, error) {
+	f.taskReviewRunParams = &arg
+	return f.taskReviewRunResult, f.taskReviewRunErr
+}
+func (f *fakeStore) GetActiveTaskReviewRunForWorkerTarget(context.Context, store.GetActiveTaskReviewRunForWorkerTargetParams) (store.Run, error) {
+	return f.activeTaskReviewRun, f.activeTaskReviewRunErr
+}
+func (f *fakeStore) UpsertTaskReviewWithFindings(_ context.Context, arg store.UpsertTaskReviewWithFindingsParams) (uuid.UUID, error) {
+	f.upsertTaskReviewParams = &arg
+	return f.upsertTaskReviewID, f.upsertTaskReviewErr
+}
+func (f *fakeStore) GetTaskReviewForTarget(context.Context, uuid.UUID) (store.TaskReview, error) {
+	return f.taskReviewForTarget, f.taskReviewForTargetErr
+}
+func (f *fakeStore) ListTaskReviewFindings(context.Context, uuid.UUID) ([]store.TaskReviewFinding, error) {
+	return f.taskReviewFindings, f.taskReviewFindingsErr
 }
 func (f *fakeStore) CountActiveRunsWithBranch(context.Context, store.CountActiveRunsWithBranchParams) (int64, error) {
 	return f.activeBranchRuns, nil

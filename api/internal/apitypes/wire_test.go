@@ -206,6 +206,18 @@ func TestReviewDTOTags(t *testing.T) {
 		"dispositions", "triage", "judge_run")
 }
 
+func TestTaskReviewDTOTags(t *testing.T) {
+	// PRD #400 M4a: review_run_id is a *string present-with-null (nil when the review run
+	// was deleted), so it is NOT omitempty — every key is always on the wire.
+	assertTags(t, "TaskReviewDTO", TaskReviewDTO{},
+		"target_run_id", "review_run_id", "status", "summary_md", "findings", "created_at")
+}
+
+func TestTaskReviewFindingDTOTags(t *testing.T) {
+	assertTags(t, "TaskReviewFindingDTO", TaskReviewFindingDTO{},
+		"file", "symbol", "line", "severity", "summary", "rationale")
+}
+
 func TestJudgeRunDTOTags(t *testing.T) {
 	// claimed_at/started_at/finished_at and usage are NOT omitempty: the timings are
 	// present-with-null for a pre-feature judge (started_at null), and usage is null when

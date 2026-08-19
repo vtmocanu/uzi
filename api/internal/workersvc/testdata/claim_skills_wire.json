@@ -25,6 +25,7 @@
   "auto_approve": true,
   "open_mr": true,
   "base_branch": "develop",
+  "review_target_run_id": null,
   "wait_on_limit": true,
   "plan_approved": true,
   "plan_source": "seeded",

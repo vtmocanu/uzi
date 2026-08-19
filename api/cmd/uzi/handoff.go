@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"strings"
 
@@ -45,9 +46,11 @@ func newHandoffCmd(env Env, gf *globalFlags) *cobra.Command {
 	handoff.Flags().StringP("file", "f", "", "read the task context from a file (or '-' for stdin)")
 	handoff.Flags().String("base", "", "branch the task from this ref instead of local HEAD (pushes <ref> as the seed)")
 	handoff.Flags().Bool("mr", false, "have the worker open a merge request for the branch (exempts it from 'uzi handoff rm')")
+	handoff.Flags().Bool("review", false, "after the task completes, run a diff-review and produce findings (fetch with 'uzi handoff review <id>')")
 	handoff.Flags().String("repo", "", "repo id to run against (overrides origin auto-detection; see 'uzi repo list')")
 
 	handoff.AddCommand(newHandoffRmCmd(env, gf))
+	handoff.AddCommand(newHandoffReviewCmd(env, gf))
 	return handoff
 }
 
@@ -56,6 +59,7 @@ func runHandoffCreate(env Env, gf *globalFlags, cmd *cobra.Command) error {
 	file, _ := cmd.Flags().GetString("file")
 	base, _ := cmd.Flags().GetString("base")
 	mr, _ := cmd.Flags().GetBool("mr")
+	review, _ := cmd.Flags().GetBool("review")
 	repoFlag, _ := cmd.Flags().GetString("repo")
 
 	// Context: -m > -f (file, or '-' for stdin) > bare stdin (non-TTY).
@@ -87,7 +91,7 @@ func runHandoffCreate(env Env, gf *globalFlags, cmd *cobra.Command) error {
 	}
 
 	// (1) Create — receive the id and the server-named uzi/task/<id> branch.
-	run, err := c.CreateTaskRun(cmd.Context(), repoID, context, strings.TrimSpace(base), mr)
+	run, err := c.CreateTaskRun(cmd.Context(), repoID, context, strings.TrimSpace(base), mr, review)
 	if err != nil {
 		return err
 	}
@@ -116,7 +120,7 @@ func runHandoffCreate(env Env, gf *globalFlags, cmd *cobra.Command) error {
 			run.ID, err, branch, run.ID)
 	}
 
-	return renderHandoff(env, gf, dispatched, branch)
+	return renderHandoff(env, gf, dispatched, branch, review)
 }
 
 // resolveHandoffContext applies the -m > -f > bare-stdin precedence, reusing the
@@ -200,7 +204,7 @@ func parseRepoPath(remote string) string {
 // renderHandoff prints the dispatched task run. --json emits the run DTO (the agent
 // contract); the human render leads with the id and branch, then the pull hint and how
 // to watch/continue.
-func renderHandoff(env Env, gf *globalFlags, run apitypes.RunDTO, branch string) error {
+func renderHandoff(env Env, gf *globalFlags, run apitypes.RunDTO, branch string, review bool) error {
 	p := env.printer(gf)
 	if p.Format == uzicli.FormatJSON {
 		return p.JSON(run)
@@ -212,6 +216,9 @@ func renderHandoff(env Env, gf *globalFlags, run apitypes.RunDTO, branch string)
 	p.Printf("  pull it with:  git fetch origin %s && git switch %s\n", branch, branch)
 	p.Printf("  watch it with: uzi run get %s   (or: uzi run logs %s --follow, or: uzi tui)\n", run.ID, run.ID)
 	p.Printf("  send more:     uzi run follow-up %s -m \"...\"\n", run.ID)
+	if review {
+		p.Printf("  a diff-review will run when the task completes; read it with: uzi handoff review %s\n", run.ID)
+	}
 	if run.OpenMr {
 		p.Printf("  an MR will be opened for this branch; it is exempt from 'uzi handoff rm'\n")
 	} else {
@@ -237,6 +244,75 @@ func newHandoffRmCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 	return rm
+}
+
+// newHandoffReviewCmd builds `uzi handoff review <task-run-id>`: fetch the diff-review a
+// `--review` handoff produced (PRD #400 M4a). --json emits the review DTO; the human view
+// prints a findings table (file:line severity — summary). A task with no review yet prints
+// a hint rather than erroring.
+func newHandoffReviewCmd(env Env, gf *globalFlags) *cobra.Command {
+	review := &cobra.Command{
+		Use:   "review <run-id>",
+		Short: "Show the diff-review findings a --review handoff produced",
+		Long: "Fetch the structured diff-review findings for a handoff task launched with --review.\n" +
+			"Each finding carries a file:line location, a severity (info|warning|error), and a\n" +
+			"summary. Pass --json for the machine-readable review. If the task is still running\n" +
+			"or was not launched with --review, a hint is printed instead.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runHandoffReview(env, gf, cmd, args[0])
+		},
+	}
+	return review
+}
+
+func runHandoffReview(env Env, gf *globalFlags, cmd *cobra.Command, id string) error {
+	c, err := env.client(gf)
+	if err != nil {
+		return err
+	}
+	rev, err := c.GetTaskReview(cmd.Context(), id)
+	if err != nil {
+		return err
+	}
+	p := env.printer(gf)
+	if p.Format == uzicli.FormatJSON {
+		// A null review still round-trips as JSON `null` so a scripted caller can branch on it.
+		return p.JSON(rev)
+	}
+	if gf.quiet {
+		return nil
+	}
+	if rev == nil {
+		p.Printf("no review available yet for task %s (it may still be running, or --review was not requested)\n", id)
+		return nil
+	}
+	p.Printf("review of task %s: %s · %s\n", rev.TargetRunID, rev.Status, findingsPhrase(len(rev.Findings)))
+	if s := strings.TrimSpace(rev.SummaryMd); s != "" {
+		p.Printf("  %s\n", sanitizeTTY(s))
+	}
+	for _, f := range rev.Findings {
+		// file/severity/summary are agent-authored free text (server-scrubbed at rest), so
+		// they go through sanitizeTTY before reaching the terminal — defence in depth,
+		// matching the findings backlog render.
+		loc := sanitizeTTY(f.File)
+		if f.Line > 0 {
+			loc = fmt.Sprintf("%s:%d", loc, f.Line)
+		}
+		if sym := strings.TrimSpace(f.Symbol); sym != "" {
+			loc = fmt.Sprintf("%s (%s)", loc, sanitizeTTY(sym))
+		}
+		p.Printf("  [%s] %s — %s\n", f.Severity, loc, sanitizeTTY(f.Summary))
+	}
+	return nil
+}
+
+// findingsPhrase renders the singular/plural finding count for the review header line.
+func findingsPhrase(n int) string {
+	if n == 1 {
+		return "1 finding"
+	}
+	return fmt.Sprintf("%d findings", n)
 }
 
 func runHandoffRm(env Env, gf *globalFlags, cmd *cobra.Command, id string) error {

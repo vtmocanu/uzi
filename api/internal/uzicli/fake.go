@@ -99,11 +99,19 @@ type FakeClient struct {
 	LastCreateTaskContext    string
 	LastCreateTaskBaseBranch string
 	LastCreateTaskOpenMr     bool
+	LastCreateTaskReview     bool
 	CreateTaskRunErr         error
 	DispatchedRun            apitypes.RunDTO
 	LastDispatchRunID        string
 	DispatchTaskRunErr       error
 	TaskCalls                []string
+
+	// GetTaskReview capture (PRD #400 M4a). TaskReview is the canned reply (nil ⇒ the
+	// task has no review yet); GetTaskReviewErr wins over Err so a 404 can be modelled on
+	// this verb; LastTaskReviewID records the requested target run id.
+	TaskReview       *apitypes.TaskReviewDTO
+	GetTaskReviewErr error
+	LastTaskReviewID string
 
 	// DeleteWorker capture: records the id it was asked to delete.
 	LastDeletedWorkerID string
@@ -573,11 +581,12 @@ func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64,
 // refusal still proves the write was reached; CreateTaskRunErr wins over Err so a
 // 422 can be modelled on this verb alone. It appends "create" to TaskCalls so the
 // create → push → dispatch ordering is observable.
-func (f *FakeClient) CreateTaskRun(_ context.Context, repoID, taskContext, baseBranch string, openMR bool) (apitypes.RunDTO, error) {
+func (f *FakeClient) CreateTaskRun(_ context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested bool) (apitypes.RunDTO, error) {
 	f.LastCreateTaskRepoID = repoID
 	f.LastCreateTaskContext = taskContext
 	f.LastCreateTaskBaseBranch = baseBranch
 	f.LastCreateTaskOpenMr = openMR
+	f.LastCreateTaskReview = reviewRequested
 	f.TaskCalls = append(f.TaskCalls, "create")
 	if f.CreateTaskRunErr != nil {
 		return apitypes.RunDTO{}, f.CreateTaskRunErr
@@ -586,6 +595,20 @@ func (f *FakeClient) CreateTaskRun(_ context.Context, repoID, taskContext, baseB
 		return apitypes.RunDTO{}, f.Err
 	}
 	return f.CreatedTaskRun, nil
+}
+
+// GetTaskReview returns the canned TaskReview (nil ⇒ "no review yet"). GetTaskReviewErr
+// wins over Err so a 404 can be modelled on this verb alone; LastTaskReviewID records the
+// requested target run id.
+func (f *FakeClient) GetTaskReview(_ context.Context, id string) (*apitypes.TaskReviewDTO, error) {
+	f.LastTaskReviewID = id
+	if f.GetTaskReviewErr != nil {
+		return nil, f.GetTaskReviewErr
+	}
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return f.TaskReview, nil
 }
 
 // DispatchTaskRun records the run id it was asked to dispatch and returns

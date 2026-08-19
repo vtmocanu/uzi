@@ -29,6 +29,10 @@ const (
 	// run born from a run_schedules row and keyed to it via schedule_id. It carries a
 	// free-form prompt rather than an issue or pipeline.
 	RunKindPrompt = "prompt"
+	// RunKindTask is the handoff kind (PRD #400): a repo-ful, issue-less run whose branch
+	// is server-named uzi/task/<id> and known at create. A review run is a task too,
+	// distinguished by a non-null review_target_run_id (PRD #400 M4a).
+	RunKindTask = "task"
 )
 
 // Judge scan caps (PRD #46 Decision 4 + audit L1): the command-not-found pre-scan

@@ -61,6 +61,15 @@ type ClaimPayload struct {
 	// so an MR/review can name what the task diverged from. Read from runs.base_branch
 	// (pgtype.Text); nil/omitted for every run that has none.
 	BaseBranch *string `json:"base_branch"`
+	// ReviewTargetRunID is the reviewed TASK run when THIS task run is a diff-review
+	// (PRD #400 M4a). Non-nil ⇒ the worker (M4b) routes this claim to a review executor:
+	// it clones the shared Branch (the reviewed target's uzi/task/<id>), diffs it against
+	// BaseBranch, runs a reviewer agent, and POSTs structured findings back to
+	// /worker/runs/<review_target_run_id>/task-review instead of committing. nil for a
+	// plain handoff (and every non-task run), which the worker executes normally. Read
+	// from runs.review_target_run_id (pgtype.UUID); re-delivered unchanged on every claim
+	// like OpenMr/BaseBranch above.
+	ReviewTargetRunID *string `json:"review_target_run_id"`
 	// OpenQuestionID is the clarification question this run is already parked on
 	// (PRD #88 M1), read from the runs row and therefore re-delivered on every
 	// resume — the same reason AutoApprove is top-level rather than in ClaimConfig.

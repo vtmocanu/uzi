@@ -896,6 +896,10 @@ type CreateTaskRunRequest struct {
 	Context    string `json:"context"`
 	BaseBranch string `json:"base_branch"`
 	OpenMr     bool   `json:"open_mr"`
+	// ReviewRequested asks that a diff-review run be auto-created when this task completes
+	// (--review, PRD #400 M4a): the review clones the finished branch, diffs it, and posts
+	// structured findings the CLI fetches. Defaults false (a plain handoff).
+	ReviewRequested bool `json:"review_requested"`
 }
 
 // CreateTaskRun queues a task/handoff run (PRD #400). Unlike CreateRun it takes no
@@ -918,7 +922,7 @@ func (h *Handler) CreateTaskRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "context is required")
 		return
 	}
-	run, err := h.wsvc.CreateTaskRun(r.Context(), user.ID, repo.ID, req.Context, req.BaseBranch, req.OpenMr)
+	run, err := h.wsvc.CreateTaskRun(r.Context(), user.ID, repo.ID, req.Context, req.BaseBranch, req.OpenMr, req.ReviewRequested)
 	if err != nil {
 		h.writeStartRunError(w, r, err)
 		return

@@ -163,6 +163,49 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	}
 }
 
+// maybeEnqueueTaskReview auto-creates a diff-review run for a just-completed task that was
+// launched with --review (PRD #400 M4a). Called at the committed terminal transition beside
+// maybeEnqueueJudge, inside the rows>0 block, so it fires only on a genuinely-applied
+// transition. It is BEST-EFFORT: it never errors the transition; a 23505 (the partial
+// unique index) is a quiet no-op ("already being reviewed"), any other error is warn-logged
+// and swallowed.
+//
+// Gates, cheap-first: only a COMPLETED task is worth reviewing (a failed/cancelled task has
+// no clean diff to review); kind == 'task'; the owner opted in via review_requested; the run
+// is NOT itself a review (review_target_run_id NULL — never review a review, no recursion);
+// and the branch is set (a task always has one, but the review clones it, so guard anyway).
+func (s *Service) maybeEnqueueTaskReview(ctx context.Context, run store.Run) {
+	// Gate 0: only a completed task run is reviewed. A failed/cancelled task has no
+	// reviewable end state, and a non-task kind is never a handoff.
+	if run.Status != "completed" || run.Kind != RunKindTask {
+		return
+	}
+	// Gate 1: the owner asked for a review at create (--review).
+	if !run.ReviewRequested {
+		return
+	}
+	// Gate 2: never review a review. A review IS a task carrying review_target_run_id; a
+	// review run never sets review_requested (CreateTaskReviewRun bakes it false), so this
+	// is belt-and-suspenders against recursion.
+	if run.ReviewTargetRunID.Valid {
+		return
+	}
+	// Gate 3: the branch must be present — the review clones it and diffs against base.
+	if !run.Branch.Valid || run.Branch.String == "" {
+		return
+	}
+	if !run.RepoID.Valid {
+		return // a task is repo-ful by shape; guard anyway before dereferencing.
+	}
+	repoID := uuid.UUID(run.RepoID.Bytes)
+	if _, err := s.CreateTaskReviewRun(ctx, run.UserID, repoID, run.ID, run.Branch.String, run.BaseBranch.String); err != nil {
+		if errors.Is(err, ErrTaskReviewAlreadyActive) {
+			return // a review run is already active for this target — expected, not an error
+		}
+		slog.Warn("task review enqueue: create review run", "run", run.ID, "error", err)
+	}
+}
+
 // judgeSpendGuardsAllow is Gate 5 (PRD #69 M5, Decision 9): the per-user, count-based,
 // best-effort spend guards. It reports whether the judge may be enqueued — false skips
 // it silently (debug-logged). Called in every mode, after the correctness/consent gates

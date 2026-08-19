@@ -23,7 +23,7 @@ func TestCreateTaskRunGuardrailBlocksBeforeInsert(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetRepoGuard(guard)
 
-	_, err := svc.CreateTaskRun(context.Background(), user, repo, "do the thing", "", false)
+	_, err := svc.CreateTaskRun(context.Background(), user, repo, "do the thing", "", false, false)
 	assertGuardrailBlocked(t, err, wantMsgs)
 	if guard.called != 1 {
 		t.Fatalf("guard called %d times, want 1", guard.called)
@@ -44,7 +44,7 @@ func TestCreateTaskRunMintsNamespacedBranch(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetRepoGuard(guard)
 
-	_, err := svc.CreateTaskRun(context.Background(), user, repo, "Fix the flaky test\nmore detail here", "develop", true)
+	_, err := svc.CreateTaskRun(context.Background(), user, repo, "Fix the flaky test\nmore detail here", "develop", true, false)
 	if err != nil {
 		t.Fatalf("CreateTaskRun with a clearing guard: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestCreateTaskRunSanitizesAndCaps(t *testing.T) {
 	fs := &fakeStore{repoRow: aValidRepoRow()}
 	svc := New(fs, newBox(t), testParams())
 	svc.SetRepoGuard(&fakeGuard{res: privcheck.GuardResult{Blocked: false}})
-	if _, err := svc.CreateTaskRun(context.Background(), user, repo, "clean\x00text", "   ", false); err != nil {
+	if _, err := svc.CreateTaskRun(context.Background(), user, repo, "clean\x00text", "   ", false, false); err != nil {
 		t.Fatalf("CreateTaskRun: %v", err)
 	}
 	if fs.taskRunParams == nil {
@@ -101,7 +101,7 @@ func TestCreateTaskRunSanitizesAndCaps(t *testing.T) {
 	svc2 := New(fs2, newBox(t), testParams())
 	svc2.SetRepoGuard(&fakeGuard{res: privcheck.GuardResult{Blocked: false}})
 	big := strings.Repeat("a", MaxIssueDescriptionBytes+1)
-	if _, err := svc2.CreateTaskRun(context.Background(), user, repo, big, "", false); !errors.Is(err, ErrDescriptionTooLarge) {
+	if _, err := svc2.CreateTaskRun(context.Background(), user, repo, big, "", false, false); !errors.Is(err, ErrDescriptionTooLarge) {
 		t.Fatalf("err = %v, want ErrDescriptionTooLarge", err)
 	}
 	if fs2.taskRunParams != nil {
@@ -115,7 +115,7 @@ func TestCreateTaskRunRepoNotOwned(t *testing.T) {
 	fs := &fakeStore{repoErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())
 	svc.SetRepoGuard(&fakeGuard{res: privcheck.GuardResult{Blocked: false}})
-	if _, err := svc.CreateTaskRun(context.Background(), uuid.New(), uuid.New(), "x", "", false); !errors.Is(err, ErrRepoNotFound) {
+	if _, err := svc.CreateTaskRun(context.Background(), uuid.New(), uuid.New(), "x", "", false, false); !errors.Is(err, ErrRepoNotFound) {
 		t.Fatalf("err = %v, want ErrRepoNotFound", err)
 	}
 }
@@ -127,7 +127,7 @@ func TestCreateTaskRunBaseBranchTooLong(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetRepoGuard(&fakeGuard{res: privcheck.GuardResult{Blocked: false}})
 	long := strings.Repeat("b", maxTaskBaseBranchBytes+1)
-	if _, err := svc.CreateTaskRun(context.Background(), uuid.New(), uuid.New(), "do it", long, false); !errors.Is(err, ErrTaskBaseBranchTooLong) {
+	if _, err := svc.CreateTaskRun(context.Background(), uuid.New(), uuid.New(), "do it", long, false, false); !errors.Is(err, ErrTaskBaseBranchTooLong) {
 		t.Fatalf("err = %v, want ErrTaskBaseBranchTooLong", err)
 	}
 	if fs.taskRunParams != nil {
@@ -143,7 +143,7 @@ func TestCreateTaskRunRepoNotOwnedBeforeCap(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetRepoGuard(&fakeGuard{res: privcheck.GuardResult{Blocked: false}})
 	big := strings.Repeat("a", MaxIssueDescriptionBytes+1)
-	if _, err := svc.CreateTaskRun(context.Background(), uuid.New(), uuid.New(), big, "", false); !errors.Is(err, ErrRepoNotFound) {
+	if _, err := svc.CreateTaskRun(context.Background(), uuid.New(), uuid.New(), big, "", false, false); !errors.Is(err, ErrRepoNotFound) {
 		t.Fatalf("err = %v, want ErrRepoNotFound (ownership resolved before the cap)", err)
 	}
 }

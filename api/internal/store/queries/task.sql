@@ -11,9 +11,95 @@
 -- (like self_improve bakes it in), so it is deliberately NOT a parameter. base_branch
 -- is the optional source ref (sqlc.narg → NULL when absent); open_mr rides straight
 -- from the caller (--mr).
-INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, open_mr, issue_title, issue_description, auto_approve)
-VALUES (@run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'), @open_mr, @issue_title, @issue_description, true)
+-- review_requested rides from the caller (--review, PRD #400 M4a): set on this PLAIN task
+-- so that its terminal 'completed' transition auto-creates a diff-review run
+-- (maybeEnqueueTaskReview); false for an ordinary handoff.
+INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, open_mr, review_requested, issue_title, issue_description, auto_approve)
+VALUES (@run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'), @open_mr, @review_requested, @issue_title, @issue_description, true)
 RETURNING *;
+
+-- name: CreateTaskReviewRun :one
+-- The dedicated insert for a REVIEW run (PRD #400 M4a): a task run that IS a review of
+-- another task. It carries the SAME task shape (repo-ful, issue-less, branch set at
+-- create) but is distinguished by a non-null review_target_run_id — the worker (M4b)
+-- routes such a claim to a diff-review executor. The branch is the REVIEWED TARGET's
+-- branch (the review clones it and diffs against base_branch); dispatched_at is stamped
+-- now() so it is immediately claimable — unlike a plain handoff a review needs no CLI seed
+-- push (the target branch is already pushed). auto_approve is baked true (no plan gate);
+-- open_mr false (a review only reports); review_requested false (a review NEVER spawns a
+-- review — no recursion). id is caller-supplied so Go derives the uzi/task/<id> namespace
+-- invariant the same way CreateTaskRun does. The uq_one_active_task_review_per_target
+-- partial unique index makes a duplicate active review raise 23505.
+INSERT INTO runs (
+    id, user_id, repo_id, kind, branch, base_branch,
+    review_target_run_id, dispatched_at, auto_approve, open_mr, review_requested,
+    issue_title, issue_description
+)
+VALUES (
+    @run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'),
+    @target_run_id, now(), true, false, false,
+    @issue_title, ''
+)
+RETURNING *;
+
+-- name: UpsertTaskReviewWithFindings :one
+-- Persist a review's header + its findings for a reviewed task in ONE atomic statement
+-- (PRD #400 M4a), the same CTE shape the judge's UpsertRunReviewWithRecommendations uses:
+-- upsert the task_reviews header (UNIQUE(target_run_id) makes a re-review REPLACE rather
+-- than 23505), clear the old findings, insert the fresh set from a jsonb array. A single
+-- CTE gives atomicity without a service-level transaction (workersvc holds no pool). The
+-- finding rows arrive already validated + scrubbed in Go; the table CHECK on severity is
+-- the backstop.
+WITH upserted AS (
+    INSERT INTO task_reviews (target_run_id, review_run_id, user_id, status, summary_md)
+    VALUES (@target_run_id, @review_run_id, @user_id, @status, @summary_md)
+    ON CONFLICT (target_run_id) DO UPDATE
+        SET review_run_id = EXCLUDED.review_run_id,
+            status        = EXCLUDED.status,
+            summary_md    = EXCLUDED.summary_md,
+            updated_at    = now()
+    RETURNING id
+),
+cleared AS (
+    DELETE FROM task_review_findings WHERE review_id = (SELECT id FROM upserted)
+),
+inserted AS (
+    INSERT INTO task_review_findings
+        (review_id, file, symbol, line, severity, summary_md, rationale_md)
+    SELECT (SELECT id FROM upserted), x.file, x.symbol, x.line, x.severity, x.summary_md, x.rationale_md
+    FROM jsonb_to_recordset(@findings::jsonb)
+        AS x(file text, symbol text, line int, severity text, summary_md text, rationale_md text)
+)
+SELECT id FROM upserted;
+
+-- name: GetTaskReviewForTarget :one
+-- The review header for a reviewed task, for the CLI/panel read (PRD #400 M4a).
+-- UNIQUE(target_run_id) makes it at most one row. Owner-or-admin visibility is enforced by
+-- the caller (GetRunForViewer on the target run) BEFORE this read, not here — a plain
+-- by-target lookup, exactly like GetRunReviewForTarget.
+SELECT * FROM task_reviews WHERE target_run_id = @target_run_id;
+
+-- name: ListTaskReviewFindings :many
+-- The structured findings of a review (PRD #400 M4a), most-severe first then oldest-first.
+-- Served by idx_task_review_findings_review. Every free-text field was scrubbed + capped at
+-- the review POST, so the panel/CLI renders them as escaped text; this read adds no trust.
+SELECT * FROM task_review_findings
+WHERE review_id = @review_id
+ORDER BY CASE severity WHEN 'error' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END ASC,
+         created_at ASC, id ASC;
+
+-- name: GetActiveTaskReviewRunForWorkerTarget :one
+-- Review-POST authorization (PRD #400 M4a, mirrors GetActiveJudgeRunForWorkerTarget): the
+-- caller's worker must own a NON-TERMINAL review run whose review_target_run_id is
+-- @target_run_id. Review-run-scoped, not user-scoped — a worker can only post the review of
+-- the target its own active review run is reviewing. Returns the review run so the caller
+-- re-asserts target.user_id == review.user_id independently.
+SELECT * FROM runs
+WHERE worker_id = @worker_id
+  AND kind = 'task'
+  AND review_target_run_id = @target_run_id
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+LIMIT 1;
 
 -- name: DispatchTaskRun :one
 -- Stamp the dispatch gate for a task run (PRD #400 Decision 6): the CLI calls this

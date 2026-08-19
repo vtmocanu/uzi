@@ -1137,6 +1137,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// GetRunReviewPanel → GetRunForViewer-scoped, capped by the same
 				// RequireUser masking as GetRun.
 				r.Get("/{id}/review", h.GetRunReview)
+				// Task diff-review read (PRD #400 M4a): the handoff task's structured
+				// findings as JSON, for `uzi handoff review <id>`. Owner-or-admin, same
+				// GetRunForViewer scoping as the review read; no forge write, no token spend.
+				r.Get("/{id}/task-review", h.GetTaskReview)
 				// Issue-draft (PRD #68 M2): the templated, human-editable draft for
 				// filing a forge issue from one recommendation. A READ (owner-or-admin,
 				// same scoping as the review read); no forge write, no token spend. The
@@ -1331,6 +1335,12 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// run reviewing {id}); {id} is the TARGET run, not the judge run.
 		r.Get("/runs/{id}/trace", h.WorkerRunTrace)
 		r.Post("/runs/{id}/review", h.WorkerRunReview)
+
+		// Task diff-review (PRD #400 M4a): a review run (a task carrying
+		// review_target_run_id) posts its structured findings for the reviewed task.
+		// Review-run-scoped (the worker must own the active review run reviewing {id});
+		// {id} is the TARGET run, not the review run.
+		r.Post("/runs/{id}/task-review", h.WorkerTaskReview)
 
 		// Chat-agent read surface (PRD #39 M3, Decision 7): the chat agent
 		// investigates its OWNER'S runs. Every query is scoped to the worker's

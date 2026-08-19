@@ -67,7 +67,7 @@ func TestCommandTree(t *testing.T) {
 		"worker":   {"list", "rm", "set-token"},
 		"token":    {"list"},
 		"repo":     {"list"},
-		"handoff":  {"rm"},
+		"handoff":  {"rm", "review"},
 		"admin":    {"users", "runs", "workers", "usage", "rate-limits"},
 		"skill":    {"status", "install"},
 		"auth":     {"token", "status"},
