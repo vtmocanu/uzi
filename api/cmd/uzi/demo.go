@@ -127,9 +127,21 @@ func demoRuns(now time.Time) []apitypes.RunListItemDTO {
 			JudgeVerdict: verdict, JudgeTodoCount: todo,
 		}
 	}
+	// A milestone-structured run (PRD #122) so `tui --demo` exercises the crew rail's
+	// milestone block: 2 of 4 frozen milestones reported complete, one in progress.
+	scheduler := mk("a1b2c3d4-1111-2222-3333-444444444444", "issue", "running", "Add rate-limit headroom to the scheduler poll", "", nil, 0, 4*time.Minute)
+	scheduler.Milestones = []apitypes.Milestone{
+		{ID: "m1", Title: "Wire the rate-limit headroom into the poll loop"},
+		{ID: "m2", Title: "Clamp the near-cap branch at 10%"},
+		{ID: "m3", Title: "Add the regression sweep"},
+		{ID: "m4", Title: "Update the scheduler docs"},
+	}
+	scheduler.MilestonesCompleted = []string{"m1", "m2"}
+	scheduler.MilestonesInProgress = []string{"m3"}
+
 	return []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: "d0e1f2a3-1111-2222-3333-444444444444", Kind: "issue", Status: "running", IsPlanning: true, IssueTitle: "Draft the plan for webhook delivery retries", CreatedAt: now.Add(-90 * time.Second)}},
-		mk("a1b2c3d4-1111-2222-3333-444444444444", "issue", "running", "Add rate-limit headroom to the scheduler poll", "", nil, 0, 4*time.Minute),
+		scheduler,
 		mk("b2c3d4e5-1111-2222-3333-444444444444", "ci_fix", "awaiting_approval", "Fix flaky pipeline on main", "", nil, 0, 2*time.Minute),
 		mk("c3d4e5f6-1111-2222-3333-444444444444", "issue", "running", "Refactor the forge sync loop for the GitHub driver", "stalled", nil, 0, 51*time.Minute),
 		mk("e5f6a7b8-1111-2222-3333-444444444444", "issue", "completed", "Wire the OIDC login button into the header", "", sp("ideal"), 0, 3*time.Hour),
