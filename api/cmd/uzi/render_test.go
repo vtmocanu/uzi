@@ -392,6 +392,126 @@ func TestRenderRunDetailMilestoneTitleSanitized(t *testing.T) {
 	}
 }
 
+// ---- PRD #362 M5: plain-English run summaries -------------------------------
+
+// TestRenderRunDetailSummaries pins `uzi run get`'s intent/plan/deltas block (PRD #362
+// M5): the INTENT row, the PLAN SUMMARY row, and one DELTA row per entry rendered as
+// `<glyph> <kind>: <text>`. All three are emit-only-when-set — a run with no summaries
+// (the common pre-feature / still-queued case) must render none of them and leave the
+// existing rows untouched.
+func TestRenderRunDetailSummaries(t *testing.T) {
+	intent := "Add rate-limit headroom to the scheduler poll."
+	plan := "Introduce a token-bucket guard and back off on 429s."
+	full := apitypes.RunDTO{
+		ID: "run-1", Kind: "issue", Status: "awaiting_approval",
+		IssueTitle: "do the thing", ForgeType: "gitlab", Health: "ok",
+		SummaryIntent: &intent,
+		SummaryPlan:   &plan,
+		SummaryDeltas: []apitypes.RunSummaryDelta{
+			{Kind: "added", Text: "a retry budget"},
+			{Kind: "changed", Text: "the poll cadence"},
+			{Kind: "dropped", Text: "the eager prefetch"},
+		},
+	}
+	out := renderDetail(t, full)
+
+	for _, want := range []string{
+		"INTENT", intent,
+		"PLAN SUMMARY", plan,
+		"DELTA",
+		"+ added: a retry budget",
+		"~ changed: the poll cadence",
+		"- dropped: the eager prefetch",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("a run with summaries must render %q, got:\n%s", want, out)
+		}
+	}
+
+	// A run with no summaries renders none of the rows — the back-compat contract the nil
+	// pointers and nil slice carry, so a pre-feature run's detail is unchanged.
+	none := apitypes.RunDTO{
+		ID: "run-2", Kind: "issue", Status: "running",
+		IssueTitle: "do the thing", ForgeType: "gitlab", Health: "ok",
+	}
+	bare := renderDetail(t, none)
+	for _, unwanted := range []string{"INTENT", "PLAN SUMMARY", "DELTA"} {
+		if strings.Contains(bare, unwanted) {
+			t.Errorf("a run with no summaries must not render %q, got:\n%s", unwanted, bare)
+		}
+	}
+
+	// Empty (non-nil) strings and a blank-text delta are the same as absent: no bare rows,
+	// no `+ added:` with nothing after it. Empty is reachable through the API as `""`.
+	empty := ""
+	edge := apitypes.RunDTO{
+		ID: "run-3", Kind: "issue", Status: "awaiting_approval",
+		IssueTitle: "do the thing", ForgeType: "gitlab", Health: "ok",
+		SummaryIntent: &empty,
+		SummaryPlan:   &empty,
+		SummaryDeltas: []apitypes.RunSummaryDelta{{Kind: "added", Text: "   "}},
+	}
+	edgeOut := renderDetail(t, edge)
+	for _, unwanted := range []string{"INTENT", "PLAN SUMMARY", "DELTA"} {
+		if strings.Contains(edgeOut, unwanted) {
+			t.Errorf("empty summaries must render no %q row, got:\n%s", unwanted, edgeOut)
+		}
+	}
+}
+
+// TestRenderRunDetailSummariesSanitized is the summary twin of
+// TestRenderRunDetailMilestoneTitleSanitized: intent, plan and delta text are all
+// model-authored UNTRUSTED strings (Decision 10), so each must go through cellText —
+// bidi override and CSI escape stripped, newline folded so the table rail holds, tab
+// folded, and an oversized value capped. The newline, tab and cap are the discriminating
+// probes (sanitizeTTY spares "\n" and "\t" and has no bound); a plain sanitizeTTY here
+// would leave all three and break the rail.
+func TestRenderRunDetailSummariesSanitized(t *testing.T) {
+	hostile := "safe\u202ednetsop\x1b[31m\nnext-line\tcol" + strings.Repeat("x", 250)
+	r := apitypes.RunDTO{
+		ID: "run-1", Kind: "issue", Status: "awaiting_approval",
+		IssueTitle: "do the thing", ForgeType: "gitlab", Health: "ok",
+		SummaryIntent: &hostile,
+		SummaryPlan:   &hostile,
+		SummaryDeltas: []apitypes.RunSummaryDelta{{Kind: "added", Text: hostile}},
+	}
+	out := renderDetail(t, r)
+
+	for _, bad := range []string{"\u202e", "\x1b", "\nnext-line", "\t"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("hostile summary text reached the terminal carrying %q, got:\n%q", bad, out)
+		}
+	}
+	if !strings.Contains(out, "safe") || !strings.Contains(out, "next-line") {
+		t.Errorf("sanitizing dropped the printable summary text too, got:\n%q", out)
+	}
+	// The cap: cellText's alone (Printer.Table's per-cell pass folds newlines but does not
+	// bound length), so an uncapped value would blow the table rail.
+	if strings.Contains(out, strings.Repeat("x", 250)) {
+		t.Errorf("a 250-char summary value reached the terminal uncapped, got:\n%q", out)
+	}
+	if !strings.Contains(out, "…") {
+		t.Errorf("an oversized summary value was neither truncated nor ellipsised, got:\n%q", out)
+	}
+}
+
+// TestDeltaGlyph pins the per-kind delta prefix, including the unknown-kind pass-through:
+// a newer server can send a delta kind this binary has never heard of, and it must render
+// a neutral bullet rather than being dropped.
+func TestDeltaGlyph(t *testing.T) {
+	for _, tc := range []struct{ kind, want string }{
+		{"added", "+"},
+		{"changed", "~"},
+		{"dropped", "-"},
+		{"resurrected", "•"},
+		{"", "•"},
+	} {
+		if got := deltaGlyph(tc.kind); got != tc.want {
+			t.Errorf("deltaGlyph(%q) = %q, want %q", tc.kind, got, tc.want)
+		}
+	}
+}
+
 // ---- PRD #35: the usage-limit park -----------------------------------------
 
 // parkedRun is the fixture every test below starts from: a run parked on a five-hour

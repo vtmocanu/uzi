@@ -1208,6 +1208,12 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	if r.ReportOnly {
 		rows = append(rows, []string{"REPORT_ONLY", "yes"})
 	}
+	// Plain-English run summaries (PRD #362 M5): the intent ("what this run will
+	// implement"), the plan summary ("what the proposed plan will do"), and the deltas
+	// (how the plan diverged from the ask). All three are model-authored UNTRUSTED text
+	// and every one is emit-only-when-set, so a pre-feature run or one whose summaries
+	// have not landed yet is byte-for-byte unchanged. Routed through cellText below.
+	rows = append(rows, summaryRows(r)...)
 	// PRD-link lifecycle (#150), the CLI twin of the fields exposed on the DTO in the
 	// prior commit. Both rows are emit-only-when-set: a run that moved no PRD, or one
 	// predating the feature, must not print a blank row. PRD_MOVE carries the run's own
@@ -1366,6 +1372,69 @@ func milestoneRows(r apitypes.RunDTO) [][]string {
 	rows = append(rows, []string{"MILESTONES", fmt.Sprintf("%d/%d reported complete", done, len(r.Milestones))})
 	rows = append(rows, perMilestone...)
 	return rows
+}
+
+// summaryRows is the CLI surface of the plain-English run summaries (PRD #362 M5): the
+// intent summary, the plan summary, and the per-delta rows describing how the proposed
+// plan diverged from the original ask. It is the `run get` twin of RunView's summary
+// cards; the web derives a "proposed"/"approved" label from run status, but the CLI
+// keeps a single plain "PLAN SUMMARY" label — a status-derived label is a web concern.
+//
+// EVERYTHING here is model-authored UNTRUSTED text (Decision 10: the summary runner is
+// tool-less and a crafted issue/PRD could bias it), so every value goes through cellText
+// — the same newline-fold, tab-fold and length cap the ANTHROPIC_TOKEN and milestone-title
+// rows rely on to keep a hostile string from breaking the table rail.
+//
+// Every row is emit-only-when-non-empty: a run with no summaries (pre-feature, still
+// queued, or a seeded run that never planned) adds nothing, so its detail is byte-for-byte
+// what it was before this milestone. Malformed deltas are already coerced to null
+// server-side (Decision 6), so r.SummaryDeltas is nil/[] here rather than junk; the
+// per-entry emptiness guard covers a stray blank entry without crashing regardless.
+func summaryRows(r apitypes.RunDTO) [][]string {
+	var rows [][]string
+	if r.SummaryIntent != nil {
+		if s := cellText(*r.SummaryIntent); s != "" {
+			rows = append(rows, []string{"INTENT", s})
+		}
+	}
+	if r.SummaryPlan != nil {
+		if s := cellText(*r.SummaryPlan); s != "" {
+			rows = append(rows, []string{"PLAN SUMMARY", s})
+		}
+	}
+	for _, d := range r.SummaryDeltas {
+		// The whole line (glyph, kind and text) is sanitized together: kind is a
+		// server-validated enum today, but "tolerated on read" means the CLI must not
+		// trust it, and cellText over the composed line caps and folds the untrusted
+		// text in one pass. An entry that sanitizes to just its label (empty text) is
+		// dropped rather than rendered as a bare "+ added:".
+		if strings.TrimSpace(d.Text) == "" {
+			continue
+		}
+		line := cellText(deltaGlyph(d.Kind) + " " + d.Kind + ": " + d.Text)
+		if line == "" {
+			continue
+		}
+		rows = append(rows, []string{"DELTA", line})
+	}
+	return rows
+}
+
+// deltaGlyph is the one-rune prefix for a plan-summary delta kind, mirroring the web's
+// added/changed/dropped affordance in ASCII the table rail can hold. An unrecognised
+// kind (a newer server than this binary) renders a neutral bullet rather than being
+// dropped — same pass-through-the-unknown stance as limitWaitLine's rate_limit_type.
+func deltaGlyph(kind string) string {
+	switch kind {
+	case "added":
+		return "+"
+	case "changed":
+		return "~"
+	case "dropped":
+		return "-"
+	default:
+		return "•"
+	}
 }
 
 // credentialCell renders WHICH credential a run spent and WHY (PRD #111 M5, D20).
