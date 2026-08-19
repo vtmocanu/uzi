@@ -169,6 +169,9 @@ func (g *gitLab) DefaultBranchProtection(ctx context.Context, projectID int64, b
 	}
 	bp := BranchProtection{Protected: true}
 	for _, pl := range pb.PushAccessLevels {
+		if pl == nil {
+			continue
+		}
 		lvl := int(pl.AccessLevel)
 		// A push level of 0 is "No one"; >= Maintainer (40) excludes a Developer
 		// bot. Only a nonzero level at or below Developer (30) lets the bot push.
@@ -188,6 +191,9 @@ func (g *gitLab) DefaultBranchProtection(ctx context.Context, projectID int64, b
 	// until now, delegating "the agent can only ever open an MR" to a sentence in
 	// the setup docs.
 	for _, ml := range pb.MergeAccessLevels {
+		if ml == nil {
+			continue
+		}
 		lvl := int(ml.AccessLevel)
 		if lvl > 0 && lvl <= developerAccessLevel {
 			bp.WriteRoleCanMerge = true

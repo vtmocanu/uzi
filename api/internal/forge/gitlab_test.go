@@ -649,6 +649,59 @@ func TestDefaultBranchProtectionParsesMergeLevels(t *testing.T) {
 	}
 }
 
+// TestGitLabDefaultBranchProtectionSkipsNullAccessLevels is the regression test for
+// the nil-pointer panic that a null array element in push_access_levels or
+// merge_access_levels used to trigger. GitLab's REST API can return a JSON
+// `null` in these arrays; go-gitlab decodes that to a nil
+// *BranchAccessDescription, and DefaultBranchProtection dereferenced it without
+// a guard. Without the `if pl == nil { continue }` / `if ml == nil { continue }`
+// guards in gitlab.go this panics; with them the null is skipped and the valid
+// entry alongside it is still processed.
+func TestGitLabDefaultBranchProtectionSkipsNullAccessLevels(t *testing.T) {
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/protected_branches/main": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": 1, "name": "main",
+				// A nil map encodes as JSON `null`, reproducing the mixed
+				// [null, {...}] array the live API can send. The valid element
+				// names the bot at Developer level, so it must still be processed.
+				"push_access_levels": []map[string]any{
+					nil,
+					{"access_level": 30, "user_id": 4242},
+				},
+				"merge_access_levels": []map[string]any{
+					nil,
+					{"access_level": 30, "user_id": 4242},
+				},
+			})
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	// A missing guard makes DefaultBranchProtection panic here rather than return.
+	bp, err := d.DefaultBranchProtection(context.Background(), 7, "main", 4242)
+	if err != nil {
+		t.Fatalf("DefaultBranchProtection: %v", err)
+	}
+	if !bp.Protected {
+		t.Fatal("expected Protected")
+	}
+	// The valid element survives the null: level 30 (Developer) sets the write
+	// role flags, and user_id 4242 matching the bot sets the per-user flags.
+	if !bp.WriteRoleCanPush {
+		t.Fatal("the level-30 push entry after the null must set WriteRoleCanPush")
+	}
+	if !bp.BotCanPush {
+		t.Fatal("the per-user (user_id=4242) push entry after the null must set BotCanPush")
+	}
+	if !bp.WriteRoleCanMerge {
+		t.Fatal("the level-30 merge entry after the null must set WriteRoleCanMerge")
+	}
+	if !bp.BotCanMerge {
+		t.Fatal("the per-user (user_id=4242) merge entry after the null must set BotCanMerge")
+	}
+}
+
 func TestDefaultBranchProtectionCleanBranch(t *testing.T) {
 	m := newMockGitLab(t, map[string]http.HandlerFunc{
 		"/api/v4/projects/7/protected_branches/main": func(w http.ResponseWriter, _ *http.Request) {
