@@ -797,3 +797,64 @@ describe("gitEnv (M10: scrubbed replacement env + hook neutralization)", () => {
     }
   });
 });
+
+describe("reviewDiff (PRD #400 M4b diff-review)", () => {
+  // Build a branch off main with N commits, pushed into the origin fixture BEFORE the
+  // bare clone so ensureClone mirrors it into refs/remotes/origin/<branch>.
+  function commitOnBranch(branch: string, files: Record<string, string>, message: string): void {
+    gitIn(fx.originPath, ["checkout", "-b", branch, "main"]);
+    for (const [rel, content] of Object.entries(files)) {
+      fs.writeFileSync(path.join(fx.originPath, rel), content);
+      gitIn(fx.originPath, ["add", rel]);
+    }
+    gitIn(fx.originPath, ["commit", "-m", message]);
+  }
+
+  it("returns the three-dot diff of a two-commit branch against its base", async () => {
+    gitIn(fx.originPath, ["checkout", "-b", "uzi/task/tgt", "main"]);
+    fs.writeFileSync(path.join(fx.originPath, "A.txt"), "alpha\n");
+    gitIn(fx.originPath, ["add", "A.txt"]);
+    gitIn(fx.originPath, ["commit", "-m", "add A"]);
+    fs.writeFileSync(path.join(fx.originPath, "B.txt"), "beta\n");
+    gitIn(fx.originPath, ["add", "B.txt"]);
+    gitIn(fx.originPath, ["commit", "-m", "add B"]);
+    gitIn(fx.originPath, ["checkout", "main"]); // leave origin on main
+
+    const bare = await git.ensureClone(fx.originPath);
+    const diff = await git.reviewDiff(bare, "main", "uzi/task/tgt");
+
+    // Both commits' changes are present (three-dot from the merge base), added content too.
+    assert.match(diff, /A\.txt/);
+    assert.match(diff, /B\.txt/);
+    assert.match(diff, /\+alpha/);
+    assert.match(diff, /\+beta/);
+    // The base's own README is unchanged on the branch, so it must NOT appear in the diff.
+    assert.ok(!diff.includes("README.md"), "unchanged base files are absent from the diff");
+  });
+
+  it("truncates past the byte cap with a marker", async () => {
+    // ~650 KiB of added content, comfortably past the 512 KiB cap.
+    const big = ("y".repeat(64) + "\n").repeat(10_000);
+    commitOnBranch("uzi/task/big", { "BIG.txt": big }, "add BIG");
+    gitIn(fx.originPath, ["checkout", "main"]);
+
+    const bare = await git.ensureClone(fx.originPath);
+    const diff = await git.reviewDiff(bare, "main", "uzi/task/big");
+
+    assert.match(diff, /diff truncated at \d+ bytes/);
+    // The kept payload is bounded near the cap (512 KiB + the short marker), not the full
+    // ~650 KiB diff.
+    assert.ok(
+      Buffer.byteLength(diff, "utf8") <= 512 * 1024 + 256,
+      `diff should be capped near 512 KiB, got ${Buffer.byteLength(diff, "utf8")} bytes`,
+    );
+  });
+
+  it("returns an empty string when the branch matches its base", async () => {
+    // A branch at the same commit as main — nothing changed.
+    gitIn(fx.originPath, ["branch", "uzi/task/same", "main"]);
+    const bare = await git.ensureClone(fx.originPath);
+    const diff = await git.reviewDiff(bare, "main", "uzi/task/same");
+    assert.equal(diff.trim(), "");
+  });
+});

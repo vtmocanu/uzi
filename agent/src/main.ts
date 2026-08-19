@@ -10,6 +10,7 @@ import { StubChatExecutor } from "./chat-executor-stub.js";
 import { RunRunner, type ExecutorFactory } from "./runner.js";
 import { ChatRunner } from "./chat-runner.js";
 import { JudgeRunner } from "./judge-runner.js";
+import { ReviewRunner } from "./review-runner.js";
 import { stubJudgeQueryFn } from "./judge-runner-stub.js";
 import { Worker } from "./worker.js";
 import { reclaimStrandedRunHomes } from "./home-reclaim.js";
@@ -192,7 +193,18 @@ async function main(): Promise<void> {
     ...(config.executor === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
   });
 
-  const worker = new Worker(config, client, runner, chatRunner, judgeRunner, log);
+  // The review lane (PRD #400 M4b): a slim runner for a `task` claim carrying a
+  // review_target_run_id. Like the judge it reuses the SDK HOME root, but it also needs
+  // `git` (RunRunner-style) to clone the reviewed branch and compute the diff before the
+  // text-only model call. Under UZI_EXECUTOR=stub the model call is the stub judge queryFn
+  // (no live Anthropic — it yields an error result, so the runner posts a graceful `failed`
+  // review), mirroring the judge lane so the e2e can drive it with a dummy token.
+  const reviewRunner = new ReviewRunner(client, git, log, {
+    homeRoot: sdkHomeRoot,
+    ...(config.executor === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
+  });
+
+  const worker = new Worker(config, client, runner, chatRunner, judgeRunner, reviewRunner, log);
 
   // Signal handlers FIRST, before anything that can take real time. Until these
   // are installed a SIGTERM hits Node's default disposition and terminates the

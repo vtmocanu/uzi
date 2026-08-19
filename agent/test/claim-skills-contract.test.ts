@@ -88,6 +88,11 @@ test("claim wire contract: worker parses the server's skill shape", () => {
   // ClaimResponse fails `npm run typecheck` if either is dropped from protocol.ts.
   assert.equal(claim.open_mr, true);
   assert.equal(claim.base_branch, "develop");
+  // PRD #400 M4b: the diff-review target rides the same claim, top-level alongside
+  // base_branch. This golden is not a review claim, so the field is null (the wire
+  // carries it byte-for-byte); pinned across the language boundary so typing the parse
+  // as ClaimResponse fails `npm run typecheck` if it is dropped from protocol.ts.
+  assert.equal(claim.review_target_run_id, null);
   assert.equal(claim.plan_approved, true);
   assert.equal(claim.plan_md, "# Plan\n");
   // PRD #209: the plan_source discriminator rides the same claim, top-level alongside

@@ -55,6 +55,12 @@ test("ci_fix claim wire contract: worker parses the server's ci_fix shape", () =
   // Pinned here as the non-seeded counterpart to the seeded golden in
   // claim-skills-contract.test.ts.
   assert.equal(claim.plan_source, "agent");
+
+  // PRD #400 M4b: the diff-review target rides every claim, top-level. This ci_fix
+  // golden is not a review claim, so the field is null (the wire carries it
+  // byte-for-byte); typing the parse as ClaimResponse fails `npm run typecheck` if it is
+  // dropped from protocol.ts.
+  assert.equal(claim.review_target_run_id, null);
 });
 
 // PRD #71 M5 cross-side contract: the server produces the guard's protected-path

@@ -7,12 +7,17 @@ import { RequestError } from "../src/client.js";
 import type { RunRunner } from "../src/runner.js";
 import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
+import type { ReviewRunner } from "../src/review-runner.js";
 import type { ClaimResponse, ChatClaimResponse, WorkerStats } from "../src/protocol.js";
 import { recordingLogger } from "./helpers.js";
 
 // These run-lane / chat-lane tests never claim a judge run, so a no-op JudgeRunner
 // stub satisfies the Worker constructor (the judge lane has its own test file).
 const noJudge = { execute: async () => {} } as unknown as JudgeRunner;
+
+// Likewise a no-op ReviewRunner: these tests never claim a diff-review run (a `task`
+// claim with review_target_run_id set); the review lane has its own test file.
+const noReview = { execute: async () => {} } as unknown as ReviewRunner;
 
 // PRD #92 M3: the real boot toolchain preflight would fail on this (non-image) test host
 // (no /opt/uzi-toolchain, no baked go/gcc on PATH), so the concurrency/semaphore tests
@@ -132,7 +137,8 @@ describe("Worker — concurrent run + chat lanes (Decision 4)", () => {
       },
     } as unknown as ChatRunner;
 
-    const worker = new Worker(fakeConfig(), client, runRunner, chatRunner, noJudge, logger, okPreflight);
+    const worker = new Worker(fakeConfig(), client, runRunner, chatRunner, noJudge,
+      noReview, logger, okPreflight);
     const done = worker.run(controller.signal);
     for (let i = 0; i < 500 && !(ranRun && ranChat); i++) await tick();
     controller.abort();
@@ -176,7 +182,8 @@ describe("Worker — concurrent run + chat lanes (Decision 4)", () => {
     } as unknown as ChatRunner;
     const runRunner = { execute: async () => {} } as unknown as RunRunner;
 
-    const worker = new Worker(fakeConfig({ chatSessions: 2 }), client, runRunner, chatRunner, noJudge, recordingLogger().logger, okPreflight);
+    const worker = new Worker(fakeConfig({ chatSessions: 2 }), client, runRunner, chatRunner, noJudge,
+      noReview, recordingLogger().logger, okPreflight);
     const done = worker.run(controller.signal);
     for (let i = 0; i < 300 && active < 2; i++) await tick();
     // Give the loop extra ticks to (wrongly) over-fill if the ceiling were not honored.
@@ -204,7 +211,8 @@ describe("Worker — heartbeat carries a resource sample (PRD #49 M1)", () => {
       claimChat: async (): Promise<ChatClaimResponse | null> => null,
     } as unknown as WorkerClient;
 
-    const worker = new Worker(fakeConfig(), client, { execute: async () => {} } as unknown as RunRunner, {} as unknown as ChatRunner, noJudge, recordingLogger().logger, okPreflight);
+    const worker = new Worker(fakeConfig(), client, { execute: async () => {} } as unknown as RunRunner, {} as unknown as ChatRunner, noJudge,
+      noReview, recordingLogger().logger, okPreflight);
     const done = worker.run(controller.signal);
     for (let i = 0; i < 500 && seen.length === 0; i++) await tick();
     controller.abort();
@@ -232,7 +240,8 @@ describe("Worker — RUN lane slot semaphore (PRD #42 M2)", () => {
     const { logger, lines } = recordingLogger();
 
     // chatRunner unused: the chat lane always claims null here, so execute is never called.
-    const worker = new Worker(fakeConfig({ maxConcurrentRuns: 2 }), client, runner, {} as unknown as ChatRunner, noJudge, logger, okPreflight);
+    const worker = new Worker(fakeConfig({ maxConcurrentRuns: 2 }), client, runner, {} as unknown as ChatRunner, noJudge,
+      noReview, logger, okPreflight);
     const done = worker.run(controller.signal);
 
     for (let i = 0; i < 500 && active() < 2; i++) await tick();
@@ -273,7 +282,8 @@ describe("Worker — RUN lane slot semaphore (PRD #42 M2)", () => {
     });
     const { logger, lines } = recordingLogger();
 
-    const worker = new Worker(fakeConfig({ maxConcurrentRuns: 1 }), client, runner, {} as unknown as ChatRunner, noJudge, logger, okPreflight);
+    const worker = new Worker(fakeConfig({ maxConcurrentRuns: 1 }), client, runner, {} as unknown as ChatRunner, noJudge,
+      noReview, logger, okPreflight);
     const done = worker.run(controller.signal);
 
     // run-1 parks holding the only slot; run-2 must NOT start until run-1 frees it.
@@ -331,6 +341,7 @@ describe("Worker — RUN lane slot semaphore (PRD #42 M2)", () => {
       runner,
       {} as unknown as ChatRunner,
       noJudge,
+      noReview,
       recordingLogger().logger,
       okPreflight,
     );
@@ -385,6 +396,7 @@ describe("Worker — RUN lane slot semaphore (PRD #42 M2)", () => {
       runner,
       {} as unknown as ChatRunner,
       noJudge,
+      noReview,
       recordingLogger().logger,
       okPreflight,
     );
@@ -415,6 +427,7 @@ describe("Worker — RUN lane slot semaphore (PRD #42 M2)", () => {
       runner,
       {} as unknown as ChatRunner,
       noJudge,
+      noReview,
       recordingLogger().logger,
       okPreflight,
     );
@@ -464,6 +477,7 @@ describe("Worker — boot toolchain preflight gate (PRD #92 M3)", () => {
       { execute: async () => {} } as unknown as RunRunner,
       {} as unknown as ChatRunner,
       noJudge,
+      noReview,
       recordingLogger().logger,
       failing,
     );
@@ -495,6 +509,7 @@ describe("Worker — boot toolchain preflight gate (PRD #92 M3)", () => {
       { execute: async () => {} } as unknown as RunRunner,
       {} as unknown as ChatRunner,
       noJudge,
+      noReview,
       recordingLogger().logger,
       okPreflight,
     );
@@ -531,6 +546,7 @@ describe("Worker — register auth-rejection classification (issue #109)", () =>
         { execute: async () => {} } as unknown as RunRunner,
         {} as unknown as ChatRunner,
         noJudge,
+      noReview,
         recordingLogger().logger,
         okPreflight,
       );
@@ -565,6 +581,7 @@ describe("Worker — register auth-rejection classification (issue #109)", () =>
       { execute: async () => {} } as unknown as RunRunner,
       {} as unknown as ChatRunner,
       noJudge,
+      noReview,
       logger,
       okPreflight,
     );
@@ -601,6 +618,7 @@ describe("Worker — register auth-rejection classification (issue #109)", () =>
       { execute: async () => {} } as unknown as RunRunner,
       {} as unknown as ChatRunner,
       noJudge,
+      noReview,
       logger,
       okPreflight,
     );
@@ -614,5 +632,67 @@ describe("Worker — register auth-rejection classification (issue #109)", () =>
     );
     controller.abort();
     await done;
+  });
+});
+
+// PRD #400 M4b — dispatch routing: a `task`-kind claim carrying review_target_run_id is
+// a diff-review claim and must route to the ReviewRunner, NOT the normal task executor
+// (RunRunner). A plain task claim (no review target) still routes to the RunRunner.
+describe("Worker — diff-review dispatch (PRD #400 M4b)", () => {
+  it("routes a review_target_run_id claim to the ReviewRunner, not the RunRunner", async () => {
+    const controller = new AbortController();
+    const routed: string[] = [];
+    let gave = false;
+    const client = {
+      register: async () => ({}),
+      heartbeat: async () => {},
+      claimRun: async (): Promise<ClaimResponse | null> => {
+        if (gave) return null;
+        gave = true;
+        return { run_id: "rev-1", kind: "task", review_target_run_id: "target-9" } as unknown as ClaimResponse;
+      },
+      claimChat: async (): Promise<ChatClaimResponse | null> => null,
+    } as unknown as WorkerClient;
+
+    const runRunner = { execute: async () => { routed.push("runner"); } } as unknown as RunRunner;
+    const judgeRunner = { execute: async () => { routed.push("judge"); } } as unknown as JudgeRunner;
+    const reviewRunner = { execute: async (c: ClaimResponse) => { routed.push(`review:${c.review_target_run_id}`); } } as unknown as ReviewRunner;
+
+    const worker = new Worker(fakeConfig(), client, runRunner, {} as unknown as ChatRunner, judgeRunner, reviewRunner, recordingLogger().logger, okPreflight);
+    const done = worker.run(controller.signal);
+    for (let i = 0; i < 500 && routed.length === 0; i++) await tick();
+    controller.abort();
+    await done;
+
+    assert.deepStrictEqual(routed, ["review:target-9"], "the review claim went to the ReviewRunner only");
+    assert.ok(!routed.includes("runner"), "the RunRunner was not called for a review claim");
+    assert.ok(!routed.includes("judge"), "the JudgeRunner was not called for a review claim");
+  });
+
+  it("routes a plain task claim (no review target) to the RunRunner", async () => {
+    const controller = new AbortController();
+    const routed: string[] = [];
+    let gave = false;
+    const client = {
+      register: async () => ({}),
+      heartbeat: async () => {},
+      claimRun: async (): Promise<ClaimResponse | null> => {
+        if (gave) return null;
+        gave = true;
+        return { run_id: "task-1", kind: "task" } as unknown as ClaimResponse;
+      },
+      claimChat: async (): Promise<ChatClaimResponse | null> => null,
+    } as unknown as WorkerClient;
+
+    const runRunner = { execute: async () => { routed.push("runner"); } } as unknown as RunRunner;
+    const reviewRunner = { execute: async () => { routed.push("review"); } } as unknown as ReviewRunner;
+
+    const worker = new Worker(fakeConfig(), client, runRunner, {} as unknown as ChatRunner, noJudge, reviewRunner, recordingLogger().logger, okPreflight);
+    const done = worker.run(controller.signal);
+    for (let i = 0; i < 500 && routed.length === 0; i++) await tick();
+    controller.abort();
+    await done;
+
+    assert.deepStrictEqual(routed, ["runner"], "a plain task claim went to the RunRunner");
   });
 });

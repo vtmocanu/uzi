@@ -22,6 +22,7 @@ import {
   type WorkerRunMessage,
   type JudgeTraceResponse,
   type ReviewRequest,
+  type TaskReviewRequest,
   type WorkerStats,
   type SaveMemoryRequest,
   type MemoryEntry,
@@ -304,6 +305,14 @@ export class WorkerClient {
    *  server validates + scrubs; a bad enum is a 400. `targetRunId` is the reviewed run. */
   async postReview(targetRunId: string, review: ReviewRequest): Promise<void> {
     await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(targetRunId)}/review`, review);
+  }
+
+  /** Post a diff-review's structured findings (POST /worker/runs/:id/task-review, PRD
+   *  #400 M4b). `targetRunId` is the reviewed task run (claim.review_target_run_id). The
+   *  server caps/scrubs the findings and validates `severity`; report-only — nothing is
+   *  pushed. Mirrors postReview. */
+  async postTaskReview(targetRunId: string, review: TaskReviewRequest): Promise<void> {
+    await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(targetRunId)}/task-review`, review);
   }
 
   /** Create a PENDING issue proposal on a chat run (POST /worker/runs/:id/proposals).

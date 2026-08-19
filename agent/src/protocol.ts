@@ -561,6 +561,14 @@ export interface ClaimResponse {
    *  `branch` (uzi/task/<run-id>), not this ref; it is carried so an MR/review can name
    *  what the task diverged from. Null/absent for a run that has none. */
   base_branch?: string | null;
+  /** PRD #400 M4b: set ⇒ this `task`-kind claim is a DIFF-REVIEW of that target task run
+   *  (its `run_id`). The worker routes such a claim to the ReviewRunner instead of the
+   *  normal task executor: it clones the reviewed `branch`, diffs it against `base_branch`,
+   *  runs a reviewer model over the diff, and POSTs structured findings to
+   *  `POST /worker/runs/{review_target_run_id}/task-review`. It pushes NOTHING and opens no
+   *  MR — a review run is report-only. Null/absent for every non-review claim. Read from
+   *  the runs row, so re-delivered on every resume like `open_mr`/`base_branch`. */
+  review_target_run_id?: string | null;
   /** PRD #88: the clarification question this run is ALREADY parked on, read from the
    *  runs row and so re-delivered on every resume — the same shape as auto_approve and
    *  for the same reason. A resumed worker re-parks with this SAME id rather than
@@ -737,6 +745,30 @@ export interface ReviewRequest {
   /** "complete" = a real LLM verdict; "failed" = the deterministic fallback. */
   status: "complete" | "failed";
   recommendations: ReviewRecommendation[];
+}
+
+/** One structured finding the diff-review reviewer posts back (PRD #400 M4b). Every
+ *  field is model-authored from an UNTRUSTED git diff; the server caps/scrubs and
+ *  validates `severity` against info|warning|error again. `line` is optional — a finding
+ *  the reviewer could not anchor to a line omits it. */
+export interface TaskReviewFinding {
+  file: string;
+  symbol: string;
+  line?: number;
+  severity: "info" | "warning" | "error";
+  summary: string;
+  rationale: string;
+}
+
+/** The diff-review POST body (POST /worker/runs/{target_run_id}/task-review, PRD #400
+ *  M4b). `status` is "complete" for a real reviewer verdict (including an empty-diff
+ *  "nothing to review"), "failed" for the graceful fallback (no token, malformed model
+ *  output, or an error before the post). The server caps the findings list and scrubs
+ *  every field. */
+export interface TaskReviewRequest {
+  status: "complete" | "failed";
+  summary: string;
+  findings: TaskReviewFinding[];
 }
 
 /**
