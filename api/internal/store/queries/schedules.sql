@@ -71,6 +71,17 @@ SET enabled = @enabled, updated_at = now()
 WHERE id = @id AND user_id = @user_id
 RETURNING *;
 
+-- name: ResumeRecurringSchedule :one
+-- Resume a recurring schedule (enabled-only PATCH, enabled→true): re-arm next_fire_at to
+-- the next future cron occurrence AND set enabled in a SINGLE write, so no crash window
+-- between two writes can leave an overdue next_fire_at behind (the exact bug of issue #396).
+-- status is deliberately NOT touched: a pause/resume is status-orthogonal and must not
+-- un-park a status='error' schedule (unlike UpdateRunSchedule, which revives to 'active').
+UPDATE run_schedules
+SET enabled = @enabled, next_fire_at = @next_fire_at, updated_at = now()
+WHERE id = @id AND user_id = @user_id
+RETURNING *;
+
 -- name: DeleteRunSchedule :execrows
 -- Owner-scoped delete; execrows lets the handler tell a real delete from a foreign id.
 DELETE FROM run_schedules WHERE id = @id AND user_id = @user_id;

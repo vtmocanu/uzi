@@ -321,11 +321,41 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Enabled != nil {
-		final, err = h.q.SetRunScheduleEnabled(r.Context(), store.SetRunScheduleEnabledParams{Enabled: *req.Enabled, ID: id, UserID: user.ID})
-		if err != nil {
-			slog.Error("set run schedule enabled", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
+		// On an enabled-only resume of a recurring schedule (issue #396), re-arm next_fire_at
+		// to the next FUTURE cron occurrence in the SAME write that flips enabled, so a
+		// schedule paused past one or more fire times does not immediately replay the missed
+		// window on resume. rearmed gates the atomic path; every other case (combined
+		// config+enabled PATCH, a `once` resume, or any pause) keeps the plain flip below.
+		rearmed := false
+		if onlyEnabled(req) && *req.Enabled && cur.Timing == "recurring" {
+			next, nfErr := schedsvc.NextFire(cur.CronExpr.String, cur.Timezone, h.clock())
+			if nfErr != nil {
+				// Defense-in-depth: a valid recurring cron should never fail here. Degrade
+				// rather than crash (mirrors scheduler.go's compute-next-fire path) — log and
+				// fall through to the plain enabled flip so the resume still succeeds.
+				slog.Error("resume recompute next fire", "error", nfErr)
+			} else {
+				final, err = h.q.ResumeRecurringSchedule(r.Context(), store.ResumeRecurringScheduleParams{
+					Enabled:    true,
+					NextFireAt: pgtype.Timestamptz{Time: next, Valid: true},
+					ID:         id,
+					UserID:     user.ID,
+				})
+				if err != nil {
+					slog.Error("resume recurring schedule", "error", err)
+					httpx.Error(w, http.StatusInternalServerError, "internal error")
+					return
+				}
+				rearmed = true
+			}
+		}
+		if !rearmed {
+			final, err = h.q.SetRunScheduleEnabled(r.Context(), store.SetRunScheduleEnabledParams{Enabled: *req.Enabled, ID: id, UserID: user.ID})
+			if err != nil {
+				slog.Error("set run schedule enabled", "error", err)
+				httpx.Error(w, http.StatusInternalServerError, "internal error")
+				return
+			}
 		}
 	}
 	httpx.JSON(w, http.StatusOK, h.scheduleDTO(final, h.repoPathFor(r.Context(), final)))

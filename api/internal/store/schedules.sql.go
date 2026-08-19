@@ -602,6 +602,62 @@ func (q *Queries) ListSweepCandidateIssues(ctx context.Context, arg ListSweepCan
 	return items, nil
 }
 
+const resumeRecurringSchedule = `-- name: ResumeRecurringSchedule :one
+UPDATE run_schedules
+SET enabled = $1, next_fire_at = $2, updated_at = now()
+WHERE id = $3 AND user_id = $4
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire
+`
+
+type ResumeRecurringScheduleParams struct {
+	Enabled    bool               `json:"enabled"`
+	NextFireAt pgtype.Timestamptz `json:"next_fire_at"`
+	ID         uuid.UUID          `json:"id"`
+	UserID     uuid.UUID          `json:"user_id"`
+}
+
+// Resume a recurring schedule (enabled-only PATCH, enabled→true): re-arm next_fire_at to
+// the next future cron occurrence AND set enabled in a SINGLE write, so no crash window
+// between two writes can leave an overdue next_fire_at behind (the exact bug of issue #396).
+// status is deliberately NOT touched: a pause/resume is status-orthogonal and must not
+// un-park a status='error' schedule (unlike UpdateRunSchedule, which revives to 'active').
+func (q *Queries) ResumeRecurringSchedule(ctx context.Context, arg ResumeRecurringScheduleParams) (RunSchedule, error) {
+	row := q.db.QueryRow(ctx, resumeRecurringSchedule,
+		arg.Enabled,
+		arg.NextFireAt,
+		arg.ID,
+		arg.UserID,
+	)
+	var i RunSchedule
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.RepoID,
+		&i.Target,
+		&i.IssueIid,
+		&i.Labels,
+		&i.Prompt,
+		&i.Timing,
+		&i.CronExpr,
+		&i.RunAt,
+		&i.Timezone,
+		&i.NextFireAt,
+		&i.LastFiredAt,
+		&i.AutoApprove,
+		&i.WaitOnLimit,
+		&i.Enabled,
+		&i.Status,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.MaxIssues,
+		&i.Guidance,
+		&i.Model,
+		&i.OverrideSubagentModel,
+		&i.LastFire,
+	)
+	return i, err
+}
+
 const setRunScheduleEnabled = `-- name: SetRunScheduleEnabled :one
 UPDATE run_schedules
 SET enabled = $1, updated_at = now()
