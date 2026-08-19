@@ -571,6 +571,243 @@ func TestScheduleRepointMalformedLiveDB(t *testing.T) {
 	}
 }
 
+// TestScheduleResumeRearmLiveDB pins issue #396: an enabled-only resume of a RECURRING
+// schedule re-arms next_fire_at to the next FUTURE cron occurrence in the same write that
+// flips enabled, so a schedule paused past one or more fire windows does not immediately
+// replay the missed window on resume — and it does so ONLY for the recurring/enabled-only
+// path, leaving status, `once` schedules, and combined config+enable PATCHes untouched.
+//
+// Runs against a real Postgres so it exercises the real ResumeRecurringSchedule query
+// (its RETURNING and its deliberate refusal to touch status) rather than a stub.
+func TestScheduleResumeRearmLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	// forceOverdue pushes a row's next_fire_at into the past so a resume that fails to
+	// re-arm would leave an overdue fire time behind (the exact bug of issue #396).
+	forceOverdue := func(t *testing.T, id string, interval string) {
+		t.Helper()
+		mustExecT(ctx, t, f.pool,
+			`UPDATE run_schedules SET next_fire_at = now() - `+interval+` WHERE id = $1`, uuid.MustParse(id))
+	}
+	// runCount reports how many runs point back at a schedule via schedule_id.
+	runCount := func(t *testing.T, id string) int {
+		t.Helper()
+		var n int
+		if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM runs WHERE schedule_id = $1`, uuid.MustParse(id)).Scan(&n); err != nil {
+			t.Fatalf("count runs: %v", err)
+		}
+		return n
+	}
+
+	t.Run("recurring-overdue-resume", func(t *testing.T) {
+		dto, code := f.createSchedule(t, f.owner.ID, f.repoID,
+			`{"target":"issue","issue_iid":7,"timing":"recurring","cron_expr":"0 2 * * *","timezone":"UTC"}`)
+		if code != http.StatusCreated {
+			t.Fatalf("create status = %d, want 201", code)
+		}
+		id := dto.ID
+
+		// Pause, then force the row overdue while paused.
+		if _, pc := f.patchSchedule(t, f.owner.ID, id, `{"enabled":false}`); pc != http.StatusOK {
+			t.Fatalf("pause status = %d, want 200", pc)
+		}
+		forceOverdue(t, id, "interval '3 hours'")
+
+		// Resume via an enabled-only PATCH: the row must re-arm to a FUTURE fire time.
+		resumed, rc := f.patchSchedule(t, f.owner.ID, id, `{"enabled":true}`)
+		if rc != http.StatusOK {
+			t.Fatalf("resume status = %d, want 200", rc)
+		}
+		if !resumed.Enabled {
+			t.Fatalf("after resume enabled = false, want true")
+		}
+		if resumed.NextFireAt == nil {
+			t.Fatalf("resumed schedule has no next_fire_at, want a future one")
+		}
+		if !resumed.NextFireAt.After(time.Now()) {
+			t.Fatalf("resumed next_fire_at = %s is not in the future (issue #396: resume must re-arm past the missed window)", resumed.NextFireAt)
+		}
+		// The overdue window must NOT have been replayed into an actual run.
+		if n := runCount(t, id); n != 0 {
+			t.Fatalf("resume created %d run(s), want 0 (resume must re-arm, not fire the missed window)", n)
+		}
+	})
+
+	t.Run("recurring-future-resume-idempotent", func(t *testing.T) {
+		dto, code := f.createSchedule(t, f.owner.ID, f.repoID,
+			`{"target":"issue","issue_iid":7,"timing":"recurring","cron_expr":"0 2 * * *","timezone":"UTC"}`)
+		if code != http.StatusCreated {
+			t.Fatalf("create status = %d, want 201", code)
+		}
+		id := dto.ID
+		if dto.NextFireAt == nil {
+			t.Fatalf("created recurring schedule has no next_fire_at")
+		}
+		created := *dto.NextFireAt // already a future occurrence; do NOT force it.
+
+		if _, pc := f.patchSchedule(t, f.owner.ID, id, `{"enabled":false}`); pc != http.StatusOK {
+			t.Fatalf("pause status = %d, want 200", pc)
+		}
+		resumed, rc := f.patchSchedule(t, f.owner.ID, id, `{"enabled":true}`)
+		if rc != http.StatusOK {
+			t.Fatalf("resume status = %d, want 200", rc)
+		}
+		if resumed.NextFireAt == nil {
+			t.Fatalf("resumed schedule has no next_fire_at")
+		}
+		// A natural future occurrence is the same first-strictly-after-now cron instant on
+		// both sides, so a resume that re-arms must land on the SAME instant it created.
+		if d := resumed.NextFireAt.Sub(created); d < -time.Second || d > time.Second {
+			t.Fatalf("resumed next_fire_at = %s, want the originally-created occurrence %s (delta %s)", resumed.NextFireAt, created, d)
+		}
+		if !resumed.NextFireAt.After(time.Now()) {
+			t.Fatalf("resumed next_fire_at = %s is not in the future", resumed.NextFireAt)
+		}
+	})
+
+	t.Run("combined-config-and-enable", func(t *testing.T) {
+		dto, code := f.createSchedule(t, f.owner.ID, f.repoID,
+			`{"target":"issue","issue_iid":7,"timing":"recurring","cron_expr":"0 2 * * *","timezone":"UTC"}`)
+		if code != http.StatusCreated {
+			t.Fatalf("create status = %d, want 201", code)
+		}
+		id := dto.ID
+		if _, pc := f.patchSchedule(t, f.owner.ID, id, `{"enabled":false}`); pc != http.StatusOK {
+			t.Fatalf("pause status = %d, want 200", pc)
+		}
+		forceOverdue(t, id, "interval '3 hours'")
+
+		// A single PATCH carrying BOTH a new cron and enabled:true is NOT the enabled-only
+		// path — it flows through the config UPDATE, which recomputes next_fire from the NEW
+		// cron. This proves the rearm branch did not re-derive from the old 0 2 cron.
+		now := time.Now()
+		combined, cc := f.patchSchedule(t, f.owner.ID, id, `{"cron_expr":"0 14 * * *","enabled":true}`)
+		if cc != http.StatusOK {
+			t.Fatalf("combined patch status = %d, want 200", cc)
+		}
+		if combined.CronExpr != "0 14 * * *" {
+			t.Fatalf("combined patch cron_expr = %q, want 0 14 * * *", combined.CronExpr)
+		}
+		if !combined.Enabled {
+			t.Fatalf("combined patch enabled = false, want true")
+		}
+		if combined.NextFireAt == nil {
+			t.Fatalf("combined patch has no next_fire_at")
+		}
+		want, err := schedsvc.NextFire("0 14 * * *", "UTC", now)
+		if err != nil {
+			t.Fatalf("compute expected next fire: %v", err)
+		}
+		if d := combined.NextFireAt.Sub(want); d < -2*time.Second || d > 2*time.Second {
+			t.Fatalf("combined next_fire_at = %s, want the NEW cron's occurrence %s (delta %s)", combined.NextFireAt, want, d)
+		}
+		if h := combined.NextFireAt.UTC().Hour(); h != 14 {
+			t.Fatalf("combined next_fire_at hour (UTC) = %d, want 14 (must derive from the NEW cron, not the old 0 2)", h)
+		}
+	})
+
+	t.Run("parked-recurring-resume-keeps-status", func(t *testing.T) {
+		dto, code := f.createSchedule(t, f.owner.ID, f.repoID,
+			`{"target":"issue","issue_iid":7,"timing":"recurring","cron_expr":"0 2 * * *","timezone":"UTC"}`)
+		if code != http.StatusCreated {
+			t.Fatalf("create status = %d, want 201", code)
+		}
+		id := dto.ID
+		// Park it (status='error') AND force it overdue, both while it is enabled.
+		mustExecT(ctx, t, f.pool,
+			`UPDATE run_schedules SET status = 'error', next_fire_at = now() - interval '3 hours' WHERE id = $1`, uuid.MustParse(id))
+		// Also pause it so the resume is a genuine enabled:false→true transition.
+		if _, pc := f.patchSchedule(t, f.owner.ID, id, `{"enabled":false}`); pc != http.StatusOK {
+			t.Fatalf("pause status = %d, want 200", pc)
+		}
+
+		resumed, rc := f.patchSchedule(t, f.owner.ID, id, `{"enabled":true}`)
+		if rc != http.StatusOK {
+			t.Fatalf("resume status = %d, want 200", rc)
+		}
+		// status is pause/resume-orthogonal: resume must NOT revive a parked schedule.
+		if resumed.Status != "error" {
+			t.Fatalf("resumed status = %q, want error (resume must not un-park a status='error' schedule)", resumed.Status)
+		}
+		// But the rearm still happened.
+		if resumed.NextFireAt == nil || !resumed.NextFireAt.After(time.Now()) {
+			t.Fatalf("resumed next_fire_at = %v, want a future instant (rearm must happen even for a parked schedule)", resumed.NextFireAt)
+		}
+	})
+
+	t.Run("once-overdue-resume-not-rearmed", func(t *testing.T) {
+		runAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+		dto, code := f.createSchedule(t, f.owner.ID, f.repoID,
+			fmt.Sprintf(`{"target":"issue","issue_iid":7,"timing":"once","run_at":%q,"timezone":"UTC"}`, runAt))
+		if code != http.StatusCreated {
+			t.Fatalf("create once status = %d, want 201 (body path checked run_at future)", code)
+		}
+		id := dto.ID
+		if _, pc := f.patchSchedule(t, f.owner.ID, id, `{"enabled":false}`); pc != http.StatusOK {
+			t.Fatalf("pause status = %d, want 200", pc)
+		}
+		// Force the once row overdue while paused.
+		forceOverdue(t, id, "interval '1 hour'")
+
+		resumed, rc := f.patchSchedule(t, f.owner.ID, id, `{"enabled":true}`)
+		if rc != http.StatusOK {
+			t.Fatalf("resume status = %d, want 200", rc)
+		}
+		if !resumed.Enabled {
+			t.Fatalf("after once resume enabled = false, want true")
+		}
+		if resumed.NextFireAt == nil {
+			t.Fatalf("resumed once schedule has no next_fire_at")
+		}
+		// The rearm branch must NOT run for a `once` schedule: next_fire_at stays the forced
+		// overdue instant (still due), leaving the fire itself to the scheduler.
+		if resumed.NextFireAt.After(time.Now()) {
+			t.Fatalf("resumed once next_fire_at = %s is in the future; a `once` resume must NOT re-arm (rearm is recurring-only)", resumed.NextFireAt)
+		}
+		if d := time.Since(*resumed.NextFireAt); d < 30*time.Minute || d > 90*time.Minute {
+			t.Fatalf("resumed once next_fire_at is %s in the past, want ~1 hour (the forced overdue value, unchanged)", d)
+		}
+	})
+
+	t.Run("pause-does-not-touch-in-flight-run", func(t *testing.T) {
+		dto, code := f.createSchedule(t, f.owner.ID, f.repoID,
+			`{"target":"prompt","prompt":"do the thing","timing":"recurring","cron_expr":"0 2 * * *","timezone":"UTC"}`)
+		if code != http.StatusCreated {
+			t.Fatalf("create status = %d, want 201", code)
+		}
+		id := dto.ID
+
+		// Insert a prompt run for this schedule (the scheduler's own insert path).
+		run, err := f.h.q.CreatePromptRun(ctx, store.CreatePromptRunParams{
+			UserID:      f.owner.ID,
+			RepoID:      f.repoID,
+			IssueTitle:  "scheduled prompt",
+			ScheduleID:  uuid.MustParse(id),
+			AutoApprove: true,
+			WaitOnLimit: true,
+		})
+		if err != nil {
+			t.Fatalf("insert prompt run: %v", err)
+		}
+		before := run.Status // default 'queued'
+
+		// Pause the schedule.
+		if _, pc := f.patchSchedule(t, f.owner.ID, id, `{"enabled":false}`); pc != http.StatusOK {
+			t.Fatalf("pause status = %d, want 200", pc)
+		}
+
+		// The in-flight run must still exist with its status UNCHANGED (pause is not cancel).
+		var after string
+		if err := f.pool.QueryRow(ctx, `SELECT status FROM runs WHERE schedule_id = $1`, uuid.MustParse(id)).Scan(&after); err != nil {
+			t.Fatalf("read run status after pause: %v (run must still exist)", err)
+		}
+		if after != before {
+			t.Fatalf("run status after pause = %q, want %q unchanged (pause must not cancel an in-flight run)", after, before)
+		}
+	})
+}
+
 // TestScheduleRepointIssueTargetRestrictedLiveDB pins D4 restrict against a real row: an
 // issue-target schedule cannot be repointed (422, because issue_iid is repo-relative), and
 // the rejected repoint does not mutate the row.
