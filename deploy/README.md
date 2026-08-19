@@ -1,5 +1,16 @@
 # Releasing and deploying uzi
 
+> **⚠ Migration note (2026-08-19).** uzi moved from GitLab + Harbor to **GitHub** on
+> 2026-08-18. The release now publishes via **GitHub Actions** (`.github/workflows/release.yml`)
+> to **GHCR** (`ghcr.io/vtmocanu/uzi/…`), driven with `gh`, and its publish jobs gate on a manual
+> **`release`-environment approval** (see the Release procedure below). **`.claude/agents/release.md`
+> is the current, authoritative release procedure — trust it and `release.yml` over any
+> GitLab/Harbor/`glab` wording still in this file.** The Release procedure section below was
+> rewritten for GitHub on 2026-08-19; the cluster-side deploy topology further down (ArgoCD, the
+> `argo-apps` GitOps repo, the registry the cluster pulls from, and the platform prerequisites)
+> has **not** been re-verified since the migration and may name retired infrastructure (Harbor,
+> GitLab CI vars, `registry.example.com`) — confirm against the live cluster before relying on it.
+
 The release + deploy runbook for uzi (PRD #52). Two deploy topologies:
 
 - **compose (laptop)** — the MVP path, unchanged. `docker compose up` on
@@ -13,9 +24,9 @@ The chart is `chart/` (an umbrella chart: web + api + the CloudNativePG `cluster
 subchart). Per-cluster values live in the private GitOps repo, not this repo:
 `argo-apps:apps/uzi/values/dev-cluster.yaml`. The in-repo `values/` holds
 only `ci-render.yaml` (sanitized CI render stand-in) and `kind-smoke.yaml` (KinD
-smoke). CI (`../.gitlab-ci.yml`) builds + publishes; ArgoCD
-(`argo-apps`, `apps/uzi/`) deploys. example-app's `deploy/README.md` is
-the sibling reference — uzi follows its Model-B release shape.
+smoke). CI is **GitHub Actions**: `ci.yml` validates every PR + `main`, and the `v*`-tag
+`release.yml` publishes the images + OCI chart to GHCR; ArgoCD (`argo-apps`, `apps/uzi/`)
+deploys. uzi follows the Model-B release shape.
 
 ## What deploys where
 
@@ -85,29 +96,18 @@ kubectl -n argocd annotate application uzi \
 The Application is already `automated: {prune, selfHeal}`, so the hard refresh both
 re-resolves the version and triggers the sync; no separate `argocd app sync` is needed.
 
-Why direct-to-`main` is preferred here: it skips the separate MR pipeline, so you wait for
-the full gate **once** (the `main`-branch build) instead of twice (the MR gate, then the
-tag's re-gate), and it runs the slow suite one fewer time — which matters because every gate
-run is an independent roll against flaky tests. The trade is that the release commit gets no
-independent pre-land review gate; that is low risk here because it only bumps `Chart.yaml` +
-CHANGELOG on code every feature MR already gated, and **the tag pipeline re-runs the whole
-gate as the safety net** (step 2).
+Why direct-to-`main` is preferred here: it skips the MR gate cycle, so `ci.yml` runs the full
+suite **once** on `main` instead of twice (MR, then merge), which matters because every gate run
+is an independent roll against flaky tests. The trade is that the release commit gets no
+independent pre-land review; that is low risk because it only bumps `Chart.yaml` + CHANGELOG on
+code every feature PR already gated.
 
-**Tag directly — do NOT serialize behind the `main` pipeline.** The tag pipeline re-runs the
-**entire** gate (test, lint, validate, build, e2e) **and** publishes — verified against a live
-tag pipeline, it carries every gate stage the `main` build does plus the `publish:*` jobs, so
-it is a strict **superset** and tagging before the `main` build finishes loses **no** gate
-coverage. So push the release commit and tag it right away (step 2); the tag pipeline and the
-`main` pipeline then run **concurrently**, and you wait for **one** long CI (the tag's) instead
-of two in series. Cancel the now-redundant `main` pipeline
-(`glab api --method POST projects/vtmocanu%2Fuzi/pipelines/<id>/cancel`) to give the runners to
-the tag pipeline. The only cost is a **cold** Harbor layer cache (the `main` build is what
-warms it, MR builds are cache-less by design, Decision 2), which makes the tag's image builds
-a full rebuild — **slower, never a failure**; a flaky tag pipeline re-runs with
-`glab ci run --branch v<X.Y.Z>`, tag left in place. This assumes the usual mechanical release
-commit (CHANGELOG + `Chart.yaml` version only, on already-gated code); if you tagged a commit
-that changed real code and are unsure it is green, wait for the `main` gate first to avoid a
-bad tag.
+**🔴 Unlike the old GitLab tag pipeline, `release.yml` does NOT re-run the full gate.** It runs
+only `assert-version` + `assert-changelog`, then publishes — the heavy test/lint/build gates are
+ASSUMED green on the tagged commit. So **confirm `main`'s `ci.yml` run is green on the exact
+commit you are about to tag BEFORE tagging** (`gh run watch` it if the release commit was just
+pushed); there is no post-tag gate to catch a red `main`. There is no separate "main pipeline"
+to cancel and no warm/cold image cache to reason about — GitHub Actions builds each release fresh.
 
 1. **Bump the chart version and write the CHANGELOG on the release commit.**
    Edit `chart/Chart.yaml` `version` **and** `appVersion` to the new `X.Y.Z` (they must be
@@ -136,49 +136,36 @@ bad tag.
 
    ```sh
    git checkout main && git pull
-   git tag v0.1.0            # == Chart.yaml version/appVersion
-   env -u GITLAB_TOKEN git push origin v0.1.0
+   git tag -a v0.1.0 -m "uzi 0.1.0"   # == Chart.yaml version/appVersion
+   git push origin v0.1.0
    ```
 
-   The tag pipeline (`publish` stage) asserts the version equality, then
-   kaniko-builds + pushes both images (`:<tag>` + `:<short-sha>`) and
-   `helm package` + `helm push`es the OCI chart, all at that version.
+   The push triggers `release.yml`: it asserts the version equality (`assert-version`) and
+   CHANGELOG coverage (`assert-changelog`), then builds + pushes each image
+   (`ghcr.io/vtmocanu/uzi/{api,web,controller,agent-base,agent-jvm}:<tag>` + `:<short-sha>`) and
+   the OCI chart (`oci://ghcr.io/vtmocanu/uzi/uzi:<tag>`, published LAST). Homebrew is a separate
+   `v*`-triggered run (`brew.yml`).
 
-   > **Tag a commit already on `main` (whether it landed direct or via an
-   > MR), and never one carrying a skip-CI marker.** Its default-branch pipeline already ran a
-   > protected-ref build that **warmed the Harbor layer cache**, so the tag
-   > pipeline's builds are mostly cache hits. Tagging a commit whose
-   > default-branch build has not run yet just means a **cold cache**: slower
-   > publish, not a failure. (MR pipelines build cache-less by design,
-   > Decision 2, so only the merge-to-`main` build warms the cache.)
+   > **🔴 The tag is not the finish line — the publish jobs WAIT on a manual approval that
+   > `git push` never surfaces.** Every `publish-*` job (and `brew.yml`) declares
+   > `environment: release`, which since the repo went public carries a required-reviewer rule.
+   > After the tag pushes, the run sits in `status: waiting` and NOTHING builds until a listed
+   > reviewer approves — and it gates **more than once**: `publish-chart` `needs:` every image, so
+   > its own gate only goes pending after the images finish, and `brew.yml` is a third gate.
+   > Approve each (you are a reviewer):
    >
-   > **A skip-CI commit is not a cache problem, it is no publish at all.**
-   > GitLab skips pipelines for a commit whose message carries a marker like
-   > `[skip ci]` or `[ci skip]` (at least; any capitalization, matched
-   > anywhere in the message including the body, not just the subject
-   > line). That reaches the tag pipeline too: it is push-triggered the
-   > same as the branch pipeline for that commit, so both get skipped
-   > together.
+   > ```sh
+   > RUN=$(gh run list --workflow release.yml --branch v0.1.0 --limit 1 --json databaseId --jq '.[0].databaseId')
+   > ENV=$(gh api repos/vtmocanu/uzi/actions/runs/$RUN/pending_deployments --jq '.[0].environment.id')
+   > printf '{"environment_ids":[%s],"state":"approved","comment":"release v0.1.0"}' "$ENV" \
+   >   | gh api --method POST repos/vtmocanu/uzi/actions/runs/$RUN/pending_deployments --input -
+   > ```
    >
-   > This is easy to miss because every signal still looks fine: `git push
-   > origin v0.1.0` reports `* [new tag]` exactly like a healthy push, and
-   > nothing errors anywhere. Even the instrument meant to catch it needs
-   > care: right after pushing the tag you are still standing on `main`, so
-   > a bare `glab ci status` reports `main`'s own pipeline, not the tag's,
-   > and it too reads `skipped` (same commit, same marker), the right word
-   > for the wrong ref with no way to tell them apart. Check `glab ci
-   > status --branch v0.1.0` instead, but that only confirms a pipeline
-   > exists for the tag and what it reports; a pipeline can run and still
-   > fail a publish job partway through, so it cannot tell you the images
-   > and chart actually landed in Harbor. Check both, in order: the scoped
-   > status tells you whether a pipeline ran at all, the images and chart
-   > in Harbor tell you whether it published.
-   >
-   > If it happens, do not move the tag. A skip-CI marker suppresses only
-   > push-triggered pipelines; a manually created one runs regardless:
-   > `glab ci run --branch v0.1.0` (`--branch` takes any ref, a tag
-   > included, despite the name) recovers the release with the tag left in
-   > place.
+   > Watch the run in the BACKGROUND (it blocks on the approvals and the multi-arch builds), then
+   > PROVE it published: `gh run view "$RUN"` all-green AND the GHCR packages carry the new tag.
+   > **Never `[skip ci]` the commit you tag** — GitHub Actions honours the marker on tag pushes
+   > too, so `git push origin v0.1.0` prints `* [new tag]` and nothing runs.
+   > `.claude/agents/release.md` carries the full, current procedure.
 
 3. **~~Point ArgoCD at the new version~~ — no longer needed on dev-cluster.**
    This cluster auto-tracks (`targetRevision: 0.*` in `apps/uzi/app.uzi.yaml`), so a
