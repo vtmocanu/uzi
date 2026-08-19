@@ -158,6 +158,10 @@ interface CtxProbe {
   sessionIds: string[];
   gated: string[];
   iterations: number[];
+  // PRD #362 M3c: the plan_md the fake gate has "persisted" (the awaiting_approval
+  // report). null until the first gate call. A guard-enforcing fake client reads this to
+  // model the server's stale-write guard (`plan_md = @expected`).
+  persisted: { planMd: string | null };
 }
 
 function makeCtx(
@@ -168,6 +172,7 @@ function makeCtx(
   const sessionIds: string[] = [];
   const gated: string[] = [];
   const iterations: number[] = [];
+  const persisted: { planMd: string | null } = { planMd: null };
   // A SEQUENCE of verdicts (PRD #41): the gate loop calls gatePlan once per round, so
   // tests script [revise, …, approve/reject/cancel]. The last entry sticks for any
   // further calls. A bare verdict behaves as a one-element sequence (unchanged).
@@ -186,8 +191,22 @@ function makeCtx(
     config: null,
     sessionId: null,
     onSessionId: (s) => sessionIds.push(s),
-    gatePlan: async (planMd) => {
+    // PRD #362 M3c: model the real gate's ordering — persist plan_md (the awaiting_approval
+    // report) THEN invoke the onAwaitingApproval hook (which posts the plan summary) BEFORE
+    // returning the verdict. The plan-summary POST's stale-write guard reads runs.plan_md,
+    // so it can only match once plan_md is persisted; this fake reproduces that ordering so
+    // the summary tests exercise the same sequence production does. The hook is swallowed
+    // here exactly as the real gate swallows it, so a throwing hook never fails the gate.
+    gatePlan: async (planMd, _milestones, onAwaitingApproval) => {
       gated.push(planMd);
+      persisted.planMd = planMd;
+      if (onAwaitingApproval) {
+        try {
+          await onAwaitingApproval(planMd);
+        } catch {
+          /* advisory — a summary failure never blocks the gate */
+        }
+      }
       const v = verdicts[Math.min(gateCall, verdicts.length - 1)]!;
       gateCall++;
       return v;
@@ -198,7 +217,7 @@ function makeCtx(
     },
     ...overrides,
   };
-  return { ctx, emits, sessionIds, gated, iterations };
+  return { ctx, emits, sessionIds, gated, iterations, persisted };
 }
 
 beforeEach(() => {
@@ -3258,6 +3277,59 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
       "each post carries the corresponding plan_md as the stale-write guard value",
     );
     assert.deepStrictEqual(rec.planCalls.map((c) => c.planMd), ["# Plan v1", "# Plan v2"]);
+  });
+
+  // ── REGRESSION (code review PR #387, finding 1): POST after plan_md is persisted ──
+  // The plan summary carries `plan_md` as the server's stale-write guard value, so the
+  // write only lands once the gate has persisted plan_md (the awaiting_approval report).
+  // An earlier revision POSTed the summary BEFORE calling ctx.gatePlan, so the guard
+  // matched 0 rows (plan_md still NULL / the previous plan) → 409 → the whole plan-summary
+  // half of the feature was silently dropped, invisibly to CI. This models the guard: the
+  // fake client rejects a post whose plan_md is not the currently-persisted one. It passes
+  // only because the summary now fires from the gate's onAwaitingApproval callback, after
+  // persist. Move the POST back before the gate and this test 409s and fails.
+  it("posts the plan summary only AFTER plan_md is persisted, so a guard-enforcing server accepts it", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# The Plan\n- step 1"), resultSuccess()],
+      [assistantText("implementing"), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    const planPosts: { summary: string; deltas: Delta[]; plan_md: string }[] = [];
+    const runner = {
+      async generateIntentSummary(): Promise<string | null> {
+        return "INTENT";
+      },
+      async generatePlanSummary(): Promise<PlanSummaryResult | null> {
+        return { summary: "PLAN SUMMARY", deltas: [{ kind: "added", text: "a step" }] };
+      },
+    } as unknown as SummaryRunner;
+    const client = {
+      async postIntentSummary(): Promise<void> {},
+      async postPlanSummary(
+        _runId: string,
+        body: { summary: string; deltas: Delta[]; plan_md: string },
+      ): Promise<void> {
+        // Model the server's Decision-3 stale-write guard: `plan_md = @expected` matches
+        // only when the posted plan_md still equals the row's persisted plan_md.
+        if (probe.persisted.planMd !== body.plan_md) {
+          throw new Error(
+            `409 stale plan: posted ${JSON.stringify(body.plan_md)} but persisted ${JSON.stringify(probe.persisted.planMd)}`,
+          );
+        }
+        planPosts.push(body);
+      },
+    } as unknown as WorkerClient;
+    await new SdkExecutor(nullLogger(), homeDir, {
+      queryFn,
+      client,
+      summaryRunner: runner,
+    }).run(probe.ctx);
+    assert.strictEqual(
+      planPosts.length,
+      1,
+      "the plan summary landed — posted after plan_md was persisted, so the guard matched",
+    );
+    assert.strictEqual(planPosts[0]!.plan_md, "# The Plan\n- step 1");
   });
 
   // ── Seeded / pre-approved → intent only (Decision 5) ─────────────────────────

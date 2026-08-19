@@ -56,11 +56,23 @@ export const SUMMARY_MODEL_TIMEOUT_MS = envTimeoutMs();
 
 // Bounds on what we return to the caller. The api endpoint (M1) re-validates and
 // re-sanitizes everything (it, not this, is the security boundary — Decision 6), so
-// these are a robustness courtesy that keeps a runaway model response bounded: the api
-// caps summaries at 4000 chars, but we ask the model to stay brief and clip well under.
+// these are a robustness courtesy that keeps a runaway model response bounded.
+//
+// The api caps by BYTES, not chars: it REJECTS (400) a summary over MaxSummaryBytes
+// (4000) or a delta text over MaxSummaryDeltaTextBytes (1000) — see
+// api/internal/workersvc/summaries.go. A char clip alone is not enough: multibyte text
+// (CJK ≈3 B/char, emoji ≈4 B) can sit under the char cap yet blow the byte cap, and the
+// whole summary is then silently dropped (code review PR #387, finding 3). So we clip by
+// chars for brevity AND by bytes to stay inside the api's hard limit. The byte budgets
+// mirror the api constants and are kept strictly UNDER them (the clip's ellipsis costs
+// bytes too, and `len(s) > cap` is the api's reject test).
 const MAX_SUMMARY_CHARS = 2000;
 const MAX_DELTA_TEXT_CHARS = 600;
 const MAX_DELTAS = 50;
+// Mirror api MaxSummaryBytes / MaxSummaryDeltaTextBytes (summaries.go). Not shared across
+// the TS/Go boundary, so if either api constant changes, change these to match.
+const MAX_SUMMARY_BYTES = 4000;
+const MAX_DELTA_TEXT_BYTES = 1000;
 
 const VALID_DELTA_KINDS = new Set(["added", "changed", "dropped"]);
 
@@ -136,7 +148,7 @@ export class SummaryRunner {
       this.log.warn("intent summary generation failed", { error: errMessage(err) });
       return null;
     }
-    const summary = clip(text.trim(), MAX_SUMMARY_CHARS);
+    const summary = clipBytes(clip(text.trim(), MAX_SUMMARY_CHARS), MAX_SUMMARY_BYTES);
     if (!summary) {
       this.log.warn("intent summary generation produced empty output");
       return null;
@@ -176,7 +188,10 @@ export class SummaryRunner {
       return null;
     }
     const rec = obj as Record<string, unknown>;
-    const summary = typeof rec.summary === "string" ? clip(rec.summary.trim(), MAX_SUMMARY_CHARS) : "";
+    const summary =
+      typeof rec.summary === "string"
+        ? clipBytes(clip(rec.summary.trim(), MAX_SUMMARY_CHARS), MAX_SUMMARY_BYTES)
+        : "";
     if (!summary) {
       this.log.warn("plan summary JSON had no usable summary");
       return null;
@@ -290,7 +305,10 @@ function coerceDeltas(raw: unknown): Delta[] {
     const d = el as Record<string, unknown>;
     const kind = typeof d.kind === "string" ? d.kind : "";
     if (!VALID_DELTA_KINDS.has(kind)) continue;
-    const text = typeof d.text === "string" ? clip(d.text.trim(), MAX_DELTA_TEXT_CHARS) : "";
+    const text =
+      typeof d.text === "string"
+        ? clipBytes(clip(d.text.trim(), MAX_DELTA_TEXT_CHARS), MAX_DELTA_TEXT_BYTES)
+        : "";
     if (!text) continue;
     out.push({ kind: kind as DeltaKind, text });
   }
@@ -361,4 +379,27 @@ export function buildPlanPrompt(input: PlanSummaryInput): string {
 
 function clip(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) + "…" : s;
+}
+
+const UTF8 = new TextEncoder();
+
+// Clip `s` to at most `maxBytes` UTF-8 bytes, appending an ellipsis when it truncates.
+// The api rejects (400) a summary/delta over its BYTE cap, so a char clip is not enough
+// for multibyte scripts (code review PR #387, finding 3). Iterating with `for..of` walks
+// whole code points, so a multibyte sequence (or a surrogate-pair emoji) is never split;
+// the ellipsis's own byte cost is reserved from the budget so the result never exceeds
+// `maxBytes` even after it is appended.
+function clipBytes(s: string, maxBytes: number): string {
+  if (UTF8.encode(s).length <= maxBytes) return s;
+  const ellipsis = "…";
+  const budget = maxBytes - UTF8.encode(ellipsis).length;
+  let used = 0;
+  let out = "";
+  for (const ch of s) {
+    const n = UTF8.encode(ch).length;
+    if (used + n > budget) break;
+    used += n;
+    out += ch;
+  }
+  return out + ellipsis;
 }

@@ -86,6 +86,22 @@ describe("SummaryRunner.generateIntentSummary", () => {
     assert.deepEqual(entries, [], "the per-turn uzi-summary-* HOME was removed");
     await fs.rm(homeRoot, { recursive: true, force: true });
   });
+
+  // Code review PR #387, finding 3: the api rejects a summary over 4000 BYTES. Multibyte
+  // text can sit under the 2000-CHAR clip yet blow the byte cap, and the whole summary is
+  // then dropped. A CJK string of 1800 chars is 5400 UTF-8 bytes — under the char cap,
+  // over the byte cap; the runner must return it clipped to ≤ 4000 bytes, not pass it on.
+  it("clips a multibyte summary to the api BYTE cap, not just the char cap", async () => {
+    const wide = "中".repeat(1800); // 1800 chars < 2000-char clip; 5400 bytes > 4000-byte cap
+    const { runner } = await makeRunner(replyingQueryFn(wide));
+    const out = await runner.generateIntentSummary(intentInput);
+    assert.ok(out, "a wide summary is clipped, not dropped");
+    assert.ok(
+      Buffer.byteLength(out, "utf8") <= 4000,
+      `summary must be ≤ 4000 bytes, got ${Buffer.byteLength(out, "utf8")}`,
+    );
+    assert.ok(out.endsWith("…"), "a clipped summary carries the ellipsis");
+  });
 });
 
 describe("SummaryRunner.generatePlanSummary", () => {
@@ -109,6 +125,28 @@ describe("SummaryRunner.generatePlanSummary", () => {
       { kind: "added", text: "a websocket frame" },
       { kind: "changed", text: "reuse the judge recipe" },
     ]);
+  });
+
+  // Code review PR #387, finding 3: the api rejects a delta text over 1000 BYTES and a
+  // summary over 4000 BYTES. A CJK delta of 500 chars is 1500 bytes — under the 600-char
+  // clip, over the byte cap. Both must come back clipped to their byte caps, not dropped.
+  it("clips a multibyte plan summary and delta text to the api BYTE caps", async () => {
+    const json = JSON.stringify({
+      summary: "中".repeat(1800), // 5400 bytes > 4000
+      deltas: [{ kind: "added", text: "中".repeat(500) }], // 1500 bytes > 1000
+    });
+    const { runner } = await makeRunner(replyingQueryFn(json));
+    const out = await runner.generatePlanSummary(planInput);
+    assert.ok(out);
+    assert.ok(
+      Buffer.byteLength(out.summary, "utf8") <= 4000,
+      `plan summary must be ≤ 4000 bytes, got ${Buffer.byteLength(out.summary, "utf8")}`,
+    );
+    assert.equal(out.deltas.length, 1);
+    assert.ok(
+      Buffer.byteLength(out.deltas[0]!.text, "utf8") <= 1000,
+      `delta text must be ≤ 1000 bytes, got ${Buffer.byteLength(out.deltas[0]!.text, "utf8")}`,
+    );
   });
 
   it("degrades a non-array deltas to an empty list, keeping the summary", async () => {

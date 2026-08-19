@@ -399,11 +399,15 @@ export class SdkExecutor implements Executor {
    * PRD #362 M3c PLAN-summary hook. AWAITS a plan summary + deltas for `approvedPlan`
    * (blocking, up to the model timeout INTERNAL to generatePlanSummary — Decision 2:
    * it blocks gate ENTRY, never the terminal outcome), then posts it carrying
-   * `plan_md: approvedPlan` as the Decision 3 stale-write guard value. That value must
-   * be the EXACT text the gate persists to runs.plan_md: `ctx.gatePlan(approvedPlan)`
-   * reports awaiting_approval with the SAME `approvedPlan`, which SetRunAwaitingApproval
-   * writes verbatim (NUL-stripped) to plan_md — so the guard matches and the server
-   * accepts the write (a superseded plan → 409, dropped).
+   * `plan_md: approvedPlan` as the Decision 3 stale-write guard value.
+   *
+   * ORDERING (code review PR #387, finding 1): this MUST run AFTER the gate has persisted
+   * plan_md, or the server guard `plan_md = @expected` matches 0 rows and 409s the write.
+   * It is therefore wired as the gate's `onAwaitingApproval` callback — the gate reports
+   * awaiting_approval (SetRunAwaitingApproval writes `approvedPlan`, NUL-stripped, to
+   * runs.plan_md) and THEN invokes this, so `planMd` here is the exact persisted text and
+   * the guard matches (a superseded plan → 409, dropped). The autopilot short-circuit
+   * never persists plan_md and never invokes the callback, so it generates no plan summary.
    *
    * ADVISORY: issue runs only, token + client + resolved-PRD present, and EVERYTHING is
    * wrapped — a null (timeout / model error / unusable output), a 409 stale, a 400 bad
@@ -1090,11 +1094,17 @@ export class SdkExecutor implements Executor {
         // approves the breakdown. It is REPLACED on each revision round (Decision 2),
         // tracked alongside approvedPlan.
         let candidateMilestones = plan.milestones;
-        // PRD #362 M3c PLAN hook (Decision 2): generate + post the plan summary BEFORE
-        // entering the gate, blocking gate ENTRY up to the model timeout but NEVER the
-        // terminal outcome. Advisory — the helper swallows every failure.
-        await this.generateAndPostPlanSummary(ctx, approvedPlan, prdInputP);
-        let verdict = await ctx.gatePlan(approvedPlan, candidateMilestones);
+        // PRD #362 M3c PLAN hook (Decision 2): generate + post the plan summary as the
+        // gate's onAwaitingApproval callback, so it fires AFTER the gate persists plan_md
+        // (the summary's stale-write guard value) and BEFORE the verdict wait — blocking
+        // gate ENTRY up to the model timeout but NEVER the terminal outcome. Posting it
+        // before the gate (as an earlier revision did) always 409s against a NULL/previous
+        // plan_md and is silently dropped. The autopilot short-circuit never invokes the
+        // callback, so an auto-approved run generates no plan summary. Advisory — the
+        // helper swallows every failure.
+        let verdict = await ctx.gatePlan(approvedPlan, candidateMilestones, (planMd) =>
+          this.generateAndPostPlanSummary(ctx, planMd, prdInputP),
+        );
         let revisions = 0;
         while (verdict.kind === "revise") {
           const feedback = verdict.feedback;
@@ -1147,10 +1157,12 @@ export class SdkExecutor implements Executor {
           approvedPlan = turn.plan;
           // Decision 2: the candidate is REPLACED across a revision round.
           candidateMilestones = turn.milestones;
-          // PRD #362 M3c: a re-plan REGENERATES the plan summary (Decision 2), sent
-          // with the NEW approvedPlan as the stale-write guard value.
-          await this.generateAndPostPlanSummary(ctx, approvedPlan, prdInputP);
-          verdict = await ctx.gatePlan(approvedPlan, candidateMilestones);
+          // PRD #362 M3c: a re-plan REGENERATES the plan summary (Decision 2), fired from
+          // the gate's onAwaitingApproval callback (after the re-report persists the NEW
+          // plan_md) so its stale-write guard matches the new plan.
+          verdict = await ctx.gatePlan(approvedPlan, candidateMilestones, (planMd) =>
+            this.generateAndPostPlanSummary(ctx, planMd, prdInputP),
+          );
         }
         if (verdict.kind === "reject")
           throw new PlanRejectedError(verdict.reason);

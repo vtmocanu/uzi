@@ -183,8 +183,20 @@ export interface RunContext {
    * PRD #122 M1: the optional CANDIDATE milestone list rides the awaiting_approval
    * report so the human approves the breakdown too. Omitted/empty ⇒ no milestones on
    * the report (additive-optional; a run with no milestones is unchanged).
+   *
+   * PRD #362 M3c: `onAwaitingApproval` is an ADVISORY callback the gate invokes AFTER
+   * it persists `plan_md` (the awaiting_approval report) and BEFORE it blocks on the
+   * verdict. The plan-summary hook rides it: the summary's stale-write guard value is
+   * `runs.plan_md`, so the POST can only match once the gate has persisted it — posting
+   * before the gate always 409s against a NULL/previous plan_md and is silently dropped.
+   * It is NEVER invoked on the autopilot short-circuit (which never persists plan_md),
+   * so an auto-approved run generates no plan summary. The gate swallows any throw.
    */
-  gatePlan?(planMd: string, milestones?: Milestone[]): Promise<PlanVerdict>;
+  gatePlan?(
+    planMd: string,
+    milestones?: Milestone[],
+    onAwaitingApproval?: (planMd: string) => Promise<void>,
+  ): Promise<PlanVerdict>;
   /**
    * PRD #88 M1 clarification park. Called by the executor after a turn that made an
    * ask_user call: the runner emits the `question` run-message, posts /state
