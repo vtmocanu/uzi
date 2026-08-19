@@ -931,6 +931,9 @@ export class SdkExecutor implements Executor {
             issueIid: ctx.issueIid ?? 0,
             issueTitle: ctx.issueTitle,
             issueDescription: ctx.issueDescription,
+            // PRD #381: the snapshotted issue comments, rendered under a per-prompt
+            // nonce fence after <issue_description>. Absent/null/empty injects nothing.
+            issueComments: ctx.issueComments,
             branch: ctx.branch,
             subagentNames: planSubagentNames,
             subagentCanWrite,

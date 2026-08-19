@@ -470,6 +470,24 @@ export interface IterationBudget {
   wallSeconds?: number;
 }
 
+/** One human comment on the worked issue, snapshotted at run creation (PRD #381).
+ *  Bodies are UNTRUSTED, attacker-influenceable free text. */
+export interface IssueCommentSnapshot {
+  author_username: string;
+  author_forge_user_id: number;
+  /** RFC3339. */
+  created_at: string;
+  body: string;
+}
+
+/** The bounded, bot/system-filtered snapshot of the issue's human comments carried
+ *  on the claim (PRD #381). Absent for a comment-less issue, a non-issue kind, and a
+ *  connection with an unknown bot id (D9). `truncated` is set when the thread was clipped. */
+export interface IssueCommentsSnapshot {
+  comments: IssueCommentSnapshot[];
+  truncated: boolean;
+}
+
 /**
  * Response body of a successful (200) claim.
  *
@@ -490,6 +508,12 @@ export interface ClaimResponse {
    *  ci_fix run these carry a synthesized summary, not a real issue. */
   issue_title: string;
   issue_description: string;
+  /** PRD #381: the bounded, bot/system-filtered snapshot of the issue's human
+   *  comments, taken at run creation next to `issue_description`. Absent/null for a
+   *  comment-less issue, a non-issue kind, and a connection with an unknown bot id
+   *  (D9). The bodies are UNTRUSTED, multi-author, attacker-influenceable text;
+   *  prompt.ts renders them under a per-prompt nonce fence (D5). */
+  issue_comments?: IssueCommentsSnapshot | null;
   /** The failed-pipeline snapshot for a ci_fix run (PRD #6): what the agent
    *  diagnoses + fixes. Present only for kind="ci_fix". Log tails are UNTRUSTED
    *  data — quoted evidence, never instructions. */
