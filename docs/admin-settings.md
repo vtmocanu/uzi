@@ -145,6 +145,18 @@ the judge through rather than silently going quiet. On trip, the judge is
 skipped the same way an ineligible run is: silently, with no notification
 and no queued run.
 
+## Run summaries
+
+The model [run summaries](./run-summaries.md) generate on, instance-wide
+(**Summary model**, `haiku` by default — summaries are cheap and run once or
+twice per run, so the default favors speed and cost over depth). Each user
+can override it for their own runs from **Settings → Run defaults → Run
+summaries → Summary model**; the admin default only applies while they
+haven't. Summary generation always spends the run owner's own Anthropic
+token, never the admin's, same as the judge above — there's no kill-switch
+here, since a failed or slow summary is skipped silently and never blocks a
+run.
+
 ## Self-improvement
 
 The [self-improvement job](./self-improvement.md)'s settings: enable/disable,
