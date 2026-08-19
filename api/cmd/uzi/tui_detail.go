@@ -85,11 +85,22 @@ func (d *detailState) applyLoaded(msg detailLoadedMsg) {
 // log — the transcript is fed by the stream/replay, this only refreshes the non-streamed
 // fields (milestones, health, kind, title, lifecycle stamps). Ignored until the initial
 // load has set the baseline, so a poll racing the first full load cannot flip `loaded`.
+//
+// Status is DELIBERATELY preserved rather than overwritten: the live stream owns it
+// (applyEvents sets it from authoritative `state` frames, including StreamRun's reconcile),
+// and applyMeta only runs while the stream is healthy (the dispatch guards on !polling).
+// Overwriting it would let a GetRun response that was in flight across a status transition
+// revert the status for up to one 2s tick — e.g. dropping the plan-gate banner and its owner
+// keys the instant a run enters awaiting_approval, or flipping a just-finished run back to
+// running. When the stream is down the poll-fallback path (loadDetailCmd/applyLoaded) owns
+// status instead, so nothing goes stale.
 func (d *detailState) applyMeta(run apitypes.RunDTO) {
 	if !d.loaded {
 		return
 	}
+	status := d.run.Status
 	d.run = run
+	d.run.Status = status
 }
 
 // applyEvents folds a batch in and reports whether the steer queue was signalled
@@ -178,8 +189,12 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 		return m, m.loadDetailCmd(m.detail.runID)
 	case keyCollapseCrew:
 		// Fold / unfold the crew list so the milestone block below it is always reachable
-		// (the rail is height-clamped and does not scroll).
-		m.detail.railCollapsed = !m.detail.railCollapsed
+		// (the rail is height-clamped and does not scroll). No-op with no lanes: there is
+		// nothing to fold and the caret/hint are hidden, so toggling would only leave a run
+		// that later gains lanes silently opening collapsed.
+		if len(m.detail.lanes) > 0 {
+			m.detail.railCollapsed = !m.detail.railCollapsed
+		}
 		return m, nil
 	case keyTab:
 		// tab cycles focus between the two panes.
@@ -296,7 +311,11 @@ func (m tuiModel) renderDetail() string {
 	if tag := m.transportHeaderTag(); tag != "" {
 		head += "  " + tag
 	}
-	sb.WriteString(head + "\n")
+	// Clamp to the terminal width so the header is always exactly ONE physical row. It is
+	// otherwise unbounded (a long title, plus the duration and the folded transport tag), and
+	// a wrap would make transcriptViewport — which counts the header as one row — under-count
+	// and push the footer off the bottom, the #379 invariant this view protects.
+	sb.WriteString(clampVisual(head, m.width) + "\n")
 
 	// The park line (PRD #35). The status word alone is already in the header, and it
 	// is not enough: "limit_wait" tells a user their run stopped and nothing about
@@ -317,7 +336,7 @@ func (m tuiModel) renderDetail() string {
 	// must see WHY it is stale. The healthy/transient states ("live", "connecting…") are the
 	// header tag above; only a degradation takes a full row here, where its longer text fits.
 	if tline := m.transportLine(); tline != "" {
-		sb.WriteString(tline + "\n")
+		sb.WriteString(clampVisual(tline, m.width) + "\n") // one physical row (a long streamErr must not wrap)
 	}
 	sb.WriteString("\n")
 
@@ -349,7 +368,7 @@ func (m tuiModel) renderDetail() string {
 		sb.WriteString(steer + "\n")
 	}
 	if m.detail.steer.mode == steerIdle {
-		sb.WriteString(m.detailFooter())
+		sb.WriteString(clampVisual(m.detailFooter(), m.width)) // one physical row on a narrow terminal
 	}
 	return sb.String()
 }
@@ -360,6 +379,13 @@ func (m tuiModel) renderDetail() string {
 // two are mutually exclusive, so exactly one of them is non-empty for any transport state.
 func (m tuiModel) transportHeaderTag() string {
 	d := &m.detail
+	// A terminal run will never produce more output, so it carries no transport chrome at all
+	// (neither this tag nor transportLine): "connecting…"/"reconnecting…" on a completed run is
+	// noise. The stream still opens to replay history, then closes — that close must not read as
+	// a degradation here.
+	if isTerminalRunStatus(d.run.Status) {
+		return ""
+	}
 	switch {
 	case d.streamErr != nil && d.polling, d.polling:
 		return "" // degraded: shown on its own line by transportLine
@@ -377,6 +403,11 @@ func (m tuiModel) transportHeaderTag() string {
 // calls it to keep the chrome accounting and the render in lockstep.
 func (m tuiModel) transportLine() string {
 	d := &m.detail
+	// A terminal run shows no transport chrome (see transportHeaderTag): its stream closing is
+	// expected, not a degradation to reconnect from.
+	if isTerminalRunStatus(d.run.Status) {
+		return ""
+	}
 	switch {
 	case d.streamErr != nil && d.polling:
 		return m.pal.faint.Render("live stream unavailable (" + fmtErr(d.streamErr) + ") — falling back to a 2s refresh")
@@ -843,21 +874,22 @@ func padVisual(s string, n int) string {
 // the whole time.
 func visualWidth(s string) int { return lipgloss.Width(s) }
 
-// runDuration is the run's elapsed wall time for the header: a live run's time since it
-// started, or a terminal run's total from start to finish. Start is the first set of
-// StartedAt / ClaimedAt / CreatedAt (in that precedence); end is FinishedAt when set, else
-// now. Empty when no start stamp is known, so a DTO without timestamps (or still queued)
-// shows nothing rather than a bogus "0s".
+// runDuration is the run's elapsed WORK time for the header: a live run's time since it
+// started, or a terminal run's total from start to finish. Start is StartedAt, or ClaimedAt
+// during the brief claimed-but-not-started window; end is FinishedAt when set, else now.
+//
+// CreatedAt is deliberately NOT a fallback: it would turn a queued run's header into its
+// queue-WAIT age dressed up as run-elapsed time (and a just-created run into a literal "0s"),
+// conflating two different clocks. A run with no start stamp yet (queued) shows nothing.
 func runDuration(run apitypes.RunDTO, now time.Time) string {
-	start := run.CreatedAt
-	if run.ClaimedAt != nil && !run.ClaimedAt.IsZero() {
-		start = *run.ClaimedAt
-	}
-	if run.StartedAt != nil && !run.StartedAt.IsZero() {
+	var start time.Time
+	switch {
+	case run.StartedAt != nil && !run.StartedAt.IsZero():
 		start = *run.StartedAt
-	}
-	if start.IsZero() {
-		return ""
+	case run.ClaimedAt != nil && !run.ClaimedAt.IsZero():
+		start = *run.ClaimedAt
+	default:
+		return "" // not started yet: no work-elapsed time to show
 	}
 	end := now
 	if run.FinishedAt != nil && !run.FinishedAt.IsZero() {

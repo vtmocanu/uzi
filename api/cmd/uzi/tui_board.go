@@ -220,7 +220,19 @@ const (
 )
 
 // boardShowMile reports whether the terminal is wide enough for the MILE column (issue #379).
-func (m tuiModel) boardShowMile() bool { return m.width >= boardMileMinWidth }
+//
+// boardMileMinWidth is calibrated against the NON-admin row prefix. The admin board carries an
+// extra OWNER column, so its prefix is boardOwnerWidth+2 cols wider and the same MILE tax
+// overflows the floored title at widths 90-91 (#380 review). Shift the admin threshold up by
+// exactly that extra prefix so the column drops on a narrow admin board instead of clipping —
+// milestone progress is still on the run-detail view.
+func (m tuiModel) boardShowMile() bool {
+	min := boardMileMinWidth
+	if m.board.admin {
+		min += boardRowPrefixWidth(true, true) - boardRowPrefixWidth(false, true)
+	}
+	return m.width >= min
+}
 
 func boardRuleWidth(w int) int {
 	if w < 2 {
