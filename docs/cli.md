@@ -384,7 +384,12 @@ also the TUI's own fallback when the live channel is unreachable (below).
   run (one planned from a `PRD`-labelled issue) carries a compact `MILE` column
   between AGE and TITLE showing `M{done}/{total}` (or `M–/N` when nothing has
   been reported complete yet); the column is hidden on a narrow terminal, and
-  the full breakdown is on the run detail view.
+  the full breakdown is on the run detail view. `[h]` hides finished runs
+  (completed/failed/cancelled), leaving the active and needs-you runs. The list
+  windows to the terminal height so the header and key legend stay on screen
+  however many runs there are, with a position readout (`N–M of T`) top-right;
+  the whole board refreshes on the poll, so STATUS, HEALTH, MILE, AGE and the
+  judge verdict stay live.
 - **Run detail** (`[enter]` from the board, or `uzi tui <run-id>` directly).
   A left rail of agent lanes — the lead plus each live subagent, one lane per
   invocation, each with a status dot — beside the selected lane's transcript,
@@ -409,6 +414,7 @@ g            detail: follow live — re-attach and jump to the newest output (li
 enter        open the selected run (board)
 /            filter the board
 a            toggle the factory-wide admin board (board only)
+h            hide finished runs — completed/failed/cancelled, keeps active + needs-you (board only; no-op on the admin board)
 r            refresh
 v            open/close the review overlay (detail)
 f            start a follow-up (detail, owner only)
@@ -416,7 +422,7 @@ y/n          approve/reject, at a plan gate (detail, owner only)
 x            cancel the run, asks to confirm (detail, owner only)
 esc          back out / dismiss
 ?            this help
-q            quit — asks to confirm; a second ctrl+c quits at once
+q            quit immediately; ctrl+c asks to confirm, and a second ctrl+c quits at once
 ```
 
 The run detail view has **two focusable panes**: the crew rail (one lane per
@@ -432,12 +438,13 @@ lines are below the fold) and the view holds still so you can read — and `g`
 (or scrolling back to the bottom) re-attaches and jumps to the newest output.
 Only a live run follows; a finished run's transcript is static.
 
-Note what isn't here: there's no `[a]`-for-approve and no bare `[q]`-quits —
-early drafts of this feature used both, but `[a]` doubling as admin-toggle
+Note what isn't here: there's no `[a]`-for-approve —
+early drafts of this feature used it, but `[a]` doubling as admin-toggle
 *and* approve would put "approve a plan" one keystroke from `[x]` cancel on
 a live run, so approve/reject moved to `y`/`n` and `a` stayed admin-only.
-Quitting always asks first (`q` or `ctrl+c`); a second `ctrl+c` is the
-escape hatch when the confirm prompt itself is what's stuck.
+`[q]` quits immediately; `ctrl+c` asks first (so a stray `ctrl+c` can't drop a
+watched run), and a second `ctrl+c` is the escape hatch when the confirm
+prompt itself is what's stuck.
 
 **A run parked on a clarifying question (`awaiting_input`) has no in-TUI
 composer** — it renders the same "blocked on a human" waiting treatment a
@@ -813,6 +820,16 @@ the PRD-link patch lifecycle has settled, an empty line while still
 pending). Both are emit-only-when-set on the human view too — `run get`
 prints them as `PRD_MOVE` and `PRD_PATCH_SETTLED_AT` rows only when the run
 has declared a move — and appear the same way under `--json`.
+
+`run get` also prints the [run summaries](./run-summaries.md), when they've
+landed: an `INTENT` row (what the run will implement), a `PLAN SUMMARY` row
+(what the proposed or approved plan will do), and one `DELTA` row per way
+the plan diverged from the original ask. All three are emit-only-when-set —
+a pre-feature run or one still queued prints none of them, and a seeded run
+(one that skipped planning) prints its `INTENT` row but no `PLAN SUMMARY` or
+`DELTA` rows. The scalar two are readable individually with
+`--field summary_intent` / `--field summary_plan`; `summary_deltas` is an
+array, so read it with `--json` instead.
 
 ### Run status, and what `--follow` waits for
 

@@ -56,7 +56,8 @@ import { SteerQueueCard } from "../components/SteerQueueCard";
 import { QuestionPanel, UnreadableQuestion } from "../components/QuestionPanel";
 import { deriveOpenQuestion } from "../lib/runQuestion";
 import { Markdown } from "../components/Markdown";
-import { Alert, Badge, Button, Card, Input, PageHeader, Select, Spinner, StatusPill, Textarea, cx } from "../components/ui";
+import { Alert, Badge, Button, Card, Input, PageHeader, Select, Spinner, StatusPill, Textarea, cx, type BadgeTone } from "../components/ui";
+import { summaryCollapse } from "../lib/prefs";
 import { ExternalLinkIcon, FileTextIcon } from "../components/icons";
 
 // stageForMessages: latest-message → human stage label (multica's
@@ -243,6 +244,122 @@ export function MilestoneChecklist({ run }: { run: Run }) {
           );
         })}
       </ul>
+    </Card>
+  );
+}
+
+// PRD #362 M4: one delta's kind → its badge tone, glyph and label. added is a green +,
+// changed a blue ~, dropped a red − — so the three read apart by shape AND colour, not
+// colour alone (Decision 6 wants them "visually distinct"). An unexpected kind (the server
+// validates the enum on persist, Decision 6, so this should not happen) falls back to a
+// neutral bullet rather than crashing the list.
+const DELTA_KIND: Record<string, { tone: BadgeTone; glyph: string; label: string }> = {
+  added: { tone: "ok", glyph: "+", label: "added" },
+  changed: { tone: "info", glyph: "~", label: "changed" },
+  dropped: { tone: "danger", glyph: "−", label: "dropped" },
+};
+
+/**
+ * PRD #362 M4 (Decisions 2/6/9/10): the run-summary cards — the intent summary ("what this
+ * run will implement"), the plan summary (labelled proposed/approved from run status,
+ * Decision 2 — never regenerated), and the plan's deltas from the original ask (Decision 6).
+ *
+ * Rendered ONLY once a summary exists; until then this returns null and the issue-title
+ * header (RunHeading) stands as the fallback (Decision 1's accepted consequence, and the
+ * seeded/pre-approved intent-only shape of Decision 5). Live update rides the existing
+ * useRunStream: M1 emits a run-updated WS frame on summary persist, so refreshRun re-reads
+ * the DTO and this re-renders with no code here.
+ *
+ * The whole section is collapsible and the choice is remembered PER RUN for 7 days via
+ * summaryCollapse (Decision 9); default expanded. All summary text is UNTRUSTED — model
+ * output over an attacker-influenceable issue/PRD/plan — and is rendered as escaped plain
+ * text through stripUnsafeChars, NEVER <Markdown> (Decision 10), the same rule report_md and
+ * the judge summary_md follow.
+ *
+ * Exported for a direct render test: RunView itself needs routing, a live stream and a dozen
+ * API mocks to mount, so the card states could not otherwise be asserted.
+ */
+export function RunSummary({ run }: { run: Run }) {
+  // The persisted per-run collapse choice, read once on mount (default expanded).
+  const [collapsed, setCollapsed] = useState(() => summaryCollapse.getCollapsed(run.id));
+
+  const intent = typeof run.summary_intent === "string" ? run.summary_intent.trim() : "";
+  const plan = typeof run.summary_plan === "string" ? run.summary_plan.trim() : "";
+  // Decision 6 (tolerate-on-read): anything that is not an array is treated as no-deltas,
+  // never a crash. The server already coerces malformed jsonb to null (M1); this is the
+  // defensive second line for a hand-built or future-shaped value reaching the renderer.
+  const deltas = Array.isArray(run.summary_deltas) ? run.summary_deltas : [];
+  const hasIntent = intent !== "";
+  const hasPlan = plan !== "";
+
+  // Nothing to show yet — the issue-title header stands (Decision 1/5).
+  if (!hasIntent && !hasPlan) return null;
+
+  const toggle = () => {
+    const next = !collapsed;
+    setCollapsed(next);
+    summaryCollapse.setCollapsed(run.id, next);
+  };
+
+  // Decision 2: label derived from run status, never regenerated. "Proposed" at the gate,
+  // "Approved" once the run is past it (a plan summary present on any non-gate status).
+  const planLabel = run.status === "awaiting_approval" ? "Proposed plan" : "Approved plan";
+
+  return (
+    <Card className="space-y-4 p-4">
+      <div className="flex items-center justify-between gap-2">
+        <h2 className="text-sm font-semibold text-fg">Run summary</h2>
+        <button
+          type="button"
+          onClick={toggle}
+          aria-expanded={!collapsed}
+          className="text-xs font-medium text-muted transition-colors hover:text-fg"
+        >
+          {collapsed ? "Expand" : "Collapse"}
+        </button>
+      </div>
+
+      {!collapsed && (
+        <div className="space-y-4">
+          {hasIntent && (
+            <section className="space-y-1">
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-faint">
+                What this run will implement
+              </h3>
+              <p className="whitespace-pre-wrap text-sm text-muted">{stripUnsafeChars(intent)}</p>
+            </section>
+          )}
+
+          {hasPlan && (
+            <section className="space-y-2">
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-faint">{planLabel}</h3>
+              <p className="whitespace-pre-wrap text-sm text-muted">{stripUnsafeChars(plan)}</p>
+
+              {/* Decision 6: the plan's deltas from the original ask, or a plain
+                  "no deviations" line when the plan matches it (empty array or null). */}
+              {deltas.length === 0 ? (
+                <p className="text-sm italic text-faint">No deviations — the plan matches the original ask</p>
+              ) : (
+                <ul className="space-y-1.5">
+                  {deltas.map((d, i) => {
+                    const kind = DELTA_KIND[d?.kind] ?? { tone: "neutral" as BadgeTone, glyph: "•", label: "note" };
+                    return (
+                      <li key={`${i}-${kind.label}`} className="flex items-start gap-2 text-sm">
+                        <Badge tone={kind.tone} title={kind.label}>
+                          <span aria-hidden="true">{kind.glyph}</span> {kind.label}
+                        </Badge>
+                        <span className="min-w-0 flex-1 whitespace-pre-wrap text-muted">
+                          {stripUnsafeChars(typeof d?.text === "string" ? d.text : "")}
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </section>
+          )}
+        </div>
+      )}
     </Card>
   );
 }
@@ -744,6 +861,11 @@ export function RunView() {
           })
         }
       />
+
+      {/* PRD #362 M4: the plain-English run summary — intent, proposed/approved plan, and
+          deltas from the original ask. Self-hides until a summary lands (the issue-title
+          header carries the run until then), collapsible + remembered per run. */}
+      <RunSummary run={run} />
 
       {/* Terminal hero: the outcome, front and center. */}
       {run.status === "completed" && (

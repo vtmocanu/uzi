@@ -714,6 +714,13 @@ export class RunRunner {
         defaultBranchCommit: runnerClone.defaultBranchCommit,
         emit: (m) => batcher.emit(m),
         oauthToken: claim.secrets.anthropic_oauth_token,
+        // PRD #362 M3c: the run-summary model resolved server-side (user-value-wins),
+        // and whether the intent summary is already set so the executor skips
+        // re-generating it on a resume/re-claim (Decision 3). Both absent on older
+        // servers, which the summary hooks tolerate (undefined model → account default,
+        // false present → generate).
+        summaryModel: claim.summary_model ?? undefined,
+        summaryIntentPresent: claim.summary_intent_present ?? false,
         agents: claim.agents,
         repoAgents,
         skills: claim.skills,
@@ -762,7 +769,7 @@ export class RunRunner {
         // verdict the steering channel resolves (bounded so an abandoned plan
         // fails rather than wedging the worker). An autopilot claim short-circuits
         // to an approve verdict (see gatePlan) — the run never parks at the gate.
-        gatePlan: async (planMd, milestones) => {
+        gatePlan: async (planMd, milestones, onAwaitingApproval) => {
           // PRD #71 M5: a CI-config-classified ci_fix plan must NOT take the auto-approve
           // short-circuit — it parks for human review even on an auto-triggered run. We
           // force the gate by passing autoApprove=false for that case; gatePlan is otherwise
@@ -779,6 +786,7 @@ export class RunRunner {
             runLog,
             effectiveAutoApprove,
             repoAgents,
+            onAwaitingApproval,
           );
           // Human-in-the-loop iff the plan reached an approve verdict via the PARK path
           // (not the auto short-circuit). Read by the pre-push guard below.
@@ -1880,6 +1888,10 @@ export class RunRunner {
     runLog: Logger,
     autoApprove: boolean,
     repoAgents: AgentTemplate[],
+    // PRD #362 M3c: advisory hook fired AFTER the awaiting_approval report persists
+    // plan_md, BEFORE the verdict wait (see the RunContext.gatePlan doc). Never reached
+    // on the autopilot branch, which returns above without persisting plan_md.
+    onAwaitingApproval?: (planMd: string) => Promise<void>,
   ): Promise<PlanVerdict> {
     batcher.emit({ kind: "plan", agent: "lead", payload: { plan_md: planMd } });
     // Get the plan message onto the stream regardless of mode — it is the audit
@@ -1957,6 +1969,23 @@ export class RunRunner {
       run_id: runId,
       gate_epoch: epoch,
     });
+
+    // PRD #362 M3c: plan_md is now persisted (the awaiting_approval report above), so the
+    // plan-summary POST's stale-write guard (`plan_md = @expected`) can match. Fire the
+    // hook HERE — after persist, before the verdict wait — never on the autopilot branch,
+    // which returned above without persisting plan_md. ADVISORY: swallow any throw so a
+    // summary failure can never wedge the gate or change the run's outcome (the hook
+    // itself also swallows internally; this is belt-and-suspenders).
+    if (onAwaitingApproval) {
+      try {
+        await onAwaitingApproval(planMd);
+      } catch (e) {
+        runLog.warn("plan summary hook failed", {
+          run_id: runId,
+          error: errMessage(e),
+        });
+      }
+    }
 
     // A terminal verdict ends the gate → clear the shared per-run gate state. A revise
     // keeps the shared budget/epoch state running; the re-report above does the bump.

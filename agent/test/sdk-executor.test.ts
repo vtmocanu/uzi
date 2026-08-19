@@ -12,6 +12,13 @@ import type { JsDepsResult } from "../src/js-deps.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { FINDINGS_SERVER_NAME } from "../src/findings-tools.js";
 import type { WorkerClient } from "../src/client.js";
+import type {
+  SummaryRunner,
+  IntentSummaryInput,
+  PlanSummaryInput,
+  PlanSummaryResult,
+  Delta,
+} from "../src/summary-runner.js";
 import { nullLogger } from "./helpers.js";
 
 // A worktree path that is UNIQUE PER PROCESS AND PER CALL, and that deliberately
@@ -151,6 +158,10 @@ interface CtxProbe {
   sessionIds: string[];
   gated: string[];
   iterations: number[];
+  // PRD #362 M3c: the plan_md the fake gate has "persisted" (the awaiting_approval
+  // report). null until the first gate call. A guard-enforcing fake client reads this to
+  // model the server's stale-write guard (`plan_md = @expected`).
+  persisted: { planMd: string | null };
 }
 
 function makeCtx(
@@ -161,6 +172,7 @@ function makeCtx(
   const sessionIds: string[] = [];
   const gated: string[] = [];
   const iterations: number[] = [];
+  const persisted: { planMd: string | null } = { planMd: null };
   // A SEQUENCE of verdicts (PRD #41): the gate loop calls gatePlan once per round, so
   // tests script [revise, …, approve/reject/cancel]. The last entry sticks for any
   // further calls. A bare verdict behaves as a one-element sequence (unchanged).
@@ -179,8 +191,22 @@ function makeCtx(
     config: null,
     sessionId: null,
     onSessionId: (s) => sessionIds.push(s),
-    gatePlan: async (planMd) => {
+    // PRD #362 M3c: model the real gate's ordering — persist plan_md (the awaiting_approval
+    // report) THEN invoke the onAwaitingApproval hook (which posts the plan summary) BEFORE
+    // returning the verdict. The plan-summary POST's stale-write guard reads runs.plan_md,
+    // so it can only match once plan_md is persisted; this fake reproduces that ordering so
+    // the summary tests exercise the same sequence production does. The hook is swallowed
+    // here exactly as the real gate swallows it, so a throwing hook never fails the gate.
+    gatePlan: async (planMd, _milestones, onAwaitingApproval) => {
       gated.push(planMd);
+      persisted.planMd = planMd;
+      if (onAwaitingApproval) {
+        try {
+          await onAwaitingApproval(planMd);
+        } catch {
+          /* advisory — a summary failure never blocks the gate */
+        }
+      }
       const v = verdicts[Math.min(gateCall, verdicts.length - 1)]!;
       gateCall++;
       return v;
@@ -191,7 +217,7 @@ function makeCtx(
     },
     ...overrides,
   };
-  return { ctx, emits, sessionIds, gated, iterations };
+  return { ctx, emits, sessionIds, gated, iterations, persisted };
 }
 
 beforeEach(() => {
@@ -3093,4 +3119,269 @@ describe("plan-turn drop of a write-only allowlist (#203)", () => {
     const statuses = probe.emits.filter((m) => m.kind === "status").map((m) => String(m.payload["text"]));
     assert.ok(!statuses.some((t) => t.includes("file-writing only")), statuses.join("\n"));
   });
+});
+
+describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
+  // A recording fake SummaryRunner + client. Both hooks are ADVISORY, so the fakes let
+  // each test drive the generator/post to succeed, return null, or throw, and prove the
+  // executor's terminal path is unchanged either way. `intentPosted` resolves the moment
+  // postIntentSummary is called, so the fire-and-forget intent hook can be awaited
+  // deterministically where a post is expected (never awaited where none is).
+  interface SummaryBehavior {
+    generateIntent?: () => Promise<string | null>;
+    generatePlan?: () => Promise<PlanSummaryResult | null>;
+    postIntent?: () => Promise<void>;
+    postPlan?: () => Promise<void>;
+  }
+  function summaryFakes(behavior: SummaryBehavior = {}) {
+    const rec = {
+      intentCalls: [] as IntentSummaryInput[],
+      planCalls: [] as PlanSummaryInput[],
+      intentPosts: [] as string[],
+      planPosts: [] as { summary: string; deltas: Delta[]; plan_md: string }[],
+    };
+    let resolveIntentPosted!: () => void;
+    const intentPosted = new Promise<void>((r) => {
+      resolveIntentPosted = r;
+    });
+    const runner = {
+      async generateIntentSummary(input: IntentSummaryInput): Promise<string | null> {
+        rec.intentCalls.push(input);
+        return behavior.generateIntent ? behavior.generateIntent() : "INTENT SUMMARY";
+      },
+      async generatePlanSummary(input: PlanSummaryInput): Promise<PlanSummaryResult | null> {
+        rec.planCalls.push(input);
+        return behavior.generatePlan
+          ? behavior.generatePlan()
+          : { summary: "PLAN SUMMARY", deltas: [{ kind: "added", text: "a caching layer" }] };
+      },
+    } as unknown as SummaryRunner;
+    const client = {
+      async postIntentSummary(_runId: string, summary: string): Promise<void> {
+        rec.intentPosts.push(summary);
+        if (behavior.postIntent) await behavior.postIntent();
+        resolveIntentPosted();
+      },
+      async postPlanSummary(
+        _runId: string,
+        body: { summary: string; deltas: Delta[]; plan_md: string },
+      ): Promise<void> {
+        rec.planPosts.push(body);
+        if (behavior.postPlan) await behavior.postPlan();
+      },
+    } as unknown as WorkerClient;
+    return { runner, client, rec, intentPosted };
+  }
+
+  // ── Failure isolation (Decision, criterion 4) — the load-bearing test ─────────
+  // A throwing generator / throwing (or 409/400) post on the BLOCKING plan path must
+  // NOT propagate: the run still reaches implement and reports the branch.
+  for (const [name, behavior] of [
+    ["the plan generator throws", { generatePlan: () => Promise.reject(new Error("model exploded")) }],
+    ["the intent generator throws", { generateIntent: () => Promise.reject(new Error("model exploded")) }],
+    ["postPlanSummary throws (e.g. 409 stale)", { postPlan: () => Promise.reject(new Error("409 stale plan")) }],
+    ["postIntentSummary throws (e.g. 400)", { postIntent: () => Promise.reject(new Error("400 bad")) }],
+  ] as [string, SummaryBehavior][]) {
+    it(`reaches implement/terminal unchanged when ${name}`, async () => {
+      const { queryFn } = fakeTurns([
+        [submitPlan("# The Plan\n- step 1"), resultSuccess()],
+        [assistantText("implementing"), signalDone(), resultSuccess()],
+      ]);
+      const { runner, client } = summaryFakes(behavior);
+      const probe = makeCtx({ agents: [lead, coder, reviewer] });
+      const result = await new SdkExecutor(nullLogger(), homeDir, {
+        queryFn,
+        client,
+        summaryRunner: runner,
+      }).run(probe.ctx);
+      // The run completed exactly as a summary-less run would.
+      assert.strictEqual(result.branch, "agent/issue-5");
+      assert.deepStrictEqual(probe.gated, ["# The Plan\n- step 1"], "the gate still saw the plan");
+      assert.deepStrictEqual(probe.iterations, [1], "the implement loop still ran");
+    });
+  }
+
+  // ── Intent skip on resume (Decision 3) ───────────────────────────────────────
+  it("does NOT generate or post an intent summary when one is already present", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const { runner, client, rec } = summaryFakes();
+    const probe = makeCtx({ agents: [lead, coder], summaryIntentPresent: true });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, client, summaryRunner: runner }).run(probe.ctx);
+    assert.deepStrictEqual(rec.intentCalls, [], "intent generation must be skipped on a resume");
+    assert.deepStrictEqual(rec.intentPosts, [], "no intent post on a resume");
+    // The plan hook is unaffected by the intent skip — it still ran.
+    assert.strictEqual(rec.planCalls.length, 1, "the plan hook still fires");
+  });
+
+  // ── Intent fires once, async, and posts the result ───────────────────────────
+  it("generates the intent summary and posts it on a fresh issue run", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const { runner, client, rec, intentPosted } = summaryFakes({
+      generateIntent: () => Promise.resolve("what this run will do"),
+    });
+    const probe = makeCtx({ agents: [lead, coder] });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, client, summaryRunner: runner }).run(probe.ctx);
+    // Fire-and-forget: awaited here only so the assertion is deterministic.
+    await intentPosted;
+    assert.strictEqual(rec.intentCalls.length, 1, "intent generated exactly once");
+    assert.deepStrictEqual(rec.intentPosts, ["what this run will do"], "posted the generated intent");
+    assert.strictEqual(rec.intentCalls[0]!.issueTitle, "Fix login");
+  });
+
+  it("does NOT delay planning on the intent generation (fire-and-forget)", async () => {
+    // The intent generator NEVER resolves. If the intent hook were awaited, the run
+    // could never reach the gate; it does, proving planning proceeds independently.
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const { runner, client, rec } = summaryFakes({
+      generateIntent: () => new Promise<string | null>(() => {}), // pending forever
+    });
+    const probe = makeCtx({ agents: [lead, coder] });
+    const result = await new SdkExecutor(nullLogger(), homeDir, {
+      queryFn,
+      client,
+      summaryRunner: runner,
+    }).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5", "the run completed despite a hung intent generator");
+    assert.strictEqual(rec.intentCalls.length, 1, "intent generation WAS kicked off");
+    assert.deepStrictEqual(rec.intentPosts, [], "but never posted (still pending) — planning did not wait");
+    // The plan summary still generated + posted (the blocking path is independent).
+    assert.strictEqual(rec.planPosts.length, 1);
+  });
+
+  // ── Plan hook fires per revise round (Decision 2) ─────────────────────────────
+  it("generates + posts a plan summary for the initial plan AND each revised plan", async () => {
+    const revise = (feedback: string): PlanVerdict => ({ kind: "revise", feedback });
+    const approve: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan v1"), resultSuccess()],
+      [submitPlan("# Plan v2"), resultSuccess()],
+      [assistantText("implementing"), signalDone(), resultSuccess()],
+    ]);
+    const { runner, client, rec } = summaryFakes();
+    const probe = makeCtx({ agents: [lead, coder, reviewer] }, [revise("add a rollback step"), approve]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, client, summaryRunner: runner }).run(probe.ctx);
+    // Two rounds → two generations + two posts, each carrying the plan_md the gate saw.
+    assert.strictEqual(rec.planCalls.length, 2, "one plan generation per revise round");
+    assert.deepStrictEqual(
+      rec.planPosts.map((p) => p.plan_md),
+      ["# Plan v1", "# Plan v2"],
+      "each post carries the corresponding plan_md as the stale-write guard value",
+    );
+    assert.deepStrictEqual(rec.planCalls.map((c) => c.planMd), ["# Plan v1", "# Plan v2"]);
+  });
+
+  // ── REGRESSION (code review PR #387, finding 1): POST after plan_md is persisted ──
+  // The plan summary carries `plan_md` as the server's stale-write guard value, so the
+  // write only lands once the gate has persisted plan_md (the awaiting_approval report).
+  // An earlier revision POSTed the summary BEFORE calling ctx.gatePlan, so the guard
+  // matched 0 rows (plan_md still NULL / the previous plan) → 409 → the whole plan-summary
+  // half of the feature was silently dropped, invisibly to CI. This models the guard: the
+  // fake client rejects a post whose plan_md is not the currently-persisted one. It passes
+  // only because the summary now fires from the gate's onAwaitingApproval callback, after
+  // persist. Move the POST back before the gate and this test 409s and fails.
+  it("posts the plan summary only AFTER plan_md is persisted, so a guard-enforcing server accepts it", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# The Plan\n- step 1"), resultSuccess()],
+      [assistantText("implementing"), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    const planPosts: { summary: string; deltas: Delta[]; plan_md: string }[] = [];
+    const runner = {
+      async generateIntentSummary(): Promise<string | null> {
+        return "INTENT";
+      },
+      async generatePlanSummary(): Promise<PlanSummaryResult | null> {
+        return { summary: "PLAN SUMMARY", deltas: [{ kind: "added", text: "a step" }] };
+      },
+    } as unknown as SummaryRunner;
+    const client = {
+      async postIntentSummary(): Promise<void> {},
+      async postPlanSummary(
+        _runId: string,
+        body: { summary: string; deltas: Delta[]; plan_md: string },
+      ): Promise<void> {
+        // Model the server's Decision-3 stale-write guard: `plan_md = @expected` matches
+        // only when the posted plan_md still equals the row's persisted plan_md.
+        if (probe.persisted.planMd !== body.plan_md) {
+          throw new Error(
+            `409 stale plan: posted ${JSON.stringify(body.plan_md)} but persisted ${JSON.stringify(probe.persisted.planMd)}`,
+          );
+        }
+        planPosts.push(body);
+      },
+    } as unknown as WorkerClient;
+    await new SdkExecutor(nullLogger(), homeDir, {
+      queryFn,
+      client,
+      summaryRunner: runner,
+    }).run(probe.ctx);
+    assert.strictEqual(
+      planPosts.length,
+      1,
+      "the plan summary landed — posted after plan_md was persisted, so the guard matched",
+    );
+    assert.strictEqual(planPosts[0]!.plan_md, "# The Plan\n- step 1");
+  });
+
+  // ── Seeded / pre-approved → intent only (Decision 5) ─────────────────────────
+  it("a seeded (pre-approved) run posts an intent summary but NEVER a plan summary", async () => {
+    const { queryFn } = fakeTurns([[signalDone(), resultSuccess()]]); // implement only, no planning
+    const { runner, client, rec, intentPosted } = summaryFakes();
+    const probe = makeCtx({
+      agents: [lead, coder],
+      planApproved: true,
+      seeded: true,
+      sessionId: null,
+      approvedPlan: "# User-authored plan\nship it",
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, client, summaryRunner: runner }).run(probe.ctx);
+    await intentPosted;
+    assert.deepStrictEqual(probe.gated, [], "a seeded run never reaches the gate");
+    assert.strictEqual(rec.intentPosts.length, 1, "the intent summary still lands (Decision 5)");
+    assert.deepStrictEqual(rec.planCalls, [], "no plan generation on a gate-less seeded run");
+    assert.deepStrictEqual(rec.planPosts, [], "and therefore no plan post");
+  });
+
+  // ── Issue-only (never on ci_fix / self_improve) ──────────────────────────────
+  for (const kind of ["ci_fix", "self_improve"] as const) {
+    it(`a ${kind} run posts NEITHER an intent nor a plan summary`, async () => {
+      const { queryFn } = fakeTurns([
+        [submitPlan("# Plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const { runner, client, rec } = summaryFakes();
+      // ci_fix needs a pipeline snapshot to be recognised as such; either way the
+      // summary guard keys on kind, so nothing is generated or posted.
+      const overrides: Partial<RunContext> =
+        kind === "ci_fix"
+          ? {
+              kind,
+              pipeline: {
+                id: 1,
+                ref: "main",
+                sha: "deadbeef",
+                web_url: "https://example.test/p/1",
+                failed_jobs: [
+                  { name: "test", stage: "test", web_url: "https://example.test/j/1", log_tail: "boom" },
+                ],
+              },
+            }
+          : { kind };
+      const probe = makeCtx(overrides);
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn, client, summaryRunner: runner }).run(probe.ctx);
+      assert.deepStrictEqual(rec.intentCalls, [], `${kind}: no intent generation`);
+      assert.deepStrictEqual(rec.intentPosts, [], `${kind}: no intent post`);
+      assert.deepStrictEqual(rec.planCalls, [], `${kind}: no plan generation`);
+      assert.deepStrictEqual(rec.planPosts, [], `${kind}: no plan post`);
+    });
+  }
 });

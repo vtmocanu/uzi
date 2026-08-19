@@ -83,6 +83,10 @@ export interface UserSettings {
    *  judge_model (which itself falls back to opus). Written through PUT /me/settings
    *  alongside default_model, validated by the same model rules. */
   judge_model: string | null;
+  /** Per-user run-summary model override (PRD #362 M2); null means inherit the
+   *  instance summary_model (which itself falls back to haiku). Written through
+   *  PUT /me/settings alongside judge_model, validated by the same model rules. */
+  summary_model: string | null;
   theme: string | null;
   /** Ids of NON-default tokens whose rate meters the user also wants on the
    *  sidebar rail. The default token always shows and is never listed here.
@@ -97,6 +101,8 @@ export interface UserSettingsPatch {
   default_model?: string | null;
   /** Per-user judge model (PRD #69 M2); present-null clears back to inherit. */
   judge_model?: string | null;
+  /** Per-user run-summary model (PRD #362 M2); present-null clears back to inherit. */
+  summary_model?: string | null;
   theme?: string | null;
   /** Replaces the whole sidebar-token set (null clears it); absent leaves it. */
   sidebar_token_ids?: string[] | null;
@@ -600,6 +606,10 @@ export interface AppSettings {
   judge_enforce_all: string;
   judge_cooldown_seconds: string;
   judge_daily_budget: string;
+  // Run-summary model (PRD #362 Decision 8): the model alias the inline run-summary
+  // generator runs on (haiku by default), served as a raw string like every other
+  // setting. Mirrors judge_model's admin machinery but delivers on the issue-run claim.
+  summary_model: string;
   // Run-health detector keys (PRD #47). health_enabled is the text "true"/"false";
   // the rest are integer seconds as strings (the API serves every setting as a
   // string). 0 disables that one signal.
@@ -1320,6 +1330,18 @@ export interface Run {
    *  never dereferenced, so an absent value reads as not-seeded and the seeded surfaces
    *  simply do not render (no `?? null` normalization needed, unlike pending_judge). */
   plan_source?: PlanSource;
+  /** PRD #362: plain-English run summaries. `summary_intent` ("what this run will
+   *  implement") lands early in `running`; `summary_plan` ("what the proposed plan will
+   *  do") and `summary_deltas` (how the plan diverged from the ask) land at the plan gate.
+   *  All null until the worker generates and posts them, and null forever on any
+   *  generation failure — summaries are advisory and the UI falls back to the issue title.
+   *  UNTRUSTED, model-authored text: render as escaped plain text, never <Markdown>. A
+   *  malformed `summary_deltas` is tolerated server-side and arrives as null ("no
+   *  deltas"). OPTIONAL for the SAME api/web rollout skew as plan_source — a mid-deploy api
+   *  pod that predates these fields omits the keys. */
+  summary_intent?: string | null;
+  summary_plan?: string | null;
+  summary_deltas?: { kind: string; text: string }[] | null;
   /** PRD #37: the roster the worker detected in the clone's `.claude/agents/`.
    *  null = no worker reported (a pre-feature run); `[]` = detection ran and found
    *  none (the plan gate's repo card is inert, NOT the same as null). Names +

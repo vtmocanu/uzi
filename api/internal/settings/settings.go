@@ -70,6 +70,13 @@ const (
 	// Runtime-tunable from the Admin Settings page; no env var.
 	KeyJudgeCooldownSeconds = "judge_cooldown_seconds"
 	KeyJudgeDailyBudget     = "judge_daily_budget"
+	// Run-summary model key (PRD #362 Decision 8). summary_model is the model the
+	// inline plain-English run-summary generator runs on (haiku by default — summaries
+	// are lighter and per-run, so the cheap/fast default is right). It mirrors
+	// judge_model's settings machinery (admin default + optional per-user override,
+	// validated with the PRD #17 model rules) but rides the ISSUE-RUN claim, not the
+	// judge claim. Admin-writable with a compiled-in default.
+	KeySummaryModel = "summary_model"
 	// Self-improvement keys (PRD #46 Decision 9). selfimprove_enabled/interval are
 	// admin-configurable (with defaults). selfimprove_repo/user_id/last_run_at are
 	// ENGINE-MANAGED state, NOT admin-writable through the generic settings PUT: they
@@ -163,6 +170,11 @@ const (
 	// count cap is opt-in because the generous cooldown already catches the loop case.
 	DefaultJudgeCooldownSeconds = "60"
 	DefaultJudgeDailyBudget     = "0"
+	// PRD #362 Decision 8. The run-summary generator defaults to haiku: summaries are
+	// lighter and produced per-run (1 intent + 1 plan + one per revise round), so the
+	// fast, near-free model is the right default — unlike the judge, which defaults to
+	// the strong opus because its recommendations feed self-improvement.
+	DefaultSummaryModel = "haiku"
 	// PRD #46 Decision 9. Self-improvement is OFF by default; when an admin enables
 	// it, the engine reviews uzi's own repo on the configured interval (2 days).
 	DefaultSelfimproveEnabled  = "false"
@@ -266,8 +278,12 @@ var Defaults = map[string]string{
 	KeyJudgeEnforceAll:      DefaultJudgeEnforceAll,
 	KeyJudgeCooldownSeconds: DefaultJudgeCooldownSeconds,
 	KeyJudgeDailyBudget:     DefaultJudgeDailyBudget,
-	KeySelfimproveEnabled:   DefaultSelfimproveEnabled,
-	KeySelfimproveInterval:  DefaultSelfimproveInterval,
+	// PRD #362 Decision 8 run-summary model. Same no-seeded-row pattern as the judge
+	// keys: an absent row synthesizes to DefaultSummaryModel ("haiku"), so All/AdminView
+	// surface it to the settings page on every instance and no migration seeds it.
+	KeySummaryModel:        DefaultSummaryModel,
+	KeySelfimproveEnabled:  DefaultSelfimproveEnabled,
+	KeySelfimproveInterval: DefaultSelfimproveInterval,
 	// PRD #47 run-health keys. Same no-seeded-row pattern: an absent row synthesizes
 	// to these defaults, so All/AdminView surface them to the settings page and no
 	// migration seeds them.
@@ -599,6 +615,14 @@ func (c *Cache) JudgeEnforceAll(ctx context.Context) (bool, error) {
 // back to the strong DefaultJudgeModel ("opus", PRD #69 Decision 1).
 func (c *Cache) JudgeModel(ctx context.Context) (string, error) {
 	return c.get(ctx, KeyJudgeModel)
+}
+
+// SummaryModel returns the model alias the inline run-summary generator runs on
+// (PRD #362 Decision 8). Falls back to DefaultSummaryModel ("haiku"). The per-user
+// override (users.summary_model) is resolved user-value-wins at issue-run claim
+// assembly, mirroring JudgeModel but on the issue-run claim rather than the judge.
+func (c *Cache) SummaryModel(ctx context.Context) (string, error) {
+	return c.get(ctx, KeySummaryModel)
 }
 
 // SelfimproveEnabled reports whether the self-improvement scheduler is enabled
@@ -998,7 +1022,7 @@ func Validate(key, value string) error {
 	case KeyPrdlessEnabled, KeySlackEnabled, KeyJudgeEnabled, KeyJudgeEnforceAll, KeySelfimproveEnabled, KeyHealthEnabled,
 		KeyEligibleLabelWaivesPRDLink:
 		return validateBool(value)
-	case KeyJudgeModel:
+	case KeyJudgeModel, KeySummaryModel:
 		return validateModelAlias(value)
 	case KeySelfimproveInterval:
 		return validateDuration(value)

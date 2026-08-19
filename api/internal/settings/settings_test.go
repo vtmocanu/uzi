@@ -350,6 +350,47 @@ func TestSelfimproveAccessors(t *testing.T) {
 // PUT) with per-value validation, while the three engine-managed selfimprove keys
 // are deliberately NOT Known — a body PUT to them is rejected as unknown, so
 // selfimprove_user_id can never be set from a request.
+// TestSummaryModelAccessor pins PRD #362 Decision 8 at the settings layer: the
+// run-summary model defaults to "haiku" (unlike the judge's "opus"), a stored value
+// is returned verbatim, the key is Known/writable, and validation accepts an alias
+// and a full id but rejects blank/over-long/garbage — reusing validateModelAlias,
+// exactly the judge_model validator.
+func TestSummaryModelAccessor(t *testing.T) {
+	// Empty table → the compiled-in cheap default.
+	c := New(&fakeStore{}, time.Minute)
+	if got, err := c.SummaryModel(context.Background()); err != nil || got != DefaultSummaryModel {
+		t.Fatalf("SummaryModel default = %q, %v; want %q", got, err, DefaultSummaryModel)
+	}
+	// Pin the literal default so an accidental flip is caught (Decision 8: haiku, the
+	// cheap per-run default, NOT the judge's opus).
+	if DefaultSummaryModel != "haiku" {
+		t.Fatalf("DefaultSummaryModel = %q, want \"haiku\"", DefaultSummaryModel)
+	}
+
+	// A configured value is returned verbatim.
+	c = New(&fakeStore{rows: []store.AppSetting{row(KeySummaryModel, "sonnet")}}, time.Minute)
+	if got, _ := c.SummaryModel(context.Background()); got != "sonnet" {
+		t.Fatalf("SummaryModel = %q, want sonnet", got)
+	}
+
+	// Writable through the settings PUT.
+	if !Known(KeySummaryModel) {
+		t.Errorf("%s should be Known (admin-writable)", KeySummaryModel)
+	}
+
+	// Validation accepts an alias and a full id; rejects blank, whitespace, and over-long.
+	for _, ok := range []string{"haiku", "sonnet", "opus", "fable", "claude-3-5-haiku-20241022"} {
+		if err := Validate(KeySummaryModel, ok); err != nil {
+			t.Errorf("Validate(%s, %q) = %v, want nil", KeySummaryModel, ok, err)
+		}
+	}
+	for _, bad := range []string{"", "   ", "two words", strings.Repeat("x", 101)} {
+		if err := Validate(KeySummaryModel, bad); err == nil {
+			t.Errorf("Validate(%s, %q) = nil, want an error", KeySummaryModel, bad)
+		}
+	}
+}
+
 func TestJudgeSelfimproveWritability(t *testing.T) {
 	writable := map[string]string{
 		KeyJudgeEnabled:        "true",

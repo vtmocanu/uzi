@@ -75,6 +75,17 @@ type streamEventsMsg struct {
 // view falls back to the same 2s REST poll `uzi run logs --follow` uses.
 type pollFallbackMsg struct{}
 
+// detailMetaMsg carries a fresh run DTO for the drilled-in run, so the detail view's
+// non-streamed fields (milestones, health, kind, title, duration) stay current while the
+// live socket is connected. The socket only carries transcript frames and status, so
+// without this the milestone checklist is frozen at open-time — the board badge polls, the
+// detail did not.
+type detailMetaMsg struct {
+	runID string
+	run   apitypes.RunDTO
+	err   error
+}
+
 // ---- model ----------------------------------------------------------------
 
 type tuiModel struct {
@@ -90,9 +101,9 @@ type tuiModel struct {
 	board  boardState
 	detail detailState
 
-	// quitting is the confirm modal (both q and ctrl+c route through it); ctrlCSeen
-	// makes a second ctrl+c quit immediately, which is the escape hatch a user reaches
-	// for when the modal itself is what is wrong.
+	// quitting is the ctrl+c confirm modal (q quits immediately and does NOT route through
+	// it); ctrlCSeen makes a second ctrl+c quit immediately, which is the escape hatch a user
+	// reaches for when the modal itself is what is wrong.
 	quitting  bool
 	ctrlCSeen bool
 	showHelp  bool
@@ -149,6 +160,17 @@ func (m tuiModel) loadDetailCmd(runID string) tea.Cmd {
 		}
 		msgs, err := c.RunLogs(ctx, runID, 0)
 		return detailLoadedMsg{run: run, msgs: msgs, err: err}
+	}
+}
+
+// refreshRunMetaCmd re-reads only the run DTO (no transcript replay), so the periodic
+// detail refresh is cheap: the socket already carries the frames, this just refreshes the
+// milestone / health / duration fields the stream does not send.
+func (m tuiModel) refreshRunMetaCmd(runID string) tea.Cmd {
+	c, ctx := m.client, m.ctx
+	return func() tea.Msg {
+		run, err := c.GetRun(ctx, runID)
+		return detailMetaMsg{runID: runID, run: run, err: err}
 	}
 }
 
@@ -212,7 +234,15 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.quitting {
 			return m, tickCmd()
 		}
-		return m, tea.Batch(m.fetchRunsCmd(m.board.admin), tickCmd())
+		cmds := []tea.Cmd{m.fetchRunsCmd(m.board.admin), tickCmd()}
+		// Keep the drilled-in run's non-streamed fields (milestones, health, duration) fresh
+		// on the same 2s cadence the board polls at: the live socket carries transcript frames
+		// and status only. Skipped while the D8 fallback (pollFallbackMsg) is already reloading
+		// the whole DTO every 2s, so the two never double up.
+		if m.view == viewDetail && !m.detail.polling && m.detail.run.ID != "" {
+			cmds = append(cmds, m.refreshRunMetaCmd(m.detail.runID))
+		}
+		return m, tea.Batch(cmds...)
 
 	case boardRunsMsg:
 		m.board.apply(msg)
@@ -222,6 +252,13 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.detail.applyLoaded(msg)
 		// The ownership probe rides the same call the queue indicator needs.
 		return m, m.fetchInputsCmd(m.detail.runID)
+
+	case detailMetaMsg:
+		if msg.runID != m.detail.runID || msg.err != nil {
+			return m, nil
+		}
+		m.detail.applyMeta(msg.run)
+		return m, nil
 
 	case runInputsMsg:
 		if msg.runID != m.detail.runID {
@@ -320,9 +357,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m tuiModel) handleKey(k string) (tea.Model, tea.Cmd) {
-	// Quit routes through a confirm modal for BOTH q and ctrl+c, so a stray keystroke
-	// cannot drop a watched run. A second ctrl+c quits at once — the escape hatch for
-	// when the modal is what is broken.
+	// q quits immediately (user preference). ctrl+c still routes through a confirm modal so a
+	// stray ctrl+c cannot drop a watched run; a second ctrl+c quits at once.
 	if k == keyCtrlC {
 		if m.ctrlCSeen || m.quitting {
 			return m, tea.Quit
@@ -345,8 +381,7 @@ func (m tuiModel) handleKey(k string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if k == keyQuit && !m.filtering() {
-		m.quitting = true
-		return m, nil
+		return m, tea.Quit
 	}
 	if k == keyHelp && !m.filtering() {
 		m.showHelp = true

@@ -25,6 +25,16 @@ type boardState struct {
 
 	filtering bool
 	filter    string
+
+	// hideDone is the `[h]` toggle: drop terminal runs (completed/failed/cancelled) from
+	// the board, keeping the active + needs-you set. A pure client-side view over the runs
+	// already fetched, so toggling it needs no refetch. On the admin board it is a no-op —
+	// AdminListRuns already returns non-terminal runs only.
+	hideDone bool
+
+	// scroll is the index of the first visible run row: the board windows the run list to
+	// the terminal height so the header and footer stay on screen even with hundreds of runs.
+	scroll int
 }
 
 func newBoardState() boardState { return boardState{} }
@@ -64,12 +74,23 @@ func (b *boardState) clampCursor() {
 // is the user's own text, matched against sanitized cell text so a control byte in a
 // title cannot affect what matches.
 func (b *boardState) visible() []apitypes.RunListItemDTO {
+	base := b.runs
+	if b.hideDone {
+		kept := make([]apitypes.RunListItemDTO, 0, len(base))
+		for _, r := range base {
+			if terminalRunStatuses[r.Status] {
+				continue
+			}
+			kept = append(kept, r)
+		}
+		base = kept
+	}
 	if strings.TrimSpace(b.filter) == "" {
-		return b.runs
+		return base
 	}
 	q := strings.ToLower(strings.TrimSpace(b.filter))
-	out := make([]apitypes.RunListItemDTO, 0, len(b.runs))
-	for _, r := range b.runs {
+	out := make([]apitypes.RunListItemDTO, 0, len(base))
+	for _, r := range base {
 		hay := strings.ToLower(strings.Join([]string{
 			r.ID, r.Kind, effectiveRunStatus(r.Status, r.IsPlanning), cellText(runTitle(r.RunDTO)),
 		}, " "))
@@ -113,12 +134,14 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 				m.board.clampCursor()
 			}
 		}
+		m.board.scroll = m.syncedScroll()
 		return m, nil
 	}
 
 	if d := motionDelta(k); d != 0 {
 		m.board.cursor += d
 		m.board.clampCursor()
+		m.board.scroll = m.syncedScroll()
 		return m, nil
 	}
 
@@ -132,7 +155,22 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		m.board.admin = !m.board.admin
 		m.board.adminDenied = false
 		m.board.cursor = 0
+		m.board.scroll = 0
 		return m, m.fetchRunsCmd(m.board.admin)
+	case keyHideDone:
+		// No-op on the admin board: AdminListRuns already returns non-terminal runs only, so
+		// hiding "finished" runs would change no rows — flipping the label there reads as a
+		// broken toggle. Ignore it rather than toggling a hidden state.
+		if m.board.admin {
+			return m, nil
+		}
+		// Client-side view over the already-fetched runs, so no refetch. Reset the cursor and
+		// scroll since the visible list changes shape under it.
+		m.board.hideDone = !m.board.hideDone
+		m.board.cursor = 0
+		m.board.scroll = 0
+		m.board.clampCursor()
+		return m, nil
 	case keyEnter:
 		sel, ok := m.board.selected()
 		if !ok {
@@ -161,13 +199,27 @@ func (m tuiModel) renderBoard() string {
 	// reaches a row (PRD #325 M2). The summary is over the WHOLE board, not the filtered
 	// view, so it stays a stable factory read while you filter.
 	brand := m.pal.title.Render("▚ uzi") + m.pal.faint.Render("  "+title)
+	if m.board.hideDone && !m.board.admin {
+		brand += m.pal.faint.Render("   active only")
+	}
 	if m.board.filter != "" || m.board.filtering {
 		brand += m.pal.faint.Render("   /" + cellText(m.board.filter))
 		if m.board.filtering {
 			brand += m.pal.faint.Render("▌")
 		}
 	}
+	// Window the run list to the terminal height so the header and footer stay on screen
+	// no matter how many runs there are. capacity is how many run rows fit; start is the
+	// first visible row, scrolled to keep the cursor in view.
+	capacity := m.boardCapacity()
+	start, end := boardWindow(m.board.cursor, m.board.scroll, len(rows), capacity)
+
 	summary := m.boardSummary()
+	if len(rows) > capacity {
+		// Position readout so a windowed board says where you are in it (top-right, beside
+		// the run counts), since the list no longer shows every row at once.
+		summary = m.pal.faint.Render(fmt.Sprintf("%d–%d of %d   ", start+1, end, len(rows))) + summary
+	}
 	sb.WriteString(padVisual(brand, m.width-visualWidth(summary)-1) + summary + "\n")
 	sb.WriteString(m.pal.faint.Render(strings.Repeat("─", boardRuleWidth(m.width))) + "\n")
 
@@ -193,13 +245,27 @@ func (m tuiModel) renderBoard() string {
 	if len(rows) == 0 {
 		sb.WriteString(m.boardEmptyState())
 	} else {
-		for i, r := range rows {
-			sb.WriteString(m.boardRow(r, i == m.board.cursor) + "\n")
+		// The judge marker's sub-column widths are sized to the WHOLE visible list (not just the
+		// window) so the columns do not jitter as you scroll. Every row flushes its marker to the
+		// board's right edge.
+		mc := m.boardMarkerCols(rows)
+		for i := start; i < end; i++ {
+			sb.WriteString(m.boardRow(rows[i], i == m.board.cursor, mc) + "\n")
 		}
 	}
 
 	sb.WriteString(m.pal.faint.Render(strings.Repeat("─", boardRuleWidth(m.width))) + "\n")
-	sb.WriteString(m.pal.faint.Render("enter open · / filter · a admin · r refresh · ? keys · q quit"))
+	// The hide-done toggle is meaningless on the admin board (non-terminal runs only), so its
+	// key hint is dropped there rather than offering a no-op.
+	hideHint := ""
+	if !m.board.admin {
+		if m.board.hideDone {
+			hideHint = "h show done · "
+		} else {
+			hideHint = "h hide done · "
+		}
+	}
+	sb.WriteString(m.pal.faint.Render("enter open · / filter · a admin · " + hideHint + "r refresh · ? keys · q quit"))
 	return sb.String()
 }
 
@@ -220,13 +286,81 @@ const (
 )
 
 // boardShowMile reports whether the terminal is wide enough for the MILE column (issue #379).
-func (m tuiModel) boardShowMile() bool { return m.width >= boardMileMinWidth }
+//
+// boardMileMinWidth is calibrated against the NON-admin row prefix. The admin board carries an
+// extra OWNER column, so its prefix is boardOwnerWidth+2 cols wider and the same MILE tax
+// overflows the floored title at widths 90-91 (#380 review). Shift the admin threshold up by
+// exactly that extra prefix so the column drops on a narrow admin board instead of clipping —
+// milestone progress is still on the run-detail view.
+func (m tuiModel) boardShowMile() bool {
+	min := boardMileMinWidth
+	if m.board.admin {
+		min += boardRowPrefixWidth(true, true) - boardRowPrefixWidth(false, true)
+	}
+	return m.width >= min
+}
 
 func boardRuleWidth(w int) int {
 	if w < 2 {
 		return 1
 	}
 	return w - 1
+}
+
+// boardCapacity is how many run rows fit between the header block and the footer at the
+// current terminal height. It must count the same chrome lines renderBoard draws: brand +
+// rule + column header (3) and the closing rule + footer (2), plus the optional adminDenied
+// and error lines. At least one row is always shown.
+func (m tuiModel) boardCapacity() int {
+	chrome := 5
+	if m.board.adminDenied {
+		chrome++
+	}
+	if m.board.err != nil {
+		chrome++
+	}
+	c := m.height - chrome
+	if c < 1 {
+		c = 1
+	}
+	return c
+}
+
+// boardWindow is the [start, end) slice of the visible run list to draw, scrolled so the
+// cursor stays on screen. Stateless: it takes the last scroll offset and returns a corrected
+// one via start, so it is safe to call from both the key handler (to persist) and the
+// renderer (to self-correct after a height or list change).
+func boardWindow(cursor, scroll, n, capacity int) (int, int) {
+	if capacity < 1 {
+		capacity = 1
+	}
+	if n <= capacity {
+		return 0, n
+	}
+	start := scroll
+	if start < 0 {
+		start = 0
+	}
+	if cursor < start {
+		start = cursor
+	}
+	if cursor >= start+capacity {
+		start = cursor - capacity + 1
+	}
+	if maxStart := n - capacity; start > maxStart {
+		start = maxStart
+	}
+	if start < 0 {
+		start = 0
+	}
+	return start, start + capacity
+}
+
+// syncedScroll returns the scroll offset that keeps the cursor visible, for the key handler
+// to persist so in-window navigation does not shift the viewport on every keystroke.
+func (m tuiModel) syncedScroll() int {
+	start, _ := boardWindow(m.board.cursor, m.board.scroll, len(m.board.visible()), m.boardCapacity())
+	return start
 }
 
 // boardSummary is the "N runs · N needs you · N stalled" bar. Predicates (PRD #325 M2):
@@ -258,6 +392,15 @@ func (m tuiModel) boardSummary() string {
 // would need a knownInstructions entry (TestPrintedInstructionsAreRegistered) it cannot
 // earn, since a lipgloss Render site classifies as neither an emitter nor a cobra field.
 func (m tuiModel) boardEmptyState() string {
+	// Distinguish an empty board from one the [h] toggle has emptied by hiding finished runs,
+	// so the view does not read as "no runs" when it is really "no active runs".
+	if m.board.hideDone && strings.TrimSpace(m.board.filter) == "" {
+		for _, r := range m.board.runs {
+			if terminalRunStatuses[r.Status] {
+				return m.pal.faint.Render("No active runs — finished runs are hidden (h to show).") + "\n"
+			}
+		}
+	}
 	if m.board.admin {
 		return m.pal.faint.Render("No active runs across the factory right now.") + "\n"
 	}
@@ -267,7 +410,7 @@ func (m tuiModel) boardEmptyState() string {
 // boardRow renders one run: a status-coloured spine (with a NO_COLOR-safe glyph), the id,
 // OWNER on the admin board, a status chip, a health marker, AGE, and the title with an
 // own-board-only judge marker.
-func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool) string {
+func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCols) string {
 	es := effectiveRunStatus(r.Status, r.IsPlanning)
 	sc := m.pal.statusColor(es, r.Health)
 
@@ -304,28 +447,36 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool) string {
 		mileCell = padVisual(m.milestoneMarker(r), boardMileWidth) + "  "
 	}
 
-	// F4: the judge marker carries the todo count when > 0 ("⚖ issues · N"), own board only
-	// (AdminListRuns carries no JudgeVerdict). It trails the title.
-	marker := ""
-	if !m.board.admin && r.JudgeVerdict != nil {
-		marker = "  " + m.verdictMarker(*r.JudgeVerdict, r.JudgeTodoCount)
-	}
 	// F2 + title trim: cap the title to the remaining width (so no row exceeds boardRuleWidth
 	// and a narrow terminal does not wrap) AND to boardTitleMax (so a very long title is
-	// trimmed to a tidy column rather than running the full width of a wide terminal). Pad to
-	// that width so the trailing judge marker lines up into a column instead of floating after
-	// each ragged title end.
-	avail := boardRuleWidth(m.width) - boardRowPrefixWidth(m.board.admin, m.boardShowMile()) - visualWidth(marker)
+	// trimmed to a tidy column rather than running the full width of a wide terminal). The
+	// marker column allowance (its full width + a 2-col minimum gap) is reserved for EVERY row
+	// so the title column keeps a single width down the board.
+	markerAllow := 0
+	if mc.fullW > 0 {
+		markerAllow = mc.fullW + 2
+	}
+	avail := boardRuleWidth(m.width) - boardRowPrefixWidth(m.board.admin, m.boardShowMile()) - markerAllow
 	if avail < 10 {
 		avail = 10
 	}
 	if avail > boardTitleMax {
 		avail = boardTitleMax
 	}
-	title := padVisual(m.renderer.Plain(runTitle(r.RunDTO), avail), avail) + marker
+	titleStr := padVisual(m.renderer.Plain(runTitle(r.RunDTO), avail), avail)
 
-	return spine + gutter + " " + id + owner + "  " + statusCell + "  " + m.boardHealthCell(r) + "  " +
-		m.pal.faint.Render(padCell(relAge(r.CreatedAt), 5)) + "  " + mileCell + title
+	row := spine + gutter + " " + id + owner + "  " + statusCell + "  " + m.boardHealthCell(r) + "  " +
+		m.pal.faint.Render(padCell(relAge(r.CreatedAt), 5)) + "  " + mileCell + titleStr
+
+	// F4: the judge marker (own board only; AdminListRuns carries no JudgeVerdict) is a
+	// fixed-width block flushed to the board's RIGHT EDGE, so the ⚖ icon and the count align
+	// down the board, in a column with the summary bar above. Every marker is mc.fullW wide, so
+	// flushing the row to boardRuleWidth-fullW lands them all in the same columns.
+	if mc.fullW > 0 && !m.board.admin && r.JudgeVerdict != nil {
+		marker := m.verdictMarker(*r.JudgeVerdict, r.JudgeTodoCount, mc.verdictW, mc.countW)
+		row = padVisual(row, boardRuleWidth(m.width)-mc.fullW) + marker
+	}
+	return row
 }
 
 // boardRowPrefixWidth is the visual width of every column before TITLE, so F2 can size the
@@ -360,17 +511,55 @@ func (m tuiModel) boardHealthCell(r apitypes.RunListItemDTO) string {
 	}
 }
 
-// verdictMarker is the own-board ⚖ judge badge, coloured by severity (issues → red,
-// ideal/ok → teal). The verdict is a closed enum, but it is rendered through Plain so an
-// unrecognised value from a newer server cannot inject control bytes. F4: it appends the
-// still-to-triage recommendation count when > 0, the DTO's "⚖ issues · N" grammar
-// (JudgeTodoCount, apitypes/run.go), so a healthy or fully-triaged run shows just the
-// verdict.
-func (m tuiModel) verdictMarker(verdict string, todo int) string {
+// boardMarkerCols are the fixed sub-column widths of the judge marker across the visible rows:
+// verdictW for the variable-length verdict WORD (ideal/ok/issues) and countW for the "· N"
+// recommendation count. fullW is the whole marker's width. Splitting the marker into fixed
+// sub-columns is what keeps the ⚖ icon and the count in stable columns while only the verdict
+// word moves within its own slot (the count is short and fixed, the verdict is not). All zero
+// on the admin board (no verdicts) or when no visible row carries a verdict.
+type boardMarkerCols struct{ verdictW, countW, fullW int }
+
+func (m tuiModel) boardMarkerCols(rows []apitypes.RunListItemDTO) boardMarkerCols {
+	var mc boardMarkerCols
+	if m.board.admin {
+		return mc
+	}
+	for _, r := range rows {
+		if r.JudgeVerdict == nil {
+			continue
+		}
+		if w := visualWidth(m.renderer.Plain(*r.JudgeVerdict, 8)); w > mc.verdictW {
+			mc.verdictW = w
+		}
+		if r.JudgeTodoCount > 0 {
+			if w := visualWidth("· " + itoa(r.JudgeTodoCount)); w > mc.countW {
+				mc.countW = w
+			}
+		}
+	}
+	if mc.verdictW > 0 {
+		// The empty-verdict/zero-count marker has the full fixed width, and visualWidth accounts
+		// for the ⚖ glyph's own cell count.
+		mc.fullW = visualWidth(m.verdictMarker("", 0, mc.verdictW, mc.countW))
+	}
+	return mc
+}
+
+// verdictMarker is the own-board ⚖ judge badge, coloured by severity (issues → red, ideal/ok →
+// teal). It lays the verdict WORD out LEFT-aligned in a fixed verdictW slot and the "· N"
+// recommendation count in a fixed countW slot after it, so down the board the ⚖ icon and the
+// count align and only the verdict word shifts within its slot. The verdict is a closed enum
+// but rendered through Plain so an unrecognised value from a newer server cannot inject control
+// bytes. A run with no open recommendations (JudgeTodoCount 0) leaves the count slot blank.
+func (m tuiModel) verdictMarker(verdict string, todo, verdictW, countW int) string {
 	c := m.pal.verdictColor(verdict)
-	label := "⚖ " + m.renderer.Plain(verdict, 8)
-	if todo > 0 {
-		label += " · " + itoa(todo)
+	label := "⚖ " + padVisual(m.renderer.Plain(verdict, 8), verdictW)
+	if countW > 0 {
+		count := ""
+		if todo > 0 {
+			count = "· " + itoa(todo)
+		}
+		label += " " + padVisual(count, countW)
 	}
 	return lipgloss.NewStyle().Foreground(c).Render(label)
 }

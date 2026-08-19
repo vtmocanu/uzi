@@ -89,6 +89,15 @@ export interface RunContext {
   emit(msg: EmittedMessage): void;
   /** Anthropic subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN) for the SDK. */
   oauthToken?: string;
+  /** PRD #362 M3c: the model the inline run-summary generator runs on, resolved
+   *  user-value-wins from users.summary_model over the instance summary_model at
+   *  issue-run claim assembly. Absent ⇒ the generator uses the SDK/account default
+   *  model. Only the SDK executor's summary hooks read it; the stub ignores it. */
+  summaryModel?: string;
+  /** PRD #362 M3c (Decision 3): the run's INTENT summary is already set, so the
+   *  executor skips intent generation on a resume/re-claim rather than re-spending
+   *  the owner's token. Absent/false ⇒ generate the intent summary. */
+  summaryIntentPresent?: boolean;
   /** PRD #3 templates (lead + subagents) mapped to SDK AgentDefinitions. */
   agents?: AgentTemplate[];
   /** PRD #37: the roster the worker parsed out of the clone's `.claude/agents/`,
@@ -181,8 +190,20 @@ export interface RunContext {
    * PRD #122 M1: the optional CANDIDATE milestone list rides the awaiting_approval
    * report so the human approves the breakdown too. Omitted/empty ⇒ no milestones on
    * the report (additive-optional; a run with no milestones is unchanged).
+   *
+   * PRD #362 M3c: `onAwaitingApproval` is an ADVISORY callback the gate invokes AFTER
+   * it persists `plan_md` (the awaiting_approval report) and BEFORE it blocks on the
+   * verdict. The plan-summary hook rides it: the summary's stale-write guard value is
+   * `runs.plan_md`, so the POST can only match once the gate has persisted it — posting
+   * before the gate always 409s against a NULL/previous plan_md and is silently dropped.
+   * It is NEVER invoked on the autopilot short-circuit (which never persists plan_md),
+   * so an auto-approved run generates no plan summary. The gate swallows any throw.
    */
-  gatePlan?(planMd: string, milestones?: Milestone[]): Promise<PlanVerdict>;
+  gatePlan?(
+    planMd: string,
+    milestones?: Milestone[],
+    onAwaitingApproval?: (planMd: string) => Promise<void>,
+  ): Promise<PlanVerdict>;
   /**
    * PRD #88 M1 clarification park. Called by the executor after a turn that made an
    * ask_user call: the runner emits the `question` run-message, posts /state

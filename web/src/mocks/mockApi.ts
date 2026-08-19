@@ -144,6 +144,7 @@ const MOCK_SETTINGS_KEY = "uzi.mock.v3";
 const SEED_USER_SETTINGS: UserSettings = {
   default_model: null,
   judge_model: null,
+  summary_model: null,
   theme: null,
   sidebar_token_ids: [],
 };
@@ -162,6 +163,8 @@ const SEED_APP_SETTINGS: AppSettings = {
   judge_enforce_all: "false",
   judge_cooldown_seconds: "60",
   judge_daily_budget: "0",
+  // PRD #362 Decision 8: the run-summary generator model, haiku by default.
+  summary_model: "haiku",
   health_enabled: "true",
   health_stall_seconds: "300",
   health_slow_seconds: "2700",
@@ -207,6 +210,8 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     (u.default_model === null || typeof u.default_model === "string") &&
     // Optional so a pre-#69 blob stays valid; absent reads as inherit.
     (u.judge_model === undefined || u.judge_model === null || typeof u.judge_model === "string") &&
+    // Optional so a pre-#362 blob stays valid; absent reads as inherit.
+    (u.summary_model === undefined || u.summary_model === null || typeof u.summary_model === "string") &&
     (u.theme === null || typeof u.theme === "string") &&
     // Optional so a pre-feature blob stays valid; absent reads as default-only.
     (u.sidebar_token_ids === undefined ||
@@ -225,6 +230,9 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     typeof a.judge_enforce_all === "string" &&
     typeof a.judge_cooldown_seconds === "string" &&
     typeof a.judge_daily_budget === "string" &&
+    // Optional so a pre-#362 blob stays valid; a missing summary_model is filled
+    // from the seed default ("haiku") on load.
+    (a.summary_model === undefined || typeof a.summary_model === "string") &&
     typeof a.health_enabled === "string" &&
     typeof a.health_stall_seconds === "string" &&
     typeof a.health_slow_seconds === "string" &&
@@ -245,8 +253,10 @@ function loadSettings(): { userSettings: UserSettings; appSettings: AppSettings 
       const parsed: unknown = JSON.parse(raw);
       if (isPersistedSettings(parsed)) {
         return {
-          userSettings: { ...parsed.userSettings },
-          appSettings: { ...parsed.appSettings },
+          // Merge over the seed so a pre-#362 blob (no summary_model on either
+          // side) still yields a complete shape; the persisted values win where present.
+          userSettings: { ...SEED_USER_SETTINGS, ...parsed.userSettings },
+          appSettings: { ...SEED_APP_SETTINGS, ...parsed.appSettings },
         };
       }
     }
@@ -1533,12 +1543,12 @@ export const mockApi = {
         (nonSecret as Record<string, string>)[key] = tokens.join(",");
         continue;
       }
-      // judge_model is a model alias (PRD #46): non-empty single token, mirroring the
-      // server's PRD #17 ValidateModel rules.
-      if (key === "judge_model") {
-        if (value.trim() === "") throw new ApiError(400, "judge_model: must not be empty");
-        if (/\s/.test(value)) throw new ApiError(400, "judge_model: must be a single token with no spaces");
-        nonSecret.judge_model = value;
+      // judge_model (PRD #46) and summary_model (PRD #362) are model aliases: non-empty
+      // single token, mirroring the server's PRD #17 ValidateModel rules.
+      if (key === "judge_model" || key === "summary_model") {
+        if (value.trim() === "") throw new ApiError(400, `${key}: must not be empty`);
+        if (/\s/.test(value)) throw new ApiError(400, `${key}: must be a single token with no spaces`);
+        (nonSecret as Record<string, string>)[key] = value;
         continue;
       }
       // public_base_url must be http(s) (PRD #25).
@@ -1913,6 +1923,15 @@ export const mockApi = {
         throw new ApiError(400, "judge_model must be a single token with no spaces");
       }
       userSettings = { ...userSettings, judge_model: trimmed === "" ? null : trimmed };
+    }
+    if (patch.summary_model !== undefined) {
+      // Same rules as judge_model (PRD #362 M2): blank clears to inherit, a value with
+      // internal whitespace is rejected, mirroring the server's ValidateModel.
+      const trimmed = patch.summary_model?.trim() ?? "";
+      if (trimmed !== "" && /\s/.test(trimmed)) {
+        throw new ApiError(400, "summary_model must be a single token with no spaces");
+      }
+      userSettings = { ...userSettings, summary_model: trimmed === "" ? null : trimmed };
     }
     if (patch.theme !== undefined) {
       const t = patch.theme?.trim() ?? "";

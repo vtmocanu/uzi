@@ -19,15 +19,18 @@ import (
 )
 
 // userSettingsDTO is the current user's own (non-secret) settings: the default
-// worker model (PRD #17), the UI theme override (PRD #21), and the sidebar
-// token-meter choice (migration 00123). null default_model means inherit (the
-// lead template's model, else the account/SDK default); null theme means "use
-// the instance default". sidebar_token_ids lists the NON-default Anthropic
+// worker model (PRD #17), the per-user judge model override (PRD #69) and
+// run-summary model override (PRD #362 M2), the UI theme override (PRD #21), and
+// the sidebar token-meter choice (migration 00123). null default_model means
+// inherit (the lead template's model, else the account/SDK default); null
+// judge_model / summary_model means inherit the instance value; null theme means
+// "use the instance default". sidebar_token_ids lists the NON-default Anthropic
 // tokens whose rate meters the user surfaced on the sidebar rail — the default
 // token always shows and is never listed; empty means default-only.
 type userSettingsDTO struct {
 	DefaultModel    *string  `json:"default_model"`
 	JudgeModel      *string  `json:"judge_model"`
+	SummaryModel    *string  `json:"summary_model"`
 	Theme           *string  `json:"theme"`
 	SidebarTokenIds []string `json:"sidebar_token_ids"`
 }
@@ -41,10 +44,20 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	// summary_model is not part of GetUserSettings' narrow read (it rides the
+	// issue-run claim, not the settings surface), so fetch it on its own column
+	// query — mirrors judge_model's own-column read at claim assembly (PRD #362 M2).
+	summaryModel, err := h.q.GetUserSummaryModel(r.Context(), userID)
+	if err != nil {
+		slog.Error("get user summary model", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"settings": userSettingsDTO{
 			DefaultModel:    textPtrValue(s.DefaultModel.Valid, s.DefaultModel.String),
 			JudgeModel:      textPtrValue(s.JudgeModel.Valid, s.JudgeModel.String),
+			SummaryModel:    textPtrValue(summaryModel.Valid, summaryModel.String),
 			Theme:           textPtrValue(s.Theme.Valid, s.Theme.String),
 			SidebarTokenIds: uuidStrings(s.SidebarTokenIds),
 		},
@@ -82,6 +95,7 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		DefaultModel    json.RawMessage `json:"default_model"`
 		JudgeModel      json.RawMessage `json:"judge_model"`
+		SummaryModel    json.RawMessage `json:"summary_model"`
 		Theme           json.RawMessage `json:"theme"`
 		SidebarTokenIds json.RawMessage `json:"sidebar_token_ids"`
 	}
@@ -129,6 +143,29 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			JudgeModel: model,
 		}); err != nil {
 			slog.Error("set user judge model", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if req.SummaryModel != nil {
+		var raw *string
+		if err := json.Unmarshal(req.SummaryModel, &raw); err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid summary_model")
+			return
+		}
+		// Same validator as judge_model (PRD #362 M2): nil/blank trims to NULL =
+		// inherit the instance summary_model; a bad model is a 400.
+		model, err := validateModel(raw)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if _, err := h.q.SetUserSummaryModel(r.Context(), store.SetUserSummaryModelParams{
+			ID:           user.ID,
+			SummaryModel: model,
+		}); err != nil {
+			slog.Error("set user summary model", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
