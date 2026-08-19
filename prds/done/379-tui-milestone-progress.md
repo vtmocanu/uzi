@@ -2,7 +2,7 @@
 
 **Issue**: #379
 **Priority**: Medium
-**Status**: Implemented (follow-ups pending)
+**Status**: Done
 
 > This PRD is **retrospective**: the implementation landed during the session that
 > authored it and is gate-clean (`task lint:api`, `task deadcode:api`,
@@ -143,10 +143,10 @@ list DTO already carried everything the badge needs.
     squeezed marker rows past the edge): the MILE column is now dropped below
     `boardMileMinWidth` (90 cols), reverting to the pre-#379 board layout on narrow terminals;
     milestone progress stays on the detail view. Guard: `TestTUIBoardRowsFitNarrowWidth`.
-- [ ] **M8 — Docs + spec note.** If `docs/cli.md` documents the TUI board columns or
-  the detail view, add `MILE`, the milestone block, and the full-height body; record the
-  design decisions (fixed column over float, `–/N` semantics, `boardTitleMax`, dynamic
-  viewport) in `specs/ai.md`.
+- [x] **M8 — Docs + spec note.** `docs/cli.md` documents the board `MILE` column and the
+  crew-rail milestone block; `specs/ai.md` §559 records the design decisions (shared fold,
+  `–/N` semantics, fixed-but-width-conditional column, `boardTitleMax`, dynamic viewport +
+  `joinColumns` clamp).
 
 ## Success criteria
 

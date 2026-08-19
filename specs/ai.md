@@ -21406,3 +21406,49 @@ scrollbar sits below the fold when a column is taller than the viewport, so a mo
 scroll the page down to reach it; two-finger/shift-scroll and the partially-cut right column
 mitigate it. Browser-validated in mock mode (columns one row, horizontal scroll works, page scrolls
 vertically, headers static).
+
+## 559. PRD #379 — milestone progress on the two TUI surfaces, and the run viewer fills the terminal height
+
+The web (`MilestoneChecklist`/`MilestoneBadge`) and `uzi run get` (`milestoneRows`) already
+surfaced a milestone-structured run's progress; the interactive TUI (`uzi tui`) showed none of
+it. #379 adds it to both TUI surfaces and fixes an unrelated layout gap the work exposed.
+
+- **One shared fold, so three surfaces cannot disagree.** `milestoneProgress(run) → (done,
+  total, reported)` + `milestoneCount` in `api/cmd/uzi/tui_detail.go` are the TUI twin of the
+  web's `milestoneBadge`. `done` counts frozen MEMBERS present in the completed set (immune to a
+  duplicate id and to a completed id naming a milestone dropped after it was ticked). `reported`
+  is `MilestonesCompleted != nil`: a nil completed slice (JSON `null`) means nothing was ever
+  reported, so the run reads `–/N`, not a `0/N` that looks like failure (matches the web's PRD
+  #265 M2). The board badge and the detail block both read this fold.
+
+- **Board: a fixed `MILE` column, width-conditional.** `M{done}/{total}` (or `M–/N`) sits in a
+  fixed 6-col cell between AGE and TITLE (`milestoneMarker`, `boardMileWidth`), blank for a run
+  with no frozen list, on both the own and admin boards. A fixed column (not a float after the
+  title) keeps the badge in one place down the board. It adds 8 cols to the fixed prefix, which
+  at ~80 cols squeezed marker rows past the edge and clipped the judge marker, so the column is
+  DROPPED below `boardMileMinWidth` (90) and the board reverts to the pre-#379 layout; milestone
+  progress is still on the detail view. The count says neither "verified" nor "complete" (PRD
+  #122 Decision 6): the worker only reports a milestone done and nothing in uzi verifies it.
+
+- **Board titles trim** (`boardTitleMax` 60): long titles are capped and padded to a tidy column
+  so the trailing judge marker aligns, instead of running the full width of a wide terminal.
+
+- **Detail: a crew-rail milestone block.** `renderMilestones` appends `MILESTONES {count}` plus
+  one glyph-marked row per milestone in frozen order (`✓` done / `◐` in progress / `○` not
+  started, the web `MilestoneMark` glyphs), on both the lanes and the no-activity paths (so a
+  queued/just-claimed run shows it before its first frame). Done rows are muted, not struck
+  through (lipgloss emits strikethrough per-rune; the `✓` carries completion). Titles are
+  UNTRUSTED repo/agent text, drawn through `renderer.Plain`, and `"Title"` joins
+  `d7UntrustedFields` with the hostile-value render test extended.
+
+- **The run viewer fills the terminal height.** Previously the two-pane body was only as tall as
+  its content, so the pane divider stopped mid-screen and a tall terminal showed dead space below
+  the footer. `transcriptViewport` now computes the body height from the ACTUAL chrome
+  renderDetail draws (header, park line, transport, banner, steer bar, footer) and
+  `padLinesToViewport` pads the window to fill it; one value feeds both the render and the scroll
+  clamp. `joinColumns` clamps the joined body to the transcript (viewport) height rather than
+  `max(rail, transcript)`, so a rail taller than the viewport (a milestone run with many lanes)
+  truncates rather than pushing the footer — which carries the only nav keys — off-screen.
+
+No server or DTO change: `ListRuns`/`AdminListRuns` already decode the milestone fields via
+`runToDTO`. Read-only presentation; no change to how milestones are created, frozen, or reported.
