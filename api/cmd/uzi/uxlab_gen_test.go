@@ -139,7 +139,7 @@ func boardRuns(now time.Time) []apitypes.RunListItemDTO {
 		}
 		return r
 	}
-	return []apitypes.RunListItemDTO{
+	runs := []apitypes.RunListItemDTO{
 		mk("a1b2c3d4-1111-2222-3333-444444444444", "issue", "running", "Add rate-limit headroom to the scheduler poll", "", nil, 0, 4*time.Minute),
 		mk("b2c3d4e5-1111-2222-3333-444444444444", "ci_fix", "awaiting_approval", "Fix flaky pipeline on main", "", nil, 0, 2*time.Minute),
 		mk("c3d4e5f6-1111-2222-3333-444444444444", "issue", "running", "Refactor the forge sync loop for the GitHub driver", "stalled", nil, 0, 51*time.Minute),
@@ -150,6 +150,23 @@ func boardRuns(now time.Time) []apitypes.RunListItemDTO {
 		mk("a7b8c9d0-1111-2222-3333-444444444444", "issue", "failed", "Migrate per-user secrets into the vault hierarchy", "", sp("issues"), 3, 5*time.Hour),
 		mk("b8c9d0e1-1111-2222-3333-444444444444", "ci_fix", "completed", "Repair the changelog assertion gate", "", sp("ok"), 0, 25*time.Hour),
 	}
+	// PRD #379: milestone-structured runs so the board's MILE column is exercised — one
+	// mid-flight (M2/4) and one that has reported nothing yet (M–/3). The rest stay blank,
+	// which is the common case and the alignment worth checking.
+	runs[0].Milestones = milestoneList
+	runs[0].MilestonesCompleted = []string{"m1", "m2"}
+	runs[0].MilestonesInProgress = []string{"m3"}
+	runs[6].Milestones = []apitypes.Milestone{{ID: "m1"}, {ID: "m2"}, {ID: "m3"}}
+	return runs
+}
+
+// milestoneList is a representative frozen milestone list shared by the board's
+// milestone-structured run and the detail-running scene, so the two stay coherent (#379).
+var milestoneList = []apitypes.Milestone{
+	{ID: "m1", Title: "Wire headroom into the poll loop"},
+	{ID: "m2", Title: "Clamp the near-cap branch at 10%"},
+	{ID: "m3", Title: "Add the regression sweep"},
+	{ID: "m4", Title: "Update the scheduler docs"},
 }
 
 func boardPopulated(dark bool, now time.Time) string {
@@ -233,8 +250,12 @@ func withLiveStream(m tuiModel) tuiModel {
 }
 
 func detailRunning(dark bool, now time.Time) string {
+	// A milestone-structured run so the crew rail's milestone block renders (#379), coherent
+	// with the board's M2/4 for the same run id.
 	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "running", Health: "ok",
-		IssueTitle: "Add rate-limit headroom to the scheduler poll"}
+		IssueTitle:          "Add rate-limit headroom to the scheduler poll",
+		Milestones:          milestoneList,
+		MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3"}}
 	m := detailBase(dark, run, now, true)
 	m = withLiveStream(m)
 	return m.View().Content

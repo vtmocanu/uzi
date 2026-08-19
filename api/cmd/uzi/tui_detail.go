@@ -405,6 +405,11 @@ func (m tuiModel) renderLaneRail() string {
 	sb.WriteString(m.paneTitle("crew", d.focus == focusRail) + "\n")
 	if len(d.lanes) == 0 {
 		sb.WriteString(m.pal.faint.Render("(no activity yet)"))
+		// A milestone-structured run has a frozen list before any frame arrives (queued /
+		// just-claimed), so the block must show even with no lanes yet.
+		if block := m.renderMilestones(); block != "" {
+			sb.WriteString("\n\n" + block)
+		}
 		return sb.String()
 	}
 	for i, l := range d.lanes {
@@ -430,7 +435,102 @@ func (m tuiModel) renderLaneRail() string {
 			sb.WriteString("   " + m.pal.faint.Render(m.renderer.Plain(l.Label, laneLabelCap)) + "\n")
 		}
 	}
+	if block := m.renderMilestones(); block != "" {
+		sb.WriteString("\n" + block)
+	}
 	return sb.String()
+}
+
+// milestoneTitleCap is the per-row title budget in the crew rail (laneRailWidth 26 minus
+// the " ✓ " glyph prefix). joinColumns clamps the whole left column anyway, but Plain must
+// cap the UNTRUSTED title itself (D7), so it caps at the width the rail can actually show.
+const milestoneTitleCap = 22
+
+// milestoneProgress folds a run's frozen milestone list into (done, total, reported) — the
+// TUI twin of the web's milestoneBadge, shared by the crew-rail block and the board badge so
+// the two surfaces cannot disagree. `done` counts frozen MEMBERS present in the completed
+// set (immune to a duplicate id and to a completed id naming a milestone dropped after it
+// was ticked). `reported` is whether ANY completion was ever reported: a nil completed slice
+// (JSON null) means never, so an unreported run reads `–/N` rather than a `0/N` that looks
+// like failure. total is 0 for a run with no frozen list — the caller renders nothing.
+func milestoneProgress(run apitypes.RunDTO) (done, total int, reported bool) {
+	total = len(run.Milestones)
+	if total == 0 {
+		return 0, 0, false
+	}
+	completed := make(map[string]bool, len(run.MilestonesCompleted))
+	for _, id := range run.MilestonesCompleted {
+		completed[id] = true
+	}
+	for _, mi := range run.Milestones {
+		if completed[mi.ID] {
+			done++
+		}
+	}
+	return done, total, run.MilestonesCompleted != nil
+}
+
+// milestoneCount is the compact `2/4` (or `–/4` when nothing was reported) shared by the
+// crew-rail block's summary and the board's `M…` badge.
+func milestoneCount(done, total int, reported bool) string {
+	if !reported {
+		return "–/" + itoa(total)
+	}
+	return itoa(done) + "/" + itoa(total)
+}
+
+// renderMilestones is the crew rail's milestone progress block (the TUI twin of the web's
+// MilestoneChecklist and the CLI `uzi run get` milestoneRows): a compact `{done}/{total}`
+// summary and one glyph-marked row per milestone in FROZEN order — done ✓, in progress ◐,
+// not started ○.
+//
+// Empty for a run with no frozen milestone list, so a pre-#122 (or non-milestone) run's
+// rail is byte-for-byte unchanged — the same back-compat contract the nil Milestones slice
+// carries elsewhere.
+//
+// The count says neither "verified" nor "complete" (PRD #122 Decision 6): the worker only
+// REPORTS a milestone done and nothing in uzi has verified it, so the bare N/M and the ✓
+// glyph must not imply verification. A run that has reported nothing shows `–/N`, not a
+// `0/N` that reads as failure (matching the web's `–/N` treatment). `done` counts frozen
+// members present in the completed set, immune to a duplicate id and to a completed id
+// that names a milestone dropped after it was ticked — the same rule milestoneBadge uses.
+//
+// Titles are UNTRUSTED repo/agent-authored text (apitypes.Milestone.Title), so each goes
+// through renderer.Plain — the D7 obligation the lane rail's Role/Label already carry, and
+// why "Title" is in d7UntrustedFields.
+func (m tuiModel) renderMilestones() string {
+	ms := m.detail.run.Milestones
+	if len(ms) == 0 {
+		return ""
+	}
+	completed := make(map[string]bool, len(m.detail.run.MilestonesCompleted))
+	for _, id := range m.detail.run.MilestonesCompleted {
+		completed[id] = true
+	}
+	inProgress := make(map[string]bool, len(m.detail.run.MilestonesInProgress))
+	for _, id := range m.detail.run.MilestonesInProgress {
+		inProgress[id] = true
+	}
+	done, total, reported := milestoneProgress(m.detail.run)
+
+	var sb strings.Builder
+	sb.WriteString(m.pal.title.Render("MILESTONES") + " " + m.pal.faint.Render(milestoneCount(done, total, reported)) + "\n")
+	for _, mi := range ms {
+		glyph := m.pal.faint.Render("○") // not started
+		style := m.pal.faint
+		switch {
+		case completed[mi.ID]:
+			glyph = m.pal.state(crewWorking).Render("✓")
+			// done → muted, like the web's text-muted; the ✓ glyph carries completion, so no
+			// strikethrough (which lipgloss emits per-rune, bloating the frame for no signal).
+			style = m.pal.faint
+		case inProgress[mi.ID]:
+			glyph = m.pal.state(crewWaiting).Render("◐")
+			style = lipgloss.NewStyle() // current — plain terminal fg, like the web's text-fg
+		}
+		sb.WriteString(" " + glyph + " " + style.Render(m.renderer.Plain(mi.Title, milestoneTitleCap)) + "\n")
+	}
+	return strings.TrimRight(sb.String(), "\n")
 }
 
 // buildTranscriptLines renders the selected lane's frames to display lines (no windowing),
@@ -446,11 +546,48 @@ func (m tuiModel) buildTranscriptLines(lane agentLane) []string {
 
 // transcriptViewport is the transcript's visible line budget (the pane title is a fixed
 // header above it, so it is one row shorter than the pane).
+//
+// The budget is the terminal height minus every OTHER row the detail view draws, so the
+// two-pane body fills the screen down to the footer (issue #379) rather than stopping at the
+// last line of content and leaving a tall terminal with dead space below the footer. It
+// counts the SAME chrome renderDetail emits — header, optional park line, transport + its
+// blank line, the pane title row, an optional attention banner, an optional steer bar, and
+// the footer — so this and the render cannot disagree; both the window render and the scroll
+// clamp read it. renderSteerBar/detailBanner are pure and never call back here (no recursion).
 func (m tuiModel) transcriptViewport() int {
-	if h := m.height - 11; h > 3 {
+	lineCount := func(s string) int {
+		if s == "" {
+			return 0
+		}
+		return strings.Count(s, "\n") + 1
+	}
+	chrome := 1 // header line (run id + chips)
+	if limitWaitLine(m.detail.run, time.Now()) != "" {
+		chrome++ // the park / limit-wait line
+	}
+	chrome += 2 // the transport line + the blank line after it
+	chrome++    // the transcript pane's own title row (the first line of the body column)
+	chrome += lineCount(m.detailBanner())
+	chrome += lineCount(m.renderSteerBar())
+	if m.detail.steer.mode == steerIdle {
+		chrome++ // the footer (suppressed while the steer bar owns the key hints)
+	}
+	if h := m.height - chrome; h > 3 {
 		return h
 	}
 	return 3
+}
+
+// padLinesToViewport joins lines and pads with blank lines to exactly vp rows, so the
+// transcript column always fills the viewport height and the pane divider joinColumns draws
+// beside it reaches the footer even when the run has fewer lines than the viewport (#379).
+func padLinesToViewport(lines []string, vp int) string {
+	out := make([]string, 0, vp)
+	out = append(out, lines...)
+	for len(out) < vp {
+		out = append(out, "")
+	}
+	return strings.Join(out, "\n")
 }
 
 // transcriptExtent gives the selected lane's total line count and the viewport, so the key
@@ -467,7 +604,8 @@ func (m tuiModel) renderTranscript() string {
 	focused := m.detail.focus == focusTranscript
 	lane, ok := m.detail.selectedLane()
 	if !ok {
-		return m.paneTitleBadge("transcript", focused, "") + "\n" + m.pal.faint.Render("no lane selected")
+		return m.paneTitleBadge("transcript", focused, "") + "\n" +
+			padLinesToViewport([]string{m.pal.faint.Render("no lane selected")}, m.transcriptViewport())
 	}
 	lines := m.buildTranscriptLines(lane)
 	vp := m.transcriptViewport()
@@ -490,7 +628,9 @@ func (m tuiModel) renderTranscript() string {
 	if end > len(lines) {
 		end = len(lines)
 	}
-	window := strings.Join(lines[top:end], "\n")
+	// Pad to the full viewport so the transcript column, and the pane divider beside it,
+	// reach the bottom of the screen even when the content is shorter than the viewport (#379).
+	window := padLinesToViewport(lines[top:end], vp)
 
 	return m.paneTitleBadge("transcript", focused, m.followBadge(top, maxTop)) + "\n" + window
 }
@@ -552,14 +692,17 @@ func transcriptText(f laneFrame) string {
 	return compactText(string(f.Payload))
 }
 
-// joinColumns places the rail beside the body at a fixed gutter.
+// joinColumns places the rail beside the body at a fixed gutter. The row count is the RIGHT
+// (transcript) column's height, NOT max(left, right): the transcript is padded to exactly the
+// viewport (padLinesToViewport), so it is the height budget for the whole two-pane body. A
+// rail TALLER than that — a run with many lanes plus a long milestone block — is truncated to
+// it rather than pushing the total past the terminal height and clipping the footer below the
+// body (issue #379: the footer carries pane nav / esc / ? and must always render). A shorter
+// rail is padded, which is what fills the divider to the bottom.
 func joinColumns(left, right string, width int) string {
 	l := strings.Split(left, "\n")
 	r := strings.Split(right, "\n")
-	n := len(l)
-	if len(r) > n {
-		n = len(r)
-	}
+	n := len(r)
 	var sb strings.Builder
 	for i := 0; i < n; i++ {
 		var lv, rv string
