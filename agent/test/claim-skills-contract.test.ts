@@ -36,6 +36,21 @@ test("claim wire contract: worker parses the server's skill shape", () => {
   // present here, so the parse is pinned across the language boundary.
   assert.equal(claim.repo.forge_type, "gitlab");
 
+  // PRD #381: the bounded, bot-filtered snapshot of the issue's human comments rides
+  // the claim next to issue_description. The golden carries one comment with truncated
+  // set, so the worker's parse of the whole snapshot (comment fields + truncated flag)
+  // is pinned across the language boundary; typing the parse as ClaimResponse also makes
+  // `npm run typecheck` fail if issue_comments is dropped from protocol.ts.
+  assert.equal(claim.issue_comments?.truncated, true);
+  assert.deepEqual(claim.issue_comments?.comments, [
+    {
+      author_username: "carol",
+      author_forge_user_id: 42,
+      created_at: "2026-07-04T09:00:00Z",
+      body: "please guard on Valid",
+    },
+  ]);
+
   // PRD #19's autopilot flag rides the same claim shape (post-landing merge): the
   // worker must still parse the skills fields alongside it.
   assert.equal(claim.auto_approve, true);

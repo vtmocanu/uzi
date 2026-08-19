@@ -6,11 +6,12 @@ audience: user
 
 # Forge read tools
 
-A run's subagents can read its own project's forge (GitLab or Forgejo) —
-issues, merge requests, pipelines, and label history — to check a claim
-against live state instead of trusting the repo's own restatement of it.
-This is separate from [chat](./chat.md)'s `propose_issue`: it is
-**read-only**, and it runs inside a run, not a chat conversation.
+A run's subagents can read its own project's forge (GitLab, Forgejo, or
+GitHub) — issues (title, description, and now comments), merge requests,
+pipelines, and label history — to check a claim against live state instead
+of trusting the repo's own restatement of it. This is separate from
+[chat](./chat.md)'s `propose_issue`: it is **read-only**, and it runs
+inside a run, not a chat conversation.
 
 ## The six tools
 
@@ -19,7 +20,7 @@ Exposed as in-process MCP tools under the server name `forge`
 
 | Tool | Answers |
 |---|---|
-| `get_issue(iid)` | One issue's title, state, labels, author, and description (capped at 32 KiB; `description_truncated` flags a cut). |
+| `get_issue(iid)` | One issue's title, state, labels, author, description (capped at 32 KiB; `description_truncated` flags a cut), and its human comments (bot- and system-note-filtered, oldest-first, capped at 200 items / 32 KiB total; `comments_truncated` flags a cut). |
 | `list_issues(state?, labels?, updated_after?)` | Filtered issue summaries, no descriptions, capped at 50 rows with `truncated`. |
 | `list_issue_label_events(iid)` | Who added/removed which label and when, on one issue. |
 | `get_merge_request(iid)` | An MR's state. |
@@ -69,7 +70,11 @@ attacker-influenceable — anyone who can open an issue or MR controls
 them. Every successful payload is wrapped in a nonce-fenced "untrusted
 evidence" envelope before it reaches the model, the same framing
 [chat](./chat.md) uses for run logs and issue text, so a prompt-injection
-attempt inside a forge payload reads as data, not instructions.
+attempt inside a forge payload reads as data, not instructions. Issue
+**comments** join that same nonce-fenced untrusted-evidence class — each
+comment is independently attacker-authored, so `get_issue`'s comment list
+is filtered (uzi's own bot comments and forge system notes dropped) and
+capped the same way as its description before it ever reaches the model.
 
 ## Status
 
