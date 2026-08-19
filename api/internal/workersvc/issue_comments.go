@@ -11,6 +11,14 @@ import (
 // of handler.MaxForgeBodyBytes (32768). Measured over the sum of comment bodies.
 const maxIssueCommentsBytes = 32768
 
+// maxIssueCommentsCount bounds the NUMBER of comments retained, independently of
+// maxIssueCommentsBytes. The byte cap charges body bytes only, so a thread of many
+// tiny comments could otherwise retain tens of thousands of entries whose per-entry
+// metadata (author, id, timestamp, JSON keys) balloons the stored JSONB and the
+// claim payload far past the nominal byte cap. 200 newest comments is far more than
+// any real issue thread of human guidance needs, while bounding that overhead.
+const maxIssueCommentsCount = 200
+
 // IssueCommentSnapshot is one human comment captured at run creation (PRD #381 D7).
 type IssueCommentSnapshot struct {
 	AuthorUsername    string    `json:"author_username"`
@@ -20,7 +28,9 @@ type IssueCommentSnapshot struct {
 }
 
 // IssueCommentsSnapshot is the structured JSONB stored in runs.issue_comments and
-// carried on the claim. Truncated is set when the D4 byte cap dropped older comments.
+// carried on the claim. Truncated is set whenever the thread was clipped to fit the
+// bounds: older comments dropped by the count or byte cap, or a single over-cap
+// newest body trimmed in place — i.e. the agent is not seeing the whole thread.
 type IssueCommentsSnapshot struct {
 	Comments  []IssueCommentSnapshot `json:"comments"`
 	Truncated bool                   `json:"truncated"`
@@ -50,12 +60,20 @@ func buildIssueCommentsSnapshot(comments []forge.IssueComment, botForgeUserID in
 		return nil
 	}
 
+	truncated := false
+
+	// Count cap over the NEWEST tail, applied before the byte cap so a flood of tiny
+	// comments cannot retain an unbounded number of entries (metadata amplification).
+	if len(kept) > maxIssueCommentsCount {
+		kept = kept[len(kept)-maxIssueCommentsCount:]
+		truncated = true
+	}
+
 	// D4 byte cap over the NEWEST tail. Sum the kept bodies; if they fit, keep all.
 	total := 0
 	for _, c := range kept {
 		total += len(c.Body)
 	}
-	truncated := false
 	if total > maxIssueCommentsBytes {
 		truncated = true
 		// Walk from the newest (last) backward, accumulating until adding the

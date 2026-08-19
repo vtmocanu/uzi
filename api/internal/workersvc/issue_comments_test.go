@@ -116,6 +116,36 @@ func TestBuildIssueCommentsSnapshotOverCap(t *testing.T) {
 	}
 }
 
+// TestBuildIssueCommentsSnapshotCountCap — a flood of tiny comments is clipped to the
+// newest maxIssueCommentsCount entries (bounding metadata amplification), oldest-first
+// among kept, with Truncated set. Fails if the count cap is removed (the byte cap alone
+// would keep all of these, since their summed bodies fit well under maxIssueCommentsBytes).
+func TestBuildIssueCommentsSnapshotCountCap(t *testing.T) {
+	const bot = int64(7)
+	n := maxIssueCommentsCount + 50
+	in := make([]forge.IssueComment, 0, n)
+	for i := 0; i < n; i++ {
+		in = append(in, forge.IssueComment{AuthorForgeUserID: 42, AuthorUsername: "human", Body: "x", CreatedAt: commentTS(i + 1)})
+	}
+	got := buildIssueCommentsSnapshot(in, bot)
+	if got == nil {
+		t.Fatal("want a snapshot, got nil")
+	}
+	if !got.Truncated {
+		t.Error("a thread exceeding the count cap must set Truncated")
+	}
+	if len(got.Comments) != maxIssueCommentsCount {
+		t.Fatalf("want the newest %d comments retained, got %d", maxIssueCommentsCount, len(got.Comments))
+	}
+	// The newest comment (highest timestamp) must survive; the oldest must be dropped.
+	if got.Comments[len(got.Comments)-1].CreatedAt != commentTS(n) {
+		t.Fatalf("want the newest comment (ts=%d) retained, got ts=%v", n, got.Comments[len(got.Comments)-1].CreatedAt.Unix())
+	}
+	if !got.Comments[0].CreatedAt.After(commentTS(1)) {
+		t.Fatalf("want the oldest comments dropped, but oldest kept is ts=%v", got.Comments[0].CreatedAt.Unix())
+	}
+}
+
 // TestBuildIssueCommentsSnapshotSingleOverCap — when the single newest body alone
 // exceeds the cap, it is kept with its body truncated byte-safe on a UTF-8 rune
 // boundary and Truncated set. Uses a multi-byte body so a naive byte cut would split
