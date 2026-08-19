@@ -54,6 +54,9 @@ func (f *fakeUserForge) UpdateIssueLabels(context.Context, int64, int64, []strin
 func (f *fakeUserForge) ListIssueLabelEvents(context.Context, int64, int64) ([]forge.LabelEvent, error) {
 	return nil, nil
 }
+func (f *fakeUserForge) ListIssueComments(context.Context, int64, int64) ([]forge.IssueComment, error) {
+	return nil, nil
+}
 func (f *fakeUserForge) CreateIssueNote(context.Context, int64, int64, string) (forge.IssueNote, error) {
 	return forge.IssueNote{}, nil
 }

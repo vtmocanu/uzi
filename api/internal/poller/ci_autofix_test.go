@@ -244,6 +244,9 @@ func (f *cfForge) UpdateIssueLabels(context.Context, int64, int64, []string, []s
 func (f *cfForge) ListIssueLabelEvents(context.Context, int64, int64) ([]forge.LabelEvent, error) {
 	return nil, nil
 }
+func (f *cfForge) ListIssueComments(context.Context, int64, int64) ([]forge.IssueComment, error) {
+	return nil, nil
+}
 func (f *cfForge) UserExists(context.Context, string) (bool, error) { return false, nil }
 func (f *cfForge) GetMergeRequest(context.Context, int64, int64) (forge.MergeRequest, error) {
 	return forge.MergeRequest{}, nil

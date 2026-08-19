@@ -373,6 +373,69 @@ func TestListIssueLabelEventsParses(t *testing.T) {
 	}
 }
 
+// TestListIssueCommentsFiltersSystemAndNormalizesOrder pins PRD #381 M1 for
+// GitLab: a system note is dropped (D2), the human notes come back oldest-first
+// (D8) even though GitLab defaults newest-first, and the neutral shape carries
+// author id/username/body/created_at. The driver asks GitLab for ascending order
+// (sort=asc), so the mock echoes them in that order to model the wire response.
+func TestListIssueCommentsFiltersSystemAndNormalizesOrder(t *testing.T) {
+	var gotSort, gotOrderBy string
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/issues/11/notes": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				t.Errorf("expected GET, got %s", r.Method)
+			}
+			gotSort = r.URL.Query().Get("sort")
+			gotOrderBy = r.URL.Query().Get("order_by")
+			w.Header().Set("X-Next-Page", "")
+			// Ascending (oldest-first) as the driver requests: the earlier human
+			// note, a system note, then the later human note.
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{
+					"id": 601, "system": false, "body": "please guard on Valid",
+					"author":     map[string]any{"id": 42, "username": "carol"},
+					"created_at": "2026-07-04T09:00:00Z",
+				},
+				{
+					"id": 602, "system": true, "body": "changed the milestone",
+					"author":     map[string]any{"id": 99, "username": "gitlab-bot"},
+					"created_at": "2026-07-04T09:30:00Z",
+				},
+				{
+					"id": 603, "system": false, "body": "and revise the existing test",
+					"author":     map[string]any{"id": 43, "username": "dave"},
+					"created_at": "2026-07-04T10:00:00Z",
+				},
+			})
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	comments, err := d.ListIssueComments(context.Background(), 7, 11)
+	if err != nil {
+		t.Fatalf("ListIssueComments: %v", err)
+	}
+	if gotSort != "asc" || gotOrderBy != "created_at" {
+		t.Errorf("driver did not request oldest-first ordering: sort=%q order_by=%q", gotSort, gotOrderBy)
+	}
+	if len(comments) != 2 {
+		t.Fatalf("expected 2 human comments (system note dropped), got %d: %+v", len(comments), comments)
+	}
+	first := comments[0]
+	if first.AuthorForgeUserID != 42 || first.AuthorUsername != "carol" || first.Body != "please guard on Valid" {
+		t.Fatalf("unexpected first comment shape: %+v", first)
+	}
+	if first.CreatedAt.IsZero() {
+		t.Error("expected a non-zero CreatedAt on the first comment")
+	}
+	if !comments[0].CreatedAt.Before(comments[1].CreatedAt) {
+		t.Errorf("comments not oldest-first: %v then %v", comments[0].CreatedAt, comments[1].CreatedAt)
+	}
+	if comments[1].AuthorUsername != "dave" || comments[1].Body != "and revise the existing test" {
+		t.Fatalf("unexpected second comment: %+v", comments[1])
+	}
+}
+
 func TestCreateIssueNoteSendsBody(t *testing.T) {
 	var gotBody string
 	m := newMockGitLab(t, map[string]http.HandlerFunc{
@@ -427,6 +490,9 @@ func TestNewMethodsRedactErrors(t *testing.T) {
 	}
 	if _, err := d.CreateIssueNote(context.Background(), 7, 11, "x"); err == nil || strings.Contains(err.Error(), token) {
 		t.Fatalf("CreateIssueNote leaked or did not error: %v", err)
+	}
+	if _, err := d.ListIssueComments(context.Background(), 7, 11); err == nil || strings.Contains(err.Error(), token) {
+		t.Fatalf("ListIssueComments leaked or did not error: %v", err)
 	}
 }
 

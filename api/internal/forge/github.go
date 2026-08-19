@@ -679,6 +679,52 @@ func (g *github) ListIssueLabelEvents(ctx context.Context, projectID, issueIID i
 	return out, nil
 }
 
+// ListIssueComments returns an issue's human comments, oldest-first (PRD #381).
+// GitHub's issue-comments endpoint returns human comments only — events and the
+// timeline are separate endpoints — so no System filter is needed (D2), and the
+// default sort is created ASC (already oldest-first, D8). Paginated.
+func (g *github) ListIssueComments(ctx context.Context, projectID, issueIID int64) ([]IssueComment, error) {
+	slug, err := g.repoSlugFor(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	opt := &gh.IssueListCommentsOptions{ListOptions: gh.ListOptions{PerPage: githubPerPage}}
+	var out []IssueComment
+	page := 0
+	for {
+		page++
+		comments, resp, err := g.client.Issues.ListComments(ctx, slug.owner, slug.repo, int(issueIID), opt)
+		if err != nil {
+			return nil, g.wrapErr("list issue comments", err)
+		}
+		for _, c := range comments {
+			if c == nil {
+				continue
+			}
+			ic := IssueComment{
+				Body:      c.GetBody(),
+				CreatedAt: c.GetCreatedAt().Time,
+			}
+			if u := c.GetUser(); u != nil {
+				ic.AuthorForgeUserID = u.GetID()
+				ic.AuthorUsername = u.GetLogin()
+			}
+			out = append(out, ic)
+		}
+		if len(out) > maxForgeItems {
+			return nil, g.wrapErr("list issue comments", forgePaginationCapErr("item", maxForgeItems))
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		if page >= maxForgePages {
+			return nil, g.wrapErr("list issue comments", forgePaginationCapErr("page", maxForgePages))
+		}
+		opt.Page = resp.NextPage
+	}
+	return out, nil
+}
+
 func (g *github) CreateIssueNote(ctx context.Context, projectID, issueIID int64, body string) (IssueNote, error) {
 	slug, err := g.repoSlugFor(ctx, projectID)
 	if err != nil {
