@@ -361,6 +361,12 @@ type Store interface {
 	UpdateDispositionLastTitle(ctx context.Context, arg store.UpdateDispositionLastTitleParams) (int64, error)
 	SetRunRunning(ctx context.Context, arg store.SetRunRunningParams) (int64, error)
 	SetRunAwaitingApproval(ctx context.Context, arg store.SetRunAwaitingApprovalParams) (int64, error)
+	// Plain-English run summaries (PRD #362 M1). Intent is a plain UPDATE (the
+	// idempotent-on-set decision lives in the service); the plan write carries the
+	// Decision 3 stale-write guard (updates only if plan_md still matches), returning
+	// rows-affected so the service detects a stale (0-row) write.
+	SetRunIntentSummary(ctx context.Context, arg store.SetRunIntentSummaryParams) (int64, error)
+	SetRunPlanSummary(ctx context.Context, arg store.SetRunPlanSummaryParams) (int64, error)
 	// SetRunAwaitingInput parks a run on a clarification question (PRD #88 M1) and
 	// stamps the question's identity. It clears health on entry, which is what makes
 	// leaving `awaiting_input` out of ListActiveRunsForHealth safe — see the query.

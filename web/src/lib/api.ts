@@ -1320,6 +1320,18 @@ export interface Run {
    *  never dereferenced, so an absent value reads as not-seeded and the seeded surfaces
    *  simply do not render (no `?? null` normalization needed, unlike pending_judge). */
   plan_source?: PlanSource;
+  /** PRD #362: plain-English run summaries. `summary_intent` ("what this run will
+   *  implement") lands early in `running`; `summary_plan` ("what the proposed plan will
+   *  do") and `summary_deltas` (how the plan diverged from the ask) land at the plan gate.
+   *  All null until the worker generates and posts them, and null forever on any
+   *  generation failure — summaries are advisory and the UI falls back to the issue title.
+   *  UNTRUSTED, model-authored text: render as escaped plain text, never <Markdown>. A
+   *  malformed `summary_deltas` is tolerated server-side and arrives as null ("no
+   *  deltas"). OPTIONAL for the SAME api/web rollout skew as plan_source — a mid-deploy api
+   *  pod that predates these fields omits the keys. */
+  summary_intent?: string | null;
+  summary_plan?: string | null;
+  summary_deltas?: { kind: string; text: string }[] | null;
   /** PRD #37: the roster the worker detected in the clone's `.claude/agents/`.
    *  null = no worker reported (a pre-feature run); `[]` = detection ran and found
    *  none (the plan gate's repo card is inert, NOT the same as null). Names +

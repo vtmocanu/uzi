@@ -368,6 +368,10 @@ func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
 		HealthSince:   timePtr(r.HealthSince.Valid, r.HealthSince.Time),
 		PlanMd:        textPtrValue(r.PlanMd.Valid, r.PlanMd.String),
 		PlanSource:    r.PlanSource,
+		// PRD #362 M1: plain-English summaries. Intent/plan are nullable text; deltas
+		// are decoded below (tolerate-on-read) so a malformed value cannot fail the read.
+		SummaryIntent: textPtrValue(r.SummaryIntent.Valid, r.SummaryIntent.String),
+		SummaryPlan:   textPtrValue(r.SummaryPlan.Valid, r.SummaryPlan.String),
 		PipelineRef:   textPtrValue(r.PipelineRef.Valid, r.PipelineRef.String),
 		FixVerdict:    textPtrValue(r.FixVerdict.Valid, r.FixVerdict.String),
 		ReportOnly:    r.ReportOnly,
@@ -493,6 +497,15 @@ func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
 	if r.BudgetWallSeconds.Valid {
 		v := int(r.BudgetWallSeconds.Int32)
 		dto.BudgetWallSeconds = &v
+	}
+	// PRD #362 M1, Decision 6 (tolerate-on-read): decode the summary_deltas jsonb into
+	// the typed slice; a malformed or unexpected value renders as NO deltas (nil), logged
+	// and never a panic — the deltas are advisory and a prior write's data, not an
+	// invariant of this read. Mirrors the milestones decode above.
+	if deltas, err := workersvc.DecodeSummaryDeltas(r.SummaryDeltas); err != nil {
+		slog.Error("decode run summary deltas", "run_id", r.ID, "error", err)
+	} else {
+		dto.SummaryDeltas = deltas
 	}
 	// The failing pipeline's URL rides the frozen snapshot, not a column (the
 	// pipeline cache row is transient). Best-effort decode; a ci_fix run always has

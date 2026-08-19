@@ -86,6 +86,10 @@ var runDTOKeys = []string{
 	"stop_kind", "health", "health_reason", "health_since", "plan_md",
 	// PRD #209: plan_md's provenance ("agent"|"seeded"), NOT NULL so always on the wire.
 	"plan_source",
+	// PRD #362 M1: plain-English run summaries. All three null until the worker posts
+	// them (and null forever on any generation failure); summary_deltas is
+	// tolerated-on-read (a malformed stored value arrives as null). Always on the wire.
+	"summary_intent", "summary_plan", "summary_deltas",
 	"pipeline_ref", "pipeline_web_url", "fix_verdict",
 	// issue #279: a completed run that opened NO merge request (report-only/evidence
 	// completion) and its persisted findings summary. report_only is NOT NULL so always
