@@ -145,6 +145,11 @@ func (d *detailState) addFrame(f laneFrame) {
 
 func (d *detailState) rebuild() {
 	d.lanes = buildLanes(d.frames)
+	// Prepend the aggregated "all agents" lane once a run has ≥2 real lanes, so index 0 is
+	// the firehose (the default landing) and the individual lanes follow for isolating one.
+	if len(d.lanes) >= 2 {
+		d.lanes = append([]agentLane{allLane(d.frames)}, d.lanes...)
+	}
 	if d.laneIdx >= len(d.lanes) {
 		d.laneIdx = len(d.lanes) - 1
 	}
@@ -526,17 +531,21 @@ func (m tuiModel) renderLaneRail() string {
 		return sb.String()
 	}
 
+	suffixes := laneSuffixes(d.lanes)
+	// The ALL row ignores this state (laneRow paints it a neutral ◉), so a plain per-key ladder
+	// is fine for every row — no rollup.
+	st := func(l agentLane) crewState {
+		return crewStateFor(d.run.Status, d.run.Health, l.Key, active, l.LastActivity, now)
+	}
 	if d.railCollapsed {
 		// Just the selected lane, so the reader still knows whose transcript is on screen while
 		// the milestones get the rest of the column.
 		if l, ok := d.selectedLane(); ok {
-			st := crewStateFor(d.run.Status, d.run.Health, l.Key, active, l.LastActivity, now)
-			sb.WriteString(m.laneRow(l, true, st))
+			sb.WriteString(m.laneRow(l, true, st(l), suffixes[l.Key]))
 		}
 	} else {
 		for i, l := range d.lanes {
-			st := crewStateFor(d.run.Status, d.run.Health, l.Key, active, l.LastActivity, now)
-			sb.WriteString(m.laneRow(l, i == d.laneIdx, st))
+			sb.WriteString(m.laneRow(l, i == d.laneIdx, st(l), suffixes[l.Key]))
 		}
 	}
 	if block := m.renderMilestones(); block != "" {
@@ -545,28 +554,51 @@ func (m tuiModel) renderLaneRail() string {
 	return sb.String()
 }
 
+// laneIdentities maps each real lane's key to the identity string the crew rail shows for it,
+// so the aggregated transcript can tag every frame with the SAME token its lane row carries:
+// the role, plus a ·N ordinal suffix (laneSuffixes) only when the run has two lanes of one
+// role. The ALL lane itself is skipped. The role goes through Plain (D7) at the same cap
+// laneRow uses, so the tag and the rail row are byte-identical.
+func (m tuiModel) laneIdentities() map[string]string {
+	suffixes := laneSuffixes(m.detail.lanes)
+	out := make(map[string]string, len(m.detail.lanes))
+	for _, l := range m.detail.lanes {
+		if l.Key == laneAllKey {
+			continue
+		}
+		out[l.Key] = m.renderer.Plain(l.Role, 14) + suffixes[l.Key]
+	}
+	return out
+}
+
 // laneRow renders one crew-rail row: the ▸ cursor, the status dot, the model-authored role and
-// (untrusted) instance id, and the optional italic label line beneath it. A selected lane rides
-// the warm selection bar (like the board). The role, id and label are all UNTRUSTED and go
-// through renderer.Plain (D7) — keeping every cell's sanitizing in this one helper is why the
-// collapsed and expanded paths share it.
-func (m tuiModel) laneRow(l agentLane, selected bool, st crewState) string {
+// an optional ·N disambiguating ordinal, and the optional italic label line beneath it. A
+// selected lane rides the warm selection bar (like the board). The role and label are UNTRUSTED
+// and go through renderer.Plain (D7); the ordinal suffix is derived, not untrusted. Keeping
+// every cell's sanitizing in this one helper is why the collapsed and expanded paths share it.
+func (m tuiModel) laneRow(l agentLane, selected bool, st crewState, suffix string) string {
 	var bg color.Color
 	if selected {
 		bg = m.pal.selBg
 	}
 	dotC := m.pal.state(st).GetForeground()
+	dot := laneDot(st)
+	if l.Key == laneAllKey {
+		// The aggregated row is a META lane, not an actor, so it wears a neutral tungsten ◉ (a
+		// circle-family glyph, distinct from the plain ● state dot) rather than a crew state
+		// dot — it never flashes the alarming ▲ a worst-state rollup would put on the whole run.
+		dot, dotC = "◉", m.pal.tungsten
+	}
 	cursor := paintSeg(nil, bg, false, " ")
 	if selected {
 		cursor = paintSeg(m.pal.tungsten, bg, true, "▸")
 	}
-	line := cursor + paintSeg(dotC, bg, false, laneDot(st)) + paintSeg(nil, bg, false, " "+m.renderer.Plain(l.Role, 14))
-	if l.Key != l.Role {
-		// The instance id is UNTRUSTED like everything else on this rail: it is the SDK's
-		// parent_tool_use_id, forwarded verbatim. shortInstanceID only takes a tail — it does
-		// not sanitize — so the result goes through Plain like every other cell. Rendering it
-		// raw was a real hole, caught by TestTUIViewsStripControlBytesFromUntrustedText.
-		line += paintSeg(m.pal.faintC, bg, false, "·"+m.renderer.Plain(shortInstanceID(l.Key), 8))
+	line := cursor + paintSeg(dotC, bg, false, dot) + paintSeg(nil, bg, false, " "+m.renderer.Plain(l.Role, 14))
+	if suffix != "" {
+		// A ·N ordinal disambiguates two lanes of one role (laneSuffixes). It is DERIVED, not
+		// the opaque SDK invocation id, so the id tail never reaches the rail — a lone role
+		// shows no suffix at all — and there is nothing untrusted here to sanitize.
+		line += paintSeg(m.pal.faintC, bg, false, suffix)
 	}
 	var sb strings.Builder
 	sb.WriteString(padSeg(line, laneRailWidth, bg) + "\n")
@@ -688,15 +720,90 @@ func (m tuiModel) renderMilestones() string {
 // a ▪ header (tungsten) over its markdown body; a tool frame compresses to a single faint
 // `⚙ <tool> #seq` line. f.Kind and the tool name are drawn through renderer.Plain (D7); the body
 // through renderer.Markdown.
+// buildTranscriptLines renders a lane's frames to human-readable display lines (no windowing),
+// so the follow/scroll windowing and the line-count extent share one layout. The presentation
+// is written for a person, not a log reader:
+//   - text/thinking  the message body (markdown), with NO "text #123" header — the body is the
+//     message. In the aggregated lane it gets a tungsten "▪ <who>" speaker line so interleaved
+//     turns stay attributable; a single-lane view needs none (the pane title names the lane).
+//   - tool_use       "⚙ <Tool>  <what it ran>" — the tool plus a compact arg preview (the
+//     command / path / pattern), never the internal seq.
+//   - tool_result    a faint "  ↳ <summary>" folded UNDER its call, the escaped-newline JSON
+//     dump flattened to one readable line (resultSummary) instead of raw "{"content":"…\n…"}".
+//   - anything else  a humanized "▪ <kind>" header (no seq) over its body.
+//
+// Every model-authored string is UNTRUSTED and passes through Plain/Markdown (D7); the whole
+// palette stays ANDON's two intensities (tungsten accent over faint body), no per-frame colour.
 func (m tuiModel) buildTranscriptLines(lane agentLane) []string {
-	var sb strings.Builder
-	for _, f := range lane.Frames {
-		if name, ok := toolFrameName(f); ok {
-			sb.WriteString(m.pal.faint.Render("⚙ "+m.renderer.Plain(name, 24)+" #"+itoa(int(f.Seq))) + "\n\n")
-			continue
+	aggregated := lane.Key == laneAllKey
+	var ids map[string]string
+	if aggregated {
+		ids = m.laneIdentities()
+	}
+	tungsten := lipgloss.NewStyle().Foreground(m.pal.tungsten)
+	tungstenB := tungsten.Bold(true)
+	width := m.transcriptWidth()
+	// who returns the aggregated lane's per-frame identity tag (empty in a single-lane view).
+	who := func(f laneFrame) string {
+		if !aggregated {
+			return ""
 		}
-		sb.WriteString(lipgloss.NewStyle().Foreground(m.pal.tungsten).Render("▪ "+m.renderer.Plain(f.Kind, 16)+" #"+itoa(int(f.Seq))) + "\n")
-		sb.WriteString(m.renderer.Markdown(transcriptText(f)) + "\n\n")
+		id := ids[laneKeyOf(f)]
+		if id == "" {
+			id = m.renderer.Plain(frameAgentTag(f), 16)
+		}
+		return id
+	}
+	var sb strings.Builder
+	for i, f := range lane.Frames {
+		var block string
+		switch f.Kind {
+		case "tool_use":
+			name, ok := toolFrameName(f)
+			if !ok {
+				name = "tool"
+			}
+			// The tool NAME is the scannable anchor of a busy tool run (many ⚙ Bash lines in a
+			// row), so it gets the bold tungsten accent; the ⚙ glyph and the arg preview stay
+			// faint. The ·<who> comes BEFORE the command, not after: a long command is the
+			// truncatable tail, and in the aggregated view the attribution must never be the
+			// thing clampVisual cuts off (it did, on long greps).
+			line := m.pal.faint.Render("⚙ ") + tungstenB.Render(m.renderer.Plain(name, 24))
+			if w := who(f); w != "" {
+				line += m.pal.faint.Render(" · ") + tungsten.Render(w)
+			}
+			if arg := toolArgPreview(f.Payload); arg != "" {
+				line += m.pal.faint.Render("  " + m.renderer.Plain(arg, 200))
+			}
+			block = clampVisual(line, width)
+		case "tool_result":
+			sum := resultSummary(f.Payload)
+			if sum == "" {
+				sum = "(no output)"
+			}
+			block = clampVisual(m.pal.faint.Render("  ↳ "+m.renderer.Plain(sum, 200)), width)
+		case "text", "thinking":
+			// TrimLeft drops Glamour's document top-margin so the body sits directly under the
+			// "▪ <who>" speaker line instead of a blank line below it.
+			body := strings.TrimLeft(m.renderer.Markdown(transcriptText(f)), "\n")
+			if w := who(f); w != "" {
+				block = tungsten.Render("▪ "+w) + "\n"
+			}
+			block += body
+		default:
+			head := tungsten.Render("▪ " + m.renderer.Plain(f.Kind, 16))
+			if w := who(f); w != "" {
+				head += m.pal.faint.Render("  · ") + tungsten.Render(w)
+			}
+			block = clampVisual(head, width) + "\n" + strings.TrimLeft(m.renderer.Markdown(transcriptText(f)), "\n")
+		}
+		// Blocks are blank-line separated, EXCEPT a tool_use and the tool_result that follows it
+		// pair tight (a single newline), so a call and its output read as one unit.
+		sep := "\n\n"
+		if f.Kind == "tool_use" && i+1 < len(lane.Frames) && lane.Frames[i+1].Kind == "tool_result" {
+			sep = "\n"
+		}
+		sb.WriteString(block + sep)
 	}
 	return strings.Split(strings.TrimRight(sb.String(), "\n"), "\n")
 }
@@ -714,6 +821,61 @@ func toolFrameName(f laneFrame) (string, bool) {
 		return p.Name, true
 	}
 	return "", false
+}
+
+// toolArgPreview renders a tool_use's arguments as a compact one-liner for the transcript, so a
+// reader sees WHAT ran, not just the tool name: the command for Bash, the path for a file tool,
+// the pattern/url otherwise, else the whole input folded. The value is model-authored and
+// UNTRUSTED — compactText folds newlines/tabs, strips control bytes and caps the length.
+func toolArgPreview(payload json.RawMessage) string {
+	var p struct {
+		Input map[string]any `json:"input"`
+	}
+	if json.Unmarshal(payload, &p) != nil || len(p.Input) == 0 {
+		return ""
+	}
+	for _, k := range []string{"command", "file_path", "path", "pattern", "query", "url", "description"} {
+		if v, ok := p.Input[k].(string); ok && strings.TrimSpace(v) != "" {
+			return compactText(v)
+		}
+	}
+	b, err := json.Marshal(p.Input)
+	if err != nil {
+		return ""
+	}
+	return compactText(string(b))
+}
+
+// resultSummary flattens a tool_result payload's content into ONE readable line — the TUI twin
+// of the web's resultToText (RunEvent.tsx). Content is a string or an SDK array of
+// {type:"text",text:…} blocks; compactText turns the escaped newlines that made the raw JSON
+// dump unreadable into spaces and caps the length. Non-text blocks (images) are dropped, and an
+// empty/unknown shape yields "" so the caller can show "(no output)".
+func resultSummary(payload json.RawMessage) string {
+	var p struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(payload, &p) != nil || len(p.Content) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(p.Content, &s) == nil {
+		return compactText(s)
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(p.Content, &blocks) == nil {
+		parts := make([]string, 0, len(blocks))
+		for _, b := range blocks {
+			if b.Type == "text" && b.Text != "" {
+				parts = append(parts, b.Text)
+			}
+		}
+		return compactText(strings.Join(parts, " "))
+	}
+	return ""
 }
 
 // transcriptViewport is the transcript's visible line budget (the pane title is a fixed

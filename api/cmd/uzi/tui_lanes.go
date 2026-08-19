@@ -19,6 +19,16 @@ import (
 // LEAD is the orchestrator's role name and the lane key of last resort.
 const laneLead = "lead"
 
+// laneAllKey identifies the synthetic "all agents" lane: an aggregated, seq-ordered
+// interleave of every frame, so a reader can watch the whole crew at once instead of
+// switching lanes. Prepended to the rail (and default-selected) only when there are ≥2
+// real lanes — with one lane it would just duplicate it. The value is a sentinel that a
+// real lane key (an SDK instance id, a role name, or "lead") cannot collide with.
+const (
+	laneAllKey  = "\x00all"
+	laneAllRole = "all agents"
+)
+
 // crewState is the five-value lane dot. D5's PRD text lists four and omits stalled,
 // which is the PRD #47 health integration and the only state that means "attention".
 type crewState string
@@ -208,6 +218,57 @@ func buildLanes(frames []laneFrame) []agentLane {
 		})
 	}
 	return lanes
+}
+
+// laneSuffixes assigns each real lane a disambiguating ordinal suffix: "" when its role is
+// unique in the run, else "·1", "·2", … by first-seen order among the lanes sharing that role.
+// So a lone tester reads "tester" and two concurrent testers read "tester·1"/"tester·2" — the
+// opaque SDK invocation id never reaches the user, and the ordinal is DERIVED (not untrusted),
+// so it needs no sanitizing. The aggregated ALL lane is skipped (it has no role of its own).
+func laneSuffixes(lanes []agentLane) map[string]string {
+	byRole := map[string][]string{}
+	for _, l := range lanes {
+		if l.Key == laneAllKey {
+			continue
+		}
+		byRole[l.Role] = append(byRole[l.Role], l.Key)
+	}
+	out := make(map[string]string, len(lanes))
+	for _, keys := range byRole {
+		if len(keys) < 2 {
+			continue
+		}
+		for i, k := range keys {
+			out[k] = "·" + itoa(i+1)
+		}
+	}
+	return out
+}
+
+// allLane builds the synthetic aggregated lane over EVERY frame (not one key's), so its
+// transcript is the whole run in seq order. It reuses the merged, deduped frame log the
+// per-lane view is filtered from — no second stream, no second follow path.
+func allLane(frames []laneFrame) agentLane {
+	var last time.Time
+	for _, f := range frames {
+		if f.CreatedAt.After(last) {
+			last = f.CreatedAt
+		}
+	}
+	return agentLane{Key: laneAllKey, Role: laneAllRole, Frames: frames, LastActivity: last}
+}
+
+// frameAgentTag names the actor a single frame belongs to, for the per-line attribution the
+// aggregated lane prefixes onto each block. Label first (the agent's own words about its
+// task), then role, then lead — the same precedence buildLanes titles a lane by.
+func frameAgentTag(f laneFrame) string {
+	if f.AgentLabel != "" {
+		return f.AgentLabel
+	}
+	if f.Agent != "" {
+		return f.Agent
+	}
+	return laneLead
 }
 
 // activeLaneKey is the lane of the newest frame while the run is LIVE, and live here

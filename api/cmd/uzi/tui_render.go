@@ -49,25 +49,33 @@ func newTUIRenderer(width int, dark bool) (*tuiRenderer, error) {
 	return &tuiRenderer{md: md}, nil
 }
 
-// tuiGlamourStyle is the stock dark/light glamour style with ONE retune (PRD #325 M6):
-// inline `code` ships as xterm colour 203 (#ff5f5f) in BOTH themes, which reads as an
-// ERROR in a status UI. Recolour it to a calm, cool neutral on the same code background so
-// a code span reads as code, not as a failure. Only the inline Code foreground is touched;
-// CodeBlock (fenced) and everything else are left as glamour ships them.
+// tuiGlamourStyle is the stock dark/light glamour style with ONE retune (PRD #325 M6, revised):
+// inline `code` ships as xterm colour 203 (#ff5f5f) on a filled dark BACKGROUND, which both
+// reads as an ERROR in a status UI and violates the ANDON rule that only ONE surface on screen
+// is ever filled (the amber attention band). Drop the background entirely and recolour the span
+// to the tungsten accent, so a code word reads as code by its COLOUR, not by a pill — the same
+// two-intensity treatment (tungsten over faint) the rest of the frame uses. Only the inline Code
+// style is touched; CodeBlock (fenced) and everything else are left as glamour ships them.
 //
 // The StyleConfig is a value copy of the package default, and Code is a value field, so
-// reassigning cfg.Code.Color mutates only this copy — the shared styles.*Config global is
-// untouched.
+// mutating cfg.Code here changes only this copy — the shared styles.*Config global is untouched.
 func tuiGlamourStyle(dark bool) ansi.StyleConfig {
+	// The stock inline-code style pads with a leading/trailing space (Prefix/Suffix " ") to give
+	// the filled pill breathing room; with the background gone those become stray spaces around
+	// the word, so clear them too.
 	if dark {
 		cfg := styles.DarkStyleConfig
-		c := "#b9c0cb" // cool light grey on the #303030-ish code bg
+		c := "#c9a061" // tungsten (dark), matching newPalette
 		cfg.Code.Color = &c
+		cfg.Code.BackgroundColor = nil
+		cfg.Code.Prefix, cfg.Code.Suffix = "", ""
 		return cfg
 	}
 	cfg := styles.LightStyleConfig
-	c := "#334155" // slate on the light code bg
+	c := "#7c5200" // tungsten (light), matching newPalette
 	cfg.Code.Color = &c
+	cfg.Code.BackgroundColor = nil
+	cfg.Code.Prefix, cfg.Code.Suffix = "", ""
 	return cfg
 }
 
