@@ -49,7 +49,12 @@ jobs:
           # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
           # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
           # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
+          # check-latest is load-bearing: without it setup-go resolves "1.26" to
+          # whatever patch the assigned runner image happens to preinstall (observed
+          # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
+          # above only holds when we force the manifest lookup here.
           go-version: "1.26"
+          check-latest: true
           cache-dependency-path: api/go.sum
       - uses: ./.github/actions/setup-task
       - name: go mod download
@@ -81,7 +86,12 @@ jobs:
           # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
           # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
           # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
+          # check-latest is load-bearing: without it setup-go resolves "1.26" to
+          # whatever patch the assigned runner image happens to preinstall (observed
+          # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
+          # above only holds when we force the manifest lookup here.
           go-version: "1.26"
+          check-latest: true
           cache-dependency-path: api/go.sum
       - uses: ./.github/actions/setup-task
       - name: go mod download
@@ -104,7 +114,12 @@ jobs:
           # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
           # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
           # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
+          # check-latest is load-bearing: without it setup-go resolves "1.26" to
+          # whatever patch the assigned runner image happens to preinstall (observed
+          # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
+          # above only holds when we force the manifest lookup here.
           go-version: "1.26"
+          check-latest: true
           cache-dependency-path: api/go.sum
       - uses: ./.github/actions/setup-task
       - name: go mod download
@@ -148,7 +163,12 @@ jobs:
           # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
           # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
           # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
+          # check-latest is load-bearing: without it setup-go resolves "1.26" to
+          # whatever patch the assigned runner image happens to preinstall (observed
+          # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
+          # above only holds when we force the manifest lookup here.
           go-version: "1.26"
+          check-latest: true
           cache-dependency-path: api/go.sum
       - name: go mod download
         working-directory: api
@@ -180,6 +200,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26"
+          check-latest: true
           cache-dependency-path: controller/go.sum
       - uses: ./.github/actions/setup-task
       - name: go mod download
@@ -200,6 +221,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26"
+          check-latest: true
           cache-dependency-path: controller/go.sum
       - uses: ./.github/actions/setup-task
       - name: go mod download
@@ -220,6 +242,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26"
+          check-latest: true
           cache-dependency-path: controller/go.sum
       - uses: ./.github/actions/setup-task
       - name: go mod download
@@ -328,7 +351,12 @@ jobs:
           # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
           # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
           # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
+          # check-latest is load-bearing: without it setup-go resolves "1.26" to
+          # whatever patch the assigned runner image happens to preinstall (observed
+          # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
+          # above only holds when we force the manifest lookup here.
           go-version: "1.26"
+          check-latest: true
           cache-dependency-path: api/go.sum
       - uses: ./.github/actions/setup-task
       - name: Install shellcheck 0.11.0 (pinned, sha256-verified)

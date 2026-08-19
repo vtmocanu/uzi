@@ -49,6 +49,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26"
+          check-latest: true
 
       - name: Run compose E2E (stub executor)
         run: ./e2e/run-e2e.sh
