@@ -454,7 +454,7 @@ func TestRenderRunDetailSummaries(t *testing.T) {
 		SummaryPlan:   &empty,
 		SummaryDeltas: []apitypes.RunSummaryDelta{
 			{Kind: "added", Text: "   "},
-			{Kind: "changed", Text: "‮"},
+			{Kind: "changed", Text: "\u202e"},
 		},
 	}
 	edgeOut := renderDetail(t, edge)
