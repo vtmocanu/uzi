@@ -39,6 +39,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Make sure the image is present BEFORE we start the container, so an image-fetch
+# fault gets the same loud, framed INFRASTRUCTURE-FAILURE treatment as a readiness
+# timeout (issue #171's contract) instead of dying at `docker run` with a raw
+# daemon error — both are "no tests ran", not a test result. `docker image inspect`
+# is a local no-op when the image is already cached (no registry call), so an
+# offline host with the image present is unaffected; the pull only happens when the
+# image is genuinely absent, and its progress is now visible rather than a silent
+# stall behind the "starting throwaway Postgres" line.
+if ! docker image inspect "$PGIMAGE" >/dev/null 2>&1; then
+  say "pulling $PGIMAGE (not present locally)"
+  if ! docker pull "$PGIMAGE"; then
+    printf '\n\033[1;31m==> INFRASTRUCTURE FAILURE: could not pull %s. NO TESTS RAN.\033[0m\n' "$PGIMAGE" >&2
+    printf '\033[1;31m==> This is NOT a test result. The throwaway Postgres image is unavailable\033[0m\n' >&2
+    printf '\033[1;31m==> (registry unreachable, or an offline host with the image not cached).\033[0m\n' >&2
+    exit 1
+  fi
+fi
+
 say "starting throwaway Postgres ($NAME) on 127.0.0.1:$PORT"
 docker run -d --rm --name "$NAME" \
   -e POSTGRES_USER=uzi -e POSTGRES_DB=uzi -e POSTGRES_PASSWORD="$PGPASS" \

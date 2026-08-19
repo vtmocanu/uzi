@@ -6,6 +6,19 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Fixed
+
+- **`e2e/run-store-it.sh` reports an unavailable throwaway-Postgres image as a
+  framed infrastructure fault, not an opaque `docker run` error.** The script now
+  checks for the image (`docker image inspect`) and, only if it is absent, pulls it
+  with a visible status line before starting the container. A failed pull prints the
+  same loud `INFRASTRUCTURE FAILURE … NO TESTS RAN` banner (on stderr, non-zero exit)
+  that a readiness timeout already gets (issue #171), so an offline host or an
+  unreachable registry can no longer masquerade as a raw Docker error one step
+  earlier in the pipeline. A host with the image already cached is unaffected
+  (`docker image inspect` is a local no-op, no registry call); this does not change
+  the readiness-wait timeout behavior.
+
 ## [0.44.0] - 2026-08-18
 
 ### Changed
