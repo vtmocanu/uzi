@@ -388,6 +388,8 @@ type Run struct {
 	DispatchedAt          pgtype.Timestamptz `json:"dispatched_at"`
 	ReviewTargetRunID     pgtype.UUID        `json:"review_target_run_id"`
 	ReviewRequested       bool               `json:"review_requested"`
+	ThenFixRequested      bool               `json:"then_fix_requested"`
+	ThenFixOfRunID        pgtype.UUID        `json:"then_fix_of_run_id"`
 }
 
 type RunMessage struct {

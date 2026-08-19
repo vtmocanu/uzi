@@ -100,6 +100,7 @@ type FakeClient struct {
 	LastCreateTaskBaseBranch string
 	LastCreateTaskOpenMr     bool
 	LastCreateTaskReview     bool
+	LastCreateTaskThenFix    bool
 	CreateTaskRunErr         error
 	DispatchedRun            apitypes.RunDTO
 	LastDispatchRunID        string
@@ -581,12 +582,13 @@ func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64,
 // refusal still proves the write was reached; CreateTaskRunErr wins over Err so a
 // 422 can be modelled on this verb alone. It appends "create" to TaskCalls so the
 // create → push → dispatch ordering is observable.
-func (f *FakeClient) CreateTaskRun(_ context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested bool) (apitypes.RunDTO, error) {
+func (f *FakeClient) CreateTaskRun(_ context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested, thenFixRequested bool) (apitypes.RunDTO, error) {
 	f.LastCreateTaskRepoID = repoID
 	f.LastCreateTaskContext = taskContext
 	f.LastCreateTaskBaseBranch = baseBranch
 	f.LastCreateTaskOpenMr = openMR
 	f.LastCreateTaskReview = reviewRequested
+	f.LastCreateTaskThenFix = thenFixRequested
 	f.TaskCalls = append(f.TaskCalls, "create")
 	if f.CreateTaskRunErr != nil {
 		return apitypes.RunDTO{}, f.CreateTaskRunErr

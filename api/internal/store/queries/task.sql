@@ -14,8 +14,38 @@
 -- review_requested rides from the caller (--review, PRD #400 M4a): set on this PLAIN task
 -- so that its terminal 'completed' transition auto-creates a diff-review run
 -- (maybeEnqueueTaskReview); false for an ordinary handoff.
-INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, open_mr, review_requested, issue_title, issue_description, auto_approve)
-VALUES (@run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'), @open_mr, @review_requested, @issue_title, @issue_description, true)
+-- then_fix_requested rides from the caller (--then-fix, PRD #400 M5): set on this ORIGINAL
+-- task so that when its auto-spawned review run completes, maybeEnqueueThenFix composes the
+-- review findings into a fix run on the same branch; false for an ordinary handoff.
+INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, open_mr, review_requested, then_fix_requested, issue_title, issue_description, auto_approve)
+VALUES (@run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'), @open_mr, @review_requested, @then_fix_requested, @issue_title, @issue_description, true)
+RETURNING *;
+
+-- name: CreateThenFixRun :one
+-- The dedicated insert for a FIX run (PRD #400 M5): a NORMAL task run that pushes fixes,
+-- derived from a diff-review's findings, back to the ORIGINAL task's branch. It mirrors
+-- CreateTaskReviewRun's immediate-dispatch shape but is IMPLEMENT-mode, not review-mode:
+-- review_target_run_id is NULL (this is not a review — it is a plain task the worker
+-- implements-and-pushes), and then_fix_of_run_id points at the original task it fixes
+-- (provenance + the uq_one_active_then_fix_per_target dedup). branch is the ORIGINAL's
+-- uzi/task/<orig> branch (the fix pushes here, where the user pulls); base_branch is the
+-- original's base. dispatched_at = now() so it is immediately claimable — the branch
+-- already exists (the original + review both used it), so unlike a direct handoff a fix
+-- needs no CLI seed push. auto_approve true (no plan gate); open_mr false (a fix is still a
+-- throwaway handoff); review_requested + then_fix_requested false (no recursion — a fix is
+-- never itself reviewed or re-fixed). id is caller-supplied like CreateTaskReviewRun.
+INSERT INTO runs (
+    id, user_id, repo_id, kind, branch, base_branch,
+    then_fix_of_run_id, review_target_run_id, dispatched_at,
+    auto_approve, open_mr, review_requested, then_fix_requested,
+    issue_title, issue_description
+)
+VALUES (
+    @run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'),
+    @then_fix_of_run_id, NULL, now(),
+    true, false, false, false,
+    @issue_title, @issue_description
+)
 RETURNING *;
 
 -- name: CreateTaskReviewRun :one

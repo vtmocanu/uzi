@@ -23,7 +23,7 @@ VALUES (
     $6, now(), true, false, false,
     $7, ''
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id
 `
 
 type CreateTaskReviewRunParams struct {
@@ -144,15 +144,17 @@ func (q *Queries) CreateTaskReviewRun(ctx context.Context, arg CreateTaskReviewR
 		&i.DispatchedAt,
 		&i.ReviewTargetRunID,
 		&i.ReviewRequested,
+		&i.ThenFixRequested,
+		&i.ThenFixOfRunID,
 	)
 	return i, err
 }
 
 const createTaskRun = `-- name: CreateTaskRun :one
 
-INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, open_mr, review_requested, issue_title, issue_description, auto_approve)
-VALUES ($1, $2, $3::uuid, 'task', $4, $5, $6, $7, $8, $9, true)
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested
+INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, open_mr, review_requested, then_fix_requested, issue_title, issue_description, auto_approve)
+VALUES ($1, $2, $3::uuid, 'task', $4, $5, $6, $7, $8, $9, $10, true)
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id
 `
 
 type CreateTaskRunParams struct {
@@ -163,6 +165,7 @@ type CreateTaskRunParams struct {
 	BaseBranch       pgtype.Text `json:"base_branch"`
 	OpenMr           bool        `json:"open_mr"`
 	ReviewRequested  bool        `json:"review_requested"`
+	ThenFixRequested bool        `json:"then_fix_requested"`
 	IssueTitle       string      `json:"issue_title"`
 	IssueDescription string      `json:"issue_description"`
 }
@@ -181,6 +184,9 @@ type CreateTaskRunParams struct {
 // review_requested rides from the caller (--review, PRD #400 M4a): set on this PLAIN task
 // so that its terminal 'completed' transition auto-creates a diff-review run
 // (maybeEnqueueTaskReview); false for an ordinary handoff.
+// then_fix_requested rides from the caller (--then-fix, PRD #400 M5): set on this ORIGINAL
+// task so that when its auto-spawned review run completes, maybeEnqueueThenFix composes the
+// review findings into a fix run on the same branch; false for an ordinary handoff.
 func (q *Queries) CreateTaskRun(ctx context.Context, arg CreateTaskRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createTaskRun,
 		arg.RunID,
@@ -190,6 +196,7 @@ func (q *Queries) CreateTaskRun(ctx context.Context, arg CreateTaskRunParams) (R
 		arg.BaseBranch,
 		arg.OpenMr,
 		arg.ReviewRequested,
+		arg.ThenFixRequested,
 		arg.IssueTitle,
 		arg.IssueDescription,
 	)
@@ -280,6 +287,151 @@ func (q *Queries) CreateTaskRun(ctx context.Context, arg CreateTaskRunParams) (R
 		&i.DispatchedAt,
 		&i.ReviewTargetRunID,
 		&i.ReviewRequested,
+		&i.ThenFixRequested,
+		&i.ThenFixOfRunID,
+	)
+	return i, err
+}
+
+const createThenFixRun = `-- name: CreateThenFixRun :one
+INSERT INTO runs (
+    id, user_id, repo_id, kind, branch, base_branch,
+    then_fix_of_run_id, review_target_run_id, dispatched_at,
+    auto_approve, open_mr, review_requested, then_fix_requested,
+    issue_title, issue_description
+)
+VALUES (
+    $1, $2, $3::uuid, 'task', $4, $5,
+    $6, NULL, now(),
+    true, false, false, false,
+    $7, $8
+)
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id
+`
+
+type CreateThenFixRunParams struct {
+	RunID            uuid.UUID   `json:"run_id"`
+	UserID           uuid.UUID   `json:"user_id"`
+	RepoID           uuid.UUID   `json:"repo_id"`
+	Branch           pgtype.Text `json:"branch"`
+	BaseBranch       pgtype.Text `json:"base_branch"`
+	ThenFixOfRunID   pgtype.UUID `json:"then_fix_of_run_id"`
+	IssueTitle       string      `json:"issue_title"`
+	IssueDescription string      `json:"issue_description"`
+}
+
+// The dedicated insert for a FIX run (PRD #400 M5): a NORMAL task run that pushes fixes,
+// derived from a diff-review's findings, back to the ORIGINAL task's branch. It mirrors
+// CreateTaskReviewRun's immediate-dispatch shape but is IMPLEMENT-mode, not review-mode:
+// review_target_run_id is NULL (this is not a review — it is a plain task the worker
+// implements-and-pushes), and then_fix_of_run_id points at the original task it fixes
+// (provenance + the uq_one_active_then_fix_per_target dedup). branch is the ORIGINAL's
+// uzi/task/<orig> branch (the fix pushes here, where the user pulls); base_branch is the
+// original's base. dispatched_at = now() so it is immediately claimable — the branch
+// already exists (the original + review both used it), so unlike a direct handoff a fix
+// needs no CLI seed push. auto_approve true (no plan gate); open_mr false (a fix is still a
+// throwaway handoff); review_requested + then_fix_requested false (no recursion — a fix is
+// never itself reviewed or re-fixed). id is caller-supplied like CreateTaskReviewRun.
+func (q *Queries) CreateThenFixRun(ctx context.Context, arg CreateThenFixRunParams) (Run, error) {
+	row := q.db.QueryRow(ctx, createThenFixRun,
+		arg.RunID,
+		arg.UserID,
+		arg.RepoID,
+		arg.Branch,
+		arg.BaseBranch,
+		arg.ThenFixOfRunID,
+		arg.IssueTitle,
+		arg.IssueDescription,
+	)
+	var i Run
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.RepoID,
+		&i.IssueIid,
+		&i.IssueTitle,
+		&i.IssueDescription,
+		&i.Status,
+		&i.RequeueCount,
+		&i.WorkerID,
+		&i.SessionID,
+		&i.LastSeq,
+		&i.Branch,
+		&i.MrIid,
+		&i.FailureReason,
+		&i.PlanMd,
+		&i.IterationCount,
+		&i.ClaimedAt,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.OriginColumn,
+		&i.BoardColumn,
+		&i.MovePendingSince,
+		&i.MrState,
+		&i.AutoApprove,
+		&i.AutopilotCommentedAt,
+		&i.Kind,
+		&i.PipelineID,
+		&i.PipelineRef,
+		&i.FailureSnapshot,
+		&i.FixVerdict,
+		&i.StopKind,
+		&i.AgentSource,
+		&i.AgentExclusions,
+		&i.RepoAgents,
+		&i.Title,
+		&i.ResumeOfRunID,
+		&i.LastActivityAt,
+		&i.Health,
+		&i.HealthReason,
+		&i.HealthSince,
+		&i.HealthNotifiedAt,
+		&i.TargetRunID,
+		&i.MrWebUrl,
+		&i.PrdDonePath,
+		&i.PrdPatchSettledAt,
+		&i.AnthropicSecretID,
+		&i.AnthropicSecretLabel,
+		&i.AnthropicSelectReason,
+		&i.AnthropicHeadroomPct,
+		&i.WaitOnLimit,
+		&i.LimitResetsAt,
+		&i.RetryNotBefore,
+		&i.LimitWaitCount,
+		&i.RateLimitType,
+		&i.OpenQuestionID,
+		&i.ReviseCount,
+		&i.PlanSource,
+		&i.PlannedBaseCommit,
+		&i.RequireBaseMatch,
+		&i.MilestonesCandidate,
+		&i.MilestonesFrozen,
+		&i.MilestonesCompleted,
+		&i.MilestonesInProgress,
+		&i.BudgetMaxIterations,
+		&i.BudgetWallSeconds,
+		&i.ScheduleID,
+		&i.LimitDeadSecretID,
+		&i.ReportOnly,
+		&i.ReportMd,
+		&i.CiConfigPaths,
+		&i.Model,
+		&i.OverrideSubagentModel,
+		&i.FailOrigin,
+		&i.Priority,
+		&i.SummaryIntent,
+		&i.SummaryPlan,
+		&i.SummaryDeltas,
+		&i.IssueComments,
+		&i.BaseBranch,
+		&i.OpenMr,
+		&i.DispatchedAt,
+		&i.ReviewTargetRunID,
+		&i.ReviewRequested,
+		&i.ThenFixRequested,
+		&i.ThenFixOfRunID,
 	)
 	return i, err
 }
@@ -288,7 +440,7 @@ const dispatchTaskRun = `-- name: DispatchTaskRun :one
 UPDATE runs
 SET dispatched_at = now(), updated_at = now()
 WHERE id = $1 AND user_id = $2 AND kind = 'task' AND dispatched_at IS NULL
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id
 `
 
 type DispatchTaskRunParams struct {
@@ -393,12 +545,14 @@ func (q *Queries) DispatchTaskRun(ctx context.Context, arg DispatchTaskRunParams
 		&i.DispatchedAt,
 		&i.ReviewTargetRunID,
 		&i.ReviewRequested,
+		&i.ThenFixRequested,
+		&i.ThenFixOfRunID,
 	)
 	return i, err
 }
 
 const getActiveTaskReviewRunForWorkerTarget = `-- name: GetActiveTaskReviewRunForWorkerTarget :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested FROM runs
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id FROM runs
 WHERE worker_id = $1
   AND kind = 'task'
   AND review_target_run_id = $2
@@ -505,6 +659,8 @@ func (q *Queries) GetActiveTaskReviewRunForWorkerTarget(ctx context.Context, arg
 		&i.DispatchedAt,
 		&i.ReviewTargetRunID,
 		&i.ReviewRequested,
+		&i.ThenFixRequested,
+		&i.ThenFixOfRunID,
 	)
 	return i, err
 }

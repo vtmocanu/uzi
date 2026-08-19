@@ -47,6 +47,7 @@ func newHandoffCmd(env Env, gf *globalFlags) *cobra.Command {
 	handoff.Flags().String("base", "", "branch the task from this ref instead of local HEAD (pushes <ref> as the seed)")
 	handoff.Flags().Bool("mr", false, "have the worker open a merge request for the branch (exempts it from 'uzi handoff rm')")
 	handoff.Flags().Bool("review", false, "after the task completes, run a diff-review and produce findings (fetch with 'uzi handoff review <id>')")
+	handoff.Flags().Bool("then-fix", false, "after the review, auto-apply a fix run for its findings to the same branch (turns on --review)")
 	handoff.Flags().String("repo", "", "repo id to run against (overrides origin auto-detection; see 'uzi repo list')")
 
 	handoff.AddCommand(newHandoffRmCmd(env, gf))
@@ -60,7 +61,13 @@ func runHandoffCreate(env Env, gf *globalFlags, cmd *cobra.Command) error {
 	base, _ := cmd.Flags().GetString("base")
 	mr, _ := cmd.Flags().GetBool("mr")
 	review, _ := cmd.Flags().GetBool("review")
+	thenFix, _ := cmd.Flags().GetBool("then-fix")
 	repoFlag, _ := cmd.Flags().GetString("repo")
+
+	// --then-fix IMPLIES --review: a chained fix consumes the review's findings, so a fix
+	// without a review is meaningless. Turning --review on here (rather than erroring) keeps
+	// `--then-fix` a single convenient flag.
+	reviewRequested := review || thenFix
 
 	// Context: -m > -f (file, or '-' for stdin) > bare stdin (non-TTY).
 	context, err := resolveHandoffContext(env, msg, file)
@@ -91,7 +98,7 @@ func runHandoffCreate(env Env, gf *globalFlags, cmd *cobra.Command) error {
 	}
 
 	// (1) Create — receive the id and the server-named uzi/task/<id> branch.
-	run, err := c.CreateTaskRun(cmd.Context(), repoID, context, strings.TrimSpace(base), mr, review)
+	run, err := c.CreateTaskRun(cmd.Context(), repoID, context, strings.TrimSpace(base), mr, reviewRequested, thenFix)
 	if err != nil {
 		return err
 	}
@@ -120,7 +127,7 @@ func runHandoffCreate(env Env, gf *globalFlags, cmd *cobra.Command) error {
 			run.ID, err, branch, run.ID)
 	}
 
-	return renderHandoff(env, gf, dispatched, branch, review)
+	return renderHandoff(env, gf, dispatched, branch, reviewRequested, thenFix)
 }
 
 // resolveHandoffContext applies the -m > -f > bare-stdin precedence, reusing the
@@ -204,7 +211,7 @@ func parseRepoPath(remote string) string {
 // renderHandoff prints the dispatched task run. --json emits the run DTO (the agent
 // contract); the human render leads with the id and branch, then the pull hint and how
 // to watch/continue.
-func renderHandoff(env Env, gf *globalFlags, run apitypes.RunDTO, branch string, review bool) error {
+func renderHandoff(env Env, gf *globalFlags, run apitypes.RunDTO, branch string, review, thenFix bool) error {
 	p := env.printer(gf)
 	if p.Format == uzicli.FormatJSON {
 		return p.JSON(run)
@@ -218,6 +225,9 @@ func renderHandoff(env Env, gf *globalFlags, run apitypes.RunDTO, branch string,
 	p.Printf("  send more:     uzi run follow-up %s -m \"...\"\n", run.ID)
 	if review {
 		p.Printf("  a diff-review will run when the task completes; read it with: uzi handoff review %s\n", run.ID)
+	}
+	if thenFix {
+		p.Printf("  a fix run will then auto-apply the review's findings to %s (--then-fix)\n", branch)
 	}
 	if run.OpenMr {
 		p.Printf("  an MR will be opened for this branch; it is exempt from 'uzi handoff rm'\n")

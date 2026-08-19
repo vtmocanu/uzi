@@ -38,9 +38,9 @@ type handoffClient struct {
 	rec *handoffRecorder
 }
 
-func (c *handoffClient) CreateTaskRun(ctx context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested bool) (apitypes.RunDTO, error) {
+func (c *handoffClient) CreateTaskRun(ctx context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested, thenFixRequested bool) (apitypes.RunDTO, error) {
 	c.rec.seq = append(c.rec.seq, "create")
-	return c.FakeClient.CreateTaskRun(ctx, repoID, taskContext, baseBranch, openMR, reviewRequested)
+	return c.FakeClient.CreateTaskRun(ctx, repoID, taskContext, baseBranch, openMR, reviewRequested, thenFixRequested)
 }
 
 func (c *handoffClient) DispatchTaskRun(ctx context.Context, runID string) (apitypes.RunDTO, error) {

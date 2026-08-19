@@ -55,7 +55,7 @@ var ErrTaskBaseBranchTooLong = errors.New("base branch is too long")
 // cheap branch-safety assertion (Decision 8) confirms the resolved branch is namespaced
 // and is not the repo's default branch — belt-and-suspenders behind the server-named
 // branch being safe by construction.
-func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, inlineContext, baseBranch string, openMR, reviewRequested bool) (store.Run, error) {
+func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, inlineContext, baseBranch string, openMR, reviewRequested, thenFixRequested bool) (store.Run, error) {
 	id := uuid.New()
 	branch := taskBranchPrefix + id.String()
 
@@ -106,6 +106,7 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 		BaseBranch:       pgTextTrimNarg(baseBranch),
 		OpenMr:           openMR,
 		ReviewRequested:  reviewRequested,
+		ThenFixRequested: thenFixRequested,
 		IssueTitle:       deriveTaskTitle(inlineContext),
 		IssueDescription: inlineContext,
 	})
@@ -177,6 +178,55 @@ func (s *Service) CreateTaskReviewRun(ctx context.Context, userID, repoID, targe
 	// so any live view re-reads it, exactly like DispatchTaskRun does for a plain handoff.
 	s.notify(run.ID, "queued")
 	return run, nil
+}
+
+// ErrThenFixAlreadyActive is returned when a fix run already exists for an original task
+// (the uq_one_active_then_fix_per_target partial unique index raised 23505). The
+// then-fix auto-enqueue hook treats it as a no-op ("a fix is already active"). PRD #400 M5.
+var ErrThenFixAlreadyActive = errors.New("a fix run is already active for this task")
+
+// CreateThenFixRun mints a FIX run for an original task (PRD #400 M5): a NORMAL task run
+// (review_target_run_id NULL) that pushes fixes — composed from a diff-review's findings —
+// back to the original's own branch. It reuses the original's branch (the user pulls fixes
+// there) and is dispatched immediately (the query stamps dispatched_at = now()): the branch
+// already exists, so unlike a direct handoff a fix needs no CLI seed push. Because it is a
+// plain task, the existing worker RunRunner implements-and-pushes it with no new worker code
+// or kind. A concurrent duplicate trips the partial unique index (23505 →
+// ErrThenFixAlreadyActive). The id is minted here for the same server-named-provenance
+// reason CreateTaskRun/CreateTaskReviewRun mint theirs.
+func (s *Service) CreateThenFixRun(ctx context.Context, userID, repoID, originalRunID uuid.UUID, branch, baseBranch, description string) (store.Run, error) {
+	id := uuid.New()
+	run, err := s.q.CreateThenFixRun(ctx, store.CreateThenFixRunParams{
+		RunID:            id,
+		UserID:           userID,
+		RepoID:           repoID,
+		Branch:           pgText(branch),
+		BaseBranch:       pgTextTrimNarg(baseBranch),
+		ThenFixOfRunID:   pgUUID(originalRunID),
+		IssueTitle:       deriveThenFixTitle(branch),
+		IssueDescription: description,
+	})
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return store.Run{}, ErrThenFixAlreadyActive
+		}
+		return store.Run{}, err
+	}
+	// The fix run is already claimable (dispatched_at stamped in SQL); broadcast queued so
+	// any live view re-reads it, exactly like CreateTaskReviewRun / DispatchTaskRun.
+	s.notify(run.ID, "queued")
+	return run, nil
+}
+
+// deriveThenFixTitle synthesizes the display title for a fix run (its issue_description
+// carries the composed findings, but the title stays short). The branch is the original's
+// server-named uzi/task/<id>, safe display text.
+func deriveThenFixTitle(branch string) string {
+	if strings.TrimSpace(branch) == "" {
+		return "Fix of handoff task"
+	}
+	return "Fix of " + branch
 }
 
 // deriveTaskReviewTitle synthesizes the display title for a review run (it has no issue

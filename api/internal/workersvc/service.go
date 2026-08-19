@@ -281,6 +281,10 @@ type Store interface {
 	// diff-review run, its review-run-scoped POST authz, the atomic header+findings
 	// upsert, and the CLI/panel read side.
 	CreateTaskReviewRun(ctx context.Context, arg store.CreateTaskReviewRunParams) (store.Run, error)
+	// CreateThenFixRun inserts the chained fix run for a --then-fix handoff (PRD #400 M5):
+	// a NORMAL task (review_target_run_id NULL) on the original's branch; 23505 → the
+	// one-active-fix-per-target index tripped.
+	CreateThenFixRun(ctx context.Context, arg store.CreateThenFixRunParams) (store.Run, error)
 	GetActiveTaskReviewRunForWorkerTarget(ctx context.Context, arg store.GetActiveTaskReviewRunForWorkerTargetParams) (store.Run, error)
 	UpsertTaskReviewWithFindings(ctx context.Context, arg store.UpsertTaskReviewWithFindingsParams) (uuid.UUID, error)
 	GetTaskReviewForTarget(ctx context.Context, targetRunID uuid.UUID) (store.TaskReview, error)
@@ -3107,6 +3111,11 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// PRD #400 M4a: auto-create a diff-review run for a just-completed --review task,
 		// on the SAME committed transition. Best-effort — never fails the report.
 		s.maybeEnqueueTaskReview(ctx, run)
+		// PRD #400 M5: auto-create a chained fix run when a --then-fix handoff's review
+		// completes with findings. Its gates fire ONLY for a completed review run, and
+		// maybeEnqueueTaskReview's review_target_run_id-null gate makes the two mutually
+		// exclusive. Best-effort — never fails the report.
+		s.maybeEnqueueThenFix(ctx, run)
 	}
 	return run, rows > 0, err
 }

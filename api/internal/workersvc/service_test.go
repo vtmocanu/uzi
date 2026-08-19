@@ -309,9 +309,14 @@ type fakeStore struct {
 	// Task diff-review (PRD #400 M4a). taskReviewRunParams stays nil until the review-run
 	// insert runs; the active-review + upsert + read fakes back PostTaskReview /
 	// GetTaskReviewPanel.
-	taskReviewRunResult    store.Run
-	taskReviewRunErr       error
-	taskReviewRunParams    *store.CreateTaskReviewRunParams
+	taskReviewRunResult store.Run
+	taskReviewRunErr    error
+	taskReviewRunParams *store.CreateTaskReviewRunParams
+	// Chained fix (PRD #400 M5). thenFixRunParams stays nil until CreateThenFixRun's insert
+	// runs; thenFixRunErr = a 23505 pgconn.PgError models the one-active-fix dedup.
+	thenFixRunResult       store.Run
+	thenFixRunErr          error
+	thenFixRunParams       *store.CreateThenFixRunParams
 	activeTaskReviewRun    store.Run
 	activeTaskReviewRunErr error
 	upsertTaskReviewID     uuid.UUID
@@ -893,6 +898,10 @@ func (f *fakeStore) DispatchTaskRun(_ context.Context, arg store.DispatchTaskRun
 func (f *fakeStore) CreateTaskReviewRun(_ context.Context, arg store.CreateTaskReviewRunParams) (store.Run, error) {
 	f.taskReviewRunParams = &arg
 	return f.taskReviewRunResult, f.taskReviewRunErr
+}
+func (f *fakeStore) CreateThenFixRun(_ context.Context, arg store.CreateThenFixRunParams) (store.Run, error) {
+	f.thenFixRunParams = &arg
+	return f.thenFixRunResult, f.thenFixRunErr
 }
 func (f *fakeStore) GetActiveTaskReviewRunForWorkerTarget(context.Context, store.GetActiveTaskReviewRunForWorkerTargetParams) (store.Run, error) {
 	return f.activeTaskReviewRun, f.activeTaskReviewRunErr
