@@ -1309,6 +1309,13 @@ export interface Run {
    *  report_only completion; rides the same embed (rendered only on the detail run view).
    *  UNTRUSTED — render as escaped plain text, never <Markdown>. */
   report_md?: string | null;
+  /** PRD #377: the worker-preserved branch diff on a workflow-scope failure — a GitHub run
+   *  whose branch touched `.github/workflows/**` cannot be pushed by the bot's `repo`-only PAT,
+   *  so the run ends `failed` and the agent's (scrubbed, size-capped) unified diff is preserved
+   *  here for a human to land as a PR. Non-null only on such a failed run; rides the same embed.
+   *  UNTRUSTED worker-authored text — render as escaped plain text through stripUnsafeChars,
+   *  never <Markdown>, exactly like report_md/failure_reason. */
+  preserved_patch?: string | null;
   /** issue #150: the repo-relative path the run declared it moved a completed PRD to
    *  (e.g. `prds/done/72-x.md`), and the RFC3339 instant its PRD-completion patch settled.
    *  Both null on a run that moved no PRD. OPTIONAL for the SAME api/web rollout skew as

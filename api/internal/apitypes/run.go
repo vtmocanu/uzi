@@ -183,6 +183,11 @@ type RunDTO struct {
 	// summary, already scrubbed server-side; nil unless report_only.
 	ReportOnly bool    `json:"report_only"`
 	ReportMd   *string `json:"report_md"`
+	// PreservedPatch is the agent's diff preserved on a workflow_scope_missing `failed`
+	// run (PRD #377 M1): the branch touched .github/workflows/** the bot PAT cannot push,
+	// so the work is surfaced here for a human to land instead of being discarded. Null on
+	// every other run (the column is nullable, set only on that failed path).
+	PreservedPatch *string `json:"preserved_patch"`
 	// PrdDonePath is the repo-relative path the run declared it moved a PRD to when it
 	// archived a completed PRD (e.g. prds/done/72-x.md), null for a run that moved none.
 	// Read-only surfacing of the runs.prd_done_path column so the issue's PRD link can be

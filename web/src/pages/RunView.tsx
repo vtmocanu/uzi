@@ -979,6 +979,27 @@ export function RunView() {
               )
             )}
           </div>
+
+          {/* PRD #377 M2: a GitHub run whose branch touched .github/workflows/** cannot be
+              pushed by the bot's repo-only PAT, so it ends `failed` with the agent's diff
+              preserved here. This is VALID work uzi can't auto-land — framed as "here's the
+              diff to land as a human PR", NOT a crash. The authoritative next-step text lives
+              in failure_reason (rendered above); this block is just the labelled diff.
+
+              preserved_patch is UNTRUSTED worker/model-authored text, rendered as escaped
+              plain text through stripUnsafeChars (same footing as report_md/failure_reason),
+              never through <Markdown>. */}
+          {run.preserved_patch != null && run.preserved_patch.trim() !== "" && (
+            <div className="mt-3 space-y-2 border-t border-edge/60 pt-3">
+              <p className="text-xs text-muted">
+                This change is valid, but uzi&rsquo;s bot token can&rsquo;t push workflow files.
+                Here&rsquo;s the diff to land as a human PR:
+              </p>
+              <pre className="max-h-96 overflow-auto rounded-md bg-raised/60 p-3 font-mono text-xs leading-relaxed text-fg whitespace-pre">
+                {stripUnsafeChars(run.preserved_patch)}
+              </pre>
+            </div>
+          )}
         </div>
       )}
 

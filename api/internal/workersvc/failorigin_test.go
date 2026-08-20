@@ -63,7 +63,7 @@ func TestCoerceFailOrigin(t *testing.T) {
 // parses the migration rather than restating the list, because a second hand-typed copy
 // is exactly the drift it prevents.
 func TestFailOriginVocabularyMatchesCheck(t *testing.T) {
-	const path = "../store/migrations/00126_run_fail_origin.sql"
+	const path = "../store/migrations/00137_run_workflow_scope_missing.sql"
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
@@ -82,8 +82,9 @@ func TestFailOriginVocabularyMatchesCheck(t *testing.T) {
 	}
 	body := stripped.String()
 
-	// Scope to THIS CHECK's statement (from the fail_origin IN list to its closing
-	// paren), so the Down section's bare DROP contributes nothing.
+	// Scope to THIS CHECK's statement (from the FIRST fail_origin IN list — the Up's
+	// widened set — to its closing paren), so the Down section's narrower re-declared
+	// CHECK, which appears later in the file, contributes nothing.
 	start := strings.Index(body, "fail_origin IN (")
 	if start < 0 {
 		t.Fatalf("%s no longer declares a fail_origin IN (...) CHECK; the guard is reading "+

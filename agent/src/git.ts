@@ -817,6 +817,43 @@ export class GitCache {
     return buf.subarray(0, REVIEW_DIFF_MAX_BYTES).toString("utf8") + marker;
   }
 
+  /**
+   * PRD #377 M1 — the full unified diff of the agent branch (`trackingRef`) against the
+   * default-branch base, preserved on a `failed` report when a GitHub run's branch touches
+   * `.github/workflows/**` and the bot's repo-only PAT cannot push it. Mirrors
+   * `changedFiles`'s base resolution (`defaultBranchRef`, three-dot) but emits a REAL patch
+   * instead of a name list.
+   *
+   * `--no-ext-diff` is LOAD-BEARING for the same reason it is in `reviewDiff`: gitEnv pins
+   * `diff.external=true` (a code-exec-key neutralization — see GIT_CODE_EXEC_KEY_PINS), so a
+   * plain `git diff` runs that no-op external driver and emits NOTHING; a real patch must
+   * disable it explicitly. `changedFiles` sidesteps it via `--name-only`. `--no-color` keeps
+   * the text plain.
+   *
+   * The result is CAPPED at REVIEW_DIFF_MAX_BYTES with a truncation marker, sliced on a byte
+   * boundary (a cut through a multi-byte rune yields at most one U+FFFD). It is secret-scrubbed
+   * by the CALLER (redactText) before it leaves the worker — this method does not scrub. Returns
+   * `null` on ANY failure (try/catch), so the caller can still report the failed outcome without
+   * a patch rather than turning a diff-computation error into a second failure.
+   */
+  async workflowScopeDiff(barePath: string, trackingRef: string): Promise<string | null> {
+    try {
+      const baseRef = await this.defaultBranchRef(barePath);
+      const out = await this.runGit(barePath, [
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        `${baseRef}...${trackingRef}`,
+      ]);
+      const buf = Buffer.from(out, "utf8");
+      if (buf.byteLength <= REVIEW_DIFF_MAX_BYTES) return out;
+      const marker = `\n… diff truncated at ${REVIEW_DIFF_MAX_BYTES} bytes (${buf.byteLength} total) …\n`;
+      return buf.subarray(0, REVIEW_DIFF_MAX_BYTES).toString("utf8") + marker;
+    } catch {
+      return null;
+    }
+  }
+
   private async cloneBare(repoUrl: string, dest: string, pat?: string, scope?: string, username?: string): Promise<void> {
     try {
       await this.runGit(undefined, ["clone", "--bare", repoUrl, dest], pat, scope, username);
