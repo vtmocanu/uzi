@@ -22,6 +22,7 @@ type Store interface {
 	UpsertHostedWorkerToken(ctx context.Context, arg store.UpsertHostedWorkerTokenParams) error
 	MarkHostedWorkerTokenDelivered(ctx context.Context, arg store.MarkHostedWorkerTokenDeliveredParams) (int64, error)
 	CordonHostedWorker(ctx context.Context, id uuid.UUID) (int64, error)
+	UncordonHostedWorker(ctx context.Context, id uuid.UUID) (int64, error)
 }
 
 // ExpiryStore is the slice of the store the pending-token expiry sweep needs. It
@@ -225,6 +226,29 @@ func (s *Service) Cordon(ctx context.Context, workerID uuid.UUID) (bool, error) 
 	rows, err := s.q.CordonHostedWorker(ctx, workerID)
 	if err != nil {
 		return false, fmt.Errorf("hostedsvc: cordon hosted worker: %w", err)
+	}
+	return rows > 0, nil
+}
+
+// Uncordon clears a hosted worker's draining state (issue #458). It is the api end
+// of the controller's uncordon-write control channel, the symmetric mirror of Cordon.
+//
+// It exists for the reverted-drift recovery: a worker cordoned on spec-hash drift
+// whose drift is then reverted before it rolls has nothing left to roll, and
+// draining_since is otherwise cleared ONLY by RegisterWorker on an actual roll — so
+// without this write the worker would stay cordoned, idled by the claim gate, forever.
+//
+// Like Cordon this MUTATES desired state, which is why it rides the same distinct
+// authenticated endpoint rather than the display-only status report.
+//
+// Idempotent: UncordonHostedWorker clears draining_since to NULL, so uncordoning an
+// already-clear worker is a harmless no-op. Returns found=false (no error) when no
+// hosted worker has that id — the handler answers 404 — so a controller uncordoning a
+// worker the api has since dropped gets a clean, actionable negative rather than a 500.
+func (s *Service) Uncordon(ctx context.Context, workerID uuid.UUID) (bool, error) {
+	rows, err := s.q.UncordonHostedWorker(ctx, workerID)
+	if err != nil {
+		return false, fmt.Errorf("hostedsvc: uncordon hosted worker: %w", err)
 	}
 	return rows > 0, nil
 }
