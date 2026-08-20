@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { RunsHistory, RunsLayout, RunsList } from "./RunsList";
+import { RunsHistory, RunsLayout, RunsList, sortPast } from "./RunsList";
 import { api, type RunListItem, type SecretMeta } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
@@ -129,6 +129,25 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
     ...over,
   };
 }
+
+describe("sortPast (archive ordering)", () => {
+  it("orders same-second finished_at by instant, not string (Go trims fractional zeros)", () => {
+    // "…:00.5Z" is LATER than "…:00Z" but sorts as SMALLER under a string compare
+    // ('.' < 'Z'). A string-keyed sort would put the earlier run first; the instant
+    // compare puts the more-recent run first. Fails on localeCompare, passes on the fix.
+    const earlier = aRun({ id: "earlier", status: "completed", finished_at: "2026-07-05T10:00:00Z" });
+    const later = aRun({ id: "later", status: "completed", finished_at: "2026-07-05T10:00:00.5Z" });
+    expect([earlier, later].sort(sortPast).map((r) => r.id)).toEqual(["later", "earlier"]);
+  });
+
+  it("falls back to updated_at when finished_at is null, and breaks exact-anchor ties by status rank", () => {
+    // Equal anchors ⇒ the primary key is 0, so the failed < cancelled < completed
+    // status rank decides. This keeps the secondary tie-break covered.
+    const done = aRun({ id: "done", status: "completed", finished_at: null, updated_at: "2026-07-05T10:00:00Z" });
+    const failed = aRun({ id: "failed", status: "failed", finished_at: null, updated_at: "2026-07-05T10:00:00Z" });
+    expect([done, failed].sort(sortPast).map((r) => r.id)).toEqual(["failed", "done"]);
+  });
+});
 
 beforeEach(() => {
   vi.mocked(useAuth).mockReturnValue({ user: { is_admin: false } } as unknown as ReturnType<typeof useAuth>);
