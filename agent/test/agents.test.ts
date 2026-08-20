@@ -196,6 +196,7 @@ describe("subagentsFromTemplates (PRD #37 repo source)", () => {
     // Inherit-all (absent tools) is untouched — the tool is already available.
     const inherit = subagentsFromTemplates([repoAuditor], new Set());
     assert.strictEqual(inherit.auditor!.tools, undefined, "inherit-all is not materialized into an allowlist");
+    assert.strictEqual(inherit.auditor!.prompt, withNudge("audit body"), "inherit-all subagent's prompt still carries the nudge");
   });
 });
 

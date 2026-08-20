@@ -76,6 +76,9 @@ const SIGNAL_SERVER_DENY = `mcp__${SIGNAL_SERVER_NAME}`;
 // scoped and server-capped, but provenance stays "the lead saved this".
 const MEMORY_SERVER_DENY = `mcp__${MEMORY_SERVER_NAME}`;
 
+// PRD #457: the incidental-findings tool name is a pure constant; compute once.
+const FINDINGS_TOOL_NAME = reportIncidentalIssueToolName();
+
 /** Membership form of WRITE_PATH_TOOLS, for planTurnSubagents' filter. Derived,
  *  never re-typed — guardrails.ts owns the list (#203). */
 const WRITE_TOOL_SET: ReadonlySet<string> = new Set<string>(WRITE_PATH_TOOLS);
@@ -169,8 +172,7 @@ function toDefinition(
   // call it). When `tools` is unset (inherit-all, e.g. coder) the tool is already
   // available — do NOT materialize an allowlist. Dedup-guarded. NOT a write tool, so
   // it survives the plan-turn write-strip (planTurnSubagents).
-  const findingsTool = reportIncidentalIssueToolName();
-  if (def.tools && !def.tools.includes(findingsTool)) def.tools = [...def.tools, findingsTool];
+  if (def.tools && !def.tools.includes(FINDINGS_TOOL_NAME)) def.tools = [...def.tools, FINDINGS_TOOL_NAME];
   if (t.model) def.model = t.model;
   // Skill scoping (PRD #16): a subagent preloads its own ALLOCATED delivered
   // skills (filtered to the materialized survivors, so it never lists a skill
@@ -380,7 +382,6 @@ export interface PlanTurnRoster {
 export function planTurnSubagents(subagents: Record<string, AgentDefinition>): PlanTurnRoster {
   const out: Record<string, AgentDefinition> = {};
   const dropped: string[] = [];
-  const findingsTool = reportIncidentalIssueToolName();
   for (const [name, def] of Object.entries(subagents)) {
     const next: AgentDefinition = { ...def };
     // Filter where present only: an ABSENT `tools` is the inherit-all contract
@@ -390,10 +391,10 @@ export function planTurnSubagents(subagents: Record<string, AgentDefinition>): P
       const kept = def.tools.filter((t) => !WRITE_TOOL_SET.has(t));
       // PRD #457 M1 R1: toDefinition now grants the (non-write) findings tool to every
       // allowlist, so a write-ONLY custom agent reaches here as `[Edit, Write,
-      // findingsTool]` and `kept` becomes `[findingsTool]` — non-empty. Exclude the
-      // findings tool from the emptiness test so such an agent still DROPS (unchanged
+      // FINDINGS_TOOL_NAME]` and `kept` becomes `[FINDINGS_TOOL_NAME]` — non-empty. Exclude
+      // the findings tool from the emptiness test so such an agent still DROPS (unchanged
       // behaviour), while a read-only agent keeps the findings tool through the plan turn.
-      const meaningful = kept.filter((t) => t !== findingsTool);
+      const meaningful = kept.filter((t) => t !== FINDINGS_TOOL_NAME);
       if (meaningful.length === 0) {
         dropped.push(name);
         continue;

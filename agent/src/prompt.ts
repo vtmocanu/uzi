@@ -19,6 +19,7 @@ import type {
   MilestoneProgress,
   RunKind,
 } from "./protocol.js";
+import { reportIncidentalIssueToolName } from "./findings-tools.js";
 import { clampToDirCharset } from "./util.js";
 
 const UNTRUSTED_FRAME =
@@ -139,14 +140,16 @@ export const REPO_SUBAGENT_UNTRUSTED_APPEND = [
 
 /**
  * PRD #457: a short, capability-framed nudge making the incidental-findings tool
- * discoverable. The tool's own schema description carries the quality bar (real
- * off-task bugs only, don't stop your task), so this must NOT restate it. Shared
- * verbatim by the lead system prompt (buildLeadSystemPrompt) and every subagent
- * prompt (toDefinition in agents.ts), so there is one source of wording.
+ * discoverable. The tool's own schema description carries the AUTHORITATIVE quality
+ * bar (real off-task bugs only, don't stop your task); the nudge intentionally adds a
+ * SHORT RECAP of it ("off-task bugs only; when in doubt, keep working") for
+ * reinforcement at the point of use, rather than the full bar. Shared verbatim by the
+ * lead system prompt (buildLeadSystemPrompt) and every subagent prompt (toDefinition
+ * in agents.ts), so there is one source of wording.
  */
 export const FINDINGS_NUDGE_APPEND = [
   "If while working your task you notice a real, actionable bug **outside** your",
-  "current task, call `mcp__findings__report_incidental_issue` to record it and keep",
+  `current task, call \`${reportIncidentalIssueToolName()}\` to record it and keep`,
   "working — don't fix it and don't stop your task. Off-task bugs only; when in doubt,",
   "keep working.",
 ].join("\n");
@@ -196,7 +199,11 @@ export function buildLeadSystemPrompt(
   // PRD #457: the findings nudge is unconditional across run kinds — the findings
   // server is mounted on every run lane. Placed here, after LEAD_GUARDRAIL_APPEND
   // and before every conditional append, so it never sits inside the untrusted-repo
-  // fence (repoInstructions is pushed last).
+  // fence (repoInstructions is pushed last). NB: the findings MCP server is mounted
+  // only under `if (this.client)` in sdk-executor.ts, yet this nudge is appended to
+  // the lead and every subagent prompt UNCONDITIONALLY; that is safe because a
+  // production worker run always sets `this.client`, so threading a client flag into
+  // prompt-building would add coupling for a case that cannot occur.
   parts.push(FINDINGS_NUDGE_APPEND);
   if ((opts.kind ?? "issue") === "issue") parts.push(PRD_LIFECYCLE_APPEND);
   if (opts.repoSourced) parts.push(REPO_SUBAGENT_UNTRUSTED_APPEND);
