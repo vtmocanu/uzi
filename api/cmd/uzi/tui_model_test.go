@@ -705,7 +705,8 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	runID := "88888888-1111"
 
 	// A hostile AnthropicSecretLabel exercises the board credential cell (boardCredSeg) and the
-	// detail credential line (detailCredLine → credentialCell → cellText). *string, so bind a local.
+	// detail credential tag on the header's first line (detailCredTag), both drawn through
+	// renderer.Plain. *string, so bind a local.
 	hostileLabel := nasty
 	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running", IssueTitle: nasty, AnthropicSecretLabel: &hostileLabel}},
@@ -722,7 +723,7 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	next, _ = detail.Update(detailLoadedMsg{
 		// A hostile milestone title exercises renderMilestones' crew-rail draw (D7): the
 		// in-progress id makes the row render its title through renderer.Plain. The hostile
-		// AnthropicSecretLabel exercises the detail credential line (detailCredLine).
+		// AnthropicSecretLabel exercises the detail credential tag (detailCredTag → renderer.Plain).
 		run: apitypes.RunDTO{ID: runID, Status: "running", IssueTitle: nasty, AnthropicSecretLabel: &hostileLabel,
 			Milestones:           []apitypes.Milestone{{ID: "m1", Title: nasty}},
 			MilestonesInProgress: []string{"m1"}},

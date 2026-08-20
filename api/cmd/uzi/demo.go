@@ -158,20 +158,23 @@ func demoRuns(now time.Time) []apitypes.RunListItemDTO {
 	}
 	scheduler.MilestonesCompleted = []string{"m1", "m2"}
 	scheduler.MilestonesInProgress = []string{"m3"}
-	// meta on an auto pick with headroom → NEUTRAL tone (no dot), the common case.
+	// A realistic spread of credentials. The TUI board and detail show just the muted LABEL
+	// (meta/personal); the select reason/mode is surfaced only by `uzi run <id>`, not the TUI, so
+	// these reasons are realistic data rather than something the demo draws a dot or colour for.
+	// meta on an auto pick with headroom, the common case.
 	headroom := 27
 	scheduler.AnthropicSecretID = sp("sec-meta")
 	scheduler.AnthropicSecretLabel = sp("meta")
 	scheduler.AnthropicSelectReason = sp("auto")
 	scheduler.AnthropicHeadroomPct = &headroom
 
-	// personal on a stale-pool fallback → WARNING tone (● amber): auto declined and the default paid.
+	// personal on a stale-pool fallback (auto declined, the default paid).
 	sync := mk("c3d4e5f6-1111-2222-3333-444444444444", "issue", "running", "Refactor the forge sync loop for the GitHub driver", "stalled", nil, 0, 51*time.Minute)
 	sync.AnthropicSecretID = sp("sec-personal")
 	sync.AnthropicSecretLabel = sp("personal")
 	sync.AnthropicSelectReason = sp("pool_stale")
 
-	// personal on a best-of-pool pick → INFO tone (● indigo): the pool is nearly exhausted.
+	// personal on a best-of-pool pick (the pool is nearly exhausted).
 	portJudge := mk("f6a7b8c9-1111-2222-3333-444444444444", "issue", "limit_wait", "Port the judge to per-model usage folding", "", nil, 0, 22*time.Minute)
 	portJudge.AnthropicSecretID = sp("sec-personal")
 	portJudge.AnthropicSecretLabel = sp("personal")
