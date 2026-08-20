@@ -164,12 +164,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v4
-      - uses: sigstore/cosign-installer@v4
+      - uses: sigstore/cosign-installer@v3
         with:
           # cosign 2.x emits classic signatures -- the broadest verifier + Kyverno
-          # compatibility. Installer v4 is REQUIRED for cosign v3.x (which defaults to
-          # the new Sigstore bundle format); before bumping cosign to v3, confirm the
-          # Kyverno version a consumer runs can verify that format.
+          # compatibility. Pinned to the installer's floating v3 major: it has NO
+          # floating v4 tag, so `@v4` does NOT resolve (only full tags like v4.1.2 do).
+          # Installing cosign v3.x later (new default bundle format) REQUIRES installer
+          # v4, so bump BOTH together then, to a full v4.x version.
           cosign-release: 'v2.6.5'
       - uses: docker/login-action@v4
         with:
@@ -212,12 +213,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v4
-      - uses: sigstore/cosign-installer@v4
+      - uses: sigstore/cosign-installer@v3
         with:
           # cosign 2.x emits classic signatures -- the broadest verifier + Kyverno
-          # compatibility. Installer v4 is REQUIRED for cosign v3.x (which defaults to
-          # the new Sigstore bundle format); before bumping cosign to v3, confirm the
-          # Kyverno version a consumer runs can verify that format.
+          # compatibility. Pinned to the installer's floating v3 major: it has NO
+          # floating v4 tag, so `@v4` does NOT resolve (only full tags like v4.1.2 do).
+          # Installing cosign v3.x later (new default bundle format) REQUIRES installer
+          # v4, so bump BOTH together then, to a full v4.x version.
           cosign-release: 'v2.6.5'
       - uses: docker/login-action@v4
         with:
@@ -250,12 +252,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v4
-      - uses: sigstore/cosign-installer@v4
+      - uses: sigstore/cosign-installer@v3
         with:
           # cosign 2.x emits classic signatures -- the broadest verifier + Kyverno
-          # compatibility. Installer v4 is REQUIRED for cosign v3.x (which defaults to
-          # the new Sigstore bundle format); before bumping cosign to v3, confirm the
-          # Kyverno version a consumer runs can verify that format.
+          # compatibility. Pinned to the installer's floating v3 major: it has NO
+          # floating v4 tag, so `@v4` does NOT resolve (only full tags like v4.1.2 do).
+          # Installing cosign v3.x later (new default bundle format) REQUIRES installer
+          # v4, so bump BOTH together then, to a full v4.x version.
           cosign-release: 'v2.6.5'
       - uses: docker/login-action@v4
         with:
@@ -295,12 +298,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v4
-      - uses: sigstore/cosign-installer@v4
+      - uses: sigstore/cosign-installer@v3
         with:
           # cosign 2.x emits classic signatures -- the broadest verifier + Kyverno
-          # compatibility. Installer v4 is REQUIRED for cosign v3.x (which defaults to
-          # the new Sigstore bundle format); before bumping cosign to v3, confirm the
-          # Kyverno version a consumer runs can verify that format.
+          # compatibility. Pinned to the installer's floating v3 major: it has NO
+          # floating v4 tag, so `@v4` does NOT resolve (only full tags like v4.1.2 do).
+          # Installing cosign v3.x later (new default bundle format) REQUIRES installer
+          # v4, so bump BOTH together then, to a full v4.x version.
           cosign-release: 'v2.6.5'
       - uses: docker/login-action@v4
         with:
@@ -346,12 +350,13 @@ jobs:
       - uses: azure/setup-helm@v5
         with:
           version: v3.21.3
-      - uses: sigstore/cosign-installer@v4
+      - uses: sigstore/cosign-installer@v3
         with:
           # cosign 2.x emits classic signatures -- the broadest verifier + Kyverno
-          # compatibility. Installer v4 is REQUIRED for cosign v3.x (which defaults to
-          # the new Sigstore bundle format); before bumping cosign to v3, confirm the
-          # Kyverno version a consumer runs can verify that format.
+          # compatibility. Pinned to the installer's floating v3 major: it has NO
+          # floating v4 tag, so `@v4` does NOT resolve (only full tags like v4.1.2 do).
+          # Installing cosign v3.x later (new default bundle format) REQUIRES installer
+          # v4, so bump BOTH together then, to a full v4.x version.
           cosign-release: 'v2.6.5'
       - name: helm registry login (GHCR)
         # --password-stdin keeps the token out of the process argv.
