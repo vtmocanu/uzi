@@ -472,6 +472,9 @@ func run() error {
 	// own goroutine, isolated from the liveness sweep so a stalled forge never
 	// delays worker-loss recovery.
 	lifecycle := runlifecycle.New(q, svc, cfg.FrontendOrigin)
+	// Project a successful uzi-originated column move onto a linked GitHub Projects
+	// v2 Status (PRD #364 M5), best-effort. The same service backs the drag handler.
+	lifecycle.SetProjector(projectSync)
 	wsvc.SetLifecycle(lifecycle)
 
 	// Background sync engine: pulls forge changes into the issue cache for every

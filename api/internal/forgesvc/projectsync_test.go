@@ -46,6 +46,7 @@ type fakeProjectSyncer struct {
 	addCalls  []string // contentIDs added
 
 	setCalls []setStatusCall
+	setErr   error
 }
 
 type setStatusCall struct {
@@ -99,7 +100,7 @@ func (f *fakeProjectSyncer) AddProjectV2Item(_ context.Context, _, contentID str
 
 func (f *fakeProjectSyncer) SetProjectV2ItemStatus(_ context.Context, _, itemID, _, optionID string) error {
 	f.setCalls = append(f.setCalls, setStatusCall{itemID: itemID, optionID: optionID})
-	return nil
+	return f.setErr
 }
 
 func (f *fakeProjectSyncer) ReadProjectV2ItemStatuses(context.Context, string, string) ([]forge.ProjectV2ItemStatus, error) {
@@ -162,6 +163,13 @@ type fakeProjectStore struct {
 	existingItems []store.GithubProjectItem
 	deletedItems  []int64
 	deletedLink   int
+
+	// Forward-sync (M5) scripting.
+	link       store.GithubProjectLink
+	linkErr    error
+	item       store.GithubProjectItem
+	itemErr    error
+	markerSets []store.SetGithubProjectItemStatusMarkerParams
 }
 
 func (s *fakeProjectStore) GetRepoByID(context.Context, uuid.UUID) (store.GetRepoByIDRow, error) {
@@ -201,6 +209,16 @@ func (s *fakeProjectStore) DeleteGithubProjectItem(_ context.Context, arg store.
 }
 func (s *fakeProjectStore) DeleteGithubProjectLink(context.Context, uuid.UUID) error {
 	s.deletedLink++
+	return nil
+}
+func (s *fakeProjectStore) GetGithubProjectLinkByRepo(context.Context, uuid.UUID) (store.GithubProjectLink, error) {
+	return s.link, s.linkErr
+}
+func (s *fakeProjectStore) GetGithubProjectItem(_ context.Context, arg store.GetGithubProjectItemParams) (store.GithubProjectItem, error) {
+	return s.item, s.itemErr
+}
+func (s *fakeProjectStore) SetGithubProjectItemStatusMarker(_ context.Context, arg store.SetGithubProjectItemStatusMarkerParams) error {
+	s.markerSets = append(s.markerSets, arg)
 	return nil
 }
 
@@ -514,5 +532,233 @@ func TestDisableDeletesItemsAndLink(t *testing.T) {
 	}
 	if st.deletedLink != 1 {
 		t.Errorf("want 1 link delete, got %d", st.deletedLink)
+	}
+}
+
+// --- ForwardMove (M5) --------------------------------------------------------
+
+// forwardLink builds a link row whose StatusOptions maps the given columns.
+func forwardLink(t *testing.T, columnOption map[string]string) store.GithubProjectLink {
+	t.Helper()
+	b, err := json.Marshal(columnOption)
+	if err != nil {
+		t.Fatalf("marshal status options: %v", err)
+	}
+	return store.GithubProjectLink{
+		ProjectNodeID: "PVT_1",
+		StatusFieldID: "PVTSSF_1",
+		StatusOptions: b,
+	}
+}
+
+// forwardSyncer builds a ProjectBoardSyncer fake with the given scopes for M5.
+func forwardSyncer() *fakeProjectSyncer {
+	return &fakeProjectSyncer{
+		fakeForge: &fakeForge{},
+		slugOwner: "acme", slugRepo: "widgets",
+		issueNode: map[int]string{7: "content7"},
+	}
+}
+
+// (a) A mapped target column sets the item's Status to the option and advances the
+// marker.
+func TestForwardMoveSetsMappedOption(t *testing.T) {
+	repoID := uuid.New()
+	syncer := forwardSyncer()
+	st := &fakeProjectStore{
+		repo: githubRepoRow(repoID),
+		link: forwardLink(t, map[string]string{"In Progress": "opt_ip"}),
+		item: store.GithubProjectItem{RepoID: repoID, ForgeIssueIid: 7, ItemNodeID: "item7"},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+
+	if err := svc.ForwardMove(context.Background(), repoID, 7, "In Progress"); err != nil {
+		t.Fatalf("ForwardMove: %v", err)
+	}
+	if len(syncer.setCalls) != 1 || syncer.setCalls[0].itemID != "item7" || syncer.setCalls[0].optionID != "opt_ip" {
+		t.Fatalf("want one set item7->opt_ip, got %v", syncer.setCalls)
+	}
+	if len(st.markerSets) != 1 || !st.markerSets[0].LastStatusOptionID.Valid || st.markerSets[0].LastStatusOptionID.String != "opt_ip" {
+		t.Errorf("want marker advanced to opt_ip, got %+v", st.markerSets)
+	}
+	if len(st.linkErrs) != 0 {
+		t.Errorf("success must not stamp last_error, got %v", st.linkErrs)
+	}
+}
+
+// (b) The Open target ("") clears Status and stores a NULL marker.
+func TestForwardMoveOpenClears(t *testing.T) {
+	repoID := uuid.New()
+	syncer := forwardSyncer()
+	st := &fakeProjectStore{
+		repo: githubRepoRow(repoID),
+		link: forwardLink(t, map[string]string{"In Progress": "opt_ip"}),
+		item: store.GithubProjectItem{RepoID: repoID, ForgeIssueIid: 7, ItemNodeID: "item7",
+			LastStatusOptionID: optionMarker("opt_ip")},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+
+	if err := svc.ForwardMove(context.Background(), repoID, 7, ""); err != nil {
+		t.Fatalf("ForwardMove: %v", err)
+	}
+	if len(syncer.setCalls) != 1 || syncer.setCalls[0].optionID != "" {
+		t.Fatalf("want one clear set (optionID \"\"), got %v", syncer.setCalls)
+	}
+	if len(st.markerSets) != 1 || st.markerSets[0].LastStatusOptionID.Valid {
+		t.Errorf("want NULL marker on clear, got %+v", st.markerSets)
+	}
+}
+
+// (c) A marker already equal to the target skips the Status write entirely.
+func TestForwardMoveMarkerNoop(t *testing.T) {
+	repoID := uuid.New()
+	syncer := forwardSyncer()
+	st := &fakeProjectStore{
+		repo: githubRepoRow(repoID),
+		link: forwardLink(t, map[string]string{"In Progress": "opt_ip"}),
+		item: store.GithubProjectItem{RepoID: repoID, ForgeIssueIid: 7, ItemNodeID: "item7",
+			LastStatusOptionID: optionMarker("opt_ip")},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+
+	if err := svc.ForwardMove(context.Background(), repoID, 7, "In Progress"); err != nil {
+		t.Fatalf("ForwardMove: %v", err)
+	}
+	if len(syncer.setCalls) != 0 {
+		t.Errorf("marker already == target must not set status, got %v", syncer.setCalls)
+	}
+	if len(st.markerSets) != 0 {
+		t.Errorf("no-op must not rewrite the marker, got %v", st.markerSets)
+	}
+}
+
+// (c') The Open no-op: NULL marker + Open target skips the write.
+func TestForwardMoveOpenMarkerNoop(t *testing.T) {
+	repoID := uuid.New()
+	syncer := forwardSyncer()
+	st := &fakeProjectStore{
+		repo: githubRepoRow(repoID),
+		link: forwardLink(t, map[string]string{"In Progress": "opt_ip"}),
+		item: store.GithubProjectItem{RepoID: repoID, ForgeIssueIid: 7, ItemNodeID: "item7"}, // NULL marker
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+
+	if err := svc.ForwardMove(context.Background(), repoID, 7, ""); err != nil {
+		t.Fatalf("ForwardMove: %v", err)
+	}
+	if len(syncer.setCalls) != 0 {
+		t.Errorf("NULL marker + Open target must not set status, got %v", syncer.setCalls)
+	}
+}
+
+// (d) Skip paths make zero forge calls: instance-disabled, no link row, non-github,
+// unmapped column.
+func TestForwardMoveSkipPaths(t *testing.T) {
+	repoID := uuid.New()
+	tracked := store.GithubProjectItem{RepoID: repoID, ForgeIssueIid: 7, ItemNodeID: "item7"}
+
+	t.Run("instance disabled", func(t *testing.T) {
+		syncer := forwardSyncer()
+		st := &fakeProjectStore{repo: githubRepoRow(repoID), link: forwardLink(t, map[string]string{"In Progress": "opt_ip"}), item: tracked}
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: false}, nil)
+		if err := svc.ForwardMove(context.Background(), repoID, 7, "In Progress"); err != nil {
+			t.Fatalf("ForwardMove: %v", err)
+		}
+		if len(syncer.setCalls) != 0 {
+			t.Errorf("disabled instance must make no forge calls, got %v", syncer.setCalls)
+		}
+	})
+
+	t.Run("no link row", func(t *testing.T) {
+		syncer := forwardSyncer()
+		st := &fakeProjectStore{repo: githubRepoRow(repoID), linkErr: pgx.ErrNoRows}
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		if err := svc.ForwardMove(context.Background(), repoID, 7, "In Progress"); err != nil {
+			t.Fatalf("ForwardMove: %v", err)
+		}
+		if len(syncer.setCalls) != 0 {
+			t.Errorf("no link row must make no forge calls, got %v", syncer.setCalls)
+		}
+	})
+
+	t.Run("non-github repo", func(t *testing.T) {
+		row := githubRepoRow(repoID)
+		row.ForgeType = string(forge.TypeGitLab)
+		syncer := forwardSyncer()
+		st := &fakeProjectStore{repo: row, link: forwardLink(t, map[string]string{"In Progress": "opt_ip"}), item: tracked}
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		if err := svc.ForwardMove(context.Background(), repoID, 7, "In Progress"); err != nil {
+			t.Fatalf("ForwardMove: %v", err)
+		}
+		if len(syncer.setCalls) != 0 {
+			t.Errorf("non-github repo must make no forge calls, got %v", syncer.setCalls)
+		}
+	})
+
+	t.Run("unmapped column", func(t *testing.T) {
+		syncer := forwardSyncer()
+		st := &fakeProjectStore{repo: githubRepoRow(repoID), link: forwardLink(t, map[string]string{"In Progress": "opt_ip"}), item: tracked}
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		if err := svc.ForwardMove(context.Background(), repoID, 7, "Later"); err != nil {
+			t.Fatalf("ForwardMove: %v", err)
+		}
+		if len(syncer.setCalls) != 0 {
+			t.Errorf("unmapped column must make no forge calls, got %v", syncer.setCalls)
+		}
+		if len(st.markerSets) != 0 {
+			t.Errorf("unmapped column must not touch the marker, got %v", st.markerSets)
+		}
+	})
+}
+
+// (e) A missing item is resolved + added, then set to the target and persisted.
+func TestForwardMoveAddsMissingItem(t *testing.T) {
+	repoID := uuid.New()
+	syncer := forwardSyncer()
+	st := &fakeProjectStore{
+		repo:    githubRepoRow(repoID),
+		link:    forwardLink(t, map[string]string{"In Progress": "opt_ip"}),
+		itemErr: pgx.ErrNoRows,
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+
+	if err := svc.ForwardMove(context.Background(), repoID, 7, "In Progress"); err != nil {
+		t.Fatalf("ForwardMove: %v", err)
+	}
+	if len(syncer.addCalls) != 1 || syncer.addCalls[0] != "content7" {
+		t.Fatalf("want issue 7 content added once, got %v", syncer.addCalls)
+	}
+	if len(syncer.setCalls) != 1 || syncer.setCalls[0].itemID != "item-content7" || syncer.setCalls[0].optionID != "opt_ip" {
+		t.Fatalf("want set item-content7->opt_ip, got %v", syncer.setCalls)
+	}
+	persisted, ok := st.items[7]
+	if !ok {
+		t.Fatalf("want new item persisted for issue 7")
+	}
+	if persisted.ItemNodeID != "item-content7" || !persisted.LastStatusOptionID.Valid || persisted.LastStatusOptionID.String != "opt_ip" {
+		t.Errorf("persisted item wrong: %+v", persisted)
+	}
+}
+
+// (f) A forge error is swallowed (ForwardMove returns nil) and stamps last_error.
+func TestForwardMoveForgeErrorSwallowed(t *testing.T) {
+	repoID := uuid.New()
+	syncer := forwardSyncer()
+	syncer.setErr = errors.New("graphql boom")
+	st := &fakeProjectStore{
+		repo: githubRepoRow(repoID),
+		link: forwardLink(t, map[string]string{"In Progress": "opt_ip"}),
+		item: store.GithubProjectItem{RepoID: repoID, ForgeIssueIid: 7, ItemNodeID: "item7"},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+
+	if err := svc.ForwardMove(context.Background(), repoID, 7, "In Progress"); err != nil {
+		t.Fatalf("ForwardMove must swallow forge errors, got %v", err)
+	}
+	if len(st.linkErrs) != 1 {
+		t.Fatalf("want last_error stamped once, got %v", st.linkErrs)
+	}
+	if len(st.markerSets) != 0 {
+		t.Errorf("a failed write must not advance the marker, got %v", st.markerSets)
 	}
 }

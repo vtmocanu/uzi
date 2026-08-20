@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/board"
@@ -66,6 +67,11 @@ type ProjectSyncStore interface {
 	ListGithubProjectItems(ctx context.Context, repoID uuid.UUID) ([]store.GithubProjectItem, error)
 	DeleteGithubProjectItem(ctx context.Context, arg store.DeleteGithubProjectItemParams) error
 	DeleteGithubProjectLink(ctx context.Context, repoID uuid.UUID) error
+	// Forward sync (M5): the link row is the per-repo enable state, the item row is
+	// the projection marker read to skip a redundant Status write.
+	GetGithubProjectLinkByRepo(ctx context.Context, repoID uuid.UUID) (store.GithubProjectLink, error)
+	GetGithubProjectItem(ctx context.Context, arg store.GetGithubProjectItemParams) (store.GithubProjectItem, error)
+	SetGithubProjectItemStatusMarker(ctx context.Context, arg store.SetGithubProjectItemStatusMarkerParams) error
 }
 
 // ProjectForgeBuilder builds a forge driver from a stored (encrypted) connection.
@@ -355,6 +361,176 @@ func (s *ProjectSyncService) Disable(ctx context.Context, repoID uuid.UUID) erro
 		return fmt.Errorf("project sync: delete link: %w", err)
 	}
 	return nil
+}
+
+// ForwardMove projects a uzi-originated label move onto the linked project's
+// Status field (PRD #364 M5): the issue's card moved to targetColumn on the label
+// board, so drive the matching Projects v2 Status option. It is BEST-EFFORT and
+// NON-FATAL — every failure path returns nil so a drag or a run-lifecycle move
+// never fails on account of the projection.
+//
+// It is hooked at the two uzi-originated AutoMove call sites (the drag handler and
+// the run lifecycle), AFTER the label write succeeds — never inside AutoMove
+// itself, which the reverse poller (M6) also calls: projecting a reverse write
+// back onto the board would loop.
+//
+// targetColumn "" is uzi's implicit Open, which maps to GitHub's native "No
+// Status" (D2): the option id is "" and the Status is CLEARED.
+func (s *ProjectSyncService) ForwardMove(ctx context.Context, repoID uuid.UUID, issueIID int64, targetColumn string) error {
+	// Instance kill-switch: sync off instance-wide → no-op.
+	enabled, err := s.settings.GithubProjectSyncEnabled(ctx)
+	if err != nil {
+		s.log.Warn("project sync: forward move read kill-switch", "repo", repoID, "issue", issueIID, "error", err)
+		return nil
+	}
+	if !enabled {
+		return nil
+	}
+
+	// The LINK ROW presence is the per-repo enable state: no row → this repo is not
+	// sync-enabled, nothing to project.
+	link, err := s.store.GetGithubProjectLinkByRepo(ctx, repoID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		s.log.Warn("project sync: forward move load link", "repo", repoID, "issue", issueIID, "error", err)
+		return nil
+	}
+
+	repo, err := s.store.GetRepoByID(ctx, repoID)
+	if err != nil {
+		s.log.Warn("project sync: forward move load repo", "repo", repoID, "issue", issueIID, "error", err)
+		return nil
+	}
+	if repo.ForgeType != string(forge.TypeGitHub) {
+		return nil
+	}
+	f, err := s.forges.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	if err != nil {
+		s.log.Warn("project sync: forward move build forge", "repo", repoID, "issue", issueIID, "error", err)
+		return nil
+	}
+	syncer, ok := f.(forge.ProjectBoardSyncer)
+	if !ok {
+		return nil
+	}
+
+	// Resolve the target Status option. Open ("" column) → "" (clear). A mapped
+	// column → its option id. An UNMAPPED column (e.g. a "Later" with no matching
+	// Status option) cannot be projected: log and no-op, leaving the card's current
+	// Status untouched.
+	var targetOption string
+	if targetColumn != "" {
+		var columnOption map[string]string
+		if err := json.Unmarshal(link.StatusOptions, &columnOption); err != nil {
+			s.log.Warn("project sync: forward move parse status options", "repo", repoID, "issue", issueIID, "error", err)
+			return nil
+		}
+		optID, mapped := columnOption[targetColumn]
+		if !mapped {
+			s.log.Info("project sync: forward move skipped, column has no Status option",
+				"repo", repoID, "issue", issueIID, "column", targetColumn)
+			return nil
+		}
+		targetOption = optID
+	}
+
+	// Ensure the item exists on the board. A tracked item carries its node id and
+	// last-known marker; a missing one is added now.
+	item, err := s.store.GetGithubProjectItem(ctx, store.GetGithubProjectItemParams{RepoID: repoID, ForgeIssueIid: issueIID})
+	switch {
+	case err == nil:
+		// existing item — fall through to the marker no-op check below.
+	case errors.Is(err, pgx.ErrNoRows):
+		itemID, aerr := s.addForwardItem(ctx, repo, syncer, link.ProjectNodeID, issueIID)
+		if aerr != nil {
+			s.stampLinkError(ctx, repoID, aerr)
+			return nil
+		}
+		// Drive the just-added item to the target and persist item node id + marker.
+		if err := syncer.SetProjectV2ItemStatus(ctx, link.ProjectNodeID, itemID, link.StatusFieldID, targetOption); err != nil {
+			s.stampLinkError(ctx, repoID, err)
+			return nil
+		}
+		if _, err := s.store.UpsertGithubProjectItem(ctx, store.UpsertGithubProjectItemParams{
+			RepoID:             repoID,
+			ForgeIssueIid:      issueIID,
+			ItemNodeID:         itemID,
+			LastStatusOptionID: optionMarker(targetOption),
+		}); err != nil {
+			s.log.Warn("project sync: forward move persist new item", "repo", repoID, "issue", issueIID, "error", err)
+		}
+		return nil
+	default:
+		s.log.Warn("project sync: forward move load item", "repo", repoID, "issue", issueIID, "error", err)
+		return nil
+	}
+
+	// Live-value no-op (D7): the stored marker is uzi's last-known value from either
+	// direction. If it already equals the target (NULL marker treated as ""), the
+	// board is already there — skip the Status mutation. Worst case under a
+	// concurrent poller interleave is a redundant same-value write, never a wrong
+	// label (PRD risk analysis).
+	if markerValue(item.LastStatusOptionID) == targetOption {
+		return nil
+	}
+	if err := syncer.SetProjectV2ItemStatus(ctx, link.ProjectNodeID, item.ItemNodeID, link.StatusFieldID, targetOption); err != nil {
+		s.stampLinkError(ctx, repoID, err)
+		return nil
+	}
+	// Advance the marker so the next reverse poll does not read this self-inflicted
+	// change as forge-side drift.
+	if err := s.store.SetGithubProjectItemStatusMarker(ctx, store.SetGithubProjectItemStatusMarkerParams{
+		LastStatusOptionID: optionMarker(targetOption),
+		RepoID:             repoID,
+		ForgeIssueIid:      issueIID,
+	}); err != nil {
+		s.log.Warn("project sync: forward move update marker", "repo", repoID, "issue", issueIID, "error", err)
+	}
+	return nil
+}
+
+// addForwardItem resolves an issue's content node and adds it to the project,
+// returning the new item node id. Split out so the ForwardMove item-missing branch
+// stays readable.
+func (s *ProjectSyncService) addForwardItem(ctx context.Context, repo store.GetRepoByIDRow, syncer forge.ProjectBoardSyncer, projectNodeID string, issueIID int64) (string, error) {
+	owner, name, err := syncer.RepoSlug(ctx, repo.ForgeProjectID)
+	if err != nil {
+		return "", fmt.Errorf("project sync: forward move resolve slug: %w", err)
+	}
+	contentID, err := syncer.ResolveIssueNodeID(ctx, owner, name, int(issueIID))
+	if err != nil {
+		return "", fmt.Errorf("project sync: forward move resolve issue #%d node: %w", issueIID, err)
+	}
+	itemID, err := syncer.AddProjectV2Item(ctx, projectNodeID, contentID)
+	if err != nil {
+		return "", fmt.Errorf("project sync: forward move add issue #%d: %w", issueIID, err)
+	}
+	return itemID, nil
+}
+
+// stampLinkError records a forward-move failure on the link row's last_error,
+// best-effort — a forward move is not a full reconcile, so a stamp failure is only
+// logged. A SUCCESSFUL forward move deliberately does NOT clear last_error (it
+// leaves M3's adopt-time state).
+func (s *ProjectSyncService) stampLinkError(ctx context.Context, repoID uuid.UUID, cause error) {
+	s.log.Warn("project sync: forward move failed", "repo", repoID, "error", cause)
+	if serr := s.store.SetGithubProjectLinkError(ctx, store.SetGithubProjectLinkErrorParams{
+		LastError: pgtype.Text{String: truncateErr(cause.Error()), Valid: true},
+		RepoID:    repoID,
+	}); serr != nil {
+		s.log.Warn("project sync: forward move record link error", "repo", repoID, "error", serr)
+	}
+}
+
+// markerValue reads a stored last_status_option_id marker as its option-id string,
+// treating NULL (a cleared/Open item) as "" — the inverse of optionMarker.
+func markerValue(m pgtype.Text) string {
+	if !m.Valid {
+		return ""
+	}
+	return m.String
 }
 
 // ensureProjectScope preflight-checks the connection PAT for the `project` scope.

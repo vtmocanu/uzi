@@ -156,6 +156,9 @@ type Handler struct {
 type ProjectSyncer interface {
 	Adopt(ctx context.Context, repoID uuid.UUID, projectNumber int, ownerKind forge.ProjectV2OwnerKind) error
 	Disable(ctx context.Context, repoID uuid.UUID) error
+	// ForwardMove projects a uzi label move onto the linked project's Status (M5).
+	// Best-effort: the handler logs and continues on a returned error.
+	ForwardMove(ctx context.Context, repoID uuid.UUID, issueIID int64, targetColumn string) error
 }
 
 // SetProjectSync wires the GitHub Projects v2 provisioning service in after

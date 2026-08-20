@@ -31,6 +31,11 @@ type fakeProjectSync struct {
 	gotOwnerKind forge.ProjectV2OwnerKind
 	adoptCalls   int
 	disableCalls int
+
+	forwardErr   error
+	forwardCalls int
+	gotIssueIID  int64
+	gotTarget    string
 }
 
 func (f *fakeProjectSync) Adopt(_ context.Context, repoID uuid.UUID, number int, kind forge.ProjectV2OwnerKind) error {
@@ -43,6 +48,12 @@ func (f *fakeProjectSync) Disable(_ context.Context, repoID uuid.UUID) error {
 	f.disableCalls++
 	f.gotRepoID = repoID
 	return f.disableErr
+}
+
+func (f *fakeProjectSync) ForwardMove(_ context.Context, repoID uuid.UUID, issueIID int64, target string) error {
+	f.forwardCalls++
+	f.gotRepoID, f.gotIssueIID, f.gotTarget = repoID, issueIID, target
+	return f.forwardErr
 }
 
 // postAdopt drives AdoptGithubProjectSync with an admin actor and the given repo id

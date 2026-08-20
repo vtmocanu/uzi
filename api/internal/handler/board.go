@@ -830,6 +830,15 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("clear pending column moves after manual drag", "error", err)
 	}
 
+	// Project the move onto a linked GitHub Projects v2 Status (PRD #364 M5),
+	// best-effort. Hooked here (a uzi-originated move) rather than inside AutoMove,
+	// which the reverse poller also calls. Never fail the response on a sync error.
+	if h.projectSync != nil {
+		if err := h.projectSync.ForwardMove(r.Context(), repo.ID, issue.ForgeIssueIid, target); err != nil {
+			slog.Warn("project sync: forward move after drag", "repo", repo.ID, "issue", issue.ForgeIssueIid, "error", err)
+		}
+	}
+
 	position := make(map[string]int, len(cols))
 	for _, c := range cols {
 		position[c.LabelName] = int(c.Position)

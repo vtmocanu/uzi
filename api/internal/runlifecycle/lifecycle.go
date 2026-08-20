@@ -77,11 +77,24 @@ type Mover interface {
 	AutoMove(ctx context.Context, f forge.Forge, forgeProjectID int64, issue store.Issue, columns []store.BoardColumn, target string) (store.Issue, error)
 }
 
+// Projector is an OPTIONAL collaborator that projects a uzi-originated column move
+// onto a linked GitHub Projects v2 Status (PRD #364 M5). *forgesvc.ProjectSyncService
+// satisfies it. It is nil unless wired via SetProjector; when nil the lifecycle
+// simply skips the projection. Best-effort: a returned error is logged, never
+// propagated (a failed projection must not fail a run's column move).
+type Projector interface {
+	ForwardMove(ctx context.Context, repoID uuid.UUID, issueIID int64, targetColumn string) error
+}
+
 // Lifecycle is the automation subscriber and reconcile loop.
 type Lifecycle struct {
 	q     Store
 	mover Mover
 	now   func() time.Time
+
+	// projector projects a successful uzi-originated move onto a linked GitHub
+	// Projects v2 Status (PRD #364 M5). Optional; nil skips the projection.
+	projector Projector
 
 	// frontendOrigin is the user-facing origin (config.FrontendOrigin) the
 	// terminal-comment hook builds run links from. Empty omits the link.
@@ -112,6 +125,12 @@ func New(q Store, mover Mover, frontendOrigin string) *Lifecycle {
 		batch:          defaultBatch,
 	}
 }
+
+// SetProjector wires the optional GitHub Projects v2 projector in after
+// construction (built in main alongside the other forge collaborators), mirroring
+// the repo's optional-collaborator pattern. Safe to leave unset — the lifecycle
+// then performs no Status projection.
+func (l *Lifecycle) SetProjector(p Projector) { l.projector = p }
 
 // moveContext is the run + connection facts one move needs, sourced identically
 // by the notifier (GetRunMoveContext) and the reconciler (re-read per run).
@@ -343,6 +362,15 @@ func (l *Lifecycle) apply(ctx context.Context, runID uuid.UUID, mc moveContext, 
 		ID:          runID,
 	}); err != nil {
 		slog.Warn("run lifecycle: record column move", "run", runID, "error", err)
+	}
+
+	// Project the move onto a linked GitHub Projects v2 Status (PRD #364 M5),
+	// best-effort. Hooked here (a uzi-originated move) rather than inside AutoMove,
+	// which the reverse poller also calls. A projection error never fails the move.
+	if l.projector != nil {
+		if err := l.projector.ForwardMove(ctx, mc.repoID, mc.issueIID, dec.target); err != nil {
+			slog.Warn("run lifecycle: forward project sync", "run", runID, "repo", mc.repoID, "issue", mc.issueIID, "error", err)
+		}
 	}
 }
 
