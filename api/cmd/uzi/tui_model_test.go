@@ -1091,7 +1091,7 @@ func TestTUIBoardRowsFitNarrowWidth(t *testing.T) {
 
 // The factory floor shows a milestone micro-bar on a milestone-structured run (milestoneMarker,
 // the web MilestoneBadge twin) — ▰ per done, ▱ per remaining — and NOTHING on a run with no
-// frozen list. A run that reported nothing shows –/N text rather than a bar that looks empty.
+// frozen list. A run that reported nothing has done=0, so it draws an all-empty ▱ bar (graphical 0/N).
 func TestTUIBoardMilestoneBadge(t *testing.T) {
 	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "running", IssueTitle: "structured",
@@ -1105,11 +1105,27 @@ func TestTUIBoardMilestoneBadge(t *testing.T) {
 	next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
 	out := stripANSI(next.(tuiModel).View().Content) // the ▰/▱ split across colour spans
 
-	// 2 of 4 done → ▰▰▱▱; nothing reported → –/2 text (never a bar that reads as failure).
-	for _, want := range []string{"▰▰▱▱", "–/2"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("board missing milestone micro-bar %q\n%s", want, out)
+	// 2 of 4 done → ▰▰▱▱ on the "structured" row.
+	if !strings.Contains(out, "▰▰▱▱") {
+		t.Errorf("board missing 2-of-4 milestone micro-bar ▰▰▱▱\n%s", out)
+	}
+	// Nothing reported → the "unreported" row draws an all-empty ▱▱ bar (graphical 0/2), never
+	// –/2 text. Anchor on that run's own line so the reported run's trailing ▱▱ can't stand in.
+	var unrep string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "unreported") {
+			unrep = line
+			break
 		}
+	}
+	if unrep == "" {
+		t.Fatalf("no board row for the unreported run\n%s", out)
+	}
+	if !strings.Contains(unrep, "▱▱") || strings.Contains(unrep, "▰") {
+		t.Errorf("unreported run should draw an all-empty ▱▱ bar\n%q", unrep)
+	}
+	if strings.Contains(unrep, "–/") {
+		t.Errorf("unreported run should draw a graphical 0/2 bar, not –/N text\n%q", unrep)
 	}
 	// A run with no frozen list draws no micro-bar cell at all: the only micro-bar is
 	// aaaaaaaa-1's, so exactly one ▰▰▱▱ pattern exists (the plain run carries none).
@@ -1120,6 +1136,8 @@ func TestTUIBoardMilestoneBadge(t *testing.T) {
 
 // The micro-bar caps at boardMileCap (9) cells: a 9-milestone run draws the full bar, while a
 // 10-milestone run falls back to N/M text (the bar would overflow the boardMileWidth column).
+// A text cell has no bar to read as 0, so an UNREPORTED over-cap run keeps the neutral –/N there,
+// not 0/N (the cross-surface convention the empty bar only overrides where a bar can be drawn).
 func TestTUIBoardMilestoneBadgeCap(t *testing.T) {
 	mile := func(n int) []apitypes.Milestone {
 		ms := make([]apitypes.Milestone, n)
@@ -1133,6 +1151,8 @@ func TestTUIBoardMilestoneBadgeCap(t *testing.T) {
 			Milestones: mile(9), MilestonesCompleted: []string{"m1"}}}, // 1/9 → full 9-cell bar
 		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "running", IssueTitle: "ten",
 			Milestones: mile(10), MilestonesCompleted: []string{"m1", "m2", "m3"}}}, // 3/10 → text
+		{RunDTO: apitypes.RunDTO{ID: "cccccccc-3", Kind: "issue", Status: "running", IssueTitle: "unreported-ten",
+			Milestones: mile(10)}}, // nil completed, over cap → –/10 text, never 0/10
 	}}
 	m := tuiTestModel(t, fake, "")
 	next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
@@ -1148,6 +1168,20 @@ func TestTUIBoardMilestoneBadgeCap(t *testing.T) {
 	// 10 milestones exceed the cap → N/M text, never a bar.
 	if !strings.Contains(out, "3/10") {
 		t.Errorf("a 10-milestone run should fall back to 3/10 text\n%s", out)
+	}
+	// Over cap AND nothing reported → neutral –/10 text, never 0/10 (which reads as failure).
+	var unrep string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "unreported-ten") {
+			unrep = line
+			break
+		}
+	}
+	if unrep == "" {
+		t.Fatalf("no board row for the unreported over-cap run\n%s", out)
+	}
+	if !strings.Contains(unrep, "–/10") || strings.Contains(unrep, "0/10") {
+		t.Errorf("an unreported over-cap run should show –/10 text, not 0/10\n%q", unrep)
 	}
 }
 
