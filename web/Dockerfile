@@ -32,6 +32,10 @@ RUN npm ci --ignore-scripts
 
 COPY web/ ./
 COPY docs/ /app/docs/
+# The in-app changelog bundles the repo-root CHANGELOG.md the same way the docs
+# viewer bundles docs/: web/src/lib/changelog.ts resolves `../../../CHANGELOG.md`,
+# which lands at /app/CHANGELOG.md only if this sibling layout is preserved here.
+COPY CHANGELOG.md /app/CHANGELOG.md
 RUN npm run build
 
 # --- runtime stage ---
