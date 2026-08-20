@@ -1328,6 +1328,9 @@ func limitWaitRows(r apitypes.RunDTO, now time.Time) [][]string {
 // (PRD #122 M5): a `{done}/{total} reported complete` summary followed by one indented
 // row per milestone in FROZEN order, marked done / in progress / left. It is the CLI twin
 // of the web's MilestoneChecklist, so both surfaces show the same state off the same fields.
+// PRD #390 M4: a run that NEVER reported progress (MilestonesCompleted == nil) renders a
+// NEUTRAL `–/{total}` numerator instead of `0/{total}`, matching the web badge's `M–/N`
+// (see the summary branch below for the null-vs-`[]` contract).
 //
 // Empty for a run with no frozen milestone list, so a pre-#122 (or non-milestone) run is
 // byte-for-byte unchanged — the same back-compat contract the nil Milestones slice carries.
@@ -1369,7 +1372,19 @@ func milestoneRows(r apitypes.RunDTO) [][]string {
 		perMilestone = append(perMilestone, []string{"  " + state, cellText(m.Title)})
 	}
 	rows := make([][]string, 0, len(r.Milestones)+1)
-	rows = append(rows, []string{"MILESTONES", fmt.Sprintf("%d/%d reported complete", done, len(r.Milestones))})
+	// PRD #390 D5: distinguish "never reported" from "reported zero". The null-vs-`[]`
+	// contract is carried by MilestonesCompleted: nil ⇒ the milestones_completed column
+	// is SQL NULL (the run never reported progress), non-nil (even an empty `[]`) ⇒ a
+	// report landed. A never-reported run must render a NEUTRAL numerator (en-dash `–`,
+	// matching the web badge's `M–/N`), NOT `0/N`, which reads as a failure. Test nil
+	// exactly — len()==0 would conflate a reported empty list with never-reported.
+	var summary string
+	if r.MilestonesCompleted == nil {
+		summary = fmt.Sprintf("–/%d reported complete", len(r.Milestones))
+	} else {
+		summary = fmt.Sprintf("%d/%d reported complete", done, len(r.Milestones))
+	}
+	rows = append(rows, []string{"MILESTONES", summary})
 	rows = append(rows, perMilestone...)
 	return rows
 }

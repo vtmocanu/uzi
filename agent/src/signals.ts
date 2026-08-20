@@ -622,13 +622,20 @@ export function scanSignals(message: unknown): ScannedSignals {
       // guards, for the SAME reason milestones is nested inside submit_plan's branch: a
       // subagent frame never reaches this loop, so a prompt-injected or buggy subagent can
       // NEVER move the run's progress. Both sides are defensively parsed (ids coerced,
-      // deduped, bad entries dropped, never throws). Last-wins within the turn if the lead
-      // reports twice — the latest snapshot is the one that describes where the run is.
+      // deduped, bad entries dropped, never throws).
+      //
+      // PRD #390 D3: an all-empty report_progress is NO SIGNAL. If neither side carries a
+      // real id after parsing (a `{}`, a defaulted, or a non-array-sided call), we assign
+      // nothing so out.progress stays undefined — the call never overwrites real progress
+      // and never persists a misleading `[]`. A call carrying ANY real id is still a
+      // signal. Last-wins within the turn holds for real reports (a later real call still
+      // overwrites), and a later all-empty call cannot wipe an earlier real one — that
+      // falls out naturally here because the empty call no longer assigns.
       const input = asRecord(block["input"]);
-      out.progress = {
-        completed: parseProgressIds(input?.["completed"]),
-        in_progress: parseProgressIds(input?.["in_progress"]),
-      };
+      const completed = parseProgressIds(input?.["completed"]);
+      const in_progress = parseProgressIds(input?.["in_progress"]);
+      if (completed.length > 0 || in_progress.length > 0)
+        out.progress = { completed, in_progress };
     } else if (name === CHECKPOINT_QUALIFIED) {
       // PRD #122 M6. Extracted HERE, inside the content loop that isSubagentFrame already
       // guards (the early return at the top of scanSignals), so it inherits the SAME

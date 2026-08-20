@@ -217,7 +217,9 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		m.board.scroll = 0
 		m.board.clampCursor()
 		return m, nil
-	case keyEnter:
+	case keyEnter, keyRight:
+		// enter or → (right) opens the selected run — → is the natural "drill in" that pairs
+		// with ← (left) backing out of the run detail (detailKey).
 		sel, ok := m.board.selected()
 		if !ok {
 			return m, nil
@@ -380,7 +382,7 @@ func (m tuiModel) boardEyebrow(it boardItem) string {
 
 // boardFooter is the one-line key legend; key letters are tungsten (keyHint), labels faint.
 func (m tuiModel) boardFooter() string {
-	parts := []string{m.keyHint("enter", "open"), m.keyHint("/", "filter")}
+	parts := []string{m.keyHint("enter/→", "open"), m.keyHint("/", "filter")}
 	if m.board.admin {
 		parts = append(parts, m.keyHint("a", "my runs"))
 	} else {
@@ -401,14 +403,15 @@ const (
 	boardIDWidth         = 8  // short run id (first 8 of the UUID)
 	boardStatusWordWidth = 12 // status word cell (fits the longest word, "rate-limited")
 	boardAgeWidth        = 4  // AGE cell (relAge, single-unit)
-	boardMileWidth       = 8  // milestone micro-bar cell (up to boardMileCap ▰/▱ cells, or –/N text)
-	boardMileCap         = 8  // above this many milestones the micro-bar falls back to N/M text
+	boardMileWidth       = 9  // milestone micro-bar cell (up to boardMileCap ▰/▱ cells, or –/N text)
+	boardMileCap         = 9  // above this many milestones the micro-bar falls back to N/M text
 	boardOwnerWidth      = 20 // admin owner-email cell
+	boardCredWidth       = 10 // credential cell: a 2-col tone-dot slot + up to 8 cols of token label
 	boardTitleMax        = 60 // TITLE cap: long titles trim to a tidy column instead of running a wide terminal
 	// boardMileMinWidth is the narrowest own board that shows the milestone micro-bar. Below it
 	// the column is dropped (milestone progress is still on the run-detail view) so the fixed
 	// prefix does not squeeze the title into an overflowing marker row (issue #379).
-	boardMileMinWidth = 90
+	boardMileMinWidth = 91
 )
 
 // boardShowMile reports whether the terminal is wide enough for the milestone micro-bar column.
@@ -416,10 +419,20 @@ const (
 // up by exactly that extra prefix — the column drops on a narrow admin board instead of clipping.
 func (m tuiModel) boardShowMile() bool {
 	min := boardMileMinWidth
-	if m.board.admin {
-		min += boardRowPrefixWidth(true, true) - boardRowPrefixWidth(false, true)
-	}
+	// The extra columns before TITLE (the admin owner cell, and the credential cell when
+	// shown) push the mile threshold up by exactly their width, so a narrow board drops the
+	// micro-bar instead of squeezing the title (issue #379). mile is false in both terms so
+	// it cancels; only the owner + credential deltas survive.
+	min += boardRowPrefixWidth(m.board.admin, false, m.boardShowCred()) - boardRowPrefixWidth(false, false, false)
 	return m.width >= min
+}
+
+// boardShowCred gates the credential column exactly as the web RunsList does (PRD #295):
+// the admin factory board always shows it (naming which account a run billed is the point
+// of the factory view), the own board only when the viewer holds more than one Anthropic
+// token — a single token has nothing to disambiguate.
+func (m tuiModel) boardShowCred() bool {
+	return m.board.admin || m.tokenCount > 1
 }
 
 // boardCapacity is how many display lines fit between the wordmark block and the footer at the
@@ -566,6 +579,7 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	band := runBand(r.Status)
 	terminal := band == bandDone
 	tok := m.pal.stateToken(r.Status, r.Health, r.IsPlanning)
+	showCred := m.boardShowCred()
 
 	var bg color.Color
 	if sel {
@@ -619,6 +633,12 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 		row += padSeg(m.milestoneMarker(r, terminal, bg), boardMileWidth, bg) + gap
 	}
 
+	// WHICH Anthropic credential this run spent (PRD #111 / #295), gated by boardShowCred:
+	// the same column the web Runs list shows, in the same place — before the title.
+	if showCred {
+		row += m.boardCredSeg(r, bg) + gap
+	}
+
 	// Title: capped to the remaining width AND to boardTitleMax. The marker column allowance is
 	// reserved for every row so the title keeps one width down the board; markers then align by
 	// flushing the whole row to width-fullW below.
@@ -626,7 +646,7 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	if mc.fullW > 0 {
 		markerAllow = mc.fullW + 2
 	}
-	avail := m.width - boardRowPrefixWidth(m.board.admin, m.boardShowMile()) - markerAllow
+	avail := m.width - boardRowPrefixWidth(m.board.admin, m.boardShowMile(), showCred) - markerAllow
 	if avail < 10 {
 		avail = 10
 	}
@@ -646,13 +666,32 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	return row
 }
 
+// boardCredSeg renders WHICH Anthropic credential a run spent (PRD #111 / #295): just the token
+// LABEL, drawn muted (faint) — deliberately no dot and no select-reason colour, so the column is
+// a quiet "which account" scan rather than an attention signal (the reason/mode lives on the run
+// detail and in `uzi run <id>`). An empty cell is drawn when no credential was recorded (a run
+// claimed before PRD #111 M1, or one not yet claimed) — a guessed placeholder would assert
+// something nothing knows. The label is USER-AUTHORED and drawn through renderer.Plain (D7);
+// AnthropicSecretLabel is in d7UntrustedFields.
+func (m tuiModel) boardCredSeg(r apitypes.RunListItemDTO, bg color.Color) string {
+	if r.AnthropicSecretLabel == nil || *r.AnthropicSecretLabel == "" {
+		return padSeg("", boardCredWidth, bg)
+	}
+	label := m.renderer.Plain(strOr(r.AnthropicSecretLabel, ""), boardCredWidth)
+	return paintSeg(m.pal.faintC, bg, false, padCell(label, boardCredWidth))
+}
+
 // boardRowPrefixWidth is the visual width of every column before TITLE, so the title can be
 // sized to what remains. cursor(1)+strip(1)+glyph(1)+space(1)+id, then two-space gaps around
-// the status-word and AGE cells, the micro-bar cell when shown, plus the admin owner cell.
-func boardRowPrefixWidth(admin, mile bool) int {
+// the status-word and AGE cells, the micro-bar cell when shown, the credential cell when
+// shown, plus the admin owner cell.
+func boardRowPrefixWidth(admin, mile, cred bool) int {
 	w := 4 + boardIDWidth + 2 + boardStatusWordWidth + 2 + boardAgeWidth + 2
 	if mile {
 		w += boardMileWidth + 2
+	}
+	if cred {
+		w += boardCredWidth + 2
 	}
 	if admin {
 		w += 2 + boardOwnerWidth

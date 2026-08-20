@@ -157,6 +157,13 @@ func boardRuns(now time.Time) []apitypes.RunListItemDTO {
 	runs[0].MilestonesCompleted = []string{"m1", "m2"}
 	runs[0].MilestonesInProgress = []string{"m3"}
 	runs[6].Milestones = []apitypes.Milestone{{ID: "m1"}, {ID: "m2"}, {ID: "m3"}}
+	// PRD #295: WHICH Anthropic credential each run spent, so the board's credential column is
+	// exercised offline — meta and personal labels, drawn muted with no dot (the select reason is
+	// realistic data but the board deliberately does not surface it). The rest stay blank (pre-#111
+	// or unclaimed), the common case and the alignment worth checking.
+	runs[0].AnthropicSecretID, runs[0].AnthropicSecretLabel, runs[0].AnthropicSelectReason = sp("sec-meta"), sp("meta"), sp("auto")
+	runs[2].AnthropicSecretID, runs[2].AnthropicSecretLabel, runs[2].AnthropicSelectReason = sp("sec-personal"), sp("personal"), sp("pool_stale")
+	runs[6].AnthropicSecretID, runs[6].AnthropicSecretLabel, runs[6].AnthropicSelectReason = sp("sec-personal"), sp("personal"), sp("best_of_pool")
 	return runs
 }
 
@@ -173,6 +180,8 @@ func boardPopulated(dark bool, now time.Time) string {
 	fake := &uzicli.FakeClient{Runs: boardRuns(now)}
 	m := uxModel(fake, "", dark)
 	m = step(m, boardRunsMsg{runs: fake.Runs})
+	// >1 token so the own board clears the credential gate (PRD #295) and the column renders.
+	m = step(m, secretsMsg{count: 2})
 	return m.View().Content
 }
 
@@ -187,10 +196,12 @@ func boardAdmin(dark bool) string {
 	m := uxModel(fake, "", dark)
 	now := time.Now()
 	m = key(m, keyAdmin)
+	// The admin factory board ALWAYS shows the credential column (PRD #295), naming which account
+	// each user's run billed — meta / personal labels, drawn muted with no dot.
 	m = step(m, boardRunsMsg{admin: true, runs: []apitypes.RunListItemDTO{
-		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll", CreatedAt: now.Add(-4 * time.Minute)}, OwnerEmail: sp("dana@example.com")},
-		{RunDTO: apitypes.RunDTO{ID: "c3d4e5f6-1111", Kind: "issue", Status: "claimed", IssueTitle: "Refactor the forge sync loop", Health: "stalled", CreatedAt: now.Add(-51 * time.Minute)}, OwnerEmail: sp("priya@example.com")},
-		{RunDTO: apitypes.RunDTO{ID: "b2c3d4e5-1111", Kind: "ci_fix", Status: "awaiting_approval", IssueTitle: "Fix flaky pipeline on main", CreatedAt: now.Add(-2 * time.Minute)}, OwnerEmail: sp("sam@example.com")},
+		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll", CreatedAt: now.Add(-4 * time.Minute), AnthropicSecretID: sp("sec-meta"), AnthropicSecretLabel: sp("meta"), AnthropicSelectReason: sp("auto")}, OwnerEmail: sp("dana@example.com")},
+		{RunDTO: apitypes.RunDTO{ID: "c3d4e5f6-1111", Kind: "issue", Status: "claimed", IssueTitle: "Refactor the forge sync loop", Health: "stalled", CreatedAt: now.Add(-51 * time.Minute), AnthropicSecretID: sp("sec-personal"), AnthropicSecretLabel: sp("personal"), AnthropicSelectReason: sp("pool_stale")}, OwnerEmail: sp("priya@example.com")},
+		{RunDTO: apitypes.RunDTO{ID: "b2c3d4e5-1111", Kind: "ci_fix", Status: "awaiting_approval", IssueTitle: "Fix flaky pipeline on main", CreatedAt: now.Add(-2 * time.Minute), AnthropicSecretID: sp("sec-meta"), AnthropicSecretLabel: sp("meta"), AnthropicSelectReason: sp("auto")}, OwnerEmail: sp("sam@example.com")},
 	}})
 	return m.View().Content
 }
@@ -257,6 +268,9 @@ func detailRunning(dark bool, now time.Time) string {
 		StartedAt:           tp(now.Add(-4 * time.Minute)), // header elapsed WORK time (`● running · 4m`)
 		Milestones:          milestoneList,
 		MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3"}}
+	// The credential label rides the right of the header's first line, before the transport tag
+	// (PRD #295), coherent with the board's meta label for this same run id.
+	run.AnthropicSecretID, run.AnthropicSecretLabel = sp("sec-meta"), sp("meta")
 	m := detailBase(dark, run, now, true)
 	m = withLiveStream(m)
 	return m.View().Content
