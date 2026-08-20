@@ -39,7 +39,7 @@ jobs:
   kind-smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # Build the api + web images the chart runs. api context is api/ (its own
       # .dockerignore); web context is the repo ROOT so the Dockerfile can bundle
@@ -70,7 +70,7 @@ jobs:
       - name: Setup Helm
         uses: azure/setup-helm@v5
         with:
-          version: v3.21.3
+          version: v4.2.3
 
       # Public CNPG operator, the SAME minor dev-cluster runs, pinned to a fixed
       # release-asset URL (not a moving branch). Wait for the controller before the
