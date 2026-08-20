@@ -1118,6 +1118,39 @@ func TestTUIBoardMilestoneBadge(t *testing.T) {
 	}
 }
 
+// The micro-bar caps at boardMileCap (9) cells: a 9-milestone run draws the full bar, while a
+// 10-milestone run falls back to N/M text (the bar would overflow the boardMileWidth column).
+func TestTUIBoardMilestoneBadgeCap(t *testing.T) {
+	mile := func(n int) []apitypes.Milestone {
+		ms := make([]apitypes.Milestone, n)
+		for i := range ms {
+			ms[i] = apitypes.Milestone{ID: "m" + itoa(i+1)}
+		}
+		return ms
+	}
+	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "running", IssueTitle: "nine",
+			Milestones: mile(9), MilestonesCompleted: []string{"m1"}}}, // 1/9 → full 9-cell bar
+		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "running", IssueTitle: "ten",
+			Milestones: mile(10), MilestonesCompleted: []string{"m1", "m2", "m3"}}}, // 3/10 → text
+	}}
+	m := tuiTestModel(t, fake, "")
+	next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
+	out := stripANSI(next.(tuiModel).View().Content)
+
+	// 9 milestones sit at the cap → the full bar renders (1 done, 8 remaining), never "1/9" text.
+	if !strings.Contains(out, "▰▱▱▱▱▱▱▱▱") {
+		t.Errorf("a 9-milestone run should draw a 9-cell bar, not text\n%s", out)
+	}
+	if strings.Contains(out, "1/9") {
+		t.Errorf("a 9-milestone run must not fall back to N/M text\n%s", out)
+	}
+	// 10 milestones exceed the cap → N/M text, never a bar.
+	if !strings.Contains(out, "3/10") {
+		t.Errorf("a 10-milestone run should fall back to 3/10 text\n%s", out)
+	}
+}
+
 // M2: the board encodes run status as a colour chip + spine and a summary bar. Automatable
 // via the View() substring / SGR seam so CI gates the semantics per milestone (B2).
 func TestTUIBoardSemanticStatusAndSummary(t *testing.T) {

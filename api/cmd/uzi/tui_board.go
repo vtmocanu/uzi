@@ -403,15 +403,15 @@ const (
 	boardIDWidth         = 8  // short run id (first 8 of the UUID)
 	boardStatusWordWidth = 12 // status word cell (fits the longest word, "rate-limited")
 	boardAgeWidth        = 4  // AGE cell (relAge, single-unit)
-	boardMileWidth       = 8  // milestone micro-bar cell (up to boardMileCap ▰/▱ cells, or –/N text)
-	boardMileCap         = 8  // above this many milestones the micro-bar falls back to N/M text
+	boardMileWidth       = 9  // milestone micro-bar cell (up to boardMileCap ▰/▱ cells, or –/N text)
+	boardMileCap         = 9  // above this many milestones the micro-bar falls back to N/M text
 	boardOwnerWidth      = 20 // admin owner-email cell
 	boardCredWidth       = 10 // credential cell: a 2-col tone-dot slot + up to 8 cols of token label
 	boardTitleMax        = 60 // TITLE cap: long titles trim to a tidy column instead of running a wide terminal
 	// boardMileMinWidth is the narrowest own board that shows the milestone micro-bar. Below it
 	// the column is dropped (milestone progress is still on the run-detail view) so the fixed
 	// prefix does not squeeze the title into an overflowing marker row (issue #379).
-	boardMileMinWidth = 90
+	boardMileMinWidth = 91
 )
 
 // boardShowMile reports whether the terminal is wide enough for the milestone micro-bar column.
