@@ -38,8 +38,9 @@ type fakeProjectSyncer struct {
 	repoNodeErr error
 	linkCalls   int
 
-	live    []forge.ProjectV2ItemStatus
-	readErr error
+	live      []forge.ProjectV2ItemStatus
+	readErr   error
+	readCalls int
 
 	issueNode map[int]string // issue number -> content node id
 	addReturn map[string]string
@@ -104,6 +105,7 @@ func (f *fakeProjectSyncer) SetProjectV2ItemStatus(_ context.Context, _, itemID,
 }
 
 func (f *fakeProjectSyncer) ReadProjectV2ItemStatuses(context.Context, string, string) ([]forge.ProjectV2ItemStatus, error) {
+	f.readCalls++
 	return f.live, f.readErr
 }
 

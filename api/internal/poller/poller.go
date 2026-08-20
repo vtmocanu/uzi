@@ -18,9 +18,18 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
+
+// projectReverseSyncer is the narrow reverse (Status → label) sync collaborator the
+// per-tick sibling calls (PRD #364 M6). *forgesvc.ProjectSyncService satisfies it.
+// Kept as an interface so the poller's tests can inject a fake without the full
+// Projects v2 dependency surface.
+type projectReverseSyncer interface {
+	ReverseSync(ctx context.Context, repoID uuid.UUID) error
+}
 
 // defaultMaxConcurrency bounds how many repos are synced in parallel per tick.
 const defaultMaxConcurrency = 4
@@ -66,6 +75,16 @@ type Engine struct {
 	// pipeline watch is on (pipelineMaxRefs > 0), since it reads the pipeline cache the
 	// same tick populates.
 	ciAutoFix *CIAutoFix
+
+	// projectReverse runs the per-tick GitHub Projects v2 reverse (Status → label)
+	// sync (PRD #364 M6) as a sibling of the other post-sync steps. Optional
+	// (nil-safe): nil disables reverse sync — a deployment or test without
+	// SetProjectReverseSync keeps forward-only behaviour. Set via
+	// SetProjectReverseSync, the same optional-collaborator pattern as autopilot/
+	// ciAutoFix. Unlike those, it runs EVERY tick (not gated on reconcileDue): a
+	// GitHub-side drag must be picked up on the poll cadence regardless of whether the
+	// tick is a full reconcile.
+	projectReverse projectReverseSyncer
 
 	// forgeTimeout is the per-forge-call HTTP timeout (config.ForgeHTTPTimeout). It
 	// is used ONLY to floor the per-tick deadline (tickBudget, at 2x) so a poll
@@ -120,6 +139,12 @@ func (e *Engine) SetAutopilot(a *Autopilot) { e.autopilot = a }
 // sync still runs, no automatic ci_fix runs are created and no autofix comments are
 // posted. NOT wiring it is the instance kill-switch, exactly like SetAutopilot.
 func (e *Engine) SetCIAutoFix(d *CIAutoFix) { e.ciAutoFix = d }
+
+// SetProjectReverseSync wires the per-tick GitHub Projects v2 reverse (Status →
+// label) sync (PRD #364 M6). Call once at startup, before Run. A nil syncer (the
+// default) disables reverse sync: the tick's forward and issue-sync behaviour is
+// unchanged. NOT wiring it is the reverse kill-switch, exactly like SetCIAutoFix.
+func (e *Engine) SetProjectReverseSync(s projectReverseSyncer) { e.projectReverse = s }
 
 // SetPipelineWatch wires the PRD #6 pipeline-status sync into each tick. Call once
 // at startup, before Run. maxRefs <= 0 (the default when unset, or an operator's
@@ -386,5 +411,19 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	// errors are handled inside; nothing surfaces here.
 	if e.pipelineMaxRefs > 0 && e.ciAutoFix != nil {
 		e.ciAutoFix.detect(ctx, r, f)
+	}
+
+	// Reverse Status→label sync (PRD #364 M6): a genuine per-tick sibling (NOT gated
+	// on reconcileDue) so a GitHub-side board drag is picked up on the poll cadence
+	// regardless of whether this tick is a full reconcile. Only for GitHub repos and
+	// only when a reverse syncer is wired (the instance kill-switch). ReverseSync is
+	// best-effort and returns nil in practice; the error log is defensive. Ticks never
+	// overlap (tick does wg.Wait()), but the forward path in the HTTP handler CAN
+	// interleave with this read — the stored-marker no-op tolerates it (worst case a
+	// redundant same-value label write).
+	if r.ForgeType == string(forge.TypeGitHub) && e.projectReverse != nil {
+		if err := e.projectReverse.ReverseSync(ctx, r.ID); err != nil {
+			slog.Error("poller: reverse project sync", "repo", r.PathWithNamespace, "error", err)
+		}
 	}
 }

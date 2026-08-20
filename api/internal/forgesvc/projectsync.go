@@ -87,13 +87,32 @@ type ProjectSyncSettings interface {
 	GithubProjectSyncEnabled(ctx context.Context) (bool, error)
 }
 
+// ProjectMover is the narrow reverse-writeback collaborator the M6 poller needs:
+// it writes a single-column label move forge-first (the ordinary AutoMove path).
+// *forgesvc.Service satisfies it. It is injected via SetMover (an OPTIONAL
+// collaborator) rather than threaded through NewProjectSync so the existing M3/M5
+// constructor callers — and their positional tests — stay unchanged. AutoMove
+// deliberately lives on *Service, not on this provisioning type, and is NOT one of
+// the two forward-hooked call sites (D6), so a reverse label write does not
+// re-project back onto Status.
+type ProjectMover interface {
+	AutoMove(ctx context.Context, f forge.Forge, forgeProjectID int64, issue store.Issue, columns []store.BoardColumn, target string) (store.Issue, error)
+}
+
 // ProjectSyncService adopts and seeds an existing GitHub Projects v2 board against
-// a repo's label board (PRD #364 M3).
+// a repo's label board (PRD #364 M3), and drives the reverse (Status → label) sync
+// (M6) when a mover is wired.
 type ProjectSyncService struct {
 	store    ProjectSyncStore
 	forges   ProjectForgeBuilder
 	settings ProjectSyncSettings
 	log      *slog.Logger
+
+	// mover is the reverse-writeback collaborator (M6). Optional (nil-safe): a nil
+	// mover disables reverse sync — ReverseSync logs and returns nil — so a
+	// deployment or test without SetMover keeps forward-only behaviour. Set via
+	// SetMover, mirroring the optional-collaborator pattern the poller uses.
+	mover ProjectMover
 }
 
 // NewProjectSync constructs the provisioning service. A nil log defaults to
@@ -104,6 +123,10 @@ func NewProjectSync(st ProjectSyncStore, forges ProjectForgeBuilder, settings Pr
 	}
 	return &ProjectSyncService{store: st, forges: forges, settings: settings, log: log}
 }
+
+// SetMover wires the reverse-writeback collaborator (PRD #364 M6). Call once at
+// startup, before the poller runs. A nil mover (the default) disables reverse sync.
+func (s *ProjectSyncService) SetMover(m ProjectMover) { s.mover = m }
 
 // Adopt links an EXISTING Projects v2 board (identified by owner-kind + number) to
 // repoID and seeds it from the repo's cached issues (PRD #364 M3). It is
@@ -511,6 +534,220 @@ func (s *ProjectSyncService) addForwardItem(ctx context.Context, repo store.GetR
 		return "", fmt.Errorf("project sync: forward move add issue #%d: %w", issueIID, err)
 	}
 	return itemID, nil
+}
+
+// ReverseSync is the M6 reverse (Status → label) sync: for a GitHub sync-enabled
+// repo it reads the linked project's live item Statuses, diffs each against the
+// STORED marker (last_status_option_id), and for every GitHub-side change writes
+// the matching column label through the ordinary AutoMove path — uzi's normal
+// issue reconcile then follows the label to move its own board.
+//
+// It is BEST-EFFORT / NON-FATAL: every failure path returns nil so a wedged forge,
+// a missing link, or a per-item error never surfaces a fatal error to the poller
+// (which logs defensively but expects nil in practice).
+//
+// The convergence invariant (M8, SC-2): the no-op basis is the SAME stored marker
+// the forward no-op (ForwardMove, M5) uses. ForwardMove advances the marker to the
+// live OptionID whenever uzi itself sets Status, so:
+//   - live OptionID == marker → NO-OP. This is exactly the case where uzi made the
+//     change via forward (the marker already advanced), so reverse must NOT write a
+//     label — that is what stops oscillation.
+//   - live OptionID != marker → a GitHub-side drag → map the option back to a column
+//     and write the label via AutoMove, then advance the marker to the live OptionID.
+//
+// Because AutoMove is NOT one of the forward-hooked call sites (D6), this writeback
+// does not re-project to Status; and advancing the marker means the next poll reads
+// live == marker → no-op. That double guard is the convergence. Concurrency: the
+// forward path can interleave with this read from the HTTP handler; the stored-marker
+// basis tolerates it — worst case a redundant same-value label write, never a wrong
+// label.
+func (s *ProjectSyncService) ReverseSync(ctx context.Context, repoID uuid.UUID) error {
+	// Instance kill-switch: sync off instance-wide → no-op.
+	enabled, err := s.settings.GithubProjectSyncEnabled(ctx)
+	if err != nil {
+		s.log.Warn("project sync: reverse read kill-switch", "repo", repoID, "error", err)
+		return nil
+	}
+	if !enabled {
+		return nil
+	}
+
+	// The LINK ROW presence is the per-repo enable state: no row → not sync-enabled.
+	link, err := s.store.GetGithubProjectLinkByRepo(ctx, repoID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		s.log.Warn("project sync: reverse load link", "repo", repoID, "error", err)
+		return nil
+	}
+
+	// A nil mover is the reverse kill-switch (SetMover not wired): nothing to write.
+	if s.mover == nil {
+		s.log.Info("project sync: reverse sync disabled (no mover wired)", "repo", repoID)
+		return nil
+	}
+
+	repo, err := s.store.GetRepoByID(ctx, repoID)
+	if err != nil {
+		s.log.Warn("project sync: reverse load repo", "repo", repoID, "error", err)
+		return nil
+	}
+	if repo.ForgeType != string(forge.TypeGitHub) {
+		return nil
+	}
+	f, err := s.forges.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	if err != nil {
+		s.log.Warn("project sync: reverse build forge", "repo", repoID, "error", err)
+		return nil
+	}
+	syncer, ok := f.(forge.ProjectBoardSyncer)
+	if !ok {
+		return nil
+	}
+
+	// Reverse map option-id → column-name, by inverting the link's stored
+	// column→option map. An option id not in this map is one uzi does not manage.
+	var columnOption map[string]string
+	if err := json.Unmarshal(link.StatusOptions, &columnOption); err != nil {
+		s.log.Warn("project sync: reverse parse status options", "repo", repoID, "error", err)
+		return nil
+	}
+	optionColumn := make(map[string]string, len(columnOption))
+	for column, optID := range columnOption {
+		optionColumn[optID] = column
+	}
+
+	// Issue cache (by iid) — AutoMove needs the full row; closed/absent issues are
+	// skipped. Item rows (by iid) carry the stored marker + item node id.
+	issues, err := s.store.ListIssuesByRepo(ctx, repoID)
+	if err != nil {
+		s.log.Warn("project sync: reverse list issues", "repo", repoID, "error", err)
+		return nil
+	}
+	issuesByIID := make(map[int64]store.Issue, len(issues))
+	for _, iss := range issues {
+		issuesByIID[iss.ForgeIssueIid] = iss
+	}
+
+	items, err := s.store.ListGithubProjectItems(ctx, repoID)
+	if err != nil {
+		s.log.Warn("project sync: reverse list items", "repo", repoID, "error", err)
+		return nil
+	}
+	itemsByIID := make(map[int64]store.GithubProjectItem, len(items))
+	for _, it := range items {
+		itemsByIID[it.ForgeIssueIid] = it
+	}
+
+	columns, err := s.store.ListBoardColumns(ctx, repoID)
+	if err != nil {
+		s.log.Warn("project sync: reverse list board columns", "repo", repoID, "error", err)
+		return nil
+	}
+
+	live, err := syncer.ReadProjectV2ItemStatuses(ctx, link.ProjectNodeID, link.StatusFieldID)
+	if err != nil {
+		s.stampLinkErrorReverse(ctx, repoID, err)
+		return nil
+	}
+
+	for _, it := range live {
+		// Non-issue content (PR/draft) carries IssueNumber 0 — nothing to move.
+		if it.IssueNumber == 0 {
+			continue
+		}
+
+		// Stored-marker no-op: an absent item row is marker "" (never seen). live ==
+		// marker is precisely the uzi-forward case (the marker already advanced), so
+		// reverse must not write — this is the convergence guard.
+		item, itemPresent := itemsByIID[it.IssueNumber]
+		var marker string
+		if itemPresent {
+			marker = markerValue(item.LastStatusOptionID)
+		}
+		if it.OptionID == marker {
+			continue
+		}
+
+		// A GitHub-side change. Resolve the target column: Open ("" option → No
+		// Status) maps to uzi's implicit Open (target column ""). A non-empty option
+		// not in the reverse map is one uzi does not manage (D5): log and SKIP,
+		// LEAVING the marker as-is so it stays visible (and re-evaluates next tick if
+		// the mapping later changes). This costs one Info line per unmanaged item per
+		// tick — deliberate, so an unmapped drag is not silently swallowed.
+		var targetColumn string
+		if it.OptionID != "" {
+			column, mapped := optionColumn[it.OptionID]
+			if !mapped {
+				s.log.Info("project sync: reverse skip, live Status option not in board map",
+					"repo", repoID, "issue", it.IssueNumber, "option", it.OptionID)
+				continue
+			}
+			targetColumn = column
+		}
+
+		// The issue must be in uzi's cache (M7 backfill / issue reconcile handles
+		// unknown issues). A closed issue's board state is its issue state (D1) — skip.
+		issue, ok := issuesByIID[it.IssueNumber]
+		if !ok {
+			s.log.Info("project sync: reverse skip, issue not in cache", "repo", repoID, "issue", it.IssueNumber)
+			continue
+		}
+		if issue.State == "closed" {
+			continue
+		}
+
+		// Write the label via the ordinary AutoMove path. On error, DO NOT advance the
+		// marker (so the change is retried next tick) and stamp the link error.
+		if _, err := s.mover.AutoMove(ctx, f, repo.ForgeProjectID, issue, columns, targetColumn); err != nil {
+			s.stampLinkErrorReverse(ctx, repoID, err)
+			continue
+		}
+
+		// Advance the marker to the live OptionID so the next poll reads live == marker
+		// → no-op (the second convergence guard). An existing item row advances just
+		// the marker; an absent one is upserted, carrying the live ItemID as the node id.
+		if itemPresent {
+			if err := s.store.SetGithubProjectItemStatusMarker(ctx, store.SetGithubProjectItemStatusMarkerParams{
+				LastStatusOptionID: optionMarker(it.OptionID),
+				RepoID:             repoID,
+				ForgeIssueIid:      it.IssueNumber,
+			}); err != nil {
+				s.log.Warn("project sync: reverse advance marker", "repo", repoID, "issue", it.IssueNumber, "error", err)
+			}
+		} else {
+			if _, err := s.store.UpsertGithubProjectItem(ctx, store.UpsertGithubProjectItemParams{
+				RepoID:             repoID,
+				ForgeIssueIid:      it.IssueNumber,
+				ItemNodeID:         it.ItemID,
+				LastStatusOptionID: optionMarker(it.OptionID),
+			}); err != nil {
+				s.log.Warn("project sync: reverse persist item", "repo", repoID, "issue", it.IssueNumber, "error", err)
+			}
+		}
+	}
+
+	// Deliberately do NOT clear last_error on a clean pass: a reverse READ succeeding
+	// says nothing about the health of the forward WRITE path, and both directions
+	// share this one link row's last_error (ForwardMove stamps it and, by convention,
+	// never clears on success). Clearing here on every read tick would wipe a still-
+	// relevant forward error within one poll interval. So reverse only STAMPS errors,
+	// matching M5's convention.
+	return nil
+}
+
+// stampLinkErrorReverse records a reverse-sync failure on the link row's last_error,
+// best-effort — a stamp failure is only logged. Mirrors stampLinkError (M5) but with
+// a reverse-specific log line.
+func (s *ProjectSyncService) stampLinkErrorReverse(ctx context.Context, repoID uuid.UUID, cause error) {
+	s.log.Warn("project sync: reverse sync failed", "repo", repoID, "error", cause)
+	if serr := s.store.SetGithubProjectLinkError(ctx, store.SetGithubProjectLinkErrorParams{
+		LastError: pgtype.Text{String: truncateErr(cause.Error()), Valid: true},
+		RepoID:    repoID,
+	}); serr != nil {
+		s.log.Warn("project sync: reverse record link error", "repo", repoID, "error", serr)
+	}
 }
 
 // stampLinkError records a forward-move failure on the link row's last_error,
