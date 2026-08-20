@@ -355,7 +355,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: azure/setup-helm@v5
         with:
-          version: v3.21.3
+          version: v4.2.3
       - uses: sigstore/cosign-installer@v3
         with:
           # cosign 2.x emits classic signatures -- the broadest verifier + Kyverno
