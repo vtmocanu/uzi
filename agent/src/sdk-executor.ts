@@ -146,6 +146,11 @@ const REASON_NO_PLAN_AFTER_CLARIFICATION =
   "the agent kept asking clarifying questions without ever submitting a plan";
 const REASON_MAX_ITERATIONS =
   "run reached its milestone-scaled implement/review iteration budget without completing";
+// PRD #390 M3 (K=2 from the D-log): consecutive work-turn misses (a milestone-bearing
+// run left with NO milestone in progress) before the loop emits a feed-only status so a
+// silently-non-reporting lead becomes observable. Enforcement is bounded and never fails
+// the run.
+const PROGRESS_MISS_LIMIT = 2;
 
 /**
  * Injectable seam over the SDK's `query`. The return only needs to be async
@@ -1314,6 +1319,11 @@ export class SdkExecutor implements Executor {
         : undefined;
       let iteration = 0;
       let followUp: string | undefined;
+      // PRD #390 M3 (D2/D4): mid-run milestone-reporting enforcement state. progressMissedLastTurn
+      // escalates the NEXT turn's prompt; consecutiveMisses counts work turns that left the tracker
+      // with no milestone in progress. Bounded, feed-only, never fails the run.
+      let progressMissedLastTurn = false;
+      let consecutiveMisses = 0;
       // Hoisted: `turn` is declared INSIDE the loop, so the return below cannot see
       // it and the terminating turn's declaration would be discarded by `break`.
       let declaredPrdPath: string | undefined;
@@ -1402,6 +1412,9 @@ export class SdkExecutor implements Executor {
             // any run with no approved breakdown, which makes the note additive-absent.
             milestones: frozenMilestones,
             progress: latestProgress,
+            // PRD #390 M3: escalate this turn when the PREVIOUS work turn left the tracker with no
+            // milestone in progress on a milestone-bearing run.
+            progressMissedLastTurn,
             // issue #279: teach the lead the report-only evidence path, ISSUE RUNS ONLY —
             // gated on the same isIssueRun discriminator the signal_done schema uses.
             reportOnly: isIssueRun,
@@ -1431,6 +1444,19 @@ export class SdkExecutor implements Executor {
         // continue when done.
         if (turn.checkpoint && !turn.done) {
           await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+          // PRD #390 M3: a cooperative checkpoint is a milestone boundary = progress evidence.
+          // Re-arm enforcement for the NEXT milestone: reset the miss streak and escalation flag,
+          // and clear the in-progress latch so a stale in_progress from the just-finished milestone
+          // cannot permanently disarm the trigger. Preserve any real completed ids (an honest
+          // "reported, nothing in progress now" snapshot); if nothing real was ever reported, drop
+          // latestProgress to undefined so the next running report never persists an empty `[]`
+          // (PRD #390 M1's no-signal invariant, enforced here on the executor side).
+          progressMissedLastTurn = false;
+          consecutiveMisses = 0;
+          latestProgress =
+            latestProgress && latestProgress.completed.length > 0
+              ? { completed: latestProgress.completed, in_progress: [] }
+              : undefined;
           continue;
         }
         if (turn.done) break;
@@ -1483,6 +1509,31 @@ export class SdkExecutor implements Executor {
 
         // Fold any queued correction into the next turn (FIFO, one per turn).
         followUp = ctx.pullFollowUp?.();
+
+        // PRD #390 M3 (D2/D4): enforcement evaluation. Only normal work turns reach here — the
+        // checkpoint and park paths `continue` above, and done/max-iter exit above. On a
+        // milestone-bearing run (≥1 frozen milestone) where the tracker shows NO milestone in
+        // progress, escalate the next turn's prompt and count the miss; after K consecutive misses
+        // emit a feed-only status so a silently-non-reporting lead is observable. A lead that
+        // declared a milestone in progress (even across several turns) is NOT nagged — the latch
+        // stays non-empty — so a compliant multi-turn milestone does not burn re-asks (SC4/R4).
+        // NEVER fails the run (D4); it only sets a prompt flag and emits a status line.
+        if ((frozenMilestones?.length ?? 0) >= 1 && !latestProgress?.in_progress?.length) {
+          progressMissedLastTurn = true;
+          consecutiveMisses++;
+          if (consecutiveMisses === PROGRESS_MISS_LIMIT) {
+            ctx.emit({
+              kind: "status",
+              agent: "worker",
+              payload: {
+                text: `milestone tracker: the lead has not marked a milestone in progress for ${PROGRESS_MISS_LIMIT} turns — progress may be unreported`,
+              },
+            });
+          }
+        } else {
+          progressMissedLastTurn = false;
+          consecutiveMisses = 0;
+        }
       }
 
       // js_deps rides the completion log so a finished run's record says whether its

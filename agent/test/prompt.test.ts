@@ -612,6 +612,54 @@ describe("buildImplementPrompt — milestone note (PRD #122 M6)", () => {
     assert.match(p, /`report_progress`/, "the note points at report_progress for mid-run visibility");
     assert.match(p, /`signal_done`/, "the note tells the lead to declare finished milestones on signal_done");
     assert.match(p, /milestones_completed/, "the note names the signal_done declaration field");
+    // PRD #390 M2: the mid-run report is now a REQUIRED per-turn declaration, not "MAY".
+    assert.match(p, /At the start of each implement turn, call/, "the note requires a per-turn report_progress declaration");
+    assert.doesNotMatch(p, /you MAY call `report_progress`/, "the old permissive MAY phrasing is gone");
+  });
+
+  it("PRD #390 M2: escalates with progressMissedLastTurn, and only then", () => {
+    const escalated = buildImplementPrompt({
+      branch: "b",
+      subagentNames: ["coder"],
+      first: false,
+      iteration: 2,
+      milestones,
+      progress: { completed: [], in_progress: [] },
+      progressMissedLastTurn: true,
+    });
+    assert.match(escalated, /Your last turn marked no milestone in progress\./, "the escalation line renders when the previous turn reported nothing");
+    // Absent flag: no escalation line.
+    const noFlag = buildImplementPrompt({
+      branch: "b",
+      subagentNames: ["coder"],
+      first: false,
+      iteration: 2,
+      milestones,
+    });
+    assert.doesNotMatch(noFlag, /Your last turn marked no milestone in progress\./, "no escalation when the flag is absent");
+    // Explicit false: no escalation line.
+    const falseFlag = buildImplementPrompt({
+      branch: "b",
+      subagentNames: ["coder"],
+      first: false,
+      iteration: 2,
+      milestones,
+      progressMissedLastTurn: false,
+    });
+    assert.doesNotMatch(falseFlag, /Your last turn marked no milestone in progress\./, "no escalation when the flag is false");
+  });
+
+  it("PRD #390 M2: the escalation flag never leaks into a 0-milestone / non-issue prompt", () => {
+    // SC4 byte-identity: the flag must not be read before the empty-milestones early return.
+    const base = { branch: "agent/issue-9", subagentNames: ["coder"], first: false, iteration: 2 };
+    const before = buildImplementPrompt({ ...base });
+    // Undefined milestones + flag set ⇒ byte-identical to the no-milestone prompt.
+    const undefinedWithFlag = buildImplementPrompt({ ...base, progressMissedLastTurn: true });
+    assert.equal(undefinedWithFlag, before, "undefined milestones + flag adds nothing");
+    // Empty milestone list + flag set ⇒ byte-identical too.
+    const emptyWithFlag = buildImplementPrompt({ ...base, milestones: [], progressMissedLastTurn: true });
+    assert.equal(emptyWithFlag, before, "empty milestone list + flag adds nothing");
+    assert.doesNotMatch(before, /Your last turn marked no milestone in progress\./);
   });
 
   it("renders live status: completed ⇒ done, in_progress ⇒ in progress, else not started", () => {
