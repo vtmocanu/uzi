@@ -6,6 +6,32 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.49.0] - 2026-08-20
+<!-- release-title: CLI contexts, in-app changelog, workflow-scope run recovery -->
+
+### Added
+
+- **In-app changelog / release notes panel ([#440](https://github.com/vtmocanu/uzi/pull/440),
+  [#415](https://github.com/vtmocanu/uzi/issues/415)).** The web UI now renders the project
+  CHANGELOG in an in-app panel, from a build-time bundle whose per-version body mirrors
+  `scripts/changelog-section.sh` so what users read in-app matches the release notes exactly.
+- **uzi CLI named contexts (multi-token profiles) ([#436](https://github.com/vtmocanu/uzi/pull/436),
+  PRD [#427](https://github.com/vtmocanu/uzi/issues/427)).** A `--context`/`-c` persistent flag
+  and `$UZI_CONTEXT` let the CLI hold several named API endpoints/tokens and switch between them,
+  with precedence flag > `$UZI_CONTEXT` > configured current > default.
+- **Explicit per-repo remove action ([#438](https://github.com/vtmocanu/uzi/pull/438),
+  [#357](https://github.com/vtmocanu/uzi/issues/357)).** An owner-scoped `DELETE /api/repos/{id}`
+  removes a disabled repo and cascades its derived data (runs, cached issues, board columns) via
+  existing foreign keys, guarded 404 for missing/foreign and 409 for a still-enabled repo.
+- **Anthropic credential shown in the TUI, plus board to run navigation
+  ([#435](https://github.com/vtmocanu/uzi/pull/435)).** The board and run-detail views surface the
+  active token label (gated the same way the web UI gates it), and the board now opens a run while
+  run detail backs out, with the header collapsing to one row when width allows.
+- **Sweep backfill: refill a skipped slot from the next eligible candidate
+  ([#426](https://github.com/vtmocanu/uzi/pull/426), [#416](https://github.com/vtmocanu/uzi/issues/416)).**
+  A sweep's `max_issues` cap now counts runs actually started rather than candidates matched, so a
+  skipped candidate is backfilled from the next eligible one instead of wasting the slot.
+
 ### Changed
 
 - **Surge upgrade: release the stack without killing in-flight runs
@@ -25,6 +51,37 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   compatibility this relies on. See `adr/0422-decouple-worker-version.md`. **Operator
   note:** an out-of-tree per-cluster values file that left `workers.image.tag` empty
   must now set a concrete pinned tag (the chart `required`-wraps it).
+- **Incidental findings now fire on normal runs ([#459](https://github.com/vtmocanu/uzi/pull/459),
+  PRD [#457](https://github.com/vtmocanu/uzi/issues/457)).** The incidental-findings capability and
+  a short discovery nudge are injected at the agent-assembly seam, so builtin and shared-library
+  repo agents both get them without editing agent files. A follow-up
+  ([#461](https://github.com/vtmocanu/uzi/pull/461)) makes the nudge string derive the tool name
+  rather than hardcode it, with no change to the emitted text.
+- **Mid-run milestone progress reporting is enforced
+  ([#437](https://github.com/vtmocanu/uzi/pull/437), PRD [#390](https://github.com/vtmocanu/uzi/issues/390)).**
+  An all-empty or defaulted `report_progress` call now counts as no signal, so it can no longer
+  overwrite real milestone progress, and the lead must actually mark milestones for the board to move.
+- **Run-summary intent and plan render through hardened Markdown
+  ([#424](https://github.com/vtmocanu/uzi/pull/424)).** The run-summary intent and plan cards now
+  go through the same hardened `<Markdown>` sink the judge summary already uses (no raw HTML, unsafe
+  characters stripped before parse), so model-emitted code spans, bold and lists render instead of
+  showing as literal source.
+- **TUI board milestone bar improvements
+  ([#460](https://github.com/vtmocanu/uzi/pull/460), [#379](https://github.com/vtmocanu/uzi/issues/379)).**
+  A milestone-structured run that has reported nothing yet draws a graphical empty bar (0/N) instead
+  of `-/N` text, and the micro-bar now renders for up to 9 milestones (only 10+ fall back to text),
+  with the column widened so a 9-cell bar fits.
+- **Go dependency bumps.** `golang.org/x/mod` ([#433](https://github.com/vtmocanu/uzi/pull/433)),
+  `golang.org/x/crypto` ([#432](https://github.com/vtmocanu/uzi/pull/432)),
+  `gitlab.com/gitlab-org/api/client-go` v2 ([#431](https://github.com/vtmocanu/uzi/pull/431)),
+  `github.com/yuin/goldmark` ([#430](https://github.com/vtmocanu/uzi/pull/430)), and
+  `github.com/coreos/go-oidc/v3` ([#429](https://github.com/vtmocanu/uzi/pull/429)).
+- **CI: KinD smoke unblocked under Helm 4 and gated on chart PRs
+  ([#447](https://github.com/vtmocanu/uzi/pull/447)).**
+- **Test-coverage hardening for viewer-identity, GetSkill and the AST checker
+  ([#439](https://github.com/vtmocanu/uzi/pull/439), PRD [#97](https://github.com/vtmocanu/uzi/issues/97)).**
+  Pins six `*ForViewer` handler call sites, adds `GetSkill` property tests, and tightens the AST
+  inert-code checker so an admin-bypass mutation no longer passes silently.
 
 ### Fixed
 
@@ -40,6 +97,24 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   cordon `POST`), so the worker resumes claiming within one reconcile tick instead of
   needing a manual pod restart. Follow-up to [#422](https://github.com/vtmocanu/uzi/issues/422); see
   `adr/0422-decouple-worker-version.md`.
+- **Runs no longer lose all their work when a branch is behind `main` on `.github/workflows`
+  ([#470](https://github.com/vtmocanu/uzi/pull/470), PRD [#456](https://github.com/vtmocanu/uzi/issues/456)).**
+  A run whose branch was behind `main` had its finalize push rejected for a workflow-scope reason
+  even though it touched no workflow file, losing the branch. The push broker now skips the
+  workflow-scope block on that path and a typed `finalize_base_align_conflict` fail origin carries a
+  clear reason. Relatedly, a run that genuinely does touch an unpushable `.github/workflows` file now
+  fails early with a typed `workflow_scope_missing` reason and preserves the agent's diff
+  ([#454](https://github.com/vtmocanu/uzi/pull/454), PRD [#377](https://github.com/vtmocanu/uzi/issues/377)),
+  instead of failing opaquely at push time.
+- **uzi handoff no longer fails auth for every CLI token
+  ([#434](https://github.com/vtmocanu/uzi/pull/434)).** `POST /api/repos/{id}/task-runs` was in the
+  cookie-only auth group, so the first forge-writing call `uzi handoff` makes exited with
+  "authentication required" for a Bearer token; it now requires a user via the token-aware path like
+  its dispatch sibling.
+- **Conversation and run-archive lists sort by instant, not string
+  ([#468](https://github.com/vtmocanu/uzi/pull/468)).** Same-second timestamps of differing
+  fractional precision (`…:00Z` vs `…:00.5Z`) ordered wrong under a string compare; both lists now
+  compare as instants.
 
 ## [0.48.0] - 2026-08-20
 <!-- release-title: signed container images and chart -->
@@ -2813,7 +2888,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.48.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.49.0...HEAD
+[0.49.0]: https://github.com/vtmocanu/uzi/compare/v0.48.0...v0.49.0
 [0.48.0]: https://github.com/vtmocanu/uzi/compare/v0.47.0...v0.48.0
 [0.47.0]: https://github.com/vtmocanu/uzi/compare/v0.46.1...v0.47.0
 [0.46.1]: https://github.com/vtmocanu/uzi/compare/v0.46.0...v0.46.1
