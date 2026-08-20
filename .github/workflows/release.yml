@@ -12,12 +12,16 @@
 #   tagged. If we ever want true single-pipeline atomicity, make ci.yml
 #   `workflow_call`-able and add it as a `needs:` job below.
 #
-# TRUST BOUNDARY: read-only default token; the only writes are `packages: write`
-# (GHCR, via the built-in GITHUB_TOKEN) granted per-job. Every publish job declares
-# `environment: release`, so once the repo can carry environment protection rules
-# (blocked on the current Free/private plan) a required-reviewer / `v*`-only rule gates
-# all publishing at once. No `pull_request` job reads these scopes; never
-# `pull_request_target`.
+# TRUST BOUNDARY: read-only default token. Writes are per-job and of two kinds:
+# `packages: write` (GHCR, via the built-in GITHUB_TOKEN) on every image + chart job,
+# and `contents: write` on the lone `publish-release` job, which creates the GitHub
+# Release. Every IMAGE/CHART publish job declares `environment: release`, so once the
+# repo can carry environment protection rules (blocked on the current Free/private
+# plan) a required-reviewer / `v*`-only rule gates all artifact publishing at once.
+# `publish-release` deliberately carries NO `environment: release` (see its own
+# comment): it `needs:` those gated jobs so it cannot run until they are approved, and
+# it pushes no registry artifact -- only a Release built from the already-published
+# tag. No `pull_request` job reads any of these scopes; never `pull_request_target`.
 #
 # Model B: the git tag `vX.Y.Z` normalizes to `X.Y.Z` (== chart version/appVersion,
 # asserted below); images push at `:X.Y.Z` and `:<short-sha>`; the chart pushes at its
@@ -108,6 +112,12 @@ jobs:
           fetch-tags: true
       - name: Changelog covers release
         run: bash scripts/assert-changelog-covers-release.sh "${GITHUB_REF_NAME}"
+      # The Release notes are the CHANGELOG section verbatim, so the section's
+      # inline #N links and the compare-link footers must already be committed --
+      # publish-release does not generate them. A tag whose CHANGELOG links are
+      # stale is rejected here, the same way a missing section is.
+      - name: Changelog links + compare footers current
+        run: bash scripts/changelog-links.sh --check
       - name: Compute build-info counts
         id: counts
         run: |
@@ -289,3 +299,64 @@ jobs:
           helm dependency build deploy/chart
           helm package deploy/chart -d /tmp/chart
           helm push /tmp/chart/uzi-*.tgz oci://ghcr.io/vtmocanu/uzi
+
+  # --------------------------------------------------------------- release ----
+  # Create the GitHub Release from the tag's CHANGELOG section. The curated prose
+  # is the source of truth (already gated by assert-changelog). Title is
+  # `vX.Y.Z[: <marker>]` -- the optional `<!-- release-title: … -->` marker under the
+  # section heading.
+  #
+  # NOTE on autolinking: GitHub autolinks a bare `#N` in a Release body to THIS repo's
+  # PR/issue N. For uzi refs that is the desired behavior; for a CROSS-REPO ref it is
+  # WRONG, so cross-repo refs must be BACKTICKED in the CHANGELOG (a code span is not
+  # autolinked) -- the same convention scripts/changelog-links.sh follows to keep them
+  # unlinked in the file. That script already emits uzi citations as explicit
+  # `[#N](…)` links, which render identically on the file and the Release surface.
+  #
+  # Runs LAST: it `needs:` every publish job, so a Release exists only once the
+  # images AND the chart are actually live -- never advertising a version whose
+  # artifacts a puller cannot get. Uses the built-in `gh` CLI (no third-party
+  # action) with the default GITHUB_TOKEN; the only new grant is contents:write to
+  # create the release. It deliberately declares NO `environment: release`: it
+  # needs the release-gated publish jobs, so it cannot run unless those were
+  # approved -- its own environment gate would add a third approval click for zero
+  # extra safety. So release.yml still gates exactly twice (image wave, then
+  # chart); brew.yml keeps its own separate approval.
+  publish-release:
+    runs-on: ubuntu-latest
+    needs: [publish-api, publish-web, publish-controller, publish-agent, publish-chart]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build release notes from the CHANGELOG section
+        id: notes
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          bash scripts/changelog-section.sh body "$VERSION" > release-notes.md
+          {
+            echo "title=$(bash scripts/changelog-section.sh title "$VERSION")"
+          } >> "$GITHUB_OUTPUT"
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          TITLE: ${{ steps.notes.outputs.title }}
+        run: |
+          set -euo pipefail
+          # A SemVer prerelease tag (vX.Y.Z-rc.1) is flagged --prerelease and is NOT
+          # marked latest; a plain vX.Y.Z is --latest. assert-version permits the
+          # prerelease form, so a prerelease must not be advertised as the latest.
+          flags=(--title "$TITLE" --notes-file release-notes.md)
+          case "$TAG" in
+            *-*) flags+=(--prerelease) ;;
+            *)   flags+=(--latest) ;;
+          esac
+          # Idempotent: re-running a tag (e.g. after a transient publish failure)
+          # edits the existing Release instead of failing on "already exists".
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" "${flags[@]}"
+          else
+            gh release create "$TAG" "${flags[@]}" --verify-tag
+          fi
