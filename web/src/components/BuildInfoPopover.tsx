@@ -427,7 +427,6 @@ export function BuildInfoPopover({
                   href={PRDS_URL}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="hover:underline"
                 >
                   <span className="text-ok">{prdsDone} done</span>{" "}
                   <span className="text-faint">· {prdsOpen} open</span>
