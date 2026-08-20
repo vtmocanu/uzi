@@ -289,6 +289,82 @@ func TestSweepRecoversStuckConfirmingProposals(t *testing.T) {
 	}
 }
 
+// TestDeriveChatTitle pins the title derivation, including the #213 terminal-safety
+// strip: control/bidi runes are NOT unicode.IsSpace, so strings.Fields alone left
+// them in runs.title, which renders in the cross-tenant `uzi admin runs` table.
+// termsafe.CellText removes them at derivation time. Cases also lock the existing
+// behaviour (first-line cut, whitespace collapse, fallback, truncation) so the fix
+// does not regress it.
+func TestDeriveChatTitle(t *testing.T) {
+	// A first line of 100 'a' runes exceeds maxChatTitleRunes (80); after truncation
+	// the (space-free) 80-rune prefix keeps all 80 runes and the ellipsis is appended,
+	// so the result is 81 runes ending in "…".
+	longInput := strings.Repeat("a", 100)
+
+	tests := []struct {
+		name  string
+		in    string
+		want  string // exact expected result; "" means use the assert func instead
+		check func(t *testing.T, got string)
+	}{
+		{
+			name: "strips ESC terminal-control sequence",
+			in:   "hi\x1b[2Jthere",
+			check: func(t *testing.T, got string) {
+				if strings.ContainsRune(got, '\x1b') {
+					t.Errorf("title %q must not contain ESC (\\x1b)", got)
+				}
+				// The visible characters survive (the '[' is ordinary text after the
+				// control rune is stripped).
+				if !strings.Contains(got, "hi") || !strings.Contains(got, "there") {
+					t.Errorf("title %q lost visible text", got)
+				}
+			},
+		},
+		{
+			name: "strips bidi RLO override",
+			in:   "safe\u202eevil",
+			check: func(t *testing.T, got string) {
+				if strings.ContainsRune(got, '\u202e') {
+					t.Errorf("title %q must not contain bidi RLO (U+202E)", got)
+				}
+				if !strings.Contains(got, "safe") || !strings.Contains(got, "evil") {
+					t.Errorf("title %q lost visible text", got)
+				}
+			},
+		},
+		{name: "cuts at first newline", in: "first\nsecond", want: "first"},
+		{name: "collapses whitespace runs", in: "a   b", want: "a b"},
+		{name: "whitespace-only first line falls back", in: "   \n rest", want: "New chat"},
+		{name: "plain text unchanged", in: "Hello world", want: "Hello world"},
+		{
+			name: "truncates past maxChatTitleRunes with ellipsis",
+			in:   longInput,
+			check: func(t *testing.T, got string) {
+				if !strings.HasSuffix(got, "…") {
+					t.Errorf("truncated title %q must end with an ellipsis", got)
+				}
+				if n := len([]rune(got)); n != maxChatTitleRunes+1 {
+					t.Errorf("truncated title rune count = %d, want %d", n, maxChatTitleRunes+1)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := deriveChatTitle(tc.in)
+			if tc.check != nil {
+				tc.check(t, got)
+				return
+			}
+			if got != tc.want {
+				t.Errorf("deriveChatTitle(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestSweepCompletesIdleChats: the sweep completes chat runs the idle-chat query
 // returns, fanning each transition out (the not-trusting-the-worker backstop).
 func TestSweepCompletesIdleChats(t *testing.T) {
