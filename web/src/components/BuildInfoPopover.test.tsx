@@ -552,6 +552,12 @@ describe("BuildInfoPopover — Changelog button + focus-within (PRD #415 M2)", (
     expect(pop.getAttribute("data-open")).toBe("false");
     expect(pop.className).toContain("pointer-events-none");
     expect(pop.className).toContain("opacity-0");
-    expect(pop.contains(pop.querySelector("[data-hover-bridge]"))).toBe(true);
+    const bridge = pop.querySelector("[data-hover-bridge]")!;
+    expect(pop.contains(bridge)).toBe(true);
+    // The inheritance only holds because the bridge sets NO pointer-events class of
+    // its own — a future `pointer-events-auto` on it would make the shut popover a
+    // hover target again, defeating the fix while this test's panel-level checks
+    // stayed green. Guard the invariant directly.
+    expect(bridge.className).not.toContain("pointer-events");
   });
 });
