@@ -80,6 +80,20 @@ The nine run statuses and which are terminal are in the `uzi-cli` skill. A run a
 message) and answer with `uzi run answer`. A run at `limit_wait` is parked on an Anthropic
 usage limit and resumes itself — keep waiting.
 
+**Watching for a REVISED plan (after `uzi run revise`) needs the plan-seq form, not a
+status heuristic.** A revise sends the run back through `running` to `awaiting_approval`,
+so a poller that waits for "`awaiting_approval` after I saw `running`" **loops forever if
+it starts after re-planning already finished** — it never observes `running` and never
+stops (measured: this silently missed a revised plan until the user asked). Detect the new
+plan by **seq** instead — capture the latest plan seq BEFORE revising and pass it as the
+5th arg so the gate only counts once a newer plan exists:
+
+```
+SEQ=$(uzi run logs RUN --json | jq -rs '[.[]|select(.kind=="plan")|.seq]|max // 0')
+uzi run revise RUN -m "…the precise change…"
+<this skill's directory>/scripts/watch-run.sh RUN "" "" "" "$SEQ"
+```
+
 ## Plan-trap checks (run before every approve)
 
 Two traps have shipped from real runs here; both pass a naive read and fail only at
