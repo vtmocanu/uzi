@@ -11,8 +11,10 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // TestRunMilestoneProgressLiveDB pins PRD #122 M2's progress + budget SQL against a
@@ -365,6 +367,71 @@ func TestRunMilestoneProgressLiveDB(t *testing.T) {
 		}
 	})
 
+	// ── PRD #390 M4/D5: the SERVER CONTRACT the neutral (`–/N`) render depends on. A
+	//    running heartbeat that carries NO progress (MilestonesCompleted AND
+	//    MilestonesInProgress both nil — exactly what the agent sends post-M1 when nothing
+	//    real was reported) must leave milestones_completed as SQL NULL, so
+	//    DecodeMilestoneIDs yields a NIL slice (not a non-nil empty `[]`). That NULL is what
+	//    the DTO marshals as `null`, which the web badge and CLI both render neutral rather
+	//    than as `0/N`. The complement to M1's agent-side no-signal proof. ──
+	t.Run("a no-progress running heartbeat leaves milestones_completed NULL", func(t *testing.T) {
+		run := newRun("claimed")
+		// Freeze a milestone breakdown and go running — but report NO progress.
+		if _, err := q.SetRunRunning(ctx, store.SetRunRunningParams{
+			MilestonesFrozen: milestoneList(3), ID: run, WorkerID: workerID,
+			MilestonesCompleted: nil, MilestonesInProgress: nil,
+			RunMaxIterations: runMaxIter, RunTimeoutSeconds: runTimeout,
+			MilestoneBudgetCap: budgetCap, BudgetWallCeilingSeconds: wallCeiling,
+		}); err != nil {
+			t.Fatalf("SetRunRunning (freeze, no progress): %v", err)
+		}
+		// A second plain heartbeat, still with no progress, must not conjure a `[]` either.
+		if _, err := q.SetRunRunning(ctx, store.SetRunRunningParams{
+			ID: run, WorkerID: workerID,
+			MilestonesCompleted: nil, MilestonesInProgress: nil,
+			RunMaxIterations: runMaxIter, RunTimeoutSeconds: runTimeout,
+			MilestoneBudgetCap: budgetCap, BudgetWallCeilingSeconds: wallCeiling,
+		}); err != nil {
+			t.Fatalf("SetRunRunning (heartbeat, no progress): %v", err)
+		}
+
+		// Read the raw column and decode via the production path: NULL ⇒ nil slice.
+		raw := rawMilestoneCol(ctx, t, pool, run, "milestones_completed")
+		if raw != nil {
+			t.Fatalf("milestones_completed must be SQL NULL after a no-progress heartbeat, got raw jsonb %q", raw)
+		}
+		ids, err := workersvc.DecodeMilestoneIDs(raw)
+		if err != nil {
+			t.Fatalf("DecodeMilestoneIDs(NULL): %v", err)
+		}
+		if ids != nil {
+			t.Fatalf("a NULL milestones_completed must decode to a NIL slice (never-reported), got %#v (len %d)", ids, len(ids))
+		}
+
+		// Discriminating / non-vacuity guard: a heartbeat WITH a real completed report
+		// makes the same column non-NULL — so this test would fail if the column were
+		// always NULL (or always non-NULL) regardless of the param.
+		if _, err := q.SetRunRunning(ctx, store.SetRunRunningParams{
+			ID: run, WorkerID: workerID,
+			MilestonesCompleted: []byte(`["m1"]`), MilestonesInProgress: nil,
+			RunMaxIterations: runMaxIter, RunTimeoutSeconds: runTimeout,
+			MilestoneBudgetCap: budgetCap, BudgetWallCeilingSeconds: wallCeiling,
+		}); err != nil {
+			t.Fatalf("SetRunRunning (real progress): %v", err)
+		}
+		raw = rawMilestoneCol(ctx, t, pool, run, "milestones_completed")
+		if raw == nil {
+			t.Fatalf("milestones_completed must be non-NULL after a real report, got SQL NULL")
+		}
+		ids, err = workersvc.DecodeMilestoneIDs(raw)
+		if err != nil {
+			t.Fatalf("DecodeMilestoneIDs(reported): %v", err)
+		}
+		if !eqIDs(ids, []string{"m1"}) {
+			t.Fatalf("a reported milestones_completed must decode to {m1}, got %#v", ids)
+		}
+	})
+
 	// ── SweepRunningTimeout honours the PER-RUN wall clock (Decision 5b). ──
 	t.Run("sweep honours the per-run wall clock", func(t *testing.T) {
 		base := time.Now().UTC()
@@ -403,6 +470,18 @@ func TestRunMilestoneProgressLiveDB(t *testing.T) {
 			t.Fatalf("a NULL-budget run 3h in MUST be swept at the global 2h")
 		}
 	})
+}
+
+// rawMilestoneCol returns a run's raw jsonb id-array column bytes, nil when SQL NULL. It
+// is the discriminating read for PRD #390 D5: the neutral render turns on the column being
+// NULL vs a non-nil `[]`, a distinction readIDs (which folds both to nil) deliberately drops.
+func rawMilestoneCol(ctx context.Context, t *testing.T, pool *pgxpool.Pool, id uuid.UUID, col string) []byte {
+	t.Helper()
+	var raw []byte
+	if err := pool.QueryRow(ctx, fmt.Sprintf(`SELECT %s FROM runs WHERE id = $1`, col), id).Scan(&raw); err != nil {
+		t.Fatalf("read raw %s of %s: %v", col, id, err)
+	}
+	return raw
 }
 
 func ptrStr(v *int32) string {

@@ -358,6 +358,44 @@ func TestRenderRunDetailMilestones(t *testing.T) {
 	}
 }
 
+// TestRenderRunDetailMilestonesNeutral pins PRD #390 D5's null-vs-`[]` display contract
+// on `uzi run get`: a milestone run that NEVER reported progress (MilestonesCompleted nil ⇒
+// the milestones_completed column is SQL NULL) must render a NEUTRAL summary with an en-dash
+// numerator (`–/N`, matching the web badge's `M–/N`), NOT `0/N` (which reads as a failure).
+// A run that GENUINELY reported zero complete (non-nil empty `[]`) still shows `0/N`. The
+// distinction is nil vs empty, so it is exactly what a `len()==0` test would destroy.
+func TestRenderRunDetailMilestonesNeutral(t *testing.T) {
+	// Never reported: nil ⇒ neutral en-dash numerator, and NEVER the `0/N` failure read.
+	neverReported := milestoneRun()
+	neverReported.MilestonesCompleted = nil
+	neverReported.MilestonesInProgress = nil
+	out := renderDetail(t, neverReported)
+	if !strings.Contains(out, "–/3 reported complete") {
+		t.Errorf("a never-reported milestone run must render the neutral –/3, got:\n%s", out)
+	}
+	if strings.Contains(out, "0/3 reported complete") {
+		t.Errorf("a never-reported milestone run must NOT render 0/3 (reads as failure), got:\n%s", out)
+	}
+
+	// Genuinely reported zero: non-nil empty `[]` ⇒ 0/N, distinct from never-reported.
+	reportedZero := milestoneRun()
+	reportedZero.MilestonesCompleted = []string{}
+	reportedZero.MilestonesInProgress = nil
+	out = renderDetail(t, reportedZero)
+	if !strings.Contains(out, "0/3 reported complete") {
+		t.Errorf("a genuinely-reported zero-complete run must render 0/3, got:\n%s", out)
+	}
+	if strings.Contains(out, "–/3") {
+		t.Errorf("a reported (non-nil) run must NOT render the neutral en-dash, got:\n%s", out)
+	}
+
+	// The existing reported case (the milestoneRun default) still shows 1/N.
+	out = renderDetail(t, milestoneRun())
+	if !strings.Contains(out, "1/3 reported complete") {
+		t.Errorf("a run that reported m1 complete must render 1/3, got:\n%s", out)
+	}
+}
+
 // TestRenderRunDetailMilestoneTitleSanitized is the milestone twin of
 // TestRenderRunDetailAnthropicToken: a milestone TITLE is UNTRUSTED repo/agent-authored
 // text (apitypes.Milestone), so it must go through cellText — bidi override and CSI escape

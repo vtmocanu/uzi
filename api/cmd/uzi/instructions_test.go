@@ -306,6 +306,21 @@ var knownInstructions = []knownInstruction{
 			"file verb the printed finding_id feeds. Never emitted at runtime; the path-" +
 			"resolution check is the complete bar.",
 	},
+	{
+		command:  "uzi context use",
+		evidence: evidenceHelpOnly,
+		// ARRIVED WITH PRD #427 M2. The span sits in `uzi context current`'s Short and
+		// Long help (context.go), which name the `use` verb that WRITES the sticky value
+		// `current` merely reads — a cross-reference, not something the CLI tells a user
+		// to run at a decision point. classifyKind reads a cobra Short/Long field as
+		// documentation, so the kind derives HELP; the complete bar for a help reference
+		// is that the path RESOLVES, and it does — `uzi context use` is a real subcommand,
+		// pinned by TestContextCommandWired and exercised by TestContextUseSetsCurrent /
+		// TestContextUseUnknown in context_test.go.
+		note: "HELP: `uzi context current`'s Short and Long help cross-link the `use` verb " +
+			"that sets the sticky current context it prints (context.go). Never emitted at " +
+			"runtime; the path-resolution check is the complete bar.",
+	},
 
 	// ---- RUNTIME: emitted at a decision point. The bar is EXECUTION. --------------------
 	{

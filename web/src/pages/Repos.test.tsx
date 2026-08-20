@@ -14,6 +14,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       listConnections: vi.fn(),
       listProjects: vi.fn(),
       setRepoEnabled: vi.fn(),
+      deleteRepo: vi.fn(),
       setRepoSkillsEnabled: vi.fn(),
       setRepoClaudemdEnabled: vi.fn(),
       setRepoTrustFlags: vi.fn(),
@@ -445,5 +446,36 @@ describe("Repos — admin per-repo override UI (PRD #66 M9, D8)", () => {
 
     fireEvent.keyDown(dialog, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+});
+
+describe("Repos — per-repo remove action (PRD #357 M2, D2/D3)", () => {
+  it("a disabled repo shows Remove; confirming calls deleteRepo and drops the row", async () => {
+    mockApi.deleteRepo.mockResolvedValue(null);
+    renderPage();
+    // example/website is the disabled repo in the fixture.
+    await screen.findByText("example/website");
+    const row = within(rowFor("example/website"));
+
+    // The Remove button reveals the row-inline confirm; nothing is deleted yet.
+    fireEvent.click(row.getByRole("button", { name: /^Remove$/ }));
+    expect(mockApi.deleteRepo).not.toHaveBeenCalled();
+    const confirm = screen.getByRole("group", { name: /Confirm removing example\/website/ });
+    // Confirm copy names the permanent consequence (board + run history).
+    expect(within(confirm).getByText(/permanent and deletes its board and run history/i)).toBeTruthy();
+
+    fireEvent.click(within(confirm).getByRole("button", { name: /Confirm remove/ }));
+    await waitFor(() => expect(mockApi.deleteRepo).toHaveBeenCalledWith("repo-www"));
+    // The row is gone from the list.
+    await waitFor(() => expect(screen.queryByText("example/website")).toBeNull());
+  });
+
+  it("an enabled repo shows NO Remove button", async () => {
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+    // Sanity: the enabled repo still offers Disable, so the row is really rendered.
+    const row = within(rowFor("vtmocanu/uzi"));
+    expect(row.getByRole("button", { name: /^Disable$/ })).toBeTruthy();
+    expect(row.queryByRole("button", { name: /^Remove$/ })).toBeNull();
   });
 });

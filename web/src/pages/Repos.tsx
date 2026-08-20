@@ -32,6 +32,11 @@ export function Repos() {
   // this holds the repo whose enable-confirm is showing. Disabling (master or a
   // sub-toggle) is immediate, matching the existing opt-in patterns.
   const [confirmTrustId, setConfirmTrustId] = useState<string | null>(null);
+  // Explicit per-repo remove (PRD #357): the disabled repo whose row-inline
+  // "Confirm remove / Cancel" affordance is showing. Its own state, distinct from
+  // confirmTrustId — that confirm renders in the panel OUTSIDE the table, this one
+  // stays in the row's action cell.
+  const [confirmRemoveId, setConfirmRemoveId] = useState<string | null>(null);
   // Per-capability busy state so each PATCH disables only its own control.
   const [skillsBusyId, setSkillsBusyId] = useState<string | null>(null);
   const [claudemdBusyId, setClaudemdBusyId] = useState<string | null>(null);
@@ -60,12 +65,19 @@ export function Repos() {
   // ("Mark as trusted", the first button inside) so a screen-reader user hears it —
   // the master switch's aria-checked stays false until the PATCH lands.
   const confirmTrustRef = useRef<HTMLDivElement | null>(null);
+  // The row-inline remove-confirm block; when it opens, focus moves to its primary
+  // button ("Confirm remove", the first button inside) for screen-reader users —
+  // same a11y pattern as the trust confirm above.
+  const confirmRemoveRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     if (trustRepoId) trustPanelRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
   }, [trustRepoId]);
   useEffect(() => {
     if (confirmTrustId) confirmTrustRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
   }, [confirmTrustId]);
+  useEffect(() => {
+    if (confirmRemoveId) confirmRemoveRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+  }, [confirmRemoveId]);
 
   const closeTrust = () => {
     setTrustRepoId(null);
@@ -113,6 +125,24 @@ export function Repos() {
       setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Update failed");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  // Explicit per-repo remove (PRD #357), modeled on `toggle`: clear any error,
+  // DELETE the repo, then drop it from local state so the row disappears. On a
+  // failure (e.g. the server's 409 for an enabled/in-flight repo) surface the
+  // message the same way `toggle` does. Reachable only from the row-inline confirm.
+  const removeRepo = async (repo: Repo) => {
+    setError("");
+    setBusyId(repo.id);
+    try {
+      await api.deleteRepo(repo.id);
+      setRepos((prev) => prev.filter((r) => r.id !== repo.id));
+      setConfirmRemoveId(null);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Remove failed");
     } finally {
       setBusyId(null);
     }
@@ -527,23 +557,71 @@ export function Repos() {
                           )}
                         </td>
                         <td className="px-4 py-3 text-right">
-                          <div className="flex justify-end gap-2">
-                            {r.enabled && (
-                              <Link to={`/repos/${r.id}/board`}>
-                                <Button variant="secondary" size="sm">
-                                  Open board
-                                </Button>
-                              </Link>
-                            )}
-                            <Button
-                              variant={r.enabled ? "danger" : "primary"}
-                              size="sm"
-                              disabled={busyId === r.id}
-                              onClick={() => toggle(r)}
+                          {/* Remove is reachable only from the disabled state (PRD #357
+                              D2); confirming it is permanent. The confirm is row-inline
+                              (its own state), replacing the action buttons in place. */}
+                          {confirmRemoveId === r.id ? (
+                            <div
+                              ref={confirmRemoveRef}
+                              role="group"
+                              aria-label={`Confirm removing ${r.path_with_namespace}`}
+                              className="ml-auto max-w-xs space-y-2 rounded-md border border-danger/40 bg-danger/5 p-3 text-left"
                             >
-                              {r.enabled ? "Disable" : "Enable"}
-                            </Button>
-                          </div>
+                              <p className="text-xs text-fg">
+                                <span className="font-medium">Remove {r.path_with_namespace}?</span> This is
+                                permanent and deletes its board and run history. If the bot still has access to
+                                the project, a refresh re-adds it as a disabled repo.
+                              </p>
+                              <div className="flex justify-end gap-2">
+                                <Button
+                                  variant="danger"
+                                  size="sm"
+                                  disabled={busyId === r.id}
+                                  onClick={() => removeRepo(r)}
+                                >
+                                  {busyId === r.id ? "Removing…" : "Confirm remove"}
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  disabled={busyId === r.id}
+                                  onClick={() => setConfirmRemoveId(null)}
+                                >
+                                  Cancel
+                                </Button>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="flex justify-end gap-2">
+                              {r.enabled && (
+                                <Link to={`/repos/${r.id}/board`}>
+                                  <Button variant="secondary" size="sm">
+                                    Open board
+                                  </Button>
+                                </Link>
+                              )}
+                              <Button
+                                variant={r.enabled ? "danger" : "primary"}
+                                size="sm"
+                                disabled={busyId === r.id}
+                                onClick={() => toggle(r)}
+                              >
+                                {r.enabled ? "Disable" : "Enable"}
+                              </Button>
+                              {/* Remove only on a DISABLED repo (PRD #357 D2). An enabled
+                                  repo shows no Remove button; disable it first. */}
+                              {!r.enabled && (
+                                <Button
+                                  variant="danger"
+                                  size="sm"
+                                  disabled={busyId === r.id}
+                                  onClick={() => setConfirmRemoveId(r.id)}
+                                >
+                                  Remove
+                                </Button>
+                              )}
+                            </div>
+                          )}
                         </td>
                       </tr>
                     ))

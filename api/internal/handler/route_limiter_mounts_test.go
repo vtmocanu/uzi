@@ -144,6 +144,9 @@ var wantRouteMounts = []routeMount{
 	{"DELETE", "/api/me/memory/{id}", noLimiter},
 	{"DELETE", "/api/me/secrets/anthropic_token", noLimiter},
 	{"DELETE", "/api/me/secrets/anthropic_token/{id}", noLimiter},
+	// Explicit per-repo remove (PRD #357): owner-scoped DB delete, no forge call →
+	// noLimiter, like the schedule/connection deletes it sits beside.
+	{"DELETE", "/api/repos/{id}", noLimiter},
 	{"DELETE", "/api/runs/{id}/review/recommendations/{recID}/disposition", noLimiter},
 	// Schedule delete (PRD #241 M4): owner-scoped DB delete, no forge read → noLimiter.
 	{"DELETE", "/api/schedules/{id}", noLimiter},
