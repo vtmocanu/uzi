@@ -6,9 +6,12 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.47.0] - 2026-08-20
+<!-- release-title: automated GitHub Release notes -->
+
 ### Added
 
-- **GitHub Releases with human-readable notes, generated from the CHANGELOG.**
+- **GitHub Releases with human-readable notes, generated from the CHANGELOG ([#413](https://github.com/vtmocanu/uzi/pull/413)).**
   Tagging `vX.Y.Z` now creates a GitHub Release whose body is that version's
   CHANGELOG section and whose title is `vX.Y.Z` plus an optional one-line summary
   (an HTML `release-title` marker placed under the section heading).
@@ -2760,7 +2763,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.46.1...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.47.0...HEAD
+[0.47.0]: https://github.com/vtmocanu/uzi/compare/v0.46.1...v0.47.0
 [0.46.1]: https://github.com/vtmocanu/uzi/compare/v0.46.0...v0.46.1
 [0.46.0]: https://github.com/vtmocanu/uzi/compare/v0.45.0...v0.46.0
 [0.45.0]: https://github.com/vtmocanu/uzi/compare/v0.44.0...v0.45.0
