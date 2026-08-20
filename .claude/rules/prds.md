@@ -49,3 +49,15 @@ See the `uzi-watcher` skill's *The workflow-scope guardrail* section and its
 plan-trap check for the sending and merging side of this: the maintainer applies any
 deferred workflow edits locally, with a workflow-scoped token, after the PRD's MR
 merges.
+
+**This guardrail is about a branch that MODIFIES `.github/workflows/**` — a distinct
+case from a branch that is merely BEHIND `main` on those files.** A branch can lose
+its whole push even without touching a workflow file itself, if `main`'s workflow
+files changed after the run's clone base (GitHub gates the push on the pushed tip's
+tree, not on what the branch's own commits changed). That case is now handled
+automatically at finalize, GitHub-only: uzi fetches `main`'s current tip and, only
+when the workflow trees actually differ, realigns the branch to it (merge first,
+rebase fallback) before pushing — no PRD authoring change needed for it. See
+[ADR-456](../../adr/0456-rebase-before-finalize-push.md). It still fails cleanly
+with the diff preserved if the realignment itself conflicts, so a PRD is never
+silently corrupted by it either way.
