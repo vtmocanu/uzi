@@ -390,6 +390,19 @@ export function BuildInfoPopover({
           open ? "opacity-100" : "pointer-events-none opacity-0",
         )}
       >
+        {/* Hover bridge: a transparent descendant of the host filling the mb-2 gap
+            below the panel, so moving the pointer from the trigger up into the panel
+            never lands on non-host geometry and the host's onMouseLeave never fires
+            mid-transit. Inside the panel, so it inherits pointer-events-none while the
+            panel is closed — no hover target when shut.
+
+            Height is 9px, not 8: `top-full` anchors to the panel's PADDING-box bottom,
+            which sits 1px inside the 1px `border`, while the mb-2 gap the pointer must
+            cross starts at the panel's BORDER-box bottom. 8px would leave a ~1px seam
+            flush against the trigger top — the exact dead-band this fix exists to
+            close, which a slow pointer can still land in. 9px reaches the trigger top
+            (1px border + 8px gap) with no overlap into the trigger below. */}
+        <div aria-hidden="true" data-hover-bridge className="absolute inset-x-0 top-full h-[9px]" />
         <div className="font-mono text-xs font-semibold text-fg">uzi {label}</div>
         {subParts.length > 0 && (
           <div className="mb-2 border-b border-edge pb-2 text-[11px] text-faint">
