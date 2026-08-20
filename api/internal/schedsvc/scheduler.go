@@ -45,6 +45,18 @@ const promptTitleCap = 60
 // only backpressure on it, so keep it.
 const sweepPacing = 50 * time.Millisecond
 
+// backfillHeadroom is how many EXTRA candidates past max_issues one sweep fire may
+// examine to backfill slots lost to skipped (ineligible/already-running/transient)
+// candidates (issue #416). The cap counts runs STARTED, not candidates matched, so the
+// fan-out walks oldest-first past a skip and starts the next eligible candidate until
+// max_issues runs fire. This constant bounds that walk: a fire fetches at most
+// max_issues + backfillHeadroom candidates and so spends at most that many forge
+// GetIssue / DB HasActiveRunForIssue calls, even when the head of the backlog is a wall
+// of ineligible issues. 10 is a round, generous headroom for realistic backlogs; it is
+// additive (not a multiplier) so per-fire cost stays predictable for small caps. Runs
+// STARTED are still capped at max_issues, so backfill adds no load on the run limiter.
+const backfillHeadroom = 10
+
 // ErrBadConfig marks a fire failure caused by a schedule's own stored config being
 // malformed (e.g. a labels selector that is valid jsonb but not a string array). Such
 // a row can NEVER succeed, so advance() treats it as PERMANENT and parks the schedule
@@ -273,10 +285,13 @@ func (e *Scheduler) fireIssue(ctx context.Context, sched store.RunSchedule) (Fir
 // skipped so one bad issue does not abort the fan-out; only a failure to resolve the
 // repo/forge or to LIST is treated as transient for the whole schedule.
 //
-// The schedule's max_issues cap (PRD #274 M2) rides straight into the query as
-// ListSweepCandidateIssuesParams.MaxIssues: a NULL/invalid cap renders an unlimited
-// LIMIT (today's unbounded behaviour), and a set cap N returns the N OLDEST candidates
-// (the query's ORDER BY forge_issue_iid ASC), so the fan-out is an oldest-first batch.
+// The schedule's max_issues cap (PRD #274 M2) counts runs STARTED, not candidates
+// matched (issue #416): the fan-out fetches a bounded scan window of the OLDEST
+// max_issues + backfillHeadroom candidates (the query's ORDER BY forge_issue_iid ASC),
+// walks it oldest-first flagging each skip exactly as before, and stops once max_issues
+// runs have started — so a slot lost to a skip is refilled from the next eligible
+// candidate rather than wasted. A NULL/invalid cap renders an unlimited LIMIT (today's
+// unbounded behaviour) and has no started ceiling, draining the candidate set as before.
 func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (FireOutcome, error) {
 	repo, f, err := e.resolveRepoForge(ctx, sched)
 	if err != nil {
@@ -286,8 +301,16 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 	if err != nil {
 		return FireOutcome{}, err
 	}
+	// Backfill scan window (issue #416): fetch max_issues + backfillHeadroom candidates so
+	// the loop below can walk past skipped slots and still start up to max_issues runs. The
+	// widened limit is computed here in Go and threaded into the SAME MaxIssues query param
+	// (no SQL change). A NULL/invalid cap stays unlimited exactly as before.
+	scanLimit := sched.MaxIssues
+	if sched.MaxIssues.Valid {
+		scanLimit = pgtype.Int4{Int32: sched.MaxIssues.Int32 + backfillHeadroom, Valid: true}
+	}
 	candidates, err := e.store.ListSweepCandidateIssues(ctx, store.ListSweepCandidateIssuesParams{
-		RepoID: repo.ID, Labels: labelsJSON, MaxIssues: sched.MaxIssues,
+		RepoID: repo.ID, Labels: labelsJSON, MaxIssues: scanLimit,
 	})
 	if err != nil {
 		return FireOutcome{}, err // transient DB error
@@ -297,6 +320,10 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 
 	// Capped probe: only a set max_issues can truncate, so count the full matching set
 	// only when the cap is present (a NULL cap can never truncate → Capped=false, no count).
+	// Since the fetch widened to the scan window (issue #416), Capped now means "more
+	// matching open issues than the scan window (max_issues + backfillHeadroom) reached",
+	// i.e. eligible issues may exist beyond backfill's reach — it still drives the
+	// started-nothing hint.
 	capped := false
 	if sched.MaxIssues.Valid {
 		total, err := e.store.CountSweepCandidateIssues(ctx, store.CountSweepCandidateIssuesParams{
@@ -308,9 +335,12 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 		capped = total > int64(len(candidates))
 	}
 
-	// Matched = the capped candidate set; every candidate must land in exactly one of
-	// Started/Skips (the matched == started + skipped invariant, PRD #308 Decision 4).
-	out := FireOutcome{Matched: len(candidates), Capped: capped}
+	// Matched is set at the END to len(Started)+len(Skips) — the candidates actually
+	// EXAMINED this fire (issue #416), which preserves the matched == started + skipped
+	// invariant (PRD #308 Decision 4) by construction. Every candidate the loop reaches
+	// lands in exactly one of Started/Skips; the loop stops early once max_issues have
+	// started, so Matched counts attempts (may exceed max_issues), not the whole window.
+	out := FireOutcome{Capped: capped}
 	for _, c := range candidates {
 		iid := c.ForgeIssueIid
 		iidCopy := iid
@@ -349,7 +379,16 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 		}
 		// Light pacing between seam calls (review N1: no per-user limiter guards this).
 		e.sleep(sweepPacing)
+		// Backfill early break (issue #416): the cap bounds runs STARTED, not candidates
+		// examined. Stop once max_issues have started so backfill refills lost slots but
+		// never overshoots the cap. A NULL cap has no ceiling and drains the (unlimited)
+		// candidate set exactly as before.
+		if sched.MaxIssues.Valid && len(out.Started) >= int(sched.MaxIssues.Int32) {
+			break
+		}
 	}
+	// Matched = candidates examined this fire (== started + skipped by construction).
+	out.Matched = len(out.Started) + len(out.Skips)
 	return out, nil
 }
 

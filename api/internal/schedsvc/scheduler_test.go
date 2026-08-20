@@ -380,18 +380,21 @@ func (h *harness) sweepSchedule(maxIssues pgtype.Int4) store.RunSchedule {
 	}
 }
 
-// TestTickSweepThreadsMaxIssues pins PRD #274 M2 at the unit level: fireSweep must pass
-// the schedule's max_issues straight into ListSweepCandidateIssuesParams.MaxIssues so the
-// SQL LIMIT applies (the fake store runs no SQL, so this is the most a unit test can pin;
-// the real LIMIT is covered by the live-DB test). A NULL cap threads NULL (unlimited).
+// TestTickSweepThreadsMaxIssues pins the scan-window fetch at the unit level. Issue #416
+// inverts the old PRD #274 M2 contract: fireSweep no longer threads the schedule's
+// max_issues verbatim — it widens the fetch to max_issues + backfillHeadroom so the loop
+// can backfill slots lost to skips, then caps runs STARTED (not candidates fetched) at
+// max_issues. So the threaded LIMIT is the SCAN WINDOW, not the cap (the fake store runs
+// no SQL, so the threaded param is the most a unit test can pin; the real LIMIT
+// truncation is covered by the live-DB test). A NULL cap still threads NULL (unlimited).
 func TestTickSweepThreadsMaxIssues(t *testing.T) {
-	// A set cap is threaded verbatim.
+	// A set cap is threaded as max_issues + backfillHeadroom (the scan window), NOT verbatim.
 	h := newHarness()
 	h.st.due = []store.RunSchedule{h.sweepSchedule(pgtype.Int4{Int32: 4, Valid: true})}
 	h.sched.Boot(context.Background())
 	got := h.st.sweepMaxIssuesParam
-	if !got.Valid || got.Int32 != 4 {
-		t.Fatalf("sweep max_issues param = %+v, want {Int32:4 Valid:true}", got)
+	if want := int32(4 + backfillHeadroom); !got.Valid || got.Int32 != want {
+		t.Fatalf("sweep max_issues param = %+v, want {Int32:%d Valid:true} (max_issues + backfillHeadroom)", got, want)
 	}
 
 	// A NULL cap threads through as NULL (unlimited).
