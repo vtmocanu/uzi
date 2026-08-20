@@ -93,6 +93,70 @@ func TestGitHubResolveProjectV2(t *testing.T) {
 	}
 }
 
+// TestGitHubResolveProjectV2Viewer pins the OwnerViewer path (the iota zero value,
+// used when a token syncs its own personal project): the query must NOT declare the
+// unused $login variable and must NOT send a login value, because GitHub's "All
+// Variables Used" rule rejects an operation that declares a variable it never uses.
+func TestGitHubResolveProjectV2Viewer(t *testing.T) {
+	var gotQuery string
+	var gotVars map[string]any
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		graphqlRoute: func(w http.ResponseWriter, r *http.Request) {
+			req := readGQL(t, r)
+			gotQuery, gotVars = req.Query, req.Variables
+			writeGQLData(w, map[string]any{
+				"viewer": map[string]any{
+					"projectV2": map[string]any{"id": "PVT_self", "number": 3, "title": "Mine"},
+				},
+			})
+		},
+	})
+	d := newGitHubRawDriver(t, m, "ghp_classicTokenValue1234567890")
+
+	ref, err := d.ResolveProjectV2(context.Background(), "", 3, OwnerViewer)
+	if err != nil {
+		t.Fatalf("ResolveProjectV2(viewer): %v", err)
+	}
+	if ref.ID != "PVT_self" || ref.Number != 3 {
+		t.Fatalf("unexpected ref: %+v", ref)
+	}
+	if strings.Contains(gotQuery, "$login") {
+		t.Errorf("viewer query must not declare $login (GitHub rejects unused variables): %q", gotQuery)
+	}
+	if _, present := gotVars["login"]; present {
+		t.Errorf("viewer path must not send a login variable: %+v", gotVars)
+	}
+}
+
+// TestGitHubResolveProjectV2OwnerIDViewer pins the same for owner-id resolution: the
+// viewer query carries no variable declaration list at all.
+func TestGitHubResolveProjectV2OwnerIDViewer(t *testing.T) {
+	var gotQuery string
+	var gotVars map[string]any
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		graphqlRoute: func(w http.ResponseWriter, r *http.Request) {
+			req := readGQL(t, r)
+			gotQuery, gotVars = req.Query, req.Variables
+			writeGQLData(w, map[string]any{"viewer": map[string]any{"id": "U_self"}})
+		},
+	})
+	d := newGitHubRawDriver(t, m, "ghp_classicTokenValue1234567890")
+
+	id, err := d.ResolveProjectV2OwnerID(context.Background(), "", OwnerViewer)
+	if err != nil {
+		t.Fatalf("ResolveProjectV2OwnerID(viewer): %v", err)
+	}
+	if id != "U_self" {
+		t.Fatalf("unexpected owner id: %q", id)
+	}
+	if strings.Contains(gotQuery, "$login") {
+		t.Errorf("viewer owner-id query must not declare $login: %q", gotQuery)
+	}
+	if len(gotVars) != 0 {
+		t.Errorf("viewer owner-id path must send no variables: %+v", gotVars)
+	}
+}
+
 // TestGitHubProjectV2StatusField pins reading a single-select field's id + options.
 func TestGitHubProjectV2StatusField(t *testing.T) {
 	m := newMockGitHub(t, map[string]http.HandlerFunc{

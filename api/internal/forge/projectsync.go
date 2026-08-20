@@ -147,12 +147,23 @@ func ownerRoot(kind ProjectV2OwnerKind) string {
 	}
 }
 
+// ownerUsesLogin reports whether ownerRoot(kind) references the $login variable.
+// The viewer root does not, and GraphQL's "All Variables Used" rule (spec §5.8.4,
+// enforced by GitHub's server) rejects an operation that DECLARES $login without
+// using it — so the $login declaration and its variable value must both be omitted
+// on the viewer path, not merely left unreferenced.
+func ownerUsesLogin(kind ProjectV2OwnerKind) bool { return kind != OwnerViewer }
+
 func (g *github) ResolveProjectV2(ctx context.Context, owner string, number int, ownerKind ProjectV2OwnerKind) (ProjectV2Ref, error) {
-	query := fmt.Sprintf(`query($login: String!, $number: Int!) {
+	loginDecl := ""
+	if ownerUsesLogin(ownerKind) {
+		loginDecl = "$login: String!, "
+	}
+	query := fmt.Sprintf(`query(%s$number: Int!) {
   %s {
     projectV2(number: $number) { id number title }
   }
-}`, ownerRoot(ownerKind))
+}`, loginDecl, ownerRoot(ownerKind))
 	var out struct {
 		User struct {
 			ProjectV2 struct {
@@ -176,7 +187,11 @@ func (g *github) ResolveProjectV2(ctx context.Context, owner string, number int,
 			} `json:"projectV2"`
 		} `json:"viewer"`
 	}
-	if err := g.graphqlDo(ctx, query, map[string]any{"login": owner, "number": number}, &out); err != nil {
+	vars := map[string]any{"number": number}
+	if ownerUsesLogin(ownerKind) {
+		vars["login"] = owner
+	}
+	if err := g.graphqlDo(ctx, query, vars, &out); err != nil {
 		return ProjectV2Ref{}, err
 	}
 	var p struct {
@@ -388,9 +403,17 @@ func (g *github) ReadProjectV2ItemStatuses(ctx context.Context, projectID, field
 }
 
 func (g *github) ResolveProjectV2OwnerID(ctx context.Context, owner string, ownerKind ProjectV2OwnerKind) (string, error) {
-	query := fmt.Sprintf(`query($login: String!) {
+	// viewer references no $login, so the declaration (and value) must be omitted
+	// entirely — GitHub rejects an operation that declares an unused variable.
+	sig := ""
+	vars := map[string]any{}
+	if ownerUsesLogin(ownerKind) {
+		sig = "($login: String!)"
+		vars["login"] = owner
+	}
+	query := fmt.Sprintf(`query%s {
   %s { id }
-}`, ownerRoot(ownerKind))
+}`, sig, ownerRoot(ownerKind))
 	var out struct {
 		User struct {
 			ID string `json:"id"`
@@ -402,8 +425,7 @@ func (g *github) ResolveProjectV2OwnerID(ctx context.Context, owner string, owne
 			ID string `json:"id"`
 		} `json:"viewer"`
 	}
-	// viewer takes no $login, but sending an unused variable is harmless.
-	if err := g.graphqlDo(ctx, query, map[string]any{"login": owner}, &out); err != nil {
+	if err := g.graphqlDo(ctx, query, vars, &out); err != nil {
 		return "", err
 	}
 	var id string
