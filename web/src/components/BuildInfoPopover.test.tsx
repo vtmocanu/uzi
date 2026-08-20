@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import {
   BuildInfoPopover,
@@ -427,5 +427,89 @@ describe("BuildInfoPopover — open on hover AND focus AND tap", () => {
     expect(ids[0]).toBeTruthy();
     expect(ids[0]).not.toBe(ids[1]);
     for (const id of ids) expect(document.getElementById(id!)).not.toBeNull();
+  });
+});
+
+describe("BuildInfoPopover — PRDs row links to the repo prds/ directory (PRD #415 M2)", () => {
+  const PRDS_URL = "https://github.com/vtmocanu/uzi/blob/main/prds";
+
+  it("renders the PRDs count as an external link, keeping the `N done · M open` text", () => {
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} />);
+    const link = screen.getByRole("link", { name: /80 done.*32 open/ });
+    expect(link.getAttribute("href")).toBe(PRDS_URL);
+    // External target → new tab + a dropped opener, the app's rule for off-app links.
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toBe("noopener noreferrer");
+    // The Variant-A visual is unchanged, just wrapped in the anchor.
+    expect(link.textContent).toContain("80 done");
+    expect(link.textContent).toContain("32 open");
+  });
+
+  it("renders no PRDs link when the counts are absent", () => {
+    render(<BuildInfoPopover info={mockBuildInfoUnstamped} now={NOW} />);
+    expect(screen.queryByRole("link")).toBeNull();
+  });
+});
+
+describe("BuildInfoPopover — Changelog button + focus-within (PRD #415 M2)", () => {
+  const trigger = () => screen.getByRole("button", { name: "v0.4.2" });
+  const changelogButton = () => screen.getByRole("button", { name: "Changelog" });
+
+  it("renders no Changelog button when no handler is wired", () => {
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} />);
+    expect(screen.queryByRole("button", { name: "Changelog" })).toBeNull();
+  });
+
+  it("renders a Changelog button inside the popover panel when a handler is wired", () => {
+    const onOpen = vi.fn();
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} onOpenChangelog={onOpen} />);
+    // The button lives INSIDE the popover panel (the role="tooltip" node), not
+    // loose in the footer — that is where the drawer opener belongs.
+    expect(popover().contains(changelogButton())).toBe(true);
+  });
+
+  it("mouse path: hover opens the panel and clicking Changelog fires the callback", () => {
+    const onOpen = vi.fn();
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} onOpenChangelog={onOpen} />);
+    const host = popover().parentElement!;
+    fireEvent.mouseEnter(host);
+    expect(popover().getAttribute("data-open")).toBe("true");
+    fireEvent.click(changelogButton());
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it("keyboard path: Tab from the version button reaches Changelog WITHOUT the panel closing, and activating it fires the callback", () => {
+    const onOpen = vi.fn();
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} onOpenChangelog={onOpen} />);
+    // Focus the trigger — the host's focus-within opens the panel.
+    fireEvent.focus(trigger());
+    expect(popover().getAttribute("data-open")).toBe("true");
+    // Tab moves focus from the trigger to the Changelog button. Before the fix, the
+    // trigger's own onBlur fired first and closed the panel, so the button could
+    // never take focus. With focus-within on the host, a blur whose relatedTarget is
+    // still inside the host keeps it open.
+    fireEvent.blur(trigger(), { relatedTarget: changelogButton() });
+    expect(popover().getAttribute("data-open")).toBe("true");
+    fireEvent.focus(changelogButton());
+    expect(popover().getAttribute("data-open")).toBe("true");
+    // Activating the (now focused) button opens the drawer.
+    fireEvent.click(changelogButton());
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes the panel only when focus leaves the whole host", () => {
+    const onOpen = vi.fn();
+    render(
+      <>
+        <button type="button">outside</button>
+        <BuildInfoPopover info={mockBuildInfo} now={NOW} onOpenChangelog={onOpen} />
+      </>,
+    );
+    fireEvent.focus(trigger());
+    expect(popover().getAttribute("data-open")).toBe("true");
+    // Focus moving to a control OUTSIDE the host closes it.
+    const outside = screen.getByRole("button", { name: "outside" });
+    fireEvent.blur(trigger(), { relatedTarget: outside });
+    expect(popover().getAttribute("data-open")).toBe("false");
   });
 });
