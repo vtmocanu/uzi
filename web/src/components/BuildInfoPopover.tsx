@@ -390,6 +390,12 @@ export function BuildInfoPopover({
           open ? "opacity-100" : "pointer-events-none opacity-0",
         )}
       >
+        {/* Hover bridge: a transparent descendant of the host filling the mb-2 gap
+            below the panel, so moving the pointer from the trigger up into the panel
+            never lands on non-host geometry and the host's onMouseLeave never fires
+            mid-transit. Inside the panel, so it inherits pointer-events-none while the
+            panel is closed — no hover target when shut. */}
+        <div aria-hidden="true" data-hover-bridge className="absolute inset-x-0 top-full h-2" />
         <div className="font-mono text-xs font-semibold text-fg">uzi {label}</div>
         {subParts.length > 0 && (
           <div className="mb-2 border-b border-edge pb-2 text-[11px] text-faint">

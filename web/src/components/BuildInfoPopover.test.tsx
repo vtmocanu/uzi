@@ -513,4 +513,45 @@ describe("BuildInfoPopover — Changelog button + focus-within (PRD #415 M2)", (
     fireEvent.blur(trigger(), { relatedTarget: outside });
     expect(popover().getAttribute("data-open")).toBe("false");
   });
+
+  it("puts a hover bridge INSIDE the panel, so it is a host descendant", () => {
+    // The mb-2 gap between the panel bottom and the trigger top is over neither the
+    // host's in-flow button nor the out-of-flow panel, so a pointer crossing it fires
+    // the host's onMouseLeave and the panel closes mid-transit. The bridge is a
+    // transparent child of the panel that fills that gap: because it is a DESCENDANT
+    // of the host, moving onto it produces no host mouseleave. jsdom can't measure the
+    // pixel gap, so assert the mechanism — the bridge exists inside the panel.
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} onOpenChangelog={vi.fn()} />);
+    const bridge = popover().querySelector("[data-hover-bridge]");
+    expect(bridge).not.toBeNull();
+    expect(popover().contains(bridge)).toBe(true);
+  });
+
+  it("mouse transit onto the bridge keeps the panel open and Changelog reachable", () => {
+    const onOpen = vi.fn();
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} onOpenChangelog={onOpen} />);
+    const host = popover().parentElement!;
+    fireEvent.mouseEnter(host);
+    expect(popover().getAttribute("data-open")).toBe("true");
+    // Moving onto the bridge is a move onto a host descendant, so no host mouseLeave
+    // is produced — the panel stays open and the Changelog button is reachable.
+    const bridge = popover().querySelector("[data-hover-bridge]")!;
+    fireEvent.mouseEnter(bridge);
+    expect(popover().getAttribute("data-open")).toBe("true");
+    expect(changelogButton()).toBeTruthy();
+    fireEvent.click(changelogButton());
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the bridge inside the CLOSED panel, so it inherits pointer-events-none", () => {
+    // On initial render the panel is closed and carries pointer-events-none opacity-0.
+    // The bridge adds NO pointer-events class of its own, so a closed panel makes it
+    // non-interactive too — it is not a hover target while the popover is shut.
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} onOpenChangelog={vi.fn()} />);
+    const pop = popover();
+    expect(pop.getAttribute("data-open")).toBe("false");
+    expect(pop.className).toContain("pointer-events-none");
+    expect(pop.className).toContain("opacity-0");
+    expect(pop.contains(pop.querySelector("[data-hover-bridge]"))).toBe(true);
+  });
 });
