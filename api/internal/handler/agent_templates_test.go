@@ -1,12 +1,20 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
+	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -232,4 +240,185 @@ func TestSecretGuardrailRejectsFullToken(t *testing.T) {
 	}); err != nil {
 		t.Errorf("format mention should be allowed, got: %v", err)
 	}
+}
+
+// fakeTemplateViewerDB is a store.DBTX for the GetAgentTemplateForViewer QueryRow
+// pass-through guards (sites GetAgentTemplate, resolveOverrides→templateForViewer, and
+// GetTemplateSkills→templateIDForSkills). Like fakeSkillDB it CAPTURES the raw
+// positional QueryRow args so a test can see WHICH identity params the handler built.
+//
+// When tmpl != nil, QueryRow scans back that template so the handler continues; when
+// nil it reports pgx.ErrNoRows (the not-visible path). Query returns an empty-but-valid
+// result for handlers that go on to list allocations (GetTemplateSkills).
+type fakeTemplateViewerDB struct {
+	tmpl    *store.AgentTemplate
+	gotArgs []any
+	called  bool
+}
+
+func (*fakeTemplateViewerDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, nil
+}
+func (*fakeTemplateViewerDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	return &emptyViewerRows{}, nil
+}
+func (f *fakeTemplateViewerDB) QueryRow(_ context.Context, _ string, args ...any) pgx.Row {
+	f.called = true
+	f.gotArgs = args
+	if f.tmpl == nil {
+		return fakeScanRow{func(...any) error { return pgx.ErrNoRows }}
+	}
+	tt := *f.tmpl
+	// GetAgentTemplateForViewer scans 13 columns: id, name, description, model, tools,
+	// prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id,
+	// customized (agent_templates.sql.go). id (dest[0]) and scope (dest[10]) are all the
+	// read path needs to proceed cleanly; the rest keep their zero values.
+	return fakeScanRow{func(dest ...any) error {
+		if p, ok := dest[0].(*uuid.UUID); ok {
+			*p = tt.ID
+		}
+		if p, ok := dest[10].(*string); ok {
+			*p = tt.Scope
+		}
+		return nil
+	}}
+}
+
+// templateViewerArgs unpacks GetAgentTemplateForViewer's positional args
+// (id, is_admin, viewer_id — agent_templates.sql.go). The t.Fatalf type guards keep the
+// non-admin assertion from going vacuous on a mis-shaped capture; the admin `== true`
+// subtest is the backstop no zero value can satisfy (see skillQueryArgs).
+func templateViewerArgs(t *testing.T, db *fakeTemplateViewerDB) (uuid.UUID, bool, pgtype.UUID) {
+	t.Helper()
+	if !db.called {
+		t.Fatal("GetAgentTemplateForViewer was never queried")
+	}
+	if len(db.gotArgs) != 3 {
+		t.Fatalf("query got %d args, want 3 (id, is_admin, viewer_id): %#v", len(db.gotArgs), db.gotArgs)
+	}
+	id, ok := db.gotArgs[0].(uuid.UUID)
+	if !ok {
+		t.Fatalf("arg 0 (id) = %#v, want uuid.UUID", db.gotArgs[0])
+	}
+	isAdmin, ok := db.gotArgs[1].(bool)
+	if !ok {
+		t.Fatalf("arg 1 (is_admin) = %#v, want bool", db.gotArgs[1])
+	}
+	viewer, ok := db.gotArgs[2].(pgtype.UUID)
+	if !ok {
+		t.Fatalf("arg 2 (viewer_id) = %#v, want pgtype.UUID", db.gotArgs[2])
+	}
+	return id, isAdmin, viewer
+}
+
+// listAgentTemplatesRec drives ListAgentTemplates (GET, no path param) as actor.
+func listAgentTemplatesRec(t *testing.T, db store.DBTX, actor store.User) *httptest.ResponseRecorder {
+	t.Helper()
+	h := &Handler{q: store.New(db)}
+	req := httptest.NewRequest(http.MethodGet, "/api/agent-templates", nil)
+	req = req.WithContext(mw.ContextWithUser(req.Context(), actor))
+	rec := httptest.NewRecorder()
+	h.ListAgentTemplates(rec, req)
+	return rec
+}
+
+// TestListAgentTemplatesPassesCallerIdentity pins the caller-identity pass-through into
+// ListAgentTemplatesForViewer (agent_templates.go:342). Mutating `IsAdmin: actor.IsAdmin`
+// to `IsAdmin: true` makes every caller list as admin — a total visibility bypass that
+// leaks every private user template — and it survived a full-scope `go test ./...` run.
+// Both flag directions are asserted; the admin `== true` check is the backstop.
+func TestListAgentTemplatesPassesCallerIdentity(t *testing.T) {
+	t.Run("non-admin caller", func(t *testing.T) {
+		actor := nonAdminCaller()
+		db := &fakeViewerListDB{}
+		if rec := listAgentTemplatesRec(t, db, actor); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		isAdmin, viewer := viewerQueryArgs(t, db.gotArgs, db.called, 0, 1)
+		if isAdmin {
+			t.Error("ListAgentTemplatesForViewer received is_admin=true for a NON-ADMIN caller: " +
+				"every caller lists as admin and any private template is listable by anyone")
+		}
+		if !viewer.Valid || uuid.UUID(viewer.Bytes) != actor.ID {
+			t.Errorf("viewer_id = %v (valid=%v), want the caller's own id %v",
+				uuid.UUID(viewer.Bytes), viewer.Valid, actor.ID)
+		}
+	})
+
+	t.Run("admin caller", func(t *testing.T) {
+		actor := adminCaller()
+		db := &fakeViewerListDB{}
+		if rec := listAgentTemplatesRec(t, db, actor); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		isAdmin, viewer := viewerQueryArgs(t, db.gotArgs, db.called, 0, 1)
+		if !isAdmin {
+			t.Error("ListAgentTemplatesForViewer received is_admin=false for an ADMIN caller: " +
+				"admins lose the cross-scope read the flag exists to grant")
+		}
+		if !viewer.Valid || uuid.UUID(viewer.Bytes) != actor.ID {
+			t.Errorf("viewer_id = %v (valid=%v), want the caller's own id %v",
+				uuid.UUID(viewer.Bytes), viewer.Valid, actor.ID)
+		}
+	})
+}
+
+// getAgentTemplateRec drives GetAgentTemplate (GET /{id}) for one id as actor.
+func getAgentTemplateRec(t *testing.T, db store.DBTX, id uuid.UUID, actor store.User) *httptest.ResponseRecorder {
+	t.Helper()
+	h := &Handler{q: store.New(db)}
+	req := httptest.NewRequest(http.MethodGet, "/api/agent-templates/"+id.String(), nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", id.String())
+	req = req.WithContext(context.WithValue(
+		mw.ContextWithUser(req.Context(), actor), chi.RouteCtxKey, rctx))
+	rec := httptest.NewRecorder()
+	h.GetAgentTemplate(rec, req)
+	return rec
+}
+
+// TestGetAgentTemplatePassesCallerIdentity pins the pass-through into
+// GetAgentTemplateForViewer at loadTemplateForViewer (agent_templates.go:624). Mutating
+// `IsAdmin: actor.IsAdmin` to `IsAdmin: true` lets any caller fetch any private
+// template by id — it survived a full-scope `go test ./...` run. Both flag directions
+// are asserted; the admin `== true` check is the backstop no zero value can satisfy.
+func TestGetAgentTemplatePassesCallerIdentity(t *testing.T) {
+	t.Run("non-admin caller", func(t *testing.T) {
+		actor := nonAdminCaller()
+		tmpl := store.AgentTemplate{ID: uuid.New(), Name: "t", Scope: "global"}
+		db := &fakeTemplateViewerDB{tmpl: &tmpl}
+		if rec := getAgentTemplateRec(t, db, tmpl.ID, actor); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		gotID, isAdmin, viewer := templateViewerArgs(t, db)
+		if isAdmin {
+			t.Error("GetAgentTemplateForViewer received is_admin=true for a NON-ADMIN caller: " +
+				"every caller reads as admin and any private template is readable by anyone")
+		}
+		if !viewer.Valid || uuid.UUID(viewer.Bytes) != actor.ID {
+			t.Errorf("viewer_id = %v (valid=%v), want the caller's own id %v",
+				uuid.UUID(viewer.Bytes), viewer.Valid, actor.ID)
+		}
+		if gotID != tmpl.ID {
+			t.Errorf("id = %v, want the path id %v", gotID, tmpl.ID)
+		}
+	})
+
+	t.Run("admin caller", func(t *testing.T) {
+		actor := adminCaller()
+		tmpl := store.AgentTemplate{ID: uuid.New(), Name: "t", Scope: "global"}
+		db := &fakeTemplateViewerDB{tmpl: &tmpl}
+		if rec := getAgentTemplateRec(t, db, tmpl.ID, actor); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		_, isAdmin, viewer := templateViewerArgs(t, db)
+		if !isAdmin {
+			t.Error("GetAgentTemplateForViewer received is_admin=false for an ADMIN caller: " +
+				"admins lose the cross-scope read the flag exists to grant")
+		}
+		if !viewer.Valid || uuid.UUID(viewer.Bytes) != actor.ID {
+			t.Errorf("viewer_id = %v (valid=%v), want the caller's own id %v",
+				uuid.UUID(viewer.Bytes), viewer.Valid, actor.ID)
+		}
+	})
 }
