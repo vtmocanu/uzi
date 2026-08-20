@@ -21682,7 +21682,7 @@ auto-unlock across restart, a PRD non-goal we keep). Full rationale in the Decis
   is caught rather than shipped.
 
 - **A deliberate worker-image roll cordons a BUSY worker instead of killing it.** Cordon state
-  is a new orthogonal `workers.draining_since` column (migration `00137_worker_draining.sql`),
+  is a new orthogonal `workers.draining_since` column (migration `00138_worker_draining.sql`),
   distinct from the heartbeat-derived `workers.status`: a cordoned worker keeps heartbeating
   and finishing its runs but claims nothing new. The controller writes cordon via a new
   control-write endpoint (`api/internal/handler/controller_cordon.go`) and rolls the worker
