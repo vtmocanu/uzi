@@ -6,6 +6,18 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Added
+
+- **Container + chart signing (cosign keyless) and an optional signature-enforcing
+  admission policy (PR-LINK-PLACEHOLDER).** `release.yml` now signs every published
+  OCI artifact by digest with Sigstore keyless signing (the api, web, controller and
+  agent images plus the Helm chart), using each release job's GitHub OIDC identity, so
+  no signing key is stored. Signatures are separate `.sig` artifacts and do not change
+  the image manifests. The chart ships an optional Kyverno `ClusterPolicy`
+  (`imageVerification.enabled`, off by default, Audit-first) that admits a uzi image
+  only if it carries a valid signature from the release workflow; see
+  `docs/container-signing.md` for manual `cosign verify` and enforcement setup.
+
 ## [0.47.0] - 2026-08-20
 <!-- release-title: automated GitHub Release notes -->
 
