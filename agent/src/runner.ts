@@ -3,7 +3,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import type { WorkerClient } from "./client.js";
 import type { GitCache } from "./git.js";
-import { gitBasicCredential, isWorkflowScopeRejection } from "./git.js";
+import {
+  gitBasicCredential,
+  isNonFastForwardRejection,
+  isWorkflowScopeRejection,
+} from "./git.js";
 import type { Executor, RunContext } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
 import { skillsPluginDir } from "./skills-plugin.js";
@@ -90,7 +94,7 @@ export function composeWorkflowScopeReason(paths: string[]): string {
     "This run's branch changes workflow files that uzi's GitHub bot token cannot push " +
     "(its scope is exactly `repo`, without `workflow`, by design): ";
   const suffix =
-    ". The change is valid — land it as a human PR (commit the file yourself with a " +
+    ". The change is valid; land it as a human PR (commit the file yourself with a " +
     "workflow-scoped token). See docs/github-bot-setup.md. Your diff is preserved below.";
   const budget = MAX_FAILURE_REASON_LEN - prefix.length - suffix.length;
   let list = paths.join(", ");
@@ -121,23 +125,32 @@ export function composeWorkflowScopeReason(paths: string[]): string {
  * aligned with the current default branch before the finalize push: its `.github/workflows/**`
  * files are BEHIND the default (main advanced them after this run's clone base), the bot's
  * repo-only PAT cannot push while they differ, and uzi's attempt to merge and then rebase the
- * current default into the branch BOTH conflicted. The run fails without pushing and the
- * agent's diff is preserved (#377's `preserved_patch`) for a human to rebase-and-land.
+ * current default into the branch either BOTH conflicted, or the aligned branch could not be
+ * pushed without rewriting already-published history (a non-fast-forward the bot cannot
+ * force-push — NB2). The run fails without pushing and the agent's diff is preserved (#377's
+ * `preserved_patch`) for a human to rebase-and-land.
  *
- * Names the default branch and points at docs/github-bot-setup.md, kept under
- * MAX_FAILURE_REASON_LEN (the default branch name is clamped so the doc link always fits).
- * Exported for a direct length-cap unit test.
+ * Names the default branch once and points at docs/github-bot-setup.md. The branch name is
+ * the only variable part and is clamped against a computed budget (MAX_FAILURE_REASON_LEN
+ * minus the fixed prefix + suffix lengths), so the fixed suffix — the doc link and the
+ * "Your diff is preserved below." pointer — always fits MAX_FAILURE_REASON_LEN and is never
+ * truncated. Exported for a direct length-cap unit test.
  */
 export function composeBaseAlignConflictReason(defaultBranch: string): string {
-  const db = (defaultBranch || "the default branch").slice(0, 64);
-  const reason =
-    `This run's branch is behind the default branch (${db}) on .github/workflows files, ` +
-    "which uzi's GitHub bot token cannot push while they differ from the default (its scope " +
-    "is exactly `repo`, without `workflow`, by design). uzi tried to merge and then rebase the " +
-    `current ${db} into the branch to realign those files, but both conflicted, so the run ` +
-    "failed without pushing. The work is valid — a human can rebase and land it. " +
-    "See docs/github-bot-setup.md. Your diff is preserved below.";
-  return reason.slice(0, MAX_FAILURE_REASON_LEN);
+  const db = defaultBranch || "the default branch";
+  const prefix = "This run's branch is behind the default branch (";
+  const suffix =
+    ") on .github/workflows files, which uzi's GitHub bot token cannot push while they " +
+    "differ from the default (its scope is `repo`, without `workflow`, by design). uzi tried " +
+    "to merge then rebase the current default into the branch to realign those files, but could " +
+    "not realign and safely push it, so the run failed without pushing. The work is valid; a " +
+    "human can rebase and land it. See docs/github-bot-setup.md. Your diff is preserved below.";
+  // Clamp the branch name (the only variable part) against the budget left after the fixed
+  // prefix + suffix, so the doc link + preserved-diff pointer in `suffix` always survive.
+  const budget = MAX_FAILURE_REASON_LEN - prefix.length - suffix.length;
+  const branch = db.length > budget ? db.slice(0, Math.max(0, budget - 1)) + "…" : db;
+  // Belt-and-braces final net, mirroring composeWorkflowScopeReason's caller.
+  return (prefix + branch + suffix).slice(0, MAX_FAILURE_REASON_LEN);
 }
 
 /**
@@ -1436,7 +1449,7 @@ export class RunRunner {
                 kind: "status",
                 agent: "worker",
                 payload: {
-                  text: "could not align the branch with the updated default branch (merge and rebase both conflicted); failing and preserving the diff for a human to land",
+                  text: "could not realign the branch with the updated default branch and safely push it (merge and rebase conflicted, or the aligned branch could not be fast-forwarded); failing and preserving the diff for a human to land",
                 },
               });
               runLog.info("run failed: finalize base-align conflict; preserving diff", {
@@ -1488,20 +1501,32 @@ export class RunRunner {
               alignPushed = true;
             };
 
-            // Push the aligned branch. A REPEAT workflow-scope rejection here means the default's
-            // workflow files moved again DURING our align (double-TOCTOU) — preserve the diff and
-            // fail typed rather than lose it to the generic catch. Any OTHER push error still
-            // rethrows unchanged (a genuine auth/transient/protected-branch failure must not be
-            // mislabelled as a base-align conflict). Returns true if it preserved-and-failed (the
-            // caller must then `return`), false on a successful push.
+            // Push the aligned branch. Two rejections here are the base-align-conflict path,
+            // not a mislabel: a REPEAT workflow-scope rejection means the default's workflow
+            // files moved again DURING our align (double-TOCTOU); a NON-FAST-FORWARD rejection
+            // means the rebase fallback rewrote the history of an already-published branch (a
+            // resume, or the self_improve fixed branch) so this non-forced push cannot
+            // fast-forward, and force-push is denied by the guardrails by design. Both preserve
+            // the diff and fail typed rather than lose it to the generic catch. Any OTHER push
+            // error still rethrows unchanged (a genuine auth/transient/protected-branch failure
+            // must not be mislabelled as a base-align conflict). Returns true if it
+            // preserved-and-failed (the caller must then `return`), false on a successful push.
             const pushAlignedOrPreserve = async (): Promise<boolean> => {
               try {
                 await fetchAndPush();
                 return false;
               } catch (e) {
-                if (!isWorkflowScopeRejection(e)) throw e;
+                const nonFf = isNonFastForwardRejection(e);
+                if (!isWorkflowScopeRejection(e) && !nonFf) throw e;
+                // Record WHICH cause fired so an operator reading logs can tell the two apart:
+                // a repeat workflow-scope rejection (the default's workflow files moved again
+                // DURING our align) versus a non-fast-forward (the rebase rewrote an
+                // already-published branch's history, a resume or the self_improve fixed
+                // branch, that the bot cannot force-push).
                 runLog.info(
-                  "finalize base-align: aligned push STILL workflow-scope-rejected (default moved again during align); preserving diff and failing typed",
+                  nonFf
+                    ? "finalize base-align: aligned push rejected non-fast-forward (rebase rewrote an already-published branch's history the bot cannot force-push); preserving diff and failing typed"
+                    : "finalize base-align: aligned push STILL workflow-scope-rejected (default moved again during align); preserving diff and failing typed",
                   { run_id: runId },
                 );
                 await failBaseAlignConflict();
