@@ -91,6 +91,7 @@ Code includes a `.claude/rules/*.md` when it reads a file matching that rule's
 | `.claude/rules/web.md` | `web/**` | `task gate:web`, mock mode, the live-stack `vite preview` hazard, the blind browser instruments, vacuous negative assertions |
 | `.claude/rules/agent.md` | `agent/**` | `task gate:agent`, `--test-timeout`, the `agent-browser` symlink clobber, the `node --test` tally trap |
 | `.claude/rules/stack.md` | `docker-compose.yml`, `e2e/**`, `scripts/**`, `deploy/**`, `.gitlab-ci.yml` | isolating a test stack, the `.env` mechanism, `run-e2e.sh` / `smoke.sh` and the `smoke.sh` recipe, CI, the Helm `-}}` object-deleting trap. The destructive rules that used to be here are in *Destructive operations* above, always loaded |
+| `.claude/rules/prds.md` | `prds/**` | the workflow-scope constraint on PRD authoring: a PRD sent to uzi must keep `.github/workflows/**` out of BOTH its implementation and its validation (the worker PAT lacks `workflow` scope, so any workflow-file touch in the branch diff is an atomic push rejection that loses the whole branch). Split a needed workflow edit into a separate maintainer/local-only issue, or do it in-session; cross-refs the `uzi-watcher` skill's guardrail |
 
 **A rule fires on a file READ.** Running a gate without opening a file in that
 component does not pull its rule in: open the file, or read the rule directly.
