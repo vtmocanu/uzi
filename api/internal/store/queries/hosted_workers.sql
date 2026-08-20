@@ -215,3 +215,15 @@ WHERE token_ciphertext IS NOT NULL
 UPDATE workers
    SET draining_since = COALESCE(draining_since, now()), updated_at = now()
  WHERE id = @id AND kind = 'hosted';
+
+-- name: UncordonHostedWorker :execrows
+-- Controller uncordon-write (issue #458): clear draining_since so a worker that was
+-- cordoned on drift but whose drift was then REVERTED (nothing to roll) resumes claiming.
+-- draining_since is otherwise cleared ONLY by RegisterWorker on an actual roll, so a
+-- reverted-drift worker would stay cordoned forever. Idempotent: NULL->NULL is harmless,
+-- so no `draining_since IS NOT NULL` guard — that keeps rows-affected=0 meaning
+-- unambiguously "no such hosted worker" (clean 404), not "already clear". kind='hosted'
+-- mirrors CordonHostedWorker: never touch an external worker.
+UPDATE workers
+   SET draining_since = NULL, updated_at = now()
+ WHERE id = @id AND kind = 'hosted';

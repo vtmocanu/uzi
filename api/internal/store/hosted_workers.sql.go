@@ -343,6 +343,27 @@ func (q *Queries) MarkHostedWorkerTokenDelivered(ctx context.Context, arg MarkHo
 	return result.RowsAffected(), nil
 }
 
+const uncordonHostedWorker = `-- name: UncordonHostedWorker :execrows
+UPDATE workers
+   SET draining_since = NULL, updated_at = now()
+ WHERE id = $1 AND kind = 'hosted'
+`
+
+// Controller uncordon-write (issue #458): clear draining_since so a worker that was
+// cordoned on drift but whose drift was then REVERTED (nothing to roll) resumes claiming.
+// draining_since is otherwise cleared ONLY by RegisterWorker on an actual roll, so a
+// reverted-drift worker would stay cordoned forever. Idempotent: NULL->NULL is harmless,
+// so no `draining_since IS NOT NULL` guard — that keeps rows-affected=0 meaning
+// unambiguously "no such hosted worker" (clean 404), not "already clear". kind='hosted'
+// mirrors CordonHostedWorker: never touch an external worker.
+func (q *Queries) UncordonHostedWorker(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, uncordonHostedWorker, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const upsertHostedWorkerToken = `-- name: UpsertHostedWorkerToken :exec
 INSERT INTO hosted_worker_tokens (worker_id, token_ciphertext, delivered_at, created_at)
 VALUES ($1, $2, NULL, now())

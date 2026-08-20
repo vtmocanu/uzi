@@ -43,14 +43,17 @@ type fakeStore struct {
 	// against the hash the caller proved. Without it the fake could not model a
 	// rotation at all — and modelling exactly what the SQL does is this fake's job.
 	tokenHashes map[uuid.UUID][]byte
-	// listErr / markErr / cordonErr force the failure paths.
-	listErr   error
-	markErr   error
-	cordonErr error
+	// listErr / markErr / cordonErr / uncordonErr force the failure paths.
+	listErr     error
+	markErr     error
+	cordonErr   error
+	uncordonErr error
 	// markCalls counts MarkHostedWorkerTokenDelivered calls, including no-ops.
 	markCalls int
 	// cordoned records the ids passed to CordonHostedWorker, in order.
 	cordoned []uuid.UUID
+	// uncordoned records the ids passed to UncordonHostedWorker, in order.
+	uncordoned []uuid.UUID
 }
 
 func newFakeStore() *fakeStore {
@@ -85,6 +88,24 @@ func (f *fakeStore) CordonHostedWorker(_ context.Context, id uuid.UUID) (int64, 
 	}
 	for _, w := range f.workers {
 		if w.ID == id {
+			return 1, nil
+		}
+	}
+	return 0, nil
+}
+
+// UncordonHostedWorker mirrors the real UPDATE ... SET draining_since = NULL WHERE
+// id = $1 AND kind = 'hosted': it clears draining_since on the matching hosted row
+// and reports rows affected = 1 when such a row exists, else 0. Every worker in this
+// fake is hosted, so existence in f.workers is the whole predicate.
+func (f *fakeStore) UncordonHostedWorker(_ context.Context, id uuid.UUID) (int64, error) {
+	f.uncordoned = append(f.uncordoned, id)
+	if f.uncordonErr != nil {
+		return 0, f.uncordonErr
+	}
+	for i := range f.workers {
+		if f.workers[i].ID == id {
+			f.workers[i].DrainingSince = pgtype.Timestamptz{Valid: false}
 			return 1, nil
 		}
 	}
@@ -554,6 +575,50 @@ func TestCordonPropagatesStoreErrors(t *testing.T) {
 	st := newFakeStore()
 	st.cordonErr = boom
 	if _, err := newTestService(t, st).Cordon(context.Background(), uuid.New()); !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want it propagated", err)
+	}
+}
+
+// Uncordon returns found=true, passes the id through, and clears draining_since when a
+// hosted worker that was cordoned exists (issue #458 reverted-drift recovery).
+func TestUncordonClearsAKnownDrainingWorker(t *testing.T) {
+	st := newFakeStore()
+	id := newTestWorker(st, "base", "m", 0)
+	// Seed it as draining, the state a reverted-drift recovery has to undo.
+	st.workers[0].DrainingSince = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+	found, err := newTestService(t, st).Uncordon(context.Background(), id)
+	if err != nil {
+		t.Fatalf("uncordon: %v", err)
+	}
+	if !found {
+		t.Fatal("found = false, want true for a known hosted worker")
+	}
+	if len(st.uncordoned) != 1 || st.uncordoned[0] != id {
+		t.Fatalf("uncordoned = %v, want exactly [%s]", st.uncordoned, id)
+	}
+	if st.workers[0].DrainingSince.Valid {
+		t.Fatal("DrainingSince still valid, want cleared")
+	}
+}
+
+// Uncordon returns found=false (no error) for an unknown worker: the handler answers 404.
+func TestUncordonUnknownWorkerReturnsNotFound(t *testing.T) {
+	st := newFakeStore()
+	found, err := newTestService(t, st).Uncordon(context.Background(), uuid.New())
+	if err != nil {
+		t.Fatalf("uncordon: %v", err)
+	}
+	if found {
+		t.Fatal("found = true, want false for an unknown worker")
+	}
+}
+
+// Uncordon surfaces its store error rather than reporting a spurious not-found.
+func TestUncordonPropagatesStoreErrors(t *testing.T) {
+	boom := errors.New("db exploded")
+	st := newFakeStore()
+	st.uncordonErr = boom
+	if _, err := newTestService(t, st).Uncordon(context.Background(), uuid.New()); !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want it propagated", err)
 	}
 }

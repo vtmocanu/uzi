@@ -1397,5 +1397,8 @@ func (h *Handler) mountControllerRoutes(r chi.Router) {
 		// Cordon control-write (PRD #422 M4). Marks a hosted worker draining so it
 		// drains before rolling; distinct from the display-only status report.
 		r.Post("/workers/{workerID}/drain", h.ControllerCordonWorker)
+		// Uncordon control-write (issue #458). Clears draining_since when drift was
+		// reverted so the worker resumes claiming; same path, different method.
+		r.Delete("/workers/{workerID}/drain", h.ControllerUncordonWorker)
 	})
 }

@@ -48,3 +48,38 @@ func (h *Handler) ControllerCordonWorker(w http.ResponseWriter, r *http.Request)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+// ControllerUncordonWorker requests that a hosted worker stop draining (issue #458).
+//
+// This is the symmetric mirror of ControllerCordonWorker, and the same CONTROL-WRITE
+// class: it MUTATES desired state (it clears draining_since so the claim gate resumes
+// scheduling the worker), unlike the display-only ControllerStatus report. It exists
+// for the reverted-drift recovery — a worker cordoned on drift whose drift is then
+// reverted before it rolls has nothing left to roll, and draining_since is otherwise
+// cleared ONLY by RegisterWorker on an actual roll, so it would stay cordoned forever.
+//
+// Authenticated by mw.RequireController on the route group — the same fleet-scoped
+// bearer credential cordon uses, so no new auth mechanism. The Decision 8 blast-radius
+// note applies symmetrically: this endpoint is scoped to exactly the uncordon action
+// and nothing more — it can clear draining, and it can do nothing else.
+//
+// 204 No Content on success; 404 when no hosted worker has that id (a controller
+// uncordoning a worker the api has since dropped); 400 on a malformed workerID; 500 on
+// a store error.
+func (h *Handler) ControllerUncordonWorker(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "workerID"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid worker id")
+		return
+	}
+	found, err := h.hsvc.Uncordon(r.Context(), id)
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if !found {
+		httpx.Error(w, http.StatusNotFound, "no such hosted worker")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
