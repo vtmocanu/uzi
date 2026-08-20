@@ -238,6 +238,23 @@ re-run) → file an issue, do not chase; **infra / can't-fix** → report and st
 done. This is the local session fixing CI, NOT uzi's `ci_autofix` (which only touches
 pre-merge `agent/*` branches).
 
+**`conclusion == cancelled` is almost never a failure — it is concurrency
+supersession.** The CI workflows run with `concurrency: cancel-in-progress` on the `main`
+branch, so when a NEWER commit lands (another session's merge, or your own next merge) the
+in-progress run of the older SHA is cancelled mid-flight. This is common on this repo's
+shared, fast-moving `main` — a release/renovate session merging alongside you will
+supersede your merge SHA's run within a minute (measured 2026-08-20: `759199c8`'s CI was
+cancelled when a renovate merge landed on top seconds later). **Do not read `cancelled` as
+red.** A genuine failure carries `conclusion == failure` (or `timed_out` /
+`startup_failure`). On `cancelled`, your merge is fine — re-point at the CURRENT
+`origin/main` HEAD (`git fetch origin main`) and confirm *that* commit's run goes green,
+since it exercises your change plus whatever superseded it. If a peer session owns that
+newer commit (coordinate via SendMessage), its green is theirs to watch and report — your
+already-landed, already-reviewed, PR-head-green change needs no separate confirmation. A
+poller that treats every non-`success` conclusion as red will cry wolf on every
+concurrent merge; classify `failure`/`timed_out`/`startup_failure` as red and `cancelled`
+as supersession.
+
 ## When a run fails
 
 Read the reason: `uzi run get RUN --json | jq '{status, failure_reason, health_reason}'`.
