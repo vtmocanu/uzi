@@ -59,8 +59,12 @@ func TestReverseSyncSiblingGate(t *testing.T) {
 				rs = &fakeReverseSyncer{}
 				e.SetProjectReverseSync(rs)
 			}
-			// The gate copied verbatim from syncRepo.
-			if tc.forgeType == string(forge.TypeGitHub) && e.projectReverse != nil {
+			// Exercise the SAME predicate syncRepo uses (not a re-implementation), so a
+			// regression in the production gate is caught here.
+			if got := e.reverseSyncEligible(tc.forgeType); got != tc.wantFire {
+				t.Fatalf("reverseSyncEligible(%q)=%v, want %v", tc.forgeType, got, tc.wantFire)
+			}
+			if e.reverseSyncEligible(tc.forgeType) {
 				_ = e.projectReverse.ReverseSync(context.Background(), repoID)
 			}
 			fired := rs != nil && len(rs.calls) == 1

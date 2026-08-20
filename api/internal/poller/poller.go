@@ -421,9 +421,17 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	// overlap (tick does wg.Wait()), but the forward path in the HTTP handler CAN
 	// interleave with this read — the stored-marker no-op tolerates it (worst case a
 	// redundant same-value label write).
-	if r.ForgeType == string(forge.TypeGitHub) && e.projectReverse != nil {
+	if e.reverseSyncEligible(r.ForgeType) {
 		if err := e.projectReverse.ReverseSync(ctx, r.ID); err != nil {
 			slog.Error("poller: reverse project sync", "repo", r.PathWithNamespace, "error", err)
 		}
 	}
+}
+
+// reverseSyncEligible reports whether the per-tick reverse (Status → label) sibling
+// should fire for a repo of forgeType: only GitHub repos, and only when a reverse
+// syncer is wired (the instance kill-switch by wiring). Extracted so the fire/skip
+// gate can be exercised as production code rather than re-implemented in a test.
+func (e *Engine) reverseSyncEligible(forgeType string) bool {
+	return forgeType == string(forge.TypeGitHub) && e.projectReverse != nil
 }
