@@ -285,6 +285,90 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     assert.strictEqual(pushed, false, "no push on an align error");
     assert.strictEqual(calls.length, 0, "no PR opened on an align error");
   });
+
+  // (e) DOUBLE-TOCTOU: the merge push is workflow-scope-rejected → rebase fallback aligns →
+  // but the POST-REBASE push is ITSELF workflow-scope-rejected (main's workflow files moved
+  // AGAIN during our align). This must NOT escape to the generic catch (which would report a
+  // raw message, a defaulted fail_origin, and NO preserved_patch — the very data-loss bug).
+  // It must route to the typed conflict-fail path: failed + finalize_base_align_conflict +
+  // preserved_patch, no PR, and the raw reject text absent from failure_reason.
+  it("(e) rebase-aligned push STILL workflow-scope-rejected → typed fail + preserved_patch, no raw catch", async () => {
+    seedWorkflowsOnOrigin();
+    const { github, calls } = fakeGitHub();
+    const strategies = spyAlign();
+    const rejectMsg =
+      "git push origin ... failed: ! [remote rejected] refs/uzi-runner/agent/issue-55 -> agent/issue-55 " +
+      "(refusing to allow a Personal Access Token to create or update workflow " +
+      "`.github/workflows/ci.yml` without workflow scope)";
+    let pushCalls = 0;
+    git.pushBranch = (async () => {
+      pushCalls++;
+      // BOTH pushes are workflow-scope-rejected: the first drives the rebase fallback, the
+      // second models main's workflow files moving again DURING the align.
+      throw new Error(rejectMsg);
+    }) as typeof git.pushBranch;
+    const exec = committingExecutor({ "impl.ts": "export const x = 1;\n" }, { ".github/workflows/ci.yml": CI_V2 });
+
+    const claim = githubClaim(55);
+    await githubRunner(github, exec).execute(claim);
+
+    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+    assert.deepStrictEqual(statuses, ["running", "running", "failed"]);
+    assert.deepStrictEqual(strategies, ["merge", "rebase"], "merge rejected → rebase, then the aligned push is rejected again");
+    assert.strictEqual(pushCalls, 2, "the merge push and the post-rebase push were both attempted and rejected");
+    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")!.body;
+    assert.strictEqual(failed.fail_origin, "finalize_base_align_conflict", "routed to the typed fail, not the generic catch");
+    assert.match(failed.failure_reason ?? "", /docs\/github-bot-setup\.md/);
+    assert.ok(
+      !(failed.failure_reason ?? "").includes("Personal Access Token"),
+      "the raw reject text must not reach failure_reason (that would mean the generic catch)",
+    );
+    assert.ok(failed.preserved_patch, "the pre-align diff is preserved even on a double-TOCTOU rejection");
+    assert.match(failed.preserved_patch!, /impl\.ts/, "the preserved patch carries the agent's work");
+    assert.strictEqual(calls.length, 0, "no PR opened when the aligned push was rejected");
+  });
+
+  // (f) mislabel guard: a NON-workflow-scope push error on the rebase-fallback path must still
+  // rethrow to the generic catch — a genuine auth/transient/protected-branch failure must NOT
+  // be mislabelled as a base-align conflict. It surfaces the raw message with a defaulted
+  // fail_origin and no preserved_patch.
+  it("(f) non-workflow-scope error on the rebase path still surfaces via the generic catch", async () => {
+    seedWorkflowsOnOrigin();
+    const { github, calls } = fakeGitHub();
+    const strategies = spyAlign();
+    let pushCalls = 0;
+    git.pushBranch = (async () => {
+      pushCalls++;
+      if (pushCalls === 1) {
+        throw new Error(
+          "git push origin ... failed: ! [remote rejected] refs/uzi-runner/agent/issue-56 -> agent/issue-56 " +
+            "(refusing to allow a Personal Access Token to create or update workflow " +
+            "`.github/workflows/ci.yml` without workflow scope)",
+        );
+      }
+      // The post-rebase push fails for an unrelated reason (transient/network) — NOT a
+      // workflow-scope rejection, so it must rethrow rather than be preserved-and-typed.
+      throw new Error("boom: transient push failure over the network");
+    }) as typeof git.pushBranch;
+    const exec = committingExecutor({ "impl.ts": "export const x = 1;\n" }, { ".github/workflows/ci.yml": CI_V2 });
+
+    const claim = githubClaim(56);
+    await githubRunner(github, exec).execute(claim);
+
+    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+    assert.deepStrictEqual(statuses, ["running", "running", "failed"]);
+    assert.deepStrictEqual(strategies, ["merge", "rebase"], "merge rejected → rebase, then the non-scope error");
+    assert.strictEqual(pushCalls, 2, "the merge push and the post-rebase push were both attempted");
+    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")!.body;
+    assert.notStrictEqual(
+      failed.fail_origin,
+      "finalize_base_align_conflict",
+      "a non-workflow-scope error must NOT be mislabelled as a base-align conflict",
+    );
+    assert.match(failed.failure_reason ?? "", /transient push failure/, "the raw error surfaces via the generic catch");
+    assert.ok(!failed.preserved_patch, "no preserved_patch on the generic-catch path");
+    assert.strictEqual(calls.length, 0, "no PR opened on the failed push");
+  });
 });
 
 describe("composeBaseAlignConflictReason", () => {

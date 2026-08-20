@@ -1488,6 +1488,27 @@ export class RunRunner {
               alignPushed = true;
             };
 
+            // Push the aligned branch. A REPEAT workflow-scope rejection here means the default's
+            // workflow files moved again DURING our align (double-TOCTOU) — preserve the diff and
+            // fail typed rather than lose it to the generic catch. Any OTHER push error still
+            // rethrows unchanged (a genuine auth/transient/protected-branch failure must not be
+            // mislabelled as a base-align conflict). Returns true if it preserved-and-failed (the
+            // caller must then `return`), false on a successful push.
+            const pushAlignedOrPreserve = async (): Promise<boolean> => {
+              try {
+                await fetchAndPush();
+                return false;
+              } catch (e) {
+                if (!isWorkflowScopeRejection(e)) throw e;
+                runLog.info(
+                  "finalize base-align: aligned push STILL workflow-scope-rejected (default moved again during align); preserving diff and failing typed",
+                  { run_id: runId },
+                );
+                await failBaseAlignConflict();
+                return true;
+              }
+            };
+
             batcher.emit({
               kind: "status",
               agent: "worker",
@@ -1511,7 +1532,7 @@ export class RunRunner {
                 );
                 const rebaseRes = await alignOp("rebase");
                 if (rebaseRes === "aligned") {
-                  await fetchAndPush();
+                  if (await pushAlignedOrPreserve()) return;
                 } else {
                   await failBaseAlignConflict();
                   return;
@@ -1525,7 +1546,7 @@ export class RunRunner {
               });
               const rebaseRes = await alignOp("rebase");
               if (rebaseRes === "aligned") {
-                await fetchAndPush();
+                if (await pushAlignedOrPreserve()) return;
               } else {
                 await failBaseAlignConflict();
                 return;
