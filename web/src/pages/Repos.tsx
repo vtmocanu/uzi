@@ -23,6 +23,9 @@ export function Repos() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
+  // A 422 enable-guardrail refusal carries a violation list we render below the
+  // page Alert, mirroring the identical 422 contract in ForgeSettings (PRD #345).
+  const [enableViolations, setEnableViolations] = useState<string[] | null>(null);
   // The repo whose "Trusted repo" panel is currently expanded. The panel groups a
   // master control over two independently-revocable capabilities — Repo skills and
   // Repo instructions (PRD #246). It renders OUTSIDE the horizontally-scrolling
@@ -119,12 +122,20 @@ export function Repos() {
 
   const toggle = async (repo: Repo) => {
     setError("");
+    setEnableViolations(null);
     setBusyId(repo.id);
     try {
       const { repo: updated } = await api.setRepoEnabled(repo.id, !repo.enabled);
       setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+      setEnableViolations(null);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Update failed");
+      if (err instanceof ApiError && err.status === 422) {
+        const body = err.body as { violations?: string[] } | null;
+        setError(err.message);
+        setEnableViolations(body?.violations ?? []);
+      } else {
+        setError(err instanceof ApiError ? err.message : "Update failed");
+      }
     } finally {
       setBusyId(null);
     }
@@ -360,6 +371,16 @@ export function Repos() {
       />
 
       {error && <Alert message={error} />}
+      {enableViolations && (
+        <Card className="border-danger/40 bg-danger/5">
+          <p className="text-sm font-medium text-danger">This repository was not enabled — the guardrail refused it:</p>
+          <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-fg">
+            {enableViolations.map((v, i) => (
+              <li key={i}>{v}</li>
+            ))}
+          </ul>
+        </Card>
+      )}
 
       {loading ? (
         <ListSkeleton rows={4} />

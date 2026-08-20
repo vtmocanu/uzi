@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { Repos } from "./Repos";
-import { api, type ForgeConnection, type Repo } from "../lib/api";
+import { api, ApiError, type ForgeConnection, type Repo } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
 vi.mock("../lib/api", async (importOriginal) => {
@@ -477,5 +477,36 @@ describe("Repos — per-repo remove action (PRD #357 M2, D2/D3)", () => {
     const row = within(rowFor("vtmocanu/uzi"));
     expect(row.getByRole("button", { name: /^Disable$/ })).toBeTruthy();
     expect(row.queryByRole("button", { name: /^Remove$/ })).toBeNull();
+  });
+});
+
+describe("Repos — enable guardrail 422 violations (PRD #345)", () => {
+  it("renders the refusal violations and leaves the repo disabled, then clears on a later success", async () => {
+    mockApi.setRepoEnabled.mockRejectedValue(
+      new ApiError(422, "this repo was not enabled", {
+        violations: ["reason one", "reason two"],
+      }),
+    );
+    renderPage();
+    // example/website is the disabled repo in the fixture — it shows an Enable toggle.
+    await screen.findByText("example/website");
+    const row = () => within(rowFor("example/website"));
+    fireEvent.click(row().getByRole("button", { name: /^Enable$/ }));
+
+    // POSITIVE: both violation strings surface in the DOM.
+    expect(await screen.findByText("reason one")).toBeTruthy();
+    expect(screen.getByText("reason two")).toBeTruthy();
+
+    // NEGATIVE: the repo stayed disabled — its toggle still reads Enable, never Disable.
+    expect(row().getByRole("button", { name: /^Enable$/ })).toBeTruthy();
+    expect(row().queryByRole("button", { name: /^Disable$/ })).toBeNull();
+
+    // A subsequent successful toggle clears the violations from the DOM.
+    mockApi.setRepoEnabled.mockResolvedValue({
+      repo: { ...REPOS[2], enabled: true },
+    });
+    fireEvent.click(row().getByRole("button", { name: /^Enable$/ }));
+    await waitFor(() => expect(screen.queryByText("reason one")).toBeNull());
+    expect(screen.queryByText("reason two")).toBeNull();
   });
 });
