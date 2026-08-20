@@ -2142,8 +2142,8 @@ function IssuesFilter({
 }: {
   open: boolean;
   onToggleOpen: () => void;
-  popRef: React.RefObject<HTMLDivElement>;
-  triggerRef: React.RefObject<HTMLButtonElement>;
+  popRef: React.RefObject<HTMLDivElement | null>;
+  triggerRef: React.RefObject<HTMLButtonElement | null>;
   prdLabel: string;
   membershipLabels: string[];
   defaultExtras: string[];

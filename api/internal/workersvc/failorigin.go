@@ -46,6 +46,11 @@ var failOrigins = []string{
 	// pushed by the bot's repo-only PAT, so the worker fails early with this origin and
 	// preserves the diff (worker-reportable — see workerReportableFailOrigins).
 	"workflow_scope_missing",
+	// PRD #456 M2: a run behind on .github/workflows/** aligns its branch with the
+	// current default before the finalize push; if BOTH the merge and the rebase
+	// fallback conflict, the worker aborts, fails with this origin and preserves the
+	// pre-align diff (worker-reportable — see workerReportableFailOrigins).
+	"finalize_base_align_conflict",
 }
 
 // failOriginSet is the lookup form. Built once; failOrigins stays the declaration so
@@ -76,18 +81,21 @@ func AllFailOrigins() []string {
 // on, and (guardrail_blocked being a Gate 4b member) let an untrusted report steer whether
 // a run is judged. CoerceFailOrigin gates on THIS set, not the full failOrigins vocabulary.
 // The worker legitimately emits only provisioning_failed / credential_unavailable
-// (failOriginForReason), rate_limited (the limit opt-out path, runner.ts), and
+// (failOriginForReason), rate_limited (the limit opt-out path, runner.ts),
 // workflow_scope_missing (PRD #377: the finalize detection that the branch touches
-// .github/workflows/** the bot PAT cannot push); agent_failure is included because it is
-// the judgeable default the `failed` arm applies anyway, so an explicit worker
-// agent_failure is harmless and semantically correct. The partition (worker-reportable +
-// server-only == vocabulary) is pinned by TestCoerceFailOrigin.
+// .github/workflows/** the bot PAT cannot push), and finalize_base_align_conflict
+// (PRD #456: the finalize base-align merge AND rebase both conflict, so the worker
+// aborts and preserves the diff); agent_failure is included because it is the judgeable
+// default the `failed` arm applies anyway, so an explicit worker agent_failure is
+// harmless and semantically correct. The partition (worker-reportable + server-only ==
+// vocabulary) is pinned by TestCoerceFailOrigin.
 var workerReportableFailOrigins = map[string]bool{
-	"provisioning_failed":    true,
-	"credential_unavailable": true,
-	"rate_limited":           true,
-	"agent_failure":          true,
-	"workflow_scope_missing": true,
+	"provisioning_failed":          true,
+	"credential_unavailable":       true,
+	"rate_limited":                 true,
+	"agent_failure":                true,
+	"workflow_scope_missing":       true,
+	"finalize_base_align_conflict": true,
 }
 
 // CoerceFailOrigin maps a worker-reported fail_origin onto the WORKER-REPORTABLE subset.

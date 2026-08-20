@@ -692,6 +692,21 @@ chain in the diagram above, with no intervening `running`.
   Slack is not attempted, since the existing Slack ❌ DM already covers opted-in
   users) for the run's owner, gated on `stop_kind` so a deliberate cancel or
   plan-rejection stays silent and only genuine breakage notifies.
+- **Finalize, GitHub only: align a behind-on-workflows branch before that push**
+  (PRD #456). GitHub rejects the bot's `repo`-only PAT push whenever the pushed
+  tip's `.github/workflows/**` tree differs from the *current* default branch —
+  even when the run's own branch never touched a workflow file, only fell
+  behind on one because main advanced it mid-run. Immediately before the push
+  above, uzi fetches the default branch's fresh tip and, only when the
+  workflow trees actually differ, aligns the branch to it: a SHA-preserving
+  merge first, falling back to a rebase (the mechanism proven to clear the
+  rejection) if the merged push is still refused. An unresolvable conflict
+  fails the run typed (`fail_origin = finalize_base_align_conflict`) with the
+  pre-align diff preserved on the failed-run card, via the same
+  `preserved_patch` mechanism PRD #377 built for a branch that *modifies* a
+  workflow file (a distinct, earlier-firing guard on the same finalize path).
+  See [ADR-456](adr/0456-rebase-before-finalize-push.md) for the mechanism and
+  why merge is tried before rebase.
 - **Milestone tracker reconciliation** (PRD #122 M2 + PRD #265 + PRD #390) — on a
   milestone-structured `issue` run the run view shows a *reported-complete*
   tracker (`runs.milestones_completed`, a monotone server-side union; never
