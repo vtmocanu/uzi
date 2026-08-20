@@ -661,6 +661,59 @@ describe("RunRunner — workflow-scope early fail (PRD #377 M1)", () => {
     assert.strictEqual(fs.existsSync(worktreeDirFor(31)), false);
   });
 
+  it("a non-issue forge-pushing kind (prompt) on github + a workflow change still gets the typed workflow_scope_missing outcome", async () => {
+    // PRD #377 success criterion: EVERY forge-pushing kind — not just `issue` — gets the
+    // typed outcome. The detection block sits BEFORE the push and is not kind-gated, so a
+    // NON-issue kind whose diff touches .github/workflows must fail identically. `prompt`
+    // (a schedule-fired ad-hoc run) is the deterministic non-issue kind here: its finalize
+    // path only composes an MR annotation, with no subprocess check-running to make the
+    // test timing-dependent. Synthetic in-memory fixtures only — no workflow file on disk.
+    const { github, calls } = fakeGitHub();
+    let pushed = false;
+    git.pushBranch = (async () => {
+      pushed = true;
+    }) as typeof git.pushBranch;
+    const PAT = "fixture-forge-pat-000000";
+    const SYNTH_DIFF =
+      "diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml\n" +
+      `+ leaked_token=${PAT}\n+on: [push]\n`;
+    git.changedFiles = (async () => [
+      ".github/workflows/release.yml",
+    ]) as typeof git.changedFiles;
+    git.workflowScopeDiff = (async () =>
+      SYNTH_DIFF) as typeof git.workflowScopeDiff;
+
+    const claim = githubClaim(35, { kind: "prompt" });
+    await githubRunner(github).execute(claim);
+
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
+    assert.deepStrictEqual(statuses, ["running", "running", "failed"]);
+    const failed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "failed",
+    )!.body;
+    // The SAME typed outcome the issue-kind test asserts, proving the fail path is not
+    // issue-gated.
+    assert.strictEqual(failed.fail_origin, "workflow_scope_missing");
+    assert.match(
+      failed.failure_reason ?? "",
+      /release\.yml/,
+      "the reason must name the offending path",
+    );
+    assert.ok(
+      failed.preserved_patch,
+      "the agent's diff must be preserved on the failed report",
+    );
+    assert.ok(
+      !failed.preserved_patch!.includes(PAT),
+      "the PAT must be scrubbed from the preserved patch",
+    );
+
+    assert.strictEqual(pushed, false, "the doomed push must be skipped");
+    assert.strictEqual(calls.length, 0, "no PR opened on the early fail");
+  });
+
   it("github + a non-workflow change pushes and opens a PR normally (predicate is workflow-path-gated)", async () => {
     const { github, calls } = fakeGitHub();
     let pushed = false;
