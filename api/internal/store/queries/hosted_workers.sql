@@ -31,12 +31,13 @@ SELECT w.id,
        (SELECT count(*) FROM runs r
           WHERE r.worker_id = w.id
             AND r.status NOT IN ('completed', 'failed', 'cancelled')) > 0 AS busy,
-       -- draining (PRD #422 M3): mirrors the orthogonal cordon column. A cordoned worker
-       -- finishes its in-flight runs then rolls; the controller reads this alongside busy.
-       -- ::boolean is required, not decoration: sqlc infers a bare `IS NOT NULL`
-       -- expression as interface{} (weaker on expressions than on columns — see
-       -- GetRunClaimContext's human_plan_approved), which is unusable as a Go bool.
-       (w.draining_since IS NOT NULL)::boolean AS draining,
+       -- draining_since (PRD #422 M3/M5): the raw nullable cordon timestamp — WHEN this
+       -- worker was cordoned, or NULL if it is not draining (draining == draining_since != nil).
+       -- M5 selects the timestamp itself rather than an `IS NOT NULL` boolean because the
+       -- controller's reconcile loop is stateless (it remembers nothing across ticks) and must
+       -- compute `now - draining_since >= deadline` to enforce the bounded drain deadline; the
+       -- bool it replaces could only answer "draining y/n", not "for how long".
+       w.draining_since,
        t.token_ciphertext
 FROM workers w
 LEFT JOIN hosted_worker_tokens t ON t.worker_id = w.id

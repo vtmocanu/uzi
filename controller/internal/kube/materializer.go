@@ -54,6 +54,20 @@ type Cordoner interface {
 	RequestDrain(ctx context.Context, workerID string) error
 }
 
+// DrainPolicy carries the two controller-side overrides that let a BUSY drifted worker
+// roll despite the M4 cordon-then-defer default (PRD #422 M5). Both are controller config
+// (a chart value + a controller env), not wire data, per Decision 4:
+//
+//   - Deadline bounds how long a cordoned busy worker delays its roll. Once
+//     now-DrainingSince >= Deadline the controller rolls it anyway (its in-flight run
+//     requeues), so a worker parked at an approval gate cannot hold the old image forever.
+//   - ForceRoll, when true, rolls every drifted worker immediately regardless of busy —
+//     the emergency override (e.g. a CVE), accepting the in-flight requeue.
+type DrainPolicy struct {
+	Deadline  time.Duration
+	ForceRoll bool
+}
+
 type Materializer struct {
 	client   kubernetes.Interface
 	cfg      RenderConfig
@@ -61,7 +75,9 @@ type Materializer struct {
 	// cordoner is the api cordon-write channel (PRD #422 M4). Nil disables cordoning;
 	// see Cordoner. Injected the same way as resolver, so tests can drive it.
 	cordoner Cordoner
-	log      *slog.Logger
+	// drain is the bounded-deadline + force-roll policy (PRD #422 M5). See DrainPolicy.
+	drain DrainPolicy
+	log   *slog.Logger
 	// now is the clock seam for roll-health's age arm (PRD #113 M3). A bare
 	// time.Now() at the comparison site would make stuckAge testable only by
 	// sleeping for ten minutes. Defaulted in New; overridden directly by tests,
@@ -71,8 +87,9 @@ type Materializer struct {
 
 // New builds a Materializer. cordoner may be nil, which disables cordoning (a busy
 // drifted worker is then deferred rather than rolled — still fail-safe); see Cordoner.
-func New(client kubernetes.Interface, cfg RenderConfig, resolver preset.Resolver, cordoner Cordoner, log *slog.Logger) *Materializer {
-	return &Materializer{client: client, cfg: cfg, resolver: resolver, cordoner: cordoner, log: log, now: time.Now}
+// drain carries the M5 bounded-deadline + force-roll policy (see DrainPolicy).
+func New(client kubernetes.Interface, cfg RenderConfig, resolver preset.Resolver, cordoner Cordoner, drain DrainPolicy, log *slog.Logger) *Materializer {
+	return &Materializer{client: client, cfg: cfg, resolver: resolver, cordoner: cordoner, drain: drain, log: log, now: time.Now}
 }
 
 // Observe lists the worker namespace and partitions it by PROVENANCE.
@@ -565,15 +582,16 @@ func (m *Materializer) reconcileWorker(ctx context.Context, w protocol.DesiredWo
 	if obs.Generation == w.Generation && obs.SpecHash == wantHash {
 		return nil // no drift
 	}
-	// PRD #422 M4: a drifted worker used to be Recreate-rolled unconditionally, with a
-	// comment noting there was deliberately NO controller-side "is it busy?" check. That
-	// check is exactly what this milestone adds. If the api reports the worker BUSY (it
-	// holds a non-terminal run), do NOT hard-kill it: cordon it (so its claim gate idles
-	// and it drains) and DEFER the roll; it rolls on a later tick once the api reports it
-	// idle. Fail-safe: any cordon failure — a write error, or no cordon channel at all —
-	// still defers, so a busy worker is never Recreate-killed.
-	if w.Busy {
-		if !w.Draining {
+	// Drift. PRD #422 M5: a busy worker is normally cordoned + deferred (M4), BUT two
+	// overrides roll it anyway (accepting today's requeue-resume): an operator force-roll
+	// (emergency, e.g. a CVE), and the bounded drain deadline (a worker parked at an
+	// approval gate must not hold the old image forever). Both measured/flagged controller-
+	// side; the deadline elapses from the api-supplied draining_since (this loop is stateless).
+	rollDespiteBusy := m.drain.ForceRoll ||
+		(w.DrainingSince != nil && m.now().Sub(*w.DrainingSince) >= m.drain.Deadline)
+	if w.Busy && !rollDespiteBusy {
+		if w.DrainingSince == nil {
+			// not yet cordoned — request the cordon (fail-safe: any failure still defers)
 			if m.cordoner != nil {
 				if err := m.cordoner.RequestDrain(ctx, w.ID); err != nil {
 					m.log.Warn("cordon request failed; deferring roll (fail-safe)", "worker_id", w.ID, "error", err)
@@ -588,8 +606,16 @@ func (m *Materializer) reconcileWorker(ctx context.Context, w protocol.DesiredWo
 		}
 		return nil
 	}
-	// Idle: safe to roll now (whether or not it was ever draining — a cordoned worker
-	// that has since gone idle rolls on this tick).
+	if w.Busy {
+		// rolling a busy worker: its in-flight run(s) will requeue (Decision 4 fallback).
+		reason := "drain deadline exceeded"
+		if m.drain.ForceRoll {
+			reason = "operator force-roll"
+		}
+		m.log.Warn("rolling a BUSY hosted worker anyway; its in-flight run will requeue", "worker_id", w.ID, "reason", reason)
+	}
+	// Idle (or an override fired): safe to roll now (whether or not it was ever draining —
+	// a cordoned worker that has since gone idle rolls on this tick).
 	m.log.Info("hosted worker drifted; rolling",
 		"worker_id", w.ID,
 		"generation_observed", obs.Generation, "generation_desired", w.Generation,

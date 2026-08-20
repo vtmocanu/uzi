@@ -375,6 +375,24 @@ workers:
     tokenSecretKey: UZI_CONTROLLER_TOKEN
     tokenHashSecretKey: WORKER_HOSTING_CONTROLLER_TOKEN_SHA256
 
+  # --- the drain policy (PRD #422 M5) ---------------------------------------------
+  #
+  # How the controller resolves a deliberate image roll (advancing workers.image.tag)
+  # of a worker that is BUSY. The default M4 behaviour cordons the busy worker and
+  # DEFERS the roll until it finishes its run(s); these two knobs bound and override
+  # that so a run parked at an approval gate can never hold the old image forever.
+  #
+  # drainDeadline: how long a cordoned busy worker delays the roll before the controller
+  #   rolls it ANYWAY and its in-flight run requeues (Decision 4). An ordinary Go
+  #   duration ("24h", "1h", "30m"). The reconcile loop is stateless, so the elapsed time
+  #   is measured from the api-supplied draining_since, not from any controller memory.
+  drainDeadline: "24h"
+  # forceRoll: the EMERGENCY override — roll every drifted worker immediately regardless
+  #   of busy, accepting the in-flight requeue (e.g. a CVE that must not wait on a drain).
+  #   It only accelerates a PENDING roll (a drifted worker); it never invents one. Leave
+  #   false in normal operation and flip it true only for the duration of the emergency.
+  forceRoll: false
+
   # --- the per-template agent images the controller renders (M6) ------------------
   #
   # The REPO PREFIX only. The controller appends "/agent-<template>:<tag>"

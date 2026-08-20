@@ -69,11 +69,14 @@ type DesiredWorker struct {
 	// a busy worker (cordon-then-roll-when-idle, M4). Always present on the wire (no
 	// omitempty) so a drop is a visible contract change, not a silent false.
 	Busy bool `json:"busy"`
-	// Draining is true when the worker has been cordoned (draining_since set, PRD #422
-	// Decision 7): it keeps heartbeating and finishing its in-flight runs but claims
-	// nothing new, and the controller rolls it once idle. Always present on the wire (no
-	// omitempty) so a drop is a visible contract change, not a silent false.
-	Draining bool `json:"draining"`
+	// DrainingSince is WHEN the worker was cordoned (draining_since set, PRD #422
+	// Decision 7), or nil when it is not draining (nil == not draining). A cordoned
+	// worker keeps heartbeating and finishing its in-flight runs but claims nothing
+	// new. The controller reads this to enforce the drain deadline — it is stateless,
+	// so `now - draining_since` is the only way it can tell how long a worker has been
+	// draining (M5) — and to avoid re-cordoning one already draining (M4). It replaces
+	// M3's `draining` bool, which could say only y/n and not for-how-long.
+	DrainingSince *time.Time `json:"draining_since"`
 	// Generation is bumped whenever the desired spec changes; the controller
 	// compares it against what it observes to decide whether to roll (Decision 9).
 	Generation int64 `json:"generation"`

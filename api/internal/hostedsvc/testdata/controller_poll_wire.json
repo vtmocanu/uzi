@@ -6,7 +6,7 @@
       "size": "s",
       "docker": true,
       "busy": true,
-      "draining": false,
+      "draining_since": null,
       "generation": 1,
       "join_token": "uzw_EXAMPLE-NOT-A-REAL-TOKEN"
     },
@@ -16,7 +16,7 @@
       "size": "l",
       "docker": false,
       "busy": false,
-      "draining": true,
+      "draining_since": "2026-01-02T03:04:05Z",
       "generation": 4,
       "join_token": null
     }

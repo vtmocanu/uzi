@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // The controller side of the PRD #58 wire contract. It parses the SAME golden file
@@ -58,16 +59,17 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 	if *pending.JoinToken != "uzw_EXAMPLE-NOT-A-REAL-TOKEN" {
 		t.Fatalf("join_token = %q", *pending.JoinToken)
 	}
-	// Busy/draining are distinct booleans (PRD #422 M3) and must round-trip to their
-	// own fields: the golden's first worker is busy but not draining. Asserting both
-	// (not just !Draining) fails a swapped/dropped json tag — a Busy field tagged
-	// json:"draining" would parse this worker's busy=true into Draining and satisfy
-	// DisallowUnknownFields, so only pinning the value catches it.
+	// Busy (bool) and draining_since (nullable timestamp) are distinct fields (PRD #422
+	// M3/M5) and must round-trip to their own fields: the golden's first worker is busy
+	// but not draining (draining == DrainingSince != nil). Asserting both (not just
+	// DrainingSince==nil) fails a swapped/dropped json tag — a Busy field tagged
+	// json:"draining_since" would misparse and satisfy DisallowUnknownFields, so only
+	// pinning the value catches it.
 	if !pending.Busy {
 		t.Fatal("busy must parse as true for the golden's first worker (the busy one)")
 	}
-	if pending.Draining {
-		t.Fatal("draining must parse as false for the golden's first worker (not cordoned)")
+	if pending.DrainingSince != nil {
+		t.Fatal("draining_since must parse as nil for the golden's first worker (not cordoned)")
 	}
 
 	// A worker needing no Secret written: null token, still fully desired state. The
@@ -84,12 +86,16 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 		t.Fatal("docker must parse as false for the golden's second worker (the plain one)")
 	}
 	// The mirror of the first worker: this one is draining but not busy, so the two
-	// assertions together fail either a swapped tag or a field collapse.
+	// assertions together fail either a swapped tag or a field collapse. The timestamp
+	// must round-trip to the golden's fixed value.
 	if noToken.Busy {
 		t.Fatal("busy must parse as false for the golden's second worker (idle)")
 	}
-	if !noToken.Draining {
-		t.Fatal("draining must parse as true for the golden's second worker (cordoned)")
+	if noToken.DrainingSince == nil {
+		t.Fatal("draining_since must parse as non-nil for the golden's second worker (cordoned)")
+	}
+	if want := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC); !noToken.DrainingSince.Equal(want) {
+		t.Fatalf("draining_since = %v, want the golden's fixed %v", noToken.DrainingSince, want)
 	}
 }
 

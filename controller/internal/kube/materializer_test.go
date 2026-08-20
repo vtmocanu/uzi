@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -24,7 +25,7 @@ import (
 func newMat(t *testing.T, objs ...runtime.Object) (*Materializer, *fake.Clientset) {
 	t.Helper()
 	client := fake.NewSimpleClientset(objs...)
-	m := New(client, testConfig(), testResolver(t), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m := New(client, testConfig(), testResolver(t), nil, DrainPolicy{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	return m, client
 }
 
@@ -274,7 +275,7 @@ func TestAnUnstampedUziHwObjectIsFlaggedAndNeverTouched(t *testing.T) {
 	}}
 	var logs strings.Builder
 	client := fake.NewSimpleClientset(orphan)
-	m := New(client, testConfig(), testResolver(t), nil, slog.New(slog.NewTextHandler(&logs, nil)))
+	m := New(client, testConfig(), testResolver(t), nil, DrainPolicy{}, slog.New(slog.NewTextHandler(&logs, nil)))
 
 	observed, err := m.Observe(context.Background())
 	if err != nil {
@@ -420,7 +421,7 @@ func TestNoSecretReadAcrossAFullFleetReconcile(t *testing.T) {
 func newDockerMat(t *testing.T, objs ...runtime.Object) (*Materializer, *fake.Clientset) {
 	t.Helper()
 	client := fake.NewSimpleClientset(objs...)
-	m := New(client, dockerTestConfig(), testResolver(t), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m := New(client, dockerTestConfig(), testResolver(t), nil, DrainPolicy{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	return m, client
 }
 
@@ -662,7 +663,7 @@ func TestOrphanInDockerNamespaceIsFlaggedNotDeleted(t *testing.T) {
 	}}
 	var logs strings.Builder
 	client := fake.NewSimpleClientset(orphan)
-	m := New(client, dockerTestConfig(), testResolver(t), nil, slog.New(slog.NewTextHandler(&logs, nil)))
+	m := New(client, dockerTestConfig(), testResolver(t), nil, DrainPolicy{}, slog.New(slog.NewTextHandler(&logs, nil)))
 	ctx := context.Background()
 
 	observed, err := m.Observe(ctx)
@@ -790,14 +791,34 @@ func (f *fakeCordoner) RequestDrain(_ context.Context, workerID string) error {
 	return f.err
 }
 
-// newMatWithCordoner builds a Materializer wired to a fake cordoner (nil disables
-// cordoning, exercising the no-channel path).
-func newMatWithCordoner(t *testing.T, c Cordoner, objs ...runtime.Object) (*Materializer, *fake.Clientset) {
+// m5Now is the pinned clock for the drift/drain tests, so a deadline comparison
+// (now - draining_since >= Deadline, PRD #422 M5) is deterministic rather than racing
+// the wall clock.
+var m5Now = time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+
+// newMatWithDrain builds a Materializer wired to a fake cordoner (nil disables
+// cordoning) under an explicit DrainPolicy, with its clock pinned to m5Now so the
+// deadline branch is deterministic.
+func newMatWithDrain(t *testing.T, c Cordoner, drain DrainPolicy, objs ...runtime.Object) (*Materializer, *fake.Clientset) {
 	t.Helper()
 	client := fake.NewSimpleClientset(objs...)
-	m := New(client, testConfig(), testResolver(t), c, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m := New(client, testConfig(), testResolver(t), c, drain, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m.now = func() time.Time { return m5Now }
 	return m, client
 }
+
+// newMatWithCordoner builds a Materializer wired to a fake cordoner (nil disables
+// cordoning, exercising the no-channel path). It uses a GENEROUS 24h deadline and no
+// force-roll, so the M4 defer tests below keep their meaning: a recently cordoned
+// worker never trips the deadline, and only the dedicated M5 tests exercise a roll.
+func newMatWithCordoner(t *testing.T, c Cordoner, objs ...runtime.Object) (*Materializer, *fake.Clientset) {
+	t.Helper()
+	return newMatWithDrain(t, c, DrainPolicy{Deadline: 24 * time.Hour}, objs...)
+}
+
+// recentDrain is a draining_since inside any reasonable deadline (one minute before the
+// pinned clock) — a worker that was just cordoned.
+func recentDrain() *time.Time { t := m5Now.Add(-time.Minute); return &t }
 
 // wasPatched reports whether any Deployment patch reached the fake apiserver — the
 // observable proof of a roll, and its absence the proof of a defer.
@@ -810,20 +831,21 @@ func wasPatched(client *fake.Clientset) bool {
 	return false
 }
 
-// driftedIdle sets up a worker whose deployed spec hash no longer matches what the
-// renderer would stamp, so it has drifted. Busy/Draining are set by the caller.
-func driftedWorker(t *testing.T, busy, draining bool) (protocol.DesiredWorker, []reconcile.ObservedWorker, *appsv1.Deployment) {
+// driftedWorker sets up a worker whose deployed spec hash no longer matches what the
+// renderer would stamp, so it has drifted. Busy and drainingSince (nil == not draining)
+// are set by the caller.
+func driftedWorker(t *testing.T, busy bool, drainingSince *time.Time) (protocol.DesiredWorker, []reconcile.ObservedWorker, *appsv1.Deployment) {
 	t.Helper()
 	dep := deployedWorker("w1", 0, "the-old-releases-hash")
 	obs := []reconcile.ObservedWorker{{ID: "w1", HasDeployment: true, Generation: 0, SpecHash: "the-old-releases-hash"}}
-	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, Busy: busy, Draining: draining}
+	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, Busy: busy, DrainingSince: drainingSince}
 	return w, obs, dep
 }
 
 // drift + busy + not draining ⇒ cordon requested once, roll deferred (no patch).
 func TestDriftBusyNotDrainingCordonsAndDefers(t *testing.T) {
 	c := &fakeCordoner{}
-	w, obs, dep := driftedWorker(t, true, false)
+	w, obs, dep := driftedWorker(t, true, nil)
 	m, client := newMatWithCordoner(t, c, dep)
 	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -836,10 +858,11 @@ func TestDriftBusyNotDrainingCordonsAndDefers(t *testing.T) {
 	}
 }
 
-// drift + busy + already draining ⇒ no re-cordon, still deferred (no patch).
+// drift + busy + already draining (recently, within the deadline) ⇒ no re-cordon, still
+// deferred (no patch).
 func TestDriftBusyAlreadyDrainingDefersWithoutRecordon(t *testing.T) {
 	c := &fakeCordoner{}
-	w, obs, dep := driftedWorker(t, true, true)
+	w, obs, dep := driftedWorker(t, true, recentDrain())
 	m, client := newMatWithCordoner(t, c, dep)
 	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -856,7 +879,7 @@ func TestDriftBusyAlreadyDrainingDefersWithoutRecordon(t *testing.T) {
 // a later tick where busy flipped false is exactly this case.
 func TestDriftIdleRollsWithoutCordon(t *testing.T) {
 	c := &fakeCordoner{}
-	w, obs, dep := driftedWorker(t, false, false)
+	w, obs, dep := driftedWorker(t, false, nil)
 	m, client := newMatWithCordoner(t, c, dep)
 	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -873,7 +896,7 @@ func TestDriftIdleRollsWithoutCordon(t *testing.T) {
 // is still flagged draining — the roll gate is idleness, not the draining flag.
 func TestDriftIdleWhileDrainingStillRolls(t *testing.T) {
 	c := &fakeCordoner{}
-	w, obs, dep := driftedWorker(t, false, true)
+	w, obs, dep := driftedWorker(t, false, recentDrain())
 	m, client := newMatWithCordoner(t, c, dep)
 	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -890,7 +913,7 @@ func TestDriftIdleWhileDrainingStillRolls(t *testing.T) {
 // (fail-safe), no panic.
 func TestDriftBusyCordonErrorStillDefers(t *testing.T) {
 	c := &fakeCordoner{err: errors.New("api unreachable")}
-	w, obs, dep := driftedWorker(t, true, false)
+	w, obs, dep := driftedWorker(t, true, nil)
 	m, client := newMatWithCordoner(t, c, dep)
 	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -905,7 +928,7 @@ func TestDriftBusyCordonErrorStillDefers(t *testing.T) {
 
 // drift + busy + nil cordoner ⇒ roll deferred (no patch), no panic.
 func TestDriftBusyNilCordonerDefers(t *testing.T) {
-	w, obs, dep := driftedWorker(t, true, false)
+	w, obs, dep := driftedWorker(t, true, nil)
 	m, client := newMatWithCordoner(t, nil, dep)
 	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -932,5 +955,115 @@ func TestNoDriftBusyDoesNothing(t *testing.T) {
 	}
 	if wasPatched(client) {
 		t.Fatal("an undrifted worker was patched")
+	}
+}
+
+// --- bounded drain deadline + force-roll override (PRD #422 M5) -------------
+
+// drift + busy + draining RECENTLY (now - since < Deadline) + ForceRoll=false ⇒ the
+// deadline has not elapsed, so the worker is still deferred: no roll, and no re-cordon
+// (it is already draining).
+func TestDriftBusyWithinDeadlineDefers(t *testing.T) {
+	c := &fakeCordoner{}
+	w, obs, dep := driftedWorker(t, true, recentDrain()) // one minute ago
+	m, client := newMatWithDrain(t, c, DrainPolicy{Deadline: 24 * time.Hour}, dep)
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if wasPatched(client) {
+		t.Fatal("a busy worker within its drain deadline was rolled; it must stay deferred")
+	}
+	if len(c.calls) != 0 {
+		t.Fatalf("RequestDrain calls = %v, want none (already draining, within deadline)", c.calls)
+	}
+}
+
+// drift + busy + draining LONGER than the deadline (now - since >= Deadline) ⇒ the
+// controller rolls it anyway (its run requeues), and issues NO new cordon (already
+// draining).
+func TestDriftBusyDeadlineExceededRolls(t *testing.T) {
+	c := &fakeCordoner{}
+	since := m5Now.Add(-2 * time.Hour) // draining for 2h ...
+	w, obs, dep := driftedWorker(t, true, &since)
+	m, client := newMatWithDrain(t, c, DrainPolicy{Deadline: time.Hour}, dep) // ... against a 1h deadline
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !wasPatched(client) {
+		t.Fatal("a busy worker past its drain deadline was not rolled; the deadline must force the roll")
+	}
+	if len(c.calls) != 0 {
+		t.Fatalf("RequestDrain calls = %v, want none (already draining; no re-cordon on the deadline roll)", c.calls)
+	}
+}
+
+// drift + busy + ForceRoll=true (DrainingSince nil, never cordoned) ⇒ rolled immediately,
+// with NO cordon: the emergency override skips the cordon-and-defer path entirely.
+func TestDriftBusyForceRollRollsImmediatelyWithoutCordon(t *testing.T) {
+	c := &fakeCordoner{}
+	w, obs, dep := driftedWorker(t, true, nil)
+	m, client := newMatWithDrain(t, c, DrainPolicy{Deadline: 24 * time.Hour, ForceRoll: true}, dep)
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !wasPatched(client) {
+		t.Fatal("force-roll did not roll a busy drifted worker")
+	}
+	if len(c.calls) != 0 {
+		t.Fatalf("RequestDrain calls = %v, want none (force-roll skips cordoning)", c.calls)
+	}
+}
+
+// drift + busy + ForceRoll=true + already draining ⇒ still rolled (no re-cordon).
+func TestDriftBusyForceRollRollsAlreadyDraining(t *testing.T) {
+	c := &fakeCordoner{}
+	w, obs, dep := driftedWorker(t, true, recentDrain())
+	m, client := newMatWithDrain(t, c, DrainPolicy{Deadline: 24 * time.Hour, ForceRoll: true}, dep)
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !wasPatched(client) {
+		t.Fatal("force-roll did not roll an already-draining busy worker")
+	}
+	if len(c.calls) != 0 {
+		t.Fatalf("RequestDrain calls = %v, want none (already draining under force-roll)", c.calls)
+	}
+}
+
+// drift + IDLE under an aggressive policy (short deadline, force-roll on) ⇒ rolled with
+// no cordon, exactly as any idle drift: the overrides only concern busy workers.
+func TestDriftIdleRollsUnderAnyPolicy(t *testing.T) {
+	c := &fakeCordoner{}
+	w, obs, dep := driftedWorker(t, false, nil)
+	m, client := newMatWithDrain(t, c, DrainPolicy{Deadline: time.Nanosecond, ForceRoll: true}, dep)
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !wasPatched(client) {
+		t.Fatal("an idle drifted worker was not rolled")
+	}
+	if len(c.calls) != 0 {
+		t.Fatalf("RequestDrain calls = %v, want none for an idle worker", c.calls)
+	}
+}
+
+// NO drift + ForceRoll=true ⇒ NOTHING happens: force-roll only accelerates a PENDING
+// roll (a drifted worker), it never invents one. An undrifted worker returns before the
+// drift block is reached.
+func TestNoDriftForceRollDoesNothing(t *testing.T) {
+	c := &fakeCordoner{}
+	hash := currentHash(t, "w1", 0)
+	dep := deployedWorker("w1", 0, hash)
+	obs := []reconcile.ObservedWorker{{ID: "w1", HasDeployment: true, Generation: 0, SpecHash: hash}}
+	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, Busy: true}
+	m, client := newMatWithDrain(t, c, DrainPolicy{Deadline: time.Nanosecond, ForceRoll: true}, dep)
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if wasPatched(client) {
+		t.Fatal("force-roll rolled an UNDRIFTED worker; it must only accelerate a pending roll, never invent one")
+	}
+	if len(c.calls) != 0 {
+		t.Fatalf("RequestDrain calls = %v, want none (no drift)", c.calls)
 	}
 }

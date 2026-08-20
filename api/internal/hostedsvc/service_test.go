@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -376,16 +377,18 @@ func TestLateRegistrationSelfHealsAnExpiredRow(t *testing.T) {
 	}
 }
 
-// The busy/draining poll fields (PRD #422 M3) must round-trip from the store row into
-// the DesiredWorker DTO the controller reads. The two workers carry discriminating
-// values (busy-not-draining vs draining-not-busy) so a swapped or dropped field is
-// caught here, not just by the wire golden.
+// The busy/draining_since poll fields (PRD #422 M3/M5) must round-trip from the store
+// row into the DesiredWorker DTO the controller reads. The two workers carry
+// discriminating values (busy-not-draining vs draining-not-busy) so a swapped or dropped
+// field is caught here, not just by the wire golden. M5 asserts on DrainingSince
+// (nil vs the mapped timestamp), not a bool: draining == DrainingSince != nil.
 func TestPollCarriesBusyAndDraining(t *testing.T) {
 	st := newFakeStore()
 	svc := newTestService(t, st)
 
 	busyID := uuid.New()
 	drainID := uuid.New()
+	drainingAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	st.workers = append(st.workers,
 		store.ListHostedWorkersForControllerRow{
 			ID:               busyID,
@@ -393,7 +396,7 @@ func TestPollCarriesBusyAndDraining(t *testing.T) {
 			HostedSize:       pgtype.Text{String: "s", Valid: true},
 			HostedGeneration: 1,
 			Busy:             true,
-			Draining:         false,
+			DrainingSince:    pgtype.Timestamptz{Valid: false},
 		},
 		store.ListHostedWorkersForControllerRow{
 			ID:               drainID,
@@ -401,7 +404,7 @@ func TestPollCarriesBusyAndDraining(t *testing.T) {
 			HostedSize:       pgtype.Text{String: "l", Valid: true},
 			HostedGeneration: 2,
 			Busy:             false,
-			Draining:         true,
+			DrainingSince:    pgtype.Timestamptz{Time: drainingAt, Valid: true},
 		},
 	)
 
@@ -417,11 +420,11 @@ func TestPollCarriesBusyAndDraining(t *testing.T) {
 	for _, w := range resp.Workers {
 		byID[w.ID] = w
 	}
-	if got := byID[busyID.String()]; !got.Busy || got.Draining {
-		t.Fatalf("busy worker = %+v, want Busy=true Draining=false", got)
+	if got := byID[busyID.String()]; !got.Busy || got.DrainingSince != nil {
+		t.Fatalf("busy worker = %+v, want Busy=true DrainingSince=nil", got)
 	}
-	if got := byID[drainID.String()]; got.Busy || !got.Draining {
-		t.Fatalf("draining worker = %+v, want Busy=false Draining=true", got)
+	if got := byID[drainID.String()]; got.Busy || got.DrainingSince == nil || !got.DrainingSince.Equal(drainingAt) {
+		t.Fatalf("draining worker = %+v, want Busy=false DrainingSince=%v", got, drainingAt)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // wireContractFixture is the single golden file both sides of the controller
@@ -35,13 +36,13 @@ func samplePollResponse() PollResponse {
 			// A docker-capable worker: the controller renders it with the privileged
 			// DinD native sidecar in the docker namespace (PRD #83 M3).
 			Docker: true,
-			// Busy true, Draining false on this worker; the second is Busy false, Draining
-			// true — so BOTH states of BOTH fields appear on one wire and a drop of either
-			// field on either side reddens (PRD #422 M3), the same both-states rationale as
-			// Docker above.
-			Busy:      true,
-			Draining:  false,
-			JoinToken: &token,
+			// Busy true, DrainingSince nil on this worker; the second is Busy false,
+			// DrainingSince set — so BOTH states of BOTH fields appear on one wire and a drop
+			// of either field on either side reddens (PRD #422 M3/M5), the same both-states
+			// rationale as Docker above.
+			Busy:          true,
+			DrainingSince: nil,
+			JoinToken:     &token,
 		},
 		{
 			ID:         "22222222-2222-2222-2222-222222222222",
@@ -52,10 +53,11 @@ func samplePollResponse() PollResponse {
 			// namespace — both docker states on one wire so a drop of the field is a
 			// red build on both sides.
 			Docker: false,
-			// Busy false, Draining true: this worker is cordoned but idle — the mirror of
-			// the first worker, so both states of both fields ride one wire (PRD #422 M3).
-			Busy:     false,
-			Draining: true,
+			// Busy false, DrainingSince set: this worker is cordoned but idle — the mirror of
+			// the first worker, so both states of both fields ride one wire (PRD #422 M3/M5).
+			// A fixed time so the golden is stable.
+			Busy:          false,
+			DrainingSince: func() *time.Time { t := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC); return &t }(),
 			// No token to write: a pod already proved it holds one (its plaintext
 			// lives only in the cluster Secret now), or the buffer expired unread.
 			JoinToken: nil,

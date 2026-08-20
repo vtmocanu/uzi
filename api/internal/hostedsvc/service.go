@@ -177,11 +177,15 @@ func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 			// reads as false here — exactly the "no sidecar" the controller wants. No
 			// need to branch on Valid.
 			Docker: row.DockerEnabled.Bool,
-			// busy/draining feed the controller's cordon/defer-roll decision (PRD #422 M3).
-			// Both are computed as SQL booleans in ListHostedWorkersForController, so they
-			// arrive as plain Go bools here.
-			Busy:     row.Busy,
-			Draining: row.Draining,
+			// busy/draining_since feed the controller's cordon/defer-roll/deadline decision
+			// (PRD #422 M3/M4/M5). Busy is a SQL boolean; draining_since is the raw nullable
+			// cordon timestamp, mapped from pgtype.Timestamptz to *time.Time below (nil == not
+			// draining) so the stateless controller can compute how long it has been draining.
+			Busy: row.Busy,
+		}
+		if row.DrainingSince.Valid {
+			t := row.DrainingSince.Time
+			dw.DrainingSince = &t
 		}
 		if len(row.TokenCiphertext) > 0 {
 			plain, err := s.box.OpenWithAAD(row.TokenCiphertext, tokenAAD(row.ID))

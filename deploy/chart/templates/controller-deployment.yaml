@@ -144,6 +144,18 @@ spec:
             # env being absent. The controller rejects a non-integer or a value < 1.
             - name: UZI_WORKER_MAX_CONCURRENT_RUNS
               value: {{ .Values.workers.maxConcurrentRuns | quote }}
+            # PRD #422 M5 drain knobs. The deadline bounds how long a cordoned BUSY worker
+            # delays a deliberate roll before the controller rolls it anyway (its run
+            # requeues); force-roll is the emergency override that rolls every drifted
+            # worker regardless of busy. The deadline is with-gated (empty leaves the
+            # controller's built-in 24h default); force-roll is unconditional so the
+            # rendered pod carries the explicit false rather than an implied one.
+            {{- with .Values.workers.drainDeadline }}
+            - name: UZI_WORKER_DRAIN_DEADLINE
+              value: {{ . | quote }}
+            {{- end }}
+            - name: UZI_WORKER_FORCE_ROLL
+              value: {{ .Values.workers.forceRoll | default false | quote }}
             # The worker container's requests.ephemeral-storage (issue #224). Without
             # it a worker pod declares nothing for the resource and is therefore the
             # first thing kubelet evicts under node disk pressure, which destroys the

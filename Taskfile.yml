@@ -708,6 +708,14 @@ tasks:
     cmds:
       - ./scripts/assert-worker-tag-decoupled.sh
 
+  render:drain-knobs-check:
+    desc: assert the controller Deployment renders the drain-deadline + force-roll knobs (PRD 422 M5)
+    cmds:
+      # Standalone, NOT wired into gate:repo/gate: the lint job lacks helm, and the CI
+      # helm-render job is a maintainer hand-off (M7). Offline + non-vacuous — see the
+      # script header.
+      - ./scripts/assert-drain-knobs-render.sh
+
   scan:secrets:
     desc: gitleaks over every tracked file, with a canary proving the scanner ran
     cmds:

@@ -57,12 +57,15 @@ type DesiredWorker struct {
 	// M4). Mirrors the api's hostedsvc.DesiredWorker.Busy; the shared golden pins the two
 	// in lockstep.
 	Busy bool `json:"busy"`
-	// Draining is true when the worker has been cordoned (PRD #422 Decision 7): it keeps
-	// heartbeating and finishing its in-flight runs but claims nothing new, and the
-	// controller rolls it once idle. Mirrors the api's hostedsvc.DesiredWorker.Draining;
-	// the shared golden pins the two in lockstep.
-	Draining   bool  `json:"draining"`
-	Generation int64 `json:"generation"`
+	// DrainingSince is WHEN the worker was cordoned (PRD #422 Decision 7), or nil when it
+	// is not draining (nil == not draining). A cordoned worker keeps heartbeating and
+	// finishing its in-flight runs but claims nothing new. This side reads it to enforce
+	// the bounded drain deadline — the reconcile loop is stateless, so `now - draining_since`
+	// is the only elapsed-time signal it has (M5) — and to avoid re-cordoning a worker
+	// already draining (M4). Replaces M3's `draining` bool; mirrors the api's
+	// hostedsvc.DesiredWorker.DrainingSince, and the shared golden pins the two in lockstep.
+	DrainingSince *time.Time `json:"draining_since"`
+	Generation    int64      `json:"generation"`
 	// JoinToken is the plaintext, present only until a pod proves it holds it (by
 	// registering) or the api's buffer expires unread.
 	//
