@@ -64,6 +64,8 @@ Both summaries render as collapsible cards on the run detail view (**expanded by
 
 10. **Advisory, never a control.** The runner is **tool-less** (untrusted issue/PRD/plan text cannot drive any action), all summary text is rendered as text (web) and routed through `cellText` (CLI). The deltas are the model's interpretation at a human approval gate, so the UI frames them as an at-a-glance heads-up, **not** a substitute for reading the plan — a crafted issue/PRD could bias the deltas (e.g. hide a dropped security step), and the human still reads the real plan to decide.
 
+    > **Revised by issue #423 (2026-08-20):** the "rendered as text (web)" clause is superseded for the **intent** and **plan** cards only — they now render through the existing hardened `<Markdown>` sink (`web/src/pages/RunView.tsx`), the same untrusted-LLM trust boundary the judge `summary_md` already crosses (no `rehype-raw`; `stripUnsafeChars` runs before the parse). The **deltas** stay escaped plain text (inline badge-row layout), and the **CLI** still routes every summary string through `cellText`. The rest of Decision 10 is unchanged: the runner is still tool-less and the framing is still advisory. "Rendered as text (web)" was a conservative default, not a finding that markdown rendering is unsafe here.
+
 ## Milestones
 
 Each producer milestone **carries its own tests** (this repo validates per-milestone; deferring all tests to the end lets the H1/H2-class races land untested). M9 is cross-cutting/e2e only.

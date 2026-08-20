@@ -272,9 +272,16 @@ const DELTA_KIND: Record<string, { tone: BadgeTone; glyph: string; label: string
  *
  * The whole section is collapsible and the choice is remembered PER RUN for 7 days via
  * summaryCollapse (Decision 9); default expanded. All summary text is UNTRUSTED — model
- * output over an attacker-influenceable issue/PRD/plan — and is rendered as escaped plain
- * text through stripUnsafeChars, NEVER <Markdown> (Decision 10), the same rule report_md and
- * the judge summary_md follow.
+ * output over an attacker-influenceable issue/PRD/plan. The intent and plan paragraphs
+ * render through the shared hardened <Markdown> sink (issue #423, revising the "rendered as
+ * text (web)" clause of Decision 10) — the same untrusted-LLM trust boundary the judge
+ * summary_md already crosses: stripUnsafeChars runs BEFORE the parse (bidi/zero-width gone,
+ * even inside fenced code) and there is NO rehype-raw, so raw HTML stays inert text. The
+ * deltas stay escaped plain text through stripUnsafeChars: they render inline next to a
+ * badge and <Markdown>'s block-level docs-prose <p> would break that tight layout. The rest
+ * of Decision 10 holds — the runner is still tool-less (untrusted text drives no action) and
+ * the CLI still routes every summary string through cellText (plain). report_md (a different
+ * surface, issue #279) remains escaped plain text; see its own comment below.
  *
  * Exported for a direct render test: RunView itself needs routing, a live stream and a dozen
  * API mocks to mount, so the card states could not otherwise be asserted.
@@ -326,14 +333,18 @@ export function RunSummary({ run }: { run: Run }) {
               <h3 className="text-xs font-semibold uppercase tracking-wider text-faint">
                 What this run will implement
               </h3>
-              <p className="whitespace-pre-wrap text-sm text-muted">{stripUnsafeChars(intent)}</p>
+              <div className="judge-prose">
+                <Markdown content={intent} />
+              </div>
             </section>
           )}
 
           {hasPlan && (
             <section className="space-y-2">
               <h3 className="text-xs font-semibold uppercase tracking-wider text-faint">{planLabel}</h3>
-              <p className="whitespace-pre-wrap text-sm text-muted">{stripUnsafeChars(plan)}</p>
+              <div className="judge-prose">
+                <Markdown content={plan} />
+              </div>
 
               {/* Decision 6: the plan's deltas from the original ask, or a plain
                   "no deviations" line when the plan matches it (empty array or null). */}

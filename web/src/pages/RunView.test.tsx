@@ -346,13 +346,25 @@ describe("RunSummary (PRD #362 M4)", () => {
     expect(screen.getByText("No deviations — the plan matches the original ask")).toBeTruthy();
   });
 
-  it("renders summary text as escaped plain text, stripping bidi/format chars (Decision 10)", () => {
+  it("renders intent markdown as elements while keeping raw HTML inert and stripping bidi (issue #423)", () => {
+    // Intent/plan now render through the shared hardened <Markdown> (issue #423, revising the
+    // "rendered as text (web)" clause of Decision 10): markdown syntax becomes real elements,
+    // but raw HTML stays INERT text (the pipeline carries NO rehype-raw) and bidi/format chars
+    // are still stripped BEFORE the parse. RLO is written as an escape sequence, never a raw byte.
     const RLO = String.fromCodePoint(0x202e);
     const { container } = render(
-      <RunSummary run={run({ summary_intent: `Implement ${RLO}rate limiting` })} />,
+      <RunSummary
+        run={run({ summary_intent: `Call \`fireSweep\` with **max_issues** <script>alert(1)</script> ${RLO}rate limiting` })}
+      />,
     );
-    // No <Markdown> sink and no format characters survive to the DOM.
+    // Markdown parsed to real elements.
+    expect(container.querySelector("code")?.textContent).toBe("fireSweep");
+    expect(container.querySelector("strong")?.textContent).toBe("max_issues");
+    // Raw HTML did NOT become a live node (no rehype-raw)…
     expect(container.querySelector("script")).toBeNull();
+    // …but survives as inert text on the page.
+    expect(container.textContent ?? "").toContain("<script>alert(1)</script>");
+    // Bidi/format characters are still stripped.
     expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
   });
 
