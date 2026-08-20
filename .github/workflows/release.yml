@@ -164,9 +164,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v4
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@v4
         with:
-          cosign-release: 'v2.4.1'   # pinned; bump as cosign releases
+          # cosign 2.x emits classic signatures -- the broadest verifier + Kyverno
+          # compatibility. Installer v4 is REQUIRED for cosign v3.x (which defaults to
+          # the new Sigstore bundle format); before bumping cosign to v3, confirm the
+          # Kyverno version a consumer runs can verify that format.
+          cosign-release: 'v2.6.5'
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -208,9 +212,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v4
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@v4
         with:
-          cosign-release: 'v2.4.1'   # pinned; bump as cosign releases
+          # cosign 2.x emits classic signatures -- the broadest verifier + Kyverno
+          # compatibility. Installer v4 is REQUIRED for cosign v3.x (which defaults to
+          # the new Sigstore bundle format); before bumping cosign to v3, confirm the
+          # Kyverno version a consumer runs can verify that format.
+          cosign-release: 'v2.6.5'
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -242,9 +250,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v4
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@v4
         with:
-          cosign-release: 'v2.4.1'   # pinned; bump as cosign releases
+          # cosign 2.x emits classic signatures -- the broadest verifier + Kyverno
+          # compatibility. Installer v4 is REQUIRED for cosign v3.x (which defaults to
+          # the new Sigstore bundle format); before bumping cosign to v3, confirm the
+          # Kyverno version a consumer runs can verify that format.
+          cosign-release: 'v2.6.5'
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -283,9 +295,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v4
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@v4
         with:
-          cosign-release: 'v2.4.1'   # pinned; bump as cosign releases
+          # cosign 2.x emits classic signatures -- the broadest verifier + Kyverno
+          # compatibility. Installer v4 is REQUIRED for cosign v3.x (which defaults to
+          # the new Sigstore bundle format); before bumping cosign to v3, confirm the
+          # Kyverno version a consumer runs can verify that format.
+          cosign-release: 'v2.6.5'
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -330,9 +346,13 @@ jobs:
       - uses: azure/setup-helm@v5
         with:
           version: v3.21.3
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@v4
         with:
-          cosign-release: 'v2.4.1'   # pinned; bump as cosign releases
+          # cosign 2.x emits classic signatures -- the broadest verifier + Kyverno
+          # compatibility. Installer v4 is REQUIRED for cosign v3.x (which defaults to
+          # the new Sigstore bundle format); before bumping cosign to v3, confirm the
+          # Kyverno version a consumer runs can verify that format.
+          cosign-release: 'v2.6.5'
       - name: helm registry login (GHCR)
         # --password-stdin keeps the token out of the process argv.
         run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
@@ -343,11 +363,11 @@ jobs:
           # the package, so the published OCI artifact is self-contained for ArgoCD.
           helm dependency build deploy/chart
           helm package deploy/chart -d /tmp/chart
-          # helm push writes "Pushed:" + "Digest: sha256:…" to STDERR. tee (not a
-          # captured $()) so that on a push FAILURE the error is still printed before
-          # set -e/pipefail aborts the step; then sign the chart BY DIGEST (same keyless
-          # flow and same packages:write as the images -- the chart is just another OCI
-          # artifact).
+          # helm push writes "Pushed:" + "Digest: sha256:…" to STDOUT; the 2>&1 folds
+          # STDERR in too, and tee (not a captured $()) means a push FAILURE still
+          # prints its error before set -e/pipefail aborts the step. Then sign the chart
+          # BY DIGEST (same keyless flow and same packages:write as the images -- the
+          # chart is just another OCI artifact).
           helm push /tmp/chart/uzi-*.tgz oci://ghcr.io/vtmocanu/uzi 2>&1 | tee /tmp/helm-push.log
           digest="$(awk '/Digest:/ {print $2}' /tmp/helm-push.log)"
           case "$digest" in

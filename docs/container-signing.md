@@ -31,12 +31,16 @@ signature covers both tags a release pushes (`:X.Y.Z` and `:<short-sha>`).
 
 ## Verifying manually
 
+Use a current cosign to verify (v3.1.3 or newer is recommended; it carries the fix for
+the verification-bypass advisory GHSA-fx35-mq7g-6g98). A v3 cosign verifies uzi's
+signatures even though the release pipeline currently signs with cosign 2.x.
+
 Verification pins two things: who signed (the release workflow) and which OIDC issuer
 minted its token (GitHub Actions). For an image:
 
 ```sh
 cosign verify \
-  --certificate-identity-regexp 'https://github.com/vtmocanu/uzi/.github/workflows/release.yml@refs/tags/.*' \
+  --certificate-identity-regexp '^https://github\.com/vtmocanu/uzi/\.github/workflows/release\.yml@refs/tags/.*$' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   ghcr.io/vtmocanu/uzi/api:<version>
 ```
@@ -45,7 +49,7 @@ The Helm chart is verified the same way, against its OCI reference:
 
 ```sh
 cosign verify \
-  --certificate-identity-regexp 'https://github.com/vtmocanu/uzi/.github/workflows/release.yml@refs/tags/.*' \
+  --certificate-identity-regexp '^https://github\.com/vtmocanu/uzi/\.github/workflows/release\.yml@refs/tags/.*$' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   ghcr.io/vtmocanu/uzi/uzi:<chart-version>
 ```
@@ -67,7 +71,7 @@ imageVerification:
   enforce: Audit          # Audit (log only) | Enforce (block admission)
   imageGlob: "ghcr.io/vtmocanu/uzi/*"
   keyless:
-    identityRegexp: "https://github.com/vtmocanu/uzi/.github/workflows/release.yml@refs/tags/.*"
+    identityRegexp: '^https://github\.com/vtmocanu/uzi/\.github/workflows/release\.yml@refs/tags/.*$'
     issuer: "https://token.actions.githubusercontent.com"
 ```
 

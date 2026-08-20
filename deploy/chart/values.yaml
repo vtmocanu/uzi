@@ -68,7 +68,8 @@ imageVerification:
   #     …/release.yml ref.
   #   issuer — the OIDC issuer; GitHub Actions' is the constant below.
   keyless:
-    identityRegexp: "https://github.com/vtmocanu/uzi/.github/workflows/release.yml@refs/tags/.*"
+    # Single-quoted: the backslash-escaped dots are literal regex, not YAML escapes.
+    identityRegexp: '^https://github\.com/vtmocanu/uzi/\.github/workflows/release\.yml@refs/tags/.*$'
     issuer: "https://token.actions.githubusercontent.com"
 
 # --- api: the Go backend (sole holder of secrets/keys, the DB client) -----------
