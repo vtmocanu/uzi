@@ -12,8 +12,10 @@
 // Checks (fail the build): missing/invalid frontmatter (README.md exempt),
 // missing/duplicate `order` among the in-app-indexed audiences (`user` and,
 // since issue #75, `operator` — each in its own order namespace), broken
-// relative links (doc->doc and doc->img), and any docs/img/* over the per-image
-// byte budget.
+// relative links (doc->doc and doc->img), stale backticked `prds/…`/`adr/…`
+// artifact paths (issue #189 — backticks are not links, so the link check is
+// blind to them; opt a line out with `check-docs:ignore-path`), and any
+// docs/img/* over the per-image byte budget.
 // Warns (does not fail): a `user` page whose body exceeds the line budget.
 import { readFileSync, readdirSync, existsSync, statSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -263,7 +265,60 @@ for (const dir of ["specs", "prds", "adr"]) {
   }
 }
 
+// Backticked artifact-path check (issue #189). A path written in `backticks` is
+// NOT a markdown link, so extractTargets/the link check above is structurally
+// blind to it — and every `git mv prds/X.md prds/done/X.md` silently rots its
+// inbound backtick references (specs/*.md cite PRDs this way in bulk). This closes
+// that blind spot without touching the link check.
+//
+// Scope + gating mirror the link check: `prds/…`/`adr/…` are repo-root-relative
+// targets that only exist in a full checkout (the web image build COPYs only web/
+// and docs/), so this runs inside `if (fullCheckout)` and resolves from repoRoot.
+//
+// It validates ONLY a token matching a STRICT real-artifact filename shape that
+// contains NO glob/regex/placeholder metacharacter. That is what keeps the many
+// legitimate illustrative forms — `prds/*.md`, `prds/[\w.-]+\.md`, `prds/<file>.md`,
+// `prds/${iid}-x.md` — from being flagged, while a real, moved path still is.
+// Fenced ``` code blocks are skipped (command/example snippets), inline `code`
+// spans are scanned (that is where the rot lives). A line carrying the
+// `check-docs:ignore-path` marker opts out — for the residual didactic examples
+// (`prds/done/72-x.md`) and forward-references to not-yet-created artifacts
+// (an ADR a PRD's M0 will add).
+const ARTIFACT_SHAPE = /^(?:prds\/(?:done\/)?\d+-[a-z0-9.-]+|adr\/\d{4}-[a-z0-9.-]+)\.md$/;
+const PLACEHOLDER_META = /[*<>[\]\\(){}$?…]/;
+const OPT_OUT_MARKER = "check-docs:ignore-path";
+function checkBacktickArtifactPaths(rel, raw) {
+  let inFence = false;
+  raw.split("\n").forEach((line, i) => {
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence;
+      return;
+    }
+    if (inFence || line.includes(OPT_OUT_MARKER)) return;
+    for (const m of line.matchAll(/`([^`\n]+?)`/g)) {
+      // Match a path token ANYWHERE in the inline span, not just at its start, so
+      // `see prds/72-x.md` is caught as well as a bare `prds/72-x.md`. The lookbehind
+      // excludes a token that is a suffix of a longer word or a `../`-relative form;
+      // the strict shape + metacharacter filter below (not the position) is what
+      // keeps legitimate globs/regex/placeholders from being flagged.
+      for (const tm of m[1].matchAll(/(?<![\w./-])((?:prds|adr)\/[^\s`]+?\.md)/g)) {
+        const p = tm[1];
+        if (PLACEHOLDER_META.test(p) || !ARTIFACT_SHAPE.test(p)) continue;
+        if (existsSync(path.join(repoRoot, p))) continue;
+        const base = path.basename(p);
+        const moved = !p.includes("/done/") && existsSync(path.join(repoRoot, "prds", "done", base));
+        fail(rel, `stale backticked artifact path \`${p}\` (line ${i + 1}) — file not found${moved ? ` (moved to prds/done/${base}?)` : ""}`);
+      }
+    }
+  });
+}
+
 if (fullCheckout) {
+  for (const rel of [...extraLinkFiles, ...files.map((f) => path.join("docs", f))]) {
+    const abs = path.join(repoRoot, rel);
+    if (!existsSync(abs)) continue; // optional files
+    checkBacktickArtifactPaths(rel, readFileSync(abs, "utf8"));
+  }
   for (const rel of extraLinkFiles) {
     const abs = path.join(repoRoot, rel);
     if (!existsSync(abs)) continue; // optional files

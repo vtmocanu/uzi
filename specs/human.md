@@ -27,7 +27,7 @@ here must hold in any rebuild. Do not edit without user approval.
 
 ## Feature #1 — Simple WebUI with user registration
 
-Tracked as GitLab issue vtmocanu/uzi#1; PRD at `prds/1-simple-webui-user-registration.md`.
+Tracked as GitLab issue vtmocanu/uzi#1; PRD at `prds/done/1-simple-webui-user-registration.md`.
 
 - Simple web UI with user support and registration.
 - Plain user/password registration stored in the DB.
@@ -39,7 +39,7 @@ Tracked as GitLab issue vtmocanu/uzi#1; PRD at `prds/1-simple-webui-user-registr
 
 ## Feature #2 — Forge integration & label-synced kanban
 
-Tracked as GitLab issue vtmocanu/uzi#2; PRD at `prds/2-forge-integration-kanban.md`.
+Tracked as GitLab issue vtmocanu/uzi#2; PRD at `prds/done/2-forge-integration-kanban.md`.
 
 - Forge-generic design: GitLab and Forgejo both supported at full parity (Forgejo added by PRD #65, 2026-07-17).
 - Each user creates their own GitLab bot account + PAT, adds it as Developer to the projects they choose.
@@ -51,7 +51,7 @@ Tracked as GitLab issue vtmocanu/uzi#2; PRD at `prds/2-forge-integration-kanban.
 
 ## Feature #3 — Agent templates & per-user Anthropic token
 
-Tracked as GitLab issue vtmocanu/uzi#3; PRD at `prds/3-agent-templates-anthropic-tokens.md`.
+Tracked as GitLab issue vtmocanu/uzi#3; PRD at `prds/done/3-agent-templates-anthropic-tokens.md`.
 
 - Agent templates stored in the DB, editable via the UI (the agents themselves sit with the code).
 - Admin-only template writes; all authenticated users can read/preview. [AI-proposed, user-confirmed 2026-07-03]
@@ -62,7 +62,7 @@ Tracked as GitLab issue vtmocanu/uzi#3; PRD at `prds/3-agent-templates-anthropic
 
 ## Feature #4 — Agent runtime: workers, job queue & live run view
 
-Tracked as GitLab issue vtmocanu/uzi#4; PRD at `prds/4-agent-runtime-workers.md`.
+Tracked as GitLab issue vtmocanu/uzi#4; PRD at `prds/done/4-agent-runtime-workers.md`.
 
 - Implement the agent-runtime/workers PRD: act on a PRD card — run an agent, watch it live, correct it, land an MR.
 - Agent execution uses the Claude Agent SDK. NOT agent-deck's real-Claude-Code/PTY approach (deferred, maybe later).
@@ -75,7 +75,7 @@ Tracked as GitLab issue vtmocanu/uzi#4; PRD at `prds/4-agent-runtime-workers.md`
 
 ## Feature #5 — Access control: registration restrictions & PAT least-privilege
 
-Tracked as GitLab issue vtmocanu/uzi#5; PRD at `prds/5-access-control-pat-hardening.md`.
+Tracked as GitLab issue vtmocanu/uzi#5; PRD at `prds/done/5-access-control-pat-hardening.md`.
 
 - Registration restricted to a configurable email-domain allowlist (plan.md: "allow registration only from @example.com - configurable"; empty = all domains).
 - Registration can be enabled/disabled (kill-switch).
@@ -85,7 +85,7 @@ Tracked as GitLab issue vtmocanu/uzi#5; PRD at `prds/5-access-control-pat-harden
 
 ## Feature #6 — CI status integration & CI-fix agent
 
-Tracked as GitLab issue vtmocanu/uzi#6; PRD at `prds/6-ci-status-integration.md`.
+Tracked as GitLab issue vtmocanu/uzi#6; PRD at `prds/done/6-ci-status-integration.md`.
 
 - Check and display GitLab CI/pipeline status in uzi (repo view, board header, per-card).
 - When CI is broken, spin up an agent to review what happened and fix it if it can.
@@ -98,7 +98,7 @@ Tracked as GitLab issue vtmocanu/uzi#6; PRD at `prds/6-ci-status-integration.md`
 
 ## Feature #7 — In-app docs section
 
-Tracked as GitLab issue vtmocanu/uzi#7; PRD at `prds/7-docs-section-webui.md`.
+Tracked as GitLab issue vtmocanu/uzi#7; PRD at `prds/done/7-docs-section-webui.md`.
 
 - A docs section on uzi with relevant howtos: how to create an agent/bot, how to do GitLab bots / give permissions, etc.
 - Include screenshots; screenshots are provided by the user (ask the user for them).
@@ -106,7 +106,7 @@ Tracked as GitLab issue vtmocanu/uzi#7; PRD at `prds/7-docs-section-webui.md`.
 
 ## Feature #28 — Docs search
 
-Tracked as GitLab issue vtmocanu/uzi#28; PRD at `prds/28-docs-search.md`.
+Tracked as GitLab issue vtmocanu/uzi#28; PRD at `prds/done/28-docs-search.md`.
 
 - A search box for the docs page.
 - Full-text search with snippets (not a title/summary filter).
@@ -114,7 +114,7 @@ Tracked as GitLab issue vtmocanu/uzi#28; PRD at `prds/28-docs-search.md`.
 
 ## Feature #11 — Run view UX: markdown plan, boxed activity, terse events
 
-Tracked as GitLab issue vtmocanu/uzi#11; PRD at `prds/11-run-view-ux.md`.
+Tracked as GitLab issue vtmocanu/uzi#11; PRD at `prds/done/11-run-view-ux.md`.
 
 - Plan (and agent prose) renders as formatted markdown, not raw `#`/`-`/backticks.
 - Activity feed is a bounded, scrollable box that auto-scrolls (follows) live runs; scrolling up pauses following without fighting the user; a "{n} new ↓" affordance resumes it in one click.
@@ -126,7 +126,7 @@ Tracked as GitLab issue vtmocanu/uzi#11; PRD at `prds/11-run-view-ux.md`.
 
 ## Feature #38 — Activity feed redesign
 
-Tracked as GitLab issue vtmocanu/uzi#38; PRD at `prds/38-activity-feed-redesign.md`.
+Tracked as GitLab issue vtmocanu/uzi#38; PRD at `prds/done/38-activity-feed-redesign.md`.
 
 - The run Activity feed is polished/redesigned per the approved mock.
 - Bash commands render as highlighted code, not plain text; no command content is lost in the UI.
@@ -135,7 +135,7 @@ Tracked as GitLab issue vtmocanu/uzi#38; PRD at `prds/38-activity-feed-redesign.
 
 ## Feature #12 — Board–run lifecycle integration
 
-Tracked as GitLab issue vtmocanu/uzi#12; PRD at `prds/12-board-run-lifecycle.md`.
+Tracked as GitLab issue vtmocanu/uzi#12; PRD at `prds/done/12-board-run-lifecycle.md`.
 
 - Issues move board columns automatically with the run lifecycle: In Progress while agents work, a review column once the MR is open. Hand-dragging is the defect being fixed.
 - The board shows that runs happened/are happening: run badges + MR link on the card; the board updates itself (no manual Refresh).
@@ -155,7 +155,7 @@ Tracked as GitLab issue vtmocanu/uzi#14; PRD at `prds/done/14-multica-ui-redesig
 
 ## Feature #16 — Agent skills (global / user / builtin / repo)
 
-Tracked as GitLab issue vtmocanu/uzi#16; PRD at `prds/16-agent-skills.md`.
+Tracked as GitLab issue vtmocanu/uzi#16; PRD at `prds/done/16-agent-skills.md`.
 
 - Skills exist at global scope and per-user scope (plan.md line 44).
 - Users allocate global skills or their own skills to each agent.
@@ -165,7 +165,7 @@ Tracked as GitLab issue vtmocanu/uzi#16; PRD at `prds/16-agent-skills.md`.
 
 ## Feature #17 — Builtin lead template (opus) + worker model selection
 
-Tracked as GitLab issue vtmocanu/uzi#17; PRD at `prds/17-lead-template-and-model-selection.md`.
+Tracked as GitLab issue vtmocanu/uzi#17; PRD at `prds/done/17-lead-template-and-model-selection.md`.
 
 - Ship `lead` as a builtin agent template with a real orchestrator prompt, on model `opus`; editable and resettable in the UI like the other builtins.
 - Builtin templates are the single source of truth; `.claude/agents/` is the dev team's own roster only. Decouples the former 1:1 mirror. [user, 2026-07-05, supersedes the earlier "both dirs" choice]
@@ -176,7 +176,7 @@ Tracked as GitLab issue vtmocanu/uzi#17; PRD at `prds/17-lead-template-and-model
 
 ## Feature #18 — Worker templates, per-repo tools & agent scopes
 
-Tracked as GitLab issue vtmocanu/uzi#18; PRD at `prds/18-worker-templates-and-agent-scopes.md`.
+Tracked as GitLab issue vtmocanu/uzi#18; PRD at `prds/done/18-worker-templates-and-agent-scopes.md`.
 
 - Curated worker image templates in git so different workers can carry different heavy toolchains (e.g. node tools vs java tools); the user picks one per worker.
 - Per-repo CLI tools installed on demand (so "command not found" stops being a dead end), from a user tool profile bounded by an admin allowlist, plus an opt-in for a repo's own devbox.json packages.
@@ -184,7 +184,7 @@ Tracked as GitLab issue vtmocanu/uzi#18; PRD at `prds/18-worker-templates-and-ag
 
 ## Feature #19 — Admin settings & autopilot label
 
-Tracked as GitLab issue vtmocanu/uzi#19; PRD at `prds/19-admin-settings-and-autopilot.md`.
+Tracked as GitLab issue vtmocanu/uzi#19; PRD at `prds/done/19-admin-settings-and-autopilot.md`.
 
 - Generic admin-only instance-settings infrastructure; the PRD label and the autopilot label are its first two configurable keys.
 - Admins can change the PRD label and the autopilot label; the board reflects the new label set after a resync (no code fork).
@@ -197,7 +197,7 @@ Tracked as GitLab issue vtmocanu/uzi#19; PRD at `prds/19-admin-settings-and-auto
 
 ## Feature #21 — Mission-control theme (second selectable theme)
 
-Tracked as GitLab issue vtmocanu/uzi#21; PRD at `prds/21-mission-control-theme.md`.
+Tracked as GitLab issue vtmocanu/uzi#21; PRD at `prds/done/21-mission-control-theme.md`.
 
 - Mission-control theme (one of three evaluated prototypes) must be selectable in the product.
 - Prototype branches preserved on origin: `prototype/mission-control` and `prototype/minimal`.
@@ -208,7 +208,7 @@ Tracked as GitLab issue vtmocanu/uzi#21; PRD at `prds/21-mission-control-theme.m
 
 ## Feature #22 — PRDLESS label: run an issue without a PRD link
 
-Tracked as GitLab issue vtmocanu/uzi#22; PRD at `prds/22-prdless-label.md`.
+Tracked as GitLab issue vtmocanu/uzi#22; PRD at `prds/done/22-prdless-label.md`.
 
 - An escape-hatch label lets an issue run without a `prds/*.md` link.
 - Label name is configurable; the feature can be toggled on/off — both in admin settings.
@@ -218,7 +218,7 @@ Tracked as GitLab issue vtmocanu/uzi#22; PRD at `prds/22-prdless-label.md`.
 
 ## Feature #23 — Web UX polish: live dashboard, collapsible sidebar, hide empty board columns
 
-Tracked as GitLab issue vtmocanu/uzi#23; PRD at `prds/23-web-ux-live-dashboard-sidebar-board.md`.
+Tracked as GitLab issue vtmocanu/uzi#23; PRD at `prds/done/23-web-ux-live-dashboard-sidebar-board.md`.
 
 - Dashboard updates live: a run reaching `awaiting_approval` must show without a manual refresh.
 - Desktop sidebar is collapsible.
@@ -247,7 +247,7 @@ Tracked as GitLab issue vtmocanu/uzi#24; PRD at `prds/done/24-mr-close-rework.md
 
 ## Feature #25 — Slack integration: run notifications, approve from Slack, reply-from-Slack
 
-Tracked as GitLab issue vtmocanu/uzi#25; PRD at `prds/25-slack-integration.md`.
+Tracked as GitLab issue vtmocanu/uzi#25; PRD at `prds/done/25-slack-integration.md`.
 
 - Per-user Slack DMs for run state (started, awaiting approval, completed + MR link, failed, cancelled).
 - Approve/reject the plan-approval gate from Slack: buttons + threaded reject reason.
@@ -259,7 +259,7 @@ Tracked as GitLab issue vtmocanu/uzi#25; PRD at `prds/25-slack-integration.md`.
 
 ## Feature #32 — Per-user vault: password-wrapped secrets
 
-Tracked as GitLab issue vtmocanu/uzi#32; PRD at `prds/32-user-vault-password-wrapped-secrets.md`.
+Tracked as GitLab issue vtmocanu/uzi#32; PRD at `prds/done/32-user-vault-password-wrapped-secrets.md`.
 
 - Threat: a k8s operator can read env/Infisical/etcd (master key) plus the DB and decrypt every user's Anthropic token. etcd encryption at rest is not an option. [user-stated threat model]
 - Goal is to make token theft materially harder, not impossible — no decryption key at rest anywhere an operator can read. [user accepts residual risks: memory dump, trojaned image]
@@ -270,7 +270,7 @@ Tracked as GitLab issue vtmocanu/uzi#32; PRD at `prds/32-user-vault-password-wra
 
 ## Feature #37 — Per-run agent selection: repo `.claude/agents` detection with plan-gate choice
 
-Tracked as GitLab issue vtmocanu/uzi#37; PRD at `prds/37-run-agent-selection.md`.
+Tracked as GitLab issue vtmocanu/uzi#37; PRD at `prds/done/37-run-agent-selection.md`.
 
 - At the plan-approval gate, the user chooses which agents the run uses: the repo's own agents (detected from `.claude/agents/`) or the user's uzi templates. [user 2026-07-10]
 - Show whether repo agents were detected and which ones. [user 2026-07-10]
@@ -283,13 +283,13 @@ Tracked as GitLab issue vtmocanu/uzi#37; PRD at `prds/37-run-agent-selection.md`
 
 ## Feature #41 — Plan revision at the approval gate
 
-Tracked as GitLab issue vtmocanu/uzi#41; PRD at `prds/41-plan-revision-gate.md`.
+Tracked as GitLab issue vtmocanu/uzi#41; PRD at `prds/done/41-plan-revision-gate.md`.
 
 - At the plan gate the user can request changes (bounded rounds) to steer the plan without killing the run.
 
 ## Feature #40 — Token usage & cost reporting (per run / per user / factory-wide)
 
-Tracked as GitLab issue vtmocanu/uzi#40; PRD at `prds/40-token-usage-reporting.md`.
+Tracked as GitLab issue vtmocanu/uzi#40; PRD at `prds/done/40-token-usage-reporting.md`.
 
 - Report token usage and cost per run, per user, and factory-wide. [user]
 - Run view shows the run's usage, broken down per phase and per agent ("coder used 800k"). [user 2026-07-12]
@@ -301,7 +301,7 @@ Tracked as GitLab issue vtmocanu/uzi#40; PRD at `prds/40-token-usage-reporting.m
 
 ## Feature — Run retrospective (LLM judge) & self-improvement job
 
-Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/46-run-judge-self-improvement.md`
+Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/done/46-run-judge-self-improvement.md`
 (supersedes plan.md:64/69/91).
 
 - **Run retrospective (LLM judge)**: after a run finishes, an LLM reviews the run
@@ -384,7 +384,7 @@ Tracked as GitLab issue vtmocanu/uzi#45; PRD at `prds/done/45-oidc-sso-login.md`
 
 ## Feature #47 — Loop/hang detection
 
-Tracked as GitLab issue vtmocanu/uzi#47; PRD at `prds/47-loop-hang-detection.md`.
+Tracked as GitLab issue vtmocanu/uzi#47; PRD at `prds/done/47-loop-hang-detection.md`.
 
 - Detect runs that are taking too long or seem stuck, and flag them. (plan.md line 68)
 - Flags surface in the web UI and on Slack.
@@ -401,7 +401,7 @@ Tracked as GitLab issue vtmocanu/uzi#47; PRD at `prds/47-loop-hang-detection.md`
 
 ## Feature #49 — Worker resource stats (live per-worker CPU/memory)
 
-Tracked as GitLab issue vtmocanu/uzi#49; PRD at `prds/49-worker-resource-stats.md`.
+Tracked as GitLab issue vtmocanu/uzi#49; PRD at `prds/done/49-worker-resource-stats.md`.
 
 - Live per-worker CPU and memory visibility in the uzi web UI ("worker resource stats"). [user 2026-07-14]
 - Per-worker granularity is sufficient; no per-run attribution. [user-confirmed]
@@ -416,7 +416,7 @@ Tracked as GitLab issue vtmocanu/uzi#52; PRD at `prds/done/52-cicd-argocd-deploy
 
 ## Feature #53 — Per-user Claude rate-limit visibility
 
-Tracked as GitLab issue vtmocanu/uzi#53; PRD at `prds/53-rate-limits.md`.
+Tracked as GitLab issue vtmocanu/uzi#53; PRD at `prds/done/53-rate-limits.md`.
 
 - Show each user's Anthropic account rate-limit headroom (5-hour and 7-day windows) in the uzi web UI.
 - Users see their own meters; admins see every user's, on one page (mirrors the PRD #40 usage split).
@@ -426,7 +426,7 @@ Tracked as GitLab issue vtmocanu/uzi#53; PRD at `prds/53-rate-limits.md`.
 
 ## Feature #55 — OIDC group → role/access mapping (Keycloak / Pocket ID)
 
-Tracked as GitLab issue vtmocanu/uzi#55; PRD at `prds/55-oidc-group-mapping.md`. Builds on PRD #45 (OIDC SSO).
+Tracked as GitLab issue vtmocanu/uzi#55; PRD at `prds/done/55-oidc-group-mapping.md`. Builds on PRD #45 (OIDC SSO).
 
 - On a shared/team deployment the IdP owns who is admin (and optionally who may log in), replacing the first-login-race / env-seed model. [user 2026-07-16]
 - Two configurable comma-separated group lists: an admin-groups list (membership ⇒ is_admin) and an allowed-groups list (membership required to SSO-login / JIT-provision at all); empty = that feature off. [user 2026-07-16]
@@ -454,7 +454,7 @@ Tracked as GitLab issue vtmocanu/uzi#58 (closed); PRD at `prds/done/58-hosted-k8
 
 ## Feature #64 — uzi CLI: terminal control for humans and agents
 
-Tracked as GitLab issue vtmocanu/uzi#64; PRD at `prds/64-uzi-cli.md`.
+Tracked as GitLab issue vtmocanu/uzi#64; PRD at `prds/done/64-uzi-cli.md`.
 
 - A `uzi` CLI shipped in this repo, installed via the existing `vtmocanu/homebrew-tap`.
 - Driven identically by humans (tables on a TTY) and agents/CI (`--json`, documented exit codes).
@@ -482,7 +482,7 @@ Tracked as GitLab issue vtmocanu/uzi#72; PRD at `prds/done/72-prd-lifecycle-in-r
 
 ## Feature #83 — Docker-capable worker
 
-Tracked as GitLab issue vtmocanu/uzi#83; PRD at `prds/83-docker-capable-worker.md`.
+Tracked as GitLab issue vtmocanu/uzi#83; PRD at `prds/done/83-docker-capable-worker.md`.
 
 - Workers must be able to run Docker/Compose projects (uzi's own e2e/smoke need `docker compose up`). [user]
 - The default worker has docker + python + go available. [user]
@@ -492,7 +492,7 @@ Tracked as GitLab issue vtmocanu/uzi#83; PRD at `prds/83-docker-capable-worker.m
 
 ## Feature #95 — Run activity pane v2: crew roster, opt-in follow, steer-queue delivery
 
-Tracked as GitLab issue vtmocanu/uzi#95; PRD at `prds/95-activity-pane-v2.md`. Rebuilds Feature #38 (activity feed); the follow behavior amends Feature #11.
+Tracked as GitLab issue vtmocanu/uzi#95; PRD at `prds/done/95-activity-pane-v2.md`. Rebuilds Feature #38 (activity feed); the follow behavior amends Feature #11.
 
 - Three user-reported UX problems to fix:
   - The activity pane must not auto-scroll / jerk to the bottom on every incoming frame — watch a live run without being dragged along. [user 2026-07-20]
@@ -522,7 +522,7 @@ can be assumed.
 
 ## Feature #102 — Board v2: column rename, label chips, manual order, non-PRD issues
 
-Tracked as GitLab issue vtmocanu/uzi#102; PRD at `prds/102-board-v2.md`.
+Tracked as GitLab issue vtmocanu/uzi#102; PRD at `prds/done/102-board-v2.md`.
 
 - The implicit no-label column is called `Backlog`, not `Open`. Display only; it is not a forge label. [user 2026-07-20]
 - The seeded `Upcoming` column label is renamed `Planned` and seeds first, before In Progress: Backlog | Planned | In Progress | Human Review | Later. Existing boards are not migrated automatically. [user 2026-07-20]
@@ -554,7 +554,7 @@ Mock at `prds/mockups/113-worker-upgrade-status-mock.html`.
 
 ## Feature #121 — Pre-provision a cloned repo's JS dependencies
 
-Tracked as GitLab issue vtmocanu/uzi#121; PRD at `prds/121-clone-js-deps-provision.md`.
+Tracked as GitLab issue vtmocanu/uzi#121; PRD at `prds/done/121-clone-js-deps-provision.md`.
 
 **Ratified [user 2026-07-27].** Derived by the team during implementation and put to the
 owner, rather than stated up front: the original trust-posture premise was found false
@@ -571,7 +571,7 @@ during the work, and the constraint below is what replaced it.
 
 ## Feature #111 — Auto-select the Anthropic token per run
 
-Tracked as GitLab issue vtmocanu/uzi#111; PRD at `prds/111-auto-select-anthropic-token.md`.
+Tracked as GitLab issue vtmocanu/uzi#111; PRD at `prds/done/111-auto-select-anthropic-token.md`.
 
 - A worker can choose its Anthropic token automatically from a pool the user opts in, preferring the account with the most headroom. [user, the originating ask on #111]
 - Every run shows which token it actually used. [user, same ask]
@@ -600,7 +600,7 @@ ADR at `adr/0035-run-limit-retry.md`.
 
 ## Feature #218 — A park or shutdown must not lose the agent's committed work
 
-Tracked as GitLab issue vtmocanu/uzi#218; PRD at `prds/218-park-resume-work-loss.md`.
+Tracked as GitLab issue vtmocanu/uzi#218; PRD at `prds/done/218-park-resume-work-loss.md`.
 
 - When a run parks on a usage limit, or its worker is shut down or evicted, the
   work the agent has already committed must survive: a resume finds those commits,
@@ -613,7 +613,7 @@ Tracked as GitLab issue vtmocanu/uzi#218; PRD at `prds/218-park-resume-work-loss
 
 ## Feature #88 — Ask-user clarification: the agent can ask the human a question
 
-Tracked as GitLab issue vtmocanu/uzi#88; PRD at `prds/88-ask-user-clarification.md`.
+Tracked as GitLab issue vtmocanu/uzi#88; PRD at `prds/done/88-ask-user-clarification.md`.
 
 - An agent can ask the user a clarifying question and wait for the answer, before
   and during a run. [user, the originating ask on #88]
@@ -623,7 +623,7 @@ Tracked as GitLab issue vtmocanu/uzi#88; PRD at `prds/88-ask-user-clarification.
 
 ## Feature #175 — Build info in the UI: version badge popover, endpoint and CLI parity
 
-Tracked as GitLab issue vtmocanu/uzi#175; PRD at `prds/175-build-info-popover.md`.
+Tracked as GitLab issue vtmocanu/uzi#175; PRD at `prds/done/175-build-info-popover.md`.
 
 **Ratified [user 2026-07-28].** The user asked for the feature and stated no design
 requirement; the team decided its shape. The two below were put to the owner because

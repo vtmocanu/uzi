@@ -918,7 +918,7 @@ every subagent).
 
 A run's PRD-completion declaration is readable the same way:
 `uzi run get <id> --field prd_done_path` (the repo-relative path the run
-declared it moved a completed PRD to, e.g. `prds/done/72-x.md`) and
+declared it moved a completed PRD to, e.g. `prds/done/72-x.md`) and <!-- check-docs:ignore-path: didactic example path, not a real PRD -->
 `uzi run get <id> --field prd_patch_settled_at` (an RFC3339 timestamp once
 the PRD-link patch lifecycle has settled, an empty line while still
 pending). Both are emit-only-when-set on the human view too — `run get`
