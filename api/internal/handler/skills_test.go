@@ -318,6 +318,130 @@ func TestGetSkillNotFoundVsFound(t *testing.T) {
 	})
 }
 
+// emptyViewerRows is an empty-but-valid pgx.Rows: Next() is immediately false, so a
+// list handler walks zero rows and reaches a clean 200. The arg capture that the
+// *ForViewer pass-through tests rely on happens at the Query call, before any row is
+// walked, so an empty result set is all these tests need. Shared by every list-site
+// guard (ListSkills, ListAgentTemplates, ListTemplateAllocations) and by the
+// GetTemplateSkills allocation listing.
+type emptyViewerRows struct{}
+
+func (*emptyViewerRows) Next() bool                    { return false }
+func (*emptyViewerRows) Scan(...any) error             { return nil }
+func (*emptyViewerRows) Close()                        {}
+func (*emptyViewerRows) Err() error                    { return nil }
+func (*emptyViewerRows) CommandTag() pgconn.CommandTag { return pgconn.CommandTag{} }
+func (*emptyViewerRows) FieldDescriptions() []pgconn.FieldDescription {
+	return nil
+}
+func (*emptyViewerRows) Values() ([]any, error) { return nil, nil }
+func (*emptyViewerRows) RawValues() [][]byte    { return nil }
+func (*emptyViewerRows) Conn() *pgx.Conn        { return nil }
+
+// fakeViewerListDB is a store.DBTX for the list-endpoint *ForViewer queries. Like
+// fakeSkillDB it CAPTURES the raw positional args of the Query call — a fake that
+// answered purely from its own fixture could not observe WHICH params the handler
+// built, so it could not see the IsAdmin/ViewerID pass-through bug the guards pin.
+// It returns an empty-but-valid result so the handler reaches 200.
+type fakeViewerListDB struct {
+	gotArgs []any
+	called  bool
+}
+
+func (*fakeViewerListDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, nil
+}
+func (f *fakeViewerListDB) Query(_ context.Context, _ string, args ...any) (pgx.Rows, error) {
+	f.called = true
+	f.gotArgs = args
+	return &emptyViewerRows{}, nil
+}
+func (*fakeViewerListDB) QueryRow(context.Context, string, ...any) pgx.Row {
+	return fakeScanRow{func(...any) error { return pgx.ErrNoRows }}
+}
+
+// viewerQueryArgs unpacks the (is_admin, viewer_id) pair from a captured list-query
+// arg slice. The two *ForViewer list queries do not agree on positional order —
+// ListSkillsForViewer/ListAgentTemplatesForViewer bind (is_admin, viewer_id) while
+// ListTemplateAllocationsForViewer binds (viewer_id, is_admin) — so the caller passes
+// the indices. The t.Fatalf type guards (not comma-ok into a zero value) are what keep
+// the non-admin assertion honest: a mismatched capture must fail loudly, never yield a
+// false that vacuously satisfies "is_admin must be false". See skillQueryArgs.
+func viewerQueryArgs(t *testing.T, args []any, called bool, isAdminIdx, viewerIdx int) (bool, pgtype.UUID) {
+	t.Helper()
+	if !called {
+		t.Fatal("the *ForViewer list query was never executed")
+	}
+	if len(args) != 2 {
+		t.Fatalf("query got %d args, want 2 (is_admin, viewer_id in some order): %#v", len(args), args)
+	}
+	isAdmin, ok := args[isAdminIdx].(bool)
+	if !ok {
+		t.Fatalf("arg %d (is_admin) = %#v, want bool", isAdminIdx, args[isAdminIdx])
+	}
+	viewer, ok := args[viewerIdx].(pgtype.UUID)
+	if !ok {
+		t.Fatalf("arg %d (viewer_id) = %#v, want pgtype.UUID", viewerIdx, args[viewerIdx])
+	}
+	return isAdmin, viewer
+}
+
+// listSkillsRec drives ListSkills (GET, no path param) as actor.
+func listSkillsRec(t *testing.T, db store.DBTX, actor store.User) *httptest.ResponseRecorder {
+	t.Helper()
+	h := &Handler{q: store.New(db)}
+	req := httptest.NewRequest(http.MethodGet, "/api/skills", nil)
+	req = req.WithContext(mw.ContextWithUser(req.Context(), actor))
+	rec := httptest.NewRecorder()
+	h.ListSkills(rec, req)
+	return rec
+}
+
+// TestListSkillsPassesCallerIdentity is the list-side twin of
+// TestGetSkillPassesCallerIdentity. ListSkills builds ListSkillsForViewerParams from
+// the caller (skills.go:164); nothing pinned that the caller's real identity is passed
+// through. Mutating `IsAdmin: actor.IsAdmin` to `IsAdmin: true` is a total bypass —
+// every caller lists as admin, so any authenticated user sees every private skill — and
+// it left the whole api suite green (confirmed by a full-scope `go test ./...` run).
+// Both directions of the flag are asserted: the admin `== true` check is the backstop no
+// zero value can satisfy, and the non-admin check guards the mirror mutation
+// (hardcoded `false`) that would strip admins of their cross-scope read.
+func TestListSkillsPassesCallerIdentity(t *testing.T) {
+	t.Run("non-admin caller", func(t *testing.T) {
+		actor := nonAdminCaller()
+		db := &fakeViewerListDB{}
+		if rec := listSkillsRec(t, db, actor); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		isAdmin, viewer := viewerQueryArgs(t, db.gotArgs, db.called, 0, 1)
+		if isAdmin {
+			t.Error("ListSkillsForViewer received is_admin=true for a NON-ADMIN caller: " +
+				"every caller lists as admin and any private skill is listable by anyone")
+		}
+		if !viewer.Valid || uuid.UUID(viewer.Bytes) != actor.ID {
+			t.Errorf("viewer_id = %v (valid=%v), want the caller's own id %v",
+				uuid.UUID(viewer.Bytes), viewer.Valid, actor.ID)
+		}
+	})
+
+	t.Run("admin caller", func(t *testing.T) {
+		actor := adminCaller()
+		db := &fakeViewerListDB{}
+		if rec := listSkillsRec(t, db, actor); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		isAdmin, viewer := viewerQueryArgs(t, db.gotArgs, db.called, 0, 1)
+		if !isAdmin {
+			t.Error("ListSkillsForViewer received is_admin=false for an ADMIN caller: " +
+				"admins lose the cross-scope read the flag exists to grant")
+		}
+		if !viewer.Valid || uuid.UUID(viewer.Bytes) != actor.ID {
+			t.Errorf("viewer_id = %v (valid=%v), want the caller's own id %v",
+				uuid.UUID(viewer.Bytes), viewer.Valid, actor.ID)
+		}
+	})
+}
+
 // TestGetSkillPassesCallerIdentity closes the OTHER half of the issue-#16 seam. The
 // 404 mapping is only a denial if the visibility query was asked the right question in
 // the first place, and nothing in the tree pinned that: TestSkillsVisibilityLiveDB
