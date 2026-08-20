@@ -390,6 +390,7 @@ type Run struct {
 	ReviewRequested       bool               `json:"review_requested"`
 	ThenFixRequested      bool               `json:"then_fix_requested"`
 	ThenFixOfRunID        pgtype.UUID        `json:"then_fix_of_run_id"`
+	PreservedPatch        pgtype.Text        `json:"preserved_patch"`
 }
 
 type RunMessage struct {

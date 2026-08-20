@@ -42,6 +42,10 @@ var failOrigins = []string{
 	"agent_failure",
 	"plan_rejected",
 	"auto_stopped",
+	// PRD #377 M1: a GitHub run whose branch touches .github/workflows/** cannot be
+	// pushed by the bot's repo-only PAT, so the worker fails early with this origin and
+	// preserves the diff (worker-reportable — see workerReportableFailOrigins).
+	"workflow_scope_missing",
 }
 
 // failOriginSet is the lookup form. Built once; failOrigins stays the declaration so
@@ -72,15 +76,18 @@ func AllFailOrigins() []string {
 // on, and (guardrail_blocked being a Gate 4b member) let an untrusted report steer whether
 // a run is judged. CoerceFailOrigin gates on THIS set, not the full failOrigins vocabulary.
 // The worker legitimately emits only provisioning_failed / credential_unavailable
-// (failOriginForReason) and rate_limited (the limit opt-out path, runner.ts); agent_failure
-// is included because it is the judgeable default the `failed` arm applies anyway, so an
-// explicit worker agent_failure is harmless and semantically correct. The partition
-// (worker-reportable + server-only == vocabulary) is pinned by TestCoerceFailOrigin.
+// (failOriginForReason), rate_limited (the limit opt-out path, runner.ts), and
+// workflow_scope_missing (PRD #377: the finalize detection that the branch touches
+// .github/workflows/** the bot PAT cannot push); agent_failure is included because it is
+// the judgeable default the `failed` arm applies anyway, so an explicit worker
+// agent_failure is harmless and semantically correct. The partition (worker-reportable +
+// server-only == vocabulary) is pinned by TestCoerceFailOrigin.
 var workerReportableFailOrigins = map[string]bool{
 	"provisioning_failed":    true,
 	"credential_unavailable": true,
 	"rate_limited":           true,
 	"agent_failure":          true,
+	"workflow_scope_missing": true,
 }
 
 // CoerceFailOrigin maps a worker-reported fail_origin onto the WORKER-REPORTABLE subset.
