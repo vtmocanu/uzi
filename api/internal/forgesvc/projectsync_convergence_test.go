@@ -154,7 +154,9 @@ func (p *statefulProject) CreateProjectV2(context.Context, string, string, strin
 func (p *statefulProject) CreateProjectV2Field(context.Context, string, string, []forge.ProjectV2NewOption) (forge.ProjectV2StatusField, error) {
 	return forge.ProjectV2StatusField{}, nil
 }
-func (p *statefulProject) LinkProjectV2ToRepository(context.Context, string, string) error { return nil }
+func (p *statefulProject) LinkProjectV2ToRepository(context.Context, string, string) error {
+	return nil
+}
 
 // --- statefulStore: a real projection store (marker survives across calls) --
 
