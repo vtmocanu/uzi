@@ -159,6 +159,9 @@ type ProjectSyncer interface {
 	// ForwardMove projects a uzi label move onto the linked project's Status (M5).
 	// Best-effort: the handler logs and continues on a returned error.
 	ForwardMove(ctx context.Context, repoID uuid.UUID, issueIID int64, targetColumn string) error
+	// ProjectSyncStatus reads a repo's link health for the GET status endpoint (M7).
+	// Returns pgx.ErrNoRows when the repo has no link, which the handler maps to 404.
+	ProjectSyncStatus(ctx context.Context, repoID uuid.UUID) (forgesvc.ProjectSyncStatus, error)
 }
 
 // SetProjectSync wires the GitHub Projects v2 provisioning service in after
@@ -970,6 +973,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// with it the position-to-name mapping the mount tests pin, for no behavioural
 				// gain.
 				r.With(authLimiter.PerUserMiddleware).Get("/cli-tokens", h.AdminListCLITokens)
+				// Admin GitHub Projects v2 sync health (PRD #364 M7): read the link
+				// status (project_number, owned_by_uzi, last_synced_at, last_error,
+				// item_count). A READ of the stored projection — no forge call, no spend —
+				// so it lives in the READ group beside the other admin reads, unlike the
+				// adopt/disable WRITES below. 404 when the repo has no link (= not
+				// sync-enabled). noLimiter, matching the sibling admin reads.
+				r.Get("/repos/{id}/github-project-sync", h.GetGithubProjectSyncStatus)
 			})
 			// WRITES: cookie-only (RequireAuth + RequireAdmin), unchanged.
 			r.Group(func(r chi.Router) {

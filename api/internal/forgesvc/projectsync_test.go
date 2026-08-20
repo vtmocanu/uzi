@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -172,6 +174,9 @@ type fakeProjectStore struct {
 	item       store.GithubProjectItem
 	itemErr    error
 	markerSets []store.SetGithubProjectItemStatusMarkerParams
+
+	// Observability (M7): count TouchGithubProjectLinkSynced calls.
+	touchCalls int
 }
 
 func (s *fakeProjectStore) GetRepoByID(context.Context, uuid.UUID) (store.GetRepoByIDRow, error) {
@@ -221,6 +226,10 @@ func (s *fakeProjectStore) GetGithubProjectItem(_ context.Context, arg store.Get
 }
 func (s *fakeProjectStore) SetGithubProjectItemStatusMarker(_ context.Context, arg store.SetGithubProjectItemStatusMarkerParams) error {
 	s.markerSets = append(s.markerSets, arg)
+	return nil
+}
+func (s *fakeProjectStore) TouchGithubProjectLinkSynced(context.Context, uuid.UUID) error {
+	s.touchCalls++
 	return nil
 }
 
@@ -534,6 +543,108 @@ func TestDisableDeletesItemsAndLink(t *testing.T) {
 	}
 	if st.deletedLink != 1 {
 		t.Errorf("want 1 link delete, got %d", st.deletedLink)
+	}
+}
+
+// (M7) Disable is local-only teardown: it deletes uzi's item + link rows for BOTH
+// owned_by_uzi values and NEVER issues a destructive GitHub mutation. There is no
+// archive/delete-project method to call, so we assert the syncer's mutating methods
+// (AddProjectV2Item / SetProjectV2ItemStatus) are untouched as a proxy, and that only
+// Delete* store calls happen.
+func TestDisableTeardownLocalOnly(t *testing.T) {
+	for _, ownedByUzi := range []bool{false, true} {
+		name := "adopted (owned_by_uzi=false)"
+		if ownedByUzi {
+			name = "uzi-owned (owned_by_uzi=true)"
+		}
+		t.Run(name, func(t *testing.T) {
+			repoID := uuid.New()
+			syncer := &fakeProjectSyncer{fakeForge: &fakeForge{}}
+			st := &fakeProjectStore{
+				link: store.GithubProjectLink{RepoID: repoID, OwnedByUzi: ownedByUzi},
+				existingItems: []store.GithubProjectItem{
+					{RepoID: repoID, ForgeIssueIid: 1},
+					{RepoID: repoID, ForgeIssueIid: 2},
+				},
+			}
+			svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+			if err := svc.Disable(context.Background(), repoID); err != nil {
+				t.Fatalf("Disable: %v", err)
+			}
+			// Local rows removed.
+			if len(st.deletedItems) != 2 {
+				t.Errorf("want 2 item deletes, got %v", st.deletedItems)
+			}
+			if st.deletedLink != 1 {
+				t.Errorf("want 1 link delete, got %d", st.deletedLink)
+			}
+			// No destructive/mutating GitHub call on disable (no archive, no project
+			// delete). The proxy: no item add, no status set.
+			if len(syncer.addCalls) != 0 || len(syncer.setCalls) != 0 {
+				t.Errorf("disable must make no GitHub mutation, got add=%v set=%v", syncer.addCalls, syncer.setCalls)
+			}
+			// No projection WRITE (upsert/marker) either — teardown only deletes.
+			if len(st.items) != 0 || len(st.markerSets) != 0 {
+				t.Errorf("teardown must not upsert/rewrite, got items=%v markerSets=%v", st.items, st.markerSets)
+			}
+		})
+	}
+}
+
+// (M7) An already-disabled repo (no link row) is a no-op: no deletes, no error.
+func TestDisableAlreadyDisabled(t *testing.T) {
+	repoID := uuid.New()
+	st := &fakeProjectStore{linkErr: pgx.ErrNoRows}
+	svc := NewProjectSync(st, fakeForgeBuilder{}, fakeSyncSettings{enabled: true}, nil)
+	if err := svc.Disable(context.Background(), repoID); err != nil {
+		t.Fatalf("Disable on an already-disabled repo must be nil, got %v", err)
+	}
+	if len(st.deletedItems) != 0 || st.deletedLink != 0 {
+		t.Errorf("no-link disable must delete nothing, got items=%v link=%d", st.deletedItems, st.deletedLink)
+	}
+}
+
+// (M7) ProjectSyncStatus returns the link's health fields + item count, and passes
+// pgx.ErrNoRows through for a repo with no link (the handler maps it to 404).
+func TestProjectSyncStatus(t *testing.T) {
+	repoID := uuid.New()
+	synced := pgtype.Timestamptz{Time: time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC), Valid: true}
+	st := &fakeProjectStore{
+		link: store.GithubProjectLink{
+			RepoID:        repoID,
+			ProjectNumber: 42,
+			OwnedByUzi:    true,
+			LastSyncedAt:  synced,
+			LastError:     pgtype.Text{String: "graphql boom", Valid: true},
+		},
+		existingItems: []store.GithubProjectItem{
+			{RepoID: repoID, ForgeIssueIid: 1},
+			{RepoID: repoID, ForgeIssueIid: 2},
+			{RepoID: repoID, ForgeIssueIid: 3},
+		},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{}, fakeSyncSettings{enabled: true}, nil)
+	got, err := svc.ProjectSyncStatus(context.Background(), repoID)
+	if err != nil {
+		t.Fatalf("ProjectSyncStatus: %v", err)
+	}
+	if got.ProjectNumber != 42 || !got.OwnedByUzi || got.ItemCount != 3 {
+		t.Errorf("status = %+v, want project 42 owned item_count 3", got)
+	}
+	if !got.LastSyncedAt.Valid || !got.LastSyncedAt.Time.Equal(synced.Time) {
+		t.Errorf("last_synced_at = %+v, want %v", got.LastSyncedAt, synced.Time)
+	}
+	if !got.LastError.Valid || got.LastError.String != "graphql boom" {
+		t.Errorf("last_error = %+v, want graphql boom", got.LastError)
+	}
+}
+
+func TestProjectSyncStatusNoLink(t *testing.T) {
+	st := &fakeProjectStore{linkErr: pgx.ErrNoRows}
+	svc := NewProjectSync(st, fakeForgeBuilder{}, fakeSyncSettings{enabled: true}, nil)
+	_, err := svc.ProjectSyncStatus(context.Background(), uuid.New())
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("want pgx.ErrNoRows for a repo with no link, got %v", err)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -106,6 +107,63 @@ func (h *Handler) DisableGithubProjectSync(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// getGithubProjectSyncStatusResponse is the health-endpoint body (PRD #364 M7): the
+// link's observability snapshot. last_synced_at/last_error are pointers so a
+// never-synced or healthy link renders them as JSON null rather than a zero value.
+type getGithubProjectSyncStatusResponse struct {
+	ProjectNumber int64      `json:"project_number"`
+	OwnedByUzi    bool       `json:"owned_by_uzi"`
+	LastSyncedAt  *time.Time `json:"last_synced_at"`
+	LastError     *string    `json:"last_error"`
+	ItemCount     int        `json:"item_count"`
+}
+
+// GetGithubProjectSyncStatus is the admin sync-health read (PRD #364 M7): report a
+// repo's project link status (project number, ownership, last_synced_at, last_error,
+// item_count). Mounted under the admin READ group (RequireUser + RequireAdminRO) — it
+// is a read of the stored projection, no forge call — unlike the adopt/disable writes.
+// A repo with no link row is 404: "no link = not sync-enabled".
+func (h *Handler) GetGithubProjectSyncStatus(w http.ResponseWriter, r *http.Request) {
+	if _, ok := mw.UserFromContext(r.Context()); !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
+		return
+	}
+	if h.projectSync == nil {
+		slog.Error("github project sync status: service not wired")
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	status, err := h.projectSync.ProjectSyncStatus(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.Error(w, http.StatusNotFound, "project sync not enabled for this repo")
+			return
+		}
+		slog.Error("github project sync status", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	resp := getGithubProjectSyncStatusResponse{
+		ProjectNumber: status.ProjectNumber,
+		OwnedByUzi:    status.OwnedByUzi,
+		ItemCount:     status.ItemCount,
+	}
+	if status.LastSyncedAt.Valid {
+		t := status.LastSyncedAt.Time
+		resp.LastSyncedAt = &t
+	}
+	if status.LastError.Valid {
+		e := status.LastError.String
+		resp.LastError = &e
+	}
+	httpx.JSON(w, http.StatusOK, resp)
 }
 
 // writeProjectSyncError maps a provisioning error to an HTTP status + clean body.

@@ -8,10 +8,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
@@ -36,6 +38,10 @@ type fakeProjectSync struct {
 	forwardCalls int
 	gotIssueIID  int64
 	gotTarget    string
+
+	status      forgesvc.ProjectSyncStatus
+	statusErr   error
+	statusCalls int
 }
 
 func (f *fakeProjectSync) Adopt(_ context.Context, repoID uuid.UUID, number int, kind forge.ProjectV2OwnerKind) error {
@@ -54,6 +60,12 @@ func (f *fakeProjectSync) ForwardMove(_ context.Context, repoID uuid.UUID, issue
 	f.forwardCalls++
 	f.gotRepoID, f.gotIssueIID, f.gotTarget = repoID, issueIID, target
 	return f.forwardErr
+}
+
+func (f *fakeProjectSync) ProjectSyncStatus(_ context.Context, repoID uuid.UUID) (forgesvc.ProjectSyncStatus, error) {
+	f.statusCalls++
+	f.gotRepoID = repoID
+	return f.status, f.statusErr
 }
 
 // postAdopt drives AdoptGithubProjectSync with an admin actor and the given repo id
@@ -209,6 +221,92 @@ func TestDisableRoute(t *testing.T) {
 	if sync.disableCalls != 1 || sync.gotRepoID != repoID {
 		t.Errorf("Disable not delegated with the path repo id: calls=%d id=%v", sync.disableCalls, sync.gotRepoID)
 	}
+}
+
+// getStatus drives GetGithubProjectSyncStatus with an admin actor and the given repo id.
+func getStatus(t *testing.T, h *Handler, repoID string) *httptest.ResponseRecorder {
+	t.Helper()
+	admin := store.User{ID: uuid.New(), IsAdmin: true}
+	r := httptest.NewRequest(http.MethodGet, "/admin/repos/x/github-project-sync", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", repoID)
+	r = r.WithContext(context.WithValue(mw.ContextWithUser(r.Context(), admin), chi.RouteCtxKey, rctx))
+	w := httptest.NewRecorder()
+	h.GetGithubProjectSyncStatus(w, r)
+	return w
+}
+
+// TestStatusRouteReturnsFields: the GET status route delegates to the service and
+// renders its fields.
+func TestStatusRouteReturnsFields(t *testing.T) {
+	sync := &fakeProjectSync{status: forgesvc.ProjectSyncStatus{
+		ProjectNumber: 42,
+		OwnedByUzi:    true,
+		LastSyncedAt:  pgtype.Timestamptz{Time: time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC), Valid: true},
+		LastError:     pgtype.Text{String: "graphql boom", Valid: true},
+		ItemCount:     3,
+	}}
+	h := &Handler{projectSync: sync}
+	repoID := uuid.New()
+	w := getStatus(t, h, repoID.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if sync.statusCalls != 1 || sync.gotRepoID != repoID {
+		t.Errorf("Status not delegated with path repo id: calls=%d id=%v", sync.statusCalls, sync.gotRepoID)
+	}
+	var body struct {
+		ProjectNumber int64      `json:"project_number"`
+		OwnedByUzi    bool       `json:"owned_by_uzi"`
+		LastSyncedAt  *time.Time `json:"last_synced_at"`
+		LastError     *string    `json:"last_error"`
+		ItemCount     int        `json:"item_count"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response not JSON: %v", err)
+	}
+	if body.ProjectNumber != 42 || !body.OwnedByUzi || body.ItemCount != 3 {
+		t.Errorf("body = %+v, want project 42 owned item_count 3", body)
+	}
+	if body.LastSyncedAt == nil {
+		t.Errorf("last_synced_at should be non-null")
+	}
+	if body.LastError == nil || *body.LastError != "graphql boom" {
+		t.Errorf("last_error = %v, want graphql boom", body.LastError)
+	}
+}
+
+// TestStatusRouteNoLinkIs404: a repo with no link (pgx.ErrNoRows) returns 404.
+func TestStatusRouteNoLinkIs404(t *testing.T) {
+	sync := &fakeProjectSync{statusErr: pgx.ErrNoRows}
+	h := &Handler{projectSync: sync}
+	w := getStatus(t, h, uuid.New().String())
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("no-link status = %d, want 404", w.Code)
+	}
+}
+
+// TestStatusRouteValidation: an invalid repo id is a 400 before the service is called;
+// a nil service is a clean 500.
+func TestStatusRouteValidation(t *testing.T) {
+	t.Run("invalid repo id", func(t *testing.T) {
+		sync := &fakeProjectSync{}
+		h := &Handler{projectSync: sync}
+		w := getStatus(t, h, "not-a-uuid")
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", w.Code)
+		}
+		if sync.statusCalls != 0 {
+			t.Errorf("service must not be called on a bad repo id")
+		}
+	})
+	t.Run("service not wired", func(t *testing.T) {
+		h := &Handler{}
+		w := getStatus(t, h, uuid.New().String())
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500", w.Code)
+		}
+	})
 }
 
 // errAny is a non-sentinel error for the internal-error mapping case.

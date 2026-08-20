@@ -205,6 +205,23 @@ func (q *Queries) SetGithubProjectLinkError(ctx context.Context, arg SetGithubPr
 	return err
 }
 
+const touchGithubProjectLinkSynced = `-- name: TouchGithubProjectLinkSynced :exec
+UPDATE github_project_links
+SET last_synced_at = now(), updated_at = now()
+WHERE repo_id = $1
+`
+
+// Record that a reverse pass completed (PRD #364 M7 observability): bump
+// last_synced_at WITHOUT touching last_error. A clean reverse READ says nothing about
+// the forward WRITE path's health, and both directions share this one row's
+// last_error, so a read tick must record "we synced" without clobbering a still-
+// relevant forward-write error (unlike ClearGithubProjectLinkError, which also nulls
+// last_error).
+func (q *Queries) TouchGithubProjectLinkSynced(ctx context.Context, repoID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, touchGithubProjectLinkSynced, repoID)
+	return err
+}
+
 const upsertGithubProjectItem = `-- name: UpsertGithubProjectItem :one
 INSERT INTO github_project_items (
     repo_id, forge_issue_iid, item_node_id, last_status_option_id, last_synced_at

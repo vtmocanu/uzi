@@ -72,6 +72,10 @@ type ProjectSyncStore interface {
 	GetGithubProjectLinkByRepo(ctx context.Context, repoID uuid.UUID) (store.GithubProjectLink, error)
 	GetGithubProjectItem(ctx context.Context, arg store.GetGithubProjectItemParams) (store.GithubProjectItem, error)
 	SetGithubProjectItemStatusMarker(ctx context.Context, arg store.SetGithubProjectItemStatusMarkerParams) error
+	// TouchGithubProjectLinkSynced (M7) bumps last_synced_at on a completed reverse
+	// pass WITHOUT touching last_error — a clean read records "we synced" without
+	// clobbering a still-relevant forward-write error.
+	TouchGithubProjectLinkSynced(ctx context.Context, repoID uuid.UUID) error
 }
 
 // ProjectForgeBuilder builds a forge driver from a stored (encrypted) connection.
@@ -363,11 +367,42 @@ func (s *ProjectSyncService) seedItems(ctx context.Context, repo store.GetRepoBy
 	return nil
 }
 
-// Disable tears down a repo's project sync (PRD #364 M3): delete the item rows and
-// the link row. It does NOT touch the project board itself (the board is the user's;
-// M7 refines whether uzi-owned boards are archived). Item rows are deleted
-// explicitly because they cascade with the repo, not the link.
+// Disable tears down a repo's project sync (PRD #364 M3, D8 semantics fixed in M7):
+// it deletes ONLY uzi's LOCAL projection rows — every item row (which cascades with
+// the repo, not the link, so it is deleted explicitly) and then the link row — and
+// NEVER issues a destructive GitHub mutation. uzi does NOT delete or archive a user's
+// GitHub project or its items on disable:
+//
+//   - An ADOPTED project (owned_by_uzi=false) is the user's; unlinking it from uzi
+//     leaves it fully intact on GitHub, exactly as adopted.
+//   - A uzi-OWNED project (owned_by_uzi=true — a future M4 create-and-own path) is
+//     likewise KEPT/frozen on GitHub in v1: project deletion is a deliberate future
+//     step, never done here, so an accidental disable can never lose a user's board.
+//
+// Both owned_by_uzi branches therefore do the same local-only teardown in v1; the
+// branch is made explicit so the future M4 divergence has a home. Re-enabling is just
+// re-Adopt, which is idempotent. Loading the link first lets an already-disabled repo
+// (no link row) return nil rather than churn deletes.
 func (s *ProjectSyncService) Disable(ctx context.Context, repoID uuid.UUID) error {
+	link, err := s.store.GetGithubProjectLinkByRepo(ctx, repoID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil // already disabled — nothing to tear down.
+		}
+		return fmt.Errorf("project sync: load link for teardown: %w", err)
+	}
+
+	// Both branches delete only uzi's local rows and issue NO destructive GitHub
+	// mutation. The switch documents the future M4 divergence without acting on it.
+	switch {
+	case link.OwnedByUzi:
+		// uzi-owned (future M4): v1 keeps/freezes the project on GitHub — no delete,
+		// no archive — and drops only the local projection, same as an adopted board.
+	default:
+		// Adopted (owned_by_uzi=false): the project is the user's and is kept intact
+		// on GitHub; only the local link/items are removed.
+	}
+
 	items, err := s.store.ListGithubProjectItems(ctx, repoID)
 	if err != nil {
 		return fmt.Errorf("project sync: list items for teardown: %w", err)
@@ -645,6 +680,20 @@ func (s *ProjectSyncService) ReverseSync(ctx context.Context, repoID uuid.UUID) 
 		s.log.Warn("project sync: reverse list board columns", "repo", repoID, "error", err)
 		return nil
 	}
+	// Column-name → position map, for board.ResolveColumn to seed a backfilled item's
+	// Status from its current label column during reconcile.
+	position := make(map[string]int, len(columns))
+	for _, c := range columns {
+		position[c.LabelName] = int(c.Position)
+	}
+
+	// Reconcile the item set BEFORE reading live statuses (M7): backfill open issues
+	// created since adopt (so they appear on the board and in the diff below) and prune
+	// items for issues that have since closed. reconcileItems mutates itemsByIID in
+	// place so the diff sees the reconciled set — a freshly-backfilled item carries
+	// marker == its seeded value == the live value the diff then reads, so the same-tick
+	// diff no-ops it (no oscillation).
+	s.reconcileItems(ctx, repo, syncer, link, issues, itemsByIID, columnOption, position)
 
 	live, err := syncer.ReadProjectV2ItemStatuses(ctx, link.ProjectNodeID, link.StatusFieldID)
 	if err != nil {
@@ -652,6 +701,148 @@ func (s *ProjectSyncService) ReverseSync(ctx context.Context, repoID uuid.UUID) 
 		return nil
 	}
 
+	s.reverseDiff(ctx, repo, f, live, optionColumn, issuesByIID, itemsByIID, columns)
+
+	// Observability (M7): record that a reverse pass completed by bumping last_synced_at.
+	// This deliberately does NOT clear last_error — a reverse READ succeeding says
+	// nothing about the health of the forward WRITE path, and both directions share this
+	// one link row's last_error (ForwardMove stamps it and, by convention, never clears
+	// on success). We touch on EVERY completed pass, even one that stamped a per-item
+	// error above, so last_synced_at means "last attempted sync" and last_error conveys
+	// health independently. Clearing here on every read tick would wipe a still-relevant
+	// forward error within one poll interval, so reverse only STAMPS errors (M5's
+	// convention) and TOUCHES the sync time.
+	if err := s.store.TouchGithubProjectLinkSynced(ctx, repoID); err != nil {
+		s.log.Warn("project sync: reverse touch last_synced_at", "repo", repoID, "error", err)
+	}
+	return nil
+}
+
+// reconcileItems is the M7 reconcile step run at the START of a reverse tick, before
+// the live-status diff, so the single per-tick poller call covers issues that appeared
+// or closed since adopt:
+//
+//   - Backfill: an OPEN issue with no tracked item row is added to the linked project
+//     and its Status seeded from its current label column (a mapped column → that
+//     option; Open or an unmapped column → cleared "No Status"). Best-effort per issue:
+//     an error is stamped on last_error and the loop continues, so one unresolvable
+//     issue never aborts the whole tick.
+//   - Close-prune (D1): a CLOSED issue that still has a tracked item row has that row
+//     DELETED locally. uzi does NOT call GitHub — there is no archive method, and
+//     leaving the closed issue's card on the project (with its last Status) is
+//     acceptable: D1 makes Closed an issue-state, not a board column, and the reverse
+//     diff already skips closed issues, so a stale card never drives a label. uzi
+//     simply stops tracking the closed issue.
+//
+// It mutates itemsByIID in place (adds backfilled rows, removes pruned ones) so the
+// caller's diff reads the reconciled projection. The repo slug is resolved lazily —
+// only when at least one issue actually needs backfilling — so a steady-state tick with
+// nothing new makes no extra forge call.
+func (s *ProjectSyncService) reconcileItems(ctx context.Context, repo store.GetRepoByIDRow, syncer forge.ProjectBoardSyncer, link store.GithubProjectLink, issues []store.Issue, itemsByIID map[int64]store.GithubProjectItem, columnOption map[string]string, position map[string]int) {
+	var owner, name string
+	slugResolved := false
+	resolveSlug := func() error {
+		if slugResolved {
+			return nil
+		}
+		o, n, err := syncer.RepoSlug(ctx, repo.ForgeProjectID)
+		if err != nil {
+			return fmt.Errorf("project sync: reverse reconcile resolve slug: %w", err)
+		}
+		owner, name, slugResolved = o, n, true
+		return nil
+	}
+
+	for _, issue := range issues {
+		_, tracked := itemsByIID[issue.ForgeIssueIid]
+		switch {
+		case issue.State == "closed":
+			// Close-prune: stop tracking, leave the card on GitHub.
+			if !tracked {
+				continue
+			}
+			if err := s.store.DeleteGithubProjectItem(ctx, store.DeleteGithubProjectItemParams{
+				RepoID:        repo.ID,
+				ForgeIssueIid: issue.ForgeIssueIid,
+			}); err != nil {
+				s.log.Warn("project sync: reverse prune closed item", "repo", repo.ID, "issue", issue.ForgeIssueIid, "error", err)
+				continue
+			}
+			delete(itemsByIID, issue.ForgeIssueIid)
+		case !tracked:
+			// Backfill an open, untracked issue.
+			if err := resolveSlug(); err != nil {
+				s.stampLinkErrorReverse(ctx, repo.ID, err)
+				return // slug is a per-repo resolve; if it fails, no issue can be backfilled.
+			}
+			if err := s.backfillItem(ctx, repo, syncer, link, owner, name, issue, itemsByIID, columnOption, position); err != nil {
+				s.stampLinkErrorReverse(ctx, repo.ID, err)
+				continue
+			}
+		}
+	}
+}
+
+// backfillItem adds one open, untracked issue to the linked project and seeds its
+// Status from its current label column, persisting the item row + marker and recording
+// it in itemsByIID for the same-tick diff. The seeded marker == the value the just-set
+// Status will read back, so the same-tick diff no-ops the new item (convergence). A
+// freshly-added item defaults to "No Status", so a cleared (Open/unmapped) seed needs
+// no redundant Set — only a mapped column drives a Status write.
+func (s *ProjectSyncService) backfillItem(ctx context.Context, repo store.GetRepoByIDRow, syncer forge.ProjectBoardSyncer, link store.GithubProjectLink, owner, name string, issue store.Issue, itemsByIID map[int64]store.GithubProjectItem, columnOption map[string]string, position map[string]int) error {
+	contentID, err := syncer.ResolveIssueNodeID(ctx, owner, name, int(issue.ForgeIssueIid))
+	if err != nil {
+		return fmt.Errorf("project sync: reverse backfill resolve issue #%d node: %w", issue.ForgeIssueIid, err)
+	}
+	itemID, err := syncer.AddProjectV2Item(ctx, link.ProjectNodeID, contentID)
+	if err != nil {
+		return fmt.Errorf("project sync: reverse backfill add issue #%d: %w", issue.ForgeIssueIid, err)
+	}
+
+	// Seed the Status from the issue's current column: a mapped column → its option;
+	// Open ("") or an unmapped column → cleared ("No Status").
+	var labels []string
+	if len(issue.Labels) > 0 {
+		if err := json.Unmarshal(issue.Labels, &labels); err != nil {
+			labels = nil
+		}
+	}
+	column, _, _ := board.ResolveColumn(labels, issue.State, position)
+	seededOption := ""
+	if column != "" {
+		if optID, mapped := columnOption[column]; mapped {
+			seededOption = optID
+		}
+	}
+	if seededOption != "" {
+		if err := syncer.SetProjectV2ItemStatus(ctx, link.ProjectNodeID, itemID, link.StatusFieldID, seededOption); err != nil {
+			return fmt.Errorf("project sync: reverse backfill seed issue #%d status: %w", issue.ForgeIssueIid, err)
+		}
+	}
+	if _, err := s.store.UpsertGithubProjectItem(ctx, store.UpsertGithubProjectItemParams{
+		RepoID:             repo.ID,
+		ForgeIssueIid:      issue.ForgeIssueIid,
+		ItemNodeID:         itemID,
+		LastStatusOptionID: optionMarker(seededOption),
+	}); err != nil {
+		return fmt.Errorf("project sync: reverse backfill persist issue #%d item: %w", issue.ForgeIssueIid, err)
+	}
+	// Record in the in-memory map so the same-tick diff reads live == marker → no-op.
+	itemsByIID[issue.ForgeIssueIid] = store.GithubProjectItem{
+		RepoID:             repo.ID,
+		ForgeIssueIid:      issue.ForgeIssueIid,
+		ItemNodeID:         itemID,
+		LastStatusOptionID: optionMarker(seededOption),
+	}
+	return nil
+}
+
+// reverseDiff is the M6 diff pass, extracted from ReverseSync (M7 refactor): for each
+// live project item it compares the live Status option against the stored marker and,
+// on a GitHub-side change, writes the mapped column label via the ordinary AutoMove
+// path, then advances the marker. See ReverseSync's doc for the convergence invariant.
+func (s *ProjectSyncService) reverseDiff(ctx context.Context, repo store.GetRepoByIDRow, f forge.Forge, live []forge.ProjectV2ItemStatus, optionColumn map[string]string, issuesByIID map[int64]store.Issue, itemsByIID map[int64]store.GithubProjectItem, columns []store.BoardColumn) {
+	repoID := repo.ID
 	for _, it := range live {
 		// Non-issue content (PR/draft) carries IssueNumber 0 — nothing to move.
 		if it.IssueNumber == 0 {
@@ -687,8 +878,9 @@ func (s *ProjectSyncService) ReverseSync(ctx context.Context, repoID uuid.UUID) 
 			targetColumn = column
 		}
 
-		// The issue must be in uzi's cache (M7 backfill / issue reconcile handles
-		// unknown issues). A closed issue's board state is its issue state (D1) — skip.
+		// The issue must be in uzi's cache (reconcile above backfills new open issues).
+		// A closed issue's board state is its issue state (D1) — skip; reconcile has
+		// already pruned its item row.
 		issue, ok := issuesByIID[it.IssueNumber]
 		if !ok {
 			s.log.Info("project sync: reverse skip, issue not in cache", "repo", repoID, "issue", it.IssueNumber)
@@ -727,14 +919,43 @@ func (s *ProjectSyncService) ReverseSync(ctx context.Context, repoID uuid.UUID) 
 			}
 		}
 	}
+}
 
-	// Deliberately do NOT clear last_error on a clean pass: a reverse READ succeeding
-	// says nothing about the health of the forward WRITE path, and both directions
-	// share this one link row's last_error (ForwardMove stamps it and, by convention,
-	// never clears on success). Clearing here on every read tick would wipe a still-
-	// relevant forward error within one poll interval. So reverse only STAMPS errors,
-	// matching M5's convention.
-	return nil
+// ProjectSyncStatus is the health/observability snapshot of a repo's project sync
+// link (PRD #364 M7), returned by ProjectSyncStatus for the admin health endpoint.
+// It carries no secret and no forge coordinate the UI cannot already see — just the
+// project number, ownership, the two health signals (last_synced_at, last_error), and
+// the count of tracked items.
+type ProjectSyncStatus struct {
+	ProjectNumber int64
+	OwnedByUzi    bool
+	LastSyncedAt  pgtype.Timestamptz
+	LastError     pgtype.Text
+	ItemCount     int
+}
+
+// ProjectSyncStatus reads a repo's link row + tracked-item count for the admin health
+// endpoint (PRD #364 M7). It is a pure STORE read of the reconciled projection — no
+// forge call — so it is cheap and cannot fail on a wedged upstream. It returns
+// pgx.ErrNoRows when the repo has no link row, which the handler maps to 404 ("no link
+// = not sync-enabled").
+func (s *ProjectSyncService) ProjectSyncStatus(ctx context.Context, repoID uuid.UUID) (ProjectSyncStatus, error) {
+	link, err := s.store.GetGithubProjectLinkByRepo(ctx, repoID)
+	if err != nil {
+		// pgx.ErrNoRows passes through verbatim so the handler can 404 on it.
+		return ProjectSyncStatus{}, err
+	}
+	items, err := s.store.ListGithubProjectItems(ctx, repoID)
+	if err != nil {
+		return ProjectSyncStatus{}, fmt.Errorf("project sync: status list items: %w", err)
+	}
+	return ProjectSyncStatus{
+		ProjectNumber: link.ProjectNumber,
+		OwnedByUzi:    link.OwnedByUzi,
+		LastSyncedAt:  link.LastSyncedAt,
+		LastError:     link.LastError,
+		ItemCount:     len(items),
+	}, nil
 }
 
 // stampLinkErrorReverse records a reverse-sync failure on the link row's last_error,

@@ -372,6 +372,188 @@ func TestReverseSyncSkipPaths(t *testing.T) {
 	})
 }
 
+// --- reconcile / backfill / observability (M7) ------------------------------
+
+// backfillSyncer builds a ProjectBoardSyncer fake that can resolve a slug + issue
+// nodes (for backfill) and returns the given live statuses. AddProjectV2Item returns
+// "item-<contentID>".
+func backfillSyncer(issueNode map[int]string, live ...forge.ProjectV2ItemStatus) *fakeProjectSyncer {
+	return &fakeProjectSyncer{
+		fakeForge: &fakeForge{},
+		slugOwner: "acme", slugRepo: "widgets",
+		issueNode: issueNode,
+		live:      live,
+	}
+}
+
+// (backfill) An OPEN issue with no item row is added to the project and its Status
+// seeded from its current column: a mapped column → its option (a Status write); an
+// Open/unmapped column → cleared (no Status write). The same-tick diff no-ops both
+// (live == seeded marker), so ZERO AutoMove, and last_synced_at is touched once.
+func TestReverseSyncBackfillsNewIssues(t *testing.T) {
+	repoID := uuid.New()
+	syncer := backfillSyncer(
+		map[int]string{7: "content7", 8: "content8"},
+		forge.ProjectV2ItemStatus{ItemID: "item-content7", IssueNumber: 7, OptionID: "opt_ip"},
+		forge.ProjectV2ItemStatus{ItemID: "item-content8", IssueNumber: 8, OptionID: ""},
+	)
+	mover := &fakeMover{}
+	st := &fakeProjectStore{
+		repo:    githubRepoRow(repoID),
+		link:    forwardLink(t, map[string]string{"In Progress": "opt_ip"}),
+		columns: []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+		issues: []store.Issue{
+			{ForgeIssueIid: 7, State: "opened", Labels: labelsJSON(t, "In Progress")}, // mapped → opt_ip
+			{ForgeIssueIid: 8, State: "opened", Labels: labelsJSON(t)},                // Open → cleared
+		},
+		// no existingItems -> both untracked -> backfilled.
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.SetMover(mover)
+
+	if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+		t.Fatalf("ReverseSync: %v", err)
+	}
+
+	// Both issues added.
+	added := map[string]bool{}
+	for _, c := range syncer.addCalls {
+		added[c] = true
+	}
+	if !added["content7"] || !added["content8"] || len(syncer.addCalls) != 2 {
+		t.Errorf("want content7+content8 added once each, got %v", syncer.addCalls)
+	}
+	// Only the mapped issue drives a Status write; the Open issue is left at "No Status".
+	if len(syncer.setCalls) != 1 || syncer.setCalls[0].itemID != "item-content7" || syncer.setCalls[0].optionID != "opt_ip" {
+		t.Errorf("want one seed set item-content7->opt_ip, got %v", syncer.setCalls)
+	}
+	// Persisted markers: issue 7 = opt_ip (valid), issue 8 = NULL (cleared).
+	if m := st.items[7].LastStatusOptionID; !m.Valid || m.String != "opt_ip" {
+		t.Errorf("issue 7 marker = %+v, want opt_ip", m)
+	}
+	if st.items[7].ItemNodeID != "item-content7" {
+		t.Errorf("issue 7 node = %q, want item-content7", st.items[7].ItemNodeID)
+	}
+	if m := st.items[8].LastStatusOptionID; m.Valid {
+		t.Errorf("issue 8 marker should be NULL (Open), got %+v", m)
+	}
+	// Convergence: the freshly-backfilled items do NOT oscillate — no AutoMove.
+	if len(mover.calls) != 0 {
+		t.Errorf("backfilled items must not oscillate (zero AutoMove), got %v", mover.calls)
+	}
+	// Observability: a completed pass touches last_synced_at once.
+	if st.touchCalls != 1 {
+		t.Errorf("want last_synced_at touched once, got %d", st.touchCalls)
+	}
+}
+
+// (close-prune, D1) A CLOSED issue that has an item row has that row DELETED locally,
+// with NO GitHub mutation (no add, no status set) and no AutoMove; the stale card is
+// left on the board. last_synced_at is still touched.
+func TestReverseSyncPrunesClosedIssue(t *testing.T) {
+	repoID := uuid.New()
+	// The closed issue's card may still be live on the board; the diff must skip it.
+	syncer := backfillSyncer(
+		nil,
+		forge.ProjectV2ItemStatus{ItemID: "item3", IssueNumber: 3, OptionID: "opt_ip"},
+	)
+	mover := &fakeMover{}
+	st := &fakeProjectStore{
+		repo:          githubRepoRow(repoID),
+		link:          forwardLink(t, map[string]string{"In Progress": "opt_ip"}),
+		columns:       []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+		issues:        []store.Issue{{ForgeIssueIid: 3, State: "closed", Labels: labelsJSON(t, "In Progress")}},
+		existingItems: []store.GithubProjectItem{projectItem(repoID, 3, "item3", "opt_ip")},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.SetMover(mover)
+
+	if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+		t.Fatalf("ReverseSync: %v", err)
+	}
+	if len(st.deletedItems) != 1 || st.deletedItems[0] != 3 {
+		t.Errorf("want issue 3 item row deleted, got %v", st.deletedItems)
+	}
+	// No destructive/mutating GitHub call for a close-prune.
+	if len(syncer.addCalls) != 0 || len(syncer.setCalls) != 0 {
+		t.Errorf("close-prune must make no GitHub add/set, got add=%v set=%v", syncer.addCalls, syncer.setCalls)
+	}
+	if len(mover.calls) != 0 {
+		t.Errorf("closed issue must drive no AutoMove, got %v", mover.calls)
+	}
+	if st.touchCalls != 1 {
+		t.Errorf("want last_synced_at touched once, got %d", st.touchCalls)
+	}
+}
+
+// (no oscillation) A backfilled item, once its seeded marker is persisted, makes ZERO
+// AutoMove and ZERO new adds on the NEXT tick — the item is tracked, so reconcile does
+// not re-add it and the diff no-ops it.
+func TestReverseSyncBackfillNoOscillationSecondPass(t *testing.T) {
+	repoID := uuid.New()
+	syncer := backfillSyncer(
+		map[int]string{7: "content7"},
+		forge.ProjectV2ItemStatus{ItemID: "item-content7", IssueNumber: 7, OptionID: "opt_ip"},
+	)
+	mover := &fakeMover{}
+	st := &fakeProjectStore{
+		repo:    githubRepoRow(repoID),
+		link:    forwardLink(t, map[string]string{"In Progress": "opt_ip"}),
+		columns: []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+		issues:  []store.Issue{{ForgeIssueIid: 7, State: "opened", Labels: labelsJSON(t, "In Progress")}},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.SetMover(mover)
+
+	if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+		t.Fatalf("ReverseSync pass 1: %v", err)
+	}
+	if len(mover.calls) != 0 || len(syncer.addCalls) != 1 {
+		t.Fatalf("pass 1 want one add + zero AutoMove, got add=%v moves=%v", syncer.addCalls, mover.calls)
+	}
+
+	// Persist the backfilled row (production's UpsertGithubProjectItem) and re-run.
+	st.existingItems = []store.GithubProjectItem{projectItem(repoID, 7, "item-content7", "opt_ip")}
+	mover.calls = nil
+	syncer.addCalls = nil
+	syncer.setCalls = nil
+	if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+		t.Fatalf("ReverseSync pass 2: %v", err)
+	}
+	if len(mover.calls) != 0 {
+		t.Errorf("pass 2 must make no AutoMove (no oscillation), got %v", mover.calls)
+	}
+	if len(syncer.addCalls) != 0 || len(syncer.setCalls) != 0 {
+		t.Errorf("pass 2 must not re-add/re-set a tracked item, got add=%v set=%v", syncer.addCalls, syncer.setCalls)
+	}
+}
+
+// (observability) A live-read failure aborts the pass BEFORE the touch: last_synced_at
+// is NOT bumped and last_error is stamped.
+func TestReverseSyncReadErrorDoesNotTouch(t *testing.T) {
+	repoID := uuid.New()
+	syncer := backfillSyncer(nil)
+	syncer.readErr = errors.New("read boom")
+	mover := &fakeMover{}
+	st := &fakeProjectStore{
+		repo: githubRepoRow(repoID),
+		link: forwardLink(t, map[string]string{"In Progress": "opt_ip"}),
+		// No issues → reconcile is a no-op, so the ONLY error is the live read.
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.SetMover(mover)
+
+	if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+		t.Fatalf("ReverseSync must swallow read errors, got %v", err)
+	}
+	if st.touchCalls != 0 {
+		t.Errorf("a failed read must not touch last_synced_at, got %d", st.touchCalls)
+	}
+	if len(st.linkErrs) != 1 {
+		t.Errorf("want last_error stamped once, got %v", st.linkErrs)
+	}
+}
+
 // (error) An AutoMove failure does NOT advance the marker (so it retries next tick)
 // and stamps last_error.
 func TestReverseSyncAutoMoveErrorRetries(t *testing.T) {

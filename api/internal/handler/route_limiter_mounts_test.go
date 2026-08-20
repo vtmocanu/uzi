@@ -67,7 +67,8 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 149 as of this commit; it was 147 until PRD #364 M3 added POST and DELETE
+// 150 as of this commit; it was 149 until PRD #364 M7 added GET
+// /api/admin/repos/{id}/github-project-sync, 147 until PRD #364 M3 added POST and DELETE
 // /api/admin/repos/{id}/github-project-sync, 146 until PRD #66 M9 added GET
 // /api/admin/blocked-repos, 144 until PRD #66 M8 added POST and DELETE
 // /api/admin/repos/{id}/guardrail-override, 143 until PRD #66 M3 added GET
@@ -172,6 +173,10 @@ var wantRouteMounts = []routeMount{
 	// reads (2 + 2×repos), so it draws from the forge pocket rather than none.
 	{"GET", "/api/admin/guardrail-impact", limForge},
 	{"GET", "/api/admin/rate-limits", noLimiter},
+	// PRD #364 M7: admin GitHub Projects v2 sync health read. A read of the stored
+	// projection (no forge call) in the admin READ group → noLimiter, like its
+	// siblings here.
+	{"GET", "/api/admin/repos/{id}/github-project-sync", noLimiter},
 	{"GET", "/api/admin/runs", noLimiter},
 	{"GET", "/api/admin/selfimprove", noLimiter},
 	{"GET", "/api/admin/settings", noLimiter},
