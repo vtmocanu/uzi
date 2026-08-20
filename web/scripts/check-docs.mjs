@@ -15,7 +15,8 @@
 // relative links (doc->doc and doc->img), stale backticked `prds/…`/`adr/…`
 // artifact paths (issue #189 — backticks are not links, so the link check is
 // blind to them; opt a line out with `check-docs:ignore-path`), and any
-// docs/img/* over the per-image byte budget.
+// docs/img/* over the per-image byte budget. prds/ is scanned RECURSIVELY,
+// including prds/done/ (issue #343), so an archived PRD's links can't rot silently.
 // Warns (does not fail): a `user` page whose body exceeds the line budget.
 import { readFileSync, readdirSync, existsSync, statSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -220,14 +221,15 @@ for (const file of files) {
 // sentence was about. The third dead link was in prds/66-guardrail-enforcement.md,
 // which is not an ADR opener.)
 //
-// 🔴 FLAT, NOT RECURSIVE, AND readdirSync IS WHAT MAKES IT SO. A non-recursive
-// read returns `done` and `mockups` as directory ENTRIES, and neither ends in
-// `.md`, so the filter drops them without a stat. That is a load-bearing property
-// of this loop rather than a happy accident: recursing would pull in
-// prds/done/*.md, which carries 16 further true positives (all the same move rot)
-// and would make this commit a 10-completed-PRD edit. Scoped flat by the user's
-// ruling of 2026-08-03; prds/done/ is a KNOWN, DELIBERATE residual. Widening it
-// is a decision, not a tidy-up.
+// 🔴 prds/ IS NOW WALKED RECURSIVELY (issue #343). It was flat until then — a
+// non-recursive read returns `done` and `mockups` as directory ENTRIES that do
+// not end in `.md`, so the filter dropped the whole prds/done/ population, and
+// that was once a deliberate property (2026-08-03 ruling: "prds/done/ is a KNOWN,
+// DELIBERATE residual. Widening it is a decision, not a tidy-up."). Issue #343 IS
+// that decision and reverses the ruling: archival `git mv prds/X.md
+// prds/done/X.md` silently rots inbound relative + backticked artifact links —
+// MR !354 had to repair 16 by hand with no CI signal — so the recursion (see
+// collectPrdsMd below) closes the gap. specs/ and adr/ stay flat (no subdirs).
 // `.claude/rules/*.md` carry moved CLAUDE.md content, including relative links that
 // were written when that content sat at the repo root. PRD-less fix, 2026-08-04: the
 // CLAUDE.md split silently broke one such link and this checker could not see it.
@@ -257,12 +259,28 @@ const walkRules = (abs, rel) => {
   }
 };
 walkRules(path.join(repoRoot, ".claude", "rules"), ".claude/rules");
-for (const dir of ["specs", "prds", "adr"]) {
+for (const dir of ["specs", "adr"]) {
   const abs = path.join(repoRoot, dir);
   if (!existsSync(abs)) continue; // optional directories
   for (const f of readdirSync(abs).sort()) {
     if (f.endsWith(".md")) extraLinkFiles.push(path.join(dir, f));
   }
+}
+// prds/ RECURSIVELY (issue #343 — see the block above the extraLinkFiles
+// declaration): pulls in prds/done/**, so an archived PRD's inbound relative and
+// backticked artifact links are checked too. `.md`-only, sorted for stable
+// output, no symlink-follow (the prds/ tree has none — contrast walkRules).
+const collectPrdsMd = (absDir, relDir) => {
+  for (const e of readdirSync(absDir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+    const abs = path.join(absDir, e.name);
+    const rel = path.join(relDir, e.name);
+    if (e.isDirectory()) collectPrdsMd(abs, rel);
+    else if (e.name.endsWith(".md")) extraLinkFiles.push(rel);
+  }
+};
+{
+  const prdsAbs = path.join(repoRoot, "prds");
+  if (existsSync(prdsAbs)) collectPrdsMd(prdsAbs, "prds");
 }
 
 // Backticked artifact-path check (issue #189). A path written in `backticks` is

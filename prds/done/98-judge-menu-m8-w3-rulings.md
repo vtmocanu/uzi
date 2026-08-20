@@ -4,7 +4,7 @@
 `feature/prd-98-t3` @ `d4740e1c` (origin/main `6be9f542` + `t2-fid` + `t2-web` merged;
 `t2-lim`, `tier2`, `t2-seam6`, `t2-cli` still pending at that moment).
 
-**This file does not edit `prds/98-judge-menu-m8-design.md`.** That file is landing through
+**This file does not edit `prds/done/98-judge-menu-m8-design.md`.** That file is landing through
 task #1's merge of `feature/prd-98-t2-fid`, and two writers on one file is how this PRD lost
 work before. Where a ruling below supersedes a section of the design note, it says so by
 section id; read them together, this one on top.
@@ -434,7 +434,7 @@ tests are what changed. But it **is** a change to a funded scope, so it goes to 
 coder as a guess.
 
 **My recommendation, and the honest way to honour "100%":** build B4′ and B6′, and record in
-`prds/98-judge-menu.md` — by test function name — where B1, B2, B3, B5 and B6's matrix are
+`prds/done/98-judge-menu.md` — by test function name — where B1, B2, B3, B5 and B6's matrix are
 actually pinned. That is 100% of the properties covered, with the coverage *named* rather than
 *repeated*, at roughly 40% of the cost and about a quarter of the added harness minutes. A
 property asserted twice is not covered twice; it is covered once and paid for twice, and the
@@ -445,7 +445,7 @@ second copy is the one that rots when the first is edited.
 extra days and ~3 extra harness minutes per run for wire-level restatements of live-DB
 assertions. Say the word and the spec above becomes an addition rather than a replacement.
 
-**One request against `prds/98-judge-menu.md`, carried forward from the design note because it
+**One request against `prds/done/98-judge-menu.md`, carried forward from the design note because it
 is still unactioned:** the Success Criteria say the no-token-spend property is *"proven by the
 M8 e2e leg"*. It is not and cannot be — see the B8 refutation. It is proven by
 `TestDispositionTouchesStoreOnly` and `TestBulkDispositionTouchesStoreOnly`. Left as a request;

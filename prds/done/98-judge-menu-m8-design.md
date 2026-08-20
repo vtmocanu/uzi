@@ -2,7 +2,7 @@
 
 **Status**: design only. Nothing here is built. Written 2026-07-21 against `ad6c63d9`
 (branch `feature/prd-98-t2-fid`, based on `origin/main`).
-**Owner of the parent PRD**: the team lead — this file does not edit `prds/98-judge-menu.md`.
+**Owner of the parent PRD**: the team lead — this file does not edit `prds/done/98-judge-menu.md`.
 
 **Why this file and not `adr/`.** `adr/` holds two entries and both are `Status: Accepted
 (PRD #N merged)` — durable design records of shipped work. An ADR for unbuilt work would
@@ -1265,7 +1265,7 @@ independent of Part B entirely and can land first.
 2. **A6a — sort stability.** Not a product question, but a cost one the lead may want to
    overrule: 13 interleaved groups to pin it, or declare it unpinned with the measured reason.
    Recommend paying — it is the cheapest case per row despite being the widest.
-3. **A request against `prds/98-judge-menu.md` (the lead's file, not mine):** the Success
+3. **A request against `prds/done/98-judge-menu.md` (the lead's file, not mine):** the Success
    Criteria say no-token-spend is *"proven by the M8 e2e leg"*. It is not, and cannot be — see
    the B8 refutation. It is proven by `TestDispositionTouchesStoreOnly` and
    `TestBulkDispositionTouchesStoreOnly`. Left as a request so the line does not silently

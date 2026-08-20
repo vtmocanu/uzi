@@ -431,7 +431,7 @@ above).
 | 2 | M1 — Price table + reconciliation test | M0 | `web/src/lib/modelPricing.ts` (+test) |
 | 3 | M2 — Cost in the usage reduction | M1 | `web/src/lib/runUsage.ts` (+test) |
 | 4 | M3 — Run-page panel | M2 | `web/src/components/RunUsage.tsx`, `web/src/pages/RunView.tsx`, `web/src/mocks/*` |
-| 5 | M4 — Docs + ADR | M3 | `docs/`, `adr/0194-live-cost-estimate.md` |
+| 5 | M4 — Docs + ADR | M3 | `docs/`, `adr/0194-live-cost-estimate.md` | <!-- check-docs:ignore-path: adr/0194 was M4's planned ADR; never created, kept as historical milestone-plan text -->
 | 5 | M5 — Verify on a live run | M3 | k8s-first per CLAUDE.md |
 
 - [ ] **M0 — Can per-call `output_tokens` be made whole? Everything hinges on
@@ -591,7 +591,7 @@ above).
   page) explaining the two figures, why the estimate is an estimate, and where
   the rate table lives and when it must be updated. Frontmatter per
   `docs/README.md`; `npm run build` runs `check-docs`. **Plus
-  `adr/0194-live-cost-estimate.md`** (numbered by originating issue per the
+  `adr/0194-live-cost-estimate.md`** (numbered by originating issue per the <!-- check-docs:ignore-path: adr/0194 was this PRD's planned M4 ADR; never created -->
   CLAUDE.md convention) recording the durable contract, not the table: a
   client-derived estimate may never be persisted, never merged into `run_usage`,
   never presented as billed; and any second consumer (CLI, board, Slack) must
