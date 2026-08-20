@@ -2311,6 +2311,16 @@ export const mockApi = {
   setRepoEnabled: async (id: string, enabled: boolean) => {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");
+    // PRD #345 M2: mirror the server, which runs the enable guardrail (privcheck)
+    // ONLY on the enable path (forge.go SetRepoEnabled). A refused enable returns
+    // 422 { error, violations[] }; a disable is never gated. This makes the
+    // refused-enable UX (Repos.tsx) reproducible under VITE_UZI_MOCK=1.
+    if (enabled && r.guardrail_blocked) {
+      const violations = mockBlockedRepoMeta[id]?.block_messages ?? [
+        "this repository cannot be enabled until its guardrail violations are resolved",
+      ];
+      throw new ApiError(422, "repository cannot be enabled — guardrail violations", { violations });
+    }
     r.enabled = enabled;
     return delay({ repo: { ...r } });
   },
