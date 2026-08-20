@@ -112,6 +112,12 @@ func newDemoClient() *uzicli.FakeClient {
 	}
 	return &uzicli.FakeClient{
 		Runs: runs, RunByID: byID, LogsByID: logs, InputsByID: inputs,
+		// Two Anthropic tokens so the own board clears the >1-token gate (PRD #295) and shows
+		// the credential column; the demo runs above carry meta/personal labels + reasons.
+		Secrets: []apitypes.SecretDTO{
+			{ID: "sec-personal", Kind: "anthropic", Label: "personal", IsDefault: true},
+			{ID: "sec-meta", Kind: "anthropic", Label: "meta"},
+		},
 		// StreamEvents nil: NewRunStream emits nothing and stays OPEN (so the detail reads
 		// "live"); the ticker above supplies the live frames.
 		StreamEvents: nil,
@@ -152,14 +158,32 @@ func demoRuns(now time.Time) []apitypes.RunListItemDTO {
 	}
 	scheduler.MilestonesCompleted = []string{"m1", "m2"}
 	scheduler.MilestonesInProgress = []string{"m3"}
+	// meta on an auto pick with headroom → NEUTRAL tone (no dot), the common case.
+	headroom := 27
+	scheduler.AnthropicSecretID = sp("sec-meta")
+	scheduler.AnthropicSecretLabel = sp("meta")
+	scheduler.AnthropicSelectReason = sp("auto")
+	scheduler.AnthropicHeadroomPct = &headroom
+
+	// personal on a stale-pool fallback → WARNING tone (● amber): auto declined and the default paid.
+	sync := mk("c3d4e5f6-1111-2222-3333-444444444444", "issue", "running", "Refactor the forge sync loop for the GitHub driver", "stalled", nil, 0, 51*time.Minute)
+	sync.AnthropicSecretID = sp("sec-personal")
+	sync.AnthropicSecretLabel = sp("personal")
+	sync.AnthropicSelectReason = sp("pool_stale")
+
+	// personal on a best-of-pool pick → INFO tone (● indigo): the pool is nearly exhausted.
+	portJudge := mk("f6a7b8c9-1111-2222-3333-444444444444", "issue", "limit_wait", "Port the judge to per-model usage folding", "", nil, 0, 22*time.Minute)
+	portJudge.AnthropicSecretID = sp("sec-personal")
+	portJudge.AnthropicSecretLabel = sp("personal")
+	portJudge.AnthropicSelectReason = sp("best_of_pool")
 
 	return []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: "d0e1f2a3-1111-2222-3333-444444444444", Kind: "issue", Status: "running", IsPlanning: true, IssueTitle: "Draft the plan for webhook delivery retries", CreatedAt: now.Add(-90 * time.Second)}},
 		scheduler,
 		mk("b2c3d4e5-1111-2222-3333-444444444444", "ci_fix", "awaiting_approval", "Fix flaky pipeline on main", "", nil, 0, 2*time.Minute),
-		mk("c3d4e5f6-1111-2222-3333-444444444444", "issue", "running", "Refactor the forge sync loop for the GitHub driver", "stalled", nil, 0, 51*time.Minute),
+		sync,
 		mk("e5f6a7b8-1111-2222-3333-444444444444", "issue", "completed", "Wire the OIDC login button into the header", "", sp("ideal"), 0, 3*time.Hour),
-		mk("f6a7b8c9-1111-2222-3333-444444444444", "issue", "limit_wait", "Port the judge to per-model usage folding", "", nil, 0, 22*time.Minute),
+		portJudge,
 		mk("a7b8c9d0-1111-2222-3333-444444444444", "issue", "failed", "Migrate per-user secrets into the vault hierarchy", "", sp("issues"), 3, 5*time.Hour),
 	}
 }
