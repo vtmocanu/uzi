@@ -6,6 +6,26 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.46.1] - 2026-08-20
+
+### Added
+
+- **check-docs now gates stale backticked artifact paths (#410, issue #189).**
+  `web/scripts/check-docs.mjs` validates backticked `prds/…` and `adr/…` paths, not
+  just Markdown links, so archiving a PRD into `prds/done/` can no longer silently
+  rot its inbound backtick references. A `check-docs:ignore-path` marker opts out the
+  didactic examples and the not-yet-created forward references. Landed with a one-off
+  sweep repointing the existing stale references across the docs and specs to
+  `prds/done/`.
+
+### Changed
+
+- **Dependency and CI maintenance.** Bumps `charm.land/lipgloss/v2` (v2.0.5 to
+  v2.0.6) and `github.com/charmbracelet/x/ansi` (v0.11.7 to v0.11.8) (#407),
+  `@anthropic-ai/claude-agent-sdk` (0.3.226 to 0.3.228) (#406), `tsx` (to 4.23.12)
+  (#405), and `knip` (to 6.32.2) (#409); bumps the Docker and paths-filter GitHub
+  Actions to their Node 24 majors (#404).
+
 ## [0.46.0] - 2026-08-19
 
 ### Added
