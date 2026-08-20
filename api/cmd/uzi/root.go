@@ -291,22 +291,50 @@ func resolveSettings(env Env, gf *globalFlags) (uzicli.Settings, error) {
 		if err != nil {
 			return s, uzicli.Exitf(uzicli.ExitAuth, "%v", err)
 		}
-		// D3: a context with no stored URL inherits the default context's URL
-		// (token does NOT inherit).
-		if s.URL == "" && name != "default" {
-			s.URL = cfg.Contexts["default"].URL
-		}
 	}
-	if v := os.Getenv("UZI_URL"); v != "" {
-		s.URL = v
+	// URL layering — D3 inheritance plus $UZI_URL/--url — is factored into
+	// resolveURL so `login` (which must resolve a URL for a brand-new --context
+	// name that D9 would reject) shares the exact same precedence and cannot drift
+	// from it. The result overrides s.URL from Resolve above (resolveURL re-reads
+	// the same stored URL), so the two are equivalent for an existing context.
+	u, err := resolveURL(env, gf, name)
+	if err != nil {
+		return s, err
 	}
+	s.URL = u
 	if v := os.Getenv("UZI_TOKEN"); v != "" {
 		s.Token = v
 	}
-	if gf.url != "" {
-		s.URL = gf.url
-	}
 	return s, nil
+}
+
+// resolveURL resolves the API base URL for the named context with the same
+// precedence resolveSettings applies — --url > $UZI_URL > the context's own
+// stored URL > the default context's stored URL (D3 inheritance) — but WITHOUT
+// D9's existence gate and without touching credentials. `login` uses it: a login
+// is a WRITE that D4 lets CREATE a brand-new --context name, so it must resolve a
+// URL for a context resolveSettings would reject as unknown, and it needs only the
+// URL (the token comes fresh from the server).
+func resolveURL(env Env, gf *globalFlags, name string) (string, error) {
+	var u string
+	if env.Store != nil {
+		cfg, err := env.Store.LoadConfig()
+		if err != nil {
+			return "", uzicli.Exitf(uzicli.ExitAuth, "%v", err)
+		}
+		u = cfg.Contexts[name].URL
+		// D3: a context with no stored URL inherits the default context's URL.
+		if u == "" && name != "default" {
+			u = cfg.Contexts["default"].URL
+		}
+	}
+	if v := os.Getenv("UZI_URL"); v != "" {
+		u = v
+	}
+	if gf.url != "" {
+		u = gf.url
+	}
+	return u, nil
 }
 
 // client resolves settings and builds the API client.

@@ -294,6 +294,90 @@ func TestContextRmUnknown(t *testing.T) {
 	}
 }
 
+// D7: `context set <name> --url <url>` creates a URL-only context — its config
+// entry has the URL and no token is stored.
+func TestContextSetCreatesURLOnly(t *testing.T) {
+	env := storeEnv(t, "")
+	out, _, code := runCLI(t, env, "context", "set", "admin", "--url", "https://a.example")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	cfg, err := env.Store.LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Contexts["admin"].URL != "https://a.example" {
+		t.Errorf("admin url = %q, want https://a.example", cfg.Contexts["admin"].URL)
+	}
+	// No token was created for it.
+	if got, _ := env.Store.Resolve("admin"); got.Token != "" {
+		t.Errorf("context set stored a token: %q", got.Token)
+	}
+	if !strings.Contains(out, "admin") || !strings.Contains(out, "https://a.example") {
+		t.Errorf("confirmation missing name/url:\n%s", out)
+	}
+}
+
+// `context set` updates an existing context's URL while preserving its token.
+func TestContextSetPreservesToken(t *testing.T) {
+	cfg := &uzicli.Config{Contexts: map[string]uzicli.Context{"admin": {URL: "https://old.example"}}}
+	creds := &uzicli.Credentials{Contexts: map[string]uzicli.Credential{"admin": {Token: "uza_keep"}}}
+	env := seedStore(t, cfg, creds)
+	if _, _, code := runCLI(t, env, "context", "set", "admin", "--url", "https://new.example"); code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	got, err := env.Store.Resolve("admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.URL != "https://new.example" {
+		t.Errorf("url = %q, want updated", got.URL)
+	}
+	if got.Token != "uza_keep" {
+		t.Errorf("token = %q, want preserved", got.Token)
+	}
+}
+
+// `context set` with no --url is a usage error.
+func TestContextSetRequiresURL(t *testing.T) {
+	env := storeEnv(t, "")
+	if _, _, code := runCLI(t, env, "context", "set", "admin"); code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage)", code, uzicli.ExitUsage)
+	}
+}
+
+// `context set` with a control/bidi name is a usage error and writes nothing.
+func TestContextSetBadName(t *testing.T) {
+	env := storeEnv(t, "")
+	if _, _, code := runCLI(t, env, "context", "set", "ad\x07min", "--url", "https://a.example"); code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage)", code, uzicli.ExitUsage)
+	}
+	cfg, err := env.Store.LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Contexts) != 0 {
+		t.Errorf("a rejected name still wrote config: %+v", cfg.Contexts)
+	}
+}
+
+// `context set` with a control/bidi URL is a usage error and writes nothing:
+// the URL is validated at the write path (symmetric with the name) because it is
+// emitted raw in the `--json` channel.
+func TestContextSetBadURL(t *testing.T) {
+	env := storeEnv(t, "")
+	if _, _, code := runCLI(t, env, "context", "set", "admin", "--url", "https://a\x07.example"); code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage)", code, uzicli.ExitUsage)
+	}
+	cfg, err := env.Store.LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Contexts) != 0 {
+		t.Errorf("a rejected url still wrote config: %+v", cfg.Contexts)
+	}
+}
+
 // The `context` verb group is wired into the root command tree.
 func TestContextCommandWired(t *testing.T) {
 	root := newRootCmd(fakeEnv(&uzicli.FakeClient{}))
@@ -301,7 +385,7 @@ func TestContextCommandWired(t *testing.T) {
 	if ctx == nil {
 		t.Fatal("context command not wired into newRootCmd")
 	}
-	for _, sub := range []string{"list", "current", "use", "rm"} {
+	for _, sub := range []string{"list", "current", "use", "set", "rm"} {
 		if findCmd(ctx, sub) == nil {
 			t.Errorf("context missing subcommand %q", sub)
 		}

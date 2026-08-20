@@ -107,11 +107,12 @@ Global flags (valid on every command): `--json`, `--url <url>`, `--quiet`,
 uzi login
 uzi logout
 uzi auth token [--with-token]
-uzi auth status
+uzi auth status [--all]
 uzi whoami
 uzi context list
 uzi context current
 uzi context use <name>
+uzi context set <name> --url <url>
 uzi context rm <name>
 
 uzi run list

@@ -187,6 +187,65 @@ func TestLoginNoURL(t *testing.T) {
 	}
 }
 
+// D4: `login --context admin` stores the minted token AND the resolved URL under
+// a BRAND-NEW `admin` context — it is CREATED, not rejected by D9 (login resolves
+// its URL without the existence gate). The default context is untouched.
+func TestLoginNamedContextCreated(t *testing.T) {
+	stubLoginHooks(t, func(string) error { return nil })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/auth/cli/start":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{"request_id":"req-9","user_code":"EEEE-FFFF","expires_in":300,"interval":5}`)
+		case "/api/auth/cli/poll":
+			_, _ = io.WriteString(w, `{"token":"uza_named_secret","user":{"id":"u2","email":"admin@x.io"}}`)
+		}
+	}))
+	defer srv.Close()
+
+	env, store, out, errb := loginEnv(t)
+	t.Setenv("UZI_URL", "")
+	t.Setenv("UZI_TOKEN", "")
+
+	// A store with no `admin` context at all — a read command under -c admin would
+	// D9-error, but login must CREATE it.
+	code := Main(env, []string{"login", "-c", "admin", "--url", srv.URL})
+	if code != uzicli.ExitOK {
+		t.Fatalf("named login exit = %d (stderr: %s)", code, errb.String())
+	}
+	got, err := store.Resolve("admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Token != "uza_named_secret" {
+		t.Fatalf("admin token = %q, want the minted token", got.Token)
+	}
+	if got.URL != srv.URL {
+		t.Fatalf("admin url = %q, want %q", got.URL, srv.URL)
+	}
+	// The default context was not written.
+	if d, _ := store.Resolve("default"); d.Token != "" || d.URL != "" {
+		t.Errorf("default context was written by a named login: %+v", d)
+	}
+	if !strings.Contains(out.String(), "admin@x.io") {
+		t.Errorf("success line missing identity:\n%s", out.String())
+	}
+}
+
+// D9 for READ commands is unaffected: an explicit unknown context is still a usage
+// error before any client is built (login is the write-path exception, not this).
+func TestReadCommandUnknownContextStillD9(t *testing.T) {
+	env := storeEnv(t, "")
+	_, errOut, code := runCLI(t, env, "auth", "status", "-c", "ghost")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("read under unknown context exit = %d, want %d (usage)", code, uzicli.ExitUsage)
+	}
+	if !strings.Contains(errOut, "unknown context") {
+		t.Errorf("error missing 'unknown context':\n%s", errOut)
+	}
+}
+
 // logout removes the stored credential (local-only; it never calls the server).
 func TestLogoutRemovesCredential(t *testing.T) {
 	store := uzicli.NewStore(t.TempDir())
@@ -206,5 +265,49 @@ func TestLogoutRemovesCredential(t *testing.T) {
 	}
 	if got, _ := store.Resolve("default"); got.Token != "" {
 		t.Fatalf("logout left a token behind: %q", got.Token)
+	}
+}
+
+// D4/D8: `logout -c admin` clears ONLY admin's token. Admin's config entry (its
+// URL) is left intact so a re-login works, and the default context is untouched.
+func TestLogoutNamedContextD8(t *testing.T) {
+	store := uzicli.NewStore(t.TempDir())
+	if err := store.SaveConfig(&uzicli.Config{Contexts: map[string]uzicli.Context{
+		"default": {URL: "https://default.example"},
+		"admin":   {URL: "https://admin.example"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveCredentials(&uzicli.Credentials{Contexts: map[string]uzicli.Credential{
+		"default": {Token: "uzc_default"},
+		"admin":   {Token: "uza_admin"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb bytes.Buffer
+	env := Env{Stdout: &out, Stderr: &errb, Stdin: strings.NewReader(""), Store: store,
+		NewClient: func(uzicli.Settings) uzicli.Client { return &uzicli.FakeClient{} }}
+	t.Setenv("UZI_URL", "")
+	t.Setenv("UZI_TOKEN", "")
+
+	if code := Main(env, []string{"logout", "-c", "admin"}); code != uzicli.ExitOK {
+		t.Fatalf("logout -c admin exit = %d (stderr: %s)", code, errb.String())
+	}
+
+	// admin's token is gone...
+	if got, _ := store.Resolve("admin"); got.Token != "" {
+		t.Errorf("admin token survived logout: %q", got.Token)
+	}
+	// ...but admin's config URL remains (re-login-ready).
+	cfg, err := store.LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Contexts["admin"].URL != "https://admin.example" {
+		t.Errorf("admin config URL = %q, want it preserved (D8)", cfg.Contexts["admin"].URL)
+	}
+	// The default context is untouched.
+	if got, _ := store.Resolve("default"); got.Token != "uzc_default" {
+		t.Errorf("default token = %q, want it untouched", got.Token)
 	}
 }
