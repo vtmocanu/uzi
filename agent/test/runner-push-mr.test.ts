@@ -5,7 +5,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { nullLogger } from "./helpers.js";
 import { StubExecutor, type Executor } from "../src/executor.js";
-import { RunRunner } from "../src/runner.js";
+import { RunRunner, composeWorkflowScopeReason } from "../src/runner.js";
+import { GitHubClient } from "../src/forge.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import {
   api,
@@ -563,5 +564,224 @@ describe("RunRunner — worker-performed push + MR", () => {
     assert.strictEqual(completed.mr_iid, 42);
     assert.strictEqual(calls.length, 1, "the MR was opened on the null-diff run");
     assert.strictEqual(pushed, true, "the branch was pushed on the null-diff run");
+  });
+});
+
+// PRD #377 M1: a GitHub run whose branch touches .github/workflows/** cannot be pushed by
+// the bot's repo-only PAT (privcheck forbids the workflow scope by design). The worker
+// detects it at finalize, BEFORE the doomed push, and ends the run in a typed `failed`
+// outcome that preserves the agent's diff. Every fixture below is a SYNTHETIC in-memory
+// `changedFiles`/`workflowScopeDiff` stub — no real workflow file ever touches disk.
+describe("RunRunner — workflow-scope early fail (PRD #377 M1)", () => {
+  /** Build a runner wired to the fake GitHub client, mirroring the github routing test. */
+  function githubRunner(github: GitHubClient): RunRunner {
+    return new RunRunner(
+      client,
+      git,
+      () => ({ executor: new StubExecutor(nullLogger()) }),
+      nullLogger(),
+      20,
+      undefined,
+      { pollMs: 5, planApprovalTimeoutMs: 0, github },
+    );
+  }
+
+  const githubClaim = (iid: number, overrides = {}) =>
+    gitlabClaim(iid, {
+      repo: {
+        id: "r1",
+        url: "https://github.com/org/repo",
+        clone_url: fx.originPath,
+        forge_type: "github",
+      },
+      ...overrides,
+    });
+
+  it("github + a .github/workflows change fails early with workflow_scope_missing, skips the push, and preserves the redacted diff", async () => {
+    const { github, calls } = fakeGitHub();
+    let pushed = false;
+    git.pushBranch = (async () => {
+      pushed = true;
+    }) as typeof git.pushBranch;
+    // Synthetic fixtures only — a workflow path in the changed set, and a diff string that
+    // carries the run's forge PAT so we can prove the CALLER's redactText was applied.
+    const PAT = "fixture-forge-pat-000000";
+    const SYNTH_DIFF =
+      "diff --git a/.github/workflows/main-guard.yml b/.github/workflows/main-guard.yml\n" +
+      `+ leaked_token=${PAT}\n+on: [push]\n`;
+    git.changedFiles = (async () => [
+      ".github/workflows/main-guard.yml",
+    ]) as typeof git.changedFiles;
+    git.workflowScopeDiff = (async () =>
+      SYNTH_DIFF) as typeof git.workflowScopeDiff;
+
+    const claim = githubClaim(31);
+    await githubRunner(github).execute(claim);
+
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
+    assert.deepStrictEqual(statuses, ["running", "running", "failed"]);
+    const failed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "failed",
+    )!.body;
+    assert.strictEqual(failed.fail_origin, "workflow_scope_missing");
+    assert.match(
+      failed.failure_reason ?? "",
+      /docs\/github-bot-setup\.md/,
+      "the reason must point at the setup doc",
+    );
+    assert.match(
+      failed.failure_reason ?? "",
+      /main-guard\.yml/,
+      "the reason must name the offending path",
+    );
+    // The preserved patch is the REDACTED form: the PAT was scrubbed in place.
+    assert.ok(
+      failed.preserved_patch,
+      "the agent's diff must be preserved on the failed report",
+    );
+    assert.ok(
+      !failed.preserved_patch!.includes(PAT),
+      "the PAT must be scrubbed from the preserved patch",
+    );
+    assert.match(
+      failed.preserved_patch!,
+      /REDACTED/,
+      "the secret should be redacted in place",
+    );
+    assert.match(
+      failed.preserved_patch!,
+      /main-guard\.yml/,
+      "the non-secret diff content is preserved",
+    );
+
+    assert.strictEqual(pushed, false, "the doomed push must be skipped");
+    assert.strictEqual(calls.length, 0, "no PR opened on the early fail");
+    assert.strictEqual(fs.existsSync(worktreeDirFor(31)), false);
+  });
+
+  it("github + a non-workflow change pushes and opens a PR normally (predicate is workflow-path-gated)", async () => {
+    const { github, calls } = fakeGitHub();
+    let pushed = false;
+    git.pushBranch = (async () => {
+      pushed = true;
+    }) as typeof git.pushBranch;
+    git.changedFiles = (async () => ["src/foo.ts"]) as typeof git.changedFiles;
+
+    const claim = githubClaim(32);
+    await githubRunner(github).execute(claim);
+
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
+    assert.ok(
+      !statuses.includes("failed"),
+      `a non-workflow github run must not fail (got ${statuses.join(",")})`,
+    );
+    const completed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "completed",
+    )!.body;
+    assert.strictEqual(completed.mr_iid, 42);
+    assert.strictEqual(pushed, true, "the branch was pushed on the non-workflow run");
+    assert.strictEqual(calls.length, 1, "the PR was opened on the non-workflow run");
+  });
+
+  it("github + changedFiles returns null (diff-failure) fails OPEN to the normal push (D6)", async () => {
+    const { github, calls } = fakeGitHub();
+    let pushed = false;
+    git.pushBranch = (async () => {
+      pushed = true;
+    }) as typeof git.pushBranch;
+    // null is diff-FAILURE, distinct from a confirmed-empty []; the guard must fall through
+    // to the normal push+PR path (fail open), never blocking a possibly-legit run.
+    git.changedFiles = (async () => null) as typeof git.changedFiles;
+
+    const claim = githubClaim(33);
+    await githubRunner(github).execute(claim);
+
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
+    assert.ok(
+      !statuses.includes("failed"),
+      `a null-diff github run must fail open, not fail (got ${statuses.join(",")})`,
+    );
+    const completed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "completed",
+    )!.body;
+    assert.strictEqual(completed.mr_iid, 42);
+    assert.strictEqual(pushed, true, "the branch was pushed on the null-diff run");
+    assert.strictEqual(calls.length, 1, "the PR was opened on the null-diff run");
+  });
+
+  it("a non-github (forgejo) claim with a workflow path is UNAFFECTED — normal push + PR", async () => {
+    const { forgejo, calls } = fakeForgejo();
+    let pushed = false;
+    git.pushBranch = (async () => {
+      pushed = true;
+    }) as typeof git.pushBranch;
+    // The exact input that fails a github run — but the predicate is github-only, so a
+    // forgejo run must push and open its PR as normal.
+    git.changedFiles = (async () => [
+      ".github/workflows/main-guard.yml",
+    ]) as typeof git.changedFiles;
+
+    const claim = gitlabClaim(34, {
+      repo: {
+        id: "r1",
+        url: "https://forgejo.example.test/org/repo",
+        clone_url: fx.originPath,
+        forge_type: "forgejo",
+      },
+    });
+    const r = new RunRunner(
+      client,
+      git,
+      () => ({ executor: new StubExecutor(nullLogger()) }),
+      nullLogger(),
+      20,
+      undefined,
+      { pollMs: 5, planApprovalTimeoutMs: 0, forgejo },
+    );
+    await r.execute(claim);
+
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
+    assert.ok(
+      !statuses.includes("failed"),
+      `a non-github run must be unaffected (got ${statuses.join(",")})`,
+    );
+    const completed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "completed",
+    )!.body;
+    assert.strictEqual(completed.mr_iid, 42);
+    assert.strictEqual(pushed, true, "the branch was pushed on the forgejo run");
+    assert.strictEqual(calls.length, 1, "the PR was opened on the forgejo run");
+  });
+
+  it("composeWorkflowScopeReason: a long path list stays within the cap and keeps the doc link intact", () => {
+    const paths = Array.from(
+      { length: 80 },
+      (_, i) => `.github/workflows/generated-guard-${i}-with-a-long-name.yml`,
+    );
+    const reason = composeWorkflowScopeReason(paths);
+    assert.ok(
+      reason.length <= 512,
+      `failure_reason must be capped at 512 (got ${reason.length})`,
+    );
+    assert.match(
+      reason,
+      /docs\/github-bot-setup\.md/,
+      "the doc link must survive path-list truncation",
+    );
+    assert.match(
+      reason,
+      /and \d+ more/,
+      "a truncated list must show the omitted count",
+    );
+    // The first path is always shown; the doc link never gets cut off the end.
+    assert.match(reason, /generated-guard-0-/);
   });
 });
