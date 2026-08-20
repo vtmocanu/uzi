@@ -401,6 +401,55 @@ describe("RunsList milestone badge (PRD #122)", () => {
     await waitFor(() => expect(screen.getByText("Plain run")).toBeTruthy());
     expect(screen.queryByText(/^M\d+\/\d+$/)).toBeNull();
   });
+
+  // PRD #390 D5 / M4 guard. A milestone-bearing run whose tracker was never reported
+  // (milestones_completed null) must render the NEUTRAL M–/N ("not reported") on the row,
+  // distinct from a genuine M0/N — so a run that reported nothing never reads as a
+  // failure-looking zero. This is the row-surface counterpart of the RunView header guard.
+  it("renders the neutral M–/N (never M0/N) on a milestone run whose tracker was never reported", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "unrep",
+          issue_title: "Unreported run",
+          status: "running",
+          milestones: [
+            { id: "a", title: "A" },
+            { id: "b", title: "B" },
+            { id: "c", title: "C" },
+          ],
+          milestones_completed: null,
+        }),
+      ],
+    });
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("Unreported run")).toBeTruthy());
+    // The badge is present, and it is the neutral en-dash numerator, never a 0.
+    expect(screen.getByText("M–/3")).toBeTruthy();
+    expect(screen.queryByText("M0/3")).toBeNull();
+  });
+
+  it("renders a genuine M0/N when an empty completion set WAS reported (distinct from neutral)", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "zero",
+          issue_title: "Reported-zero run",
+          status: "running",
+          milestones: [
+            { id: "a", title: "A" },
+            { id: "b", title: "B" },
+            { id: "c", title: "C" },
+          ],
+          milestones_completed: [],
+        }),
+      ],
+    });
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("Reported-zero run")).toBeTruthy());
+    expect(screen.getByText("M0/3")).toBeTruthy();
+    expect(screen.queryByText("M–/3")).toBeNull();
+  });
 });
 
 // Issue #256 M3: each row carries a live, per-state duration token derived client-side
