@@ -21663,7 +21663,7 @@ earlier Model-B lockstep in which the hosted-worker image tag defaulted to
 `Chart.AppVersion`, so every release Recreate-rolled the whole worker fleet and hard-killed
 in-flight runs — which then requeue and strand on the vault-unlock gate (OIDC vaults do not
 auto-unlock across restart, a PRD non-goal we keep). Full rationale in the Decision Log of
-`prds/422-surge-upgrade.md`.
+`prds/done/422-surge-upgrade.md`.
 
 - **Worker tag pinned to a CONCRETE version, independent of appVersion.** The hosted-worker
   image tag is `workers.image.tag` (`deploy/chart/values.yaml`), a concrete pin the

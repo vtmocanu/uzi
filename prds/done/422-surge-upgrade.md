@@ -1,7 +1,7 @@
 # PRD #422 — Surge upgrade: release without killing in-flight runs
 
 **Issue**: #422
-**Status**: Draft
+**Status**: Complete
 **Priority**: High
 **Author**: Vlad Mocanu
 **Created**: 2026-08-20
