@@ -227,8 +227,11 @@ export function BuildInfoPopover({
   // Instance-scoped: TWO SidebarContent mounts exist simultaneously (the desktop
   // aside and the mobile drawer), so a hardcoded id would put a duplicate in the
   // document and make aria-describedby ambiguous. Not a lint nit — it is the one
-  // structural fact about this component's environment.
+  // structural fact about this component's environment. `popId` is the hover/
+  // opacity container; `descId` is the DESCRIPTIVE subtree the badge points at
+  // (see the aria-describedby note below).
   const popId = useId();
+  const descId = useId();
 
   // Escape dismisses it however it was opened. On the BUTTON's onKeyDown this only
   // worked while the badge had focus, so a mouse user who hovered it open pressed
@@ -339,10 +342,21 @@ export function BuildInfoPopover({
         // `display:none` and `visibility:hidden` all do the same. If you change
         // how this hides, re-measure the AX tree; do not reason about it.
         //
+        // aria-describedby points at the inner `#descId` div — the DESCRIPTIVE
+        // subtree ONLY (the `uzi <label>` heading, the age/commits subtitle and the
+        // coordinate `<dl>`). It deliberately does NOT point at the outer `#popId`
+        // container, which also holds the interactive "Changelog" button (PRD #415):
+        // folding a button's label into the badge's accessible DESCRIPTION is an
+        // ARIA anti-pattern, so the button lives inside `#popId` (for the hover/
+        // opacity/pointer-events behaviour) but OUTSIDE `#descId`. The exact
+        // computed description above is re-measured over CDP in the M5 browser pass
+        // against this inner-`#descId` structure; do not reason about it from the
+        // markup.
+        //
         // No aria-expanded, deliberately: the APG tooltip pattern associates by
         // aria-describedby alone, and announcing "collapsed"/"expanded" for
         // something a screen reader can already read in full would be noise.
-        aria-describedby={popId}
+        aria-describedby={descId}
         // Focus opens it, which is what makes this keyboard-reachable at all —
         // handled at the HOST now (see the host's onFocus/onBlur) so focus moving
         // onto the panel's Changelog button does not close it. A tap opens it
@@ -389,13 +403,18 @@ export function BuildInfoPopover({
           open ? "opacity-100" : "pointer-events-none opacity-0",
         )}
       >
-        <div className="font-mono text-xs font-semibold text-fg">uzi {label}</div>
-        {subParts.length > 0 && (
-          <div className="mb-2 border-b border-edge pb-2 text-[11px] text-faint">
-            {subParts.join(" · ")}
-          </div>
-        )}
-        <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px]">
+        {/* The DESCRIPTIVE subtree the badge's aria-describedby points at: the
+            heading, the subtitle and the coordinate list ONLY. The Changelog
+            button below is intentionally OUTSIDE this div so it is not folded into
+            the badge's accessible description (see the aria-describedby note). */}
+        <div id={descId}>
+          <div className="font-mono text-xs font-semibold text-fg">uzi {label}</div>
+          {subParts.length > 0 && (
+            <div className="mb-2 border-b border-edge pb-2 text-[11px] text-faint">
+              {subParts.join(" · ")}
+            </div>
+          )}
+          <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px]">
           {founded && <Row label="Founded" value={founded} />}
           {/* `full` is the raw RFC3339 the server sent, seconds and all — the
               rendered form is minute-granular, and the one time you want the
@@ -438,10 +457,13 @@ export function BuildInfoPopover({
               reads at the bottom rather than sitting between the static build
               coordinates and the PRD counts. */}
           {uptime && <Row label="Uptime" value={uptime} />}
-        </dl>
+          </dl>
+        </div>
         {/* The Changelog entry point (PRD #415 M2). Below the definition list so
-            it reads as an action, not a coordinate. Reachable by keyboard because
-            the host's focus wiring keeps the panel open while focus is on it. */}
+            it reads as an action, not a coordinate. Inside `#popId` (so the host's
+            focus/hover wiring keeps the panel open while focus is on it) but
+            OUTSIDE `#descId`, so this button's label is not folded into the badge's
+            accessible description. */}
         {onOpenChangelog && (
           <button
             type="button"

@@ -500,4 +500,35 @@ describe("BuildInfoPopover — the Changelog entry point (PRD #415 M2)", () => {
     fireEvent.blur(trigger(), { relatedTarget: outside });
     expect(popover().getAttribute("data-open")).toBe("false");
   });
+
+  it("keeps the Changelog button OUT of the badge's accessible description subtree", () => {
+    // aria-describedby points at the inner #descId (heading + subtitle + dl) ONLY,
+    // not the outer #popId container that also holds the interactive Changelog
+    // button. Folding a button's label into a description is an ARIA anti-pattern.
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} onOpenChangelog={vi.fn()} />);
+    const trig = trigger();
+    const descId = trig.getAttribute("aria-describedby");
+    expect(descId).toBeTruthy();
+    // (An id from useId contains a ':' which is invalid in a bare `#id` selector,
+    // so match by attribute — the semantic equivalent of `closest('#' + descId)`.)
+    const descSel = `[id="${descId}"]`;
+    const descEl = document.getElementById(descId!);
+    expect(descEl).not.toBeNull();
+
+    const changelogBtn = screen.getByRole("button", { name: "Changelog" });
+    // NEGATIVE: the button is not a descendant of #descId…
+    expect(changelogBtn.closest(descSel)).toBeNull();
+    // …and the description subtree carries no "Changelog" label at all.
+    expect(descEl!.textContent).not.toContain("Changelog");
+
+    // POSITIVE: #descId still contains the coordinate text a screen reader should
+    // hear when the badge is described.
+    expect(descEl!.textContent).toContain("uzi v0.4.2");
+    expect(descEl!.textContent).toContain("Founded");
+    expect(descEl!.textContent).toContain("Commit");
+
+    // And the button DOES stay inside #popId (the tooltip container) so the host's
+    // focus/hover wiring still reaches it.
+    expect(changelogBtn.closest('[role="tooltip"]')).not.toBeNull();
+  });
 });
