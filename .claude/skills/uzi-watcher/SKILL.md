@@ -133,10 +133,22 @@ worker that could rewrite CI is a supply-chain risk, so this is by design, not a
 "fix" by granting scope. A run whose diff touches `.github/workflows` therefore fails at
 the final push, **atomically**, with a `remote rejected … refusing to allow a Personal
 Access Token to create or update workflow … without workflow scope`. The whole branch push
-is rejected, so **nothing lands** (a `git ls-remote origin` for the run's `agent/issue-*`
-branch comes back empty) and the run's work is unrecoverable (the worker container is gone).
+is rejected, so **nothing lands on the remote** (a `git ls-remote origin` for the run's
+`agent/issue-*` branch comes back empty). But on hosted (k8s) workers **the work is NOT
+lost** — it survives in the worker's PVC; see *Recovering a failed run's work from the
+worker PVC* below (recovered #422's full 12 commits that way, 2026-08-20).
 
-**The split:** uzi implements everything except `.github/workflows`; **you** add the
+**A workflow-scope rejection does NOT always mean the branch touched a workflow file.**
+GitHub compares the branch's `.github/workflows/` tree against the *current* default branch,
+so a branch merely **behind** main on those files (main's CI changed after the run's clone
+base) is rejected the same way — the "base-staleness" mode that killed #422 and #377's first
+run on 2026-08-20 (neither touched a workflow file). PRD #456 fixes this by aligning the
+branch onto current main before the push, so once it lands this mode disappears. Either way,
+if you hit it the work is recoverable (below): `git log --name-only BASE..TIP --
+.github/workflows/` on the recovered branch coming back **empty** confirms base-staleness
+rather than a real plan trap, and a plain rebase onto main then lands it.
+
+**The split** (for a plan that genuinely *edits* a workflow file): uzi implements everything except `.github/workflows`; **you** add the
 workflow-file pieces locally, because your own token has `workflow` scope (confirm with
 `gh auth status` — look for `workflow` in the scopes). So:
 
@@ -146,8 +158,45 @@ workflow-file pieces locally, because your own token has `workflow` scope (confi
 - **After the MR merges**, make the `.github/workflows` edit yourself on a branch, open a
   PR, and merge it (your token carries the scope). Read the target job first, e.g.
   `grep -nA14 'validate-web:' .github/workflows/ci.yml`.
-- **For an already-failed run**, re-create it gated and revise out the workflow edit; the
-  old work cannot be salvaged.
+- **For an already-failed run** whose plan genuinely edited a workflow file, re-create it
+  gated and revise out the workflow edit — but first **recover its work from the worker PVC**
+  (below); the old branch is not gone. For the base-staleness mode a plain rebase lands it
+  with no re-run at all.
+
+## Recovering a failed run's work from the worker PVC
+
+**A push-rejected run's work is usually NOT lost.** On hosted (k8s) workers the branch
+survives in the worker's persistent volume at `refs/uzi-runner/agent/issue-N` (the
+worker-side tracking ref — the branch tip with every commit); only the worker *container* is
+torn down, its data volume persists. Recovered #422's full 12 commits this way, 2026-08-20.
+Needs kube access to your deployment's worker namespace — **read the context and namespace
+from your own kubeconfig; they are deployment-specific, do not hard-code them** (and this is
+a public file).
+
+1. **Find the worker:** `uzi run get RUN --json | jq -r .worker_id`. Its pod is
+   `uzi-hw-WORKER_ID-*` in the worker namespace.
+2. **Bundle the branch out** of the bare clone on the worker's data volume, base excluded so
+   it stays small: `git --git-dir=BARE bundle create /tmp/r.bundle
+   refs/uzi-runner/agent/issue-N ^MERGEBASE` (where `MERGEBASE` = `git
+   --git-dir=BARE merge-base refs/uzi-runner/agent/issue-N refs/remotes/origin/main`),
+   then `kubectl cp` it out.
+3. **Fetch into a branch + an ISOLATED worktree** (never the `main` worktree): `git fetch
+   BUNDLE 'refs/uzi-runner/agent/issue-N:refs/heads/recover/issue-N'`; `git worktree
+   add DIR recover/issue-N`.
+4. **Rebase onto current main** (adopts main's workflow files → clears base-staleness): `git
+   rebase origin/main`. Common conflicts: a `specs/ai.md` section-number collision (keep
+   both sections, renumber the incoming one); a new goose migration (renumber to the next
+   free number above the live head, sequenced after any sibling PR's migration).
+5. **Verify + land:** both `git diff --name-only origin/main..HEAD -- .github/workflows/` and
+   `git log --name-only origin/main..HEAD -- .github/workflows/` empty; run the touched `task
+   gate:*`; push `recover/issue-N` (your token carries `workflow` scope); open a maintainer
+   PR that explains the recovery; review; admin-merge. If a sibling PR must land first
+   (migration ordering), merge it, then `gh pr update-branch` this one so CI runs on the
+   merged tree.
+
+The remote `refs/uzi-checkpoints/agent/issue-N` ref is the other recovery source, but a
+behind-on-workflows run leaves none (its checkpoint push hit the same rejection). The PVC
+tracking ref is the reliable source.
 
 ## Reviewing the diff
 
