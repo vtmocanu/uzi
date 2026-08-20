@@ -82,6 +82,7 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"board-admin":              boardAdmin,
 		"board-filter":             func(d bool) string { return boardFilter(d, now) },
 		"board-planning":           func(d bool) string { return boardPlanning(d, now) },
+		"board-milestones":         func(d bool) string { return boardMilestones(d, now) },
 		"detail-running":           func(d bool) string { return detailRunning(d, now) },
 		"detail-planning":          func(d bool) string { return detailPlanning(d, now) },
 		"detail-focus-transcript":  func(d bool) string { return detailFocusTranscript(d, now) },
@@ -151,8 +152,8 @@ func boardRuns(now time.Time) []apitypes.RunListItemDTO {
 		mk("b8c9d0e1-1111-2222-3333-444444444444", "ci_fix", "completed", "Repair the changelog assertion gate", "", sp("ok"), 0, 25*time.Hour),
 	}
 	// PRD #379: milestone-structured runs so the board's MILE column is exercised — one
-	// mid-flight (M2/4) and one that has reported nothing yet (M–/3). The rest stay blank,
-	// which is the common case and the alignment worth checking.
+	// mid-flight (▰▰▱▱) and one that has reported nothing yet (all-empty ▱▱▱, graphical 0/3).
+	// The rest stay blank, which is the common case and the alignment worth checking.
 	runs[0].Milestones = milestoneList
 	runs[0].MilestonesCompleted = []string{"m1", "m2"}
 	runs[0].MilestonesInProgress = []string{"m3"}
@@ -227,6 +228,21 @@ func boardPlanning(dark bool, now time.Time) string {
 		{RunDTO: apitypes.RunDTO{ID: "d0e1f2a3-1111-2222-3333-444444444444", Kind: "issue", Status: "running", IsPlanning: true, IssueTitle: "Draft the plan for webhook delivery retries", CreatedAt: now.Add(-90 * time.Second)}},
 		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111-2222-3333-444444444444", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll", CreatedAt: now.Add(-4 * time.Minute)}},
 		{RunDTO: apitypes.RunDTO{ID: "c3d4e5f6-1111-2222-3333-444444444444", Kind: "issue", Status: "running", Health: "stalled", IssueTitle: "Refactor the forge sync loop for the GitHub driver", CreatedAt: now.Add(-51 * time.Minute)}},
+	}})
+	return m.View().Content
+}
+
+// boardMilestones renders an own board whose MILE micro-bar column is on show (#379): a
+// run mid-flight (▰▰▱▱, 2 of 4 reported) beside one that has reported nothing yet, which
+// draws an all-empty ▱▱▱ bar — the graphical 0/N, never –/N text. No credential labels, so
+// the MILE column clears the width gate at the lab's 100 cols instead of being dropped.
+func boardMilestones(dark bool, now time.Time) string {
+	fake := &uzicli.FakeClient{}
+	m := uxModel(fake, "", dark)
+	m = step(m, boardRunsMsg{runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll", CreatedAt: now.Add(-4 * time.Minute), Milestones: milestoneList, MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3"}}},
+		{RunDTO: apitypes.RunDTO{ID: "d4e5f6a7-1111", Kind: "issue", Status: "running", IssueTitle: "Port the judge to per-model usage folding", CreatedAt: now.Add(-1 * time.Minute), Milestones: []apitypes.Milestone{{ID: "m1"}, {ID: "m2"}, {ID: "m3"}}}}, // nil completed ⇒ never reported
+		{RunDTO: apitypes.RunDTO{ID: "c9d0e1f2-1111", Kind: "issue", Status: "running", IssueTitle: "Tighten the retry backoff jitter", CreatedAt: now.Add(-12 * time.Minute)}},                                                                               // no frozen list ⇒ no bar
 	}})
 	return m.View().Content
 }

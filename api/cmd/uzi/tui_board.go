@@ -753,17 +753,15 @@ func (m tuiModel) verdictMarker(verdict string, todo, verdictW, countW int, bg c
 
 // milestoneMarker is the board's compact milestone micro-bar — one cell per frozen milestone,
 // done ▰ (tungsten, or faint on a DONE row) ahead of remaining ▱ (faint) — the TUI twin of the
-// web's MilestoneBadge. It keeps the –/N TEXT when nothing was reported (never a bar that looks
-// like failure) and falls back to N/M text when the list is longer than boardMileCap. Empty for
-// a run with no frozen list, so a non-milestone row draws nothing. Carries only counts, so it
-// needs no D7 sanitizing. bg carries the selection bar behind it on a selected row.
+// web's MilestoneBadge. A run that has reported nothing yet has done=0, so it draws an all-empty
+// ▱ bar (the graphical `0/N`); it falls back to N/M text when the list is longer than
+// boardMileCap. Empty for a run with no frozen list, so a non-milestone row draws nothing.
+// Carries only counts, so it needs no D7 sanitizing. bg carries the selection bar behind it on a
+// selected row.
 func (m tuiModel) milestoneMarker(r apitypes.RunListItemDTO, dim bool, bg color.Color) string {
-	done, total, reported := milestoneProgress(r.RunDTO)
+	done, total, _ := milestoneProgress(r.RunDTO)
 	if total == 0 {
 		return ""
-	}
-	if !reported {
-		return paintSeg(m.pal.faintC, bg, false, "–/"+itoa(total))
 	}
 	if total > boardMileCap {
 		return paintSeg(m.pal.faintC, bg, false, itoa(done)+"/"+itoa(total))
