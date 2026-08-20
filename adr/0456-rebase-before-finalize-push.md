@@ -13,7 +13,7 @@ A run can lose its **entire** branch at the finalize push even when it never tou
 1. Fetches the default branch's **current** tip from origin (`fetchDefaultTip` — the existing finalize `fetchAgentBranch` is a local `file://` fetch and would otherwise compare against a stale claim-time mirror).
 2. Triggers only when the branch's `.github/workflows/` tree actually **differs** from that fresh tip (`workflowTreeDiffers`) — a precise, cheap predicate that keeps the align/conflict surface to the runs that need it.
 3. Aligns the branch in the runner clone (never the bare — B3): tries a **SHA-preserving merge** first; if the merged push is **still** rejected for workflow scope, falls back to a **rebase** (the mechanism proven in the #422 manual recovery). See D2 for why merge is tried first.
-4. On an unresolvable conflict (merge and rebase both fail to auto-resolve), aborts, fails the run with a new typed `fail_origin = finalize_base_align_conflict`, and preserves the pre-align diff in `runs.preserved_patch` (#377's column, migration `00139`) for a human to rebase-and-land.
+4. On an unresolvable conflict (merge and rebase both fail to auto-resolve), aborts, fails the run with a new typed `fail_origin = finalize_base_align_conflict`, and preserves the pre-align diff in `runs.preserved_patch` (the column #377 added) for a human to rebase-and-land.
 5. Server-side, the checkpoint broker (`pushbroker`) now recognizes the same rejection on `refs/uzi-checkpoints/<branch>` and **skips the push cleanly** (`ErrWorkflowScopeRejected` → a benign skip, like `ErrNotDescendant`) instead of erroring every checkpoint. See D5 for why it cannot do more than skip.
 
 ## Context
