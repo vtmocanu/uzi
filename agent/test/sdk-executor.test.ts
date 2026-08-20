@@ -10,7 +10,8 @@ import type { PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate, ClaimSkill, MilestoneProgress } from "../src/protocol.js";
 import type { JsDepsResult } from "../src/js-deps.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
-import { FINDINGS_SERVER_NAME } from "../src/findings-tools.js";
+import { FINDINGS_SERVER_NAME, reportIncidentalIssueToolName } from "../src/findings-tools.js";
+import { FINDINGS_NUDGE_APPEND } from "../src/prompt.js";
 import type { WorkerClient } from "../src/client.js";
 import type {
   SummaryRunner,
@@ -47,6 +48,11 @@ function nonexistentWorktree(): string {
 const OAUTH = "dummy-oauth-token-do-not-scan-0000";
 const FAKE_PAT = "dummy-forge-pat-do-not-scan-1111";
 const FAKE_JOIN_TOKEN = "dummy-join-token-do-not-scan-2222";
+
+// PRD #457: toDefinition grants the findings tool to a non-empty allowlist and appends
+// the discovery nudge to every subagent prompt. Reference the helper, not a literal.
+const FINDINGS_TOOL = reportIncidentalIssueToolName();
+const withNudge = (body: string) => `${body}\n\n${FINDINGS_NUDGE_APPEND}`;
 
 const coder: AgentTemplate = { name: "coder", description: "writes code", prompt_body: "You implement.", tools: ["Read", "Edit", "Write", "Bash"] };
 const reviewer: AgentTemplate = { name: "reviewer", description: "reviews", prompt_body: "You review.", tools: ["Read", "Grep"] };
@@ -433,9 +439,9 @@ describe("SdkExecutor agent selection at the gate boundary (PRD #37)", () => {
     assert.deepStrictEqual(Object.keys(impl.agents ?? {}).sort(), ["auditor", "coder"]);
     // The repo coder's declared WebFetch is HONORED (Decision 2, policy reversed).
     assert.ok(impl.agents!.coder!.tools?.includes("WebFetch"), "repo agent keeps its declared WebFetch");
-    assert.deepStrictEqual(impl.agents!.coder!.tools, ["Read", "Edit", "Bash", "WebFetch"]);
-    // The repo body — not the own coder's — is what runs.
-    assert.strictEqual(impl.agents!.coder!.prompt, "REPO CODER BODY");
+    assert.deepStrictEqual(impl.agents!.coder!.tools, ["Read", "Edit", "Bash", "WebFetch", FINDINGS_TOOL]);
+    // The repo body — not the own coder's — is what runs (plus the findings nudge).
+    assert.strictEqual(impl.agents!.coder!.prompt, withNudge("REPO CODER BODY"));
     // The resolved roster is returned for the MR marker.
     assert.deepStrictEqual(result.agentSelection, { source: "repo", agents: ["coder", "auditor"] });
   });
@@ -485,7 +491,7 @@ describe("SdkExecutor agent selection at the gate boundary (PRD #37)", () => {
     const impl = turns[1]!.options;
     // `lead` is an invokable subagent...
     assert.ok(Object.keys(impl.agents ?? {}).includes("lead"), "repo lead is a subagent");
-    assert.strictEqual(impl.agents!.lead!.prompt, "REPO LEAD BODY");
+    assert.strictEqual(impl.agents!.lead!.prompt, withNudge("REPO LEAD BODY"));
     // ...and the MAIN-THREAD prompt is uzi's builtin lead, NOT the repo lead body.
     const append = appendOf(impl.systemPrompt);
     assert.ok(append.includes("LEAD SYSTEM PROMPT"), "the own builtin lead prompt runs the main thread");
@@ -1455,9 +1461,10 @@ describe("SdkExecutor skill delivery (PRD #16)", () => {
     const { turns, run } = runWithSkills();
     await run;
     const reviewerDef = turns[0]!.options.agents!["reviewer"] as { tools?: string[]; skills?: string[] };
-    // Read-only allowlist is untouched (no "Skill" added — the skills field is the
-    // enable switch, sdk.d.ts:44/1869), and the skill is scoped to this subagent.
-    assert.deepStrictEqual(reviewerDef.tools, ["Read", "Grep"]);
+    // Read-only allowlist gains only the (non-Skill) findings tool — no "Skill" added,
+    // the skills field is the enable switch (sdk.d.ts:44/1869) — and the skill is
+    // scoped to this subagent.
+    assert.deepStrictEqual(reviewerDef.tools, ["Read", "Grep", FINDINGS_TOOL]);
     assert.ok(!reviewerDef.tools!.includes("Skill"));
     assert.deepStrictEqual(reviewerDef.skills, ["uzi:team-kb"]);
   });
@@ -1604,8 +1611,9 @@ describe("SdkExecutor repo skills (PRD #16 M6)", () => {
     // Repo skills carry no allocation ⇒ enabled for every template (PRD §Worker 3).
     assert.deepStrictEqual(subagent(o, "coder").skills, ["uzi:deploy-notes"]);
     assert.deepStrictEqual(subagent(o, "reviewer").skills, ["uzi:deploy-notes"]);
-    // The read-only subagent's allowlist is NOT widened (no 'Skill' grant needed).
-    assert.deepStrictEqual(subagent(o, "reviewer").tools, ["Read", "Grep"]);
+    // The read-only subagent's allowlist is NOT widened by skills (no 'Skill' grant);
+    // it carries only the (non-write) findings tool PRD #457 grants.
+    assert.deepStrictEqual(subagent(o, "reviewer").tools, ["Read", "Grep", FINDINGS_TOOL]);
     assert.ok(!subagent(o, "reviewer").tools!.includes("Skill"));
   });
 
@@ -1827,8 +1835,9 @@ describe("SdkExecutor delivered skills on a repo-source run (PRD #72 M1)", () =>
         `repo subagent ${name} must receive the delivered skills its owner allocated`,
       );
     }
-    // The read-only shape is untouched: no `Skill` grant, declared tools verbatim.
-    assert.deepStrictEqual(subagent(impl, "coder").tools, ["Read", "Edit", "Bash", "WebFetch"]);
+    // The shape is untouched by skills (no `Skill` grant); declared tools verbatim plus
+    // the (non-write) findings tool PRD #457 grants.
+    assert.deepStrictEqual(subagent(impl, "coder").tools, ["Read", "Edit", "Bash", "WebFetch", FINDINGS_TOOL]);
     assert.strictEqual(subagent(impl, "auditor").tools, undefined, "inherit-all repo agent stays inherit-all");
   });
 
@@ -2936,8 +2945,10 @@ describe("plan-turn write-tool subtraction (#203)", () => {
     // in declaration order. This is the half that proves the scoping — the same
     // subtraction applied one key lower (baseOptions.disallowedTools) would be
     // inherited through the implementOptions spread and redden here.
-    assert.deepStrictEqual(impl.agents!.architect!.tools, architectA.tools);
-    assert.deepStrictEqual(impl.agents!.tester!.tools, testerA.tools);
+    // PRD #457: the implement roster carries each declared tool plus the granted
+    // findings tool (appended last).
+    assert.deepStrictEqual(impl.agents!.architect!.tools, [...architectA.tools!, FINDINGS_TOOL]);
+    assert.deepStrictEqual(impl.agents!.tester!.tools, [...testerA.tools!, FINDINGS_TOOL]);
     for (const role of ["architect", "tester"]) {
       assert.deepStrictEqual(
         impl.agents![role]!.disallowedTools,
@@ -2946,14 +2957,16 @@ describe("plan-turn write-tool subtraction (#203)", () => {
       );
     }
 
-    // Non-write tools are NOT collateral: only the four come off.
+    // Non-write tools are NOT collateral: only the four come off (the granted findings
+    // tool is non-write, so it survives too).
     assert.deepStrictEqual(
       plan.agents!.architect!.tools,
-      ["Bash", "Read", "Grep", "WebFetch"],
-      "reads, Bash and WebFetch survive the plan turn untouched",
+      ["Bash", "Read", "Grep", "WebFetch", FINDINGS_TOOL],
+      "reads, Bash, WebFetch and the findings tool survive the plan turn untouched",
     );
-    // A role that declared no write tool in the first place is unchanged.
-    assert.deepStrictEqual(plan.agents!.reviewer!.tools, reviewer.tools);
+    // A role that declared no write tool in the first place keeps its allowlist, plus
+    // the granted findings tool.
+    assert.deepStrictEqual(plan.agents!.reviewer!.tools, [...reviewer.tools!, FINDINGS_TOOL]);
   });
 
   it("the inherit-all role (no `tools:` line) is covered by the denial arm, and only on the plan turn", async () => {
@@ -3014,8 +3027,8 @@ describe("plan-turn write-tool subtraction (#203)", () => {
         assert.ok(opts.agents!.coder!.disallowedTools!.includes(t), `turn ${turnIdx}: coder must deny ${t}`);
       }
     }
-    // ...and the implement turn still restores them.
-    assert.deepStrictEqual(turns[2]!.options.agents!.architect!.tools, architectA.tools);
+    // ...and the implement turn still restores them (plus the granted findings tool).
+    assert.deepStrictEqual(turns[2]!.options.agents!.architect!.tools, [...architectA.tools!, FINDINGS_TOOL]);
   });
 });
 
@@ -3101,7 +3114,8 @@ describe("plan-turn drop of a write-only allowlist (#203)", () => {
     // 4. The IMPLEMENT turn is untouched — the drop is plan-turn-scoped, and
     //    `penman` gets its declared write tools back where writing is the job.
     assert.deepStrictEqual(Object.keys(impl.options.agents ?? {}).sort(), ["coder", "penman", "reviewer"]);
-    assert.deepStrictEqual(impl.options.agents!.penman!.tools, ["Edit", "Write"]);
+    // PRD #457: the implement roster grants the (non-write) findings tool too.
+    assert.deepStrictEqual(impl.options.agents!.penman!.tools, ["Edit", "Write", FINDINGS_TOOL]);
   });
 
   it("says so on the run feed rather than dropping it silently", async () => {

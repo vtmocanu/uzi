@@ -50,6 +50,8 @@ import { NESTED_AGENT_TOOL, WRITE_PATH_TOOLS } from "./guardrails.js";
 import { SIGNAL_SERVER_NAME } from "./signals.js";
 import { MEMORY_SERVER_NAME } from "./memory-tools.js";
 import { qualifiedSkillName } from "./skills-plugin.js";
+import { reportIncidentalIssueToolName } from "./findings-tools.js";
+import { FINDINGS_NUDGE_APPEND } from "./prompt.js";
 
 // Server-level MCP denial (PRD #43 M2 / Decision 3). A `mcp__<server>` entry in
 // disallowedTools removes EVERY tool the named in-process MCP server exposes
@@ -144,7 +146,10 @@ function toDefinition(
 ): AgentDefinition {
   const def: AgentDefinition = {
     description: t.description,
-    prompt: t.prompt_body,
+    // PRD #457 M3: append the findings discovery nudge to every subagent's prompt,
+    // so shared-library repo agents get it WITHOUT editing their files. Same constant
+    // as the lead nudge (buildLeadSystemPrompt) — one source of wording.
+    prompt: `${t.prompt_body}\n\n${FINDINGS_NUDGE_APPEND}`,
     // No subagent may spawn nested agents (defense-in-depth over the fact that
     // `agents` + settingSources:[] already limit spawnable agents to these), reach
     // the run's workflow-signal MCP tools (SIGNAL_SERVER_DENY — the plan gate and
@@ -159,6 +164,13 @@ function toDefinition(
   // sdk.d.ts:44 a tools-`Skill` grant is deprecated), so a read-only subagent
   // (reviewer/auditor) still expands a repo skill without any tools widening.
   if (t.tools && t.tools.length > 0) def.tools = [...t.tools];
+  // PRD #457 M1: grant the incidental-findings tool to any subagent with a non-empty
+  // allowlist (the broad-reading read-only roles that would otherwise be unable to
+  // call it). When `tools` is unset (inherit-all, e.g. coder) the tool is already
+  // available — do NOT materialize an allowlist. Dedup-guarded. NOT a write tool, so
+  // it survives the plan-turn write-strip (planTurnSubagents).
+  const findingsTool = reportIncidentalIssueToolName();
+  if (def.tools && !def.tools.includes(findingsTool)) def.tools = [...def.tools, findingsTool];
   if (t.model) def.model = t.model;
   // Skill scoping (PRD #16): a subagent preloads its own ALLOCATED delivered
   // skills (filtered to the materialized survivors, so it never lists a skill
@@ -368,6 +380,7 @@ export interface PlanTurnRoster {
 export function planTurnSubagents(subagents: Record<string, AgentDefinition>): PlanTurnRoster {
   const out: Record<string, AgentDefinition> = {};
   const dropped: string[] = [];
+  const findingsTool = reportIncidentalIssueToolName();
   for (const [name, def] of Object.entries(subagents)) {
     const next: AgentDefinition = { ...def };
     // Filter where present only: an ABSENT `tools` is the inherit-all contract
@@ -375,7 +388,13 @@ export function planTurnSubagents(subagents: Record<string, AgentDefinition>): P
     // to whatever this function happened to think the full toolset was.
     if (def.tools) {
       const kept = def.tools.filter((t) => !WRITE_TOOL_SET.has(t));
-      if (kept.length === 0) {
+      // PRD #457 M1 R1: toDefinition now grants the (non-write) findings tool to every
+      // allowlist, so a write-ONLY custom agent reaches here as `[Edit, Write,
+      // findingsTool]` and `kept` becomes `[findingsTool]` — non-empty. Exclude the
+      // findings tool from the emptiness test so such an agent still DROPS (unchanged
+      // behaviour), while a read-only agent keeps the findings tool through the plan turn.
+      const meaningful = kept.filter((t) => t !== findingsTool);
+      if (meaningful.length === 0) {
         dropped.push(name);
         continue;
       }
