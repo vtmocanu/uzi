@@ -20,6 +20,7 @@ type lastFireStarted struct {
 	IssueIID *int64 `json:"issue_iid"` // nil for a prompt schedule
 	RunID    string `json:"run_id"`    // uuid string
 	Title    string `json:"title"`
+	WebURL   string `json:"web_url"` // forge issue URL snapshotted at fire time (PRD #411); empty for prompt/unfetched
 }
 
 // lastFireSkip is one candidate a fire considered but started nothing for, with its
@@ -27,7 +28,8 @@ type lastFireStarted struct {
 type lastFireSkip struct {
 	IssueIID *int64 `json:"issue_iid"`
 	Title    string `json:"title"`
-	Reason   string `json:"reason"` // a SkipReason string
+	Reason   string `json:"reason"`  // a SkipReason string
+	WebURL   string `json:"web_url"` // forge issue URL snapshotted at fire time (PRD #411); empty for prompt/unfetched
 }
 
 // lastFireRecord is the top-level persisted summary of the last scheduled fire. FiredAt
@@ -59,6 +61,7 @@ func marshalLastFire(out FireOutcome, firedAt time.Time) ([]byte, error) {
 			IssueIID: s.IssueIID,
 			RunID:    s.RunID.String(),
 			Title:    s.Title,
+			WebURL:   s.WebURL,
 		})
 	}
 	for _, s := range out.Skips {
@@ -66,6 +69,7 @@ func marshalLastFire(out FireOutcome, firedAt time.Time) ([]byte, error) {
 			IssueIID: s.IssueIID,
 			Title:    s.Title,
 			Reason:   string(s.Reason),
+			WebURL:   s.WebURL,
 		})
 	}
 	return json.Marshal(rec)

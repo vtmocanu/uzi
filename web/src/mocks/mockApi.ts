@@ -948,6 +948,7 @@ let schedules: Schedule[] = [
           issue_iid: 96,
           title: "Mid-run worker restart discards all un-pushed commits on resume",
           reason: "no_prd_link",
+          web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/96",
         },
       ],
     },
@@ -972,6 +973,7 @@ let schedules: Schedule[] = [
           issue_iid: 142,
           run_id: "3f1a2b7c-9d4e-4a1b-8c6d-1e2f3a4b5c6d",
           title: "RunKind (TypeScript) omits 'chat', which the DB CHECK allows",
+          web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/142",
         },
       ],
       skips: [],
@@ -1021,7 +1023,7 @@ let schedules: Schedule[] = [
     last_fire: {
       fired_at: daysFromNow(-3, 18), matched: 3, capped: false,
       started: [
-        { issue_iid: 124, run_id: "a20b4e51-77c8-4d2a-9f10-2b3c4d5e6f70", title: "web: judge free text renders without Unicode Cf stripping" },
+        { issue_iid: 124, run_id: "a20b4e51-77c8-4d2a-9f10-2b3c4d5e6f70", title: "web: judge free text renders without Unicode Cf stripping", web_url: "https://gitlab.example.com/vtmocanu/atlas-api/-/issues/124" },
         { issue_iid: 139, run_id: "c7d5f0a2-1e34-4b56-88a9-0c1d2e3f4a5b", title: "Poller sync timeouts against forge-fake in the e2e stack" },
         { issue_iid: 151, run_id: "e91f6b03-42d7-4c88-b1a2-3c4d5e6f7a80", title: "Board card CI badge flickers on refetch" },
       ],

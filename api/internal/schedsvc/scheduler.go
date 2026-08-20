@@ -275,7 +275,7 @@ func (e *Scheduler) fireIssue(ctx context.Context, sched store.RunSchedule) (Fir
 		// zero outcome so nothing is recorded for this fire.
 		return FireOutcome{}, fmt.Errorf("get issue %d: %w", iid, err) // transient forge error
 	}
-	return e.createIssueRun(ctx, sched, repo.ID, iid, issue.Title, issue.Description, issue.Labels)
+	return e.createIssueRun(ctx, sched, repo.ID, iid, issue.Title, issue.Description, issue.Labels, issue.WebURL)
 }
 
 // fireSweep resolves the label selector (an empty/NULL selector defaults to the PRD
@@ -364,13 +364,13 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Reason: SkipFetchFailed})
 			continue
 		}
-		res, err := e.createIssueRun(ctx, sched, repo.ID, iid, issue.Title, issue.Description, issue.Labels)
+		res, err := e.createIssueRun(ctx, sched, repo.ID, iid, issue.Title, issue.Description, issue.Labels, issue.WebURL)
 		if err != nil {
 			// A permanent/transient repo error mid-sweep is unexpected (the repo just
 			// resolved); record it as fetch_failed and keep going rather than aborting the
 			// whole fan-out or dropping the candidate.
 			e.logger.Warn("scheduler: sweep create run", "schedule", sched.ID.String(), "issue", iid, "error", err)
-			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Title: issue.Title, Reason: SkipFetchFailed})
+			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Title: issue.Title, Reason: SkipFetchFailed, WebURL: issue.WebURL})
 		} else {
 			// createIssueRun returns a single-issue FireOutcome (one Started or one Skip);
 			// fold it into the sweep's buckets.
@@ -446,7 +446,7 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (Fi
 // MaxIssueDescriptionBytes, so guidance never turns a runnable issue into a silent
 // ErrDescriptionTooLarge skip. It is purely additive: allowWithoutPRD is computed from
 // the raw labels and no eligibility gate sees the composed text.
-func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule, repoID uuid.UUID, iid int64, title, description string, labels []string) (FireOutcome, error) {
+func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule, repoID uuid.UUID, iid int64, title, description string, labels []string, webURL string) (FireOutcome, error) {
 	iidCopy := iid
 	allowWithoutPRD := e.allowWithoutPRD(ctx, labels)
 
@@ -470,7 +470,7 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 	}
 
 	if err == nil {
-		return FireOutcome{Matched: 1, Started: []Started{{IssueIID: &iidCopy, RunID: run.ID, Title: title}}}, nil
+		return FireOutcome{Matched: 1, Started: []Started{{IssueIID: &iidCopy, RunID: run.ID, Title: title, WebURL: webURL}}}, nil
 	}
 	// Benign per-fire seam sentinel → a typed Skip; the schedule still advances (no
 	// tick-storm). skipReasonForErr maps the four benign sentinels (ErrActiveRunExists →
@@ -478,7 +478,7 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 	// ErrDescriptionTooLarge → description_too_large).
 	if reason, ok := skipReasonForErr(err); ok {
 		e.logger.Info("scheduler: issue fire skipped", "schedule", sched.ID.String(), "issue", iid, "reason", err)
-		return FireOutcome{Matched: 1, Skips: []Skip{{IssueIID: &iidCopy, Title: title, Reason: reason}}}, nil
+		return FireOutcome{Matched: 1, Skips: []Skip{{IssueIID: &iidCopy, Title: title, Reason: reason, WebURL: webURL}}}, nil
 	}
 	if errors.Is(err, workersvc.ErrRepoNotFound) {
 		return FireOutcome{}, workersvc.ErrRepoNotFound // permanent

@@ -884,6 +884,9 @@ export interface LastFireStarted {
   issue_iid: number | null;
   run_id: string;
   title: string;
+  // Forge issue URL snapshotted at fire time (PRD #411). Optional + nullable so pre-#411
+  // persisted fires and existing mock entries degrade gracefully to a plain number.
+  web_url?: string | null;
 }
 
 // One candidate a persisted fire considered but started nothing for, with its typed
@@ -892,6 +895,9 @@ export interface LastFireSkip {
   issue_iid: number | null;
   title: string;
   reason: ScheduleSkipReason;
+  // Forge issue URL snapshotted at fire time (PRD #411). Optional + nullable so pre-#411
+  // persisted fires and existing mock entries degrade gracefully to a plain number.
+  web_url?: string | null;
 }
 
 // The structured summary of a schedule's most recent persisted fire (PRD #308). matched

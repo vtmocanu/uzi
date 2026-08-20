@@ -10,6 +10,7 @@ import { Link } from "react-router-dom";
 import {
   api,
   ApiError,
+  isHttpsUrl,
   type LastFire,
   type LastFireSkip,
   type Schedule,
@@ -28,7 +29,14 @@ import {
   Toggle,
   cx,
 } from "../components/ui";
-import { ChevronDownIcon, ClockIcon, PencilIcon, PlayIcon, PlusIcon } from "../components/icons";
+import {
+  ChevronDownIcon,
+  ClockIcon,
+  ExternalLinkIcon,
+  PencilIcon,
+  PlayIcon,
+  PlusIcon,
+} from "../components/icons";
 
 // The COLSPAN of the schedules table, so the expandable "Last fire" detail row
 // stretches the full width (Target · When · Next run · Last run · Options · On).
@@ -472,9 +480,7 @@ function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
               key={r.run_id}
               className="flex items-start gap-3 rounded-lg border border-edge bg-raised/50 px-3 py-2"
             >
-              <span className="min-w-[46px] shrink-0 pt-0.5 font-mono text-[12.5px] text-fg">
-                {r.issue_iid != null ? `#${r.issue_iid}` : "prompt"}
-              </span>
+              <IssueRef issueIID={r.issue_iid} webURL={r.web_url} />
               <div className="min-w-0 flex-1">
                 {r.title && <div className="text-[12.5px] text-muted">{r.title}</div>}
               </div>
@@ -529,14 +535,41 @@ function Tally({
   );
 }
 
+// IssueRef renders the fire row's issue ref (PRD #411): `#<iid>` as an external forge
+// link when the issue's web_url was snapshotted at fire time and is a valid https URL,
+// otherwise a plain `#<iid>`; an issue-less fire (null iid) renders the "prompt" marker.
+// The schedule DTO carries no forge_type on fire rows, so the accessible label uses a
+// generic "the forge". This span is a SIBLING of the row's run <Link>, so a plain anchor
+// is correct here (no nested-anchor, no stopPropagation needed).
+function IssueRef({ issueIID, webURL }: { issueIID: number | null; webURL?: string | null }) {
+  const cls = "min-w-[46px] shrink-0 pt-0.5 font-mono text-[12.5px] text-fg";
+  if (issueIID == null) {
+    return <span className={cls}>prompt</span>;
+  }
+  if (webURL && isHttpsUrl(webURL)) {
+    return (
+      <a
+        href={webURL}
+        target="_blank"
+        rel="noreferrer"
+        aria-label={`Open issue #${issueIID} on the forge`}
+        title={`Open issue #${issueIID} on the forge`}
+        className={cx(cls, "inline-flex items-center gap-0.5 hover:text-brand")}
+      >
+        {`#${issueIID}`}
+        <ExternalLinkIcon className="h-3 w-3" />
+      </a>
+    );
+  }
+  return <span className={cls}>{`#${issueIID}`}</span>;
+}
+
 // SkipRow renders one skipped candidate: its issue ref (or a prompt marker), its
 // title when present, and a tone-coded badge carrying the human reason label.
 function SkipRow({ skip }: { skip: LastFireSkip }) {
   return (
     <div className="flex items-start gap-3 rounded-lg border border-edge bg-raised/50 px-3 py-2">
-      <span className="min-w-[46px] shrink-0 pt-0.5 font-mono text-[12.5px] text-fg">
-        {skip.issue_iid != null ? `#${skip.issue_iid}` : "prompt"}
-      </span>
+      <IssueRef issueIID={skip.issue_iid} webURL={skip.web_url} />
       <div className="min-w-0 flex-1">
         {skip.title && <div className="text-[12.5px] text-muted">{skip.title}</div>}
       </div>

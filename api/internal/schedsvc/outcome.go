@@ -9,6 +9,9 @@ type Started struct {
 	IssueIID *int64
 	RunID    uuid.UUID
 	Title    string
+	// WebURL is the forge issue's web URL snapshotted at fire time (PRD #411); empty for
+	// prompt schedules and for skips that never fetched the issue.
+	WebURL string
 }
 
 // Skip records one candidate a fire considered but started nothing for, with the typed
@@ -19,6 +22,9 @@ type Skip struct {
 	IssueIID *int64
 	Title    string
 	Reason   SkipReason
+	// WebURL is the forge issue's web URL snapshotted at fire time (PRD #411); empty for
+	// prompt schedules and for skips that never fetched the issue.
+	WebURL string
 }
 
 // FireOutcome is the structured result of one schedule fire (PRD #308). It replaces the
