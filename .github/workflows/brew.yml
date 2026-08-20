@@ -20,8 +20,13 @@
 #
 # The default GITHUB_TOKEN cannot write to a second repo, so the cross-repo push uses
 # HOMEBREW_TAP_TOKEN (a fine-grained PAT scoped to vtmocanu/homebrew-tap, contents:write),
-# from the `release` environment. No GitHub Release is created (the auto-archive needs
-# none), so permissions stay read-only -- matching cc-statusline.
+# from the `release` environment. The `environment: release` below is REQUIRED for that
+# reason -- it scopes the token as an environment secret -- NOT as an approval gate: that
+# environment carries no required reviewer (removed 2026-08-20), so this publishes
+# immediately on the tag with no approval click. Access control is the `v*` tag ruleset
+# (only a repo admin can create the tag), same as release.yml. No GitHub Release is
+# created (the auto-archive needs none), so permissions stay read-only -- matching
+# cc-statusline.
 
 name: Brew
 

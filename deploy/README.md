@@ -2,8 +2,9 @@
 
 > **⚠ Migration note (2026-08-19).** uzi moved from GitLab + Harbor to **GitHub** on
 > 2026-08-18. The release now publishes via **GitHub Actions** (`.github/workflows/release.yml`)
-> to **GHCR** (`ghcr.io/vtmocanu/uzi/…`), driven with `gh`, and its publish jobs gate on a manual
-> **`release`-environment approval** (see the Release procedure below). **`.claude/agents/release.md`
+> to **GHCR** (`ghcr.io/vtmocanu/uzi/…`), driven with `gh`, and its publish jobs run UNATTENDED on a
+> `v*` tag — no approval gate; access control is the `protect-release-tags` tag ruleset (see the
+> Release procedure below). **`.claude/agents/release.md`
 > is the current, authoritative release procedure — trust it and `release.yml` over any
 > GitLab/Harbor/`glab` wording still in this file.** The Release procedure section below was
 > rewritten for GitHub on 2026-08-19; the cluster-side deploy topology further down (ArgoCD, the
@@ -146,25 +147,23 @@ to cancel and no warm/cold image cache to reason about — GitHub Actions builds
    the OCI chart (`oci://ghcr.io/vtmocanu/uzi/uzi:<tag>`, published LAST). Homebrew is a separate
    `v*`-triggered run (`brew.yml`).
 
-   > **🔴 The tag is not the finish line — the publish jobs WAIT on a manual approval that
-   > `git push` never surfaces.** Every `publish-*` job (and `brew.yml`) declares
-   > `environment: release`, which since the repo went public carries a required-reviewer rule.
-   > After the tag pushes, the run sits in `status: waiting` and NOTHING builds until a listed
-   > reviewer approves — and it gates **more than once**: `publish-chart` `needs:` every image, so
-   > its own gate only goes pending after the images finish, and `brew.yml` is a third gate.
-   > Approve each (you are a reviewer):
+   > **The tag publishes everything UNATTENDED — there is no approval gate.** The old
+   > `release`-environment required-reviewer was removed 2026-08-20; access control is now the
+   > `protect-release-tags` tag ruleset, so only a repo admin can create a `v*` tag and the tag
+   > push itself is the authorization. (`publish-*` jobs keep `environment: release` only for
+   > deployment tracking; `brew.yml` keeps it to scope the `HOMEBREW_TAP_TOKEN` secret. Neither
+   > carries a reviewer.) After `git push origin v0.1.0`, the run builds the images, then the
+   > chart, then the GitHub Release, with no pause:
    >
    > ```sh
    > RUN=$(gh run list --workflow release.yml --branch v0.1.0 --limit 1 --json databaseId --jq '.[0].databaseId')
-   > ENV=$(gh api repos/vtmocanu/uzi/actions/runs/$RUN/pending_deployments --jq '.[0].environment.id')
-   > printf '{"environment_ids":[%s],"state":"approved","comment":"release v0.1.0"}' "$ENV" \
-   >   | gh api --method POST repos/vtmocanu/uzi/actions/runs/$RUN/pending_deployments --input -
+   > gh run view "$RUN"    # every job success; no publish-* left waiting
    > ```
    >
-   > Watch the run in the BACKGROUND (it blocks on the approvals and the multi-arch builds), then
-   > PROVE it published: `gh run view "$RUN"` all-green AND the GHCR packages carry the new tag.
-   > **Never `[skip ci]` the commit you tag** — GitHub Actions honours the marker on tag pushes
-   > too, so `git push origin v0.1.0` prints `* [new tag]` and nothing runs.
+   > Watch the run in the BACKGROUND (the multi-arch builds take a few minutes), then PROVE it
+   > published: `gh run view "$RUN"` all-green AND the GHCR packages carry the new tag plus a
+   > cosign `.sig`. **Never `[skip ci]` the commit you tag** — GitHub Actions honours the marker
+   > on tag pushes too, so `git push origin v0.1.0` prints `* [new tag]` and nothing runs.
    > `.claude/agents/release.md` carries the full, current procedure.
 
 3. **~~Point ArgoCD at the new version~~ — no longer needed on dev-cluster.**

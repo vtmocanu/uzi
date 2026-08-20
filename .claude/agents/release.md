@@ -63,7 +63,7 @@ release role.)
 
 ## For this repo (uzi)
 
-**When the `uzi-release` skill dispatches you, the release-cutting mechanics below are your job end to end** (the skill owns survey/review/merge and confirms `main`'s `ci.yml` is green before handing off). Your task carries the context you need — the new `X.Y.Z`, the previous `v*` tag, a drafted `## [X.Y.Z]` CHANGELOG section to apply, and explicit authorization to land the bump direct-to-`main`, tag, and approve the `release`-environment publish gates for the run you create. Apply the handed CHANGELOG draft (or author it if none was given: fold `[Unreleased]` into a dated `## [X.Y.Z]` section, keep an empty `[Unreleased]` on top, Keep-a-Changelog subsections, **no em dashes**), then verify it with the oracle before tagging. If any of that context is missing, report it via SendMessage to `main` rather than improvising.
+**When the `uzi-release` skill dispatches you, the release-cutting mechanics below are your job end to end** (the skill owns survey/review/merge and confirms `main`'s `ci.yml` is green before handing off). Your task carries the context you need — the new `X.Y.Z`, the previous `v*` tag, a drafted `## [X.Y.Z]` CHANGELOG section to apply, and explicit authorization to land the bump direct-to-`main` and tag it (the publish then runs unattended — there are no approval gates any more; see below). Apply the handed CHANGELOG draft (or author it if none was given: fold `[Unreleased]` into a dated `## [X.Y.Z]` section, keep an empty `[Unreleased]` on top, Keep-a-Changelog subsections, **no em dashes**), then verify it with the oracle before tagging. If any of that context is missing, report it via SendMessage to `main` rather than improvising.
 
 Remote is **GitHub** (`github.com/vtmocanu/uzi`) as of 2026-08-18 — use **`gh`**, never
 `glab`/`tea`. *(This whole section described the retired GitLab flow — `.gitlab-ci.yml`,
@@ -85,41 +85,47 @@ tag triggers **`.github/workflows/release.yml`** (GitHub Actions, `push: tags: [
    (+ `:<short-sha>`) and the chart `oci://ghcr.io/vtmocanu/uzi/uzi:<version>` (chart LAST, after
    every image). Homebrew is a SEPARATE tag-triggered workflow (`brew.yml`), not a job here.
 
-**🔴 THE PUBLISH JOBS GATE ON A MANUAL APPROVAL, AND `git push origin vX.Y.Z` DOES NOT TELL YOU.**
-Every `publish-*` job declares `environment: release`, and since the repo went public that
-environment carries a required-reviewer rule. So after the tag pushes, the run sits in
-`status: waiting` with every publish job `waiting` and NOTHING builds until a listed reviewer
-approves — `git push` still printed `* [new tag]`, so the release LOOKS launched. You are a
-listed reviewer; approve it:
+**NO APPROVAL GATE — a `v*` tag publishes everything unattended.** There USED to be a
+required-reviewer gate on the `release` environment: the run sat `status: waiting` and you
+POSTed `pending_deployments` approvals, more than once per run (image wave, then chart, then
+brew). That gate was **REMOVED 2026-08-20** — on a solo repo it was redundant with tag
+protection and was pure friction. Access control is now the **`protect-release-tags` tag
+ruleset**: only a repo admin can create, delete or move a `v*` tag (admin `bypass_actors`,
+same shape as `protect-main`). So the tag push ITSELF is the authorization — whoever is
+allowed to cut the tag is the only one who could publish — and there is **no approval click
+anywhere**. (`release.yml`'s publish jobs keep `environment: release` only for deployment
+tracking; `brew.yml` keeps it because that environment scopes the `HOMEBREW_TAP_TOKEN`
+secret. Neither carries a reviewer.) If `git push origin vX.Y.Z` is REJECTED by the ruleset,
+your token is not admin-scoped — surface that, never try to force it.
+
+**Because nothing pauses mid-run, you can OWN the whole release without the self-wake dance
+that the old multi-approval flow forced.** Tag once `main`'s CI is green, then just watch —
+in the BACKGROUND, never the foreground (a foreground `gh run watch` pins the turn). The run
+builds the images, then the chart, then `publish-release`, with no stop. A single blocking
+`gh run watch "$RUN" --exit-status` (or a `run_in_background` poll) covers it end to end;
+when it finishes, PROVE the publish:
 
 ```sh
 RUN=$(gh run list --workflow release.yml --branch vX.Y.Z --limit 1 --json databaseId --jq '.[0].databaseId')
-ENV=$(gh api repos/vtmocanu/uzi/actions/runs/$RUN/pending_deployments --jq '.[0].environment.id')
-printf '{"environment_ids":[%s],"state":"approved","comment":"release vX.Y.Z"}' "$ENV" \
-  | gh api --method POST repos/vtmocanu/uzi/actions/runs/$RUN/pending_deployments --input -
+gh run view "$RUN"    # every job success; no publish-* left waiting
+# images + chart carry the tag AND a cosign `.sig` (signing is part of every publish job):
+gh api '/users/vtmocanu/packages/container/uzi%2Fapi/versions' \
+  --jq '[.[].metadata.container.tags[]]|map(select(test("^X\\.Y\\.Z$|\\.sig$")))'
 ```
 
-**The approval GATES MORE THAN ONCE — do not walk away after the first one.** `publish-chart`
-`needs:` every image job, so its own `environment: release` gate only goes pending AFTER the
-images finish; the run returns to `status: waiting` a SECOND time and you must re-run the
-approval above for it (re-read `pending_deployments` once the images are green). `brew.yml` is a
-separate tag-triggered run with its OWN `release`-environment gate, so that is a THIRD approval.
-Every one of them sits silent until approved.
-
-**WATCH THE RELEASE RUN IN THE BACKGROUND, never the foreground.** It blocks first on the
-approval above, then on the multi-arch image builds, then on the second (chart) approval, so a
-foreground `gh run watch` just pins the turn (this is what prompted the rewrite). Background it (`run_in_background`, or
-`gh run watch "$RUN" --exit-status &`) and, after it finishes, PROVE the publish: `gh run view
-"$RUN"` all-green AND the GHCR packages carry the new tag (`gh api
-'/users/vtmocanu/packages/container/uzi%2Fapi/versions' --jq '.[].metadata.container.tags'`).
-
-**`publish-release` then creates the GitHub Release automatically.** It `needs:` every publish
-job, so it runs LAST, after the images and the chart are live, and its body is the tag's
+**`publish-release` creates the GitHub Release automatically.** It `needs:` every publish
+job, so it runs LAST, after the images and the chart are live; its body is the tag's
 `## [X.Y.Z]` CHANGELOG section (the notes are only as good as that section — see the CHANGELOG
-contract below), its title `vX.Y.Z` plus the optional one-line marker. It adds NO approval of its
-own — it has no `environment: release` — so `release.yml` still gates exactly twice (image wave,
-then chart) before `brew.yml`'s separate one. Once the run is green, confirm with `gh release view
-"vX.Y.Z"` that the Release exists and is marked latest.
+contract below), its title `vX.Y.Z` plus the optional one-line marker. It carries no
+`environment: release`. Once the run is green, confirm with `gh release view "vX.Y.Z"` that
+the Release exists and is marked latest. `brew.yml` is a separate tag-triggered run that
+publishes the Homebrew formula unattended too — confirm it green.
+
+**Two signing traps this path already hit once (both fixed in `release.yml`, noted so a
+future edit does not reintroduce them):** `sigstore/cosign-installer` has NO floating `@v4`
+tag (only full `v4.x`), so pin `@v3` while signing with cosign 2.x; and the chart job needs
+BOTH a `helm registry login` (for `helm push`) AND a `docker/login-action` (cosign reads the
+Docker cred store), or `cosign sign` 401s on the signature push.
 
 The CHANGELOG coverage gate runs `scripts/assert-changelog-covers-release.sh`. Fold
 `[Unreleased]` into a `## [X.Y.Z] - <date>` section citing each shipping merge's issue number or
