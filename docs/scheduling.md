@@ -141,7 +141,12 @@ Schedules page's `Last run` cell (an outcome badge — started work vs.
 started nothing) with an expandable **Last fire** panel giving the
 per-issue breakdown; `uzi schedule get`'s **Last fire** block (and its
 `--json` `.last_fire`); and `uzi schedule run-now`'s per-candidate
-summary. A sweep fire with more eligible-label issues than its [scan
+summary. In the web **Last fire** panel, each row's `#<iid>` links to
+the issue on the forge for the issues the fire actually fetched
+(started rows, and a sweep's post-fetch skip); a candidate skipped
+before it was fetched (e.g. `already_running`) shows a plain number
+instead — the CLI's `Last fire` block always prints a plain number. A
+sweep fire with more eligible-label issues than its [scan
 window](#sweep-cap) reached that still started nothing also carries the
 actionable hint — raise `max_issues` or add PRDLESS / a PRD link to the
 issues behind it.
