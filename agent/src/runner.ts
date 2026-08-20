@@ -1517,8 +1517,15 @@ export class RunRunner {
                 return false;
               } catch (e) {
                 if (!isWorkflowScopeRejection(e) && !isNonFastForwardRejection(e)) throw e;
+                // Record WHICH cause fired so an operator reading logs can tell the two apart:
+                // a repeat workflow-scope rejection (the default's workflow files moved again
+                // DURING our align) versus a non-fast-forward (the rebase rewrote an
+                // already-published branch's history — a resume, or the self_improve fixed
+                // branch — that the bot cannot force-push).
                 runLog.info(
-                  "finalize base-align: aligned push rejected (repeat workflow-scope — default moved again during align — OR non-fast-forward because the rebase rewrote an already-published branch's history the bot cannot force-push); preserving diff and failing typed",
+                  isNonFastForwardRejection(e)
+                    ? "finalize base-align: aligned push rejected non-fast-forward (rebase rewrote an already-published branch's history the bot cannot force-push); preserving diff and failing typed"
+                    : "finalize base-align: aligned push STILL workflow-scope-rejected (default moved again during align); preserving diff and failing typed",
                   { run_id: runId },
                 );
                 await failBaseAlignConflict();
