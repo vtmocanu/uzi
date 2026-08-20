@@ -1394,5 +1394,8 @@ func (h *Handler) mountControllerRoutes(r chi.Router) {
 		r.Get("/poll", h.ControllerPoll)
 		// Roll-health report (PRD #113 M4). Display-only; see ControllerStatus.
 		r.Post("/status", h.ControllerStatus)
+		// Cordon control-write (PRD #422 M4). Marks a hosted worker draining so it
+		// drains before rolling; distinct from the display-only status report.
+		r.Post("/workers/{workerID}/drain", h.ControllerCordonWorker)
 	})
 }

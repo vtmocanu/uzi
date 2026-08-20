@@ -2,6 +2,7 @@ package kube
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"sort"
@@ -23,7 +24,7 @@ import (
 func newMat(t *testing.T, objs ...runtime.Object) (*Materializer, *fake.Clientset) {
 	t.Helper()
 	client := fake.NewSimpleClientset(objs...)
-	m := New(client, testConfig(), testResolver(t), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m := New(client, testConfig(), testResolver(t), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	return m, client
 }
 
@@ -273,7 +274,7 @@ func TestAnUnstampedUziHwObjectIsFlaggedAndNeverTouched(t *testing.T) {
 	}}
 	var logs strings.Builder
 	client := fake.NewSimpleClientset(orphan)
-	m := New(client, testConfig(), testResolver(t), slog.New(slog.NewTextHandler(&logs, nil)))
+	m := New(client, testConfig(), testResolver(t), nil, slog.New(slog.NewTextHandler(&logs, nil)))
 
 	observed, err := m.Observe(context.Background())
 	if err != nil {
@@ -419,7 +420,7 @@ func TestNoSecretReadAcrossAFullFleetReconcile(t *testing.T) {
 func newDockerMat(t *testing.T, objs ...runtime.Object) (*Materializer, *fake.Clientset) {
 	t.Helper()
 	client := fake.NewSimpleClientset(objs...)
-	m := New(client, dockerTestConfig(), testResolver(t), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m := New(client, dockerTestConfig(), testResolver(t), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	return m, client
 }
 
@@ -661,7 +662,7 @@ func TestOrphanInDockerNamespaceIsFlaggedNotDeleted(t *testing.T) {
 	}}
 	var logs strings.Builder
 	client := fake.NewSimpleClientset(orphan)
-	m := New(client, dockerTestConfig(), testResolver(t), slog.New(slog.NewTextHandler(&logs, nil)))
+	m := New(client, dockerTestConfig(), testResolver(t), nil, slog.New(slog.NewTextHandler(&logs, nil)))
 	ctx := context.Background()
 
 	observed, err := m.Observe(ctx)
@@ -773,4 +774,163 @@ func keysOf(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// --- cordon / defer-roll on drift (PRD #422 M4) ----------------------------
+
+// fakeCordoner records the worker ids handed to RequestDrain and can force the
+// write to fail, so a test can prove the fail-safe defer path.
+type fakeCordoner struct {
+	calls []string
+	err   error
+}
+
+func (f *fakeCordoner) RequestDrain(_ context.Context, workerID string) error {
+	f.calls = append(f.calls, workerID)
+	return f.err
+}
+
+// newMatWithCordoner builds a Materializer wired to a fake cordoner (nil disables
+// cordoning, exercising the no-channel path).
+func newMatWithCordoner(t *testing.T, c Cordoner, objs ...runtime.Object) (*Materializer, *fake.Clientset) {
+	t.Helper()
+	client := fake.NewSimpleClientset(objs...)
+	m := New(client, testConfig(), testResolver(t), c, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return m, client
+}
+
+// wasPatched reports whether any Deployment patch reached the fake apiserver — the
+// observable proof of a roll, and its absence the proof of a defer.
+func wasPatched(client *fake.Clientset) bool {
+	for _, a := range client.Actions() {
+		if a.GetVerb() == "patch" {
+			return true
+		}
+	}
+	return false
+}
+
+// driftedIdle sets up a worker whose deployed spec hash no longer matches what the
+// renderer would stamp, so it has drifted. Busy/Draining are set by the caller.
+func driftedWorker(t *testing.T, busy, draining bool) (protocol.DesiredWorker, []reconcile.ObservedWorker, *appsv1.Deployment) {
+	t.Helper()
+	dep := deployedWorker("w1", 0, "the-old-releases-hash")
+	obs := []reconcile.ObservedWorker{{ID: "w1", HasDeployment: true, Generation: 0, SpecHash: "the-old-releases-hash"}}
+	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, Busy: busy, Draining: draining}
+	return w, obs, dep
+}
+
+// drift + busy + not draining ⇒ cordon requested once, roll deferred (no patch).
+func TestDriftBusyNotDrainingCordonsAndDefers(t *testing.T) {
+	c := &fakeCordoner{}
+	w, obs, dep := driftedWorker(t, true, false)
+	m, client := newMatWithCordoner(t, c, dep)
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(c.calls) != 1 || c.calls[0] != "w1" {
+		t.Fatalf("RequestDrain calls = %v, want exactly [w1]", c.calls)
+	}
+	if wasPatched(client) {
+		t.Fatal("a busy worker was rolled; it must be cordoned and deferred, never hard-killed")
+	}
+}
+
+// drift + busy + already draining ⇒ no re-cordon, still deferred (no patch).
+func TestDriftBusyAlreadyDrainingDefersWithoutRecordon(t *testing.T) {
+	c := &fakeCordoner{}
+	w, obs, dep := driftedWorker(t, true, true)
+	m, client := newMatWithCordoner(t, c, dep)
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(c.calls) != 0 {
+		t.Fatalf("RequestDrain calls = %v, want none (already draining)", c.calls)
+	}
+	if wasPatched(client) {
+		t.Fatal("an already-draining busy worker was rolled; it must be deferred")
+	}
+}
+
+// drift + idle ⇒ no cordon, rolled (patch issued). Covers cordoned-then-idle too:
+// a later tick where busy flipped false is exactly this case.
+func TestDriftIdleRollsWithoutCordon(t *testing.T) {
+	c := &fakeCordoner{}
+	w, obs, dep := driftedWorker(t, false, false)
+	m, client := newMatWithCordoner(t, c, dep)
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(c.calls) != 0 {
+		t.Fatalf("RequestDrain calls = %v, want none for an idle worker", c.calls)
+	}
+	if !wasPatched(client) {
+		t.Fatal("an idle drifted worker was not rolled")
+	}
+}
+
+// A cordoned worker that has since gone idle rolls on the next tick even though it
+// is still flagged draining — the roll gate is idleness, not the draining flag.
+func TestDriftIdleWhileDrainingStillRolls(t *testing.T) {
+	c := &fakeCordoner{}
+	w, obs, dep := driftedWorker(t, false, true)
+	m, client := newMatWithCordoner(t, c, dep)
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(c.calls) != 0 {
+		t.Fatalf("RequestDrain calls = %v, want none (already idle)", c.calls)
+	}
+	if !wasPatched(client) {
+		t.Fatal("a now-idle drifted worker was not rolled")
+	}
+}
+
+// drift + busy + cordon write fails ⇒ cordon attempted, roll still deferred
+// (fail-safe), no panic.
+func TestDriftBusyCordonErrorStillDefers(t *testing.T) {
+	c := &fakeCordoner{err: errors.New("api unreachable")}
+	w, obs, dep := driftedWorker(t, true, false)
+	m, client := newMatWithCordoner(t, c, dep)
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(c.calls) != 1 {
+		t.Fatalf("RequestDrain calls = %v, want exactly one attempt", c.calls)
+	}
+	if wasPatched(client) {
+		t.Fatal("a busy worker was rolled after a failed cordon; the defer must be fail-safe")
+	}
+}
+
+// drift + busy + nil cordoner ⇒ roll deferred (no patch), no panic.
+func TestDriftBusyNilCordonerDefers(t *testing.T) {
+	w, obs, dep := driftedWorker(t, true, false)
+	m, client := newMatWithCordoner(t, nil, dep)
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if wasPatched(client) {
+		t.Fatal("a busy worker was rolled with no cordon channel; it must be deferred")
+	}
+}
+
+// no drift + busy ⇒ nothing happens: no cordon, no patch. Busy alone must never
+// trigger a cordon; only drift does.
+func TestNoDriftBusyDoesNothing(t *testing.T) {
+	c := &fakeCordoner{}
+	hash := currentHash(t, "w1", 0)
+	dep := deployedWorker("w1", 0, hash)
+	obs := []reconcile.ObservedWorker{{ID: "w1", HasDeployment: true, Generation: 0, SpecHash: hash}}
+	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, Busy: true}
+	m, client := newMatWithCordoner(t, c, dep)
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(c.calls) != 0 {
+		t.Fatalf("RequestDrain calls = %v, want none (no drift)", c.calls)
+	}
+	if wasPatched(client) {
+		t.Fatal("an undrifted worker was patched")
+	}
 }

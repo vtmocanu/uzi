@@ -42,10 +42,25 @@ import (
 // something is wrong. Two of three validators independently caught M1's first
 // protocol violating this line, and materializer_test.go asserts over the WHOLE
 // fake-client action log that no Secret get/list ever happens.
+// Cordoner is the api control-write that marks a hosted worker draining (PRD #422
+// M4, Decision 8). *apiclient.Client satisfies it structurally (its RequestDrain),
+// and tests substitute a fake.
+//
+// It is nil-safe by design: a nil Cordoner DISABLES cordoning, so a busy drifted
+// worker is simply DEFERRED (never rolled) rather than hard-killed. That keeps the
+// whole feature fail-safe even in a build or config where the channel is absent —
+// the one thing that must never happen is Recreate-killing a busy worker.
+type Cordoner interface {
+	RequestDrain(ctx context.Context, workerID string) error
+}
+
 type Materializer struct {
 	client   kubernetes.Interface
 	cfg      RenderConfig
 	resolver preset.Resolver
+	// cordoner is the api cordon-write channel (PRD #422 M4). Nil disables cordoning;
+	// see Cordoner. Injected the same way as resolver, so tests can drive it.
+	cordoner Cordoner
 	log      *slog.Logger
 	// now is the clock seam for roll-health's age arm (PRD #113 M3). A bare
 	// time.Now() at the comparison site would make stuckAge testable only by
@@ -54,9 +69,10 @@ type Materializer struct {
 	now func() time.Time
 }
 
-// New builds a Materializer.
-func New(client kubernetes.Interface, cfg RenderConfig, resolver preset.Resolver, log *slog.Logger) *Materializer {
-	return &Materializer{client: client, cfg: cfg, resolver: resolver, log: log, now: time.Now}
+// New builds a Materializer. cordoner may be nil, which disables cordoning (a busy
+// drifted worker is then deferred rather than rolled — still fail-safe); see Cordoner.
+func New(client kubernetes.Interface, cfg RenderConfig, resolver preset.Resolver, cordoner Cordoner, log *slog.Logger) *Materializer {
+	return &Materializer{client: client, cfg: cfg, resolver: resolver, cordoner: cordoner, log: log, now: time.Now}
 }
 
 // Observe lists the worker namespace and partitions it by PROVENANCE.
@@ -545,13 +561,35 @@ func (m *Materializer) reconcileWorker(ctx context.Context, w protocol.DesiredWo
 	}
 
 	// Drift (Decision 9): two independent sources, either of which must roll the pod.
-	// Note there is deliberately NO controller-side "is the worker busy?" check: the
-	// active-run predicate is enforced api-side at delete, and this side has no DB to
-	// check with. By the time a row leaves the fleet set the api has already checked.
 	wantHash := dep.Spec.Template.Annotations[AnnotationSpecHash]
 	if obs.Generation == w.Generation && obs.SpecHash == wantHash {
+		return nil // no drift
+	}
+	// PRD #422 M4: a drifted worker used to be Recreate-rolled unconditionally, with a
+	// comment noting there was deliberately NO controller-side "is it busy?" check. That
+	// check is exactly what this milestone adds. If the api reports the worker BUSY (it
+	// holds a non-terminal run), do NOT hard-kill it: cordon it (so its claim gate idles
+	// and it drains) and DEFER the roll; it rolls on a later tick once the api reports it
+	// idle. Fail-safe: any cordon failure — a write error, or no cordon channel at all —
+	// still defers, so a busy worker is never Recreate-killed.
+	if w.Busy {
+		if !w.Draining {
+			if m.cordoner != nil {
+				if err := m.cordoner.RequestDrain(ctx, w.ID); err != nil {
+					m.log.Warn("cordon request failed; deferring roll (fail-safe)", "worker_id", w.ID, "error", err)
+				} else {
+					m.log.Info("hosted worker drifted but busy; cordoned, deferring roll", "worker_id", w.ID)
+				}
+			} else {
+				m.log.Warn("hosted worker drifted but busy and no cordon channel; deferring roll", "worker_id", w.ID)
+			}
+		} else {
+			m.log.Info("hosted worker drifted, busy, already draining; deferring roll", "worker_id", w.ID)
+		}
 		return nil
 	}
+	// Idle: safe to roll now (whether or not it was ever draining — a cordoned worker
+	// that has since gone idle rolls on this tick).
 	m.log.Info("hosted worker drifted; rolling",
 		"worker_id", w.ID,
 		"generation_observed", obs.Generation, "generation_desired", w.Generation,

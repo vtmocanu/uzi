@@ -12,6 +12,26 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const cordonHostedWorker = `-- name: CordonHostedWorker :execrows
+UPDATE workers
+   SET draining_since = COALESCE(draining_since, now()), updated_at = now()
+ WHERE id = $1 AND kind = 'hosted'
+`
+
+// Controller cordon-write (PRD #422 M4): mark a hosted worker draining so the claim
+// gate (workersvc.Claim) idles it — it finishes its in-flight runs, then the controller
+// rolls it. COALESCE preserves the ORIGINAL cordon time so a repeat cordon is idempotent
+// and does NOT reset the M5 drain-deadline clock. Scoped to kind='hosted': the controller
+// manages only hosted workers and must never cordon an external one. Rows affected = 0
+// means no such hosted worker exists (the handler answers 404).
+func (q *Queries) CordonHostedWorker(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, cordonHostedWorker, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const countHostedWorkersForUser = `-- name: CountHostedWorkersForUser :one
 SELECT count(*) FROM workers WHERE user_id = $1 AND kind = 'hosted'
 `

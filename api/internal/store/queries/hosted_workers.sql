@@ -203,3 +203,14 @@ WHERE worker_id = @worker_id
 UPDATE hosted_worker_tokens SET token_ciphertext = NULL
 WHERE token_ciphertext IS NOT NULL
   AND created_at < @cutoff;
+
+-- name: CordonHostedWorker :execrows
+-- Controller cordon-write (PRD #422 M4): mark a hosted worker draining so the claim
+-- gate (workersvc.Claim) idles it — it finishes its in-flight runs, then the controller
+-- rolls it. COALESCE preserves the ORIGINAL cordon time so a repeat cordon is idempotent
+-- and does NOT reset the M5 drain-deadline clock. Scoped to kind='hosted': the controller
+-- manages only hosted workers and must never cordon an external one. Rows affected = 0
+-- means no such hosted worker exists (the handler answers 404).
+UPDATE workers
+   SET draining_since = COALESCE(draining_since, now()), updated_at = now()
+ WHERE id = @id AND kind = 'hosted';

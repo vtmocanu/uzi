@@ -503,7 +503,7 @@ func TestObserveWarnsAboutAnUnmanagedPodInAWorkerNamespace(t *testing.T) {
 			Namespace: testConfig().Namespace,
 		},
 	})
-	m := New(client, testConfig(), testResolver(t), slog.New(slog.NewTextHandler(&logged, nil)))
+	m := New(client, testConfig(), testResolver(t), nil, slog.New(slog.NewTextHandler(&logged, nil)))
 
 	observed, err := m.Observe(ctx)
 	if err != nil {
