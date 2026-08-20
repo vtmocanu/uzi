@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/vtmocanu/uzi/api/internal/termsafe"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -36,6 +37,17 @@ func newAuthCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// D4: `auth token` writes to the ACTIVE context, and an unknown
+			// --context name is CREATED here (it does NOT call resolveSettings, so
+			// D9 does not gate it). The name is validated at the write path because
+			// it is stored raw and later appears verbatim in `context list --json`.
+			name, _, err := resolveContextName(env, gf)
+			if err != nil {
+				return uzicli.Exitf(uzicli.ExitAuth, "%v", err)
+			}
+			if err := termsafe.Validate("context name", name); err != nil {
+				return uzicli.Exitf(uzicli.ExitUsage, "%v", err)
+			}
 			creds, err := env.Store.LoadCredentials()
 			if err != nil {
 				return uzicli.Exitf(uzicli.ExitGeneric, "%v", err)
@@ -43,14 +55,15 @@ func newAuthCmd(env Env, gf *globalFlags) *cobra.Command {
 			if creds.Contexts == nil {
 				creds.Contexts = map[string]uzicli.Credential{}
 			}
-			c := creds.Contexts["default"]
+			c := creds.Contexts[name]
 			c.Token = tok
-			creds.Contexts["default"] = c
+			creds.Contexts[name] = c
 			if err := env.Store.SaveCredentials(creds); err != nil {
 				return uzicli.Exitf(uzicli.ExitGeneric, "%v", err)
 			}
 			if !gf.quiet {
-				_, _ = fmt.Fprintf(env.Stdout, "Stored token %s for context default.\n", maskToken(tok))
+				// name is termsafe.Validate'd above, so it carries no control bytes.
+				_, _ = fmt.Fprintf(env.Stdout, "Stored token %s for context %s.\n", maskToken(tok), name)
 			}
 			return nil
 		},
@@ -64,6 +77,14 @@ func newAuthCmd(env Env, gf *globalFlags) *cobra.Command {
 		Short: "Show whether a credential is stored for the current context",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if all, _ := cmd.Flags().GetBool("all"); all {
+				return runAuthStatusAll(env, gf)
+			}
+			// Report the ACTIVE context (D4), not the literal "default".
+			name, _, err := resolveContextName(env, gf)
+			if err != nil {
+				return uzicli.Exitf(uzicli.ExitAuth, "%v", err)
+			}
 			s, err := resolveSettings(env, gf)
 			if err != nil {
 				return err
@@ -71,22 +92,71 @@ func newAuthCmd(env Env, gf *globalFlags) *cobra.Command {
 			p := env.printer(gf)
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(map[string]any{
-					"context":      "default",
+					"context":      name,
 					"url":          s.URL,
 					"has_token":    s.Token != "",
 					"token_prefix": tokenPrefix(s.Token),
 				})
 			}
 			return p.Table(nil, [][]string{
-				{"CONTEXT", "default"},
+				{"CONTEXT", name},
 				{"URL", strDefault(s.URL, "(unset)")},
 				{"TOKEN", tokenStatus(s.Token)},
 			})
 		},
 	}
+	status.Flags().Bool("all", false, "report every stored context, not just the active one")
 
 	cmd.AddCommand(token, status)
 	return cmd
+}
+
+// authStatusRow is one row of `uzi auth status --all`. It carries only the token
+// PREFIX, never the value — the same guarantee `context list` makes.
+type authStatusRow struct {
+	Context     string `json:"context"`
+	URL         string `json:"url"`
+	HasToken    bool   `json:"has_token"`
+	TokenPrefix string `json:"token_prefix"`
+	Current     bool   `json:"current"`
+}
+
+// runAuthStatusAll lists every stored context — the union of config.toml and
+// credentials.toml names, sorted — with each context's OWN stored URL (blank when
+// it inherits the default per D3) and whether a token is stored, marking the
+// active one. It never prints a token value. This overlaps `context list` in
+// spirit; the two are kept consistent but remain separate commands.
+func runAuthStatusAll(env Env, gf *globalFlags) error {
+	if env.Store == nil {
+		return uzicli.Exitf(uzicli.ExitGeneric, "no config directory available")
+	}
+	ctxs, err := gatherContexts(env, gf)
+	if err != nil {
+		return err
+	}
+	p := env.printer(gf)
+	if p.Format == uzicli.FormatJSON {
+		out := make([]authStatusRow, 0, len(ctxs))
+		for _, d := range ctxs {
+			out = append(out, authStatusRow{
+				Context:     d.Name,
+				URL:         d.OwnURL,
+				HasToken:    d.HasToken,
+				TokenPrefix: d.TokenPrefix,
+				Current:     d.Current,
+			})
+		}
+		return p.JSON(out)
+	}
+	rows := make([][]string, 0, len(ctxs))
+	for _, d := range ctxs {
+		marker := ""
+		if d.Current {
+			marker = "*"
+		}
+		rows = append(rows, []string{d.Name, d.OwnURL, ctxTokenCell(d), marker})
+	}
+	return p.Table([]string{"CONTEXT", "URL", "TOKEN", "CURRENT"}, rows)
 }
 
 // readToken reads a token from stdin. On a TTY without --with-token it first

@@ -48,6 +48,13 @@ type boardRunsMsg struct {
 
 type boardTickMsg struct{}
 
+// secretsMsg carries the viewer's Anthropic token count (from ListSecrets), fetched once
+// at Init to gate the board credential column on PRD #295's more-than-one-token rule.
+type secretsMsg struct {
+	count int
+	err   error
+}
+
 type detailLoadedMsg struct {
 	run  apitypes.RunDTO
 	msgs []apitypes.MessageDTO
@@ -107,6 +114,13 @@ type tuiModel struct {
 	quitting  bool
 	ctrlCSeen bool
 	showHelp  bool
+
+	// tokenCount is how many Anthropic tokens the viewer holds (from ListSecrets, fetched
+	// once at Init). It gates the board's credential column exactly as the web RunsList
+	// does (PRD #295): the own board shows WHICH token a run spent only when there is more
+	// than one to disambiguate. 0 until the probe returns, so the column stays hidden until
+	// then rather than flashing in.
+	tokenCount int
 }
 
 func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel {
@@ -126,7 +140,7 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 }
 
 func (m tuiModel) Init() tea.Cmd {
-	cmds := []tea.Cmd{m.fetchRunsCmd(m.board.admin), tickCmd()}
+	cmds := []tea.Cmd{m.fetchRunsCmd(m.board.admin), m.fetchSecretsCmd(), tickCmd()}
 	if m.view == viewDetail {
 		cmds = append(cmds, m.loadDetailCmd(m.detail.runID), m.openStreamCmd(m.detail.runID))
 	}
@@ -148,6 +162,17 @@ func (m tuiModel) fetchRunsCmd(admin bool) tea.Cmd {
 			runs, err = c.ListRuns(ctx)
 		}
 		return boardRunsMsg{runs: runs, admin: admin, err: err}
+	}
+}
+
+// fetchSecretsCmd reads the viewer's Anthropic tokens once so the board can gate the
+// credential column on holding more than one (PRD #295). A failure is swallowed — the
+// column just stays hidden, and never blocks the board.
+func (m tuiModel) fetchSecretsCmd() tea.Cmd {
+	c, ctx := m.client, m.ctx
+	return func() tea.Msg {
+		secrets, err := c.ListSecrets(ctx)
+		return secretsMsg{count: len(secrets), err: err}
 	}
 }
 
@@ -246,6 +271,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case boardRunsMsg:
 		m.board.apply(msg)
+		return m, nil
+
+	case secretsMsg:
+		if msg.err == nil {
+			m.tokenCount = msg.count
+		}
 		return m, nil
 
 	case detailLoadedMsg:

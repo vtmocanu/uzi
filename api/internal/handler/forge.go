@@ -696,6 +696,63 @@ func (h *Handler) SetRepoEnabled(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"repo": repoToDTO(repo)})
 }
 
+// DeleteRepo removes a single repo row (PRD #357), cascading its derived data
+// (runs, cached issues, board columns, ...) via existing FKs. Owner-scoped: a
+// non-owned or unknown id is a 404. Two structural guards keep this from nuking an
+// actively-tracked repo's board/history: an ENABLED repo is refused with 409 (D2 —
+// disable is the "I've stopped tracking this" state removal is reachable from), and
+// a repo with a non-terminal run is refused with 409 (D7 — disabling drops the repo
+// from the poll set but does not cancel an in-flight run). The DELETE itself also
+// carries `AND enabled = false` (D6), so a concurrent enable between the fetch and
+// the delete cannot slip a tracked repo through — the fetch drives the precise
+// status code, the predicate is the atomic guard. 204 on success, mirroring
+// DeleteConnection.
+func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
+		return
+	}
+	row, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.Error(w, http.StatusNotFound, "repo not found")
+			return
+		}
+		slog.Error("get repo for delete", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if row.Enabled {
+		httpx.JSON(w, http.StatusConflict, map[string]any{"error": "disable this repo before removing it"})
+		return
+	}
+	active, err := h.q.CountActiveRunsForRepo(r.Context(), id)
+	if err != nil {
+		slog.Error("count active runs for delete", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if active > 0 {
+		httpx.JSON(w, http.StatusConflict, map[string]any{"error": "this repo has a run in progress; wait for it to finish before removing"})
+		return
+	}
+	// The :execrows return may be 0 if a concurrent enable slipped in between the
+	// fetch above and this delete — that is the D6 `enabled = false` guard working, so
+	// treat 0 rows as an already-gone no-op and still return 204, never 500.
+	if _, err := h.q.DeleteRepoForUser(r.Context(), store.DeleteRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
+		slog.Error("delete repo", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 type patchRepoRequest struct {
 	// RepoSkillsEnabled is the repo-skills opt-in (PRD #16): load skills from the
 	// repo's own .claude/skills at run time. Pointer so an omitted field is a

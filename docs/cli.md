@@ -73,10 +73,15 @@ uzi run list --json
 headless path. **In CI, keep `UZI_TOKEN` in a secret (e.g. a GitHub Actions
 secret), never a plain variable.**
 
+**Holding more than one credential?** Both `uzi login` and `uzi auth token`
+can target a *named context* instead of overwriting the one you already have —
+see [Named contexts](#named-contexts) below.
+
 ## Commands
 
 ```
-uzi login | logout | auth token [--with-token] | auth status | whoami
+uzi login | logout | auth token [--with-token] | auth status [--all] | whoami
+uzi context list | current | use <name> | set <name> --url <url> | rm <name>
 uzi run list | get <id> [--field <name> ...] | logs <id> [--follow] [--after <seq>]
 uzi run wait <id> [--until <status,...>] [--interval <dur>] [--timeout <dur>]
 uzi run create --repo <id> --issue <iid> [--plan-file <path>]
@@ -107,14 +112,15 @@ uzi handoff -m <text> | -f <path> [--base <ref>] [--mr] [--review] [--then-fix] 
 uzi handoff rm <run-id> | review <run-id>
 uzi token list
 uzi worker list | rm <id> | set-token <worker-id> <label> | set-token <worker-id> --default
-uzi repo list
+uzi repo list | remove <id> [--force]
 uzi admin users | runs | workers | usage | rate-limits | cli-tokens | guardrail-impact | blocked-repos
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi tui [run-id]
 uzi version
 ```
 
-Global flags: `--json`, `--url <url>`, `--quiet`, `--no-color`.
+Global flags: `--json`, `--url <url>`, `--quiet`, `--no-color`,
+`--context <name>`/`-c <name>`.
 
 A few worth knowing:
 
@@ -350,9 +356,21 @@ A few worth knowing:
   warns and the JSON `checks_unknown` is true, so an empty list means "unknown",
   not "none blocked". The table has `OWNER`, `PATH`, `BLOCKED`, `ALLOWED BY`
   (the admin who allowed it, or `—`). Allowing/revoking is done from the web UI.
-- **`uzi logout` is local-only.** It removes the stored credential; it does
-  **not** revoke it server-side (see [Managing tokens](#managing-tokens)
-  below).
+- **`uzi repo remove <id>` deletes a single stale repo** — the surgical
+  counterpart to deleting a whole forge connection. It only works on a
+  **disabled** repo, so disable it first (`enabled` shows in `uzi repo list`);
+  the server refuses an enabled repo, or one with a run still in flight, with a
+  conflict. Removing a repo deletes its board and run history (the row and its
+  cascade), so it is destructive: it prompts `[y/N]` on stdin unless you pass
+  `--force`/`-f`. Note it is **not permanent for a repo the bot can still see** —
+  the next projects refresh re-adds it as a disabled row, because the projects
+  list reflects live membership. To keep a still-visible repo out for good,
+  remove the bot's access on the forge first; `remove` is meant for a repo the
+  bot no longer sees (a deleted/recreated project, the stale-duplicate case).
+- **`uzi logout` is local-only.** It removes **the active context's** stored
+  credential (its stored URL is left intact, so a later re-login needs no
+  re-typed URL); it does **not** revoke it server-side (see
+  [Managing tokens](#managing-tokens) below).
 
 ## uzi handoff: ephemeral branch-scoped task runs
 
@@ -1048,6 +1066,58 @@ neither.
 `$XDG_CONFIG_HOME` — deliberately: on at least one machine on this team that
 variable points into a git-tracked, synced directory, and honouring it would
 write a live token into version control.
+
+### Named contexts
+
+Both files hold a **map** of contexts, not a single slot — `config.toml` has
+`[contexts.<name>]` (a URL) and `credentials.toml` has `[contexts.<name>]` (a
+token), keyed by the same names. This is what lets the CLI hold several
+credentials at once — say a `uzc_` owner token under `default` and a `uza_`
+admin-read token under a second context named `admin` — instead of forcing you
+to overwrite one with `uzi auth token` or juggle a `UZI_TOKEN=…` override per
+invocation.
+
+**Which context is active**, in order: the `--context`/`-c <name>` flag, then
+`$UZI_CONTEXT`, then the sticky current context (set by `uzi context use`),
+then `"default"`. An empty `--context`/`$UZI_CONTEXT` counts as unset. Only
+after that is resolved do the per-invocation overrides from
+[Authenticate](#3-authenticate) layer on top — `$UZI_TOKEN` still overrides
+whatever token the context resolved to, and `$UZI_URL`/`--url` still override
+the URL — so a headless job using plain `UZI_URL`+`UZI_TOKEN` behaves exactly
+as before, whether or not contexts exist.
+
+```
+uzi context list                       # every stored context, its URL, token stored?, current
+uzi context current                    # the sticky current context (or "default")
+uzi context use <name>                 # set the sticky current context
+uzi context set <name> --url <url>     # create/update a URL-only context
+uzi context rm <name>                  # remove a context; resets current to "default" if it was current
+```
+
+`uzi auth token --context <name>` and `uzi login --context <name>` store the
+credential under that context (an unknown name is **created** here — that's
+the only way a context comes into being besides `context set`). `uzi auth
+status --all` lists every stored context; a plain `uzi auth status` reports
+just the active one. `uzi logout` removes only the active context's token,
+leaving its URL in place.
+
+**URL inheritance.** A context with no URL of its own inherits the `default`
+context's URL (never its token), so the common case — two tokens against one
+server — needs the URL stored just once, on `default`. **Multi-server
+caution**: that inheritance is only right when every context talks to the same
+server. A context aimed at a *different* server needs its own URL
+(`uzi context set <name> --url <url>`) — otherwise it would send its token to
+the wrong host.
+
+**Security framing.** A context is pure client-side credential *selection* —
+switching contexts never changes what a token can do. Authority is still the
+token's server-enforced scope (a default `uzc_` token acts as your own user;
+an admin-scoped `uza_` token is what `uzi admin …` needs — see
+[Commands](#commands) above), so choosing the `admin` context above only works
+because that token already carries `admin_ro`; a context never grants
+capability it wasn't already given. The `0600` credentials-file rule and the
+no-token-on-`argv` rule (above) hold for every context — they share the one
+store.
 
 ## When your CLI is older than the server
 

@@ -2314,6 +2314,17 @@ export const mockApi = {
     r.enabled = enabled;
     return delay({ repo: { ...r } });
   },
+  // Explicit per-repo remove (PRD #357). Mirrors deleteConnection: drops the repo
+  // from the in-memory list so demo/browser mode reflects the deletion. Enforces
+  // the server's disabled-only guard (409 on an enabled repo) so the flow behaves
+  // like the real endpoint without any /api/ call escaping the mock.
+  deleteRepo: async (id: string) => {
+    const r = repos.find((x) => x.id === id);
+    if (!r) throw new ApiError(404, "repo not found");
+    if (r.enabled) throw new ApiError(409, "disable this repo before removing it");
+    repos = repos.filter((x) => x.id !== id);
+    return delay(null);
+  },
   setRepoSkillsEnabled: async (id: string, enabled: boolean) => {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");

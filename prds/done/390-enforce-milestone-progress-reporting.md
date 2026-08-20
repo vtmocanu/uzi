@@ -2,7 +2,7 @@
 
 **Issue**: #390
 **Priority**: Medium
-**Status**: draft
+**Status**: complete
 
 ## Problem
 
@@ -196,14 +196,14 @@ Dependency graph: **M1 ⟂ M2** (independent) **→ M3**; **M1 → M4**; **{M3, 
 M1 and M2 can run in parallel; M3 (executor) needs M1's no-signal semantics and M2's
 escalation slot; M4 (display) needs M1; M5 is the cross-cutting close.
 
-- [ ] **M1 — All-empty `report_progress` is no signal (agent, D3).** In
+- [x] **M1 — All-empty `report_progress` is no signal (agent, D3).** In
   `agent/src/signals.ts` `scanSignals`, only set `out.progress` when at least one
   side has ≥1 id after parsing; an all-empty/defaulted call yields no `progress`.
   Keep last-wins for real reports. Update `agent/test/signals.test.ts`. **Success:**
   a `report_progress` with both sides empty scans to `{}` (no progress); one with a
   real id still yields it; `task gate:agent` green. Offline (scripted tool_use).
 
-- [ ] **M2 — Prompt: require, don't suggest + escalation slot (agent).** In
+- [x] **M2 — Prompt: require, don't suggest + escalation slot (agent).** In
   `agent/src/prompt.ts`, change `milestoneStatusNote` from `MAY` to a required
   per-turn declaration ("at the start of each implement turn, call `report_progress`
   with the milestone id you are working on; call it again when one completes"), and
@@ -213,7 +213,7 @@ escalation slot; M4 (display) needs M1; M5 is the cross-cutting close.
   carries the required wording; with the flag set it renders the escalation; the
   comment-less/no-milestone path is unchanged.
 
-- [ ] **M3 — Executor enforcement + observability (agent, D2/D4).** In
+- [x] **M3 — Executor enforcement + observability (agent, D2/D4).** In
   `agent/src/sdk-executor.ts`'s implement/review loop, key enforcement on **the state
   of the tracker, not on "did this turn call the tool"** — escalate when, after a work
   turn, **no milestone is marked in progress** (`latestProgress?.in_progress` empty)
@@ -234,7 +234,7 @@ escalation slot; M4 (display) needs M1; M5 is the cross-cutting close.
   run that declares a milestone in progress (even one spanning several turns) shows
   neither; a checkpoint turn and a park turn do not trigger; the run still completes.
 
-- [ ] **M4 — Display honesty end-to-end (api + web + cli, D5).** Add the missing
+- [x] **M4 — Display honesty end-to-end (api + web + cli, D5).** Add the missing
   null-vs-`[]` branch to the **CLI** (`api/cmd/uzi/run.go` L1340-1369) so a `null`
   tracker prints a neutral `–/N` ("not reported") instead of `0/N` (this is a code
   change, not just a test — the CLI has no such branch today). Add a live-DB
@@ -248,7 +248,7 @@ escalation slot; M4 (display) needs M1; M5 is the cross-cutting close.
   `–/N`; a genuinely-reported 0-complete run still shows `M0/N` / `0/N`; `task gate:api`
   + `task gate:web` green.
 
-- [ ] **M5 — Cross-cutting tests + docs.** Coverage beyond the per-milestone tests;
+- [x] **M5 — Cross-cutting tests + docs.** Coverage beyond the per-milestone tests;
   update `ARCHITECTURE.md` "Milestone tracker reconciliation" (L667+) to state that
   mid-run reporting is now enforced (required + escalated + surfaced) and that an
   all-empty report is a no-op, and refresh any user-facing docs page that describes
@@ -345,6 +345,24 @@ escalation slot; M4 (display) needs M1; M5 is the cross-cutting close.
   soft-enforcement outcomes; **K defaulted to 2**; the **resume/seeded enforcement gap**
   (R3) added to Out of scope; the D3 clear-`in_progress` note narrowed (R7); noted M1
   inverts a currently-pinned `signals.test.ts` invariant.
+- **2026-08-20 — implemented and landed** on branch `agent/issue-390` (M1–M5, one commit
+  each). M1 (`agent/src/signals.ts`): an all-empty `report_progress` sets no progress, so it
+  never persists `[]`. M2 (`agent/src/prompt.ts`): `milestoneStatusNote` MAY→required + an
+  optional `progressMissedLastTurn` escalation line; the 0-milestone/non-issue path is
+  byte-for-byte unchanged. M3 (`agent/src/sdk-executor.ts`): the implement/review loop
+  escalates the next turn and, after K=2 consecutive misses, emits a feed-only `status`;
+  a cooperative checkpoint re-arms enforcement and clears the in-progress latch *without*
+  persisting an empty `[]` (guarded to `undefined` when nothing real was completed —
+  executor-side M1 invariant, covered by a dedicated test); checkpoint and park turns are
+  excluded; never fails the run. M4 (`api/cmd/uzi/run.go`): the CLI renders a neutral `–/N`
+  for a never-reported run (`MilestonesCompleted == nil`), with a CLI render test, a live-DB
+  regression test proving `SetRunRunning` with nil progress leaves the column SQL NULL (ran
+  green against a real postgres:17), and web guard tests. M5: ARCHITECTURE "Milestone tracker
+  reconciliation" bullet extended (lineage #122→#265→#390); `docs/cli.md` needed no change
+  (its TUI surfaces were already neutral-aware). Each milestone was reviewed per-commit and
+  its component gate (`gate:agent`/`gate:api`/`gate:web`, `check-docs:web`) confirmed green;
+  M3 and M4 test non-vacuity proven by mutation. Every design decision above (D1–D8) held as
+  written — no scope deviation.
 
 ## Notes for an offline (uzi) worker
 

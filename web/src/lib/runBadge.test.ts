@@ -572,6 +572,55 @@ describe("milestoneBadgeText (not-reported vs 0/N, PRD #265 M2)", () => {
   });
 });
 
+// PRD #390 D5 / M4 guard. The two functions above are pinned in isolation; this threads
+// milestoneBadge → milestoneBadgeText so the null-vs-[] distinction is asserted END TO END,
+// on both the `reported` boolean AND the composed label. A regression that collapsed a null
+// tracker into [] (a genuinely-unreported run reading as a failure-looking M0/N) — or the
+// reverse — would keep each half locally plausible and only redden here. The tooltip wording
+// must differ between the two states too: it is the only thing that tells them apart on hover.
+describe("milestone progress null-vs-[] end to end (PRD #390 D5)", () => {
+  const ms = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({ id: `m${i + 1}`, title: `Milestone ${i + 1}` }));
+
+  it("a null tracker on a milestone-bearing run is NOT reported and composes to M–/N", () => {
+    const p = milestoneBadge({ milestones: ms(5), milestones_completed: null });
+    expect(p).not.toBeNull();
+    expect(p!.reported).toBe(false);
+    const text = milestoneBadgeText(p!);
+    expect(text.label).toBe("M–/5");
+    expect(text.label).not.toContain("0");
+    expect(text.title).toBe("No milestone completion reported for this run");
+  });
+
+  it("an ABSENT milestones_completed key behaves exactly like null (M–/N, not reported)", () => {
+    const p = milestoneBadge({ milestones: ms(5) });
+    expect(p).not.toBeNull();
+    expect(p!.reported).toBe(false);
+    expect(milestoneBadgeText(p!).label).toBe("M–/5");
+  });
+
+  it("an empty reported set IS reported and composes to a genuine M0/N, distinct from neutral", () => {
+    const reported = milestoneBadge({ milestones: ms(5), milestones_completed: [] });
+    expect(reported).not.toBeNull();
+    expect(reported!.reported).toBe(true);
+    const text = milestoneBadgeText(reported!);
+    expect(text.label).toBe("M0/5");
+    expect(text.title).toBe("Milestones reported complete of the approved plan");
+    // The neutral and the genuine-zero states must NOT share a tooltip — that is the whole
+    // distinction D5 exists to preserve.
+    const neutral = milestoneBadgeText(milestoneBadge({ milestones: ms(5), milestones_completed: null })!);
+    expect(text.title).not.toBe(neutral.title);
+    expect(text.label).not.toBe(neutral.label);
+  });
+
+  it("a single reported completion composes to M1/N and is reported", () => {
+    const p = milestoneBadge({ milestones: ms(5), milestones_completed: ["m1"] });
+    expect(p).not.toBeNull();
+    expect(p!.reported).toBe(true);
+    expect(milestoneBadgeText(p!).label).toBe("M1/5");
+  });
+});
+
 describe("priorityBadge (queue priority → pill, PRD #320 D8)", () => {
   it("background → a neutral 'Deprioritized' pill explaining it yields", () => {
     const b = priorityBadge("background");

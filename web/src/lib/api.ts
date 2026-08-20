@@ -2695,6 +2695,10 @@ const realApi = {
   listRepos: () => request<{ repos: Repo[] }>("GET", "/repos"),
   setRepoEnabled: (id: string, enabled: boolean) =>
     request<{ repo: Repo }>("PUT", `/repos/${id}`, { enabled }),
+  // Explicit per-repo remove (PRD #357). Owner-scoped; the server permits it only
+  // on a DISABLED repo with no in-flight run (409 otherwise), then deletes the
+  // repos row and cascades its board/run history. Empty 204 body.
+  deleteRepo: (id: string) => request<null>("DELETE", `/repos/${id}`),
   setRepoSkillsEnabled: (id: string, enabled: boolean) =>
     request<{ repo: Repo }>("PATCH", `/repos/${id}`, {
       repo_skills_enabled: enabled,

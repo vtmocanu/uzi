@@ -33,6 +33,6 @@
   // worker toolchain (agent/devbox-global/devbox.json) instead — it is a broadly-useful
   // base crypto/TLS CLI, not a repo-specific extra like ruby, so every worker gets it.
   "packages": [
-    "ruby@3.3"
+    "ruby@3.4.9"
   ]
 }
