@@ -403,7 +403,7 @@ const (
 	boardIDWidth         = 8  // short run id (first 8 of the UUID)
 	boardStatusWordWidth = 12 // status word cell (fits the longest word, "rate-limited")
 	boardAgeWidth        = 4  // AGE cell (relAge, single-unit)
-	boardMileWidth       = 9  // milestone micro-bar cell (up to boardMileCap ▰/▱ cells, or –/N text)
+	boardMileWidth       = 9  // milestone micro-bar cell (up to boardMileCap ▰/▱ cells, or done/total | –/N text above that)
 	boardMileCap         = 9  // above this many milestones the micro-bar falls back to N/M text
 	boardOwnerWidth      = 20 // admin owner-email cell
 	boardCredWidth       = 10 // credential cell: a 2-col tone-dot slot + up to 8 cols of token label
@@ -752,19 +752,22 @@ func (m tuiModel) verdictMarker(verdict string, todo, verdictW, countW int, bg c
 }
 
 // milestoneMarker is the board's compact milestone micro-bar — one cell per frozen milestone,
-// done ▰ (tungsten, or faint on a DONE row) ahead of remaining ▱ (faint) — the TUI twin of the
-// web's MilestoneBadge. A run that has reported nothing yet has done=0, so it draws an all-empty
-// ▱ bar (the graphical `0/N`); it falls back to N/M text when the list is longer than
-// boardMileCap. Empty for a run with no frozen list, so a non-milestone row draws nothing.
-// Carries only counts, so it needs no D7 sanitizing. bg carries the selection bar behind it on a
-// selected row.
+// done ▰ (tungsten, or faint on a DONE row) ahead of remaining ▱ (faint). A run that has reported
+// nothing yet has done=0, so it draws an all-empty ▱ bar (the graphical `0/N`) rather than the
+// web MilestoneBadge's `–/N` text — the board favours the at-a-glance bar over the never/zero
+// distinction the wider detail rail keeps. When the list is longer than boardMileCap the bar
+// would overflow the column, so it falls back to text: `done/total` once reported, and the
+// neutral `–/N` while nothing is reported (a text cell has no bar to read as `0`, so the
+// cross-surface `–/N` convention wins there). Empty for a run with no frozen list, so a
+// non-milestone row draws nothing. Carries only counts, so it needs no D7 sanitizing. bg carries
+// the selection bar behind it on a selected row.
 func (m tuiModel) milestoneMarker(r apitypes.RunListItemDTO, dim bool, bg color.Color) string {
-	done, total, _ := milestoneProgress(r.RunDTO)
+	done, total, reported := milestoneProgress(r.RunDTO)
 	if total == 0 {
 		return ""
 	}
 	if total > boardMileCap {
-		return paintSeg(m.pal.faintC, bg, false, itoa(done)+"/"+itoa(total))
+		return paintSeg(m.pal.faintC, bg, false, milestoneCount(done, total, reported))
 	}
 	fillC := m.pal.tungsten
 	if dim {

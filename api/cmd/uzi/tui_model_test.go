@@ -1136,6 +1136,8 @@ func TestTUIBoardMilestoneBadge(t *testing.T) {
 
 // The micro-bar caps at boardMileCap (9) cells: a 9-milestone run draws the full bar, while a
 // 10-milestone run falls back to N/M text (the bar would overflow the boardMileWidth column).
+// A text cell has no bar to read as 0, so an UNREPORTED over-cap run keeps the neutral –/N there,
+// not 0/N (the cross-surface convention the empty bar only overrides where a bar can be drawn).
 func TestTUIBoardMilestoneBadgeCap(t *testing.T) {
 	mile := func(n int) []apitypes.Milestone {
 		ms := make([]apitypes.Milestone, n)
@@ -1149,6 +1151,8 @@ func TestTUIBoardMilestoneBadgeCap(t *testing.T) {
 			Milestones: mile(9), MilestonesCompleted: []string{"m1"}}}, // 1/9 → full 9-cell bar
 		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "running", IssueTitle: "ten",
 			Milestones: mile(10), MilestonesCompleted: []string{"m1", "m2", "m3"}}}, // 3/10 → text
+		{RunDTO: apitypes.RunDTO{ID: "cccccccc-3", Kind: "issue", Status: "running", IssueTitle: "unreported-ten",
+			Milestones: mile(10)}}, // nil completed, over cap → –/10 text, never 0/10
 	}}
 	m := tuiTestModel(t, fake, "")
 	next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
@@ -1164,6 +1168,20 @@ func TestTUIBoardMilestoneBadgeCap(t *testing.T) {
 	// 10 milestones exceed the cap → N/M text, never a bar.
 	if !strings.Contains(out, "3/10") {
 		t.Errorf("a 10-milestone run should fall back to 3/10 text\n%s", out)
+	}
+	// Over cap AND nothing reported → neutral –/10 text, never 0/10 (which reads as failure).
+	var unrep string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "unreported-ten") {
+			unrep = line
+			break
+		}
+	}
+	if unrep == "" {
+		t.Fatalf("no board row for the unreported over-cap run\n%s", out)
+	}
+	if !strings.Contains(unrep, "–/10") || strings.Contains(unrep, "0/10") {
+		t.Errorf("an unreported over-cap run should show –/10 text, not 0/10\n%q", unrep)
 	}
 }
 
