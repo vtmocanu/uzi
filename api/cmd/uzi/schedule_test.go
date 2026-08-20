@@ -900,7 +900,7 @@ func TestScheduleGetLastFireBlock(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Last fire:",
-		"fired 2026-08-13T09:00:00Z · matched 3 · started 1 · skipped 2",
+		"fired 2026-08-13T09:00:00Z · examined 3 · started 1 · skipped 2",
 		"#158 → run run_c81a  Fix the thing",
 		"#96  no PRD link  A raw bug report", // reason LABEL, not the raw wire string
 		"#97  already running  Already in flight",
@@ -921,7 +921,7 @@ func TestScheduleGetLastFireBlock(t *testing.T) {
 }
 
 // TestScheduleGetLastFireCappedHint: a capped fire that started nothing and skipped every
-// matched candidate shows the raise-the-cap hint.
+// examined candidate shows the raise-the-cap hint.
 func TestScheduleGetLastFireCappedHint(t *testing.T) {
 	lf := &apitypes.LastFire{
 		FiredAt: time.Date(2026, 8, 13, 9, 0, 0, 0, time.UTC),
@@ -1006,7 +1006,7 @@ func TestScheduleGetLastFireJSON(t *testing.T) {
 }
 
 // TestScheduleRunNowBreakdown (PRD #308 M5): run-now human output prints the started run
-// ids, per-started lines, and the matched/skipped tally with human reason labels and the
+// ids, per-started lines, and the examined/skipped tally with human reason labels and the
 // remediation hint.
 func TestScheduleRunNowBreakdown(t *testing.T) {
 	fc := &uzicli.FakeClient{RunNowResult: apitypes.RunNowResponse{
@@ -1027,7 +1027,7 @@ func TestScheduleRunNowBreakdown(t *testing.T) {
 	for _, want := range []string{
 		"Started 1 run(s) from sch_rn: run_c81a",
 		"#158 → run run_c81a  Fix the thing",
-		"Matched 3 candidate(s), skipped 2:",
+		"Examined 3 candidate(s), skipped 2:",
 		"#96  no PRD link   # add PRDLESS / a prds link, or raise --max-issues", // LABEL + hint
 		"#97  already running",
 	} {
@@ -1058,7 +1058,7 @@ func TestScheduleRunNowStartedNothing(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Started 0 runs from sch_rn.",
-		"Matched 1 candidate(s), skipped 1:",
+		"Examined 1 candidate(s), skipped 1:",
 		"#96  no PRD link   # add PRDLESS / a prds link, or raise --max-issues",
 	} {
 		if !strings.Contains(out, want) {

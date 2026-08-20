@@ -65,14 +65,20 @@ create-time default, not a retroactive change.
 ## Sweep cap
 
 A label sweep also has a **max issues per fire**, applied oldest issue first
-(lowest issue number). A new sweep defaults to **10**, so one fire can't fan
-out across an entire label's backlog at once; raise it, or in the web modal
-blank the field for unlimited (today's original behavior — the CLI always
-sends a cap, defaulting to 10, so an unlimited sweep is web-only). An
-existing sweep created before this cap existed stays unbounded until you set
-one. If the oldest N candidates are all still mid-run from a previous fire,
-this fire starts none of them and doesn't reach newer issues — bounded, and
-self-correcting on the next fire.
+(lowest issue number). The cap counts runs **started**, not candidates
+matched: when the oldest candidate can't start — no PRD link, already
+mid-run from a previous fire, or a transient fetch error — the fire flags it
+(see [Fire outcomes](#fire-outcomes)) and walks on to the next eligible
+issue, so a stale issue at the head of the backlog no longer wastes a slot or
+blocks newer work. That walk is bounded by a **scan window** — the cap plus a
+fixed headroom — so one fire's cost stays predictable even when the head is a
+wall of ineligible issues; if every issue in that window is ineligible the
+fire under-fills, and each skipped issue stays flagged for you to fix. A new
+sweep defaults to **10**, so one fire can't fan out across an entire label's
+backlog at once; raise it, or in the web modal blank the field for unlimited
+(today's original behavior — the CLI always sends a cap, defaulting to 10, so
+an unlimited sweep is web-only). An existing sweep created before this cap
+existed stays unbounded until you set one.
 
 ## Guidance
 
@@ -101,13 +107,15 @@ already is the instruction.
 
 A schedule can fire right on time and still start **zero** runs — every
 candidate can be benign-skipped by the same gate a manual start goes
-through. The motivating case: a `bug` label sweep with `max_issues: 1`
-whose single oldest candidate has no `prds/*.md` link and no `PRDLESS`
-label — the fire runs every night, `Last run` keeps advancing, and
-nothing ever starts. Without a fire outcome, that looks identical to a
-healthy schedule.
+through. The motivating case: a `bug` label sweep whose oldest candidates
+all lack a `prds/*.md` link and a `PRDLESS` label — [backfill](#sweep-cap)
+walks past them to start any eligible issue in reach, but when the whole
+scan window is ineligible the fire runs every night, `Last run` keeps
+advancing, and nothing ever starts. Without a fire outcome, that looks
+identical to a healthy schedule.
 
-Each fire records how many candidates it **matched**, which ones
+Each fire records how many candidates it **examined** (attempted — this can
+exceed `max_issues` once backfill walks past a skip), which ones
 **started** (paired with the run they produced), and which were
 **skipped**, each with a typed reason — never free text:
 
@@ -125,17 +133,18 @@ Each fire records how many candidates it **matched**, which ones
   can't stall the rest of the fan-out, so that candidate is bucketed
   `fetch_failed` and the sweep continues.
 
-`matched == started + skipped` always holds — every candidate lands in
-exactly one bucket, so the tally never silently drops one.
+`examined == started + skipped` always holds — every candidate the fire
+reaches lands in exactly one bucket, so the tally never silently drops one.
 
 The outcome surfaces everywhere a schedule's status does: the
 Schedules page's `Last run` cell (an outcome badge — started work vs.
 started nothing) with an expandable **Last fire** panel giving the
 per-issue breakdown; `uzi schedule get`'s **Last fire** block (and its
 `--json` `.last_fire`); and `uzi schedule run-now`'s per-candidate
-summary. A sweep fire that was truncated by the [cap](#sweep-cap) and
-started nothing also carries the actionable hint — raise `max_issues`
-or add PRDLESS / a PRD link to the issues behind it.
+summary. A sweep fire with more eligible-label issues than its [scan
+window](#sweep-cap) reached that still started nothing also carries the
+actionable hint — raise `max_issues` or add PRDLESS / a PRD link to the
+issues behind it.
 
 Only the **last** fire is kept, and only the last *scheduled* one:
 `last_fire` is written on the same path that advances the schedule, so

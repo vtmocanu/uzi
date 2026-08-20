@@ -393,9 +393,13 @@ nothing a manual start cannot.
   - `--enabled` defaults **on**; pass `--enabled=false` to create the schedule already
     paused (no separate `schedule pause` step, avoiding a brief window where a due schedule
     could fire).
-  - `--max-issues <n>` caps how many issues one `--sweep` fire starts, oldest (lowest
+  - `--max-issues <n>` caps how many runs one `--sweep` fire **starts**, oldest (lowest
     number) first; defaults to 10, ignored for non-sweep targets. `--max-issues 1` is
-    "one issue per fire".
+    "one run per fire". The cap counts runs *started*, not candidates matched: a
+    candidate that can't start (no PRD link, already running, transient fetch) is flagged
+    and the fire walks on to the next eligible issue, bounded by a scan window (the cap
+    plus a fixed headroom), so a stale issue at the head of the backlog no longer wastes a
+    slot.
   - `--guidance <text>` (with `--issue`/`--sweep`) injects free owner steering into the
     run instruction ("keep the diff small", "add a failing test first") without editing
     each issue; capped at 8 KiB.
@@ -407,7 +411,7 @@ nothing a manual start cannot.
   `NEXT`, `ON`); `--json` dumps the raw array.
 - `uzi schedule get <schedule-id>` — one schedule's config plus its computed next fires.
   When the schedule has fired at least once it also prints a **Last fire** block: a
-  summary line (`fired <time> · matched N · started M · skipped K`), one line per started
+  summary line (`fired <time> · examined N · started M · skipped K`), one line per started
   run (`#<iid> → run <run-id>  <title>`, or a `prompt` marker for a prompt schedule), one
   line per skipped candidate with a human reason label (`no PRD link`, `already running`,
   `not eligible`, `description too large`, `fetch failed`), and — when a capped fire
@@ -434,7 +438,7 @@ nothing a manual start cannot.
 - `uzi schedule run-now <schedule-id>` — fire immediately without disturbing the cadence.
   Prints a per-candidate breakdown: a `Started N run(s)` header with the created run
   id(s), one line per started run, then — when candidates were skipped — a
-  `Matched N candidate(s), skipped K:` tally with a human reason label per skip and, for a
+  `Examined N candidate(s), skipped K:` tally with a human reason label per skip and, for a
   missing PRD link, a `# add PRDLESS / a prds link, or raise --max-issues` hint. A fire
   that started nothing AND skipped nothing (a benign dedup, a prior run still live) reports
   `no run started`. `--json` dumps the raw response (`created`, `run_ids`, `matched`,

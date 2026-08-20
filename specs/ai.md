@@ -21520,3 +21520,45 @@ requirement; the `main`-never-touched invariant is unchanged.
   `uzi handoff rm <id>` deletes only within the `uzi/task/*` namespace (a CLI-side guard refuses any
   other branch), with the user's own credentials, exempting an `--mr`-opened branch. Server-side
   auto-prune (a new `Forge.DeleteBranch`) is deferred to Later.
+
+## 561. Issue #416 — sweep backfill: the `max_issues` cap counts runs STARTED, not candidates matched
+
+A label-sweep fire (`api/internal/schedsvc`, `fireSweep`) used to cap the candidates it
+*considered* at `max_issues`: it fetched the `max_issues` oldest matching open issues and fired
+each, so a candidate it could not start (no PRD link, already running, transient fetch) simply
+lost its slot and the fire started fewer than `max_issues`. A permanently ineligible issue at the
+head of the backlog could under-fill every fire indefinitely while newer eligible issues waited.
+This change makes the cap count runs **started**: the fire walks oldest-first past a skip and
+starts the next eligible candidate until `max_issues` runs fire, bounded by a scan window so
+per-fire cost stays bounded. It lives in the shared `fireSweep` path, so it applies to every
+sweep (`bug`, `Night-Shift`, any future sweep) with no per-schedule code. Aligns behaviour with
+the intent `SKILL.md` already documented ("how many issues one `--sweep` fire *starts*").
+
+- **Bounded scan window, additive headroom.** When `max_issues` is set, the fetch widens to
+  `max_issues + backfillHeadroom` (a `schedsvc` package constant, default **10**); the widened
+  limit is computed in Go and threaded into the existing `ListSweepCandidateIssues` `MaxIssues`
+  param — no SQL/sqlc change. The loop stops (early break) once `max_issues` runs have started, so
+  dense eligibility examines exactly `max_issues` and a wall of ineligible head issues costs at
+  most the window in forge `GetIssue` / DB `HasActiveRunForIssue` calls. An additive constant
+  (not a multiplier) keeps per-fire cost predictable for small caps. A NULL cap stays unlimited
+  with no started ceiling, exactly as before.
+
+- **`Matched` redefined as "examined", no wire change.** `FireOutcome.Matched` now counts the
+  candidates a fire actually examined (`len(Started) + len(Skips)`), so the invariant
+  `Matched == started + skipped` still holds by construction; the value may now exceed
+  `max_issues`. The `last_fire` json tag, `apitypes.LastFire.Matched`, the web `LastFire` type,
+  and the skip-reason contract are all untouched at the wire level. Four count-*display* sites are
+  relabeled "matched N" → "examined N" (web `Schedules.tsx` collapsed cell + tally; CLI
+  `schedule get` / `run-now`); the two "matched 0" zero-candidate badges keep their wording.
+
+- **`Capped` redefined to "beyond the scan window".** Because the fetch widened, `Capped` now
+  means "more matching open issues than the scan window reached" rather than "more than
+  `max_issues`". Kept (not dropped) because the started-nothing hint still needs it; the shift is
+  documented in `docs/scheduling.md`.
+
+- **No new skip reason and no new `last_fire` field.** A skipped candidate is still flagged
+  exactly as before (the typed skip record is the flag). A silent partial-under-fill mode
+  (`0 < started < max_issues`, window exhausted by ineligible candidates) is acknowledged as a v1
+  limitation; a `scan_exhausted` fire-level signal to surface it is a possible follow-up, not
+  shipped here. SQL-side eligibility pre-filtering and a user-configurable `backfillHeadroom` are
+  likewise out of scope. Full rationale in the Decision Log of `prds/done/416-sweep-backfill-skipped-slots.md`.

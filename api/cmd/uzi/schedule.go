@@ -761,7 +761,7 @@ var skipReasonHints = map[string]string{
 func skipReasonHint(reason string) string { return skipReasonHints[reason] }
 
 // lastFireCappedHint is the one-line steer shown when a capped fire started nothing and
-// every matched candidate was skipped — the newest issues were never reached.
+// every examined candidate was skipped — the newest issues were never reached.
 const lastFireCappedHint = "newer issues not reached — raise --max-issues or add PRDLESS / a PRD link"
 
 // fireCandidateLabel renders a started/skipped candidate's identity: "#<iid>" for an
@@ -783,7 +783,7 @@ func renderLastFire(p *uzicli.Printer, lf *apitypes.LastFire) {
 		return
 	}
 	p.Printf("Last fire:\n")
-	p.Printf("  fired %s · matched %d · started %d · skipped %d\n",
+	p.Printf("  fired %s · examined %d · started %d · skipped %d\n",
 		lf.FiredAt.UTC().Format(time.RFC3339), lf.Matched, len(lf.Started), len(lf.Skips))
 	for _, st := range lf.Started {
 		p.Printf("    %s → run %s  %s\n", fireCandidateLabel(st.IssueIID), st.RunID, st.Title)
@@ -798,7 +798,7 @@ func renderLastFire(p *uzicli.Printer, lf *apitypes.LastFire) {
 
 // renderRunNow prints the human outcome of a `schedule run-now` fire (PRD #308 M5) from
 // the widened RunNowResponse: a header with the started run ids, a per-started line, and —
-// when candidates were skipped — the matched/skipped tally with a human reason label and
+// when candidates were skipped — the examined/skipped tally with a human reason label and
 // an optional remediation hint per skip. A fire that started nothing AND skipped nothing is
 // a benign dedup (a prior run still live), reported as such rather than as "started 0".
 func renderRunNow(p *uzicli.Printer, id string, res apitypes.RunNowResponse) {
@@ -822,7 +822,7 @@ func renderRunNow(p *uzicli.Printer, id string, res apitypes.RunNowResponse) {
 		p.Printf("  %s → run %s  %s\n", fireCandidateLabel(st.IssueIID), st.RunID, st.Title)
 	}
 	if len(res.Skips) > 0 {
-		p.Printf("Matched %d candidate(s), skipped %d:\n", res.Matched, len(res.Skips))
+		p.Printf("Examined %d candidate(s), skipped %d:\n", res.Matched, len(res.Skips))
 		for _, sk := range res.Skips {
 			line := fmt.Sprintf("  %s  %s", fireCandidateLabel(sk.IssueIID), skipReasonLabel(sk.Reason))
 			if hint := skipReasonHint(sk.Reason); hint != "" {

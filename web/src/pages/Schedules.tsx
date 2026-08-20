@@ -347,7 +347,7 @@ function ScheduleRow({
 
 // LastRunOutcome is the enriched "Last run" cell for a schedule that has a
 // persisted fire (PRD #308 M4, mock §1): an outcome badge, a muted "{stamp} ·
-// matched N" line, and a disclosure that toggles the "Last fire" detail row.
+// examined N" line, and a disclosure that toggles the "Last fire" detail row.
 function LastRunOutcome({
   fire,
   expanded,
@@ -366,7 +366,7 @@ function LastRunOutcome({
         <OutcomeBadge fire={fire} />
       </span>
       <span className="text-[11px] text-faint tabular-nums">
-        {formatStamp(fire.fired_at)} · matched {fire.matched}
+        {formatStamp(fire.fired_at)} · examined {fire.matched}
       </span>
       {/* A DISCLOSURE, not a link (ux-tweaks item 2): it expands the detail row in
           place, so it must not wear the app's link costume (text-info + underline
@@ -415,7 +415,7 @@ function OutcomeBadge({ fire }: { fire: LastFire }) {
 }
 
 // LastFireDetail is the expandable "Last fire" panel (mock §2): a header with the
-// fire timestamp + a status badge, a matched/started/skipped/max-issues tally, one
+// fire timestamp + a status badge, an examined/started/skipped/max-issues tally, one
 // row per started run (linking to the run) and per skipped candidate (with its
 // typed reason), and the actionable cap hint when a capped fire started nothing.
 function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
@@ -455,7 +455,7 @@ function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
       </div>
 
       <div className="mb-3.5 flex flex-wrap gap-x-5 gap-y-2">
-        <Tally n={fire.matched} label="matched" tone="mut" />
+        <Tally n={fire.matched} label="examined" tone="mut" />
         <Tally n={fire.started.length} label="started" tone={fire.started.length > 0 ? "ok" : "mut"} />
         <Tally n={fire.skips.length} label="skipped" tone={fire.skips.length > 0 ? "warn" : "mut"} />
         <Tally

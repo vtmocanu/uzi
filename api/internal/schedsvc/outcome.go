@@ -30,13 +30,18 @@ type Skip struct {
 // balances (PRD #308 Decision 4). A transient per-candidate sweep failure is a
 // fetch_failed Skip, not a dropped candidate.
 type FireOutcome struct {
-	// Matched is the number of candidates considered this fire: sweep = len(the capped
-	// candidate set), issue = 0/1 (1 once the pinned issue is considered), prompt = 1
-	// (the schedule itself is the single candidate whenever a fire is attempted).
+	// Matched is the number of candidates EXAMINED this fire: sweep = candidates the
+	// backfill walk actually attempted (issue #416: the cap counts runs STARTED, so a
+	// slot lost to a skip is refilled from the next eligible candidate, and Matched may
+	// exceed max_issues — it counts attempts, not the cap), issue = 0/1 (1 once the
+	// pinned issue is considered), prompt = 1 (the schedule itself is the single candidate
+	// whenever a fire is attempted).
 	Matched int
-	// Capped is set only by a sweep whose max_issues cap truncated the candidate set, so
-	// the "newer issues not reached" hint can be factual. Always false for issue/prompt
-	// and for a sweep with a NULL cap (a NULL cap can never truncate).
+	// Capped is set only by a sweep whose max_issues cap is present and the repo has more
+	// matching open issues than the SCAN WINDOW (max_issues + backfillHeadroom) reached
+	// (issue #416 widened the fetch, so "truncated" now means "beyond backfill's reach"),
+	// so the "newer issues not reached" hint can be factual. Always false for issue/prompt
+	// and for a sweep with a NULL cap (a NULL cap fetches everything and can never truncate).
 	Capped  bool
 	Started []Started
 	Skips   []Skip

@@ -495,7 +495,12 @@ is its **ad-hoc prompt** target, which — like `ci_fix` — has no issue to
 seam through, so it lands via a dedicated INSERT as a new `prompt` run kind
 (`runs.kind`, beside `chat`/`ci_fix`/`self_improve`/`judge`/`issue`):
 repo-ful, issue-less, `schedule_id`-keyed for dedup (no issue to key
-`HasActiveRunForIssue` on), and MR-opening on the `ci_fix` shape. See
+`HasActiveRunForIssue` on), and MR-opening on the `ci_fix` shape. A **sweep**
+target fans out over the oldest open issues matching its label; its
+`max_issues` cap counts runs *started*, not candidates matched — a candidate
+it can't start is flagged and the fire backfills from the next eligible issue
+within a bounded scan window (`fireSweep`, issue #416), so a stale ineligible
+issue at the head no longer under-fills every fire. See
 [docs/scheduling.md](docs/scheduling.md) and
 `prds/done/241-schedule-runs.md`.
 
