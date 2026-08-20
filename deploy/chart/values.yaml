@@ -415,7 +415,7 @@ workers:
     # so the fleet rolls as its workers finish their runs. It must be concrete: the
     # controller-deployment template wraps it in `required`, so a blank tag fails the
     # render loudly rather than shipping an empty image reference.
-    tag: "0.48.0"
+    tag: "0.49.0"
   # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
   # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
   # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image
@@ -609,8 +609,8 @@ workers:
     # digest-pinned and share the other tracks' pins: rootlessImage == docker-compose.yml
     # `dind`; nonRootlessImage == .gitlab-ci.yml's `docker:28-dind` service (same major).
     # One image ref serves both the sidecar and the tiny root socket-prep helper.
-    rootlessImage: docker:28-dind-rootless@sha256:7c3e797187e43738220462658f4586572cbd3bf009f728b21e34d9c5c06ce431
-    nonRootlessImage: docker:28-dind@sha256:2a232a42256f70d78e3cc5d2b5d6b3276710a0de0596c145f627ecfae90282ac
+    rootlessImage: docker:29-dind-rootless@sha256:8a213afdd096a44dff403aaf8eb58b7a96a63113f18a4b094b98b7d0ed7d948b
+    nonRootlessImage: docker:29-dind@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07
     # Explicit image override: non-empty is used VERBATIM instead of the posture
     # selection above (still subject to the coherence fail-guard, which rejects a
     # -dind-rootless image with rootless:false, or a plain -dind image with

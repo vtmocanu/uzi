@@ -3505,8 +3505,9 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 
 // PublishResult is the outcome of a checkpoint publish (PRD #122 M8). Published is
 // true only when the push landed. Skipped names the benign reason a publish did NOT
-// advance the ref ("no_ref" | "not_descendant" | "unsupported"); it is empty on a
-// successful publish. Either way Ref is the checkpoint ref the worker asked about.
+// advance the ref ("no_ref" | "not_descendant" | "unsupported" | "workflow_scope"); it
+// is empty on a successful publish. Either way Ref is the checkpoint ref the worker
+// asked about.
 type PublishResult struct {
 	Published bool
 	Ref       string
@@ -3610,6 +3611,14 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		return PublishResult{Published: true, Ref: ref}, nil
 	case errors.Is(err, pushbroker.ErrNotDescendant):
 		return PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}, nil
+	case errors.Is(err, pushbroker.ErrWorkflowScopeRejected):
+		// The branch is behind on .github/workflows/** relative to the default branch,
+		// so the bot's repo-only PAT cannot push the checkpoint (PRD #456 M4). This is a
+		// benign skip like ErrNotDescendant — nil error, so it never reaches the 5xx /
+		// slog.Error default arm and never fails the run. Checkpoints stay best-effort;
+		// the finalize base-align (PRD #456 M1) is the real safety net that saves this
+		// run's work.
+		return PublishResult{Published: false, Ref: ref, Skipped: "workflow_scope"}, nil
 	case errors.Is(err, pushbroker.ErrTipMissing),
 		errors.Is(err, pushbroker.ErrPackTooLarge),
 		errors.Is(err, pushbroker.ErrPackInvalid):
