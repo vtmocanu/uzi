@@ -276,7 +276,7 @@ func evaluateToken(forgeType forge.Type, info forge.TokenInfo, isAdmin bool, now
 		return tr
 	}
 
-	if !scopesEqualRequired(forgeType, info.Scopes) {
+	if !scopesAcceptable(forgeType, info.Scopes) {
 		tr.Violations = append(tr.Violations, fmt.Sprintf("token scopes %v are not exactly %v", info.Scopes, requiredScopesFor(forgeType)))
 	}
 	if !info.Active {
@@ -306,35 +306,78 @@ func requiredScopesFor(t forge.Type) []string {
 	case forge.TypeForgejo:
 		return []string{"read:user", "write:issue", "write:repository"}
 	case forge.TypeGitHub:
-		// GitHub classic PAT: the single coarse `repo` scope, exactly (PRD #238
-		// D7). The set-equality semantics below make {repo, workflow} and
-		// {repo, delete_repo} save-blocking over-privilege violations for free
-		// (D7a) — deliberately no allowed-extra set.
+		// GitHub classic PAT: the single coarse `repo` scope is REQUIRED (PRD #238
+		// D7). It is no longer the ONLY acceptable scope, though — see
+		// allowedOptionalScopesFor: PRD #364's board↔Projects v2 sync needs the PAT to
+		// also carry `project`, so the acceptance test below is a bounded superset,
+		// not exact equality. Over-privilege outside that named allowance
+		// ({repo, workflow}, {repo, delete_repo}) still blocks at save (D7a).
 		return []string{"repo"}
 	default:
 		return []string{"api"}
 	}
 }
 
-// scopesEqualRequired reports whether scopes is exactly the forge's required set,
-// compared as an unordered set. It must NOT be a string compare: Forgejo re-emits
-// a token's scopes in its own canonical order, not the order they were minted in,
-// so the required three come back reordered (D6b). The god-mode ["all"] token —
-// which Forgejo produces by collapsing every write:* scope into one literal — is
-// rejected here for free: it is simply a set that does not equal the required
-// three, and this never tries to expand it back out. Fewer scopes would have
-// failed VerifyToken/ListProjects already; more is over-privilege.
-func scopesEqualRequired(t forge.Type, scopes []string) bool {
+// allowedOptionalScopesFor returns the scopes a forge type ACCEPTS but does not
+// REQUIRE — permitted when present, never demanded. This is the minimal, deliberate
+// widening of the over-privilege guard PRD #364 needs: GitHub's board↔Projects v2
+// Status sync (F4) mutates a Projects v2 board, which the classic PAT can only do
+// when it carries `project` (or the read-only `read:project`), so those two must
+// pass the save-time scope gate rather than being rejected as over-privilege. It is
+// scoped to GitHub ALONE: GitLab and Forgejo have no Projects v2 equivalent, so
+// their optional set is empty and required ∪ ∅ == required leaves their acceptance
+// exactly the old set-equality (their behavior must not change).
+func allowedOptionalScopesFor(t forge.Type) []string {
+	switch t {
+	case forge.TypeGitHub:
+		return []string{"project", "read:project"}
+	default:
+		return nil
+	}
+}
+
+// scopesAcceptable reports whether scopes is a permissible set for the forge,
+// compared as an unordered set (never a string compare: Forgejo re-emits a token's
+// scopes in its own canonical order, not mint order — D6b). A set is acceptable iff
+// it is a SUPERSET of the required set AND a SUBSET of required ∪ allowedOptional:
+//
+//   - superset of required — fewer would have failed VerifyToken/ListProjects
+//     already, so a missing required scope is rejected here too;
+//   - subset of required ∪ allowedOptional — anything BEYOND the required scopes and
+//     the named optional allowance is over-privilege PRD #5 blocks at save.
+//
+// This REPLACES the old exact set-equality (scopesEqualRequired). For GitLab and
+// Forgejo allowedOptionalScopesFor is empty, so required ∪ ∅ == required and the
+// two bounds collapse back to equality — their behavior is unchanged. Only GitHub
+// gains the {project, read:project} allowance (PRD #364): {repo}, {repo, project}
+// and {repo, read:project} pass, while {repo, workflow} and {repo, delete_repo}
+// still fail (workflow/delete_repo are not in the optional set — D7a is preserved).
+//
+// The god-mode ["all"] Forgejo token — which collapses every write:* scope into one
+// literal — is still rejected for free: "all" is neither a required scope nor an
+// optional one, so it fails the subset half, and this never tries to expand it.
+func scopesAcceptable(t forge.Type, scopes []string) bool {
 	req := requiredScopesFor(t)
+	allowed := map[string]struct{}{}
+	for _, r := range req {
+		allowed[r] = struct{}{}
+	}
+	for _, o := range allowedOptionalScopesFor(t) {
+		allowed[o] = struct{}{}
+	}
 	seen := map[string]struct{}{}
 	for _, s := range scopes {
 		seen[s] = struct{}{}
 	}
-	if len(seen) != len(req) {
-		return false
-	}
+	// Superset of required: every required scope must be present.
 	for _, r := range req {
 		if _, ok := seen[r]; !ok {
+			return false
+		}
+	}
+	// Subset of required ∪ allowedOptional: no scope beyond the allowed set.
+	for s := range seen {
+		if _, ok := allowed[s]; !ok {
 			return false
 		}
 	}

@@ -17,6 +17,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/config"
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
@@ -141,7 +142,27 @@ type Handler struct {
 	// instance is never started. nil when a test builds a Handler as a struct literal;
 	// the run-now handler nil-guards it.
 	scheduler *schedsvc.Scheduler
+	// projectSync adopts/links an existing GitHub Projects v2 board to a repo's label
+	// board and seeds it (PRD #364 M3). Reached only from the admin
+	// github-project-sync routes; nil-guarded there so a struct-literal test handler
+	// (or a build without the service wired) returns a clean error rather than panics.
+	projectSync ProjectSyncer
 }
+
+// ProjectSyncer is the slice of the GitHub Projects v2 provisioning service the
+// admin github-project-sync handlers drive (PRD #364 M3). *forgesvc.ProjectSyncService
+// satisfies it; kept as an interface so the handler test can inject a fake without
+// the forge/secretbox machinery.
+type ProjectSyncer interface {
+	Adopt(ctx context.Context, repoID uuid.UUID, projectNumber int, ownerKind forge.ProjectV2OwnerKind) error
+	Disable(ctx context.Context, repoID uuid.UUID) error
+}
+
+// SetProjectSync wires the GitHub Projects v2 provisioning service in after
+// construction (built in main alongside the other forge collaborators), matching the
+// repo's pattern for optional post-New dependencies. Safe to leave unset — the admin
+// github-project-sync routes then return a clean 500 rather than panic.
+func (h *Handler) SetProjectSync(p ProjectSyncer) { h.projectSync = p }
 
 // clock reads the classification clock seam, nil-safe.
 //
@@ -969,6 +990,12 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// route-around D8 forbids. Actor + timestamp from the session, never the body.
 				r.Post("/repos/{id}/guardrail-override", h.SetRepoGuardrailOverride)
 				r.Delete("/repos/{id}/guardrail-override", h.ClearRepoGuardrailOverride)
+				// Admin GitHub Projects v2 Status sync (PRD #364 M3): adopt/link an
+				// existing project + seed it, and tear the link down. Admin-only because
+				// the sync writes to a user's project board; repo target from the path,
+				// project coordinates from the body.
+				r.Post("/repos/{id}/github-project-sync", h.AdoptGithubProjectSync)
+				r.Delete("/repos/{id}/github-project-sync", h.DisableGithubProjectSync)
 			})
 		})
 

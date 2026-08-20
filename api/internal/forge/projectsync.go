@@ -130,6 +130,11 @@ type ProjectBoardSyncer interface {
 	// LinkProjectV2ToRepository links a project to a repo so it appears under the
 	// repo's Projects tab (F8). Not required for the board's fields/items to work.
 	LinkProjectV2ToRepository(ctx context.Context, projectID, repositoryID string) error
+	// RepoSlug resolves a numeric forge project id to its owner/name pair (PRD #364
+	// M3). The adopt/seed flow needs the owner and repo STRINGS for
+	// ResolveProjectV2/ResolveIssueNodeID/ResolveRepositoryNodeID, whereas the rest
+	// of uzi keys a repo by its numeric forge_project_id — this bridges the two.
+	RepoSlug(ctx context.Context, forgeProjectID int64) (owner, name string, err error)
 }
 
 // --- github driver implementation ------------------------------------------
@@ -549,6 +554,18 @@ func (g *github) LinkProjectV2ToRepository(ctx context.Context, projectID, repos
   }
 }`
 	return g.graphqlDo(ctx, mutation, map[string]any{"projectId": projectID, "repositoryId": repositoryID}, nil)
+}
+
+// RepoSlug resolves a numeric forge project id to its owner/name pair by reusing
+// the driver's cached repoSlugFor (github.go) — the same resolver the pipeline
+// reads use. The adopt flow (PRD #364 M3) needs the owner/repo strings the
+// Projects v2 GraphQL queries take, not the numeric id uzi stores.
+func (g *github) RepoSlug(ctx context.Context, forgeProjectID int64) (string, string, error) {
+	s, err := g.repoSlugFor(ctx, forgeProjectID)
+	if err != nil {
+		return "", "", err
+	}
+	return s.owner, s.repo, nil
 }
 
 // toProjectV2Options maps the decoded {id,name} option nodes onto the neutral

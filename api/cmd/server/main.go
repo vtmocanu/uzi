@@ -332,6 +332,11 @@ func run() error {
 
 	svc := forgesvc.New(q, box, cfg.ForgeHTTPTimeout, settingsCache)
 
+	// GitHub Projects v2 Status-sync provisioning service (PRD #364 M3): adopt/link
+	// an existing project + seed it. Builds forges through svc (same decryption path
+	// the handlers use) and gates on the instance kill-switch in settingsCache.
+	projectSync := forgesvc.NewProjectSync(q, svc, settingsCache, slog.Default())
+
 	// Wire the forge builder into workersvc so its composite forge-write operations —
 	// ConfirmProposalForUser, StartRunForUser (PRD #191 Decision 8) — reach the forge
 	// through the same decryption path the handlers use, without a forgesvc↔workersvc
@@ -702,6 +707,9 @@ func run() error {
 	// let a burst of dragging starve the user's real forge operations.
 	boardOrderLimiter := mw.NewLimiter(cfg.BoardOrderRateLimitMax, cfg.BoardOrderRateLimitWindow, cfg.TrustedProxies)
 	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub, settingsCache)
+	// GitHub Projects v2 Status-sync provisioning service (PRD #364 M3), wired
+	// post-construction like the other optional forge collaborators.
+	h.SetProjectSync(projectSync)
 	h.SetVersion(version)
 	// The rest of the build coordinates (PRD #175). Passed raw: the handler decides
 	// what an absent or unparseable stamp means, so there is one such place.

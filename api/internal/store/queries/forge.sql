@@ -91,6 +91,21 @@ FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE r.id = $1 AND c.user_id = $2;
 
+-- name: GetRepoByID :one
+-- One repo plus the connection fields needed to build a forge client, UNSCOPED by
+-- user. Modeled on GetRepoForUser but WITHOUT the user_id filter — the GitHub
+-- Projects v2 sync (PRD #364 M3) is driven from an ADMIN-only route, targeting a
+-- repo by id regardless of which user owns its connection (precedent:
+-- SetRepoGuardrailOverride is the unscoped admin write). Returns the joined
+-- connection fields the forge builder needs (forge_type, base_url, token_ciphertext)
+-- plus forge_project_id for slug/issue resolution.
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
+       r.default_branch, r.enabled,
+       c.forge_type, c.base_url, c.token_ciphertext, c.user_id
+FROM repos r
+JOIN forge_connections c ON c.id = r.connection_id
+WHERE r.id = $1;
+
 -- name: SetRepoGuardrailOverride :one
 -- PRD #66 M8 (D8): set the admin per-repo guardrail override. ADMIN-ONLY and
 -- UNSCOPED by id — there is deliberately no `...ForUser` member variant, because a

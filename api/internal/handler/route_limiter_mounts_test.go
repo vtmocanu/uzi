@@ -67,7 +67,8 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 147 as of this commit; it was 146 until PRD #66 M9 added GET
+// 149 as of this commit; it was 147 until PRD #364 M3 added POST and DELETE
+// /api/admin/repos/{id}/github-project-sync, 146 until PRD #66 M9 added GET
 // /api/admin/blocked-repos, 144 until PRD #66 M8 added POST and DELETE
 // /api/admin/repos/{id}/guardrail-override, 143 until PRD #66 M3 added GET
 // /api/admin/guardrail-impact, 142 until PRD #122 M8 added POST
@@ -138,6 +139,12 @@ var wantRouteMounts = []routeMount{
 	// PRD #66 M8 (D8): admin per-repo guardrail override revoke — an admin-only,
 	// unscoped-by-id DB write, no forge call → noLimiter.
 	{"DELETE", "/api/admin/repos/{id}/guardrail-override", noLimiter},
+	// PRD #364 M3: admin GitHub Projects v2 Status sync adopt/disable. Admin-only,
+	// path-scoped, manual operations. Adopt does make forge calls, but it is an
+	// infrequent admin action (not a user-spammable proxying route), so it wears no
+	// per-user limiter like the rest of the admin write group → noLimiter.
+	{"DELETE", "/api/admin/repos/{id}/github-project-sync", noLimiter},
+	{"POST", "/api/admin/repos/{id}/github-project-sync", noLimiter},
 	{"DELETE", "/api/agent-templates/{id}", noLimiter},
 	{"DELETE", "/api/forge/connections/{id}", noLimiter},
 	{"DELETE", "/api/me/cli-tokens/{id}", noLimiter},
