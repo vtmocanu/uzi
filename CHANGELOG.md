@@ -6,6 +6,26 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Changed
+
+- **Surge upgrade: release the stack without killing in-flight runs
+  ([#422](https://github.com/vtmocanu/uzi/issues/422)).** The hosted-worker image tag
+  is now pinned to a concrete version (`workers.image.tag`) independent of
+  `Chart.appVersion`, reversing the old Model-B lockstep — an app-only release
+  (api/web/db/controller) renders an unchanged worker spec-hash and rolls **zero**
+  worker pods, so in-flight runs keep running on the old worker (which talks to the new
+  API unchanged). A deliberate worker-image roll now **cordons** a busy worker (new
+  orthogonal `workers.draining_since` column + a `POST /api/controller/workers/{id}/drain`
+  control-write) and lets its runs finish before rolling it, bounded by a configurable
+  drain deadline (`workers.drainDeadline`, default 24h) with an operator force-roll
+  override (`workers.forceRoll`); past the deadline the run takes the existing
+  requeue-resume path. The upgrade badge compares hosted workers against the pinned
+  worker version so an intentionally-pinned-behind worker is not flagged `outdated`. An
+  additive-migration guard and an old-worker↔new-API skew test enforce the N-1
+  compatibility this relies on. See `adr/0422-decouple-worker-version.md`. **Operator
+  note:** an out-of-tree per-cluster values file that left `workers.image.tag` empty
+  must now set a concrete pinned tag (the chart `required`-wraps it).
+
 ## [0.48.0] - 2026-08-20
 <!-- release-title: signed container images and chart -->
 

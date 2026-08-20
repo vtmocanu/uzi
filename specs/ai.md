@@ -21655,3 +21655,45 @@ the existing `GET /api/version`. Full rationale in the Decision Log of
 - **CI wiring for the version-match gate is deferred to a maintainer follow-up.** The worker's git
   token lacks `workflow` scope, so this run could not edit `.github/workflows/` to add the
   `check-changelog.mjs` step. The parity gate already runs in CI via the existing `test:web` job.
+## 563. PRD #422 — surge upgrade: hosted-worker image version DECOUPLED from `Chart.AppVersion`, so an app-only release rolls zero workers and never kills in-flight runs
+
+Serves issue #422 — "release without killing in-flight runs": releasing the stack
+during active work must not interrupt runs or force a manual vault unlock. Reverses the
+earlier Model-B lockstep in which the hosted-worker image tag defaulted to
+`Chart.AppVersion`, so every release Recreate-rolled the whole worker fleet and hard-killed
+in-flight runs — which then requeue and strand on the vault-unlock gate (OIDC vaults do not
+auto-unlock across restart, a PRD non-goal we keep). Full rationale in the Decision Log of
+`prds/422-surge-upgrade.md`.
+
+- **Worker tag pinned to a CONCRETE version, independent of appVersion.** The hosted-worker
+  image tag is `workers.image.tag` (`deploy/chart/values.yaml`), a concrete pin the
+  controller-deployment template `required`-wraps
+  (`deploy/chart/templates/controller-deployment.yaml`) so an empty tag refuses to render —
+  the pin can never silently fall back to appVersion. An app-only release (api/web/db/
+  controller) renders an UNCHANGED worker spec-hash, so the controller
+  (`controller/internal/kube/materializer.go`) rolls ZERO worker pods; in-flight runs keep
+  running on the old worker, which talks to the new API unchanged. Advancing the fleet is a
+  deliberate operator step (bump `workers.image.tag`), not a side effect of releasing.
+
+- **N-1 worker↔API skew is a MAINTAINED contract, not a tolerated accident.** The worker↔API
+  protocol is additive and version-agnostic: the API never gates on the worker version and
+  requests decode leniently in our direction. This is guarded by an additive-migration check
+  and an old-worker skew LiveDB test (PRD #422 M6), so a breaking change to the wire contract
+  is caught rather than shipped.
+
+- **A deliberate worker-image roll cordons a BUSY worker instead of killing it.** Cordon state
+  is a new orthogonal `workers.draining_since` column (migration `00137_worker_draining.sql`),
+  distinct from the heartbeat-derived `workers.status`: a cordoned worker keeps heartbeating
+  and finishing its runs but claims nothing new. The controller writes cordon via a new
+  control-write endpoint (`api/internal/handler/controller_cordon.go`) and rolls the worker
+  only once idle, bounded by a configurable drain deadline (`workers.drainDeadline`, default
+  24h) with an operator force-roll override; past the deadline the run takes the unchanged
+  requeue-resume path. Drain-gate logic lives in `api/internal/workersvc/`.
+
+- **The PRD #113 upgrade badge compares against the PIN, not appVersion.** The hosted-worker
+  upgrade target is `PinnedWorkerVersion` (`api/internal/workersvc/upgrade.go`), so a worker
+  intentionally pinned behind appVersion is not flagged outdated fleet-wide.
+
+- **Non-goals respected (per the PRD):** no auto-unlock of OIDC vaults across restart; no
+  RollingUpdate/surge worker pods (RWO PVCs — Recreate stays); single-replica API assumption
+  unchanged.

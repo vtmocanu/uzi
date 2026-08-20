@@ -144,6 +144,36 @@ locally before tagging. One authoring rule the script cannot enforce: the Releas
 section, and GitHub autolinks a bare `#N` there to a uzi PR — so write any cross-repo reference
 BACKTICKED (`` `k8s #119593` ``), which keeps it plain in the file and unlinked in the Release.
 
+**Worker-image rolls are a separate, deliberate step from an app release (PRD #422) —
+tagging `vX.Y.Z` does NOT, by itself, touch the hosted-worker fleet.** Three distinct
+situations, and which one applies depends on what actually changed:
+
+1. **App-only release** (api/web/db/controller change, no worker-image content
+   changed): bump `Chart.version`/`appVersion` and tag `vX.Y.Z` as usual — the normal
+   flow above. `workers.image.tag` in `deploy/chart/values.yaml` is left untouched, so
+   the worker pod-spec hash does not change and the controller rolls **zero** worker
+   pods; any run in flight keeps running on its current worker, uninterrupted. This is
+   the common case and needs no extra step.
+2. **A deliberate worker-image roll** (a new agent image, a worker-side security fix):
+   bump `workers.image.tag` in `deploy/chart/values.yaml` to a new **concrete** version
+   (never a floating tag like `:stable` — the chart's `required` guard rejects a blank
+   value, and a floating tag would never change the pod-spec hash at all), and bump
+   `PINNED_TAG` in `scripts/assert-worker-tag-decoupled.sh` to match, so the offline
+   render assertion keeps asserting the tag operators actually intend. Once that
+   deploys, the controller cordons each busy worker (defers the roll while it has an
+   in-flight run), then rolls it once idle — bounded by `workers.drainDeadline`
+   (chart value, default `24h`).
+3. **Force-roll escape hatch** (an emergency — e.g. a worker-image CVE that cannot
+   wait on a drain): set `workers.forceRoll: true` in the deploy values for the
+   duration of the emergency. The controller then rolls every drifted worker
+   immediately regardless of busy-ness; any in-flight run on a force-rolled worker
+   falls back to the existing requeue path (it is not lost, only interrupted). Flip
+   `forceRoll` back to `false` once the emergency roll has gone out — leaving it `true`
+   makes every future worker-tag bump skip the drain entirely.
+
+Full rationale for all three is `adr/0422-decouple-worker-version.md`; the chart-value
+reference is `deploy/README.md`'s "Values worth knowing" table under Hosted workers.
+
 The version bump (`CHANGELOG.md` + `deploy/chart/Chart.yaml`) lands **direct-to-`main`** (the
 DEFAULT at this dev stage — an admin push bypasses branch protection, verified live 2026-08-19)
 or via an MR when review is wanted; ask the lead if unspecified. Re-verify `main` IMMEDIATELY

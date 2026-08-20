@@ -23,7 +23,9 @@
   third-party workloads.
 
   mutateDigest/verifyDigest are BOTH false: uzi's own workloads reference images by tag
-  (Chart.appVersion, Model B), so requiring a digest reference (verifyDigest) would
+  (the app tier by Chart.appVersion under Model B; hosted workers by the independently
+  pinned workers.image.tag since PRD #422 — either way a tag, not a digest), so
+  requiring a digest reference (verifyDigest) would
   reject them, and rewriting the tag to a digest at admission (mutateDigest) would fight
   ArgoCD's desired state. We verify the signature and leave the reference as-is. Flip
   mutateDigest on (matching Pods, so the Deployment ArgoCD manages is untouched) if you
