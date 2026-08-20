@@ -67,7 +67,8 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 150 as of this commit; it was 149 until PRD #364 M7 added GET
+// 151 as of this commit; it was 150 until PRD #364 M4 added POST
+// /api/admin/repos/{id}/github-project-sync/provision, 149 until PRD #364 M7 added GET
 // /api/admin/repos/{id}/github-project-sync, 147 until PRD #364 M3 added POST and DELETE
 // /api/admin/repos/{id}/github-project-sync, 146 until PRD #66 M9 added GET
 // /api/admin/blocked-repos, 144 until PRD #66 M8 added POST and DELETE
@@ -146,6 +147,9 @@ var wantRouteMounts = []routeMount{
 	// per-user limiter like the rest of the admin write group → noLimiter.
 	{"DELETE", "/api/admin/repos/{id}/github-project-sync", noLimiter},
 	{"POST", "/api/admin/repos/{id}/github-project-sync", noLimiter},
+	// PRD #364 M4: admin autonomous provisioning (create project + uzi's own Status
+	// field + seed). Infrequent admin action in the same write group → noLimiter.
+	{"POST", "/api/admin/repos/{id}/github-project-sync/provision", noLimiter},
 	{"DELETE", "/api/agent-templates/{id}", noLimiter},
 	{"DELETE", "/api/forge/connections/{id}", noLimiter},
 	{"DELETE", "/api/me/cli-tokens/{id}", noLimiter},

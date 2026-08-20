@@ -84,6 +84,53 @@ func (h *Handler) AdoptGithubProjectSync(w http.ResponseWriter, r *http.Request)
 	httpx.JSON(w, http.StatusOK, map[string]any{"status": "linked"})
 }
 
+// provisionGithubProjectSyncRequest is the POST body for the autonomous-provision
+// route (PRD #364 M4): owner_kind selects the GraphQL owner root the new project is
+// created under (defaults to "user"), and title optionally names the created board
+// (defaulting to a sensible value in the service when empty). The repo target is
+// taken from the path, never the body (audit), like adopt.
+type provisionGithubProjectSyncRequest struct {
+	OwnerKind string `json:"owner_kind"`
+	Title     string `json:"title"`
+}
+
+// ProvisionGithubProjectSync is the admin autonomous-provision write (PRD #364 M4):
+// CREATE a GitHub Projects v2 board with uzi's OWN "uzi Status" field, link it to
+// this repo, and seed it — zero manual GitHub-UI clicks. Same admin-only, path-scoped
+// shape as the adopt route (RequireAuth + RequireAdmin), and the same error mapping;
+// it persists owned_by_uzi=true. Success is 201 Created (a new board was made).
+func (h *Handler) ProvisionGithubProjectSync(w http.ResponseWriter, r *http.Request) {
+	if _, ok := mw.UserFromContext(r.Context()); !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
+		return
+	}
+	var req provisionGithubProjectSyncRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	ownerKind, ok := parseOwnerKind(req.OwnerKind)
+	if !ok {
+		httpx.Error(w, http.StatusBadRequest, "owner_kind must be one of user, org, viewer")
+		return
+	}
+	if h.projectSync == nil {
+		slog.Error("github project sync provision: service not wired")
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if err := h.projectSync.Provision(r.Context(), id, ownerKind, req.Title); err != nil {
+		writeProjectSyncError(w, "provision", err)
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, map[string]any{"status": "provisioned"})
+}
+
 // DisableGithubProjectSync is the admin teardown (PRD #364 M3): drop the repo's
 // project link + item projection rows. Same admin-only, path-scoped shape as the
 // adopt route. It does not touch the project board itself (M7 refines that).

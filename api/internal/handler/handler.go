@@ -155,6 +155,9 @@ type Handler struct {
 // the forge/secretbox machinery.
 type ProjectSyncer interface {
 	Adopt(ctx context.Context, repoID uuid.UUID, projectNumber int, ownerKind forge.ProjectV2OwnerKind) error
+	// Provision autonomously CREATES a project + uzi's own Status field, links, and
+	// seeds it (M4). owned_by_uzi is persisted true; title may be "" (defaulted).
+	Provision(ctx context.Context, repoID uuid.UUID, ownerKind forge.ProjectV2OwnerKind, title string) error
 	Disable(ctx context.Context, repoID uuid.UUID) error
 	// ForwardMove projects a uzi label move onto the linked project's Status (M5).
 	// Best-effort: the handler logs and continues on a returned error.
@@ -1009,6 +1012,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// project coordinates from the body.
 				r.Post("/repos/{id}/github-project-sync", h.AdoptGithubProjectSync)
 				r.Delete("/repos/{id}/github-project-sync", h.DisableGithubProjectSync)
+				// Admin autonomous provisioning (PRD #364 M4): CREATE a project + uzi's own
+				// Status field, link + seed it (owned_by_uzi=true). Same admin-only, path-
+				// scoped write group; a separate static sub-path so it never shadows the
+				// adopt POST above.
+				r.Post("/repos/{id}/github-project-sync/provision", h.ProvisionGithubProjectSync)
 			})
 		})
 

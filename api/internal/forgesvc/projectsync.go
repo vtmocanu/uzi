@@ -143,32 +143,8 @@ func (s *ProjectSyncService) SetMover(m ProjectMover) { s.mover = m }
 // An unintrospectable PAT proceeds best-effort — the first mutation surfaces the
 // real error, captured in the link row's last_error.
 func (s *ProjectSyncService) Adopt(ctx context.Context, repoID uuid.UUID, projectNumber int, ownerKind forge.ProjectV2OwnerKind) error {
-	enabled, err := s.settings.GithubProjectSyncEnabled(ctx)
+	repo, syncer, err := s.projectSyncPreamble(ctx, repoID)
 	if err != nil {
-		return fmt.Errorf("project sync: read kill-switch: %w", err)
-	}
-	if !enabled {
-		return ErrProjectSyncDisabled
-	}
-
-	repo, err := s.store.GetRepoByID(ctx, repoID)
-	if err != nil {
-		// pgx.ErrNoRows for an unknown id — the handler maps it to 404.
-		return err
-	}
-	if repo.ForgeType != string(forge.TypeGitHub) {
-		return ErrProjectSyncNotGitHub
-	}
-
-	f, err := s.forges.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
-	if err != nil {
-		return fmt.Errorf("project sync: build forge: %w", err)
-	}
-	syncer, ok := f.(forge.ProjectBoardSyncer)
-	if !ok {
-		return ErrProjectSyncUnsupported
-	}
-	if err := ensureProjectScope(ctx, f); err != nil {
 		return err
 	}
 
@@ -196,6 +172,190 @@ func (s *ProjectSyncService) Adopt(ctx context.Context, repoID uuid.UUID, projec
 	}
 	if serr := s.store.ClearGithubProjectLinkError(ctx, repoID); serr != nil {
 		s.log.Warn("project sync: clear link error", "repo", repoID, "error", serr)
+	}
+	return nil
+}
+
+// projectSyncPreamble runs the preconditions Adopt and Provision share and returns
+// the resolved repo row + the type-asserted ProjectBoardSyncer. The check order and
+// the CLEAR sentinels it returns (ErrProjectSyncDisabled / NotGitHub / Unsupported /
+// MissingScope, and a bare pgx.ErrNoRows for an unknown repo id) are exactly what the
+// admin handler maps to a 4xx — extracting it keeps the two entry points DRY without
+// changing either's observable behavior.
+func (s *ProjectSyncService) projectSyncPreamble(ctx context.Context, repoID uuid.UUID) (store.GetRepoByIDRow, forge.ProjectBoardSyncer, error) {
+	enabled, err := s.settings.GithubProjectSyncEnabled(ctx)
+	if err != nil {
+		return store.GetRepoByIDRow{}, nil, fmt.Errorf("project sync: read kill-switch: %w", err)
+	}
+	if !enabled {
+		return store.GetRepoByIDRow{}, nil, ErrProjectSyncDisabled
+	}
+
+	repo, err := s.store.GetRepoByID(ctx, repoID)
+	if err != nil {
+		// pgx.ErrNoRows for an unknown id — the handler maps it to 404.
+		return store.GetRepoByIDRow{}, nil, err
+	}
+	if repo.ForgeType != string(forge.TypeGitHub) {
+		return store.GetRepoByIDRow{}, nil, ErrProjectSyncNotGitHub
+	}
+
+	f, err := s.forges.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	if err != nil {
+		return store.GetRepoByIDRow{}, nil, fmt.Errorf("project sync: build forge: %w", err)
+	}
+	syncer, ok := f.(forge.ProjectBoardSyncer)
+	if !ok {
+		return store.GetRepoByIDRow{}, nil, ErrProjectSyncUnsupported
+	}
+	if err := ensureProjectScope(ctx, f); err != nil {
+		return store.GetRepoByIDRow{}, nil, err
+	}
+	return repo, syncer, nil
+}
+
+// Provision AUTONOMOUSLY creates a GitHub Projects v2 board with uzi's OWN "uzi
+// Status" single-select field (whose options are the repo's board columns), links it
+// to the repo, persists the link with owned_by_uzi=true, and seeds it from the repo's
+// cached issues (PRD #364 M4). It is the create-and-own counterpart to Adopt (which
+// links a user's EXISTING board): an admin gets a working, seeded board with zero
+// manual GitHub-UI clicks.
+//
+// v1 is BOOTSTRAP-ONCE (D5): the field's options are set at creation and there is NO
+// ongoing option reconcile — a later board-column add/rename/remove is a documented
+// manual step. This is deliberate: the destructive full-list-replace update (F9) that
+// ongoing reconcile needs can clear every item's Status on a mis-echoed option id, so
+// it is not built here. Creating uzi's own field is the SAFE half of F9 — a fresh
+// field has no existing values to clear.
+//
+// owned_by_uzi=true records that uzi created this board; it governs the FUTURE
+// teardown divergence (D8), but in v1 Disable stays local-only / non-destructive (M7)
+// for both ownership values, so an accidental disable can never lose a board.
+//
+// Preconditions and the CLEAR sentinels it returns are identical to Adopt (see
+// projectSyncPreamble). title defaults to a sensible value when empty.
+func (s *ProjectSyncService) Provision(ctx context.Context, repoID uuid.UUID, ownerKind forge.ProjectV2OwnerKind, title string) error {
+	repo, syncer, err := s.projectSyncPreamble(ctx, repoID)
+	if err != nil {
+		return err
+	}
+
+	// Everything below can hit the forge and is captured on the link row's last_error
+	// for observability once the link exists (mirrors Adopt).
+	if err := s.provisionAndSeed(ctx, repo, syncer, ownerKind, title); err != nil {
+		// Best-effort: stamp the failure if a link row already exists (a failure before
+		// the link is persisted matches zero rows, which is fine).
+		if serr := s.store.SetGithubProjectLinkError(ctx, store.SetGithubProjectLinkErrorParams{
+			LastError: pgtype.Text{String: truncateErr(err.Error()), Valid: true},
+			RepoID:    repoID,
+		}); serr != nil {
+			s.log.Warn("project sync: record link error", "repo", repoID, "error", serr)
+		}
+		return err
+	}
+	if serr := s.store.ClearGithubProjectLinkError(ctx, repoID); serr != nil {
+		s.log.Warn("project sync: clear link error", "repo", repoID, "error", serr)
+	}
+	return nil
+}
+
+// provisionColors is the fixed 8-color palette uzi cycles through when creating its
+// own Status field's options (M4). GitHub's createProjectV2Field requires each
+// SINGLE_SELECT option carry one of its 8-color enum; picking deterministically by
+// column index means a re-provision produces the same colors and spans the enum so
+// adjacent columns are visually distinct. Every entry is a valid GitHub color enum.
+var provisionColors = []string{"BLUE", "GREEN", "YELLOW", "ORANGE", "RED", "PURPLE", "PINK", "GRAY"}
+
+// provisionColor picks the palette color for the option at board-column index i,
+// cycling the palette so a board with more columns than colors still resolves.
+func provisionColor(i int) string {
+	return provisionColors[i%len(provisionColors)]
+}
+
+// provisionAndSeed does the resolve → create-project → create-field → map →
+// persist-link → seed-items work for Provision. Unlike adoptAndSeed there is NO
+// unmatched-column note: uzi CREATES the field's options FROM the board columns, so
+// every column matches by construction. The column→option map is still built from the
+// CREATED field's returned Options because the option ids only exist after creation.
+func (s *ProjectSyncService) provisionAndSeed(ctx context.Context, repo store.GetRepoByIDRow, syncer forge.ProjectBoardSyncer, ownerKind forge.ProjectV2OwnerKind, title string) error {
+	owner, name, err := syncer.RepoSlug(ctx, repo.ForgeProjectID)
+	if err != nil {
+		return fmt.Errorf("project sync: resolve repo slug: %w", err)
+	}
+	if title == "" {
+		title = "uzi: " + name
+	}
+
+	ownerID, err := syncer.ResolveProjectV2OwnerID(ctx, owner, ownerKind)
+	if err != nil {
+		return fmt.Errorf("project sync: resolve owner id: %w", err)
+	}
+	repoNodeID, err := syncer.ResolveRepositoryNodeID(ctx, owner, name)
+	if err != nil {
+		return fmt.Errorf("project sync: resolve repository node id: %w", err)
+	}
+
+	// createProjectV2 with repositoryId already links the project to the repo; the
+	// explicit LinkProjectV2ToRepository below is a best-effort second link for the
+	// repo's Projects tab and is NON-FATAL.
+	project, err := syncer.CreateProjectV2(ctx, ownerID, title, repoNodeID)
+	if err != nil {
+		return fmt.Errorf("project sync: create project: %w", err)
+	}
+	if lerr := syncer.LinkProjectV2ToRepository(ctx, project.ID, repoNodeID); lerr != nil {
+		s.log.Warn("project sync: link project to repository", "repo", repo.ID, "error", lerr)
+	}
+
+	columns, err := s.store.ListBoardColumns(ctx, repo.ID)
+	if err != nil {
+		return fmt.Errorf("project sync: list board columns: %w", err)
+	}
+	newOptions := make([]forge.ProjectV2NewOption, 0, len(columns))
+	for i, c := range columns {
+		newOptions = append(newOptions, forge.ProjectV2NewOption{
+			Name:  c.LabelName,
+			Color: provisionColor(i),
+		})
+	}
+	field, err := syncer.CreateProjectV2Field(ctx, project.ID, uziStatusFieldName, newOptions)
+	if err != nil {
+		return fmt.Errorf("project sync: create status field: %w", err)
+	}
+
+	// Build the column→option map + position from the CREATED field's option ids. Every
+	// column matches by construction (we created the options from the columns).
+	optionByName := make(map[string]string, len(field.Options))
+	for _, o := range field.Options {
+		optionByName[o.Name] = o.ID
+	}
+	columnOption := make(map[string]string, len(columns))
+	position := make(map[string]int, len(columns))
+	for _, c := range columns {
+		position[c.LabelName] = int(c.Position)
+		if optID, ok := optionByName[c.LabelName]; ok {
+			columnOption[c.LabelName] = optID
+		}
+	}
+
+	// Persist the link BEFORE seeding, so a mid-seed failure still records the link (and
+	// its last_error). owned_by_uzi=TRUE — this is a uzi-created board (unlike adopt).
+	optionsJSON, err := json.Marshal(columnOption)
+	if err != nil {
+		return fmt.Errorf("project sync: marshal status options: %w", err)
+	}
+	if _, err := s.store.UpsertGithubProjectLink(ctx, store.UpsertGithubProjectLinkParams{
+		RepoID:        repo.ID,
+		ProjectNodeID: project.ID,
+		ProjectNumber: int64(project.Number),
+		StatusFieldID: field.ID,
+		StatusOptions: optionsJSON,
+		OwnedByUzi:    true, // provision create-and-owns
+	}); err != nil {
+		return fmt.Errorf("project sync: persist link: %w", err)
+	}
+
+	if err := s.seedItems(ctx, repo, syncer, owner, name, project.ID, field.ID, columnOption, position); err != nil {
+		return err
 	}
 	return nil
 }

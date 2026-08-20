@@ -25,14 +25,17 @@ import (
 // standing in for *forgesvc.ProjectSyncService so the handler is exercised without
 // the forge/store machinery.
 type fakeProjectSync struct {
-	adoptErr   error
-	disableErr error
+	adoptErr     error
+	disableErr   error
+	provisionErr error
 
-	gotRepoID    uuid.UUID
-	gotNumber    int
-	gotOwnerKind forge.ProjectV2OwnerKind
-	adoptCalls   int
-	disableCalls int
+	gotRepoID      uuid.UUID
+	gotNumber      int
+	gotOwnerKind   forge.ProjectV2OwnerKind
+	gotTitle       string
+	adoptCalls     int
+	disableCalls   int
+	provisionCalls int
 
 	forwardErr   error
 	forwardCalls int
@@ -48,6 +51,12 @@ func (f *fakeProjectSync) Adopt(_ context.Context, repoID uuid.UUID, number int,
 	f.adoptCalls++
 	f.gotRepoID, f.gotNumber, f.gotOwnerKind = repoID, number, kind
 	return f.adoptErr
+}
+
+func (f *fakeProjectSync) Provision(_ context.Context, repoID uuid.UUID, kind forge.ProjectV2OwnerKind, title string) error {
+	f.provisionCalls++
+	f.gotRepoID, f.gotOwnerKind, f.gotTitle = repoID, kind, title
+	return f.provisionErr
 }
 
 func (f *fakeProjectSync) Disable(_ context.Context, repoID uuid.UUID) error {
@@ -307,6 +316,128 @@ func TestStatusRouteValidation(t *testing.T) {
 			t.Fatalf("status = %d, want 500", w.Code)
 		}
 	})
+}
+
+// postProvision drives ProvisionGithubProjectSync with an admin actor and the given
+// repo id + raw body.
+func postProvision(t *testing.T, h *Handler, repoID string, body []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	admin := store.User{ID: uuid.New(), IsAdmin: true}
+	r := httptest.NewRequest(http.MethodPost, "/admin/repos/x/github-project-sync/provision", bytes.NewReader(body))
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", repoID)
+	r = r.WithContext(context.WithValue(mw.ContextWithUser(r.Context(), admin), chi.RouteCtxKey, rctx))
+	w := httptest.NewRecorder()
+	h.ProvisionGithubProjectSync(w, r)
+	return w
+}
+
+// TestProvisionRouteDecodesAndDelegates: a valid request decodes owner_kind + title,
+// passes the path repo id through, and returns 201.
+func TestProvisionRouteDecodesAndDelegates(t *testing.T) {
+	sync := &fakeProjectSync{}
+	h := &Handler{projectSync: sync}
+	repoID := uuid.New()
+	w := postProvision(t, h, repoID.String(), []byte(`{"owner_kind":"org","title":"My Board"}`))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", w.Code)
+	}
+	if sync.provisionCalls != 1 {
+		t.Fatalf("want 1 Provision call, got %d", sync.provisionCalls)
+	}
+	if sync.gotRepoID != repoID {
+		t.Errorf("repo id = %v, want %v (must come from the path)", sync.gotRepoID, repoID)
+	}
+	if sync.gotOwnerKind != forge.OwnerOrg {
+		t.Errorf("owner kind = %v, want OwnerOrg", sync.gotOwnerKind)
+	}
+	if sync.gotTitle != "My Board" {
+		t.Errorf("title = %q, want My Board", sync.gotTitle)
+	}
+}
+
+// TestProvisionOwnerKindDefault: an omitted owner_kind defaults to OwnerUser and an
+// omitted title passes "" through (the service defaults it).
+func TestProvisionOwnerKindDefault(t *testing.T) {
+	sync := &fakeProjectSync{}
+	h := &Handler{projectSync: sync}
+	w := postProvision(t, h, uuid.New().String(), []byte(`{}`))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", w.Code)
+	}
+	if sync.gotOwnerKind != forge.OwnerUser {
+		t.Errorf("default owner kind = %v, want OwnerUser", sync.gotOwnerKind)
+	}
+	if sync.gotTitle != "" {
+		t.Errorf("title = %q, want empty (service defaults it)", sync.gotTitle)
+	}
+}
+
+// TestProvisionRequestValidation: bad inputs are rejected BEFORE the service is called.
+func TestProvisionRequestValidation(t *testing.T) {
+	cases := []struct {
+		name   string
+		repoID string
+		body   []byte
+		want   int
+	}{
+		{"invalid repo id", "not-a-uuid", []byte(`{}`), http.StatusBadRequest},
+		{"malformed body", uuid.New().String(), []byte("{"), http.StatusBadRequest},
+		{"unknown owner kind", uuid.New().String(), []byte(`{"owner_kind":"team"}`), http.StatusBadRequest},
+		{"unknown field", uuid.New().String(), []byte(`{"project_number":7}`), http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sync := &fakeProjectSync{}
+			h := &Handler{projectSync: sync}
+			w := postProvision(t, h, tc.repoID, tc.body)
+			if w.Code != tc.want {
+				t.Fatalf("status = %d, want %d", w.Code, tc.want)
+			}
+			if sync.provisionCalls != 0 {
+				t.Errorf("service must not be called on a rejected request")
+			}
+		})
+	}
+}
+
+// TestProvisionErrorMapping: each service sentinel maps to its documented 4xx; an
+// unknown error is a 500 that does not leak its text.
+func TestProvisionErrorMapping(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"disabled", forgesvc.ErrProjectSyncDisabled, http.StatusConflict},
+		{"not github", forgesvc.ErrProjectSyncNotGitHub, http.StatusUnprocessableEntity},
+		{"unsupported", forgesvc.ErrProjectSyncUnsupported, http.StatusUnprocessableEntity},
+		{"missing scope", forgesvc.ErrProjectSyncMissingScope, http.StatusUnprocessableEntity},
+		{"unknown repo", pgx.ErrNoRows, http.StatusNotFound},
+		{"internal", errAny, http.StatusInternalServerError},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sync := &fakeProjectSync{provisionErr: tc.err}
+			h := &Handler{projectSync: sync}
+			w := postProvision(t, h, uuid.New().String(), []byte(`{}`))
+			if w.Code != tc.want {
+				t.Fatalf("err %v → status %d, want %d", tc.err, w.Code, tc.want)
+			}
+			if tc.want == http.StatusInternalServerError && strings.Contains(w.Body.String(), "boom") {
+				t.Errorf("500 body leaked the raw error text: %s", w.Body.String())
+			}
+		})
+	}
+}
+
+// TestProvisionServiceNotWired: a nil projectSync returns a clean 500 rather than panics.
+func TestProvisionServiceNotWired(t *testing.T) {
+	h := &Handler{}
+	w := postProvision(t, h, uuid.New().String(), []byte(`{}`))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", w.Code)
+	}
 }
 
 // errAny is a non-sentinel error for the internal-error mapping case.

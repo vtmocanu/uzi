@@ -40,6 +40,15 @@ type fakeProjectSyncer struct {
 	repoNodeErr error
 	linkCalls   int
 
+	// Provisioning (M4): scripted returns + recorded calls for the create mutations.
+	ownerID            string
+	createProject      forge.ProjectV2Ref
+	createProjectErr   error
+	createProjectCalls []createProjectCall
+	createField        forge.ProjectV2StatusField
+	createFieldErr     error
+	createFieldCalls   []createFieldCall
+
 	live      []forge.ProjectV2ItemStatus
 	readErr   error
 	readCalls int
@@ -55,6 +64,17 @@ type fakeProjectSyncer struct {
 type setStatusCall struct {
 	itemID   string
 	optionID string
+}
+
+type createProjectCall struct {
+	ownerID string
+	title   string
+	repoID  string
+}
+
+type createFieldCall struct {
+	name    string
+	options []forge.ProjectV2NewOption
 }
 
 func (f *fakeProjectSyncer) TokenInfo(context.Context) (forge.TokenInfo, error) {
@@ -112,6 +132,9 @@ func (f *fakeProjectSyncer) ReadProjectV2ItemStatuses(context.Context, string, s
 }
 
 func (f *fakeProjectSyncer) ResolveProjectV2OwnerID(context.Context, string, forge.ProjectV2OwnerKind) (string, error) {
+	if f.ownerID != "" {
+		return f.ownerID, nil
+	}
 	return "owner-id", nil
 }
 
@@ -119,12 +142,20 @@ func (f *fakeProjectSyncer) ResolveRepositoryNodeID(context.Context, string, str
 	return f.repoNodeID, f.repoNodeErr
 }
 
-func (f *fakeProjectSyncer) CreateProjectV2(context.Context, string, string, string) (forge.ProjectV2Ref, error) {
-	return forge.ProjectV2Ref{}, nil
+func (f *fakeProjectSyncer) CreateProjectV2(_ context.Context, ownerID, title, repositoryID string) (forge.ProjectV2Ref, error) {
+	f.createProjectCalls = append(f.createProjectCalls, createProjectCall{ownerID: ownerID, title: title, repoID: repositoryID})
+	if f.createProjectErr != nil {
+		return forge.ProjectV2Ref{}, f.createProjectErr
+	}
+	return f.createProject, nil
 }
 
-func (f *fakeProjectSyncer) CreateProjectV2Field(context.Context, string, string, []forge.ProjectV2NewOption) (forge.ProjectV2StatusField, error) {
-	return forge.ProjectV2StatusField{}, nil
+func (f *fakeProjectSyncer) CreateProjectV2Field(_ context.Context, _, name string, options []forge.ProjectV2NewOption) (forge.ProjectV2StatusField, error) {
+	f.createFieldCalls = append(f.createFieldCalls, createFieldCall{name: name, options: options})
+	if f.createFieldErr != nil {
+		return forge.ProjectV2StatusField{}, f.createFieldErr
+	}
+	return f.createField, nil
 }
 
 func (f *fakeProjectSyncer) LinkProjectV2ToRepository(context.Context, string, string) error {
@@ -523,6 +554,233 @@ func TestAdoptRepoNotFound(t *testing.T) {
 	err := svc.Adopt(context.Background(), uuid.New(), 7, forge.OwnerUser)
 	if !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("want pgx.ErrNoRows, got %v", err)
+	}
+}
+
+// --- Provision (M4) ----------------------------------------------------------
+
+// validGithubColors is GitHub's SINGLE_SELECT option color enum: every created
+// option must carry one of these.
+var validGithubColors = map[string]bool{
+	"BLUE": true, "GRAY": true, "GREEN": true, "ORANGE": true,
+	"PINK": true, "PURPLE": true, "RED": true, "YELLOW": true,
+}
+
+// provisionSyncer builds a fake ProjectBoardSyncer scripted to create a project +
+// field with the given created option ids.
+func provisionSyncer(fieldID string, createdOptions []forge.ProjectV2Option) *fakeProjectSyncer {
+	return &fakeProjectSyncer{
+		fakeForge: &fakeForge{},
+		scopes:    []string{"repo", "project"},
+		slugOwner: "acme", slugRepo: "widgets",
+		ownerID:       "owner-node-1",
+		repoNodeID:    "REPO_1",
+		createProject: forge.ProjectV2Ref{ID: "PVT_NEW", Number: 9, Title: "created"},
+		createField:   forge.ProjectV2StatusField{ID: fieldID, Name: "uzi Status", Options: createdOptions},
+		issueNode:     map[int]string{1: "content1"},
+	}
+}
+
+// TestProvisionCreatesBoardAndSeeds is the full happy path: create the project with
+// the resolved owner/repo node ids + defaulted title, create the "uzi Status" field
+// from the board columns (valid colors, names == columns), build the column→option
+// map from the CREATED field's ids, persist the link with owned_by_uzi=TRUE, and seed
+// each open issue.
+func TestProvisionCreatesBoardAndSeeds(t *testing.T) {
+	repoID := uuid.New()
+	syncer := provisionSyncer("PVTSSF_NEW", []forge.ProjectV2Option{
+		{ID: "opt_ip", Name: "In Progress"},
+		{ID: "opt_hr", Name: "Human Review"},
+	})
+	st := &fakeProjectStore{
+		repo: githubRepoRow(repoID),
+		columns: []store.BoardColumn{
+			{LabelName: "In Progress", Position: 1},
+			{LabelName: "Human Review", Position: 2},
+		},
+		issues: []store.Issue{
+			{ForgeIssueIid: 1, State: "opened", Labels: labelsJSON(t, "In Progress")},
+		},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+
+	if err := svc.Provision(context.Background(), repoID, forge.OwnerUser, ""); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+
+	// Project created with resolved node ids and a defaulted title (name is "widgets").
+	if len(syncer.createProjectCalls) != 1 {
+		t.Fatalf("want 1 CreateProjectV2 call, got %d", len(syncer.createProjectCalls))
+	}
+	cp := syncer.createProjectCalls[0]
+	if cp.ownerID != "owner-node-1" || cp.repoID != "REPO_1" {
+		t.Errorf("create project used wrong node ids: %+v", cp)
+	}
+	if cp.title == "" {
+		t.Errorf("empty title should have been defaulted, got %q", cp.title)
+	}
+
+	// Field created as "uzi Status", options == the board column names, valid colors.
+	if len(syncer.createFieldCalls) != 1 {
+		t.Fatalf("want 1 CreateProjectV2Field call, got %d", len(syncer.createFieldCalls))
+	}
+	cf := syncer.createFieldCalls[0]
+	if cf.name != "uzi Status" {
+		t.Errorf("field name = %q, want \"uzi Status\"", cf.name)
+	}
+	if len(cf.options) != 2 || cf.options[0].Name != "In Progress" || cf.options[1].Name != "Human Review" {
+		t.Errorf("created options = %+v, want the two board columns in order", cf.options)
+	}
+	for _, o := range cf.options {
+		if !validGithubColors[o.Color] {
+			t.Errorf("option %q has invalid color %q", o.Name, o.Color)
+		}
+	}
+
+	// Link persisted once, owned_by_uzi TRUE, coordinates from the created project +
+	// field, and the map built from the CREATED option ids.
+	if len(st.links) != 1 {
+		t.Fatalf("want 1 link upsert, got %d", len(st.links))
+	}
+	link := st.links[0]
+	if !link.OwnedByUzi {
+		t.Errorf("owned_by_uzi must be TRUE on provision")
+	}
+	if link.ProjectNodeID != "PVT_NEW" || link.StatusFieldID != "PVTSSF_NEW" || link.ProjectNumber != 9 {
+		t.Errorf("link coordinates wrong: %+v", link)
+	}
+	var gotMap map[string]string
+	if err := json.Unmarshal(link.StatusOptions, &gotMap); err != nil {
+		t.Fatalf("status_options not valid json: %v", err)
+	}
+	if gotMap["In Progress"] != "opt_ip" || gotMap["Human Review"] != "opt_hr" {
+		t.Errorf("column->option map = %v, want the created option ids", gotMap)
+	}
+
+	// Best-effort repo link attempted, and issue 1 seeded to its option.
+	if syncer.linkCalls != 1 {
+		t.Errorf("want LinkProjectV2ToRepository called once, got %d", syncer.linkCalls)
+	}
+	if len(syncer.addCalls) != 1 || syncer.addCalls[0] != "content1" {
+		t.Errorf("want issue 1 added once, got %v", syncer.addCalls)
+	}
+	if len(syncer.setCalls) != 1 || syncer.setCalls[0].optionID != "opt_ip" {
+		t.Errorf("want issue 1 set to opt_ip, got %v", syncer.setCalls)
+	}
+	if st.linkErrCleared != 1 {
+		t.Errorf("successful provision must clear last_error once, got %d", st.linkErrCleared)
+	}
+	if len(st.linkErrs) != 0 {
+		t.Errorf("successful provision must not stamp last_error, got %v", st.linkErrs)
+	}
+}
+
+// TestProvisionCustomTitle: a non-empty title is passed through to CreateProjectV2.
+func TestProvisionCustomTitle(t *testing.T) {
+	repoID := uuid.New()
+	syncer := provisionSyncer("PVTSSF_NEW", []forge.ProjectV2Option{{ID: "opt_ip", Name: "In Progress"}})
+	st := &fakeProjectStore{
+		repo:    githubRepoRow(repoID),
+		columns: []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	if err := svc.Provision(context.Background(), repoID, forge.OwnerUser, "Roadmap"); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if syncer.createProjectCalls[0].title != "Roadmap" {
+		t.Errorf("title = %q, want Roadmap", syncer.createProjectCalls[0].title)
+	}
+}
+
+// TestProvisionColorsCycle: more columns than the 8-color palette still resolves —
+// every option carries a valid color and the palette wraps.
+func TestProvisionColorsCycle(t *testing.T) {
+	repoID := uuid.New()
+	var columns []store.BoardColumn
+	var created []forge.ProjectV2Option
+	for i := 0; i < 10; i++ {
+		name := "col" + string(rune('A'+i))
+		columns = append(columns, store.BoardColumn{LabelName: name, Position: int32(i)})
+		created = append(created, forge.ProjectV2Option{ID: "o" + name, Name: name})
+	}
+	syncer := provisionSyncer("PVTSSF_NEW", created)
+	st := &fakeProjectStore{repo: githubRepoRow(repoID), columns: columns}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	if err := svc.Provision(context.Background(), repoID, forge.OwnerUser, ""); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	cf := syncer.createFieldCalls[0]
+	if len(cf.options) != 10 {
+		t.Fatalf("want 10 options, got %d", len(cf.options))
+	}
+	for _, o := range cf.options {
+		if !validGithubColors[o.Color] {
+			t.Errorf("option %q has invalid color %q", o.Name, o.Color)
+		}
+	}
+}
+
+// TestProvisionSkipPaths: the shared preconditions block provisioning with zero
+// create calls — disabled, non-github, missing scope.
+func TestProvisionSkipPaths(t *testing.T) {
+	t.Run("disabled", func(t *testing.T) {
+		repoID := uuid.New()
+		syncer := provisionSyncer("f", nil)
+		st := &fakeProjectStore{repo: githubRepoRow(repoID)}
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: false}, nil)
+		if err := svc.Provision(context.Background(), repoID, forge.OwnerUser, ""); !errors.Is(err, ErrProjectSyncDisabled) {
+			t.Fatalf("want ErrProjectSyncDisabled, got %v", err)
+		}
+		if len(syncer.createProjectCalls) != 0 || len(st.links) != 0 {
+			t.Errorf("disabled provision must create nothing")
+		}
+	})
+	t.Run("non-github", func(t *testing.T) {
+		repoID := uuid.New()
+		row := githubRepoRow(repoID)
+		row.ForgeType = string(forge.TypeGitLab)
+		syncer := provisionSyncer("f", nil)
+		st := &fakeProjectStore{repo: row}
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		if err := svc.Provision(context.Background(), repoID, forge.OwnerUser, ""); !errors.Is(err, ErrProjectSyncNotGitHub) {
+			t.Fatalf("want ErrProjectSyncNotGitHub, got %v", err)
+		}
+		if len(syncer.createProjectCalls) != 0 {
+			t.Errorf("non-github provision must create nothing")
+		}
+	})
+	t.Run("missing scope", func(t *testing.T) {
+		repoID := uuid.New()
+		syncer := provisionSyncer("f", nil)
+		syncer.scopes = []string{"repo"} // no project scope
+		st := &fakeProjectStore{repo: githubRepoRow(repoID)}
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		if err := svc.Provision(context.Background(), repoID, forge.OwnerUser, ""); !errors.Is(err, ErrProjectSyncMissingScope) {
+			t.Fatalf("want ErrProjectSyncMissingScope, got %v", err)
+		}
+		if len(syncer.createProjectCalls) != 0 || len(st.links) != 0 {
+			t.Errorf("missing-scope provision must create nothing")
+		}
+	})
+}
+
+// TestProvisionCreateErrorStamps: a create failure after no link exists returns the
+// error and best-effort stamps last_error (matching zero rows is fine).
+func TestProvisionCreateErrorStamps(t *testing.T) {
+	repoID := uuid.New()
+	syncer := provisionSyncer("f", nil)
+	syncer.createProjectErr = errors.New("graphql boom")
+	st := &fakeProjectStore{repo: githubRepoRow(repoID), columns: []store.BoardColumn{{LabelName: "In Progress"}}}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	err := svc.Provision(context.Background(), repoID, forge.OwnerUser, "")
+	if err == nil {
+		t.Fatalf("want an error on create failure")
+	}
+	if len(st.links) != 0 {
+		t.Errorf("no link should be persisted when create fails")
+	}
+	if len(st.linkErrs) != 1 {
+		t.Errorf("want last_error stamped once, got %v", st.linkErrs)
 	}
 }
 
