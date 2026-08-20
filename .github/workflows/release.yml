@@ -359,8 +359,17 @@ jobs:
           # v4, so bump BOTH together then, to a full v4.x version.
           cosign-release: 'v2.6.5'
       - name: helm registry login (GHCR)
-        # --password-stdin keeps the token out of the process argv.
+        # --password-stdin keeps the token out of the process argv. Authenticates
+        # `helm push` (helm's OWN registry cred store, ~/.config/helm/...).
         run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+      # cosign reads the DOCKER cred store (~/.docker/config.json), which helm login
+      # does NOT populate -- so the chart job needs BOTH logins or `cosign sign` 401s
+      # pushing the signature (the image jobs only worked because they log in this way).
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Package + push + sign chart
         run: |
           set -euo pipefail
