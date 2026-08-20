@@ -42,16 +42,20 @@ import (
 // something is wrong. Two of three validators independently caught M1's first
 // protocol violating this line, and materializer_test.go asserts over the WHOLE
 // fake-client action log that no Secret get/list ever happens.
-// Cordoner is the api control-write that marks a hosted worker draining (PRD #422
-// M4, Decision 8). *apiclient.Client satisfies it structurally (its RequestDrain),
-// and tests substitute a fake.
+// Cordoner is the api cordon/uncordon control-write channel for a hosted worker's
+// draining_since flag (PRD #422 M4, Decision 8; uncordon added for issue #458).
+// RequestDrain cordons (sets draining_since); ClearDrain uncordons (clears it).
+// *apiclient.Client satisfies it structurally (its RequestDrain / ClearDrain), and
+// tests substitute a fake.
 //
 // It is nil-safe by design: a nil Cordoner DISABLES cordoning, so a busy drifted
-// worker is simply DEFERRED (never rolled) rather than hard-killed. That keeps the
-// whole feature fail-safe even in a build or config where the channel is absent —
-// the one thing that must never happen is Recreate-killing a busy worker.
+// worker is simply DEFERRED (never rolled) rather than hard-killed, and the no-drift
+// uncordon step is skipped the same way. That keeps the whole feature fail-safe even
+// in a build or config where the channel is absent — the one thing that must never
+// happen is Recreate-killing a busy worker.
 type Cordoner interface {
 	RequestDrain(ctx context.Context, workerID string) error
+	ClearDrain(ctx context.Context, workerID string) error
 }
 
 // DrainPolicy carries the two controller-side overrides that let a BUSY drifted worker
@@ -580,7 +584,24 @@ func (m *Materializer) reconcileWorker(ctx context.Context, w protocol.DesiredWo
 	// Drift (Decision 9): two independent sources, either of which must roll the pod.
 	wantHash := dep.Spec.Template.Annotations[AnnotationSpecHash]
 	if obs.Generation == w.Generation && obs.SpecHash == wantHash {
-		return nil // no drift
+		// No drift. But a worker cordoned on a PREVIOUS tick's drift whose drift was then
+		// REVERTED (operator reset workers.image.tag mid-rollout) has nothing left to roll,
+		// and draining_since is otherwise cleared ONLY by RegisterWorker on an actual roll
+		// (api runtime.sql) — so without this it would stay cordoned, idled by the claim
+		// gate, forever (issue #458). Clearing here is safe because draining_since has a
+		// SINGLE writer and a single meaning — the controller's own drift-cordon (there is
+		// no user/admin/node-maintenance drain) — so "no drift + draining" can only be a
+		// reverted drift or a just-committed roll, both correct to clear. Fail-safe and
+		// idempotent: on error we log and let the next tick retry (the condition persists);
+		// a nil cordoner (cordoning disabled) skips it, as with RequestDrain.
+		if w.DrainingSince != nil && m.cordoner != nil {
+			if err := m.cordoner.ClearDrain(ctx, w.ID); err != nil {
+				m.log.Warn("uncordon (clear draining_since) failed; will retry next tick", "worker_id", w.ID, "error", err)
+			} else {
+				m.log.Info("hosted worker no longer drifted; cleared cordon", "worker_id", w.ID)
+			}
+		}
+		return nil
 	}
 	// Drift. PRD #422 M5: a busy worker is normally cordoned + deferred (M4), BUT two
 	// overrides roll it anyway (accepting today's requeue-resume): an operator force-roll

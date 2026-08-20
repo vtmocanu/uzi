@@ -782,13 +782,20 @@ func keysOf(m map[string]bool) []string {
 // fakeCordoner records the worker ids handed to RequestDrain and can force the
 // write to fail, so a test can prove the fail-safe defer path.
 type fakeCordoner struct {
-	calls []string
-	err   error
+	calls      []string
+	err        error
+	clearCalls []string
+	clearErr   error
 }
 
 func (f *fakeCordoner) RequestDrain(_ context.Context, workerID string) error {
 	f.calls = append(f.calls, workerID)
 	return f.err
+}
+
+func (f *fakeCordoner) ClearDrain(_ context.Context, workerID string) error {
+	f.clearCalls = append(f.clearCalls, workerID)
+	return f.clearErr
 }
 
 // m5Now is the pinned clock for the drift/drain tests, so a deadline comparison
@@ -952,6 +959,78 @@ func TestNoDriftBusyDoesNothing(t *testing.T) {
 	}
 	if len(c.calls) != 0 {
 		t.Fatalf("RequestDrain calls = %v, want none (no drift)", c.calls)
+	}
+	if len(c.clearCalls) != 0 {
+		t.Fatalf("ClearDrain calls = %v, want none (not draining)", c.clearCalls)
+	}
+	if wasPatched(client) {
+		t.Fatal("an undrifted worker was patched")
+	}
+}
+
+// --- uncordon on the no-drift path (issue #458) ----------------------------
+
+// no drift + still draining ⇒ the cordon left over from a since-reverted drift is
+// cleared: ClearDrain called exactly once with "w1", and no Deployment patch (nothing
+// to roll). This is the core issue #458 fix — without it the worker stays cordoned
+// forever, idled by the claim gate.
+func TestNoDriftDrainingClearsCordon(t *testing.T) {
+	c := &fakeCordoner{}
+	hash := currentHash(t, "w1", 0)
+	dep := deployedWorker("w1", 0, hash)
+	obs := []reconcile.ObservedWorker{{ID: "w1", HasDeployment: true, Generation: 0, SpecHash: hash}}
+	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, Busy: true, DrainingSince: recentDrain()}
+	m, client := newMatWithCordoner(t, c, dep)
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(c.clearCalls) != 1 || c.clearCalls[0] != "w1" {
+		t.Fatalf("ClearDrain calls = %v, want exactly [w1]", c.clearCalls)
+	}
+	if len(c.calls) != 0 {
+		t.Fatalf("RequestDrain calls = %v, want none (no drift)", c.calls)
+	}
+	if wasPatched(client) {
+		t.Fatal("an undrifted worker was patched; there is nothing to roll on the no-drift path")
+	}
+}
+
+// The discriminating negative: no drift + NOT draining ⇒ ClearDrain is NOT called.
+// This pins the guard to `DrainingSince != nil`; drop it and this case goes red while
+// the clear-on-draining case stays green.
+func TestNoDriftNotDrainingDoesNotClear(t *testing.T) {
+	c := &fakeCordoner{}
+	hash := currentHash(t, "w1", 0)
+	dep := deployedWorker("w1", 0, hash)
+	obs := []reconcile.ObservedWorker{{ID: "w1", HasDeployment: true, Generation: 0, SpecHash: hash}}
+	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, Busy: false, DrainingSince: nil}
+	m, client := newMatWithCordoner(t, c, dep)
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(c.clearCalls) != 0 {
+		t.Fatalf("ClearDrain calls = %v, want none (worker was not draining)", c.clearCalls)
+	}
+	if wasPatched(client) {
+		t.Fatal("an undrifted worker was patched")
+	}
+}
+
+// no drift + draining + ClearDrain fails ⇒ Reconcile still returns nil (self-heal:
+// the condition persists and the next tick retries), no patch, and the clear was
+// attempted once. A failed uncordon must NOT inject a spurious per-tick joined error.
+func TestNoDriftDrainingClearErrorSelfHeals(t *testing.T) {
+	c := &fakeCordoner{clearErr: errors.New("api unreachable")}
+	hash := currentHash(t, "w1", 0)
+	dep := deployedWorker("w1", 0, hash)
+	obs := []reconcile.ObservedWorker{{ID: "w1", HasDeployment: true, Generation: 0, SpecHash: hash}}
+	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, Busy: true, DrainingSince: recentDrain()}
+	m, client := newMatWithCordoner(t, c, dep)
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
+		t.Fatalf("Reconcile returned %v; a failed uncordon must self-heal (return nil) not error", err)
+	}
+	if len(c.clearCalls) != 1 || c.clearCalls[0] != "w1" {
+		t.Fatalf("ClearDrain calls = %v, want exactly one attempt on [w1]", c.clearCalls)
 	}
 	if wasPatched(client) {
 		t.Fatal("an undrifted worker was patched")

@@ -262,3 +262,52 @@ func TestRequestDrainTreatsEveryNon2xxIncluding404AsError(t *testing.T) {
 		}
 	}
 }
+
+// ClearDrain is the UNCORDON control-write (issue #458): it DELETEs the same
+// per-worker drain path and carries the fleet bearer credential. On 204 it succeeds.
+func TestClearDrainDeletesTheWorkerDrainPathWithBearerAuth(t *testing.T) {
+	var gotAuth, gotPath, gotMethod string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth, gotPath, gotMethod = r.Header.Get("Authorization"), r.URL.Path, r.Method
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	if err := New(srv.URL, "the-token", 5*time.Second, nil, testLogger()).ClearDrain(context.Background(), "w1"); err != nil {
+		t.Fatalf("ClearDrain: %v", err)
+	}
+	if gotMethod != http.MethodDelete {
+		t.Errorf("method = %q, want DELETE", gotMethod)
+	}
+	if gotPath != "/api/controller/workers/w1/drain" {
+		t.Errorf("path = %q, want /api/controller/workers/w1/drain", gotPath)
+	}
+	if gotAuth != "Bearer the-token" {
+		t.Errorf("authorization = %q, want the fleet bearer credential", gotAuth)
+	}
+}
+
+// Unlike RequestDrain, uncordon fails in the OPPOSITE direction: a 404 is BENIGN
+// success (the worker already is not draining — RegisterWorker won the race, or it was
+// dropped; either way the desired "not cordoned" end state already holds), so it must
+// return nil. Only a real 5xx store error is returned as an error, to be retried next
+// tick.
+func TestClearDrainTreats404AsSuccessButErrorsOn5xx(t *testing.T) {
+	// 404 → nil (benign: already not draining).
+	srv404 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	if err := New(srv404.URL, "t", 5*time.Second, nil, testLogger()).ClearDrain(context.Background(), "w1"); err != nil {
+		t.Errorf("ClearDrain returned %v for 404; a 404 is the desired end state and must be nil", err)
+	}
+	srv404.Close()
+
+	// 500 → error (real store failure worth retrying).
+	srv500 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	if err := New(srv500.URL, "t", 5*time.Second, nil, testLogger()).ClearDrain(context.Background(), "w1"); err == nil {
+		t.Error("ClearDrain returned nil for 500; a store error must be surfaced so the next tick retries")
+	}
+	srv500.Close()
+}

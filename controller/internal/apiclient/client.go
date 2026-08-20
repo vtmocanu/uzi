@@ -195,3 +195,52 @@ func (c *Client) RequestDrain(ctx context.Context, workerID string) error {
 	}
 	return nil
 }
+
+// ClearDrain asks the api to UNCORDON a hosted worker — clear draining_since so the
+// claim gate stops idling it (issue #458). It is the exact mirror endpoint of
+// RequestDrain: DELETE where cordon POSTs, on the same worker path.
+//
+// Its failure semantics are DELIBERATELY the OPPOSITE direction from RequestDrain,
+// and that asymmetry is the whole point. RequestDrain fails CLOSED: any non-2xx
+// (including 404) is an error, so the caller DEFERS the roll and a busy worker is
+// never hard-killed — the costly mistake there is acting when the write did not land.
+// Uncordon is the reverse. The costly mistake here would be to KEEP a worker cordoned
+// forever, and a failed clear does not cause that: it merely leaves the worker
+// cordoned one extra tick and self-heals on the next reconcile (the no-drift +
+// draining condition still holds, so the controller retries). So this must fail SAFE
+// toward clearing, i.e. tolerate the benign cases:
+//
+//   - The 2xx band is success (the api cleared it).
+//   - A 404 is ALSO success (return nil): it means the worker already is not draining
+//     — RegisterWorker won the race and cleared draining_since on an actual roll, or
+//     the worker was dropped. Either way the desired end state ("not cordoned") already
+//     holds, so treating 404 as an error would be inverted from cordon for no reason and
+//     would inject a spurious per-tick error for a condition that is already correct.
+//
+// Only OTHER non-2xx (5xx store errors) and transport/build errors are returned as
+// errors; the caller logs and retries next tick.
+func (c *Client) ClearDrain(ctx context.Context, workerID string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/api/controller/workers/"+workerID+"/drain", nil)
+	if err != nil {
+		return fmt.Errorf("apiclient: build clear-drain request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("apiclient: clear-drain request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// 204 is the documented success; a 404 means the worker already is not draining —
+	// both are the desired "not cordoned" end state (see doc comment). Everything else
+	// (5xx) is a real error worth retrying next tick.
+	if resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+		return fmt.Errorf("apiclient: clear-drain request: api returned %d: %s", resp.StatusCode, bytes.TrimSpace(snippet))
+	}
+	return nil
+}
