@@ -792,7 +792,12 @@ func RenderDeployment(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Sp
 			// Recreate, never RollingUpdate: the surge pod would Multi-Attach-deadlock
 			// against the RWO PVCs the old pod still holds.
 			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
-			Template: tmpl,
+			// Bounds superseded-RS retention so wedged init pods from old agent-image rolls
+			// are GC'd (issue #360). This is a DeploymentSpec-level field, not part of the
+			// pod Template, so it does not affect the spec-hash and cannot cause a spurious
+			// roll.
+			RevisionHistoryLimit: ptr(int32(1)),
+			Template:             tmpl,
 		},
 	}
 }

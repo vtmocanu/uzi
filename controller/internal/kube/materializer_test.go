@@ -2,6 +2,7 @@ package kube
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -363,6 +364,33 @@ func TestASpecHashChangeRollsTheDeploymentAndReadsNoSecret(t *testing.T) {
 		t.Errorf("the patch must restamp the spec hash; got:\n%s", patch)
 	}
 	assertNoSecretReads(t, client)
+}
+
+// The drift patch must carry spec.revisionHistoryLimit so an already-provisioned
+// long-lived worker picks up the bounded RS history on its next drift-roll — the
+// field is a spec-level sibling of template, and a merge patch would otherwise
+// never write it to an existing Deployment (issue #360).
+func TestDriftPatchCarriesRevisionHistoryLimit(t *testing.T) {
+	m, client := newMat(t, deployedWorker("w1", 0, "the-old-releases-hash"))
+	observed := []reconcile.ObservedWorker{{ID: "w1", HasDeployment: true, Generation: 0, SpecHash: "the-old-releases-hash"}}
+
+	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0}
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, observed); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	patch := findPatch(t, client)
+
+	var parsed struct {
+		Spec struct {
+			RevisionHistoryLimit *int32 `json:"revisionHistoryLimit"`
+		} `json:"spec"`
+	}
+	if err := json.Unmarshal([]byte(patch), &parsed); err != nil {
+		t.Fatalf("unmarshal patch: %v; patch:\n%s", err, patch)
+	}
+	if parsed.Spec.RevisionHistoryLimit == nil || *parsed.Spec.RevisionHistoryLimit != 1 {
+		t.Errorf("patch spec.revisionHistoryLimit = %v, want 1; got:\n%s", parsed.Spec.RevisionHistoryLimit, patch)
+	}
 }
 
 // The steady state: nothing drifted, so nothing is patched. If this breaks, every

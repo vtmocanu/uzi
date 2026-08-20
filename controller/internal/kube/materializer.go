@@ -671,6 +671,12 @@ func patchFor(dep *appsv1.Deployment) ([]byte, error) {
 	patch := map[string]any{
 		"spec": map[string]any{
 			"template": dep.Spec.Template,
+			// revisionHistoryLimit is a spec-level SIBLING of template, not inside it
+			// (a merge patch treats an absent key as "leave alone", so it would never
+			// reach an already-provisioned worker if omitted). Carry it here so existing
+			// long-lived workers pick up the bounded RS history on their next drift-roll,
+			// in lockstep with the Create path in RenderDeployment (issue #360).
+			"revisionHistoryLimit": dep.Spec.RevisionHistoryLimit,
 		},
 	}
 	raw, err := json.Marshal(patch)
