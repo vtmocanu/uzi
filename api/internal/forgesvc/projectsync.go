@@ -467,11 +467,14 @@ func (s *ProjectSyncService) ForwardMove(ctx context.Context, repoID uuid.UUID, 
 		return nil
 	}
 
-	// Live-value no-op (D7): the stored marker is uzi's last-known value from either
-	// direction. If it already equals the target (NULL marker treated as ""), the
-	// board is already there — skip the Status mutation. Worst case under a
-	// concurrent poller interleave is a redundant same-value write, never a wrong
-	// label (PRD risk analysis).
+	// Stored-marker no-op (D7): the marker is uzi's last-known value from either
+	// direction (both forward and the M6 reverse writeback advance it), so it is the
+	// convergence basis both directions share — M8 depends on the two using the SAME
+	// basis. This is deliberately NOT a per-move live forge read: if the marker
+	// already equals the target (NULL marker treated as ""), the board is already
+	// there, so skip the Status mutation. Worst case under a concurrent poller
+	// interleave is a redundant same-value write, never a wrong label (PRD risk
+	// analysis) — the same guarantee a live read would give, without the extra call.
 	if markerValue(item.LastStatusOptionID) == targetOption {
 		return nil
 	}
