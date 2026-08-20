@@ -296,7 +296,7 @@ tasks:
       - task: test:controller
 
   gate:web:
-    desc: web - deps-check, lint, deadcode, check-docs, check-styles, typecheck, test
+    desc: web - deps-check, lint, deadcode, check-docs, check-changelog, check-styles, typecheck, test
     cmds:
       # 🔴 deps-check FIRST, AND IT DELIBERATELY BREAKS THE CHEAPEST-FIRST ORDER THE
       # REST OF THIS TARGET ARGUES FOR (PRD #103 M5 MR-C). oxlint is ~0.06s and this

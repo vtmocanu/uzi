@@ -23,7 +23,7 @@ import { Button, cx } from "./ui";
 // The repo blob URL for the `prds/` directory. Hardcoded rather than imported from
 // docs.ts's REPO_BLOB_BASE so this footer component pulls in none of the docs
 // build-time glob; kept in step with that constant by hand.
-const PRDS_URL = "https://github.com/vtmocanu/uzi/blob/main/prds";
+const PRDS_URL = "https://github.com/vtmocanu/uzi/tree/main/prds";
 
 // displayVersion prefixes a "v" only for a numeric version, so "0.6.0" reads
 // "v0.6.0" while "dev"/"demo" stay as-is and never become "vdev".

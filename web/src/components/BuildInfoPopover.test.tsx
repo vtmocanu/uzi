@@ -431,7 +431,8 @@ describe("BuildInfoPopover — open on hover AND focus AND tap", () => {
 });
 
 describe("BuildInfoPopover — PRDs row links to the repo prds/ directory (PRD #415 M2)", () => {
-  const PRDS_URL = "https://github.com/vtmocanu/uzi/blob/main/prds";
+  // A directory is served under /tree/, not /blob/ (PRD #415 M3 review nit).
+  const PRDS_URL = "https://github.com/vtmocanu/uzi/tree/main/prds";
 
   it("renders the PRDs count as an external link, keeping the `N done · M open` text", () => {
     render(<BuildInfoPopover info={mockBuildInfo} now={NOW} />);
