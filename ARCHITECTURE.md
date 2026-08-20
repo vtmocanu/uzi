@@ -98,7 +98,7 @@ The server making authenticated outbound calls to a `base_url` supplied at conne
 Migration `00002_forge.sql` adds four tables, all scoped down to `forge_connections.user_id` by FK cascade:
 
 - **`forge_connections`** — one row per (user, forge_type, base_url); carries the encrypted PAT and the verified bot identity.
-- **`repos`** — projects discovered via the bot's membership list, keyed by the forge's stable numeric project id (not the path, which can be renamed); upserted with `enabled=false` on every listing call so enable/disable always has a row to target.
+- **`repos`** — projects discovered via the bot's membership list, keyed by the forge's stable numeric project id (not the path, which can be renamed); upserted with `enabled=false` on every listing call so enable/disable always has a row to target. `ListProjects` never deletes a row absent from the fetch — it stays add/update-only **by design** (PRD #357 D1): `repos.id` is an `ON DELETE CASCADE` anchor for a dozen tables, so letting a routine, frequent membership read prune would cascade-delete runs/board/issues on a transient gap (a permissions blip, a paginated response). Removal is instead an explicit, owner-scoped `DELETE /api/repos/{id}` (D2: refused with 409 unless the repo is already `enabled=false`; D7: also refused with 409 while the repo has a non-terminal run) that deletes the `repos` row and cascades its derived data via the existing FKs — a bounded, owner-initiated action rather than a side effect of a read.
 - **`board_columns`** — ordered label names per repo; the implicit Open (no column label) and Closed (issue `state`) columns are never stored.
 - **`issues`** — a *cache*, never authoritative. uzi's own board state is limited to column configuration; every other field is overwritten from the forge on each sync. `has_prd_link` is computed at fetch time from the issue description (regex match on a `prds/*.md` reference) and stored as a bool — the description itself is never persisted.
 
@@ -691,7 +691,7 @@ chain in the diagram above, with no intervening `running`.
   Slack is not attempted, since the existing Slack ❌ DM already covers opted-in
   users) for the run's owner, gated on `stop_kind` so a deliberate cancel or
   plan-rejection stays silent and only genuine breakage notifies.
-- **Milestone tracker reconciliation** (PRD #122 M2 + PRD #265) — on a
+- **Milestone tracker reconciliation** (PRD #122 M2 + PRD #265 + PRD #390) — on a
   milestone-structured `issue` run the run view shows a *reported-complete*
   tracker (`runs.milestones_completed`, a monotone server-side union; never
   "verified"). Two sources feed it, both subset-validated against the frozen
@@ -707,7 +707,24 @@ chain in the diagram above, with no intervening `running`.
   union) is cleared on every terminal transition a milestone-bearing run can
   reach, since "in progress" is meaningless on a done/failed/cancelled run. The web renders a **null** tracker
   as "not reported" (`M–/N`), distinct from a genuine `0/N`, so a completed run
-  that simply never reported does not read as a failure.
+  that simply never reported does not read as a failure. PRD #390 is the
+  "make mid-run reporting truthful and enforced" step in that #122 → #265 → #390
+  progression: mid-run reporting is now **enforced**, not merely offered — the
+  per-turn prompt requires a `report_progress` declaration (`agent/src/prompt.ts`),
+  and the implement/review loop (`agent/src/sdk-executor.ts`) escalates the next
+  turn's prompt when a work turn leaves a milestone-bearing run with no milestone
+  marked in progress, then surfaces a feed-only `status` signal after K=2
+  consecutive misses so a silently-non-reporting lead is observable — while still
+  never failing the run (D4) and keeping `checkpoint` a durability boundary, not a
+  gate (D2): a cooperative checkpoint re-arms enforcement and clears the
+  in-progress latch instead of nagging past a milestone boundary. Complementing
+  that, an all-empty `report_progress` call (both sides empty after parsing) is
+  now a **no-op, not a signal** (D3, `agent/src/signals.ts`) — it never persists a
+  misleading `[]`, so the `milestones_completed` column stays `null` on a run that
+  truly never reported and the neutral `M–/N` render is what that run actually
+  shows. The CLI's `uzi run get` now renders that same neutral `–/N` numerator for
+  a never-reported run (PRD #390 D5/M4, `api/cmd/uzi/run.go`), bringing it to
+  display parity with the web badge and the TUI rail.
 - **Sweeper** (a goroutine beside the forge poller) enforces what workers
   can't be trusted to self-report: a claimed-but-never-started run older than
   5 minutes is re-queued; a running run older than `RUN_TIMEOUT` (default 2h)
@@ -991,6 +1008,13 @@ sanitize and render helpers it must reuse live there; that trade is recorded in
 [prds/done/112-uzi-tui.md](prds/done/112-uzi-tui.md). User-facing usage is
 [docs/cli.md](docs/cli.md); the plain `--json` verbs remain the agent-facing surface
 and are unchanged.
+
+The CLI can also hold several credentials at once as **named contexts**
+(`uzi context …`, PRD #427) and switch which one a command uses via a flag, an
+env var, or a sticky default. This is purely client-side credential selection —
+which already-stored `{URL, token}` pair a command sends — with no server, API,
+or scope change; authority is still the token's server-enforced scope. See
+[Config and credentials](docs/cli.md#config-and-credentials) for the mechanics.
 
 - **One new credential, one new middleware.** A `cli_tokens` row (`uzc_`
   user-scoped / `uza_` admin-scoped, sha256 at rest, mirroring the worker

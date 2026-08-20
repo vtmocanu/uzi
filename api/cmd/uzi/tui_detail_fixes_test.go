@@ -256,8 +256,9 @@ func TestDetailCollapsibleCrewRevealsMilestones(t *testing.T) {
 }
 
 // The MILE column's width guard is calibrated for the non-admin prefix; the admin board's extra
-// OWNER column makes its rows wider, so the column must drop on a narrow admin board rather than
-// overflow the edge (it clipped at widths 90-91 before the admin-aware threshold).
+// OWNER column AND its always-on credential column (PRD #295) make its rows wider, so the column
+// must drop on a narrow admin board rather than overflow the edge (it clipped at widths 90-91
+// before the admin-aware threshold), and only returns once the terminal is wide enough for both.
 func TestTUIAdminBoardRowsFitNarrowWidth(t *testing.T) {
 	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "running",
@@ -283,7 +284,7 @@ func TestTUIAdminBoardRowsFitNarrowWidth(t *testing.T) {
 			t.Errorf("milestone micro-bar should be hidden on the narrow admin board at width %d\n%s", w, out)
 		}
 	}
-	if wide := stripANSI(render(120)); !strings.Contains(wide, "▰▰▱▱") {
+	if wide := stripANSI(render(130)); !strings.Contains(wide, "▰▰▱▱") {
 		t.Errorf("milestone micro-bar should return on a wide admin board\n%s", wide)
 	}
 }

@@ -811,6 +811,15 @@ export interface ImplementPromptInput {
    *  which is why the milestone note is not first-turn-only: it re-renders the live status
    *  each turn. Absent ⇒ every milestone renders as not-yet-started. See milestoneStatusNote. */
   progress?: MilestoneProgress;
+  /** PRD #390 M2/M3: the executor sets this when the PREVIOUS work turn marked no
+   *  milestone in progress, so this turn's note escalates from the standing per-turn
+   *  requirement into a direct re-ask. Absent/false ⇒ no escalation line. It only ever
+   *  ADDS a line to an already-non-empty milestone note; a 0-milestone/non-issue run hits
+   *  milestoneStatusNote's empty-list early return before the flag is read, so that path
+   *  is byte-for-byte identical to before regardless of this flag (SC4). (A run WITH
+   *  milestones already carries M2's required-declaration wording; this flag only governs
+   *  the additional escalation line.) */
+  progressMissedLastTurn?: boolean;
   /** issue #279: whether `report_only` is available on signal_done this run (ISSUE RUNS
    *  ONLY, gated on the same isIssueRun discriminator the schema uses). When true the
    *  implement prompt teaches the lead to complete an evidence run report-only instead of
@@ -883,7 +892,11 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
   // PRD #122 M6: name the approved milestones and their live status EVERY turn (not
   // first-turn-only like the facts above — progress is dynamic), so the lead can see the
   // milestone boundaries and checkpoint at each one. Empty ⇒ nothing added.
-  const milestoneNote = milestoneStatusNote(input.milestones, input.progress);
+  const milestoneNote = milestoneStatusNote(
+    input.milestones,
+    input.progress,
+    input.progressMissedLastTurn,
+  );
   if (milestoneNote) lines.push("", milestoneNote);
   if (input.followUp) {
     lines.push(
@@ -959,6 +972,7 @@ export function buildRevisePlanPrompt(feedback: string): string {
 function milestoneStatusNote(
   milestones: readonly Milestone[] | undefined,
   progress: MilestoneProgress | undefined,
+  progressMissedLastTurn?: boolean,
 ): string {
   if (!milestones || milestones.length === 0) return "";
   const done = new Set(progress?.completed ?? []);
@@ -971,25 +985,41 @@ function milestoneStatusNote(
         : "not started";
     return `- [${m.id}] ${m.title} — ${status}`;
   });
-  return [
+  const lines = [
     "Your approved plan is broken into these milestones. When a milestone's work is",
     "committed locally, call the `checkpoint` tool once and end your turn so the work is",
     "saved durably before you start the next one:",
     ...rows,
     "",
-    // PRD #265 M3: keep the run's milestone tracker truthful. report_progress gives
-    // mid-run visibility without ending the turn (it is already decoupled from the
-    // durability checkpoint), and the signal_done declaration is what reconciles the
-    // tracker at completion — the load-bearing fix for a single-turn run that never got
-    // to report. Framed as "what you actually finished" so it never becomes a rote
-    // "declare them all" that re-lies (a deliberately-skipped milestone stays undeclared).
-    "Keep this tracker honest as you go. On a multi-turn run you MAY call `report_progress`",
-    "at any point to mark milestones in progress or complete — it updates the tracker right",
+    // PRD #265 M3 / PRD #390 M2: keep the run's milestone tracker truthful. report_progress
+    // gives mid-run visibility without ending the turn (it is already decoupled from the
+    // durability checkpoint), and the signal_done declaration is what reconciles the tracker
+    // at completion — the load-bearing fix for a single-turn run that never got to report.
+    // PRD #390 M2 turns the mid-run report from "MAY" into a REQUIRED per-turn declaration so
+    // the tracker reflects reality on every turn, not only at completion. The signal_done
+    // sentence is framed as "what you actually finished" so it never becomes a rote "declare
+    // them all" that re-lies (a deliberately-skipped milestone stays undeclared).
+    "Keep this tracker honest as you go. At the start of each implement turn, call",
+    "`report_progress` with the id of the milestone you are working on (its `in_progress`);",
+    "call it again with that id in `completed` when it is done. It updates the tracker right",
     "away and does NOT end your turn. When you finish, declare the milestones you ACTUALLY",
     "completed on `signal_done` (its `milestones_completed` field): list only what you truly",
     "finished, and leave any you deliberately left undone undeclared, so the tracker reflects",
     "what actually shipped rather than reading as 0 on a run that succeeded.",
-  ].join("\n");
+  ];
+  // PRD #390 M2/M3: the executor sets progressMissedLastTurn when the PREVIOUS work turn
+  // marked no milestone in progress, escalating the standing requirement above into a direct
+  // re-ask for THIS turn. Rendered only inside the non-empty note (the early return above
+  // guarantees the flag never leaks into a 0-milestone/non-issue prompt).
+  if (progressMissedLastTurn) {
+    lines.push(
+      "",
+      "Your last turn marked no milestone in progress. Before you continue, call",
+      "`report_progress` now with the milestone id you are currently working on so the",
+      "tracker reflects reality.",
+    );
+  }
+  return lines.join("\n");
 }
 
 // PRD #266 M1: the roster line names each subagent AND its write capability, so the
