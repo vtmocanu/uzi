@@ -170,7 +170,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@v4.1.2
         with:
           # cosign 2.x emits classic signatures -- the broadest verifier + Kyverno
           # compatibility. Pinned to the installer's floating v3 major: it has NO
@@ -219,7 +219,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@v4.1.2
         with:
           # cosign 2.x emits classic signatures -- the broadest verifier + Kyverno
           # compatibility. Pinned to the installer's floating v3 major: it has NO
@@ -258,7 +258,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@v4.1.2
         with:
           # cosign 2.x emits classic signatures -- the broadest verifier + Kyverno
           # compatibility. Pinned to the installer's floating v3 major: it has NO
@@ -304,7 +304,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@v4.1.2
         with:
           # cosign 2.x emits classic signatures -- the broadest verifier + Kyverno
           # compatibility. Pinned to the installer's floating v3 major: it has NO
@@ -356,7 +356,7 @@ jobs:
       - uses: azure/setup-helm@v5
         with:
           version: v4.2.3
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@v4.1.2
         with:
           # cosign 2.x emits classic signatures -- the broadest verifier + Kyverno
           # compatibility. Pinned to the installer's floating v3 major: it has NO
