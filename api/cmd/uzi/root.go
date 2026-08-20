@@ -120,6 +120,7 @@ type globalFlags struct {
 	url     string
 	quiet   bool
 	noColor bool
+	context string
 }
 
 // Main builds the command tree, runs it, prints any error to stderr, and maps
@@ -197,6 +198,7 @@ func newRootCmd(env Env) *cobra.Command {
 	pf.StringVar(&gf.url, "url", "", "uzi API base URL (overrides config and $UZI_URL)")
 	pf.BoolVar(&gf.quiet, "quiet", false, "suppress non-essential output")
 	pf.BoolVar(&gf.noColor, "no-color", false, "disable colour output")
+	pf.StringVarP(&gf.context, "context", "c", "", "named context to use (overrides $UZI_CONTEXT and config current)")
 
 	root.AddCommand(
 		newLoginCmd(env, gf),
@@ -220,17 +222,78 @@ func newRootCmd(env Env) *cobra.Command {
 	return root
 }
 
-// resolveSettings layers env vars and flags over the store-resolved context.
-// Precedence: --url > $UZI_URL > config file for the URL; $UZI_TOKEN >
-// credentials file for the token. There is deliberately no --token flag — a
-// credential must never land on argv (PRD #64).
+// resolveContextName returns the active context name and whether it was chosen
+// explicitly. Precedence (PRD #427 D1): --context/-c flag > $UZI_CONTEXT >
+// config.Current > "default". An empty flag or empty $UZI_CONTEXT is treated as
+// unset (the same `!= ""` "set" test resolveSettings uses for $UZI_URL), so
+// `-c ""` falls through. `explicit` is true when the name came from the flag,
+// $UZI_CONTEXT, or config.Current, and false only for the implicit "default"
+// fallback — D9's existence check keys on that bit.
+//
+// It resolves the NAME ONLY; it does not validate that the context exists. A
+// LoadConfig failure is surfaced as the error return rather than swallowed. When
+// env.Store is nil there is no config, so the implicit "default" is returned.
+func resolveContextName(env Env, gf *globalFlags) (string, bool, error) {
+	if gf.context != "" {
+		return gf.context, true, nil
+	}
+	if v := os.Getenv("UZI_CONTEXT"); v != "" {
+		return v, true, nil
+	}
+	if env.Store == nil {
+		return "default", false, nil
+	}
+	cfg, err := env.Store.LoadConfig()
+	if err != nil {
+		return "", false, err
+	}
+	if cfg.Current != "" {
+		return cfg.Current, true, nil
+	}
+	return "default", false, nil
+}
+
+// resolveSettings resolves the active context (PRD #427 D1), reads its stored
+// URL/token, applies D3 URL inheritance from the default context, then layers
+// env vars and flags on top. Precedence for the URL: --url > $UZI_URL > active
+// context URL > default context URL; for the token: $UZI_TOKEN > active context
+// token. There is deliberately no --token flag — a credential must never land on
+// argv (PRD #64).
 func resolveSettings(env Env, gf *globalFlags) (uzicli.Settings, error) {
+	name, explicit, err := resolveContextName(env, gf)
+	if err != nil {
+		return uzicli.Settings{}, uzicli.Exitf(uzicli.ExitAuth, "%v", err)
+	}
+
 	var s uzicli.Settings
 	if env.Store != nil {
-		var err error
-		s, err = env.Store.Resolve("default")
+		cfg, err := env.Store.LoadConfig()
 		if err != nil {
 			return s, uzicli.Exitf(uzicli.ExitAuth, "%v", err)
+		}
+		creds, err := env.Store.LoadCredentials()
+		if err != nil {
+			return s, uzicli.Exitf(uzicli.ExitAuth, "%v", err)
+		}
+		// D9: an explicitly named context that exists in neither map is an error
+		// before any client is built. The implicit "default" fallback must never
+		// error on absence — a fresh user's first `uzi --url … login` has no
+		// stored default context yet.
+		if explicit {
+			_, inCfg := cfg.Contexts[name]
+			_, inCreds := creds.Contexts[name]
+			if !inCfg && !inCreds {
+				return s, uzicli.Exitf(uzicli.ExitUsage, "unknown context %q", name)
+			}
+		}
+		s, err = env.Store.Resolve(name)
+		if err != nil {
+			return s, uzicli.Exitf(uzicli.ExitAuth, "%v", err)
+		}
+		// D3: a context with no stored URL inherits the default context's URL
+		// (token does NOT inherit).
+		if s.URL == "" && name != "default" {
+			s.URL = cfg.Contexts["default"].URL
 		}
 	}
 	if v := os.Getenv("UZI_URL"); v != "" {
