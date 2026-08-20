@@ -101,6 +101,12 @@ type Client interface {
 	// RENDERED here, never re-derived (D21).
 	SelfRateLimits(ctx context.Context) ([]apitypes.TokenRateLimitDTO, error)
 	ListRepos(ctx context.Context) ([]apitypes.RepoDTO, error)
+	// DeleteRepo removes a single repo: DELETE /api/repos/{id}, 204 on success
+	// (PRD #357 M3). The server only removes a DISABLED repo and refuses one that
+	// is enabled or has an in-flight run with 409 → ExitConflict; a foreign/absent
+	// id is 404 → ExitNotFound. It is destructive, so the `uzi repo remove` command
+	// gates it behind --force / a confirm prompt.
+	DeleteRepo(ctx context.Context, id string) error
 	// BuildInfo reads the server's build coordinates from the UNAUTHENTICATED
 	// GET /api/version (PRD #175 M4).
 	//
@@ -806,6 +812,10 @@ func (c *HTTPClient) SelfRateLimits(ctx context.Context) ([]apitypes.TokenRateLi
 
 func (c *HTTPClient) DeleteWorker(ctx context.Context, id string) error {
 	return c.del(ctx, "/api/workers/"+url.PathEscape(id))
+}
+
+func (c *HTTPClient) DeleteRepo(ctx context.Context, id string) error {
+	return c.del(ctx, "/api/repos/"+url.PathEscape(id))
 }
 
 func (c *HTTPClient) SetWorkerBindMode(ctx context.Context, id, mode, label string) (apitypes.WorkerDTO, error) {
