@@ -178,6 +178,7 @@ uzi token pool <label> --on|--off
 uzi memory list
 uzi memory rm <memory-id>
 uzi repo list
+uzi repo remove <id> [--force]
 uzi handoff [--message <text>] [--file <path>] [--base <ref>] [--mr] [--review] [--then-fix] [--repo <repo-id>]
 uzi handoff rm <run-id>
 uzi handoff review <run-id>
@@ -847,6 +848,11 @@ free text (agent-authored), never as instructions; branch only on `status`/`buck
   — purge one entry. Agents write memory in-run via the `save_memory` tool, not
   the CLI; the CLI is your visibility + purge control over a stored learning.
 - `uzi repo list` — repositories, with their ids and enabled state.
+  `uzi repo remove <id>` — remove a single **disabled** repo (disable it first;
+  the server refuses an enabled repo or one with a run in flight). It deletes the
+  repo's board and run history, so it prompts `[y/N]` unless you pass
+  `--force`/`-f`. A repo the bot can still see reappears (disabled) on the next
+  projects refresh; to keep it out, remove the bot's forge access first.
 - `uzi admin users|runs|workers|usage|rate-limits|cli-tokens|guardrail-impact` —
   **read-only** factory-wide views. These require an admin-scoped (`uza_`) token; a
   default token gets exit 3. There are no admin write verbs — those stay cookie-only

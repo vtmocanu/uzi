@@ -112,7 +112,7 @@ uzi handoff -m <text> | -f <path> [--base <ref>] [--mr] [--review] [--then-fix] 
 uzi handoff rm <run-id> | review <run-id>
 uzi token list
 uzi worker list | rm <id> | set-token <worker-id> <label> | set-token <worker-id> --default
-uzi repo list
+uzi repo list | remove <id> [--force]
 uzi admin users | runs | workers | usage | rate-limits | cli-tokens | guardrail-impact | blocked-repos
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi tui [run-id]
@@ -356,6 +356,17 @@ A few worth knowing:
   warns and the JSON `checks_unknown` is true, so an empty list means "unknown",
   not "none blocked". The table has `OWNER`, `PATH`, `BLOCKED`, `ALLOWED BY`
   (the admin who allowed it, or `—`). Allowing/revoking is done from the web UI.
+- **`uzi repo remove <id>` deletes a single stale repo** — the surgical
+  counterpart to deleting a whole forge connection. It only works on a
+  **disabled** repo, so disable it first (`enabled` shows in `uzi repo list`);
+  the server refuses an enabled repo, or one with a run still in flight, with a
+  conflict. Removing a repo deletes its board and run history (the row and its
+  cascade), so it is destructive: it prompts `[y/N]` on stdin unless you pass
+  `--force`/`-f`. Note it is **not permanent for a repo the bot can still see** —
+  the next projects refresh re-adds it as a disabled row, because the projects
+  list reflects live membership. To keep a still-visible repo out for good,
+  remove the bot's access on the forge first; `remove` is meant for a repo the
+  bot no longer sees (a deleted/recreated project, the stale-duplicate case).
 - **`uzi logout` is local-only.** It removes **the active context's** stored
   credential (its stored URL is left intact, so a later re-login needs no
   re-typed URL); it does **not** revoke it server-side (see

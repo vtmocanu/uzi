@@ -547,11 +547,46 @@ non-fatal (see §24).
   (allowlisted base URLs for the dropdown).
 - `GET /api/forge/connections/:id/projects` — live membership; upserts `repos`
   (`enabled=false`).
-- `PUT /api/repos/:id` (enable/disable) · `GET /api/repos` (enabled repos).
+- `PUT /api/repos/:id` (enable/disable) · `DELETE /api/repos/:id` (remove;
+  owner-scoped, disabled-only, cascades — see the per-repo remove note below) ·
+  `GET /api/repos` (enabled repos).
 - `GET /api/repos/:id/board` · `PUT /api/repos/:id/board/columns` · `POST
   /api/repos/:id/issues/:iid/move {to_column}` · `POST /api/repos/:id/sync`.
 - Every repo/board endpoint authorizes through the owning connection's `user_id`
   (bottega's membership-authz shape) — a user only ever sees their own bot's world.
+
+**Per-repo remove (`DELETE /api/repos/:id`, PRD #357).** Owner-scoped explicit
+removal of a single tracked repo: deletes the `repos` row and lets existing FKs
+cascade its derived data (runs, cached issues, board columns, ...). No migration —
+pure query + handler + route + client + CLI (D5).
+
+- **Explicit remove, not refresh-prune (D1).** `ListProjects` stays add/update-only
+  and never prunes. Auto-deleting rows absent from a live membership fetch is
+  rejected because `repos.id` is an `ON DELETE CASCADE` anchor for ~a dozen tables,
+  so a transient membership gap (permissions blip, token-scope loss, paginated
+  response) would cascade-delete runs/board/issues on a routine read. Remove is a
+  bounded, explicit, owner-initiated action instead.
+- **Disabled-only server guard (D2).** The server rejects DELETE unless the repo is
+  `enabled = false` (409 otherwise) — the real safety, not the UI confirm, because
+  two of the three callers are non-interactive (CLI, auto-approving sweep worker).
+  The DELETE also folds `AND enabled = false` into the statement itself (D6) as the
+  atomic race guard against a concurrent enable between the handler's fetch and the
+  delete.
+- **Active-run guard (D7).** Removal is also refused (409) while the repo has a
+  non-terminal run — "disabled" is not "quiescent": disabling only drops the repo
+  from the poll set, it does not cancel an in-flight run. Implemented as a count over
+  the terminal complement (`status NOT IN ('completed','failed','cancelled')`) so it
+  covers `limit_wait` (a parked run is still in flight) and any future non-terminal
+  status.
+- **Removal is transient for a still-visible repo (D3).** If the bot still has forge
+  access, the next `ListProjects` refresh re-adds the repo as a disabled row. This is
+  correct (the list reflects live membership); remove targets STALE repos the bot no
+  longer sees (a deleted/recreated project gets a new numeric id → a duplicate row).
+  To keep a still-visible repo out permanently, remove the bot's access on the forge
+  first.
+- Mounted in the **RequireUser** group (cookie OR `uzc_` Bearer), not the cookie-only
+  RequireAuth group, so the CLI's Bearer token is accepted — a cookie-only mount would
+  401 it.
 
 ## 27. Compose worktree isolation
 

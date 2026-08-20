@@ -117,6 +117,11 @@ type FakeClient struct {
 	// DeleteWorker capture: records the id it was asked to delete.
 	LastDeletedWorkerID string
 
+	// DeleteRepo capture (PRD #357 M3): records the id `uzi repo remove` asked to
+	// delete. It stays empty when the confirm gate declines, which is what proves
+	// the gate blocked the call.
+	LastDeletedRepoID string
+
 	// SetTokenAutoEligible capture (PRD #111 M2): the secret id the command
 	// RESOLVED the label to, and the boolean it sent. The id is what proves the
 	// label→id resolution happened client-side against the caller's own list rather
@@ -465,6 +470,11 @@ func (f *FakeClient) ListRepos(context.Context) ([]apitypes.RepoDTO, error) {
 		return nil, f.Err
 	}
 	return f.Repos, nil
+}
+
+func (f *FakeClient) DeleteRepo(_ context.Context, id string) error {
+	f.LastDeletedRepoID = id
+	return f.Err
 }
 
 // BuildInfo returns Build, or BuildErr when set. BuildErr is SEPARATE from the

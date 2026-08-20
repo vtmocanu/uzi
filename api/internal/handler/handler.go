@@ -1012,6 +1012,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// and falls back (silently) to a shared IP bucket if it runs before auth —
 				// so auth first, limiter second (B.4).
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/runs", h.CreateRun)
+				// Explicit per-repo remove (PRD #357). RequireUser (NOT the cookie-only
+				// RequireAuth group below) so the CLI's Bearer token is accepted — a
+				// cookie-only mount would 401 it (issue #428 regression). No forge limiter:
+				// the handler makes no forge call, like POST /{id}/schedules. Owner-scoped
+				// and guarded server-side (GetRepoForUser 404, enabled/active-run 409) inside
+				// the handler.
+				r.Delete("/{id}", h.DeleteRepo)
 				// Queue a task/handoff run (PRD #400): ephemeral, branch-scoped,
 				// issue-less. Same per-user forge budget as the other run creators.
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/task-runs", h.CreateTaskRun)
