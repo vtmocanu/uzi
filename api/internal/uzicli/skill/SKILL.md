@@ -76,9 +76,12 @@ it.
 
 - `UZI_URL` — the API base URL (e.g. `https://uzi.example.com`). Overrides the
   config file.
-- `UZI_TOKEN` — a Bearer CLI token. Overrides the stored credential. **This is
-  the headless path**: with `UZI_URL` + `UZI_TOKEN` set you need no browser, no
-  cookie, and no `$HOME`. In GitLab CI, make `UZI_TOKEN` a **masked** variable.
+- `UZI_TOKEN` — a Bearer CLI token. Overrides **the active context's** stored
+  credential. **This is the headless path**: with `UZI_URL` + `UZI_TOKEN` set
+  you need no browser, no cookie, and no `$HOME`. In GitLab CI, make
+  `UZI_TOKEN` a **masked** variable.
+- `UZI_CONTEXT` — the name of the context to use for this invocation (see
+  **Named contexts**, below). An empty value counts as unset.
 - There is deliberately **no flag that takes the token on the command line** — a
   credential must never land on `argv` (readable via `ps` / `/proc`). Use
   `UZI_TOKEN`, or `uzi auth token` which reads the token from stdin.
@@ -98,10 +101,28 @@ reports `is_admin:false` even if you are an admin — that is the token's effect
 authority, not your résumé. The `admin` subcommands need an admin-scoped
 (`uza_`) token.
 
+**Named contexts.** The CLI can hold several stored credentials at once — a
+`uzc_` owner token and a `uza_` admin-read token, say — instead of forcing you
+to overwrite one or juggle `UZI_TOKEN=…` per invocation. Each is a **context**:
+a name for one stored `{URL, token}` pair. The active context is resolved by
+precedence — `--context`/`-c <name>` flag > `$UZI_CONTEXT` > the sticky current
+context (set by `uzi context use`) > `"default"` — and only THEN do the
+per-invocation overrides above (`UZI_TOKEN`, `UZI_URL`/`--url`) layer on top, so
+the headless `UZI_URL`+`UZI_TOKEN` path is unaffected whether or not you use
+contexts. A context that stores no URL of its own inherits the `default`
+context's URL (not its token), so the common case — two tokens against one
+server — needs the URL stored only once; a context aimed at a **different**
+server needs its own URL (`uzi context set <name> --url <url>`), or its token
+goes to the wrong host. A context is pure client-side credential *selection* —
+it never grants capability, authority is still the token's server-enforced
+scope — and the `0600` credentials-file rule and the no-token-on-`argv` rule
+hold for every context (they share one store). See **Named contexts** below for
+the `context` verbs.
+
 ## Command reference
 
 Global flags (valid on every command): `--json`, `--url <url>`, `--quiet`,
-`--no-color`.
+`--no-color`, `--context <name>`/`-c <name>`.
 
 ```
 uzi login
@@ -179,15 +200,42 @@ uzi version
 
 - `uzi login` — browser-brokered login. Prints a one-time code and a URL; you
   approve in an already-authenticated tab. Works over SSH and in containers (no
-  loopback listener). For agents, prefer `UZI_TOKEN` instead.
+  loopback listener). For agents, prefer `UZI_TOKEN` instead. `--context <name>`
+  targets a named context instead of the active one; an unknown name is
+  **created**.
 - `uzi auth token` — store a static token read from stdin (pipe it in). Use
-  `--with-token` to force the stdin read even on a TTY.
-- `uzi auth status` — show whether a credential is stored and the resolved URL
-  (never prints the token).
+  `--with-token` to force the stdin read even on a TTY. `--context <name>`
+  targets a named context instead of the active one; an unknown name is
+  **created** (write commands create; read/run commands error on an unknown
+  `--context`).
+- `uzi auth status` — show the **active** context, whether a credential is
+  stored for it, and the resolved URL (never prints the token). `--all` lists
+  every stored context instead (name, url, whether a token is stored — never
+  the value).
 - `uzi whoami` — the identity and effective scope of the current credential
   (`GET /api/auth/me`).
-- `uzi logout` — remove the **local** credential. It does **not** revoke the
-  token server-side; do that in the web UI (Settings → Access).
+- `uzi logout` — remove **the active context's** local credential. Its stored
+  URL is left intact (a later re-login needs no re-typed URL). It does **not**
+  revoke the token server-side; do that in the web UI (Settings → Access).
+
+### Named contexts
+
+- `uzi context list` — every stored context (union of `config.toml` and
+  `credentials.toml`): its own URL (blank when it inherits the `default`
+  context's URL), whether a token is stored (never the value), and which is
+  current (`*`). `--json` supported.
+- `uzi context current` — print the sticky current context (or `default`). A
+  `--context`/`$UZI_CONTEXT` override picks a context for that one invocation
+  but does **not** change this sticky value.
+- `uzi context use <name>` — set the sticky current context. The context must
+  already exist (in `config.toml` or `credentials.toml`), except `default`,
+  which is always valid.
+- `uzi context set <name> --url <url>` — create or update a URL-only context.
+  This is the only way to store just an endpoint — `auth token`/`login` always
+  require a token — and is what a multi-server setup uses to give a context its
+  own URL instead of inheriting `default`'s.
+- `uzi context rm <name>` — remove a context from both files. If it was the
+  current context, current resets to `default`.
 
 ### Runs — the core loop
 

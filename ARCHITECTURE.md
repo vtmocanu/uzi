@@ -992,6 +992,13 @@ sanitize and render helpers it must reuse live there; that trade is recorded in
 [docs/cli.md](docs/cli.md); the plain `--json` verbs remain the agent-facing surface
 and are unchanged.
 
+The CLI can also hold several credentials at once as **named contexts**
+(`uzi context …`, PRD #427) and switch which one a command uses via a flag, an
+env var, or a sticky default. This is purely client-side credential selection —
+which already-stored `{URL, token}` pair a command sends — with no server, API,
+or scope change; authority is still the token's server-enforced scope. See
+[Config and credentials](docs/cli.md#config-and-credentials) for the mechanics.
+
 - **One new credential, one new middleware.** A `cli_tokens` row (`uzc_`
   user-scoped / `uza_` admin-scoped, sha256 at rest, mirroring the worker
   join-token posture) is presented as `Authorization: Bearer …`.
