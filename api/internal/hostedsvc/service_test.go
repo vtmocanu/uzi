@@ -357,6 +357,55 @@ func TestLateRegistrationSelfHealsAnExpiredRow(t *testing.T) {
 	}
 }
 
+// The busy/draining poll fields (PRD #422 M3) must round-trip from the store row into
+// the DesiredWorker DTO the controller reads. The two workers carry discriminating
+// values (busy-not-draining vs draining-not-busy) so a swapped or dropped field is
+// caught here, not just by the wire golden.
+func TestPollCarriesBusyAndDraining(t *testing.T) {
+	st := newFakeStore()
+	svc := newTestService(t, st)
+
+	busyID := uuid.New()
+	drainID := uuid.New()
+	st.workers = append(st.workers,
+		store.ListHostedWorkersForControllerRow{
+			ID:               busyID,
+			TemplateDeclared: pgtype.Text{String: "base", Valid: true},
+			HostedSize:       pgtype.Text{String: "s", Valid: true},
+			HostedGeneration: 1,
+			Busy:             true,
+			Draining:         false,
+		},
+		store.ListHostedWorkersForControllerRow{
+			ID:               drainID,
+			TemplateDeclared: pgtype.Text{String: "jvm", Valid: true},
+			HostedSize:       pgtype.Text{String: "l", Valid: true},
+			HostedGeneration: 2,
+			Busy:             false,
+			Draining:         true,
+		},
+	)
+
+	resp, err := svc.Poll(context.Background())
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if len(resp.Workers) != 2 {
+		t.Fatalf("%d workers, want 2", len(resp.Workers))
+	}
+
+	byID := map[string]DesiredWorker{}
+	for _, w := range resp.Workers {
+		byID[w.ID] = w
+	}
+	if got := byID[busyID.String()]; !got.Busy || got.Draining {
+		t.Fatalf("busy worker = %+v, want Busy=true Draining=false", got)
+	}
+	if got := byID[drainID.String()]; got.Busy || !got.Draining {
+		t.Fatalf("draining worker = %+v, want Busy=false Draining=true", got)
+	}
+}
+
 // A registration for a worker with no token row at all deletes nothing and must not
 // error — the worker still registered successfully.
 func TestNoteRegisteredForWorkerWithNoRowIsNotAnError(t *testing.T) {

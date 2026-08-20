@@ -1068,6 +1068,15 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 		return nil, nil // idle: owner locked
 	}
 
+	// Drain gate (PRD #422 M3): a cordoned worker finishes its in-flight runs but
+	// claims nothing new, so the controller can roll it once idle. Like the vault
+	// gate this reports idle (nil,nil), not an error — the worker keeps heartbeating
+	// and reporting its running runs; only NEW claims are refused. draining_since is
+	// cleared on the worker's next register (after its roll), which re-enables claims.
+	if wkr.DrainingSince.Valid {
+		return nil, nil // idle: worker draining/cordoned
+	}
+
 	// Docker-worker repo allowlist (PRD #89 M-allow): a docker-enabled worker may
 	// claim ONLY runs whose repo is on the trusted allowlist. Repo-less JUDGE runs are
 	// exempt (the SQL narrows the exemption to kind='judge', so a future repo-less kind

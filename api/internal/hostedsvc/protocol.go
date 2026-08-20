@@ -63,6 +63,17 @@ type DesiredWorker struct {
 	// COALESCEd from the nullable docker_enabled column, so a NULL (external rows
 	// never reach this poll) and an explicit false both mean "no sidecar".
 	Docker bool `json:"docker"`
+	// Busy is true when the worker holds at least one non-terminal run (PRD #422 M3,
+	// Decision 5): it reuses the same active-run predicate the DeleteWorker guard uses
+	// (awaiting_approval included). The controller reads it to defer a deliberate roll of
+	// a busy worker (cordon-then-roll-when-idle, M4). Always present on the wire (no
+	// omitempty) so a drop is a visible contract change, not a silent false.
+	Busy bool `json:"busy"`
+	// Draining is true when the worker has been cordoned (draining_since set, PRD #422
+	// Decision 7): it keeps heartbeating and finishing its in-flight runs but claims
+	// nothing new, and the controller rolls it once idle. Always present on the wire (no
+	// omitempty) so a drop is a visible contract change, not a silent false.
+	Draining bool `json:"draining"`
 	// Generation is bumped whenever the desired spec changes; the controller
 	// compares it against what it observes to decide whether to roll (Decision 9).
 	Generation int64 `json:"generation"`

@@ -51,7 +51,17 @@ type DesiredWorker struct {
 	// DIMENSION orthogonal to Template (Decision 1: docker is not a template), which
 	// is why it rides its own bool rather than a template name. Mirrors the api's
 	// hostedsvc.DesiredWorker.Docker; the shared golden pins the two in lockstep.
-	Docker     bool  `json:"docker"`
+	Docker bool `json:"docker"`
+	// Busy is true when the worker holds at least one non-terminal run (PRD #422 M3).
+	// The controller defers a deliberate roll of a busy worker (cordon-then-roll-when-idle,
+	// M4). Mirrors the api's hostedsvc.DesiredWorker.Busy; the shared golden pins the two
+	// in lockstep.
+	Busy bool `json:"busy"`
+	// Draining is true when the worker has been cordoned (PRD #422 Decision 7): it keeps
+	// heartbeating and finishing its in-flight runs but claims nothing new, and the
+	// controller rolls it once idle. Mirrors the api's hostedsvc.DesiredWorker.Draining;
+	// the shared golden pins the two in lockstep.
+	Draining   bool  `json:"draining"`
 	Generation int64 `json:"generation"`
 	// JoinToken is the plaintext, present only until a pod proves it holds it (by
 	// registering) or the api's buffer expires unread.

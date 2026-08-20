@@ -23,6 +23,20 @@ SELECT w.id,
        w.hosted_size,
        w.hosted_generation,
        w.docker_enabled,
+       -- busy (PRD #422 M3, Decision 5): does this worker hold any non-terminal run? This
+       -- reuses the EXACT active-run predicate the DeleteWorker guard uses
+       -- (CountWorkerNonTerminalRuns), awaiting_approval included, because rolling a worker
+       -- that holds such a run would requeue it. Feeds the controller's cordon/defer-roll
+       -- decision (M4).
+       (SELECT count(*) FROM runs r
+          WHERE r.worker_id = w.id
+            AND r.status NOT IN ('completed', 'failed', 'cancelled')) > 0 AS busy,
+       -- draining (PRD #422 M3): mirrors the orthogonal cordon column. A cordoned worker
+       -- finishes its in-flight runs then rolls; the controller reads this alongside busy.
+       -- ::boolean is required, not decoration: sqlc infers a bare `IS NOT NULL`
+       -- expression as interface{} (weaker on expressions than on columns — see
+       -- GetRunClaimContext's human_plan_approved), which is unusable as a Go bool.
+       (w.draining_since IS NOT NULL)::boolean AS draining,
        t.token_ciphertext
 FROM workers w
 LEFT JOIN hosted_worker_tokens t ON t.worker_id = w.id

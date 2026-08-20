@@ -54,7 +54,7 @@ func (q *Queries) CountHostedWorkersForUser(ctx context.Context, userID uuid.UUI
 const createHostedWorker = `-- name: CreateHostedWorker :one
 INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled)
 VALUES ($1, $2, $3, $4, 'hosted', $5, $6)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since
 `
 
 type CreateHostedWorkerParams struct {
@@ -117,6 +117,7 @@ func (q *Queries) CreateHostedWorker(ctx context.Context, arg CreateHostedWorker
 		&i.AnthropicSecretID,
 		&i.AnthropicBindMode,
 		&i.OnlineSince,
+		&i.DrainingSince,
 	)
 	return i, err
 }
@@ -168,6 +169,20 @@ SELECT w.id,
        w.hosted_size,
        w.hosted_generation,
        w.docker_enabled,
+       -- busy (PRD #422 M3, Decision 5): does this worker hold any non-terminal run? This
+       -- reuses the EXACT active-run predicate the DeleteWorker guard uses
+       -- (CountWorkerNonTerminalRuns), awaiting_approval included, because rolling a worker
+       -- that holds such a run would requeue it. Feeds the controller's cordon/defer-roll
+       -- decision (M4).
+       (SELECT count(*) FROM runs r
+          WHERE r.worker_id = w.id
+            AND r.status NOT IN ('completed', 'failed', 'cancelled')) > 0 AS busy,
+       -- draining (PRD #422 M3): mirrors the orthogonal cordon column. A cordoned worker
+       -- finishes its in-flight runs then rolls; the controller reads this alongside busy.
+       -- ::boolean is required, not decoration: sqlc infers a bare ` + "`" + `IS NOT NULL` + "`" + `
+       -- expression as interface{} (weaker on expressions than on columns — see
+       -- GetRunClaimContext's human_plan_approved), which is unusable as a Go bool.
+       (w.draining_since IS NOT NULL)::boolean AS draining,
        t.token_ciphertext
 FROM workers w
 LEFT JOIN hosted_worker_tokens t ON t.worker_id = w.id
@@ -181,6 +196,8 @@ type ListHostedWorkersForControllerRow struct {
 	HostedSize       pgtype.Text `json:"hosted_size"`
 	HostedGeneration int64       `json:"hosted_generation"`
 	DockerEnabled    pgtype.Bool `json:"docker_enabled"`
+	Busy             bool        `json:"busy"`
+	Draining         bool        `json:"draining"`
 	TokenCiphertext  []byte      `json:"token_ciphertext"`
 }
 
@@ -217,6 +234,8 @@ func (q *Queries) ListHostedWorkersForController(ctx context.Context) ([]ListHos
 			&i.HostedSize,
 			&i.HostedGeneration,
 			&i.DockerEnabled,
+			&i.Busy,
+			&i.Draining,
 			&i.TokenCiphertext,
 		); err != nil {
 			return nil, err

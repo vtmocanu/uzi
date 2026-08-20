@@ -5,6 +5,8 @@
       "template": "base",
       "size": "s",
       "docker": true,
+      "busy": true,
+      "draining": false,
       "generation": 1,
       "join_token": "uzw_EXAMPLE-NOT-A-REAL-TOKEN"
     },
@@ -13,6 +15,8 @@
       "template": "jvm",
       "size": "l",
       "docker": false,
+      "busy": false,
+      "draining": true,
       "generation": 4,
       "join_token": null
     }
