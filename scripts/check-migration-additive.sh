@@ -97,20 +97,42 @@ scan() {
     function norm(s){ gsub(/[ \t]+/, " ", s); sub(/^ /, "", s); sub(/ $/, "", s); return s }
     function cleantbl(s){ gsub(/"/, "", s); sub(/^public\./, "", s); gsub(/[(),;]/, "", s); return s }
     function report(tbl, verb, stmt){ print FILENAME "\t" tbl "\t" verb "\t" norm(stmt) }
-    function check(raw,   stmt, rest, w, tbl, verb){
+    # A column drop in Postgres is `DROP [COLUMN] <name>`; the COLUMN keyword is OPTIONAL.
+    # Flag a `drop` whose following word is a real column name -- i.e. anything EXCEPT the
+    # relaxations the guard deliberately ignores: `drop constraint`, `drop default`, and
+    # `drop not null`. (`drop column <name>` also lands here: its next word "column" is not
+    # a relaxation keyword, so it is treated as a column drop.) DROP INDEX / DROP TABLE are
+    # never inside an ALTER TABLE statement, so they never reach this function.
+    function col_drop(r,   tmp, tail, word){
+      tmp = r
+      while (match(tmp, /(^| )drop /)){
+        tail = substr(tmp, RSTART + RLENGTH)
+        if (match(tail, /^[a-z_"][a-z0-9_"]*/)){
+          word = substr(tail, RSTART, RLENGTH); gsub(/"/, "", word)
+          if (word != "constraint" && word != "default" && word != "not") return 1
+        }
+        tmp = tail
+      }
+      return 0
+    }
+    function check(raw,   stmt, rest, w, tbl, verb, m, parts, k, tw){
       stmt = norm(raw)
       if (stmt == "") return
       if (stmt ~ /^drop table /){
-        rest = stmt; sub(/^drop table /, "", rest); sub(/^if exists /, "", rest)
-        split(rest, w, " "); tbl = cleantbl(w[1])
-        if (tbl in wf) report(tbl, "DROP TABLE", stmt)
+        # DROP TABLE takes a comma-separated LIST of targets; flag if ANY is worker-facing.
+        rest = stmt; sub(/^drop table /, "", rest); sub(/^if exists /, "", rest); sub(/^only /, "", rest)
+        m = split(rest, parts, ",")
+        for (k = 1; k <= m; k++){
+          split(parts[k], tw, " "); tbl = cleantbl(tw[1])   # first token drops a trailing cascade/restrict
+          if (tbl in wf) report(tbl, "DROP TABLE", stmt)
+        }
         return
       }
       if (stmt ~ /^alter table /){
         rest = stmt; sub(/^alter table /, "", rest); sub(/^if exists /, "", rest); sub(/^only /, "", rest)
         split(rest, w, " "); tbl = cleantbl(w[1])
         verb = ""
-        if (rest ~ /(^| )drop column /)               verb = "DROP COLUMN"
+        if (col_drop(rest))                           verb = "DROP COLUMN"
         else if (rest ~ /(^| )rename column /)         verb = "RENAME COLUMN"
         else if (rest ~ /(^| )rename to /)             verb = "RENAME TO"
         else if (rest ~ /(^| )alter column .* type /)  verb = "ALTER COLUMN ... TYPE"
