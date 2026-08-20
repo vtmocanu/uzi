@@ -15,7 +15,7 @@
     "audit": "npm audit --audit-level=high --include=dev"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "0.3.228",
+    "@anthropic-ai/claude-agent-sdk": "0.3.231",
     "agent-browser": "0.32.3",
     "tsx": "^4.19.2",
     "zod": "4.4.3"
