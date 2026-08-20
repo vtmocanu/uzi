@@ -922,6 +922,77 @@ describe("RunView report-only surfaces (issue #279)", () => {
   });
 });
 
+// PRD #377 M2: the failed card surfaces the worker-preserved diff for a GitHub run whose
+// branch touched .github/workflows/** (the bot's repo-only PAT can't push it). The block is
+// gated on run.preserved_patch on a terminal, non-completed run — the same gate as
+// failure_reason — and must read as "valid work preserved", not a crash.
+describe("RunView preserved-patch surface (PRD #377)", () => {
+  const FRAMING = "Here’s the diff to land as a human PR:";
+  const PATCH =
+    "diff --git a/.github/workflows/main-guard.yml b/.github/workflows/main-guard.yml\n" +
+    "+name: main-guard\n";
+
+  function renderPage(over: Partial<Run>) {
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: false,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    return render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+  }
+
+  it("renders the framing label and the diff on a failed run with a preserved patch", async () => {
+    const { container } = renderPage({
+      status: "failed",
+      forge_type: "github",
+      failure_reason: "Land the preserved diff as a human PR; see docs/github-bot-setup.md.",
+      preserved_patch: PATCH,
+    });
+    // The framing reads as "valid work preserved", not an error.
+    expect(await screen.findByText(FRAMING, { exact: false })).toBeTruthy();
+    // The diff renders in a monospace <pre> block, verbatim.
+    const pre = container.querySelector("pre");
+    expect(pre).not.toBeNull();
+    expect(pre?.textContent).toContain("diff --git a/.github/workflows/main-guard.yml");
+    expect(pre?.textContent).toContain("+name: main-guard");
+  });
+
+  it("does not render the diff block on a failed run without a preserved patch", async () => {
+    const { container } = renderPage({
+      status: "failed",
+      forge_type: "github",
+      failure_reason: "run timed out after 2h0m0s (RUN_TIMEOUT)",
+      preserved_patch: null,
+    });
+    // Wait for the failure card (the reason) to mount before asserting absence.
+    expect(await screen.findByText("run timed out after 2h0m0s (RUN_TIMEOUT)")).toBeTruthy();
+    expect(screen.queryByText(FRAMING, { exact: false })).toBeNull();
+    expect(container.querySelector("pre")).toBeNull();
+  });
+
+  it("does not render the diff block on a completed run even if a patch is present", async () => {
+    const { container } = renderPage({
+      status: "completed",
+      forge_type: "github",
+      branch: "agent/issue-87",
+      preserved_patch: PATCH,
+    });
+    expect(await screen.findByText("Run completed")).toBeTruthy();
+    expect(screen.queryByText(FRAMING, { exact: false })).toBeNull();
+    expect(container.querySelector("pre")).toBeNull();
+  });
+});
+
 describe("RunHeading — the forge issue title carries no format characters (#124)", () => {
   it("strips bidi/zero-width characters, and keeps the iid beside them", () => {
     const { container } = render(

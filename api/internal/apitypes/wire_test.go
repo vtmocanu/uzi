@@ -103,6 +103,10 @@ var runDTOKeys = []string{
 	// completion) and its persisted findings summary. report_only is NOT NULL so always
 	// on the wire; report_md is null unless report_only.
 	"report_only", "report_md",
+	// PRD #377 M1: the agent's diff preserved on a workflow_scope_missing failed run
+	// (the branch touched .github/workflows/** the bot PAT cannot push). Nullable, set
+	// only on that failed path, but the key is always on the wire.
+	"preserved_patch",
 	// PRD-link reconciliation (read-only): the path the run declared it archived a PRD
 	// to, and when that patch lifecycle settled (null while pending). Both always on the
 	// wire — prd_done_path null for a run that moved no PRD, prd_patch_settled_at null

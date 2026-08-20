@@ -2964,6 +2964,15 @@ type StateRequest struct {
 	// the DB, exactly as it does RateLimitType. Ordinary agent failures omit it and the
 	// server defaults them to 'agent_failure'. Ignored on every non-`failed` state.
 	FailOrigin *string `json:"fail_origin"`
+	// PreservedPatch is the agent's branch diff (PRD #377 M1), carried ONLY on a
+	// `failed` report whose fail_origin is workflow_scope_missing: the run touched
+	// .github/workflows/** which the bot's repo-only PAT cannot push, so instead of
+	// discarding the work the worker preserves the diff for a human to land. UNTRUSTED
+	// worker text — the agent may have seen repo secrets during the run — so it is
+	// control-char-stripped and length-capped server-side (clampWirePreservedPatch)
+	// before storage. Absent on every other report; a dedicated column keeps report_md's
+	// report-only semantics untouched (PRD D3).
+	PreservedPatch *string `json:"preserved_patch"`
 }
 
 // SetState applies a worker's state transition and returns the run's resulting
@@ -3079,9 +3088,10 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// compromised worker cannot smuggle a non-enum rate_limit_type past the
 			// server" would then be false on exactly the path a human reads. When the
 			// fields are absent this is nil and every other failure path is untouched.
-			FailureReason: limitAwareFailureReason(req),
-			FailOrigin:    pgText(failOrigin),
-			SessionID:     sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+			FailureReason:  limitAwareFailureReason(req),
+			FailOrigin:     pgText(failOrigin),
+			PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
+			SessionID:      sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	default:
 		return store.Run{}, false, ErrInvalidState
@@ -5059,6 +5069,29 @@ func sanitizeFailureReason(s *string) pgtype.Text {
 	}
 	clean, _ := stripNUL(*s)
 	clean = truncateRunes(clean, maxFailureReasonRunes)
+	return pgText(clean)
+}
+
+// PreservedPatchMaxBytes bounds runs.preserved_patch — the agent's branch diff carried
+// on a workflow_scope_missing `failed` report (PRD #377 M1). Generous headroom: the
+// motivating #188 workflow file was ~112 lines, but a run can touch several workflow
+// files, and this is a one-off column read on a single failed card, not an index key.
+// The agent already secret-scrubs and size-caps before sending; this is the server-side
+// bound that does not take the worker's word for the length.
+const PreservedPatchMaxBytes = 1 << 20 // 1 MiB
+
+// clampWirePreservedPatch maps the worker's preserved_patch onto the nullable
+// runs.preserved_patch column. nil/empty → NULL. Otherwise the untrusted worker text is
+// run through termsafe.SanitizeBounded, which strips NUL and every other control/bidi
+// rune (Trojan-Source defense) while SPARING \n and \t so the diff's line structure
+// survives, then applies the byte bound. A NUL would raise 22021 on this terminal
+// `failed` write exactly as it does for failure_reason (see stripNULParam); the byte cap
+// bounds a hostile or buggy worker. A value that sanitizes to empty maps to NULL.
+func clampWirePreservedPatch(s *string) pgtype.Text {
+	if s == nil {
+		return pgtype.Text{}
+	}
+	clean := termsafe.SanitizeBounded(*s, PreservedPatchMaxBytes)
 	return pgText(clean)
 }
 

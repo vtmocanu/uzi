@@ -164,7 +164,7 @@ Concretely:
 M1 is a cross-module MVP that addresses all three costs on its own. M2-M4 refine
 and validate it.
 
-- [ ] **M1 — Detect, fail with a typed reason, and preserve the diff (the MVP).**
+- [x] **M1 — Detect, fail with a typed reason, and preserve the diff (the MVP).**
   - *api (Go):* a **new** migration (number assigned at merge, above the live head)
     that `DROP CONSTRAINT ... ADD CONSTRAINT ... CHECK` widens the `fail_origin`
     set to include `workflow_scope_missing` (mirroring
@@ -180,17 +180,23 @@ and validate it.
     `workflow_scope_missing` + the composed `failure_reason` + the patch.
   - Serves every forge-pushing kind (`issue`, human-approved `ci_fix`,
     `self_improve`, `prompt`), because the failed path is not issue-gated.
-- [ ] **M2 — Web surface.** Render the preserved patch and the typed reason on the
+- [x] **M2 — Web surface.** Render the preserved patch and the typed reason on the
   **failed** card in `RunView.tsx` (the failure card already renders
   `failure_reason`; the patch needs a rendered block gated on the new field).
   Resolve D2 (keep the human message in `failure_reason` text vs. add `fail_origin`
   to `RunDTO` for a structured badge). It must read as "the agent did valid work
   uzi can't auto-land; here it is", not as a crash.
-- [ ] **M3 — Edit-time advisory (stretch).** When the agent writes a
+- [ ] **M3 — Edit-time advisory (stretch). DROPPED (not implemented).** When the agent writes a
   `.github/workflows/**` file, surface an advisory (guardrail path classifier or a
   run-feed message) so the agent knows the change cannot be auto-landed. Must not
   block the write (the diff must survive for M1's preservation).
-- [ ] **M4 — Cross-cutting validation and docs.** Deterministic tests over the
+  *Deliberately dropped this run:* the advisory would have to add a non-blocking
+  "allow-with-advice" path into `agent/src/guardrails.ts`, a load-bearing security
+  deny-hook whose contract is denial, for a marginal and inherently-partial nicety
+  (it cannot see a Bash `tee`/`sed -i` into a workflow file — see Risks). M1's
+  finalize detection already authoritatively handles all three costs, so M3's value
+  did not justify complicating the security boundary. Left for a future run if wanted.
+- [x] **M4 — Cross-cutting validation and docs.** Deterministic tests over the
   matrix that unit tests in M1 can't cover in one place: GitHub + workflow path ⇒
   blocked-and-preserved; GitLab/Forgejo or non-workflow path ⇒ normal push;
   null-diff ⇒ normal push; each forge-pushing kind; `fail_origin` round-trip; both

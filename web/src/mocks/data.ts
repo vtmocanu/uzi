@@ -3056,6 +3056,86 @@ export const mockRuns: Run[] = [
     updated_at: daysAgo(1.1),
   },
   {
+    // PRD #377 M2: a GitHub run whose branch touched .github/workflows/** — the bot's
+    // repo-only PAT can't push workflow files, so uzi fails the run early with a typed
+    // reason and PRESERVES the agent's diff (preserved_patch) for a human to land as a PR.
+    // The diff is an in-memory synthetic string, NOT a real workflow file.
+    id: "run-workflow-scope",
+    repo_id: "repo-atlas",
+    issue_iid: 9,
+    issue_title: "Add a main-branch guard workflow",
+    issue_description: "See prds/9-main-guard.md.",
+    kind: "issue",
+    title: null,
+    resume_of_run_id: null,
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
+    status: "failed",
+    requeue_count: 0,
+    iteration_count: 2,
+    auto_approve: false,
+    worker_id: "w-ci",
+    branch: "agent/issue-9",
+    model: null,
+    override_subagent_model: false,
+    forge_type: "github",
+    mr_web_url: null,
+    mr_iid: null,
+    mr_state: null,
+    failure_reason:
+      "The agent's change is valid but touches .github/workflows/main-guard.yml, which " +
+      "uzi's bot token can't push (it is scoped to `repo`, not `workflow`, by design). " +
+      "Land the preserved diff below as a human PR; see docs/github-bot-setup.md.",
+    preserved_patch:
+      "diff --git a/.github/workflows/main-guard.yml b/.github/workflows/main-guard.yml\n" +
+      "new file mode 100644\n" +
+      "index 0000000..a1b2c3d\n" +
+      "--- /dev/null\n" +
+      "+++ b/.github/workflows/main-guard.yml\n" +
+      "@@ -0,0 +1,12 @@\n" +
+      "+name: main-guard\n" +
+      "+on:\n" +
+      "+  pull_request:\n" +
+      "+    branches: [main]\n" +
+      "+jobs:\n" +
+      "+  guard:\n" +
+      "+    runs-on: ubuntu-latest\n" +
+      "+    steps:\n" +
+      "+      - uses: actions/checkout@v4\n" +
+      "+      - name: Block direct pushes\n" +
+      "+        run: ./scripts/assert-not-direct-push.sh\n",
+    stop_kind: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
+    plan_md: null,
+    repo_agents: null,
+    agent_source: null,
+    agent_exclusions: null,
+    own_agents: null,
+    milestones: null,
+    milestones_completed: null,
+    milestones_in_progress: null,
+    milestones_candidate: null,
+    budget_max_iterations: 4,
+    budget_wall_seconds: 7200,
+    anthropic_secret_id: "sec-default",
+    anthropic_secret_label: "default",
+    anthropic_select_reason: "pinned",
+    anthropic_headroom_pct: null,
+    wait_on_limit: false,
+    limit_resets_at: null,
+    retry_not_before: null,
+    limit_wait_count: 0,
+    rate_limit_type: null,
+    claimed_at: daysAgo(0.6),
+    started_at: daysAgo(0.6),
+    finished_at: daysAgo(0.55),
+    created_at: daysAgo(0.62),
+    updated_at: daysAgo(0.55),
+  },
+  {
     id: "run-cancelled",
     repo_id: "repo-atlas",
     issue_iid: 5,

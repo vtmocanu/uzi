@@ -74,6 +74,49 @@ export function failOriginForReason(rawReason: string): string | undefined {
 }
 
 /**
+ * PRD #377 M1 — compose the actionable `failure_reason` for a GitHub run whose branch
+ * touches `.github/workflows/**`, a path the bot's repo-only PAT cannot push. It names the
+ * offending path(s) and points at `docs/github-bot-setup.md`.
+ *
+ * The path LIST is truncated to fit MAX_FAILURE_REASON_LEN (showing the first paths + an
+ * "and N more" tail) — but the doc link, which lives in the fixed suffix, is NEVER cut. The
+ * truncation math is done BEFORE assembly (against the budget left after the fixed prefix +
+ * suffix), not by blindly slicing the whole string at the end. Exported for a direct
+ * truncation unit test. The caller still applies `.slice(0, MAX_FAILURE_REASON_LEN)` as a
+ * belt-and-braces net after the doc link is guaranteed to fit.
+ */
+export function composeWorkflowScopeReason(paths: string[]): string {
+  const prefix =
+    "This run's branch changes workflow files that uzi's GitHub bot token cannot push " +
+    "(its scope is exactly `repo`, without `workflow`, by design): ";
+  const suffix =
+    ". The change is valid — land it as a human PR (commit the file yourself with a " +
+    "workflow-scoped token). See docs/github-bot-setup.md. Your diff is preserved below.";
+  const budget = MAX_FAILURE_REASON_LEN - prefix.length - suffix.length;
+  let list = paths.join(", ");
+  if (list.length > budget) {
+    // Drop trailing paths (replaced by an "and N more" tail) until the list fits the
+    // budget. The doc link is in `suffix`, so it is untouched by this truncation.
+    let shown = paths.length;
+    for (; shown > 0; shown--) {
+      const more = paths.length - shown;
+      const candidate =
+        paths.slice(0, shown).join(", ") + (more > 0 ? `, and ${more} more` : "");
+      if (candidate.length <= budget) {
+        list = candidate;
+        break;
+      }
+    }
+    if (shown === 0) {
+      // Pathological: even one path overflows the budget (a single very long path). Keep a
+      // hard-truncated first entry so the fixed suffix — and its doc link — still fits.
+      list = paths[0]!.slice(0, Math.max(0, budget - 1)) + "…";
+    }
+  }
+  return prefix + list + suffix;
+}
+
+/**
  * Thrown when a SEEDED run's clone was cut from a commit that diverges from the one the
  * user planned against AND the run was created with --require-base (PRD #209 M4, Open
  * Question 3). The runner catches it on the generic failure path and reports `failed`
@@ -1226,6 +1269,56 @@ export class RunRunner {
           // reason and does NOT re-queue (unlike LimitReached/shutdown). Same terminal
           // convention the push/MR failures use.
           throw new Error(reason);
+        }
+      }
+
+      // PRD #377 M1: a GitHub run whose branch touches .github/workflows/** cannot be
+      // pushed by the bot's repo-only PAT (privcheck forbids the workflow scope by design).
+      // Detect it here, BEFORE the doomed push, and end the run in a typed `failed` outcome
+      // that preserves the agent's diff for a human to land — instead of face-planting into
+      // GitHub's opaque "without workflow scope" rejection and discarding the committed work.
+      // Serves every forge-pushing kind (the failed path is not issue-gated).
+      if (claim.repo.forge_type === "github") {
+        // Capture the narrowed bare path in a const the SAME way the push block does
+        // (barePath is an outer `let string | undefined` and TS drops the narrowing here).
+        const wfBarePath = barePath;
+        const changedForWf = await this.git.changedFiles(wfBarePath, trackingRef);
+        // D6: a null diff (diff-computation failure) fails OPEN to the normal push — do not
+        // fail a possibly-legitimate non-workflow run on an inability to compute the diff.
+        const wfHits =
+          changedForWf === null
+            ? null
+            : flagCIConfigPaths(changedForWf, [".github/workflows/**"]);
+        if (wfHits && wfHits.length > 0) {
+          // Compose an actionable, capped failure_reason that names the offending path(s)
+          // (truncating the path LIST if needed, never the doc link) and points at
+          // docs/github-bot-setup.md.
+          const reason = composeWorkflowScopeReason(wfHits);
+          // Preserve the agent's diff so a human can land it without re-deriving it from the
+          // transcript. redactText scrubs the run's secrets before it reaches the api; a null
+          // diff (best-effort failure) just omits the patch — the typed failure still lands.
+          const rawPatch = await this.git.workflowScopeDiff(wfBarePath, trackingRef);
+          const patch = rawPatch === null ? undefined : redactText(rawPatch);
+          batcher.emit({
+            kind: "status",
+            agent: "worker",
+            payload: {
+              text:
+                "branch changes .github/workflows, which the bot token cannot push; failing early and preserving the diff for a human to land",
+            },
+          });
+          runLog.info(
+            "run failed: branch touches .github/workflows which the bot PAT cannot push; preserving diff",
+            { run_id: runId, paths: wfHits },
+          );
+          await batcher.close();
+          await reportState({
+            status: "failed",
+            failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
+            fail_origin: "workflow_scope_missing",
+            preserved_patch: patch,
+          });
+          return;
         }
       }
 

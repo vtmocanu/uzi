@@ -1323,6 +1323,10 @@ UPDATE runs SET
     -- classless failure to 'agent_failure'; the limit-opt-out non-park path stamps
     -- 'rate_limited'). Never derived from failure_reason, which is never parsed.
     fail_origin        = @fail_origin,
+    -- PRD #377 M1: the agent's secret-scrubbed, size-capped branch diff, preserved on a
+    -- workflow_scope_missing failure so a human can apply the work the bot PAT could not
+    -- push. NULL on every other failed path (only that arm sends a non-nil value).
+    preserved_patch    = @preserved_patch,
     session_id         = COALESCE(sqlc.narg('session_id'), session_id),
     move_pending_since = now(),
     finished_at        = now(),
