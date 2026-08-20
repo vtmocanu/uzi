@@ -46,6 +46,7 @@ import { forgeNounLower, mrAbbrev, mrRefSymbol } from "../lib/forgeNoun";
 import { useRunStream } from "../lib/useRunStream";
 import { deriveRunUsage } from "../lib/runUsage";
 import { CIFixRunHeader } from "../components/CIFixRunHeader";
+import { RunIssueRef } from "../components/RunIssueRef";
 import { RunCredential } from "../components/RunCredential";
 import { RunPriorityBadge } from "../components/RunPriorityBadge";
 import { formatDuration } from "../components/RunEvent";
@@ -1600,7 +1601,13 @@ export function RunHeading({ run }: { run: Run }) {
   return (
     <div className="flex flex-wrap items-center gap-x-2">
       <h1 className="truncate text-xl font-semibold tracking-tight">{stripUnsafeChars(run.issue_title)}</h1>
-      {run.issue_iid != null && <span className="text-sm text-faint">#{run.issue_iid}</span>}
+      <RunIssueRef
+        issueIid={run.issue_iid}
+        issueWebUrl={run.issue_web_url}
+        kind={run.kind}
+        forgeType={run.forge_type}
+        className="text-sm text-faint"
+      />
     </div>
   );
 }

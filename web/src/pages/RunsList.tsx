@@ -22,6 +22,7 @@ import { api, ApiError, isTerminalRun, type AdminWorker, type RunListItem, type 
 import { Alert, Badge, Card, EmptyState, Input, ListSkeleton, PageHeader, SectionTitle, StatusPill, cx } from "../components/ui";
 import { ActivityIcon } from "../components/icons";
 import { MrChip } from "../components/MrChip";
+import { RunIssueRef } from "../components/RunIssueRef";
 import { mrAbbrev } from "../lib/forgeNoun";
 import { effectiveRunStatus, isStoppedRun, milestoneBadge, milestoneBadgeText, mrChipState } from "../lib/runBadge";
 import { RunPriorityBadge } from "../components/RunPriorityBadge";
@@ -268,8 +269,15 @@ function RunRow({
             <p className="mt-0.5 truncate text-xs text-muted">{stripUnsafeChars(run.summary_intent)}</p>
           )}
           <p className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint">
-            <span>
-              {run.repo_path} #{run.issue_iid}
+            <span className="inline-flex items-center gap-1">
+              {run.repo_path}{" "}
+              <RunIssueRef
+                issueIid={run.issue_iid}
+                issueWebUrl={run.issue_web_url}
+                kind={run.kind}
+                forgeType={run.forge_type}
+                inCardLink
+              />
             </span>
             {run.worker_name && <span>· {run.worker_name}</span>}
             {showOwner && run.owner_email && <span>· {run.owner_email}</span>}
