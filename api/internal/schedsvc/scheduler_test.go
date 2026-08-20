@@ -30,8 +30,12 @@ type fakeStore struct {
 	repoErr error
 	repoRow store.GetRepoForUserRow
 
-	activeIssue         bool
-	activeIssueErr      error
+	activeIssue    bool
+	activeIssueErr error
+	// activeByIssue overrides activeIssue per candidate iid (issue #416 backfill tests):
+	// when non-nil and the iid is present, HasActiveRunForIssue returns that value; else it
+	// falls back to activeIssue/activeIssueErr, so existing single-value tests are unchanged.
+	activeByIssue       map[int64]bool
 	activeSchedule      bool
 	sweepRows           []store.ListSweepCandidateIssuesRow
 	sweepLabelParam     []byte
@@ -70,7 +74,12 @@ func (f *fakeStore) CountSweepCandidateIssues(_ context.Context, arg store.Count
 	}
 	return f.sweepCount, nil
 }
-func (f *fakeStore) HasActiveRunForIssue(_ context.Context, _ store.HasActiveRunForIssueParams) (bool, error) {
+func (f *fakeStore) HasActiveRunForIssue(_ context.Context, arg store.HasActiveRunForIssueParams) (bool, error) {
+	if f.activeByIssue != nil {
+		if v, ok := f.activeByIssue[arg.IssueIid.Int64]; ok {
+			return v, nil
+		}
+	}
 	return f.activeIssue, f.activeIssueErr
 }
 func (f *fakeStore) HasActiveRunForSchedule(_ context.Context, _ pgtype.UUID) (bool, error) {
@@ -139,6 +148,21 @@ type fakeRuns struct {
 	runs      []runCall
 	prompts   []promptCall
 	err       error
+	// errByIssue overrides err per candidate iid (issue #416 backfill tests): when non-nil
+	// and the iid is present, the scheduled create seams return that error (so one candidate
+	// can be a no_prd_link skip while its neighbours start); else they fall back to err.
+	errByIssue map[int64]error
+}
+
+// effErr resolves the create-seam error for one candidate iid: a per-issue override if
+// present, otherwise the shared err. Keeps single-value tests (errByIssue nil) unchanged.
+func (f *fakeRuns) effErr(issueIID int64) error {
+	if f.errByIssue != nil {
+		if e, ok := f.errByIssue[issueIID]; ok {
+			return e
+		}
+	}
+	return f.err
 }
 
 func (f *fakeRuns) CreateRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, allowWithoutPRD bool, waitOnLimit *bool, _ *workersvc.SeededPlan) (store.Run, error) {
@@ -155,8 +179,8 @@ func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUI
 	// bucket as CreateRun so the existing wait-on-limit / path-selection count
 	// assertions still observe it, but tagged scheduled=true so a test can prove the
 	// scheduler routed here (waiver-free) rather than through CreateRun.
-	if f.err != nil {
-		return store.Run{}, f.err
+	if err := f.effErr(issueIID); err != nil {
+		return store.Run{}, err
 	}
 	f.runs = append(f.runs, runCall{userID, repoID, issueIID, allowWithoutPRD, waitOnLimit, true, model, overrideSubagentModel})
 	return store.Run{ID: uuid.New()}, nil
@@ -176,8 +200,8 @@ func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID
 	// `autopilot` bucket as CreateAutopilotRun so the existing count assertions still
 	// observe it, but it CAPTURES waitOnLimit (which CreateAutopilotRun drops) and the
 	// schedule's model (PRD #300) so a test can prove both are threaded through.
-	if f.err != nil {
-		return store.Run{}, f.err
+	if err := f.effErr(issueIID); err != nil {
+		return store.Run{}, err
 	}
 	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, allowWithoutPRD, waitOnLimit, model, overrideSubagentModel})
 	return store.Run{ID: uuid.New()}, nil
@@ -196,9 +220,14 @@ type fakeForge struct {
 	forge.Forge
 	issue forge.Issue
 	err   error
+	// getIID logs every candidate iid GetIssue was called for, in order (issue #416): the
+	// examined-count / forge-call-bound assertions read it. A candidate skipped by the
+	// active-run pre-check never reaches GetIssue, so it is absent here.
+	getIID []int64
 }
 
-func (f *fakeForge) GetIssue(context.Context, int64, int64) (forge.Issue, error) {
+func (f *fakeForge) GetIssue(_ context.Context, _ int64, iid int64) (forge.Issue, error) {
+	f.getIID = append(f.getIID, iid)
 	return f.issue, f.err
 }
 
@@ -987,8 +1016,9 @@ func TestFireSweepCapped(t *testing.T) {
 	})
 }
 
-// TestFireMatchedPerTarget pins the per-target Matched definition: sweep = candidate count,
-// issue = 1, prompt = 1.
+// TestFireMatchedPerTarget pins the per-target Matched definition: sweep = candidates
+// EXAMINED (issue #416; here all 3 start, so examined == candidate count == 3), issue = 1,
+// prompt = 1.
 func TestFireMatchedPerTarget(t *testing.T) {
 	h := newHarness()
 	issueOut, _ := h.sched.RunNow(context.Background(), h.issueSchedule())
@@ -1015,6 +1045,175 @@ func TestFireMatchedPerTarget(t *testing.T) {
 	if promptOut.Matched != 1 {
 		t.Fatalf("prompt Matched = %d, want 1", promptOut.Matched)
 	}
+}
+
+// ── Sweep backfill (issue #416) ──────────────────────────────────────────────
+
+// startedIIDs extracts the started candidate iids in order, for the oldest-eligible-first
+// assertions below.
+func startedIIDs(o FireOutcome) []int64 {
+	out := make([]int64, 0, len(o.Started))
+	for _, s := range o.Started {
+		if s.IssueIID != nil {
+			out = append(out, *s.IssueIID)
+		}
+	}
+	return out
+}
+
+func eqInt64s(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestFireSweepBackfillFillsSlotPastSkip is the flagship case: a window whose 2nd candidate
+// is a no_prd_link skip still starts max_issues runs by walking past the skip to the next
+// eligible candidate — AND stops at max_issues (the 5th, eligible, candidate is never
+// examined). The skipped candidate is still flagged, oldest-eligible ordering is preserved,
+// and Matched counts only the examined prefix (issue #416).
+func TestFireSweepBackfillFillsSlotPastSkip(t *testing.T) {
+	h := newHarness()
+	// Window the DB would return under LIMIT max_issues+backfillHeadroom, oldest-first. The
+	// fake store applies no LIMIT, so we hand it exactly the window's contents.
+	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{
+		{ForgeIssueIid: 10}, {ForgeIssueIid: 20}, {ForgeIssueIid: 30}, {ForgeIssueIid: 40}, {ForgeIssueIid: 50},
+	}
+	h.st.sweepCount = 5
+	h.runs.errByIssue = map[int64]error{20: workersvc.ErrNoPRDLink} // 20 cannot start
+	out, err := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{Int32: 3, Valid: true}))
+	if err != nil {
+		t.Fatalf("backfill fire must not error, got %v", err)
+	}
+	// Started 3: 10, 30, 40 — the slot lost to 20 is refilled by walking to 30/40, and the
+	// early break stops before 50.
+	if want := []int64{10, 30, 40}; !eqInt64s(startedIIDs(out), want) {
+		t.Fatalf("started iids = %v, want %v (oldest-eligible first, backfilled past 20, capped at 3)", startedIIDs(out), want)
+	}
+	if len(out.Skips) != 1 || out.Skips[0].Reason != SkipNoPRDLink || out.Skips[0].IssueIID == nil || *out.Skips[0].IssueIID != 20 {
+		t.Fatalf("skips = %+v, want exactly one no_prd_link skip for iid 20", out.Skips)
+	}
+	// Matched = examined prefix [10,20,30,40] = 4 (NOT 3, NOT 5): the skip is counted, 50 is not.
+	if out.Matched != 4 {
+		t.Fatalf("Matched = %d, want 4 (examined 10,20,30,40; 50 never reached)", out.Matched)
+	}
+	// 50 is never fetched: the forge is spared once the cap is filled.
+	if want := []int64{10, 20, 30, 40}; !eqInt64s(h.fb.f.getIID, want) {
+		t.Fatalf("GetIssue called for %v, want %v (50 not examined after the cap filled)", h.fb.f.getIID, want)
+	}
+	assertBalances(t, out)
+}
+
+// TestFireSweepBackfillPastAlreadyRunningAndNoPRDLink proves backfill walks past BOTH a
+// pre-check already_running skip (no forge call) and a no_prd_link skip, filling the cap
+// from the eligible candidates beyond them.
+func TestFireSweepBackfillPastAlreadyRunningAndNoPRDLink(t *testing.T) {
+	h := newHarness()
+	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{
+		{ForgeIssueIid: 10}, {ForgeIssueIid: 20}, {ForgeIssueIid: 30}, {ForgeIssueIid: 40}, {ForgeIssueIid: 50},
+	}
+	h.st.sweepCount = 5
+	h.st.activeByIssue = map[int64]bool{20: true}                   // 20 already running (pre-check skip)
+	h.runs.errByIssue = map[int64]error{30: workersvc.ErrNoPRDLink} // 30 has no PRD link
+	out, err := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{Int32: 3, Valid: true}))
+	if err != nil {
+		t.Fatalf("backfill fire must not error, got %v", err)
+	}
+	if want := []int64{10, 40, 50}; !eqInt64s(startedIIDs(out), want) {
+		t.Fatalf("started iids = %v, want %v (past already_running 20 and no_prd_link 30)", startedIIDs(out), want)
+	}
+	if len(out.Skips) != 2 {
+		t.Fatalf("skips = %+v, want two (already_running 20, no_prd_link 30)", out.Skips)
+	}
+	byIID := map[int64]SkipReason{}
+	for _, s := range out.Skips {
+		if s.IssueIID != nil {
+			byIID[*s.IssueIID] = s.Reason
+		}
+	}
+	if byIID[20] != SkipAlreadyRunning || byIID[30] != SkipNoPRDLink {
+		t.Fatalf("skip reasons = %v, want {20:already_running, 30:no_prd_link}", byIID)
+	}
+	if out.Matched != 5 {
+		t.Fatalf("Matched = %d, want 5 (examined 10,20,30,40,50)", out.Matched)
+	}
+	// 20 is skipped by the active-run pre-check WITHOUT a forge call; all others are fetched.
+	if want := []int64{10, 30, 40, 50}; !eqInt64s(h.fb.f.getIID, want) {
+		t.Fatalf("GetIssue called for %v, want %v (20 skipped pre-forge)", h.fb.f.getIID, want)
+	}
+	assertBalances(t, out)
+}
+
+// TestFireSweepBackfillScanBound: a head of all-ineligible candidates under-fills the fire
+// (starts fewer than max_issues) and the forge cost is bounded by the scan window. Two
+// fake caveats (PRD M2): the fake store applies no LIMIT, so we (a) assert the THREADED
+// limit param is max_issues+backfillHeadroom (the real truncation is covered by the live-DB
+// test), and (b) hand the fake exactly the window's worth of rows.
+func TestFireSweepBackfillScanBound(t *testing.T) {
+	const maxIssues = 3
+	window := maxIssues + backfillHeadroom
+	rows := make([]store.ListSweepCandidateIssuesRow, 0, window)
+	errs := map[int64]error{}
+	for i := 0; i < window; i++ {
+		iid := int64(100 + i)
+		rows = append(rows, store.ListSweepCandidateIssuesRow{ForgeIssueIid: iid})
+		errs[iid] = workersvc.ErrNoPRDLink // the whole window is ineligible
+	}
+	h := newHarness()
+	h.st.sweepRows = rows
+	h.st.sweepCount = int64(window + 5) // more matching issues exist beyond the window → Capped
+	h.runs.errByIssue = errs
+	out, err := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{Int32: maxIssues, Valid: true}))
+	if err != nil {
+		t.Fatalf("scan-bound fire must not error, got %v", err)
+	}
+	// The threaded LIMIT is the scan window, not the cap (the bound the live-DB test verifies
+	// truncates for real).
+	if got := h.st.sweepMaxIssuesParam; !got.Valid || got.Int32 != int32(window) {
+		t.Fatalf("threaded max_issues param = %+v, want {Int32:%d Valid:true}", got, window)
+	}
+	if len(out.Started) != 0 {
+		t.Fatalf("all-ineligible head must start nothing, got %d started", len(out.Started))
+	}
+	if len(out.Skips) != window || out.Matched != window {
+		t.Fatalf("Matched=%d skips=%d, want %d each (examined the whole window, no early break)", out.Matched, len(out.Skips), window)
+	}
+	// Forge calls are bounded by the window — the fire does not walk past it.
+	if len(h.fb.f.getIID) != window {
+		t.Fatalf("GetIssue calls = %d, want %d (bounded by the scan window)", len(h.fb.f.getIID), window)
+	}
+	if !out.Capped {
+		t.Fatalf("Capped = false, want true (more matching issues than the scan window reached)")
+	}
+	assertBalances(t, out)
+}
+
+// TestFireSweepBackfillNullCapUnchanged: a NULL cap threads NULL (unlimited, not widened),
+// has no started ceiling (no early break), and still records skips inline — it examines
+// every candidate and starts all it can, exactly as before issue #416.
+func TestFireSweepBackfillNullCapUnchanged(t *testing.T) {
+	h := newHarness()
+	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{
+		{ForgeIssueIid: 10}, {ForgeIssueIid: 20}, {ForgeIssueIid: 30},
+	}
+	h.runs.errByIssue = map[int64]error{20: workersvc.ErrNoPRDLink}
+	out, _ := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{})) // NULL cap
+	if h.st.sweepMaxIssuesParam.Valid {
+		t.Fatalf("NULL cap must thread an invalid (NULL, unlimited) param, not a widened window: got %+v", h.st.sweepMaxIssuesParam)
+	}
+	if want := []int64{10, 30}; !eqInt64s(startedIIDs(out), want) {
+		t.Fatalf("started iids = %v, want %v (all eligible started, 20 skipped)", startedIIDs(out), want)
+	}
+	if out.Matched != 3 || len(out.Skips) != 1 {
+		t.Fatalf("Matched=%d skips=%d, want 3 and 1 (examined all, no cap ceiling)", out.Matched, len(out.Skips))
+	}
+	assertBalances(t, out)
 }
 
 // ── Persisted last_fire (PRD #308 M2) ────────────────────────────────────────

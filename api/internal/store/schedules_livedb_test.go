@@ -213,6 +213,55 @@ func TestListSweepCandidateIssuesMaxIssuesLiveDB(t *testing.T) {
 	}
 }
 
+// TestListSweepCandidateIssuesScanWindowLiveDB is the mandatory live-DB coverage for the
+// issue #416 backfill scan window: fireSweep no longer passes the schedule's max_issues as
+// the LIMIT — it passes max_issues + backfillHeadroom (a wider "scan window") so the fan-out
+// can walk past skipped candidates and still start up to max_issues runs, while the LIMIT
+// keeps per-fire forge cost bounded when the backlog is large. The arithmetic that builds
+// the window lives in schedsvc and is unit-tested there (the fake store applies no LIMIT);
+// this test verifies the other half against real Postgres — that a window-sized LIMIT truly
+// TRUNCATES a backlog larger than the window to exactly the window's worth of oldest issues.
+//
+// window = 13 mirrors the enabled sweeps' shape (max_issues 3 + backfillHeadroom 10); the
+// value is a literal here on purpose, keeping the store-layer test agnostic of schedsvc's
+// package constant. It seeds MORE issues than the window (16) so truncation is observable.
+func TestListSweepCandidateIssuesScanWindowLiveDB(t *testing.T) {
+	ctx := context.Background()
+	q, _, repoID := schedFixture(ctx, t)
+
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	const window = 13 // max_issues (3) + backfillHeadroom (10) for the enabled sweeps
+	const seeded = 16 // a backlog larger than the window, so LIMIT must truncate
+	for i := 0; i < seeded; i++ {
+		mustExec(ctx, t, pool,
+			`INSERT INTO issues (repo_id, forge_issue_iid, title, state, labels, web_url, has_prd_link, forge_updated_at, synced_at)
+			 VALUES ($1, $2, 't', 'opened', '["bug"]'::jsonb, 'https://x', true, now(), now())`,
+			repoID, int64(301+i))
+	}
+
+	rows, err := q.ListSweepCandidateIssues(ctx, store.ListSweepCandidateIssuesParams{
+		RepoID: repoID, Labels: []byte(`["bug"]`), MaxIssues: pgtype.Int4{Int32: window, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("ListSweepCandidateIssues: %v", err)
+	}
+	if len(rows) != window {
+		t.Fatalf("scan-window LIMIT returned %d rows, want exactly %d (a %d-issue backlog truncated to the window)", len(rows), window, seeded)
+	}
+	// The truncation keeps the OLDEST window's worth, in ascending iid order: [301 .. 313].
+	for i, r := range rows {
+		if want := int64(301 + i); r.ForgeIssueIid != want {
+			t.Fatalf("row %d = iid %d, want %d (oldest-first, truncated at the window)", i, r.ForgeIssueIid, want)
+		}
+	}
+}
+
 // TestRunScheduleModelRoundTripLiveDB is the mandatory live-DB coverage for the PRD #300
 // per-schedule model override on run_schedules.model: a green `sqlc generate` does not
 // prove the new column round-trips through a real INSERT/UPDATE, so this exercises the
