@@ -43,6 +43,15 @@ func newMockGitHub(t *testing.T, routes map[string]http.HandlerFunc) *mockGitHub
 		})
 	}
 	for pattern, h := range routes {
+		// The GraphQL endpoint (PRD #364) is served at the absolute "/api/graphql":
+		// go-github's enterprise/httptest REST base is "<srv>/api/v3/", and GHES serves
+		// GraphQL at "<host>/api/graphql" (NOT under /api/v3), which graphqlEndpoint
+		// derives. Any "/api/…" route key is mounted absolute; every REST route key
+		// ("/user", "/repos/…", …) keeps the /api/v3 prefix.
+		if strings.HasPrefix(pattern, "/api/") {
+			mux.HandleFunc(pattern, h)
+			continue
+		}
 		mux.HandleFunc("/api/v3"+pattern, h)
 	}
 	m.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
