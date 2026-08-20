@@ -109,6 +109,10 @@ uzi logout
 uzi auth token [--with-token]
 uzi auth status
 uzi whoami
+uzi context list
+uzi context current
+uzi context use <name>
+uzi context rm <name>
 
 uzi run list
 uzi run get <run-id> [--field <name>]...

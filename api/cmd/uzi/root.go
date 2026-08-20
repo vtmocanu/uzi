@@ -204,6 +204,7 @@ func newRootCmd(env Env) *cobra.Command {
 		newLoginCmd(env, gf),
 		newLogoutCmd(env, gf),
 		newAuthCmd(env, gf),
+		newContextCmd(env, gf),
 		newWhoamiCmd(env, gf),
 		newRunCmd(env, gf),
 		newScheduleCmd(env, gf),
