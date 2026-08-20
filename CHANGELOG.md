@@ -2105,8 +2105,11 @@ yet cited — and `v*` tags are immutable here, so the identical code ships as 0
   Terminal control characters and Unicode format characters (the bidi
   overrides, zero-widths, the BOM) are now stripped at a shared render
   boundary before anything reaches stdout; `--json` output is deliberately
-  untouched, since it already escapes those bytes and stays the lossless
-  forensic channel. **The accepted cost:** a zero-width joiner is itself one
+  untouched and stays the lossless forensic channel, because its bytes go to a
+  parser rather than to a terminal. `encoding/json` escapes C0 and
+  U+2028/U+2029 only, so DEL, the C1 range and the Cf characters above (bidi
+  overrides, zero-widths, the BOM, the soft hyphen) all survive in `--json`:
+  piping it straight to a TTY is outside the guarantee. **The accepted cost:** a zero-width joiner is itself one
   of the stripped characters, so a multi-part emoji built from one (a family
   emoji) now renders as its separate members instead of the joined glyph; a
   single-codepoint emoji is unaffected (issue [#180](https://github.com/vtmocanu/uzi/pull/180)).
