@@ -94,7 +94,7 @@ export function composeWorkflowScopeReason(paths: string[]): string {
     "This run's branch changes workflow files that uzi's GitHub bot token cannot push " +
     "(its scope is exactly `repo`, without `workflow`, by design): ";
   const suffix =
-    ". The change is valid — land it as a human PR (commit the file yourself with a " +
+    ". The change is valid; land it as a human PR (commit the file yourself with a " +
     "workflow-scoped token). See docs/github-bot-setup.md. Your diff is preserved below.";
   const budget = MAX_FAILURE_REASON_LEN - prefix.length - suffix.length;
   let list = paths.join(", ");
@@ -143,7 +143,7 @@ export function composeBaseAlignConflictReason(defaultBranch: string): string {
     ") on .github/workflows files, which uzi's GitHub bot token cannot push while they " +
     "differ from the default (its scope is `repo`, without `workflow`, by design). uzi tried " +
     "to merge then rebase the current default into the branch to realign those files, but could " +
-    "not realign and safely push it, so the run failed without pushing. The work is valid — a " +
+    "not realign and safely push it, so the run failed without pushing. The work is valid; a " +
     "human can rebase and land it. See docs/github-bot-setup.md. Your diff is preserved below.";
   // Clamp the branch name (the only variable part) against the budget left after the fixed
   // prefix + suffix, so the doc link + preserved-diff pointer in `suffix` always survive.
@@ -1449,7 +1449,7 @@ export class RunRunner {
                 kind: "status",
                 agent: "worker",
                 payload: {
-                  text: "could not align the branch with the updated default branch (merge and rebase both conflicted); failing and preserving the diff for a human to land",
+                  text: "could not realign the branch with the updated default branch and safely push it (merge and rebase conflicted, or the aligned branch could not be fast-forwarded); failing and preserving the diff for a human to land",
                 },
               });
               runLog.info("run failed: finalize base-align conflict; preserving diff", {
@@ -1516,14 +1516,15 @@ export class RunRunner {
                 await fetchAndPush();
                 return false;
               } catch (e) {
-                if (!isWorkflowScopeRejection(e) && !isNonFastForwardRejection(e)) throw e;
+                const nonFf = isNonFastForwardRejection(e);
+                if (!isWorkflowScopeRejection(e) && !nonFf) throw e;
                 // Record WHICH cause fired so an operator reading logs can tell the two apart:
                 // a repeat workflow-scope rejection (the default's workflow files moved again
                 // DURING our align) versus a non-fast-forward (the rebase rewrote an
-                // already-published branch's history — a resume, or the self_improve fixed
-                // branch — that the bot cannot force-push).
+                // already-published branch's history, a resume or the self_improve fixed
+                // branch, that the bot cannot force-push).
                 runLog.info(
-                  isNonFastForwardRejection(e)
+                  nonFf
                     ? "finalize base-align: aligned push rejected non-fast-forward (rebase rewrote an already-published branch's history the bot cannot force-push); preserving diff and failing typed"
                     : "finalize base-align: aligned push STILL workflow-scope-rejected (default moved again during align); preserving diff and failing typed",
                   { run_id: runId },
