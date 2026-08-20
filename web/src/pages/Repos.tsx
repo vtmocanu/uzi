@@ -373,12 +373,20 @@ export function Repos() {
       {error && <Alert message={error} />}
       {enableViolations && (
         <Card className="border-danger/40 bg-danger/5">
-          <p className="text-sm font-medium text-danger">This repository was not enabled — the guardrail refused it:</p>
-          <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-fg">
-            {enableViolations.map((v, i) => (
-              <li key={i}>{v}</li>
-            ))}
-          </ul>
+          {/* role="alert" so the reasons are announced to assistive tech when they
+              appear; Card does not forward a role, so it sits on the wrapper (PRD #345 M3). */}
+          <div role="alert">
+            <p className="text-sm font-medium text-danger">This repository was not enabled — the guardrail refused it:</p>
+            <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-fg">
+              {enableViolations.map((v, i) => (
+                <li key={i}>{v}</li>
+              ))}
+            </ul>
+            <p className="mt-3 text-sm text-muted">
+              Fix the repository's default-branch protection on the forge so the bot cannot push or
+              merge to it directly, then click Enable again.
+            </p>
+          </div>
         </Card>
       )}
 
