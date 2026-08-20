@@ -21561,4 +21561,4 @@ the intent `SKILL.md` already documented ("how many issues one `--sweep` fire *s
   (`0 < started < max_issues`, window exhausted by ineligible candidates) is acknowledged as a v1
   limitation; a `scan_exhausted` fire-level signal to surface it is a possible follow-up, not
   shipped here. SQL-side eligibility pre-filtering and a user-configurable `backfillHeadroom` are
-  likewise out of scope. Full rationale in the Decision Log of `prds/416-sweep-backfill-skipped-slots.md`.
+  likewise out of scope. Full rationale in the Decision Log of `prds/done/416-sweep-backfill-skipped-slots.md`.

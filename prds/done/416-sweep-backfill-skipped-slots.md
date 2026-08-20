@@ -81,36 +81,36 @@ Consequences, all intended:
 ## Milestones
 
 ### M1 - Backfill logic in `fireSweep` [no deps]
-- [ ] Widen the candidate fetch to a bounded scan window (`max_issues + backfillHeadroom`) when the cap is set; unlimited when NULL.
-- [ ] Iterate oldest-first, starting runs until `max_issues` have started (early break); each non-start recorded as the same typed flagged skip as today.
-- [ ] Set `Matched = len(Started) + len(Skips)` so the invariant holds; leave the NULL-cap path behaviourally identical to today.
-- [ ] `backfillHeadroom` is a documented package constant with its cost rationale beside it.
+- [x] Widen the candidate fetch to a bounded scan window (`max_issues + backfillHeadroom`) when the cap is set; unlimited when NULL.
+- [x] Iterate oldest-first, starting runs until `max_issues` have started (early break); each non-start recorded as the same typed flagged skip as today.
+- [x] Set `Matched = len(Started) + len(Skips)` so the invariant holds; leave the NULL-cap path behaviourally identical to today.
+- [x] `backfillHeadroom` is a documented package constant with its cost rationale beside it.
 
 ### M2 - Tests [deps: M1]
-- [ ] Backfill fills the slot past a skip: window `[eligible, no_prd_link, eligible, eligible]`, `max_issues=3` starts 3, flags 1, `Matched=4`, oldest-eligible first.
-- [ ] Scan bound: a head of `> backfillHeadroom` ineligible issues starts fewer than `max_issues`, examines at most the window, and does not walk the whole backlog. Note two test-fake caveats to design around: the fake `fakeForge.GetIssue` (`scheduler_test.go:201`) takes unnamed args and counts nothing today, so it needs a call counter to assert the examined count; and the fake `ListSweepCandidateIssues` (`scheduler_test.go:60`) runs no SQL and does not apply the LIMIT, so a unit test can only assert the *threaded limit param* (`max_issues + headroom`), not that truncation happens.
-- [ ] Add one live-DB (`*LiveDB`) test that exercises the real `LIMIT max_issues + headroom` arithmetic against Postgres, since the unit fake cannot (run via `./e2e/run-store-it.sh`).
-- [ ] `already_running` and `no_prd_link` are both backfilled past.
-- [ ] NULL cap unchanged (examines all, starts all it can). `TestTickSweepThreadsMaxIssues` (`scheduler_test.go:387`) is not just a number bump: its stated purpose is that `fireSweep` passes `max_issues` *straight into* the query param, which this change inverts (it now threads `max_issues + headroom`); update the test AND its rationale comment.
-- [ ] The invariant `Matched == started + skipped` holds in every case (the existing `scheduler_test.go:588` `assertBalances` assertion stays green).
-- [ ] Deterministic only: no timing/wall-clock/sleep assertions.
+- [x] Backfill fills the slot past a skip: window `[eligible, no_prd_link, eligible, eligible]`, `max_issues=3` starts 3, flags 1, `Matched=4`, oldest-eligible first.
+- [x] Scan bound: a head of `> backfillHeadroom` ineligible issues starts fewer than `max_issues`, examines at most the window, and does not walk the whole backlog. Note two test-fake caveats to design around: the fake `fakeForge.GetIssue` (`scheduler_test.go:201`) takes unnamed args and counts nothing today, so it needs a call counter to assert the examined count; and the fake `ListSweepCandidateIssues` (`scheduler_test.go:60`) runs no SQL and does not apply the LIMIT, so a unit test can only assert the *threaded limit param* (`max_issues + headroom`), not that truncation happens.
+- [x] Add one live-DB (`*LiveDB`) test that exercises the real `LIMIT max_issues + headroom` arithmetic against Postgres, since the unit fake cannot (run via `./e2e/run-store-it.sh`).
+- [x] `already_running` and `no_prd_link` are both backfilled past.
+- [x] NULL cap unchanged (examines all, starts all it can). `TestTickSweepThreadsMaxIssues` (`scheduler_test.go:387`) is not just a number bump: its stated purpose is that `fireSweep` passes `max_issues` *straight into* the query param, which this change inverts (it now threads `max_issues + headroom`); update the test AND its rationale comment.
+- [x] The invariant `Matched == started + skipped` holds in every case (the existing `scheduler_test.go:588` `assertBalances` assertion stays green).
+- [x] Deterministic only: no timing/wall-clock/sleep assertions.
 
 ### M3 - UI + CLI display clarity [deps: M1]
 Redefining `Matched` as "examined" (may exceed `max_issues`) leaks into **four** count-display sites, all of which must be relabeled consistently (the wire field name stays `matched`; these are display strings only):
-- [ ] Web `LastFireDetail` tally: `Schedules.tsx:458` `label="matched"` to "examined".
-- [ ] Web `LastRunOutcome` collapsed "Last run" cell (always visible, no expand needed): `Schedules.tsx:369` `· matched {fire.matched}` to "examined". The two `matched 0` empty-state badges (`:412`, `:451`) describe the zero-candidate outcome and can keep their wording.
-- [ ] CLI `uzi schedule get`: `api/cmd/uzi/schedule.go:786` `fired %s · matched %d · started %d · skipped %d` to "examined".
-- [ ] CLI `uzi schedule run-now`: the `matched/skipped` tally printer around `schedule.go:825` (`Matched %d candidate(s), skipped %d:`) to "examined". The `--max-issues` flag help (`schedule.go:87`) already says "started per fire" and is correct as-is.
-- [ ] No backfill pill or per-row marker: a refilled slot is just another started run (its position past the skip is enough).
-- [ ] Update `web/src/pages/Schedules.test.tsx` for the relabels and add a case with started > 0 alongside a flagged skip; confirm the started/skip rows and the started-nothing hint still render.
+- [x] Web `LastFireDetail` tally: `Schedules.tsx:458` `label="matched"` to "examined".
+- [x] Web `LastRunOutcome` collapsed "Last run" cell (always visible, no expand needed): `Schedules.tsx:369` `· matched {fire.matched}` to "examined". The two `matched 0` empty-state badges (`:412`, `:451`) describe the zero-candidate outcome and can keep their wording.
+- [x] CLI `uzi schedule get`: `api/cmd/uzi/schedule.go:786` `fired %s · matched %d · started %d · skipped %d` to "examined".
+- [x] CLI `uzi schedule run-now`: the `matched/skipped` tally printer around `schedule.go:825` (`Matched %d candidate(s), skipped %d:`) to "examined". The `--max-issues` flag help (`schedule.go:87`) already says "started per fire" and is correct as-is.
+- [x] No backfill pill or per-row marker: a refilled slot is just another started run (its position past the skip is enough).
+- [x] Update `web/src/pages/Schedules.test.tsx` for the relabels and add a case with started > 0 alongside a flagged skip; confirm the started/skip rows and the started-nothing hint still render.
 
 ### M4 - Docs [deps: M1-M3]
-- [ ] Update the sweep-mechanics docs to state backfill and that it applies to all sweeps: `api/internal/uzicli/skill/SKILL.md` (the `--max-issues` / oldest-first / "Sweep gotcha" section around lines 380-438), `ARCHITECTURE.md`'s sweep description, and the schedule guidance text if it describes cap behaviour.
-- [ ] Note that `Matched` now means "examined" (may exceed `max_issues`) and that `Capped` now means "more than the scan window".
-- [ ] `specs/ai.md` design-decision entry for the cap-counts-started change.
+- [x] Update the sweep-mechanics docs to state backfill and that it applies to all sweeps: `api/internal/uzicli/skill/SKILL.md` (the `--max-issues` / oldest-first / "Sweep gotcha" section around lines 380-438), `ARCHITECTURE.md`'s sweep description, and the schedule guidance text if it describes cap behaviour.
+- [x] Note that `Matched` now means "examined" (may exceed `max_issues`) and that `Capped` now means "more than the scan window".
+- [x] `specs/ai.md` design-decision entry for the cap-counts-started change.
 
 ### M5 - Gate [deps: M1-M4]
-- [ ] Run the repo gate for touched components (`task gate:api`, `task gate:web`) and the live-DB store sweep for the new `*LiveDB` test.
+- [x] Run the repo gate for touched components (`task gate:api`, `task gate:web`) and the live-DB store sweep for the new `*LiveDB` test.
 
 ## Success criteria
 
