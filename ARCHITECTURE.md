@@ -1354,7 +1354,12 @@ cordon fails safe: the roll is deferred, never forced through.
 "Surge" here means the app stack surges forward on every release while old
 worker pods linger until their work is done — not overlapping worker pods.
 Workers hold RWO PVCs, so `Recreate` (not `RollingUpdate`) stays the worker roll
-strategy. The requeue-then-manual-vault-unlock fallback (a run that does get
+strategy. The rendered worker Deployment also sets `RevisionHistoryLimit: 1`
+(`RenderDeployment`, re-asserted through `patchFor`'s drift merge patch so
+long-lived workers pick it up on their next roll), deliberately bounding
+superseded-ReplicaSet retention below the k8s default of 10: an init-wedged pod
+left behind on a scaled-to-0 old RS is otherwise never garbage-collected and
+holds its tier's ResourceQuota indefinitely (issue #360). The requeue-then-manual-vault-unlock fallback (a run that does get
 rolled — past the drain deadline, on force-roll, or by an uncontrolled pod loss)
 is unchanged by this PRD. Full rationale, the Decision Log, and what remains
 open (a CLI drain verb, live-cluster validation) are in
