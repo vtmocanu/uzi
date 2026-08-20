@@ -39,7 +39,7 @@ jobs:
   kind-smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # Build the api + web images the chart runs. api context is api/ (its own
       # .dockerignore); web context is the repo ROOT so the Dockerfile can bundle

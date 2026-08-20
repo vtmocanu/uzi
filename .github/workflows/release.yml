@@ -80,7 +80,7 @@ jobs:
   assert-version:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Validate SemVer tag + Chart.yaml match
         run: |
           set -euo pipefail
@@ -112,7 +112,7 @@ jobs:
     steps:
       # Full history + tags: the script compares the release window against the
       # previous `v*` tag, and the commit count is over all of history.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -168,7 +168,7 @@ jobs:
       packages: write
       id-token: write   # cosign keyless: mint the OIDC token used to sign
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
       - uses: sigstore/cosign-installer@v3
         with:
@@ -217,7 +217,7 @@ jobs:
       packages: write
       id-token: write   # cosign keyless: mint the OIDC token used to sign
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
       - uses: sigstore/cosign-installer@v3
         with:
@@ -256,7 +256,7 @@ jobs:
       packages: write
       id-token: write   # cosign keyless: mint the OIDC token used to sign
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
       - uses: sigstore/cosign-installer@v3
         with:
@@ -302,7 +302,7 @@ jobs:
       matrix:
         template: [base, jvm]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
       - uses: sigstore/cosign-installer@v3
         with:
@@ -352,7 +352,7 @@ jobs:
       packages: write
       id-token: write   # cosign keyless: mint the OIDC token used to sign
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: azure/setup-helm@v5
         with:
           version: v3.21.3
@@ -424,7 +424,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Build release notes from the CHANGELOG section
         id: notes
         run: |
