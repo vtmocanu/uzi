@@ -3385,3 +3385,211 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
     });
   }
 });
+
+// PRD #390 M3: mid-run milestone-reporting enforcement. On a milestone-bearing run, a
+// work turn that leaves the tracker with NO milestone in progress escalates the NEXT
+// turn's prompt (progressMissedLastTurn) and, after K=2 consecutive misses, emits a
+// feed-only status. Compliant leads (an in_progress declared, even spanning turns) are
+// never nagged; checkpoint and park turns are excluded and a checkpoint re-arms.
+describe("SdkExecutor milestone-reporting enforcement (PRD #390 M3)", () => {
+  /** A submit_plan that ALSO declares a milestone breakdown, so the run is milestone-bearing. */
+  function submitPlanWithMilestones(
+    plan: string,
+    milestones: Array<{ id: string; title: string }>,
+    sessionId = "sess-1",
+  ): SDKMessage {
+    return {
+      type: "assistant",
+      session_id: sessionId,
+      message: {
+        content: [
+          { type: "tool_use", id: "t1", name: "mcp__uzi__submit_plan", input: { plan_md: plan, milestones } },
+        ],
+      },
+    } as unknown as SDKMessage;
+  }
+
+  /** An ask_user tool_use (parks the run between turns, PRD #88). */
+  function askUser(question: string, sessionId = "sess-1"): SDKMessage {
+    return {
+      type: "assistant",
+      session_id: sessionId,
+      message: {
+        content: [
+          { type: "tool_use", id: "ta", name: "mcp__uzi__ask_user", input: { questions: [{ question }] } },
+        ],
+      },
+    } as unknown as SDKMessage;
+  }
+
+  const MILESTONES = [{ id: "m1", title: "First milestone" }];
+  const ESCALATION = "Your last turn marked no milestone in progress.";
+  const ENFORCE_RE = /not marked a milestone in progress|progress may be unreported/;
+
+  /** The enforcement status lines emitted (feed-only), if any. */
+  function enforcementStatuses(emits: EmittedMessage[]): string[] {
+    return emits
+      .filter((m) => m.kind === "status" && ENFORCE_RE.test(String((m.payload as { text?: unknown }).text ?? "")))
+      .map((m) => String((m.payload as { text?: string }).text));
+  }
+
+  /** Whether a captured turn's prompt carried the escalation line. */
+  function escalated(turn: Turn): boolean {
+    return (turn.promptText ?? "").includes(ESCALATION);
+  }
+
+  it("escalates from the 2nd work turn and emits a status after K=2 misses when the lead never reports (run still completes)", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlanWithMilestones("plan", MILESTONES), resultSuccess()], // plan → milestone-bearing
+      [assistantText("work 1"), resultSuccess()], // iter 1: no report → miss 1
+      [assistantText("work 2"), resultSuccess()], // iter 2: escalated, no report → miss 2 → emit
+      [assistantText("work 3"), signalDone(), resultSuccess()], // iter 3: escalated, done
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.strictEqual(result.branch, "agent/issue-5", "the run completes normally — enforcement never fails it");
+    // turns[0] = plan, turns[1..3] = work turns. The 1st work turn is not yet escalated
+    // (no prior miss); the 2nd and 3rd carry the escalation line.
+    assert.ok(!escalated(turns[1]!), "1st work turn is not escalated");
+    assert.ok(escalated(turns[2]!), "2nd work turn is escalated after the 1st turn's miss");
+    assert.ok(escalated(turns[3]!), "3rd work turn stays escalated");
+    // Exactly one enforcement status, emitted once the streak reaches K=2.
+    assert.deepStrictEqual(
+      enforcementStatuses(probe.emits),
+      ["milestone tracker: the lead has not marked a milestone in progress for 2 turns — progress may be unreported"],
+    );
+  });
+
+  it("never nags a compliant lead that declared an in_progress milestone that spans several work turns", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlanWithMilestones("plan", MILESTONES), resultSuccess()], // plan
+      [reportProgress([], ["m1"]), resultSuccess()], // iter 1: declares m1 in progress
+      [assistantText("still on m1"), resultSuccess()], // iter 2: keeps working, no re-report
+      [assistantText("still on m1"), resultSuccess()], // iter 3: still, no re-report
+      [assistantText("done now"), signalDone(), resultSuccess()], // iter 4: done
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.strictEqual(result.branch, "agent/issue-5");
+    // The in_progress latch stays non-empty across the un-reported turns, so no turn is a
+    // miss: no prompt is escalated and no enforcement status is emitted.
+    for (const t of turns.slice(1)) {
+      assert.ok(!escalated(t), "a compliant multi-turn milestone is never escalated");
+    }
+    assert.deepStrictEqual(enforcementStatuses(probe.emits), [], "a compliant lead is never nagged");
+  });
+
+  it("a checkpoint re-arms enforcement: after a checkpoint the streak restarts and escalation only reappears after 2 fresh misses", async () => {
+    const calls: Array<{ reap: boolean; progress?: MilestoneProgress }> = [];
+    const { queryFn, turns } = fakeTurns([
+      [submitPlanWithMilestones("plan", MILESTONES), resultSuccess()], // plan
+      [assistantText("work"), resultSuccess()], // iter 1: no report → miss 1
+      [reportProgress(["m1"], []), checkpointSignal(), resultSuccess()], // iter 2: report + checkpoint → re-arm, continue
+      [assistantText("work"), resultSuccess()], // iter 3: fresh miss 1 (NOT escalated yet)
+      [assistantText("work"), resultSuccess()], // iter 4: escalated, fresh miss 2 → emit
+      [assistantText("done now"), signalDone(), resultSuccess()], // iter 5: done
+    ]);
+    const probe = makeCtx({
+      agents: [lead, coder, reviewer],
+      checkpoint: async (opts) => {
+        calls.push(opts);
+      },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.strictEqual(result.branch, "agent/issue-5");
+    // Exactly one COOPERATIVE checkpoint (reap:true) fired — the others are the
+    // iteration-boundary fallbacks (reap:false) the plain work turns produce. The
+    // cooperative one carries the PRE-clear progress the lead reported this turn.
+    const cooperative = calls.filter((c) => c.reap);
+    assert.deepStrictEqual(cooperative, [{ reap: true, progress: { completed: ["m1"], in_progress: [] } }]);
+    // turns: [0]=plan, [1]=iter1, [2]=iter2(checkpoint), [3]=iter3, [4]=iter4, [5]=iter5.
+    // The checkpoint reset the escalation flag, so the FIRST post-checkpoint work turn is
+    // NOT escalated; escalation only reappears on the 2nd post-checkpoint miss.
+    assert.ok(!escalated(turns[3]!), "the checkpoint re-armed enforcement — the first fresh turn is not escalated");
+    assert.ok(escalated(turns[4]!), "escalation reappears only after 2 fresh misses");
+    // Exactly one enforcement status, emitted on the 2nd fresh miss (not immediately after the checkpoint).
+    assert.strictEqual(enforcementStatuses(probe.emits).length, 1);
+  });
+
+  it("a park (ask_user) turn is excluded from the miss count and never triggers the status emit", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlanWithMilestones("plan", MILESTONES), resultSuccess()], // plan
+      [askUser("which config?"), resultSuccess()], // iter 1: parks — NOT a miss
+      [assistantText("work"), resultSuccess()], // (re-entered) iter 1: no report → miss 1
+      [assistantText("done now"), signalDone(), resultSuccess()], // done
+    ]);
+    let asked = 0;
+    const probe = makeCtx({
+      agents: [lead, coder, reviewer],
+      askUser: async () => {
+        asked++;
+        return { kind: "answer", answers: ["use the default"] };
+      },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.strictEqual(result.branch, "agent/issue-5");
+    assert.strictEqual(asked, 1, "the run parked once to ask the human");
+    // Only ONE real work turn missed (the park is excluded). Had the park counted, the
+    // streak would have reached 2 and emitted — so an empty enforcement list proves exclusion.
+    assert.deepStrictEqual(enforcementStatuses(probe.emits), [], "the park turn is not counted as a miss");
+  });
+
+  it("a run with no milestone breakdown never escalates and never emits an enforcement status", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()], // plan with NO milestones → not milestone-bearing
+      [assistantText("work 1"), resultSuccess()], // iter 1
+      [assistantText("work 2"), resultSuccess()], // iter 2
+      [assistantText("done now"), signalDone(), resultSuccess()], // iter 3: done
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.strictEqual(result.branch, "agent/issue-5");
+    for (const t of turns.slice(1)) {
+      assert.ok(!escalated(t), "a 0-milestone run never escalates");
+    }
+    assert.deepStrictEqual(enforcementStatuses(probe.emits), [], "a 0-milestone run emits no enforcement status");
+  });
+
+  it("a checkpoint with nothing completed drops latestProgress to undefined — never persists an empty [] (M1 invariant, executor side)", async () => {
+    // The re-arm guard's `: undefined` arm: at the checkpoint latestProgress is
+    // {completed:[], in_progress:["m1"]} (in_progress declared, NOTHING really completed),
+    // so completed.length === 0 and the guard MUST drop latestProgress to undefined rather
+    // than carry an empty {completed:[], in_progress:[]} into the next running report. That
+    // is PRD #390 M1's no-signal invariant enforced on the executor side; every other
+    // checkpoint test here reports a non-empty completed, leaving this arm unexercised.
+    const seen: Array<{ iteration: number; progress?: MilestoneProgress }> = [];
+    const { queryFn } = fakeTurns([
+      [submitPlanWithMilestones("plan", MILESTONES), resultSuccess()], // plan → milestone-bearing
+      // iter 1: mark m1 IN PROGRESS but complete nothing, then checkpoint → the guard's
+      // `: undefined` arm fires (completed is empty).
+      [reportProgress([], ["m1"]), checkpointSignal(), resultSuccess()],
+      [assistantText("done now"), signalDone(), resultSuccess()], // iter 2 (post-checkpoint): done
+    ]);
+    const probe = makeCtx({
+      agents: [lead, coder, reviewer],
+      // Record every (iteration, progress) the loop reports, mirroring how the checkpoint
+      // tests record `checkpoint` opts. The shared makeCtx mock keeps only the iteration
+      // number, so this local override is what captures the progress argument.
+      reportIteration: (iteration, progress) => {
+        seen.push({ iteration, progress });
+      },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.strictEqual(result.branch, "agent/issue-5", "the run still completes");
+    // The iteration AFTER the checkpoint must receive undefined — NOT the empty
+    // {completed:[], in_progress:[]} and NOT the pre-clear {completed:[], in_progress:["m1"]}.
+    const postCheckpoint = seen.find((s) => s.iteration === 2);
+    assert.ok(postCheckpoint, "reportIteration ran again after the checkpoint");
+    assert.strictEqual(
+      postCheckpoint!.progress,
+      undefined,
+      "the checkpoint dropped latestProgress to undefined — no empty [] is persisted from the executor side",
+    );
+  });
+});
