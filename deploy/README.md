@@ -1,16 +1,20 @@
 # Releasing and deploying uzi
 
-> **⚠ Migration note (2026-08-19).** uzi moved from GitLab + Harbor to **GitHub** on
+> **⚠ Migration note (updated 2026-08-20).** uzi moved from GitLab + Harbor to **GitHub** on
 > 2026-08-18. The release now publishes via **GitHub Actions** (`.github/workflows/release.yml`)
 > to **GHCR** (`ghcr.io/vtmocanu/uzi/…`), driven with `gh`, and its publish jobs run UNATTENDED on a
-> `v*` tag — no approval gate; access control is the `protect-release-tags` tag ruleset (see the
-> Release procedure below). **`.claude/agents/release.md`
-> is the current, authoritative release procedure — trust it and `release.yml` over any
-> GitLab/Harbor/`glab` wording still in this file.** The Release procedure section below was
-> rewritten for GitHub on 2026-08-19; the cluster-side deploy topology further down (ArgoCD, the
-> `argo-apps` GitOps repo, the registry the cluster pulls from, and the platform prerequisites)
-> has **not** been re-verified since the migration and may name retired infrastructure (Harbor,
-> GitLab CI vars, `registry.example.com`) — confirm against the live cluster before relying on it.
+> `v*` tag (no approval gate; access control is the `protect-release-tags` tag ruleset, see the
+> Release procedure below). **`.claude/agents/release.md` is the current, authoritative release
+> procedure; trust it and `release.yml` over any GitLab/`glab` wording still in this file.**
+>
+> **The registry the cluster pulls from is now GHCR, and the Harbor references below were
+> corrected on 2026-08-20** (verified live: the deployed pods run `ghcr.io/vtmocanu/uzi/*`, and
+> the ArgoCD `uzi` Application's chart source is `ghcr.io/vtmocanu/uzi` with `targetRevision: 0.*`;
+> the per-cluster values relocated into the private `argo-apps` GitOps repo). The remaining
+> cluster-topology values further down (CIDRs, Infisical folder scopes, the CNPG image, DNS) are
+> deliberate **public-repo placeholders** (`example.com`, `dev-cluster`, RFC 5737 CIDRs) and some
+> have not been re-verified since the migration; confirm against the live cluster and the private
+> `argo-apps` values before relying on them.
 
 The release + deploy runbook for uzi (PRD #52). Two deploy topologies:
 
@@ -34,15 +38,15 @@ deploys. uzi follows the Model-B release shape.
 | | compose (laptop) | k8s (dev-cluster) |
 | --- | --- | --- |
 | Brought up by | `docker compose up` | ArgoCD (auto-sync) from `argo-apps` `apps/uzi/` |
-| web / api images | built locally | `registry.example.com/uzi/{web,api}:<tag>` |
-| controller / agent images | n/a (compose runs no controller) | `.../uzi/controller:<tag>`, `.../uzi/agent-{base,jvm}:<tag>` (PRD #58 M6) |
+| web / api images | built locally | `ghcr.io/vtmocanu/uzi/{web,api}:<tag>` |
+| controller / agent images | n/a (compose runs no controller) | `ghcr.io/vtmocanu/uzi/controller:<tag>`, `ghcr.io/vtmocanu/uzi/agent-{base,jvm}:<tag>` (PRD #58 M6) |
 | Postgres | `postgres:17` container | CNPG `Cluster` (`postgres-uzi-cluster`, 1 instance, `standard`) |
 | Secrets | `./.env` | Infisical (`/uzi` folder) + CNPG-generated `-app` creds |
 | Public URL | `http://127.0.0.1:8080` | `https://uzi.example.com` (ingress-nginx, `*.example.com` wildcard TLS) |
 | Worker | `docker compose --profile agent` | laptop workers unchanged; **hosted workers ship but are OFF** — see [Hosted workers](#hosted-workers-prd-58) |
 
 The ArgoCD `Application` is **multi-source** (example-app precedent): the released
-chart from Harbor OCI + the per-cluster values from the argo-apps GitOps
+chart from the public GHCR OCI registry + the per-cluster values from the argo-apps GitOps
 repo, so operational config (`apps/uzi/values/dev-cluster.yaml` there) can change
 without cutting a new chart release — that path is proven: the M6 Infisical-scope fix
 reached the running deploy through it, with no chart release. Wiring lives in
@@ -51,7 +55,7 @@ reached the running deploy through it, with no chart release. Wiring lives in
 
 **dev-cluster auto-tracks the chart version** (changed 2026-08-11). The OCI-chart
 source's `targetRevision` is a **bounded semver range `0.*`**, not an exact pin, so
-ArgoCD resolves the newest published `0.x` chart from Harbor on each reconcile: a
+ArgoCD resolves the newest published `0.x` chart from GHCR on each reconcile: a
 `v0.Y.Z` release deploys with **no `targetRevision` bump** — step 3 below is gone
 for this cluster. The `0.*` bound keeps a future major (`1.0.0`) a deliberate human
 change, and uzi's plain `vX.Y.Z` tags carry no prereleases (a `-0` suffix in the
@@ -67,10 +71,10 @@ advisory lock).
 `chart/Chart.yaml` `version` == `appVersion` == the release git tag (`vX.Y.Z`).
 Both images follow `appVersion` (the chart leaves `api.image.tag`/`web.image.tag`
 unset), so one version is the whole release coordinate: images at
-`.../uzi/{api,web}:<version>` and the chart at
-`oci://registry.example.com/uzi/uzi:<version>`. The tag pipeline
-**asserts** `version == appVersion == tag` (`publish:assert-version`) and fails
-the whole publish stage on a mismatch — a lagging `Chart.yaml` blocks the release
+`ghcr.io/vtmocanu/uzi/{api,web}:<version>` and the chart at
+`oci://ghcr.io/vtmocanu/uzi/uzi:<version>`. The tag workflow
+**asserts** `version == appVersion == tag` (`release.yml`'s `assert-version` job) and fails
+the whole publish on a mismatch — a lagging `Chart.yaml` blocks the release
 atomically, it does not ship a half-version.
 
 ## Release procedure
@@ -85,8 +89,8 @@ the change reviewed. Step 2 (the tag) is identical either way. Both repos (`vtmo
 
 **Auto-tracking does not mean instant.** ArgoCD only notices the new chart on its next
 reconcile poll (default ~3 min) — and a **normal** refresh reuses the cached resolved
-version, so to deploy the moment the tag pipeline finishes publishing, force a **hard**
-refresh (it invalidates the manifest cache, re-resolving `0.*` against Harbor):
+version, so to deploy the moment the tag workflow finishes publishing, force a **hard**
+refresh (it invalidates the manifest cache, re-resolving `0.*` against GHCR):
 
 ```sh
 kubectl -n argocd annotate application uzi \
@@ -116,14 +120,15 @@ to cancel and no warm/cold image cache to reason about — GitHub Actions builds
    date — in the **same** commit. Then land it one of two ways:
 
    - **Direct to `main` (default).** `git checkout main && git pull --rebase`, commit the
-     bump, `git push origin main`, then **tag right away** (step 2) — do not wait for the
-     `main` pipeline to go green; the tag pipeline re-gates and publishes (see "Tag directly"
-     above), so tagging concurrently saves a full serial CI cycle. Cancel the redundant `main`
-     pipeline to free runners.
+     bump, `git push origin main`, then **wait for `main`'s `ci.yml` run to go GREEN on that
+     commit before tagging** (step 2). Unlike the old GitLab tag pipeline, `release.yml` does
+     NOT re-run the test/lint/build gate (see the note above), so the tag has no safety net and
+     tagging a red `main` publishes a broken release. `ci.yml`'s `concurrency` cancels any
+     superseded `main` run automatically, so there is nothing to cancel by hand.
    - **Via an MR (when you want it reviewed).** Open an MR, let CI go green, merge to `main`.
 
    **Re-check the CHANGELOG just before tagging, whichever way you landed it.**
-   `publish:assert-changelog` fails the publish stage if any merge since the previous tag
+   `release.yml`'s `assert-changelog` job fails the publish if any merge since the previous tag
    changed shipping code without being cited in the new version's section. Run it yourself
    first — `bash scripts/assert-changelog-covers-release.sh main` — because the failure mode
    it guards is invisible in the release commit's own diff (MR or direct): **anything that
@@ -181,7 +186,7 @@ to cancel and no warm/cold image cache to reason about — GitHub Actions builds
 **Rollback** (auto-tracking changes this — a plain git revert no longer moves the deploy):
 pin `targetRevision` in `apps/uzi/app.uzi.yaml` from `0.*` **back to the last-good exact
 version** (e.g. `0.28.0`) and push; ArgoCD re-syncs to that older, still-published chart (no
-image rebuild — old versions stay in Harbor). Because `0.*` would otherwise re-advance to the
+image rebuild; old versions stay in GHCR). Because `0.*` would otherwise re-advance to the
 bad version, resuming auto-tracking means cutting a **fix release** (`0.Y.Z+1`) first, then
 setting `targetRevision` back to `0.*`.
 
@@ -190,45 +195,43 @@ setting `targetRevision` back to `0.*`.
 These are **not** MRs to this repo — they are platform config an admin runs once
 before the first deploy. Each mirrors an existing example-app step.
 
-1. **Harbor CI credentials — protected + masked ONLY.** Enable the
-   GitLab↔Harbor integration for `vtmocanu/uzi` so tag pipelines get
-   `HARBOR_USERNAME`/`HARBOR_PASSWORD`, but mark both variables **protected +
-   masked** so they are **absent on unprotected-ref (MR) pipelines**. This is
-   Decision 2 and it is load-bearing: uzi's core loop opens **agent-authored
-   MRs** that can edit `.gitlab-ci.yml` itself, and an MR pipeline runs the MR's
-   own CI file — a push-capable Harbor credential must never be reachable from
-   one. (MR builds run cache-less + credential-less + `--no-push`; only
-   protected refs authenticate.)
+1. **GHCR publish uses the workflow's own token — no stored registry credential.**
+   `release.yml` pushes images + the OCI chart to `ghcr.io/vtmocanu/uzi/*` with the
+   run's `GITHUB_TOKEN` (`packages: write`, scoped to this repo's GHCR namespace) plus
+   GitHub OIDC for cosign keyless signing, so there is no Harbor robot, no
+   GitLab↔Harbor integration, and no `HARBOR_USERNAME`/`HARBOR_PASSWORD` to provision.
+   The credential-isolation property Decision 2 wanted still holds: PR builds run
+   `--no-push` and never touch the registry, and the push-capable token exists only on
+   the `v*`-tag run, which the tag ruleset below restricts to admins. So an
+   agent-authored PR that edits a workflow file cannot reach a push credential.
 
-2. **Protected `v*` tags — Maintainer-create-only (exclude Developers).** The
-   agent/worker PAT has **Developer** role. The one path by which an untrusted
-   actor could reach the tag-pipeline push creds is *creating a release tag*. Set
-   `v*` as protected tags with **create restricted to Maintainer+** so a
-   Developer-role token cannot cut a release tag → protected pipeline → Harbor
-   creds. Combined with `main` being protected (poisoned CI needs human review to
-   land), this closes the agent-MR loop.
+2. **Protected `v*` tags — admin-create-only (`protect-release-tags` ruleset).** The
+   agent/worker PAT lacks the `workflow` scope and cannot create a `v*` tag, and the
+   ruleset restricts `v*` tag creation to a repo admin (admin `bypass_actors`, same
+   shape as `protect-main`). Cutting a release tag — the thing that triggers the
+   unattended publish — is therefore an admin-only action; the tag push itself is the
+   authorization, and there is no approval gate anywhere. Combined with `main` being
+   protected, this closes the agent-MR loop. (Replaces the old GitLab "Maintainer-only
+   protected tags" step and the since-removed `release`-environment reviewer.)
 
-3. **Harbor robot scoped push-only on `uzi/*`.** No delete, no
-   cross-project. Contains the accepted Decision-2 residual: on a protected ref,
-   a reviewed-but-malicious Dockerfile could still read `config.json`; a
-   tightly-scoped robot bounds the blast radius to uzi's own repos.
+3. **GHCR packages are anonymous-pullable, so the cluster needs no image pull secret.**
+   The `ghcr.io/vtmocanu/uzi/*` images and chart are public. The only pull secret still
+   needed is for the CNPG Postgres image, which stays on the internal mirror (see
+   item 6). (Replaces the old push-only Harbor robot on `uzi/*`.)
 
-4. **ArgoCD Helm OCI repo credential** — **already covered, no action taken**
-   (confirmed at M6, 2026-07-16). ArgoCD repo-creds match by **URL prefix**, and
-   argo-cluster already carries `oci-helm-creds` registered at the
-   `registry.example.com` root with `type: helm` + `enableOCI: "true"`, which
-   covers `registry.example.com/uzi` — the same credential example-app
-   pulls its chart through. uzi's first sync pulled `uzi:0.2.0` with no new cred.
-   Only if that prefix cred is ever removed/narrowed would you need a per-repo
-   one: `argocd repo add registry.example.com/uzi --type helm
-   --enable-oci=true …`, or the equivalent `repo`/`repo-creds` Secret with
-   `enableOCI: "true"` + `type: helm`. Without some covering cred ArgoCD cannot
-   pull the chart.
+4. **ArgoCD Helm OCI repo for `ghcr.io` — registered WITHOUT credentials.** Because the
+   chart package is anonymous-pullable, register the `ghcr.io` Helm OCI repo on the
+   ArgoCD instance with `type: helm`, `enableOCI: true`, and **no** secret
+   (`argocd repo add ghcr.io/vtmocanu/uzi --type helm --enable-oci=true`, or the
+   equivalent `repo` Secret). This is an instance-level step, not part of this repo.
+   Without some covering repo entry ArgoCD cannot resolve the chart. (Replaces the old
+   Harbor `oci-helm-creds` prefix credential.)
 
-5. **ArgoCD git access to `vtmocanu/uzi`** (for the `$values` source): already
-   covered by the existing **`repo-creds`** group-prefix repo-creds
-   template (the same one example-app uses for its `ref: values` source). Verify, no
-   new token expected.
+5. **ArgoCD git access to the `argo-apps` GitOps repo** (for the `$values` source):
+   already covered, because the per-cluster values now live in `argo-apps` itself (the
+   uzi-side file was removed so the uzi repo could go public without exposing cluster
+   topology), and ArgoCD already reads `argo-apps` as its app-of-apps source. The uzi
+   repo is no longer an ArgoCD source at all, so no token for it is needed.
 
 6. **Infisical `/uzi` folder + an operator grant on the app-secrets project.**
    uzi's own runtime secrets live at `/uzi` in the **app-secrets** project (slug
@@ -237,9 +240,10 @@ before the first deploy. Each mirrors an existing example-app step.
    `app-secrets`/`dev`:`/sibling-app`). Populate `JWT_SECRET`, `UZI_SECRET_KEY`
    (required; the api refuses to boot without them) plus any optional
    `UZI_SEED_*` / Slack / OIDC keys the chart maps (`chart/values.yaml`
-   `api.secretEnv`). Only the **shared Harbor robot pull secret** comes from the
-   k8s-clusters project (`example-project`, envSlug `prod`, `/registry-robot`),
-   which is why `chart/values.yaml` `infisicalList` intentionally has two
+   `api.secretEnv`). With the app/worker images now anonymous-pullable from GHCR (item 3),
+   the only image pull secret still sourced from the k8s-clusters project
+   (`example-project`, envSlug `prod`, `/registry-robot`) is the one for the internal-mirror
+   CNPG Postgres image, which is why `chart/values.yaml` `infisicalList` intentionally has two
    different scopes.
 
    > **The cluster's operator identity needs membership on the `app-secrets` project.**
@@ -402,7 +406,7 @@ which takes uzi down. It fails closed, but the blast radius is the whole product
 |---|---|---|
 | `workers.enabled` | `false` | The envelope + (with the controller) the whole feature. |
 | `workers.controller.enabled` | `true` | `false` = M3's envelope-only shape: namespace/RBAC/quotas/policies with nothing running. Also turns the api's hosting switch off — the two are one flag (`uzi.apiHostingEnabled`), because hosting with no controller means users provision workers nothing ever materializes. Only `kind-smoke.yaml` sets it. |
-| `workers.image.repository` | `.../uzi` | The **prefix**; the controller appends `/agent-<template>:<tag>`. Must match CI's `HARBOR_AGENT_IMAGE_PREFIX` minus `-agent`. |
+| `workers.image.repository` | `ghcr.io/vtmocanu/uzi` | The **prefix**; the controller appends `/agent-<template>:<tag>`. Must match the prefix `release.yml` publishes the agent images under (`ghcr.io/vtmocanu/uzi/agent-base`, `.../agent-jvm`). |
 | `workers.image.tag` | `"0.48.0"` (a **concrete** pin) | **Decoupled from `Chart.AppVersion`** (PRD #422; reverses the old `""` → appVersion default). An app-only release (api/web/db/controller bump) leaves this tag alone, so it rolls **zero** worker pods. Bump it to a new concrete version to deliberately advance the worker fleet — the controller then cordons and drains each busy worker (see `workers.drainDeadline`/`workers.forceRoll` below) instead of hard-killing it. **Must be a concrete version string**: the chart wraps it in `required`, so a blank tag fails the render rather than silently reverting to appVersion — an out-of-tree per-cluster values file that relied on the old empty-tag default must now set one explicitly. See [adr/0422-decouple-worker-version.md](../adr/0422-decouple-worker-version.md). |
 | `workers.drainDeadline` | `"24h"` | How long the controller waits for a cordoned busy worker to finish its run before rolling it anyway (its run then falls back to the existing requeue path). A Go duration string (`"1h"`, `"30m"`). |
 | `workers.forceRoll` | `false` | Emergency override: rolls every drifted worker immediately, regardless of busy-ness (e.g. a CVE that cannot wait on a drain). Leave `false` in normal operation. |
