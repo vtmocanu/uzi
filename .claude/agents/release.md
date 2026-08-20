@@ -134,7 +134,9 @@ the release commit: it refreshes the Keep-a-Changelog compare-link footers (each
 links to its diff) and linkifies uzi PR/issue citations, leaving `PRD #N` and cross-repo refs (e.g.
 `k8s #119593`) plain. `release.yml`'s `assert-changelog` job runs `scripts/changelog-links.sh
 --check`, so a tag whose links are stale is rejected the same way a missing section is — run it
-locally before tagging.
+locally before tagging. One authoring rule the script cannot enforce: the Release BODY is that
+section, and GitHub autolinks a bare `#N` there to a uzi PR — so write any cross-repo reference
+BACKTICKED (`` `k8s #119593` ``), which keeps it plain in the file and unlinked in the Release.
 
 The version bump (`CHANGELOG.md` + `deploy/chart/Chart.yaml`) lands **direct-to-`main`** (the
 DEFAULT at this dev stage — an admin push bypasses branch protection, verified live 2026-08-19)

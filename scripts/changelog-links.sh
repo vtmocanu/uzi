@@ -78,8 +78,13 @@ awk '
 REPO_URL="$repo_url" perl -0777 -pe '
   my $u = $ENV{REPO_URL};
   my $link = sub { my $s = shift; $s =~ s{(?<!\[)#(\d+)\b}{[#$1]($u/pull/$1)}g; $s };
+  # Hide the `#` inside an inline code span so a `(#N)` written as code is neither
+  # linkified here (it would break the span) nor, once it reaches the Release body,
+  # autolinked by GitHub. \x01 is a sentinel that cannot occur in the source.
+  s{(`[^`\n]*`)}{ (my $c = $1) =~ s/#/\x01/g; $c }ge;
   s{\((#\d+(?:\s*,\s*#\d+)*)}{"(" . $link->($1)}ge;
   s{\b(issues?|pull\ requests?|PR)(\s+)(#\d+(?:\s*,\s*#\d+)*)}{$1 . $2 . $link->($3)}gie;
+  s/\x01/#/g;
 ' "$work/stripped.md" > "$work/linked.md"
 
 # 3. Regenerate the compare-footer block. Versions in file order (newest first);
