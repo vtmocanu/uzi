@@ -6,6 +6,9 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.48.0] - 2026-08-20
+<!-- release-title: signed container images and chart -->
+
 ### Added
 
 - **Container + chart signing (cosign keyless) and an optional signature-enforcing
@@ -2775,7 +2778,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.47.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.48.0...HEAD
+[0.48.0]: https://github.com/vtmocanu/uzi/compare/v0.47.0...v0.48.0
 [0.47.0]: https://github.com/vtmocanu/uzi/compare/v0.46.1...v0.47.0
 [0.46.1]: https://github.com/vtmocanu/uzi/compare/v0.46.0...v0.46.1
 [0.46.0]: https://github.com/vtmocanu/uzi/compare/v0.45.0...v0.46.0
