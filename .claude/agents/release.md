@@ -1,6 +1,6 @@
 ---
 name: release
-version: 5
+version: 6
 description: Runs the project's release/PR/merge workflow. Never modifies code. Reports exact errors and stops on failure.
 tools: Bash, Read, Grep, Glob, SendMessage, TaskUpdate, TaskList, TaskGet
 model: sonnet
@@ -113,10 +113,28 @@ foreground `gh run watch` just pins the turn (this is what prompted the rewrite)
 "$RUN"` all-green AND the GHCR packages carry the new tag (`gh api
 '/users/vtmocanu/packages/container/uzi%2Fapi/versions' --jq '.[].metadata.container.tags'`).
 
+**`publish-release` then creates the GitHub Release automatically.** It `needs:` every publish
+job, so it runs LAST, after the images and the chart are live, and its body is the tag's
+`## [X.Y.Z]` CHANGELOG section (the notes are only as good as that section — see the CHANGELOG
+contract below), its title `vX.Y.Z` plus the optional one-line marker. It adds NO approval of its
+own — it has no `environment: release` — so `release.yml` still gates exactly twice (image wave,
+then chart) before `brew.yml`'s separate one. Once the run is green, confirm with `gh release view
+"vX.Y.Z"` that the Release exists and is marked latest.
+
 The CHANGELOG coverage gate runs `scripts/assert-changelog-covers-release.sh`. Fold
 `[Unreleased]` into a `## [X.Y.Z] - <date>` section citing each shipping merge's issue number or
 short SHA BEFORE tagging, and run it locally against your release commit first:
 `bash scripts/assert-changelog-covers-release.sh HEAD v<prev> X.Y.Z`.
+
+**That same `## [X.Y.Z]` section becomes the GitHub Release notes, so write it for a reader.**
+Optionally give the Release a one-line title by placing an HTML marker on the line directly under
+the heading — `## [X.Y.Z] - <date>` then `<!-- release-title: readable run transcript + all-agents
+lane -->`; absent it, the Release is titled `vX.Y.Z`. Then run `bash scripts/changelog-links.sh` in
+the release commit: it refreshes the Keep-a-Changelog compare-link footers (each version heading
+links to its diff) and linkifies uzi PR/issue citations, leaving `PRD #N` and cross-repo refs (e.g.
+`k8s #119593`) plain. `release.yml`'s `assert-changelog` job runs `scripts/changelog-links.sh
+--check`, so a tag whose links are stale is rejected the same way a missing section is — run it
+locally before tagging.
 
 The version bump (`CHANGELOG.md` + `deploy/chart/Chart.yaml`) lands **direct-to-`main`** (the
 DEFAULT at this dev stage — an admin push bypasses branch protection, verified live 2026-08-19)
