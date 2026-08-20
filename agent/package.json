@@ -23,7 +23,7 @@
   "devDependencies": {
     "@types/node": "^24.13.3",
     "knip": "6.32.2",
-    "oxlint": "1.76.0",
+    "oxlint": "1.78.0",
     "typescript": "^5.7.2"
   }
 }
