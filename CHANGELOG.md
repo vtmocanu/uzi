@@ -9,7 +9,7 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 ### Added
 
 - **Container + chart signing (cosign keyless) and an optional signature-enforcing
-  admission policy (PR-LINK-PLACEHOLDER).** `release.yml` now signs every published
+  admission policy ([#414](https://github.com/vtmocanu/uzi/pull/414)).** `release.yml` now signs every published
   OCI artifact by digest with Sigstore keyless signing (the api, web, controller and
   agent images plus the Helm chart), using each release job's GitHub OIDC identity, so
   no signing key is stored. Signatures are separate `.sig` artifacts and do not change
