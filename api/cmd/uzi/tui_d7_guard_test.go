@@ -106,6 +106,10 @@ var d7UntrustedFields = []string{
 	// screenshots cannot catch a raw draw, so this guard + the hostile-OwnerEmail render
 	// test in TestTUIViewsStripControlBytesFromUntrustedText are the defence.
 	"OwnerEmail",
+	// AnthropicSecretLabel is the USER-AUTHORED token label shown in the board credential cell
+	// (boardCredSeg) and on the run-detail header's first line (detailCredTag), both via
+	// renderer.Plain (PRD #295). Same defence: this guard + the hostile-label case in the render test.
+	"AnthropicSecretLabel",
 }
 
 // d7Writers are the calls that put a string on the screen. lipgloss's Render is one:

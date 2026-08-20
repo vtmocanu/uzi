@@ -704,19 +704,27 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	const nasty = "\x1b[2J\u202E\x07\x01safe"
 	runID := "88888888-1111"
 
+	// A hostile AnthropicSecretLabel exercises the board credential cell (boardCredSeg) and the
+	// detail credential tag on the header's first line (detailCredTag), both drawn through
+	// renderer.Plain. *string, so bind a local.
+	hostileLabel := nasty
 	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
-		{RunDTO: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running", IssueTitle: nasty}},
+		{RunDTO: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running", IssueTitle: nasty, AnthropicSecretLabel: &hostileLabel}},
 	}}
 	board := tuiTestModel(t, fake, "")
 	next, _ := board.Update(boardRunsMsg{runs: fake.Runs})
+	board = next.(tuiModel)
+	// >1 token so the own board draws the credential cell (the boardCredSeg path).
+	next, _ = board.Update(secretsMsg{count: 2})
 	board = next.(tuiModel)
 	assertNoRawControls(t, "board", board.View().Content)
 
 	detail := tuiTestModel(t, fake, runID)
 	next, _ = detail.Update(detailLoadedMsg{
 		// A hostile milestone title exercises renderMilestones' crew-rail draw (D7): the
-		// in-progress id makes the row render its title through renderer.Plain.
-		run: apitypes.RunDTO{ID: runID, Status: "running", IssueTitle: nasty,
+		// in-progress id makes the row render its title through renderer.Plain. The hostile
+		// AnthropicSecretLabel exercises the detail credential tag (detailCredTag → renderer.Plain).
+		run: apitypes.RunDTO{ID: runID, Status: "running", IssueTitle: nasty, AnthropicSecretLabel: &hostileLabel,
 			Milestones:           []apitypes.Milestone{{ID: "m1", Title: nasty}},
 			MilestonesInProgress: []string{"m1"}},
 		msgs: []apitypes.MessageDTO{
@@ -745,6 +753,152 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 		t.Fatalf("the admin board is not drawing OwnerEmail, so this test is not exercising that render path\n%s", admOut)
 	}
 	assertNoRawControls(t, "admin board", admOut)
+}
+
+// The board credential cell (boardCredSeg) shows just the token LABEL, muted and WITHOUT a dot,
+// whatever the select reason (PRD #295 — the reason/mode lives on the detail and `uzi run <id>`,
+// not the board). A run with no recorded credential draws a blank cell.
+func TestTUIBoardCredentialCell(t *testing.T) {
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+	meta, personal := "meta", "personal"
+
+	// The label shows, without a ● dot, for every reason — neutral and fallback alike.
+	for _, reason := range []string{"auto", "default", "pool_stale", "best_of_pool", ""} {
+		reason := reason
+		r := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{AnthropicSecretLabel: &personal}}
+		if reason != "" {
+			r.AnthropicSelectReason = &reason
+		}
+		if s := stripANSI(m.boardCredSeg(r, nil)); !strings.Contains(s, "personal") || strings.Contains(s, "●") {
+			t.Errorf("credential cell (reason %q): want the label without a dot, got %q", reason, s)
+		}
+	}
+
+	// It is the label, not a constant.
+	if s := stripANSI(m.boardCredSeg(apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{AnthropicSecretLabel: &meta}}, nil)); !strings.Contains(s, "meta") {
+		t.Errorf("credential cell: want the meta label, got %q", s)
+	}
+
+	// No recorded credential (pre-#111 or unclaimed): a blank cell, never a guessed placeholder.
+	if s := strings.TrimSpace(stripANSI(m.boardCredSeg(apitypes.RunListItemDTO{}, nil))); s != "" {
+		t.Errorf("no-credential cell must be blank, got %q", s)
+	}
+}
+
+// → (right) on the board opens the selected run (mirroring enter); ← (left) from the run detail's
+// leftmost pane backs out to the board (mirroring esc) — the board↔detail drill in / out pair.
+func TestTUIBoardArrowNavigation(t *testing.T) {
+	runs := []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1111", Kind: "issue", Status: "running", IssueTitle: "a run"}},
+	}
+	m := tuiTestModel(t, &uzicli.FakeClient{Runs: runs}, "")
+	next, _ := m.Update(boardRunsMsg{runs: runs})
+	m = next.(tuiModel)
+
+	// → opens the selected run.
+	m = press(t, m, keyRight)
+	if m.view != viewDetail || m.detail.runID != "aaaaaaaa-1111" {
+		t.Fatalf("→ on the board should open the selected run; view=%v runID=%q", m.view, m.detail.runID)
+	}
+
+	// ← from the detail (focus opens on the rail, the leftmost pane) returns to the board.
+	m = press(t, m, keyLeft)
+	if m.view != viewBoard {
+		t.Fatalf("← from the run detail's leftmost pane should return to the board; view=%v", m.view)
+	}
+}
+
+// ← moves pane focus first (transcript → rail) and backs out only on the SECOND press, at the left
+// boundary — it must NOT exit while the transcript pane is focused.
+func TestTUIDetailLeftExitsAtBoundaryNotBefore(t *testing.T) {
+	runID := "bbbbbbbb-1111"
+	now := time.Now()
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	next, _ := m.Update(detailLoadedMsg{
+		run: apitypes.RunDTO{ID: runID, Status: "running", IssueTitle: "multi-lane"},
+		msgs: []apitypes.MessageDTO{
+			msgDTO(1, "text", "lead", "toolu_a", "impl", "hi", now),
+			msgDTO(2, "text", "coder", "toolu_b", "impl", "yo", now),
+		},
+	})
+	m = next.(tuiModel)
+	m.detail.focus = focusTranscript
+
+	// First ← focuses the rail, still inside the detail view.
+	m = press(t, m, keyLeft)
+	if m.view != viewDetail || m.detail.focus != focusRail {
+		t.Fatalf("first ← should focus the rail, not exit; view=%v focus=%d", m.view, m.detail.focus)
+	}
+	// Second ← at the rail boundary returns to the board.
+	m = press(t, m, keyLeft)
+	if m.view != viewBoard {
+		t.Fatalf("second ← at the rail boundary should return to the board; view=%v", m.view)
+	}
+}
+
+// The credential column is GATED exactly as the web RunsList (PRD #295): the own board shows it
+// only when the viewer holds more than one Anthropic token; the admin factory board always does.
+func TestTUIBoardCredentialGate(t *testing.T) {
+	meta := "meta"
+	runs := []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1111", Kind: "issue", Status: "running", IssueTitle: "cred run", AnthropicSecretLabel: &meta}},
+	}
+	fake := &uzicli.FakeClient{Runs: runs}
+	drive := func(m tuiModel, msg tea.Msg) tuiModel {
+		t.Helper()
+		next, _ := m.Update(msg)
+		return next.(tuiModel)
+	}
+
+	// Own board, ONE token → no credential column.
+	one := drive(drive(tuiTestModel(t, fake, ""), boardRunsMsg{runs: runs}), secretsMsg{count: 1})
+	if out := stripANSI(one.View().Content); strings.Contains(out, "meta") {
+		t.Errorf("own board with one token must not show the credential\n%s", out)
+	}
+
+	// Own board, TWO tokens → the credential shows.
+	two := drive(drive(tuiTestModel(t, fake, ""), boardRunsMsg{runs: runs}), secretsMsg{count: 2})
+	if out := stripANSI(two.View().Content); !strings.Contains(out, "meta") {
+		t.Errorf("own board with two tokens must show the credential\n%s", out)
+	}
+
+	// Admin factory board → always shows, without any token probe.
+	adm := press(t, tuiTestModel(t, &uzicli.FakeClient{}, ""), keyAdmin)
+	adm = drive(adm, boardRunsMsg{admin: true, runs: runs})
+	if out := stripANSI(adm.View().Content); !strings.Contains(out, "meta") {
+		t.Errorf("admin factory board must always show the credential\n%s", out)
+	}
+}
+
+// The detail header collapses to ONE row when the terminal is wide enough to hold the full title
+// beside the status/credential/transport, and stays SPLIT across two rows otherwise so a long
+// title never clips the status (PRD #325 M3). transcriptViewport counts len(detailHeaderLines),
+// so the footer accounting follows either way (#379).
+func TestTUIDetailHeaderCombinesWhenWide(t *testing.T) {
+	runID := "cccccccc-1111"
+	run := apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running", IssueTitle: "Short title"}
+	load := func(w int) tuiModel {
+		m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+		m.width = w
+		next, _ := m.Update(detailLoadedMsg{run: run,
+			msgs: []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "hi", time.Now())}})
+		return next.(tuiModel)
+	}
+
+	// Wide: one header row, carrying BOTH the title and the status word.
+	wide := load(160).detailHeaderLines()
+	if len(wide) != 1 {
+		t.Fatalf("a wide terminal should combine the header into 1 row, got %d: %q", len(wide), wide)
+	}
+	if s := stripANSI(wide[0]); !strings.Contains(s, "Short title") || !strings.Contains(s, "running") {
+		t.Errorf("the combined header row must carry both the title and the status: %q", s)
+	}
+
+	// Narrow: two header rows (the title gets its own near-full-width row and truncates instead of
+	// the status).
+	if n := len(load(60).detailHeaderLines()); n != 2 {
+		t.Errorf("a narrow terminal should split the header into 2 rows, got %d", n)
+	}
 }
 
 // D7 regression guard for the transcript's TOOL-FRAME path. buildTranscriptLines → toolFrameName

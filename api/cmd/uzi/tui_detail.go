@@ -183,6 +183,18 @@ func (d *detailState) selectedLane() (agentLane, bool) {
 	return d.lanes[d.laneIdx], true
 }
 
+// exitToBoard leaves the run detail and returns to the factory-floor board: it closes the live
+// stream, drops the detail state, and refetches the board. Shared by esc and by ← at the left
+// pane boundary so the two cannot drift.
+func (m tuiModel) exitToBoard() (tea.Model, tea.Cmd) {
+	if m.detail.stream != nil {
+		m.detail.stream.Close()
+	}
+	m.view = viewBoard
+	m.detail = detailState{}
+	return m, m.fetchRunsCmd(m.board.admin)
+}
+
 func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 	// The overlay and the steer bar get first refusal, in that order: while either is
 	// in an input/confirm mode it must swallow keys that would otherwise be pane
@@ -203,12 +215,7 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 	}
 	switch k {
 	case keyEsc:
-		if m.detail.stream != nil {
-			m.detail.stream.Close()
-		}
-		m.view = viewBoard
-		m.detail = detailState{}
-		return m, m.fetchRunsCmd(m.board.admin)
+		return m.exitToBoard()
 	case keyRefresh:
 		return m, m.loadDetailCmd(m.detail.runID)
 	case keyCollapseCrew:
@@ -225,6 +232,12 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 		m.detail.focus = 1 - m.detail.focus
 		return m, nil
 	case "h", keyLeft:
+		// ← from the transcript moves focus to the crew rail; ← again from the rail (the leftmost
+		// pane) backs out of the run and returns to the factory floor — the natural "back out" at
+		// the left boundary, the mirror of the board's → drill-in, and alongside esc.
+		if m.detail.focus == focusRail {
+			return m.exitToBoard()
+		}
 		m.detail.focus = focusRail
 		return m, nil
 	case "l", keyRight:
@@ -295,56 +308,101 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m tuiModel) renderDetail() string {
+// joinTags joins the non-empty parts with sep, so an absent tag (no credential, no transport)
+// leaves no stray separator.
+func joinTags(sep string, parts ...string) string {
+	out := ""
+	for _, p := range parts {
+		if p == "" {
+			continue
+		}
+		if out != "" {
+			out += sep
+		}
+		out += p
+	}
+	return out
+}
+
+// detailHeaderLines builds the priority header (PRD #325 M3): the breadcrumb + run id + kind, the
+// run TITLE as the bold headline, WHICH Anthropic credential the run spent (PRD #295), the run
+// status token + duration, and the transport tag ("● live"). It returns ONE line when the terminal
+// is wide enough to hold the FULL title beside all of that (title and status on the same row), and
+// otherwise stays SPLIT across two lines so a long title never clips the status — the reason the
+// header was split in the first place. Each returned line is clamped to exactly one physical row
+// (the #379 invariant); transcriptViewport uses len() of this to keep its budget in step.
+func (m tuiModel) detailHeaderLines() []string {
 	d := &m.detail
-	var sb strings.Builder
 
-	// A two-line priority header (PRD #325 M3 redesigned). Line 1 is the breadcrumb + run id +
-	// kind, with the transport tag pinned RIGHT; line 2 is the run TITLE as the bold headline
-	// with the status token + duration pinned right. Splitting them fixes the baseline clip
-	// where "● live" collapsed to "● …" behind a long title — "live" now has reserved space on
-	// its own line and is never the field that truncates. Both lines are clamped to exactly ONE
-	// physical row: a wrap would make transcriptViewport under-count and push the footer off the
-	// bottom (the #379 invariant this view protects).
-	line1 := m.pal.faint.Render("‹ floor") + m.pal.faint.Render("   run ") + m.pal.title.Render(shortRunID(d.runID))
+	crumb := m.pal.faint.Render("‹ floor") + m.pal.faint.Render("   run ") + m.pal.title.Render(shortRunID(d.runID))
 	if d.run.ID != "" && d.run.Kind != "" {
-		line1 += m.pal.faint.Render(" · " + m.renderer.Plain(d.run.Kind, 12))
+		crumb += m.pal.faint.Render(" · " + m.renderer.Plain(d.run.Kind, 12))
 	}
-	// The healthy/transient transport state folds into the header (see transportHeaderTag) so it
-	// does not cost its own row; a degradation gets a full line below instead.
-	if tag := m.transportHeaderTag(); tag != "" {
-		line1 = padVisual(line1, m.width-visualWidth(tag)-1) + tag
-	}
-	sb.WriteString(clampVisual(line1, m.width) + "\n")
 
+	// The credential label (PRD #295, label only — reason/mode lives on `uzi run <id>`) and the
+	// healthy/transient transport tag; a transport DEGRADATION still takes its own line below.
+	credTag := m.detailCredTag()
+	transportTag := m.transportHeaderTag()
+	// The status token (glyph + human word, its state colour; the glyph is the NO_COLOR twin) plus
+	// elapsed time — a live run's runtime or a terminal run's total wall time.
+	statusTag := ""
+	if d.run.ID != "" {
+		tok := m.pal.stateToken(d.run.Status, d.run.Health, d.run.IsPlanning)
+		statusTag = lipgloss.NewStyle().Foreground(tok.color).Render(tok.glyph + " " + tok.word)
+		if dur := runDuration(d.run, time.Now()); dur != "" {
+			statusTag += m.pal.faint.Render(" · " + dur)
+		}
+	}
+
+	sep := m.pal.faint.Render("   ")
+	combinedRight := joinTags(sep, statusTag, credTag, transportTag) // one-line: status, credential, transport
+	title := m.renderer.Plain(runTitle(d.run), 80)                   // plain, capped at the 80-rune upper bound
+	titleW := visualWidth(title)
+
+	// Combine only when the FULL title fits on one row beside the crumb and the combined right
+	// block (3 = the "   " gap after the crumb; 1 = the trailing gap padVisual reserves). Below
+	// that, splitting gives the title its own near-full-width row so it truncates instead of the
+	// status — the field that must never be the one cut (padVisual never truncates).
+	if d.run.ID != "" && titleW > 0 && m.width-visualWidth(crumb)-3-visualWidth(combinedRight)-1 >= titleW {
+		left := crumb + sep + lipgloss.NewStyle().Bold(true).Render(title)
+		if combinedRight != "" {
+			left = padVisual(left, m.width-visualWidth(combinedRight)-1) + combinedRight
+		}
+		return []string{clampVisual(left, m.width)}
+	}
+
+	// Split. Line 1: crumb + credential/transport pinned right.
+	line1 := crumb
+	if r := joinTags(sep, credTag, transportTag); r != "" {
+		line1 = padVisual(crumb, m.width-visualWidth(r)-1) + r
+	}
+	// Line 2: the title (truncating with …) + the status pinned right, so the status renders in
+	// full. 4 = the 3-col "   " prefix + a 1-col gap; 80 stays the upper-bound rune cap.
 	line2 := ""
 	if d.run.ID != "" {
-		// The status token (glyph + human word, its state colour). "stalled"/"looping"/"slow"
-		// health surfaces here as ▲ + the word — the glyph is the NO_COLOR twin, so no health
-		// state is lost when colour is stripped.
-		tok := m.pal.stateToken(d.run.Status, d.run.Health, d.run.IsPlanning)
-		right := lipgloss.NewStyle().Foreground(tok.color).Render(tok.glyph + " " + tok.word)
-		// Elapsed time: how long a live run has been going, or a terminal run's total wall time.
-		if dur := runDuration(d.run, time.Now()); dur != "" {
-			right += m.pal.faint.Render(" · " + dur)
-		}
-		// Cap the TITLE to what is left after `right`, exactly as the board sizes its title column:
-		// padVisual never truncates, so a long title would otherwise fill the left and the final
-		// clampVisual would cut `right` (the status word + duration) off the end — at a narrow width
-		// the status word vanished entirely. Capping the title makes it the field that truncates
-		// with … instead, so `right` always renders in full. 4 = the 3-col "   " prefix + a 1-col
-		// gap; 80 stays the upper-bound rune cap.
-		titleCap := m.width - visualWidth(right) - 4
+		titleCap := m.width - visualWidth(statusTag) - 4
 		if titleCap < 10 {
 			titleCap = 10
 		}
 		if titleCap > 80 {
 			titleCap = 80
 		}
-		title := lipgloss.NewStyle().Bold(true).Render(clampVisual(m.renderer.Plain(runTitle(d.run), titleCap), titleCap))
-		line2 = padVisual("   "+title, m.width-visualWidth(right)-1) + right
+		bt := lipgloss.NewStyle().Bold(true).Render(clampVisual(m.renderer.Plain(runTitle(d.run), titleCap), titleCap))
+		line2 = padVisual("   "+bt, m.width-visualWidth(statusTag)-1) + statusTag
 	}
-	sb.WriteString(clampVisual(line2, m.width) + "\n")
+	return []string{clampVisual(line1, m.width), clampVisual(line2, m.width)}
+}
+
+func (m tuiModel) renderDetail() string {
+	d := &m.detail
+	var sb strings.Builder
+
+	// The priority header (PRD #325 M3), rendered as ONE or TWO physical rows depending on width
+	// (see detailHeaderLines). Each row is clamped to exactly one physical line: a wrap would make
+	// transcriptViewport under-count and push the footer off the bottom (the #379 invariant).
+	for _, hl := range m.detailHeaderLines() {
+		sb.WriteString(hl + "\n")
+	}
 
 	// The park line (PRD #35). The status word alone is already in the header, and it
 	// is not enough: "limit_wait" tells a user their run stopped and nothing about
@@ -401,6 +459,20 @@ func (m tuiModel) renderDetail() string {
 		sb.WriteString(clampVisual(m.detailFooter(), m.width)) // one physical row on a narrow terminal
 	}
 	return sb.String()
+}
+
+// detailCredTag renders WHICH Anthropic credential this run spent as a compact, muted LABEL for
+// the right of the header's first line (PRD #295), before the transport tag. Label only — no dot,
+// no reason/mode — matching the quiet board column; the full "label — mode, N% headroom" lives on
+// `uzi run <id>`. Empty when no credential was recorded (a run claimed before PRD #111 M1, or one
+// not yet claimed). The label is USER-AUTHORED and drawn through renderer.Plain (D7);
+// AnthropicSecretLabel is in d7UntrustedFields.
+func (m tuiModel) detailCredTag() string {
+	r := m.detail.run
+	if r.AnthropicSecretLabel == nil || *r.AnthropicSecretLabel == "" {
+		return ""
+	}
+	return m.pal.faint.Render(m.renderer.Plain(strOr(r.AnthropicSecretLabel, ""), 24))
 }
 
 // transportHeaderTag is the compact connection tag folded into the header for the healthy
@@ -1023,7 +1095,8 @@ func resultIsError(payload json.RawMessage) bool {
 // The budget is the terminal height minus every OTHER row the detail view draws, so the
 // two-pane body fills the screen down to the footer (issue #379) rather than stopping at the
 // last line of content and leaving a tall terminal with dead space below the footer. It
-// counts the SAME chrome renderDetail emits — header, optional park line, an optional degraded
+// counts the SAME chrome renderDetail emits — header (1 or 2 rows, detailHeaderLines), optional
+// park line, an optional degraded
 // transport line (a healthy "live"/"connecting…" folds into the header), the blank separator,
 // the pane title row, an optional attention banner, an optional steer bar, and the footer — so
 // this and the render cannot disagree; both the window render and the scroll clamp read it.
@@ -1035,7 +1108,7 @@ func (m tuiModel) transcriptViewport() int {
 		}
 		return strings.Count(s, "\n") + 1
 	}
-	chrome := 2 // the two-line priority header (breadcrumb/id + title/status)
+	chrome := len(m.detailHeaderLines()) // the priority header: 1 or 2 rows depending on width (detailHeaderLines)
 	if limitWaitLine(m.detail.run, time.Now()) != "" {
 		chrome++ // the park / limit-wait line
 	}
