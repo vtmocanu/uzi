@@ -124,20 +124,27 @@ export function composeWorkflowScopeReason(paths: string[]): string {
  * current default into the branch BOTH conflicted. The run fails without pushing and the
  * agent's diff is preserved (#377's `preserved_patch`) for a human to rebase-and-land.
  *
- * Names the default branch and points at docs/github-bot-setup.md, kept under
- * MAX_FAILURE_REASON_LEN (the default branch name is clamped so the doc link always fits).
- * Exported for a direct length-cap unit test.
+ * Names the default branch once and points at docs/github-bot-setup.md. The branch name is
+ * the only variable part and is clamped against a computed budget (MAX_FAILURE_REASON_LEN
+ * minus the fixed prefix + suffix lengths), so the fixed suffix — the doc link and the
+ * "Your diff is preserved below." pointer — always fits MAX_FAILURE_REASON_LEN and is never
+ * truncated. Exported for a direct length-cap unit test.
  */
 export function composeBaseAlignConflictReason(defaultBranch: string): string {
-  const db = (defaultBranch || "the default branch").slice(0, 64);
-  const reason =
-    `This run's branch is behind the default branch (${db}) on .github/workflows files, ` +
-    "which uzi's GitHub bot token cannot push while they differ from the default (its scope " +
-    "is exactly `repo`, without `workflow`, by design). uzi tried to merge and then rebase the " +
-    `current ${db} into the branch to realign those files, but both conflicted, so the run ` +
-    "failed without pushing. The work is valid — a human can rebase and land it. " +
-    "See docs/github-bot-setup.md. Your diff is preserved below.";
-  return reason.slice(0, MAX_FAILURE_REASON_LEN);
+  const db = defaultBranch || "the default branch";
+  const prefix = "This run's branch is behind the default branch (";
+  const suffix =
+    ") on .github/workflows files, which uzi's GitHub bot token cannot push while they " +
+    "differ from the default (its scope is `repo`, without `workflow`, by design). uzi tried " +
+    "to merge then rebase the current default into the branch to realign those files, but could " +
+    "not realign and safely push it, so the run failed without pushing. The work is valid — a " +
+    "human can rebase and land it. See docs/github-bot-setup.md. Your diff is preserved below.";
+  // Clamp the branch name (the only variable part) against the budget left after the fixed
+  // prefix + suffix, so the doc link + preserved-diff pointer in `suffix` always survive.
+  const budget = MAX_FAILURE_REASON_LEN - prefix.length - suffix.length;
+  const branch = db.length > budget ? db.slice(0, Math.max(0, budget - 1)) + "…" : db;
+  // Belt-and-braces final net, mirroring composeWorkflowScopeReason's caller.
+  return (prefix + branch + suffix).slice(0, MAX_FAILURE_REASON_LEN);
 }
 
 /**

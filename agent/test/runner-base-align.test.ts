@@ -372,7 +372,7 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
 });
 
 describe("composeBaseAlignConflictReason", () => {
-  it("stays within the failure_reason cap and keeps the doc link, even for a long branch name", () => {
+  it("keeps the doc link and preserved-diff pointer within the cap, even for a long branch name", () => {
     const short = composeBaseAlignConflictReason("main");
     assert.ok(short.length <= 512, `reason must be capped at 512 (got ${short.length})`);
     assert.match(short, /docs\/github-bot-setup\.md/);
@@ -381,5 +381,16 @@ describe("composeBaseAlignConflictReason", () => {
 
     const long = composeBaseAlignConflictReason("x".repeat(300));
     assert.ok(long.length <= 512, `reason must be capped at 512 (got ${long.length})`);
+    assert.match(long, /docs\/github-bot-setup\.md/, "doc link survives a long branch name");
+    assert.match(long, /Your diff is preserved below\./, "preserved-diff pointer survives a long branch name");
+    assert.match(long, /\.github\/workflows/);
+
+    // The issue's measured regression: a 64-char branch name pushed the assembled reason to
+    // 599 chars, so a blind slice(0, 512) dropped the doc link and preserved pointer.
+    const sixtyFour = composeBaseAlignConflictReason("a".repeat(64));
+    assert.ok(sixtyFour.length <= 512, `reason must be capped at 512 (got ${sixtyFour.length})`);
+    assert.match(sixtyFour, /docs\/github-bot-setup\.md/, "doc link survives a 64-char branch name");
+    assert.match(sixtyFour, /Your diff is preserved below\./, "preserved-diff pointer survives a 64-char branch name");
+    assert.match(sixtyFour, /\.github\/workflows/);
   });
 });
