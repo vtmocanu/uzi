@@ -137,6 +137,20 @@ export const REPO_SUBAGENT_UNTRUSTED_APPEND = [
   "review. You remain responsible for the correctness and safety of what you commit.",
 ].join("\n");
 
+/**
+ * PRD #457: a short, capability-framed nudge making the incidental-findings tool
+ * discoverable. The tool's own schema description carries the quality bar (real
+ * off-task bugs only, don't stop your task), so this must NOT restate it. Shared
+ * verbatim by the lead system prompt (buildLeadSystemPrompt) and every subagent
+ * prompt (toDefinition in agents.ts), so there is one source of wording.
+ */
+export const FINDINGS_NUDGE_APPEND = [
+  "If while working your task you notice a real, actionable bug **outside** your",
+  "current task, call `mcp__findings__report_incidental_issue` to record it and keep",
+  "working — don't fix it and don't stop your task. Off-task bugs only; when in doubt,",
+  "keep working.",
+].join("\n");
+
 /** SDK `systemPrompt` shape: the claude_code preset plus an appended string. */
 export interface LeadSystemPrompt {
   type: "preset";
@@ -179,6 +193,11 @@ export function buildLeadSystemPrompt(
   const body = templateBody?.trim();
   const parts = [LEAD_GUARDRAIL_APPEND];
   if (body && body.length > 0) parts.unshift(body);
+  // PRD #457: the findings nudge is unconditional across run kinds — the findings
+  // server is mounted on every run lane. Placed here, after LEAD_GUARDRAIL_APPEND
+  // and before every conditional append, so it never sits inside the untrusted-repo
+  // fence (repoInstructions is pushed last).
+  parts.push(FINDINGS_NUDGE_APPEND);
   if ((opts.kind ?? "issue") === "issue") parts.push(PRD_LIFECYCLE_APPEND);
   if (opts.repoSourced) parts.push(REPO_SUBAGENT_UNTRUSTED_APPEND);
   // PRD #246: the nonce-fenced UNTRUSTED/ADVISORY repo instructions go LAST, so no

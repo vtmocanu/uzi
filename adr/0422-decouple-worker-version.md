@@ -3,7 +3,7 @@
 **Status**: Accepted (PRD #422 M1–M6 merged; M8 CLI verb and M9 live-cluster validation are open — see "Maintainer hand-off / follow-ups")
 **Date**: 2026-08-20
 **Deciders**: Vlad Mocanu + agent team (PRD #422 Decision Log)
-**PRD**: [prds/422-surge-upgrade.md](../prds/422-surge-upgrade.md) — the PRD carries the full Decision Log, milestone tests, and the offline/live-infra split; this ADR carries the durable design shape and its rationale.
+**PRD**: [prds/done/422-surge-upgrade.md](../prds/done/422-surge-upgrade.md) — the PRD carries the full Decision Log, milestone tests, and the offline/live-infra split; this ADR carries the durable design shape and its rationale.
 
 ## Decision (summary)
 

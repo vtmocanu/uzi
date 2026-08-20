@@ -714,13 +714,15 @@ func (m tuiModel) laneRow(l agentLane, selected bool, st crewState, suffix strin
 // cap the UNTRUSTED title itself (D7), so it caps at the width the rail can actually show.
 const milestoneTitleCap = 22
 
-// milestoneProgress folds a run's frozen milestone list into (done, total, reported) — the
-// TUI twin of the web's milestoneBadge, shared by the crew-rail block and the board badge so
-// the two surfaces cannot disagree. `done` counts frozen MEMBERS present in the completed
-// set (immune to a duplicate id and to a completed id naming a milestone dropped after it
-// was ticked). `reported` is whether ANY completion was ever reported: a nil completed slice
-// (JSON null) means never, so an unreported run reads `–/N` rather than a `0/N` that looks
-// like failure. total is 0 for a run with no frozen list — the caller renders nothing.
+// milestoneProgress folds a run's frozen milestone list into (done, total, reported), shared by
+// the crew-rail block and the board badge so their COUNTS cannot disagree. `done` counts frozen
+// MEMBERS present in the completed set (immune to a duplicate id and to a completed id naming a
+// milestone dropped after it was ticked). `reported` is whether ANY completion was ever reported:
+// a nil completed slice (JSON null) means never. The crew rail and the board's text fallback use
+// it to read `–/N` rather than a `0/N` that looks like failure; the board's own micro-bar instead
+// draws an all-empty ▱ bar for an unreported run (see milestoneMarker), trading the never/zero
+// distinction for an at-a-glance bar. total is 0 for a run with no frozen list — caller renders
+// nothing.
 func milestoneProgress(run apitypes.RunDTO) (done, total int, reported bool) {
 	total = len(run.Milestones)
 	if total == 0 {
