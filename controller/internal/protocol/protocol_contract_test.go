@@ -58,6 +58,17 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 	if *pending.JoinToken != "uzw_EXAMPLE-NOT-A-REAL-TOKEN" {
 		t.Fatalf("join_token = %q", *pending.JoinToken)
 	}
+	// Busy/draining are distinct booleans (PRD #422 M3) and must round-trip to their
+	// own fields: the golden's first worker is busy but not draining. Asserting both
+	// (not just !Draining) fails a swapped/dropped json tag — a Busy field tagged
+	// json:"draining" would parse this worker's busy=true into Draining and satisfy
+	// DisallowUnknownFields, so only pinning the value catches it.
+	if !pending.Busy {
+		t.Fatal("busy must parse as true for the golden's first worker (the busy one)")
+	}
+	if pending.Draining {
+		t.Fatal("draining must parse as false for the golden's first worker (not cordoned)")
+	}
 
 	// A worker needing no Secret written: null token, still fully desired state. The
 	// nil is load-bearing — it means "write nothing", not "this worker has no token"
@@ -71,6 +82,14 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 	}
 	if noToken.Docker {
 		t.Fatal("docker must parse as false for the golden's second worker (the plain one)")
+	}
+	// The mirror of the first worker: this one is draining but not busy, so the two
+	// assertions together fail either a swapped tag or a field collapse.
+	if noToken.Busy {
+		t.Fatal("busy must parse as false for the golden's second worker (idle)")
+	}
+	if !noToken.Draining {
+		t.Fatal("draining must parse as true for the golden's second worker (cordoned)")
 	}
 }
 
