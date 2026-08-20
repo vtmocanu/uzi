@@ -385,6 +385,7 @@ tasks:
       # does not run tsc.
       - task: deadcode:web
       - task: check-docs:web
+      - task: check-changelog:web
       - task: check-styles:web
       - task: typecheck:web
       - task: test:web
@@ -1589,6 +1590,12 @@ tasks:
     dir: web
     cmds:
       - npm run check-docs
+
+  check-changelog:web:
+    desc: assert the newest released CHANGELOG section matches Chart.yaml version
+    dir: web
+    cmds:
+      - npm run check-changelog
 
   check-styles:web:
     desc: fail on Tailwind classes whose stem is not in tailwind.config.js
