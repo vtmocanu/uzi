@@ -221,7 +221,8 @@ func writeProjectSyncError(w http.ResponseWriter, op string, err error) {
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		httpx.Error(w, http.StatusNotFound, "repo not found")
-	case errors.Is(err, forgesvc.ErrProjectSyncDisabled):
+	case errors.Is(err, forgesvc.ErrProjectSyncDisabled),
+		errors.Is(err, forgesvc.ErrProjectSyncAlreadyLinked):
 		httpx.Error(w, http.StatusConflict, err.Error())
 	case errors.Is(err, forgesvc.ErrProjectSyncNotGitHub),
 		errors.Is(err, forgesvc.ErrProjectSyncUnsupported),

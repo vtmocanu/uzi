@@ -593,7 +593,8 @@ func TestProvisionCreatesBoardAndSeeds(t *testing.T) {
 		{ID: "opt_hr", Name: "Human Review"},
 	})
 	st := &fakeProjectStore{
-		repo: githubRepoRow(repoID),
+		repo:    githubRepoRow(repoID),
+		linkErr: pgx.ErrNoRows, // no existing link → provision proceeds
 		columns: []store.BoardColumn{
 			{LabelName: "In Progress", Position: 1},
 			{LabelName: "Human Review", Position: 2},
@@ -681,6 +682,7 @@ func TestProvisionCustomTitle(t *testing.T) {
 	syncer := provisionSyncer("PVTSSF_NEW", []forge.ProjectV2Option{{ID: "opt_ip", Name: "In Progress"}})
 	st := &fakeProjectStore{
 		repo:    githubRepoRow(repoID),
+		linkErr: pgx.ErrNoRows,
 		columns: []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
 	}
 	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
@@ -704,7 +706,7 @@ func TestProvisionColorsCycle(t *testing.T) {
 		created = append(created, forge.ProjectV2Option{ID: "o" + name, Name: name})
 	}
 	syncer := provisionSyncer("PVTSSF_NEW", created)
-	st := &fakeProjectStore{repo: githubRepoRow(repoID), columns: columns}
+	st := &fakeProjectStore{repo: githubRepoRow(repoID), linkErr: pgx.ErrNoRows, columns: columns}
 	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
 	if err := svc.Provision(context.Background(), repoID, forge.OwnerUser, ""); err != nil {
 		t.Fatalf("Provision: %v", err)
@@ -770,7 +772,7 @@ func TestProvisionCreateErrorStamps(t *testing.T) {
 	repoID := uuid.New()
 	syncer := provisionSyncer("f", nil)
 	syncer.createProjectErr = errors.New("graphql boom")
-	st := &fakeProjectStore{repo: githubRepoRow(repoID), columns: []store.BoardColumn{{LabelName: "In Progress"}}}
+	st := &fakeProjectStore{repo: githubRepoRow(repoID), linkErr: pgx.ErrNoRows, columns: []store.BoardColumn{{LabelName: "In Progress"}}}
 	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
 	err := svc.Provision(context.Background(), repoID, forge.OwnerUser, "")
 	if err == nil {
@@ -781,6 +783,29 @@ func TestProvisionCreateErrorStamps(t *testing.T) {
 	}
 	if len(st.linkErrs) != 1 {
 		t.Errorf("want last_error stamped once, got %v", st.linkErrs)
+	}
+}
+
+// TestProvisionRefusesWhenAlreadyLinked: Provision creates a NEW board, so it must
+// refuse (not orphan the prior one) when a link row already exists — the guard against
+// duplicate GitHub projects an admin double-submit would otherwise create.
+func TestProvisionRefusesWhenAlreadyLinked(t *testing.T) {
+	repoID := uuid.New()
+	syncer := provisionSyncer("PVTSSF_NEW", []forge.ProjectV2Option{{ID: "opt_ip", Name: "In Progress"}})
+	st := &fakeProjectStore{
+		repo:    githubRepoRow(repoID),
+		link:    store.GithubProjectLink{RepoID: repoID, ProjectNodeID: "PVT_existing"}, // linkErr nil → a row exists
+		columns: []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	if err := svc.Provision(context.Background(), repoID, forge.OwnerUser, ""); !errors.Is(err, ErrProjectSyncAlreadyLinked) {
+		t.Fatalf("want ErrProjectSyncAlreadyLinked, got %v", err)
+	}
+	if len(syncer.createProjectCalls) != 0 {
+		t.Errorf("must not create a board when a link already exists, got %d", len(syncer.createProjectCalls))
+	}
+	if len(st.links) != 0 {
+		t.Errorf("must not repoint the link, got %d upserts", len(st.links))
 	}
 }
 

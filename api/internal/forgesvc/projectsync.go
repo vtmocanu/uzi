@@ -51,6 +51,11 @@ var (
 	// ErrProjectSyncMissingScope is a connection PAT that can be introspected and is
 	// missing the `project` scope the Projects v2 mutations require.
 	ErrProjectSyncMissingScope = errors.New("connection token is missing the required 'project' scope for project sync")
+	// ErrProjectSyncAlreadyLinked is a Provision against a repo that already has a link
+	// row (adopted or previously provisioned). Provision CREATES a new board, so it
+	// must refuse rather than orphan the existing one — Disable never deletes a board,
+	// so a silent re-provision would leak GitHub projects. Disable first, then re-provision.
+	ErrProjectSyncAlreadyLinked = errors.New("this repo already has a linked project; disable sync before provisioning a new one")
 )
 
 // ProjectSyncStore is the subset of store methods the provisioning service needs.
@@ -238,6 +243,16 @@ func (s *ProjectSyncService) Provision(ctx context.Context, repoID uuid.UUID, ow
 	repo, syncer, err := s.projectSyncPreamble(ctx, repoID)
 	if err != nil {
 		return err
+	}
+
+	// Refuse to provision over an existing link. Provision CREATES a fresh board;
+	// re-running it would build a duplicate and abandon the prior one (Disable never
+	// deletes a board, so orphans would accumulate). Adopt is the idempotent path; a
+	// deliberate re-provision requires Disable first.
+	if _, lerr := s.store.GetGithubProjectLinkByRepo(ctx, repoID); lerr == nil {
+		return ErrProjectSyncAlreadyLinked
+	} else if !errors.Is(lerr, pgx.ErrNoRows) {
+		return fmt.Errorf("project sync: check existing link: %w", lerr)
 	}
 
 	// Everything below can hit the forge and is captured on the link row's last_error
