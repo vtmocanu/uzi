@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import type { WorkerClient } from "./client.js";
 import type { GitCache } from "./git.js";
-import { gitBasicCredential } from "./git.js";
+import { gitBasicCredential, isWorkflowScopeRejection } from "./git.js";
 import type { Executor, RunContext } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
 import { skillsPluginDir } from "./skills-plugin.js";
@@ -114,6 +114,30 @@ export function composeWorkflowScopeReason(paths: string[]): string {
     }
   }
   return prefix + list + suffix;
+}
+
+/**
+ * PRD #456 M2 — the actionable `failure_reason` for a GitHub run whose branch could not be
+ * aligned with the current default branch before the finalize push: its `.github/workflows/**`
+ * files are BEHIND the default (main advanced them after this run's clone base), the bot's
+ * repo-only PAT cannot push while they differ, and uzi's attempt to merge and then rebase the
+ * current default into the branch BOTH conflicted. The run fails without pushing and the
+ * agent's diff is preserved (#377's `preserved_patch`) for a human to rebase-and-land.
+ *
+ * Names the default branch and points at docs/github-bot-setup.md, kept under
+ * MAX_FAILURE_REASON_LEN (the default branch name is clamped so the doc link always fits).
+ * Exported for a direct length-cap unit test.
+ */
+export function composeBaseAlignConflictReason(defaultBranch: string): string {
+  const db = (defaultBranch || "the default branch").slice(0, 64);
+  const reason =
+    `This run's branch is behind the default branch (${db}) on .github/workflows files, ` +
+    "which uzi's GitHub bot token cannot push while they differ from the default (its scope " +
+    "is exactly `repo`, without `workflow`, by design). uzi tried to merge and then rebase the " +
+    `current ${db} into the branch to realign those files, but both conflicted, so the run ` +
+    "failed without pushing. The work is valid — a human can rebase and land it. " +
+    "See docs/github-bot-setup.md. Your diff is preserved below.";
+  return reason.slice(0, MAX_FAILURE_REASON_LEN);
 }
 
 /**
@@ -1322,6 +1346,216 @@ export class RunRunner {
         }
       }
 
+      // The single authenticated finalize push (PAT-bearing, worker-owned; the agent never
+      // has a credential). Captured once as a closure so the align path (below) and the
+      // normal path push through EXACTLY ONE code path — the run must never push twice.
+      // PRD #284 Layer A: a transient push failure (a dropped HTTP/2 stream, a 5xx, a
+      // connection reset) retries rather than discarding the agent's already-committed work;
+      // a permanent rejection (auth, protected branch, non-fast-forward) fails fast and
+      // propagates to the catch below. The push is idempotent on retry (non-forced, same
+      // commits → "Everything up-to-date"). Capture the narrowed bare path: barePath is an
+      // outer `let` (string | undefined) and TS drops the narrowing inside the closure.
+      const finalizeBarePath = barePath;
+      const pushToOrigin = () =>
+        withForgeRetry(
+          () =>
+            this.git.pushBranch(
+              finalizeBarePath,
+              result.branch,
+              claim.secrets.forge_pat,
+              claim.repo.clone_url,
+              claim.secrets.forge_username,
+            ),
+          { log: runLog },
+        );
+
+      // PRD #456 M1: a GitHub run can be merely BEHIND the default branch on
+      // .github/workflows/** (main advanced those files after this run's clone base) WITHOUT
+      // having touched them. The bot's repo-only PAT push is then rejected atomically —
+      // losing ALL the run's work — even though #377's guard above (which fires only when the
+      // BRANCH modifies a workflow) did not trip. Align the branch's workflow tree with the
+      // FRESH default before pushing: merge first (SHA-preserving, D2), and if the merged push
+      // is STILL workflow-scope-rejected fall back to a rebase (the empirically proven #422
+      // recovery). On an unresolvable conflict, fail the run typed + preserve the diff (M2)
+      // rather than face-plant into GitHub's opaque rejection and discard the committed work.
+      // GitHub-only: GitLab/Forgejo impose no workflow-scope rule.
+      let alignPushed = false;
+      if (claim.repo.forge_type === "github") {
+        const alignBarePath = barePath;
+        const alignDefaultBranch =
+          claim.repo.default_branch?.trim() ||
+          (await this.git.defaultBranchName(alignBarePath)) ||
+          "main";
+        // Detection is best-effort (N2/D6 posture): a fetch/diff failure must NOT block a push
+        // that may well succeed (the branch may not actually be behind) — fall through to the
+        // normal push, never fail a run on an inability to compute the align target.
+        let defaultTip: string | undefined;
+        let differs = false;
+        try {
+          defaultTip = await this.git.fetchDefaultTip(
+            alignBarePath,
+            alignDefaultBranch,
+            claim.secrets.forge_pat,
+            claim.repo.clone_url,
+            claim.secrets.forge_username,
+          );
+          differs = await this.git.workflowTreeDiffers(
+            alignBarePath,
+            trackingRef,
+            defaultTip,
+          );
+        } catch (e) {
+          runLog.warn(
+            "finalize base-align: could not compute the align target; pushing without aligning",
+            { run_id: runId, error: errMessage(e) },
+          );
+        }
+        if (defaultTip && differs) {
+          // The pre-align committed agent tip — the base every align strategy starts from, so
+          // a rebase FALLBACK after a clean merge replays the ORIGINAL commits, not the merge.
+          const originalAgentTip = await this.git.branchTip(
+            runnerClone.path,
+            result.branch,
+          );
+          if (!originalAgentTip) {
+            runLog.warn(
+              "finalize base-align: could not resolve the branch tip; pushing without aligning",
+              { run_id: runId },
+            );
+          } else {
+            // The conflict-failure path (M2). The abort already ran inside
+            // alignBranchWithDefault; here we preserve the pre-align diff via #377's
+            // preserved_patch and fail typed. `trackingRef` still points at the agent's
+            // committed work when a merge conflicted first (we re-fetchAgentBranch only after
+            // a SUCCESSFUL align), so workflowScopeDiff captures the human-landable diff.
+            const defTip = defaultTip;
+            const failBaseAlignConflict = async () => {
+              const rawPatch = await this.git.workflowScopeDiff(alignBarePath, trackingRef);
+              const patch = rawPatch === null ? undefined : redactText(rawPatch);
+              batcher.emit({
+                kind: "status",
+                agent: "worker",
+                payload: {
+                  text: "could not align the branch with the updated default branch (merge and rebase both conflicted); failing and preserving the diff for a human to land",
+                },
+              });
+              runLog.info("run failed: finalize base-align conflict; preserving diff", {
+                run_id: runId,
+              });
+              await batcher.close();
+              await reportState({
+                status: "failed",
+                failure_reason: composeBaseAlignConflictReason(alignDefaultBranch),
+                fail_origin: "finalize_base_align_conflict",
+                preserved_patch: patch,
+              });
+            };
+
+            // Run one align STRATEGY, treating an UNEXPECTED throw (the S3 count-mismatch
+            // guard, or any git error) exactly like a `"conflict"` return. This is the whole
+            // point of the feature: the agent's work must be PRESERVED on failure, so an
+            // unexpected align error must route to failBaseAlignConflict (typed fail + diff),
+            // NOT escape to the generic catch below (raw message, no preserved_patch, defaulted
+            // fail_origin). Scoped to the align OPERATION only — the push keeps its own
+            // handling (workflow-scope → rebase fallback; any other push error rethrows).
+            const alignOp = async (strategy: "merge" | "rebase"): Promise<"aligned" | "conflict"> => {
+              try {
+                return await this.git.alignBranchWithDefault(
+                  runnerClone.path,
+                  result.branch,
+                  originalAgentTip,
+                  defTip,
+                  strategy,
+                );
+              } catch (e) {
+                runLog.warn(
+                  "finalize base-align: unexpected error during align; preserving diff and failing typed",
+                  { run_id: runId, strategy, error: errMessage(e) },
+                );
+                return "conflict";
+              }
+            };
+
+            // Re-fetch the aligned tip into the worker bare's tracking ref, then push once.
+            const fetchAndPush = async () => {
+              await this.git.fetchAgentBranch(
+                alignBarePath,
+                runnerClone.path,
+                result.branch,
+                runId,
+              );
+              await pushToOrigin();
+              alignPushed = true;
+            };
+
+            // Push the aligned branch. A REPEAT workflow-scope rejection here means the default's
+            // workflow files moved again DURING our align (double-TOCTOU) — preserve the diff and
+            // fail typed rather than lose it to the generic catch. Any OTHER push error still
+            // rethrows unchanged (a genuine auth/transient/protected-branch failure must not be
+            // mislabelled as a base-align conflict). Returns true if it preserved-and-failed (the
+            // caller must then `return`), false on a successful push.
+            const pushAlignedOrPreserve = async (): Promise<boolean> => {
+              try {
+                await fetchAndPush();
+                return false;
+              } catch (e) {
+                if (!isWorkflowScopeRejection(e)) throw e;
+                runLog.info(
+                  "finalize base-align: aligned push STILL workflow-scope-rejected (default moved again during align); preserving diff and failing typed",
+                  { run_id: runId },
+                );
+                await failBaseAlignConflict();
+                return true;
+              }
+            };
+
+            batcher.emit({
+              kind: "status",
+              agent: "worker",
+              payload: {
+                text: "branch is behind the default branch on .github/workflows; aligning before pushing",
+              },
+            });
+            const mergeRes = await alignOp("merge");
+            if (mergeRes === "aligned") {
+              try {
+                await fetchAndPush();
+              } catch (e) {
+                if (!isWorkflowScopeRejection(e)) throw e;
+                // The merge did NOT clear GitHub's workflow-scope rejection → the proven
+                // rebase fallback (#422). alignBranchWithDefault rewinds to originalAgentTip
+                // first, so the rebase replays the ORIGINAL agent commits onto the fresh
+                // default rather than the merge commit.
+                runLog.info(
+                  "finalize base-align: merge push still workflow-scope-rejected; trying rebase fallback",
+                  { run_id: runId },
+                );
+                const rebaseRes = await alignOp("rebase");
+                if (rebaseRes === "aligned") {
+                  if (await pushAlignedOrPreserve()) return;
+                } else {
+                  await failBaseAlignConflict();
+                  return;
+                }
+              }
+            } else {
+              // The merge conflicted (or errored) — a rebase may still replay cleanly where a
+              // single merge did not, so try it before giving up.
+              runLog.info("finalize base-align: merge conflicted; trying rebase", {
+                run_id: runId,
+              });
+              const rebaseRes = await alignOp("rebase");
+              if (rebaseRes === "aligned") {
+                if (await pushAlignedOrPreserve()) return;
+              } else {
+                await failBaseAlignConflict();
+                return;
+              }
+            }
+          }
+        }
+      }
+
       // PRD #400 M2: a TASK run always pushes its branch back (the deliverable is the
       // commits the user pulls from uzi/task/<id>) but opens a merge request only when
       // it opted in (`uzi handoff --mr` → runs.open_mr → claim.open_mr). Every non-task
@@ -1341,25 +1575,12 @@ export class RunRunner {
             : "work complete; pushing branch (no merge request — pull the branch)",
         },
       });
-      // PRD #284 Layer A: a transient push failure (a dropped HTTP/2 stream, a 5xx,
-      // a connection reset) must retry rather than discard the agent's already-
-      // committed work; a permanent rejection (auth, protected branch, non-fast-
-      // forward) still fails fast and propagates to the catch below. The push is
-      // idempotent on retry (non-forced, same commits → "Everything up-to-date").
-      // Capture the narrowed bare path in a const: barePath is an outer `let`
-      // (string | undefined) and TS drops the narrowing inside the retry closure.
-      const pushBarePath = barePath;
-      await withForgeRetry(
-        () =>
-          this.git.pushBranch(
-            pushBarePath,
-            result.branch,
-            claim.secrets.forge_pat,
-            claim.repo.clone_url,
-            claim.secrets.forge_username,
-          ),
-        { log: runLog },
-      );
+      // The finalize push. Skipped when the PRD #456 align path above already pushed the
+      // aligned branch — the run pushes through EXACTLY ONE code path (`pushToOrigin`), so a
+      // successful align-push and the normal push converge here without ever double-pushing.
+      if (!alignPushed) {
+        await pushToOrigin();
+      }
 
       // PRD #400 M2: a no-MR task completes HERE — the branch is pushed, there is
       // nothing more to open. Report the branch on the completion payload (the same

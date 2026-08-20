@@ -81,6 +81,25 @@ preserved diff from the failed run's card, commit the file yourself on a branch
 with a personal token that carries `workflow` scope, and open a normal pull
 request. Keep the uzi bot token at exactly `repo`.
 
+**A second, subtler case: the run's branch never touched a workflow file at
+all, but is merely BEHIND `main` on one.** GitHub enforces the `workflow`-scope
+requirement on the *pushed tip*, not on what the branch's own commits changed:
+if `main`'s `.github/workflows/**` files were updated (say, by a dependency
+bot) after a run's clone base, that run's branch tip differs from `main` on
+those files even though the run itself never edited one — and the same
+rejection fires at the final push, which used to lose the entire run's work
+with no recovery path. uzi now handles this automatically: immediately before
+the finalize push, it fetches `main`'s current tip and, only when the
+workflow trees actually differ, realigns the branch with it (a merge first,
+falling back to a rebase if the merged push is still rejected) before
+pushing — so the run completes normally with no user action needed. If that
+realignment itself cannot resolve (a genuine conflict on both the merge and
+the rebase), the run fails cleanly with a typed reason
+(`fail_origin = finalize_base_align_conflict`) and, exactly as above, the
+diff is preserved and rendered on the failed run's card for you to rebase and
+land by hand. See [ADR-456](../adr/0456-rebase-before-finalize-push.md) for
+the mechanism.
+
 ## 4. Add the bot to your repo
 
 Repository → **Settings → Collaborators**, add the bot with role **Write** (not
