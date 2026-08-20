@@ -21,6 +21,7 @@ type Store interface {
 	ListHostedWorkersForController(ctx context.Context) ([]store.ListHostedWorkersForControllerRow, error)
 	UpsertHostedWorkerToken(ctx context.Context, arg store.UpsertHostedWorkerTokenParams) error
 	MarkHostedWorkerTokenDelivered(ctx context.Context, arg store.MarkHostedWorkerTokenDeliveredParams) (int64, error)
+	CordonHostedWorker(ctx context.Context, id uuid.UUID) (int64, error)
 }
 
 // ExpiryStore is the slice of the store the pending-token expiry sweep needs. It
@@ -176,6 +177,15 @@ func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 			// reads as false here — exactly the "no sidecar" the controller wants. No
 			// need to branch on Valid.
 			Docker: row.DockerEnabled.Bool,
+			// busy/draining_since feed the controller's cordon/defer-roll/deadline decision
+			// (PRD #422 M3/M4/M5). Busy is a SQL boolean; draining_since is the raw nullable
+			// cordon timestamp, mapped from pgtype.Timestamptz to *time.Time below (nil == not
+			// draining) so the stateless controller can compute how long it has been draining.
+			Busy: row.Busy,
+		}
+		if row.DrainingSince.Valid {
+			t := row.DrainingSince.Time
+			dw.DrainingSince = &t
 		}
 		if len(row.TokenCiphertext) > 0 {
 			plain, err := s.box.OpenWithAAD(row.TokenCiphertext, tokenAAD(row.ID))
@@ -196,4 +206,25 @@ func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 		out.Workers = append(out.Workers, dw)
 	}
 	return out, nil
+}
+
+// Cordon marks a hosted worker draining (PRD #422 M4, Decision 8). It is the api
+// end of the controller's cordon-write control channel: on spec-hash drift the
+// controller cordons a BUSY worker instead of hard-killing it, so the claim gate
+// idles it, it finishes its in-flight runs, and the controller rolls it once idle.
+//
+// Unlike Poll (a pure read) and NoteRegistered (settled by proof of possession),
+// this MUTATES desired state, which is why it rides a distinct authenticated
+// endpoint rather than being folded into the display-only status report.
+//
+// Idempotent: CordonHostedWorker COALESCEs draining_since, so a repeat cordon does
+// not reset the drain-deadline clock. Returns found=false (no error) when no hosted
+// worker has that id — the handler answers 404 — so a controller cordoning a worker
+// the api has since dropped gets a clean, actionable negative rather than a 500.
+func (s *Service) Cordon(ctx context.Context, workerID uuid.UUID) (bool, error) {
+	rows, err := s.q.CordonHostedWorker(ctx, workerID)
+	if err != nil {
+		return false, fmt.Errorf("hostedsvc: cordon hosted worker: %w", err)
+	}
+	return rows > 0, nil
 }

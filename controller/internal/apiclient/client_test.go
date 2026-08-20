@@ -222,3 +222,43 @@ func TestReportReturnsAnErrorForNon404Failures(t *testing.T) {
 		}
 	}
 }
+
+// RequestDrain is the cordon control-write (PRD #422 M4). On 204 it succeeds and
+// carries the fleet bearer credential to the per-worker drain path.
+func TestRequestDrainPostsToTheWorkerDrainPathWithBearerAuth(t *testing.T) {
+	var gotAuth, gotPath, gotMethod string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth, gotPath, gotMethod = r.Header.Get("Authorization"), r.URL.Path, r.Method
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	if err := New(srv.URL, "the-token", 5*time.Second, nil, testLogger()).RequestDrain(context.Background(), "w1"); err != nil {
+		t.Fatalf("RequestDrain: %v", err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", gotMethod)
+	}
+	if gotPath != "/api/controller/workers/w1/drain" {
+		t.Errorf("path = %q, want /api/controller/workers/w1/drain", gotPath)
+	}
+	if gotAuth != "Bearer the-token" {
+		t.Errorf("authorization = %q, want the fleet bearer credential", gotAuth)
+	}
+}
+
+// Unlike Report, a cordon must FAIL SAFE: ANY non-2xx — including a 404 — is an
+// error, so the caller defers the roll rather than proceeding to hard-kill a worker
+// whose drain state it could not write.
+func TestRequestDrainTreatsEveryNon2xxIncluding404AsError(t *testing.T) {
+	for _, code := range []int{http.StatusNotFound, http.StatusBadRequest, http.StatusInternalServerError} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(code)
+		}))
+		err := New(srv.URL, "t", 5*time.Second, nil, testLogger()).RequestDrain(context.Background(), "w1")
+		srv.Close()
+		if err == nil {
+			t.Errorf("RequestDrain returned nil for %d; a cordon must fail safe on every non-2xx", code)
+		}
+	}
+}

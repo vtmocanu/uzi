@@ -319,6 +319,10 @@ var wantRouteMounts = []routeMount{
 	// carries no per-user limiter, like the recommendation disposition write.
 	{"POST", "/api/findings/{id}/dismiss", noLimiter},
 	{"POST", "/api/controller/status", noLimiter},
+	// Controller cordon control-write (PRD #422 M4): a fleet-scoped controller-only
+	// route behind RequireController, not a per-user credential, so no per-user
+	// limiter — like the poll and status routes above.
+	{"POST", "/api/controller/workers/{workerID}/drain", noLimiter},
 	{"POST", "/api/chats/{id}/proposals/{pid}/confirm", limForge},
 	{"POST", "/api/chats/{id}/proposals/{pid}/dismiss", noLimiter},
 	{"POST", "/api/forge/connections/", noLimiter},

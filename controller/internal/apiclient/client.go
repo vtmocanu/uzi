@@ -163,3 +163,35 @@ func (c *Client) Report(ctx context.Context, report protocol.StatusReport) error
 	// desired-state channel.
 	return nil
 }
+
+// RequestDrain asks the api to cordon a hosted worker so it drains before rolling
+// (PRD #422 M4, Decision 8).
+//
+// Unlike Report, this is a CONTROL-WRITE: it mutates desired state (the api stamps
+// draining_since so the claim gate idles the worker). Its failure semantics are the
+// mirror image of Report's, and deliberately so. Report tolerates a 404 as success
+// because it is display-only and skew across it is benign. Cordon does NOT: it must
+// FAIL SAFE. Any non-2xx — including a 404 (the worker vanished, or an older api
+// without this endpoint) — is returned as an error, so the caller DEFERS the roll
+// rather than proceeding. A busy worker whose cordon could not be written is left
+// running, never hard-killed; deferring costs a tick, hard-killing costs a run.
+func (c *Client) RequestDrain(ctx context.Context, workerID string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/controller/workers/"+workerID+"/drain", nil)
+	if err != nil {
+		return fmt.Errorf("apiclient: build drain request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("apiclient: drain request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// 204 is the documented success. Accept the 2xx band rather than pinning 204.
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+		return fmt.Errorf("apiclient: drain request: api returned %d: %s", resp.StatusCode, bytes.TrimSpace(snippet))
+	}
+	return nil
+}

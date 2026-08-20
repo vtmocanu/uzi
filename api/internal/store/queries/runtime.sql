@@ -184,6 +184,13 @@ WITH prev AS (
         -- the OLD row, so workers.status/online_since here read the pre-update tuple (the
         -- same mechanism SetRunRunning's `health = CASE WHEN status='running'` relies on).
         online_since        = CASE WHEN workers.status = 'online' AND workers.online_since IS NOT NULL THEN workers.online_since ELSE now() END,
+        -- Clear-on-roll (PRD #422 M3, Decision 7 lifecycle): a rolled/restarted pod
+        -- re-registers under the same hosted id, and clearing draining_since here is what
+        -- lets a cordoned worker resume claiming after its roll (or a benign restart) —
+        -- without it, a drained worker stays cordoned forever. HeartbeatWorker deliberately
+        -- does NOT touch draining_since: a draining worker heartbeats and must STAY draining
+        -- until it actually rolls.
+        draining_since      = NULL,
         last_heartbeat_at   = now(),
         updated_at          = now()
     WHERE workers.id = @id
@@ -293,6 +300,9 @@ WHERE user_id = @user_id
 -- Sweeper: workers past the heartbeat-stale window go offline. online_since is CLEARED
 -- here (PRD #251 M1): an offline worker carries no uptime, so the next online transition
 -- starts a fresh anchor rather than reporting a session that spanned the outage.
+-- draining_since is DELIBERATELY NOT filtered here (PRD #422 Decision 7): draining is an
+-- orthogonal column, so a draining worker whose pod actually dies is still swept offline
+-- like any other — do not add a draining predicate.
 UPDATE workers SET status = 'offline', online_since = NULL, updated_at = now()
 WHERE status = 'online'
   AND (last_heartbeat_at IS NULL OR last_heartbeat_at < @cutoff);
@@ -587,6 +597,9 @@ WHERE id = (
                 AND p.id <> @worker_id
                 AND p.last_heartbeat_at IS NOT NULL
                 AND p.last_heartbeat_at >= @heartbeat_cutoff
+                -- A draining peer claims nothing (PRD #422 Decision 7), so never DEFER a
+                -- run to it — it would never pick the run up.
+                AND p.draining_since IS NULL
                 AND p.max_concurrent_runs IS NOT NULL
                 AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), @docker_repo_allowlist::uuid[], r.repo_id, r.kind)
                 AND pa.active < p.max_concurrent_runs
@@ -2195,6 +2208,9 @@ WHERE id = @id AND status = @status;
 -- How many of a user's workers are online — the queued-run reason resolver uses it
 -- to say "no worker is online" vs "waiting for a worker" (Decision 8). Only called
 -- for a queued run already past its threshold, so it is off the hot path.
+-- draining_since is DELIBERATELY NOT filtered here (PRD #422 Decision 7): a draining
+-- worker keeps status='online' and still counts as an online worker for "no worker is
+-- online" purposes — do not add a draining predicate.
 SELECT count(*) FROM workers WHERE user_id = @user_id AND status = 'online';
 
 -- name: CountOnlineWorkersWithFreeSlotForUser :one
@@ -2210,6 +2226,9 @@ SELECT count(*) FROM workers WHERE user_id = @user_id AND status = 'online';
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
+  -- A draining worker has no free slot for NEW work (it claims nothing), so the
+  -- queued-run reason resolver must not count it as an idle worker (PRD #422 Decision 7).
+  AND w.draining_since IS NULL
   AND (w.max_concurrent_runs IS NULL
        OR (SELECT count(*) FROM runs r
             WHERE r.worker_id = w.id

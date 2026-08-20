@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -42,11 +43,14 @@ type fakeStore struct {
 	// against the hash the caller proved. Without it the fake could not model a
 	// rotation at all — and modelling exactly what the SQL does is this fake's job.
 	tokenHashes map[uuid.UUID][]byte
-	// listErr / markErr force the failure paths.
-	listErr error
-	markErr error
+	// listErr / markErr / cordonErr force the failure paths.
+	listErr   error
+	markErr   error
+	cordonErr error
 	// markCalls counts MarkHostedWorkerTokenDelivered calls, including no-ops.
 	markCalls int
+	// cordoned records the ids passed to CordonHostedWorker, in order.
+	cordoned []uuid.UUID
 }
 
 func newFakeStore() *fakeStore {
@@ -69,6 +73,22 @@ func (f *fakeStore) ListHostedWorkersForController(context.Context) ([]store.Lis
 		out = append(out, w)
 	}
 	return out, nil
+}
+
+// CordonHostedWorker mirrors the real UPDATE ... WHERE id = $1 AND kind = 'hosted':
+// rows affected = 1 when a hosted worker with that id exists, else 0. Every worker in
+// this fake is hosted, so existence in f.workers is the whole predicate.
+func (f *fakeStore) CordonHostedWorker(_ context.Context, id uuid.UUID) (int64, error) {
+	f.cordoned = append(f.cordoned, id)
+	if f.cordonErr != nil {
+		return 0, f.cordonErr
+	}
+	for _, w := range f.workers {
+		if w.ID == id {
+			return 1, nil
+		}
+	}
+	return 0, nil
 }
 
 // UpsertHostedWorkerToken mirrors the real ON CONFLICT DO UPDATE: a re-park
@@ -357,6 +377,57 @@ func TestLateRegistrationSelfHealsAnExpiredRow(t *testing.T) {
 	}
 }
 
+// The busy/draining_since poll fields (PRD #422 M3/M5) must round-trip from the store
+// row into the DesiredWorker DTO the controller reads. The two workers carry
+// discriminating values (busy-not-draining vs draining-not-busy) so a swapped or dropped
+// field is caught here, not just by the wire golden. M5 asserts on DrainingSince
+// (nil vs the mapped timestamp), not a bool: draining == DrainingSince != nil.
+func TestPollCarriesBusyAndDraining(t *testing.T) {
+	st := newFakeStore()
+	svc := newTestService(t, st)
+
+	busyID := uuid.New()
+	drainID := uuid.New()
+	drainingAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	st.workers = append(st.workers,
+		store.ListHostedWorkersForControllerRow{
+			ID:               busyID,
+			TemplateDeclared: pgtype.Text{String: "base", Valid: true},
+			HostedSize:       pgtype.Text{String: "s", Valid: true},
+			HostedGeneration: 1,
+			Busy:             true,
+			DrainingSince:    pgtype.Timestamptz{Valid: false},
+		},
+		store.ListHostedWorkersForControllerRow{
+			ID:               drainID,
+			TemplateDeclared: pgtype.Text{String: "jvm", Valid: true},
+			HostedSize:       pgtype.Text{String: "l", Valid: true},
+			HostedGeneration: 2,
+			Busy:             false,
+			DrainingSince:    pgtype.Timestamptz{Time: drainingAt, Valid: true},
+		},
+	)
+
+	resp, err := svc.Poll(context.Background())
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if len(resp.Workers) != 2 {
+		t.Fatalf("%d workers, want 2", len(resp.Workers))
+	}
+
+	byID := map[string]DesiredWorker{}
+	for _, w := range resp.Workers {
+		byID[w.ID] = w
+	}
+	if got := byID[busyID.String()]; !got.Busy || got.DrainingSince != nil {
+		t.Fatalf("busy worker = %+v, want Busy=true DrainingSince=nil", got)
+	}
+	if got := byID[drainID.String()]; got.Busy || got.DrainingSince == nil || !got.DrainingSince.Equal(drainingAt) {
+		t.Fatalf("draining worker = %+v, want Busy=false DrainingSince=%v", got, drainingAt)
+	}
+}
+
 // A registration for a worker with no token row at all deletes nothing and must not
 // error — the worker still registered successfully.
 func TestNoteRegisteredForWorkerWithNoRowIsNotAnError(t *testing.T) {
@@ -446,5 +517,43 @@ func TestPollReturnsEmptySliceNotNil(t *testing.T) {
 	}
 	if resp.Workers == nil {
 		t.Fatal("Workers is nil; want an empty slice")
+	}
+}
+
+// Cordon returns found=true and passes the id through when a hosted worker exists.
+func TestCordonMarksAKnownWorkerDraining(t *testing.T) {
+	st := newFakeStore()
+	id := newTestWorker(st, "base", "m", 0)
+	found, err := newTestService(t, st).Cordon(context.Background(), id)
+	if err != nil {
+		t.Fatalf("cordon: %v", err)
+	}
+	if !found {
+		t.Fatal("found = false, want true for a known hosted worker")
+	}
+	if len(st.cordoned) != 1 || st.cordoned[0] != id {
+		t.Fatalf("cordoned = %v, want exactly [%s]", st.cordoned, id)
+	}
+}
+
+// Cordon returns found=false (no error) for an unknown worker: the handler answers 404.
+func TestCordonUnknownWorkerReturnsNotFound(t *testing.T) {
+	st := newFakeStore()
+	found, err := newTestService(t, st).Cordon(context.Background(), uuid.New())
+	if err != nil {
+		t.Fatalf("cordon: %v", err)
+	}
+	if found {
+		t.Fatal("found = true, want false for an unknown worker")
+	}
+}
+
+// Cordon surfaces its store error rather than reporting a spurious not-found.
+func TestCordonPropagatesStoreErrors(t *testing.T) {
+	boom := errors.New("db exploded")
+	st := newFakeStore()
+	st.cordonErr = boom
+	if _, err := newTestService(t, st).Cordon(context.Background(), uuid.New()); !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want it propagated", err)
 	}
 }

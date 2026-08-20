@@ -492,6 +492,14 @@ type Config struct {
 	// workers and then turned hosting off is exactly the case that would strand
 	// ciphertext, so the sweep — and therefore this knob — outlives the flag.
 	HostedTokenTTL time.Duration
+
+	// HostedWorkerVersion is the concrete pinned hosted-worker image tag (the deploy's
+	// workers.image.tag, PRD #422), used as the hosted-worker upgrade-badge target so a
+	// worker intentionally pinned behind appVersion is not flagged outdated once the
+	// api's own release (appVersion) has moved ahead of it. Optional and unvalidated at
+	// load (empty = unknown, handled at use): empty falls back to the api's own release,
+	// which is today's behavior.
+	HostedWorkerVersion string
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -817,6 +825,10 @@ func Load() (Config, error) {
 	if err := loadWorkerHosting(&cfg); err != nil {
 		return Config{}, err
 	}
+	// PRD #422: the concrete pinned hosted-worker image tag (deploy's workers.image.tag),
+	// used as the hosted-worker upgrade-badge target. Optional, unvalidated at load (empty
+	// falls back to the api's own release at classification time — today's behavior).
+	cfg.HostedWorkerVersion = getenv("HOSTED_WORKER_VERSION", "")
 	// Must run after Addr and TLSAddr are set (it rejects the two colliding).
 	if err := loadTLS(&cfg); err != nil {
 		return Config{}, err

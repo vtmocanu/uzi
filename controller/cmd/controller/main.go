@@ -98,7 +98,12 @@ func main() {
 		MaxConcurrentRuns:   cfg.WorkerMaxConcurrentRuns,
 		APICAPEM:            cfg.APICAPEM,
 	}
-	materializer := kube.New(kubeClient, materializerCfg, resolver, log)
+	// The apiclient doubles as the cordon-write channel (PRD #422 M4): its RequestDrain
+	// satisfies kube.Cordoner, so a busy drifted worker is cordoned and drained rather
+	// than hard-killed. The DrainPolicy carries M5's two overrides: the bounded deadline
+	// after which a cordoned busy worker rolls anyway, and the emergency force-roll.
+	materializer := kube.New(kubeClient, materializerCfg, resolver, client,
+		kube.DrainPolicy{Deadline: cfg.DrainDeadline, ForceRoll: cfg.ForceRoll}, log)
 
 	// REFUSE TO BOOT on a PVC that its namespace's LimitRange will reject (issue #224).
 	//

@@ -165,20 +165,25 @@ func bindingForMode(mode string, secretID pgtype.UUID, label string) (*string, *
 // the Handler because that is this file's convention for these builders, and because
 // it keeps the classification a pure function of its inputs. Passing "" yields
 // `unknown`, which is also what a genuinely unstamped build produces.
+// pinnedWorkerVersion is the deploy's concrete pinned hosted-worker image tag
+// (h.cfg.HostedWorkerVersion / workers.image.tag, PRD #422) — the hosted-worker upgrade
+// target, so a worker intentionally pinned behind appVersion is not flagged `outdated`.
+// Passing "" falls back to cpVersion (today's behavior for an unconfigured deploy).
 //
 // NO ROLL SIGNAL on this path, deliberately (PRD #113 M4). The bare-row callers —
 // register, heartbeat, create, admin list — hold a worker row with no roll-health
 // join, so they classify by version comparison alone. That is honest rather than
 // degraded: passing a nil signal says "this row carries no controller report", which
 // is exactly what it carries. The per-user LIST path has the join and folds it.
-func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel, cpVersion string, now, apiStartedAt time.Time) apitypes.WorkerDTO {
+func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel, cpVersion, pinnedWorkerVersion string, now, apiStartedAt time.Time) apitypes.WorkerDTO {
 	upgradeStatus, upgradeDetail, upgradeTarget := workersvc.ClassifyUpgradeWithTarget(workersvc.UpgradeInput{
-		Reported:     w.Version.String,
-		Kind:         w.Kind,
-		CPVersion:    cpVersion,
-		Signal:       nil,
-		Now:          now,
-		APIStartedAt: apiStartedAt,
+		Reported:            w.Version.String,
+		Kind:                w.Kind,
+		CPVersion:           cpVersion,
+		PinnedWorkerVersion: pinnedWorkerVersion,
+		Signal:              nil,
+		Now:                 now,
+		APIStartedAt:        apiStartedAt,
 	}, workersvc.UpgradeParams{})
 	bindingID, bindingLabel := bindingForMode(w.AnthropicBindMode, w.AnthropicSecretID, secretLabel)
 	return apitypes.WorkerDTO{
@@ -210,14 +215,15 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 	}
 }
 
-func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion string, now, apiStartedAt time.Time) apitypes.WorkerDTO {
+func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersion string, now, apiStartedAt time.Time) apitypes.WorkerDTO {
 	upgradeStatus, upgradeDetail, upgradeTarget := workersvc.ClassifyUpgradeWithTarget(workersvc.UpgradeInput{
-		Reported:     w.Version.String,
-		Kind:         w.Kind,
-		CPVersion:    cpVersion,
-		Signal:       rollSignalFromRow(w),
-		Now:          now,
-		APIStartedAt: apiStartedAt,
+		Reported:            w.Version.String,
+		Kind:                w.Kind,
+		CPVersion:           cpVersion,
+		PinnedWorkerVersion: pinnedWorkerVersion,
+		Signal:              rollSignalFromRow(w),
+		Now:                 now,
+		APIStartedAt:        apiStartedAt,
 	}, workersvc.UpgradeParams{})
 	rowBindingID, rowBindingLabel := bindingForMode(
 		w.AnthropicBindMode, w.AnthropicSecretID, w.AnthropicSecretLabel.String)
@@ -616,7 +622,7 @@ func (h *Handler) CreateWorker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, map[string]any{
-		"worker": workerDTOFromWorker(wkr, 0, false, tokenLabel, h.version, h.clock(), h.startedAt),
+		"worker": workerDTOFromWorker(wkr, 0, false, tokenLabel, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt),
 		"token":  token,
 	})
 }
@@ -636,7 +642,7 @@ func (h *Handler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]apitypes.WorkerDTO, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, workerDTOFromRow(row, h.version, h.clock(), h.startedAt))
+		out = append(out, workerDTOFromRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt))
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"workers": out})
 }
@@ -789,7 +795,7 @@ func (h *Handler) PatchWorker(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(wkr, 0, false, token.label, h.version, h.clock(), h.startedAt)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(wkr, 0, false, token.label, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)})
 }
 
 // -------------------------------------------------------------------------

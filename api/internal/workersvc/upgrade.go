@@ -198,6 +198,13 @@ type UpgradeInput struct {
 	Kind string
 	// CPVersion is the control plane's own release ("dev" on an unstamped build).
 	CPVersion string
+	// PinnedWorkerVersion is the deploy's concrete pinned hosted-worker image tag
+	// (workers.image.tag, PRD #422), or "" if unknown. After M1 the worker image tag is
+	// pinned independently of the api's own release (appVersion), so a HOSTED worker's
+	// upgrade target is this pin, not CPVersion — otherwise a worker intentionally pinned
+	// behind appVersion reads `outdated` fleet-wide whenever there is no fresh controller
+	// signal. Empty/unparseable falls back to CPVersion (today's behavior).
+	PinnedWorkerVersion string
 	// Signal is the persisted controller report, or nil.
 	Signal *RollSignal
 	// Now and APIStartedAt come from the caller. APIStartedAt anchors the no-signal
@@ -395,8 +402,19 @@ func classifyWithTarget(in UpgradeInput, p UpgradeParams) (status string, detail
 	// unparseable tag falls back to the api's own version rather than blinding the
 	// fleet — the PHASE half of the signal is still honoured.
 	target := in.CPVersion
-	if hosted && signalFresh && semver.IsValid(normSemver(s.RolledTag)) {
-		target = s.RolledTag
+	if hosted {
+		// PRD #422: the worker image tag is pinned independently of the api's own
+		// release (appVersion), so a hosted worker's target is the pinned worker
+		// version, NOT CPVersion. Empty/unparseable pin falls back to CPVersion
+		// (today's behavior — no regression for an unconfigured deploy).
+		if semver.IsValid(normSemver(in.PinnedWorkerVersion)) {
+			target = in.PinnedWorkerVersion
+		}
+		// A FRESH controller RolledTag stays authoritative above the static pin: it is
+		// what the controller actually rolls to, confirmed live (Decision 9).
+		if signalFresh && semver.IsValid(normSemver(s.RolledTag)) {
+			target = s.RolledTag
+		}
 	}
 
 	// R1 is NOT ceiling-gated — see the ceilingOK comment above (issue #151).
@@ -598,7 +616,12 @@ type UpgradeFleetSummary struct {
 // inputs. That matters more than the small duplication it avoids: if this endpoint
 // counted with its own rules, the badge could say "1 needs attention" beside a list in
 // which nothing is badged, and no test comparing the two would exist to catch it.
-func (s *Service) UpgradeSummaryForUser(ctx context.Context, userID uuid.UUID, cpVersion string, apiStartedAt time.Time, p UpgradeParams) (UpgradeFleetSummary, error) {
+//
+// pinnedWorkerVersion is the deploy's concrete pinned hosted-worker image tag (PRD #422,
+// the api's HostedWorkerVersion / workers.image.tag), threaded onto each UpgradeInput so a
+// hosted worker intentionally pinned behind appVersion is not counted `outdated`. Empty
+// falls back to cpVersion — today's behavior for an unconfigured deploy.
+func (s *Service) UpgradeSummaryForUser(ctx context.Context, userID uuid.UUID, cpVersion, pinnedWorkerVersion string, apiStartedAt time.Time, p UpgradeParams) (UpgradeFleetSummary, error) {
 	rows, err := s.q.GetWorkerUpgradeSummaryForUser(ctx, userID)
 	if err != nil {
 		return UpgradeFleetSummary{}, err
@@ -633,12 +656,13 @@ func (s *Service) UpgradeSummaryForUser(ctx context.Context, userID uuid.UUID, c
 			}
 		}
 		status, _ := ClassifyUpgrade(UpgradeInput{
-			Reported:     row.Version.String,
-			Kind:         row.Kind,
-			CPVersion:    cpVersion,
-			Signal:       sig,
-			Now:          now,
-			APIStartedAt: apiStartedAt,
+			Reported:            row.Version.String,
+			Kind:                row.Kind,
+			CPVersion:           cpVersion,
+			PinnedWorkerVersion: pinnedWorkerVersion,
+			Signal:              sig,
+			Now:                 now,
+			APIStartedAt:        apiStartedAt,
 		}, p)
 		if !InUpgradeAttentionSet(status) {
 			continue

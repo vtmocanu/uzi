@@ -1128,8 +1128,12 @@ the design rationale (Decision Log, the compose→chart adaptations) is
   layered over the cluster-agnostic `deploy/chart/values.yaml`. ArgoCD deploys a
   **multi-source** app (the private GitOps repo's `apps/uzi/`): the released chart
   from an OCI registry + these values from that GitOps repo. Public URL
-  `https://uzi.example.com` behind ingress-nginx (a wildcard-TLS domain). Images + chart are versioned Model B (chart `version` ==
-  `appVersion` == the release git tag; see the runbook). **Optionally** (PRD
+  `https://uzi.example.com` behind ingress-nginx (a wildcard-TLS domain). The
+  `api`/`web`/chart triple is versioned Model B (chart `version` ==
+  `appVersion` == the release git tag; see the runbook) — the **worker** image
+  tag is deliberately decoupled from that lockstep (PRD #422; see
+  [Worker image tag](#worker-image-tag-decoupled-from-appversion-drained-instead-of-hard-killed-prd-422)
+  below). **Optionally** (PRD
   #58, off by default — `workers.enabled: false`) a `uzi-controller`
   Deployment and a dedicated `uzi-workers` namespace it renders hosted worker
   pods into; see [Worker controller](#worker-controller-k8s-only) below.
@@ -1301,6 +1305,45 @@ which is what makes the per-user scoping unavoidable.
 Rationale, the decision log, and the alternatives that were rejected are in
 `prds/done/113-worker-upgrade-status.md`. The user-facing behaviour is
 [docs/worker-upgrades.md](docs/worker-upgrades.md).
+
+### Worker image tag: decoupled from appVersion, drained instead of hard-killed (PRD #422)
+
+**The worker fleet no longer rolls on every release.** `workers.image.tag` is a
+concrete pinned version independent of `Chart.AppVersion` (`required` in the chart —
+a blank tag fails the render rather than silently following appVersion). An
+app-only release (an api/web/db/controller bump that advances `Chart.version`/
+`appVersion`) therefore renders an unchanged worker pod-spec hash, and the
+controller rolls **zero** worker pods; any run in flight keeps running on the old
+worker, which talks to the new api unchanged. Advancing the worker fleet is a
+deliberate operator step: bump `workers.image.tag` to a new concrete version.
+
+When that deliberate bump does move the tag, the controller does not hard-kill a
+busy worker. On spec-hash drift it first asks the api whether the worker has an
+active run; if so it **cordons** the worker over a new authenticated control-write
+endpoint (`POST /api/controller/workers/{id}/drain`, distinct from the existing
+display-only status report above) instead of rolling — the api stamps a `workers.
+draining_since` timestamp, an orthogonal column, not a `workers.status` value,
+because `status` is rewritten to `'online'` on every heartbeat and would clobber a
+drain flag stored there. A draining worker keeps heartbeating and finishes its
+in-flight run, but the claim gate treats it as a third "stop claiming" lever
+(alongside the vault gate and the concurrency cap) so it takes on nothing new; the
+controller performs the `Recreate` roll once the api reports it idle, and
+`RegisterWorker` clears `draining_since` on the worker's next registration after
+that roll. The wait is bounded by `workers.drainDeadline` (default `24h`) — past
+it the controller rolls the busy worker anyway and its run falls back to the
+existing requeue-resume path — and `workers.forceRoll` is the operator emergency
+override that rolls every drifted worker immediately regardless of busy-ness, for
+a fix that cannot wait on a drain. Any failure reading busy-ness or writing the
+cordon fails safe: the roll is deferred, never forced through.
+
+"Surge" here means the app stack surges forward on every release while old
+worker pods linger until their work is done — not overlapping worker pods.
+Workers hold RWO PVCs, so `Recreate` (not `RollingUpdate`) stays the worker roll
+strategy. The requeue-then-manual-vault-unlock fallback (a run that does get
+rolled — past the drain deadline, on force-roll, or by an uncontrolled pod loss)
+is unchanged by this PRD. Full rationale, the Decision Log, and what remains
+open (a CLI drain verb, live-cluster validation) are in
+[adr/0422-decouple-worker-version.md](adr/0422-decouple-worker-version.md).
 
 ## Not yet in scope
 

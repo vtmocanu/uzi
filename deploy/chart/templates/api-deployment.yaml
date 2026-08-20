@@ -115,6 +115,12 @@ spec:
                   key: {{ .Values.workers.controller.tokenHashSecretKey | quote }}
                   optional: true
             {{- end }}
+            # The api compares hosted workers' reported version against this pinned tag
+            # for the upgrade badge (PRD #422), so an intentionally-pinned worker is not
+            # flagged `outdated` when appVersion has moved ahead. workers.image.tag is a
+            # concrete pinned value after M1, so this is always non-empty in a normal deploy.
+            - name: HOSTED_WORKER_VERSION
+              value: {{ .Values.workers.image.tag | quote }}
           resources:
             {{- toYaml .Values.api.resources | nindent 12 }}
           {{- with .Values.api.startupProbe }}
