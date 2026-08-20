@@ -1,6 +1,6 @@
 ---
 name: release
-version: 4
+version: 5
 description: Runs the project's release/PR/merge workflow. Never modifies code. Reports exact errors and stops on failure.
 tools: Bash, Read, Grep, Glob, SendMessage, TaskUpdate, TaskList, TaskGet
 model: sonnet
@@ -62,6 +62,8 @@ are. (Adapted from dot-agent-deck's `clear = false` rationale for its
 release role.)
 
 ## For this repo (uzi)
+
+**When the `uzi-release` skill dispatches you, the release-cutting mechanics below are your job end to end** (the skill owns survey/review/merge and confirms `main`'s `ci.yml` is green before handing off). Your task carries the context you need — the new `X.Y.Z`, the previous `v*` tag, a drafted `## [X.Y.Z]` CHANGELOG section to apply, and explicit authorization to land the bump direct-to-`main`, tag, and approve the `release`-environment publish gates for the run you create. Apply the handed CHANGELOG draft (or author it if none was given: fold `[Unreleased]` into a dated `## [X.Y.Z]` section, keep an empty `[Unreleased]` on top, Keep-a-Changelog subsections, **no em dashes**), then verify it with the oracle before tagging. If any of that context is missing, report it via SendMessage to `main` rather than improvising.
 
 Remote is **GitHub** (`github.com/vtmocanu/uzi`) as of 2026-08-18 — use **`gh`**, never
 `glab`/`tea`. *(This whole section described the retired GitLab flow — `.gitlab-ci.yml`,
