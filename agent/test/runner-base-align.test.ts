@@ -133,6 +133,12 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     seedWorkflowsOnOrigin();
     const { github, calls } = fakeGitHub();
     const strategies = spyAlign();
+    let pushCalls = 0;
+    const realPush = git.pushBranch.bind(git);
+    git.pushBranch = (async (...args: Parameters<typeof git.pushBranch>) => {
+      pushCalls++;
+      return realPush(...args);
+    }) as typeof git.pushBranch;
     const exec = committingExecutor({ "impl.ts": "export const x = 1;\n" }, { ".github/workflows/ci.yml": CI_V2 });
 
     const claim = githubClaim(50);
@@ -141,6 +147,9 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
     assert.deepStrictEqual(statuses, ["running", "running", "completed"]);
     assert.deepStrictEqual(strategies, ["merge"], "the merge path aligns; no rebase fallback");
+    // Pins the exactly-one-push `if (!alignPushed)` guard: the align path pushed, so the
+    // normal push must be skipped — one push total, never two.
+    assert.strictEqual(pushCalls, 1, "the aligned branch is pushed exactly once");
     assert.strictEqual(calls.length, 1, "the PR was opened once");
 
     // The branch really landed on origin, carrying the agent's file AND the fresh workflow.
@@ -239,6 +248,42 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     assert.strictEqual(pushCalls, 1, "exactly one push");
     assert.strictEqual(calls.length, 1, "the PR was opened once");
     assert.strictEqual(gitIn(fx.originPath, ["show", "agent/issue-53:impl.ts"]), "export const x = 1;");
+  });
+
+  // An UNEXPECTED throw from alignBranchWithDefault (e.g. the S3 count-mismatch guard, or any
+  // git error) must NOT escape to the generic catch — which would report `failed` with a raw
+  // internal message and NO preserved_patch. It must route to the typed conflict-fail path so
+  // the agent's work is still preserved. This is the whole point of the feature on failure.
+  it("an unexpected align error still fails typed with preserved_patch, never the raw generic catch", async () => {
+    seedWorkflowsOnOrigin();
+    const { github, calls } = fakeGitHub();
+    let pushed = false;
+    git.pushBranch = (async () => {
+      pushed = true;
+    }) as typeof git.pushBranch;
+    // Both align attempts throw an unexpected internal error (models the count-mismatch guard).
+    git.alignBranchWithDefault = (async () => {
+      throw new Error("alignBranchWithDefault: rebase dropped commits (2 → 1) — refusing to push truncated work");
+    }) as typeof git.alignBranchWithDefault;
+    const exec = committingExecutor({ "impl.ts": "export const x = 1;\n" }, { ".github/workflows/ci.yml": CI_V2 });
+
+    const claim = githubClaim(54);
+    await githubRunner(github, exec).execute(claim);
+
+    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+    assert.deepStrictEqual(statuses, ["running", "running", "failed"]);
+    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")!.body;
+    assert.strictEqual(failed.fail_origin, "finalize_base_align_conflict");
+    // The typed reason, NOT the raw internal error the generic catch would surface.
+    assert.match(failed.failure_reason ?? "", /docs\/github-bot-setup\.md/);
+    assert.ok(
+      !(failed.failure_reason ?? "").includes("dropped commits"),
+      "the raw internal error must not reach the failure_reason (that would mean the generic catch)",
+    );
+    assert.ok(failed.preserved_patch, "the diff is preserved even on an unexpected align error");
+    assert.match(failed.preserved_patch!, /impl\.ts/);
+    assert.strictEqual(pushed, false, "no push on an align error");
+    assert.strictEqual(calls.length, 0, "no PR opened on an align error");
   });
 });
 

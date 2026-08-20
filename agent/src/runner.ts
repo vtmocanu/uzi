@@ -1445,13 +1445,35 @@ export class RunRunner {
               await batcher.close();
               await reportState({
                 status: "failed",
-                failure_reason: composeBaseAlignConflictReason(alignDefaultBranch).slice(
-                  0,
-                  MAX_FAILURE_REASON_LEN,
-                ),
+                failure_reason: composeBaseAlignConflictReason(alignDefaultBranch),
                 fail_origin: "finalize_base_align_conflict",
                 preserved_patch: patch,
               });
+            };
+
+            // Run one align STRATEGY, treating an UNEXPECTED throw (the S3 count-mismatch
+            // guard, or any git error) exactly like a `"conflict"` return. This is the whole
+            // point of the feature: the agent's work must be PRESERVED on failure, so an
+            // unexpected align error must route to failBaseAlignConflict (typed fail + diff),
+            // NOT escape to the generic catch below (raw message, no preserved_patch, defaulted
+            // fail_origin). Scoped to the align OPERATION only — the push keeps its own
+            // handling (workflow-scope → rebase fallback; any other push error rethrows).
+            const alignOp = async (strategy: "merge" | "rebase"): Promise<"aligned" | "conflict"> => {
+              try {
+                return await this.git.alignBranchWithDefault(
+                  runnerClone.path,
+                  result.branch,
+                  originalAgentTip,
+                  defTip,
+                  strategy,
+                );
+              } catch (e) {
+                runLog.warn(
+                  "finalize base-align: unexpected error during align; preserving diff and failing typed",
+                  { run_id: runId, strategy, error: errMessage(e) },
+                );
+                return "conflict";
+              }
             };
 
             // Re-fetch the aligned tip into the worker bare's tracking ref, then push once.
@@ -1473,13 +1495,7 @@ export class RunRunner {
                 text: "branch is behind the default branch on .github/workflows; aligning before pushing",
               },
             });
-            const mergeRes = await this.git.alignBranchWithDefault(
-              runnerClone.path,
-              result.branch,
-              originalAgentTip,
-              defTip,
-              "merge",
-            );
+            const mergeRes = await alignOp("merge");
             if (mergeRes === "aligned") {
               try {
                 await fetchAndPush();
@@ -1493,13 +1509,7 @@ export class RunRunner {
                   "finalize base-align: merge push still workflow-scope-rejected; trying rebase fallback",
                   { run_id: runId },
                 );
-                const rebaseRes = await this.git.alignBranchWithDefault(
-                  runnerClone.path,
-                  result.branch,
-                  originalAgentTip,
-                  defTip,
-                  "rebase",
-                );
+                const rebaseRes = await alignOp("rebase");
                 if (rebaseRes === "aligned") {
                   await fetchAndPush();
                 } else {
@@ -1508,18 +1518,12 @@ export class RunRunner {
                 }
               }
             } else {
-              // The merge conflicted — a rebase may still replay cleanly where a single merge
-              // did not, so try it before giving up.
+              // The merge conflicted (or errored) — a rebase may still replay cleanly where a
+              // single merge did not, so try it before giving up.
               runLog.info("finalize base-align: merge conflicted; trying rebase", {
                 run_id: runId,
               });
-              const rebaseRes = await this.git.alignBranchWithDefault(
-                runnerClone.path,
-                result.branch,
-                originalAgentTip,
-                defTip,
-                "rebase",
-              );
+              const rebaseRes = await alignOp("rebase");
               if (rebaseRes === "aligned") {
                 await fetchAndPush();
               } else {

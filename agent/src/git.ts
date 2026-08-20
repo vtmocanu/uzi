@@ -1003,13 +1003,17 @@ export class GitCache {
       }
 
       // rebase: count the branch's own commits (ahead of the target) before and after so a
-      // silently dropped commit is caught (S3).
+      // silently dropped commit is caught (S3). `--reapply-cherry-picks` re-applies commits
+      // whose change already landed on the target (git drops these by default), so a branch
+      // whose work overlaps main's new commits keeps ITS commits and the count stays honest —
+      // otherwise the S3 count guard would false-trip on safe, landable work.
       const before = await this.countAhead(clonePath, defaultTip, branch);
       try {
         await this.runGitAsRunner(clonePath, [
           "rebase",
           "--empty=keep",
           "--no-autosquash",
+          "--reapply-cherry-picks",
           targetRef,
         ]);
       } catch (err) {
