@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -343,15 +342,15 @@ func TestAdoptSeedsBoard(t *testing.T) {
 		t.Errorf("issue 1 item node id = %q, want item-content1", st.items[1].ItemNodeID)
 	}
 
-	// Unmatched column ("Later") recorded as a note; NOT cleared.
-	if st.linkErrCleared != 0 {
-		t.Errorf("unmatched columns present: last_error must not be cleared")
+	// An unmatched column ("Later") is a non-fatal ADVISORY, not an error: a
+	// successful adopt must still clear last_error and must NOT write the note to
+	// last_error (else a UI/poller reading non-null last_error would misread a
+	// healthy link). The note is surfaced via logs; a health surface is M7.
+	if st.linkErrCleared != 1 {
+		t.Errorf("successful adopt (even with unmatched columns) must clear last_error once, got %d", st.linkErrCleared)
 	}
-	if len(st.linkErrs) != 1 {
-		t.Fatalf("want 1 note recorded, got %v", st.linkErrs)
-	}
-	if want := "Later"; !strings.Contains(st.linkErrs[0], want) {
-		t.Errorf("note %q should mention the unmatched column %q", st.linkErrs[0], want)
+	if len(st.linkErrs) != 0 {
+		t.Errorf("advisory note must not be written to last_error, got %v", st.linkErrs)
 	}
 }
 

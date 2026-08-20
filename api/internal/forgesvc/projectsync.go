@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -152,16 +153,15 @@ func (s *ProjectSyncService) Adopt(ctx context.Context, repoID uuid.UUID, projec
 		}
 		return err
 	}
-	// Success. A non-empty note (unmatched board columns) is still worth surfacing
-	// on the link row rather than clearing it; a clean run clears last_error.
+	// Success clears last_error unconditionally. An unmatched-columns note is a
+	// non-fatal advisory, NOT an error, so it must not land in last_error — a UI
+	// or the poller treating a non-null last_error as "sync broken" would misread
+	// a healthy link. The note is logged (see adoptAndSeed); a proper health
+	// surface for advisories is M7's job.
 	if note != "" {
-		if serr := s.store.SetGithubProjectLinkError(ctx, store.SetGithubProjectLinkErrorParams{
-			LastError: pgtype.Text{String: truncateErr(note), Valid: true},
-			RepoID:    repoID,
-		}); serr != nil {
-			s.log.Warn("project sync: record adopt note", "repo", repoID, "error", serr)
-		}
-	} else if serr := s.store.ClearGithubProjectLinkError(ctx, repoID); serr != nil {
+		s.log.Info("project sync: adopt completed with advisory", "repo", repoID, "note", note)
+	}
+	if serr := s.store.ClearGithubProjectLinkError(ctx, repoID); serr != nil {
 		s.log.Warn("project sync: clear link error", "repo", repoID, "error", serr)
 	}
 	return nil
@@ -394,11 +394,18 @@ func unmatchedNote(unmatched []string) string {
 }
 
 // truncateErr bounds the text written to the link row's last_error so a verbose
-// forge error cannot bloat the row.
+// forge error cannot bloat the row. It cuts on a rune boundary so a multibyte
+// character straddling the limit is not split into an invalid UTF-8 sequence
+// (which Postgres would reject on the write).
 func truncateErr(s string) string {
 	const max = 500
-	if len(s) > max {
-		return s[:max]
+	if len(s) <= max {
+		return s
 	}
-	return s
+	// Back up off the limit until it lands on a rune start byte.
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }

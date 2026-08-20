@@ -277,7 +277,7 @@ func evaluateToken(forgeType forge.Type, info forge.TokenInfo, isAdmin bool, now
 	}
 
 	if !scopesAcceptable(forgeType, info.Scopes) {
-		tr.Violations = append(tr.Violations, fmt.Sprintf("token scopes %v are not exactly %v", info.Scopes, requiredScopesFor(forgeType)))
+		tr.Violations = append(tr.Violations, fmt.Sprintf("token scopes %v are not acceptable: they must include %v and add nothing beyond the allowed optional scopes %v", info.Scopes, requiredScopesFor(forgeType), allowedOptionalScopesFor(forgeType)))
 	}
 	if !info.Active {
 		tr.Violations = append(tr.Violations, "token is not active")

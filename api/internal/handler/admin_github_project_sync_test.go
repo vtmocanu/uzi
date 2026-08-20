@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -161,6 +162,10 @@ func TestAdoptErrorMapping(t *testing.T) {
 			}
 			if _, ok := body["error"]; !ok {
 				t.Errorf("error response must carry an {\"error\":...} body, got %s", w.Body.String())
+			}
+			// A 500 must not leak the raw internal error text to the client.
+			if tc.want == http.StatusInternalServerError && strings.Contains(w.Body.String(), "boom") {
+				t.Errorf("500 body leaked the raw error text: %s", w.Body.String())
 			}
 		})
 	}

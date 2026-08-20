@@ -226,8 +226,8 @@ func TestEvaluateToken(t *testing.T) {
 		wantWarning   string // substring expected in warnings, "" if none
 	}{
 		{"exactly api is clean", forge.TokenInfo{Scopes: []string{"api"}, Active: true}, false, "", ""},
-		{"extra scope is a violation", forge.TokenInfo{Scopes: []string{"api", "sudo"}, Active: true}, false, "are not exactly [api]", ""},
-		{"read_api instead of api is a violation", forge.TokenInfo{Scopes: []string{"read_api"}, Active: true}, false, "are not exactly [api]", ""},
+		{"extra scope is a violation", forge.TokenInfo{Scopes: []string{"api", "sudo"}, Active: true}, false, "are not acceptable", ""},
+		{"read_api instead of api is a violation", forge.TokenInfo{Scopes: []string{"read_api"}, Active: true}, false, "are not acceptable", ""},
 		{"instance admin is a violation", forge.TokenInfo{Scopes: []string{"api"}, Active: true}, true, "instance admin", ""},
 		{"inactive is a violation", forge.TokenInfo{Scopes: []string{"api"}, Active: false}, false, "not active", ""},
 		{"expired is a violation", forge.TokenInfo{Scopes: []string{"api"}, Active: true, ExpiresAt: expired}, false, "has expired", ""},
@@ -491,7 +491,7 @@ func TestScopesPerForge(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tr := evaluateToken(tc.forgeType, forge.TokenInfo{Scopes: tc.scopes, Active: true}, false, now, warnWindow, "")
-			got := hasFinding(tr.Violations, "are not exactly")
+			got := hasFinding(tr.Violations, "are not acceptable")
 			if got != tc.wantViolation {
 				t.Errorf("scopes %v on %s: scope violation = %v, want %v (violations=%v)",
 					tc.scopes, tc.forgeType, got, tc.wantViolation, tr.Violations)
