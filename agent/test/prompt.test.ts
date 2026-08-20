@@ -22,6 +22,7 @@ import {
   NOT_CODE_MARKER,
   REPO_SUBAGENT_UNTRUSTED_APPEND,
 } from "../src/prompt.js";
+import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
 import type {
   IssueCommentsSnapshot,
   MemoryEntry,
@@ -772,7 +773,7 @@ describe("buildLeadSystemPrompt", () => {
   it("PRD #457: the findings nudge is unconditional across run kinds", () => {
     // The tool name is the discoverability payload — assert it reaches the append on
     // the issue path AND a non-issue path, proving the push is not kind-gated.
-    const tool = "mcp__findings__report_incidental_issue";
+    const tool = reportIncidentalIssueToolName();
     for (const kind of ["issue", "ci_fix"] as const) {
       const { append } = buildLeadSystemPrompt(undefined, { kind });
       assert.ok(append.includes(FINDINGS_NUDGE_APPEND), `${kind}: nudge present`);
