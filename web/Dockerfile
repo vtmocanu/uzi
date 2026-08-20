@@ -32,6 +32,9 @@ RUN npm ci --ignore-scripts
 
 COPY web/ ./
 COPY docs/ /app/docs/
+# The in-app changelog panel bundles repo-root CHANGELOG.md via a `?raw` import
+# (web/src/lib/changelog.ts resolves `../../../CHANGELOG.md`); copy it beside docs/.
+COPY CHANGELOG.md /app/CHANGELOG.md
 RUN npm run build
 
 # --- runtime stage ---
