@@ -21597,3 +21597,61 @@ the intent `SKILL.md` already documented ("how many issues one `--sweep` fire *s
   limitation; a `scan_exhausted` fire-level signal to surface it is a possible follow-up, not
   shipped here. SQL-side eligibility pre-filtering and a user-configurable `backfillHeadroom` are
   likewise out of scope. Full rationale in the Decision Log of `prds/done/416-sweep-backfill-skipped-slots.md`.
+
+## 562. PRD #415 — in-app changelog / release-notes panel: a build-time bundle read from the build-info popover, synced by gates not a copy
+
+An owner-approved user-facing feature (no human.md item yet; proposed to the owner). Extends
+Feature #175's build-info popover: the version button's popover gains a **Changelog** button
+that opens a panel showing the repo's `CHANGELOG.md`, with running-version markers derived from
+the existing `GET /api/version`. Full rationale in the Decision Log of
+`prds/done/415-in-app-changelog.md`.
+
+- **Delivery is a build-time bundle, not a runtime endpoint.** The panel reads repo-root
+  `CHANGELOG.md` bundled at build time via the same `import.meta.glob(..., {query:"?raw"})`
+  mechanism the docs viewer (`web/src/lib/docs.ts`) uses — new module `web/src/lib/changelog.ts`.
+  No new API route, no runtime service, no committed second copy. `web/Dockerfile` gained
+  `COPY CHANGELOG.md /app/CHANGELOG.md` so the glob resolves inside the image build context.
+  Why: a static, versioned artifact needs no request path and cannot drift from the shipped image.
+
+- **Left-side drawer on the shared `Modal`, mounted once at `AppShell`.** `web/src/components/
+  ChangelogDrawer.tsx` is a left-side drawer built on the existing `Modal`, mounted at `AppShell`
+  level and opened from the popover's new Changelog button. Why AppShell and not inside the
+  popover: there are two `SidebarContent` mounts, so a drawer living inside the popover would be
+  double-mounted — hoisting it to the shell keeps a single instance.
+
+- **Popover close-semantics changed `onBlur`→focus-within; the `role="tooltip"` interactive-control
+  limitation is an ACCEPTED tradeoff, not an oversight.** To make an interactive control inside the
+  panel keyboard-reachable, the popover now closes on focus-leaving-the-subtree (focus-within)
+  rather than on `onBlur`. The panel keeps PRD #175's `role="tooltip"` + `aria-describedby` so the
+  build coordinates remain the version button's accessible description. Putting interactive controls
+  (the Changelog button, the PRDs link) inside a `role="tooltip"` is a known ARIA imperfection that
+  two independent reviewers flagged NON-BLOCKING (not a keyboard trap — focus flows in and out
+  correctly). Kept as-is rather than re-rolling the panel to a dialog/menu role, which would regress
+  the deliberate coordinates-as-description behavior. Recorded as an accepted limitation.
+
+- **Running-version markers derive from `GET /api/version`, guarded for non-semver; no wire/schema
+  change.** A small `X.Y.Z` comparator (`web/src/lib/semver.ts`) marks the matching release
+  "You're running this" and strictly-greater released versions "Newer", with a running-vs-latest
+  banner. A `dev`/`demo`/absent version renders a NEUTRAL panel: no markers, no banner. `[Unreleased]`
+  and `[NOT RELEASED]` sections are never marker-eligible. No new wire field, no DB/schema/migration.
+  `-rc.N` prereleases are unsupported (Model B is plain semver) — a documented limitation.
+
+- **`PRD #N` linkifies to the GitHub issue, only in rendered output; raw stays plain.** The transform
+  (`web/src/lib/changelogLinks.ts`) turns `PRD #N` into a link to `/issues/N` in rendered output
+  only — `CHANGELOG.md` keeps `PRD #N` plain and the transform does NOT touch the raw parity `body`
+  (so the parity gate below stays byte-exact). Repo base is overridable at build time via
+  `VITE_UZI_CHANGELOG_REPO_URL` (default `https://github.com/vtmocanu/uzi`) for forks.
+
+- **Sync is guaranteed by two gates, not a shared copy.** (1) A version-match check
+  (`web/scripts/check-changelog.mjs`, pure text: newest released CHANGELOG section ==
+  `Chart.yaml` version, self-skips outside a full checkout) wired into `task gate:web`. (2) A parity
+  vitest (`web/src/lib/changelog.parity.test.ts`) asserting each version's `Release.body` is
+  byte-identical to `scripts/changelog-section.sh body <ver>`. Why two: one pins the newest section
+  to the release version, the other pins every parsed section to its canonical source text.
+
+- **No CLI change.** The feature renders a repo file already visible via git/GitHub; a `uzi changelog`
+  verb is possible future scope, not built (`api/cmd/uzi/` untouched).
+
+- **CI wiring for the version-match gate is deferred to a maintainer follow-up.** The worker's git
+  token lacks `workflow` scope, so this run could not edit `.github/workflows/` to add the
+  `check-changelog.mjs` step. The parity gate already runs in CI via the existing `test:web` job.

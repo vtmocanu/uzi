@@ -19,6 +19,7 @@ import { onNotificationsChanged } from "../lib/notifications";
 import { useFavicon } from "../lib/useFavicon";
 import { JudgeTodoContext, JudgeTodoValueContext } from "./JudgeTodoContext";
 import { BuildInfoPopover } from "./BuildInfoPopover";
+import { ChangelogDrawer } from "./ChangelogDrawer";
 import {
   ActivityIcon,
   AlertIcon,
@@ -349,6 +350,7 @@ function SidebarContent({
   schedulesEnabled = 0,
   workersAttention = 0,
   findingsOpen = 0,
+  onOpenChangelog,
 }: {
   onNavigate?: () => void;
   // Desktop-only icon-rail mode. The mobile sheet always renders expanded (it is
@@ -379,6 +381,10 @@ function SidebarContent({
   // parent AppShell so the single poll feeds both this badge and the status
   // favicon (PRD #70), and both sidebar instances (desktop + mobile) share it.
   unread?: number;
+  // Opens the app-level changelog drawer (PRD #415 M2). AppShell passes the SAME
+  // callback to both SidebarContent mounts so the two footer triggers open one
+  // drawer instance mounted at AppShell scope — the drawer must NOT live here.
+  onOpenChangelog?: () => void;
 }) {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
@@ -675,7 +681,12 @@ function SidebarContent({
             saying different things. Renders nothing at all until the fetch resolves
             with a version, exactly as the old badge did. */}
         {build?.status === "ok" && build.info.version && (
-          <BuildInfoPopover info={build.info} collapsed={collapsed} fetchedAtMs={build.fetchedAtMs} />
+          <BuildInfoPopover
+            info={build.info}
+            collapsed={collapsed}
+            fetchedAtMs={build.fetchedAtMs}
+            onOpenChangelog={onOpenChangelog}
+          />
         )}
       </div>
     </div>
@@ -754,6 +765,14 @@ export function AppShell({ children }: { children: ReactNode }) {
   useEffect(() => {
     prefs.set(SIDEBAR_COLLAPSED_KEY, collapsed);
   }, [collapsed]);
+  // Changelog drawer (PRD #415 M2). Owned HERE, not in SidebarContent, because the
+  // sidebar is mounted twice (desktop rail + mobile drawer) and there must be a
+  // single drawer instance; both footer triggers call the same setter. Read the
+  // build snapshot from the shared module-scope promise so the drawer can mark the
+  // running version — the memoisation makes this the same GET the footer already
+  // issued, not a second request.
+  const [changelogOpen, setChangelogOpen] = useState(false);
+  const build = useBuildInfoSnapshot();
 
   // Unread badge: poll on navigation (no WS — PRD #46 M2) and refresh on the
   // in-app change event (e.g. after marking one read on the inbox page). A failed
@@ -929,6 +948,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           schedulesEnabled={schedulesEnabled}
           workersAttention={workersAttention}
           findingsOpen={findingsOpen}
+          onOpenChangelog={() => setChangelogOpen(true)}
         />
       </aside>
 
@@ -960,7 +980,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             >
               <XIcon />
             </button>
-            <SidebarContent onNavigate={() => setMobileOpen(false)} unread={unread} judgeTodo={judgeTodo} runsInProgress={runsInProgress} schedulesEnabled={schedulesEnabled} workersAttention={workersAttention} findingsOpen={findingsOpen} />
+            <SidebarContent onNavigate={() => setMobileOpen(false)} unread={unread} judgeTodo={judgeTodo} runsInProgress={runsInProgress} schedulesEnabled={schedulesEnabled} workersAttention={workersAttention} findingsOpen={findingsOpen} onOpenChangelog={() => setChangelogOpen(true)} />
           </div>
         </div>
       )}
@@ -979,6 +999,17 @@ export function AppShell({ children }: { children: ReactNode }) {
           </JudgeTodoContext.Provider>
         </div>
       </main>
+
+      {/* The ONE changelog drawer instance (PRD #415 M2). Mounted at AppShell scope,
+          not inside SidebarContent, because the sidebar renders twice; both footer
+          triggers set the same state. `runningVersion` is the footer's own version
+          coordinate, undefined until the shared /api/version fetch settles. */}
+      {changelogOpen && (
+        <ChangelogDrawer
+          runningVersion={build?.status === "ok" ? build.info.version : undefined}
+          onClose={() => setChangelogOpen(false)}
+        />
+      )}
     </div>
   );
 }

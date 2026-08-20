@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "check-docs": "node scripts/check-docs.mjs",
+    "check-changelog": "node scripts/check-changelog.mjs",
     "check-styles": "node scripts/check-styles.mjs",
     "lint": "oxlint --config .oxlintrc.json -D correctness --report-unused-disable-directives-severity=error src",
     "knip": "knip",

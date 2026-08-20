@@ -296,7 +296,7 @@ tasks:
       - task: test:controller
 
   gate:web:
-    desc: web - deps-check, lint, deadcode, check-docs, check-styles, typecheck, test
+    desc: web - deps-check, lint, deadcode, check-docs, check-changelog, check-styles, typecheck, test
     cmds:
       # 🔴 deps-check FIRST, AND IT DELIBERATELY BREAKS THE CHEAPEST-FIRST ORDER THE
       # REST OF THIS TARGET ARGUES FOR (PRD #103 M5 MR-C). oxlint is ~0.06s and this
@@ -385,6 +385,7 @@ tasks:
       # does not run tsc.
       - task: deadcode:web
       - task: check-docs:web
+      - task: check-changelog:web
       - task: check-styles:web
       - task: typecheck:web
       - task: test:web
@@ -1589,6 +1590,12 @@ tasks:
     dir: web
     cmds:
       - npm run check-docs
+
+  check-changelog:web:
+    desc: assert the newest released CHANGELOG section matches Chart.yaml version
+    dir: web
+    cmds:
+      - npm run check-changelog
 
   check-styles:web:
     desc: fail on Tailwind classes whose stem is not in tailwind.config.js

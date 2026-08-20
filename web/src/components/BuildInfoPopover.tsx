@@ -18,7 +18,12 @@
 import { useEffect, useId, useState } from "react";
 import type { ReactNode } from "react";
 import type { BuildInfo } from "../lib/api";
-import { cx } from "./ui";
+import { Button, cx } from "./ui";
+
+// The repo blob URL for the `prds/` directory. Hardcoded rather than imported from
+// docs.ts's REPO_BLOB_BASE so this footer component pulls in none of the docs
+// build-time glob; kept in step with that constant by hand.
+const PRDS_URL = "https://github.com/vtmocanu/uzi/tree/main/prds";
 
 // displayVersion prefixes a "v" only for a numeric version, so "0.6.0" reads
 // "v0.6.0" while "dev"/"demo" stay as-is and never become "vdev".
@@ -202,6 +207,11 @@ function Row({
 export function BuildInfoPopover({
   info,
   collapsed = false,
+  // Opens the app-level changelog drawer (PRD #415 M2). Optional: the popover is
+  // reused in tests without a changelog, and the button simply is not rendered when
+  // this is absent. AppShell threads ONE callback down to both SidebarContent mounts
+  // so the two triggers open a single drawer instance.
+  onOpenChangelog,
   // Injected only by tests, so the age/uptime assertions are not hostage to the
   // wall clock. Production always reads the real clock.
   now,
@@ -209,6 +219,7 @@ export function BuildInfoPopover({
 }: {
   info: BuildInfo;
   collapsed?: boolean;
+  onOpenChangelog?: () => void;
   now?: number;
   fetchedAtMs?: number;
 }) {
@@ -295,6 +306,19 @@ export function BuildInfoPopover({
       // instant the pointer crosses from the trigger onto the panel above it.
       onMouseEnter={() => setOpen(true)}
       onMouseLeave={() => setOpen(false)}
+      // FOCUS-WITHIN, on the host rather than the trigger. The panel now carries
+      // interactive controls (the Changelog button, the PRDs link), and a control
+      // inside it was keyboard-unreachable while blur lived on the trigger: tabbing
+      // from the version button fired ITS blur and closed the panel before the inner
+      // control could take focus. Keeping open/close on the host and testing
+      // relatedTarget keeps the popover open while focus is anywhere inside it and
+      // closes it only when focus leaves the whole host. onFocus/onBlur bubble in
+      // React (via focusin/focusout), so a child gaining or losing focus reaches
+      // these handlers.
+      onFocus={() => setOpen(true)}
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setOpen(false);
+      }}
     >
       <button
         type="button"
@@ -319,13 +343,14 @@ export function BuildInfoPopover({
         // aria-describedby alone, and announcing "collapsed"/"expanded" for
         // something a screen reader can already read in full would be noise.
         aria-describedby={popId}
-        // Focus opens it, which is what makes this keyboard-reachable at all. A tap
-        // opens it through onClick — which always OPENS rather than toggling, so a
-        // desktop click landing on an already-hovered badge cannot close it under
-        // the pointer. Escape is handled on the DOCUMENT while open (see above), not
-        // here, so it works for a hover-opened popover the badge never focused.
-        onFocus={() => setOpen(true)}
-        onBlur={() => setOpen(false)}
+        // Focus opens it, which is what makes this keyboard-reachable at all — but
+        // open/close on FOCUS now live on the host div (see the focus-within note
+        // there), because a control inside the panel must keep it open while it
+        // takes focus. A tap opens it through onClick — which always OPENS rather
+        // than toggling, so a desktop click landing on an already-hovered badge
+        // cannot close it under the pointer. Escape is handled on the DOCUMENT while
+        // open (see above), not here, so it works for a hover-opened popover the
+        // badge never focused.
         onClick={() => setOpen(true)}
         className={cx(
           "block w-full truncate text-left font-mono text-faint transition-colors",
@@ -395,10 +420,18 @@ export function BuildInfoPopover({
             <Row
               label="PRDs"
               value={
-                <>
+                // The count links to the repo's `prds/` directory (PRD #415 M2).
+                // External target, so it opens in a new tab and drops the opener.
+                // The `N done · M open` visual is unchanged — the anchor wraps it.
+                <a
+                  href={PRDS_URL}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="hover:underline"
+                >
                   <span className="text-ok">{prdsDone} done</span>{" "}
                   <span className="text-faint">· {prdsOpen} open</span>
-                </>
+                </a>
               }
             />
           )}
@@ -407,6 +440,23 @@ export function BuildInfoPopover({
               coordinates and the PRD counts. */}
           {uptime && <Row label="Uptime" value={uptime} />}
         </dl>
+        {/* Changelog opener (PRD #415 M2). An interactive control INSIDE the panel,
+            which is why the close logic moved to focus-within on the host — see that
+            note. Rendered only when a handler is wired (AppShell provides one; bare
+            test renders omit it). */}
+        {onOpenChangelog && (
+          <div className="mt-2 border-t border-edge pt-2">
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              className="w-full"
+              onClick={onOpenChangelog}
+            >
+              Changelog
+            </Button>
+          </div>
+        )}
       </div>
     </div>
   );
