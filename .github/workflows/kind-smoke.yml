@@ -106,7 +106,7 @@ jobs:
       - name: Setup Helm
         uses: azure/setup-helm@v5
         with:
-          version: v4.2.3
+          version: v4.2.4
 
       # Public CNPG operator, the SAME minor dev-cluster runs, pinned to a fixed
       # release-asset URL (not a moving branch). Wait for the controller before the
