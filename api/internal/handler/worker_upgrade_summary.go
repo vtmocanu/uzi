@@ -29,7 +29,7 @@ func (h *Handler) WorkerUpgradeSummary(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	summary, err := h.wsvc.UpgradeSummaryForUser(r.Context(), user.ID, h.version, h.startedAt, workersvc.UpgradeParams{})
+	summary, err := h.wsvc.UpgradeSummaryForUser(r.Context(), user.ID, h.version, h.cfg.HostedWorkerVersion, h.startedAt, workersvc.UpgradeParams{})
 	if err != nil {
 		slog.Error("worker upgrade summary", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
