@@ -14,6 +14,7 @@ import {
   buildRevisePlanPrompt,
   buildSelfImprovePlanPrompt,
   CI_CONFIG_MARKER,
+  FINDINGS_NUDGE_APPEND,
   isCIConfigPlan,
   isNotCodePlan,
   LEAD_GUARDRAIL_APPEND,
@@ -755,11 +756,28 @@ describe("buildLeadSystemPrompt", () => {
     // This is the lead's SYSTEM PROMPT, so an unreviewed clause reaching the model
     // unnoticed is exactly what the original equality was buying. Both pins stay:
     // adding anything to either path without updating this test reddens it.
+    // PRD #457: the findings nudge is pushed right after LEAD_GUARDRAIL_APPEND on
+    // EVERY kind (the findings server is mounted on every run lane), before the
+    // issue-only PRD-lifecycle clause.
     assert.strictEqual(
       buildLeadSystemPrompt(undefined, { kind: "issue" }).append,
-      [LEAD_GUARDRAIL_APPEND, PRD_LIFECYCLE_APPEND].join("\n\n"),
+      [LEAD_GUARDRAIL_APPEND, FINDINGS_NUDGE_APPEND, PRD_LIFECYCLE_APPEND].join("\n\n"),
     );
-    assert.strictEqual(buildLeadSystemPrompt(undefined, { kind: "ci_fix" }).append, LEAD_GUARDRAIL_APPEND);
+    assert.strictEqual(
+      buildLeadSystemPrompt(undefined, { kind: "ci_fix" }).append,
+      [LEAD_GUARDRAIL_APPEND, FINDINGS_NUDGE_APPEND].join("\n\n"),
+    );
+  });
+
+  it("PRD #457: the findings nudge is unconditional across run kinds", () => {
+    // The tool name is the discoverability payload — assert it reaches the append on
+    // the issue path AND a non-issue path, proving the push is not kind-gated.
+    const tool = "mcp__findings__report_incidental_issue";
+    for (const kind of ["issue", "ci_fix"] as const) {
+      const { append } = buildLeadSystemPrompt(undefined, { kind });
+      assert.ok(append.includes(FINDINGS_NUDGE_APPEND), `${kind}: nudge present`);
+      assert.ok(append.includes(tool), `${kind}: nudge names the findings tool`);
+    }
   });
 
   it("appends the template body ahead of the guardrail reminder", () => {
@@ -775,7 +793,10 @@ describe("buildLeadSystemPrompt", () => {
   it("falls back to the reminder only when the body is blank", () => {
     // A blank body must contribute nothing, whatever else the options add.
     assert.strictEqual(buildLeadSystemPrompt("   ").append, buildLeadSystemPrompt(undefined).append);
-    assert.strictEqual(buildLeadSystemPrompt("   ", { kind: "ci_fix" }).append, LEAD_GUARDRAIL_APPEND);
+    assert.strictEqual(
+      buildLeadSystemPrompt("   ", { kind: "ci_fix" }).append,
+      [LEAD_GUARDRAIL_APPEND, FINDINGS_NUDGE_APPEND].join("\n\n"),
+    );
   });
 
   it("appends the untrusted-review passage ONLY when the run is repo-sourced (PRD #37)", () => {

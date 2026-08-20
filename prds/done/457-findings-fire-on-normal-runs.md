@@ -2,7 +2,7 @@
 
 **Issue**: [#457](https://github.com/vtmocanu/uzi/issues/457)
 **Priority**: Medium
-**Status**: Draft
+**Status**: Complete
 
 ## Problem
 
@@ -130,7 +130,7 @@ the implementer's; keep it terse and framed as capability, not obligation):
 
 ## Milestones
 
-- [ ] **M1 — Capability grant at assembly.** `toDefinition` appends the findings tool
+- [x] **M1 — Capability grant at assembly.** `toDefinition` appends the findings tool
   to every subagent that has a restricted allowlist (dedup-guarded); inherit-all
   subagents untouched. Applies to both the builtin roster (`assembleAgents`) and the
   repo roster (`subagentsFromTemplates`). The tool survives the plan-turn write-strip.
@@ -139,12 +139,12 @@ the implementer's; keep it terse and framed as capability, not obligation):
   `planTurnSubagents` on the plan turn — compute that drop against the pre-grant list,
   or exclude the findings tool from the "consisted only of write tools" test. Ship the
   regression test with this milestone (see M4).
-- [ ] **M2 — Lead discovery nudge.** A short findings nudge is appended in
+- [x] **M2 — Lead discovery nudge.** A short findings nudge is appended in
   `buildLeadSystemPrompt`, on every run kind.
-- [ ] **M3 — Subagent discovery nudge.** The same one-line nudge is injected into each
+- [x] **M3 — Subagent discovery nudge.** The same one-line nudge is injected into each
   subagent's `prompt` in `toDefinition`, reaching shared-library repo agents without
   editing their files.
-- [ ] **M4 — Tests.** Unit tests prove: every subagent def carries the findings tool
+- [x] **M4 — Tests.** Unit tests prove: every subagent def carries the findings tool
   in its allowlist and the prompt nudge, across **both** the own/builtin path and the
   repo-sourced path; an inherit-all subagent (`coder`) is unaffected and can still
   call it; the plan-turn roster still carries the tool; and the lead system prompt
@@ -157,9 +157,11 @@ the implementer's; keep it terse and framed as capability, not obligation):
   and confirm the repo-roster path tests (`agent/test/runner-repo-agents.test.ts`,
   `agent/test/sdk-resume-honors-agents.test.ts`) don't deep-equal tool contents in a
   way the added member breaks.
-- [ ] **M5 — Docs.** Reconcile `docs/findings.md` with the new behaviour: confirm no
-  wording implies findings are lead-only, and (if useful) note that any run-lane
-  subagent can now flag one. Keep it light; do not describe internal wiring.
+- [x] **M5 — Docs.** Reconciled `docs/findings.md` with the new behaviour. It already
+  describes "the worker" flagging findings with no lead-only wording, and the "Which
+  runs can report a finding" note is framed by run kind, not by which internal agent
+  reports — so no edit was warranted (the optional subagent note was declined because
+  it would describe internal wiring, which this milestone excludes). No file change.
 
 ## Success criteria
 
