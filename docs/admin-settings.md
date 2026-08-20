@@ -164,6 +164,14 @@ the connected repo it targets, and its interval (default `48h`). Unlike the
 run judge, enabling this spends **the enabling admin's own token** on a
 standing basis — see the linked doc for what that means before turning it on.
 
+## GitHub Projects v2 sync
+
+Whether uzi keeps a GitHub repo's board columns synced with a linked GitHub
+Projects v2 board's Status field: the `github_project_sync_enabled` instance
+kill switch, off by default. See
+[GitHub Projects v2 sync](./github-project-sync.md) for what it does, the
+required PAT scope, and how a repo gets linked.
+
 ## Hosted worker quota
 
 On a k8s deployment with [hosted workers](./hosted-workers.md) turned on, a
