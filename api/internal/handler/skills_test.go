@@ -3,10 +3,12 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -198,9 +200,13 @@ func (f *fakeSkillDB) QueryRow(_ context.Context, _ string, args ...any) pgx.Row
 		return fakeScanRow{func(...any) error { return pgx.ErrNoRows }}
 	}
 	s := *f.skill
-	// GetSkillForViewer scans id, name, description, body, scope, user_id,
-	// updated_by, created_at, updated_at — the first five are all the DTO assertions
-	// below need; the rest keep their zero values.
+	// GetSkillForViewer scans all nine columns in this order: id, name,
+	// description, body, scope, user_id, updated_by, created_at, updated_at
+	// (store/skills.sql.go). Scatter EVERY column from the fixture so the full DTO
+	// round-trips — a fake that filled only id/name/scope would let a dropped field
+	// (e.g. body) sail past TestGetSkillDTOAllFields. The identity/404 callers set
+	// only id/name/scope on their fixtures, so the extra fields carry zero values
+	// there and change nothing for them.
 	return fakeScanRow{func(dest ...any) error {
 		if p, ok := dest[0].(*uuid.UUID); ok {
 			*p = s.ID
@@ -208,8 +214,26 @@ func (f *fakeSkillDB) QueryRow(_ context.Context, _ string, args ...any) pgx.Row
 		if p, ok := dest[1].(*string); ok {
 			*p = s.Name
 		}
+		if p, ok := dest[2].(*string); ok {
+			*p = s.Description
+		}
+		if p, ok := dest[3].(*string); ok {
+			*p = s.Body
+		}
 		if p, ok := dest[4].(*string); ok {
 			*p = s.Scope
+		}
+		if p, ok := dest[5].(*pgtype.UUID); ok {
+			*p = s.UserID
+		}
+		if p, ok := dest[6].(*pgtype.UUID); ok {
+			*p = s.UpdatedBy
+		}
+		if p, ok := dest[7].(*pgtype.Timestamptz); ok {
+			*p = s.CreatedAt
+		}
+		if p, ok := dest[8].(*pgtype.Timestamptz); ok {
+			*p = s.UpdatedAt
 		}
 		return nil
 	}}
@@ -314,6 +338,148 @@ func TestGetSkillNotFoundVsFound(t *testing.T) {
 		}
 		if out.Skill.ID != want.ID.String() || out.Skill.Name != want.Name || out.Skill.Scope != want.Scope {
 			t.Errorf("skill = %+v, want id=%s name=%s scope=%s", out.Skill, want.ID, want.Name, want.Scope)
+		}
+	})
+}
+
+// TestGetSkillDTOAllFields pins the found -> 200 body on ALL NINE skillDTO fields
+// (skills.go:24), not just the id/name/scope the existing found subtest checks.
+// body is the actual payload of a skills API, and user_id/updated_by/timestamps are
+// the audit trail; dropping any of them from skillToDTO would go unnoticed with a
+// three-field assertion. Every expected value is deliberately NON-ZERO so no
+// assertion is vacuously satisfiable (PRD #97 rule 4): user_id/updated_by are valid
+// pgtype.UUIDs (so the DTO's *string pointers are non-nil) and the two timestamps are
+// valid and distinct. Proven to bite by commenting out `Body: s.Body` (and, spot-
+// checked, `UserID`/`CreatedAt`) in skillToDTO.
+func TestGetSkillDTOAllFields(t *testing.T) {
+	userID := uuid.New()
+	updatedBy := uuid.New()
+	created := time.Date(2023, 1, 2, 3, 4, 5, 0, time.UTC)
+	updated := time.Date(2024, 6, 7, 8, 9, 10, 0, time.UTC)
+
+	want := store.Skill{
+		ID:          uuid.New(),
+		Name:        "deploy-runbook",
+		Description: "how to deploy the thing",
+		Body:        "# Playbook\n\nstep 1: do it\n",
+		Scope:       "user",
+		UserID:      pgUUID(userID),
+		UpdatedBy:   pgUUID(updatedBy),
+		CreatedAt:   pgtype.Timestamptz{Time: created, Valid: true},
+		UpdatedAt:   pgtype.Timestamptz{Time: updated, Valid: true},
+	}
+
+	rec := getSkillRec(t, &fakeSkillDB{skill: &want}, want.ID, adminCaller())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	var out struct {
+		Skill struct {
+			ID          string    `json:"id"`
+			Name        string    `json:"name"`
+			Description string    `json:"description"`
+			Body        string    `json:"body"`
+			Scope       string    `json:"scope"`
+			UserID      *string   `json:"user_id"`
+			UpdatedBy   *string   `json:"updated_by"`
+			CreatedAt   time.Time `json:"created_at"`
+			UpdatedAt   time.Time `json:"updated_at"`
+		} `json:"skill"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got := out.Skill
+
+	if got.ID != want.ID.String() {
+		t.Errorf("id = %q, want %q", got.ID, want.ID)
+	}
+	if got.Name != want.Name {
+		t.Errorf("name = %q, want %q", got.Name, want.Name)
+	}
+	if got.Description != want.Description {
+		t.Errorf("description = %q, want %q", got.Description, want.Description)
+	}
+	if got.Body != want.Body {
+		t.Errorf("body = %q, want %q", got.Body, want.Body)
+	}
+	if got.Scope != want.Scope {
+		t.Errorf("scope = %q, want %q", got.Scope, want.Scope)
+	}
+	if got.UserID == nil || *got.UserID != userID.String() {
+		t.Errorf("user_id = %v, want %q", got.UserID, userID)
+	}
+	if got.UpdatedBy == nil || *got.UpdatedBy != updatedBy.String() {
+		t.Errorf("updated_by = %v, want %q", got.UpdatedBy, updatedBy)
+	}
+	if !got.CreatedAt.Equal(created) {
+		t.Errorf("created_at = %v, want %v", got.CreatedAt, created)
+	}
+	if !got.UpdatedAt.Equal(updated) {
+		t.Errorf("updated_at = %v, want %v", got.UpdatedAt, updated)
+	}
+}
+
+// fakeErrSkillDB is a store.DBTX whose QueryRow scan reports a NON-ErrNoRows error,
+// standing in for a DB fault (dropped connection, query error) that GetSkill must map
+// to 500. The 404 branch is reserved for pgx.ErrNoRows alone (skills.go:198-205); a
+// generic error collapsing to 404 would be an existence-oracle lie in the opposite
+// direction — "does not exist" when the truth is "the DB fell over".
+type fakeErrSkillDB struct{}
+
+func (*fakeErrSkillDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, nil
+}
+func (*fakeErrSkillDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	return nil, pgx.ErrNoRows
+}
+func (*fakeErrSkillDB) QueryRow(context.Context, string, ...any) pgx.Row {
+	// A wrapped error that is explicitly NOT pgx.ErrNoRows.
+	return fakeScanRow{func(...any) error { return errors.New("boom: connection reset") }}
+}
+
+// TestGetSkillGenericErrorIs500 pins that a non-ErrNoRows DB error stays 500 and never
+// collapses to the 404 reserved for a genuinely absent row. Proven to bite by
+// transiently mapping all errors to 404 in GetSkill's error branch.
+func TestGetSkillGenericErrorIs500(t *testing.T) {
+	rec := getSkillRec(t, &fakeErrSkillDB{}, uuid.New(), nonAdminCaller())
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (a DB fault must not read as 404 not-found); body=%s",
+			rec.Code, rec.Body.String())
+	}
+}
+
+// TestGetSkillAuthAndParamGuards pins the two defence-in-depth edges behind RequireAuth
+// and chi routing: no user in context -> 401, an unparseable {id} -> 400. Terse on
+// purpose; the middleware/router normally never let these reach the handler.
+func TestGetSkillAuthAndParamGuards(t *testing.T) {
+	t.Run("no user in context -> 401", func(t *testing.T) {
+		id := uuid.New()
+		h := &Handler{q: store.New(&fakeSkillDB{})}
+		req := httptest.NewRequest(http.MethodGet, "/api/skills/"+id.String(), nil)
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", id.String())
+		// Deliberately NO mw.ContextWithUser.
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+		rec := httptest.NewRecorder()
+		h.GetSkill(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401; body=%s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("unparseable id -> 400", func(t *testing.T) {
+		h := &Handler{q: store.New(&fakeSkillDB{})}
+		req := httptest.NewRequest(http.MethodGet, "/api/skills/not-a-uuid", nil)
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", "not-a-uuid")
+		req = req.WithContext(context.WithValue(
+			mw.ContextWithUser(req.Context(), nonAdminCaller()), chi.RouteCtxKey, rctx))
+		rec := httptest.NewRecorder()
+		h.GetSkill(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
 		}
 	})
 }
