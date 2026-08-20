@@ -196,6 +196,41 @@ func bearerReq(router http.Handler, method, path, token string) *httptest.Respon
 	return rec
 }
 
+// bearerReqBody is bearerReq with a JSON body, for the write routes (e.g. task-runs)
+// whose handlers 400 on an empty body. token "" sends no Authorization header (the
+// no-credential path); body "" sends no body.
+func bearerReqBody(router http.Handler, method, path, token, body string) *httptest.ResponseRecorder {
+	var r io.Reader
+	if body != "" {
+		r = strings.NewReader(body)
+	}
+	req := httptest.NewRequest(method, path, r)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+// cliSeedOwnedRepo seeds a forge connection and one enabled repo (default_branch
+// 'main') owned by ownerID, and returns the repo id. It mirrors the connection+repo
+// half of cliSeedJudgedRun, for tests that only need an owned repo to POST to.
+func cliSeedOwnedRepo(t *testing.T, pool *pgxpool.Pool, ownerID uuid.UUID) uuid.UUID {
+	t.Helper()
+	connID, repoID := uuid.New(), uuid.New()
+	cliMustExec(t, pool,
+		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, ownerID, []byte{0x1})
+	cliMustExec(t, pool,
+		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		 VALUES ($1, $2, 1, 'g/r', 'https://forge.e2e/g/r', 'main', true)`, repoID, connID)
+	return repoID
+}
+
 // cliMintJWT issues a valid session JWT cookie value for userID, reading the row's
 // live token_version so RequireAuth's revocation check passes (the users default is
 // not 0).
@@ -670,5 +705,56 @@ func TestCLICRUDBearerRejectAndOwnerScopeLiveDB(t *testing.T) {
 	if rec := cookieReq(t, router, http.MethodDelete, "/api/me/cli-tokens/"+victimID.String(),
 		cliMintJWT(t, pool, owner), ""); rec.Code != http.StatusNoContent {
 		t.Errorf("owner DELETE own token = %d, want 204 (proves the 404 was scoping, not a missing row)\nbody: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// -------------------------------------------------------------------------
+// (k) POST /repos/{id}/task-runs (uzi handoff, PRD #400) is RequireUser, not the
+// cookie-only RequireAuth: a CLI Bearer token must reach it exactly like POST
+// /repos/{id}/runs. This is the issue #428 regression — the route was mounted in the
+// cookie-only group, so every CLI Bearer 401'd (uzi handoff exited 3). Driven through
+// the real mounted router so the middleware chain (RequireUser's presence-dispatch)
+// is what decides, not a direct handler call.
+// -------------------------------------------------------------------------
+
+func TestCLITaskRunsBearerReachableLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	user := cliSeedUser(t, pool, false)
+	uzc := cliMintToken(t, pool, user, clitoken.ScopeUser)
+	repoID := cliSeedOwnedRepo(t, pool, user)
+
+	path := "/api/repos/" + repoID.String() + "/task-runs"
+	const body = `{"context":"do the thing"}`
+
+	// 1. A valid uzc_ Bearer, no cookie, reaches the owner-scoped handler ⇒ 201. The
+	// regression made this 401 (route was cookie-only), which is what broke uzi handoff.
+	if rec := bearerReqBody(router, http.MethodPost, path, uzc, body); rec.Code != http.StatusCreated {
+		t.Errorf("valid uzc_ POST %s = %d, want 201 (RequireUser must accept the CLI Bearer path)\nbody: %s", path, rec.Code, rec.Body.String())
+	}
+
+	// 2. No credential at all is still refused ⇒ 401. Proves the 201 above is the
+	// credential being honoured, not an unauthenticated route.
+	if rec := bearerReqBody(router, http.MethodPost, path, "", body); rec.Code != http.StatusUnauthorized {
+		t.Errorf("no-credential POST %s = %d, want 401 (task-runs is authenticated)\nbody: %s", path, rec.Code, rec.Body.String())
+	}
+
+	// 3. The browser path is unchanged: a valid session cookie + a valid CSRF header
+	// reaches the same handler ⇒ 201.
+	if rec := cookieReq(t, router, http.MethodPost, path, cliMintJWT(t, pool, user), body); rec.Code != http.StatusCreated {
+		t.Errorf("valid cookie+CSRF POST %s = %d, want 201 (browser path unchanged)\nbody: %s", path, rec.Code, rec.Body.String())
+	}
+
+	// 4. Presence-dispatch is preserved: a valid session cookie plus a BOGUS
+	// Authorization header takes the bearer path (bad token → 401) and must NOT fall
+	// back to the cookie path — mirrors TestCLICSRFBypassShapeLiveDB's bogus-Bearer
+	// assertion, now for a write route.
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: cliMintJWT(t, pool, user)})
+	req.Header.Set("Authorization", "Bearer uzc_not-a-real-token")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("cookie + bogus Bearer POST %s = %d, want 401 (presence-dispatch must not fall back to cookie)\nbody: %s", path, rec.Code, rec.Body.String())
 	}
 }

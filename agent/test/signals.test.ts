@@ -456,16 +456,14 @@ describe("scanSignals report_progress (PRD #122 M2)", () => {
     );
   });
 
-  it("drops malformed input without throwing (empty arrays, never a throw)", () => {
-    // A completely empty call still sets progress with two empty arrays (the tool fired).
-    assert.deepStrictEqual(scanSignals(toolUse(PROGRESS, {})).progress, {
-      completed: [],
-      in_progress: [],
-    });
-    // Non-array sides ⇒ empty arrays.
-    assert.deepStrictEqual(
+  it("drops malformed input without throwing (all-empty = no signal, PRD #390 D3)", () => {
+    // PRD #390 D3: a completely empty call is NO SIGNAL — it must not persist a
+    // misleading `[]`, so progress stays undefined.
+    assert.strictEqual(scanSignals(toolUse(PROGRESS, {})).progress, undefined);
+    // Non-array sides parse to two empty arrays ⇒ still no signal ⇒ undefined.
+    assert.strictEqual(
       scanSignals(toolUse(PROGRESS, { completed: "nope", in_progress: 42 })).progress,
-      { completed: [], in_progress: [] },
+      undefined,
     );
     // Junk entries dropped, blanks removed, ids trimmed, numbers/booleans coerced, deduped.
     assert.deepStrictEqual(
@@ -499,6 +497,23 @@ describe("scanSignals report_progress (PRD #122 M2)", () => {
     assert.deepStrictEqual(scanSignals(msg).progress, {
       completed: ["m1", "m2"],
       in_progress: [],
+    });
+  });
+
+  it("a later all-empty report does NOT wipe an earlier real one (PRD #390 D3)", () => {
+    const msg = {
+      type: "assistant",
+      session_id: "s",
+      message: {
+        content: [
+          { type: "tool_use", id: "a", name: PROGRESS, input: { completed: ["m1"], in_progress: ["m2"] } },
+          { type: "tool_use", id: "b", name: PROGRESS, input: {} },
+        ],
+      },
+    };
+    assert.deepStrictEqual(scanSignals(msg).progress, {
+      completed: ["m1"],
+      in_progress: ["m2"],
     });
   });
 });

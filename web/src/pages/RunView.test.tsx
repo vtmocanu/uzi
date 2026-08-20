@@ -3284,6 +3284,19 @@ describe("MilestoneBadge (compact M{done}/{total}, PRD #122)", () => {
     render(<MilestoneBadge run={run({ milestones: ms(4), milestones_completed: [] })} />);
     expect(screen.getByText("M0/4")).toBeTruthy();
   });
+
+  // PRD #390 D5 / M4. The two cases above assert the visible LABEL; the tooltip that tells the
+  // states apart on hover is a `title` ATTRIBUTE, invisible to a text query — so a regression
+  // that handed the neutral state the "reported complete" wording (or the reverse) would slip
+  // past them. Assert the attribute on both states directly.
+  it("carries the 'not reported' tooltip on the neutral state and 'reported complete' on a genuine zero (PRD #390 D5)", () => {
+    const { rerender } = render(<MilestoneBadge run={run({ milestones: ms(4), milestones_completed: null })} />);
+    const neutral = screen.getByText("M–/4");
+    expect(neutral.getAttribute("title")).toBe("No milestone completion reported for this run");
+    rerender(<MilestoneBadge run={run({ milestones: ms(4), milestones_completed: [] })} />);
+    const zero = screen.getByText("M0/4");
+    expect(zero.getAttribute("title")).toBe("Milestones reported complete of the approved plan");
+  });
 });
 
 describe("MilestoneChecklist (done / in-progress / left, PRD #122)", () => {

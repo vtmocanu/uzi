@@ -2,7 +2,7 @@
 
 - **Issue**: [#427](https://github.com/vtmocanu/uzi/issues/427)
 - **Priority**: Medium
-- **Status**: Draft — not started
+- **Status**: Done — all five milestones landed on `agent/issue-427` (M1 resolution core, M2 `context` verbs, M3 per-context writes + `status --all` + `context set`, M4 docs, M5 gate + smoke).
 - **Forge scope**: Forge-agnostic. This is a **client-side CLI-only** change (config/credential resolution in `api/cmd/uzi` + `api/internal/uzicli`). No server, API, DTO, route, auth-tier, or migration change. It works identically against a GitLab, Forgejo, or GitHub uzi instance because it touches nothing that talks to a forge.
 - **Handoff**: Send to uzi (Auto mode), offline worker. This PRD is entirely codebase-local — every fact below was resolved from this repo, and no milestone needs open-web access. All tests are pure Go unit tests in `api/cmd/uzi` / `api/internal/uzicli` (no live DB, no network, no browser).
 
