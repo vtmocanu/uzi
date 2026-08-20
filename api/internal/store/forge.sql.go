@@ -154,6 +154,25 @@ func (q *Queries) ClearRepoGuardrailOverride(ctx context.Context, id uuid.UUID) 
 	return i, err
 }
 
+const countActiveRunsForRepo = `-- name: CountActiveRunsForRepo :one
+SELECT count(*) FROM runs
+WHERE repo_id = $1::uuid
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+`
+
+// Non-terminal run count for a repo (PRD #357 D7). "Disabled" is not "quiescent":
+// disabling only drops the repo from the poll set, it does not cancel an in-flight
+// run. Removal is refused while any run is in a non-terminal state. Uses the
+// terminal complement (like CountActiveRunsWithBranch, ci_fix.sql) so it covers
+// limit_wait (a parked run is still in flight, PRD #35) and any future non-terminal
+// status without an edit here.
+func (q *Queries) CountActiveRunsForRepo(ctx context.Context, repoID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countActiveRunsForRepo, repoID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countBoardColumns = `-- name: CountBoardColumns :one
 SELECT count(*) FROM board_columns WHERE repo_id = $1
 `
@@ -211,6 +230,30 @@ type DeleteIssuesNotInParams struct {
 // mean "the forge really is empty" rather than "one request timed out".
 func (q *Queries) DeleteIssuesNotIn(ctx context.Context, arg DeleteIssuesNotInParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteIssuesNotIn, arg.RepoID, arg.KeepIids)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteRepoForUser = `-- name: DeleteRepoForUser :execrows
+DELETE FROM repos
+WHERE repos.id = $1
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $2)
+  AND repos.enabled = false
+`
+
+type DeleteRepoForUserParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// Owner-scoped hard delete of a single repo (PRD #357). The `AND enabled = false`
+// is the atomic race guard (D6): a concurrent enable between the handler's fetch
+// and this delete must not let a tracked repo through. Cascades derived data
+// (runs, cached issues, board columns, ...) via existing FKs.
+func (q *Queries) DeleteRepoForUser(ctx context.Context, arg DeleteRepoForUserParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteRepoForUser, arg.ID, arg.UserID)
 	if err != nil {
 		return 0, err
 	}

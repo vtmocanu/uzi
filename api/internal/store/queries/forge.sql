@@ -151,6 +151,27 @@ WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
 RETURNING *;
 
+-- name: DeleteRepoForUser :execrows
+-- Owner-scoped hard delete of a single repo (PRD #357). The `AND enabled = false`
+-- is the atomic race guard (D6): a concurrent enable between the handler's fetch
+-- and this delete must not let a tracked repo through. Cascades derived data
+-- (runs, cached issues, board columns, ...) via existing FKs.
+DELETE FROM repos
+WHERE repos.id = $1
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $2)
+  AND repos.enabled = false;
+
+-- name: CountActiveRunsForRepo :one
+-- Non-terminal run count for a repo (PRD #357 D7). "Disabled" is not "quiescent":
+-- disabling only drops the repo from the poll set, it does not cancel an in-flight
+-- run. Removal is refused while any run is in a non-terminal state. Uses the
+-- terminal complement (like CountActiveRunsWithBranch, ci_fix.sql) so it covers
+-- limit_wait (a parked run is still in flight, PRD #35) and any future non-terminal
+-- status without an edit here.
+SELECT count(*) FROM runs
+WHERE repo_id = @repo_id::uuid
+  AND status NOT IN ('completed', 'failed', 'cancelled');
+
 -- name: SetRepoDevboxOptInForUser :one
 -- Tier-2 repo devbox.json opt-in toggle (PRD #18 M5), authorized through the
 -- repo's owning connection. A non-owned or unknown id returns no rows (404).
