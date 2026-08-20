@@ -56,8 +56,17 @@ function pastAnchor(r: RunListItem): string {
   return r.finished_at ?? r.updated_at;
 }
 
-function sortPast(a: RunListItem, b: RunListItem): number {
-  const t = pastAnchor(b).localeCompare(pastAnchor(a));
+// pastInstant parses the anchor to an epoch-ms instant. Date.parse and NOT a string
+// compare: Go trims trailing zeros from the fractional seconds, so same-second stamps
+// of differing precision ("…:00Z" vs "…:00.5Z") order correctly as instants and
+// INCORRECTLY as strings (see lib/boardOrder.ts's timeKey).
+function pastInstant(r: RunListItem): number {
+  const t = Date.parse(pastAnchor(r));
+  return Number.isNaN(t) ? -Infinity : t;
+}
+
+export function sortPast(a: RunListItem, b: RunListItem): number {
+  const t = pastInstant(b) - pastInstant(a);
   if (t !== 0) return t;
   return (PAST_STATUS_RANK[a.status] ?? 3) - (PAST_STATUS_RANK[b.status] ?? 3);
 }

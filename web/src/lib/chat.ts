@@ -106,8 +106,18 @@ export function conversationSortKey(c: Chat): string {
   return c.last_message_at ?? c.updated_at;
 }
 
+// conversationInstant parses the sort key to an epoch-ms instant. Date.parse and
+// NOT a string compare: Go marshals time.Time with trailing zeros TRIMMED from the
+// fractional seconds, so same-second stamps of differing precision ("…:00Z" vs
+// "…:00.5Z") order correctly as instants and INCORRECTLY as strings (see
+// boardOrder.ts's timeKey). A missing/unparseable key sorts last (most-recent first).
+function conversationInstant(c: Chat): number {
+  const t = Date.parse(conversationSortKey(c));
+  return Number.isNaN(t) ? -Infinity : t;
+}
+
 export function sortConversations(chats: Chat[]): Chat[] {
-  return [...chats].sort((a, b) => conversationSortKey(b).localeCompare(conversationSortKey(a)));
+  return [...chats].sort((a, b) => conversationInstant(b) - conversationInstant(a));
 }
 
 // conversationTitle is the display label for a conversation row — the derived

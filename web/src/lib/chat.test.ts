@@ -161,6 +161,17 @@ describe("chatIsEnded / conversationTitle / sortConversations", () => {
     const sorted = sortConversations([older, noMsg, newer]);
     expect(sorted.map((c) => c.id)).toEqual(["new", "nomsg", "old"]);
   });
+
+  it("sortConversations orders same-second stamps by instant, not string (Go trims fractional zeros)", () => {
+    // Go marshals the whole second as "…:00Z" and the sub-second as "…:00.5Z"; the
+    // latter is LATER but sorts as SMALLER under a string compare ('.' < 'Z'), so a
+    // string-keyed sort shows the more-recent conversation as older. Fails on
+    // localeCompare, passes on the instant compare.
+    const earlier = aChat({ id: "earlier", last_message_at: "2026-07-05T10:00:00Z" });
+    const later = aChat({ id: "later", last_message_at: "2026-07-05T10:00:00.5Z" });
+    const sorted = sortConversations([earlier, later]);
+    expect(sorted.map((c) => c.id)).toEqual(["later", "earlier"]);
+  });
 });
 
 describe("chatFromRun (create/continue runDTO → unified Chat view)", () => {
