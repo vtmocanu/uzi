@@ -131,6 +131,39 @@ describe("Schedules — fire outcomes (PRD #308 M4)", () => {
     expect(chip.getAttribute("href")).toBe("/runs/3f1a2b7c-dead-beef-0000-000000000000");
   });
 
+  it("backfill (issue #416): a fire that backfilled past a skip shows the started runs AND the flagged skip, and the tally is relabeled 'examined' (may exceed max_issues)", async () => {
+    only1({
+      target: "sweep",
+      max_issues: 3,
+      // examined 4 = started 3 (10, 30, 40 — 30/40 backfilled past the skip) + skipped 1 (20).
+      // matched is the WIRE field name (unchanged); it now carries the examined count.
+      last_fire: fire({
+        matched: 4,
+        capped: false,
+        started: [
+          { issue_iid: 10, run_id: "10101010-0000-0000-0000-000000000000", title: "oldest eligible" },
+          { issue_iid: 30, run_id: "30303030-0000-0000-0000-000000000000", title: "backfilled one" },
+          { issue_iid: 40, run_id: "40404040-0000-0000-0000-000000000000", title: "backfilled two" },
+        ],
+        skips: [{ issue_iid: 20, title: "no prd here", reason: "no_prd_link" }],
+      }),
+    });
+    renderPage();
+    // Collapsed cell: three runs started even though the 2nd candidate was skipped.
+    await waitFor(() => expect(screen.getByText("3 started")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "Last fire" }));
+    // Both a started run row and the skipped candidate row render together.
+    expect(screen.getByText("backfilled two")).toBeTruthy();
+    expect(screen.getByText("no prd here")).toBeTruthy();
+    expect(screen.getByText("no PRD link")).toBeTruthy();
+    // The tally label is "examined", not "matched" (and its value 4 exceeds max_issues 3).
+    expect(screen.getByText("examined")).toBeTruthy();
+    expect(screen.queryByText("matched")).toBeNull();
+    // The started-nothing cap hint must NOT show — the fire started runs.
+    expect(screen.queryByText("Nothing newer was reached.")).toBeNull();
+  });
+
   it("started-nothing: an amber '0 started · 1 skipped' badge, expandable to the skip + its reason", async () => {
     only1({
       target: "sweep",
