@@ -53,9 +53,9 @@ Below, a run id is written `RUN` and a PR number `PR` in the example commands.
 5. **Watch to MR.** After approving, narrow the poller's stop set past the gate you just
    cleared: `watch-run.sh RUN completed,failed,cancelled 60`. A `failed`/`cancelled`
    result → diagnose (see *When a run fails*) and stop.
-6. **Get the MR and review the diff.** `uzi run get RUN --field mr_web_url`; review with
-   `/code-review` or a `reviewer` agent for anything non-trivial, plus `gh pr diff`.
-   Verify the diff against the approved plan.
+6. **Get the MR and review the diff.** `uzi run get RUN --field mr_web_url`, then review
+   (see *Reviewing the diff* below), plus `gh pr diff`. Verify the diff against the
+   approved plan.
 7. **Merge** (see *Merging past branch protection*).
 8. **Watch post-merge CI and fix** (see *Post-merge CI*).
 
@@ -93,6 +93,19 @@ SEQ=$(uzi run logs RUN --json | jq -rs '[.[]|select(.kind=="plan")|.seq]|max // 
 uzi run revise RUN -m "…the precise change…"
 <this skill's directory>/scripts/watch-run.sh RUN "" "" "" "$SEQ"
 ```
+
+**🔴 NEVER put backticks in the `-m` message when it is DOUBLE-quoted (the Bash tool
+runs zsh).** Backticks inside a double-quoted string are command substitution: a message
+like -m "add a (backtick)task foo(backtick) step" actually runs `task foo`, replaces the
+whole backticked span with that command's stdout, and sends uzi a message with the
+identifier silently blanked out — the revise still succeeds, so the corruption is
+invisible until you read the mangled plan back (measured 2026-08-20: two backticked
+`task check-changelog:web` spans ran the erroring command and were dropped from the
+message uzi received). The core directive survived only because it had no backticks.
+**Single-quote the whole message** so nothing is evaluated, or drop the backticks
+entirely. `$`, `$(…)` and unescaped `!` bite the same way inside double quotes; single
+quotes disarm all of them. Always re-read the revised plan at the next gate to confirm
+your instruction landed — do not assume the message arrived clean.
 
 ## Plan-trap checks (run before every approve)
 
@@ -135,6 +148,42 @@ workflow-file pieces locally, because your own token has `workflow` scope (confi
   `grep -nA14 'validate-web:' .github/workflows/ci.yml`.
 - **For an already-failed run**, re-create it gated and revise out the workflow edit; the
   old work cannot be salvaged.
+
+## Reviewing the diff
+
+The watcher's merge-gate review is a **second, confirmatory** pass: uzi already ran its own
+internal review wave inside the run (a reviewer + auditor + fact-checker over each commit,
+per the plan's "read-only validation wave"). So default to the **lighter, faster** tool and
+escalate only where an independent deep look earns its keep.
+
+- **Default — `/code-review medium` on the PR** (`/code-review <PR#>` for a GitHub PR; it
+  reuses your last effort level if you omit one). It is purpose-built for correctness +
+  reuse/simplification findings and is faster than briefing a from-scratch agent. It runs
+  in your session turn, but that does **not** stall the other runs — the background pollers
+  are the parallel machinery, and the review is a per-PR serial step you do when one run
+  reaches its MR anyway. Bump to `/code-review high` for a broader sweep.
+- **Escalate to a bespoke `reviewer` agent** (a custom prompt naming the plan's specific
+  invariants) when the diff is one of: **security / auth / credential**-touching (a generic
+  pass won't reason about 0600 perms, token-leak paths, or a cookie-only route the way a
+  targeted prompt will); **subtle state / concurrency logic** (a sticky latch, an
+  off-by-one counter, a re-arm condition); a **test-only diff whose main risk is the
+  vacuous-assertion trap** (a generic reviewer won't know to demand `IsAdmin==true` over
+  the zero value — name it); or simply **large**. Give the agent the approved plan's
+  invariants verbatim and have it review at the immutable PR-head SHA in an isolated
+  `git worktree add --detach` (the shared `main` worktree is often dirty and moves under a
+  reviewer — see below).
+- **Always yours, whichever reviewer runs** — the cheap deterministic checks a reviewer
+  isn't for: the `.github/workflows` grep on the changed-file list (`gh pr diff PR
+  --name-only`), and the **plan↔diff scope match** (did the worker do what the plan said,
+  no more, no less).
+
+**The shared `main` worktree is a multi-writer tree — never assert it is clean.** Other
+sessions leave modified files in it and advance `main` mid-review (measured 2026-08-20:
+two reviewers found unrelated `tui_*` edits and `main` moving `6fc6c5eb`→`2007cbf4` under
+them). This never blocks a merge — `gh pr merge` is a GitHub-side op that reads the PR
+branch, not your local tree — but it means a local commit here (e.g. a docs/skill fix) must
+`git add` **only** its own file(s), never `git add -A`, and you must leave the foreign dirty
+files and any `wt-*` ghost worktrees alone.
 
 ## Merging past branch protection
 
