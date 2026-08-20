@@ -779,8 +779,9 @@ func keysOf(m map[string]bool) []string {
 
 // --- cordon / defer-roll on drift (PRD #422 M4) ----------------------------
 
-// fakeCordoner records the worker ids handed to RequestDrain and can force the
-// write to fail, so a test can prove the fail-safe defer path.
+// fakeCordoner records the worker ids handed to RequestDrain (cordon) and to
+// ClearDrain (uncordon), and can force either write to fail, so a test can prove
+// the fail-safe defer path and the no-drift uncordon-and-retry path.
 type fakeCordoner struct {
 	calls      []string
 	err        error

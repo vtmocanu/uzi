@@ -26,6 +26,21 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   note:** an out-of-tree per-cluster values file that left `workers.image.tag` empty
   must now set a concrete pinned tag (the chart `required`-wraps it).
 
+### Fixed
+
+- **A hosted worker cordoned mid-rollout no longer stays cordoned forever when the
+  drift is reverted ([#458](https://github.com/vtmocanu/uzi/issues/458)).** If an
+  operator reverted `workers.image.tag` after a busy hosted worker had been cordoned
+  (`draining_since` set) but before it rolled, the worker kept heartbeating ("online")
+  yet claimed no runs forever — `draining_since` was cleared only by a worker
+  re-registering on an actual roll, and a reverted drift never rolls, so neither the
+  drain deadline nor an operator force-roll could recover it. The controller now
+  clears the cordon on its no-drift reconcile path (a new
+  `DELETE /api/controller/workers/{id}/drain` uncordon control-write mirroring the
+  cordon `POST`), so the worker resumes claiming within one reconcile tick instead of
+  needing a manual pod restart. Follow-up to [#422](https://github.com/vtmocanu/uzi/issues/422); see
+  `adr/0422-decouple-worker-version.md`.
+
 ## [0.48.0] - 2026-08-20
 <!-- release-title: signed container images and chart -->
 
