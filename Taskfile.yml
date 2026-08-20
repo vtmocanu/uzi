@@ -703,6 +703,11 @@ tasks:
       # detect, or it exits 2 (instrument broken). See the script header.
       - ./scripts/check-spec-numbering.sh specs/ai.md scripts/spec-numbering-canary.md
 
+  render:worker-tag-check:
+    desc: assert the hosted-worker image tag is pinned independently of Chart.AppVersion (PRD 422 M1)
+    cmds:
+      - ./scripts/assert-worker-tag-decoupled.sh
+
   scan:secrets:
     desc: gitleaks over every tracked file, with a canary proving the scanner ran
     cmds:

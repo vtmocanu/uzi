@@ -378,8 +378,9 @@ workers:
   # --- the per-template agent images the controller renders (M6) ------------------
   #
   # The REPO PREFIX only. The controller appends "/agent-<template>:<tag>"
-  # (controller/internal/preset), so this must equal what CI publishes:
-  # .gitlab-ci.yml HARBOR_AGENT_IMAGE_PREFIX is this value + "/agent".
+  # (controller/internal/preset), so this must equal what CI publishes: the GitHub
+  # Actions publish (.github/workflows/release.yml) pushes the agent images under this
+  # value + "/agent".
   #
   # A template the product offers (api/internal/workertmpl) but CI never published
   # provisions a worker that sits in ImagePullBackOff forever — which in v1 surfaces
@@ -387,10 +388,16 @@ workers:
   # not by a gate.
   image:
     repository: ghcr.io/vtmocanu/uzi
-    # Unset => Chart.appVersion (Model B). Changing the tag is what rolls every hosted
-    # worker onto a new release (Decision 9) — the controller stamps it into the pod
-    # spec hash, so a release rolls the fleet as its workers finish their runs.
-    tag: ""
+    # A CONCRETE pinned worker version, decoupled from Chart.appVersion (PRD #422
+    # Decision 1/3). This reverses the old Model B lockstep (tag "" => appVersion): an
+    # app-only release (bumping Chart.version/appVersion for an api/web/chart change)
+    # does NOT move this tag, so it rolls ZERO worker pods. Advancing it is a deliberate
+    # operator step and is what rolls every hosted worker onto a new agent release
+    # (Decision 9) — the controller stamps this literal string into the pod-spec hash,
+    # so the fleet rolls as its workers finish their runs. It must be concrete: the
+    # controller-deployment template wraps it in `required`, so a blank tag fails the
+    # render loudly rather than shipping an empty image reference.
+    tag: "0.48.0"
   # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
   # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
   # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image
