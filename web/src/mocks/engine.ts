@@ -21,11 +21,18 @@ import { appendMessage, getRun, listMessages, nextProposalId, patchRun, putPropo
 //
 // PLAN_RESULT_FRAME: the plan TURN's own cumulative-usage frame (a distinct
 // "Plan" per-phase row).
+//
+// issue #199 (defect 4): `num_turns` is PER-INVOCATION, not a running total
+// (runUsage.ts:11), so the plan frame's count deliberately EXCEEDS the implement
+// frame's below (16 → 11). A decreasing sequence is the one shape a cumulative
+// counter cannot produce, which is what makes the per-invocation semantics
+// unambiguous — a monotonically rising 9 → 61 reads as a running total and once
+// manufactured a false "turns double-counted" bug report against deriveRunUsage.
 export const PLAN_RESULT_FRAME = {
   event: "result",
   subtype: "success",
   duration_ms: 5 * 60_000,
-  num_turns: 9,
+  num_turns: 16,
   total_cost_usd: 0.24,
   usage: { input_tokens: 21_400, cache_read_input_tokens: 188_000, cache_creation_input_tokens: 0, output_tokens: 6_100 },
   modelUsage: {
@@ -37,11 +44,15 @@ export const PLAN_RESULT_FRAME = {
 // RUN_RESULT_FRAME: the implement TURN's cumulative run-usage frame. It DROPS
 // sonnet-4-6 and ADDS opus-4-8 versus the plan frame — deliberately demonstrating
 // the issue #195 "a model present in one frame drops in another" property.
+// `num_turns` (11) is deliberately BELOW the plan frame's (16): per-invocation, not
+// cumulative (issue #199) — a focused post-approval burst after a heavier plan
+// exploration, the real "13 then 2" shape. More tokens/cost in fewer turns is
+// legitimate: turns ≠ tokens.
 export const RUN_RESULT_FRAME = {
   event: "result",
   subtype: "success",
   duration_ms: 21 * 60_000 + 44_000,
-  num_turns: 61,
+  num_turns: 11,
   total_cost_usd: 1.87,
   // PRD #40: cumulative run usage (the strip/per-phase table fold from here).
   usage: { input_tokens: 114_400, cache_read_input_tokens: 1_170_000, cache_creation_input_tokens: 0, output_tokens: 48_200 },

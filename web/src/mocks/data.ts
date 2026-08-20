@@ -3684,11 +3684,15 @@ export const mockDoneMessages: RunMessage[] = [
   dm("tool_result", "lead", { tool_use_id: "tu-2", content: "web/src/components/RunEvent.tsx:12\nweb/src/components/ActivityFeed.tsx:44" }, 217),
   dm("plan", "lead", { text: SAMPLE_PLAN() }, 216),
   // PRD #40: the plan turn's own result frame → a distinct "Plan" per-phase row.
+  // issue #199 (defect 4): `num_turns` is PER-INVOCATION, not a running total, so the
+  // plan frame (16) deliberately EXCEEDS the implement frame (11) below. A decreasing
+  // sequence is the one shape a cumulative counter cannot produce, so it disambiguates
+  // the per-phase table's summed total — a rising pair reads as a double-count.
   dm("status", null, {
     event: "result",
     subtype: "success",
     duration_ms: 5 * 60_000,
-    num_turns: 9,
+    num_turns: 16,
     total_cost_usd: 0.24,
     usage: { input_tokens: 21_400, cache_read_input_tokens: 188_000, cache_creation_input_tokens: 0, output_tokens: 6_100 },
     modelUsage: {
@@ -3725,11 +3729,14 @@ export const mockDoneMessages: RunMessage[] = [
     confidence: "high",
   }, 187),
   dm("status", null, { text: "pushing branch agent/issue-18 and opening the MR" }, 185),
+  // issue #199 (defect 4): implement `num_turns` (11) sits BELOW the plan frame's (16) —
+  // per-invocation, not cumulative. Heavier tokens/cost in fewer turns is legitimate
+  // (turns ≠ tokens): the implement burst ran larger turns than the plan exploration.
   dm("status", null, {
     event: "result",
     subtype: "success",
     duration_ms: 2_100_000,
-    num_turns: 38,
+    num_turns: 11,
     total_cost_usd: 1.87,
     usage: { input_tokens: 114_400, cache_read_input_tokens: 1_170_000, cache_creation_input_tokens: 0, output_tokens: 48_200 },
     modelUsage: {
