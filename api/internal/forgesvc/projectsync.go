@@ -753,32 +753,43 @@ func (s *ProjectSyncService) reconcileItems(ctx context.Context, repo store.GetR
 		return nil
 	}
 
+	// Pass 1 — close-prune. This is slug-INDEPENDENT (a purely local delete), so it
+	// runs first and to completion even when the forge slug cannot be resolved; a
+	// backfill slug failure below must never strand a closed issue's stale item row.
 	for _, issue := range issues {
-		_, tracked := itemsByIID[issue.ForgeIssueIid]
-		switch {
-		case issue.State == "closed":
-			// Close-prune: stop tracking, leave the card on GitHub.
-			if !tracked {
-				continue
-			}
-			if err := s.store.DeleteGithubProjectItem(ctx, store.DeleteGithubProjectItemParams{
-				RepoID:        repo.ID,
-				ForgeIssueIid: issue.ForgeIssueIid,
-			}); err != nil {
-				s.log.Warn("project sync: reverse prune closed item", "repo", repo.ID, "issue", issue.ForgeIssueIid, "error", err)
-				continue
-			}
-			delete(itemsByIID, issue.ForgeIssueIid)
-		case !tracked:
-			// Backfill an open, untracked issue.
-			if err := resolveSlug(); err != nil {
-				s.stampLinkErrorReverse(ctx, repo.ID, err)
-				return // slug is a per-repo resolve; if it fails, no issue can be backfilled.
-			}
-			if err := s.backfillItem(ctx, repo, syncer, link, owner, name, issue, itemsByIID, columnOption, position); err != nil {
-				s.stampLinkErrorReverse(ctx, repo.ID, err)
-				continue
-			}
+		if issue.State != "closed" {
+			continue
+		}
+		if _, tracked := itemsByIID[issue.ForgeIssueIid]; !tracked {
+			continue
+		}
+		if err := s.store.DeleteGithubProjectItem(ctx, store.DeleteGithubProjectItemParams{
+			RepoID:        repo.ID,
+			ForgeIssueIid: issue.ForgeIssueIid,
+		}); err != nil {
+			s.log.Warn("project sync: reverse prune closed item", "repo", repo.ID, "issue", issue.ForgeIssueIid, "error", err)
+			continue
+		}
+		delete(itemsByIID, issue.ForgeIssueIid)
+	}
+
+	// Pass 2 — backfill open untracked issues. Needs the repo slug (resolved lazily,
+	// once). A slug failure is a per-repo condition: no issue can be backfilled, so
+	// stamp and stop this pass — the close-prunes above already completed.
+	for _, issue := range issues {
+		if issue.State == "closed" {
+			continue
+		}
+		if _, tracked := itemsByIID[issue.ForgeIssueIid]; tracked {
+			continue
+		}
+		if err := resolveSlug(); err != nil {
+			s.stampLinkErrorReverse(ctx, repo.ID, err)
+			return
+		}
+		if err := s.backfillItem(ctx, repo, syncer, link, owner, name, issue, itemsByIID, columnOption, position); err != nil {
+			s.stampLinkErrorReverse(ctx, repo.ID, err)
+			continue
 		}
 	}
 }

@@ -486,6 +486,47 @@ func TestReverseSyncPrunesClosedIssue(t *testing.T) {
 	}
 }
 
+// (close-prune is slug-independent) When the repo slug cannot be resolved (backfill
+// is impossible), a closed issue's stale item row is STILL pruned — close-prune runs
+// as a first pass before backfill needs the slug, so a degraded forge does not strand
+// closed-issue rows.
+func TestReverseSyncPrunesClosedEvenWhenSlugFails(t *testing.T) {
+	repoID := uuid.New()
+	syncer := backfillSyncer(
+		map[int]string{9: "content9"},
+		forge.ProjectV2ItemStatus{ItemID: "item3", IssueNumber: 3, OptionID: "opt_ip"},
+	)
+	syncer.slugErr = errors.New("slug boom") // backfill of the open issue cannot proceed
+	mover := &fakeMover{}
+	st := &fakeProjectStore{
+		repo:    githubRepoRow(repoID),
+		link:    forwardLink(t, map[string]string{"In Progress": "opt_ip"}),
+		columns: []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+		issues: []store.Issue{
+			{ForgeIssueIid: 3, State: "closed", Labels: labelsJSON(t, "In Progress")}, // tracked → prune
+			{ForgeIssueIid: 9, State: "opened", Labels: labelsJSON(t, "In Progress")}, // untracked → backfill (blocked by slug)
+		},
+		existingItems: []store.GithubProjectItem{projectItem(repoID, 3, "item3", "opt_ip")},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.SetMover(mover)
+
+	if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+		t.Fatalf("ReverseSync: %v", err)
+	}
+	// The closed issue is pruned despite the slug failure blocking backfill.
+	if len(st.deletedItems) != 1 || st.deletedItems[0] != 3 {
+		t.Errorf("want issue 3 pruned even though slug failed, got %v", st.deletedItems)
+	}
+	// Backfill could not add the open issue (no slug), so no GitHub add; slug error stamped.
+	if len(syncer.addCalls) != 0 {
+		t.Errorf("backfill must not add when slug fails, got %v", syncer.addCalls)
+	}
+	if len(st.linkErrs) == 0 {
+		t.Errorf("a slug failure must stamp last_error")
+	}
+}
+
 // (no oscillation) A backfilled item, once its seeded marker is persisted, makes ZERO
 // AutoMove and ZERO new adds on the NEXT tick — the item is tracked, so reconcile does
 // not re-add it and the diff no-ops it.
