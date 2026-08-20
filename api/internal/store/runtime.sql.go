@@ -2255,6 +2255,7 @@ func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessagePara
 const listActiveRunsAll = `-- name: ListActiveRunsAll :many
 SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, r.revise_count, r.plan_source, r.planned_base_commit, r.require_base_match, r.milestones_candidate, r.milestones_frozen, r.milestones_completed, r.milestones_in_progress, r.budget_max_iterations, r.budget_wall_seconds, r.schedule_id, r.limit_dead_secret_id, r.report_only, r.report_md, r.ci_config_paths, r.model, r.override_subagent_model, r.fail_origin, r.priority, r.summary_intent, r.summary_plan, r.summary_deltas, r.issue_comments, r.base_branch, r.open_mr, r.dispatched_at, r.review_target_run_id, r.review_requested, r.then_fix_requested, r.then_fix_of_run_id, r.preserved_patch, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
        c.forge_type,
+       i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link
        -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function (same as
        -- ListRunsForUser), so the admin overview pill and the claim order agree.
        -- @background_grace_cutoff (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag.
@@ -2262,6 +2263,7 @@ SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_descripti
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2)
+LEFT JOIN issues i ON i.repo_id = r.repo_id AND i.forge_issue_iid = r.issue_iid   -- PRD #411: 1:1 (issues UNIQUE (repo_id, forge_issue_iid)); yields the issue web URL for the run's #<iid> link
 LEFT JOIN workers w ON w.id = r.worker_id
 JOIN users u ON u.id = r.user_id
 WHERE r.status NOT IN ('completed', 'failed', 'cancelled')
@@ -2278,6 +2280,7 @@ type ListActiveRunsAllRow struct {
 	WorkerName    pgtype.Text `json:"worker_name"`
 	OwnerEmail    string      `json:"owner_email"`
 	ForgeType     string      `json:"forge_type"`
+	IssueWebUrl   pgtype.Text `json:"issue_web_url"`
 	PriorityClass string      `json:"priority_class"`
 }
 
@@ -2385,6 +2388,7 @@ func (q *Queries) ListActiveRunsAll(ctx context.Context, backgroundGraceCutoff p
 			&i.WorkerName,
 			&i.OwnerEmail,
 			&i.ForgeType,
+			&i.IssueWebUrl,
 			&i.PriorityClass,
 		); err != nil {
 			return nil, err
@@ -2888,6 +2892,7 @@ func (q *Queries) ListRunToolWindow(ctx context.Context, arg ListRunToolWindowPa
 const listRunsForUser = `-- name: ListRunsForUser :many
 SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, r.revise_count, r.plan_source, r.planned_base_commit, r.require_base_match, r.milestones_candidate, r.milestones_frozen, r.milestones_completed, r.milestones_in_progress, r.budget_max_iterations, r.budget_wall_seconds, r.schedule_id, r.limit_dead_secret_id, r.report_only, r.report_md, r.ci_config_paths, r.model, r.override_subagent_model, r.fail_origin, r.priority, r.summary_intent, r.summary_plan, r.summary_deltas, r.issue_comments, r.base_branch, r.open_mr, r.dispatched_at, r.review_target_run_id, r.review_requested, r.then_fix_requested, r.then_fix_of_run_id, r.preserved_patch, rp.path_with_namespace AS repo_path, w.name AS worker_name,
        c.forge_type,
+       i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link
        -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function, so the
        -- Runs-list pill and ClaimRun's ORDER BY are the same decision. @background_grace_cutoff
        -- (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag: a demoted run created
@@ -2902,6 +2907,7 @@ SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_descripti
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2); every repo has a connection
+LEFT JOIN issues i ON i.repo_id = r.repo_id AND i.forge_issue_iid = r.issue_iid   -- PRD #411: 1:1 (issues UNIQUE (repo_id, forge_issue_iid)); yields the issue web URL for the run's #<iid> link
 LEFT JOIN workers w ON w.id = r.worker_id
 LEFT JOIN run_reviews rv
        ON rv.target_run_id = r.id      -- UNIQUE target_run_id → at most one row (PRD #98 M4)
@@ -2931,6 +2937,7 @@ type ListRunsForUserRow struct {
 	RepoPath                 string         `json:"repo_path"`
 	WorkerName               pgtype.Text    `json:"worker_name"`
 	ForgeType                string         `json:"forge_type"`
+	IssueWebUrl              pgtype.Text    `json:"issue_web_url"`
 	PriorityClass            string         `json:"priority_class"`
 	JudgeVerdict             pgtype.Text    `json:"judge_verdict"`
 	UsageInputTokens         pgtype.Int8    `json:"usage_input_tokens"`
@@ -3080,6 +3087,7 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 			&i.RepoPath,
 			&i.WorkerName,
 			&i.ForgeType,
+			&i.IssueWebUrl,
 			&i.PriorityClass,
 			&i.JudgeVerdict,
 			&i.UsageInputTokens,

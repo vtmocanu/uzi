@@ -69,7 +69,9 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 			RepoPath:   row.RepoPath,
 			WorkerName: textPtrValue(row.WorkerName.Valid, row.WorkerName.String),
 		}
-		item.ForgeType = row.ForgeType     // per-run MR/PR noun (PRD #65 D2)
+		item.ForgeType = row.ForgeType // per-run MR/PR noun (PRD #65 D2)
+		// PRD #411: the joined forge issue web URL, nil for issue-less/uncached runs.
+		item.IssueWebURL = textPtrValue(row.IssueWebUrl.Valid, row.IssueWebUrl.String)
 		item.Usage = usageFromListRow(row) // nil when the run has no usage rows (PRD #40)
 		// nil stays nil for an unjudged run — absent, not a neutral verdict.
 		item.JudgeVerdict = textPtrValue(row.JudgeVerdict.Valid, row.JudgeVerdict.String)
@@ -98,6 +100,8 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 			OwnerEmail: &email,
 		}
 		item.ForgeType = row.ForgeType // per-run MR/PR noun (PRD #65 D2)
+		// PRD #411: the joined forge issue web URL, nil for issue-less/uncached runs.
+		item.IssueWebURL = textPtrValue(row.IssueWebUrl.Valid, row.IssueWebUrl.String)
 		out = append(out, item)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"runs": out})

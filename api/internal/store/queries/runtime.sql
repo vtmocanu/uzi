@@ -433,6 +433,7 @@ WHERE r.id = @repo_id;
 -- and buckets them in Go (ListJudgeTriageRowsForRuns).
 SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name,
        c.forge_type,
+       i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link
        -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function, so the
        -- Runs-list pill and ClaimRun's ORDER BY are the same decision. @background_grace_cutoff
        -- (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag: a demoted run created
@@ -447,6 +448,7 @@ SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2); every repo has a connection
+LEFT JOIN issues i ON i.repo_id = r.repo_id AND i.forge_issue_iid = r.issue_iid   -- PRD #411: 1:1 (issues UNIQUE (repo_id, forge_issue_iid)); yields the issue web URL for the run's #<iid> link
 LEFT JOIN workers w ON w.id = r.worker_id
 LEFT JOIN run_reviews rv
        ON rv.target_run_id = r.id      -- UNIQUE target_run_id → at most one row (PRD #98 M4)
@@ -471,6 +473,7 @@ LIMIT 200;
 -- worker name, and owner email for the admin overview.
 SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
        c.forge_type,
+       i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link
        -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function (same as
        -- ListRunsForUser), so the admin overview pill and the claim order agree.
        -- @background_grace_cutoff (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag.
@@ -478,6 +481,7 @@ SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2)
+LEFT JOIN issues i ON i.repo_id = r.repo_id AND i.forge_issue_iid = r.issue_iid   -- PRD #411: 1:1 (issues UNIQUE (repo_id, forge_issue_iid)); yields the issue web URL for the run's #<iid> link
 LEFT JOIN workers w ON w.id = r.worker_id
 JOIN users u ON u.id = r.user_id
 WHERE r.status NOT IN ('completed', 'failed', 'cancelled')

@@ -61,6 +61,7 @@ function fakeRun(): Run {
     resume_of_run_id: null,
     forge_type: "gitlab",
     mr_web_url: null,
+    issue_web_url: null,
     status: "running",
     requeue_count: 0,
     iteration_count: 0,

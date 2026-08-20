@@ -122,6 +122,9 @@ type RunDTO struct {
 	// it directly through isHttpsUrl and only falls back to the legacy GitLab URL
 	// reconstruction for those null rows — it is the only correct link on Forgejo.
 	MrWebURL *string `json:"mr_web_url"`
+	// IssueWebURL is the forge-supplied issue web URL (PRD #411), nil for issue-less
+	// runs or when the issue is no longer cached; rendered through isHttpsUrl on the web.
+	IssueWebURL *string `json:"issue_web_url"`
 	// MrState is the last merge-request state the PRD #24 watcher observed for
 	// mr_iid (opened|closed|merged|locked), null when never observed. Display-only
 	// and best-effort (PRD #33 Decision 1): the chip treats merged/closed distinctly

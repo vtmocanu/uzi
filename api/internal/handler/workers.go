@@ -1087,6 +1087,23 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 			dto.ForgeType = ft
 		}
 	}
+	// PRD #411: stamp the run's originating forge issue web URL for the run-view #<iid>
+	// link, resolved best-effort from the cached issues row — a join on GetRunByID* would
+	// flip its return type and ripple through ~15 callers (Design Decision 2). Guarded on
+	// BOTH a repo AND an issue: issue-less runs (task/ci_fix/prompt/chat) carry a NULL
+	// issue_iid. A lookup miss (issue no longer cached) leaves issue_web_url nil, never
+	// failing the read of an otherwise-fine run.
+	if run.RepoID.Valid && run.IssueIid.Valid {
+		if issue, err := h.q.GetIssueByIID(r.Context(), store.GetIssueByIIDParams{
+			RepoID:        uuid.UUID(run.RepoID.Bytes),
+			ForgeIssueIid: run.IssueIid.Int64,
+		}); err != nil {
+			slog.Debug("resolve run issue web url", "run_id", run.ID, "error", err)
+		} else {
+			webURL := issue.WebUrl
+			dto.IssueWebURL = &webURL
+		}
+	}
 	// PRD #37 M4-fix: resolve the owner's OWN-source roster here, on the detail read,
 	// so the plan-gate picker sources its "My agent templates" chips from exactly the
 	// roster the approve validator + worker use (allocation-resolved, lead stripped).
