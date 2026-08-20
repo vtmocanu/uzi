@@ -997,6 +997,29 @@ func TestDriftBusyDeadlineExceededRolls(t *testing.T) {
 	}
 }
 
+// drift + busy + draining EXACTLY the deadline (now - since == Deadline) + ForceRoll=false
+// ⇒ the boundary rolls: the comparison is >=, so a worker parked exactly AT the deadline
+// rolls (its run requeues) rather than deferring one more tick, and issues NO new cordon
+// (already draining). This pins the boundary the "well within" and "well past" cases leave
+// open: flip the production >= to > and this case goes RED while both of those stay green.
+func TestDriftBusyDeadlineExactlyReachedRolls(t *testing.T) {
+	c := &fakeCordoner{}
+	deadline := time.Hour
+	since := m5Now.Add(-deadline) // now - since == Deadline, exactly
+	w, obs, dep := driftedWorker(t, true, &since)
+	m, client := newMatWithDrain(t, c, DrainPolicy{Deadline: deadline}, dep)
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !wasPatched(client) {
+		t.Fatal("a busy worker exactly AT its drain deadline was not rolled; the boundary is >= " +
+			"(now - draining_since >= Deadline), so the deadline must force the roll at equality")
+	}
+	if len(c.calls) != 0 {
+		t.Fatalf("RequestDrain calls = %v, want none (already draining; no re-cordon on the deadline roll)", c.calls)
+	}
+}
+
 // drift + busy + ForceRoll=true (DrainingSince nil, never cordoned) ⇒ rolled immediately,
 // with NO cordon: the emergency override skips the cordon-and-defer path entirely.
 func TestDriftBusyForceRollRollsImmediatelyWithoutCordon(t *testing.T) {
