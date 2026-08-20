@@ -267,7 +267,7 @@ jobs:
       - name: npm ci
         working-directory: web
         run: npm ci
-      - name: lint + deadcode + vulncheck + check-docs + check-styles + typecheck
+      - name: lint + deadcode + vulncheck + check-docs + check-changelog + check-styles + typecheck
         env:
           # Turns the deadcode wrapper's loud-SKIP (when knip is absent) into exit 2:
           # CI always installs knip, so a skip here means the image regressed.
@@ -277,6 +277,7 @@ jobs:
           task deadcode:web
           task vulncheck:web
           task check-docs:web
+          task check-changelog:web
           task check-styles:web
           task typecheck:web
 
