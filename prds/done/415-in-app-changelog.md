@@ -2,7 +2,11 @@
 
 **Issue**: #415
 **Priority**: Medium
-**Status**: Not started
+**Status**: Complete — all milestones landed on branch `agent/issue-415` (M1 `63eca22f`, M2 `02268f28`, M4 `19d43b89`, M3 `8ee7829d`, M5 docs/specs/architecture). `task gate:web` green (incl. the new `check-changelog` version-match gate and the parity test over every emitted version); a `VITE_UZI_MOCK=1` browser pass confirmed the drawer opens from the popover, the running-version guard behaves, and all close paths restore focus.
+
+> **MAINTAINER FOLLOW-UP:** add a `task check-changelog:web` step to the `validate-web` job in `.github/workflows/ci.yml` so the version-match gate runs in CI. The worker's git token lacks `workflow` scope, so this run could not edit workflow files; the change is safe and one line. The **parity** gate needs no follow-up — it already runs in CI via the existing `test-web` job's `task test:web`.
+>
+> **PROPOSED `specs/human.md` line (needs owner approval — not added):** a one-line requirement that the web UI shows the changelog in-app from the version popover and marks the running release. `specs/human.md` edits require explicit user approval.
 
 ## Problem
 
