@@ -250,6 +250,11 @@ tasks:
       # cheapest-first: this whole-file duplicate check is sub-second, so it runs
       # before `scan:secrets`, which is deliberately last because it dominates.
       - task: check:spec-numbering
+      # Additive-migration guard (PRD #422 M6): also sub-second and offline, so it
+      # runs before `scan:secrets` too. Belongs in gate:repo, not a component gate:
+      # it is a function of the migration corpus (a tree fact), and the compatibility
+      # invariant it protects — an N-1 worker reading a HEAD schema — is cross-cutting.
+      - task: check:migration-additive
       - task: scan:secrets
 
   gate:api:
@@ -702,6 +707,17 @@ tasks:
       # the tail, not sorted). The canary carries a planted duplicate the check must
       # detect, or it exits 2 (instrument broken). See the script header.
       - ./scripts/check-spec-numbering.sh specs/ai.md scripts/spec-numbering-canary.md
+
+  check:migration-additive:
+    desc: migration Up sections make no destructive change to a worker-facing table, with a canary proving the detector fired
+    cmds:
+      # Additive-only release-window discipline (PRD #422 M6): an N-1 worker reads a
+      # HEAD schema during a rolling release, so a DROP/RENAME/RETYPE of a worker-facing
+      # column/table in a forward migration breaks it. Scans Up sections ONLY (Down is a
+      # legitimate rollback). The canary carries a planted destructive statement the check
+      # must detect (Up) and one it must ignore (Down), or it exits 2 (instrument broken).
+      # Both args are explicit so this echo shows exactly what is scanned. See the script header.
+      - ./scripts/check-migration-additive.sh scripts/migration-additive-canary.sql api/internal/store/migrations
 
   render:worker-tag-check:
     desc: assert the hosted-worker image tag is pinned independently of Chart.AppVersion (PRD 422 M1)
