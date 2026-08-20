@@ -23,6 +23,17 @@ checker: a false `INERT` would let a real code change pass as comment-only,
 whereas a false `DIFFERS` only asks a human to look. Never invert this by
 "fixing" a conservative `DIFFERS`.
 
+### Caveat: magic comments are load-bearing yet reported `INERT`
+
+Go build constraints and toolchain directives — `//go:build`, `//go:generate`,
+`//go:embed`, `//nolint`, and the cgo `import "C"` preamble — are *lexically*
+comments, so they are dropped before reprinting and a change to one reports
+`INERT`. This tool proves **textual comment/formatting inertness, not semantic
+inertness**: an added `//go:build linux` or `//go:embed` changes compilation
+while the reprints stay byte-identical. When a diff touches a magic comment,
+read it by eye; `INERT` here means "only comments and formatting", and a magic
+comment *is* a comment.
+
 ## Exit codes
 
 Mirrors the repo's `fmt-check:api` convention (2 = instrument broken, 1 =
