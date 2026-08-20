@@ -1423,6 +1423,26 @@ export function isWorkflowScopeRejection(err: unknown): boolean {
   return msg.includes("workflow scope");
 }
 
+/**
+ * PRD #456 NB2 — true when a push error is a non-fast-forward rejection: the remote
+ * refused a non-forced push because the pushed tip is not a descendant of the branch's
+ * already-published tip. This is the resumed / rewritten-history case: when the finalize
+ * base-align rebase fallback rewinds to the original agent tip and replays the commits,
+ * it rewrites SHAs that were already published at origin (a resume, or the `self_improve`
+ * fixed branch), so the subsequent non-forced push cannot fast-forward. Force-push is
+ * denied by the guardrails by design, so the correct outcome is the typed
+ * base-align-conflict preserve path (preserved_patch + `finalize_base_align_conflict`),
+ * not a push retry — routing here keeps it off the generic catch (raw error, defaulted
+ * `fail_origin`, no preserved diff). Matches the stable git phrases `non-fast-forward` and
+ * `fetch first` (case-insensitive), the same phrases forge-retry treats as permanent
+ * push-failure patterns; deliberately does NOT match the bare `[rejected]` token, which is
+ * too broad.
+ */
+export function isNonFastForwardRejection(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return msg.includes("non-fast-forward") || msg.includes("fetch first");
+}
+
 export function httpScopeForUrl(rawUrl: string): string | undefined {
   try {
     const u = new URL(rawUrl);

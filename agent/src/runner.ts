@@ -3,7 +3,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import type { WorkerClient } from "./client.js";
 import type { GitCache } from "./git.js";
-import { gitBasicCredential, isWorkflowScopeRejection } from "./git.js";
+import {
+  gitBasicCredential,
+  isNonFastForwardRejection,
+  isWorkflowScopeRejection,
+} from "./git.js";
 import type { Executor, RunContext } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
 import { skillsPluginDir } from "./skills-plugin.js";
@@ -121,8 +125,10 @@ export function composeWorkflowScopeReason(paths: string[]): string {
  * aligned with the current default branch before the finalize push: its `.github/workflows/**`
  * files are BEHIND the default (main advanced them after this run's clone base), the bot's
  * repo-only PAT cannot push while they differ, and uzi's attempt to merge and then rebase the
- * current default into the branch BOTH conflicted. The run fails without pushing and the
- * agent's diff is preserved (#377's `preserved_patch`) for a human to rebase-and-land.
+ * current default into the branch either BOTH conflicted, or the aligned branch could not be
+ * pushed without rewriting already-published history (a non-fast-forward the bot cannot
+ * force-push — NB2). The run fails without pushing and the agent's diff is preserved (#377's
+ * `preserved_patch`) for a human to rebase-and-land.
  *
  * Names the default branch once and points at docs/github-bot-setup.md. The branch name is
  * the only variable part and is clamped against a computed budget (MAX_FAILURE_REASON_LEN
@@ -1495,20 +1501,24 @@ export class RunRunner {
               alignPushed = true;
             };
 
-            // Push the aligned branch. A REPEAT workflow-scope rejection here means the default's
-            // workflow files moved again DURING our align (double-TOCTOU) — preserve the diff and
-            // fail typed rather than lose it to the generic catch. Any OTHER push error still
-            // rethrows unchanged (a genuine auth/transient/protected-branch failure must not be
-            // mislabelled as a base-align conflict). Returns true if it preserved-and-failed (the
-            // caller must then `return`), false on a successful push.
+            // Push the aligned branch. Two rejections here are the base-align-conflict path,
+            // not a mislabel: a REPEAT workflow-scope rejection means the default's workflow
+            // files moved again DURING our align (double-TOCTOU); a NON-FAST-FORWARD rejection
+            // means the rebase fallback rewrote the history of an already-published branch (a
+            // resume, or the self_improve fixed branch) so this non-forced push cannot
+            // fast-forward, and force-push is denied by the guardrails by design. Both preserve
+            // the diff and fail typed rather than lose it to the generic catch. Any OTHER push
+            // error still rethrows unchanged (a genuine auth/transient/protected-branch failure
+            // must not be mislabelled as a base-align conflict). Returns true if it
+            // preserved-and-failed (the caller must then `return`), false on a successful push.
             const pushAlignedOrPreserve = async (): Promise<boolean> => {
               try {
                 await fetchAndPush();
                 return false;
               } catch (e) {
-                if (!isWorkflowScopeRejection(e)) throw e;
+                if (!isWorkflowScopeRejection(e) && !isNonFastForwardRejection(e)) throw e;
                 runLog.info(
-                  "finalize base-align: aligned push STILL workflow-scope-rejected (default moved again during align); preserving diff and failing typed",
+                  "finalize base-align: aligned push rejected (repeat workflow-scope — default moved again during align — OR non-fast-forward because the rebase rewrote an already-published branch's history the bot cannot force-push); preserving diff and failing typed",
                   { run_id: runId },
                 );
                 await failBaseAlignConflict();

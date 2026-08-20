@@ -6,6 +6,7 @@ import path from "node:path";
 import { nullLogger } from "./helpers.js";
 import { type Executor, type RunContext, type ExecutorResult } from "../src/executor.js";
 import { RunRunner, composeBaseAlignConflictReason } from "../src/runner.js";
+import { isNonFastForwardRejection } from "../src/git.js";
 import { GitHubClient } from "../src/forge.js";
 import {
   api,
@@ -368,6 +369,85 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     assert.match(failed.failure_reason ?? "", /transient push failure/, "the raw error surfaces via the generic catch");
     assert.ok(!failed.preserved_patch, "no preserved_patch on the generic-catch path");
     assert.strictEqual(calls.length, 0, "no PR opened on the failed push");
+  });
+
+  // (g) NB2 — resumed / rewritten-history edge. The merge push is workflow-scope-rejected →
+  // rebase fallback aligns → but the POST-REBASE push is rejected NON-FAST-FORWARD, because the
+  // rebase rewound to the original agent tip and replayed the commits, rewriting SHAs that were
+  // already published at origin (a resume, or the self_improve fixed branch). Force-push is
+  // denied by the guardrails, so this must NOT escape to the generic catch (raw message,
+  // defaulted fail_origin, no preserved_patch); it must route to the SAME typed conflict-fail
+  // path a repeat workflow-scope rejection takes: failed + finalize_base_align_conflict +
+  // preserved_patch, no PR, and the raw non-fast-forward text absent from failure_reason.
+  it("(g) rebase-aligned push rejected non-fast-forward (resumed branch) → typed fail + preserved_patch, no raw catch", async () => {
+    seedWorkflowsOnOrigin();
+    const { github, calls } = fakeGitHub();
+    const strategies = spyAlign();
+    const nonFfMsg =
+      "git push origin ... failed: ! [rejected] agent/issue-57 -> agent/issue-57 (non-fast-forward)\n" +
+      "error: failed to push some refs to '...'\n" +
+      "hint: Updates were rejected because the tip of your current branch is behind\n" +
+      "hint: its remote counterpart. Integrate the remote changes (e.g.\n" +
+      "hint: 'git pull ...') before pushing again.";
+    let pushCalls = 0;
+    git.pushBranch = (async () => {
+      pushCalls++;
+      if (pushCalls === 1) {
+        // The merge push is workflow-scope-rejected → drives the rebase fallback.
+        throw new Error(
+          "git push origin ... failed: ! [remote rejected] refs/uzi-runner/agent/issue-57 -> agent/issue-57 " +
+            "(refusing to allow a Personal Access Token to create or update workflow " +
+            "`.github/workflows/ci.yml` without workflow scope)",
+        );
+      }
+      // The post-rebase push cannot fast-forward — the rebase rewrote already-published history.
+      throw new Error(nonFfMsg);
+    }) as typeof git.pushBranch;
+    const exec = committingExecutor({ "impl.ts": "export const x = 1;\n" }, { ".github/workflows/ci.yml": CI_V2 });
+
+    const claim = githubClaim(57);
+    await githubRunner(github, exec).execute(claim);
+
+    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+    assert.deepStrictEqual(statuses, ["running", "running", "failed"]);
+    assert.deepStrictEqual(strategies, ["merge", "rebase"], "merge rejected → rebase, then the aligned push is non-fast-forward rejected");
+    assert.strictEqual(pushCalls, 2, "the merge push and the post-rebase push were both attempted and rejected");
+    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")!.body;
+    assert.strictEqual(failed.fail_origin, "finalize_base_align_conflict", "routed to the typed fail, not the generic catch");
+    assert.match(failed.failure_reason ?? "", /docs\/github-bot-setup\.md/);
+    assert.ok(
+      !(failed.failure_reason ?? "").includes("non-fast-forward"),
+      "the raw non-fast-forward text must not reach failure_reason (that would mean the generic catch)",
+    );
+    assert.ok(failed.preserved_patch, "the pre-align diff is preserved even on a non-fast-forward rejection");
+    assert.match(failed.preserved_patch!, /impl\.ts/, "the preserved patch carries the agent's work");
+    assert.strictEqual(calls.length, 0, "no PR opened when the aligned push was rejected");
+  });
+});
+
+describe("isNonFastForwardRejection", () => {
+  it("matches the stable non-ff git phrases and rejects unrelated errors", () => {
+    assert.ok(
+      isNonFastForwardRejection(new Error("! [rejected] agent/issue-57 -> agent/issue-57 (non-fast-forward)")),
+      "matches a non-fast-forward rejection",
+    );
+    assert.ok(
+      isNonFastForwardRejection(new Error("Updates were rejected; fetch first before pushing")),
+      "matches a fetch-first rejection",
+    );
+    assert.ok(
+      !isNonFastForwardRejection(new Error("boom: transient push failure over the network")),
+      "does not match an unrelated transient error",
+    );
+    assert.ok(
+      !isNonFastForwardRejection(
+        new Error(
+          "refusing to allow a Personal Access Token to create or update workflow " +
+            "`.github/workflows/ci.yml` without workflow scope",
+        ),
+      ),
+      "does not match a pure workflow-scope rejection",
+    );
   });
 });
 
