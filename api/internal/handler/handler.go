@@ -996,9 +996,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			})
 		})
 
-		// Repos (PRD #64): GET / (uzi repo list) and POST /{id}/runs (uzi run create)
-		// are RequireUser; every other repo route is cookie-only. PATCH /{id} is the F1
-		// admin-write path (repo_skills_enabled / repo_devbox_opt_in via PatchRepo's
+		// Repos (PRD #64): GET / (uzi repo list), POST /{id}/runs (uzi run create) and
+		// POST /{id}/task-runs (uzi handoff) are RequireUser; every other repo route is
+		// cookie-only. PATCH /{id} is the F1 admin-write path (repo_skills_enabled /
+		// repo_devbox_opt_in via PatchRepo's
 		// IsAdmin branches), so it stays cookie-only — a Bearer credential 401s before
 		// those branches. Split WITHIN the sub-router (not two /repos mounts) so chi
 		// keeps one registration site per path+method.
@@ -1011,6 +1012,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// and falls back (silently) to a shared IP bucket if it runs before auth —
 				// so auth first, limiter second (B.4).
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/runs", h.CreateRun)
+				// Queue a task/handoff run (PRD #400): ephemeral, branch-scoped,
+				// issue-less. Same per-user forge budget as the other run creators.
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/task-runs", h.CreateTaskRun)
 				// Create a scheduled run on this repo (PRD #241 M4). Owner-scoped
 				// (GetRepoForUser inside the handler → 404 for a foreign repo). No forge
 				// limiter: create validates config and computes next_fire_at without a
@@ -1065,9 +1069,6 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// Queue a CI-fix run for a failed pipeline (PRD #6). Snapshots the
 				// failed pipeline's jobs + logs from the forge → per-user budget.
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/ci-fix-runs", h.CreateCIFixRun)
-				// Queue a task/handoff run (PRD #400): ephemeral, branch-scoped,
-				// issue-less. Same per-user forge budget as the other run creators.
-				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/task-runs", h.CreateTaskRun)
 			})
 		})
 
