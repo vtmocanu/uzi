@@ -19,6 +19,7 @@ import { onNotificationsChanged } from "../lib/notifications";
 import { useFavicon } from "../lib/useFavicon";
 import { JudgeTodoContext, JudgeTodoValueContext } from "./JudgeTodoContext";
 import { BuildInfoPopover } from "./BuildInfoPopover";
+import { ChangelogDrawer } from "./ChangelogDrawer";
 import {
   ActivityIcon,
   AlertIcon,
@@ -349,6 +350,7 @@ function SidebarContent({
   schedulesEnabled = 0,
   workersAttention = 0,
   findingsOpen = 0,
+  onOpenChangelog,
 }: {
   onNavigate?: () => void;
   // Desktop-only icon-rail mode. The mobile sheet always renders expanded (it is
@@ -379,6 +381,10 @@ function SidebarContent({
   // parent AppShell so the single poll feeds both this badge and the status
   // favicon (PRD #70), and both sidebar instances (desktop + mobile) share it.
   unread?: number;
+  // Raises AppShell's shared changelog-drawer open state (PRD #415 M2). Both
+  // SidebarContent mounts pass the same setter down to their BuildInfoPopover, and
+  // the drawer itself mounts ONCE at AppShell so the two rails cannot each open one.
+  onOpenChangelog?: () => void;
 }) {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
@@ -675,7 +681,12 @@ function SidebarContent({
             saying different things. Renders nothing at all until the fetch resolves
             with a version, exactly as the old badge did. */}
         {build?.status === "ok" && build.info.version && (
-          <BuildInfoPopover info={build.info} collapsed={collapsed} fetchedAtMs={build.fetchedAtMs} />
+          <BuildInfoPopover
+            info={build.info}
+            collapsed={collapsed}
+            fetchedAtMs={build.fetchedAtMs}
+            onOpenChangelog={onOpenChangelog}
+          />
         )}
       </div>
     </div>
@@ -720,6 +731,12 @@ export function AppShell({ children }: { children: ReactNode }) {
   const { user } = useAuth();
   const location = useLocation();
   const [mobileOpen, setMobileOpen] = useState(false);
+  // The in-app changelog drawer (PRD #415 M2). Owned here so the drawer mounts
+  // ONCE even though two SidebarContent mounts each render a BuildInfoPopover that
+  // can raise it. Read the running version the same way SidebarContent does, so
+  // the drawer can flag the current release.
+  const [changelogOpen, setChangelogOpen] = useState(false);
+  const build = useBuildInfoSnapshot();
   // Notifications unread badge (PRD #46 M2). Owned here — above the guest early
   // return — so a single poll feeds both the bell badge (passed to each
   // SidebarContent) and the status favicon, and it survives across routes.
@@ -913,6 +930,13 @@ export function AppShell({ children }: { children: ReactNode }) {
           window crossing into warn/danger announces on any route, not only
           while the Settings meters are on screen. */}
       <RateLimitAnnouncer />
+      {/* The in-app changelog drawer (PRD #415 M2), mounted ONCE for both rails.
+          Renders nothing while closed; `version` flags the running release. */}
+      <ChangelogDrawer
+        open={changelogOpen}
+        onClose={() => setChangelogOpen(false)}
+        version={build?.status === "ok" ? build.info.version : undefined}
+      />
       {/* Desktop sidebar */}
       <aside
         className={cx(
@@ -929,6 +953,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           schedulesEnabled={schedulesEnabled}
           workersAttention={workersAttention}
           findingsOpen={findingsOpen}
+          onOpenChangelog={() => setChangelogOpen(true)}
         />
       </aside>
 
@@ -960,7 +985,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             >
               <XIcon />
             </button>
-            <SidebarContent onNavigate={() => setMobileOpen(false)} unread={unread} judgeTodo={judgeTodo} runsInProgress={runsInProgress} schedulesEnabled={schedulesEnabled} workersAttention={workersAttention} findingsOpen={findingsOpen} />
+            <SidebarContent onNavigate={() => setMobileOpen(false)} unread={unread} judgeTodo={judgeTodo} runsInProgress={runsInProgress} schedulesEnabled={schedulesEnabled} workersAttention={workersAttention} findingsOpen={findingsOpen} onOpenChangelog={() => setChangelogOpen(true)} />
           </div>
         </div>
       )}

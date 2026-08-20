@@ -15,9 +15,10 @@
 // promise and its assertion would pass or fail for the wrong reason. Taking the
 // data as a prop removes the hazard rather than working around it.
 
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type { BuildInfo } from "../lib/api";
+import { REPO_BLOB_BASE } from "../lib/docs";
 import { cx } from "./ui";
 
 // displayVersion prefixes a "v" only for a numeric version, so "0.6.0" reads
@@ -206,13 +207,23 @@ export function BuildInfoPopover({
   // wall clock. Production always reads the real clock.
   now,
   fetchedAtMs,
+  // Raises the shared changelog-drawer open state owned by AppShell. Optional so
+  // this component stays presentational and its existing call sites/tests are
+  // unchanged; when set, a Changelog button appears inside the panel.
+  onOpenChangelog,
 }: {
   info: BuildInfo;
   collapsed?: boolean;
   now?: number;
   fetchedAtMs?: number;
+  onOpenChangelog?: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  // The popover host, so blur/mouseleave can tell "focus/pointer left the whole
+  // control" from "focus moved onto the panel's own button". Without this, the
+  // trigger's raw onBlur fired the instant focus crossed into the panel, which
+  // made any interactive control inside the panel keyboard-unreachable.
+  const hostRef = useRef<HTMLDivElement>(null);
   // Instance-scoped: TWO SidebarContent mounts exist simultaneously (the desktop
   // aside and the mobile drawer), so a hardcoded id would put a duplicate in the
   // document and make aria-describedby ambiguous. Not a lint nit — it is the one
@@ -290,11 +301,24 @@ export function BuildInfoPopover({
 
   return (
     <div
+      ref={hostRef}
       className="relative border-t border-edge"
       // Hover on the HOST, not the button, so the popover does not vanish the
       // instant the pointer crosses from the trigger onto the panel above it.
       onMouseEnter={() => setOpen(true)}
-      onMouseLeave={() => setOpen(false)}
+      // Close on pointer-out only when nothing inside still has focus: a keyboard
+      // user who focused the panel's Changelog button must not have it yanked shut
+      // when the pointer happens to leave.
+      onMouseLeave={() => {
+        if (!hostRef.current?.contains(document.activeElement)) setOpen(false);
+      }}
+      // Focus/blur at the HOST, not the trigger button, so focus moving ONTO the
+      // panel's own controls keeps it open (relatedTarget still inside the host);
+      // it closes only when focus lands outside the whole control.
+      onFocus={() => setOpen(true)}
+      onBlur={(e) => {
+        if (!hostRef.current?.contains(e.relatedTarget as Node)) setOpen(false);
+      }}
     >
       <button
         type="button"
@@ -319,13 +343,13 @@ export function BuildInfoPopover({
         // aria-describedby alone, and announcing "collapsed"/"expanded" for
         // something a screen reader can already read in full would be noise.
         aria-describedby={popId}
-        // Focus opens it, which is what makes this keyboard-reachable at all. A tap
-        // opens it through onClick — which always OPENS rather than toggling, so a
-        // desktop click landing on an already-hovered badge cannot close it under
-        // the pointer. Escape is handled on the DOCUMENT while open (see above), not
+        // Focus opens it, which is what makes this keyboard-reachable at all —
+        // handled at the HOST now (see the host's onFocus/onBlur) so focus moving
+        // onto the panel's Changelog button does not close it. A tap opens it
+        // through onClick — which always OPENS rather than toggling, so a desktop
+        // click landing on an already-hovered badge cannot close it under the
+        // pointer. Escape is handled on the DOCUMENT while open (see above), not
         // here, so it works for a hover-opened popover the badge never focused.
-        onFocus={() => setOpen(true)}
-        onBlur={() => setOpen(false)}
         onClick={() => setOpen(true)}
         className={cx(
           "block w-full truncate text-left font-mono text-faint transition-colors",
@@ -395,10 +419,18 @@ export function BuildInfoPopover({
             <Row
               label="PRDs"
               value={
-                <>
+                // The counts link to the repo's prds/ directory (approved in the
+                // mock). Only rendered when the row itself renders — i.e. both
+                // counts present.
+                <a
+                  href={`${REPO_BLOB_BASE}prds`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="hover:underline"
+                >
                   <span className="text-ok">{prdsDone} done</span>{" "}
                   <span className="text-faint">· {prdsOpen} open</span>
-                </>
+                </a>
               }
             />
           )}
@@ -407,6 +439,18 @@ export function BuildInfoPopover({
               coordinates and the PRD counts. */}
           {uptime && <Row label="Uptime" value={uptime} />}
         </dl>
+        {/* The Changelog entry point (PRD #415 M2). Below the definition list so
+            it reads as an action, not a coordinate. Reachable by keyboard because
+            the host's focus wiring keeps the panel open while focus is on it. */}
+        {onOpenChangelog && (
+          <button
+            type="button"
+            onClick={onOpenChangelog}
+            className="mt-2 block w-full rounded-md border border-edge px-2 py-1 text-left text-[11px] text-muted transition-colors hover:bg-raised hover:text-fg"
+          >
+            Changelog
+          </button>
+        )}
       </div>
     </div>
   );

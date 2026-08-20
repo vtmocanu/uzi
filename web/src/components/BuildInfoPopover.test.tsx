@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { afterEach, describe, it, expect } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, it, expect, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import {
   BuildInfoPopover,
   ageInDays,
@@ -427,5 +427,77 @@ describe("BuildInfoPopover — open on hover AND focus AND tap", () => {
     expect(ids[0]).toBeTruthy();
     expect(ids[0]).not.toBe(ids[1]);
     for (const id of ids) expect(document.getElementById(id!)).not.toBeNull();
+  });
+});
+
+describe("BuildInfoPopover — PRDs row links to the repo", () => {
+  it("wraps the `N done · M open` counts in a link to the prds/ directory", () => {
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} />);
+    const link = within(popover()).getByRole("link");
+    // The repo blob base + prds, opened in a new tab with the noopener rel.
+    expect(link.getAttribute("href")).toBe("https://github.com/vtmocanu/uzi/blob/main/prds");
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toBe("noopener noreferrer");
+    // The Variant A styling is preserved inside the anchor.
+    expect(link.textContent).toContain("80 done");
+    expect(link.textContent).toContain("32 open");
+  });
+
+  it("renders no PRDs link on a build that stamps neither count", () => {
+    // Negative pair: the anchor only exists when the PRDs row renders (both counts).
+    render(<BuildInfoPopover info={mockBuildInfoUnstamped} now={NOW} />);
+    expect(within(popover()).queryByRole("link")).toBeNull();
+  });
+});
+
+describe("BuildInfoPopover — the Changelog entry point (PRD #415 M2)", () => {
+  const trigger = () => screen.getByRole("button", { name: "v0.4.2" });
+
+  it("shows the Changelog button only when onOpenChangelog is provided, and calls it on click", () => {
+    const { rerender } = render(<BuildInfoPopover info={mockBuildInfo} now={NOW} />);
+    // Negative: no entry point without the prop…
+    expect(screen.queryByRole("button", { name: "Changelog" })).toBeNull();
+
+    const onOpenChangelog = vi.fn();
+    rerender(<BuildInfoPopover info={mockBuildInfo} now={NOW} onOpenChangelog={onOpenChangelog} />);
+    // …positive: it appears, and clicking it (mouse) raises the drawer.
+    fireEvent.click(screen.getByRole("button", { name: "Changelog" }));
+    expect(onOpenChangelog).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the panel open when focus moves from the trigger onto the Changelog button (keyboard-reachable)", () => {
+    const onOpenChangelog = vi.fn();
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} onOpenChangelog={onOpenChangelog} />);
+    const trig = trigger();
+    fireEvent.focus(trig);
+    expect(popover().getAttribute("data-open")).toBe("true");
+
+    const changelogBtn = screen.getByRole("button", { name: "Changelog" });
+    // Focus crosses from the trigger onto the panel's own button. The OLD raw
+    // onBlur on the trigger fired here and closed the panel, so this control was
+    // keyboard-unreachable (blur ran before the child could receive focus).
+    fireEvent.blur(trig, { relatedTarget: changelogBtn });
+    fireEvent.focus(changelogBtn);
+    expect(popover().getAttribute("data-open")).toBe("true");
+
+    // And once focused it is genuinely actionable by keyboard.
+    fireEvent.click(changelogBtn);
+    expect(onOpenChangelog).toHaveBeenCalledTimes(1);
+  });
+
+  it("still closes when focus leaves the whole control", () => {
+    // The counterpart to the reachability test: focus landing OUTSIDE the host
+    // must still close, so the relatedTarget check is not a blanket "never close".
+    render(
+      <>
+        <BuildInfoPopover info={mockBuildInfo} now={NOW} onOpenChangelog={vi.fn()} />
+        <button type="button">outside</button>
+      </>,
+    );
+    const outside = screen.getByRole("button", { name: "outside" });
+    fireEvent.focus(trigger());
+    expect(popover().getAttribute("data-open")).toBe("true");
+    fireEvent.blur(trigger(), { relatedTarget: outside });
+    expect(popover().getAttribute("data-open")).toBe("false");
   });
 });
