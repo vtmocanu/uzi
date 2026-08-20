@@ -40,6 +40,38 @@ secrets:
 imagePullSecret:
   name: ""
 
+# --- imageVerification: cosign signature enforcement (OFF by default) ------------
+# A Kyverno ClusterPolicy that admits an image only if it carries a valid cosign
+# keyless signature from uzi's release workflow (release.yml signs every image + the
+# chart by digest). OFF by default and gated, exactly like workers.enabled: this
+# template renders NOTHING unless you turn it on.
+#
+# PREREQUISITE (read before enabling): the policy is a `kyverno.io/v1 ClusterPolicy`,
+# so KYVERNO MUST ALREADY BE INSTALLED in the cluster. If it is not, the kind is
+# unknown and `helm install`/ArgoCD sync FAILS on this object — it is not a no-op.
+# This chart deliberately does NOT bundle Kyverno.
+#
+# START IN Audit. `enforce: Audit` logs violations without blocking admission; flip to
+# `Enforce` only once you have confirmed every uzi image verifies (`cosign verify`,
+# see docs/container-signing.md). Enforcing before signatures are in place — or with a
+# wrong identity/issuer — will block the very pods this chart deploys.
+imageVerification:
+  enabled: false
+  # Audit (log only, safe default) | Enforce (block unsigned/unverified admission).
+  enforce: Audit
+  # Which images the policy checks. Defaults to uzi's own image namespace; a fork that
+  # re-signs under its own registry overrides this glob.
+  imageGlob: "ghcr.io/vtmocanu/uzi/*"
+  # Keyless (Sigstore) verification pins WHO signed and via WHICH OIDC issuer.
+  #   identityRegexp — a regex matched against the signer certificate identity, i.e.
+  #     uzi's release workflow at any release tag. A fork sets this to its own
+  #     …/release.yml ref.
+  #   issuer — the OIDC issuer; GitHub Actions' is the constant below.
+  keyless:
+    # Single-quoted: the backslash-escaped dots are literal regex, not YAML escapes.
+    identityRegexp: '^https://github\.com/vtmocanu/uzi/\.github/workflows/release\.yml@refs/tags/.*$'
+    issuer: "https://token.actions.githubusercontent.com"
+
 # --- api: the Go backend (sole holder of secrets/keys, the DB client) -----------
 api:
   enabled: true

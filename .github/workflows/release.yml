@@ -140,6 +140,18 @@ jobs:
   # buildx builds on the runner and pushes to GHCR. provenance:false keeps the pushed
   # tag a single plain image manifest (no attestation index), matching the chart's
   # simple {repo}:{tag} image references. platforms: linux/amd64 -- amd64-only for now.
+  #
+  # SIGNING (cosign keyless / Sigstore). Every image is signed BY DIGEST after push,
+  # using the job's GitHub OIDC identity (id-token: write) -- no long-lived key to
+  # store or rotate. The signer identity is this workflow's ref
+  # (…/release.yml@refs/tags/vX.Y.Z), which is what a verifier pins with
+  # `cosign verify --certificate-identity-regexp … --certificate-oidc-issuer
+  # https://token.actions.githubusercontent.com`. A cosign signature is a SEPARATE
+  # OCI artifact (a `sha256-<digest>.sig` tag pushed to the same repo under the
+  # existing packages:write), so it does NOT change the image manifest and stays
+  # compatible with provenance:false. Signing by digest (not tag) is deliberate: the
+  # two tags a job pushes (:version and :short_sha) share one digest, so one signature
+  # covers both and there is no tag->digest TOCTOU window.
 
   publish-api:
     runs-on: ubuntu-latest
@@ -148,15 +160,24 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write   # cosign keyless: mint the OIDC token used to sign
     steps:
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v4
+      - uses: sigstore/cosign-installer@v4
+        with:
+          # cosign 2.x emits classic signatures -- the broadest verifier + Kyverno
+          # compatibility. Installer v4 is REQUIRED for cosign v3.x (which defaults to
+          # the new Sigstore bundle format); before bumping cosign to v3, confirm the
+          # Kyverno version a consumer runs can verify that format.
+          cosign-release: 'v2.6.5'
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v7
+      - id: build
+        uses: docker/build-push-action@v7
         with:
           context: api
           file: api/Dockerfile
@@ -176,6 +197,9 @@ jobs:
             UZI_COMMIT_COUNT=${{ needs.assert-changelog.outputs.commit_count }}
             UZI_PRDS_DONE=${{ needs.assert-changelog.outputs.prds_done }}
             UZI_PRDS_OPEN=${{ needs.assert-changelog.outputs.prds_open }}
+      # Sign by digest (covers both pushed tags; no tag->digest TOCTOU).
+      - name: Sign image (cosign keyless)
+        run: cosign sign --yes ghcr.io/vtmocanu/uzi/api@${{ steps.build.outputs.digest }}
 
   publish-web:
     runs-on: ubuntu-latest
@@ -184,16 +208,25 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write   # cosign keyless: mint the OIDC token used to sign
     steps:
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v4
+      - uses: sigstore/cosign-installer@v4
+        with:
+          # cosign 2.x emits classic signatures -- the broadest verifier + Kyverno
+          # compatibility. Installer v4 is REQUIRED for cosign v3.x (which defaults to
+          # the new Sigstore bundle format); before bumping cosign to v3, confirm the
+          # Kyverno version a consumer runs can verify that format.
+          cosign-release: 'v2.6.5'
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       # Context is the repo ROOT: web/Dockerfile COPYs both web/ and docs/.
-      - uses: docker/build-push-action@v7
+      - id: build
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: web/Dockerfile
@@ -203,6 +236,8 @@ jobs:
           tags: |
             ghcr.io/vtmocanu/uzi/web:${{ needs.prep.outputs.version }}
             ghcr.io/vtmocanu/uzi/web:${{ needs.prep.outputs.short_sha }}
+      - name: Sign image (cosign keyless)
+        run: cosign sign --yes ghcr.io/vtmocanu/uzi/web@${{ steps.build.outputs.digest }}
 
   publish-controller:
     runs-on: ubuntu-latest
@@ -211,15 +246,24 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write   # cosign keyless: mint the OIDC token used to sign
     steps:
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v4
+      - uses: sigstore/cosign-installer@v4
+        with:
+          # cosign 2.x emits classic signatures -- the broadest verifier + Kyverno
+          # compatibility. Installer v4 is REQUIRED for cosign v3.x (which defaults to
+          # the new Sigstore bundle format); before bumping cosign to v3, confirm the
+          # Kyverno version a consumer runs can verify that format.
+          cosign-release: 'v2.6.5'
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v7
+      - id: build
+        uses: docker/build-push-action@v7
         with:
           context: controller
           file: controller/Dockerfile
@@ -229,6 +273,8 @@ jobs:
           tags: |
             ghcr.io/vtmocanu/uzi/controller:${{ needs.prep.outputs.version }}
             ghcr.io/vtmocanu/uzi/controller:${{ needs.prep.outputs.short_sha }}
+      - name: Sign image (cosign keyless)
+        run: cosign sign --yes ghcr.io/vtmocanu/uzi/controller@${{ steps.build.outputs.digest }}
 
   # Per-template worker images. Destination is <prefix>/agent-<template>, which is what
   # makes the chart's workers.image.repository (ghcr.io/vtmocanu/uzi) + the controller's
@@ -241,6 +287,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write   # cosign keyless: mint the OIDC token used to sign
     strategy:
       fail-fast: false
       matrix:
@@ -248,6 +295,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v4
+      - uses: sigstore/cosign-installer@v4
+        with:
+          # cosign 2.x emits classic signatures -- the broadest verifier + Kyverno
+          # compatibility. Installer v4 is REQUIRED for cosign v3.x (which defaults to
+          # the new Sigstore bundle format); before bumping cosign to v3, confirm the
+          # Kyverno version a consumer runs can verify that format.
+          cosign-release: 'v2.6.5'
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -258,7 +312,8 @@ jobs:
       # keeps the leading v (the Dockerfile strips it) and carries +g<short-sha> build
       # metadata; SemVer excludes build metadata from precedence, so the reported
       # version still classifies as the release.
-      - uses: docker/build-push-action@v7
+      - id: build
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: agent/templates/${{ matrix.template }}/Dockerfile
@@ -271,6 +326,8 @@ jobs:
           build-args: |
             UZI_SRC_SHA=${{ github.sha }}
             UZI_AGENT_VERSION=${{ github.ref_name }}+g${{ needs.prep.outputs.short_sha }}
+      - name: Sign image (cosign keyless)
+        run: cosign sign --yes ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}@${{ steps.build.outputs.digest }}
 
   # ----------------------------------------------------------------- chart ----
   # Package + push the Helm chart as an OCI artifact, LAST (after every image), so
@@ -283,22 +340,41 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write   # cosign keyless: mint the OIDC token used to sign
     steps:
       - uses: actions/checkout@v5
       - uses: azure/setup-helm@v5
         with:
           version: v3.21.3
+      - uses: sigstore/cosign-installer@v4
+        with:
+          # cosign 2.x emits classic signatures -- the broadest verifier + Kyverno
+          # compatibility. Installer v4 is REQUIRED for cosign v3.x (which defaults to
+          # the new Sigstore bundle format); before bumping cosign to v3, confirm the
+          # Kyverno version a consumer runs can verify that format.
+          cosign-release: 'v2.6.5'
       - name: helm registry login (GHCR)
         # --password-stdin keeps the token out of the process argv.
         run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
-      - name: Package + push chart
+      - name: Package + push + sign chart
         run: |
           set -euo pipefail
           # helm dependency build vendors the CNPG `cluster` subchart (Chart.lock) into
           # the package, so the published OCI artifact is self-contained for ArgoCD.
           helm dependency build deploy/chart
           helm package deploy/chart -d /tmp/chart
-          helm push /tmp/chart/uzi-*.tgz oci://ghcr.io/vtmocanu/uzi
+          # helm push writes "Pushed:" + "Digest: sha256:…" to STDOUT; the 2>&1 folds
+          # STDERR in too, and tee (not a captured $()) means a push FAILURE still
+          # prints its error before set -e/pipefail aborts the step. Then sign the chart
+          # BY DIGEST (same keyless flow and same packages:write as the images -- the
+          # chart is just another OCI artifact).
+          helm push /tmp/chart/uzi-*.tgz oci://ghcr.io/vtmocanu/uzi 2>&1 | tee /tmp/helm-push.log
+          digest="$(awk '/Digest:/ {print $2}' /tmp/helm-push.log)"
+          case "$digest" in
+            sha256:*) : ;;
+            *) echo "ERROR: could not parse chart digest from helm push output" >&2; exit 1 ;;
+          esac
+          cosign sign --yes "ghcr.io/vtmocanu/uzi/uzi@${digest}"
 
   # --------------------------------------------------------------- release ----
   # Create the GitHub Release from the tag's CHANGELOG section. The curated prose
