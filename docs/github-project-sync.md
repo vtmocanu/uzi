@@ -37,9 +37,10 @@ dedicated settings-page control yet.
 ## Adopt vs. provision
 
 - **Adopt** links a project you already built by hand: give uzi its project
-  number and uzi matches the Status field's existing options against your
-  board's column names. An unmatched option is skipped, and logged, never
-  guessed.
+  number and uzi matches your board's column names against the Status field's
+  existing options by exact name. A column with no matching option is skipped,
+  and logged, never guessed — so if you later drag such a card in uzi its
+  Status is left unchanged until you add the matching option.
 - **Provision** is zero-click: uzi creates a new project, adds its own
   single-select field ("uzi Status", not GitHub's built-in Status) seeded
   with one option per board column, links it to the repo, and seeds every
