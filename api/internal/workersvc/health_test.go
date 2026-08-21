@@ -65,6 +65,18 @@ type healthFakeStore struct {
 	// the cutoff from WorkerBackgroundGrace and that the queued-threshold guard
 	// short-circuits ahead of it (no query for a freshly-queued run).
 	priorityCalls []store.RunPriorityClassForRunParams
+	// satisfyingCaps is the canned CountOnlineWorkersSatisfyingCaps answer (PRD #84 M3):
+	// how many online, non-draining workers have effective caps covering the run's
+	// required set. 0 with a non-empty requirement is the unplaceable run that drives
+	// reasonNoEligibleWorker. satisfyingCapsErr forces the read to fail (falls through to
+	// the generic queuedReason). The subset predicate itself is NOT reimplemented here —
+	// it is pinned against a real Postgres by store.TestCountOnlineWorkersSatisfyingCaps*
+	// LiveDB; this side pins the ARM (flag/count → reason mapping).
+	satisfyingCaps    int64
+	satisfyingCapsErr error
+	// capsCalls records every lookup's params, so a test can prove the arm asks about
+	// THIS run's user and required set, and that the guards ahead of it short-circuit.
+	capsCalls []store.CountOnlineWorkersSatisfyingCapsParams
 }
 
 func (f *healthFakeStore) ListActiveRunsForHealth(context.Context) ([]store.ListActiveRunsForHealthRow, error) {
@@ -82,6 +94,13 @@ func (f *healthFakeStore) CountOnlineWorkersForUser(context.Context, uuid.UUID) 
 }
 func (f *healthFakeStore) CountOnlineWorkersWithFreeSlotForUser(context.Context, uuid.UUID) (int64, error) {
 	return f.freeSlotWorkers, nil
+}
+func (f *healthFakeStore) CountOnlineWorkersSatisfyingCaps(_ context.Context, arg store.CountOnlineWorkersSatisfyingCapsParams) (int64, error) {
+	f.capsCalls = append(f.capsCalls, arg)
+	if f.satisfyingCapsErr != nil {
+		return 0, f.satisfyingCapsErr
+	}
+	return f.satisfyingCaps, nil
 }
 func (f *healthFakeStore) CountOnlineEligibleWorkersForRepo(context.Context, store.CountOnlineEligibleWorkersForRepoParams) (int64, error) {
 	return f.eligibleWorkers, f.eligibleErr

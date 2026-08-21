@@ -172,6 +172,8 @@ const SEED_APP_SETTINGS: AppSettings = {
   health_approval_seconds: "3600",
   health_nudge_cooldown_seconds: "1800",
   docker_repo_allowlist: "",
+  // PRD #84 M2: capability-aware scheduling kill-switch, default ON.
+  capability_aware_scheduling: "true",
   // PRD #196 M2: comma-separated label lists (run_eligible always contains the
   // primary) and the PRD-link waiver bool, mirroring the server defaults.
   run_eligible_labels: "PRD,bug",
@@ -2365,6 +2367,15 @@ export const mockApi = {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");
     r.repo_devbox_opt_in = enabled;
+    return delay({ repo: { ...r } });
+  },
+  // PRD #84 M2: static per-repo capability hint. Mirrors the server's
+  // capability.Filter to the {docker, jvm} vocabulary so only valid names persist.
+  setRepoRequiredCapabilities: async (id: string, caps: string[]) => {
+    const r = repos.find((x) => x.id === id);
+    if (!r) throw new ApiError(404, "repo not found");
+    const vocab = new Set(["docker", "jvm"]);
+    r.required_capabilities = caps.filter((c) => vocab.has(c));
     return delay({ repo: { ...r } });
   },
   // PRD #66 M9 (D8): admin per-repo guardrail override. Requires a non-empty reason

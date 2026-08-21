@@ -176,6 +176,13 @@ WITH prev AS (
         status              = 'online',
         version             = @version,
         template_reported   = @template_reported,
+        -- capabilities is the server-authoritative capability set (PRD #84 M1): the
+        -- Filter-ed union of the worker's self-report and its template-derived caps,
+        -- computed in Service.Register. Overwritten on every register (the fresh-start
+        -- signal), so a worker that stops self-reporting docker loses it here too.
+        -- COALESCE guards the NOT NULL column against a nil slice from any caller
+        -- (pgx encodes a nil []string as SQL NULL): a nil report stores '{}', not NULL.
+        capabilities        = COALESCE(@capabilities::text[], '{}'),
         max_concurrent_runs = sqlc.narg('max_concurrent_runs'),
         -- online_since is the api-owned uptime anchor (PRD #251 M1): PRESERVE it if the
         -- worker is already online with one, else STAMP now() — so a steady stream of
@@ -356,8 +363,15 @@ WHERE status = 'online'
 -- issue-less kind, a comment-less issue, and a connection with an unknown bot id
 -- (D9) all store NULL — so an omitted Go struct field would compile green and
 -- silently ship NULL for every run. The fetch is centralized in createRun.
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb)
+--
+-- 🔴 required_capabilities (PRD #84 M2) is NOT a Go struct param: it is copied
+-- atomically from the run's repo via a subquery, so the createRun path needs no
+-- extra Go read and cannot ship a stale hint. The repo's hint is already Filter-ed
+-- against the vocabulary at its write path, so no re-validation is needed here.
+-- Repo-less kinds (judge/chat/self_improve) INSERT elsewhere and keep the '{}'
+-- column default. Plan inference (M4) later union-merges via a separate UPDATE.
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, required_capabilities)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'))
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -568,7 +582,9 @@ WHERE id = (
            OR r.worker_id = @worker_id
            OR r.updated_at < @affinity_cutoff)
       -- PRD #216 D5: claiming-worker eligibility via the shared expression.
-      AND fn_worker_can_claim(@is_docker_worker::boolean, @docker_repo_allowlist::uuid[], r.repo_id, r.kind)
+      -- PRD #84 M2 extends it: the run's required_capabilities must be a subset of the
+      -- claiming worker's effective caps (@worker_caps ∪ docker), gated by @capability_aware.
+      AND fn_worker_can_claim(@is_docker_worker::boolean, @docker_repo_allowlist::uuid[], r.repo_id, r.kind, @worker_caps::text[], r.required_capabilities, @capability_aware::boolean)
       -- PRD #216 fleet-aware spread (D3/D4/D7/D8/R3). Defer this run to a peer
       -- ONLY when a strictly-better peer exists. Resume affinity (worker_id = me)
       -- and a run older than @spread_cutoff both BYPASS the spread, so the spread
@@ -605,7 +621,7 @@ WHERE id = (
                 -- run to it — it would never pick the run up.
                 AND p.draining_since IS NULL
                 AND p.max_concurrent_runs IS NOT NULL
-                AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), @docker_repo_allowlist::uuid[], r.repo_id, r.kind)
+                AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), @docker_repo_allowlist::uuid[], r.repo_id, r.kind, p.capabilities, r.required_capabilities, @capability_aware::boolean)
                 AND pa.active < p.max_concurrent_runs
                 AND pa.active * (SELECT w.max_concurrent_runs FROM workers w WHERE w.id = @worker_id)
                     < (SELECT count(*) FROM runs mr
@@ -2166,10 +2182,16 @@ WHERE id = @id;
 -- PRD #122 M2 (Decision 5b): budget_wall_seconds rides this read so the running-run
 -- "slow" clamp uses the run's EFFECTIVE timeout, not the global one — a scaled run must
 -- not render slow for its whole extended life. NULL for a run on the global default.
+-- PRD #84 M3: repo_id, kind and required_capabilities ride this read so the queued
+-- arm can surface a capability-specific "no eligible worker" reason (required caps not
+-- a subset of any online worker's effective caps). kind was previously only a WHERE
+-- filter; it is projected now so the resolver can branch on it too. No sweeper change —
+-- a parked run stays queued and every sweep pass is scoped away from it by construction.
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at,
        health, health_reason, health_since, health_notified_at,
-       budget_wall_seconds, repo_id, kind
+       budget_wall_seconds,
+       repo_id, kind, required_capabilities
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat';
@@ -2219,26 +2241,31 @@ SELECT count(*) FROM workers WHERE user_id = @user_id AND status = 'online';
 
 -- name: CountOnlineEligibleWorkersForRepo :one
 -- How many of a user's ONLINE workers are ELIGIBLE to claim a run on this repo/kind
--- per fn_worker_can_claim (migration 00113), IGNORING free slots. PRD #361's queued
--- Docker-allowlist reason uses it: with >0 online workers, a result of 0 means every
--- online worker is a Docker worker the allowlist predicate rejects for this repo — the
--- run is genuinely unrunnable without allowlisting, distinct from "all busy" (a free
--- slot won't help). Params cast EXACTLY as ClaimRun passes them so a green sqlc generate
--- is not mistaken for a query Postgres will accept. Only called for a queued run already
--- past its health threshold, so it is off the hot path.
+-- per fn_worker_can_claim (migration 00113, extended in 00142), IGNORING free slots.
+-- PRD #361's queued Docker-allowlist reason uses it: with >0 online workers, a result of
+-- 0 means every online worker is a Docker worker the allowlist predicate rejects for this
+-- repo — the run is genuinely unrunnable without allowlisting, distinct from "all busy" (a
+-- free slot won't help). Params cast EXACTLY as ClaimRun passes them so a green sqlc
+-- generate is not mistaken for a query Postgres will accept. capability_aware is passed
+-- FALSE (worker_caps/required_capabilities empty) so this stays the pure docker→allowlist
+-- eligibility 00142's capability clause trivially satisfies — the capability notion is
+-- handled separately upstream by CountOnlineWorkersSatisfyingCaps. Only called for a
+-- queued run already past its health threshold, so it is off the hot path.
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
-  AND fn_worker_can_claim(COALESCE(w.docker_enabled, false), @docker_repo_allowlist::uuid[], @repo_id::uuid, @kind::text);
+  AND fn_worker_can_claim(COALESCE(w.docker_enabled, false), @docker_repo_allowlist::uuid[], @repo_id::uuid, @kind::text, '{}'::text[], '{}'::text[], false);
 
 -- name: ListDockerBlockedReposForUser :many
 -- The caller's repo ids that a Docker-allowlist gap is ACTIVELY blocking (PRD #361 M3):
 -- an enabled repo with ≥1 of the caller's QUEUED runs, for which the caller has ≥1 online
 -- worker but ZERO online workers eligible to claim a repo-bearing run on it — i.e. every
 -- online worker is a Docker worker and the repo is not on the docker allowlist. Reuses the
--- fn_worker_can_claim eligibility notion (migration 00113); for a repo-bearing run the kind
--- is irrelevant (the judge exemption needs repo_id IS NULL), so eligibility is per repo and
--- the kind arg is a placeholder. The "≥1 online AND zero eligible" pair already implies the
+-- fn_worker_can_claim eligibility notion (migration 00113, extended in 00142); for a
+-- repo-bearing run the kind is irrelevant (the judge exemption needs repo_id IS NULL), so
+-- eligibility is per repo and the kind arg is a placeholder. capability_aware is passed
+-- FALSE (worker_caps/required_capabilities empty) so this stays the pure docker→allowlist
+-- eligibility notion. The "≥1 online AND zero eligible" pair already implies the
 -- repo is not allowlisted (an allowlisted repo makes every worker eligible), so no separate
 -- allowlist clause is needed. Requiring ≥1 online worker keeps this distinct from a
 -- no-worker-online block (mirrors the M2 queued reason). Drives the Setup chip's info
@@ -2260,7 +2287,7 @@ WHERE fc.user_id = @user_id
   AND NOT EXISTS (
     SELECT 1 FROM workers w
     WHERE w.user_id = @user_id AND w.status = 'online'
-      AND fn_worker_can_claim(COALESCE(w.docker_enabled, false), @docker_repo_allowlist::uuid[], r.id, 'task'::text)
+      AND fn_worker_can_claim(COALESCE(w.docker_enabled, false), @docker_repo_allowlist::uuid[], r.id, 'task'::text, '{}'::text[], '{}'::text[], false)
   );
 
 -- name: CountOnlineWorkersWithFreeSlotForUser :one
@@ -2284,6 +2311,22 @@ WHERE w.user_id = @user_id
             WHERE r.worker_id = w.id
               AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
               AND r.kind <> 'chat') < w.max_concurrent_runs);
+
+-- name: CountOnlineWorkersSatisfyingCaps :one
+-- How many of a user's ONLINE, non-draining workers have EFFECTIVE caps that are a
+-- SUPERSET of a given required set — the queued-run reason resolver (PRD #84 M3) uses
+-- it to tell "no online worker can run this" (a capability nothing in the fleet has)
+-- from the generic wait. The effective-caps fold is the SAME one fn_worker_can_claim
+-- (migration 00142) applies at claim time — capabilities plus `docker` when
+-- docker_enabled — so a run this returns 0 for is exactly a run no online worker can
+-- claim. draining_since IS NULL mirrors CountOnlineWorkersWithFreeSlotForUser: a
+-- draining worker claims nothing, so it cannot be the eligible worker. Only called for
+-- a queued run already past its health threshold, so it is off the hot path.
+SELECT count(*) FROM workers w
+WHERE w.user_id = @user_id
+  AND w.status = 'online'
+  AND w.draining_since IS NULL
+  AND @required_capabilities::text[] <@ (COALESCE(w.capabilities, '{}') || CASE WHEN COALESCE(w.docker_enabled, false) THEN ARRAY['docker'] ELSE ARRAY[]::text[] END);
 
 -- name: RunHasVerdictSinceGateOpened :one
 -- Has the owner already answered THIS approval gate, with the worker yet to act on it

@@ -210,7 +210,9 @@ WHERE id = (
            OR r.worker_id = $1
            OR r.updated_at < $3)
       -- PRD #216 D5: claiming-worker eligibility via the shared expression.
-      AND fn_worker_can_claim($4::boolean, $5::uuid[], r.repo_id, r.kind)
+      -- PRD #84 M2 extends it: the run's required_capabilities must be a subset of the
+      -- claiming worker's effective caps (@worker_caps ∪ docker), gated by @capability_aware.
+      AND fn_worker_can_claim($4::boolean, $5::uuid[], r.repo_id, r.kind, $6::text[], r.required_capabilities, $7::boolean)
       -- PRD #216 fleet-aware spread (D3/D4/D7/D8/R3). Defer this run to a peer
       -- ONLY when a strictly-better peer exists. Resume affinity (worker_id = me)
       -- and a run older than @spread_cutoff both BYPASS the spread, so the spread
@@ -228,7 +230,7 @@ WHERE id = (
       -- claim (a minimum-loaded worker never defers, guaranteeing claimability).
       AND (
           r.worker_id = $1
-          OR r.updated_at < $6
+          OR r.updated_at < $8
           OR NOT EXISTS (
               SELECT 1
               FROM workers p
@@ -242,12 +244,12 @@ WHERE id = (
               WHERE p.user_id = $2
                 AND p.id <> $1
                 AND p.last_heartbeat_at IS NOT NULL
-                AND p.last_heartbeat_at >= $7
+                AND p.last_heartbeat_at >= $9
                 -- A draining peer claims nothing (PRD #422 Decision 7), so never DEFER a
                 -- run to it — it would never pick the run up.
                 AND p.draining_since IS NULL
                 AND p.max_concurrent_runs IS NOT NULL
-                AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), $5::uuid[], r.repo_id, r.kind)
+                AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), $5::uuid[], r.repo_id, r.kind, p.capabilities, r.required_capabilities, $7::boolean)
                 AND pa.active < p.max_concurrent_runs
                 AND pa.active * (SELECT w.max_concurrent_runs FROM workers w WHERE w.id = $1)
                     < (SELECT count(*) FROM runs mr
@@ -266,12 +268,12 @@ WHERE id = (
     -- fail-open: a demoted run created before it reads as stale, so
     -- fn_run_priority returns normal and background work never starves.
     ORDER BY COALESCE(r.worker_id = $1, false) DESC,
-             fn_run_priority(r.kind, r.priority, r.created_at < $8) DESC,
+             fn_run_priority(r.kind, r.priority, r.created_at < $10) DESC,
              r.created_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities
 `
 
 type ClaimRunParams struct {
@@ -280,6 +282,8 @@ type ClaimRunParams struct {
 	AffinityCutoff        pgtype.Timestamptz `json:"affinity_cutoff"`
 	IsDockerWorker        bool               `json:"is_docker_worker"`
 	DockerRepoAllowlist   []uuid.UUID        `json:"docker_repo_allowlist"`
+	WorkerCaps            []string           `json:"worker_caps"`
+	CapabilityAware       bool               `json:"capability_aware"`
 	SpreadCutoff          pgtype.Timestamptz `json:"spread_cutoff"`
 	HeartbeatCutoff       pgtype.Timestamptz `json:"heartbeat_cutoff"`
 	BackgroundGraceCutoff pgtype.Timestamptz `json:"background_grace_cutoff"`
@@ -318,6 +322,8 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		arg.AffinityCutoff,
 		arg.IsDockerWorker,
 		arg.DockerRepoAllowlist,
+		arg.WorkerCaps,
+		arg.CapabilityAware,
 		arg.SpreadCutoff,
 		arg.HeartbeatCutoff,
 		arg.BackgroundGraceCutoff,
@@ -412,6 +418,7 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		&i.ThenFixRequested,
 		&i.ThenFixOfRunID,
 		&i.PreservedPatch,
+		&i.RequiredCapabilities,
 	)
 	return i, err
 }
@@ -521,7 +528,7 @@ const countOnlineEligibleWorkersForRepo = `-- name: CountOnlineEligibleWorkersFo
 SELECT count(*) FROM workers w
 WHERE w.user_id = $1
   AND w.status = 'online'
-  AND fn_worker_can_claim(COALESCE(w.docker_enabled, false), $2::uuid[], $3::uuid, $4::text)
+  AND fn_worker_can_claim(COALESCE(w.docker_enabled, false), $2::uuid[], $3::uuid, $4::text, '{}'::text[], '{}'::text[], false)
 `
 
 type CountOnlineEligibleWorkersForRepoParams struct {
@@ -532,13 +539,16 @@ type CountOnlineEligibleWorkersForRepoParams struct {
 }
 
 // How many of a user's ONLINE workers are ELIGIBLE to claim a run on this repo/kind
-// per fn_worker_can_claim (migration 00113), IGNORING free slots. PRD #361's queued
-// Docker-allowlist reason uses it: with >0 online workers, a result of 0 means every
-// online worker is a Docker worker the allowlist predicate rejects for this repo — the
-// run is genuinely unrunnable without allowlisting, distinct from "all busy" (a free
-// slot won't help). Params cast EXACTLY as ClaimRun passes them so a green sqlc generate
-// is not mistaken for a query Postgres will accept. Only called for a queued run already
-// past its health threshold, so it is off the hot path.
+// per fn_worker_can_claim (migration 00113, extended in 00142), IGNORING free slots.
+// PRD #361's queued Docker-allowlist reason uses it: with >0 online workers, a result of
+// 0 means every online worker is a Docker worker the allowlist predicate rejects for this
+// repo — the run is genuinely unrunnable without allowlisting, distinct from "all busy" (a
+// free slot won't help). Params cast EXACTLY as ClaimRun passes them so a green sqlc
+// generate is not mistaken for a query Postgres will accept. capability_aware is passed
+// FALSE (worker_caps/required_capabilities empty) so this stays the pure docker→allowlist
+// eligibility 00142's capability clause trivially satisfies — the capability notion is
+// handled separately upstream by CountOnlineWorkersSatisfyingCaps. Only called for a
+// queued run already past its health threshold, so it is off the hot path.
 func (q *Queries) CountOnlineEligibleWorkersForRepo(ctx context.Context, arg CountOnlineEligibleWorkersForRepoParams) (int64, error) {
 	row := q.db.QueryRow(ctx, countOnlineEligibleWorkersForRepo,
 		arg.UserID,
@@ -563,6 +573,35 @@ SELECT count(*) FROM workers WHERE user_id = $1 AND status = 'online'
 // online" purposes — do not add a draining predicate.
 func (q *Queries) CountOnlineWorkersForUser(ctx context.Context, userID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersForUser, userID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countOnlineWorkersSatisfyingCaps = `-- name: CountOnlineWorkersSatisfyingCaps :one
+SELECT count(*) FROM workers w
+WHERE w.user_id = $1
+  AND w.status = 'online'
+  AND w.draining_since IS NULL
+  AND $2::text[] <@ (COALESCE(w.capabilities, '{}') || CASE WHEN COALESCE(w.docker_enabled, false) THEN ARRAY['docker'] ELSE ARRAY[]::text[] END)
+`
+
+type CountOnlineWorkersSatisfyingCapsParams struct {
+	UserID               uuid.UUID `json:"user_id"`
+	RequiredCapabilities []string  `json:"required_capabilities"`
+}
+
+// How many of a user's ONLINE, non-draining workers have EFFECTIVE caps that are a
+// SUPERSET of a given required set — the queued-run reason resolver (PRD #84 M3) uses
+// it to tell "no online worker can run this" (a capability nothing in the fleet has)
+// from the generic wait. The effective-caps fold is the SAME one fn_worker_can_claim
+// (migration 00142) applies at claim time — capabilities plus `docker` when
+// docker_enabled — so a run this returns 0 for is exactly a run no online worker can
+// claim. draining_since IS NULL mirrors CountOnlineWorkersWithFreeSlotForUser: a
+// draining worker claims nothing, so it cannot be the eligible worker. Only called for
+// a queued run already past its health threshold, so it is off the hot path.
+func (q *Queries) CountOnlineWorkersSatisfyingCaps(ctx context.Context, arg CountOnlineWorkersSatisfyingCapsParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingCaps, arg.UserID, arg.RequiredCapabilities)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -716,9 +755,9 @@ func (q *Queries) CreateApprovePlanInput(ctx context.Context, arg CreateApproveP
 
 const createRun = `-- name: CreateRun :one
 
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments)
-VALUES ($1, $2::uuid, $3, $4, $5, $6, now(), $7, $8, $9, $10, $11, $12::jsonb, $13, $14, $15, $16, $17::jsonb)
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, required_capabilities)
+VALUES ($1, $2::uuid, $3, $4, $5, $6, now(), $7, $8, $9, $10, $11, $12::jsonb, $13, $14, $15, $16, $17::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $2::uuid), '{}'))
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities
 `
 
 type CreateRunParams struct {
@@ -788,6 +827,13 @@ type CreateRunParams struct {
 // issue-less kind, a comment-less issue, and a connection with an unknown bot id
 // (D9) all store NULL — so an omitted Go struct field would compile green and
 // silently ship NULL for every run. The fetch is centralized in createRun.
+//
+// 🔴 required_capabilities (PRD #84 M2) is NOT a Go struct param: it is copied
+// atomically from the run's repo via a subquery, so the createRun path needs no
+// extra Go read and cannot ship a stale hint. The repo's hint is already Filter-ed
+// against the vocabulary at its write path, so no re-validation is needed here.
+// Repo-less kinds (judge/chat/self_improve) INSERT elsewhere and keep the '{}'
+// column default. Plan inference (M4) later union-merges via a separate UPDATE.
 func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createRun,
 		arg.UserID,
@@ -898,6 +944,7 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		&i.ThenFixRequested,
 		&i.ThenFixOfRunID,
 		&i.PreservedPatch,
+		&i.RequiredCapabilities,
 	)
 	return i, err
 }
@@ -1142,7 +1189,7 @@ const createWorker = `-- name: CreateWorker :one
 
 INSERT INTO workers (user_id, name, token_hash, template_declared, anthropic_secret_id, anthropic_bind_mode)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities
 `
 
 type CreateWorkerParams struct {
@@ -1210,6 +1257,7 @@ func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Wor
 		&i.AnthropicBindMode,
 		&i.OnlineSince,
 		&i.DrainingSince,
+		&i.Capabilities,
 	)
 	return i, err
 }
@@ -1437,7 +1485,7 @@ func (q *Queries) GetForgeTypeForRepo(ctx context.Context, repoID uuid.UUID) (st
 }
 
 const getRunByID = `-- name: GetRunByID :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch FROM runs WHERE id = $1
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities FROM runs WHERE id = $1
 `
 
 // Admin viewer path: fetch any run regardless of owner. The per-run authz check
@@ -1535,12 +1583,13 @@ func (q *Queries) GetRunByID(ctx context.Context, id uuid.UUID) (Run, error) {
 		&i.ThenFixRequested,
 		&i.ThenFixOfRunID,
 		&i.PreservedPatch,
+		&i.RequiredCapabilities,
 	)
 	return i, err
 }
 
 const getRunByIDForUser = `-- name: GetRunByIDForUser :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch FROM runs WHERE id = $1 AND user_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities FROM runs WHERE id = $1 AND user_id = $2
 `
 
 type GetRunByIDForUserParams struct {
@@ -1640,6 +1689,7 @@ func (q *Queries) GetRunByIDForUser(ctx context.Context, arg GetRunByIDForUserPa
 		&i.ThenFixRequested,
 		&i.ThenFixOfRunID,
 		&i.PreservedPatch,
+		&i.RequiredCapabilities,
 	)
 	return i, err
 }
@@ -1927,7 +1977,7 @@ func (q *Queries) GetRunMoveContext(ctx context.Context, runID uuid.UUID) (GetRu
 }
 
 const getRunOwnedByWorker = `-- name: GetRunOwnedByWorker :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch FROM runs WHERE id = $1 AND worker_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities FROM runs WHERE id = $1 AND worker_id = $2
 `
 
 type GetRunOwnedByWorkerParams struct {
@@ -2028,6 +2078,7 @@ func (q *Queries) GetRunOwnedByWorker(ctx context.Context, arg GetRunOwnedByWork
 		&i.ThenFixRequested,
 		&i.ThenFixOfRunID,
 		&i.PreservedPatch,
+		&i.RequiredCapabilities,
 	)
 	return i, err
 }
@@ -2065,7 +2116,7 @@ func (q *Queries) GetRunUsageTotal(ctx context.Context, runID uuid.UUID) (GetRun
 }
 
 const getWorkerByID = `-- name: GetWorkerByID :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since FROM workers WHERE id = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities FROM workers WHERE id = $1
 `
 
 func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, error) {
@@ -2096,12 +2147,13 @@ func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, erro
 		&i.AnthropicBindMode,
 		&i.OnlineSince,
 		&i.DrainingSince,
+		&i.Capabilities,
 	)
 	return i, err
 }
 
 const getWorkerByIDForUser = `-- name: GetWorkerByIDForUser :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since FROM workers WHERE id = $1 AND user_id = $2
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities FROM workers WHERE id = $1 AND user_id = $2
 `
 
 type GetWorkerByIDForUserParams struct {
@@ -2137,12 +2189,13 @@ func (q *Queries) GetWorkerByIDForUser(ctx context.Context, arg GetWorkerByIDFor
 		&i.AnthropicBindMode,
 		&i.OnlineSince,
 		&i.DrainingSince,
+		&i.Capabilities,
 	)
 	return i, err
 }
 
 const getWorkerByTokenHash = `-- name: GetWorkerByTokenHash :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since FROM workers WHERE token_hash = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities FROM workers WHERE token_hash = $1
 `
 
 // Worker auth: Bearer join token → sha256 → this lookup.
@@ -2174,6 +2227,7 @@ func (q *Queries) GetWorkerByTokenHash(ctx context.Context, tokenHash []byte) (W
 		&i.AnthropicBindMode,
 		&i.OnlineSince,
 		&i.DrainingSince,
+		&i.Capabilities,
 	)
 	return i, err
 }
@@ -2194,7 +2248,7 @@ UPDATE workers SET
     stats_source          = $4,
     updated_at            = now()
 WHERE id = $5
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities
 `
 
 type HeartbeatWorkerParams struct {
@@ -2246,6 +2300,7 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams
 		&i.AnthropicBindMode,
 		&i.OnlineSince,
 		&i.DrainingSince,
+		&i.Capabilities,
 	)
 	return i, err
 }
@@ -2287,7 +2342,7 @@ func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessagePara
 }
 
 const listActiveRunsAll = `-- name: ListActiveRunsAll :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, r.revise_count, r.plan_source, r.planned_base_commit, r.require_base_match, r.milestones_candidate, r.milestones_frozen, r.milestones_completed, r.milestones_in_progress, r.budget_max_iterations, r.budget_wall_seconds, r.schedule_id, r.limit_dead_secret_id, r.report_only, r.report_md, r.ci_config_paths, r.model, r.override_subagent_model, r.fail_origin, r.priority, r.summary_intent, r.summary_plan, r.summary_deltas, r.issue_comments, r.base_branch, r.open_mr, r.dispatched_at, r.review_target_run_id, r.review_requested, r.then_fix_requested, r.then_fix_of_run_id, r.preserved_patch, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, r.revise_count, r.plan_source, r.planned_base_commit, r.require_base_match, r.milestones_candidate, r.milestones_frozen, r.milestones_completed, r.milestones_in_progress, r.budget_max_iterations, r.budget_wall_seconds, r.schedule_id, r.limit_dead_secret_id, r.report_only, r.report_md, r.ci_config_paths, r.model, r.override_subagent_model, r.fail_origin, r.priority, r.summary_intent, r.summary_plan, r.summary_deltas, r.issue_comments, r.base_branch, r.open_mr, r.dispatched_at, r.review_target_run_id, r.review_requested, r.then_fix_requested, r.then_fix_of_run_id, r.preserved_patch, r.required_capabilities, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
        c.forge_type,
        i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link
        -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function (same as
@@ -2418,6 +2473,7 @@ func (q *Queries) ListActiveRunsAll(ctx context.Context, backgroundGraceCutoff p
 			&i.Run.ThenFixRequested,
 			&i.Run.ThenFixOfRunID,
 			&i.Run.PreservedPatch,
+			&i.Run.RequiredCapabilities,
 			&i.RepoPath,
 			&i.WorkerName,
 			&i.OwnerEmail,
@@ -2440,27 +2496,29 @@ const listActiveRunsForHealth = `-- name: ListActiveRunsForHealth :many
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at,
        health, health_reason, health_since, health_notified_at,
-       budget_wall_seconds, repo_id, kind
+       budget_wall_seconds,
+       repo_id, kind, required_capabilities
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat'
 `
 
 type ListActiveRunsForHealthRow struct {
-	ID                uuid.UUID          `json:"id"`
-	UserID            uuid.UUID          `json:"user_id"`
-	Status            string             `json:"status"`
-	AutoApprove       bool               `json:"auto_approve"`
-	StartedAt         pgtype.Timestamptz `json:"started_at"`
-	LastActivityAt    pgtype.Timestamptz `json:"last_activity_at"`
-	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
-	Health            string             `json:"health"`
-	HealthReason      pgtype.Text        `json:"health_reason"`
-	HealthSince       pgtype.Timestamptz `json:"health_since"`
-	HealthNotifiedAt  pgtype.Timestamptz `json:"health_notified_at"`
-	BudgetWallSeconds pgtype.Int4        `json:"budget_wall_seconds"`
-	RepoID            pgtype.UUID        `json:"repo_id"`
-	Kind              string             `json:"kind"`
+	ID                   uuid.UUID          `json:"id"`
+	UserID               uuid.UUID          `json:"user_id"`
+	Status               string             `json:"status"`
+	AutoApprove          bool               `json:"auto_approve"`
+	StartedAt            pgtype.Timestamptz `json:"started_at"`
+	LastActivityAt       pgtype.Timestamptz `json:"last_activity_at"`
+	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+	Health               string             `json:"health"`
+	HealthReason         pgtype.Text        `json:"health_reason"`
+	HealthSince          pgtype.Timestamptz `json:"health_since"`
+	HealthNotifiedAt     pgtype.Timestamptz `json:"health_notified_at"`
+	BudgetWallSeconds    pgtype.Int4        `json:"budget_wall_seconds"`
+	RepoID               pgtype.UUID        `json:"repo_id"`
+	Kind                 string             `json:"kind"`
+	RequiredCapabilities []string           `json:"required_capabilities"`
 }
 
 // Run health detector (PRD #47) ----------------------------------------------
@@ -2476,6 +2534,11 @@ type ListActiveRunsForHealthRow struct {
 // PRD #122 M2 (Decision 5b): budget_wall_seconds rides this read so the running-run
 // "slow" clamp uses the run's EFFECTIVE timeout, not the global one — a scaled run must
 // not render slow for its whole extended life. NULL for a run on the global default.
+// PRD #84 M3: repo_id, kind and required_capabilities ride this read so the queued
+// arm can surface a capability-specific "no eligible worker" reason (required caps not
+// a subset of any online worker's effective caps). kind was previously only a WHERE
+// filter; it is projected now so the resolver can branch on it too. No sweeper change —
+// a parked run stays queued and every sweep pass is scoped away from it by construction.
 func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRunsForHealthRow, error) {
 	rows, err := q.db.Query(ctx, listActiveRunsForHealth)
 	if err != nil {
@@ -2500,6 +2563,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRuns
 			&i.BudgetWallSeconds,
 			&i.RepoID,
 			&i.Kind,
+			&i.RequiredCapabilities,
 		); err != nil {
 			return nil, err
 		}
@@ -2512,7 +2576,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRuns
 }
 
 const listAllWorkers = `-- name: ListAllWorkers :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities,
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
@@ -2577,6 +2641,7 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 			&i.Worker.AnthropicBindMode,
 			&i.Worker.OnlineSince,
 			&i.Worker.DrainingSince,
+			&i.Worker.Capabilities,
 			&i.Busy,
 			&i.ActiveRuns,
 			&i.OwnerEmail,
@@ -2608,7 +2673,7 @@ WHERE fc.user_id = $1
   AND NOT EXISTS (
     SELECT 1 FROM workers w
     WHERE w.user_id = $1 AND w.status = 'online'
-      AND fn_worker_can_claim(COALESCE(w.docker_enabled, false), $2::uuid[], r.id, 'task'::text)
+      AND fn_worker_can_claim(COALESCE(w.docker_enabled, false), $2::uuid[], r.id, 'task'::text, '{}'::text[], '{}'::text[], false)
   )
 `
 
@@ -2621,9 +2686,11 @@ type ListDockerBlockedReposForUserParams struct {
 // an enabled repo with ≥1 of the caller's QUEUED runs, for which the caller has ≥1 online
 // worker but ZERO online workers eligible to claim a repo-bearing run on it — i.e. every
 // online worker is a Docker worker and the repo is not on the docker allowlist. Reuses the
-// fn_worker_can_claim eligibility notion (migration 00113); for a repo-bearing run the kind
-// is irrelevant (the judge exemption needs repo_id IS NULL), so eligibility is per repo and
-// the kind arg is a placeholder. The "≥1 online AND zero eligible" pair already implies the
+// fn_worker_can_claim eligibility notion (migration 00113, extended in 00142); for a
+// repo-bearing run the kind is irrelevant (the judge exemption needs repo_id IS NULL), so
+// eligibility is per repo and the kind arg is a placeholder. capability_aware is passed
+// FALSE (worker_caps/required_capabilities empty) so this stays the pure docker→allowlist
+// eligibility notion. The "≥1 online AND zero eligible" pair already implies the
 // repo is not allowlisted (an allowlisted repo makes every worker eligible), so no separate
 // allowlist clause is needed. Requiring ≥1 online worker keeps this distinct from a
 // no-worker-online block (mirrors the M2 queued reason). Drives the Setup chip's info
@@ -2986,7 +3053,7 @@ func (q *Queries) ListRunToolWindow(ctx context.Context, arg ListRunToolWindowPa
 }
 
 const listRunsForUser = `-- name: ListRunsForUser :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, r.revise_count, r.plan_source, r.planned_base_commit, r.require_base_match, r.milestones_candidate, r.milestones_frozen, r.milestones_completed, r.milestones_in_progress, r.budget_max_iterations, r.budget_wall_seconds, r.schedule_id, r.limit_dead_secret_id, r.report_only, r.report_md, r.ci_config_paths, r.model, r.override_subagent_model, r.fail_origin, r.priority, r.summary_intent, r.summary_plan, r.summary_deltas, r.issue_comments, r.base_branch, r.open_mr, r.dispatched_at, r.review_target_run_id, r.review_requested, r.then_fix_requested, r.then_fix_of_run_id, r.preserved_patch, rp.path_with_namespace AS repo_path, w.name AS worker_name,
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, r.revise_count, r.plan_source, r.planned_base_commit, r.require_base_match, r.milestones_candidate, r.milestones_frozen, r.milestones_completed, r.milestones_in_progress, r.budget_max_iterations, r.budget_wall_seconds, r.schedule_id, r.limit_dead_secret_id, r.report_only, r.report_md, r.ci_config_paths, r.model, r.override_subagent_model, r.fail_origin, r.priority, r.summary_intent, r.summary_plan, r.summary_deltas, r.issue_comments, r.base_branch, r.open_mr, r.dispatched_at, r.review_target_run_id, r.review_requested, r.then_fix_requested, r.then_fix_of_run_id, r.preserved_patch, r.required_capabilities, rp.path_with_namespace AS repo_path, w.name AS worker_name,
        c.forge_type,
        i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link
        -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function, so the
@@ -3180,6 +3247,7 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 			&i.Run.ThenFixRequested,
 			&i.Run.ThenFixOfRunID,
 			&i.Run.PreservedPatch,
+			&i.Run.RequiredCapabilities,
 			&i.RepoPath,
 			&i.WorkerName,
 			&i.ForgeType,
@@ -3281,7 +3349,7 @@ func (q *Queries) ListRunsForWorkerUser(ctx context.Context, arg ListRunsForWork
 }
 
 const listWorkersByUser = `-- name: ListWorkersByUser :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities,
        s.label AS anthropic_secret_label,
        EXISTS (
            SELECT 1 FROM runs r
@@ -3344,6 +3412,7 @@ type ListWorkersByUserRow struct {
 	AnthropicBindMode     string             `json:"anthropic_bind_mode"`
 	OnlineSince           pgtype.Timestamptz `json:"online_since"`
 	DrainingSince         pgtype.Timestamptz `json:"draining_since"`
+	Capabilities          []string           `json:"capabilities"`
 	AnthropicSecretLabel  pgtype.Text        `json:"anthropic_secret_label"`
 	Busy                  bool               `json:"busy"`
 	ActiveRuns            int64              `json:"active_runs"`
@@ -3412,6 +3481,7 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 			&i.AnthropicBindMode,
 			&i.OnlineSince,
 			&i.DrainingSince,
+			&i.Capabilities,
 			&i.AnthropicSecretLabel,
 			&i.Busy,
 			&i.ActiveRuns,
@@ -3639,7 +3709,14 @@ WITH prev AS (
         status              = 'online',
         version             = $2,
         template_reported   = $3,
-        max_concurrent_runs = $4,
+        -- capabilities is the server-authoritative capability set (PRD #84 M1): the
+        -- Filter-ed union of the worker's self-report and its template-derived caps,
+        -- computed in Service.Register. Overwritten on every register (the fresh-start
+        -- signal), so a worker that stops self-reporting docker loses it here too.
+        -- COALESCE guards the NOT NULL column against a nil slice from any caller
+        -- (pgx encodes a nil []string as SQL NULL): a nil report stores '{}', not NULL.
+        capabilities        = COALESCE($4::text[], '{}'),
+        max_concurrent_runs = $5,
         -- online_since is the api-owned uptime anchor (PRD #251 M1): PRESERVE it if the
         -- worker is already online with one, else STAMP now() — so a steady stream of
         -- registers never moves it and the first register after an offline gap (or for a
@@ -3657,7 +3734,7 @@ WITH prev AS (
         last_heartbeat_at   = now(),
         updated_at          = now()
     WHERE workers.id = $1
-    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since
+    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities
 ), cleared AS (
     UPDATE worker_upgrade_reports r
        SET upgrading_since    = NULL,
@@ -3709,13 +3786,14 @@ WITH prev AS (
        -- preserves that.
        AND split_part($2::text, '+', 1) IS DISTINCT FROM split_part(prev.old_version, '+', 1)
 )
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since FROM upd
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities FROM upd
 `
 
 type RegisterWorkerParams struct {
 	ID                uuid.UUID   `json:"id"`
 	Version           pgtype.Text `json:"version"`
 	TemplateReported  pgtype.Text `json:"template_reported"`
+	Capabilities      []string    `json:"capabilities"`
 	MaxConcurrentRuns pgtype.Int4 `json:"max_concurrent_runs"`
 }
 
@@ -3744,6 +3822,7 @@ type RegisterWorkerRow struct {
 	AnthropicBindMode  string             `json:"anthropic_bind_mode"`
 	OnlineSince        pgtype.Timestamptz `json:"online_since"`
 	DrainingSince      pgtype.Timestamptz `json:"draining_since"`
+	Capabilities       []string           `json:"capabilities"`
 }
 
 // Worker announces version + its self-reported template and comes online;
@@ -3798,6 +3877,7 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 		arg.ID,
 		arg.Version,
 		arg.TemplateReported,
+		arg.Capabilities,
 		arg.MaxConcurrentRuns,
 	)
 	var i RegisterWorkerRow
@@ -3826,6 +3906,7 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 		&i.AnthropicBindMode,
 		&i.OnlineSince,
 		&i.DrainingSince,
+		&i.Capabilities,
 	)
 	return i, err
 }
@@ -5117,7 +5198,7 @@ SET anthropic_secret_id = $1,
     anthropic_bind_mode = $2,
     updated_at = now()
 WHERE id = $3 AND user_id = $4
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities
 `
 
 type SetWorkerAnthropicSecretParams struct {
@@ -5182,6 +5263,7 @@ func (q *Queries) SetWorkerAnthropicSecret(ctx context.Context, arg SetWorkerAnt
 		&i.AnthropicBindMode,
 		&i.OnlineSince,
 		&i.DrainingSince,
+		&i.Capabilities,
 	)
 	return i, err
 }

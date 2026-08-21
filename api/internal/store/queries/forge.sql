@@ -200,6 +200,22 @@ RETURNING *;
 -- the caller being an admin in the handler.
 UPDATE repos SET repo_devbox_opt_in = $2 WHERE repos.id = $1 RETURNING *;
 
+-- name: SetRepoRequiredCapabilitiesForUser :one
+-- Static per-repo capability hint (PRD #84 M2), authorized through the repo's owning
+-- connection. A non-owned or unknown id returns no rows (404). The incoming list is
+-- Filter-ed against the server-owned vocabulary in the handler BEFORE it reaches here,
+-- so an unknown/spoofed name is dropped and never persisted.
+UPDATE repos SET required_capabilities = $2
+WHERE repos.id = $1
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
+RETURNING *;
+
+-- name: SetRepoRequiredCapabilities :one
+-- Admin path for the static per-repo capability hint (PRD #84 M2): not scoped to the
+-- owning user; gated on the caller being an admin in the handler. The list is
+-- Filter-ed against the vocabulary in the handler before it reaches here.
+UPDATE repos SET required_capabilities = $2 WHERE repos.id = $1 RETURNING *;
+
 -- name: SetRepoTrustFlags :one
 -- Atomic Trusted-repo (PRD #246) toggle: sets repo_skills_enabled and/or
 -- repo_claudemd_enabled in ONE round-trip. A nil arg leaves that column unchanged

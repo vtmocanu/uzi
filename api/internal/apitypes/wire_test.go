@@ -468,7 +468,9 @@ func TestSecretDTOTags(t *testing.T) {
 func TestRepoDTOTags(t *testing.T) {
 	assertTags(t, "RepoDTO", RepoDTO{},
 		"id", "connection_id", "forge_project_id", "path_with_namespace", "web_url",
-		"default_branch", "enabled", "repo_skills_enabled", "repo_claudemd_enabled", "repo_devbox_opt_in", "pipeline",
+		"default_branch", "enabled", "repo_skills_enabled", "repo_claudemd_enabled", "repo_devbox_opt_in",
+		// PRD #84 M2: the static per-repo capability hint routed onto each run.
+		"required_capabilities", "pipeline",
 		// PRD #66 M8 (D8): admin per-repo guardrail override metadata, null when no
 		// override is active. Display-only surfacing for M9's badge.
 		"guardrail_override",
@@ -497,6 +499,10 @@ func TestPipelineDTOTags(t *testing.T) {
 // WorkerDTO pin and the AdminWorkerDTO embed pin.
 var workerDTOKeys = []string{
 	"id", "name", "status", "kind", "hosted_size", "docker", "busy", "active_runs",
+	// PRD #84 M1: the server-authoritative capability set (Filter-ed union of the
+	// worker's self-report and its template-derived caps, v1 vocabulary {docker, jvm}).
+	// Read-only display for the workers UI.
+	"capabilities",
 	"max_concurrent_runs", "template_declared", "template_reported", "version",
 	// PRD #113: derived upgrade health, computed at read time from `version` against
 	// the control-plane release. Derived rather than stored, so nothing in the store

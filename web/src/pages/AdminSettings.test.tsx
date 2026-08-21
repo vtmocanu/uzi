@@ -48,6 +48,7 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   health_approval_seconds: "3600",
   health_nudge_cooldown_seconds: "1800",
   docker_repo_allowlist: "",
+  capability_aware_scheduling: "true",
   run_eligible_labels: "PRD,bug",
   board_extra_labels: "bug",
   eligible_label_waives_prd_link: "true",
@@ -582,6 +583,46 @@ describe("AdminSettings — docker repo allowlist (PRD #89 M-allow)", () => {
     // promise a removal the admin can't perform.
     expect(await screen.findByText(/could not load repositories/i)).toBeTruthy();
     expect(screen.queryByText(/outside your visibility/i)).toBeNull();
+  });
+});
+
+describe("AdminSettings — capability-aware scheduling kill-switch (PRD #84 M2)", () => {
+  const toggle = () =>
+    screen.getByLabelText(/enable capability-aware scheduling/i) as HTMLInputElement;
+  const saveBtn = () =>
+    screen.getByRole("button", { name: /save capability scheduling/i }) as HTMLButtonElement;
+
+  it("renders the toggle checked (default ON) with Save disabled until changed", async () => {
+    renderPage();
+    await screen.findByText("Capability-aware scheduling");
+    expect(toggle().checked).toBe(true);
+    expect(saveBtn().disabled).toBe(true);
+
+    fireEvent.click(toggle());
+    expect(saveBtn().disabled).toBe(false);
+  });
+
+  it("saves the flag OFF through the settings PATCH", async () => {
+    mockApi.updateSettings.mockResolvedValue(response({ capability_aware_scheduling: "false" }));
+    renderPage();
+    await screen.findByText("Capability-aware scheduling");
+
+    fireEvent.click(toggle());
+    fireEvent.click(saveBtn());
+
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith({ capability_aware_scheduling: "false" }),
+    );
+  });
+
+  it("disables the toggle when the setting is fixed by the environment", async () => {
+    mockApi.getSettings.mockResolvedValue(
+      response({ capability_aware_scheduling: "true" }, {}, { capability_aware_scheduling: "env" }),
+    );
+    renderPage();
+    await screen.findByText("Capability-aware scheduling");
+    expect(toggle().disabled).toBe(true);
+    expect(saveBtn().disabled).toBe(true);
   });
 });
 

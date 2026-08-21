@@ -35,6 +35,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/autoselectrow"
 	"github.com/vtmocanu/uzi/api/internal/board"
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	"github.com/vtmocanu/uzi/api/internal/planpolicy"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
@@ -426,6 +427,12 @@ type Store interface {
 	SetRunHealth(ctx context.Context, arg store.SetRunHealthParams) (int64, error)
 	CountOnlineWorkersForUser(ctx context.Context, userID uuid.UUID) (int64, error)
 	CountOnlineWorkersWithFreeSlotForUser(ctx context.Context, userID uuid.UUID) (int64, error)
+	// CountOnlineWorkersSatisfyingCaps backs PRD #84 M3: a queued run whose
+	// required_capabilities are not a subset of ANY online worker's effective caps gets
+	// a capability-specific "no eligible worker" reason. A per-run lookup like the two
+	// counts above, and off the hot path for the same reason — it runs only for a queued
+	// run already past its health threshold.
+	CountOnlineWorkersSatisfyingCaps(ctx context.Context, arg store.CountOnlineWorkersSatisfyingCapsParams) (int64, error)
 	// CountOnlineEligibleWorkersForRepo backs PRD #361's queued Docker-allowlist reason:
 	// how many of the caller's online workers fn_worker_can_claim accepts for this
 	// repo/kind, ignoring free slots. A result of 0 with online workers present means the
@@ -796,6 +803,18 @@ type DockerAllowlistReader interface {
 	DockerRepoAllowlist(ctx context.Context) ([]uuid.UUID, error)
 }
 
+// CapabilityScheduleReader is the narrow settings view the claim gate reads for the
+// capability-aware scheduling kill-switch (PRD #84 Decision 13). *settings.Cache
+// satisfies it. Kept its own interface (interface segregation, like
+// DockerAllowlistReader) so a test exercises only what it uses. Optional (nil-safe):
+// a nil reader — or a read error — DEFAULTS the flag ON (capability_aware=true), the
+// safe default, so an unconfigured or momentarily-unreadable setting routes rather
+// than degrading to best-effort claiming. Existing tests construct the service
+// without it and are unaffected.
+type CapabilityScheduleReader interface {
+	CapabilityAwareScheduling(ctx context.Context) (bool, error)
+}
+
 // Service holds the store, the secret cipher, and the runtime params.
 type Service struct {
 	q   Store
@@ -836,6 +855,12 @@ type Service struct {
 	// claims no repo-bearing run); a non-docker worker never consults it, so tests and
 	// deployments without a settings cache are unaffected.
 	dockerAllowlist DockerAllowlistReader
+	// capabilitySettings reads the capability-aware scheduling kill-switch the claim
+	// gate threads into ClaimRun (PRD #84 Decision 13). Optional (nil-safe); set via
+	// SetCapabilitySettings with the same settings cache the HTTP handlers hold. Nil ⇒
+	// the flag DEFAULTS ON, so tests and deployments without a settings cache route
+	// capability-aware exactly as a live instance whose admin left the default in place.
+	capabilitySettings CapabilityScheduleReader
 	// lastSlowClampWarn is the last health_slow_seconds value the read-time clamp
 	// warned about (PRD #47), so the warning logs once per distinct misconfigured
 	// value instead of on every 15s sweep. Touched only by the sweeper goroutine
@@ -922,6 +947,13 @@ func (s *Service) SetHealthSettings(cfg Settings) { s.healthSettings = cfg }
 // workers wholly unaffected.
 func (s *Service) SetDockerAllowlist(r DockerAllowlistReader) { s.dockerAllowlist = r }
 
+// SetCapabilitySettings wires the capability-aware scheduling kill-switch reader the
+// claim gate threads into ClaimRun (PRD #84 Decision 13). Call once at startup, before
+// serving, with the same settings cache the HTTP handlers hold. Nil (the default in
+// tests) defaults the flag ON — capability matching is enforced — so the omission is
+// safe rather than a silent disable.
+func (s *Service) SetCapabilitySettings(r CapabilityScheduleReader) { s.capabilitySettings = r }
+
 // SetForgeBaseURLAllowed wires the SSRF gate for the M8 checkpoint-publish path
 // (PRD #122). Call once at startup with config.Config.ForgeBaseURLAllowed. Leaving
 // it unset (nil) makes Publish refuse — it is a loud misconfiguration, never
@@ -974,7 +1006,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 // awaiting_input forever, pointing at execution that no longer exists, with its
 // worker-held answer deadline gone and no user-visible signal — on the ordinary
 // restart path this comment already names.
-func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns *int) (store.Worker, error) {
+func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns *int, capabilities []string) (store.Worker, error) {
 	max := int32(s.p.RunMaxRequeues)
 	orphanFailed, err := s.q.FailWorkerRunsOverCap(ctx, store.FailWorkerRunsOverCapParams{
 		FailureReason: pgText("worker restarted; run orphaned and out of re-queue budget"),
@@ -1002,9 +1034,19 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 	// maxConcurrentRuns is the worker's advertised concurrency cap (PRD #42); nil →
 	// NULL (an older image, or M3a before the M2 agent sends it). Observability
 	// only — the server never enforces it, so it is stored exactly as reported.
+	//
+	// capabilities is the STORED set (PRD #84 M1): the union of the worker's
+	// SELF-REPORTABLE caps and the template-derived caps. capability.SelfReportable
+	// restricts the self-report side to names a worker is allowed to announce (today
+	// only docker), so a base worker cannot spoof a template-only capability like jvm
+	// by self-reporting it. The union is passed through Filter for vocabulary
+	// validation, dedupe, and stable order — so the column stays authoritative and a
+	// later milestone's peer subquery can read workers.capabilities directly.
+	storedCaps := capability.Filter(append(capability.SelfReportable(capabilities), capability.TemplateCapabilities(template)...))
 	row, err := s.q.RegisterWorker(ctx, store.RegisterWorkerParams{
 		Version:           pgText(version),
 		TemplateReported:  pgText(template),
+		Capabilities:      storedCaps,
 		MaxConcurrentRuns: pgIntPtr(maxConcurrentRuns),
 		ID:                wkr.ID,
 	})
@@ -1120,12 +1162,24 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 		}
 	}
 
+	// Capability-aware scheduling kill-switch (PRD #84 Decision 13). Threaded into
+	// ClaimRun as @capability_aware: the extended fn_worker_can_claim reads its new
+	// subset clause as `NOT capability_aware OR (required ⊆ caps)`, so a false flag makes
+	// the capability match trivially true (best-effort claiming) while the docker
+	// allowlist clause above stays enforced. capabilityAwareOn (shared with the health
+	// detector's queued-reason path) is DEFAULT ON: a nil reader (tests, or a deployment
+	// without a settings cache) or a read error both leave it true, so an unconfirmable
+	// flag routes rather than silently degrading to a mid-run crash.
+	capabilityAware := s.capabilityAwareOn(ctx)
+
 	run, err := s.q.ClaimRun(ctx, store.ClaimRunParams{
 		WorkerID:              pgUUID(wkr.ID),
 		UserID:                wkr.UserID,
 		AffinityCutoff:        pgTime(s.now().Add(-s.p.WorkerAffinityGrace)),
 		IsDockerWorker:        isDocker,
 		DockerRepoAllowlist:   allowlist,
+		WorkerCaps:            wkr.Capabilities,
+		CapabilityAware:       capabilityAware,
 		SpreadCutoff:          pgTime(s.now().Add(-s.p.WorkerSpreadGrace)),
 		BackgroundGraceCutoff: pgTime(s.now().Add(-s.p.WorkerBackgroundGrace)),
 		HeartbeatCutoff:       pgTime(s.now().Add(-s.p.WorkerHeartbeatStale)),

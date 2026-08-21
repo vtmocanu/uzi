@@ -165,7 +165,7 @@ func TestRegisterEnqueuesJudgeForOrphanFailedRuns(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 
-	if _, err := svc.Register(context.Background(), worker(), "v1", "", nil); err != nil {
+	if _, err := svc.Register(context.Background(), worker(), "v1", "", nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if fs.createdJudgeRun == nil {

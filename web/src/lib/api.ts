@@ -369,6 +369,11 @@ export interface Repo {
   // Tier-2 opt-in (PRD #18 M5): when true, a run on this repo also unions the
   // packages from the repo's own devbox.json (packages-only). Default false.
   repo_devbox_opt_in: boolean;
+  // Static per-repo capability hint (PRD #84 M2): a server-owned subset of the
+  // capability vocabulary ({docker, jvm}). A run on this repo inherits these as its
+  // required_capabilities, so the scheduler routes it only to a worker that has them.
+  // The server capability.Filters the list, so only valid names persist. Default [].
+  required_capabilities?: string[];
   // Default-branch CI status (PRD #6), null when there is no cached default-branch
   // pipeline (no CI, MR-only pipelines, or not yet synced).
   pipeline: PipelineStatus | null;
@@ -634,6 +639,11 @@ export interface AppSettings {
   // workers are unaffected. The admin UI edits it as a repo multiselect writing the
   // ids — admins pick paths, never paste UUIDs.
   docker_repo_allowlist: string;
+  // Capability-aware scheduling kill-switch (PRD #84 M2). The text "true"/"false"
+  // (default "true"). When on, a run is routed only to a worker that can run it
+  // (e.g. a docker-needing run only to a docker worker). Turning it OFF reverts to
+  // best-effort claiming; it does NOT disable the docker repo allowlist.
+  capability_aware_scheduling: string;
   // Configurable board-membership + run-eligible labels (PRD #196 M2). All three
   // are served as raw strings like every other setting. run_eligible_labels and
   // board_extra_labels are COMMA-SEPARATED lists (safe because ValidateLabel rejects
@@ -1040,6 +1050,11 @@ export interface Worker {
   // Absent/undefined or null for an external worker (docker is not applicable),
   // false for a hosted worker without the sidecar, true for a docker-capable one.
   docker?: boolean;
+  // Server-authoritative capability set (PRD #84 M1): the Filter-ed union of the
+  // worker's self-reported caps and its template-derived caps, v1 vocabulary
+  // {docker, jvm}. Read-only display. Optional so an older response (or a test
+  // fixture) without the field reads as "none".
+  capabilities?: string[];
   busy: boolean; // derived: holds a claimed/running/awaiting_approval run (== active_runs > 0)
   // Bounded concurrency (PRD #42 Decision 10). active_runs is the live count of the
   // worker's claimed/running/awaiting_approval runs (busy is derived from it);
@@ -2745,6 +2760,14 @@ const realApi = {
   setRepoDevboxOptIn: (id: string, enabled: boolean) =>
     request<{ repo: Repo }>("PATCH", `/repos/${id}`, {
       repo_devbox_opt_in: enabled,
+    }),
+  // Static per-repo capability hint (PRD #84 M2). Owner or admin. Mutually
+  // exclusive in one request with repo_devbox_opt_in and the trust flags, so it is
+  // sent alone. The server capability.Filters the list to the {docker, jvm}
+  // vocabulary, so only valid names persist.
+  setRepoRequiredCapabilities: (id: string, caps: string[]) =>
+    request<{ repo: Repo }>("PATCH", `/repos/${id}`, {
+      required_capabilities: caps,
     }),
   // Admin per-repo guardrail override (PRD #66 D8). ADMIN-ONLY, no member path — a
   // dedicated route, not PatchRepo. Requires a non-empty reason; returns the repo.

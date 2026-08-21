@@ -2008,7 +2008,7 @@ func TestRegisterRecoversOrphansThenComesOnline(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", intp(2)); err != nil {
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", intp(2), nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	want := []string{"fail_over_cap", "requeue_worker", "register"}
@@ -2032,6 +2032,60 @@ func TestRegisterRecoversOrphansThenComesOnline(t *testing.T) {
 	if !fs.registerParams.MaxConcurrentRuns.Valid || fs.registerParams.MaxConcurrentRuns.Int32 != 2 {
 		t.Fatalf("register max_concurrent_runs wrong: %+v", fs.registerParams.MaxConcurrentRuns)
 	}
+	// The jvm template implies {jvm}; with no self-report the stored set is exactly
+	// the template-derived capability (PRD #84 M1).
+	if got := fs.registerParams.Capabilities; len(got) != 1 || got[0] != "jvm" {
+		t.Fatalf("register capabilities = %v, want [jvm]", got)
+	}
+}
+
+func TestRegisterUnionsAndFiltersCapabilities(t *testing.T) {
+	// A worker self-reports docker plus an unknown name, on the jvm template. The
+	// stored set is the Filter-ed union: docker (self-reported) + jvm (template),
+	// with the unknown dropped, deduped, in vocabulary order (PRD #84 M1).
+	w := worker()
+	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", nil, []string{"docker", "gpu", "docker"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	got := fs.registerParams.Capabilities
+	if len(got) != 2 || got[0] != "docker" || got[1] != "jvm" {
+		t.Fatalf("register capabilities = %v, want [docker jvm]", got)
+	}
+}
+
+func TestRegisterBaseTemplateDropsSelfReportedJVM(t *testing.T) {
+	// A base worker self-reports ["jvm","docker"]. jvm is TEMPLATE-derived and not
+	// self-reportable, so the stored set is only ["docker"] — the base worker cannot
+	// spoof a jvm capability its template does not imply (PRD #84 M1).
+	w := worker()
+	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, []string{"jvm", "docker"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	got := fs.registerParams.Capabilities
+	if len(got) != 1 || got[0] != "docker" {
+		t.Fatalf("register capabilities = %v, want [docker] (self-reported jvm must be dropped)", got)
+	}
+}
+
+func TestRegisterBaseTemplateNoSelfReportEmptyCapabilities(t *testing.T) {
+	// A base-template worker that self-reports nothing stores the empty set (PRD #84
+	// M1 success criterion: base with no self-report → {}).
+	w := worker()
+	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, nil); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if got := fs.registerParams.Capabilities; len(got) != 0 {
+		t.Fatalf("register capabilities = %v, want empty", got)
+	}
 }
 
 func TestRegisterNilCapStoresNull(t *testing.T) {
@@ -2041,7 +2095,7 @@ func TestRegisterNilCapStoresNull(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil); err != nil {
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if fs.registerParams == nil || fs.registerParams.MaxConcurrentRuns.Valid {
@@ -2056,7 +2110,7 @@ func TestRegisterEmptyTemplateStoresNull(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil); err != nil {
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if fs.registerParams == nil || fs.registerParams.TemplateReported.Valid {

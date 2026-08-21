@@ -431,6 +431,12 @@ func run() error {
 	// unaffected.
 	wsvc.SetDockerAllowlist(settingsCache)
 
+	// Capability-aware scheduling kill-switch (PRD #84 Decision 13): the claim gate reads
+	// it from the same settings cache, so an admin flip takes effect within the cache TTL.
+	// Default ON — a docker-needing run is claimable only by a docker-capable worker; OFF
+	// reverts to best-effort claiming while the docker allowlist above stays enforced.
+	wsvc.SetCapabilitySettings(settingsCache)
+
 	// Browser live-event hub (M5): workersvc broadcasts persisted run events to
 	// it, and the WS handler fans them out to subscribed browsers. In-process and
 	// stateless — every event is already durable in the DB.

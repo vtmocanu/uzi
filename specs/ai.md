@@ -8360,9 +8360,38 @@ Serves human Feature #4; scoped so #83 does not pre-empt #84's capability vocabu
   register (the same reason `Name` is declared-but-ignored); it is NOT threaded into `wsvc.Register`.
   **No column, no DTO, no sqlc/migration in #83** (Q-A: no-persist). Nothing in #83 reads it — the
   guardrail keys on `DOCKER_HOST` (§300), not the registered capability, and a homogeneous dogfood
-  fleet needs no claim-time filter. Storage + the claim-time match predicate are **PRD #84's** to
-  own (it owns the vocabulary + the consuming query); persisting now would bake a shape #84 should
-  define.
+  fleet needs no claim-time filter. Storage + the claim-time match predicate were **PRD #84's** to
+  own (it owns the vocabulary + the consuming query); persisting in #83 would bake a shape #84
+  should define. **RESOLVED by PRD #84 M1–M3 (see next bullet); M4/M5 remain deferred.**
+- **PRD #84 M1–M3 fulfilled the reservation — the register self-report is now PERSISTED, not
+  ignored** (this bullet supersedes "accepts-and-ignores" above for the storage/consuming-query
+  dimension; the #83 wire + compat decisions above stand).
+  - **M1 — vocabulary + persistence.** Server-owned capability vocabulary `{docker, jvm}` and a
+    `template→capabilities` map live in `api/internal/capability/capability.go` (code constant, not
+    a DB table). Register no longer ignores the report: `wsvc.Register`
+    (`api/internal/workersvc/service.go`, ~L1040) stores
+    `capability.Filter(SelfReportable(reported) ∪ TemplateCapabilities(template))` into
+    `workers.capabilities text[]` (migration `00141_worker_capabilities.sql`). Only `docker` is
+    self-reportable; `jvm` is template-derived (`SelfReportable` strips a worker's spoofed `jvm`).
+    Surfaced on `WorkerDTO.Capabilities` (`api/internal/apitypes/worker.go`).
+  - **M2 — run/repo requirements + claim gate + kill-switch.** `runs.required_capabilities` and
+    `repos.required_capabilities` (`text[]`, migration `00142_capability_scheduling.sql`); the repo
+    static hint is copied onto every new issue run at the `CreateRun` INSERT (subquery in
+    `runtime.sql` `CreateRun`, not a Go param). `fn_worker_can_claim` is EXTENDED (drop + recreate,
+    same 00142) from 4 args to 7 — adding `worker_caps`, `run_required_capabilities`,
+    `capability_aware` — AND-ing a `required ⊆ effective_worker_caps` subset clause onto the existing
+    docker→allowlist clause (effective caps fold `docker_enabled` into the stored caps). Global admin
+    kill-switch `settings.KeyCapabilityAwareScheduling` (bool, default `true`, mirrors
+    `KeyHealthEnabled`) gates ONLY the new subset clause; off reverts #84's addition while the
+    docker→allowlist authorization clause stays enforced.
+  - **M3 — unplaceable-run health reason.** `reasonNoEligibleWorker`
+    (`api/internal/workersvc/health.go`) is a `health_reason` projection over the existing `queued`
+    status (no new `runs.status`, no migration; maps to the existing `waiting_worker` enum), emitted
+    when a queued run's `required_capabilities` are a subset of no online worker's effective caps.
+    Backed by a new `CountOnlineWorkersSatisfyingCaps` query using the same docker-fold.
+  - **Still DEFERRED (NOT shipped):** M4 (plan-time `detect()` inference + the plan-approval-gate
+    block; `runs.required_tools` provisionable column) and M5 (jvm retrofit as a matched routing
+    capability beyond the map, user docs page, CLI parity, ARCHITECTURE.md).
 - **Compat rule (load-bearing):** the api MUST declare `capabilities` in the SAME release the worker
   starts sending it — an older DisallowUnknownFields api would 400 the register and wedge the fleet's
   retry loop. Both land in M1, same MR; never split across releases.
