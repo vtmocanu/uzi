@@ -5117,9 +5117,17 @@ notified_at() { db_psql "SELECT COALESCE(to_char(health_notified_at, 'YYYYMMDDHH
 # approve). This setup step alone needs the cap-3 worker — each approved run holds its
 # slot past the gate (PRD #42 Decision 2) and stays running while the stub holds ~95s, so
 # the third hrun can only reach the gate if a third slot exists.
+#
+# ORDER MATTERS: the legs only start observing AFTER all three runs exist, so a run
+# created earlier ages by the create+approve time of every run made after it. STALL and
+# LOOP carry a time-boxed transient state (leg_loop's `wait_health looping 60`, leg_stall's
+# stalled window) that CPU contention can push past its window before the leg polls, so
+# create them LAST to minimise their aging — LOOP (tightest 60s ceiling) truly last. The
+# in-flight run has no transient window (its leg only asserts stalled NEVER appears), so it
+# absorbs the up-front aging and is created first.
+RUN_IF="$(hrun UZI_STUB_INFLIGHT)"
 RUN_ST="$(hrun UZI_STUB_STALL)"
 RUN_LP="$(hrun UZI_STUB_LOOP)"
-RUN_IF="$(hrun UZI_STUB_INFLIGHT)"
 pass "three health runs created + approved on the cap-3 worker (stall=$RUN_ST loop=$RUN_LP inflight=$RUN_IF)"
 
 # --- (a) STALL → flagged stalled, nudged once, self-clears on resume -----------
@@ -5203,6 +5211,13 @@ pass "PRD #47: all three health legs passed concurrently (stall / loop / in-flig
 
 # Restore the default threshold so nothing downstream inherits the tightened value.
 apiput /api/admin/settings '{"settings":{"health_stall_seconds":"300"}}' >/dev/null
+# Revert the cap-3 export so the cap-3 window is scoped to THIS health phase only. The
+# export out-ranks the env-file's UZI_E2E_MAX_CONCURRENT_RUNS=2, and unsetting it (rather
+# than exporting =2) restores that env-file value for the NEXT agent --force-recreate
+# (PRD #83 M2, further down). No recreate needed here — nothing between now and there
+# asserts on the cap; this just stops a future phase inserted here from silently inheriting
+# cap 3 when it expects cap 2.
+unset UZI_E2E_MAX_CONCURRENT_RUNS
 fi
 
 # ---------------------------------------------------------------------------
@@ -5722,7 +5737,13 @@ pass "D5 live: deleting a bound token unbinds the worker and leaves workers.user
 #     E2E_WORKER_HEARTBEAT_STALE=15s, set earlier in the suite). A live poller gets a
 #     cancel verdict enqueued; unconsumed (we never poll inputs) it ESCALATES at +60s
 #     to a server-side FailRunAutoStop -> status='failed', stop_kind='auto_stopped'.
-#     The sweep ticks every 15s, so the whole journey is ~135-165s.
+#     The sweep ticks every 2s now (SWEEP_INTERVAL=2s from boot, PRD #97 M6 / #100), not
+#     the shipped 15s. That cadence does NOT set the journey length, though: it is floored
+#     by two FIXED 60s server-side timers — autoStopWindow (streak sustained >=60s) then
+#     autoStopEscalateAfter (+60s after the verdict is enqueued), workersvc/autostop.go —
+#     plus the harness poison-loop-driven streak build, so the whole journey is ~120-140s.
+#     The 2s cadence only removes the up-to-two-15s-tick detection slack that made the old
+#     figure 135-165s; it does not shorten the 120s of fixed timers.
 #   * peersSucceeding is strict recency AND re-checked EVERY sweep before the
 #     escalation branch, and a run whose worker heartbeat goes stale is REQUEUED out
 #     of running (evicting its streak). So BOTH run B's valid appends AND the worker
