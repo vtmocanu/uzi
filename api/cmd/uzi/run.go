@@ -87,7 +87,8 @@ var terminalRunStatuses = map[string]bool{
 }
 
 // allRunStatusesOrder is the run status enum in wire/enum order (matching migration
-// 00092's runs_status_check), the ONE source of truth both allRunStatuses (membership)
+// 00144's runs_status_check — the current last rewrite, ten values), the ONE source of
+// truth both allRunStatuses (membership)
 // and the `--until` validation-error's "valid: …" list derive from — so a status added
 // here can never be silently omitted from the human-readable enumeration.
 var allRunStatusesOrder = []string{
@@ -104,7 +105,7 @@ var allRunStatusesOrder = []string{
 }
 
 // allRunStatuses is the run status enum the skill documents and migration
-// 00092 constrains (runs_status_check). It is the source of truth `run wait`
+// 00144 constrains (runs_status_check). It is the source of truth `run wait`
 // validates `--until` against, so a typo'd target is a clean usage error rather than
 // a silent forever-wait. A status the SERVER reports that is NOT in this set is a
 // newer server than this binary (surfaced, treated non-terminal — never a target,
@@ -797,7 +798,7 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 			lastStatus = run.Status
 			sawStatus = true
 		}
-		// A status outside the nine-value enum means the server is newer than this
+		// A status outside the ten-value enum means the server is newer than this
 		// binary. Surface it once and keep waiting (it can never be a target — `--until`
 		// only names known statuses), so it is never a silent forever-wait; `--timeout`
 		// still bounds it (R1).

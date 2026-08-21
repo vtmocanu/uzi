@@ -247,7 +247,7 @@ func TestRunWaitHelpAndErrorDerivedFromConstants(t *testing.T) {
 }
 
 func TestRunWaitUnknownStatusSurfacedAndNonTerminal(t *testing.T) {
-	// A status outside the nine-value enum must be surfaced and NOT treated as a stop
+	// A status outside the ten-value enum must be surfaced and NOT treated as a stop
 	// state (it is never in --until), so the wait continues to a real target.
 	fc := &uzicli.FakeClient{GetRunHook: scriptHook(okStep("teleporting"), okStep("completed"))}
 	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "wait", "r1", "--interval", "1ms")

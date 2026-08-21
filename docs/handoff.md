@@ -99,7 +99,7 @@ uzi handoff -m "add input validation to the signup form" --interactive
   cancel`, which aborts mid-turn, `stop` finishes the current turn and
   finalizes gracefully — push, open the MR iff `--mr` was set — then lands
   `completed` with a distinct stop disposition. See [uzi
-  CLI](./cli.md#agents-json-and-exit-codes) for its exit codes.
+  CLI](./cli.md) for its exit codes.
 - **An idle timeout backstops a forgotten park.** If nobody sends a
   follow-up or a stop, the worker's own clock (`WORKER_TASK_IDLE_TIMEOUT`,
   default 30 minutes) finalizes the task the same way `run stop` does — push,
