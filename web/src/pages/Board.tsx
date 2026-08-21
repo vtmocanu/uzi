@@ -46,13 +46,16 @@ import {
   visibleCards,
 } from "../lib/boardCards";
 import {
+  DEFAULT_SORT_DIR,
   dropIntent,
   insertionEdgeFor,
+  isSortDir,
   isSortMode,
   neighbourAnchor,
   sortCards,
   SORT_MODES,
   type DropAnchor,
+  type SortDir,
   type SortMode,
 } from "../lib/boardOrder";
 import { prefs } from "../lib/prefs";
@@ -238,10 +241,42 @@ export function Board() {
     const v = prefs.get<string>(`uzi.board.${repoId}.sortMode`, "manual");
     setSortModeState(isSortMode(v) ? v : "manual");
   }, [repoId]);
+
+  // sortDir mirrors sortMode: a per-browser, per-repo view preference (Decision 3).
+  // Read through isSortDir so a stale or hand-edited localStorage value degrades to the
+  // mode's natural default instead of an invalid direction. The useEffect re-read is
+  // load-bearing for the same reason sortMode's is: the route swaps :id without
+  // remounting, so a lazy useState initialiser only ever runs for the first repo, and
+  // omitting the re-read would keep the previous repo's direction after a route swap.
+  const sortDirKey = `uzi.board.${repoId}.sortDir`;
+  const [sortDir, setSortDirState] = useState<SortDir>(() => {
+    const v = prefs.get<string>(sortDirKey, DEFAULT_SORT_DIR[sortMode]);
+    return isSortDir(v) ? v : DEFAULT_SORT_DIR[sortMode];
+  });
+  useEffect(() => {
+    const v = prefs.get<string>(`uzi.board.${repoId}.sortDir`, DEFAULT_SORT_DIR[sortMode]);
+    setSortDirState(isSortDir(v) ? v : DEFAULT_SORT_DIR[sortMode]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [repoId]);
+  const setSortDir = useCallback(
+    (next: SortDir) => {
+      setSortDirState(next);
+      prefs.set(`uzi.board.${repoId}.sortDir`, next);
+    },
+    [repoId],
+  );
+
+  // Switching mode resets direction to that mode's natural default (Decision 4): a user
+  // picking Title expects A->Z, not a leftover direction from the previous mode; the
+  // toggle is then their explicit opt-out. Because applyDrop calls setSortMode("manual"),
+  // a drop resets direction too, which is harmless — manual ignores direction.
   const setSortMode = useCallback(
     (next: SortMode) => {
       setSortModeState(next);
       prefs.set(`uzi.board.${repoId}.sortMode`, next);
+      const nextDir = DEFAULT_SORT_DIR[next];
+      setSortDirState(nextDir);
+      prefs.set(`uzi.board.${repoId}.sortDir`, nextDir);
     },
     [repoId],
   );
@@ -858,27 +893,31 @@ export function Board() {
 
   const cardsByColumn = useMemo(() => {
     const map = new Map<string, CardData[]>();
-    for (const c of sortCards(searchedCards, sortMode)) {
+    for (const c of sortCards(searchedCards, sortMode, sortDir)) {
       const key = columnKeyForCard(c);
       const arr = map.get(key) ?? [];
       arr.push(c);
       map.set(key, arr);
     }
-    // S4. THE CLOSED LANE IS ALWAYS iid ORDER, never the board's mode. Closed cards are
-    // excluded from the freeze by design (Decision 7b) and keep a NULL position, so the
-    // FIRST drop from any non-iid mode silently re-sorts the Closed lane underneath the
-    // user: the payload comes back ordered by the SQL fallback and the lane jumps.
+    // S4. THE CLOSED LANE NOW HONOURS mode+direction like every other lane (#412).
+    // Previously an INTENTIONAL pin here re-sorted Closed to iid order in ALL modes:
+    //   const closed = map.get(CLOSED_KEY);
+    //   if (closed) map.set(CLOSED_KEY, [...closed].sort((a, b) => a.iid - b.iid));
+    // #412 removed that pin so Closed flows through the same sortCards() bucketing as
+    // every other lane. In `manual` mode sortCards is identity, so Closed still renders
+    // issue-number ascending exactly as before — only the non-manual modes now reach it.
     //
-    // The browser pass showed it happening on a gesture that moved NOTHING — a card
-    // dropped back on itself, which is the natural "changed my mind" recovery — and the
-    // Closed lane still went 18 15 -> 15 18. A lane that reshuffles when the user
-    // deliberately cancelled is worse than one that ignores the sort control, and Closed
-    // is the one lane where the modes are least useful anyway (nothing there is running,
-    // and its cards are not draggable).
-    const closed = map.get(CLOSED_KEY);
-    if (closed) map.set(CLOSED_KEY, [...closed].sort((a, b) => a.iid - b.iid));
+    // ACCEPTED, KNOWN cost of removing the pin: a drop calls setSortMode("manual"), and
+    // because the drop-freeze excludes closed cards (Decision 7b), a drop taken from a
+    // non-manual mode leaves the OPEN lanes holding their just-frozen (unchanged) order
+    // while the CLOSED lane alone reverts from mode-order to iid-order — the exact
+    // isolated reshuffle the old pin used to hide. This is accepted because it fires only
+    // on an actual drop, manual-mode iid IS the correct Closed identity ordering, and the
+    // alternative (a permanent iid pin) is precisely the cross-lane inconsistency #412
+    // removes. An M3 test asserts this post-drop Closed state — DO NOT re-add the pin to
+    // "fix" it, as that silently reverts the feature.
     return map;
-  }, [searchedCards, sortMode]);
+  }, [searchedCards, sortMode, sortDir]);
 
   // applyDrop is THE single order-computing path. A pointer drop and a keyboard ↑/↓
   // both land here with the same three arguments, so the two gestures cannot drift:
@@ -930,6 +969,7 @@ export function Board() {
         payloadCards, // UNFILTERED — the payload-set rule (Decision 7b)
         columnKeys,
         sortMode,
+        sortDir,
         dragIid,
         destColumnKey: destKey,
         anchor,
@@ -967,7 +1007,7 @@ export function Board() {
     // move/setBoard/setError are stable enough for this callback's purpose; the state
     // it genuinely depends on is listed.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [payloadCards, columnKeys, sortMode, repoId, setSortMode],
+    [payloadCards, columnKeys, sortMode, sortDir, repoId, setSortMode],
   );
 
   // moveCard is the keyboard path (PRD #102 M5, lead ruling 1). It builds the anchor a
@@ -1101,6 +1141,22 @@ export function Board() {
                 ))}
               </Select>
             </label>
+            {/* Direction toggle (Decision 6). DISABLED (not hidden) in manual mode so the
+                toolbar layout stays stable and the control remains discoverable; manual
+                ignores direction. Carries an accessible name and aria-pressed for the
+                reversed state, plus a visible arrow and text label. */}
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              className="py-1 text-xs"
+              disabled={sortMode === "manual"}
+              aria-pressed={sortDir === "desc"}
+              aria-label={`Sort direction: ${sortDir === "asc" ? "ascending" : "descending"}`}
+              onClick={() => setSortDir(sortDir === "asc" ? "desc" : "asc")}
+            >
+              {sortDir === "asc" ? "↑ Ascending" : "↓ Descending"}
+            </Button>
             {/* Per-lane density (PRD #304 M4), mirroring the Sort control's markup.
                 Changing it re-baselines every lane's shownCount (the effect on
                 [searchActive, perLane, repoId]). */}
