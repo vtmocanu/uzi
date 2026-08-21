@@ -18,6 +18,8 @@ import { WorkerStatGauges } from "../components/WorkerStats";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { stripUnsafeChars } from "../lib/safeText";
 import { formatUptimeSince } from "../lib/formatUptimeSince";
+import { DocLink } from "../components/DocLink";
+import { DOC_WORKER_SETUP } from "../lib/doclinks";
 
 // Stable per-row ids: the delete button is a focus target after a dismissed confirm,
 // and the warning is the confirm group's aria-description (PRD #58).
@@ -291,7 +293,12 @@ export function WorkersSettings() {
     <div className="space-y-6">
       <PageHeader
         title="Workers"
-        description="Workers are your uzi-agent containers: they claim your runs and stream them back."
+        description={
+          <>
+            Workers are your uzi-agent containers: they claim your runs and stream them back. See the{" "}
+            <DocLink slug={DOC_WORKER_SETUP}>worker setup</DocLink> guide.
+          </>
+        }
       />
       {error && <Alert message={error} />}
 

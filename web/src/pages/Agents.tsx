@@ -16,6 +16,8 @@ import {
 } from "../lib/agentTemplates";
 import { Alert, Badge, Button, Card, ListSkeleton, PageHeader } from "../components/ui";
 import { PlusIcon } from "../components/icons";
+import { DocLink } from "../components/DocLink";
+import { DOC_AGENT_TEMPLATES } from "../lib/doclinks";
 
 // SHADOWED_HINT is stated once and used twice — as the badge's `title` and as the
 // text of the sr-only span it points at. Two copies of the same sentence is how a
@@ -108,7 +110,15 @@ export function Agents() {
     <div className="space-y-6">
       <PageHeader
         title="Agents"
-        description={`Agent templates render to Claude Code subagent files. Toggle which ride your runs${isAdmin ? "; admins publish globals and set the defaults everyone starts from." : "; author your own private agents anytime."}`}
+        description={
+          <>
+            Agent templates render to Claude Code subagent files. Toggle which ride your runs
+            {isAdmin
+              ? "; admins publish globals and set the defaults everyone starts from."
+              : "; author your own private agents anytime."}{" "}
+            See the <DocLink slug={DOC_AGENT_TEMPLATES}>agent templates</DocLink> guide.
+          </>
+        }
         actions={
           <Link to="/agents/new">
             <Button size="sm">

@@ -10,6 +10,8 @@ import { Alert, Badge, Button, Card, EmptyState, ListSkeleton, PageHeader, Selec
 import { PipelineBadge } from "../components/PipelineBadge";
 import { Modal } from "../components/Modal";
 import { BoardIcon, XIcon } from "../components/icons";
+import { DocLink } from "../components/DocLink";
+import { DOC_REPO_AGENTS } from "../lib/doclinks";
 
 export function Repos() {
   // The guardrail override write is admin-only (PRD #66 D8): a member sees the block
@@ -360,7 +362,12 @@ export function Repos() {
     <div className="space-y-6">
       <PageHeader
         title="Boards"
-        description="Projects your bot can see. Enable one to track its PRD issues on a board."
+        description={
+          <>
+            Projects your bot can see. Enable one to track its PRD issues on a board. See the{" "}
+            <DocLink slug={DOC_REPO_AGENTS}>repo agents</DocLink> guide.
+          </>
+        }
         actions={
           connectionId ? (
             <Button variant="secondary" size="sm" disabled={refreshing} onClick={() => loadProjects(connectionId)}>

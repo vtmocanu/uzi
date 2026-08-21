@@ -1,7 +1,8 @@
 # PRD #57: Contextual docs links — UI surfaces link to their in-app guide
 
 **GitHub Issue**: [vtmocanu/uzi#57](https://github.com/vtmocanu/uzi/issues/57)
-**Status**: Draft
+**Status**: Implemented (M1–M4 landed on `agent/issue-57`); M5 in-branch parts
+done, its release cut + live dev-cluster verification pending post-merge
 **Priority**: Low
 **Created**: 2026-07-16
 **Refreshed**: 2026-08-21 — reconciled against a repo that has since gone
@@ -112,12 +113,12 @@ readable, and linking them from admin pages creates no new exposure.
 
 ## Milestones
 
-- [ ] **M1 — Link infrastructure**: `DocLink` component + `doclinks.ts` slug
+- [x] **M1 — Link infrastructure**: `DocLink` component + `doclinks.ts` slug
   registry (including the three forge-setup constants) + slug-validity vitest
   (incl. the non-empty guard); ForgeSettings' existing forge-aware error-card
   link migrated to source its slug from the registry, staying forge-aware.
   `task typecheck:web` and `task test:web` green.
-- [ ] **M2 — Settings surfaces** (the original ask): always-visible guide
+- [x] **M2 — Settings surfaces** (the original ask): always-visible guide
   links on the Forge (forge-aware), Workers, Account & token, and Slack cards,
   per the mapping table — Account & token and Slack are child components
   rendered in `Settings.tsx` (`AnthropicTokens` and `SlackNotifications`
@@ -125,15 +126,18 @@ readable, and linking them from admin pages creates no new exposure.
   `AnthropicTokens.tsx` is replaced by the in-app DocLink; page tests
   (`Settings.test.tsx`, `ForgeSettings.test.tsx`) updated to assert the links
   render.
-- [ ] **M3 — Management surfaces**: Repos/boards home, Agents, Skills.
-- [ ] **M4 — Admin surfaces**: Tool allowlist, Admin settings, Admin rate
-  limits.
+- [x] **M3 — Management surfaces**: Repos/boards home, Agents, AgentNew, Skills
+  (AgentNew gained a minimal test, as it had none).
+- [x] **M4 — Admin surfaces**: Tool allowlist, Admin settings, Admin rate
+  limits (via widening `AdminShell`'s `description` prop to `ReactNode`).
 - [ ] **M5 — Convention recorded + shipped**: `docs/dev-conventions.md`
   documents the DocLink registry + test contract (new UI surface ⇒ consider
   a guide link); full `cd web && npm run build` (check-docs + typecheck +
   vite) green. Ships with the next tagged release (Model B, cut per
   `.claude/agents/release.md`); verify one link live on dev-cluster after it
-  rolls out.
+  rolls out. **In-branch parts done** (dev-conventions.md section added; full
+  web build green); the checkbox stays open for the post-merge release cut and
+  the live dev-cluster verification, which happen after this branch merges.
 
 ## Success criteria
 

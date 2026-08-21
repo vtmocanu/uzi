@@ -7,6 +7,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, ApiError, type SlackLink } from "../lib/api";
 import { Alert, Badge, type BadgeTone, Button, Card, Field, Input, SectionTitle, Skeleton } from "./ui";
+import { DocLink } from "./DocLink";
+import { DOC_SLACK } from "../lib/doclinks";
 
 const STATE_META: Record<SlackLink["state"], { label: string; tone: BadgeTone }> = {
   unlinked: { label: "Not linked", tone: "neutral" },
@@ -111,7 +113,8 @@ export function SlackNotifications() {
         <p className="mt-2 text-sm text-muted">
           Get a Slack DM when a run you own starts, needs your approval, finishes with a merge
           request, or fails. uzi matches you by your account email; if that misses, set your Slack
-          member ID below. Notifications only start once you confirm the link in Slack.
+          member ID below. Notifications only start once you confirm the link in Slack.{" "}See the{" "}
+          <DocLink slug={DOC_SLACK}>Slack notifications</DocLink> guide.
         </p>
       </div>
 

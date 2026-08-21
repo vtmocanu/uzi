@@ -1,8 +1,18 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { SlackNotifications } from "./SlackNotifications";
 import { api, ApiError, type SlackLink } from "../lib/api";
+
+// SlackNotifications now renders a DocLink (a react-router Link), so it must mount
+// inside a Router context (PRD #57 M2).
+const renderCard = () =>
+  render(
+    <MemoryRouter>
+      <SlackNotifications />
+    </MemoryRouter>,
+  );
 
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
@@ -41,12 +51,20 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+describe("SlackNotifications — always-visible Slack guide link (PRD #57 M2)", () => {
+  it("renders the Slack notifications guide link in the intro", async () => {
+    renderCard();
+    const docLink = await screen.findByRole("link", { name: "Slack notifications" });
+    expect(docLink.getAttribute("href")).toBe("/docs/slack");
+  });
+});
+
 describe("SlackNotifications (PRD #25 M3)", () => {
   it("shows the confirmed state with the resolved id", async () => {
     mockApi.getMySlack.mockResolvedValue({
       slack: link({ member_id: null, resolved_id: "U123", confirmed: true, state: "confirmed" }),
     });
-    render(<SlackNotifications />);
+    renderCard();
     expect(await screen.findByText("Linked")).toBeTruthy();
     expect(screen.getByText("U123")).toBeTruthy();
   });
@@ -55,12 +73,12 @@ describe("SlackNotifications (PRD #25 M3)", () => {
     mockApi.getMySlack.mockResolvedValue({
       slack: link({ resolved_id: "U1", state: "pending" }),
     });
-    render(<SlackNotifications />);
+    renderCard();
     expect(await screen.findByText("Pending confirmation")).toBeTruthy();
   });
 
   it("reflects and toggles the notify switch", async () => {
-    render(<SlackNotifications />);
+    renderCard();
     await waitFor(() => expect(notifyToggle().checked).toBe(true));
     fireEvent.click(notifyToggle());
     await waitFor(() => expect(mockApi.setMySlackNotify).toHaveBeenCalledWith(false));
@@ -68,7 +86,7 @@ describe("SlackNotifications (PRD #25 M3)", () => {
   });
 
   it("saves a member-ID override and reports the pending confirmation", async () => {
-    render(<SlackNotifications />);
+    renderCard();
     await waitFor(() => expect(overrideInput()).toBeTruthy());
     fireEvent.change(overrideInput(), { target: { value: "U9" } });
     fireEvent.click(screen.getByText("Save override"));
@@ -82,7 +100,7 @@ describe("SlackNotifications (PRD #25 M3)", () => {
     mockApi.setMySlackOverride.mockRejectedValue(
       new ApiError(409, "that Slack member ID is already linked to another account"),
     );
-    render(<SlackNotifications />);
+    renderCard();
     await waitFor(() => expect(overrideInput()).toBeTruthy());
     fireEvent.change(overrideInput(), { target: { value: "U9" } });
     fireEvent.click(screen.getByText("Save override"));
@@ -92,13 +110,13 @@ describe("SlackNotifications (PRD #25 M3)", () => {
   const testButton = () => screen.getByText("Send test DM").closest("button") as HTMLButtonElement;
 
   it("disables the test DM while unlinked", async () => {
-    render(<SlackNotifications />);
+    renderCard();
     await waitFor(() => expect(testButton().disabled).toBe(true));
   });
 
   it("sends a test DM once a Slack id resolves", async () => {
     mockApi.getMySlack.mockResolvedValue({ slack: link({ resolved_id: "U9", state: "pending" }) });
-    render(<SlackNotifications />);
+    renderCard();
     await waitFor(() => expect(testButton().disabled).toBe(false));
     fireEvent.click(testButton());
     await waitFor(() => expect(mockApi.testMySlackDM).toHaveBeenCalled());
@@ -110,7 +128,7 @@ describe("SlackNotifications (PRD #25 M3)", () => {
   // Workspace axis (PRD #56 M2). These compose over the link-state layout above.
   it("explains an unconfigured workspace and disables every control", async () => {
     mockApi.getMySlack.mockResolvedValue({ slack: link({ workspace: "unconfigured" }) });
-    const { container } = render(<SlackNotifications />);
+    const { container } = renderCard();
     await waitFor(() => expect(notifyToggle()).toBeTruthy());
     expect(container.textContent).toContain("Slack isn't connected on this uzi instance yet");
     expect(notifyToggle().disabled).toBe(true);
@@ -121,7 +139,7 @@ describe("SlackNotifications (PRD #25 M3)", () => {
 
   it("hints where test DMs come from when unlinked, with no workspace alert", async () => {
     mockApi.getMySlack.mockResolvedValue({ slack: link({ workspace: "connected", state: "unlinked" }) });
-    const { container } = render(<SlackNotifications />);
+    const { container } = renderCard();
     await waitFor(() => expect(notifyToggle()).toBeTruthy());
     expect(container.textContent).toContain("Test DMs become available once uzi resolves your Slack account");
     expect(container.querySelector('[role="status"]')).toBeNull();
@@ -131,14 +149,14 @@ describe("SlackNotifications (PRD #25 M3)", () => {
     mockApi.getMySlack.mockResolvedValue({
       slack: link({ workspace: "connected", state: "pending", resolved_id: "U1" }),
     });
-    const { container } = render(<SlackNotifications />);
+    const { container } = renderCard();
     await waitFor(() => expect(testButton().disabled).toBe(false));
     expect(container.textContent).toContain("Check Slack for a confirmation DM from uzi");
   });
 
   it("shows the reconnecting alert but leaves controls enabled", async () => {
     mockApi.getMySlack.mockResolvedValue({ slack: link({ workspace: "connecting" }) });
-    const { container } = render(<SlackNotifications />);
+    const { container } = renderCard();
     await waitFor(() => expect(notifyToggle()).toBeTruthy());
     expect(container.textContent).toContain("Slack is reconnecting");
     expect(notifyToggle().disabled).toBe(false);
@@ -152,7 +170,7 @@ describe("SlackNotifications (PRD #25 M3)", () => {
       slack: link({ workspace: "error", resolved_id: "U9", state: "pending" }),
     });
     mockApi.testMySlackDM.mockRejectedValue(new ApiError(502, "Slack is unavailable right now (502)"));
-    render(<SlackNotifications />);
+    renderCard();
     await waitFor(() => expect(testButton().disabled).toBe(false));
     fireEvent.click(testButton());
     await waitFor(() => expect(mockApi.testMySlackDM).toHaveBeenCalled());

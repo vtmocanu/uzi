@@ -13,9 +13,8 @@ import { autoChipFor } from "../lib/rateLimits";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { isShownInSidebar } from "../lib/sidebarTokens";
 import { Badge, Button, Card, Field, Input, SectionTitle, Skeleton } from "./ui";
-
-const DOC_URL =
-  "https://github.com/vtmocanu/uzi/blob/main/docs/anthropic-token.md";
+import { DocLink } from "./DocLink";
+import { DOC_ANTHROPIC_TOKEN } from "../lib/doclinks";
 
 // vaultLockedMessage is the shared copy for a 409 vault_locked: the global handler
 // has already refreshed the session, so the unlock banner is showing above.
@@ -532,10 +531,7 @@ export function AnthropicTokens({
           <code className="rounded bg-raised px-1 py-0.5 text-fg">claude setup-token</code> or a
           Console API key. Give each one a name so you can point individual workers at it. The{" "}
           <strong className="text-fg">default</strong> is what every unbound worker spends.{" "}
-          <a href={DOC_URL} target="_blank" rel="noreferrer" className="text-brand hover:text-brand-hover">
-            How to obtain a token
-          </a>
-          .
+          <DocLink slug={DOC_ANTHROPIC_TOKEN}>How to obtain a token</DocLink>.
         </p>
       </div>
 

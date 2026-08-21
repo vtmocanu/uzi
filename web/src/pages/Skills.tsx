@@ -28,6 +28,8 @@ import {
   Select,
 } from "../components/ui";
 import { PlusIcon, SkillIcon } from "../components/icons";
+import { DocLink } from "../components/DocLink";
+import { DOC_SKILLS } from "../lib/doclinks";
 
 type EditState =
   | { mode: "create" }
@@ -147,7 +149,13 @@ export function Skills() {
     <div className="space-y-6">
       <PageHeader
         title="Skills"
-        description="Reusable SKILL.md playbooks. Their one-line description sits cheaply in an agent's context; the body loads only when relevant. Allocate them to agents on an agent's page."
+        description={
+          <>
+            Reusable SKILL.md playbooks. Their one-line description sits cheaply in an agent's
+            context; the body loads only when relevant. Allocate them to agents on an agent's page.
+            See the <DocLink slug={DOC_SKILLS}>agent skills</DocLink> guide.
+          </>
+        }
         actions={
           <Button size="sm" onClick={() => setEdit({ mode: "create" })}>
             <PlusIcon /> New skill

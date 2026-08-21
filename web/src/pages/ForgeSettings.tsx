@@ -4,22 +4,24 @@
 // state instead of one page-wide busy flag.
 
 import { Fragment, useCallback, useEffect, useState } from "react";
-import { Link } from "react-router-dom";
 import { api, ApiError, type ForgeConnection, type PrivilegeReport } from "../lib/api";
 import { privilegeBadge } from "../lib/privilege";
 import { forgePlatform } from "../lib/forgeNoun";
+import { DOC_BOT_SETUP_FORGEJO, DOC_BOT_SETUP_GITHUB, DOC_BOT_SETUP_GITLAB } from "../lib/doclinks";
 import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Select, Skeleton } from "../components/ui";
 import { SettingsShell } from "../components/SettingsShell";
+import { DocLink } from "../components/DocLink";
 import { BranchIcon } from "../components/icons";
 
 // botSetupDoc is the in-app bot-setup guide for a forge (PRD #65 M6b). Each forge
 // has its own guide (both audience: user); the over-privilege violation card links
-// to the one for the forge the user is connecting, not always GitLab's. gitlab (and
-// any unknown/absent type — the only kind pre-M6b) keeps the exact GitLab path.
+// to the one for the forge the user is connecting, not always GitLab's. It returns
+// a BARE slug from the doclinks registry (PRD #57) — DocLink prepends "/docs/".
+// gitlab (and any unknown/absent type — the only kind pre-M6b) keeps GitLab's guide.
 function botSetupDoc(forgeType: string): string {
-  if (forgeType === "forgejo") return "/docs/forgejo-bot-setup";
-  if (forgeType === "github") return "/docs/github-bot-setup";
-  return "/docs/gitlab-bot-setup";
+  if (forgeType === "forgejo") return DOC_BOT_SETUP_FORGEJO;
+  if (forgeType === "github") return DOC_BOT_SETUP_GITHUB;
+  return DOC_BOT_SETUP_GITLAB;
 }
 
 // ConnectHints is the connect form's inline token guidance for one forge. On a
@@ -246,9 +248,7 @@ export function ForgeSettings() {
             Mint a least-privilege token ({hints.scopeWord}{" "}
             <code className="rounded bg-raised px-1 py-0.5 text-fg">{hints.scopeCode}</code> only,
             non-admin bot) — see the{" "}
-            <Link to={botSetupDoc(forgeType)} className="text-brand hover:underline">
-              bot setup guide
-            </Link>
+            <DocLink slug={botSetupDoc(forgeType)}>bot setup guide</DocLink>
             .
           </p>
         </Card>
@@ -262,7 +262,8 @@ export function ForgeSettings() {
           Create a bot account, give it a personal access token with the{" "}
           <code className="rounded bg-raised px-1 py-0.5 text-fg">{hints.scopeCode}</code> {hints.scopeWord}, and add
           it {hints.roleClause} to the projects uzi should see. The token is stored encrypted and never
-          shown again.
+          shown again.{" "}Step-by-step instructions are in the{" "}
+          <DocLink slug={botSetupDoc(forgeType)}>bot setup</DocLink> guide.
         </p>
         <form className="mt-4 space-y-4" onSubmit={connect}>
           <Field label="Forge base URL">

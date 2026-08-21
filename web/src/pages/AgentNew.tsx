@@ -4,6 +4,8 @@ import { useAuth } from "../auth/AuthContext";
 import { api, ApiError, type AgentTemplateInput } from "../lib/api";
 import { Button, Card } from "../components/ui";
 import { AgentTemplateEditor } from "../components/AgentTemplateEditor";
+import { DocLink } from "../components/DocLink";
+import { DOC_AGENT_TEMPLATES } from "../lib/doclinks";
 
 const BLANK = {
   name: "",
@@ -41,6 +43,7 @@ export function AgentNew() {
             {user?.is_admin
               ? " Publish it globally or keep it private to you."
               : " Your agent stays private to your runs."}
+            {" "}See the <DocLink slug={DOC_AGENT_TEMPLATES}>agent templates</DocLink> guide.
           </p>
         </div>
         <Button variant="ghost" onClick={() => navigate("/agents")}>
