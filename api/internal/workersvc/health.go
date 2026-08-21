@@ -104,6 +104,13 @@ const (
 	// owner-visible reason string differs.
 	reasonDeprioritized = "deprioritized — yields to interactive work"
 	reasonRestored      = "priority restored — no longer yielding"
+	// reasonNoEligibleWorker (PRD #84 M3) is emitted for a queued run whose
+	// required_capabilities are not a subset of ANY online worker's effective caps —
+	// distinct from reasonNoWorker (no worker online at all) and reasonAllWorkersBusy
+	// (a capable worker exists but is at its slot cap). Maps to the SAME
+	// healthWaitingWorker enum (no migration — runs.health_reason is free text). Gated
+	// by KeyCapabilityAwareScheduling: when the flag is off this reason is never emitted.
+	reasonNoEligibleWorker = "no online worker can run this — it needs a capability none of your workers has; provision a capable worker"
 )
 
 // Persistence-failure FLAG thresholds (PRD #108 M4), code constants for the same
@@ -227,6 +234,27 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 		// transition into queued (updated_at).
 		if th.queued == 0 || !olderThan(now, r.UpdatedAt, th.queued) {
 			return healthOK, ""
+		}
+		// A run whose required_capabilities no online worker can satisfy is genuinely
+		// UNPLACEABLE (PRD #84 M3) — the most actionable queued reason — so it is resolved
+		// BEFORE the priority-class re-label below: a yield/restored message would hide the
+		// real block. Gated by the capability-aware kill-switch (default ON, same fail
+		// direction as the claim path in service.go): with the flag OFF the fleet claims
+		// best-effort, so there is no "eligible worker" concept to report and this stays
+		// silent. The per-run Count sits behind the queued-threshold guard above, so it runs
+		// for ~0 runs/tick — the same affordability argument as queuedPriorityClass below. A
+		// Count read error falls through to the generic queuedReason rather than inventing a
+		// reason on a failed lookup (the conservative degrade the sibling per-run lookups use).
+		if len(r.RequiredCapabilities) > 0 && s.capabilityAwareOn(ctx) {
+			n, err := s.q.CountOnlineWorkersSatisfyingCaps(ctx, store.CountOnlineWorkersSatisfyingCapsParams{
+				UserID:               r.UserID,
+				RequiredCapabilities: r.RequiredCapabilities,
+			})
+			if err != nil {
+				slog.Error("health: count online workers satisfying caps", "run_id", r.ID, "error", err)
+			} else if n == 0 {
+				return healthWaitingWorker, reasonNoEligibleWorker
+			}
 		}
 		// A queued run the kind-derived priority DEMOTED (PRD #320 D9) is not stuck —
 		// it is yielding to interactive work — so its owner gets a reason that says so
@@ -509,6 +537,24 @@ func (s *Service) queuedReason(ctx context.Context, userID uuid.UUID) string {
 		return reasonAllWorkersBusy
 	}
 	return reasonWaitingWorker
+}
+
+// capabilityAwareOn reads the capability-aware scheduling kill-switch, nil-safe and
+// DEFAULTING ON (a nil reader — tests, or a deployment without a settings cache — or a
+// read error both leave it true), IDENTICALLY to the claim path in service.go. A run
+// the claim gate is fencing for want of an eligible worker must surface its
+// capability-specific reason in exactly the flag state that fencing happens in; a
+// different fail direction here would report "no eligible worker" for a run the fleet
+// is in fact claiming best-effort (flag off), or hide it for a run being fenced.
+func (s *Service) capabilityAwareOn(ctx context.Context) bool {
+	if s.capabilitySettings == nil {
+		return true
+	}
+	on, err := s.capabilitySettings.CapabilityAwareScheduling(ctx)
+	if err != nil {
+		return true
+	}
+	return on
 }
 
 // verdictUndelivered reports whether the run carries a gate verdict submitted AT OR AFTER

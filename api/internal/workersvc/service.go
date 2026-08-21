@@ -427,6 +427,12 @@ type Store interface {
 	SetRunHealth(ctx context.Context, arg store.SetRunHealthParams) (int64, error)
 	CountOnlineWorkersForUser(ctx context.Context, userID uuid.UUID) (int64, error)
 	CountOnlineWorkersWithFreeSlotForUser(ctx context.Context, userID uuid.UUID) (int64, error)
+	// CountOnlineWorkersSatisfyingCaps backs PRD #84 M3: a queued run whose
+	// required_capabilities are not a subset of ANY online worker's effective caps gets
+	// a capability-specific "no eligible worker" reason. A per-run lookup like the two
+	// counts above, and off the hot path for the same reason — it runs only for a queued
+	// run already past its health threshold.
+	CountOnlineWorkersSatisfyingCaps(ctx context.Context, arg store.CountOnlineWorkersSatisfyingCapsParams) (int64, error)
 	// RunHasVerdictSinceGateOpened backs issue #182: an awaiting_approval run whose
 	// owner already answered THIS gate reports waiting_worker rather than
 	// approval_idle. A per-run lookup like ListRunToolWindow above, and for the same

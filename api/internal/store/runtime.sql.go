@@ -541,6 +541,35 @@ func (q *Queries) CountOnlineWorkersForUser(ctx context.Context, userID uuid.UUI
 	return count, err
 }
 
+const countOnlineWorkersSatisfyingCaps = `-- name: CountOnlineWorkersSatisfyingCaps :one
+SELECT count(*) FROM workers w
+WHERE w.user_id = $1
+  AND w.status = 'online'
+  AND w.draining_since IS NULL
+  AND $2::text[] <@ (COALESCE(w.capabilities, '{}') || CASE WHEN COALESCE(w.docker_enabled, false) THEN ARRAY['docker'] ELSE ARRAY[]::text[] END)
+`
+
+type CountOnlineWorkersSatisfyingCapsParams struct {
+	UserID               uuid.UUID `json:"user_id"`
+	RequiredCapabilities []string  `json:"required_capabilities"`
+}
+
+// How many of a user's ONLINE, non-draining workers have EFFECTIVE caps that are a
+// SUPERSET of a given required set — the queued-run reason resolver (PRD #84 M3) uses
+// it to tell "no online worker can run this" (a capability nothing in the fleet has)
+// from the generic wait. The effective-caps fold is the SAME one fn_worker_can_claim
+// (migration 00142) applies at claim time — capabilities plus `docker` when
+// docker_enabled — so a run this returns 0 for is exactly a run no online worker can
+// claim. draining_since IS NULL mirrors CountOnlineWorkersWithFreeSlotForUser: a
+// draining worker claims nothing, so it cannot be the eligible worker. Only called for
+// a queued run already past its health threshold, so it is off the hot path.
+func (q *Queries) CountOnlineWorkersSatisfyingCaps(ctx context.Context, arg CountOnlineWorkersSatisfyingCapsParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingCaps, arg.UserID, arg.RequiredCapabilities)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countOnlineWorkersWithFreeSlotForUser = `-- name: CountOnlineWorkersWithFreeSlotForUser :one
 SELECT count(*) FROM workers w
 WHERE w.user_id = $1
@@ -2430,25 +2459,29 @@ const listActiveRunsForHealth = `-- name: ListActiveRunsForHealth :many
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at,
        health, health_reason, health_since, health_notified_at,
-       budget_wall_seconds
+       budget_wall_seconds,
+       repo_id, kind, required_capabilities
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat'
 `
 
 type ListActiveRunsForHealthRow struct {
-	ID                uuid.UUID          `json:"id"`
-	UserID            uuid.UUID          `json:"user_id"`
-	Status            string             `json:"status"`
-	AutoApprove       bool               `json:"auto_approve"`
-	StartedAt         pgtype.Timestamptz `json:"started_at"`
-	LastActivityAt    pgtype.Timestamptz `json:"last_activity_at"`
-	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
-	Health            string             `json:"health"`
-	HealthReason      pgtype.Text        `json:"health_reason"`
-	HealthSince       pgtype.Timestamptz `json:"health_since"`
-	HealthNotifiedAt  pgtype.Timestamptz `json:"health_notified_at"`
-	BudgetWallSeconds pgtype.Int4        `json:"budget_wall_seconds"`
+	ID                   uuid.UUID          `json:"id"`
+	UserID               uuid.UUID          `json:"user_id"`
+	Status               string             `json:"status"`
+	AutoApprove          bool               `json:"auto_approve"`
+	StartedAt            pgtype.Timestamptz `json:"started_at"`
+	LastActivityAt       pgtype.Timestamptz `json:"last_activity_at"`
+	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+	Health               string             `json:"health"`
+	HealthReason         pgtype.Text        `json:"health_reason"`
+	HealthSince          pgtype.Timestamptz `json:"health_since"`
+	HealthNotifiedAt     pgtype.Timestamptz `json:"health_notified_at"`
+	BudgetWallSeconds    pgtype.Int4        `json:"budget_wall_seconds"`
+	RepoID               pgtype.UUID        `json:"repo_id"`
+	Kind                 string             `json:"kind"`
+	RequiredCapabilities []string           `json:"required_capabilities"`
 }
 
 // Run health detector (PRD #47) ----------------------------------------------
@@ -2464,6 +2497,11 @@ type ListActiveRunsForHealthRow struct {
 // PRD #122 M2 (Decision 5b): budget_wall_seconds rides this read so the running-run
 // "slow" clamp uses the run's EFFECTIVE timeout, not the global one — a scaled run must
 // not render slow for its whole extended life. NULL for a run on the global default.
+// PRD #84 M3: repo_id, kind and required_capabilities ride this read so the queued
+// arm can surface a capability-specific "no eligible worker" reason (required caps not
+// a subset of any online worker's effective caps). kind was previously only a WHERE
+// filter; it is projected now so the resolver can branch on it too. No sweeper change —
+// a parked run stays queued and every sweep pass is scoped away from it by construction.
 func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRunsForHealthRow, error) {
 	rows, err := q.db.Query(ctx, listActiveRunsForHealth)
 	if err != nil {
@@ -2486,6 +2524,9 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRuns
 			&i.HealthSince,
 			&i.HealthNotifiedAt,
 			&i.BudgetWallSeconds,
+			&i.RepoID,
+			&i.Kind,
+			&i.RequiredCapabilities,
 		); err != nil {
 			return nil, err
 		}
