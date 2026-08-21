@@ -1359,7 +1359,9 @@ func (c *HTTPClient) DismissFinding(ctx context.Context, id, reason string) erro
 // ReviewFiledIssueDTO / ReviewIssueFileResult mirror the review file handler's wire shape
 // (POST .../review/recommendations/{recID}/issue): the created forge issue plus an optional
 // created-with-warning note. Defined here (not in apitypes) because the handler's response is
-// a handler-local type; the shape is pinned by the M3 live-DB roundtrip test.
+// a handler-local type; the shape is pinned by TestFileIssueClientWireRoundtripLiveDB (decodes
+// a real server fileIssueResponse into this type) and TestReviewFileClientWireRoundtrip
+// (marshal/unmarshal json-tag parity incl. warning), both in api/internal/handler.
 type ReviewFiledIssueDTO struct {
 	IID    int64  `json:"iid"`
 	WebURL string `json:"web_url"`
