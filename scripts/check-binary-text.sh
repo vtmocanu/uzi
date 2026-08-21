@@ -27,18 +27,25 @@
 #     whole-tree floor with no network op (Decision 2) -- it mirrors git's own
 #     `diff --stat` view and is kept as DEFENSE-IN-DEPTH.
 #   Clause 2 (non-NUL control bytes git's heuristic misses): enumerate every tracked
-#     file in the set NUL-delimited (`git ls-files -z`) and let perl itself iterate the
-#     names and open each in raw mode, scanning for control bytes outside `\t`=09,
-#     `\n`=0a, `\r`=0d. NUL-delimited + perl-iterated opens (no shell `read` loop) is
-#     LOAD-BEARING: git C-QUOTES any path with a non-ASCII/control byte, quote or
-#     backslash (core.quotePath defaults true), so a `while read` loop would hand perl
-#     a quoted literal it cannot open -- and a failed open silently reports that file
-#     CLEAN, a fail-OPEN on the exact class this gate guards. A file perl cannot open is
-#     printed as a finding (fail CLOSED), never skipped. Clause 2 SUBSUMES clause 1's
-#     NUL detection (a NUL anywhere, not just the first ~8KB) and additionally catches
-#     the non-NUL control-byte case git does not treat as binary at all.
+#     file in the set NUL-delimited (`git ls-files -z`) and run scan_control_bytes()
+#     over them. That ONE function is ALSO what the canary liveness step below runs,
+#     so a change to the detector cannot pass the canary green while silently blinding
+#     the whole-tree scan (the vacuous-pass hole a canary-only second detector would
+#     leave). It opens each file in raw mode and scans in 64 KiB chunks with an early
+#     exit on the first control byte outside `\t`=09, `\n`=0a, `\r`=0d. NUL-delimited
+#     names are LOAD-BEARING: git C-QUOTES any path with a non-ASCII/control byte
+#     (core.quotePath defaults true), so a `while read` loop would hand perl a quoted
+#     literal it cannot open. A tracked file ABSENT from the worktree (locally deleted,
+#     sparse checkout, mid-rebase) has no content to judge and is SKIPPED; a file that
+#     EXISTS but cannot be opened is printed as a finding (fail CLOSED). Clause 2
+#     SUBSUMES clause 1's NUL detection (a NUL anywhere, not just the first ~8KB) and
+#     additionally catches the non-NUL control-byte case git does not treat as binary.
 # perl (not plain `grep`) does the control-byte test because this host's `grep` is
 # ugrep, which mis-handles negated character classes in POSIX modes (root CLAUDE.md).
+#
+# 🔴 perl IS REQUIRED, AND CHECKED UP FRONT. If perl is missing the instrument is
+# declared BROKEN (exit 2), never a silent clean pass -- a missing perl must not read
+# as "0 control-byte files" on the exact class this gate guards.
 #
 # 🔴 LOAD-BEARING: `:(exclude)scripts/binary-text-canary.*` IS ON BOTH WHOLE-TREE
 # CLAUSES. The committed canary carries a planted NUL and lives at a text extension
@@ -51,18 +58,19 @@
 # 🔴 A LIVENESS CANARY, BECAUSE A SILENT PASS IS THE FAILURE MODE. If the detector
 # ever matched nothing (a changed pattern, a broken perl), the tree would read "0
 # binary/control-byte files" and this gate would pass VACUOUSLY. The canary file ($1)
-# carries a deliberately planted NUL; the clause-2 control-byte detector is run over it
-# FIRST and MUST fire, or the instrument is declared broken. A clean run therefore
-# confirms the canary fired -- a positive observation, so a green here is not "the
-# detector never looked".
+# carries a deliberately planted NUL; scan_control_bytes() -- the SAME detector the
+# whole-tree scan uses -- is run over it FIRST and MUST fire, or the instrument is
+# declared broken. A clean run therefore confirms the canary fired -- a positive
+# observation, so a green here is not "the detector never looked".
 #
 # NO SKIP BRANCH AND NO *_REQUIRED ENV VAR, deliberately -- the asymmetry with
 # lint-yaml.sh / lint-formula.sh is that those wrap brew/pip tools a contributor may
-# lack, whereas this check needs only sh/git/perl/awk/sort, which are always present.
+# lack, whereas this check needs only sh/git/perl/awk/sort, which are always present
+# (and perl's presence is asserted above rather than assumed).
 #
 # EXIT CODES (the check-spec-numbering.sh / check-migration-numbering.sh convention):
-#     2 = the instrument is broken (bad args, not-a-git-tree, missing canary, or the
-#         canary control byte did not fire)
+#     2 = the instrument is broken (bad args, not-a-git-tree, missing perl, missing
+#         canary, or the canary control byte did not fire)
 #     1 = there are findings (a binary/control-byte text file from clause 1 or 2)
 #     0 = clean, and the canary control byte was seen
 # `task`'s own rc is 201 for all of them.
@@ -89,6 +97,16 @@ cd "$ROOT" || {
   exit 2
 }
 
+# 🔴 perl runs the control-byte detector; a missing perl must be an INSTRUMENT-BROKEN
+# error, never a silent clean pass. (has_control_byte's old `! perl …` form returned
+# "found" on a 127 exit, so a missing perl silently passed the canary AND blanked the
+# scan -- a fail-OPEN on the class this gate guards.)
+if ! command -v perl >/dev/null 2>&1; then
+  echo "check-binary-text: INSTRUMENT BROKEN -- perl not found on PATH; the" >&2
+  echo "check-binary-text: control-byte scan cannot run, so no tree verdict is trustworthy." >&2
+  exit 2
+fi
+
 if [ ! -f "$CANARY" ]; then
   echo "check-binary-text: canary file not found: $CANARY" >&2
   echo "  The canary is what proves the control-byte detector fires; without it a" >&2
@@ -96,17 +114,34 @@ if [ ! -f "$CANARY" ]; then
   exit 2
 fi
 
-# The clause-2 control-byte detector, as a function so the exact same test runs over
-# the canary (explicitly) and over each tracked file. Returns non-zero (perl exit 1)
-# when the file carries a control byte outside \t \n \r.
-has_control_byte() {
-  ! perl -ne 'exit 1 if /[\x00-\x08\x0b\x0c\x0e-\x1f]/' "$1"
+# THE clause-2 control-byte detector -- used for BOTH the canary liveness check
+# (explicit path) and the whole-tree scan, so the two CANNOT drift. Reads
+# NUL-delimited filenames on stdin; for each: opens raw and scans in 64 KiB chunks,
+# early-exiting on the first control byte outside \t(09) \n(0a) \r(0d). Prints any
+# offender (newline-terminated). A tracked file ABSENT from the worktree is SKIPPED
+# (no content to judge -- e.g. a locally deleted-but-tracked file mid-rebase); one
+# that EXISTS but cannot be opened is printed (fail CLOSED).
+scan_control_bytes() {
+  perl -0 -ne '
+    chomp(my $f = $_);
+    if (open my $fh, "<:raw", $f) {
+      my $hit = 0;
+      while (read($fh, my $buf, 65536)) {
+        if ($buf =~ /[\x00-\x08\x0b\x0c\x0e-\x1f]/) { $hit = 1; last; }
+      }
+      close $fh;
+      print "$f\n" if $hit;
+    } elsif (-e $f) {
+      print "$f\n";
+    }
+  '
 }
 
-# 🔴 CANARY FIRST: prove the instrument fires before trusting any tree verdict. Scan
-# the canary EXPLICITLY (its own path, never via the excluded whole-tree scan). If the
-# planted NUL does not fire the detector, the whole-tree "clean" would be meaningless.
-if ! has_control_byte "$CANARY"; then
+# 🔴 CANARY FIRST: prove the instrument fires before trusting any tree verdict, using
+# the SAME scan_control_bytes the whole-tree scan uses. Scan the canary EXPLICITLY
+# (its own path, never via the excluded whole-tree scan). If the planted NUL does not
+# fire the detector, the whole-tree "clean" would be meaningless.
+if [ -z "$(printf '%s\0' "$CANARY" | scan_control_bytes)" ]; then
   echo "check-binary-text: ================================================================" >&2
   echo "check-binary-text: INSTRUMENT BROKEN -- the control-byte detector did not fire on the" >&2
   echo "check-binary-text: canary ($CANARY)." >&2
@@ -114,7 +149,7 @@ if ! has_control_byte "$CANARY"; then
   echo "check-binary-text: That fixture carries a deliberately planted NUL byte. Finding none" >&2
   echo "check-binary-text: means the perl control-byte scan matched nothing (a changed pattern," >&2
   echo "check-binary-text: a mangled canary), so a \"clean\" tree would mean nothing. Restore the" >&2
-  echo "check-binary-text: canary's NUL or fix has_control_byte()." >&2
+  echo "check-binary-text: canary's NUL or fix scan_control_bytes()." >&2
   echo "check-binary-text: ================================================================" >&2
   exit 2
 fi
@@ -133,24 +168,10 @@ clause1="$(git -c core.quotePath=false diff --numstat "$EMPTY_TREE" HEAD -- "$@"
   | awk -F'\t' '$1 == "-" && $2 == "-" { print $3 }')"
 
 # Clause 2: every tracked file in the set (canary excluded), scanned for control bytes
-# outside \t \n \r. 🔴 NUL-DELIMITED (`ls-files -z`) so a path carrying a non-ASCII or
-# control byte -- or an embedded newline -- is NEITHER C-quoted (git's core.quotePath
-# default) NOR split. Either would hand perl a filename it cannot open, and a failed
-# open would silently report that file CLEAN: a fail-OPEN on the exact class this gate
-# guards. perl reads the NUL-delimited names, opens each in raw mode, and prints the
-# offenders; a tracked file it cannot open is itself printed as a finding (fail CLOSED),
-# never skipped.
-clause2="$(git ls-files -z -- "$@" | perl -0 -ne '
-  chomp(my $f = $_);
-  if (open my $fh, "<:raw", $f) {
-    local $/;
-    my $data = <$fh>;
-    close $fh;
-    print "$f\n" if defined($data) && $data =~ /[\x00-\x08\x0b\x0c\x0e-\x1f]/;
-  } else {
-    print "$f\n";
-  }
-')"
+# outside \t \n \r via scan_control_bytes (the same detector the canary proved live).
+# 🔴 NUL-DELIMITED (`ls-files -z`) so a path carrying a non-ASCII or control byte -- or
+# an embedded newline -- is NEITHER C-quoted (git's core.quotePath default) NOR split.
+clause2="$(git ls-files -z -- "$@" | scan_control_bytes)"
 
 # Union of both clauses, blank lines dropped, deduplicated.
 findings="$(printf '%s\n%s\n' "$clause1" "$clause2" | awk 'NF' | sort -u)"
