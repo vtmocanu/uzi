@@ -3117,6 +3117,17 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		runningParams.RunTimeoutSeconds = int32(s.p.RunTimeout.Seconds())
 		runningParams.MilestoneBudgetCap = milestoneBudgetCap
 		runningParams.BudgetWallCeilingSeconds = budgetWallCeilingSeconds
+		// PRD #84 M4: an AUTOPILOT run auto-approves its own plan and NEVER reports
+		// awaiting_approval, so it rides the plan-time INFERRED requirement set on this
+		// self-contained `running` report instead (runner.ts toolchainReportFields, the
+		// same fields the awaiting_approval case consumes). Persist it the SAME way — the
+		// shared inferredRequirementParams sanitiser feeding the query's absent-safe
+		// COALESCE guards (required_capabilities union-merged escalation-only,
+		// required_tools/size_class replaced) — so autopilot runs are not silently stripped
+		// of their inference (the SWEEP auto-approves, so this is the only path that carries
+		// it for them). Absent on every ordinary session-id/iteration heartbeat, so those
+		// stay no-ops.
+		runningParams.InferredCapabilities, runningParams.InferredTools, runningParams.SizeClass = inferredRequirementParams(req)
 		rows, err = s.q.SetRunRunning(ctx, runningParams)
 	case "awaiting_approval":
 		// PRD #122 M1: the CANDIDATE milestone list rides the pre-approval report.
@@ -3132,30 +3143,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// same report (PRD #84 M4 4b): it is clamped to the {s,m,l} vocabulary and passed
 		// as an absent-safe pgtype.Text, so an off-vocabulary or absent value is an invalid
 		// (SQL NULL) param the query's COALESCE keeps out of the column.
-		var inferredCaps, inferredTools []string
-		if req.RequiredCapabilities != nil {
-			inferredCaps = capability.Filter(*req.RequiredCapabilities)
-		}
-		if req.RequiredTools != nil {
-			// FilterTools returns a NON-nil empty slice when every name is unknown (e.g.
-			// ["cobol"]), which pgx encodes as {} (not NULL). Since required_tools is a
-			// COALESCE-guarded REPLACE, passing {} would WIPE a prior tool set — asymmetric
-			// with the caps/size paths, where a garbled report is already a no-op. Only pass
-			// a non-empty filtered set through, so an all-unknown or empty report leaves the
-			// param nil and the query's COALESCE keeps the existing column (no change). The
-			// worker only emits required_tools when non-empty, so this loses no legitimate
-			// behaviour; it closes the hostile/garbled wipe.
-			if filtered := capability.FilterTools(*req.RequiredTools); len(filtered) > 0 {
-				inferredTools = filtered
-			}
-		}
-		var sizeClass pgtype.Text
-		if req.SizeClass != nil {
-			switch *req.SizeClass {
-			case "s", "m", "l":
-				sizeClass = pgText(*req.SizeClass)
-			}
-		}
+		inferredCaps, inferredTools, sizeClass := inferredRequirementParams(req)
 		rows, err = s.q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
 			PlanMd: stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
 			MilestonesCandidate:  milestonesParam(owned.Kind, req.Milestones),
@@ -3306,6 +3294,40 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		s.maybeEnqueueThenFix(ctx, run)
 	}
 	return run, rows > 0, err
+}
+
+// inferredRequirementParams sanitises the plan-time INFERRED requirement set a worker
+// emits on a state report (PRD #84 M4 4b) into the three absent-safe params BOTH write
+// paths take: SetRunAwaitingApproval on a human-gated plan park, SetRunRunning on an
+// autopilot's self-contained running report (an autopilot run never reports
+// awaiting_approval). Shared so the two consumers can never drift in how they filter a
+// report against the server-owned vocabulary. Each return is absent-safe, matching the
+// queries' COALESCE guards:
+//   - inferredCaps: capability.Filter (unknown names dropped). An absent (nil) field or
+//     an all-unknown report yields nil/empty, which UNION-MERGES with '{}' — a no-op —
+//     so caps are never wiped; a present set escalates (adds), never replaces.
+//   - inferredTools: capability.FilterTools, but only passed through when NON-empty.
+//     required_tools is a COALESCE-guarded REPLACE, so a non-nil empty slice ({}) would
+//     WIPE a prior tool set; leaving it nil makes the query keep the existing column.
+//     The worker only emits required_tools when non-empty, so this loses no behaviour.
+//   - sizeClass: clamped to the {s,m,l} vocabulary; an absent or off-vocabulary value is
+//     an invalid pgtype.Text (SQL NULL) the query's COALESCE keeps out of the column.
+func inferredRequirementParams(req StateRequest) (inferredCaps, inferredTools []string, sizeClass pgtype.Text) {
+	if req.RequiredCapabilities != nil {
+		inferredCaps = capability.Filter(*req.RequiredCapabilities)
+	}
+	if req.RequiredTools != nil {
+		if filtered := capability.FilterTools(*req.RequiredTools); len(filtered) > 0 {
+			inferredTools = filtered
+		}
+	}
+	if req.SizeClass != nil {
+		switch *req.SizeClass {
+		case "s", "m", "l":
+			sizeClass = pgText(*req.SizeClass)
+		}
+	}
+	return inferredCaps, inferredTools, sizeClass
 }
 
 // runningStateParams builds the `running` update's PRD #37 columns from a worker's
@@ -4672,7 +4694,27 @@ type SubmitInputResult struct {
 // awaiting approval because a live worker put it there, so an approve with no
 // poller is a race the worker's own gate timeout resolves. Only cancel/reject_plan
 // need the branch below.
+//
+// The capability approval gate (PRD #84 M4 4c) is ENFORCED here — use
+// SubmitInputWithCapabilityOverride for the owner "run without the capability" override.
 func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind, body string, sel *AgentSelection) (SubmitInputResult, error) {
+	return s.submitInput(ctx, userID, runID, kind, body, sel, false)
+}
+
+// SubmitInputWithCapabilityOverride is SubmitInput for the PRD #84 M4 4c owner override
+// ("run without the capability", Decision 12). It BYPASSES the capability approval gate and
+// clears the run's inferred/hinted required_capabilities — but ATOMICALLY with a successful
+// approve: the clear runs ONLY after the approve's own validation (selection roster check)
+// and enqueue succeed, so a FAILED approve (e.g. an invalid agent selection) leaves
+// required_capabilities INTACT and the retry stays gated. This closes the non-atomic drop
+// the old handler-side pre-clear had, where a failed approve permanently dropped the
+// requirement. The override is meaningful only for approve_plan; on any other kind the gate
+// never runs, so the flag is inert.
+func (s *Service) SubmitInputWithCapabilityOverride(ctx context.Context, userID, runID uuid.UUID, kind, body string, sel *AgentSelection) (SubmitInputResult, error) {
+	return s.submitInput(ctx, userID, runID, kind, body, sel, true)
+}
+
+func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind, body string, sel *AgentSelection, overrideCapabilities bool) (SubmitInputResult, error) {
 	run, err := s.GetRun(ctx, userID, runID)
 	if err != nil {
 		return SubmitInputResult{}, err
@@ -4693,18 +4735,40 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		return SubmitInputResult{}, fmt.Errorf("%w: an agent selection is only valid when approving a plan", ErrInvalidSelection)
 	}
 	// PRD #84 M4 4c: the AUTHORITATIVE capability approval gate runs here for EVERY
-	// approve_plan — before the selection-bearing dispatch below AND before the
-	// nil-selection plain-enqueue path further down — so neither path can approve a plan
-	// onto a worker that cannot run it. See capabilityGate; the user override cleared the
-	// run's required_capabilities in the handler BEFORE this call, so on override the set is
-	// empty and the gate passes.
+	// approve_plan — both the selection-bearing dispatch and the nil-selection plain-enqueue
+	// path — so neither can approve a plan onto a worker that cannot run it. See
+	// capabilityGate.
+	//
+	// The owner OVERRIDE ("run without the capability", Decision 12) instead BYPASSES the
+	// gate and clears the run's required_capabilities — but the clear is ATOMIC with a
+	// successful approve: it runs ONLY after the approve's own validation (submitApproval's
+	// roster check) and enqueue have succeeded, so a FAILED approve (e.g. an invalid
+	// selection) leaves the requirement INTACT and the retry stays gated. Doing the clear
+	// here, after the enqueue, rather than in the handler BEFORE this call, is the fix for
+	// the non-atomic drop.
 	if kind == "approve_plan" {
-		if err := s.capabilityGate(ctx, run); err != nil {
+		if !overrideCapabilities {
+			if err := s.capabilityGate(ctx, run); err != nil {
+				return SubmitInputResult{}, err
+			}
+		}
+		var res SubmitInputResult
+		if sel != nil {
+			res, err = s.submitApproval(ctx, run, *sel)
+		} else {
+			res, err = s.enqueueRunInput(ctx, runID, kind, body)
+		}
+		if err != nil {
 			return SubmitInputResult{}, err
 		}
-	}
-	if kind == "approve_plan" && sel != nil {
-		return s.submitApproval(ctx, run, *sel)
+		if overrideCapabilities {
+			// Only reached once the approve fully succeeded, so a failed approve above never
+			// clears the requirement. Owner- and awaiting_approval-scoped in SQL.
+			if err := s.OverrideRunRequiredCapabilities(ctx, userID, runID); err != nil {
+				return SubmitInputResult{}, err
+			}
+		}
+		return res, nil
 	}
 
 	// An `answer` resolves the clarification question the run is CURRENTLY parked on
@@ -4842,9 +4906,16 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		return SubmitInputResult{ServerSide: false, ID: row.ID, CreatedAt: row.CreatedAt.Time}, nil
 	}
 
-	// A plain steering input (approve_plan / follow_up): enqueue for the worker with no
-	// stop signal and no runs-row touch. Return the created row (PRD #95 S2) so the
-	// handler can surface id + created_at for a follow_up's optimistic reconcile.
+	// A plain steering input (follow_up, or a nil-selection approve_plan handled above):
+	// enqueue for the worker with no stop signal and no runs-row touch.
+	return s.enqueueRunInput(ctx, runID, kind, body)
+}
+
+// enqueueRunInput writes a plain worker-bound input row (no stop signal, no runs-row
+// touch) and returns the created row (PRD #95 S2) so the handler can surface id +
+// created_at for a follow_up's optimistic reconcile. Shared by the follow_up path and the
+// nil-selection approve_plan path so both go through one enqueue.
+func (s *Service) enqueueRunInput(ctx context.Context, runID uuid.UUID, kind, body string) (SubmitInputResult, error) {
 	row, err := s.q.CreateRunInput(ctx, store.CreateRunInputParams{
 		RunID: runID, Kind: kind, Body: pgText(body),
 	})
@@ -4910,10 +4981,10 @@ func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSe
 // (migration 00142) and CountOnlineWorkersSatisfyingCaps apply, so approve and claim never
 // disagree. Gated by the capability-aware kill-switch (default ON), identically to the
 // claim/health paths: with the flag OFF the fleet claims best-effort, so there is no
-// eligibility to enforce and this stays silent. Called from SubmitInput for every approve_plan
-// (both the selection and nil-selection paths) so the gate has no bypass; the user override
-// clears required_capabilities BEFORE the approve (ClearRunRequiredCapabilities, handler
-// CreateRunInput), so on override the required set is empty and this returns nil.
+// eligibility to enforce and this stays silent. Called from submitInput for every approve_plan
+// (both the selection and nil-selection paths) so the gate has no bypass — EXCEPT the owner
+// override path (SubmitInputWithCapabilityOverride), which skips this gate deliberately and
+// clears required_capabilities AFTER a successful approve (OverrideRunRequiredCapabilities).
 func (s *Service) capabilityGate(ctx context.Context, run store.Run) error {
 	if len(run.RequiredCapabilities) == 0 || !s.capabilityAwareOn(ctx) {
 		return nil
@@ -4952,15 +5023,15 @@ func (s *Service) effectiveOwningWorkerCaps(ctx context.Context, run store.Run) 
 }
 
 // OverrideRunRequiredCapabilities backs the PRD #84 M4 4c user override ("run without the
-// capability", Decision 12): it clears the run's inferred/hinted required_capabilities so a
-// subsequent approve_plan is no longer fenced by the capability gate above. The clear is
-// owner- AND awaiting_approval-scoped in SQL, so a non-owner runID or a run outside the plan
-// gate is a silent no-op (0 rows) — the approve that follows resolves ownership and status
-// itself (GetRun 404s a non-owner). It runs BEFORE that approve, so submitApproval reloads a
-// run whose required set is already empty and the block is skipped. v1 clears the WHOLE set
-// (repo hint + inferred); a hint-vs-inference split is a future refinement (Decision 6/12),
-// and no runtime security boundary is bypassed — the §300 guardrail still denies docker USE
-// on a daemon-less worker at run time.
+// capability", Decision 12): it clears the run's inferred/hinted required_capabilities. The
+// clear is owner- AND awaiting_approval-scoped in SQL, so a non-owner runID or a run outside
+// the plan gate is a silent no-op (0 rows). It is called from submitInput's override path
+// AFTER the approve has validated and enqueued (the gate is bypassed for that path), so the
+// clear runs ONLY on a successful approve — a failed approve leaves the requirement intact
+// and the retry stays gated. v1 clears the WHOLE set (repo hint + inferred); a
+// hint-vs-inference split is a future refinement (Decision 6/12), and no runtime security
+// boundary is bypassed — the §300 guardrail still denies docker USE on a daemon-less worker
+// at run time.
 func (s *Service) OverrideRunRequiredCapabilities(ctx context.Context, userID, runID uuid.UUID) error {
 	_, err := s.q.ClearRunRequiredCapabilities(ctx, store.ClearRunRequiredCapabilitiesParams{ID: runID, UserID: userID})
 	return err

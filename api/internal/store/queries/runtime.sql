@@ -831,6 +831,30 @@ UPDATE runs SET
     repo_agents      = COALESCE(sqlc.narg('repo_agents')::jsonb, repo_agents),
     agent_source     = COALESCE(sqlc.narg('agent_source'), agent_source),
     agent_exclusions = COALESCE(sqlc.narg('agent_exclusions')::jsonb, agent_exclusions),
+    -- PRD #84 M4: persist the plan-time INFERRED requirement set an AUTOPILOT run emits
+    -- on this self-contained `running` report. An autopilot run auto-approves its own
+    -- plan and never reports awaiting_approval, so SetRunAwaitingApproval's identical
+    -- clauses are never reached on it — without these three the inference is silently
+    -- lost for every auto-approved run (the sweep uses auto-approve). ALL THREE are
+    -- ABSENT-SAFE so the ordinary session-id/iteration heartbeats (which omit them) never
+    -- disturb the columns, mirroring SetRunAwaitingApproval byte-for-byte:
+    --
+    -- required_capabilities is UNION-MERGED (escalation-only): the M2 enqueue seam already
+    -- copied the repo's static hint, and inference can only ADD. The COALESCE is
+    -- LOAD-BEARING — a nil text[] param encodes SQL NULL and `arr || NULL = NULL` would
+    -- WIPE the NOT-NULL column — so an absent param unions with '{}' (no change) and a
+    -- present set adds its members, deduped; `<@` is order-independent so it stays unsorted.
+    required_capabilities = ARRAY(SELECT DISTINCT unnest(
+        required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))),
+    -- required_tools is SET, absent-safe: a present set REPLACES (the run's single
+    -- authoritative inferred toolchain list), an absent (NULL) param COALESCEs back to the
+    -- existing column. The service only passes a non-empty filtered set, so a garbled/empty
+    -- report leaves the param nil rather than wiping the column.
+    required_tools = COALESCE(sqlc.narg('inferred_tools')::text[], required_tools),
+    -- size_class is SET, absent-safe like required_tools: a present (clamped s/m/l) value
+    -- REPLACES, an absent (NULL) param COALESCEs back. The service clamps to {s,m,l} before
+    -- passing, so a garbled report becomes a nil param (no change) rather than a bad value.
+    size_class = COALESCE(sqlc.narg('size_class'), size_class),
     -- PRD #122 M1: the FROZEN milestone list an AUTOPILOT run resolved for itself,
     -- with a SAFETY-NET fallback to milestones_candidate (issue #259). Written
     -- IMMUTABLY — COALESCE keeps the EXISTING value, so a later `running` report can

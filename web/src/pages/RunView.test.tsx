@@ -364,6 +364,26 @@ describe("PlanPanel readiness summary (PRD #84 M4 4d)", () => {
     expect(screen.queryByText("Run requirements")).toBeNull();
   });
 
+  // Review fix: size_class alone must NOT open the panel. detectToolchain ALWAYS emits a
+  // non-empty size_class (s/m/l), so with the old `sizeClass !== ""` term the panel rendered
+  // for EVERY plan gate. size is advisory-only: with no capability and no tool the panel — and
+  // the "size:" label with it — is suppressed entirely.
+  it("does NOT render the panel when only size_class is set (no capability, no tool)", async () => {
+    render(
+      <PlanPanel
+        run={run({ required_capabilities: [], required_tools: [], size_class: "l", repo_agents: [], own_agents: [] })}
+        workers={[worker("w1", [])]}
+        busy={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
+    // Positive anchor first so the absence checks are not vacuous.
+    expect(await screen.findByText("step one")).toBeTruthy();
+    expect(screen.queryByText("Run requirements")).toBeNull();
+    expect(screen.queryByText("size: l")).toBeNull();
+  });
+
   it("the override button approves with overrideCapabilities=true (the false-positive correction)", async () => {
     const onApprove = vi.fn();
     render(

@@ -5117,6 +5117,30 @@ UPDATE runs SET
     repo_agents      = COALESCE($3::jsonb, repo_agents),
     agent_source     = COALESCE($4, agent_source),
     agent_exclusions = COALESCE($5::jsonb, agent_exclusions),
+    -- PRD #84 M4: persist the plan-time INFERRED requirement set an AUTOPILOT run emits
+    -- on this self-contained ` + "`" + `running` + "`" + ` report. An autopilot run auto-approves its own
+    -- plan and never reports awaiting_approval, so SetRunAwaitingApproval's identical
+    -- clauses are never reached on it — without these three the inference is silently
+    -- lost for every auto-approved run (the sweep uses auto-approve). ALL THREE are
+    -- ABSENT-SAFE so the ordinary session-id/iteration heartbeats (which omit them) never
+    -- disturb the columns, mirroring SetRunAwaitingApproval byte-for-byte:
+    --
+    -- required_capabilities is UNION-MERGED (escalation-only): the M2 enqueue seam already
+    -- copied the repo's static hint, and inference can only ADD. The COALESCE is
+    -- LOAD-BEARING — a nil text[] param encodes SQL NULL and ` + "`" + `arr || NULL = NULL` + "`" + ` would
+    -- WIPE the NOT-NULL column — so an absent param unions with '{}' (no change) and a
+    -- present set adds its members, deduped; ` + "`" + `<@` + "`" + ` is order-independent so it stays unsorted.
+    required_capabilities = ARRAY(SELECT DISTINCT unnest(
+        required_capabilities || COALESCE($6::text[], '{}'))),
+    -- required_tools is SET, absent-safe: a present set REPLACES (the run's single
+    -- authoritative inferred toolchain list), an absent (NULL) param COALESCEs back to the
+    -- existing column. The service only passes a non-empty filtered set, so a garbled/empty
+    -- report leaves the param nil rather than wiping the column.
+    required_tools = COALESCE($7::text[], required_tools),
+    -- size_class is SET, absent-safe like required_tools: a present (clamped s/m/l) value
+    -- REPLACES, an absent (NULL) param COALESCEs back. The service clamps to {s,m,l} before
+    -- passing, so a garbled report becomes a nil param (no change) rather than a bad value.
+    size_class = COALESCE($8, size_class),
     -- PRD #122 M1: the FROZEN milestone list an AUTOPILOT run resolved for itself,
     -- with a SAFETY-NET fallback to milestones_candidate (issue #259). Written
     -- IMMUTABLY — COALESCE keeps the EXISTING value, so a later ` + "`" + `running` + "`" + ` report can
@@ -5140,17 +5164,17 @@ UPDATE runs SET
     --      round-1 resume already froze round-1's candidate, so the already-frozen list
     --      wins and the stale round-2 candidate cannot overwrite it. The common heartbeat
     --      is likewise a no-op via clause 1.
-    milestones_frozen = COALESCE(milestones_frozen, $6::jsonb, milestones_candidate),
+    milestones_frozen = COALESCE(milestones_frozen, $9::jsonb, milestones_candidate),
     -- PRD #122 M2 (Decision 5/5b): per-run budget derived SERVER-SIDE from the frozen
     -- milestone count at freeze, written IMMUTABLY. NULL for a 0/1-milestone run so its
     -- budget is byte-for-byte the global default. Count capped at milestone_budget_cap,
     -- wall capped at budget_wall_ceiling_seconds. Frozen source = same COALESCE as above.
     budget_max_iterations = COALESCE(budget_max_iterations,
-        CASE WHEN COALESCE(jsonb_array_length(COALESCE(milestones_frozen, $6::jsonb, milestones_candidate)), 0) <= 1 THEN NULL
-             ELSE $7::int * LEAST(jsonb_array_length(COALESCE(milestones_frozen, $6::jsonb, milestones_candidate)), $8::int) END),
+        CASE WHEN COALESCE(jsonb_array_length(COALESCE(milestones_frozen, $9::jsonb, milestones_candidate)), 0) <= 1 THEN NULL
+             ELSE $10::int * LEAST(jsonb_array_length(COALESCE(milestones_frozen, $9::jsonb, milestones_candidate)), $11::int) END),
     budget_wall_seconds = COALESCE(budget_wall_seconds,
-        CASE WHEN COALESCE(jsonb_array_length(COALESCE(milestones_frozen, $6::jsonb, milestones_candidate)), 0) <= 1 THEN NULL
-             ELSE LEAST($9::int * LEAST(jsonb_array_length(COALESCE(milestones_frozen, $6::jsonb, milestones_candidate)), $8::int), $10::int) END),
+        CASE WHEN COALESCE(jsonb_array_length(COALESCE(milestones_frozen, $9::jsonb, milestones_candidate)), 0) <= 1 THEN NULL
+             ELSE LEAST($12::int * LEAST(jsonb_array_length(COALESCE(milestones_frozen, $9::jsonb, milestones_candidate)), $11::int), $13::int) END),
     -- PRD #122 M2 (Decision 3): completed is UNIONED (monotone, dedup); in_progress is
     -- OVERWRITTEN wholesale. NULL param = "not reported this call" → column untouched.
     -- Ids are validated + membership-checked server-side (progressParams) before here.
@@ -5158,13 +5182,13 @@ UPDATE runs SET
     -- completion path (signal_done reconciliation). The two sites MUST keep identical
     -- dedup semantics — if you change one, change both.
     milestones_completed = CASE
-        WHEN $11::jsonb IS NULL THEN milestones_completed
+        WHEN $14::jsonb IS NULL THEN milestones_completed
         ELSE COALESCE((SELECT jsonb_agg(DISTINCT e)
-                       FROM jsonb_array_elements_text(COALESCE(milestones_completed, '[]'::jsonb) || $11::jsonb) AS e), '[]'::jsonb)
+                       FROM jsonb_array_elements_text(COALESCE(milestones_completed, '[]'::jsonb) || $14::jsonb) AS e), '[]'::jsonb)
     END,
     milestones_in_progress = CASE
-        WHEN $12::jsonb IS NULL THEN milestones_in_progress
-        ELSE $12::jsonb
+        WHEN $15::jsonb IS NULL THEN milestones_in_progress
+        ELSE $15::jsonb
     END,
     -- Exit contract (PRD #47 Decision 3), guarded so it fires only on ENTRY to
     -- running. This statement is also the running→running heartbeat (idempotent),
@@ -5176,7 +5200,7 @@ UPDATE runs SET
     health_reason = CASE WHEN status = 'running' THEN health_reason ELSE NULL END,
     health_since  = CASE WHEN status = 'running' THEN health_since  ELSE NULL END,
     updated_at       = now()
-WHERE runs.id = $13 AND worker_id = $14
+WHERE runs.id = $16 AND worker_id = $17
   AND status NOT IN ('completed', 'failed', 'cancelled')
   -- limit_wait is excluded EXPLICITLY, and note that the negative guard above does
   -- NOT cover it (PRD #35): a parked run is inside 'NOT IN (terminal)', so without
@@ -5191,7 +5215,7 @@ WHERE runs.id = $13 AND worker_id = $14
   AND status <> 'limit_wait'
   AND (status <> 'awaiting_approval' OR EXISTS (
         SELECT 1 FROM run_user_inputs
-        WHERE run_user_inputs.run_id = $13
+        WHERE run_user_inputs.run_id = $16
           AND run_user_inputs.kind = 'approve_plan'
           AND run_user_inputs.consumed_at IS NOT NULL))
   -- awaiting_input → running is guarded the same way and for the same reason
@@ -5214,7 +5238,7 @@ WHERE runs.id = $13 AND worker_id = $14
   -- equality NULL, so the guard blocks: fail-closed.
   AND (status <> 'awaiting_input' OR EXISTS (
         SELECT 1 FROM run_user_inputs
-        WHERE run_user_inputs.run_id = $13
+        WHERE run_user_inputs.run_id = $16
           AND run_user_inputs.kind = 'answer'
           AND run_user_inputs.consumed_at IS NOT NULL
           AND run_user_inputs.question_id = runs.open_question_id))
@@ -5226,6 +5250,9 @@ type SetRunRunningParams struct {
 	RepoAgents               []byte      `json:"repo_agents"`
 	AgentSource              pgtype.Text `json:"agent_source"`
 	AgentExclusions          []byte      `json:"agent_exclusions"`
+	InferredCapabilities     []string    `json:"inferred_capabilities"`
+	InferredTools            []string    `json:"inferred_tools"`
+	SizeClass                pgtype.Text `json:"size_class"`
 	MilestonesFrozen         []byte      `json:"milestones_frozen"`
 	RunMaxIterations         int32       `json:"run_max_iterations"`
 	MilestoneBudgetCap       int32       `json:"milestone_budget_cap"`
@@ -5273,6 +5300,9 @@ func (q *Queries) SetRunRunning(ctx context.Context, arg SetRunRunningParams) (i
 		arg.RepoAgents,
 		arg.AgentSource,
 		arg.AgentExclusions,
+		arg.InferredCapabilities,
+		arg.InferredTools,
+		arg.SizeClass,
 		arg.MilestonesFrozen,
 		arg.RunMaxIterations,
 		arg.MilestoneBudgetCap,

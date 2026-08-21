@@ -1322,7 +1322,13 @@ export function PlanPanel({
     return caps;
   }, [run.worker_id, workers]);
   const unmetCaps = useMemo(() => requiredCaps.filter((c) => !workerCaps.has(c)), [requiredCaps, workerCaps]);
-  const hasRequirements = requiredCaps.length > 0 || requiredTools.length > 0 || sizeClass !== "";
+  // Whether to render the readiness panel at all. size_class is DELIBERATELY excluded: the
+  // agent's detectToolchain always emits a non-empty size_class (s/m/l), so including it here
+  // made the panel render for EVERY plan gate. size is advisory-only, so it never justifies the
+  // panel on its own — it is shown as a minor detail INSIDE the panel when a capability or tool
+  // already opened it, and simply not shown when nothing else was inferred. A block is a subset
+  // of requiredCaps, so "a capability, a tool, or a block" reduces to caps-or-tools here.
+  const hasRequirements = requiredCaps.length > 0 || requiredTools.length > 0;
 
   // The rounds counter is always shown at the head; MAX is the display default (the
   // server owns the real cap).
@@ -1438,10 +1444,11 @@ export function PlanPanel({
 
         {/* PRD #84 M4 4d: the pre-run readiness summary — the run's inferred/hinted
             requirements checked against the assigned worker, shown between the candidate
-            milestones and the plan body. Renders NOTHING when nothing was inferred (all
-            three empty). Capability/tool names are a server-Filter-ed vocabulary, but rendered
-            through stripUnsafeChars anyway (defense-in-depth, matching the candidate
-            milestones above) — this is an approval dialog. */}
+            milestones and the plan body. Renders NOTHING when no CAPABILITY or TOOL was
+            inferred — size_class alone (always emitted) does not open it (see hasRequirements).
+            Capability/tool names are a server-Filter-ed vocabulary, but rendered through
+            stripUnsafeChars anyway (defense-in-depth, matching the candidate milestones above) —
+            this is an approval dialog. */}
         {hasRequirements && (
           <div className="rounded-lg border border-edge bg-surface/60 p-3">
             <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-faint">Run requirements</p>

@@ -131,9 +131,10 @@ func TestSubmitApproveNoRequirementsNeverGated(t *testing.T) {
 	}
 }
 
-// The override path: OverrideRunRequiredCapabilities clears the run's required set (the
-// handler runs it BEFORE SubmitInput), so the subsequent approve on the same run is no
-// longer blocked. Asserts both the clear call and the success.
+// The override PRIMITIVES compose: OverrideRunRequiredCapabilities clears the run's required
+// set, so a subsequent approve on the same run is no longer blocked. (The handler no longer
+// calls these two in sequence — it uses SubmitInputWithCapabilityOverride, which does the
+// clear atomically; see TestOverrideApproveSucceedsAndClears. This still pins the primitives.)
 func TestOverrideClearsThenApproveSucceeds(t *testing.T) {
 	fs, svc, user, runID := gatedRun(t)
 	svc.capabilitySettings = fakeCapabilitySettings{on: true}
@@ -164,6 +165,60 @@ func TestOverrideClearsThenApproveSucceeds(t *testing.T) {
 	}
 	if fs.createdApproval == nil {
 		t.Fatal("approve_plan must be enqueued after the override cleared the requirement")
+	}
+}
+
+// The happy override path through the real entry point: a VALID selection on an unmet run
+// BYPASSES the gate, enqueues the approve, AND clears the requirement — atomically, only after
+// the enqueue succeeds.
+func TestOverrideApproveSucceedsAndClears(t *testing.T) {
+	fs, svc, user, runID := gatedRun(t)
+	svc.capabilitySettings = fakeCapabilitySettings{on: true}
+	fs.runByID.RequiredCapabilities = []string{"docker"}
+	fs.clearCapsRows = 1
+
+	if _, err := svc.SubmitInputWithCapabilityOverride(context.Background(), user, runID, "approve_plan", "", approveSel()); err != nil {
+		t.Fatalf("override approve on an unmet run must succeed (gate bypassed): %v", err)
+	}
+	if fs.createdApproval == nil {
+		t.Fatal("a successful override approve must enqueue the approve_plan input")
+	}
+	if fs.clearedCaps == nil {
+		t.Fatal("a successful override approve must clear required_capabilities")
+	}
+	if fs.clearedCaps.ID != runID || fs.clearedCaps.UserID != user {
+		t.Fatalf("clear scoped to id=%v user=%v, want id=%v user=%v", fs.clearedCaps.ID, fs.clearedCaps.UserID, runID, user)
+	}
+}
+
+// Review fix (PRD #84 M4 4c): the override is ATOMIC with a successful approve. A FAILED
+// approve (an invalid agent selection) must leave the run's required_capabilities INTACT so a
+// retry stays gated — the clear runs ONLY after the approve validates and enqueues. Before the
+// fix the handler cleared BEFORE SubmitInput, so a failed approve permanently dropped the
+// requirement and the retry was ungated.
+func TestOverrideFailedApproveLeavesRequirementIntact(t *testing.T) {
+	fs, svc, user, runID := gatedRun(t)
+	svc.capabilitySettings = fakeCapabilitySettings{on: true}
+	fs.runByID.RequiredCapabilities = []string{"docker"}
+	fs.clearCapsRows = 1
+
+	// An invalid selection: excluding an agent that is not in the repo roster {coder,reviewer},
+	// which validateSelection rejects with ErrInvalidSelection AFTER the gate would be bypassed.
+	badSel := &AgentSelection{Source: AgentSourceRepo, Exclusions: []string{"no-such-agent"}}
+	_, err := svc.SubmitInputWithCapabilityOverride(context.Background(), user, runID, "approve_plan", "", badSel)
+	if !errors.Is(err, ErrInvalidSelection) {
+		t.Fatalf("an invalid selection must fail with ErrInvalidSelection, got %v", err)
+	}
+	if fs.clearedCaps != nil {
+		t.Fatal("a FAILED override approve must NOT clear required_capabilities (the retry must stay gated)")
+	}
+	if fs.createdApproval != nil {
+		t.Fatal("a failed approve must not enqueue an approve_plan input")
+	}
+	// The requirement is untouched, so a subsequent NON-override approve still blocks — the
+	// direct proof that the failed override left the run gated.
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "approve_plan", "", approveSel()); !errors.Is(err, ErrCapabilityUnmet) {
+		t.Fatalf("after a failed override the run must still be gated, got %v", err)
 	}
 }
 

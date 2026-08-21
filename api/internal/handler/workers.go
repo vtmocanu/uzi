@@ -1231,20 +1231,18 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// PRD #84 M4 4c: the "run without the capability" user override (Decision 12). When the
-	// owner approves WITH override_capabilities, clear the run's inferred/hinted
-	// required_capabilities FIRST, so the capability approval gate in submitApproval reloads
-	// an empty required set and does not 409-block. Owner- and awaiting_approval-scoped in
-	// SQL, so it is a no-op for a non-owner or a run outside the plan gate; the SubmitInput
-	// below then resolves ownership/status authoritatively. Only meaningful with approve_plan.
-	if req.Kind == "approve_plan" && req.OverrideCapabilities {
-		if err := h.wsvc.OverrideRunRequiredCapabilities(r.Context(), user.ID, id); err != nil {
-			slog.Error("override run required capabilities", "run_id", id, "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
-		}
+	// owner approves WITH override_capabilities, the override entry point BYPASSES the
+	// capability approval gate and clears the run's inferred/hinted required_capabilities —
+	// but ATOMICALLY with a successful approve: the clear runs only AFTER the approve's own
+	// validation and enqueue succeed, so a failed approve (e.g. an invalid selection) leaves
+	// the requirement INTACT and the retry stays gated. Owner- and awaiting_approval-scoped in
+	// SQL, and inert for any kind other than approve_plan (the gate only runs for approve_plan).
+	var res workersvc.SubmitInputResult
+	if req.OverrideCapabilities {
+		res, err = h.wsvc.SubmitInputWithCapabilityOverride(r.Context(), user.ID, id, req.Kind, req.Body, req.Selection)
+	} else {
+		res, err = h.wsvc.SubmitInput(r.Context(), user.ID, id, req.Kind, req.Body, req.Selection)
 	}
-
-	res, err := h.wsvc.SubmitInput(r.Context(), user.ID, id, req.Kind, req.Body, req.Selection)
 	if err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRunNotFound):
