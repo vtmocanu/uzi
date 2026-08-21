@@ -536,6 +536,32 @@ func (m tuiModel) boardSummary() string {
 // rateBarWidth is the mini rate-limit meter's fixed cell width.
 const rateBarWidth = 6
 
+// selectedRateMeters applies the #519 board/sidebar selection to the model's own
+// per-token meters, shared by the board strip and the detail rail so the two surfaces
+// cannot disagree on which accounts show OR on showLabel. readable = Limits.Status "ok";
+// showLabel is keyed off the READABLE count (>1), not the shown count, so a readable-but-
+// unlisted token still forces per-token labels; shown = readable filtered by
+// (IsDefault || SecretID in sidebar_token_ids). Empty selection => (nil, false).
+func (m tuiModel) selectedRateMeters() (shown []apitypes.TokenRateLimitDTO, showLabel bool) {
+	readable := make([]apitypes.TokenRateLimitDTO, 0, len(m.rateLimits))
+	for _, t := range m.rateLimits {
+		if t.Limits.Status == "ok" {
+			readable = append(readable, t)
+		}
+	}
+	if len(readable) == 0 {
+		return nil, false
+	}
+	showLabel = len(readable) > 1
+	shown = make([]apitypes.TokenRateLimitDTO, 0, len(readable))
+	for _, t := range readable {
+		if t.IsDefault || slices.Contains(m.sidebarTokenIds, t.SecretID) {
+			shown = append(shown, t)
+		}
+	}
+	return shown, showLabel
+}
+
 // boardRateLimitStrip is the single-line rate-limit meter strip drawn under the wordmark,
 // mirroring the web left-bottom sidebar's token SELECTION (SidebarRateLimits +
 // sidebarTokens.ts):
@@ -554,22 +580,7 @@ const rateBarWidth = 6
 // tone) keeps the legible signal — colour is never the only cue. Clamped to one physical line.
 // The Label is USER-AUTHORED and drawn through renderer.Plain (D7).
 func (m tuiModel) boardRateLimitStrip() string {
-	readable := make([]apitypes.TokenRateLimitDTO, 0, len(m.rateLimits))
-	for _, t := range m.rateLimits {
-		if t.Limits.Status == "ok" {
-			readable = append(readable, t)
-		}
-	}
-	if len(readable) == 0 {
-		return ""
-	}
-	showLabel := len(readable) > 1
-	shown := make([]apitypes.TokenRateLimitDTO, 0, len(readable))
-	for _, t := range readable {
-		if t.IsDefault || slices.Contains(m.sidebarTokenIds, t.SecretID) {
-			shown = append(shown, t)
-		}
-	}
+	shown, showLabel := m.selectedRateMeters()
 	if len(shown) == 0 {
 		return ""
 	}

@@ -13,6 +13,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/colorprofile"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // okMeter builds one readable ("ok") token meter with the given windows.
@@ -223,5 +224,290 @@ func TestBoardRateLimitStripEmptyCases(t *testing.T) {
 	emptyBoard := none.renderBoard()
 	if strings.Contains(emptyBoard, "5h") || strings.Contains(emptyBoard, "7d") {
 		t.Errorf("an empty strip must not draw any window cell into the board:\n%s", emptyBoard)
+	}
+}
+
+// PRD #530 — the run-detail crew rail's stacked per-account rate-limit block (railRateMeters).
+// It reuses the SAME #519 selection seam (selectedRateMeters) as the board strip, so the two
+// surfaces cannot disagree, but stacks each account's 5h/7d windows vertically at rail width
+// under an ACCOUNTS eyebrow, capped to whole entries so joinColumns' bottom-line clamp never
+// leaves a half-drawn account.
+
+// twoMilestones is a small frozen milestone list so renderMilestones is non-empty and the
+// account block sits under it, matching the real rail layout.
+func twoMilestones() []apitypes.Milestone {
+	return []apitypes.Milestone{{ID: "m1", Title: "seam"}, {ID: "m2", Title: "rail block"}}
+}
+
+// railModel seeds a detail model with meters + sidebar selection and a frozen milestone list,
+// then returns it at a comfortable 100x40 so transcriptViewport() is generous. renderLaneRail()
+// takes the no-lanes branch (no frames seeded), so the account block sits directly under the
+// milestone block.
+func railModel(t *testing.T, meters []apitypes.TokenRateLimitDTO, sidebar []string) tuiModel {
+	t.Helper()
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "run-detail")
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m = next.(tuiModel)
+	next, _ = m.Update(rateLimitsMsg{tokens: meters})
+	m = next.(tuiModel)
+	next, _ = m.Update(settingsMsg{settings: apitypes.UserSettingsDTO{SidebarTokenIds: sidebar}})
+	m = next.(tuiModel)
+	next, _ = m.Update(detailLoadedMsg{run: apitypes.RunDTO{
+		ID: "run-detail", Status: "running", Health: "ok", Milestones: twoMilestones(),
+	}})
+	m = next.(tuiModel)
+	return m
+}
+
+// TestRailRateMetersDropsUnreadable — a token with Status != "ok" never appears in the rail
+// block. The unreadable fixture is IsDefault:true (would clear the shown filter), so only the
+// readable filter can drop it. A second readable default keeps the block non-empty.
+func TestRailRateMetersDropsUnreadable(t *testing.T) {
+	m := railModel(t, []apitypes.TokenRateLimitDTO{
+		okMeter("sec-personal", "personal", true, 33, 61),
+		{SecretID: "sec-down", Label: "throttled", IsDefault: true, Limits: apitypes.RateLimitDTO{
+			Status: "unavailable", FiveHour: &apitypes.RateLimitWindow{Pct: 77}}},
+	}, nil)
+	out := stripANSI(m.renderLaneRail())
+	if !strings.Contains(out, "ACCOUNTS") {
+		t.Fatalf("readable account block missing its ACCOUNTS header:\n%s", out)
+	}
+	if !strings.Contains(out, "33%") {
+		t.Errorf("readable default token's 5h pct 33%% missing from the rail:\n%s", out)
+	}
+	if strings.Contains(out, "throttled") {
+		t.Errorf("a token with Status != \"ok\" leaked its label into the rail:\n%s", out)
+	}
+	if strings.Contains(out, "77%") {
+		t.Errorf("a token with Status != \"ok\" leaked its window pct into the rail:\n%s", out)
+	}
+}
+
+// TestRailRateMetersSelection — default AND a listed non-default show; an unlisted non-default
+// does not (the shared #519 shown filter).
+func TestRailRateMetersSelection(t *testing.T) {
+	m := railModel(t, []apitypes.TokenRateLimitDTO{
+		okMeter("sec-personal", "personal", true, 33, 61),
+		okMeter("sec-meta", "metaacct", false, 87, 45),
+		okMeter("sec-unlisted", "unlistedacct", false, 11, 22),
+	}, []string{"sec-meta"})
+	out := stripANSI(m.renderLaneRail())
+	if !strings.Contains(out, "personal") {
+		t.Errorf("the default token is not shown in the rail:\n%s", out)
+	}
+	if !strings.Contains(out, "metaacct") {
+		t.Errorf("a non-default token listed in sidebar_token_ids is not shown in the rail:\n%s", out)
+	}
+	if strings.Contains(out, "unlistedacct") {
+		t.Errorf("a non-default token NOT in sidebar_token_ids leaked into the rail:\n%s", out)
+	}
+}
+
+// TestRailRateMetersLabelKeyedOffReadable — a single readable default shows NO label eyebrow
+// (showLabel false) but still renders the 5h/7d cells and the ACCOUNTS header; two readable
+// tokens force the label even when only the default is shown (showLabel keyed off readable).
+func TestRailRateMetersLabelKeyedOffReadable(t *testing.T) {
+	single := railModel(t, []apitypes.TokenRateLimitDTO{
+		okMeter("sec-personal", "solorail", true, 33, 61),
+	}, nil)
+	singleOut := stripANSI(single.renderLaneRail())
+	if strings.Contains(singleOut, "solorail") {
+		t.Errorf("label rendered for a single readable token (showLabel must be false):\n%s", singleOut)
+	}
+	for _, want := range []string{"ACCOUNTS", "5h", "7d", "33%", "61%"} {
+		if !strings.Contains(singleOut, want) {
+			t.Errorf("single-token rail block missing %q:\n%s", want, singleOut)
+		}
+	}
+
+	multi := railModel(t, []apitypes.TokenRateLimitDTO{
+		okMeter("sec-personal", "labelledrail", true, 33, 61),
+		okMeter("sec-unlisted", "unlistedrail", false, 11, 22),
+	}, nil)
+	multiOut := stripANSI(multi.renderLaneRail())
+	if !strings.Contains(multiOut, "labelledrail") {
+		t.Errorf("label absent when len(readable) > 1 (showLabel keyed off readable):\n%s", multiOut)
+	}
+}
+
+// TestRailRateMetersNilWindow — a nil window renders `label -` via rateWindowCell, mirroring
+// the board strip and windowPct.
+func TestRailRateMetersNilWindow(t *testing.T) {
+	m := railModel(t, []apitypes.TokenRateLimitDTO{
+		{SecretID: "sec-personal", Label: "personal", IsDefault: true, Limits: apitypes.RateLimitDTO{
+			Status: "ok", FiveHour: &apitypes.RateLimitWindow{Pct: 50}, SevenDay: nil}},
+	}, nil)
+	out := stripANSI(m.renderLaneRail())
+	if !strings.Contains(out, "7d -") {
+		t.Errorf("a nil 7d window must render `7d -` in the rail (mirroring windowPct):\n%s", out)
+	}
+}
+
+// TestRailRateMetersAsciiSignalSurvives — under an Ascii (NO_COLOR) profile the always-present
+// NN% text and the ▰/▱ bar glyphs survive in the DETAIL block, so the signal is legible when
+// tone colour is gone. Mirrors TestBoardRateLimitStripAsciiSignalSurvives.
+func TestRailRateMetersAsciiSignalSurvives(t *testing.T) {
+	m := railModel(t, []apitypes.TokenRateLimitDTO{
+		okMeter("sec-personal", "personal", true, 88, 20),
+	}, nil)
+	next, _ := m.Update(tea.ColorProfileMsg{Profile: colorprofile.Ascii})
+	m = next.(tuiModel)
+	rail := m.renderLaneRail()
+	for _, want := range []string{"88%", "20%", "▰", "▱"} {
+		if !strings.Contains(rail, want) {
+			t.Errorf("Ascii-profile rail dropped the always-present cue %q:\n%q", want, rail)
+		}
+	}
+}
+
+// TestRailRateMetersEmptyCases — an empty selection renders NO account block AND no stray blank
+// line at the rail's tail.
+func TestRailRateMetersEmptyCases(t *testing.T) {
+	assertNoBlock := func(t *testing.T, label string, m tuiModel) {
+		t.Helper()
+		if s := m.railRateMeters(3); s != "" {
+			t.Errorf("%s: railRateMeters must be empty, got %q", label, s)
+		}
+		out := m.renderLaneRail()
+		if strings.Contains(out, "ACCOUNTS") || strings.Contains(out, "5h") || strings.Contains(out, "7d") {
+			t.Errorf("%s: rail drew an account block for an empty selection:\n%s", label, out)
+		}
+		if strings.HasSuffix(out, "\n") {
+			t.Errorf("%s: rail has a stray trailing newline with no account block:\n%q", label, out)
+		}
+	}
+	// (a) no tokens at all.
+	assertNoBlock(t, "no tokens", railModel(t, nil, nil))
+	// (b) all tokens unreadable.
+	assertNoBlock(t, "all unreadable", railModel(t, []apitypes.TokenRateLimitDTO{
+		{SecretID: "a", Label: "a", Limits: apitypes.RateLimitDTO{Status: "unavailable"}},
+		{SecretID: "b", Label: "b", IsDefault: true, Limits: apitypes.RateLimitDTO{Status: "no_token"}},
+	}, nil))
+	// (c) readable but nothing shown (a single non-default token not in the sidebar).
+	assertNoBlock(t, "readable but hidden", railModel(t, []apitypes.TokenRateLimitDTO{
+		okMeter("sec-x", "hiddenlabel", false, 40, 40),
+	}, nil))
+}
+
+// countWindows returns how many 5h and 7d window cells the rendered rail block carries. Every
+// whole account entry contributes exactly one of each, so a mismatch means a half-drawn entry.
+func countWindows(out string) (fiveH, sevenD int) {
+	return strings.Count(out, "5h "), strings.Count(out, "7d ")
+}
+
+// TestRailRateMetersTruncatesAtWholeEntry — an over-full rail drops WHOLE account entries, never
+// half of one. Seeded with several accounts and a small height so only some entries fit, the rail
+// must (a) show strictly fewer accounts than seeded, yet (b) keep every visible account complete:
+// its 5h cell count equals its 7d cell count equals its label-eyebrow count.
+func TestRailRateMetersTruncatesAtWholeEntry(t *testing.T) {
+	// One default + four sidebar-listed non-defaults: all readable, all shown, showLabel true.
+	meters := []apitypes.TokenRateLimitDTO{
+		okMeter("sec-0", "acctzero", true, 10, 11),
+		okMeter("sec-1", "acctone", false, 20, 21),
+		okMeter("sec-2", "accttwo", false, 30, 31),
+		okMeter("sec-3", "acctthree", false, 40, 41),
+		okMeter("sec-4", "acctfour", false, 50, 51),
+	}
+	sidebar := []string{"sec-1", "sec-2", "sec-3", "sec-4"}
+
+	full := railModel(t, meters, sidebar)
+	fullOut := stripANSI(full.renderLaneRail())
+	full5h, full7d := countWindows(fullOut)
+	if full5h != len(meters) || full7d != len(meters) {
+		t.Fatalf("at full height all %d accounts must show, got 5h=%d 7d=%d:\n%s", len(meters), full5h, full7d, fullOut)
+	}
+
+	// Shrink the terminal so the viewport leaves room for only some whole entries. The exact
+	// cutoff depends on chrome; sweep a band of small heights and require at least one that
+	// truncates, and the whole-entry invariant on EVERY height.
+	truncatedSeen := false
+	for h := 14; h <= 26; h++ {
+		next, _ := full.Update(tea.WindowSizeMsg{Width: 100, Height: h})
+		m := next.(tuiModel)
+		out := stripANSI(m.renderLaneRail())
+		five, seven := countWindows(out)
+		if five != seven {
+			t.Fatalf("height %d left a half-drawn entry: 5h=%d != 7d=%d:\n%s", h, five, seven, out)
+		}
+		// When the block renders, its label-eyebrow count must equal its window count too, and it
+		// must carry exactly one ACCOUNTS header.
+		if seven > 0 {
+			labels := 0
+			for _, want := range []string{"acctzero", "acctone", "accttwo", "acctthree", "acctfour"} {
+				if strings.Contains(out, want) {
+					labels++
+				}
+			}
+			if labels != seven {
+				t.Fatalf("height %d: %d label eyebrows for %d 7d cells (half-entry):\n%s", h, labels, seven, out)
+			}
+			if n := strings.Count(out, "ACCOUNTS"); n != 1 {
+				t.Fatalf("height %d: expected exactly one ACCOUNTS header, got %d:\n%s", h, n, out)
+			}
+		}
+		if seven > 0 && seven < len(meters) {
+			truncatedSeen = true
+		}
+	}
+	if !truncatedSeen {
+		t.Errorf("no small height truncated the block to a strict subset of whole entries; the cap never fired")
+	}
+}
+
+// TestRailRateMetersSanitizesLabel — an account Label carrying control/bidi bytes is scrubbed by
+// renderer.Plain (D7) before it reaches the rail, exactly as the board strip and lane rows do.
+func TestRailRateMetersSanitizesLabel(t *testing.T) {
+	// A second readable token forces showLabel so the eyebrow renders; the hostile label carries a
+	// bidi override, an ESC-based SGR and a carriage return, all written as Go escapes (never raw).
+	hostile := "acct\u202ehostile\x1b[31m\rmeta"
+	m := railModel(t, []apitypes.TokenRateLimitDTO{
+		okMeter("sec-personal", "benign", true, 33, 61),
+		okMeter("sec-evil", hostile, false, 44, 55),
+	}, []string{"sec-evil"})
+	rail := m.renderLaneRail()
+	for _, bad := range []string{"\u202e", "\x1b[31m", "\r"} {
+		if strings.Contains(rail, bad) {
+			t.Errorf("hostile label byte %q survived into the rail block; Plain (D7) did not scrub it:\n%q", bad, rail)
+		}
+	}
+}
+
+// TestSelectedRateMetersSharedByBoardAndRail — the anti-drift guarantee: selectedRateMeters()
+// returns the SAME shown set and showLabel the board strip derives, from one shared fixture. The
+// board strip and the rail block both consume this method, so they cannot disagree on selection.
+func TestSelectedRateMetersSharedByBoardAndRail(t *testing.T) {
+	meters := []apitypes.TokenRateLimitDTO{
+		okMeter("sec-personal", "personal", true, 33, 61),
+		okMeter("sec-meta", "metaacct", false, 87, 45),
+		okMeter("sec-unlisted", "unlistedacct", false, 11, 22),
+		{SecretID: "sec-down", Label: "down", IsDefault: true, Limits: apitypes.RateLimitDTO{Status: "no_token"}},
+	}
+	sidebar := []string{"sec-meta"}
+	m := stripModel(t, meters, sidebar)
+
+	shown, showLabel := m.selectedRateMeters()
+	if !showLabel {
+		t.Errorf("showLabel must be true (two readable tokens), got false")
+	}
+	gotIDs := make([]string, 0, len(shown))
+	for _, t := range shown {
+		gotIDs = append(gotIDs, t.SecretID)
+	}
+	wantIDs := []string{"sec-personal", "sec-meta"}
+	if strings.Join(gotIDs, ",") != strings.Join(wantIDs, ",") {
+		t.Errorf("selectedRateMeters shown set = %v, want %v", gotIDs, wantIDs)
+	}
+	// The board strip renders exactly this selection: both shown labels present, the unlisted and
+	// the unreadable absent — proving the board consumes the same seam.
+	board := stripANSI(m.boardRateLimitStrip())
+	for _, want := range []string{"personal", "metaacct"} {
+		if !strings.Contains(board, want) {
+			t.Errorf("board strip missing shown token %q; it diverged from selectedRateMeters:\n%s", want, board)
+		}
+	}
+	for _, bad := range []string{"unlistedacct", "down"} {
+		if strings.Contains(board, bad) {
+			t.Errorf("board strip drew %q, which selectedRateMeters excluded:\n%s", bad, board)
+		}
 	}
 }
