@@ -1,0 +1,14 @@
+# Accepted dev-team/product role-parity divergences (issue #63).
+#
+# The role-parity NUDGE (`task nudge:roles`, api/cmd/roleparity) compares this
+# repo's dev-team roster (.claude/agents/*.md) against the product builtin roster
+# (api/internal/agenttmpl/builtins/*.md). A role on one side and absent from the
+# other is a divergence worth NOTICING — a nudge, never a gate. Roles listed here
+# are known-and-accepted divergences the nudge stays quiet about.
+#
+# Tab-separated, three columns: side<TAB>role<TAB>reason
+#   side   = product-only | devteam-only  (which roster the role is in)
+#   role   = the role identity (the .md filename stem)
+#   reason = why this divergence is accepted (documentation for humans)
+product-only	lead	orchestrator; product-only by design (never on the dev team)
+devteam-only	release	release runbook is a dev-machine-only role
