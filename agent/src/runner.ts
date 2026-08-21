@@ -791,6 +791,10 @@ export class RunRunner {
         // PRD #501 REC B: thread the autopilot flag to plan-build time so the plan
         // builders render the no-human-in-the-loop note. Absent ⇒ false.
         autoApprove: claim.auto_approve ?? false,
+        // PRD #517 M3: an interactive task run parks at awaiting_followup on signal_done
+        // instead of finalizing (see the awaitFollowUp callback below). Absent ⇒ false, so
+        // every non-interactive run (and every older server) is byte-identical to today.
+        interactive: claim.interactive ?? false,
         // The seed resolved this in the bare; forwarding it is what stops the lead from
         // guessing the branch's parent (judge rec, run 51757591).
         baseCommit: runnerClone.baseCommit,
@@ -891,6 +895,34 @@ export class RunRunner {
             claim.config ?? null,
           ),
         pullFollowUp: () => steering.pullFollowUp(),
+        // PRD #517 M3: the interactive-task follow-up park. The executor calls this after a
+        // clean signal_done on an interactive run (it has already checkpoint-pushed): report
+        // awaiting_followup, verify the park took, then BLOCK on the steering channel until
+        // the next follow-up (or an idle/cancel end).
+        //
+        // CONSUME-BEFORE-REPORT ORDERING (the server's SetRunRunning wake guard): the report
+        // of `running` that un-parks the run is the loop's NEXT reportIteration, which the
+        // executor only reaches AFTER this resolves with a follow-up. steering.awaitFollowUp
+        // resolves that follow-up ONLY from the poll loop's post-route service step, i.e.
+        // after ConsumeRunInputs stamped consumed_at — so a consumed follow_up input always
+        // exists before `running` is reported, and the server admits the wake. This mirrors
+        // askUser's settle discipline; the ordering is satisfied by construction here.
+        awaitFollowUp: async (idleMs) => {
+          // Read the ACK the same way askUser and the limit park do: the park TOOK only if
+          // the server reports `awaiting_followup`. SetRunAwaitingFollowup (M2) matches
+          // nothing when the run went terminal under us or is no longer ours (or is not an
+          // interactive task) — without this check the worker would block on a follow-up no
+          // surface can produce, since the status never changed. Fail loudly instead.
+          const ack = await reportState({ status: "awaiting_followup" });
+          const parked = (ack as { status?: string } | undefined)?.status;
+          if (parked !== "awaiting_followup") {
+            throw new Error(
+              `${REASON_FOLLOWUP_NOT_PARKED} (server reports ${parked ?? "an unreadable status"})`,
+            );
+          }
+          runLog.info("interactive task: awaiting follow-up", { run_id: runId });
+          return steering.awaitFollowUp(idleMs);
+        },
         // PRD #122 M2: carry the lead's live progress into the `running` report and return
         // the server-computed effective budget from the ack. Async (unlike M4's fire-and-
         // forget void) so the loop can apply the budget — but still fire-and-forget in
@@ -2611,6 +2643,14 @@ export const REASON_QUESTION_TIMEOUT = "clarification timed out";
  *  saw a question to answer. */
 export const REASON_QUESTION_NOT_PARKED =
   "could not park the run to ask a question";
+
+/** The server declined the interactive-task follow-up park (PRD #517 M3). Mirrors
+ *  REASON_QUESTION_NOT_PARKED: the run went terminal or changed hands mid-turn, or the
+ *  run is not an interactive task, so the awaiting_followup transition matched nothing and
+ *  no surface can produce a follow-up. Fail loudly rather than block on a park that never
+ *  took. */
+export const REASON_FOLLOWUP_NOT_PARKED =
+  "could not park the interactive task to await a follow-up";
 
 /** The effective answer deadline: the server-configured claim value when it is
  *  present and positive, else the worker default. An older server omits it (R8). */

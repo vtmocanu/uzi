@@ -26,7 +26,7 @@ import { RUN_ID_RE } from "./util.js";
  *    run whose HOME is genuinely garbage, but "probably" is not the standard
  *    here, and the cost of being wrong is asymmetric;
  *  - any non-terminal status (`queued`, `claimed`, `running`, `awaiting_approval`,
- *    `awaiting_input`) → the run may still resume into this HOME, skip.
+ *    `awaiting_input`, `awaiting_followup`) → the run may still resume into this HOME, skip.
  *
  * A requeued run reads `queued`, and a run live on ANOTHER worker sharing the
  * volume reads `running` — both non-terminal, both skipped.
@@ -58,19 +58,21 @@ import { RUN_ID_RE } from "./util.js";
  * Run statuses a run never leaves. A run in one of these will never resume, so its
  * HOME cannot be wanted again.
  *
- * The `runs.status` CHECK now holds NINE values — queued / claimed / running /
- * awaiting_approval / limit_wait / awaiting_input / completed / failed / cancelled —
- * after PRD #35 widened migration `00020`'s original seven with `limit_wait` and
- * PRD #88 added `awaiting_input`.
+ * The `runs.status` CHECK now holds TEN values — queued / claimed / running /
+ * awaiting_approval / limit_wait / awaiting_input / awaiting_followup / completed /
+ * failed / cancelled — after PRD #35 widened migration `00020`'s original seven with
+ * `limit_wait`, PRD #88 added `awaiting_input`, and PRD #517 added `awaiting_followup`
+ * (an interactive task parked between turns for the next follow-up).
  *
- * 🔴 NEITHER `limit_wait` NOR `awaiting_input` IS TERMINAL, AND NEITHER MAY EVER BE
- * ADDED TO THIS SET. Read the DEFAULT_RECLAIM_MIN_AGE_MS comment below before
- * touching it: a parked run's HOME is past `minAgeMs` for essentially its whole park
- * (the age filter is 3h, a limit park runs to RUN_LIMIT_MAX_PARK, default 8d, and a
- * clarification park waits on a human for up to QUESTION_TIMEOUT, default 24h), so it
- * becomes a candidate on EVERY sweep and survives only because the API answers a
- * non-terminal status and that status is absent here. Adding either deletes the
- * ~170 MB SDK transcript the entire resume depends on.
+ * 🔴 NONE OF `limit_wait`, `awaiting_input` NOR `awaiting_followup` IS TERMINAL, AND
+ * NONE MAY EVER BE ADDED TO THIS SET. Read the DEFAULT_RECLAIM_MIN_AGE_MS comment below
+ * before touching it: a parked run's HOME is past `minAgeMs` for essentially its whole
+ * park (the age filter is 3h, a limit park runs to RUN_LIMIT_MAX_PARK, default 8d, a
+ * clarification park waits on a human for up to QUESTION_TIMEOUT, default 24h, and an
+ * interactive follow-up park can wait indefinitely between turns), so it becomes a
+ * candidate on EVERY sweep and survives only because the API answers a non-terminal
+ * status and that status is absent here. Adding any deletes the ~170 MB SDK transcript
+ * the entire resume depends on.
  *
  * This is the SECOND of two independent protections for a parked HOME. The first is
  * the runner's cleanup carve-out, which skips the teardown deletion; this one skips

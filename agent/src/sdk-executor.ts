@@ -152,6 +152,15 @@ const REASON_MAX_ITERATIONS =
 // the run.
 const PROGRESS_MISS_LIMIT = 2;
 
+// PRD #517 M3: the idle bound for an INTERACTIVE task's follow-up park — how long the run
+// waits at awaiting_followup for the next follow-up before the park ENDS and the run
+// finalizes. A sensible constant for now; M5 wires it to the server-configured
+// WORKER_TASK_IDLE_TIMEOUT (delivered on the claim, like the other per-run caps) plus a
+// server-side backstop. Kept generous so an interactive session survives a human thinking
+// between turns, but bounded so an abandoned interactive run does not pin a worker slot
+// forever.
+const TASK_FOLLOWUP_IDLE_MS = 30 * 60_000; // 30m
+
 /**
  * Injectable seam over the SDK's `query`. The return only needs to be async
  * iterable for the executor; cancellation goes through `options.abortController`
@@ -1465,7 +1474,42 @@ export class SdkExecutor implements Executor {
               : undefined;
           continue;
         }
-        if (turn.done) break;
+        if (turn.done) {
+          // PRD #517 M3: an INTERACTIVE task run does NOT finalize on a clean signal_done —
+          // it checkpoint-pushes its branch, PARKS at awaiting_followup, and resumes the SAME
+          // session on the next follow-up. Guarded on ctx.interactive AND a wired
+          // awaitFollowUp, so a non-interactive run (and any executor that did not wire the
+          // callback) breaks to the normal finalize below, byte-identical to today.
+          if (ctx.interactive && ctx.awaitFollowUp) {
+            // Checkpoint-push at every park (Decision 4): the deliverable is commits the user
+            // pulls, so make the turn's work durable on origin before blocking. reap:true —
+            // the same reap-before-git ordering the done path uses; the session transcript
+            // survives on disk, so the next turn resumes it.
+            await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+            // Park OUTSIDE driveTurn (the idle watchdog lives inside driveTurn, so a parked
+            // run cannot trip REASON_IDLE — the same property the ask_user park relies on).
+            const outcome = await ctx.awaitFollowUp(TASK_FOLLOWUP_IDLE_MS);
+            if (outcome.kind === "followup") {
+              // Fold the follow-up into the next turn EXACTLY as a mid-run follow-up is
+              // (buildImplementPrompt renders `followUp` as UNTRUSTED user input); the
+              // resumed session keeps full context, so nothing is replayed.
+              followUp = outcome.body;
+              // RESET the iteration budget: each follow-up gets a fresh maxIterations. An
+              // interactive run spans many follow-ups over its lifetime and must NOT fail with
+              // REASON_MAX_ITERATIONS after N turns SUMMED across them — the budget bounds one
+              // task, not the whole conversation. `continue` re-enters the loop, which does
+              // iteration++ (→ 1) and reportIteration (→ running); that report passes the
+              // server's wake guard because the follow-up was already consumed by the poll
+              // loop before awaitFollowUp resolved (consume-before-report).
+              iteration = 0;
+              continue;
+            }
+            // outcome.kind === "ended" (idle in M3; stopped/cancelled reuse the same exit):
+            // fall through to the normal finalize below, exactly as a non-interactive done.
+            // M5 refines the idle value + adds a server backstop; M4 refines stop handling.
+          }
+          break;
+        }
         if (iteration >= maxIterations) throw new Error(REASON_MAX_ITERATIONS);
 
         // PRD #122 M6 (Decision 10b): iteration-boundary fallback checkpoint. Only reached

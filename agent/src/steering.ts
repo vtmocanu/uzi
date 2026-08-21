@@ -30,6 +30,7 @@
 // pre-feedback plan.
 
 import type { WorkerClient } from "./client.js";
+import type { FollowUpOutcome } from "./executor.js";
 import type { Logger } from "./log.js";
 import { parseAgentSelection, type AgentSelectionParse } from "./protocol.js";
 import { errMessage, sleep } from "./util.js";
@@ -58,6 +59,9 @@ export interface SteeringOptions {
    *  by the runner (wired to the batcher) so the channel never reaches into runner
    *  internals; optional so tests can omit it. */
   notify?: (text: string) => void;
+  /** PRD #517 M3: injectable clock so the interactive follow-up park's idle window is
+   *  provable without real time (mirrors ChatSteeringOptions.now). Default Date.now. */
+  now?: () => number;
 }
 
 /** Feed notices for events discarded because they were written against a plan version
@@ -139,8 +143,18 @@ export class SteeringChannel {
   /** The answer waiter parked on awaitAnswer, with the question id it is waiting for. */
   private answerWaiter:
     { questionId: string; resolve: (v: AnswerVerdict) => void } | undefined;
+  /** PRD #517 M3: the interactive-task follow-up park waiter (single outstanding), with
+   *  the idle bound and the clock reading it armed at. A DISTINCT slot from gateWaiter /
+   *  answerWaiter for the same reason those are distinct (one shared slot would have two
+   *  owners): an interactive task parks HERE between turns, never at the plan gate or an
+   *  ask_user question, so the three are mutually exclusive and each owns its own slot. */
+  private followUpWaiter:
+    | { resolve: (o: FollowUpOutcome) => void; idleMs: number; parkedAt: number }
+    | undefined;
   private readonly sleepFn: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly notify: ((text: string) => void) | undefined;
+  /** PRD #517 M3: clock the follow-up park's idle window measures against. */
+  private readonly now: () => number;
 
   constructor(
     private readonly client: WorkerClient,
@@ -153,6 +167,7 @@ export class SteeringChannel {
   ) {
     this.sleepFn = opts.sleep ?? sleep;
     this.notify = opts.notify;
+    this.now = opts.now ?? Date.now;
   }
 
   /** Start the poll loop (idempotent). Runs until stop(). */
@@ -271,6 +286,77 @@ export class SteeringChannel {
     return this.followUps.shift();
   }
 
+  /**
+   * Park until the next follow-up for an INTERACTIVE task run (PRD #517 M3), or until the
+   * park ENDS: idle after `idleMs` with no follow-up, or a cancel. Modeled on
+   * ChatSteering.awaitFollowUp + serviceWaiter (route-then-service, drain-after-arm, single
+   * outstanding park, channel-owned idle clock) — NOT on pullFollowUp. The waiter resolves
+   * ONLY from serviceFollowUp, called by pollLoop AFTER a batch routes, so a follow-up
+   * delivered here has already been consumed server-side (ConsumeRunInputs stamped
+   * consumed_at in the same RETURNING that handed it over). That is exactly the ordering the
+   * server's SetRunRunning wake guard requires before the loop reports `running` — obtaining
+   * the follow-up through this path satisfies consume-before-report by construction.
+   *
+   * DRAIN-AFTER-ARM: a follow-up already buffered when this is called (it arrived in the
+   * window between the executor deciding to break and arming the waiter) is returned
+   * immediately, so a follow-up that races the park boundary is never lost — the drop-on-idle
+   * race.
+   *
+   * Single outstanding park only: the executor parks exactly once per `signal_done`, and an
+   * interactive park is mutually exclusive with the plan gate / an ask_user question. A
+   * double-arm is a programming error, not a runtime condition — throw rather than silently
+   * clobber the earlier waiter.
+   */
+  awaitFollowUp(idleMs: number): Promise<FollowUpOutcome> {
+    if (this.followUpWaiter)
+      throw new Error("steering: awaitFollowUp is already parked (double-arm)");
+    // Cancel is sticky and always wins immediately, exactly as it does for the plan gate
+    // and the answer waiter.
+    if (this.cancelled)
+      return Promise.resolve<FollowUpOutcome>({
+        kind: "ended",
+        reason: "cancelled",
+      });
+    // SEAM (M4): a `stop` input, once wired, resolves { kind:"ended", reason:"stopped" } and
+    // is serviced AHEAD of a buffered follow-up (an explicit stop wins over a queued turn).
+    // Its check belongs HERE — before the drain below — and in serviceFollowUp.
+    if (this.followUps.length)
+      return Promise.resolve<FollowUpOutcome>({
+        kind: "followup",
+        body: this.followUps.shift()!,
+      });
+    return new Promise<FollowUpOutcome>((resolve) => {
+      this.followUpWaiter = { resolve, idleMs, parkedAt: this.now() };
+    });
+  }
+
+  /** After routing an input batch, deliver to a parked follow-up waiter if one is now due
+   *  (PRD #517 M3). Precedence: a cancel ends it (`cancelled`); [SEAM M4: a pending `stop`
+   *  input ends it with reason "stopped" AHEAD of the follow-up drain below]; then a buffered
+   *  follow-up; then idle once `idleMs` has elapsed since it armed. Same route-THEN-service
+   *  discipline as serviceGate / serviceAnswer / ChatSteering.serviceWaiter — resolving from
+   *  here (post-route) is what guarantees a delivered follow-up was already consumed. */
+  private serviceFollowUp(): void {
+    const w = this.followUpWaiter;
+    if (!w) return;
+    if (this.cancelled) {
+      this.followUpWaiter = undefined;
+      w.resolve({ kind: "ended", reason: "cancelled" });
+      return;
+    }
+    // SEAM (M4): resolve { kind:"ended", reason:"stopped" } here — BEFORE the follow-up
+    // drain — when a `stop` input is pending, so an explicit stop wins over a queued turn.
+    if (this.followUps.length) {
+      this.followUpWaiter = undefined;
+      w.resolve({ kind: "followup", body: this.followUps.shift()! });
+      return;
+    }
+    if (this.now() - w.parkedAt >= w.idleMs) {
+      this.followUpWaiter = undefined;
+      w.resolve({ kind: "ended", reason: "idle" });
+    }
+  }
+
   /** Consume the next actionable gate event for `epoch`, applying the precedence rule
    *  and discarding stale events (with a feed notice) as a side effect. Returns the
    *  verdict to deliver, or undefined when nothing is (yet) actionable. */
@@ -385,6 +471,11 @@ export class SteeringChannel {
         // Same batch-then-service-once position, for the same reason (PRD #88): an
         // answer that lands in this batch may satisfy a parked question.
         this.serviceAnswer();
+        // PRD #517 M3: same position, same reason — a follow-up that lands in this batch may
+        // satisfy a parked interactive-task waiter, and servicing it HERE (post-route) is
+        // what makes the delivered follow-up already-consumed (the wake-guard ordering). Also
+        // re-evaluated every idle tick so a park with no follow-up ends on its idle bound.
+        this.serviceFollowUp();
       } catch (err) {
         this.log.warn("steering: input poll failed", {
           run_id: this.runId,
