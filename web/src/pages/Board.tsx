@@ -1233,7 +1233,7 @@ export function Board() {
                 issueWebUrl={r.issue_web_url}
                 kind={r.kind}
                 forgeType={r.forge_type}
-                className="relative z-10"
+                raised
               />{" "}
               →
             </span>

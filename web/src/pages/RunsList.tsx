@@ -285,7 +285,7 @@ function RunRow({
                 issueWebUrl={run.issue_web_url}
                 kind={run.kind}
                 forgeType={run.forge_type}
-                className="relative z-10"
+                raised
               />
             </span>
             {run.worker_name && <span>· {run.worker_name}</span>}

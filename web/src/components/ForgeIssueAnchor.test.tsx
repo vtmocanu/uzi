@@ -5,8 +5,8 @@
 // rel=noreferrer, aria-label/title=label, an ExternalLinkIcon, and `#<iid>` text);
 // when it is not https (http, or null) it renders a plain `#<iid>` span with no
 // anchor at all. An optional onClick fires on click of the anchor.
-import { afterEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, it, expect } from "vitest";
+import { cleanup, render, screen } from "@testing-library/react";
 import { ForgeIssueAnchor } from "./ForgeIssueAnchor";
 
 afterEach(cleanup);
@@ -54,21 +54,5 @@ describe("ForgeIssueAnchor — non-https url (span fallback)", () => {
     const span = screen.getByText("#42");
     expect(span.className).toBe("fallback-cls");
     expect(span.className).not.toContain("anchor-only-cls");
-  });
-});
-
-describe("ForgeIssueAnchor — onClick", () => {
-  // An outer capture-phase preventDefault suppresses jsdom's navigation attempt on the
-  // anchor without touching the onClick handler under test, so the spy reflects only
-  // whether ForgeIssueAnchor wired onClick through.
-  it("invokes onClick when the anchor is clicked", () => {
-    const spy = vi.fn();
-    render(
-      <div onClickCapture={(e) => e.preventDefault()}>
-        <ForgeIssueAnchor webUrl={URL42} iid={42} label={LABEL} onClick={spy} />
-      </div>,
-    );
-    fireEvent.click(screen.getByRole("link"));
-    expect(spy).toHaveBeenCalledTimes(1);
   });
 });

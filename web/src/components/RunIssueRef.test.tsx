@@ -69,3 +69,36 @@ describe("runKindLabel", () => {
     expect(runKindLabel("self_improve")).toBe("self improve");
   });
 });
+
+describe("RunIssueRef — raised scopes z-10 to the interactive anchor only (#485 NB1)", () => {
+  // In a stretched-link card the forge anchor must sit ABOVE the overlay (relative
+  // z-10) so it stays clickable, but the non-interactive branches must stay BELOW it
+  // so a click on their footprint still navigates to the run. `raised` must therefore
+  // lift branch 2 only, never branch 1 (kind chip) or branch 3 (cached-out #iid span).
+  it("branch 2 (https anchor): raised adds relative z-10 to the anchor", () => {
+    render(<RunIssueRef issueIid={26} issueWebUrl={URL26} kind="issue" forgeType="gitlab" raised />);
+    const link = screen.getByRole("link");
+    expect(link.className).toContain("relative");
+    expect(link.className).toContain("z-10");
+  });
+
+  it("branch 1 (kind chip): raised does NOT lift the non-interactive chip", () => {
+    const { container } = render(
+      <RunIssueRef issueIid={null} issueWebUrl={null} kind="task" forgeType="gitlab" raised />,
+    );
+    const chip = container.firstElementChild as HTMLElement;
+    expect(chip.tagName).toBe("SPAN");
+    expect(chip.className).not.toContain("z-10");
+  });
+
+  it("branch 3 (cached-out #iid span): raised does NOT lift the plain span", () => {
+    const { container } = render(
+      <RunIssueRef issueIid={26} issueWebUrl={null} kind="issue" forgeType="gitlab" raised />,
+    );
+    // No anchor in branch 3 (hrefless), so the rendered element is the plain span.
+    expect(container.querySelector("a")).toBeNull();
+    const span = container.firstElementChild as HTMLElement;
+    expect(span.tagName).toBe("SPAN");
+    expect(span.className).not.toContain("z-10");
+  });
+});

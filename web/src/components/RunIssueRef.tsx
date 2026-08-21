@@ -27,14 +27,21 @@ export function RunIssueRef({
   kind,
   forgeType,
   className,
+  raised = false,
 }: {
   issueIid: number | null;
   issueWebUrl: string | null;
   kind: string;
   forgeType: string | null;
   className?: string;
+  // raised lifts ONLY the interactive forge anchor (branch 2) above a stretched-link
+  // card overlay via `relative z-10` (issue #485 NB1). It is deliberately NOT applied
+  // to the kind chip (branch 1) or the cached-out #iid span (branch 3): those are
+  // non-interactive, so they stay below the overlay and a click on them navigates to
+  // the run rather than landing on a dead zone.
+  raised?: boolean;
 }) {
-  // Branch 1: no issue → kind chip.
+  // Branch 1: no issue → kind chip. Never raised (stays below the card overlay).
   if (issueIid == null) {
     return (
       <span
@@ -54,7 +61,7 @@ export function RunIssueRef({
       webUrl={issueWebUrl}
       iid={issueIid}
       label={label}
-      className={`text-faint transition-colors hover:text-brand${
+      className={`text-faint transition-colors hover:text-brand${raised ? " relative z-10" : ""}${
         className ? ` ${className}` : ""
       }`}
       fallbackClassName={className}

@@ -1,4 +1,3 @@
-import type { MouseEvent } from "react";
 import { isHttpsUrl } from "../lib/api";
 import { ExternalLinkIcon } from "./icons";
 
@@ -13,14 +12,12 @@ export function ForgeIssueAnchor({
   label,
   className,
   fallbackClassName,
-  onClick,
 }: {
   webUrl: string | null | undefined;
   iid: number;
   label: string; // used as both aria-label and title on the anchor
   className?: string; // anchor path (https url)
   fallbackClassName?: string; // non-https plain-#iid span path
-  onClick?: (e: MouseEvent) => void;
 }) {
   if (isHttpsUrl(webUrl)) {
     return (
@@ -30,7 +27,6 @@ export function ForgeIssueAnchor({
         rel="noreferrer"
         aria-label={label}
         title={label}
-        onClick={onClick}
         className={`inline-flex items-center gap-0.5${className ? ` ${className}` : ""}`}
       >
         #{iid}
