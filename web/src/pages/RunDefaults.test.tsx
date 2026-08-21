@@ -437,6 +437,19 @@ describe("Run defaults — usage-limit default (PRD #35 M3)", () => {
     expect(limitToggle().checked).toBe(true);
   });
 
+  // Issue #520: the shipped column default is ON, so a field-absent response
+  // (the boolean missing from the user object) must render the toggle CHECKED,
+  // matching the DB default rather than assuming OFF.
+  it("assumes the shipped default-on when wait_on_limit is absent", () => {
+    mockAuth({ ...baseUser, wait_on_limit: undefined as unknown as boolean });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    expect(limitToggle().checked).toBe(true);
+  });
+
   it("enabling calls the API and refreshes the session", async () => {
     mockApi.setWaitOnLimit.mockResolvedValue({ user: { ...baseUser, wait_on_limit: true } });
     render(

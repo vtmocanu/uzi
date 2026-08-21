@@ -8,11 +8,11 @@ audience: user
 
 When a run hits your Anthropic 5-hour or 7-day usage cap partway through, uzi can pause it instead of failing it outright, and pick it back up on its own once the window resets — no re-running by hand.
 
-## Turning it on
+## On by default
 
-Off by default, in two places:
+Every new run waits out a usage limit unless you turn it off, in two places:
 
-- **Settings → Anthropic usage limits** — *"Pause my new runs on a usage limit instead of failing them"* sets the default for every new run, and is the **only** way to opt in an autopilot, CI-fix, or self-improvement run: none of those has a start button of its own.
+- **Settings → Anthropic usage limits** — *"Pause my new runs on a usage limit instead of failing them"* sets the default for every new run, and is the **only** way to change it for an autopilot, CI-fix, or self-improvement run: none of those has a start button of its own.
 - **The run view** — *"Wait out future Anthropic usage limits on this run"* overrides the default for one run, live, for as long as it's still going.
 
 Starting a run by hand stays one click and inherits the Settings default; there's no checkbox at start. The API accepts the flag per run for scripted callers.
@@ -30,6 +30,8 @@ The run's status stays visibly "waiting" the whole time — never "stalled" — 
 ## What happens automatically
 
 Once the window resets, the run resumes on the same worker, in the same session, keeping its branch and its history. If you had already approved its plan before the pause, it goes straight back to work instead of asking you to approve the plan again.
+
+That's the trade: a parked run keeps holding its issue and its worker's disk for as long as it waits, which is the price of never losing work to a mid-run limit.
 
 The pause itself also updates that credential's rate-limit meter right away, so it reads as exhausted for anyone else's claim too — see [Claude rate limits](rate-limits.md) for what that looks like. And the resuming claim goes further: it skips the credential that just paused it even when the meter alone wouldn't have ruled it out, which is what keeps an `auto` worker from immediately picking the very token that just refused it.
 
