@@ -537,12 +537,17 @@ func (m tuiModel) boardSummary() string {
 const rateBarWidth = 6
 
 // boardRateLimitStrip is the single-line rate-limit meter strip drawn under the wordmark,
-// mirroring EXACTLY the web left-bottom sidebar's selection (SidebarRateLimits +
+// mirroring the web left-bottom sidebar's token SELECTION (SidebarRateLimits +
 // sidebarTokens.ts):
 //   - readable = tokens whose Limits.Status == "ok"; nothing readable → no strip.
 //   - showLabel is keyed off readable (len > 1), NOT off the shown subset.
 //   - shown = readable filtered by isShownInSidebar (IsDefault || SecretID ∈ sidebarTokenIds);
 //     nothing shown → no strip.
+//
+// The SELECTION is mirrored, not the web's rendering: when readable > 0 but shown == 0 the web
+// still draws an empty aria container plus a "+N more in Settings" deep-link, whereas this strip
+// returns "" — there is no TUI analog for that Settings affordance. That is a render difference,
+// not a selection one.
 //
 // Each shown token renders its 5h and 7d windows as a faint label + tone-coloured mini bar +
 // NN% text. The NN% text is always present so an Ascii/NO_COLOR terminal (which strips the SGR
@@ -578,7 +583,9 @@ func (m tuiModel) boardRateLimitStrip() string {
 		segs = append(segs, seg)
 	}
 	// A faint leading space aligns the strip under the brand block (the brand line starts " ").
-	strip := " " + strings.Join(segs, "   ")
+	// Tokens are joined with the board's faint dot separator (as boardSummary does) so each
+	// token's two windows group visually; the intra-token 5h↔7d gap stays 3 spaces.
+	strip := " " + strings.Join(segs, m.pal.faint.Render(" · "))
 	return clampVisual(strip, m.width)
 }
 

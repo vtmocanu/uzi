@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/colorprofile"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
@@ -37,10 +39,15 @@ func stripModel(t *testing.T, meters []apitypes.TokenRateLimitDTO, sidebar []str
 }
 
 // TestBoardRateLimitStripDropsUnreadable — a token with Status != "ok" never appears.
+// The unreadable fixture is IsDefault:true, so it WOULD clear the shown (sidebar) filter — only
+// the readable (Status=="ok") filter can drop it. That isolates the readable filter as the cause
+// (deleting `if t.Limits.Status == "ok"` in boardRateLimitStrip makes this test fail red). A
+// second readable default keeps the strip non-empty so the drop is observable against real chrome.
 func TestBoardRateLimitStripDropsUnreadable(t *testing.T) {
 	meters := []apitypes.TokenRateLimitDTO{
 		okMeter("sec-personal", "personal", true, 33, 61),
-		{SecretID: "sec-down", Label: "throttled", Limits: apitypes.RateLimitDTO{Status: "unavailable"}},
+		{SecretID: "sec-down", Label: "throttled", IsDefault: true, Limits: apitypes.RateLimitDTO{
+			Status: "unavailable", FiveHour: &apitypes.RateLimitWindow{Pct: 77}}},
 	}
 	m := stripModel(t, meters, nil)
 	out := m.View().Content
@@ -48,7 +55,10 @@ func TestBoardRateLimitStripDropsUnreadable(t *testing.T) {
 		t.Fatalf("readable default token's 5h pct 33%% missing from board:\n%s", out)
 	}
 	if strings.Contains(out, "throttled") {
-		t.Errorf("a token with Status != \"ok\" leaked into the strip:\n%s", out)
+		t.Errorf("a token with Status != \"ok\" leaked its label into the strip:\n%s", out)
+	}
+	if strings.Contains(out, "77%") {
+		t.Errorf("a token with Status != \"ok\" leaked its window pct into the strip:\n%s", out)
 	}
 }
 
@@ -100,16 +110,28 @@ func TestBoardRateLimitStripLabelKeyedOffReadable(t *testing.T) {
 	}
 }
 
-// TestBoardRateLimitStripTonePct — both windows' server-rounded NN% text renders.
+// TestBoardRateLimitStripTonePct — both windows' server-rounded NN% text renders AND the
+// tone colour is actually painted onto the bar: a danger-band window (Pct 88 ≥ 85) fills with
+// m.pal.alarm, an ok-band window (Pct 20 < 40) with m.pal.sage. Asserting the exact paintSeg
+// fragment (same fg SGR + same ▰ run) fails if rateTone returned the wrong band.
 func TestBoardRateLimitStripTonePct(t *testing.T) {
 	m := stripModel(t, []apitypes.TokenRateLimitDTO{
-		okMeter("sec-personal", "personal", true, 88, 44),
+		okMeter("sec-personal", "personal", true, 88, 20),
 	}, nil)
 	out := m.View().Content
-	for _, want := range []string{"88%", "44%"} {
+	for _, want := range []string{"88%", "20%"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("window pct %q missing from the strip:\n%s", want, out)
 		}
+	}
+	// The danger band's filled run is painted alarm; the ok band's filled run is painted sage.
+	alarmFilled, _ := rateBarParts(88)
+	if frag := paintSeg(m.pal.alarm, nil, false, alarmFilled); !strings.Contains(out, frag) {
+		t.Errorf("danger-band bar (Pct 88) is not painted with m.pal.alarm; want fragment %q in:\n%s", frag, out)
+	}
+	sageFilled, _ := rateBarParts(20)
+	if frag := paintSeg(m.pal.sage, nil, false, sageFilled); !strings.Contains(out, frag) {
+		t.Errorf("ok-band bar (Pct 20) is not painted with m.pal.sage; want fragment %q in:\n%s", frag, out)
 	}
 }
 
@@ -122,6 +144,54 @@ func TestBoardRateLimitStripNilWindow(t *testing.T) {
 	out := m.View().Content
 	if !strings.Contains(out, "7d -") {
 		t.Errorf("a nil 7d window must render `7d -` (mirroring windowPct):\n%s", out)
+	}
+}
+
+// TestBoardRateLimitStripSingleLineAndClamps — the chrome-count correctness depends on the
+// strip being exactly ONE physical line clamped to the terminal width. Pin both at a narrow and
+// a wide width.
+func TestBoardRateLimitStripSingleLineAndClamps(t *testing.T) {
+	m := stripModel(t, []apitypes.TokenRateLimitDTO{
+		okMeter("sec-personal", "personal", true, 88, 44),
+		okMeter("sec-meta", "meta", true, 12, 30),
+	}, nil)
+
+	// Narrow terminal: one physical line, no wider than m.width.
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 40, Height: 20})
+	m = next.(tuiModel)
+	strip := m.boardRateLimitStrip()
+	if strings.Contains(strip, "\n") {
+		t.Errorf("strip must be one physical line at width 40, got a newline:\n%q", strip)
+	}
+	if w := visualWidth(strip); w > m.width {
+		t.Errorf("strip visual width %d exceeds m.width %d:\n%q", w, m.width, strip)
+	}
+
+	// Wide terminal: still one physical line.
+	next, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 20})
+	m = next.(tuiModel)
+	if strip := m.boardRateLimitStrip(); strings.Contains(strip, "\n") {
+		t.Errorf("strip must be one physical line at width 120, got a newline:\n%q", strip)
+	}
+}
+
+// TestBoardRateLimitStripAsciiSignalSurvives — under an Ascii (NO_COLOR) profile the
+// always-present cues (the NN% text and the ▰/▱ bar glyphs) must survive, so the signal is
+// legible when tone colour is gone. NOTE: boardRateLimitStrip emits paintSeg SGR regardless of
+// profile; the colorprofile Writer strips the colour downstream at flush, which is NOT observable
+// in the returned strip / View().Content — so this asserts signal-survival, not SGR removal (the
+// latter is a downstream-writer property this layer cannot see).
+func TestBoardRateLimitStripAsciiSignalSurvives(t *testing.T) {
+	m := stripModel(t, []apitypes.TokenRateLimitDTO{
+		okMeter("sec-personal", "personal", true, 88, 20),
+	}, nil)
+	next, _ := m.Update(tea.ColorProfileMsg{Profile: colorprofile.Ascii})
+	m = next.(tuiModel)
+	strip := m.boardRateLimitStrip()
+	for _, want := range []string{"88%", "20%", "▰", "▱"} {
+		if !strings.Contains(strip, want) {
+			t.Errorf("Ascii-profile strip dropped the always-present cue %q:\n%q", want, strip)
+		}
 	}
 }
 
