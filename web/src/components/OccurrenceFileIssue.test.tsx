@@ -60,6 +60,7 @@ function repoOpt(id: string, path: string): Repo {
     pipeline: null,
     guardrail_blocked: false,
     docker_allowlisted: false,
+    docker_blocked: false,
   };
 }
 

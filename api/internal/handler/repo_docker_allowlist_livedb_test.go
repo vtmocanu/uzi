@@ -138,3 +138,183 @@ func TestListReposDockerAllowlistedLiveDB(t *testing.T) {
 		t.Errorf("repoB docker_allowlisted = true, want false (it is NOT on the allowlist)")
 	}
 }
+
+// TestListReposDockerBlockedLiveDB pins PRD #361 M3's computed, caller-scoped
+// docker_blocked field against a REAL Postgres, through the ListRepos handler. It
+// executes the ListDockerBlockedReposForUser query against the live fn_worker_can_claim
+// (migration 00113) — a green sqlc generate is not evidence the query runs (see
+// .claude/rules/go.md) — and drives the four states the field distinguishes.
+//
+// The eligibility query is OWNER-scoped (it counts the caller's own online workers), and
+// a NON-Docker online worker is eligible for EVERY repo. So the "eligible non-Docker
+// worker exists" state cannot share a fleet with the "zero eligible workers → blocked"
+// state under one owner: the non-Docker worker would make the blocked repo eligible too.
+// The four states are therefore driven across two owner-scoped fleets:
+//
+//   - ownerDocker has ONE online Docker worker (docker_enabled=true). Under it:
+//   - repoBlocked    — queued run, NOT allowlisted → zero eligible workers → docker_blocked TRUE.
+//   - repoAllowlisted — queued run, allowlisted     → the Docker worker is eligible → FALSE.
+//   - repoNoRun      — no queued run, NOT allowlisted → the queued-run predicate fails → FALSE.
+//   - ownerEligible has ONE online NON-Docker worker (docker_enabled=false). Under it:
+//   - repoEligible   — queued run, NOT allowlisted → a non-Docker worker is eligible → FALSE.
+//
+// Each fleet's ListRepos response is len-checked (non-vacuity) before the field checks,
+// so the test cannot pass green on an empty result.
+//
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres.
+func TestListReposDockerBlockedLiveDB(t *testing.T) {
+	ctx := context.Background()
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via ./e2e/run-store-it.sh for live-DB coverage")
+	}
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	q := store.New(pool)
+	box := newHandlerTestBox(t)
+
+	ownerDocker := store.User{ID: uuid.New(), Email: fmt.Sprintf("db-docker-%s@e2e", uuid.NewString()[:8])}
+	ownerEligible := store.User{ID: uuid.New(), Email: fmt.Sprintf("db-elig-%s@e2e", uuid.NewString()[:8])}
+	ownerNoWorker := store.User{ID: uuid.New(), Email: fmt.Sprintf("db-noworker-%s@e2e", uuid.NewString()[:8])}
+	mustExecT(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, ownerDocker.ID, ownerDocker.Email)
+	mustExecT(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, ownerEligible.ID, ownerEligible.Email)
+	mustExecT(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, ownerNoWorker.ID, ownerNoWorker.Email)
+
+	sealed, err := box.Seal([]byte("glpat-dummy-token"))
+	if err != nil {
+		t.Fatalf("seal token: %v", err)
+	}
+	// project ids double as the unique base_url discriminator (forge_connections is
+	// unique on (user_id, forge_type, base_url)); a global counter keeps them distinct
+	// across owners.
+	var projSeq int64
+	seedRepo := func(userID uuid.UUID, path string) uuid.UUID {
+		projSeq++
+		connID, repoID := uuid.New(), uuid.New()
+		baseURL := fmt.Sprintf("https://forgeb%d.example", projSeq)
+		mustExecT(ctx, t, pool,
+			`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+			 VALUES ($1, $2, 'gitlab', $3, $4, $5, $6)`, connID, userID, baseURL, fmt.Sprintf("bot%d", projSeq), projSeq, sealed)
+		mustExecT(ctx, t, pool,
+			`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+			 VALUES ($1, $2, $3, $4, 'https://forge.example/g/db', 'main', true)`, repoID, connID, projSeq, path)
+		return repoID
+	}
+	var tokenSeq byte
+	seedWorker := func(userID uuid.UUID, dockerEnabled bool) {
+		tokenSeq++
+		mustExecT(ctx, t, pool,
+			`INSERT INTO workers (id, user_id, name, token_hash, status, last_heartbeat_at, docker_enabled)
+			 VALUES ($1, $2, $3, $4, 'online', now(), $5)`,
+			uuid.New(), userID, fmt.Sprintf("w%d", tokenSeq), []byte{tokenSeq}, dockerEnabled)
+	}
+	var issueSeq int64
+	seedQueuedRun := func(userID, repoID uuid.UUID) {
+		issueSeq++
+		mustExecT(ctx, t, pool,
+			`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status)
+			 VALUES ($1, $2, $3, $4, 'seed', 'seed', 'queued')`,
+			uuid.New(), userID, repoID, issueSeq)
+	}
+
+	// ── ownerDocker: one online Docker worker; three repos ────────────────────────
+	seedWorker(ownerDocker.ID, true)
+	repoBlocked := seedRepo(ownerDocker.ID, "g/db-blocked")         // not allowlisted, queued run → blocked
+	repoAllowlisted := seedRepo(ownerDocker.ID, "g/db-allowlisted") // allowlisted, queued run → not blocked
+	repoNoRun := seedRepo(ownerDocker.ID, "g/db-norun")             // not allowlisted, NO queued run → not blocked
+	seedQueuedRun(ownerDocker.ID, repoBlocked)
+	seedQueuedRun(ownerDocker.ID, repoAllowlisted)
+	// repoNoRun deliberately gets no queued run.
+
+	// ── ownerEligible: one online NON-Docker worker; one repo ─────────────────────
+	seedWorker(ownerEligible.ID, false)
+	repoEligible := seedRepo(ownerEligible.ID, "g/db-eligible") // not allowlisted, queued run, but eligible worker → not blocked
+	seedQueuedRun(ownerEligible.ID, repoEligible)
+
+	// ── ownerNoWorker: NO online worker at all; one repo with a queued run ─────────
+	// The block is "no worker online", NOT the allowlist, so this must read docker_blocked
+	// FALSE — pinning the query's ≥1-online-worker EXISTS clause (deleting that clause
+	// would flip this to true).
+	repoNoWorker := seedRepo(ownerNoWorker.ID, "g/db-noworker") // not allowlisted, queued run, but zero workers → not blocked
+	seedQueuedRun(ownerNoWorker.ID, repoNoWorker)
+
+	// The allowlist holds only repoAllowlisted.
+	h := &Handler{
+		pool: pool,
+		q:    q,
+		box:  box,
+		cfg:  config.Config{},
+		settings: settings.New(&settingsStore{rows: []store.AppSetting{
+			{Key: settings.KeyDockerRepoAllowlist, Value: repoAllowlisted.String()},
+		}}, time.Minute),
+		svc:  forgesvc.New(q, box, 5*time.Second, nil),
+		wsvc: workersvc.New(q, box, workersvc.Params{}),
+	}
+
+	listFor := func(u store.User) map[string]apitypes.RepoDTO {
+		r := httptest.NewRequest(http.MethodGet, "/api/repos", nil)
+		r = r.WithContext(mw.ContextWithUser(r.Context(), u))
+		rec := httptest.NewRecorder()
+		h.ListRepos(rec, r)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("ListRepos(%s) status = %d, want 200; body=%s", u.Email, rec.Code, rec.Body.String())
+		}
+		var resp struct {
+			Repos []apitypes.RepoDTO `json:"repos"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, rec.Body.String())
+		}
+		byID := map[string]apitypes.RepoDTO{}
+		for _, d := range resp.Repos {
+			byID[d.ID] = d
+		}
+		return byID
+	}
+
+	dockerRepos := listFor(ownerDocker)
+	if len(dockerRepos) != 3 {
+		t.Fatalf("ownerDocker got %d repos, want 3 (repoBlocked+repoAllowlisted+repoNoRun)", len(dockerRepos))
+	}
+	if d, ok := dockerRepos[repoBlocked.String()]; !ok {
+		t.Fatalf("repoBlocked %s missing", repoBlocked)
+	} else if !d.DockerBlocked {
+		t.Errorf("repoBlocked docker_blocked = false, want true (queued run, not allowlisted, only Docker workers)")
+	}
+	if d, ok := dockerRepos[repoAllowlisted.String()]; !ok {
+		t.Fatalf("repoAllowlisted %s missing", repoAllowlisted)
+	} else if d.DockerBlocked {
+		t.Errorf("repoAllowlisted docker_blocked = true, want false (Docker worker is eligible for an allowlisted repo)")
+	}
+	if d, ok := dockerRepos[repoNoRun.String()]; !ok {
+		t.Fatalf("repoNoRun %s missing", repoNoRun)
+	} else if d.DockerBlocked {
+		t.Errorf("repoNoRun docker_blocked = true, want false (no queued run)")
+	}
+
+	eligibleRepos := listFor(ownerEligible)
+	if len(eligibleRepos) != 1 {
+		t.Fatalf("ownerEligible got %d repos, want 1 (repoEligible)", len(eligibleRepos))
+	}
+	if d, ok := eligibleRepos[repoEligible.String()]; !ok {
+		t.Fatalf("repoEligible %s missing", repoEligible)
+	} else if d.DockerBlocked {
+		t.Errorf("repoEligible docker_blocked = true, want false (an eligible non-Docker worker exists)")
+	}
+
+	noWorkerRepos := listFor(ownerNoWorker)
+	if len(noWorkerRepos) != 1 {
+		t.Fatalf("ownerNoWorker got %d repos, want 1 (repoNoWorker)", len(noWorkerRepos))
+	}
+	if d, ok := noWorkerRepos[repoNoWorker.String()]; !ok {
+		t.Fatalf("repoNoWorker %s missing", repoNoWorker)
+	} else if d.DockerBlocked {
+		t.Errorf("repoNoWorker docker_blocked = true, want false (no worker online — the block is no-worker, not the allowlist)")
+	}
+}

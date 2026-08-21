@@ -477,7 +477,10 @@ func TestRepoDTOTags(t *testing.T) {
 		"guardrail_blocked",
 		// PRD #361 M1: the computed, caller-scoped "is this repo on the global Docker-
 		// worker allowlist" bool. Never the list itself.
-		"docker_allowlisted")
+		"docker_allowlisted",
+		// PRD #361 M3: the computed, caller-scoped "is a run on this repo actually
+		// blocked by the Docker-allowlist gap right now" bool, from eligibility directly.
+		"docker_blocked")
 }
 
 func TestGuardrailOverrideDTOTags(t *testing.T) {

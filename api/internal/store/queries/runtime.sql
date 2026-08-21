@@ -2231,6 +2231,38 @@ WHERE w.user_id = @user_id
   AND w.status = 'online'
   AND fn_worker_can_claim(COALESCE(w.docker_enabled, false), @docker_repo_allowlist::uuid[], @repo_id::uuid, @kind::text);
 
+-- name: ListDockerBlockedReposForUser :many
+-- The caller's repo ids that a Docker-allowlist gap is ACTIVELY blocking (PRD #361 M3):
+-- an enabled repo with ≥1 of the caller's QUEUED runs, for which the caller has ≥1 online
+-- worker but ZERO online workers eligible to claim a repo-bearing run on it — i.e. every
+-- online worker is a Docker worker and the repo is not on the docker allowlist. Reuses the
+-- fn_worker_can_claim eligibility notion (migration 00113); for a repo-bearing run the kind
+-- is irrelevant (the judge exemption needs repo_id IS NULL), so eligibility is per repo and
+-- the kind arg is a placeholder. The "≥1 online AND zero eligible" pair already implies the
+-- repo is not allowlisted (an allowlisted repo makes every worker eligible), so no separate
+-- allowlist clause is needed. Requiring ≥1 online worker keeps this distinct from a
+-- no-worker-online block (mirrors the M2 queued reason). Drives the Setup chip's info
+-- escalation, computed from eligibility directly — independent of the sweeper's
+-- health_reason text and health_enabled/threshold gating.
+SELECT r.id
+FROM repos r
+JOIN forge_connections fc ON fc.id = r.connection_id
+WHERE fc.user_id = @user_id
+  AND r.enabled = true
+  AND EXISTS (
+    SELECT 1 FROM runs run
+    WHERE run.repo_id = r.id AND run.user_id = @user_id AND run.status = 'queued'
+  )
+  AND EXISTS (
+    SELECT 1 FROM workers w
+    WHERE w.user_id = @user_id AND w.status = 'online'
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM workers w
+    WHERE w.user_id = @user_id AND w.status = 'online'
+      AND fn_worker_can_claim(COALESCE(w.docker_enabled, false), @docker_repo_allowlist::uuid[], r.id, 'task'::text)
+  );
+
 -- name: CountOnlineWorkersWithFreeSlotForUser :one
 -- How many of a user's ONLINE workers plausibly have room for another run — the
 -- queued-run reason resolver (PRD #216) uses it to tell a SATURATED fleet (every

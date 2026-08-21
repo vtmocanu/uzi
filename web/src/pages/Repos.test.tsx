@@ -65,6 +65,7 @@ function repo(over: Partial<Repo> & Pick<Repo, "id" | "path_with_namespace">): R
     pipeline: null,
     guardrail_blocked: false,
     docker_allowlisted: false,
+    docker_blocked: false,
     ...over,
   };
 }

@@ -2591,6 +2591,64 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 	return items, nil
 }
 
+const listDockerBlockedReposForUser = `-- name: ListDockerBlockedReposForUser :many
+SELECT r.id
+FROM repos r
+JOIN forge_connections fc ON fc.id = r.connection_id
+WHERE fc.user_id = $1
+  AND r.enabled = true
+  AND EXISTS (
+    SELECT 1 FROM runs run
+    WHERE run.repo_id = r.id AND run.user_id = $1 AND run.status = 'queued'
+  )
+  AND EXISTS (
+    SELECT 1 FROM workers w
+    WHERE w.user_id = $1 AND w.status = 'online'
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM workers w
+    WHERE w.user_id = $1 AND w.status = 'online'
+      AND fn_worker_can_claim(COALESCE(w.docker_enabled, false), $2::uuid[], r.id, 'task'::text)
+  )
+`
+
+type ListDockerBlockedReposForUserParams struct {
+	UserID              uuid.UUID   `json:"user_id"`
+	DockerRepoAllowlist []uuid.UUID `json:"docker_repo_allowlist"`
+}
+
+// The caller's repo ids that a Docker-allowlist gap is ACTIVELY blocking (PRD #361 M3):
+// an enabled repo with ≥1 of the caller's QUEUED runs, for which the caller has ≥1 online
+// worker but ZERO online workers eligible to claim a repo-bearing run on it — i.e. every
+// online worker is a Docker worker and the repo is not on the docker allowlist. Reuses the
+// fn_worker_can_claim eligibility notion (migration 00113); for a repo-bearing run the kind
+// is irrelevant (the judge exemption needs repo_id IS NULL), so eligibility is per repo and
+// the kind arg is a placeholder. The "≥1 online AND zero eligible" pair already implies the
+// repo is not allowlisted (an allowlisted repo makes every worker eligible), so no separate
+// allowlist clause is needed. Requiring ≥1 online worker keeps this distinct from a
+// no-worker-online block (mirrors the M2 queued reason). Drives the Setup chip's info
+// escalation, computed from eligibility directly — independent of the sweeper's
+// health_reason text and health_enabled/threshold gating.
+func (q *Queries) ListDockerBlockedReposForUser(ctx context.Context, arg ListDockerBlockedReposForUserParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listDockerBlockedReposForUser, arg.UserID, arg.DockerRepoAllowlist)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listFollowUpInputsForRun = `-- name: ListFollowUpInputsForRun :many
 SELECT id, run_id, kind, body, consumed_at, created_at, question_id FROM run_user_inputs
 WHERE run_id = $1 AND kind = 'follow_up'
