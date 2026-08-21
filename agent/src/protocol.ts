@@ -1310,6 +1310,18 @@ export interface StateRequest {
    *  Never sent on any other report in M1. Reporting is fire-and-forget: the server
    *  validates the list (Decision 12) and an informational field never fails a run. */
   milestones?: Milestone[];
+  // PRD #84 M4: plan-time inferred requirement set (deterministic detectToolchain()).
+  /** Non-provisionable capabilities the run needs (closed vocab {docker, jvm}). Additive
+   *  + optional and OMITTED ENTIRELY when empty — never `null` or `[]`. Rides the same two
+   *  reports as `milestones` (candidate on awaiting_approval, frozen on the autopilot
+   *  running report). */
+  required_capabilities?: string[];
+  /** Provisionable toolchain names the run needs (e.g. go, node, python, rust, jvm).
+   *  Additive + optional, OMITTED ENTIRELY when empty, same discipline as above. */
+  required_tools?: string[];
+  /** A coarse, soft/display-only size bucket ("s"|"m"|"l") for the run's repo. Additive +
+   *  optional; may be sent whenever the deterministic scan computed one. */
+  size_class?: string;
   /** The lead's live milestone progress (PRD #122 M2, Decision 3). Additive + optional
    *  and OMITTED ENTIRELY when the lead has reported no progress — never `null` or `[]` —
    *  so an old worker's payload and a new worker's "no progress" payload stay the same

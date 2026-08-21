@@ -831,6 +831,30 @@ UPDATE runs SET
     repo_agents      = COALESCE(sqlc.narg('repo_agents')::jsonb, repo_agents),
     agent_source     = COALESCE(sqlc.narg('agent_source'), agent_source),
     agent_exclusions = COALESCE(sqlc.narg('agent_exclusions')::jsonb, agent_exclusions),
+    -- PRD #84 M4: persist the plan-time INFERRED requirement set an AUTOPILOT run emits
+    -- on this self-contained `running` report. An autopilot run auto-approves its own
+    -- plan and never reports awaiting_approval, so SetRunAwaitingApproval's identical
+    -- clauses are never reached on it — without these three the inference is silently
+    -- lost for every auto-approved run (the sweep uses auto-approve). ALL THREE are
+    -- ABSENT-SAFE so the ordinary session-id/iteration heartbeats (which omit them) never
+    -- disturb the columns, mirroring SetRunAwaitingApproval byte-for-byte:
+    --
+    -- required_capabilities is UNION-MERGED (escalation-only): the M2 enqueue seam already
+    -- copied the repo's static hint, and inference can only ADD. The COALESCE is
+    -- LOAD-BEARING — a nil text[] param encodes SQL NULL and `arr || NULL = NULL` would
+    -- WIPE the NOT-NULL column — so an absent param unions with '{}' (no change) and a
+    -- present set adds its members, deduped; `<@` is order-independent so it stays unsorted.
+    required_capabilities = ARRAY(SELECT DISTINCT unnest(
+        required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))),
+    -- required_tools is SET, absent-safe: a present set REPLACES (the run's single
+    -- authoritative inferred toolchain list), an absent (NULL) param COALESCEs back to the
+    -- existing column. The service only passes a non-empty filtered set, so a garbled/empty
+    -- report leaves the param nil rather than wiping the column.
+    required_tools = COALESCE(sqlc.narg('inferred_tools')::text[], required_tools),
+    -- size_class is SET, absent-safe like required_tools: a present (clamped s/m/l) value
+    -- REPLACES, an absent (NULL) param COALESCEs back. The service clamps to {s,m,l} before
+    -- passing, so a garbled report becomes a nil param (no change) rather than a bad value.
+    size_class = COALESCE(sqlc.narg('size_class'), size_class),
     -- PRD #122 M1: the FROZEN milestone list an AUTOPILOT run resolved for itself,
     -- with a SAFETY-NET fallback to milestones_candidate (issue #259). Written
     -- IMMUTABLY — COALESCE keeps the EXISTING value, so a later `running` report can
@@ -978,6 +1002,33 @@ UPDATE runs SET
     -- correct: the candidate reflects only the latest proposal. The immutable
     -- frozen list is untouched here (it is written at approve / by autopilot).
     milestones_candidate = sqlc.narg('milestones_candidate')::jsonb,
+    -- PRD #84 M4 (unit 4b): persist the plan-time INFERRED requirement set the worker
+    -- emits on this report. ALL THREE assignments are ABSENT-SAFE (a nil param must not
+    -- disturb the column). ESCALATION-ONLY applies to required_capabilities ALONE:
+    -- inference can ADD but never DROP what the M2 repo hint already established, via the
+    -- union-merge below. required_tools and size_class are absent-safe SET/REPLACE — a
+    -- present value REPLACES the column outright, an absent (nil) param COALESCEs to a
+    -- no-op.
+    --
+    -- required_capabilities is UNION-MERGED, not replaced: the M2 enqueue seam already
+    -- copied the repo's static hint onto this run, and the plan-time inference can only
+    -- ADD to it (Decision: escalation-only). The COALESCE is LOAD-BEARING — a nil text[]
+    -- param encodes SQL NULL, and `arr || NULL = NULL` would WIPE the NOT-NULL column
+    -- (the exact pgx trap the register path guards the same way, runtime.sql ~185). So an
+    -- ABSENT param unions with '{}' and changes nothing; a present set adds its members,
+    -- deduped. The claim predicate uses the order-independent `<@` subset test, so the
+    -- merged array is intentionally left unsorted.
+    required_capabilities = ARRAY(SELECT DISTINCT unnest(
+        required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))),
+    -- required_tools is SET, absent-safe: a present set REPLACES (it is the run's single
+    -- authoritative inferred toolchain list, not merged with a prior source), and an
+    -- absent (NULL) param COALESCEs back to the existing column, leaving it untouched.
+    required_tools = COALESCE(sqlc.narg('inferred_tools')::text[], required_tools),
+    -- size_class is SET, absent-safe like required_tools: a present (clamped s/m/l) value
+    -- REPLACES the column, and an absent (NULL) param COALESCEs back to the existing value,
+    -- leaving it untouched. The service clamps to the {s,m,l} vocabulary before passing it,
+    -- so a garbled worker report becomes a nil param (no change) rather than a bad value.
+    size_class = COALESCE(sqlc.narg('size_class'), size_class),
     session_id = COALESCE(sqlc.narg('session_id'), session_id),
     -- 🔴 INVARIANT, carried by TWO call sites and by nothing else:
     -- NO SETTER MAY LEAVE A RESOLVED open_question_id BEHIND. The sibling clear is in
@@ -1050,6 +1101,23 @@ WHERE id = @id AND worker_id = @worker_id
   -- then never reach the plan gate at all — it wedges every pre-run clarification
   -- permanently. Do not add it.
   AND status <> 'limit_wait';
+
+-- name: ClearRunRequiredCapabilities :execrows
+-- PRD #84 M4 (unit 4c): the user override ("run without the capability", Decision 12).
+-- When the owner approves a plan the capability gate would BLOCK — because plan-time
+-- inference (or the repo hint) attached a required capability the owning worker cannot
+-- satisfy — this clears the run's inferred/hinted requirement set so the subsequent
+-- approve is no longer fenced. v1 clears the WHOLE run set (repo hint + inferred); a
+-- hint-vs-inference split is a future refinement (Decision 6/12). No security boundary is
+-- crossed: the §300 guardrail still denies docker USE on a daemon-less worker at run time,
+-- so clearing the SCHEDULING requirement only removes the approval fence, never the
+-- runtime protection.
+--
+-- Owner-scoped (user_id) AND status-guarded (awaiting_approval only): the clear runs from
+-- the owner-authenticated approve path, and a run outside the plan gate is a no-op
+-- (0 rows), so a stray override on a running/terminal run changes nothing.
+UPDATE runs SET required_capabilities = '{}', updated_at = now()
+WHERE id = @id AND user_id = @user_id AND status = 'awaiting_approval';
 
 -- name: SetRunIntentSummary :execrows
 -- PRD #362 M1: persist a run's plain-English INTENT summary ("what this run will

@@ -21796,3 +21796,62 @@ in tension with Feature #35's "two opt-in scopes" wording — see the provenance
 - **Web (per issue #520):** the RunDefaults settings toggle fallback is `?? true` and the mock
   session user is flipped on, so the UI reflects the new default rather than showing OFF for a user
   whose stored value is unset.
+
+## 565. PRD #84 M4/M5 — plan-time inference is a DETERMINISTIC function feeding an authoritative, no-bypass approval gate; jvm is a retrofit with no new code
+
+Closes the M4/M5 half of the reservation §299 left open (M1–M3 recorded there). M4 adds
+plan-time capability/tool inference plus a plan-approval-gate block; M5 retrofits `jvm` as a
+verified routing capability and surfaces the requirement set. Richer rationale lives in PRD #84's
+Decision Log; this is the terse contract.
+
+- **Plan-time inference is a DETERMINISTIC function, not LLM prose.**
+  `agent/src/toolchain-detect.ts#detectToolchain(clonePath)` scans manifests (`go.mod`,
+  `package.json`, `pyproject.toml`/`requirements.txt`, `Cargo.toml`, `pom.xml`/`build.gradle`) +
+  docker markers (Dockerfile/compose/testcontainers) + root build/test scripts and returns
+  `{required_capabilities (server vocab {docker,jvm}), required_tools (go/node/python/rust/jvm),
+  size_class (s/m/l)}` (the `ToolchainDetection` interface). It is the tested unit; the lead may
+  narrate the toolchain but the gate acts on this structured output, never on prose.
+
+- **Persistence: two new run columns, escalation-only capability merge.** `runs.required_tools` +
+  `runs.size_class` (migration `00145_run_required_tools.sql`). `SetRunAwaitingApproval`
+  (`api/internal/store/queries/runtime.sql`) persists the inferred set on the plan report:
+  `required_capabilities` is UNION-MERGED (escalation-only — inference ADDs, never drops the M2
+  repo hint), `required_tools` is SET/replaced (the run's single authoritative inferred list),
+  `size_class` is SET. All three are ABSENT-SAFE via `COALESCE` — a nil param never wipes the
+  column (a nil `text[]` would `arr || NULL = NULL`-wipe the NOT-NULL column without it). The
+  server owns the tool vocabulary: `capability.FilterTools` (`api/internal/capability/capability.go`)
+  gates which tool names are accepted.
+
+- **The gate formula's `−provisionable` term lives ONLY in the M4 approval gate, NOT the claim
+  clause.** The claim predicate (`fn_worker_can_claim`, migration 00142, unchanged by 00145) reads
+  `required_capabilities ⊆ worker_effective_caps` with NO subtraction —
+  `required_capabilities` is non-provisionable by construction. The approval-gate residual is
+  `unmet = required_capabilities − worker_effective_caps` and is capability-only. `size_class` is
+  SOFT (advisory, never blocks); `required_tools` are provisionable (surfaced as "will provision",
+  never a block).
+
+- **The approval gate is AUTHORITATIVE and has no bypass.** `capabilityGate`
+  (`api/internal/workersvc/service.go`) is enforced inside `SubmitInput` for EVERY approve_plan —
+  both the selection-bearing and the nil-selection path — using the SAME effective-caps fold as
+  `fn_worker_can_claim` (`capabilities ∪ {docker if docker_enabled}`), so approve and claim can
+  never disagree. It fails CLOSED: no owning worker → empty caps → every requirement unmet; a
+  worker-load error PROPAGATES (never opens the gate). Gated by
+  `settings.KeyCapabilityAwareScheduling` (default ON, same kill-switch as M2); OFF ⇒ no block and
+  the system degrades to the old mid-run failure.
+
+- **The user override (Decision 12) is the ONLY user removal of a requirement.**
+  `override_capabilities` on approve clears the run's `required_capabilities`
+  (`ClearRunRequiredCapabilities`, scoped owner + `awaiting_approval`) and proceeds. Inference can
+  only ADD; this is the sole path that REMOVES. It bypasses no security boundary — the §300
+  guardrail still denies docker USE on a daemon-less worker, so the override changes scheduling
+  preference, not containment.
+
+- **M5 jvm retrofit is verification, not new code.** `jvm` was already a matched capability via the
+  M1 `template→caps` map (`{jvm}→{jvm}`, `api/internal/capability/capability.go`). M5 confirmed the
+  claim routing with the live-DB `api/internal/store/claim_capability_integration_test.go` jvm case
+  (a base worker is fenced, a jvm worker claims). No new production code shipped for the routing
+  itself.
+
+- **Surfacing.** The run DTO (`api/internal/apitypes/run.go`) carries
+  `required_capabilities`/`required_tools`/`size_class`; the web plan-gate readiness summary renders
+  them with an override button; the CLI (`api/cmd/uzi/run.go`, `uzi run get`) shows them in its rows.

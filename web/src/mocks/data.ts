@@ -1922,6 +1922,10 @@ export const mockWorkers: Worker[] = [
     kind: "hosted",
     hosted_size: "m",
     docker: true,
+    // PRD #84 M1/M4: the server-authoritative capability set. This docker-capable hosted
+    // worker advertises "docker", so the Workers page shows the capability chip AND — were a
+    // docker-requiring run assigned here — the plan-gate readiness summary would read it MET.
+    capabilities: ["docker"],
     busy: false,
     active_runs: 0,
     max_concurrent_runs: null,
@@ -2701,6 +2705,14 @@ export const mockRuns: Run[] = [
     milestones_completed: null,
     milestones_in_progress: null,
     milestones_candidate: APPROVAL_NOTIFY_CANDIDATES,
+    // PRD #84 M4 4d: plan-time inference tagged this run as needing docker, so the plan
+    // gate's readiness summary renders. Its assigned worker (w-laptop, external) advertises
+    // NO capabilities, so `docker` shows UNMET (warn badge + remediation + the "run without
+    // it" override) — the docker-blocked scenario. required_tools are display-only ("will be
+    // provisioned"); size_class is the advisory estimate.
+    required_capabilities: ["docker"],
+    required_tools: ["node", "go"],
+    size_class: "m",
     budget_max_iterations: 8,
     budget_wall_seconds: 5400,
     anthropic_secret_id: "sec-default",
