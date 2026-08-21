@@ -31,6 +31,12 @@ import (
 // disproportionate.
 var boardPollInterval = 2 * time.Second
 
+// rateLimitPollInterval is the strip's own cadence: re-fetch the per-token meters and
+// settings on ~60s, matching the web sidebar's useMyRateLimits(60_000). The server
+// recomputes meters only every ~5m (UZI_USAGE_POLL_INTERVAL), so polling faster
+// re-serves the same value. A var (not const) so a test can shrink it.
+var rateLimitPollInterval = 60 * time.Second
+
 // tuiView is which screen has focus.
 type tuiView int
 
@@ -49,6 +55,10 @@ type boardRunsMsg struct {
 
 type boardTickMsg struct{}
 
+// stripTickMsg fires on the 60s rateLimitPollInterval to refresh the rate-limit strip's
+// meters + settings, independently of the 2s boardTickMsg runs cadence.
+type stripTickMsg struct{}
+
 // secretsMsg carries the viewer's Anthropic token count (from ListSecrets), fetched once
 // at Init to gate the board credential column on PRD #295's more-than-one-token rule.
 type secretsMsg struct {
@@ -57,7 +67,8 @@ type secretsMsg struct {
 }
 
 // rateLimitsMsg carries the viewer's own per-token rate-limit meters (from SelfRateLimits),
-// which drive the factory-floor rate-limit strip. Fetched at Init and on manual refresh.
+// which drive the factory-floor rate-limit strip. Fetched at Init, on the 60s strip ticker
+// (stripTickMsg), and on manual refresh.
 type rateLimitsMsg struct {
 	tokens []apitypes.TokenRateLimitDTO
 	err    error
@@ -173,7 +184,7 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 
 func (m tuiModel) Init() tea.Cmd {
 	cmds := []tea.Cmd{m.fetchRunsCmd(m.board.admin), m.fetchSecretsCmd(),
-		m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), tickCmd()}
+		m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), tickCmd(), stripTickCmd()}
 	if m.view == viewDetail {
 		cmds = append(cmds, m.loadDetailCmd(m.detail.runID), m.openStreamCmd(m.detail.runID))
 	}
@@ -182,6 +193,10 @@ func (m tuiModel) Init() tea.Cmd {
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(boardPollInterval, func(time.Time) tea.Msg { return boardTickMsg{} })
+}
+
+func stripTickCmd() tea.Cmd {
+	return tea.Tick(rateLimitPollInterval, func(time.Time) tea.Msg { return stripTickMsg{} })
 }
 
 func (m tuiModel) fetchRunsCmd(admin bool) tea.Cmd {
@@ -326,6 +341,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.refreshRunMetaCmd(m.detail.runID))
 		}
 		return m, tea.Batch(cmds...)
+
+	case stripTickMsg:
+		if m.quitting {
+			return m, stripTickCmd()
+		}
+		return m, tea.Batch(m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), stripTickCmd())
 
 	case boardRunsMsg:
 		m.board.apply(msg)
