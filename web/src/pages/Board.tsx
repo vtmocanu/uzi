@@ -1213,20 +1213,30 @@ export function Board() {
               .join(" · ")}
           </span>
           {[...awaitingRuns, ...questionRuns, ...stuckRuns].map((r) => (
-            <Link
+            // Issue #485 NB1: the forge issue anchor rendered by RunIssueRef is a real
+            // <a>, so it can no longer nest inside the navigational <Link> (also an <a> —
+            // invalid HTML). The pill span is a `relative` container; the run-details
+            // <Link> is a stretched absolute overlay, and the interactive ref is raised
+            // above it (relative z-10). The pill's hover-bg lives on the container, so
+            // hovering the transparent overlay (a descendant) still tints it.
+            <span
               key={r.id}
-              to={`/runs/${r.id}`}
-              className="inline-flex items-center gap-1 rounded-md border border-warn/40 px-1.5 py-0.5 text-warn transition-colors hover:bg-warn/20"
+              className="relative inline-flex items-center gap-1 rounded-md border border-warn/40 px-1.5 py-0.5 text-warn transition-colors hover:bg-warn/20"
             >
+              <Link
+                to={`/runs/${r.id}`}
+                aria-label={`Open run${r.issue_iid != null ? ` for issue #${r.issue_iid}` : ""}`}
+                className="absolute inset-0 rounded-md"
+              />
               <RunIssueRef
                 issueIid={r.issue_iid}
                 issueWebUrl={r.issue_web_url}
                 kind={r.kind}
                 forgeType={r.forge_type}
-                inCardLink
+                className="relative z-10"
               />{" "}
               →
-            </Link>
+            </span>
           ))}
         </div>
       )}

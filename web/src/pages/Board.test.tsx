@@ -1447,7 +1447,10 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
     expect(strip().textContent).toBe("1 run needs approval");
     // ...and one chip, not two. The strip spreads all three buckets into one .map keyed
     // on r.id, so a double-list is also a duplicate React key.
-    expect(screen.getAllByRole("link", { name: "#7 →" })).toHaveLength(1);
+    // Issue #485 NB1: the pill's navigational element is now a stretched-link overlay
+    // named by its aria-label (the forge ref anchor is a sibling, not a nested <a>), so
+    // the per-run chip is this "Open run for issue #7" link — still exactly one.
+    expect(screen.getAllByRole("link", { name: "Open run for issue #7" })).toHaveLength(1);
   });
 
   it("still lists a genuinely stuck run — the control", async () => {
@@ -1458,7 +1461,7 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
     });
     renderBoard();
     await screen.findByText("1 run looks stuck");
-    expect(screen.getAllByRole("link", { name: "#7 →" })).toHaveLength(1);
+    expect(screen.getAllByRole("link", { name: "Open run for issue #7" })).toHaveLength(1);
   });
 
   it("keeps the buckets separate when two different runs are in different states", async () => {
@@ -1470,7 +1473,7 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
     });
     renderBoard();
     await screen.findByText("1 run needs approval · 1 run looks stuck");
-    expect(screen.getAllByRole("link", { name: /#(7|8) →/ })).toHaveLength(2);
+    expect(screen.getAllByRole("link", { name: /Open run for issue #(7|8)/ })).toHaveLength(2);
   });
 
   it("does not double-list an awaiting_input run that still carries a flag", async () => {
@@ -1483,7 +1486,7 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
     renderBoard();
     await screen.findByText("1 run needs an answer");
     expect(strip().textContent).toBe("1 run needs an answer");
-    expect(screen.getAllByRole("link", { name: "#7 →" })).toHaveLength(1);
+    expect(screen.getAllByRole("link", { name: "Open run for issue #7" })).toHaveLength(1);
   });
 });
 

@@ -3,9 +3,9 @@
 // RunIssueRef (PRD #411 M2): the three-way render of a run's originating issue ref —
 // a muted kind chip when there is no issue, a forge external link when a valid https
 // issue_web_url is snapshotted, and a plain `#<iid>` span when the issue is no longer
-// cached. Plus the runKindLabel mapping and the in-card stopPropagation guard.
-import { afterEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+// cached. Plus the runKindLabel mapping.
+import { afterEach, describe, it, expect } from "vitest";
+import { cleanup, render, screen } from "@testing-library/react";
 import { RunIssueRef, runKindLabel } from "./RunIssueRef";
 
 afterEach(cleanup);
@@ -67,40 +67,5 @@ describe("runKindLabel", () => {
     expect(runKindLabel("ci_fix")).toBe("ci fix");
     expect(runKindLabel("task")).toBe("task");
     expect(runKindLabel("self_improve")).toBe("self improve");
-  });
-});
-
-describe("RunIssueRef — stopPropagation in a card link", () => {
-  // The anchor sits inside a wrapper whose onClick is a spy. An outer capture-phase
-  // preventDefault suppresses jsdom's navigation attempt without touching bubbling, so
-  // whether the spy fires reflects only the anchor's stopPropagation behaviour.
-  function renderInCard(inCardLink: boolean) {
-    const spy = vi.fn();
-    render(
-      <div onClickCapture={(e) => e.preventDefault()}>
-        <div onClick={spy}>
-          <RunIssueRef
-            issueIid={26}
-            issueWebUrl={URL26}
-            kind="issue"
-            forgeType="gitlab"
-            inCardLink={inCardLink}
-          />
-        </div>
-      </div>,
-    );
-    return spy;
-  }
-
-  it("positive: with inCardLink, a click on the anchor does NOT bubble to the wrapper", () => {
-    const spy = renderInCard(true);
-    fireEvent.click(screen.getByRole("link"));
-    expect(spy).not.toHaveBeenCalled();
-  });
-
-  it("paired negative: without inCardLink, the click bubbles to the wrapper", () => {
-    const spy = renderInCard(false);
-    fireEvent.click(screen.getByRole("link"));
-    expect(spy).toHaveBeenCalledTimes(1);
   });
 });

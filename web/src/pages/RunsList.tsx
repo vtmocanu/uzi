@@ -246,11 +246,20 @@ function RunRow({
     }
   };
   return (
-    <li>
+    // Issue #485 NB1: RunIssueRef and the Expedite control are real interactive elements,
+    // so they can no longer nest inside the card's navigational <Link> (an <a>; a nested
+    // <a> is invalid HTML). The <li> is a `group relative` container, the run-details
+    // <Link> is a stretched absolute overlay, and the card content sits in normal flow
+    // with each genuinely-interactive descendant raised above the overlay (relative
+    // z-10). The card's hover border/bg live on the content layer via group-hover so the
+    // transparent overlay never paints over the content.
+    <li className="group relative">
       <Link
         to={`/runs/${run.id}`}
-        className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 transition-colors hover:border-edge-strong hover:bg-raised/70"
-      >
+        aria-label={`Open run${run.issue_iid != null ? ` for issue #${run.issue_iid}` : ""}`}
+        className="absolute inset-0 rounded-lg"
+      />
+      <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 transition-colors group-hover:border-edge-strong group-hover:bg-raised/70">
         {/* w-full below sm stacks the badge cluster UNDER the title (review-wave
             fix 1): with min-w-0 alone the title column could shrink to nothing, so
             at 390px the unshrinkable badges starved it to a few characters before
@@ -276,7 +285,7 @@ function RunRow({
                 issueWebUrl={run.issue_web_url}
                 kind={run.kind}
                 forgeType={run.forge_type}
-                inCardLink
+                className="relative z-10"
               />
             </span>
             {run.worker_name && <span>· {run.worker_name}</span>}
@@ -339,9 +348,11 @@ function RunRow({
                   self-hiding on a normal or non-queued run. */}
               <RunPriorityBadge priority={run.priority} status={run.status} />
               <StatusPill status={pillStatus} />
-              {/* PRD #320 M6: the owner-only Expedite/undo control, queued rows only. It
-                  lives inside the row <Link>, so it preventDefaults + stopPropagates before
-                  firing the mutation; a non-owner never reaches this branch (owned gate). */}
+              {/* PRD #320 M6: the owner-only Expedite/undo control, queued rows only. It is
+                  raised above the card's stretched-link overlay (relative z-10, issue #485
+                  NB1) so the click hits the button rather than the run-details Link; it
+                  still preventDefaults + stopPropagates defensively before firing the
+                  mutation. A non-owner never reaches this branch (owned gate). */}
               {canExpedite && (
                 <button
                   type="button"
@@ -356,7 +367,7 @@ function RunRow({
                       ? "Return this run to its natural queue position."
                       : "Bump this run to the front of the queue."
                   }
-                  className="rounded-md border border-edge bg-raised px-2 py-1 text-xs font-medium text-muted transition-colors hover:border-edge-strong hover:text-fg disabled:opacity-50"
+                  className="relative z-10 rounded-md border border-edge bg-raised px-2 py-1 text-xs font-medium text-muted transition-colors hover:border-edge-strong hover:text-fg disabled:opacity-50"
                 >
                   {isExpedited ? "Undo" : "Expedite"}
                 </button>
@@ -368,7 +379,7 @@ function RunRow({
             </>
           )}
         </div>
-      </Link>
+      </div>
     </li>
   );
 }

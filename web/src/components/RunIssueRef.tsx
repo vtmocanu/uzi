@@ -26,14 +26,12 @@ export function RunIssueRef({
   issueWebUrl,
   kind,
   forgeType,
-  inCardLink = false,
   className,
 }: {
   issueIid: number | null;
   issueWebUrl: string | null;
   kind: string;
   forgeType: string | null;
-  inCardLink?: boolean;
   className?: string;
 }) {
   // Branch 1: no issue → kind chip.
@@ -60,7 +58,6 @@ export function RunIssueRef({
         className ? ` ${className}` : ""
       }`}
       fallbackClassName={className}
-      onClick={inCardLink ? (e) => e.stopPropagation() : undefined}
     />
   );
 }

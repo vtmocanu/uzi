@@ -337,11 +337,20 @@ export function Dashboard() {
               const ms = milestoneBadge(r);
               const msBadge = ms ? milestoneBadgeText(ms) : null;
               return (
-              <li key={r.id}>
+              // Issue #485 NB1: RunIssueRef renders a real forge <a>, which cannot nest
+              // inside the row's navigational <Link> (also an <a> — invalid HTML). The
+              // <li> is a `group relative` container, the run-details <Link> is a
+              // stretched absolute overlay, and the content row sits in normal flow with
+              // the interactive ref raised above the overlay (relative z-10). The
+              // row-hover tint lives on the content layer via group-hover so the
+              // transparent overlay never paints over the content.
+              <li key={r.id} className="group relative">
                 <Link
                   to={`/runs/${r.id}`}
-                  className="flex items-center gap-3 py-2.5 transition-colors hover:bg-raised/40"
-                >
+                  aria-label={`Open run${r.issue_iid != null ? ` for issue #${r.issue_iid}` : ""}`}
+                  className="absolute inset-0 rounded-md"
+                />
+                <div className="flex items-center gap-3 py-2.5 transition-colors group-hover:bg-raised/40">
                   <div className="min-w-0 flex-1">
                     {/* Issue #124: forge-supplied issue title, untrusted (see RunsList). */}
                     <p className="truncate text-sm font-medium text-fg">{stripUnsafeChars(r.issue_title)}</p>
@@ -352,7 +361,7 @@ export function Dashboard() {
                         issueWebUrl={r.issue_web_url}
                         kind={r.kind}
                         forgeType={r.forge_type}
-                        inCardLink
+                        className="relative z-10"
                       />
                       {r.mr_iid != null && (
                         <MrChip
@@ -382,7 +391,7 @@ export function Dashboard() {
                   )}
                   <RunHealthBadge run={r} />
                   <StatusPill status={effectiveRunStatus(r)} />
-                </Link>
+                </div>
               </li>
               );
             })}
