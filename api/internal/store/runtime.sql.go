@@ -4285,9 +4285,12 @@ UPDATE runs SET
     -- frozen list is untouched here (it is written at approve / by autopilot).
     milestones_candidate = $2::jsonb,
     -- PRD #84 M4 (unit 4b): persist the plan-time INFERRED requirement set the worker
-    -- emits on this report. Both assignments are ABSENT-SAFE (a nil param must not
-    -- disturb the column) and ESCALATION-ONLY (inference can ADD but never DROP what the
-    -- M2 repo hint already established).
+    -- emits on this report. ALL THREE assignments are ABSENT-SAFE (a nil param must not
+    -- disturb the column). ESCALATION-ONLY applies to required_capabilities ALONE:
+    -- inference can ADD but never DROP what the M2 repo hint already established, via the
+    -- union-merge below. required_tools and size_class are absent-safe SET/REPLACE — a
+    -- present value REPLACES the column outright, an absent (nil) param COALESCEs to a
+    -- no-op.
     --
     -- required_capabilities is UNION-MERGED, not replaced: the M2 enqueue seam already
     -- copied the repo's static hint onto this run, and the plan-time inference can only

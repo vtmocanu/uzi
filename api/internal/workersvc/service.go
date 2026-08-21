@@ -3107,7 +3107,17 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			inferredCaps = capability.Filter(*req.RequiredCapabilities)
 		}
 		if req.RequiredTools != nil {
-			inferredTools = capability.FilterTools(*req.RequiredTools)
+			// FilterTools returns a NON-nil empty slice when every name is unknown (e.g.
+			// ["cobol"]), which pgx encodes as {} (not NULL). Since required_tools is a
+			// COALESCE-guarded REPLACE, passing {} would WIPE a prior tool set — asymmetric
+			// with the caps/size paths, where a garbled report is already a no-op. Only pass
+			// a non-empty filtered set through, so an all-unknown or empty report leaves the
+			// param nil and the query's COALESCE keeps the existing column (no change). The
+			// worker only emits required_tools when non-empty, so this loses no legitimate
+			// behaviour; it closes the hostile/garbled wipe.
+			if filtered := capability.FilterTools(*req.RequiredTools); len(filtered) > 0 {
+				inferredTools = filtered
+			}
 		}
 		var sizeClass pgtype.Text
 		if req.SizeClass != nil {

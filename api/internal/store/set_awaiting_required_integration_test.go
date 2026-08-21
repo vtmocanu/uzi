@@ -5,6 +5,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -134,6 +135,53 @@ func TestSetAwaitingRequirementAbsentNoWipeLiveDB(t *testing.T) {
 	}
 	if size != "m" {
 		t.Fatalf("absent param wiped size_class to %q, want unchanged %q", size, "m")
+	}
+}
+
+// TestSetAwaitingRequirementAllUnknownToolsNoWipeLiveDB proves Fix A end to end: an
+// all-unknown required_tools report (e.g. ["cobol"]) must be a no-op, not a wipe of an
+// established required_tools set. capability.FilterTools reduces an all-unknown report to
+// a NON-nil empty slice, which pgx would encode as {} (not NULL) and — because
+// required_tools is a COALESCE-guarded REPLACE — WIPE the prior set. The service therefore
+// reduces an empty filtered set back to a nil (absent) param. This test drives the SAME
+// FilterTools + empty-guard the service does, then feeds the resulting param to the live
+// query, and separately proves the wipe the fix avoids (so it is non-vacuous).
+func TestSetAwaitingRequirementAllUnknownToolsNoWipeLiveDB(t *testing.T) {
+	fx := newFleetFixture(t)
+	w := fx.worker("W", capOf(4), false)
+	run := ownedRun(fx, w, []string{"docker"})
+
+	// Establish required_tools = {go}.
+	setAwaiting(fx, run, w, nil, []string{"go"}, "")
+	_, tools, _ := runReqs(fx, run)
+	if !sameSet(tools, []string{"go"}) {
+		t.Fatalf("setup: required_tools = %v, want {go}", tools)
+	}
+
+	// The exact service path: an all-unknown ["cobol"] filters to an empty (non-nil) slice.
+	filtered := capability.FilterTools([]string{"cobol"})
+	if len(filtered) != 0 {
+		t.Fatalf("FilterTools([cobol]) = %v, want empty — the fix's premise (all-unknown -> empty) is wrong", filtered)
+	}
+	// The service's Fix A guard: only a non-empty filtered set becomes the param; an empty
+	// one stays nil (absent).
+	var toolsParam []string
+	if len(filtered) > 0 {
+		toolsParam = filtered
+	}
+	setAwaiting(fx, run, w, nil, toolsParam, "")
+	_, tools, _ = runReqs(fx, run)
+	if !sameSet(tools, []string{"go"}) {
+		t.Fatalf("all-unknown tools report wiped required_tools to %v, want unchanged {go}", tools)
+	}
+
+	// Non-vacuous guard: prove the SAME query WOULD wipe had the service passed the empty
+	// (non-nil) filtered slice directly (the pre-fix behaviour) — {} encodes as non-NULL and
+	// the COALESCE'd REPLACE overwrites {go} with {}. This is exactly the trap Fix A closes.
+	setAwaiting(fx, run, w, nil, filtered, "")
+	_, tools, _ = runReqs(fx, run)
+	if len(tools) != 0 {
+		t.Fatalf("empty (non-nil) tools param should REPLACE to {}, got %v — the fix's premise is wrong", tools)
 	}
 }
 
