@@ -21855,3 +21855,40 @@ Decision Log; this is the terse contract.
 - **Surfacing.** The run DTO (`api/internal/apitypes/run.go`) carries
   `required_capabilities`/`required_tools`/`size_class`; the web plan-gate readiness summary renders
   them with an override button; the CLI (`api/cmd/uzi/run.go`, `uzi run get`) shows them in its rows.
+
+## 566. PRD #337 — connect-form base-URL ⇄ forge-type sync + a reusable reveal-token input
+
+Frontend-only UX polish on Settings → Forge → connect. Richer rationale lives in PRD #337's
+Decision Log (D1–D9); this is the terse contract.
+
+- **Two-way, host-inferred, recognized-only sync.** The base-URL `<Select>` and the forge-type
+  `<Select>` are kept consistent in BOTH directions on user change, but ONLY for recognized hosts.
+  *This SUPERSEDES §296's "independent choices (D11a): a mismatch is caught by VerifyToken" stance* —
+  the form now keeps the pair consistent and VerifyToken is the backstop, not the first line of
+  defense.
+- **Recognition lives in `web/src/lib/forgeInfer.ts`** (a sibling to `forgeNoun.ts`, kept separate so
+  forgeNoun's "exactly one GitLab-noun literal" acceptance test stays clean — D2).
+  `inferForgeType(baseUrl, forgeTypes)` parses the host, does a case-insensitive substring match
+  (`github`/`gitlab`/`forgejo`) plus a tiny alias map (`codeberg.org`/`*.codeberg.org` → forgejo), and
+  returns the type ONLY if it is advertised in `forgeTypes` (the D4 guard — inference can never select
+  a forge the instance did not enable). Unrecognized host → `null` ("user chooses").
+- **Direction rules.** URL→type switches the type when the inferred type is recognized, advertised,
+  and different. type→URL moves the URL only when the CURRENT host is a recognized forge of a
+  different type AND `defaultUrlForType(type, allowedUrls)` returns a recognized target; when it
+  returns `null` (the chosen type has no recognized allowlist URL — e.g. a self-hosted
+  `git.example.com`), KEEP the current URL rather than blank or mis-set it (D8). An
+  unrecognized/self-hosted host is left under full manual control in both directions (D4/D5). *Why:*
+  sync fires on user change events only, never on mount (D5), so the landing pair is byte-identical to
+  before this change.
+- **Frontend-only, no backend touch.** No API/DB/worker change; `createConnection(baseUrl, token,
+  forgeType)` still carries all three values and VerifyToken is unchanged. The auto-changed field gets
+  a cosmetic CSS-only highlight (D9) that carries no behavioral assertion.
+- **Reusable `PasswordInput`** (`web/src/components/ui.tsx`) with `EyeIcon`/`EyeOffIcon`
+  (`icons.tsx`): a masked secret input with a reveal (eye) toggle. Masked by default; the toggle is
+  `type="button"` (never submits), carries a toggling `aria-label`/`aria-pressed` and a visible focus
+  ring, and forwards `id` to the inner input so a `Field htmlFor` associates the label with the input,
+  not the composite. *Why the re-mask:* a `useEffect` re-masks when the value is externally cleared
+  (D7 leak guard) — a revealed field must not display the NEXT pasted token in clear. Applied to the
+  forge PAT field now; rolling it out to the other six `type="password"` sites is a deliberate
+  out-of-scope follow-up (D6). This is client-only and does NOT touch the secretbox no-reveal
+  invariant, which governs STORED tokens (D7) — there is still no reveal endpoint.
