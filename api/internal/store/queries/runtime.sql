@@ -176,6 +176,11 @@ WITH prev AS (
         status              = 'online',
         version             = @version,
         template_reported   = @template_reported,
+        -- capabilities is the server-authoritative capability set (PRD #84 M1): the
+        -- Filter-ed union of the worker's self-report and its template-derived caps,
+        -- computed in Service.Register. Overwritten on every register (the fresh-start
+        -- signal), so a worker that stops self-reporting docker loses it here too.
+        capabilities        = @capabilities,
         max_concurrent_runs = sqlc.narg('max_concurrent_runs'),
         -- online_since is the api-owned uptime anchor (PRD #251 M1): PRESERVE it if the
         -- worker is already online with one, else STAMP now() — so a steady stream of

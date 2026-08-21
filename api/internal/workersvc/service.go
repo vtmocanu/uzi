@@ -35,6 +35,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/autoselectrow"
 	"github.com/vtmocanu/uzi/api/internal/board"
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	"github.com/vtmocanu/uzi/api/internal/planpolicy"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
@@ -969,7 +970,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 // awaiting_input forever, pointing at execution that no longer exists, with its
 // worker-held answer deadline gone and no user-visible signal — on the ordinary
 // restart path this comment already names.
-func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns *int) (store.Worker, error) {
+func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns *int, capabilities []string) (store.Worker, error) {
 	max := int32(s.p.RunMaxRequeues)
 	orphanFailed, err := s.q.FailWorkerRunsOverCap(ctx, store.FailWorkerRunsOverCapParams{
 		FailureReason: pgText("worker restarted; run orphaned and out of re-queue budget"),
@@ -997,9 +998,17 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 	// maxConcurrentRuns is the worker's advertised concurrency cap (PRD #42); nil →
 	// NULL (an older image, or M3a before the M2 agent sends it). Observability
 	// only — the server never enforces it, so it is stored exactly as reported.
+	//
+	// capabilities is the STORED set (PRD #84 M1): the server-owned Filter applied to
+	// the union of the worker's self-reported caps and the template-derived caps. The
+	// column is therefore authoritative — an unknown/garbled self-report name is
+	// dropped here, never persisted — so a later milestone's peer subquery can read
+	// workers.capabilities directly. Filter also dedupes and stabilizes order.
+	storedCaps := capability.Filter(append(append([]string{}, capabilities...), capability.TemplateCapabilities(template)...))
 	row, err := s.q.RegisterWorker(ctx, store.RegisterWorkerParams{
 		Version:           pgText(version),
 		TemplateReported:  pgText(template),
+		Capabilities:      storedCaps,
 		MaxConcurrentRuns: pgIntPtr(maxConcurrentRuns),
 		ID:                wkr.ID,
 	})

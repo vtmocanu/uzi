@@ -631,6 +631,7 @@ type Worker struct {
 	AnthropicBindMode  string             `json:"anthropic_bind_mode"`
 	OnlineSince        pgtype.Timestamptz `json:"online_since"`
 	DrainingSince      pgtype.Timestamptz `json:"draining_since"`
+	Capabilities       []string           `json:"capabilities"`
 }
 
 type WorkerUpgradeMute struct {

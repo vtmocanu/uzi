@@ -14,7 +14,7 @@ import { ServerIcon } from "../components/icons";
 import { DEFAULT_WORKER_TEMPLATE, WORKER_TEMPLATES, hasTemplateDrift } from "../lib/workerTemplates";
 import { HostedWorkers } from "../components/HostedWorkers";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
-import { WorkerStatGauges } from "../components/WorkerStats";
+import { WorkerStatGauges, formatBytes } from "../components/WorkerStats";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { stripUnsafeChars } from "../lib/safeText";
 import { formatUptimeSince } from "../lib/formatUptimeSince";
@@ -461,6 +461,12 @@ export function WorkersSettings() {
                       ) : (
                         w.template_declared && <span>template {w.template_declared} (awaiting report)</span>
                       )}
+                      {/* Size envelope (PRD #84 M1): the container mem ceiling from the
+                          latest stats sample. Null when unlimited / process-fallback /
+                          no sample yet — then say nothing rather than "0". Read-only. */}
+                      {w.mem_limit_bytes != null && w.mem_limit_bytes > 0 && (
+                        <span>· {formatBytes(w.mem_limit_bytes)} limit</span>
+                      )}
                       {/* Issue #124: worker self-reported (sanitizeSelfReported at ingest). */}
                       {w.version && <span>· v{stripUnsafeChars(w.version)}</span>}
                       {w.status === "online" && w.online_since && (
@@ -568,6 +574,15 @@ export function WorkersSettings() {
                         template drift
                       </Badge>
                     )}
+                    {/* Server-authoritative capability set (PRD #84 M1), rendered as
+                        small read-only chips beside the template/drift badge. The set is
+                        Filter-ed server-side to the {docker, jvm} vocabulary, so a name
+                        here is always known; empty/absent renders nothing. */}
+                    {w.capabilities?.map((cap) => (
+                      <Badge key={cap} title={`Worker capability: ${cap}`}>
+                        {cap}
+                      </Badge>
+                    ))}
                     <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
                       {w.status}
                     </Badge>
