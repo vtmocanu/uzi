@@ -4,7 +4,8 @@
 // web URL is a valid https URL it renders an external anchor (target=_blank,
 // rel=noreferrer, aria-label/title=label, an ExternalLinkIcon, and `#<iid>` text);
 // when it is not https (http, or null) it renders a plain `#<iid>` span with no
-// anchor at all. An optional onClick fires on click of the anchor.
+// anchor at all. The anchor path applies `className`; the span path applies
+// `fallbackClassName`.
 import { afterEach, describe, it, expect } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { ForgeIssueAnchor } from "./ForgeIssueAnchor";
