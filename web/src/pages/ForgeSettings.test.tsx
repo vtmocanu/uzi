@@ -386,6 +386,57 @@ describe("ForgeSettings — base-URL ⇄ forge-type sync (PRD #337)", () => {
   });
 });
 
+describe("ForgeSettings — PAT reveal toggle (PRD #337)", () => {
+  const patInput = () => document.querySelector("#forge-bot-pat") as HTMLInputElement;
+
+  it("is masked on mount with a 'Show token' button (aria-pressed false)", async () => {
+    renderPage();
+    await screen.findByText("unchecked"); // page loaded
+    expect(patInput().getAttribute("type")).toBe("password");
+    const btn = screen.getByRole("button", { name: "Show token" });
+    expect(btn.getAttribute("aria-pressed")).toBe("false");
+    // No "Hide token" button while masked.
+    expect(screen.queryByRole("button", { name: "Hide token" })).toBeNull();
+  });
+
+  it("reveal flips the input type and aria, and hiding flips them back", async () => {
+    renderPage();
+    await screen.findByText("unchecked");
+    expect(patInput().getAttribute("type")).toBe("password");
+
+    fireEvent.click(screen.getByRole("button", { name: "Show token" }));
+    expect(patInput().getAttribute("type")).toBe("text");
+    const hideBtn = screen.getByRole("button", { name: "Hide token" });
+    expect(hideBtn.getAttribute("aria-pressed")).toBe("true");
+
+    fireEvent.click(hideBtn);
+    expect(patInput().getAttribute("type")).toBe("password");
+    const showBtn = screen.getByRole("button", { name: "Show token" });
+    expect(showBtn.getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("re-masks after a successful connect clears the token (D7 leak guard)", async () => {
+    mockApi.createConnection.mockResolvedValue({ connection: conn() });
+    renderPage();
+    await screen.findByText("unchecked");
+
+    // Reveal the field, then type a token into it.
+    fireEvent.click(screen.getByRole("button", { name: "Show token" }));
+    expect(patInput().getAttribute("type")).toBe("text");
+    fireEvent.change(patInput(), { target: { value: "glpat-secret" } });
+    expect(patInput().value).toBe("glpat-secret");
+
+    // Submit → connect resolves → setToken("") runs → the field re-masks.
+    fireEvent.submit(document.querySelector("form") as HTMLFormElement);
+    await waitFor(() =>
+      expect(mockApi.createConnection).toHaveBeenCalledWith("https://gitlab.example.com", "glpat-secret", "gitlab"),
+    );
+    await waitFor(() => expect(patInput().getAttribute("type")).toBe("password"));
+    expect(screen.getByRole("button", { name: "Show token" }).getAttribute("aria-pressed")).toBe("false");
+    expect(screen.queryByRole("button", { name: "Hide token" })).toBeNull();
+  });
+});
+
 describe("ForgeSettings — connect-form token hints follow the forge (M6b, D6b)", () => {
   it("shows GitLab's api scope + Developer role + glpat placeholder by default", async () => {
     renderPage();

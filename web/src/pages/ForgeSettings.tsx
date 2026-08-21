@@ -9,7 +9,7 @@ import { privilegeBadge } from "../lib/privilege";
 import { forgePlatform } from "../lib/forgeNoun";
 import { inferForgeType, defaultUrlForType } from "../lib/forgeInfer";
 import { DOC_BOT_SETUP_FORGEJO, DOC_BOT_SETUP_GITHUB, DOC_BOT_SETUP_GITLAB } from "../lib/doclinks";
-import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Select, Skeleton } from "../components/ui";
+import { Alert, Badge, Button, Card, EmptyState, Field, Input, PasswordInput, SectionTitle, Select, Skeleton } from "../components/ui";
 import { SettingsShell } from "../components/SettingsShell";
 import { DocLink } from "../components/DocLink";
 import { BranchIcon } from "../components/icons";
@@ -337,9 +337,9 @@ export function ForgeSettings() {
               </div>
             </Field>
           )}
-          <Field label={`Bot personal access token (${hints.scopeLabel})`}>
-            <Input
-              type="password"
+          <Field label={`Bot personal access token (${hints.scopeLabel})`} htmlFor="forge-bot-pat">
+            <PasswordInput
+              id="forge-bot-pat"
               autoComplete="off"
               placeholder={hints.placeholder}
               value={token}
