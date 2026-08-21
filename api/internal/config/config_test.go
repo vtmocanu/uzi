@@ -114,6 +114,7 @@ func TestLoadAgentRuntimeDefaults(t *testing.T) {
 		{"RunMaxRequeues", cfg.RunMaxRequeues, 1},
 		{"WorkerHeartbeatInterval", cfg.WorkerHeartbeatInterval, 15 * time.Second},
 		{"WorkerHeartbeatStale", cfg.WorkerHeartbeatStale, 45 * time.Second},
+		{"SweepInterval", cfg.SweepInterval, time.Duration(0)},
 		{"WorkerPollInterval", cfg.WorkerPollInterval, 3 * time.Second},
 		{"WorkerAffinityGrace", cfg.WorkerAffinityGrace, 2 * time.Minute},
 	}
@@ -131,6 +132,16 @@ func TestLoadAgentRuntimeDefaults(t *testing.T) {
 	}
 	if cfg.RunMaxRequeues != 0 {
 		t.Errorf("RunMaxRequeues = %d, want 0 (never re-queue)", cfg.RunMaxRequeues)
+	}
+
+	// SWEEP_INTERVAL is an optional override; an explicit value is honoured.
+	t.Setenv("SWEEP_INTERVAL", "2s")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() with SWEEP_INTERVAL=2s: %v", err)
+	}
+	if cfg.SweepInterval != 2*time.Second {
+		t.Errorf("SweepInterval = %v, want 2s", cfg.SweepInterval)
 	}
 }
 

@@ -526,7 +526,7 @@ func run() error {
 	// the one whose tokens would otherwise never be swept. Riding this existing
 	// ticker (rather than a goroutine of its own) also keeps the flag-off footprint
 	// to one indexed UPDATE that matches nothing on a stack with no hosted workers.
-	sweep := sweeper.New(wsvc, 0,
+	sweep := sweeper.New(wsvc, cfg.SweepInterval,
 		sweeper.Pass{
 			Name: "hosted_tokens_expired",
 			Run: func(ctx context.Context) (int64, error) {

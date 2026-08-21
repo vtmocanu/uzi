@@ -13,9 +13,13 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// defaultInterval is the sweep cadence. Not a PRD env var: it only bounds how
-// long a dead worker's runs sit before recovery, and it must be well under the
-// heartbeat-stale window (45s) so a stale worker is caught promptly.
+// defaultInterval is the fallback sweep cadence used when New is given a
+// non-positive interval. The cadence is operator-tunable via SWEEP_INTERVAL
+// (PRD #97 M6 / #100), which config.Load parses and main.go passes here;
+// unset/0 falls back to this value. It only bounds how long a dead worker's
+// runs sit before recovery, and it should stay well under the heartbeat-stale
+// window (45s) so a stale worker is caught promptly — not clamped, matching the
+// lenient-parse treatment of the sibling worker-liveness knobs.
 const defaultInterval = 15 * time.Second
 
 // Sweeper is the narrow behavior the engine needs; *workersvc.Service satisfies
