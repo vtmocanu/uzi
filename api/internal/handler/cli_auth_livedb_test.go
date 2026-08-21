@@ -359,8 +359,9 @@ func TestCLISelfReportHonestyLiveDB(t *testing.T) {
 // (c/d) Cross-credential-class + spend containment: a Bearer credential is rejected
 // on the cookie-only routes — the D18 POST /api/workers (mint of a plaintext uzw_
 // whose claim yields decrypted secrets) and the D21 POST /api/runs/{id}/rejudge
-// (the sole cookie-only /runs route; catches the "wrap the whole /runs group"
-// shortcut), plus the other PAT-writing / factory-killing / run-minting routes.
+// (one of two cookie-only /runs routes, with wait-on-limit; catches the "wrap the
+// whole /runs group" shortcut), plus the other PAT-writing / factory-killing /
+// run-minting routes.
 // -------------------------------------------------------------------------
 
 func TestCLIRejectsBearerOnCookieOnlyRoutesLiveDB(t *testing.T) {
@@ -373,7 +374,7 @@ func TestCLIRejectsBearerOnCookieOnlyRoutesLiveDB(t *testing.T) {
 		name, method, path string
 	}{
 		{"mint worker (D18: strictly worse than PAT-write)", http.MethodPost, "/api/workers"},
-		{"rejudge (D21: sole cookie-only /runs route)", http.MethodPost, "/api/runs/" + runID.String() + "/rejudge"},
+		{"rejudge (D21: one of two cookie-only /runs routes, with wait-on-limit)", http.MethodPost, "/api/runs/" + runID.String() + "/rejudge"},
 		{"forge connection (writes a bot PAT)", http.MethodPost, "/api/forge/connections"},
 		{"delete anthropic token (factory kill)", http.MethodDelete, "/api/me/secrets/anthropic_token"},
 		{"create chat (mints a run)", http.MethodPost, "/api/chats"},
