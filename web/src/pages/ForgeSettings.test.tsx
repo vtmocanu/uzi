@@ -138,6 +138,15 @@ describe("ForgeSettings — forge identity mapping (PRD #19 M3)", () => {
   });
 });
 
+describe("ForgeSettings — always-visible bot-setup guide link (PRD #57 M2)", () => {
+  it("renders the happy-path connect-card bot-setup link on the default gitlab forge", async () => {
+    renderPage();
+    await screen.findByText("unchecked"); // page loaded, no over-privilege card shown
+    const docLink = screen.getByRole("link", { name: "bot setup" });
+    expect(docLink.getAttribute("href")).toBe("/docs/gitlab-bot-setup");
+  });
+});
+
 describe("ForgeSettings privilege surfacing", () => {
   it("renders an unchecked badge for a never-checked connection", async () => {
     renderPage();

@@ -246,11 +246,27 @@ function RunRow({
     }
   };
   return (
-    <li>
+    // Issue #485 NB1: RunIssueRef and the Expedite control are real interactive elements,
+    // so they can no longer nest inside the card's navigational <Link> (an <a>; a nested
+    // <a> is invalid HTML). The <li> is a `group relative` container, the run-details
+    // <Link> is a stretched absolute overlay, and the card content sits in normal flow
+    // with each genuinely-interactive descendant raised above the overlay (relative
+    // z-10). The card's hover border/bg live on the content layer via group-hover so the
+    // transparent overlay never paints over the content.
+    <li className="group relative">
       <Link
         to={`/runs/${run.id}`}
-        className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 transition-colors hover:border-edge-strong hover:bg-raised/70"
-      >
+        // Issue #485 review FIX 2: name the link by the run's visible title so multiple
+        // issue-less runs (task/ci_fix/chat/self-improve, all "Open run" otherwise) get
+        // distinct, meaningful accessible names — the title now sits under the overlay
+        // and no longer contributes to the link name on its own. issue_title is untrusted
+        // forge text, so it stays sanitized (same stripUnsafeChars as the visible title).
+        aria-label={`Open run${run.issue_iid != null ? ` for issue #${run.issue_iid}` : ""}${
+          run.issue_title.trim() ? `: ${stripUnsafeChars(run.issue_title)}` : ""
+        }`}
+        className="absolute inset-0 rounded-lg"
+      />
+      <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 transition-colors group-hover:border-edge-strong group-hover:bg-raised/70">
         {/* w-full below sm stacks the badge cluster UNDER the title (review-wave
             fix 1): with min-w-0 alone the title column could shrink to nothing, so
             at 390px the unshrinkable badges starved it to a few characters before
@@ -276,7 +292,7 @@ function RunRow({
                 issueWebUrl={run.issue_web_url}
                 kind={run.kind}
                 forgeType={run.forge_type}
-                inCardLink
+                raised
               />
             </span>
             {run.worker_name && <span>· {run.worker_name}</span>}
@@ -291,7 +307,10 @@ function RunRow({
                 mrIid={run.mr_iid}
                 mrState={mrState}
                 href={null}
-                className="font-medium"
+                // Issue #485 review FIX 1: raised above the card's stretched-link overlay
+                // (relative z-10) so its native `title` (MR state) fires on hover; the
+                // href-less chip is not click-to-navigate, which is fine for a status chip.
+                className="relative z-10 font-medium"
               />
             )}
             {/* PRD #40: tokens + cost join the meta line; hidden for a run with no
@@ -310,7 +329,15 @@ function RunRow({
             )}
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
+        {/* Issue #485 review FIX 1: raise the whole right-side badge cluster above the
+            card's stretched-link overlay (relative z-10) so every badge's native `title`
+            tooltip fires on hover — the transparent overlay otherwise intercepts the
+            pointer and its title is empty. These are status badges nobody clicks to open
+            a run, so trading their click-to-navigate for working tooltips is correct; the
+            title/body text stays under the overlay and still navigates. The Expedite
+            button (already relative z-10, stopPropagation) is unaffected by a raised
+            ancestor. */}
+        <div className="relative z-10 flex flex-wrap items-center gap-2">
           {run.auto_approve && (
             <Badge tone="brand" title="Autopilot: started from the label, plan auto-approved">
               autopilot
@@ -339,9 +366,11 @@ function RunRow({
                   self-hiding on a normal or non-queued run. */}
               <RunPriorityBadge priority={run.priority} status={run.status} />
               <StatusPill status={pillStatus} />
-              {/* PRD #320 M6: the owner-only Expedite/undo control, queued rows only. It
-                  lives inside the row <Link>, so it preventDefaults + stopPropagates before
-                  firing the mutation; a non-owner never reaches this branch (owned gate). */}
+              {/* PRD #320 M6: the owner-only Expedite/undo control, queued rows only. It is
+                  raised above the card's stretched-link overlay (relative z-10, issue #485
+                  NB1) so the click hits the button rather than the run-details Link; it
+                  still preventDefaults + stopPropagates defensively before firing the
+                  mutation. A non-owner never reaches this branch (owned gate). */}
               {canExpedite && (
                 <button
                   type="button"
@@ -356,7 +385,7 @@ function RunRow({
                       ? "Return this run to its natural queue position."
                       : "Bump this run to the front of the queue."
                   }
-                  className="rounded-md border border-edge bg-raised px-2 py-1 text-xs font-medium text-muted transition-colors hover:border-edge-strong hover:text-fg disabled:opacity-50"
+                  className="relative z-10 rounded-md border border-edge bg-raised px-2 py-1 text-xs font-medium text-muted transition-colors hover:border-edge-strong hover:text-fg disabled:opacity-50"
                 >
                   {isExpedited ? "Undo" : "Expedite"}
                 </button>
@@ -368,7 +397,7 @@ function RunRow({
             </>
           )}
         </div>
-      </Link>
+      </div>
     </li>
   );
 }

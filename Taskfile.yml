@@ -1784,3 +1784,19 @@ tasks:
       # The unit is the lesson, not the number: under node's per-file cap a large
       # test file is a serialization point that no timeout value fixes.
       - npm test
+
+  # -------------------------------------------------------------------- nudge --
+  # A NUDGE is not a gate. This target is DELIBERATELY absent from `gate` and from
+  # every `gate:*`, and the tool it runs is structurally incapable of failing a
+  # build: api/cmd/roleparity ALWAYS exits 0 by default (the -strict opt-in is
+  # never passed here). Issue #63 resolved the dev-team roster (.claude/agents/)
+  # and the product roster (api/internal/agenttmpl/builtins/) as DECOUPLED BY
+  # DESIGN -- the product must never be hostage to our team's shape -- but a
+  # divergence is worth NOTICING. Wiring an advisory, non-failing CI job is a
+  # SEPARATE maintainer follow-up: a CI job edits .github/workflows/**, which the
+  # uzi worker token cannot push. See CLAUDE.md "Builtin agent templates".
+  nudge:roles:
+    desc: 'role-parity NUDGE - dev-team vs product rosters (issue #63; never gates)'
+    dir: api
+    cmds:
+      - go run ./cmd/roleparity

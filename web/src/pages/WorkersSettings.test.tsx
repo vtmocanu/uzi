@@ -115,6 +115,15 @@ function renderPage() {
   );
 }
 
+describe("WorkersSettings — always-visible worker-setup guide link (PRD #57 M2)", () => {
+  it("renders the worker-setup guide link in the page header", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    renderPage();
+    const docLink = await screen.findByRole("link", { name: "worker setup" });
+    expect(docLink.getAttribute("href")).toBe("/docs/worker-setup");
+  });
+});
+
 // Issue #124, item 7 addendum: the worker's self-reported version, same trust class and
 // same ingest scrubber as `target`.
 describe("WorkersSettings — the reported version carries no format characters (#124)", () => {

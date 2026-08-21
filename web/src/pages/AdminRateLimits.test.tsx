@@ -66,6 +66,17 @@ const USERS = [
 ];
 
 describe("AdminRateLimits", () => {
+  it("renders the always-visible rate-limits guide link", async () => {
+    mockApi.getAdminRateLimits.mockResolvedValue({ users: USERS });
+    render(
+    <MemoryRouter>
+      <AdminRateLimits />
+    </MemoryRouter>,
+  );
+    const link = await screen.findByRole("link", { name: "Claude rate limits" });
+    expect(link.getAttribute("href")).toBe("/docs/rate-limits");
+  });
+
   it("renders every user, badges each state, and sorts danger-first", async () => {
     mockApi.getAdminRateLimits.mockResolvedValue({ users: USERS });
     render(
