@@ -1189,6 +1189,36 @@ func TestForwardMoveAddsMissingItem(t *testing.T) {
 	}
 }
 
+// (e2) A missing item moved to Open ("") is resolved + added and persisted with a
+// NULL marker, but no Set fires: a just-added item already carries "No Status".
+func TestForwardMoveAddsMissingItemOpenSkipsClear(t *testing.T) {
+	repoID := uuid.New()
+	syncer := forwardSyncer()
+	st := &fakeProjectStore{
+		repo:    githubRepoRow(repoID),
+		link:    forwardLink(t, map[string]string{"In Progress": "opt_ip"}),
+		itemErr: pgx.ErrNoRows,
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+
+	if err := svc.ForwardMove(context.Background(), repoID, 7, ""); err != nil {
+		t.Fatalf("ForwardMove: %v", err)
+	}
+	if len(syncer.addCalls) != 1 || syncer.addCalls[0] != "content7" {
+		t.Fatalf("want issue 7 content added once, got %v", syncer.addCalls)
+	}
+	if len(syncer.setCalls) != 0 {
+		t.Fatalf("Open target on a just-added item must not set status, got %v", syncer.setCalls)
+	}
+	persisted, ok := st.items[7]
+	if !ok {
+		t.Fatalf("want new item persisted for issue 7")
+	}
+	if persisted.ItemNodeID != "item-content7" || persisted.LastStatusOptionID.Valid {
+		t.Errorf("persisted item wrong (want NULL marker): %+v", persisted)
+	}
+}
+
 // (f) A forge error is swallowed (ForwardMove returns nil) and stamps last_error.
 func TestForwardMoveForgeErrorSwallowed(t *testing.T) {
 	repoID := uuid.New()

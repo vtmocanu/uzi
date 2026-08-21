@@ -123,15 +123,6 @@ func TestGithubProjectSyncLiveDB(t *testing.T) {
 		t.Errorf("last_error should be NULL after clear, got %+v", got.LastError)
 	}
 
-	// --- synced-repo list --------------------------------------------------
-	links, err := q.ListGithubProjectSyncedRepos(ctx)
-	if err != nil {
-		t.Fatalf("ListGithubProjectSyncedRepos: %v", err)
-	}
-	if len(links) != 1 || links[0].RepoID != repoID {
-		t.Fatalf("ListGithubProjectSyncedRepos = %d rows, want exactly the one synced repo", len(links))
-	}
-
 	// --- item upsert (insert, then conflict update) ------------------------
 	item, err := q.UpsertGithubProjectItem(ctx, store.UpsertGithubProjectItemParams{
 		RepoID:             repoID,

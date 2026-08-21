@@ -27,10 +27,6 @@ RETURNING *;
 -- The link row for a repo, or no row when the repo is not synced.
 SELECT * FROM github_project_links WHERE repo_id = sqlc.arg('repo_id');
 
--- name: ListGithubProjectSyncedRepos :many
--- Every link row, for the poller to iterate all synced repos.
-SELECT * FROM github_project_links ORDER BY created_at ASC;
-
 -- name: DeleteGithubProjectLink :exec
 -- Teardown: drop a repo's link. The item rows cascade with the repo, not with the
 -- link, so item cleanup on unlink (if wanted) is a separate DeleteGithubProjectItem.

@@ -132,43 +132,6 @@ func (q *Queries) ListGithubProjectItems(ctx context.Context, repoID uuid.UUID) 
 	return items, nil
 }
 
-const listGithubProjectSyncedRepos = `-- name: ListGithubProjectSyncedRepos :many
-SELECT id, repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi, last_synced_at, last_error, created_at, updated_at FROM github_project_links ORDER BY created_at ASC
-`
-
-// Every link row, for the poller to iterate all synced repos.
-func (q *Queries) ListGithubProjectSyncedRepos(ctx context.Context) ([]GithubProjectLink, error) {
-	rows, err := q.db.Query(ctx, listGithubProjectSyncedRepos)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []GithubProjectLink{}
-	for rows.Next() {
-		var i GithubProjectLink
-		if err := rows.Scan(
-			&i.ID,
-			&i.RepoID,
-			&i.ProjectNodeID,
-			&i.ProjectNumber,
-			&i.StatusFieldID,
-			&i.StatusOptions,
-			&i.OwnedByUzi,
-			&i.LastSyncedAt,
-			&i.LastError,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const setGithubProjectItemStatusMarker = `-- name: SetGithubProjectItemStatusMarker :exec
 UPDATE github_project_items
 SET last_status_option_id = $1, last_synced_at = now()
