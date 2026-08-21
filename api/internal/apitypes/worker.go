@@ -23,15 +23,11 @@ type WorkerDTO struct {
 	Docker *bool `json:"docker"`
 	// Capabilities is the worker's server-authoritative capability set (PRD #84 M1):
 	// the Filter-ed union of its self-reported caps and its template-derived caps,
-	// v1 vocabulary {docker, jvm}. Read-only display for the workers UI; empty slice
-	// (never null on the wire — emit_empty_slices) when the worker has none.
+	// v1 vocabulary {docker, jvm}. Read-only display for the workers UI. Serialized by
+	// stdlib encoding/json, so nullness rides on whether the slice is nil: pgx yields a
+	// non-nil empty slice for the text[] column, so a worker with no capabilities
+	// encodes as [] rather than null.
 	Capabilities []string `json:"capabilities"`
-	// MemLimitBytes is the worker container's memory ceiling in bytes (the size
-	// envelope surfaced on the workers UI, PRD #84 M1), sourced from the latest stats
-	// sample's stats_mem_limit_bytes column. Null when the container is unlimited, the
-	// sample came from the process fallback, or no sample has arrived — same nullability
-	// as StatsMemLimitBytes, which it mirrors under the heartbeat JSON's field name.
-	MemLimitBytes *int64 `json:"mem_limit_bytes"`
 	// Busy is the any-kind non-terminal signal (PRD #42 Decision 10): true whenever
 	// the worker holds ANY active run, chat included — so a lone active chat still
 	// reads as busy even though active_runs (run-lane only) is 0.

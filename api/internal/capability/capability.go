@@ -34,6 +34,38 @@ var vocabulary = map[string]struct{}{
 // iteration order is not stable). Keep in lockstep with vocabulary.
 var order = []string{Docker, JVM}
 
+// selfReportable is the subset of the vocabulary a worker is allowed to
+// SELF-REPORT. Today it is exactly {docker}: JVM is TEMPLATE-derived and must
+// never be accepted from a worker's own report, or a base worker could spoof a
+// jvm capability it does not have. SelfReportable enforces this before the
+// self-report side is unioned with the template-derived caps.
+var selfReportable = map[string]struct{}{
+	Docker: {},
+}
+
+// SelfReportable returns the members of in that a worker is permitted to
+// SELF-REPORT — today only docker — DROPPING everything else (including the
+// template-derived jvm), deduped, in stable vocabulary order. It is the gate the
+// self-report side passes through before it is unioned with template-derived
+// caps at register, so a worker cannot smuggle a template-only capability past
+// the scheduler by announcing it.
+func SelfReportable(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	for _, name := range in {
+		if _, ok := selfReportable[name]; !ok {
+			continue
+		}
+		seen[name] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for _, name := range order {
+		if _, ok := seen[name]; ok {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 // templateCaps maps a worker-template registry name (workertmpl.Names) to the
 // capabilities that template implies. A template absent from this map — or the
 // empty string — contributes nothing (returns {}), which is the correct answer

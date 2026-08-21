@@ -464,8 +464,8 @@ export function WorkersSettings() {
                       {/* Size envelope (PRD #84 M1): the container mem ceiling from the
                           latest stats sample. Null when unlimited / process-fallback /
                           no sample yet — then say nothing rather than "0". Read-only. */}
-                      {w.mem_limit_bytes != null && w.mem_limit_bytes > 0 && (
-                        <span>· {formatBytes(w.mem_limit_bytes)} limit</span>
+                      {w.stats_mem_limit_bytes != null && w.stats_mem_limit_bytes > 0 && (
+                        <span>· {formatBytes(w.stats_mem_limit_bytes)} limit</span>
                       )}
                       {/* Issue #124: worker self-reported (sanitizeSelfReported at ingest). */}
                       {w.version && <span>· v{stripUnsafeChars(w.version)}</span>}

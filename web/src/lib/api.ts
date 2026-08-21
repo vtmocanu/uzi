@@ -1036,10 +1036,6 @@ export interface Worker {
   // {docker, jvm}. Read-only display. Optional so an older response (or a test
   // fixture) without the field reads as "none".
   capabilities?: string[];
-  // The worker container's memory ceiling in bytes (the size envelope, PRD #84 M1),
-  // mirroring stats_mem_limit_bytes under the heartbeat JSON's field name. Null when
-  // unlimited, from the process fallback, or no sample has arrived.
-  mem_limit_bytes?: number | null;
   busy: boolean; // derived: holds a claimed/running/awaiting_approval run (== active_runs > 0)
   // Bounded concurrency (PRD #42 Decision 10). active_runs is the live count of the
   // worker's claimed/running/awaiting_approval runs (busy is derived from it);

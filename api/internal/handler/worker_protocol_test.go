@@ -204,9 +204,11 @@ func TestWorkerRegisterToleratesCapabilities(t *testing.T) {
 	// PRD #83 Q1: an M1 worker with a daemon wired sends {"capabilities":["docker"]}.
 	// DecodeJSON rejects unknown fields, so register MUST declare the field or the
 	// worker 400s on register and wedges its retry loop — the compat rule (the api
-	// tolerates `capabilities` in the SAME release the worker starts sending it). M1 is
-	// accept-and-ignore: no column, no DTO surface, just no 400. An empty array and an
-	// absent field must both be tolerated too.
+	// tolerates `capabilities` in the SAME release the worker starts sending it). M1
+	// now PERSISTS the reported set (server-Filter-ed) to workers.capabilities and
+	// surfaces it on the DTO; this test asserts only the tolerance contract — an
+	// unknown, empty, or absent `capabilities` must never 400 register. An empty array
+	// and an absent field must both be tolerated too.
 	for _, body := range []string{
 		`{"name":"laptop","version":"1.2.3","capabilities":["docker"]}`,
 		`{"name":"laptop","version":"1.2.3","capabilities":[]}`,

@@ -999,12 +999,14 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 	// NULL (an older image, or M3a before the M2 agent sends it). Observability
 	// only — the server never enforces it, so it is stored exactly as reported.
 	//
-	// capabilities is the STORED set (PRD #84 M1): the server-owned Filter applied to
-	// the union of the worker's self-reported caps and the template-derived caps. The
-	// column is therefore authoritative — an unknown/garbled self-report name is
-	// dropped here, never persisted — so a later milestone's peer subquery can read
-	// workers.capabilities directly. Filter also dedupes and stabilizes order.
-	storedCaps := capability.Filter(append(append([]string{}, capabilities...), capability.TemplateCapabilities(template)...))
+	// capabilities is the STORED set (PRD #84 M1): the union of the worker's
+	// SELF-REPORTABLE caps and the template-derived caps. capability.SelfReportable
+	// restricts the self-report side to names a worker is allowed to announce (today
+	// only docker), so a base worker cannot spoof a template-only capability like jvm
+	// by self-reporting it. The union is passed through Filter for vocabulary
+	// validation, dedupe, and stable order — so the column stays authoritative and a
+	// later milestone's peer subquery can read workers.capabilities directly.
+	storedCaps := capability.Filter(append(capability.SelfReportable(capabilities), capability.TemplateCapabilities(template)...))
 	row, err := s.q.RegisterWorker(ctx, store.RegisterWorkerParams{
 		Version:           pgText(version),
 		TemplateReported:  pgText(template),

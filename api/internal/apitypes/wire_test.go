@@ -492,10 +492,9 @@ func TestPipelineDTOTags(t *testing.T) {
 var workerDTOKeys = []string{
 	"id", "name", "status", "kind", "hosted_size", "docker", "busy", "active_runs",
 	// PRD #84 M1: the server-authoritative capability set (Filter-ed union of the
-	// worker's self-report and its template-derived caps, v1 vocabulary {docker, jvm}),
-	// and the container mem ceiling (size envelope) mirroring stats_mem_limit_bytes
-	// under the heartbeat JSON's field name. Both read-only display for the workers UI.
-	"capabilities", "mem_limit_bytes",
+	// worker's self-report and its template-derived caps, v1 vocabulary {docker, jvm}).
+	// Read-only display for the workers UI.
+	"capabilities",
 	"max_concurrent_runs", "template_declared", "template_reported", "version",
 	// PRD #113: derived upgrade health, computed at read time from `version` against
 	// the control-plane release. Derived rather than stored, so nothing in the store

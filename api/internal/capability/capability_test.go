@@ -65,3 +65,26 @@ func TestFilter_EmptyAndAllUnknown(t *testing.T) {
 		t.Errorf("Filter(all-unknown) = %v, want empty", got)
 	}
 }
+
+// TestSelfReportable_DropsTemplateAndUnknown proves the self-report gate keeps
+// ONLY docker: jvm is template-derived and must never survive a worker's own
+// report, and an unknown name is dropped like Filter drops it.
+func TestSelfReportable_DropsTemplateAndUnknown(t *testing.T) {
+	got := SelfReportable([]string{"jvm", "docker", "gpu"})
+	want := []string{"docker"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("SelfReportable dropped/kept wrong names: got %v, want %v", got, want)
+	}
+}
+
+func TestSelfReportable_DedupesStableOrderAndEmpty(t *testing.T) {
+	if got := SelfReportable([]string{"docker", "docker"}); !reflect.DeepEqual(got, []string{"docker"}) {
+		t.Errorf("SelfReportable(dupes) = %v, want [docker]", got)
+	}
+	if got := SelfReportable(nil); len(got) != 0 {
+		t.Errorf("SelfReportable(nil) = %v, want empty", got)
+	}
+	if got := SelfReportable([]string{"jvm", "gpu"}); len(got) != 0 {
+		t.Errorf("SelfReportable(no self-reportable names) = %v, want empty", got)
+	}
+}

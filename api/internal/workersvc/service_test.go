@@ -2056,6 +2056,23 @@ func TestRegisterUnionsAndFiltersCapabilities(t *testing.T) {
 	}
 }
 
+func TestRegisterBaseTemplateDropsSelfReportedJVM(t *testing.T) {
+	// A base worker self-reports ["jvm","docker"]. jvm is TEMPLATE-derived and not
+	// self-reportable, so the stored set is only ["docker"] — the base worker cannot
+	// spoof a jvm capability its template does not imply (PRD #84 M1).
+	w := worker()
+	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, []string{"jvm", "docker"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	got := fs.registerParams.Capabilities
+	if len(got) != 1 || got[0] != "docker" {
+		t.Fatalf("register capabilities = %v, want [docker] (self-reported jvm must be dropped)", got)
+	}
+}
+
 func TestRegisterBaseTemplateNoSelfReportEmptyCapabilities(t *testing.T) {
 	// A base-template worker that self-reports nothing stores the empty set (PRD #84
 	// M1 success criterion: base with no self-report → {}).
