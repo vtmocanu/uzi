@@ -401,6 +401,12 @@ type Store interface {
 	PromoteLimitWaitRuns(ctx context.Context, now pgtype.Timestamptz) ([]store.PromoteLimitWaitRunsRow, error)
 	MarkRunFailedByID(ctx context.Context, arg store.MarkRunFailedByIDParams) (int64, error)
 	CancelRunServerSide(ctx context.Context, arg store.CancelRunServerSideParams) (int64, error)
+	// CancelRunByWorker is the LIVE-worker cancel transition (PRD #503 M1). SetState's
+	// failed arm routes here (instead of SetRunFailed) when the loaded run carries
+	// stop_kind='cancelled', so an operator cancel ends 'cancelled'/NULL fail_origin —
+	// converging with CancelRunServerSide — rather than being mis-classified as
+	// agent_failure. Worker-scoped because SetState holds a worker, not a user.
+	CancelRunByWorker(ctx context.Context, arg store.CancelRunByWorkerParams) (int64, error)
 	RejectRunServerSide(ctx context.Context, arg store.RejectRunServerSideParams) (int64, error)
 	// FailRunAutoStop is the server-side half of PRD #108 M5's auto-stop. Unlike
 	// its two neighbours it takes no user_id: it is driven by the sweeper, not by a
@@ -3128,30 +3134,58 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	case "limit_wait":
 		rows, err = s.setLimitWait(ctx, owned, wkr, req, sessionID)
 	case "failed":
-		// PRD #69 M7a: stamp the TRUSTED failure class. The worker-reported origin is
-		// UNTRUSTED, so CoerceFailOrigin allowlists it (unknown → nil) before it reaches
-		// the DB. A classless (nil) failure is exactly the judgeable AGENT-FAILURE case —
-		// an ordinary agent death reports `failed` with no fail_origin — so it defaults to
-		// 'agent_failure' here rather than storing NULL (NULL is reserved for pre-feature /
-		// unclassified rows). The rate-limit opt-out path sends fail_origin='rate_limited'.
-		failOrigin := "agent_failure"
-		if o := CoerceFailOrigin(req.FailOrigin); o != nil {
-			failOrigin = *o
+		// PRD #503 M1 (REC A): a LIVE worker cannot report a `cancelled` terminal status —
+		// there is no `cancelled` case in this switch — so a consumed cancel or plan-reject
+		// verdict arrives here as `failed`. The run's stop_kind was stamped by
+		// CreateStopVerdictInput BEFORE this report, so it is already on the loaded `owned`
+		// row; branch on it BEFORE the agent_failure default so an operator's deliberate stop
+		// is not mis-classified as an agent failure (which would also get judged, contradicting
+		// "cancelled runs are not judged").
+		switch {
+		case owned.StopKind.Valid && owned.StopKind.String == "cancelled":
+			// Route to a `cancelled` transition (status 'cancelled', fail_origin NULL),
+			// converging with the server-side CancelRunServerSide path. SetRunFailed is NOT
+			// called. rows drives the same applied/not-applied logic below (execrows, like
+			// SetRunFailed).
+			rows, err = s.q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{
+				ID: runID, WorkerID: pgUUID(wkr.ID),
+			})
+		case owned.StopKind.Valid && owned.StopKind.String == "plan_rejected":
+			// A live plan-reject: stamp fail_origin='plan_rejected' (overriding the untrusted
+			// req.FailOrigin, which the worker cannot forge), matching the server-side
+			// RejectRunServerSide path rather than defaulting to agent_failure.
+			rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
+				FailureReason:  limitAwareFailureReason(req),
+				FailOrigin:     pgText("plan_rejected"),
+				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
+				SessionID:      sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+			})
+		default:
+			// PRD #69 M7a: stamp the TRUSTED failure class. The worker-reported origin is
+			// UNTRUSTED, so CoerceFailOrigin allowlists it (unknown → nil) before it reaches
+			// the DB. A classless (nil) failure is exactly the judgeable AGENT-FAILURE case —
+			// an ordinary agent death reports `failed` with no fail_origin — so it defaults to
+			// 'agent_failure' here rather than storing NULL (NULL is reserved for pre-feature /
+			// unclassified rows). The rate-limit opt-out path sends fail_origin='rate_limited'.
+			failOrigin := "agent_failure"
+			if o := CoerceFailOrigin(req.FailOrigin); o != nil {
+				failOrigin = *o
+			}
+			rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
+				// PRD #35 §7.8: when a `failed` report carries the structured limit fields,
+				// the SERVER composes the sentence from its own allowlisted enum and replaces
+				// whatever text the worker sent. That is the opt-out path (a run with
+				// wait_on_limit=false reports failed directly), and letting the worker compose
+				// it would put the enum on the untrusted side of the wire — the criterion "a
+				// compromised worker cannot smuggle a non-enum rate_limit_type past the
+				// server" would then be false on exactly the path a human reads. When the
+				// fields are absent this is nil and every other failure path is untouched.
+				FailureReason:  limitAwareFailureReason(req),
+				FailOrigin:     pgText(failOrigin),
+				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
+				SessionID:      sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+			})
 		}
-		rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
-			// PRD #35 §7.8: when a `failed` report carries the structured limit fields,
-			// the SERVER composes the sentence from its own allowlisted enum and replaces
-			// whatever text the worker sent. That is the opt-out path (a run with
-			// wait_on_limit=false reports failed directly), and letting the worker compose
-			// it would put the enum on the untrusted side of the wire — the criterion "a
-			// compromised worker cannot smuggle a non-enum rate_limit_type past the
-			// server" would then be false on exactly the path a human reads. When the
-			// fields are absent this is nil and every other failure path is untouched.
-			FailureReason:  limitAwareFailureReason(req),
-			FailOrigin:     pgText(failOrigin),
-			PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
-			SessionID:      sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
-		})
 	default:
 		return store.Run{}, false, ErrInvalidState
 	}

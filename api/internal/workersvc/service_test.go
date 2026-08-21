@@ -271,7 +271,13 @@ type fakeStore struct {
 	createdStopVerdict *store.CreateStopVerdictInputParams
 	createdApproval    *store.CreateApprovePlanInputParams
 	cancelled          *store.CancelRunServerSideParams
-	rejected           *store.RejectRunServerSideParams
+	// cancelledByWorker captures the PRD #503 M1 live-worker cancel transition; SetState's
+	// failed arm calls it (instead of SetRunFailed) when the loaded run's stop_kind is
+	// 'cancelled'. cancelledByWorkerRows is the rows-affected it returns (defaults to 1 →
+	// applied, like the SetRunFailed fake).
+	cancelledByWorker     *store.CancelRunByWorkerParams
+	cancelledByWorkerRows int64
+	rejected              *store.RejectRunServerSideParams
 
 	// Create run.
 	repoRow         store.GetRepoForUserRow // repo GetRepoForUser returns (zero value = the pre-#191 empty row)
@@ -852,6 +858,18 @@ func (f *fakeStore) CreateApprovePlanInput(_ context.Context, arg store.CreateAp
 }
 func (f *fakeStore) CancelRunServerSide(_ context.Context, arg store.CancelRunServerSideParams) (int64, error) {
 	f.cancelled = &arg
+	return 1, nil
+}
+
+// CancelRunByWorker (PRD #503 M1) records the live-worker cancel transition. Rows
+// defaults to 1 (applied) like the SetRunFailed fake, so a fixture that says nothing gets
+// an applied transition; a test wanting the no-op path sets cancelledByWorkerRows<0 — but
+// the common case is 0 meaning "unset", which we map to 1.
+func (f *fakeStore) CancelRunByWorker(_ context.Context, arg store.CancelRunByWorkerParams) (int64, error) {
+	f.cancelledByWorker = &arg
+	if f.cancelledByWorkerRows != 0 {
+		return f.cancelledByWorkerRows, nil
+	}
 	return 1, nil
 }
 func (f *fakeStore) RejectRunServerSide(_ context.Context, arg store.RejectRunServerSideParams) (int64, error) {

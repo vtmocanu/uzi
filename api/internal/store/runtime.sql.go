@@ -137,6 +137,44 @@ func (q *Queries) AdminUsageTotals(ctx context.Context) (AdminUsageTotalsRow, er
 	return i, err
 }
 
+const cancelRunByWorker = `-- name: CancelRunByWorker :execrows
+UPDATE runs SET
+    status             = 'cancelled',
+    fail_origin        = NULL,
+    move_pending_since = now(),
+    finished_at        = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at         = now()
+WHERE id = $1 AND worker_id = $2
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+`
+
+type CancelRunByWorkerParams struct {
+	ID       uuid.UUID   `json:"id"`
+	WorkerID pgtype.UUID `json:"worker_id"`
+}
+
+// Live-worker cancel transition (PRD #503 M1). When a LIVE worker consumes a cancel
+// verdict it reports `failed`; SetState's failed arm routes HERE off the run's already
+// loaded stop_kind='cancelled' (stamped by CreateStopVerdictInput BEFORE this report)
+// instead of SetRunFailed, so an operator cancellation is not mis-classified as
+// 'agent_failure'. This converges the live cancel path with the server-side
+// CancelRunServerSide: status 'cancelled', fail_origin NULL (a cancel is not a failure,
+// so it is never judged — Gate 0). It is worker-scoped (@worker_id) because SetState holds
+// a worker, not a user, so CancelRunServerSide (user_id-scoped) is unusable from it.
+// stop_kind is left untouched (already 'cancelled'). Terminal-run cleanup + guard mirror
+// SetRunFailed exactly, so a report onto an already-terminal run is a 0-row no-op.
+func (q *Queries) CancelRunByWorker(ctx context.Context, arg CancelRunByWorkerParams) (int64, error) {
+	result, err := q.db.Exec(ctx, cancelRunByWorker, arg.ID, arg.WorkerID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const cancelRunServerSide = `-- name: CancelRunServerSide :execrows
 UPDATE runs SET status = 'cancelled', stop_kind = 'cancelled', move_pending_since = now(), finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
