@@ -99,3 +99,56 @@ func TestWorkerDTOCarriesUpgradeClassification(t *testing.T) {
 			never.UpgradeStatus, workersvc.UpgradeStatusUnknown)
 	}
 }
+
+// TestWorkerDTOCarriesDrainingSince pins the workers.draining_since →
+// WorkerDTO.DrainingSince wiring (PRD #496 M1) through BOTH DTO builders, the same
+// way TestWorkerDTOCarriesUpgradeClassification does: a field added to one mapper and
+// forgotten in the other is invisible from the outside. A valid pgtype.Timestamptz
+// must carry its instant through unchanged; a NULL column must map to JSON null (the
+// worker that will claim normally).
+func TestWorkerDTOCarriesDrainingSince(t *testing.T) {
+	ts := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	now := time.Now()
+
+	t.Run("workerDTOFromWorker set", func(t *testing.T) {
+		dto := workerDTOFromWorker(
+			store.Worker{DrainingSince: pgtype.Timestamptz{Time: ts, Valid: true}},
+			0, false, "", "", "", now, now)
+		if dto.DrainingSince == nil {
+			t.Fatalf("DrainingSince = nil, want a non-nil *time.Time for a valid column")
+		}
+		if !dto.DrainingSince.Equal(ts) {
+			t.Fatalf("DrainingSince = %v, want %v", *dto.DrainingSince, ts)
+		}
+	})
+
+	t.Run("workerDTOFromWorker null", func(t *testing.T) {
+		dto := workerDTOFromWorker(
+			store.Worker{DrainingSince: pgtype.Timestamptz{Valid: false}},
+			0, false, "", "", "", now, now)
+		if dto.DrainingSince != nil {
+			t.Fatalf("DrainingSince = %v, want nil for a NULL draining_since column", *dto.DrainingSince)
+		}
+	})
+
+	t.Run("workerDTOFromRow set", func(t *testing.T) {
+		dto := workerDTOFromRow(
+			store.ListWorkersByUserRow{DrainingSince: pgtype.Timestamptz{Time: ts, Valid: true}},
+			"", "", now, now)
+		if dto.DrainingSince == nil {
+			t.Fatalf("DrainingSince = nil, want a non-nil *time.Time for a valid column")
+		}
+		if !dto.DrainingSince.Equal(ts) {
+			t.Fatalf("DrainingSince = %v, want %v", *dto.DrainingSince, ts)
+		}
+	})
+
+	t.Run("workerDTOFromRow null", func(t *testing.T) {
+		dto := workerDTOFromRow(
+			store.ListWorkersByUserRow{DrainingSince: pgtype.Timestamptz{Valid: false}},
+			"", "", now, now)
+		if dto.DrainingSince != nil {
+			t.Fatalf("DrainingSince = %v, want nil for a NULL draining_since column", *dto.DrainingSince)
+		}
+	})
+}
