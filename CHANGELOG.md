@@ -6,13 +6,62 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.50.0] - 2026-08-21
+<!-- release-title: board + Projects v2 sync, worker fleet roll, dependency majors -->
+
 ### Added
 
-- **Clickable issue links on runs ([#411](https://github.com/vtmocanu/uzi/issues/411)).**
-  A run's originating forge issue number now links to the issue on the forge — from the
-  runs list, run detail, dashboard, the board's needs-attention strip, and a schedule's
-  Last fire panel — opening in a new tab, same as the existing Open MR button. Runs with
-  no issue (task, CI-fix, prompt) show a muted kind chip instead of a dead link.
+- **Bidirectional board to GitHub Projects v2 Status sync ([#478](https://github.com/vtmocanu/uzi/pull/478), PRD #364).** A uzi
+  board column-label and its mapped GitHub Projects v2 Status field now stay in sync in
+  both directions: moving a card on the uzi board updates the Projects v2 Status, and a
+  Status change made in GitHub Projects flows back to the uzi board column.
+- **Clickable issue links on runs ([#477](https://github.com/vtmocanu/uzi/pull/477), issue [#411](https://github.com/vtmocanu/uzi/pull/411)).** A run's originating forge issue
+  number now links to the issue on the forge, from the runs list, run detail, dashboard,
+  the board's needs-attention strip, and a schedule's Last fire panel, opening in a new
+  tab like the existing Open MR button. Runs with no issue (task, CI-fix, prompt) show a
+  muted kind chip instead of a dead link.
+- **Repo-enable guardrail violations surfaced in the UI ([#483](https://github.com/vtmocanu/uzi/pull/483), issue [#345](https://github.com/vtmocanu/uzi/pull/345)).** The Repos
+  page now renders the guardrail violations that block a repo from being enabled, with
+  actionable copy and an accessible violations card instead of a generic failure.
+
+### Changed
+
+- **Hosted-worker fleet rolled to 0.50.0.** This release deliberately advances
+  `workers.image.tag` to `0.50.0` (picking up the agent-side base-align fixes below and
+  the TypeScript 7 toolchain upgrade). Under the PRD #422 surge model the controller
+  cordons each busy worker and lets its in-flight run finish before rolling it, bounded
+  by `workers.drainDeadline` (default 24h), so running work is drained rather than
+  killed. `scripts/assert-worker-tag-decoupled.sh`'s pin is bumped to match.
+- **TypeScript 7 (native compiler) in web and agent ([#486](https://github.com/vtmocanu/uzi/pull/486)).** Upgraded from the 5.x
+  series to the native Go port; the app's own types needed no source changes, only the
+  tooling that drives the compiler API programmatically.
+- **Tailwind CSS v4 in web ([#487](https://github.com/vtmocanu/uzi/pull/487)).** Migrated the frontend from Tailwind v3 to v4 through
+  the `@tailwindcss/postcss` plugin, keeping the existing tokenized JS config via
+  `@config`.
+- **Frontend framework majors: React 19 and React Router 7 ([#467](https://github.com/vtmocanu/uzi/pull/467)).**
+- **Build and CI dependency majors: Docker 29 ([#464](https://github.com/vtmocanu/uzi/pull/464)), plus jsdom 30, Helm 4, Ruby 4, and
+  cosign 3 / cosign-installer 4.**
+
+### Fixed
+
+- **Controller no longer leaks orphaned worker pods ([#480](https://github.com/vtmocanu/uzi/pull/480), issue [#360](https://github.com/vtmocanu/uzi/pull/360)).** The worker
+  Deployment now sets a bounded `revisionHistoryLimit`, so wedged pods from superseded
+  ReplicaSets are garbage-collected instead of accumulating.
+- **base-align: conflict-reason truncation and resumed-branch edge ([#475](https://github.com/vtmocanu/uzi/pull/475), issue [#471](https://github.com/vtmocanu/uzi/pull/471)).**
+  A follow-up to #470 that base-aligns the conflict-reason truncation, fixes the
+  resumed-branch edge case, and corrects test naming.
+- **Version popover: the Changelog button is reachable by mouse again ([#474](https://github.com/vtmocanu/uzi/pull/474)), and the
+  stray hover underline on the PRDs link is removed ([#476](https://github.com/vtmocanu/uzi/pull/476)).** An 8px hover gap used to
+  close the popover mid-transit before the pointer reached the Changelog button.
+- **Mock result-frame fixtures now exhibit the divergence class they validate ([#481](https://github.com/vtmocanu/uzi/pull/481),
+  issue [#199](https://github.com/vtmocanu/uzi/pull/199)).** The `num_turns` result-frame mocks are strictly decreasing, so they can
+  actually reproduce the divergence the tests assert against.
+
+### Security
+
+- **Strip terminal-control and bidi override runes from derived chat titles ([#484](https://github.com/vtmocanu/uzi/pull/484), issue
+  [#213](https://github.com/vtmocanu/uzi/pull/213)).** `deriveChatTitle` no longer lets ESC and Unicode bidi override characters into
+  `runs.title`, which renders in the cross-tenant admin runs table.
 
 ## [0.49.0] - 2026-08-20
 <!-- release-title: CLI contexts, in-app changelog, workflow-scope run recovery -->
@@ -2899,7 +2948,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.49.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.50.0...HEAD
+[0.50.0]: https://github.com/vtmocanu/uzi/compare/v0.49.0...v0.50.0
 [0.49.0]: https://github.com/vtmocanu/uzi/compare/v0.48.0...v0.49.0
 [0.48.0]: https://github.com/vtmocanu/uzi/compare/v0.47.0...v0.48.0
 [0.47.0]: https://github.com/vtmocanu/uzi/compare/v0.46.1...v0.47.0
