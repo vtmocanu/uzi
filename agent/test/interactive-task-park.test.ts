@@ -561,6 +561,35 @@ describe("SteeringChannel.awaitFollowUp (PRD #517 M3)", () => {
     await ch.stop();
   });
 
+  it("ends the park with reason idle even when getInputs throws on EVERY tick (persistent input-fetch outage)", async () => {
+    // PRD #517 M5: the park's idle clock is evaluated by serviceFollowUp(), called from the
+    // poll loop. A PERSISTENT run-scoped getInputs failure (e.g. a 500 on ConsumeInputs, or a
+    // not-owned 404) must NOT starve that evaluation — otherwise, concurrent with a healthy
+    // worker heartbeat, the park pins at awaiting_followup forever (a permanent zombie the
+    // heartbeat-keyed stale-worker requeue never sees). The fake client rejects on every tick,
+    // so no follow-up can ever be delivered, yet the idle bound must still finalize the park.
+    // Mutation: move serviceFollowUp() back INSIDE the try block after getInputs (revert the
+    // fix) → the throwing getInputs skips serviceFollowUp on every tick, the idle clock is
+    // never evaluated, and this test hangs forever (never resolves → --test-timeout kills it).
+    let clock = 1000;
+    let calls = 0;
+    const alwaysThrows = {
+      getInputs: async () => {
+        calls++;
+        throw new Error("simulated persistent ConsumeInputs 500");
+      },
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(alwaysThrows, "run-1", 1, nullLogger(), new AbortController(), {
+      now: () => clock,
+    });
+    ch.start();
+    const parked = ch.awaitFollowUp(50); // arms with parkedAt = 1000
+    clock = 1051; // advance past the idle bound; the next (still-throwing) poll tick ends the park
+    assert.deepStrictEqual(await parked, { kind: "ended", reason: "idle" });
+    assert.ok(calls > 0, "getInputs was polled (and threw) on every tick");
+    await ch.stop();
+  });
+
   it("ends the park with reason cancelled when the run is cancelled", async () => {
     // Mutation: drop the `if (this.cancelled)` arm in serviceFollowUp/awaitFollowUp → a
     // cancelled interactive run never leaves its park.

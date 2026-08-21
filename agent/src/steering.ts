@@ -486,26 +486,46 @@ export class SteeringChannel {
       try {
         const inputs = await this.client.getInputs(this.runId);
         for (const inp of inputs) this.route(inp.kind, inp.body ?? undefined);
-        // Route the WHOLE batch, THEN service once: whatever landed may now satisfy a
-        // parked gate. Servicing per-input would let an approve at the head of a
-        // [approve, revise] batch resolve the gate before the revise routes — the revise
-        // would then sit un-consumed (a silent drop that still burned a server cap slot).
-        // One service call per batch evaluates full precedence (revise beats approve) once.
-        this.serviceGate();
-        // Same batch-then-service-once position, for the same reason (PRD #88): an
-        // answer that lands in this batch may satisfy a parked question.
-        this.serviceAnswer();
-        // PRD #517 M3: same position, same reason — a follow-up that lands in this batch may
-        // satisfy a parked interactive-task waiter, and servicing it HERE (post-route) is
-        // what makes the delivered follow-up already-consumed (the wake-guard ordering). Also
-        // re-evaluated every idle tick so a park with no follow-up ends on its idle bound.
-        this.serviceFollowUp();
       } catch (err) {
+        // The loop continues on a getInputs failure (HTTP >=400 / timeout) — but only the
+        // FETCH is skipped, not the service step below. PRD #517 M5: serviceFollowUp()
+        // evaluates the interactive park's idle clock and is called ONLY from this loop, so
+        // if the service step lived inside this try a PERSISTENT run-scoped getInputs outage
+        // (a 500 on ConsumeInputs, a not-owned 404 flip) concurrent with a healthy worker
+        // heartbeat would starve the idle finalize forever — pinning the park at
+        // awaiting_followup as a permanent zombie the heartbeat-keyed stale-worker requeue
+        // never sees. Log and fall through; the service step runs regardless.
         this.log.warn("steering: input poll failed", {
           run_id: this.runId,
           error: errMessage(err),
         });
       }
+      // Service the parked waiters on EVERY tick, OUTSIDE the try above, so a getInputs
+      // failure cannot starve them (PRD #517 M5). serviceGate/serviceAnswer/serviceFollowUp
+      // operate PURELY on in-memory state — the buffered verdict/answer/follow-up, the
+      // sticky cancel/stop flags, and the channel-owned idle clock — never on the getInputs
+      // result, so running them on a failed tick is safe and delivers nothing NEW: a
+      // follow-up (and a verdict/answer/cancel/stop) still only ENTERS via route() from a
+      // SUCCESSFUL batch, so follow-up/stop/cancel delivery semantics are unchanged. What a
+      // failed tick still evaluates is the idle bound (serviceFollowUp) and any event
+      // already buffered by a prior successful batch. (This mirrors ChatSteering.pollLoop,
+      // which likewise services its waiter after the catch.)
+      //
+      // Route the WHOLE batch, THEN service once: whatever landed may now satisfy a parked
+      // gate. Servicing per-input would let an approve at the head of a [approve, revise]
+      // batch resolve the gate before the revise routes — the revise would then sit
+      // un-consumed (a silent drop that still burned a server cap slot). One service call
+      // per batch evaluates full precedence (revise beats approve) once.
+      this.serviceGate();
+      // Same batch-then-service-once position, for the same reason (PRD #88): an
+      // answer that lands in this batch may satisfy a parked question.
+      this.serviceAnswer();
+      // PRD #517 M3: same position, same reason — a follow-up that lands in this batch may
+      // satisfy a parked interactive-task waiter, and servicing it HERE (post-route) is
+      // what makes the delivered follow-up already-consumed (the wake-guard ordering). Also
+      // re-evaluated every idle tick so a park with no follow-up ends on its idle bound —
+      // including on a tick where getInputs threw (PRD #517 M5).
+      this.serviceFollowUp();
       if (this.stopped) break;
       await this.sleepFn(this.pollMs);
     }
