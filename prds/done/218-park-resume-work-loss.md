@@ -383,7 +383,7 @@ clone was destroyed, recreated at the same path, and the session still resolved
   recoverable across workers means pushing to the forge, which is R2.
 - **R2 — pushing on park is NOT in scope, and it has a closed decision record that
   must be engaged rather than re-opened.** PRD #110
-  (`prds/110-checkpoint-agent-work.md`, *"Closed — will not implement"*) rejected
+  (`prds/done/110-checkpoint-agent-work.md`, *"Closed — will not implement"*) rejected
   push-during-run on a PAT-disclosure argument. **That objection may not survive
   at park time**, for a reason this PRD already establishes: #110's case rests on
   a checkpoint being mid-run so the agent tree cannot be reaped, and at park the

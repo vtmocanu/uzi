@@ -7,7 +7,7 @@ verified with `git fetch origin && git rev-parse origin/main` at kickoff, 2026-0
 only name the section that moved. The upstream statement of the problem is GitLab issue
 **#224** (`env -u GITLAB_TOKEN glab issue view 224`) — read it, it carries the raw eviction evidence.
 `.claude/agent-team-tasks/` is gitignored here (`.gitignore:52`), so the brief lives in `prds/`,
-alongside its sibling `prds/218-park-resume-work-loss.md`.
+alongside its sibling `prds/done/218-park-resume-work-loss.md`.
 
 ---
 

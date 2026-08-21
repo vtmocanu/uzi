@@ -1388,6 +1388,17 @@ the only gate).
   versions reached the right conclusion from a mechanism that does not carry it,
   and the mechanism is the half a reader reasons from when deciding whether adding
   a directory to `extraLinkFiles` is safe.)*
+- **Outside-`docs/` scope (full checkout only)**: `ARCHITECTURE.md`, `README.md`,
+  `CLAUDE.md`, `.claude/rules/**` (recursive, symlink-following), `specs/*.md`,
+  `adr/*.md` (both flat), and **`prds/**/*.md`** get the relative-link existence
+  check plus a backticked-artifact-path check (issue #189 — a `` `prds/…md` ``/
+  `` `adr/…md` `` written in backticks is not a markdown link, so the link check is
+  blind to it; strict real-filename shape only, opt a line out with
+  `check-docs:ignore-path`). `prds/` is walked **recursively including `prds/done/`**
+  (issue #343): a PRD archived by `git mv prds/X.md prds/done/X.md` silently rots
+  its inbound relative + backticked links, and the earlier flat walk was blind to
+  the whole `prds/done/` population (MR !354 had to repair 16 such links by hand
+  with no CI signal). This reverses the deliberate flat scoping of 2026-08-03.
 
 ## 59. Screenshots: placeholders now, real captures as one final commit
 
