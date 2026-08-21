@@ -6,6 +6,19 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Added
+
+- **Interactive, long-lived task runs (PRD #517, issue [#517](https://github.com/vtmocanu/uzi/issues/517)).**
+  `uzi handoff --interactive` keeps a task run alive past a clean `signal_done` instead of
+  finalizing it: the run checkpoint-pushes its branch and parks in a new non-terminal
+  status, `awaiting_followup`, holding the same agent session, clone and branch open.
+  `uzi run follow-up <id>` wakes it for another turn with full context (no history
+  replay); the new `uzi run stop <id>` winds it down gracefully (finalize, optional MR)
+  as a distinct alternative to the hard-abort `run cancel`; and a forgotten park is
+  finalized on its own by a 30-minute worker-side idle timeout
+  (`WORKER_TASK_IDLE_TIMEOUT`), with the existing stale-worker requeue as the dead-worker
+  backstop so no checkpoint-pushed work is ever lost.
+
 ### Changed
 
 - **Lead agent run-context guidance (PRD #501).** The builtin `lead` template and the

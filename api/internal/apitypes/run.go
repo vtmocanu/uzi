@@ -495,10 +495,11 @@ type RunEventDTO struct {
 	CreatedAt     *time.Time      `json:"created_at,omitempty"`
 	// Status is set on "state" frames and is a CLOSED set enforced by a database
 	// CHECK constraint (runs.status, created by 00020_workers_runs.sql, widened with
-	// 'limit_wait' by 00091_run_limit_wait.sql and with 'awaiting_input' by
-	// 00092_run_awaiting_input.sql): queued, claimed, running, awaiting_approval,
-	// limit_wait, awaiting_input, completed, failed, cancelled — NINE values. It is
-	// the field that decides whether a run reads as still live, so an unrecognised
-	// value must never reach a consumer as-is.
+	// 'limit_wait' by 00091_run_limit_wait.sql, with 'awaiting_input' by
+	// 00092_run_awaiting_input.sql, and with 'awaiting_followup' by
+	// 00144_interactive_task_runs.sql): queued, claimed, running, awaiting_approval,
+	// limit_wait, awaiting_input, awaiting_followup, completed, failed, cancelled —
+	// TEN values. It is the field that decides whether a run reads as still live, so
+	// an unrecognised value must never reach a consumer as-is.
 	Status string `json:"status,omitempty"` // set on "state" frames
 }

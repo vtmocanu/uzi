@@ -21744,3 +21744,82 @@ auto-unlock across restart, a PRD non-goal we keep). Full rationale in the Decis
 - **Non-goals respected (per the PRD):** no auto-unlock of OIDC vaults across restart; no
   RollingUpdate/surge worker pods (RWO PVCs — Recreate stays); single-replica API assumption
   unchanged.
+
+## 564. PRD #517 — interactive, long-lived task runs: opt-in park at a new `awaiting_followup`, `run stop` wind-down, worker-side idle backstop
+
+Extends PRD #400's `task` kind with an opt-in conversational mode: a task marked
+`--interactive` does NOT terminate on a clean `signal_done` — it parks in-process at a NEW
+non-terminal status and resumes the SAME SDK session on the next `uzi run follow-up`,
+iterating until `uzi run stop` winds it down to `completed`. Serves human.md's interactive-run
+requirement; the `main`-never-touched invariant and the `task` guardrails are unchanged. Full
+rationale in the Decision Log of `prds/done/517-interactive-task-runs.md`. <!-- check-docs:ignore-path: PRD is being moved to prds/done/ this milestone; cite the destination path -->
+
+
+- **`runs.interactive`, threaded like `open_mr`.** A `boolean NOT NULL DEFAULT false` column
+  (migration `00144`), false for every existing and non-interactive run, riding create→row→claim
+  exactly as PRD #400's `open_mr` does — a plain bool that re-delivers unchanged on every claim
+  (`--interactive` on `uzi handoff`). `--interactive --then-fix` is REJECTED at the CLI (exit 2,
+  `ExitUsage`): `--then-fix` winds a run down into a chained review+fix while `--interactive`
+  keeps it alive, so they are mutually exclusive rather than silently reconciled.
+
+- **A NEW non-terminal status `awaiting_followup`, not a reuse.** `00144` widens
+  `runs_status_check` to a tenth value (verbatim carry of the live nine from `00092`, the
+  drop+re-add discipline). It is deliberately distinct: `awaiting_input` means "answer a
+  question" and fails on timeout, and staying `running` would hide the park — a user-visible
+  "your turn" park is the feature. `SetRunAwaitingFollowup` is a sibling of
+  `SetRunAwaitingInput`/limit_wait (same PRD #47 exit contract, same load-bearing health clear)
+  but takes NO `open_question_id`: the park is not gated on a question, it resumes on a consumed
+  `follow_up`. The worker-side kind/interactive guard lives in `SetState`, so the park is
+  accepted only for an interactive task run.
+
+- **The full SQL status-set placement of `awaiting_followup`** (each decided on the merits, not
+  reflexively): added to the recovery IN-lists (both the register-time orphan sweeps and the
+  stale-heartbeat `RequeueRunsOfStaleWorkers`), the concurrency/load reads, and the credential
+  in-flight counter (`anthropic_rate_limits.sql`); EXCLUDED from autostop (SQL backstop in
+  `RejectRunServerSide`'s sibling, since the park's message writes have stopped, not looped) and
+  from `SweepRunningTimeout`; kept OUT of `terminalStatuses` (`workersvc/service.go`). A
+  Decision-7 WAKE GUARD on `SetRunRunning`: the `awaiting_followup`→`running` transition is
+  admitted only when a CONSUMED `follow_up` input exists, as a third independent clause beside
+  the `answer` gate — so a stale/duplicate pre-park `running` report cannot un-park an idle task
+  and re-arm the wall clock. It is not keyed on a per-park identity (M1 added no `follow_up`
+  analog of `open_question_id`); the residual is bounded by the outer `worker_id` pin.
+
+- **`run stop` = a new `stop` steering-input kind, not a cancel.** Owner-scoped via `SubmitInput`,
+  written by `CreateStopVerdictInput` which stamps `stop_kind='stopped'` in the SAME statement as
+  the input (PRD #33 atomicity), a fourth `stop_kind` value that folds in with the human stops
+  (`cancelled`/`plan_rejected`), NOT with `auto_stopped`. Unlike `cancel`, stop finalizes
+  GRACEFULLY: the worker pushes, opens an MR iff `open_mr`, and reports `completed`; `stop_kind`
+  survives the `SetRunCompleted` transition. `--review` then composes via that completed
+  transition. The `stop` kind is a distinct SQL enum value (`run_user_inputs.kind`, `00144`) — a
+  genuinely new kind here, safe because the interactive worker is new code that recognises it
+  (contrast auto-stop, which reused `cancel` to stay safe on the older fleet).
+
+- **Worker follow-up waiter: `awaitFollowUp` on the task-lane `SteeringChannel`.** A blocking
+  wait with route-then-service / drain-after-arm discipline (no lost wakeup): a follow-up/stop/
+  cancel that arrived before the executor armed the waiter is buffered and delivered on arm.
+  `serviceFollowUp` precedence is cancelled → stop → buffered follow-up → idle. CRITICALLY, the
+  park's idle clock is evaluated on EVERY poll tick even when `getInputs` fails: `serviceFollowUp`
+  is called OUTSIDE the fetch `try` (it operates purely on in-memory state), so a persistent
+  run-scoped input-fetch outage cannot strand the park as a heartbeat-invisible zombie.
+
+- **Checkpoint-push at every park.** On each `signal_done` park the worker best-effort
+  checkpoint-pushes the branch tip (reap-then-git) before blocking, so a dead-worker recovery is
+  a requeue-and-resume, not commit loss. Best-effort by design (PRD Decision 4: "a park that
+  fails is worse than a park that loses work") — the park proceeds even if the push failed, with
+  the worker PVC and a later re-push as backstops.
+
+- **Idle timeout (M5): worker-side is primary; NO separate server park-age sweep.** The primary
+  backstop is `WORKER_TASK_IDLE_TIMEOUT` (default 30m, `parseDuration` in api config), delivered
+  on the claim as `task_idle_timeout_seconds` and consumed by the worker's `awaitFollowUp` (with
+  a compiled fallback for an older server) → graceful finalize → `completed`. The server-side
+  "requeue a dead-worker park" backstop is the EXISTING `RequeueRunsOfStaleWorkers` (park added
+  to its IN-list), NOT a new park-age `TASK_IDLE_TIMEOUT` sweep — that separate sweep was
+  deliberately NOT built: redundant for a dead worker (the stale-worker requeue already covers
+  it) and unsafe for a live-but-stuck worker (it would race a second worker onto the same run).
+
+- **Wall-clock exemption.** Interactive runs are exempted from `SweepRunningTimeout` on their
+  KIND (`interactive = false` filter), covering both the park (already `status <> 'running'`) and
+  the resumed `running` state. `started_at` is stamped once and never reset, so a legitimately
+  resumed long-lived session would sit past `RUN_TIMEOUT` and be wall-clock-killed on the first
+  tick — the exact use case the feature exists for. Interactive runs are user-paced like chat and
+  are bounded instead by the M5 idle timeout, so the exemption must live on kind, not status.

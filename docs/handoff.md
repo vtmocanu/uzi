@@ -74,6 +74,49 @@ A handoff can end with a second opinion instead of ending with your pull:
   them to the same `uzi/task/<run-id>` branch, so the whole loop — task,
   review, fix — runs without a manual step in between.
 
+## Interactive mode
+
+A one-shot task is done when the agent calls `signal_done`: it finalizes
+(pushes the branch, opens an MR if you asked) and goes terminal. Pass
+`--interactive` and it doesn't finalize on a clean `signal_done` — it
+**parks** instead, so you can keep iterating with the *same* agent session
+instead of paying for a fresh task's cold-start context every time.
+
+```sh
+uzi handoff -m "add input validation to the signup form" --interactive
+```
+
+- **Park, not finish.** On `signal_done`, an interactive task
+  checkpoint-pushes `uzi/task/<run-id>` and enters a new non-terminal status,
+  `awaiting_followup`, holding its SDK session, clone and branch alive rather
+  than tearing them down.
+- **`uzi run follow-up <run-id>` wakes it.** The *same* agent session resumes
+  with full context (a session-id resume, not a fresh session with the
+  history replayed), takes turns against your follow-up until the next
+  `signal_done`, checkpoint-pushes, and parks again — repeat as many times as
+  you like.
+- **`uzi run stop <run-id>` winds it down on purpose.** Unlike `uzi run
+  cancel`, which aborts mid-turn, `stop` finishes the current turn and
+  finalizes gracefully — push, open the MR iff `--mr` was set — then lands
+  `completed` with a distinct stop disposition. See [uzi
+  CLI](./cli.md#agents-json-and-exit-codes) for its exit codes.
+- **An idle timeout backstops a forgotten park.** If nobody sends a
+  follow-up or a stop, the worker's own clock (`WORKER_TASK_IDLE_TIMEOUT`,
+  default 30 minutes) finalizes the task the same way `run stop` does — push,
+  then `completed` — so a parked task never pins a worker slot indefinitely.
+  Work is checkpoint-pushed at *every* park, not only at wind-down, so a
+  worker dying mid-session never strands unpushed commits.
+- **`--review`/`--mr` compose at wind-down, not at every park.** The
+  diff-review fires once — when the run finally reports `completed`, whether
+  via `run stop` or the idle timeout — never on an intermediate park.
+- **`--interactive --then-fix` is rejected.** `--then-fix` auto-terminates a
+  task into a chained review-and-fix run, which conflicts with keeping the
+  task alive to iterate; the CLI rejects the combination as a usage error
+  (exit 2) rather than guessing which behavior you meant.
+
+Interactive mode is a `uzi handoff` opt-in only — a task run created any
+other way (there is no `uzi run create --interactive`) is always one-shot.
+
 ## Lifecycle and guardrails
 
 - **The branch is always `uzi/task/<run-id>`, server-named.** You never
