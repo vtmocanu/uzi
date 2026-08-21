@@ -1438,7 +1438,8 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
       </MemoryRouter>,
     );
 
-  const strip = () => screen.getByText(/needs approval|needs an answer|looks? stuck|look stuck/);
+  const strip = () =>
+    screen.getByText(/needs approval|needs an answer|awaiting follow-up|looks? stuck|look stuck/);
 
   it("does not double-list an awaiting_approval run flagged waiting_worker", async () => {
     mockApi.listRuns.mockResolvedValue({
@@ -1492,6 +1493,34 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
     await screen.findByText("1 run needs an answer");
     expect(strip().textContent).toBe("1 run needs an answer");
     expect(screen.getAllByRole("link", { name: "Open run for issue #7: Fix the parser" })).toHaveLength(1);
+  });
+
+  it("counts an awaiting_followup run and offers it a jump-chip (PRD #517)", async () => {
+    // A follow-up park is a needs-you state carrying the same loud ring (needsHumanAttention)
+    // as the two parks above, so the strip must tally it and jump-link it. Reverting the
+    // followupRuns bucket drops both the clause and the chip — the strip then undercounts the
+    // visible loud card.
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "run-4", status: "awaiting_followup", health: "ok", issue_iid: 7 })],
+    });
+    renderBoard();
+    await screen.findByText("1 run awaiting follow-up");
+    expect(strip().textContent).toBe("1 run awaiting follow-up");
+    expect(screen.getAllByRole("link", { name: "Open run for issue #7: Fix the parser" })).toHaveLength(1);
+  });
+
+  it("keeps awaiting_followup in its OWN clause, separate from the answer count (PRD #517)", async () => {
+    // A follow-up park is not an unanswered question, so it is its own bucket rather than
+    // folded into questionRuns: two distinct clauses, two distinct chips.
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "run-3", status: "awaiting_input", health: "ok", issue_iid: 7 }),
+        aRun({ id: "run-4", status: "awaiting_followup", health: "ok", issue_iid: 8 }),
+      ],
+    });
+    renderBoard();
+    await screen.findByText("1 run needs an answer · 1 run awaiting follow-up");
+    expect(screen.getAllByRole("link", { name: /Open run for issue #(7|8)/ })).toHaveLength(2);
   });
 });
 

@@ -771,6 +771,14 @@ func TestRunAgeCell(t *testing.T) {
 			want: "10m",
 		},
 		{
+			// awaiting_followup (PRD #517) is a park like the other two — it anchors on
+			// UpdatedAt and renders a waiting duration, NOT "-" (the CLI twin of the web's
+			// runDuration, which added awaiting_followup too).
+			name: "awaiting_followup off UpdatedAt",
+			r:    apitypes.RunDTO{Status: "awaiting_followup", UpdatedAt: now.Add(-20 * time.Minute), CreatedAt: now.Add(-30 * time.Minute)},
+			want: "20m",
+		},
+		{
 			// Terminal is a static span FinishedAt−StartedAt, so a now far from either end
 			// does not change it: this run ran for 2h whenever it is listed.
 			name: "completed is a static ran-span",
@@ -920,6 +928,11 @@ func TestSteerStateOnAParkedRun(t *testing.T) {
 	}
 	if got := steerState(&consumed, "awaiting_approval"); got != "delivered (applies after approval)" {
 		t.Errorf("steerState(consumed, awaiting_approval) = %q — the gate label regressed", got)
+	}
+	// PRD #517: a delivered follow-up while the run is parked awaiting_followup gets the
+	// tailored "resumes the run" copy (the web twin's wording), not the generic "delivered".
+	if got := steerState(&consumed, "awaiting_followup"); got != "delivered (resumes the run)" {
+		t.Errorf("steerState(consumed, awaiting_followup) = %q, want the tailored follow-up label", got)
 	}
 	if got := steerState(nil, "completed"); got != "not delivered (run finished)" {
 		t.Errorf("steerState(unconsumed, completed) = %q — the terminal label regressed", got)

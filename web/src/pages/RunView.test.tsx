@@ -3333,6 +3333,53 @@ describe("the park announcement does not live inside the panel (PRD #88 M2, a11y
   });
 });
 
+// PRD #517 (a11y): a run parking into awaiting_followup is a needs-you state classified
+// identically by needsHumanAttention, so it must announce too — not only awaiting_input.
+// These render the whole page (useRunStream mocked) and read the ALWAYS-MOUNTED sr-only
+// region's CONTENT, which is the actual fix (a region born holding text is silent; the
+// content change is what assistive tech narrates). The parkAnnounce region is a <div>;
+// HealthFlag's is a <span>, so `div.sr-only[role="status"]` targets parkAnnounce uniquely.
+describe("RunView park announcement — awaiting_followup (PRD #517, a11y)", () => {
+  function renderPage(over: Partial<Run>) {
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: true,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    return render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+  }
+
+  it("announces the follow-up park through the always-mounted sr-only region", async () => {
+    renderPage({ status: "awaiting_followup" });
+    const region = await waitFor(() => {
+      const el = document.querySelector('div.sr-only[role="status"]') as HTMLElement | null;
+      if (!el || el.textContent === "") throw new Error("not announced yet");
+      return el;
+    });
+    expect(region.getAttribute("aria-live")).toBe("polite");
+    expect(region.textContent).toBe("The run is waiting for your next follow-up.");
+    // Mutation guard: it is the follow-up copy, NOT the awaiting_input question copy.
+    expect(region.textContent).not.toContain("asking you a question");
+  });
+
+  it("leaves the region empty on a plain running run (nothing to announce)", async () => {
+    renderPage({ status: "running" });
+    await screen.findByText("Add rate limiting");
+    const region = document.querySelector('div.sr-only[role="status"]') as HTMLElement;
+    expect(region.textContent).toBe("");
+  });
+});
+
 // PRD #122: the milestone header badge, the checklist, and the plan-gate candidate list.
 describe("MilestoneBadge (compact M{done}/{total}, PRD #122)", () => {
   const ms = (n: number) =>

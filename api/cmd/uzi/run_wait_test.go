@@ -220,6 +220,32 @@ func TestRunWaitUnknownUntilIsUsageError(t *testing.T) {
 	}
 }
 
+// TestRunWaitHelpAndErrorDerivedFromConstants pins the human-readable status enumerations
+// against their source-of-truth sets so a future status addition that misses a hand-written
+// string reddens here. Mutation that reddens this: hardcoding either string with a status
+// omitted (e.g. the pre-PRD-#517 lists that dropped awaiting_followup).
+func TestRunWaitHelpAndErrorDerivedFromConstants(t *testing.T) {
+	// `run wait --help` names every defaultWaitStates member (the Long help and the --until
+	// flag default are both joined from that slice).
+	fc := &uzicli.FakeClient{}
+	stdout, _, _ := runCLI(t, fakeEnv(fc), "run", "wait", "--help")
+	for _, s := range defaultWaitStates {
+		if !strings.Contains(stdout, s) {
+			t.Errorf("`run wait --help` omits default state %q — the help must enumerate every defaultWaitStates member\n%s", s, stdout)
+		}
+	}
+	// The --until validation error names every valid status (joined from allRunStatusesOrder).
+	_, err := waitTargets([]string{"bogus"})
+	if err == nil {
+		t.Fatal("waitTargets(bogus) returned no error, want a usage error")
+	}
+	for _, s := range allRunStatusesOrder {
+		if !strings.Contains(err.Error(), s) {
+			t.Errorf("--until validation error omits valid status %q; got %q", s, err.Error())
+		}
+	}
+}
+
 func TestRunWaitUnknownStatusSurfacedAndNonTerminal(t *testing.T) {
 	// A status outside the nine-value enum must be surfaced and NOT treated as a stop
 	// state (it is never in --until), so the wait continues to a real target.

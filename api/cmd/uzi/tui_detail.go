@@ -567,7 +567,9 @@ func (m tuiModel) paneTitle(title string, focused bool) string {
 // at a clarification park, which is answered off-TUI (run answer / web / Slack); awaiting_followup
 // (PRD #517) gets its OWN band, distinct from needs-input: an interactive task parked for the
 // user's next follow-up, which is NOT a y/n prompt — the owner sends a follow-up (the `f` key) or
-// stops the run. All show for owner and non-owner alike; only the inline keys are ownership-gated.
+// stops the run. All bands show for owner and non-owner alike; the inline y/n keys are
+// ownership-gated, and the follow-up band's "with f" hint is too (the `f` key is owner-only, so a
+// read-only viewer is pointed at web/Slack instead of an inert key).
 func (m tuiModel) detailBanner() string {
 	owner := m.detail.steer.access == steerAllowed
 	switch m.detail.run.Status {
@@ -576,7 +578,17 @@ func (m tuiModel) detailBanner() string {
 	case "awaiting_input":
 		return m.attentionBanner("✎ NEEDS INPUT", "the agent asked a question; answer it from another terminal, the web, or Slack", false)
 	case "awaiting_followup":
-		return m.attentionBanner("➤ AWAITING FOLLOW-UP", "the task is parked for your next follow-up; send one with f, or from the web or Slack", false)
+		// The "with f" hint is owner-only: the `f` steer key is gated to the run owner
+		// (tui_steer.go), so a read-only viewer is pointed at the web/Slack surfaces
+		// instead of an inert key. Body kept under the awaiting_input banner's width so
+		// the amber band never truncates at the 100-col reference frame. Owners still see
+		// `f` in the footer regardless; withKeys stays false (a follow-up park is not a
+		// y/n prompt).
+		body := "parked for your follow-up — send one from the web or Slack"
+		if owner {
+			body = "parked for your follow-up — send one with f, web, or Slack"
+		}
+		return m.attentionBanner("➤ AWAITING FOLLOW-UP", body, false)
 	}
 	return ""
 }

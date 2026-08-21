@@ -494,17 +494,21 @@ func (m tuiModel) syncedScroll() int {
 	return start
 }
 
-// boardSummary is the top-right glyph cluster: ⚑ N · ✎ N · ▲ N · <total> runs. Zero-count
-// segments are dropped, so a healthy factory reads simply "N runs". Computed over m.board.runs
-// so it does not shrink under a filter.
+// boardSummary is the top-right glyph cluster: ⚑ N · ✎ N · ➤ N · ▲ N · <total> runs.
+// Zero-count segments are dropped, so a healthy factory reads simply "N runs". Computed
+// over m.board.runs so it does not shrink under a filter. All three parks in the NEEDS YOU
+// band get a segment — awaiting_followup (PRD #517) alongside awaiting_approval and
+// awaiting_input — so a follow-up park is never invisible in the summary line.
 func (m tuiModel) boardSummary() string {
-	approvals, inputs, warn := 0, 0, 0
+	approvals, inputs, followups, warn := 0, 0, 0, 0
 	for _, r := range m.board.runs {
 		switch r.Status {
 		case "awaiting_approval":
 			approvals++
 		case "awaiting_input":
 			inputs++
+		case "awaiting_followup":
+			followups++
 		}
 		if stalledHealth[r.Health] {
 			warn++
@@ -516,6 +520,9 @@ func (m tuiModel) boardSummary() string {
 	}
 	if inputs > 0 {
 		segs = append(segs, paintSeg(m.pal.amber, nil, false, "✎ "+itoa(inputs)))
+	}
+	if followups > 0 {
+		segs = append(segs, paintSeg(m.pal.amber, nil, false, "➤ "+itoa(followups)))
 	}
 	if warn > 0 {
 		segs = append(segs, paintSeg(m.pal.stall, nil, false, "▲ "+itoa(warn)))
