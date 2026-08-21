@@ -152,6 +152,11 @@ type fakeStore struct {
 	lastSeqUpdated   *int32
 	setRunningParams *store.SetRunRunningParams
 	setAwaiting      *store.SetRunAwaitingApprovalParams
+	// PRD #517 M2: captures the SetRunAwaitingFollowup arg (nil until the park query
+	// is reached) so a test can assert the accept path was taken and prove the
+	// interactive/task guard rejects BEFORE the query on a mismatched run.
+	setFollowup      *store.SetRunAwaitingFollowupParams
+	setFollowupRows  int64
 	setCompleted     *store.SetRunCompletedParams
 	setFailed        *store.SetRunFailedParams
 	reconciledMR     *store.ReconcileRunMRParams
@@ -656,6 +661,10 @@ func (f *fakeStore) SetRunRunning(_ context.Context, arg store.SetRunRunningPara
 func (f *fakeStore) SetRunAwaitingApproval(_ context.Context, arg store.SetRunAwaitingApprovalParams) (int64, error) {
 	f.setAwaiting = &arg
 	return 1, nil
+}
+func (f *fakeStore) SetRunAwaitingFollowup(_ context.Context, arg store.SetRunAwaitingFollowupParams) (int64, error) {
+	f.setFollowup = &arg
+	return f.setFollowupRows, nil
 }
 func (f *fakeStore) SetRunCompleted(_ context.Context, arg store.SetRunCompletedParams) (int64, error) {
 	f.setCompleted = &arg
@@ -1876,6 +1885,57 @@ func TestSetStateRejectsUnknownState(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	if _, _, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{State: "bogus"}); err != ErrInvalidState {
 		t.Fatalf("err = %v, want ErrInvalidState", err)
+	}
+}
+
+// PRD #517 M2: an interactive task run parks in-process on signal_done. SetState must
+// ACCEPT the awaiting_followup report for such a run (reaching SetRunAwaitingFollowup),
+// and REJECT it as ErrInvalidState for any run that is not BOTH a task run AND
+// interactive — the status is meaningless there and accepting it would strand a
+// non-resumable run in a non-terminal status the follow-up path never wakes.
+func TestSetStateAwaitingFollowupAcceptsInteractiveTask(t *testing.T) {
+	w := worker()
+	fs := &fakeStore{
+		runOwned:        store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "running", Kind: RunKindTask, Interactive: true},
+		setFollowupRows: 1,
+	}
+	svc := New(fs, newBox(t), testParams())
+	_, applied, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{State: "awaiting_followup"})
+	if err != nil {
+		t.Fatalf("SetState(awaiting_followup) on an interactive task: %v", err)
+	}
+	if !applied {
+		t.Fatal("a legitimate interactive-task park must apply (handler answers 200)")
+	}
+	if fs.setFollowup == nil {
+		t.Fatal("SetRunAwaitingFollowup was never called — the accept path did not persist the park")
+	}
+}
+
+// Each fixture flips exactly ONE of the two guard conditions, so a test that dropped
+// either half of `kind == RunKindTask && interactive` would let one of these through;
+// a run holding both would satisfy the guard and could not observe the guard at all.
+// The setFollowup==nil assertion is what makes each case non-vacuous: it proves the
+// rejection happened BEFORE the park query, not that the query merely returned 0 rows.
+func TestSetStateAwaitingFollowupRejectsNonInteractiveOrNonTask(t *testing.T) {
+	w := worker()
+	cases := map[string]store.Run{
+		"task but not interactive":   {Kind: RunKindTask, Interactive: false},
+		"interactive but not a task": {Kind: RunKindIssue, Interactive: true},
+		"neither":                    {Kind: RunKindIssue, Interactive: false},
+	}
+	for name, r := range cases {
+		t.Run(name, func(t *testing.T) {
+			r.ID, r.WorkerID, r.Status = uuid.New(), pgUUID(w.ID), "running"
+			fs := &fakeStore{runOwned: r, setFollowupRows: 1}
+			svc := New(fs, newBox(t), testParams())
+			if _, _, err := svc.SetState(context.Background(), w, r.ID, StateRequest{State: "awaiting_followup"}); !errors.Is(err, ErrInvalidState) {
+				t.Fatalf("err = %v, want ErrInvalidState", err)
+			}
+			if fs.setFollowup != nil {
+				t.Fatal("SetRunAwaitingFollowup must NOT be called for a non-interactive/non-task run — the guard must reject BEFORE the query")
+			}
+		})
 	}
 }
 

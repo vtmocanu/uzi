@@ -89,12 +89,12 @@ SELECT w.*,
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
-             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
        ) AS busy,
        (
            SELECT count(*) FROM runs r
            WHERE r.worker_id = w.id
-             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
              AND r.kind <> 'chat'
        ) AS active_runs,
        -- Roll health (PRD #113 M4), LEFT JOINed so a worker with no report — every
@@ -516,12 +516,12 @@ SELECT sqlc.embed(w),
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
-             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
        ) AS busy,
        (
            SELECT count(*) FROM runs r
            WHERE r.worker_id = w.id
-             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
              AND r.kind <> 'chat'
        ) AS active_runs,
        u.email AS owner_email
@@ -610,7 +610,7 @@ WHERE id = (
                   SELECT count(*) AS active
                   FROM runs pr
                   WHERE pr.worker_id = p.id
-                    AND pr.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+                    AND pr.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
                     AND pr.kind <> 'chat'
               ) pa
               WHERE p.user_id = @user_id
@@ -626,7 +626,7 @@ WHERE id = (
                 AND pa.active * (SELECT w.max_concurrent_runs FROM workers w WHERE w.id = @worker_id)
                     < (SELECT count(*) FROM runs mr
                         WHERE mr.worker_id = @worker_id
-                          AND mr.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+                          AND mr.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
                           AND mr.kind <> 'chat')
                       * p.max_concurrent_runs
           )
@@ -931,7 +931,34 @@ WHERE runs.id = @id AND worker_id = @worker_id
         WHERE run_user_inputs.run_id = @id
           AND run_user_inputs.kind = 'answer'
           AND run_user_inputs.consumed_at IS NOT NULL
-          AND run_user_inputs.question_id = runs.open_question_id));
+          AND run_user_inputs.question_id = runs.open_question_id))
+  -- awaiting_followup → running is guarded the SAME way and for the same reason as
+  -- awaiting_input above (PRD #517 Decision 7), as a THIRD, INDEPENDENT clause. The
+  -- interactive-task park (Decision 3) holds the run in-process at `awaiting_followup`
+  -- after signal_done; the worker resumes ONLY when a `follow_up` steering input has
+  -- been consumed (`uzi run follow-up`, Decision 4 waiter). Requiring a CONSUMED
+  -- follow_up is what ties the wake to the in-process worker on the current claim:
+  -- the outer `worker_id = @worker_id` already pins the worker, and this clause pins the
+  -- CAUSE — a delayed or duplicate PRE-PARK `running` report (the batcher retries, and
+  -- the pre-gate fire-and-forget reports already exist, so reordering is not
+  -- hypothetical) carries no consumed follow_up, so it cannot un-park an idle task and
+  -- re-arm the wall clock. Kept SEPARATE from the two clauses above, never merged into
+  -- a single `status NOT IN (...) OR kind IN (...)`: that would let a consumed `answer`
+  -- satisfy the FOLLOWUP gate (and vice-versa), re-opening #44 F2 sideways.
+  --
+  -- Unlike awaiting_input this clause is NOT keyed on a per-park identity: PRD #517 M1
+  -- added no follow_up analog of open_question_id, so the tie is "a follow_up was
+  -- consumed" rather than "THIS follow_up was consumed". The residual — on a run that
+  -- has already iterated (an earlier follow_up consumed), a stale pre-park report is
+  -- admitted — is bounded by the same in-process hold the whole park relies on, and by
+  -- SetRunRunning being idempotent (a spurious `running` on an in-process worker that
+  -- is genuinely mid-turn is a heartbeat, not a state change). Narrow it to a
+  -- park-scoped follow_up identity if M3+ adds one.
+  AND (status <> 'awaiting_followup' OR EXISTS (
+        SELECT 1 FROM run_user_inputs
+        WHERE run_user_inputs.run_id = @id
+          AND run_user_inputs.kind = 'follow_up'
+          AND run_user_inputs.consumed_at IS NOT NULL));
 
 -- name: SetRunAwaitingApproval :execrows
 UPDATE runs SET
@@ -1232,6 +1259,34 @@ UPDATE runs SET
 WHERE id = @id AND worker_id = @worker_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
+-- name: SetRunAwaitingFollowup :execrows
+-- PRD #517 M2/M3: the interactive-task park. On signal_done an interactive task run
+-- parks here IN-PROCESS (Decision 3) rather than finalizing to `completed`, holding
+-- its worker slot, clone and session alive so `uzi run follow-up` can resume the SAME
+-- agent session with full context. Sibling of SetRunAwaitingInput/limit_wait, and it
+-- carries the same PRD #47 exit contract for the same reason.
+--
+-- Unlike SetRunAwaitingInput there is NO question requirement: the park is not gated
+-- on a clarification question, so it takes no open_question_id (the worker resumes on
+-- a `follow_up` steering input, which SetRunRunning's Decision-7 wake guard keys on).
+--
+-- The health clear is LOAD-BEARING, not cosmetic, exactly as on SetRunAwaitingInput:
+-- awaiting_followup is (like awaiting_input) not a stalled/looping state, so a run
+-- must enter the park with health='ok' or it would carry a stale flag through the
+-- entire park with nothing able to clear it.
+--
+-- The worker-side kind/interactive guard lives in SetState (workersvc): the park is
+-- accepted only for an interactive task run, so this statement stays a plain guarded
+-- status write like its siblings. status NOT IN (terminal) makes a report onto an
+-- already-terminal run (a cancel raced in) a no-op → 0 rows → "already terminal".
+UPDATE runs SET
+    status     = 'awaiting_followup',
+    session_id = COALESCE(sqlc.narg('session_id'), session_id),
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND status NOT IN ('completed', 'failed', 'cancelled');
+
 -- name: SetRunCompleted :execrows
 -- completed is the terminal MR-opened event → Human Review. move_pending_since is
 -- stamped here (same statement as the status write) so a crash before the forge
@@ -1490,7 +1545,14 @@ WHERE id = @id
   -- in that line's own comment, and equally exposed if someone relaxes it. Equally
   -- inert today, and added for the same reason — a backstop belongs where the guard is
   -- enforced, not where it currently happens to be derived.
-  AND status <> 'awaiting_input';
+  AND status <> 'awaiting_input'
+  -- awaiting_followup (PRD #517) is the interactive-task park and the same argument
+  -- transfers verbatim once more: it is excluded today only by autostop.go's single
+  -- `if run.Status != "running"` line, unmentioned in that line's own comment, and
+  -- exposed the day someone relaxes it. An auto-stopped park would be wrong on the
+  -- merits — its message writes have STOPPED (the worker parked after signal_done,
+  -- awaiting a follow-up), not looped — so this is the SQL backstop for that day.
+  AND status <> 'awaiting_followup';
 
 -- name: RejectRunServerSide :execrows
 -- Server-side plan rejection → failed → origin restore → stamp. stop_kind is
@@ -1606,7 +1668,7 @@ UPDATE runs SET status = 'failed', failure_reason = @failure_reason,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND requeue_count >= @max_requeues
   AND worker_id IN (
       SELECT id FROM workers WHERE last_heartbeat_at IS NULL OR last_heartbeat_at < @cutoff
@@ -1621,7 +1683,7 @@ UPDATE runs SET status = 'queued', requeue_count = requeue_count + 1,
     -- detector re-evaluates the queued signal from this transition's updated_at.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND requeue_count < @max_requeues
   AND worker_id IN (
       SELECT id FROM workers WHERE last_heartbeat_at IS NULL OR last_heartbeat_at < @cutoff
@@ -1647,7 +1709,7 @@ UPDATE runs SET status = 'failed', failure_reason = @failure_reason,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE worker_id = @worker_id
-  AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+  AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND requeue_count >= @max_requeues
 RETURNING id;
 
@@ -1660,7 +1722,7 @@ UPDATE runs SET status = 'queued', requeue_count = requeue_count + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE worker_id = @worker_id
-  AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+  AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND requeue_count < @max_requeues;
 
 -- Messages -----------------------------------------------------------------
@@ -2344,7 +2406,7 @@ WHERE w.user_id = @user_id
   AND (w.max_concurrent_runs IS NULL
        OR (SELECT count(*) FROM runs r
             WHERE r.worker_id = w.id
-              AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+              AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
               AND r.kind <> 'chat') < w.max_concurrent_runs);
 
 -- name: CountOnlineWorkersSatisfyingCaps :one

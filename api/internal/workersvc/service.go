@@ -389,6 +389,11 @@ type Store interface {
 	// stamps the question's identity. It clears health on entry, which is what makes
 	// leaving `awaiting_input` out of ListActiveRunsForHealth safe — see the query.
 	SetRunAwaitingInput(ctx context.Context, arg store.SetRunAwaitingInputParams) (int64, error)
+	// SetRunAwaitingFollowup parks an interactive task run in-process after signal_done
+	// (PRD #517 M2/M3, Decision 3), holding the worker slot/clone/session for `uzi run
+	// follow-up` to resume. Like SetRunAwaitingInput it clears health on entry (the same
+	// reason awaiting_followup is safe to leave out of ListActiveRunsForHealth).
+	SetRunAwaitingFollowup(ctx context.Context, arg store.SetRunAwaitingFollowupParams) (int64, error)
 	SetRunCompleted(ctx context.Context, arg store.SetRunCompletedParams) (int64, error)
 	SetRunFailed(ctx context.Context, arg store.SetRunFailedParams) (int64, error)
 	ReconcileRunMR(ctx context.Context, arg store.ReconcileRunMRParams) (int64, error)
@@ -3111,6 +3116,28 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		}
 		rows, err = s.q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
 			OpenQuestionID: pgText(qid), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+		})
+	case "awaiting_followup":
+		// PRD #517 M2/M3 (Decision 3): the interactive-task park. On signal_done an
+		// interactive task run parks IN-PROCESS here instead of finalizing to `completed`,
+		// so the SAME worker holds its slot, clone and SDK session alive for `uzi run
+		// follow-up` to resume with full context. No question requirement (unlike
+		// awaiting_input): the park is not gated on a clarification, and the resume rides a
+		// `follow_up` steering input that SetRunRunning's Decision-7 wake guard keys on.
+		//
+		// ONLY an interactive task run may park this way. The status is meaningless for any
+		// other kind, and accepting it for one would strand a non-resumable run in a
+		// non-terminal status the follow-up path never wakes — so a mismatched report is
+		// genuinely invalid input (a stale, buggy, or hostile worker) and is rejected loudly
+		// with ErrInvalidState, consistent with awaiting_input's missing-question rejection,
+		// rather than silently persisted. A legitimate park always satisfies both guards
+		// (the interactive opt-in is immutable from create, PRD #517 M1), so this never
+		// rejects a real one.
+		if owned.Kind != RunKindTask || !owned.Interactive {
+			return store.Run{}, false, fmt.Errorf("%w: awaiting_followup requires an interactive task run", ErrInvalidState)
+		}
+		rows, err = s.q.SetRunAwaitingFollowup(ctx, store.SetRunAwaitingFollowupParams{
+			SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "completed":
 		// PRD #265 M1: reconcile the milestone tracker from the lead's signal_done
