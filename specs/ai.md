@@ -7688,9 +7688,10 @@ table + Decisions 5, 16, 18, 21. M2 splits existing chi groups so only the enume
   - `POST /api/auth/logout` — shares a group with `/auth/me` but must **split**: logout bumps
     `token_version`, which would kill the user's **browser** sessions from a CLI call.
   - `POST /api/runs/{id}/rejudge` — mints a token-spending run; excluded on the read-vs-spend
-    distinction (D21), **not** by inheritance. After the `/review` swap it is the **only** cookie-only
-    route left in the `/runs` group, so "wrap the whole `/runs` group in `RequireUser`" is the single
-    most tempting M2 shortcut — pinned by a dedicated Bearer-reject test (Criterion 4).
+    distinction (D21), **not** by inheritance. After the `/review` and `FileIssue` (PRD #365) swaps it
+    and `PUT /api/runs/{id}/wait-on-limit` (an unattended-spend consent toggle) are the cookie-only
+    routes left in the `/runs` group, so "wrap the whole `/runs` group in `RequireUser`" is a tempting
+    shortcut that would silently widen them — pinned by a dedicated Bearer-reject test (Criterion 4).
   - **`POST /api/workers`** — mints a plaintext `uzw_` join token whose claim response carries
     **decrypted** `ForgePAT` + `AnthropicOAuthToken`. A non-admin `uzc_` reaching it could exfiltrate a
     forge PAT and a paid credential over HTTPS, defeating `secretbox` + PRD #32's vault, and the minted

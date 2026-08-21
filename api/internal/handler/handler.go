@@ -1198,7 +1198,8 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// Issue-draft (PRD #68 M2): the templated, human-editable draft for
 				// filing a forge issue from one recommendation. A READ (owner-or-admin,
 				// same scoping as the review read); no forge write, no token spend. The
-				// file POST (M3) mounts separately on the cookie+CSRF RequireAuth path.
+				// file POST (PRD #68 M3; moved to RequireUser in PRD #365 M1) mounts just
+				// below in this same RequireUser group.
 				r.Get("/{id}/review/recommendations/{recID}/issue-draft", h.GetIssueDraft)
 				// Triage a recommendation (PRD #94 Decision 5): set/clear the caller's
 				// disposition. RequireUser (CLI-reachable, no token spend, no forge write) —
