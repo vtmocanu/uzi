@@ -3031,6 +3031,23 @@ type StateRequest struct {
 	// before storage. Absent on every other report; a dedicated column keeps report_md's
 	// report-only semantics untouched (PRD D3).
 	PreservedPatch *string `json:"preserved_patch"`
+	// RequiredCapabilities, RequiredTools and SizeClass are the plan-time INFERRED
+	// requirement set the lead emits on the `awaiting_approval` report (PRD #84 M4 4a),
+	// each a tri-state pointer for the same absent="say nothing" semantics as Milestones:
+	// absent (nil) = this report says nothing; a non-nil value = the inferred set. The
+	// worker sends each array only when non-empty. UNTRUSTED on arrival — every name is
+	// Filter-ed / FilterTools-ed against the server-owned vocabulary before storage
+	// (capability package), and SizeClass is clamped to {"s","m","l"}, so a garbled
+	// report cannot smuggle arbitrary strings into the requirement panel. Ignored on
+	// every non-`awaiting_approval` report.
+	//
+	// required_capabilities is UNION-MERGED onto the M2 repo hint (escalation-only:
+	// inference can add, never drop); required_tools is SET. size_class is SET the same
+	// way (PRD #84 M4 4b): the clamped value REPLACES the run's size_class column, and a
+	// nil / off-vocabulary value COALESCEs to a no-op. A later unit surfaces it on the DTO.
+	RequiredCapabilities *[]string `json:"required_capabilities"`
+	RequiredTools        *[]string `json:"required_tools"`
+	SizeClass            *string   `json:"size_class"`
 }
 
 // SetState applies a worker's state transition and returns the run's resulting
@@ -3076,9 +3093,35 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// milestonesParam validates + kind-gates it (Decision 12/13) and returns NULL
 		// when the list is absent, rejected, or from a non-issue run — the query writes
 		// that directly, clearing the candidate (Decision 2: replaced each round).
+		//
+		// PRD #84 M4 4b: the plan-time INFERRED requirement set also rides this report.
+		// Each array is a tri-state pointer — absent (nil) means "no change", and the
+		// query's COALESCE makes a nil param a no-op (union with '{}' / keep-existing).
+		// A present set is Filter-ed / FilterTools-ed against the server-owned vocabulary
+		// so the worker cannot smuggle an unknown name into storage. size_class rides the
+		// same report (PRD #84 M4 4b): it is clamped to the {s,m,l} vocabulary and passed
+		// as an absent-safe pgtype.Text, so an off-vocabulary or absent value is an invalid
+		// (SQL NULL) param the query's COALESCE keeps out of the column.
+		var inferredCaps, inferredTools []string
+		if req.RequiredCapabilities != nil {
+			inferredCaps = capability.Filter(*req.RequiredCapabilities)
+		}
+		if req.RequiredTools != nil {
+			inferredTools = capability.FilterTools(*req.RequiredTools)
+		}
+		var sizeClass pgtype.Text
+		if req.SizeClass != nil {
+			switch *req.SizeClass {
+			case "s", "m", "l":
+				sizeClass = pgText(*req.SizeClass)
+			}
+		}
 		rows, err = s.q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
 			PlanMd: stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
-			MilestonesCandidate: milestonesParam(owned.Kind, req.Milestones),
+			MilestonesCandidate:  milestonesParam(owned.Kind, req.Milestones),
+			InferredCapabilities: inferredCaps,
+			InferredTools:        inferredTools,
+			SizeClass:            sizeClass,
 		})
 	case "awaiting_input":
 		// PRD #88 M1: park on a clarification question. The question id is REQUIRED

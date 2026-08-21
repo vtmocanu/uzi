@@ -66,6 +66,34 @@ func TestFilter_EmptyAndAllUnknown(t *testing.T) {
 	}
 }
 
+func TestFilterTools_DropsUnknownsKeepsVocabulary(t *testing.T) {
+	// Capability names (docker) and arbitrary strings are NOT tools and must drop;
+	// only the provisionable toolchain families survive.
+	got := FilterTools([]string{"docker", "go", "rm -rf", "node", "GO", "python", "rust", "jvm"})
+	want := []string{"go", "node", "python", "rust", "jvm"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("FilterTools dropped/kept wrong names: got %v, want %v", got, want)
+	}
+}
+
+func TestFilterTools_DedupesStableOrder(t *testing.T) {
+	// Input order is scrambled with duplicates; output is vocabulary order, deduped.
+	got := FilterTools([]string{"rust", "go", "node", "go", "rust", "jvm", "node"})
+	want := []string{"go", "node", "rust", "jvm"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("FilterTools = %v, want %v", got, want)
+	}
+}
+
+func TestFilterTools_EmptyAndAllUnknown(t *testing.T) {
+	if got := FilterTools(nil); len(got) != 0 {
+		t.Errorf("FilterTools(nil) = %v, want empty", got)
+	}
+	if got := FilterTools([]string{"docker", "cobol", "haskell"}); len(got) != 0 {
+		t.Errorf("FilterTools(all-unknown) = %v, want empty", got)
+	}
+}
+
 // TestSelfReportable_DropsTemplateAndUnknown proves the self-report gate keeps
 // ONLY docker: jvm is template-derived and must never survive a worker's own
 // report, and an unknown name is dropped like Filter drops it.

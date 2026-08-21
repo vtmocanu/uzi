@@ -978,6 +978,30 @@ UPDATE runs SET
     -- correct: the candidate reflects only the latest proposal. The immutable
     -- frozen list is untouched here (it is written at approve / by autopilot).
     milestones_candidate = sqlc.narg('milestones_candidate')::jsonb,
+    -- PRD #84 M4 (unit 4b): persist the plan-time INFERRED requirement set the worker
+    -- emits on this report. Both assignments are ABSENT-SAFE (a nil param must not
+    -- disturb the column) and ESCALATION-ONLY (inference can ADD but never DROP what the
+    -- M2 repo hint already established).
+    --
+    -- required_capabilities is UNION-MERGED, not replaced: the M2 enqueue seam already
+    -- copied the repo's static hint onto this run, and the plan-time inference can only
+    -- ADD to it (Decision: escalation-only). The COALESCE is LOAD-BEARING — a nil text[]
+    -- param encodes SQL NULL, and `arr || NULL = NULL` would WIPE the NOT-NULL column
+    -- (the exact pgx trap the register path guards the same way, runtime.sql ~185). So an
+    -- ABSENT param unions with '{}' and changes nothing; a present set adds its members,
+    -- deduped. The claim predicate uses the order-independent `<@` subset test, so the
+    -- merged array is intentionally left unsorted.
+    required_capabilities = ARRAY(SELECT DISTINCT unnest(
+        required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))),
+    -- required_tools is SET, absent-safe: a present set REPLACES (it is the run's single
+    -- authoritative inferred toolchain list, not merged with a prior source), and an
+    -- absent (NULL) param COALESCEs back to the existing column, leaving it untouched.
+    required_tools = COALESCE(sqlc.narg('inferred_tools')::text[], required_tools),
+    -- size_class is SET, absent-safe like required_tools: a present (clamped s/m/l) value
+    -- REPLACES the column, and an absent (NULL) param COALESCEs back to the existing value,
+    -- leaving it untouched. The service clamps to the {s,m,l} vocabulary before passing it,
+    -- so a garbled worker report becomes a nil param (no change) rather than a bad value.
+    size_class = COALESCE(sqlc.narg('size_class'), size_class),
     session_id = COALESCE(sqlc.narg('session_id'), session_id),
     -- 🔴 INVARIANT, carried by TWO call sites and by nothing else:
     -- NO SETTER MAY LEAVE A RESOLVED open_question_id BEHIND. The sibling clear is in
