@@ -420,6 +420,12 @@ type Store interface {
 	PromoteLimitWaitRuns(ctx context.Context, now pgtype.Timestamptz) ([]store.PromoteLimitWaitRunsRow, error)
 	MarkRunFailedByID(ctx context.Context, arg store.MarkRunFailedByIDParams) (int64, error)
 	CancelRunServerSide(ctx context.Context, arg store.CancelRunServerSideParams) (int64, error)
+	// CancelRunByWorker is the LIVE-worker cancel transition (PRD #503 M1). SetState's
+	// failed arm routes here (instead of SetRunFailed) when the loaded run carries
+	// stop_kind='cancelled', so an operator cancel ends 'cancelled'/NULL fail_origin —
+	// converging with CancelRunServerSide — rather than being mis-classified as
+	// agent_failure. Worker-scoped because SetState holds a worker, not a user.
+	CancelRunByWorker(ctx context.Context, arg store.CancelRunByWorkerParams) (int64, error)
 	RejectRunServerSide(ctx context.Context, arg store.RejectRunServerSideParams) (int64, error)
 	// FailRunAutoStop is the server-side half of PRD #108 M5's auto-stop. Unlike
 	// its two neighbours it takes no user_id: it is driven by the sweeper, not by a
@@ -452,6 +458,11 @@ type Store interface {
 	// counts above, and off the hot path for the same reason — it runs only for a queued
 	// run already past its health threshold.
 	CountOnlineWorkersSatisfyingCaps(ctx context.Context, arg store.CountOnlineWorkersSatisfyingCapsParams) (int64, error)
+	// CountOnlineEligibleWorkersForRepo backs PRD #361's queued Docker-allowlist reason:
+	// how many of the caller's online workers fn_worker_can_claim accepts for this
+	// repo/kind, ignoring free slots. A result of 0 with online workers present means the
+	// repo is unrunnable without allowlisting (an all-Docker fleet, repo not allowlisted).
+	CountOnlineEligibleWorkersForRepo(ctx context.Context, arg store.CountOnlineEligibleWorkersForRepoParams) (int64, error)
 	// RunHasVerdictSinceGateOpened backs issue #182: an awaiting_approval run whose
 	// owner already answered THIS gate reports waiting_worker rather than
 	// approval_idle. A per-run lookup like ListRunToolWindow above, and for the same
@@ -1184,15 +1195,11 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 	// ClaimRun as @capability_aware: the extended fn_worker_can_claim reads its new
 	// subset clause as `NOT capability_aware OR (required ⊆ caps)`, so a false flag makes
 	// the capability match trivially true (best-effort claiming) while the docker
-	// allowlist clause above stays enforced. DEFAULT ON: a nil reader (tests, or a
-	// deployment without a settings cache) or a read error both leave it true, so an
-	// unconfirmable flag routes rather than silently degrading to a mid-run crash.
-	capabilityAware := true
-	if s.capabilitySettings != nil {
-		if v, cerr := s.capabilitySettings.CapabilityAwareScheduling(ctx); cerr == nil {
-			capabilityAware = v
-		}
-	}
+	// allowlist clause above stays enforced. capabilityAwareOn (shared with the health
+	// detector's queued-reason path) is DEFAULT ON: a nil reader (tests, or a deployment
+	// without a settings cache) or a read error both leave it true, so an unconfirmable
+	// flag routes rather than silently degrading to a mid-run crash.
+	capabilityAware := s.capabilityAwareOn(ctx)
 
 	run, err := s.q.ClaimRun(ctx, store.ClaimRunParams{
 		WorkerID:              pgUUID(wkr.ID),
@@ -3203,30 +3210,58 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	case "limit_wait":
 		rows, err = s.setLimitWait(ctx, owned, wkr, req, sessionID)
 	case "failed":
-		// PRD #69 M7a: stamp the TRUSTED failure class. The worker-reported origin is
-		// UNTRUSTED, so CoerceFailOrigin allowlists it (unknown → nil) before it reaches
-		// the DB. A classless (nil) failure is exactly the judgeable AGENT-FAILURE case —
-		// an ordinary agent death reports `failed` with no fail_origin — so it defaults to
-		// 'agent_failure' here rather than storing NULL (NULL is reserved for pre-feature /
-		// unclassified rows). The rate-limit opt-out path sends fail_origin='rate_limited'.
-		failOrigin := "agent_failure"
-		if o := CoerceFailOrigin(req.FailOrigin); o != nil {
-			failOrigin = *o
+		// PRD #503 M1 (REC A): a LIVE worker cannot report a `cancelled` terminal status —
+		// there is no `cancelled` case in this switch — so a consumed cancel or plan-reject
+		// verdict arrives here as `failed`. The run's stop_kind was stamped by
+		// CreateStopVerdictInput BEFORE this report, so it is already on the loaded `owned`
+		// row; branch on it BEFORE the agent_failure default so an operator's deliberate stop
+		// is not mis-classified as an agent failure (which would also get judged, contradicting
+		// "cancelled runs are not judged").
+		switch {
+		case owned.StopKind.Valid && owned.StopKind.String == "cancelled":
+			// Route to a `cancelled` transition (status 'cancelled', fail_origin NULL),
+			// converging with the server-side CancelRunServerSide path. SetRunFailed is NOT
+			// called. rows drives the same applied/not-applied logic below (execrows, like
+			// SetRunFailed).
+			rows, err = s.q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{
+				ID: runID, WorkerID: pgUUID(wkr.ID),
+			})
+		case owned.StopKind.Valid && owned.StopKind.String == "plan_rejected":
+			// A live plan-reject: stamp fail_origin='plan_rejected' (overriding the untrusted
+			// req.FailOrigin, which the worker cannot forge), matching the server-side
+			// RejectRunServerSide path rather than defaulting to agent_failure.
+			rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
+				FailureReason:  limitAwareFailureReason(req),
+				FailOrigin:     pgText("plan_rejected"),
+				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
+				SessionID:      sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+			})
+		default:
+			// PRD #69 M7a: stamp the TRUSTED failure class. The worker-reported origin is
+			// UNTRUSTED, so CoerceFailOrigin allowlists it (unknown → nil) before it reaches
+			// the DB. A classless (nil) failure is exactly the judgeable AGENT-FAILURE case —
+			// an ordinary agent death reports `failed` with no fail_origin — so it defaults to
+			// 'agent_failure' here rather than storing NULL (NULL is reserved for pre-feature /
+			// unclassified rows). The rate-limit opt-out path sends fail_origin='rate_limited'.
+			failOrigin := "agent_failure"
+			if o := CoerceFailOrigin(req.FailOrigin); o != nil {
+				failOrigin = *o
+			}
+			rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
+				// PRD #35 §7.8: when a `failed` report carries the structured limit fields,
+				// the SERVER composes the sentence from its own allowlisted enum and replaces
+				// whatever text the worker sent. That is the opt-out path (a run with
+				// wait_on_limit=false reports failed directly), and letting the worker compose
+				// it would put the enum on the untrusted side of the wire — the criterion "a
+				// compromised worker cannot smuggle a non-enum rate_limit_type past the
+				// server" would then be false on exactly the path a human reads. When the
+				// fields are absent this is nil and every other failure path is untouched.
+				FailureReason:  limitAwareFailureReason(req),
+				FailOrigin:     pgText(failOrigin),
+				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
+				SessionID:      sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+			})
 		}
-		rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
-			// PRD #35 §7.8: when a `failed` report carries the structured limit fields,
-			// the SERVER composes the sentence from its own allowlisted enum and replaces
-			// whatever text the worker sent. That is the opt-out path (a run with
-			// wait_on_limit=false reports failed directly), and letting the worker compose
-			// it would put the enum on the untrusted side of the wire — the criterion "a
-			// compromised worker cannot smuggle a non-enum rate_limit_type past the
-			// server" would then be false on exactly the path a human reads. When the
-			// fields are absent this is nil and every other failure path is untouched.
-			FailureReason:  limitAwareFailureReason(req),
-			FailOrigin:     pgText(failOrigin),
-			PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
-			SessionID:      sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
-		})
 	default:
 		return store.Run{}, false, ErrInvalidState
 	}
@@ -4695,11 +4730,26 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		if !live {
 			status := "cancelled"
 			if kind == "cancel" {
-				_, err = s.q.CancelRunServerSide(ctx, store.CancelRunServerSideParams{ID: runID, UserID: userID})
+				// PRD #503 M3: persist the operator's OPTIONAL cancel reason; an empty
+				// body stores NULL (a cancel reason is helpful, not mandatory).
+				_, err = s.q.CancelRunServerSide(ctx, store.CancelRunServerSideParams{
+					ID: runID, UserID: userID, StopReason: stopReasonParam(body),
+				})
 			} else {
 				status = "failed"
+				// PRD #503 M2 — persist the operator's reject reason as failure_reason
+				// instead of the hardcoded literal; the CLI now requires it, but keep a
+				// fallback for non-CLI callers that may still send an empty body. Sanitize
+				// like the worker-reported failure_reason (strip NUL — a NUL in a text column
+				// raises 22021 and would abort the reject — then cap length).
+				reason, _ := stripNUL(body)
+				reason = strings.TrimSpace(reason)
+				if reason == "" {
+					reason = "plan rejected"
+				}
+				reason = truncateRunes(reason, maxFailureReasonRunes)
 				_, err = s.q.RejectRunServerSide(ctx, store.RejectRunServerSideParams{
-					ID: runID, UserID: userID, FailureReason: pgText("plan rejected"),
+					ID: runID, UserID: userID, FailureReason: pgText(reason),
 				})
 			}
 			if err != nil {
@@ -4722,8 +4772,21 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		// here (kind is cancel/reject_plan). The stamp lands while the run is still
 		// non-terminal; the client's terminal-guarded isStoppedRun ignores it until the
 		// run reaches failed/cancelled.
+		// PRD #503 M3: the shared CTE stamps stop_reason unconditionally, but the reason
+		// belongs on a CANCEL only. Pass the operator's optional reason for a cancel;
+		// NULL for reject_plan, whose reason lives in failure_reason via the M2 path (the
+		// server-side reject branch above) — double-writing would contradict that split.
+		var stopReason pgtype.Text // NULL for reject_plan
+		if kind == "cancel" {
+			stopReason = stopReasonParam(body)
+		}
+		// Strip NUL from the body co-written to run_user_inputs.body in the SAME INSERT:
+		// a NUL in a text column raises Postgres 22021, which would abort the whole CTE and
+		// silently drop the cancel/reject verdict (the stop_reason sanitizing above would be
+		// moot if this INSERT never lands). NUL is never meaningful in an operator message.
+		cleanBody, _ := stripNUL(body)
 		if _, err := s.q.CreateStopVerdictInput(ctx, store.CreateStopVerdictInputParams{
-			RunID: runID, Kind: kind, Body: pgText(body), StopKind: pgText(stopKindFor(kind)),
+			RunID: runID, Kind: kind, Body: pgText(cleanBody), StopKind: pgText(stopKindFor(kind)), StopReason: stopReason,
 		}); err != nil {
 			return SubmitInputResult{}, err
 		}
@@ -5261,6 +5324,18 @@ func pgText(s string) pgtype.Text {
 		return pgtype.Text{}
 	}
 	return pgtype.Text{String: s, Valid: true}
+}
+
+// stopReasonParam maps an operator's OPTIONAL cancel reason (PRD #503 M3) onto the nullable
+// runs.stop_reason column, sanitizing like sanitizeFailureReason (its failure-class
+// sibling): strip NUL — a NUL in a text column raises Postgres 22021 and would abort the
+// cancel — then trim and cap the length (the same 2048-rune bound as failure_reason). An
+// empty / whitespace-only / NUL-only body stores NULL, never an empty string. Shared by
+// both cancel paths (server-side + live).
+func stopReasonParam(body string) pgtype.Text {
+	clean, _ := stripNUL(body)
+	clean = truncateRunes(strings.TrimSpace(clean), maxFailureReasonRunes)
+	return pgText(clean)
 }
 
 func textParam(s *string) pgtype.Text {

@@ -1432,12 +1432,39 @@ WHERE id = @id
 -- stamped 'cancelled' for uniformity (PRD #33 Decision 3), though isStoppedRun's
 -- status='cancelled' branch already treats this run as a deliberate stop.
 UPDATE runs SET status = 'cancelled', stop_kind = 'cancelled', move_pending_since = now(), finished_at = now(),
+    -- PRD #503 M3: persist the operator's OPTIONAL cancel reason. @stop_reason binds a
+    -- nullable pgtype.Text: an invalid/zero value stores NULL (no reason supplied).
+    stop_reason = @stop_reason,
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND user_id = @user_id
+  AND status NOT IN ('completed', 'failed', 'cancelled');
+
+-- name: CancelRunByWorker :execrows
+-- Live-worker cancel transition (PRD #503 M1). When a LIVE worker consumes a cancel
+-- verdict it reports `failed`; SetState's failed arm routes HERE off the run's already
+-- loaded stop_kind='cancelled' (stamped by CreateStopVerdictInput BEFORE this report)
+-- instead of SetRunFailed, so an operator cancellation is not mis-classified as
+-- 'agent_failure'. This converges the live cancel path with the server-side
+-- CancelRunServerSide: status 'cancelled', fail_origin NULL (a cancel is not a failure,
+-- so it is never judged — Gate 0). It is worker-scoped (@worker_id) because SetState holds
+-- a worker, not a user, so CancelRunServerSide (user_id-scoped) is unusable from it.
+-- stop_kind is left untouched (already 'cancelled'). Terminal-run cleanup + guard mirror
+-- SetRunFailed exactly, so a report onto an already-terminal run is a 0-row no-op.
+UPDATE runs SET
+    status             = 'cancelled',
+    fail_origin        = NULL,
+    move_pending_since = now(),
+    finished_at        = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at         = now()
+WHERE id = @id AND worker_id = @worker_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: FailRunAutoStop :execrows
@@ -2062,8 +2089,16 @@ RETURNING *;
 -- kind would therefore be a silent no-op on exactly the older fleet Phase 2 exists
 -- to protect — and would need a second migration for run_user_inputs.kind's CHECK.
 -- The distinguishing information rides runs.stop_kind, which the worker never sees.
+--
+-- PRD #503 M3: @stop_reason is stamped UNCONDITIONALLY here (like @stop_kind), but its
+-- VALUE is decided by the Go caller and belongs on a CANCEL only. A cancel passes the
+-- operator's optional reason (or NULL when none was given); reject_plan passes NULL,
+-- because a reject's reason goes to failure_reason via the M2 path and double-writing
+-- would contradict that clean split; auto-stop passes NULL, its identity being
+-- stop_kind='auto_stopped'. The stamp stays unconditional to avoid the
+-- parameter-type-inference pitfall the comment above already warns about.
 WITH stamped AS (
-    UPDATE runs SET stop_kind = @stop_kind, updated_at = now()
+    UPDATE runs SET stop_kind = @stop_kind, stop_reason = @stop_reason, updated_at = now()
     WHERE id = @run_id
     RETURNING id
 )
@@ -2282,6 +2317,57 @@ WHERE id = @id AND status = @status;
 -- worker keeps status='online' and still counts as an online worker for "no worker is
 -- online" purposes — do not add a draining predicate.
 SELECT count(*) FROM workers WHERE user_id = @user_id AND status = 'online';
+
+-- name: CountOnlineEligibleWorkersForRepo :one
+-- How many of a user's ONLINE workers are ELIGIBLE to claim a run on this repo/kind
+-- per fn_worker_can_claim (migration 00113, extended in 00142), IGNORING free slots.
+-- PRD #361's queued Docker-allowlist reason uses it: with >0 online workers, a result of
+-- 0 means every online worker is a Docker worker the allowlist predicate rejects for this
+-- repo — the run is genuinely unrunnable without allowlisting, distinct from "all busy" (a
+-- free slot won't help). Params cast EXACTLY as ClaimRun passes them so a green sqlc
+-- generate is not mistaken for a query Postgres will accept. capability_aware is passed
+-- FALSE (worker_caps/required_capabilities empty) so this stays the pure docker→allowlist
+-- eligibility 00142's capability clause trivially satisfies — the capability notion is
+-- handled separately upstream by CountOnlineWorkersSatisfyingCaps. Only called for a
+-- queued run already past its health threshold, so it is off the hot path.
+SELECT count(*) FROM workers w
+WHERE w.user_id = @user_id
+  AND w.status = 'online'
+  AND fn_worker_can_claim(COALESCE(w.docker_enabled, false), @docker_repo_allowlist::uuid[], @repo_id::uuid, @kind::text, '{}'::text[], '{}'::text[], false);
+
+-- name: ListDockerBlockedReposForUser :many
+-- The caller's repo ids that a Docker-allowlist gap is ACTIVELY blocking (PRD #361 M3):
+-- an enabled repo with ≥1 of the caller's QUEUED runs, for which the caller has ≥1 online
+-- worker but ZERO online workers eligible to claim a repo-bearing run on it — i.e. every
+-- online worker is a Docker worker and the repo is not on the docker allowlist. Reuses the
+-- fn_worker_can_claim eligibility notion (migration 00113, extended in 00142); for a
+-- repo-bearing run the kind is irrelevant (the judge exemption needs repo_id IS NULL), so
+-- eligibility is per repo and the kind arg is a placeholder. capability_aware is passed
+-- FALSE (worker_caps/required_capabilities empty) so this stays the pure docker→allowlist
+-- eligibility notion. The "≥1 online AND zero eligible" pair already implies the
+-- repo is not allowlisted (an allowlisted repo makes every worker eligible), so no separate
+-- allowlist clause is needed. Requiring ≥1 online worker keeps this distinct from a
+-- no-worker-online block (mirrors the M2 queued reason). Drives the Setup chip's info
+-- escalation, computed from eligibility directly — independent of the sweeper's
+-- health_reason text and health_enabled/threshold gating.
+SELECT r.id
+FROM repos r
+JOIN forge_connections fc ON fc.id = r.connection_id
+WHERE fc.user_id = @user_id
+  AND r.enabled = true
+  AND EXISTS (
+    SELECT 1 FROM runs run
+    WHERE run.repo_id = r.id AND run.user_id = @user_id AND run.status = 'queued'
+  )
+  AND EXISTS (
+    SELECT 1 FROM workers w
+    WHERE w.user_id = @user_id AND w.status = 'online'
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM workers w
+    WHERE w.user_id = @user_id AND w.status = 'online'
+      AND fn_worker_can_claim(COALESCE(w.docker_enabled, false), @docker_repo_allowlist::uuid[], r.id, 'task'::text, '{}'::text[], '{}'::text[], false)
+  );
 
 -- name: CountOnlineWorkersWithFreeSlotForUser :one
 -- How many of a user's ONLINE workers plausibly have room for another run — the

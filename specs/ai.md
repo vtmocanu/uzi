@@ -7688,9 +7688,10 @@ table + Decisions 5, 16, 18, 21. M2 splits existing chi groups so only the enume
   - `POST /api/auth/logout` — shares a group with `/auth/me` but must **split**: logout bumps
     `token_version`, which would kill the user's **browser** sessions from a CLI call.
   - `POST /api/runs/{id}/rejudge` — mints a token-spending run; excluded on the read-vs-spend
-    distinction (D21), **not** by inheritance. After the `/review` swap it is the **only** cookie-only
-    route left in the `/runs` group, so "wrap the whole `/runs` group in `RequireUser`" is the single
-    most tempting M2 shortcut — pinned by a dedicated Bearer-reject test (Criterion 4).
+    distinction (D21), **not** by inheritance. After the `/review` and `FileIssue` (PRD #365) swaps it
+    and `PUT /api/runs/{id}/wait-on-limit` (an unattended-spend consent toggle) are the cookie-only
+    routes left in the `/runs` group, so "wrap the whole `/runs` group in `RequireUser`" is a tempting
+    shortcut that would silently widen them — pinned by a dedicated Bearer-reject test (Criterion 4).
   - **`POST /api/workers`** — mints a plaintext `uzw_` join token whose claim response carries
     **decrypted** `ForgePAT` + `AnthropicOAuthToken`. A non-admin `uzc_` reaching it could exfiltrate a
     forge PAT and a paid credential over HTTPS, defeating `secretbox` + PRD #32's vault, and the minted
@@ -8668,11 +8669,13 @@ admin-can-file** (not restrict to the owner), conditioned on prominent provenanc
     (that would inflate every run-page load to serve a draft usually never opened).
 - **Routing is split, not uniform, because of the CLI (Interactions).** The judge-review *read* is
   already CLI-reachable, so the draft **GET mounts on `RequireUser`** (session **or** admin-scoped
-  CLI Bearer, CSRF-safe, mirroring the review read). Filing is **browser-only in this PRD** (no CLI
-  verb), so the **POST mounts on the cookie+CSRF `RequireAuth` path behind
-  `forgeLimiter.PerUserMiddleware`**, mirroring `ConfirmProposal` — never on the cookie-only
-  `RequireAdmin` write group. Pinned so a future reader does not mistake the CLI omission for an
-  oversight.
+  CLI Bearer, CSRF-safe, mirroring the review read). Filing was browser-only under PRD #68 (no CLI
+  verb then); **PRD #365 M1 moved it**, so the file **POST now mounts on `RequireUser` behind
+  `forgeLimiter.PerUserMiddleware`** — `uzi review file` reaches it from a CLI `uzc_` Bearer token,
+  while a browser caller stays on the cookie path with CSRF preserved via `RequireUser`'s
+  presence-dispatch (cookie request → CSRF-checked, Bearer request → no cookie to forge). Still
+  behind the per-user forge limiter, and still **never on the cookie-only `RequireAdmin` write
+  group**.
 - **Authorization: owner-or-admin to read, caller-owns-repo to write (D8).** The draft is
   owner-or-admin scoped via `GetRunForViewer` (non-owner → not-found), exactly like `GetRunReview`.
   The write additionally requires the *caller* to own the target repo via `GetRepoForUser`
@@ -9471,8 +9474,12 @@ state ("filed", PRD #68) and had no way to record "handled", "won't do", or
 - `PUT/DELETE /api/runs/{id}/review/recommendations/{recID}/disposition`
   mount on **`RequireUser`** (`handler.go`), mirroring `POST /{id}/inputs`
   (`CreateRunInput`) — CLI-reachable, no token spend, no forge write —
-  **not** the cookie-only `RequireAuth` path `rejudge`/`FileIssue` sit on
-  (those mint a spend / write a forge; this does neither).
+  **not** the cookie-only `RequireAuth` path `rejudge`/`wait-on-limit` sit
+  on (`rejudge` mints a token-spending judge run; `wait-on-limit` is an
+  unattended-spend consent toggle — this does neither). `FileIssue` itself
+  moved to `RequireUser` in PRD #365 M1: it is a forge write, but a
+  rate-limited, owner-scoped, reversible one — the same tier as these
+  disposition routes.
 - **The load-bearing authz correction, found on review**: an owner-**or**-admin
   write here would be a hole. `RequireUser` degrades a non-`admin_ro` CLI
   token to `IsAdmin=false` for free — **but a `uza_ admin_ro` token keeps
@@ -21606,7 +21613,7 @@ head of the backlog could under-fill every fire indefinitely while newer eligibl
 This change makes the cap count runs **started**: the fire walks oldest-first past a skip and
 starts the next eligible candidate until `max_issues` runs fire, bounded by a scan window so
 per-fire cost stays bounded. It lives in the shared `fireSweep` path, so it applies to every
-sweep (`bug`, `Night-Shift`, any future sweep) with no per-schedule code. Aligns behaviour with
+sweep (`bug`, `Planned`, any future sweep) with no per-schedule code. Aligns behaviour with
 the intent `SKILL.md` already documented ("how many issues one `--sweep` fire *starts*").
 
 - **Bounded scan window, additive headroom.** When `max_issues` is set, the fetch widens to
@@ -21754,7 +21761,7 @@ Decision Log; this is the terse contract.
   narrate the toolchain but the gate acts on this structured output, never on prose.
 
 - **Persistence: two new run columns, escalation-only capability merge.** `runs.required_tools` +
-  `runs.size_class` (migration `00143_run_required_tools.sql`). `SetRunAwaitingApproval`
+  `runs.size_class` (migration `00144_run_required_tools.sql`). `SetRunAwaitingApproval`
   (`api/internal/store/queries/runtime.sql`) persists the inferred set on the plan report:
   `required_capabilities` is UNION-MERGED (escalation-only — inference ADDs, never drops the M2
   repo hint), `required_tools` is SET/replaced (the run's single authoritative inferred list),
@@ -21764,7 +21771,7 @@ Decision Log; this is the terse contract.
   gates which tool names are accepted.
 
 - **The gate formula's `−provisionable` term lives ONLY in the M4 approval gate, NOT the claim
-  clause.** The claim predicate (`fn_worker_can_claim`, migration 00142, unchanged by 00143) reads
+  clause.** The claim predicate (`fn_worker_can_claim`, migration 00142, unchanged by 00144) reads
   `required_capabilities ⊆ worker_effective_caps` with NO subtraction —
   `required_capabilities` is non-provisionable by construction. The approval-gate residual is
   `unmet = required_capabilities − worker_effective_caps` and is capability-only. `size_class` is

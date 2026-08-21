@@ -1081,6 +1081,11 @@ export const mockRepos: Repo[] = [
     guardrail_override: null,
     // PRD #66 M9 (D8): not refused by the guardrail (server-computed).
     guardrail_blocked: false,
+    // PRD #361 M1: this repo is on the global Docker-worker allowlist (the fully
+    // set-up row), so its Setup chip's Docker capability reads on.
+    docker_allowlisted: true,
+    // PRD #361 M3: not blocked (an allowlisted repo makes every worker eligible).
+    docker_blocked: false,
   },
   {
     id: "repo-atlas",
@@ -1104,6 +1109,11 @@ export const mockRepos: Repo[] = [
     // guardrail — the "allowed by admin" badge + Revoke path in the demo.
     guardrail_override: { ...mockAtlasOverride },
     guardrail_blocked: false,
+    // PRD #361 M1: not on the Docker-worker allowlist.
+    docker_allowlisted: false,
+    // PRD #361 M3: actively blocked — an enabled repo with a queued run whose only
+    // online workers are Docker workers, so its Setup chip escalates to the info tone.
+    docker_blocked: true,
   },
   {
     // PRD #66 M9 (D8): a repo the push/merge guardrail REFUSES right now
@@ -1124,6 +1134,10 @@ export const mockRepos: Repo[] = [
     pipeline: null,
     guardrail_override: null,
     guardrail_blocked: true,
+    // PRD #361 M1: not on the Docker-worker allowlist.
+    docker_allowlisted: false,
+    // PRD #361 M3: not actively blocked by the Docker-allowlist gap.
+    docker_blocked: false,
   },
   {
     id: "repo-www",
@@ -1139,6 +1153,10 @@ export const mockRepos: Repo[] = [
     pipeline: null,
     guardrail_override: null,
     guardrail_blocked: false,
+    // PRD #361 M1: not on the Docker-worker allowlist.
+    docker_allowlisted: false,
+    // PRD #361 M3: not actively blocked by the Docker-allowlist gap.
+    docker_blocked: false,
   },
   {
     // PRD #345 M2: the disabled+blocked row that makes the refused-enable demo
@@ -1161,6 +1179,10 @@ export const mockRepos: Repo[] = [
     pipeline: null,
     guardrail_override: null,
     guardrail_blocked: true,
+    // PRD #361 M1: not on the Docker-worker allowlist.
+    docker_allowlisted: false,
+    // PRD #361 M3: not actively blocked by the Docker-allowlist gap.
+    docker_blocked: false,
   },
 ];
 

@@ -197,7 +197,26 @@ func newReviewCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(show, backlog, resolve, dismiss, undo, stats)
+	file := &cobra.Command{
+		Use:   "file <run-id> <rec-id>",
+		Short: "File a forge issue from one judge recommendation (server-templated)",
+		Long: "File a forge issue from one judge recommendation on your own forge connection. The\n" +
+			"title and description are server-templated defaults; edit-before-file is a web action,\n" +
+			"so the CLI files the defaults. Records the issue under the review's filed_issues and\n" +
+			"moves the rec to the filed bucket. Exit 5 if already filed/being filed, 4 if unknown.\n" +
+			"Use --repo when the default repo is ambiguous.",
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			return runReviewFile(env, gf, c, cmd, args[0], args[1])
+		},
+	}
+	file.Flags().String("repo", "", "file against this repo id (as `uzi repo list` prints it); overrides the draft's default. Required when the default repo is ambiguous")
+
+	cmd.AddCommand(show, backlog, resolve, dismiss, undo, stats, file)
 	return cmd
 }
 
@@ -629,6 +648,61 @@ func resolveRecID(ctx context.Context, c uzicli.Client, runID, want string) (str
 		return "", uzicli.Exitf(uzicli.ExitUsage,
 			"ambiguous recommendation id %q matches %d recommendations — use a longer id", want, len(matches))
 	}
+}
+
+// runReviewFile files a forge issue from one judge recommendation (PRD #365 M2), mirroring
+// `uzi findings file`. It resolves the short rec id against the run's current review, fetches the
+// server-templated draft, resolves the repo id (--repo overrides the draft default), and POSTs
+// the defaults. A missing default repo with no --repo is a usage error (exit 2) — the CLI never
+// guesses a repo. A 409 (already filed/filing) and a 404 (unknown/foreign id) propagate as exit
+// 5 / 4 from statusError.
+func runReviewFile(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runArg, recArg string) error {
+	recID, err := resolveRecID(cmd.Context(), c, runArg, recArg)
+	if err != nil {
+		return err
+	}
+	draft, err := c.GetReviewIssueDraft(cmd.Context(), runArg, recID)
+	if err != nil {
+		return err
+	}
+	p := env.printer(gf)
+	repoID, _ := cmd.Flags().GetString("repo")
+	repoID = strings.TrimSpace(repoID)
+	if repoID == "" {
+		repoID = draft.DefaultRepoID
+	}
+	if repoID == "" {
+		// The default is ambiguous — surface the server's picker note (through sanitizeTTY for
+		// parity with the render path) as a human-facing hint, then return a usage error telling
+		// the user to pass --repo. Do NOT guess a repo. The hint is suppressed under --json/--quiet
+		// so a machine consumer's stdout is not polluted by a non-JSON line before the exit-2
+		// error; the usage error itself still returns on every path.
+		if draft.DefaultNote != "" && p.Format != uzicli.FormatJSON && !gf.quiet {
+			p.Printf("%s\n", sanitizeTTY(draft.DefaultNote))
+		}
+		return uzicli.Exitf(uzicli.ExitUsage, "no default repo for this recommendation — pass --repo <repo-id>")
+	}
+	res, err := c.FileReviewIssue(cmd.Context(), runArg, recID, repoID, draft.Title, draft.Description)
+	if err != nil {
+		return err
+	}
+	if p.Format == uzicli.FormatJSON {
+		return p.JSON(res)
+	}
+	if !gf.quiet {
+		// The title is server-templated, but it is agent-influenced text reaching a TTY, so it
+		// goes through sanitizeTTY here too (defence in depth, matching the findings render).
+		p.Printf("filed issue #%d: %s\n", res.Issue.IID, sanitizeTTY(res.Issue.Title))
+		if res.Issue.WebURL != "" {
+			p.Printf("  %s\n", res.Issue.WebURL)
+		}
+		// A warning is created-with-warning: the forge issue is REAL, so this is a note on a
+		// success (exit 0), never a retry signal.
+		if res.Warning != "" {
+			p.Printf("warning: %s\n", sanitizeTTY(res.Warning))
+		}
+	}
+	return nil
 }
 
 // reportDisposition prints the outcome of a triage mutation. --json emits the

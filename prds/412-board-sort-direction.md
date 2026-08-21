@@ -28,7 +28,7 @@ Add an **ascending/descending direction toggle** beside the Sort control. The to
 
 ## Background — current state (resolved facts)
 
-All facts below were verified against the codebase on 2026-08-20 and are baked in here so the work needs **no** external lookups (the implementing worker runs offline via the Night-Shift sweep).
+All facts below were verified against the codebase on 2026-08-20 and are baked in here so the work needs **no** external lookups (the implementing worker runs offline via the Planned sweep).
 
 ### The sort core (`web/src/lib/boardOrder.ts`)
 
@@ -168,8 +168,8 @@ Milestones are ordered by dependency: **M2 depends on M1**; **M3 depends on M2**
 
 ## Dependencies
 
-- **No external / internet dependency.** Every fact is codebase-resolvable and there is no server, forge, or network interaction — the offline Night-Shift sweep worker can complete this fully.
-- **PRD #411 (`prds/done/411-run-issue-links.md`, now landed) shares `web/src/pages/Board.tsx`, in disjoint regions.** #411 edits the run-issue-link surfaces — the needs-attention strip (`:1220`), the board-card forge anchor (`:1862`), and the run fetch (`:468`) — none of which overlap this PRD's sort toolbar (`:1089-1102`), `sortMode`/`sortDir` state (`:218-246`), `cardsByColumn`/Closed-lane memo (`:858-880`), or `applyDrop` (the `useCallback` opens at `:917`, through `:970`). #411 does **not** touch `web/src/lib/boardOrder.ts`, `boardOrder.test.ts`, or `Board.test.tsx` at all, so the sort core is exclusively this PRD's. The two are logically independent; if both land around the same time, whichever merges second rebases the non-overlapping `Board.tsx` hunks. Both are queued for the **Night-Shift** sweep.
+- **No external / internet dependency.** Every fact is codebase-resolvable and there is no server, forge, or network interaction — the offline Planned sweep worker can complete this fully.
+- **PRD #411 (`prds/done/411-run-issue-links.md`, now landed) shares `web/src/pages/Board.tsx`, in disjoint regions.** #411 edits the run-issue-link surfaces — the needs-attention strip (`:1220`), the board-card forge anchor (`:1862`), and the run fetch (`:468`) — none of which overlap this PRD's sort toolbar (`:1089-1102`), `sortMode`/`sortDir` state (`:218-246`), `cardsByColumn`/Closed-lane memo (`:858-880`), or `applyDrop` (the `useCallback` opens at `:917`, through `:970`). #411 does **not** touch `web/src/lib/boardOrder.ts`, `boardOrder.test.ts`, or `Board.test.tsx` at all, so the sort core is exclusively this PRD's. The two are logically independent; if both land around the same time, whichever merges second rebases the non-overlapping `Board.tsx` hunks. Both are queued for the **Planned** sweep.
 - **Milestone ordering**: M2 needs M1's `SortDir`/`sortCards` signature; M3 needs M2's toggle + wiring. All within `web/`.
 
 ## Decision log
@@ -179,5 +179,5 @@ Milestones are ordered by dependency: **M2 depends on M1**; **M3 depends on M2**
 - **2026-08-20**: One `sortDir` is stored and **reset to the mode's natural default on mode change** (Decision 4), rather than a remembered direction per mode — smaller surface, matches user expectation (pick Title → A → Z). Per-mode memory left as a possible later enhancement.
 - **2026-08-20**: Direction applied as a sign with two preserved invariants — **NULLS always last** and **`byIID` tiebreak always ascending** — in both directions (Decision 2), so `desc`→`asc` never floats never-run cards to the top.
 - **2026-08-20**: Pure client-side, no server/API/DB change; direction is a per-browser, per-repo `prefs` value beside `sortMode`.
-- **2026-08-20**: Next step = **queue for the uzi Night-Shift sweep** (deferred, offline worker). PRD authored to be fully internet-independent. Reviewer count: skill-decided (one reviewer, small single-component PRD).
+- **2026-08-20**: Next step = **queue for the uzi Planned sweep** (deferred, offline worker). PRD authored to be fully internet-independent. Reviewer count: skill-decided (one reviewer, small single-component PRD).
 - **2026-08-20**: Reviewer-driven corrections (one Explore reviewer, all file:line facts confirmed exact): rewrote Design Decision 5 to stop claiming the S4 Closed-jump is "subsumed" (it stays isolated to Closed on a drop, since the freeze excludes closed cards) and present it as an accepted, M3-tested cost; scoped the "pixel-identical / invisible until toggle flip" reassurance to open lanes + Manual, since Closed under a persisted non-manual mode intentionally changes on day one; marked the M2 browser Closed-lane check best-effort with M3 authoritative (default mock may lack closed cards); added an M3 assertion for the post-drop Closed state; corrected the `applyDrop` line reference to `:917`.

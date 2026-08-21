@@ -305,6 +305,7 @@ type Config struct {
 	RunMaxRequeues          int           // worker-death re-queues allowed before a run is failed
 	WorkerHeartbeatInterval time.Duration // how often a worker heartbeats
 	WorkerHeartbeatStale    time.Duration // no heartbeat past this ⇒ worker offline + runs re-queued
+	SweepInterval           time.Duration // run-liveness sweep cadence; 0 ⇒ sweeper's built-in 15s default
 	WorkerPollInterval      time.Duration // worker claim-poll cadence
 	WorkerAffinityGrace     time.Duration // a re-queued run waits this long for its prior worker
 	WorkerSpreadGrace       time.Duration // PRD #216: a queued run older than this is exempt from the fleet-aware spread
@@ -695,6 +696,9 @@ func Load() (Config, error) {
 	cfg.RunMaxRequeues = parseNonNegInt("RUN_MAX_REQUEUES", 1)
 	cfg.WorkerHeartbeatInterval = parseDuration("WORKER_HEARTBEAT_INTERVAL", 15*time.Second)
 	cfg.WorkerHeartbeatStale = parseDuration("WORKER_HEARTBEAT_STALE", 45*time.Second)
+	// 0 (or unset) delegates to the sweeper's own built-in 15s default, so current
+	// behaviour is preserved unless SWEEP_INTERVAL is explicitly set.
+	cfg.SweepInterval = parseNonNegDuration("SWEEP_INTERVAL", 0)
 	cfg.WorkerPollInterval = parseDuration("WORKER_POLL_INTERVAL", 3*time.Second)
 	cfg.WorkerAffinityGrace = parseDuration("WORKER_AFFINITY_GRACE", 2*time.Minute)
 	// PRD #216: a queued run older than this grace is exempt from the fleet-aware

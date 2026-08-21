@@ -188,6 +188,60 @@ func TestSetStateFailedCoercesUnknownOriginToAgentFailure(t *testing.T) {
 	}
 }
 
+// TestSetStateFailedCancelledRoutesToCancel (PRD #503 M1, REC A): a LIVE worker cannot
+// report a `cancelled` status, so a consumed cancel verdict arrives as `failed`. Because
+// the loaded run carries stop_kind='cancelled' (stamped by CreateStopVerdictInput before
+// the report), the failed arm must route to CancelRunByWorker (status 'cancelled',
+// fail_origin NULL) instead of SetRunFailed — so an operator cancel is not mis-classified
+// as agent_failure (and is not judged).
+func TestSetStateFailedCancelledRoutesToCancel(t *testing.T) {
+	run := runningRun(false)
+	run.StopKind = pgText("cancelled")
+	fs, svc, wkr := limitParkFixture(t, run)
+
+	worker := "run cancelled"
+	if _, _, err := svc.SetState(context.Background(), wkr, run.ID, StateRequest{
+		State: "failed", FailureReason: &worker,
+	}); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	if fs.cancelledByWorker == nil {
+		t.Fatal("CancelRunByWorker was never called for a stop_kind='cancelled' failed report")
+	}
+	if fs.cancelledByWorker.ID != run.ID {
+		t.Fatalf("CancelRunByWorker id = %v, want %v", fs.cancelledByWorker.ID, run.ID)
+	}
+	if fs.setFailed != nil {
+		t.Fatalf("SetRunFailed was called for a cancelled stop_kind (should route to cancel): %+v", fs.setFailed)
+	}
+}
+
+// TestSetStateFailedPlanRejectedStampsPlanRejected (PRD #503 M1, REC A): a live plan-reject
+// arrives as `failed` with stop_kind='plan_rejected'; the failed arm must stamp
+// fail_origin='plan_rejected' via SetRunFailed (matching the server-side RejectRunServerSide
+// path) rather than defaulting to agent_failure, and must NOT route to CancelRunByWorker.
+func TestSetStateFailedPlanRejectedStampsPlanRejected(t *testing.T) {
+	run := runningRun(false)
+	run.StopKind = pgText("plan_rejected")
+	fs, svc, wkr := limitParkFixture(t, run)
+
+	worker := "plan rejected: not aligned with the issue"
+	if _, _, err := svc.SetState(context.Background(), wkr, run.ID, StateRequest{
+		State: "failed", FailureReason: &worker,
+	}); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	if fs.setFailed == nil {
+		t.Fatal("SetRunFailed was never called for a stop_kind='plan_rejected' failed report")
+	}
+	if got := fs.setFailed.FailOrigin; !got.Valid || got.String != "plan_rejected" {
+		t.Fatalf("fail_origin = %+v, want plan_rejected", got)
+	}
+	if fs.cancelledByWorker != nil {
+		t.Fatalf("CancelRunByWorker was called for a plan_rejected stop_kind (should fail with plan_rejected): %+v", fs.cancelledByWorker)
+	}
+}
+
 // TestRecoverClaimAssemblyStampsInfraOrigin: the three infra sentinels used to collapse
 // into one indistinguishable failed write; PRD #69 M7a (4) splits them so each stamps
 // its own TRUSTED class through MarkRunFailedByID.

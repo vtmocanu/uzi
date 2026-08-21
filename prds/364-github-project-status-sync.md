@@ -4,7 +4,7 @@
 - **Priority**: Medium
 - **Status**: Implemented (offline milestones M1–M8 + M4 landed and gated). Pending post-merge live acceptance (SC-A1/SC-A2) against a real GitHub Project + a `project`-scoped PAT — a human/e2e step this offline run cannot self-close. Stays in `prds/` (not moved to `prds/done/`) until that acceptance passes.
 - **Forge scope**: GitHub only. GitLab and Forgejo repos are untouched by this feature.
-- **Handoff**: queued for the `Night-Shift` uzi sweep (offline worker). All external facts are resolved and baked into this document; **every milestone is implementable offline** (code + httptest, no live network). The distinction to hold: *implementation* is internet-independent, but *final end-to-end acceptance* (SC-A1, SC-A2 below) exercises a live GitHub Project with a `project`-scoped PAT and is a human/e2e step the offline worker cannot self-close — see "Acceptance vs. offline verification".
+- **Handoff**: queued for the `Planned` uzi sweep (offline worker). All external facts are resolved and baked into this document; **every milestone is implementable offline** (code + httptest, no live network). The distinction to hold: *implementation* is internet-independent, but *final end-to-end acceptance* (SC-A1, SC-A2 below) exercises a live GitHub Project with a `project`-scoped PAT and is a human/e2e step the offline worker cannot self-close — see "Acceptance vs. offline verification".
 
 ---
 

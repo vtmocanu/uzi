@@ -37,7 +37,9 @@ Note the irony, because it inverts the usual intuition: **`./e2e/run-store-it.sh
 
 Migrations are goose SQL files embedded via `go:embed` and run at API boot; there is no separate migration step.
 
-**A MIGRATION COMMENT MAY NEVER CONTAIN THE LITERAL `+goose` — not quoted, not in prose, not while warning someone off an annotation.** goose's parser (v3.27.2, `internal/sqlparser/parser.go`) triggers on `HasPrefix(TrimSpace(line), "--") && Contains(line, "+goose")`, so the token **anywhere** on a comment line makes that line an annotation. The hazard is the token, not the annotation's name: `-- see the +goose docs` fails to parse exactly like a malformed one. Measured 2026-07-27, writing the sentence *"do not add `-- +goose NO TRANSACTION` to this file"* into a Down comment:
+**Migration NUMBER prefixes must be unique, and `gate:repo`'s `check:migration-numbering` (PRD #500) now enforces it.** A duplicate prefix makes goose panic (`goose: duplicate version <N> detected`) at API boot and in every `*LiveDB` test; the check reports any number carried by more than one file and tells you to renumber above the live head (numbers are assigned at merge time — intentional gaps are fine, order is not checked). Separately, a NEW text-extension source file that git treats as binary (a raw NUL) or that carries other control bytes is caught by `gate:repo`'s `check:no-binary-text` (PRD #500) — that class otherwise passes lint/typecheck/tests/check-styles because the bytes are behaviorally invisible.
+
+**A MIGRATION COMMENT MAY NEVER CONTAIN THE LITERAL `+goose` — not quoted, not in prose, not while warning someone off an annotation.** goose's parser (v3.27.3, `internal/sqlparser/parser.go`) triggers on `HasPrefix(TrimSpace(line), "--") && Contains(line, "+goose")`, so the token **anywhere** on a comment line makes that line an annotation. The hazard is the token, not the annotation's name: `-- see the +goose docs` fails to parse exactly like a malformed one. Measured 2026-07-27, writing the sentence *"do not add `-- +goose NO TRANSACTION` to this file"* into a Down comment:
 
 ```
 ERROR 00090_run_limit_wait.sql: failed to parse SQL migration file:

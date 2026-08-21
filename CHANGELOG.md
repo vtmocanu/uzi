@@ -6,6 +6,33 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Changed
+
+- **Lead agent run-context guidance (PRD #501).** The builtin `lead` template and the
+  autopilot plan prompts now tell the lead three things it previously learned too late:
+  (A) the Bash working directory persists across tool calls and the run starts at the
+  worktree root, so relative-path greps and `cd`s should use absolute paths or re-`cd`
+  from root (generalized from the integration-gate-only note); (B) on an autopilot run
+  (no human in the loop) it is told up front, at planning time, to resolve open decisions
+  on best judgment and record the assumption rather than spending an `ask_user` round-trip;
+  and (C) any commit landing after a clean review — including the lead's own edits —
+  re-opens a read-only validator wave over the new range before the run is signalled done.
+- **Cancel/reject steering reason is now captured (PRD #503, issue [#503](https://github.com/vtmocanu/uzi/issues/503)).**
+  `uzi run reject` now requires a reason (pass `-m`, or pipe it on stdin) instead of
+  accepting an empty one, and the reason is persisted as the run's `failure_reason` on
+  every reject path (it was previously dropped and replaced by a hardcoded "plan rejected"
+  on the server-side path). `uzi run cancel` gains an optional `-m/--message`, stored on the
+  run in a new nullable `runs.stop_reason` column on both cancel paths.
+
+### Fixed
+
+- **Operator cancellations are no longer classified as agent failures or judged (PRD #503, issue [#503](https://github.com/vtmocanu/uzi/issues/503)).**
+  A run cancelled or plan-rejected while a live worker held it used to end `failed` with
+  `fail_origin='agent_failure'`, so an operator cancellation was judged and blamed on the
+  agent (polluting per-agent reliability signal). A live cancel now ends `cancelled` (and is
+  never judged), and a live plan-rejection carries `fail_origin='plan_rejected'` — both
+  matching the existing server-side paths.
+
 ## [0.50.0] - 2026-08-21
 <!-- release-title: board + Projects v2 sync, worker fleet roll, dependency majors -->
 

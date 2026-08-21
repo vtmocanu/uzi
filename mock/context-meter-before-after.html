@@ -1,0 +1,345 @@
+<title>Context Meter · Before / After</title>
+<style>
+  :root {
+    /* uzi "ember" default theme — verbatim from web/src/index.css */
+    --bg: 8 10 15;
+    --surface: 15 18 26;
+    --raised: 23 27 38;
+    --edge: 39 45 60;
+    --edge-strong: 58 66 86;
+    --fg: 228 232 240;
+    --muted: 148 158 176;
+    --faint: 122 133 154;
+    --brand: 251 146 60;
+    --brand-hover: 253 186 116;
+    --ok: 52 211 153;
+    --warn: 251 191 36;
+    --danger: 251 113 133;
+    --info: 56 189 248;
+    --radius: 0.625rem;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: rgb(var(--bg));
+    color: rgb(var(--fg));
+    font-family: var(--sans);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    font-size: 16px;
+  }
+  .page { max-width: 1120px; margin: 0 auto; padding: 3rem 1.25rem 5rem; }
+
+  /* ── page header ── */
+  .eyebrow {
+    font-family: var(--mono); font-size: 0.6875rem; letter-spacing: 0.18em;
+    text-transform: uppercase; color: rgb(var(--brand));
+    display: inline-flex; align-items: center; gap: 0.5rem;
+  }
+  .eyebrow::before { content: ""; width: 1.5rem; height: 1px; background: rgb(var(--brand) / 0.6); }
+  h1 { font-size: clamp(1.8rem, 4.5vw, 2.5rem); line-height: 1.06; letter-spacing: -0.02em; margin: 0.7rem 0 0.5rem; font-weight: 650; text-wrap: balance; }
+  h1 .molten {
+    background: linear-gradient(96deg, rgb(var(--brand-hover)), rgb(var(--brand)) 55%, rgb(var(--danger)));
+    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; color: transparent;
+  }
+  .lede { color: rgb(var(--muted)); max-width: 66ch; margin: 0; font-size: 1rem; }
+  .lede code { font-family: var(--mono); font-size: 0.85em; color: rgb(var(--brand-hover)); }
+  .lede strong { color: rgb(var(--fg)); font-weight: 600; }
+
+  /* ── comparison band ── */
+  .band-label {
+    display: flex; align-items: center; gap: 0.75rem;
+    font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.14em; text-transform: uppercase;
+    color: rgb(var(--faint)); margin: 2.5rem 0 0.9rem;
+  }
+  .band-label .tag { color: rgb(var(--fg)); border: 1px solid rgb(var(--edge)); border-radius: 5px; padding: 0.12rem 0.5rem; }
+  .band-label.after .tag { color: rgb(var(--brand)); border-color: rgb(var(--brand) / 0.5); }
+  .band-label .rule { flex: 1; height: 1px; background: rgb(var(--edge)); }
+  .band-label .hint { letter-spacing: 0.02em; text-transform: none; color: rgb(var(--faint)); font-family: var(--sans); font-size: 0.8rem; }
+
+  /* ── the ActivityFeed panel (faithful reproduction) ── */
+  .panel {
+    background: rgb(var(--surface));
+    border: 1px solid rgb(var(--edge));
+    border-radius: 1rem;
+    padding: 1.5rem 1.5rem 1.65rem;
+  }
+  .toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem; }
+  .toolbar h2 { font-size: 0.72rem; font-weight: 650; letter-spacing: 0.12em; text-transform: uppercase; color: rgb(var(--faint)); margin: 0; }
+  .tools { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; font-size: 0.82rem; }
+  .seg { display: inline-flex; overflow: hidden; border: 1px solid rgb(var(--edge)); border-radius: 0.5rem; }
+  .seg button { font: inherit; border: 0; background: transparent; color: rgb(var(--muted)); padding: 0.25rem 0.65rem; cursor: pointer; }
+  .seg button.on { background: rgb(var(--raised)); color: rgb(var(--fg)); font-weight: 500; }
+  .seg button:focus-visible { outline: 2px solid rgb(var(--brand)); outline-offset: -2px; }
+  .seg button + button { border-left: 1px solid rgb(var(--edge)); }
+  .tools .link { color: rgb(var(--muted)); cursor: pointer; }
+  .tools .chk { display: inline-flex; align-items: center; gap: 0.4rem; color: rgb(var(--muted)); cursor: pointer; }
+  .tools .chk .box { width: 0.85rem; height: 0.85rem; border: 1.5px solid rgb(var(--edge-strong)); border-radius: 3px; }
+  .tools .count { color: rgb(var(--muted)); }
+
+  /* ── crew chips ── */
+  .crew { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; margin-top: 1rem; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 0.42rem;
+    border: 1px solid rgb(var(--edge)); background: rgb(var(--raised));
+    border-radius: 999px; padding: 0.2rem 0.65rem; font-size: 0.8rem;
+  }
+  .chip .cdot { width: 0.42rem; height: 0.42rem; border-radius: 50%; background: currentColor; }
+  .chip .cname { color: rgb(var(--fg)); font-weight: 500; }
+  .chip .cn { color: rgb(var(--faint)); font-variant-numeric: tabular-nums; }
+  .chip .cstate { font-size: 0.68rem; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.85; }
+  .chip .cpct { font-family: var(--mono); font-size: 0.72rem; font-variant-numeric: tabular-nums; color: rgb(var(--faint)); padding-left: 0.1rem; }
+  .t-waiting { color: rgb(var(--info)); }
+  .t-working { color: rgb(var(--ok)); }
+  .t-idle    { color: rgb(var(--faint)); }
+  .t-stalled { color: rgb(var(--warn)); }
+
+  /* ── lanes ── */
+  .lanes { margin-top: 1rem; border: 1px solid rgb(var(--edge)); border-radius: 0.85rem; padding: 0.85rem; display: flex; flex-direction: column; gap: 0.55rem; }
+  .lane {
+    display: flex; align-items: center; gap: 0.6rem;
+    background: rgb(var(--surface) / 0.6);
+    border: 1px solid rgb(var(--edge) / 0.6);
+    border-left: 2px solid var(--rail);
+    border-radius: 0.6rem;
+    padding: 0.7rem 0.85rem;
+  }
+  .lane .chev { color: rgb(var(--muted)); font-size: 0.9rem; width: 1rem; text-align: center; flex-shrink: 0; }
+  .lane .sdot { width: 0.42rem; height: 0.42rem; border-radius: 50%; background: currentColor; flex-shrink: 0; }
+  .lane .lname { font-weight: 650; font-size: 0.92rem; color: var(--rail-fg); flex-shrink: 0; }
+  .lane .llabel { font-family: var(--mono); font-size: 0.76rem; color: rgb(var(--faint)); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  /* shrink-20: the one-liner yields ~20x faster than the identity label, so at tight
+     widths the meter + timestamp keep their place and the detail truncates first
+     (mirrors ActivityFeed's shrink-[20] on the live one-liner). */
+  .lane .lone { font-size: 0.84rem; color: rgb(var(--muted)); white-space: nowrap; min-width: 0; overflow: hidden; text-overflow: ellipsis; flex-shrink: 20; }
+  .lane .lstate { font-size: 0.68rem; letter-spacing: 0.06em; text-transform: uppercase; flex-shrink: 0; }
+  .lane .pill { font-family: var(--mono); font-size: 0.72rem; font-variant-numeric: tabular-nums; color: rgb(var(--brand)); background: rgb(var(--brand) / 0.14); border: 1px solid rgb(var(--brand) / 0.3); border-radius: 999px; padding: 0.04rem 0.4rem; flex-shrink: 0; }
+  .lane .spacer { margin-left: auto; }
+  .lane .ts { font-size: 0.82rem; color: rgb(var(--faint)); flex-shrink: 0; white-space: nowrap; min-width: 4.2rem; text-align: right; }
+
+  .pulse { animation: pulse 1.7s ease-in-out infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+  /* rails / name colors */
+  .r-brand { --rail: rgb(var(--brand) / 0.4); --rail-fg: rgb(var(--brand)); }
+  .r-info  { --rail: rgb(var(--info) / 0.4);  --rail-fg: rgb(var(--info)); }
+  .r-ok    { --rail: rgb(var(--ok) / 0.4);    --rail-fg: rgb(var(--ok)); }
+
+  /* ── the context meter ──────────────────────────────────────────────────────
+     A machined steel channel that goes MOLTEN as the LEAD window fills: cool/steel
+     while there is room, molten orange as it fills, rose in the last stretch. The
+     channel spans the whole autocompact window (rawMaxTokens), so 100% — the TOP
+     of the channel — is compaction; the wall lives at the end, not a mid tick. */
+  .ctx { display: grid; grid-template-columns: 88px 2.9rem; align-items: center; gap: 0.55rem; flex-shrink: 0; }
+  .meter {
+    position: relative; height: 7px; border-radius: 999px; overflow: hidden;
+    background: linear-gradient(180deg, rgb(var(--bg)), rgb(var(--surface)));
+    border: 1px solid rgb(var(--edge));
+    box-shadow: inset 0 1px 1.5px rgb(0 0 0 / 0.55);
+  }
+  /* the last 5% is the compaction danger wash — the fill climbs it toward the wall */
+  .meter .zone { position: absolute; top: 0; bottom: 0; left: 95%; right: 0; background: rgb(var(--danger) / 0.18); }
+  /* the compaction wall AT 100% — the far end of the channel, where autocompaction fires */
+  .meter .wall { position: absolute; top: -1px; bottom: -1px; right: 0; width: 2px; background: rgb(var(--danger) / 0.9); box-shadow: 0 0 5px rgb(var(--danger) / 0.6); }
+  .meter .fill {
+    position: absolute; top: 0; bottom: 0; left: 0; border-radius: 999px;
+    animation: grow 0.9s cubic-bezier(0.16, 0.84, 0.28, 1) both;
+  }
+  /* the molten leading edge — a hot cap extruded at the fill's tip */
+  .meter .fill::after { content: ""; position: absolute; top: -1px; bottom: -1px; right: -1px; width: 3px; border-radius: 999px; }
+  /* cool / steel — plenty of room, nothing to watch */
+  .fill.cool { background: linear-gradient(180deg, rgb(255 255 255 / 0.16), transparent 55%), linear-gradient(90deg, rgb(var(--edge-strong)), rgb(var(--muted))); }
+  .fill.cool::after { background: rgb(var(--muted)); box-shadow: 0 0 4px rgb(var(--muted) / 0.5); }
+  /* warm / molten — filling toward the line */
+  .fill.warm { background: linear-gradient(180deg, rgb(255 255 255 / 0.26), transparent 55%), linear-gradient(90deg, rgb(var(--brand)), rgb(var(--brand-hover))); box-shadow: 0 0 8px rgb(var(--brand) / 0.45); }
+  .fill.warm::after { background: rgb(var(--brand-hover)); box-shadow: 0 0 7px rgb(var(--brand-hover) / 0.85); }
+  /* hot / rose — in the last stretch, climbing the wall toward compaction */
+  .fill.hot { background: linear-gradient(180deg, rgb(255 255 255 / 0.28), transparent 55%), linear-gradient(90deg, rgb(var(--danger)), rgb(var(--brand-hover))); box-shadow: 0 0 11px rgb(var(--danger) / 0.6); }
+  .fill.hot::after { background: rgb(var(--brand-hover)); box-shadow: 0 0 9px rgb(var(--danger) / 0.95); animation: menisc 1.5s ease-in-out infinite; }
+  /* number: value in the state tone, unit small + faint (tabular so the column holds) */
+  .num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; line-height: 1; white-space: nowrap; }
+  .num .v { font-size: 0.84rem; letter-spacing: -0.01em; }
+  .num .u { font-size: 0.6rem; color: rgb(var(--faint)); margin-left: 0.06rem; }
+  .num.cool .v { color: rgb(var(--fg)); }
+  .num.warm .v { color: rgb(var(--brand)); }
+  .num.hot  .v { color: rgb(var(--danger)); }
+  /* ── lead-context headline: the operator surface you read without scanning lanes ──
+     A wider molten channel + readout sitting above the lanes. Same material as the
+     lane meter, one size up, spanning the row. */
+  .leadband { display: flex; align-items: center; gap: 0.85rem; margin-top: 1rem; padding: 0.7rem 0.9rem; border: 1px solid rgb(var(--edge)); border-radius: 0.75rem; background: linear-gradient(180deg, rgb(var(--raised) / 0.5), rgb(var(--bg))); }
+  .leadband .lbl { font-family: var(--mono); font-size: 0.68rem; letter-spacing: 0.14em; text-transform: uppercase; color: rgb(var(--faint)); white-space: nowrap; }
+  .leadband .meter { flex: 1; min-width: 60px; }
+  .meter.big { height: 9px; }
+  .leadband .rd { display: flex; align-items: baseline; gap: 0.5rem; white-space: nowrap; }
+  .leadband .rd .p { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 1rem; font-weight: 600; color: rgb(var(--brand)); }
+  .leadband .rd .p .u { font-size: 0.65rem; color: rgb(var(--faint)); margin-left: 0.05rem; }
+  .leadband .rd .t { font-family: var(--mono); font-size: 0.76rem; color: rgb(var(--muted)); font-variant-numeric: tabular-nums; }
+
+  @keyframes grow { from { width: 0 !important; } }
+  @keyframes menisc { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+  /* micro-meter carried onto the crew chips (single tone, no cap — chips stay quiet) */
+  .chip .wm { display: inline-flex; align-items: center; gap: 0.34rem; padding-left: 0.15rem; }
+  .chip .wm .bar { position: relative; width: 26px; height: 5px; border-radius: 999px; overflow: hidden; background: rgb(var(--bg)); border: 1px solid rgb(var(--edge)); box-shadow: inset 0 1px 1px rgb(0 0 0 / 0.5); }
+  .chip .wm .bar > i { position: absolute; top: 0; bottom: 0; left: 0; border-radius: 999px; }
+  .chip .wm.cool .bar > i { background: rgb(var(--muted)); }
+  .chip .wm.warm .bar > i { background: linear-gradient(90deg, rgb(var(--brand)), rgb(var(--brand-hover))); box-shadow: 0 0 5px rgb(var(--brand) / 0.5); }
+  .chip .wm.hot  .bar > i { background: rgb(var(--danger)); box-shadow: 0 0 5px rgb(var(--danger) / 0.6); }
+  .chip .wm .pc { font-family: var(--mono); font-size: 0.7rem; font-variant-numeric: tabular-nums; }
+  .chip .wm.cool .pc { color: rgb(var(--faint)); }
+  .chip .wm.warm .pc { color: rgb(var(--brand)); }
+  .chip .wm.hot  .pc { color: rgb(var(--danger)); }
+
+  @media (prefers-reduced-motion: reduce) {
+    .pulse, .meter .fill, .fill.hot::after { animation: none; }
+  }
+
+  /* ── states specimen + rationale (the After's explainer) ── */
+  .states { margin-top: 1.1rem; border: 1px solid rgb(var(--edge)); border-radius: 0.85rem; background: rgb(var(--bg)); padding: 1rem 1.1rem 1.1rem; }
+  .states .head { font-family: var(--mono); font-size: 0.7rem; letter-spacing: 0.14em; text-transform: uppercase; color: rgb(var(--faint)); margin-bottom: 0.35rem; }
+  .states .spec { display: grid; grid-template-columns: 5.5rem 88px 2.9rem 1fr; align-items: center; gap: 0.35rem 1rem; padding: 0.5rem 0; border-top: 1px solid rgb(var(--edge) / 0.6); }
+  .states .spec:first-of-type { border-top: 0; }
+  .states .sname { font-size: 0.82rem; font-weight: 600; }
+  .states .sname.cool { color: rgb(var(--muted)); }
+  .states .sname.warm { color: rgb(var(--brand)); }
+  .states .sname.hot  { color: rgb(var(--danger)); }
+  .states .sdesc { font-size: 0.82rem; color: rgb(var(--muted)); }
+  .states .sdesc code { font-family: var(--mono); font-size: 0.82em; color: rgb(var(--brand-hover)); }
+
+  .after-note { margin-top: 0.7rem; display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 0.7rem; }
+  .after-note div { border: 1px solid rgb(var(--edge)); border-radius: 0.6rem; padding: 0.7rem 0.85rem; background: rgb(var(--bg)); }
+  .after-note h3 { margin: 0 0 0.25rem; font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.04em; text-transform: uppercase; color: rgb(var(--brand)); font-weight: 600; }
+  .after-note p { margin: 0; font-size: 0.85rem; color: rgb(var(--muted)); }
+  .after-note code { font-family: var(--mono); font-size: 0.82em; color: rgb(var(--brand-hover)); }
+
+  .foot { margin-top: 2.5rem; border-top: 1px solid rgb(var(--edge)); padding-top: 1rem; font-size: 0.82rem; color: rgb(var(--faint)); }
+  .foot b { color: rgb(var(--muted)); }
+  .foot code { font-family: var(--mono); color: rgb(var(--brand-hover)); }
+
+  @media (max-width: 620px) {
+    /* Reclaim horizontal budget so the lanes never force a body scroll: the same
+       progressive-disclosure the real ActivityFeed does below `sm`, plus the meter
+       compacts (shorter channel, dot carries state) rather than being dropped. */
+    .page { padding: 2.25rem 0.85rem 3.5rem; }
+    .panel { padding: 1rem 0.9rem 1.1rem; }
+    .lanes { padding: 0.6rem; }
+    .lane { padding: 0.6rem 0.65rem; gap: 0.5rem; }
+    /* Identity > fill > state > recency: on a phone the timestamp yields (all read
+       "just now" here anyway) and the state word folds into its dot, leaving name +
+       channel + %. The name can still truncate below ~340px so the body never scrolls. */
+    .lane .llabel, .lane .lone, .lane .pill, .lane .lstate, .lane .ts { display: none; }
+    .lane .lname { font-size: 0.88rem; flex-shrink: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ctx { grid-template-columns: 60px 2.5rem; gap: 0.45rem; }
+    .meter { height: 6px; }
+    /* the lead-context headline keeps its channel but lets the readout wrap under it */
+    .leadband { flex-wrap: wrap; gap: 0.5rem 0.75rem; padding: 0.6rem 0.75rem; }
+    .leadband .meter { flex: 1 1 100%; order: 3; }
+    .states .spec { display: flex; flex-wrap: wrap; gap: 0.4rem 0.85rem; grid-template-columns: none; }
+    .states .sname { flex: 0 0 6rem; }
+    .states .sdesc { flex-basis: 100%; }
+  }
+</style>
+
+<div class="page">
+  <header>
+    <span class="eyebrow">uzi · run activity</span>
+    <h1>The <span class="molten">context meter</span>, in place</h1>
+    <p class="lede">The same run-activity panel you have today, then the one change under review: a context-window meter for the <strong>lead</strong> — the only session the SDK exposes a window for — fed by <code>context_usage</code> from claude-agent-sdk 0.3.232. Real component structure, ember theme, 122-message crew mid-plan.</p>
+  </header>
+
+  <!-- ══════════ BEFORE ══════════ -->
+  <div class="band-label"><span class="tag">Before</span><span class="rule"></span><span class="hint">today — no window-fill signal anywhere</span></div>
+
+  <section class="panel">
+    <div class="toolbar">
+      <h2>Activity</h2>
+      <div class="tools">
+        <span class="seg"><button class="on">By agent</button><button>Timeline</button></span>
+        <span class="link">Expand all</span>
+        <span class="chk"><span class="box"></span>Follow live</span>
+        <span class="count">122 messages</span>
+      </div>
+    </div>
+
+    <div class="crew">
+      <span class="chip t-waiting"><span class="cdot"></span><span class="cname">lead</span><span class="cstate">WAITING</span></span>
+      <span class="chip t-waiting"><span class="cdot"></span><span class="cname">researcher</span><span class="cn">×3</span><span class="cstate">WAITING</span></span>
+      <span class="chip t-idle"><span class="cdot"></span><span class="cname">worker</span><span class="cstate">IDLE</span></span>
+    </div>
+
+    <div class="lanes">
+      <div class="lane r-brand"><span class="chev">›</span><span class="sdot t-idle"></span><span class="lname">worker</span><span class="lone">starting SDK agent (planning)</span><span class="lstate t-idle">IDLE</span><span class="spacer"></span><span class="ts">2m ago</span></div>
+      <div class="lane r-info"><span class="chev">›</span><span class="sdot t-waiting"></span><span class="lname">lead</span><span class="lone">researcher: Map web+CLI plan approval surface</span><span class="lstate t-waiting">WAITING</span><span class="spacer"></span><span class="ts">just now</span></div>
+      <div class="lane r-ok"><span class="chev">›</span><span class="sdot t-waiting"></span><span class="lname">researcher</span><span class="llabel">· Map agent-side plan inference surface</span><span class="lone">Ran a tool</span><span class="lstate t-waiting">WAITING</span><span class="pill">+6</span><span class="spacer"></span><span class="ts">just now</span></div>
+      <div class="lane r-ok"><span class="chev">›</span><span class="sdot t-waiting"></span><span class="lname">researcher</span><span class="llabel">· Map api plan-approval gate surface</span><span class="lone">Ran a tool</span><span class="lstate t-waiting">WAITING</span><span class="pill">+4</span><span class="spacer"></span><span class="ts">just now</span></div>
+      <div class="lane r-ok"><span class="chev">›</span><span class="sdot t-working pulse"></span><span class="lname">researcher</span><span class="llabel">· Map web+CLI plan approval surface</span><span class="lone">Ran a tool</span><span class="lstate t-working">WORKING</span><span class="pill">+4</span><span class="spacer"></span><span class="ts">just now</span></div>
+    </div>
+  </section>
+
+  <!-- ══════════ AFTER ══════════ -->
+  <div class="band-label after"><span class="tag">After</span><span class="rule"></span><span class="hint">one molten channel for the lead — the only window the SDK exposes</span></div>
+
+  <section class="panel">
+    <div class="toolbar">
+      <h2>Activity</h2>
+      <div class="tools">
+        <span class="seg"><button class="on">By agent</button><button>Timeline</button></span>
+        <span class="link">Expand all</span>
+        <span class="chk"><span class="box"></span>Follow live</span>
+        <span class="count">122 messages</span>
+      </div>
+    </div>
+
+    <div class="crew">
+      <span class="chip t-waiting"><span class="cdot"></span><span class="cname">lead</span><span class="cstate">WAITING</span><span class="wm warm" title="lead context window 78% full"><span class="bar"><i style="width:78%"></i></span><span class="pc">78%</span></span></span>
+      <span class="chip t-waiting"><span class="cdot"></span><span class="cname">researcher</span><span class="cn">×3</span><span class="cstate">WAITING</span></span>
+      <span class="chip t-idle"><span class="cdot"></span><span class="cname">worker</span><span class="cstate">IDLE</span></span>
+    </div>
+
+    <div class="lanes">
+      <!-- Lead-only: the SDK exposes the main-loop (lead) window. Subagents and the
+           bootstrapping worker have no observable window, so their lanes carry no meter. -->
+      <div class="lane r-brand"><span class="chev">›</span><span class="sdot t-idle"></span><span class="lname">worker</span><span class="lone">starting SDK agent (planning)</span><span class="lstate t-idle">IDLE</span><span class="spacer"></span><span class="ts">2m ago</span></div>
+
+      <div class="lane r-info"><span class="chev">›</span><span class="sdot t-waiting"></span><span class="lname">lead</span><span class="lone">researcher: Map web+CLI plan approval surface</span><span class="lstate t-waiting">WAITING</span><span class="spacer"></span><span class="ctx" title="lead context window 78% full — 156k of 200k tokens, filling toward compaction at 100%"><span class="meter"><span class="zone"></span><span class="fill warm" style="width:78%"></span><span class="wall"></span></span><span class="num warm"><span class="v">78</span><span class="u">%</span></span></span><span class="ts">just now</span></div>
+
+      <div class="lane r-ok"><span class="chev">›</span><span class="sdot t-waiting"></span><span class="lname">researcher</span><span class="llabel">· Map agent-side plan inference surface</span><span class="lone">Ran a tool</span><span class="lstate t-waiting">WAITING</span><span class="pill">+6</span><span class="spacer"></span><span class="ts">just now</span></div>
+
+      <div class="lane r-ok"><span class="chev">›</span><span class="sdot t-waiting"></span><span class="lname">researcher</span><span class="llabel">· Map api plan-approval gate surface</span><span class="lone">Ran a tool</span><span class="lstate t-waiting">WAITING</span><span class="pill">+4</span><span class="spacer"></span><span class="ts">just now</span></div>
+
+      <div class="lane r-ok"><span class="chev">›</span><span class="sdot t-working pulse"></span><span class="lname">researcher</span><span class="llabel">· Map web+CLI plan approval surface</span><span class="lone">Ran a tool</span><span class="lstate t-working">WORKING</span><span class="pill">+4</span><span class="spacer"></span><span class="ts">just now</span></div>
+    </div>
+
+    <div class="states">
+      <div class="head">Three states, one channel · 100% = compaction</div>
+      <div class="spec">
+        <span class="sname cool">Cool</span>
+        <span class="meter"><span class="zone"></span><span class="fill cool" style="width:34%"></span><span class="wall"></span></span>
+        <span class="num cool"><span class="v">34</span><span class="u">%</span></span>
+        <span class="sdesc">Room to spare — steel, quiet, nothing to watch.</span>
+      </div>
+      <div class="spec">
+        <span class="sname warm">Molten</span>
+        <span class="meter"><span class="zone"></span><span class="fill warm" style="width:78%"></span><span class="wall"></span></span>
+        <span class="num warm"><span class="v">78</span><span class="u">%</span></span>
+        <span class="sdesc">Filling toward the wall — the channel runs molten, the tip glows hotter.</span>
+      </div>
+      <div class="spec">
+        <span class="sname hot">Near compaction</span>
+        <span class="meter"><span class="zone"></span><span class="fill hot" style="width:97%"></span><span class="wall"></span></span>
+        <span class="num hot"><span class="v">97</span><span class="u">%</span></span>
+        <span class="sdesc">≥95%, into the rose wash — at 100% autocompaction fires and older turns get summarized.</span>
+      </div>
+    </div>
+
+    <div class="after-note">
+      <div><h3>Lead only</h3><p>The SDK exposes the <i>main-loop</i> (lead) context window — the one it autocompacts. A subagent runs in its own session the parent can't read, so researcher windows aren't observable; the <code>worker</code> bootstraps the SDK and is not a model session at all. So one channel, on the lead — a headline above the lanes and the lead's own row.</p></div>
+      <div><h3>100% is the wall</h3><p><code>rawMaxTokens</code> is the autocompact window, so the channel spans the whole budget: 100% — the end of the channel — is where compaction fires and older turns get summarized. The rose wash in the last stretch is the cue worth catching at a glance.</p></div>
+    </div>
+  </section>
+
+  <p class="foot"><b>Not the same as token spend.</b> The run page already tallies per-agent token <i>cost</i> from the message stream (<code>PhaseUsage</code>). This is a different number: how full the lead's live window is <i>right now</i> — the thing that predicts compaction. The SDK exposes the lead's <code>context_usage</code>; surfacing it through the run DTO, the WS frames, the lead chip, the headline and the lead lane is the net-new work an enhancement issue would cover.</p>
+</div>

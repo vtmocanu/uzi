@@ -32,6 +32,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -273,6 +274,9 @@ func (s *Service) evaluateAutoStop(ctx context.Context, now time.Time, c persist
 			Kind:     "cancel",
 			Body:     pgText(autoStopBody),
 			StopKind: pgText(stopKindAutoStopped),
+			// PRD #503 M3: NULL — auto-stop carries no operator reason; its
+			// identity is stop_kind='auto_stopped'.
+			StopReason: pgtype.Text{},
 		}); err != nil {
 			slog.Error("workersvc: auto-stop could not enqueue the stop verdict", "run_id", c.runID.String(), "error", err)
 			return false

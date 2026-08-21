@@ -59,9 +59,9 @@ func TestCommandTree(t *testing.T) {
 
 	subWant := map[string][]string{
 		"run": {"list", "get", "logs", "wait", "review", "create", "approve", "reject", "revise", "cancel", "follow-up", "answer", "inputs", "expedite"},
-		// backlog is the PRD #98 M7 read; there is deliberately no `file` verb —
-		// filing stays browser-only (#68's stance, Decision 10).
-		"review": {"show", "backlog", "resolve", "dismiss", "undo", "stats"},
+		// backlog is the PRD #98 M7 read; `file` (PRD #365 M2) files a recommendation
+		// as a forge issue from the CLI, mirroring `findings file`.
+		"review": {"show", "backlog", "resolve", "dismiss", "undo", "stats", "file"},
 		// PRD #333 M6: the terminal form of the per-repo Findings backlog.
 		"findings": {"list", "file", "dismiss"},
 		"worker":   {"list", "rm", "set-token"},
