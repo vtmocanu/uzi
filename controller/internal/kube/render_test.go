@@ -151,6 +151,12 @@ func TestRenderedPodPosture(t *testing.T) {
 	if dep.Spec.Strategy.Type != "Recreate" {
 		t.Errorf("strategy = %q, want Recreate", dep.Spec.Strategy.Type)
 	}
+	// Bounds superseded-RS retention so wedged init pods from old rolls are GC'd
+	// (issue #360). Set unconditionally at DeploymentSpec level, outside the
+	// plain-vs-docker tier branching.
+	if dep.Spec.RevisionHistoryLimit == nil || *dep.Spec.RevisionHistoryLimit != 1 {
+		t.Errorf("revisionHistoryLimit = %v, want 1", dep.Spec.RevisionHistoryLimit)
+	}
 	// A Deployment's selector is IMMUTABLE — anything extra in it is unpatchable
 	// forever. This is a one-way door.
 	if len(dep.Spec.Selector.MatchLabels) != 1 || dep.Spec.Selector.MatchLabels[LabelWorkerID] != "abc" {
