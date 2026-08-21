@@ -601,7 +601,7 @@ function SkillEditor({
               rows={16}
               aria-label="Body (Markdown, SKILL.md)"
               placeholder={"# my-skill\n\nWhat this playbook covers and the steps to follow."}
-              className="w-full rounded-lg border border-edge bg-raised px-3 py-2 font-mono text-sm text-fg outline-none focus:border-brand/70"
+              className="w-full rounded-lg border border-edge bg-raised px-3 py-2 font-mono text-sm text-fg outline-hidden focus:border-brand/70"
             />
             {body.trim() !== "" && bErr && <p className="text-xs text-warn">{bErr}</p>}
           </div>

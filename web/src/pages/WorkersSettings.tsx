@@ -393,7 +393,7 @@ export function WorkersSettings() {
           a different reason: it holds a SECRET that should not linger on screen.) */}
       {notice && (
         // tabIndex -1: focusable programmatically, never a tab stop of its own.
-        <div ref={noticeRef} tabIndex={-1} className="outline-none">
+        <div ref={noticeRef} tabIndex={-1} className="outline-hidden">
           <Alert tone={notice.tone} message={notice.text} />
         </div>
       )}
@@ -670,7 +670,7 @@ export function WorkersSettings() {
                     onKeyDown={(e) => {
                       if (e.key === "Escape") dismissConfirm(w.id);
                     }}
-                    className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 outline-none"
+                    className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 outline-hidden"
                   >
                     <p id={deleteWarningId(w.id)} className="text-xs text-warn">
                       Delete is not a restart: a hosted worker’s disks go with it, permanently —{" "}

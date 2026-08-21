@@ -1,6 +1,11 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+/* The semantic design tokens (colors routed through CSS variables with the
+   rgb(var(--x) / <alpha-value>) pattern, the derived radius scale and the font
+   families) live in tailwind.config.js. v4 no longer auto-discovers a JS config,
+   so it is loaded explicitly here; the config's `content` globs drive class
+   detection. */
+@config "../tailwind.config.js";
 
 /* Semantic design tokens (multica-style: packages/ui/styles/tokens.css keeps
    every color behind CSS variables; we do the same, with color channels as
@@ -186,18 +191,29 @@ body {
   select:focus-visible,
   textarea:focus-visible,
   [tabindex]:not([tabindex="-1"]):focus-visible {
-    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-ink;
+    @apply outline-hidden ring-2 ring-ring ring-offset-2 ring-offset-ink;
+  }
+}
+
+/* Preflight compatibility (Tailwind v4): v4's reset follows the browser and sets
+   `cursor: default` on buttons, where v3's reset set `cursor: pointer`. Restore
+   the pointer on enabled buttons and role=button elements so every clickable in
+   the app keeps the affordance it had under v3. */
+@layer base {
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
   }
 }
 
 /* Respect prefers-reduced-motion (PRD #38 M4): neutralize the two Tailwind
    keyframe utilities the run feed animates — the running-tool spinner
-   (animate-spin) and the active-agent pulsing dot (animate-pulse). This wins by
-   SOURCE ORDER: Tailwind v3 flattens @layer into plain CSS (no native @layer in
-   the compiled output), so at equal specificity the later rule wins. This block
-   is placed after `@tailwind utilities` (where the animate-* utilities are
-   emitted), so it overrides them — and is deliberately kept OUT of `@layer base`,
-   whose contents Tailwind hoists ahead of the utilities (they would lose). */
+   (animate-spin) and the active-agent pulsing dot (animate-pulse). This block is
+   deliberately UNLAYERED (kept out of any @layer). Tailwind v4 emits its
+   utilities inside the native `utilities` cascade layer, and an unlayered rule
+   always wins over any layered rule regardless of source order — so these
+   overrides beat the animate-* utilities. Keeping it out of `@layer base` also
+   matters: base sorts below utilities, so a base rule would lose to them. */
 @media (prefers-reduced-motion: reduce) {
   .animate-spin,
   .animate-pulse {

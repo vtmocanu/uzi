@@ -204,7 +204,7 @@ function TagInput({
               add();
             }
           }}
-          className="min-w-32 flex-1 bg-transparent px-2 py-1 text-sm text-fg placeholder:text-faint outline-none disabled:opacity-50"
+          className="min-w-32 flex-1 bg-transparent px-2 py-1 text-sm text-fg placeholder:text-faint outline-hidden disabled:opacity-50"
         />
         <Button type="button" variant="secondary" size="sm" onClick={add} disabled={disabled || !draft.trim()}>
           Add

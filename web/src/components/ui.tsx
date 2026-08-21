@@ -154,7 +154,7 @@ export function Field({
 // The brand-tinted border marks the focused field on any focus (incl. mouse);
 // the keyboard-only ring comes from the global :focus-visible rule (index.css).
 const INPUT_CLASS =
-  "w-full rounded-lg border border-edge bg-raised px-3 py-2 text-sm text-fg placeholder:text-faint outline-none focus:border-brand/70";
+  "w-full rounded-lg border border-edge bg-raised px-3 py-2 text-sm text-fg placeholder:text-faint outline-hidden focus:border-brand/70";
 
 export function Input({
   className = "",

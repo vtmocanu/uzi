@@ -31,8 +31,9 @@
 // …, see COLOR_PREFIXES) are flagged — that is where silent color failures live
 // and matches issue #170's stated scope. Because membership already uses the real
 // engine, widening to ALL utilities is just widening that one constant later.
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import os from "node:os";
 import path from "node:path";
 // PARSER: @babel/parser, not the `typescript` package. TypeScript 7 (the native
 // port) removed the synchronous programmatic parser from its public JS API:
@@ -48,8 +49,7 @@ import path from "node:path";
 import { parse } from "@babel/parser";
 import { isStringLiteral, isTemplateLiteral, isJSXAttribute, isJSXIdentifier, isCallExpression, isIdentifier, VISITOR_KEYS } from "@babel/types";
 import postcss from "postcss";
-import tailwind from "tailwindcss";
-import cfg from "../tailwind.config.js";
+import tailwindPostcss from "@tailwindcss/postcss";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const webRoot = path.resolve(scriptDir, "..");
@@ -194,9 +194,29 @@ for (const u of usages) {
 }
 
 // ── 3. Membership via the real engine ──────────────────────────────────────────
+// Tailwind v4's PostCSS plugin (@tailwindcss/postcss) reads its content from
+// source files rather than a `content: [{ raw }]` config, so we feed the
+// collected tokens through a throwaway HTML file: `source(none)` disables the
+// automatic filesystem scan so ONLY these tokens are considered, `@config` loads
+// the project's theme exactly as src/index.css does, and `@source` points the
+// scanner at the token file. A token that generates no rule is an unknown class.
 const uniqueTokens = [...new Set(dedup.map((u) => u.token))];
-const config = { ...cfg, content: [{ raw: uniqueTokens.join("\n"), extension: "html" }] };
-const css = (await postcss([tailwind(config)]).process("@tailwind utilities;", { from: undefined })).css;
+const tmpDir = mkdtempSync(path.join(os.tmpdir(), "uzi-check-styles-"));
+let css;
+try {
+  const tokenFile = path.join(tmpDir, "tokens.html");
+  writeFileSync(tokenFile, `<div class="${uniqueTokens.join(" ")}"></div>\n`);
+  const input = [
+    '@import "tailwindcss" source(none);',
+    '@config "./tailwind.config.js";',
+    `@source "${tokenFile}";`,
+  ].join("\n");
+  css = (await postcss([tailwindPostcss()]).process(input, {
+    from: path.join(webRoot, "check-styles.virtual.css"),
+  })).css;
+} finally {
+  rmSync(tmpDir, { recursive: true, force: true });
+}
 
 // Escape-tolerant selector test: matches `.<token>` allowing tailwind's optional
 // backslash escapes for `/` (opacity), `[]` (arbitrary values) and `:` (variants),
