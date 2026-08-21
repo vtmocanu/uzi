@@ -21766,7 +21766,7 @@ in tension with Feature #35's "two opt-in scopes" wording — see the provenance
   three-way and inherits the default when unset.
 
 - **`runs.wait_on_limit` column DEFAULT stays FALSE — the judge invariant is preserved.** The flip
-  is the per-user/schedule default, NOT the per-run column. Judge runs must never park (§432, PRD
+  is the per-user/schedule default, NOT the per-run column. Judge runs must never park (§433, PRD
   #35 Decision 14), and stay double-guarded: `CreateJudgeRun` never stamps `wait_on_limit`, and
   `SetRunLimitWait` carries `AND kind <> 'judge'`. Flipping the per-run column default would have
   parked judge runs; leaving it false keeps them off.
