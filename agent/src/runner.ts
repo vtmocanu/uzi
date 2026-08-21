@@ -788,6 +788,9 @@ export class RunRunner {
         pipeline: claim.pipeline,
         worktreePath: runnerClone.path,
         branch: runnerClone.branch,
+        // PRD #501 REC B: thread the autopilot flag to plan-build time so the plan
+        // builders render the no-human-in-the-loop note. Absent ⇒ false.
+        autoApprove: claim.auto_approve ?? false,
         // The seed resolved this in the bare; forwarding it is what stops the lead from
         // guessing the branch's parent (judge rec, run 51757591).
         baseCommit: runnerClone.baseCommit,

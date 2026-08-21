@@ -1023,6 +1023,8 @@ export class SdkExecutor implements Executor {
             // does not infer the parent from the clone's freshly-fetched default branch.
             baseCommit: ctx.baseCommit,
             defaultBranchCommit: ctx.defaultBranchCommit,
+            // PRD #501 REC B: thread the autopilot flag so the plan note renders.
+            autoApprove: ctx.autoApprove,
           });
         } else if (isSelfImprove) {
           // The self_improve run's issue_description carries the untrusted improve_uzi
@@ -1044,6 +1046,8 @@ export class SdkExecutor implements Executor {
             // cycle's tip, so its base is the least guessable of the three kinds.
             baseCommit: ctx.baseCommit,
             defaultBranchCommit: ctx.defaultBranchCommit,
+            // PRD #501 REC B: thread the autopilot flag so the plan note renders.
+            autoApprove: ctx.autoApprove,
           });
         } else {
           planPrompt = buildPlanPrompt({
@@ -1064,6 +1068,8 @@ export class SdkExecutor implements Executor {
             // See above.
             baseCommit: ctx.baseCommit,
             defaultBranchCommit: ctx.defaultBranchCommit,
+            // PRD #501 REC B: thread the autopilot flag so the plan note renders.
+            autoApprove: ctx.autoApprove,
           });
         }
         const planningLabel = isCIFix
