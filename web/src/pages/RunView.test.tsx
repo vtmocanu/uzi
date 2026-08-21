@@ -304,6 +304,25 @@ describe("PlanPanel readiness summary (PRD #84 M4 4d)", () => {
     expect(screen.queryByRole("button", { name: /Run without/i })).toBeNull();
   });
 
+  it("marks docker MET via the docker_enabled fold even when capabilities[] omits it", async () => {
+    // A provision-time docker worker whose self-report has not landed: docker=true but
+    // capabilities=[]. The server folds docker_enabled into effective caps, so the panel must
+    // too — otherwise it shows a false UNMET for a plan the approve gate accepts (no 409).
+    const w = { id: "w1", capabilities: [], docker: true } as unknown as Worker;
+    render(
+      <PlanPanel
+        run={run({ worker_id: "w1", required_capabilities: ["docker"], repo_agents: [], own_agents: [] })}
+        workers={[w]}
+        busy={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
+    expect(await screen.findByTitle(/advertises "docker"/)).toBeTruthy();
+    expect(screen.queryByTitle(/does not advertise "docker"/)).toBeNull();
+    expect(screen.queryByRole("button", { name: /Run without/i })).toBeNull();
+  });
+
   it("renders required_tools ('will be provisioned') and the size_class label", async () => {
     render(
       <PlanPanel

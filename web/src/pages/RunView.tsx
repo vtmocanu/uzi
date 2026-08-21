@@ -1312,7 +1312,14 @@ export function PlanPanel({
   const sizeClass = run.size_class ?? "";
   const workerCaps = useMemo(() => {
     const w = run.worker_id ? workers.find((x) => x.id === run.worker_id) : undefined;
-    return new Set(w?.capabilities ?? []);
+    const caps = new Set(w?.capabilities ?? []);
+    // Fold docker_enabled in exactly as the server does (effectiveOwningWorkerCaps /
+    // fn_worker_can_claim: capabilities ∪ {docker if docker_enabled}). The worker DTO carries
+    // `docker` and `capabilities` as INDEPENDENT signals, so a provision-time docker worker
+    // whose self-report has not landed still satisfies a docker requirement — without this
+    // fold the panel would show a false "unmet" for a plan the approve gate accepts.
+    if (w?.docker === true) caps.add("docker");
+    return caps;
   }, [run.worker_id, workers]);
   const unmetCaps = useMemo(() => requiredCaps.filter((c) => !workerCaps.has(c)), [requiredCaps, workerCaps]);
   const hasRequirements = requiredCaps.length > 0 || requiredTools.length > 0 || sizeClass !== "";
@@ -1450,8 +1457,8 @@ export function PlanPanel({
                         tone={unmet ? "warning" : "ok"}
                         title={
                           unmet
-                            ? `The assigned worker does not advertise "${cap}" — this plan cannot run here until one that does claims it, or you run without it.`
-                            : `The assigned worker advertises "${cap}".`
+                            ? `The assigned worker does not advertise "${stripUnsafeChars(cap)}" — this plan cannot run here until one that does claims it, or you run without it.`
+                            : `The assigned worker advertises "${stripUnsafeChars(cap)}".`
                         }
                       >
                         {unmet ? "⚠ " : "✓ "}
