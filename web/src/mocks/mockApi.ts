@@ -3339,7 +3339,13 @@ export const mockApi = {
     const inputs = (mockRunInputs[id] ?? []).map((i) => ({ ...i }));
     return delay({ inputs }, 60);
   },
-  submitRunInput: async (id: string, kind: RunInputKind, body = "", selection?: AgentSelectionInput) => {
+  submitRunInput: async (
+    id: string,
+    kind: RunInputKind,
+    body = "",
+    selection?: AgentSelectionInput,
+    overrideCapabilities?: boolean,
+  ) => {
     if (!getRun(id)) throw new ApiError(404, "run not found");
     // PRD #88: the engine returns the refusals the real api answers with (a 409 for an
     // answer to a question that has moved on, a 400 for a malformed body) rather than
@@ -3351,6 +3357,12 @@ export const mockApi = {
     // post-approval view has something to show.
     if (kind === "approve_plan" && selection) {
       patchRun(id, { agent_source: selection.source, agent_exclusions: selection.exclusions });
+    }
+    // PRD #84 M4 4c/4d: the "run without the capability" override clears the run's inferred
+    // required_capabilities before approving, mirroring the server (the false-positive
+    // correction). required_tools/size_class are display-only and untouched.
+    if (kind === "approve_plan" && overrideCapabilities) {
+      patchRun(id, { required_capabilities: [] });
     }
     return delay({ server_side: false }, 150);
   },

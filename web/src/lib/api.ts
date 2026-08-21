@@ -1488,6 +1488,21 @@ export interface Run {
    *  vocabulary is the SDK's and a newer server can ship a member this build has not
    *  heard of. Null for a run that has never parked. */
   rate_limit_type: string | null;
+  /** PRD #84 M4: the run's inferred/hinted scheduling requirements, surfaced RAW so the
+   *  web derives the plan-gate readiness display from them plus the assigned worker's
+   *  capabilities (there is no server-computed "capability_block" field — the 409 the
+   *  approval gate returns is the authoritative enforcement). `required_capabilities` is
+   *  the claim-gating set (M2 repo hint UNION plan-time inference); `required_tools` are
+   *  DISPLAY-ONLY provisionable toolchain families that never block; `size_class` is the
+   *  clamped s/m/l estimate ("" when plan-time inference never set it).
+   *
+   *  OPTIONAL + back-compat, mirroring RepoDTO.required_capabilities: a mid-deploy api pod
+   *  that predates PRD #84 M4 omits the keys, and an absent value reads as "none inferred"
+   *  so the readiness block simply does not render. The server Filter-s the capability set
+   *  to the v1 vocabulary ({docker, jvm}), so a name here is always known. */
+  required_capabilities?: string[];
+  required_tools?: string[];
+  size_class?: string;
 }
 
 // RunUsage is a run's server-rolled token/cost totals (PRD #40). The run VIEW
@@ -2935,6 +2950,13 @@ const realApi = {
     kind: RunInputKind,
     body = "",
     selection?: AgentSelectionInput,
+    // PRD #84 M4 4c: the "run without the capability" override, meaningful ONLY with
+    // approve_plan (the server ignores it on any other kind). When true the server clears
+    // the run's inferred/hinted required_capabilities before approving, so a plan the
+    // capability gate would otherwise 409-BLOCK is approved anyway — the deliberate
+    // false-positive-inference correction. Sent only when truthy so an ordinary approve
+    // body is unchanged (default false server-side).
+    overrideCapabilities?: boolean,
   ) =>
     request<{ server_side: boolean; id?: number; created_at?: string }>(
       "POST",
@@ -2946,6 +2968,7 @@ const realApi = {
         // server ignores/validates it per kind. Omitted entirely when absent so a
         // plain follow-up/cancel body is unchanged.
         ...(selection ? { selection } : {}),
+        ...(overrideCapabilities ? { override_capabilities: true } : {}),
       },
     ),
 
