@@ -2663,6 +2663,7 @@ export const mockApi = {
       anthropic_secret_id: null,
       anthropic_secret_label: null,
       anthropic_bind_mode: "default" as const,
+      draining_since: null,
     };
     workers.push(w);
     const token = `uzi_wk_${Array.from(crypto.getRandomValues(new Uint8Array(18)), (b) => b.toString(16).padStart(2, "0")).join("")}`;
@@ -2709,7 +2710,8 @@ export const mockApi = {
   // is not a demo — and quota 2 against one seeded hosted worker puts the whole
   // journey three clicks away: provision → 2 of 2 → the button disables → delete →
   // it enables again.
-  // Quota 3 against TWO seeded hosted workers (PRD #113 M5 raised both by one). The
+  // Quota 5 against FOUR seeded hosted workers (PRD #496 added two cordoned demo
+  // workers, w-cordon-eu and w-cordon-idle, on top of the two PRD #113 M5 seeded). The
   // load-bearing property is unchanged and is why the numbers moved together: there is
   // exactly ONE slot of headroom, so web-ux can still drive provision -> at quota ->
   // button disables -> delete -> it enables again, which is the only way to prove the
@@ -2717,7 +2719,7 @@ export const mockApi = {
   //
   // The second seeded worker is the failed roller, which the demo previously could not
   // show at all — so a browser pass could only ever validate the healthy path.
-  hostedConfig: async () => delay({ enabled: true, quota: 3 }),
+  hostedConfig: async () => delay({ enabled: true, quota: 5 }),
   provisionHostedWorker: async (template: string, size: string, docker = false, name?: string) => {
     const w = {
       id: `w-hosted-${++workerCounter}`,
@@ -2759,6 +2761,7 @@ export const mockApi = {
       anthropic_secret_id: null,
       anthropic_secret_label: null,
       anthropic_bind_mode: "default" as const,
+      draining_since: null,
     };
     workers.push(w);
     // { worker } and NOTHING ELSE. Do not mint a token here the way createWorker does

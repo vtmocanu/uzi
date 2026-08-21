@@ -14,6 +14,7 @@ import { ServerIcon } from "../components/icons";
 import { DEFAULT_WORKER_TEMPLATE, WORKER_TEMPLATES, hasTemplateDrift } from "../lib/workerTemplates";
 import { HostedWorkers } from "../components/HostedWorkers";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
+import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
 import { WorkerStatGauges, formatBytes } from "../components/WorkerStats";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { stripUnsafeChars } from "../lib/safeText";
@@ -586,6 +587,7 @@ export function WorkersSettings() {
                     <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
                       {w.status}
                     </Badge>
+                    <WorkerCordonBadge worker={w} />
                     <WorkerRunBadge worker={w} />
                     {/* Hosted deletes confirm; external ones stay one click, and that
                         asymmetry is the whole point. Deleting an EXTERNAL worker
