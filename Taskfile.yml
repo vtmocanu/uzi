@@ -255,6 +255,10 @@ tasks:
       # it is a function of the migration corpus (a tree fact), and the compatibility
       # invariant it protects — an N-1 worker reading a HEAD schema — is cross-cutting.
       - task: check:migration-additive
+      # Migration-number collision guard (PRD #500 M1): also sub-second and offline, so
+      # it runs before `scan:secrets` too. A tree fact (a duplicate goose prefix panics
+      # the runner at boot and in every *LiveDB test), so it belongs in gate:repo.
+      - task: check:migration-numbering
       - task: scan:secrets
 
   gate:api:
@@ -718,6 +722,17 @@ tasks:
       # must detect (Up) and one it must ignore (Down), or it exits 2 (instrument broken).
       # Both args are explicit so this echo shows exactly what is scanned. See the script header.
       - ./scripts/check-migration-additive.sh scripts/migration-additive-canary.sql api/internal/store/migrations
+
+  check:migration-numbering:
+    desc: goose migration number prefixes are unique (whole-dir), with a canary proving the detector fired
+    cmds:
+      # Uniqueness ONLY -- never order/gaps/contiguity (numbers are assigned at merge
+      # time above the live head, so intentional gaps exist and must not be flagged). A
+      # duplicate prefix makes goose panic at boot and in every *LiveDB test. The canary
+      # dir carries two colliding-numbered stubs the check must detect, or it exits 2
+      # (instrument broken). Both args are explicit so this echo shows exactly what is
+      # scanned. See the script header.
+      - ./scripts/check-migration-numbering.sh scripts/migration-numbering-canary api/internal/store/migrations
 
   render:worker-tag-check:
     desc: assert the hosted-worker image tag is pinned independently of Chart.AppVersion (PRD 422 M1)
