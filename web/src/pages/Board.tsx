@@ -254,9 +254,16 @@ export function Board() {
     return isSortDir(v) ? v : DEFAULT_SORT_DIR[sortMode];
   });
   useEffect(() => {
-    const v = prefs.get<string>(`uzi.board.${repoId}.sortDir`, DEFAULT_SORT_DIR[sortMode]);
-    setSortDirState(isSortDir(v) ? v : DEFAULT_SORT_DIR[sortMode]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // Read the persisted MODE from storage rather than closing over the sortMode state:
+    // on a route swap both [repoId] effects run in one commit pass and setSortModeState
+    // has not flushed yet, so the closed-over sortMode is the PREVIOUS repo's. Reading
+    // storage makes the DEFAULT_SORT_DIR fallback match the repo we are switching TO,
+    // which matters only for a pre-#412 prefs state (a persisted non-manual mode with no
+    // persisted sortDir); after #412 setSortMode/setSortDir always persist dir alongside.
+    const persistedMode = prefs.get<string>(`uzi.board.${repoId}.sortMode`, "manual");
+    const modeDefault = DEFAULT_SORT_DIR[isSortMode(persistedMode) ? persistedMode : "manual"];
+    const v = prefs.get<string>(`uzi.board.${repoId}.sortDir`, modeDefault);
+    setSortDirState(isSortDir(v) ? v : modeDefault);
   }, [repoId]);
   const setSortDir = useCallback(
     (next: SortDir) => {
@@ -1144,14 +1151,16 @@ export function Board() {
             {/* Direction toggle (Decision 6). DISABLED (not hidden) in manual mode so the
                 toolbar layout stays stable and the control remains discoverable; manual
                 ignores direction. Carries an accessible name and aria-pressed for the
-                reversed state, plus a visible arrow and text label. */}
+                reversed state, plus a visible arrow and text label. When disabled in
+                manual mode aria-pressed is omitted, so the inert control does not advertise
+                a stale pressed state to a screen reader. */}
             <Button
               type="button"
               variant="secondary"
               size="sm"
               className="py-1 text-xs"
               disabled={sortMode === "manual"}
-              aria-pressed={sortDir === "desc"}
+              aria-pressed={sortMode === "manual" ? undefined : sortDir === "desc"}
               aria-label={`Sort direction: ${sortDir === "asc" ? "ascending" : "descending"}`}
               onClick={() => setSortDir(sortDir === "asc" ? "desc" : "asc")}
             >
