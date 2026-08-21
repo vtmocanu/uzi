@@ -299,6 +299,7 @@ type Repo struct {
 	GuardrailOverrideReason pgtype.Text        `json:"guardrail_override_reason"`
 	GuardrailOverrideBy     pgtype.UUID        `json:"guardrail_override_by"`
 	GuardrailOverrideAt     pgtype.Timestamptz `json:"guardrail_override_at"`
+	RequiredCapabilities    []string           `json:"required_capabilities"`
 }
 
 type RepoToolProfile struct {
@@ -413,6 +414,7 @@ type Run struct {
 	ThenFixRequested      bool               `json:"then_fix_requested"`
 	ThenFixOfRunID        pgtype.UUID        `json:"then_fix_of_run_id"`
 	PreservedPatch        pgtype.Text        `json:"preserved_patch"`
+	RequiredCapabilities  []string           `json:"required_capabilities"`
 }
 
 type RunMessage struct {

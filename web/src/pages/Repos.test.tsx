@@ -22,6 +22,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       listToolAllowlist: vi.fn(),
       setRepoToolProfile: vi.fn(),
       setRepoDevboxOptIn: vi.fn(),
+      setRepoRequiredCapabilities: vi.fn(),
       setRepoGuardrailOverride: vi.fn(),
       clearRepoGuardrailOverride: vi.fn(),
     },
@@ -356,11 +357,51 @@ describe("Repos — tier-2 devbox opt-in (PRD #18 M5)", () => {
 
     // Open the per-repo Tools panel.
     fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: "Tools" }));
-    // The trust toggle appears (allowlist is empty, so it's the only checkbox).
-    const toggle = await screen.findByRole("checkbox");
+    // The devbox trust toggle (distinct from the capability checkboxes below it).
+    const toggle = await screen.findByRole("checkbox", { name: /Also trust this repo/i });
     fireEvent.click(toggle);
 
     await waitFor(() => expect(mockApi.setRepoDevboxOptIn).toHaveBeenCalledWith("repo-uzi", true));
+  });
+});
+
+describe("Repos — static capability hint (PRD #84 M2)", () => {
+  it("ticks a capability and PATCHes required_capabilities alone", async () => {
+    mockApi.setRepoRequiredCapabilities.mockResolvedValue({
+      repo: { ...REPOS[0], required_capabilities: ["docker"] },
+    });
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+
+    fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: "Tools" }));
+    // The fixed vocabulary renders as two checkboxes; tick docker.
+    const docker = await screen.findByRole("checkbox", { name: "docker" });
+    expect((docker as HTMLInputElement).checked).toBe(false);
+    fireEvent.click(docker);
+
+    await waitFor(() =>
+      expect(mockApi.setRepoRequiredCapabilities).toHaveBeenCalledWith("repo-uzi", ["docker"]),
+    );
+  });
+
+  it("unticks a capability and PATCHes the shrunk list", async () => {
+    mockApi.listProjects.mockResolvedValue({
+      repos: [{ ...REPOS[0], required_capabilities: ["docker", "jvm"] }],
+    });
+    mockApi.setRepoRequiredCapabilities.mockResolvedValue({
+      repo: { ...REPOS[0], required_capabilities: ["jvm"] },
+    });
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+
+    fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: "Tools" }));
+    const docker = (await screen.findByRole("checkbox", { name: "docker" })) as HTMLInputElement;
+    expect(docker.checked).toBe(true);
+    fireEvent.click(docker);
+
+    await waitFor(() =>
+      expect(mockApi.setRepoRequiredCapabilities).toHaveBeenCalledWith("repo-uzi", ["jvm"]),
+    );
   });
 });
 

@@ -792,6 +792,18 @@ type DockerAllowlistReader interface {
 	DockerRepoAllowlist(ctx context.Context) ([]uuid.UUID, error)
 }
 
+// CapabilityScheduleReader is the narrow settings view the claim gate reads for the
+// capability-aware scheduling kill-switch (PRD #84 Decision 13). *settings.Cache
+// satisfies it. Kept its own interface (interface segregation, like
+// DockerAllowlistReader) so a test exercises only what it uses. Optional (nil-safe):
+// a nil reader — or a read error — DEFAULTS the flag ON (capability_aware=true), the
+// safe default, so an unconfigured or momentarily-unreadable setting routes rather
+// than degrading to best-effort claiming. Existing tests construct the service
+// without it and are unaffected.
+type CapabilityScheduleReader interface {
+	CapabilityAwareScheduling(ctx context.Context) (bool, error)
+}
+
 // Service holds the store, the secret cipher, and the runtime params.
 type Service struct {
 	q   Store
@@ -832,6 +844,12 @@ type Service struct {
 	// claims no repo-bearing run); a non-docker worker never consults it, so tests and
 	// deployments without a settings cache are unaffected.
 	dockerAllowlist DockerAllowlistReader
+	// capabilitySettings reads the capability-aware scheduling kill-switch the claim
+	// gate threads into ClaimRun (PRD #84 Decision 13). Optional (nil-safe); set via
+	// SetCapabilitySettings with the same settings cache the HTTP handlers hold. Nil ⇒
+	// the flag DEFAULTS ON, so tests and deployments without a settings cache route
+	// capability-aware exactly as a live instance whose admin left the default in place.
+	capabilitySettings CapabilityScheduleReader
 	// lastSlowClampWarn is the last health_slow_seconds value the read-time clamp
 	// warned about (PRD #47), so the warning logs once per distinct misconfigured
 	// value instead of on every 15s sweep. Touched only by the sweeper goroutine
@@ -917,6 +935,13 @@ func (s *Service) SetHealthSettings(cfg Settings) { s.healthSettings = cfg }
 // worker fail-closed — it claims no repo-bearing run — while leaving non-docker
 // workers wholly unaffected.
 func (s *Service) SetDockerAllowlist(r DockerAllowlistReader) { s.dockerAllowlist = r }
+
+// SetCapabilitySettings wires the capability-aware scheduling kill-switch reader the
+// claim gate threads into ClaimRun (PRD #84 Decision 13). Call once at startup, before
+// serving, with the same settings cache the HTTP handlers hold. Nil (the default in
+// tests) defaults the flag ON — capability matching is enforced — so the omission is
+// safe rather than a silent disable.
+func (s *Service) SetCapabilitySettings(r CapabilityScheduleReader) { s.capabilitySettings = r }
 
 // SetForgeBaseURLAllowed wires the SSRF gate for the M8 checkpoint-publish path
 // (PRD #122). Call once at startup with config.Config.ForgeBaseURLAllowed. Leaving
@@ -1126,12 +1151,28 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 		}
 	}
 
+	// Capability-aware scheduling kill-switch (PRD #84 Decision 13). Threaded into
+	// ClaimRun as @capability_aware: the extended fn_worker_can_claim reads its new
+	// subset clause as `NOT capability_aware OR (required ⊆ caps)`, so a false flag makes
+	// the capability match trivially true (best-effort claiming) while the docker
+	// allowlist clause above stays enforced. DEFAULT ON: a nil reader (tests, or a
+	// deployment without a settings cache) or a read error both leave it true, so an
+	// unconfirmable flag routes rather than silently degrading to a mid-run crash.
+	capabilityAware := true
+	if s.capabilitySettings != nil {
+		if v, cerr := s.capabilitySettings.CapabilityAwareScheduling(ctx); cerr == nil {
+			capabilityAware = v
+		}
+	}
+
 	run, err := s.q.ClaimRun(ctx, store.ClaimRunParams{
 		WorkerID:              pgUUID(wkr.ID),
 		UserID:                wkr.UserID,
 		AffinityCutoff:        pgTime(s.now().Add(-s.p.WorkerAffinityGrace)),
 		IsDockerWorker:        isDocker,
 		DockerRepoAllowlist:   allowlist,
+		WorkerCaps:            wkr.Capabilities,
+		CapabilityAware:       capabilityAware,
 		SpreadCutoff:          pgTime(s.now().Add(-s.p.WorkerSpreadGrace)),
 		BackgroundGraceCutoff: pgTime(s.now().Add(-s.p.WorkerBackgroundGrace)),
 		HeartbeatCutoff:       pgTime(s.now().Add(-s.p.WorkerHeartbeatStale)),

@@ -13,6 +13,11 @@ import { BoardIcon, XIcon } from "../components/icons";
 import { DocLink } from "../components/DocLink";
 import { DOC_REPO_AGENTS } from "../lib/doclinks";
 
+// The server-owned capability vocabulary (PRD #84). The repo hint offers only these
+// names; the server capability.Filters anything else, so free-form entry is not
+// allowed. Keep in sync with api/internal/capability's Vocabulary.
+const CAPABILITY_VOCABULARY = ["docker", "jvm"] as const;
+
 export function Repos() {
   // The guardrail override write is admin-only (PRD #66 D8): a member sees the block
   // and a pointer to ask an admin, never an Allow/Revoke control.
@@ -276,6 +281,23 @@ export function Repos() {
     setToolsBusy(true);
     try {
       const { repo: updated } = await api.setRepoDevboxOptIn(repo.id, enabled);
+      setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Update failed");
+    } finally {
+      setToolsBusy(false);
+    }
+  };
+
+  // Static per-repo capability hint (PRD #84 M2): route this repo's runs only to
+  // workers that have the ticked capabilities. Applied immediately like the devbox
+  // toggle; the server capability.Filters the list, so the response is authoritative
+  // and reflected in repo state so the checkboxes stay in sync.
+  const setRepoRequiredCapabilities = async (repo: Repo, nextCaps: string[]) => {
+    setError("");
+    setToolsBusy(true);
+    try {
+      const { repo: updated } = await api.setRepoRequiredCapabilities(repo.id, nextCaps);
       setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Update failed");
@@ -888,6 +910,42 @@ export function Repos() {
                     so enable this only for a repo whose review discipline you trust. Your tools above always win a version
                     conflict.
                   </p>
+                </div>
+
+                {/* Static per-repo capability hint (PRD #84 M2): route this repo's
+                    runs only to workers with the ticked capabilities. Fixed
+                    vocabulary, no free-form entry. */}
+                <div
+                  role="group"
+                  aria-label="Required capabilities"
+                  className="space-y-1.5 border-t border-edge pt-3"
+                >
+                  <p className="text-sm text-fg">Required capabilities</p>
+                  <p className="text-xs text-muted">
+                    Route this repo&rsquo;s runs only to workers that have them.
+                  </p>
+                  <div className="flex flex-wrap gap-x-6 gap-y-2 pt-1">
+                    {CAPABILITY_VOCABULARY.map((cap) => {
+                      const current = toolsRepo.required_capabilities ?? [];
+                      const checked = current.includes(cap);
+                      return (
+                        <label key={cap} className="flex items-center gap-2 text-sm text-fg">
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            disabled={toolsBusy}
+                            onChange={(e) => {
+                              const next = e.target.checked
+                                ? [...current, cap]
+                                : current.filter((c) => c !== cap);
+                              setRepoRequiredCapabilities(toolsRepo, next);
+                            }}
+                          />
+                          <span className="font-mono text-xs">{cap}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
                 </div>
               </div>
             )}

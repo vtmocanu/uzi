@@ -99,6 +99,37 @@ func TestGetSettingsSurfacesJudgeEnforceAll(t *testing.T) {
 	}
 }
 
+// The admin GET surface auto-surfaces the PRD #84 capability-aware scheduling
+// kill-switch: unset it reads as its compiled-in default ("true"), and a stored bool
+// round-trips verbatim through the admin view. Read half; the write half round-trips
+// through Validate's bool case (settings package test).
+func TestGetSettingsSurfacesCapabilityAwareScheduling(t *testing.T) {
+	// Unset → compiled-in default "true".
+	h := newSettingsHandler()
+	rec := httptest.NewRecorder()
+	h.GetSettings(rec, httptest.NewRequest(http.MethodGet, "/api/admin/settings", nil))
+	var resp struct {
+		Settings map[string]string `json:"settings"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got := resp.Settings[settings.KeyCapabilityAwareScheduling]; got != settings.DefaultCapabilityAwareScheduling {
+		t.Errorf("capability_aware_scheduling default = %q, want %q", got, settings.DefaultCapabilityAwareScheduling)
+	}
+
+	// A stored "false" round-trips through the admin view.
+	h = newSettingsHandler(store.AppSetting{Key: settings.KeyCapabilityAwareScheduling, Value: "false"})
+	rec = httptest.NewRecorder()
+	h.GetSettings(rec, httptest.NewRequest(http.MethodGet, "/api/admin/settings", nil))
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got := resp.Settings[settings.KeyCapabilityAwareScheduling]; got != "false" {
+		t.Errorf("capability_aware_scheduling stored = %q, want false", got)
+	}
+}
+
 func TestUpdateSettingsRejectsUnauthenticated(t *testing.T) {
 	h := newSettingsHandler()
 	rec := httptest.NewRecorder()

@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
@@ -119,6 +120,17 @@ func guardrailBlockedForRepo(rep *privcheck.Report, repoID string, overridden bo
 	return false
 }
 
+// capsOrEmpty normalizes a repo/run capability slice to a non-nil empty slice so the
+// DTO marshals `[]` rather than `null` when the column holds the empty set. The column
+// is NOT NULL DEFAULT '{}', but pgx can hand back a nil slice for a zero-length array,
+// and the web/CLI want a stable array shape.
+func capsOrEmpty(caps []string) []string {
+	if caps == nil {
+		return []string{}
+	}
+	return caps
+}
+
 // repoDTO (apitypes.RepoDTO) moved to the stdlib-only apitypes leaf (PRD #64 M1);
 // repoToDTO stays here as the store→DTO mapper.
 func repoToDTO(r store.Repo) apitypes.RepoDTO {
@@ -132,6 +144,10 @@ func repoToDTO(r store.Repo) apitypes.RepoDTO {
 		RepoSkillsEnabled:   r.RepoSkillsEnabled,
 		RepoClaudemdEnabled: r.RepoClaudemdEnabled,
 		RepoDevboxOptIn:     r.RepoDevboxOptIn,
+		// PRD #84 M2: the static per-repo capability hint. Filter-ed at the write path,
+		// so what the DTO surfaces is always a vocabulary-legal set. Normalized to a
+		// non-nil empty slice ([] over null) so the JSON shape is stable for the web.
+		RequiredCapabilities: capsOrEmpty(r.RequiredCapabilities),
 	}
 	if r.DefaultBranch.Valid {
 		dto.DefaultBranch = &r.DefaultBranch.String
@@ -767,6 +783,13 @@ type patchRepoRequest struct {
 	// devbox.json packages (packages-only) into provisioning. Pointer = omitted is a
 	// no-op. Its own exclusive path — cannot be combined with the trust flags.
 	RepoDevboxOptIn *bool `json:"repo_devbox_opt_in"`
+	// RepoRequiredCapabilities is the static per-repo capability hint (PRD #84 M2): the
+	// non-provisionable capabilities every run on this repo requires (today {docker}).
+	// Pointer so an omitted field is a no-op; a present (possibly empty) slice replaces
+	// the stored set. Its own exclusive path. The list is Filter-ed against the
+	// server-owned vocabulary before storage, so an unknown/spoofed name is dropped and
+	// never persisted (enqueue-time validation, Decision 4).
+	RepoRequiredCapabilities *[]string `json:"required_capabilities"`
 }
 
 // optBoolToPgtype maps an optional request bool to a pgtype.Bool: a nil pointer is
@@ -779,13 +802,14 @@ func optBoolToPgtype(v *bool) pgtype.Bool {
 	return pgtype.Bool{Bool: *v, Valid: true}
 }
 
-// PatchRepo updates a repo's mutable opt-in settings. Two disjoint paths: the
+// PatchRepo updates a repo's mutable opt-in settings. Three disjoint paths: the
 // trust flags (repo_skills_enabled and/or repo_claudemd_enabled, PRD #16/#246) —
 // which may be set together or individually in one atomic round-trip
-// (SetRepoTrustFlags) — and repo_devbox_opt_in (PRD #18), which is its own exclusive
-// path. The two paths cannot be combined in one request. At least one field must be
-// present. Authorization: the repo owner (via the owning connection) or an admin. A
-// non-owned, unknown id returns 404 for a non-admin; an admin may target any repo.
+// (SetRepoTrustFlags) — repo_devbox_opt_in (PRD #18), and required_capabilities (the
+// static per-repo capability hint, PRD #84 M2). Each of the three is its own exclusive
+// path and no two can be combined in one request. At least one field must be present.
+// Authorization: the repo owner (via the owning connection) or an admin. A non-owned,
+// unknown id returns 404 for a non-admin; an admin may target any repo.
 func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -804,12 +828,22 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 	}
 	devboxSet := req.RepoDevboxOptIn != nil
 	trustSet := req.RepoSkillsEnabled != nil || req.RepoClaudemdEnabled != nil
-	if devboxSet && trustSet {
-		httpx.Error(w, http.StatusBadRequest, "repo_devbox_opt_in cannot be combined with repo_skills_enabled or repo_claudemd_enabled")
+	capsSet := req.RepoRequiredCapabilities != nil
+	// Each of the three settings groups is its own exclusive path — at most one per
+	// request. b2i counts how many are present so a combined request is rejected
+	// uniformly rather than pairwise.
+	b2i := func(b bool) int {
+		if b {
+			return 1
+		}
+		return 0
+	}
+	if b2i(devboxSet)+b2i(trustSet)+b2i(capsSet) > 1 {
+		httpx.Error(w, http.StatusBadRequest, "repo_devbox_opt_in, required_capabilities, and the trust flags cannot be combined in one request")
 		return
 	}
-	if !devboxSet && !trustSet {
-		httpx.Error(w, http.StatusBadRequest, "provide repo_devbox_opt_in, or at least one of repo_skills_enabled or repo_claudemd_enabled")
+	if !devboxSet && !trustSet && !capsSet {
+		httpx.Error(w, http.StatusBadRequest, "provide repo_devbox_opt_in, required_capabilities, or at least one of repo_skills_enabled or repo_claudemd_enabled")
 		return
 	}
 
@@ -831,6 +865,16 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 			repo, err = h.q.SetRepoDevboxOptIn(r.Context(), store.SetRepoDevboxOptInParams{ID: id, RepoDevboxOptIn: *req.RepoDevboxOptIn})
 		} else {
 			repo, err = h.q.SetRepoDevboxOptInForUser(r.Context(), store.SetRepoDevboxOptInForUserParams{ID: id, RepoDevboxOptIn: *req.RepoDevboxOptIn, UserID: user.ID})
+		}
+	case capsSet:
+		// Filter against the server-owned vocabulary BEFORE storage (Decision 4): an
+		// unknown/spoofed name is dropped and never persisted, and the stored set is
+		// deduped in stable vocabulary order.
+		caps := capability.Filter(*req.RepoRequiredCapabilities)
+		if user.IsAdmin {
+			repo, err = h.q.SetRepoRequiredCapabilities(r.Context(), store.SetRepoRequiredCapabilitiesParams{ID: id, RequiredCapabilities: caps})
+		} else {
+			repo, err = h.q.SetRepoRequiredCapabilitiesForUser(r.Context(), store.SetRepoRequiredCapabilitiesForUserParams{ID: id, RequiredCapabilities: caps, UserID: user.ID})
 		}
 	}
 	if err != nil {

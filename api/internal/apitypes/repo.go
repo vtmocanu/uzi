@@ -21,6 +21,12 @@ type RepoDTO struct {
 	// repo also unions the packages from the repo's own devbox.json (packages-only,
 	// never its hooks/scripts). Default false.
 	RepoDevboxOptIn bool `json:"repo_devbox_opt_in"`
+	// RequiredCapabilities is the static per-repo capability hint (PRD #84 M2): the
+	// non-provisionable capabilities (e.g. docker) every run on this repo is routed to
+	// require. Copied onto each new issue run at enqueue and matched at claim time.
+	// Server-owned vocabulary — an unknown name is Filter-ed out before it is stored.
+	// Empty (the default) means no requirement, so runs claim anywhere.
+	RequiredCapabilities []string `json:"required_capabilities"`
 	// Pipeline is the repo's default-branch CI status (PRD #6), null when there is
 	// no cached default-branch pipeline (no CI configured, MR-only pipelines, or not
 	// yet synced). Set by the list handlers, which enrich from the pipeline cache.

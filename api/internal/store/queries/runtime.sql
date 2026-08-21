@@ -180,7 +180,9 @@ WITH prev AS (
         -- Filter-ed union of the worker's self-report and its template-derived caps,
         -- computed in Service.Register. Overwritten on every register (the fresh-start
         -- signal), so a worker that stops self-reporting docker loses it here too.
-        capabilities        = @capabilities,
+        -- COALESCE guards the NOT NULL column against a nil slice from any caller
+        -- (pgx encodes a nil []string as SQL NULL): a nil report stores '{}', not NULL.
+        capabilities        = COALESCE(@capabilities::text[], '{}'),
         max_concurrent_runs = sqlc.narg('max_concurrent_runs'),
         -- online_since is the api-owned uptime anchor (PRD #251 M1): PRESERVE it if the
         -- worker is already online with one, else STAMP now() — so a steady stream of
@@ -361,8 +363,15 @@ WHERE status = 'online'
 -- issue-less kind, a comment-less issue, and a connection with an unknown bot id
 -- (D9) all store NULL — so an omitted Go struct field would compile green and
 -- silently ship NULL for every run. The fetch is centralized in createRun.
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb)
+--
+-- 🔴 required_capabilities (PRD #84 M2) is NOT a Go struct param: it is copied
+-- atomically from the run's repo via a subquery, so the createRun path needs no
+-- extra Go read and cannot ship a stale hint. The repo's hint is already Filter-ed
+-- against the vocabulary at its write path, so no re-validation is needed here.
+-- Repo-less kinds (judge/chat/self_improve) INSERT elsewhere and keep the '{}'
+-- column default. Plan inference (M4) later union-merges via a separate UPDATE.
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, required_capabilities)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'))
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -573,7 +582,9 @@ WHERE id = (
            OR r.worker_id = @worker_id
            OR r.updated_at < @affinity_cutoff)
       -- PRD #216 D5: claiming-worker eligibility via the shared expression.
-      AND fn_worker_can_claim(@is_docker_worker::boolean, @docker_repo_allowlist::uuid[], r.repo_id, r.kind)
+      -- PRD #84 M2 extends it: the run's required_capabilities must be a subset of the
+      -- claiming worker's effective caps (@worker_caps ∪ docker), gated by @capability_aware.
+      AND fn_worker_can_claim(@is_docker_worker::boolean, @docker_repo_allowlist::uuid[], r.repo_id, r.kind, @worker_caps::text[], r.required_capabilities, @capability_aware::boolean)
       -- PRD #216 fleet-aware spread (D3/D4/D7/D8/R3). Defer this run to a peer
       -- ONLY when a strictly-better peer exists. Resume affinity (worker_id = me)
       -- and a run older than @spread_cutoff both BYPASS the spread, so the spread
@@ -610,7 +621,7 @@ WHERE id = (
                 -- run to it — it would never pick the run up.
                 AND p.draining_since IS NULL
                 AND p.max_concurrent_runs IS NOT NULL
-                AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), @docker_repo_allowlist::uuid[], r.repo_id, r.kind)
+                AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), @docker_repo_allowlist::uuid[], r.repo_id, r.kind, p.capabilities, r.required_capabilities, @capability_aware::boolean)
                 AND pa.active < p.max_concurrent_runs
                 AND pa.active * (SELECT w.max_concurrent_runs FROM workers w WHERE w.id = @worker_id)
                     < (SELECT count(*) FROM runs mr
