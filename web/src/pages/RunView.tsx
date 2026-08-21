@@ -788,7 +788,12 @@ export function RunView() {
                   failing from the other side: not a false alarm, a false all-clear.
                   `awaiting_approval` has the same shape and keeps the chip, because a
                   human gate is minutes and someone is expected to be looking; a park
-                  is hours by design, which is what makes it different in kind. */}
+                  is hours by design, which is what makes it different in kind.
+
+                  PRD #517: `awaiting_followup` also KEEPS the chip — it is a needs-you
+                  gate (the user is expected to send the next follow-up), the same kind
+                  as awaiting_input, NOT the self-resuming clock park that limit_wait is.
+                  So only limit_wait is excluded here. */}
               {!terminal && run.status !== "limit_wait" && (
                 <span
                   title={connected ? "Live" : "Reconnecting…"}

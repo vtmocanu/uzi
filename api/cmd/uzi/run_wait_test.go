@@ -100,6 +100,43 @@ func TestRunWaitNarrowedUntilSkipsGate(t *testing.T) {
 	}
 }
 
+func TestRunWaitStopsAtFollowupPark(t *testing.T) {
+	// PRD #517 D9: a bare `uzi run wait <id>` must STOP on awaiting_followup — an
+	// interactive task parked awaiting the user's next follow-up needs the caller and does
+	// NOT auto-resume. Mutation that reddens this: dropping "awaiting_followup" from
+	// defaultWaitStates → the wait passes through the park and runs on to the later
+	// `completed` step, so the "→ completed" guard below fires.
+	fc := &uzicli.FakeClient{GetRunHook: scriptHook(
+		okStep("running"), okStep("running"), okStep("awaiting_followup"), okStep("completed"),
+	)}
+	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "wait", "r1", "--interval", "1ms")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stderr, "running → awaiting_followup") {
+		t.Errorf("expected a running→awaiting_followup transition, stderr = %q", stderr)
+	}
+	if strings.Contains(stderr, "→ completed") {
+		t.Errorf("must stop AT the follow-up park, not run past it to completed; stderr = %q", stderr)
+	}
+}
+
+func TestRunWaitUntilFollowupValidates(t *testing.T) {
+	// `uzi run wait --until awaiting_followup` must validate (not a usage error) and stop
+	// on the park. Mutation that reddens this: dropping "awaiting_followup" from
+	// allRunStatuses → the --until validator rejects it and the CLI exits 2 (ExitUsage)
+	// instead of 0, so the exit-code assertion fails.
+	fc := &uzicli.FakeClient{GetRunHook: scriptHook(okStep("running"), okStep("awaiting_followup"))}
+	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "wait", "r1",
+		"--until", "awaiting_followup", "--interval", "1ms")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 — --until awaiting_followup must validate (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stderr, "→ awaiting_followup") {
+		t.Errorf("should have stopped at the follow-up park, stderr = %q", stderr)
+	}
+}
+
 func TestRunWaitTimeoutExitsSeven(t *testing.T) {
 	fc := &uzicli.FakeClient{GetRunHook: scriptHook(okStep("running"))}
 	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "wait", "r1",

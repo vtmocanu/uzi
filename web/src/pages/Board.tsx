@@ -25,6 +25,7 @@ import {
   canOpenRunView,
   hasActiveRun,
   isAwaitingApproval,
+  isAwaitingFollowup,
   isAwaitingInput,
   needsHumanAttention,
   retryHint,
@@ -479,6 +480,11 @@ export function Board() {
             // Whatever the two buckets above already show, this one must not repeat.
             !isAwaitingApproval(r.status) &&
             !isAwaitingInput(r.status) &&
+            // PRD #517: awaiting_followup deliberately has NO strip bucket of its own (a
+            // follow-up park is not an unanswered question), but its card still goes loud
+            // via needsHumanAttention. Excluded here so a stale health flag on a parked
+            // run is never mislabelled "looks stuck", matching the two parks above.
+            !isAwaitingFollowup(r.status) &&
             // Belt-and-braces for a STALE flag: the server's exit contract clears
             // health on every status transition, so an approval_idle on some other
             // status should not exist — but if one ever did, "looks stuck" would be

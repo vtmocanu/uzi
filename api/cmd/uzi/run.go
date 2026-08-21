@@ -86,7 +86,7 @@ var terminalRunStatuses = map[string]bool{
 	"cancelled": true,
 }
 
-// allRunStatuses is the nine-value status enum the skill documents and migration
+// allRunStatuses is the run status enum the skill documents and migration
 // 00092 constrains (runs_status_check). It is the source of truth `run wait`
 // validates `--until` against, so a typo'd target is a clean usage error rather than
 // a silent forever-wait. A status the SERVER reports that is NOT in this set is a
@@ -98,6 +98,7 @@ var allRunStatuses = map[string]bool{
 	"running":           true,
 	"awaiting_approval": true,
 	"awaiting_input":    true,
+	"awaiting_followup": true,
 	statusLimitWait:     true,
 	"completed":         true,
 	"failed":            true,
@@ -105,11 +106,14 @@ var allRunStatuses = map[string]bool{
 }
 
 // defaultWaitStates is `run wait`'s `--until` default (PRD #264 D2): the "actionable"
-// set — every state that needs the caller or ends the run. It deliberately OMITS
-// queued/claimed/running (still working) and limit_wait (auto-resumes; parking on it
-// is legitimate), so a bare `uzi run wait <id>` returns at the plan gate, a
-// clarification park, or a terminal — the common "wait for the gate OR the end" case.
-var defaultWaitStates = []string{"awaiting_approval", "awaiting_input", "completed", "failed", "cancelled"}
+// set — every state that needs the caller or ends the run. It INCLUDES awaiting_followup
+// (PRD #517 D9): an interactive task parked awaiting the user's next follow-up needs the
+// caller and does NOT auto-resume, so a bare `uzi run wait <id>` must stop on it. It
+// deliberately OMITS queued/claimed/running (still working) and limit_wait (auto-resumes;
+// parking on it is legitimate), so a bare `uzi run wait <id>` returns at the plan gate, a
+// clarification park, a follow-up park, or a terminal — the common "wait for the gate OR
+// the end" case.
+var defaultWaitStates = []string{"awaiting_approval", "awaiting_input", "awaiting_followup", "completed", "failed", "cancelled"}
 
 // run wait poll cadence and transient-blip resilience knobs (PRD #264 D1/D9). Vars,
 // not consts, only so tests shrink the waits; nothing at runtime reassigns them.

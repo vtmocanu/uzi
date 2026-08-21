@@ -112,7 +112,7 @@ func (b *boardState) visible() []apitypes.RunListItemDTO {
 
 // The three triage bands, in fixed top-to-bottom order.
 const (
-	bandNeedsYou = iota // awaiting_approval + awaiting_input — the only rows a human must act on
+	bandNeedsYou = iota // awaiting_approval + awaiting_input + awaiting_followup — the only rows a human must act on
 	bandFloor           // everything non-terminal not in NEEDS YOU (running/claimed/queued/planning/limit_wait, stalled)
 	bandDone            // terminal: completed/failed/cancelled
 	numBands
@@ -123,7 +123,9 @@ var bandNames = [numBands]string{"NEEDS YOU", "ON THE FLOOR", "DONE"}
 // runBand places a run in its triage band from its status alone.
 func runBand(status string) int {
 	switch status {
-	case "awaiting_approval", "awaiting_input":
+	case "awaiting_approval", "awaiting_input", "awaiting_followup":
+		// awaiting_followup (PRD #517) is the user's turn — an interactive task parked for
+		// its next follow-up — so it belongs in NEEDS YOU alongside the other two parks.
 		return bandNeedsYou
 	}
 	if terminalRunStatuses[status] {

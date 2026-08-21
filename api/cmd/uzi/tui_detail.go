@@ -561,11 +561,13 @@ func (m tuiModel) paneTitle(title string, focused bool) string {
 	return " " + m.pal.faint.Render(strings.ToUpper(title))
 }
 
-// detailBanner is the S3 two-band treatment: awaiting_approval gets the PLAN GATE band with the
-// OWNER's approve/reject keys inline (dropped from the footer so they are not duplicated);
+// detailBanner is the S3 attention-band treatment: awaiting_approval gets the PLAN GATE band with
+// the OWNER's approve/reject keys inline (dropped from the footer so they are not duplicated);
 // awaiting_input gets a DISTINCT needs-input band that never offers y/n — those keys do nothing
-// at a clarification park, which is answered off-TUI (run answer / web / Slack). Both show for
-// owner and non-owner alike; only the inline keys are ownership-gated.
+// at a clarification park, which is answered off-TUI (run answer / web / Slack); awaiting_followup
+// (PRD #517) gets its OWN band, distinct from needs-input: an interactive task parked for the
+// user's next follow-up, which is NOT a y/n prompt — the owner sends a follow-up (the `f` key) or
+// stops the run. All show for owner and non-owner alike; only the inline keys are ownership-gated.
 func (m tuiModel) detailBanner() string {
 	owner := m.detail.steer.access == steerAllowed
 	switch m.detail.run.Status {
@@ -573,6 +575,8 @@ func (m tuiModel) detailBanner() string {
 		return m.attentionBanner("⚑ PLAN GATE", "the crew is waiting on your approval", owner)
 	case "awaiting_input":
 		return m.attentionBanner("✎ NEEDS INPUT", "the agent asked a question; answer it from another terminal, the web, or Slack", false)
+	case "awaiting_followup":
+		return m.attentionBanner("➤ AWAITING FOLLOW-UP", "the task is parked for your next follow-up; send one with f, or from the web or Slack", false)
 	}
 	return ""
 }
