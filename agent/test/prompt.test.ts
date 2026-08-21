@@ -600,9 +600,11 @@ describe("buildImplementPrompt", () => {
   it("issue #222: a resumed first turn warns the tree was rebuilt and prior local-only work is gone", () => {
     const p = buildImplementPrompt({ branch: "b", subagentNames: ["coder"], first: true, iteration: 1, resumed: true });
     assert.match(p, /picked up again after an interruption/i);
-    assert.match(p, /working tree\s+was rebuilt from the remote/i);
-    assert.match(p, /never pushed, are gone from the tree/i);
-    assert.match(p, /treat its actual state as/i);
+    assert.match(p, /working tree\s+was rebuilt/i);
+    assert.match(p, /UNCOMMITTED changes an earlier attempt/i);
+    // Accurate on the recovery legs too: committed work survives only if recovered.
+    assert.match(p, /committed work is present only if it was\s+recovered/i);
+    assert.match(p, /treat its actual state as authoritative/i);
   });
 
   it("issue #222: the reseed warning is first-turn-only and absent on a fresh run (byte-identity)", () => {

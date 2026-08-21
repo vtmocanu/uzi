@@ -455,13 +455,18 @@ function priorWorkNote(prior: PriorWork | undefined): string {
  *  only when `resumed` is true; a fresh run (no prior tree to lose) adds nothing. */
 function reseedNote(resumed: boolean | undefined): string {
   if (!resumed) return "";
+  // Worded to be TRUE on every reseed leg, so it never contradicts a co-rendered
+  // priorWorkNote. Uncommitted edits are lost on ANY reseed; committed work survives ONLY
+  // where the reseed recovered it (the tracking/checkpoint legs) — on the default-branch
+  // leg nothing is recovered, and "only if it was recovered" then correctly means none.
   return [
     `IMPORTANT — this run was picked up again after an interruption, and its working tree`,
-    `was rebuilt from the remote at the start of this attempt. Any files an earlier attempt`,
-    `changed, or commits it made but never pushed, are gone from the tree. If a correction`,
-    `you receive later refers to work you cannot find, do not assume it is still here —`,
-    `inspect the tree (\`git status\`, \`git log\`) and treat its actual state as`,
-    `authoritative before acting on it.`,
+    `was rebuilt at the start of this attempt. Any UNCOMMITTED changes an earlier attempt`,
+    `made did not survive that rebuild, and its committed work is present only if it was`,
+    `recovered onto this branch. So if a correction you receive later refers to files or`,
+    `commits you cannot find, do not assume they are still here — inspect the tree`,
+    `(\`git status\`, \`git log\`) and treat its actual state as authoritative before acting`,
+    `on it.`,
   ].join("\n");
 }
 
