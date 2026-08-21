@@ -2269,6 +2269,37 @@ func TestSubmitInputEnqueuesWhenWorkerLive(t *testing.T) {
 	}
 }
 
+// TestSubmitInputLiveCancelStripsNULFromStopReason: PRD #503 M3 — the live-path cancel
+// (CreateStopVerdictInput) sanitizes the operator reason exactly like the server-side
+// path, stripping a NUL byte that would otherwise raise Postgres 22021 and abort the
+// cancel. Both cancel paths share stopReasonParam, so this pins the live side too.
+func TestSubmitInputLiveCancelStripsNULFromStopReason(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	wkrID := uuid.New()
+	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	fs := &fakeStore{
+		runByID:    store.Run{ID: runID, UserID: user, Status: "running", WorkerID: pgUUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)}, // fresh
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.now = func() time.Time { return fixed }
+
+	res, err := svc.SubmitInput(context.Background(), user, runID, "cancel", "x\x00y", nil)
+	if err != nil {
+		t.Fatalf("SubmitInput: %v", err)
+	}
+	if res.ServerSide {
+		t.Fatal("a live worker should consume the cancel; not server-side")
+	}
+	if fs.createdStopVerdict == nil || fs.createdStopVerdict.Kind != "cancel" {
+		t.Fatalf("stop verdict not enqueued for the worker: %+v", fs.createdStopVerdict)
+	}
+	if !fs.createdStopVerdict.StopReason.Valid || fs.createdStopVerdict.StopReason.String != "xy" {
+		t.Fatalf("live cancel must strip the NUL from stop_reason (want %q), got %+v", "xy", fs.createdStopVerdict.StopReason)
+	}
+}
+
 func TestSubmitInputLiveRejectStampsStopKind(t *testing.T) {
 	user := uuid.New()
 	runID := uuid.New()

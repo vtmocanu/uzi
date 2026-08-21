@@ -4652,11 +4652,15 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 				status = "failed"
 				// PRD #503 M2 — persist the operator's reject reason as failure_reason
 				// instead of the hardcoded literal; the CLI now requires it, but keep a
-				// fallback for non-CLI callers that may still send an empty body.
-				reason := strings.TrimSpace(body)
+				// fallback for non-CLI callers that may still send an empty body. Sanitize
+				// like the worker-reported failure_reason (strip NUL — a NUL in a text column
+				// raises 22021 and would abort the reject — then cap length).
+				reason, _ := stripNUL(body)
+				reason = strings.TrimSpace(reason)
 				if reason == "" {
 					reason = "plan rejected"
 				}
+				reason = truncateRunes(reason, maxFailureReasonRunes)
 				_, err = s.q.RejectRunServerSide(ctx, store.RejectRunServerSideParams{
 					ID: runID, UserID: userID, FailureReason: pgText(reason),
 				})
@@ -5161,11 +5165,16 @@ func pgText(s string) pgtype.Text {
 	return pgtype.Text{String: s, Valid: true}
 }
 
-// stopReasonParam maps an OPTIONAL operator cancel reason (PRD #503 M3) to a nullable
-// runs.stop_reason: an empty/whitespace-only body stores NULL (invalid pgtype.Text),
-// never an empty string. Shared by both cancel paths (server-side + live).
+// stopReasonParam maps an operator's OPTIONAL cancel reason (PRD #503 M3) onto the nullable
+// runs.stop_reason column, sanitizing like sanitizeFailureReason (its failure-class
+// sibling): strip NUL — a NUL in a text column raises Postgres 22021 and would abort the
+// cancel — then trim and cap the length (the same 2048-rune bound as failure_reason). An
+// empty / whitespace-only / NUL-only body stores NULL, never an empty string. Shared by
+// both cancel paths (server-side + live).
 func stopReasonParam(body string) pgtype.Text {
-	return pgText(strings.TrimSpace(body))
+	clean, _ := stripNUL(body)
+	clean = truncateRunes(strings.TrimSpace(clean), maxFailureReasonRunes)
+	return pgText(clean)
 }
 
 func textParam(s *string) pgtype.Text {
