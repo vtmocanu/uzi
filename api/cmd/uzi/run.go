@@ -489,9 +489,13 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return submitInput(env, gf, c, cmd, args[0], kindCancel, "", nil)
+			// PRD #503 M3: the cancel reason is OPTIONAL — unlike reject, no empty check.
+			msg, _ := cmd.Flags().GetString("message")
+			msg = resolveMessage(env, msg)
+			return submitInput(env, gf, c, cmd, args[0], kindCancel, msg, nil)
 		},
 	}
+	cancel.Flags().StringP("message", "m", "", "reason for cancelling (optional; or pipe it on stdin)")
 
 	followUp := &cobra.Command{
 		Use:   "follow-up <run-id>",

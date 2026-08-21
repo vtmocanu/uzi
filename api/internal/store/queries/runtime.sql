@@ -1388,6 +1388,9 @@ WHERE id = @id
 -- stamped 'cancelled' for uniformity (PRD #33 Decision 3), though isStoppedRun's
 -- status='cancelled' branch already treats this run as a deliberate stop.
 UPDATE runs SET status = 'cancelled', stop_kind = 'cancelled', move_pending_since = now(), finished_at = now(),
+    -- PRD #503 M3: persist the operator's OPTIONAL cancel reason. @stop_reason binds a
+    -- nullable pgtype.Text: an invalid/zero value stores NULL (no reason supplied).
+    stop_reason = @stop_reason,
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
@@ -2042,8 +2045,16 @@ RETURNING *;
 -- kind would therefore be a silent no-op on exactly the older fleet Phase 2 exists
 -- to protect — and would need a second migration for run_user_inputs.kind's CHECK.
 -- The distinguishing information rides runs.stop_kind, which the worker never sees.
+--
+-- PRD #503 M3: @stop_reason is stamped UNCONDITIONALLY here (like @stop_kind), but its
+-- VALUE is decided by the Go caller and belongs on a CANCEL only. A cancel passes the
+-- operator's optional reason (or NULL when none was given); reject_plan passes NULL,
+-- because a reject's reason goes to failure_reason via the M2 path and double-writing
+-- would contradict that clean split; auto-stop passes NULL, its identity being
+-- stop_kind='auto_stopped'. The stamp stays unconditional to avoid the
+-- parameter-type-inference pitfall the comment above already warns about.
 WITH stamped AS (
-    UPDATE runs SET stop_kind = @stop_kind, updated_at = now()
+    UPDATE runs SET stop_kind = @stop_kind, stop_reason = @stop_reason, updated_at = now()
     WHERE id = @run_id
     RETURNING id
 )

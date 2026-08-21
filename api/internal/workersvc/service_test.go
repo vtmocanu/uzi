@@ -2241,7 +2241,7 @@ func TestSubmitInputEnqueuesWhenWorkerLive(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.now = func() time.Time { return fixed }
 
-	res, err := svc.SubmitInput(context.Background(), user, runID, "cancel", "", nil)
+	res, err := svc.SubmitInput(context.Background(), user, runID, "cancel", "operator changed their mind", nil)
 	if err != nil {
 		t.Fatalf("SubmitInput: %v", err)
 	}
@@ -2256,6 +2256,10 @@ func TestSubmitInputEnqueuesWhenWorkerLive(t *testing.T) {
 	}
 	if fs.createdStopVerdict.StopKind.String != "cancelled" || !fs.createdStopVerdict.StopKind.Valid {
 		t.Fatalf("live cancel must stamp stop_kind 'cancelled', got %+v", fs.createdStopVerdict.StopKind)
+	}
+	// PRD #503 M3: a live cancel carries the operator's optional reason into stop_reason.
+	if !fs.createdStopVerdict.StopReason.Valid || fs.createdStopVerdict.StopReason.String != "operator changed their mind" {
+		t.Fatalf("live cancel must stamp stop_reason with the operator reason, got %+v", fs.createdStopVerdict.StopReason)
 	}
 	if fs.createdInput != nil {
 		t.Fatal("a stop verdict must not use the plain CreateRunInput path")
@@ -2291,6 +2295,11 @@ func TestSubmitInputLiveRejectStampsStopKind(t *testing.T) {
 	}
 	if fs.createdStopVerdict.StopKind.String != "plan_rejected" || !fs.createdStopVerdict.StopKind.Valid {
 		t.Fatalf("live reject must stamp stop_kind 'plan_rejected', got %+v", fs.createdStopVerdict.StopKind)
+	}
+	// PRD #503 M3 shared-CTE split guard: a reject's reason lives in failure_reason (the
+	// M2 path), NOT in stop_reason — even though the reject carried a verbatim body above.
+	if fs.createdStopVerdict.StopReason.Valid {
+		t.Fatalf("live reject must leave stop_reason NULL (reason belongs to failure_reason), got %+v", fs.createdStopVerdict.StopReason)
 	}
 }
 

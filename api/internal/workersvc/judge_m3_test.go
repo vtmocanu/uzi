@@ -480,6 +480,49 @@ func TestSubmitInputCancelServerSideDoesNotEnqueueJudge(t *testing.T) {
 	}
 }
 
+// TestSubmitInputCancelServerSidePersistsStopReason: a server-side CANCEL persists the
+// operator's OPTIONAL reason to runs.stop_reason (PRD #503 M3). Unlike reject, an empty
+// body is not an error — it stores NULL rather than a fallback string.
+func TestSubmitInputCancelServerSidePersistsStopReason(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		body      string
+		wantValid bool
+		want      string
+	}{
+		{name: "concrete reason", body: "superseded by a newer run", wantValid: true, want: "superseded by a newer run"},
+		{name: "trims surrounding whitespace", body: "  changed my mind  ", wantValid: true, want: "changed my mind"},
+		{name: "empty body stores NULL", body: "", wantValid: false},
+		{name: "whitespace-only body stores NULL", body: "   ", wantValid: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user, runID := uuid.New(), uuid.New()
+			fs := &fakeStore{
+				runByID:      store.Run{ID: runID, UserID: user, Status: "queued"}, // GetRun + no worker ⇒ no live poller
+				runByIDPlain: store.Run{ID: runID, UserID: user, Status: "cancelled", Kind: RunKindIssue},
+			}
+			svc := New(fs, newBox(t), testParams())
+
+			res, err := svc.SubmitInput(context.Background(), user, runID, "cancel", tc.body, nil)
+			if err != nil {
+				t.Fatalf("SubmitInput: %v", err)
+			}
+			if !res.ServerSide {
+				t.Fatal("a cancel with no live poller must be applied server-side")
+			}
+			if fs.cancelled == nil {
+				t.Fatal("CancelRunServerSide not called")
+			}
+			if fs.cancelled.StopReason.Valid != tc.wantValid {
+				t.Fatalf("StopReason.Valid = %v, want %v (%+v)", fs.cancelled.StopReason.Valid, tc.wantValid, fs.cancelled.StopReason)
+			}
+			if tc.wantValid && fs.cancelled.StopReason.String != tc.want {
+				t.Fatalf("StopReason.String = %q, want %q", fs.cancelled.StopReason.String, tc.want)
+			}
+		})
+	}
+}
+
 func TestPostReviewRejectsUnauthorizedWorker(t *testing.T) {
 	fs := &fakeStore{activeJudgeRunErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())

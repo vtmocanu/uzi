@@ -4643,7 +4643,11 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		if !live {
 			status := "cancelled"
 			if kind == "cancel" {
-				_, err = s.q.CancelRunServerSide(ctx, store.CancelRunServerSideParams{ID: runID, UserID: userID})
+				// PRD #503 M3: persist the operator's OPTIONAL cancel reason; an empty
+				// body stores NULL (a cancel reason is helpful, not mandatory).
+				_, err = s.q.CancelRunServerSide(ctx, store.CancelRunServerSideParams{
+					ID: runID, UserID: userID, StopReason: stopReasonParam(body),
+				})
 			} else {
 				status = "failed"
 				// PRD #503 M2 — persist the operator's reject reason as failure_reason
@@ -4677,8 +4681,16 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		// here (kind is cancel/reject_plan). The stamp lands while the run is still
 		// non-terminal; the client's terminal-guarded isStoppedRun ignores it until the
 		// run reaches failed/cancelled.
+		// PRD #503 M3: the shared CTE stamps stop_reason unconditionally, but the reason
+		// belongs on a CANCEL only. Pass the operator's optional reason for a cancel;
+		// NULL for reject_plan, whose reason lives in failure_reason via the M2 path (the
+		// server-side reject branch above) — double-writing would contradict that split.
+		var stopReason pgtype.Text // NULL for reject_plan
+		if kind == "cancel" {
+			stopReason = stopReasonParam(body)
+		}
 		if _, err := s.q.CreateStopVerdictInput(ctx, store.CreateStopVerdictInputParams{
-			RunID: runID, Kind: kind, Body: pgText(body), StopKind: pgText(stopKindFor(kind)),
+			RunID: runID, Kind: kind, Body: pgText(body), StopKind: pgText(stopKindFor(kind)), StopReason: stopReason,
 		}); err != nil {
 			return SubmitInputResult{}, err
 		}
@@ -5147,6 +5159,13 @@ func pgText(s string) pgtype.Text {
 		return pgtype.Text{}
 	}
 	return pgtype.Text{String: s, Valid: true}
+}
+
+// stopReasonParam maps an OPTIONAL operator cancel reason (PRD #503 M3) to a nullable
+// runs.stop_reason: an empty/whitespace-only body stores NULL (invalid pgtype.Text),
+// never an empty string. Shared by both cancel paths (server-side + live).
+func stopReasonParam(body string) pgtype.Text {
+	return pgText(strings.TrimSpace(body))
 }
 
 func textParam(s *string) pgtype.Text {
