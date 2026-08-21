@@ -262,7 +262,8 @@ export function ForgeSettings() {
           Create a bot account, give it a personal access token with the{" "}
           <code className="rounded bg-raised px-1 py-0.5 text-fg">{hints.scopeCode}</code> {hints.scopeWord}, and add
           it {hints.roleClause} to the projects uzi should see. The token is stored encrypted and never
-          shown again.
+          shown again.{" "}Step-by-step instructions are in the{" "}
+          <DocLink slug={botSetupDoc(forgeType)}>bot setup</DocLink> guide.
         </p>
         <form className="mt-4 space-y-4" onSubmit={connect}>
           <Field label="Forge base URL">
