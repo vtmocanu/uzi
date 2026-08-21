@@ -533,6 +533,7 @@ export function ActivityFeed({
   connected,
   terminal,
   phaseUsageBySeq,
+  leadContext: leadContextProp,
 }: {
   messages: RunMessage[];
   // The full run (PRD #95 M1 seam). M2 consumes it: the crew roster reads run.health /
@@ -543,6 +544,11 @@ export function ActivityFeed({
   terminal: boolean;
   // PRD #40: per-result-frame token/cost deltas keyed by seq. Optional.
   phaseUsageBySeq?: Map<number, PhaseUsage>;
+  // PRD #516: the lead's live context-window fill. Optional — when the parent already
+  // derived RunUsage (RunView does, and threads phaseUsageBySeq from the same object),
+  // it passes leadContext too so this component does NOT re-run the full O(n) derive.
+  // Absent (standalone/tests) ⇒ fall back to deriving it from `messages` below.
+  leadContext?: LeadContext;
 }) {
   const [showAll, setShowAll] = useState(false);
   // Opt-in Follow (Decision 3), default OFF — replaces the old whole-pane auto-jump.
@@ -565,10 +571,15 @@ export function ActivityFeed({
   const visible = capped ? messages.slice(-CAP_VISIBLE) : messages;
   const groups = useMemo(() => groupByAgent(visible), [visible]);
   const lanes = useMemo(() => groupByInstance(visible), [visible]);
-  // PRD #516: the lead's live context-window fill, derived from the same message stream
-  // (latest-wins, lead-only). Off `messages` (not `visible`) so the CAP that hides old
+  // PRD #516: the lead's live context-window fill (latest-wins, lead-only). Prefer the
+  // value the parent already derived (RunView threads it from the same RunUsage object it
+  // built for phaseUsageBySeq, so the run view derives once, not twice). Only when it is
+  // absent do we derive here, off `messages` (not `visible`) so the CAP that hides old
   // rows never drops a still-current reading. Feeds the lead-lane meter + crew micro-meter.
-  const leadContext = useMemo(() => deriveRunUsage(messages).leadContext, [messages]);
+  const leadContext = useMemo(
+    () => leadContextProp ?? deriveRunUsage(messages).leadContext,
+    [leadContextProp, messages],
+  );
 
   // Per-agent aggregates for the crew roster: first-seen order, message count, newest
   // message (for the one-liner), and last-activity time (for the recency split).

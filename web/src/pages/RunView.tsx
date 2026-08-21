@@ -1101,6 +1101,7 @@ export function RunView() {
           connected={connected}
           terminal={terminal}
           phaseUsageBySeq={usage.phaseUsageBySeq}
+          leadContext={usage.leadContext}
         />
       </Card>
 
