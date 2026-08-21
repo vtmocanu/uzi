@@ -2,7 +2,7 @@
 
 - **Issue**: [#516](https://github.com/vtmocanu/uzi/issues/516)
 - **Priority**: Medium
-- **Status**: Draft — ready for implementation
+- **Status**: Complete — shipped 2026-08-21 (M1–M5 landed; moved to `prds/done/`)
 - **Design mock**: `mock/context-meter-before-after.html` (before/after of the Activity panel; molten "steel channel" meter). Published artifact: https://claude.ai/code/artifact/2cd5fd49-3666-4894-af83-c9674bf454de
 
 > **Self-contained for an offline worker.** Every external fact this PRD relies on (the claude-agent-sdk 0.3.232 context-usage API, its exact shapes, and the streaming-mode requirement) is resolved and stated inline below, verified against the published type defs. No milestone requires open-web access. All file:line references resolve in the repo clone.
