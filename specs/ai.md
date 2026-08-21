@@ -21863,9 +21863,11 @@ Decision Log (D1–D9); this is the terse contract.
 
 - **Two-way, host-inferred, recognized-only sync.** The base-URL `<Select>` and the forge-type
   `<Select>` are kept consistent in BOTH directions on user change, but ONLY for recognized hosts.
-  *This SUPERSEDES §296's "independent choices (D11a): a mismatch is caught by VerifyToken" stance* —
-  the form now keeps the pair consistent and VerifyToken is the backstop, not the first line of
-  defense.
+  *This changes the connect form's prior stance*, recorded as the code comment that read `Base URL
+  and type are independent choices (D11a): a mismatch is caught by VerifyToken` (in `ForgeSettings.tsx`,
+  reworded by M2's fix-the-doc): the form now keeps the pair consistent and VerifyToken is the backstop,
+  not the first line of defense. This refines — it does not contradict — §296's connect-picker design,
+  where the forge-type pick was an independent choice reconciled by save-time scope/version validation.
 - **Recognition lives in `web/src/lib/forgeInfer.ts`** (a sibling to `forgeNoun.ts`, kept separate so
   forgeNoun's "exactly one GitLab-noun literal" acceptance test stays clean — D2).
   `inferForgeType(baseUrl, forgeTypes)` parses the host, does a case-insensitive substring match
