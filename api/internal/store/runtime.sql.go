@@ -517,6 +517,40 @@ func (q *Queries) CountInProgressRunsForUser(ctx context.Context, userID uuid.UU
 	return count, err
 }
 
+const countOnlineEligibleWorkersForRepo = `-- name: CountOnlineEligibleWorkersForRepo :one
+SELECT count(*) FROM workers w
+WHERE w.user_id = $1
+  AND w.status = 'online'
+  AND fn_worker_can_claim(COALESCE(w.docker_enabled, false), $2::uuid[], $3::uuid, $4::text)
+`
+
+type CountOnlineEligibleWorkersForRepoParams struct {
+	UserID              uuid.UUID   `json:"user_id"`
+	DockerRepoAllowlist []uuid.UUID `json:"docker_repo_allowlist"`
+	RepoID              uuid.UUID   `json:"repo_id"`
+	Kind                string      `json:"kind"`
+}
+
+// How many of a user's ONLINE workers are ELIGIBLE to claim a run on this repo/kind
+// per fn_worker_can_claim (migration 00113), IGNORING free slots. PRD #361's queued
+// Docker-allowlist reason uses it: with >0 online workers, a result of 0 means every
+// online worker is a Docker worker the allowlist predicate rejects for this repo — the
+// run is genuinely unrunnable without allowlisting, distinct from "all busy" (a free
+// slot won't help). Params cast EXACTLY as ClaimRun passes them so a green sqlc generate
+// is not mistaken for a query Postgres will accept. Only called for a queued run already
+// past its health threshold, so it is off the hot path.
+func (q *Queries) CountOnlineEligibleWorkersForRepo(ctx context.Context, arg CountOnlineEligibleWorkersForRepoParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countOnlineEligibleWorkersForRepo,
+		arg.UserID,
+		arg.DockerRepoAllowlist,
+		arg.RepoID,
+		arg.Kind,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countOnlineWorkersForUser = `-- name: CountOnlineWorkersForUser :one
 SELECT count(*) FROM workers WHERE user_id = $1 AND status = 'online'
 `
@@ -2406,7 +2440,7 @@ const listActiveRunsForHealth = `-- name: ListActiveRunsForHealth :many
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at,
        health, health_reason, health_since, health_notified_at,
-       budget_wall_seconds
+       budget_wall_seconds, repo_id, kind
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat'
@@ -2425,6 +2459,8 @@ type ListActiveRunsForHealthRow struct {
 	HealthSince       pgtype.Timestamptz `json:"health_since"`
 	HealthNotifiedAt  pgtype.Timestamptz `json:"health_notified_at"`
 	BudgetWallSeconds pgtype.Int4        `json:"budget_wall_seconds"`
+	RepoID            pgtype.UUID        `json:"repo_id"`
+	Kind              string             `json:"kind"`
 }
 
 // Run health detector (PRD #47) ----------------------------------------------
@@ -2462,6 +2498,8 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRuns
 			&i.HealthSince,
 			&i.HealthNotifiedAt,
 			&i.BudgetWallSeconds,
+			&i.RepoID,
+			&i.Kind,
 		); err != nil {
 			return nil, err
 		}

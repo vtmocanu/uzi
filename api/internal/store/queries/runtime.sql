@@ -2169,7 +2169,7 @@ WHERE id = @id;
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at,
        health, health_reason, health_since, health_notified_at,
-       budget_wall_seconds
+       budget_wall_seconds, repo_id, kind
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat';
@@ -2216,6 +2216,20 @@ WHERE id = @id AND status = @status;
 -- worker keeps status='online' and still counts as an online worker for "no worker is
 -- online" purposes — do not add a draining predicate.
 SELECT count(*) FROM workers WHERE user_id = @user_id AND status = 'online';
+
+-- name: CountOnlineEligibleWorkersForRepo :one
+-- How many of a user's ONLINE workers are ELIGIBLE to claim a run on this repo/kind
+-- per fn_worker_can_claim (migration 00113), IGNORING free slots. PRD #361's queued
+-- Docker-allowlist reason uses it: with >0 online workers, a result of 0 means every
+-- online worker is a Docker worker the allowlist predicate rejects for this repo — the
+-- run is genuinely unrunnable without allowlisting, distinct from "all busy" (a free
+-- slot won't help). Params cast EXACTLY as ClaimRun passes them so a green sqlc generate
+-- is not mistaken for a query Postgres will accept. Only called for a queued run already
+-- past its health threshold, so it is off the hot path.
+SELECT count(*) FROM workers w
+WHERE w.user_id = @user_id
+  AND w.status = 'online'
+  AND fn_worker_can_claim(COALESCE(w.docker_enabled, false), @docker_repo_allowlist::uuid[], @repo_id::uuid, @kind::text);
 
 -- name: CountOnlineWorkersWithFreeSlotForUser :one
 -- How many of a user's ONLINE workers plausibly have room for another run — the

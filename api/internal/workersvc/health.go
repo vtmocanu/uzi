@@ -104,6 +104,14 @@ const (
 	// owner-visible reason string differs.
 	reasonDeprioritized = "deprioritized — yields to interactive work"
 	reasonRestored      = "priority restored — no longer yielding"
+	// reasonRepoNotDockerAllowed (PRD #361) is the queued reason for a repo-bearing run
+	// that no online worker is eligible to claim because every online worker is a Docker
+	// worker and the repo is not on the Docker-worker allowlist (fn_worker_can_claim,
+	// migration 00113). Same contract as its siblings — fixed, server-controlled, no
+	// tool name, no repo content, no live duration — and maps to the SAME
+	// healthWaitingWorker enum (no migration owed; runs.health_reason is free text).
+	// Distinct from reasonAllWorkersBusy: allowlisting, not a free slot, unblocks it.
+	reasonRepoNotDockerAllowed = "this repo isn't on the Docker worker allowlist, so no Docker worker can run it"
 )
 
 // Persistence-failure FLAG thresholds (PRD #108 M4), code constants for the same
@@ -244,7 +252,7 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 		case "restored":
 			return healthWaitingWorker, reasonRestored
 		}
-		return healthWaitingWorker, s.queuedReason(ctx, r.UserID)
+		return healthWaitingWorker, s.queuedReason(ctx, r.UserID, r.RepoID, r.Kind)
 	case "awaiting_approval":
 		// auto_approve runs self-resolve their gate and must never nudge anyone to
 		// approve them (Decision 8).
@@ -484,11 +492,13 @@ func stallBaseline(r store.ListActiveRunsForHealthRow) time.Time {
 }
 
 // queuedReason resolves the human reason a queued run past its threshold is not
-// running, most-actionable first (Decision 8, extended by PRD #216): a locked owner
-// vault (they unlock and it claims within a poll), then no online worker at all, then
-// a saturated fleet where every online worker is at its cap (add capacity), else a
-// plain wait for an idle worker to claim.
-func (s *Service) queuedReason(ctx context.Context, userID uuid.UUID) string {
+// running, most-actionable first (Decision 8, extended by PRD #216 and PRD #361): a
+// locked owner vault (they unlock and it claims within a poll), then no online worker
+// at all, then (PRD #361) a repo no online worker is eligible to claim because every
+// online worker is a Docker worker and the repo is not allowlisted, then a saturated
+// fleet where every online worker is at its cap (add capacity), else a plain wait for
+// an idle worker to claim.
+func (s *Service) queuedReason(ctx context.Context, userID uuid.UUID, repoID pgtype.UUID, kind string) string {
 	if s.vlt != nil && !s.vlt.Unlocked(userID) {
 		return reasonVaultLocked
 	}
@@ -499,6 +509,32 @@ func (s *Service) queuedReason(ctx context.Context, userID uuid.UUID) string {
 	}
 	if n == 0 {
 		return reasonNoWorker
+	}
+	// PRD #361: a repo-bearing queued run that NO online worker is eligible to claim —
+	// every online worker is a Docker worker fn_worker_can_claim rejects because the repo
+	// is not on the Docker allowlist — is genuinely unrunnable without allowlisting,
+	// distinct from "all busy" (a free slot won't help). We are here only with n>0 online
+	// workers, so elig==0 implies an all-Docker fleet AND a non-allowlisted repo (any
+	// non-Docker worker short-circuits fn_worker_can_claim to eligible; an allowlisted
+	// repo makes Docker workers eligible too). A repo-less run (judge, repoID invalid)
+	// never trips this. On a nil reader or any read error we degrade to the generic
+	// free-slot logic below.
+	if repoID.Valid && s.dockerAllowlist != nil {
+		if al, aerr := s.dockerAllowlist.DockerRepoAllowlist(ctx); aerr != nil {
+			slog.Error("health: docker allowlist for queued reason", "error", aerr)
+		} else {
+			elig, eerr := s.q.CountOnlineEligibleWorkersForRepo(ctx, store.CountOnlineEligibleWorkersForRepoParams{
+				UserID:              userID,
+				DockerRepoAllowlist: al,
+				RepoID:              uuid.UUID(repoID.Bytes),
+				Kind:                kind,
+			})
+			if eerr != nil {
+				slog.Error("health: count eligible workers for repo", "error", eerr)
+			} else if elig == 0 {
+				return reasonRepoNotDockerAllowed
+			}
+		}
 	}
 	free, err := s.q.CountOnlineWorkersWithFreeSlotForUser(ctx, userID)
 	if err != nil {
