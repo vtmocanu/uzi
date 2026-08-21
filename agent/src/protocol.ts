@@ -399,6 +399,12 @@ export interface ClaimSecrets {
 export interface ClaimConfig {
   run_timeout_seconds?: number;
   idle_timeout_seconds?: number;
+  /** PRD #517 M5: the interactive-task park idle backstop (env WORKER_TASK_IDLE_TIMEOUT).
+   *  How long a parked interactive task waits at awaiting_followup for the next follow-up
+   *  before the worker gracefully finalizes (push, MR iff open_mr) → completed. Present
+   *  only on an interactive task claim; absent ⇒ the worker's TASK_FOLLOWUP_IDLE_MS
+   *  constant (30m). Seconds, converted to ms at the park site. */
+  task_idle_timeout_seconds?: number;
   max_iterations?: number;
   /** Bound on plan-revision rounds at the approval gate (PRD #41, env
    *  PLAN_MAX_REVISIONS). The worker enforces the same cap the server does. */

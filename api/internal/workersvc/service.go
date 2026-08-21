@@ -594,9 +594,14 @@ type Store interface {
 
 // Params are the runtime knobs the service needs, mirrored from config.
 type Params struct {
-	RunTimeout       time.Duration
-	RunIdleTimeout   time.Duration
-	RunMaxIterations int
+	RunTimeout     time.Duration
+	RunIdleTimeout time.Duration
+	// WorkerTaskIdleTimeout (PRD #517 M5, WORKER_TASK_IDLE_TIMEOUT) is the interactive-task
+	// park's worker-side idle backstop. Mirrored from config and shipped in the claim (like
+	// RunIdleTimeout) so the worker's own park idle timer matches what the server configured
+	// (no drift). Delivered only on an interactive task claim; every other claim omits it.
+	WorkerTaskIdleTimeout time.Duration
+	RunMaxIterations      int
 	// PlanMaxRevisions caps how many times a run's plan may be revised at the
 	// approval gate (PRD #41, PLAN_MAX_REVISIONS). Enforced server-side in
 	// SubmitInput and shipped in the claim so the worker enforces the same limit.
@@ -1984,6 +1989,16 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		}
 	}
 
+	// PRD #517 M5: deliver the interactive-task park idle backstop ONLY on an interactive
+	// task claim (the sole path that parks on awaitFollowUp). Left zero for every other run
+	// so omitempty keeps its claim byte-identical to today's wire; the worker falls back to
+	// its own TASK_FOLLOWUP_IDLE_MS constant when the field is absent. run.Interactive is
+	// immutable from create, so a resumed interactive run re-delivers the same value.
+	taskIdleTimeoutSeconds := 0
+	if run.Interactive {
+		taskIdleTimeoutSeconds = int(s.p.WorkerTaskIdleTimeout.Seconds())
+	}
+
 	payload := &ClaimPayload{
 		RunID:            run.ID.String(),
 		Kind:             run.Kind,
@@ -2094,6 +2109,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// clock off the state-ack, but the claim carries it too for a fresh resume.
 			RunTimeoutSeconds:      coalesceInt(run.BudgetWallSeconds, int(s.p.RunTimeout.Seconds())),
 			IdleTimeoutSeconds:     int(s.p.RunIdleTimeout.Seconds()),
+			TaskIdleTimeoutSeconds: taskIdleTimeoutSeconds,
 			MaxIterations:          coalesceInt(run.BudgetMaxIterations, s.p.RunMaxIterations),
 			PlanMaxRevisions:       s.p.PlanMaxRevisions,
 			QuestionMax:            s.p.QuestionMax,

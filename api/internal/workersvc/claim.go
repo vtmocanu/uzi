@@ -319,7 +319,14 @@ type ClaimAgent struct {
 type ClaimConfig struct {
 	RunTimeoutSeconds  int `json:"run_timeout_seconds"`
 	IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
-	MaxIterations      int `json:"max_iterations"`
+	// TaskIdleTimeoutSeconds is the interactive-task park idle backstop (PRD #517 M5,
+	// WORKER_TASK_IDLE_TIMEOUT): how long a parked interactive task waits at
+	// awaiting_followup for the next follow-up before the worker gracefully finalizes
+	// (push, MR iff open_mr) → completed. Delivered ONLY on an interactive task claim;
+	// omitempty keeps every other claim byte-identical to today's wire, and an older
+	// worker (or a missing field) falls back to its own TASK_FOLLOWUP_IDLE_MS constant.
+	TaskIdleTimeoutSeconds int `json:"task_idle_timeout_seconds,omitempty"`
+	MaxIterations          int `json:"max_iterations"`
 	// PlanMaxRevisions is the PRD #41 plan-revision cap the worker enforces at the
 	// approval gate (server-authoritative; the server also caps in SubmitInput).
 	PlanMaxRevisions int `json:"plan_max_revisions"`

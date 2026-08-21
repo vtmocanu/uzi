@@ -152,13 +152,15 @@ const REASON_MAX_ITERATIONS =
 // the run.
 const PROGRESS_MISS_LIMIT = 2;
 
-// PRD #517 M3: the idle bound for an INTERACTIVE task's follow-up park — how long the run
-// waits at awaiting_followup for the next follow-up before the park ENDS and the run
-// finalizes. A sensible constant for now; M5 wires it to the server-configured
-// WORKER_TASK_IDLE_TIMEOUT (delivered on the claim, like the other per-run caps) plus a
-// server-side backstop. Kept generous so an interactive session survives a human thinking
-// between turns, but bounded so an abandoned interactive run does not pin a worker slot
-// forever.
+// PRD #517 M3/M5: the FALLBACK idle bound for an INTERACTIVE task's follow-up park — how
+// long the run waits at awaiting_followup for the next follow-up before the park ENDS and
+// the run finalizes. As of M5 the live value is server-configured via
+// WORKER_TASK_IDLE_TIMEOUT, delivered on the claim as `config.task_idle_timeout_seconds`
+// (like the other per-run caps); this constant is the fallback used only when that field
+// is absent or non-positive (an older server / missing field ⇒ 30m). Kept generous so an
+// interactive session survives a human thinking between turns, but bounded so an abandoned
+// interactive run does not pin a worker slot forever. NOTE the unit is MS; the park site
+// passes it to seconds() as SECONDS (÷1000), since seconds()'s fallback is in seconds.
 const TASK_FOLLOWUP_IDLE_MS = 30 * 60_000; // 30m
 
 /**
@@ -1510,7 +1512,16 @@ export class SdkExecutor implements Executor {
             hasParked = true;
             // Park OUTSIDE driveTurn (the idle watchdog lives inside driveTurn, so a parked
             // run cannot trip REASON_IDLE — the same property the ask_user park relies on).
-            const outcome = await ctx.awaitFollowUp(TASK_FOLLOWUP_IDLE_MS);
+            // PRD #517 M5: the idle bound is the server-configured WORKER_TASK_IDLE_TIMEOUT
+            // delivered on the claim (task_idle_timeout_seconds), with the TASK_FOLLOWUP_IDLE_MS
+            // constant as the fallback for an older server / missing field. seconds() converts
+            // the claim seconds → ms and guards a non-positive value to the fallback; its
+            // fallback is in SECONDS, so the ms constant is passed as seconds (÷1000).
+            const followupIdleMs = seconds(
+              ctx.config?.task_idle_timeout_seconds,
+              TASK_FOLLOWUP_IDLE_MS / 1000,
+            );
+            const outcome = await ctx.awaitFollowUp(followupIdleMs);
             if (outcome.kind === "followup") {
               // Fold the follow-up into the next turn EXACTLY as a mid-run follow-up is
               // (buildImplementPrompt renders `followUp` as UNTRUSTED user input); the

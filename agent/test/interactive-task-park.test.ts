@@ -428,6 +428,59 @@ describe("SdkExecutor interactive task park (PRD #517 M3)", () => {
     assert.match(resumeTurn, /UNTRUSTED INPUT/, "and is rendered as untrusted input");
   });
 
+  it("parks on the claim-configured task_idle_timeout_seconds, falling back to the constant when absent", async () => {
+    // PRD #517 M5: the park's idle bound is server-configured on the claim
+    // (config.task_idle_timeout_seconds), not the bare TASK_FOLLOWUP_IDLE_MS constant.
+    // Mutation: revert the park to `awaitFollowUp(TASK_FOLLOWUP_IDLE_MS)` → the configured
+    // 120s no longer reaches the park and parkIdle[0] reads 1_800_000 (the constant),
+    // reddening the deepStrictEqual([120_000]) assert.
+    const withConfig = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [assistantText("t1"), signalDone(), resultSuccess()], // → done → park (idle)
+    ]);
+    const parkIdle: number[] = [];
+    const { ctx } = makeCtx({
+      interactive: true,
+      config: { task_idle_timeout_seconds: 120 },
+      checkpoint: async () => {},
+      awaitFollowUp: async (idleMs) => {
+        parkIdle.push(idleMs);
+        return { kind: "ended", reason: "idle" };
+      },
+    });
+    await new SdkExecutor(nullLogger(), sdkHome, { queryFn: withConfig.queryFn }).run(ctx);
+    assert.deepStrictEqual(
+      parkIdle,
+      [120_000],
+      "the park used config.task_idle_timeout_seconds * 1000",
+    );
+
+    // A missing field falls back to TASK_FOLLOWUP_IDLE_MS (30m = 1_800_000ms). config:null
+    // exercises the ctx.config?.task_idle_timeout_seconds optional-chain → seconds() fallback.
+    // This also guards the unit: seconds()'s fallback is in SECONDS, so the ms constant is
+    // passed ÷1000 — a `seconds(..., TASK_FOLLOWUP_IDLE_MS)` bug would read 1_800_000_000 here.
+    const noConfig = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [assistantText("t1"), signalDone(), resultSuccess()],
+    ]);
+    const parkIdleFallback: number[] = [];
+    const { ctx: ctx2 } = makeCtx({
+      interactive: true,
+      config: null,
+      checkpoint: async () => {},
+      awaitFollowUp: async (idleMs) => {
+        parkIdleFallback.push(idleMs);
+        return { kind: "ended", reason: "idle" };
+      },
+    });
+    await new SdkExecutor(nullLogger(), sdkHome, { queryFn: noConfig.queryFn }).run(ctx2);
+    assert.deepStrictEqual(
+      parkIdleFallback,
+      [30 * 60 * 1000],
+      "a missing task_idle_timeout_seconds falls back to TASK_FOLLOWUP_IDLE_MS (30m)",
+    );
+  });
+
   it("a non-interactive run finalizes on done without parking or checkpoint-parking", async () => {
     // Byte-identical-to-today control. Mutation: guard the park block on `ctx.awaitFollowUp`
     // ALONE (dropping the `ctx.interactive` term) → awaitFollowUp fires here and the assert
@@ -606,6 +659,38 @@ function parkingExecutor(log: {
   };
 }
 
+/** Like parkingExecutor but parks with a SHORT idle bound and receives NO follow-up, so the
+ *  real SteeringChannel resolves { kind:"ended", reason:"idle" }; it then commits real work
+ *  and returns so the run winds down through the normal finalize (push + completed) — the M5
+ *  worker-side idle finalize. */
+function idleParkingExecutor(log: { outcome?: FollowUpOutcome }): Executor {
+  return {
+    async run(ctx: RunContext): Promise<{ branch: string }> {
+      await ctx.checkpoint?.({ reap: true });
+      // Short idle; no follow-up is ever delivered, so the park ends idle within a few polls.
+      log.outcome = await ctx.awaitFollowUp!(40);
+      fs.writeFileSync(path.join(ctx.worktreePath, "UZI_RUN.md"), "# interactive idle finalize\n");
+      execFileSync("git", ["add", "UZI_RUN.md"], { cwd: ctx.worktreePath });
+      execFileSync(
+        "git",
+        [
+          "-c",
+          "user.name=uzi-agent",
+          "-c",
+          "user.email=uzi-agent@uzi.local",
+          "-c",
+          "commit.gpgsign=false",
+          "commit",
+          "-m",
+          "uzi test: interactive idle finalize",
+        ],
+        { cwd: ctx.worktreePath },
+      );
+      return { branch: ctx.branch };
+    },
+  };
+}
+
 function taskClaim(overrides: Partial<ClaimResponse> = {}): ClaimResponse {
   const runId = (overrides.run_id as string | undefined) ?? randomUUID();
   return makeClaim({
@@ -693,5 +778,53 @@ describe("RunRunner interactive follow-up park (PRD #517 M3)", () => {
     assert.ok(failed, "a declined park must fail the run, not hang it");
     assert.match(failed!.body.failure_reason ?? "", new RegExp(REASON_FOLLOWUP_NOT_PARKED));
     assert.deepStrictEqual(log.outcomes, [], "the executor never received a follow-up");
+  });
+
+  it("finalizes an idle park gracefully: reports completed (not failed) and pushes the branch", async () => {
+    // PRD #517 M5 (SC4b / Decision 6): when no follow-up arrives within the idle bound the
+    // steering park resolves { ended, reason:"idle" } and the run winds down like a normal
+    // signal_done — push then `completed`, NEVER failed. No follow-up is delivered, so the
+    // real SteeringChannel idles. Mutation: route `idle` to the cancel-signal throw (as
+    // `cancelled` does in sdk-executor) → the run reports `failed` and the completed +
+    // branch-pushed asserts redden.
+    const { gitlab, calls } = fakeGitlab();
+    const log: { outcome?: FollowUpOutcome } = {};
+    const claim = taskClaim({ open_mr: false });
+
+    await runner(idleParkingExecutor(log), gitlab).execute(claim);
+
+    assert.deepStrictEqual(
+      log.outcome,
+      { kind: "ended", reason: "idle" },
+      "the park ended idle (no follow-up arrived within the bound)",
+    );
+
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
+    assert.ok(statuses.includes("awaiting_followup"), "the run parked before idling");
+    assert.ok(
+      !statuses.includes("failed"),
+      `an idle finalize must NOT report failed; statuses were ${JSON.stringify(statuses)}`,
+    );
+    assert.strictEqual(
+      statuses.at(-1),
+      "completed",
+      "an idle park finalizes as completed",
+    );
+
+    // The branch really landed on origin — the deliverable the user pulls (mirrors
+    // runner-task.test.ts's real-push assertion, not a mock).
+    const gitLog = execFileSync(
+      "git",
+      ["-C", fx.originPath, "log", "--oneline", `uzi/task/${claim.run_id}`],
+      { encoding: "utf8" },
+    );
+    assert.ok(
+      gitLog.includes("uzi test: interactive idle finalize"),
+      "the worker's commit landed on the task branch (pushed at idle finalize)",
+    );
+    // open_mr:false ⇒ a push, not an MR-open: no createMergeRequest POST reached the forge.
+    assert.equal(calls.length, 0, "a no-MR idle finalize opens no merge request");
   });
 });

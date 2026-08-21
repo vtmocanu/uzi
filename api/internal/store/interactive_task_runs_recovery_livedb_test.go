@@ -92,6 +92,27 @@ func (f *followupFixture) seedInteractiveTaskRun(ctx context.Context, t *testing
 	return id
 }
 
+// seedNonInteractiveTaskRun creates a NON-interactive kind='task' run (a plain handoff)
+// held by worker — the contrast case for the recovery/sweep tests: it exercises the
+// pre-#517 requeue behavior the awaiting_followup additions must leave unchanged.
+func (f *followupFixture) seedNonInteractiveTaskRun(ctx context.Context, t *testing.T, status string, worker *uuid.UUID) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	if _, err := f.q.CreateTaskRun(ctx, store.CreateTaskRunParams{
+		RunID:            id,
+		UserID:           f.userID,
+		RepoID:           f.repoID,
+		Branch:           pgtype.Text{String: "uzi/task/" + id.String(), Valid: true},
+		Interactive:      false,
+		IssueTitle:       "plain handoff",
+		IssueDescription: "no interaction",
+	}); err != nil {
+		t.Fatalf("CreateTaskRun(non-interactive): %v", err)
+	}
+	mustExec(ctx, t, f.pool, `UPDATE runs SET status = $2, worker_id = $3 WHERE id = $1`, id, status, worker)
+	return id
+}
+
 func (f *followupFixture) status(ctx context.Context, t *testing.T, id uuid.UUID) string {
 	t.Helper()
 	run, err := f.q.GetRunByID(ctx, id)
@@ -175,6 +196,125 @@ func TestAwaitingFollowupRecoveryLiveDB(t *testing.T) {
 	}
 	if got := f.status(ctx, t, staleTerminal); got != "completed" {
 		t.Fatalf("a completed run under the stale worker changed to %q", got)
+	}
+}
+
+// 1a. SC4b LOCK-IN — a DEAD-worker park is REQUEUED for worker finalize, NEVER completed
+// in place, and its branch is PRESERVED. This is the PRD's highest single risk: a server
+// sweep that flipped a git-backed park to `completed` cannot push the branch, so the
+// checkpoint-pushed work is stranded (Decision 6). There is deliberately NO new
+// server-side park-age (TASK_IDLE_TIMEOUT) sweep — the EXISTING stale-worker requeue (M2)
+// is the whole server-side recovery. This test locks that in: it asserts the WORK/BRANCH
+// outcome (not merely the status label), so it cannot codify the lost-work bug, and any
+// future chat-style UPDATE→completed idle sweep for tasks reddens it.
+//
+// Controls that make the claim non-vacuous:
+//   - a FRESH-heartbeat worker's park is UNTOUCHED (still awaiting_followup, branch intact):
+//     a live park is finalized by its OWN worker-side idle (30m), never by a server sweep;
+//   - a NON-interactive run under the dead worker is requeued exactly as before, so the
+//     awaiting_followup addition changed nothing for non-interactive recovery.
+//
+// MUTATION PROOF: a code path that completed a dead park in place leaves status != "queued"
+// and reddens the queued/requeue_count asserts; clearing the branch on requeue reddens the
+// branch-preserved assert; a sweep that swept the fresh park reddens the untouched assert.
+func TestAwaitingFollowupDeadWorkerRequeuedNotCompletedLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	f, done := setupFollowup(ctx, t, dsn)
+	defer done()
+
+	noCap := pgtype.Int4{}
+
+	// DEAD (stale-heartbeat) worker: an interactive park + a non-interactive run.
+	deadWkr := f.seedWorker(ctx, t, "online", noCap, true)
+	deadParked := f.seedInteractiveTaskRun(ctx, t, "awaiting_followup", &deadWkr)
+	deadNonInteractive := f.seedNonInteractiveTaskRun(ctx, t, "running", &deadWkr)
+
+	// FRESH (live-heartbeat) worker: an interactive park the sweep must NOT touch.
+	freshWkr := f.seedWorker(ctx, t, "online", noCap, false)
+	freshParked := f.seedInteractiveTaskRun(ctx, t, "awaiting_followup", &freshWkr)
+
+	// Snapshot the dead park's branch so we can assert it survives the requeue verbatim.
+	before, err := f.q.GetRunByID(ctx, deadParked)
+	if err != nil {
+		t.Fatalf("GetRunByID(before): %v", err)
+	}
+	if !before.Branch.Valid || before.Branch.String == "" {
+		t.Fatalf("test setup: the parked run has no branch to preserve")
+	}
+
+	// The cutoff must sit BETWEEN the two workers' heartbeats: the fresh worker
+	// heartbeats at DB now(), the dead one an hour ago. A now() cutoff wrongly
+	// catches the fresh worker because Go's time.Now() runs a few ms after the DB
+	// stamped now() at seed. Use now-1min (production uses now-WorkerHeartbeatStale,
+	// 45s) so fresh > cutoff > dead.
+	requeued, err := f.q.RequeueRunsOfStaleWorkers(ctx, store.RequeueRunsOfStaleWorkersParams{
+		MaxRequeues: 3, Cutoff: pgtype.Timestamptz{Time: time.Now().Add(-1 * time.Minute), Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("RequeueRunsOfStaleWorkers: %v", err)
+	}
+
+	var sawDeadParked, sawDeadNon, sawFresh bool
+	for _, r := range requeued {
+		switch r.ID {
+		case deadParked:
+			sawDeadParked = true
+		case deadNonInteractive:
+			sawDeadNon = true
+		case freshParked:
+			sawFresh = true
+		}
+		if r.Status != "queued" {
+			t.Fatalf("RequeueRunsOfStaleWorkers returned run %s with status %q, want queued — the sweep must "+
+				"REQUEUE a dead-worker park for worker finalize, never complete it in place", r.ID, r.Status)
+		}
+	}
+	if !sawDeadParked {
+		t.Fatalf("the dead-worker interactive park was NOT requeued (SC4b) — a missed IN-list entry makes it a " +
+			"zombie, and a completing sweep would strand its unpushed work")
+	}
+	if !sawDeadNon {
+		t.Fatalf("the dead-worker non-interactive run was NOT requeued — the awaiting_followup addition must not " +
+			"have changed non-interactive recovery")
+	}
+	if sawFresh {
+		t.Fatalf("the FRESH-heartbeat worker's park was requeued — the stale-worker sweep must not touch a live park")
+	}
+
+	// The dead park: queued (NOT completed), requeue_count incremented, branch PRESERVED —
+	// the work outcome, not merely the status label.
+	after, err := f.q.GetRunByID(ctx, deadParked)
+	if err != nil {
+		t.Fatalf("GetRunByID(after): %v", err)
+	}
+	if after.Status != "queued" {
+		t.Fatalf("dead park status = %q after the sweep, want queued (NEVER completed)", after.Status)
+	}
+	if after.RequeueCount != before.RequeueCount+1 {
+		t.Fatalf("dead park requeue_count = %d, want %d — the requeue must increment the counter",
+			after.RequeueCount, before.RequeueCount+1)
+	}
+	if !after.Branch.Valid || after.Branch.String != before.Branch.String {
+		t.Fatalf("dead park branch = %q (valid=%v) after requeue, want %q preserved — a requeue must NOT clear the "+
+			"branch, or the user's checkpoint-pushed work is orphaned", after.Branch.String, after.Branch.Valid, before.Branch.String)
+	}
+
+	// The fresh park is untouched: still awaiting_followup, branch intact. This is the guard
+	// that NO server sweep completes (or otherwise moves) a LIVE park in place.
+	freshAfter, err := f.q.GetRunByID(ctx, freshParked)
+	if err != nil {
+		t.Fatalf("GetRunByID(fresh): %v", err)
+	}
+	if freshAfter.Status != "awaiting_followup" {
+		t.Fatalf("the fresh-worker park status = %q, want awaiting_followup — a live park must be left for its OWN "+
+			"worker-side idle to finalize; no server sweep may complete it", freshAfter.Status)
+	}
+	if !freshAfter.Branch.Valid || freshAfter.Branch.String == "" {
+		t.Fatalf("the fresh-worker park lost its branch (%q) — an untouched park must keep its work", freshAfter.Branch.String)
 	}
 }
 

@@ -973,6 +973,7 @@ func testParams() Params {
 	return Params{
 		RunTimeout:             2 * time.Hour,
 		RunIdleTimeout:         10 * time.Minute,
+		WorkerTaskIdleTimeout:  30 * time.Minute, // PRD #517 M5 interactive-task park idle cap
 		RunMaxIterations:       5,
 		PlanMaxRevisions:       3,
 		QuestionMax:            5,     // PRD #88 clarification-question cap
@@ -1154,6 +1155,84 @@ func TestClaimCarriesTaskOpenMrAndBaseBranch(t *testing.T) {
 	}
 	if payload.Branch == nil || *payload.Branch != taskBranch {
 		t.Errorf("branch = %v, want %s", payload.Branch, taskBranch)
+	}
+}
+
+// TestClaimCarriesTaskIdleTimeoutForInteractiveRun proves assembleClaim ships the
+// server-configured WORKER_TASK_IDLE_TIMEOUT (testParams: 30m) on an INTERACTIVE task
+// claim as Config.TaskIdleTimeoutSeconds, so the worker parks on the same idle bound the
+// server configured (no drift) — PRD #517 M5. Mirrors the RunTimeout/IdleTimeout claim
+// asserts above. MUTATION PROOF: omitting `TaskIdleTimeoutSeconds: taskIdleTimeoutSeconds`
+// from the ClaimConfig assembly reads back 0 (the zero value), reddening the ==1800 assert.
+func TestClaimCarriesTaskIdleTimeoutForInteractiveRun(t *testing.T) {
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-TASKIDLE-abcdef1234567890"))
+	sealedTok, _ := box.Seal([]byte("anthropic-TASKIDLE-abcdef1234567890"))
+
+	runID := uuid.New()
+	fs := &fakeStore{
+		claimRun: store.Run{
+			ID: runID, Kind: "task", Status: "claimed", Interactive: true,
+			IssueTitle: "Handoff: interactive", IssueDescription: "iterate with me",
+			Branch: pgText("uzi/task/" + runID.String()),
+		},
+		claimCtx: store.GetRunClaimContextRow{
+			RepoWebUrl: "https://gitlab.example.com/grp/proj", RepoPath: "grp/proj",
+			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
+		},
+		anthropic: sealedTok,
+	}
+
+	svc := New(fs, box, testParams())
+	payload, err := svc.Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload == nil {
+		t.Fatal("expected a payload, got idle")
+	}
+	// 30m == 1800s, the WorkerTaskIdleTimeout testParams sets.
+	if payload.Config.TaskIdleTimeoutSeconds != 1800 {
+		t.Fatalf("Config.TaskIdleTimeoutSeconds = %d, want 1800 — the interactive-task park idle "+
+			"timeout must ride the claim (WORKER_TASK_IDLE_TIMEOUT)", payload.Config.TaskIdleTimeoutSeconds)
+	}
+}
+
+// TestClaimOmitsTaskIdleTimeoutForNonInteractiveRun is the negative control that pins the
+// gating decision: a NON-interactive run's claim leaves TaskIdleTimeoutSeconds at zero, so
+// omitempty keeps its wire byte-identical to today's (an un-upgraded worker never sees a new
+// key). MUTATION PROOF: setting TaskIdleTimeoutSeconds unconditionally (dropping the
+// `if run.Interactive` guard) makes this read 1800, reddening the ==0 assert.
+func TestClaimOmitsTaskIdleTimeoutForNonInteractiveRun(t *testing.T) {
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-NOIDLE-abcdef1234567890"))
+	sealedTok, _ := box.Seal([]byte("anthropic-NOIDLE-abcdef1234567890"))
+
+	fs := &fakeStore{
+		claimRun: store.Run{
+			ID: uuid.New(), Kind: "issue", Status: "claimed",
+			IssueIid: pgtype.Int8{Int64: 7, Valid: true},
+		},
+		claimCtx: store.GetRunClaimContextRow{
+			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
+			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
+		},
+		anthropic: sealedTok,
+	}
+
+	svc := New(fs, box, testParams())
+	payload, err := svc.Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload == nil {
+		t.Fatal("expected a payload, got idle")
+	}
+	if payload.Config.TaskIdleTimeoutSeconds != 0 {
+		t.Fatalf("Config.TaskIdleTimeoutSeconds = %d, want 0 for a non-interactive run — the park idle "+
+			"timeout must be delivered ONLY on an interactive task claim", payload.Config.TaskIdleTimeoutSeconds)
 	}
 }
 
