@@ -702,27 +702,23 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Put("/recommendations/disposition", h.BulkSetDispositions)
 		})
 
-		// Incidental Findings backlog (PRD #333 M4/M5, D7/D8): the per-repo, owner-scoped,
-		// coordinate-deduped backlog of off-task bugs the worker flagged mid-run, its issue
-		// draft, and the human-gated file/dismiss WRITES. Two sibling groups (the runs
-		// pattern): the READS are RequireUser (so `uzi findings list` works from a CLI token)
-		// and the WRITES are the stricter cookie+CSRF RequireAuth — a CLI token cannot drive a
-		// forge write.
+		// Incidental Findings backlog (PRD #333 M4/M5, D7/D8; PRD #365 M1): the per-repo,
+		// owner-scoped, coordinate-deduped backlog of off-task bugs the worker flagged mid-run,
+		// its issue draft, and the human-gated file/dismiss WRITES. All on RequireUser so the
+		// `uzi findings` CLI verbs work from a uzc_ Bearer token, while browser callers still
+		// carry a cookie with CSRF enforced via RequireUser's presence dispatch. Filing is a
+		// forge write, but an owner-scoped, reversible one behind the per-user forge limiter;
+		// dismiss is a LOCAL write (no forge call, no spend, no forge blast radius) and carries
+		// no limiter. Mints/reveals/consent routes stay cookie-only RequireAuth.
 		r.Route("/findings", func(r chi.Router) {
+			r.Use(mw.RequireUser(h.q, h.cfg))
 			// Reads: owner-scoped by the query's user_id filter, no forge write, no spend.
-			r.Group(func(r chi.Router) {
-				r.Use(mw.RequireUser(h.q, h.cfg))
-				r.Get("/", h.ListFindings)
-				r.Get("/{id}/issue-draft", h.GetFindingIssueDraft)
-			})
-			// Writes (M5): cookie+CSRF RequireAuth. Filing is a forge write, so it rides the
-			// per-user forge limiter (mirroring FileIssue); dismiss is a LOCAL write (no forge
-			// call, no spend) and carries no limiter, beside the reads.
-			r.Group(func(r chi.Router) {
-				r.Use(mw.RequireAuth(h.q, h.cfg))
-				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issue", h.FileFinding)
-				r.Post("/{id}/dismiss", h.DismissFinding)
-			})
+			r.Get("/", h.ListFindings)
+			r.Get("/{id}/issue-draft", h.GetFindingIssueDraft)
+			// Writes: filing rides the per-user forge limiter (mirroring FileIssue); dismiss is
+			// a local write and carries no limiter.
+			r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issue", h.FileFinding)
+			r.Post("/{id}/dismiss", h.DismissFinding)
 		})
 
 		// Per-user vault (PRD #32): unlock/lock/status for the password-wrapped
@@ -1162,11 +1158,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		})
 
 		// Runs (PRD #64): the core CLI loop is RequireUser — list/get/messages/inputs,
-		// and /{id}/review (Decision 21). POST /{id}/rejudge is the SOLE cookie-only
-		// route left in this group: it MINTS a token-spending judge run, excluded on the
-		// read-vs-spend line, NOT by inheritance. Do NOT wrap the whole /runs group in
-		// RequireUser — that shortcut passes the trio 404 and the admin checks while
-		// silently exposing rejudge; the inner split is the point.
+		// /{id}/review (Decision 21), and the forge FileIssue write (PRD #365 M1). The
+		// cookie-only routes left in this group are POST /{id}/rejudge and PUT
+		// /{id}/wait-on-limit: rejudge MINTS a token-spending judge run and wait-on-limit is
+		// a consent toggle, both excluded on the read/spend/consent line, NOT by inheritance.
+		// Do NOT wrap the whole /runs group in RequireUser — that shortcut passes the trio
+		// 404 and the admin checks while silently exposing those two; the inner split is the
+		// point.
 		r.Route("/runs", func(r chi.Router) {
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireUser(h.q, h.cfg))
@@ -1200,15 +1198,22 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// Issue-draft (PRD #68 M2): the templated, human-editable draft for
 				// filing a forge issue from one recommendation. A READ (owner-or-admin,
 				// same scoping as the review read); no forge write, no token spend. The
-				// file POST (M3) mounts separately on the cookie+CSRF RequireAuth path.
+				// file POST (PRD #68 M3; moved to RequireUser in PRD #365 M1) mounts just
+				// below in this same RequireUser group.
 				r.Get("/{id}/review/recommendations/{recID}/issue-draft", h.GetIssueDraft)
 				// Triage a recommendation (PRD #94 Decision 5): set/clear the caller's
 				// disposition. RequireUser (CLI-reachable, no token spend, no forge write) —
-				// NOT the cookie-only RequireAuth path rejudge/FileIssue sit on. OWNER-ONLY:
+				// NOT the cookie-only RequireAuth path rejudge/wait-on-limit sit on. OWNER-ONLY:
 				// the service resolves by strict caller-ownership, so a uza_ admin_ro token
 				// (which keeps IsAdmin) is refused on another user's review, like CreateRunInput.
 				r.Put("/{id}/review/recommendations/{recID}/disposition", h.SetDisposition)
 				r.Delete("/{id}/review/recommendations/{recID}/disposition", h.DeleteDisposition)
+				// File a forge issue from a recommendation (PRD #68 M3; PRD #365 M1): a forge
+				// WRITE, now RequireUser so `uzi review file` works from a uzc_ Bearer token
+				// (browser callers still carry a cookie with CSRF enforced via RequireUser's
+				// presence dispatch). Behind the per-user forge limiter; owner-or-admin to read
+				// the recommendation, caller-owns-repo to write, and reversible.
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/review/recommendations/{recID}/issue", h.FileIssue)
 				// Expedite / undo one queued run's manual priority override (PRD #320 D6/D7).
 				// RequireUser so the M5 `uzi run expedite` CLI verb (a CLI token) can reach it —
 				// NOT the cookie+CSRF RequireAuth group where wait-on-limit sits. Owner-scoped
@@ -1223,11 +1228,6 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// (service-enforced, audit H3); behind a DEDICATED per-user judge spend
 				// limiter (separate budget from chat).
 				r.With(judgeLimiter.PerUserMiddleware).Post("/{id}/rejudge", h.RerunJudge)
-				// File a forge issue from a recommendation (PRD #68 M3): a forge WRITE, so
-				// cookie+CSRF (this RequireAuth group) behind the per-user forge limiter,
-				// mirroring ConfirmProposal — not the RequireUser read group the draft GET
-				// sits in. Owner-or-admin to see the recommendation, caller-owns-repo to write.
-				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/review/recommendations/{recID}/issue", h.FileIssue)
 				// Per-run usage-limit opt-in (PRD #35 Decision 7, the surface the user chose
 				// over a start-run modal). Cookie-only, matching /me/wait-on-limit: the same
 				// consent, at a finer grain. Owner-scoped in SQL, spends nothing, mints

@@ -8,6 +8,7 @@ import { repoFindings } from "../lib/privilege";
 import { useAuth } from "../auth/AuthContext";
 import { Alert, Badge, Button, Card, EmptyState, ListSkeleton, PageHeader, Select, Textarea, Toggle } from "../components/ui";
 import { PipelineBadge } from "../components/PipelineBadge";
+import { RepoSetupChip } from "../components/RepoSetupChip";
 import { Modal } from "../components/Modal";
 import { BoardIcon, XIcon } from "../components/icons";
 import { DocLink } from "../components/DocLink";
@@ -573,6 +574,11 @@ export function Repos() {
                                 </Badge>
                               );
                             })()}
+                            {/* PRD #361 M4: the neutral per-repo Setup chip, appended
+                                after the guardrail badges. Enabled-only, matching the
+                                Trusted/Tools cells' `!r.enabled` guards — a disabled
+                                repo has no capabilities to report. */}
+                            {r.enabled && <RepoSetupChip repo={r} />}
                           </div>
                         </td>
                         <td className="px-4 py-3">

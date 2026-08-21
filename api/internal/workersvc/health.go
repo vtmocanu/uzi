@@ -111,6 +111,14 @@ const (
 	// healthWaitingWorker enum (no migration — runs.health_reason is free text). Gated
 	// by KeyCapabilityAwareScheduling: when the flag is off this reason is never emitted.
 	reasonNoEligibleWorker = "no online worker can run this — it needs a capability none of your workers has; provision a capable worker"
+	// reasonRepoNotDockerAllowed (PRD #361) is the queued reason for a repo-bearing run
+	// that no online worker is eligible to claim because every online worker is a Docker
+	// worker and the repo is not on the Docker-worker allowlist (fn_worker_can_claim,
+	// migration 00113). Same contract as its siblings — fixed, server-controlled, no
+	// tool name, no repo content, no live duration — and maps to the SAME
+	// healthWaitingWorker enum (no migration owed; runs.health_reason is free text).
+	// Distinct from reasonAllWorkersBusy: allowlisting, not a free slot, unblocks it.
+	reasonRepoNotDockerAllowed = "this repo isn't on the Docker worker allowlist, so no Docker worker can run it"
 )
 
 // Persistence-failure FLAG thresholds (PRD #108 M4), code constants for the same
@@ -235,44 +243,11 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 		if th.queued == 0 || !olderThan(now, r.UpdatedAt, th.queued) {
 			return healthOK, ""
 		}
-		// A run whose required_capabilities no online worker can satisfy is genuinely
-		// UNPLACEABLE (PRD #84 M3) — the most actionable queued reason — so it is resolved
-		// BEFORE the priority-class re-label below: a yield/restored message would hide the
-		// real block. Gated by the capability-aware kill-switch (default ON, same fail
-		// direction as the claim path in service.go): with the flag OFF the fleet claims
-		// best-effort, so there is no "eligible worker" concept to report and this stays
-		// silent. The per-run Count sits behind the queued-threshold guard above, so it runs
-		// for ~0 runs/tick — the same affordability argument as queuedPriorityClass below. A
-		// Count read error falls through to the generic queuedReason rather than inventing a
-		// reason on a failed lookup (the conservative degrade the sibling per-run lookups use).
-		if len(r.RequiredCapabilities) > 0 && s.capabilityAwareOn(ctx) {
-			n, err := s.q.CountOnlineWorkersSatisfyingCaps(ctx, store.CountOnlineWorkersSatisfyingCapsParams{
-				UserID:               r.UserID,
-				RequiredCapabilities: r.RequiredCapabilities,
-			})
-			if err != nil {
-				slog.Error("health: count online workers satisfying caps", "run_id", r.ID, "error", err)
-			} else if n == 0 {
-				return healthWaitingWorker, reasonNoEligibleWorker
-			}
-		}
-		// A queued run the kind-derived priority DEMOTED (PRD #320 D9) is not stuck —
-		// it is yielding to interactive work — so its owner gets a reason that says so
-		// rather than the generic wait. The class comes from the SAME SQL function
-		// ClaimRun's ORDER BY ranks by (fn_run_priority_class), so the reason and the
-		// claim order can never disagree. This per-run lookup is affordable for exactly
-		// verdictUndelivered's reason: it sits BEHIND the queued-threshold guard above,
-		// so it runs for approximately zero runs per tick. The FLAG stays
-		// healthWaitingWorker in every branch (only the reason differs), so
-		// healthSince's "stuck for Xm" preservation keeps working; on `normal`/
-		// `expedited` and on a read error we fall through to the generic queuedReason.
-		switch s.queuedPriorityClass(ctx, now, r) {
-		case "background":
-			return healthWaitingWorker, reasonDeprioritized
-		case "restored":
-			return healthWaitingWorker, reasonRestored
-		}
-		return healthWaitingWorker, s.queuedReason(ctx, r.UserID)
+		// Every queued-past-threshold reason is resolved in queuedReason, most-fundamental
+		// first (vault-lock, no online worker, no capability-eligible worker, priority-class
+		// re-label, then the fleet reasons). The flag is always healthWaitingWorker; only the
+		// reason string differs, so healthSince's "stuck for Xm" preservation keeps working.
+		return healthWaitingWorker, s.queuedReason(ctx, now, r)
 	case "awaiting_approval":
 		// auto_approve runs self-resolve their gate and must never nudge anyone to
 		// approve them (Decision 8).
@@ -512,15 +487,25 @@ func stallBaseline(r store.ListActiveRunsForHealthRow) time.Time {
 }
 
 // queuedReason resolves the human reason a queued run past its threshold is not
-// running, most-actionable first (Decision 8, extended by PRD #216): a locked owner
-// vault (they unlock and it claims within a poll), then no online worker at all, then
-// a saturated fleet where every online worker is at its cap (add capacity), else a
-// plain wait for an idle worker to claim.
-func (s *Service) queuedReason(ctx context.Context, userID uuid.UUID) string {
-	if s.vlt != nil && !s.vlt.Unlocked(userID) {
+// running, MOST-FUNDAMENTAL first (Decision 8, extended by PRD #216, #361, #84 M3 and
+// #320 D9): a locked owner vault (they unlock and it claims within a poll), then no
+// online worker at all, then (PRD #84 M3) no online worker whose capabilities can satisfy
+// the run's required set, then (PRD #320 D9) the deprioritized/restored re-label for a
+// kind-demoted run, then (PRD #361) a repo no online worker is eligible to claim because
+// every online worker is a Docker worker and the repo is not allowlisted, then a saturated
+// fleet where every online worker is at its cap (add capacity), else a plain wait for an
+// idle worker to claim.
+//
+// ORDERING (review finding): vault-lock and no-online-worker come FIRST — ahead of the
+// capability reason — because a locked vault or an empty fleet is the real block, and a
+// capability-specific "no eligible worker" for such a run would name the wrong cause. The
+// capability check stays AHEAD of the priority-class re-label, so a demoted-but-unplaceable
+// run still reports the actionable capability block rather than a yield message.
+func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow) string {
+	if s.vlt != nil && !s.vlt.Unlocked(r.UserID) {
 		return reasonVaultLocked
 	}
-	n, err := s.q.CountOnlineWorkersForUser(ctx, userID)
+	n, err := s.q.CountOnlineWorkersForUser(ctx, r.UserID)
 	if err != nil {
 		slog.Error("health: count online workers", "error", err)
 		return reasonWaitingWorker
@@ -528,7 +513,67 @@ func (s *Service) queuedReason(ctx context.Context, userID uuid.UUID) string {
 	if n == 0 {
 		return reasonNoWorker
 	}
-	free, err := s.q.CountOnlineWorkersWithFreeSlotForUser(ctx, userID)
+	// A run whose required_capabilities no online worker can satisfy is genuinely
+	// UNPLACEABLE (PRD #84 M3) — the most actionable reason once a worker IS online — so it
+	// is resolved BEFORE the priority-class re-label below: a yield/restored message would
+	// hide the real block. Gated by the capability-aware kill-switch (default ON, same fail
+	// direction as the claim path in service.go): with the flag OFF the fleet claims
+	// best-effort, so there is no "eligible worker" concept to report and this stays silent.
+	// The per-run Count sits behind the queued-threshold guard in healthTargetFor, so it
+	// runs for ~0 runs/tick. A Count read error falls through to the generic reasons below
+	// rather than inventing a reason on a failed lookup (the conservative degrade the sibling
+	// per-run lookups use).
+	if len(r.RequiredCapabilities) > 0 && s.capabilityAwareOn(ctx) {
+		m, cerr := s.q.CountOnlineWorkersSatisfyingCaps(ctx, store.CountOnlineWorkersSatisfyingCapsParams{
+			UserID:               r.UserID,
+			RequiredCapabilities: r.RequiredCapabilities,
+		})
+		if cerr != nil {
+			slog.Error("health: count online workers satisfying caps", "run_id", r.ID, "error", cerr)
+		} else if m == 0 {
+			return reasonNoEligibleWorker
+		}
+	}
+	// A queued run the kind-derived priority DEMOTED (PRD #320 D9) is not stuck — it is
+	// yielding to interactive work — so its owner gets a reason that says so rather than the
+	// generic wait. The class comes from the SAME SQL function ClaimRun's ORDER BY ranks by
+	// (fn_run_priority_class), so the reason and the claim order can never disagree. This
+	// per-run lookup is affordable for the same reason as the caps lookup above: it sits
+	// BEHIND the queued-threshold guard in healthTargetFor, so it runs for ~0 runs/tick. On
+	// normal/expedited and on a read error we fall through to the generic reasons below.
+	switch s.queuedPriorityClass(ctx, now, r) {
+	case "background":
+		return reasonDeprioritized
+	case "restored":
+		return reasonRestored
+	}
+	// PRD #361: a repo-bearing queued run that NO online worker is eligible to claim —
+	// every online worker is a Docker worker fn_worker_can_claim rejects because the repo
+	// is not on the Docker allowlist — is genuinely unrunnable without allowlisting,
+	// distinct from "all busy" (a free slot won't help). We are here only with n>0 online
+	// workers, so elig==0 implies an all-Docker fleet AND a non-allowlisted repo (any
+	// non-Docker worker short-circuits fn_worker_can_claim to eligible; an allowlisted
+	// repo makes Docker workers eligible too). A repo-less run (judge, repoID invalid)
+	// never trips this. On a nil reader or any read error we degrade to the generic
+	// free-slot logic below.
+	if r.RepoID.Valid && s.dockerAllowlist != nil {
+		if al, aerr := s.dockerAllowlist.DockerRepoAllowlist(ctx); aerr != nil {
+			slog.Error("health: docker allowlist for queued reason", "error", aerr)
+		} else {
+			elig, eerr := s.q.CountOnlineEligibleWorkersForRepo(ctx, store.CountOnlineEligibleWorkersForRepoParams{
+				UserID:              r.UserID,
+				DockerRepoAllowlist: al,
+				RepoID:              uuid.UUID(r.RepoID.Bytes),
+				Kind:                r.Kind,
+			})
+			if eerr != nil {
+				slog.Error("health: count eligible workers for repo", "error", eerr)
+			} else if elig == 0 {
+				return reasonRepoNotDockerAllowed
+			}
+		}
+	}
+	free, err := s.q.CountOnlineWorkersWithFreeSlotForUser(ctx, r.UserID)
 	if err != nil {
 		slog.Error("health: count online workers with free slot", "error", err)
 		return reasonWaitingWorker

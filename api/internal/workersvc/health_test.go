@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -27,6 +28,11 @@ type healthFakeStore struct {
 	// #216): how many online workers still have room. 0 with onlineWorkers>0 is the
 	// saturated fleet that drives reasonAllWorkersBusy.
 	freeSlotWorkers int64
+	// eligibleWorkers is the canned CountOnlineEligibleWorkersForRepo answer (PRD #361):
+	// how many online workers fn_worker_can_claim accepts for the run's repo/kind. 0 with
+	// onlineWorkers>0 and a non-allowlisted repo drives reasonRepoNotDockerAllowed.
+	eligibleWorkers int64
+	eligibleErr     error
 	writes          []store.SetRunHealthParams
 	// leftStatus marks run ids whose SetRunHealth returns 0 rows — the exit race,
 	// where the run changed status between the list read and the health write.
@@ -96,6 +102,9 @@ func (f *healthFakeStore) CountOnlineWorkersSatisfyingCaps(_ context.Context, ar
 	}
 	return f.satisfyingCaps, nil
 }
+func (f *healthFakeStore) CountOnlineEligibleWorkersForRepo(context.Context, store.CountOnlineEligibleWorkersForRepoParams) (int64, error) {
+	return f.eligibleWorkers, f.eligibleErr
+}
 func (f *healthFakeStore) RunHasVerdictSinceGateOpened(_ context.Context, arg store.RunHasVerdictSinceGateOpenedParams) (bool, error) {
 	f.verdictCalls = append(f.verdictCalls, arg)
 	if f.verdictErr != nil {
@@ -135,6 +144,26 @@ func (s fakeHealthSettings) HealthApprovalSeconds(context.Context) (int, error) 
 func (s fakeHealthSettings) HealthNudgeCooldownSeconds(context.Context) (int, error) {
 	return s.cooldown, nil
 }
+
+// fakeAllowlistReader is a static DockerAllowlistReader (PRD #361): ids is the canned
+// docker-worker repo allowlist, err forces the read to fail so the arm's degrade path
+// can be exercised.
+type fakeAllowlistReader struct {
+	ids []uuid.UUID
+	err error
+}
+
+func (f fakeAllowlistReader) DockerRepoAllowlist(context.Context) ([]uuid.UUID, error) {
+	return f.ids, f.err
+}
+
+// Sentinel errors for the queued-reason degrade-path cases (PRD #361): an allowlist
+// read failure and an eligible-count failure must each fall through to the generic
+// free-slot logic, never a spurious docker reason.
+var (
+	errFakeAllowlist = errors.New("fake allowlist read error")
+	errFakeEligible  = errors.New("fake eligible-count error")
+)
 
 // defaultHealthSettings mirrors the compiled-in defaults (5m / 45m / 10m / 1h / 30m).
 func defaultHealthSettings() fakeHealthSettings {
@@ -334,6 +363,72 @@ func TestHealthQueuedReasons(t *testing.T) {
 
 			svc.detectRunHealth(context.Background(), t0)
 			w := lastWrite(t, fs, r.ID)
+			if w.Health != healthWaitingWorker {
+				t.Fatalf("health = %q, want waiting_worker", w.Health)
+			}
+			if w.HealthReason.String != tc.want {
+				t.Fatalf("reason = %q, want %q", w.HealthReason.String, tc.want)
+			}
+		})
+	}
+}
+
+// TestHealthQueuedRepoNotDockerAllowed drives PRD #361's new queued arm through
+// detectRunHealth: a repo-bearing run no online worker is eligible to claim (all-Docker
+// fleet, repo off the allowlist) reports reasonRepoNotDockerAllowed, while a merely-busy
+// eligible worker, an idle eligible worker, and a repo-less run all fall through. The
+// FLAG stays healthWaitingWorker in every case (the enum never changes).
+func TestHealthQueuedRepoNotDockerAllowed(t *testing.T) {
+	validRepo := pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	cases := []struct {
+		name            string
+		repoID          pgtype.UUID
+		kind            string
+		onlineWorkers   int64
+		eligibleWorkers int64
+		freeSlotWorkers int64
+		allowIDs        []uuid.UUID
+		allowErr        error
+		eligibleErr     error
+		want            string
+	}{
+		// (a) all-Docker fleet, repo not allowlisted: no eligible worker → the new reason.
+		{"all-docker not allowlisted", validRepo, "task", 1, 0, 0, nil, nil, nil, reasonRepoNotDockerAllowed},
+		// (b) an eligible worker exists but is busy: eligible>0 must NOT fire the docker
+		// reason, and with no free slot it falls through to all-busy.
+		{"eligible worker busy", validRepo, "task", 2, 1, 0, nil, nil, nil, reasonAllWorkersBusy},
+		// (b2) an eligible worker is idle: eligible>0, free slot → plain wait.
+		{"eligible worker idle", validRepo, "task", 1, 1, 1, nil, nil, nil, reasonWaitingWorker},
+		// (c) repo-less/judge run: repoID invalid, so the arm is guarded out and the
+		// eligibleWorkers=0 is never consulted → plain wait.
+		{"repo-less judge run", pgtype.UUID{}, "judge", 1, 0, 1, nil, nil, nil, reasonWaitingWorker},
+		// (d) allowlist read error: the arm degrades (never a spurious docker reason)
+		// and falls through to the generic free-slot logic. eligibleWorkers=0 is set but
+		// must never be consulted (the read failed before the count) → all-busy.
+		{"allowlist read error degrades", validRepo, "task", 1, 0, 0, nil, errFakeAllowlist, nil, reasonAllWorkersBusy},
+		// (e) eligible-count error: same degrade — the arm falls through rather than
+		// firing the docker reason on a failed count → all-busy.
+		{"eligible count error degrades", validRepo, "task", 1, 0, 0, nil, nil, errFakeEligible, reasonAllWorkersBusy},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := runRow("queued")
+			r.UpdatedAt = ago(15 * time.Minute) // > 10m queued
+			r.RepoID = tc.repoID
+			r.Kind = tc.kind
+			fs := &healthFakeStore{
+				active:          []store.ListActiveRunsForHealthRow{r},
+				onlineWorkers:   tc.onlineWorkers,
+				freeSlotWorkers: tc.freeSlotWorkers,
+				eligibleWorkers: tc.eligibleWorkers,
+				eligibleErr:     tc.eligibleErr,
+			}
+			svc := healthSvc(fs, defaultHealthSettings()) // vlt nil → treated unlocked
+			svc.SetDockerAllowlist(fakeAllowlistReader{ids: tc.allowIDs, err: tc.allowErr})
+
+			svc.detectRunHealth(context.Background(), t0)
+			w := lastWrite(t, fs, r.ID)
+			// Positive control: the enum never changes across any of these reasons.
 			if w.Health != healthWaitingWorker {
 				t.Fatalf("health = %q, want waiting_worker", w.Health)
 			}

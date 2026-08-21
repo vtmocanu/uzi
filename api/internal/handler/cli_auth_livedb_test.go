@@ -359,8 +359,9 @@ func TestCLISelfReportHonestyLiveDB(t *testing.T) {
 // (c/d) Cross-credential-class + spend containment: a Bearer credential is rejected
 // on the cookie-only routes — the D18 POST /api/workers (mint of a plaintext uzw_
 // whose claim yields decrypted secrets) and the D21 POST /api/runs/{id}/rejudge
-// (the sole cookie-only /runs route; catches the "wrap the whole /runs group"
-// shortcut), plus the other PAT-writing / factory-killing / run-minting routes.
+// (one of two cookie-only /runs routes, with wait-on-limit; catches the "wrap the
+// whole /runs group" shortcut), plus the other PAT-writing / factory-killing /
+// run-minting routes.
 // -------------------------------------------------------------------------
 
 func TestCLIRejectsBearerOnCookieOnlyRoutesLiveDB(t *testing.T) {
@@ -373,7 +374,7 @@ func TestCLIRejectsBearerOnCookieOnlyRoutesLiveDB(t *testing.T) {
 		name, method, path string
 	}{
 		{"mint worker (D18: strictly worse than PAT-write)", http.MethodPost, "/api/workers"},
-		{"rejudge (D21: sole cookie-only /runs route)", http.MethodPost, "/api/runs/" + runID.String() + "/rejudge"},
+		{"rejudge (D21: one of two cookie-only /runs routes, with wait-on-limit)", http.MethodPost, "/api/runs/" + runID.String() + "/rejudge"},
 		{"forge connection (writes a bot PAT)", http.MethodPost, "/api/forge/connections"},
 		{"delete anthropic token (factory kill)", http.MethodDelete, "/api/me/secrets/anthropic_token"},
 		{"create chat (mints a run)", http.MethodPost, "/api/chats"},
@@ -756,5 +757,117 @@ func TestCLITaskRunsBearerReachableLiveDB(t *testing.T) {
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("cookie + bogus Bearer POST %s = %d, want 401 (presence-dispatch must not fall back to cookie)\nbody: %s", path, rec.Code, rec.Body.String())
+	}
+}
+
+// -------------------------------------------------------------------------
+// (l) PRD #365 M1 moved THREE filing WRITES from the cookie-only RequireAuth path
+// to RequireUser, so `uzi review file` / `uzi findings file` / `uzi findings dismiss`
+// work from a uzc_ Bearer token:
+//
+//	POST /api/findings/{id}/dismiss
+//	POST /api/findings/{id}/issue
+//	POST /api/runs/{id}/review/recommendations/{recID}/issue
+//
+// This is the positive counterpart to TestCLIRejectsBearerOnCookieOnlyRoutesLiveDB
+// (which must still pass — these three routes are deliberately NOT in its list). The
+// crux is NOT 401: pre-M1 the cookie-only mount rejected the Bearer credential at the
+// middleware before any handler ran, so a uzc_ POST returned 401. After M1 the
+// credential is honoured and the handler runs. Driven through the real mounted
+// router so RequireUser's presence-dispatch is what decides, not a direct handler call.
+//
+// For a random (nonexistent) coordinate every one of the three returns a CLEAN 404 at
+// its owner-scoped lookup, WITHOUT ever calling the forge — so no fake forge is needed,
+// and the 404 doubles as the owner-scoping assertion over the Bearer path (no leak).
+// The exact ordering that makes each a 404 (and not a 400) was confirmed by reading the
+// handlers: FileIssue parses run/rec/body/repo then 404s at GetReviewForTarget;
+// FileFinding accepts an empty {} body then 404s at GetIncidentalFinding; DismissFinding
+// decodes+validates the reason (so a VALID {"reason":"wont_do"} is required to reach the
+// clean 404) then 404s at GetIncidentalFinding.
+func TestCLIReachesFilingRoutesOverBearerLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	user := cliSeedUser(t, pool, false)
+	uzc := cliMintToken(t, pool, user, clitoken.ScopeUser)
+
+	runID := uuid.New()
+	recID := uuid.New()
+	findingID := uuid.New()
+	repoID := uuid.New()
+
+	cases := []struct {
+		name, path, body string
+		want             int
+	}{
+		{
+			// A valid reason is mandatory to reach the owner lookup: an empty/invalid body
+			// is a 400 (still not 401), but a valid one gives the cleaner owner-scoped 404.
+			name: "findings dismiss",
+			path: "/api/findings/" + findingID.String() + "/dismiss",
+			body: `{"reason":"wont_do"}`,
+			want: http.StatusNotFound,
+		},
+		{
+			name: "findings file",
+			path: "/api/findings/" + findingID.String() + "/issue",
+			body: `{}`,
+			want: http.StatusNotFound,
+		},
+		{
+			name: "review file",
+			path: "/api/runs/" + runID.String() + "/review/recommendations/" + recID.String() + "/issue",
+			body: `{"repo_id":"` + repoID.String() + `","title":"t","description":"d"}`,
+			want: http.StatusNotFound,
+		},
+	}
+	for _, tc := range cases {
+		rec := bearerReqBody(router, http.MethodPost, tc.path, uzc, tc.body)
+		// The crux: RequireUser accepted the Bearer token. The pre-M1 cookie-only mount
+		// would have returned 401 here.
+		if rec.Code == http.StatusUnauthorized {
+			t.Errorf("PRD #365 M1: %s POST %s over Bearer = 401 — the route is still cookie-only; M1 must move it to RequireUser\nbody: %s",
+				tc.name, tc.path, rec.Body.String())
+			continue
+		}
+		// And the exact deterministic code for a foreign/nonexistent coordinate: an
+		// owner-scoped clean 404, no existence oracle, proving owner-scoping over Bearer.
+		if rec.Code != tc.want {
+			t.Errorf("PRD #365 M1: %s POST %s over Bearer = %d, want %d (owner-scoped clean not-found, no forge call)\nbody: %s",
+				tc.name, tc.path, rec.Code, tc.want, rec.Body.String())
+		}
+	}
+}
+
+// TestCLIFilingRoutesStillEnforceCSRFLiveDB is the browser-path counterpart: the mount
+// move (cookie-only RequireAuth → RequireUser) must NOT open a CSRF hole. RequireUser's
+// presence-dispatch takes the cookie path when no Authorization header is present, and
+// that path still enforces CSRF on writes — so a valid session cookie POST WITHOUT the
+// CSRF header is 403 for all three moved routes. The 403 fires at the CSRF check before
+// the handler, so random UUIDs suffice and no seeding is needed. Mirrors the CSRF-write
+// assertion at the tail of TestCLICSRFBypassShapeLiveDB.
+func TestCLIFilingRoutesStillEnforceCSRFLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	user := cliSeedUser(t, pool, false)
+	jwt := cliMintJWT(t, pool, user)
+
+	runID := uuid.New()
+	recID := uuid.New()
+	findingID := uuid.New()
+
+	paths := []struct{ name, path string }{
+		{"findings dismiss", "/api/findings/" + findingID.String() + "/dismiss"},
+		{"findings file", "/api/findings/" + findingID.String() + "/issue"},
+		{"review file", "/api/runs/" + runID.String() + "/review/recommendations/" + recID.String() + "/issue"},
+	}
+	for _, tc := range paths {
+		// A valid auth cookie, NO CSRF header: the cookie path must reject the write at
+		// the CSRF check (403), proving RequireUser preserves CSRF for the moved routes.
+		req := httptest.NewRequest(http.MethodPost, tc.path, nil)
+		req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt})
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("PRD #365 M1: %s cookie POST %s without CSRF = %d, want 403 (RequireUser must preserve CSRF on the browser path; the mount move must not open a CSRF hole)\nbody: %s",
+				tc.name, tc.path, rec.Code, rec.Body.String())
+		}
 	}
 }

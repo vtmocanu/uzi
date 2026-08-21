@@ -39,9 +39,10 @@ type fileIssueResponse struct {
 }
 
 // FileIssue files a GitLab issue from one judge recommendation (PRD #68 M3). It mounts on
-// the cookie+CSRF RequireAuth path behind forgeLimiter.PerUserMiddleware (a forge write),
-// mirroring ConfirmProposal. Authorization is two-part (Decision 8): owner-or-admin to SEE
-// the recommendation (GetReviewForTarget), and caller-owns-repo to WRITE (GetRepoForUser,
+// RequireUser behind forgeLimiter.PerUserMiddleware (still a forge write): reachable from a
+// CLI uzc_ Bearer token, while a browser caller stays on the cookie path with CSRF preserved
+// via RequireUser's presence dispatch (PRD #365 M1). Authorization is two-part (Decision 8):
+// owner-or-admin to SEE the recommendation (GetReviewForTarget), and caller-owns-repo to WRITE (GetRepoForUser,
 // session-user-scoped). The body that reaches the forge is the CLIENT's, so the
 // write-boundary sanitizer (Decision 10) re-runs here — the draft is never trusted to have
 // preserved its inertness. Ordering is forge-first (the forge is the source of truth):

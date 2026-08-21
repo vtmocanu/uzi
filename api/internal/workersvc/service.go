@@ -433,6 +433,11 @@ type Store interface {
 	// counts above, and off the hot path for the same reason — it runs only for a queued
 	// run already past its health threshold.
 	CountOnlineWorkersSatisfyingCaps(ctx context.Context, arg store.CountOnlineWorkersSatisfyingCapsParams) (int64, error)
+	// CountOnlineEligibleWorkersForRepo backs PRD #361's queued Docker-allowlist reason:
+	// how many of the caller's online workers fn_worker_can_claim accepts for this
+	// repo/kind, ignoring free slots. A result of 0 with online workers present means the
+	// repo is unrunnable without allowlisting (an all-Docker fleet, repo not allowlisted).
+	CountOnlineEligibleWorkersForRepo(ctx context.Context, arg store.CountOnlineEligibleWorkersForRepoParams) (int64, error)
 	// RunHasVerdictSinceGateOpened backs issue #182: an awaiting_approval run whose
 	// owner already answered THIS gate reports waiting_worker rather than
 	// approval_idle. A per-run lookup like ListRunToolWindow above, and for the same
@@ -1161,15 +1166,11 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 	// ClaimRun as @capability_aware: the extended fn_worker_can_claim reads its new
 	// subset clause as `NOT capability_aware OR (required ⊆ caps)`, so a false flag makes
 	// the capability match trivially true (best-effort claiming) while the docker
-	// allowlist clause above stays enforced. DEFAULT ON: a nil reader (tests, or a
-	// deployment without a settings cache) or a read error both leave it true, so an
-	// unconfirmable flag routes rather than silently degrading to a mid-run crash.
-	capabilityAware := true
-	if s.capabilitySettings != nil {
-		if v, cerr := s.capabilitySettings.CapabilityAwareScheduling(ctx); cerr == nil {
-			capabilityAware = v
-		}
-	}
+	// allowlist clause above stays enforced. capabilityAwareOn (shared with the health
+	// detector's queued-reason path) is DEFAULT ON: a nil reader (tests, or a deployment
+	// without a settings cache) or a read error both leave it true, so an unconfirmable
+	// flag routes rather than silently degrading to a mid-run crash.
+	capabilityAware := s.capabilityAwareOn(ctx)
 
 	run, err := s.q.ClaimRun(ctx, store.ClaimRunParams{
 		WorkerID:              pgUUID(wkr.ID),

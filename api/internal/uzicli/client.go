@@ -336,6 +336,22 @@ type Client interface {
 	// unknown/foreign id is a 404 (exit 4); a non-open coordinate (filed/filing/already
 	// dismissed) is a 409 (exit 5). 200 → nil.
 	DismissFinding(ctx context.Context, id, reason string) error
+	// GetReviewIssueDraft fetches the server-templated issue draft for one judge
+	// recommendation (PRD #365 M2): GET
+	// /api/runs/{runID}/review/recommendations/{recID}/issue-draft. Owner-or-admin to READ
+	// the recommendation, reachable from a CLI token on RequireUser. The reply is the
+	// {"draft": IssueDraftDTO} envelope; this returns the unwrapped draft carrying the
+	// default repo, title, description and picker note. A foreign/unknown run or rec is a
+	// 404 (exit 4).
+	GetReviewIssueDraft(ctx context.Context, runID, recID string) (apitypes.IssueDraftDTO, error)
+	// FileReviewIssue files a forge issue from one judge recommendation (PRD #365 M2): POST
+	// /api/runs/{runID}/review/recommendations/{recID}/issue with {repo_id,title,description}
+	// (all three required — unlike FileFinding's empty body, the CLI sends the draft defaults
+	// it just fetched). Owner-or-admin to READ the recommendation, caller-owns-repo to WRITE.
+	// Returns the created forge issue (iid/web_url/title) and any created-with-warning note.
+	// A foreign/unknown run or rec is a 404 (exit 4); an already-filed or mid-filing
+	// recommendation is a 409 (exit 5) — both come straight from statusError.
+	FileReviewIssue(ctx context.Context, runID, recID, repoID, title, description string) (ReviewIssueFileResult, error)
 }
 
 // ErrNoDisposition is returned by DeleteDisposition when the recommendation had
@@ -1338,4 +1354,49 @@ func (c *HTTPClient) DismissFinding(ctx context.Context, id, reason string) erro
 	// reason is the wire enum, already mapped and validated by the command. postJSON discards
 	// the (200) body via a nil out and maps a non-2xx through statusError (404→4, 409→5).
 	return c.postJSON(ctx, "/api/findings/"+url.PathEscape(id)+"/dismiss", map[string]string{"reason": reason}, nil)
+}
+
+// ReviewFiledIssueDTO / ReviewIssueFileResult mirror the review file handler's wire shape
+// (POST .../review/recommendations/{recID}/issue): the created forge issue plus an optional
+// created-with-warning note. Defined here (not in apitypes) because the handler's response is
+// a handler-local type; the shape is pinned by TestFileIssueClientWireRoundtripLiveDB (decodes
+// a real server fileIssueResponse into this type) and TestReviewFileClientWireRoundtrip
+// (marshal/unmarshal json-tag parity incl. warning), both in api/internal/handler.
+type ReviewFiledIssueDTO struct {
+	IID    int64  `json:"iid"`
+	WebURL string `json:"web_url"`
+	Title  string `json:"title"`
+}
+
+type ReviewIssueFileResult struct {
+	Issue   ReviewFiledIssueDTO `json:"issue"`
+	Warning string              `json:"warning,omitempty"`
+}
+
+func (c *HTTPClient) GetReviewIssueDraft(ctx context.Context, runID, recID string) (apitypes.IssueDraftDTO, error) {
+	// The handler wraps the DTO in a {"draft": ...} envelope, so decode into a local envelope
+	// and hand back the unwrapped draft. Both ids are escaped — they are user input off the
+	// positionals. A non-2xx (404 for a foreign/unknown run or rec) maps through statusError.
+	var env struct {
+		Draft apitypes.IssueDraftDTO `json:"draft"`
+	}
+	path := "/api/runs/" + url.PathEscape(runID) + "/review/recommendations/" + url.PathEscape(recID) + "/issue-draft"
+	if err := c.get(ctx, path, &env); err != nil {
+		return apitypes.IssueDraftDTO{}, err
+	}
+	return env.Draft, nil
+}
+
+func (c *HTTPClient) FileReviewIssue(ctx context.Context, runID, recID, repoID, title, description string) (ReviewIssueFileResult, error) {
+	// Unlike FileFinding's empty body, the review file endpoint decodes fileIssueRequest
+	// {repo_id,title,description} — all three required — so the CLI sends the draft defaults it
+	// just fetched (the web is the rich editor). postJSON routes a non-2xx through statusError,
+	// so 404→ExitNotFound and 409→ExitConflict come for free.
+	body := map[string]string{"repo_id": repoID, "title": title, "description": description}
+	path := "/api/runs/" + url.PathEscape(runID) + "/review/recommendations/" + url.PathEscape(recID) + "/issue"
+	var out ReviewIssueFileResult
+	if err := c.postJSON(ctx, path, body, &out); err != nil {
+		return ReviewIssueFileResult{}, err
+	}
+	return out, nil
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // PRD #84 M3: a queued run whose required_capabilities are not a subset of ANY online
@@ -237,5 +238,98 @@ func TestReasonNoEligibleWorkerWording(t *testing.T) {
 	const want = "no online worker can run this — it needs a capability none of your workers has; provision a capable worker"
 	if reasonNoEligibleWorker != want {
 		t.Fatalf("reasonNoEligibleWorker = %q, does not match the PRD #84 M3 wording", reasonNoEligibleWorker)
+	}
+}
+
+// ORDERING (review finding #2): vault-lock and no-online-worker are MORE FUNDAMENTAL than
+// the capability reason and must be resolved AHEAD of it. Before the reorder the capability
+// early-return ran in healthTargetFor, ahead of queuedReason where those two checks live, so
+// a docker-requiring run whose vault is locked (or whose fleet is empty) mis-reported
+// reasonNoEligibleWorker. These three cases pin the corrected precedence; (a) and (b) fail on
+// the pre-reorder ordering and pass after it, (c) guards that the reorder did not swallow the
+// capability reason on the path where it still applies.
+
+// (a) A docker-requiring queued run whose owner's VAULT IS LOCKED reports reasonVaultLocked,
+// not the capability reason — a locked vault means the run cannot start at all. The caps
+// lookup must not even be reached.
+func TestHealthQueuedLockedVaultBeatsCapabilityReason(t *testing.T) {
+	box := newBox(t)
+	r := queuedRunPastThreshold()
+	r.RequiredCapabilities = []string{"docker"}
+	fs := &healthFakeStore{
+		active:          []store.ListActiveRunsForHealthRow{r},
+		satisfyingCaps:  0, // would flag reasonNoEligibleWorker if the caps check were reached
+		onlineWorkers:   1,
+		freeSlotWorkers: 1,
+	}
+	svc := healthSvc(fs, defaultHealthSettings())
+	svc.capabilitySettings = fakeCapabilitySettings{on: true}
+	svc.SetVault(vault.New(box, newMemVaultStore())) // r.UserID never unlocked → locked
+
+	svc.detectRunHealth(context.Background(), t0)
+	w := lastWrite(t, fs, r.ID)
+	if w.HealthReason.String != reasonVaultLocked {
+		t.Fatalf("reason = %q, want %q — a locked vault must preempt the capability reason", w.HealthReason.String, reasonVaultLocked)
+	}
+	if w.HealthReason.String == reasonNoEligibleWorker {
+		t.Fatal("capability reason preempted a locked vault (the more fundamental block)")
+	}
+	if len(fs.capsCalls) != 0 {
+		t.Fatalf("issued %d caps lookups after a vault-lock early-return, want 0", len(fs.capsCalls))
+	}
+}
+
+// (b) A docker-requiring queued run with ZERO online workers reports reasonNoWorker, not the
+// capability reason — an empty fleet is the more fundamental block (and the caps count is 0
+// with no workers anyway). The caps lookup must not be reached.
+func TestHealthQueuedNoOnlineWorkerBeatsCapabilityReason(t *testing.T) {
+	r := queuedRunPastThreshold()
+	r.RequiredCapabilities = []string{"docker"}
+	fs := &healthFakeStore{
+		active:         []store.ListActiveRunsForHealthRow{r},
+		satisfyingCaps: 0, // 0 satisfying — but 0 online is the real reason
+		onlineWorkers:  0, // no worker online at all
+	}
+	svc := healthSvc(fs, defaultHealthSettings()) // vlt nil → treated unlocked
+	svc.capabilitySettings = fakeCapabilitySettings{on: true}
+
+	svc.detectRunHealth(context.Background(), t0)
+	w := lastWrite(t, fs, r.ID)
+	if w.HealthReason.String != reasonNoWorker {
+		t.Fatalf("reason = %q, want %q — zero online workers must preempt the capability reason", w.HealthReason.String, reasonNoWorker)
+	}
+	if w.HealthReason.String == reasonNoEligibleWorker {
+		t.Fatal("capability reason preempted a no-online-worker block")
+	}
+	if len(fs.capsCalls) != 0 {
+		t.Fatalf("issued %d caps lookups after a no-worker early-return, want 0", len(fs.capsCalls))
+	}
+}
+
+// (c) With the vault UNLOCKED and a worker ONLINE, the capability reason is still emitted for
+// a run no online worker can satisfy — the hoisted vault-lock and no-worker guards return
+// control to the capability check when they do not apply, so the reorder does not swallow the
+// capability reason.
+func TestHealthQueuedCapabilityReasonSurvivesReorder(t *testing.T) {
+	box := newBox(t)
+	r := queuedRunPastThreshold()
+	r.RequiredCapabilities = []string{"docker"}
+	fs := &healthFakeStore{
+		active:          []store.ListActiveRunsForHealthRow{r},
+		satisfyingCaps:  0,
+		onlineWorkers:   1,
+		freeSlotWorkers: 1,
+	}
+	svc := healthSvc(fs, defaultHealthSettings())
+	svc.capabilitySettings = fakeCapabilitySettings{on: true}
+	svc.SetVault(unlockedVault(t, r.UserID, box)) // r.UserID explicitly unlocked
+
+	svc.detectRunHealth(context.Background(), t0)
+	w := lastWrite(t, fs, r.ID)
+	if w.HealthReason.String != reasonNoEligibleWorker {
+		t.Fatalf("reason = %q, want %q — an unlocked vault + online worker must still reach the capability reason", w.HealthReason.String, reasonNoEligibleWorker)
+	}
+	if len(fs.capsCalls) != 1 {
+		t.Fatalf("issued %d caps lookups, want 1 (the capability check must run past the vault/no-worker guards)", len(fs.capsCalls))
 	}
 }

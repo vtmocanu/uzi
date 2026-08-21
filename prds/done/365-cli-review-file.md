@@ -2,7 +2,7 @@
 
 - **Issue**: [#365](https://github.com/vtmocanu/uzi/issues/365)
 - **Priority**: Medium
-- **Status**: Draft — not started
+- **Status**: Complete — all four milestones landed on `agent/issue-365` (M1 route auth-tier move, M2 `uzi review file` command + client, M3 live-DB + command tests, M4 docs/comment sweep). `task gate:api` green. All seven success criteria met.
 - **Forge scope**: All forges (GitLab, Forgejo, GitHub). The change is in auth-tier mounting and the CLI; filing itself reuses the existing driver-neutral `CreateIssue` path, so nothing here is forge-specific.
 - **Handoff**: queued for the `Night-Shift` uzi sweep (offline worker). This PRD is entirely codebase-local — no milestone needs open-web access. Live-DB tests use the repo's throwaway-Postgres harness (`./e2e/run-store-it.sh`), which is local, not internet.
 
