@@ -471,10 +471,14 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 				return err
 			}
 			msg, _ := cmd.Flags().GetString("message")
+			msg = resolveMessage(env, msg)
+			if strings.TrimSpace(msg) == "" {
+				return uzicli.Exitf(uzicli.ExitUsage, "a rejection needs a reason: pass -m <reason> or pipe it on stdin")
+			}
 			return submitInput(env, gf, c, cmd, args[0], kindRejectPlan, msg, nil)
 		},
 	}
-	reject.Flags().StringP("message", "m", "", "reason to send back to the agent (optional)")
+	reject.Flags().StringP("message", "m", "", "reason to send back to the agent (or pipe it on stdin)")
 
 	cancel := &cobra.Command{
 		Use:   "cancel <run-id>",

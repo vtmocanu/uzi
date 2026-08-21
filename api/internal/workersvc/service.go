@@ -4646,8 +4646,15 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 				_, err = s.q.CancelRunServerSide(ctx, store.CancelRunServerSideParams{ID: runID, UserID: userID})
 			} else {
 				status = "failed"
+				// PRD #503 M2 — persist the operator's reject reason as failure_reason
+				// instead of the hardcoded literal; the CLI now requires it, but keep a
+				// fallback for non-CLI callers that may still send an empty body.
+				reason := strings.TrimSpace(body)
+				if reason == "" {
+					reason = "plan rejected"
+				}
 				_, err = s.q.RejectRunServerSide(ctx, store.RejectRunServerSideParams{
-					ID: runID, UserID: userID, FailureReason: pgText("plan rejected"),
+					ID: runID, UserID: userID, FailureReason: pgText(reason),
 				})
 			}
 			if err != nil {

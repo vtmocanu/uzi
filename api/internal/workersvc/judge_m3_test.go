@@ -419,6 +419,47 @@ func TestSubmitInputRejectServerSideEnqueuesJudge(t *testing.T) {
 	}
 }
 
+// TestSubmitInputRejectServerSidePersistsReason: PRD #503 M2 — a server-side reject
+// must persist the caller's real reason as failure_reason (not the hardcoded literal),
+// and fall back to "plan rejected" only when the body is empty.
+func TestSubmitInputRejectServerSidePersistsReason(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "concrete reason", body: "some concrete reason", want: "some concrete reason"},
+		{name: "empty body falls back", body: "", want: "plan rejected"},
+		{name: "whitespace body falls back", body: "   ", want: "plan rejected"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user, runID := uuid.New(), uuid.New()
+			fs := &fakeStore{
+				runByID:      store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},          // GetRun + no worker ⇒ no live poller
+				runByIDPlain: store.Run{ID: runID, UserID: user, Status: "failed", Kind: RunKindIssue}, // post-reject reload
+				userByID:     store.User{JudgeEnabled: true},
+				anthropic:    []byte("sealed"),
+			}
+			svc := New(fs, newBox(t), testParams())
+			svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
+
+			res, err := svc.SubmitInput(context.Background(), user, runID, "reject_plan", tc.body, nil)
+			if err != nil {
+				t.Fatalf("SubmitInput: %v", err)
+			}
+			if !res.ServerSide {
+				t.Fatal("a reject with no live poller must be applied server-side")
+			}
+			if fs.rejected == nil {
+				t.Fatal("RejectRunServerSide not called")
+			}
+			if !fs.rejected.FailureReason.Valid || fs.rejected.FailureReason.String != tc.want {
+				t.Fatalf("FailureReason = %+v, want %q", fs.rejected.FailureReason, tc.want)
+			}
+		})
+	}
+}
+
 // TestSubmitInputCancelServerSideDoesNotEnqueueJudge: a server-side CANCEL commits
 // 'cancelled', which is never judged (Decision 2).
 func TestSubmitInputCancelServerSideDoesNotEnqueueJudge(t *testing.T) {
