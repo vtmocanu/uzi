@@ -64,7 +64,7 @@ export const mockAdmin: User = {
   autopilot_enabled: false,
   judge_enabled: false,
   ci_autofix_enabled: false,
-  wait_on_limit: false,
+  wait_on_limit: true,
   judge_anthropic_secret_id: null,
   judge_anthropic_secret_label: null,
   created_at: daysAgo(41),
