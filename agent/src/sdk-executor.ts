@@ -153,17 +153,84 @@ const REASON_MAX_ITERATIONS =
 const PROGRESS_MISS_LIMIT = 2;
 
 /**
+ * The reading returned by the SDK Query's `getContextUsage()` control method,
+ * narrowed to the three fields uzi attaches to the lead's usage frame (PRD #516).
+ * The real `SDKControlGetContextUsageResponse` is a superset, so the real `Query`
+ * still satisfies this shape (return types are covariant).
+ */
+export interface ContextUsageReading {
+  totalTokens: number;
+  rawMaxTokens: number;
+  percentage: number;
+}
+
+/**
  * Injectable seam over the SDK's `query`. The return only needs to be async
  * iterable for the executor; cancellation goes through `options.abortController`
  * and the process-group kill uses the pid captured by `spawnClaudeCodeProcess`.
+ *
+ * PRD #516: the runtime object is the SDK's real `Query`, which carries a
+ * `getContextUsage()` control method the bare `AsyncIterable<SDKMessage>` does not
+ * surface. It is declared here as an OPTIONAL method so the ~10 existing `queryFn`
+ * fakes across `agent/test/` (which return a bare async iterable) keep compiling
+ * untouched; the producer null-checks it before calling.
  */
 export type SdkQueryFn = (params: {
   prompt: AsyncIterable<unknown>;
   options: SdkOptions;
-}) => AsyncIterable<SDKMessage>;
+}) => AsyncIterable<SDKMessage> & {
+  getContextUsage?(): Promise<ContextUsageReading>;
+};
 
 const defaultQueryFn: SdkQueryFn = (params) =>
+  // The real SDK `Query` has a required `getContextUsage()` returning the wider
+  // `SDKControlGetContextUsageResponse`; it satisfies the optional, narrower seam
+  // type above by covariance, so no cast is needed here.
   sdkQuery({ prompt: params.prompt as never, options: params.options });
+
+/** PRD #516 R1: how long to wait on the `getContextUsage()` control call before
+ *  giving up. A bare `await` on a call that never resolves (CLI mid-shutdown,
+ *  control unsupported) would block the turn until the wall watchdog kills it, so
+ *  the reading is raced against this timeout and any timeout/error is swallowed. */
+const CONTEXT_USAGE_TIMEOUT_MS = 2000;
+
+/**
+ * PRD #516 M1: read the lead session's live context-window fill via the SDK
+ * Query's `getContextUsage()` control method, mapped to the pinned payload
+ * contract `{ used, window, pct }`. Returns `undefined` — never throws — when the
+ * method is absent (existing fakes, older CLI), the call errors, or it hangs past
+ * the timeout, so the caller simply attaches no `context` and the turn is
+ * unaffected (Risk R1/R2, Success Criteria 5).
+ */
+async function readLeadContext(
+  queryInstance: { getContextUsage?(): Promise<ContextUsageReading> },
+  timeoutMs: number,
+): Promise<{ used: number; window: number; pct: number } | undefined> {
+  const getContextUsage = queryInstance.getContextUsage;
+  if (typeof getContextUsage !== "function") return undefined;
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const reading = await Promise.race([
+      getContextUsage.call(queryInstance),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("getContextUsage timed out")),
+          timeoutMs,
+        );
+        timer.unref?.();
+      }),
+    ]);
+    return {
+      used: reading.totalTokens,
+      window: reading.rawMaxTokens,
+      pct: reading.percentage,
+    };
+  } catch {
+    return undefined;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 export interface SdkExecutorOptions {
   /** Override the SDK entrypoint (tests inject a fake transport here). */
@@ -209,6 +276,10 @@ export interface SdkExecutorOptions {
    *  clone). Injected in tests so the advisory hooks are drivable with a fake that
    *  records calls and can throw, proving failure isolation with no live SDK. */
   summaryRunner?: SummaryRunner;
+  /** PRD #516 M1: timeout for the per-turn `getContextUsage()` control call.
+   *  Default {@link CONTEXT_USAGE_TIMEOUT_MS} (2s); tests lower it so the hang case
+   *  resolves fast. */
+  contextUsageTimeoutMs?: number;
 }
 
 /** What one turn observed: the session id, and any workflow signals. */
@@ -320,6 +391,8 @@ export class SdkExecutor implements Executor {
    *  shared provisioning HOME, a writable data-volume path — never the clone); tests
    *  inject a fake. Only used by the advisory summary hooks. */
   private readonly summaryRunner: SummaryRunner;
+  /** PRD #516 M1: timeout for the per-turn `getContextUsage()` control call. */
+  private readonly contextUsageTimeoutMs: number;
   /** Every pid spawned across the current run's turns, for the done-path reap.
    *  Private to THIS instance — one SdkExecutor is built per run (PRD #42 Decision
    *  4), so two concurrent runs can never wipe/kill each other's set. */
@@ -363,6 +436,8 @@ export class SdkExecutor implements Executor {
     // is where the judge/run put theirs — NOT the clone). Tests inject a fake.
     this.summaryRunner =
       opts.summaryRunner ?? new SummaryRunner(this.log, { homeRoot: this.provisionHomeDir });
+    this.contextUsageTimeoutMs =
+      opts.contextUsageTimeoutMs ?? CONTEXT_USAGE_TIMEOUT_MS;
   }
 
   /**
@@ -1898,6 +1973,10 @@ export class SdkExecutor implements Executor {
 
     const result: TurnResult = { done: false };
     let turnSessionId: string | undefined;
+    // PRD #516 M1: the lead context reading is attached AT MOST ONCE per turn, on
+    // the same lead assistant frame that first latches usage. Turn-scoped so a turn
+    // with several assistant frames issues exactly one `getContextUsage()` call.
+    let contextAttached = false;
     let sawErrorResult = false;
     let errorSubtype = "unknown";
     // PRD #35. The observer rides the SAME iteration mapSdkMessage already does —
@@ -1984,6 +2063,24 @@ export class SdkExecutor implements Executor {
             // from a model-only frame. No usage ⇒ no model, deliberately.
             if (frameModel !== undefined) em.payload["model"] = frameModel;
             usageAttached = true;
+            // PRD #516 M1: CO-ATTACH the lead's live context-window fill on the SAME
+            // frame that got usage, once per turn. The first usage frame of a turn is
+            // the lead's assistant frame, and `getContextUsage()` is a main-loop-only
+            // control call, so this keys the reading to the lead and rides the
+            // consumer's existing `"usage" in payload` branch (Decision D5, D3). The
+            // `contextAttached` latch is set BEFORE the await so a slow/hanging call
+            // is issued at most once per turn; the read is timeout-guarded and never
+            // throws, so on absence/error/timeout no `context` key is written and the
+            // turn is unaffected (R1, R2, SC5). The await delays only this one em's
+            // emit; ordering is otherwise identical to before.
+            if (!contextAttached) {
+              contextAttached = true;
+              const context = await readLeadContext(
+                queryInstance,
+                this.contextUsageTimeoutMs,
+              );
+              if (context) em.payload["context"] = context;
+            }
           }
           ctx.emit(em);
         }
