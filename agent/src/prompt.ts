@@ -981,9 +981,9 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
     : "";
   if (depsNote) lines.push("", depsNote);
   // issue #222: the reseed warning, first turn only. Placed BEFORE baseNote so the two read
-  // together — "the tree was rebuilt from the remote" then "your branch was created at
-  // <base>". A queued follow-up cannot land on turn 1 (it drains at iteration end), so this
-  // is in context by the time one arrives. Empty on a fresh run ⇒ nothing added.
+  // together — "the tree was rebuilt at the start of this attempt" then "your branch was
+  // created at <base>". A queued follow-up cannot land on turn 1 (it drains at iteration
+  // end), so this is in context by the time one arrives. Empty on a fresh run ⇒ nothing added.
   const reseed = input.first ? reseedNote(input.resumed) : "";
   if (reseed) lines.push("", reseed);
   // The base commit, first turn only — this is the phase where the lead delegates a
