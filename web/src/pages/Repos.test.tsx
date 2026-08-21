@@ -521,3 +521,33 @@ describe("Repos — enable guardrail 422 violations (PRD #345)", () => {
     expect(screen.queryByText("reason two")).toBeNull();
   });
 });
+
+describe("Repos — Setup chip (PRD #361 M4)", () => {
+  it("renders only for enabled repos and reflects the flags (docker_blocked → info)", async () => {
+    // A docker_blocked enabled repo (escalates to info) plus the disabled fixture row.
+    mockApi.listProjects.mockResolvedValue({
+      repos: [
+        repo({ id: "repo-blocked", path_with_namespace: "vtmocanu/blocked", docker_blocked: true }),
+        repo({ id: "repo-off", path_with_namespace: "example/website", enabled: false }),
+      ],
+    });
+    renderPage();
+    await screen.findByText("vtmocanu/blocked");
+
+    // PRESENT on the enabled row, ABSENT on the disabled one.
+    const enabledChip = within(rowFor("vtmocanu/blocked")).getByRole("button", {
+      name: /^(Setup|Ready)$/,
+    });
+    expect(enabledChip).toBeTruthy();
+    expect(
+      within(rowFor("example/website")).queryByRole("button", { name: /^(Setup|Ready)$/ }),
+    ).toBeNull();
+
+    // Reflects the flag: a blocked repo's chip carries the info tone (positive)…
+    const badge = enabledChip.querySelector("span");
+    expect(badge?.className).toContain("text-info");
+    // …and never a red/amber warning (paired negative, so it is not vacuous).
+    expect(badge?.className).not.toContain("text-danger");
+    expect(badge?.className).not.toContain("text-warn");
+  });
+});
