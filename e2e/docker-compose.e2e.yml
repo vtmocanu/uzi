@@ -126,10 +126,13 @@ services:
       # claim config from the api's WORKER_CHAT_IDLE_TIMEOUT (chat.go -> ClaimConfig, which
       # the ChatRunner prefers over the agent env), so it MUST be set here, short, for the
       # worker to idle-complete before this server backstop. 20s -> 15s (#100) to shave the
-      # idle-completion wait while staying ABOVE the chat scenario's own intermediate waits
-      # (the proposal-card poll and wait_msg_*/wait_tool_result tolerate up to 20s): a 10s
-      # window could idle-complete the chat mid-scenario if a step legitimately takes 10-20s
-      # under load, after which the next apipost against the completed chat fails.
+      # idle-completion wait while keeping a safe margin over realistic step latency. The
+      # chat scenario's own intermediate waits (the proposal-card poll,
+      # wait_msg_*/wait_tool_result) carry 20s GIVE-UP ceilings, not expected times — under
+      # the stub, turns settle sub-second — but a 10s idle window could still idle-complete
+      # the chat mid-scenario if one step legitimately took 10-20s under load, after which
+      # the next apipost against the completed chat fails. 15s clears the observed latency
+      # with headroom (M9 margin report: chat waits kept 19-20s of their 20s ceiling).
       # CHAT_IDLE_TIMEOUT (90s) stays well above it so the worker still completes an idle
       # chat before the server backstop fires.
       WORKER_CHAT_IDLE_TIMEOUT: 15s
@@ -220,9 +223,10 @@ services:
       # e2e sees idle-completion in seconds instead of the 60m default. This agent-side
       # value is only the FALLBACK — the effective window is the api's claim-config
       # WORKER_CHAT_IDLE_TIMEOUT (above), which the ChatRunner prefers — but keep the two
-      # in lockstep. 20s -> 15s (#100); still above the chat scenario's ≤20s intermediate
-      # waits so the chat can't idle out during a mid-scenario issue-run step (validated via
-      # the M9 margin report).
+      # in lockstep. 20s -> 15s (#100); still comfortably over realistic turn latency (the
+      # scenario's 20s intermediate waits are give-up ceilings, not expected times) so the
+      # chat can't idle out during a mid-scenario issue-run step (validated via the M9
+      # margin report: chat waits kept 19-20s headroom).
       WORKER_CHAT_POLL_MS: "500"
       WORKER_CHAT_IDLE_TIMEOUT: 15s
     volumes:

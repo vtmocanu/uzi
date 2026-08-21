@@ -5081,8 +5081,9 @@ pass "health_stall_seconds tightened to 60s for the scenario"
 # worker from the cap 2 it entered on (PRD #42, set earlier and never reverted) to cap 3.
 # EXPORT the cap rather than appending to the env-file: a shell env var out-ranks the
 # env-file's UZI_E2E_MAX_CONCURRENT_RUNS=2 (compose ranks shell env above --env-file), so
-# there is no ambiguity about which of two duplicate keys wins. Never reverted; no phase
-# after #47 asserts cap==2.
+# there is no ambiguity about which of two duplicate keys wins. Reverted (`unset`) after
+# the #47 legs finish (below) so the cap-3 window is scoped to this phase; no phase after
+# #47 asserts cap==2, but the unset keeps a future one inserted here from inheriting cap 3.
 export UZI_E2E_MAX_CONCURRENT_RUNS=3
 "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
 # Wait for the recreated worker to actually ADVERTISE cap 3, not merely `online`: the
