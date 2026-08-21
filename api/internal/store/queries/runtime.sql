@@ -949,11 +949,16 @@ WHERE runs.id = @id AND worker_id = @worker_id
   -- Unlike awaiting_input this clause is NOT keyed on a per-park identity: PRD #517 M1
   -- added no follow_up analog of open_question_id, so the tie is "a follow_up was
   -- consumed" rather than "THIS follow_up was consumed". The residual — on a run that
-  -- has already iterated (an earlier follow_up consumed), a stale pre-park report is
-  -- admitted — is bounded by the same in-process hold the whole park relies on, and by
-  -- SetRunRunning being idempotent (a spurious `running` on an in-process worker that
-  -- is genuinely mid-turn is a heartbeat, not a state change). Narrow it to a
-  -- park-scoped follow_up identity if M3+ adds one.
+  -- has already iterated (cycle ≥2, an earlier follow_up consumed) this clause finds a
+  -- consumed follow_up and degrades to a no-op, so a stale pre-park `running` report is
+  -- admitted — is NOT bounded by idempotency: when it bites the run is re-parked at
+  -- awaiting_followup (idle in the follow-up waiter), so admitting `running` is a real
+  -- awaiting_followup→running STATE CHANGE (the health CASE arms fire their ELSE branch),
+  -- not a mid-turn heartbeat. What actually bounds it is the outer `worker_id = @worker_id`
+  -- pin — the same pin the in-process park already relies on: the admitted report is a
+  -- stale SAME-worker pre-park `running`, and a report from any other worker is rejected
+  -- by that pin regardless of this clause. Narrow it to a park-scoped follow_up identity
+  -- if M3+ adds one.
   AND (status <> 'awaiting_followup' OR EXISTS (
         SELECT 1 FROM run_user_inputs
         WHERE run_user_inputs.run_id = @id
@@ -1628,6 +1633,17 @@ WHERE id = @id AND status = 'claimed';
 -- and is bounded by its own runner-side timeout, so folding it in here would newly fail a
 -- slow judge (large trace / slow API) that would otherwise complete.
 --
+-- Interactive task runs are exempt too (PRD #517 Decision 6, `interactive = false`
+-- below). An interactive task is user-paced like a chat: it parks at awaiting_followup
+-- between follow-ups and, over many turns, can legitimately be alive far longer than
+-- RUN_TIMEOUT. started_at is stamped ONCE and never reset, so on the resume back to
+-- 'running' the ORIGINAL started_at is already past the wall budget and the first sweep
+-- tick would fail a legitimately-resumed long-lived run — the exact use case the feature
+-- exists for. The park itself is already exempt (status <> 'running'); it is the RESUME
+-- that re-exposes it, so the exemption must live on the run's kind, not its status. It is
+-- instead bounded by the M5 worker idle timeout. `interactive` is NOT NULL DEFAULT false,
+-- so this changes NOTHING for non-interactive runs.
+--
 -- PRD #122 M2 (Decision 5b): the cutoff is now PER-RUN, not a single global @cutoff.
 -- A run that froze a scaled budget carries budget_wall_seconds; the sweep honours it,
 -- falling back to global_timeout_seconds (RUN_TIMEOUT) for a NULL-budget run — so a
@@ -1652,6 +1668,7 @@ UPDATE runs SET status = 'failed', failure_reason = @failure_reason,
 WHERE status = 'running'
   AND started_at < (sqlc.arg('now')::timestamptz - make_interval(secs => COALESCE(budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)))
   AND kind NOT IN ('chat', 'judge')
+  AND interactive = false
 RETURNING id, user_id, status;
 
 -- name: FailRunsOfStaleWorkersOverCap :many

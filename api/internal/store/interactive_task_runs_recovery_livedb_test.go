@@ -178,6 +178,97 @@ func TestAwaitingFollowupRecoveryLiveDB(t *testing.T) {
 	}
 }
 
+// 1b. OVER-CAP RECOVERY, BOTH FAIL PATHS. A parked interactive task whose worker dies
+// AND which has already spent its re-queue budget must be FAILED (not requeued) — via the
+// REGISTER path (FailWorkerRunsOverCap) and the stale-heartbeat sweep
+// (FailRunsOfStaleWorkersOverCap). Test 1 seeds requeue_count=0, so only the requeue
+// branch runs and the awaiting_followup additions to these two over-cap queries go
+// unexercised; this test drives them at/over the cap.
+//
+// Non-vacuity: each path also holds a genuinely TERMINAL run (completed) at the same
+// over-cap requeue_count under the same worker and asserts it is NOT failed — so the
+// positive assertion is not satisfiable by a query that fails everything. MUTATION PROOF:
+// drop 'awaiting_followup' from either over-cap IN-list and the park is skipped (rows==0,
+// status stays awaiting_followup) — the zombie the recovery is meant to prevent, now a
+// PERMANENT one because the requeue path also skipped it.
+func TestAwaitingFollowupOverCapFailedLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	f, done := setupFollowup(ctx, t, dsn)
+	defer done()
+
+	noCap := pgtype.Int4{}
+	// atCap pins requeue_count to the cap so the over-cap predicate (requeue_count >=
+	// max_requeues, with MaxRequeues=3 below) selects the run and the within-budget
+	// requeue predicate (requeue_count < max_requeues) does not.
+	atCap := func(id uuid.UUID) {
+		mustExec(ctx, t, f.pool, `UPDATE runs SET requeue_count = 3 WHERE id = $1`, id)
+	}
+
+	// ── Register-time over-cap path (worker-scoped: FailWorkerRunsOverCap). ──
+	regWkr := f.seedWorker(ctx, t, "online", noCap, false)
+	parked := f.seedInteractiveTaskRun(ctx, t, "awaiting_followup", &regWkr)
+	terminal := f.seedInteractiveTaskRun(ctx, t, "completed", &regWkr)
+	atCap(parked)
+	atCap(terminal)
+
+	failed, err := f.q.FailWorkerRunsOverCap(ctx, store.FailWorkerRunsOverCapParams{
+		WorkerID: pgU(regWkr), MaxRequeues: 3, FailureReason: pgT("worker restarted over cap"),
+	})
+	if err != nil {
+		t.Fatalf("FailWorkerRunsOverCap: %v", err)
+	}
+	if len(failed) != 1 || failed[0] != parked {
+		t.Fatalf("FailWorkerRunsOverCap returned %+v, want exactly the parked run — an over-cap parked "+
+			"interactive task must be FAILED on register (drop awaiting_followup from the IN-list and this "+
+			"is empty, a permanent zombie)", failed)
+	}
+	if got := f.status(ctx, t, parked); got != "failed" {
+		t.Fatalf("over-cap parked run status = %q after FailWorkerRunsOverCap, want failed", got)
+	}
+	if got := f.status(ctx, t, terminal); got != "completed" {
+		t.Fatalf("a completed run was failed (status = %q) — the over-cap IN-list swept a terminal run", got)
+	}
+
+	// ── Stale-heartbeat over-cap sweep path (FailRunsOfStaleWorkersOverCap). ──
+	staleWkr := f.seedWorker(ctx, t, "online", noCap, true)
+	staleParked := f.seedInteractiveTaskRun(ctx, t, "awaiting_followup", &staleWkr)
+	staleTerminal := f.seedInteractiveTaskRun(ctx, t, "completed", &staleWkr)
+	atCap(staleParked)
+	atCap(staleTerminal)
+
+	staleFailed, err := f.q.FailRunsOfStaleWorkersOverCap(ctx, store.FailRunsOfStaleWorkersOverCapParams{
+		MaxRequeues: 3, Cutoff: pgtype.Timestamptz{Time: time.Now(), Valid: true},
+		FailureReason: pgT("stale worker over cap"),
+	})
+	if err != nil {
+		t.Fatalf("FailRunsOfStaleWorkersOverCap: %v", err)
+	}
+	var sawStaleParked bool
+	for _, r := range staleFailed {
+		if r.ID == staleTerminal {
+			t.Fatalf("the stale over-cap sweep failed a completed run — the IN-list swept a terminal run")
+		}
+		if r.ID == staleParked {
+			sawStaleParked = true
+		}
+	}
+	if !sawStaleParked {
+		t.Fatalf("the stale over-cap sweep did NOT fail the parked interactive task — remove awaiting_followup "+
+			"from FailRunsOfStaleWorkersOverCap's IN-list and the over-cap park becomes a permanent zombie "+
+			"(failed=%d)", len(staleFailed))
+	}
+	if got := f.status(ctx, t, staleParked); got != "failed" {
+		t.Fatalf("stale-worker over-cap parked run status = %q after the sweep, want failed", got)
+	}
+	if got := f.status(ctx, t, staleTerminal); got != "completed" {
+		t.Fatalf("a completed run under the stale worker changed to %q", got)
+	}
+}
+
 // 2. CONCURRENCY / LOAD. A park holds an in-process slot (Decision 3), so it must count
 // as ACTIVE — or the fleet schedules new runs onto a worker that is actually full and
 // the UI under-reports load. Assert it counts in ListWorkersByUser (active_runs/busy),
