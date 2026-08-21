@@ -727,6 +727,19 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	// >1 token so the own board draws the credential cell (the boardCredSeg path).
 	next, _ = board.Update(secretsMsg{count: 2})
 	board = next.(tuiModel)
+	// A hostile rate-limit token Label exercises the factory-floor rate-limit strip
+	// (boardRateLimitStrip → rateWindowCell), drawn through renderer.Plain (D7). IsDefault so it
+	// clears the sidebar selection and actually renders; status "ok" so it is readable.
+	next, _ = board.Update(rateLimitsMsg{tokens: []apitypes.TokenRateLimitDTO{
+		{SecretID: "sec-nasty", Label: nasty, IsDefault: true, Limits: apitypes.RateLimitDTO{
+			Status: "ok", FiveHour: &apitypes.RateLimitWindow{Pct: 40}, SevenDay: &apitypes.RateLimitWindow{Pct: 70}}},
+		{SecretID: "sec-second", Label: "second", Limits: apitypes.RateLimitDTO{
+			Status: "ok", FiveHour: &apitypes.RateLimitWindow{Pct: 10}, SevenDay: &apitypes.RateLimitWindow{Pct: 20}}},
+	}})
+	board = next.(tuiModel)
+	// Two readable tokens ⇒ showLabel true ⇒ the hostile Label is actually drawn.
+	next, _ = board.Update(settingsMsg{settings: apitypes.UserSettingsDTO{SidebarTokenIds: []string{"sec-second"}}})
+	board = next.(tuiModel)
 	boardOut := board.View().Content
 	assertNoRawControls(t, "board", boardOut)
 	// Belt-and-braces beyond assertNoRawControls: the raw control bytes from the hostile

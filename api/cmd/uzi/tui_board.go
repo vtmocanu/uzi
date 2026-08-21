@@ -2,6 +2,7 @@ package main
 
 import (
 	"image/color"
+	"slices"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -196,7 +197,7 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		m.board.filtering = true
 		return m, nil
 	case keyRefresh:
-		return m, m.fetchRunsCmd(m.board.admin)
+		return m, tea.Batch(m.fetchRunsCmd(m.board.admin), m.fetchRateLimitsCmd(), m.fetchSettingsCmd())
 	case keyAdmin:
 		m.board.admin = !m.board.admin
 		m.board.adminDenied = false
@@ -269,6 +270,11 @@ func (m tuiModel) renderBoard() string {
 		summary += m.pal.faint.Render(" · " + itoa(lo) + "–" + itoa(hi))
 	}
 	sb.WriteString(clampVisual(padVisual(" "+brand, m.width-visualWidth(summary)-1)+summary, m.width) + "\n")
+	// The viewer's own rate-limit meters, mirroring the web sidebar's selection. One line,
+	// only when at least one token is readable AND shown; otherwise nothing (no strip).
+	if strip := m.boardRateLimitStrip(); strip != "" {
+		sb.WriteString(strip + "\n")
+	}
 	sb.WriteString("\n")
 
 	if m.board.adminDenied {
@@ -447,6 +453,11 @@ func (m tuiModel) boardCapacity() int {
 	if m.board.err != nil {
 		chrome++
 	}
+	// The rate-limit strip, when present, adds one line between the wordmark and the blank
+	// below it. Recomputed here (cheap) so the row-window math matches renderBoard's layout.
+	if m.boardRateLimitStrip() != "" {
+		chrome++
+	}
 	c := m.height - chrome
 	if c < 1 {
 		c = 1
@@ -520,6 +531,98 @@ func (m tuiModel) boardSummary() string {
 	}
 	segs = append(segs, m.pal.faint.Render(itoa(len(m.board.runs))+" runs"))
 	return strings.Join(segs, m.pal.faint.Render(" · "))
+}
+
+// rateBarWidth is the mini rate-limit meter's fixed cell width.
+const rateBarWidth = 6
+
+// boardRateLimitStrip is the single-line rate-limit meter strip drawn under the wordmark,
+// mirroring EXACTLY the web left-bottom sidebar's selection (SidebarRateLimits +
+// sidebarTokens.ts):
+//   - readable = tokens whose Limits.Status == "ok"; nothing readable → no strip.
+//   - showLabel is keyed off readable (len > 1), NOT off the shown subset.
+//   - shown = readable filtered by isShownInSidebar (IsDefault || SecretID ∈ sidebarTokenIds);
+//     nothing shown → no strip.
+//
+// Each shown token renders its 5h and 7d windows as a faint label + tone-coloured mini bar +
+// NN% text. The NN% text is always present so an Ascii/NO_COLOR terminal (which strips the SGR
+// tone) keeps the legible signal — colour is never the only cue. Clamped to one physical line.
+// The Label is USER-AUTHORED and drawn through renderer.Plain (D7).
+func (m tuiModel) boardRateLimitStrip() string {
+	readable := make([]apitypes.TokenRateLimitDTO, 0, len(m.rateLimits))
+	for _, t := range m.rateLimits {
+		if t.Limits.Status == "ok" {
+			readable = append(readable, t)
+		}
+	}
+	if len(readable) == 0 {
+		return ""
+	}
+	showLabel := len(readable) > 1
+	shown := make([]apitypes.TokenRateLimitDTO, 0, len(readable))
+	for _, t := range readable {
+		if t.IsDefault || slices.Contains(m.sidebarTokenIds, t.SecretID) {
+			shown = append(shown, t)
+		}
+	}
+	if len(shown) == 0 {
+		return ""
+	}
+	segs := make([]string, 0, len(shown))
+	for _, t := range shown {
+		seg := ""
+		if showLabel {
+			seg = paintSeg(m.pal.faintC, nil, false, m.renderer.Plain(t.Label, 16)+" ")
+		}
+		seg += m.rateWindowCell("5h", t.Limits.FiveHour) + "   " + m.rateWindowCell("7d", t.Limits.SevenDay)
+		segs = append(segs, seg)
+	}
+	// A faint leading space aligns the strip under the brand block (the brand line starts " ").
+	strip := " " + strings.Join(segs, "   ")
+	return clampVisual(strip, m.width)
+}
+
+// rateWindowCell renders one rate-limit window as `label <bar> NN%`: a faint label ("5h"/"7d"),
+// a tone-coloured mini block-bar filled proportional to pct, then the server-rounded NN% text.
+// A nil window (Anthropic reported none) draws a faint `label -`, mirroring windowPct's "-".
+func (m tuiModel) rateWindowCell(label string, w *apitypes.RateLimitWindow) string {
+	if w == nil {
+		return paintSeg(m.pal.faintC, nil, false, label+" -")
+	}
+	filled, empty := rateBarParts(w.Pct)
+	return paintSeg(m.pal.faintC, nil, false, label+" ") +
+		paintSeg(m.rateTone(w.Pct), nil, false, filled) +
+		paintSeg(m.pal.faintC, nil, false, empty) +
+		paintSeg(m.pal.faintC, nil, false, " "+windowPct(w)+"%")
+}
+
+// rateTone maps a rounded pct to the shared tone (mirrors the web toneFor): danger ≥ 85,
+// warn ≥ 40, else ok.
+func (m tuiModel) rateTone(pct int) color.Color {
+	switch {
+	case pct >= 85:
+		return m.pal.alarm
+	case pct >= 40:
+		return m.pal.amber
+	default:
+		return m.pal.sage
+	}
+}
+
+// rateBarParts splits the rateBarWidth-cell mini bar into its filled (▰) and empty (▱) runs,
+// filled proportional to pct (the same ▰/▱ glyph vocabulary the milestone micro-bar uses).
+func rateBarParts(pct int) (filled, empty string) {
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	f := (pct*rateBarWidth + 50) / 100
+	if f > rateBarWidth {
+		f = rateBarWidth
+	}
+	return strings.Repeat("▰", f), strings.Repeat("▱", rateBarWidth-f)
 }
 
 // boardEmptyState replaces the old dead-end "no runs to show": it keeps the footer (added

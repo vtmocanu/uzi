@@ -188,12 +188,32 @@ var milestoneList = []apitypes.Milestone{
 	{ID: "m4", Title: "Update the scheduler docs"},
 }
 
+// boardMeters is a representative set of the viewer's own per-token rate-limit meters,
+// mirroring demo.go's SelfMeters: the default "personal" token (ok/warn) and the non-default
+// "meta" token (danger/warn) both show, "unlisted" is readable but hidden, "throttled" is
+// dropped (status != "ok"). Shared by the ux-lab board frame so the strip is exercised (#519).
+func boardMeters() []apitypes.TokenRateLimitDTO {
+	return []apitypes.TokenRateLimitDTO{
+		{SecretID: "sec-personal", Label: "personal", IsDefault: true, Limits: apitypes.RateLimitDTO{
+			Status: "ok", FiveHour: &apitypes.RateLimitWindow{Pct: 35}, SevenDay: &apitypes.RateLimitWindow{Pct: 62}}},
+		{SecretID: "sec-meta", Label: "meta", Limits: apitypes.RateLimitDTO{
+			Status: "ok", FiveHour: &apitypes.RateLimitWindow{Pct: 88}, SevenDay: &apitypes.RateLimitWindow{Pct: 44}}},
+		{SecretID: "sec-unlisted", Label: "unlisted", Limits: apitypes.RateLimitDTO{
+			Status: "ok", FiveHour: &apitypes.RateLimitWindow{Pct: 12}, SevenDay: &apitypes.RateLimitWindow{Pct: 20}}},
+		{SecretID: "sec-throttled", Label: "throttled", Limits: apitypes.RateLimitDTO{Status: "unavailable"}},
+	}
+}
+
 func boardPopulated(dark bool, now time.Time) string {
 	fake := &uzicli.FakeClient{Runs: boardRuns(now)}
 	m := uxModel(fake, "", dark)
 	m = step(m, boardRunsMsg{runs: fake.Runs})
 	// >1 token so the own board clears the credential gate (PRD #295) and the column renders.
 	m = step(m, secretsMsg{count: 2})
+	// The viewer's own rate-limit meters + the sidebar selection so the rate-limit strip renders
+	// under the wordmark (#519).
+	m = step(m, rateLimitsMsg{tokens: boardMeters()})
+	m = step(m, settingsMsg{settings: apitypes.UserSettingsDTO{SidebarTokenIds: []string{"sec-meta"}}})
 	return m.View().Content
 }
 

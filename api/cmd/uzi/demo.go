@@ -118,6 +118,22 @@ func newDemoClient() *uzicli.FakeClient {
 			{ID: "sec-personal", Kind: "anthropic", Label: "personal", IsDefault: true},
 			{ID: "sec-meta", Kind: "anthropic", Label: "meta"},
 		},
+		// The viewer's own per-token meters drive the factory-floor rate-limit strip (PRD #519
+		// F2), mirroring the web sidebar's selection. The default token always shows; the
+		// non-default "meta" shows because it is listed in SidebarTokenIds below; "unlisted" is
+		// readable but NOT shown (default:false and absent from the list), and "throttled" is
+		// dropped entirely (status != "ok"). Percentages land on each tone band (ok/warn/danger).
+		SelfMeters: []apitypes.TokenRateLimitDTO{
+			{SecretID: "sec-personal", Label: "personal", IsDefault: true, Limits: apitypes.RateLimitDTO{
+				Status: "ok", FiveHour: &apitypes.RateLimitWindow{Pct: 35}, SevenDay: &apitypes.RateLimitWindow{Pct: 62}}},
+			{SecretID: "sec-meta", Label: "meta", Limits: apitypes.RateLimitDTO{
+				Status: "ok", FiveHour: &apitypes.RateLimitWindow{Pct: 88}, SevenDay: &apitypes.RateLimitWindow{Pct: 44}}},
+			{SecretID: "sec-unlisted", Label: "unlisted", Limits: apitypes.RateLimitDTO{
+				Status: "ok", FiveHour: &apitypes.RateLimitWindow{Pct: 12}, SevenDay: &apitypes.RateLimitWindow{Pct: 20}}},
+			{SecretID: "sec-throttled", Label: "throttled", Limits: apitypes.RateLimitDTO{Status: "unavailable"}},
+		},
+		// Only "meta" is promoted into the sidebar selection; "unlisted" stays hidden.
+		Settings: apitypes.UserSettingsDTO{SidebarTokenIds: []string{"sec-meta"}},
 		// StreamEvents nil: NewRunStream emits nothing and stays OPEN (so the detail reads
 		// "live"); the ticker above supplies the live frames.
 		StreamEvents: nil,

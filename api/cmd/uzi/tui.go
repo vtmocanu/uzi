@@ -56,6 +56,20 @@ type secretsMsg struct {
 	err   error
 }
 
+// rateLimitsMsg carries the viewer's own per-token rate-limit meters (from SelfRateLimits),
+// which drive the factory-floor rate-limit strip. Fetched at Init and on manual refresh.
+type rateLimitsMsg struct {
+	tokens []apitypes.TokenRateLimitDTO
+	err    error
+}
+
+// settingsMsg carries the viewer's own non-secret settings (from GetMySettings); only
+// SidebarTokenIds is used, to mirror the web sidebar's non-default-token selection.
+type settingsMsg struct {
+	settings apitypes.UserSettingsDTO
+	err      error
+}
+
 type detailLoadedMsg struct {
 	run  apitypes.RunDTO
 	msgs []apitypes.MessageDTO
@@ -130,6 +144,14 @@ type tuiModel struct {
 	// self-gate). Defaults to TrueColor so the first frame and untouched test models
 	// emit links, mirroring the dark:true default.
 	profile colorprofile.Profile
+
+	// rateLimits and sidebarTokenIds drive the factory-floor rate-limit strip
+	// (mirrors the web sidebar selection: default token + sidebar_token_ids,
+	// status=="ok"). Fetched at Init and on manual refresh (r), NOT on the 2s board
+	// tick — a meter changes at most once per server poll, so ticking it would just
+	// double the API load. A fetch failure is swallowed: the strip just hides.
+	rateLimits      []apitypes.TokenRateLimitDTO
+	sidebarTokenIds []string
 }
 
 func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel {
@@ -150,7 +172,8 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 }
 
 func (m tuiModel) Init() tea.Cmd {
-	cmds := []tea.Cmd{m.fetchRunsCmd(m.board.admin), m.fetchSecretsCmd(), tickCmd()}
+	cmds := []tea.Cmd{m.fetchRunsCmd(m.board.admin), m.fetchSecretsCmd(),
+		m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), tickCmd()}
 	if m.view == viewDetail {
 		cmds = append(cmds, m.loadDetailCmd(m.detail.runID), m.openStreamCmd(m.detail.runID))
 	}
@@ -183,6 +206,27 @@ func (m tuiModel) fetchSecretsCmd() tea.Cmd {
 	return func() tea.Msg {
 		secrets, err := c.ListSecrets(ctx)
 		return secretsMsg{count: len(secrets), err: err}
+	}
+}
+
+// fetchRateLimitsCmd reads the viewer's own per-token rate-limit meters so the board can
+// draw the factory-floor rate-limit strip. A failure is swallowed — the strip just hides,
+// and never blocks the board.
+func (m tuiModel) fetchRateLimitsCmd() tea.Cmd {
+	c, ctx := m.client, m.ctx
+	return func() tea.Msg {
+		tokens, err := c.SelfRateLimits(ctx)
+		return rateLimitsMsg{tokens: tokens, err: err}
+	}
+}
+
+// fetchSettingsCmd reads the viewer's own settings so the strip mirrors the web sidebar's
+// non-default-token selection (sidebar_token_ids). Swallowed on failure like the meters.
+func (m tuiModel) fetchSettingsCmd() tea.Cmd {
+	c, ctx := m.client, m.ctx
+	return func() tea.Msg {
+		s, err := c.GetMySettings(ctx)
+		return settingsMsg{settings: s, err: err}
 	}
 }
 
@@ -290,6 +334,18 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case secretsMsg:
 		if msg.err == nil {
 			m.tokenCount = msg.count
+		}
+		return m, nil
+
+	case rateLimitsMsg:
+		if msg.err == nil {
+			m.rateLimits = msg.tokens
+		}
+		return m, nil
+
+	case settingsMsg:
+		if msg.err == nil {
+			m.sidebarTokenIds = msg.settings.SidebarTokenIds
 		}
 		return m, nil
 
