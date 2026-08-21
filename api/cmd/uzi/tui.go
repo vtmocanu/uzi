@@ -158,9 +158,10 @@ type tuiModel struct {
 
 	// rateLimits and sidebarTokenIds drive the factory-floor rate-limit strip
 	// (mirrors the web sidebar selection: default token + sidebar_token_ids,
-	// status=="ok"). Fetched at Init and on manual refresh (r), NOT on the 2s board
-	// tick — a meter changes at most once per server poll, so ticking it would just
-	// double the API load. A fetch failure is swallowed: the strip just hides.
+	// status=="ok"). Fetched at Init, on the 60s strip ticker (stripTickMsg), and on
+	// manual refresh (r) — NOT on the 2s board tick: a meter changes at most once per
+	// ~5m server poll, so 60s already re-serves the same value and the 2s runs cadence
+	// would only multiply the API load. A fetch failure is swallowed: the strip just hides.
 	rateLimits      []apitypes.TokenRateLimitDTO
 	sidebarTokenIds []string
 }
