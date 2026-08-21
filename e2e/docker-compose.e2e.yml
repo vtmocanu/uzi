@@ -99,11 +99,17 @@ services:
       # Give the restart-resilience step head-room to re-queue the orphaned run.
       RUN_MAX_REQUEUES: "3"
       # Heartbeat-stale window: no heartbeat past this ⇒ the worker goes offline and
-      # its non-terminal runs re-queue (the sweeper's worker-loss recovery). Default
-      # matches the base config (45s); the PRD #42 M5 mid-run-kill step tightens it
-      # (E2E_WORKER_HEARTBEAT_STALE=15s + api recreate) so the sweeper-driven requeue
-      # of two in-flight runs is bounded, still well above the 5s heartbeat interval.
+      # its non-terminal runs re-queue (the sweeper's worker-loss recovery). run-e2e.sh
+      # sets E2E_WORKER_HEARTBEAT_STALE=15s in the env-file from BOOT (was tightened
+      # mid-suite via a dedicated api recreate before #100), so the sweeper-driven
+      # requeue in the PRD #42 M5 mid-run-kill step is bounded with no extra recreate,
+      # still 3× the 5s heartbeat interval so a live worker is never spuriously swept.
       WORKER_HEARTBEAT_STALE: ${E2E_WORKER_HEARTBEAT_STALE:-45s}
+      # Run-liveness sweep cadence (PRD #97 M6 / #100): shrunk from the shipped 15s
+      # default so stall/loop detection latency (threshold + one tick) and the #42
+      # worker-loss requeue are bounded by ~2s rather than ~15s. Product knob added in
+      # the same change; unset ⇒ the api's built-in 15s default.
+      SWEEP_INTERVAL: 2s
       # Point the SSRF allowlist + the boot seed at the fake forge.
       FORGE_ALLOWED_BASE_URLS: https://forge-fake.e2e
       # Poll rarely by DEFAULT: the harness drives issues/runs directly, and a long
@@ -119,8 +125,10 @@ services:
       # without a minutes-long wait. The worker's idle window ITSELF is delivered in the
       # claim config from the api's WORKER_CHAT_IDLE_TIMEOUT (chat.go -> ClaimConfig, which
       # the ChatRunner prefers over the agent env), so it MUST be set here, short, for the
-      # worker to idle-complete before this server backstop.
-      WORKER_CHAT_IDLE_TIMEOUT: 20s
+      # worker to idle-complete before this server backstop. Halved 20s -> 10s (#100) to
+      # shave the idle-completion wait; CHAT_IDLE_TIMEOUT (90s) stays well above it so the
+      # worker still completes an idle chat before the server backstop fires.
+      WORKER_CHAT_IDLE_TIMEOUT: 10s
       CHAT_IDLE_TIMEOUT: 90s
       # Deterministic bootstrap (no registration race): seed the admin, the
       # Anthropic token (dummy), and the forge connection + repo at boot. All
@@ -205,10 +213,13 @@ services:
       # recreates the agent to prove two runs execute concurrently.
       WORKER_MAX_CONCURRENT_RUNS: ${UZI_E2E_MAX_CONCURRENT_RUNS:-1}
       # Chat lane (PRD #39): fast turn pickup + a SHORT worker-driven idle window so the
-      # e2e sees idle-completion in seconds instead of the 60m default. 30s (not 8-10s)
-      # leaves headroom so the chat can't idle out during a mid-scenario issue-run step.
+      # e2e sees idle-completion in seconds instead of the 60m default. This agent-side
+      # value is only the FALLBACK — the effective window is the api's claim-config
+      # WORKER_CHAT_IDLE_TIMEOUT (above), which the ChatRunner prefers — but keep the two
+      # in lockstep. Halved 20s -> 10s (#100); still leaves headroom so the chat can't
+      # idle out during a mid-scenario issue-run step (validated via the M9 margin report).
       WORKER_CHAT_POLL_MS: "500"
-      WORKER_CHAT_IDLE_TIMEOUT: 20s
+      WORKER_CHAT_IDLE_TIMEOUT: 10s
     volumes:
       - ${E2E_RUN_DIR}/certs:/certs:ro
       - ${E2E_RUN_DIR}/agent-gitconfig:/e2e-git:ro

@@ -899,6 +899,12 @@ POSTGRES_PASSWORD=$(openssl rand -hex 16)
 JWT_SECRET=$(openssl rand -hex 64)
 UZI_SECRET_KEY=$(openssl rand -base64 32)
 UZI_WORKER_TOKEN=e2e-placeholder-unused
+# Tighten the heartbeat-stale window (default 45s) from BOOT so the sweeper's
+# worker-loss recovery is bounded for the PRD #42 mid-run-kill step without a
+# dedicated mid-suite api recreate. 15s is still 3x the 5s heartbeat interval, so
+# a LIVE worker is never spuriously swept; the overlay's api service reads this
+# via the E2E_WORKER_HEARTBEAT_STALE interpolation default.
+E2E_WORKER_HEARTBEAT_STALE=15s
 EOF
 
 # --- build + bring up the control plane (no worker yet) ----------------------
@@ -4997,14 +5003,9 @@ else
 
   # --- (e) mid-run SIGKILL → sweeper re-queues BOTH (N=2) → restart completes ---
   say "PRD #42: mid-run SIGKILL of the agent with two in-flight runs → sweeper re-queues BOTH → restart completes"
-  # Tighten the heartbeat-stale window so the sweeper's worker-loss recovery is
-  # bounded (15s, still 3× the 5s heartbeat, so a LIVE worker is never spuriously
-  # swept). Recreate the api to pick it up; the worker (cap 2) keeps heartbeating.
-  printf 'E2E_WORKER_HEARTBEAT_STALE=15s\n' >> "$ENVFILE"
-  "${COMPOSE[@]}" up -d --no-deps --force-recreate api >/dev/null
-  wait_http
-  login
-  wait_worker_online
+  # The heartbeat-stale window is already tightened to 15s from BOOT (E2E_WORKER_HEARTBEAT_STALE
+  # in the env-file), so the sweeper's worker-loss recovery is bounded here with no dedicated
+  # api recreate — 15s is still 3× the 5s heartbeat, so a LIVE worker is never spuriously swept.
 
   IID_KA="$(apipost "/api/repos/$REPO_ID/issues" \
     '{"title":"E2E cap2 kill A","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
