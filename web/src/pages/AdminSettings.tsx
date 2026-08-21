@@ -29,6 +29,8 @@ import {
   Skeleton,
 } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
+import { DocLink } from "../components/DocLink";
+import { DOC_ADMIN_SETTINGS } from "../lib/doclinks";
 import { THEMES, THEME_LABELS } from "../lib/theme";
 
 // slackStatusChip renders the live Slack connection state (PRD #25 M2) as a
@@ -398,7 +400,14 @@ export function AdminSettings() {
   ];
 
   return (
-    <AdminShell description="Configuration shared across every user of this uzi instance.">
+    <AdminShell
+      description={
+        <>
+          Configuration shared across every user of this uzi instance. See the{" "}
+          <DocLink slug={DOC_ADMIN_SETTINGS}>admin settings</DocLink> guide.
+        </>
+      }
+    >
       {/* The section index: this tab is eight cards deep, and without an index the
           only way to learn what it holds is to scroll all of it. Quiet pill links,
           not a second tab row — tabs switch content, these just scroll it. */}

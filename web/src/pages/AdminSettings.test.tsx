@@ -136,6 +136,12 @@ describe("AdminSettings — vault migration (PRD #32)", () => {
 });
 
 describe("AdminSettings", () => {
+  it("renders the always-visible admin-settings guide link", async () => {
+    renderPage();
+    const link = await screen.findByRole("link", { name: "admin settings" });
+    expect(link.getAttribute("href")).toBe("/docs/admin-settings");
+  });
+
   it("loads the current labels into the fields", async () => {
     renderPage();
     const prd = (await screen.findByLabelText("PRD label")) as HTMLInputElement;

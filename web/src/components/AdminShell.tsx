@@ -17,7 +17,7 @@ const TABS = [
   { to: "/admin/settings", label: "Instance" },
 ];
 
-export function AdminShell({ description, children }: { description: string; children: ReactNode }) {
+export function AdminShell({ description, children }: { description: ReactNode; children: ReactNode }) {
   return (
     <div className="space-y-6">
       {/* The header description is CONSTANT across tabs, deliberately: the per-tab
