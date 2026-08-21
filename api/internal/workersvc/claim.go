@@ -55,6 +55,13 @@ type ClaimPayload struct {
 	// behaviour. Read from runs.open_mr (a plain bool, false for every non-task run),
 	// so it re-delivers unchanged on every resume like AutoApprove above.
 	OpenMr bool `json:"open_mr"`
+	// Interactive marks a long-lived, conversational task run (PRD #517 M1). When true the
+	// worker keeps the run alive after signal_done — parking it in awaiting_followup to
+	// iterate rather than terminating — until a 'uzi run stop' winds it down. Read from
+	// runs.interactive (a plain bool, false for every non-interactive and non-task run), so
+	// it re-delivers unchanged on every resume like OpenMr above. Additive on the wire — an
+	// old worker ignores the key and keeps its terminating behaviour.
+	Interactive bool `json:"interactive"`
 	// BaseBranch is the source ref a task run was branched from (PRD #400 M2),
 	// meaningful only for kind='task'. It is carried for context/review — the worker
 	// works the pre-seeded, server-named Branch (uzi/task/<run-id>), not this ref —

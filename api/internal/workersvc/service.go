@@ -1993,6 +1993,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// none). Both re-read from the row on every claim, like AutoApprove above.
 		OpenMr:     run.OpenMr,
 		BaseBranch: textPtr(run.BaseBranch),
+		// PRD #517 M1: the interactive opt-in rides every claim (a plain bool, false for
+		// every non-interactive and non-task run), re-read from the row like OpenMr above so
+		// a resumed run re-delivers it unchanged. It tells the worker to keep the run alive
+		// (park in awaiting_followup) after signal_done rather than terminating.
+		Interactive: run.Interactive,
 		// PRD #400 M4a: when set, this task run is a diff-review of that target task, and
 		// the worker (M4b) routes on it. nil for a plain handoff and every non-task run.
 		ReviewTargetRunID: uuidPtr(run.ReviewTargetRunID),

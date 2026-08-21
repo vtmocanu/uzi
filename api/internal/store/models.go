@@ -416,6 +416,7 @@ type Run struct {
 	PreservedPatch        pgtype.Text        `json:"preserved_patch"`
 	RequiredCapabilities  []string           `json:"required_capabilities"`
 	StopReason            pgtype.Text        `json:"stop_reason"`
+	Interactive           bool               `json:"interactive"`
 }
 
 type RunMessage struct {

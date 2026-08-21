@@ -111,6 +111,11 @@ type RunDTO struct {
 	// non-task run — a plain handoff produces commits on the branch, not an MR).
 	BaseBranch *string `json:"base_branch"`
 	OpenMr     bool    `json:"open_mr"`
+	// Interactive marks a long-lived, conversational task run (PRD #517 M1): the worker
+	// keeps it alive (parking in awaiting_followup) after signal_done rather than
+	// terminating. Set at create from --interactive; false by default and for every
+	// non-task run. Always on the wire, like OpenMr above.
+	Interactive bool `json:"interactive"`
 	// DispatchedAt is when the CLI stamped a task run's dispatch gate (PRD #400
 	// Decision 6) — the moment it became claimable, after its uzi/task/<id> branch was
 	// seeded. Null on every non-task run and on a task run not yet dispatched. Mapped

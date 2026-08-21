@@ -369,6 +369,7 @@ func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
 		Branch:      textPtrValue(r.Branch.Valid, r.Branch.String),
 		BaseBranch:  textPtrValue(r.BaseBranch.Valid, r.BaseBranch.String),
 		OpenMr:      r.OpenMr,
+		Interactive: r.Interactive,
 		// PRD #400 Decision 6: when the task run's dispatch gate was stamped (null until
 		// then, and on every non-task run). Mapped like ClaimedAt.
 		DispatchedAt:  timePtr(r.DispatchedAt.Valid, r.DispatchedAt.Time),
@@ -906,6 +907,10 @@ type CreateTaskRunRequest struct {
 	Context    string `json:"context"`
 	BaseBranch string `json:"base_branch"`
 	OpenMr     bool   `json:"open_mr"`
+	// Interactive asks that the worker keep the run alive after signal_done (--interactive,
+	// PRD #517 M1), parking it in awaiting_followup to iterate conversationally rather than
+	// terminating; wound down with 'uzi run stop'. Defaults false (a plain handoff).
+	Interactive bool `json:"interactive"`
 	// ReviewRequested asks that a diff-review run be auto-created when this task completes
 	// (--review, PRD #400 M4a): the review clones the finished branch, diffs it, and posts
 	// structured findings the CLI fetches. Defaults false (a plain handoff).
@@ -936,7 +941,7 @@ func (h *Handler) CreateTaskRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "context is required")
 		return
 	}
-	run, err := h.wsvc.CreateTaskRun(r.Context(), user.ID, repo.ID, req.Context, req.BaseBranch, req.OpenMr, req.ReviewRequested, req.ThenFixRequested)
+	run, err := h.wsvc.CreateTaskRun(r.Context(), user.ID, repo.ID, req.Context, req.BaseBranch, req.OpenMr, req.ReviewRequested, req.ThenFixRequested, req.Interactive)
 	if err != nil {
 		h.writeStartRunError(w, r, err)
 		return

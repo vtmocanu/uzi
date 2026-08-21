@@ -94,18 +94,19 @@ type FakeClient struct {
 	// DispatchTaskRunErr win over the blanket Err so a test can model a create 422 or
 	// a dispatch 404 on the specific verb while the capture still proves it was
 	// reached.
-	CreatedTaskRun           apitypes.RunDTO
-	LastCreateTaskRepoID     string
-	LastCreateTaskContext    string
-	LastCreateTaskBaseBranch string
-	LastCreateTaskOpenMr     bool
-	LastCreateTaskReview     bool
-	LastCreateTaskThenFix    bool
-	CreateTaskRunErr         error
-	DispatchedRun            apitypes.RunDTO
-	LastDispatchRunID        string
-	DispatchTaskRunErr       error
-	TaskCalls                []string
+	CreatedTaskRun            apitypes.RunDTO
+	LastCreateTaskRepoID      string
+	LastCreateTaskContext     string
+	LastCreateTaskBaseBranch  string
+	LastCreateTaskOpenMr      bool
+	LastCreateTaskInteractive bool
+	LastCreateTaskReview      bool
+	LastCreateTaskThenFix     bool
+	CreateTaskRunErr          error
+	DispatchedRun             apitypes.RunDTO
+	LastDispatchRunID         string
+	DispatchTaskRunErr        error
+	TaskCalls                 []string
 
 	// GetTaskReview capture (PRD #400 M4a). TaskReview is the canned reply (nil ⇒ the
 	// task has no review yet); GetTaskReviewErr wins over Err so a 404 can be modelled on
@@ -608,11 +609,12 @@ func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64,
 // refusal still proves the write was reached; CreateTaskRunErr wins over Err so a
 // 422 can be modelled on this verb alone. It appends "create" to TaskCalls so the
 // create → push → dispatch ordering is observable.
-func (f *FakeClient) CreateTaskRun(_ context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested, thenFixRequested bool) (apitypes.RunDTO, error) {
+func (f *FakeClient) CreateTaskRun(_ context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool) (apitypes.RunDTO, error) {
 	f.LastCreateTaskRepoID = repoID
 	f.LastCreateTaskContext = taskContext
 	f.LastCreateTaskBaseBranch = baseBranch
 	f.LastCreateTaskOpenMr = openMR
+	f.LastCreateTaskInteractive = interactive
 	f.LastCreateTaskReview = reviewRequested
 	f.LastCreateTaskThenFix = thenFixRequested
 	f.TaskCalls = append(f.TaskCalls, "create")
