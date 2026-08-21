@@ -37,6 +37,7 @@ import { RunCredential } from "../components/RunCredential";
 import { stripUnsafeChars } from "../lib/safeText";
 import { formatUptimeSince } from "../lib/formatUptimeSince";
 import { anthropicTokenCount } from "../lib/hasToken";
+import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { lanePaging } from "../lib/boardColumns";
 import { groupRuns, runMatchesQuery } from "../lib/runGroups";
 
@@ -89,7 +90,8 @@ interface RunsData {
   tokenCount: number;
   // PRD #320 M6: re-run the layout's one runs fetch, so an Expedite/undo on a queued
   // row can refresh the priority pill + queue ordering the way RunView's refreshRun
-  // does — the list otherwise loads once with no poll.
+  // does — on top of the 10s visibility-gated background poll (PRD #518) that keeps
+  // the list live without a manual reload.
   reload: () => void;
 }
 
@@ -142,6 +144,24 @@ export function RunsLayout() {
       alive = false;
     };
   }, [load]);
+
+  // Liveness (PRD #518): re-fetch only the volatile runs list every 10s while the
+  // tab is visible (catching up immediately on focus), so runs moving queued →
+  // running → completed/failed, and new runs appearing, show without a manual
+  // browser refresh — matching Board and Dashboard. A transient poll failure keeps
+  // the last-good rows: unlike the first load, this swallows its error and never
+  // routes through setError/setLoading, so a blip cannot re-flash the skeleton or
+  // pop an error banner. The credential-badge secrets/tokenCount stay mount-only
+  // (they change rarely), so the poll re-fetches api.listRuns() alone.
+  const poll = useCallback(async () => {
+    try {
+      const { runs } = await api.listRuns();
+      setRuns(runs);
+    } catch {
+      // keep the last-good list
+    }
+  }, []);
+  usePollWhileVisible(poll, 10000);
 
   const pastCount = loading ? null : runs.filter((r) => isTerminalRun(r.status)).length;
   const tabs = [
@@ -409,8 +429,9 @@ function RunRow({
 export function RunsList() {
   const { user, vaultUnlocked } = useAuth();
   const isAdmin = !!user?.is_admin;
-  // Issue #256 M3: a 1s tick drives the live duration token on every row; the page
-  // otherwise loads once (no poll), so the token would freeze without this clock.
+  // Issue #256 M3: a 1s tick drives the live duration token on every row; the 10s
+  // data poll (PRD #518) refreshes the rows but does not re-derive the token between
+  // fetches, so it would freeze without this finer clock.
   const now = useNow(1000);
 
   const { runs, loading, error, tokenCount, reload } = useRunsData();
@@ -438,6 +459,27 @@ export function RunsList() {
       alive = false;
     };
   }, [isAdmin]);
+
+  // Liveness (PRD #518): the admin Factory card re-fetches its own volatile lists
+  // (runs + workers) on the same 10s visibility-gated cadence, so other users' runs
+  // and worker online/offline state update live. The hook is called unconditionally
+  // (React rules of hooks); the callback self-gates on isAdmin, mirroring the mount
+  // effect's early return, so no admin endpoint is hit for a normal user. A blip is
+  // swallowed to keep last-good — it must NOT route through setAdminError/
+  // setAdminLoading, or a transient failure would pop the in-card Alert over working
+  // data. This is happy-path setState only, separate from the mount effect's
+  // first-load semantics.
+  const pollAdmin = useCallback(async () => {
+    if (!isAdmin) return;
+    try {
+      const [r, w] = await Promise.all([api.adminListRuns(), api.adminListWorkers()]);
+      setAdminRuns(r.runs);
+      setAdminWorkers(w.workers);
+    } catch {
+      // keep the last-good factory data
+    }
+  }, [isAdmin]);
+  usePollWhileVisible(pollAdmin, 10000);
 
   const active = runs.filter((r) => !isTerminalRun(r.status));
   const past = runs.filter((r) => isTerminalRun(r.status));

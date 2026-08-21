@@ -2,7 +2,7 @@
 
 - **Issue**: [#518](https://github.com/vtmocanu/uzi/issues/518)
 - **Priority**: Medium
-- **Status**: Draft — ready for implementation
+- **Status**: Done — shipped on `agent/issue-518`
 
 > **Self-contained for an offline worker.** This is a frontend-only change confined to `web/`. Every fact it relies on is a codebase read (file:line references below resolve in the repo clone); no milestone needs open-web access, external API semantics, or a docs lookup. The mechanism reuses an existing, already-tested primitive (`usePollWhileVisible`).
 
@@ -53,9 +53,9 @@ All changes are in `web/src/pages/RunsList.tsx` plus its test `web/src/pages/Run
 
 ## Milestones
 
-- [ ] **M1 — Personal runs list (Active + Past) live-updates.** `RunsLayout` re-fetches `api.listRuns()` every 10s while the tab is visible via `usePollWhileVisible`, catches up immediately on tab focus, and both the Active and Past-runs tabs reflect run state changes (`queued → running → completed/failed`, new runs appearing, terminal runs moving to Past) with no manual browser refresh. A transient poll failure keeps the last-good list (no skeleton re-flash, no error banner over working data). The initial load and the Expedite/undo `reload` are unchanged.
-- [ ] **M2 — Admin Factory Status card live-updates.** The admin-only Factory card re-fetches `adminListRuns()` + `adminListWorkers()` on the same 10s visibility-gated cadence, so other users' runs and worker online/offline state update live; a poll blip keeps last-good. Non-admin users are unaffected.
-- [ ] **M3 — Tests green and stale comments fixed.** `RunsList.test.tsx` gains coverage (modelled on `Dashboard.test.tsx:226-245`, using `vi.useFakeTimers()` + `vi.advanceTimersByTimeAsync(10000)`) proving: (a) the poll fires at 10s and re-renders updated run state; (b) a failed re-poll preserves last-good data and does not blank to skeleton or show an error banner; (c) the admin card polls when admin. The two stale "loads once / no poll" comments are corrected. `task gate:web` passes (deps-check + lint + deadcode + check-docs + typecheck + test).
+- [x] **M1 — Personal runs list (Active + Past) live-updates.** `RunsLayout` re-fetches `api.listRuns()` every 10s while the tab is visible via `usePollWhileVisible`, catches up immediately on tab focus, and both the Active and Past-runs tabs reflect run state changes (`queued → running → completed/failed`, new runs appearing, terminal runs moving to Past) with no manual browser refresh. A transient poll failure keeps the last-good list (no skeleton re-flash, no error banner over working data). The initial load and the Expedite/undo `reload` are unchanged.
+- [x] **M2 — Admin Factory Status card live-updates.** The admin-only Factory card re-fetches `adminListRuns()` + `adminListWorkers()` on the same 10s visibility-gated cadence, so other users' runs and worker online/offline state update live; a poll blip keeps last-good. Non-admin users are unaffected.
+- [x] **M3 — Tests green and stale comments fixed.** `RunsList.test.tsx` gains coverage (modelled on `Dashboard.test.tsx:226-245`, using `vi.useFakeTimers()` + `vi.advanceTimersByTimeAsync(10000)`) proving: (a) the poll fires at 10s and re-renders updated run state; (b) a failed re-poll preserves last-good data and does not blank to skeleton or show an error banner; (c) the admin card polls when admin. The two stale "loads once / no poll" comments are corrected. `task gate:web` passes (deps-check + lint + deadcode + check-docs + typecheck + test).
 
   **Test-setup gotchas for the offline worker (verified against the current test file):**
   - **Restore real timers.** `RunsList.test.tsx`'s `afterEach` (~`:156-159`) does only `cleanup(); vi.clearAllMocks();` — it does **not** call `vi.useRealTimers()` (unlike `Dashboard.test.tsx` `:190`). The file has ~40 existing tests using real-timer `waitFor(...)`; a new `vi.useFakeTimers()` test that does not restore real timers will leak fake timers into them and hang their `waitFor`. Add `vi.useRealTimers()` to `afterEach` (or restore per-test).

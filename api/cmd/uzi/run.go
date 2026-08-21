@@ -471,10 +471,14 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 				return err
 			}
 			msg, _ := cmd.Flags().GetString("message")
+			msg = resolveMessage(env, msg)
+			if strings.TrimSpace(msg) == "" {
+				return uzicli.Exitf(uzicli.ExitUsage, "a rejection needs a reason: pass -m <reason> or pipe it on stdin")
+			}
 			return submitInput(env, gf, c, cmd, args[0], kindRejectPlan, msg, nil)
 		},
 	}
-	reject.Flags().StringP("message", "m", "", "reason to send back to the agent (optional)")
+	reject.Flags().StringP("message", "m", "", "reason to send back to the agent (or pipe it on stdin)")
 
 	cancel := &cobra.Command{
 		Use:   "cancel <run-id>",
@@ -485,9 +489,13 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return submitInput(env, gf, c, cmd, args[0], kindCancel, "", nil)
+			// PRD #503 M3: the cancel reason is OPTIONAL — unlike reject, no empty check.
+			msg, _ := cmd.Flags().GetString("message")
+			msg = resolveMessage(env, msg)
+			return submitInput(env, gf, c, cmd, args[0], kindCancel, msg, nil)
 		},
 	}
+	cancel.Flags().StringP("message", "m", "", "reason for cancelling (optional; or pipe it on stdin)")
 
 	followUp := &cobra.Command{
 		Use:   "follow-up <run-id>",

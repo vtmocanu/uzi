@@ -83,6 +83,22 @@ func TestPreStartInfraFailureSkipsJudge(t *testing.T) {
 	}
 }
 
+// TestLiveCancelledRunNotJudged (PRD #503 M1, REC A regression): after M1 a live-worker
+// cancel routes to a `cancelled` terminal status (not `failed`+`agent_failure`), so Gate 0
+// (maybeEnqueueJudge, judge_enqueue.go:62 — only completed/failed are judged) excludes it.
+// This pins that "cancelled runs are not judged" holds uniformly for the live path now, not
+// just the server-side cancel path. (Also covered by TestEnqueueJudgeGatesBlock's "cancelled
+// status" case; kept here as the named REC A regression.)
+func TestLiveCancelledRunNotJudged(t *testing.T) {
+	fs, svc, run := eligibleFixture(t)
+	run.Status = "cancelled" // what CancelRunByWorker now writes for a live cancel
+	run.IterationCount = 0
+	svc.maybeEnqueueJudge(context.Background(), run)
+	if fs.createdJudgeRun != nil {
+		t.Fatalf("a cancelled run must NOT be enqueued for judging (Gate 0), got %+v", fs.createdJudgeRun)
+	}
+}
+
 // TestAgentFailureAtIterZeroStillJudged (SC3): an agent that started and crashed at
 // iteration 0 carries fail_origin='agent_failure' (the worker-reported default), which
 // is NOT in the pre-start set — so it is still judged.
