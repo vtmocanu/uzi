@@ -46,11 +46,13 @@ func (m tuiModel) linksEnabled() bool { return m.profile >= colorprofile.ANSI }
 // has already confirmed r.IssueIID != nil and built styledIID.
 func (m tuiModel) issueLink(r apitypes.RunDTO, styledIID string) string {
 	if r.IssueWebURL != nil && m.linksEnabled() {
-		// The sanitizeTTY call here is load-bearing for the D7 static guard: the guard
-		// requires the .IssueWebURL field access to sit lexically inside a recognized
-		// sanitizer, and oscLink is not one. oscLink then does its own OSC-8-strict
-		// stripping (control/format runes, incl. \n and \t) on the target.
-		return oscLink(sanitizeTTY(strOr(r.IssueWebURL, "")), styledIID)
+		// oscLink is the sanitizing sink for the URL: it strips every control/format
+		// rune (incl. \n and \t) from the OSC-8 target, which is the real defense here
+		// (with the hostile-URL case in TestTUIViewsStripControlBytesFromUntrustedText).
+		// IssueWebURL stays in d7UntrustedFields as a tripwire for any DIRECT draw of it,
+		// but the D7 AST guard does not gate THIS path — oscLink is not a recognized
+		// writer, so the guard reads the field mention as plumbing either way.
+		return oscLink(strOr(r.IssueWebURL, ""), styledIID)
 	}
 	return styledIID
 }
