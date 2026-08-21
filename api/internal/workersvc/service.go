@@ -4667,6 +4667,29 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		return s.submitAnswer(ctx, run, body)
 	}
 
+	// A graceful `stop` (PRD #517 M4) is the interactive-run wind-down: unlike cancel/
+	// reject_plan it has NO server-side !live transition branch, because only the worker can
+	// finalize it (push + open MR iff open_mr) and report `completed` with stop_kind='stopped'.
+	// So a stop ALWAYS enqueues via CreateStopVerdictInput, stamping stop_kind='stopped' in the
+	// same statement. A live parked/running worker consumes it and finalizes; a dead-worker
+	// parked run is requeued by M2's stale-heartbeat sweep (awaiting_followup is in
+	// RequeueRunsOfStaleWorkers) and honors the pending stop on resume. The terminal guard at
+	// the top of SubmitInput already 409s a stop on a finished run. Never routes through
+	// CancelRunServerSide/RejectRunServerSide.
+	//
+	// stop_reason carries the operator's OPTIONAL message (like a cancel's — a stop reason is
+	// helpful, not mandatory); the same message is co-written to run_user_inputs.body, NUL-
+	// stripped to avoid Postgres 22021 aborting the CTE.
+	if kind == "stop" {
+		cleanBody, _ := stripNUL(body)
+		if _, err := s.q.CreateStopVerdictInput(ctx, store.CreateStopVerdictInputParams{
+			RunID: runID, Kind: kind, Body: pgText(cleanBody), StopKind: pgText(stopKindFor(kind)), StopReason: stopReasonParam(body),
+		}); err != nil {
+			return SubmitInputResult{}, err
+		}
+		return SubmitInputResult{ServerSide: false}, nil
+	}
+
 	if kind == "cancel" || kind == "reject_plan" {
 		live, err := s.hasLivePoller(ctx, run)
 		if err != nil {
@@ -4939,16 +4962,18 @@ func orEmpty(v []string) []string {
 }
 
 // stopKindFor maps a deliberate-stop steering kind to the stop signal stamped on the
-// run (PRD #33): a cancel verdict is 'cancelled', a plan reject is 'plan_rejected'.
-// Only cancel/reject_plan reach it (the stop-verdict branch of SubmitInput); the
-// server owns this mapping so the signal never depends on the reason string the
-// worker later reports.
+// run (PRD #33): a cancel verdict is 'cancelled', a plan reject is 'plan_rejected', a
+// graceful interactive wind-down (PRD #517 M4) is 'stopped'. Only cancel/reject_plan/
+// stop reach it (the stop-verdict branches of SubmitInput); the server owns this mapping
+// so the signal never depends on the reason string the worker later reports.
 func stopKindFor(kind string) string {
 	switch kind {
 	case "cancel":
 		return "cancelled"
 	case "reject_plan":
 		return "plan_rejected"
+	case "stop":
+		return "stopped"
 	default:
 		return ""
 	}

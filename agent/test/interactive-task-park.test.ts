@@ -318,6 +318,38 @@ describe("SdkExecutor interactive task park (PRD #517 M3)", () => {
     assert.strictEqual(turns.length, 2, "plan + one loop turn; no turn ran after the cancel");
   });
 
+  it("finalizes gracefully (completed, no throw) when a parked run is stopped", async () => {
+    // PRD #517 M4: a graceful `stop` is a CLEAN completion, not an abort. `{ended,
+    // reason:"stopped"}` shares the idle break — push + open MR iff open_mr → report
+    // `completed` — and must NOT throw the cancel signal (unlike `cancelled`). The server
+    // pre-stamped stop_kind='stopped' and SetRunCompleted preserves it, so the run lands
+    // completed-with-stopped and fires --review iff requested. Mutation: route `stopped`
+    // to the cancel-signal throw (as `cancelled` does) → run() REJECTS instead of returning
+    // the branch, reddening the assert below.
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [assistantText("t1"), signalDone(), resultSuccess()], // loop 1 → done → park → stopped
+    ]);
+    let checkpointCalls = 0;
+    const { ctx } = makeCtx({
+      interactive: true,
+      checkpoint: async () => {
+        checkpointCalls++;
+      },
+      awaitFollowUp: async () => ({ kind: "ended", reason: "stopped" }),
+    });
+
+    const result = await new SdkExecutor(nullLogger(), sdkHome, { queryFn }).run(ctx);
+    assert.strictEqual(
+      result.branch,
+      "agent/issue-5",
+      "a stopped park finalizes as a completed result (push + MR), never throws",
+    );
+    // The run parked (checkpoint-pushed) before the stop, and no follow-up turn ran after.
+    assert.strictEqual(checkpointCalls, 1, "the run parked (checkpoint-pushed) before the stop");
+    assert.strictEqual(turns.length, 2, "plan + one loop turn; no turn ran after the stop");
+  });
+
   it("resets the WALL budget for each follow-up so summed in-turn time does not trip REASON_WALL", async () => {
     // Fix 2: each follow-up is a fresh task with a fresh wall budget (bounded per-follow-up,
     // not per-conversation). Budget is 300ms and every turn burns 60ms of real in-turn time.
@@ -492,6 +524,46 @@ describe("SteeringChannel.awaitFollowUp (PRD #517 M3)", () => {
     const outcome = await ch.awaitFollowUp(60_000);
     assert.deepStrictEqual(outcome, { kind: "ended", reason: "cancelled" });
     assert.strictEqual(cancel.signal.aborted, true);
+    await ch.stop();
+  });
+
+  it("ends the park with reason stopped, AHEAD of a buffered follow-up (stop precedence)", async () => {
+    // PRD #517 M4 Decision 5: an explicit `stop` wins over a QUEUED follow-up. The batch
+    // carries BOTH — the follow-up first — so routing buffers the follow-up AND sets the
+    // sticky stop flag; awaitFollowUp's drain-after-arm must return `stopped`, not the
+    // follow-up. Mutation: check `this.followUps.length` before `this.stopRequested` in
+    // awaitFollowUp → this returns { kind:"followup", body:"queued task" } and reddens.
+    const ch = new SteeringChannel(
+      fakeClient([[inp("follow_up", "queued task"), inp("stop", "wind down")]]),
+      "run-1",
+      1,
+      nullLogger(),
+      new AbortController(),
+    );
+    ch.start();
+    await tick(); // poll routes BOTH the follow-up and the stop before we park
+    const outcome = await ch.awaitFollowUp(60_000);
+    assert.deepStrictEqual(outcome, { kind: "ended", reason: "stopped" });
+    await ch.stop();
+  });
+
+  it("ends an ALREADY-PARKED waiter with reason stopped when a stop arrives (serviceFollowUp)", async () => {
+    // The post-arm service path (park first, stop later), also AHEAD of a follow-up in the
+    // same batch. awaitFollowUp is called synchronously after start() — before the first
+    // poll routes — so it ARMS the waiter; the poll then routes [follow_up, stop] and
+    // serviceFollowUp resolves it. Mutation: check `this.followUps.length` before
+    // `this.stopRequested` in serviceFollowUp → resolves { kind:"followup" } instead.
+    const ch = new SteeringChannel(
+      fakeClient([[inp("follow_up", "queued task"), inp("stop")]]),
+      "run-1",
+      1,
+      nullLogger(),
+      new AbortController(),
+    );
+    ch.start();
+    const parked = ch.awaitFollowUp(60_000); // arm BEFORE the first poll routes anything
+    const outcome = await parked;
+    assert.deepStrictEqual(outcome, { kind: "ended", reason: "stopped" });
     await ch.stop();
   });
 });

@@ -1550,12 +1550,15 @@ export class SdkExecutor implements Executor {
               // stamped stop_kind='cancelled' to CancelRunByWorker.
               throw new Error(REASON_CANCELLED);
             }
-            // outcome.reason === "idle" (the real M3 end: no follow-up arrived within the idle
-            // bound) → finalize normally via the break below; M5 refines the idle value + adds
-            // a server backstop. outcome.reason === "stopped" is the M4 SEAM: serviceFollowUp
-            // never emits it in M3, so for now it shares the idle break. M4 will make `stop` a
-            // GRACEFUL stop stamping stop_kind='stopped' — a distinct disposition from cancel,
-            // so `stopped` must NOT throw the cancel signal here.
+            // outcome.reason === "idle" (no follow-up arrived within the idle bound) and
+            // outcome.reason === "stopped" (PRD #517 M4: a graceful `uzi run stop` — the
+            // steering `stop` input the poll loop consumed and routed) BOTH finalize normally
+            // via the break below: push + open MR iff open_mr → report `completed`. The server
+            // pre-stamped stop_kind='stopped' on the run (SubmitInput's stop branch); SetRun-
+            // Completed does NOT clear it, so the completion lands with stop_kind='stopped' and
+            // fires --review iff requested. A `stopped` disposition must NOT throw the cancel
+            // signal (unlike `cancelled` above) — a graceful stop is a clean completion, not an
+            // abort. Named explicitly so the three ended-reasons are exhaustively handled.
           }
           break;
         }

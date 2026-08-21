@@ -30,6 +30,7 @@ const (
 	kindFollowUp    = "follow_up"
 	kindRevisePlan  = "revise_plan"
 	kindAnswer      = "answer"
+	kindStop        = "stop"
 )
 
 // agentSources are the two rosters a plan approval may draw its subagents from
@@ -497,6 +498,29 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 	cancel.Flags().StringP("message", "m", "", "reason for cancelling (optional; or pipe it on stdin)")
 
+	stop := &cobra.Command{
+		Use:   "stop <run-id>",
+		Short: "Gracefully stop an interactive run (finalize: push, open MR if requested)",
+		Long: "Gracefully wind down an interactive task run (PRD #517). Unlike `cancel`, which " +
+			"aborts mid-turn, `stop` lets the worker FINALIZE: it finishes the current turn, " +
+			"pushes the branch, opens the merge request (when the run requested one), and reports " +
+			"`completed`. The stop is serviced ahead of any buffered follow-up.\n\n" +
+			"An optional message can accompany the stop (pass -m or pipe it on stdin). A stop on a " +
+			"run that has already finished answers 409 (exit 5).",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			// The stop message is OPTIONAL, like a cancel reason — no empty check.
+			msg, _ := cmd.Flags().GetString("message")
+			msg = resolveMessage(env, msg)
+			return submitInput(env, gf, c, cmd, args[0], kindStop, msg, nil)
+		},
+	}
+	stop.Flags().StringP("message", "m", "", "an optional message to accompany the stop (or pipe it on stdin)")
+
 	followUp := &cobra.Command{
 		Use:   "follow-up <run-id>",
 		Short: "Send a follow-up message to a run",
@@ -683,7 +707,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 	expedite.Flags().Bool("clear", false, "clear the manual expedite (undo), returning the run to its kind default priority")
 
-	cmd.AddCommand(list, get, logs, wait, review, create, approve, reject, revise, cancel, followUp, answer, inputs, expedite)
+	cmd.AddCommand(list, get, logs, wait, review, create, approve, reject, revise, cancel, stop, followUp, answer, inputs, expedite)
 	return cmd
 }
 
@@ -1034,6 +1058,10 @@ func inputOutcome(kind string, serverSide bool) string {
 			return "run cancelled"
 		}
 		return "cancellation sent"
+	case kindStop:
+		// A stop always enqueues (never a server-side transition), so serverSide is always
+		// false here — the worker finalizes the graceful wind-down.
+		return "stop sent"
 	case kindFollowUp:
 		return "follow-up sent"
 	case kindRevisePlan:

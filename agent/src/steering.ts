@@ -122,6 +122,11 @@ export class SteeringChannel {
   private bufferedVerdict: { verdict: PlanVerdict; epoch: number } | undefined;
   /** Cancel is sticky and epoch-exempt: once seen it always wins, at any epoch. */
   private cancelled = false;
+  /** PRD #517 M4: a graceful `stop` is sticky. Once seen it ends an interactive park with
+   *  { kind:"ended", reason:"stopped" }, serviced AHEAD of a buffered follow-up (an explicit
+   *  stop wins over a queued turn). DISTINCT from `this.stopped` (~:112), which means "the
+   *  poll loop should stop" — reusing that would kill the poll loop before the park resolves. */
+  private stopRequested = false;
   /** FIFO queue of revision feedback (PRD #41), each stamped with its arrival epoch. */
   private readonly reviseQueue: { feedback: string; epoch: number }[] = [];
   /** The gate waiter parked on awaitGateEvent, with the epoch it is waiting for. */
@@ -317,9 +322,14 @@ export class SteeringChannel {
         kind: "ended",
         reason: "cancelled",
       });
-    // SEAM (M4): a `stop` input, once wired, resolves { kind:"ended", reason:"stopped" } and
-    // is serviced AHEAD of a buffered follow-up (an explicit stop wins over a queued turn).
-    // Its check belongs HERE — before the drain below — and in serviceFollowUp.
+    // PRD #517 M4: a `stop` input resolves { kind:"ended", reason:"stopped" } and is serviced
+    // AHEAD of a buffered follow-up (an explicit stop wins over a queued turn, Decision 5).
+    // Precedence: cancelled (above) → stop (here) → buffered follow-up → idle.
+    if (this.stopRequested)
+      return Promise.resolve<FollowUpOutcome>({
+        kind: "ended",
+        reason: "stopped",
+      });
     if (this.followUps.length)
       return Promise.resolve<FollowUpOutcome>({
         kind: "followup",
@@ -331,11 +341,11 @@ export class SteeringChannel {
   }
 
   /** After routing an input batch, deliver to a parked follow-up waiter if one is now due
-   *  (PRD #517 M3). Precedence: a cancel ends it (`cancelled`); [SEAM M4: a pending `stop`
-   *  input ends it with reason "stopped" AHEAD of the follow-up drain below]; then a buffered
-   *  follow-up; then idle once `idleMs` has elapsed since it armed. Same route-THEN-service
-   *  discipline as serviceGate / serviceAnswer / ChatSteering.serviceWaiter — resolving from
-   *  here (post-route) is what guarantees a delivered follow-up was already consumed. */
+   *  (PRD #517 M3). Precedence: a cancel ends it (`cancelled`); a pending `stop` ends it with
+   *  reason "stopped" AHEAD of the follow-up drain below (PRD #517 M4, Decision 5); then a
+   *  buffered follow-up; then idle once `idleMs` has elapsed since it armed. Same route-THEN-
+   *  service discipline as serviceGate / serviceAnswer / ChatSteering.serviceWaiter — resolving
+   *  from here (post-route) is what guarantees a delivered follow-up was already consumed. */
   private serviceFollowUp(): void {
     const w = this.followUpWaiter;
     if (!w) return;
@@ -344,8 +354,14 @@ export class SteeringChannel {
       w.resolve({ kind: "ended", reason: "cancelled" });
       return;
     }
-    // SEAM (M4): resolve { kind:"ended", reason:"stopped" } here — BEFORE the follow-up
+    // PRD #517 M4: resolve { kind:"ended", reason:"stopped" } here — BEFORE the follow-up
     // drain — when a `stop` input is pending, so an explicit stop wins over a queued turn.
+    // Precedence: cancelled (above) → stop (here) → buffered follow-up → idle.
+    if (this.stopRequested) {
+      this.followUpWaiter = undefined;
+      w.resolve({ kind: "ended", reason: "stopped" });
+      return;
+    }
     if (this.followUps.length) {
       this.followUpWaiter = undefined;
       w.resolve({ kind: "followup", body: this.followUps.shift()! });
@@ -428,6 +444,14 @@ export class SteeringChannel {
       case "cancel":
         if (!this.cancel.signal.aborted) this.cancel.abort();
         this.cancelled = true;
+        break;
+      case "stop":
+        // PRD #517 M4: a graceful wind-down of an interactive task. Sticky, like cancel, but
+        // it does NOT abort ctx.signal — the current turn finishes and the park resolves
+        // { kind:"ended", reason:"stopped" }, which sdk-executor finalizes normally (push +
+        // MR iff open_mr → completed). serviceFollowUp/awaitFollowUp check this AHEAD of the
+        // follow-up drain so an explicit stop beats a queued follow-up (Decision 5).
+        this.stopRequested = true;
         break;
       case "follow_up":
         if (body && body.trim()) this.followUps.push(body.trim());

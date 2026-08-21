@@ -2423,6 +2423,111 @@ func TestSubmitInputRejectServerSideWhenWorkerStale(t *testing.T) {
 	}
 }
 
+// TestSubmitInputStopEnqueuesOnParkedRun: PRD #517 M4 — a graceful `stop` on a parked
+// interactive run (awaiting_followup, live worker) ALWAYS enqueues via the dedicated
+// CreateStopVerdictInput CTE, stamping stop_kind='stopped', and NEVER transitions the run
+// server-side. The worker consumes it and finalizes (push + MR iff open_mr → completed).
+//
+// MUTATION PROOF: route `stop` through CancelRunServerSide / RejectRunServerSide (or the
+// plain CreateRunInput path) and fs.createdStopVerdict is nil / fs.cancelled|rejected is
+// set — every assertion below flips.
+func TestSubmitInputStopEnqueuesOnParkedRun(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	wkrID := uuid.New()
+	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	fs := &fakeStore{
+		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Status: "awaiting_followup", WorkerID: pgUUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)}, // fresh
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.now = func() time.Time { return fixed }
+
+	res, err := svc.SubmitInput(context.Background(), user, runID, "stop", "wind down please", nil)
+	if err != nil {
+		t.Fatalf("SubmitInput(stop): %v", err)
+	}
+	if res.ServerSide {
+		t.Fatal("a stop must ALWAYS enqueue (worker-finalized), never transition server-side")
+	}
+	if fs.createdStopVerdict == nil || fs.createdStopVerdict.Kind != "stop" {
+		t.Fatalf("stop verdict not enqueued: %+v", fs.createdStopVerdict)
+	}
+	if !fs.createdStopVerdict.StopKind.Valid || fs.createdStopVerdict.StopKind.String != "stopped" {
+		t.Fatalf("stop must stamp stop_kind 'stopped', got %+v", fs.createdStopVerdict.StopKind)
+	}
+	if fs.createdInput != nil {
+		t.Fatal("a stop verdict must not use the plain CreateRunInput path")
+	}
+	if fs.cancelled != nil || fs.rejected != nil {
+		t.Fatal("a stop must never reach CancelRunServerSide/RejectRunServerSide")
+	}
+}
+
+// TestSubmitInputStopEnqueuesEvenWithoutLivePoller: the design's core distinction from
+// cancel — a stop has NO server-side !live branch. A parked run whose worker is STALE
+// still enqueues the stop (M2's stale-heartbeat sweep requeues the park; it honors the
+// pending stop on resume). This is what would break if someone copied cancel's
+// hasLivePoller branch onto stop.
+func TestSubmitInputStopEnqueuesEvenWithoutLivePoller(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	wkrID := uuid.New()
+	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	fs := &fakeStore{
+		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Status: "awaiting_followup", WorkerID: pgUUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed.Add(-2 * time.Minute))}, // stale
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.now = func() time.Time { return fixed }
+
+	res, err := svc.SubmitInput(context.Background(), user, runID, "stop", "", nil)
+	if err != nil {
+		t.Fatalf("SubmitInput(stop): %v", err)
+	}
+	if res.ServerSide {
+		t.Fatal("a stop must enqueue even with a stale worker — it has no server-side transition branch")
+	}
+	if fs.createdStopVerdict == nil || fs.createdStopVerdict.StopKind.String != "stopped" {
+		t.Fatalf("stop against a stale worker must still enqueue with stop_kind 'stopped', got %+v", fs.createdStopVerdict)
+	}
+	if fs.cancelled != nil || fs.rejected != nil {
+		t.Fatal("a stop must never reach CancelRunServerSide/RejectRunServerSide, even with a dead worker")
+	}
+}
+
+// TestSubmitInputStopForeignUserRejected: owner-scoping — a stop from a non-owner is a
+// 404 (ErrRunNotFound, via GetRun), so nothing is enqueued.
+func TestSubmitInputStopForeignUserRejected(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	fs := &fakeStore{runByIDErr: pgx.ErrNoRows} // GetRunByIDForUser finds no row for this user
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "stop", "", nil); err != ErrRunNotFound {
+		t.Fatalf("a foreign-user stop must return ErrRunNotFound, got %v", err)
+	}
+	if fs.createdStopVerdict != nil {
+		t.Fatal("no stop verdict may be enqueued for a run the caller does not own")
+	}
+}
+
+// TestSubmitInputStopRejectsTerminalRun: the terminal guard already 409s a stop on a
+// finished run (ErrRunTerminal → 409), before any row is written.
+func TestSubmitInputStopRejectsTerminalRun(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: user, Kind: RunKindTask, Status: "completed"}}
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "stop", "", nil); err != ErrRunTerminal {
+		t.Fatalf("a stop on a terminal run must return ErrRunTerminal, got %v", err)
+	}
+	if fs.createdStopVerdict != nil {
+		t.Fatal("no stop verdict may be enqueued on a terminal run")
+	}
+}
+
 func TestSubmitInputFollowUpAlwaysEnqueues(t *testing.T) {
 	user := uuid.New()
 	runID := uuid.New()

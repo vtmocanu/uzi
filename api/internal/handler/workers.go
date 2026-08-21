@@ -101,7 +101,7 @@ const maxWorkerNameBytes = 200
 // runInputKinds is the accepted steering-input set (mirrors the DB CHECK).
 var runInputKinds = map[string]bool{
 	"follow_up": true, "approve_plan": true, "reject_plan": true, "cancel": true, "revise_plan": true,
-	"answer": true,
+	"answer": true, "stop": true,
 }
 
 // -------------------------------------------------------------------------
@@ -1224,7 +1224,7 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !runInputKinds[req.Kind] {
-		httpx.Error(w, http.StatusBadRequest, "kind must be one of follow_up, approve_plan, reject_plan, cancel, revise_plan, answer")
+		httpx.Error(w, http.StatusBadRequest, "kind must be one of follow_up, approve_plan, reject_plan, cancel, revise_plan, answer, stop")
 		return
 	}
 

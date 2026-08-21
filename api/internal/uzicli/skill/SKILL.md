@@ -146,6 +146,7 @@ uzi run approve <run-id> [--agent-source own|repo] [--exclude-agents <a,b>]
 uzi run reject <run-id> [--message <text>]
 uzi run revise <run-id> [--message <text>]
 uzi run cancel <run-id>
+uzi run stop <run-id> [--message <text>]
 uzi run follow-up <run-id> [--message <text>]
 uzi run answer <run-id> [--message <text>]
 uzi run inputs <run-id>
@@ -387,6 +388,7 @@ uzi version
   limit; once it is exhausted — or the run has already finished — the server answers
   409 (exit 5).
 - `uzi run cancel <run-id>` — cancel a run.
+- `uzi run stop <run-id>` — gracefully stop an interactive run (finalize + optional MR).
 - `uzi run follow-up <run-id> [--message <text>]` — send a follow-up message. The
   message can also be piped on stdin instead of `--message`.
 - `uzi run answer <run-id> [--message <text>]` — answer the clarifying question a

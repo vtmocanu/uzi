@@ -144,7 +144,10 @@ export type InputKind =
   | "reject_plan"
   | "cancel"
   | "revise_plan"
-  | "answer";
+  | "answer"
+  // PRD #517 M4: the graceful interactive wind-down. Consumed by the steering poll and
+  // routed to SteeringChannel.route("stop"), which sets the sticky stop flag.
+  | "stop";
 
 /** One question in an ask_user call (PRD #88 M1), mirroring the local
  *  AskUserQuestion tool's shape so the model has a familiar contract and the UI can
