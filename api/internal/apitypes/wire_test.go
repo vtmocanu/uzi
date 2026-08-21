@@ -474,7 +474,13 @@ func TestRepoDTOTags(t *testing.T) {
 		"guardrail_override",
 		// PRD #66 M9 (D8): the server-computed "would a run be refused now" bool the
 		// web reads for the badge STATE (override already applied, single Go rule).
-		"guardrail_blocked")
+		"guardrail_blocked",
+		// PRD #361 M1: the computed, caller-scoped "is this repo on the global Docker-
+		// worker allowlist" bool. Never the list itself.
+		"docker_allowlisted",
+		// PRD #361 M3: the computed, caller-scoped "is a run on this repo actually
+		// blocked by the Docker-allowlist gap right now" bool, from eligibility directly.
+		"docker_blocked")
 }
 
 func TestGuardrailOverrideDTOTags(t *testing.T) {

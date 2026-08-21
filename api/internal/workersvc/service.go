@@ -426,6 +426,11 @@ type Store interface {
 	SetRunHealth(ctx context.Context, arg store.SetRunHealthParams) (int64, error)
 	CountOnlineWorkersForUser(ctx context.Context, userID uuid.UUID) (int64, error)
 	CountOnlineWorkersWithFreeSlotForUser(ctx context.Context, userID uuid.UUID) (int64, error)
+	// CountOnlineEligibleWorkersForRepo backs PRD #361's queued Docker-allowlist reason:
+	// how many of the caller's online workers fn_worker_can_claim accepts for this
+	// repo/kind, ignoring free slots. A result of 0 with online workers present means the
+	// repo is unrunnable without allowlisting (an all-Docker fleet, repo not allowlisted).
+	CountOnlineEligibleWorkersForRepo(ctx context.Context, arg store.CountOnlineEligibleWorkersForRepoParams) (int64, error)
 	// RunHasVerdictSinceGateOpened backs issue #182: an awaiting_approval run whose
 	// owner already answered THIS gate reports waiting_worker rather than
 	// approval_idle. A per-run lookup like ListRunToolWindow above, and for the same

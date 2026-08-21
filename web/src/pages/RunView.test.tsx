@@ -1933,6 +1933,8 @@ describe("JudgePanel (PRD #46 M4)", () => {
       repo_devbox_opt_in: false,
       pipeline: null,
       guardrail_blocked: false,
+      docker_allowlisted: false,
+      docker_blocked: false,
     };
   }
   function draftFixture(over: Partial<IssueDraft> = {}): IssueDraft {

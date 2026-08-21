@@ -543,10 +543,49 @@ func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
 	// The badge STATE (PRD #66 M9) comes from this connection's stored report, run
 	// through the single shared downgrade — parsed once for the whole page.
 	report := parsePrivilegeReport(conn.PrivilegeReport, conn.ID)
+	// PRD #361: read the Docker-worker allowlist once per request. M1's per-repo
+	// docker_allowlisted flag membership-tests it; M3's docker_blocked reuses it to ask
+	// the DB which of the caller's repos a Docker-allowlist gap is actively blocking. The
+	// list itself is never sent — both fields are booleans about the caller's own repos.
+	var allowlist []uuid.UUID
+	allowlistOK := false
+	if al, err := h.settings.DockerRepoAllowlist(r.Context()); err != nil {
+		// Non-fatal: the chip is enrichment. Degrade to "not allowlisted" (false).
+		slog.Warn("list projects: docker allowlist", "error", err)
+	} else {
+		allowlist = al
+		allowlistOK = true
+	}
+	allowSet := map[uuid.UUID]bool{}
+	for _, id := range allowlist {
+		allowSet[id] = true
+	}
+	// docker_blocked reuses the same allowlist to ask the DB which repos a gap is actively
+	// blocking. Only run it when the allowlist read SUCCEEDED: with an untrustworthy
+	// (empty) allowlist the eligibility test fails closed and would over-escalate an
+	// actually-allowlisted repo to blocked — the opposite of docker_allowlisted's
+	// degrade-to-false. On a read failure, degrade to neutral (empty blockedSet, no
+	// escalation) instead, matching M1's direction.
+	blockedSet := map[uuid.UUID]bool{}
+	if allowlistOK {
+		if ids, err := h.q.ListDockerBlockedReposForUser(r.Context(), store.ListDockerBlockedReposForUserParams{
+			UserID:              user.ID,
+			DockerRepoAllowlist: allowlist,
+		}); err != nil {
+			// Non-fatal: the chip degrades to neutral (no escalation) on error.
+			slog.Warn("list projects: docker-blocked repos", "error", err)
+		} else {
+			for _, id := range ids {
+				blockedSet[id] = true
+			}
+		}
+	}
 	for _, rp := range repos {
 		d := repoToDTO(rp)
 		d.Pipeline = pipelines[rp.ID]
 		d.GuardrailBlocked = guardrailBlockedForRepo(report, rp.ID.String(), rp.GuardrailOverrideReason.Valid)
+		d.DockerAllowlisted = allowSet[rp.ID]
+		d.DockerBlocked = blockedSet[rp.ID]
 		out = append(out, d)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"repos": out})
@@ -588,10 +627,49 @@ func (h *Handler) ListRepos(w http.ResponseWriter, r *http.Request) {
 			reports[c.ID] = parsePrivilegeReport(c.PrivilegeReport, c.ID)
 		}
 	}
+	// PRD #361: read the Docker-worker allowlist once per request. M1's per-repo
+	// docker_allowlisted flag membership-tests it; M3's docker_blocked reuses it to ask
+	// the DB which of the caller's repos a Docker-allowlist gap is actively blocking. The
+	// list itself is never sent — both fields are booleans about the caller's own repos.
+	var allowlist []uuid.UUID
+	allowlistOK := false
+	if al, err := h.settings.DockerRepoAllowlist(r.Context()); err != nil {
+		// Non-fatal: the chip is enrichment. Degrade to "not allowlisted" (false).
+		slog.Warn("list repos: docker allowlist", "error", err)
+	} else {
+		allowlist = al
+		allowlistOK = true
+	}
+	allowSet := map[uuid.UUID]bool{}
+	for _, id := range allowlist {
+		allowSet[id] = true
+	}
+	// docker_blocked reuses the same allowlist to ask the DB which repos a gap is actively
+	// blocking. Only run it when the allowlist read SUCCEEDED: with an untrustworthy
+	// (empty) allowlist the eligibility test fails closed and would over-escalate an
+	// actually-allowlisted repo to blocked — the opposite of docker_allowlisted's
+	// degrade-to-false. On a read failure, degrade to neutral (empty blockedSet, no
+	// escalation) instead, matching M1's direction.
+	blockedSet := map[uuid.UUID]bool{}
+	if allowlistOK {
+		if ids, err := h.q.ListDockerBlockedReposForUser(r.Context(), store.ListDockerBlockedReposForUserParams{
+			UserID:              user.ID,
+			DockerRepoAllowlist: allowlist,
+		}); err != nil {
+			// Non-fatal: the chip degrades to neutral (no escalation) on error.
+			slog.Warn("list repos: docker-blocked repos", "error", err)
+		} else {
+			for _, id := range ids {
+				blockedSet[id] = true
+			}
+		}
+	}
 	for _, rp := range repos {
 		d := repoToDTO(rp)
 		d.Pipeline = pipelines[rp.ID]
 		d.GuardrailBlocked = guardrailBlockedForRepo(reports[rp.ConnectionID], rp.ID.String(), rp.GuardrailOverrideReason.Valid)
+		d.DockerAllowlisted = allowSet[rp.ID]
+		d.DockerBlocked = blockedSet[rp.ID]
 		out = append(out, d)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"repos": out})

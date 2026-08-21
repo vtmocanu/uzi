@@ -202,6 +202,19 @@ signal off, from **Admin → Instance settings → Run health**:
 | Awaiting approval after | 3600s (1h) | Seconds a run may sit awaiting approval before it's flagged; skipped for autopilot runs. |
 | Slack nudge cooldown | 1800s (30m) | Minimum time between Slack DMs about the same run's flag — see [Slack notifications](./slack.md). |
 
+**A repo-bearing run stuck past "Stuck queued after" can also be waiting on
+the Docker worker repo allowlist.** If every online worker is Docker-capable
+and the run's repo isn't on that allowlist, the owner's reason names it
+directly, distinct from "no worker online" or "all workers busy" — see
+[Run health](./run-health.md#what-the-flags-mean). That allowlist is keyed
+by **repo id**, not path, so a repo re-added to uzi (say, after moving it to
+a new forge) gets a new id and silently drops off — nothing re-adds it for
+you. The Repos page's **Setup** chip surfaces each repo's optional
+capabilities (repo skills, repo instructions, tool profile, Docker workers)
+as on/off with where to set them, staying neutral while a repo sits on its
+safe defaults and escalating to an info tone only once a queued run is
+actually blocked this way.
+
 ## Guardrail override (per repo)
 
 uzi refuses to enable a repo, or to start or claim a run against it, if its bot

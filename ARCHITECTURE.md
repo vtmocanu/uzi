@@ -99,7 +99,7 @@ The server making authenticated outbound calls to a `base_url` supplied at conne
 Migration `00002_forge.sql` adds four tables, all scoped down to `forge_connections.user_id` by FK cascade:
 
 - **`forge_connections`** — one row per (user, forge_type, base_url); carries the encrypted PAT and the verified bot identity.
-- **`repos`** — projects discovered via the bot's membership list, keyed by the forge's stable numeric project id (not the path, which can be renamed); upserted with `enabled=false` on every listing call so enable/disable always has a row to target. `ListProjects` never deletes a row absent from the fetch — it stays add/update-only **by design** (PRD #357 D1): `repos.id` is an `ON DELETE CASCADE` anchor for a dozen tables, so letting a routine, frequent membership read prune would cascade-delete runs/board/issues on a transient gap (a permissions blip, a paginated response). Removal is instead an explicit, owner-scoped `DELETE /api/repos/{id}` (D2: refused with 409 unless the repo is already `enabled=false`; D7: also refused with 409 while the repo has a non-terminal run) that deletes the `repos` row and cascades its derived data via the existing FKs — a bounded, owner-initiated action rather than a side effect of a read.
+- **`repos`** — projects discovered via the bot's membership list, keyed by the forge's stable numeric project id (not the path, which can be renamed); upserted with `enabled=false` on every listing call so enable/disable always has a row to target. `ListProjects` never deletes a row absent from the fetch — it stays add/update-only **by design** (PRD #357 D1): `repos.id` is an `ON DELETE CASCADE` anchor for a dozen tables, so letting a routine, frequent membership read prune would cascade-delete runs/board/issues on a transient gap (a permissions blip, a paginated response). Removal is instead an explicit, owner-scoped `DELETE /api/repos/{id}` (D2: refused with 409 unless the repo is already `enabled=false`; D7: also refused with 409 while the repo has a non-terminal run) that deletes the `repos` row and cascades its derived data via the existing FKs — a bounded, owner-initiated action rather than a side effect of a read. This local `repos.id` is a distinct row from the forge's own project id: re-adding a repo (e.g. after moving it to a new forge) mints a **new** `repos.id`, so anything keyed by that id server-side — like the Docker-worker allowlist (see "queued → claimed" under [Run lifecycle](#run-lifecycle)) — silently drops it, with no auto-remediation ([PRD #361](prds/done/361-repo-setup-indicator.md)).
 - **`board_columns`** — ordered label names per repo; the implicit Open (no column label) and Closed (issue `state`) columns are never stored.
 - **`issues`** — a *cache*, never authoritative. uzi's own board state is limited to column configuration; every other field is overwritten from the forge on each sync. `has_prd_link` is computed at fetch time from the issue description (regex match on a `prds/*.md` reference) and stored as a bool — the description itself is never persisted.
 
@@ -577,6 +577,17 @@ chain in the diagram above, with no intervening `running`.
   waiting for a peer — see [adr/0216-fleet-aware-claim.md](adr/0216-fleet-aware-claim.md)
   for the eligibility seam and the placement/enforcement boundary against
   ADR-42.
+  The same `fn_worker_can_claim` predicate also gates a Docker-capable
+  worker against the `docker_repo_allowlist` admin setting ([PRD #361](prds/done/361-repo-setup-indicator.md)):
+  two read-only surfaces reuse it rather than re-deriving eligibility —
+  `RepoDTO.DockerAllowlisted`/`DockerBlocked` (`apitypes.RepoDTO`) are
+  computed, caller-scoped booleans about the caller's own repo, never the
+  list (the same shape as `GuardrailBlocked`), feeding the Repos page's
+  Setup chip; and the PRD #47 `queuedReason` resolver (`workersvc/health.go`)
+  adds `reasonRepoNotDockerAllowed`, mapped onto the existing
+  `waiting_worker` health enum, when every online worker is Docker-capable
+  and none is eligible for the run's repo. No migration — `runs.health_reason`
+  is free text.
 - **claimed → running, before the plan turn** — once `provisionRunTools` has set up
   the run's tool env, the executor kicks off a lockfile-driven JS dependency
   install for the cloned repo, picked per discovered lockfile (monorepo
