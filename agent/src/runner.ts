@@ -55,6 +55,7 @@ import {
   type CheckRunner,
 } from "./self-improve.js";
 import { installJsDeps } from "./js-deps.js";
+import { detectToolchain, type ToolchainDetection } from "./toolchain-detect.js";
 import { isCIConfigPlan } from "./prompt.js";
 import { flagCIConfigPaths, DEFAULT_CI_CONFIG_PATHS } from "./ci-config-guard.js";
 import { REASON_PROVISION_FAILED } from "./provision-run.js";
@@ -752,6 +753,20 @@ export class RunRunner {
         );
       }
 
+      // PRD #84 M4: infer the run's requirement set from the checked-out clone with the
+      // deterministic scan, ONCE, best-effort. A scan failure must never break a run, so
+      // it is caught and yields `undefined` ("emit nothing"). The result rides the same
+      // two reports as `milestones` — the CANDIDATE set on the awaiting_approval report and
+      // the FROZEN set on the autopilot running report — threaded through gatePlan below.
+      let toolchainDetection: ToolchainDetection | undefined;
+      try {
+        toolchainDetection = await detectToolchain(runnerClone.path);
+      } catch (err) {
+        runLog.warn("toolchain detection failed; continuing without a requirement set", {
+          error: errMessage(err),
+        });
+      }
+
       // Cross-run memory (PRD #90): fetch this run's (user, repo) memory so the
       // executor can compose it into the lead's plan prompt as inert, nonce-fenced,
       // untrusted-advisory context. Guarded HARD — a fetch failure (older API, repo-
@@ -869,6 +884,7 @@ export class RunRunner {
             runLog,
             effectiveAutoApprove,
             repoAgents,
+            toolchainDetection,
             onAwaitingApproval,
           );
           // Human-in-the-loop iff the plan reached an approve verdict via the PARK path
@@ -2285,6 +2301,11 @@ export class RunRunner {
     runLog: Logger,
     autoApprove: boolean,
     repoAgents: AgentTemplate[],
+    // PRD #84 M4: the plan-time inferred requirement set (deterministic detectToolchain()),
+    // or undefined when the scan failed. Rides the same two reports as `milestones` — the
+    // CANDIDATE set on the awaiting_approval report and the FROZEN set on the autopilot
+    // running report — each field emitted only when its array is non-empty.
+    toolchainDetection: ToolchainDetection | undefined,
     // PRD #362 M3c: advisory hook fired AFTER the awaiting_approval report persists
     // plan_md, BEFORE the verdict wait (see the RunContext.gatePlan doc). Never reached
     // on the autopilot branch, which returns above without persisting plan_md.
@@ -2325,6 +2346,10 @@ export class RunRunner {
       // mirroring the repo_agents conditional above. Only when non-empty (additive-
       // optional, never []). Reporting stays fire-and-forget via the .catch below.
       if (milestones?.length) autopilotState.milestones = milestones;
+      // PRD #84 M4: the FROZEN requirement set rides this same self-contained running
+      // report (an autopilot run never reports awaiting_approval), each field only when
+      // non-empty — same conditional-spread discipline as milestones/repo_agents above.
+      Object.assign(autopilotState, toolchainReportFields(toolchainDetection));
       await reportState(autopilotState).catch((e) =>
         runLog.warn("could not persist autopilot agent selection", {
           error: errMessage(e),
@@ -2358,6 +2383,10 @@ export class RunRunner {
       status: "awaiting_approval",
       plan_md: planMd,
       ...(milestones?.length ? { milestones } : {}),
+      // PRD #84 M4: the CANDIDATE requirement set rides the awaiting_approval report so
+      // the server can gate plan-approval on worker eligibility. Each field only when
+      // non-empty (additive-optional), matching the milestones conditional above.
+      ...toolchainReportFields(toolchainDetection),
     });
     if (this.gatedRuns.has(runId)) steering.bumpEpoch();
     else this.gatedRuns.add(runId);
@@ -2611,6 +2640,23 @@ export const REASON_QUESTION_TIMEOUT = "clarification timed out";
  *  saw a question to answer. */
 export const REASON_QUESTION_NOT_PARKED =
   "could not park the run to ask a question";
+
+/** PRD #84 M4: the additive `StateRequest` fields for a plan-time toolchain detection.
+ *  Each array field is included ONLY when non-empty — mirroring the `milestones?.length ?
+ *  {milestones} : {}` conditional-spread discipline, so a run that detected nothing (or
+ *  whose scan failed and passed `undefined`) reports byte-for-byte as before. `size_class`
+ *  is included whenever a detection was computed (it is soft/display-only). */
+function toolchainReportFields(
+  detection: ToolchainDetection | undefined,
+): Partial<StateRequest> {
+  if (!detection) return {};
+  const fields: Partial<StateRequest> = { size_class: detection.size_class };
+  if (detection.required_capabilities.length)
+    fields.required_capabilities = detection.required_capabilities;
+  if (detection.required_tools.length)
+    fields.required_tools = detection.required_tools;
+  return fields;
+}
 
 /** The effective answer deadline: the server-configured claim value when it is
  *  present and positive, else the worker default. An older server omits it (R8). */

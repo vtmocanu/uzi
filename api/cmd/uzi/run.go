@@ -471,10 +471,14 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 				return err
 			}
 			msg, _ := cmd.Flags().GetString("message")
+			msg = resolveMessage(env, msg)
+			if strings.TrimSpace(msg) == "" {
+				return uzicli.Exitf(uzicli.ExitUsage, "a rejection needs a reason: pass -m <reason> or pipe it on stdin")
+			}
 			return submitInput(env, gf, c, cmd, args[0], kindRejectPlan, msg, nil)
 		},
 	}
-	reject.Flags().StringP("message", "m", "", "reason to send back to the agent (optional)")
+	reject.Flags().StringP("message", "m", "", "reason to send back to the agent (or pipe it on stdin)")
 
 	cancel := &cobra.Command{
 		Use:   "cancel <run-id>",
@@ -485,9 +489,13 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return submitInput(env, gf, c, cmd, args[0], kindCancel, "", nil)
+			// PRD #503 M3: the cancel reason is OPTIONAL — unlike reject, no empty check.
+			msg, _ := cmd.Flags().GetString("message")
+			msg = resolveMessage(env, msg)
+			return submitInput(env, gf, c, cmd, args[0], kindCancel, msg, nil)
 		},
 	}
+	cancel.Flags().StringP("message", "m", "", "reason for cancelling (optional; or pipe it on stdin)")
 
 	followUp := &cobra.Command{
 		Use:   "follow-up <run-id>",
@@ -1192,6 +1200,21 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	}
 	if r.FailureReason != nil && *r.FailureReason != "" {
 		rows = append(rows, []string{"FAILURE_REASON", sanitizeTTY(*r.FailureReason)})
+	}
+	// The run's inferred scheduling requirement set (PRD #84 M4), the CLI twin of the
+	// three DTO fields added in 4c. All three are model/inference-derived, hence UNTRUSTED,
+	// and each is emit-only-when-set exactly like HEALTH_REASON/FAILURE_REASON above: a run
+	// predating the feature, or one whose plan-time inference produced nothing, carries no
+	// blank row. The two slices are comma-joined into a single cell before sanitizeTTY, so
+	// the untrusted join goes through the same scrub the sibling free-text rows use.
+	if len(r.RequiredCapabilities) > 0 {
+		rows = append(rows, []string{"REQUIRED_CAPABILITIES", sanitizeTTY(strings.Join(r.RequiredCapabilities, ","))})
+	}
+	if len(r.RequiredTools) > 0 {
+		rows = append(rows, []string{"REQUIRED_TOOLS", sanitizeTTY(strings.Join(r.RequiredTools, ","))})
+	}
+	if r.SizeClass != "" {
+		rows = append(rows, []string{"SIZE_CLASS", sanitizeTTY(r.SizeClass)})
 	}
 	// Emitted only when set, like its two neighbours — every non-stopped run would
 	// otherwise carry a blank row. It is a server-controlled enum, so sanitizeTTY is

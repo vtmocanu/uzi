@@ -21744,3 +21744,114 @@ auto-unlock across restart, a PRD non-goal we keep). Full rationale in the Decis
 - **Non-goals respected (per the PRD):** no auto-unlock of OIDC vaults across restart; no
   RollingUpdate/surge worker pods (RWO PVCs — Recreate stays); single-replica API assumption
   unchanged.
+
+## 564. Issue #520 — usage-limit park defaults ON: the per-user (and schedule) default flips OFF→ON, the per-run column stays OFF
+
+Serves issue #520 ("make wait-on-limit default ON"). Reverses the original opt-in-default
+posture of PRD #35 (`prds/done/35-run-limit-retry.md`, `adr/0035-run-limit-retry.md`), where a
+run failed on a mid-run usage limit unless the user had opted in. Rationale: this is a
+single-operator self-host, and nobody should have to opt in for a run to survive a usage limit
+the account will recover from on its own. The flip is a later, deliberate user directive that sits
+in tension with Feature #35's "two opt-in scopes" wording — see the provenance note below.
+
+- **The DEFAULT flipped OFF→ON, scoped to the per-user and schedule defaults, not the per-run
+  column.** Migration `00144_wait_on_limit_default_on.sql` flips `users.wait_on_limit` column
+  DEFAULT false→true and aligns `run_schedules.wait_on_limit` DEFAULT to true (schedules were
+  already default-on at the handler, `applyCreateDefaults`, PRD #274 D1a; the migration only makes
+  the DB column agree). No creation-path Go changed: every origin resolves the per-user default via
+  `resolveWaitOnLimit` (`api/internal/workersvc/limitwait.go`), so manual `CreateRun`,
+  `CreateAutopilotRun`, `ci_fix` and `self_improve` all follow the flipped default with no per-path
+  edit (the four-writer trap §438 warned about is avoided precisely because the effective flag is
+  resolved in one Go seam, never defaulted per-path in SQL). The CLI `--wait-on-limit` stays
+  three-way and inherits the default when unset.
+
+- **`runs.wait_on_limit` column DEFAULT stays FALSE — the judge invariant is preserved.** The flip
+  is the per-user/schedule default, NOT the per-run column. Judge runs must never park (§433, PRD
+  #35 Decision 14), and stay double-guarded: `CreateJudgeRun` never stamps `wait_on_limit`, and
+  `SetRunLimitWait` carries `AND kind <> 'judge'`. Flipping the per-run column default would have
+  parked judge runs; leaving it false keeps them off.
+
+- **Existing users ARE backfilled, and it is intentionally ONE-WAY.** The migration runs
+  `UPDATE users SET wait_on_limit = true WHERE wait_on_limit = false`, so users predating the flip
+  get the new default rather than being stranded on the old one. Tradeoff, accepted for a
+  single-operator instance: this overrides any prior *deliberate* opt-out, and it cannot be undone
+  by the goose Down — Down restores only the column DEFAULT, not the data, because a backfilled
+  `true` is indistinguishable from a user-chosen `true`. Down-then-up does not round-trip a user's
+  original value; that is by design, not a migration bug.
+
+- **The resource-hold tradeoff, recorded because #520 asked for it.** A parked run keeps holding its
+  issue (board card stays In Progress) and its worker disk until the usage window reopens, instead
+  of failing fast and freeing them. Default-on trades that hold for never losing an in-flight run's
+  work to a mid-run limit — the right default when work-loss is the expensive outcome and disk is
+  cheap. Operators who want the old fail-fast behaviour opt out per user or per run (§438 toggle);
+  the retry budget cap (`RUN_LIMIT_MAX_WAITS`, default 5) still bounds how long a run may park.
+
+- **PROVENANCE / tension with `specs/human.md`.** Feature #35 in `specs/human.md` still records
+  "two opt-in scopes: a per-user default in Settings, and a per-run choice" (the PRD #35
+  requirement, opt-in-by-default). Issue #520 is a later user directive that changes that default to
+  ON. `specs/human.md` was NOT edited here — a human-contract change needs explicit user approval and
+  is being surfaced separately at the review gate. This entry records the AI/design mechanics of the
+  flip; the contract wording awaits the owner's ratification.
+
+- **Web (per issue #520):** the RunDefaults settings toggle fallback is `?? true` and the mock
+  session user is flipped on, so the UI reflects the new default rather than showing OFF for a user
+  whose stored value is unset.
+
+## 565. PRD #84 M4/M5 — plan-time inference is a DETERMINISTIC function feeding an authoritative, no-bypass approval gate; jvm is a retrofit with no new code
+
+Closes the M4/M5 half of the reservation §299 left open (M1–M3 recorded there). M4 adds
+plan-time capability/tool inference plus a plan-approval-gate block; M5 retrofits `jvm` as a
+verified routing capability and surfaces the requirement set. Richer rationale lives in PRD #84's
+Decision Log; this is the terse contract.
+
+- **Plan-time inference is a DETERMINISTIC function, not LLM prose.**
+  `agent/src/toolchain-detect.ts#detectToolchain(clonePath)` scans manifests (`go.mod`,
+  `package.json`, `pyproject.toml`/`requirements.txt`, `Cargo.toml`, `pom.xml`/`build.gradle`) +
+  docker markers (Dockerfile/compose/testcontainers) + root build/test scripts and returns
+  `{required_capabilities (server vocab {docker,jvm}), required_tools (go/node/python/rust/jvm),
+  size_class (s/m/l)}` (the `ToolchainDetection` interface). It is the tested unit; the lead may
+  narrate the toolchain but the gate acts on this structured output, never on prose.
+
+- **Persistence: two new run columns, escalation-only capability merge.** `runs.required_tools` +
+  `runs.size_class` (migration `00145_run_required_tools.sql`). `SetRunAwaitingApproval`
+  (`api/internal/store/queries/runtime.sql`) persists the inferred set on the plan report:
+  `required_capabilities` is UNION-MERGED (escalation-only — inference ADDs, never drops the M2
+  repo hint), `required_tools` is SET/replaced (the run's single authoritative inferred list),
+  `size_class` is SET. All three are ABSENT-SAFE via `COALESCE` — a nil param never wipes the
+  column (a nil `text[]` would `arr || NULL = NULL`-wipe the NOT-NULL column without it). The
+  server owns the tool vocabulary: `capability.FilterTools` (`api/internal/capability/capability.go`)
+  gates which tool names are accepted.
+
+- **The gate formula's `−provisionable` term lives ONLY in the M4 approval gate, NOT the claim
+  clause.** The claim predicate (`fn_worker_can_claim`, migration 00142, unchanged by 00145) reads
+  `required_capabilities ⊆ worker_effective_caps` with NO subtraction —
+  `required_capabilities` is non-provisionable by construction. The approval-gate residual is
+  `unmet = required_capabilities − worker_effective_caps` and is capability-only. `size_class` is
+  SOFT (advisory, never blocks); `required_tools` are provisionable (surfaced as "will provision",
+  never a block).
+
+- **The approval gate is AUTHORITATIVE and has no bypass.** `capabilityGate`
+  (`api/internal/workersvc/service.go`) is enforced inside `SubmitInput` for EVERY approve_plan —
+  both the selection-bearing and the nil-selection path — using the SAME effective-caps fold as
+  `fn_worker_can_claim` (`capabilities ∪ {docker if docker_enabled}`), so approve and claim can
+  never disagree. It fails CLOSED: no owning worker → empty caps → every requirement unmet; a
+  worker-load error PROPAGATES (never opens the gate). Gated by
+  `settings.KeyCapabilityAwareScheduling` (default ON, same kill-switch as M2); OFF ⇒ no block and
+  the system degrades to the old mid-run failure.
+
+- **The user override (Decision 12) is the ONLY user removal of a requirement.**
+  `override_capabilities` on approve clears the run's `required_capabilities`
+  (`ClearRunRequiredCapabilities`, scoped owner + `awaiting_approval`) and proceeds. Inference can
+  only ADD; this is the sole path that REMOVES. It bypasses no security boundary — the §300
+  guardrail still denies docker USE on a daemon-less worker, so the override changes scheduling
+  preference, not containment.
+
+- **M5 jvm retrofit is verification, not new code.** `jvm` was already a matched capability via the
+  M1 `template→caps` map (`{jvm}→{jvm}`, `api/internal/capability/capability.go`). M5 confirmed the
+  claim routing with the live-DB `api/internal/store/claim_capability_integration_test.go` jvm case
+  (a base worker is fenced, a jvm worker claims). No new production code shipped for the routing
+  itself.
+
+- **Surfacing.** The run DTO (`api/internal/apitypes/run.go`) carries
+  `required_capabilities`/`required_tools`/`size_class`; the web plan-gate readiness summary renders
+  them with an override button; the CLI (`api/cmd/uzi/run.go`, `uzi run get`) shows them in its rows.

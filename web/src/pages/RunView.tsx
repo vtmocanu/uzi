@@ -25,6 +25,7 @@ import {
   type RunMessage,
   type RunReview,
   type TriageCounts,
+  type Worker,
 } from "../lib/api";
 import { coordKey, recommendationLabel, verdictLabel, verdictTone } from "../lib/judge";
 import { canToggleWaitOnLimit, formatCountdown, runWindowLabel } from "../lib/limitWait";
@@ -589,6 +590,7 @@ export function RunView() {
   const { id = "" } = useParams();
   const { run, messages, connected, error, submit, refreshRun, inputs, canSteer } = useRunStream(id);
   const [repoWebUrl, setRepoWebUrl] = useState<string | null>(null);
+  const [workers, setWorkers] = useState<Worker[]>([]);
   const [actionErr, setActionErr] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -604,6 +606,19 @@ export function RunView() {
       })
       .catch(() => setRepoWebUrl(null));
   }, [run]);
+
+  // PRD #84 M4 4d: the workers list backs the plan-gate readiness summary — a required
+  // capability is "met" when the run's ASSIGNED worker (run.worker_id) advertises it. Only
+  // needed at the approval gate; best-effort (an empty list just renders every required cap
+  // as unmet, which is the honest fail-closed reading). The Workers page owns the live poll;
+  // this is a one-shot fetch when a run reaches the gate.
+  useEffect(() => {
+    if (run?.status !== "awaiting_approval") return;
+    api
+      .listWorkers()
+      .then(({ workers }: { workers: Worker[] }) => setWorkers(workers))
+      .catch(() => setWorkers([]));
+  }, [run?.status]);
 
   const act = async (fn: () => Promise<unknown>) => {
     setActionErr("");
@@ -1013,9 +1028,12 @@ export function RunView() {
         <PlanPanel
           run={run}
           messages={messages}
+          workers={workers}
           busy={busy}
           canSteer={canSteer}
-          onApprove={(selection) => act(() => submit("approve_plan", "", selection))}
+          onApprove={(selection, overrideCapabilities) =>
+            act(() => submit("approve_plan", "", selection, overrideCapabilities))
+          }
           onReject={(reason) => act(() => submit("reject_plan", reason))}
           onRequestChanges={(feedback) => act(() => submit("revise_plan", feedback))}
           onCancel={() => act(() => submit("cancel"))}
@@ -1209,6 +1227,7 @@ function RevisionThread({ feedback, working = false }: { feedback: string | null
 export function PlanPanel({
   run,
   messages = [],
+  workers = [],
   busy,
   canSteer = true,
   onApprove,
@@ -1221,6 +1240,11 @@ export function PlanPanel({
   // (PRD #41 Decision 9). Optional so a caller/test that only exercises the base gate
   // can omit it — the derivation degrades to v1 / revision 0 of 3.
   messages?: RunMessage[];
+  // PRD #84 M4 4d: the fleet, so the readiness summary can look up the run's assigned
+  // worker (run.worker_id) and decide which required capabilities it satisfies. Optional
+  // + defaulted to [] so a base-gate-only caller/test need not wire it — an empty list
+  // simply renders every required capability as unmet (the honest fail-closed reading).
+  workers?: Worker[];
   busy: boolean;
   // False for a NON-OWNER viewer. PRE-EXISTING and unrelated to PRD #88: POST /inputs is
   // user-scoped, so a non-owner admin — who can legitimately OPEN this owner-or-admin run
@@ -1231,7 +1255,10 @@ export function PlanPanel({
   // prop, and it hides the ACTIONS only — the plan body stays readable, which is the whole
   // reason a non-owner admin opens this page.
   canSteer?: boolean;
-  onApprove: (selection: AgentSelectionInput) => void;
+  // PRD #84 M4 4d: onApprove takes an optional overrideCapabilities flag — the "run without
+  // the capability" false-positive correction. The normal Approve button omits it (undefined
+  // ≡ false); the readiness block's override button passes true.
+  onApprove: (selection: AgentSelectionInput, overrideCapabilities?: boolean) => void;
   onReject: (reason: string) => void;
   // Request-changes (PRD #41) and the revising-state Cancel-run affordance. Optional
   // with a no-op default so a base-gate-only caller need not wire them.
@@ -1273,6 +1300,35 @@ export function PlanPanel({
   const activeCount = activeRoster.length - selection.exclusions.length;
   const approveLabel =
     activeRoster.length > 0 ? `Approve plan · ${selectionLabel(selection.source, activeCount)}` : "Approve plan";
+
+  // PRD #84 M4 4d: the pre-run readiness summary. Requirements are inferred/hinted
+  // server-side and surfaced RAW on the run (run.required_*); "met" means the run's ASSIGNED
+  // worker (run.worker_id) advertises the capability. required_tools never block (they are
+  // provisioned at run time); size_class is advisory. An empty workers list (fetch not yet
+  // in, or a non-owner with no read) renders every required cap as unmet — the honest
+  // fail-closed reading, matching the 409 the approve gate would return.
+  const requiredCaps = useMemo(() => run.required_capabilities ?? [], [run.required_capabilities]);
+  const requiredTools = useMemo(() => run.required_tools ?? [], [run.required_tools]);
+  const sizeClass = run.size_class ?? "";
+  const workerCaps = useMemo(() => {
+    const w = run.worker_id ? workers.find((x) => x.id === run.worker_id) : undefined;
+    const caps = new Set(w?.capabilities ?? []);
+    // Fold docker_enabled in exactly as the server does (effectiveOwningWorkerCaps /
+    // fn_worker_can_claim: capabilities ∪ {docker if docker_enabled}). The worker DTO carries
+    // `docker` and `capabilities` as INDEPENDENT signals, so a provision-time docker worker
+    // whose self-report has not landed still satisfies a docker requirement — without this
+    // fold the panel would show a false "unmet" for a plan the approve gate accepts.
+    if (w?.docker === true) caps.add("docker");
+    return caps;
+  }, [run.worker_id, workers]);
+  const unmetCaps = useMemo(() => requiredCaps.filter((c) => !workerCaps.has(c)), [requiredCaps, workerCaps]);
+  // Whether to render the readiness panel at all. size_class is DELIBERATELY excluded: the
+  // agent's detectToolchain always emits a non-empty size_class (s/m/l), so including it here
+  // made the panel render for EVERY plan gate. size is advisory-only, so it never justifies the
+  // panel on its own — it is shown as a minor detail INSIDE the panel when a capability or tool
+  // already opened it, and simply not shown when nothing else was inferred. A block is a subset
+  // of requiredCaps, so "a capability, a tool, or a block" reduces to caps-or-tools here.
+  const hasRequirements = requiredCaps.length > 0 || requiredTools.length > 0;
 
   // The rounds counter is always shown at the head; MAX is the display default (the
   // server owns the real cap).
@@ -1383,6 +1439,84 @@ export function PlanPanel({
                 </li>
               ))}
             </ol>
+          </div>
+        )}
+
+        {/* PRD #84 M4 4d: the pre-run readiness summary — the run's inferred/hinted
+            requirements checked against the assigned worker, shown between the candidate
+            milestones and the plan body. Renders NOTHING when no CAPABILITY or TOOL was
+            inferred — size_class alone (always emitted) does not open it (see hasRequirements).
+            Capability/tool names are a server-Filter-ed vocabulary, but rendered through
+            stripUnsafeChars anyway (defense-in-depth, matching the candidate milestones above) —
+            this is an approval dialog. */}
+        {hasRequirements && (
+          <div className="rounded-lg border border-edge bg-surface/60 p-3">
+            <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-faint">Run requirements</p>
+
+            {requiredCaps.length > 0 && (
+              <div className="mb-2">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {requiredCaps.map((cap) => {
+                    const unmet = !workerCaps.has(cap);
+                    return (
+                      <Badge
+                        key={cap}
+                        tone={unmet ? "warning" : "ok"}
+                        title={
+                          unmet
+                            ? `The assigned worker does not advertise "${stripUnsafeChars(cap)}" — this plan cannot run here until one that does claims it, or you run without it.`
+                            : `The assigned worker advertises "${stripUnsafeChars(cap)}".`
+                        }
+                      >
+                        {unmet ? "⚠ " : "✓ "}
+                        {stripUnsafeChars(cap)}
+                      </Badge>
+                    );
+                  })}
+                </div>
+                {unmetCaps.length > 0 && (
+                  <p className="mt-1.5 text-xs text-warn">
+                    Provision or start a worker with:{" "}
+                    <span className="font-medium">{unmetCaps.map((c) => stripUnsafeChars(c)).join(", ")}</span>, or run
+                    without it.
+                  </p>
+                )}
+              </div>
+            )}
+
+            {requiredTools.length > 0 && (
+              <div className="mb-2 flex flex-wrap items-center gap-1.5">
+                {requiredTools.map((tool) => (
+                  <Badge key={tool} tone="neutral" title={`Toolchain provisioned at run time: ${tool}`}>
+                    {stripUnsafeChars(tool)}
+                  </Badge>
+                ))}
+                <span className="text-[11px] text-faint">will be provisioned</span>
+              </div>
+            )}
+
+            {sizeClass !== "" && (
+              <span className="inline-flex items-center rounded-md border border-edge bg-raised/50 px-1.5 py-px text-[11px] font-medium text-muted">
+                {`size: ${stripUnsafeChars(sizeClass)}`}
+              </span>
+            )}
+
+            {/* The false-positive override (PRD #84 M4 4c/4d, Decision 12): when a required
+                capability is unmet AND the viewer can steer, offer a distinct SECONDARY
+                approve that clears the inferred requirements server-side ("run without it").
+                Visually separated from the header's primary Approve so it never reads as the
+                default path. */}
+            {unmetCaps.length > 0 && canSteer && (
+              <div className="mt-2.5 border-t border-edge/60 pt-2.5">
+                <Button variant="secondary" size="sm" disabled={busy} onClick={() => onApprove(selection, true)}>
+                  Run without {unmetCaps.map((c) => stripUnsafeChars(c)).join(", ")}
+                </Button>
+                <p className="mt-1 text-[11px] text-faint">
+                  Approves the plan and drops the inferred capability requirement, in case the inference is a false
+                  positive. The runtime guardrail still refuses the capability&rsquo;s use on a worker that lacks it.
+                </p>
+              </div>
+            )}
           </div>
         )}
 

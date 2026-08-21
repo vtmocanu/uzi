@@ -969,6 +969,17 @@ a pre-feature run or one still queued prints none of them, and a seeded run
 `--field summary_intent` / `--field summary_plan`; `summary_deltas` is an
 array, so read it with `--json` instead.
 
+`run get` also prints a run's inferred/hinted scheduling requirements (see
+[Capability-aware scheduling](./capability-scheduling.md)), emit-only-when-set
+like the rows above — a run predating the feature, or one whose plan-time
+inference produced nothing, carries none of them: a `REQUIRED_CAPABILITIES`
+row (the hard, closed-vocabulary set — today `docker`/`jvm` — a subset of
+which the run's worker must have to claim and to clear the plan-approval
+gate), a `REQUIRED_TOOLS` row (provisionable toolchains that will simply be
+installed at run time, never a blocker), and a `SIZE_CLASS` row (`s`/`m`/`l`,
+advisory only). All three are comma-joined where the value is a list, and
+readable the same way under `--json`.
+
 ### Run status, and what `--follow` waits for
 
 A run's `status` (on `run get` and `run list`) is one of exactly **nine** values:

@@ -271,7 +271,18 @@ type fakeStore struct {
 	createdStopVerdict *store.CreateStopVerdictInputParams
 	createdApproval    *store.CreateApprovePlanInputParams
 	cancelled          *store.CancelRunServerSideParams
-	rejected           *store.RejectRunServerSideParams
+	// cancelledByWorker captures the PRD #503 M1 live-worker cancel transition; SetState's
+	// failed arm calls it (instead of SetRunFailed) when the loaded run's stop_kind is
+	// 'cancelled'. cancelledByWorkerRows is the rows-affected it returns (defaults to 1 →
+	// applied, like the SetRunFailed fake).
+	cancelledByWorker     *store.CancelRunByWorkerParams
+	cancelledByWorkerRows int64
+	rejected              *store.RejectRunServerSideParams
+	// clearedCaps captures the PRD #84 M4 4c override clear (ClearRunRequiredCapabilities);
+	// clearCapsRows is the RowsAffected the fake returns. When cleared, the fake also empties
+	// runByID.RequiredCapabilities so a subsequent SubmitInput reload sees the override effect.
+	clearedCaps   *store.ClearRunRequiredCapabilitiesParams
+	clearCapsRows int64
 
 	// Create run.
 	repoRow         store.GetRepoForUserRow // repo GetRepoForUser returns (zero value = the pre-#191 empty row)
@@ -825,6 +836,13 @@ func (f *fakeStore) ListJudgeTriageRowsForUser(_ context.Context, userID uuid.UU
 func (f *fakeStore) GetWorkerByID(context.Context, uuid.UUID) (store.Worker, error) {
 	return f.workerByID, f.workerByIDErr
 }
+func (f *fakeStore) ClearRunRequiredCapabilities(_ context.Context, arg store.ClearRunRequiredCapabilitiesParams) (int64, error) {
+	f.clearedCaps = &arg
+	// Mirror the real owner+status-guarded UPDATE: on a matching row, empty the run's
+	// required set so a subsequent SubmitInput reload observes the override.
+	f.runByID.RequiredCapabilities = nil
+	return f.clearCapsRows, nil
+}
 func (f *fakeStore) CreateRunInput(_ context.Context, arg store.CreateRunInputParams) (store.RunUserInput, error) {
 	f.createdInput = &arg
 	return store.RunUserInput{}, nil
@@ -852,6 +870,18 @@ func (f *fakeStore) CreateApprovePlanInput(_ context.Context, arg store.CreateAp
 }
 func (f *fakeStore) CancelRunServerSide(_ context.Context, arg store.CancelRunServerSideParams) (int64, error) {
 	f.cancelled = &arg
+	return 1, nil
+}
+
+// CancelRunByWorker (PRD #503 M1) records the live-worker cancel transition. Rows
+// defaults to 1 (applied) like the SetRunFailed fake, so a fixture that says nothing gets
+// an applied transition; a test wanting the no-op path sets cancelledByWorkerRows<0 — but
+// the common case is 0 meaning "unset", which we map to 1.
+func (f *fakeStore) CancelRunByWorker(_ context.Context, arg store.CancelRunByWorkerParams) (int64, error) {
+	f.cancelledByWorker = &arg
+	if f.cancelledByWorkerRows != 0 {
+		return f.cancelledByWorkerRows, nil
+	}
 	return 1, nil
 }
 func (f *fakeStore) RejectRunServerSide(_ context.Context, arg store.RejectRunServerSideParams) (int64, error) {
@@ -2223,7 +2253,7 @@ func TestSubmitInputEnqueuesWhenWorkerLive(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.now = func() time.Time { return fixed }
 
-	res, err := svc.SubmitInput(context.Background(), user, runID, "cancel", "", nil)
+	res, err := svc.SubmitInput(context.Background(), user, runID, "cancel", "operator changed their mind", nil)
 	if err != nil {
 		t.Fatalf("SubmitInput: %v", err)
 	}
@@ -2239,11 +2269,51 @@ func TestSubmitInputEnqueuesWhenWorkerLive(t *testing.T) {
 	if fs.createdStopVerdict.StopKind.String != "cancelled" || !fs.createdStopVerdict.StopKind.Valid {
 		t.Fatalf("live cancel must stamp stop_kind 'cancelled', got %+v", fs.createdStopVerdict.StopKind)
 	}
+	// PRD #503 M3: a live cancel carries the operator's optional reason into stop_reason.
+	if !fs.createdStopVerdict.StopReason.Valid || fs.createdStopVerdict.StopReason.String != "operator changed their mind" {
+		t.Fatalf("live cancel must stamp stop_reason with the operator reason, got %+v", fs.createdStopVerdict.StopReason)
+	}
 	if fs.createdInput != nil {
 		t.Fatal("a stop verdict must not use the plain CreateRunInput path")
 	}
 	if fs.cancelled != nil {
 		t.Fatal("server-side cancel must not run when a worker is live")
+	}
+}
+
+// TestSubmitInputLiveCancelStripsNULFromStopReason: PRD #503 M3 — the live-path cancel
+// (CreateStopVerdictInput) sanitizes the operator reason exactly like the server-side
+// path, stripping a NUL byte that would otherwise raise Postgres 22021 and abort the
+// cancel. Both cancel paths share stopReasonParam, so this pins the live side too.
+func TestSubmitInputLiveCancelStripsNULFromStopReason(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	wkrID := uuid.New()
+	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	fs := &fakeStore{
+		runByID:    store.Run{ID: runID, UserID: user, Status: "running", WorkerID: pgUUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)}, // fresh
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.now = func() time.Time { return fixed }
+
+	res, err := svc.SubmitInput(context.Background(), user, runID, "cancel", "x\x00y", nil)
+	if err != nil {
+		t.Fatalf("SubmitInput: %v", err)
+	}
+	if res.ServerSide {
+		t.Fatal("a live worker should consume the cancel; not server-side")
+	}
+	if fs.createdStopVerdict == nil || fs.createdStopVerdict.Kind != "cancel" {
+		t.Fatalf("stop verdict not enqueued for the worker: %+v", fs.createdStopVerdict)
+	}
+	if !fs.createdStopVerdict.StopReason.Valid || fs.createdStopVerdict.StopReason.String != "xy" {
+		t.Fatalf("live cancel must strip the NUL from stop_reason (want %q), got %+v", "xy", fs.createdStopVerdict.StopReason)
+	}
+	// The body co-written to run_user_inputs.body in the SAME INSERT must also be
+	// NUL-stripped, or the CTE would 22021 on that column before stop_reason ever mattered.
+	if fs.createdStopVerdict.Body.String != "xy" || strings.ContainsRune(fs.createdStopVerdict.Body.String, '\x00') {
+		t.Fatalf("live cancel must strip the NUL from run_user_inputs.body (want %q), got %+v", "xy", fs.createdStopVerdict.Body)
 	}
 }
 
@@ -2273,6 +2343,11 @@ func TestSubmitInputLiveRejectStampsStopKind(t *testing.T) {
 	}
 	if fs.createdStopVerdict.StopKind.String != "plan_rejected" || !fs.createdStopVerdict.StopKind.Valid {
 		t.Fatalf("live reject must stamp stop_kind 'plan_rejected', got %+v", fs.createdStopVerdict.StopKind)
+	}
+	// PRD #503 M3 shared-CTE split guard: a reject's reason lives in failure_reason (the
+	// M2 path), NOT in stop_reason — even though the reject carried a verbatim body above.
+	if fs.createdStopVerdict.StopReason.Valid {
+		t.Fatalf("live reject must leave stop_reason NULL (reason belongs to failure_reason), got %+v", fs.createdStopVerdict.StopReason)
 	}
 }
 
