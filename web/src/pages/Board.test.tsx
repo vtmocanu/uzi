@@ -1395,7 +1395,11 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
   // Only the four fields the strip's predicates read. RunListItem extends Run and
   // carries ~30 more that no code path here touches.
   const aRun = (over: { id: string; status: string; health: string; issue_iid: number }) =>
-    over as unknown as import("../lib/api").RunListItem;
+    // Issue #485 review FIX 2: the strip's overlay <Link> is now named by the run title
+    // as well, so the fixture must carry an issue_title the way the real RunListItem does
+    // (RunListItem.issue_title is a non-optional string; this cast used to omit it because
+    // the strip never read it before).
+    ({ issue_title: "Fix the parser", ...over }) as unknown as import("../lib/api").RunListItem;
 
   beforeEach(() => {
     vi.mocked(useAuth).mockReturnValue({
@@ -1449,8 +1453,9 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
     // on r.id, so a double-list is also a duplicate React key.
     // Issue #485 NB1: the pill's navigational element is now a stretched-link overlay
     // named by its aria-label (the forge ref anchor is a sibling, not a nested <a>), so
-    // the per-run chip is this "Open run for issue #7" link — still exactly one.
-    expect(screen.getAllByRole("link", { name: "Open run for issue #7" })).toHaveLength(1);
+    // the per-run chip is this "Open run for issue #7: Fix the parser" link (FIX 2 adds
+    // the title to the accessible name) — still exactly one.
+    expect(screen.getAllByRole("link", { name: "Open run for issue #7: Fix the parser" })).toHaveLength(1);
   });
 
   it("still lists a genuinely stuck run — the control", async () => {
@@ -1461,7 +1466,7 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
     });
     renderBoard();
     await screen.findByText("1 run looks stuck");
-    expect(screen.getAllByRole("link", { name: "Open run for issue #7" })).toHaveLength(1);
+    expect(screen.getAllByRole("link", { name: "Open run for issue #7: Fix the parser" })).toHaveLength(1);
   });
 
   it("keeps the buckets separate when two different runs are in different states", async () => {
@@ -1486,7 +1491,7 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
     renderBoard();
     await screen.findByText("1 run needs an answer");
     expect(strip().textContent).toBe("1 run needs an answer");
-    expect(screen.getAllByRole("link", { name: "Open run for issue #7" })).toHaveLength(1);
+    expect(screen.getAllByRole("link", { name: "Open run for issue #7: Fix the parser" })).toHaveLength(1);
   });
 });
 

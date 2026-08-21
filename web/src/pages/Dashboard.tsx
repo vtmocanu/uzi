@@ -347,7 +347,13 @@ export function Dashboard() {
               <li key={r.id} className="group relative">
                 <Link
                   to={`/runs/${r.id}`}
-                  aria-label={`Open run${r.issue_iid != null ? ` for issue #${r.issue_iid}` : ""}`}
+                  // Issue #485 review FIX 2: name the link by the run's visible title so
+                  // multiple issue-less runs (all "Open run" otherwise) get distinct,
+                  // meaningful accessible names. issue_title is untrusted forge text, so it
+                  // stays sanitized (same stripUnsafeChars as the visible title).
+                  aria-label={`Open run${r.issue_iid != null ? ` for issue #${r.issue_iid}` : ""}${
+                    r.issue_title.trim() ? `: ${stripUnsafeChars(r.issue_title)}` : ""
+                  }`}
                   className="absolute inset-0 rounded-md"
                 />
                 <div className="flex items-center gap-3 py-2.5 transition-colors group-hover:bg-raised/40">
@@ -371,26 +377,37 @@ export function Dashboard() {
                           mrIid={r.mr_iid}
                           mrState={mrState}
                           href={null}
-                          className="ml-2"
+                          // Issue #485 review FIX 1: raised above the card overlay
+                          // (relative z-10) so its `title` (MR state) fires on hover.
+                          className="relative z-10 ml-2"
                         />
                       )}
                     </p>
                   </div>
-                  {r.iteration_count > 0 && (
-                    <Badge tone="neutral" title="implement ⇄ review iterations">
-                      iter {r.iteration_count}
-                    </Badge>
-                  )}
-                  {/* PRD #122: compact milestone progress next to the iter badge; a
-                      non-milestone run keeps only the iter badge. PRD #265 M2: an
-                      unreported tracker shows M–/N, not a 0/N that reads as failure. */}
-                  {msBadge && (
-                    <Badge tone="info" title={msBadge.title}>
-                      {msBadge.label}
-                    </Badge>
-                  )}
-                  <RunHealthBadge run={r} />
-                  <StatusPill status={effectiveRunStatus(r)} />
+                  {/* Issue #485 review FIX 1: raise the right-side badge cluster above the
+                      card's stretched-link overlay (relative z-10) so each badge's native
+                      `title` tooltip fires on hover — the transparent overlay otherwise
+                      intercepts the pointer and carries no title. These status badges are
+                      not click-to-navigate targets, so the trade is correct; the title/body
+                      text stays under the overlay and still opens the run. The wrapper keeps
+                      the row's gap-3 spacing so the layout is unchanged. */}
+                  <div className="relative z-10 flex items-center gap-3">
+                    {r.iteration_count > 0 && (
+                      <Badge tone="neutral" title="implement ⇄ review iterations">
+                        iter {r.iteration_count}
+                      </Badge>
+                    )}
+                    {/* PRD #122: compact milestone progress next to the iter badge; a
+                        non-milestone run keeps only the iter badge. PRD #265 M2: an
+                        unreported tracker shows M–/N, not a 0/N that reads as failure. */}
+                    {msBadge && (
+                      <Badge tone="info" title={msBadge.title}>
+                        {msBadge.label}
+                      </Badge>
+                    )}
+                    <RunHealthBadge run={r} />
+                    <StatusPill status={effectiveRunStatus(r)} />
+                  </div>
                 </div>
               </li>
               );

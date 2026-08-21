@@ -1225,7 +1225,13 @@ export function Board() {
             >
               <Link
                 to={`/runs/${r.id}`}
-                aria-label={`Open run${r.issue_iid != null ? ` for issue #${r.issue_iid}` : ""}`}
+                // Issue #485 review FIX 2: name the link by the run's title so several
+                // issue-less runs in the strip get distinct, meaningful accessible names
+                // instead of a repeated bare "Open run". issue_title is untrusted forge
+                // text, so it stays sanitized via stripUnsafeChars.
+                aria-label={`Open run${r.issue_iid != null ? ` for issue #${r.issue_iid}` : ""}${
+                  r.issue_title.trim() ? `: ${stripUnsafeChars(r.issue_title)}` : ""
+                }`}
                 className="absolute inset-0 rounded-md"
               />
               <RunIssueRef

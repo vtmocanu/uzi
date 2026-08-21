@@ -256,7 +256,14 @@ function RunRow({
     <li className="group relative">
       <Link
         to={`/runs/${run.id}`}
-        aria-label={`Open run${run.issue_iid != null ? ` for issue #${run.issue_iid}` : ""}`}
+        // Issue #485 review FIX 2: name the link by the run's visible title so multiple
+        // issue-less runs (task/ci_fix/chat/self-improve, all "Open run" otherwise) get
+        // distinct, meaningful accessible names — the title now sits under the overlay
+        // and no longer contributes to the link name on its own. issue_title is untrusted
+        // forge text, so it stays sanitized (same stripUnsafeChars as the visible title).
+        aria-label={`Open run${run.issue_iid != null ? ` for issue #${run.issue_iid}` : ""}${
+          run.issue_title.trim() ? `: ${stripUnsafeChars(run.issue_title)}` : ""
+        }`}
         className="absolute inset-0 rounded-lg"
       />
       <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 transition-colors group-hover:border-edge-strong group-hover:bg-raised/70">
@@ -300,7 +307,10 @@ function RunRow({
                 mrIid={run.mr_iid}
                 mrState={mrState}
                 href={null}
-                className="font-medium"
+                // Issue #485 review FIX 1: raised above the card's stretched-link overlay
+                // (relative z-10) so its native `title` (MR state) fires on hover; the
+                // href-less chip is not click-to-navigate, which is fine for a status chip.
+                className="relative z-10 font-medium"
               />
             )}
             {/* PRD #40: tokens + cost join the meta line; hidden for a run with no
@@ -319,7 +329,15 @@ function RunRow({
             )}
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
+        {/* Issue #485 review FIX 1: raise the whole right-side badge cluster above the
+            card's stretched-link overlay (relative z-10) so every badge's native `title`
+            tooltip fires on hover — the transparent overlay otherwise intercepts the
+            pointer and its title is empty. These are status badges nobody clicks to open
+            a run, so trading their click-to-navigate for working tooltips is correct; the
+            title/body text stays under the overlay and still navigates. The Expedite
+            button (already relative z-10, stopPropagation) is unaffected by a raised
+            ancestor. */}
+        <div className="relative z-10 flex flex-wrap items-center gap-2">
           {run.auto_approve && (
             <Badge tone="brand" title="Autopilot: started from the label, plan auto-approved">
               autopilot
