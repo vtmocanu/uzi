@@ -253,6 +253,22 @@ type FakeClient struct {
 	LastDismissFindingReason string
 	DismissFindingErr        error
 
+	// Review issue filing (PRD #365 M2). ReviewIssueDraft is the canned issue-draft reply;
+	// ReviewFileResult / Last... capture the file write. *Err fields win over Err so a test can
+	// model a 404/409 on the write while the capture still proves it was reached.
+	ReviewIssueDraft       apitypes.IssueDraftDTO
+	GetReviewIssueDraftErr error
+	LastReviewDraftRunID   string
+	LastReviewDraftRecID   string
+
+	ReviewFileResult     ReviewIssueFileResult
+	FileReviewIssueErr   error
+	LastFileReviewRunID  string
+	LastFileReviewRecID  string
+	LastFileReviewRepoID string
+	LastFileReviewTitle  string
+	LastFileReviewDesc   string
+
 	// GetRunHook, when non-nil, drives GetRun instead of the static RunByID map. It
 	// is the sequencing seam `uzi run wait`'s tests need: a poll loop calls GetRun
 	// repeatedly, so a test scripts a per-call STATUS SEQUENCE (and injects a
@@ -751,6 +767,39 @@ func (f *FakeClient) DismissFinding(_ context.Context, id, reason string) error 
 		return f.DismissFindingErr
 	}
 	return f.Err
+}
+
+// GetReviewIssueDraft records the (run, rec) it was asked about and returns the canned draft.
+// GetReviewIssueDraftErr wins over the blanket Err so a test can model a 404 on the read while
+// the capture still proves the read was reached.
+func (f *FakeClient) GetReviewIssueDraft(_ context.Context, runID, recID string) (apitypes.IssueDraftDTO, error) {
+	f.LastReviewDraftRunID = runID
+	f.LastReviewDraftRecID = recID
+	if f.GetReviewIssueDraftErr != nil {
+		return apitypes.IssueDraftDTO{}, f.GetReviewIssueDraftErr
+	}
+	if f.Err != nil {
+		return apitypes.IssueDraftDTO{}, f.Err
+	}
+	return f.ReviewIssueDraft, nil
+}
+
+// FileReviewIssue records the (run, rec, repo, title, description) it was called with and returns
+// the canned result. FileReviewIssueErr wins over Err so a test can model a 409/404 on the WRITE
+// precisely, while the captures still prove the write was reached with the right arguments.
+func (f *FakeClient) FileReviewIssue(_ context.Context, runID, recID, repoID, title, description string) (ReviewIssueFileResult, error) {
+	f.LastFileReviewRunID = runID
+	f.LastFileReviewRecID = recID
+	f.LastFileReviewRepoID = repoID
+	f.LastFileReviewTitle = title
+	f.LastFileReviewDesc = description
+	if f.FileReviewIssueErr != nil {
+		return ReviewIssueFileResult{}, f.FileReviewIssueErr
+	}
+	if f.Err != nil {
+		return ReviewIssueFileResult{}, f.Err
+	}
+	return f.ReviewFileResult, nil
 }
 
 func (f *FakeClient) StreamRun(ctx context.Context, runID string) (*RunStream, error) {
