@@ -259,6 +259,11 @@ tasks:
       # it runs before `scan:secrets` too. A tree fact (a duplicate goose prefix panics
       # the runner at boot and in every *LiveDB test), so it belongs in gate:repo.
       - task: check:migration-numbering
+      # Binary/control-byte text-file guard (PRD #500 M2): also sub-second and offline,
+      # so it runs before `scan:secrets` too. A tree fact (a NEW text-extension file
+      # carrying a raw NUL or other control byte passes lint/typecheck/tests invisibly),
+      # so it belongs in gate:repo.
+      - task: check:no-binary-text
       - task: scan:secrets
 
   gate:api:
@@ -733,6 +738,19 @@ tasks:
       # (instrument broken). Both args are explicit so this echo shows exactly what is
       # scanned. See the script header.
       - ./scripts/check-migration-numbering.sh scripts/migration-numbering-canary api/internal/store/migrations
+
+  check:no-binary-text:
+    desc: no NEW text-extension source file is git-binary or carries control bytes, with a canary proving the detector fired
+    cmds:
+      # A NEW text-extension file that git treats as binary (a raw NUL) or that carries
+      # other control bytes passes lint/typecheck/tests/check-styles because the bytes
+      # are behaviorally invisible. Whole-tree floor (empty-tree base, offline) over a
+      # fixed source-code-oriented pathspec set. The committed canary carries a planted
+      # NUL and MUST be excluded from the whole-tree clauses (it would flag itself); the
+      # detector is proven live by scanning that canary explicitly first, or it exits 2
+      # (instrument broken). The explicit canary arg makes this echo show what is scanned.
+      # See the script header.
+      - ./scripts/check-binary-text.sh scripts/binary-text-canary.go
 
   render:worker-tag-check:
     desc: assert the hosted-worker image tag is pinned independently of Chart.AppVersion (PRD 422 M1)
