@@ -19,72 +19,84 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 )
 
+// result is run's outcome: the process exit code plus the text to print. run
+// builds the output as strings and RETURNS it rather than writing to os.Stdout,
+// so a test can assert both the exit code and the message without capturing a
+// file descriptor. main does the actual printing.
+type result struct {
+	code   int
+	stdout string
+	stderr string
+}
+
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	res := run(os.Args[1:])
+	if res.stdout != "" {
+		fmt.Print(res.stdout)
+	}
+	if res.stderr != "" {
+		fmt.Fprint(os.Stderr, res.stderr)
+	}
+	os.Exit(res.code)
 }
 
 // run is main's body as a testable unit: it parses args, resolves the rosters,
-// prints the nudge to stdout, and RETURNS the process exit code rather than
-// calling os.Exit. Keeping the exit code a return value is what lets a test pin
-// the load-bearing invariant — the default path (any divergence, no -strict)
-// returns 0 — so a future regression that exits nonzero on a nudge is caught.
-// 0 = success (nudge printed or rosters agree); 1 = -strict with an un-accepted
-// divergence; 2 = operational error (a roster dir or the accepted list missing).
-func run(args []string, stdout, stderr io.Writer) int {
+// and RETURNS the exit code and output rather than printing or calling os.Exit.
+// Keeping the exit code a return value is what lets a test pin the load-bearing
+// invariant — the default path (any divergence, no -strict) returns 0 — so a
+// future regression that exits nonzero on a nudge is caught. Codes: 0 = success
+// (nudge printed or rosters agree); 1 = -strict with an un-accepted divergence;
+// 2 = operational error (a roster dir or the accepted list missing).
+func run(args []string) result {
 	fs := flag.NewFlagSet("roleparity", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs.SetOutput(os.Stderr)
 	strict := fs.Bool("strict", false, "exit 1 on any un-accepted divergence (opt-in; the nudge default never does)")
 	repoRoot := fs.String("repo-root", "", "repo root (default: auto-detected by walking up to the .git marker)")
 	if err := fs.Parse(args); err != nil {
-		return 2
+		return result{code: 2}
 	}
 
 	root := *repoRoot
 	if root == "" {
 		r, err := findRepoRoot()
 		if err != nil {
-			fmt.Fprintf(stderr, "roleparity: %v\n", err)
-			return 2
+			return result{code: 2, stderr: fmt.Sprintf("roleparity: %v\n", err)}
 		}
 		root = r
 	}
 
 	product, err := roleStems(filepath.Join(root, "api", "internal", "agenttmpl", "builtins"))
 	if err != nil {
-		fmt.Fprintf(stderr, "roleparity: read product roster: %v\n", err)
-		return 2
+		return result{code: 2, stderr: fmt.Sprintf("roleparity: read product roster: %v\n", err)}
 	}
 	devteam, err := roleStems(filepath.Join(root, ".claude", "agents"))
 	if err != nil {
-		fmt.Fprintf(stderr, "roleparity: read dev-team roster: %v\n", err)
-		return 2
+		return result{code: 2, stderr: fmt.Sprintf("roleparity: read dev-team roster: %v\n", err)}
 	}
 	acc, err := readAccepted(filepath.Join(root, "scripts", "role-parity-accepted.tsv"))
 	if err != nil {
-		fmt.Fprintf(stderr, "roleparity: read accepted list: %v\n", err)
-		return 2
+		return result{code: 2, stderr: fmt.Sprintf("roleparity: read accepted list: %v\n", err)}
 	}
 
 	divs := roleParity(product, devteam, acc)
 	if len(divs) == 0 {
-		fmt.Fprintln(stdout, "role parity: dev-team and product rosters agree (modulo accepted divergences). Nothing to nudge.")
-		return 0
+		return result{code: 0, stdout: "role parity: dev-team and product rosters agree (modulo accepted divergences). Nothing to nudge.\n"}
 	}
-	fmt.Fprintf(stdout, "role parity: %d un-accepted divergence(s) — a nudge, not a failure:\n", len(divs))
+	out := fmt.Sprintf("role parity: %d un-accepted divergence(s) — a nudge, not a failure:\n", len(divs))
 	for _, d := range divs {
-		fmt.Fprintf(stdout, "  [%s] %s — %s\n", d.side, d.role, d.msg)
+		out += fmt.Sprintf("  [%s] %s — %s\n", d.side, d.role, d.msg)
 	}
+	code := 0
 	if *strict {
-		return 1
+		code = 1
 	}
-	return 0
+	return result{code: code, stdout: out}
 }
 
 // roleStems returns the sorted role identities in dir: the filename stem of each

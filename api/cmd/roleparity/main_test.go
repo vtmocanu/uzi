@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,19 +51,18 @@ func TestRunExitCodeDiscipline(t *testing.T) {
 	)
 
 	t.Run("default path exits 0 despite a divergence", func(t *testing.T) {
-		var out, errb bytes.Buffer
-		if code := run([]string{"-repo-root", root}, &out, &errb); code != 0 {
-			t.Fatalf("default run returned %d, want 0 (a nudge must never gate); stderr=%q", code, errb.String())
+		res := run([]string{"-repo-root", root})
+		if res.code != 0 {
+			t.Fatalf("default run returned %d, want 0 (a nudge must never gate); stderr=%q", res.code, res.stderr)
 		}
-		if !strings.Contains(out.String(), "tui-ux") {
-			t.Errorf("expected the tui-ux divergence in stdout, got %q", out.String())
+		if !strings.Contains(res.stdout, "tui-ux") {
+			t.Errorf("expected the tui-ux divergence in stdout, got %q", res.stdout)
 		}
 	})
 
 	t.Run("strict exits 1 on an un-accepted divergence", func(t *testing.T) {
-		var out, errb bytes.Buffer
-		if code := run([]string{"-repo-root", root, "-strict"}, &out, &errb); code != 1 {
-			t.Fatalf("strict run returned %d, want 1", code)
+		if res := run([]string{"-repo-root", root, "-strict"}); res.code != 1 {
+			t.Fatalf("strict run returned %d, want 1", res.code)
 		}
 	})
 }
@@ -75,28 +73,26 @@ func TestRunAgreeingRostersExitsZero(t *testing.T) {
 		[]string{"coder", "release"},
 		"product-only\tlead\tby design\ndevteam-only\trelease\tdev-only\n",
 	)
-	var out, errb bytes.Buffer
-	if code := run([]string{"-repo-root", root, "-strict"}, &out, &errb); code != 0 {
-		t.Fatalf("all-accepted run returned %d, want 0; stderr=%q", code, errb.String())
+	res := run([]string{"-repo-root", root, "-strict"})
+	if res.code != 0 {
+		t.Fatalf("all-accepted run returned %d, want 0; stderr=%q", res.code, res.stderr)
 	}
-	if !strings.Contains(out.String(), "Nothing to nudge") {
-		t.Errorf("expected the agree message, got %q", out.String())
+	if !strings.Contains(res.stdout, "Nothing to nudge") {
+		t.Errorf("expected the agree message, got %q", res.stdout)
 	}
 }
 
 func TestRunOperationalErrorsExitTwo(t *testing.T) {
 	t.Run("missing roster directory", func(t *testing.T) {
-		var out, errb bytes.Buffer
-		if code := run([]string{"-repo-root", filepath.Join(t.TempDir(), "nope")}, &out, &errb); code != 2 {
-			t.Fatalf("missing repo returned %d, want 2", code)
+		if res := run([]string{"-repo-root", filepath.Join(t.TempDir(), "nope")}); res.code != 2 {
+			t.Fatalf("missing repo returned %d, want 2", res.code)
 		}
 	})
 
 	t.Run("unknown side in accepted TSV", func(t *testing.T) {
 		root := fixtureRepo(t, []string{"coder"}, []string{"coder"}, "sideways\tcoder\tbad\n")
-		var out, errb bytes.Buffer
-		if code := run([]string{"-repo-root", root}, &out, &errb); code != 2 {
-			t.Fatalf("bad-side TSV returned %d, want 2", code)
+		if res := run([]string{"-repo-root", root}); res.code != 2 {
+			t.Fatalf("bad-side TSV returned %d, want 2", res.code)
 		}
 	})
 }
@@ -106,11 +102,11 @@ func TestRunOperationalErrorsExitTwo(t *testing.T) {
 func TestRunTolerantTSVComments(t *testing.T) {
 	accepted := "# header\n\n   # indented comment\nproduct-only\tlead\tby design\n"
 	root := fixtureRepo(t, []string{"coder", "lead"}, []string{"coder"}, accepted)
-	var out, errb bytes.Buffer
-	if code := run([]string{"-repo-root", root, "-strict"}, &out, &errb); code != 0 {
-		t.Fatalf("run with indented TSV comment returned %d, want 0; stderr=%q", code, errb.String())
+	res := run([]string{"-repo-root", root, "-strict"})
+	if res.code != 0 {
+		t.Fatalf("run with indented TSV comment returned %d, want 0; stderr=%q", res.code, res.stderr)
 	}
-	if !strings.Contains(out.String(), "Nothing to nudge") {
-		t.Errorf("lead should be suppressed, leaving no divergence; got %q", out.String())
+	if !strings.Contains(res.stdout, "Nothing to nudge") {
+		t.Errorf("lead should be suppressed, leaving no divergence; got %q", res.stdout)
 	}
 }
