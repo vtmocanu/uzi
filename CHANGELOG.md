@@ -14,6 +14,10 @@ place.)
 
 ## [Unreleased]
 
+### Added
+
+- **Board sort direction toggle ([#412](https://github.com/vtmocanu/uzi/issues/412), PRD #412).** The board's Sort control gains an ascending/descending toggle beside it, so any mode can run either direction (it is disabled for Manual); each mode keeps its previous direction as its default. The chosen sort (mode and direction) now applies to every lane, including **Closed**, which was previously always pinned to issue-number order.
+
 ## [0.51.0] - 2026-08-21
 <!-- release-title: capability-aware scheduling, wait-on-limit on by default, live runs list -->
 
