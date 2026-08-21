@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -280,6 +281,156 @@ func TestReviewUndoRefusedForReadOnlyToken(t *testing.T) {
 	if fc.LastDispositionRecID != "aaaaaaaa-1111-4111-8111-000000000001" {
 		t.Errorf("undo did not reach the delete with the resolved rec id, got %q", fc.LastDispositionRecID)
 	}
+}
+
+// -------------------------------------------------------------------------
+// `uzi review file <run-id> <rec-id>` (PRD #365 M2): resolve the short rec id,
+// fetch the server-templated draft, resolve the repo (--repo overrides the draft
+// default; an ambiguous default with no --repo is a usage error that NEVER guesses),
+// and POST the draft defaults. Exit codes mirror `uzi findings file`.
+// -------------------------------------------------------------------------
+
+// file success resolves the short id, POSTs the draft's default repo + templated
+// title/description, and prints the created issue (number + url).
+func TestReviewFileSuccess(t *testing.T) {
+	fc := reviewFake()
+	fc.ReviewIssueDraft = apitypes.IssueDraftDTO{DefaultRepoID: "repo-1", Title: "Fix the thing", Description: "details"}
+	fc.ReviewFileResult = uzicli.ReviewIssueFileResult{
+		Issue: uzicli.ReviewFiledIssueDTO{IID: 42, WebURL: "https://forge/x/-/issues/42", Title: "Fix the thing"},
+	}
+	out, _, code := runCLI(t, fakeEnv(fc), "review", "file", "r1", "aaaaaaaa-1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	// Both the draft fetch and the file write carried the RESOLVED full first rec id,
+	// so the short id mapped once and the same coordinate rode through both calls.
+	const wantRec = "aaaaaaaa-1111-4111-8111-000000000001"
+	if fc.LastReviewDraftRecID != wantRec {
+		t.Errorf("draft fetch rec id = %q, want the full first rec id %q", fc.LastReviewDraftRecID, wantRec)
+	}
+	if fc.LastFileReviewRecID != wantRec {
+		t.Errorf("file write rec id = %q, want the full first rec id %q", fc.LastFileReviewRecID, wantRec)
+	}
+	// The draft defaults were POSTed verbatim (repo/title/description), proving the CLI
+	// files the server-templated draft rather than inventing a body.
+	if fc.LastFileReviewRepoID != "repo-1" {
+		t.Errorf("file repo id = %q, want the draft default repo-1", fc.LastFileReviewRepoID)
+	}
+	if fc.LastFileReviewTitle != "Fix the thing" || fc.LastFileReviewDesc != "details" {
+		t.Errorf("file body = (%q,%q), want the draft defaults (Fix the thing, details)", fc.LastFileReviewTitle, fc.LastFileReviewDesc)
+	}
+	for _, want := range []string{"#42", "https://forge/x/-/issues/42"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("file output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// file --json emits the whole ReviewIssueFileResult, and a created-with-warning survives
+// in it (the forge issue is real, so a warning is a note on a success — exit 0).
+func TestReviewFileJSON(t *testing.T) {
+	fc := reviewFake()
+	fc.ReviewIssueDraft = apitypes.IssueDraftDTO{DefaultRepoID: "repo-1", Title: "Fix the thing", Description: "details"}
+	fc.ReviewFileResult = uzicli.ReviewIssueFileResult{
+		Issue:   uzicli.ReviewFiledIssueDTO{IID: 42, WebURL: "https://forge/x/-/issues/42", Title: "Fix the thing"},
+		Warning: "created but not linked",
+	}
+	out, _, code := runCLI(t, fakeEnv(fc), "review", "file", "r1", "aaaaaaaa-1", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	var got uzicli.ReviewIssueFileResult
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("--json is not a ReviewIssueFileResult: %v\n%s", err, out)
+	}
+	if got.Issue.IID != 42 {
+		t.Errorf("--json lost the issue iid: %+v", got)
+	}
+	if got.Warning != "created but not linked" {
+		t.Errorf("--json lost the warning: %+v", got)
+	}
+}
+
+// --repo overrides the draft's default repo (the flag wins), so the file write carries
+// the flag value, not the draft default.
+func TestReviewFileRepoOverride(t *testing.T) {
+	fc := reviewFake()
+	fc.ReviewIssueDraft = apitypes.IssueDraftDTO{DefaultRepoID: "repo-default", Title: "t", Description: "d"}
+	fc.ReviewFileResult = uzicli.ReviewIssueFileResult{Issue: uzicli.ReviewFiledIssueDTO{IID: 1}}
+	_, _, code := runCLI(t, fakeEnv(fc), "review", "file", "r1", "aaaaaaaa-1", "--repo", "repo-override")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc.LastFileReviewRepoID != "repo-override" {
+		t.Errorf("file repo id = %q, want the --repo override repo-override (flag must win over draft default)", fc.LastFileReviewRepoID)
+	}
+}
+
+// An ambiguous default repo (draft DefaultRepoID empty) with NO --repo is a usage error
+// (exit 2): the CLI must NEVER guess a repo. It prints the draft's picker note and calls
+// FileReviewIssue NOT AT ALL, so every capture stays zero.
+func TestReviewFileAmbiguousDefaultRepoIsUsageError(t *testing.T) {
+	fc := reviewFake()
+	fc.ReviewIssueDraft = apitypes.IssueDraftDTO{DefaultRepoID: "", DefaultNote: "pick a repo: A or B", Title: "t", Description: "d"}
+	out, errb, code := runCLI(t, fakeEnv(fc), "review", "file", "r1", "aaaaaaaa-1")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage — never guess a repo)", code, uzicli.ExitUsage)
+	}
+	// The write was never reached: the draft fetch resolved the rec id, but with no repo
+	// the command bailed BEFORE FileReviewIssue, so its captures are untouched.
+	if fc.LastFileReviewRepoID != "" || fc.LastFileReviewRecID != "" {
+		t.Errorf("FileReviewIssue must not be called on an ambiguous default (repo=%q, rec=%q)", fc.LastFileReviewRepoID, fc.LastFileReviewRecID)
+	}
+	// The picker note is surfaced so the user knows which repos to choose between.
+	if !strings.Contains(out+errb, "pick a repo") {
+		t.Errorf("want the draft's picker note in the output, got stdout:\n%s\nstderr:\n%s", out, errb)
+	}
+}
+
+// A 409 on the file write (already filed / being filed) is exit 5 (conflict), straight
+// from statusError — and the write was REACHED with the resolved rec id before refusal.
+func TestReviewFileAlreadyFiledExit5(t *testing.T) {
+	fc := reviewFake()
+	fc.ReviewIssueDraft = apitypes.IssueDraftDTO{DefaultRepoID: "repo-1", Title: "t", Description: "d"}
+	fc.FileReviewIssueErr = uzicli.Exitf(uzicli.ExitConflict, "already filed or being filed")
+	_, _, code := runCLI(t, fakeEnv(fc), "review", "file", "r1", "aaaaaaaa-1")
+	if code != uzicli.ExitConflict {
+		t.Fatalf("exit = %d, want %d (conflict)", code, uzicli.ExitConflict)
+	}
+	if fc.LastFileReviewRecID != "aaaaaaaa-1111-4111-8111-000000000001" {
+		t.Errorf("the file write was never reached with the resolved rec id (got %q)", fc.LastFileReviewRecID)
+	}
+}
+
+// An unknown rec id resolves to a not-found (exit 4) BEFORE any draft/file, and a 404
+// from the file write is likewise exit 4. Both must be exit 4.
+func TestReviewFileUnknownExit4(t *testing.T) {
+	// (a) An unknown short id: resolveRecID returns ExitNotFound, so the command never
+	// fetches the draft or files anything (the captures stay zero).
+	t.Run("unknown rec id", func(t *testing.T) {
+		fc := reviewFake()
+		_, _, code := runCLI(t, fakeEnv(fc), "review", "file", "r1", "zzzzzzzz")
+		if code != uzicli.ExitNotFound {
+			t.Fatalf("exit = %d, want %d (not found)", code, uzicli.ExitNotFound)
+		}
+		if fc.LastReviewDraftRecID != "" || fc.LastFileReviewRecID != "" {
+			t.Errorf("an unknown rec id must not fetch the draft or file (draft rec=%q, file rec=%q)", fc.LastReviewDraftRecID, fc.LastFileReviewRecID)
+		}
+	})
+	// (b) A valid rec but a 404 from the file write (unknown/foreign coordinate at the
+	// server) is exit 4, straight from statusError; the write was reached.
+	t.Run("file write 404", func(t *testing.T) {
+		fc := reviewFake()
+		fc.ReviewIssueDraft = apitypes.IssueDraftDTO{DefaultRepoID: "repo-1", Title: "t", Description: "d"}
+		fc.FileReviewIssueErr = uzicli.Exitf(uzicli.ExitNotFound, "not found")
+		_, _, code := runCLI(t, fakeEnv(fc), "review", "file", "r1", "aaaaaaaa-1")
+		if code != uzicli.ExitNotFound {
+			t.Fatalf("exit = %d, want %d (not found)", code, uzicli.ExitNotFound)
+		}
+		if fc.LastFileReviewRecID != "aaaaaaaa-1111-4111-8111-000000000001" {
+			t.Errorf("the file write was never reached with the resolved rec id (got %q)", fc.LastFileReviewRecID)
+		}
+	})
 }
 
 // The deprecated `uzi run review` alias still works (shares runReviewShow) and its
