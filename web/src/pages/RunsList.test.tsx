@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { RunsHistory, RunsLayout, RunsList, sortPast } from "./RunsList";
 import { api, type RunListItem, type SecretMeta } from "../lib/api";
@@ -155,6 +155,10 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
+  // Restore real timers so the fake-timer poll tests below cannot leak fake timers
+  // into the ~40 real-timer waitFor(...) tests (which would hang their waits). The
+  // Dashboard.test.tsx afterEach does the same for the same reason.
+  vi.useRealTimers();
   vi.clearAllMocks();
 });
 
@@ -960,5 +964,102 @@ describe("RunsList — queue priority pill + Expedite action (PRD #320 M6)", () 
     expect(screen.queryByText("Expedited")).toBeNull();
     expect(screen.queryByRole("button", { name: "Expedite" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
+  });
+});
+
+// PRD #518: the Runs list live-updates by re-fetching every 10s while the tab is
+// visible (usePollWhileVisible), matching Board and Dashboard. These use fake timers
+// + advanceTimersByTimeAsync(10000) — the afterEach restores real timers so they do
+// not leak into the real-timer waitFor tests above. useNow is a mocked constant, so
+// advancing 10000ms fires only the poll, never the 1s duration clock.
+describe("RunsList — live poll (PRD #518)", () => {
+  beforeEach(() => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: false },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+  });
+
+  it("re-fetches the runs list every 10s and re-renders updated run state", async () => {
+    vi.useFakeTimers();
+    // First load shows a queued run; the 10s poll returns it running.
+    mockApi.listRuns
+      .mockResolvedValueOnce({ runs: [aRun({ id: "r", issue_title: "First title", status: "queued" })] })
+      .mockResolvedValue({ runs: [aRun({ id: "r", issue_title: "Second title", status: "running" })] });
+
+    renderRuns();
+    // Flush the first load.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText("First title")).toBeTruthy();
+    expect(screen.getByText("queued")).toBeTruthy();
+
+    // The 10s poll re-fetches listRuns() and the row reflects the new state.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10000);
+    });
+    expect(mockApi.listRuns).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("Second title")).toBeTruthy();
+    expect(screen.getByText("running")).toBeTruthy();
+    // The mount-only credential secrets fetch does NOT re-fire on a poll (design
+    // invariant 2: poll only the volatile endpoint).
+    expect(mockApi.listSecrets).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the last-good list when a poll fails — no skeleton re-flash, no error banner", async () => {
+    vi.useFakeTimers();
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "r", issue_title: "Steady run", status: "running" })],
+    });
+
+    renderRuns();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText("Steady run")).toBeTruthy();
+
+    // The next poll rejects; the poll must swallow it and keep last-good.
+    mockApi.listRuns.mockRejectedValueOnce(new Error("poll blip"));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10000);
+    });
+
+    expect(mockApi.listRuns).toHaveBeenCalledTimes(2); // first load + one poll
+    expect(screen.getByText("Steady run")).toBeTruthy(); // last-good rows intact
+    // No error banner over the working list (the poll never routes through setError).
+    expect(screen.queryByText(/Failed to load runs/)).toBeNull();
+  });
+
+  it("re-polls the admin factory lists (runs + workers) when the viewer is admin", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: true, email: "me@uzi.test" },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListWorkers.mockResolvedValue({ workers: [] });
+    mockApi.adminListRuns
+      .mockResolvedValueOnce({
+        runs: [aRun({ id: "a", issue_title: "First factory run", status: "running", owner_email: "other@uzi.test" })],
+      })
+      .mockResolvedValue({
+        runs: [aRun({ id: "b", issue_title: "Second factory run", status: "running", owner_email: "other@uzi.test" })],
+      });
+
+    vi.useFakeTimers();
+    renderRuns();
+    // Flush the first admin load so the card renders (!adminLoading).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText("First factory run")).toBeTruthy();
+
+    // The 10s poll re-fetches both admin lists and the card reflects the new run.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10000);
+    });
+    expect(mockApi.adminListRuns).toHaveBeenCalledTimes(2);
+    expect(mockApi.adminListWorkers).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("Second factory run")).toBeTruthy();
   });
 });
