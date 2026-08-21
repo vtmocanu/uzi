@@ -497,6 +497,30 @@ pragma-carrying files: 14 of them run under jsdom today and still do. The check 
 proves it is a per-file census of what all 118 files actually run under, taken before
 and after and byte-identical, rather than a count or a classification.
 
+## Contextual doc links: the DocLink registry
+
+`web/src/lib/doclinks.ts` is the single source of truth for every SPA link into
+the in-app docs (`/docs/:slug`). It exports bare-slug `DOC_*` constants (e.g.
+`DOC_ADMIN_SETTINGS = "admin-settings"`) plus `ALL_DOC_SLUGS`, the list of all
+of them.
+
+UI surfaces link out via `<DocLink slug={DOC_...}>guide title</DocLink>`
+(`web/src/components/DocLink.tsx`), which renders a react-router `Link` to
+`/docs/${slug}`. Never hand-write a `/docs/…` route string and never link out
+to a GitHub-blob URL for a `docs/*.md` file — both bypass the registry and
+the in-app renderer. The link text is the guide's title, never "click here";
+navigation stays same-tab (no `target="_blank"`).
+
+Every registry slug must name an `audience: user` doc. `web/src/lib/doclinks.test.ts`
+enforces this by cross-checking each slug against `listUserDocs()`, with a
+non-empty-corpus guard so the check can't pass vacuously — renaming or
+de-`user`-ing a linked doc reddens `npm test` before it can ship a soft-404
+(PRD #57).
+
+When you add a new user-facing setup/management/admin surface, add its
+guide's slug to the registry (and to `ALL_DOC_SLUGS`) and drop a `DocLink`
+into the card's always-visible intro, not only into an error state.
+
 ## Scripting the bot setup with `glab`
 
 The UI steps in [GitLab bot setup](./gitlab-bot-setup.md) have `glab`
