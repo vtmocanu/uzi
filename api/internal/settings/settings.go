@@ -77,6 +77,11 @@ const (
 	// validated with the PRD #17 model rules) but rides the ISSUE-RUN claim, not the
 	// judge claim. Admin-writable with a compiled-in default.
 	KeySummaryModel = "summary_model"
+	// GitHub Projects v2 Status sync (PRD #364). Instance-wide kill-switch
+	// (text "true"/"false"): OFF until an admin enables it, so the whole sync
+	// feature is a strict no-op on a fresh instance. Admin-writable with a
+	// compiled-in default; no seeded row (an absent row synthesizes to the default).
+	KeyGithubProjectSyncEnabled = "github_project_sync_enabled"
 	// Self-improvement keys (PRD #46 Decision 9). selfimprove_enabled/interval are
 	// admin-configurable (with defaults). selfimprove_repo/user_id/last_run_at are
 	// ENGINE-MANAGED state, NOT admin-writable through the generic settings PUT: they
@@ -161,6 +166,10 @@ const (
 	// M5's spend guards and the per-user override exist.
 	DefaultJudgeEnabled = "false"
 	DefaultJudgeModel   = "opus"
+	// PRD #364. The GitHub Projects v2 Status sync is OFF until an admin enables it
+	// (it writes to a user's project board), so the feature is a strict no-op on a
+	// fresh instance and on upgrade.
+	DefaultGithubProjectSyncEnabled = "false"
 	// PRD #69. Judge enforcement is OFF by default: the per-user opt-in gate stands
 	// until an admin flips this on, so the feature is a strict no-op on upgrade.
 	DefaultJudgeEnforceAll = "false"
@@ -278,6 +287,9 @@ var Defaults = map[string]string{
 	KeyJudgeEnforceAll:      DefaultJudgeEnforceAll,
 	KeyJudgeCooldownSeconds: DefaultJudgeCooldownSeconds,
 	KeyJudgeDailyBudget:     DefaultJudgeDailyBudget,
+	// PRD #364 GitHub Projects v2 Status sync kill-switch. Same no-seeded-row
+	// pattern as the judge keys: an absent row synthesizes to the default (off).
+	KeyGithubProjectSyncEnabled: DefaultGithubProjectSyncEnabled,
 	// PRD #362 Decision 8 run-summary model. Same no-seeded-row pattern as the judge
 	// keys: an absent row synthesizes to DefaultSummaryModel ("haiku"), so All/AdminView
 	// surface it to the settings page on every instance and no migration seeds it.
@@ -591,6 +603,23 @@ func (c *Cache) JudgeEnabled(ctx context.Context) (bool, error) {
 		return false, err
 	default:
 		return DefaultJudgeEnabled == "true", err
+	}
+}
+
+// GithubProjectSyncEnabled reports whether the GitHub Projects v2 Status sync is
+// enabled instance-wide (PRD #364): the global kill-switch. Stored as the text
+// "true"/"false"; any other value falls back to the compiled-in default (false) —
+// the same strict junk-tolerance as JudgeEnabled, so a malformed value never
+// silently starts writing to a user's project board.
+func (c *Cache) GithubProjectSyncEnabled(ctx context.Context) (bool, error) {
+	v, err := c.get(ctx, KeyGithubProjectSyncEnabled)
+	switch v {
+	case "true":
+		return true, err
+	case "false":
+		return false, err
+	default:
+		return DefaultGithubProjectSyncEnabled == "true", err
 	}
 }
 
@@ -1020,7 +1049,7 @@ func Validate(key, value string) error {
 	case KeyDefaultTheme:
 		return theme.Validate(value)
 	case KeyPrdlessEnabled, KeySlackEnabled, KeyJudgeEnabled, KeyJudgeEnforceAll, KeySelfimproveEnabled, KeyHealthEnabled,
-		KeyEligibleLabelWaivesPRDLink:
+		KeyEligibleLabelWaivesPRDLink, KeyGithubProjectSyncEnabled:
 		return validateBool(value)
 	case KeyJudgeModel, KeySummaryModel:
 		return validateModelAlias(value)

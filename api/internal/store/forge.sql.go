@@ -397,6 +397,55 @@ func (q *Queries) GetLatestRunForIssue(ctx context.Context, arg GetLatestRunForI
 	return i, err
 }
 
+const getRepoByID = `-- name: GetRepoByID :one
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
+       r.default_branch, r.enabled,
+       c.forge_type, c.base_url, c.token_ciphertext, c.user_id
+FROM repos r
+JOIN forge_connections c ON c.id = r.connection_id
+WHERE r.id = $1
+`
+
+type GetRepoByIDRow struct {
+	ID                uuid.UUID   `json:"id"`
+	ConnectionID      uuid.UUID   `json:"connection_id"`
+	ForgeProjectID    int64       `json:"forge_project_id"`
+	PathWithNamespace string      `json:"path_with_namespace"`
+	WebUrl            string      `json:"web_url"`
+	DefaultBranch     pgtype.Text `json:"default_branch"`
+	Enabled           bool        `json:"enabled"`
+	ForgeType         string      `json:"forge_type"`
+	BaseUrl           string      `json:"base_url"`
+	TokenCiphertext   []byte      `json:"token_ciphertext"`
+	UserID            uuid.UUID   `json:"user_id"`
+}
+
+// One repo plus the connection fields needed to build a forge client, UNSCOPED by
+// user. Modeled on GetRepoForUser but WITHOUT the user_id filter — the GitHub
+// Projects v2 sync (PRD #364 M3) is driven from an ADMIN-only route, targeting a
+// repo by id regardless of which user owns its connection (precedent:
+// SetRepoGuardrailOverride is the unscoped admin write). Returns the joined
+// connection fields the forge builder needs (forge_type, base_url, token_ciphertext)
+// plus forge_project_id for slug/issue resolution.
+func (q *Queries) GetRepoByID(ctx context.Context, id uuid.UUID) (GetRepoByIDRow, error) {
+	row := q.db.QueryRow(ctx, getRepoByID, id)
+	var i GetRepoByIDRow
+	err := row.Scan(
+		&i.ID,
+		&i.ConnectionID,
+		&i.ForgeProjectID,
+		&i.PathWithNamespace,
+		&i.WebUrl,
+		&i.DefaultBranch,
+		&i.Enabled,
+		&i.ForgeType,
+		&i.BaseUrl,
+		&i.TokenCiphertext,
+		&i.UserID,
+	)
+	return i, err
+}
+
 const getRepoForUser = `-- name: GetRepoForUser :one
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled,

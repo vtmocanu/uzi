@@ -332,6 +332,16 @@ func run() error {
 
 	svc := forgesvc.New(q, box, cfg.ForgeHTTPTimeout, settingsCache)
 
+	// GitHub Projects v2 Status-sync provisioning service (PRD #364 M3): adopt/link
+	// an existing project + seed it. Builds forges through svc (same decryption path
+	// the handlers use) and gates on the instance kill-switch in settingsCache.
+	projectSync := forgesvc.NewProjectSync(q, svc, settingsCache, slog.Default())
+	// Reverse (Status → label) writeback collaborator (PRD #364 M6): the reverse
+	// poller writes column labels through svc.AutoMove — the ordinary label-move path,
+	// deliberately NOT one of the two forward-hooked call sites (D6), so a reverse
+	// write does not re-project back onto Status.
+	projectSync.SetMover(svc)
+
 	// Wire the forge builder into workersvc so its composite forge-write operations —
 	// ConfirmProposalForUser, StartRunForUser (PRD #191 Decision 8) — reach the forge
 	// through the same decryption path the handlers use, without a forgesvc↔workersvc
@@ -467,6 +477,9 @@ func run() error {
 	// own goroutine, isolated from the liveness sweep so a stalled forge never
 	// delays worker-loss recovery.
 	lifecycle := runlifecycle.New(q, svc, cfg.FrontendOrigin)
+	// Project a successful uzi-originated column move onto a linked GitHub Projects
+	// v2 Status (PRD #364 M5), best-effort. The same service backs the drag handler.
+	lifecycle.SetProjector(projectSync)
 	wsvc.SetLifecycle(lifecycle)
 
 	// Background sync engine: pulls forge changes into the issue cache for every
@@ -495,6 +508,12 @@ func run() error {
 	// simply NOT wiring it; per-user ci_autofix_enabled (default-OFF) and the
 	// pipelineMaxRefs>0 gate control activation. notifier lands the inbox rows.
 	engine.SetCIAutoFix(poller.NewCIAutoFix(q, wsvc, notifier, cfg.CIFixMaxJobs, cfg.CIFixLogTailBytes, cfg.CIAutofixMaxAttempts, cfg.CIAutofixConfigPaths))
+	// Reverse GitHub Projects v2 sync (PRD #364 M6): a per-tick poller sibling for
+	// GitHub synced repos that reads item Statuses, diffs each against the stored
+	// marker, and writes the matching column label via AutoMove for GitHub-side
+	// changes. Wired unconditionally — the instance kill-switch is simply NOT wiring
+	// it; the per-repo link row + the settings kill-switch gate activation.
+	engine.SetProjectReverseSync(projectSync)
 
 	// Run-liveness sweeper (sibling of the poller). Boot runs one orphan sweep
 	// immediately, then the goroutine sweeps on its own interval. Both lifetimes
@@ -702,6 +721,9 @@ func run() error {
 	// let a burst of dragging starve the user's real forge operations.
 	boardOrderLimiter := mw.NewLimiter(cfg.BoardOrderRateLimitMax, cfg.BoardOrderRateLimitWindow, cfg.TrustedProxies)
 	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub, settingsCache)
+	// GitHub Projects v2 Status-sync provisioning service (PRD #364 M3), wired
+	// post-construction like the other optional forge collaborators.
+	h.SetProjectSync(projectSync)
 	h.SetVersion(version)
 	// The rest of the build coordinates (PRD #175). Passed raw: the handler decides
 	// what an absent or unparseable stamp means, so there is one such place.

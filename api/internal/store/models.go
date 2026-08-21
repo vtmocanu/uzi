@@ -163,6 +163,28 @@ type ForgeConnection struct {
 	HumanUsername      pgtype.Text        `json:"human_username"`
 }
 
+type GithubProjectItem struct {
+	RepoID             uuid.UUID          `json:"repo_id"`
+	ForgeIssueIid      int64              `json:"forge_issue_iid"`
+	ItemNodeID         string             `json:"item_node_id"`
+	LastStatusOptionID pgtype.Text        `json:"last_status_option_id"`
+	LastSyncedAt       pgtype.Timestamptz `json:"last_synced_at"`
+}
+
+type GithubProjectLink struct {
+	ID            uuid.UUID          `json:"id"`
+	RepoID        uuid.UUID          `json:"repo_id"`
+	ProjectNodeID string             `json:"project_node_id"`
+	ProjectNumber int64              `json:"project_number"`
+	StatusFieldID string             `json:"status_field_id"`
+	StatusOptions []byte             `json:"status_options"`
+	OwnedByUzi    bool               `json:"owned_by_uzi"`
+	LastSyncedAt  pgtype.Timestamptz `json:"last_synced_at"`
+	LastError     pgtype.Text        `json:"last_error"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+}
+
 type HostedWorkerToken struct {
 	WorkerID        uuid.UUID          `json:"worker_id"`
 	TokenCiphertext []byte             `json:"token_ciphertext"`
