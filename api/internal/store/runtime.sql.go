@@ -460,6 +460,37 @@ func (q *Queries) ClearRunMovePending(ctx context.Context, id uuid.UUID) (int64,
 	return result.RowsAffected(), nil
 }
 
+const clearRunRequiredCapabilities = `-- name: ClearRunRequiredCapabilities :execrows
+UPDATE runs SET required_capabilities = '{}', updated_at = now()
+WHERE id = $1 AND user_id = $2 AND status = 'awaiting_approval'
+`
+
+type ClearRunRequiredCapabilitiesParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// PRD #84 M4 (unit 4c): the user override ("run without the capability", Decision 12).
+// When the owner approves a plan the capability gate would BLOCK — because plan-time
+// inference (or the repo hint) attached a required capability the owning worker cannot
+// satisfy — this clears the run's inferred/hinted requirement set so the subsequent
+// approve is no longer fenced. v1 clears the WHOLE run set (repo hint + inferred); a
+// hint-vs-inference split is a future refinement (Decision 6/12). No security boundary is
+// crossed: the §300 guardrail still denies docker USE on a daemon-less worker at run time,
+// so clearing the SCHEDULING requirement only removes the approval fence, never the
+// runtime protection.
+//
+// Owner-scoped (user_id) AND status-guarded (awaiting_approval only): the clear runs from
+// the owner-authenticated approve path, and a run outside the plan gate is a no-op
+// (0 rows), so a stray override on a running/terminal run changes nothing.
+func (q *Queries) ClearRunRequiredCapabilities(ctx context.Context, arg ClearRunRequiredCapabilitiesParams) (int64, error) {
+	result, err := q.db.Exec(ctx, clearRunRequiredCapabilities, arg.ID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const consumeRunInputs = `-- name: ConsumeRunInputs :many
 WITH pending AS (
     SELECT p.id FROM run_user_inputs p

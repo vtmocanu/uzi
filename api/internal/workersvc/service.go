@@ -172,7 +172,14 @@ var (
 	// agent roster that breaks a cap, and a browser-submitted agent selection that
 	// names an agent the run does not have. Both map to 400.
 	ErrInvalidSelection = errors.New("invalid agent selection")
-	ErrWorkerNotFound   = errors.New("worker not found")
+	// ErrCapabilityUnmet is the sentinel for the PRD #84 M4 4c approval gate: a plan being
+	// approved requires capabilities its OWNING worker cannot satisfy, so the approve is
+	// blocked → 409. It is carried by a *CapabilityUnmetError, which names the unmet set for
+	// the handler to render; errors.Is against this sentinel matches (Unwrap), and errors.As
+	// on the struct extracts the names. Mirrors ErrInvalidSelection's role as the stable
+	// match target the handler switches on.
+	ErrCapabilityUnmet = errors.New("run requires capabilities the owning worker cannot satisfy")
+	ErrWorkerNotFound  = errors.New("worker not found")
 	// ErrWorkerHasActiveRuns rejects deletion of a worker that still owns a
 	// non-terminal run: the FK is ON DELETE SET NULL, so deleting would orphan the
 	// run past every sweep (and the one-active-run index would then block re-runs).
@@ -224,6 +231,18 @@ type GuardrailBlockedError struct{ Findings []string }
 
 func (e *GuardrailBlockedError) Error() string { return ErrGuardrailBlocked.Error() }
 func (e *GuardrailBlockedError) Unwrap() error { return ErrGuardrailBlocked }
+
+// CapabilityUnmetError is returned by capabilityGate when the PRD #84 M4 4c approval gate
+// blocks: Unmet carries the run's required capabilities the owning worker cannot satisfy,
+// in stable capability order, for the handler's 409 body. It wraps ErrCapabilityUnmet so
+// callers can errors.Is it for the status mapping and errors.As it to read Unmet — exactly
+// the GuardrailBlockedError pattern above.
+type CapabilityUnmetError struct{ Unmet []string }
+
+func (e *CapabilityUnmetError) Error() string {
+	return fmt.Sprintf("%s: %s", ErrCapabilityUnmet.Error(), strings.Join(e.Unmet, ", "))
+}
+func (e *CapabilityUnmetError) Unwrap() error { return ErrCapabilityUnmet }
 
 // Agent-memory caps (PRD #90, OQ-C). Server-enforced (not client-trusted) and the
 // single Go source of truth the SDK tool schema mirrors: at most
@@ -473,6 +492,10 @@ type Store interface {
 	// CreateApprovePlanInput enqueues an approve_plan AND records the run's agent
 	// selection atomically (PRD #37).
 	CreateApprovePlanInput(ctx context.Context, arg store.CreateApprovePlanInputParams) (store.RunUserInput, error)
+	// ClearRunRequiredCapabilities wipes a run's inferred/hinted required_capabilities
+	// set (PRD #84 M4 4c), owner- and awaiting_approval-scoped. Backs the "run without the
+	// capability" user override so a capability-gated approve is no longer fenced.
+	ClearRunRequiredCapabilities(ctx context.Context, arg store.ClearRunRequiredCapabilitiesParams) (int64, error)
 	// CreateRunAnswerInput enqueues an `answer` and records the question it answers
 	// (PRD #88 M1). The question id is a column, not a JSON field, because
 	// SetRunRunning's resume guard compares it in SQL.
@@ -4634,6 +4657,17 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	if sel != nil && kind != "approve_plan" {
 		return SubmitInputResult{}, fmt.Errorf("%w: an agent selection is only valid when approving a plan", ErrInvalidSelection)
 	}
+	// PRD #84 M4 4c: the AUTHORITATIVE capability approval gate runs here for EVERY
+	// approve_plan — before the selection-bearing dispatch below AND before the
+	// nil-selection plain-enqueue path further down — so neither path can approve a plan
+	// onto a worker that cannot run it. See capabilityGate; the user override cleared the
+	// run's required_capabilities in the handler BEFORE this call, so on override the set is
+	// empty and the gate passes.
+	if kind == "approve_plan" {
+		if err := s.capabilityGate(ctx, run); err != nil {
+			return SubmitInputResult{}, err
+		}
+	}
 	if kind == "approve_plan" && sel != nil {
 		return s.submitApproval(ctx, run, *sel)
 	}
@@ -4774,6 +4808,10 @@ func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSe
 	if err := validateSelection(sel, roster); err != nil {
 		return SubmitInputResult{}, err
 	}
+	// The capability approval gate (capabilityGate) is enforced UPSTREAM in SubmitInput for
+	// every approve_plan — both the selection-bearing path that reaches here and the
+	// nil-selection plain-enqueue path — so a plan can never be approved onto a worker that
+	// cannot run it, whichever path the client used.
 	exclusions, err := encodeJSONArray(sel.Exclusions)
 	if err != nil {
 		return SubmitInputResult{}, fmt.Errorf("encode agent exclusions: %w", err)
@@ -4798,6 +4836,71 @@ func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSe
 	// Populated AFTER validateSelection accepted the selection: only a valid, accepted
 	// guard-role exclusion warrants the owner heads-up (PRD #319 M3).
 	return SubmitInputResult{ServerSide: false, ExcludedGuardRoles: excludedGuardRoles(sel)}, nil
+}
+
+// capabilityGate is the AUTHORITATIVE, server-side PRD #84 M4 4c approval gate. A run at
+// awaiting_approval is owned by exactly one worker (run.WorkerID); if that worker's EFFECTIVE
+// capabilities do not satisfy the run's plan-time-inferred (and M2 repo-hinted)
+// required_capabilities, the approve is BLOCKED (a *CapabilityUnmetError → 409) so a plan can
+// never be approved onto a worker that cannot run it. The effective-caps fold —
+// worker.capabilities ∪ {docker if docker_enabled} — is the SAME one fn_worker_can_claim
+// (migration 00142) and CountOnlineWorkersSatisfyingCaps apply, so approve and claim never
+// disagree. Gated by the capability-aware kill-switch (default ON), identically to the
+// claim/health paths: with the flag OFF the fleet claims best-effort, so there is no
+// eligibility to enforce and this stays silent. Called from SubmitInput for every approve_plan
+// (both the selection and nil-selection paths) so the gate has no bypass; the user override
+// clears required_capabilities BEFORE the approve (ClearRunRequiredCapabilities, handler
+// CreateRunInput), so on override the required set is empty and this returns nil.
+func (s *Service) capabilityGate(ctx context.Context, run store.Run) error {
+	if len(run.RequiredCapabilities) == 0 || !s.capabilityAwareOn(ctx) {
+		return nil
+	}
+	effective, err := s.effectiveOwningWorkerCaps(ctx, run)
+	if err != nil {
+		return err
+	}
+	if unmet := capability.Unmet(run.RequiredCapabilities, effective); len(unmet) > 0 {
+		return &CapabilityUnmetError{Unmet: unmet}
+	}
+	return nil
+}
+
+// effectiveOwningWorkerCaps folds the run's OWNING worker's effective capability set the
+// SAME way fn_worker_can_claim (migration 00142) and CountOnlineWorkersSatisfyingCaps do —
+// the worker's stored capabilities plus `docker` when docker_enabled — so the PRD #84 M4 4c
+// approval gate and the claim gate evaluate the identical set and can never disagree. A run
+// with no owning worker (no awaiting_approval run reaches submitApproval without one) folds
+// to the empty set, which fails CLOSED: every required capability is then unmet, matching
+// the claim path's fail direction. A GetWorkerByID error (including the worker having been
+// deleted) propagates as an error rather than silently opening the gate.
+func (s *Service) effectiveOwningWorkerCaps(ctx context.Context, run store.Run) ([]string, error) {
+	if !run.WorkerID.Valid {
+		return nil, nil
+	}
+	wkr, err := s.q.GetWorkerByID(ctx, uuid.UUID(run.WorkerID.Bytes))
+	if err != nil {
+		return nil, err
+	}
+	effective := append([]string{}, wkr.Capabilities...)
+	if wkr.DockerEnabled.Valid && wkr.DockerEnabled.Bool {
+		effective = append(effective, capability.Docker)
+	}
+	return effective, nil
+}
+
+// OverrideRunRequiredCapabilities backs the PRD #84 M4 4c user override ("run without the
+// capability", Decision 12): it clears the run's inferred/hinted required_capabilities so a
+// subsequent approve_plan is no longer fenced by the capability gate above. The clear is
+// owner- AND awaiting_approval-scoped in SQL, so a non-owner runID or a run outside the plan
+// gate is a silent no-op (0 rows) — the approve that follows resolves ownership and status
+// itself (GetRun 404s a non-owner). It runs BEFORE that approve, so submitApproval reloads a
+// run whose required set is already empty and the block is skipped. v1 clears the WHOLE set
+// (repo hint + inferred); a hint-vs-inference split is a future refinement (Decision 6/12),
+// and no runtime security boundary is bypassed — the §300 guardrail still denies docker USE
+// on a daemon-less worker at run time.
+func (s *Service) OverrideRunRequiredCapabilities(ctx context.Context, userID, runID uuid.UUID) error {
+	_, err := s.q.ClearRunRequiredCapabilities(ctx, store.ClearRunRequiredCapabilitiesParams{ID: runID, UserID: userID})
+	return err
 }
 
 // AnswerBody is the wire shape of an `answer` steering input (PRD #88 M1). It is

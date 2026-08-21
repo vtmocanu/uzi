@@ -1078,6 +1078,23 @@ WHERE id = @id AND worker_id = @worker_id
   -- permanently. Do not add it.
   AND status <> 'limit_wait';
 
+-- name: ClearRunRequiredCapabilities :execrows
+-- PRD #84 M4 (unit 4c): the user override ("run without the capability", Decision 12).
+-- When the owner approves a plan the capability gate would BLOCK — because plan-time
+-- inference (or the repo hint) attached a required capability the owning worker cannot
+-- satisfy — this clears the run's inferred/hinted requirement set so the subsequent
+-- approve is no longer fenced. v1 clears the WHOLE run set (repo hint + inferred); a
+-- hint-vs-inference split is a future refinement (Decision 6/12). No security boundary is
+-- crossed: the §300 guardrail still denies docker USE on a daemon-less worker at run time,
+-- so clearing the SCHEDULING requirement only removes the approval fence, never the
+-- runtime protection.
+--
+-- Owner-scoped (user_id) AND status-guarded (awaiting_approval only): the clear runs from
+-- the owner-authenticated approve path, and a run outside the plan gate is a no-op
+-- (0 rows), so a stray override on a running/terminal run changes nothing.
+UPDATE runs SET required_capabilities = '{}', updated_at = now()
+WHERE id = @id AND user_id = @user_id AND status = 'awaiting_approval';
+
 -- name: SetRunIntentSummary :execrows
 -- PRD #362 M1: persist a run's plain-English INTENT summary ("what this run will
 -- implement"), posted by the worker after the clone is provisioned and before it

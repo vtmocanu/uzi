@@ -418,6 +418,13 @@ func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
 		// PRD #320 D8: the display priority class, supplied by the caller (a list-query
 		// column or h.runPriorityClass) so this mapper stays pure.
 		Priority: priorityClass,
+		// PRD #84: the run's inferred/hinted scheduling requirements, surfaced RAW for the
+		// web/CLI (4d) readiness/mismatch display. Capability/tool slices are normalized to
+		// a non-nil empty slice ([] over null), mirroring the repo DTO; size_class is the
+		// NOT NULL DEFAULT '' string (empty for a run whose inference never set it).
+		RequiredCapabilities: capsOrEmpty(r.RequiredCapabilities),
+		RequiredTools:        capsOrEmpty(r.RequiredTools),
+		SizeClass:            r.SizeClass,
 	}
 	if r.RepoID.Valid {
 		s := uuid.UUID(r.RepoID.Bytes).String()
@@ -1223,6 +1230,20 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// PRD #84 M4 4c: the "run without the capability" user override (Decision 12). When the
+	// owner approves WITH override_capabilities, clear the run's inferred/hinted
+	// required_capabilities FIRST, so the capability approval gate in submitApproval reloads
+	// an empty required set and does not 409-block. Owner- and awaiting_approval-scoped in
+	// SQL, so it is a no-op for a non-owner or a run outside the plan gate; the SubmitInput
+	// below then resolves ownership/status authoritatively. Only meaningful with approve_plan.
+	if req.Kind == "approve_plan" && req.OverrideCapabilities {
+		if err := h.wsvc.OverrideRunRequiredCapabilities(r.Context(), user.ID, id); err != nil {
+			slog.Error("override run required capabilities", "run_id", id, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
 	res, err := h.wsvc.SubmitInput(r.Context(), user.ID, id, req.Kind, req.Body, req.Selection)
 	if err != nil {
 		switch {
@@ -1247,6 +1268,20 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrInvalidSelection):
 			httpx.Error(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, workersvc.ErrCapabilityUnmet):
+			// PRD #84 M4 4c: the server-side capability approval gate blocked — the run's
+			// owning worker cannot satisfy an inferred/hinted required capability → 409, with
+			// the unmet names and a remediation hint in the error body (same {"error": ...}
+			// envelope as the sibling cases). The web/CLI (4d) can also derive the mismatch
+			// from the run DTO's required_capabilities + the worker caps it already fetches;
+			// this 409 is the authoritative enforcement, and its message names the fix.
+			var unmet *workersvc.CapabilityUnmetError
+			names := "the required capabilities"
+			if errors.As(err, &unmet) {
+				names = strings.Join(unmet.Unmet, ", ")
+			}
+			httpx.Error(w, http.StatusConflict, "the plan requires capabilities the assigned worker cannot satisfy: "+names+
+				". Provision or start a worker with: "+names+"; or approve with override_capabilities to run without it")
 		default:
 			slog.Error("submit run input", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")

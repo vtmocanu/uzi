@@ -272,6 +272,11 @@ type fakeStore struct {
 	createdApproval    *store.CreateApprovePlanInputParams
 	cancelled          *store.CancelRunServerSideParams
 	rejected           *store.RejectRunServerSideParams
+	// clearedCaps captures the PRD #84 M4 4c override clear (ClearRunRequiredCapabilities);
+	// clearCapsRows is the RowsAffected the fake returns. When cleared, the fake also empties
+	// runByID.RequiredCapabilities so a subsequent SubmitInput reload sees the override effect.
+	clearedCaps   *store.ClearRunRequiredCapabilitiesParams
+	clearCapsRows int64
 
 	// Create run.
 	repoRow         store.GetRepoForUserRow // repo GetRepoForUser returns (zero value = the pre-#191 empty row)
@@ -824,6 +829,13 @@ func (f *fakeStore) ListJudgeTriageRowsForUser(_ context.Context, userID uuid.UU
 }
 func (f *fakeStore) GetWorkerByID(context.Context, uuid.UUID) (store.Worker, error) {
 	return f.workerByID, f.workerByIDErr
+}
+func (f *fakeStore) ClearRunRequiredCapabilities(_ context.Context, arg store.ClearRunRequiredCapabilitiesParams) (int64, error) {
+	f.clearedCaps = &arg
+	// Mirror the real owner+status-guarded UPDATE: on a matching row, empty the run's
+	// required set so a subsequent SubmitInput reload observes the override.
+	f.runByID.RequiredCapabilities = nil
+	return f.clearCapsRows, nil
 }
 func (f *fakeStore) CreateRunInput(_ context.Context, arg store.CreateRunInputParams) (store.RunUserInput, error) {
 	f.createdInput = &arg

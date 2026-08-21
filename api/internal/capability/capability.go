@@ -111,6 +111,36 @@ func Filter(in []string) []string {
 	return out
 }
 
+// Unmet returns the members of required that are NOT present in effective — the
+// capabilities a run needs that a given (already-folded) effective worker set does not
+// satisfy. It is the pure, offline-checkable core of the PRD #84 M4 4c approval gate: the
+// caller folds the owning worker's effective caps (capabilities ∪ {docker if
+// docker_enabled}, the SAME fold fn_worker_can_claim applies) and passes them here, so a
+// docker-folded effective set yields no `docker` in the result. Output is deduped and in
+// stable vocabulary order; a `required` name outside the vocabulary is dropped (it is not
+// a legal capability and can never be a real unmet requirement — required_capabilities is
+// Filter-ed at every write, so this never discards a live requirement). An empty result
+// means required ⊆ effective, i.e. the run is claimable/approvable by that worker.
+func Unmet(required, effective []string) []string {
+	have := make(map[string]struct{}, len(effective))
+	for _, name := range effective {
+		have[name] = struct{}{}
+	}
+	need := make(map[string]struct{}, len(required))
+	for _, name := range required {
+		if _, ok := have[name]; !ok {
+			need[name] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(need))
+	for _, name := range order {
+		if _, ok := need[name]; ok {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 // Tool names are the PROVISIONABLE toolchain families the plan-time inference
 // (PRD #84 M4) emits on the awaiting_approval report — the languages/runtimes a
 // worker could install for the run, as distinct from the non-provisionable
