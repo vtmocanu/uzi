@@ -868,16 +868,26 @@ func TestPrescanSuppressesBashKeywordFunctionForm(t *testing.T) {
 // cat/grep'd source. Each is its own negative control — the asserted name being REPORTED is
 // the no-suppression behavior, so these stay green whether or not the `|| funcs[cmd]` clause
 // is present (they prove the regex does not over-index, not that suppression fires).
+//
+// Two of the cases pin the anchor TIGHTENING specifically (they would be wrongly indexed by
+// a boundary of `^[ \t]*` / `[;&|(]`, and are only excluded because it is now `^` / `[;&|]`):
+// an INDENTED zero-arg method `  poll() {` inside a cat'd class body (indentation is not a
+// boundary), and a `(`-preceded expression `setTimeout(function tick() {` (a JS IIFE/callback;
+// `(` is not a boundary). Both names stay REPORTED.
 func TestPrescanDoesNotSuppressForeignLanguageFunctionDef(t *testing.T) {
 	rows := []store.ListToolTraceForRunRow{
-		traceResult(10, "u1", "export function serve(opts) {\n  return http.listen();\n}", false),
+		traceResult(10, "u1", "function serve(opts) {\n  return http.listen();\n}", false),
 		traceResult(20, "u2", "bash: serve: command not found", true),
 		traceResult(30, "u3", "func build() {\n  return\n}", false),
 		traceResult(40, "u4", "bash: build: command not found", true),
 		traceResult(50, "u5", "export function watch() {\n  fs.watch(dir);\n}", false),
 		traceResult(60, "u6", "bash: watch: command not found", true),
+		traceResult(70, "u7", "class Server {\n  poll() {\n    return this.q.shift();\n  }\n}", false),
+		traceResult(80, "u8", "bash: poll: command not found", true),
+		traceResult(90, "u9", "setTimeout(function tick() {\n  render();\n}, 16)", false),
+		traceResult(100, "u10", "bash: tick: command not found", true),
 	}
-	// All three source-def names still reported — no foreign def (with-args, zero-arg, or Go)
-	// is indexed as a shell func.
-	assertReported(t, rows, []string{"build", "serve", "watch"})
+	// All source-def names still reported — no foreign def (with-args, zero-arg, Go, an
+	// INDENTED method, or a `(`-preceded IIFE) is indexed as a shell func.
+	assertReported(t, rows, []string{"build", "poll", "serve", "tick", "watch"})
 }

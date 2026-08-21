@@ -123,26 +123,32 @@ var (
 // function name.
 //
 // Residual, accepted (this file's conservative-under-suppression philosophy, matching
-// pinned/invoked): a statement-leading ZERO-ARG `name() {` in another language (a bare
-// `serve() {` printed on its own line) is indistinguishable from a shell def and is still
-// indexed. Dropping a real miss that shares a name with such a def is the safe direction —
-// a false "install this tool" is worse than a missed one.
+// pinned/invoked): a COLUMN-0 (unindented) statement-leading ZERO-ARG `name() {` in another
+// language — or such a def written into a file via a heredoc body, whose lines are also at
+// column 0 — is indistinguishable from a shell def and is still indexed. Dropping a real miss
+// that shares a name with such a def is the safe direction — a false "install this tool" is
+// worse than a missed one. INDENTED foreign methods (`  serve() {` in a cat'd class body) and
+// `(`-preceded function expressions (a JS IIFE/callback) are NOT indexed: the anchor is
+// column 0 or a `;&|` separator, deliberately not indentation and not `(`.
 var (
 	// reShellFuncPosix matches the POSIX form `name() { … }` (optionally `function name() {`).
 	// (?m) so `^` matches each LINE start (a def sits deep in a cat'd script, preceded by a
-	// real newline, not at string start). Anchored ONLY on a statement boundary — line start
-	// (with `[ \t]*` indentation) or after `;&|(` — NOT on bare whitespace, so a `func name()`
-	// in printed Go/C source is excluded (its name is not the statement-leading token; `func `
-	// precedes it). The empty `()` is required, so a `name(args) {` never matches here.
-	reShellFuncPosix = regexp.MustCompile(`(?m)(?:^[ \t]*|[;&|(]\s*)(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*\{`)
+	// real newline, not at string start). Anchored on a statement boundary that is COLUMN 0
+	// (line start, NO leading indentation) or right after a `;&|` command separator — NOT on
+	// bare whitespace and NOT on indentation, so a `func name()` in printed Go/C source (its
+	// name is not statement-leading; `func ` precedes it) and an INDENTED zero-arg method
+	// `  serve() {` in a cat'd class body are both excluded. The empty `()` is required, so a
+	// `name(args) {` never matches here.
+	reShellFuncPosix = regexp.MustCompile(`(?m)(?:^|[;&|]\s*)(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*\{`)
 	// reShellFuncKeyword matches the ksh/bash keyword form `function name { … }` (optionally
 	// `function name() {`). Like reShellFuncPosix it is (?m) and anchored on a statement
-	// boundary (line start with `[ \t]*` indentation, or after `;&|(`), and the trailing
-	// shell body brace `{` is required. So a JS `function serve(opts) {` (non-empty parens),
-	// a zero-arg `export function serve() {` or `const f = function serve() {` (not
-	// statement-leading), and a prose "the function serve" (no brace) are all excluded, while
+	// boundary that is COLUMN 0 or right after a `;&|` separator (NOT indentation, NOT after
+	// `(`), and the trailing shell body brace `{` is required. So a JS `function serve(opts) {`
+	// (non-empty parens), a zero-arg `export function serve() {` or `const f = function serve()
+	// {` (not statement-leading), a `(`-preceded `setTimeout(function tick() {` (an IIFE/
+	// callback), and a prose "the function serve" (no brace) are all excluded, while
 	// `function db_psql {` and `function db_psql() {` at a statement boundary match.
-	reShellFuncKeyword = regexp.MustCompile(`(?m)(?:^[ \t]*|[;&|(]\s*)function\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\)\s*)?\{`)
+	reShellFuncKeyword = regexp.MustCompile(`(?m)(?:^|[;&|]\s*)function\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\)\s*)?\{`)
 )
 
 // shellNames are the interpreters that REPORT a missing command; they are never the
@@ -459,7 +465,10 @@ func goRunPinnedTools(rows []store.ListToolTraceForRunRow) map[string]bool {
 // discipline as goRunPinnedTools/invokedExecutables. The larger tool_result window
 // matters: a definition sitting in the 128 KB–512 KB slice of a tool_result payload is
 // still indexed and still suppresses its miss, while that miss itself is still detected
-// (the scan shares the same 512 KB tool_result budget).
+// (scanCommandNotFound applies the same 512 KB tool_result budget — though it counts the
+// RAW jsonb payload length while this indexer counts the DECODED text length, so the two
+// reach slightly different depths into the trace; that only shifts WHICH rows are
+// in-budget, never correctness, since leaving a miss unsuppressed is the safe direction).
 func shellFunctionNames(rows []store.ListToolTraceForRunRow) map[string]bool {
 	funcs := map[string]bool{}
 	resultBytes := 0
