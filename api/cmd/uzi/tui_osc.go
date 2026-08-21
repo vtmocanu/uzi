@@ -1,21 +1,38 @@
 package main
 
 import (
+	"strings"
+	"unicode"
+
 	"github.com/charmbracelet/colorprofile"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
 // oscLink wraps visible text in an OSC-8 hyperlink so a command-click opens url in
-// the browser. url is forge-authored and untrusted, so control bytes are stripped
-// (D7) — sanitizeTTY also removes the ESC that would otherwise let a hostile url
-// forge its own ST terminator. Uses the ST form (ESC \) rather than BEL. Returns
-// bare text when url is empty (nothing to link to).
+// the browser. url is forge-authored and untrusted, so EVERY control/format rune is
+// stripped here — including \n and \t, which sanitizeTTY deliberately spares for
+// flowing text but which have no place in a single-line URL. Uses the ST form (ESC \)
+// rather than BEL. Returns bare text when url is empty (nothing to link to).
 func oscLink(url, text string) string {
 	if url == "" {
 		return text
 	}
-	url = sanitizeTTY(url)
+	// The URL is an OSC-8 escape PARAMETER, not flowing text: per the spec its URI is
+	// single-line printable, and a raw newline/tab is a framing break, not content.
+	// sanitizeTTY (tuned for multi-line free text) SPARES \n and \t, which here would
+	// forge a row in the frame (#169 class), so strip every control/format rune instead.
+	// This also removes ESC/BEL, so a hostile forge URL cannot forge its own ST
+	// terminator or open a new OSC.
+	url = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
+			return -1
+		}
+		return r
+	}, url)
+	if url == "" {
+		return text
+	}
 	return "\x1b]8;;" + url + "\x1b\\" + text + "\x1b]8;;\x1b\\"
 }
 
@@ -29,6 +46,10 @@ func (m tuiModel) linksEnabled() bool { return m.profile >= colorprofile.ANSI }
 // has already confirmed r.IssueIID != nil and built styledIID.
 func (m tuiModel) issueLink(r apitypes.RunDTO, styledIID string) string {
 	if r.IssueWebURL != nil && m.linksEnabled() {
+		// The sanitizeTTY call here is load-bearing for the D7 static guard: the guard
+		// requires the .IssueWebURL field access to sit lexically inside a recognized
+		// sanitizer, and oscLink is not one. oscLink then does its own OSC-8-strict
+		// stripping (control/format runes, incl. \n and \t) on the target.
 		return oscLink(sanitizeTTY(strOr(r.IssueWebURL, "")), styledIID)
 	}
 	return styledIID

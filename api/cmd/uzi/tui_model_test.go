@@ -712,7 +712,9 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	// forge-authored URL is the link target, so its control bytes must be stripped before
 	// they reach the frame. IssueIID is non-nil so the link path actually runs; the default
 	// test profile is TrueColor, so the link is emitted (not degraded). *string, so bind a local.
-	hostileURL := nasty
+	// The trailing newline+tab+text would forge a whole extra row in the frame (#169 class) if
+	// oscLink used sanitizeTTY (which spares \n/\t) instead of its OSC-8-strict strip.
+	hostileURL := nasty + "\n  FORGED-ROW\t"
 	hostileIID := int64(519)
 	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running", IssueTitle: nasty, AnthropicSecretLabel: &hostileLabel}},
@@ -733,6 +735,13 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 		if strings.Contains(boardOut, ctrl) {
 			t.Errorf("board frame contains a raw control byte %q from the hostile IssueWebURL", ctrl)
 		}
+	}
+	// The hostile URL's trailing "\n  FORGED-ROW\t" must not survive into the frame as a real
+	// line break followed by attacker text — that is the forged-row (#169) class oscLink's
+	// OSC-8-strict strip exists to prevent. A regression to sanitizeTTY (which spares \n/\t)
+	// would also trip assertNoRawControls above via Fix 2 — defense in depth.
+	if strings.Contains(boardOut, "\n  FORGED-ROW") {
+		t.Errorf("board frame gained a forged line from the hostile IssueWebURL newline\n%s", boardOut)
 	}
 
 	detail := tuiTestModel(t, fake, runID)
@@ -1331,18 +1340,26 @@ func sgrSequenceEnd(rs []rune, i int) (int, bool) {
 // hyperlink DELIMITER starting at i (ESC ] 8 ; ; <params/url> ESC \), and whether
 // one is there. Each of the open and close delimiters matches this shape; the
 // enclosed styled text between them is scanned normally (its SGR is handled by
-// sgrSequenceEnd). The url carries no ESC because it is sanitized before emission,
-// so the ESC we scan to can only be the ST terminator.
+// sgrSequenceEnd). It REJECTS (returns 0, false) a delimiter whose URL param carries
+// a raw control byte before the ST — so a control byte smuggled into the OSC-8 target
+// is flagged by assertNoRawControls independently, not skipped over on the assumption
+// that emission was sanitized.
 func osc8SequenceEnd(rs []rune, i int) (int, bool) {
 	// ESC ] 8 ; ;
 	if i+4 >= len(rs) || rs[i+1] != ']' || rs[i+2] != '8' || rs[i+3] != ';' || rs[i+4] != ';' {
 		return 0, false
 	}
 	for j := i + 5; j < len(rs); j++ {
-		if rs[j] == 0x1b { // ST is ESC \
+		c := rs[j]
+		if c == 0x1b { // ST is ESC \
 			if j+1 < len(rs) && rs[j+1] == '\\' {
 				return j + 1, true
 			}
+			return 0, false
+		}
+		if unicode.IsControl(c) {
+			// A raw control byte inside the URL param — not a well-formed delimiter.
+			// Fall through so assertNoRawControls flags the escape instead of skipping it.
 			return 0, false
 		}
 	}

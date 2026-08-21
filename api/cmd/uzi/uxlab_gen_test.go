@@ -36,6 +36,7 @@ const (
 )
 
 func sp(s string) *string       { return &s }
+func ip(n int64) *int64         { return &n }
 func tp(t time.Time) *time.Time { return &t }
 
 // uxModel builds a model at the lab's fixed size and theme. The renderer is rebuilt
@@ -165,6 +166,16 @@ func boardRuns(now time.Time) []apitypes.RunListItemDTO {
 	runs[0].AnthropicSecretID, runs[0].AnthropicSecretLabel, runs[0].AnthropicSelectReason = sp("sec-meta"), sp("meta"), sp("auto")
 	runs[2].AnthropicSecretID, runs[2].AnthropicSecretLabel, runs[2].AnthropicSelectReason = sp("sec-personal"), sp("personal"), sp("pool_stale")
 	runs[6].AnthropicSecretID, runs[6].AnthropicSecretLabel, runs[6].AnthropicSelectReason = sp("sec-personal"), sp("personal"), sp("best_of_pool")
+	// PRD #519: stamp forge issue ids on the issue-kind runs so the board's clickable #<iid>
+	// OSC-8 link is exercised by the generated frames. The ci_fix runs (b2c3d4e5 "Fix flaky
+	// pipeline", b8c9d0e1) and the chat run keep a nil id — the no-id case, which draws no #.
+	iurl := func(n int64) *string { return sp(fmt.Sprintf("https://github.com/vtmocanu/uzi/issues/%d", n)) }
+	runs[0].IssueIID, runs[0].IssueWebURL = ip(452), iurl(452)
+	runs[2].IssueIID, runs[2].IssueWebURL = ip(477), iurl(477)
+	runs[4].IssueIID, runs[4].IssueWebURL = ip(468), iurl(468)
+	runs[5].IssueIID, runs[5].IssueWebURL = ip(419), iurl(419)
+	runs[6].IssueIID, runs[6].IssueWebURL = ip(463), iurl(463)
+	runs[7].IssueIID, runs[7].IssueWebURL = ip(408), iurl(408)
 	return runs
 }
 
@@ -280,7 +291,11 @@ func detailRunning(dark bool, now time.Time) string {
 	// A milestone-structured run so the crew rail's milestone block renders (#379), coherent
 	// with the board's M2/4 for the same run id.
 	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "running", Health: "ok",
-		IssueTitle:          "Add rate-limit headroom to the scheduler poll",
+		IssueTitle: "Add rate-limit headroom to the scheduler poll",
+		// PRD #519: an issue id + url so the detail header renders the clickable #<iid> beside
+		// the crumb, coherent with the board's #452 for this same run id.
+		IssueIID:            ip(452),
+		IssueWebURL:         sp("https://github.com/vtmocanu/uzi/issues/452"),
 		StartedAt:           tp(now.Add(-4 * time.Minute)), // header elapsed WORK time (`● running · 4m`)
 		Milestones:          milestoneList,
 		MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3"}}

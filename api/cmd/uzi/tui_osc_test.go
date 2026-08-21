@@ -32,6 +32,23 @@ func TestOscLink(t *testing.T) {
 	if !strings.HasPrefix(got, "\x1b]8;;https://ex.com\x1b\\") {
 		t.Errorf("oscLink target not sanitized to https://ex.com: %q", got)
 	}
+
+	// A URL is single-line printable by construction, so the OSC-8-strict filter drops
+	// \n and \t too (which sanitizeTTY spares) — a raw newline in the target would forge
+	// a row in the frame. The visible text is untouched.
+	nl := oscLink("https://x\n\tY\x07", "#1")
+	if strings.Contains(nl, "\n") {
+		t.Errorf("oscLink did not strip the newline from the url: %q", nl)
+	}
+	if strings.Contains(nl, "\t") {
+		t.Errorf("oscLink did not strip the tab from the url: %q", nl)
+	}
+	if strings.Contains(nl, "\x07") {
+		t.Errorf("oscLink did not strip the BEL from the url: %q", nl)
+	}
+	if !strings.Contains(nl, "#1") {
+		t.Errorf("oscLink dropped the visible text: %q", nl)
+	}
 }
 
 // The board's #<iid> link degrades to plain text when the terminal profile can't render
