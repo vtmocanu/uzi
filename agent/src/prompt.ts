@@ -676,6 +676,24 @@ export function depsProvisionImplementNote(
   return lines.join("\n");
 }
 
+/** PRD #501 REC B: rendered in the plan prompt of an AUTOPILOT run (auto_approve
+ *  true). On such a run an `ask_user` call does not reach a human: it is
+ *  auto-resolved (see AUTOPILOT_SENTINEL_ANSWER in runner.ts) and a park would only
+ *  waste a turn. So the note tells the lead to decide open questions up front and
+ *  record the assumption in the plan instead. It speaks ONLY to `ask_user`, not to
+ *  plan approval: a human may still review the resulting plan (a CI-config ci_fix
+ *  plan is force-gated even on autopilot) or the merge request, so the note must not
+ *  claim "no human in the loop" outright. It also paraphrases the sentinel rather
+ *  than quoting it, so the two do not silently drift. */
+export const AUTOPILOT_PLAN_NOTE = [
+  "This is an autopilot run: an `ask_user` call will not reach a human on this run.",
+  "It is auto-resolved to a proceed-on-your-best-judgment answer, so a park would",
+  "only waste a turn. Do not call `ask_user` to resolve an open decision; decide it",
+  "on your best judgment now and record the assumption in the plan. (A human may",
+  "still review the resulting plan or the merge request; this note is only about not",
+  "parking on `ask_user`.)",
+].join("\n");
+
 export interface PlanPromptInput {
   issueIid: number;
   issueTitle: string;
@@ -704,6 +722,10 @@ export interface PlanPromptInput {
    *  `baseCommit` on a fresh branch; on a resume it is the branch's true fork point and
    *  the note names both. Absent ⇒ the note makes the narrower claim. */
   defaultBranchCommit?: string;
+  /** PRD #501 REC B: autopilot run (claim.auto_approve). When true, the plan prompt
+   *  tells the lead there is no human and to decide open questions on best judgment.
+   *  Absent/false ⇒ byte-identical to before. */
+  autoApprove?: boolean;
 }
 
 /**
@@ -748,6 +770,9 @@ export function buildPlanPrompt(input: PlanPromptInput): string {
     "and the repository and the issue do not settle it — call `ask_user` BEFORE",
     "planning rather than planning around it. The same bar applies as always: only",
     "when a wrong guess is costly and the answer is not inferable.",
+    // PRD #501 REC B: on an autopilot run only, add the no-human-in-the-loop note so
+    // the lead resolves open decisions up front instead of parking on `ask_user`.
+    ...(input.autoApprove ? ["", AUTOPILOT_PLAN_NOTE] : []),
     "",
     "Produce a concrete implementation plan, then call the `submit_plan` tool with",
     "the plan as Markdown and STOP. Do NOT implement anything yet — a human must",
@@ -1136,6 +1161,10 @@ export interface SelfImprovePlanPromptInput {
   /** Issue #297: coordinate lines for work already in flight on this repo, rendered as
    *  their OWN untrusted nonce-fenced block. Absent/empty ⇒ no block. */
   inflightTargets?: string[];
+  /** PRD #501 REC B: autopilot run (claim.auto_approve). When true, the plan prompt
+   *  tells the lead there is no human and to decide open questions on best judgment.
+   *  Absent/false ⇒ byte-identical to before. */
+  autoApprove?: boolean;
 }
 
 /**
@@ -1211,6 +1240,10 @@ export function buildSelfImprovePlanPrompt(
     delegatesLine(input.subagentNames, input.subagentCanWrite),
     "",
     depsProvisionPlanNote(),
+    // PRD #501 REC B: on an autopilot run only, add the no-human-in-the-loop note.
+    // A self_improve run is always auto-approved, so this normally renders; a caller
+    // that leaves autoApprove absent/false stays byte-identical to before.
+    ...(input.autoApprove ? ["", AUTOPILOT_PLAN_NOTE] : []),
     "",
     "Produce a concrete implementation plan for the ONE improvement you chose, then call",
     "the `submit_plan` tool with the plan as Markdown and STOP. Do NOT implement yet.",
@@ -1293,6 +1326,10 @@ export interface CIFixPlanPromptInput {
   baseCommit?: string;
   /** The default branch's tip. See baseCommitNote. */
   defaultBranchCommit?: string;
+  /** PRD #501 REC B: autopilot run (claim.auto_approve). When true, the plan prompt
+   *  tells the lead there is no human and to decide open questions on best judgment.
+   *  Absent/false ⇒ byte-identical to before. */
+  autoApprove?: boolean;
 }
 
 // CI job logs are the most attacker-influenceable text uzi ever feeds an agent:
@@ -1358,6 +1395,11 @@ export function buildCIFixPlanPrompt(input: CIFixPlanPromptInput): string {
     "linters) to reproduce it; you cannot touch the forge or network.",
     "",
     depsProvisionPlanNote(),
+  );
+  // PRD #501 REC B: on an autopilot run only, add the no-human-in-the-loop note so
+  // the lead resolves open decisions up front instead of parking on `ask_user`.
+  if (input.autoApprove) lines.push("", AUTOPILOT_PLAN_NOTE);
+  lines.push(
     "",
     "Then call `submit_plan` with ONE of:",
     "  1. A root-cause analysis and a concrete plan to fix the CODE, OR",

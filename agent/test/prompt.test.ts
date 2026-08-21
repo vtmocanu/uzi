@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  AUTOPILOT_PLAN_NOTE,
   baseCommitNote,
   buildCIFixPlanPrompt,
   buildImplementPrompt,
@@ -973,6 +974,71 @@ describe("buildSelfImprovePlanPrompt — in-flight avoid-set (issue #297)", () =
     // And it is there even with NO avoid-set (it is a standing rule, not gated on the block).
     const absent = buildSelfImprovePlanPrompt({ ...base });
     assert.match(absent, /already IN FLIGHT/);
+  });
+});
+
+describe("plan prompts — autopilot no-human-in-the-loop note (PRD #501 REC B)", () => {
+  // buildSelfImprovePlanPrompt/buildCIFixPlanPrompt mint a random per-prompt fence
+  // nonce (fenceNonce → randomBytes), so two separate calls never match byte-for-byte
+  // on the raw string. Normalize the 16-hex nonce so "unchanged when autoApprove is
+  // absent/false" is a strict equality on everything EXCEPT that random fence tag.
+  const stripNonces = (s: string) => s.replace(/_[0-9a-f]{16}/g, "_N");
+
+  describe("buildPlanPrompt", () => {
+    const base = {
+      issueIid: 1,
+      issueTitle: "t",
+      issueDescription: "d",
+      branch: "agent/issue-1",
+      subagentNames: [],
+    };
+    it("renders the note when autoApprove is true", () => {
+      assert.ok(buildPlanPrompt({ ...base, autoApprove: true }).includes(AUTOPILOT_PLAN_NOTE));
+    });
+    it("is byte-identical and note-free when autoApprove is absent/false", () => {
+      const baseline = buildPlanPrompt({ ...base });
+      assert.strictEqual(buildPlanPrompt({ ...base, autoApprove: false }), baseline);
+      assert.strictEqual(buildPlanPrompt({ ...base, autoApprove: undefined }), baseline);
+      assert.ok(!baseline.includes(AUTOPILOT_PLAN_NOTE));
+    });
+  });
+
+  describe("buildSelfImprovePlanPrompt", () => {
+    const base = {
+      branch: "self-improve/main",
+      recommendations: "backlog item",
+      subagentNames: ["coder"],
+    };
+    it("renders the note when autoApprove is true", () => {
+      assert.ok(
+        buildSelfImprovePlanPrompt({ ...base, autoApprove: true }).includes(AUTOPILOT_PLAN_NOTE),
+      );
+    });
+    it("is byte-identical (modulo fence nonce) and note-free when autoApprove is absent/false", () => {
+      const baseline = stripNonces(buildSelfImprovePlanPrompt({ ...base }));
+      assert.strictEqual(stripNonces(buildSelfImprovePlanPrompt({ ...base, autoApprove: false })), baseline);
+      assert.strictEqual(stripNonces(buildSelfImprovePlanPrompt({ ...base, autoApprove: undefined })), baseline);
+      assert.ok(!baseline.includes(AUTOPILOT_PLAN_NOTE));
+    });
+  });
+
+  describe("buildCIFixPlanPrompt", () => {
+    const base = {
+      ref: "main",
+      branch: "b",
+      pipelineWebURL: "u",
+      failedJobs: [{ name: "j", stage: "s", logTail: "l" }],
+      subagentNames: [],
+    };
+    it("renders the note when autoApprove is true", () => {
+      assert.ok(buildCIFixPlanPrompt({ ...base, autoApprove: true }).includes(AUTOPILOT_PLAN_NOTE));
+    });
+    it("is byte-identical (modulo fence nonce) and note-free when autoApprove is absent/false", () => {
+      const baseline = stripNonces(buildCIFixPlanPrompt({ ...base }));
+      assert.strictEqual(stripNonces(buildCIFixPlanPrompt({ ...base, autoApprove: false })), baseline);
+      assert.strictEqual(stripNonces(buildCIFixPlanPrompt({ ...base, autoApprove: undefined })), baseline);
+      assert.ok(!baseline.includes(AUTOPILOT_PLAN_NOTE));
+    });
   });
 });
 

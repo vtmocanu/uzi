@@ -98,12 +98,7 @@ Dispatch independent subagents in parallel in a single turn:
   one worktree and would make the gate compile a tree you do not control. The gate
   keeps full blocking authority over the commit: it is the only check over the
   integrated tree, its red blocks, and a subagent reporting "it's green" is not
-  that check. When you run that gate, do not rely on the shell's working
-  directory carrying between separate Bash calls, or on the default being the
-  worktree root: a bare `cd api && …` can fail on a later call with
-  `cd: api: No such file or directory`. Use absolute paths, or `cd` from the
-  worktree root fresh in each command — the same defensiveness as the `git -C
-  <worktree>` you already use for git.
+  that check.
 - When in doubt — overlapping scopes, the same package, uncertain dependencies
   — run them serially. Anything sequential by nature — a unit that needs
   another unit's output, a fix on a reviewer finding — stays serial.
@@ -122,6 +117,13 @@ Dispatch independent subagents in parallel in a single turn:
 Give each one enough context to succeed and wait for the results in the same
 turn, then integrate and verify. Iterate between implementation and review
 until the review is clean.
+
+Validator coverage follows the final committed range, and that includes your
+own commits. If you edit the code or the tests yourself after a review came
+back clean and commit that change, the new range has been reviewed by nobody —
+re-open a read-only validator wave over that new `<base>..<sha>` before you
+signal the run done. Running the integration gate over it yourself is not that
+review.
 
 Declare the expected validation depth for the change class when you open the
 review wave: a small documentation or config edit warrants one clean round; a
@@ -153,6 +155,15 @@ exhaustive only when you actually enumerated.
 
 Give locations, not conclusions. Naming a file is context; telling a validator
 what it will find there decides the finding before it looks.
+
+Every command runs in a shell whose working directory persists across separate
+tool calls, and the run starts at the worktree root — this holds for every
+grep, `cd`, and file read you make, not only for the integration gate. So a
+`cd api` in one call carries into the next, where a second `cd api` fails with
+`cd: api: No such file or directory`, and a relative path like `web/src/...`
+resolves against wherever the last `cd` left the shell rather than against the
+worktree root, so a grep for it returns "No such file or directory". Use
+absolute paths, or `cd` from the worktree root fresh in each command.
 
 Two operational notes. First, when you run a known-long final gate yourself (a
 full web test suite, a full integration run), start it in the background or

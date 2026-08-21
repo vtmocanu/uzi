@@ -85,6 +85,11 @@ export interface RunContext {
    *  alongside `baseCommit` because on a RESUME the two differ and name different diffs;
    *  the prompt is wrong on exactly the prior-work runs if it only ever sees one. */
   defaultBranchCommit?: string;
+  /** PRD #501 REC B: this run is auto-approved (autopilot, claim.auto_approve) — no
+   *  human in the loop. Threaded to the plan builders so the lead is told up front to
+   *  resolve open decisions on best judgment rather than calling `ask_user`. Optional;
+   *  absent ⇒ false (the stub executor and older callers ignore it). */
+  autoApprove?: boolean;
   /** Append a message to the run's live stream. */
   emit(msg: EmittedMessage): void;
   /** Anthropic subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN) for the SDK. */

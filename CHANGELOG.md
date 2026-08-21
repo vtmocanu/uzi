@@ -6,6 +6,18 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Changed
+
+- **Lead agent run-context guidance (PRD #501).** The builtin `lead` template and the
+  autopilot plan prompts now tell the lead three things it previously learned too late:
+  (A) the Bash working directory persists across tool calls and the run starts at the
+  worktree root, so relative-path greps and `cd`s should use absolute paths or re-`cd`
+  from root (generalized from the integration-gate-only note); (B) on an autopilot run
+  (no human in the loop) it is told up front, at planning time, to resolve open decisions
+  on best judgment and record the assumption rather than spending an `ask_user` round-trip;
+  and (C) any commit landing after a clean review — including the lead's own edits —
+  re-opens a read-only validator wave over the new range before the run is signalled done.
+
 ## [0.50.0] - 2026-08-21
 <!-- release-title: board + Projects v2 sync, worker fleet roll, dependency majors -->
 
