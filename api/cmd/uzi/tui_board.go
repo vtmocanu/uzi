@@ -602,8 +602,9 @@ func (m tuiModel) boardRateLimitStrip() string {
 		seg += m.rateWindowCell("5h", t.Limits.FiveHour) + "   " + m.rateWindowCell("7d", t.Limits.SevenDay)
 		// Prefix a per-group accent bar TIGHT against the label: it both delimits the group and
 		// doubles as a status light — alarm when the token's peak window pct ≥ rateDangerPct,
-		// faint otherwise. Emitted unconditionally via paintSeg so the delimiter and the danger
-		// cue survive colour stripping (NO_COLOR/Ascii).
+		// faint otherwise. Emitted unconditionally via paintSeg so the group DELIMITER survives
+		// colour stripping (NO_COLOR/Ascii); the tint is the danger cue and is stripped there, so
+		// danger legibility falls back on the always-present bar-fill + NN% text, not this glyph.
 		accent := m.pal.faintC
 		if tokenPeakPct(t) >= rateDangerPct {
 			accent = m.pal.alarm
