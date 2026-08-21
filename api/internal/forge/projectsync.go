@@ -114,6 +114,12 @@ type ProjectBoardSyncer interface {
 	// content is not an issue carry IssueNumber 0; items with no value carry
 	// OptionID "".
 	ReadProjectV2ItemStatuses(ctx context.Context, projectID, fieldID string) ([]ProjectV2ItemStatus, error)
+	// ReadProjectV2ItemStatus returns ONE project item's current Status option id for
+	// the given single-select field ("" when the item has no value set — "No Status").
+	// A single-item read used by the forward-move live-value no-op guard (D7) so a uzi
+	// move can beat a racing GitHub-side drag; cheaper than ReadProjectV2ItemStatuses
+	// when only one item is in question.
+	ReadProjectV2ItemStatus(ctx context.Context, itemID, fieldID string) (string, error)
 	// ResolveProjectV2OwnerID resolves an owner to its node id for createProjectV2
 	// (F8): viewer/user/organization per ownerKind.
 	ResolveProjectV2OwnerID(ctx context.Context, owner string, ownerKind ProjectV2OwnerKind) (string, error)
@@ -405,6 +411,44 @@ func (g *github) ReadProjectV2ItemStatuses(ctx context.Context, projectID, field
 		cursor = &next
 	}
 	return out, nil
+}
+
+func (g *github) ReadProjectV2ItemStatus(ctx context.Context, itemID, fieldID string) (string, error) {
+	const query = `query($itemId: ID!) {
+  node(id: $itemId) {
+    ... on ProjectV2Item {
+      fieldValues(first: 20) {
+        nodes {
+          ... on ProjectV2ItemFieldSingleSelectValue {
+            optionId
+            field { ... on ProjectV2SingleSelectField { id } }
+          }
+        }
+      }
+    }
+  }
+}`
+	var out struct {
+		Node struct {
+			FieldValues struct {
+				Nodes []struct {
+					OptionID string `json:"optionId"`
+					Field    struct {
+						ID string `json:"id"`
+					} `json:"field"`
+				} `json:"nodes"`
+			} `json:"fieldValues"`
+		} `json:"node"`
+	}
+	if err := g.graphqlDo(ctx, query, map[string]any{"itemId": itemID}, &out); err != nil {
+		return "", err
+	}
+	for _, fv := range out.Node.FieldValues.Nodes {
+		if fv.Field.ID == fieldID {
+			return fv.OptionID, nil
+		}
+	}
+	return "", nil
 }
 
 func (g *github) ResolveProjectV2OwnerID(ctx context.Context, owner string, ownerKind ProjectV2OwnerKind) (string, error) {

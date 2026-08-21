@@ -58,9 +58,10 @@ type statefulProject struct {
 	itemIssue map[string]int64  // itemID -> issue number
 	byContent map[string]string // contentID -> itemID (idempotent Add)
 
-	setCalls  int // uzi-driven SetProjectV2ItemStatus calls
-	addCalls  int
-	readCalls int
+	setCalls      int // uzi-driven SetProjectV2ItemStatus calls
+	addCalls      int
+	readCalls     int
+	readItemCalls int // single-item live reads (D7 forward guard)
 }
 
 var _ forge.ProjectBoardSyncer = (*statefulProject)(nil)
@@ -132,6 +133,14 @@ func (p *statefulProject) ReadProjectV2ItemStatuses(context.Context, string, str
 		})
 	}
 	return out, nil
+}
+
+// ReadProjectV2ItemStatus returns the LIVE option for one item (D7 forward guard) —
+// reading the same mutated `status` map ReadProjectV2ItemStatuses reflects, so a
+// concurrent drag() is genuinely observed by ForwardMove's live no-op check.
+func (p *statefulProject) ReadProjectV2ItemStatus(_ context.Context, itemID, _ string) (string, error) {
+	p.readItemCalls++
+	return p.status[itemID], nil
 }
 
 // Remaining ProjectBoardSyncer methods are unused by ForwardMove/ReverseSync (they are
@@ -373,6 +382,75 @@ func TestProjectSyncRoundTripConverges(t *testing.T) {
 	}
 	if got := project.status["item-content-7"]; got != "opt_hr" {
 		t.Errorf("live status must stay opt_hr through the forward no-op, got %q", got)
+	}
+}
+
+// TestForwardMoveLiveGuardBeatsConcurrentDrag is the D7 regression: it pins the
+// dropped-move race the live-value guard closes. A stored marker can go stale when a
+// user drags a card on GitHub between two uzi syncs (no reverse poll has observed the
+// drag yet), and a marker-based no-op would then DROP a uzi move that happens to
+// re-target the marker's stale value. The live guard reads the board's CURRENT value
+// and re-asserts the uzi target, so the uzi move wins.
+//
+// The interleaving:
+//  1. converged: issue 7's card is at opt_ip (In Progress) and the store marker is opt_ip;
+//  2. a GitHub-side drag moves the card to opt_hr (Human Review) — marker stays opt_ip
+//     because no reverse poll ran;
+//  3. uzi re-targets In Progress (opt_ip): marker(opt_ip) == target(opt_ip), so a
+//     marker-based guard would NO-OP and drop the move, leaving the board at opt_hr;
+//     the live guard reads opt_hr != opt_ip and issues the Set, landing opt_ip;
+//  4. a following reverse poll reads live opt_ip == marker opt_ip → no writeback: the
+//     uzi value won the race and the system is stable.
+func TestForwardMoveLiveGuardBeatsConcurrentDrag(t *testing.T) {
+	ctx := context.Background()
+	repoID := uuid.New()
+
+	project := newStatefulProject()
+	// Converged start: uzi last drove issue 7 to In Progress (opt_ip); marker records it.
+	itemID := project.seedItem(7, "opt_ip")
+
+	link := forwardLink(t, map[string]string{"In Progress": "opt_ip", "Human Review": "opt_hr"})
+	st := newStatefulStore(githubRepoRow(repoID), link)
+	st.columns = []store.BoardColumn{
+		{LabelName: "In Progress", Position: 1},
+		{LabelName: "Human Review", Position: 2},
+	}
+	st.issues = []store.Issue{{ForgeIssueIid: 7, State: "opened", Labels: labelsJSON(t, "In Progress")}}
+	st.items[7] = projectItem(repoID, 7, itemID, "opt_ip") // marker still opt_ip (no reverse poll ran)
+
+	mover := &fakeMover{}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: project}, fakeSyncSettings{enabled: true}, nil)
+	svc.SetMover(mover)
+
+	// A concurrent GitHub-side drag to Human Review. setCalls stays 0 (drag is not a uzi Set),
+	// and the stored marker is untouched — it is now STALE relative to the live board.
+	project.drag(itemID, "opt_hr")
+	if project.setCalls != 0 {
+		t.Fatalf("drag must not count as a uzi Set, setCalls = %d, want 0", project.setCalls)
+	}
+
+	// uzi re-targets In Progress. The stale marker equals the target; only a live read
+	// can tell the board has actually moved. The move must NOT be dropped.
+	if err := svc.ForwardMove(ctx, repoID, 7, "In Progress"); err != nil {
+		t.Fatalf("ForwardMove: %v", err)
+	}
+	if project.setCalls != 1 {
+		t.Fatalf("live guard must re-assert the uzi move over a stale marker: want exactly 1 Set, got %d", project.setCalls)
+	}
+	if got := project.status[itemID]; got != "opt_ip" {
+		t.Fatalf("uzi move must land on the board, live status = %q, want opt_ip", got)
+	}
+	if got := st.marker(7); got != "opt_ip" {
+		t.Fatalf("marker must advance to the uzi target, got %q, want opt_ip", got)
+	}
+
+	// Convergence: a following reverse poll now reads live opt_ip == marker opt_ip → no
+	// label writeback. The uzi value won and the system is stable.
+	if err := svc.ReverseSync(ctx, repoID); err != nil {
+		t.Fatalf("ReverseSync: %v", err)
+	}
+	if len(mover.calls) != 0 {
+		t.Fatalf("after the uzi move wins, reverse must no-op (live == marker), got AutoMove %v", mover.calls)
 	}
 }
 

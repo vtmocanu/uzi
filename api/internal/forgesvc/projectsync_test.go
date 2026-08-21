@@ -53,6 +53,14 @@ type fakeProjectSyncer struct {
 	readErr   error
 	readCalls int
 
+	// Live single-item read (D7 forward no-op guard). liveStatus maps an item node id
+	// to its CURRENT forge option id; a nil/absent entry reads "" (No Status).
+	// readItemErr forces the read to fail (falls through to the write). readItemCalls
+	// records how many single-item reads ForwardMove issued.
+	liveStatus    map[string]string
+	readItemErr   error
+	readItemCalls int
+
 	issueNode map[int]string // issue number -> content node id
 	addReturn map[string]string
 	addCalls  []string // contentIDs added
@@ -129,6 +137,14 @@ func (f *fakeProjectSyncer) SetProjectV2ItemStatus(_ context.Context, _, itemID,
 func (f *fakeProjectSyncer) ReadProjectV2ItemStatuses(context.Context, string, string) ([]forge.ProjectV2ItemStatus, error) {
 	f.readCalls++
 	return f.live, f.readErr
+}
+
+func (f *fakeProjectSyncer) ReadProjectV2ItemStatus(_ context.Context, itemID, _ string) (string, error) {
+	f.readItemCalls++
+	if f.readItemErr != nil {
+		return "", f.readItemErr
+	}
+	return f.liveStatus[itemID], nil
 }
 
 func (f *fakeProjectSyncer) ResolveProjectV2OwnerID(context.Context, string, forge.ProjectV2OwnerKind) (string, error) {
@@ -982,10 +998,13 @@ func TestForwardMoveSetsMappedOption(t *testing.T) {
 	}
 }
 
-// (b) The Open target ("") clears Status and stores a NULL marker.
+// (b) The Open target ("") clears Status and stores a NULL marker. The live value is
+// opt_ip (the card is still In Progress on the board), so the live guard sees
+// live(opt_ip) != target("") and issues the clear.
 func TestForwardMoveOpenClears(t *testing.T) {
 	repoID := uuid.New()
 	syncer := forwardSyncer()
+	syncer.liveStatus = map[string]string{"item7": "opt_ip"}
 	st := &fakeProjectStore{
 		repo: githubRepoRow(repoID),
 		link: forwardLink(t, map[string]string{"In Progress": "opt_ip"}),
@@ -1005,15 +1024,49 @@ func TestForwardMoveOpenClears(t *testing.T) {
 	}
 }
 
-// (c) A marker already equal to the target skips the Status write entirely.
-func TestForwardMoveMarkerNoop(t *testing.T) {
+// (c) A LIVE value already equal to the target skips the Status write entirely (D7).
+// The guard is live-based, not marker-based: here the live value AND the marker both
+// equal the target, so the board is genuinely already there — zero set calls, and
+// (since the marker is already in step) zero marker writes.
+func TestForwardMoveLiveValueNoop(t *testing.T) {
 	repoID := uuid.New()
 	syncer := forwardSyncer()
+	syncer.liveStatus = map[string]string{"item7": "opt_ip"} // live == target
 	st := &fakeProjectStore{
 		repo: githubRepoRow(repoID),
 		link: forwardLink(t, map[string]string{"In Progress": "opt_ip"}),
 		item: store.GithubProjectItem{RepoID: repoID, ForgeIssueIid: 7, ItemNodeID: "item7",
-			LastStatusOptionID: optionMarker("opt_ip")},
+			LastStatusOptionID: optionMarker("opt_ip")}, // marker == target
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+
+	if err := svc.ForwardMove(context.Background(), repoID, 7, "In Progress"); err != nil {
+		t.Fatalf("ForwardMove: %v", err)
+	}
+	if syncer.readItemCalls != 1 {
+		t.Errorf("live no-op must consult the live value once, got %d reads", syncer.readItemCalls)
+	}
+	if len(syncer.setCalls) != 0 {
+		t.Errorf("live == target must not set status, got %v", syncer.setCalls)
+	}
+	if len(st.markerSets) != 0 {
+		t.Errorf("no-op with an in-step marker must not rewrite the marker, got %v", st.markerSets)
+	}
+}
+
+// (c”) The live no-op with a STALE marker: the board is already at the target but the
+// stored marker disagrees (e.g. a prior reverse write it never observed). The Status
+// write is still skipped, but the marker is re-synced to the live target so the next
+// reverse poll does not misread the stale marker as forge-side drift.
+func TestForwardMoveLiveNoopResyncsStaleMarker(t *testing.T) {
+	repoID := uuid.New()
+	syncer := forwardSyncer()
+	syncer.liveStatus = map[string]string{"item7": "opt_ip"} // live already at target
+	st := &fakeProjectStore{
+		repo: githubRepoRow(repoID),
+		link: forwardLink(t, map[string]string{"In Progress": "opt_ip"}),
+		item: store.GithubProjectItem{RepoID: repoID, ForgeIssueIid: 7, ItemNodeID: "item7",
+			LastStatusOptionID: optionMarker("opt_stale")}, // marker disagrees with live
 	}
 	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
 
@@ -1021,10 +1074,10 @@ func TestForwardMoveMarkerNoop(t *testing.T) {
 		t.Fatalf("ForwardMove: %v", err)
 	}
 	if len(syncer.setCalls) != 0 {
-		t.Errorf("marker already == target must not set status, got %v", syncer.setCalls)
+		t.Errorf("board already at target must not set status, got %v", syncer.setCalls)
 	}
-	if len(st.markerSets) != 0 {
-		t.Errorf("no-op must not rewrite the marker, got %v", st.markerSets)
+	if len(st.markerSets) != 1 || !st.markerSets[0].LastStatusOptionID.Valid || st.markerSets[0].LastStatusOptionID.String != "opt_ip" {
+		t.Errorf("a stale marker must be re-synced to the live target, got %+v", st.markerSets)
 	}
 }
 

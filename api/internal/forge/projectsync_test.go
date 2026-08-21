@@ -340,6 +340,82 @@ func TestGitHubReadProjectV2ItemStatusesPaginates(t *testing.T) {
 	}
 }
 
+// TestGitHubReadProjectV2ItemStatus pins the single-item read the forward-move live
+// no-op guard (D7) uses: it returns the option id for the value matching the requested
+// field, and "" when the item has no value or only values on OTHER fields.
+func TestGitHubReadProjectV2ItemStatus(t *testing.T) {
+	t.Run("matching field", func(t *testing.T) {
+		var gotVars map[string]any
+		m := newMockGitHub(t, map[string]http.HandlerFunc{
+			graphqlRoute: func(w http.ResponseWriter, r *http.Request) {
+				gotVars = readGQL(t, r).Variables
+				writeGQLData(w, map[string]any{
+					"node": map[string]any{
+						"fieldValues": map[string]any{"nodes": []map[string]any{
+							{"optionId": "opt_prog", "field": map[string]any{"id": "PVTSSF_1"}},
+							{"optionId": "IGNORED", "field": map[string]any{"id": "OTHER_FIELD"}},
+						}},
+					},
+				})
+			},
+		})
+		d := newGitHubRawDriver(t, m, "ghp_classicTokenValue1234567890")
+
+		opt, err := d.ReadProjectV2ItemStatus(context.Background(), "PVTI_1", "PVTSSF_1")
+		if err != nil {
+			t.Fatalf("ReadProjectV2ItemStatus: %v", err)
+		}
+		if opt != "opt_prog" {
+			t.Fatalf("want opt_prog for the matching field, got %q", opt)
+		}
+		if gotVars["itemId"] != "PVTI_1" {
+			t.Errorf("itemId var not sent: %+v", gotVars)
+		}
+	})
+
+	t.Run("no value set", func(t *testing.T) {
+		m := newMockGitHub(t, map[string]http.HandlerFunc{
+			graphqlRoute: func(w http.ResponseWriter, _ *http.Request) {
+				writeGQLData(w, map[string]any{
+					"node": map[string]any{"fieldValues": map[string]any{"nodes": []map[string]any{}}},
+				})
+			},
+		})
+		d := newGitHubRawDriver(t, m, "ghp_classicTokenValue1234567890")
+
+		opt, err := d.ReadProjectV2ItemStatus(context.Background(), "PVTI_2", "PVTSSF_1")
+		if err != nil {
+			t.Fatalf("ReadProjectV2ItemStatus: %v", err)
+		}
+		if opt != "" {
+			t.Fatalf("an item with no value must read \"\", got %q", opt)
+		}
+	})
+
+	t.Run("only other fields", func(t *testing.T) {
+		m := newMockGitHub(t, map[string]http.HandlerFunc{
+			graphqlRoute: func(w http.ResponseWriter, _ *http.Request) {
+				writeGQLData(w, map[string]any{
+					"node": map[string]any{
+						"fieldValues": map[string]any{"nodes": []map[string]any{
+							{"optionId": "opt_other", "field": map[string]any{"id": "OTHER_FIELD"}},
+						}},
+					},
+				})
+			},
+		})
+		d := newGitHubRawDriver(t, m, "ghp_classicTokenValue1234567890")
+
+		opt, err := d.ReadProjectV2ItemStatus(context.Background(), "PVTI_3", "PVTSSF_1")
+		if err != nil {
+			t.Fatalf("ReadProjectV2ItemStatus: %v", err)
+		}
+		if opt != "" {
+			t.Fatalf("a value only on a non-matching field must read \"\", got %q", opt)
+		}
+	})
+}
+
 // TestGitHubCreateProjectV2Field pins one provisioning mutation: SINGLE_SELECT
 // field create returns the field id + created options, and each option carries a
 // color (defaulted when absent).

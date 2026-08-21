@@ -674,7 +674,7 @@ func (s *ProjectSyncService) ForwardMove(ctx context.Context, repoID uuid.UUID, 
 	item, err := s.store.GetGithubProjectItem(ctx, store.GetGithubProjectItemParams{RepoID: repoID, ForgeIssueIid: issueIID})
 	switch {
 	case err == nil:
-		// existing item — fall through to the marker no-op check below.
+		// existing item — fall through to the live-value no-op check below.
 	case errors.Is(err, pgx.ErrNoRows):
 		itemID, aerr := s.addForwardItem(ctx, repo, syncer, link.ProjectNodeID, issueIID)
 		if aerr != nil {
@@ -700,16 +700,30 @@ func (s *ProjectSyncService) ForwardMove(ctx context.Context, repoID uuid.UUID, 
 		return nil
 	}
 
-	// Stored-marker no-op (D7): the marker is uzi's last-known value from either
-	// direction (both forward and the M6 reverse writeback advance it), so it is the
-	// convergence basis both directions share — M8 depends on the two using the SAME
-	// basis. This is deliberately NOT a per-move live forge read: if the marker
-	// already equals the target (NULL marker treated as ""), the board is already
-	// there, so skip the Status mutation. Worst case under a concurrent poller
-	// interleave is a redundant same-value write, never a wrong label (PRD risk
-	// analysis) — the same guarantee a live read would give, without the extra call.
-	if markerValue(item.LastStatusOptionID) == targetOption {
+	// Live-value no-op (D7): read the item's CURRENT Status from the forge and skip
+	// the mutation only when the board is ALREADY at the target. Comparing against a
+	// LIVE read — not the stored marker — is what lets a uzi move win a race with a
+	// concurrent GitHub-side drag: if the card was dragged since our last sync the
+	// marker is stale but the live value is not, so we still re-assert the target the
+	// user just chose. A live-read failure must not fail the drag: log and fall
+	// through to the write (worst case a redundant same-value write).
+	liveOption, lerr := syncer.ReadProjectV2ItemStatus(ctx, item.ItemNodeID, link.StatusFieldID)
+	if lerr == nil && liveOption == targetOption {
+		// Board already at target. Keep the marker in step with reality so the next
+		// reverse poll does not read a stale marker as forge-side drift.
+		if markerValue(item.LastStatusOptionID) != targetOption {
+			if err := s.store.SetGithubProjectItemStatusMarker(ctx, store.SetGithubProjectItemStatusMarkerParams{
+				LastStatusOptionID: optionMarker(targetOption),
+				RepoID:             repoID,
+				ForgeIssueIid:      issueIID,
+			}); err != nil {
+				s.log.Warn("project sync: forward move sync marker", "repo", repoID, "issue", issueIID, "error", err)
+			}
+		}
 		return nil
+	}
+	if lerr != nil {
+		s.log.Warn("project sync: forward move live-status read", "repo", repoID, "issue", issueIID, "error", lerr)
 	}
 	if err := syncer.SetProjectV2ItemStatus(ctx, link.ProjectNodeID, item.ItemNodeID, link.StatusFieldID, targetOption); err != nil {
 		s.stampLinkError(ctx, repoID, err)
