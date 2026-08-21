@@ -188,7 +188,13 @@ export function buildSignalMcpServer(
   // option is set, so the `milestones` param is invisible to the model on a
   // non-issue run (Decision 13) rather than present-and-silently-dropped.
   const planShape: Record<string, z.ZodTypeAny> = {
-    plan_md: z.string().describe("The full implementation plan, as Markdown."),
+    plan_md: z
+      .string()
+      .describe(
+        "REQUIRED. The full implementation plan, as Markdown. Pass it as the top-level " +
+          "string argument named 'plan_md' (not 'plan', 'summary', 'body', or 'markdown'). " +
+          "This is the only required argument.",
+      ),
   };
   if (opts.milestones) {
     planShape["milestones"] = z
@@ -206,7 +212,7 @@ export function buildSignalMcpServer(
     tools: [
       tool(
         SUBMIT_PLAN_TOOL,
-        "Submit your implementation plan for human approval. Call this EXACTLY ONCE when the plan is ready, then STOP and end your turn — do not begin implementing. A human approves or rejects the plan out of band; you will be re-prompted to implement only after approval.",
+        "Submit your implementation plan for human approval. Call this EXACTLY ONCE when the plan is ready, then STOP and end your turn — do not begin implementing. A human approves or rejects the plan out of band; you will be re-prompted to implement only after approval. Pass the plan as the 'plan_md' argument (Markdown).",
         planShape,
         async () => ({
           content: [
