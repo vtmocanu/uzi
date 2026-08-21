@@ -143,7 +143,7 @@ export function CliTokens() {
           ref={mintedRef}
           tabIndex={-1}
           role="status"
-          className="space-y-3 rounded-xl border border-edge bg-surface p-5 outline-none border-ok/40"
+          className="space-y-3 rounded-xl border border-edge bg-surface p-5 outline-hidden border-ok/40"
         >
           <SectionTitle className="text-ok">Token “{minted.row.name}” created</SectionTitle>
           <p className="text-sm text-muted">
@@ -214,7 +214,7 @@ export function CliTokens() {
             onKeyDown={(e) => {
               if (e.key === "Escape") setConfirmingAll(false);
             }}
-            className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 outline-none"
+            className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 outline-hidden"
           >
             <p id="cli-revoke-all-warning" className="text-xs text-warn">
               Revoke all {activeCount} active {activeCount === 1 ? "token" : "tokens"}? Every{" "}

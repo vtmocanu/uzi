@@ -258,7 +258,7 @@ export const AgentTemplateEditor = forwardRef<
             onKeyDown={onToolKey}
             onBlur={() => toolDraft && addTool(toolDraft)}
             placeholder={tools.length ? "" : "Bash, Read, …"}
-            className="min-w-[8rem] flex-1 bg-transparent text-sm text-fg outline-none"
+            className="min-w-[8rem] flex-1 bg-transparent text-sm text-fg outline-hidden"
             autoCapitalize="off"
             autoCorrect="off"
             spellCheck={false}
@@ -283,7 +283,7 @@ export const AgentTemplateEditor = forwardRef<
           value={promptBody}
           onChange={(e) => setPromptBody(e.target.value)}
           rows={12}
-          className="w-full rounded-lg border border-edge bg-raised px-3 py-2 font-mono text-sm text-fg outline-none focus:border-brand/70"
+          className="w-full rounded-lg border border-edge bg-raised px-3 py-2 font-mono text-sm text-fg outline-hidden focus:border-brand/70"
         />
       </div>
 

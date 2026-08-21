@@ -33,7 +33,7 @@ export function PipelineBadge({ pipeline }: { pipeline: PipelineStatus }) {
       rel="noreferrer"
       title={title}
       aria-label={`CI ${label} (opens the pipeline on the forge in a new tab)`}
-      className="inline-flex rounded-md transition-[filter] hover:brightness-110 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/50"
+      className="inline-flex rounded-md transition-[filter] hover:brightness-110 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-brand/50"
     >
       {badge}
     </a>
