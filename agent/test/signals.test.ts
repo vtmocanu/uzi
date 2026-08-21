@@ -420,6 +420,20 @@ describe("buildSignalMcpServer milestones schema gate (PRD #122 M1)", () => {
     assert.ok("milestones" in shape, `expected milestones; got ${Object.keys(shape).join(", ")}`);
     assert.ok("plan_md" in shape);
   });
+
+  it("names the plan_md key in the property description and the tool description (#502)", () => {
+    const server = buildSignalMcpServer();
+    // Property .describe() -> inputSchema property description.
+    const propDesc = (planToolShape(server).plan_md as { description?: string }).description;
+    assert.ok(propDesc, "expected a description on the plan_md property");
+    assert.ok(propDesc!.includes("plan_md"), `plan_md property description must name the key; got: ${propDesc}`);
+    // Tool-level description read off the same registered-tool object the helper indexes.
+    const s = server as { instance?: unknown };
+    const tools = (s.instance as { _registeredTools?: Record<string, { description?: string }> } | undefined)?._registeredTools;
+    const toolDesc = tools?.["submit_plan"]?.description;
+    assert.ok(toolDesc, "expected a submit_plan tool description");
+    assert.ok(toolDesc!.includes("plan_md"), `submit_plan tool description must name the key; got: ${toolDesc}`);
+  });
 });
 
 describe("scanSignals report_progress (PRD #122 M2)", () => {
