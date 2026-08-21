@@ -34,7 +34,19 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import ts from "typescript";
+// PARSER: @babel/parser, not the `typescript` package. TypeScript 7 (the native
+// port) removed the synchronous programmatic parser from its public JS API:
+// `import ts from "typescript"` now resolves to `lib/version.cjs` (just `{ version }`),
+// so `ts.createSourceFile` / `ts.ScriptTarget` / `ts.forEachChild` are all undefined,
+// and the only text->AST path left is the Go-backed, async, explicitly-unstable
+// `typescript/unstable/sync` Project model. Re-implementing a JSX-aware parser on
+// TS7's raw scanner would be far riskier for this false-positive-sensitive guard, so
+// this script parses with Babel instead. Babel is already resolved in this tree via
+// @vitejs/plugin-react (which runs Babel over these same .tsx files), so it adds no
+// download weight and is proven to accept this codebase's syntax. The AST walk below
+// is a faithful port of the previous TypeScript-AST version.
+import { parse } from "@babel/parser";
+import { isStringLiteral, isTemplateLiteral, isJSXAttribute, isJSXIdentifier, isCallExpression, isIdentifier, VISITOR_KEYS } from "@babel/types";
 import postcss from "postcss";
 import tailwind from "tailwindcss";
 import cfg from "../tailwind.config.js";
@@ -94,43 +106,68 @@ const quasiTokens = (text, hasBefore, hasAfter) => {
   return toks;
 };
 
+// Generic child walk — the Babel equivalent of `ts.forEachChild`. VISITOR_KEYS
+// lists exactly the child-bearing properties for a node type, so this skips
+// `loc`, comments and other non-AST fields (prose can never be read as classes).
+const eachChild = (node, cb) => {
+  const keys = VISITOR_KEYS[node.type];
+  if (!keys) return;
+  for (const key of keys) {
+    const val = node[key];
+    if (Array.isArray(val)) {
+      for (const c of val) if (c && typeof c.type === "string") cb(c);
+    } else if (val && typeof val.type === "string") {
+      cb(val);
+    }
+  }
+};
+
 for (const abs of tsFiles) {
   const rel = path.relative(webRoot, abs);
   const src = readFileSync(abs, "utf8");
-  const sf = ts.createSourceFile(rel, src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-  const lineOf = (node) => sf.getLineAndCharacterOfPosition(node.getStart()).line + 1;
+  // JSX lives only in `.tsx` here (TS requires it); enabling `jsx` for a plain
+  // `.ts` would misread a `<T>x` angle-bracket type assertion as JSX, so gate it.
+  const plugins = abs.endsWith(".tsx") ? ["typescript", "jsx"] : ["typescript"];
+  const ast = parse(src, { sourceType: "module", plugins });
+  const lineOf = (node) => node.loc.start.line; // Babel loc is already 1-based
 
   // Collect every string/template literal inside a known className/cx subtree,
   // recursing through ternaries, logical `&&`, arrays and nested cx() to reach
-  // them. TemplateExpression quasis get the abutting-fragment drop; interpolated
+  // them. Template quasis get the abutting-fragment drop; interpolated
   // expressions are recursed so `${cond ? "text-danger" : ""}` is still seen.
+  // Babel folds NoSubstitutionTemplateLiteral and TemplateExpression into one
+  // TemplateLiteral node (quasis.length === expressions.length + 1): quasi `i`
+  // has an interpolation before it iff `i > 0`, and after it iff `i < n` — which
+  // reproduces the old head/span hasBefore/hasAfter flags exactly, including the
+  // no-interpolation case (a single quasi, both flags false).
   const collect = (node) => {
-    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
-      push(quasiTokens(node.text, false, false), rel, lineOf(node));
+    if (isStringLiteral(node)) {
+      push(quasiTokens(node.value, false, false), rel, lineOf(node));
       return;
     }
-    if (ts.isTemplateExpression(node)) {
-      push(quasiTokens(node.head.text, false, true), rel, lineOf(node.head));
-      const spans = node.templateSpans;
-      spans.forEach((span, i) => {
-        const isLast = i === spans.length - 1;
-        push(quasiTokens(span.literal.text, true, !isLast), rel, lineOf(span.literal));
-        collect(span.expression);
+    if (isTemplateLiteral(node)) {
+      const n = node.expressions.length;
+      node.quasis.forEach((q, i) => {
+        const text = q.value.cooked ?? q.value.raw;
+        push(quasiTokens(text, i > 0, i < n), rel, lineOf(q));
       });
+      node.expressions.forEach(collect);
       return;
     }
-    ts.forEachChild(node, collect);
+    eachChild(node, collect);
   };
 
   const walk = (node) => {
-    if (ts.isJsxAttribute(node) && node.name.getText(sf) === "className" && node.initializer) {
-      collect(node.initializer);
-    } else if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "cx") {
+    if (isJSXAttribute(node) && isJSXIdentifier(node.name) && node.name.name === "className" && node.value) {
+      // node.value is a StringLiteral (className="…") or a JSXExpressionContainer
+      // (className={…}); collect() recurses into the container's expression.
+      collect(node.value);
+    } else if (isCallExpression(node) && isIdentifier(node.callee) && node.callee.name === "cx") {
       node.arguments.forEach(collect);
     }
-    ts.forEachChild(node, walk);
+    eachChild(node, walk);
   };
-  walk(sf);
+  walk(ast.program);
 }
 
 // index.html carries only the static app shell (no JSX/cx), so its classes come
