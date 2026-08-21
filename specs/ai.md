@@ -21755,7 +21755,7 @@ the account will recover from on its own. The flip is a later, deliberate user d
 in tension with Feature #35's "two opt-in scopes" wording — see the provenance note below.
 
 - **The DEFAULT flipped OFF→ON, scoped to the per-user and schedule defaults, not the per-run
-  column.** Migration `00143_wait_on_limit_default_on.sql` flips `users.wait_on_limit` column
+  column.** Migration `00144_wait_on_limit_default_on.sql` flips `users.wait_on_limit` column
   DEFAULT false→true and aligns `run_schedules.wait_on_limit` DEFAULT to true (schedules were
   already default-on at the handler, `applyCreateDefaults`, PRD #274 D1a; the migration only makes
   the DB column agree). No creation-path Go changed: every origin resolves the per-user default via

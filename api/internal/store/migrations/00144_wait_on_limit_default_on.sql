@@ -6,12 +6,12 @@
 -- This flips the two per-user / per-schedule column defaults and backfills
 -- existing users, so the whole instance moves to the safe-by-default behaviour.
 --
--- NUMBER ASSIGNED AT LANDING. Drafted as 00143 against a live head of
--- 00142_capability_scheduling.sql; renumber above the live head on the landing
--- rebase if another migration merged first. Per CLAUDE.md that renumber is
--- mandatory, not tidy: the boot runner is strict goose (no allow-missing, see
--- 00091's header), so landing a version BELOW an already-applied head makes
--- every upgraded instance refuse to boot.
+-- NUMBER ASSIGNED AT LANDING. Drafted as 00143 against a then-live head of
+-- 00142_capability_scheduling.sql; renumbered to 00144 on the landing rebase
+-- because 00143_run_stop_reason.sql merged to main first. Per CLAUDE.md that
+-- renumber is mandatory, not tidy: the boot runner is strict goose (no
+-- allow-missing, see 00091's header), so landing a version BELOW an
+-- already-applied head makes every upgraded instance refuse to boot.
 --
 -- 🔴 DO NOT TOUCH runs.wait_on_limit. Judge runs deliberately rely on
 -- runs.wait_on_limit DEFAULT false staying false, so a judge run is never
