@@ -102,3 +102,62 @@ describe("RunIssueRef — raised scopes z-10 to the interactive anchor only (#48
     expect(span.className).not.toContain("z-10");
   });
 });
+
+describe('RunIssueRef — tone="inherit" lets the ref read the parent colour (#485 NB2)', () => {
+  // The Board needs-attention strip themes the whole pill `text-warn`; a ref that forces
+  // its own text-faint/text-muted mismatches the amber. tone="inherit" drops those
+  // explicit colours so the number reads warn, and (branch 2) swaps hover:text-brand —
+  // which would break the warn theme — for a warn-safe hover:underline. Each check pairs
+  // an inherit assertion with a default-tone positive control on the same surface.
+  it("branch 2 (https anchor): inherit drops text-faint and hover:text-brand", () => {
+    render(
+      <RunIssueRef issueIid={26} issueWebUrl={URL26} kind="issue" forgeType="gitlab" tone="inherit" />,
+    );
+    const link = screen.getByRole("link");
+    expect(link.className).not.toContain("text-faint");
+    expect(link.className).not.toContain("hover:text-brand");
+    // The warn-safe hover affordance is still present.
+    expect(link.className).toContain("hover:underline");
+  });
+
+  it("branch 2 (https anchor): default tone DOES force text-faint and hover:text-brand", () => {
+    render(<RunIssueRef issueIid={26} issueWebUrl={URL26} kind="issue" forgeType="gitlab" />);
+    const link = screen.getByRole("link");
+    expect(link.className).toContain("text-faint");
+    expect(link.className).toContain("hover:text-brand");
+  });
+
+  it("branch 2 (https anchor): inherit still composes raised as relative z-10", () => {
+    render(
+      <RunIssueRef
+        issueIid={26}
+        issueWebUrl={URL26}
+        kind="issue"
+        forgeType="gitlab"
+        raised
+        tone="inherit"
+      />,
+    );
+    const link = screen.getByRole("link");
+    expect(link.className).toContain("relative");
+    expect(link.className).toContain("z-10");
+    expect(link.className).not.toContain("text-faint");
+  });
+
+  it("branch 1 (kind chip): inherit drops text-muted", () => {
+    const { container } = render(
+      <RunIssueRef issueIid={null} issueWebUrl={null} kind="task" forgeType="gitlab" tone="inherit" />,
+    );
+    const chip = container.firstElementChild as HTMLElement;
+    expect(chip.tagName).toBe("SPAN");
+    expect(chip.className).not.toContain("text-muted");
+  });
+
+  it("branch 1 (kind chip): default tone DOES force text-muted", () => {
+    const { container } = render(
+      <RunIssueRef issueIid={null} issueWebUrl={null} kind="task" forgeType="gitlab" />,
+    );
+    const chip = container.firstElementChild as HTMLElement;
+    expect(chip.className).toContain("text-muted");
+  });
+});

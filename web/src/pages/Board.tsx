@@ -1234,6 +1234,7 @@ export function Board() {
                 kind={r.kind}
                 forgeType={r.forge_type}
                 raised
+                tone="inherit"
               />{" "}
               →
             </span>
