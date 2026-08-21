@@ -338,6 +338,10 @@ func (m tuiModel) detailHeaderLines() []string {
 	if d.run.ID != "" && d.run.Kind != "" {
 		crumb += m.pal.faint.Render(" · " + m.renderer.Plain(d.run.Kind, 12))
 	}
+	if d.run.IssueIID != nil {
+		styledIID := m.pal.title.Render("#" + itoa(int(*d.run.IssueIID)))
+		crumb += m.pal.faint.Render(" · ") + m.issueLink(d.run, styledIID)
+	}
 
 	// The credential label (PRD #295, label only — reason/mode lives on `uzi run <id>`) and the
 	// healthy/transient transport tag; a transport DEGRADATION still takes its own line below.

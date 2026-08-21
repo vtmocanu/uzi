@@ -94,6 +94,9 @@ var d7UntrustedFields = []string{
 	"Target",
 	"IssueTitle",
 	"IssueDescription",
+	// IssueWebURL is the forge-authored issue URL drawn as an OSC-8 hyperlink target via
+	// oscLink; it must reach a draw only inside a sanitizeTTY(...) call (issueLink does so).
+	"IssueWebURL",
 	"AgentLabel",
 	"HealthReason",
 	"FailureReason",

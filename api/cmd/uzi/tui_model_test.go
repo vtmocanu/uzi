@@ -708,8 +708,16 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	// detail credential tag on the header's first line (detailCredTag), both drawn through
 	// renderer.Plain. *string, so bind a local.
 	hostileLabel := nasty
+	// A hostile IssueWebURL exercises the OSC-8 issue-link path (issueLink → oscLink): the
+	// forge-authored URL is the link target, so its control bytes must be stripped before
+	// they reach the frame. IssueIID is non-nil so the link path actually runs; the default
+	// test profile is TrueColor, so the link is emitted (not degraded). *string, so bind a local.
+	hostileURL := nasty
+	hostileIID := int64(519)
 	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running", IssueTitle: nasty, AnthropicSecretLabel: &hostileLabel}},
+		{RunDTO: apitypes.RunDTO{ID: "77777777-2222", Kind: "issue", Status: "running", IssueTitle: nasty,
+			IssueIID: &hostileIID, IssueWebURL: &hostileURL}},
 	}}
 	board := tuiTestModel(t, fake, "")
 	next, _ := board.Update(boardRunsMsg{runs: fake.Runs})
@@ -717,7 +725,15 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	// >1 token so the own board draws the credential cell (the boardCredSeg path).
 	next, _ = board.Update(secretsMsg{count: 2})
 	board = next.(tuiModel)
-	assertNoRawControls(t, "board", board.View().Content)
+	boardOut := board.View().Content
+	assertNoRawControls(t, "board", boardOut)
+	// Belt-and-braces beyond assertNoRawControls: the raw control bytes from the hostile
+	// IssueWebURL must not survive verbatim into the frame (the OSC-8 target is sanitized).
+	for _, ctrl := range []string{"\x1b[2J", "\x07", "\x01"} {
+		if strings.Contains(boardOut, ctrl) {
+			t.Errorf("board frame contains a raw control byte %q from the hostile IssueWebURL", ctrl)
+		}
+	}
 
 	detail := tuiTestModel(t, fake, runID)
 	next, _ = detail.Update(detailLoadedMsg{
@@ -1247,9 +1263,13 @@ func TestTUIBoardSemanticStatusAndSummary(t *testing.T) {
 //     and a letter was sheltered. Order is now reversed.
 //
 // CAVEAT, and treat a red here as information rather than a defect: nobody has proven
-// the frames contain ONLY SGR. If lipgloss v2 starts emitting OSC 8 hyperlinks, this
-// goes red on legitimate output. Widen the allowlist with a named reason — never
-// restore the blanket skip, which is what made it blind.
+// the frames contain ONLY SGR and OSC-8 hyperlink delimiters. OSC-8 hyperlink
+// delimiters ARE now allowed (named reason: the clickable #<iid> issue link, m2), via
+// osc8SequenceEnd — the skip covers ONLY the two well-formed delimiters (ESC ] 8 ; ;
+// … ESC \), not arbitrary OSC, and the styled text between them is still scanned. Any
+// OTHER escape than SGR or a well-formed OSC-8 delimiter is still a finding. Widen the
+// allowlist further only with a named reason — never restore the blanket skip, which is
+// what made it blind.
 //
 // RESIDUAL, stated rather than papered over: the steer bar, help overlay and quit modal
 // are not driven by any caller of this, so their draws are unasserted. That decay is
@@ -1263,6 +1283,10 @@ func assertNoRawControls(t *testing.T, where, out string) {
 	for i := 0; i < len(rs); i++ {
 		r := rs[i]
 		if r == 0x1b {
+			if end, ok := osc8SequenceEnd(rs, i); ok {
+				i = end // a legitimate OSC-8 hyperlink delimiter; skip past it
+				continue
+			}
 			if end, ok := sgrSequenceEnd(rs, i); ok {
 				i = end // a legitimate colour sequence; skip past it
 				continue
@@ -1299,6 +1323,28 @@ func sgrSequenceEnd(rs []rune, i int) (int, bool) {
 			return j, true
 		}
 		return 0, false
+	}
+	return 0, false
+}
+
+// osc8SequenceEnd reports the index of the final rune of a well-formed OSC-8
+// hyperlink DELIMITER starting at i (ESC ] 8 ; ; <params/url> ESC \), and whether
+// one is there. Each of the open and close delimiters matches this shape; the
+// enclosed styled text between them is scanned normally (its SGR is handled by
+// sgrSequenceEnd). The url carries no ESC because it is sanitized before emission,
+// so the ESC we scan to can only be the ST terminator.
+func osc8SequenceEnd(rs []rune, i int) (int, bool) {
+	// ESC ] 8 ; ;
+	if i+4 >= len(rs) || rs[i+1] != ']' || rs[i+2] != '8' || rs[i+3] != ';' || rs[i+4] != ';' {
+		return 0, false
+	}
+	for j := i + 5; j < len(rs); j++ {
+		if rs[j] == 0x1b { // ST is ESC \
+			if j+1 < len(rs) && rs[j+1] == '\\' {
+				return j + 1, true
+			}
+			return 0, false
+		}
 	}
 	return 0, false
 }

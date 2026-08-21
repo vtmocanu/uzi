@@ -653,7 +653,20 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	if avail > boardTitleMax {
 		avail = boardTitleMax
 	}
-	row += paintSeg(titleC, bg, false, clampVisual(m.renderer.Plain(runTitle(r.RunDTO), avail), avail))
+	// Clickable #<iid> immediately before the title (issue-less runs render nothing).
+	// Its visual width comes off the title budget; the OSC-8 escape is zero-width to
+	// lipgloss so padding stays correct. Variable-width, so it is deliberately NOT in
+	// boardRowPrefixWidth's fixed column set.
+	titlePrefix := ""
+	if r.IssueIID != nil {
+		styledIID := paintSeg(idC, bg, sel, "#"+itoa(int(*r.IssueIID)))
+		titlePrefix = m.issueLink(r.RunDTO, styledIID) + paintSeg(nil, bg, false, " ")
+		avail -= visualWidth(titlePrefix)
+		if avail < 10 {
+			avail = 10
+		}
+	}
+	row += titlePrefix + paintSeg(titleC, bg, false, clampVisual(m.renderer.Plain(runTitle(r.RunDTO), avail), avail))
 
 	// Judge marker (own board only; AdminListRuns carries no JudgeVerdict), flushed to the right
 	// edge so the ⚖ icon and count align down the board.

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/colorprofile"
 	"github.com/spf13/cobra"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -121,14 +122,23 @@ type tuiModel struct {
 	// than one to disambiguate. 0 until the probe returns, so the column stays hidden until
 	// then rather than flashing in.
 	tokenCount int
+
+	// profile is the terminal's colour profile (tea.ColorProfileMsg, set at program
+	// start). It gates OSC-8 hyperlink emission: links are emitted only at ANSI or
+	// richer, so a NO_COLOR/Ascii terminal gets plain #<iid> text (the colorprofile
+	// Writer strips SGR under Ascii but passes OSC-8 through unchanged, so links must
+	// self-gate). Defaults to TrueColor so the first frame and untouched test models
+	// emit links, mirroring the dark:true default.
+	profile colorprofile.Profile
 }
 
 func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel {
 	m := tuiModel{
 		client: c, ctx: ctx,
 		width: 100, height: 30, dark: true,
-		pal:  newPalette(true),
-		view: viewBoard,
+		profile: colorprofile.TrueColor,
+		pal:     newPalette(true),
+		view:    viewBoard,
 	}
 	m.renderer, _ = newTUIRenderer(m.width, m.dark)
 	m.board = newBoardState()
@@ -250,6 +260,10 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.dark = msg.IsDark()
 		m.pal = newPalette(m.dark)
 		m.renderer, _ = newTUIRenderer(m.transcriptWidth(), m.dark)
+		return m, nil
+
+	case tea.ColorProfileMsg:
+		m.profile = msg.Profile
 		return m, nil
 
 	case tea.KeyPressMsg:
