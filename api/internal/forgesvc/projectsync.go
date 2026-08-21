@@ -682,9 +682,13 @@ func (s *ProjectSyncService) ForwardMove(ctx context.Context, repoID uuid.UUID, 
 			return nil
 		}
 		// Drive the just-added item to the target and persist item node id + marker.
-		if err := syncer.SetProjectV2ItemStatus(ctx, link.ProjectNodeID, itemID, link.StatusFieldID, targetOption); err != nil {
-			s.stampLinkError(ctx, repoID, err)
-			return nil
+		// An Open/clear target ("") needs no Set: a just-added item already carries
+		// "No Status", so a Set with "" would be a redundant clear mutation.
+		if targetOption != "" {
+			if err := syncer.SetProjectV2ItemStatus(ctx, link.ProjectNodeID, itemID, link.StatusFieldID, targetOption); err != nil {
+				s.stampLinkError(ctx, repoID, err)
+				return nil
+			}
 		}
 		if _, err := s.store.UpsertGithubProjectItem(ctx, store.UpsertGithubProjectItemParams{
 			RepoID:             repoID,
