@@ -6,32 +6,86 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.51.0] - 2026-08-21
+<!-- release-title: capability-aware scheduling, wait-on-limit on by default, live runs list -->
+
+### Added
+
+- **Capability-aware run scheduling and plan gate ([#510](https://github.com/vtmocanu/uzi/pull/510), [#523](https://github.com/vtmocanu/uzi/pull/523), PRD #84).** Runs now carry
+  a required-capability set ({docker, jvm}) inferred at plan time, and repos carry a static
+  hint; both the worker-claim predicate and an authoritative approval-gate check route a run
+  only to a worker whose effective capabilities satisfy it. A queued run with no eligible
+  worker surfaces a capability-specific health reason instead of the generic "waiting for a
+  worker", the plan-approval gate shows met/unmet capability chips with a "run without
+  <caps>" override, and `uzi run get` prints the requirement rows. Gated by a
+  `capability_aware_scheduling` admin kill-switch (default on).
+- **Contextual in-app documentation links ([#497](https://github.com/vtmocanu/uzi/pull/497), PRD #57).** Settings, management, and admin
+  surfaces now link directly to their in-app guide, via a shared DocLink component and a slug
+  registry.
+- **Per-repo Setup indicator ([#508](https://github.com/vtmocanu/uzi/pull/508), PRD #361).** The Repos page shows a Setup chip and popover
+  for a repo that is not yet Docker-allowlisted, and a run queued behind that restriction now
+  surfaces the specific reason.
+- **Live-updating runs list ([#522](https://github.com/vtmocanu/uzi/pull/522), PRD #518).** The /runs list refreshes on its own while the
+  tab is visible instead of needing a manual browser reload.
+- **`uzi review file`: file judge recommendations from the CLI ([#504](https://github.com/vtmocanu/uzi/pull/504), [#507](https://github.com/vtmocanu/uzi/pull/507), PRD #365).** A new
+  CLI command files a judge recommendation as a forge issue or a run finding; the underlying
+  file/dismiss endpoints move to Bearer-capable `RequireUser` auth.
+- **TUI: clickable issue link and rate-limit meters ([#528](https://github.com/vtmocanu/uzi/pull/528)).** The factory-floor board and the
+  run-detail header render the forge issue id as an OSC-8 hyperlink (plain text under
+  NO_COLOR/Ascii terminals), and the board shows the viewer's own Anthropic 5h/7d rate-limit
+  meters, mirroring the web sidebar.
+
 ### Changed
 
-- **Lead agent run-context guidance (PRD #501).** The builtin `lead` template and the
+- **wait-on-limit now defaults ON ([#526](https://github.com/vtmocanu/uzi/pull/526), [#520](https://github.com/vtmocanu/uzi/pull/520)).** New and existing users default to
+  parking-and-resuming a run that hits an Anthropic usage limit instead of failing it; judge
+  runs still never park. The change is a one-way backfill via migration.
+- **Lead agent run-context guidance ([#511](https://github.com/vtmocanu/uzi/pull/511), PRD #501).** The builtin `lead` template and the
   autopilot plan prompts now tell the lead three things it previously learned too late:
   (A) the Bash working directory persists across tool calls and the run starts at the
   worktree root, so relative-path greps and `cd`s should use absolute paths or re-`cd`
   from root (generalized from the integration-gate-only note); (B) on an autopilot run
   (no human in the loop) it is told up front, at planning time, to resolve open decisions
   on best judgment and record the assumption rather than spending an `ask_user` round-trip;
-  and (C) any commit landing after a clean review — including the lead's own edits —
+  and (C) any commit landing after a clean review, including the lead's own edits,
   re-opens a read-only validator wave over the new range before the run is signalled done.
-- **Cancel/reject steering reason is now captured (PRD #503, issue [#503](https://github.com/vtmocanu/uzi/issues/503)).**
-  `uzi run reject` now requires a reason (pass `-m`, or pipe it on stdin) instead of
-  accepting an empty one, and the reason is persisted as the run's `failure_reason` on
-  every reject path (it was previously dropped and replaced by a hardcoded "plan rejected"
-  on the server-side path). `uzi run cancel` gains an optional `-m/--message`, stored on the
-  run in a new nullable `runs.stop_reason` column on both cancel paths.
+- **Cancel/reject steering reason is now captured ([#521](https://github.com/vtmocanu/uzi/pull/521), PRD #503).** `uzi run reject` now
+  requires a reason (pass `-m`, or pipe it on stdin) instead of accepting an empty one, and
+  the reason is persisted as the run's `failure_reason` on every reject path (it was
+  previously dropped and replaced by a hardcoded "plan rejected" on the server-side path).
+  `uzi run cancel` gains an optional `-m/--message`, stored on the run in a new nullable
+  `runs.stop_reason` column on both cancel paths.
+- **`submit_plan` names the `plan_md` key ([#515](https://github.com/vtmocanu/uzi/pull/515), [#502](https://github.com/vtmocanu/uzi/pull/502)).** The plan-submission tool schema and
+  description now name the markdown key explicitly.
+- **Dependency majors:** `@anthropic-ai/claude-agent-sdk` ([#493](https://github.com/vtmocanu/uzi/pull/493)), `golang.org/x/mod` ([#494](https://github.com/vtmocanu/uzi/pull/494)),
+  and the Babel monorepo ([#495](https://github.com/vtmocanu/uzi/pull/495)).
 
 ### Fixed
 
-- **Operator cancellations are no longer classified as agent failures or judged (PRD #503, issue [#503](https://github.com/vtmocanu/uzi/issues/503)).**
+- **Operator cancellations are no longer classified as agent failures or judged ([#521](https://github.com/vtmocanu/uzi/pull/521), PRD #503).**
   A run cancelled or plan-rejected while a live worker held it used to end `failed` with
   `fail_origin='agent_failure'`, so an operator cancellation was judged and blamed on the
   agent (polluting per-agent reliability signal). A live cancel now ends `cancelled` (and is
-  never judged), and a live plan-rejection carries `fail_origin='plan_rejected'` — both
+  never judged), and a live plan-rejection carries `fail_origin='plan_rejected'`, both
   matching the existing server-side paths.
+- **Card issue-ref anchors ([#491](https://github.com/vtmocanu/uzi/pull/491), PRD #411).** Issue-ref links on run cards and the
+  needs-attention strip are now valid sibling anchors, with restored badge tooltips and
+  distinct link names under the stretched-link overlay.
+- **GitHub Projects sync cleanup ([#489](https://github.com/vtmocanu/uzi/pull/489), PRD #364).** Dropped an orphan
+  `ListGithubProjectSyncedRepos` query and a redundant clear on the forward-move
+  item-missing branch.
+- **Judge pre-scan false positives on repo shell functions ([#513](https://github.com/vtmocanu/uzi/pull/513)).** The command-not-found
+  pre-scan no longer flags a repo's own shell functions (anchored to column-0 or a `;&|`
+  boundary, excluding indented methods and IIFEs).
+
+### Internal
+
+- **Run-liveness sweep interval is now configurable ([#506](https://github.com/vtmocanu/uzi/pull/506), PRD #97).** A `SWEEP_INTERVAL` knob
+  for the run-liveness sweeper, plus e2e-suite speedups.
+- **Two `gate:repo` structural checks ([#514](https://github.com/vtmocanu/uzi/pull/514), PRD #500):** migration-number collision and
+  binary/control-byte text-file detection.
+- **Dev-team/product role-parity nudge ([#490](https://github.com/vtmocanu/uzi/pull/490)).** A non-gating nudge reporting any role present
+  on one roster and absent from the other.
 
 ## [0.50.0] - 2026-08-21
 <!-- release-title: board + Projects v2 sync, worker fleet roll, dependency majors -->
@@ -2975,7 +3029,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.50.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.51.0...HEAD
+[0.51.0]: https://github.com/vtmocanu/uzi/compare/v0.50.0...v0.51.0
 [0.50.0]: https://github.com/vtmocanu/uzi/compare/v0.49.0...v0.50.0
 [0.49.0]: https://github.com/vtmocanu/uzi/compare/v0.48.0...v0.49.0
 [0.48.0]: https://github.com/vtmocanu/uzi/compare/v0.47.0...v0.48.0
