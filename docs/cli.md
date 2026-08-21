@@ -105,6 +105,7 @@ uzi review show <id> | backlog [--bucket todo|filed|done|dismissed|all] [--categ
 uzi review resolve <id> <rec> | --category <c> --target <t>
 uzi review dismiss <id> <rec> | --category <c> --target <t> --reason wont-do|not-an-issue
 uzi review undo <id> <rec> | stats [--json]
+uzi review file <id> <rec> [--repo <repo-id>]
 uzi findings list [--repo <id>] [--bucket to_file|filed|dismissed|all] [--run <id>]
 uzi findings file <finding-id>
 uzi findings dismiss <finding-id> --reason wont-do|not-an-issue
@@ -253,7 +254,8 @@ A few worth knowing:
   recommendations, and triage tally for a run — see
   [Run judge](./judge.md#reading-a-review-from-the-cli) for the full `--json`
   contract. The rest of the `review` group (`backlog`/`resolve`/`dismiss`/
-  `undo`/`stats`) triages recommendations, per run or across all of them — see
+  `undo`/`stats`, plus `file` to turn a recommendation into a forge issue)
+  triages recommendations, per run or across all of them — see
   [Reviewing and triaging from the CLI](#reviewing-and-triaging-from-the-cli)
   below. There's still no `rejudge` verb: re-running the judge spends the
   owner's Anthropic budget and stays a web action.
@@ -623,6 +625,8 @@ uzi review dismiss <run-id> <rec-id> --reason wont-do        # valid, not worth 
 uzi review dismiss <run-id> <rec-id> --reason not-an-issue   # false positive
 uzi review undo <run-id> <rec-id>                            # clear a disposition
 uzi review stats [--json]                                    # your triage tally, across all runs
+uzi review file <run-id> <rec-id>                            # file this recommendation as a forge issue
+uzi review file <run-id> <rec-id> --repo <repo-id>           # file against a specific repo (ambiguous default)
 ```
 
 `show` is one run. `backlog` is every recommendation across **all** your runs,
@@ -688,8 +692,20 @@ Three things to know before acting on a group action's output:
 
 Passing only one of `--category`/`--target` is a usage error (exit 2). An empty
 half is a literal empty string, not a wildcard, so sending it would report a
-successful no-op. Filing an issue from a recommendation stays a web action:
-there is no `file` verb.
+successful no-op.
+
+`uzi review file <run-id> <rec-id>` files one recommendation as a real forge
+issue on **your own** connection. Title and description are server-templated
+defaults from the same draft the web filing UI shows — the CLI files the
+defaults; editing the draft before filing stays a web action. A successful
+file records the issue under the review's `filed_issues` and moves the
+recommendation to the `filed` bucket. `--repo <repo-id>` overrides the draft's
+default repo; when the default is ambiguous and no `--repo` is given, the CLI
+prints the server's picker note and exits with a usage error (exit 2) rather
+than guessing. Exit 5 if the recommendation is already filed or mid-filing,
+exit 4 if the run or recommendation is unknown or not yours. There is no
+group form — filing is one issue per recommendation, matching the web; only
+`resolve`/`dismiss` have a `--category`/`--target` group shape.
 
 `<rec-id>` is the short, git-style id `show` prints as the first column of
 each recommendation (or the full UUID from `--json`); an unambiguous prefix

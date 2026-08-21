@@ -164,6 +164,7 @@ uzi review backlog [--bucket todo|filed|done|dismissed|all] [--run <run-id>] [--
 uzi review resolve <run-id> <rec-id> | --category <c> --target <t>
 uzi review dismiss <run-id> <rec-id> | --category <c> --target <t> --reason wont-do|not-an-issue
 uzi review undo <run-id> <rec-id>
+uzi review file <run-id> <rec-id> [--repo <repo-id>]
 uzi review stats
 uzi findings list [--repo <repo-id>] [--bucket to_file|filed|dismissed|all] [--run <run-id>]
 uzi findings file <finding-id>
@@ -728,8 +729,19 @@ Triage a whole group in one call with the coordinate `backlog` prints:
 - `uzi review resolve --category <c> --target <t>` — mark the group **done**.
 - `uzi review dismiss --category <c> --target <t> --reason wont-do|not-an-issue`.
 
-There is deliberately **no `file` verb** under `review` — filing a recommendation
-as a forge issue stays a web action.
+`uzi review file <run-id> <rec-id>` files a real forge issue from **one**
+recommendation, on **your own** forge connection. Title and description are
+server-templated defaults assembled from the same draft the web filing UI
+shows — the CLI files the defaults; editing the draft before filing stays a
+web action. A successful file records the issue under the review's
+`filed_issues` and moves the rec to the **filed** bucket, exactly like filing
+from the web. `--repo <repo-id>` overrides the draft's default repo; when the
+default is ambiguous and no `--repo` is given, the CLI prints the server's
+picker note and exits with a usage error (exit 2) rather than guessing. Exit
+5 if the rec is already filed or being filed, exit 4 if the run or rec is
+unknown or not yours. There is no group form — filing is one issue per
+recommendation, matching the web; `resolve`/`dismiss` are the only verbs with
+a `--category`/`--target` group shape.
 
 Three contracts to read carefully before acting on the output:
 

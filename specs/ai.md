@@ -8639,11 +8639,13 @@ admin-can-file** (not restrict to the owner), conditioned on prominent provenanc
     (that would inflate every run-page load to serve a draft usually never opened).
 - **Routing is split, not uniform, because of the CLI (Interactions).** The judge-review *read* is
   already CLI-reachable, so the draft **GET mounts on `RequireUser`** (session **or** admin-scoped
-  CLI Bearer, CSRF-safe, mirroring the review read). Filing is **browser-only in this PRD** (no CLI
-  verb), so the **POST mounts on the cookie+CSRF `RequireAuth` path behind
-  `forgeLimiter.PerUserMiddleware`**, mirroring `ConfirmProposal` — never on the cookie-only
-  `RequireAdmin` write group. Pinned so a future reader does not mistake the CLI omission for an
-  oversight.
+  CLI Bearer, CSRF-safe, mirroring the review read). Filing was browser-only under PRD #68 (no CLI
+  verb then); **PRD #365 M1 moved it**, so the file **POST now mounts on `RequireUser` behind
+  `forgeLimiter.PerUserMiddleware`** — `uzi review file` reaches it from a CLI `uzc_` Bearer token,
+  while a browser caller stays on the cookie path with CSRF preserved via `RequireUser`'s
+  presence-dispatch (cookie request → CSRF-checked, Bearer request → no cookie to forge). Still
+  behind the per-user forge limiter, and still **never on the cookie-only `RequireAdmin` write
+  group**.
 - **Authorization: owner-or-admin to read, caller-owns-repo to write (D8).** The draft is
   owner-or-admin scoped via `GetRunForViewer` (non-owner → not-found), exactly like `GetRunReview`.
   The write additionally requires the *caller* to own the target repo via `GetRepoForUser`
@@ -9442,8 +9444,12 @@ state ("filed", PRD #68) and had no way to record "handled", "won't do", or
 - `PUT/DELETE /api/runs/{id}/review/recommendations/{recID}/disposition`
   mount on **`RequireUser`** (`handler.go`), mirroring `POST /{id}/inputs`
   (`CreateRunInput`) — CLI-reachable, no token spend, no forge write —
-  **not** the cookie-only `RequireAuth` path `rejudge`/`FileIssue` sit on
-  (those mint a spend / write a forge; this does neither).
+  **not** the cookie-only `RequireAuth` path `rejudge`/`wait-on-limit` sit
+  on (`rejudge` mints a token-spending judge run; `wait-on-limit` is an
+  unattended-spend consent toggle — this does neither). `FileIssue` itself
+  moved to `RequireUser` in PRD #365 M1: it is a forge write, but a
+  rate-limited, owner-scoped, reversible one — the same tier as these
+  disposition routes.
 - **The load-bearing authz correction, found on review**: an owner-**or**-admin
   write here would be a hole. `RequireUser` degrades a non-`admin_ro` CLI
   token to `IsAdmin=false` for free — **but a `uza_ admin_ro` token keeps
