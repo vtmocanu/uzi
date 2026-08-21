@@ -300,7 +300,7 @@ export function RunDefaults() {
           <input
             type="checkbox"
             className="h-4 w-4 accent-brand"
-            checked={user?.wait_on_limit ?? false}
+            checked={user?.wait_on_limit ?? true}
             disabled={waitLimitBusy}
             onChange={(e) => toggleWaitOnLimit(e.target.checked)}
           />
