@@ -672,10 +672,12 @@ func runReviewFile(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command
 		repoID = draft.DefaultRepoID
 	}
 	if repoID == "" {
-		// The default is ambiguous — print the server's picker note (through sanitizeTTY for
-		// parity with the render path) as an informational line, then a usage error telling the
-		// user to pass --repo. Do NOT guess a repo.
-		if draft.DefaultNote != "" {
+		// The default is ambiguous — surface the server's picker note (through sanitizeTTY for
+		// parity with the render path) as a human-facing hint, then return a usage error telling
+		// the user to pass --repo. Do NOT guess a repo. The hint is suppressed under --json/--quiet
+		// so a machine consumer's stdout is not polluted by a non-JSON line before the exit-2
+		// error; the usage error itself still returns on every path.
+		if draft.DefaultNote != "" && p.Format != uzicli.FormatJSON && !gf.quiet {
 			p.Printf("%s\n", sanitizeTTY(draft.DefaultNote))
 		}
 		return uzicli.Exitf(uzicli.ExitUsage, "no default repo for this recommendation — pass --repo <repo-id>")

@@ -387,6 +387,26 @@ func TestReviewFileAmbiguousDefaultRepoIsUsageError(t *testing.T) {
 	}
 }
 
+// Same ambiguous-default case, but with --json: still a usage error (exit 2, no file write),
+// yet the human-facing picker note must NOT land on stdout — a --json consumer must not get a
+// non-JSON line before the exit-2 error, or its stdout parse breaks.
+func TestReviewFileAmbiguousDefaultRepoJSONSuppressesNote(t *testing.T) {
+	fc := reviewFake()
+	fc.ReviewIssueDraft = apitypes.IssueDraftDTO{DefaultRepoID: "", DefaultNote: "pick a repo: A or B", Title: "t", Description: "d"}
+	out, _, code := runCLI(t, fakeEnv(fc), "review", "file", "r1", "aaaaaaaa-1", "--json")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage — gating the hint must not change the exit)", code, uzicli.ExitUsage)
+	}
+	// The non-JSON picker note must be absent from stdout so a --json consumer's parse is clean.
+	if strings.Contains(out, "pick a repo") {
+		t.Errorf("--json leaked the non-JSON picker note onto stdout, breaking machine parse:\n%s", out)
+	}
+	// The write was never reached: an ambiguous default bails BEFORE FileReviewIssue.
+	if fc.LastFileReviewRepoID != "" || fc.LastFileReviewRecID != "" {
+		t.Errorf("FileReviewIssue must not be called on an ambiguous default (repo=%q, rec=%q)", fc.LastFileReviewRepoID, fc.LastFileReviewRecID)
+	}
+}
+
 // A 409 on the file write (already filed / being filed) is exit 5 (conflict), straight
 // from statusError — and the write was REACHED with the resolved rec id before refusal.
 func TestReviewFileAlreadyFiledExit5(t *testing.T) {
