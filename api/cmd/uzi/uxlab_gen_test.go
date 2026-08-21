@@ -297,6 +297,12 @@ func detailBase(dark bool, run apitypes.RunDTO, now time.Time, allow bool) tuiMo
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, detailRunID, dark)
 	m = step(m, detailLoadedMsg{run: run, msgs: laneMsgs(now)})
+	// The viewer's own rate-limit meters + sidebar selection so the crew rail's stacked
+	// account block renders under the milestones (#530). Reuses the board fixture's meters
+	// (boardMeters) and the same sidebar selection, so the detail rail and the board strip
+	// show the SAME accounts — the two surfaces share selectedRateMeters.
+	m = step(m, rateLimitsMsg{tokens: boardMeters()})
+	m = step(m, settingsMsg{settings: apitypes.UserSettingsDTO{SidebarTokenIds: []string{"sec-meta"}}})
 	if allow {
 		m = step(m, runInputsMsg{runID: detailRunID, err: nil})
 	}
