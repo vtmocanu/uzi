@@ -808,3 +808,40 @@ func TestPrescanGenuineBusyboxMissPreserved(t *testing.T) {
 	}
 	assertReported(t, rows, []string{"foo"})
 }
+
+// TestPrescanSuppressesShellFunctionDefinition pins PRD #499: a name the run DEFINES as
+// a shell function (here `db_psql`) must NOT be reported as a missing worker tool even
+// when a subshell that could not see the function emits `db_psql: command not found`.
+// A genuine miss for a name defined NOWHERE (`jq`) is the negative control proving the
+// suppression does not over-fire.
+//
+// 🔴 The fixture is built with traceResult, which marshals the content to jsonb so the
+// `\n` newlines land ESCAPED exactly as a real payload holds them. shellFunctionNames
+// runs its anchored def regexes on DECODED text (toolResultText), so a literal-newline
+// fixture would pass even against a wrong raw-payloadText implementation, making the
+// test vacuous w.r.t. the decode path.
+func TestPrescanSuppressesShellFunctionDefinition(t *testing.T) {
+	// One tool_result carrying BOTH the function definition and the not-found line, plus
+	// a second row with a genuine miss for a name defined nowhere. The not-found line
+	// carries bash's real `bash: ` prefix so the space before the name breaks the raw
+	// scan's `\n`-bleed (the scan reads raw payloadText, where the preceding newline is
+	// the two chars `\n`); shellFunctionNames indexes the def off DECODED text.
+	rows := []store.ListToolTraceForRunRow{
+		traceResult(10, "u1", "db_psql() {\n  psql \"$DATABASE_URL\" \"$@\"\n}\nbash: db_psql: command not found", true),
+		traceResult(20, "u2", "bash: jq: command not found", true),
+	}
+	// db_psql suppressed (defined as a function), jq reported (never defined).
+	assertReported(t, rows, []string{"jq"})
+}
+
+// TestPrescanCallSiteAloneDoesNotSuppress confirms a mere INVOCATION of a name (no
+// definition anywhere in the trace) does NOT suppress its miss: the def regexes are
+// anchored on a real function-definition shape, so a call site alone leaves the miss
+// reported. This is the guard against the anchoring regressing to match call sites.
+func TestPrescanCallSiteAloneDoesNotSuppress(t *testing.T) {
+	rows := []store.ListToolTraceForRunRow{
+		traceUse(9, "u1", "db_psql --version"),
+		traceResult(10, "u1", "db_psql: command not found", false),
+	}
+	assertReported(t, rows, []string{"db_psql"})
+}
