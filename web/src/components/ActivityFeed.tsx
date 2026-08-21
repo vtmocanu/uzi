@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Run, RunMessage } from "../lib/api";
+import { formatTokens } from "../lib/formatTokens";
 import { prefs } from "../lib/prefs";
 import { stripUnsafeChars } from "../lib/safeText";
-import type { PhaseUsage } from "../lib/runUsage";
+import { deriveRunUsage, type PhaseUsage } from "../lib/runUsage";
 import { useReconnectingBanner, useTailOnAppend } from "../lib/useFollowScroll";
 import {
   buildToolIndex,
@@ -398,6 +399,133 @@ interface ActorAgg {
   lastMs: number;
 }
 
+// ── Lead context-window meter (PRD #516) ──────────────────────────────────────
+// The molten "steel channel": window FILL (how full the lead's context window is —
+// predicts autocompaction), DISTINCT from token SPEND (PhaseUsage). Lead lane only.
+type LeadContext = { used: number; window: number; pct: number };
+type ContextState = "cool" | "molten" | "near";
+
+// Three ramp states keyed off the TRUE (unclamped) pct. `rawMaxTokens` is the
+// autocompact window, so 100% is the compaction line and >=95% is near-compaction —
+// pct >= 100 folds into `near` (it is >= 95). NOT a 90% tick (see PRD Decision 4).
+function contextState(pct: number): ContextState {
+  if (pct >= 95) return "near";
+  if (pct >= 70) return "molten";
+  return "cool";
+}
+
+// Fill gradient + glow per state. Cool steel stays quiet (no glow); molten warms with a
+// brand glow; near-compaction saturates danger with a stronger glow. The near-state
+// meniscus pulse is added at the call site so `prefers-reduced-motion` can neutralize it
+// (index.css neutralizes `animate-pulse`).
+const CONTEXT_FILL: Record<ContextState, string> = {
+  cool: "bg-gradient-to-r from-edge-strong to-muted",
+  molten:
+    "bg-gradient-to-r from-brand to-brand-hover shadow-[0_0_8px_rgb(var(--brand)/0.55)]",
+  near: "bg-gradient-to-r from-danger to-danger shadow-[0_0_10px_rgb(var(--danger)/0.75)]",
+};
+const CONTEXT_MENISCUS: Record<ContextState, string> = {
+  cool: "bg-muted",
+  molten: "bg-brand-hover shadow-[0_0_6px_rgb(var(--brand-hover)/0.8)]",
+  near: "bg-danger shadow-[0_0_6px_rgb(var(--danger)/0.9)]",
+};
+
+// The visible bar width clamps to [0,100]; the LABEL always shows the true number, so a
+// pct of 110 renders a full channel beside a "110%" label.
+function contextBarWidth(pct: number): number {
+  return Math.max(0, Math.min(100, pct));
+}
+
+function contextAriaLabel(ctx: LeadContext): string {
+  return `lead context ${Math.round(ctx.pct)}% — ${formatTokens(ctx.used)}/${formatTokens(ctx.window)} tokens`;
+}
+
+// The lane-header meter: a machined near-black channel (track: --raised fill, --edge
+// border, inset shadow) with a molten fill, a bright leading-edge meniscus cap, and a
+// faint danger wash over the last band marking the 100% compaction line.
+function ContextMeter({ ctx }: { ctx: LeadContext }) {
+  const state = contextState(ctx.pct);
+  const width = contextBarWidth(ctx.pct);
+  return (
+    <span
+      role="meter"
+      aria-label={contextAriaLabel(ctx)}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={width}
+      aria-valuetext={`${Math.round(ctx.pct)}%`}
+      data-testid="lead-context-meter"
+      data-context-state={state}
+      title={contextAriaLabel(ctx)}
+      className="hidden shrink-0 items-center gap-1.5 sm:inline-flex"
+    >
+      <span className="relative h-1.5 w-20 overflow-hidden rounded-full border border-edge bg-raised shadow-[inset_0_1px_2px_rgb(0_0_0/0.6)]">
+        {/* Compaction wash: a faint danger band over the last ~12% of the channel — the
+            top of the channel IS the autocompact line. */}
+        <span
+          aria-hidden="true"
+          className="absolute inset-y-0 right-0 w-[12%] rounded-r-full bg-danger/20"
+        />
+        {/* The molten fill. */}
+        <span
+          aria-hidden="true"
+          data-testid="lead-context-meter-fill"
+          className={cx("absolute inset-y-0 left-0 rounded-full", CONTEXT_FILL[state])}
+          style={{ width: `${width}%` }}
+        >
+          {/* Bright leading-edge meniscus cap; slow pulse at near-compaction (reduced
+              motion neutralizes animate-pulse → a steady full-width cap). */}
+          <span
+            aria-hidden="true"
+            className={cx(
+              "absolute inset-y-0 right-0 w-0.5 rounded-full",
+              CONTEXT_MENISCUS[state],
+              state === "near" && "animate-pulse",
+            )}
+          />
+        </span>
+      </span>
+      <span className="text-[11px] tabular-nums text-muted">
+        {Math.round(ctx.pct)}%
+        <span className="ml-1 hidden text-[10px] text-faint md:inline">
+          {formatTokens(ctx.used)}/{formatTokens(ctx.window)}
+        </span>
+      </span>
+    </span>
+  );
+}
+
+// The crew-chip rollup: the compact glance (there is no separate run-headline band).
+// A tiny channel + `%`, sharing the ramp logic with the lane meter.
+function ContextMicroMeter({ ctx }: { ctx: LeadContext }) {
+  const state = contextState(ctx.pct);
+  const width = contextBarWidth(ctx.pct);
+  return (
+    <span
+      role="meter"
+      aria-label={contextAriaLabel(ctx)}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={width}
+      aria-valuetext={`${Math.round(ctx.pct)}%`}
+      data-testid="lead-context-micrometer"
+      data-context-state={state}
+      title={contextAriaLabel(ctx)}
+      className="inline-flex items-center gap-1"
+    >
+      <span className="relative h-1 w-7 overflow-hidden rounded-full border border-edge bg-raised">
+        <span
+          aria-hidden="true"
+          data-testid="lead-context-micrometer-fill"
+          className={cx("absolute inset-y-0 left-0 rounded-full", CONTEXT_FILL[state])}
+          style={{ width: `${width}%` }}
+        />
+      </span>
+      <span className="text-[10px] tabular-nums text-faint">{Math.round(ctx.pct)}%</span>
+    </span>
+  );
+}
+
 export function ActivityFeed({
   messages,
   run,
@@ -437,6 +565,10 @@ export function ActivityFeed({
   const visible = capped ? messages.slice(-CAP_VISIBLE) : messages;
   const groups = useMemo(() => groupByAgent(visible), [visible]);
   const lanes = useMemo(() => groupByInstance(visible), [visible]);
+  // PRD #516: the lead's live context-window fill, derived from the same message stream
+  // (latest-wins, lead-only). Off `messages` (not `visible`) so the CAP that hides old
+  // rows never drops a still-current reading. Feeds the lead-lane meter + crew micro-meter.
+  const leadContext = useMemo(() => deriveRunUsage(messages).leadContext, [messages]);
 
   // Per-agent aggregates for the crew roster: first-seen order, message count, newest
   // message (for the one-liner), and last-activity time (for the recency split).
@@ -807,6 +939,8 @@ export function ActivityFeed({
                   <span className="text-[11px] uppercase tracking-wide opacity-80">
                     {state}
                   </span>
+                  {/* PRD #516: the lead's context-fill glance rides ONLY the lead chip. */}
+                  {r === LEAD && leadContext && <ContextMicroMeter ctx={leadContext} />}
                 </button>
               );
             })}
@@ -915,6 +1049,11 @@ export function ActivityFeed({
                   toolIndex={toolIndex}
                   visibleToolUseIds={visibleToolUseIds}
                   phaseUsageBySeq={phaseUsageBySeq}
+                  // PRD #516: the context-window meter rides the LEAD lane only. The lead
+                  // lane is the one whose key is LEAD (null instance + null/"lead" agent);
+                  // a repo-shipped `lead.md` subagent has a real instance id → its key is
+                  // that id, so it never matches and never draws a meter.
+                  leadContext={l.key === LEAD ? leadContext : undefined}
                 />
               ))
             : groups.map((g, i) => {
@@ -973,6 +1112,7 @@ function AgentBlock({
   toolIndex,
   visibleToolUseIds,
   phaseUsageBySeq,
+  leadContext,
 }: {
   agent: string;
   // The lane's task label, ALREADY clamped by laneLabelText: model-authored text
@@ -999,6 +1139,9 @@ function AgentBlock({
   toolIndex: ReturnType<typeof buildToolIndex>;
   visibleToolUseIds: Set<string>;
   phaseUsageBySeq?: Map<number, PhaseUsage>;
+  // PRD #516: the lead's context-window fill. Set ONLY on the lead lane (undefined on
+  // every subagent lane), so the header meter renders lead-only by construction.
+  leadContext?: LeadContext;
 }) {
   // Accent is keyed on the ROLE, not the lane, so two parallel coders read as one role
   // in two lanes rather than two unrelated colours.
@@ -1187,11 +1330,16 @@ function AgentBlock({
             +{unseen}
           </span>
         )}
-        <span
-          className="ml-auto shrink-0 text-[11px] tabular-nums text-faint"
-          title={lastActivity}
-        >
-          {relativeTime(lastActivity, now)}
+        {/* Right-aligned group: the lead-lane context meter rides just left of the
+            timestamp (PRD #516). ml-auto on the wrapper packs both to the far right. */}
+        <span className="ml-auto flex shrink-0 items-center gap-2">
+          {leadContext && <ContextMeter ctx={leadContext} />}
+          <span
+            className="shrink-0 text-[11px] tabular-nums text-faint"
+            title={lastActivity}
+          >
+            {relativeTime(lastActivity, now)}
+          </span>
         </span>
       </div>
       <div
