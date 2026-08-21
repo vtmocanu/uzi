@@ -4,7 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { MemoryRouter } from "react-router-dom";
 import { ForgeSettings } from "./ForgeSettings";
 import { api, ApiError, type ForgeConnection, type PrivilegeReport } from "../lib/api";
-import { mockForgeConfigMultiForge } from "../mocks/data";
+import { mockForgeConfigMultiForge, mockForgeConfigSyncForges } from "../mocks/data";
 
 // Only the api object is swapped; ApiError and the types stay real so the page's
 // `instanceof ApiError` checks match what the mocked methods throw. The page loads
@@ -303,6 +303,86 @@ describe("ForgeSettings — forge-type picker (PRD #65 D11, lands dark)", () => 
         "forgejo",
       ),
     );
+  });
+});
+
+describe("ForgeSettings — base-URL ⇄ forge-type sync (PRD #337)", () => {
+  const baseUrlSelect = () => screen.getByLabelText("Forge base URL") as HTMLSelectElement;
+  const typeSelect = () => screen.getByLabelText("Forge type") as HTMLSelectElement;
+
+  it("URL → type: choosing a recognized github.com URL switches the type to github and the hints follow", async () => {
+    mockApi.forgeConfig.mockResolvedValue(mockForgeConfigSyncForges);
+    renderPage();
+    await screen.findByLabelText("Forge type");
+    // Landing pair is the first URL / gitlab (sync is change-only, D5).
+    expect(baseUrlSelect().value).toBe("https://gitlab.example.com");
+    expect(typeSelect().value).toBe("gitlab");
+
+    fireEvent.change(baseUrlSelect(), { target: { value: "https://github.com" } });
+
+    await waitFor(() => expect(typeSelect().value).toBe("github"));
+    // connectHints copy tracks the resulting github type.
+    expect(screen.getByText("Bot personal access token (scope: repo)")).toBeTruthy();
+    expect(screen.getByPlaceholderText("ghp_…")).toBeTruthy();
+  });
+
+  it("type → URL: choosing the github type moves the base URL to github.com", async () => {
+    mockApi.forgeConfig.mockResolvedValue(mockForgeConfigSyncForges);
+    renderPage();
+    await screen.findByLabelText("Forge type");
+    expect(baseUrlSelect().value).toBe("https://gitlab.example.com");
+
+    fireEvent.change(typeSelect(), { target: { value: "github" } });
+
+    await waitFor(() => expect(baseUrlSelect().value).toBe("https://github.com"));
+  });
+
+  it("forgejo round-trip: URL→type sets forgejo, and type→URL moves the URL to the forgejo host", async () => {
+    mockApi.forgeConfig.mockResolvedValue(mockForgeConfigSyncForges);
+    renderPage();
+    await screen.findByLabelText("Forge type");
+
+    // URL → type
+    fireEvent.change(baseUrlSelect(), { target: { value: "https://forgejo.example.com" } });
+    await waitFor(() => expect(typeSelect().value).toBe("forgejo"));
+
+    // Now from a gitlab URL, choosing the forgejo type moves the URL to the forgejo host.
+    fireEvent.change(baseUrlSelect(), { target: { value: "https://gitlab.example.com" } });
+    await waitFor(() => expect(typeSelect().value).toBe("gitlab"));
+    fireEvent.change(typeSelect(), { target: { value: "forgejo" } });
+    await waitFor(() => expect(baseUrlSelect().value).toBe("https://forgejo.example.com"));
+  });
+
+  it("null-target keep-URL (D8): choosing a type with no recognized allowlist URL keeps the current URL", async () => {
+    // mockForgeConfigMultiForge advertises forgejo, but its only non-gitlab host is
+    // the unrecognized forge.example.com (infers to null) — so there is no recognized
+    // forgejo URL. The current gitlab URL must be kept, not blanked or mis-set.
+    mockApi.forgeConfig.mockResolvedValue(mockForgeConfigMultiForge);
+    renderPage();
+    await screen.findByLabelText("Forge type");
+    expect(baseUrlSelect().value).toBe("https://gitlab.example.com");
+
+    fireEvent.change(typeSelect(), { target: { value: "forgejo" } });
+
+    await waitFor(() => expect(typeSelect().value).toBe("forgejo"));
+    // URL unchanged — no recognized forgejo target in the allowlist.
+    expect(baseUrlSelect().value).toBe("https://gitlab.example.com");
+  });
+
+  it("unrecognized host opts out of sync in both directions", async () => {
+    mockApi.forgeConfig.mockResolvedValue(mockForgeConfigSyncForges);
+    renderPage();
+    await screen.findByLabelText("Forge type");
+
+    // URL → type: an unrecognized/self-hosted host leaves the type on the manual pick.
+    fireEvent.change(baseUrlSelect(), { target: { value: "https://git.example.com" } });
+    await waitFor(() => expect(baseUrlSelect().value).toBe("https://git.example.com"));
+    expect(typeSelect().value).toBe("gitlab");
+
+    // type → URL: with the current host unrecognized, changing the type keeps the URL.
+    fireEvent.change(typeSelect(), { target: { value: "forgejo" } });
+    await waitFor(() => expect(typeSelect().value).toBe("forgejo"));
+    expect(baseUrlSelect().value).toBe("https://git.example.com");
   });
 });
 

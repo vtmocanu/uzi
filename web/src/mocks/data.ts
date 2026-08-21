@@ -1046,6 +1046,19 @@ export const mockForgeConfigAllForges = {
   forge_types: ["gitlab", "forgejo", "github"],
 };
 
+// PRD #337 M2: a multi-forge config exercising the connect-form URL⇄type sync —
+// three recognized hosts (github/gitlab/forgejo) plus one unrecognized self-hosted
+// host that stays under manual control in both directions.
+export const mockForgeConfigSyncForges = {
+  allowed_base_urls: [
+    "https://gitlab.example.com",
+    "https://forgejo.example.com",
+    "https://github.com",
+    "https://git.example.com",
+  ],
+  forge_types: ["gitlab", "forgejo", "github"],
+};
+
 // PRD #66 M9 (D8): the atlas repo's admin override, shared by the Boards repo fixture
 // and the admin blocked-repos list so both read ONE literal. Typed as the wire
 // GuardrailOverrideMeta (the same shape RepoDTO.guardrail_override and
