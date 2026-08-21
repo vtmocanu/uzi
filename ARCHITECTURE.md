@@ -577,6 +577,30 @@ chain in the diagram above, with no intervening `running`.
   waiting for a peer — see [adr/0216-fleet-aware-claim.md](adr/0216-fleet-aware-claim.md)
   for the eligibility seam and the placement/enforcement boundary against
   ADR-42.
+- **Capability-aware eligibility, claim through plan gate (PRD #84).** A
+  worker advertises a capability set (`workers.capabilities`, from the
+  closed `{docker, jvm}` vocabulary: `jvm` is template-derived from its
+  image, `docker` is worker-self-reported when a DinD sidecar answers, both
+  `capability.Filter`-ed at register so a worker can never spoof a
+  template-only name). A run carries `required_capabilities`, seeded from a
+  static per-repo hint (`repos.required_capabilities`, set in Repo settings)
+  and escalation-only unioned with what the lead's deterministic clone scan
+  (`agent/src/toolchain-detect.ts`) infers at plan time, plus a
+  display-only `required_tools` (provisionable toolchains) and
+  `size_class`. `fn_worker_can_claim` (migration `00142`) folds a worker's
+  `docker_enabled` flag into its capabilities and requires
+  `required ⊆ effective` before the claim query returns that run to it; the
+  same fold blocks plan-approval server-side (409, naming the unmet set) if
+  the run's assigned worker still can't satisfy it once a plan exists, with
+  an owner override that clears the run's requirement — correcting a
+  false-positive inference — rather than bypassing the runtime docker
+  guardrail. Both the claim clause and the approval block are gated by the
+  `capability_aware_scheduling` admin kill-switch (default on); off, the
+  pre-existing docker-worker→repo-allowlist enforcement (PRD #83/#89,
+  `docker_repo_allowlist`) is unaffected, but capability matching reverts to
+  best-effort claiming, so a mismatched run degrades to the pre-#84 mid-run
+  failure instead of being blocked up front. See
+  [docs/capability-scheduling.md](docs/capability-scheduling.md).
 - **claimed → running, before the plan turn** — once `provisionRunTools` has set up
   the run's tool env, the executor kicks off a lockfile-driven JS dependency
   install for the cloned repo, picked per discovered lockfile (monorepo
@@ -1368,12 +1392,16 @@ open (a CLI drain verb, live-cluster validation) are in
 ## Not yet in scope
 
 Auto-starting a run from a GitLab label, a CI-status watching/fixing agent,
-WS wakeup for idle workers (a 3s poll is the MVP), **PRD #84's
-capability-aware pre-run readiness check** (the lead can already `ask_user`
-before planning — see [Run lifecycle](#run-lifecycle) — but nothing yet
-decides automatically that an issue is missing capability/tool/size and
-calls it; #88 ships the mechanism, #84 owns that trigger and remains
-Draft), **autoscaled/spawn-on-demand hosted workers** (PRD #58 delivered the
+WS wakeup for idle workers (a 3s poll is the MVP), **wiring PRD #84's
+capability-aware readiness pass into PRD #88's `ask_user` path** (#84's own
+infra-readiness scope — declare, match, gate — has shipped; see
+[Run lifecycle](#run-lifecycle) and
+[docs/capability-scheduling.md](docs/capability-scheduling.md). What remains
+open is the one-directional edge PRD #84 names for itself: auto-raising a
+pre-planning clarification question through #88's `ask_user` mechanism from
+a detected capability/tool/size gap, instead of today's plan-approval block.
+#84 without that edge is complete for its own infra-readiness scope),
+**autoscaled/spawn-on-demand hosted workers** (PRD #58 delivered the
 static-provisioning subset of the item decided 2026-07-10, specs/ai.md §168 —
 a user-triggered click provisions a persistent worker via the dedicated
 controller described [above](#worker-controller-k8s-only); the controller
