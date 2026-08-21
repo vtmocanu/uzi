@@ -677,15 +677,21 @@ export function depsProvisionImplementNote(
 }
 
 /** PRD #501 REC B: rendered in the plan prompt of an AUTOPILOT run (auto_approve
- *  true) — no human is in the loop, so `ask_user` is auto-resolved with the frozen
- *  AUTOPILOT_SENTINEL_ANSWER and a park would only waste a turn. Tells the lead to
- *  decide open questions up front and record the assumption in the plan instead. */
+ *  true). On such a run an `ask_user` call does not reach a human: it is
+ *  auto-resolved (see AUTOPILOT_SENTINEL_ANSWER in runner.ts) and a park would only
+ *  waste a turn. So the note tells the lead to decide open questions up front and
+ *  record the assumption in the plan instead. It speaks ONLY to `ask_user`, not to
+ *  plan approval: a human may still review the resulting plan (a CI-config ci_fix
+ *  plan is force-gated even on autopilot) or the merge request, so the note must not
+ *  claim "no human in the loop" outright. It also paraphrases the sentinel rather
+ *  than quoting it, so the two do not silently drift. */
 export const AUTOPILOT_PLAN_NOTE = [
-  "This is an autopilot run: there is no human in the loop. An `ask_user` call is",
-  "auto-resolved with \"no human available — proceed on your best judgment, and note",
-  "the assumption you made\" and a park would only waste a turn — so do not call",
-  "`ask_user` to resolve an open decision. Decide it on your best judgment now and",
-  "record the assumption in the plan.",
+  "This is an autopilot run: an `ask_user` call will not reach a human on this run.",
+  "It is auto-resolved to a proceed-on-your-best-judgment answer, so a park would",
+  "only waste a turn. Do not call `ask_user` to resolve an open decision; decide it",
+  "on your best judgment now and record the assumption in the plan. (A human may",
+  "still review the resulting plan or the merge request; this note is only about not",
+  "parking on `ask_user`.)",
 ].join("\n");
 
 export interface PlanPromptInput {
