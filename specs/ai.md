@@ -21613,7 +21613,7 @@ head of the backlog could under-fill every fire indefinitely while newer eligibl
 This change makes the cap count runs **started**: the fire walks oldest-first past a skip and
 starts the next eligible candidate until `max_issues` runs fire, bounded by a scan window so
 per-fire cost stays bounded. It lives in the shared `fireSweep` path, so it applies to every
-sweep (`bug`, `Night-Shift`, any future sweep) with no per-schedule code. Aligns behaviour with
+sweep (`bug`, `Planned`, any future sweep) with no per-schedule code. Aligns behaviour with
 the intent `SKILL.md` already documented ("how many issues one `--sweep` fire *starts*").
 
 - **Bounded scan window, additive headroom.** When `max_issues` is set, the fetch widens to
