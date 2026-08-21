@@ -2100,20 +2100,19 @@ VALUES (@run_id, 'approve_plan', @body)
 RETURNING *;
 
 -- name: CreateStopVerdictInput :one
--- Enqueue a deliberate-stop verdict (cancel / reject_plan) for the live worker AND
+-- Enqueue a deliberate-stop verdict (cancel / reject_plan / stop) for the live worker AND
 -- stamp runs.stop_kind in the SAME statement (PRD #33 Decision 3): a data-modifying
 -- CTE runs to completion exactly once, so the stop signal can never be lost
 -- independently of the input that requested it — which a second, non-transactional
 -- UPDATE would risk, reintroducing the failed-vs-stopped bug. workersvc.Store exposes
 -- no transaction seam, so this single combined statement IS the atomicity.
 --
--- THREE callers since PRD #108 M5, not two, and the third is not a human verdict:
--- the auto-stop evaluator enqueues kind='cancel' with stop_kind='auto_stopped' for a
--- run whose message writes are in a confirmed permanent-failure loop. The MECHANISM
--- is unchanged — every caller stamps, so the stamp stays unconditional (no
--- IS NOT NULL guard and thus no parameter-type-inference pitfall) — only the
--- enumeration in this comment was wrong, and it is corrected in the same commit that
--- made it wrong. The stamp lands while the run is still non-terminal
+-- FOUR callers now, not two, and one is not a human verdict: PRD #108 M5's auto-stop
+-- evaluator enqueues kind='cancel' with stop_kind='auto_stopped' for a run whose message
+-- writes are in a confirmed permanent-failure loop, and PRD #517 M4's graceful `stop`
+-- enqueues kind='stop' with stop_kind='stopped'. The MECHANISM is unchanged — every caller
+-- stamps, so the stamp stays unconditional (no IS NOT NULL guard and thus no
+-- parameter-type-inference pitfall). The stamp lands while the run is still non-terminal
 -- (awaiting_approval/running); the client's terminal-guarded isStoppedRun ignores it
 -- until the run actually reaches failed/cancelled.
 --
@@ -2126,9 +2125,10 @@ RETURNING *;
 -- The distinguishing information rides runs.stop_kind, which the worker never sees.
 --
 -- PRD #503 M3: @stop_reason is stamped UNCONDITIONALLY here (like @stop_kind), but its
--- VALUE is decided by the Go caller and belongs on a CANCEL only. A cancel passes the
--- operator's optional reason (or NULL when none was given); reject_plan passes NULL,
--- because a reject's reason goes to failure_reason via the M2 path and double-writing
+-- VALUE is decided by the Go caller and belongs on the CANCEL and STOP paths only. A cancel
+-- passes the operator's optional reason (or NULL when none was given); a graceful stop
+-- (PRD #517 M4) likewise passes the operator's optional stop reason; reject_plan passes
+-- NULL, because a reject's reason goes to failure_reason via the M2 path and double-writing
 -- would contradict that clean split; auto-stop passes NULL, its identity being
 -- stop_kind='auto_stopped'. The stamp stays unconditional to avoid the
 -- parameter-type-inference pitfall the comment above already warns about.

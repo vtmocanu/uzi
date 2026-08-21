@@ -2437,7 +2437,7 @@ func TestSubmitInputStopEnqueuesOnParkedRun(t *testing.T) {
 	wkrID := uuid.New()
 	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	fs := &fakeStore{
-		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Status: "awaiting_followup", WorkerID: pgUUID(wkrID)},
+		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: true, Status: "awaiting_followup", WorkerID: pgUUID(wkrID)},
 		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)}, // fresh
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -2475,7 +2475,7 @@ func TestSubmitInputStopEnqueuesEvenWithoutLivePoller(t *testing.T) {
 	wkrID := uuid.New()
 	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	fs := &fakeStore{
-		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Status: "awaiting_followup", WorkerID: pgUUID(wkrID)},
+		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: true, Status: "awaiting_followup", WorkerID: pgUUID(wkrID)},
 		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed.Add(-2 * time.Minute))}, // stale
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -2525,6 +2525,90 @@ func TestSubmitInputStopRejectsTerminalRun(t *testing.T) {
 	}
 	if fs.createdStopVerdict != nil {
 		t.Fatal("no stop verdict may be enqueued on a terminal run")
+	}
+}
+
+// TestSubmitInputStopRejectsNonInteractiveTask: PRD #517 M4 review — a `stop` is honored
+// ONLY by the interactive-task park, so a stop on a NON-interactive task run is rejected
+// with ErrStopNotInteractive (→ 409) BEFORE any stop_kind is stamped. Otherwise it would
+// stamp a permanent, spurious stop_kind='stopped' and return a misleading success while
+// nothing winds the run down.
+//
+// MUTATION PROOF: remove the `run.Kind != RunKindTask || !run.Interactive` guard and this
+// run's stop is accepted — err becomes nil and fs.createdStopVerdict is stamped 'stopped'.
+func TestSubmitInputStopRejectsNonInteractiveTask(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	wkrID := uuid.New()
+	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	fs := &fakeStore{
+		// A task run, but NOT interactive — no park reads the stop flag.
+		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: false, Status: "running", WorkerID: pgUUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)},
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.now = func() time.Time { return fixed }
+
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "stop", "wind down", nil); err != ErrStopNotInteractive {
+		t.Fatalf("a stop on a non-interactive task must return ErrStopNotInteractive, got %v", err)
+	}
+	if fs.createdStopVerdict != nil {
+		t.Fatal("no stop verdict may be stamped on a non-interactive task run")
+	}
+}
+
+// TestSubmitInputStopRejectsNonTaskRun: the same guard rejects a stop on a non-task run
+// (here an interactive-flagged chat run — kind is what fails). Nothing is stamped.
+//
+// MUTATION PROOF: remove the guard's `run.Kind != RunKindTask` conjunct and this stop is
+// accepted and stamped.
+func TestSubmitInputStopRejectsNonTaskRun(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	wkrID := uuid.New()
+	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	fs := &fakeStore{
+		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindChat, Interactive: true, Status: "running", WorkerID: pgUUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)},
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.now = func() time.Time { return fixed }
+
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "stop", "", nil); err != ErrStopNotInteractive {
+		t.Fatalf("a stop on a non-task run must return ErrStopNotInteractive, got %v", err)
+	}
+	if fs.createdStopVerdict != nil {
+		t.Fatal("no stop verdict may be stamped on a non-task run")
+	}
+}
+
+// TestSubmitInputStopAcceptsRunningInteractiveTask: the guard keys on kind+interactive
+// only, NOT on status — a stop on a RUNNING (not yet parked) interactive task is a valid
+// wind-down and is accepted, stamping stop_kind='stopped'.
+//
+// MUTATION PROOF: tighten the guard to also require status=='awaiting_followup' and this
+// running-run stop is wrongly rejected.
+func TestSubmitInputStopAcceptsRunningInteractiveTask(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	wkrID := uuid.New()
+	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	fs := &fakeStore{
+		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: true, Status: "running", WorkerID: pgUUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)},
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.now = func() time.Time { return fixed }
+
+	res, err := svc.SubmitInput(context.Background(), user, runID, "stop", "", nil)
+	if err != nil {
+		t.Fatalf("a stop on a RUNNING interactive task must be accepted, got %v", err)
+	}
+	if res.ServerSide {
+		t.Fatal("a stop must always enqueue, never transition server-side")
+	}
+	if fs.createdStopVerdict == nil || fs.createdStopVerdict.StopKind.String != "stopped" {
+		t.Fatalf("a running interactive-task stop must stamp stop_kind 'stopped', got %+v", fs.createdStopVerdict)
 	}
 }
 

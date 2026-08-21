@@ -135,6 +135,15 @@ var (
 	ErrInvalidPlannedCommit = errors.New("planned base commit is not a valid commit sha (hex, 7-64 chars)")
 	ErrActiveRunExists      = errors.New("a non-terminal run already exists for this issue")
 	ErrRunTerminal          = errors.New("run has already finished")
+	// ErrStopNotInteractive rejects a `stop` on a run that is not an interactive task
+	// (PRD #517 M4) → 409. A graceful stop is honored ONLY by the interactive-task park:
+	// no other run kind reads the stop flag, so a stop on a plan-gated / chat /
+	// non-interactive task run would stamp a permanent, spurious stop_kind='stopped' and
+	// return a misleading "stop sent" success while nothing actually winds the run down.
+	// Gated on kind+interactive alone, NOT on status: a stop on a RUNNING interactive task
+	// (not yet parked) is still valid. It is a run-state conflict, hence 409 (the CLI maps
+	// 409 → ExitConflict).
+	ErrStopNotInteractive = errors.New("run stop applies only to interactive task runs")
 	// ErrReviseCapReached rejects a revise_plan once the run has hit
 	// PLAN_MAX_REVISIONS persisted revisions (PRD #41). Counted over ALL
 	// revise_plan rows for the run (a consumed revise still counts), so the cap is
@@ -3182,6 +3191,19 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			rows, err = s.q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{
 				ID: runID, WorkerID: pgUUID(wkr.ID),
 			})
+		case owned.StopKind.Valid && owned.StopKind.String == "stopped":
+			// PRD #517 M4: a graceful stop stamped stop_kind='stopped' BEFORE this report.
+			// Its happy path is the worker finalizing (push + MR iff open_mr) and reporting
+			// `completed`; this arm is the EDGE where the worker instead reports `failed` —
+			// either the finalize (push/MR) threw, or a cancel-then-stop sequence let the
+			// cancel win in steering and the worker threw REASON_CANCELLED. Either way it is a
+			// deliberate wind-down, not an agent bug, so it must NOT default to
+			// fail_origin='agent_failure' and must NOT be judged. Route to CancelRunByWorker
+			// exactly like the 'cancelled' arm: status 'cancelled', fail_origin NULL (CHECK-safe,
+			// no new vocabulary value), which Gate 0 of maybeEnqueueJudge excludes from judging.
+			rows, err = s.q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{
+				ID: runID, WorkerID: pgUUID(wkr.ID),
+			})
 		case owned.StopKind.Valid && owned.StopKind.String == "plan_rejected":
 			// A live plan-reject: stamp fail_origin='plan_rejected' (overriding the untrusted
 			// req.FailOrigin, which the worker cannot forge), matching the server-side
@@ -4681,6 +4703,17 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	// helpful, not mandatory); the same message is co-written to run_user_inputs.body, NUL-
 	// stripped to avoid Postgres 22021 aborting the CTE.
 	if kind == "stop" {
+		// Only an interactive task run has a park that reads the stop flag, so a stop is
+		// meaningful ONLY there. Reject it on any other run BEFORE stamping, so a
+		// non-interactive-task / chat / plan-gated run cannot acquire a spurious permanent
+		// stop_kind='stopped' and return a misleading success. `run` came from GetRun (a
+		// SELECT *), so Kind and Interactive are populated. The guard is on kind+interactive
+		// only — a RUNNING interactive task (not yet parked) is still a legal stop target.
+		// The owner-scope (GetRun→404) and terminal (ErrRunTerminal→409) guards above run
+		// first and are unchanged.
+		if run.Kind != RunKindTask || !run.Interactive {
+			return SubmitInputResult{}, ErrStopNotInteractive
+		}
 		cleanBody, _ := stripNUL(body)
 		if _, err := s.q.CreateStopVerdictInput(ctx, store.CreateStopVerdictInputParams{
 			RunID: runID, Kind: kind, Body: pgText(cleanBody), StopKind: pgText(stopKindFor(kind)), StopReason: stopReasonParam(body),
@@ -5232,7 +5265,8 @@ func pgText(s string) pgtype.Text {
 // sibling): strip NUL — a NUL in a text column raises Postgres 22021 and would abort the
 // cancel — then trim and cap the length (the same 2048-rune bound as failure_reason). An
 // empty / whitespace-only / NUL-only body stores NULL, never an empty string. Shared by
-// both cancel paths (server-side + live).
+// both cancel paths (server-side + live) and, since PRD #517 M4, by the graceful `stop`
+// path, which carries the operator's OPTIONAL stop reason the same way a cancel does.
 func stopReasonParam(body string) pgtype.Text {
 	clean, _ := stripNUL(body)
 	clean = truncateRunes(strings.TrimSpace(clean), maxFailureReasonRunes)

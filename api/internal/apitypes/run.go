@@ -137,10 +137,17 @@ type RunDTO struct {
 	// run's value can be stale, so freshness is scoped to the board card in the UI.
 	MrState       *string `json:"mr_state"`
 	FailureReason *string `json:"failure_reason"`
-	// StopKind is the server-stamped stop signal (PRD #33, widened by #108 M5):
+	// StopKind is the server-stamped stop signal (PRD #33, widened by #108 M5 and #517 M4):
 	// "cancelled" or "plan_rejected" for a deliberate HUMAN stop, "auto_stopped" when
-	// the SERVER stopped a run whose updates could not be saved, null for every other
-	// run. It — not the failure_reason text — is what clients read.
+	// the SERVER stopped a run whose updates could not be saved, "stopped" for a graceful
+	// `uzi run stop` of an interactive task run, null for every other run. It — not the
+	// failure_reason text — is what clients read.
+	//
+	// A "stopped" run's happy path lands `completed` (the worker finalizes — push + MR iff
+	// open_mr — and reports completed); on the edge where that finalize throws (or a
+	// cancel-then-stop let the cancel win) the worker reports `failed` and the server routes
+	// it to `cancelled`, never `agent_failure` and never judged. So a "stopped" stop_kind
+	// rides a `completed` or a `cancelled` run, not a `failed` one.
 	//
 	// Consumers must NOT treat the three alike, and the web's isStoppedRun is the
 	// worked example: it styles the two human kinds calm/neutral because a deliberate

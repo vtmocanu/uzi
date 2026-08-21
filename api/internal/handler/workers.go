@@ -1235,6 +1235,10 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusNotFound, "run not found")
 		case errors.Is(err, workersvc.ErrRunTerminal):
 			httpx.Error(w, http.StatusConflict, "run has already finished")
+		case errors.Is(err, workersvc.ErrStopNotInteractive):
+			// 409: a run-state conflict. Only an interactive task run's park honors a
+			// graceful stop; on any other run nothing would wind it down.
+			httpx.Error(w, http.StatusConflict, "run stop applies only to interactive task runs")
 		case errors.Is(err, workersvc.ErrReviseCapReached):
 			httpx.Error(w, http.StatusConflict, "plan revision limit reached")
 		case errors.Is(err, workersvc.ErrChatInputNotAllowed):
