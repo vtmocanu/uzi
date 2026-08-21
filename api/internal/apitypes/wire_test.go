@@ -597,6 +597,14 @@ func TestAdminRateLimitRowDTOTags(t *testing.T) {
 		"id", "email", "name", "vault_locked", "tokens")
 }
 
+// TestUserSettingsDTOTags pins the CLI's decoding mirror of GET /api/me/settings
+// against the handler's own userSettingsDTO — a divergence in either type's tag
+// set fails here rather than silently dropping a field on decode.
+func TestUserSettingsDTOTags(t *testing.T) {
+	assertTags(t, "UserSettingsDTO", UserSettingsDTO{},
+		"default_model", "judge_model", "summary_model", "theme", "sidebar_token_ids")
+}
+
 // TestAgentMemoryWriteRequestTags pins the worker save body: {title, body} plus the
 // writer-declared provenance {basis, evidence} (PRD #266). No identity fields exist
 // on the wire, so (user_id, repo_id) can only be derived server-side from the run

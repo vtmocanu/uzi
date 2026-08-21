@@ -100,6 +100,10 @@ type Client interface {
 	// half. The status string is computed server-side by autoselect.Classify and is
 	// RENDERED here, never re-derived (D21).
 	SelfRateLimits(ctx context.Context) ([]apitypes.TokenRateLimitDTO, error)
+	// GetMySettings returns the caller's own non-secret settings, including
+	// sidebar_token_ids: GET /api/me/settings. RequireUser (the GET was split out
+	// from the cookie-only /me/settings group so a uzc_ can read it).
+	GetMySettings(ctx context.Context) (apitypes.UserSettingsDTO, error)
 	ListRepos(ctx context.Context) ([]apitypes.RepoDTO, error)
 	// DeleteRepo removes a single repo: DELETE /api/repos/{id}, 204 on success
 	// (PRD #357 M3). The server only removes a DISABLED repo and refuses one that
@@ -824,6 +828,16 @@ func (c *HTTPClient) SelfRateLimits(ctx context.Context) ([]apitypes.TokenRateLi
 		return nil, err
 	}
 	return env.Tokens, nil
+}
+
+func (c *HTTPClient) GetMySettings(ctx context.Context) (apitypes.UserSettingsDTO, error) {
+	var env struct {
+		Settings apitypes.UserSettingsDTO `json:"settings"`
+	}
+	if err := c.get(ctx, "/api/me/settings", &env); err != nil {
+		return apitypes.UserSettingsDTO{}, err
+	}
+	return env.Settings, nil
 }
 
 func (c *HTTPClient) DeleteWorker(ctx context.Context, id string) error {
