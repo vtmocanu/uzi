@@ -622,6 +622,9 @@ func (m tuiModel) renderLaneRail() string {
 		if block := m.renderMilestones(); block != "" {
 			sb.WriteString("\n\n" + block)
 		}
+		if rb := m.railRateMeters(strings.Count(sb.String(), "\n") + 1); rb != "" {
+			sb.WriteString("\n\n" + rb)
+		}
 		return sb.String()
 	}
 
@@ -648,6 +651,9 @@ func (m tuiModel) renderLaneRail() string {
 	}
 	if block := m.renderMilestones(); block != "" {
 		sb.WriteString("\n" + block)
+	}
+	if rb := m.railRateMeters(strings.Count(sb.String(), "\n") + 1); rb != "" {
+		sb.WriteString("\n\n" + rb)
 	}
 	return sb.String()
 }
@@ -813,6 +819,56 @@ func (m tuiModel) renderMilestones() string {
 		sb.WriteString(" " + glyph + " " + style.Render(m.renderer.Plain(mi.Title, milestoneTitleCap)) + "\n")
 	}
 	return strings.TrimRight(sb.String(), "\n")
+}
+
+// railRateMeters renders the stacked per-account rate-limit block for the crew rail, or ""
+// when the selection is empty. It appends WHOLE account entries only while they fit within
+// the remaining rail height (transcriptViewport() minus usedRows minus the blank separator
+// the caller adds), because joinColumns clamps the rail to the transcript height by dropping
+// its BOTTOM lines one at a time — an uncapped block would leave a half-drawn entry (label +
+// 5h, no 7d). Dropping whole entries keeps every visible entry complete. Reuses rateWindowCell
+// so the bar/percent/tone and the nil-window "-" are identical to the board strip.
+//
+// Deploy-ordering note (#519): the meters populate only when GET /api/me/settings and
+// /api/me/rate-limits answer over the CLI uzc_ Bearer token. /me/settings GET moved to
+// RequireUser in #519; against a server that predates that the settings fetch 401s (error
+// swallowed) and this falls back to default-token-only, exactly as the board strip does. No
+// server change here.
+func (m tuiModel) railRateMeters(usedRows int) string {
+	shown, showLabel := m.selectedRateMeters()
+	if len(shown) == 0 {
+		return ""
+	}
+	// budget is the rail height left below the content already built; the -1 is the blank
+	// separator the caller prepends via "\n\n" before this block.
+	budget := m.transcriptViewport() - usedRows - 1
+
+	// Each account entry is a \n-joined string of an optional faint label eyebrow + the two
+	// window cells; entries are added whole while they fit under the ACCOUNTS header.
+	const headerRow = 1
+	var fitted []string
+	accumulated := 0
+	for _, t := range shown {
+		var lines []string
+		if showLabel {
+			lines = append(lines, m.pal.faint.Render(m.renderer.Plain(t.Label, laneRailWidth)))
+		}
+		lines = append(lines,
+			m.rateWindowCell("5h", t.Limits.FiveHour),
+			m.rateWindowCell("7d", t.Limits.SevenDay),
+		)
+		entry := strings.Join(lines, "\n")
+		rows := len(lines)
+		if headerRow+accumulated+rows > budget {
+			break
+		}
+		fitted = append(fitted, entry)
+		accumulated += rows
+	}
+	if len(fitted) == 0 {
+		return ""
+	}
+	return m.pal.faint.Render("ACCOUNTS") + "\n" + strings.Join(fitted, "\n")
 }
 
 // buildTranscriptLines renders the selected lane's frames to display lines (no windowing),
