@@ -108,6 +108,17 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+describe("Skills page — always-visible skills guide link (PRD #57 M3)", () => {
+  it("renders the agent skills guide link in the list-view intro", async () => {
+    setAuth(MEMBER);
+    renderPage();
+    // The list view is the default render.
+    await screen.findByText("qdrant-kb");
+    const docLink = screen.getByRole("link", { name: "agent skills" });
+    expect(docLink.getAttribute("href")).toBe("/docs/skills");
+  });
+});
+
 describe("Skills page — authz-conditional rendering", () => {
   it("admin: builtin rows show Edit + Reset and never Delete", async () => {
     setAuth(ADMIN);

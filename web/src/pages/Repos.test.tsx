@@ -117,6 +117,15 @@ async function openTrustPanel(name: string): Promise<HTMLElement> {
   return screen.getByRole("group", { name: new RegExp(`Trusted repo for ${name}`) });
 }
 
+describe("Repos — always-visible repo-agents guide link (PRD #57 M3)", () => {
+  it("renders the repo agents guide link in the page intro", async () => {
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+    const docLink = screen.getByRole("link", { name: "repo agents" });
+    expect(docLink.getAttribute("href")).toBe("/docs/repo-agents");
+  });
+});
+
 describe("Repos — Trusted repo cell", () => {
   it("shows an Off badge + Manage on an enabled, untrusted repo", async () => {
     renderPage();
