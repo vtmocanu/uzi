@@ -808,3 +808,76 @@ func TestPrescanGenuineBusyboxMissPreserved(t *testing.T) {
 	}
 	assertReported(t, rows, []string{"foo"})
 }
+
+// TestPrescanSuppressesShellFunctionDefinition pins PRD #499: a name the run DEFINES as
+// a shell function (here `db_psql`) must NOT be reported as a missing worker tool even
+// when a subshell that could not see the function emits `db_psql: command not found`.
+// A genuine miss for a name defined NOWHERE (`jq`) is the negative control proving the
+// suppression does not over-fire.
+//
+// 🔴 The fixture is built with traceResult, which marshals the content to jsonb so the
+// `\n` newlines land ESCAPED exactly as a real payload holds them. shellFunctionNames
+// runs its anchored def regexes on DECODED text (toolResultText), so a literal-newline
+// fixture would pass even against a wrong raw-payloadText implementation, making the
+// test vacuous w.r.t. the decode path.
+func TestPrescanSuppressesShellFunctionDefinition(t *testing.T) {
+	// One tool_result carrying BOTH the function definition and the not-found line, plus
+	// a second row with a genuine miss for a name defined nowhere. The not-found line
+	// carries bash's real `bash: ` prefix so the space before the name breaks the raw
+	// scan's `\n`-bleed (the scan reads raw payloadText, where the preceding newline is
+	// the two chars `\n`); shellFunctionNames indexes the def off DECODED text.
+	rows := []store.ListToolTraceForRunRow{
+		traceResult(10, "u1", "db_psql() {\n  psql \"$DATABASE_URL\" \"$@\"\n}\nbash: db_psql: command not found", true),
+		traceResult(20, "u2", "bash: jq: command not found", true),
+	}
+	// db_psql suppressed (defined as a function), jq reported (never defined).
+	assertReported(t, rows, []string{"jq"})
+}
+
+// TestPrescanCallSiteAloneDoesNotSuppress confirms a mere INVOCATION of a name (no
+// definition anywhere in the trace) does NOT suppress its miss: the def regexes are
+// anchored on a real function-definition shape, so a call site alone leaves the miss
+// reported. This is the guard against the anchoring regressing to match call sites.
+func TestPrescanCallSiteAloneDoesNotSuppress(t *testing.T) {
+	rows := []store.ListToolTraceForRunRow{
+		traceUse(9, "u1", "db_psql --version"),
+		traceResult(10, "u1", "db_psql: command not found", false),
+	}
+	assertReported(t, rows, []string{"db_psql"})
+}
+
+// TestPrescanSuppressesBashKeywordFunctionForm guards the ksh/bash keyword form
+// (`function name { … }`) specifically — the original suppression test exercised only the
+// POSIX `name() {` form, so a regression in reShellFuncKeyword would go unseen. A genuine
+// miss (`jq`) in the same trace is the negative control.
+func TestPrescanSuppressesBashKeywordFunctionForm(t *testing.T) {
+	rows := []store.ListToolTraceForRunRow{
+		traceResult(10, "u1", "function db_psql {\n  psql \"$DATABASE_URL\" \"$@\"\n}\nbash: db_psql: command not found", true),
+		traceResult(20, "u2", "bash: jq: command not found", true),
+	}
+	assertReported(t, rows, []string{"jq"})
+}
+
+// TestPrescanDoesNotSuppressForeignLanguageFunctionDef pins the regex-scope tightening:
+// a function DEFINITION in another language printed into a tool_result (source code under
+// review) must NOT read as a shell-function def and suppress a same-named genuine miss.
+// JS `function serve(opts) {` (non-empty parens defeats reShellFuncKeyword's `{` clause),
+// a ZERO-ARG `export function watch() {` (not statement-leading defeats reShellFuncKeyword's
+// boundary anchor), and Go `func build() {` (name not statement-leading defeats
+// reShellFuncPosix's boundary anchor) are all real cases: judge traces routinely carry
+// cat/grep'd source. Each is its own negative control — the asserted name being REPORTED is
+// the no-suppression behavior, so these stay green whether or not the `|| funcs[cmd]` clause
+// is present (they prove the regex does not over-index, not that suppression fires).
+func TestPrescanDoesNotSuppressForeignLanguageFunctionDef(t *testing.T) {
+	rows := []store.ListToolTraceForRunRow{
+		traceResult(10, "u1", "export function serve(opts) {\n  return http.listen();\n}", false),
+		traceResult(20, "u2", "bash: serve: command not found", true),
+		traceResult(30, "u3", "func build() {\n  return\n}", false),
+		traceResult(40, "u4", "bash: build: command not found", true),
+		traceResult(50, "u5", "export function watch() {\n  fs.watch(dir);\n}", false),
+		traceResult(60, "u6", "bash: watch: command not found", true),
+	}
+	// All three source-def names still reported — no foreign def (with-args, zero-arg, or Go)
+	// is indexed as a shell func.
+	assertReported(t, rows, []string{"build", "serve", "watch"})
+}

@@ -111,6 +111,40 @@ var (
 	reShNotFound     = regexp.MustCompile(`([A-Za-z0-9_.+-]+): not found\b`)                          // dash/busybox: `foo: not found`
 )
 
+// Shell FUNCTION DEFINITION patterns. shellFunctionNames uses these to index the
+// names a repo defines as shell functions, so a bare-name `command not found` for a
+// function (e.g. a repo-local `db_psql` whose body a subshell could not resolve) is
+// suppressed rather than reported as a missing worker tool. Both are constrained to the
+// SHELL definition shapes so a printed source line in ANOTHER language does not read as a
+// shell-function def and over-suppress a genuine miss: judge tool_result payloads
+// routinely carry source code (a cat/grep of a file under review), and a JS
+// `function serve(opts) {` or a Go `func build() {` would otherwise index `serve`/`build`
+// and cancel a real `serve`/`build: command not found`. The captured group ([1]) is the
+// function name.
+//
+// Residual, accepted (this file's conservative-under-suppression philosophy, matching
+// pinned/invoked): a statement-leading ZERO-ARG `name() {` in another language (a bare
+// `serve() {` printed on its own line) is indistinguishable from a shell def and is still
+// indexed. Dropping a real miss that shares a name with such a def is the safe direction —
+// a false "install this tool" is worse than a missed one.
+var (
+	// reShellFuncPosix matches the POSIX form `name() { … }` (optionally `function name() {`).
+	// (?m) so `^` matches each LINE start (a def sits deep in a cat'd script, preceded by a
+	// real newline, not at string start). Anchored ONLY on a statement boundary — line start
+	// (with `[ \t]*` indentation) or after `;&|(` — NOT on bare whitespace, so a `func name()`
+	// in printed Go/C source is excluded (its name is not the statement-leading token; `func `
+	// precedes it). The empty `()` is required, so a `name(args) {` never matches here.
+	reShellFuncPosix = regexp.MustCompile(`(?m)(?:^[ \t]*|[;&|(]\s*)(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*\{`)
+	// reShellFuncKeyword matches the ksh/bash keyword form `function name { … }` (optionally
+	// `function name() {`). Like reShellFuncPosix it is (?m) and anchored on a statement
+	// boundary (line start with `[ \t]*` indentation, or after `;&|(`), and the trailing
+	// shell body brace `{` is required. So a JS `function serve(opts) {` (non-empty parens),
+	// a zero-arg `export function serve() {` or `const f = function serve() {` (not
+	// statement-leading), and a prose "the function serve" (no brace) are all excluded, while
+	// `function db_psql {` and `function db_psql() {` at a statement boundary match.
+	reShellFuncKeyword = regexp.MustCompile(`(?m)(?:^[ \t]*|[;&|(]\s*)function\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\)\s*)?\{`)
+)
+
 // shellNames are the interpreters that REPORT a missing command; they are never the
 // missing command themselves, so the bash/zsh forms (`zsh: command not found: foo`)
 // would otherwise flag the shell prefix. Filtered out of the results.
@@ -202,6 +236,12 @@ func normalizeCommandToken(cmd string) string {
 // a generic output word ("key: not found"), not a missing worker tool, and is dropped.
 // The three high-confidence forms are unfiltered.
 //
+// It also suppresses names that are not gaps at all: the denylisted credential CLIs
+// (toolprofile.DeniedExecutable), tools reached via a pinned `go run <module>@<version>`
+// ref (goRunPinnedTools), and names the run DEFINES as a shell function anywhere in the
+// trace (shellFunctionNames) — a subshell that cannot see a repo-local function reports
+// `db_psql: command not found`, but nothing is missing to install.
+//
 // 🔴 THE REGEXES RUN OVER tool_result ROWS ONLY. That is load-bearing, not an
 // optimization. Since PRD #121 M3 the trace carries both kinds; a tool_use payload
 // holds the command the agent TYPED, which by definition never ran. Feeding those to
@@ -211,6 +251,7 @@ func normalizeCommandToken(cmd string) string {
 func scanCommandNotFound(rows []store.ListToolTraceForRunRow) []missCandidate {
 	invoked := invokedExecutables(rows)
 	pinned := goRunPinnedTools(rows)
+	funcs := shellFunctionNames(rows)
 	var out []missCandidate
 	seen := map[string]bool{}
 	scanned := 0
@@ -259,7 +300,13 @@ func scanCommandNotFound(rows []store.ListToolTraceForRunRow) []missCandidate {
 			// green/seq-gated like suppressResolved: the ref's mere presence proves the
 			// canonical invocation does not need PATH, and the bare-name probe often comes
 			// AFTER the successful `go run`.
-			if cmd == "" || shellNames[cmd] || toolprofile.DeniedExecutable(cmd) || pinned[cmd] ||
+			//
+			// funcs[cmd] is the same shape of not-a-gap: a name the run DEFINES as a shell
+			// function anywhere in the trace (shellFunctionNames) is not a missing worker
+			// tool — a subshell that could not see the function reports `db_psql: command
+			// not found`, but installing anything would be wrong. Presence-based, like
+			// pinned above.
+			if cmd == "" || shellNames[cmd] || toolprofile.DeniedExecutable(cmd) || pinned[cmd] || funcs[cmd] ||
 				(lowConfidence && !invoked[cmd]) || seen[cmd] || len(out) >= judgeMissCandidateCap {
 				return
 			}
@@ -393,6 +440,63 @@ func goRunPinnedTools(rows []store.ListToolTraceForRunRow) map[string]bool {
 		}
 	}
 	return pinned
+}
+
+// shellFunctionNames indexes the names a run defines as SHELL FUNCTIONS anywhere in its
+// trace, so scanCommandNotFound can suppress a bare-name `command not found` for a
+// repo-local function (e.g. `db_psql`) — that absence is a subshell not inheriting the
+// function, not a missing worker tool to install. Structural twin of goRunPinnedTools.
+//
+// It applies reShellFuncPosix and reShellFuncKeyword to DECODED text — toolResultText
+// for tool_result rows, toolUseCommand for tool_use rows — NOT the scan's raw
+// payloadText: the def regexes are anchored on real command separators/newlines, and in
+// a raw jsonb payload a newline is the escaped two-char `\n`, so they would match
+// nothing on raw text.
+//
+// The two kinds are byte-budgeted SEPARATELY (per-kind accumulators), matching each
+// index's own budget: tool_result text by judgeScanByteBudget (512 KB), tool_use text by
+// judgeCommandByteBudget (128 KB), each a true bound via the same check-before-add
+// discipline as goRunPinnedTools/invokedExecutables. The larger tool_result window
+// matters: a definition sitting in the 128 KB–512 KB slice of a tool_result payload is
+// still indexed and still suppresses its miss, while that miss itself is still detected
+// (the scan shares the same 512 KB tool_result budget).
+func shellFunctionNames(rows []store.ListToolTraceForRunRow) map[string]bool {
+	funcs := map[string]bool{}
+	resultBytes := 0
+	cmdBytes := 0
+	add := func(text string) {
+		for _, m := range reShellFuncPosix.FindAllStringSubmatch(text, -1) {
+			funcs[m[1]] = true
+		}
+		for _, m := range reShellFuncKeyword.FindAllStringSubmatch(text, -1) {
+			funcs[m[1]] = true
+		}
+	}
+	for _, row := range rows {
+		switch row.Kind {
+		case "tool_result":
+			text := toolResultText(row.Payload)
+			if text == "" {
+				continue
+			}
+			if resultBytes+len(text) > judgeScanByteBudget {
+				continue
+			}
+			resultBytes += len(text)
+			add(text)
+		case "tool_use":
+			_, cmd := toolUseCommand(row.Payload)
+			if cmd == "" {
+				continue
+			}
+			if cmdBytes+len(cmd) > judgeCommandByteBudget {
+				continue
+			}
+			cmdBytes += len(cmd)
+			add(cmd)
+		}
+	}
+	return funcs
 }
 
 // suppressResolved drops a candidate whose tool the SAME run demonstrably ran green
