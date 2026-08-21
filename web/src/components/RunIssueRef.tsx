@@ -1,6 +1,5 @@
-import { isHttpsUrl } from "../lib/api";
 import { forgePlatform } from "../lib/forgeNoun";
-import { ExternalLinkIcon } from "./icons";
+import { ForgeIssueAnchor } from "./ForgeIssueAnchor";
 
 // runKindLabel maps an issue-less run's kind to a short human label for the chip
 // (PRD #411). The three issue-less kinds that reach the runs list are task, ci_fix,
@@ -50,27 +49,18 @@ export function RunIssueRef({
     );
   }
 
-  // Branch 2: cached issue with a valid https URL → forge link.
-  if (isHttpsUrl(issueWebUrl)) {
-    const label = `Open issue #${issueIid} on ${forgePlatform(forgeType)}`;
-    return (
-      <a
-        href={issueWebUrl ?? undefined}
-        target="_blank"
-        rel="noreferrer"
-        aria-label={label}
-        title={label}
-        onClick={inCardLink ? (e) => e.stopPropagation() : undefined}
-        className={`inline-flex items-center gap-0.5 text-faint transition-colors hover:text-brand${
-          className ? ` ${className}` : ""
-        }`}
-      >
-        #{issueIid}
-        <ExternalLinkIcon className="h-3 w-3" />
-      </a>
-    );
-  }
-
-  // Branch 3: issue no longer cached → plain number.
-  return <span className={className}>#{issueIid}</span>;
+  // Branches 2 & 3: cached issue → guarded forge link, or plain #iid when no valid https url.
+  const label = `Open issue #${issueIid} on ${forgePlatform(forgeType)}`;
+  return (
+    <ForgeIssueAnchor
+      webUrl={issueWebUrl}
+      iid={issueIid}
+      label={label}
+      className={`text-faint transition-colors hover:text-brand${
+        className ? ` ${className}` : ""
+      }`}
+      fallbackClassName={className}
+      onClick={inCardLink ? (e) => e.stopPropagation() : undefined}
+    />
+  );
 }
