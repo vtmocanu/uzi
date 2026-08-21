@@ -19,6 +19,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -26,48 +27,64 @@ import (
 )
 
 func main() {
-	strict := flag.Bool("strict", false, "exit 1 on any un-accepted divergence (opt-in; the nudge default never does)")
-	repoRoot := flag.String("repo-root", "", "repo root (default: auto-detected by walking up to the .git marker)")
-	flag.Parse()
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+// run is main's body as a testable unit: it parses args, resolves the rosters,
+// prints the nudge to stdout, and RETURNS the process exit code rather than
+// calling os.Exit. Keeping the exit code a return value is what lets a test pin
+// the load-bearing invariant — the default path (any divergence, no -strict)
+// returns 0 — so a future regression that exits nonzero on a nudge is caught.
+// 0 = success (nudge printed or rosters agree); 1 = -strict with an un-accepted
+// divergence; 2 = operational error (a roster dir or the accepted list missing).
+func run(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("roleparity", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	strict := fs.Bool("strict", false, "exit 1 on any un-accepted divergence (opt-in; the nudge default never does)")
+	repoRoot := fs.String("repo-root", "", "repo root (default: auto-detected by walking up to the .git marker)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
 
 	root := *repoRoot
 	if root == "" {
 		r, err := findRepoRoot()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "roleparity: %v\n", err)
-			os.Exit(2)
+			fmt.Fprintf(stderr, "roleparity: %v\n", err)
+			return 2
 		}
 		root = r
 	}
 
 	product, err := roleStems(filepath.Join(root, "api", "internal", "agenttmpl", "builtins"))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "roleparity: read product roster: %v\n", err)
-		os.Exit(2)
+		fmt.Fprintf(stderr, "roleparity: read product roster: %v\n", err)
+		return 2
 	}
 	devteam, err := roleStems(filepath.Join(root, ".claude", "agents"))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "roleparity: read dev-team roster: %v\n", err)
-		os.Exit(2)
+		fmt.Fprintf(stderr, "roleparity: read dev-team roster: %v\n", err)
+		return 2
 	}
 	acc, err := readAccepted(filepath.Join(root, "scripts", "role-parity-accepted.tsv"))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "roleparity: read accepted list: %v\n", err)
-		os.Exit(2)
+		fmt.Fprintf(stderr, "roleparity: read accepted list: %v\n", err)
+		return 2
 	}
 
 	divs := roleParity(product, devteam, acc)
 	if len(divs) == 0 {
-		fmt.Println("role parity: dev-team and product rosters agree (modulo accepted divergences). Nothing to nudge.")
-		return
+		fmt.Fprintln(stdout, "role parity: dev-team and product rosters agree (modulo accepted divergences). Nothing to nudge.")
+		return 0
 	}
-	fmt.Printf("role parity: %d un-accepted divergence(s) — a nudge, not a failure:\n", len(divs))
+	fmt.Fprintf(stdout, "role parity: %d un-accepted divergence(s) — a nudge, not a failure:\n", len(divs))
 	for _, d := range divs {
-		fmt.Printf("  [%s] %s — %s\n", d.side, d.role, d.msg)
+		fmt.Fprintf(stdout, "  [%s] %s — %s\n", d.side, d.role, d.msg)
 	}
 	if *strict {
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 // roleStems returns the sorted role identities in dir: the filename stem of each
@@ -94,9 +111,9 @@ func roleStems(dir string) ([]string, error) {
 
 // readAccepted parses the tab-separated accepted-divergence allowlist. Each
 // non-blank, non-comment line is `side<TAB>role<TAB>reason`, where side is
-// "product-only" or "devteam-only". Blank lines and lines beginning with '#' are
-// ignored. The reason column is documentation for humans; only side+role affect
-// the nudge.
+// "product-only" or "devteam-only". Blank lines and comment lines (first
+// non-blank character '#', leading whitespace allowed) are ignored. The reason
+// column is documentation for humans; only side+role affect the nudge.
 func readAccepted(path string) (accepted, error) {
 	acc := accepted{
 		productOnly: map[string]bool{},
@@ -108,7 +125,7 @@ func readAccepted(path string) (accepted, error) {
 	}
 	for i, line := range strings.Split(string(raw), "\n") {
 		line = strings.TrimRight(line, "\r")
-		if strings.TrimSpace(line) == "" || strings.HasPrefix(line, "#") {
+		if trimmed := strings.TrimSpace(line); trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
 		fields := strings.Split(line, "\t")
