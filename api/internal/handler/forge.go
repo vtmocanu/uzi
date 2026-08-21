@@ -543,10 +543,24 @@ func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
 	// The badge STATE (PRD #66 M9) comes from this connection's stored report, run
 	// through the single shared downgrade — parsed once for the whole page.
 	report := parsePrivilegeReport(conn.PrivilegeReport, conn.ID)
+	// The Docker-allowlist membership set (PRD #361 M1), read once per request. The
+	// per-repo docker_allowlisted flag is a boolean about the caller's OWN repo, never
+	// the list itself.
+	allowSet := map[uuid.UUID]bool{}
+	if al, err := h.settings.DockerRepoAllowlist(r.Context()); err != nil {
+		// Non-fatal: the chip is enrichment. Degrade to "not allowlisted" (false),
+		// never fail the list.
+		slog.Warn("list projects: docker allowlist", "error", err)
+	} else {
+		for _, id := range al {
+			allowSet[id] = true
+		}
+	}
 	for _, rp := range repos {
 		d := repoToDTO(rp)
 		d.Pipeline = pipelines[rp.ID]
 		d.GuardrailBlocked = guardrailBlockedForRepo(report, rp.ID.String(), rp.GuardrailOverrideReason.Valid)
+		d.DockerAllowlisted = allowSet[rp.ID]
 		out = append(out, d)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"repos": out})
@@ -588,10 +602,24 @@ func (h *Handler) ListRepos(w http.ResponseWriter, r *http.Request) {
 			reports[c.ID] = parsePrivilegeReport(c.PrivilegeReport, c.ID)
 		}
 	}
+	// The Docker-allowlist membership set (PRD #361 M1), read once per request. The
+	// per-repo docker_allowlisted flag is a boolean about the caller's OWN repo, never
+	// the list itself.
+	allowSet := map[uuid.UUID]bool{}
+	if al, err := h.settings.DockerRepoAllowlist(r.Context()); err != nil {
+		// Non-fatal: the chip is enrichment. Degrade to "not allowlisted" (false),
+		// never fail the list.
+		slog.Warn("list repos: docker allowlist", "error", err)
+	} else {
+		for _, id := range al {
+			allowSet[id] = true
+		}
+	}
 	for _, rp := range repos {
 		d := repoToDTO(rp)
 		d.Pipeline = pipelines[rp.ID]
 		d.GuardrailBlocked = guardrailBlockedForRepo(reports[rp.ConnectionID], rp.ID.String(), rp.GuardrailOverrideReason.Valid)
+		d.DockerAllowlisted = allowSet[rp.ID]
 		out = append(out, d)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"repos": out})

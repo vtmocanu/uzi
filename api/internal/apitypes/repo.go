@@ -39,6 +39,12 @@ type RepoDTO struct {
 	// enable/run gates still fail closed live (M4-M6); the admin blocked-repos list is
 	// where that unknown is surfaced explicitly (R1).
 	GuardrailBlocked bool `json:"guardrail_blocked"`
+	// DockerAllowlisted is the computed, caller-scoped "is THIS repo on the global
+	// Docker-worker repo allowlist" (PRD #361): membership-tested server-side against
+	// the docker_repo_allowlist admin setting in the owner-scoped list handlers. It is
+	// a boolean about the caller's OWN repo — never the list, which may hold other
+	// admins' repos. Not set by repoToDTO/PatchRepo (computed, like GuardrailBlocked).
+	DockerAllowlisted bool `json:"docker_allowlisted"`
 }
 
 // GuardrailOverrideDTO is the audit metadata for an active admin per-repo guardrail

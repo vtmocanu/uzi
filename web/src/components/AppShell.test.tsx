@@ -89,6 +89,7 @@ const repos = [
     repo_devbox_opt_in: false,
     pipeline: null,
     guardrail_blocked: false,
+    docker_allowlisted: false,
   },
   {
     id: "repo-atlas",
@@ -103,6 +104,7 @@ const repos = [
     repo_devbox_opt_in: false,
     pipeline: null,
     guardrail_blocked: false,
+    docker_allowlisted: false,
   },
 ];
 
