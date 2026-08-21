@@ -4693,8 +4693,13 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		if kind == "cancel" {
 			stopReason = stopReasonParam(body)
 		}
+		// Strip NUL from the body co-written to run_user_inputs.body in the SAME INSERT:
+		// a NUL in a text column raises Postgres 22021, which would abort the whole CTE and
+		// silently drop the cancel/reject verdict (the stop_reason sanitizing above would be
+		// moot if this INSERT never lands). NUL is never meaningful in an operator message.
+		cleanBody, _ := stripNUL(body)
 		if _, err := s.q.CreateStopVerdictInput(ctx, store.CreateStopVerdictInputParams{
-			RunID: runID, Kind: kind, Body: pgText(body), StopKind: pgText(stopKindFor(kind)), StopReason: stopReason,
+			RunID: runID, Kind: kind, Body: pgText(cleanBody), StopKind: pgText(stopKindFor(kind)), StopReason: stopReason,
 		}); err != nil {
 			return SubmitInputResult{}, err
 		}

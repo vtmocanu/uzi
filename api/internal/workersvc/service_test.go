@@ -2298,6 +2298,11 @@ func TestSubmitInputLiveCancelStripsNULFromStopReason(t *testing.T) {
 	if !fs.createdStopVerdict.StopReason.Valid || fs.createdStopVerdict.StopReason.String != "xy" {
 		t.Fatalf("live cancel must strip the NUL from stop_reason (want %q), got %+v", "xy", fs.createdStopVerdict.StopReason)
 	}
+	// The body co-written to run_user_inputs.body in the SAME INSERT must also be
+	// NUL-stripped, or the CTE would 22021 on that column before stop_reason ever mattered.
+	if fs.createdStopVerdict.Body.String != "xy" || strings.ContainsRune(fs.createdStopVerdict.Body.String, '\x00') {
+		t.Fatalf("live cancel must strip the NUL from run_user_inputs.body (want %q), got %+v", "xy", fs.createdStopVerdict.Body)
+	}
 }
 
 func TestSubmitInputLiveRejectStampsStopKind(t *testing.T) {
