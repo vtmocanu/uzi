@@ -10,7 +10,6 @@ import { Link } from "react-router-dom";
 import {
   api,
   ApiError,
-  isHttpsUrl,
   type LastFire,
   type LastFireSkip,
   type Schedule,
@@ -32,11 +31,11 @@ import {
 import {
   ChevronDownIcon,
   ClockIcon,
-  ExternalLinkIcon,
   PencilIcon,
   PlayIcon,
   PlusIcon,
 } from "../components/icons";
+import { ForgeIssueAnchor } from "../components/ForgeIssueAnchor";
 
 // The COLSPAN of the schedules table, so the expandable "Last fire" detail row
 // stretches the full width (Target · When · Next run · Last run · Options · On).
@@ -546,22 +545,15 @@ function IssueRef({ issueIID, webURL }: { issueIID: number | null; webURL?: stri
   if (issueIID == null) {
     return <span className={cls}>prompt</span>;
   }
-  if (webURL && isHttpsUrl(webURL)) {
-    return (
-      <a
-        href={webURL}
-        target="_blank"
-        rel="noreferrer"
-        aria-label={`Open issue #${issueIID} on the forge`}
-        title={`Open issue #${issueIID} on the forge`}
-        className={cx(cls, "inline-flex items-center gap-0.5 hover:text-brand")}
-      >
-        {`#${issueIID}`}
-        <ExternalLinkIcon className="h-3 w-3" />
-      </a>
-    );
-  }
-  return <span className={cls}>{`#${issueIID}`}</span>;
+  return (
+    <ForgeIssueAnchor
+      webUrl={webURL}
+      iid={issueIID}
+      label={`Open issue #${issueIID} on the forge`}
+      className={cx(cls, "hover:text-brand")}
+      fallbackClassName={cls}
+    />
+  );
 }
 
 // SkipRow renders one skipped candidate: its issue ref (or a prompt marker), its

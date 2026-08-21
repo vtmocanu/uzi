@@ -3,9 +3,9 @@
 // RunIssueRef (PRD #411 M2): the three-way render of a run's originating issue ref —
 // a muted kind chip when there is no issue, a forge external link when a valid https
 // issue_web_url is snapshotted, and a plain `#<iid>` span when the issue is no longer
-// cached. Plus the runKindLabel mapping and the in-card stopPropagation guard.
-import { afterEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+// cached. Plus the runKindLabel mapping.
+import { afterEach, describe, it, expect } from "vitest";
+import { cleanup, render, screen } from "@testing-library/react";
 import { RunIssueRef, runKindLabel } from "./RunIssueRef";
 
 afterEach(cleanup);
@@ -70,37 +70,94 @@ describe("runKindLabel", () => {
   });
 });
 
-describe("RunIssueRef — stopPropagation in a card link", () => {
-  // The anchor sits inside a wrapper whose onClick is a spy. An outer capture-phase
-  // preventDefault suppresses jsdom's navigation attempt without touching bubbling, so
-  // whether the spy fires reflects only the anchor's stopPropagation behaviour.
-  function renderInCard(inCardLink: boolean) {
-    const spy = vi.fn();
-    render(
-      <div onClickCapture={(e) => e.preventDefault()}>
-        <div onClick={spy}>
-          <RunIssueRef
-            issueIid={26}
-            issueWebUrl={URL26}
-            kind="issue"
-            forgeType="gitlab"
-            inCardLink={inCardLink}
-          />
-        </div>
-      </div>,
-    );
-    return spy;
-  }
-
-  it("positive: with inCardLink, a click on the anchor does NOT bubble to the wrapper", () => {
-    const spy = renderInCard(true);
-    fireEvent.click(screen.getByRole("link"));
-    expect(spy).not.toHaveBeenCalled();
+describe("RunIssueRef — raised scopes z-10 to the interactive anchor only (#485 NB1)", () => {
+  // In a stretched-link card the forge anchor must sit ABOVE the overlay (relative
+  // z-10) so it stays clickable, but the non-interactive branches must stay BELOW it
+  // so a click on their footprint still navigates to the run. `raised` must therefore
+  // lift branch 2 only, never branch 1 (kind chip) or branch 3 (cached-out #iid span).
+  it("branch 2 (https anchor): raised adds relative z-10 to the anchor", () => {
+    render(<RunIssueRef issueIid={26} issueWebUrl={URL26} kind="issue" forgeType="gitlab" raised />);
+    const link = screen.getByRole("link");
+    expect(link.className).toContain("relative");
+    expect(link.className).toContain("z-10");
   });
 
-  it("paired negative: without inCardLink, the click bubbles to the wrapper", () => {
-    const spy = renderInCard(false);
-    fireEvent.click(screen.getByRole("link"));
-    expect(spy).toHaveBeenCalledTimes(1);
+  it("branch 1 (kind chip): raised does NOT lift the non-interactive chip", () => {
+    const { container } = render(
+      <RunIssueRef issueIid={null} issueWebUrl={null} kind="task" forgeType="gitlab" raised />,
+    );
+    const chip = container.firstElementChild as HTMLElement;
+    expect(chip.tagName).toBe("SPAN");
+    expect(chip.className).not.toContain("z-10");
+  });
+
+  it("branch 3 (cached-out #iid span): raised does NOT lift the plain span", () => {
+    const { container } = render(
+      <RunIssueRef issueIid={26} issueWebUrl={null} kind="issue" forgeType="gitlab" raised />,
+    );
+    // No anchor in branch 3 (hrefless), so the rendered element is the plain span.
+    expect(container.querySelector("a")).toBeNull();
+    const span = container.firstElementChild as HTMLElement;
+    expect(span.tagName).toBe("SPAN");
+    expect(span.className).not.toContain("z-10");
+  });
+});
+
+describe('RunIssueRef — tone="inherit" lets the ref read the parent colour (#485 NB2)', () => {
+  // The Board needs-attention strip themes the whole pill `text-warn`; a ref that forces
+  // its own text-faint/text-muted mismatches the amber. tone="inherit" drops those
+  // explicit colours so the number reads warn, and (branch 2) swaps hover:text-brand —
+  // which would break the warn theme — for a warn-safe hover:underline. Each check pairs
+  // an inherit assertion with a default-tone positive control on the same surface.
+  it("branch 2 (https anchor): inherit drops text-faint and hover:text-brand", () => {
+    render(
+      <RunIssueRef issueIid={26} issueWebUrl={URL26} kind="issue" forgeType="gitlab" tone="inherit" />,
+    );
+    const link = screen.getByRole("link");
+    expect(link.className).not.toContain("text-faint");
+    expect(link.className).not.toContain("hover:text-brand");
+    // The warn-safe hover affordance is still present.
+    expect(link.className).toContain("hover:underline");
+  });
+
+  it("branch 2 (https anchor): default tone DOES force text-faint and hover:text-brand", () => {
+    render(<RunIssueRef issueIid={26} issueWebUrl={URL26} kind="issue" forgeType="gitlab" />);
+    const link = screen.getByRole("link");
+    expect(link.className).toContain("text-faint");
+    expect(link.className).toContain("hover:text-brand");
+  });
+
+  it("branch 2 (https anchor): inherit still composes raised as relative z-10", () => {
+    render(
+      <RunIssueRef
+        issueIid={26}
+        issueWebUrl={URL26}
+        kind="issue"
+        forgeType="gitlab"
+        raised
+        tone="inherit"
+      />,
+    );
+    const link = screen.getByRole("link");
+    expect(link.className).toContain("relative");
+    expect(link.className).toContain("z-10");
+    expect(link.className).not.toContain("text-faint");
+  });
+
+  it("branch 1 (kind chip): inherit drops text-muted", () => {
+    const { container } = render(
+      <RunIssueRef issueIid={null} issueWebUrl={null} kind="task" forgeType="gitlab" tone="inherit" />,
+    );
+    const chip = container.firstElementChild as HTMLElement;
+    expect(chip.tagName).toBe("SPAN");
+    expect(chip.className).not.toContain("text-muted");
+  });
+
+  it("branch 1 (kind chip): default tone DOES force text-muted", () => {
+    const { container } = render(
+      <RunIssueRef issueIid={null} issueWebUrl={null} kind="task" forgeType="gitlab" />,
+    );
+    const chip = container.firstElementChild as HTMLElement;
+    expect(chip.className).toContain("text-muted");
   });
 });

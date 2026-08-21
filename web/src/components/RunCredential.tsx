@@ -61,15 +61,19 @@ export function RunCredential({
 
   const chip =
     variant === "compact" ? (
-      // PRD #295: the Runs-list rendering, embedded inside the row's own <Link>. The
-      // tone dot carries the "worth a look" signal the full chip carries with a link,
-      // and the label answers "which account". Everything else — mode, hint, the full
-      // (untruncated) label — lives in the title, NOT in a visible pill or an sr-only
-      // span: the sr-only hint would fold a whole sentence into every row link's
-      // accessible name, and a nested <a> is illegal HTML inside the row <Link>. So the
-      // compact badge is deliberately a bare Badge with no aria-describedby and no
-      // inner link; the direct /settings link and the described hint stay on the full
-      // run-detail chip, which is not inside a row link.
+      // PRD #295: the Runs-list rendering. Since issue #485 this badge is a SIBLING of the
+      // row's stretched-link overlay <Link> (no longer a child of it), and it is raised
+      // above that overlay (relative z-10, applied by the badge-cluster container in
+      // RunsList) so its native `title` tooltip fires on hover — without the raise the
+      // transparent overlay would intercept the pointer and the title, which holds the
+      // whole story below, would never show. The tone dot carries the "worth a look"
+      // signal the full chip carries with a link, and the label answers "which account".
+      // Everything else — mode, hint, the full (untruncated) label — lives in the title,
+      // NOT in a visible pill or an sr-only span: an sr-only hint would bloat the row and
+      // (were this badge ever nested back under a link) fold a whole sentence into its
+      // accessible name. So the compact badge is deliberately a bare Badge with no
+      // aria-describedby and no inner link; the direct /settings link and the described
+      // hint stay on the full run-detail chip.
       <Badge
         tone={tone === "warning" ? "warning" : tone === "info" ? "info" : "neutral"}
         // dot only where the state is non-neutral, matching the full chip's
@@ -128,8 +132,10 @@ export function RunCredential({
       </Badge>
     );
 
-  // The COMPACT badge never links: it is embedded inside the Runs-list row <Link>, so
-  // an inner <a> would be a nested anchor (illegal HTML), and the tone dot + title
+  // The COMPACT badge never links: it sits beside the Runs-list row's stretched-link
+  // overlay <Link>, raised above it (relative z-10) so its `title` tooltip works while
+  // the overlay handles run navigation (issue #485). Adding an inner <a> would put a
+  // second link on the same card competing with the overlay, and the tone dot + title
   // already carry the "worth a look" signal. Only the FULL run-detail chip links, and
   // only where there is something to do — link iff the tone is not neutral, one rule so
   // the two cannot drift. PRD #104 M5 already ships the per-token meters and
