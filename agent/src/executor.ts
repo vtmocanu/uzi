@@ -39,11 +39,19 @@ const execFileAsync = promisify(execFile);
  * follow-up" apart from every way a park can END:
  *   - `followup` — the next user turn arrived; `body` is its text, folded into the next
  *     implement turn exactly as a mid-run follow-up is.
- *   - `ended` — the park is over and the run finalizes normally. `reason`:
- *       `idle`      — no follow-up arrived within the park's idle bound (M3);
+ *   - `ended` — the park is over. The disposition DEPENDS on `reason` — it is not one exit:
+ *       `idle`      — no follow-up arrived within the park's idle bound (M3); the run
+ *                     finalizes NORMALLY (reports `completed`, pushes its branch, opens an MR
+ *                     on `open_mr`), exactly as a non-interactive done;
  *       `stopped`   — an explicit `stop` input ended the interactive run (SEAM: M4 wires
- *                     the `stop` input kind + serviceFollowUp precedence; M3 never produces it);
- *       `cancelled` — the run was cancelled (the existing steering cancel signal).
+ *                     the `stop` input kind + serviceFollowUp precedence; M3 never produces
+ *                     it). Reserved for a GRACEFUL stop (stop_kind='stopped'); for now it
+ *                     shares the idle normal-finalize;
+ *       `cancelled` — the run was cancelled (the existing steering cancel signal). This does
+ *                     NOT finalize as `completed`: the executor throws the cancel signal so
+ *                     the run reaches its terminal CANCEL path (reports `failed`; the server
+ *                     routes the stamped stop_kind='cancelled' to CancelRunByWorker). A parked
+ *                     cancel finalized as `completed` would wrongly push + open an MR.
  */
 export type FollowUpOutcome =
   | { kind: "followup"; body: string }

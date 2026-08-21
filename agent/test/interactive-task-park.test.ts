@@ -107,6 +107,35 @@ function fakeTurns(scripts: SDKMessage[][]): { queryFn: SdkQueryFn; turns: Turn[
   return { queryFn, turns };
 }
 
+/** Like fakeTurns, but each turn's stream burns `sleepMs` of REAL wall-clock time in-turn
+ *  (between consuming the prompt and yielding its messages). driveTurn arms the wall budget
+ *  around this window (armWall→…→disarmWall), so the sleep is what disarmWall debits — the
+ *  only way to exercise the wall-clock trip with scripted turns, which are otherwise instant.
+ *  Used by the per-follow-up wall-reset test. */
+function fakeTurnsSlow(
+  scripts: SDKMessage[][],
+  sleepMs: number,
+): { queryFn: SdkQueryFn; turns: Turn[] } {
+  const turns: Turn[] = [];
+  let i = 0;
+  const queryFn: SdkQueryFn = (params) => {
+    const script = scripts[Math.min(i, scripts.length - 1)]!;
+    i++;
+    const turn: Turn = { options: params.options };
+    turns.push(turn);
+    return (async function* () {
+      for await (const p of params.prompt) {
+        const rec = p as { message?: { content?: unknown } };
+        const content = rec.message?.content;
+        turn.promptText = typeof content === "string" ? content : JSON.stringify(content);
+      }
+      await new Promise((r) => setTimeout(r, sleepMs)); // debited from the wall budget
+      for (const m of script) yield m;
+    })();
+  };
+  return { queryFn, turns };
+}
+
 // ── the SdkExecutor loop park ────────────────────────────────────────────────
 describe("SdkExecutor interactive task park (PRD #517 M3)", () => {
   let sdkHome: string;
@@ -256,6 +285,115 @@ describe("SdkExecutor interactive task park (PRD #517 M3)", () => {
       "agent/issue-5",
       "each follow-up gets a fresh iteration budget",
     );
+  });
+
+  it("throws the cancel signal (not a normal finalize) when a parked run is cancelled", async () => {
+    // Fix 1: a cancelled parked run is still awaiting_followup server-side; finalizing it as
+    // `completed` would push its branch and open an MR. It must instead reach the terminal
+    // CANCEL path — the executor throws the same cancel signal the plan gate / clarification
+    // park use, which the runner maps to `failed` (server routes stop_kind='cancelled' to
+    // CancelRunByWorker). Mutation: revert Fix 1 so `{ended, reason:"cancelled"}` shares idle's
+    // `break` → run() RESOLVES normally (returns the branch) instead of throwing, reddening the
+    // assert.rejects below.
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [assistantText("t1"), signalDone(), resultSuccess()], // loop 1 → done → park → cancelled
+    ]);
+    let checkpointCalls = 0;
+    const { ctx } = makeCtx({
+      interactive: true,
+      checkpoint: async () => {
+        checkpointCalls++;
+      },
+      awaitFollowUp: async () => ({ kind: "ended", reason: "cancelled" }),
+    });
+
+    await assert.rejects(
+      () => new SdkExecutor(nullLogger(), sdkHome, { queryFn }).run(ctx),
+      /cancel/i,
+      "a cancelled park must throw the cancel signal, not return a completed result",
+    );
+    // The run DID park (checkpoint-pushed) before the cancel, and no follow-up turn ran after.
+    assert.strictEqual(checkpointCalls, 1, "the run parked (checkpoint-pushed) before the cancel");
+    assert.strictEqual(turns.length, 2, "plan + one loop turn; no turn ran after the cancel");
+  });
+
+  it("resets the WALL budget for each follow-up so summed in-turn time does not trip REASON_WALL", async () => {
+    // Fix 2: each follow-up is a fresh task with a fresh wall budget (bounded per-follow-up,
+    // not per-conversation). Budget is 300ms and every turn burns 60ms of real in-turn time.
+    // WITH the reset each of the many follow-ups re-arms at the full 300ms and none trips (a
+    // single 60ms turn against 300ms is a 5x margin). WITHOUT it (delete
+    // `state.wallRemainingMs = initialWallMs`) the 60ms debits accumulate across plan + 7 turns
+    // = 480ms > 300ms and armWall trips REASON_WALL mid-session, so run() rejects and the
+    // turns.length assert below (all 8 turns ran) reddens. max_iterations is high so only the
+    // wall — not the iteration budget — is under test.
+    const { queryFn, turns } = fakeTurnsSlow(
+      [
+        [submitPlan("plan"), resultSuccess()], // planning
+        [assistantText("work"), signalDone(), resultSuccess()], // every loop turn: done → park
+      ],
+      60,
+    );
+    // park #1 (loop1) … #6 return a follow-up; park #7 ends the session idle.
+    const outcomes: FollowUpOutcome[] = [
+      { kind: "followup", body: "task 2" },
+      { kind: "followup", body: "task 3" },
+      { kind: "followup", body: "task 4" },
+      { kind: "followup", body: "task 5" },
+      { kind: "followup", body: "task 6" },
+      { kind: "followup", body: "task 7" },
+      { kind: "ended", reason: "idle" },
+    ];
+    const { ctx } = makeCtx({
+      config: { max_iterations: 30, run_timeout_seconds: 0.3 },
+      interactive: true,
+      checkpoint: async () => {},
+      awaitFollowUp: async () => outcomes.shift()!,
+    });
+
+    const result = await new SdkExecutor(nullLogger(), sdkHome, { queryFn }).run(ctx);
+    assert.strictEqual(result.branch, "agent/issue-5", "the long interactive session did not trip the wall");
+    // plan + loop1 + 6 follow-up turns = 8 turns all ran, proving the wall never tripped
+    // (a REASON_WALL trip would have rejected the run before the later turns).
+    assert.strictEqual(turns.length, 8, "every follow-up turn ran on its own fresh wall budget");
+  });
+
+  it("emits first-turn scaffolding only on the genuine first turn, never on a resumed follow-up", async () => {
+    // Fix 3: the "plan approved" framing and the base-commit note are first-turn-ONLY, keyed on
+    // the whole run's first turn (hasParked), NOT the per-follow-up iteration counter. Mutation:
+    // revert Fix 3 (`first: iteration === 1`) → after `iteration = 0` the resumed turn is
+    // iteration 1 again, so turn 2 re-emits "Your plan was approved" + the ORIGINAL base commit,
+    // reddening the doesNotMatch asserts. The follow-up body must still appear either way.
+    const baseCommit = "a".repeat(40);
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [assistantText("t1"), signalDone(), resultSuccess()], // loop 1 (genuine first turn) → park
+      [assistantText("t2"), signalDone(), resultSuccess()], // loop 2 (resumed follow-up) → park idle
+    ]);
+    const outcomes: FollowUpOutcome[] = [
+      { kind: "followup", body: "please also update the docs" },
+      { kind: "ended", reason: "idle" },
+    ];
+    const { ctx } = makeCtx({
+      interactive: true,
+      baseCommit,
+      checkpoint: async () => {},
+      awaitFollowUp: async () => outcomes.shift()!,
+    });
+
+    await new SdkExecutor(nullLogger(), sdkHome, { queryFn }).run(ctx);
+
+    const firstTurn = turns[1]!.promptText ?? "";
+    const resumeTurn = turns[2]!.promptText ?? "";
+    // The genuine first turn carries the first-turn-only scaffolding.
+    assert.match(firstTurn, /Your plan was approved/, "first turn has the plan-approved framing");
+    assert.match(firstTurn, /Your branch was created at commit/, "first turn has the base-commit note");
+    // The resumed follow-up turn suppresses BOTH.
+    assert.doesNotMatch(resumeTurn, /Your plan was approved/, "resume must not re-frame as newly approved");
+    assert.doesNotMatch(resumeTurn, /Your branch was created at commit/, "resume must not re-inject the base commit");
+    // But the follow-up body itself still appears, untrusted-fenced.
+    assert.match(resumeTurn, /please also update the docs/, "the follow-up body still appears");
+    assert.match(resumeTurn, /UNTRUSTED INPUT/, "and is rendered as untrusted input");
   });
 
   it("a non-interactive run finalizes on done without parking or checkpoint-parking", async () => {

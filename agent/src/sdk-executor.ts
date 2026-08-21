@@ -1334,6 +1334,16 @@ export class SdkExecutor implements Executor {
         : undefined;
       let iteration = 0;
       let followUp: string | undefined;
+      // PRD #517 M3 (Fix 3): latches TRUE the first time this run parks at an interactive
+      // follow-up. The first-turn-only prompt scaffolding (the "your plan was approved"
+      // framing, priorWork/deps notes, and the base-commit note) must be emitted on the
+      // GENUINE first turn of the whole run, never on a resumed follow-up turn — a follow-up
+      // is not a newly-approved plan, and its base-commit note would re-inject the ORIGINAL
+      // base across already-landed follow-up work. So `first` is `iteration === 1 &&
+      // !hasParked`, not `iteration === 1` (the per-follow-up counter resets to 0 on each
+      // follow-up). A non-interactive run never parks, so this stays false and its `first`
+      // behaviour is byte-identical to before.
+      let hasParked = false;
       // PRD #390 M3 (D2/D4): mid-run milestone-reporting enforcement state. progressMissedLastTurn
       // escalates the NEXT turn's prompt; consecutiveMisses counts work turns that left the tracker
       // with no milestone in progress. Bounded, feed-only, never fails the run.
@@ -1395,7 +1405,11 @@ export class SdkExecutor implements Executor {
             // both the own AND repo sources — not the plan-turn map, which is keyed by
             // `assembled.subagents` and would miss every repo-source name.
             subagentCanWrite: selectedCanWrite,
-            first: iteration === 1,
+            // PRD #517 M3 (Fix 3): first-turn scaffolding on the genuine first turn of the
+            // WHOLE run only, not the first turn of each follow-up. hasParked latches true
+            // once the run has parked, so a resumed follow-up turn (iteration back at 1) is
+            // NOT treated as first. Non-interactive runs never park → identical to before.
+            first: iteration === 1 && !hasParked,
             iteration,
             // PRD #209 (Decision A): a seeded run's first-turn opening says the user
             // supplied the plan, not that it was "approved". First turn only (gated
@@ -1482,10 +1496,18 @@ export class SdkExecutor implements Executor {
           // callback) breaks to the normal finalize below, byte-identical to today.
           if (ctx.interactive && ctx.awaitFollowUp) {
             // Checkpoint-push at every park (Decision 4): the deliverable is commits the user
-            // pulls, so make the turn's work durable on origin before blocking. reap:true —
-            // the same reap-before-git ordering the done path uses; the session transcript
-            // survives on disk, so the next turn resumes it.
+            // pulls, so try to get the turn's work onto origin before blocking. This is
+            // BEST-EFFORT — checkpoint swallows push failures, so the run still PARKS even if
+            // the branch tip did not reach the remote; durability is bounded by this push but
+            // NOT guaranteed by it. D4 chooses that deliberately ("a park that fails is worse
+            // than a park that loses work"), consistent with the existing checkpoint
+            // semantics. The backstops are the worker PVC (the commits survive on disk) and a
+            // later checkpoint re-push. reap:true — the same reap-before-git ordering the done
+            // path uses; the session transcript survives on disk, so the next turn resumes it.
             await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+            // Fix 3: the run has now parked at least once. Latch it so no resumed follow-up
+            // turn re-emits the first-turn-only scaffolding (see `first` above and hasParked).
+            hasParked = true;
             // Park OUTSIDE driveTurn (the idle watchdog lives inside driveTurn, so a parked
             // run cannot trip REASON_IDLE — the same property the ask_user park relies on).
             const outcome = await ctx.awaitFollowUp(TASK_FOLLOWUP_IDLE_MS);
@@ -1502,11 +1524,38 @@ export class SdkExecutor implements Executor {
               // server's wake guard because the follow-up was already consumed by the poll
               // loop before awaitFollowUp resolved (consume-before-report).
               iteration = 0;
+              // Fix 2: RESET the wall-clock budget too, to the same fresh per-run allowance
+              // the loop initialised it to (initialWallMs, ~:816). Each follow-up is a fresh
+              // task with a fresh budget — the wall bounds ONE follow-up's in-turn compute,
+              // not the whole conversation, matching the iteration-reset rationale above.
+              // Without this, cumulative in-turn time SUMMED across all follow-ups debits from
+              // one budget and a genuinely long-lived interactive session self-trips
+              // REASON_WALL, defeating the feature (the server-side SweepRunningTimeout was
+              // exempted for interactive runs in M2 for the same reason). This is the exact
+              // field armWall/disarmWall read/debit, so no stale wall accumulator survives.
+              // The whole-session cap is the M5 idle timeout, not the per-follow-up wall.
+              state.wallRemainingMs = initialWallMs;
               continue;
             }
-            // outcome.kind === "ended" (idle in M3; stopped/cancelled reuse the same exit):
-            // fall through to the normal finalize below, exactly as a non-interactive done.
-            // M5 refines the idle value + adds a server backstop; M4 refines stop handling.
+            // outcome.kind === "ended". Discriminate on the reason (Fix 1):
+            if (outcome.reason === "cancelled") {
+              // A cancelled parked run is still `awaiting_followup` server-side. Falling
+              // through to the normal `break` would finalize it as `completed`
+              // (SetRunCompleted admits any non-terminal status and ignores stop_kind), so the
+              // branch would be pushed and an MR opened on `open_mr` — WRONG for a cancel.
+              // Throw the SAME cancel signal the plan gate (~:1192) and the clarification park
+              // use — Error(REASON_CANCELLED), which yields a `cancelled` terminal, NOT
+              // PlanRejectedError (that is a plan-rejected terminal). The run then reaches the
+              // terminal cancel path: the worker reports `failed`, and the server routes the
+              // stamped stop_kind='cancelled' to CancelRunByWorker.
+              throw new Error(REASON_CANCELLED);
+            }
+            // outcome.reason === "idle" (the real M3 end: no follow-up arrived within the idle
+            // bound) → finalize normally via the break below; M5 refines the idle value + adds
+            // a server backstop. outcome.reason === "stopped" is the M4 SEAM: serviceFollowUp
+            // never emits it in M3, so for now it shares the idle break. M4 will make `stop` a
+            // GRACEFUL stop stamping stop_kind='stopped' — a distinct disposition from cancel,
+            // so `stopped` must NOT throw the cancel signal here.
           }
           break;
         }
