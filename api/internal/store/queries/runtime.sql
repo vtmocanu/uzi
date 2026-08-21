@@ -1388,12 +1388,39 @@ WHERE id = @id
 -- stamped 'cancelled' for uniformity (PRD #33 Decision 3), though isStoppedRun's
 -- status='cancelled' branch already treats this run as a deliberate stop.
 UPDATE runs SET status = 'cancelled', stop_kind = 'cancelled', move_pending_since = now(), finished_at = now(),
+    -- PRD #503 M3: persist the operator's OPTIONAL cancel reason. @stop_reason binds a
+    -- nullable pgtype.Text: an invalid/zero value stores NULL (no reason supplied).
+    stop_reason = @stop_reason,
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND user_id = @user_id
+  AND status NOT IN ('completed', 'failed', 'cancelled');
+
+-- name: CancelRunByWorker :execrows
+-- Live-worker cancel transition (PRD #503 M1). When a LIVE worker consumes a cancel
+-- verdict it reports `failed`; SetState's failed arm routes HERE off the run's already
+-- loaded stop_kind='cancelled' (stamped by CreateStopVerdictInput BEFORE this report)
+-- instead of SetRunFailed, so an operator cancellation is not mis-classified as
+-- 'agent_failure'. This converges the live cancel path with the server-side
+-- CancelRunServerSide: status 'cancelled', fail_origin NULL (a cancel is not a failure,
+-- so it is never judged — Gate 0). It is worker-scoped (@worker_id) because SetState holds
+-- a worker, not a user, so CancelRunServerSide (user_id-scoped) is unusable from it.
+-- stop_kind is left untouched (already 'cancelled'). Terminal-run cleanup + guard mirror
+-- SetRunFailed exactly, so a report onto an already-terminal run is a 0-row no-op.
+UPDATE runs SET
+    status             = 'cancelled',
+    fail_origin        = NULL,
+    move_pending_since = now(),
+    finished_at        = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at         = now()
+WHERE id = @id AND worker_id = @worker_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: FailRunAutoStop :execrows
@@ -2018,8 +2045,16 @@ RETURNING *;
 -- kind would therefore be a silent no-op on exactly the older fleet Phase 2 exists
 -- to protect — and would need a second migration for run_user_inputs.kind's CHECK.
 -- The distinguishing information rides runs.stop_kind, which the worker never sees.
+--
+-- PRD #503 M3: @stop_reason is stamped UNCONDITIONALLY here (like @stop_kind), but its
+-- VALUE is decided by the Go caller and belongs on a CANCEL only. A cancel passes the
+-- operator's optional reason (or NULL when none was given); reject_plan passes NULL,
+-- because a reject's reason goes to failure_reason via the M2 path and double-writing
+-- would contradict that clean split; auto-stop passes NULL, its identity being
+-- stop_kind='auto_stopped'. The stamp stays unconditional to avoid the
+-- parameter-type-inference pitfall the comment above already warns about.
 WITH stamped AS (
-    UPDATE runs SET stop_kind = @stop_kind, updated_at = now()
+    UPDATE runs SET stop_kind = @stop_kind, stop_reason = @stop_reason, updated_at = now()
     WHERE id = @run_id
     RETURNING id
 )
