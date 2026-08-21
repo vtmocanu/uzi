@@ -4,6 +4,14 @@ Notable changes to uzi, loosely following [Keep a Changelog](https://keepachange
 Versions are release git tags (`deploy/chart/Chart.yaml`'s `version`/`appVersion`, Model B) — this
 file is not bumped per-commit; `[Unreleased]` collects everything since the last tag.
 
+Write each bullet on ONE physical line (no mid-bullet newlines): a release's notes are this file's
+`## [X.Y.Z]` section verbatim (`scripts/changelog-section.sh body`), and GitHub renders single
+newlines in a release body as hard `<br>` breaks, so hard-wrapped bullets show as short, ragged
+lines in the published Release. One line per bullet lets GitHub reflow to the reader's width. Blank
+lines between bullets and `###` subsection headers are unaffected. (Established repo-wide 2026-08-21;
+sections at or before `[0.50.0]` stay wrapped — their Releases were already published and edited in
+place.)
+
 ## [Unreleased]
 
 ## [0.51.0] - 2026-08-21
