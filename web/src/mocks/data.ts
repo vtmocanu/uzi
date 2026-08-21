@@ -1140,6 +1140,28 @@ export const mockRepos: Repo[] = [
     guardrail_override: null,
     guardrail_blocked: false,
   },
+  {
+    // PRD #345 M2: the disabled+blocked row that makes the refused-enable demo
+    // reachable under VITE_UZI_MOCK=1. No pre-existing fixture was BOTH
+    // enabled:false AND guardrail_blocked:true, so clicking Enable here is the
+    // one-click path that trips mockApi.setRepoEnabled's 422 guardrail block
+    // (reasons from mockBlockedRepoMeta below). We add this row rather than
+    // flipping repo-payments, whose enabled:true state the Boards "runs blocked"
+    // badge and admin Allow-anyway demo depend on.
+    id: "repo-ledger",
+    connection_id: "conn-1",
+    forge_project_id: 641,
+    path_with_namespace: "team-beta/ledger-service",
+    web_url: "https://gitlab.example.com/team-beta/ledger-service",
+    default_branch: "main",
+    enabled: false,
+    repo_skills_enabled: false,
+    repo_claudemd_enabled: false,
+    repo_devbox_opt_in: false,
+    pipeline: null,
+    guardrail_override: null,
+    guardrail_blocked: true,
+  },
 ];
 
 // PRD #66 M9 (D8): per-repo metadata the admin cross-user blocked-repos list needs but
@@ -1172,6 +1194,20 @@ export const mockBlockedRepoMeta: Record<string, MockBlockedRepoMeta> = {
     block_messages: [
       "the default branch is protected but the write role (Developer) may push to it",
       "the write role (Developer) may merge to the default branch",
+    ],
+    privilege_status: "violations",
+    privilege_checked_at: minsAgo(18),
+  },
+  // PRD #345 M2: the disabled+blocked row (repo-ledger) whose enable is refused.
+  // These block_messages are the enable-guardrail (privcheck) reasons rendered as
+  // the 422 violations when a member clicks Enable on it under VITE_UZI_MOCK=1.
+  "repo-ledger": {
+    owner_id: "u-dana",
+    owner_email: "dana@example.com",
+    forge_type: "gitlab",
+    block_messages: [
+      "could not read default-branch protection on this repo",
+      "the default branch is protected but the write role (Developer) may push to it",
     ],
     privilege_status: "violations",
     privilege_checked_at: minsAgo(18),
