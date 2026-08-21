@@ -1387,6 +1387,11 @@ export class SdkExecutor implements Executor {
             // `assembled.subagents` and would miss every repo-source name.
             subagentCanWrite: selectedCanWrite,
             first: iteration === 1,
+            // issue #222: warn the lead on the first implement turn that this resume's
+            // reseed destroyed any local-only prior-attempt work, so a queued follow-up
+            // written against the old tree is not acted on as if that work survived. The
+            // reseedNote gate is first-turn-only, so later turns are unchanged.
+            resumed: ctx.resumed,
             iteration,
             // PRD #209 (Decision A): a seeded run's first-turn opening says the user
             // supplied the plan, not that it was "approved". First turn only (gated

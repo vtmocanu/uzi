@@ -833,6 +833,12 @@ export class RunRunner {
         // on this worker (issue #105).
         sessionId,
         priorWork,
+        // issue #222: this run executed before (it reported a session), so this claim's
+        // reseed wiped whatever an earlier attempt left in the tree. Read the RAW
+        // claim.session_id, not the `sessionId` var cleared above on a dropped transcript —
+        // a dropped-session resume still had its tree destroyed. Same discriminator the
+        // reseed feed-status uses (this.emit "starting from the default branch" above).
+        resumed: claim.session_id != null,
         // PRD #35 Decision 6b + PRD #209 D4. The RUNNER is the only layer that knows
         // all the facts, which is why it resolves them here rather than the executor
         // reading the claim: the server said the plan is approved, and EITHER a session

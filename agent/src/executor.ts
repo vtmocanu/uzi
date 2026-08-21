@@ -148,6 +148,14 @@ export interface RunContext {
    *  session-less seeded path there is no planning turn, so the sdk-executor forwards it to
    *  the IMPLEMENT prompt instead (first turn only). */
   priorWork?: PriorWork;
+  /** issue #222: this run was picked up again (a resume), so the runner clone was wiped
+   *  and re-seeded on this claim, destroying any local-only work an earlier attempt left in
+   *  the tree. Set by the RUNNER from the raw `claim.session_id` (a run that executed before
+   *  reported one) — the same discriminator the reseed feed-status uses, read raw so a
+   *  dropped-transcript resume still counts. Forwarded to the FIRST implement prompt so the
+   *  lead is warned before a queued follow-up written against the destroyed tree arrives.
+   *  Optional; absent ⇒ false (the stub executor and older callers ignore it). */
+  resumed?: boolean;
   /** PRD #35 Decision 6b + PRD #209 D4: this run's plan is ALREADY APPROVED, so the
    *  executor skips the Phase-1 planning turn and the gate and goes straight to
    *  implement⇄review with `approvedPlan` below.

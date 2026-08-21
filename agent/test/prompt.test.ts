@@ -591,6 +591,31 @@ describe("buildImplementPrompt", () => {
     const blank = buildImplementPrompt({ branch: "b", subagentNames: [], first: true, iteration: 1, seeded: true, seededPlan: "   " });
     assert.ok(!/<plan>/.test(blank));
   });
+
+  // issue #222: a resume reseeds the working tree (unconditional fs.rm + re-clone),
+  // destroying local-only prior-attempt work. A follow-up queued against that tree is
+  // delivered on a later turn, so the lead must be told the tree changed. The warning
+  // rides the FIRST implement turn (queued follow-ups drain at iteration end, so turn 1
+  // never carries one) and is gated on `resumed`.
+  it("issue #222: a resumed first turn warns the tree was rebuilt and prior local-only work is gone", () => {
+    const p = buildImplementPrompt({ branch: "b", subagentNames: ["coder"], first: true, iteration: 1, resumed: true });
+    assert.match(p, /picked up again after an interruption/i);
+    assert.match(p, /working tree\s+was rebuilt from the remote/i);
+    assert.match(p, /never pushed, are gone from the tree/i);
+    assert.match(p, /treat its actual state as/i);
+  });
+
+  it("issue #222: the reseed warning is first-turn-only and absent on a fresh run (byte-identity)", () => {
+    // A later turn resumes a session that already saw the warning, so it is not repeated.
+    const later = buildImplementPrompt({ branch: "b", subagentNames: ["coder"], first: false, iteration: 2, resumed: true });
+    assert.ok(!/picked up again after an interruption/i.test(later));
+    // A fresh run had no prior tree to lose: `resumed:false` and the absent field must both
+    // give the exact byte-identical prompt (no reseed warning added).
+    const absent = buildImplementPrompt({ branch: "b", subagentNames: ["coder"], first: true, iteration: 1 });
+    const explicitFalse = buildImplementPrompt({ branch: "b", subagentNames: ["coder"], first: true, iteration: 1, resumed: false });
+    assert.ok(!/picked up again after an interruption/i.test(absent));
+    assert.strictEqual(absent, explicitFalse, "resumed:false must change nothing");
+  });
 });
 
 describe("buildImplementPrompt — milestone note (PRD #122 M6)", () => {
