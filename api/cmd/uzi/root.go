@@ -139,7 +139,13 @@ func Main(env Env, args []string) int {
 		// CellText, not SanitizeTTY: this is a one-line report with a fixed "uzi: "
 		// prefix, so a newline in a server error would print a second line that carries
 		// no prefix and reads as the CLI's own voice.
-		_, _ = fmt.Fprintln(env.Stderr, "uzi:", uzicli.CellText(err.Error()))
+		//
+		// The LOCAL cellText, not uzicli.CellText: the server's {"error": "..."} body is
+		// read via a 32 MiB io.LimitReader in uzicli, and CellText does not truncate, so a
+		// hostile server's megabyte-long error would print here in full. The local helper
+		// adds compactText's 200-char cap on top of the SAME strip/fold, keeping this
+		// broadest untrusted-text line bounded (#220).
+		_, _ = fmt.Fprintln(env.Stderr, "uzi:", cellText(err.Error()))
 	}
 	return uzicli.ExitCodeFor(err)
 }
