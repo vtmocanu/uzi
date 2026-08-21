@@ -2,7 +2,7 @@
 
 **Issue**: #530
 **Priority**: Medium
-**Status**: Not started
+**Status**: Complete (tui-ux narrow-rail legibility review is a post-merge human step, per M4)
 **Surface**: `uzi tui` run **detail** view only (no web change, no API change)
 
 ## Problem
@@ -104,25 +104,25 @@ on `main`. State it in the code comment where the strip is added; do not add a n
 
 ## Milestones
 
-- [ ] **M1 — Shared selection seam.** Extract the account-selection rule (status ok; default or in
+- [x] **M1 — Shared selection seam.** Extract the account-selection rule (status ok; default or in
   `sidebar_token_ids`; `showLabel = len(readable) > 1`) out of `boardRateLimitStrip()` into a shared
   `tuiModel` helper that returns **both** the shown tokens **and** the `showLabel` bool, with the
   board refactored to consume it and its existing tests still green (no behaviour change on the
   board). A test pins that board and detail derive the **same set and the same `showLabel`** from
   one fixture.
-- [ ] **M2 — Rail-width stacked account block in the detail view.** Render the selected accounts,
+- [x] **M2 — Rail-width stacked account block in the detail view.** Render the selected accounts,
   vertically stacked at rail width, directly under the milestone block in both `renderLaneRail`
   branches, reusing `rateWindowCell`. Cap the block by **reading** `transcriptViewport()` (minus the
   roster + milestone rows already drawn) so it drops whole account lines cleanly rather than
   rendering a half-cut row; **do not modify `transcriptViewport()`**.
-- [ ] **M3 — Tests.** Drive the detail view through the model with seeded `rateLimits` +
+- [x] **M3 — Tests.** Drive the detail view through the model with seeded `rateLimits` +
   `sidebarTokenIds` and assert: a `status != "ok"` token is dropped; default + a listed token both
   show; an unlisted non-default token is hidden; the label appears only when `len(readable) > 1`;
   the nil window renders `-`; `NO_COLOR` keeps the `NN%` text in the **detail** block; empty
   selection renders no block and no stray blank line; and an over-full rail truncates the block at a
   whole-row boundary (never mid-row). Fold a hostile token `Label` into the existing
   control-byte-stripping detail test. Mirror the board patterns in `api/cmd/uzi/tui_ratelimit_test.go`.
-- [ ] **M4 — Demo + screenshot regen (worker-verifiable).** Extend the demo detail fixture so
+- [x] **M4 — Demo + screenshot regen (worker-verifiable).** Extend the demo detail fixture so
   `uzi tui --demo` shows the account block on a run's detail view (the demo client already seeds
   `SelfMeters` + `SidebarTokenIds` for the board — reuse them), and regenerate the uxlab screenshots
   (`uxlab_gen_test.go`). This milestone is the worker's gate; the **tui-ux legibility review** of the
