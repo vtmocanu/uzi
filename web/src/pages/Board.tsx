@@ -59,6 +59,7 @@ import { prefs } from "../lib/prefs";
 import { Alert, Badge, Button, Card, cx, Field, Input, PageHeader, SectionTitle, Select, Skeleton, Textarea } from "../components/ui";
 import { FixCiButton, PipelineBadge } from "../components/PipelineBadge";
 import { MrChip } from "../components/MrChip";
+import { RunIssueRef } from "../components/RunIssueRef";
 import { forgePlatform } from "../lib/forgeNoun";
 import { ExternalLinkIcon, GripVerticalIcon, PlusIcon, XIcon } from "../components/icons";
 import { useAuth } from "../auth/AuthContext";
@@ -1215,9 +1216,16 @@ export function Board() {
             <Link
               key={r.id}
               to={`/runs/${r.id}`}
-              className="rounded-md border border-warn/40 px-1.5 py-0.5 text-warn transition-colors hover:bg-warn/20"
+              className="inline-flex items-center gap-1 rounded-md border border-warn/40 px-1.5 py-0.5 text-warn transition-colors hover:bg-warn/20"
             >
-              #{r.issue_iid} →
+              <RunIssueRef
+                issueIid={r.issue_iid}
+                issueWebUrl={r.issue_web_url}
+                kind={r.kind}
+                forgeType={r.forge_type}
+                inCardLink
+              />{" "}
+              →
             </Link>
           ))}
         </div>

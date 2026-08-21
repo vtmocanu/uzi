@@ -91,6 +91,9 @@ var runDTOKeys = []string{
 	// non-task run and on a task run not yet dispatched). Always on the wire.
 	"dispatched_at",
 	"mr_iid", "mr_web_url", "mr_state", "failure_reason",
+	// PRD #411: the forge issue's web URL for the run's clickable #<iid> link. Null for
+	// issue-less runs and when the issue is no longer cached. Always on the wire.
+	"issue_web_url",
 	"stop_kind", "health", "health_reason", "health_since", "plan_md",
 	// PRD #209: plan_md's provenance ("agent"|"seeded"), NOT NULL so always on the wire.
 	"plan_source",

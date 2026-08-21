@@ -51,6 +51,7 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
     repo_id: "repo-1",
     forge_type: "gitlab",
     mr_web_url: null,
+    issue_web_url: null,
     kind: "issue",
     issue_iid: 7,
     issue_title: "Live run row",

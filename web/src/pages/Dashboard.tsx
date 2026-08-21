@@ -11,6 +11,7 @@ import { api, isTerminalRun, type AdminUsage, type RunListItem, type SelfUsage, 
 import { hasAnthropicToken } from "../lib/hasToken";
 import { effectiveRunStatus, milestoneBadge, milestoneBadgeText, mrChipState } from "../lib/runBadge";
 import { MrChip } from "../components/MrChip";
+import { RunIssueRef } from "../components/RunIssueRef";
 import { mrAbbrev } from "../lib/forgeNoun";
 import { YourUsageCard, FactoryTotalCard, PerUserUsageTable } from "../components/UsageCards";
 import { RunHealthBadge } from "../components/RunHealthBadge";
@@ -344,8 +345,15 @@ export function Dashboard() {
                   <div className="min-w-0 flex-1">
                     {/* Issue #124: forge-supplied issue title, untrusted (see RunsList). */}
                     <p className="truncate text-sm font-medium text-fg">{stripUnsafeChars(r.issue_title)}</p>
-                    <p className="text-xs text-faint">
-                      {r.repo_path} #{r.issue_iid}
+                    <p className="flex flex-wrap items-center gap-x-1 text-xs text-faint">
+                      {r.repo_path}{" "}
+                      <RunIssueRef
+                        issueIid={r.issue_iid}
+                        issueWebUrl={r.issue_web_url}
+                        kind={r.kind}
+                        forgeType={r.forge_type}
+                        inCardLink
+                      />
                       {r.mr_iid != null && (
                         <MrChip
                           variant="inline"

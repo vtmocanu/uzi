@@ -884,6 +884,9 @@ export interface LastFireStarted {
   issue_iid: number | null;
   run_id: string;
   title: string;
+  // Forge issue URL snapshotted at fire time (PRD #411). Optional + nullable so pre-#411
+  // persisted fires and existing mock entries degrade gracefully to a plain number.
+  web_url?: string | null;
 }
 
 // One candidate a persisted fire considered but started nothing for, with its typed
@@ -892,6 +895,9 @@ export interface LastFireSkip {
   issue_iid: number | null;
   title: string;
   reason: ScheduleSkipReason;
+  // Forge issue URL snapshotted at fire time (PRD #411). Optional + nullable so pre-#411
+  // persisted fires and existing mock entries degrade gracefully to a plain number.
+  web_url?: string | null;
 }
 
 // The structured summary of a schedule's most recent persisted fire (PRD #308). matched
@@ -1271,6 +1277,9 @@ export interface Run {
    *  null on runs created before it landed. Rendered directly through isHttpsUrl; a
    *  null falls back to the legacy GitLab reconstruction (forgeUrls.ts). */
   mr_web_url: string | null;
+  /** Forge-supplied issue web URL (PRD #411), null for issue-less runs or when the
+   *  issue is no longer cached. Rendered through isHttpsUrl into the #<iid> link. */
+  issue_web_url: string | null;
   /** Last MR state the PRD #24 watcher observed for mr_iid
    *  (opened|closed|merged|locked), null when never observed. Display-only hint
    *  (PRD #33); frozen per run, so a superseded run's value can be stale. */

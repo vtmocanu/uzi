@@ -1354,20 +1354,24 @@ func TestTickParkDoesNotPersistLastFire(t *testing.T) {
 func TestMarshalLastFire(t *testing.T) {
 	iid := int64(7)
 	runID := uuid.New()
+	const startedURL = "https://forge/x/-/issues/7"
 	out := FireOutcome{
 		Matched: 2,
 		Capped:  true,
-		Started: []Started{{IssueIID: &iid, RunID: runID, Title: "Do it"}},
-		Skips:   []Skip{{IssueIID: nil, Title: "prompt", Reason: SkipAlreadyRunning}},
+		// PRD #411 M3: a fetched issue's Started carries the snapshotted web_url; a
+		// pre-fetch skip (here the prompt-style Skip) carries an empty URL.
+		Started: []Started{{IssueIID: &iid, RunID: runID, Title: "Do it", WebURL: startedURL}},
+		Skips:   []Skip{{IssueIID: nil, Title: "prompt", Reason: SkipAlreadyRunning, WebURL: ""}},
 	}
 	firedAt := time.Date(2026, 8, 12, 9, 0, 0, 0, time.UTC)
 	raw, err := marshalLastFire(out, firedAt)
 	if err != nil {
 		t.Fatalf("marshalLastFire err = %v", err)
 	}
-	// Assert the exact tag keys are present (the persisted contract).
+	// Assert the exact tag keys are present (the persisted contract). web_url is the
+	// PRD #411 M3 addition to both started and skip rows.
 	for _, key := range []string{`"fired_at"`, `"matched"`, `"capped"`, `"started"`, `"skips"`,
-		`"issue_iid"`, `"run_id"`, `"title"`, `"reason"`} {
+		`"issue_iid"`, `"run_id"`, `"title"`, `"reason"`, `"web_url"`} {
 		if !strings.Contains(string(raw), key) {
 			t.Fatalf("last_fire JSON missing key %s, got %s", key, raw)
 		}
@@ -1385,8 +1389,17 @@ func TestMarshalLastFire(t *testing.T) {
 	if rec.Started[0].IssueIID == nil || *rec.Started[0].IssueIID != 7 {
 		t.Fatalf("started issue_iid = %v, want 7", rec.Started[0].IssueIID)
 	}
+	// PRD #411 M3: the started row round-trips its snapshotted web_url. Non-vacuity:
+	// flip startedURL to a wrong string and this fails.
+	if rec.Started[0].WebURL != startedURL {
+		t.Fatalf("started web_url = %q, want %q", rec.Started[0].WebURL, startedURL)
+	}
 	if len(rec.Skips) != 1 || rec.Skips[0].Reason != string(SkipAlreadyRunning) || rec.Skips[0].IssueIID != nil {
 		t.Fatalf("skip = %+v, want already_running / nil iid", rec.Skips)
+	}
+	// PRD #411 M3: a pre-fetch skip carries NO web_url (degrades to a plain #<iid>).
+	if rec.Skips[0].WebURL != "" {
+		t.Fatalf("skip web_url = %q, want empty (pre-fetch skip has no snapshotted URL)", rec.Skips[0].WebURL)
 	}
 
 	// The empty-outcome case: non-nil [] arrays, not null.
@@ -1397,6 +1410,75 @@ func TestMarshalLastFire(t *testing.T) {
 	if !strings.Contains(string(rawEmpty), `"started":[]`) || !strings.Contains(string(rawEmpty), `"skips":[]`) {
 		t.Fatalf("empty outcome must encode [] not null, got %s", rawEmpty)
 	}
+}
+
+// TestTickWebURLPresentIffFetched pins PRD #411 M3's core invariant end-to-end through the
+// persisted last_fire jsonb: a fire that FETCHES the issue snapshots its web_url onto the
+// started row, and a fire whose pre-fetch active-run skip fires BEFORE GetIssue carries NO
+// url (a #<iid> that degrades to a plain number). Both cases drive the real tick path
+// (Boot → fireIssue → advance → marshalLastFire) and read the captured AdvanceSchedule
+// bytes, so this covers the snapshot wiring, not just marshalLastFire's projection.
+func TestTickWebURLPresentIffFetched(t *testing.T) {
+	const url = "https://forge.e2e/-/issues/7"
+
+	// Positive: a successful issue fire fetches the issue (fakeForge.GetIssue returns
+	// h.fb.f.issue) and snapshots its WebURL onto the persisted started row.
+	t.Run("fetched_started_carries_url", func(t *testing.T) {
+		h := newHarness()
+		h.fb.f.issue.Title = "Ship it"
+		h.fb.f.issue.WebURL = url
+		h.st.due = []store.RunSchedule{h.issueSchedule()} // auto-approve issue, success
+
+		h.sched.Boot(context.Background())
+
+		if len(h.st.advanceCalls) != 1 {
+			t.Fatalf("success fire must advance once, got %d", len(h.st.advanceCalls))
+		}
+		var rec lastFireRecord
+		if err := json.Unmarshal(h.st.advanceCalls[0].LastFire, &rec); err != nil {
+			t.Fatalf("last_fire not valid JSON: %v", err)
+		}
+		if len(rec.Started) != 1 {
+			t.Fatalf("last_fire = %+v, want one started row", rec)
+		}
+		// Non-vacuity: a bug that dropped issue.WebURL on the createIssueRun path (or a
+		// wrong field) leaves this empty and fails here.
+		if rec.Started[0].WebURL != url {
+			t.Fatalf("started web_url = %q, want the fetched issue URL %q", rec.Started[0].WebURL, url)
+		}
+	})
+
+	// Paired negative: the issue already has an active run, so the pre-check skip fires
+	// BEFORE GetIssue is ever called (fireIssue returns already_running without fetching).
+	// The benign skip still advances, so a last_fire is persisted — and its skip row must
+	// carry an EMPTY web_url even though the (unfetched) fake issue has one set.
+	t.Run("prefetch_skip_carries_no_url", func(t *testing.T) {
+		h := newHarness()
+		h.st.activeIssue = true   // prior run live → pre-check already_running skip, no GetIssue
+		h.fb.f.issue.WebURL = url // set but must NOT leak: the fetch never happens
+		h.st.due = []store.RunSchedule{h.issueSchedule()}
+
+		h.sched.Boot(context.Background())
+
+		if len(h.st.advanceCalls) != 1 {
+			t.Fatalf("benign skip must still advance once, got %d", len(h.st.advanceCalls))
+		}
+		var rec lastFireRecord
+		if err := json.Unmarshal(h.st.advanceCalls[0].LastFire, &rec); err != nil {
+			t.Fatalf("last_fire not valid JSON: %v", err)
+		}
+		if len(rec.Skips) != 1 || rec.Skips[0].Reason != string(SkipAlreadyRunning) {
+			t.Fatalf("last_fire = %+v, want one already_running skip", rec)
+		}
+		// The invariant: a pre-fetch skip carries no snapshotted URL. Confirm GetIssue was
+		// never called, so "empty" is genuinely "unfetched" and not a fetch that returned "".
+		if len(h.fb.f.getIID) != 0 {
+			t.Fatalf("pre-check skip must NOT fetch the issue, GetIssue called for %v", h.fb.f.getIID)
+		}
+		if rec.Skips[0].WebURL != "" {
+			t.Fatalf("pre-fetch skip web_url = %q, want empty (issue never fetched)", rec.Skips[0].WebURL)
+		}
+	})
 }
 
 // ── Guidance composition (PRD #274 M3) ───────────────────────────────────────

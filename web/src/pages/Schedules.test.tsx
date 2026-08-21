@@ -3,7 +3,7 @@
 // Schedules list page (PRD #241 M5, mock §1): rows render per target/timing, and the
 // per-row enable toggle PATCHes { enabled } and adopts the server's returned row.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { Schedules } from "./Schedules";
 import { api, type LastFire, type Schedule } from "../lib/api";
@@ -213,6 +213,79 @@ describe("Schedules — fire outcomes (PRD #308 M4)", () => {
     only1({ status: "error", last_fired_at: null, last_fire: null });
     renderPage();
     await waitFor(() => expect(screen.getByText("— never fired")).toBeTruthy());
+  });
+});
+
+// ── PRD #411 M3: forge issue links on fire rows ────────────────────────────────
+const ISSUE_URL = "https://gitlab.example.com/vtmocanu/uzi/-/issues/26";
+
+describe("Schedules — issue links on fire rows (PRD #411)", () => {
+  it("started row with a valid https web_url renders an external forge anchor for #26", async () => {
+    only1({
+      target: "issue",
+      issue_iid: 26,
+      last_fire: fire({
+        matched: 1,
+        started: [
+          {
+            issue_iid: 26,
+            run_id: "26262626-0000-0000-0000-000000000000",
+            title: "Clickable issue links",
+            web_url: ISSUE_URL,
+          },
+        ],
+      }),
+    });
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Last fire" }));
+    // The forge anchor is distinct from the row's "run <id>" link (matched by name).
+    const link = screen.getByRole("link", { name: /Open issue #26/ });
+    expect(link.getAttribute("href")).toBe(ISSUE_URL);
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toBe("noreferrer");
+  });
+
+  it("paired negative on the SAME #26 wording: a started row with no web_url renders plain #26, no forge anchor", async () => {
+    only1({
+      target: "issue",
+      issue_iid: 26,
+      last_fire: fire({
+        matched: 1,
+        started: [
+          {
+            issue_iid: 26,
+            run_id: "26262626-0000-0000-0000-000000000000",
+            title: "Clickable issue links",
+            web_url: null,
+          },
+        ],
+      }),
+    });
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Last fire" }));
+    // Scope to the fire row (the schedule's target cell also shows a #26).
+    const row = screen.getByText("Clickable issue links").closest<HTMLElement>("div.rounded-lg")!;
+    // No forge anchor for the issue...
+    expect(within(row).queryByRole("link", { name: /Open issue/ })).toBeNull();
+    // ...but the SAME #26 wording renders as plain text in the fire row.
+    expect(within(row).getByText("#26")).toBeTruthy();
+  });
+
+  it("a fire row with a null issue_iid renders the 'prompt' marker, not an anchor", async () => {
+    only1({
+      target: "sweep",
+      max_issues: 5,
+      last_fire: fire({
+        matched: 1,
+        skips: [{ issue_iid: null, title: "pinned-issue candidate", reason: "no_prd_link", web_url: null }],
+      }),
+    });
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Last fire" }));
+    // Scope to the skip row (the target legend also shows a "prompt" badge).
+    const row = screen.getByText("pinned-issue candidate").closest<HTMLElement>("div.rounded-lg")!;
+    expect(within(row).getByText("prompt")).toBeTruthy();
+    expect(within(row).queryByRole("link")).toBeNull();
   });
 });
 

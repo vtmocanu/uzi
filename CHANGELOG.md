@@ -6,6 +6,14 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Added
+
+- **Clickable issue links on runs ([#411](https://github.com/vtmocanu/uzi/issues/411)).**
+  A run's originating forge issue number now links to the issue on the forge — from the
+  runs list, run detail, dashboard, the board's needs-attention strip, and a schedule's
+  Last fire panel — opening in a new tab, same as the existing Open MR button. Runs with
+  no issue (task, CI-fix, prompt) show a muted kind chip instead of a dead link.
+
 ## [0.49.0] - 2026-08-20
 <!-- release-title: CLI contexts, in-app changelog, workflow-scope run recovery -->
 

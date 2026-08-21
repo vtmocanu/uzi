@@ -73,6 +73,7 @@ function runFixture(over: Partial<Run> = {}): Run {
     override_subagent_model: false,
     mr_iid: null,
     mr_web_url: null,
+    issue_web_url: null,
     mr_state: null,
     failure_reason: null,
     stop_kind: null,
