@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { prefs, summaryCollapse } from "./prefs";
+import { prefs, selectedForge, summaryCollapse } from "./prefs";
 
 // This jsdom build does not expose window.localStorage (Node warns "localStorage
 // is not available because --localstorage-file was not provided"), so back it with
@@ -117,5 +117,40 @@ describe("summaryCollapse (PRD #362 Decision 9)", () => {
     window.localStorage.setItem("uzi.summaryCollapse", "{not json");
     expect(() => summaryCollapse.getCollapsed("run-1")).not.toThrow();
     expect(summaryCollapse.getCollapsed("run-1")).toBe(false);
+  });
+});
+
+// Issue #578: the last-selected Boards forge connection. A single scalar with a 7-day TTL,
+// so an expired entry simply reads as null (no GC loop). The expiry is exercised via the
+// injected `now` param rather than the system clock.
+describe("selectedForge (issue #578)", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const t0 = 1_700_000_000_000;
+
+  it("round-trips a selected connection id", () => {
+    selectedForge.set("conn-2");
+    expect(selectedForge.get()).toBe("conn-2");
+  });
+
+  it("returns null when nothing is stored", () => {
+    expect(selectedForge.get()).toBeNull();
+  });
+
+  it("expires after 7 days, and a fresh set is readable at that time", () => {
+    selectedForge.set("conn-2", t0);
+    expect(selectedForge.get(t0 + 8 * DAY)).toBeNull(); // expired → null
+    selectedForge.set("conn-3", t0 + 8 * DAY);
+    expect(selectedForge.get(t0 + 8 * DAY)).toBe("conn-3");
+  });
+
+  it("keeps an entry that is exactly under the 7-day boundary", () => {
+    selectedForge.set("conn-2", t0);
+    expect(selectedForge.get(t0 + 7 * DAY - 1)).toBe("conn-2");
+  });
+
+  it("returns null when the stored value is corrupt, without throwing", () => {
+    window.localStorage.setItem("uzi.selectedForge", "{not json");
+    expect(() => selectedForge.get()).not.toThrow();
+    expect(selectedForge.get()).toBeNull();
   });
 });

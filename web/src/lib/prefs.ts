@@ -84,3 +84,35 @@ export const summaryCollapse = {
     prefs.set(SUMMARY_COLLAPSE_KEY, pruned);
   },
 };
+
+// Issue #578: remember the last-selected Boards forge connection so a returning user lands
+// back on it. Unlike summaryCollapse this is a SINGLE scalar (the chosen connection id),
+// not a keyed map, so there is no GC loop — an entry past its 7-day TTL simply reads as
+// null and the next set overwrites it.
+const SELECTED_FORGE_KEY = "uzi.selectedForge";
+const SELECTED_FORGE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+interface SelectedForgeEntry {
+  id: string;
+  savedAt: number;
+}
+
+export const selectedForge = {
+  // get returns the remembered connection id, or null when unset, expired, or malformed.
+  get(now: number = Date.now()): string | null {
+    const entry = prefs.get<SelectedForgeEntry | null>(SELECTED_FORGE_KEY, null);
+    if (
+      entry != null &&
+      typeof entry.id === "string" &&
+      typeof entry.savedAt === "number" &&
+      now - entry.savedAt < SELECTED_FORGE_TTL_MS
+    ) {
+      return entry.id;
+    }
+    return null;
+  },
+  // set records the chosen connection id with a fresh savedAt.
+  set(id: string, now: number = Date.now()): void {
+    prefs.set<SelectedForgeEntry>(SELECTED_FORGE_KEY, { id, savedAt: now });
+  },
+};
