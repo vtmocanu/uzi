@@ -419,6 +419,7 @@ type Run struct {
 	RequiredTools         []string           `json:"required_tools"`
 	SizeClass             string             `json:"size_class"`
 	Interactive           bool               `json:"interactive"`
+	OpenFollowupID        pgtype.Int8        `json:"open_followup_id"`
 }
 
 type RunMessage struct {

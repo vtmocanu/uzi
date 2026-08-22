@@ -610,6 +610,110 @@ func TestSetRunRunningAwaitingFollowupWakeGuardLiveDB(t *testing.T) {
 	}
 }
 
+// Issue #552 M1: the DISCRIMINATING cycle-≥2 scenario the bare "any consumed follow_up"
+// guard could not distinguish. The wake guard now keys on runs.open_followup_id, a
+// watermark of the highest already-consumed follow_up stamped at each park, so a STALE
+// pre-park `running` report on a run that has already iterated (an earlier follow_up
+// consumed) must be REFUSED — it carries no follow_up NEWER than the watermark. Step (c)
+// is the teeth: on the UNPATCHED guard (`AND consumed_at IS NOT NULL`, no id comparison)
+// it returns 1 (the run un-parks); with the watermark it returns 0.
+func TestSetRunRunningAwaitingFollowupWatermarkDiscriminatesLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	f, done := setupFollowup(ctx, t, dsn)
+	defer done()
+
+	wkr := f.seedWorker(ctx, t, "online", pgtype.Int4{}, false)
+	run := f.seedInteractiveTaskRun(ctx, t, "running", &wkr)
+
+	park := func() {
+		t.Helper()
+		rows, err := f.q.SetRunAwaitingFollowup(ctx, store.SetRunAwaitingFollowupParams{
+			ID: run, WorkerID: pgU(wkr),
+		})
+		if err != nil || rows != 1 {
+			t.Fatalf("SetRunAwaitingFollowup: rows=%d err=%v", rows, err)
+		}
+	}
+	resume := func() int64 {
+		t.Helper()
+		rows, err := f.q.SetRunRunning(ctx, store.SetRunRunningParams{
+			ID: run, WorkerID: pgU(wkr), IterationCount: 1,
+		})
+		if err != nil {
+			t.Fatalf("SetRunRunning: %v", err)
+		}
+		return rows
+	}
+	createFollowup := func() int64 {
+		t.Helper()
+		in, err := f.q.CreateRunInput(ctx, store.CreateRunInputParams{
+			RunID: run, Kind: "follow_up", Body: pgT(`{"body":"steer"}`),
+		})
+		if err != nil {
+			t.Fatalf("CreateRunInput(follow_up): %v", err)
+		}
+		return in.ID
+	}
+	watermark := func() int64 {
+		t.Helper()
+		got, err := f.q.GetRunByID(ctx, run)
+		if err != nil {
+			t.Fatalf("GetRunByID: %v", err)
+		}
+		return got.OpenFollowupID.Int64 // Int64 is 0 when NULL, matching the guard's COALESCE
+	}
+
+	// (1) First park: nothing consumed yet ⇒ watermark 0.
+	park()
+	if w := watermark(); w != 0 {
+		t.Fatalf("watermark after first park = %d, want 0", w)
+	}
+
+	// (2) Follow_up #1 arrives, is consumed, and wakes the park (cycle 1).
+	id1 := createFollowup()
+	if _, err := f.q.ConsumeRunInputs(ctx, run); err != nil {
+		t.Fatalf("ConsumeRunInputs #1: %v", err)
+	}
+	if rows := resume(); rows != 1 {
+		t.Fatalf("follow_up #1 did not wake the park (%d rows)", rows)
+	}
+
+	// (3) Re-park: the watermark now advances to id1 (the follow_up just spent).
+	park()
+	if w := watermark(); w != id1 {
+		t.Fatalf("watermark after re-park = %d, want id1=%d — the re-park did not recompute", w, id1)
+	}
+
+	// (4) THE TEETH: a stale pre-park `running` report, with follow_up #1 still the newest
+	//     consumed follow_up, is REFUSED. This returns 1 on the unpatched guard.
+	if rows := resume(); rows != 0 {
+		t.Fatalf("a stale pre-park report un-parked the run at cycle ≥2 (%d rows) — the open_followup_id "+
+			"watermark is not discriminating THIS park's follow_up from any-ever-consumed", rows)
+	}
+	if got := f.status(ctx, t, run); got != "awaiting_followup" {
+		t.Fatalf("status = %q after the refused report, want awaiting_followup (the park must hold)", got)
+	}
+
+	// (5) A genuinely NEW follow_up (#2, id2 > id1) still wakes the park.
+	id2 := createFollowup()
+	if id2 <= id1 {
+		t.Fatalf("follow_up #2 id=%d not > #1 id=%d — run_user_inputs.id is not monotone as assumed", id2, id1)
+	}
+	if _, err := f.q.ConsumeRunInputs(ctx, run); err != nil {
+		t.Fatalf("ConsumeRunInputs #2: %v", err)
+	}
+	if rows := resume(); rows != 1 {
+		t.Fatalf("a genuinely new follow_up (#2) did not wake the park (%d rows) — the watermark is too strict", rows)
+	}
+	if got := f.status(ctx, t, run); got != "running" {
+		t.Fatalf("status = %q after new follow_up wake, want running", got)
+	}
+}
+
 // The park WRITER itself (SetRunAwaitingFollowup): status write, the load-bearing health
 // clear (what makes leaving awaiting_followup out of ListActiveRunsForHealth safe, exactly
 // as on awaiting_input), and the ownership + terminality guards. sqlc's type deduction is
@@ -652,6 +756,13 @@ func TestSetRunAwaitingFollowupLiveDB(t *testing.T) {
 	if got.Health != "ok" || got.HealthReason.Valid || got.HealthSince.Valid {
 		t.Fatalf("health not cleared on entry: health=%q reason=%v since=%v — the ListActiveRunsForHealth "+
 			"omission depends on this", got.Health, got.HealthReason, got.HealthSince)
+	}
+	// Issue #552 M1: the park stamps open_followup_id to the highest ALREADY-consumed
+	// follow_up. This run never consumed one, so the watermark is 0 (COALESCE floor), not
+	// NULL — SetRunAwaitingFollowup writes the subquery result, and MAX over no rows is 0.
+	if !got.OpenFollowupID.Valid || got.OpenFollowupID.Int64 != 0 {
+		t.Fatalf("open_followup_id after first park = %v (valid=%v), want 0 — the watermark was not stamped",
+			got.OpenFollowupID.Int64, got.OpenFollowupID.Valid)
 	}
 
 	// Foreign worker cannot park it.

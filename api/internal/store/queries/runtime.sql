@@ -970,24 +970,35 @@ WHERE runs.id = @id AND worker_id = @worker_id
   -- a single `status NOT IN (...) OR kind IN (...)`: that would let a consumed `answer`
   -- satisfy the FOLLOWUP gate (and vice-versa), re-opening #44 F2 sideways.
   --
-  -- Unlike awaiting_input this clause is NOT keyed on a per-park identity: PRD #517 M1
-  -- added no follow_up analog of open_question_id, so the tie is "a follow_up was
-  -- consumed" rather than "THIS follow_up was consumed". The residual — on a run that
-  -- has already iterated (cycle ≥2, an earlier follow_up consumed) this clause finds a
-  -- consumed follow_up and degrades to a no-op, so a stale pre-park `running` report is
-  -- admitted — is NOT bounded by idempotency: when it bites the run is re-parked at
-  -- awaiting_followup (idle in the follow-up waiter), so admitting `running` is a real
+  -- Like awaiting_input this clause IS now keyed on a per-park identity (issue #552 M1):
+  -- runs.open_followup_id, a WATERMARK of the highest follow_up the run had already
+  -- consumed at the moment it parked. The tie is therefore "a follow_up NEWER than the
+  -- watermark was consumed" — i.e. THIS park's follow_up — not "any follow_up was ever
+  -- consumed". Without it, on a run that has already iterated (cycle ≥2, an earlier
+  -- follow_up consumed) the bare EXISTS always found a consumed follow_up and degraded
+  -- to a no-op, so a stale pre-park `running` report un-parked an idle run: a real
   -- awaiting_followup→running STATE CHANGE (the health CASE arms fire their ELSE branch),
-  -- not a mid-turn heartbeat. What actually bounds it is the outer `worker_id = @worker_id`
-  -- pin — the same pin the in-process park already relies on: the admitted report is a
-  -- stale SAME-worker pre-park `running`, and a report from any other worker is rejected
-  -- by that pin regardless of this clause. Narrow it to a park-scoped follow_up identity
-  -- if M3+ adds one.
+  -- re-arming the wall clock on a task sitting in the follow-up waiter.
+  --
+  -- runs.open_followup_id reads the OLD (pre-update) row here — Postgres evaluates the
+  -- WHERE, and every SET right-hand side, against the pre-update tuple — exactly as
+  -- runs.open_question_id does in the awaiting_input guard above. A NULL watermark (a run
+  -- that never parked, or a first park with nothing consumed) COALESCEs to 0, so any
+  -- consumed follow_up clears it: fail-open only in the one case where any consumed
+  -- follow_up genuinely IS new.
+  --
+  -- No clear-on-wake is needed, and a future reader must NOT "add the missing sibling
+  -- clear" the way open_question_id needs one. The watermark keys on CONSUMED-only rows
+  -- and is RECOMPUTED at each park (SetRunAwaitingFollowup) to the max already-consumed
+  -- follow_up: the follow_up that wakes a park is unconsumed until it wakes, so it never
+  -- counts toward the watermark that guards its own park, and the next park's recompute
+  -- rolls the watermark forward to include it. There is nothing to reset between parks.
   AND (status <> 'awaiting_followup' OR EXISTS (
         SELECT 1 FROM run_user_inputs
         WHERE run_user_inputs.run_id = @id
           AND run_user_inputs.kind = 'follow_up'
-          AND run_user_inputs.consumed_at IS NOT NULL));
+          AND run_user_inputs.consumed_at IS NOT NULL
+          AND run_user_inputs.id > COALESCE(runs.open_followup_id, 0)));
 
 -- name: SetRunAwaitingApproval :execrows
 UPDATE runs SET
@@ -1355,6 +1366,19 @@ WHERE id = @id AND worker_id = @worker_id
 UPDATE runs SET
     status     = 'awaiting_followup',
     session_id = COALESCE(sqlc.narg('session_id'), session_id),
+    -- Issue #552 M1: the park-scoped follow_up watermark. Stamp it, at EVERY park, to
+    -- the highest follow_up this run has ALREADY consumed. A later follow_up with a
+    -- higher id — the one the resuming worker will consume to wake THIS park — is what
+    -- SetRunRunning's Decision-7 guard requires to admit awaiting_followup → running,
+    -- so it discriminates "THIS park's follow_up" from "any follow_up ever consumed".
+    --
+    -- CONSUMED-only (consumed_at IS NOT NULL) is load-bearing: the follow_up that wakes
+    -- a park is UNCONSUMED until it wakes, so a consumed-only MAX never advances past
+    -- it. That makes recomputing the watermark at every re-park correct with NO claim
+    -- re-delivery, NO worker echo and NO clear-on-wake — the watermark simply names the
+    -- last follow_up already spent, and anything newer is a genuine new steer.
+    open_followup_id = (SELECT COALESCE(MAX(id), 0) FROM run_user_inputs
+                        WHERE run_id = @id AND kind = 'follow_up' AND consumed_at IS NOT NULL),
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND worker_id = @worker_id

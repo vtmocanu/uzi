@@ -21917,8 +21917,11 @@ rationale in the Decision Log of `prds/done/517-interactive-task-runs.md`. <!-- 
   Decision-7 WAKE GUARD on `SetRunRunning`: the `awaiting_followup`→`running` transition is
   admitted only when a CONSUMED `follow_up` input exists, as a third independent clause beside
   the `answer` gate — so a stale/duplicate pre-park `running` report cannot un-park an idle task
-  and re-arm the wall clock. It is not keyed on a per-park identity (M1 added no `follow_up`
-  analog of `open_question_id`); the residual is bounded by the outer `worker_id` pin.
+  and re-arm the wall clock. It is now keyed on a per-park identity (issue #552): `runs.open_followup_id`,
+  a watermark of the highest already-CONSUMED `follow_up` id, recomputed at each park by
+  `SetRunAwaitingFollowup`, so the wake requires a consumed `follow_up` NEWER than the watermark —
+  a stale pre-park `running` report on a run that has already iterated (cycle ≥2) can no longer un-park
+  an idle run.
 
 - **`run stop` = a new `stop` steering-input kind, not a cancel.** Owner-scoped via `SubmitInput`,
   written by `CreateStopVerdictInput` which stamps `stop_kind='stopped'` in the SAME statement as
