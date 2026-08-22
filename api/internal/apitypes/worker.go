@@ -48,7 +48,12 @@ type WorkerDTO struct {
 	// OnlineSince is the api-owned anchor of when the worker became online (PRD #251);
 	// null when offline or never online. Uptime is derived client-side as now − online_since.
 	OnlineSince *time.Time `json:"online_since"`
-	CreatedAt   time.Time  `json:"created_at"`
+	// DrainingSince is set (to when it was cordoned) while a hosted worker is
+	// draining/cordoned: it finishes its in-flight runs but claims nothing new
+	// (PRD #422/#496). null for a worker that will claim normally. Hosted-only by
+	// construction — every non-null write is WHERE kind='hosted'.
+	DrainingSince *time.Time `json:"draining_since"`
+	CreatedAt     time.Time  `json:"created_at"`
 	// Derived upgrade health (PRD #113): "up_to_date" | "outdated" | "unknown" |
 	// "upgrading" | "upgrade_failed". Computed at read time from Version against the
 	// control plane's release — never stored, so it cannot go stale against the row

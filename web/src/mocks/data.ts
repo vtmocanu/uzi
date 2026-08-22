@@ -1813,6 +1813,7 @@ export const mockWorkers: Worker[] = [
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
+    draining_since: null,
   },
   {
     // Declared jvm at issuance but the running image is base → drift badge demo.
@@ -1844,6 +1845,7 @@ export const mockWorkers: Worker[] = [
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
+    draining_since: null,
   },
   {
     // PRD #113 M5: the FAILED upgrade. Present so the demo can show the failed-worker
@@ -1891,6 +1893,7 @@ export const mockWorkers: Worker[] = [
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
+    draining_since: null,
   },
   {
     // Un-quota'd / cgroup-v1 host → process fallback: no known limit (absolute mem,
@@ -1922,6 +1925,7 @@ export const mockWorkers: Worker[] = [
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
+    draining_since: null,
   },
   {
     // A hosted worker (PRD #58): the controller runs this one in the cluster. Seeded
@@ -1961,6 +1965,75 @@ export const mockWorkers: Worker[] = [
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
+    draining_since: null,
+  },
+  {
+    // The #365 scenario (PRD #496): online, one free slot (1/2), cordoned for a roll
+    // (so also `outdated`), so it claims nothing new. It shows the `draining` label
+    // beside the amber outdated badge — demonstrating the pill is visually distinct
+    // (dashed neutral, not solid amber) and keyed on draining_since, NOT upgrade_status.
+    id: "w-cordon-eu",
+    name: "base.m-9f3c",
+    status: "online",
+    kind: "hosted",
+    hosted_size: "m",
+    docker: true,
+    capabilities: ["docker"],
+    busy: true,
+    active_runs: 1,
+    max_concurrent_runs: 2,
+    template_declared: "base",
+    template_reported: "base",
+    version: "0.4.1",
+    upgrade_status: "outdated",
+    upgrade_detail: "running 0.4.1, target 0.4.2",
+    upgrade_target: "0.4.2",
+    upgrade_blocking_container: null,
+    upgrade_blocking_reason: null,
+    upgrade_last_exit_code: null,
+    last_heartbeat_at: minsAgo(0.3),
+    online_since: minsAgo(48),
+    created_at: daysAgo(4),
+    stats_cpu_pct: 21.5,
+    stats_mem_bytes: 1181116006, // 1.1 GiB
+    stats_mem_limit_bytes: 4294967296, // 4 GiB → ~27%
+    stats_source: "cgroup",
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
+    anthropic_bind_mode: "default",
+    draining_since: minsAgo(6),
+  },
+  {
+    // An idle cordoned worker (no runs in flight) → shows the `cordoned` label.
+    id: "w-cordon-idle",
+    name: "base.s-4d7a",
+    status: "online",
+    kind: "hosted",
+    hosted_size: "s",
+    docker: false,
+    busy: false,
+    active_runs: 0,
+    max_concurrent_runs: 2,
+    template_declared: "base",
+    template_reported: "base",
+    version: "0.4.2",
+    upgrade_status: "up_to_date",
+    upgrade_detail: null,
+    upgrade_target: "0.4.2",
+    upgrade_blocking_container: null,
+    upgrade_blocking_reason: null,
+    upgrade_last_exit_code: null,
+    last_heartbeat_at: minsAgo(0.5),
+    online_since: minsAgo(90),
+    created_at: daysAgo(5),
+    stats_cpu_pct: 21.5,
+    stats_mem_bytes: 1181116006, // 1.1 GiB
+    stats_mem_limit_bytes: 4294967296, // 4 GiB → ~27%
+    stats_source: "cgroup",
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
+    anthropic_bind_mode: "default",
+    draining_since: minsAgo(20),
   },
 ];
 
@@ -1999,6 +2072,7 @@ export const mockAdminWorkers: AdminWorker[] = [
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
+    draining_since: null,
     owner_email: "mira@uzi.local",
   },
 ];

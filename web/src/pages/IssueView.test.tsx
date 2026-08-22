@@ -378,6 +378,7 @@ describe("IssueView Start gate honors the PRDLESS bypass (PRD #22 B1)", () => {
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
+    draining_since: null,
   });
   const aToken = (): SecretMeta => ({
     id: "sec-1",

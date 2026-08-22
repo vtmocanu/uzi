@@ -16,6 +16,7 @@ place.)
 
 ### Added
 
+- **Draining/cordoned worker signal ([#496](https://github.com/vtmocanu/uzi/pull/496), PRD #496).** The Workers list and `uzi worker list` now show when a hosted worker is draining/cordoned — finishing its current runs but not claiming new ones — so an online worker with a free slot that isn't picking up a queued run reads as an in-progress roll rather than a bug.
 - **Interactive, long-lived task runs (PRD #517, issue [#517](https://github.com/vtmocanu/uzi/issues/517)).**
   `uzi handoff --interactive` keeps a task run alive past a clean `signal_done` instead of
   finalizing it: the run checkpoint-pushes its branch and parks in a new non-terminal

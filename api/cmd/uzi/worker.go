@@ -71,7 +71,7 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 					version = "-"
 				}
 				rows = append(rows, []string{
-					w.ID, cellText(w.Name), w.Status, uptimeCell(w), version, upgradeCell(w), bindModeCell(w),
+					w.ID, cellText(w.Name), statusCell(w), uptimeCell(w), version, upgradeCell(w), bindModeCell(w),
 				})
 			}
 			// VERSION is here because docs/run-auto-stopped.md's first remedy for an
@@ -195,6 +195,33 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 
 	cmd.AddCommand(list, rm, setToken)
 	return cmd
+}
+
+// statusCell annotates the STATUS column for `uzi worker list` so a cordoned/draining
+// worker reads as more than its bare status (PRD #496 M4).
+//
+// It COMPOSES from the raw w.Status and never hardcodes "online": a cordoned worker
+// whose pod dies is swept offline by the sweeper WITHOUT clearing draining_since, so
+// `offline (draining)` is a real, reachable state (Decision 5) — the annotation is a
+// suffix on whatever status the control plane reports, not a replacement for it.
+//
+// The (draining) vs (cordoned) split mirrors the web pill and keys on active_runs, NOT
+// on busy: a chat-only cordoned worker is `busy` with zero in-flight runs and must read
+// `(cordoned)`, so the discriminator is "does it still have runs to finish", i.e.
+// ActiveRuns > 0, not whether it happens to be busy.
+//
+// Like uptimeCell's, every field this reads (Status, DrainingSince, ActiveRuns) is
+// control-plane-owned (Decision 1), so the cell needs no scrub — it is never worker
+// self-reported. The raw draining_since field also rides along in `--json` untouched,
+// so scripting keys off the timestamp rather than parsing this annotation.
+func statusCell(w apitypes.WorkerDTO) string {
+	if w.DrainingSince == nil {
+		return w.Status
+	}
+	if w.ActiveRuns > 0 {
+		return w.Status + " (draining)"
+	}
+	return w.Status + " (cordoned)"
 }
 
 // uptimeCell renders a worker's continuous-online duration for `uzi worker list`'s
