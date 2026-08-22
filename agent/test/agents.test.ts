@@ -273,10 +273,23 @@ describe("issue #581: in-process MCP server wiring for subagents", () => {
     }
   });
 
-  it("never wires the memory or signal servers onto any subagent", () => {
+  it("never wires the memory or signal servers, even when a template names their tools", () => {
     // memory/signal are server-DENIED to every subagent (MEMORY_SERVER_DENY /
-    // SIGNAL_SERVER_DENY); the wiring loop is deliberately limited to forge + findings.
-    const { subagents } = assembleAgents([coder, reviewer, factChecker]);
+    // SIGNAL_SERVER_DENY); the wiring loop is deliberately limited to the hardcoded
+    // [forge, findings] set — it does NOT naively name every `mcp__<server>__` prefix in
+    // the allowlist. A fixture that explicitly lists mcp__memory__* / mcp__uzi__* tools is
+    // what makes this a real guard: widening the loop to derive from those prefixes would
+    // redden it. (Those tools stay non-callable via the server-level deny regardless.)
+    const namesDeniedServers: AgentTemplate = {
+      name: "greedy",
+      description: "names denied servers in its allowlist",
+      prompt_body: "greedy",
+      tools: ["Read", "mcp__memory__save_memory", "mcp__uzi__submit_plan", "mcp__forge__get_issue"],
+    };
+    const { subagents } = assembleAgents([coder, reviewer, factChecker, namesDeniedServers]);
+    // The greedy fixture names memory + signal tools AND a forge tool: forge is wired,
+    // findings is wired (appended tool), memory/signal are NOT — despite being named.
+    assert.deepStrictEqual(subagents.greedy?.mcpServers, [FORGE_SERVER_NAME, FINDINGS_SERVER_NAME]);
     for (const [name, def] of Object.entries(subagents)) {
       if (!def.mcpServers) continue;
       assert.ok(!def.mcpServers.includes(MEMORY_SERVER_NAME), `${name} must not wire the memory server`);
