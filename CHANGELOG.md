@@ -18,10 +18,19 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.53.1] - 2026-08-22
+<!-- release-title: automatic worker-image roll + interactive-task hardening -->
+
 ### Changed
 
 - **Hosted-worker image roll is now automatic at release time.**
-  `scripts/worker-tag-autobump.sh <version>`, run while cutting a release, bumps `deploy/chart/values.yaml` `workers.image.tag` (and the decouple assert's `PINNED_TAG`) to the release version only when the agent image's runtime surface (`agent/src`, agent deps, `agent/templates`, `agent/devbox-global`, `agent/bin`, `agent/tsconfig.json`) changed since the currently-pinned tag, so an app-only release still rolls zero workers (PRD #422) while an agent change rolls the fleet, draining in-flight runs, with no manual tag edit. Applied this cycle, the worker pin moves 0.50.0 to 0.53.0.
+  `scripts/worker-tag-autobump.sh <version>`, run while cutting a release, bumps `deploy/chart/values.yaml` `workers.image.tag` (and the decouple assert's `PINNED_TAG`) to the release version only when the agent image's runtime surface (`agent/src`, agent deps, `agent/templates`, `agent/devbox-global`, `agent/bin`, `agent/tsconfig.json`) changed since the currently-pinned tag, so an app-only release still rolls zero workers (PRD #422) while an agent change rolls the fleet, draining in-flight runs, with no manual tag edit. Applied this cycle, the worker pin is bumped to 0.53.1, so the hosted fleet rolls to the current agent image.
+
+### Fixed
+
+- **Interactive task-run post-ship hardening ([#558](https://github.com/vtmocanu/uzi/pull/558), PRD #517).**
+  Follow-up fixes to the interactive/long-lived task runs shipped in 0.52.0: a wake guard against spurious follow-up wakeups, a stop-on-crash wind-down path so a crashed interactive run finalizes instead of parking forever, `wallScaled` budget handling, and an `awaiting_followup` mock for the web tests.
+<!-- coverage: merge 8b2d60a30 = the #558 hardening described in this bullet (its merge-commit message carries no issue number, so the coverage oracle needs the SHA cited here) -->
 
 ## [0.53.0] - 2026-08-22
 <!-- release-title: GitHub Projects sync kill-switch + per-repo UI, merged-MR state, SDK todo tools -->
@@ -3073,7 +3082,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.53.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.53.1...HEAD
+[0.53.1]: https://github.com/vtmocanu/uzi/compare/v0.53.0...v0.53.1
 [0.53.0]: https://github.com/vtmocanu/uzi/compare/v0.52.0...v0.53.0
 [0.52.0]: https://github.com/vtmocanu/uzi/compare/v0.51.0...v0.52.0
 [0.51.0]: https://github.com/vtmocanu/uzi/compare/v0.50.0...v0.51.0
