@@ -18,6 +18,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **Hosted-worker image roll is now automatic at release time.**
+  `scripts/worker-tag-autobump.sh <version>`, run while cutting a release, bumps `deploy/chart/values.yaml` `workers.image.tag` (and the decouple assert's `PINNED_TAG`) to the release version only when the agent image's runtime surface (`agent/src`, agent deps, `agent/templates`, `agent/devbox-global`, `agent/bin`, `agent/tsconfig.json`) changed since the currently-pinned tag, so an app-only release still rolls zero workers (PRD #422) while an agent change rolls the fleet, draining in-flight runs, with no manual tag edit. Applied this cycle, the worker pin moves 0.50.0 to 0.53.0.
+
 ## [0.53.0] - 2026-08-22
 <!-- release-title: GitHub Projects sync kill-switch + per-repo UI, merged-MR state, SDK todo tools -->
 

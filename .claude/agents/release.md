@@ -154,24 +154,31 @@ section, and GitHub autolinks a bare `#N` there to a uzi PR — so write any cro
 BACKTICKED (`` `k8s #119593` ``), which keeps it plain in the file and unlinked in the Release.
 
 **Worker-image rolls are a separate, deliberate step from an app release (PRD #422) —
-tagging `vX.Y.Z` does NOT, by itself, touch the hosted-worker fleet.** Three distinct
-situations, and which one applies depends on what actually changed:
+tagging `vX.Y.Z` does NOT, by itself, touch the hosted-worker fleet.** As part of cutting
+a release, run **`scripts/worker-tag-autobump.sh <X.Y.Z>`** so the roll decision is made
+for you, automatically and only when warranted. It inspects the agent image's RUNTIME
+surface (`agent/src`, `agent/package*.json`, `agent/tsconfig.json`, `agent/bin`,
+`agent/templates`, `agent/devbox-global`) since the currently-pinned worker tag; it does
+NOT key off the whole build context, because the agent Dockerfile bakes all of uzi's
+source at `/opt/uzi-src` and so the image differs on every release — keying off that would
+roll the fleet every release, the exact churn #422 exists to prevent. `--check <X.Y.Z>` is
+the report-only mode (exit 1 if a bump is owed but not applied) for a pre-tag sanity check.
+Three situations, which the script picks between:
 
-1. **App-only release** (api/web/db/controller change, no worker-image content
-   changed): bump `Chart.version`/`appVersion` and tag `vX.Y.Z` as usual — the normal
-   flow above. `workers.image.tag` in `deploy/chart/values.yaml` is left untouched, so
-   the worker pod-spec hash does not change and the controller rolls **zero** worker
-   pods; any run in flight keeps running on its current worker, uninterrupted. This is
-   the common case and needs no extra step.
-2. **A deliberate worker-image roll** (a new agent image, a worker-side security fix):
-   bump `workers.image.tag` in `deploy/chart/values.yaml` to a new **concrete** version
-   (never a floating tag like `:stable` — the chart's `required` guard rejects a blank
-   value, and a floating tag would never change the pod-spec hash at all), and bump
-   `PINNED_TAG` in `scripts/assert-worker-tag-decoupled.sh` to match, so the offline
-   render assertion keeps asserting the tag operators actually intend. Once that
-   deploys, the controller cordons each busy worker (defers the roll while it has an
-   in-flight run), then rolls it once idle — bounded by `workers.drainDeadline`
-   (chart value, default `24h`).
+1. **App-only release** (api/web/db/controller change, agent runtime surface untouched):
+   the script leaves `workers.image.tag` in `deploy/chart/values.yaml` alone, so the
+   worker pod-spec hash does not change and the controller rolls **zero** worker pods; any
+   run in flight keeps running on its current worker, uninterrupted. The common case; the
+   script prints that it left the tag pinned. Bump `Chart.version`/`appVersion` and tag
+   `vX.Y.Z` as usual.
+2. **A deliberate worker-image roll** (the agent runtime surface changed — a new agent
+   image, an SDK bump, a worker-side fix): the script bumps `workers.image.tag` to
+   `X.Y.Z` (a concrete tag — never floating: the chart's `required` guard rejects a blank
+   value and a floating tag would never change the pod-spec hash) and keeps `PINNED_TAG`
+   in `scripts/assert-worker-tag-decoupled.sh` in lockstep, so `task render:worker-tag-check`
+   keeps passing. Once that chart publishes and ArgoCD syncs, the controller cordons each
+   busy worker (defers the roll while it has an in-flight run), then rolls it once idle —
+   bounded by `workers.drainDeadline` (chart value, default `24h`).
 3. **Force-roll escape hatch** (an emergency — e.g. a worker-image CVE that cannot
    wait on a drain): set `workers.forceRoll: true` in the deploy values for the
    duration of the emergency. The controller then rolls every drifted worker
