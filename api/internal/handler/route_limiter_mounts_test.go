@@ -67,7 +67,9 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 151 as of this commit; it was 150 until PRD #364 M4 added POST
+// 151 as of this commit (issue #534 relocated the four github-project-sync routes
+// from /api/admin/repos/{id}/... to /api/repos/{id}/... — a move, not a count change).
+// It was 150 until PRD #364 M4 added POST
 // /api/admin/repos/{id}/github-project-sync/provision, 149 until PRD #364 M7 added GET
 // /api/admin/repos/{id}/github-project-sync, 147 until PRD #364 M3 added POST and DELETE
 // /api/admin/repos/{id}/github-project-sync, 146 until PRD #66 M9 added GET
@@ -141,15 +143,6 @@ var wantRouteMounts = []routeMount{
 	// PRD #66 M8 (D8): admin per-repo guardrail override revoke — an admin-only,
 	// unscoped-by-id DB write, no forge call → noLimiter.
 	{"DELETE", "/api/admin/repos/{id}/guardrail-override", noLimiter},
-	// PRD #364 M3: admin GitHub Projects v2 Status sync adopt/disable. Admin-only,
-	// path-scoped, manual operations. Adopt does make forge calls, but it is an
-	// infrequent admin action (not a user-spammable proxying route), so it wears no
-	// per-user limiter like the rest of the admin write group → noLimiter.
-	{"DELETE", "/api/admin/repos/{id}/github-project-sync", noLimiter},
-	{"POST", "/api/admin/repos/{id}/github-project-sync", noLimiter},
-	// PRD #364 M4: admin autonomous provisioning (create project + uzi's own Status
-	// field + seed). Infrequent admin action in the same write group → noLimiter.
-	{"POST", "/api/admin/repos/{id}/github-project-sync/provision", noLimiter},
 	{"DELETE", "/api/agent-templates/{id}", noLimiter},
 	{"DELETE", "/api/forge/connections/{id}", noLimiter},
 	{"DELETE", "/api/me/cli-tokens/{id}", noLimiter},
@@ -159,6 +152,11 @@ var wantRouteMounts = []routeMount{
 	// Explicit per-repo remove (PRD #357): owner-scoped DB delete, no forge call →
 	// noLimiter, like the schedule/connection deletes it sits beside.
 	{"DELETE", "/api/repos/{id}", noLimiter},
+	// GitHub Projects v2 sync disable (issue #534, PRD #364 follow-up): relocated
+	// from /admin to the owner-or-admin /repos group (D4). Owner preflight + DB
+	// teardown, no user-spammable forge proxying → noLimiter, like the admin write
+	// group it left.
+	{"DELETE", "/api/repos/{id}/github-project-sync", noLimiter},
 	{"DELETE", "/api/runs/{id}/review/recommendations/{recID}/disposition", noLimiter},
 	// Schedule delete (PRD #241 M4): owner-scoped DB delete, no forge read → noLimiter.
 	{"DELETE", "/api/schedules/{id}", noLimiter},
@@ -177,10 +175,6 @@ var wantRouteMounts = []routeMount{
 	// reads (2 + 2×repos), so it draws from the forge pocket rather than none.
 	{"GET", "/api/admin/guardrail-impact", limForge},
 	{"GET", "/api/admin/rate-limits", noLimiter},
-	// PRD #364 M7: admin GitHub Projects v2 sync health read. A read of the stored
-	// projection (no forge call) in the admin READ group → noLimiter, like its
-	// siblings here.
-	{"GET", "/api/admin/repos/{id}/github-project-sync", noLimiter},
 	{"GET", "/api/admin/runs", noLimiter},
 	{"GET", "/api/admin/selfimprove", noLimiter},
 	{"GET", "/api/admin/settings", noLimiter},
@@ -243,6 +237,10 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/repos/", noLimiter},
 	{"GET", "/api/repos/{id}/board", noLimiter},
 	{"GET", "/api/repos/{id}/board/prefs", noLimiter},
+	// GitHub Projects v2 sync status read (issue #534, PRD #364 follow-up): relocated
+	// from the admin READ group to owner-or-admin /repos (D4). A read of the stored
+	// projection, no forge call → noLimiter.
+	{"GET", "/api/repos/{id}/github-project-sync", noLimiter},
 	{"GET", "/api/repos/{id}/issues/{iid}", limForge},
 	{"GET", "/api/repos/{id}/tool-profile", noLimiter},
 	{"GET", "/api/runs/", noLimiter},
@@ -353,6 +351,12 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/me/slack/test-dm", limSlackDM},
 	{"POST", "/api/notifications/{id}/read", noLimiter},
 	{"POST", "/api/repos/{id}/ci-fix-runs", limForge},
+	// GitHub Projects v2 sync adopt + autonomous provision (issue #534, PRD #364
+	// follow-up): relocated from /admin to owner-or-admin /repos (D4). Adopt/provision
+	// make forge calls but are infrequent manual actions, not user-spammable proxying,
+	// so they wear no per-user limiter → noLimiter, as in the admin write group they left.
+	{"POST", "/api/repos/{id}/github-project-sync", noLimiter},
+	{"POST", "/api/repos/{id}/github-project-sync/provision", noLimiter},
 	{"POST", "/api/repos/{id}/issues", limForge},
 	{"POST", "/api/repos/{id}/issues/{iid}/move", limForge},
 	{"POST", "/api/repos/{id}/issues/{iid}/prdless", limForge},
