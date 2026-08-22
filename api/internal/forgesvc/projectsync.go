@@ -164,6 +164,16 @@ type ProjectSyncService struct {
 	// adopt→seed flow runs in-line and ordering/lease assertions are deterministic
 	// (no wall-clock, no sleeps, no goroutine races).
 	background func(func())
+
+	// reverseCapK / reverseCapPct are the two thresholds of the reverse per-tick
+	// destructive-write cap (PRD #576 M5): a tick that would strip an existing column
+	// label off more than reverseCapK issues AND more than reverseCapPct percent of the
+	// tracked items is aborted wholesale (F-F / R1 / R1b). They are INJECTABLE service
+	// fields (defaulted in NewProjectSync to 3 and 25) so a test can DISABLE the cap
+	// (set reverseCapK huge) and assert the SAME fixture DOES fire the AutoMove calls —
+	// the mutation control the cap's negative assertions need to be non-vacuous.
+	reverseCapK   int
+	reverseCapPct int
 }
 
 // NewProjectSync constructs the provisioning service. A nil log defaults to
@@ -180,6 +190,10 @@ func NewProjectSync(st ProjectSyncStore, forges ProjectForgeBuilder, settings Pr
 		// Default: run the seed in a detached goroutine. Tests overwrite this with a
 		// synchronous launcher to make the seam deterministic.
 		background: func(fn func()) { go fn() },
+		// Reverse destructive-write cap defaults (PRD #576 M5): a single genuine drag
+		// (destructiveCount 1) always passes; a mass corruption event trips.
+		reverseCapK:   3,
+		reverseCapPct: 25,
 	}
 }
 
@@ -464,7 +478,7 @@ func (s *ProjectSyncService) seed(ctx context.Context, p seedParams) error {
 
 // launchSeed runs the item-seeding step asynchronously (PRD #576 M4) so Adopt/Resync/
 // Provision return immediately instead of blocking on the ~27s item loop (the cosmetic
-// 502). The link is already persisted by prepareSeedLink/provisionAndSeed before this is
+// 502). The link is already persisted by prepareSeedLink/provisionPrepare before this is
 // called.
 //
 // Ordering that matters:
@@ -1401,12 +1415,50 @@ func (s *ProjectSyncService) backfillItem(ctx context.Context, repo store.GetRep
 	return nil
 }
 
-// reverseDiff is the M6 diff pass, extracted from ReverseSync (M7 refactor): for each
-// live project item it compares the live Status option against the stored marker and,
-// on a GitHub-side change, writes the mapped column label via the ordinary AutoMove
-// path, then advances the marker. See ReverseSync's doc for the convergence invariant.
+// plannedMove is one intended reverse AutoMove for the tick, computed in reverseDiff's
+// PLAN pass (no AutoMove, no store writes) so the whole tick's destructive-write count
+// is known BEFORE any AutoMove fires. destructive marks a move that would strip an
+// EXISTING column label off the real forge issue — either a clear (targetColumn ""
+// while the issue currently sits in a column, the F-F empty cascade) or a remap to a
+// different valid column (R1b). This is the corruption shape M5's cap bounds; a naive
+// running counter would strip the first N issues before tripping (partial corruption),
+// which is why the plan is materialized in full first.
+type plannedMove struct {
+	issue        store.Issue
+	targetColumn string
+	itemPresent  bool
+	itemID       string
+	liveOptionID string
+	destructive  bool
+}
+
+// reverseDiff is the M6 diff pass (extracted from ReverseSync in M7), restructured for
+// PRD #576 M5 into count-then-decide-then-execute so a single reverse tick cannot mass-
+// strip real forge issue labels (F-F / R1 / R1b, the standing PRD #364 data-loss bug):
+//
+//   - PASS 1 (PLAN) applies the existing skip/no-op logic unchanged and records every
+//     item that survives to an intended AutoMove, classifying each as destructive.
+//   - DECIDE: if the destructive count both exceeds reverseCapK AND is more than
+//     reverseCapPct percent of the tracked items, the whole tick is aborted — execute
+//     none (not even non-destructive adds: a corrupted tick is untrustworthy wholesale),
+//     advance no markers, stamp last_error, and log loudly.
+//   - PASS 2 (EXECUTE) runs the existing per-item AutoMove + marker-advance verbatim.
+//
+// A single genuine user drag (destructive count 1) always passes both gates. See
+// ReverseSync's doc for the convergence invariant the marker advance preserves.
 func (s *ProjectSyncService) reverseDiff(ctx context.Context, repo store.GetRepoByIDRow, f forge.Forge, live []forge.ProjectV2ItemStatus, optionColumn map[string]string, issuesByIID map[int64]store.Issue, itemsByIID map[int64]store.GithubProjectItem, columns []store.BoardColumn) {
 	repoID := repo.ID
+
+	// Column-name → position map, so board.ResolveColumn can report each issue's CURRENT
+	// column for the destructive classification (identical construction to seedItems).
+	position := make(map[string]int, len(columns))
+	for _, c := range columns {
+		position[c.LabelName] = int(c.Position)
+	}
+
+	// Pass 1 — PLAN. No AutoMove, no store writes: just compute the full set of intended
+	// moves so the tick's total destructive-write count is known before any executes.
+	var plan []plannedMove
 	for _, it := range live {
 		// Non-issue content (PR/draft) carries IssueNumber 0 — nothing to move.
 		if it.IssueNumber == 0 {
@@ -1454,9 +1506,62 @@ func (s *ProjectSyncService) reverseDiff(ctx context.Context, repo store.GetRepo
 			continue
 		}
 
+		// Classify destructive: resolve the issue's CURRENT column from its labels and
+		// state (exactly as seedItems unmarshals + resolves). The move strips an existing
+		// column label iff the issue currently sits in a non-empty column that differs
+		// from the target — a clear (target "") or a remap to a different valid column.
+		// A move that only ADDS a label (currentColumn "" → some column) or is already in
+		// the target strips nothing → NOT destructive.
+		var labels []string
+		if len(issue.Labels) > 0 {
+			if err := json.Unmarshal(issue.Labels, &labels); err != nil {
+				labels = nil
+			}
+		}
+		currentColumn, _, _ := board.ResolveColumn(labels, issue.State, position)
+		destructive := currentColumn != "" && currentColumn != targetColumn
+
+		plan = append(plan, plannedMove{
+			issue:        issue,
+			targetColumn: targetColumn,
+			itemPresent:  itemPresent,
+			itemID:       it.ItemID,
+			liveOptionID: it.OptionID,
+			destructive:  destructive,
+		})
+	}
+
+	// DECIDE. Count the planned destructive moves and compare against the per-tick cap.
+	// trackedItems is the count of items uzi has markers for; when it is 0 the percentage
+	// side reduces to "any destructive move" (destructiveCount*100 > 0), so the reverseCapK
+	// gate alone governs — a mass destructive backfill on an untracked board still trips.
+	destructiveCount := 0
+	for _, p := range plan {
+		if p.destructive {
+			destructiveCount++
+		}
+	}
+	trackedItems := len(itemsByIID)
+	if destructiveCount > s.reverseCapK && destructiveCount*100 > s.reverseCapPct*trackedItems {
+		// Cap tripped: a corrupted tick is untrustworthy wholesale, so execute NONE of
+		// the planned moves (not even non-destructive adds), advance NO markers, stamp
+		// last_error, and log LOUDLY with the count.
+		err := fmt.Errorf("project sync: reverse tick aborted: %d destructive moves exceed cap (k=%d, pct=%d, tracked=%d)",
+			destructiveCount, s.reverseCapK, s.reverseCapPct, trackedItems)
+		s.log.Error("project sync: reverse tick aborted, destructive-write cap tripped",
+			"repo", repoID, "destructive", destructiveCount, "capK", s.reverseCapK, "capPct", s.reverseCapPct, "tracked", trackedItems)
+		s.stampLinkErrorReverse(ctx, repoID, err)
+		return
+	}
+
+	// Pass 2 — EXECUTE. The existing per-item logic, verbatim: AutoMove, then advance the
+	// marker on success (or stamp + continue without advancing on error).
+	for _, p := range plan {
+		issue := p.issue
+
 		// Write the label via the ordinary AutoMove path. On error, DO NOT advance the
 		// marker (so the change is retried next tick) and stamp the link error.
-		if _, err := s.mover.AutoMove(ctx, f, repo.ForgeProjectID, issue, columns, targetColumn); err != nil {
+		if _, err := s.mover.AutoMove(ctx, f, repo.ForgeProjectID, issue, columns, p.targetColumn); err != nil {
 			s.stampLinkErrorReverse(ctx, repoID, err)
 			continue
 		}
@@ -1464,22 +1569,22 @@ func (s *ProjectSyncService) reverseDiff(ctx context.Context, repo store.GetRepo
 		// Advance the marker to the live OptionID so the next poll reads live == marker
 		// → no-op (the second convergence guard). An existing item row advances just
 		// the marker; an absent one is upserted, carrying the live ItemID as the node id.
-		if itemPresent {
+		if p.itemPresent {
 			if err := s.store.SetGithubProjectItemStatusMarker(ctx, store.SetGithubProjectItemStatusMarkerParams{
-				LastStatusOptionID: optionMarker(it.OptionID),
+				LastStatusOptionID: optionMarker(p.liveOptionID),
 				RepoID:             repoID,
-				ForgeIssueIid:      it.IssueNumber,
+				ForgeIssueIid:      issue.ForgeIssueIid,
 			}); err != nil {
-				s.log.Warn("project sync: reverse advance marker", "repo", repoID, "issue", it.IssueNumber, "error", err)
+				s.log.Warn("project sync: reverse advance marker", "repo", repoID, "issue", issue.ForgeIssueIid, "error", err)
 			}
 		} else {
 			if _, err := s.store.UpsertGithubProjectItem(ctx, store.UpsertGithubProjectItemParams{
 				RepoID:             repoID,
-				ForgeIssueIid:      it.IssueNumber,
-				ItemNodeID:         it.ItemID,
-				LastStatusOptionID: optionMarker(it.OptionID),
+				ForgeIssueIid:      issue.ForgeIssueIid,
+				ItemNodeID:         p.itemID,
+				LastStatusOptionID: optionMarker(p.liveOptionID),
 			}); err != nil {
-				s.log.Warn("project sync: reverse persist item", "repo", repoID, "issue", it.IssueNumber, "error", err)
+				s.log.Warn("project sync: reverse persist item", "repo", repoID, "issue", issue.ForgeIssueIid, "error", err)
 			}
 		}
 	}
