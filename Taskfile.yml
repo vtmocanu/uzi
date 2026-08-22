@@ -247,6 +247,10 @@ tasks:
       - task: lint:shell
       - task: lint:yaml
       - task: lint:formula
+      # hermetic (~instant): a fake `docker` on PATH, no daemon touched. It guards
+      # the destructive e2e leaked-project reclaim's selection contract so a future
+      # edit that would tear down the wrong project reddens here instead of on a host.
+      - task: test:e2e-reclaim
       # cheapest-first: this whole-file duplicate check is sub-second, so it runs
       # before `scan:secrets`, which is deliberately last because it dominates.
       - task: check:spec-numbering
@@ -708,6 +712,14 @@ tasks:
       # elsewhere, so the distinction is live -- and copies this file VERBATIM
       # into vtmocanu/homebrew-tap on every v* tag.
       - ./scripts/lint-formula.sh Formula/uzi-cli.rb
+
+  test:e2e-reclaim:
+    desc: behavioral test of the e2e leaked-project reclaim safety contract (fake docker, hermetic)
+    cmds:
+      # No real docker daemon involved -- the test puts a fake `docker` on PATH and
+      # asserts only a definitely-dead `uzi-e2e-<pid>` project is torn down (the real
+      # `uzi` stack, store-it, the current run, and an EPERM/alive pid are all skipped).
+      - ./e2e/reclaim-leaked-e2e.test.sh
 
   check:spec-numbering:
     desc: specs/ai.md section numbers are unique (whole-file), with a canary proving the detector fired
