@@ -18,10 +18,21 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.54.0] - 2026-08-22
+
+### Added
+
+- **GitHub Projects sync: board visibility and collaborator sharing from the UI ([#568](https://github.com/vtmocanu/uzi/pull/568), PRD #534 follow-up).**
+  The repo's Board-access panel can now read and flip the linked GitHub Project board's public/private visibility and grant or revoke Reader access by GitHub username, via four owner-or-admin routes on the github-only ProjectBoardSyncer; sharing is write-only since GitHub exposes no readable collaborator list.
+- **TUI: lead context-window meter on the run view's lead row ([#570](https://github.com/vtmocanu/uzi/pull/570), issue [#565](https://github.com/vtmocanu/uzi/pull/565)).**
+  The lead's crew-rail row in the `uzi tui` run view now shows an inline context-window meter (a bar plus percentage) with cool, molten, and near-full states, mirroring the web meter shipped in PRD #516.
+
 ### Fixed
 
+- **Board card titles no longer overflow on a long unbreakable token ([#566](https://github.com/vtmocanu/uzi/pull/566), issue [#562](https://github.com/vtmocanu/uzi/pull/562)).**
+  A long unbreakable token in a board card's title now wraps instead of overflowing the card.
 - **Revert the no-op SDK todo-tools flag (issue [#561](https://github.com/vtmocanu/uzi/issues/561), reverting [#550](https://github.com/vtmocanu/uzi/pull/550)).**
-  `CLAUDE_CODE_ENABLE_TODO_TOOLS=1`, added in 0.53.0 (whose notes billed it as "Restore SDK todo/task tools"), is a no-op on claude-agent-sdk 0.3.233: TodoWrite was removed from the SDK and no flag surfaces it, so the flag and its comment are removed. The SDK 0.3.233 pin (#531) is unchanged, and `CLAUDE_CODE_ENABLE_TASKS` is deliberately not added since the Task tools already work as deferred tools.
+  `CLAUDE_CODE_ENABLE_TODO_TOOLS=1`, added in 0.53.0 (whose notes billed it as "Restore SDK todo/task tools"), is a no-op on claude-agent-sdk 0.3.233: TodoWrite was removed from the SDK and no flag surfaces it, so the flag and its comment are removed. The SDK 0.3.233 pin ([#531](https://github.com/vtmocanu/uzi/pull/531)) is unchanged, and `CLAUDE_CODE_ENABLE_TASKS` is deliberately not added since the Task tools already work as deferred tools.
 
 ## [0.53.1] - 2026-08-22
 <!-- release-title: automatic worker-image roll + interactive-task hardening -->
@@ -3087,7 +3098,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.53.1...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.54.0...HEAD
+[0.54.0]: https://github.com/vtmocanu/uzi/compare/v0.53.1...v0.54.0
 [0.53.1]: https://github.com/vtmocanu/uzi/compare/v0.53.0...v0.53.1
 [0.53.0]: https://github.com/vtmocanu/uzi/compare/v0.52.0...v0.53.0
 [0.52.0]: https://github.com/vtmocanu/uzi/compare/v0.51.0...v0.52.0
