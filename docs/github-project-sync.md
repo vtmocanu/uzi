@@ -98,7 +98,9 @@ type, it falls back to showing both options rather than guessing.)
   single-select field ("uzi Status", not GitHub's built-in Status) seeded
   with one option per board column, links it to the repo, and seeds every
   current issue's Status from its column. Provisioning a repo that already
-  has a link is refused — disable it first.
+  has a link is refused — disable it first. Because this uses "uzi Status"
+  rather than the built-in Status, set the board's **Column by** to it as
+  described in [Skipped columns and fixing them](#skipped-columns-and-fixing-them).
 
 ## The Adopt flow, step by step
 
@@ -149,6 +151,18 @@ Two ways to fix it, both offered from the same panel:
   Project ends up carrying **two** status-like fields (the original
   Status, and uzi's own "uzi Status"), since the old one is left alone
   rather than edited in place.
+
+**After auto-create (or Provision), point the board view at "uzi Status".**
+Because "uzi Status" is a *separate* field, your GitHub board keeps grouping
+by whichever field it grouped by before (usually the built-in **Status**,
+whose default options are `Todo` / `In Progress` / `Done` / `No Status`) — so
+the board still shows *those* columns even though uzi is now writing your
+board's columns to "uzi Status". This looks like "sync did nothing", but the
+values are there on the other field. Switch the board over in GitHub: open the
+board, click **View** (top right), set **Column by** to **uzi Status**, then
+**Save view**. The board then shows your uzi columns with every item already
+populated. (In Table layout the same control is labeled **Group by**; the
+original Status field is harmless and can be ignored or deleted.)
 
 ## The `project` PAT scope
 
