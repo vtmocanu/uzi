@@ -28,8 +28,8 @@ DEAD="uzi-e2e-$DEAD_PID"
 
 # Fake docker. The candidate list is emitted for `docker ps`; `docker compose -p
 # <proj> down ...` appends <proj> to the log so we can assert exactly what got
-# torn down. UNquoted heredoc: $LOG and $CURRENT expand now (test time), while the
-# fake's own positional args (\$1, \$3) stay literal for run time.
+# torn down. UNquoted heredoc: $LOG, $CURRENT and $DEAD expand now (test time),
+# while the fake's own positional args (\$1, \$3) stay literal for run time.
 cat > "$FAKEBIN/docker" <<EOF
 #!/usr/bin/env bash
 case "\$1" in
