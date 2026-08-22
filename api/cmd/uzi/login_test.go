@@ -111,6 +111,64 @@ func TestLoginFlow(t *testing.T) {
 	}
 }
 
+// A hostile server returns a megabyte-long user_code and email. Both are server-supplied
+// and printed outside the Printer, so they must go through the LOCAL cellText (200-char
+// cap), not the unbounded uzicli.CellText — otherwise the giant strings flood the terminal
+// (#220). The sharp assertion is that a 1000-rune run of A's never appears in full.
+func TestLoginBoundsServerStrings(t *testing.T) {
+	stubLoginHooks(t, func(string) error { return nil })
+
+	giant := strings.Repeat("A", 1<<20)
+	var polls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/auth/cli/start":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{"request_id":"req-1","user_code":"`+giant+`","expires_in":300,"interval":5}`)
+		case "/api/auth/cli/poll":
+			if atomic.AddInt32(&polls, 1) == 1 {
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = io.WriteString(w, `{"status":"pending"}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"token":"uzc_x","user":{"id":"u1","email":"`+giant+`@x.io"}}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	env, _, out, errb := loginEnv(t)
+	t.Setenv("UZI_URL", srv.URL)
+	t.Setenv("UZI_TOKEN", "")
+
+	code := Main(env, []string{"login"})
+	if code != uzicli.ExitOK {
+		t.Fatalf("login exit = %d (stderr: %s)", code, errb.String())
+	}
+
+	// stderr carries the user_code line (plus the consent URL and instructions), so bound
+	// it generously — the point is that the megabyte code did NOT flood it.
+	if n := len(errb.String()); n > 8192 {
+		t.Errorf("stderr is %d bytes; the server user_code reached the terminal unbounded", n)
+	}
+	if strings.Contains(errb.String(), strings.Repeat("A", 1000)) {
+		t.Errorf("the giant user_code reached the terminal in full:\n%s", errb.String())
+	}
+	// Non-vacuous: the code line still rendered.
+	if !strings.Contains(errb.String(), "and enter this one-time code") {
+		t.Errorf("user_code line not shown:\n%s", errb.String())
+	}
+
+	// stdout carries the "Logged in as ..." line; the giant email must be bounded there too.
+	if strings.Contains(out.String(), strings.Repeat("A", 1000)) {
+		t.Errorf("the giant email reached stdout in full:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "Logged in as") {
+		t.Errorf("success line missing:\n%s", out.String())
+	}
+}
+
 // Headless / no-browser: the opener fails, but login still completes because the URL
 // is printed for the human to open manually. The token still lands.
 func TestLoginHeadlessBrowserFailure(t *testing.T) {

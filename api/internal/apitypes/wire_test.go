@@ -87,6 +87,9 @@ var runDTOKeys = []string{
 	// kind='task' run. base_branch is null on every non-task run; open_mr is false by
 	// default and on every non-task run. Always on the wire.
 	"base_branch", "open_mr",
+	// PRD #517 M1: interactive marks a long-lived task run; false by default and on every
+	// non-task run. Always on the wire, like open_mr above.
+	"interactive",
 	// PRD #400 Decision 6: when a task run's dispatch gate was stamped (null on every
 	// non-task run and on a task run not yet dispatched). Always on the wire.
 	"dispatched_at",

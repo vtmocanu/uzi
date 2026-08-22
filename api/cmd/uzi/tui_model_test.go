@@ -299,6 +299,50 @@ func TestTUIDetailPlanGateBannerNonOwnerHasNoKeys(t *testing.T) {
 	}
 }
 
+// PRD #517: awaiting_followup gets its own attention band. The owner's banner names the
+// follow-up park and the `f` hint; the non-owner's names the park but OMITS "with f" (the
+// `f` steer key is owner-only, so a viewer is pointed at web/Slack, not an inert key); and
+// the band fits the 100-col reference frame without truncating.
+func TestTUIDetailFollowupBanner(t *testing.T) {
+	runID := "fu-1"
+
+	// Owner: nil-err runInputs → steerAllowed.
+	mo := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	next, _ := mo.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "awaiting_followup"}})
+	mo = next.(tuiModel)
+	next, _ = mo.Update(runInputsMsg{runID: runID})
+	mo = next.(tuiModel)
+	mo.width = 100 // the reference frame width the TUI-UX validator measured against
+	ob := mo.detailBanner()
+	if !strings.Contains(ob, "AWAITING FOLLOW-UP") {
+		t.Errorf("owner follow-up banner missing the head\n%q", ob)
+	}
+	if !strings.Contains(ob, "with f") {
+		t.Errorf("owner follow-up banner should offer the `f` hint\n%q", ob)
+	}
+	if strings.Contains(ob, "…") {
+		t.Errorf("follow-up banner truncated at the 100-col frame (too long)\n%q", ob)
+	}
+	if w := visualWidth(ob); w > mo.width {
+		t.Errorf("follow-up banner width %d exceeds the %d-col frame", w, mo.width)
+	}
+
+	// Non-owner: 404 runInputs → steerNotOwner. Same band, but no inert `f` hint.
+	mn := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	next, _ = mn.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "awaiting_followup"}})
+	mn = next.(tuiModel)
+	next, _ = mn.Update(runInputsMsg{runID: runID, err: uzicli.Exitf(uzicli.ExitNotFound, "not found")})
+	mn = next.(tuiModel)
+	mn.width = 100
+	nb := mn.detailBanner()
+	if !strings.Contains(nb, "AWAITING FOLLOW-UP") {
+		t.Errorf("non-owner follow-up banner missing the head\n%q", nb)
+	}
+	if strings.Contains(nb, "with f") {
+		t.Errorf("non-owner banner points a read-only viewer at the owner-only `f` key\n%q", nb)
+	}
+}
+
 // M6: the review overlay colours the verdict WORD by SEVERITY (issues → alarm red, ideal →
 // faint) via the shared verdictColor. No chip fill now — it is a bold coloured word — so this
 // asserts through the foreground SGR, and that the two verdicts resolve to different colours.
@@ -1259,6 +1303,23 @@ func TestTUIBoardSemanticStatusAndSummary(t *testing.T) {
 	}
 }
 
+// TestTUIBoardSummaryCountsFollowupPark pins that an awaiting_followup run (PRD #517) is
+// counted in the board summary's needs-you cluster — it is in the NEEDS YOU band, so it
+// must not be invisible in the summary line. Mutation that reddens this: dropping the
+// awaiting_followup case from boardSummary → no "➤ 1" segment appears.
+func TestTUIBoardSummaryCountsFollowupPark(t *testing.T) {
+	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "running", IssueTitle: "one"}},
+		{RunDTO: apitypes.RunDTO{ID: "ffffffff-2", Kind: "issue", Status: "awaiting_followup", IssueTitle: "parked"}},
+	}}
+	m := tuiTestModel(t, fake, "")
+	next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
+	m = next.(tuiModel)
+	if got := m.boardSummary(); !strings.Contains(got, "➤ 1") {
+		t.Errorf("board summary omits the follow-up park (want a ➤ 1 segment): %q", got)
+	}
+}
+
 // assertNoRawControls fails on anything in a rendered frame that is not printable text
 // or a legitimate SGR colour sequence.
 //
@@ -1595,6 +1656,92 @@ func TestTUIBoardWindowsToHeightAndKeepsFooter(t *testing.T) {
 	sel, _ := m.board.selected()
 	if !strings.Contains(out, shortRunID(sel.ID)) {
 		t.Errorf("cursor scrolled out of the window: selected %s not rendered\n%s", sel.ID, out)
+	}
+}
+
+// The strip's meters/settings must refresh on their own 60s ticker, not just at Init and on
+// the manual refresh key — otherwise the boardRateLimitStrip freezes at its launch value while
+// the 2s boardTickMsg re-fetches only runs. This is the mutation guard: it reddens if the
+// stripTickMsg handler stops re-fetching the meters.
+func TestTUIStripTickRefetchesMeters(t *testing.T) {
+	// Shrink the strip cadence so the re-arm (tea.Tick) fires promptly instead of in 60s.
+	orig := rateLimitPollInterval
+	rateLimitPollInterval = time.Millisecond
+	t.Cleanup(func() { rateLimitPollInterval = orig })
+
+	fake := &uzicli.FakeClient{SelfMeters: []apitypes.TokenRateLimitDTO{
+		{SecretID: "sec-x", Label: "tok", IsDefault: true, Limits: apitypes.RateLimitDTO{
+			Status: "ok", FiveHour: &apitypes.RateLimitWindow{Pct: 42}}},
+	}}
+	m := tuiTestModel(t, fake, "")
+
+	_, cmd := m.Update(stripTickMsg{})
+	if cmd == nil {
+		t.Fatal("stripTickMsg returned no command; the strip will never refresh on its own ticker")
+	}
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("stripTickMsg command yielded %T, want a tea.BatchMsg", msg)
+	}
+
+	var sawMeters, sawRearm bool
+	for _, inner := range batch {
+		if inner == nil {
+			continue
+		}
+		switch im := inner().(type) {
+		case rateLimitsMsg:
+			// Non-vacuous: assert the fake's meter actually reached the message, not merely
+			// that the batch is non-empty.
+			if len(im.tokens) != 1 {
+				t.Fatalf("rateLimitsMsg carried %d tokens, want 1 (the fake's meter)", len(im.tokens))
+			}
+			if got := im.tokens[0]; got.SecretID != "sec-x" || got.Limits.FiveHour == nil || got.Limits.FiveHour.Pct != 42 {
+				t.Errorf("rateLimitsMsg did not carry the fake's meter: %+v", got)
+			}
+			sawMeters = true
+		case stripTickMsg:
+			sawRearm = true
+		}
+	}
+	if !sawMeters {
+		t.Error("the stripTickMsg batch did not re-fetch the meters; the strip would freeze at its launch value")
+	}
+	if !sawRearm {
+		t.Error("the stripTickMsg batch did not re-arm the 60s strip ticker; it would fire only once")
+	}
+}
+
+// Init must start the strip's own 60s ticker, so the rate-limit strip refreshes without the
+// user pressing the manual refresh key.
+func TestTUIInitStartsStripTicker(t *testing.T) {
+	orig := rateLimitPollInterval
+	rateLimitPollInterval = time.Millisecond
+	t.Cleanup(func() { rateLimitPollInterval = orig })
+
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+	cmd := m.Init()
+	if cmd == nil {
+		t.Fatal("Init returned no command")
+	}
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("Init command yielded %T, want a tea.BatchMsg", msg)
+	}
+
+	var sawRearm bool
+	for _, inner := range batch {
+		if inner == nil {
+			continue
+		}
+		if _, ok := inner().(stripTickMsg); ok {
+			sawRearm = true
+		}
+	}
+	if !sawRearm {
+		t.Error("Init did not start the strip's 60s ticker; the strip would only refresh on the manual key")
 	}
 }
 

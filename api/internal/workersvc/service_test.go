@@ -152,6 +152,11 @@ type fakeStore struct {
 	lastSeqUpdated   *int32
 	setRunningParams *store.SetRunRunningParams
 	setAwaiting      *store.SetRunAwaitingApprovalParams
+	// PRD #517 M2: captures the SetRunAwaitingFollowup arg (nil until the park query
+	// is reached) so a test can assert the accept path was taken and prove the
+	// interactive/task guard rejects BEFORE the query on a mismatched run.
+	setFollowup      *store.SetRunAwaitingFollowupParams
+	setFollowupRows  int64
 	setCompleted     *store.SetRunCompletedParams
 	setFailed        *store.SetRunFailedParams
 	reconciledMR     *store.ReconcileRunMRParams
@@ -662,6 +667,10 @@ func (f *fakeStore) SetRunAwaitingApproval(_ context.Context, arg store.SetRunAw
 	f.setAwaiting = &arg
 	return 1, nil
 }
+func (f *fakeStore) SetRunAwaitingFollowup(_ context.Context, arg store.SetRunAwaitingFollowupParams) (int64, error) {
+	f.setFollowup = &arg
+	return f.setFollowupRows, nil
+}
 func (f *fakeStore) SetRunCompleted(_ context.Context, arg store.SetRunCompletedParams) (int64, error) {
 	f.setCompleted = &arg
 	return f.setCompletedRows, nil
@@ -976,6 +985,7 @@ func testParams() Params {
 	return Params{
 		RunTimeout:             2 * time.Hour,
 		RunIdleTimeout:         10 * time.Minute,
+		WorkerTaskIdleTimeout:  30 * time.Minute, // PRD #517 M5 interactive-task park idle cap
 		RunMaxIterations:       5,
 		PlanMaxRevisions:       3,
 		QuestionMax:            5,     // PRD #88 clarification-question cap
@@ -1157,6 +1167,84 @@ func TestClaimCarriesTaskOpenMrAndBaseBranch(t *testing.T) {
 	}
 	if payload.Branch == nil || *payload.Branch != taskBranch {
 		t.Errorf("branch = %v, want %s", payload.Branch, taskBranch)
+	}
+}
+
+// TestClaimCarriesTaskIdleTimeoutForInteractiveRun proves assembleClaim ships the
+// server-configured WORKER_TASK_IDLE_TIMEOUT (testParams: 30m) on an INTERACTIVE task
+// claim as Config.TaskIdleTimeoutSeconds, so the worker parks on the same idle bound the
+// server configured (no drift) — PRD #517 M5. Mirrors the RunTimeout/IdleTimeout claim
+// asserts above. MUTATION PROOF: omitting `TaskIdleTimeoutSeconds: taskIdleTimeoutSeconds`
+// from the ClaimConfig assembly reads back 0 (the zero value), reddening the ==1800 assert.
+func TestClaimCarriesTaskIdleTimeoutForInteractiveRun(t *testing.T) {
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-TASKIDLE-abcdef1234567890"))
+	sealedTok, _ := box.Seal([]byte("anthropic-TASKIDLE-abcdef1234567890"))
+
+	runID := uuid.New()
+	fs := &fakeStore{
+		claimRun: store.Run{
+			ID: runID, Kind: "task", Status: "claimed", Interactive: true,
+			IssueTitle: "Handoff: interactive", IssueDescription: "iterate with me",
+			Branch: pgText("uzi/task/" + runID.String()),
+		},
+		claimCtx: store.GetRunClaimContextRow{
+			RepoWebUrl: "https://gitlab.example.com/grp/proj", RepoPath: "grp/proj",
+			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
+		},
+		anthropic: sealedTok,
+	}
+
+	svc := New(fs, box, testParams())
+	payload, err := svc.Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload == nil {
+		t.Fatal("expected a payload, got idle")
+	}
+	// 30m == 1800s, the WorkerTaskIdleTimeout testParams sets.
+	if payload.Config.TaskIdleTimeoutSeconds != 1800 {
+		t.Fatalf("Config.TaskIdleTimeoutSeconds = %d, want 1800 — the interactive-task park idle "+
+			"timeout must ride the claim (WORKER_TASK_IDLE_TIMEOUT)", payload.Config.TaskIdleTimeoutSeconds)
+	}
+}
+
+// TestClaimOmitsTaskIdleTimeoutForNonInteractiveRun is the negative control that pins the
+// gating decision: a NON-interactive run's claim leaves TaskIdleTimeoutSeconds at zero, so
+// omitempty keeps its wire byte-identical to today's (an un-upgraded worker never sees a new
+// key). MUTATION PROOF: setting TaskIdleTimeoutSeconds unconditionally (dropping the
+// `if run.Interactive` guard) makes this read 1800, reddening the ==0 assert.
+func TestClaimOmitsTaskIdleTimeoutForNonInteractiveRun(t *testing.T) {
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-NOIDLE-abcdef1234567890"))
+	sealedTok, _ := box.Seal([]byte("anthropic-NOIDLE-abcdef1234567890"))
+
+	fs := &fakeStore{
+		claimRun: store.Run{
+			ID: uuid.New(), Kind: "issue", Status: "claimed",
+			IssueIid: pgtype.Int8{Int64: 7, Valid: true},
+		},
+		claimCtx: store.GetRunClaimContextRow{
+			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
+			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
+		},
+		anthropic: sealedTok,
+	}
+
+	svc := New(fs, box, testParams())
+	payload, err := svc.Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload == nil {
+		t.Fatal("expected a payload, got idle")
+	}
+	if payload.Config.TaskIdleTimeoutSeconds != 0 {
+		t.Fatalf("Config.TaskIdleTimeoutSeconds = %d, want 0 for a non-interactive run — the park idle "+
+			"timeout must be delivered ONLY on an interactive task claim", payload.Config.TaskIdleTimeoutSeconds)
 	}
 }
 
@@ -1891,6 +1979,57 @@ func TestSetStateRejectsUnknownState(t *testing.T) {
 	}
 }
 
+// PRD #517 M2: an interactive task run parks in-process on signal_done. SetState must
+// ACCEPT the awaiting_followup report for such a run (reaching SetRunAwaitingFollowup),
+// and REJECT it as ErrInvalidState for any run that is not BOTH a task run AND
+// interactive — the status is meaningless there and accepting it would strand a
+// non-resumable run in a non-terminal status the follow-up path never wakes.
+func TestSetStateAwaitingFollowupAcceptsInteractiveTask(t *testing.T) {
+	w := worker()
+	fs := &fakeStore{
+		runOwned:        store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "running", Kind: RunKindTask, Interactive: true},
+		setFollowupRows: 1,
+	}
+	svc := New(fs, newBox(t), testParams())
+	_, applied, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{State: "awaiting_followup"})
+	if err != nil {
+		t.Fatalf("SetState(awaiting_followup) on an interactive task: %v", err)
+	}
+	if !applied {
+		t.Fatal("a legitimate interactive-task park must apply (handler answers 200)")
+	}
+	if fs.setFollowup == nil {
+		t.Fatal("SetRunAwaitingFollowup was never called — the accept path did not persist the park")
+	}
+}
+
+// Each fixture flips exactly ONE of the two guard conditions, so a test that dropped
+// either half of `kind == RunKindTask && interactive` would let one of these through;
+// a run holding both would satisfy the guard and could not observe the guard at all.
+// The setFollowup==nil assertion is what makes each case non-vacuous: it proves the
+// rejection happened BEFORE the park query, not that the query merely returned 0 rows.
+func TestSetStateAwaitingFollowupRejectsNonInteractiveOrNonTask(t *testing.T) {
+	w := worker()
+	cases := map[string]store.Run{
+		"task but not interactive":   {Kind: RunKindTask, Interactive: false},
+		"interactive but not a task": {Kind: RunKindIssue, Interactive: true},
+		"neither":                    {Kind: RunKindIssue, Interactive: false},
+	}
+	for name, r := range cases {
+		t.Run(name, func(t *testing.T) {
+			r.ID, r.WorkerID, r.Status = uuid.New(), pgUUID(w.ID), "running"
+			fs := &fakeStore{runOwned: r, setFollowupRows: 1}
+			svc := New(fs, newBox(t), testParams())
+			if _, _, err := svc.SetState(context.Background(), w, r.ID, StateRequest{State: "awaiting_followup"}); !errors.Is(err, ErrInvalidState) {
+				t.Fatalf("err = %v, want ErrInvalidState", err)
+			}
+			if fs.setFollowup != nil {
+				t.Fatal("SetRunAwaitingFollowup must NOT be called for a non-interactive/non-task run — the guard must reject BEFORE the query")
+			}
+		})
+	}
+}
+
 func TestSetStateRejectsForeignRun(t *testing.T) {
 	// A valid worker token but the run belongs to another worker/tenant: the
 	// ownership lookup misses, so the transition is refused (handler answers 404)
@@ -2372,6 +2511,195 @@ func TestSubmitInputRejectServerSideWhenWorkerStale(t *testing.T) {
 	}
 	if fs.rejected == nil {
 		t.Fatal("RejectRunServerSide not called")
+	}
+}
+
+// TestSubmitInputStopEnqueuesOnParkedRun: PRD #517 M4 — a graceful `stop` on a parked
+// interactive run (awaiting_followup, live worker) ALWAYS enqueues via the dedicated
+// CreateStopVerdictInput CTE, stamping stop_kind='stopped', and NEVER transitions the run
+// server-side. The worker consumes it and finalizes (push + MR iff open_mr → completed).
+//
+// MUTATION PROOF: route `stop` through CancelRunServerSide / RejectRunServerSide (or the
+// plain CreateRunInput path) and fs.createdStopVerdict is nil / fs.cancelled|rejected is
+// set — every assertion below flips.
+func TestSubmitInputStopEnqueuesOnParkedRun(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	wkrID := uuid.New()
+	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	fs := &fakeStore{
+		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: true, Status: "awaiting_followup", WorkerID: pgUUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)}, // fresh
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.now = func() time.Time { return fixed }
+
+	res, err := svc.SubmitInput(context.Background(), user, runID, "stop", "wind down please", nil)
+	if err != nil {
+		t.Fatalf("SubmitInput(stop): %v", err)
+	}
+	if res.ServerSide {
+		t.Fatal("a stop must ALWAYS enqueue (worker-finalized), never transition server-side")
+	}
+	if fs.createdStopVerdict == nil || fs.createdStopVerdict.Kind != "stop" {
+		t.Fatalf("stop verdict not enqueued: %+v", fs.createdStopVerdict)
+	}
+	if !fs.createdStopVerdict.StopKind.Valid || fs.createdStopVerdict.StopKind.String != "stopped" {
+		t.Fatalf("stop must stamp stop_kind 'stopped', got %+v", fs.createdStopVerdict.StopKind)
+	}
+	if fs.createdInput != nil {
+		t.Fatal("a stop verdict must not use the plain CreateRunInput path")
+	}
+	if fs.cancelled != nil || fs.rejected != nil {
+		t.Fatal("a stop must never reach CancelRunServerSide/RejectRunServerSide")
+	}
+}
+
+// TestSubmitInputStopEnqueuesEvenWithoutLivePoller: the design's core distinction from
+// cancel — a stop has NO server-side !live branch. A parked run whose worker is STALE
+// still enqueues the stop (M2's stale-heartbeat sweep requeues the park; it honors the
+// pending stop on resume). This is what would break if someone copied cancel's
+// hasLivePoller branch onto stop.
+func TestSubmitInputStopEnqueuesEvenWithoutLivePoller(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	wkrID := uuid.New()
+	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	fs := &fakeStore{
+		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: true, Status: "awaiting_followup", WorkerID: pgUUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed.Add(-2 * time.Minute))}, // stale
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.now = func() time.Time { return fixed }
+
+	res, err := svc.SubmitInput(context.Background(), user, runID, "stop", "", nil)
+	if err != nil {
+		t.Fatalf("SubmitInput(stop): %v", err)
+	}
+	if res.ServerSide {
+		t.Fatal("a stop must enqueue even with a stale worker — it has no server-side transition branch")
+	}
+	if fs.createdStopVerdict == nil || fs.createdStopVerdict.StopKind.String != "stopped" {
+		t.Fatalf("stop against a stale worker must still enqueue with stop_kind 'stopped', got %+v", fs.createdStopVerdict)
+	}
+	if fs.cancelled != nil || fs.rejected != nil {
+		t.Fatal("a stop must never reach CancelRunServerSide/RejectRunServerSide, even with a dead worker")
+	}
+}
+
+// TestSubmitInputStopForeignUserRejected: owner-scoping — a stop from a non-owner is a
+// 404 (ErrRunNotFound, via GetRun), so nothing is enqueued.
+func TestSubmitInputStopForeignUserRejected(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	fs := &fakeStore{runByIDErr: pgx.ErrNoRows} // GetRunByIDForUser finds no row for this user
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "stop", "", nil); err != ErrRunNotFound {
+		t.Fatalf("a foreign-user stop must return ErrRunNotFound, got %v", err)
+	}
+	if fs.createdStopVerdict != nil {
+		t.Fatal("no stop verdict may be enqueued for a run the caller does not own")
+	}
+}
+
+// TestSubmitInputStopRejectsTerminalRun: the terminal guard already 409s a stop on a
+// finished run (ErrRunTerminal → 409), before any row is written.
+func TestSubmitInputStopRejectsTerminalRun(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: user, Kind: RunKindTask, Status: "completed"}}
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "stop", "", nil); err != ErrRunTerminal {
+		t.Fatalf("a stop on a terminal run must return ErrRunTerminal, got %v", err)
+	}
+	if fs.createdStopVerdict != nil {
+		t.Fatal("no stop verdict may be enqueued on a terminal run")
+	}
+}
+
+// TestSubmitInputStopRejectsNonInteractiveTask: PRD #517 M4 review — a `stop` is honored
+// ONLY by the interactive-task park, so a stop on a NON-interactive task run is rejected
+// with ErrStopNotInteractive (→ 409) BEFORE any stop_kind is stamped. Otherwise it would
+// stamp a permanent, spurious stop_kind='stopped' and return a misleading success while
+// nothing winds the run down.
+//
+// MUTATION PROOF: remove the `run.Kind != RunKindTask || !run.Interactive` guard and this
+// run's stop is accepted — err becomes nil and fs.createdStopVerdict is stamped 'stopped'.
+func TestSubmitInputStopRejectsNonInteractiveTask(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	wkrID := uuid.New()
+	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	fs := &fakeStore{
+		// A task run, but NOT interactive — no park reads the stop flag.
+		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: false, Status: "running", WorkerID: pgUUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)},
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.now = func() time.Time { return fixed }
+
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "stop", "wind down", nil); err != ErrStopNotInteractive {
+		t.Fatalf("a stop on a non-interactive task must return ErrStopNotInteractive, got %v", err)
+	}
+	if fs.createdStopVerdict != nil {
+		t.Fatal("no stop verdict may be stamped on a non-interactive task run")
+	}
+}
+
+// TestSubmitInputStopRejectsNonTaskRun: the same guard rejects a stop on a non-task run
+// (here an interactive-flagged chat run — kind is what fails). Nothing is stamped.
+//
+// MUTATION PROOF: remove the guard's `run.Kind != RunKindTask` conjunct and this stop is
+// accepted and stamped.
+func TestSubmitInputStopRejectsNonTaskRun(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	wkrID := uuid.New()
+	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	fs := &fakeStore{
+		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindChat, Interactive: true, Status: "running", WorkerID: pgUUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)},
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.now = func() time.Time { return fixed }
+
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "stop", "", nil); err != ErrStopNotInteractive {
+		t.Fatalf("a stop on a non-task run must return ErrStopNotInteractive, got %v", err)
+	}
+	if fs.createdStopVerdict != nil {
+		t.Fatal("no stop verdict may be stamped on a non-task run")
+	}
+}
+
+// TestSubmitInputStopAcceptsRunningInteractiveTask: the guard keys on kind+interactive
+// only, NOT on status — a stop on a RUNNING (not yet parked) interactive task is a valid
+// wind-down and is accepted, stamping stop_kind='stopped'.
+//
+// MUTATION PROOF: tighten the guard to also require status=='awaiting_followup' and this
+// running-run stop is wrongly rejected.
+func TestSubmitInputStopAcceptsRunningInteractiveTask(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	wkrID := uuid.New()
+	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	fs := &fakeStore{
+		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: true, Status: "running", WorkerID: pgUUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)},
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.now = func() time.Time { return fixed }
+
+	res, err := svc.SubmitInput(context.Background(), user, runID, "stop", "", nil)
+	if err != nil {
+		t.Fatalf("a stop on a RUNNING interactive task must be accepted, got %v", err)
+	}
+	if res.ServerSide {
+		t.Fatal("a stop must always enqueue, never transition server-side")
+	}
+	if fs.createdStopVerdict == nil || fs.createdStopVerdict.StopKind.String != "stopped" {
+		t.Fatalf("a running interactive-task stop must stamp stop_kind 'stopped', got %+v", fs.createdStopVerdict)
 	}
 }
 

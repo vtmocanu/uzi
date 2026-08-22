@@ -100,6 +100,43 @@ func TestRunWaitNarrowedUntilSkipsGate(t *testing.T) {
 	}
 }
 
+func TestRunWaitStopsAtFollowupPark(t *testing.T) {
+	// PRD #517 D9: a bare `uzi run wait <id>` must STOP on awaiting_followup — an
+	// interactive task parked awaiting the user's next follow-up needs the caller and does
+	// NOT auto-resume. Mutation that reddens this: dropping "awaiting_followup" from
+	// defaultWaitStates → the wait passes through the park and runs on to the later
+	// `completed` step, so the "→ completed" guard below fires.
+	fc := &uzicli.FakeClient{GetRunHook: scriptHook(
+		okStep("running"), okStep("running"), okStep("awaiting_followup"), okStep("completed"),
+	)}
+	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "wait", "r1", "--interval", "1ms")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stderr, "running → awaiting_followup") {
+		t.Errorf("expected a running→awaiting_followup transition, stderr = %q", stderr)
+	}
+	if strings.Contains(stderr, "→ completed") {
+		t.Errorf("must stop AT the follow-up park, not run past it to completed; stderr = %q", stderr)
+	}
+}
+
+func TestRunWaitUntilFollowupValidates(t *testing.T) {
+	// `uzi run wait --until awaiting_followup` must validate (not a usage error) and stop
+	// on the park. Mutation that reddens this: dropping "awaiting_followup" from
+	// allRunStatuses → the --until validator rejects it and the CLI exits 2 (ExitUsage)
+	// instead of 0, so the exit-code assertion fails.
+	fc := &uzicli.FakeClient{GetRunHook: scriptHook(okStep("running"), okStep("awaiting_followup"))}
+	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "wait", "r1",
+		"--until", "awaiting_followup", "--interval", "1ms")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 — --until awaiting_followup must validate (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stderr, "→ awaiting_followup") {
+		t.Errorf("should have stopped at the follow-up park, stderr = %q", stderr)
+	}
+}
+
 func TestRunWaitTimeoutExitsSeven(t *testing.T) {
 	fc := &uzicli.FakeClient{GetRunHook: scriptHook(okStep("running"))}
 	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "wait", "r1",
@@ -183,8 +220,34 @@ func TestRunWaitUnknownUntilIsUsageError(t *testing.T) {
 	}
 }
 
+// TestRunWaitHelpAndErrorDerivedFromConstants pins the human-readable status enumerations
+// against their source-of-truth sets so a future status addition that misses a hand-written
+// string reddens here. Mutation that reddens this: hardcoding either string with a status
+// omitted (e.g. the pre-PRD-#517 lists that dropped awaiting_followup).
+func TestRunWaitHelpAndErrorDerivedFromConstants(t *testing.T) {
+	// `run wait --help` names every defaultWaitStates member (the Long help and the --until
+	// flag default are both joined from that slice).
+	fc := &uzicli.FakeClient{}
+	stdout, _, _ := runCLI(t, fakeEnv(fc), "run", "wait", "--help")
+	for _, s := range defaultWaitStates {
+		if !strings.Contains(stdout, s) {
+			t.Errorf("`run wait --help` omits default state %q — the help must enumerate every defaultWaitStates member\n%s", s, stdout)
+		}
+	}
+	// The --until validation error names every valid status (joined from allRunStatusesOrder).
+	_, err := waitTargets([]string{"bogus"})
+	if err == nil {
+		t.Fatal("waitTargets(bogus) returned no error, want a usage error")
+	}
+	for _, s := range allRunStatusesOrder {
+		if !strings.Contains(err.Error(), s) {
+			t.Errorf("--until validation error omits valid status %q; got %q", s, err.Error())
+		}
+	}
+}
+
 func TestRunWaitUnknownStatusSurfacedAndNonTerminal(t *testing.T) {
-	// A status outside the nine-value enum must be surfaced and NOT treated as a stop
+	// A status outside the ten-value enum must be surfaced and NOT treated as a stop
 	// state (it is never in --until), so the wait continues to a real target.
 	fc := &uzicli.FakeClient{GetRunHook: scriptHook(okStep("teleporting"), okStep("completed"))}
 	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "wait", "r1", "--interval", "1ms")

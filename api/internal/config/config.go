@@ -298,6 +298,7 @@ type Config struct {
 	// payload; the rest drive the server sweeper and claim affinity.
 	RunTimeout              time.Duration // wall clock before a running run is failed
 	RunIdleTimeout          time.Duration // worker-side no-message idle cap
+	WorkerTaskIdleTimeout   time.Duration // PRD #517 M5: interactive-task park idle cap (worker-side); rides the claim
 	RunMaxIterations        int           // implement⇄review loop cap (worker-side)
 	PlanMaxRevisions        int           // PRD #41 plan-revision cap at the approval gate (server + worker)
 	QuestionMax             int           // PRD #88 clarification-question cap per run (worker-enforced)
@@ -689,6 +690,13 @@ func Load() (Config, error) {
 
 	cfg.RunTimeout = parseDuration("RUN_TIMEOUT", 2*time.Hour)
 	cfg.RunIdleTimeout = parseDuration("RUN_IDLE_TIMEOUT", 10*time.Minute)
+	// PRD #517 M5: the interactive-task park's worker-side idle backstop, delivered on
+	// the claim (like RunIdleTimeout). Shorter than chat's 60m because a parked task pins
+	// a git clone/HOME + worker slot; on idle the worker gracefully finalizes (push, MR
+	// iff open_mr) → completed. There is deliberately NO server-side park-age sweep: a
+	// dead-worker park is recovered by the existing stale-worker requeue (M2), not a new
+	// TASK_IDLE_TIMEOUT completing a run the server cannot push.
+	cfg.WorkerTaskIdleTimeout = parseDuration("WORKER_TASK_IDLE_TIMEOUT", 30*time.Minute)
 	cfg.RunMaxIterations = parseInt("RUN_MAX_ITERATIONS", 5)
 	cfg.PlanMaxRevisions = parseInt("PLAN_MAX_REVISIONS", 3)
 	cfg.QuestionMax = parseInt("QUESTION_MAX", 5)

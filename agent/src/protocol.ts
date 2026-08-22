@@ -19,6 +19,12 @@ export type RunState =
    *  open_question_id; the api rejects it otherwise, because a park with no question
    *  identity can never satisfy SetRunRunning's resume guard. */
   | "awaiting_input"
+  /** PRD #517 M3: an INTERACTIVE task run parked after a clean signal_done, waiting for the
+   *  next follow-up. The server admits awaiting_followup only for kind==task && interactive
+   *  (SetState guard), and admits the awaiting_followup→running wake only once a follow_up
+   *  input has been consumed (SetRunRunning guard) — the worker satisfies that by obtaining
+   *  the follow-up through the normal poll/consume path before it reports running. */
+  | "awaiting_followup"
   | "limit_wait"
   | "completed"
   | "failed";
@@ -138,7 +144,10 @@ export type InputKind =
   | "reject_plan"
   | "cancel"
   | "revise_plan"
-  | "answer";
+  | "answer"
+  // PRD #517 M4: the graceful interactive wind-down. Consumed by the steering poll and
+  // routed to SteeringChannel.route("stop"), which sets the sticky stop flag.
+  | "stop";
 
 /** One question in an ask_user call (PRD #88 M1), mirroring the local
  *  AskUserQuestion tool's shape so the model has a familiar contract and the UI can
@@ -390,6 +399,12 @@ export interface ClaimSecrets {
 export interface ClaimConfig {
   run_timeout_seconds?: number;
   idle_timeout_seconds?: number;
+  /** PRD #517 M5: the interactive-task park idle backstop (env WORKER_TASK_IDLE_TIMEOUT).
+   *  How long a parked interactive task waits at awaiting_followup for the next follow-up
+   *  before the worker gracefully finalizes (push, MR iff open_mr) → completed. Present
+   *  only on an interactive task claim; absent ⇒ the worker's TASK_FOLLOWUP_IDLE_MS
+   *  constant (30m). Seconds, converted to ms at the park site. */
+  task_idle_timeout_seconds?: number;
   max_iterations?: number;
   /** Bound on plan-revision rounds at the approval gate (PRD #41, env
    *  PLAN_MAX_REVISIONS). The worker enforces the same cap the server does. */
@@ -556,6 +571,13 @@ export interface ClaimResponse {
    *  other kind ignores it. Read from the runs row, so re-delivered on every resume like
    *  auto_approve. Absent on an older server ⇒ treat as false (no MR for a task). */
   open_mr?: boolean;
+  /** PRD #517 M3: this TASK run is INTERACTIVE (`uzi handoff --interactive`). Meaningful
+   *  only for kind="task": on `signal_done` the worker checkpoint-pushes and PARKS at
+   *  `awaiting_followup` (instead of finalizing), blocking in-process for the next
+   *  follow-up and resuming the SAME SDK session when it arrives. Every other kind ignores
+   *  it. Read from the runs row, so re-delivered on every resume like `open_mr`/`auto_approve`.
+   *  Absent on an older server ⇒ treat as false (a task finalizes on done, today's behavior). */
+  interactive?: boolean;
   /** PRD #400 M2: the source ref a task run was branched from, for context/review.
    *  Meaningful only for kind="task" — the worker works the pre-seeded, server-named
    *  `branch` (uzi/task/<run-id>), not this ref; it is carried so an MR/review can name
