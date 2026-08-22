@@ -654,15 +654,18 @@ func (m tuiModel) renderLaneRail() string {
 		}
 		return crewStateFor(d.run.Status, d.run.Health, l.Key, active, l.LastActivity, now)
 	}
+	// The lead's context-window meter (#565): latest-wins across LEAD frames only, computed once
+	// and shown ONLY on the lead lane. A subagent lane and the synthetic ALL lane never get it.
+	fill, hasCtx := leadContextFill(d.lanes)
 	if d.railCollapsed {
 		// Just the selected lane, so the reader still knows whose transcript is on screen while
 		// the milestones get the rest of the column.
 		if l, ok := d.selectedLane(); ok {
-			sb.WriteString(m.laneRow(l, true, st(l), suffixes[l.Key]))
+			sb.WriteString(m.laneRow(l, true, st(l), suffixes[l.Key], fill, hasCtx && l.Key == laneLead))
 		}
 	} else {
 		for i, l := range d.lanes {
-			sb.WriteString(m.laneRow(l, i == d.laneIdx, st(l), suffixes[l.Key]))
+			sb.WriteString(m.laneRow(l, i == d.laneIdx, st(l), suffixes[l.Key], fill, hasCtx && l.Key == laneLead))
 		}
 	}
 	if block := m.renderMilestones(); block != "" {
@@ -696,7 +699,11 @@ func (m tuiModel) laneIdentities() map[string]string {
 // selected lane rides the warm selection bar (like the board). The role and label are UNTRUSTED
 // and go through renderer.Plain (D7); the ordinal suffix is derived, not untrusted. Keeping
 // every cell's sanitizing in this one helper is why the collapsed and expanded paths share it.
-func (m tuiModel) laneRow(l agentLane, selected bool, st crewState, suffix string) string {
+//
+// When showMeter is set (the lead lane, and only when leadContextFill found a valid reading) the
+// row carries the inline context-window meter AFTER the role/suffix. The meter is DERIVED, not
+// untrusted (no Plain needed), and is built here so it rides this row's own selection bg.
+func (m tuiModel) laneRow(l agentLane, selected bool, st crewState, suffix string, fill contextFill, showMeter bool) string {
 	var bg color.Color
 	if selected {
 		bg = m.pal.selBg
@@ -719,6 +726,9 @@ func (m tuiModel) laneRow(l agentLane, selected bool, st crewState, suffix strin
 		// the opaque SDK invocation id, so the id tail never reaches the rail — a lone role
 		// shows no suffix at all — and there is nothing untrusted here to sanitize.
 		line += paintSeg(m.pal.faintC, bg, false, suffix)
+	}
+	if showMeter {
+		line += m.contextMeterCell(bg, fill)
 	}
 	var sb strings.Builder
 	sb.WriteString(padSeg(line, laneRailWidth, bg) + "\n")
