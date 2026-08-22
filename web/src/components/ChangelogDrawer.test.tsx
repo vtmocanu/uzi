@@ -11,7 +11,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
-vi.mock("../lib/changelog", () => ({
+// Spread the REAL module and override only `releases`, so the mock's
+// `splitBulletTitle` (which ChangelogDrawer now imports) is the real
+// implementation rather than a re-typed copy that could drift.
+vi.mock("../lib/changelog", async (importActual) => ({
+  ...(await importActual<typeof import("../lib/changelog")>()),
   releases: [
     {
       version: "Unreleased",
@@ -58,6 +62,23 @@ vi.mock("../lib/changelog", () => ({
       date: "2026-08-01",
       body: "Old release.",
       groups: [{ category: "Added", bullets: ["An old feature."] }],
+      unreleased: false,
+      notReleased: false,
+    },
+    // A title-bearing bullet for the split-render assertions. Uses a LOW version
+    // (older than everything) so it carries no marker and never becomes the
+    // banner's "available" target — the existing marker/banner math (which
+    // expects v0.48.0 as newest eligible) stays intact.
+    {
+      version: "0.8.0",
+      date: "2026-08-21",
+      body: "x",
+      groups: [
+        {
+          category: "Added",
+          bullets: ["**Bold headline (PRD #534 follow-up).** The description text follows here."],
+        },
+      ],
       unreleased: false,
       notReleased: false,
     },
@@ -217,6 +238,29 @@ describe("ChangelogDrawer — M3 rendering (links, dots)", () => {
 
     const prLink = screen.getByRole("link", { name: "#413" });
     expect(prLink.getAttribute("href")).toBe("https://github.com/vtmocanu/uzi/pull/413");
+  });
+
+  it("renders a bullet's bold title on its own block, separate from its description", () => {
+    render(<ChangelogDrawer onClose={vi.fn()} />);
+
+    // The title's <strong> lives in a <p> that does NOT carry the description.
+    const strong = Array.from(document.querySelectorAll("strong")).find((el) =>
+      (el.textContent ?? "").includes("Bold headline"),
+    );
+    expect(strong).toBeTruthy();
+    const titleP = strong!.closest("p")!;
+    expect(titleP.textContent).not.toContain("The description text follows here");
+
+    // The description renders in a DIFFERENT block.
+    const descP = Array.from(document.querySelectorAll("p")).find((el) =>
+      (el.textContent ?? "").includes("The description text follows here"),
+    );
+    expect(descP).toBeTruthy();
+    expect(descP).not.toBe(titleP);
+
+    // linkify applies to the title too: the `PRD #534` inside the bold span is an anchor.
+    const prdLink = screen.getByRole("link", { name: "PRD #534" });
+    expect(prdLink.getAttribute("href")).toBe("https://github.com/vtmocanu/uzi/issues/534");
   });
 
   it("maps each category to its status-tone dot class", () => {

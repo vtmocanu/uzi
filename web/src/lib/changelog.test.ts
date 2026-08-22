@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseChangelog, type Release } from "./changelog";
+import { parseChangelog, splitBulletTitle, type Release } from "./changelog";
 
 // These tests feed literal fixture strings to the pure parser, so they are
 // decoupled from the real CHANGELOG.md content. The parity test against the real
@@ -185,5 +185,37 @@ describe("parseChangelog", () => {
     const truncated = parseChangelog("## [0.1.0] - 2026-08-01");
     expect(Array.isArray(truncated)).toBe(true);
     expect(truncated[0]?.version).toBe("0.1.0");
+  });
+});
+
+describe("splitBulletTitle", () => {
+  it("splits a leading bold title off from its description", () => {
+    expect(splitBulletTitle("**Title.** description")).toEqual({
+      title: "Title.",
+      description: "description",
+    });
+  });
+
+  it("keeps an inline PR link and a PRD ref verbatim inside the title", () => {
+    const bullet =
+      "**Feature ([#568](https://github.com/vtmocanu/uzi/pull/568), PRD #534 follow-up).** The description follows.";
+    expect(splitBulletTitle(bullet)).toEqual({
+      title: "Feature ([#568](https://github.com/vtmocanu/uzi/pull/568), PRD #534 follow-up).",
+      description: "The description follows.",
+    });
+  });
+
+  it("returns a null title when the bullet has no leading bold span", () => {
+    expect(splitBulletTitle("reworded a nudge that wraps")).toEqual({
+      title: null,
+      description: "reworded a nudge that wraps",
+    });
+  });
+
+  it("returns an empty description for a title-only bullet", () => {
+    expect(splitBulletTitle("**Title.**")).toEqual({
+      title: "Title.",
+      description: "",
+    });
   });
 });

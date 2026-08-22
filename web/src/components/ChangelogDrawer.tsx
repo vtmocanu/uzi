@@ -23,7 +23,7 @@ import { Modal } from "./Modal";
 import { MarkdownCore } from "./MarkdownCore";
 import { cx } from "./ui";
 import { displayVersion } from "./BuildInfoPopover";
-import { releases, type Release } from "../lib/changelog";
+import { releases, splitBulletTitle, type Release } from "../lib/changelog";
 import { parseSemver, compareSemver } from "../lib/semver";
 import { linkifyPrdRefs, releaseTagUrl } from "../lib/changelogLinks";
 
@@ -241,15 +241,40 @@ function ReleaseEntry({
             </span>
           </div>
           <ul className="mt-1 space-y-1">
-            {group.bullets.map((bullet, i) => (
-              <li key={`${group.category}-${i}`} className="pl-3">
-                <MarkdownCore
-                  content={linkifyPrdRefs(bullet)}
-                  components={bulletComponents}
-                  className="text-sm text-muted [&_p]:m-0"
-                />
-              </li>
-            ))}
+            {group.bullets.map((bullet, i) => {
+              // Render the bold title on its own line above the description, to
+              // match GitHub release-notes layout. `linkifyPrdRefs` runs on the
+              // title too because the CHANGELOG puts `PRD #N` refs inside the
+              // bold span. A bullet with no leading bold span renders as one
+              // paragraph exactly as before.
+              const { title, description } = splitBulletTitle(bullet);
+              return (
+                <li key={`${group.category}-${i}`} className="space-y-0.5 pl-3">
+                  {title === null ? (
+                    <MarkdownCore
+                      content={linkifyPrdRefs(bullet)}
+                      components={bulletComponents}
+                      className="text-sm text-muted [&_p]:m-0"
+                    />
+                  ) : (
+                    <>
+                      <MarkdownCore
+                        content={linkifyPrdRefs("**" + title + "**")}
+                        components={bulletComponents}
+                        className="text-sm text-muted [&_p]:m-0"
+                      />
+                      {description !== "" && (
+                        <MarkdownCore
+                          content={linkifyPrdRefs(description)}
+                          components={bulletComponents}
+                          className="text-sm text-muted [&_p]:m-0"
+                        />
+                      )}
+                    </>
+                  )}
+                </li>
+              );
+            })}
           </ul>
         </div>
       ))}
