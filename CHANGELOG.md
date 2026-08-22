@@ -18,10 +18,24 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.56.0] - 2026-08-22
+<!-- release-title: closed-issue Done status + Resync field-id fix -->
+
 ### Added
 
 - **GitHub Projects sync: closed issues land in a Done status, and reopening restores the card (issue [#584](https://github.com/vtmocanu/uzi/issues/584), PRD #584).**
   Closing an issue now sets its linked board card's Status to a dedicated `Done` option and keeps the card tracked instead of leaving it stranded at its last-known Status; reopening the issue restores the card to its current column (or clears it to No Status). A uzi-created field (Provision or auto-create) and an adopted built-in GitHub Status field both get the `Done` option automatically; a `uzi Status` or custom field without one gets an advisory in the sync panel and `uzi project-sync status` instead, since uzi never adds an option to an existing field. Reverse sync is unchanged: a Done card never reopens or closes the issue.
+
+### Fixed
+
+- **GitHub Projects sync: Resync no longer re-points a uzi-Status board back to the built-in Status ([#585](https://github.com/vtmocanu/uzi/pull/585), PRD #582).**
+  Resync now re-reads the exact field the link already points at (by its stored id) instead of re-resolving by name, so a board synced through uzi's own `uzi Status` field keeps using it across a Resync instead of silently switching to GitHub's built-in Status and leaving most columns unmatched.
+- **check-docs: repointed a moved artifact reference in specs/ai.md (3aeffd8b).**
+  `specs/ai.md` cited `prds/158-forge-read-tools.md` after it moved to `prds/done/`, which failed the docs check on every pull request that merged with main.
+
+### Internal
+
+- **Docs: clarified that run-log message content lives under `payload` ([#144](https://github.com/vtmocanu/uzi/pull/144)).**
 
 ## [0.55.1] - 2026-08-22
 <!-- release-title: forge read tools reach the fact-checker -->
@@ -3130,7 +3144,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.55.1...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.56.0...HEAD
+[0.56.0]: https://github.com/vtmocanu/uzi/compare/v0.55.1...v0.56.0
 [0.55.1]: https://github.com/vtmocanu/uzi/compare/v0.55.0...v0.55.1
 [0.55.0]: https://github.com/vtmocanu/uzi/compare/v0.54.0...v0.55.0
 [0.54.0]: https://github.com/vtmocanu/uzi/compare/v0.53.1...v0.54.0
