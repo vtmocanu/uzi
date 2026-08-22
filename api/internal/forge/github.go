@@ -884,6 +884,11 @@ func (g *github) graphqlURL() string {
 // error model), so graphqlDo surfaces these as a redacted Go error.
 type graphqlError struct {
 	Message string `json:"message"`
+	// Type is GitHub's machine-readable error classification (e.g. "NOT_FOUND",
+	// "FORBIDDEN"). graphqlDo inspects it so a caller can distinguish a
+	// non-existent login (NOT_FOUND) from a permission/transient failure without
+	// parsing the redacted message; see ErrGitHubUserNotFound in projectsync.go.
+	Type string `json:"type"`
 }
 
 // graphqlResponse is the standard GraphQL envelope: data plus an optional
@@ -930,10 +935,24 @@ func (g *github) graphqlDo(ctx context.Context, query string, vars map[string]an
 	}
 	if len(envelope.Errors) > 0 {
 		msgs := make([]string, 0, len(envelope.Errors))
+		notFound := false
 		for _, e := range envelope.Errors {
 			msgs = append(msgs, e.Message)
+			if e.Type == "NOT_FOUND" {
+				notFound = true
+			}
 		}
-		return g.redact.error(fmt.Errorf("github: graphql: %s", strings.Join(msgs, "; ")))
+		// The joined message is still redacted so a reflected PAT never escapes.
+		redactedErr := g.redact.error(fmt.Errorf("github: graphql: %s", strings.Join(msgs, "; ")))
+		if notFound {
+			// Wrap the (already redacted) error so errors.Is(err,
+			// ErrGitHubUserNotFound) is true for the caller while the scrubbed
+			// message stays authoritative. Only a NOT_FOUND type is wrapped, so a
+			// permission/transient error stays a plain redacted error and maps to
+			// 500 rather than "bad username".
+			return fmt.Errorf("%w: %w", ErrGitHubUserNotFound, redactedErr)
+		}
+		return redactedErr
 	}
 	if out != nil {
 		if err := json.Unmarshal(envelope.Data, out); err != nil {

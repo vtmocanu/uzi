@@ -2,7 +2,29 @@ package forge
 
 import (
 	"context"
+	"errors"
 	"fmt"
+)
+
+// ErrGitHubUserNotFound is returned (wrapped) when a GitHub GraphQL operation
+// reports a NOT_FOUND error type — for ResolveUserNodeID this means the login
+// does not resolve to a user. graphqlDo (github.go) wraps its redacted error
+// with this sentinel whenever any errors[] entry has type "NOT_FOUND", so
+// callers can errors.Is against it to distinguish a bad username from a
+// permission/transient failure. Every other GraphQL error propagates as a plain
+// redacted error.
+var ErrGitHubUserNotFound = errors.New("github: user not found")
+
+// ProjectV2CollaboratorRole is the closed set of collaborator roles uzi sets on
+// a Projects v2 board via updateProjectV2Collaborators. The wire values are the
+// GitHub ProjectV2Roles enum strings.
+type ProjectV2CollaboratorRole string
+
+const (
+	// RoleReaderCollaborator grants read access (ProjectV2Roles READER).
+	RoleReaderCollaborator ProjectV2CollaboratorRole = "READER"
+	// RoleNoneCollaborator revokes access (ProjectV2Roles NONE).
+	RoleNoneCollaborator ProjectV2CollaboratorRole = "NONE"
 )
 
 // projectsync.go defines the OPTIONAL capability interface for GitHub Projects v2
@@ -141,6 +163,23 @@ type ProjectBoardSyncer interface {
 	// ResolveProjectV2/ResolveIssueNodeID/ResolveRepositoryNodeID, whereas the rest
 	// of uzi keys a repo by its numeric forge_project_id — this bridges the two.
 	RepoSlug(ctx context.Context, forgeProjectID int64) (owner, name string, err error)
+	// GetProjectV2Visibility reads a board's current public flag by node id
+	// (node(id){ ... on ProjectV2 { public } }) (PRD #557 M1). A private board is
+	// visible only to accounts granted project-level access.
+	GetProjectV2Visibility(ctx context.Context, projectID string) (bool, error)
+	// SetProjectV2Visibility writes a board's public flag (updateProjectV2) (PRD
+	// #557 M1). true makes the board internet-visible; false makes it private.
+	SetProjectV2Visibility(ctx context.Context, projectID string, public bool) error
+	// SetProjectV2Collaborator sets one user's collaborator role on a board
+	// (updateProjectV2Collaborators, upsert semantics) (PRD #557 M1). Grant Reader
+	// with RoleReaderCollaborator; revoke with RoleNoneCollaborator. GitHub exposes
+	// no readable collaborator list, so this is a write-only operation.
+	SetProjectV2Collaborator(ctx context.Context, projectID, userID string, role ProjectV2CollaboratorRole) error
+	// ResolveUserNodeID resolves a login to its user node id (user(login){ id })
+	// (PRD #557 M1). Returns ErrGitHubUserNotFound when the login does not resolve
+	// (GitHub's NOT_FOUND), so callers can map a bad username to 422 while every
+	// other error stays a 500.
+	ResolveUserNodeID(ctx context.Context, login string) (string, error)
 }
 
 // --- github driver implementation ------------------------------------------
@@ -610,6 +649,67 @@ func (g *github) RepoSlug(ctx context.Context, forgeProjectID int64) (string, st
 		return "", "", err
 	}
 	return s.owner, s.repo, nil
+}
+
+func (g *github) GetProjectV2Visibility(ctx context.Context, projectID string) (bool, error) {
+	const query = `query($projectId: ID!) {
+  node(id: $projectId) {
+    ... on ProjectV2 { public }
+  }
+}`
+	var out struct {
+		Node struct {
+			Public bool `json:"public"`
+		} `json:"node"`
+	}
+	if err := g.graphqlDo(ctx, query, map[string]any{"projectId": projectID}, &out); err != nil {
+		return false, err
+	}
+	return out.Node.Public, nil
+}
+
+func (g *github) SetProjectV2Visibility(ctx context.Context, projectID string, public bool) error {
+	const mutation = `mutation($projectId: ID!, $public: Boolean!) {
+  updateProjectV2(input: {projectId: $projectId, public: $public}) {
+    projectV2 { id }
+  }
+}`
+	return g.graphqlDo(ctx, mutation, map[string]any{"projectId": projectID, "public": public}, nil)
+}
+
+func (g *github) SetProjectV2Collaborator(ctx context.Context, projectID, userID string, role ProjectV2CollaboratorRole) error {
+	const mutation = `mutation($projectId: ID!, $collaborators: [ProjectV2Collaborator!]!) {
+  updateProjectV2Collaborators(input: {projectId: $projectId, collaborators: $collaborators}) {
+    clientMutationId
+  }
+}`
+	// The ProjectV2Collaborator input carries userId, role, teamId; uzi sends a
+	// single user grant/revoke (userId + role only).
+	collaborators := []map[string]any{{"userId": userID, "role": string(role)}}
+	return g.graphqlDo(ctx, mutation, map[string]any{"projectId": projectID, "collaborators": collaborators}, nil)
+}
+
+func (g *github) ResolveUserNodeID(ctx context.Context, login string) (string, error) {
+	const query = `query($login: String!) {
+  user(login: $login) { id }
+}`
+	var out struct {
+		User struct {
+			ID string `json:"id"`
+		} `json:"user"`
+	}
+	if err := g.graphqlDo(ctx, query, map[string]any{"login": login}, &out); err != nil {
+		if errors.Is(err, ErrGitHubUserNotFound) {
+			return "", ErrGitHubUserNotFound
+		}
+		return "", err
+	}
+	if out.User.ID == "" {
+		// Defensive: a null user with no errors entry (belt and braces) — treat as
+		// not found rather than returning an empty id.
+		return "", ErrGitHubUserNotFound
+	}
+	return out.User.ID, nil
 }
 
 // toProjectV2Options maps the decoded {id,name} option nodes onto the neutral

@@ -166,6 +166,18 @@ func (p *statefulProject) CreateProjectV2Field(context.Context, string, string, 
 func (p *statefulProject) LinkProjectV2ToRepository(context.Context, string, string) error {
 	return nil
 }
+func (p *statefulProject) GetProjectV2Visibility(context.Context, string) (bool, error) {
+	return false, nil
+}
+func (p *statefulProject) SetProjectV2Visibility(context.Context, string, bool) error {
+	return nil
+}
+func (p *statefulProject) SetProjectV2Collaborator(context.Context, string, string, forge.ProjectV2CollaboratorRole) error {
+	return nil
+}
+func (p *statefulProject) ResolveUserNodeID(context.Context, string) (string, error) {
+	return "", nil
+}
 
 // --- statefulStore: a real projection store (marker survives across calls) --
 

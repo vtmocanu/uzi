@@ -67,6 +67,29 @@ type fakeProjectSyncer struct {
 
 	setCalls []setStatusCall
 	setErr   error
+
+	// Board access (PRD #557 M1): scripted returns + recorded calls for the
+	// visibility/sharing capability methods.
+	visibilityReturn   bool
+	visibilityErr      error
+	setVisibilityCalls []setVisibilityCall
+	setVisibilityErr   error
+	collaboratorCalls  []collaboratorCall
+	collaboratorErr    error
+	resolveUserID      string
+	resolveUserCalls   []string // logins resolved
+	resolveUserErr     error
+}
+
+type setVisibilityCall struct {
+	projectID string
+	public    bool
+}
+
+type collaboratorCall struct {
+	projectID string
+	userID    string
+	role      forge.ProjectV2CollaboratorRole
 }
 
 type setStatusCall struct {
@@ -177,6 +200,28 @@ func (f *fakeProjectSyncer) CreateProjectV2Field(_ context.Context, _, name stri
 func (f *fakeProjectSyncer) LinkProjectV2ToRepository(context.Context, string, string) error {
 	f.linkCalls++
 	return nil
+}
+
+func (f *fakeProjectSyncer) GetProjectV2Visibility(context.Context, string) (bool, error) {
+	return f.visibilityReturn, f.visibilityErr
+}
+
+func (f *fakeProjectSyncer) SetProjectV2Visibility(_ context.Context, projectID string, public bool) error {
+	f.setVisibilityCalls = append(f.setVisibilityCalls, setVisibilityCall{projectID: projectID, public: public})
+	return f.setVisibilityErr
+}
+
+func (f *fakeProjectSyncer) SetProjectV2Collaborator(_ context.Context, projectID, userID string, role forge.ProjectV2CollaboratorRole) error {
+	f.collaboratorCalls = append(f.collaboratorCalls, collaboratorCall{projectID: projectID, userID: userID, role: role})
+	return f.collaboratorErr
+}
+
+func (f *fakeProjectSyncer) ResolveUserNodeID(_ context.Context, login string) (string, error) {
+	f.resolveUserCalls = append(f.resolveUserCalls, login)
+	if f.resolveUserErr != nil {
+		return "", f.resolveUserErr
+	}
+	return f.resolveUserID, nil
 }
 
 // fakeForgeBuilder returns a fixed forge for ForgeForConnection.

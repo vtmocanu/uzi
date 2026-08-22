@@ -3,6 +3,7 @@ package forge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -514,4 +515,178 @@ func TestForgeIsolationCapability(t *testing.T) {
 	if _, ok := fjd.(ProjectBoardSyncer); ok {
 		t.Fatal("forgejo driver must NOT implement ProjectBoardSyncer (SC-4 forge isolation)")
 	}
+}
+
+// TestGitHubGetSetProjectV2Visibility pins PRD #557 M1: reading a board's public
+// flag (node(id){ ... on ProjectV2 { public } }) and writing it through
+// updateProjectV2 with the projectId + public variables.
+func TestGitHubGetSetProjectV2Visibility(t *testing.T) {
+	// Read leg.
+	var readVars map[string]any
+	mr := newMockGitHub(t, map[string]http.HandlerFunc{
+		graphqlRoute: func(w http.ResponseWriter, r *http.Request) {
+			readVars = readGQL(t, r).Variables
+			writeGQLData(w, map[string]any{"node": map[string]any{"public": true}})
+		},
+	})
+	dr := newGitHubRawDriver(t, mr, "ghp_classicTokenValue1234567890")
+	public, err := dr.GetProjectV2Visibility(context.Background(), "PVT_123")
+	if err != nil {
+		t.Fatalf("GetProjectV2Visibility: %v", err)
+	}
+	if !public {
+		t.Fatalf("expected public=true, got %v", public)
+	}
+	if readVars["projectId"] != "PVT_123" {
+		t.Errorf("projectId var not sent on read: %+v", readVars)
+	}
+
+	// Write leg.
+	var setQuery string
+	var setVars map[string]any
+	mw := newMockGitHub(t, map[string]http.HandlerFunc{
+		graphqlRoute: func(w http.ResponseWriter, r *http.Request) {
+			req := readGQL(t, r)
+			setQuery, setVars = req.Query, req.Variables
+			writeGQLData(w, map[string]any{"updateProjectV2": map[string]any{"projectV2": map[string]any{"id": "PVT_123"}}})
+		},
+	})
+	dw := newGitHubRawDriver(t, mw, "ghp_classicTokenValue1234567890")
+	if err := dw.SetProjectV2Visibility(context.Background(), "PVT_123", false); err != nil {
+		t.Fatalf("SetProjectV2Visibility: %v", err)
+	}
+	if !strings.Contains(setQuery, "updateProjectV2") {
+		t.Errorf("set visibility query must name updateProjectV2: %q", setQuery)
+	}
+	if setVars["projectId"] != "PVT_123" {
+		t.Errorf("projectId var not sent on set: %+v", setVars)
+	}
+	if setVars["public"] != false {
+		t.Errorf("public var not sent on set: %+v", setVars)
+	}
+}
+
+// TestGitHubSetProjectV2Collaborator pins PRD #557 M1: the collaborators variable
+// carries a single element with userId + role, for both a READER grant and a NONE
+// revoke.
+func TestGitHubSetProjectV2Collaborator(t *testing.T) {
+	cases := []struct {
+		name string
+		role ProjectV2CollaboratorRole
+		want string
+	}{
+		{"grant reader", RoleReaderCollaborator, "READER"},
+		{"revoke", RoleNoneCollaborator, "NONE"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotQuery string
+			var gotVars map[string]any
+			m := newMockGitHub(t, map[string]http.HandlerFunc{
+				graphqlRoute: func(w http.ResponseWriter, r *http.Request) {
+					req := readGQL(t, r)
+					gotQuery, gotVars = req.Query, req.Variables
+					writeGQLData(w, map[string]any{"updateProjectV2Collaborators": map[string]any{"clientMutationId": nil}})
+				},
+			})
+			d := newGitHubRawDriver(t, m, "ghp_classicTokenValue1234567890")
+			if err := d.SetProjectV2Collaborator(context.Background(), "PVT_123", "U_42", tc.role); err != nil {
+				t.Fatalf("SetProjectV2Collaborator: %v", err)
+			}
+			if !strings.Contains(gotQuery, "updateProjectV2Collaborators") {
+				t.Errorf("query must name updateProjectV2Collaborators: %q", gotQuery)
+			}
+			if gotVars["projectId"] != "PVT_123" {
+				t.Errorf("projectId var not sent: %+v", gotVars)
+			}
+			list, ok := gotVars["collaborators"].([]any)
+			if !ok || len(list) != 1 {
+				t.Fatalf("collaborators must be a 1-element array: %+v", gotVars["collaborators"])
+			}
+			elem, ok := list[0].(map[string]any)
+			if !ok {
+				t.Fatalf("collaborator element must be an object: %+v", list[0])
+			}
+			if elem["userId"] != "U_42" {
+				t.Errorf("collaborator userId wrong: %+v", elem)
+			}
+			if elem["role"] != tc.want {
+				t.Errorf("collaborator role = %v, want %q", elem["role"], tc.want)
+			}
+		})
+	}
+}
+
+// TestGitHubResolveUserNodeID pins PRD #557 M1: a login resolves to its node id;
+// a GitHub NOT_FOUND envelope surfaces as ErrGitHubUserNotFound; and a generic
+// (non-NOT_FOUND) error does NOT — so a bad username maps to 422 while a
+// permission/transient error stays a 500. Redaction still holds on the NOT_FOUND
+// path.
+func TestGitHubResolveUserNodeID(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		var gotVars map[string]any
+		m := newMockGitHub(t, map[string]http.HandlerFunc{
+			graphqlRoute: func(w http.ResponseWriter, r *http.Request) {
+				gotVars = readGQL(t, r).Variables
+				writeGQLData(w, map[string]any{"user": map[string]any{"id": "U_99"}})
+			},
+		})
+		d := newGitHubRawDriver(t, m, "ghp_classicTokenValue1234567890")
+		id, err := d.ResolveUserNodeID(context.Background(), "octocat")
+		if err != nil {
+			t.Fatalf("ResolveUserNodeID: %v", err)
+		}
+		if id != "U_99" {
+			t.Fatalf("unexpected id: %q", id)
+		}
+		if gotVars["login"] != "octocat" {
+			t.Errorf("login var not sent: %+v", gotVars)
+		}
+	})
+
+	t.Run("not found is typed", func(t *testing.T) {
+		const token = "ghp_secretTokenValue1234567890abcd"
+		m := newMockGitHub(t, map[string]http.HandlerFunc{
+			graphqlRoute: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"data": map[string]any{"user": nil},
+					"errors": []map[string]any{{
+						"type": "NOT_FOUND",
+						// Reflect the token to prove redaction survives the wrap.
+						"message": "Could not resolve to a User with the login of 'nouser' " + token,
+					}},
+				})
+			},
+		})
+		d := newGitHubRawDriver(t, m, token)
+		_, err := d.ResolveUserNodeID(context.Background(), "nouser")
+		if err == nil {
+			t.Fatal("a NOT_FOUND envelope must yield an error")
+		}
+		if !errors.Is(err, ErrGitHubUserNotFound) {
+			t.Fatalf("NOT_FOUND must be errors.Is ErrGitHubUserNotFound, got: %v", err)
+		}
+		if strings.Contains(err.Error(), token) {
+			t.Fatalf("token leaked in not-found error: %q", err.Error())
+		}
+	})
+
+	t.Run("generic error is not typed", func(t *testing.T) {
+		m := newMockGitHub(t, map[string]http.HandlerFunc{
+			graphqlRoute: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"data":   nil,
+					"errors": []map[string]any{{"type": "FORBIDDEN", "message": "insufficient scope"}},
+				})
+			},
+		})
+		d := newGitHubRawDriver(t, m, "ghp_classicTokenValue1234567890")
+		_, err := d.ResolveUserNodeID(context.Background(), "octocat")
+		if err == nil {
+			t.Fatal("a FORBIDDEN envelope must yield an error")
+		}
+		if errors.Is(err, ErrGitHubUserNotFound) {
+			t.Fatalf("a non-NOT_FOUND error must NOT be ErrGitHubUserNotFound: %v", err)
+		}
+	})
 }
