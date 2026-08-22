@@ -21962,9 +21962,13 @@ the terse contract.
   token, and project link from the `repoID` internally, so no further ownership check is needed
   downstream.
 
-- **The instance flag still gates all four**, enforced in the service, surfaced as 409
-  (`forgesvc.ErrProjectSyncDisabled`, mapped in `writeProjectSyncError`) when the master toggle is
-  off — orthogonal to and layered under the per-repo owner-or-admin check.
+- **The instance flag gates the two forge-writing entry points — adopt and provision — not all
+  four.** Only `Adopt` and `Provision` route through `projectSyncPreamble` (`forgesvc/projectsync.go`),
+  which returns `forgesvc.ErrProjectSyncDisabled` when the master toggle is off; that maps to 409 in
+  `writeProjectSyncError`. `Disable` and `ProjectSyncStatus` deliberately do NOT check the flag — they
+  touch only uzi's own local link rows (teardown / read), so tearing down or viewing an existing link
+  stays reachable while the feature is off. The flag is orthogonal to and layered under the per-repo
+  owner-or-admin check.
 
 - **Web-only; the CLI is deliberately excluded.** These are state-changing writes that require the
   browser's cookie + CSRF posture, whereas the CLI authenticates with a `uzc_` bearer token — and
