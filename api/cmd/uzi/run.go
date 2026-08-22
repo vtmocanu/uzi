@@ -30,6 +30,7 @@ const (
 	kindFollowUp    = "follow_up"
 	kindRevisePlan  = "revise_plan"
 	kindAnswer      = "answer"
+	kindStop        = "stop"
 )
 
 // agentSources are the two rosters a plan approval may draw its subagents from
@@ -85,30 +86,48 @@ var terminalRunStatuses = map[string]bool{
 	"cancelled": true,
 }
 
-// allRunStatuses is the nine-value status enum the skill documents and migration
-// 00092 constrains (runs_status_check). It is the source of truth `run wait`
+// allRunStatusesOrder is the run status enum in wire/enum order (matching migration
+// 00146's runs_status_check — the current last rewrite, ten values), the ONE source of
+// truth both allRunStatuses (membership)
+// and the `--until` validation-error's "valid: …" list derive from — so a status added
+// here can never be silently omitted from the human-readable enumeration.
+var allRunStatusesOrder = []string{
+	"queued",
+	"claimed",
+	"running",
+	"awaiting_approval",
+	"awaiting_input",
+	"awaiting_followup",
+	statusLimitWait,
+	"completed",
+	"failed",
+	"cancelled",
+}
+
+// allRunStatuses is the run status enum the skill documents and migration
+// 00146 constrains (runs_status_check). It is the source of truth `run wait`
 // validates `--until` against, so a typo'd target is a clean usage error rather than
 // a silent forever-wait. A status the SERVER reports that is NOT in this set is a
 // newer server than this binary (surfaced, treated non-terminal — never a target,
-// since `--until` can only name a member here).
-var allRunStatuses = map[string]bool{
-	"queued":            true,
-	"claimed":           true,
-	"running":           true,
-	"awaiting_approval": true,
-	"awaiting_input":    true,
-	statusLimitWait:     true,
-	"completed":         true,
-	"failed":            true,
-	"cancelled":         true,
-}
+// since `--until` can only name a member here). Derived from allRunStatusesOrder so the
+// membership set and the enumerated list cannot drift.
+var allRunStatuses = func() map[string]bool {
+	m := make(map[string]bool, len(allRunStatusesOrder))
+	for _, s := range allRunStatusesOrder {
+		m[s] = true
+	}
+	return m
+}()
 
 // defaultWaitStates is `run wait`'s `--until` default (PRD #264 D2): the "actionable"
-// set — every state that needs the caller or ends the run. It deliberately OMITS
-// queued/claimed/running (still working) and limit_wait (auto-resumes; parking on it
-// is legitimate), so a bare `uzi run wait <id>` returns at the plan gate, a
-// clarification park, or a terminal — the common "wait for the gate OR the end" case.
-var defaultWaitStates = []string{"awaiting_approval", "awaiting_input", "completed", "failed", "cancelled"}
+// set — every state that needs the caller or ends the run. It INCLUDES awaiting_followup
+// (PRD #517 D9): an interactive task parked awaiting the user's next follow-up needs the
+// caller and does NOT auto-resume, so a bare `uzi run wait <id>` must stop on it. It
+// deliberately OMITS queued/claimed/running (still working) and limit_wait (auto-resumes;
+// parking on it is legitimate), so a bare `uzi run wait <id>` returns at the plan gate, a
+// clarification park, a follow-up park, or a terminal — the common "wait for the gate OR
+// the end" case.
+var defaultWaitStates = []string{"awaiting_approval", "awaiting_input", "awaiting_followup", "completed", "failed", "cancelled"}
 
 // run wait poll cadence and transient-blip resilience knobs (PRD #264 D1/D9). Vars,
 // not consts, only so tests shrink the waits; nothing at runtime reassigns them.
@@ -131,8 +150,8 @@ var (
 //   - running   → time since StartedAt (when the agent began), or CreatedAt if unstamped.
 //   - claimed   → time since ClaimedAt (when a worker took it), or CreatedAt if unstamped.
 //   - queued    → time since CreatedAt (how long it has waited to be claimed).
-//   - awaiting_approval / awaiting_input / limit_wait → time since UpdatedAt, i.e. how long
-//     it has been parked in that waiting state.
+//   - awaiting_approval / awaiting_input / awaiting_followup / limit_wait → time since
+//     UpdatedAt, i.e. how long it has been parked in that waiting state.
 //   - completed / failed / cancelled → the STATIC span FinishedAt−StartedAt, how long it
 //     actually ran, independent of now. A terminal run with no StartedAt (cancelled or
 //     failed before it ever started) never ran, so it renders "-".
@@ -159,7 +178,7 @@ func runAgeCell(r apitypes.RunDTO, now time.Time) string {
 		}
 	case "queued":
 		anchor = &r.CreatedAt
-	case "awaiting_approval", "awaiting_input", statusLimitWait:
+	case "awaiting_approval", "awaiting_input", "awaiting_followup", statusLimitWait:
 		anchor = &r.UpdatedAt
 	case "completed", "failed", "cancelled":
 		// A static ran-span, not a live age: only meaningful when the run both started
@@ -315,7 +334,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 					// cellText, NOT sanitizeTTY, and the difference is the whole point:
 					// sanitizeTTY spares "\n", so a status carrying one would inject a
 					// line onto stderr. Unreachable today because runs_status_check
-					// constrains status to nine values (migration 00092) — which is precisely the argument
+					// constrains status to ten values (migration 00146) — which is precisely the argument
 					// limitWaitLine's own comment REJECTS for rate_limit_type ("server-
 					// controlled today" is exactly the assumption that rots). Holding one
 					// line of this file to a weaker standard than the line beside it, on a
@@ -338,7 +357,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 		Short: "Block until a run reaches a chosen state",
 		Long: "Poll a run until its status enters the `--until` set, then exit 0 (PRD #264).\n\n" +
 			"With no `--until`, it stops on any state that needs you or ends the run: " +
-			"awaiting_approval, awaiting_input, completed, failed, cancelled. It does NOT stop " +
+			strings.Join(defaultWaitStates, ", ") + ". It does NOT stop " +
 			"on queued/claimed/running (still working) or limit_wait (auto-resumes), so a bare " +
 			"`uzi run wait <id>` waits for the plan gate OR the end.\n\n" +
 			"Transitions print to stderr; `--json` prints the final run object (same shape as " +
@@ -362,7 +381,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 	wait.Flags().StringSlice("until", nil,
-		"comma-separated run statuses to wait for (default: awaiting_approval,awaiting_input,completed,failed,cancelled)")
+		"comma-separated run statuses to wait for (default: "+strings.Join(defaultWaitStates, ",")+")")
 	wait.Flags().Duration("interval", runWaitPollInterval, "how often to poll the run's status")
 	wait.Flags().Duration("timeout", 0, "give up with exit 7 after this long (default: no timeout)")
 
@@ -496,6 +515,29 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 	cancel.Flags().StringP("message", "m", "", "reason for cancelling (optional; or pipe it on stdin)")
+
+	stop := &cobra.Command{
+		Use:   "stop <run-id>",
+		Short: "Gracefully stop an interactive run (finalize: push, open MR if requested)",
+		Long: "Gracefully wind down an interactive task run (PRD #517). Unlike `cancel`, which " +
+			"aborts mid-turn, `stop` lets the worker FINALIZE: it finishes the current turn, " +
+			"pushes the branch, opens the merge request (when the run requested one), and reports " +
+			"`completed`. The stop is serviced ahead of any buffered follow-up.\n\n" +
+			"An optional message can accompany the stop (pass -m or pipe it on stdin). A stop on a " +
+			"run that has already finished answers 409 (exit 5).",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			// The stop message is OPTIONAL, like a cancel reason — no empty check.
+			msg, _ := cmd.Flags().GetString("message")
+			msg = resolveMessage(env, msg)
+			return submitInput(env, gf, c, cmd, args[0], kindStop, msg, nil)
+		},
+	}
+	stop.Flags().StringP("message", "m", "", "an optional message to accompany the stop (or pipe it on stdin)")
 
 	followUp := &cobra.Command{
 		Use:   "follow-up <run-id>",
@@ -683,7 +725,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 	expedite.Flags().Bool("clear", false, "clear the manual expedite (undo), returning the run to its kind default priority")
 
-	cmd.AddCommand(list, get, logs, wait, review, create, approve, reject, revise, cancel, followUp, answer, inputs, expedite)
+	cmd.AddCommand(list, get, logs, wait, review, create, approve, reject, revise, cancel, stop, followUp, answer, inputs, expedite)
 	return cmd
 }
 
@@ -756,7 +798,7 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 			lastStatus = run.Status
 			sawStatus = true
 		}
-		// A status outside the nine-value enum means the server is newer than this
+		// A status outside the ten-value enum means the server is newer than this
 		// binary. Surface it once and keep waiting (it can never be a target — `--until`
 		// only names known statuses), so it is never a silent forever-wait; `--timeout`
 		// still bounds it (R1).
@@ -794,7 +836,7 @@ func waitTargets(until []string) (map[string]bool, error) {
 		s = strings.TrimSpace(s)
 		if !allRunStatuses[s] {
 			return nil, uzicli.Exitf(uzicli.ExitUsage,
-				"--until: %q is not a run status (valid: queued, claimed, running, awaiting_approval, awaiting_input, limit_wait, completed, failed, cancelled)", s)
+				"--until: %q is not a run status (valid: %s)", s, strings.Join(allRunStatusesOrder, ", "))
 		}
 		targets[s] = true
 	}
@@ -1034,6 +1076,10 @@ func inputOutcome(kind string, serverSide bool) string {
 			return "run cancelled"
 		}
 		return "cancellation sent"
+	case kindStop:
+		// A stop always enqueues (never a server-side transition), so serverSide is always
+		// false here — the worker finalizes the graceful wind-down.
+		return "stop sent"
 	case kindFollowUp:
 		return "follow-up sent"
 	case kindRevisePlan:
@@ -1793,6 +1839,7 @@ func renderRunInputs(p *uzicli.Printer, inputs []apitypes.SteerInputDTO, runStat
 //   - not consumed, run parked    → "queued (run paused on a usage limit)"
 //   - not consumed, otherwise     → "queued"
 //   - consumed, run at plan gate  → "delivered (applies after approval)"
+//   - consumed, awaiting follow-up → "delivered (resumes the run)"
 //   - consumed, run parked        → "delivered (run paused on a usage limit)"
 //   - consumed, otherwise         → "delivered"
 //
@@ -1828,6 +1875,12 @@ func steerState(consumedAt *time.Time, runStatus string) string {
 		// the user owes is different, and telling them to approve something would be
 		// simply wrong.
 		return "delivered (applies after the question is answered)"
+	}
+	if runStatus == "awaiting_followup" {
+		// PRD #517: the interactive task is parked awaiting the user's next follow-up.
+		// Tailored copy mirroring the web twin (SteerQueueCard's "Delivered — resumes
+		// the run") — a delivered follow-up here is what wakes the parked run.
+		return "delivered (resumes the run)"
 	}
 	if runStatus == statusLimitWait {
 		return "delivered" + parkedSuffix

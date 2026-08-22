@@ -136,6 +136,41 @@ func TestBoardRateLimitStripTonePct(t *testing.T) {
 	}
 }
 
+// TestBoardRateLimitStripAccentBarPerToken — every shown token is prefixed with exactly one
+// per-group accent bar ▎ (U+258E), so a 3-account fixture renders 3 bars. Count-anchored so it
+// fails red if the accent-bar prefix is removed.
+func TestBoardRateLimitStripAccentBarPerToken(t *testing.T) {
+	m := stripModel(t, []apitypes.TokenRateLimitDTO{
+		okMeter("sec-cristi", "cristi", true, 4, 82),
+		okMeter("sec-meta", "meta", true, 4, 94),
+		okMeter("sec-personal", "personal", true, 7, 100),
+	}, nil)
+	out := m.View().Content
+	if n := strings.Count(out, "▎"); n != 3 {
+		t.Errorf("want exactly 3 per-group accent bars (one per shown token), got %d:\n%s", n, out)
+	}
+}
+
+// TestBoardRateLimitStripAccentTint — the accent bar is a status light, tinted by the token's
+// PEAK window pct: alarm SGR when peak ≥ rateDangerPct, faint SGR otherwise. Asserted at the
+// SGR level (mirrors TestBoardRateLimitStripTonePct). `personal` (5h 7 low, 7d 100 danger)
+// proves PEAK drives the tint — a low 5h with a danger 7d must still redden, so flipping the
+// peak/threshold logic reddens this test.
+func TestBoardRateLimitStripAccentTint(t *testing.T) {
+	m := stripModel(t, []apitypes.TokenRateLimitDTO{
+		okMeter("sec-cristi", "cristi", true, 4, 82),      // peak 82 < 85 → faint
+		okMeter("sec-meta", "meta", true, 4, 94),          // peak 94 ≥ 85 → alarm
+		okMeter("sec-personal", "personal", true, 7, 100), // peak 100 ≥ 85 via 7d → alarm
+	}, nil)
+	out := m.View().Content
+	if frag := paintSeg(m.pal.alarm, nil, false, "▎"); !strings.Contains(out, frag) {
+		t.Errorf("a peak-≥-85 token's accent bar is not painted with m.pal.alarm; want fragment %q in:\n%s", frag, out)
+	}
+	if frag := paintSeg(m.pal.faintC, nil, false, "▎"); !strings.Contains(out, frag) {
+		t.Errorf("a peak-<-85 token's accent bar is not painted with m.pal.faintC; want fragment %q in:\n%s", frag, out)
+	}
+}
+
 // TestBoardRateLimitStripNilWindow — a nil window mirrors windowPct's "-" (no NN%).
 func TestBoardRateLimitStripNilWindow(t *testing.T) {
 	m := stripModel(t, []apitypes.TokenRateLimitDTO{

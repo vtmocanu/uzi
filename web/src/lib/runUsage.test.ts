@@ -99,6 +99,17 @@ function assistantUsageInst(
   return { ...assistantUsage(agent, u), agent_instance: agentInstance };
 }
 
+// PRD #516: a lead usage frame that ALSO co-carries `payload.context` (the lead's
+// context-window fill), exactly as the agent attaches it alongside `payload.usage`.
+function assistantUsageCtx(
+  agent: string,
+  u: { input: number; cacheRead?: number; cacheCreation?: number; output: number; model?: string },
+  ctx: { used: number; window: number; pct: number },
+): RunMessage {
+  const base = assistantUsage(agent, u);
+  return { ...base, payload: { ...(base.payload as Record<string, unknown>), context: ctx } };
+}
+
 describe("deriveRunUsage", () => {
   it("differences cumulative result frames into per-phase deltas; total is the high-water mark", () => {
     beforeEachReset();
@@ -897,5 +908,67 @@ describe("cacheDisplayPct", () => {
       if (fresh > 0) expect(pct, `${at}: fresh tokens exist, so 100% would be a lie`).toBeLessThan(100);
       if (cached > 0) expect(pct, `${at}: cache reads exist, so 0% would be a lie`).toBeGreaterThan(0);
     }
+  });
+});
+
+// PRD #516 — the lead's context-window fill (window FILL, not token spend). It rides the
+// lead's usage-latched assistant frame as `payload.context` and is derived onto
+// `RunUsage.leadContext`, latest-wins, lead-only.
+describe("deriveRunUsage.leadContext", () => {
+  beforeEachReset();
+
+  it("keeps the LATEST lead reading across multiple turns (last-wins)", () => {
+    const d = deriveRunUsage([
+      assistantUsageCtx("lead", { input: 100, output: 10 }, { used: 40_000, window: 200_000, pct: 20 }),
+      assistantUsageCtx("lead", { input: 200, output: 20 }, { used: 110_000, window: 200_000, pct: 55 }),
+      assistantUsageCtx("lead", { input: 300, output: 30 }, { used: 156_000, window: 200_000, pct: 78 }),
+    ]);
+    // The third turn wins — not the first, not a max, but the last in stream order.
+    expect(d.leadContext).toEqual({ used: 156_000, window: 200_000, pct: 78 });
+  });
+
+  it("is undefined when no frame carries a context", () => {
+    const d = deriveRunUsage([
+      assistantUsage("lead", { input: 100, output: 10 }),
+      assistantUsage("lead", { input: 200, output: 20 }),
+    ]);
+    expect(d.leadContext).toBeUndefined();
+  });
+
+  it("IGNORES a context on a non-lead (subagent) frame — the lead-only guard", () => {
+    const d = deriveRunUsage([
+      // A subagent frame carrying a synthetic context must never populate leadContext.
+      assistantUsageCtx("code-reviewer", { input: 500, output: 50 }, { used: 190_000, window: 200_000, pct: 95 }),
+    ]);
+    expect(d.leadContext).toBeUndefined();
+  });
+
+  it("takes the lead reading even when a later subagent frame carries its own context", () => {
+    const d = deriveRunUsage([
+      assistantUsageCtx("lead", { input: 100, output: 10 }, { used: 80_000, window: 200_000, pct: 40 }),
+      // A subagent frame AFTER the lead's must not overwrite the lead reading.
+      assistantUsageCtx("worker", { input: 500, output: 50 }, { used: 199_000, window: 200_000, pct: 99 }),
+    ]);
+    expect(d.leadContext).toEqual({ used: 80_000, window: 200_000, pct: 40 });
+  });
+
+  it("preserves pct > 100 unclamped (over the compaction line) in the data layer", () => {
+    const d = deriveRunUsage([
+      assistantUsageCtx("lead", { input: 300, output: 30 }, { used: 220_000, window: 200_000, pct: 110 }),
+    ]);
+    expect(d.leadContext).toEqual({ used: 220_000, window: 200_000, pct: 110 });
+    // The bar-width clamp lives in the render layer; the derived data keeps the truth.
+    expect(d.leadContext?.pct).toBe(110);
+  });
+
+  it("ignores a malformed context (non-finite / missing fields)", () => {
+    const d = deriveRunUsage([
+      msg("text", "lead", {
+        text: "…",
+        usage: { input_tokens: 100, output_tokens: 10 },
+        context: { used: 40_000, window: 200_000 }, // no pct → not a valid reading
+      }),
+    ]);
+    expect(d.leadContext).toBeUndefined();
   });
 });

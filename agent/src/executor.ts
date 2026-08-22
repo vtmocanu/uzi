@@ -33,6 +33,30 @@ import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * The resolution of an interactive-task follow-up park (PRD #517 M3). Returned by
+ * `RunContext.awaitFollowUp`. Discriminated so the loop can tell "keep going with a new
+ * follow-up" apart from every way a park can END:
+ *   - `followup` — the next user turn arrived; `body` is its text, folded into the next
+ *     implement turn exactly as a mid-run follow-up is.
+ *   - `ended` — the park is over. The disposition DEPENDS on `reason` — it is not one exit:
+ *       `idle`      — no follow-up arrived within the park's idle bound (M3); the run
+ *                     finalizes NORMALLY (reports `completed`, pushes its branch, opens an MR
+ *                     on `open_mr`), exactly as a non-interactive done;
+ *       `stopped`   — an explicit `stop` input ended the interactive run (SEAM: M4 wires
+ *                     the `stop` input kind + serviceFollowUp precedence; M3 never produces
+ *                     it). Reserved for a GRACEFUL stop (stop_kind='stopped'); for now it
+ *                     shares the idle normal-finalize;
+ *       `cancelled` — the run was cancelled (the existing steering cancel signal). This does
+ *                     NOT finalize as `completed`: the executor throws the cancel signal so
+ *                     the run reaches its terminal CANCEL path (reports `failed`; the server
+ *                     routes the stamped stop_kind='cancelled' to CancelRunByWorker). A parked
+ *                     cancel finalized as `completed` would wrongly push + open an MR.
+ */
+export type FollowUpOutcome =
+  | { kind: "followup"; body: string }
+  | { kind: "ended"; reason: "idle" | "stopped" | "cancelled" };
+
 /** A message the executor emits to the run stream (seq assigned downstream). */
 export interface EmittedMessage {
   kind: MessageKind;
@@ -90,6 +114,12 @@ export interface RunContext {
    *  resolve open decisions on best judgment rather than calling `ask_user`. Optional;
    *  absent ⇒ false (the stub executor and older callers ignore it). */
   autoApprove?: boolean;
+  /** PRD #517 M3: this is an INTERACTIVE task run (claim.interactive). Only meaningful for
+   *  kind="task": when true the implement loop, on a clean `signal_done`, checkpoint-pushes
+   *  and PARKS (via `awaitFollowUp`) instead of finalizing, then resumes the same session on
+   *  the next follow-up. Absent ⇒ false (the stub/test executors and non-interactive runs
+   *  never enter the park). */
+  interactive?: boolean;
   /** Append a message to the run's live stream. */
   emit(msg: EmittedMessage): void;
   /** Anthropic subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN) for the SDK. */
@@ -262,6 +292,24 @@ export interface RunContext {
    * failure so a checkpoint can never fail the run. Absent on the stub/test executors.
    */
   checkpoint?(opts: { reap: boolean; progress?: MilestoneProgress }): Promise<void>;
+  /**
+   * PRD #517 M3: park an INTERACTIVE task run after a clean `signal_done`, waiting for the
+   * next follow-up. The runner's implementation (a) reports `awaiting_followup` and verifies
+   * the ack (the park must actually take, mirroring askUser's ack check), then (b) blocks on
+   * the steering channel's `awaitFollowUp(idleMs)` and returns the outcome.
+   *
+   * CONSUME-BEFORE-REPORT ORDERING: the follow-up is delivered ONLY from the poll loop's
+   * post-route service step (serviceFollowUp), which runs after ConsumeRunInputs has stamped
+   * `consumed_at` in the same RETURNING that handed over the follow-up. So by the time this
+   * resolves `{kind:"followup"}`, the input is already consumed — and the loop's next
+   * `reportIteration` (`running`) passes the server's SetRunRunning wake guard by construction.
+   * This is the same discipline askUser uses; see runner.ts.
+   *
+   * The executor calls it OUTSIDE driveTurn (the idle watchdog lives inside driveTurn, so a
+   * parked run cannot trip REASON_IDLE), guarded on `ctx.interactive`. Absent on the
+   * stub/test/non-interactive executors, in which case the loop finalizes on done as today.
+   */
+  awaitFollowUp?(idleMs: number): Promise<FollowUpOutcome>;
 }
 
 export interface ExecutorResult {

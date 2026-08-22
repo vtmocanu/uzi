@@ -166,18 +166,6 @@
   .num.cool .v { color: rgb(var(--fg)); }
   .num.warm .v { color: rgb(var(--brand)); }
   .num.hot  .v { color: rgb(var(--danger)); }
-  /* ── lead-context headline: the operator surface you read without scanning lanes ──
-     A wider molten channel + readout sitting above the lanes. Same material as the
-     lane meter, one size up, spanning the row. */
-  .leadband { display: flex; align-items: center; gap: 0.85rem; margin-top: 1rem; padding: 0.7rem 0.9rem; border: 1px solid rgb(var(--edge)); border-radius: 0.75rem; background: linear-gradient(180deg, rgb(var(--raised) / 0.5), rgb(var(--bg))); }
-  .leadband .lbl { font-family: var(--mono); font-size: 0.68rem; letter-spacing: 0.14em; text-transform: uppercase; color: rgb(var(--faint)); white-space: nowrap; }
-  .leadband .meter { flex: 1; min-width: 60px; }
-  .meter.big { height: 9px; }
-  .leadband .rd { display: flex; align-items: baseline; gap: 0.5rem; white-space: nowrap; }
-  .leadband .rd .p { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 1rem; font-weight: 600; color: rgb(var(--brand)); }
-  .leadband .rd .p .u { font-size: 0.65rem; color: rgb(var(--faint)); margin-left: 0.05rem; }
-  .leadband .rd .t { font-family: var(--mono); font-size: 0.76rem; color: rgb(var(--muted)); font-variant-numeric: tabular-nums; }
-
   @keyframes grow { from { width: 0 !important; } }
   @keyframes menisc { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
 
@@ -234,9 +222,6 @@
     .lane .lname { font-size: 0.88rem; flex-shrink: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .ctx { grid-template-columns: 60px 2.5rem; gap: 0.45rem; }
     .meter { height: 6px; }
-    /* the lead-context headline keeps its channel but lets the readout wrap under it */
-    .leadband { flex-wrap: wrap; gap: 0.5rem 0.75rem; padding: 0.6rem 0.75rem; }
-    .leadband .meter { flex: 1 1 100%; order: 3; }
     .states .spec { display: flex; flex-wrap: wrap; gap: 0.4rem 0.85rem; grid-template-columns: none; }
     .states .sname { flex: 0 0 6rem; }
     .states .sdesc { flex-basis: 100%; }
@@ -247,7 +232,7 @@
   <header>
     <span class="eyebrow">uzi · run activity</span>
     <h1>The <span class="molten">context meter</span>, in place</h1>
-    <p class="lede">The same run-activity panel you have today, then the one change under review: a context-window meter for the <strong>lead</strong> — the only session the SDK exposes a window for — fed by <code>context_usage</code> from claude-agent-sdk 0.3.232. Real component structure, ember theme, 122-message crew mid-plan.</p>
+    <p class="lede">The same run-activity panel you have today, then the one change under review: a context-window meter for the <strong>lead</strong> — the only session the SDK exposes a window for — fed by <code>query.getContextUsage()</code> from claude-agent-sdk 0.3.232. Real component structure, ember theme, 122-message crew mid-plan.</p>
   </header>
 
   <!-- ══════════ BEFORE ══════════ -->
@@ -336,10 +321,10 @@
     </div>
 
     <div class="after-note">
-      <div><h3>Lead only</h3><p>The SDK exposes the <i>main-loop</i> (lead) context window — the one it autocompacts. A subagent runs in its own session the parent can't read, so researcher windows aren't observable; the <code>worker</code> bootstraps the SDK and is not a model session at all. So one channel, on the lead — a headline above the lanes and the lead's own row.</p></div>
+      <div><h3>Lead only</h3><p>The SDK exposes the <i>main-loop</i> (lead) context window — the one it autocompacts. A subagent runs in its own session the parent can't read, so researcher windows aren't observable; the <code>worker</code> bootstraps the SDK and is not a model session at all. So the meter rides only the lead: its own lane row, plus a small micro-meter on its crew chip — no separate headline band.</p></div>
       <div><h3>100% is the wall</h3><p><code>rawMaxTokens</code> is the autocompact window, so the channel spans the whole budget: 100% — the end of the channel — is where compaction fires and older turns get summarized. The rose wash in the last stretch is the cue worth catching at a glance.</p></div>
     </div>
   </section>
 
-  <p class="foot"><b>Not the same as token spend.</b> The run page already tallies per-agent token <i>cost</i> from the message stream (<code>PhaseUsage</code>). This is a different number: how full the lead's live window is <i>right now</i> — the thing that predicts compaction. The SDK exposes the lead's <code>context_usage</code>; surfacing it through the run DTO, the WS frames, the lead chip, the headline and the lead lane is the net-new work an enhancement issue would cover.</p>
+  <p class="foot"><b>Not the same as token spend.</b> The run page already tallies per-agent token <i>cost</i> from the message stream (<code>PhaseUsage</code>). This is a different number: how full the lead's live window is <i>right now</i> — the thing that predicts compaction. The SDK exposes the lead's window via <code>query.getContextUsage()</code>; surfacing it through the message payload, the lead chip, and the lead lane is the net-new work this change covers.</p>
 </div>

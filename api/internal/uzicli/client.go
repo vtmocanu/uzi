@@ -177,8 +177,10 @@ type Client interface {
 	// (--review) asks that a diff-review run be auto-created when the task completes,
 	// producing structured findings fetched via GetTaskReview; thenFixRequested
 	// (--then-fix) asks that, after that review, a chained fix run push fixes for its
-	// findings to the same branch (--then-fix implies --review).
-	CreateTaskRun(ctx context.Context, repoID, context, baseBranch string, openMR, reviewRequested, thenFixRequested bool) (apitypes.RunDTO, error)
+	// findings to the same branch (--then-fix implies --review); interactive
+	// (--interactive) asks the worker to keep the run alive after signal_done (parking in
+	// awaiting_followup to iterate) rather than terminating.
+	CreateTaskRun(ctx context.Context, repoID, context, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool) (apitypes.RunDTO, error)
 	// GetTaskReview fetches a handoff task's diff-review (PRD #400 M4a): GET
 	// /api/runs/{id}/task-review, whose envelope is {"task_review": <dto>|null}. A visible
 	// task with no review yet returns a nil DTO (the CLI prints "no review available yet");
@@ -1211,7 +1213,7 @@ func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int6
 	return env.Run, nil
 }
 
-func (c *HTTPClient) CreateTaskRun(ctx context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested, thenFixRequested bool) (apitypes.RunDTO, error) {
+func (c *HTTPClient) CreateTaskRun(ctx context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool) (apitypes.RunDTO, error) {
 	var env struct {
 		Run apitypes.RunDTO `json:"run"`
 	}
@@ -1224,9 +1226,10 @@ func (c *HTTPClient) CreateTaskRun(ctx context.Context, repoID, taskContext, bas
 		Context          string `json:"context"`
 		BaseBranch       string `json:"base_branch,omitempty"`
 		OpenMr           bool   `json:"open_mr"`
+		Interactive      bool   `json:"interactive"`
 		ReviewRequested  bool   `json:"review_requested"`
 		ThenFixRequested bool   `json:"then_fix_requested"`
-	}{Context: taskContext, BaseBranch: baseBranch, OpenMr: openMR, ReviewRequested: reviewRequested, ThenFixRequested: thenFixRequested}
+	}{Context: taskContext, BaseBranch: baseBranch, OpenMr: openMR, Interactive: interactive, ReviewRequested: reviewRequested, ThenFixRequested: thenFixRequested}
 	if err := c.postJSON(ctx, "/api/repos/"+url.PathEscape(repoID)+"/task-runs", reqBody, &env); err != nil {
 		return apitypes.RunDTO{}, err
 	}

@@ -237,6 +237,16 @@ export interface RunUsage {
   /** One row per agent (lane), keyed by `agent ?? "lead"`, in insertion order. NO
    *  `out`, NO cost. Untrusted-key `Map` for the same reason as `liveByModel`. */
   liveByAgent: { agent: string; fresh: number; cached: number }[];
+
+  /** The LEAD session's live context-window fill (PRD #516), read from the lead's
+   *  usage-latched assistant frame's `payload.context` and kept LATEST-WINS across the
+   *  lead's turns. This is window FILL (predicts autocompaction), DISTINCT from the token
+   *  SPEND surfaces above — the two must not be conflated. Lead-only: a `context` on any
+   *  non-lead (subagent) frame is ignored (the SDK exposes context usage for the main-loop
+   *  window only). `undefined` when no lead frame carried a `context`. `pct` is unclamped
+   *  and MAY exceed 100 — not clamped in this data layer; the meter clamps bar width while
+   *  showing the true number. */
+  leadContext?: { used: number; window: number; pct: number };
 }
 
 /**
@@ -283,6 +293,34 @@ function readUsage(u: unknown): { fresh: number; cached: number; out: number } |
     cached: num(r["cache_read_input_tokens"]),
     out: num(r["output_tokens"]),
   };
+}
+
+/**
+ * The lead session's live context-window fill, co-attached to the lead's usage-latched
+ * assistant frame as `payload.context` (PRD #516). This is window FILL — how full the
+ * live context window is, which predicts autocompaction — and is DISTINCT from the token
+ * SPEND tracked by `readUsage`/`PhaseUsage`. `pct` is the SDK's unclamped percentage and
+ * MAY exceed 100 (`totalTokens > rawMaxTokens`); it is NOT clamped here — the display
+ * layer clamps the bar width while showing the true number. Returns null unless all three
+ * fields are finite numbers, so a malformed or partial `context` never renders a meter.
+ */
+function readContext(v: unknown): { used: number; window: number; pct: number } | null {
+  const r = rec(v);
+  if (!r) return null;
+  const used = r["used"];
+  const window = r["window"];
+  const pct = r["pct"];
+  if (
+    typeof used !== "number" ||
+    !Number.isFinite(used) ||
+    typeof window !== "number" ||
+    !Number.isFinite(window) ||
+    typeof pct !== "number" ||
+    !Number.isFinite(pct)
+  ) {
+    return null;
+  }
+  return { used, window, pct };
 }
 
 /**
@@ -521,6 +559,11 @@ export function deriveRunUsage(messages: RunMessage[]): RunUsage {
   const phaseUsageBySeq = new Map<number, PhaseUsage>();
   const agentMap = new Map<string, AgentAcc>();
   let model: string | null = null;
+  // The lead's latest context-window fill (PRD #516). Latest-wins across the lead's
+  // turns: the loop walks `messages` in stream order, so a plain last-write here is the
+  // most-recent lead reading. Only the lead lane writes it — a `context` on a subagent
+  // frame is ignored (lead-only is the real SDK constraint, not a simplification).
+  let leadContext: { used: number; window: number; pct: number } | undefined;
 
   // The LIVE aggregate (issue #237), DEDUPED by `(agent_instance, usage)`. All state
   // is local to this one call — the reduction stays pure and idempotent under the
@@ -630,6 +673,14 @@ export function deriveRunUsage(messages: RunMessage[]): RunUsage {
       const u = readUsage(payload["usage"]);
       if (u) {
         const agent = m.agent ?? "lead";
+        // PRD #516: the lead's context-window fill co-rides this same usage-latched lead
+        // frame as `payload.context`. Read it ONLY on the lead lane (keyed exactly like
+        // the usage sum above) and keep the latest — a subagent frame carrying a
+        // synthetic `context` is deliberately ignored (lead-only SDK constraint).
+        if (agent === "lead") {
+          const ctx = readContext(payload["context"]);
+          if (ctx) leadContext = ctx;
+        }
         const acc = agentMap.get(agent) ?? { agent, fresh: 0, cached: 0, out: 0, modelCounts: newModelCounts() };
         acc.fresh += u.fresh;
         acc.cached += u.cached;
@@ -729,5 +780,6 @@ export function deriveRunUsage(messages: RunMessage[]): RunUsage {
     liveTotal,
     liveByModel,
     liveByAgent,
+    leadContext,
   };
 }

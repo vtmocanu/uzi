@@ -36,6 +36,7 @@ function parseTs(iso: string | null | undefined): number | null {
  *   - running             → `running <elapsed>` since started_at ?? created_at
  *   - awaiting_approval /
  *     awaiting_input /
+ *     awaiting_followup /
  *     limit_wait           → `waiting <elapsed>` since updated_at (time parked in that state)
  *   - completed / failed /
  *     cancelled (terminal) → `ran <elapsed>`, the STATIC span finished_at − started_at, i.e.
@@ -59,6 +60,7 @@ export function runDurationLabel(run: RunDurationInput, nowMs: number): string {
       return liveToken("running", run.started_at ?? run.created_at, nowMs);
     case "awaiting_approval":
     case "awaiting_input":
+    case "awaiting_followup":
     case "limit_wait":
       return liveToken("waiting", run.updated_at, nowMs);
     case "completed":
