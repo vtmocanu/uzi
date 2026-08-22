@@ -625,6 +625,27 @@ func (s *ProjectSyncService) GetVisibility(ctx context.Context, repoID uuid.UUID
 	return syncer.GetProjectV2Visibility(ctx, link.ProjectNodeID)
 }
 
+// RepoOwnerType reports whether the repo's owner is a GitHub User or Organization
+// (PRD #576 M1, F-G), for the sync panel's Provision feasibility nudge. It runs the
+// shared projectSyncPreamble (instance-flag gate, GitHub-only, forge build,
+// ProjectBoardSyncer assertion, scope preflight), resolves the repo's owner login via
+// RepoSlug, then issues a single `repositoryOwner(login){ __typename }` query. Unlike
+// GetVisibility it needs NO link row — the nudge is for a not-yet-linked repo — so it
+// never reads github_project_links. Errors (a bad slug, an unexpected __typename)
+// propagate to the handler's default 500; the frontend treats any failure as
+// "unresolved" and falls back to showing both paths.
+func (s *ProjectSyncService) RepoOwnerType(ctx context.Context, repoID uuid.UUID) (forge.ProjectV2OwnerType, error) {
+	repo, syncer, err := s.projectSyncPreamble(ctx, repoID)
+	if err != nil {
+		return "", err
+	}
+	owner, _, err := syncer.RepoSlug(ctx, repo.ForgeProjectID)
+	if err != nil {
+		return "", fmt.Errorf("project sync: resolve repo slug: %w", err)
+	}
+	return syncer.ResolveRepositoryOwnerType(ctx, owner)
+}
+
 // SetVisibility writes the linked board's `public` flag on GitHub (PRD #557 M2) via
 // `updateProjectV2`. Same preamble + link-row read as GetVisibility. As with
 // GetVisibility, a stale board node id propagates as a generic error (→ 500), not

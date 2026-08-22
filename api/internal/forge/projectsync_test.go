@@ -690,3 +690,64 @@ func TestGitHubResolveUserNodeID(t *testing.T) {
 		}
 	})
 }
+
+// TestGitHubResolveRepositoryOwnerType pins PRD #576 M1 (F-G): the
+// repositoryOwner(login){ __typename } query sends the login var and maps the wire
+// __typename "User" → OwnerTypeUser and "Organization" → OwnerTypeOrg; an
+// unexpected/empty __typename is a redacted error, not a silent zero value.
+func TestGitHubResolveRepositoryOwnerType(t *testing.T) {
+	t.Run("user", func(t *testing.T) {
+		var gotQuery string
+		var gotVars map[string]any
+		m := newMockGitHub(t, map[string]http.HandlerFunc{
+			graphqlRoute: func(w http.ResponseWriter, r *http.Request) {
+				req := readGQL(t, r)
+				gotQuery, gotVars = req.Query, req.Variables
+				writeGQLData(w, map[string]any{"repositoryOwner": map[string]any{"__typename": "User"}})
+			},
+		})
+		d := newGitHubRawDriver(t, m, "ghp_classicTokenValue1234567890")
+		ot, err := d.ResolveRepositoryOwnerType(context.Background(), "vtmocanu")
+		if err != nil {
+			t.Fatalf("ResolveRepositoryOwnerType: %v", err)
+		}
+		if ot != OwnerTypeUser {
+			t.Fatalf("owner type = %q, want %q", ot, OwnerTypeUser)
+		}
+		if !strings.Contains(gotQuery, "repositoryOwner") {
+			t.Errorf("query must name repositoryOwner: %q", gotQuery)
+		}
+		if gotVars["login"] != "vtmocanu" {
+			t.Errorf("login var not sent: %+v", gotVars)
+		}
+	})
+
+	t.Run("organization", func(t *testing.T) {
+		m := newMockGitHub(t, map[string]http.HandlerFunc{
+			graphqlRoute: func(w http.ResponseWriter, _ *http.Request) {
+				writeGQLData(w, map[string]any{"repositoryOwner": map[string]any{"__typename": "Organization"}})
+			},
+		})
+		d := newGitHubRawDriver(t, m, "ghp_classicTokenValue1234567890")
+		ot, err := d.ResolveRepositoryOwnerType(context.Background(), "some-org")
+		if err != nil {
+			t.Fatalf("ResolveRepositoryOwnerType: %v", err)
+		}
+		if ot != OwnerTypeOrg {
+			t.Fatalf("owner type = %q, want %q", ot, OwnerTypeOrg)
+		}
+	})
+
+	t.Run("unexpected typename errors", func(t *testing.T) {
+		m := newMockGitHub(t, map[string]http.HandlerFunc{
+			graphqlRoute: func(w http.ResponseWriter, _ *http.Request) {
+				// A null repositoryOwner (unknown login) decodes to an empty __typename.
+				writeGQLData(w, map[string]any{"repositoryOwner": nil})
+			},
+		})
+		d := newGitHubRawDriver(t, m, "ghp_classicTokenValue1234567890")
+		if _, err := d.ResolveRepositoryOwnerType(context.Background(), "nobody"); err == nil {
+			t.Fatal("an empty/unexpected __typename must yield an error")
+		}
+	})
+}

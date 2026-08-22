@@ -178,6 +178,9 @@ func (p *statefulProject) SetProjectV2Collaborator(context.Context, string, stri
 func (p *statefulProject) ResolveUserNodeID(context.Context, string) (string, error) {
 	return "", nil
 }
+func (p *statefulProject) ResolveRepositoryOwnerType(context.Context, string) (forge.ProjectV2OwnerType, error) {
+	return forge.OwnerTypeUser, nil
+}
 
 // --- statefulStore: a real projection store (marker survives across calls) --
 

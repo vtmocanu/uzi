@@ -79,6 +79,12 @@ type fakeProjectSyncer struct {
 	resolveUserID      string
 	resolveUserCalls   []string // logins resolved
 	resolveUserErr     error
+
+	// Owner-type resolution (PRD #576 M1): scripted return + error for the Provision
+	// feasibility nudge's repositoryOwner __typename lookup.
+	ownerType     forge.ProjectV2OwnerType
+	ownerTypeErr  error
+	ownerTypeCall []string // owner logins resolved
 }
 
 type setVisibilityCall struct {
@@ -222,6 +228,14 @@ func (f *fakeProjectSyncer) ResolveUserNodeID(_ context.Context, login string) (
 		return "", f.resolveUserErr
 	}
 	return f.resolveUserID, nil
+}
+
+func (f *fakeProjectSyncer) ResolveRepositoryOwnerType(_ context.Context, owner string) (forge.ProjectV2OwnerType, error) {
+	f.ownerTypeCall = append(f.ownerTypeCall, owner)
+	if f.ownerTypeErr != nil {
+		return "", f.ownerTypeErr
+	}
+	return f.ownerType, nil
 }
 
 // fakeForgeBuilder returns a fixed forge for ForgeForConnection.

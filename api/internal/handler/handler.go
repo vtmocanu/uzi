@@ -168,6 +168,10 @@ type ProjectSyncer interface {
 	// GetVisibility reads the linked board's current public flag (PRD #557 M2/M3): a
 	// live forge round-trip, kept off the DB-only status endpoint (D4).
 	GetVisibility(ctx context.Context, repoID uuid.UUID) (bool, error)
+	// RepoOwnerType reports whether the repo's owner is a GitHub User or Organization
+	// (PRD #576 M1), for the sync panel's Provision feasibility nudge. A live forge
+	// round-trip; needs no link row (used before the repo is linked).
+	RepoOwnerType(ctx context.Context, repoID uuid.UUID) (forge.ProjectV2OwnerType, error)
 	// SetVisibility writes the linked board's public flag (PRD #557).
 	SetVisibility(ctx context.Context, repoID uuid.UUID, public bool) error
 	// ShareWithUser grants the named GitHub login Reader access to the linked board
@@ -1078,6 +1082,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// relocated out of /admin (D4). Owner path is guarded by a GetRepoForUser
 				// preflight inside each handler; admin skips it. Instance flag still gates.
 				r.Get("/{id}/github-project-sync", h.GetGithubProjectSyncStatus)
+				// Owner-type read for the Adopt-first Provision nudge (PRD #576 M1):
+				// a live forge round-trip (repositoryOwner __typename), fetched for a
+				// not-yet-linked repo so it needs no link row. Web-only; the CLI does
+				// not use it.
+				r.Get("/{id}/github-project-sync/owner-type", h.GetGithubProjectOwnerType)
 				r.Post("/{id}/github-project-sync", h.AdoptGithubProjectSync)
 				r.Post("/{id}/github-project-sync/provision", h.ProvisionGithubProjectSync)
 				r.Delete("/{id}/github-project-sync", h.DisableGithubProjectSync)

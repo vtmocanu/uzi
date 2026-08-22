@@ -268,6 +268,49 @@ func (h *Handler) GetGithubProjectSyncStatus(w http.ResponseWriter, r *http.Requ
 	httpx.JSON(w, http.StatusOK, resp)
 }
 
+// GetGithubProjectOwnerType is the owner-type read (PRD #576 M1, owner-or-admin by
+// issue #534 D4): report whether the repo's GitHub owner is a "User" or an
+// "Organization", for the sync panel's Provision feasibility nudge. Like the
+// visibility read it makes a live forge round-trip (repositoryOwner __typename), and
+// unlike the DB-only status route it needs NO link row — it is fetched for a
+// not-yet-linked repo. Same owner-or-admin, path-scoped shape and error mapping as the
+// sibling routes: a non-admin must own the repo (GetRepoForUser preflight, 404 for a
+// foreign/unknown id), an admin skips it; the preflight runs BEFORE the nil-guard.
+func (h *Handler) GetGithubProjectOwnerType(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
+		return
+	}
+	if !user.IsAdmin {
+		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				httpx.Error(w, http.StatusNotFound, "repo not found")
+				return
+			}
+			slog.Error("github project sync: owner preflight", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+	if h.projectSync == nil {
+		slog.Error("github project sync owner-type: service not wired")
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	ot, err := h.projectSync.RepoOwnerType(r.Context(), id)
+	if err != nil {
+		writeProjectSyncError(w, "owner-type", err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"owner_type": string(ot)})
+}
+
 // setVisibilityRequest is the PUT body for the visibility toggle: the desired public
 // flag. The repo target is taken from the path, never the body (audit), like adopt.
 type setVisibilityRequest struct {

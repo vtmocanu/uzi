@@ -2472,6 +2472,12 @@ export const mockApi = {
     if (!link) throw new ApiError(404, "project sync not enabled for this repo");
     return delay({ ...link });
   },
+  // Owner type for the Adopt-first Provision nudge (PRD #576 M1). The mock treats
+  // every repo as org-owned so Provision stays available in the demo/offline mode.
+  getProjectSyncOwnerType: async (id: string) => {
+    void id;
+    return delay<{ owner_type: "User" | "Organization" }>({ owner_type: "Organization" });
+  },
   // Provision a fresh project: record a uzi-owned link and return the created status.
   provisionProjectSync: async (
     id: string,

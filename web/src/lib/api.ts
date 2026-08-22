@@ -2857,6 +2857,15 @@ const realApi = {
       `/repos/${id}/github-project-sync/provision`,
       { owner_kind: body.owner_kind, title: body.title ?? "" },
     ),
+  // Read the repo owner's GitHub type for the Adopt-first Provision nudge (PRD
+  // #576 M1): a live forge round-trip (repositoryOwner __typename), fetched for a
+  // not-yet-linked repo. "User" means Provision cannot own a project under a
+  // personal account (Adopt instead); "Organization" means Provision is available.
+  getProjectSyncOwnerType: (id: string) =>
+    request<{ owner_type: "User" | "Organization" }>(
+      "GET",
+      `/repos/${id}/github-project-sync/owner-type`,
+    ),
   // Adopt an EXISTING Project v2 by number (200 { status: "linked" }).
   adoptProjectSync: (
     id: string,

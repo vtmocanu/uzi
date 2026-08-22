@@ -67,7 +67,10 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 155 as of this commit (PRD #557 added GET+PUT /api/repos/{id}/github-project-sync/
+// 156 as of this commit (PRD #576 M1 added GET
+// /api/repos/{id}/github-project-sync/owner-type — the Adopt-first Provision nudge's
+// owner-type read).
+// It was 155 until then (PRD #557 added GET+PUT /api/repos/{id}/github-project-sync/
 // visibility and POST+DELETE /api/repos/{id}/github-project-sync/collaborators — the
 // four board-access routes).
 // It was 151 until then (issue #534 relocated the four github-project-sync routes
@@ -247,6 +250,9 @@ var wantRouteMounts = []routeMount{
 	// from the admin READ group to owner-or-admin /repos (D4). A read of the stored
 	// projection, no forge call → noLimiter.
 	{"GET", "/api/repos/{id}/github-project-sync", noLimiter},
+	// PRD #576 M1 owner-type read for the Adopt-first Provision nudge: a lazy forge
+	// round-trip on the same owner-or-admin group as the sibling routes → noLimiter.
+	{"GET", "/api/repos/{id}/github-project-sync/owner-type", noLimiter},
 	// PRD #557 board-access visibility read: a lazy forge round-trip on the same
 	// owner-or-admin group as the sibling routes → noLimiter, like the sibling reads.
 	{"GET", "/api/repos/{id}/github-project-sync/visibility", noLimiter},

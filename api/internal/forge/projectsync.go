@@ -59,6 +59,23 @@ const (
 	OwnerOrg
 )
 
+// ProjectV2OwnerType is the GraphQL `__typename` of a repository owner — the
+// closed set uzi distinguishes for the Provision feasibility nudge (PRD #576 M1,
+// F-G). The wire values are GitHub's interface-implementation type names as
+// returned by `repositoryOwner(login){ __typename }`.
+type ProjectV2OwnerType string
+
+const (
+	// OwnerTypeUser is a personal account (repositoryOwner __typename "User"). A
+	// PAT can create projects only for its own viewer, never for another user, so
+	// Provision cannot produce a linkable project for a user-owned repo (F-A).
+	OwnerTypeUser ProjectV2OwnerType = "User"
+	// OwnerTypeOrg is an organization (repositoryOwner __typename "Organization").
+	// Provision is the safe path here when the bot is an org member with project
+	// rights.
+	OwnerTypeOrg ProjectV2OwnerType = "Organization"
+)
+
 // ProjectV2Ref identifies a resolved Projects v2 board: its opaque node id, its
 // human-facing number, and its title.
 type ProjectV2Ref struct {
@@ -180,6 +197,14 @@ type ProjectBoardSyncer interface {
 	// (GitHub's NOT_FOUND), so callers can map a bad username to 422 while every
 	// other error stays a 500.
 	ResolveUserNodeID(ctx context.Context, login string) (string, error)
+	// ResolveRepositoryOwnerType reports whether a repo owner login is a User or an
+	// Organization via `repositoryOwner(login){ __typename }` (PRD #576 M1, F-G).
+	// GitHub's repositoryOwner interface resolves to a User or Organization object,
+	// whose __typename distinguishes the two; the Provision feasibility nudge uses
+	// this to steer user-owned repos toward Adopt (Provision cannot own a project
+	// under a personal account — F-A). Any other/empty __typename is a redacted
+	// error.
+	ResolveRepositoryOwnerType(ctx context.Context, owner string) (ProjectV2OwnerType, error)
 }
 
 // --- github driver implementation ------------------------------------------
@@ -710,6 +735,32 @@ func (g *github) ResolveUserNodeID(ctx context.Context, login string) (string, e
 		return "", ErrGitHubUserNotFound
 	}
 	return out.User.ID, nil
+}
+
+func (g *github) ResolveRepositoryOwnerType(ctx context.Context, owner string) (ProjectV2OwnerType, error) {
+	const query = `query($login: String!) {
+  repositoryOwner(login: $login) { __typename }
+}`
+	var out struct {
+		RepositoryOwner struct {
+			TypeName string `json:"__typename"`
+		} `json:"repositoryOwner"`
+	}
+	if err := g.graphqlDo(ctx, query, map[string]any{"login": owner}, &out); err != nil {
+		return "", err
+	}
+	switch out.RepositoryOwner.TypeName {
+	case string(OwnerTypeUser):
+		return OwnerTypeUser, nil
+	case string(OwnerTypeOrg):
+		return OwnerTypeOrg, nil
+	default:
+		// An empty or unexpected __typename (owner not found, or a future owner
+		// interface implementation) — redact and refuse rather than guess. No PAT
+		// is interpolated into this message, but route it through redact for
+		// consistency with the other resolvers.
+		return "", g.redact.error(fmt.Errorf("github: resolve owner type: unexpected owner __typename %q for %q", out.RepositoryOwner.TypeName, owner))
+	}
 }
 
 // toProjectV2Options maps the decoded {id,name} option nodes onto the neutral
