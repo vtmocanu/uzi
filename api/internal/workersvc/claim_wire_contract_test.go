@@ -78,8 +78,12 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 		// present-and-zero" reason the flags above carry non-default — even though they
 		// are only meaningful for kind='task'. open_mr has no omitempty (always present,
 		// like auto_approve); base_branch is a pointer (nil ⇒ absent).
-		OpenMr:     true,
-		BaseBranch: strptr("develop"),
+		OpenMr: true,
+		// PRD #517 M1: interactive rides every claim (a plain bool, no omitempty, always
+		// present). Non-default (true) here for the same "wired vs present-and-zero" reason
+		// as open_mr above, even though it is only meaningful for kind='task'.
+		Interactive: true,
+		BaseBranch:  strptr("develop"),
 		// PRD #400 M4a: review_target_run_id rides every claim (a *string, no omitempty, so
 		// always present — null for a non-review run). This sample is NOT a review run, so it
 		// is left nil/null here; the non-null delivery for an actual review run is pinned in

@@ -101,7 +101,7 @@ const maxWorkerNameBytes = 200
 // runInputKinds is the accepted steering-input set (mirrors the DB CHECK).
 var runInputKinds = map[string]bool{
 	"follow_up": true, "approve_plan": true, "reject_plan": true, "cancel": true, "revise_plan": true,
-	"answer": true,
+	"answer": true, "stop": true,
 }
 
 // -------------------------------------------------------------------------
@@ -369,6 +369,7 @@ func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
 		Branch:      textPtrValue(r.Branch.Valid, r.Branch.String),
 		BaseBranch:  textPtrValue(r.BaseBranch.Valid, r.BaseBranch.String),
 		OpenMr:      r.OpenMr,
+		Interactive: r.Interactive,
 		// PRD #400 Decision 6: when the task run's dispatch gate was stamped (null until
 		// then, and on every non-task run). Mapped like ClaimedAt.
 		DispatchedAt:  timePtr(r.DispatchedAt.Valid, r.DispatchedAt.Time),
@@ -913,6 +914,10 @@ type CreateTaskRunRequest struct {
 	Context    string `json:"context"`
 	BaseBranch string `json:"base_branch"`
 	OpenMr     bool   `json:"open_mr"`
+	// Interactive asks that the worker keep the run alive after signal_done (--interactive,
+	// PRD #517 M1), parking it in awaiting_followup to iterate conversationally rather than
+	// terminating; wound down with 'uzi run stop'. Defaults false (a plain handoff).
+	Interactive bool `json:"interactive"`
 	// ReviewRequested asks that a diff-review run be auto-created when this task completes
 	// (--review, PRD #400 M4a): the review clones the finished branch, diffs it, and posts
 	// structured findings the CLI fetches. Defaults false (a plain handoff).
@@ -943,7 +948,7 @@ func (h *Handler) CreateTaskRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "context is required")
 		return
 	}
-	run, err := h.wsvc.CreateTaskRun(r.Context(), user.ID, repo.ID, req.Context, req.BaseBranch, req.OpenMr, req.ReviewRequested, req.ThenFixRequested)
+	run, err := h.wsvc.CreateTaskRun(r.Context(), user.ID, repo.ID, req.Context, req.BaseBranch, req.OpenMr, req.ReviewRequested, req.ThenFixRequested, req.Interactive)
 	if err != nil {
 		h.writeStartRunError(w, r, err)
 		return
@@ -1226,7 +1231,7 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !runInputKinds[req.Kind] {
-		httpx.Error(w, http.StatusBadRequest, "kind must be one of follow_up, approve_plan, reject_plan, cancel, revise_plan, answer")
+		httpx.Error(w, http.StatusBadRequest, "kind must be one of follow_up, approve_plan, reject_plan, cancel, revise_plan, answer, stop")
 		return
 	}
 
@@ -1249,6 +1254,10 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusNotFound, "run not found")
 		case errors.Is(err, workersvc.ErrRunTerminal):
 			httpx.Error(w, http.StatusConflict, "run has already finished")
+		case errors.Is(err, workersvc.ErrStopNotInteractive):
+			// 409: a run-state conflict. Only an interactive task run's park honors a
+			// graceful stop; on any other run nothing would wind it down.
+			httpx.Error(w, http.StatusConflict, "run stop applies only to interactive task runs")
 		case errors.Is(err, workersvc.ErrReviseCapReached):
 			httpx.Error(w, http.StatusConflict, "plan revision limit reached")
 		case errors.Is(err, workersvc.ErrChatInputNotAllowed):

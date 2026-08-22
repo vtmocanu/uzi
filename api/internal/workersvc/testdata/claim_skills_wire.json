@@ -24,6 +24,7 @@
   "plan_md": "# Plan\n",
   "auto_approve": true,
   "open_mr": true,
+  "interactive": true,
   "base_branch": "develop",
   "review_target_run_id": null,
   "wait_on_limit": true,

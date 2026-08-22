@@ -1194,6 +1194,12 @@ func statusGlyph(rc store.GetSlackRunContextRow) (emoji, label string) {
 		// on the root line of a user-facing DM — the web has a replace(/_/g," ") fallback,
 		// Slack has none (PRD #88 M3).
 		return "❓", "Needs your answer"
+	case "awaiting_followup":
+		// PRD #517: an interactive task parked awaiting the user's next follow-up. Distinct
+		// emoji and label from awaiting_input's ❓ "Needs your answer" — this is a follow-up
+		// park, not a clarification. Without this case the default arm renders the raw enum
+		// `awaiting_followup` on the root line (Slack has no _→space fallback).
+		return "💬", "Awaiting your follow-up"
 	case "limit_wait":
 		return "⏸️", "Paused · usage limit"
 	case "completed":

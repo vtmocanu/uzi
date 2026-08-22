@@ -244,6 +244,7 @@ func run() error {
 	wsvc := workersvc.New(q, box, workersvc.Params{
 		RunTimeout:                  cfg.RunTimeout,
 		RunIdleTimeout:              cfg.RunIdleTimeout,
+		WorkerTaskIdleTimeout:       cfg.WorkerTaskIdleTimeout,
 		RunMaxIterations:            cfg.RunMaxIterations,
 		PlanMaxRevisions:            cfg.PlanMaxRevisions,
 		QuestionMax:                 cfg.QuestionMax,

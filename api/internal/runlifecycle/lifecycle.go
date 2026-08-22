@@ -189,7 +189,13 @@ func reconcilerDecision(status string, origin pgtype.Text) decision {
 	//
 	// awaiting_input (PRD #88) is here for exactly the same reasons, and a
 	// clarification park outlasts 30 minutes just as routinely.
-	case "queued", "claimed", "running", "awaiting_approval", "awaiting_input", "limit_wait":
+	//
+	// awaiting_followup (PRD #517) is the interactive-task park and belongs here for
+	// the same reasons: a run parked after signal_done still holds its issue, session
+	// and branch, resumes on its own follow-up, and routinely idles past 30 minutes —
+	// so the default {act:false} arm would leave its pending move marker UNHEALED and
+	// trip the give-up warn as the normal case.
+	case "queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "limit_wait":
 		return decision{act: true, target: board.ColumnInProgress}
 	case "completed":
 		return decision{act: true, target: board.ColumnHumanReview}

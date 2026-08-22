@@ -152,18 +152,96 @@ const REASON_MAX_ITERATIONS =
 // the run.
 const PROGRESS_MISS_LIMIT = 2;
 
+// PRD #517 M3/M5: the FALLBACK idle bound for an INTERACTIVE task's follow-up park — how
+// long the run waits at awaiting_followup for the next follow-up before the park ENDS and
+// the run finalizes. As of M5 the live value is server-configured via
+// WORKER_TASK_IDLE_TIMEOUT, delivered on the claim as `config.task_idle_timeout_seconds`
+// (like the other per-run caps); this constant is the fallback used only when that field
+// is absent or non-positive (an older server / missing field ⇒ 30m). Kept generous so an
+// interactive session survives a human thinking between turns, but bounded so an abandoned
+// interactive run does not pin a worker slot forever. NOTE the unit is MS; the park site
+// passes it to seconds() as SECONDS (÷1000), since seconds()'s fallback is in seconds.
+const TASK_FOLLOWUP_IDLE_MS = 30 * 60_000; // 30m
+
+/**
+ * The reading returned by the SDK Query's `getContextUsage()` control method,
+ * narrowed to the three fields uzi attaches to the lead's usage frame (PRD #516).
+ * The real `SDKControlGetContextUsageResponse` is a superset, so the real `Query`
+ * still satisfies this shape (return types are covariant).
+ */
+export interface ContextUsageReading {
+  totalTokens: number;
+  rawMaxTokens: number;
+  percentage: number;
+}
+
 /**
  * Injectable seam over the SDK's `query`. The return only needs to be async
  * iterable for the executor; cancellation goes through `options.abortController`
  * and the process-group kill uses the pid captured by `spawnClaudeCodeProcess`.
+ *
+ * PRD #516: the runtime object is the SDK's real `Query`, which carries a
+ * `getContextUsage()` control method the bare `AsyncIterable<SDKMessage>` does not
+ * surface. It is declared here as an OPTIONAL method so the ~10 existing `queryFn`
+ * fakes across `agent/test/` (which return a bare async iterable) keep compiling
+ * untouched; the producer null-checks it before calling.
  */
 export type SdkQueryFn = (params: {
   prompt: AsyncIterable<unknown>;
   options: SdkOptions;
-}) => AsyncIterable<SDKMessage>;
+}) => AsyncIterable<SDKMessage> & {
+  getContextUsage?(): Promise<ContextUsageReading>;
+};
 
 const defaultQueryFn: SdkQueryFn = (params) =>
+  // The real SDK `Query` has a required `getContextUsage()` returning the wider
+  // `SDKControlGetContextUsageResponse`; it satisfies the optional, narrower seam
+  // type above by covariance, so no cast is needed here.
   sdkQuery({ prompt: params.prompt as never, options: params.options });
+
+/** PRD #516 R1: how long to wait on the `getContextUsage()` control call before
+ *  giving up. A bare `await` on a call that never resolves (CLI mid-shutdown,
+ *  control unsupported) would block the turn until the wall watchdog kills it, so
+ *  the reading is raced against this timeout and any timeout/error is swallowed. */
+const CONTEXT_USAGE_TIMEOUT_MS = 2000;
+
+/**
+ * PRD #516 M1: read the lead session's live context-window fill via the SDK
+ * Query's `getContextUsage()` control method, mapped to the pinned payload
+ * contract `{ used, window, pct }`. Returns `undefined` — never throws — when the
+ * method is absent (existing fakes, older CLI), the call errors, or it hangs past
+ * the timeout, so the caller simply attaches no `context` and the turn is
+ * unaffected (Risk R1/R2, Success Criteria 5).
+ */
+async function readLeadContext(
+  queryInstance: { getContextUsage?(): Promise<ContextUsageReading> },
+  timeoutMs: number,
+): Promise<{ used: number; window: number; pct: number } | undefined> {
+  const getContextUsage = queryInstance.getContextUsage;
+  if (typeof getContextUsage !== "function") return undefined;
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const reading = await Promise.race([
+      getContextUsage.call(queryInstance),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("getContextUsage timed out")),
+          timeoutMs,
+        );
+        timer.unref?.();
+      }),
+    ]);
+    return {
+      used: reading.totalTokens,
+      window: reading.rawMaxTokens,
+      pct: reading.percentage,
+    };
+  } catch {
+    return undefined;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 export interface SdkExecutorOptions {
   /** Override the SDK entrypoint (tests inject a fake transport here). */
@@ -209,6 +287,10 @@ export interface SdkExecutorOptions {
    *  clone). Injected in tests so the advisory hooks are drivable with a fake that
    *  records calls and can throw, proving failure isolation with no live SDK. */
   summaryRunner?: SummaryRunner;
+  /** PRD #516 M1: timeout for the per-turn `getContextUsage()` control call.
+   *  Default {@link CONTEXT_USAGE_TIMEOUT_MS} (2s); tests lower it so the hang case
+   *  resolves fast. */
+  contextUsageTimeoutMs?: number;
 }
 
 /** What one turn observed: the session id, and any workflow signals. */
@@ -320,6 +402,8 @@ export class SdkExecutor implements Executor {
    *  shared provisioning HOME, a writable data-volume path — never the clone); tests
    *  inject a fake. Only used by the advisory summary hooks. */
   private readonly summaryRunner: SummaryRunner;
+  /** PRD #516 M1: timeout for the per-turn `getContextUsage()` control call. */
+  private readonly contextUsageTimeoutMs: number;
   /** Every pid spawned across the current run's turns, for the done-path reap.
    *  Private to THIS instance — one SdkExecutor is built per run (PRD #42 Decision
    *  4), so two concurrent runs can never wipe/kill each other's set. */
@@ -363,6 +447,8 @@ export class SdkExecutor implements Executor {
     // is where the judge/run put theirs — NOT the clone). Tests inject a fake.
     this.summaryRunner =
       opts.summaryRunner ?? new SummaryRunner(this.log, { homeRoot: this.provisionHomeDir });
+    this.contextUsageTimeoutMs =
+      opts.contextUsageTimeoutMs ?? CONTEXT_USAGE_TIMEOUT_MS;
   }
 
   /**
@@ -1325,6 +1411,16 @@ export class SdkExecutor implements Executor {
         : undefined;
       let iteration = 0;
       let followUp: string | undefined;
+      // PRD #517 M3 (Fix 3): latches TRUE the first time this run parks at an interactive
+      // follow-up. The first-turn-only prompt scaffolding (the "your plan was approved"
+      // framing, priorWork/deps notes, and the base-commit note) must be emitted on the
+      // GENUINE first turn of the whole run, never on a resumed follow-up turn — a follow-up
+      // is not a newly-approved plan, and its base-commit note would re-inject the ORIGINAL
+      // base across already-landed follow-up work. So `first` is `iteration === 1 &&
+      // !hasParked`, not `iteration === 1` (the per-follow-up counter resets to 0 on each
+      // follow-up). A non-interactive run never parks, so this stays false and its `first`
+      // behaviour is byte-identical to before.
+      let hasParked = false;
       // PRD #390 M3 (D2/D4): mid-run milestone-reporting enforcement state. progressMissedLastTurn
       // escalates the NEXT turn's prompt; consecutiveMisses counts work turns that left the tracker
       // with no milestone in progress. Bounded, feed-only, never fails the run.
@@ -1386,7 +1482,11 @@ export class SdkExecutor implements Executor {
             // both the own AND repo sources — not the plan-turn map, which is keyed by
             // `assembled.subagents` and would miss every repo-source name.
             subagentCanWrite: selectedCanWrite,
-            first: iteration === 1,
+            // PRD #517 M3 (Fix 3): first-turn scaffolding on the genuine first turn of the
+            // WHOLE run only, not the first turn of each follow-up. hasParked latches true
+            // once the run has parked, so a resumed follow-up turn (iteration back at 1) is
+            // NOT treated as first. Non-interactive runs never park → identical to before.
+            first: iteration === 1 && !hasParked,
             iteration,
             // PRD #209 (Decision A): a seeded run's first-turn opening says the user
             // supplied the plan, not that it was "approved". First turn only (gated
@@ -1465,7 +1565,89 @@ export class SdkExecutor implements Executor {
               : undefined;
           continue;
         }
-        if (turn.done) break;
+        if (turn.done) {
+          // PRD #517 M3: an INTERACTIVE task run does NOT finalize on a clean signal_done —
+          // it checkpoint-pushes its branch, PARKS at awaiting_followup, and resumes the SAME
+          // session on the next follow-up. Guarded on ctx.interactive AND a wired
+          // awaitFollowUp, so a non-interactive run (and any executor that did not wire the
+          // callback) breaks to the normal finalize below, byte-identical to today.
+          if (ctx.interactive && ctx.awaitFollowUp) {
+            // Checkpoint-push at every park (Decision 4): the deliverable is commits the user
+            // pulls, so try to get the turn's work onto origin before blocking. This is
+            // BEST-EFFORT — checkpoint swallows push failures, so the run still PARKS even if
+            // the branch tip did not reach the remote; durability is bounded by this push but
+            // NOT guaranteed by it. D4 chooses that deliberately ("a park that fails is worse
+            // than a park that loses work"), consistent with the existing checkpoint
+            // semantics. The backstops are the worker PVC (the commits survive on disk) and a
+            // later checkpoint re-push. reap:true — the same reap-before-git ordering the done
+            // path uses; the session transcript survives on disk, so the next turn resumes it.
+            await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+            // Fix 3: the run has now parked at least once. Latch it so no resumed follow-up
+            // turn re-emits the first-turn-only scaffolding (see `first` above and hasParked).
+            hasParked = true;
+            // Park OUTSIDE driveTurn (the idle watchdog lives inside driveTurn, so a parked
+            // run cannot trip REASON_IDLE — the same property the ask_user park relies on).
+            // PRD #517 M5: the idle bound is the server-configured WORKER_TASK_IDLE_TIMEOUT
+            // delivered on the claim (task_idle_timeout_seconds), with the TASK_FOLLOWUP_IDLE_MS
+            // constant as the fallback for an older server / missing field. seconds() converts
+            // the claim seconds → ms and guards a non-positive value to the fallback; its
+            // fallback is in SECONDS, so the ms constant is passed as seconds (÷1000).
+            const followupIdleMs = seconds(
+              ctx.config?.task_idle_timeout_seconds,
+              TASK_FOLLOWUP_IDLE_MS / 1000,
+            );
+            const outcome = await ctx.awaitFollowUp(followupIdleMs);
+            if (outcome.kind === "followup") {
+              // Fold the follow-up into the next turn EXACTLY as a mid-run follow-up is
+              // (buildImplementPrompt renders `followUp` as UNTRUSTED user input); the
+              // resumed session keeps full context, so nothing is replayed.
+              followUp = outcome.body;
+              // RESET the iteration budget: each follow-up gets a fresh maxIterations. An
+              // interactive run spans many follow-ups over its lifetime and must NOT fail with
+              // REASON_MAX_ITERATIONS after N turns SUMMED across them — the budget bounds one
+              // task, not the whole conversation. `continue` re-enters the loop, which does
+              // iteration++ (→ 1) and reportIteration (→ running); that report passes the
+              // server's wake guard because the follow-up was already consumed by the poll
+              // loop before awaitFollowUp resolved (consume-before-report).
+              iteration = 0;
+              // Fix 2: RESET the wall-clock budget too, to the same fresh per-run allowance
+              // the loop initialised it to (initialWallMs, ~:816). Each follow-up is a fresh
+              // task with a fresh budget — the wall bounds ONE follow-up's in-turn compute,
+              // not the whole conversation, matching the iteration-reset rationale above.
+              // Without this, cumulative in-turn time SUMMED across all follow-ups debits from
+              // one budget and a genuinely long-lived interactive session self-trips
+              // REASON_WALL, defeating the feature (the server-side SweepRunningTimeout was
+              // exempted for interactive runs in M2 for the same reason). This is the exact
+              // field armWall/disarmWall read/debit, so no stale wall accumulator survives.
+              // The whole-session cap is the M5 idle timeout, not the per-follow-up wall.
+              state.wallRemainingMs = initialWallMs;
+              continue;
+            }
+            // outcome.kind === "ended". Discriminate on the reason (Fix 1):
+            if (outcome.reason === "cancelled") {
+              // A cancelled parked run is still `awaiting_followup` server-side. Falling
+              // through to the normal `break` would finalize it as `completed`
+              // (SetRunCompleted admits any non-terminal status and ignores stop_kind), so the
+              // branch would be pushed and an MR opened on `open_mr` — WRONG for a cancel.
+              // Throw the SAME cancel signal the plan gate (~:1192) and the clarification park
+              // use — Error(REASON_CANCELLED), which yields a `cancelled` terminal, NOT
+              // PlanRejectedError (that is a plan-rejected terminal). The run then reaches the
+              // terminal cancel path: the worker reports `failed`, and the server routes the
+              // stamped stop_kind='cancelled' to CancelRunByWorker.
+              throw new Error(REASON_CANCELLED);
+            }
+            // outcome.reason === "idle" (no follow-up arrived within the idle bound) and
+            // outcome.reason === "stopped" (PRD #517 M4: a graceful `uzi run stop` — the
+            // steering `stop` input the poll loop consumed and routed) BOTH finalize normally
+            // via the break below: push + open MR iff open_mr → report `completed`. The server
+            // pre-stamped stop_kind='stopped' on the run (SubmitInput's stop branch); SetRun-
+            // Completed does NOT clear it, so the completion lands with stop_kind='stopped' and
+            // fires --review iff requested. A `stopped` disposition must NOT throw the cancel
+            // signal (unlike `cancelled` above) — a graceful stop is a clean completion, not an
+            // abort. Named explicitly so the three ended-reasons are exhaustively handled.
+          }
+          break;
+        }
         if (iteration >= maxIterations) throw new Error(REASON_MAX_ITERATIONS);
 
         // PRD #122 M6 (Decision 10b): iteration-boundary fallback checkpoint. Only reached
@@ -1898,6 +2080,10 @@ export class SdkExecutor implements Executor {
 
     const result: TurnResult = { done: false };
     let turnSessionId: string | undefined;
+    // PRD #516 M1: the lead context reading is attached AT MOST ONCE per turn, on
+    // the same lead assistant frame that first latches usage. Turn-scoped so a turn
+    // with several assistant frames issues exactly one `getContextUsage()` call.
+    let contextAttached = false;
     let sawErrorResult = false;
     let errorSubtype = "unknown";
     // PRD #35. The observer rides the SAME iteration mapSdkMessage already does —
@@ -1984,6 +2170,24 @@ export class SdkExecutor implements Executor {
             // from a model-only frame. No usage ⇒ no model, deliberately.
             if (frameModel !== undefined) em.payload["model"] = frameModel;
             usageAttached = true;
+            // PRD #516 M1: CO-ATTACH the lead's live context-window fill on the SAME
+            // frame that got usage, once per turn. The first usage frame of a turn is
+            // the lead's assistant frame, and `getContextUsage()` is a main-loop-only
+            // control call, so this keys the reading to the lead and rides the
+            // consumer's existing `"usage" in payload` branch (Decision D5, D3). The
+            // `contextAttached` latch is set BEFORE the await so a slow/hanging call
+            // is issued at most once per turn; the read is timeout-guarded and never
+            // throws, so on absence/error/timeout no `context` key is written and the
+            // turn is unaffected (R1, R2, SC5). The await delays only this one em's
+            // emit; ordering is otherwise identical to before.
+            if (!contextAttached) {
+              contextAttached = true;
+              const context = await readLeadContext(
+                queryInstance,
+                this.contextUsageTimeoutMs,
+              );
+              if (context) em.payload["context"] = context;
+            }
           }
           ctx.emit(em);
         }

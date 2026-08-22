@@ -224,6 +224,12 @@ func stateGlyphWord(status, health string, isPlanning bool) (glyph, word string)
 		return "⚑", "plan gate"
 	case "awaiting_input":
 		return "✎", "needs input"
+	case "awaiting_followup":
+		// PRD #517: an interactive task parked awaiting the user's next follow-up. The ➤
+		// glyph reads "your turn / over to you" and is the NO_COLOR twin of the amber ink
+		// below (it survives an Ascii/NoTTY profile the way ✎ and ⚑ do). The word is
+		// deliberately "follow-up", NOT "needs input" (that is awaiting_input's).
+		return "➤", "follow-up"
 	case statusLimitWait:
 		return "~", "rate-limited"
 	case "completed":
@@ -248,7 +254,8 @@ func (p palette) stateColor(status, health string, isPlanning bool) color.Color 
 		return p.sage
 	case "planning":
 		return p.indigo
-	case "awaiting_approval", "awaiting_input":
+	case "awaiting_approval", "awaiting_input", "awaiting_followup":
+		// awaiting_followup (PRD #517) is a needs-you park like the other two: amber.
 		return p.amber
 	case statusLimitWait:
 		return p.wait
