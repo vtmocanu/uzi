@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"image/color"
 	"slices"
 	"strings"
@@ -619,7 +620,7 @@ func (m tuiModel) boardRateLimitStrip() string {
 		if showLabel {
 			seg = paintSeg(m.pal.faintC, nil, false, m.renderer.Plain(t.Label, 16)+" ")
 		}
-		seg += m.rateWindowCell("5h", t.Limits.FiveHour) + "   " + m.rateWindowCell("7d", t.Limits.SevenDay)
+		seg += m.rateWindowCell("5h", t.Limits.FiveHour, rateBarWidth, 0) + "   " + m.rateWindowCell("7d", t.Limits.SevenDay, rateBarWidth, 0)
 		// Prefix a per-group accent bar TIGHT against the label: it both delimits the group and
 		// doubles as a status light — alarm when the token's peak window pct ≥ rateDangerPct,
 		// faint otherwise. Emitted unconditionally via paintSeg so the group DELIMITER survives
@@ -643,15 +644,21 @@ func (m tuiModel) boardRateLimitStrip() string {
 // rateWindowCell renders one rate-limit window as `label <bar> NN%`: a faint label ("5h"/"7d"),
 // a tone-coloured mini block-bar filled proportional to pct, then the server-rounded NN% text.
 // A nil window (Anthropic reported none) draws a faint `label -`, mirroring windowPct's "-".
-func (m tuiModel) rateWindowCell(label string, w *apitypes.RateLimitWindow) string {
+func (m tuiModel) rateWindowCell(label string, w *apitypes.RateLimitWindow, barW, pctW int) string {
 	if w == nil {
 		return paintSeg(m.pal.faintC, nil, false, label+" -")
 	}
-	filled, empty := rateBarParts(w.Pct)
+	filled, empty := rateBarParts(w.Pct, barW)
+	// pctW == 0 emits the board strip's byte-identical " NN%"; pctW > 0 right-aligns the
+	// percent to pctW cols so the full-rail account meters land flush at the rail edge.
+	pctSeg := " " + windowPct(w) + "%"
+	if pctW > 0 {
+		pctSeg = " " + fmt.Sprintf("%*s", pctW, windowPct(w)+"%")
+	}
 	return paintSeg(m.pal.faintC, nil, false, label+" ") +
 		paintSeg(m.rateTone(w.Pct), nil, false, filled) +
 		paintSeg(m.pal.faintC, nil, false, empty) +
-		paintSeg(m.pal.faintC, nil, false, " "+windowPct(w)+"%")
+		paintSeg(m.pal.faintC, nil, false, pctSeg)
 }
 
 // rateTone maps a rounded pct to the shared tone (mirrors the web toneFor): danger ≥ 85,
@@ -667,20 +674,20 @@ func (m tuiModel) rateTone(pct int) color.Color {
 	}
 }
 
-// rateBarParts splits the rateBarWidth-cell mini bar into its filled (▰) and empty (▱) runs,
+// rateBarParts splits a width-cell mini bar into its filled (▰) and empty (▱) runs,
 // filled proportional to pct (the same ▰/▱ glyph vocabulary the milestone micro-bar uses).
-func rateBarParts(pct int) (filled, empty string) {
+func rateBarParts(pct, width int) (filled, empty string) {
 	if pct < 0 {
 		pct = 0
 	}
 	if pct > 100 {
 		pct = 100
 	}
-	f := (pct*rateBarWidth + 50) / 100
-	if f > rateBarWidth {
-		f = rateBarWidth
+	f := (pct*width + 50) / 100
+	if f > width {
+		f = width
 	}
-	return strings.Repeat("▰", f), strings.Repeat("▱", rateBarWidth-f)
+	return strings.Repeat("▰", f), strings.Repeat("▱", width-f)
 }
 
 // boardEmptyState replaces the old dead-end "no runs to show": it keeps the footer (added
