@@ -4,12 +4,16 @@ Notable changes to uzi, loosely following [Keep a Changelog](https://keepachange
 Versions are release git tags (`deploy/chart/Chart.yaml`'s `version`/`appVersion`, Model B) — this
 file is not bumped per-commit; `[Unreleased]` collects everything since the last tag.
 
-Write each bullet on ONE physical line (no mid-bullet newlines): a release's notes are this file's
-`## [X.Y.Z]` section verbatim (`scripts/changelog-section.sh body`), and GitHub renders single
-newlines in a release body as hard `<br>` breaks, so hard-wrapped bullets show as short, ragged
-lines in the published Release. One line per bullet lets GitHub reflow to the reader's width. Blank
-lines between bullets and `###` subsection headers are unaffected. (Established repo-wide 2026-08-21;
-sections at or before `[0.50.0]` stay wrapped — their Releases were already published and edited in
+Format each bullet as a bold title on its own physical line, then a blank line, then the description
+as ONE physical line (no mid-description newlines): a release's notes are this file's `## [X.Y.Z]`
+section verbatim (`scripts/changelog-section.sh body`), and GitHub renders single newlines in a
+release body as hard `<br>` breaks, so a hard-wrapped description shows as short, ragged lines in the
+published Release. Keeping the description on one physical line lets GitHub reflow it to the reader's
+width, and the blank line after the title renders as a paragraph break so the title stands alone.
+Indent the description two spaces so it stays inside the list item across the blank line. Blank lines
+between bullets and `###` subsection headers are unaffected. (Title-then-blank-then-description
+established 2026-08-22; one-physical-line-per-bullet was the rule from 2026-08-21 through `[0.52.0]`;
+sections at or before `[0.50.0]` stay hard-wrapped, their Releases already published and edited in
 place.)
 
 ## [Unreleased]
@@ -19,16 +23,24 @@ place.)
 
 ### Added
 
-- **GitHub Projects sync: admin kill-switch and per-repo web UI ([#555](https://github.com/vtmocanu/uzi/pull/555), PRD #364).** The per-repo Projects-sync routes (status, adopt, provision, disable) move off the `/admin` group to the per-repo `/repos/{id}/github-project-sync*` group behind an owner-or-admin guard, a new admin Instance-settings toggle (`github_project_sync_enabled`, default off) gates the feature instance-wide, and the Repos page gains the per-repo sync controls.
+- **GitHub Projects sync: admin kill-switch and per-repo web UI ([#555](https://github.com/vtmocanu/uzi/pull/555), PRD #364).**
+
+  The per-repo Projects-sync routes (status, adopt, provision, disable) move off the `/admin` group to the per-repo `/repos/{id}/github-project-sync*` group behind an owner-or-admin guard, a new admin Instance-settings toggle (`github_project_sync_enabled`, default off) gates the feature instance-wide, and the Repos page gains the per-repo sync controls.
 
 ### Fixed
 
-- **Record "merged" MR state for cleanly-merged PRs ([#551](https://github.com/vtmocanu/uzi/pull/551), issue [#527](https://github.com/vtmocanu/uzi/pull/527)).** A run's "merged" badge almost never appeared because `runs.mr_state` was only written while the issue was still open, yet merging a PR closes the issue before the state is recorded; MR-watch now keeps observing a completed run's MR after its issue closes (a new Lane B) so `merged`/`closed` is recorded, and backfills historical merged PRs.
-- **Restore SDK todo/task tools dropped by claude-agent-sdk 0.3.233 ([#550](https://github.com/vtmocanu/uzi/pull/550), issue [#549](https://github.com/vtmocanu/uzi/pull/549)).** claude-agent-sdk 0.3.233 removes the todo/task-tracking tools (TodoWrite, TaskCreate/Get/Update/List) from the default surface on newer models, silently stripping them from the lead and its inherit-all subagents; `buildSdkEnv` now sets `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` to restore the pre-0.3.233 surface everywhere, inert where a strict allowlist or deny hook already constrains the surface.
+- **Record "merged" MR state for cleanly-merged PRs ([#551](https://github.com/vtmocanu/uzi/pull/551), issue [#527](https://github.com/vtmocanu/uzi/pull/527)).**
+
+  A run's "merged" badge almost never appeared because `runs.mr_state` was only written while the issue was still open, yet merging a PR closes the issue before the state is recorded; MR-watch now keeps observing a completed run's MR after its issue closes (a new Lane B) so `merged`/`closed` is recorded, and backfills historical merged PRs.
+- **Restore SDK todo/task tools dropped by claude-agent-sdk 0.3.233 ([#550](https://github.com/vtmocanu/uzi/pull/550), issue [#549](https://github.com/vtmocanu/uzi/pull/549)).**
+
+  claude-agent-sdk 0.3.233 removes the todo/task-tracking tools (TodoWrite, TaskCreate/Get/Update/List) from the default surface on newer models, silently stripping them from the lead and its inherit-all subagents; `buildSdkEnv` now sets `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` to restore the pre-0.3.233 surface everywhere, inert where a strict allowlist or deny hook already constrains the surface.
 
 ### Internal
 
-- **Dependency:** `@anthropic-ai/claude-agent-sdk` to v0.3.233 ([#531](https://github.com/vtmocanu/uzi/pull/531)).
+- **Dependency bump ([#531](https://github.com/vtmocanu/uzi/pull/531)).**
+
+  `@anthropic-ai/claude-agent-sdk` to v0.3.233.
 
 ## [0.52.0] - 2026-08-22
 <!-- release-title: interactive task runs, context + rate-limit meters, board sort, forge-connect UX -->
