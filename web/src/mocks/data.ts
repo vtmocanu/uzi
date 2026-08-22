@@ -1506,6 +1506,32 @@ const boardFixtures: Record<string, Board> = {
         pipeline: null,
       },
       {
+        // PRD #517: the board's only follow-up-parked card. It is what makes runBadge's
+        // `awaiting_followup` arm and the board's follow-up attention strip reachable in
+        // mock mode. A parked-awaiting-you run, so it sits alongside the awaiting_approval
+        // sibling in Review.
+        iid: 25,
+        title: "Debounce the board poll while a drag is in flight",
+        state: "opened",
+        labels: ["PRD", "Review"],
+        web_url: uziUrl(25),
+        author: "mira",
+        forge_type: "gitlab",
+        has_prd_link: true,
+        column: "Review",
+        closed: false,
+        conflict: false,
+        forge_updated_at: minsAgo(19),
+        latest_run: latestRun({
+          id: "run-awaiting-followup",
+          status: "awaiting_followup",
+          worker_name: "laptop",
+          created_at: minsAgo(19),
+          updated_at: minsAgo(3),
+        }),
+        pipeline: null,
+      },
+      {
         iid: 18,
         title: "Run view: fold tool results under their calls",
         state: "closed",
@@ -2953,6 +2979,75 @@ export const mockRuns: Run[] = [
     finished_at: null,
     created_at: minsAgo(21),
     updated_at: minsAgo(14),
+  },
+  {
+    // run-awaiting-followup is parked on a follow-up (PRD #517): the interactive run
+    // finished the turn it was steered to and stopped to wait for its owner's NEXT
+    // follow-up, holding its worker slot open the whole time. It is the ONLY
+    // awaiting_followup fixture, so it is what makes the follow-up park reachable under
+    // VITE_UZI_MOCK=1 — the board's follow-up attention strip, the run view's park
+    // announcement, and SteerQueueCard's "Delivered — resumes the run" chip render
+    // nowhere without it.
+    id: "run-awaiting-followup",
+    repo_id: "repo-uzi",
+    issue_iid: 25,
+    issue_title: "Debounce the board poll while a drag is in flight",
+    issue_description: "See prds/25-board-drag-poll.md.",
+    kind: "issue",
+    title: null,
+    resume_of_run_id: null,
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
+    status: "awaiting_followup",
+    requeue_count: 0,
+    iteration_count: 3,
+    auto_approve: false,
+    // The park holds its worker slot, so it still names a live worker (like the
+    // awaiting_input sibling).
+    worker_id: "w-laptop",
+    branch: null,
+    model: null,
+    override_subagent_model: false,
+    forge_type: "gitlab",
+    mr_web_url: null,
+    issue_web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/25",
+    mr_iid: null,
+    mr_state: null,
+    failure_reason: null,
+    stop_kind: null,
+    // The server CLEARS health on park entry (a data.test.ts invariant pins this for
+    // parked runs).
+    health: "ok",
+    health_reason: null,
+    health_since: null,
+    // PRD #517: a follow-up park is independent of the usage-limit park, so it carries
+    // no limit state at all — same as the awaiting_input sibling.
+    wait_on_limit: false,
+    limit_resets_at: null,
+    retry_not_before: null,
+    limit_wait_count: 0,
+    rate_limit_type: null,
+    plan_md: null,
+    repo_agents: null,
+    agent_source: "own",
+    agent_exclusions: null,
+    own_agents: null,
+    milestones: null,
+    milestones_completed: null,
+    milestones_in_progress: null,
+    milestones_candidate: null,
+    budget_max_iterations: 6,
+    budget_wall_seconds: null,
+    anthropic_secret_id: "sec-default",
+    anthropic_secret_label: "default",
+    anthropic_select_reason: "default",
+    anthropic_headroom_pct: null,
+    claimed_at: minsAgo(18),
+    started_at: minsAgo(18),
+    finished_at: null,
+    created_at: minsAgo(19),
+    updated_at: minsAgo(3),
   },
   {
     id: "run-done",
@@ -4525,6 +4620,11 @@ export const mockRunInputs: Record<string, SteerInput[]> = {
   ],
   // At the gate: a follow-up consumed while parked → "Delivered — applies after approval".
   "run-awaiting": [steerInput(3, "prefer email over Slack for the first cut", 5, 4)],
+  // PRD #517: parked awaiting a follow-up. The follow-up was consumed (non-null
+  // consumed_at) so SteerQueueCard renders the "Delivered — resumes the run" parked chip.
+  "run-awaiting-followup": [
+    steerInput(7, "also skip the poll while the drag preview is animating out", 4, 2),
+  ],
   // Finished run: a follow-up that was never consumed → "Not delivered — run finished".
   "run-done": [steerInput(4, "one more nit: memoize the tool index", 186, null)],
   "run-crew": [

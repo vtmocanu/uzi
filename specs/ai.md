@@ -21917,8 +21917,17 @@ rationale in the Decision Log of `prds/done/517-interactive-task-runs.md`. <!-- 
   Decision-7 WAKE GUARD on `SetRunRunning`: the `awaiting_followup`→`running` transition is
   admitted only when a CONSUMED `follow_up` input exists, as a third independent clause beside
   the `answer` gate — so a stale/duplicate pre-park `running` report cannot un-park an idle task
-  and re-arm the wall clock. It is not keyed on a per-park identity (M1 added no `follow_up`
-  analog of `open_question_id`); the residual is bounded by the outer `worker_id` pin.
+  and re-arm the wall clock. It is now keyed on a per-park identity (issue #552): `runs.open_followup_id`,
+  a watermark of the highest already-CONSUMED `follow_up` id, recomputed at each park by
+  `SetRunAwaitingFollowup`, so the wake requires a consumed `follow_up` NEWER than the watermark —
+  a stale pre-park `running` report on a run that has already iterated (cycle ≥2) can no longer un-park
+  an idle run. The worker completes the identity: the `awaiting_followup` report (which stamps the
+  watermark) is emitted ONLY when the run is genuinely going idle — `RunRunner.awaitFollowUp` first
+  checks `SteeringChannel.hasPendingFollowUpOutcome()` and, when a follow-up (or stop/cancel) arrived
+  MID-TURN and is already buffered, SKIPS the park report and services that outcome directly. Without
+  that skip the mid-turn follow-up would be folded into its own park's watermark (it is consumed but
+  not yet applied), so `MAX(consumed follow_up id)` at the park equals the last APPLIED follow-up and
+  the buffered one is genuinely newer.
 
 - **`run stop` = a new `stop` steering-input kind, not a cancel.** Owner-scoped via `SubmitInput`,
   written by `CreateStopVerdictInput` which stamps `stop_kind='stopped'` in the SAME statement as
@@ -21928,7 +21937,11 @@ rationale in the Decision Log of `prds/done/517-interactive-task-runs.md`. <!-- 
   survives the `SetRunCompleted` transition. `--review` then composes via that completed
   transition. The `stop` kind is a distinct SQL enum value (`run_user_inputs.kind`, `00146`) — a
   genuinely new kind here, safe because the interactive worker is new code that recognises it
-  (contrast auto-stop, which reused `cancel` to stay safe on the older fleet).
+  (contrast auto-stop, which reused `cancel` to stay safe on the older fleet). A graceful stop now
+  survives a worker crash (issue #552 M3): the durable `stop_kind='stopped'` fact is re-delivered on
+  every claim as `stop_pending` (derived server-side from the run row, the OpenQuestionID
+  claim-redelivery precedent), so a resumed worker seeds `stopRequested` and winds the park down
+  immediately instead of re-parking at `awaiting_followup` and completing only on the idle timeout.
 
 - **Worker follow-up waiter: `awaitFollowUp` on the task-lane `SteeringChannel`.** A blocking
   wait with route-then-service / drain-after-arm discipline (no lost wakeup): a follow-up/stop/

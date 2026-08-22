@@ -1248,6 +1248,75 @@ func TestClaimOmitsTaskIdleTimeoutForNonInteractiveRun(t *testing.T) {
 	}
 }
 
+// TestClaimDerivesStopPending pins issue #552 M3's server-side derivation: StopPending is
+// true iff the run is interactive AND carries the durable stop_kind='stopped' AND is
+// non-terminal. This re-delivers a graceful stop that was consumed into the worker's
+// in-memory flag and lost on a crash, so the resumed worker winds the park down instead of
+// waiting out the idle timeout. The negative rows pin that a non-interactive run, a non-stop
+// stop_kind (cancelled/plan_rejected/auto_stopped/NULL), and a terminal run all read false.
+func TestClaimDerivesStopPending(t *testing.T) {
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-STOPPEND-abcdef1234567890"))
+	sealedTok, _ := box.Seal([]byte("anthropic-STOPPEND-abcdef1234567890"))
+
+	stopKind := func(s string) pgtype.Text {
+		if s == "" {
+			return pgtype.Text{}
+		}
+		return pgtype.Text{String: s, Valid: true}
+	}
+
+	cases := []struct {
+		name        string
+		interactive bool
+		stopKind    string
+		status      string
+		want        bool
+	}{
+		{"interactive+stopped+non-terminal", true, "stopped", "awaiting_followup", true},
+		{"non-interactive", false, "stopped", "awaiting_followup", false},
+		{"stop_kind=cancelled", true, "cancelled", "awaiting_followup", false},
+		{"stop_kind=plan_rejected", true, "plan_rejected", "awaiting_followup", false},
+		{"stop_kind NULL", true, "", "awaiting_followup", false},
+		{"terminal completed", true, "stopped", "completed", false},
+		{"terminal failed", true, "stopped", "failed", false},
+		{"terminal cancelled", true, "stopped", "cancelled", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runID := uuid.New()
+			fs := &fakeStore{
+				claimRun: store.Run{
+					ID: runID, Kind: "task", Status: tc.status, Interactive: tc.interactive,
+					StopKind:   stopKind(tc.stopKind),
+					IssueTitle: "Handoff: interactive", IssueDescription: "iterate with me",
+					Branch: pgText("uzi/task/" + runID.String()),
+				},
+				claimCtx: store.GetRunClaimContextRow{
+					RepoWebUrl: "https://gitlab.example.com/grp/proj", RepoPath: "grp/proj",
+					DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+					BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
+				},
+				anthropic: sealedTok,
+			}
+
+			svc := New(fs, box, testParams())
+			payload, err := svc.Claim(context.Background(), worker())
+			if err != nil {
+				t.Fatalf("Claim: %v", err)
+			}
+			if payload == nil {
+				t.Fatal("expected a payload, got idle")
+			}
+			if payload.StopPending != tc.want {
+				t.Fatalf("StopPending = %v, want %v (interactive=%v stop_kind=%q status=%q)",
+					payload.StopPending, tc.want, tc.interactive, tc.stopKind, tc.status)
+			}
+		})
+	}
+}
+
 func TestClaimOmitsDefaultModelWhenOwnerHasNone(t *testing.T) {
 	box := newBox(t)
 	sealedPAT, _ := box.Seal([]byte("bot-pat-OMITTEST-abcdef1234567890"))

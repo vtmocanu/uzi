@@ -136,6 +136,36 @@ function fakeTurnsSlow(
   return { queryFn, turns };
 }
 
+/** Like fakeTurnsSlow, but the in-turn sleep is PER-TURN (`sleeps[i]` for turn i, clamped
+ *  to the last entry). Lets a test keep the plan turn cheap while making one specific
+ *  resumed follow-up turn burn a chosen amount — needed to isolate the wall-scaling latch,
+ *  whose effect shows only on a resumed turn and would otherwise be masked by the plan turn
+ *  sharing the same unscaled `initialWallMs` budget under a uniform sleep. */
+function fakeTurnsSlowPerTurn(
+  scripts: SDKMessage[][],
+  sleeps: number[],
+): { queryFn: SdkQueryFn; turns: Turn[] } {
+  const turns: Turn[] = [];
+  let i = 0;
+  const queryFn: SdkQueryFn = (params) => {
+    const script = scripts[Math.min(i, scripts.length - 1)]!;
+    const sleepMs = sleeps[Math.min(i, sleeps.length - 1)]!;
+    i++;
+    const turn: Turn = { options: params.options };
+    turns.push(turn);
+    return (async function* () {
+      for await (const p of params.prompt) {
+        const rec = p as { message?: { content?: unknown } };
+        const content = rec.message?.content;
+        turn.promptText = typeof content === "string" ? content : JSON.stringify(content);
+      }
+      await new Promise((r) => setTimeout(r, sleepMs)); // debited from the wall budget
+      for (const m of script) yield m;
+    })();
+  };
+  return { queryFn, turns };
+}
+
 // ── the SdkExecutor loop park ────────────────────────────────────────────────
 describe("SdkExecutor interactive task park (PRD #517 M3)", () => {
   let sdkHome: string;
@@ -390,6 +420,57 @@ describe("SdkExecutor interactive task park (PRD #517 M3)", () => {
     assert.strictEqual(turns.length, 8, "every follow-up turn ran on its own fresh wall budget");
   });
 
+  it("re-applies the server's wall-budget scaling on a resumed follow-up (re-arms the wallScaled latch)", async () => {
+    // Fix 4 (this M4): a follow-up is a fresh task, so the applied-once `wallScaled` latch must
+    // be RE-ARMED at the follow-up reset (`wallScaled = false` beside `state.wallRemainingMs =
+    // initialWallMs`). Otherwise the latch stays `true` from the first turn and the resumed
+    // follow-up's `served.wallSeconds > initialWallMs` scaling (~sdk-executor.ts:1462) is
+    // SKIPPED, leaving the resumed turn on the unscaled default wall.
+    //
+    // Setup: initialWallMs = 300ms; every reportIteration serves wallSeconds = 0.9 (900ms), so
+    // the applied-once scaling adds 900-300 = 600ms → a scaled budget of 900ms. Per-turn sleeps
+    // isolate the effect: the plan turn burns ~0 (its budget is the unscaled 300ms), turn 1
+    // burns 50ms (comfortably inside its scaled 900ms), and the RESUMED turn burns 450ms.
+    //   WITH the re-arm: the resumed turn re-scales to 900ms → 450ms burn is a 2x margin, the
+    //   turn completes, the run parks again and ends idle → run() resolves.
+    //   WITHOUT it (delete `wallScaled = false`): the latch is still set, the resumed turn is
+    //   NOT re-scaled and keeps the reset 300ms budget → the 450ms burn trips REASON_WALL
+    //   mid-turn and run() REJECTS. (The plan turn does NOT falsely trip: its budget is the
+    //   same unscaled 300ms but it burns ~0, which is why the sleep must be per-turn — a
+    //   uniform sleep would trip the plan turn identically and stop discriminating.)
+    const { queryFn, turns } = fakeTurnsSlowPerTurn(
+      [
+        [submitPlan("plan"), resultSuccess()], // planning (unscaled 300ms budget, ~0 burn)
+        [assistantText("t1"), signalDone(), resultSuccess()], // loop1 → done → park
+        [assistantText("t2"), signalDone(), resultSuccess()], // resumed follow-up → done → park (idle)
+      ],
+      [0, 50, 450],
+    );
+    const outcomes: FollowUpOutcome[] = [
+      { kind: "followup", body: "the resumed task" },
+      { kind: "ended", reason: "idle" },
+    ];
+    const { ctx } = makeCtx({
+      config: { max_iterations: 30, run_timeout_seconds: 0.3 },
+      interactive: true,
+      checkpoint: async () => {},
+      awaitFollowUp: async () => outcomes.shift()!,
+      // Serve a wall budget larger than initialWallMs on every iteration report so the
+      // applied-once scaling has a delta to add — and, on the resumed turn, re-add.
+      reportIteration: async () => ({ wallSeconds: 0.9 }),
+    });
+
+    const result = await new SdkExecutor(nullLogger(), sdkHome, { queryFn }).run(ctx);
+    assert.strictEqual(
+      result.branch,
+      "agent/issue-5",
+      "the resumed follow-up re-applied the server's wall scaling and did not trip the wall",
+    );
+    // plan + loop1 + resumed follow-up turn = 3 turns; the resumed turn completing (rather than
+    // the run rejecting mid-turn) is what proves the re-scaling fired.
+    assert.strictEqual(turns.length, 3, "the resumed follow-up turn ran to completion on a re-scaled wall");
+  });
+
   it("emits first-turn scaffolding only on the genuine first turn, never on a resumed follow-up", async () => {
     // Fix 3: the "plan approved" framing and the base-commit note are first-turn-ONLY, keyed on
     // the whole run's first turn (hasParked), NOT the per-follow-up iteration counter. Mutation:
@@ -542,6 +623,62 @@ describe("SteeringChannel.awaitFollowUp (PRD #517 M3)", () => {
     await ch.stop();
   });
 
+  it("hasPendingFollowUpOutcome reflects a buffered follow-up / stop / cancel without consuming it (issue #552 M1)", async () => {
+    // The peek the interactive park uses to decide whether to report awaiting_followup (and so
+    // stamp the open_followup_id watermark). Mutation: make it always return false → the park
+    // report is never skipped and the mid-turn wake-guard bug returns.
+    const ch = new SteeringChannel(
+      fakeClient([[inp("follow_up", "next task")]]),
+      "run-1",
+      1,
+      nullLogger(),
+      new AbortController(),
+    );
+    assert.strictEqual(ch.hasPendingFollowUpOutcome(), false, "empty channel: nothing pending");
+    ch.start();
+    await tick(); // poll consumes + buffers the follow-up
+    assert.strictEqual(
+      ch.hasPendingFollowUpOutcome(),
+      true,
+      "a buffered follow-up is pending — the run is NOT idle",
+    );
+    // Non-consuming: awaitFollowUp still returns the same buffered follow-up afterwards.
+    const outcome = await ch.awaitFollowUp(60_000);
+    assert.deepStrictEqual(outcome, { kind: "followup", body: "next task" });
+    assert.strictEqual(
+      ch.hasPendingFollowUpOutcome(),
+      false,
+      "after the buffer drained, nothing is pending again",
+    );
+    await ch.stop();
+  });
+
+  it("hasPendingFollowUpOutcome is true for a buffered stop and for a cancel (issue #552 M1)", async () => {
+    const stopCh = new SteeringChannel(
+      fakeClient([[inp("stop", "wind down")]]),
+      "run-1",
+      1,
+      nullLogger(),
+      new AbortController(),
+    );
+    stopCh.start();
+    await tick();
+    assert.strictEqual(stopCh.hasPendingFollowUpOutcome(), true, "a buffered stop is pending");
+    await stopCh.stop();
+
+    const cancelCh = new SteeringChannel(
+      fakeClient([[inp("cancel")]]),
+      "run-1",
+      1,
+      nullLogger(),
+      new AbortController(),
+    );
+    cancelCh.start();
+    await tick(); // poll routes the cancel → sticky `cancelled`
+    assert.strictEqual(cancelCh.hasPendingFollowUpOutcome(), true, "a cancel is pending");
+    await cancelCh.stop();
+  });
+
   it("ends the park with reason idle when no follow-up arrives within idleMs", async () => {
     // Mutation: drop the `now() - parkedAt >= idleMs` branch in serviceFollowUp → the park
     // never ends and the test hangs (a NAMED hang: the run would pin a slot forever).
@@ -645,6 +782,30 @@ describe("SteeringChannel.awaitFollowUp (PRD #517 M3)", () => {
     ch.start();
     const parked = ch.awaitFollowUp(60_000); // arm BEFORE the first poll routes anything
     const outcome = await parked;
+    assert.deepStrictEqual(outcome, { kind: "ended", reason: "stopped" });
+    await ch.stop();
+  });
+
+  it("ends the park with reason stopped from a SEEDED stop, with NO stop/follow-up input arriving (issue #552 M3 crash-recovery)", async () => {
+    // The crash-recovery path: a graceful `uzi run stop` was consumed into stopRequested on
+    // a prior worker that then DIED before winding the park down. On the requeue the fresh
+    // SteeringChannel starts stopRequested=false and the already-consumed stop input never
+    // re-delivers (empty input batch here) — so without the seed the park would idle for
+    // ~30m. The claim re-delivers the durable stop_kind='stopped' fact as stop_pending, and
+    // RunRunner calls seedStopRequested() from it, reconstructing the sticky stop state so
+    // awaitFollowUp's arm-time check resolves { kind:"ended", reason:"stopped" } immediately.
+    // Mutation: drop the seedStopRequested() call (or the `if (this.stopRequested)` arm in
+    // awaitFollowUp) → this park never ends and the test hangs (killed by --test-timeout).
+    const ch = new SteeringChannel(
+      fakeClient([[]]), // no inputs at all — the stop input was consumed pre-crash
+      "run-1",
+      1,
+      nullLogger(),
+      new AbortController(),
+    );
+    ch.seedStopRequested(); // what RunRunner does from claim.stop_pending
+    ch.start();
+    const outcome = await ch.awaitFollowUp(60_000);
     assert.deepStrictEqual(outcome, { kind: "ended", reason: "stopped" });
     await ch.stop();
   });
@@ -784,6 +945,43 @@ describe("RunRunner interactive follow-up park (PRD #517 M3)", () => {
       statuses.at(-1),
       "completed",
       "the run resumed past the park and finalized",
+    );
+  });
+
+  it("skips the awaiting_followup park report when a follow-up is already buffered mid-turn (issue #552 M1)", async () => {
+    // A follow-up that arrived MID-TURN is consumed (consumed_at stamped) + buffered by the
+    // poll loop BEFORE the park. Reporting awaiting_followup here would stamp the
+    // open_followup_id watermark to MAX(consumed follow_up id) INCLUDING that follow-up, so its
+    // own wake `running` report would then fail the server's `id > watermark` guard and strand
+    // a live run at awaiting_followup. The callback must SKIP the park report and service the
+    // buffered follow-up directly (the run stays running, no spurious park). Mutation: drop the
+    // `if (!steering.hasPendingFollowUpOutcome())` guard around the park report → awaiting_followup
+    // is reported and the `!statuses.includes("awaiting_followup")` assert reddens.
+    const { gitlab } = fakeGitlab();
+    const log = { outcomes: [] as FollowUpOutcome[], checkpointed: false };
+    const claim = taskClaim();
+    // Seed the follow-up BEFORE the run starts: the 5ms poll loop consumes + buffers it during
+    // the executor's checkpoint (real git, >> 5ms), so it is in hand when the park callback fires.
+    api.setInputs(claim.run_id, [{ id: 1, kind: "follow_up", body: "keep going" }]);
+
+    await runner(parkingExecutor(log), gitlab).execute(claim);
+
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
+    assert.ok(
+      !statuses.includes("awaiting_followup"),
+      `a mid-turn-buffered follow-up must NOT trigger an awaiting_followup park; statuses were ${JSON.stringify(statuses)}`,
+    );
+    assert.deepStrictEqual(
+      log.outcomes,
+      [{ kind: "followup", body: "keep going" }],
+      "the buffered follow-up was serviced directly, without parking",
+    );
+    assert.strictEqual(
+      statuses.at(-1),
+      "completed",
+      "the run resumed past the skipped park and finalized",
     );
   });
 

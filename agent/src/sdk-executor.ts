@@ -1626,6 +1626,12 @@ export class SdkExecutor implements Executor {
               // field armWall/disarmWall read/debit, so no stale wall accumulator survives.
               // The whole-session cap is the M5 idle timeout, not the per-follow-up wall.
               state.wallRemainingMs = initialWallMs;
+              // Re-arm the applied-once wall-scaling latch (matching Fix 2's
+              // state.wallRemainingMs reset): a follow-up is a fresh task, so the server's
+              // wall-budget scaling must re-apply. Without this the latch stays `true` from a
+              // prior turn and the next `served.wallSeconds > initialWallMs` scaling (~:1462)
+              // is skipped, leaving the resumed follow-up on the unscaled default wall.
+              wallScaled = false;
               continue;
             }
             // outcome.kind === "ended". Discriminate on the reason (Fix 1):
