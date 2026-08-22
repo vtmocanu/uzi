@@ -396,6 +396,16 @@ export interface Repo {
   // and zero eligible online workers. Drives the Setup chip's info escalation; computed
   // from eligibility, not the sweeper's health text. Set by the list handlers.
   docker_blocked: boolean;
+  // Caller-scoped GitHub Projects v2 sync-health summary (PRD #576 M2), null/absent
+  // when the repo is not linked. Drives the Sync badge tone: linked && healthy → green
+  // (ok), linked && !healthy (last_error set) → danger, absent → neutral. Derived from
+  // the github_project_links row (last_error/last_synced_at); set by the list handlers.
+  github_project_sync?: {
+    linked: boolean;
+    healthy: boolean;
+    last_error?: string;
+    last_synced_at?: string;
+  } | null;
 }
 
 // GuardrailOverrideMeta is the audit metadata for an active admin per-repo guardrail

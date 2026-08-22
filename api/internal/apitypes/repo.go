@@ -59,6 +59,23 @@ type RepoDTO struct {
 	// from the sweeper's health_reason text — so the Setup chip escalates immediately and
 	// independently of health_enabled/thresholds. Not set by repoToDTO/PatchRepo.
 	DockerBlocked bool `json:"docker_blocked"`
+	// GithubProjectSync is the caller-scoped sync-health summary for this repo's
+	// GitHub Projects v2 link (PRD #576 M2), or nil when the repo is not linked.
+	// Computed in the list handlers like GuardrailBlocked/DockerBlocked; never set
+	// by repoToDTO/PatchRepo. Derived purely from the github_project_links row's
+	// last_error/last_synced_at — a pure store read, no forge call.
+	GithubProjectSync *RepoProjectSyncHealth `json:"github_project_sync,omitempty"`
+}
+
+// RepoProjectSyncHealth is the health readout the sync badge reads (PRD #576 M2). It
+// exists only for a linked repo (nil otherwise), so Linked is always true when the
+// struct is present — kept as an explicit field for the frontend contract. Healthy is
+// "the last sync recorded no error" (github_project_links.last_error IS NULL/empty).
+type RepoProjectSyncHealth struct {
+	Linked       bool       `json:"linked"`
+	Healthy      bool       `json:"healthy"`
+	LastError    *string    `json:"last_error,omitempty"`
+	LastSyncedAt *time.Time `json:"last_synced_at,omitempty"`
 }
 
 // GuardrailOverrideDTO is the audit metadata for an active admin per-repo guardrail

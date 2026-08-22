@@ -27,6 +27,11 @@ RETURNING *;
 -- The link row for a repo, or no row when the repo is not synced.
 SELECT * FROM github_project_links WHERE repo_id = sqlc.arg('repo_id');
 
+-- name: ListGithubProjectLinksByRepoIDs :many
+-- Batch-load link rows for a set of repo ids, for the caller-scoped repos-list
+-- sync-health enrichment (PRD #576 M2). Repos with no link are simply absent.
+SELECT * FROM github_project_links WHERE repo_id = ANY(sqlc.arg('repo_ids')::uuid[]);
+
 -- name: DeleteGithubProjectLink :exec
 -- Teardown: drop a repo's link. The item rows cascade with the repo, not with the
 -- link, so item cleanup on unlink (if wanted) is a separate DeleteGithubProjectItem.

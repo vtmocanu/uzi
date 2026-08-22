@@ -795,6 +795,86 @@ describe("Repos — Adopt-first sync (PRD #576 M1)", () => {
   });
 });
 
+describe("Repos — sync-health badge (PRD #576 M2)", () => {
+  const GH_CONN: ForgeConnection = {
+    ...CONN,
+    id: "conn-gh",
+    forge_type: "github",
+    base_url: "https://github.com",
+  };
+
+  function ghRepo(over: Partial<Repo>): Repo {
+    return repo({
+      id: "repo-gh",
+      path_with_namespace: "vtmocanu/gh",
+      connection_id: "conn-gh",
+      ...over,
+    });
+  }
+
+  beforeEach(() => {
+    mockApi.listConnections.mockResolvedValue({ connections: [GH_CONN] });
+    mockApi.getProjectSyncStatus.mockRejectedValue(new ApiError(404, "project sync not enabled for this repo"));
+    mockApi.getProjectSyncVisibility.mockResolvedValue({ public: false });
+  });
+
+  // The Badge renders a single <span> whose className carries the tone hue class
+  // (text-ok / text-danger / text-neutral-fg). Assert on that rendered output, not
+  // component internals — the same technique the Setup-chip test uses.
+  function syncBadge(name: string): HTMLElement {
+    return within(rowFor(name)).getByText("Sync");
+  }
+
+  it("linked && healthy → ok (green) tone", async () => {
+    mockApi.listProjects.mockResolvedValue({
+      repos: [ghRepo({ github_project_sync: { linked: true, healthy: true, last_synced_at: "2026-08-20T10:00:00Z" } })],
+    });
+    renderPage();
+    await screen.findByText("vtmocanu/gh");
+    const badge = syncBadge("vtmocanu/gh");
+    expect(badge.className).toContain("text-ok");
+    // Paired negatives so the tone assertion is not vacuous.
+    expect(badge.className).not.toContain("text-danger");
+    expect(badge.className).not.toContain("text-neutral-fg");
+  });
+
+  it("linked && !healthy (last_error set) → danger tone, with the error surfaced", async () => {
+    mockApi.listProjects.mockResolvedValue({
+      repos: [
+        ghRepo({
+          github_project_sync: { linked: true, healthy: false, last_error: "provision failed: owner mismatch" },
+        }),
+      ],
+    });
+    renderPage();
+    await screen.findByText("vtmocanu/gh");
+    const badge = syncBadge("vtmocanu/gh");
+    expect(badge.className).toContain("text-danger");
+    expect(badge.className).not.toContain("text-ok");
+    // The error text is surfaced for the user (title/aria), not swallowed.
+    expect(badge.getAttribute("title")).toContain("provision failed: owner mismatch");
+    expect(badge.getAttribute("aria-label")).toContain("provision failed: owner mismatch");
+  });
+
+  it("not linked (field absent) → neutral tone (current look)", async () => {
+    mockApi.listProjects.mockResolvedValue({ repos: [ghRepo({})] });
+    renderPage();
+    await screen.findByText("vtmocanu/gh");
+    const badge = syncBadge("vtmocanu/gh");
+    expect(badge.className).toContain("text-neutral-fg");
+    expect(badge.className).not.toContain("text-ok");
+    expect(badge.className).not.toContain("text-danger");
+  });
+
+  it("linked but explicitly null field → neutral tone", async () => {
+    mockApi.listProjects.mockResolvedValue({ repos: [ghRepo({ github_project_sync: null })] });
+    renderPage();
+    await screen.findByText("vtmocanu/gh");
+    const badge = syncBadge("vtmocanu/gh");
+    expect(badge.className).toContain("text-neutral-fg");
+  });
+});
+
 describe("Repos — Board access (PRD #557 M4)", () => {
   const GH_CONN: ForgeConnection = {
     ...CONN,

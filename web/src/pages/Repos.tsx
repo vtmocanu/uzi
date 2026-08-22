@@ -882,9 +882,37 @@ export function Repos() {
                             <span className="text-xs text-faint">—</span>
                           ) : (
                             <div className="flex flex-wrap items-center gap-2">
-                              <Badge tone="neutral" dot>
-                                Sync
-                              </Badge>
+                              {/* Health-aware sync badge (PRD #576 M2): green when the
+                                  repo is linked and the last sync recorded no error,
+                                  danger when a last_error is set (with the error in the
+                                  title/aria), neutral when the repo is not linked. */}
+                              {(() => {
+                                const sync = r.github_project_sync;
+                                if (sync && sync.linked && !sync.healthy) {
+                                  return (
+                                    <Badge
+                                      tone="danger"
+                                      dot
+                                      title={sync.last_error ?? "Sync error"}
+                                      aria-label={`Sync error: ${sync.last_error ?? "unknown"}`}
+                                    >
+                                      Sync
+                                    </Badge>
+                                  );
+                                }
+                                if (sync && sync.linked) {
+                                  return (
+                                    <Badge tone="ok" dot title="Sync healthy">
+                                      Sync
+                                    </Badge>
+                                  );
+                                }
+                                return (
+                                  <Badge tone="neutral" dot>
+                                    Sync
+                                  </Badge>
+                                );
+                              })()}
                               <Button
                                 variant="secondary"
                                 size="sm"
