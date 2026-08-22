@@ -18,6 +18,25 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.55.0] - 2026-08-22
+<!-- release-title: GitHub Projects sync adopt-first UX + safe column auto-create -->
+
+### Added
+
+- **GitHub Projects sync: Adopt-first UX, health-aware badge, and safe column auto-create ([#580](https://github.com/vtmocanu/uzi/pull/580), PRD #576).**
+  The repo Projects-sync panel now defaults to Adopt with a terse explainer (Provision stays available for org-owned repos, the only place a bot can own the linked board), the repo-list "Sync" pill reflects real health (green when linked and error-free, amber or red on a sync error) from a new per-repo sync-health field, adopting a board now surfaces the columns it had to skip and offers a one-click Resync, adopt seeds asynchronously so it no longer returns a cosmetic 502, and a new auto-create action adds the missing columns via a fresh uzi-owned Status field with an atomic marker reset so it can never strip labels off real issues.
+- **Boards page: remember the selected forge and grow the board list naturally ([#579](https://github.com/vtmocanu/uzi/pull/579), issue [#578](https://github.com/vtmocanu/uzi/pull/578)).**
+  The Boards page remembers your selected forge connection for 7 days (validated against the live list on load, falling back to the first connection if it was since removed), and the board list grows down the page like /schedules instead of sitting inside a padded scroll container.
+- **TUI: full-width account meters and the lead context-window meter on the run-detail rail ([#577](https://github.com/vtmocanu/uzi/pull/577), issue [#574](https://github.com/vtmocanu/uzi/pull/574)).**
+  The `uzi tui` run-detail rail now shows full-width per-account usage meters alongside the lead's context-window meter.
+
+### Fixed
+
+- **Reverse Projects-sync can no longer bulk-strip labels off real issues ([#580](https://github.com/vtmocanu/uzi/pull/580), PRD #576).**
+  The reverse Status-to-label sync now counts a tick's destructive label moves before executing any and aborts the whole tick when they exceed a relative cap, so a Status field edited or cleared out from under uzi (or a botched option reconcile) cannot cascade into mass label-stripping on the real forge issues.
+- **In-app changelog renders each bullet's bold title on its own line ([#575](https://github.com/vtmocanu/uzi/pull/575), issue [#573](https://github.com/vtmocanu/uzi/pull/573)).**
+  The in-app changelog view renders each bullet's bold title on its own physical line with the description directly below, matching the GitHub release-notes layout.
+
 ## [0.54.0] - 2026-08-22
 
 ### Added
@@ -3098,7 +3117,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.54.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.55.0...HEAD
+[0.55.0]: https://github.com/vtmocanu/uzi/compare/v0.54.0...v0.55.0
 [0.54.0]: https://github.com/vtmocanu/uzi/compare/v0.53.1...v0.54.0
 [0.53.1]: https://github.com/vtmocanu/uzi/compare/v0.53.0...v0.53.1
 [0.53.0]: https://github.com/vtmocanu/uzi/compare/v0.52.0...v0.53.0
