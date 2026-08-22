@@ -565,11 +565,15 @@ func (m tuiModel) paneTitle(title string, focused bool) string {
 	return " " + m.pal.faint.Render(strings.ToUpper(title))
 }
 
-// detailBanner is the S3 two-band treatment: awaiting_approval gets the PLAN GATE band with the
-// OWNER's approve/reject keys inline (dropped from the footer so they are not duplicated);
+// detailBanner is the S3 attention-band treatment: awaiting_approval gets the PLAN GATE band with
+// the OWNER's approve/reject keys inline (dropped from the footer so they are not duplicated);
 // awaiting_input gets a DISTINCT needs-input band that never offers y/n — those keys do nothing
-// at a clarification park, which is answered off-TUI (run answer / web / Slack). Both show for
-// owner and non-owner alike; only the inline keys are ownership-gated.
+// at a clarification park, which is answered off-TUI (run answer / web / Slack); awaiting_followup
+// (PRD #517) gets its OWN band, distinct from needs-input: an interactive task parked for the
+// user's next follow-up, which is NOT a y/n prompt — the owner sends a follow-up (the `f` key) or
+// stops the run. All bands show for owner and non-owner alike; the inline y/n keys are
+// ownership-gated, and the follow-up band's "with f" hint is too (the `f` key is owner-only, so a
+// read-only viewer is pointed at web/Slack instead of an inert key).
 func (m tuiModel) detailBanner() string {
 	owner := m.detail.steer.access == steerAllowed
 	switch m.detail.run.Status {
@@ -577,6 +581,18 @@ func (m tuiModel) detailBanner() string {
 		return m.attentionBanner("⚑ PLAN GATE", "the crew is waiting on your approval", owner)
 	case "awaiting_input":
 		return m.attentionBanner("✎ NEEDS INPUT", "the agent asked a question; answer it from another terminal, the web, or Slack", false)
+	case "awaiting_followup":
+		// The "with f" hint is owner-only: the `f` steer key is gated to the run owner
+		// (tui_steer.go), so a read-only viewer is pointed at the web/Slack surfaces
+		// instead of an inert key. Body kept under the awaiting_input banner's width so
+		// the amber band never truncates at the 100-col reference frame. Owners still see
+		// `f` in the footer regardless; withKeys stays false (a follow-up park is not a
+		// y/n prompt).
+		body := "parked for your follow-up — send one from the web or Slack"
+		if owner {
+			body = "parked for your follow-up — send one with f, web, or Slack"
+		}
+		return m.attentionBanner("➤ AWAITING FOLLOW-UP", body, false)
 	}
 	return ""
 }
@@ -622,6 +638,9 @@ func (m tuiModel) renderLaneRail() string {
 		if block := m.renderMilestones(); block != "" {
 			sb.WriteString("\n\n" + block)
 		}
+		if rb := m.railRateMeters(strings.Count(sb.String(), "\n") + 1); rb != "" {
+			sb.WriteString("\n\n" + rb)
+		}
 		return sb.String()
 	}
 
@@ -648,6 +667,9 @@ func (m tuiModel) renderLaneRail() string {
 	}
 	if block := m.renderMilestones(); block != "" {
 		sb.WriteString("\n" + block)
+	}
+	if rb := m.railRateMeters(strings.Count(sb.String(), "\n") + 1); rb != "" {
+		sb.WriteString("\n\n" + rb)
 	}
 	return sb.String()
 }
@@ -813,6 +835,56 @@ func (m tuiModel) renderMilestones() string {
 		sb.WriteString(" " + glyph + " " + style.Render(m.renderer.Plain(mi.Title, milestoneTitleCap)) + "\n")
 	}
 	return strings.TrimRight(sb.String(), "\n")
+}
+
+// railRateMeters renders the stacked per-account rate-limit block for the crew rail, or ""
+// when the selection is empty. It appends WHOLE account entries only while they fit within
+// the remaining rail height (transcriptViewport() minus usedRows minus the blank separator
+// the caller adds), because joinColumns clamps the rail to the transcript height by dropping
+// its BOTTOM lines one at a time — an uncapped block would leave a half-drawn entry (label +
+// 5h, no 7d). Dropping whole entries keeps every visible entry complete. Reuses rateWindowCell
+// so the bar/percent/tone and the nil-window "-" are identical to the board strip.
+//
+// Deploy-ordering note (#519): the meters populate only when GET /api/me/settings and
+// /api/me/rate-limits answer over the CLI uzc_ Bearer token. /me/settings GET moved to
+// RequireUser in #519; against a server that predates that the settings fetch 401s (error
+// swallowed) and this falls back to default-token-only, exactly as the board strip does. No
+// server change here.
+func (m tuiModel) railRateMeters(usedRows int) string {
+	shown, showLabel := m.selectedRateMeters()
+	if len(shown) == 0 {
+		return ""
+	}
+	// budget is the rail height left below the content already built; the -1 is the blank
+	// separator the caller prepends via "\n\n" before this block.
+	budget := m.transcriptViewport() - usedRows - 1
+
+	// Each account entry is a \n-joined string of an optional faint label eyebrow + the two
+	// window cells; entries are added whole while they fit under the ACCOUNTS header.
+	const headerRow = 1
+	var fitted []string
+	accumulated := 0
+	for _, t := range shown {
+		var lines []string
+		if showLabel {
+			lines = append(lines, m.pal.faint.Render(m.renderer.Plain(t.Label, laneRailWidth)))
+		}
+		lines = append(lines,
+			m.rateWindowCell("5h", t.Limits.FiveHour),
+			m.rateWindowCell("7d", t.Limits.SevenDay),
+		)
+		entry := strings.Join(lines, "\n")
+		rows := len(lines)
+		if headerRow+accumulated+rows > budget {
+			break
+		}
+		fitted = append(fitted, entry)
+		accumulated += rows
+	}
+	if len(fitted) == 0 {
+		return ""
+	}
+	return m.pal.faint.Render("ACCOUNTS") + "\n" + strings.Join(fitted, "\n")
 }
 
 // buildTranscriptLines renders the selected lane's frames to display lines (no windowing),

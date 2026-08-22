@@ -163,6 +163,36 @@ func TestReplierRejectPendingStaleTerminalRunIsFinished(t *testing.T) {
 	}
 }
 
+// A reply to an interactive task PARKED in awaiting_followup (PRD #517) is that follow-up:
+// it submits a `follow_up` steering input (which resumes the parked run) and is acked. It
+// must NOT go through the answer path (there is no clarification question) — that is the
+// discriminating half from awaiting_input. Reddening mutation: remove the awaiting_followup
+// arm from the reply switch → it still submits follow_up via the default, so this test
+// stays green; its value is pinning that awaiting_followup routes to follow_up (an answer/
+// nudge/finished disposition would fail it) rather than proving the arm's existence.
+func TestReplierAwaitingFollowupSubmitsFollowUp(t *testing.T) {
+	runID, user := uuid.New(), store.User{ID: uuid.New()}
+	fs := &fakeReplierStore{user: user, anchor: anchorRow(runID, "")}
+	sub := &fakeSubmitter{run: liveRun(runID, user.ID, "awaiting_followup")}
+	fp := &fakePoster{}
+	r := NewReplier(fs, sub, fp, nil)
+
+	r.HandleMessage(context.Background(), reply("now add the integration test"))
+
+	if len(sub.submitted) != 1 || sub.submitted[0].kind != "follow_up" || sub.submitted[0].body != "now add the integration test" {
+		t.Fatalf("a reply to an awaiting_followup park must submit follow_up to resume it: %+v", sub.submitted)
+	}
+	if len(sub.answers) != 0 {
+		t.Fatalf("an awaiting_followup reply must NOT go through the answer path (no clarification question): %+v", sub.answers)
+	}
+	if len(fp.reactions) != 1 || fp.reactions[0].emoji != ackReaction {
+		t.Fatalf("an accepted follow-up must be acked: %+v", fp.reactions)
+	}
+	if len(fp.ephemerals) != 0 || len(fs.gateSet) != 0 {
+		t.Fatalf("an awaiting_followup reply must not ephemeral or touch the gate: eph=%v gate=%v", fp.ephemerals, fs.gateSet)
+	}
+}
+
 // A reply on a live run with no open gate becomes a follow_up.
 func TestReplierLiveRunSubmitsFollowUp(t *testing.T) {
 	runID, user := uuid.New(), store.User{ID: uuid.New()}

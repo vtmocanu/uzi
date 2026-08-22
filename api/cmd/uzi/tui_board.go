@@ -113,7 +113,7 @@ func (b *boardState) visible() []apitypes.RunListItemDTO {
 
 // The three triage bands, in fixed top-to-bottom order.
 const (
-	bandNeedsYou = iota // awaiting_approval + awaiting_input — the only rows a human must act on
+	bandNeedsYou = iota // awaiting_approval + awaiting_input + awaiting_followup — the only rows a human must act on
 	bandFloor           // everything non-terminal not in NEEDS YOU (running/claimed/queued/planning/limit_wait, stalled)
 	bandDone            // terminal: completed/failed/cancelled
 	numBands
@@ -124,7 +124,9 @@ var bandNames = [numBands]string{"NEEDS YOU", "ON THE FLOOR", "DONE"}
 // runBand places a run in its triage band from its status alone.
 func runBand(status string) int {
 	switch status {
-	case "awaiting_approval", "awaiting_input":
+	case "awaiting_approval", "awaiting_input", "awaiting_followup":
+		// awaiting_followup (PRD #517) is the user's turn — an interactive task parked for
+		// its next follow-up — so it belongs in NEEDS YOU alongside the other two parks.
 		return bandNeedsYou
 	}
 	if terminalRunStatuses[status] {
@@ -503,17 +505,21 @@ func (m tuiModel) syncedScroll() int {
 	return start
 }
 
-// boardSummary is the top-right glyph cluster: ⚑ N · ✎ N · ▲ N · <total> runs. Zero-count
-// segments are dropped, so a healthy factory reads simply "N runs". Computed over m.board.runs
-// so it does not shrink under a filter.
+// boardSummary is the top-right glyph cluster: ⚑ N · ✎ N · ➤ N · ▲ N · <total> runs.
+// Zero-count segments are dropped, so a healthy factory reads simply "N runs". Computed
+// over m.board.runs so it does not shrink under a filter. All three parks in the NEEDS YOU
+// band get a segment — awaiting_followup (PRD #517) alongside awaiting_approval and
+// awaiting_input — so a follow-up park is never invisible in the summary line.
 func (m tuiModel) boardSummary() string {
-	approvals, inputs, warn := 0, 0, 0
+	approvals, inputs, followups, warn := 0, 0, 0, 0
 	for _, r := range m.board.runs {
 		switch r.Status {
 		case "awaiting_approval":
 			approvals++
 		case "awaiting_input":
 			inputs++
+		case "awaiting_followup":
+			followups++
 		}
 		if stalledHealth[r.Health] {
 			warn++
@@ -526,6 +532,9 @@ func (m tuiModel) boardSummary() string {
 	if inputs > 0 {
 		segs = append(segs, paintSeg(m.pal.amber, nil, false, "✎ "+itoa(inputs)))
 	}
+	if followups > 0 {
+		segs = append(segs, paintSeg(m.pal.amber, nil, false, "➤ "+itoa(followups)))
+	}
 	if warn > 0 {
 		segs = append(segs, paintSeg(m.pal.stall, nil, false, "▲ "+itoa(warn)))
 	}
@@ -535,6 +544,52 @@ func (m tuiModel) boardSummary() string {
 
 // rateBarWidth is the mini rate-limit meter's fixed cell width.
 const rateBarWidth = 6
+
+// rateDangerPct / rateWarnPct are the shared tone-band cutoffs (mirror the web toneFor): a
+// rounded pct ≥ rateDangerPct is danger, ≥ rateWarnPct is warn, else ok. The per-group accent
+// bar reddens on a token's peak window pct ≥ rateDangerPct.
+const (
+	rateDangerPct = 85
+	rateWarnPct   = 40
+)
+
+// tokenPeakPct is the max .Pct across a token's non-nil windows; a nil window contributes
+// nothing, and a token with no window at all returns the sentinel -1 (stays faint).
+func tokenPeakPct(t apitypes.TokenRateLimitDTO) int {
+	peak := -1
+	for _, w := range []*apitypes.RateLimitWindow{t.Limits.FiveHour, t.Limits.SevenDay} {
+		if w != nil && w.Pct > peak {
+			peak = w.Pct
+		}
+	}
+	return peak
+}
+
+// selectedRateMeters applies the #519 board/sidebar selection to the model's own
+// per-token meters, shared by the board strip and the detail rail so the two surfaces
+// cannot disagree on which accounts show OR on showLabel. readable = Limits.Status "ok";
+// showLabel is keyed off the READABLE count (>1), not the shown count, so a readable-but-
+// unlisted token still forces per-token labels; shown = readable filtered by
+// (IsDefault || SecretID in sidebar_token_ids). Empty selection => (nil, false).
+func (m tuiModel) selectedRateMeters() (shown []apitypes.TokenRateLimitDTO, showLabel bool) {
+	readable := make([]apitypes.TokenRateLimitDTO, 0, len(m.rateLimits))
+	for _, t := range m.rateLimits {
+		if t.Limits.Status == "ok" {
+			readable = append(readable, t)
+		}
+	}
+	if len(readable) == 0 {
+		return nil, false
+	}
+	showLabel = len(readable) > 1
+	shown = make([]apitypes.TokenRateLimitDTO, 0, len(readable))
+	for _, t := range readable {
+		if t.IsDefault || slices.Contains(m.sidebarTokenIds, t.SecretID) {
+			shown = append(shown, t)
+		}
+	}
+	return shown, showLabel
+}
 
 // boardRateLimitStrip is the single-line rate-limit meter strip drawn under the wordmark,
 // mirroring the web left-bottom sidebar's token SELECTION (SidebarRateLimits +
@@ -554,22 +609,7 @@ const rateBarWidth = 6
 // tone) keeps the legible signal — colour is never the only cue. Clamped to one physical line.
 // The Label is USER-AUTHORED and drawn through renderer.Plain (D7).
 func (m tuiModel) boardRateLimitStrip() string {
-	readable := make([]apitypes.TokenRateLimitDTO, 0, len(m.rateLimits))
-	for _, t := range m.rateLimits {
-		if t.Limits.Status == "ok" {
-			readable = append(readable, t)
-		}
-	}
-	if len(readable) == 0 {
-		return ""
-	}
-	showLabel := len(readable) > 1
-	shown := make([]apitypes.TokenRateLimitDTO, 0, len(readable))
-	for _, t := range readable {
-		if t.IsDefault || slices.Contains(m.sidebarTokenIds, t.SecretID) {
-			shown = append(shown, t)
-		}
-	}
+	shown, showLabel := m.selectedRateMeters()
 	if len(shown) == 0 {
 		return ""
 	}
@@ -580,12 +620,23 @@ func (m tuiModel) boardRateLimitStrip() string {
 			seg = paintSeg(m.pal.faintC, nil, false, m.renderer.Plain(t.Label, 16)+" ")
 		}
 		seg += m.rateWindowCell("5h", t.Limits.FiveHour) + "   " + m.rateWindowCell("7d", t.Limits.SevenDay)
+		// Prefix a per-group accent bar TIGHT against the label: it both delimits the group and
+		// doubles as a status light — alarm when the token's peak window pct ≥ rateDangerPct,
+		// faint otherwise. Emitted unconditionally via paintSeg so the group DELIMITER survives
+		// colour stripping (NO_COLOR/Ascii); the tint is the danger cue and is stripped there, so
+		// danger legibility falls back on the always-present bar-fill + NN% text, not this glyph.
+		accent := m.pal.faintC
+		if tokenPeakPct(t) >= rateDangerPct {
+			accent = m.pal.alarm
+		}
+		seg = paintSeg(accent, nil, false, "▎") + seg
 		segs = append(segs, seg)
 	}
 	// A faint leading space aligns the strip under the brand block (the brand line starts " ").
-	// Tokens are joined with the board's faint dot separator (as boardSummary does) so each
-	// token's two windows group visually; the intra-token 5h↔7d gap stays 3 spaces.
-	strip := " " + strings.Join(segs, m.pal.faint.Render(" · "))
+	// Tokens are joined with three spaces; the per-group accent bar ▎ (prefixed above) is the
+	// group delimiter, so each token's two windows still read as a group; the intra-token 5h↔7d
+	// gap stays 3 spaces.
+	strip := " " + strings.Join(segs, "   ")
 	return clampVisual(strip, m.width)
 }
 
@@ -607,9 +658,9 @@ func (m tuiModel) rateWindowCell(label string, w *apitypes.RateLimitWindow) stri
 // warn ≥ 40, else ok.
 func (m tuiModel) rateTone(pct int) color.Color {
 	switch {
-	case pct >= 85:
+	case pct >= rateDangerPct:
 		return m.pal.alarm
-	case pct >= 40:
+	case pct >= rateWarnPct:
 		return m.pal.amber
 	default:
 		return m.pal.sage

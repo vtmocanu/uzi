@@ -53,6 +53,7 @@ func newHandoffCmd(env Env, gf *globalFlags) *cobra.Command {
 	handoff.Flags().Bool("mr", false, "have the worker open a merge request for the branch (exempts it from 'uzi handoff rm')")
 	handoff.Flags().Bool("review", false, "after the task completes, run a diff-review and produce findings (fetch with 'uzi handoff review <id>')")
 	handoff.Flags().Bool("then-fix", false, "after the review, auto-apply a fix run for its findings to the same branch (turns on --review)")
+	handoff.Flags().Bool("interactive", false, "Keep the task alive after signal_done to iterate conversationally; wind down with 'uzi run stop'")
 	handoff.Flags().String("repo", "", "repo id to run against (overrides origin auto-detection; see 'uzi repo list')")
 
 	handoff.AddCommand(newHandoffRmCmd(env, gf))
@@ -67,12 +68,21 @@ func runHandoffCreate(env Env, gf *globalFlags, cmd *cobra.Command) error {
 	mr, _ := cmd.Flags().GetBool("mr")
 	review, _ := cmd.Flags().GetBool("review")
 	thenFix, _ := cmd.Flags().GetBool("then-fix")
+	interactive, _ := cmd.Flags().GetBool("interactive")
 	repoFlag, _ := cmd.Flags().GetString("repo")
 
 	// --then-fix IMPLIES --review: a chained fix consumes the review's findings, so a fix
 	// without a review is meaningless. Turning --review on here (rather than erroring) keeps
 	// `--then-fix` a single convenient flag.
 	reviewRequested := review || thenFix
+
+	// --interactive and --then-fix are mutually exclusive: --then-fix auto-terminates the
+	// run into a chained review+fix, while --interactive keeps it alive to iterate. Asking
+	// for both is contradictory, so reject it as a usage error (exit 2) rather than silently
+	// picking one.
+	if interactive && thenFix {
+		return uzicli.Exitf(uzicli.ExitUsage, "--interactive and --then-fix are mutually exclusive: --then-fix winds the run down into a review+fix, --interactive keeps it alive")
+	}
 
 	// Context: -m > -f (file, or '-' for stdin) > bare stdin (non-TTY).
 	context, err := resolveHandoffContext(env, msg, file)
@@ -103,7 +113,7 @@ func runHandoffCreate(env Env, gf *globalFlags, cmd *cobra.Command) error {
 	}
 
 	// (1) Create — receive the id and the server-named uzi/task/<id> branch.
-	run, err := c.CreateTaskRun(cmd.Context(), repoID, context, strings.TrimSpace(base), mr, reviewRequested, thenFix)
+	run, err := c.CreateTaskRun(cmd.Context(), repoID, context, strings.TrimSpace(base), mr, reviewRequested, thenFix, interactive)
 	if err != nil {
 		return err
 	}

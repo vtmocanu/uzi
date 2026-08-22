@@ -30,6 +30,7 @@
 // pre-feedback plan.
 
 import type { WorkerClient } from "./client.js";
+import type { FollowUpOutcome } from "./executor.js";
 import type { Logger } from "./log.js";
 import { parseAgentSelection, type AgentSelectionParse } from "./protocol.js";
 import { errMessage, sleep } from "./util.js";
@@ -58,6 +59,9 @@ export interface SteeringOptions {
    *  by the runner (wired to the batcher) so the channel never reaches into runner
    *  internals; optional so tests can omit it. */
   notify?: (text: string) => void;
+  /** PRD #517 M3: injectable clock so the interactive follow-up park's idle window is
+   *  provable without real time (mirrors ChatSteeringOptions.now). Default Date.now. */
+  now?: () => number;
 }
 
 /** Feed notices for events discarded because they were written against a plan version
@@ -118,6 +122,11 @@ export class SteeringChannel {
   private bufferedVerdict: { verdict: PlanVerdict; epoch: number } | undefined;
   /** Cancel is sticky and epoch-exempt: once seen it always wins, at any epoch. */
   private cancelled = false;
+  /** PRD #517 M4: a graceful `stop` is sticky. Once seen it ends an interactive park with
+   *  { kind:"ended", reason:"stopped" }, serviced AHEAD of a buffered follow-up (an explicit
+   *  stop wins over a queued turn). DISTINCT from `this.stopped` (~:112), which means "the
+   *  poll loop should stop" — reusing that would kill the poll loop before the park resolves. */
+  private stopRequested = false;
   /** FIFO queue of revision feedback (PRD #41), each stamped with its arrival epoch. */
   private readonly reviseQueue: { feedback: string; epoch: number }[] = [];
   /** The gate waiter parked on awaitGateEvent, with the epoch it is waiting for. */
@@ -139,8 +148,18 @@ export class SteeringChannel {
   /** The answer waiter parked on awaitAnswer, with the question id it is waiting for. */
   private answerWaiter:
     { questionId: string; resolve: (v: AnswerVerdict) => void } | undefined;
+  /** PRD #517 M3: the interactive-task follow-up park waiter (single outstanding), with
+   *  the idle bound and the clock reading it armed at. A DISTINCT slot from gateWaiter /
+   *  answerWaiter for the same reason those are distinct (one shared slot would have two
+   *  owners): an interactive task parks HERE between turns, never at the plan gate or an
+   *  ask_user question, so the three are mutually exclusive and each owns its own slot. */
+  private followUpWaiter:
+    | { resolve: (o: FollowUpOutcome) => void; idleMs: number; parkedAt: number }
+    | undefined;
   private readonly sleepFn: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly notify: ((text: string) => void) | undefined;
+  /** PRD #517 M3: clock the follow-up park's idle window measures against. */
+  private readonly now: () => number;
 
   constructor(
     private readonly client: WorkerClient,
@@ -153,6 +172,7 @@ export class SteeringChannel {
   ) {
     this.sleepFn = opts.sleep ?? sleep;
     this.notify = opts.notify;
+    this.now = opts.now ?? Date.now;
   }
 
   /** Start the poll loop (idempotent). Runs until stop(). */
@@ -271,6 +291,88 @@ export class SteeringChannel {
     return this.followUps.shift();
   }
 
+  /**
+   * Park until the next follow-up for an INTERACTIVE task run (PRD #517 M3), or until the
+   * park ENDS: idle after `idleMs` with no follow-up, or a cancel. Modeled on
+   * ChatSteering.awaitFollowUp + serviceWaiter (route-then-service, drain-after-arm, single
+   * outstanding park, channel-owned idle clock) — NOT on pullFollowUp. The waiter resolves
+   * ONLY from serviceFollowUp, called by pollLoop AFTER a batch routes, so a follow-up
+   * delivered here has already been consumed server-side (ConsumeRunInputs stamped
+   * consumed_at in the same RETURNING that handed it over). That is exactly the ordering the
+   * server's SetRunRunning wake guard requires before the loop reports `running` — obtaining
+   * the follow-up through this path satisfies consume-before-report by construction.
+   *
+   * DRAIN-AFTER-ARM: a follow-up already buffered when this is called (it arrived in the
+   * window between the executor deciding to break and arming the waiter) is returned
+   * immediately, so a follow-up that races the park boundary is never lost — the drop-on-idle
+   * race.
+   *
+   * Single outstanding park only: the executor parks exactly once per `signal_done`, and an
+   * interactive park is mutually exclusive with the plan gate / an ask_user question. A
+   * double-arm is a programming error, not a runtime condition — throw rather than silently
+   * clobber the earlier waiter.
+   */
+  awaitFollowUp(idleMs: number): Promise<FollowUpOutcome> {
+    if (this.followUpWaiter)
+      throw new Error("steering: awaitFollowUp is already parked (double-arm)");
+    // Cancel is sticky and always wins immediately, exactly as it does for the plan gate
+    // and the answer waiter.
+    if (this.cancelled)
+      return Promise.resolve<FollowUpOutcome>({
+        kind: "ended",
+        reason: "cancelled",
+      });
+    // PRD #517 M4: a `stop` input resolves { kind:"ended", reason:"stopped" } and is serviced
+    // AHEAD of a buffered follow-up (an explicit stop wins over a queued turn, Decision 5).
+    // Precedence: cancelled (above) → stop (here) → buffered follow-up → idle.
+    if (this.stopRequested)
+      return Promise.resolve<FollowUpOutcome>({
+        kind: "ended",
+        reason: "stopped",
+      });
+    if (this.followUps.length)
+      return Promise.resolve<FollowUpOutcome>({
+        kind: "followup",
+        body: this.followUps.shift()!,
+      });
+    return new Promise<FollowUpOutcome>((resolve) => {
+      this.followUpWaiter = { resolve, idleMs, parkedAt: this.now() };
+    });
+  }
+
+  /** After routing an input batch, deliver to a parked follow-up waiter if one is now due
+   *  (PRD #517 M3). Precedence: a cancel ends it (`cancelled`); a pending `stop` ends it with
+   *  reason "stopped" AHEAD of the follow-up drain below (PRD #517 M4, Decision 5); then a
+   *  buffered follow-up; then idle once `idleMs` has elapsed since it armed. Same route-THEN-
+   *  service discipline as serviceGate / serviceAnswer / ChatSteering.serviceWaiter — resolving
+   *  from here (post-route) is what guarantees a delivered follow-up was already consumed. */
+  private serviceFollowUp(): void {
+    const w = this.followUpWaiter;
+    if (!w) return;
+    if (this.cancelled) {
+      this.followUpWaiter = undefined;
+      w.resolve({ kind: "ended", reason: "cancelled" });
+      return;
+    }
+    // PRD #517 M4: resolve { kind:"ended", reason:"stopped" } here — BEFORE the follow-up
+    // drain — when a `stop` input is pending, so an explicit stop wins over a queued turn.
+    // Precedence: cancelled (above) → stop (here) → buffered follow-up → idle.
+    if (this.stopRequested) {
+      this.followUpWaiter = undefined;
+      w.resolve({ kind: "ended", reason: "stopped" });
+      return;
+    }
+    if (this.followUps.length) {
+      this.followUpWaiter = undefined;
+      w.resolve({ kind: "followup", body: this.followUps.shift()! });
+      return;
+    }
+    if (this.now() - w.parkedAt >= w.idleMs) {
+      this.followUpWaiter = undefined;
+      w.resolve({ kind: "ended", reason: "idle" });
+    }
+  }
+
   /** Consume the next actionable gate event for `epoch`, applying the precedence rule
    *  and discarding stale events (with a feed notice) as a side effect. Returns the
    *  verdict to deliver, or undefined when nothing is (yet) actionable. */
@@ -343,6 +445,14 @@ export class SteeringChannel {
         if (!this.cancel.signal.aborted) this.cancel.abort();
         this.cancelled = true;
         break;
+      case "stop":
+        // PRD #517 M4: a graceful wind-down of an interactive task. Sticky, like cancel, but
+        // it does NOT abort ctx.signal — the current turn finishes and the park resolves
+        // { kind:"ended", reason:"stopped" }, which sdk-executor finalizes normally (push +
+        // MR iff open_mr → completed). serviceFollowUp/awaitFollowUp check this AHEAD of the
+        // follow-up drain so an explicit stop beats a queued follow-up (Decision 5).
+        this.stopRequested = true;
+        break;
       case "follow_up":
         if (body && body.trim()) this.followUps.push(body.trim());
         break;
@@ -376,21 +486,46 @@ export class SteeringChannel {
       try {
         const inputs = await this.client.getInputs(this.runId);
         for (const inp of inputs) this.route(inp.kind, inp.body ?? undefined);
-        // Route the WHOLE batch, THEN service once: whatever landed may now satisfy a
-        // parked gate. Servicing per-input would let an approve at the head of a
-        // [approve, revise] batch resolve the gate before the revise routes — the revise
-        // would then sit un-consumed (a silent drop that still burned a server cap slot).
-        // One service call per batch evaluates full precedence (revise beats approve) once.
-        this.serviceGate();
-        // Same batch-then-service-once position, for the same reason (PRD #88): an
-        // answer that lands in this batch may satisfy a parked question.
-        this.serviceAnswer();
       } catch (err) {
+        // The loop continues on a getInputs failure (HTTP >=400 / timeout) — but only the
+        // FETCH is skipped, not the service step below. PRD #517 M5: serviceFollowUp()
+        // evaluates the interactive park's idle clock and is called ONLY from this loop, so
+        // if the service step lived inside this try a PERSISTENT run-scoped getInputs outage
+        // (a 500 on ConsumeInputs, a not-owned 404 flip) concurrent with a healthy worker
+        // heartbeat would starve the idle finalize forever — pinning the park at
+        // awaiting_followup as a permanent zombie the heartbeat-keyed stale-worker requeue
+        // never sees. Log and fall through; the service step runs regardless.
         this.log.warn("steering: input poll failed", {
           run_id: this.runId,
           error: errMessage(err),
         });
       }
+      // Service the parked waiters on EVERY tick, OUTSIDE the try above, so a getInputs
+      // failure cannot starve them (PRD #517 M5). serviceGate/serviceAnswer/serviceFollowUp
+      // operate PURELY on in-memory state — the buffered verdict/answer/follow-up, the
+      // sticky cancel/stop flags, and the channel-owned idle clock — never on the getInputs
+      // result, so running them on a failed tick is safe and delivers nothing NEW: a
+      // follow-up (and a verdict/answer/cancel/stop) still only ENTERS via route() from a
+      // SUCCESSFUL batch, so follow-up/stop/cancel delivery semantics are unchanged. What a
+      // failed tick still evaluates is the idle bound (serviceFollowUp) and any event
+      // already buffered by a prior successful batch. (This mirrors ChatSteering.pollLoop,
+      // which likewise services its waiter after the catch.)
+      //
+      // Route the WHOLE batch, THEN service once: whatever landed may now satisfy a parked
+      // gate. Servicing per-input would let an approve at the head of a [approve, revise]
+      // batch resolve the gate before the revise routes — the revise would then sit
+      // un-consumed (a silent drop that still burned a server cap slot). One service call
+      // per batch evaluates full precedence (revise beats approve) once.
+      this.serviceGate();
+      // Same batch-then-service-once position, for the same reason (PRD #88): an
+      // answer that lands in this batch may satisfy a parked question.
+      this.serviceAnswer();
+      // PRD #517 M3: same position, same reason — a follow-up that lands in this batch may
+      // satisfy a parked interactive-task waiter, and servicing it HERE (post-route) is
+      // what makes the delivered follow-up already-consumed (the wake-guard ordering). Also
+      // re-evaluated every idle tick so a park with no follow-up ends on its idle bound —
+      // including on a tick where getInputs threw (PRD #517 M5).
+      this.serviceFollowUp();
       if (this.stopped) break;
       await this.sleepFn(this.pollMs);
     }

@@ -55,7 +55,7 @@ var ErrTaskBaseBranchTooLong = errors.New("base branch is too long")
 // cheap branch-safety assertion (Decision 8) confirms the resolved branch is namespaced
 // and is not the repo's default branch — belt-and-suspenders behind the server-named
 // branch being safe by construction.
-func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, inlineContext, baseBranch string, openMR, reviewRequested, thenFixRequested bool) (store.Run, error) {
+func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, inlineContext, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool) (store.Run, error) {
 	id := uuid.New()
 	branch := taskBranchPrefix + id.String()
 
@@ -105,6 +105,7 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 		Branch:           pgText(branch),
 		BaseBranch:       pgTextTrimNarg(baseBranch),
 		OpenMr:           openMR,
+		Interactive:      interactive,
 		ReviewRequested:  reviewRequested,
 		ThenFixRequested: thenFixRequested,
 		IssueTitle:       deriveTaskTitle(inlineContext),

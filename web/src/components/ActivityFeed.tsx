@@ -258,6 +258,10 @@ function crewStateFor(
   if (
     run.status === "awaiting_approval" ||
     run.status === "awaiting_input" ||
+    // PRD #517: a follow-up park blocks the whole crew the same way — the lead is
+    // stopped between turns awaiting the user's next follow-up and nothing else can
+    // proceed — so it joins the gate arm rather than aging every lane to `idle`.
+    run.status === "awaiting_followup" ||
     run.health === "waiting_worker"
   )
     return "waiting";
