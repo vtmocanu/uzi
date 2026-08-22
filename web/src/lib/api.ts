@@ -396,6 +396,16 @@ export interface Repo {
   // and zero eligible online workers. Drives the Setup chip's info escalation; computed
   // from eligibility, not the sweeper's health text. Set by the list handlers.
   docker_blocked: boolean;
+  // Caller-scoped GitHub Projects v2 sync-health summary (PRD #576 M2), null/absent
+  // when the repo is not linked. Drives the Sync badge tone: linked && healthy → green
+  // (ok), linked && !healthy (last_error set) → danger, absent → neutral. Derived from
+  // the github_project_links row (last_error/last_synced_at); set by the list handlers.
+  github_project_sync?: {
+    linked: boolean;
+    healthy: boolean;
+    last_error?: string;
+    last_synced_at?: string;
+  } | null;
 }
 
 // GuardrailOverrideMeta is the audit metadata for an active admin per-repo guardrail
@@ -416,6 +426,10 @@ export interface ProjectSyncStatus {
   last_synced_at: string | null;
   last_error: string | null;
   item_count: number;
+  // Board columns with no matching Status option at the last adopt/resync (PRD #576
+  // M3): the panel surfaces them with a Resync prompt. Always an array from the server
+  // (never null); optional here so a pre-M3 fixture without the field still typechecks.
+  unmatched_columns?: string[];
 }
 // Which GitHub owner a provision/adopt targets (PRD #534): the connecting user,
 // an org, or the token's own viewer. "user" is the default.
@@ -2857,11 +2871,39 @@ const realApi = {
       `/repos/${id}/github-project-sync/provision`,
       { owner_kind: body.owner_kind, title: body.title ?? "" },
     ),
+  // Read the repo owner's GitHub type for the Adopt-first Provision nudge (PRD
+  // #576 M1): a live forge round-trip (repositoryOwner __typename), fetched for a
+  // not-yet-linked repo. "User" means Provision cannot own a project under a
+  // personal account (Adopt instead); "Organization" means Provision is available.
+  getProjectSyncOwnerType: (id: string) =>
+    request<{ owner_type: "User" | "Organization" }>(
+      "GET",
+      `/repos/${id}/github-project-sync/owner-type`,
+    ),
   // Adopt an EXISTING Project v2 by number (200 { status: "linked" }).
   adoptProjectSync: (
     id: string,
     body: { project_number: number; owner_kind: ProjectSyncOwnerKind },
   ) => request<{ status: string }>("POST", `/repos/${id}/github-project-sync`, body),
+  // Re-seed an already-linked board (PRD #576 M3): re-reads the Status field so
+  // newly-added options resolve and re-persists the unmatched set. Idempotent (Adopt
+  // re-diffs every item); needs no body. 200 { status: "resynced" }; 404 when the repo
+  // has no link.
+  resyncProjectSync: (id: string) =>
+    request<{ status: string }>(
+      "POST",
+      `/repos/${id}/github-project-sync/resync`,
+    ),
+  // Safe column auto-create (PRD #576 M6): create a FRESH uzi-owned "uzi Status"
+  // field on the adopted board carrying ALL the repo's columns and switch the link to
+  // it, turning skipped columns into synced ones with no manual GitHub edit and no
+  // destructive field replace. Needs no body. 200 { status: "columns_created" }; 404
+  // when the repo has no link. Tradeoff: the board then carries two status-like fields.
+  autocreateProjectSyncColumns: (id: string) =>
+    request<{ status: string }>(
+      "POST",
+      `/repos/${id}/github-project-sync/autocreate-columns`,
+    ),
   // Unlink the repo from its project (204, empty body). Idempotent server-side.
   disableProjectSync: (id: string) =>
     request<null>("DELETE", `/repos/${id}/github-project-sync`),

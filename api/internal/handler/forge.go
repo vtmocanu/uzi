@@ -120,6 +120,27 @@ func guardrailBlockedForRepo(rep *privcheck.Report, repoID string, overridden bo
 	return false
 }
 
+// syncHealthForLink maps a github_project_links row to the caller-scoped sync-health
+// DTO (PRD #576 M2), mirroring the pure guardrailBlockedForRepo seam so the badge
+// state is offline-unit-testable. It is called ONLY for a repo that actually has a
+// link row, so Linked is always true; Healthy is "the last sync recorded no error"
+// (last_error IS NULL/empty). LastError/LastSyncedAt copy through from the pgtype
+// fields when present. No forge call — purely the stored row.
+func syncHealthForLink(link store.GithubProjectLink) *apitypes.RepoProjectSyncHealth {
+	h := &apitypes.RepoProjectSyncHealth{Linked: true}
+	if link.LastError.Valid && link.LastError.String != "" {
+		msg := link.LastError.String
+		h.LastError = &msg
+	} else {
+		h.Healthy = true
+	}
+	if link.LastSyncedAt.Valid {
+		ts := link.LastSyncedAt.Time
+		h.LastSyncedAt = &ts
+	}
+	return h
+}
+
 // capsOrEmpty normalizes a repo/run capability slice to a non-nil empty slice so the
 // DTO marshals `[]` rather than `null` when the column holds the empty set. The column
 // is NOT NULL DEFAULT '{}', but pgx can hand back a nil slice for a zero-length array,
@@ -596,15 +617,44 @@ func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// PRD #576 M2: batch-load each repo's GitHub Projects v2 sync-health once per
+	// request and map it caller-scoped, alongside the docker/guardrail enrichments.
+	// A store error degrades gracefully (empty map → field stays nil), never failing
+	// the whole list, matching the docker-allowlist direction.
+	syncLinks := syncLinksForRepos(r.Context(), h.q, repoIDs, "list projects")
 	for _, rp := range repos {
 		d := repoToDTO(rp)
 		d.Pipeline = pipelines[rp.ID]
 		d.GuardrailBlocked = guardrailBlockedForRepo(report, rp.ID.String(), rp.GuardrailOverrideReason.Valid)
 		d.DockerAllowlisted = allowSet[rp.ID]
 		d.DockerBlocked = blockedSet[rp.ID]
+		if link, ok := syncLinks[rp.ID]; ok {
+			d.GithubProjectSync = syncHealthForLink(link)
+		}
 		out = append(out, d)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"repos": out})
+}
+
+// syncLinksForRepos batch-loads the GitHub Projects v2 link rows for a set of repo
+// ids and returns them keyed by repo id, for the caller-scoped sync-health badge
+// (PRD #576 M2). A query error is non-fatal — the badge is enrichment, so it logs and
+// returns an empty map (every repo's field stays nil), mirroring how the docker
+// enrichments degrade rather than failing the whole list.
+func syncLinksForRepos(ctx context.Context, q *store.Queries, repoIDs []uuid.UUID, logPrefix string) map[uuid.UUID]store.GithubProjectLink {
+	out := map[uuid.UUID]store.GithubProjectLink{}
+	if len(repoIDs) == 0 {
+		return out
+	}
+	links, err := q.ListGithubProjectLinksByRepoIDs(ctx, repoIDs)
+	if err != nil {
+		slog.Warn(logPrefix+": github project sync links", "error", err)
+		return out
+	}
+	for _, l := range links {
+		out[l.RepoID] = l
+	}
+	return out
 }
 
 // ── Repos ───────────────────────────────────────────────────────────────────
@@ -680,12 +730,18 @@ func (h *Handler) ListRepos(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// PRD #576 M2: batch-load each repo's GitHub Projects v2 sync-health once, keyed by
+	// repo id, degrading gracefully on a store error (see syncLinksForRepos).
+	syncLinks := syncLinksForRepos(r.Context(), h.q, repoIDs, "list repos")
 	for _, rp := range repos {
 		d := repoToDTO(rp)
 		d.Pipeline = pipelines[rp.ID]
 		d.GuardrailBlocked = guardrailBlockedForRepo(reports[rp.ConnectionID], rp.ID.String(), rp.GuardrailOverrideReason.Valid)
 		d.DockerAllowlisted = allowSet[rp.ID]
 		d.DockerBlocked = blockedSet[rp.ID]
+		if link, ok := syncLinks[rp.ID]; ok {
+			d.GithubProjectSync = syncHealthForLink(link)
+		}
 		out = append(out, d)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"repos": out})

@@ -49,7 +49,7 @@ func TestCommandTree(t *testing.T) {
 
 	topWant := []string{
 		"login", "logout", "auth", "whoami", "run", "review", "findings",
-		"worker", "token", "repo", "handoff", "admin", "skill", "version",
+		"worker", "token", "repo", "project-sync", "handoff", "admin", "skill", "version",
 	}
 	for _, name := range topWant {
 		if findCmd(root, name) == nil {
@@ -67,10 +67,12 @@ func TestCommandTree(t *testing.T) {
 		"worker":   {"list", "rm", "set-token"},
 		"token":    {"list"},
 		"repo":     {"list", "remove"},
-		"handoff":  {"rm", "review"},
-		"admin":    {"users", "runs", "workers", "usage", "rate-limits"},
-		"skill":    {"status", "install"},
-		"auth":     {"token", "status"},
+		// PRD #576 M7: read (status) + fix-loop re-seed (resync); Adopt/Provision are web-only.
+		"project-sync": {"status", "resync"},
+		"handoff":      {"rm", "review"},
+		"admin":        {"users", "runs", "workers", "usage", "rate-limits"},
+		"skill":        {"status", "install"},
+		"auth":         {"token", "status"},
 	}
 	for parent, kids := range subWant {
 		pc := findCmd(root, parent)

@@ -1,7 +1,7 @@
 # PRD #576 — GitHub Project sync: Adopt-first UX + safe column auto-create
 
 **Issue**: [#576](https://github.com/vtmocanu/uzi/issues/576)
-**Status**: Draft
+**Status**: Implemented (2026-08-22) — all seven milestones (M1–M7) shipped on branch `agent/issue-576`.
 **Priority**: Medium
 **Owner**: TBD
 
@@ -166,6 +166,18 @@ Close the loop across the second API consumer and the user docs.
 
 - PRD #364 (core Projects v2 sync), PRD #534 (visibility/sharing). No new external services; no new trust boundary.
 - **New goose migrations** (M2 batch query needs none; M3 adds an `unmatched_columns` column on `github_project_links`; M4's reverse-suppression flag may need a column too). Number each above the live head in `api/internal/store/migrations/` at merge, per repo convention; run `sqlc generate` after any query/schema change and confirm the regenerate is a no-op in CI.
+
+## As-built notes (2026-08-22)
+
+All seven milestones shipped; the design was followed as written, with these concrete implementation choices worth recording:
+
+- **M1** — owner type resolves via a new **GitHub-only** `ProjectBoardSyncer.ResolveRepositoryOwnerType` (`repositoryOwner(login){__typename}`), surfaced by a new `GET /repos/{id}/github-project-sync/owner-type` endpoint (kept OFF `ProjectSyncStatus` to preserve its pure-store-read property, D5). The Provision nudge disables for a `User` owner (with visible reason), stays available for an `Organization`, and shows both on resolution failure.
+- **M2** — new batch query `ListGithubProjectLinksByRepoIDs` + pure `syncHealthForLink` mapper; the DTO field is `github_project_sync: {linked, healthy, last_error?, last_synced_at?}`, computed caller-scoped in both repos-list loops.
+- **M3** — `unmatched_columns text[]` added by **migration 00148** (COALESCE-guarded upsert to dodge the nil-slice→NULL trap). **Resync** ships as a dedicated `POST /repos/{id}/github-project-sync/resync` that re-seeds against the stored link (no re-input of owner_kind/project_number), reusing the M4 seed seam. Both stale "recorded on the link row" docstrings corrected.
+- **M4** — the seed step runs in a background goroutine on a detached context (`context.WithoutCancel` + 8m timeout); the finalize (lease-clear + last_error stamp/clear) always runs on a fresh 30s context. Reverse suppression is a **timestamp lease** (`seeding_started_at`, **migration 00149**), not a boolean: `ReverseSync` skips a repo only while the lease is younger than 10m, so a crash-orphaned lease ages out and the poller reconciles. The async seed applies to Adopt, Resync AND Provision; response codes unchanged (200/200/201).
+- **M5** — `reverseDiff` restructured plan→decide→execute; the destructive-write cap thresholds (k=3, pct=25) are injectable service fields so the negative tests carry built-in mutation controls.
+- **M6** — auto-create ships as `POST /repos/{id}/github-project-sync/autocreate-columns` + `ResetGithubProjectItemMarkers` query (no migration). The field switch holds the M4 lease AND resets markers to NULL (order: lease → reset → switch → async re-seed); `owned_by_uzi` is preserved (uzi owns the field, not the project). No `updateProjectV2Field` in the diff (D3).
+- **M7** — `GET .../github-project-sync` (status) and `POST .../github-project-sync/resync` moved from the cookie-only `RequireAuth` group to `RequireUser` so the CLI `uzc_` Bearer token is accepted; adopt/provision/disable/visibility/collaborators/owner-type/autocreate stay web-only on `RequireAuth`. CLI group `uzi project-sync status|resync <repo>` (read+fix loop only, D4); a `*LiveDB` test asserts the Bearer path returns an owner-scoped 404 (not 401).
 
 ## Decision log
 

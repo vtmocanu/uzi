@@ -67,7 +67,16 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 155 as of this commit (PRD #557 added GET+PUT /api/repos/{id}/github-project-sync/
+// 158 as of this commit (PRD #576 M6 added POST
+// /api/repos/{id}/github-project-sync/autocreate-columns — create a fresh uzi-owned
+// Status field on an adopted board so skipped columns become synced ones).
+// It was 157 until then (PRD #576 M3 added POST
+// /api/repos/{id}/github-project-sync/resync — re-seed an already-linked board to pick
+// up newly-added Status options).
+// It was 156 until then (PRD #576 M1 added GET
+// /api/repos/{id}/github-project-sync/owner-type — the Adopt-first Provision nudge's
+// owner-type read).
+// It was 155 until then (PRD #557 added GET+PUT /api/repos/{id}/github-project-sync/
 // visibility and POST+DELETE /api/repos/{id}/github-project-sync/collaborators — the
 // four board-access routes).
 // It was 151 until then (issue #534 relocated the four github-project-sync routes
@@ -247,6 +256,9 @@ var wantRouteMounts = []routeMount{
 	// from the admin READ group to owner-or-admin /repos (D4). A read of the stored
 	// projection, no forge call → noLimiter.
 	{"GET", "/api/repos/{id}/github-project-sync", noLimiter},
+	// PRD #576 M1 owner-type read for the Adopt-first Provision nudge: a lazy forge
+	// round-trip on the same owner-or-admin group as the sibling routes → noLimiter.
+	{"GET", "/api/repos/{id}/github-project-sync/owner-type", noLimiter},
 	// PRD #557 board-access visibility read: a lazy forge round-trip on the same
 	// owner-or-admin group as the sibling routes → noLimiter, like the sibling reads.
 	{"GET", "/api/repos/{id}/github-project-sync/visibility", noLimiter},
@@ -366,6 +378,12 @@ var wantRouteMounts = []routeMount{
 	// so they wear no per-user limiter → noLimiter, as in the admin write group they left.
 	{"POST", "/api/repos/{id}/github-project-sync", noLimiter},
 	{"POST", "/api/repos/{id}/github-project-sync/provision", noLimiter},
+	// PRD #576 M3 Resync: re-seed an already-linked board; infrequent manual action in
+	// the same owner-or-admin write group → noLimiter.
+	{"POST", "/api/repos/{id}/github-project-sync/resync", noLimiter},
+	// PRD #576 M6 auto-create columns: create a fresh uzi-owned Status field on the
+	// adopted board; infrequent manual action in the same owner-or-admin write group → noLimiter.
+	{"POST", "/api/repos/{id}/github-project-sync/autocreate-columns", noLimiter},
 	// PRD #557 board-access grant (Reader): same owner-or-admin write group → noLimiter.
 	{"POST", "/api/repos/{id}/github-project-sync/collaborators", noLimiter},
 	{"POST", "/api/repos/{id}/issues", limForge},

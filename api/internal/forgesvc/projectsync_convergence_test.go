@@ -18,9 +18,11 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -178,6 +180,9 @@ func (p *statefulProject) SetProjectV2Collaborator(context.Context, string, stri
 func (p *statefulProject) ResolveUserNodeID(context.Context, string) (string, error) {
 	return "", nil
 }
+func (p *statefulProject) ResolveRepositoryOwnerType(context.Context, string) (forge.ProjectV2OwnerType, error) {
+	return forge.OwnerTypeUser, nil
+}
 
 // --- statefulStore: a real projection store (marker survives across calls) --
 
@@ -267,8 +272,23 @@ func (s *statefulStore) SetGithubProjectItemStatusMarker(_ context.Context, arg 
 	s.items[arg.ForgeIssueIid] = it
 	return nil
 }
+func (s *statefulStore) ResetGithubProjectItemMarkers(_ context.Context, _ uuid.UUID) error {
+	for iid, it := range s.items {
+		it.LastStatusOptionID = pgtype.Text{Valid: false}
+		s.items[iid] = it
+	}
+	return nil
+}
 func (s *statefulStore) TouchGithubProjectLinkSynced(context.Context, uuid.UUID) error {
 	s.touchCalls++
+	return nil
+}
+func (s *statefulStore) MarkGithubProjectLinkSeeding(_ context.Context, _ uuid.UUID) error {
+	s.link.SeedingStartedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+	return nil
+}
+func (s *statefulStore) ClearGithubProjectLinkSeeding(_ context.Context, _ uuid.UUID) error {
+	s.link.SeedingStartedAt = pgtype.Timestamptz{Valid: false}
 	return nil
 }
 

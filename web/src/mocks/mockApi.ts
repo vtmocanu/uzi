@@ -2472,6 +2472,12 @@ export const mockApi = {
     if (!link) throw new ApiError(404, "project sync not enabled for this repo");
     return delay({ ...link });
   },
+  // Owner type for the Adopt-first Provision nudge (PRD #576 M1). The mock treats
+  // every repo as org-owned so Provision stays available in the demo/offline mode.
+  getProjectSyncOwnerType: async (id: string) => {
+    void id;
+    return delay<{ owner_type: "User" | "Organization" }>({ owner_type: "Organization" });
+  },
   // Provision a fresh project: record a uzi-owned link and return the created status.
   provisionProjectSync: async (
     id: string,
@@ -2500,6 +2506,23 @@ export const mockApi = {
       item_count: 0,
     });
     return delay({ status: "linked" });
+  },
+  // Re-seed an already-linked board (PRD #576 M3). A 404 when not linked, mirroring
+  // the server's not-linked sentinel; otherwise a no-op idempotent re-seed.
+  resyncProjectSync: async (id: string) => {
+    if (!githubProjectLinks.has(id))
+      throw new ApiError(404, "this repo has no linked project to resync");
+    return delay({ status: "resynced" });
+  },
+  // Safe column auto-create (PRD #576 M6): create a fresh uzi-owned field with all the
+  // repo's columns and switch the link to it. In the mock, clear the unmatched set so the
+  // panel reflects "all columns now sync".
+  autocreateProjectSyncColumns: async (id: string) => {
+    const link = githubProjectLinks.get(id);
+    if (!link)
+      throw new ApiError(404, "this repo has no linked project to auto-create columns for");
+    githubProjectLinks.set(id, { ...link, unmatched_columns: [] });
+    return delay({ status: "columns_created" });
   },
   // Unlink the repo from its project (empty 204 body).
   disableProjectSync: async (id: string) => {

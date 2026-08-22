@@ -52,6 +52,10 @@ type fakeProjectSyncer struct {
 	live      []forge.ProjectV2ItemStatus
 	readErr   error
 	readCalls int
+	// onRead (PRD #576 M4) fires at the START of ReadProjectV2ItemStatuses — the first
+	// forge call the item-seed makes — so a test can capture store state AT SEED TIME
+	// (e.g. that the link is persisted and the seeding lease is set before seeding runs).
+	onRead func()
 
 	// Live single-item read (D7 forward no-op guard). liveStatus maps an item node id
 	// to its CURRENT forge option id; a nil/absent entry reads "" (No Status).
@@ -79,6 +83,12 @@ type fakeProjectSyncer struct {
 	resolveUserID      string
 	resolveUserCalls   []string // logins resolved
 	resolveUserErr     error
+
+	// Owner-type resolution (PRD #576 M1): scripted return + error for the Provision
+	// feasibility nudge's repositoryOwner __typename lookup.
+	ownerType     forge.ProjectV2OwnerType
+	ownerTypeErr  error
+	ownerTypeCall []string // owner logins resolved
 }
 
 type setVisibilityCall struct {
@@ -159,6 +169,9 @@ func (f *fakeProjectSyncer) SetProjectV2ItemStatus(_ context.Context, _, itemID,
 
 func (f *fakeProjectSyncer) ReadProjectV2ItemStatuses(context.Context, string, string) ([]forge.ProjectV2ItemStatus, error) {
 	f.readCalls++
+	if f.onRead != nil {
+		f.onRead()
+	}
 	return f.live, f.readErr
 }
 
@@ -224,6 +237,14 @@ func (f *fakeProjectSyncer) ResolveUserNodeID(_ context.Context, login string) (
 	return f.resolveUserID, nil
 }
 
+func (f *fakeProjectSyncer) ResolveRepositoryOwnerType(_ context.Context, owner string) (forge.ProjectV2OwnerType, error) {
+	f.ownerTypeCall = append(f.ownerTypeCall, owner)
+	if f.ownerTypeErr != nil {
+		return "", f.ownerTypeErr
+	}
+	return f.ownerType, nil
+}
+
 // fakeForgeBuilder returns a fixed forge for ForgeForConnection.
 type fakeForgeBuilder struct {
 	f   forge.Forge
@@ -269,6 +290,19 @@ type fakeProjectStore struct {
 
 	// Observability (M7): count TouchGithubProjectLinkSynced calls.
 	touchCalls int
+
+	// Seeding lease (PRD #576 M4): Mark stamps now/Valid, Clear nulls it. Keyed by repo
+	// so a seed-time hook can observe "seeding set" and a post-Adopt assertion can see it
+	// cleared.
+	seeding map[uuid.UUID]pgtype.Timestamptz
+
+	// Marker reset (PRD #576 M6): ResetGithubProjectItemMarkers simulates the real UPDATE
+	// by nulling every existingItems marker, so a same-flow reverse tick reads
+	// live("") == marker(NULL) → no-op. resetMarkerCalls counts the calls; skipMarkerReset
+	// makes the reset a NO-OP (markers keep the old field's ids) — the mutation control the
+	// M6 test uses to prove the reset, not the M5 cap, is what prevents the cascade.
+	resetMarkerCalls int
+	skipMarkerReset  bool
 }
 
 func (s *fakeProjectStore) GetRepoByID(context.Context, uuid.UUID) (store.GetRepoByIDRow, error) {
@@ -324,8 +358,38 @@ func (s *fakeProjectStore) TouchGithubProjectLinkSynced(context.Context, uuid.UU
 	s.touchCalls++
 	return nil
 }
+func (s *fakeProjectStore) ResetGithubProjectItemMarkers(_ context.Context, _ uuid.UUID) error {
+	s.resetMarkerCalls++
+	if s.skipMarkerReset {
+		return nil // mutation control: old-field markers stay in place.
+	}
+	for i := range s.existingItems {
+		s.existingItems[i].LastStatusOptionID = pgtype.Text{Valid: false}
+	}
+	return nil
+}
+func (s *fakeProjectStore) MarkGithubProjectLinkSeeding(_ context.Context, repoID uuid.UUID) error {
+	if s.seeding == nil {
+		s.seeding = map[uuid.UUID]pgtype.Timestamptz{}
+	}
+	s.seeding[repoID] = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+	return nil
+}
+func (s *fakeProjectStore) ClearGithubProjectLinkSeeding(_ context.Context, repoID uuid.UUID) error {
+	if s.seeding == nil {
+		s.seeding = map[uuid.UUID]pgtype.Timestamptz{}
+	}
+	s.seeding[repoID] = pgtype.Timestamptz{Valid: false}
+	return nil
+}
 
 // --- helpers ----------------------------------------------------------------
+
+// syncBackground is the deterministic background launcher tests inject (PRD #576 M4):
+// it runs the seed in-line so the whole Adopt/Resync/Provision → seed → finalize flow
+// completes before the call returns, with no goroutine, no sleep, and no wall-clock —
+// making lease/ordering/error assertions deterministic and race-free.
+func syncBackground(fn func()) { fn() }
 
 func labelsJSON(t *testing.T, labels ...string) []byte {
 	t.Helper()
@@ -390,6 +454,7 @@ func TestAdoptSeedsBoard(t *testing.T) {
 		},
 	}
 	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.background = syncBackground // PRD #576 M4: run the async seed in-line, deterministically
 
 	if err := svc.Adopt(context.Background(), repoID, 7, forge.OwnerUser); err != nil {
 		t.Fatalf("Adopt: %v", err)
@@ -496,6 +561,7 @@ func TestAdoptCleanRunClearsError(t *testing.T) {
 		issues:  []store.Issue{{ForgeIssueIid: 1, State: "opened", Labels: labelsJSON(t, "In Progress")}},
 	}
 	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.background = syncBackground // PRD #576 M4: run the async seed in-line, deterministically
 	if err := svc.Adopt(context.Background(), repoID, 7, forge.OwnerUser); err != nil {
 		t.Fatalf("Adopt: %v", err)
 	}
@@ -527,6 +593,7 @@ func TestAdoptStatusFieldFallback(t *testing.T) {
 		columns: []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
 	}
 	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.background = syncBackground // PRD #576 M4: run the async seed in-line, deterministically
 	if err := svc.Adopt(context.Background(), repoID, 7, forge.OwnerUser); err != nil {
 		t.Fatalf("Adopt: %v", err)
 	}
@@ -600,6 +667,7 @@ func TestAdoptIntrospectionUnsupportedProceeds(t *testing.T) {
 	}
 	st := &fakeProjectStore{repo: githubRepoRow(repoID)}
 	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.background = syncBackground // PRD #576 M4: run the async seed in-line, deterministically
 	if err := svc.Adopt(context.Background(), repoID, 7, forge.OwnerUser); err != nil {
 		t.Fatalf("introspection-unsupported adopt should proceed, got %v", err)
 	}
@@ -665,6 +733,7 @@ func TestProvisionCreatesBoardAndSeeds(t *testing.T) {
 		},
 	}
 	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.background = syncBackground // PRD #576 M4: run the async seed in-line, deterministically
 
 	if err := svc.Provision(context.Background(), repoID, forge.OwnerUser, ""); err != nil {
 		t.Fatalf("Provision: %v", err)
@@ -747,6 +816,7 @@ func TestProvisionCustomTitle(t *testing.T) {
 		columns: []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
 	}
 	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.background = syncBackground // PRD #576 M4: run the async seed in-line, deterministically
 	if err := svc.Provision(context.Background(), repoID, forge.OwnerUser, "Roadmap"); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
@@ -769,6 +839,7 @@ func TestProvisionColorsCycle(t *testing.T) {
 	syncer := provisionSyncer("PVTSSF_NEW", created)
 	st := &fakeProjectStore{repo: githubRepoRow(repoID), linkErr: pgx.ErrNoRows, columns: columns}
 	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.background = syncBackground // PRD #576 M4: run the async seed in-line, deterministically
 	if err := svc.Provision(context.Background(), repoID, forge.OwnerUser, ""); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
@@ -989,6 +1060,164 @@ func TestProjectSyncStatusNoLink(t *testing.T) {
 	_, err := svc.ProjectSyncStatus(context.Background(), uuid.New())
 	if !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("want pgx.ErrNoRows for a repo with no link, got %v", err)
+	}
+}
+
+// --- unmatched-columns advisory (PRD #576 M3) --------------------------------
+
+// TestAdoptPersistsUnmatchedColumns (SC (a)): a board whose columns do not all match
+// the field's Status options persists EXACTLY the skipped columns into the captured
+// UpsertGithubProjectLinkParams.UnmatchedColumns — the set the panel later surfaces.
+func TestAdoptPersistsUnmatchedColumns(t *testing.T) {
+	repoID := uuid.New()
+	syncer := &fakeProjectSyncer{
+		fakeForge: &fakeForge{},
+		scopes:    []string{"repo", "project"},
+		slugOwner: "acme", slugRepo: "widgets",
+		project:    forge.ProjectV2Ref{ID: "PVT_1", Number: 7},
+		repoNodeID: "REPO_1",
+		fields: map[string]forge.ProjectV2StatusField{
+			// Only "In Progress" exists as an option; the other three columns are unmatched.
+			"Status": {ID: "PVTSSF_1", Name: "Status", Options: []forge.ProjectV2Option{
+				{ID: "opt_ip", Name: "In Progress"},
+			}},
+		},
+	}
+	st := &fakeProjectStore{
+		repo: githubRepoRow(repoID),
+		columns: []store.BoardColumn{
+			{LabelName: "In Progress", Position: 1},
+			{LabelName: "Planned", Position: 2},      // unmatched
+			{LabelName: "Human Review", Position: 3}, // unmatched
+			{LabelName: "Later", Position: 4},        // unmatched
+		},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.background = syncBackground // PRD #576 M4: run the async seed in-line, deterministically
+	if err := svc.Adopt(context.Background(), repoID, 7, forge.OwnerUser); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	if len(st.links) != 1 {
+		t.Fatalf("want 1 link upsert, got %d", len(st.links))
+	}
+	got := st.links[0].UnmatchedColumns
+	want := []string{"Planned", "Human Review", "Later"}
+	if len(got) != len(want) {
+		t.Fatalf("unmatched_columns = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("unmatched_columns[%d] = %q, want %q (full: %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+// TestProjectSyncStatusReturnsUnmatchedColumns (SC (b)): the stored link's
+// unmatched_columns is mapped verbatim into the status DTO — a pure store read, no
+// forge call (D5).
+func TestProjectSyncStatusReturnsUnmatchedColumns(t *testing.T) {
+	repoID := uuid.New()
+	st := &fakeProjectStore{
+		link: store.GithubProjectLink{
+			RepoID:           repoID,
+			ProjectNumber:    42,
+			UnmatchedColumns: []string{"Planned", "bug"},
+		},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{}, fakeSyncSettings{enabled: true}, nil)
+	got, err := svc.ProjectSyncStatus(context.Background(), repoID)
+	if err != nil {
+		t.Fatalf("ProjectSyncStatus: %v", err)
+	}
+	if len(got.UnmatchedColumns) != 2 || got.UnmatchedColumns[0] != "Planned" || got.UnmatchedColumns[1] != "bug" {
+		t.Errorf("UnmatchedColumns = %v, want [Planned bug]", got.UnmatchedColumns)
+	}
+}
+
+// TestResyncReseedsAndRepersists (SC (c)): with a stored link, Resync re-seeds items
+// (seedItems ran — an item was added and set) and re-persists the link against the
+// STORED project coordinates (not any caller-supplied owner_kind/number), recomputing
+// the unmatched set from the current field. Resync takes no owner_kind — it is
+// structurally impossible to pass one — so re-seeding the stored board is the assertion.
+func TestResyncReseedsAndRepersists(t *testing.T) {
+	repoID := uuid.New()
+	syncer := &fakeProjectSyncer{
+		fakeForge: &fakeForge{},
+		scopes:    []string{"repo", "project"},
+		slugOwner: "acme", slugRepo: "widgets",
+		repoNodeID: "REPO_1",
+		fields: map[string]forge.ProjectV2StatusField{
+			"Status": {ID: "PVTSSF_NEW", Name: "Status", Options: []forge.ProjectV2Option{
+				{ID: "opt_ip", Name: "In Progress"},
+			}},
+		},
+		issueNode: map[int]string{1: "content1"},
+	}
+	st := &fakeProjectStore{
+		repo: githubRepoRow(repoID),
+		// A stored link the Resync path reuses (node id + number + ownership) — no
+		// owner_kind/project_number comes from a caller.
+		link: store.GithubProjectLink{
+			RepoID:        repoID,
+			ProjectNodeID: "PVT_STORED",
+			ProjectNumber: 9,
+			OwnedByUzi:    false,
+		},
+		columns: []store.BoardColumn{
+			{LabelName: "In Progress", Position: 1},
+			{LabelName: "Later", Position: 2}, // unmatched now
+		},
+		issues: []store.Issue{
+			{ForgeIssueIid: 1, State: "opened", Labels: labelsJSON(t, "In Progress")},
+		},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.background = syncBackground // PRD #576 M4: run the async seed in-line, deterministically
+
+	note, err := svc.Resync(context.Background(), repoID)
+	if err != nil {
+		t.Fatalf("Resync: %v", err)
+	}
+
+	// seedItems ran: issue 1 was added to the board and set to its option.
+	if len(syncer.addCalls) != 1 || syncer.addCalls[0] != "content1" {
+		t.Errorf("want issue 1 content added once (seed ran), got %v", syncer.addCalls)
+	}
+	if len(syncer.setCalls) != 1 || syncer.setCalls[0].optionID != "opt_ip" {
+		t.Errorf("want issue 1 set to opt_ip, got %v", syncer.setCalls)
+	}
+
+	// The link was re-persisted against the STORED coordinates + the re-read field.
+	if len(st.links) != 1 {
+		t.Fatalf("want 1 link upsert on resync, got %d", len(st.links))
+	}
+	link := st.links[0]
+	if link.ProjectNodeID != "PVT_STORED" || link.ProjectNumber != 9 {
+		t.Errorf("resync must reuse stored coordinates, got node=%q number=%d", link.ProjectNodeID, link.ProjectNumber)
+	}
+	if link.StatusFieldID != "PVTSSF_NEW" {
+		t.Errorf("resync must re-read the field, got %q", link.StatusFieldID)
+	}
+	if len(link.UnmatchedColumns) != 1 || link.UnmatchedColumns[0] != "Later" {
+		t.Errorf("recomputed unmatched = %v, want [Later]", link.UnmatchedColumns)
+	}
+	if note == "" {
+		t.Errorf("want a non-empty note for the unmatched Later column")
+	}
+	// Clean run clears last_error once (mirrors Adopt).
+	if st.linkErrCleared != 1 {
+		t.Errorf("clean resync should clear last_error once, got %d", st.linkErrCleared)
+	}
+}
+
+// TestResyncNoLink: a repo with no link row returns ErrProjectSyncNotLinked (→ 404),
+// distinct from a bare pgx.ErrNoRows.
+func TestResyncNoLink(t *testing.T) {
+	st := &fakeProjectStore{linkErr: pgx.ErrNoRows}
+	svc := NewProjectSync(st, fakeForgeBuilder{}, fakeSyncSettings{enabled: true}, nil)
+	_, err := svc.Resync(context.Background(), uuid.New())
+	if !errors.Is(err, ErrProjectSyncNotLinked) {
+		t.Fatalf("want ErrProjectSyncNotLinked, got %v", err)
 	}
 }
 
@@ -1519,4 +1748,98 @@ func TestBoardAccessNoLinkRow(t *testing.T) {
 			t.Fatalf("want pgx.ErrNoRows, got %v", err)
 		}
 	})
+}
+
+// --- M4: asynchronous seeding seam -------------------------------------------
+
+// adoptAsyncSyncer builds a minimal working Adopt syncer whose single Status option
+// matches the single board column, so the seed step runs cleanly. readErr, when set,
+// forces the seed's first forge call (ReadProjectV2ItemStatuses) to fail.
+func adoptAsyncSyncer(readErr error) *fakeProjectSyncer {
+	return &fakeProjectSyncer{
+		fakeForge: &fakeForge{},
+		scopes:    []string{"repo", "project"},
+		slugOwner: "acme", slugRepo: "widgets",
+		project:    forge.ProjectV2Ref{ID: "PVT_1", Number: 7},
+		repoNodeID: "REPO_1",
+		fields: map[string]forge.ProjectV2StatusField{
+			"Status": {ID: "PVTSSF_1", Name: "Status", Options: []forge.ProjectV2Option{
+				{ID: "opt_ip", Name: "In Progress"},
+			}},
+		},
+		readErr: readErr,
+	}
+}
+
+// TestAdoptAsyncLinkAndLeaseBeforeSeed (M4 SC (a)+(b)): with the synchronous background
+// injected, the persist-link and mark-seeding both happen BEFORE the seed step runs, and
+// the seeding lease is released after the seed completes. The onRead hook captures store
+// state at the seed's first forge call.
+func TestAdoptAsyncLinkAndLeaseBeforeSeed(t *testing.T) {
+	repoID := uuid.New()
+	syncer := adoptAsyncSyncer(nil)
+	st := &fakeProjectStore{
+		repo:    githubRepoRow(repoID),
+		columns: []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+	}
+	var linkAtSeed, leaseAtSeed bool
+	syncer.onRead = func() {
+		linkAtSeed = len(st.links) > 0
+		leaseAtSeed = st.seeding[repoID].Valid
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.background = syncBackground
+
+	if err := svc.Adopt(context.Background(), repoID, 7, forge.OwnerUser); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	// (a) The link was persisted AND the seeding lease was set at the moment the seed's
+	// first forge call ran — persist-link + mark-seeding precede the seed step.
+	if !linkAtSeed {
+		t.Error("(a) link must be persisted before the seed step runs")
+	}
+	if !leaseAtSeed {
+		t.Error("(a) seeding lease must be set before the seed step runs")
+	}
+	// (b) After Adopt returns (synchronous background → seed done), the lease is cleared.
+	if st.seeding[repoID].Valid {
+		t.Errorf("(b) seeding lease must be cleared after the seed completes, still Valid")
+	}
+	// A clean seed clears last_error and stamps none.
+	if len(st.linkErrs) != 0 {
+		t.Errorf("clean async seed must not stamp last_error, got %v", st.linkErrs)
+	}
+	if st.linkErrCleared != 1 {
+		t.Errorf("clean async seed must clear last_error once, got %d", st.linkErrCleared)
+	}
+}
+
+// TestAdoptAsyncSeedFailureStampsError (M4 SC (c)): Adopt still returns nil (the link
+// persisted synchronously), but a scripted seed failure stamps last_error and the
+// finalize defer still clears the seeding lease.
+func TestAdoptAsyncSeedFailureStampsError(t *testing.T) {
+	repoID := uuid.New()
+	syncer := adoptAsyncSyncer(errors.New("forge read boom"))
+	st := &fakeProjectStore{
+		repo:    githubRepoRow(repoID),
+		columns: []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.background = syncBackground
+
+	// Link persisted synchronously → Adopt succeeds even though the async seed fails.
+	if err := svc.Adopt(context.Background(), repoID, 7, forge.OwnerUser); err != nil {
+		t.Fatalf("Adopt must succeed (link persisted); seed failure is async: %v", err)
+	}
+	if len(st.linkErrs) != 1 {
+		t.Errorf("(c) an async seed failure must stamp last_error once, got %v", st.linkErrs)
+	}
+	// The finalize defer runs on failure too: the lease is released, not wedged.
+	if st.seeding[repoID].Valid {
+		t.Errorf("(c) seeding lease must be cleared even on seed failure, still Valid")
+	}
+	// A failed seed does not clear last_error.
+	if st.linkErrCleared != 0 {
+		t.Errorf("(c) a failed seed must not clear last_error, got %d", st.linkErrCleared)
+	}
 }

@@ -123,6 +123,55 @@ func TestGithubProjectSyncLiveDB(t *testing.T) {
 		t.Errorf("last_error should be NULL after clear, got %+v", got.LastError)
 	}
 
+	// --- M3 unmatched_columns round-trip (non-empty) -----------------------
+	// The inserts above carried a nil UnmatchedColumns (COALESCE'd to '{}'); pin the
+	// non-empty case round-trips verbatim on real Postgres (a text[] read-back).
+	if _, err := q.UpsertGithubProjectLink(ctx, store.UpsertGithubProjectLinkParams{
+		RepoID:           repoID,
+		ProjectNodeID:    "PVT_node_2",
+		ProjectNumber:    9,
+		StatusFieldID:    "PVTSSF_field_2",
+		StatusOptions:    []byte(`{"In Progress":"opt_wip"}`),
+		OwnedByUzi:       false,
+		UnmatchedColumns: []string{"Backlog", "Blocked"},
+	}); err != nil {
+		t.Fatalf("UpsertGithubProjectLink with unmatched: %v", err)
+	}
+	got, err = q.GetGithubProjectLinkByRepo(ctx, repoID)
+	if err != nil {
+		t.Fatalf("GetGithubProjectLinkByRepo after unmatched upsert: %v", err)
+	}
+	if len(got.UnmatchedColumns) != 2 || got.UnmatchedColumns[0] != "Backlog" || got.UnmatchedColumns[1] != "Blocked" {
+		t.Errorf("unmatched_columns round-trip = %v, want [Backlog Blocked]", got.UnmatchedColumns)
+	}
+
+	// --- M4 seeding lease mark/clear ---------------------------------------
+	// seeding_started_at is the per-repo reverse-suppression lease; it must start NULL,
+	// stamp on Mark, and null again on Clear (the nullable-timestamp lease semantics).
+	if got.SeedingStartedAt.Valid {
+		t.Errorf("seeding_started_at should be NULL before any seed, got %+v", got.SeedingStartedAt)
+	}
+	if err := q.MarkGithubProjectLinkSeeding(ctx, repoID); err != nil {
+		t.Fatalf("MarkGithubProjectLinkSeeding: %v", err)
+	}
+	got, err = q.GetGithubProjectLinkByRepo(ctx, repoID)
+	if err != nil {
+		t.Fatalf("GetGithubProjectLinkByRepo after mark seeding: %v", err)
+	}
+	if !got.SeedingStartedAt.Valid {
+		t.Error("seeding_started_at should be set after MarkGithubProjectLinkSeeding")
+	}
+	if err := q.ClearGithubProjectLinkSeeding(ctx, repoID); err != nil {
+		t.Fatalf("ClearGithubProjectLinkSeeding: %v", err)
+	}
+	got, err = q.GetGithubProjectLinkByRepo(ctx, repoID)
+	if err != nil {
+		t.Fatalf("GetGithubProjectLinkByRepo after clear seeding: %v", err)
+	}
+	if got.SeedingStartedAt.Valid {
+		t.Errorf("seeding_started_at should be NULL after ClearGithubProjectLinkSeeding, got %+v", got.SeedingStartedAt)
+	}
+
 	// --- item upsert (insert, then conflict update) ------------------------
 	item, err := q.UpsertGithubProjectItem(ctx, store.UpsertGithubProjectItemParams{
 		RepoID:             repoID,
@@ -190,6 +239,37 @@ func TestGithubProjectSyncLiveDB(t *testing.T) {
 	}
 	if one.ItemNodeID != "PVTI_item_101b" {
 		t.Errorf("SetGithubProjectItemStatusMarker must not touch item_node_id, got %q", one.ItemNodeID)
+	}
+
+	// --- reset all item markers (PRD #576 M6) ------------------------------
+	// Give 102 a non-NULL marker too, then reset the whole repo's markers to NULL in one
+	// query (the atomic marker reset AutoCreateColumns runs when it switches to a fresh
+	// field) and confirm EVERY tracked item's last_status_option_id is NULL afterward,
+	// while the item rows themselves (item_node_id) survive.
+	if err := q.SetGithubProjectItemStatusMarker(ctx, store.SetGithubProjectItemStatusMarkerParams{
+		RepoID:             repoID,
+		ForgeIssueIid:      102,
+		LastStatusOptionID: pgtype.Text{String: "opt_todo", Valid: true},
+	}); err != nil {
+		t.Fatalf("SetGithubProjectItemStatusMarker 102: %v", err)
+	}
+	if err := q.ResetGithubProjectItemMarkers(ctx, repoID); err != nil {
+		t.Fatalf("ResetGithubProjectItemMarkers: %v", err)
+	}
+	reset, err := q.ListGithubProjectItems(ctx, repoID)
+	if err != nil {
+		t.Fatalf("ListGithubProjectItems after reset: %v", err)
+	}
+	if len(reset) != 2 {
+		t.Fatalf("reset must keep both item rows, got %d", len(reset))
+	}
+	for _, it := range reset {
+		if it.LastStatusOptionID.Valid {
+			t.Errorf("item %d marker must be NULL after reset, got %+v", it.ForgeIssueIid, it.LastStatusOptionID)
+		}
+		if it.ItemNodeID == "" {
+			t.Errorf("reset must not clear item_node_id for item %d", it.ForgeIssueIid)
+		}
 	}
 
 	// --- item delete -------------------------------------------------------

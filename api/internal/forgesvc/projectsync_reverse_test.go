@@ -2,11 +2,15 @@ package forgesvc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -622,4 +626,497 @@ func TestReverseSyncAutoMoveErrorRetries(t *testing.T) {
 	if len(st.linkErrs) != 1 {
 		t.Errorf("want last_error stamped once, got %v", st.linkErrs)
 	}
+}
+
+// TestReverseSyncSuppressedWhileSeeding (PRD #576 M4 SC (d)): while the per-repo seeding
+// lease is active, ReverseSync makes ZERO AutoMove calls (a reverse tick must not race a
+// partially-seeded board). The zero-call assertion is NEGATIVE, so the second subtest is
+// its built-in mutation control: a lease older than seedSuppressLease does NOT suppress,
+// and the same fixture then drives exactly one AutoMove — proving the suppression, not a
+// vacuous no-op, is what silenced the first case.
+func TestReverseSyncSuppressedWhileSeeding(t *testing.T) {
+	// A live status that differs from the stored marker — this WOULD drive one AutoMove
+	// if the tick were not suppressed.
+	newStore := func(repoID uuid.UUID, seedingAt pgtype.Timestamptz) *fakeProjectStore {
+		link := forwardLink(t, map[string]string{"In Progress": "opt_ip"})
+		link.SeedingStartedAt = seedingAt
+		return &fakeProjectStore{
+			repo:          githubRepoRow(repoID),
+			link:          link,
+			issues:        []store.Issue{{ForgeIssueIid: 7, State: "opened", Labels: labelsJSON(t)}},
+			existingItems: []store.GithubProjectItem{projectItem(repoID, 7, "item7", "opt_old")},
+		}
+	}
+
+	t.Run("suppressed within the lease", func(t *testing.T) {
+		repoID := uuid.New()
+		syncer := reverseSyncer(forge.ProjectV2ItemStatus{ItemID: "item7", IssueNumber: 7, OptionID: "opt_ip"})
+		mover := &fakeMover{}
+		st := newStore(repoID, pgtype.Timestamptz{Time: time.Now(), Valid: true})
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		svc.SetMover(mover)
+
+		if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+			t.Fatalf("ReverseSync: %v", err)
+		}
+		if len(mover.calls) != 0 {
+			t.Errorf("seeding in progress must suppress reverse (zero AutoMove), got %v", mover.calls)
+		}
+		// The tick returned BEFORE reading live statuses or touching last_synced_at.
+		if syncer.readCalls != 0 {
+			t.Errorf("suppressed tick must not read live statuses, got %d reads", syncer.readCalls)
+		}
+		if st.touchCalls != 0 {
+			t.Errorf("suppressed tick must not touch last_synced_at, got %d", st.touchCalls)
+		}
+	})
+
+	t.Run("proceeds past the lease (mutation control)", func(t *testing.T) {
+		repoID := uuid.New()
+		syncer := reverseSyncer(forge.ProjectV2ItemStatus{ItemID: "item7", IssueNumber: 7, OptionID: "opt_ip"})
+		mover := &fakeMover{}
+		// A lease started 20m ago is past seedSuppressLease (10m): suppression must NOT fire.
+		st := newStore(repoID, pgtype.Timestamptz{Time: time.Now().Add(-20 * time.Minute), Valid: true})
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		svc.SetMover(mover)
+
+		if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+			t.Fatalf("ReverseSync: %v", err)
+		}
+		if len(mover.calls) != 1 || mover.calls[0].issueIID != 7 || mover.calls[0].target != "In Progress" {
+			t.Fatalf("an expired lease must NOT suppress; want one AutoMove issue7->\"In Progress\", got %v", mover.calls)
+		}
+	})
+}
+
+// --- reverse destructive-write cap (PRD #576 M5) ----------------------------
+
+// oneColumnLink is the standard single-column link used by the cap fixtures: board
+// column "In Progress" ↔ option "opt_ip". Its inverse (opt_ip → In Progress) is what
+// reverseDiff builds the reverse map from.
+func oneColumnLink(t *testing.T) store.GithubProjectLink {
+	return forwardLink(t, map[string]string{"In Progress": "opt_ip"})
+}
+
+// twoColumnLink adds a second valid column "Done" ↔ "opt_done" so a remap fixture has
+// a valid-but-different target to move to.
+func twoColumnLink(t *testing.T) store.GithubProjectLink {
+	return forwardLink(t, map[string]string{"In Progress": "opt_ip", "Done": "opt_done"})
+}
+
+// (a) MASS CLEAR-TO-EMPTY. Five items each transition real→empty while currently in a
+// column, so all five are DESTRUCTIVE clears; with five tracked items the count trips
+// both cap gates (5 > k=3 AND 500 > 25*5=125). The whole tick aborts: ZERO AutoMove and
+// last_error stamped. The zero-call assertion is NEGATIVE, so the second subtest is its
+// mutation control: with the cap DISABLED (reverseCapK huge) the SAME fixture fires
+// exactly five AutoMove(target="") — proving the zero is the cap, not a dead harness.
+func TestReverseSyncCapMassClearToEmpty(t *testing.T) {
+	newFixture := func(repoID uuid.UUID) (*fakeProjectSyncer, *fakeMover, *fakeProjectStore) {
+		var live []forge.ProjectV2ItemStatus
+		var issues []store.Issue
+		var items []store.GithubProjectItem
+		for i := int64(1); i <= 5; i++ {
+			live = append(live, forge.ProjectV2ItemStatus{ItemID: itemNode(i), IssueNumber: i, OptionID: ""}) // live cleared
+			issues = append(issues, store.Issue{ForgeIssueIid: i, State: "opened", Labels: labelsJSON(t, "In Progress")})
+			items = append(items, projectItem(repoID, i, itemNode(i), "opt_ip")) // marker still the old option
+		}
+		st := &fakeProjectStore{
+			repo:          githubRepoRow(repoID),
+			link:          oneColumnLink(t),
+			columns:       []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+			issues:        issues,
+			existingItems: items,
+		}
+		return reverseSyncer(live...), &fakeMover{}, st
+	}
+
+	t.Run("cap trips, tick aborted", func(t *testing.T) {
+		repoID := uuid.New()
+		syncer, mover, st := newFixture(repoID)
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		svc.SetMover(mover)
+
+		if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+			t.Fatalf("ReverseSync: %v", err)
+		}
+		if len(mover.calls) != 0 {
+			t.Errorf("mass clear must abort the tick (zero AutoMove), got %v", mover.calls)
+		}
+		if len(st.markerSets) != 0 || len(st.items) != 0 {
+			t.Errorf("aborted tick must advance no markers, got sets=%v items=%v", st.markerSets, st.items)
+		}
+		if len(st.linkErrs) == 0 {
+			t.Errorf("aborted tick must stamp last_error")
+		}
+	})
+
+	t.Run("cap disabled fires 5 clears (mutation control)", func(t *testing.T) {
+		repoID := uuid.New()
+		syncer, mover, st := newFixture(repoID)
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		svc.SetMover(mover)
+		svc.reverseCapK = 1 << 30 // disable the cap: destructiveCount can never exceed this
+
+		if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+			t.Fatalf("ReverseSync: %v", err)
+		}
+		if len(mover.calls) != 5 {
+			t.Fatalf("cap disabled must fire 5 AutoMove, got %d: %v", len(mover.calls), mover.calls)
+		}
+		for _, c := range mover.calls {
+			if c.target != "" {
+				t.Errorf("each move must clear to Open (target \"\"), got %v", c)
+			}
+		}
+	})
+}
+
+// (b) MASS REMAP-TO-WRONG-VALID-OPTION. Five items each remap from "In Progress" to the
+// valid-but-different column "Done" (currentColumn "In Progress" != target "Done"), so
+// all five are DESTRUCTIVE (a clear-counting guard would miss these — R1b). Same shape
+// as (a): ZERO AutoMove + last_error, and the cap-disabled control fires five
+// AutoMove(target="Done").
+func TestReverseSyncCapMassRemapToWrongColumn(t *testing.T) {
+	newFixture := func(repoID uuid.UUID) (*fakeProjectSyncer, *fakeMover, *fakeProjectStore) {
+		var live []forge.ProjectV2ItemStatus
+		var issues []store.Issue
+		var items []store.GithubProjectItem
+		for i := int64(1); i <= 5; i++ {
+			live = append(live, forge.ProjectV2ItemStatus{ItemID: itemNode(i), IssueNumber: i, OptionID: "opt_done"}) // live remapped to Done
+			issues = append(issues, store.Issue{ForgeIssueIid: i, State: "opened", Labels: labelsJSON(t, "In Progress")})
+			items = append(items, projectItem(repoID, i, itemNode(i), "opt_ip")) // marker still In Progress's option
+		}
+		st := &fakeProjectStore{
+			repo:          githubRepoRow(repoID),
+			link:          twoColumnLink(t),
+			columns:       []store.BoardColumn{{LabelName: "In Progress", Position: 1}, {LabelName: "Done", Position: 2}},
+			issues:        issues,
+			existingItems: items,
+		}
+		return reverseSyncer(live...), &fakeMover{}, st
+	}
+
+	t.Run("cap trips, tick aborted", func(t *testing.T) {
+		repoID := uuid.New()
+		syncer, mover, st := newFixture(repoID)
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		svc.SetMover(mover)
+
+		if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+			t.Fatalf("ReverseSync: %v", err)
+		}
+		if len(mover.calls) != 0 {
+			t.Errorf("mass remap must abort the tick (zero AutoMove), got %v", mover.calls)
+		}
+		if len(st.markerSets) != 0 || len(st.items) != 0 {
+			t.Errorf("aborted tick must advance no markers, got sets=%v items=%v", st.markerSets, st.items)
+		}
+		if len(st.linkErrs) == 0 {
+			t.Errorf("aborted tick must stamp last_error")
+		}
+	})
+
+	t.Run("cap disabled fires 5 remaps (mutation control)", func(t *testing.T) {
+		repoID := uuid.New()
+		syncer, mover, st := newFixture(repoID)
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		svc.SetMover(mover)
+		svc.reverseCapK = 1 << 30
+
+		if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+			t.Fatalf("ReverseSync: %v", err)
+		}
+		if len(mover.calls) != 5 {
+			t.Fatalf("cap disabled must fire 5 AutoMove, got %d: %v", len(mover.calls), mover.calls)
+		}
+		for _, c := range mover.calls {
+			if c.target != "Done" {
+				t.Errorf("each move must remap to Done, got %v", c)
+			}
+		}
+	})
+}
+
+// (c) SINGLE GENUINE CLEAR. One item clears while sitting in a column (destructiveCount
+// 1) — below k=3, so it PASSES the cap: exactly one AutoMove(target="") and the marker
+// advances. This is also a positive control proving the harness observes calls.
+func TestReverseSyncCapSingleClearPasses(t *testing.T) {
+	repoID := uuid.New()
+	syncer := reverseSyncer(forge.ProjectV2ItemStatus{ItemID: "item7", IssueNumber: 7, OptionID: ""})
+	mover := &fakeMover{}
+	st := &fakeProjectStore{
+		repo:          githubRepoRow(repoID),
+		link:          oneColumnLink(t),
+		columns:       []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+		issues:        []store.Issue{{ForgeIssueIid: 7, State: "opened", Labels: labelsJSON(t, "In Progress")}},
+		existingItems: []store.GithubProjectItem{projectItem(repoID, 7, "item7", "opt_ip")},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.SetMover(mover)
+
+	if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+		t.Fatalf("ReverseSync: %v", err)
+	}
+	if len(mover.calls) != 1 || mover.calls[0].target != "" {
+		t.Fatalf("a single genuine clear must pass the cap; want one AutoMove(target=\"\"), got %v", mover.calls)
+	}
+	if len(st.markerSets) != 1 || st.markerSets[0].LastStatusOptionID.Valid {
+		t.Errorf("want marker cleared to NULL, got %+v", st.markerSets)
+	}
+	if len(st.linkErrs) != 0 {
+		t.Errorf("a passing tick must not stamp last_error, got %v", st.linkErrs)
+	}
+}
+
+// (d) BELOW-THRESHOLD via the AND-gate. Four items clear-to-empty (destructiveCount 4,
+// which EXCEEDS k=3) but the board tracks 100 items, so the percentage side is NOT
+// exceeded (400 > 25*100=2500 is false). Because BOTH conditions are required, the tick
+// executes all four moves. An OR-gate (or a capK-only guard) would wrongly trip here —
+// so this proves the AND.
+func TestReverseSyncCapBelowThresholdAndGate(t *testing.T) {
+	repoID := uuid.New()
+	var live []forge.ProjectV2ItemStatus
+	var issues []store.Issue
+	var items []store.GithubProjectItem
+	// Four destructive clears.
+	for i := int64(1); i <= 4; i++ {
+		live = append(live, forge.ProjectV2ItemStatus{ItemID: itemNode(i), IssueNumber: i, OptionID: ""})
+		issues = append(issues, store.Issue{ForgeIssueIid: i, State: "opened", Labels: labelsJSON(t, "In Progress")})
+		items = append(items, projectItem(repoID, i, itemNode(i), "opt_ip"))
+	}
+	// Pad the tracked-item set to 100 with phantom rows for issues NOT in live and NOT in
+	// the issue cache (so reconcile neither prunes nor backfills them): they only inflate
+	// trackedItems, driving the percentage threshold down.
+	for i := int64(900); i < 996; i++ {
+		items = append(items, projectItem(repoID, i, itemNode(i), "opt_ip"))
+	}
+	st := &fakeProjectStore{
+		repo:          githubRepoRow(repoID),
+		link:          oneColumnLink(t),
+		columns:       []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+		issues:        issues,
+		existingItems: items,
+	}
+	if len(items) != 100 {
+		t.Fatalf("fixture wants 100 tracked items, got %d", len(items))
+	}
+	rsyncer := reverseSyncer(live...)
+	mover := &fakeMover{}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: rsyncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.SetMover(mover)
+
+	if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+		t.Fatalf("ReverseSync: %v", err)
+	}
+	if len(mover.calls) != 4 {
+		t.Fatalf("AND-gate: capK exceeded but pct not, want all 4 moves executed, got %d: %v", len(mover.calls), mover.calls)
+	}
+	if len(st.linkErrs) != 0 {
+		t.Errorf("a below-threshold tick must not stamp last_error, got %v", st.linkErrs)
+	}
+}
+
+// itemNode builds a deterministic item node id for issue iid in the cap fixtures.
+func itemNode(iid int64) string { return "item" + strconv.FormatInt(iid, 10) }
+
+// --- safe column auto-create (PRD #576 M6) ----------------------------------
+
+// autocreateSyncer builds a ProjectBoardSyncer fake for AutoCreateColumns: it resolves a
+// slug, creates a fresh field returning the given created options, and reads the given
+// live statuses back (all empty for a fresh field).
+func autocreateSyncer(fieldID string, createdOptions []forge.ProjectV2Option, live ...forge.ProjectV2ItemStatus) *fakeProjectSyncer {
+	return &fakeProjectSyncer{
+		fakeForge:   &fakeForge{},
+		scopes:      []string{"repo", "project"},
+		slugOwner:   "acme",
+		slugRepo:    "widgets",
+		createField: forge.ProjectV2StatusField{ID: fieldID, Name: "uzi Status", Options: createdOptions},
+		live:        live,
+	}
+}
+
+// adoptedLink is the stored link an AutoCreateColumns test starts from: an ADOPTED board
+// (owned_by_uzi=false) on the built-in "Status" field whose options omit some columns.
+func adoptedLink(t *testing.T, columnOption map[string]string) store.GithubProjectLink {
+	l := forwardLink(t, columnOption)
+	l.OwnedByUzi = false
+	l.ProjectNumber = 42
+	return l
+}
+
+// (M6 SC a) Fresh-field creation includes EVERY uzi column as an option, and the switch
+// points the link at the new field with an empty unmatched set. Proves auto-create turns
+// every skipped column into a synced one via CreateProjectV2Field (F-E), no destructive
+// full-list option replace.
+func TestAutoCreateColumnsCreatesFreshFieldWithEveryColumn(t *testing.T) {
+	repoID := uuid.New()
+	// The board has three columns; the adopted "Status" field only matched "In Progress",
+	// so "Planned" and "Human Review" were skipped.
+	columns := []store.BoardColumn{
+		{LabelName: "In Progress", Position: 1},
+		{LabelName: "Planned", Position: 2},
+		{LabelName: "Human Review", Position: 3},
+	}
+	createdOptions := []forge.ProjectV2Option{
+		{ID: "n_ip", Name: "In Progress"},
+		{ID: "n_pl", Name: "Planned"},
+		{ID: "n_hr", Name: "Human Review"},
+	}
+	syncer := autocreateSyncer("PVTSSF_NEW", createdOptions)
+	st := &fakeProjectStore{
+		repo:    githubRepoRow(repoID),
+		link:    adoptedLink(t, map[string]string{"In Progress": "opt_ip"}), // only one matched
+		columns: columns,
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.background = syncBackground // run the async re-seed in-line, deterministically
+
+	note, err := svc.AutoCreateColumns(context.Background(), repoID)
+	if err != nil {
+		t.Fatalf("AutoCreateColumns: %v", err)
+	}
+	if note == "" {
+		t.Errorf("want a non-empty note describing the created columns")
+	}
+
+	// The fresh field was created ON THE EXISTING project with EXACTLY every board column,
+	// in order, each with a valid color.
+	if len(syncer.createFieldCalls) != 1 {
+		t.Fatalf("want 1 CreateProjectV2Field call, got %d", len(syncer.createFieldCalls))
+	}
+	cf := syncer.createFieldCalls[0]
+	if cf.name != "uzi Status" {
+		t.Errorf("field name = %q, want \"uzi Status\"", cf.name)
+	}
+	wantNames := []string{"In Progress", "Planned", "Human Review"}
+	if len(cf.options) != len(wantNames) {
+		t.Fatalf("created options = %+v, want exactly the %d board columns", cf.options, len(wantNames))
+	}
+	for i, want := range wantNames {
+		if cf.options[i].Name != want {
+			t.Errorf("option[%d].Name = %q, want %q", i, cf.options[i].Name, want)
+		}
+		if !validGithubColors[cf.options[i].Color] {
+			t.Errorf("option %q has invalid color %q", cf.options[i].Name, cf.options[i].Color)
+		}
+	}
+
+	// The link was switched to the new field id, its option map built from the CREATED
+	// option ids, unmatched now empty, and owned_by_uzi PRESERVED (adopted → still false).
+	if len(st.links) != 1 {
+		t.Fatalf("want 1 link upsert, got %d", len(st.links))
+	}
+	link := st.links[0]
+	if link.StatusFieldID != "PVTSSF_NEW" {
+		t.Errorf("status_field_id = %q, want the freshly created field PVTSSF_NEW", link.StatusFieldID)
+	}
+	if len(link.UnmatchedColumns) != 0 {
+		t.Errorf("unmatched_columns must be empty after auto-create, got %v", link.UnmatchedColumns)
+	}
+	if link.OwnedByUzi {
+		t.Errorf("owned_by_uzi must be PRESERVED false for an adopted board (uzi owns the field, not the project)")
+	}
+	var gotMap map[string]string
+	if err := json.Unmarshal(link.StatusOptions, &gotMap); err != nil {
+		t.Fatalf("status_options not valid json: %v", err)
+	}
+	if gotMap["In Progress"] != "n_ip" || gotMap["Planned"] != "n_pl" || gotMap["Human Review"] != "n_hr" {
+		t.Errorf("column->option map = %v, want the created option ids", gotMap)
+	}
+	// The reset ran (F-H marker reset) exactly once.
+	if st.resetMarkerCalls != 1 {
+		t.Errorf("want ResetGithubProjectItemMarkers called once, got %d", st.resetMarkerCalls)
+	}
+}
+
+// (M6 SC b) After the switch, a reverse tick fires ZERO AutoMove — and the marker RESET,
+// NOT the M5 cap, is what prevents it. This is the subtle isolation the PRD demands:
+//
+// M5's per-tick destructive-write cap would ALSO abort a mass cascade, so to prove the
+// RESET independently prevents it, the M5 cap is DISABLED in BOTH arms (reverseCapK huge,
+// reverseCapPct 100). Then:
+//   - reset PRESENT  → the reverse tick reads live("") == marker(NULL) for every item →
+//     zero AutoMove (the reset is load-bearing).
+//   - reset OMITTED  → markers keep the old field's ids → live("") != marker(old id) for
+//     every item → mass AutoMove(target="") (the F-F cascade fires).
+//
+// If the cap were left ENABLED, the "omit reset" arm would ALSO show zero (the cap aborts
+// it) and the test would prove nothing — the cap-disabled pair is what makes the reset's
+// role non-vacuous. A simulated mis-echo here can only exercise the reverse-READ guard
+// (M5's input), not a real field-update round trip, because the write path is fresh-create
+// only (D3).
+func TestAutoCreateColumnsResetPreventsReverseCascade(t *testing.T) {
+	const n = 5
+
+	// newFixture builds a store whose 5 items sit in "In Progress" with the OLD field's
+	// option id as their marker, whose live statuses are all "" (the fresh field reads
+	// empty), and the syncer/mover to drive it. skipReset toggles the marker reset off.
+	newFixture := func(repoID uuid.UUID, skipReset bool) (*fakeProjectSyncer, *fakeMover, *fakeProjectStore) {
+		var live []forge.ProjectV2ItemStatus
+		var issues []store.Issue
+		var items []store.GithubProjectItem
+		for i := int64(1); i <= n; i++ {
+			live = append(live, forge.ProjectV2ItemStatus{ItemID: itemNode(i), IssueNumber: i, OptionID: ""})
+			issues = append(issues, store.Issue{ForgeIssueIid: i, State: "opened", Labels: labelsJSON(t, "In Progress")})
+			items = append(items, projectItem(repoID, i, itemNode(i), "opt_ip")) // OLD field's option id
+		}
+		syncer := autocreateSyncer("PVTSSF_NEW", []forge.ProjectV2Option{{ID: "n_ip", Name: "In Progress"}}, live...)
+		st := &fakeProjectStore{
+			repo:            githubRepoRow(repoID),
+			link:            adoptedLink(t, map[string]string{"In Progress": "opt_ip"}),
+			columns:         []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+			issues:          issues,
+			existingItems:   items,
+			skipMarkerReset: skipReset,
+		}
+		return syncer, &fakeMover{}, st
+	}
+
+	t.Run("reset present: cap DISABLED, still zero AutoMove", func(t *testing.T) {
+		repoID := uuid.New()
+		syncer, mover, st := newFixture(repoID, false)
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		svc.background = syncBackground
+		svc.SetMover(mover)
+		// Disable the M5 cap in BOTH arms so the reset alone is the discriminator.
+		svc.reverseCapK = 1 << 30
+		svc.reverseCapPct = 100
+
+		if _, err := svc.AutoCreateColumns(context.Background(), repoID); err != nil {
+			t.Fatalf("AutoCreateColumns: %v", err)
+		}
+		mover.calls = nil // ignore anything the re-seed did; assert only the reverse tick
+		if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+			t.Fatalf("ReverseSync: %v", err)
+		}
+		if len(mover.calls) != 0 {
+			t.Fatalf("reset present must yield ZERO AutoMove even with the cap disabled, got %v", mover.calls)
+		}
+	})
+
+	t.Run("reset OMITTED: cap DISABLED, mass AutoMove(target=\"\") — the cascade", func(t *testing.T) {
+		repoID := uuid.New()
+		syncer, mover, st := newFixture(repoID, true) // reset is a no-op → markers keep old ids
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		svc.background = syncBackground
+		svc.SetMover(mover)
+		svc.reverseCapK = 1 << 30
+		svc.reverseCapPct = 100
+
+		if _, err := svc.AutoCreateColumns(context.Background(), repoID); err != nil {
+			t.Fatalf("AutoCreateColumns: %v", err)
+		}
+		mover.calls = nil
+		if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+			t.Fatalf("ReverseSync: %v", err)
+		}
+		if len(mover.calls) != n {
+			t.Fatalf("reset omitted must fire the mass cascade of %d AutoMove, got %d: %v", n, len(mover.calls), mover.calls)
+		}
+		for _, c := range mover.calls {
+			if c.target != "" {
+				t.Errorf("cascade move must clear to Open (target \"\"), got %v", c)
+			}
+		}
+	})
 }

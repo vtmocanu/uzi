@@ -181,6 +181,8 @@ uzi memory list
 uzi memory rm <memory-id>
 uzi repo list
 uzi repo remove <id> [--force]
+uzi project-sync status <repo>
+uzi project-sync resync <repo>
 uzi handoff [--message <text>] [--file <path>] [--base <ref>] [--mr] [--review] [--then-fix] [--interactive] [--repo <repo-id>]
 uzi handoff rm <run-id>
 uzi handoff review <run-id>

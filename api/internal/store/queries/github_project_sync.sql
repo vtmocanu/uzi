@@ -8,24 +8,35 @@
 -- the conflict target is repo_id; every mutable column is overwritten and updated_at
 -- bumped. Does NOT touch last_synced_at/last_error — those are written by the
 -- error/clear queries below on each sync attempt, not by a (re)link.
+-- unmatched_columns (PRD #576 M3) is COALESCE'd from nil→'{}' so a nil Go []string
+-- never becomes SQL NULL and violates the NOT NULL constraint; the same guard is
+-- applied on both the INSERT and the conflict update.
 INSERT INTO github_project_links (
-    repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi
+    repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi,
+    unmatched_columns
 ) VALUES (
     sqlc.arg('repo_id'), sqlc.arg('project_node_id'), sqlc.arg('project_number'),
-    sqlc.arg('status_field_id'), sqlc.arg('status_options'), sqlc.arg('owned_by_uzi')
+    sqlc.arg('status_field_id'), sqlc.arg('status_options'), sqlc.arg('owned_by_uzi'),
+    COALESCE(sqlc.arg('unmatched_columns')::text[], '{}')
 )
 ON CONFLICT (repo_id) DO UPDATE SET
-    project_node_id = EXCLUDED.project_node_id,
-    project_number  = EXCLUDED.project_number,
-    status_field_id = EXCLUDED.status_field_id,
-    status_options  = EXCLUDED.status_options,
-    owned_by_uzi    = EXCLUDED.owned_by_uzi,
-    updated_at      = now()
+    project_node_id   = EXCLUDED.project_node_id,
+    project_number    = EXCLUDED.project_number,
+    status_field_id   = EXCLUDED.status_field_id,
+    status_options    = EXCLUDED.status_options,
+    owned_by_uzi      = EXCLUDED.owned_by_uzi,
+    unmatched_columns = COALESCE(sqlc.arg('unmatched_columns')::text[], '{}'),
+    updated_at        = now()
 RETURNING *;
 
 -- name: GetGithubProjectLinkByRepo :one
 -- The link row for a repo, or no row when the repo is not synced.
 SELECT * FROM github_project_links WHERE repo_id = sqlc.arg('repo_id');
+
+-- name: ListGithubProjectLinksByRepoIDs :many
+-- Batch-load link rows for a set of repo ids, for the caller-scoped repos-list
+-- sync-health enrichment (PRD #576 M2). Repos with no link are simply absent.
+SELECT * FROM github_project_links WHERE repo_id = ANY(sqlc.arg('repo_ids')::uuid[]);
 
 -- name: DeleteGithubProjectLink :exec
 -- Teardown: drop a repo's link. The item rows cascade with the repo, not with the
@@ -55,6 +66,23 @@ UPDATE github_project_links
 SET last_synced_at = now(), updated_at = now()
 WHERE repo_id = sqlc.arg('repo_id');
 
+-- name: MarkGithubProjectLinkSeeding :exec
+-- Take the per-repo seeding lease (PRD #576 M4): stamp seeding_started_at = now() so a
+-- reverse tick that fires while async seeding is in flight suppresses itself (it checks
+-- the lease age against seedSuppressLease). Set synchronously by launchSeed BEFORE the
+-- write handler returns, so a reverse poll landing right after Adopt is already covered.
+UPDATE github_project_links
+SET seeding_started_at = now(), updated_at = now()
+WHERE repo_id = sqlc.arg('repo_id');
+
+-- name: ClearGithubProjectLinkSeeding :exec
+-- Release the seeding lease (PRD #576 M4): null seeding_started_at when the background
+-- seed finishes (success, error, OR timeout — the finalize defer always runs). NULL =
+-- "not seeding", which re-enables the reverse poller for the repo.
+UPDATE github_project_links
+SET seeding_started_at = NULL, updated_at = now()
+WHERE repo_id = sqlc.arg('repo_id');
+
 -- name: UpsertGithubProjectItem :one
 -- Create or refresh the projection state for one issue. Keyed on the composite PK
 -- (repo_id, forge_issue_iid); item_node_id, last_status_option_id and last_synced_at
@@ -82,6 +110,15 @@ WHERE repo_id = sqlc.arg('repo_id') AND forge_issue_iid = sqlc.arg('forge_issue_
 SELECT * FROM github_project_items
 WHERE repo_id = sqlc.arg('repo_id')
 ORDER BY forge_issue_iid ASC;
+
+-- name: ResetGithubProjectItemMarkers :exec
+-- Clear every tracked item's status marker for a repo (PRD #576 M6). Used when the
+-- link's status_field_id is switched to a freshly-created field: the new field reads
+-- EMPTY for every item, so the stored markers (old field's option ids) must be reset
+-- to NULL atomically with the switch — else the next reverse tick sees live("") !=
+-- marker(old id) for every issue and fires the mass-clear cascade (F-H/R1).
+UPDATE github_project_items SET last_status_option_id = NULL, last_synced_at = now()
+WHERE repo_id = sqlc.arg('repo_id');
 
 -- name: SetGithubProjectItemStatusMarker :exec
 -- After a successful Status write, advance just the diff marker (and stamp the

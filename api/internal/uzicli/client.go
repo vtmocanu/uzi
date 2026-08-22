@@ -358,6 +358,36 @@ type Client interface {
 	// A foreign/unknown run or rec is a 404 (exit 4); an already-filed or mid-filing
 	// recommendation is a 409 (exit 5) — both come straight from statusError.
 	FileReviewIssue(ctx context.Context, runID, recID, repoID, title, description string) (ReviewIssueFileResult, error)
+
+	// GetProjectSyncStatus reads a repo's GitHub Projects v2 sync health (PRD #576
+	// M7): GET /api/repos/{id}/github-project-sync. RequireUser since M7 moved the
+	// route out of the cookie-only group, so a uzc_ Bearer reaches it (issue #428
+	// class). Owner-or-admin server-side (GetRepoForUser preflight) — a
+	// foreign/unknown repo is a 404 → *ExitError{ExitNotFound}, which the command
+	// softens to "not linked" (a repo with NO link row is the SAME 404, "not sync
+	// enabled"): both are the not-linked case for a read the CLI treats as normal
+	// output, never an error.
+	GetProjectSyncStatus(ctx context.Context, repoID string) (ProjectSyncStatus, error)
+	// ResyncProjectSync re-seeds an already-linked board, picking up newly-added
+	// Status options (PRD #576 M7): POST /api/repos/{id}/github-project-sync/resync.
+	// RequireUser (moved with the status read) so the CLI Bearer is accepted. A
+	// foreign/unknown repo, or one with no link row, is a 404 (exit 4) straight from
+	// statusError.
+	ResyncProjectSync(ctx context.Context, repoID string) error
+}
+
+// ProjectSyncStatus mirrors the handler's getGithubProjectSyncStatusResponse JSON
+// (PRD #576 M7): a repo's project link health snapshot. LastSyncedAt/LastError are
+// pointers so a never-synced or healthy link decodes them as nil rather than a zero
+// value; UnmatchedColumns is always a JSON array (never null) server-side, so `uzi
+// project-sync status` can range it unconditionally.
+type ProjectSyncStatus struct {
+	ProjectNumber    int64      `json:"project_number"`
+	OwnedByUzi       bool       `json:"owned_by_uzi"`
+	LastSyncedAt     *time.Time `json:"last_synced_at"`
+	LastError        *string    `json:"last_error"`
+	ItemCount        int        `json:"item_count"`
+	UnmatchedColumns []string   `json:"unmatched_columns"`
 }
 
 // ErrNoDisposition is returned by DeleteDisposition when the recommendation had
@@ -1416,4 +1446,16 @@ func (c *HTTPClient) FileReviewIssue(ctx context.Context, runID, recID, repoID, 
 		return ReviewIssueFileResult{}, err
 	}
 	return out, nil
+}
+
+func (c *HTTPClient) GetProjectSyncStatus(ctx context.Context, repoID string) (ProjectSyncStatus, error) {
+	var out ProjectSyncStatus
+	if err := c.get(ctx, "/api/repos/"+url.PathEscape(repoID)+"/github-project-sync", &out); err != nil {
+		return ProjectSyncStatus{}, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) ResyncProjectSync(ctx context.Context, repoID string) error {
+	return c.postJSON(ctx, "/api/repos/"+url.PathEscape(repoID)+"/github-project-sync/resync", nil, nil)
 }

@@ -26,8 +26,11 @@ vi.mock("../lib/api", async (importOriginal) => {
       setRepoGuardrailOverride: vi.fn(),
       clearRepoGuardrailOverride: vi.fn(),
       getProjectSyncStatus: vi.fn(),
+      getProjectSyncOwnerType: vi.fn(),
       provisionProjectSync: vi.fn(),
       adoptProjectSync: vi.fn(),
+      resyncProjectSync: vi.fn(),
+      autocreateProjectSyncColumns: vi.fn(),
       disableProjectSync: vi.fn(),
       getProjectSyncVisibility: vi.fn(),
       setProjectSyncVisibility: vi.fn(),
@@ -711,6 +714,276 @@ describe("Repos — GitHub Projects sync (PRD #534 M3)", () => {
     expect(
       await within(panel).findByText(/turned off for this instance — ask an admin to enable it/i),
     ).toBeTruthy();
+  });
+});
+
+describe("Repos — skipped columns + Resync (PRD #576 M3)", () => {
+  const GH_CONN: ForgeConnection = {
+    ...CONN,
+    id: "conn-gh",
+    forge_type: "github",
+    base_url: "https://github.com",
+  };
+  const GH_REPO: Repo = repo({
+    id: "repo-gh",
+    path_with_namespace: "vtmocanu/gh",
+    connection_id: "conn-gh",
+  });
+
+  const linkedWithUnmatched = {
+    project_number: 42,
+    owned_by_uzi: false,
+    last_synced_at: "2026-08-20T10:00:00Z",
+    last_error: null,
+    item_count: 7,
+    unmatched_columns: ["Planned", "bug"],
+  };
+
+  async function openSyncPanel(name: string): Promise<HTMLElement> {
+    renderPage();
+    await screen.findByText(name);
+    fireEvent.click(within(rowFor(name)).getByRole("button", { name: /Project sync settings for/ }));
+    return screen.getByRole("group", { name: new RegExp(`Project sync for ${name}`) });
+  }
+
+  beforeEach(() => {
+    mockApi.listConnections.mockResolvedValue({ connections: [GH_CONN] });
+    mockApi.listProjects.mockResolvedValue({ repos: [{ ...GH_REPO }] });
+    mockApi.getProjectSyncVisibility.mockResolvedValue({ public: false });
+  });
+
+  it("lists the skipped columns and renders a Resync button", async () => {
+    mockApi.getProjectSyncStatus.mockResolvedValue({ ...linkedWithUnmatched });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Linked");
+
+    // Both skipped column names appear in the advisory copy.
+    expect(within(panel).getByText(/Planned, bug/)).toBeTruthy();
+    expect(
+      within(panel).getByText(/no matching Status option and won.?t\s+sync/i),
+    ).toBeTruthy();
+    expect(within(panel).getByRole("button", { name: /Resync/ })).toBeTruthy();
+  });
+
+  it("clicking Resync calls resyncProjectSync with the repo id and reloads status", async () => {
+    mockApi.getProjectSyncStatus.mockResolvedValue({ ...linkedWithUnmatched });
+    mockApi.resyncProjectSync.mockResolvedValue({ status: "resynced" });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Linked");
+
+    mockApi.getProjectSyncStatus.mockClear();
+    fireEvent.click(within(panel).getByRole("button", { name: /Resync/ }));
+
+    await waitFor(() => expect(mockApi.resyncProjectSync).toHaveBeenCalledWith("repo-gh"));
+    // Status is reloaded after the resync so the readout reflects the result.
+    await waitFor(() => expect(mockApi.getProjectSyncStatus).toHaveBeenCalledWith("repo-gh"));
+  });
+
+  it("renders the auto-create button with the two-status-field tradeoff copy (PRD #576 M6)", async () => {
+    mockApi.getProjectSyncStatus.mockResolvedValue({ ...linkedWithUnmatched });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Linked");
+
+    // The tradeoff is documented near the button.
+    expect(within(panel).getByText(/two status-like fields/i)).toBeTruthy();
+    expect(
+      within(panel).getByRole("button", { name: /Auto-create the missing columns/ }),
+    ).toBeTruthy();
+  });
+
+  it("clicking Auto-create calls autocreateProjectSyncColumns and reloads status (PRD #576 M6)", async () => {
+    mockApi.getProjectSyncStatus.mockResolvedValue({ ...linkedWithUnmatched });
+    mockApi.autocreateProjectSyncColumns.mockResolvedValue({ status: "columns_created" });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Linked");
+
+    mockApi.getProjectSyncStatus.mockClear();
+    fireEvent.click(
+      within(panel).getByRole("button", { name: /Auto-create the missing columns/ }),
+    );
+
+    await waitFor(() =>
+      expect(mockApi.autocreateProjectSyncColumns).toHaveBeenCalledWith("repo-gh"),
+    );
+    // Status is reloaded so the (now empty) skipped-columns list reflects the result.
+    await waitFor(() => expect(mockApi.getProjectSyncStatus).toHaveBeenCalledWith("repo-gh"));
+  });
+});
+
+describe("Repos — Adopt-first sync (PRD #576 M1)", () => {
+  const GH_CONN: ForgeConnection = {
+    ...CONN,
+    id: "conn-gh",
+    forge_type: "github",
+    base_url: "https://github.com",
+  };
+  const GH_REPO: Repo = repo({
+    id: "repo-gh",
+    path_with_namespace: "vtmocanu/gh",
+    connection_id: "conn-gh",
+  });
+
+  async function openSyncPanel(name: string): Promise<HTMLElement> {
+    renderPage();
+    await screen.findByText(name);
+    fireEvent.click(within(rowFor(name)).getByRole("button", { name: /Project sync settings for/ }));
+    return screen.getByRole("group", { name: new RegExp(`Project sync for ${name}`) });
+  }
+
+  beforeEach(() => {
+    mockApi.listConnections.mockResolvedValue({ connections: [GH_CONN] });
+    mockApi.listProjects.mockResolvedValue({ repos: [{ ...GH_REPO }] });
+    // Not linked (404) so the panel opens on the provision/adopt state.
+    mockApi.getProjectSyncStatus.mockRejectedValue(new ApiError(404, "project sync not enabled for this repo"));
+    mockApi.getProjectSyncVisibility.mockResolvedValue({ public: false });
+  });
+
+  it("fetches owner type on open and renders the Adopt-first explainer, Adopt before Provision", async () => {
+    mockApi.getProjectSyncOwnerType.mockResolvedValue({ owner_type: "Organization" });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Not linked");
+    await waitFor(() => expect(mockApi.getProjectSyncOwnerType).toHaveBeenCalledWith("repo-gh"));
+
+    // The terse one-line explainer renders.
+    expect(
+      within(panel).getByText(/Adopt a Project you already created \(recommended\)/i),
+    ).toBeTruthy();
+
+    // Adopt is presented first (foreground): its heading precedes Provision's in DOM order.
+    const adoptHeading = within(panel).getByText("Adopt an existing project");
+    const provisionHeading = within(panel).getByText("Create a new project");
+    expect(
+      adoptHeading.compareDocumentPosition(provisionHeading) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("for a user-owned repo, Provision is disabled with its reason rendered", async () => {
+    mockApi.getProjectSyncOwnerType.mockResolvedValue({ owner_type: "User" });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Not linked");
+    await waitFor(() => expect(mockApi.getProjectSyncOwnerType).toHaveBeenCalledWith("repo-gh"));
+
+    // Provision is disabled...
+    await waitFor(() =>
+      expect(
+        (within(panel).getByRole("button", { name: /Provision/ }) as HTMLButtonElement).disabled,
+      ).toBe(true),
+    );
+    // ...and its reason text is in the DOM.
+    expect(
+      within(panel).getByText(/can.?t own a Project under a personal account/i),
+    ).toBeTruthy();
+    // Adopt stays available.
+    expect(
+      (within(panel).getByRole("button", { name: /Adopt/ }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+  });
+
+  it("for an org-owned repo, Provision is enabled", async () => {
+    mockApi.getProjectSyncOwnerType.mockResolvedValue({ owner_type: "Organization" });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Not linked");
+    await waitFor(() => expect(mockApi.getProjectSyncOwnerType).toHaveBeenCalledWith("repo-gh"));
+
+    expect(
+      (within(panel).getByRole("button", { name: /Provision/ }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+    expect(within(panel).queryByText(/personal account/i)).toBeNull();
+  });
+
+  it("on owner-type fetch rejection, both forms are enabled (fallback)", async () => {
+    mockApi.getProjectSyncOwnerType.mockRejectedValue(new ApiError(500, "boom"));
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Not linked");
+    await waitFor(() => expect(mockApi.getProjectSyncOwnerType).toHaveBeenCalledWith("repo-gh"));
+
+    expect(
+      (within(panel).getByRole("button", { name: /Provision/ }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+    expect(
+      (within(panel).getByRole("button", { name: /Adopt/ }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+    expect(within(panel).queryByText(/personal account/i)).toBeNull();
+  });
+});
+
+describe("Repos — sync-health badge (PRD #576 M2)", () => {
+  const GH_CONN: ForgeConnection = {
+    ...CONN,
+    id: "conn-gh",
+    forge_type: "github",
+    base_url: "https://github.com",
+  };
+
+  function ghRepo(over: Partial<Repo>): Repo {
+    return repo({
+      id: "repo-gh",
+      path_with_namespace: "vtmocanu/gh",
+      connection_id: "conn-gh",
+      ...over,
+    });
+  }
+
+  beforeEach(() => {
+    mockApi.listConnections.mockResolvedValue({ connections: [GH_CONN] });
+    mockApi.getProjectSyncStatus.mockRejectedValue(new ApiError(404, "project sync not enabled for this repo"));
+    mockApi.getProjectSyncVisibility.mockResolvedValue({ public: false });
+  });
+
+  // The Badge renders a single <span> whose className carries the tone hue class
+  // (text-ok / text-danger / text-neutral-fg). Assert on that rendered output, not
+  // component internals — the same technique the Setup-chip test uses.
+  function syncBadge(name: string): HTMLElement {
+    return within(rowFor(name)).getByText("Sync");
+  }
+
+  it("linked && healthy → ok (green) tone", async () => {
+    mockApi.listProjects.mockResolvedValue({
+      repos: [ghRepo({ github_project_sync: { linked: true, healthy: true, last_synced_at: "2026-08-20T10:00:00Z" } })],
+    });
+    renderPage();
+    await screen.findByText("vtmocanu/gh");
+    const badge = syncBadge("vtmocanu/gh");
+    expect(badge.className).toContain("text-ok");
+    // Paired negatives so the tone assertion is not vacuous.
+    expect(badge.className).not.toContain("text-danger");
+    expect(badge.className).not.toContain("text-neutral-fg");
+  });
+
+  it("linked && !healthy (last_error set) → danger tone, with the error surfaced", async () => {
+    mockApi.listProjects.mockResolvedValue({
+      repos: [
+        ghRepo({
+          github_project_sync: { linked: true, healthy: false, last_error: "provision failed: owner mismatch" },
+        }),
+      ],
+    });
+    renderPage();
+    await screen.findByText("vtmocanu/gh");
+    const badge = syncBadge("vtmocanu/gh");
+    expect(badge.className).toContain("text-danger");
+    expect(badge.className).not.toContain("text-ok");
+    // The error text is surfaced for the user (title/aria), not swallowed.
+    expect(badge.getAttribute("title")).toContain("provision failed: owner mismatch");
+    expect(badge.getAttribute("aria-label")).toContain("provision failed: owner mismatch");
+  });
+
+  it("not linked (field absent) → neutral tone (current look)", async () => {
+    mockApi.listProjects.mockResolvedValue({ repos: [ghRepo({})] });
+    renderPage();
+    await screen.findByText("vtmocanu/gh");
+    const badge = syncBadge("vtmocanu/gh");
+    expect(badge.className).toContain("text-neutral-fg");
+    expect(badge.className).not.toContain("text-ok");
+    expect(badge.className).not.toContain("text-danger");
+  });
+
+  it("linked but explicitly null field → neutral tone", async () => {
+    mockApi.listProjects.mockResolvedValue({ repos: [ghRepo({ github_project_sync: null })] });
+    renderPage();
+    await screen.findByText("vtmocanu/gh");
+    const badge = syncBadge("vtmocanu/gh");
+    expect(badge.className).toContain("text-neutral-fg");
   });
 });
 

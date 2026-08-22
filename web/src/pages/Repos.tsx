@@ -78,6 +78,11 @@ export function Repos() {
   const [provisionTitle, setProvisionTitle] = useState("");
   const [adoptOwnerKind, setAdoptOwnerKind] = useState<ProjectSyncOwnerKind>("user");
   const [adoptProjectNumber, setAdoptProjectNumber] = useState("");
+  // Owner type of the repo, for the Adopt-first Provision feasibility nudge (PRD
+  // #576 M1): fetched (resiliently) when the panel opens for a NOT-linked repo.
+  // "User" → Provision is infeasible (disabled with a reason); "Organization" →
+  // Provision is available; null → unresolved/error → fall back to both enabled.
+  const [syncOwnerType, setSyncOwnerType] = useState<"User" | "Organization" | null>(null);
   // Board access (PRD #557), inside the linked readout. Visibility is fetched
   // lazily when the panel opens, in its OWN call (D4): null = not-yet-loaded or
   // unavailable (toggle disabled), true/false = the board's public flag.
@@ -150,6 +155,7 @@ export function Repos() {
     setSharedThisSession([]);
     setShareError("");
     setShareConfirmation("");
+    setSyncOwnerType(null);
     setSyncLoading(true);
     try {
       const status = await api.getProjectSyncStatus(repoId);
@@ -172,6 +178,15 @@ export function Repos() {
       if (err instanceof ApiError && err.status === 404) {
         setSyncStatus(null);
         setSyncLinked(false);
+        // Not linked: resolve the owner type for the Provision feasibility nudge
+        // (PRD #576 M1). Resilient — any failure leaves it null, which falls back
+        // to showing BOTH paths fully enabled (current behavior).
+        try {
+          const ot = await api.getProjectSyncOwnerType(repoId);
+          setSyncOwnerType(ot?.owner_type ?? null);
+        } catch {
+          setSyncOwnerType(null);
+        }
       } else {
         setSyncStatus(null);
         setSyncLinked(false);
@@ -244,6 +259,39 @@ export function Repos() {
     setSyncBusy(true);
     try {
       await api.adoptProjectSync(repoId, { project_number: num, owner_kind: adoptOwnerKind });
+      await loadSyncStatus(repoId);
+    } catch (err) {
+      setSyncError(syncErrorMessage(err));
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
+  // Re-seed an already-linked board (PRD #576 M3): re-reads the Status field so
+  // newly-added options resolve, then reloads status so the skipped-columns list and
+  // health reflect the result. Reuses the syncBusy pattern from adopt/provision.
+  const resyncSync = async (repoId: string) => {
+    setSyncError("");
+    setSyncBusy(true);
+    try {
+      await api.resyncProjectSync(repoId);
+      await loadSyncStatus(repoId);
+    } catch (err) {
+      setSyncError(syncErrorMessage(err));
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
+  // Safe column auto-create (PRD #576 M6): create a fresh uzi-owned "uzi Status" field
+  // carrying every board column and switch the link to it, so the skipped columns start
+  // syncing without a manual GitHub edit. Reuses the syncBusy pattern; reloads status so
+  // the (now empty) skipped-columns list and health reflect the result.
+  const autocreateSyncColumns = async (repoId: string) => {
+    setSyncError("");
+    setSyncBusy(true);
+    try {
+      await api.autocreateProjectSyncColumns(repoId);
       await loadSyncStatus(repoId);
     } catch (err) {
       setSyncError(syncErrorMessage(err));
@@ -886,9 +934,37 @@ export function Repos() {
                             <span className="text-xs text-faint">—</span>
                           ) : (
                             <div className="flex flex-wrap items-center gap-2">
-                              <Badge tone="neutral" dot>
-                                Sync
-                              </Badge>
+                              {/* Health-aware sync badge (PRD #576 M2): green when the
+                                  repo is linked and the last sync recorded no error,
+                                  danger when a last_error is set (with the error in the
+                                  title/aria), neutral when the repo is not linked. */}
+                              {(() => {
+                                const sync = r.github_project_sync;
+                                if (sync && sync.linked && !sync.healthy) {
+                                  return (
+                                    <Badge
+                                      tone="danger"
+                                      dot
+                                      title={sync.last_error ?? "Sync error"}
+                                      aria-label={`Sync error: ${sync.last_error ?? "unknown"}`}
+                                    >
+                                      Sync
+                                    </Badge>
+                                  );
+                                }
+                                if (sync && sync.linked) {
+                                  return (
+                                    <Badge tone="ok" dot title="Sync healthy">
+                                      Sync
+                                    </Badge>
+                                  );
+                                }
+                                return (
+                                  <Badge tone="neutral" dot>
+                                    Sync
+                                  </Badge>
+                                );
+                              })()}
                               <Button
                                 variant="secondary"
                                 size="sm"
@@ -1300,6 +1376,45 @@ export function Repos() {
                       </div>
                     </dl>
 
+                    {/* Skipped columns advisory (PRD #576 M3): board columns with no
+                        matching Status option never sync. Surface them with a Resync
+                        loop — add the options in GitHub, then Resync to pick them up. */}
+                    {syncStatus.unmatched_columns &&
+                      syncStatus.unmatched_columns.length > 0 && (
+                        <div
+                          role="alert"
+                          className="space-y-2 rounded-md border border-warn/40 bg-warn/10 p-3 text-sm"
+                        >
+                          <p className="text-fg">
+                            These board columns have no matching Status option and won&rsquo;t
+                            sync: {syncStatus.unmatched_columns.join(", ")}. Add them as Status
+                            options in GitHub, then Resync.
+                          </p>
+                          {/* Safe auto-create (PRD #576 M6): create uzi's own field with all
+                              columns rather than editing the user's field (no data-loss risk).
+                              Document the two-status-field tradeoff. */}
+                          <p className="text-muted">
+                            Or let uzi create its own &ldquo;uzi Status&rdquo; field with all your
+                            columns; your board will then show two status-like fields.
+                          </p>
+                          <Button
+                            size="sm"
+                            disabled={syncBusy}
+                            onClick={() => autocreateSyncColumns(syncRepo.id)}
+                          >
+                            {syncBusy ? "Working…" : "Auto-create the missing columns"}
+                          </Button>
+                        </div>
+                      )}
+
+                    <Button
+                      size="sm"
+                      disabled={syncBusy}
+                      onClick={() => resyncSync(syncRepo.id)}
+                    >
+                      {syncBusy ? "Working…" : "Resync"}
+                    </Button>
+
                     {/* Board access (PRD #557): visibility toggle + write-only
                         sharing. GitHub-gated already (linked implies GitHub). */}
                     <div className="space-y-3 rounded-md border border-edge bg-raised p-3">
@@ -1412,73 +1527,92 @@ export function Repos() {
                     </Button>
                   </div>
                 ) : (
-                  // Not linked: two ways to link — provision a new project, or adopt one.
-                  <div className="grid gap-3 sm:grid-cols-2">
-                    <div className="space-y-2 rounded-md border border-edge bg-raised p-3">
-                      <h4 className="text-sm font-semibold text-fg">Create a new project</h4>
-                      <p className="text-sm text-muted">
-                        uzi provisions a fresh Project v2 for this repo and owns it.
-                      </p>
-                      <label className="block space-y-1">
-                        <span className="text-xs text-muted">Owner</span>
-                        <Select
-                          aria-label="Provision owner"
-                          value={provisionOwnerKind}
-                          disabled={syncBusy}
-                          onChange={(e) => setProvisionOwnerKind(e.target.value as ProjectSyncOwnerKind)}
-                        >
-                          <option value="user">User</option>
-                          <option value="org">Org</option>
-                          <option value="viewer">Viewer</option>
-                        </Select>
-                      </label>
-                      <label className="block space-y-1">
-                        <span className="text-xs text-muted">Title (optional)</span>
-                        <Input
-                          aria-label="Project title"
-                          value={provisionTitle}
-                          disabled={syncBusy}
-                          placeholder="uzi board"
-                          onChange={(e) => setProvisionTitle(e.target.value)}
-                        />
-                      </label>
-                      <Button size="sm" disabled={syncBusy} onClick={() => provisionSync(syncRepo.id)}>
-                        {syncBusy ? "Working…" : "Provision"}
-                      </Button>
-                    </div>
+                  // Not linked: Adopt is the recommended default (PRD #576 M1);
+                  // Provision stays available but is nudged to secondary and, for a
+                  // user-owned repo, disabled with a reason (uzi can't own a Project
+                  // under a personal account — F-A). syncOwnerType null → both enabled.
+                  <div className="space-y-3">
+                    <p className="text-sm text-muted">
+                      Adopt a Project you already created (recommended); Provision only if
+                      uzi should create one for you (org repos).
+                    </p>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div className="space-y-2 rounded-md border border-edge bg-raised p-3">
+                        <h4 className="text-sm font-semibold text-fg">Adopt an existing project</h4>
+                        <p className="text-sm text-muted">
+                          Link an existing Project v2 by its number.
+                        </p>
+                        <label className="block space-y-1">
+                          <span className="text-xs text-muted">Owner</span>
+                          <Select
+                            aria-label="Adopt owner"
+                            value={adoptOwnerKind}
+                            disabled={syncBusy}
+                            onChange={(e) => setAdoptOwnerKind(e.target.value as ProjectSyncOwnerKind)}
+                          >
+                            <option value="user">User</option>
+                            <option value="org">Org</option>
+                            <option value="viewer">Viewer</option>
+                          </Select>
+                        </label>
+                        <label className="block space-y-1">
+                          <span className="text-xs text-muted">Project number</span>
+                          <Input
+                            type="number"
+                            aria-label="Project number"
+                            value={adoptProjectNumber}
+                            disabled={syncBusy}
+                            placeholder="42"
+                            onChange={(e) => setAdoptProjectNumber(e.target.value)}
+                          />
+                        </label>
+                        <Button size="sm" disabled={syncBusy} onClick={() => adoptSync(syncRepo.id)}>
+                          {syncBusy ? "Working…" : "Adopt"}
+                        </Button>
+                      </div>
 
-                    <div className="space-y-2 rounded-md border border-edge bg-raised p-3">
-                      <h4 className="text-sm font-semibold text-fg">Adopt an existing project</h4>
-                      <p className="text-sm text-muted">
-                        Link an existing Project v2 by its number.
-                      </p>
-                      <label className="block space-y-1">
-                        <span className="text-xs text-muted">Owner</span>
-                        <Select
-                          aria-label="Adopt owner"
-                          value={adoptOwnerKind}
-                          disabled={syncBusy}
-                          onChange={(e) => setAdoptOwnerKind(e.target.value as ProjectSyncOwnerKind)}
+                      <div className="space-y-2 rounded-md border border-edge bg-raised p-3 opacity-90">
+                        <h4 className="text-sm font-semibold text-fg">Create a new project</h4>
+                        <p className="text-sm text-muted">
+                          uzi provisions a fresh Project v2 for this repo and owns it.
+                        </p>
+                        {syncOwnerType === "User" && (
+                          <p className="text-xs text-warn" role="note">
+                            uzi can&rsquo;t own a Project under a personal account — Adopt instead.
+                          </p>
+                        )}
+                        <label className="block space-y-1">
+                          <span className="text-xs text-muted">Owner</span>
+                          <Select
+                            aria-label="Provision owner"
+                            value={provisionOwnerKind}
+                            disabled={syncBusy || syncOwnerType === "User"}
+                            onChange={(e) => setProvisionOwnerKind(e.target.value as ProjectSyncOwnerKind)}
+                          >
+                            <option value="user">User</option>
+                            <option value="org">Org</option>
+                            <option value="viewer">Viewer</option>
+                          </Select>
+                        </label>
+                        <label className="block space-y-1">
+                          <span className="text-xs text-muted">Title (optional)</span>
+                          <Input
+                            aria-label="Project title"
+                            value={provisionTitle}
+                            disabled={syncBusy || syncOwnerType === "User"}
+                            placeholder="uzi board"
+                            onChange={(e) => setProvisionTitle(e.target.value)}
+                          />
+                        </label>
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          disabled={syncBusy || syncOwnerType === "User"}
+                          onClick={() => provisionSync(syncRepo.id)}
                         >
-                          <option value="user">User</option>
-                          <option value="org">Org</option>
-                          <option value="viewer">Viewer</option>
-                        </Select>
-                      </label>
-                      <label className="block space-y-1">
-                        <span className="text-xs text-muted">Project number</span>
-                        <Input
-                          type="number"
-                          aria-label="Project number"
-                          value={adoptProjectNumber}
-                          disabled={syncBusy}
-                          placeholder="42"
-                          onChange={(e) => setAdoptProjectNumber(e.target.value)}
-                        />
-                      </label>
-                      <Button size="sm" disabled={syncBusy} onClick={() => adoptSync(syncRepo.id)}>
-                        {syncBusy ? "Working…" : "Adopt"}
-                      </Button>
+                          {syncBusy ? "Working…" : "Provision"}
+                        </Button>
+                      </div>
                     </div>
                   </div>
                 )}

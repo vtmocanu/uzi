@@ -115,6 +115,7 @@ uzi handoff rm <run-id> | review <run-id>
 uzi token list
 uzi worker list | rm <id> | set-token <worker-id> <label> | set-token <worker-id> --default
 uzi repo list | remove <id> [--force]
+uzi project-sync status <repo> | resync <repo>
 uzi admin users | runs | workers | usage | rate-limits | cli-tokens | guardrail-impact | blocked-repos
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi tui [run-id]
@@ -380,6 +381,17 @@ A few worth knowing:
   list reflects live membership. To keep a still-visible repo out for good,
   remove the bot's access on the forge first; `remove` is meant for a repo the
   bot no longer sees (a deleted/recreated project, the stale-duplicate case).
+- **`uzi project-sync status <repo>` and `uzi project-sync resync <repo>`** are the
+  CLI's read-and-fix-loop window onto a repo's GitHub Projects v2 sync. `<repo>` is a
+  path-with-namespace (`org/repo`, matched against `uzi repo list`) or a raw repo id.
+  `status` prints whether the repo is linked and, if so, the project number, whether the
+  board is uzi-owned, the last sync time, the last error (health), the synced item count,
+  and any board columns with no matching Status option; a repo that is **not linked** is
+  reported as normal output (`--json` returns `{"linked": false}`), not an error.
+  `resync` re-seeds an already-linked board, picking up newly-added Status columns — the
+  same operation the web panel's Resync button drives. Linking a repo to a project in the
+  first place (**Adopt**) and creating a fresh uzi-owned board (**Provision**) stay
+  **web-only** (D4): the CLI observes and re-seeds, it never mints a link or a project.
 - **`uzi logout` is local-only.** It removes **the active context's** stored
   credential (its stored URL is left intact, so a later re-login needs no
   re-typed URL); it does **not** revoke it server-side (see

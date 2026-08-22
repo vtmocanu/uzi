@@ -168,6 +168,10 @@ type ProjectSyncer interface {
 	// GetVisibility reads the linked board's current public flag (PRD #557 M2/M3): a
 	// live forge round-trip, kept off the DB-only status endpoint (D4).
 	GetVisibility(ctx context.Context, repoID uuid.UUID) (bool, error)
+	// RepoOwnerType reports whether the repo's owner is a GitHub User or Organization
+	// (PRD #576 M1), for the sync panel's Provision feasibility nudge. A live forge
+	// round-trip; needs no link row (used before the repo is linked).
+	RepoOwnerType(ctx context.Context, repoID uuid.UUID) (forge.ProjectV2OwnerType, error)
 	// SetVisibility writes the linked board's public flag (PRD #557).
 	SetVisibility(ctx context.Context, repoID uuid.UUID, public bool) error
 	// ShareWithUser grants the named GitHub login Reader access to the linked board
@@ -177,6 +181,16 @@ type ProjectSyncer interface {
 	ShareWithUser(ctx context.Context, repoID uuid.UUID, username string) error
 	// Unshare revokes the named GitHub login's access to the linked board (PRD #557).
 	Unshare(ctx context.Context, repoID uuid.UUID, username string) error
+	// Resync re-runs the adopt seed against a repo's already-linked board (PRD #576
+	// M3), re-reading the Status field so newly-added options resolve and re-persisting
+	// the unmatched set. Needs no owner_kind/project_number (uses the stored node id).
+	// Returns ErrProjectSyncNotLinked when the repo has no link (the handler → 404).
+	Resync(ctx context.Context, repoID uuid.UUID) (string, error)
+	// AutoCreateColumns creates a FRESH uzi-owned Status field on an adopted board
+	// carrying all the repo's columns and switches the link to it (PRD #576 M6),
+	// turning skipped columns into synced ones with no destructive field replace.
+	// Returns ErrProjectSyncNotLinked when the repo has no link (the handler → 404).
+	AutoCreateColumns(ctx context.Context, repoID uuid.UUID) (string, error)
 }
 
 // SetProjectSync wires the GitHub Projects v2 provisioning service in after
@@ -1068,6 +1082,18 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// limiter: create validates config and computes next_fire_at without a
 				// forge read (run-now, which does read the forge, carries the limiter).
 				r.Post("/{id}/schedules", h.CreateSchedule)
+				// GitHub Projects v2 sync READS + RESYNC for the CLI (PRD #576 M7):
+				// RequireUser (NOT the cookie-only RequireAuth group below) so the CLI's
+				// `uzc_` Bearer token is accepted — a cookie-only mount would 401 it
+				// (issue #428 regression). Both are owner-scoped and guarded server-side by
+				// the same GetRepoForUser preflight inside each handler (404 for a
+				// foreign/unknown repo); under the CLI token's IsAdmin=false ceiling they
+				// are correctly owner-only. No forge limiter: the status read hits only the
+				// stored projection, and resync re-seeds without charging the forge budget.
+				// The mutating link setup (Adopt/Provision/autocreate/disable) and the
+				// board-access controls stay on RequireAuth (cookie-only) below — web-only.
+				r.Get("/{id}/github-project-sync", h.GetGithubProjectSyncStatus)
+				r.Post("/{id}/github-project-sync/resync", h.ResyncGithubProjectSync)
 			})
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))
@@ -1077,9 +1103,21 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// GitHub Projects v2 sync, owner-or-admin (issue #534, PRD #364 follow-up):
 				// relocated out of /admin (D4). Owner path is guarded by a GetRepoForUser
 				// preflight inside each handler; admin skips it. Instance flag still gates.
-				r.Get("/{id}/github-project-sync", h.GetGithubProjectSyncStatus)
+				// The status read and resync moved UP to the RequireUser group (PRD #576 M7)
+				// so the CLI's Bearer token reaches them; the mutating link setup below stays
+				// cookie-only (web-only — Adopt/Provision/autocreate/disable, D4).
+				// Owner-type read for the Adopt-first Provision nudge (PRD #576 M1):
+				// a live forge round-trip (repositoryOwner __typename), fetched for a
+				// not-yet-linked repo so it needs no link row. Web-only; the CLI does
+				// not use it.
+				r.Get("/{id}/github-project-sync/owner-type", h.GetGithubProjectOwnerType)
 				r.Post("/{id}/github-project-sync", h.AdoptGithubProjectSync)
 				r.Post("/{id}/github-project-sync/provision", h.ProvisionGithubProjectSync)
+				// Safe column auto-create (PRD #576 M6): create a fresh uzi-owned
+				// Status field with all the repo's columns and switch the link to it,
+				// turning skipped columns into synced ones with no destructive replace.
+				// Same owner-or-admin write group → noLimiter.
+				r.Post("/{id}/github-project-sync/autocreate-columns", h.AutoCreateGithubProjectColumns)
 				r.Delete("/{id}/github-project-sync", h.DisableGithubProjectSync)
 				// Board access controls (PRD #557): read/flip the board's visibility, and
 				// grant/revoke Reader access by username. Same owner-or-admin preflight +

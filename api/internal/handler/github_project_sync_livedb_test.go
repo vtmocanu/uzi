@@ -24,8 +24,12 @@ import (
 // no-link 404 never occurs here, since projectSync is nil and 500 fires first, so the
 // 404 seen below is unambiguously the owner preflight.)
 //
-// The routes sit in the per-repo RequireAuth (cookie-only) group beside SetRepoEnabled
-// / PatchRepo, so these use the cookie+CSRF path (cookieReq), not a CLI Bearer.
+// The mutating link routes exercised here (DELETE sync, POST provision) sit in the
+// per-repo RequireAuth (cookie-only) group beside SetRepoEnabled / PatchRepo, so they
+// use the cookie+CSRF path (cookieReq). PRD #576 M7 moved the status READ (GET) and
+// resync UP to the RequireUser group so the CLI's uzc_ Bearer reaches them; a cookie
+// works on that group too, so the GET-status cases below still drive it via cookieReq.
+// The Bearer-accept proof for the moved routes lives in the *CLIBearer* LiveDB test.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres;
 // ./e2e/run-store-it.sh provides one and sweeps this package for the LiveDB suffix.

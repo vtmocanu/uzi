@@ -24,6 +24,20 @@ func (q *Queries) ClearGithubProjectLinkError(ctx context.Context, repoID uuid.U
 	return err
 }
 
+const clearGithubProjectLinkSeeding = `-- name: ClearGithubProjectLinkSeeding :exec
+UPDATE github_project_links
+SET seeding_started_at = NULL, updated_at = now()
+WHERE repo_id = $1
+`
+
+// Release the seeding lease (PRD #576 M4): null seeding_started_at when the background
+// seed finishes (success, error, OR timeout — the finalize defer always runs). NULL =
+// "not seeding", which re-enables the reverse poller for the repo.
+func (q *Queries) ClearGithubProjectLinkSeeding(ctx context.Context, repoID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, clearGithubProjectLinkSeeding, repoID)
+	return err
+}
+
 const deleteGithubProjectItem = `-- name: DeleteGithubProjectItem :exec
 DELETE FROM github_project_items
 WHERE repo_id = $1 AND forge_issue_iid = $2
@@ -76,7 +90,7 @@ func (q *Queries) GetGithubProjectItem(ctx context.Context, arg GetGithubProject
 }
 
 const getGithubProjectLinkByRepo = `-- name: GetGithubProjectLinkByRepo :one
-SELECT id, repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi, last_synced_at, last_error, created_at, updated_at FROM github_project_links WHERE repo_id = $1
+SELECT id, repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi, last_synced_at, last_error, created_at, updated_at, unmatched_columns, seeding_started_at FROM github_project_links WHERE repo_id = $1
 `
 
 // The link row for a repo, or no row when the repo is not synced.
@@ -95,6 +109,8 @@ func (q *Queries) GetGithubProjectLinkByRepo(ctx context.Context, repoID uuid.UU
 		&i.LastError,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UnmatchedColumns,
+		&i.SeedingStartedAt,
 	)
 	return i, err
 }
@@ -130,6 +146,76 @@ func (q *Queries) ListGithubProjectItems(ctx context.Context, repoID uuid.UUID) 
 		return nil, err
 	}
 	return items, nil
+}
+
+const listGithubProjectLinksByRepoIDs = `-- name: ListGithubProjectLinksByRepoIDs :many
+SELECT id, repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi, last_synced_at, last_error, created_at, updated_at, unmatched_columns, seeding_started_at FROM github_project_links WHERE repo_id = ANY($1::uuid[])
+`
+
+// Batch-load link rows for a set of repo ids, for the caller-scoped repos-list
+// sync-health enrichment (PRD #576 M2). Repos with no link are simply absent.
+func (q *Queries) ListGithubProjectLinksByRepoIDs(ctx context.Context, repoIds []uuid.UUID) ([]GithubProjectLink, error) {
+	rows, err := q.db.Query(ctx, listGithubProjectLinksByRepoIDs, repoIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []GithubProjectLink{}
+	for rows.Next() {
+		var i GithubProjectLink
+		if err := rows.Scan(
+			&i.ID,
+			&i.RepoID,
+			&i.ProjectNodeID,
+			&i.ProjectNumber,
+			&i.StatusFieldID,
+			&i.StatusOptions,
+			&i.OwnedByUzi,
+			&i.LastSyncedAt,
+			&i.LastError,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.UnmatchedColumns,
+			&i.SeedingStartedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const markGithubProjectLinkSeeding = `-- name: MarkGithubProjectLinkSeeding :exec
+UPDATE github_project_links
+SET seeding_started_at = now(), updated_at = now()
+WHERE repo_id = $1
+`
+
+// Take the per-repo seeding lease (PRD #576 M4): stamp seeding_started_at = now() so a
+// reverse tick that fires while async seeding is in flight suppresses itself (it checks
+// the lease age against seedSuppressLease). Set synchronously by launchSeed BEFORE the
+// write handler returns, so a reverse poll landing right after Adopt is already covered.
+func (q *Queries) MarkGithubProjectLinkSeeding(ctx context.Context, repoID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, markGithubProjectLinkSeeding, repoID)
+	return err
+}
+
+const resetGithubProjectItemMarkers = `-- name: ResetGithubProjectItemMarkers :exec
+UPDATE github_project_items SET last_status_option_id = NULL, last_synced_at = now()
+WHERE repo_id = $1
+`
+
+// Clear every tracked item's status marker for a repo (PRD #576 M6). Used when the
+// link's status_field_id is switched to a freshly-created field: the new field reads
+// EMPTY for every item, so the stored markers (old field's option ids) must be reset
+// to NULL atomically with the switch — else the next reverse tick sees live("") !=
+// marker(old id) for every issue and fires the mass-clear cascade (F-H/R1).
+func (q *Queries) ResetGithubProjectItemMarkers(ctx context.Context, repoID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, resetGithubProjectItemMarkers, repoID)
+	return err
 }
 
 const setGithubProjectItemStatusMarker = `-- name: SetGithubProjectItemStatusMarker :exec
@@ -231,28 +317,32 @@ func (q *Queries) UpsertGithubProjectItem(ctx context.Context, arg UpsertGithubP
 const upsertGithubProjectLink = `-- name: UpsertGithubProjectLink :one
 
 INSERT INTO github_project_links (
-    repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi
+    repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi,
+    unmatched_columns
 ) VALUES (
     $1, $2, $3,
-    $4, $5, $6
+    $4, $5, $6,
+    COALESCE($7::text[], '{}')
 )
 ON CONFLICT (repo_id) DO UPDATE SET
-    project_node_id = EXCLUDED.project_node_id,
-    project_number  = EXCLUDED.project_number,
-    status_field_id = EXCLUDED.status_field_id,
-    status_options  = EXCLUDED.status_options,
-    owned_by_uzi    = EXCLUDED.owned_by_uzi,
-    updated_at      = now()
-RETURNING id, repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi, last_synced_at, last_error, created_at, updated_at
+    project_node_id   = EXCLUDED.project_node_id,
+    project_number    = EXCLUDED.project_number,
+    status_field_id   = EXCLUDED.status_field_id,
+    status_options    = EXCLUDED.status_options,
+    owned_by_uzi      = EXCLUDED.owned_by_uzi,
+    unmatched_columns = COALESCE($7::text[], '{}'),
+    updated_at        = now()
+RETURNING id, repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi, last_synced_at, last_error, created_at, updated_at, unmatched_columns, seeding_started_at
 `
 
 type UpsertGithubProjectLinkParams struct {
-	RepoID        uuid.UUID `json:"repo_id"`
-	ProjectNodeID string    `json:"project_node_id"`
-	ProjectNumber int64     `json:"project_number"`
-	StatusFieldID string    `json:"status_field_id"`
-	StatusOptions []byte    `json:"status_options"`
-	OwnedByUzi    bool      `json:"owned_by_uzi"`
+	RepoID           uuid.UUID `json:"repo_id"`
+	ProjectNodeID    string    `json:"project_node_id"`
+	ProjectNumber    int64     `json:"project_number"`
+	StatusFieldID    string    `json:"status_field_id"`
+	StatusOptions    []byte    `json:"status_options"`
+	OwnedByUzi       bool      `json:"owned_by_uzi"`
+	UnmatchedColumns []string  `json:"unmatched_columns"`
 }
 
 // GitHub Projects v2 Status sync persistence (PRD #364). The poller (M5/M6/M7) and
@@ -263,6 +353,9 @@ type UpsertGithubProjectLinkParams struct {
 // the conflict target is repo_id; every mutable column is overwritten and updated_at
 // bumped. Does NOT touch last_synced_at/last_error — those are written by the
 // error/clear queries below on each sync attempt, not by a (re)link.
+// unmatched_columns (PRD #576 M3) is COALESCE'd from nil→'{}' so a nil Go []string
+// never becomes SQL NULL and violates the NOT NULL constraint; the same guard is
+// applied on both the INSERT and the conflict update.
 func (q *Queries) UpsertGithubProjectLink(ctx context.Context, arg UpsertGithubProjectLinkParams) (GithubProjectLink, error) {
 	row := q.db.QueryRow(ctx, upsertGithubProjectLink,
 		arg.RepoID,
@@ -271,6 +364,7 @@ func (q *Queries) UpsertGithubProjectLink(ctx context.Context, arg UpsertGithubP
 		arg.StatusFieldID,
 		arg.StatusOptions,
 		arg.OwnedByUzi,
+		arg.UnmatchedColumns,
 	)
 	var i GithubProjectLink
 	err := row.Scan(
@@ -285,6 +379,8 @@ func (q *Queries) UpsertGithubProjectLink(ctx context.Context, arg UpsertGithubP
 		&i.LastError,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UnmatchedColumns,
+		&i.SeedingStartedAt,
 	)
 	return i, err
 }

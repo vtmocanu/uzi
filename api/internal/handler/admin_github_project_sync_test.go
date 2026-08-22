@@ -59,6 +59,21 @@ type fakeProjectSync struct {
 	gotUsername        string
 	shareCalls         int
 	unshareCalls       int
+
+	// PRD #576 M1: scripted owner-type return + error for the Provision nudge.
+	ownerType      forge.ProjectV2OwnerType
+	ownerTypeErr   error
+	ownerTypeCalls int
+
+	// PRD #576 M3: scripted resync note + error, and a call counter.
+	resyncNote  string
+	resyncErr   error
+	resyncCalls int
+
+	// PRD #576 M6: scripted auto-create note + error, and a call counter.
+	autocreateNote  string
+	autocreateErr   error
+	autocreateCalls int
 }
 
 func (f *fakeProjectSync) Adopt(_ context.Context, repoID uuid.UUID, number int, kind forge.ProjectV2OwnerKind) error {
@@ -97,6 +112,12 @@ func (f *fakeProjectSync) GetVisibility(_ context.Context, repoID uuid.UUID) (bo
 	return f.visibilityReturn, f.visibilityErr
 }
 
+func (f *fakeProjectSync) RepoOwnerType(_ context.Context, repoID uuid.UUID) (forge.ProjectV2OwnerType, error) {
+	f.ownerTypeCalls++
+	f.gotRepoID = repoID
+	return f.ownerType, f.ownerTypeErr
+}
+
 func (f *fakeProjectSync) SetVisibility(_ context.Context, repoID uuid.UUID, public bool) error {
 	f.setVisibilityCalls++
 	f.gotRepoID, f.gotPublic = repoID, public
@@ -113,6 +134,18 @@ func (f *fakeProjectSync) Unshare(_ context.Context, repoID uuid.UUID, username 
 	f.unshareCalls++
 	f.gotRepoID, f.gotUsername = repoID, username
 	return f.unshareErr
+}
+
+func (f *fakeProjectSync) Resync(_ context.Context, repoID uuid.UUID) (string, error) {
+	f.resyncCalls++
+	f.gotRepoID = repoID
+	return f.resyncNote, f.resyncErr
+}
+
+func (f *fakeProjectSync) AutoCreateColumns(_ context.Context, repoID uuid.UUID) (string, error) {
+	f.autocreateCalls++
+	f.gotRepoID = repoID
+	return f.autocreateNote, f.autocreateErr
 }
 
 // postAdopt drives AdoptGithubProjectSync with an admin actor and the given repo id
@@ -321,6 +354,206 @@ func TestStatusRouteReturnsFields(t *testing.T) {
 	if body.LastError == nil || *body.LastError != "graphql boom" {
 		t.Errorf("last_error = %v, want graphql boom", body.LastError)
 	}
+}
+
+// getOwnerType drives GetGithubProjectOwnerType with an admin actor and the given repo id.
+func getOwnerType(t *testing.T, h *Handler, repoID string) *httptest.ResponseRecorder {
+	t.Helper()
+	admin := store.User{ID: uuid.New(), IsAdmin: true}
+	r := httptest.NewRequest(http.MethodGet, "/repos/x/github-project-sync/owner-type", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", repoID)
+	r = r.WithContext(context.WithValue(mw.ContextWithUser(r.Context(), admin), chi.RouteCtxKey, rctx))
+	w := httptest.NewRecorder()
+	h.GetGithubProjectOwnerType(w, r)
+	return w
+}
+
+// TestOwnerTypeRouteReturnsType (PRD #576 M1): the owner-type route delegates to the
+// service and renders the wire owner_type string.
+func TestOwnerTypeRouteReturnsType(t *testing.T) {
+	sync := &fakeProjectSync{ownerType: forge.OwnerTypeOrg}
+	h := &Handler{projectSync: sync}
+	repoID := uuid.New()
+	w := getOwnerType(t, h, repoID.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("owner-type status = %d, want 200", w.Code)
+	}
+	if sync.ownerTypeCalls != 1 || sync.gotRepoID != repoID {
+		t.Errorf("RepoOwnerType not delegated with path repo id: calls=%d id=%v", sync.ownerTypeCalls, sync.gotRepoID)
+	}
+	var body struct {
+		OwnerType string `json:"owner_type"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response not JSON: %v", err)
+	}
+	if body.OwnerType != "Organization" {
+		t.Errorf("owner_type = %q, want Organization", body.OwnerType)
+	}
+}
+
+// TestOwnerTypeRouteValidation: a bad repo id is a 400 before the service; a nil
+// service is a clean 500.
+func TestOwnerTypeRouteValidation(t *testing.T) {
+	t.Run("invalid repo id", func(t *testing.T) {
+		sync := &fakeProjectSync{}
+		h := &Handler{projectSync: sync}
+		w := getOwnerType(t, h, "not-a-uuid")
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", w.Code)
+		}
+		if sync.ownerTypeCalls != 0 {
+			t.Errorf("service must not be called on a bad repo id")
+		}
+	})
+	t.Run("service not wired", func(t *testing.T) {
+		h := &Handler{}
+		w := getOwnerType(t, h, uuid.New().String())
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500", w.Code)
+		}
+	})
+}
+
+// resync drives ResyncGithubProjectSync with an admin actor and the given repo id.
+func resync(t *testing.T, h *Handler, repoID string) *httptest.ResponseRecorder {
+	t.Helper()
+	admin := store.User{ID: uuid.New(), IsAdmin: true}
+	r := httptest.NewRequest(http.MethodPost, "/repos/x/github-project-sync/resync", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", repoID)
+	r = r.WithContext(context.WithValue(mw.ContextWithUser(r.Context(), admin), chi.RouteCtxKey, rctx))
+	w := httptest.NewRecorder()
+	h.ResyncGithubProjectSync(w, r)
+	return w
+}
+
+// TestResyncRouteDelegates (PRD #576 M3): the resync route delegates to the service
+// with the path repo id and returns 200 {"status":"resynced"}; it needs no body.
+func TestResyncRouteDelegates(t *testing.T) {
+	sync := &fakeProjectSync{resyncNote: "1 column skipped"}
+	h := &Handler{projectSync: sync}
+	repoID := uuid.New()
+	w := resync(t, h, repoID.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("resync status = %d, want 200", w.Code)
+	}
+	if sync.resyncCalls != 1 || sync.gotRepoID != repoID {
+		t.Errorf("Resync not delegated with path repo id: calls=%d id=%v", sync.resyncCalls, sync.gotRepoID)
+	}
+	var body struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response not JSON: %v", err)
+	}
+	if body.Status != "resynced" {
+		t.Errorf("status = %q, want resynced", body.Status)
+	}
+}
+
+// TestResyncRouteNotLinkedIs404: the not-linked sentinel maps to 404.
+func TestResyncRouteNotLinkedIs404(t *testing.T) {
+	sync := &fakeProjectSync{resyncErr: forgesvc.ErrProjectSyncNotLinked}
+	h := &Handler{projectSync: sync}
+	w := resync(t, h, uuid.New().String())
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("resync status = %d, want 404", w.Code)
+	}
+}
+
+// TestResyncRouteValidation: a bad repo id is 400 before the service; a nil service
+// is a clean 500.
+func TestResyncRouteValidation(t *testing.T) {
+	t.Run("invalid repo id", func(t *testing.T) {
+		sync := &fakeProjectSync{}
+		h := &Handler{projectSync: sync}
+		w := resync(t, h, "not-a-uuid")
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", w.Code)
+		}
+		if sync.resyncCalls != 0 {
+			t.Errorf("service must not be called on a bad repo id")
+		}
+	})
+	t.Run("service not wired", func(t *testing.T) {
+		h := &Handler{}
+		w := resync(t, h, uuid.New().String())
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500", w.Code)
+		}
+	})
+}
+
+// autocreateColumns drives AutoCreateGithubProjectColumns with an admin actor.
+func autocreateColumns(t *testing.T, h *Handler, repoID string) *httptest.ResponseRecorder {
+	t.Helper()
+	admin := store.User{ID: uuid.New(), IsAdmin: true}
+	r := httptest.NewRequest(http.MethodPost, "/repos/x/github-project-sync/autocreate-columns", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", repoID)
+	r = r.WithContext(context.WithValue(mw.ContextWithUser(r.Context(), admin), chi.RouteCtxKey, rctx))
+	w := httptest.NewRecorder()
+	h.AutoCreateGithubProjectColumns(w, r)
+	return w
+}
+
+// TestAutoCreateColumnsRouteDelegates (PRD #576 M6): the route delegates to the service
+// with the path repo id and returns 200 {"status":"columns_created"}; it needs no body.
+func TestAutoCreateColumnsRouteDelegates(t *testing.T) {
+	sync := &fakeProjectSync{autocreateNote: "created 4 columns"}
+	h := &Handler{projectSync: sync}
+	repoID := uuid.New()
+	w := autocreateColumns(t, h, repoID.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("autocreate status = %d, want 200", w.Code)
+	}
+	if sync.autocreateCalls != 1 || sync.gotRepoID != repoID {
+		t.Errorf("AutoCreateColumns not delegated with path repo id: calls=%d id=%v", sync.autocreateCalls, sync.gotRepoID)
+	}
+	var body struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response not JSON: %v", err)
+	}
+	if body.Status != "columns_created" {
+		t.Errorf("status = %q, want columns_created", body.Status)
+	}
+}
+
+// TestAutoCreateColumnsRouteNotLinkedIs404: the not-linked sentinel maps to 404.
+func TestAutoCreateColumnsRouteNotLinkedIs404(t *testing.T) {
+	sync := &fakeProjectSync{autocreateErr: forgesvc.ErrProjectSyncNotLinked}
+	h := &Handler{projectSync: sync}
+	w := autocreateColumns(t, h, uuid.New().String())
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("autocreate status = %d, want 404", w.Code)
+	}
+}
+
+// TestAutoCreateColumnsRouteValidation: a bad repo id is 400 before the service; a nil
+// service is a clean 500.
+func TestAutoCreateColumnsRouteValidation(t *testing.T) {
+	t.Run("invalid repo id", func(t *testing.T) {
+		sync := &fakeProjectSync{}
+		h := &Handler{projectSync: sync}
+		w := autocreateColumns(t, h, "not-a-uuid")
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", w.Code)
+		}
+		if sync.autocreateCalls != 0 {
+			t.Errorf("service must not be called on a bad repo id")
+		}
+	})
+	t.Run("service not wired", func(t *testing.T) {
+		h := &Handler{}
+		w := autocreateColumns(t, h, uuid.New().String())
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500", w.Code)
+		}
+	})
 }
 
 // TestStatusRouteNoLinkIs404: a repo with no link (pgx.ErrNoRows) returns 404.
