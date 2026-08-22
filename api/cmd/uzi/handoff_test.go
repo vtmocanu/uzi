@@ -38,9 +38,9 @@ type handoffClient struct {
 	rec *handoffRecorder
 }
 
-func (c *handoffClient) CreateTaskRun(ctx context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested, thenFixRequested bool) (apitypes.RunDTO, error) {
+func (c *handoffClient) CreateTaskRun(ctx context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool) (apitypes.RunDTO, error) {
 	c.rec.seq = append(c.rec.seq, "create")
-	return c.FakeClient.CreateTaskRun(ctx, repoID, taskContext, baseBranch, openMR, reviewRequested, thenFixRequested)
+	return c.FakeClient.CreateTaskRun(ctx, repoID, taskContext, baseBranch, openMR, reviewRequested, thenFixRequested, interactive)
 }
 
 func (c *handoffClient) DispatchTaskRun(ctx context.Context, runID string) (apitypes.RunDTO, error) {
@@ -166,6 +166,63 @@ func TestHandoffReviewAndThenFixFlags(t *testing.T) {
 				t.Errorf("then_fix_requested = %v, want %v", fc.LastCreateTaskThenFix, tc.wantThenFix)
 			}
 		})
+	}
+}
+
+// --interactive sets interactive=true in the create call (PRD #517 M1): the worker keeps
+// the run alive after signal_done rather than terminating. A plain handoff sends false.
+func TestHandoffInteractive(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		CreatedTaskRun: taskRun("ri", "uzi/task/ri"),
+		DispatchedRun:  taskRun("ri", "uzi/task/ri"),
+	}
+	rec := &handoffRecorder{}
+	env, _ := handoffEnv(fc, rec)
+
+	_, _, code := runCLI(t, env, "handoff", "--repo", "p1", "-m", "x", "--interactive")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !fc.LastCreateTaskInteractive {
+		t.Errorf("create interactive = false, want true when --interactive was passed")
+	}
+}
+
+// Without --interactive, the create call sends interactive=false (the common default).
+func TestHandoffNotInteractiveByDefault(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		CreatedTaskRun: taskRun("rn", "uzi/task/rn"),
+		DispatchedRun:  taskRun("rn", "uzi/task/rn"),
+	}
+	rec := &handoffRecorder{}
+	env, _ := handoffEnv(fc, rec)
+
+	_, _, code := runCLI(t, env, "handoff", "--repo", "p1", "-m", "x")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc.LastCreateTaskInteractive {
+		t.Errorf("create interactive = true, want false by default")
+	}
+}
+
+// --interactive and --then-fix are mutually exclusive: the combination is rejected as a
+// usage error (exit 2) BEFORE any run is created — the fake client's create is never
+// reached.
+func TestHandoffInteractiveThenFixRejected(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		CreatedTaskRun: taskRun("rx", "uzi/task/rx"),
+		DispatchedRun:  taskRun("rx", "uzi/task/rx"),
+	}
+	rec := &handoffRecorder{}
+	env, _ := handoffEnv(fc, rec)
+
+	_, _, code := runCLI(t, env, "handoff", "--repo", "p1", "-m", "x", "--interactive", "--then-fix")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (ExitUsage) for --interactive --then-fix", code, uzicli.ExitUsage)
+	}
+	if fc.LastCreateTaskRepoID != "" || len(fc.TaskCalls) != 0 {
+		t.Errorf("create should not be reached when the flags conflict; TaskCalls=%v", fc.TaskCalls)
 	}
 }
 

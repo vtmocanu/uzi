@@ -304,6 +304,22 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 		// question has no such sub-state — awaiting_input means exactly one thing.
 		r.answer(ctx, m, user.ID, anchor, text)
 
+	case run.Status == "awaiting_followup":
+		// The interactive task is PARKED awaiting the user's next follow-up (PRD #517). A
+		// threaded reply IS that follow-up, and submitting it as a `follow_up` steering input
+		// is exactly what resumes the parked run — SetRunRunning's Decision-7 wake guard keys
+		// the resume on a `follow_up` (workersvc/service.go). This is a BARE status check like
+		// awaiting_input above: awaiting_followup means exactly one thing, with no gate
+		// sub-state. Handled explicitly rather than left to the default arm so a human sees an
+		// "Awaiting your follow-up" park treated as a park — its label is rendered by the
+		// notifier's statusGlyph — and so a future change to the default cannot silently break
+		// the resume of a parked interactive task.
+		if err := r.svc.SubmitInput(ctx, user.ID, anchor.RunID, "follow_up", text); err != nil {
+			r.logf("submit follow_up (awaiting_followup)", err)
+			return
+		}
+		r.ack(ctx, m)
+
 	default:
 		// Live run, no gate → follow_up for the next implement turn.
 		if err := r.svc.SubmitInput(ctx, user.ID, anchor.RunID, "follow_up", text); err != nil {

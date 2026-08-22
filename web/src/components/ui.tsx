@@ -338,6 +338,12 @@ export const RUN_STATUS_TONES: Record<
   // worker is held), and the PRD frames it as the third human-in-the-loop channel
   // alongside the plan gate (D-O #4). The label distinguishes them; the tone must not.
   awaiting_input: { tone: "warning", pulse: true },
+  /** PRD #517: an interactive task run parked awaiting the owner's next follow-up.
+   *  Warn-toned like the other parks (a human owes the run its next turn), and
+   *  deliberately NOT pulsing: like limit_wait it does nothing until the user acts,
+   *  and a pulse reads as live work. The label overrides to "awaiting follow-up"
+   *  below so the pill does not echo the raw enum. */
+  awaiting_followup: { tone: "warning" },
   /** PRD #35: parked until the owner's Anthropic usage window reopens. Warn-toned
    *  like the other "blocked on something outside the run" state, and deliberately
    *  NOT pulsing: a pulse reads as live work, and a parked run does nothing at all
@@ -361,6 +367,10 @@ export const RUN_STATUS_TONES: Record<
 // fine de-underscored. Keep the two in step for any status added here.
 const RUN_STATUS_LABELS: Record<string, string> = {
   awaiting_input: "needs your answer",
+  // PRD #517: distinct copy from awaiting_input — a follow-up park is the run's
+  // turn-taking pause, not an unanswered question. Kept in step with runBadge's
+  // "awaiting follow-up" label.
+  awaiting_followup: "awaiting follow-up",
 };
 
 export function StatusPill({ status }: { status: string }) {

@@ -111,6 +111,11 @@ type RunDTO struct {
 	// non-task run — a plain handoff produces commits on the branch, not an MR).
 	BaseBranch *string `json:"base_branch"`
 	OpenMr     bool    `json:"open_mr"`
+	// Interactive marks a long-lived, conversational task run (PRD #517 M1): the worker
+	// keeps it alive (parking in awaiting_followup) after signal_done rather than
+	// terminating. Set at create from --interactive; false by default and for every
+	// non-task run. Always on the wire, like OpenMr above.
+	Interactive bool `json:"interactive"`
 	// DispatchedAt is when the CLI stamped a task run's dispatch gate (PRD #400
 	// Decision 6) — the moment it became claimable, after its uzi/task/<id> branch was
 	// seeded. Null on every non-task run and on a task run not yet dispatched. Mapped
@@ -132,10 +137,17 @@ type RunDTO struct {
 	// run's value can be stale, so freshness is scoped to the board card in the UI.
 	MrState       *string `json:"mr_state"`
 	FailureReason *string `json:"failure_reason"`
-	// StopKind is the server-stamped stop signal (PRD #33, widened by #108 M5):
+	// StopKind is the server-stamped stop signal (PRD #33, widened by #108 M5 and #517 M4):
 	// "cancelled" or "plan_rejected" for a deliberate HUMAN stop, "auto_stopped" when
-	// the SERVER stopped a run whose updates could not be saved, null for every other
-	// run. It — not the failure_reason text — is what clients read.
+	// the SERVER stopped a run whose updates could not be saved, "stopped" for a graceful
+	// `uzi run stop` of an interactive task run, null for every other run. It — not the
+	// failure_reason text — is what clients read.
+	//
+	// A "stopped" run's happy path lands `completed` (the worker finalizes — push + MR iff
+	// open_mr — and reports completed); on the edge where that finalize throws (or a
+	// cancel-then-stop let the cancel win) the worker reports `failed` and the server routes
+	// it to `cancelled`, never `agent_failure` and never judged. So a "stopped" stop_kind
+	// rides a `completed` or a `cancelled` run, not a `failed` one.
 	//
 	// Consumers must NOT treat the three alike, and the web's isStoppedRun is the
 	// worked example: it styles the two human kinds calm/neutral because a deliberate
@@ -503,10 +515,11 @@ type RunEventDTO struct {
 	CreatedAt     *time.Time      `json:"created_at,omitempty"`
 	// Status is set on "state" frames and is a CLOSED set enforced by a database
 	// CHECK constraint (runs.status, created by 00020_workers_runs.sql, widened with
-	// 'limit_wait' by 00091_run_limit_wait.sql and with 'awaiting_input' by
-	// 00092_run_awaiting_input.sql): queued, claimed, running, awaiting_approval,
-	// limit_wait, awaiting_input, completed, failed, cancelled — NINE values. It is
-	// the field that decides whether a run reads as still live, so an unrecognised
-	// value must never reach a consumer as-is.
+	// 'limit_wait' by 00091_run_limit_wait.sql, with 'awaiting_input' by
+	// 00092_run_awaiting_input.sql, and with 'awaiting_followup' by
+	// 00146_interactive_task_runs.sql): queued, claimed, running, awaiting_approval,
+	// limit_wait, awaiting_input, awaiting_followup, completed, failed, cancelled —
+	// TEN values. It is the field that decides whether a run reads as still live, so
+	// an unrecognised value must never reach a consumer as-is.
 	Status string `json:"status,omitempty"` // set on "state" frames
 }

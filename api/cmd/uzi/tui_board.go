@@ -113,7 +113,7 @@ func (b *boardState) visible() []apitypes.RunListItemDTO {
 
 // The three triage bands, in fixed top-to-bottom order.
 const (
-	bandNeedsYou = iota // awaiting_approval + awaiting_input — the only rows a human must act on
+	bandNeedsYou = iota // awaiting_approval + awaiting_input + awaiting_followup — the only rows a human must act on
 	bandFloor           // everything non-terminal not in NEEDS YOU (running/claimed/queued/planning/limit_wait, stalled)
 	bandDone            // terminal: completed/failed/cancelled
 	numBands
@@ -124,7 +124,9 @@ var bandNames = [numBands]string{"NEEDS YOU", "ON THE FLOOR", "DONE"}
 // runBand places a run in its triage band from its status alone.
 func runBand(status string) int {
 	switch status {
-	case "awaiting_approval", "awaiting_input":
+	case "awaiting_approval", "awaiting_input", "awaiting_followup":
+		// awaiting_followup (PRD #517) is the user's turn — an interactive task parked for
+		// its next follow-up — so it belongs in NEEDS YOU alongside the other two parks.
 		return bandNeedsYou
 	}
 	if terminalRunStatuses[status] {
@@ -503,17 +505,21 @@ func (m tuiModel) syncedScroll() int {
 	return start
 }
 
-// boardSummary is the top-right glyph cluster: ⚑ N · ✎ N · ▲ N · <total> runs. Zero-count
-// segments are dropped, so a healthy factory reads simply "N runs". Computed over m.board.runs
-// so it does not shrink under a filter.
+// boardSummary is the top-right glyph cluster: ⚑ N · ✎ N · ➤ N · ▲ N · <total> runs.
+// Zero-count segments are dropped, so a healthy factory reads simply "N runs". Computed
+// over m.board.runs so it does not shrink under a filter. All three parks in the NEEDS YOU
+// band get a segment — awaiting_followup (PRD #517) alongside awaiting_approval and
+// awaiting_input — so a follow-up park is never invisible in the summary line.
 func (m tuiModel) boardSummary() string {
-	approvals, inputs, warn := 0, 0, 0
+	approvals, inputs, followups, warn := 0, 0, 0, 0
 	for _, r := range m.board.runs {
 		switch r.Status {
 		case "awaiting_approval":
 			approvals++
 		case "awaiting_input":
 			inputs++
+		case "awaiting_followup":
+			followups++
 		}
 		if stalledHealth[r.Health] {
 			warn++
@@ -525,6 +531,9 @@ func (m tuiModel) boardSummary() string {
 	}
 	if inputs > 0 {
 		segs = append(segs, paintSeg(m.pal.amber, nil, false, "✎ "+itoa(inputs)))
+	}
+	if followups > 0 {
+		segs = append(segs, paintSeg(m.pal.amber, nil, false, "➤ "+itoa(followups)))
 	}
 	if warn > 0 {
 		segs = append(segs, paintSeg(m.pal.stall, nil, false, "▲ "+itoa(warn)))

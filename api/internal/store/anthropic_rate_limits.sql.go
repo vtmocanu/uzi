@@ -123,11 +123,17 @@ LEFT JOIN (
     -- 'awaiting_approval' counts for the opposite reason and the contrast is the
     -- point: that run's worker is holding its session and WILL resume on that same
     -- token, so its load is real and already directed.
+    --
+    -- 'awaiting_followup' (PRD #517) counts for the SAME reason as 'awaiting_approval'
+    -- and by the same contrast with 'limit_wait' above: it is the interactive-task
+    -- park, an in-process hold on the SAME credential (SetRunAwaitingFollowup does not
+    -- clear anthropic_secret_id) that resumes in-process on that token, so its directed
+    -- load is real. Unlike 'limit_wait', its credential is not the exhausted one.
     SELECT r.anthropic_secret_id AS sid, count(*) AS n
     FROM runs r
     WHERE r.user_id = $1
       AND r.anthropic_secret_id IS NOT NULL
-      AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+      AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
     GROUP BY r.anthropic_secret_id
 ) f ON f.sid = s.id
 WHERE s.user_id = $1

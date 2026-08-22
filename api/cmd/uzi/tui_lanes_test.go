@@ -247,6 +247,40 @@ func TestCrewStateForParkedRun(t *testing.T) {
 	}
 }
 
+// PRD #517: an interactive task parked in awaiting_followup is WAITING on the human, not
+// stalled or idle — it rides the same gate/park rung as awaiting_input/awaiting_approval.
+//
+// The two cases below are the discriminating ones, and each fails against the un-fixed
+// ladder (awaiting_followup absent from the waiting rung) for a different reason:
+//
+//   - quiet for 4h, no active speaker → the recency split answers crewIdle ("nobody is
+//     coming"), which is wrong for a run parked awaiting a follow-up from the user;
+//   - a frozen `stalled` health flag on the active speaker → the active-speaker rung
+//     answers crewStalled off a health flag that can never be cleared (awaiting_followup
+//     is outside ListActiveRunsForHealth's allowlist, service.go), which fails the
+//     "visibly waiting, never stalled" property outright.
+//
+// Both must resolve to crewWaiting, which only the waiting rung produces.
+func TestCrewStateForAwaitingFollowup(t *testing.T) {
+	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	const me = "toolu_me"
+
+	if got := crewStateFor("awaiting_followup", "ok", me, "", now.Add(-4*time.Hour), now); got != crewWaiting {
+		t.Errorf("crewStateFor(awaiting_followup, quiet for 4h) = %s, want %s — a run parked for the user's follow-up is waiting, not idle", got, crewWaiting)
+	}
+	for _, health := range []string{"stalled", "slow", "looping"} {
+		if got := crewStateFor("awaiting_followup", health, me, me, now.Add(-4*time.Hour), now); got != crewWaiting {
+			t.Errorf("crewStateFor(awaiting_followup, health=%q, active speaker) = %s, want %s — a stale health flag frozen at park time must not make a follow-up park read stalled",
+				health, got, crewWaiting)
+		}
+	}
+	// The park is NOT terminal — the inverse property, which would break `uzi run logs
+	// --follow` on an interactive task if it regressed.
+	if isTerminalRunStatus("awaiting_followup") {
+		t.Error("isTerminalRunStatus(awaiting_followup) = true — the interactive-task park resumes on a follow-up and must not read terminal")
+	}
+}
+
 // TRAP 2: the active lane is computed over `live`, which INCLUDES claimed.
 func TestActiveLaneKeyIncludesClaimed(t *testing.T) {
 	now := time.Now()

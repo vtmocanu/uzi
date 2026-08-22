@@ -96,6 +96,12 @@ export function mrChipTitle(state: MrChipState, forgeType: string): string {
 // An auto-stop is uzi killing a run because it was broken. That is breakage and its
 // owner needs to see it. Listing the members means the NEXT stop_kind added has to
 // make this choice deliberately instead of inheriting it.
+//
+// PRD #517 M4 made that deliberate choice for `stopped`: it is DELIBERATELY EXCLUDED.
+// A graceful run stop lands status="completed" (green success), not a `failed`/
+// `cancelled` run, so it must not render as a calm "stopped by human" pill — and
+// isStoppedRun only ever consults this set for a `failed` run anyway. Excluding it
+// keeps a gracefully-stopped completed run reading as the success it is.
 const HUMAN_STOP_KINDS: ReadonlySet<StopKind> = new Set<StopKind>([
   "cancelled",
   "plan_rejected",
@@ -184,6 +190,9 @@ export function runStatusTone(
   if (status === "planning") return "plan";
   if (status === "awaiting_approval" || status === "awaiting_input")
     return "warning";
+  // PRD #517: an interactive run parked awaiting the owner's next follow-up.
+  // Warn, like the other parks — it is a needs-you state, not a failure.
+  if (status === "awaiting_followup") return "warning";
   // PRD #35: a run parked on the owner's Anthropic usage limit. Warn, like the
   // other "blocked on something outside the run" state — never danger: it has not
   // failed and it resumes by itself.
@@ -378,6 +387,20 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
         tone: "warning",
         pulse: false,
       };
+    // PRD #517: an interactive task run parked awaiting the owner's next follow-up.
+    // Its own copy, deliberately NOT awaiting_input's "needs your answer": this is
+    // not an unanswered question but the run's turn-taking pause — it holds until
+    // the user sends the next follow-up (and, unlike limit_wait, never self-resumes).
+    // Warn-toned like the other parks; static, no countdown.
+    case "awaiting_followup":
+      return {
+        kind: "badge",
+        label: "awaiting follow-up",
+        tone: "warning",
+        pulse: false,
+        title:
+          "Waiting for your next follow-up. Send one to continue the run.",
+      };
     // PRD #35: parked on the owner's Anthropic usage limit. STATIC — no countdown
     // and no elapsed, unlike the running badge above. LatestRun is a deliberately
     // narrow board projection that carries neither retry_not_before nor
@@ -518,9 +541,24 @@ export function isAwaitingInput(status: string): boolean {
   return status === "awaiting_input";
 }
 
+// isAwaitingFollowup is the PRD #517 THIRD sibling, mirroring the deliberate
+// isAwaitingInput split rather than widening it. An interactive task run parked
+// awaiting the user's next follow-up is a distinct "your-turn" state: it does not
+// self-resume (unlike limit_wait) and it is not an unanswered question (unlike
+// awaiting_input), so a surface can tell "send your next follow-up" from "answer my
+// question". What it SHARES with the other parks is the treatment — warn tone, loud
+// card ring, favicon dot — expressed once in needsHumanAttention below.
+export function isAwaitingFollowup(status: string): boolean {
+  return status === "awaiting_followup";
+}
+
 // needsHumanAttention is the union: a run parked on ANY human decision. Use it for
 // presentation that is identical for both (the card ring, the favicon dot); use the two
 // predicates above wherever the WORDING differs, which is anywhere a human reads it.
 export function needsHumanAttention(status: string): boolean {
-  return isAwaitingApproval(status) || isAwaitingInput(status);
+  return (
+    isAwaitingApproval(status) ||
+    isAwaitingInput(status) ||
+    isAwaitingFollowup(status)
+  );
 }

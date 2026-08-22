@@ -1182,6 +1182,12 @@ export type RunStatus =
    *  to the person who owes the run an action. M1 lands the type; the badge, tone and
    *  composer are M2. */
   | "awaiting_input"
+  /** PRD #517: an interactive task run parked awaiting the owner's next
+   *  follow-up. NON-terminal — deliberately absent from TERMINAL_RUN_STATUSES
+   *  below — but unlike limit_wait it does NOT resume on its own; it needs the
+   *  user. Distinct from awaiting_input (a clarification question) because a
+   *  follow-up park is the run's turn-taking pause, not an unanswered question. */
+  | "awaiting_followup"
   /** Parked until the owner's Anthropic usage window reopens (PRD #35).
    *  NON-terminal — deliberately absent from TERMINAL_RUN_STATUSES below. */
   | "limit_wait"
@@ -1207,7 +1213,15 @@ export { TERMINAL_RUN_STATUSES, isTerminalRun } from "./runStatus";
 // This union crosses a JSON decode boundary, so an unlisted member is a silent lie
 // rather than a type error — TypeScript cannot catch a missing value here, only a
 // test can.
-export type StopKind = "cancelled" | "plan_rejected" | "auto_stopped";
+// PRD #517 M4: "stopped" is stamped on a completed interactive run that was
+// gracefully stopped (board.go). It is NOT a human-stopped failure/cancel — the
+// run lands status="completed" (green success) — so it is deliberately NOT in
+// runBadge's HUMAN_STOP_KINDS; see the note there.
+export type StopKind =
+  | "cancelled"
+  | "plan_rejected"
+  | "auto_stopped"
+  | "stopped";
 
 // RunHealth is the server-side run-health flag (PRD #47): a non-terminal,
 // self-clearing signal that a run looks slow, stuck, or looping. "ok" is the

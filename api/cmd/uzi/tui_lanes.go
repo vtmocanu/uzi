@@ -329,7 +329,13 @@ func crewStateFor(runStatus, runHealth, actor, activeActor string, lastActivity,
 	// above — awaiting_input is likewise absent from ListActiveRunsForHealth's
 	// allowlist, so nothing downstream could clear a flag frozen at park time. It is on
 	// this rung rather than in atPlanGate, which is specifically the PLAN gate.
-	if runStatus == "awaiting_approval" || runStatus == "awaiting_input" || runStatus == statusLimitWait || runHealth == "waiting_worker" {
+	//
+	// awaiting_followup (PRD #517) is an interactive task parked awaiting the user's next
+	// follow-up. It is the user's turn and does NOT auto-resume, so it rides the same
+	// waiting rung: a follow-up park routinely outlasts the recency window (it waits on a
+	// human), and reading it as `idle` or `stalled` would both be wrong for the same
+	// reasons the two parks above are.
+	if runStatus == "awaiting_approval" || runStatus == "awaiting_input" || runStatus == "awaiting_followup" || runStatus == statusLimitWait || runHealth == "waiting_worker" {
 		return crewWaiting
 	}
 	if activeActor != "" && actor == activeActor {

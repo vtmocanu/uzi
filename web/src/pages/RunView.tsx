@@ -658,16 +658,29 @@ export function RunView() {
   // worst kind of accessibility bug: the markup looks right". Putting role="status" on
   // the QuestionPanel itself — which mounts with the park — would have been exactly that.
   const [parkAnnounce, setParkAnnounce] = useState("");
-  const parked = run?.status === "awaiting_input" ? (openQuestion?.question.questionId ?? "") : "";
+  // PRD #517: BOTH needs-you parks announce, not just awaiting_input — awaiting_followup is
+  // classified identically by needsHumanAttention and shows the same loud ring, so a
+  // screen-reader user parking into it must get a signal too. A single stable KEY drives
+  // the re-announce logic: awaiting_input keys on the question IDENTITY (a second question
+  // re-announces while a re-render of the same park stays quiet, and an unusable/absent
+  // question does not announce — the UnreadableQuestion branch owns that state), while
+  // awaiting_followup is one stable park. The text is derived from the key in the effect.
+  // NOTE this is PURELY the sr-only announcement; the QuestionPanel below stays
+  // awaiting_input-only.
+  const questionId = run?.status === "awaiting_input" ? (openQuestion?.question.questionId ?? "") : "";
+  const parkKey =
+    questionId !== "" ? `question:${questionId}` : run?.status === "awaiting_followup" ? "followup" : "";
   useEffect(() => {
-    // Keyed on the question IDENTITY, so a second question re-announces while a re-render
-    // of the same park stays quiet.
-    if (parked === "") {
+    if (parkKey === "") {
       setParkAnnounce("");
       return;
     }
-    setParkAnnounce("The agent is asking you a question. The run is parked until you answer.");
-  }, [parked]);
+    setParkAnnounce(
+      parkKey === "followup"
+        ? "The run is waiting for your next follow-up."
+        : "The agent is asking you a question. The run is parked until you answer.",
+    );
+  }, [parkKey]);
 
   if (!run) {
     return (
@@ -803,7 +816,12 @@ export function RunView() {
                   failing from the other side: not a false alarm, a false all-clear.
                   `awaiting_approval` has the same shape and keeps the chip, because a
                   human gate is minutes and someone is expected to be looking; a park
-                  is hours by design, which is what makes it different in kind. */}
+                  is hours by design, which is what makes it different in kind.
+
+                  PRD #517: `awaiting_followup` also KEEPS the chip — it is a needs-you
+                  gate (the user is expected to send the next follow-up), the same kind
+                  as awaiting_input, NOT the self-resuming clock park that limit_wait is.
+                  So only limit_wait is excluded here. */}
               {!terminal && run.status !== "limit_wait" && (
                 <span
                   title={connected ? "Live" : "Reconnecting…"}

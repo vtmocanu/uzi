@@ -78,8 +78,11 @@ describe("runDurationLabel", () => {
     ).toBe("running 5m");
   });
 
-  it("awaiting_approval, awaiting_input, and limit_wait wait off updated_at", () => {
-    for (const status of ["awaiting_approval", "awaiting_input", "limit_wait"]) {
+  it("awaiting_approval, awaiting_input, awaiting_followup, and limit_wait wait off updated_at", () => {
+    // PRD #517: awaiting_followup joins the waiting arm — mutation guard: dropping it
+    // makes runDurationLabel fall to the default "" and this assert reddens (the board
+    // card would then show an empty duration token for a parked interactive run).
+    for (const status of ["awaiting_approval", "awaiting_input", "awaiting_followup", "limit_wait"]) {
       expect(
         runDurationLabel(
           { status, created_at: isoBefore(30), updated_at: isoBefore(7) },

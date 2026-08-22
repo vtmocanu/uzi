@@ -242,6 +242,38 @@ func TestSetStateFailedPlanRejectedStampsPlanRejected(t *testing.T) {
 	}
 }
 
+// TestSetStateFailedStoppedRoutesToCancel (PRD #517 M4 review): a graceful stop stamped
+// stop_kind='stopped' before the report. Its happy path reports `completed`, but on the
+// edge where the worker's finalize (push/MR) throws — or a cancel-then-stop lets the cancel
+// win — the worker reports `failed`. The failed arm must route THAT to CancelRunByWorker
+// (status 'cancelled', fail_origin NULL) exactly like the cancelled arm, NOT to SetRunFailed:
+// so a deliberate wind-down is never labeled fail_origin='agent_failure' and, landing
+// 'cancelled', is excluded from judging by maybeEnqueueJudge's Gate 0.
+//
+// MUTATION PROOF: remove the `case "stopped"` arm and this report falls to the default,
+// calling SetRunFailed with fail_origin='agent_failure' (fs.setFailed set, fs.cancelledByWorker nil).
+func TestSetStateFailedStoppedRoutesToCancel(t *testing.T) {
+	run := runningRun(false)
+	run.StopKind = pgText("stopped")
+	fs, svc, wkr := limitParkFixture(t, run)
+
+	worker := "finalize failed: push rejected"
+	if _, _, err := svc.SetState(context.Background(), wkr, run.ID, StateRequest{
+		State: "failed", FailureReason: &worker,
+	}); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	if fs.cancelledByWorker == nil {
+		t.Fatal("CancelRunByWorker was never called for a stop_kind='stopped' failed report")
+	}
+	if fs.cancelledByWorker.ID != run.ID {
+		t.Fatalf("CancelRunByWorker id = %v, want %v", fs.cancelledByWorker.ID, run.ID)
+	}
+	if fs.setFailed != nil {
+		t.Fatalf("SetRunFailed was called for a stopped stop_kind (should route to cancel, never agent_failure): %+v", fs.setFailed)
+	}
+}
+
 // TestRecoverClaimAssemblyStampsInfraOrigin: the three infra sentinels used to collapse
 // into one indistinguishable failed write; PRD #69 M7a (4) splits them so each stamps
 // its own TRUSTED class through MarkRunFailedByID.

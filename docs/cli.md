@@ -91,6 +91,7 @@ uzi run approve <id> [--agent-source own|repo] [--exclude-agents a,b]
 uzi run reject <id> [--message <text>]
 uzi run revise <id> [--message <text>]
 uzi run cancel <id>
+uzi run stop <id> [--message <text>]
 uzi run follow-up <id> [--message <text>]
 uzi run answer <id> [--message <text> ...]
 uzi run inputs <id> [--json]
@@ -109,7 +110,7 @@ uzi review file <id> <rec> [--repo <repo-id>]
 uzi findings list [--repo <id>] [--bucket to_file|filed|dismissed|all] [--run <id>]
 uzi findings file <finding-id>
 uzi findings dismiss <finding-id> --reason wont-do|not-an-issue
-uzi handoff -m <text> | -f <path> [--base <ref>] [--mr] [--review] [--then-fix] [--repo <id>]
+uzi handoff -m <text> | -f <path> [--base <ref>] [--mr] [--review] [--then-fix] [--interactive] [--repo <id>]
 uzi handoff rm <run-id> | review <run-id>
 uzi token list
 uzi worker list | rm <id> | set-token <worker-id> <label> | set-token <worker-id> --default
@@ -165,6 +166,16 @@ A few worth knowing:
   (`-m`/`--message`, or piped on stdin). Revisions are capped by the run's
   revision limit, and an exhausted limit — or a run that has already finished —
   is a 409 (exit 5).
+- **`run stop <id>`** gracefully winds down an **interactive** task run (one
+  created with `uzi handoff --interactive`; see [Interactive
+  mode](./handoff.md#interactive-mode)) — the current turn
+  finishes, the branch is pushed, an MR opens iff `--mr` was set at handoff,
+  and (via the server's `completed` transition) `--review` fires iff it was
+  requested, then the run lands `completed` with a distinct stop disposition.
+  Unlike `run cancel`, which aborts mid-turn, `stop` never discards in-flight
+  work. An optional `-m`/`--message` (or piped stdin) rides along with the
+  stop. A foreign or unknown run id is exit 4; a run that has already
+  finished is exit 5.
 - **`run answer <id>`** answers the clarifying question a run is parked on
   (`awaiting_input`) — see [Answering a
   question](./run-activity.md#answering-a-question). It reads the open
@@ -455,6 +466,14 @@ A few things worth knowing before you rely on this:
   follow-on fix run auto-applies fixes for them and pushes to the same
   `uzi/task/<id>` branch. Use it when you want the whole loop — task, review,
   fix — without a manual step in between.
+- **`--interactive`** keeps the task alive after `signal_done` instead of
+  finalizing it: the run parks in `awaiting_followup` (session, clone and
+  branch held open) until `uzi run follow-up <id>` wakes it for another turn
+  or `uzi run stop <id>` winds it down. A forgotten park still finalizes on
+  its own after `WORKER_TASK_IDLE_TIMEOUT` (30 minutes by default).
+  `--review`/`--mr` compose at wind-down rather than at each park, and
+  `--interactive --then-fix` is a usage error (exit 2) — see [Interactive
+  mode](./handoff.md#interactive-mode) for the full loop.
 
 Cleaning up:
 
@@ -982,14 +1001,19 @@ readable the same way under `--json`.
 
 ### Run status, and what `--follow` waits for
 
-A run's `status` (on `run get` and `run list`) is one of exactly **nine** values:
+A run's `status` (on `run get` and `run list`) is one of exactly **ten** values:
 `queued`, `claimed`, `running`, `awaiting_approval`, `awaiting_input`,
-`limit_wait`, `completed`, `failed`, `cancelled`. Only the last three are
-**terminal**, and `uzi run logs --follow` returns **only** on those three. The
-three non-terminal parks it will *not* stop at:
+`awaiting_followup`, `limit_wait`, `completed`, `failed`, `cancelled`. Only the
+last three are **terminal**, and `uzi run logs --follow` returns **only** on
+those three. The four non-terminal parks it will *not* stop at:
 
 - `awaiting_approval` — the plan gate;
 - `awaiting_input` — a clarifying question, answered with `run answer`;
+- `awaiting_followup` — an interactive task (`uzi handoff --interactive`)
+  parked after a clean `signal_done`, awaiting your next `run follow-up`; it
+  does **not** auto-resume on its own — wind it down explicitly with `run
+  stop`, or let its worker-side idle timeout finalize it — see [Interactive
+  mode](./handoff.md#interactive-mode);
 - `limit_wait` — parked while an Anthropic usage limit resets, promoted back to
   `queued` once past its `retry_not_before`.
 
@@ -1004,7 +1028,7 @@ A `running` run whose agent is still drafting its plan, pre-approval, reads
 **planning** instead — in the STATUS column of `run list`/`run get`, in the
 TUI board and detail header's status chip, and on `admin runs` — so you can
 tell "still proposing work" apart from "actively implementing" at a glance.
-It's still the same `running` value underneath, not a tenth status.
+It's still the same `running` value underneath, not an eleventh status.
 
 ### Waiting for a state: `uzi run wait`
 
@@ -1012,9 +1036,10 @@ It's still the same `running` value underneath, not a tenth status.
 built-in primitive for driving a gated run headless, replacing the hand-rolled
 `while … run get … sleep` poll loop. With no `--until` it stops on any
 **actionable or terminal** state (`awaiting_approval`, `awaiting_input`,
-`completed`, `failed`, `cancelled`) and waits through the rest
-(`queued`/`claimed`/`running`/`limit_wait`), so a bare `run wait` means "wait for
-the plan gate **or** the end".
+`awaiting_followup`, `completed`, `failed`, `cancelled`) and waits through the
+rest (`queued`/`claimed`/`running`/`limit_wait`), so a bare `run wait` means
+"wait for the plan gate, a clarification, an interactive task's park, **or**
+the end".
 
 - It **exits 0** the moment a target state is reached — including if the run is
   already in one when you call it.
@@ -1026,7 +1051,7 @@ the plan gate **or** the end".
   gate, so a bare wait cannot hang.
 - A single transient `6` (a server blip) is retried, not fatal; a `4` (not
   found) is immediate.
-- `--until <a,b>` overrides the stop set, validated against the nine statuses.
+- `--until <a,b>` overrides the stop set, validated against the ten statuses.
 
 **Narrow the wait after approving.** A run lingers at `awaiting_approval` for a
 beat after a successful `run approve` (the async flip to `running`), so the
