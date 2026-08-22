@@ -56,7 +56,7 @@ func TestContextTone(t *testing.T) {
 func TestContextMeterCell(t *testing.T) {
 	m := tuiTestModel(t, nil, "")
 
-	over := stripANSI(m.contextMeterCell(nil, contextFill{used: 224000, window: 200000, pct: 112}))
+	over := stripANSI(m.contextMeterCell(nil, contextFill{used: 224000, window: 200000, pct: 112}, 13))
 	if !strings.Contains(over, "▰▰▰▰▰▰") {
 		t.Errorf("pct 112 must clamp the bar to full ▰▰▰▰▰▰:\n%q", over)
 	}
@@ -67,7 +67,7 @@ func TestContextMeterCell(t *testing.T) {
 		t.Errorf("meter must NOT carry a used/window token count (no `/`):\n%q", over)
 	}
 
-	partial := stripANSI(m.contextMeterCell(nil, contextFill{used: 124000, window: 200000, pct: 62}))
+	partial := stripANSI(m.contextMeterCell(nil, contextFill{used: 124000, window: 200000, pct: 62}, 13))
 	if !strings.Contains(partial, "62%") {
 		t.Errorf("pct 62 label missing:\n%q", partial)
 	}
@@ -147,7 +147,7 @@ func TestContextMeterCellToneColour(t *testing.T) {
 		// The FILLED run is the tone SGR code immediately followed by a ▰ glyph; asserting the
 		// code sits directly on ▰ (not merely somewhere in the string) pins the colour to the
 		// filled portion, distinct from the faint leading space / empty run / label.
-		raw := m.contextMeterCell(nil, contextFill{used: 1, window: 2, pct: c.pct})
+		raw := m.contextMeterCell(nil, contextFill{used: 1, window: 2, pct: c.pct}, 13)
 		wantFilled := "\x1b[" + c.want + "m▰"
 		if !strings.Contains(raw, wantFilled) {
 			t.Errorf("%s (pct=%v): filled run must carry tone %s directly on ▰:\n%q",
@@ -157,7 +157,7 @@ func TestContextMeterCellToneColour(t *testing.T) {
 
 	// Non-vacuity guard: the cool meter must carry NEITHER the amber NOR the alarm colour, so the
 	// test would fail if contextMeterCell ever painted one fixed accent regardless of pct.
-	cool := m.contextMeterCell(nil, contextFill{used: 1, window: 2, pct: 50})
+	cool := m.contextMeterCell(nil, contextFill{used: 1, window: 2, pct: 50}, 13)
 	if strings.Contains(cool, amberCode) {
 		t.Errorf("cool meter must not carry the amber (molten) colour %s:\n%q", amberCode, cool)
 	}
@@ -269,5 +269,58 @@ func TestDetailLeadContextMeterAsciiSignalSurvives(t *testing.T) {
 		if !strings.Contains(rail, want) {
 			t.Errorf("Ascii-profile rail dropped the context-meter cue %q:\n%s", want, rail)
 		}
+	}
+}
+
+// TestDetailLeadContextMeterFillsRail — the inline lead meter fills the rail to its right edge:
+// the rendered lead row is exactly laneRailWidth (26) visual cols and ends with the right-aligned
+// percent, so the bar lands flush at col 26 rather than the old fixed 6-wide stub.
+func TestDetailLeadContextMeterFillsRail(t *testing.T) {
+	now := time.Now()
+	m := loadDetail(t, "ctx-fill", "ok", []apitypes.MessageDTO{
+		leadCtxMsg(1, 124000, 200000, 62, now),
+	})
+	lead, ok := railLine(t, m, "lead")
+	if !ok {
+		t.Fatal("no lead row in the rail")
+	}
+	if w := visualWidth(lead); w != laneRailWidth {
+		t.Errorf("lead meter row width = %d, want the full laneRailWidth %d:\n%q", w, laneRailWidth, lead)
+	}
+	if !strings.HasSuffix(strings.TrimRight(lead, " "), "62%") {
+		t.Errorf("lead row must end with the right-aligned percent (bar flush at col %d):\n%q", laneRailWidth, lead)
+	}
+}
+
+// TestContextMeterCellShrinksWithPrefix — laneRow derives the meter bar width from the actual
+// row prefix (▸● <role><suffix>): a wider prefix leaves a narrower bar, and the whole row never
+// exceeds laneRailWidth. The lead prefix "lead" (7 cols) yields a 13-wide bar; a longer role +
+// a ·N suffix yields a shorter one, both padded to exactly 26.
+func TestContextMeterCellShrinksWithPrefix(t *testing.T) {
+	m := tuiTestModel(t, nil, "")
+	fill := contextFill{used: 124000, window: 200000, pct: 62}
+
+	firstLine := func(s string) string {
+		return strings.SplitN(stripANSI(s), "\n", 2)[0]
+	}
+	barGlyphs := func(s string) int {
+		return strings.Count(s, "▰") + strings.Count(s, "▱")
+	}
+
+	leadRow := firstLine(m.laneRow(agentLane{Key: laneLead, Role: "lead"}, false, crewIdle, "", fill, true))
+	longRow := firstLine(m.laneRow(agentLane{Key: "orch", Role: "orchestrator"}, false, crewIdle, "·2", fill, true))
+
+	for name, row := range map[string]string{"lead": leadRow, "long": longRow} {
+		if w := visualWidth(row); w != laneRailWidth {
+			t.Errorf("%s row width = %d, want laneRailWidth %d (no overflow):\n%q", name, w, laneRailWidth, row)
+		}
+	}
+	leadBars, longBars := barGlyphs(leadRow), barGlyphs(longRow)
+	if leadBars != 13 {
+		t.Errorf("lead prefix (7 cols) must leave a 13-wide bar, got %d:\n%q", leadBars, leadRow)
+	}
+	if longBars >= leadBars {
+		t.Errorf("a wider prefix must shrink the bar: long=%d not < lead=%d:\n%q\n%q",
+			longBars, leadBars, longRow, leadRow)
 	}
 }

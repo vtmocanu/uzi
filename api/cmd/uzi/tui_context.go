@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"image/color"
 	"math"
 	"strconv"
@@ -83,11 +84,11 @@ func contextTone(pal palette, pct float64) color.Color {
 // carries bg so a selected lead row's meter rides the selection background like the rest of the
 // row; under cool the tone is faintC, so the whole bar reads faint (no accent). No used/window
 // token counts — this is a bare pct meter.
-func (m tuiModel) contextMeterCell(bg color.Color, fill contextFill) string {
+func (m tuiModel) contextMeterCell(bg color.Color, fill contextFill, barW int) string {
 	r := int(math.Round(fill.pct))
-	filled, empty := rateBarParts(r)
+	filled, empty := rateBarParts(r, barW)
 	return paintSeg(m.pal.faintC, bg, false, " ") +
 		paintSeg(contextTone(m.pal, fill.pct), bg, false, filled) +
 		paintSeg(m.pal.faintC, bg, false, empty) +
-		paintSeg(m.pal.faintC, bg, false, " "+strconv.Itoa(r)+"%")
+		paintSeg(m.pal.faintC, bg, false, " "+fmt.Sprintf("%4s", strconv.Itoa(r)+"%"))
 }

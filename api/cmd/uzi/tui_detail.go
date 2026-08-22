@@ -17,6 +17,10 @@ import (
 // laneRailWidth is the left rail's fixed column budget.
 const laneRailWidth = 26
 
+// railRateBarWidth is the full-rail account meter's bar: laneRailWidth minus the
+// "5h " label+space (3) and the " 100%" separator+right-aligned-percent field (5).
+const railRateBarWidth = laneRailWidth - 3 - 5 // 18
+
 // The detail view has two focusable panes (PRD #325 M4). ←/→ (and tab) move focus between
 // them; ↑/↓ act WITHIN the focused pane — between agents on the rail, scrolling the
 // transcript. The zero value is focusRail, so a run opens focused on the crew rail.
@@ -728,7 +732,13 @@ func (m tuiModel) laneRow(l agentLane, selected bool, st crewState, suffix strin
 		line += paintSeg(m.pal.faintC, bg, false, suffix)
 	}
 	if showMeter {
-		line += m.contextMeterCell(bg, fill)
+		// The bar fills whatever the rail has left after the ▸● <role><suffix> prefix,
+		// the meter's own leading space, its separator space, and the 4-col percent (=6).
+		barW := laneRailWidth - visualWidth(line) - 6
+		if barW < 0 {
+			barW = 0
+		}
+		line += m.contextMeterCell(bg, fill, barW)
 	}
 	var sb strings.Builder
 	sb.WriteString(padSeg(line, laneRailWidth, bg) + "\n")
@@ -880,8 +890,8 @@ func (m tuiModel) railRateMeters(usedRows int) string {
 			lines = append(lines, m.pal.faint.Render(m.renderer.Plain(t.Label, laneRailWidth)))
 		}
 		lines = append(lines,
-			m.rateWindowCell("5h", t.Limits.FiveHour),
-			m.rateWindowCell("7d", t.Limits.SevenDay),
+			m.rateWindowCell("5h", t.Limits.FiveHour, railRateBarWidth, 4),
+			m.rateWindowCell("7d", t.Limits.SevenDay, railRateBarWidth, 4),
 		)
 		entry := strings.Join(lines, "\n")
 		rows := len(lines)

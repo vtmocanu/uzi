@@ -126,11 +126,11 @@ func TestBoardRateLimitStripTonePct(t *testing.T) {
 		}
 	}
 	// The danger band's filled run is painted alarm; the ok band's filled run is painted sage.
-	alarmFilled, _ := rateBarParts(88)
+	alarmFilled, _ := rateBarParts(88, rateBarWidth)
 	if frag := paintSeg(m.pal.alarm, nil, false, alarmFilled); !strings.Contains(out, frag) {
 		t.Errorf("danger-band bar (Pct 88) is not painted with m.pal.alarm; want fragment %q in:\n%s", frag, out)
 	}
-	sageFilled, _ := rateBarParts(20)
+	sageFilled, _ := rateBarParts(20, rateBarWidth)
 	if frag := paintSeg(m.pal.sage, nil, false, sageFilled); !strings.Contains(out, frag) {
 		t.Errorf("ok-band bar (Pct 20) is not painted with m.pal.sage; want fragment %q in:\n%s", frag, out)
 	}
@@ -544,5 +544,66 @@ func TestSelectedRateMetersSharedByBoardAndRail(t *testing.T) {
 		if strings.Contains(board, bad) {
 			t.Errorf("board strip drew %q, which selectedRateMeters excluded:\n%s", bad, board)
 		}
+	}
+}
+
+// TestRailRateMetersFullWidth — the full-rail account meters fill the whole laneRailWidth (26):
+// each 5h/7d line is exactly 26 visual cols, its ▰/▱ bar run is exactly railRateBarWidth (18)
+// glyphs, and the server pct is right-aligned so the line ends flush at the rail's right edge
+// (a line for pct 33 ends with "  33%"). This is the wider full-rail meter, distinct from the
+// board strip's fixed 6-wide bar.
+func TestRailRateMetersFullWidth(t *testing.T) {
+	m := railModel(t, []apitypes.TokenRateLimitDTO{
+		okMeter("sec-personal", "personal", true, 33, 61),
+	}, nil)
+	lines := strings.Split(stripANSI(m.renderLaneRail()), "\n")
+
+	for _, tc := range []struct {
+		prefix  string
+		endsPct string
+	}{
+		{"5h ", "  33%"},
+		{"7d ", "  61%"},
+	} {
+		var line string
+		found := false
+		for _, ln := range lines {
+			if strings.HasPrefix(ln, tc.prefix) {
+				line, found = ln, true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("no %q account line in the rail:\n%s", tc.prefix, strings.Join(lines, "\n"))
+		}
+		if w := visualWidth(line); w != laneRailWidth {
+			t.Errorf("%q line width = %d, want the full laneRailWidth %d:\n%q", tc.prefix, w, laneRailWidth, line)
+		}
+		if bars := strings.Count(line, "▰") + strings.Count(line, "▱"); bars != railRateBarWidth {
+			t.Errorf("%q bar run = %d glyphs, want railRateBarWidth %d:\n%q", tc.prefix, bars, railRateBarWidth, line)
+		}
+		if !strings.HasSuffix(line, tc.endsPct) {
+			t.Errorf("%q line must end with the right-aligned percent %q (flush at col %d):\n%q",
+				tc.prefix, tc.endsPct, laneRailWidth, line)
+		}
+	}
+}
+
+// TestBoardRateLimitStripBarStaysSix — parametrizing the meter widths must NOT touch the board's
+// two-up rate strip: a 100%% window there is still exactly rateBarWidth (6) ▰ glyphs, never the
+// rail's 18-wide bar. Guards that rateWindowCell(barW=rateBarWidth, pctW=0) is byte-unchanged.
+func TestBoardRateLimitStripBarStaysSix(t *testing.T) {
+	m := stripModel(t, []apitypes.TokenRateLimitDTO{
+		okMeter("sec-personal", "personal", true, 100, 100),
+	}, nil)
+	out := stripANSI(m.View().Content)
+	if !strings.Contains(out, strings.Repeat("▰", rateBarWidth)) {
+		t.Errorf("board strip 100%% window must render a %d-glyph filled bar:\n%s", rateBarWidth, out)
+	}
+	if strings.Contains(out, strings.Repeat("▰", rateBarWidth+1)) {
+		t.Errorf("board strip must NOT widen its bar beyond rateBarWidth (%d):\n%s", rateBarWidth, out)
+	}
+	if strings.Contains(out, strings.Repeat("▰", railRateBarWidth)) {
+		t.Errorf("board strip must NOT carry the rail's %d-wide bar:\n%s", railRateBarWidth, out)
 	}
 }
