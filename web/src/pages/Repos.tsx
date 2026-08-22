@@ -1292,11 +1292,13 @@ export function Repos() {
                             onChange={(next) => toggleVisibility(syncRepo.id, next)}
                           />
                           <span className="text-sm text-fg">
-                            {syncPublic === null && !syncVisibilityError
-                              ? "Loading visibility…"
-                              : syncPublic === true
-                                ? "Public board"
-                                : "Private board"}
+                            {syncVisibilityError
+                              ? "Visibility unavailable"
+                              : syncPublic === null
+                                ? "Loading visibility…"
+                                : syncPublic === true
+                                  ? "Public board"
+                                  : "Private board"}
                           </span>
                         </div>
                         {syncPublic === true && (
