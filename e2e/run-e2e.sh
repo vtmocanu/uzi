@@ -891,6 +891,14 @@ UZI_WORKER_TOKEN=e2e-placeholder-unused
 EOF
 
 # --- build + bring up the control plane (no worker yet) ----------------------
+# Reclaim leaked artifacts from prior ABORTED e2e runs BEFORE we build, so a
+# previous killed run's leftover project cannot ENOSPC-poison this one's worker.
+# Best-effort and safe by construction (see e2e/reclaim-leaked-e2e.sh): it only
+# ever tears down definitely-dead `uzi-e2e-<pid>` projects, never `uzi`/store-it/
+# custom names, never a live concurrent run. `|| true`: this runs under
+# `set -euo pipefail` and must never fail the run.
+"$ROOT/e2e/reclaim-leaked-e2e.sh" "$PROJECT" || true
+
 say "building images"
 "${COMPOSE[@]}" build >/dev/null
 
