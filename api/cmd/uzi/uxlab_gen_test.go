@@ -287,8 +287,9 @@ const detailRunID = "a1b2c3d4-1111-2222-3333-444444444444"
 func laneMsgs(now time.Time) []apitypes.MessageDTO {
 	return []apitypes.MessageDTO{
 		msgDTO(1, "text", "lead", "", "", "Planning the change. I'll split this into a scheduler tweak and a test, then dispatch a coder and a tester.", now.Add(-4*time.Minute)),
-		// A lead usage frame carrying a molten-ish context reading (pct 62) so the crew rail's
-		// lead row exercises the inline context-window meter (#565) in the regenerated scenes.
+		// A lead usage frame carrying a cool/quiet context reading (pct 62, below the 70 molten
+		// cutoff) so it renders un-accented (faint) — matching the issue's mock, which shows 62%.
+		// This exercises the crew rail's inline context-window meter (#565) in the regenerated scenes.
 		leadCtxMsg(5, 124000, 200000, 62, now.Add(-30*time.Second)),
 		msgDTO(2, "tool_use", "coder", "toolu_01aaaaaa3v6ptu", "scheduler headroom", "`Edit`", now.Add(-90*time.Second)),
 		msgDTO(3, "text", "coder", "toolu_01aaaaaa3v6ptu", "scheduler headroom", "Adjusted `pollInterval` to back off when the usage window is within 10% of the cap. Running the unit tests now.", now.Add(-40*time.Second)),

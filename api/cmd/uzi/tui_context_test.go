@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -104,6 +105,64 @@ func TestLeadContextFillGuards(t *testing.T) {
 	}
 	if fill.pct != 50 {
 		t.Errorf("newest-VALID wins: want pct 50, got %v", fill.pct)
+	}
+}
+
+// sgrTruecolor pulls the `38;2;r;g;b` foreground triplet out of a reference render (e.g. a
+// paintSeg span) so an expected colour is DERIVED from the live palette at runtime, not hardcoded
+// as hex — this keeps the assertion immune to theme/hex drift.
+var sgrTruecolor = regexp.MustCompile(`38;2;[0-9]+;[0-9]+;[0-9]+`)
+
+func toneCode(t *testing.T, c interface{ RGBA() (r, g, b, a uint32) }) string {
+	t.Helper()
+	ref := paintSeg(c, nil, false, "▰")
+	code := sgrTruecolor.FindString(ref)
+	if code == "" {
+		t.Fatalf("no 38;2;r;g;b triplet in reference render %q", ref)
+	}
+	return code
+}
+
+// TestContextMeterCellToneColour — the render-level twin of TestContextTone (AC3): verify that
+// contextMeterCell actually APPLIES the tone to the FILLED run in the raw SGR output, so the
+// tone→colour mapping is gated through the render path and not just the pure function. Expected
+// colours are derived from m.pal at runtime (via a paintSeg reference) rather than hardcoded hex.
+func TestContextMeterCellToneColour(t *testing.T) {
+	m := tuiTestModel(t, nil, "")
+
+	alarmCode := toneCode(t, m.pal.alarm)
+	amberCode := toneCode(t, m.pal.amber)
+	faintCode := toneCode(t, m.pal.faintC)
+
+	cases := []struct {
+		name string
+		pct  float64
+		want string // the SGR triplet the FILLED run must carry
+	}{
+		{"near", 98, alarmCode},
+		{"molten", 80, amberCode},
+		{"cool", 50, faintCode},
+	}
+	for _, c := range cases {
+		// The FILLED run is the tone SGR code immediately followed by a ▰ glyph; asserting the
+		// code sits directly on ▰ (not merely somewhere in the string) pins the colour to the
+		// filled portion, distinct from the faint leading space / empty run / label.
+		raw := m.contextMeterCell(nil, contextFill{used: 1, window: 2, pct: c.pct})
+		wantFilled := "\x1b[" + c.want + "m▰"
+		if !strings.Contains(raw, wantFilled) {
+			t.Errorf("%s (pct=%v): filled run must carry tone %s directly on ▰:\n%q",
+				c.name, c.pct, c.want, raw)
+		}
+	}
+
+	// Non-vacuity guard: the cool meter must carry NEITHER the amber NOR the alarm colour, so the
+	// test would fail if contextMeterCell ever painted one fixed accent regardless of pct.
+	cool := m.contextMeterCell(nil, contextFill{used: 1, window: 2, pct: 50})
+	if strings.Contains(cool, amberCode) {
+		t.Errorf("cool meter must not carry the amber (molten) colour %s:\n%q", amberCode, cool)
+	}
+	if strings.Contains(cool, alarmCode) {
+		t.Errorf("cool meter must not carry the alarm (near) colour %s:\n%q", alarmCode, cool)
 	}
 }
 
