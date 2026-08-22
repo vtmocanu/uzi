@@ -67,7 +67,10 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 157 as of this commit (PRD #576 M3 added POST
+// 158 as of this commit (PRD #576 M6 added POST
+// /api/repos/{id}/github-project-sync/autocreate-columns — create a fresh uzi-owned
+// Status field on an adopted board so skipped columns become synced ones).
+// It was 157 until then (PRD #576 M3 added POST
 // /api/repos/{id}/github-project-sync/resync — re-seed an already-linked board to pick
 // up newly-added Status options).
 // It was 156 until then (PRD #576 M1 added GET
@@ -378,6 +381,9 @@ var wantRouteMounts = []routeMount{
 	// PRD #576 M3 Resync: re-seed an already-linked board; infrequent manual action in
 	// the same owner-or-admin write group → noLimiter.
 	{"POST", "/api/repos/{id}/github-project-sync/resync", noLimiter},
+	// PRD #576 M6 auto-create columns: create a fresh uzi-owned Status field on the
+	// adopted board; infrequent manual action in the same owner-or-admin write group → noLimiter.
+	{"POST", "/api/repos/{id}/github-project-sync/autocreate-columns", noLimiter},
 	// PRD #557 board-access grant (Reader): same owner-or-admin write group → noLimiter.
 	{"POST", "/api/repos/{id}/github-project-sync/collaborators", noLimiter},
 	{"POST", "/api/repos/{id}/issues", limForge},

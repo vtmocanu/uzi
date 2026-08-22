@@ -186,6 +186,11 @@ type ProjectSyncer interface {
 	// the unmatched set. Needs no owner_kind/project_number (uses the stored node id).
 	// Returns ErrProjectSyncNotLinked when the repo has no link (the handler → 404).
 	Resync(ctx context.Context, repoID uuid.UUID) (string, error)
+	// AutoCreateColumns creates a FRESH uzi-owned Status field on an adopted board
+	// carrying all the repo's columns and switches the link to it (PRD #576 M6),
+	// turning skipped columns into synced ones with no destructive field replace.
+	// Returns ErrProjectSyncNotLinked when the repo has no link (the handler → 404).
+	AutoCreateColumns(ctx context.Context, repoID uuid.UUID) (string, error)
 }
 
 // SetProjectSync wires the GitHub Projects v2 provisioning service in after
@@ -1098,6 +1103,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// options (PRD #576 M3). Same owner-or-admin group; the CLI move to
 				// RequireUser is M7's job, not now.
 				r.Post("/{id}/github-project-sync/resync", h.ResyncGithubProjectSync)
+				// Safe column auto-create (PRD #576 M6): create a fresh uzi-owned
+				// Status field with all the repo's columns and switch the link to it,
+				// turning skipped columns into synced ones with no destructive replace.
+				// Same owner-or-admin write group → noLimiter.
+				r.Post("/{id}/github-project-sync/autocreate-columns", h.AutoCreateGithubProjectColumns)
 				r.Delete("/{id}/github-project-sync", h.DisableGithubProjectSync)
 				// Board access controls (PRD #557): read/flip the board's visibility, and
 				// grant/revoke Reader access by username. Same owner-or-admin preflight +

@@ -140,6 +140,47 @@ func (h *Handler) ResyncGithubProjectSync(w http.ResponseWriter, r *http.Request
 	httpx.JSON(w, http.StatusOK, map[string]any{"status": "resynced"})
 }
 
+// AutoCreateGithubProjectColumns is the safe column auto-create write (PRD #576 M6):
+// create a FRESH uzi-owned single-select field on the adopted board carrying all of the
+// repo's board columns, switch the link to it, and re-seed — turning skipped columns into
+// synced ones with no manual GitHub edit and no destructive field replace. Same
+// owner-or-admin, path-scoped shape and nil-guard as the sibling routes; it needs NO body
+// (the coordinates come from the stored link). A repo with no link row maps to 404 ("not
+// linked") via the not-linked sentinel. Success is 200 {"status":"columns_created"}.
+func (h *Handler) AutoCreateGithubProjectColumns(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
+		return
+	}
+	if !user.IsAdmin {
+		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				httpx.Error(w, http.StatusNotFound, "repo not found")
+				return
+			}
+			slog.Error("github project sync: owner preflight", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+	if h.projectSync == nil {
+		slog.Error("github project sync autocreate-columns: service not wired")
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if _, err := h.projectSync.AutoCreateColumns(r.Context(), id); err != nil {
+		writeProjectSyncError(w, "autocreate-columns", err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"status": "columns_created"})
+}
+
 // provisionGithubProjectSyncRequest is the POST body for the autonomous-provision
 // route (PRD #364 M4): owner_kind selects the GraphQL owner root the new project is
 // created under (defaults to "user"), and title optionally names the created board

@@ -111,6 +111,15 @@ SELECT * FROM github_project_items
 WHERE repo_id = sqlc.arg('repo_id')
 ORDER BY forge_issue_iid ASC;
 
+-- name: ResetGithubProjectItemMarkers :exec
+-- Clear every tracked item's status marker for a repo (PRD #576 M6). Used when the
+-- link's status_field_id is switched to a freshly-created field: the new field reads
+-- EMPTY for every item, so the stored markers (old field's option ids) must be reset
+-- to NULL atomically with the switch — else the next reverse tick sees live("") !=
+-- marker(old id) for every issue and fires the mass-clear cascade (F-H/R1).
+UPDATE github_project_items SET last_status_option_id = NULL, last_synced_at = now()
+WHERE repo_id = sqlc.arg('repo_id');
+
 -- name: SetGithubProjectItemStatusMarker :exec
 -- After a successful Status write, advance just the diff marker (and stamp the
 -- sync time) without touching item_node_id.

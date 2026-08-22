@@ -2894,6 +2894,16 @@ const realApi = {
       "POST",
       `/repos/${id}/github-project-sync/resync`,
     ),
+  // Safe column auto-create (PRD #576 M6): create a FRESH uzi-owned "uzi Status"
+  // field on the adopted board carrying ALL the repo's columns and switch the link to
+  // it, turning skipped columns into synced ones with no manual GitHub edit and no
+  // destructive field replace. Needs no body. 200 { status: "columns_created" }; 404
+  // when the repo has no link. Tradeoff: the board then carries two status-like fields.
+  autocreateProjectSyncColumns: (id: string) =>
+    request<{ status: string }>(
+      "POST",
+      `/repos/${id}/github-project-sync/autocreate-columns`,
+    ),
   // Unlink the repo from its project (204, empty body). Idempotent server-side.
   disableProjectSync: (id: string) =>
     request<null>("DELETE", `/repos/${id}/github-project-sync`),

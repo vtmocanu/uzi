@@ -241,6 +241,37 @@ func TestGithubProjectSyncLiveDB(t *testing.T) {
 		t.Errorf("SetGithubProjectItemStatusMarker must not touch item_node_id, got %q", one.ItemNodeID)
 	}
 
+	// --- reset all item markers (PRD #576 M6) ------------------------------
+	// Give 102 a non-NULL marker too, then reset the whole repo's markers to NULL in one
+	// query (the atomic marker reset AutoCreateColumns runs when it switches to a fresh
+	// field) and confirm EVERY tracked item's last_status_option_id is NULL afterward,
+	// while the item rows themselves (item_node_id) survive.
+	if err := q.SetGithubProjectItemStatusMarker(ctx, store.SetGithubProjectItemStatusMarkerParams{
+		RepoID:             repoID,
+		ForgeIssueIid:      102,
+		LastStatusOptionID: pgtype.Text{String: "opt_todo", Valid: true},
+	}); err != nil {
+		t.Fatalf("SetGithubProjectItemStatusMarker 102: %v", err)
+	}
+	if err := q.ResetGithubProjectItemMarkers(ctx, repoID); err != nil {
+		t.Fatalf("ResetGithubProjectItemMarkers: %v", err)
+	}
+	reset, err := q.ListGithubProjectItems(ctx, repoID)
+	if err != nil {
+		t.Fatalf("ListGithubProjectItems after reset: %v", err)
+	}
+	if len(reset) != 2 {
+		t.Fatalf("reset must keep both item rows, got %d", len(reset))
+	}
+	for _, it := range reset {
+		if it.LastStatusOptionID.Valid {
+			t.Errorf("item %d marker must be NULL after reset, got %+v", it.ForgeIssueIid, it.LastStatusOptionID)
+		}
+		if it.ItemNodeID == "" {
+			t.Errorf("reset must not clear item_node_id for item %d", it.ForgeIssueIid)
+		}
+	}
+
 	// --- item delete -------------------------------------------------------
 	if err := q.DeleteGithubProjectItem(ctx, store.DeleteGithubProjectItemParams{RepoID: repoID, ForgeIssueIid: 101}); err != nil {
 		t.Fatalf("DeleteGithubProjectItem: %v", err)

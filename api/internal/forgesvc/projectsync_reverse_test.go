@@ -2,6 +2,7 @@ package forgesvc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strconv"
 	"testing"
@@ -917,3 +918,205 @@ func TestReverseSyncCapBelowThresholdAndGate(t *testing.T) {
 
 // itemNode builds a deterministic item node id for issue iid in the cap fixtures.
 func itemNode(iid int64) string { return "item" + strconv.FormatInt(iid, 10) }
+
+// --- safe column auto-create (PRD #576 M6) ----------------------------------
+
+// autocreateSyncer builds a ProjectBoardSyncer fake for AutoCreateColumns: it resolves a
+// slug, creates a fresh field returning the given created options, and reads the given
+// live statuses back (all empty for a fresh field).
+func autocreateSyncer(fieldID string, createdOptions []forge.ProjectV2Option, live ...forge.ProjectV2ItemStatus) *fakeProjectSyncer {
+	return &fakeProjectSyncer{
+		fakeForge:   &fakeForge{},
+		scopes:      []string{"repo", "project"},
+		slugOwner:   "acme",
+		slugRepo:    "widgets",
+		createField: forge.ProjectV2StatusField{ID: fieldID, Name: "uzi Status", Options: createdOptions},
+		live:        live,
+	}
+}
+
+// adoptedLink is the stored link an AutoCreateColumns test starts from: an ADOPTED board
+// (owned_by_uzi=false) on the built-in "Status" field whose options omit some columns.
+func adoptedLink(t *testing.T, columnOption map[string]string) store.GithubProjectLink {
+	l := forwardLink(t, columnOption)
+	l.OwnedByUzi = false
+	l.ProjectNumber = 42
+	return l
+}
+
+// (M6 SC a) Fresh-field creation includes EVERY uzi column as an option, and the switch
+// points the link at the new field with an empty unmatched set. Proves auto-create turns
+// every skipped column into a synced one via CreateProjectV2Field (F-E), no destructive
+// full-list option replace.
+func TestAutoCreateColumnsCreatesFreshFieldWithEveryColumn(t *testing.T) {
+	repoID := uuid.New()
+	// The board has three columns; the adopted "Status" field only matched "In Progress",
+	// so "Planned" and "Human Review" were skipped.
+	columns := []store.BoardColumn{
+		{LabelName: "In Progress", Position: 1},
+		{LabelName: "Planned", Position: 2},
+		{LabelName: "Human Review", Position: 3},
+	}
+	createdOptions := []forge.ProjectV2Option{
+		{ID: "n_ip", Name: "In Progress"},
+		{ID: "n_pl", Name: "Planned"},
+		{ID: "n_hr", Name: "Human Review"},
+	}
+	syncer := autocreateSyncer("PVTSSF_NEW", createdOptions)
+	st := &fakeProjectStore{
+		repo:    githubRepoRow(repoID),
+		link:    adoptedLink(t, map[string]string{"In Progress": "opt_ip"}), // only one matched
+		columns: columns,
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.background = syncBackground // run the async re-seed in-line, deterministically
+
+	note, err := svc.AutoCreateColumns(context.Background(), repoID)
+	if err != nil {
+		t.Fatalf("AutoCreateColumns: %v", err)
+	}
+	if note == "" {
+		t.Errorf("want a non-empty note describing the created columns")
+	}
+
+	// The fresh field was created ON THE EXISTING project with EXACTLY every board column,
+	// in order, each with a valid color.
+	if len(syncer.createFieldCalls) != 1 {
+		t.Fatalf("want 1 CreateProjectV2Field call, got %d", len(syncer.createFieldCalls))
+	}
+	cf := syncer.createFieldCalls[0]
+	if cf.name != "uzi Status" {
+		t.Errorf("field name = %q, want \"uzi Status\"", cf.name)
+	}
+	wantNames := []string{"In Progress", "Planned", "Human Review"}
+	if len(cf.options) != len(wantNames) {
+		t.Fatalf("created options = %+v, want exactly the %d board columns", cf.options, len(wantNames))
+	}
+	for i, want := range wantNames {
+		if cf.options[i].Name != want {
+			t.Errorf("option[%d].Name = %q, want %q", i, cf.options[i].Name, want)
+		}
+		if !validGithubColors[cf.options[i].Color] {
+			t.Errorf("option %q has invalid color %q", cf.options[i].Name, cf.options[i].Color)
+		}
+	}
+
+	// The link was switched to the new field id, its option map built from the CREATED
+	// option ids, unmatched now empty, and owned_by_uzi PRESERVED (adopted → still false).
+	if len(st.links) != 1 {
+		t.Fatalf("want 1 link upsert, got %d", len(st.links))
+	}
+	link := st.links[0]
+	if link.StatusFieldID != "PVTSSF_NEW" {
+		t.Errorf("status_field_id = %q, want the freshly created field PVTSSF_NEW", link.StatusFieldID)
+	}
+	if len(link.UnmatchedColumns) != 0 {
+		t.Errorf("unmatched_columns must be empty after auto-create, got %v", link.UnmatchedColumns)
+	}
+	if link.OwnedByUzi {
+		t.Errorf("owned_by_uzi must be PRESERVED false for an adopted board (uzi owns the field, not the project)")
+	}
+	var gotMap map[string]string
+	if err := json.Unmarshal(link.StatusOptions, &gotMap); err != nil {
+		t.Fatalf("status_options not valid json: %v", err)
+	}
+	if gotMap["In Progress"] != "n_ip" || gotMap["Planned"] != "n_pl" || gotMap["Human Review"] != "n_hr" {
+		t.Errorf("column->option map = %v, want the created option ids", gotMap)
+	}
+	// The reset ran (F-H marker reset) exactly once.
+	if st.resetMarkerCalls != 1 {
+		t.Errorf("want ResetGithubProjectItemMarkers called once, got %d", st.resetMarkerCalls)
+	}
+}
+
+// (M6 SC b) After the switch, a reverse tick fires ZERO AutoMove — and the marker RESET,
+// NOT the M5 cap, is what prevents it. This is the subtle isolation the PRD demands:
+//
+// M5's per-tick destructive-write cap would ALSO abort a mass cascade, so to prove the
+// RESET independently prevents it, the M5 cap is DISABLED in BOTH arms (reverseCapK huge,
+// reverseCapPct 100). Then:
+//   - reset PRESENT  → the reverse tick reads live("") == marker(NULL) for every item →
+//     zero AutoMove (the reset is load-bearing).
+//   - reset OMITTED  → markers keep the old field's ids → live("") != marker(old id) for
+//     every item → mass AutoMove(target="") (the F-F cascade fires).
+//
+// If the cap were left ENABLED, the "omit reset" arm would ALSO show zero (the cap aborts
+// it) and the test would prove nothing — the cap-disabled pair is what makes the reset's
+// role non-vacuous. A simulated mis-echo here can only exercise the reverse-READ guard
+// (M5's input), not a real field-update round trip, because the write path is fresh-create
+// only (D3).
+func TestAutoCreateColumnsResetPreventsReverseCascade(t *testing.T) {
+	const n = 5
+
+	// newFixture builds a store whose 5 items sit in "In Progress" with the OLD field's
+	// option id as their marker, whose live statuses are all "" (the fresh field reads
+	// empty), and the syncer/mover to drive it. skipReset toggles the marker reset off.
+	newFixture := func(repoID uuid.UUID, skipReset bool) (*fakeProjectSyncer, *fakeMover, *fakeProjectStore) {
+		var live []forge.ProjectV2ItemStatus
+		var issues []store.Issue
+		var items []store.GithubProjectItem
+		for i := int64(1); i <= n; i++ {
+			live = append(live, forge.ProjectV2ItemStatus{ItemID: itemNode(i), IssueNumber: i, OptionID: ""})
+			issues = append(issues, store.Issue{ForgeIssueIid: i, State: "opened", Labels: labelsJSON(t, "In Progress")})
+			items = append(items, projectItem(repoID, i, itemNode(i), "opt_ip")) // OLD field's option id
+		}
+		syncer := autocreateSyncer("PVTSSF_NEW", []forge.ProjectV2Option{{ID: "n_ip", Name: "In Progress"}}, live...)
+		st := &fakeProjectStore{
+			repo:            githubRepoRow(repoID),
+			link:            adoptedLink(t, map[string]string{"In Progress": "opt_ip"}),
+			columns:         []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+			issues:          issues,
+			existingItems:   items,
+			skipMarkerReset: skipReset,
+		}
+		return syncer, &fakeMover{}, st
+	}
+
+	t.Run("reset present: cap DISABLED, still zero AutoMove", func(t *testing.T) {
+		repoID := uuid.New()
+		syncer, mover, st := newFixture(repoID, false)
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		svc.background = syncBackground
+		svc.SetMover(mover)
+		// Disable the M5 cap in BOTH arms so the reset alone is the discriminator.
+		svc.reverseCapK = 1 << 30
+		svc.reverseCapPct = 100
+
+		if _, err := svc.AutoCreateColumns(context.Background(), repoID); err != nil {
+			t.Fatalf("AutoCreateColumns: %v", err)
+		}
+		mover.calls = nil // ignore anything the re-seed did; assert only the reverse tick
+		if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+			t.Fatalf("ReverseSync: %v", err)
+		}
+		if len(mover.calls) != 0 {
+			t.Fatalf("reset present must yield ZERO AutoMove even with the cap disabled, got %v", mover.calls)
+		}
+	})
+
+	t.Run("reset OMITTED: cap DISABLED, mass AutoMove(target=\"\") — the cascade", func(t *testing.T) {
+		repoID := uuid.New()
+		syncer, mover, st := newFixture(repoID, true) // reset is a no-op → markers keep old ids
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		svc.background = syncBackground
+		svc.SetMover(mover)
+		svc.reverseCapK = 1 << 30
+		svc.reverseCapPct = 100
+
+		if _, err := svc.AutoCreateColumns(context.Background(), repoID); err != nil {
+			t.Fatalf("AutoCreateColumns: %v", err)
+		}
+		mover.calls = nil
+		if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+			t.Fatalf("ReverseSync: %v", err)
+		}
+		if len(mover.calls) != n {
+			t.Fatalf("reset omitted must fire the mass cascade of %d AutoMove, got %d: %v", n, len(mover.calls), mover.calls)
+		}
+		for _, c := range mover.calls {
+			if c.target != "" {
+				t.Errorf("cascade move must clear to Open (target \"\"), got %v", c)
+			}
+		}
+	})
+}

@@ -108,6 +108,12 @@ type ProjectSyncStore interface {
 	GetGithubProjectLinkByRepo(ctx context.Context, repoID uuid.UUID) (store.GithubProjectLink, error)
 	GetGithubProjectItem(ctx context.Context, arg store.GetGithubProjectItemParams) (store.GithubProjectItem, error)
 	SetGithubProjectItemStatusMarker(ctx context.Context, arg store.SetGithubProjectItemStatusMarkerParams) error
+	// ResetGithubProjectItemMarkers (PRD #576 M6) clears EVERY tracked item's status
+	// marker (→ NULL) for a repo. AutoCreateColumns calls it atomically with a
+	// status_field_id switch to a freshly-created field: the new field reads "" for
+	// every item, so leaving old-field markers in place would make the next reverse tick
+	// see live("") != marker(old id) for all issues and fire the F-F mass-clear cascade.
+	ResetGithubProjectItemMarkers(ctx context.Context, repoID uuid.UUID) error
 	// TouchGithubProjectLinkSynced (M7) bumps last_synced_at on a completed reverse
 	// pass WITHOUT touching last_error — a clean read records "we synced" without
 	// clobbering a still-relevant forward-write error.
@@ -701,6 +707,143 @@ func (s *ProjectSyncService) resyncPrepare(ctx context.Context, repo store.GetRe
 		return seedParams{}, "", err
 	}
 	return sp, unmatchedNote(unmatched), nil
+}
+
+// AutoCreateColumns is the M6 safe column auto-create (PRD #576): it turns a repo's
+// SKIPPED (unmatched) board columns into synced ones WITHOUT any destructive GitHub
+// mutation and without ever risking existing item labels. It creates a FRESH uzi-owned
+// single-select field (F-E — a new field has no item values, nothing to clear) on the
+// EXISTING adopted board and switches the link's status_field_id to it. It never touches
+// the destructive full-list option-replace path (F-B replace, D3): that GraphQL mutation
+// does not exist in this codebase and is deliberately not built.
+//
+// For an ORG repo the equivalent is just Provision (uzi's own fresh field), already
+// built; this method is the ADOPT (user-repo) path — it makes uzi own the FIELD, not
+// the PROJECT, so an adopted board stays owned_by_uzi=false and teardown never deletes
+// the user's board.
+//
+// 🔴 Atomic field switch + marker reset (F-H / R1). A fresh field reads EMPTY for every
+// item; if status_field_id is switched while item markers still hold the OLD field's
+// option ids, the very next reverse tick sees live("") != marker(old id) for EVERY issue
+// and fires the F-F mass-clear cascade (strips every board-column label off the real
+// forge issues). So the switch MUST both (a) reset all item markers to "" AND (b) pause
+// reverse sync across it (reuse M4's seeding lease) — defense in depth. The ordering
+// below closes the reverse race:
+//
+//  1. MarkGithubProjectLinkSeeding — take the reverse-suppression lease BEFORE the switch
+//     is visible (launchSeed re-marks it; the mark is idempotent).
+//  2. ResetGithubProjectItemMarkers — old-field markers → NULL, so a reverse tick that
+//     somehow ran would read live("") == marker(NULL→"") = no-op, not a cascade.
+//  3. UpsertGithubProjectLink — switch status_field_id to the new field; the unmatched
+//     set is now empty (every column matched by construction); owned_by_uzi is PRESERVED.
+//  4. launchSeed — re-seed every open issue's Status on the NEW field (async), advancing
+//     markers; its finalize clears the lease + last_error.
+//
+// Crash-safety: because markers were reset to NULL and the new field reads "" for every
+// item, even a crash mid-reseed converges safely — an unseeded item has
+// live("") == marker(NULL→"") = no-op, and the lease ages out (M4, seedSuppressLease).
+// No cascade either way.
+//
+// A repo with no link row returns ErrProjectSyncNotLinked (→ 404). It deliberately does
+// NOT reuse prepareSeedLink: that resolves the field BY NAME, and the built-in "Status"
+// still exists, so it would re-resolve the WRONG (old) field. AutoCreateColumns uses the
+// freshly created field directly.
+func (s *ProjectSyncService) AutoCreateColumns(ctx context.Context, repoID uuid.UUID) (string, error) {
+	link, err := s.store.GetGithubProjectLinkByRepo(ctx, repoID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrProjectSyncNotLinked
+		}
+		return "", fmt.Errorf("project sync: autocreate load link: %w", err)
+	}
+
+	repo, syncer, err := s.projectSyncPreamble(ctx, repoID)
+	if err != nil {
+		return "", err
+	}
+
+	owner, name, err := syncer.RepoSlug(ctx, repo.ForgeProjectID)
+	if err != nil {
+		return "", fmt.Errorf("project sync: resolve repo slug: %w", err)
+	}
+
+	// Build the new field's options from ALL board columns (mirror provisionPrepare):
+	// every column becomes an option, so nothing is skipped after the switch.
+	columns, err := s.store.ListBoardColumns(ctx, repo.ID)
+	if err != nil {
+		return "", fmt.Errorf("project sync: list board columns: %w", err)
+	}
+	newOptions := make([]forge.ProjectV2NewOption, 0, len(columns))
+	for i, c := range columns {
+		newOptions = append(newOptions, forge.ProjectV2NewOption{
+			Name:  c.LabelName,
+			Color: provisionColor(i),
+		})
+	}
+
+	// Fresh uzi-owned field on the EXISTING adopted project (link.ProjectNodeID) — NOT a
+	// new project. F-E: a fresh field has no item values, so setting its options is safe.
+	field, err := syncer.CreateProjectV2Field(ctx, link.ProjectNodeID, uziStatusFieldName, newOptions)
+	if err != nil {
+		return "", fmt.Errorf("project sync: create status field: %w", err)
+	}
+
+	// Build the column→option map + position from the CREATED field's option ids. Every
+	// column matches by construction (we created the options from the columns), so the
+	// unmatched set is now empty.
+	optionByName := make(map[string]string, len(field.Options))
+	for _, o := range field.Options {
+		optionByName[o.Name] = o.ID
+	}
+	columnOption := make(map[string]string, len(columns))
+	position := make(map[string]int, len(columns))
+	for _, c := range columns {
+		position[c.LabelName] = int(c.Position)
+		if optID, ok := optionByName[c.LabelName]; ok {
+			columnOption[c.LabelName] = optID
+		}
+	}
+	optionsJSON, err := json.Marshal(columnOption)
+	if err != nil {
+		return "", fmt.Errorf("project sync: marshal status options: %w", err)
+	}
+
+	// --- Atomic field switch under the seeding lease (F-H / R1), ordering as documented. ---
+	// 1. Pause reverse BEFORE the switch is visible. launchSeed re-marks; Mark is idempotent.
+	if err := s.store.MarkGithubProjectLinkSeeding(ctx, repoID); err != nil {
+		s.log.Warn("project sync: autocreate mark seeding lease", "repo", repoID, "error", err)
+	}
+	// 2. Old-field markers → NULL, so no item reads as live("") != marker(old id).
+	if err := s.store.ResetGithubProjectItemMarkers(ctx, repoID); err != nil {
+		return "", fmt.Errorf("project sync: reset item markers: %w", err)
+	}
+	// 3. Switch status_field_id to the fresh field; unmatched now empty; PRESERVE
+	//    owned_by_uzi — auto-create makes uzi own the FIELD, not the adopted PROJECT.
+	if _, err := s.store.UpsertGithubProjectLink(ctx, store.UpsertGithubProjectLinkParams{
+		RepoID:           repo.ID,
+		ProjectNodeID:    link.ProjectNodeID,
+		ProjectNumber:    link.ProjectNumber,
+		StatusFieldID:    field.ID,
+		StatusOptions:    optionsJSON,
+		OwnedByUzi:       link.OwnedByUzi,
+		UnmatchedColumns: []string{},
+	}); err != nil {
+		return "", fmt.Errorf("project sync: persist link: %w", err)
+	}
+	// 4. Re-seed every open issue's Status on the NEW field (async); finalize clears the
+	//    lease + last_error. Uses the freshly created field directly, not prepareSeedLink.
+	s.launchSeed(ctx, repoID, seedParams{
+		repo:         repo,
+		syncer:       syncer,
+		owner:        owner,
+		name:         name,
+		projectID:    link.ProjectNodeID,
+		fieldID:      field.ID,
+		columnOption: columnOption,
+		position:     position,
+	})
+
+	return fmt.Sprintf("created %d column(s) as a new %q field", len(columns), uziStatusFieldName), nil
 }
 
 // seedItems reads the project's live item Statuses once, then for each OPEN cached

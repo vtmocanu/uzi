@@ -295,6 +295,14 @@ type fakeProjectStore struct {
 	// so a seed-time hook can observe "seeding set" and a post-Adopt assertion can see it
 	// cleared.
 	seeding map[uuid.UUID]pgtype.Timestamptz
+
+	// Marker reset (PRD #576 M6): ResetGithubProjectItemMarkers simulates the real UPDATE
+	// by nulling every existingItems marker, so a same-flow reverse tick reads
+	// live("") == marker(NULL) → no-op. resetMarkerCalls counts the calls; skipMarkerReset
+	// makes the reset a NO-OP (markers keep the old field's ids) — the mutation control the
+	// M6 test uses to prove the reset, not the M5 cap, is what prevents the cascade.
+	resetMarkerCalls int
+	skipMarkerReset  bool
 }
 
 func (s *fakeProjectStore) GetRepoByID(context.Context, uuid.UUID) (store.GetRepoByIDRow, error) {
@@ -348,6 +356,16 @@ func (s *fakeProjectStore) SetGithubProjectItemStatusMarker(_ context.Context, a
 }
 func (s *fakeProjectStore) TouchGithubProjectLinkSynced(context.Context, uuid.UUID) error {
 	s.touchCalls++
+	return nil
+}
+func (s *fakeProjectStore) ResetGithubProjectItemMarkers(_ context.Context, _ uuid.UUID) error {
+	s.resetMarkerCalls++
+	if s.skipMarkerReset {
+		return nil // mutation control: old-field markers stay in place.
+	}
+	for i := range s.existingItems {
+		s.existingItems[i].LastStatusOptionID = pgtype.Text{Valid: false}
+	}
 	return nil
 }
 func (s *fakeProjectStore) MarkGithubProjectLinkSeeding(_ context.Context, repoID uuid.UUID) error {

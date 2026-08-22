@@ -2514,6 +2514,15 @@ export const mockApi = {
       throw new ApiError(404, "this repo has no linked project to resync");
     return delay({ status: "resynced" });
   },
+  // Safe column auto-create (PRD #576 M6): create a fresh uzi-owned field with all the
+  // repo's columns and switch the link to it. In the mock, clear the unmatched set so the
+  // panel reflects "all columns now sync".
+  autocreateProjectSyncColumns: async (id: string) => {
+    const link = githubProjectLinks.get(id);
+    if (!link) throw new ApiError(404, "this repo has no linked project to resync");
+    githubProjectLinks.set(id, { ...link, unmatched_columns: [] });
+    return delay({ status: "columns_created" });
+  },
   // Unlink the repo from its project (empty 204 body).
   disableProjectSync: async (id: string) => {
     githubProjectLinks.delete(id);

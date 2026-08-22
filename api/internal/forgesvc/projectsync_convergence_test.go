@@ -272,6 +272,13 @@ func (s *statefulStore) SetGithubProjectItemStatusMarker(_ context.Context, arg 
 	s.items[arg.ForgeIssueIid] = it
 	return nil
 }
+func (s *statefulStore) ResetGithubProjectItemMarkers(_ context.Context, _ uuid.UUID) error {
+	for iid, it := range s.items {
+		it.LastStatusOptionID = pgtype.Text{Valid: false}
+		s.items[iid] = it
+	}
+	return nil
+}
 func (s *statefulStore) TouchGithubProjectLinkSynced(context.Context, uuid.UUID) error {
 	s.touchCalls++
 	return nil

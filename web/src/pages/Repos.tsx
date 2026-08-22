@@ -282,6 +282,23 @@ export function Repos() {
     }
   };
 
+  // Safe column auto-create (PRD #576 M6): create a fresh uzi-owned "uzi Status" field
+  // carrying every board column and switch the link to it, so the skipped columns start
+  // syncing without a manual GitHub edit. Reuses the syncBusy pattern; reloads status so
+  // the (now empty) skipped-columns list and health reflect the result.
+  const autocreateSyncColumns = async (repoId: string) => {
+    setSyncError("");
+    setSyncBusy(true);
+    try {
+      await api.autocreateProjectSyncColumns(repoId);
+      await loadSyncStatus(repoId);
+    } catch (err) {
+      setSyncError(syncErrorMessage(err));
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
   const disableSync = async (repoId: string) => {
     setSyncError("");
     setSyncBusy(true);
@@ -1354,6 +1371,20 @@ export function Repos() {
                             sync: {syncStatus.unmatched_columns.join(", ")}. Add them as Status
                             options in GitHub, then Resync.
                           </p>
+                          {/* Safe auto-create (PRD #576 M6): create uzi's own field with all
+                              columns rather than editing the user's field (no data-loss risk).
+                              Document the two-status-field tradeoff. */}
+                          <p className="text-muted">
+                            Or let uzi create its own &ldquo;uzi Status&rdquo; field with all your
+                            columns; your board will then show two status-like fields.
+                          </p>
+                          <Button
+                            size="sm"
+                            disabled={syncBusy}
+                            onClick={() => autocreateSyncColumns(syncRepo.id)}
+                          >
+                            {syncBusy ? "Working…" : "Auto-create the missing columns"}
+                          </Button>
                         </div>
                       )}
 

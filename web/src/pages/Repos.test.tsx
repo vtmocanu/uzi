@@ -30,6 +30,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       provisionProjectSync: vi.fn(),
       adoptProjectSync: vi.fn(),
       resyncProjectSync: vi.fn(),
+      autocreateProjectSyncColumns: vi.fn(),
       disableProjectSync: vi.fn(),
       getProjectSyncVisibility: vi.fn(),
       setProjectSyncVisibility: vi.fn(),
@@ -758,6 +759,36 @@ describe("Repos — skipped columns + Resync (PRD #576 M3)", () => {
 
     await waitFor(() => expect(mockApi.resyncProjectSync).toHaveBeenCalledWith("repo-gh"));
     // Status is reloaded after the resync so the readout reflects the result.
+    await waitFor(() => expect(mockApi.getProjectSyncStatus).toHaveBeenCalledWith("repo-gh"));
+  });
+
+  it("renders the auto-create button with the two-status-field tradeoff copy (PRD #576 M6)", async () => {
+    mockApi.getProjectSyncStatus.mockResolvedValue({ ...linkedWithUnmatched });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Linked");
+
+    // The tradeoff is documented near the button.
+    expect(within(panel).getByText(/two status-like fields/i)).toBeTruthy();
+    expect(
+      within(panel).getByRole("button", { name: /Auto-create the missing columns/ }),
+    ).toBeTruthy();
+  });
+
+  it("clicking Auto-create calls autocreateProjectSyncColumns and reloads status (PRD #576 M6)", async () => {
+    mockApi.getProjectSyncStatus.mockResolvedValue({ ...linkedWithUnmatched });
+    mockApi.autocreateProjectSyncColumns.mockResolvedValue({ status: "columns_created" });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Linked");
+
+    mockApi.getProjectSyncStatus.mockClear();
+    fireEvent.click(
+      within(panel).getByRole("button", { name: /Auto-create the missing columns/ }),
+    );
+
+    await waitFor(() =>
+      expect(mockApi.autocreateProjectSyncColumns).toHaveBeenCalledWith("repo-gh"),
+    );
+    // Status is reloaded so the (now empty) skipped-columns list reflects the result.
     await waitFor(() => expect(mockApi.getProjectSyncStatus).toHaveBeenCalledWith("repo-gh"));
   });
 });

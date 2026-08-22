@@ -203,6 +203,21 @@ func (q *Queries) MarkGithubProjectLinkSeeding(ctx context.Context, repoID uuid.
 	return err
 }
 
+const resetGithubProjectItemMarkers = `-- name: ResetGithubProjectItemMarkers :exec
+UPDATE github_project_items SET last_status_option_id = NULL, last_synced_at = now()
+WHERE repo_id = $1
+`
+
+// Clear every tracked item's status marker for a repo (PRD #576 M6). Used when the
+// link's status_field_id is switched to a freshly-created field: the new field reads
+// EMPTY for every item, so the stored markers (old field's option ids) must be reset
+// to NULL atomically with the switch — else the next reverse tick sees live("") !=
+// marker(old id) for every issue and fires the mass-clear cascade (F-H/R1).
+func (q *Queries) ResetGithubProjectItemMarkers(ctx context.Context, repoID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, resetGithubProjectItemMarkers, repoID)
+	return err
+}
+
 const setGithubProjectItemStatusMarker = `-- name: SetGithubProjectItemStatusMarker :exec
 UPDATE github_project_items
 SET last_status_option_id = $1, last_synced_at = now()
