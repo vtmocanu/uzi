@@ -7,6 +7,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/colorprofile"
 	"github.com/spf13/cobra"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -30,6 +31,12 @@ import (
 // disproportionate.
 var boardPollInterval = 2 * time.Second
 
+// rateLimitPollInterval is the strip's own cadence: re-fetch the per-token meters and
+// settings on ~60s, matching the web sidebar's useMyRateLimits(60_000). The server
+// recomputes meters only every ~5m (UZI_USAGE_POLL_INTERVAL), so polling faster
+// re-serves the same value. A var (not const) so a test can shrink it.
+var rateLimitPollInterval = 60 * time.Second
+
 // tuiView is which screen has focus.
 type tuiView int
 
@@ -48,11 +55,30 @@ type boardRunsMsg struct {
 
 type boardTickMsg struct{}
 
+// stripTickMsg fires on the 60s rateLimitPollInterval to refresh the rate-limit strip's
+// meters + settings, independently of the 2s boardTickMsg runs cadence.
+type stripTickMsg struct{}
+
 // secretsMsg carries the viewer's Anthropic token count (from ListSecrets), fetched once
 // at Init to gate the board credential column on PRD #295's more-than-one-token rule.
 type secretsMsg struct {
 	count int
 	err   error
+}
+
+// rateLimitsMsg carries the viewer's own per-token rate-limit meters (from SelfRateLimits),
+// which drive the factory-floor rate-limit strip. Fetched at Init, on the 60s strip ticker
+// (stripTickMsg), and on manual refresh.
+type rateLimitsMsg struct {
+	tokens []apitypes.TokenRateLimitDTO
+	err    error
+}
+
+// settingsMsg carries the viewer's own non-secret settings (from GetMySettings); only
+// SidebarTokenIds is used, to mirror the web sidebar's non-default-token selection.
+type settingsMsg struct {
+	settings apitypes.UserSettingsDTO
+	err      error
 }
 
 type detailLoadedMsg struct {
@@ -121,14 +147,32 @@ type tuiModel struct {
 	// than one to disambiguate. 0 until the probe returns, so the column stays hidden until
 	// then rather than flashing in.
 	tokenCount int
+
+	// profile is the terminal's colour profile (tea.ColorProfileMsg, set at program
+	// start). It gates OSC-8 hyperlink emission: links are emitted only at ANSI or
+	// richer, so a NO_COLOR/Ascii terminal gets plain #<iid> text (the colorprofile
+	// Writer strips SGR under Ascii but passes OSC-8 through unchanged, so links must
+	// self-gate). Defaults to TrueColor so the first frame and untouched test models
+	// emit links, mirroring the dark:true default.
+	profile colorprofile.Profile
+
+	// rateLimits and sidebarTokenIds drive the factory-floor rate-limit strip
+	// (mirrors the web sidebar selection: default token + sidebar_token_ids,
+	// status=="ok"). Fetched at Init, on the 60s strip ticker (stripTickMsg), and on
+	// manual refresh (r) — NOT on the 2s board tick: a meter changes at most once per
+	// ~5m server poll, so 60s already re-serves the same value and the 2s runs cadence
+	// would only multiply the API load. A fetch failure is swallowed: the strip just hides.
+	rateLimits      []apitypes.TokenRateLimitDTO
+	sidebarTokenIds []string
 }
 
 func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel {
 	m := tuiModel{
 		client: c, ctx: ctx,
 		width: 100, height: 30, dark: true,
-		pal:  newPalette(true),
-		view: viewBoard,
+		profile: colorprofile.TrueColor,
+		pal:     newPalette(true),
+		view:    viewBoard,
 	}
 	m.renderer, _ = newTUIRenderer(m.width, m.dark)
 	m.board = newBoardState()
@@ -140,7 +184,8 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 }
 
 func (m tuiModel) Init() tea.Cmd {
-	cmds := []tea.Cmd{m.fetchRunsCmd(m.board.admin), m.fetchSecretsCmd(), tickCmd()}
+	cmds := []tea.Cmd{m.fetchRunsCmd(m.board.admin), m.fetchSecretsCmd(),
+		m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), tickCmd(), stripTickCmd()}
 	if m.view == viewDetail {
 		cmds = append(cmds, m.loadDetailCmd(m.detail.runID), m.openStreamCmd(m.detail.runID))
 	}
@@ -149,6 +194,10 @@ func (m tuiModel) Init() tea.Cmd {
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(boardPollInterval, func(time.Time) tea.Msg { return boardTickMsg{} })
+}
+
+func stripTickCmd() tea.Cmd {
+	return tea.Tick(rateLimitPollInterval, func(time.Time) tea.Msg { return stripTickMsg{} })
 }
 
 func (m tuiModel) fetchRunsCmd(admin bool) tea.Cmd {
@@ -173,6 +222,27 @@ func (m tuiModel) fetchSecretsCmd() tea.Cmd {
 	return func() tea.Msg {
 		secrets, err := c.ListSecrets(ctx)
 		return secretsMsg{count: len(secrets), err: err}
+	}
+}
+
+// fetchRateLimitsCmd reads the viewer's own per-token rate-limit meters so the board can
+// draw the factory-floor rate-limit strip. A failure is swallowed — the strip just hides,
+// and never blocks the board.
+func (m tuiModel) fetchRateLimitsCmd() tea.Cmd {
+	c, ctx := m.client, m.ctx
+	return func() tea.Msg {
+		tokens, err := c.SelfRateLimits(ctx)
+		return rateLimitsMsg{tokens: tokens, err: err}
+	}
+}
+
+// fetchSettingsCmd reads the viewer's own settings so the strip mirrors the web sidebar's
+// non-default-token selection (sidebar_token_ids). Swallowed on failure like the meters.
+func (m tuiModel) fetchSettingsCmd() tea.Cmd {
+	c, ctx := m.client, m.ctx
+	return func() tea.Msg {
+		s, err := c.GetMySettings(ctx)
+		return settingsMsg{settings: s, err: err}
 	}
 }
 
@@ -252,6 +322,10 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.renderer, _ = newTUIRenderer(m.transcriptWidth(), m.dark)
 		return m, nil
 
+	case tea.ColorProfileMsg:
+		m.profile = msg.Profile
+		return m, nil
+
 	case tea.KeyPressMsg:
 		return m.handleKey(keyString(msg))
 
@@ -269,6 +343,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(cmds...)
 
+	case stripTickMsg:
+		if m.quitting {
+			return m, stripTickCmd()
+		}
+		return m, tea.Batch(m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), stripTickCmd())
+
 	case boardRunsMsg:
 		m.board.apply(msg)
 		return m, nil
@@ -276,6 +356,18 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case secretsMsg:
 		if msg.err == nil {
 			m.tokenCount = msg.count
+		}
+		return m, nil
+
+	case rateLimitsMsg:
+		if msg.err == nil {
+			m.rateLimits = msg.tokens
+		}
+		return m, nil
+
+	case settingsMsg:
+		if msg.err == nil {
+			m.sidebarTokenIds = msg.settings.SidebarTokenIds
 		}
 		return m, nil
 

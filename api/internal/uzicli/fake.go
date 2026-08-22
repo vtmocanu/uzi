@@ -145,6 +145,9 @@ type FakeClient struct {
 	// meters, each carrying the server-computed auto-selection status.
 	SelfMeters []apitypes.TokenRateLimitDTO
 
+	// Settings drives GetMySettings: the caller's own non-secret settings.
+	Settings apitypes.UserSettingsDTO
+
 	// Secrets drives ListSecrets (PRD #104 M2).
 	Secrets []apitypes.SecretDTO
 
@@ -400,6 +403,13 @@ func (f *FakeClient) SelfRateLimits(context.Context) ([]apitypes.TokenRateLimitD
 		return nil, f.Err
 	}
 	return f.SelfMeters, nil
+}
+
+func (f *FakeClient) GetMySettings(context.Context) (apitypes.UserSettingsDTO, error) {
+	if f.Err != nil {
+		return apitypes.UserSettingsDTO{}, f.Err
+	}
+	return f.Settings, nil
 }
 
 func (f *FakeClient) DeleteWorker(_ context.Context, id string) error {

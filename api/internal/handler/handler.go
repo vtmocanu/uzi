@@ -805,11 +805,14 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		})
 
 		// Current-user settings (non-secret, own-user only): the per-user default
-		// worker model (PRD #17). Session-authenticated, no admin path.
+		// worker model (PRD #17). Per-method auth so the READ is reachable by a CLI
+		// uzc_ token (RequireUser), mirroring GET /me/rate-limits (PRD #111 D23), so
+		// the CLI can read sidebar_token_ids et al; the PUT write path stays
+		// cookie-only (RequireAuth). No admin path either way. Kept as one Route so
+		// both verbs stay on the same `/me/settings/` pattern.
 		r.Route("/me/settings", func(r chi.Router) {
-			r.Use(mw.RequireAuth(h.q, h.cfg))
-			r.Get("/", h.GetMySettings)
-			r.Put("/", h.PutMySettings)
+			r.With(mw.RequireUser(h.q, h.cfg)).Get("/", h.GetMySettings)
+			r.With(mw.RequireAuth(h.q, h.cfg)).Put("/", h.PutMySettings)
 		})
 
 		// Current-user Slack linking (PRD #25 M3): the Notifications settings —

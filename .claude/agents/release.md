@@ -133,6 +133,11 @@ short SHA BEFORE tagging, and run it locally against your release commit first:
 `bash scripts/assert-changelog-covers-release.sh HEAD v<prev> X.Y.Z`.
 
 **That same `## [X.Y.Z]` section becomes the GitHub Release notes, so write it for a reader.**
+Write each bullet on ONE physical line (no mid-bullet newlines): GitHub renders the release body's
+single newlines as hard `<br>` breaks, so ~80-col hard-wrapped bullets show as short, ragged lines in
+the published Release. One line per bullet lets GitHub reflow to width — the CHANGELOG header states
+this too. (Established repo-wide 2026-08-21; older already-published sections stay wrapped and were
+edited in place.)
 Optionally give the Release a one-line title by placing an HTML marker on the line directly under
 the heading — `## [X.Y.Z] - <date>` then `<!-- release-title: readable run transcript + all-agents
 lane -->`; absent it, the Release is titled `vX.Y.Z`. Then run `bash scripts/changelog-links.sh` in

@@ -36,6 +36,7 @@ const (
 )
 
 func sp(s string) *string       { return &s }
+func ip(n int64) *int64         { return &n }
 func tp(t time.Time) *time.Time { return &t }
 
 // uxModel builds a model at the lab's fixed size and theme. The renderer is rebuilt
@@ -165,6 +166,16 @@ func boardRuns(now time.Time) []apitypes.RunListItemDTO {
 	runs[0].AnthropicSecretID, runs[0].AnthropicSecretLabel, runs[0].AnthropicSelectReason = sp("sec-meta"), sp("meta"), sp("auto")
 	runs[2].AnthropicSecretID, runs[2].AnthropicSecretLabel, runs[2].AnthropicSelectReason = sp("sec-personal"), sp("personal"), sp("pool_stale")
 	runs[6].AnthropicSecretID, runs[6].AnthropicSecretLabel, runs[6].AnthropicSelectReason = sp("sec-personal"), sp("personal"), sp("best_of_pool")
+	// PRD #519: stamp forge issue ids on the issue-kind runs so the board's clickable #<iid>
+	// OSC-8 link is exercised by the generated frames. The ci_fix runs (b2c3d4e5 "Fix flaky
+	// pipeline", b8c9d0e1) and the chat run keep a nil id — the no-id case, which draws no #.
+	iurl := func(n int64) *string { return sp(fmt.Sprintf("https://github.com/vtmocanu/uzi/issues/%d", n)) }
+	runs[0].IssueIID, runs[0].IssueWebURL = ip(452), iurl(452)
+	runs[2].IssueIID, runs[2].IssueWebURL = ip(477), iurl(477)
+	runs[4].IssueIID, runs[4].IssueWebURL = ip(468), iurl(468)
+	runs[5].IssueIID, runs[5].IssueWebURL = ip(419), iurl(419)
+	runs[6].IssueIID, runs[6].IssueWebURL = ip(463), iurl(463)
+	runs[7].IssueIID, runs[7].IssueWebURL = ip(408), iurl(408)
 	return runs
 }
 
@@ -177,12 +188,32 @@ var milestoneList = []apitypes.Milestone{
 	{ID: "m4", Title: "Update the scheduler docs"},
 }
 
+// boardMeters is a representative set of the viewer's own per-token rate-limit meters,
+// mirroring demo.go's SelfMeters: the default "personal" token (ok/warn) and the non-default
+// "meta" token (danger/warn) both show, "unlisted" is readable but hidden, "throttled" is
+// dropped (status != "ok"). Shared by the ux-lab board frame so the strip is exercised (#519).
+func boardMeters() []apitypes.TokenRateLimitDTO {
+	return []apitypes.TokenRateLimitDTO{
+		{SecretID: "sec-personal", Label: "personal", IsDefault: true, Limits: apitypes.RateLimitDTO{
+			Status: "ok", FiveHour: &apitypes.RateLimitWindow{Pct: 35}, SevenDay: &apitypes.RateLimitWindow{Pct: 62}}},
+		{SecretID: "sec-meta", Label: "meta", Limits: apitypes.RateLimitDTO{
+			Status: "ok", FiveHour: &apitypes.RateLimitWindow{Pct: 88}, SevenDay: &apitypes.RateLimitWindow{Pct: 44}}},
+		{SecretID: "sec-unlisted", Label: "unlisted", Limits: apitypes.RateLimitDTO{
+			Status: "ok", FiveHour: &apitypes.RateLimitWindow{Pct: 12}, SevenDay: &apitypes.RateLimitWindow{Pct: 20}}},
+		{SecretID: "sec-throttled", Label: "throttled", Limits: apitypes.RateLimitDTO{Status: "unavailable"}},
+	}
+}
+
 func boardPopulated(dark bool, now time.Time) string {
 	fake := &uzicli.FakeClient{Runs: boardRuns(now)}
 	m := uxModel(fake, "", dark)
 	m = step(m, boardRunsMsg{runs: fake.Runs})
 	// >1 token so the own board clears the credential gate (PRD #295) and the column renders.
 	m = step(m, secretsMsg{count: 2})
+	// The viewer's own rate-limit meters + the sidebar selection so the rate-limit strip renders
+	// under the wordmark (#519).
+	m = step(m, rateLimitsMsg{tokens: boardMeters()})
+	m = step(m, settingsMsg{settings: apitypes.UserSettingsDTO{SidebarTokenIds: []string{"sec-meta"}}})
 	return m.View().Content
 }
 
@@ -266,6 +297,12 @@ func detailBase(dark bool, run apitypes.RunDTO, now time.Time, allow bool) tuiMo
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, detailRunID, dark)
 	m = step(m, detailLoadedMsg{run: run, msgs: laneMsgs(now)})
+	// The viewer's own rate-limit meters + sidebar selection so the crew rail's stacked
+	// account block renders under the milestones (#530). Reuses the board fixture's meters
+	// (boardMeters) and the same sidebar selection, so the detail rail and the board strip
+	// show the SAME accounts — the two surfaces share selectedRateMeters.
+	m = step(m, rateLimitsMsg{tokens: boardMeters()})
+	m = step(m, settingsMsg{settings: apitypes.UserSettingsDTO{SidebarTokenIds: []string{"sec-meta"}}})
 	if allow {
 		m = step(m, runInputsMsg{runID: detailRunID, err: nil})
 	}
@@ -280,7 +317,11 @@ func detailRunning(dark bool, now time.Time) string {
 	// A milestone-structured run so the crew rail's milestone block renders (#379), coherent
 	// with the board's M2/4 for the same run id.
 	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "running", Health: "ok",
-		IssueTitle:          "Add rate-limit headroom to the scheduler poll",
+		IssueTitle: "Add rate-limit headroom to the scheduler poll",
+		// PRD #519: an issue id + url so the detail header renders the clickable #<iid> beside
+		// the crumb, coherent with the board's #452 for this same run id.
+		IssueIID:            ip(452),
+		IssueWebURL:         sp("https://github.com/vtmocanu/uzi/issues/452"),
 		StartedAt:           tp(now.Add(-4 * time.Minute)), // header elapsed WORK time (`● running · 4m`)
 		Milestones:          milestoneList,
 		MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3"}}

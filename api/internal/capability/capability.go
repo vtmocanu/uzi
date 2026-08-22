@@ -110,3 +110,85 @@ func Filter(in []string) []string {
 	}
 	return out
 }
+
+// Unmet returns the members of required that are NOT present in effective — the
+// capabilities a run needs that a given (already-folded) effective worker set does not
+// satisfy. It is the pure, offline-checkable core of the PRD #84 M4 4c approval gate: the
+// caller folds the owning worker's effective caps (capabilities ∪ {docker if
+// docker_enabled}, the SAME fold fn_worker_can_claim applies) and passes them here, so a
+// docker-folded effective set yields no `docker` in the result. Output is deduped and in
+// stable vocabulary order; a `required` name outside the vocabulary is dropped (it is not
+// a legal capability and can never be a real unmet requirement — required_capabilities is
+// Filter-ed at every write, so this never discards a live requirement). An empty result
+// means required ⊆ effective, i.e. the run is claimable/approvable by that worker.
+func Unmet(required, effective []string) []string {
+	have := make(map[string]struct{}, len(effective))
+	for _, name := range effective {
+		have[name] = struct{}{}
+	}
+	need := make(map[string]struct{}, len(required))
+	for _, name := range required {
+		if _, ok := have[name]; !ok {
+			need[name] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(need))
+	for _, name := range order {
+		if _, ok := need[name]; ok {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// Tool names are the PROVISIONABLE toolchain families the plan-time inference
+// (PRD #84 M4) emits on the awaiting_approval report — the languages/runtimes a
+// worker could install for the run, as distinct from the non-provisionable
+// capabilities above. Unlike capabilities they are DISPLAY-ONLY in v1: they never
+// gate a claim (there is no fn_worker_can_claim clause for them). The server still
+// owns the name set, and every reported tool set passes through FilterTools before
+// storage, so a garbled or hostile worker report cannot smuggle an arbitrary string
+// into the run's requirement panel.
+const (
+	ToolGo     = "go"
+	ToolNode   = "node"
+	ToolPython = "python"
+	ToolRust   = "rust"
+	ToolJVM    = "jvm"
+)
+
+// toolVocabulary is the v1 closed set of legal provisionable-tool names. FilterTools
+// drops anything not in here; nothing outside this map is ever persisted or surfaced.
+var toolVocabulary = map[string]struct{}{
+	ToolGo:     {},
+	ToolNode:   {},
+	ToolPython: {},
+	ToolRust:   {},
+	ToolJVM:    {},
+}
+
+// toolOrder fixes FilterTools's stable output order (toolVocabulary is a map, so its
+// own iteration order is not stable). Keep in lockstep with toolVocabulary.
+var toolOrder = []string{ToolGo, ToolNode, ToolPython, ToolRust, ToolJVM}
+
+// FilterTools returns the members of in that are in the tool vocabulary, DROPPING
+// unknowns silently (never an error), deduped, in stable vocabulary order. It mirrors
+// Filter and is the single gate every provisionable-tool set passes through before it
+// is stored or surfaced, so the server — not the worker — decides what tool names are
+// legal even though the set never gates scheduling.
+func FilterTools(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	for _, name := range in {
+		if _, ok := toolVocabulary[name]; !ok {
+			continue
+		}
+		seen[name] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for _, name := range toolOrder {
+		if _, ok := seen[name]; ok {
+			out = append(out, name)
+		}
+	}
+	return out
+}

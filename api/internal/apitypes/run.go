@@ -372,6 +372,18 @@ type RunDTO struct {
 	// `normal` everything else. runToDTO takes it as an explicit param and stays pure —
 	// no now()/config reaches into the mapper (D8).
 	Priority string `json:"priority"`
+	// The run's inferred/hinted scheduling requirements (PRD #84): RequiredCapabilities is
+	// the claim-gating capability set (M2 repo hint UNION-merged with M4 plan-time
+	// inference), RequiredTools the DISPLAY-ONLY provisionable toolchain families (M4 4b),
+	// and SizeClass the clamped s/m/l estimate (M4 4b). All three are surfaced RAW so the
+	// web/CLI (4d) derive the readiness/mismatch display from them plus the worker caps they
+	// already fetch — there is deliberately no server-computed "capability_block" field; the
+	// authoritative enforcement is the 409 the approval gate returns. Capability/tool slices
+	// are non-nil ([] over null) via capsOrEmpty; SizeClass is "" for a run whose plan-time
+	// inference never set it (the column is NOT NULL DEFAULT '').
+	RequiredCapabilities []string `json:"required_capabilities"`
+	RequiredTools        []string `json:"required_tools"`
+	SizeClass            string   `json:"size_class"`
 }
 
 // RunListItemDTO is a run row for the Runs index and the admin Agents-status
@@ -429,6 +441,14 @@ type RunInputRequest struct {
 	// the server validates this against the run's real roster and writes its own
 	// canonical JSON encoding into that body.
 	Selection *AgentSelection `json:"selection"`
+	// OverrideCapabilities is the PRD #84 M4 4c user override ("run without the
+	// capability", Decision 12), meaningful ONLY with approve_plan and default false. When
+	// true the server clears the run's inferred/hinted required_capabilities before
+	// approving, so a plan the capability gate would otherwise 409-BLOCK (its owning worker
+	// cannot satisfy an inferred requirement) is approved anyway — the deliberate
+	// false-positive-inference correction. No runtime security boundary is bypassed: the
+	// §300 guardrail still denies docker USE on a daemon-less worker at run time.
+	OverrideCapabilities bool `json:"override_capabilities"`
 }
 
 // RunInputResponse is the POST /api/runs/{id}/inputs reply: server_side reports
@@ -497,7 +517,7 @@ type RunEventDTO struct {
 	// CHECK constraint (runs.status, created by 00020_workers_runs.sql, widened with
 	// 'limit_wait' by 00091_run_limit_wait.sql, with 'awaiting_input' by
 	// 00092_run_awaiting_input.sql, and with 'awaiting_followup' by
-	// 00144_interactive_task_runs.sql): queued, claimed, running, awaiting_approval,
+	// 00146_interactive_task_runs.sql): queued, claimed, running, awaiting_approval,
 	// limit_wait, awaiting_input, awaiting_followup, completed, failed, cancelled —
 	// TEN values. It is the field that decides whether a run reads as still live, so
 	// an unrecognised value must never reach a consumer as-is.

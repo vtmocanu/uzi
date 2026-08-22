@@ -273,6 +273,56 @@ func TestRenderRunDetailPrdLifecycle(t *testing.T) {
 	}
 }
 
+// ---- PRD #84 M4 4d: inferred requirement set ------------------------------
+
+// TestRenderRunDetailRequirementSet pins `uzi run get`'s inferred requirement rows:
+// REQUIRED_CAPABILITIES (comma-joined), REQUIRED_TOOLS (comma-joined) and SIZE_CLASS.
+// All three are emit-only-when-set, so a run with none of them rendered must be
+// byte-for-byte the pre-feature output. The slices are UNTRUSTED inference output, so a
+// hostile family name must be neutralised before it reaches the terminal.
+func TestRenderRunDetailRequirementSet(t *testing.T) {
+	set := apitypes.RunDTO{
+		ID: "run-1", Kind: "issue", Status: "completed",
+		IssueTitle: "needs a toolchain", ForgeType: "gitlab", Health: "ok",
+		RequiredCapabilities: []string{"docker", "gpu"},
+		RequiredTools:        []string{"go", "node"},
+		SizeClass:            "l",
+	}
+	out := renderDetail(t, set)
+	for _, want := range []string{
+		"REQUIRED_CAPABILITIES", "docker,gpu",
+		"REQUIRED_TOOLS", "go,node",
+		"SIZE_CLASS", "l",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("a run with an inferred requirement set must render %q, got:\n%s", want, out)
+		}
+	}
+
+	// The families are inference output, so a hostile value must be neutralised: the escape
+	// and the bidi override are stripped, the printable text survives.
+	hostile := set
+	hostile.RequiredTools = []string{"go\u202e\x1b[31mrm", "node"}
+	hout := renderDetail(t, hostile)
+	for _, bad := range []string{"\u202e", "\x1b"} {
+		if strings.Contains(hout, bad) {
+			t.Errorf("a hostile required_tools value reached the terminal carrying %q, got:\n%q", bad, hout)
+		}
+	}
+	if !strings.Contains(hout, "node") {
+		t.Errorf("sanitizing dropped the printable tool too, got:\n%q", hout)
+	}
+
+	// All three empty ⇒ none of the rows, byte-for-byte the pre-4d output.
+	none := apitypes.RunDTO{ID: "run-2", Kind: "issue", Status: "completed", Health: "ok"}
+	nout := renderDetail(t, none)
+	for _, bad := range []string{"REQUIRED_CAPABILITIES", "REQUIRED_TOOLS", "SIZE_CLASS"} {
+		if strings.Contains(nout, bad) {
+			t.Errorf("a run with no inferred requirement set must render no %q row, got:\n%s", bad, nout)
+		}
+	}
+}
+
 // ---- PRD #122 M5: milestone progress + effective budget --------------------
 
 // milestoneRun is the fixture the milestone tests start from: a three-milestone frozen

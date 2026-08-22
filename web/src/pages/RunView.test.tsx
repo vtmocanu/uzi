@@ -40,6 +40,7 @@ import {
   type Run,
   type RunMessage,
   type RunReview,
+  type Worker,
 } from "../lib/api";
 
 // The picker no longer fetches the template list (PRD #37 M4-fix — it reads the
@@ -256,6 +257,165 @@ describe("PlanPanel agent picker (PRD #37 M4)", () => {
       />,
     );
     expect(await screen.findByText("step one")).toBeTruthy();
+  });
+});
+
+// PRD #84 M4 4d: the plan-gate readiness summary — the run's inferred requirements checked
+// against its ASSIGNED worker's capabilities, plus the false-positive "run without it"
+// override. Rendered inside the awaiting_approval PlanPanel, so these drive the panel
+// directly with the workers prop (the whole page needs a live stream + a dozen mocks).
+describe("PlanPanel readiness summary (PRD #84 M4 4d)", () => {
+  // The readiness code reads only w.id + w.capabilities; a cast keeps the fixture terse
+  // without filling the whole Worker shape (the test file already casts elsewhere).
+  function worker(id: string, capabilities: string[]): Worker {
+    return { id, capabilities } as unknown as Worker;
+  }
+
+  it("marks a required capability UNMET when the assigned worker lacks it, with remediation", async () => {
+    render(
+      <PlanPanel
+        run={run({ worker_id: "w1", required_capabilities: ["docker"], repo_agents: [], own_agents: [] })}
+        workers={[worker("w1", [])]}
+        busy={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
+    expect(await screen.findByText("Run requirements")).toBeTruthy();
+    // The unmet badge is identified by its title (the warn-toned "does not advertise" copy).
+    expect(screen.getByTitle(/does not advertise "docker"/)).toBeTruthy();
+    // The remediation line names the missing cap and the escape hatch.
+    expect(screen.getByText(/Provision or start a worker with/i)).toBeTruthy();
+  });
+
+  it("marks a required capability MET (ok-toned) and offers NO override when the worker advertises it", async () => {
+    render(
+      <PlanPanel
+        run={run({ worker_id: "w1", required_capabilities: ["docker"], repo_agents: [], own_agents: [] })}
+        workers={[worker("w1", ["docker"])]}
+        busy={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
+    expect(await screen.findByTitle(/advertises "docker"/)).toBeTruthy();
+    // Nothing unmet → no remediation, no override button.
+    expect(screen.queryByText(/Provision or start a worker with/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /Run without/i })).toBeNull();
+  });
+
+  it("marks docker MET via the docker_enabled fold even when capabilities[] omits it", async () => {
+    // A provision-time docker worker whose self-report has not landed: docker=true but
+    // capabilities=[]. The server folds docker_enabled into effective caps, so the panel must
+    // too — otherwise it shows a false UNMET for a plan the approve gate accepts (no 409).
+    const w = { id: "w1", capabilities: [], docker: true } as unknown as Worker;
+    render(
+      <PlanPanel
+        run={run({ worker_id: "w1", required_capabilities: ["docker"], repo_agents: [], own_agents: [] })}
+        workers={[w]}
+        busy={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
+    expect(await screen.findByTitle(/advertises "docker"/)).toBeTruthy();
+    expect(screen.queryByTitle(/does not advertise "docker"/)).toBeNull();
+    expect(screen.queryByRole("button", { name: /Run without/i })).toBeNull();
+  });
+
+  it("renders required_tools ('will be provisioned') and the size_class label", async () => {
+    render(
+      <PlanPanel
+        run={run({
+          worker_id: "w1",
+          required_capabilities: [],
+          required_tools: ["node", "go"],
+          size_class: "m",
+          repo_agents: [],
+          own_agents: [],
+        })}
+        workers={[worker("w1", [])]}
+        busy={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
+    expect(await screen.findByText("Run requirements")).toBeTruthy();
+    expect(screen.getByText("node")).toBeTruthy();
+    expect(screen.getByText("go")).toBeTruthy();
+    expect(screen.getByText("will be provisioned")).toBeTruthy();
+    expect(screen.getByText("size: m")).toBeTruthy();
+    // Tools never block, so even with no capability check there is no override affordance.
+    expect(screen.queryByRole("button", { name: /Run without/i })).toBeNull();
+  });
+
+  it("renders NO requirements block when nothing was inferred (all three empty)", async () => {
+    render(
+      <PlanPanel
+        run={run({ required_capabilities: [], required_tools: [], size_class: "", repo_agents: [], own_agents: [] })}
+        workers={[worker("w1", [])]}
+        busy={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
+    // Positive anchor first so the absence check is not vacuous.
+    expect(await screen.findByText("step one")).toBeTruthy();
+    expect(screen.queryByText("Run requirements")).toBeNull();
+  });
+
+  // Review fix: size_class alone must NOT open the panel. detectToolchain ALWAYS emits a
+  // non-empty size_class (s/m/l), so with the old `sizeClass !== ""` term the panel rendered
+  // for EVERY plan gate. size is advisory-only: with no capability and no tool the panel — and
+  // the "size:" label with it — is suppressed entirely.
+  it("does NOT render the panel when only size_class is set (no capability, no tool)", async () => {
+    render(
+      <PlanPanel
+        run={run({ required_capabilities: [], required_tools: [], size_class: "l", repo_agents: [], own_agents: [] })}
+        workers={[worker("w1", [])]}
+        busy={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
+    // Positive anchor first so the absence checks are not vacuous.
+    expect(await screen.findByText("step one")).toBeTruthy();
+    expect(screen.queryByText("Run requirements")).toBeNull();
+    expect(screen.queryByText("size: l")).toBeNull();
+  });
+
+  it("the override button approves with overrideCapabilities=true (the false-positive correction)", async () => {
+    const onApprove = vi.fn();
+    render(
+      <PlanPanel
+        run={run({ worker_id: "w1", required_capabilities: ["docker"], repo_agents: [], own_agents: [] })}
+        workers={[worker("w1", [])]}
+        busy={false}
+        onApprove={onApprove}
+        onReject={() => {}}
+      />,
+    );
+    const override = await screen.findByRole("button", { name: /Run without docker/i });
+    fireEvent.click(override);
+    // Default selection for a lead-only run (no repo/own agents) is source "own", no exclusions,
+    // and the override flag rides as the second arg.
+    expect(onApprove).toHaveBeenCalledWith({ source: "own", exclusions: [] }, true);
+  });
+
+  it("hides the override from a NON-OWNER (canSteer=false) even when a cap is unmet", async () => {
+    render(
+      <PlanPanel
+        run={run({ worker_id: "w1", required_capabilities: ["docker"], repo_agents: [], own_agents: [] })}
+        workers={[worker("w1", [])]}
+        busy={false}
+        canSteer={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
+    // The unmet state still renders (read-only), but the action does not.
+    expect(await screen.findByTitle(/does not advertise "docker"/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Run without/i })).toBeNull();
   });
 });
 

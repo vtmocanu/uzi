@@ -395,6 +395,10 @@ func TestCLIRejectsBearerOnCookieOnlyRoutesLiveDB(t *testing.T) {
 		// that test and silently widen a consent switch to a stolen CLI token.
 		{"wait-on-limit default (park consent)", http.MethodPut, "/api/me/wait-on-limit"},
 		{"wait-on-limit per run (park consent)", http.MethodPut, "/api/runs/" + runID.String() + "/wait-on-limit"},
+		// The /me/settings group was split like /me/rate-limits: GET moved to
+		// RequireUser so a uzc_ can read it (see TestCLIReachesSettingsOverBearerLiveDB),
+		// but the PUT write path stayed cookie-only and must NOT have travelled with it.
+		{"settings write (split group, PUT stays cookie-only)", http.MethodPut, "/api/me/settings"},
 	}
 	for _, tc := range cases {
 		rec := bearerReq(router, tc.method, tc.path, uzc)
@@ -435,6 +439,35 @@ func TestCLIReachesRateLimitsOverBearerLiveDB(t *testing.T) {
 	// not authenticated→public.
 	if rec := bearerReq(router, http.MethodGet, "/api/me/rate-limits", ""); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated GET /api/me/rate-limits = %d, want 401", rec.Code)
+	}
+}
+
+// TestCLIReachesSettingsOverBearerLiveDB mirrors the rate-limits move for
+// GET /api/me/settings: the read was split out of the cookie-only /me/settings
+// group onto RequireUser so a uzc_ Bearer can decode the caller's own settings
+// (including sidebar_token_ids), while the PUT write stays cookie-only (asserted
+// in TestCLIRejectsBearerOnCookieOnlyRoutesLiveDB). Asserting only the PUT-401
+// half would pass on a tree where the GET never moved, so this pins the GET-200.
+func TestCLIReachesSettingsOverBearerLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	user := cliSeedUser(t, pool, false)
+	uzc := cliMintToken(t, pool, user, clitoken.ScopeUser)
+
+	rec := bearerReq(router, http.MethodGet, "/api/me/settings", uzc)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/me/settings over Bearer = %d, want 200 — the GET was split to "+
+			"RequireUser so the CLI can read the caller's own settings\nbody: %s", rec.Code, rec.Body.String())
+	}
+	// The caller's own settings ride a {"settings": {...}} envelope, which is the
+	// shape the CLI decodes; asserting it keeps the move from passing on an error
+	// envelope that happened to be 200.
+	if body := rec.Body.String(); !strings.Contains(body, `"settings"`) {
+		t.Fatalf("response carries no settings object: %s", body)
+	}
+	// And an UNAUTHENTICATED request is still refused — the move is cookie→bearer,
+	// not authenticated→public.
+	if rec := bearerReq(router, http.MethodGet, "/api/me/settings", ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated GET /api/me/settings = %d, want 401", rec.Code)
 	}
 }
 

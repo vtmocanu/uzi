@@ -152,6 +152,41 @@ func TestHTTPClientWhoami(t *testing.T) {
 	}
 }
 
+func TestHTTPClientGetMySettings(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/me/settings" {
+			t.Errorf("request = %s %s", r.Method, r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"settings":{"default_model":"claude","judge_model":null,` +
+			`"summary_model":null,"theme":null,"sidebar_token_ids":["a","b"]}}`))
+	}))
+	defer srv.Close()
+	s, err := newTestClient(srv).GetMySettings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.SidebarTokenIds) != 2 || s.SidebarTokenIds[0] != "a" || s.SidebarTokenIds[1] != "b" {
+		t.Errorf("sidebar_token_ids = %v", s.SidebarTokenIds)
+	}
+	if s.DefaultModel == nil || *s.DefaultModel != "claude" {
+		t.Errorf("default_model = %v", s.DefaultModel)
+	}
+	if s.JudgeModel != nil || s.Theme != nil {
+		t.Errorf("nullable fields should decode to nil, got judge=%v theme=%v", s.JudgeModel, s.Theme)
+	}
+}
+
+func TestFakeGetMySettings(t *testing.T) {
+	f := &FakeClient{Settings: apitypes.UserSettingsDTO{SidebarTokenIds: []string{"x", "y"}}}
+	s, err := f.GetMySettings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.SidebarTokenIds) != 2 || s.SidebarTokenIds[0] != "x" {
+		t.Errorf("settings = %+v", s)
+	}
+}
+
 // A 200 {"review": null} is a visible-but-unjudged run: (nil, nil), exit 0. It
 // must NOT be turned into a 404.
 func TestHTTPClientReviewNull(t *testing.T) {

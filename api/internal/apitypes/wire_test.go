@@ -148,6 +148,12 @@ var runDTOKeys = []string{
 	// restored}), computed by fn_run_priority_class. NOT omitempty — always a real
 	// value on the wire, so it is asserted on the zero value here.
 	"priority",
+	// PRD #84: the run's inferred/hinted scheduling requirements, surfaced RAW for the
+	// web/CLI readiness/mismatch display. required_capabilities (M2 hint ∪ M4 inference)
+	// and required_tools (M4 4b, display-only) are non-nil slices ([] over null); size_class
+	// (M4 4b) is the NOT NULL DEFAULT '' string. All three always on the wire, and — via the
+	// RunListItemDTO embed pin — on both the list and detail reads.
+	"required_capabilities", "required_tools", "size_class",
 }
 
 func TestRunDTOTags(t *testing.T) {
@@ -181,7 +187,9 @@ func TestMessageDTOTags(t *testing.T) {
 }
 
 func TestRunInputTags(t *testing.T) {
-	assertTags(t, "RunInputRequest", RunInputRequest{}, "kind", "body", "selection")
+	// PRD #84 M4 4c: override_capabilities is a plain bool (not omitempty), so it is always
+	// on the wire; meaningful only with approve_plan, default false.
+	assertTags(t, "RunInputRequest", RunInputRequest{}, "kind", "body", "selection", "override_capabilities")
 	// id + created_at are omitempty (nil on approve/cancel/reject): the zero value is
 	// still just server_side (PRD #95 S2).
 	assertTags(t, "RunInputResponse", RunInputResponse{}, "server_side")
@@ -598,6 +606,14 @@ func TestTokenRateLimitDTOTags(t *testing.T) {
 func TestAdminRateLimitRowDTOTags(t *testing.T) {
 	assertTags(t, "AdminRateLimitRowDTO", AdminRateLimitRowDTO{},
 		"id", "email", "name", "vault_locked", "tokens")
+}
+
+// TestUserSettingsDTOTags pins the CLI's decoding mirror of GET /api/me/settings
+// against the handler's own userSettingsDTO — a divergence in either type's tag
+// set fails here rather than silently dropping a field on decode.
+func TestUserSettingsDTOTags(t *testing.T) {
+	assertTags(t, "UserSettingsDTO", UserSettingsDTO{},
+		"default_model", "judge_model", "summary_model", "theme", "sidebar_token_ids")
 }
 
 // TestAgentMemoryWriteRequestTags pins the worker save body: {title, body} plus the

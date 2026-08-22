@@ -419,6 +419,13 @@ func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
 		// PRD #320 D8: the display priority class, supplied by the caller (a list-query
 		// column or h.runPriorityClass) so this mapper stays pure.
 		Priority: priorityClass,
+		// PRD #84: the run's inferred/hinted scheduling requirements, surfaced RAW for the
+		// web/CLI (4d) readiness/mismatch display. Capability/tool slices are normalized to
+		// a non-nil empty slice ([] over null), mirroring the repo DTO; size_class is the
+		// NOT NULL DEFAULT '' string (empty for a run whose inference never set it).
+		RequiredCapabilities: capsOrEmpty(r.RequiredCapabilities),
+		RequiredTools:        capsOrEmpty(r.RequiredTools),
+		SizeClass:            r.SizeClass,
 	}
 	if r.RepoID.Valid {
 		s := uuid.UUID(r.RepoID.Bytes).String()
@@ -1228,7 +1235,19 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := h.wsvc.SubmitInput(r.Context(), user.ID, id, req.Kind, req.Body, req.Selection)
+	// PRD #84 M4 4c: the "run without the capability" user override (Decision 12). When the
+	// owner approves WITH override_capabilities, the override entry point BYPASSES the
+	// capability approval gate and clears the run's inferred/hinted required_capabilities —
+	// but ATOMICALLY with a successful approve: the clear runs only AFTER the approve's own
+	// validation and enqueue succeed, so a failed approve (e.g. an invalid selection) leaves
+	// the requirement INTACT and the retry stays gated. Owner- and awaiting_approval-scoped in
+	// SQL, and inert for any kind other than approve_plan (the gate only runs for approve_plan).
+	var res workersvc.SubmitInputResult
+	if req.OverrideCapabilities {
+		res, err = h.wsvc.SubmitInputWithCapabilityOverride(r.Context(), user.ID, id, req.Kind, req.Body, req.Selection)
+	} else {
+		res, err = h.wsvc.SubmitInput(r.Context(), user.ID, id, req.Kind, req.Body, req.Selection)
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRunNotFound):
@@ -1256,6 +1275,20 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrInvalidSelection):
 			httpx.Error(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, workersvc.ErrCapabilityUnmet):
+			// PRD #84 M4 4c: the server-side capability approval gate blocked — the run's
+			// owning worker cannot satisfy an inferred/hinted required capability → 409, with
+			// the unmet names and a remediation hint in the error body (same {"error": ...}
+			// envelope as the sibling cases). The web/CLI (4d) can also derive the mismatch
+			// from the run DTO's required_capabilities + the worker caps it already fetches;
+			// this 409 is the authoritative enforcement, and its message names the fix.
+			var unmet *workersvc.CapabilityUnmetError
+			names := "the required capabilities"
+			if errors.As(err, &unmet) {
+				names = strings.Join(unmet.Unmet, ", ")
+			}
+			httpx.Error(w, http.StatusConflict, "the plan requires capabilities the assigned worker cannot satisfy: "+names+
+				". Provision or start a worker with: "+names+"; or approve with override_capabilities to run without it")
 		default:
 			slog.Error("submit run input", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
