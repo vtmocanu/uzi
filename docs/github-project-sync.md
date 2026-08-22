@@ -160,9 +160,12 @@ the board still shows *those* columns even though uzi is now writing your
 board's columns to "uzi Status". This looks like "sync did nothing", but the
 values are there on the other field. Switch the board over in GitHub: open the
 board, click **View** (top right), set **Column by** to **uzi Status**, then
-**Save view**. The board then shows your uzi columns with every item already
-populated. (In Table layout the same control is labeled **Group by**; the
-original Status field is harmless and can be ignored or deleted.)
+click **Save view** — this last step is required. An unsaved grouping change is
+local and temporary: it reverts on reload and other viewers still see the old
+columns, so it looks like the switch didn't take. Once saved, the board shows
+your uzi columns with every item already populated. (In Table layout the same
+control is labeled **Group by**; the original Status field is harmless and can
+be ignored or deleted.)
 
 ## The `project` PAT scope
 
