@@ -1907,7 +1907,11 @@ export function IssueCard({
         <Link
           to={`/repos/${repoId}/issues/${card.iid}`}
           draggable={false}
-          className="font-medium leading-snug text-fg hover:text-brand-hover"
+          // min-w-0 break-words (issue #562): a title with a long unbreakable token
+          // (e.g. CLAUDE_CODE_ENABLE_TODO_TOOLS=1) must wrap within the fixed w-72
+          // lane. break-words lets the token wrap; min-w-0 overrides the flex child's
+          // default min-width:auto so it can shrink below the token's intrinsic width.
+          className="min-w-0 break-words font-medium leading-snug text-fg hover:text-brand-hover"
         >
           {/* Issue #124: the forge issue title, writable by anyone who can open an issue
               on the repo. Display only — the link targets card.iid, not this string.

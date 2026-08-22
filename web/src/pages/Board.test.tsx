@@ -133,6 +133,21 @@ describe("IssueCard — the forge title carries no format characters (#124)", ()
   });
 });
 
+// Issue #562. A title carrying a long unbreakable token (e.g. an env-var assignment)
+// overflowed the fixed w-72 lane because the title <Link> could neither wrap nor shrink.
+// jsdom does no layout, so pixel overflow is unassertable here; the enforceable unit-level
+// guard is that the two utilities the fix depends on are present on the title link. Both are
+// required together — break-words lets the token wrap, min-w-0 overrides the flex child's
+// default min-width:auto so the wrap can take effect — so both are asserted.
+describe("IssueCard — long-token title can wrap within the lane (#562)", () => {
+  it("gives the title link min-w-0 and break-words", () => {
+    renderCard({ title: "Revert #550: CLAUDE_CODE_ENABLE_TODO_TOOLS=1 is a no-op", iid: 7 });
+    const link = screen.getByRole("link", { name: /Revert #550/ });
+    expect(link.className).toContain("min-w-0");
+    expect(link.className).toContain("break-words");
+  });
+});
+
 // PRD #102 M4. The predicate itself is unit-tested in labelChips.test.ts; these cover
 // what the card does with the result, which is the half a pure test cannot see.
 describe("IssueCard label chips (PRD #102 M4)", () => {
