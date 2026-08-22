@@ -136,6 +136,36 @@ function fakeTurnsSlow(
   return { queryFn, turns };
 }
 
+/** Like fakeTurnsSlow, but the in-turn sleep is PER-TURN (`sleeps[i]` for turn i, clamped
+ *  to the last entry). Lets a test keep the plan turn cheap while making one specific
+ *  resumed follow-up turn burn a chosen amount — needed to isolate the wall-scaling latch,
+ *  whose effect shows only on a resumed turn and would otherwise be masked by the plan turn
+ *  sharing the same unscaled `initialWallMs` budget under a uniform sleep. */
+function fakeTurnsSlowPerTurn(
+  scripts: SDKMessage[][],
+  sleeps: number[],
+): { queryFn: SdkQueryFn; turns: Turn[] } {
+  const turns: Turn[] = [];
+  let i = 0;
+  const queryFn: SdkQueryFn = (params) => {
+    const script = scripts[Math.min(i, scripts.length - 1)]!;
+    const sleepMs = sleeps[Math.min(i, sleeps.length - 1)]!;
+    i++;
+    const turn: Turn = { options: params.options };
+    turns.push(turn);
+    return (async function* () {
+      for await (const p of params.prompt) {
+        const rec = p as { message?: { content?: unknown } };
+        const content = rec.message?.content;
+        turn.promptText = typeof content === "string" ? content : JSON.stringify(content);
+      }
+      await new Promise((r) => setTimeout(r, sleepMs)); // debited from the wall budget
+      for (const m of script) yield m;
+    })();
+  };
+  return { queryFn, turns };
+}
+
 // ── the SdkExecutor loop park ────────────────────────────────────────────────
 describe("SdkExecutor interactive task park (PRD #517 M3)", () => {
   let sdkHome: string;
@@ -388,6 +418,57 @@ describe("SdkExecutor interactive task park (PRD #517 M3)", () => {
     // plan + loop1 + 6 follow-up turns = 8 turns all ran, proving the wall never tripped
     // (a REASON_WALL trip would have rejected the run before the later turns).
     assert.strictEqual(turns.length, 8, "every follow-up turn ran on its own fresh wall budget");
+  });
+
+  it("re-applies the server's wall-budget scaling on a resumed follow-up (re-arms the wallScaled latch)", async () => {
+    // Fix 4 (this M4): a follow-up is a fresh task, so the applied-once `wallScaled` latch must
+    // be RE-ARMED at the follow-up reset (`wallScaled = false` beside `state.wallRemainingMs =
+    // initialWallMs`). Otherwise the latch stays `true` from the first turn and the resumed
+    // follow-up's `served.wallSeconds > initialWallMs` scaling (~sdk-executor.ts:1462) is
+    // SKIPPED, leaving the resumed turn on the unscaled default wall.
+    //
+    // Setup: initialWallMs = 300ms; every reportIteration serves wallSeconds = 0.9 (900ms), so
+    // the applied-once scaling adds 900-300 = 600ms → a scaled budget of 900ms. Per-turn sleeps
+    // isolate the effect: the plan turn burns ~0 (its budget is the unscaled 300ms), turn 1
+    // burns 50ms (comfortably inside its scaled 900ms), and the RESUMED turn burns 450ms.
+    //   WITH the re-arm: the resumed turn re-scales to 900ms → 450ms burn is a 2x margin, the
+    //   turn completes, the run parks again and ends idle → run() resolves.
+    //   WITHOUT it (delete `wallScaled = false`): the latch is still set, the resumed turn is
+    //   NOT re-scaled and keeps the reset 300ms budget → the 450ms burn trips REASON_WALL
+    //   mid-turn and run() REJECTS. (The plan turn does NOT falsely trip: its budget is the
+    //   same unscaled 300ms but it burns ~0, which is why the sleep must be per-turn — a
+    //   uniform sleep would trip the plan turn identically and stop discriminating.)
+    const { queryFn, turns } = fakeTurnsSlowPerTurn(
+      [
+        [submitPlan("plan"), resultSuccess()], // planning (unscaled 300ms budget, ~0 burn)
+        [assistantText("t1"), signalDone(), resultSuccess()], // loop1 → done → park
+        [assistantText("t2"), signalDone(), resultSuccess()], // resumed follow-up → done → park (idle)
+      ],
+      [0, 50, 450],
+    );
+    const outcomes: FollowUpOutcome[] = [
+      { kind: "followup", body: "the resumed task" },
+      { kind: "ended", reason: "idle" },
+    ];
+    const { ctx } = makeCtx({
+      config: { max_iterations: 30, run_timeout_seconds: 0.3 },
+      interactive: true,
+      checkpoint: async () => {},
+      awaitFollowUp: async () => outcomes.shift()!,
+      // Serve a wall budget larger than initialWallMs on every iteration report so the
+      // applied-once scaling has a delta to add — and, on the resumed turn, re-add.
+      reportIteration: async () => ({ wallSeconds: 0.9 }),
+    });
+
+    const result = await new SdkExecutor(nullLogger(), sdkHome, { queryFn }).run(ctx);
+    assert.strictEqual(
+      result.branch,
+      "agent/issue-5",
+      "the resumed follow-up re-applied the server's wall scaling and did not trip the wall",
+    );
+    // plan + loop1 + resumed follow-up turn = 3 turns; the resumed turn completing (rather than
+    // the run rejecting mid-turn) is what proves the re-scaling fired.
+    assert.strictEqual(turns.length, 3, "the resumed follow-up turn ran to completion on a re-scaled wall");
   });
 
   it("emits first-turn scaffolding only on the genuine first turn, never on a resumed follow-up", async () => {
