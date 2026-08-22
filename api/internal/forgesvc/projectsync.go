@@ -360,6 +360,37 @@ func provisionColor(i int) string {
 	return provisionColors[i%len(provisionColors)]
 }
 
+// doneColumnName is the reserved name of the "Done" projection option uzi appends on the
+// create path (PRD #584 M1), so a CLOSED issue can later (M2) be projected to a dedicated
+// Done status. It is NOT a board column: the column→option map is built by iterating the
+// board columns slice, so appending this option to the FIELD's option list never leaks it
+// into status_options. When a board column is ALREADY literally named "Done" (case-
+// sensitive exact match) uzi does NOT append — that column's own option carries the name,
+// and done_option_id points at it (capturing by name would otherwise be ambiguous — R6).
+const doneColumnName = "Done"
+
+// doneColumnColor is the fixed distinct color for the appended "Done" option. GREEN is a
+// valid member of GitHub's ProjectV2SingleSelectFieldOptionColor enum (see provisionColors,
+// which cycles GREEN as one of its eight) and reads as "done". It is appended AFTER the
+// per-column cycled colors, so provisionColor stays keyed on the board-column index and the
+// palette assignment for real columns is unchanged.
+const doneColumnColor = "GREEN"
+
+// appendDoneOption appends the reserved "Done" projection option (PRD #584 M1) to a
+// create-path field's option list, UNLESS a board column is already literally named "Done"
+// (case-sensitive exact match against LabelName), in which case that column's own option
+// carries the name and nothing is appended. It never mutates the caller's columns slice —
+// "Done" is added only to the FIELD options, not to the board columns that build the
+// column→option map.
+func appendDoneOption(options []forge.ProjectV2NewOption, columns []store.BoardColumn) []forge.ProjectV2NewOption {
+	for _, c := range columns {
+		if c.LabelName == doneColumnName {
+			return options // a real "Done" column already provides the option
+		}
+	}
+	return append(options, forge.ProjectV2NewOption{Name: doneColumnName, Color: doneColumnColor})
+}
+
 // provisionPrepare does the resolve → create-project → create-field → map →
 // persist-link work for Provision, and returns the seedParams for the caller to seed
 // asynchronously (PRD #576 M4). It does NOT seed items. Unlike adoptPrepare there is NO
@@ -399,13 +430,17 @@ func (s *ProjectSyncService) provisionPrepare(ctx context.Context, repo store.Ge
 	if err != nil {
 		return seedParams{}, fmt.Errorf("project sync: list board columns: %w", err)
 	}
-	newOptions := make([]forge.ProjectV2NewOption, 0, len(columns))
+	newOptions := make([]forge.ProjectV2NewOption, 0, len(columns)+1)
 	for i, c := range columns {
 		newOptions = append(newOptions, forge.ProjectV2NewOption{
 			Name:  c.LabelName,
 			Color: provisionColor(i),
 		})
 	}
+	// Append the reserved "Done" projection option (PRD #584 M1) unless a board column is
+	// already named "Done". It rides the FIELD options only — the columnOption loop below
+	// iterates the board columns slice, so "Done" never becomes a status option/column here.
+	newOptions = appendDoneOption(newOptions, columns)
 	field, err := syncer.CreateProjectV2Field(ctx, project.ID, uziStatusFieldName, newOptions)
 	if err != nil {
 		return seedParams{}, fmt.Errorf("project sync: create status field: %w", err)
@@ -425,6 +460,10 @@ func (s *ProjectSyncService) provisionPrepare(ctx context.Context, repo store.Ge
 			columnOption[c.LabelName] = optID
 		}
 	}
+	// The reserved "Done" option id (PRD #584 M1): the appended option, or a pre-existing
+	// "Done" board column's option — either way it resolves by name off the created field.
+	// "" only if neither was present (defensive; the append guarantees one of the two).
+	doneOptionID := optionByName[doneColumnName]
 
 	// Persist the link BEFORE seeding, so a mid-seed failure still records the link (and
 	// its last_error). owned_by_uzi=TRUE — this is a uzi-created board (unlike adopt).
@@ -443,6 +482,7 @@ func (s *ProjectSyncService) provisionPrepare(ctx context.Context, repo store.Ge
 		// matches by construction — the unmatched set is always empty here. Pass an
 		// explicit empty slice (the query's COALESCE makes nil safe too).
 		UnmatchedColumns: []string{},
+		DoneOptionID:     doneOptionID, // PRD #584 M1: reserved "Done" projection option
 	}); err != nil {
 		return seedParams{}, fmt.Errorf("project sync: persist link: %w", err)
 	}
@@ -568,6 +608,11 @@ func (s *ProjectSyncService) prepareSeedLink(ctx context.Context, repo store.Get
 	for _, o := range field.Options {
 		optionByName[o.Name] = o.ID
 	}
+	// Adopt-path "Done" projection option (PRD #584 M1): if the resolved field already has
+	// a "Done" option, capture its id; else "" (no Done projection). "Done" is a RESERVED
+	// name — it is NOT added to columnOption/unmatched below (the loop iterates board
+	// columns, so a "Done" option with no matching board column is simply never visited).
+	doneOptionID := optionByName[doneColumnName]
 	columnOption := make(map[string]string, len(columns))
 	position := make(map[string]int, len(columns))
 	var unmatched []string
@@ -607,6 +652,7 @@ func (s *ProjectSyncService) prepareSeedLink(ctx context.Context, repo store.Get
 		StatusOptions:    optionsJSON,
 		OwnedByUzi:       ownedByUzi,
 		UnmatchedColumns: unmatched,
+		DoneOptionID:     doneOptionID, // PRD #584 M1: reserved "Done" projection option (adopt/resync)
 	}); err != nil {
 		return seedParams{}, nil, fmt.Errorf("project sync: persist link: %w", err)
 	}
@@ -798,13 +844,17 @@ func (s *ProjectSyncService) AutoCreateColumns(ctx context.Context, repoID uuid.
 	if err != nil {
 		return "", fmt.Errorf("project sync: list board columns: %w", err)
 	}
-	newOptions := make([]forge.ProjectV2NewOption, 0, len(columns))
+	newOptions := make([]forge.ProjectV2NewOption, 0, len(columns)+1)
 	for i, c := range columns {
 		newOptions = append(newOptions, forge.ProjectV2NewOption{
 			Name:  c.LabelName,
 			Color: provisionColor(i),
 		})
 	}
+	// Append the reserved "Done" projection option (PRD #584 M1) unless a board column is
+	// already named "Done". It rides the FIELD options only — the columnOption loop below
+	// iterates the board columns slice, so "Done" never becomes a status option/column here.
+	newOptions = appendDoneOption(newOptions, columns)
 
 	// Fresh uzi-owned field on the EXISTING adopted project (link.ProjectNodeID) — NOT a
 	// new project. F-E: a fresh field has no item values, so setting its options is safe.
@@ -828,6 +878,9 @@ func (s *ProjectSyncService) AutoCreateColumns(ctx context.Context, repoID uuid.
 			columnOption[c.LabelName] = optID
 		}
 	}
+	// The reserved "Done" option id (PRD #584 M1): the appended option, or a pre-existing
+	// "Done" board column's option — resolved by name off the freshly created field.
+	doneOptionID := optionByName[doneColumnName]
 	optionsJSON, err := json.Marshal(columnOption)
 	if err != nil {
 		return "", fmt.Errorf("project sync: marshal status options: %w", err)
@@ -852,6 +905,7 @@ func (s *ProjectSyncService) AutoCreateColumns(ctx context.Context, repoID uuid.
 		StatusOptions:    optionsJSON,
 		OwnedByUzi:       link.OwnedByUzi,
 		UnmatchedColumns: []string{},
+		DoneOptionID:     doneOptionID, // PRD #584 M1: reserved "Done" projection option
 	}); err != nil {
 		return "", fmt.Errorf("project sync: persist link: %w", err)
 	}

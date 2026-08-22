@@ -988,9 +988,10 @@ func TestAutoCreateColumnsCreatesFreshFieldWithEveryColumn(t *testing.T) {
 	if cf.name != "uzi Status" {
 		t.Errorf("field name = %q, want \"uzi Status\"", cf.name)
 	}
-	wantNames := []string{"In Progress", "Planned", "Human Review"}
+	// PRD #584 M1: every board column in order, then the reserved appended "Done" option.
+	wantNames := []string{"In Progress", "Planned", "Human Review", "Done"}
 	if len(cf.options) != len(wantNames) {
-		t.Fatalf("created options = %+v, want exactly the %d board columns", cf.options, len(wantNames))
+		t.Fatalf("created options = %+v, want the %d board columns plus the reserved Done option", cf.options, len(wantNames))
 	}
 	for i, want := range wantNames {
 		if cf.options[i].Name != want {
@@ -999,6 +1000,10 @@ func TestAutoCreateColumnsCreatesFreshFieldWithEveryColumn(t *testing.T) {
 		if !validGithubColors[cf.options[i].Color] {
 			t.Errorf("option %q has invalid color %q", cf.options[i].Name, cf.options[i].Color)
 		}
+	}
+	// The switched link captures the reserved Done option's created id (PRD #584 M1).
+	if link := st.links[0]; link.DoneOptionID != "opt-Done" {
+		t.Errorf("done_option_id = %q, want the created Done option id opt-Done", link.DoneOptionID)
 	}
 
 	// The link was switched to the new field id, its option map built from the CREATED
