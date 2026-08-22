@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -622,4 +624,65 @@ func TestReverseSyncAutoMoveErrorRetries(t *testing.T) {
 	if len(st.linkErrs) != 1 {
 		t.Errorf("want last_error stamped once, got %v", st.linkErrs)
 	}
+}
+
+// TestReverseSyncSuppressedWhileSeeding (PRD #576 M4 SC (d)): while the per-repo seeding
+// lease is active, ReverseSync makes ZERO AutoMove calls (a reverse tick must not race a
+// partially-seeded board). The zero-call assertion is NEGATIVE, so the second subtest is
+// its built-in mutation control: a lease older than seedSuppressLease does NOT suppress,
+// and the same fixture then drives exactly one AutoMove — proving the suppression, not a
+// vacuous no-op, is what silenced the first case.
+func TestReverseSyncSuppressedWhileSeeding(t *testing.T) {
+	// A live status that differs from the stored marker — this WOULD drive one AutoMove
+	// if the tick were not suppressed.
+	newStore := func(repoID uuid.UUID, seedingAt pgtype.Timestamptz) *fakeProjectStore {
+		link := forwardLink(t, map[string]string{"In Progress": "opt_ip"})
+		link.SeedingStartedAt = seedingAt
+		return &fakeProjectStore{
+			repo:          githubRepoRow(repoID),
+			link:          link,
+			issues:        []store.Issue{{ForgeIssueIid: 7, State: "opened", Labels: labelsJSON(t)}},
+			existingItems: []store.GithubProjectItem{projectItem(repoID, 7, "item7", "opt_old")},
+		}
+	}
+
+	t.Run("suppressed within the lease", func(t *testing.T) {
+		repoID := uuid.New()
+		syncer := reverseSyncer(forge.ProjectV2ItemStatus{ItemID: "item7", IssueNumber: 7, OptionID: "opt_ip"})
+		mover := &fakeMover{}
+		st := newStore(repoID, pgtype.Timestamptz{Time: time.Now(), Valid: true})
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		svc.SetMover(mover)
+
+		if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+			t.Fatalf("ReverseSync: %v", err)
+		}
+		if len(mover.calls) != 0 {
+			t.Errorf("seeding in progress must suppress reverse (zero AutoMove), got %v", mover.calls)
+		}
+		// The tick returned BEFORE reading live statuses or touching last_synced_at.
+		if syncer.readCalls != 0 {
+			t.Errorf("suppressed tick must not read live statuses, got %d reads", syncer.readCalls)
+		}
+		if st.touchCalls != 0 {
+			t.Errorf("suppressed tick must not touch last_synced_at, got %d", st.touchCalls)
+		}
+	})
+
+	t.Run("proceeds past the lease (mutation control)", func(t *testing.T) {
+		repoID := uuid.New()
+		syncer := reverseSyncer(forge.ProjectV2ItemStatus{ItemID: "item7", IssueNumber: 7, OptionID: "opt_ip"})
+		mover := &fakeMover{}
+		// A lease started 20m ago is past seedSuppressLease (10m): suppression must NOT fire.
+		st := newStore(repoID, pgtype.Timestamptz{Time: time.Now().Add(-20 * time.Minute), Valid: true})
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		svc.SetMover(mover)
+
+		if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+			t.Fatalf("ReverseSync: %v", err)
+		}
+		if len(mover.calls) != 1 || mover.calls[0].issueIID != 7 || mover.calls[0].target != "In Progress" {
+			t.Fatalf("an expired lease must NOT suppress; want one AutoMove issue7->\"In Progress\", got %v", mover.calls)
+		}
+	})
 }

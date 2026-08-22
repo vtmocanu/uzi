@@ -66,6 +66,23 @@ UPDATE github_project_links
 SET last_synced_at = now(), updated_at = now()
 WHERE repo_id = sqlc.arg('repo_id');
 
+-- name: MarkGithubProjectLinkSeeding :exec
+-- Take the per-repo seeding lease (PRD #576 M4): stamp seeding_started_at = now() so a
+-- reverse tick that fires while async seeding is in flight suppresses itself (it checks
+-- the lease age against seedSuppressLease). Set synchronously by launchSeed BEFORE the
+-- write handler returns, so a reverse poll landing right after Adopt is already covered.
+UPDATE github_project_links
+SET seeding_started_at = now(), updated_at = now()
+WHERE repo_id = sqlc.arg('repo_id');
+
+-- name: ClearGithubProjectLinkSeeding :exec
+-- Release the seeding lease (PRD #576 M4): null seeding_started_at when the background
+-- seed finishes (success, error, OR timeout — the finalize defer always runs). NULL =
+-- "not seeding", which re-enables the reverse poller for the repo.
+UPDATE github_project_links
+SET seeding_started_at = NULL, updated_at = now()
+WHERE repo_id = sqlc.arg('repo_id');
+
 -- name: UpsertGithubProjectItem :one
 -- Create or refresh the projection state for one issue. Keyed on the composite PK
 -- (repo_id, forge_issue_iid); item_node_id, last_status_option_id and last_synced_at

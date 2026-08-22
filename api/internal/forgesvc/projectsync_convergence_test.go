@@ -18,9 +18,11 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -272,6 +274,14 @@ func (s *statefulStore) SetGithubProjectItemStatusMarker(_ context.Context, arg 
 }
 func (s *statefulStore) TouchGithubProjectLinkSynced(context.Context, uuid.UUID) error {
 	s.touchCalls++
+	return nil
+}
+func (s *statefulStore) MarkGithubProjectLinkSeeding(_ context.Context, _ uuid.UUID) error {
+	s.link.SeedingStartedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+	return nil
+}
+func (s *statefulStore) ClearGithubProjectLinkSeeding(_ context.Context, _ uuid.UUID) error {
+	s.link.SeedingStartedAt = pgtype.Timestamptz{Valid: false}
 	return nil
 }
 

@@ -24,6 +24,20 @@ func (q *Queries) ClearGithubProjectLinkError(ctx context.Context, repoID uuid.U
 	return err
 }
 
+const clearGithubProjectLinkSeeding = `-- name: ClearGithubProjectLinkSeeding :exec
+UPDATE github_project_links
+SET seeding_started_at = NULL, updated_at = now()
+WHERE repo_id = $1
+`
+
+// Release the seeding lease (PRD #576 M4): null seeding_started_at when the background
+// seed finishes (success, error, OR timeout — the finalize defer always runs). NULL =
+// "not seeding", which re-enables the reverse poller for the repo.
+func (q *Queries) ClearGithubProjectLinkSeeding(ctx context.Context, repoID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, clearGithubProjectLinkSeeding, repoID)
+	return err
+}
+
 const deleteGithubProjectItem = `-- name: DeleteGithubProjectItem :exec
 DELETE FROM github_project_items
 WHERE repo_id = $1 AND forge_issue_iid = $2
@@ -76,7 +90,7 @@ func (q *Queries) GetGithubProjectItem(ctx context.Context, arg GetGithubProject
 }
 
 const getGithubProjectLinkByRepo = `-- name: GetGithubProjectLinkByRepo :one
-SELECT id, repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi, last_synced_at, last_error, created_at, updated_at, unmatched_columns FROM github_project_links WHERE repo_id = $1
+SELECT id, repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi, last_synced_at, last_error, created_at, updated_at, unmatched_columns, seeding_started_at FROM github_project_links WHERE repo_id = $1
 `
 
 // The link row for a repo, or no row when the repo is not synced.
@@ -96,6 +110,7 @@ func (q *Queries) GetGithubProjectLinkByRepo(ctx context.Context, repoID uuid.UU
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.UnmatchedColumns,
+		&i.SeedingStartedAt,
 	)
 	return i, err
 }
@@ -134,7 +149,7 @@ func (q *Queries) ListGithubProjectItems(ctx context.Context, repoID uuid.UUID) 
 }
 
 const listGithubProjectLinksByRepoIDs = `-- name: ListGithubProjectLinksByRepoIDs :many
-SELECT id, repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi, last_synced_at, last_error, created_at, updated_at, unmatched_columns FROM github_project_links WHERE repo_id = ANY($1::uuid[])
+SELECT id, repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi, last_synced_at, last_error, created_at, updated_at, unmatched_columns, seeding_started_at FROM github_project_links WHERE repo_id = ANY($1::uuid[])
 `
 
 // Batch-load link rows for a set of repo ids, for the caller-scoped repos-list
@@ -161,6 +176,7 @@ func (q *Queries) ListGithubProjectLinksByRepoIDs(ctx context.Context, repoIds [
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.UnmatchedColumns,
+			&i.SeedingStartedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -170,6 +186,21 @@ func (q *Queries) ListGithubProjectLinksByRepoIDs(ctx context.Context, repoIds [
 		return nil, err
 	}
 	return items, nil
+}
+
+const markGithubProjectLinkSeeding = `-- name: MarkGithubProjectLinkSeeding :exec
+UPDATE github_project_links
+SET seeding_started_at = now(), updated_at = now()
+WHERE repo_id = $1
+`
+
+// Take the per-repo seeding lease (PRD #576 M4): stamp seeding_started_at = now() so a
+// reverse tick that fires while async seeding is in flight suppresses itself (it checks
+// the lease age against seedSuppressLease). Set synchronously by launchSeed BEFORE the
+// write handler returns, so a reverse poll landing right after Adopt is already covered.
+func (q *Queries) MarkGithubProjectLinkSeeding(ctx context.Context, repoID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, markGithubProjectLinkSeeding, repoID)
+	return err
 }
 
 const setGithubProjectItemStatusMarker = `-- name: SetGithubProjectItemStatusMarker :exec
@@ -286,7 +317,7 @@ ON CONFLICT (repo_id) DO UPDATE SET
     owned_by_uzi      = EXCLUDED.owned_by_uzi,
     unmatched_columns = COALESCE($7::text[], '{}'),
     updated_at        = now()
-RETURNING id, repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi, last_synced_at, last_error, created_at, updated_at, unmatched_columns
+RETURNING id, repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi, last_synced_at, last_error, created_at, updated_at, unmatched_columns, seeding_started_at
 `
 
 type UpsertGithubProjectLinkParams struct {
@@ -334,6 +365,7 @@ func (q *Queries) UpsertGithubProjectLink(ctx context.Context, arg UpsertGithubP
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.UnmatchedColumns,
+		&i.SeedingStartedAt,
 	)
 	return i, err
 }

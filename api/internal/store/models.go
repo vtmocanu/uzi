@@ -184,6 +184,7 @@ type GithubProjectLink struct {
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
 	UnmatchedColumns []string           `json:"unmatched_columns"`
+	SeedingStartedAt pgtype.Timestamptz `json:"seeding_started_at"`
 }
 
 type HostedWorkerToken struct {
