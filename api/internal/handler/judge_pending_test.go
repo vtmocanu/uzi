@@ -25,7 +25,7 @@ import (
 // GetActiveJudgeRunForTarget can actually hand back. Its predicate carries the
 // uq_runs_one_active_judge_per_target active set, `status NOT IN ('completed','failed',
 // 'cancelled')`, which is a set defined by SUBTRACTION. Against the LIVE constraint
-// (runs_status_check, ten values as of 00144) that is SEVEN statuses — queued, claimed,
+// (runs_status_check, ten values as of 00146) that is SEVEN statuses — queued, claimed,
 // running, awaiting_approval, awaiting_input, limit_wait, awaiting_followup — and a future
 // migration widening runs_status_check silently adds its new value too.
 //
@@ -58,7 +58,7 @@ func TestPendingJudgeState(t *testing.T) {
 				"status) carries AND kind <> 'judge'. Enumerated anyway: the set is the constraint's, " +
 				"not the reachable subset's, and a guard is a fact about today's code"},
 		{"awaiting_followup", "running",
-			"inside the active set (00144) — PRD #517's interactive-task park; out of reach for a judge " +
+			"inside the active set (00146) — PRD #517's interactive-task park; out of reach for a judge " +
 				"(its writer guards kind='task' AND interactive), but schema-permitted like the rest, so " +
 				"the query can return it"},
 		{"some_future_status", "running",

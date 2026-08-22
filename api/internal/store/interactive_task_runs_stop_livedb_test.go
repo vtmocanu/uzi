@@ -103,7 +103,7 @@ func TestStopVerdictStopsThenCompletesLiveDB(t *testing.T) {
 }
 
 // A defense-in-depth read: the run_user_inputs.kind CHECK admits 'stop' (migration
-// 00144). A raw insert of a bogus kind is rejected, so the constraint is live.
+// 00146). A raw insert of a bogus kind is rejected, so the constraint is live.
 func TestStopInputKindConstraintLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {

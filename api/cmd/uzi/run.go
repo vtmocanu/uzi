@@ -87,7 +87,7 @@ var terminalRunStatuses = map[string]bool{
 }
 
 // allRunStatusesOrder is the run status enum in wire/enum order (matching migration
-// 00144's runs_status_check — the current last rewrite, ten values), the ONE source of
+// 00146's runs_status_check — the current last rewrite, ten values), the ONE source of
 // truth both allRunStatuses (membership)
 // and the `--until` validation-error's "valid: …" list derive from — so a status added
 // here can never be silently omitted from the human-readable enumeration.
@@ -105,7 +105,7 @@ var allRunStatusesOrder = []string{
 }
 
 // allRunStatuses is the run status enum the skill documents and migration
-// 00144 constrains (runs_status_check). It is the source of truth `run wait`
+// 00146 constrains (runs_status_check). It is the source of truth `run wait`
 // validates `--until` against, so a typo'd target is a clean usage error rather than
 // a silent forever-wait. A status the SERVER reports that is NOT in this set is a
 // newer server than this binary (surfaced, treated non-terminal — never a target,
@@ -334,7 +334,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 					// cellText, NOT sanitizeTTY, and the difference is the whole point:
 					// sanitizeTTY spares "\n", so a status carrying one would inject a
 					// line onto stderr. Unreachable today because runs_status_check
-					// constrains status to ten values (migration 00144) — which is precisely the argument
+					// constrains status to ten values (migration 00146) — which is precisely the argument
 					// limitWaitLine's own comment REJECTS for rate_limit_type ("server-
 					// controlled today" is exactly the assumption that rots). Holding one
 					// line of this file to a weaker standard than the line beside it, on a

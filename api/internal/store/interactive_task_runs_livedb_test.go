@@ -1,7 +1,7 @@
 package store_test
 
 // PRD #517 M1 — the parts of interactive, long-lived task runs that only a real Postgres
-// can answer: whether migration 00144's four CHECK/column changes actually took, and
+// can answer: whether migration 00146's four CHECK/column changes actually took, and
 // whether runs.interactive round-trips create → row.
 //
 // (a) The widened CHECKs must ACCEPT the new values and still accept every pre-existing
