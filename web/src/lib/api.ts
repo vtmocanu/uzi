@@ -430,6 +430,9 @@ export interface ProjectSyncStatus {
   // M3): the panel surfaces them with a Resync prompt. Always an array from the server
   // (never null); optional here so a pre-M3 fixture without the field still typechecks.
   unmatched_columns?: string[];
+  // True when the synced Status field has no "Done" option, so closed issues cannot show
+  // a Done status (PRD #584 M4). Optional so a pre-M4 fixture without the field typechecks.
+  no_done_option?: boolean;
 }
 // Which GitHub owner a provision/adopt targets (PRD #534): the connecting user,
 // an org, or the token's own viewer. "user" is the default.

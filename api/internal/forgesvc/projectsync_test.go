@@ -226,7 +226,26 @@ func (f *fakeProjectSyncer) CreateProjectV2Field(_ context.Context, _, name stri
 	if f.createFieldErr != nil {
 		return forge.ProjectV2StatusField{}, f.createFieldErr
 	}
-	return f.createField, nil
+	// Return the scripted field, but ensure EVERY passed option is present in the returned
+	// Options with a stable id — so a create path that appends the reserved "Done" option
+	// (PRD #584 M1) can capture its id by name. Scripted options (createField.Options) keep
+	// their explicit ids (e.g. opt_ip); any passed option not already scripted (typically
+	// the appended "Done") gets a synthetic "opt-"+Name id.
+	field := f.createField
+	opts := make([]forge.ProjectV2Option, len(field.Options))
+	copy(opts, field.Options)
+	have := make(map[string]bool, len(opts))
+	for _, o := range opts {
+		have[o.Name] = true
+	}
+	for _, o := range options {
+		if !have[o.Name] {
+			opts = append(opts, forge.ProjectV2Option{ID: "opt-" + o.Name, Name: o.Name})
+			have[o.Name] = true
+		}
+	}
+	field.Options = opts
+	return field, nil
 }
 
 func (f *fakeProjectSyncer) LinkProjectV2ToRepository(context.Context, string, string) error {
@@ -621,6 +640,89 @@ func TestAdoptStatusFieldFallback(t *testing.T) {
 	}
 }
 
+// TestAdoptCapturesDoneOption (PRD #584 M1, adopt path): when the resolved Status field
+// already has a "Done" option, the persisted link captures its id — and "Done" is a
+// RESERVED name, so it must NOT appear in status_options or unmatched_columns (there is no
+// board column named "Done" here; the columnOption loop iterates board columns, so the
+// field's "Done" option is simply never visited).
+func TestAdoptCapturesDoneOption(t *testing.T) {
+	repoID := uuid.New()
+	syncer := &fakeProjectSyncer{
+		fakeForge: &fakeForge{},
+		scopes:    []string{"repo", "project"},
+		slugOwner: "acme", slugRepo: "widgets",
+		project:    forge.ProjectV2Ref{ID: "PVT_1", Number: 7},
+		repoNodeID: "REPO_1",
+		fields: map[string]forge.ProjectV2StatusField{
+			"Status": {ID: "PVTSSF_1", Name: "Status", Options: []forge.ProjectV2Option{
+				{ID: "opt_ip", Name: "In Progress"},
+				{ID: "opt_done", Name: "Done"},
+			}},
+		},
+	}
+	st := &fakeProjectStore{
+		repo:    githubRepoRow(repoID),
+		columns: []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.background = syncBackground
+	if err := svc.Adopt(context.Background(), repoID, 7, forge.OwnerUser); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	if len(st.links) != 1 {
+		t.Fatalf("want 1 link upsert, got %d", len(st.links))
+	}
+	link := st.links[0]
+	if link.DoneOptionID != "opt_done" {
+		t.Errorf("done_option_id = %q, want opt_done (adopted the field's existing Done option)", link.DoneOptionID)
+	}
+	var gotMap map[string]string
+	if err := json.Unmarshal(link.StatusOptions, &gotMap); err != nil {
+		t.Fatalf("status_options not valid json: %v", err)
+	}
+	if _, ok := gotMap["Done"]; ok {
+		t.Errorf("reserved \"Done\" must NOT be a status option (no board column named Done), got %v", gotMap)
+	}
+	for _, u := range link.UnmatchedColumns {
+		if u == "Done" {
+			t.Errorf("reserved \"Done\" must NOT be reported as an unmatched column, got %v", link.UnmatchedColumns)
+		}
+	}
+}
+
+// TestAdoptNoDoneOption (PRD #584 M1, adopt path): a field with no "Done" option persists
+// an empty done_option_id (no Done projection).
+func TestAdoptNoDoneOption(t *testing.T) {
+	repoID := uuid.New()
+	syncer := &fakeProjectSyncer{
+		fakeForge: &fakeForge{},
+		scopes:    []string{"repo", "project"},
+		slugOwner: "acme", slugRepo: "widgets",
+		project:    forge.ProjectV2Ref{ID: "PVT_1", Number: 7},
+		repoNodeID: "REPO_1",
+		fields: map[string]forge.ProjectV2StatusField{
+			"Status": {ID: "PVTSSF_1", Name: "Status", Options: []forge.ProjectV2Option{
+				{ID: "opt_ip", Name: "In Progress"},
+			}},
+		},
+	}
+	st := &fakeProjectStore{
+		repo:    githubRepoRow(repoID),
+		columns: []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.background = syncBackground
+	if err := svc.Adopt(context.Background(), repoID, 7, forge.OwnerUser); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	if len(st.links) != 1 {
+		t.Fatalf("want 1 link upsert, got %d", len(st.links))
+	}
+	if link := st.links[0]; link.DoneOptionID != "" {
+		t.Errorf("done_option_id = %q, want empty (field has no Done option)", link.DoneOptionID)
+	}
+}
+
 func TestAdoptDisabled(t *testing.T) {
 	st := &fakeProjectStore{repo: githubRepoRow(uuid.New())}
 	svc := NewProjectSync(st, fakeForgeBuilder{}, fakeSyncSettings{enabled: false}, nil)
@@ -778,13 +880,18 @@ func TestProvisionCreatesBoardAndSeeds(t *testing.T) {
 	if cf.name != "uzi Status" {
 		t.Errorf("field name = %q, want \"uzi Status\"", cf.name)
 	}
-	if len(cf.options) != 2 || cf.options[0].Name != "In Progress" || cf.options[1].Name != "Human Review" {
-		t.Errorf("created options = %+v, want the two board columns in order", cf.options)
+	// PRD #584 M1: the two board columns in order, then the reserved appended "Done" option.
+	if len(cf.options) != 3 || cf.options[0].Name != "In Progress" || cf.options[1].Name != "Human Review" || cf.options[2].Name != "Done" {
+		t.Errorf("created options = %+v, want the two board columns then the reserved Done option", cf.options)
 	}
 	for _, o := range cf.options {
 		if !validGithubColors[o.Color] {
 			t.Errorf("option %q has invalid color %q", o.Name, o.Color)
 		}
+	}
+	// The persisted link captures the reserved Done option's created id (PRD #584 M1).
+	if link := st.links[0]; link.DoneOptionID != "opt-Done" {
+		t.Errorf("done_option_id = %q, want the created Done option id opt-Done", link.DoneOptionID)
 	}
 
 	// Link persisted once, owned_by_uzi TRUE, coordinates from the created project +
@@ -863,13 +970,61 @@ func TestProvisionColorsCycle(t *testing.T) {
 		t.Fatalf("Provision: %v", err)
 	}
 	cf := syncer.createFieldCalls[0]
-	if len(cf.options) != 10 {
-		t.Fatalf("want 10 options, got %d", len(cf.options))
+	// PRD #584 M1: 10 board columns + the reserved appended "Done" option = 11, and the
+	// Done option (appended AFTER the cycled column colors) carries a valid color too.
+	if len(cf.options) != 11 {
+		t.Fatalf("want 11 options (10 columns + Done), got %d", len(cf.options))
+	}
+	if cf.options[10].Name != "Done" {
+		t.Errorf("last option = %q, want the reserved Done option", cf.options[10].Name)
 	}
 	for _, o := range cf.options {
 		if !validGithubColors[o.Color] {
 			t.Errorf("option %q has invalid color %q", o.Name, o.Color)
 		}
+	}
+}
+
+// TestProvisionDoneColumnNotDoubleAppended (PRD #584 M1, R6): when a board column is
+// ALREADY literally named "Done", the create path must NOT append a second "Done" option
+// (option count == column count) — that column's own option carries the name — and
+// done_option_id points at that column's option id, which also stays a normal status option.
+func TestProvisionDoneColumnNotDoubleAppended(t *testing.T) {
+	repoID := uuid.New()
+	syncer := provisionSyncer("PVTSSF_NEW", []forge.ProjectV2Option{
+		{ID: "opt_ip", Name: "In Progress"},
+		{ID: "opt_done_col", Name: "Done"},
+	})
+	st := &fakeProjectStore{
+		repo:    githubRepoRow(repoID),
+		linkErr: pgx.ErrNoRows,
+		columns: []store.BoardColumn{
+			{LabelName: "In Progress", Position: 1},
+			{LabelName: "Done", Position: 2}, // a real board column named "Done"
+		},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.background = syncBackground
+	if err := svc.Provision(context.Background(), repoID, forge.OwnerUser, ""); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	cf := syncer.createFieldCalls[0]
+	// No extra "Done" appended: exactly the two board columns, both named as given.
+	if len(cf.options) != 2 || cf.options[0].Name != "In Progress" || cf.options[1].Name != "Done" {
+		t.Fatalf("created options = %+v, want exactly the two board columns (no extra Done)", cf.options)
+	}
+	link := st.links[0]
+	// done_option_id is the existing "Done" column's option id, and "Done" is still a
+	// normal status option (it is a real board column here).
+	if link.DoneOptionID != "opt_done_col" {
+		t.Errorf("done_option_id = %q, want the existing Done column's id opt_done_col", link.DoneOptionID)
+	}
+	var gotMap map[string]string
+	if err := json.Unmarshal(link.StatusOptions, &gotMap); err != nil {
+		t.Fatalf("status_options not valid json: %v", err)
+	}
+	if gotMap["Done"] != "opt_done_col" {
+		t.Errorf("a real Done column must stay a status option, got %v", gotMap)
 	}
 }
 
@@ -1150,6 +1305,39 @@ func TestProjectSyncStatusReturnsUnmatchedColumns(t *testing.T) {
 	}
 	if len(got.UnmatchedColumns) != 2 || got.UnmatchedColumns[0] != "Planned" || got.UnmatchedColumns[1] != "bug" {
 		t.Errorf("UnmatchedColumns = %v, want [Planned bug]", got.UnmatchedColumns)
+	}
+}
+
+// TestProjectSyncStatusReportsNoDoneOption (PRD #584 M4): the status DTO's NoDoneOption
+// is a pure store read of link.DoneOptionID — true when the linked Status field has no
+// reserved "Done" option (empty id), false when it has one. No forge call (D5).
+func TestProjectSyncStatusReportsNoDoneOption(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		doneOptionID string
+		wantNoDone   bool
+	}{
+		{"empty id => no Done option", "", true},
+		{"non-empty id => has Done option", "opt_done", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repoID := uuid.New()
+			st := &fakeProjectStore{
+				link: store.GithubProjectLink{
+					RepoID:        repoID,
+					ProjectNumber: 42,
+					DoneOptionID:  tc.doneOptionID,
+				},
+			}
+			svc := NewProjectSync(st, fakeForgeBuilder{}, fakeSyncSettings{enabled: true}, nil)
+			got, err := svc.ProjectSyncStatus(context.Background(), repoID)
+			if err != nil {
+				t.Fatalf("ProjectSyncStatus: %v", err)
+			}
+			if got.NoDoneOption != tc.wantNoDone {
+				t.Errorf("NoDoneOption = %v, want %v (done_option_id %q)", got.NoDoneOption, tc.wantNoDone, tc.doneOptionID)
+			}
+		})
 	}
 }
 
@@ -1953,4 +2141,105 @@ func TestAdoptAsyncSeedFailureStampsError(t *testing.T) {
 	if st.linkErrCleared != 0 {
 		t.Errorf("(c) a failed seed must not clear last_error, got %d", st.linkErrCleared)
 	}
+}
+
+// (seedItems re-seed, PRD #584 M2) A manual Adopt re-seed projects a CLOSED issue to the
+// reserved Done option: the item is ADDED (if missing) and Set to Done, and its marker is
+// persisted as Done. With NO Done option on the field the closed issue is SKIPPED (no add,
+// no Set) — the pre-M2 D1 behavior.
+//
+// Non-vacuity: revert seedItems' closed branch to the old unconditional `continue` and the
+// "Done option present" sub-case reds — the closed issue is neither added nor Set to Done.
+func TestSeedItemsClosedIssueProjectsToDone(t *testing.T) {
+	t.Run("field has a Done option: add + Set closed issue to Done", func(t *testing.T) {
+		repoID := uuid.New()
+		syncer := &fakeProjectSyncer{
+			fakeForge: &fakeForge{},
+			scopes:    []string{"repo", "project"},
+			slugOwner: "acme", slugRepo: "widgets",
+			project:    forge.ProjectV2Ref{ID: "PVT_1", Number: 7, Title: "Board"},
+			repoNodeID: "REPO_1",
+			fields: map[string]forge.ProjectV2StatusField{
+				"Status": {ID: "PVTSSF_1", Name: "Status", Options: []forge.ProjectV2Option{
+					{ID: "opt_ip", Name: "In Progress"},
+					{ID: "opt_done", Name: "Done"}, // reserved Done option already on the field
+				}},
+			},
+			live:      nil, // closed issue not on the board yet → added
+			issueNode: map[int]string{3: "content3"},
+		}
+		st := &fakeProjectStore{
+			repo:    githubRepoRow(repoID),
+			columns: []store.BoardColumn{{LabelName: "In Progress", Position: 1}}, // no "Done" board column
+			issues: []store.Issue{
+				{ForgeIssueIid: 3, State: "closed", Labels: labelsJSON(t, "In Progress")}, // → Done
+			},
+		}
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		svc.background = syncBackground
+
+		if err := svc.Adopt(context.Background(), repoID, 7, forge.OwnerUser); err != nil {
+			t.Fatalf("Adopt: %v", err)
+		}
+		// The link captured the field's existing Done option id.
+		if len(st.links) != 1 || st.links[0].DoneOptionID != "opt_done" {
+			t.Fatalf("want link done_option_id opt_done, got %+v", st.links)
+		}
+		// The closed issue was added once, then Set to Done.
+		if len(syncer.addCalls) != 1 || syncer.addCalls[0] != "content3" {
+			t.Errorf("want closed issue content3 added once, got %v", syncer.addCalls)
+		}
+		if len(syncer.setCalls) != 1 || syncer.setCalls[0].itemID != "item-content3" || syncer.setCalls[0].optionID != "opt_done" {
+			t.Errorf("want one Set item-content3->opt_done, got %v", syncer.setCalls)
+		}
+		// The persisted marker is Done.
+		if m := st.items[3].LastStatusOptionID; !m.Valid || m.String != "opt_done" {
+			t.Errorf("issue 3 marker = %+v, want opt_done", m)
+		}
+	})
+
+	t.Run("field has no Done option: closed issue skipped", func(t *testing.T) {
+		repoID := uuid.New()
+		syncer := &fakeProjectSyncer{
+			fakeForge: &fakeForge{},
+			scopes:    []string{"repo", "project"},
+			slugOwner: "acme", slugRepo: "widgets",
+			project:    forge.ProjectV2Ref{ID: "PVT_1", Number: 7, Title: "Board"},
+			repoNodeID: "REPO_1",
+			fields: map[string]forge.ProjectV2StatusField{
+				"Status": {ID: "PVTSSF_1", Name: "Status", Options: []forge.ProjectV2Option{
+					{ID: "opt_ip", Name: "In Progress"}, // no Done option
+				}},
+			},
+			issueNode: map[int]string{3: "content3"},
+		}
+		st := &fakeProjectStore{
+			repo:    githubRepoRow(repoID),
+			columns: []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+			issues: []store.Issue{
+				{ForgeIssueIid: 3, State: "closed", Labels: labelsJSON(t, "In Progress")}, // skipped
+			},
+		}
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		svc.background = syncBackground
+
+		if err := svc.Adopt(context.Background(), repoID, 7, forge.OwnerUser); err != nil {
+			t.Fatalf("Adopt: %v", err)
+		}
+		if len(st.links) != 1 || st.links[0].DoneOptionID != "" {
+			t.Fatalf("want empty done_option_id, got %+v", st.links)
+		}
+		// The closed issue is neither added nor Set, and has no persisted item.
+		for _, c := range syncer.addCalls {
+			if c == "content3" {
+				t.Errorf("closed issue must not be added when there is no Done option, got adds %v", syncer.addCalls)
+			}
+		}
+		if len(syncer.setCalls) != 0 {
+			t.Errorf("closed issue must not be Set when there is no Done option, got %v", syncer.setCalls)
+		}
+		if _, ok := st.items[3]; ok {
+			t.Errorf("closed issue must not persist an item when skipped, got %+v", st.items[3])
+		}
+	})
 }

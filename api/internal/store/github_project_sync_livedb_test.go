@@ -145,6 +145,51 @@ func TestGithubProjectSyncLiveDB(t *testing.T) {
 		t.Errorf("unmatched_columns round-trip = %v, want [Backlog Blocked]", got.UnmatchedColumns)
 	}
 
+	// --- PRD #584 M1 done_option_id round-trip -----------------------------
+	// The inserts above carried a zero-value DoneOptionID (defaulted to ''); pin that a
+	// non-empty create-path Done option id round-trips verbatim AND that the conflict-update
+	// path overwrites it (EXCLUDED.done_option_id), mirroring every other mutable column.
+	if got.DoneOptionID != "" {
+		t.Errorf("done_option_id should default to '' for a link that never set it, got %q", got.DoneOptionID)
+	}
+	if _, err := q.UpsertGithubProjectLink(ctx, store.UpsertGithubProjectLinkParams{
+		RepoID:        repoID,
+		ProjectNodeID: "PVT_node_2",
+		ProjectNumber: 9,
+		StatusFieldID: "PVTSSF_field_2",
+		StatusOptions: []byte(`{"In Progress":"opt_wip"}`),
+		OwnedByUzi:    false,
+		DoneOptionID:  "opt_done_584",
+	}); err != nil {
+		t.Fatalf("UpsertGithubProjectLink with done_option_id: %v", err)
+	}
+	got, err = q.GetGithubProjectLinkByRepo(ctx, repoID)
+	if err != nil {
+		t.Fatalf("GetGithubProjectLinkByRepo after done_option_id upsert: %v", err)
+	}
+	if got.DoneOptionID != "opt_done_584" {
+		t.Errorf("done_option_id round-trip = %q, want opt_done_584", got.DoneOptionID)
+	}
+	// Conflict-update overwrites it back to '' (EXCLUDED path), proving it is a mutable column.
+	if _, err := q.UpsertGithubProjectLink(ctx, store.UpsertGithubProjectLinkParams{
+		RepoID:        repoID,
+		ProjectNodeID: "PVT_node_2",
+		ProjectNumber: 9,
+		StatusFieldID: "PVTSSF_field_2",
+		StatusOptions: []byte(`{"In Progress":"opt_wip"}`),
+		OwnedByUzi:    false,
+		DoneOptionID:  "",
+	}); err != nil {
+		t.Fatalf("UpsertGithubProjectLink clearing done_option_id: %v", err)
+	}
+	got, err = q.GetGithubProjectLinkByRepo(ctx, repoID)
+	if err != nil {
+		t.Fatalf("GetGithubProjectLinkByRepo after done_option_id clear: %v", err)
+	}
+	if got.DoneOptionID != "" {
+		t.Errorf("conflict-update must overwrite done_option_id back to '', got %q", got.DoneOptionID)
+	}
+
 	// --- M4 seeding lease mark/clear ---------------------------------------
 	// seeding_started_at is the per-repo reverse-suppression lease; it must start NULL,
 	// stamp on Mark, and null again on Clear (the nullable-timestamp lease semantics).

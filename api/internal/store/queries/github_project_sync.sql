@@ -11,13 +11,16 @@
 -- unmatched_columns (PRD #576 M3) is COALESCE'd from nil→'{}' so a nil Go []string
 -- never becomes SQL NULL and violates the NOT NULL constraint; the same guard is
 -- applied on both the INSERT and the conflict update.
+-- done_option_id (PRD #584 M1) is the reserved "Done" projection option id (empty =
+-- none) captured on link setup (create AND adopt paths); it is overwritten on the
+-- conflict update like every other mutable column.
 INSERT INTO github_project_links (
     repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi,
-    unmatched_columns
+    unmatched_columns, done_option_id
 ) VALUES (
     sqlc.arg('repo_id'), sqlc.arg('project_node_id'), sqlc.arg('project_number'),
     sqlc.arg('status_field_id'), sqlc.arg('status_options'), sqlc.arg('owned_by_uzi'),
-    COALESCE(sqlc.arg('unmatched_columns')::text[], '{}')
+    COALESCE(sqlc.arg('unmatched_columns')::text[], '{}'), sqlc.arg('done_option_id')
 )
 ON CONFLICT (repo_id) DO UPDATE SET
     project_node_id   = EXCLUDED.project_node_id,
@@ -26,6 +29,7 @@ ON CONFLICT (repo_id) DO UPDATE SET
     status_options    = EXCLUDED.status_options,
     owned_by_uzi      = EXCLUDED.owned_by_uzi,
     unmatched_columns = COALESCE(sqlc.arg('unmatched_columns')::text[], '{}'),
+    done_option_id    = EXCLUDED.done_option_id,
     updated_at        = now()
 RETURNING *;
 

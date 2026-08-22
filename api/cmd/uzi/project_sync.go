@@ -65,6 +65,7 @@ func newProjectSyncCmd(env Env, gf *globalFlags) *cobra.Command {
 					"last_error":        st.LastError,
 					"item_count":        st.ItemCount,
 					"unmatched_columns": st.UnmatchedColumns,
+					"no_done_option":    st.NoDoneOption,
 				})
 			}
 			health := "ok"
@@ -92,6 +93,7 @@ func newProjectSyncCmd(env Env, gf *globalFlags) *cobra.Command {
 				[]string{"LAST_SYNCED", lastSynced},
 				[]string{"ITEMS", strconv.Itoa(st.ItemCount)},
 				[]string{"UNMATCHED_COLUMNS", unmatched},
+				[]string{"NO_DONE_OPTION", boolStr(st.NoDoneOption)},
 			)
 			return p.Table([]string{"FIELD", "VALUE"}, rows)
 		},

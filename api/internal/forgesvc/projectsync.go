@@ -360,6 +360,37 @@ func provisionColor(i int) string {
 	return provisionColors[i%len(provisionColors)]
 }
 
+// doneColumnName is the reserved name of the "Done" projection option uzi appends on the
+// create path (PRD #584 M1), so a CLOSED issue can later (M2) be projected to a dedicated
+// Done status. It is NOT a board column: the column→option map is built by iterating the
+// board columns slice, so appending this option to the FIELD's option list never leaks it
+// into status_options. When a board column is ALREADY literally named "Done" (case-
+// sensitive exact match) uzi does NOT append — that column's own option carries the name,
+// and done_option_id points at it (capturing by name would otherwise be ambiguous — R6).
+const doneColumnName = "Done"
+
+// doneColumnColor is the fixed distinct color for the appended "Done" option. GREEN is a
+// valid member of GitHub's ProjectV2SingleSelectFieldOptionColor enum (see provisionColors,
+// which cycles GREEN as one of its eight) and reads as "done". It is appended AFTER the
+// per-column cycled colors, so provisionColor stays keyed on the board-column index and the
+// palette assignment for real columns is unchanged.
+const doneColumnColor = "GREEN"
+
+// appendDoneOption appends the reserved "Done" projection option (PRD #584 M1) to a
+// create-path field's option list, UNLESS a board column is already literally named "Done"
+// (case-sensitive exact match against LabelName), in which case that column's own option
+// carries the name and nothing is appended. It never mutates the caller's columns slice —
+// "Done" is added only to the FIELD options, not to the board columns that build the
+// column→option map.
+func appendDoneOption(options []forge.ProjectV2NewOption, columns []store.BoardColumn) []forge.ProjectV2NewOption {
+	for _, c := range columns {
+		if c.LabelName == doneColumnName {
+			return options // a real "Done" column already provides the option
+		}
+	}
+	return append(options, forge.ProjectV2NewOption{Name: doneColumnName, Color: doneColumnColor})
+}
+
 // provisionPrepare does the resolve → create-project → create-field → map →
 // persist-link work for Provision, and returns the seedParams for the caller to seed
 // asynchronously (PRD #576 M4). It does NOT seed items. Unlike adoptPrepare there is NO
@@ -399,13 +430,17 @@ func (s *ProjectSyncService) provisionPrepare(ctx context.Context, repo store.Ge
 	if err != nil {
 		return seedParams{}, fmt.Errorf("project sync: list board columns: %w", err)
 	}
-	newOptions := make([]forge.ProjectV2NewOption, 0, len(columns))
+	newOptions := make([]forge.ProjectV2NewOption, 0, len(columns)+1)
 	for i, c := range columns {
 		newOptions = append(newOptions, forge.ProjectV2NewOption{
 			Name:  c.LabelName,
 			Color: provisionColor(i),
 		})
 	}
+	// Append the reserved "Done" projection option (PRD #584 M1) unless a board column is
+	// already named "Done". It rides the FIELD options only — the columnOption loop below
+	// iterates the board columns slice, so "Done" never becomes a status option/column here.
+	newOptions = appendDoneOption(newOptions, columns)
 	field, err := syncer.CreateProjectV2Field(ctx, project.ID, uziStatusFieldName, newOptions)
 	if err != nil {
 		return seedParams{}, fmt.Errorf("project sync: create status field: %w", err)
@@ -425,6 +460,10 @@ func (s *ProjectSyncService) provisionPrepare(ctx context.Context, repo store.Ge
 			columnOption[c.LabelName] = optID
 		}
 	}
+	// The reserved "Done" option id (PRD #584 M1): the appended option, or a pre-existing
+	// "Done" board column's option — either way it resolves by name off the created field.
+	// "" only if neither was present (defensive; the append guarantees one of the two).
+	doneOptionID := optionByName[doneColumnName]
 
 	// Persist the link BEFORE seeding, so a mid-seed failure still records the link (and
 	// its last_error). owned_by_uzi=TRUE — this is a uzi-created board (unlike adopt).
@@ -443,6 +482,7 @@ func (s *ProjectSyncService) provisionPrepare(ctx context.Context, repo store.Ge
 		// matches by construction — the unmatched set is always empty here. Pass an
 		// explicit empty slice (the query's COALESCE makes nil safe too).
 		UnmatchedColumns: []string{},
+		DoneOptionID:     doneOptionID, // PRD #584 M1: reserved "Done" projection option
 	}); err != nil {
 		return seedParams{}, fmt.Errorf("project sync: persist link: %w", err)
 	}
@@ -456,6 +496,7 @@ func (s *ProjectSyncService) provisionPrepare(ctx context.Context, repo store.Ge
 		fieldID:      field.ID,
 		columnOption: columnOption,
 		position:     position,
+		doneOptionID: doneOptionID, // PRD #584 M2: seed closed issues to Done on re-seed
 	}, nil
 }
 
@@ -472,6 +513,11 @@ type seedParams struct {
 	fieldID      string
 	columnOption map[string]string
 	position     map[string]int
+	// doneOptionID is the link's reserved "Done" projection option id (PRD #584 M2),
+	// threaded so a manual re-seed (Adopt/Resync/Provision/AutoCreateColumns) projects a
+	// CLOSED issue to Done — mirroring the periodic reconcile path — instead of skipping
+	// it. "" = no Done option, so closed issues are skipped (the pre-M2 behavior).
+	doneOptionID string
 }
 
 // seed runs the item-seeding step for a prepared link. It is a thin wrapper over
@@ -479,7 +525,7 @@ type seedParams struct {
 // a goroutine. seedItems keeps its explicit positional signature (unchanged since
 // PRD #364) so its many internal references stay stable.
 func (s *ProjectSyncService) seed(ctx context.Context, p seedParams) error {
-	return s.seedItems(ctx, p.repo, p.syncer, p.owner, p.name, p.projectID, p.fieldID, p.columnOption, p.position)
+	return s.seedItems(ctx, p.repo, p.syncer, p.owner, p.name, p.projectID, p.fieldID, p.columnOption, p.position, p.doneOptionID)
 }
 
 // launchSeed runs the item-seeding step asynchronously (PRD #576 M4) so Adopt/Resync/
@@ -568,6 +614,11 @@ func (s *ProjectSyncService) prepareSeedLink(ctx context.Context, repo store.Get
 	for _, o := range field.Options {
 		optionByName[o.Name] = o.ID
 	}
+	// Adopt-path "Done" projection option (PRD #584 M1): if the resolved field already has
+	// a "Done" option, capture its id; else "" (no Done projection). "Done" is a RESERVED
+	// name — it is NOT added to columnOption/unmatched below (the loop iterates board
+	// columns, so a "Done" option with no matching board column is simply never visited).
+	doneOptionID := optionByName[doneColumnName]
 	columnOption := make(map[string]string, len(columns))
 	position := make(map[string]int, len(columns))
 	var unmatched []string
@@ -607,6 +658,7 @@ func (s *ProjectSyncService) prepareSeedLink(ctx context.Context, repo store.Get
 		StatusOptions:    optionsJSON,
 		OwnedByUzi:       ownedByUzi,
 		UnmatchedColumns: unmatched,
+		DoneOptionID:     doneOptionID, // PRD #584 M1: reserved "Done" projection option (adopt/resync)
 	}); err != nil {
 		return seedParams{}, nil, fmt.Errorf("project sync: persist link: %w", err)
 	}
@@ -620,6 +672,7 @@ func (s *ProjectSyncService) prepareSeedLink(ctx context.Context, repo store.Get
 		fieldID:      field.ID,
 		columnOption: columnOption,
 		position:     position,
+		doneOptionID: doneOptionID, // PRD #584 M2: seed closed issues to Done on re-seed
 	}, unmatched, nil
 }
 
@@ -798,13 +851,17 @@ func (s *ProjectSyncService) AutoCreateColumns(ctx context.Context, repoID uuid.
 	if err != nil {
 		return "", fmt.Errorf("project sync: list board columns: %w", err)
 	}
-	newOptions := make([]forge.ProjectV2NewOption, 0, len(columns))
+	newOptions := make([]forge.ProjectV2NewOption, 0, len(columns)+1)
 	for i, c := range columns {
 		newOptions = append(newOptions, forge.ProjectV2NewOption{
 			Name:  c.LabelName,
 			Color: provisionColor(i),
 		})
 	}
+	// Append the reserved "Done" projection option (PRD #584 M1) unless a board column is
+	// already named "Done". It rides the FIELD options only — the columnOption loop below
+	// iterates the board columns slice, so "Done" never becomes a status option/column here.
+	newOptions = appendDoneOption(newOptions, columns)
 
 	// Fresh uzi-owned field on the EXISTING adopted project (link.ProjectNodeID) — NOT a
 	// new project. F-E: a fresh field has no item values, so setting its options is safe.
@@ -828,6 +885,9 @@ func (s *ProjectSyncService) AutoCreateColumns(ctx context.Context, repoID uuid.
 			columnOption[c.LabelName] = optID
 		}
 	}
+	// The reserved "Done" option id (PRD #584 M1): the appended option, or a pre-existing
+	// "Done" board column's option — resolved by name off the freshly created field.
+	doneOptionID := optionByName[doneColumnName]
 	optionsJSON, err := json.Marshal(columnOption)
 	if err != nil {
 		return "", fmt.Errorf("project sync: marshal status options: %w", err)
@@ -852,6 +912,7 @@ func (s *ProjectSyncService) AutoCreateColumns(ctx context.Context, repoID uuid.
 		StatusOptions:    optionsJSON,
 		OwnedByUzi:       link.OwnedByUzi,
 		UnmatchedColumns: []string{},
+		DoneOptionID:     doneOptionID, // PRD #584 M1: reserved "Done" projection option
 	}); err != nil {
 		return "", fmt.Errorf("project sync: persist link: %w", err)
 	}
@@ -866,15 +927,20 @@ func (s *ProjectSyncService) AutoCreateColumns(ctx context.Context, repoID uuid.
 		fieldID:      field.ID,
 		columnOption: columnOption,
 		position:     position,
+		doneOptionID: doneOptionID, // PRD #584 M2: seed closed issues to Done on re-seed
 	})
 
 	return fmt.Sprintf("created %d column(s) as a new %q field", len(columns), uziStatusFieldName), nil
 }
 
-// seedItems reads the project's live item Statuses once, then for each OPEN cached
-// issue ensures its project item exists and its Status matches the target derived
-// from the label board.
-func (s *ProjectSyncService) seedItems(ctx context.Context, repo store.GetRepoByIDRow, syncer forge.ProjectBoardSyncer, owner, name, projectID, fieldID string, columnOption map[string]string, position map[string]int) error {
+// seedItems reads the project's live item Statuses once, then for each cached issue
+// ensures its project item exists and its Status matches the target derived from the
+// label board. An OPEN issue's target is its mapped column option (Open/unmapped →
+// cleared); a CLOSED issue's target is the reserved Done option (PRD #584 M2) when the
+// link has one — so a manual re-seed projects and KEEPS closed issues on the board,
+// mirroring the periodic reconcile path — or is skipped entirely when there is no Done
+// option (doneOptionID == "", the pre-M2 D1 behavior).
+func (s *ProjectSyncService) seedItems(ctx context.Context, repo store.GetRepoByIDRow, syncer forge.ProjectBoardSyncer, owner, name, projectID, fieldID string, columnOption map[string]string, position map[string]int, doneOptionID string) error {
 	live, err := syncer.ReadProjectV2ItemStatuses(ctx, projectID, fieldID)
 	if err != nil {
 		return fmt.Errorf("project sync: read project items: %w", err)
@@ -895,31 +961,37 @@ func (s *ProjectSyncService) seedItems(ctx context.Context, repo store.GetRepoBy
 		return fmt.Errorf("project sync: list issues: %w", err)
 	}
 	for _, issue := range issues {
-		// D1: closed issues carry no Status option — they are skipped entirely.
-		if issue.State == "closed" {
-			continue
-		}
-		var labels []string
-		if len(issue.Labels) > 0 {
-			if err := json.Unmarshal(issue.Labels, &labels); err != nil {
-				labels = nil
-			}
-		}
-		column, closed, _ := board.ResolveColumn(labels, issue.State, position)
-		if closed {
-			continue // defensive: ResolveColumn also treats state=="closed" as closed
-		}
-
-		// Target option: Open ("" column) → CLEAR (D2: uzi's implicit Open maps to
-		// GitHub's native "No Status"). Otherwise the mapped option, if any; a column
-		// with no matching option is skipped (its issues keep their current Status).
+		// Target option, derived per issue-state:
+		//   - CLOSED (PRD #584 M2): project to the reserved Done option and KEEP the item
+		//     on the board — but only when the link has a Done option; with none there is
+		//     nowhere to project it, so skip the issue (the pre-M2 D1 skip behavior).
+		//   - OPEN: Open ("" column) → CLEAR (D2: uzi's implicit Open maps to GitHub's
+		//     native "No Status"); otherwise the mapped option, if any; a column with no
+		//     matching option is skipped (its issues keep their current Status).
 		var targetOption string
-		if column != "" {
-			optID, mapped := columnOption[column]
-			if !mapped {
+		if issue.State == "closed" {
+			if doneOptionID == "" {
 				continue
 			}
-			targetOption = optID
+			targetOption = doneOptionID
+		} else {
+			var labels []string
+			if len(issue.Labels) > 0 {
+				if err := json.Unmarshal(issue.Labels, &labels); err != nil {
+					labels = nil
+				}
+			}
+			column, closed, _ := board.ResolveColumn(labels, issue.State, position)
+			if closed {
+				continue // defensive: ResolveColumn also treats state=="closed" as closed
+			}
+			if column != "" {
+				optID, mapped := columnOption[column]
+				if !mapped {
+					continue
+				}
+				targetOption = optID
+			}
 		}
 
 		state, present := byIssue[issue.ForgeIssueIid]
@@ -1423,11 +1495,12 @@ func (s *ProjectSyncService) ReverseSync(ctx context.Context, repoID uuid.UUID) 
 	}
 
 	// Reconcile the item set BEFORE reading live statuses (M7): backfill open issues
-	// created since adopt (so they appear on the board and in the diff below) and prune
-	// items for issues that have since closed. reconcileItems mutates itemsByIID in
-	// place so the diff sees the reconciled set — a freshly-backfilled item carries
-	// marker == its seeded value == the live value the diff then reads, so the same-tick
-	// diff no-ops it (no oscillation).
+	// created since adopt (so they appear on the board and in the diff below), project
+	// since-closed issues to Done and KEEP their rows (PRD #584 M2; or prune them when
+	// the link has no Done option), and restore since-reopened issues off Done.
+	// reconcileItems mutates itemsByIID in place so the diff sees the reconciled set — a
+	// freshly-backfilled item carries marker == its seeded value == the live value the
+	// diff then reads, so the same-tick diff no-ops it (no oscillation).
 	s.reconcileItems(ctx, repo, syncer, link, issues, itemsByIID, columnOption, position)
 
 	live, err := syncer.ReadProjectV2ItemStatuses(ctx, link.ProjectNodeID, link.StatusFieldID)
@@ -1462,17 +1535,25 @@ func (s *ProjectSyncService) ReverseSync(ctx context.Context, repoID uuid.UUID) 
 //     option; Open or an unmapped column → cleared "No Status"). Best-effort per issue:
 //     an error is stamped on last_error and the loop continues, so one unresolvable
 //     issue never aborts the whole tick.
-//   - Close-prune (D1): a CLOSED issue that still has a tracked item row has that row
-//     DELETED locally. uzi does NOT call GitHub — there is no archive method, and
-//     leaving the closed issue's card on the project (with its last Status) is
-//     acceptable: D1 makes Closed an issue-state, not a board column, and the reverse
-//     diff already skips closed issues, so a stale card never drives a label. uzi
-//     simply stops tracking the closed issue.
+//   - Close→Done (PRD #584 M2): a CLOSED issue that still has a tracked item row has its
+//     Status projected to the reserved Done option and its item row KEPT (not deleted),
+//     so the closed issue lands in a dedicated Done status on the board. The write is
+//     idempotent (skipped when the marker already reads Done) and best-effort (a set
+//     failure keeps the row and retries next tick). When the link has NO Done option
+//     (link.DoneOptionID == ""), there is nowhere to project it, so it falls back to the
+//     pre-M2 D1 close-prune: DELETE the item row locally with no GitHub call.
+//   - Reopen restoration (PRD #584 M2): a since-reopened issue (now open) that is still
+//     tracked and whose marker sits on Done has its Status restored to its CURRENT label
+//     column (a mapped column → that option; Open/unmapped → cleared). Neither the diff
+//     nor Pass 2 (open UNtracked) would touch it — the diff no-ops it (live == marker ==
+//     Done) and Pass 2 skips tracked issues — so reconcile restores it explicitly. When
+//     the issue legitimately sits in a real "Done" board column (target == Done, the R6
+//     case) nothing is written, so it does not thrash.
 //
-// It mutates itemsByIID in place (adds backfilled rows, removes pruned ones) so the
-// caller's diff reads the reconciled projection. The repo slug is resolved lazily —
-// only when at least one issue actually needs backfilling — so a steady-state tick with
-// nothing new makes no extra forge call.
+// It mutates itemsByIID in place (adds backfilled rows, removes pruned ones, advances
+// Done/restore markers) so the caller's diff reads the reconciled projection. The repo
+// slug is resolved lazily — only when at least one issue actually needs backfilling — so
+// a steady-state tick with nothing new makes no extra forge call.
 func (s *ProjectSyncService) reconcileItems(ctx context.Context, repo store.GetRepoByIDRow, syncer forge.ProjectBoardSyncer, link store.GithubProjectLink, issues []store.Issue, itemsByIID map[int64]store.GithubProjectItem, columnOption map[string]string, position map[string]int) {
 	var owner, name string
 	slugResolved := false
@@ -1488,29 +1569,117 @@ func (s *ProjectSyncService) reconcileItems(ctx context.Context, repo store.GetR
 		return nil
 	}
 
-	// Pass 1 — close-prune. This is slug-INDEPENDENT (a purely local delete), so it
-	// runs first and to completion even when the forge slug cannot be resolved; a
-	// backfill slug failure below must never strand a closed issue's stale item row.
+	// Pass 1 — close→Done (PRD #584 M2), else close-prune. This is slug-INDEPENDENT
+	// (it drives the already-stored item node id + field id + project node id, never the
+	// repo slug), so it runs first and to completion even when the forge slug cannot be
+	// resolved; a backfill slug failure below must never strand a closed issue's row.
 	for _, issue := range issues {
 		if issue.State != "closed" {
 			continue
 		}
-		if _, tracked := itemsByIID[issue.ForgeIssueIid]; !tracked {
+		iid := issue.ForgeIssueIid
+		item, tracked := itemsByIID[iid]
+		if !tracked {
 			continue
 		}
-		if err := s.store.DeleteGithubProjectItem(ctx, store.DeleteGithubProjectItemParams{
-			RepoID:        repo.ID,
-			ForgeIssueIid: issue.ForgeIssueIid,
+		if link.DoneOptionID == "" {
+			// No Done option to project to: fall back to the pre-M2 close-prune — DELETE
+			// the item row locally with no GitHub call, and stop tracking the issue.
+			if err := s.store.DeleteGithubProjectItem(ctx, store.DeleteGithubProjectItemParams{
+				RepoID:        repo.ID,
+				ForgeIssueIid: iid,
+			}); err != nil {
+				s.log.Warn("project sync: reverse prune closed item", "repo", repo.ID, "issue", iid, "error", err)
+				continue
+			}
+			delete(itemsByIID, iid)
+			continue
+		}
+		// Idempotent: the marker already reads Done → nothing to do, KEEP the row.
+		if markerValue(item.LastStatusOptionID) == link.DoneOptionID {
+			continue
+		}
+		// Project to Done and KEEP the row. Best-effort: on error DO NOT advance the
+		// marker and DO NOT delete (retry next tick), mirroring the prune warn above.
+		if err := syncer.SetProjectV2ItemStatus(ctx, link.ProjectNodeID, item.ItemNodeID, link.StatusFieldID, link.DoneOptionID); err != nil {
+			s.log.Warn("project sync: reverse set closed issue to Done", "repo", repo.ID, "issue", iid, "error", err)
+			continue
+		}
+		if err := s.store.SetGithubProjectItemStatusMarker(ctx, store.SetGithubProjectItemStatusMarkerParams{
+			LastStatusOptionID: optionMarker(link.DoneOptionID),
+			RepoID:             repo.ID,
+			ForgeIssueIid:      iid,
 		}); err != nil {
-			s.log.Warn("project sync: reverse prune closed item", "repo", repo.ID, "issue", issue.ForgeIssueIid, "error", err)
-			continue
+			s.log.Warn("project sync: reverse advance Done marker", "repo", repo.ID, "issue", iid, "error", err)
 		}
-		delete(itemsByIID, issue.ForgeIssueIid)
+		// Advance the in-memory marker so the same-tick reverseDiff reads marker == live
+		// (== Done) and no-ops it — the convergence no-op the reverse diff relies on.
+		item.LastStatusOptionID = optionMarker(link.DoneOptionID)
+		itemsByIID[iid] = item
+	}
+
+	// Pass 1b — reopen restoration (PRD #584 M2). A since-reopened issue (now open) that
+	// is STILL tracked and whose marker sits on Done is restored to its CURRENT label
+	// column's Status. Slug-INDEPENDENT (the item node id is already stored, so no
+	// resolve/add), so it runs alongside Pass 1 before the slug-dependent backfill. Pass 2
+	// skips tracked issues and the diff no-ops a marker == live == Done item, so without
+	// this pass a reopened issue would stay stuck on Done.
+	if link.DoneOptionID != "" {
+		for _, issue := range issues {
+			if issue.State == "closed" {
+				continue
+			}
+			iid := issue.ForgeIssueIid
+			item, tracked := itemsByIID[iid]
+			if !tracked {
+				continue
+			}
+			if markerValue(item.LastStatusOptionID) != link.DoneOptionID {
+				continue // not sitting on Done → nothing to restore
+			}
+			// Compute the restore target from the issue's CURRENT column (like backfillItem):
+			// a mapped column → its option; Open/unmapped → cleared ("").
+			var labels []string
+			if len(issue.Labels) > 0 {
+				if err := json.Unmarshal(issue.Labels, &labels); err != nil {
+					labels = nil
+				}
+			}
+			column, _, _ := board.ResolveColumn(labels, issue.State, position)
+			target := ""
+			if column != "" {
+				if optID, mapped := columnOption[column]; mapped {
+					target = optID
+				}
+			}
+			if target == link.DoneOptionID {
+				// R6: a real "Done" board column the issue currently sits in — the item
+				// legitimately stays on Done. Do NOT write (no thrash).
+				continue
+			}
+			// Restore Status off Done. Best-effort: on error DO NOT advance (retry next tick).
+			if err := syncer.SetProjectV2ItemStatus(ctx, link.ProjectNodeID, item.ItemNodeID, link.StatusFieldID, target); err != nil {
+				s.log.Warn("project sync: reverse restore reopened issue status", "repo", repo.ID, "issue", iid, "error", err)
+				continue
+			}
+			if err := s.store.SetGithubProjectItemStatusMarker(ctx, store.SetGithubProjectItemStatusMarkerParams{
+				LastStatusOptionID: optionMarker(target),
+				RepoID:             repo.ID,
+				ForgeIssueIid:      iid,
+			}); err != nil {
+				s.log.Warn("project sync: reverse advance restore marker", "repo", repo.ID, "issue", iid, "error", err)
+			}
+			// Advance the in-memory marker so the same-tick reverseDiff reads marker == live
+			// (== target) and no-ops it.
+			item.LastStatusOptionID = optionMarker(target)
+			itemsByIID[iid] = item
+		}
 	}
 
 	// Pass 2 — backfill open untracked issues. Needs the repo slug (resolved lazily,
 	// once). A slug failure is a per-repo condition: no issue can be backfilled, so
-	// stamp and stop this pass — the close-prunes above already completed.
+	// stamp and stop this pass — Pass 1 (close→Done or close-prune) and Pass 1b (reopen
+	// restore) above already completed.
 	for _, issue := range issues {
 		if issue.State == "closed" {
 			continue
@@ -1664,7 +1833,9 @@ func (s *ProjectSyncService) reverseDiff(ctx context.Context, repo store.GetRepo
 
 		// The issue must be in uzi's cache (reconcile above backfills new open issues).
 		// A closed issue's board state is its issue state (D1) — skip; reconcile has
-		// already pruned its item row.
+		// either projected it to Done and KEPT its row (PRD #584 M2) or, when the link
+		// has no Done option, pruned it — either way reverse must not drive a label from
+		// a closed issue's card.
 		issue, ok := issuesByIID[it.IssueNumber]
 		if !ok {
 			s.log.Info("project sync: reverse skip, issue not in cache", "repo", repoID, "issue", it.IssueNumber)
@@ -1774,6 +1945,12 @@ type ProjectSyncStatus struct {
 	// this stays a pure store read with no forge call (D5). Empty when every column
 	// matched.
 	UnmatchedColumns []string
+	// NoDoneOption is true when the linked Status field has no reserved "Done" option
+	// (link.done_option_id == ""), so a CLOSED issue cannot be projected to Done (PRD
+	// #584 M4). The panel surfaces an advisory: add a "Done" option and Resync, or
+	// re-provision. False for an adopted built-in Status (which ships a Done option) and
+	// for any uzi-created field (which appends one). A pure store read — no forge call.
+	NoDoneOption bool
 }
 
 // ProjectSyncStatus reads a repo's link row + tracked-item count for the admin health
@@ -1798,6 +1975,7 @@ func (s *ProjectSyncService) ProjectSyncStatus(ctx context.Context, repoID uuid.
 		LastError:        link.LastError,
 		ItemCount:        len(items),
 		UnmatchedColumns: link.UnmatchedColumns,
+		NoDoneOption:     link.DoneOptionID == "",
 	}, nil
 }
 

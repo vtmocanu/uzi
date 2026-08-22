@@ -90,7 +90,7 @@ func (q *Queries) GetGithubProjectItem(ctx context.Context, arg GetGithubProject
 }
 
 const getGithubProjectLinkByRepo = `-- name: GetGithubProjectLinkByRepo :one
-SELECT id, repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi, last_synced_at, last_error, created_at, updated_at, unmatched_columns, seeding_started_at FROM github_project_links WHERE repo_id = $1
+SELECT id, repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi, last_synced_at, last_error, created_at, updated_at, unmatched_columns, seeding_started_at, done_option_id FROM github_project_links WHERE repo_id = $1
 `
 
 // The link row for a repo, or no row when the repo is not synced.
@@ -111,6 +111,7 @@ func (q *Queries) GetGithubProjectLinkByRepo(ctx context.Context, repoID uuid.UU
 		&i.UpdatedAt,
 		&i.UnmatchedColumns,
 		&i.SeedingStartedAt,
+		&i.DoneOptionID,
 	)
 	return i, err
 }
@@ -149,7 +150,7 @@ func (q *Queries) ListGithubProjectItems(ctx context.Context, repoID uuid.UUID) 
 }
 
 const listGithubProjectLinksByRepoIDs = `-- name: ListGithubProjectLinksByRepoIDs :many
-SELECT id, repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi, last_synced_at, last_error, created_at, updated_at, unmatched_columns, seeding_started_at FROM github_project_links WHERE repo_id = ANY($1::uuid[])
+SELECT id, repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi, last_synced_at, last_error, created_at, updated_at, unmatched_columns, seeding_started_at, done_option_id FROM github_project_links WHERE repo_id = ANY($1::uuid[])
 `
 
 // Batch-load link rows for a set of repo ids, for the caller-scoped repos-list
@@ -177,6 +178,7 @@ func (q *Queries) ListGithubProjectLinksByRepoIDs(ctx context.Context, repoIds [
 			&i.UpdatedAt,
 			&i.UnmatchedColumns,
 			&i.SeedingStartedAt,
+			&i.DoneOptionID,
 		); err != nil {
 			return nil, err
 		}
@@ -318,11 +320,11 @@ const upsertGithubProjectLink = `-- name: UpsertGithubProjectLink :one
 
 INSERT INTO github_project_links (
     repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi,
-    unmatched_columns
+    unmatched_columns, done_option_id
 ) VALUES (
     $1, $2, $3,
     $4, $5, $6,
-    COALESCE($7::text[], '{}')
+    COALESCE($7::text[], '{}'), $8
 )
 ON CONFLICT (repo_id) DO UPDATE SET
     project_node_id   = EXCLUDED.project_node_id,
@@ -331,8 +333,9 @@ ON CONFLICT (repo_id) DO UPDATE SET
     status_options    = EXCLUDED.status_options,
     owned_by_uzi      = EXCLUDED.owned_by_uzi,
     unmatched_columns = COALESCE($7::text[], '{}'),
+    done_option_id    = EXCLUDED.done_option_id,
     updated_at        = now()
-RETURNING id, repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi, last_synced_at, last_error, created_at, updated_at, unmatched_columns, seeding_started_at
+RETURNING id, repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi, last_synced_at, last_error, created_at, updated_at, unmatched_columns, seeding_started_at, done_option_id
 `
 
 type UpsertGithubProjectLinkParams struct {
@@ -343,6 +346,7 @@ type UpsertGithubProjectLinkParams struct {
 	StatusOptions    []byte    `json:"status_options"`
 	OwnedByUzi       bool      `json:"owned_by_uzi"`
 	UnmatchedColumns []string  `json:"unmatched_columns"`
+	DoneOptionID     string    `json:"done_option_id"`
 }
 
 // GitHub Projects v2 Status sync persistence (PRD #364). The poller (M5/M6/M7) and
@@ -356,6 +360,9 @@ type UpsertGithubProjectLinkParams struct {
 // unmatched_columns (PRD #576 M3) is COALESCE'd from nil→'{}' so a nil Go []string
 // never becomes SQL NULL and violates the NOT NULL constraint; the same guard is
 // applied on both the INSERT and the conflict update.
+// done_option_id (PRD #584 M1) is the reserved "Done" projection option id (empty =
+// none) captured on link setup (create AND adopt paths); it is overwritten on the
+// conflict update like every other mutable column.
 func (q *Queries) UpsertGithubProjectLink(ctx context.Context, arg UpsertGithubProjectLinkParams) (GithubProjectLink, error) {
 	row := q.db.QueryRow(ctx, upsertGithubProjectLink,
 		arg.RepoID,
@@ -365,6 +372,7 @@ func (q *Queries) UpsertGithubProjectLink(ctx context.Context, arg UpsertGithubP
 		arg.StatusOptions,
 		arg.OwnedByUzi,
 		arg.UnmatchedColumns,
+		arg.DoneOptionID,
 	)
 	var i GithubProjectLink
 	err := row.Scan(
@@ -381,6 +389,7 @@ func (q *Queries) UpsertGithubProjectLink(ctx context.Context, arg UpsertGithubP
 		&i.UpdatedAt,
 		&i.UnmatchedColumns,
 		&i.SeedingStartedAt,
+		&i.DoneOptionID,
 	)
 	return i, err
 }

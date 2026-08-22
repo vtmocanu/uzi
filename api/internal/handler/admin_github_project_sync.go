@@ -292,6 +292,9 @@ type getGithubProjectSyncStatusResponse struct {
 	// adopt/resync (PRD #576 M3); the panel surfaces them with a Resync prompt. Always
 	// a JSON array (never null) so the frontend can `.length` it unconditionally.
 	UnmatchedColumns []string `json:"unmatched_columns"`
+	// NoDoneOption is true when the synced Status field has no "Done" option, so closed
+	// issues cannot show a Done status (PRD #584 M4). The panel shows a recovery advisory.
+	NoDoneOption bool `json:"no_done_option"`
 }
 
 // GetGithubProjectSyncStatus is the sync-health read (PRD #364 M7, owner-or-admin by
@@ -348,6 +351,7 @@ func (h *Handler) GetGithubProjectSyncStatus(w http.ResponseWriter, r *http.Requ
 		OwnedByUzi:       status.OwnedByUzi,
 		ItemCount:        status.ItemCount,
 		UnmatchedColumns: unmatched,
+		NoDoneOption:     status.NoDoneOption,
 	}
 	if status.LastSyncedAt.Valid {
 		t := status.LastSyncedAt.Time

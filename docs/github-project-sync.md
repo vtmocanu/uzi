@@ -182,6 +182,50 @@ your uzi columns with every item already populated. (In Table layout the same
 control is labeled **Group by**; the original Status field is harmless and can
 be ignored or deleted.)
 
+## Closed issues and the Done status
+
+Closing an issue now projects to a dedicated **Done** Status option on the
+linked board, and uzi keeps the card — it no longer stops tracking it, the
+way it used to. This runs on uzi's periodic sync tick, the same poll
+cadence described in [Forward vs. reverse](#forward-vs-reverse--why-reverse-isnt-instant),
+so it lands on the next tick rather than the instant you close the issue.
+Reopening the issue restores the card to its current column (or clears it
+to **No Status** if the issue has no column label) and resumes normal
+tracking.
+
+Where the `Done` option comes from depends on how the field was built:
+
+- **Provision, or auto-create** (see [Skipped columns and fixing
+  them](#skipped-columns-and-fixing-them)): uzi appends a `Done` option
+  whenever it creates its own field, so a uzi-owned "uzi Status" field
+  carries `Done` automatically — no user action needed.
+- **Adopt, on GitHub's built-in Status field**: the built-in Status ships
+  `Todo` / `In Progress` / `Done` / `No Status` by default, so an adopted
+  built-in Status field already has `Done` and picks it up automatically
+  too.
+- **A `uzi Status` field or custom field with no `Done` option**: uzi never
+  adds an option to an existing field — there's no safe API for that, the
+  same constraint behind [Skipped columns and fixing
+  them](#skipped-columns-and-fixing-them). Add a `Done` option to the field
+  in GitHub yourself, then click **Resync** — or re-provision. Until then,
+  the sync panel and `uzi project-sync status` (see the [CLI
+  reference](./cli.md)) carry an advisory: *"Closed issues won't show a
+  Done status. Add a `Done` option to the synced field and Resync, or
+  re-provision."*
+
+**One-time note for boards linked before this feature shipped.** Whether a
+link shows the advisory depends on whether it has a *stored* Done-option
+id, and linking (or last resyncing) an older board never captured one — so
+even a board that adopted the built-in Status field, which already has
+`Done`, can show the advisory until its next Resync. A single Resync
+re-captures the existing `Done` option and clears the advisory; treat this
+as a one-time step after upgrading, not a bug.
+
+Reverse never reacts to Done: dragging a card to Done in GitHub, or a Done
+item showing up on the board any other way, never reopens or closes the
+issue. uzi only ever changes issue open/closed state because you closed or
+reopened the issue itself.
+
 ## The `project` PAT scope
 
 The connection's GitHub PAT must carry the **`project` scope** (read+write —
@@ -229,12 +273,14 @@ Like the rest of the panel, these are web-only actions; there's still no
 
 A Status field holds exactly one value, matching a card in exactly one
 column. An issue with no column label (uzi's implicit "Open") maps to
-GitHub's native **No Status**. A closed issue is left to issue state — no
-dedicated "Done" option — and uzi stops tracking its card, leaving it on the
-project at its last-known Status, never deleted. Disabling sync for a repo
-is likewise non-destructive: uzi drops its own link and stops tracking, but
-never deletes a GitHub project or any of its cards, whether uzi created the
-project or you did.
+GitHub's native **No Status**. A closed issue projects to a dedicated
+**Done** option and keeps its card tracked, and reopening it restores the
+card to its column — see [Closed issues and the Done
+status](#closed-issues-and-the-done-status) above for the full behavior,
+including the fields that don't have a `Done` option to project to yet.
+Disabling sync for a repo is likewise non-destructive: uzi drops its own
+link and stops tracking, but never deletes a GitHub project or any of its
+cards, whether uzi created the project or you did.
 
 Status options are built at adopt/provision time. A board column added
 afterward that has no matching option is handled by [Resync or auto-create](#skipped-columns-and-fixing-them)

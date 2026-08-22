@@ -1407,6 +1407,22 @@ export function Repos() {
                         </div>
                       )}
 
+                    {/* No-Done-option advisory (PRD #584 M4): the synced Status field
+                        has no reserved "Done" option, so a closed issue cannot be
+                        projected to Done. Recovery is to add a "Done" option in GitHub
+                        then Resync (the Resync control below), or re-provision. */}
+                    {syncStatus.no_done_option && (
+                      <div
+                        role="alert"
+                        className="space-y-2 rounded-md border border-warn/40 bg-warn/10 p-3 text-sm"
+                      >
+                        <p className="text-fg">
+                          Closed issues won&rsquo;t show a Done status. Add a &ldquo;Done&rdquo;
+                          option to the synced field and Resync, or re-provision.
+                        </p>
+                      </div>
+                    )}
+
                     <Button
                       size="sm"
                       disabled={syncBusy}

@@ -14,7 +14,7 @@ import (
 const psRepoID = "11111111-1111-1111-1111-111111111111"
 
 // status on a linked repo renders every field: project number, ownership, health,
-// last sync, item count, and the unmatched-columns list.
+// last sync, item count, the unmatched-columns list, and the no-Done-option flag.
 func TestProjectSyncStatusLinked(t *testing.T) {
 	synced := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
 	fc := &uzicli.FakeClient{ProjectSyncStatusResult: uzicli.ProjectSyncStatus{
@@ -23,6 +23,7 @@ func TestProjectSyncStatusLinked(t *testing.T) {
 		LastSyncedAt:     &synced,
 		ItemCount:        42,
 		UnmatchedColumns: []string{"Blocked", "Icebox"},
+		NoDoneOption:     true,
 	}}
 	out, _, code := runCLI(t, fakeEnv(fc), "project-sync", "status", psRepoID)
 	if code != uzicli.ExitOK {
@@ -31,7 +32,9 @@ func TestProjectSyncStatusLinked(t *testing.T) {
 	if fc.LastProjectSyncStatusRepoID != psRepoID {
 		t.Fatalf("status queried repo %q, want %q", fc.LastProjectSyncStatusRepoID, psRepoID)
 	}
-	for _, want := range []string{"LINKED", "#7", "OWNED_BY_UZI", "true", "42", "Blocked", "Icebox"} {
+	// NO_DONE_OPTION renders via the boolStr helper (true/false, like OWNED_BY_UZI),
+	// so a set flag shows the row with "true".
+	for _, want := range []string{"LINKED", "#7", "OWNED_BY_UZI", "true", "42", "Blocked", "Icebox", "NO_DONE_OPTION"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("status output missing %q:\n%s", want, out)
 		}
@@ -90,6 +93,10 @@ func TestProjectSyncStatusLinkedJSON(t *testing.T) {
 	}
 	if !strings.Contains(out, `"linked": true`) || !strings.Contains(out, `"project_number": 9`) || !strings.Contains(out, `"item_count": 5`) {
 		t.Errorf("--json linked output missing fields:\n%s", out)
+	}
+	// The no-Done-option flag rides along; an unset flag decodes as false.
+	if !strings.Contains(out, `"no_done_option": false`) {
+		t.Errorf("--json linked output missing no_done_option:\n%s", out)
 	}
 }
 

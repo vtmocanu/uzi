@@ -810,6 +810,66 @@ describe("Repos — skipped columns + Resync (PRD #576 M3)", () => {
   });
 });
 
+describe("Repos — no-Done-option advisory (PRD #584 M4)", () => {
+  const GH_CONN: ForgeConnection = {
+    ...CONN,
+    id: "conn-gh",
+    forge_type: "github",
+    base_url: "https://github.com",
+  };
+  const GH_REPO: Repo = repo({
+    id: "repo-gh",
+    path_with_namespace: "vtmocanu/gh",
+    connection_id: "conn-gh",
+  });
+
+  const linkedBase = {
+    project_number: 42,
+    owned_by_uzi: false,
+    last_synced_at: "2026-08-20T10:00:00Z",
+    last_error: null,
+    item_count: 7,
+  };
+
+  async function openSyncPanel(name: string): Promise<HTMLElement> {
+    renderPage();
+    await screen.findByText(name);
+    fireEvent.click(within(rowFor(name)).getByRole("button", { name: /Project sync settings for/ }));
+    return screen.getByRole("group", { name: new RegExp(`Project sync for ${name}`) });
+  }
+
+  beforeEach(() => {
+    mockApi.listConnections.mockResolvedValue({ connections: [GH_CONN] });
+    mockApi.listProjects.mockResolvedValue({ repos: [{ ...GH_REPO }] });
+    mockApi.getProjectSyncVisibility.mockResolvedValue({ public: false });
+  });
+
+  it("renders the advisory when no_done_option is true", async () => {
+    mockApi.getProjectSyncStatus.mockResolvedValue({ ...linkedBase, no_done_option: true });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Linked");
+
+    expect(within(panel).getByText(/Closed issues won.?t show a Done status/i)).toBeTruthy();
+    expect(within(panel).getByText(/Add a .?Done.? option to the synced field/i)).toBeTruthy();
+  });
+
+  it("does NOT render the advisory when no_done_option is false", async () => {
+    mockApi.getProjectSyncStatus.mockResolvedValue({ ...linkedBase, no_done_option: false });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Linked");
+
+    expect(within(panel).queryByText(/Closed issues won.?t show a Done status/i)).toBeNull();
+  });
+
+  it("does NOT render the advisory when no_done_option is absent", async () => {
+    mockApi.getProjectSyncStatus.mockResolvedValue({ ...linkedBase });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Linked");
+
+    expect(within(panel).queryByText(/Closed issues won.?t show a Done status/i)).toBeNull();
+  });
+});
+
 describe("Repos — Adopt-first sync (PRD #576 M1)", () => {
   const GH_CONN: ForgeConnection = {
     ...CONN,

@@ -988,9 +988,10 @@ func TestAutoCreateColumnsCreatesFreshFieldWithEveryColumn(t *testing.T) {
 	if cf.name != "uzi Status" {
 		t.Errorf("field name = %q, want \"uzi Status\"", cf.name)
 	}
-	wantNames := []string{"In Progress", "Planned", "Human Review"}
+	// PRD #584 M1: every board column in order, then the reserved appended "Done" option.
+	wantNames := []string{"In Progress", "Planned", "Human Review", "Done"}
 	if len(cf.options) != len(wantNames) {
-		t.Fatalf("created options = %+v, want exactly the %d board columns", cf.options, len(wantNames))
+		t.Fatalf("created options = %+v, want the %d board columns plus the reserved Done option", cf.options, len(wantNames))
 	}
 	for i, want := range wantNames {
 		if cf.options[i].Name != want {
@@ -999,6 +1000,10 @@ func TestAutoCreateColumnsCreatesFreshFieldWithEveryColumn(t *testing.T) {
 		if !validGithubColors[cf.options[i].Color] {
 			t.Errorf("option %q has invalid color %q", cf.options[i].Name, cf.options[i].Color)
 		}
+	}
+	// The switched link captures the reserved Done option's created id (PRD #584 M1).
+	if link := st.links[0]; link.DoneOptionID != "opt-Done" {
+		t.Errorf("done_option_id = %q, want the created Done option id opt-Done", link.DoneOptionID)
 	}
 
 	// The link was switched to the new field id, its option map built from the CREATED
@@ -1119,4 +1124,311 @@ func TestAutoCreateColumnsResetPreventsReverseCascade(t *testing.T) {
 			}
 		}
 	})
+}
+
+// --- close→Done + reopen restoration (PRD #584 M2) --------------------------
+
+// doneLink is a forwardLink with a reserved Done projection option id set — the M2
+// close→Done / reopen-restore fixtures start from a link that HAS a Done option.
+func doneLink(t *testing.T, columnOption map[string]string, doneOptionID string) store.GithubProjectLink {
+	t.Helper()
+	l := forwardLink(t, columnOption)
+	l.DoneOptionID = doneOptionID
+	return l
+}
+
+// (close→Done, PRD #584 M2) On a reverse tick, a newly-closed tracked issue is projected
+// to the reserved Done option and its item row is KEPT (not deleted); the stored marker
+// advances to Done. With NO Done option on the link, the pre-M2 close-prune still fires
+// (row deleted, no GitHub Set).
+//
+// Non-vacuity, proven by two call-site mutations against reconcileItems Pass 1:
+//
+//	(i)  revert the CLOSED branch to the old unconditional DeleteGithubProjectItem +
+//	     delete(itemsByIID) — the "Done option set" sub-case reds (setCalls == 0 and the
+//	     row is deleted instead of kept).
+//	(ii) drop the `if link.DoneOptionID == ""` fallback so the Done Set fires
+//	     unconditionally — the "no Done option" sub-case reds (a Set is issued and the
+//	     row is not deleted).
+func TestReverseSyncClosedIssueProjectsToDone(t *testing.T) {
+	t.Run("Done option set: project to Done and keep the row", func(t *testing.T) {
+		repoID := uuid.New()
+		// The closed issue's card is still live on the board at its old column option.
+		syncer := reverseSyncer(forge.ProjectV2ItemStatus{ItemID: "item7", IssueNumber: 7, OptionID: "opt_ip"})
+		mover := &fakeMover{}
+		st := &fakeProjectStore{
+			repo:          githubRepoRow(repoID),
+			link:          doneLink(t, map[string]string{"In Progress": "opt_ip"}, "opt_done"),
+			columns:       []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+			issues:        []store.Issue{{ForgeIssueIid: 7, State: "closed", Labels: labelsJSON(t, "In Progress")}},
+			existingItems: []store.GithubProjectItem{projectItem(repoID, 7, "item7", "opt_ip")},
+		}
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		svc.SetMover(mover)
+
+		if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+			t.Fatalf("ReverseSync: %v", err)
+		}
+		// The closed item was Set to Done, exactly once.
+		if len(syncer.setCalls) != 1 || syncer.setCalls[0].itemID != "item7" || syncer.setCalls[0].optionID != "opt_done" {
+			t.Fatalf("want one Set item7->opt_done, got %v", syncer.setCalls)
+		}
+		// The row is KEPT — no local delete.
+		if len(st.deletedItems) != 0 {
+			t.Errorf("close→Done must KEEP the row, got deletes %v", st.deletedItems)
+		}
+		// The stored marker advanced to Done.
+		if len(st.markerSets) != 1 || !st.markerSets[0].LastStatusOptionID.Valid || st.markerSets[0].LastStatusOptionID.String != "opt_done" {
+			t.Errorf("want marker advanced to opt_done, got %+v", st.markerSets)
+		}
+		// A closed issue drives no label writeback.
+		if len(mover.calls) != 0 {
+			t.Errorf("closed issue must drive no AutoMove, got %v", mover.calls)
+		}
+	})
+
+	t.Run("no Done option: fall back to close-prune (delete, no Set)", func(t *testing.T) {
+		repoID := uuid.New()
+		syncer := reverseSyncer(forge.ProjectV2ItemStatus{ItemID: "item7", IssueNumber: 7, OptionID: "opt_ip"})
+		mover := &fakeMover{}
+		st := &fakeProjectStore{
+			repo:          githubRepoRow(repoID),
+			link:          doneLink(t, map[string]string{"In Progress": "opt_ip"}, ""), // no Done option
+			columns:       []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+			issues:        []store.Issue{{ForgeIssueIid: 7, State: "closed", Labels: labelsJSON(t, "In Progress")}},
+			existingItems: []store.GithubProjectItem{projectItem(repoID, 7, "item7", "opt_ip")},
+		}
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		svc.SetMover(mover)
+
+		if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+			t.Fatalf("ReverseSync: %v", err)
+		}
+		// The item row was pruned locally.
+		if len(st.deletedItems) != 1 || st.deletedItems[0] != 7 {
+			t.Errorf("want issue 7 item row deleted, got %v", st.deletedItems)
+		}
+		// No GitHub Set (nowhere to project a closed issue with no Done option).
+		if len(syncer.setCalls) != 0 {
+			t.Errorf("no-Done close-prune must make no Set, got %v", syncer.setCalls)
+		}
+		if len(st.markerSets) != 0 {
+			t.Errorf("no-Done close-prune must not advance a marker, got %v", st.markerSets)
+		}
+	})
+
+	t.Run("idempotent: marker already Done makes no Set and keeps the row", func(t *testing.T) {
+		repoID := uuid.New()
+		syncer := reverseSyncer(forge.ProjectV2ItemStatus{ItemID: "item7", IssueNumber: 7, OptionID: "opt_done"})
+		mover := &fakeMover{}
+		st := &fakeProjectStore{
+			repo:          githubRepoRow(repoID),
+			link:          doneLink(t, map[string]string{"In Progress": "opt_ip"}, "opt_done"),
+			columns:       []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+			issues:        []store.Issue{{ForgeIssueIid: 7, State: "closed", Labels: labelsJSON(t, "In Progress")}},
+			existingItems: []store.GithubProjectItem{projectItem(repoID, 7, "item7", "opt_done")}, // already Done
+		}
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		svc.SetMover(mover)
+
+		if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+			t.Fatalf("ReverseSync: %v", err)
+		}
+		if len(syncer.setCalls) != 0 {
+			t.Errorf("already-Done item must not be re-Set, got %v", syncer.setCalls)
+		}
+		if len(st.deletedItems) != 0 {
+			t.Errorf("already-Done item must be kept, got deletes %v", st.deletedItems)
+		}
+		if len(st.markerSets) != 0 {
+			t.Errorf("already-Done item must not re-advance its marker, got %v", st.markerSets)
+		}
+	})
+}
+
+// (reopen restoration, PRD #584 M2) A since-reopened issue (now open) whose marker sits on
+// the Done option is restored to its CURRENT label column's Status: a mapped column → that
+// option, no column → cleared. When the issue genuinely sits in a real "Done" board column
+// (target == Done, the R6 case) nothing is written — no thrash.
+//
+// Non-vacuity: remove the Pass-1b reopen restoration and the reopened issues stay stuck on
+// Done — setCalls goes empty and these assertions red. The R6 sub-case is the negative
+// control: it proves the restore does NOT fire a redundant Set when target already == Done.
+func TestReverseSyncReopenedIssueRestoresStatus(t *testing.T) {
+	t.Run("mapped column and no-column restore off Done", func(t *testing.T) {
+		repoID := uuid.New()
+		// Post-restore live reality: issue 7 back at opt_ip, issue 8 cleared — so the
+		// same-tick diff reads live == restored marker → no oscillation.
+		syncer := reverseSyncer(
+			forge.ProjectV2ItemStatus{ItemID: "item7", IssueNumber: 7, OptionID: "opt_ip"},
+			forge.ProjectV2ItemStatus{ItemID: "item8", IssueNumber: 8, OptionID: ""},
+		)
+		mover := &fakeMover{}
+		st := &fakeProjectStore{
+			repo:    githubRepoRow(repoID),
+			link:    doneLink(t, map[string]string{"In Progress": "opt_ip"}, "opt_done"),
+			columns: []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+			issues: []store.Issue{
+				{ForgeIssueIid: 7, State: "opened", Labels: labelsJSON(t, "In Progress")}, // → restore to opt_ip
+				{ForgeIssueIid: 8, State: "opened", Labels: labelsJSON(t)},                // → cleared
+			},
+			existingItems: []store.GithubProjectItem{
+				projectItem(repoID, 7, "item7", "opt_done"), // sitting on Done
+				projectItem(repoID, 8, "item8", "opt_done"), // sitting on Done
+			},
+		}
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		svc.SetMover(mover)
+
+		if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+			t.Fatalf("ReverseSync: %v", err)
+		}
+		// Both reopened items restored off Done: 7 → opt_ip, 8 → cleared "".
+		got := map[string]string{}
+		for _, c := range syncer.setCalls {
+			got[c.itemID] = c.optionID
+		}
+		if len(syncer.setCalls) != 2 || got["item7"] != "opt_ip" || got["item8"] != "" {
+			t.Fatalf("want restores item7->opt_ip and item8->\"\", got %v", syncer.setCalls)
+		}
+		// Markers advanced OFF Done: 7 → opt_ip (valid), 8 → NULL (cleared).
+		markers := map[int64]pgtype.Text{}
+		for _, m := range st.markerSets {
+			markers[m.ForgeIssueIid] = m.LastStatusOptionID
+		}
+		if m := markers[7]; !m.Valid || m.String != "opt_ip" {
+			t.Errorf("issue 7 marker = %+v, want opt_ip", m)
+		}
+		if m := markers[8]; m.Valid {
+			t.Errorf("issue 8 marker should be NULL (cleared), got %+v", m)
+		}
+		// Rows KEPT (restoration never deletes) and no label writeback (convergence).
+		if len(st.deletedItems) != 0 {
+			t.Errorf("restoration must keep rows, got deletes %v", st.deletedItems)
+		}
+		if len(mover.calls) != 0 {
+			t.Errorf("restored items must not oscillate (zero AutoMove), got %v", mover.calls)
+		}
+	})
+
+	t.Run("R6: issue in a real Done column stays on Done without thrash", func(t *testing.T) {
+		repoID := uuid.New()
+		// A board that has a real "Done" column mapped to opt_done. The reopened issue sits
+		// in it, so target == Done == marker → the restore must NOT fire a Set.
+		syncer := reverseSyncer(forge.ProjectV2ItemStatus{ItemID: "item9", IssueNumber: 9, OptionID: "opt_done"})
+		mover := &fakeMover{}
+		st := &fakeProjectStore{
+			repo: githubRepoRow(repoID),
+			link: doneLink(t, map[string]string{"In Progress": "opt_ip", "Done": "opt_done"}, "opt_done"),
+			columns: []store.BoardColumn{
+				{LabelName: "In Progress", Position: 1},
+				{LabelName: "Done", Position: 2},
+			},
+			issues:        []store.Issue{{ForgeIssueIid: 9, State: "opened", Labels: labelsJSON(t, "Done")}},
+			existingItems: []store.GithubProjectItem{projectItem(repoID, 9, "item9", "opt_done")},
+		}
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		svc.SetMover(mover)
+
+		if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+			t.Fatalf("ReverseSync: %v", err)
+		}
+		if len(syncer.setCalls) != 0 {
+			t.Errorf("R6: an issue legitimately in a Done column must not be re-Set, got %v", syncer.setCalls)
+		}
+		if len(st.markerSets) != 0 {
+			t.Errorf("R6: no marker thrash, got %v", st.markerSets)
+		}
+		if len(st.deletedItems) != 0 {
+			t.Errorf("R6: row must be kept, got deletes %v", st.deletedItems)
+		}
+		if len(mover.calls) != 0 {
+			t.Errorf("R6: no AutoMove, got %v", mover.calls)
+		}
+	})
+}
+
+// (invariant, PRD #584 M3) Reverse sync leaves the Done projection alone BY
+// CONSTRUCTION: the reserved Done option is NEVER a value in the link's status_options
+// map, so it is absent from the inverted optionColumn map reverseDiff builds — a live
+// item reading the Done option therefore hits the "option not in board map" skip (D5)
+// and drives no AutoMove, even for an OPEN issue that carries a real column label.
+//
+// This fixture is engineered to exercise the BY-CONSTRUCTION guard (skip (b): option not
+// in optionColumn), NOT the marker no-op (skip (a): live == marker):
+//
+//   - The live item reads Status == "opt_done" (the Done option).
+//   - Its issue is OPEN and labelled "In Progress" (a real, mapped column), so IF reverse
+//     ever classified this item the move would be DESTRUCTIVE — it would strip the
+//     existing "In Progress" label (currentColumn "In Progress" != target).
+//   - The stored marker is deliberately "" (NOT "opt_done"), so live ("opt_done") !=
+//     marker (""): execution passes THROUGH skip (a) and reaches skip (b). (A marker ==
+//     "opt_done" fixture would no-op via skip (a) and prove nothing about the
+//     construction invariant — that Done is never in the map.)
+//
+// Non-vacuity, by a call-site mutation against this fixture's link (do NOT leave it in):
+// temporarily add "Done": "opt_done" into the status_options map passed to doneLink,
+// making Done a MANAGED option. Two independent assertions then red, either of which
+// proves the zero-AutoMove is load-bearing:
+//
+//	(i)  the construction-invariant loop below Fatalfs — "opt_done" is now a
+//	     status_options value, which is precisely the state this test asserts can never
+//	     happen; AND
+//	(ii) were that loop removed, optionColumn would contain "opt_done" → "Done", so skip
+//	     (b) no longer fires: the open, "In Progress"-labelled item is classified as a
+//	     destructive remap to "Done" and one AutoMove(target="Done") executes, reddening
+//	     the zero-AutoMove assertion.
+//
+// That both hold ONLY while "opt_done" is absent from status_options is exactly the
+// construction invariant this test anchors.
+func TestReverseSyncLeavesDoneProjectionAlone(t *testing.T) {
+	repoID := uuid.New()
+	// status_options maps ONLY the real column "In Progress" → "opt_ip". done_option_id is
+	// "opt_done", which is NOT one of those values — the reserved Done option is never a
+	// managed column option.
+	link := doneLink(t, map[string]string{"In Progress": "opt_ip"}, "opt_done")
+
+	// The live board item sits on the Done option; its issue is OPEN with a real column
+	// label, and its stored marker is "" (not Done) to force past skip (a) into skip (b).
+	syncer := reverseSyncer(forge.ProjectV2ItemStatus{ItemID: "item7", IssueNumber: 7, OptionID: "opt_done"})
+	mover := &fakeMover{}
+	st := &fakeProjectStore{
+		repo:          githubRepoRow(repoID),
+		link:          link,
+		columns:       []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+		issues:        []store.Issue{{ForgeIssueIid: 7, State: "opened", Labels: labelsJSON(t, "In Progress")}},
+		existingItems: []store.GithubProjectItem{projectItem(repoID, 7, "item7", "")}, // marker NOT opt_done → past skip (a)
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.SetMover(mover)
+
+	// Construction invariant (the non-vacuity anchor, PRD #584 M3 SC): the reserved Done
+	// option id is NOT a value in status_options, so it can never be in the reverse map.
+	var columnOption map[string]string
+	if err := json.Unmarshal(link.StatusOptions, &columnOption); err != nil {
+		t.Fatalf("unmarshal status_options: %v", err)
+	}
+	for column, optID := range columnOption {
+		if optID == link.DoneOptionID {
+			t.Fatalf("construction invariant broken: done_option_id %q is a status_options value (column %q); Done must never be a managed option", link.DoneOptionID, column)
+		}
+	}
+
+	if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+		t.Fatalf("ReverseSync: %v", err)
+	}
+
+	// The Done-projected item drives ZERO AutoMove — the by-construction skip (b) fired,
+	// so the open issue's "In Progress" label was left intact (no destructive move).
+	if len(mover.calls) != 0 {
+		t.Errorf("a live Done-option item must drive no AutoMove (by-construction skip), got %v", mover.calls)
+	}
+	// It advanced no marker and was not upserted (skip (b) leaves the marker as-is).
+	if len(st.markerSets) != 0 || len(st.items) != 0 {
+		t.Errorf("skip (b) must not touch the marker, got sets=%v items=%v", st.markerSets, st.items)
+	}
+	// A skip is not an error: no last_error stamped for a (non-)destructive move.
+	if len(st.linkErrs) != 0 {
+		t.Errorf("leaving the Done projection alone must stamp no last_error, got %v", st.linkErrs)
+	}
 }
