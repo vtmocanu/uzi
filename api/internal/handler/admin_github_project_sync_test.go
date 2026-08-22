@@ -64,6 +64,11 @@ type fakeProjectSync struct {
 	ownerType      forge.ProjectV2OwnerType
 	ownerTypeErr   error
 	ownerTypeCalls int
+
+	// PRD #576 M3: scripted resync note + error, and a call counter.
+	resyncNote  string
+	resyncErr   error
+	resyncCalls int
 }
 
 func (f *fakeProjectSync) Adopt(_ context.Context, repoID uuid.UUID, number int, kind forge.ProjectV2OwnerKind) error {
@@ -124,6 +129,12 @@ func (f *fakeProjectSync) Unshare(_ context.Context, repoID uuid.UUID, username 
 	f.unshareCalls++
 	f.gotRepoID, f.gotUsername = repoID, username
 	return f.unshareErr
+}
+
+func (f *fakeProjectSync) Resync(_ context.Context, repoID uuid.UUID) (string, error) {
+	f.resyncCalls++
+	f.gotRepoID = repoID
+	return f.resyncNote, f.resyncErr
 }
 
 // postAdopt drives AdoptGithubProjectSync with an admin actor and the given repo id
@@ -388,6 +399,76 @@ func TestOwnerTypeRouteValidation(t *testing.T) {
 	t.Run("service not wired", func(t *testing.T) {
 		h := &Handler{}
 		w := getOwnerType(t, h, uuid.New().String())
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500", w.Code)
+		}
+	})
+}
+
+// resync drives ResyncGithubProjectSync with an admin actor and the given repo id.
+func resync(t *testing.T, h *Handler, repoID string) *httptest.ResponseRecorder {
+	t.Helper()
+	admin := store.User{ID: uuid.New(), IsAdmin: true}
+	r := httptest.NewRequest(http.MethodPost, "/repos/x/github-project-sync/resync", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", repoID)
+	r = r.WithContext(context.WithValue(mw.ContextWithUser(r.Context(), admin), chi.RouteCtxKey, rctx))
+	w := httptest.NewRecorder()
+	h.ResyncGithubProjectSync(w, r)
+	return w
+}
+
+// TestResyncRouteDelegates (PRD #576 M3): the resync route delegates to the service
+// with the path repo id and returns 200 {"status":"resynced"}; it needs no body.
+func TestResyncRouteDelegates(t *testing.T) {
+	sync := &fakeProjectSync{resyncNote: "1 column skipped"}
+	h := &Handler{projectSync: sync}
+	repoID := uuid.New()
+	w := resync(t, h, repoID.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("resync status = %d, want 200", w.Code)
+	}
+	if sync.resyncCalls != 1 || sync.gotRepoID != repoID {
+		t.Errorf("Resync not delegated with path repo id: calls=%d id=%v", sync.resyncCalls, sync.gotRepoID)
+	}
+	var body struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response not JSON: %v", err)
+	}
+	if body.Status != "resynced" {
+		t.Errorf("status = %q, want resynced", body.Status)
+	}
+}
+
+// TestResyncRouteNotLinkedIs404: the not-linked sentinel maps to 404.
+func TestResyncRouteNotLinkedIs404(t *testing.T) {
+	sync := &fakeProjectSync{resyncErr: forgesvc.ErrProjectSyncNotLinked}
+	h := &Handler{projectSync: sync}
+	w := resync(t, h, uuid.New().String())
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("resync status = %d, want 404", w.Code)
+	}
+}
+
+// TestResyncRouteValidation: a bad repo id is 400 before the service; a nil service
+// is a clean 500.
+func TestResyncRouteValidation(t *testing.T) {
+	t.Run("invalid repo id", func(t *testing.T) {
+		sync := &fakeProjectSync{}
+		h := &Handler{projectSync: sync}
+		w := resync(t, h, "not-a-uuid")
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", w.Code)
+		}
+		if sync.resyncCalls != 0 {
+			t.Errorf("service must not be called on a bad repo id")
+		}
+	})
+	t.Run("service not wired", func(t *testing.T) {
+		h := &Handler{}
+		w := resync(t, h, uuid.New().String())
 		if w.Code != http.StatusInternalServerError {
 			t.Fatalf("status = %d, want 500", w.Code)
 		}

@@ -29,6 +29,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       getProjectSyncOwnerType: vi.fn(),
       provisionProjectSync: vi.fn(),
       adoptProjectSync: vi.fn(),
+      resyncProjectSync: vi.fn(),
       disableProjectSync: vi.fn(),
       getProjectSyncVisibility: vi.fn(),
       setProjectSyncVisibility: vi.fn(),
@@ -695,6 +696,69 @@ describe("Repos — GitHub Projects sync (PRD #534 M3)", () => {
     expect(
       await within(panel).findByText(/turned off for this instance — ask an admin to enable it/i),
     ).toBeTruthy();
+  });
+});
+
+describe("Repos — skipped columns + Resync (PRD #576 M3)", () => {
+  const GH_CONN: ForgeConnection = {
+    ...CONN,
+    id: "conn-gh",
+    forge_type: "github",
+    base_url: "https://github.com",
+  };
+  const GH_REPO: Repo = repo({
+    id: "repo-gh",
+    path_with_namespace: "vtmocanu/gh",
+    connection_id: "conn-gh",
+  });
+
+  const linkedWithUnmatched = {
+    project_number: 42,
+    owned_by_uzi: false,
+    last_synced_at: "2026-08-20T10:00:00Z",
+    last_error: null,
+    item_count: 7,
+    unmatched_columns: ["Planned", "bug"],
+  };
+
+  async function openSyncPanel(name: string): Promise<HTMLElement> {
+    renderPage();
+    await screen.findByText(name);
+    fireEvent.click(within(rowFor(name)).getByRole("button", { name: /Project sync settings for/ }));
+    return screen.getByRole("group", { name: new RegExp(`Project sync for ${name}`) });
+  }
+
+  beforeEach(() => {
+    mockApi.listConnections.mockResolvedValue({ connections: [GH_CONN] });
+    mockApi.listProjects.mockResolvedValue({ repos: [{ ...GH_REPO }] });
+    mockApi.getProjectSyncVisibility.mockResolvedValue({ public: false });
+  });
+
+  it("lists the skipped columns and renders a Resync button", async () => {
+    mockApi.getProjectSyncStatus.mockResolvedValue({ ...linkedWithUnmatched });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Linked");
+
+    // Both skipped column names appear in the advisory copy.
+    expect(within(panel).getByText(/Planned, bug/)).toBeTruthy();
+    expect(
+      within(panel).getByText(/no matching Status option and won.?t\s+sync/i),
+    ).toBeTruthy();
+    expect(within(panel).getByRole("button", { name: /Resync/ })).toBeTruthy();
+  });
+
+  it("clicking Resync calls resyncProjectSync with the repo id and reloads status", async () => {
+    mockApi.getProjectSyncStatus.mockResolvedValue({ ...linkedWithUnmatched });
+    mockApi.resyncProjectSync.mockResolvedValue({ status: "resynced" });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Linked");
+
+    mockApi.getProjectSyncStatus.mockClear();
+    fireEvent.click(within(panel).getByRole("button", { name: /Resync/ }));
+
+    await waitFor(() => expect(mockApi.resyncProjectSync).toHaveBeenCalledWith("repo-gh"));
+    // Status is reloaded after the resync so the readout reflects the result.
+    await waitFor(() => expect(mockApi.getProjectSyncStatus).toHaveBeenCalledWith("repo-gh"));
   });
 });
 

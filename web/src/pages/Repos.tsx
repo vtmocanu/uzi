@@ -266,6 +266,22 @@ export function Repos() {
     }
   };
 
+  // Re-seed an already-linked board (PRD #576 M3): re-reads the Status field so
+  // newly-added options resolve, then reloads status so the skipped-columns list and
+  // health reflect the result. Reuses the syncBusy pattern from adopt/provision.
+  const resyncSync = async (repoId: string) => {
+    setSyncError("");
+    setSyncBusy(true);
+    try {
+      await api.resyncProjectSync(repoId);
+      await loadSyncStatus(repoId);
+    } catch (err) {
+      setSyncError(syncErrorMessage(err));
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
   const disableSync = async (repoId: string) => {
     setSyncError("");
     setSyncBusy(true);
@@ -1323,6 +1339,31 @@ export function Repos() {
                         <dd className="text-fg">{syncStatus.last_error ?? "none"}</dd>
                       </div>
                     </dl>
+
+                    {/* Skipped columns advisory (PRD #576 M3): board columns with no
+                        matching Status option never sync. Surface them with a Resync
+                        loop — add the options in GitHub, then Resync to pick them up. */}
+                    {syncStatus.unmatched_columns &&
+                      syncStatus.unmatched_columns.length > 0 && (
+                        <div
+                          role="alert"
+                          className="space-y-2 rounded-md border border-warn/40 bg-warn/10 p-3 text-sm"
+                        >
+                          <p className="text-fg">
+                            These board columns have no matching Status option and won&rsquo;t
+                            sync: {syncStatus.unmatched_columns.join(", ")}. Add them as Status
+                            options in GitHub, then Resync.
+                          </p>
+                        </div>
+                      )}
+
+                    <Button
+                      size="sm"
+                      disabled={syncBusy}
+                      onClick={() => resyncSync(syncRepo.id)}
+                    >
+                      {syncBusy ? "Working…" : "Resync"}
+                    </Button>
 
                     {/* Board access (PRD #557): visibility toggle + write-only
                         sharing. GitHub-gated already (linked implies GitHub). */}

@@ -99,6 +99,47 @@ func (h *Handler) AdoptGithubProjectSync(w http.ResponseWriter, r *http.Request)
 	httpx.JSON(w, http.StatusOK, map[string]any{"status": "linked"})
 }
 
+// ResyncGithubProjectSync re-runs the adopt seed against a repo's already-linked board
+// (PRD #576 M3): it re-reads the Status field so newly-added options are picked up and
+// re-persists the recomputed unmatched set, giving the user a one-click fix loop after
+// they add the missing Status options in GitHub. Same owner-or-admin, path-scoped shape
+// and nil-guard as the sibling routes; it needs NO body (the coordinates come from the
+// stored link). A repo with no link row maps to 404 ("not linked") via the not-linked
+// sentinel. Success is 200 {"status":"resynced"}.
+func (h *Handler) ResyncGithubProjectSync(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
+		return
+	}
+	if !user.IsAdmin {
+		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				httpx.Error(w, http.StatusNotFound, "repo not found")
+				return
+			}
+			slog.Error("github project sync: owner preflight", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+	if h.projectSync == nil {
+		slog.Error("github project sync resync: service not wired")
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if _, err := h.projectSync.Resync(r.Context(), id); err != nil {
+		writeProjectSyncError(w, "resync", err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"status": "resynced"})
+}
+
 // provisionGithubProjectSyncRequest is the POST body for the autonomous-provision
 // route (PRD #364 M4): owner_kind selects the GraphQL owner root the new project is
 // created under (defaults to "user"), and title optionally names the created board
@@ -206,6 +247,10 @@ type getGithubProjectSyncStatusResponse struct {
 	LastSyncedAt  *time.Time `json:"last_synced_at"`
 	LastError     *string    `json:"last_error"`
 	ItemCount     int        `json:"item_count"`
+	// UnmatchedColumns are board columns with no matching Status option at the last
+	// adopt/resync (PRD #576 M3); the panel surfaces them with a Resync prompt. Always
+	// a JSON array (never null) so the frontend can `.length` it unconditionally.
+	UnmatchedColumns []string `json:"unmatched_columns"`
 }
 
 // GetGithubProjectSyncStatus is the sync-health read (PRD #364 M7, owner-or-admin by
@@ -252,10 +297,15 @@ func (h *Handler) GetGithubProjectSyncStatus(w http.ResponseWriter, r *http.Requ
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	unmatched := status.UnmatchedColumns
+	if unmatched == nil {
+		unmatched = []string{}
+	}
 	resp := getGithubProjectSyncStatusResponse{
-		ProjectNumber: status.ProjectNumber,
-		OwnedByUzi:    status.OwnedByUzi,
-		ItemCount:     status.ItemCount,
+		ProjectNumber:    status.ProjectNumber,
+		OwnedByUzi:       status.OwnedByUzi,
+		ItemCount:        status.ItemCount,
+		UnmatchedColumns: unmatched,
 	}
 	if status.LastSyncedAt.Valid {
 		t := status.LastSyncedAt.Time
@@ -517,6 +567,8 @@ func writeProjectSyncError(w http.ResponseWriter, op string, err error) {
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		httpx.Error(w, http.StatusNotFound, "repo not found")
+	case errors.Is(err, forgesvc.ErrProjectSyncNotLinked):
+		httpx.Error(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, forgesvc.ErrProjectSyncDisabled),
 		errors.Is(err, forgesvc.ErrProjectSyncAlreadyLinked):
 		httpx.Error(w, http.StatusConflict, err.Error())

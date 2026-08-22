@@ -1006,6 +1006,162 @@ func TestProjectSyncStatusNoLink(t *testing.T) {
 	}
 }
 
+// --- unmatched-columns advisory (PRD #576 M3) --------------------------------
+
+// TestAdoptPersistsUnmatchedColumns (SC (a)): a board whose columns do not all match
+// the field's Status options persists EXACTLY the skipped columns into the captured
+// UpsertGithubProjectLinkParams.UnmatchedColumns — the set the panel later surfaces.
+func TestAdoptPersistsUnmatchedColumns(t *testing.T) {
+	repoID := uuid.New()
+	syncer := &fakeProjectSyncer{
+		fakeForge: &fakeForge{},
+		scopes:    []string{"repo", "project"},
+		slugOwner: "acme", slugRepo: "widgets",
+		project:    forge.ProjectV2Ref{ID: "PVT_1", Number: 7},
+		repoNodeID: "REPO_1",
+		fields: map[string]forge.ProjectV2StatusField{
+			// Only "In Progress" exists as an option; the other three columns are unmatched.
+			"Status": {ID: "PVTSSF_1", Name: "Status", Options: []forge.ProjectV2Option{
+				{ID: "opt_ip", Name: "In Progress"},
+			}},
+		},
+	}
+	st := &fakeProjectStore{
+		repo: githubRepoRow(repoID),
+		columns: []store.BoardColumn{
+			{LabelName: "In Progress", Position: 1},
+			{LabelName: "Planned", Position: 2},      // unmatched
+			{LabelName: "Human Review", Position: 3}, // unmatched
+			{LabelName: "Later", Position: 4},        // unmatched
+		},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	if err := svc.Adopt(context.Background(), repoID, 7, forge.OwnerUser); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	if len(st.links) != 1 {
+		t.Fatalf("want 1 link upsert, got %d", len(st.links))
+	}
+	got := st.links[0].UnmatchedColumns
+	want := []string{"Planned", "Human Review", "Later"}
+	if len(got) != len(want) {
+		t.Fatalf("unmatched_columns = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("unmatched_columns[%d] = %q, want %q (full: %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+// TestProjectSyncStatusReturnsUnmatchedColumns (SC (b)): the stored link's
+// unmatched_columns is mapped verbatim into the status DTO — a pure store read, no
+// forge call (D5).
+func TestProjectSyncStatusReturnsUnmatchedColumns(t *testing.T) {
+	repoID := uuid.New()
+	st := &fakeProjectStore{
+		link: store.GithubProjectLink{
+			RepoID:           repoID,
+			ProjectNumber:    42,
+			UnmatchedColumns: []string{"Planned", "bug"},
+		},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{}, fakeSyncSettings{enabled: true}, nil)
+	got, err := svc.ProjectSyncStatus(context.Background(), repoID)
+	if err != nil {
+		t.Fatalf("ProjectSyncStatus: %v", err)
+	}
+	if len(got.UnmatchedColumns) != 2 || got.UnmatchedColumns[0] != "Planned" || got.UnmatchedColumns[1] != "bug" {
+		t.Errorf("UnmatchedColumns = %v, want [Planned bug]", got.UnmatchedColumns)
+	}
+}
+
+// TestResyncReseedsAndRepersists (SC (c)): with a stored link, Resync re-seeds items
+// (seedItems ran — an item was added and set) and re-persists the link against the
+// STORED project coordinates (not any caller-supplied owner_kind/number), recomputing
+// the unmatched set from the current field. Resync takes no owner_kind — it is
+// structurally impossible to pass one — so re-seeding the stored board is the assertion.
+func TestResyncReseedsAndRepersists(t *testing.T) {
+	repoID := uuid.New()
+	syncer := &fakeProjectSyncer{
+		fakeForge: &fakeForge{},
+		scopes:    []string{"repo", "project"},
+		slugOwner: "acme", slugRepo: "widgets",
+		repoNodeID: "REPO_1",
+		fields: map[string]forge.ProjectV2StatusField{
+			"Status": {ID: "PVTSSF_NEW", Name: "Status", Options: []forge.ProjectV2Option{
+				{ID: "opt_ip", Name: "In Progress"},
+			}},
+		},
+		issueNode: map[int]string{1: "content1"},
+	}
+	st := &fakeProjectStore{
+		repo: githubRepoRow(repoID),
+		// A stored link the Resync path reuses (node id + number + ownership) — no
+		// owner_kind/project_number comes from a caller.
+		link: store.GithubProjectLink{
+			RepoID:        repoID,
+			ProjectNodeID: "PVT_STORED",
+			ProjectNumber: 9,
+			OwnedByUzi:    false,
+		},
+		columns: []store.BoardColumn{
+			{LabelName: "In Progress", Position: 1},
+			{LabelName: "Later", Position: 2}, // unmatched now
+		},
+		issues: []store.Issue{
+			{ForgeIssueIid: 1, State: "opened", Labels: labelsJSON(t, "In Progress")},
+		},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+
+	note, err := svc.Resync(context.Background(), repoID)
+	if err != nil {
+		t.Fatalf("Resync: %v", err)
+	}
+
+	// seedItems ran: issue 1 was added to the board and set to its option.
+	if len(syncer.addCalls) != 1 || syncer.addCalls[0] != "content1" {
+		t.Errorf("want issue 1 content added once (seed ran), got %v", syncer.addCalls)
+	}
+	if len(syncer.setCalls) != 1 || syncer.setCalls[0].optionID != "opt_ip" {
+		t.Errorf("want issue 1 set to opt_ip, got %v", syncer.setCalls)
+	}
+
+	// The link was re-persisted against the STORED coordinates + the re-read field.
+	if len(st.links) != 1 {
+		t.Fatalf("want 1 link upsert on resync, got %d", len(st.links))
+	}
+	link := st.links[0]
+	if link.ProjectNodeID != "PVT_STORED" || link.ProjectNumber != 9 {
+		t.Errorf("resync must reuse stored coordinates, got node=%q number=%d", link.ProjectNodeID, link.ProjectNumber)
+	}
+	if link.StatusFieldID != "PVTSSF_NEW" {
+		t.Errorf("resync must re-read the field, got %q", link.StatusFieldID)
+	}
+	if len(link.UnmatchedColumns) != 1 || link.UnmatchedColumns[0] != "Later" {
+		t.Errorf("recomputed unmatched = %v, want [Later]", link.UnmatchedColumns)
+	}
+	if note == "" {
+		t.Errorf("want a non-empty note for the unmatched Later column")
+	}
+	// Clean run clears last_error once (mirrors Adopt).
+	if st.linkErrCleared != 1 {
+		t.Errorf("clean resync should clear last_error once, got %d", st.linkErrCleared)
+	}
+}
+
+// TestResyncNoLink: a repo with no link row returns ErrProjectSyncNotLinked (→ 404),
+// distinct from a bare pgx.ErrNoRows.
+func TestResyncNoLink(t *testing.T) {
+	st := &fakeProjectStore{linkErr: pgx.ErrNoRows}
+	svc := NewProjectSync(st, fakeForgeBuilder{}, fakeSyncSettings{enabled: true}, nil)
+	_, err := svc.Resync(context.Background(), uuid.New())
+	if !errors.Is(err, ErrProjectSyncNotLinked) {
+		t.Fatalf("want ErrProjectSyncNotLinked, got %v", err)
+	}
+}
+
 // --- ForwardMove (M5) --------------------------------------------------------
 
 // forwardLink builds a link row whose StatusOptions maps the given columns.

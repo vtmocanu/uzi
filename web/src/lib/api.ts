@@ -426,6 +426,10 @@ export interface ProjectSyncStatus {
   last_synced_at: string | null;
   last_error: string | null;
   item_count: number;
+  // Board columns with no matching Status option at the last adopt/resync (PRD #576
+  // M3): the panel surfaces them with a Resync prompt. Always an array from the server
+  // (never null); optional here so a pre-M3 fixture without the field still typechecks.
+  unmatched_columns?: string[];
 }
 // Which GitHub owner a provision/adopt targets (PRD #534): the connecting user,
 // an org, or the token's own viewer. "user" is the default.
@@ -2881,6 +2885,15 @@ const realApi = {
     id: string,
     body: { project_number: number; owner_kind: ProjectSyncOwnerKind },
   ) => request<{ status: string }>("POST", `/repos/${id}/github-project-sync`, body),
+  // Re-seed an already-linked board (PRD #576 M3): re-reads the Status field so
+  // newly-added options resolve and re-persists the unmatched set. Idempotent (Adopt
+  // re-diffs every item); needs no body. 200 { status: "resynced" }; 404 when the repo
+  // has no link.
+  resyncProjectSync: (id: string) =>
+    request<{ status: string }>(
+      "POST",
+      `/repos/${id}/github-project-sync/resync`,
+    ),
   // Unlink the repo from its project (204, empty body). Idempotent server-side.
   disableProjectSync: (id: string) =>
     request<null>("DELETE", `/repos/${id}/github-project-sync`),

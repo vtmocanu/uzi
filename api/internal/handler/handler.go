@@ -181,6 +181,11 @@ type ProjectSyncer interface {
 	ShareWithUser(ctx context.Context, repoID uuid.UUID, username string) error
 	// Unshare revokes the named GitHub login's access to the linked board (PRD #557).
 	Unshare(ctx context.Context, repoID uuid.UUID, username string) error
+	// Resync re-runs the adopt seed against a repo's already-linked board (PRD #576
+	// M3), re-reading the Status field so newly-added options resolve and re-persisting
+	// the unmatched set. Needs no owner_kind/project_number (uses the stored node id).
+	// Returns ErrProjectSyncNotLinked when the repo has no link (the handler → 404).
+	Resync(ctx context.Context, repoID uuid.UUID) (string, error)
 }
 
 // SetProjectSync wires the GitHub Projects v2 provisioning service in after
@@ -1089,6 +1094,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				r.Get("/{id}/github-project-sync/owner-type", h.GetGithubProjectOwnerType)
 				r.Post("/{id}/github-project-sync", h.AdoptGithubProjectSync)
 				r.Post("/{id}/github-project-sync/provision", h.ProvisionGithubProjectSync)
+				// Resync re-seeds an already-linked board, picking up newly-added Status
+				// options (PRD #576 M3). Same owner-or-admin group; the CLI move to
+				// RequireUser is M7's job, not now.
+				r.Post("/{id}/github-project-sync/resync", h.ResyncGithubProjectSync)
 				r.Delete("/{id}/github-project-sync", h.DisableGithubProjectSync)
 				// Board access controls (PRD #557): read/flip the board's visibility, and
 				// grant/revoke Reader access by username. Same owner-or-admin preflight +

@@ -61,6 +61,11 @@ var (
 	// username is user-actionable, never a 500. Only a NOT_FOUND login maps here —
 	// a stale board node id or any other forge error stays a generic 500.
 	ErrProjectSyncUserNotFound = errors.New("no github user with that username")
+	// ErrProjectSyncNotLinked is a Resync against a repo with no link row: there is
+	// nothing to re-seed. The handler maps it to 404 ("not linked"). Distinct from a
+	// bare pgx.ErrNoRows so the Resync path can 404 on a missing LINK without an
+	// unknown-repo-id read (which would also be ErrNoRows) being conflated with it.
+	ErrProjectSyncNotLinked = errors.New("this repo has no linked project to resync")
 )
 
 // ProjectSyncStore is the subset of store methods the provisioning service needs.
@@ -370,6 +375,10 @@ func (s *ProjectSyncService) provisionAndSeed(ctx context.Context, repo store.Ge
 		StatusFieldID: field.ID,
 		StatusOptions: optionsJSON,
 		OwnedByUzi:    true, // provision create-and-owns
+		// Provision CREATES the field's options from the columns, so every column
+		// matches by construction — the unmatched set is always empty here. Pass an
+		// explicit empty slice (the query's COALESCE makes nil safe too).
+		UnmatchedColumns: []string{},
 	}); err != nil {
 		return fmt.Errorf("project sync: persist link: %w", err)
 	}
@@ -380,34 +389,52 @@ func (s *ProjectSyncService) provisionAndSeed(ctx context.Context, repo store.Ge
 	return nil
 }
 
-// adoptAndSeed does the resolve → map → persist-link → seed-items work. It returns
-// a human-readable NOTE describing any board columns that did not match a Status
-// option (recorded on the link row) and an error on any hard failure.
-func (s *ProjectSyncService) adoptAndSeed(ctx context.Context, repo store.GetRepoByIDRow, syncer forge.ProjectBoardSyncer, projectNumber int, ownerKind forge.ProjectV2OwnerKind) (string, error) {
-	owner, name, err := syncer.RepoSlug(ctx, repo.ForgeProjectID)
-	if err != nil {
-		return "", fmt.Errorf("project sync: resolve repo slug: %w", err)
-	}
+// seedParams carries the resolved inputs prepareSeedLink computes and hands to the
+// seed step. Bundling them as one value keeps the seed a single, wrappable call —
+// M4 will run that step in a background goroutine, so the persist-link work (which
+// stays synchronous) and the seed work are cleanly separable seams.
+type seedParams struct {
+	repo         store.GetRepoByIDRow
+	syncer       forge.ProjectBoardSyncer
+	owner        string
+	name         string
+	projectID    string
+	fieldID      string
+	columnOption map[string]string
+	position     map[string]int
+}
 
-	project, err := syncer.ResolveProjectV2(ctx, owner, projectNumber, ownerKind)
-	if err != nil {
-		return "", fmt.Errorf("project sync: resolve project #%d: %w", projectNumber, err)
-	}
+// seed runs the item-seeding step for a prepared link. It is a thin wrapper over
+// seedItems so callers (adopt/resync) invoke a single method — the seam M4 wraps in
+// a goroutine. seedItems keeps its explicit positional signature (unchanged since
+// PRD #364) so its many internal references stay stable.
+func (s *ProjectSyncService) seed(ctx context.Context, p seedParams) error {
+	return s.seedItems(ctx, p.repo, p.syncer, p.owner, p.name, p.projectID, p.fieldID, p.columnOption, p.position)
+}
 
-	field, err := syncer.ProjectV2StatusFieldByName(ctx, project.ID, statusFieldName)
+// prepareSeedLink is the shared adopt/resync core: given an ALREADY-resolved project
+// (node id + number), it resolves the Status field by name (falling back to uzi's own
+// field name exactly as adopt did), builds the column→option map, computes the
+// unmatched set and per-column positions, best-effort links the project into the
+// repo's Projects tab, and PERSISTS the link INCLUDING the unmatched set. It returns
+// the seed parameters for the caller to feed to seed(), plus the unmatched columns for
+// the human-readable note. It does NOT seed items — that is the caller's separately
+// invocable step (see seed()), so the persist-link and seed seams stay independent.
+func (s *ProjectSyncService) prepareSeedLink(ctx context.Context, repo store.GetRepoByIDRow, syncer forge.ProjectBoardSyncer, owner, name, projectID string, projectNumber int64, ownedByUzi bool) (seedParams, []string, error) {
+	field, err := syncer.ProjectV2StatusFieldByName(ctx, projectID, statusFieldName)
 	if err != nil {
 		// Fall back to uzi's own field name before giving up (a board uzi created).
-		field, err = syncer.ProjectV2StatusFieldByName(ctx, project.ID, uziStatusFieldName)
+		field, err = syncer.ProjectV2StatusFieldByName(ctx, projectID, uziStatusFieldName)
 		if err != nil {
-			return "", fmt.Errorf("project sync: resolve status field: %w", err)
+			return seedParams{}, nil, fmt.Errorf("project sync: resolve status field: %w", err)
 		}
 	}
 
 	// Column-name → option-id map: exact-match each board column label to a Status
-	// option name. Unmatched columns are omitted and reported in the note.
+	// option name. Unmatched columns are omitted, reported in the note, and persisted.
 	columns, err := s.store.ListBoardColumns(ctx, repo.ID)
 	if err != nil {
-		return "", fmt.Errorf("project sync: list board columns: %w", err)
+		return seedParams{}, nil, fmt.Errorf("project sync: list board columns: %w", err)
 	}
 	optionByName := make(map[string]string, len(field.Options))
 	for _, o := range field.Options {
@@ -432,28 +459,126 @@ func (s *ProjectSyncService) adoptAndSeed(ctx context.Context, repo store.GetRep
 	// Best-effort link into the repo's Projects tab; never fatal to the seed.
 	if repoNodeID, rerr := syncer.ResolveRepositoryNodeID(ctx, owner, name); rerr != nil {
 		s.log.Warn("project sync: resolve repository node id", "repo", repo.ID, "error", rerr)
-	} else if lerr := syncer.LinkProjectV2ToRepository(ctx, project.ID, repoNodeID); lerr != nil {
+	} else if lerr := syncer.LinkProjectV2ToRepository(ctx, projectID, repoNodeID); lerr != nil {
 		s.log.Warn("project sync: link project to repository", "repo", repo.ID, "error", lerr)
 	}
 
 	// Persist the link BEFORE seeding items, so a mid-seed failure still records the
-	// link (and its last_error) rather than losing the resolved coordinates.
+	// link (and its last_error) rather than losing the resolved coordinates. The
+	// unmatched set is persisted here (PRD #576 M3) so ProjectSyncStatus can surface
+	// it with no forge call.
 	optionsJSON, err := json.Marshal(columnOption)
 	if err != nil {
-		return "", fmt.Errorf("project sync: marshal status options: %w", err)
+		return seedParams{}, nil, fmt.Errorf("project sync: marshal status options: %w", err)
 	}
 	if _, err := s.store.UpsertGithubProjectLink(ctx, store.UpsertGithubProjectLinkParams{
-		RepoID:        repo.ID,
-		ProjectNodeID: project.ID,
-		ProjectNumber: int64(project.Number),
-		StatusFieldID: field.ID,
-		StatusOptions: optionsJSON,
-		OwnedByUzi:    false, // adopt persists false; M4 create-and-owns
+		RepoID:           repo.ID,
+		ProjectNodeID:    projectID,
+		ProjectNumber:    projectNumber,
+		StatusFieldID:    field.ID,
+		StatusOptions:    optionsJSON,
+		OwnedByUzi:       ownedByUzi,
+		UnmatchedColumns: unmatched,
 	}); err != nil {
-		return "", fmt.Errorf("project sync: persist link: %w", err)
+		return seedParams{}, nil, fmt.Errorf("project sync: persist link: %w", err)
 	}
 
-	if err := s.seedItems(ctx, repo, syncer, owner, name, project.ID, field.ID, columnOption, position); err != nil {
+	return seedParams{
+		repo:         repo,
+		syncer:       syncer,
+		owner:        owner,
+		name:         name,
+		projectID:    projectID,
+		fieldID:      field.ID,
+		columnOption: columnOption,
+		position:     position,
+	}, unmatched, nil
+}
+
+// adoptAndSeed does the resolve → prepare-link → seed-items work for Adopt. It
+// returns a human-readable NOTE describing any board columns that did not match a
+// Status option — those columns are ALSO persisted to the link's unmatched_columns
+// (PRD #576 M3), so the note is both returned AND recorded on the link row — and an
+// error on any hard failure. owned_by_uzi is persisted false (M4 create-and-owns).
+func (s *ProjectSyncService) adoptAndSeed(ctx context.Context, repo store.GetRepoByIDRow, syncer forge.ProjectBoardSyncer, projectNumber int, ownerKind forge.ProjectV2OwnerKind) (string, error) {
+	owner, name, err := syncer.RepoSlug(ctx, repo.ForgeProjectID)
+	if err != nil {
+		return "", fmt.Errorf("project sync: resolve repo slug: %w", err)
+	}
+
+	project, err := syncer.ResolveProjectV2(ctx, owner, projectNumber, ownerKind)
+	if err != nil {
+		return "", fmt.Errorf("project sync: resolve project #%d: %w", projectNumber, err)
+	}
+
+	sp, unmatched, err := s.prepareSeedLink(ctx, repo, syncer, owner, name, project.ID, int64(project.Number), false)
+	if err != nil {
+		return "", err
+	}
+	if err := s.seed(ctx, sp); err != nil {
+		return "", err
+	}
+	return unmatchedNote(unmatched), nil
+}
+
+// Resync re-runs the adopt seed against a repo's ALREADY-linked board (PRD #576 M3),
+// re-reading the Status field so newly-added options are picked up — that is the whole
+// point of Resync — and re-persisting the link (including a recomputed unmatched set).
+// It takes NO owner_kind/project_number from the caller: it reuses the stored
+// project_node_id, so a user who added the missing Status options in GitHub can one-
+// click reconcile. A repo with no link row returns ErrProjectSyncNotLinked (→ 404).
+// Clears/stamps last_error exactly as Adopt does. It is fully synchronous in M3; the
+// seed seam is kept separable for M4's async wrapping.
+func (s *ProjectSyncService) Resync(ctx context.Context, repoID uuid.UUID) (string, error) {
+	link, err := s.store.GetGithubProjectLinkByRepo(ctx, repoID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrProjectSyncNotLinked
+		}
+		return "", fmt.Errorf("project sync: resync load link: %w", err)
+	}
+
+	repo, syncer, err := s.projectSyncPreamble(ctx, repoID)
+	if err != nil {
+		return "", err
+	}
+
+	note, err := s.resyncSeed(ctx, repo, syncer, link)
+	if err != nil {
+		// Best-effort: stamp the failure on the (already-existing) link row, mirroring Adopt.
+		if serr := s.store.SetGithubProjectLinkError(ctx, store.SetGithubProjectLinkErrorParams{
+			LastError: pgtype.Text{String: truncateErr(err.Error()), Valid: true},
+			RepoID:    repoID,
+		}); serr != nil {
+			s.log.Warn("project sync: record link error", "repo", repoID, "error", serr)
+		}
+		return "", err
+	}
+	// Success clears last_error unconditionally; the unmatched note is a non-fatal
+	// advisory, logged not stamped (see Adopt's note handling).
+	if note != "" {
+		s.log.Info("project sync: resync completed with advisory", "repo", repoID, "note", note)
+	}
+	if serr := s.store.ClearGithubProjectLinkError(ctx, repoID); serr != nil {
+		s.log.Warn("project sync: clear link error", "repo", repoID, "error", serr)
+	}
+	return note, nil
+}
+
+// resyncSeed is Resync's forge-touching core (split out so Resync owns the stamp/clear
+// wrapping, like Adopt/adoptAndSeed): resolve the repo slug, then prepare + seed the
+// link against the STORED project coordinates (reusing the stored node id, number, and
+// ownership). Re-reading the field is what lets newly-added Status options resolve.
+func (s *ProjectSyncService) resyncSeed(ctx context.Context, repo store.GetRepoByIDRow, syncer forge.ProjectBoardSyncer, link store.GithubProjectLink) (string, error) {
+	owner, name, err := syncer.RepoSlug(ctx, repo.ForgeProjectID)
+	if err != nil {
+		return "", fmt.Errorf("project sync: resolve repo slug: %w", err)
+	}
+	sp, unmatched, err := s.prepareSeedLink(ctx, repo, syncer, owner, name, link.ProjectNodeID, link.ProjectNumber, link.OwnedByUzi)
+	if err != nil {
+		return "", err
+	}
+	if err := s.seed(ctx, sp); err != nil {
 		return "", err
 	}
 	return unmatchedNote(unmatched), nil
@@ -1256,6 +1381,11 @@ type ProjectSyncStatus struct {
 	LastSyncedAt  pgtype.Timestamptz
 	LastError     pgtype.Text
 	ItemCount     int
+	// UnmatchedColumns are the board columns that had no matching Status option at the
+	// last adopt/resync (PRD #576 M3). Read straight off the link row (SELECT *), so
+	// this stays a pure store read with no forge call (D5). Empty when every column
+	// matched.
+	UnmatchedColumns []string
 }
 
 // ProjectSyncStatus reads a repo's link row + tracked-item count for the admin health
@@ -1274,11 +1404,12 @@ func (s *ProjectSyncService) ProjectSyncStatus(ctx context.Context, repoID uuid.
 		return ProjectSyncStatus{}, fmt.Errorf("project sync: status list items: %w", err)
 	}
 	return ProjectSyncStatus{
-		ProjectNumber: link.ProjectNumber,
-		OwnedByUzi:    link.OwnedByUzi,
-		LastSyncedAt:  link.LastSyncedAt,
-		LastError:     link.LastError,
-		ItemCount:     len(items),
+		ProjectNumber:    link.ProjectNumber,
+		OwnedByUzi:       link.OwnedByUzi,
+		LastSyncedAt:     link.LastSyncedAt,
+		LastError:        link.LastError,
+		ItemCount:        len(items),
+		UnmatchedColumns: link.UnmatchedColumns,
 	}, nil
 }
 
@@ -1345,8 +1476,10 @@ func optionMarker(optionID string) pgtype.Text {
 	return pgtype.Text{String: optionID, Valid: optionID != ""}
 }
 
-// unmatchedNote renders the note recorded on the link row for board columns that
-// had no matching Status option. Empty when every column matched.
+// unmatchedNote renders the human-readable advisory RETURNED to the caller for board
+// columns that had no matching Status option. The columns themselves are persisted to
+// the link's unmatched_columns (PRD #576 M3, in prepareSeedLink); this is the string
+// form of the same set. Empty when every column matched.
 func unmatchedNote(unmatched []string) string {
 	if len(unmatched) == 0 {
 		return ""

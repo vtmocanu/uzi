@@ -8,19 +8,25 @@
 -- the conflict target is repo_id; every mutable column is overwritten and updated_at
 -- bumped. Does NOT touch last_synced_at/last_error — those are written by the
 -- error/clear queries below on each sync attempt, not by a (re)link.
+-- unmatched_columns (PRD #576 M3) is COALESCE'd from nil→'{}' so a nil Go []string
+-- never becomes SQL NULL and violates the NOT NULL constraint; the same guard is
+-- applied on both the INSERT and the conflict update.
 INSERT INTO github_project_links (
-    repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi
+    repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi,
+    unmatched_columns
 ) VALUES (
     sqlc.arg('repo_id'), sqlc.arg('project_node_id'), sqlc.arg('project_number'),
-    sqlc.arg('status_field_id'), sqlc.arg('status_options'), sqlc.arg('owned_by_uzi')
+    sqlc.arg('status_field_id'), sqlc.arg('status_options'), sqlc.arg('owned_by_uzi'),
+    COALESCE(sqlc.arg('unmatched_columns')::text[], '{}')
 )
 ON CONFLICT (repo_id) DO UPDATE SET
-    project_node_id = EXCLUDED.project_node_id,
-    project_number  = EXCLUDED.project_number,
-    status_field_id = EXCLUDED.status_field_id,
-    status_options  = EXCLUDED.status_options,
-    owned_by_uzi    = EXCLUDED.owned_by_uzi,
-    updated_at      = now()
+    project_node_id   = EXCLUDED.project_node_id,
+    project_number    = EXCLUDED.project_number,
+    status_field_id   = EXCLUDED.status_field_id,
+    status_options    = EXCLUDED.status_options,
+    owned_by_uzi      = EXCLUDED.owned_by_uzi,
+    unmatched_columns = COALESCE(sqlc.arg('unmatched_columns')::text[], '{}'),
+    updated_at        = now()
 RETURNING *;
 
 -- name: GetGithubProjectLinkByRepo :one

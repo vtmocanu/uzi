@@ -2507,6 +2507,13 @@ export const mockApi = {
     });
     return delay({ status: "linked" });
   },
+  // Re-seed an already-linked board (PRD #576 M3). A 404 when not linked, mirroring
+  // the server's not-linked sentinel; otherwise a no-op idempotent re-seed.
+  resyncProjectSync: async (id: string) => {
+    if (!githubProjectLinks.has(id))
+      throw new ApiError(404, "this repo has no linked project to resync");
+    return delay({ status: "resynced" });
+  },
   // Unlink the repo from its project (empty 204 body).
   disableProjectSync: async (id: string) => {
     githubProjectLinks.delete(id);
