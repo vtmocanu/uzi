@@ -18,6 +18,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Revert the no-op SDK todo-tools flag (issue [#561](https://github.com/vtmocanu/uzi/issues/561), reverting [#550](https://github.com/vtmocanu/uzi/pull/550)).**
+  `CLAUDE_CODE_ENABLE_TODO_TOOLS=1`, added in 0.53.0 (whose notes billed it as "Restore SDK todo/task tools"), is a no-op on claude-agent-sdk 0.3.233: TodoWrite was removed from the SDK and no flag surfaces it, so the flag and its comment are removed. The SDK 0.3.233 pin (#531) is unchanged, and `CLAUDE_CODE_ENABLE_TASKS` is deliberately not added since the Task tools already work as deferred tools.
+
 ## [0.53.1] - 2026-08-22
 <!-- release-title: automatic worker-image roll + interactive-task hardening -->
 

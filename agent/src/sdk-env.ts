@@ -86,15 +86,6 @@ export function buildSdkEnv(
     PATH: runnerPath(),
     ANTHROPIC_API_KEY: undefined,
     ANTHROPIC_AUTH_TOKEN: undefined,
-    // Restore the pre-0.3.233 default tool surface (issue #549): claude-agent-sdk
-    // 0.3.233 dropped the todo/task-tracking tools (TodoWrite, Task*) from the default
-    // surface on newer models. uzi's lead + inherit-all subagents run on that surface,
-    // so they would silently lose planning tools. This re-advertises them everywhere
-    // buildSdkEnv feeds. It adds ONLY planning tools (no Edit/Write/Bash) and is inert
-    // wherever the surface is already constrained by a strict tools: allowlist (chat, the
-    // allowlisted subagents) or a denyAllTools PreToolUse hook (judge/review/summary),
-    // so no guardrail layer is weakened.
-    CLAUDE_CODE_ENABLE_TODO_TOOLS: "1",
   };
   // 5-bis: the agent's scratch on the runner's private 0700 TMPDIR under the split.
   const tmp = runnerTmpdir();
