@@ -172,6 +172,23 @@ describe("Repos — Trusted repo panel", () => {
     const panel = await openTrustPanel("vtmocanu/uzi");
     expect(panel.closest(".overflow-x-auto")).toBeNull();
   });
+});
+
+describe("Repos — board list layout (issue #578)", () => {
+  it("puts the projects table in a bordered box like /schedules, not a padded Card", async () => {
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+    const table = screen.getByRole("table");
+    // The table sits in the /schedules-style wrapper: a rounded, bordered box on
+    // the surface — a positive assertion the Card wrapper was dropped for M3.
+    const wrapper = table.closest("div.overflow-x-auto");
+    expect(wrapper).not.toBeNull();
+    expect(wrapper!.className).toContain("rounded-xl");
+    expect(wrapper!.className).toContain("border-edge");
+    // The removed Card carried a p-0 padding override; nothing wrapping the table
+    // should still be that Card.
+    expect(table.closest(".p-0")).toBeNull();
+  });
 
   it("moves focus into the panel when it opens", async () => {
     await openTrustPanel("vtmocanu/uzi");

@@ -699,8 +699,13 @@ export function Repos() {
             </div>
           )}
 
-          <Card className="p-0">
-            <div className="overflow-x-auto">
+          {/* Grouping div, not a Card: the board list grows down the page like
+              /schedules rather than reading as a padded scroll container (issue
+              #578). The table and its three detail panels are siblings here — the
+              panels stay OUTSIDE the table's horizontal-scroll box so their copy is
+              never clipped; a 16px gap (space-y-4) separates them. */}
+          <div className="space-y-4">
+            <div className="overflow-x-auto rounded-xl border border-edge bg-surface">
               <table className="w-full text-left text-sm">
                 <thead className="border-b border-edge text-muted">
                   <tr>
@@ -982,7 +987,7 @@ export function Repos() {
                 ref={trustPanelRef}
                 role="group"
                 aria-label={`Trusted repo for ${trustRepo.path_with_namespace}`}
-                className="space-y-4 border-t border-edge bg-raised/20 p-4"
+                className="space-y-4 rounded-xl border border-edge bg-raised/20 p-4"
               >
                 {/* Header: what "trusted" means, plus the master switch. */}
                 <div className="flex items-start gap-4">
@@ -1136,7 +1141,7 @@ export function Repos() {
               <div
                 role="group"
                 aria-label={`Tool profile for ${toolsRepo.path_with_namespace}`}
-                className="space-y-3 border-t border-edge bg-raised/20 p-4"
+                className="space-y-3 rounded-xl border border-edge bg-raised/20 p-4"
               >
                 <p className="text-sm text-fg">
                   <span className="font-medium">Tools for {toolsRepo.path_with_namespace}</span> — the worker installs
@@ -1245,7 +1250,7 @@ export function Repos() {
                 ref={syncPanelRef}
                 role="group"
                 aria-label={`Project sync for ${syncRepo.path_with_namespace}`}
-                className="space-y-4 border-t border-edge bg-raised/20 p-4"
+                className="space-y-4 rounded-xl border border-edge bg-raised/20 p-4"
               >
                 <div className="min-w-0 space-y-1">
                   <h3 className="flex items-center gap-2 text-sm font-semibold text-fg">
@@ -1485,7 +1490,7 @@ export function Repos() {
                 </div>
               </div>
             )}
-          </Card>
+          </div>
         </>
       )}
 
