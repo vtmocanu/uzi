@@ -22052,3 +22052,58 @@ the terse contract.
   `RequireUser` forces `IsAdmin=false` for CLI tokens, so an owner-or-admin path could not grant a
   CLI caller the admin arm anyway. Repos-page UI lives in `web/src/pages/Repos.tsx` (per-repo sync
   panel: adopt / provision / disable / status).
+
+## 569. PRD #557 — GitHub Projects sync board visibility + write-only collaborator sharing (github-only follow-up over #534's panel)
+
+Adds a **Board access** section to #534's linked-board panel: a visibility toggle and
+write-only Reader sharing, both github-only and reusing #534's owner-or-admin
+authorization. No change to provision/adopt/disable, the poller, or reverse sync.
+Terse contract; richer rationale is in PRD #557's Decision Log.
+
+- **Four github-only driver methods on `ProjectBoardSyncer`** (`api/internal/forge/projectsync.go`):
+  `GetProjectV2Visibility`/`SetProjectV2Visibility` round-trip `ProjectV2.public` via
+  `node(id){...on ProjectV2{public}}` / `updateProjectV2`; `SetProjectV2Collaborator`
+  sets `RoleReaderCollaborator`/`RoleNoneCollaborator` (`READER`/`NONE`) via
+  `updateProjectV2Collaborators`; `ResolveUserNodeID` resolves `user(login){id}`. All
+  four live on the optional capability interface, not the neutral `Forge` interface,
+  so `gitlab.go`/`forgejo.go` and the six `Forge` fakes are untouched — only the two
+  test *syncer* fakes gained stubs.
+- **Typed not-found, not a string match.** `graphqlDo` (`api/internal/forge/github.go`)
+  now captures the GraphQL error envelope's `type` field and, only when it is
+  `NOT_FOUND`, wraps the redacted error with `forge.ErrGitHubUserNotFound` (`errors.Is`-able);
+  every other GraphQL error stays a plain redacted error, unchanged for existing
+  callers. `ResolveUserNodeID` is the only caller that inspects it.
+- **The not-found mapping is scoped to the resolve step, not the whole surface.**
+  `forgesvc/projectsync.go`'s `ShareWithUser`/`Unshare` translate
+  `forge.ErrGitHubUserNotFound` → the new sentinel `ErrProjectSyncUserNotFound` (422 via
+  `writeProjectSyncError`) only around the username→node-id resolve call.
+  `GetVisibility`/`SetVisibility` share the same preamble and link-row read but never
+  touch that translation, so a stale/bad board node id on the visibility path still
+  surfaces as a generic 500, never a false "user not found" 422.
+- **Four service methods** (`forgesvc/projectsync.go`): `GetVisibility`, `SetVisibility`,
+  `ShareWithUser`, `Unshare` — each through the existing `projectSyncPreamble` (instance
+  flag + GitHub-only + `ProjectBoardSyncer` assertion + scope check) and the link row's
+  `ProjectNodeID` (`GetGithubProjectLinkByRepo`), reusing #364/#534's plumbing rather than
+  adding new preflight logic.
+- **Four routes**, all on #534's per-repo `RequireAuth` owner-or-admin group
+  (`api/internal/handler/handler.go`): `GET`/`PUT /repos/{id}/github-project-sync/visibility`
+  (`{"public": bool}` in/out) and `POST`/`DELETE /repos/{id}/github-project-sync/collaborators`
+  (`{"username": string}`, grant/revoke Reader, 204). Same owner-or-admin preflight,
+  existence-hiding 404, and instance-flag gate as #534's four routes;
+  `writeProjectSyncError` is extended for the new 422. Role is fixed to Reader in v1 —
+  the request shape has no `role` field, deliberately leaving room to add one later
+  without a breaking change.
+- **Write-only sharing is API-forced, not a design preference (D2).** `ProjectV2`
+  exposes no collaborators connection in GitHub's GraphQL schema, so uzi cannot render
+  an authoritative current-collaborator list at all. The web panel shows only
+  session-granted usernames plus an explicit note, rather than a uzi-owned
+  collaborator side-table — no new migration, no source-of-truth drift to maintain.
+- **Web-only; CLI stays excluded**, same reasoning as #534 (`RequireAuth` needs cookie +
+  CSRF; a CLI bearer token cannot carry either, and `RequireUser` forces
+  `IsAdmin=false` for CLI tokens regardless).
+- **No automated live-forge test in scope.** Every Go test drives a fake syncer or an
+  httptest GraphQL server; nothing exercises the real `updateProjectV2` /
+  `updateProjectV2Collaborators` / `node(...ProjectV2{public})` calls against GitHub, so
+  the GraphQL field/enum facts this design rests on are unverified by any gate — a
+  manual smoke test against a throwaway project is recommended before relying on this
+  in production.

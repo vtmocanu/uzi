@@ -69,6 +69,41 @@ scopes can be edited in place on github.com, no re-paste needed. See
 [GitHub bot setup](./github-bot-setup.md) for the base `repo` scope this
 adds to.
 
+## Board access — visibility and sharing
+
+A board uzi **provisions** is created by the connection's PAT, so it's owned
+by that account — often a separate bot account, kept deliberately out of your
+own GitHub login — and, per GitHub's default, **private**. GitHub gates a
+private project on project-level read access, so your repo access alone
+doesn't let you see the board uzi just made; you'd otherwise have to leave
+uzi and fix that in GitHub's own project settings. **Board access** puts
+those same controls inside uzi instead.
+
+You'll find it in the linked board's Manage panel on the **Boards** page,
+right below the sync status readout — same reach as the rest of the panel:
+the repo's connection owner (or an admin), GitHub only, and only once an
+admin has turned on the `github_project_sync_enabled` instance switch above.
+
+- **Visibility toggle.** Reads the board's current public/private state and
+  lets you flip it — it round-trips GitHub's `ProjectV2.public` flag, so the
+  toggle always reflects true state. When the board is public, the panel
+  warns that it's visible to anyone on the internet.
+- **Share with a GitHub user (Reader).** Type a GitHub username and uzi
+  grants that user **Reader** access to the board; a Revoke control removes
+  it. Reader is the only role this version grants.
+- **Write-only, by GitHub's own limit.** GitHub's Projects v2 API exposes no
+  readable collaborator list, so uzi can grant and revoke access by username
+  but cannot show you who currently has it. The panel lists only the users
+  you granted **in the current session**, as a convenience for revoking —
+  not as an authoritative list of who has access right now. To remove
+  someone's access later, revoke them by username.
+- **Bad usernames are reported, not swallowed.** An unknown GitHub login
+  comes back as a clear inline error, distinct from a transient or
+  permission failure — so a typo never looks like a successful grant.
+
+Like the rest of the panel, these are web-only actions; there's still no
+`uzi` CLI verb for them.
+
 ## What the model does and doesn't cover
 
 A Status field holds exactly one value, matching a card in exactly one

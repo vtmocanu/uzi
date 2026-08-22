@@ -2,7 +2,7 @@
 
 - **Issue**: [#557](https://github.com/vtmocanu/uzi/issues/557)
 - **Priority**: Medium
-- **Status**: Planned
+- **Status**: Complete (2026-08-22, M1–M5 on branch `agent/issue-557`: driver + service + owner-or-admin routes + web Board-access panel + docs; per-milestone review clean, store-it live-DB green, `task gate:api` and `task gate:web` green)
 - **Forge scope**: GitHub only. GitLab and Forgejo repos never show the control (the capability interface is github-only; `forge/projectsync_test.go:502` asserts the negative — the gitlab/forgejo drivers do not implement it).
 - **Depends on**: PRD #534 (merged, `44ee36030`). This is a pure follow-up: it extends #534's per-repo Project-sync panel and adds routes to the `/repos/{id}/github-project-sync*` group #534 relocated. Every fact below is resolved from the merged code.
 - **Workflow-scope**: touches **no** `.github/workflows/**` file in either implementation or validation, so it is safe for a uzi worker PAT (per `.claude/rules/prds.md`).
