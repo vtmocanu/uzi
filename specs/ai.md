@@ -20028,7 +20028,7 @@ and `prds/216-worker-load-balancing.md`.
 
 ## 509. PRD #158 — forge read tools: a run-scoped, worker-mediated, read-only `forge` MCP server the agent reaches WITHOUT holding a credential
 
-Design record: `prds/158-forge-read-tools.md`. Gives the fact-checker subagent structured
+Design record: `prds/done/158-forge-read-tools.md`. Gives the fact-checker subagent structured
 read access to the run's own forge (issues, MRs, pipelines) so it can verify claims against
 the source, without ever exposing the forge token or coordinates to the model.
 
