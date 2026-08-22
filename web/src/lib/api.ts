@@ -644,6 +644,11 @@ export interface AppSettings {
   // (e.g. a docker-needing run only to a docker worker). Turning it OFF reverts to
   // best-effort claiming; it does NOT disable the docker repo allowlist.
   capability_aware_scheduling: string;
+  // GitHub Projects v2 sync instance kill-switch (PRD #534 / issue #534 M2). The
+  // text "true"/"false" (default "false"). When OFF, no run mirrors board-column
+  // labels to a linked GitHub Projects Status field — an instance-wide rate-limit /
+  // cost lever. GitLab and Forgejo repos are unaffected either way.
+  github_project_sync_enabled: string;
   // Configurable board-membership + run-eligible labels (PRD #196 M2). All three
   // are served as raw strings like every other setting. run_eligible_labels and
   // board_extra_labels are COMMA-SEPARATED lists (safe because ValidateLabel rejects

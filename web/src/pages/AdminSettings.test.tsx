@@ -49,6 +49,7 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   health_nudge_cooldown_seconds: "1800",
   docker_repo_allowlist: "",
   capability_aware_scheduling: "true",
+  github_project_sync_enabled: "false",
   run_eligible_labels: "PRD,bug",
   board_extra_labels: "bug",
   eligible_label_waives_prd_link: "true",
@@ -621,6 +622,76 @@ describe("AdminSettings — capability-aware scheduling kill-switch (PRD #84 M2)
     );
     renderPage();
     await screen.findByText("Capability-aware scheduling");
+    expect(toggle().disabled).toBe(true);
+    expect(saveBtn().disabled).toBe(true);
+  });
+});
+
+describe("AdminSettings — GitHub Projects sync kill-switch (issue #534 M2)", () => {
+  const toggle = () => screen.getByLabelText(/enable github projects sync/i) as HTMLInputElement;
+  const saveBtn = () =>
+    screen.getByRole("button", { name: /save github projects sync/i }) as HTMLButtonElement;
+
+  it("renders the toggle unchecked (default OFF) with Save disabled until changed", async () => {
+    // The fixture defaults github_project_sync_enabled to "false".
+    renderPage();
+    await screen.findByText("GitHub Projects sync");
+    expect(toggle().checked).toBe(false);
+    expect(saveBtn().disabled).toBe(true);
+
+    fireEvent.click(toggle());
+    expect(saveBtn().disabled).toBe(false);
+  });
+
+  it("reflects the served value ON when github_project_sync_enabled is \"true\"", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ github_project_sync_enabled: "true" }));
+    renderPage();
+    await screen.findByText("GitHub Projects sync");
+    expect(toggle().checked).toBe(true);
+    // Already at the served value, so nothing is dirty.
+    expect(saveBtn().disabled).toBe(true);
+  });
+
+  it("saves the flag ON through the settings PATCH, sending only that key", async () => {
+    mockApi.updateSettings.mockResolvedValue(response({ github_project_sync_enabled: "true" }));
+    renderPage();
+    await screen.findByText("GitHub Projects sync");
+
+    fireEvent.click(toggle());
+    fireEvent.click(saveBtn());
+
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith({ github_project_sync_enabled: "true" }),
+    );
+    expect(mockApi.updateSettings.mock.calls[0][0]).toEqual({ github_project_sync_enabled: "true" });
+  });
+
+  it("saves the flag back OFF when the served value is ON", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ github_project_sync_enabled: "true" }));
+    mockApi.updateSettings.mockResolvedValue(response({ github_project_sync_enabled: "false" }));
+    renderPage();
+    await screen.findByText("GitHub Projects sync");
+
+    fireEvent.click(toggle());
+    fireEvent.click(saveBtn());
+
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith({ github_project_sync_enabled: "false" }),
+    );
+  });
+
+  it("links to the GitHub Projects sync guide", async () => {
+    renderPage();
+    const link = await screen.findByRole("link", { name: "GitHub Projects v2 sync" });
+    expect(link.getAttribute("href")).toBe("/docs/github-project-sync");
+  });
+
+  it("disables the toggle when the setting is fixed by the environment", async () => {
+    mockApi.getSettings.mockResolvedValue(
+      response({ github_project_sync_enabled: "true" }, {}, { github_project_sync_enabled: "env" }),
+    );
+    renderPage();
+    await screen.findByText("GitHub Projects sync");
     expect(toggle().disabled).toBe(true);
     expect(saveBtn().disabled).toBe(true);
   });

@@ -174,6 +174,8 @@ const SEED_APP_SETTINGS: AppSettings = {
   docker_repo_allowlist: "",
   // PRD #84 M2: capability-aware scheduling kill-switch, default ON.
   capability_aware_scheduling: "true",
+  // Issue #534 M2: GitHub Projects v2 sync instance kill-switch, default OFF.
+  github_project_sync_enabled: "false",
   // PRD #196 M2: comma-separated label lists (run_eligible always contains the
   // primary) and the PRD-link waiver bool, mirroring the server defaults.
   run_eligible_labels: "PRD,bug",
