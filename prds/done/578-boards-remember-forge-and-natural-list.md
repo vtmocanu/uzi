@@ -131,13 +131,13 @@ Notes:
 
 ## Milestones
 
-- [ ] **M1 — `selectedForge` 7-day cache helper + unit tests.** Add `selectedForge` to
+- [x] **M1 — `selectedForge` 7-day cache helper + unit tests.** Add `selectedForge` to
       `web/src/lib/prefs.ts` (single scalar, 7-day TTL, injected `now`). Add a
       `selectedForge` describe block to `web/src/lib/prefs.test.ts` mirroring the
       `summaryCollapse` tests: round-trips an id, returns `null` when unset, expires after
       7 days (via injected `now`), keeps an entry just under the boundary, and returns
       `null` (no throw) on corrupt JSON.
-- [ ] **M2 — Persist and restore the selected forge in Repos, with its test.** Import and
+- [x] **M2 — Persist and restore the selected forge in Repos, with its test.** Import and
       use `selectedForge` in `web/src/pages/Repos.tsx`: prefer the remembered connection on
       mount when it is still in the connection list (else first), and persist on selector
       change. Land the behavior *verified*: add a Repos test that mocks two connections,
@@ -148,7 +148,7 @@ Notes:
       the stub `selectedForge.set/get` silently no-op and the test would pass for the wrong
       reason. Behavior when only one connection exists is unchanged (the selector is not
       rendered below two connections).
-- [ ] **M3 — Board list grows naturally (match /schedules).** Remove the `Card` wrapper
+- [x] **M3 — Board list grows naturally (match /schedules).** Remove the `Card` wrapper
       (keep its import); table goes in the `/schedules`-style
       `overflow-x-auto rounded-xl border border-edge bg-surface` div; the three detail
       panels become standalone bordered siblings below it, still outside the
@@ -157,7 +157,7 @@ Notes:
       not inside a `.p-0` card). The existing "panel OUTSIDE the horizontal-scroll
       container" test passes with OR without the `Card`, so it is an invariant to preserve,
       not proof M3 happened.
-- [ ] **M4 — Gate green.** `task gate:web` passes (lint, deadcode, typecheck, tests),
+- [x] **M4 — Gate green.** `task gate:web` passes (lint, deadcode, typecheck, tests),
       including the tests added in M1-M3.
 
 ## Success criteria
