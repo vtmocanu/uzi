@@ -14,6 +14,10 @@ place.)
 
 ## [Unreleased]
 
+### Added
+
+- **Draining/cordoned worker signal ([#496](https://github.com/vtmocanu/uzi/pull/496), PRD #496).** The Workers list and `uzi worker list` now show when a hosted worker is draining/cordoned — finishing its current runs but not claiming new ones — so an online worker with a free slot that isn't picking up a queued run reads as an in-progress roll rather than a bug.
+
 ## [0.51.0] - 2026-08-21
 <!-- release-title: capability-aware scheduling, wait-on-limit on by default, live runs list -->
 
