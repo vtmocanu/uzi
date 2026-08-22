@@ -472,7 +472,16 @@ nothing a manual start cannot.
     subagent, overriding each agent's own model pin. Both are restated on `edit`, so a
     partial `edit` never wipes them.
 - `uzi schedule list` — your schedules as a table (`ID`, `TARGET`, `REPO`, `WHEN`,
-  `NEXT`, `ON`); `--json` dumps the raw array.
+  `NEXT`, `ON`); `--json` dumps the raw array. Each element's `target` is the
+  string enum `issue` | `sweep` | `prompt` (a plain string, NOT a nested object),
+  and a sweep's label selector is the top-level `labels` array. So the correct way
+  to answer "is there a sweep schedule, and on which label(s)?" is
+  `uzi schedule list --json | jq '[.[] | select(.target=="sweep") | {id, labels, enabled}]'`.
+  Two mistakes to avoid, because they fail silently in the reassuring direction:
+  do NOT guess a nested shape like `.target.kind` (it matches nothing and reports
+  zero sweeps), and do NOT conclude from a truncated dump (`head -c`, which shows
+  only the first element) that the whole array is one kind. Inspect one full
+  element's keys (`jq '.[0]|keys'`) before writing a filter.
 - `uzi schedule get <schedule-id>` — one schedule's config plus its computed next fires.
   When the schedule has fired at least once it also prints a **Last fire** block: a
   summary line (`fired <time> · examined N · started M · skipped K`), one line per started
