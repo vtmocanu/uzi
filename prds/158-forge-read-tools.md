@@ -417,3 +417,26 @@ like a failure.
   agent-side counter in the single per-executor `forge` server (shared by lead + all subagents);
   a run *resume* builds a fresh executor and a fresh counter. Accepted as per-session rather than
   strictly per-run; the model, not the agent code, is the untrusted party the counter bounds.
+- **2026-08-22 — issue #581: the shipped forge/findings wiring was lead-only in production;
+  fixed. M6's live acceptance run is still open.** The `fact-checker` subagent got "No such
+  tool available" on every `mcp__forge__*` call — the in-process forge and findings MCP
+  servers were registered only in `sdk-executor.ts`'s top-level `options.mcpServers`, which
+  the SDK exposes to the main-thread (lead) session, not to programmatically-defined subagent
+  sessions. This does not contradict M0's PASS: that spike was measured on
+  `@anthropic-ai/claude-agent-sdk@0.3.219`, where an explicit-allowlist subagent did reach the
+  top-level server; production runs `0.3.233`, where that inheritance no longer holds. The
+  behaviour delta tracks the SDK pin between the two measurements (the M0 harness also ran a
+  different `claude` CLI build and model, so the SDK version is the most likely but not the
+  sole-proven variable — the M6 caveat already flagged the CLI-build difference); either way
+  it is not a wiring defect in this PRD's own code, and the per-agent fix is robust across both.
+  **Fix:** `agents.ts` `toDefinition` now derives each allowlisted subagent's
+  `AgentDefinition.mcpServers` (the SDK's string-reference form, the only way to attach an
+  in-process server instance to a subagent) from its resolved `tools` allowlist — any
+  subagent granted a `mcp__forge__*` or `mcp__findings__*` tool now names that server;
+  inherit-all subagents are untouched, and `memory`/`signal` stay server-denied to every
+  subagent by design. A regression test in `agent/test/agents.test.ts` anchors to the real
+  `fact-checker` builtin file and asserts it resolves to `mcpServers: ["forge","findings"]`,
+  so this cannot silently regress again. **M6's live acceptance run remains open and is NOT
+  satisfied by this fix** — it is a downstream, post-deploy verification step (a real run's
+  fact-checker actually calling and citing a forge read tool), and is still the reason this
+  PRD has not moved to `prds/done/`.

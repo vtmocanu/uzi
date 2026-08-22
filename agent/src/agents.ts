@@ -50,7 +50,8 @@ import { NESTED_AGENT_TOOL, WRITE_PATH_TOOLS } from "./guardrails.js";
 import { SIGNAL_SERVER_NAME } from "./signals.js";
 import { MEMORY_SERVER_NAME } from "./memory-tools.js";
 import { qualifiedSkillName } from "./skills-plugin.js";
-import { reportIncidentalIssueToolName } from "./findings-tools.js";
+import { reportIncidentalIssueToolName, FINDINGS_SERVER_NAME } from "./findings-tools.js";
+import { FORGE_SERVER_NAME } from "./forge-tools.js";
 import { FINDINGS_NUDGE_APPEND } from "./prompt.js";
 
 // Server-level MCP denial (PRD #43 M2 / Decision 3). A `mcp__<server>` entry in
@@ -173,6 +174,24 @@ function toDefinition(
   // available — do NOT materialize an allowlist. Dedup-guarded. NOT a write tool, so
   // it survives the plan-turn write-strip (planTurnSubagents).
   if (def.tools && !def.tools.includes(FINDINGS_TOOL_NAME)) def.tools = [...def.tools, FINDINGS_TOOL_NAME];
+  // PRD #158 / issue #581: an in-process MCP server (forge, findings) is registered
+  // once in the top-level options.mcpServers (sdk-executor.ts); on the pinned SDK that
+  // map reaches only the LEAD session. To let an allowlisted subagent (e.g. the
+  // fact-checker, granted the mcp__forge__* read tools) actually reach it, name the
+  // server on this AgentDefinition via the string form of mcpServers (sdk.d.ts:59,120)
+  // — the only way to attach an in-process instance to a subagent. Derived from the
+  // resolved allowlist (which now already includes the findings tool from the line
+  // above), so it self-tracks whatever the template declares. Inherit-all subagents
+  // (no `tools`) are left untouched. memory/signal are DELIBERATELY excluded — they are
+  // server-denied to every subagent above (MEMORY_SERVER_DENY / SIGNAL_SERVER_DENY).
+  if (def.tools) {
+    const servers: string[] = [];
+    for (const server of [FORGE_SERVER_NAME, FINDINGS_SERVER_NAME]) {
+      const prefix = `mcp__${server}__`;
+      if (def.tools.some((name) => name.startsWith(prefix))) servers.push(server);
+    }
+    if (servers.length > 0) def.mcpServers = servers;
+  }
   if (t.model) def.model = t.model;
   // Skill scoping (PRD #16): a subagent preloads its own ALLOCATED delivered
   // skills (filtered to the materialized survivors, so it never lists a skill

@@ -784,9 +784,12 @@ export class SdkExecutor implements Executor {
       }).server;
       // PRD #158: run-lane forge READ tools (mcp__forge__*). Endpoints are
       // run-scoped, so the server needs only the client + runId — no RunContext
-      // change. Built once here and shared by the lead + every subagent (the
-      // fact-checker is granted these on the Go side); the per-run call budget is a
-      // single counter inside the server, genuinely per-session.
+      // change. The server INSTANCE is registered here in the top-level map, which
+      // the SDK exposes to the LEAD session only; each subagent that names a forge
+      // tool in its allowlist (e.g. the fact-checker) receives it by reference
+      // through its AgentDefinition.mcpServers, wired in agents.ts toDefinition
+      // (issue #581). The per-run call budget is a single counter inside the
+      // server, genuinely per-session.
       mcpServers[FORGE_SERVER_NAME] = buildForgeToolsServer({
         client: this.client,
         runId: ctx.runId,
@@ -851,7 +854,10 @@ export class SdkExecutor implements Executor {
       agents: planTurn.subagents,
       // In-process tools the lead calls: the signal server (gate the plan / mark
       // done, see signals.ts) plus, when a client is threaded, the memory server
-      // (save_memory, PRD #90). Only the lead (full toolset) reaches them.
+      // (save_memory, PRD #90). Only the lead (full toolset) reaches the signal +
+      // memory servers (lead-only by design). The forge and findings servers are
+      // ADDITIONALLY exposed to allowlisted subagents per-agent via each
+      // AgentDefinition.mcpServers (see agents.ts toDefinition, issue #581).
       mcpServers,
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
