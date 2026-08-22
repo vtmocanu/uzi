@@ -542,21 +542,20 @@ func (s *ProjectSyncService) launchSeed(reqCtx context.Context, repoID uuid.UUID
 }
 
 // prepareSeedLink is the shared adopt/resync core: given an ALREADY-resolved project
-// (node id + number), it resolves the Status field by name (falling back to uzi's own
-// field name exactly as adopt did), builds the column→option map, computes the
-// unmatched set and per-column positions, best-effort links the project into the
-// repo's Projects tab, and PERSISTS the link INCLUDING the unmatched set. It returns
-// the seed parameters for the caller to feed to seed(), plus the unmatched columns for
-// the human-readable note. It does NOT seed items — that is the caller's separately
-// invocable step (see seed()), so the persist-link and seed seams stay independent.
-func (s *ProjectSyncService) prepareSeedLink(ctx context.Context, repo store.GetRepoByIDRow, syncer forge.ProjectBoardSyncer, owner, name, projectID string, projectNumber int64, ownedByUzi bool) (seedParams, []string, error) {
-	field, err := syncer.ProjectV2StatusFieldByName(ctx, projectID, statusFieldName)
+// (node id + number), it resolves the Status field via the caller-supplied resolveField
+// closure (Adopt resolves BY NAME — "Status" falling back to uzi's own field name;
+// Resync resolves BY ID off the stored link.StatusFieldID so it re-reads the SAME field
+// the link already points at rather than re-resolving by name — PRD #582), builds the
+// column→option map, computes the unmatched set and per-column positions, best-effort
+// links the project into the repo's Projects tab, and PERSISTS the link INCLUDING the
+// unmatched set. It returns the seed parameters for the caller to feed to seed(), plus
+// the unmatched columns for the human-readable note. It does NOT seed items — that is
+// the caller's separately invocable step (see seed()), so the persist-link and seed
+// seams stay independent.
+func (s *ProjectSyncService) prepareSeedLink(ctx context.Context, repo store.GetRepoByIDRow, syncer forge.ProjectBoardSyncer, owner, name, projectID string, projectNumber int64, ownedByUzi bool, resolveField func(context.Context) (forge.ProjectV2StatusField, error)) (seedParams, []string, error) {
+	field, err := resolveField(ctx)
 	if err != nil {
-		// Fall back to uzi's own field name before giving up (a board uzi created).
-		field, err = syncer.ProjectV2StatusFieldByName(ctx, projectID, uziStatusFieldName)
-		if err != nil {
-			return seedParams{}, nil, fmt.Errorf("project sync: resolve status field: %w", err)
-		}
+		return seedParams{}, nil, fmt.Errorf("project sync: resolve status field: %w", err)
 	}
 
 	// Column-name → option-id map: exact-match each board column label to a Status
@@ -626,10 +625,13 @@ func (s *ProjectSyncService) prepareSeedLink(ctx context.Context, repo store.Get
 
 // adoptPrepare does the resolve → prepare-link work for Adopt: it resolves the repo
 // slug and the project, then PERSISTS the link (including the unmatched set, PRD #576
-// M3) via prepareSeedLink. It does NOT seed items — the caller launches that
-// asynchronously (PRD #576 M4, see launchSeed) — so it returns the seedParams for the
-// background step plus a human-readable NOTE describing any board columns that did not
-// match a Status option (also persisted to unmatched_columns). owned_by_uzi is false.
+// M3) via prepareSeedLink. It supplies prepareSeedLink a BY-NAME field resolver (PRD
+// #582): try the built-in "Status" field, falling back to uzi's own field name — the
+// original adopt behavior, unchanged, since a first adopt holds no field id yet. It
+// does NOT seed items — the caller launches that asynchronously (PRD #576 M4, see
+// launchSeed) — so it returns the seedParams for the background step plus a
+// human-readable NOTE describing any board columns that did not match a Status option
+// (also persisted to unmatched_columns). owned_by_uzi is false.
 func (s *ProjectSyncService) adoptPrepare(ctx context.Context, repo store.GetRepoByIDRow, syncer forge.ProjectBoardSyncer, projectNumber int, ownerKind forge.ProjectV2OwnerKind) (seedParams, string, error) {
 	owner, name, err := syncer.RepoSlug(ctx, repo.ForgeProjectID)
 	if err != nil {
@@ -641,7 +643,20 @@ func (s *ProjectSyncService) adoptPrepare(ctx context.Context, repo store.GetRep
 		return seedParams{}, "", fmt.Errorf("project sync: resolve project #%d: %w", projectNumber, err)
 	}
 
-	sp, unmatched, err := s.prepareSeedLink(ctx, repo, syncer, owner, name, project.ID, int64(project.Number), false)
+	// By-name resolver: the built-in "Status" field, falling back to uzi's own field
+	// name (a board uzi created) — identical to adopt's pre-#582 behavior.
+	resolveField := func(ctx context.Context) (forge.ProjectV2StatusField, error) {
+		field, err := syncer.ProjectV2StatusFieldByName(ctx, project.ID, statusFieldName)
+		if err != nil {
+			field, err = syncer.ProjectV2StatusFieldByName(ctx, project.ID, uziStatusFieldName)
+			if err != nil {
+				return forge.ProjectV2StatusField{}, err
+			}
+		}
+		return field, nil
+	}
+
+	sp, unmatched, err := s.prepareSeedLink(ctx, repo, syncer, owner, name, project.ID, int64(project.Number), false, resolveField)
 	if err != nil {
 		return seedParams{}, "", err
 	}
@@ -695,14 +710,24 @@ func (s *ProjectSyncService) Resync(ctx context.Context, repoID uuid.UUID) (stri
 // resyncPrepare is Resync's forge-touching prepare core (split out so Resync owns the
 // stamp/launch wrapping, like Adopt/adoptPrepare): resolve the repo slug, then prepare
 // (persist) the link against the STORED project coordinates (reusing the stored node id,
-// number, and ownership). Re-reading the field is what lets newly-added Status options
-// resolve. It does NOT seed — the caller launches that asynchronously (PRD #576 M4).
+// number, and ownership). It supplies prepareSeedLink a BY-ID field resolver keyed on
+// the stored link.StatusFieldID (PRD #582), so Resync re-reads the SAME field the link
+// already points at — never re-resolving by name, which would silently re-point a
+// uzi-Status-synced board at the built-in "Status" field (#582). Re-reading that field
+// is what lets newly-added options on it resolve and recomputes the unmatched set
+// against its current options. A field deleted on GitHub makes the by-id read return
+// not-found, which propagates as the existing pre-seed error (stamped to last_error by
+// Resync). It does NOT seed — the caller launches that asynchronously (PRD #576 M4).
 func (s *ProjectSyncService) resyncPrepare(ctx context.Context, repo store.GetRepoByIDRow, syncer forge.ProjectBoardSyncer, link store.GithubProjectLink) (seedParams, string, error) {
 	owner, name, err := syncer.RepoSlug(ctx, repo.ForgeProjectID)
 	if err != nil {
 		return seedParams{}, "", fmt.Errorf("project sync: resolve repo slug: %w", err)
 	}
-	sp, unmatched, err := s.prepareSeedLink(ctx, repo, syncer, owner, name, link.ProjectNodeID, link.ProjectNumber, link.OwnedByUzi)
+	// By-id resolver: re-read the exact field the link already points at.
+	resolveField := func(ctx context.Context) (forge.ProjectV2StatusField, error) {
+		return syncer.ProjectV2StatusFieldByID(ctx, link.ProjectNodeID, link.StatusFieldID)
+	}
+	sp, unmatched, err := s.prepareSeedLink(ctx, repo, syncer, owner, name, link.ProjectNodeID, link.ProjectNumber, link.OwnedByUzi, resolveField)
 	if err != nil {
 		return seedParams{}, "", err
 	}
@@ -745,9 +770,9 @@ func (s *ProjectSyncService) resyncPrepare(ctx context.Context, repo store.GetRe
 // No cascade either way.
 //
 // A repo with no link row returns ErrProjectSyncNotLinked (→ 404). It deliberately does
-// NOT reuse prepareSeedLink: that resolves the field BY NAME, and the built-in "Status"
-// still exists, so it would re-resolve the WRONG (old) field. AutoCreateColumns uses the
-// freshly created field directly.
+// NOT reuse prepareSeedLink: this flow has just CREATED the field and holds it in hand,
+// so it switches the link to that fresh field directly rather than re-resolving it at
+// all — no by-name or by-id read is needed or wanted here.
 func (s *ProjectSyncService) AutoCreateColumns(ctx context.Context, repoID uuid.UUID) (string, error) {
 	link, err := s.store.GetGithubProjectLinkByRepo(ctx, repoID)
 	if err != nil {

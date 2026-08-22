@@ -36,6 +36,12 @@ type fakeProjectSyncer struct {
 	fields   map[string]forge.ProjectV2StatusField
 	fieldErr map[string]error
 
+	// By-id field resolution (PRD #582): Resync re-reads the LINKED field by its stored
+	// node id instead of re-resolving by name. Keyed by field node id, mirroring
+	// fields/fieldErr.
+	fieldsByID   map[string]forge.ProjectV2StatusField
+	fieldErrByID map[string]error
+
 	repoNodeID  string
 	repoNodeErr error
 	linkCalls   int
@@ -142,6 +148,19 @@ func (f *fakeProjectSyncer) ProjectV2StatusFieldByName(_ context.Context, _, fie
 	fld, ok := f.fields[fieldName]
 	if !ok {
 		return forge.ProjectV2StatusField{}, errors.New("no such field")
+	}
+	return fld, nil
+}
+
+func (f *fakeProjectSyncer) ProjectV2StatusFieldByID(_ context.Context, _, fieldID string) (forge.ProjectV2StatusField, error) {
+	if f.fieldErrByID != nil {
+		if err, ok := f.fieldErrByID[fieldID]; ok {
+			return forge.ProjectV2StatusField{}, err
+		}
+	}
+	fld, ok := f.fieldsByID[fieldID]
+	if !ok {
+		return forge.ProjectV2StatusField{}, errors.New("no such field id")
 	}
 	return fld, nil
 }
@@ -1139,6 +1158,9 @@ func TestProjectSyncStatusReturnsUnmatchedColumns(t *testing.T) {
 // STORED project coordinates (not any caller-supplied owner_kind/number), recomputing
 // the unmatched set from the current field. Resync takes no owner_kind — it is
 // structurally impossible to pass one — so re-seeding the stored board is the assertion.
+// Since PRD #582 Resync re-reads the field BY the stored StatusFieldID, so the fixture
+// stores that id (PVTSSF_UZI) and scripts fieldsByID for it (the fixture repair for
+// #582): the re-persisted id is the SAME stored id, never a by-name re-resolve.
 func TestResyncReseedsAndRepersists(t *testing.T) {
 	repoID := uuid.New()
 	syncer := &fakeProjectSyncer{
@@ -1146,8 +1168,9 @@ func TestResyncReseedsAndRepersists(t *testing.T) {
 		scopes:    []string{"repo", "project"},
 		slugOwner: "acme", slugRepo: "widgets",
 		repoNodeID: "REPO_1",
-		fields: map[string]forge.ProjectV2StatusField{
-			"Status": {ID: "PVTSSF_NEW", Name: "Status", Options: []forge.ProjectV2Option{
+		// Resync reads the linked field by its stored id (PRD #582).
+		fieldsByID: map[string]forge.ProjectV2StatusField{
+			"PVTSSF_UZI": {ID: "PVTSSF_UZI", Name: "uzi Status", Options: []forge.ProjectV2Option{
 				{ID: "opt_ip", Name: "In Progress"},
 			}},
 		},
@@ -1155,12 +1178,13 @@ func TestResyncReseedsAndRepersists(t *testing.T) {
 	}
 	st := &fakeProjectStore{
 		repo: githubRepoRow(repoID),
-		// A stored link the Resync path reuses (node id + number + ownership) — no
-		// owner_kind/project_number comes from a caller.
+		// A stored link the Resync path reuses (node id + number + ownership + the
+		// status_field_id it re-reads by) — no owner_kind/project_number comes from a caller.
 		link: store.GithubProjectLink{
 			RepoID:        repoID,
 			ProjectNodeID: "PVT_STORED",
 			ProjectNumber: 9,
+			StatusFieldID: "PVTSSF_UZI",
 			OwnedByUzi:    false,
 		},
 		columns: []store.BoardColumn{
@@ -1195,8 +1219,8 @@ func TestResyncReseedsAndRepersists(t *testing.T) {
 	if link.ProjectNodeID != "PVT_STORED" || link.ProjectNumber != 9 {
 		t.Errorf("resync must reuse stored coordinates, got node=%q number=%d", link.ProjectNodeID, link.ProjectNumber)
 	}
-	if link.StatusFieldID != "PVTSSF_NEW" {
-		t.Errorf("resync must re-read the field, got %q", link.StatusFieldID)
+	if link.StatusFieldID != "PVTSSF_UZI" {
+		t.Errorf("resync must re-read the SAME linked field id, got %q", link.StatusFieldID)
 	}
 	if len(link.UnmatchedColumns) != 1 || link.UnmatchedColumns[0] != "Later" {
 		t.Errorf("recomputed unmatched = %v, want [Later]", link.UnmatchedColumns)
@@ -1207,6 +1231,93 @@ func TestResyncReseedsAndRepersists(t *testing.T) {
 	// Clean run clears last_error once (mirrors Adopt).
 	if st.linkErrCleared != 1 {
 		t.Errorf("clean resync should clear last_error once, got %d", st.linkErrCleared)
+	}
+}
+
+// TestResyncPreservesLinkedUziStatusField (PRD #582, the regression): a board synced via
+// uzi's OWN "uzi Status" field, where GitHub's built-in "Status" field ALSO exists.
+// Resync must re-read the LINKED field by its stored id and keep pointing at it — it must
+// NOT re-resolve by name and silently re-point sync at the built-in "Status".
+//
+// Mutation check (documented, not left in the code): reverting resyncPrepare to a by-name
+// resolver ("Status" first) would resolve PVTSSF_STATUS instead — flipping the persisted
+// StatusFieldID to "PVTSSF_STATUS" and, because the built-in Status only has Todo/In
+// Progress/Done, making unmatched = [Planned, bug, Human Review, Later] instead of empty.
+func TestResyncPreservesLinkedUziStatusField(t *testing.T) {
+	repoID := uuid.New()
+	// The built-in Status field: only three of the five uzi columns exist as options.
+	builtinStatus := forge.ProjectV2StatusField{ID: "PVTSSF_STATUS", Name: "Status", Options: []forge.ProjectV2Option{
+		{ID: "opt_todo", Name: "Todo"},
+		{ID: "opt_ip", Name: "In Progress"},
+		{ID: "opt_done", Name: "Done"},
+	}}
+	// uzi's own field: an option for EVERY board column, so a by-id re-read matches all.
+	uziStatus := forge.ProjectV2StatusField{ID: "PVTSSF_UZI", Name: "uzi Status", Options: []forge.ProjectV2Option{
+		{ID: "u_planned", Name: "Planned"},
+		{ID: "u_ip", Name: "In Progress"},
+		{ID: "u_bug", Name: "bug"},
+		{ID: "u_hr", Name: "Human Review"},
+		{ID: "u_later", Name: "Later"},
+	}}
+	syncer := &fakeProjectSyncer{
+		fakeForge: &fakeForge{},
+		scopes:    []string{"repo", "project"},
+		slugOwner: "acme", slugRepo: "widgets",
+		repoNodeID: "REPO_1",
+		// Both fields resolvable by name AND by id — the bug is that by-name picks the wrong one.
+		fields: map[string]forge.ProjectV2StatusField{
+			"Status":     builtinStatus,
+			"uzi Status": uziStatus,
+		},
+		fieldsByID: map[string]forge.ProjectV2StatusField{
+			"PVTSSF_STATUS": builtinStatus,
+			"PVTSSF_UZI":    uziStatus,
+		},
+		issueNode: map[int]string{1: "content1"},
+	}
+	st := &fakeProjectStore{
+		repo: githubRepoRow(repoID),
+		// The link already points at uzi's own field — Resync must not switch it.
+		link: store.GithubProjectLink{
+			RepoID:        repoID,
+			ProjectNodeID: "PVT_STORED",
+			ProjectNumber: 9,
+			StatusFieldID: "PVTSSF_UZI",
+			OwnedByUzi:    false,
+		},
+		columns: []store.BoardColumn{
+			{LabelName: "Planned", Position: 1},
+			{LabelName: "In Progress", Position: 2},
+			{LabelName: "bug", Position: 3},
+			{LabelName: "Human Review", Position: 4},
+			{LabelName: "Later", Position: 5},
+		},
+		issues: []store.Issue{
+			{ForgeIssueIid: 1, State: "opened", Labels: labelsJSON(t, "In Progress")},
+		},
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.background = syncBackground // run the async seed in-line, deterministically
+
+	if _, err := svc.Resync(context.Background(), repoID); err != nil {
+		t.Fatalf("Resync: %v", err)
+	}
+
+	if len(st.links) != 1 {
+		t.Fatalf("want 1 link upsert on resync, got %d", len(st.links))
+	}
+	link := st.links[0]
+	// STILL the uzi field — never re-pointed at the built-in Status.
+	if link.StatusFieldID != "PVTSSF_UZI" {
+		t.Errorf("resync must keep the linked uzi field, got %q (by-name re-resolve would give PVTSSF_STATUS)", link.StatusFieldID)
+	}
+	// Every column matched the uzi field's options, so nothing is unmatched.
+	if len(link.UnmatchedColumns) != 0 {
+		t.Errorf("unmatched = %v, want empty (uzi field has all five columns)", link.UnmatchedColumns)
+	}
+	// The Projects-tab re-link fired (best-effort LinkProjectV2ToRepository).
+	if syncer.linkCalls < 1 {
+		t.Errorf("want LinkProjectV2ToRepository called at least once, got %d", syncer.linkCalls)
 	}
 }
 
