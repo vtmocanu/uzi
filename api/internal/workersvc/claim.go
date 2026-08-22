@@ -62,6 +62,22 @@ type ClaimPayload struct {
 	// it re-delivers unchanged on every resume like OpenMr above. Additive on the wire — an
 	// old worker ignores the key and keeps its terminating behaviour.
 	Interactive bool `json:"interactive"`
+	// StopPending re-delivers the durable runs.stop_kind='stopped' fact on every claim
+	// (issue #552 M3), derived here from the already-loaded run row — the direct analog
+	// of what OpenQuestionID does for the stale-answer guard below.
+	//
+	// A graceful `uzi run stop` (PRD #517 M4) is consumed by the worker's steering poll
+	// into the in-memory stopRequested flag. That flag is LOST if the worker dies before
+	// winding the park down: on the requeue the fresh SteeringChannel starts with
+	// stopRequested=false, the stop steering input is already consumed_at so ConsumeInputs
+	// re-delivers nothing, and the run re-parks at awaiting_followup — completing only on
+	// the ~30m idle timeout. But stop_kind='stopped' is DURABLY stamped at submit time
+	// (CreateStopVerdictInput) and survives the death, independent of the consumed input.
+	// StopPending carries that surviving fact so the resumed worker seeds stopRequested
+	// and winds the park down immediately instead of waiting out the idle timeout.
+	// Additive on the wire — an old worker ignores the key and the idle timeout stays the
+	// backstop.
+	StopPending bool `json:"stop_pending"`
 	// BaseBranch is the source ref a task run was branched from (PRD #400 M2),
 	// meaningful only for kind='task'. It is carried for context/review — the worker
 	// works the pre-seeded, server-named Branch (uzi/task/<run-id>), not this ref —

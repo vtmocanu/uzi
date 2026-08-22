@@ -25,6 +25,7 @@
   "auto_approve": true,
   "open_mr": true,
   "interactive": true,
+  "stop_pending": true,
   "base_branch": "develop",
   "review_target_run_id": null,
   "wait_on_limit": true,

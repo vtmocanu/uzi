@@ -175,6 +175,18 @@ export class SteeringChannel {
     this.now = opts.now ?? Date.now;
   }
 
+  /** Seed the sticky `stop` state at construction time (issue #552 M3), before the poll
+   *  loop starts. A graceful `uzi run stop` is stamped durably as runs.stop_kind='stopped'
+   *  (PRD #517 M4) but the steering input that carried it is consume-on-read, so a worker
+   *  that dies before winding the park down loses the in-memory flag and the input never
+   *  re-delivers. The claim re-delivers the durable fact as `stop_pending`; seeding it here
+   *  reconstructs the same state a live `stop` input would have set (~:454), so the next
+   *  interactive park resolves { kind:"ended", reason:"stopped" } immediately instead of
+   *  waiting out the idle timeout. Idempotent with a later live `stop` input. */
+  seedStopRequested(): void {
+    this.stopRequested = true;
+  }
+
   /** Start the poll loop (idempotent). Runs until stop(). */
   start(): void {
     if (this.loop) return;
@@ -289,6 +301,24 @@ export class SteeringChannel {
   /** Dequeue the oldest un-consumed follow-up, or undefined if none. */
   pullFollowUp(): string | undefined {
     return this.followUps.shift();
+  }
+
+  /**
+   * True when awaitFollowUp would resolve SYNCHRONOUSLY — a cancel or stop is pending, or a
+   * follow-up is already buffered from mid-turn — i.e. the run is NOT actually going idle.
+   *
+   * issue #552 M1: the interactive park calls this BEFORE reporting `awaiting_followup`. That
+   * report stamps the open_followup_id wake-guard watermark to MAX(consumed follow_up id); a
+   * follow-up consumed MID-TURN (by the poll loop, while the agent worked) is already consumed
+   * but NOT yet applied, so folding it into the watermark would make its own wake `running`
+   * report fail the `id > watermark` guard and strand a live run at awaiting_followup. When an
+   * outcome is already in hand the park is skipped and the outcome serviced directly, so the
+   * watermark is stamped only when the run genuinely idles (MAX(consumed) == last APPLIED).
+   * Mirrors awaitFollowUp's own precedence (cancelled → stop → buffered follow-up) as a
+   * read-only peek that consumes nothing.
+   */
+  hasPendingFollowUpOutcome(): boolean {
+    return this.cancelled || this.stopRequested || this.followUps.length > 0;
   }
 
   /**

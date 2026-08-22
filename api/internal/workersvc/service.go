@@ -2050,6 +2050,13 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// a resumed run re-delivers it unchanged. It tells the worker to keep the run alive
 		// (park in awaiting_followup) after signal_done rather than terminating.
 		Interactive: run.Interactive,
+		// issue #552 M3: re-deliver the durable stop_kind='stopped' fact so a graceful
+		// stop survives a worker crash. Derived from the loaded row, like OpenQuestionID
+		// below and for the same reason — the in-memory stopRequested flag is lost on a
+		// death, but the runs row keeps stop_kind='stopped', so the resumed worker winds
+		// the park down instead of waiting out the idle timeout. Never set for a terminal
+		// run (a finished run has nothing left to wind down).
+		StopPending: run.Interactive && run.StopKind.Valid && run.StopKind.String == "stopped" && !terminalStatuses[run.Status],
 		// PRD #400 M4a: when set, this task run is a diff-review of that target task, and
 		// the worker (M4b) routes on it. nil for a plain handoff and every non-task run.
 		ReviewTargetRunID: uuidPtr(run.ReviewTargetRunID),

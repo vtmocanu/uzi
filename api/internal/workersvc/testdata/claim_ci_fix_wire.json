@@ -14,6 +14,7 @@
   "auto_approve": false,
   "open_mr": false,
   "interactive": false,
+  "stop_pending": false,
   "base_branch": null,
   "review_target_run_id": null,
   "wait_on_limit": false,

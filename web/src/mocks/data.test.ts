@@ -195,6 +195,36 @@ describe("the parked-run fixture can actually discriminate (PRD #35)", () => {
   });
 });
 
+// PRD #517. The follow-up park (awaiting_followup) is a first-class parked state, but
+// unlike limit_wait / awaiting_approval / awaiting_input it had NO seeded fixture, so
+// its whole web surface — the board follow-up strip, the run view's park announcement,
+// SteerQueueCard's "resumes the run" chip — was unreachable under VITE_UZI_MOCK=1. This
+// fixture makes it reachable; these pin the properties that make it able to catch
+// anything.
+describe("the follow-up-parked fixture can actually discriminate (PRD #517)", () => {
+  const parked = mockRuns.find((r) => r.id === "run-awaiting-followup");
+
+  it("exists in mockRuns at status awaiting_followup", () => {
+    expect(parked, "no run-awaiting-followup fixture — nothing in mock mode renders a follow-up park").toBeDefined();
+    expect(parked!.status).toBe("awaiting_followup");
+  });
+
+  it("has a board card, so runBadge's awaiting_followup arm is reachable without opening the run", () => {
+    const card = mockBoards["repo-uzi"]?.cards.find((c) => c.latest_run?.id === "run-awaiting-followup");
+    expect(card, "the follow-up-parked run has no card — runBadge's awaiting_followup arm renders nowhere").toBeDefined();
+    expect(card!.latest_run!.status).toBe("awaiting_followup");
+  });
+
+  it("🔴 carries health 'ok', never a stale flag", () => {
+    // The server CLEARS health on park entry (same invariant the limit_wait fixture pins):
+    // a flag live at park time would freeze for the whole park, so a fixture carrying one
+    // here would reproduce that bug in the demo and look entirely plausible while doing it.
+    expect(parked!.health).toBe("ok");
+    expect(parked!.health_reason).toBeNull();
+    expect(parked!.health_since).toBeNull();
+  });
+});
+
 // The demo board is the one build most people click, so a feature that is invisible
 // there is a feature nobody sees (web-ux S7). Each of these pinned a fixture that was
 // silently arguing against a shipped decision.

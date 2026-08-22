@@ -87,6 +87,11 @@ test("claim wire contract: worker parses the server's skill shape", () => {
   // carries them; pinned across the language boundary so typing the parse as
   // ClaimResponse fails `npm run typecheck` if either is dropped from protocol.ts.
   assert.equal(claim.open_mr, true);
+  // issue #552 M3: stop_pending re-delivers the durable stop_kind='stopped' fact so a
+  // graceful stop survives a worker crash. Pinned across the language boundary; typing the
+  // parse as ClaimResponse also makes `npm run typecheck` fail if it is dropped from
+  // protocol.ts. The golden models an interactive, non-terminal, stopped run, so it is true.
+  assert.equal(claim.stop_pending, true);
   assert.equal(claim.base_branch, "develop");
   // PRD #400 M4b: the diff-review target rides the same claim, top-level alongside
   // base_branch. This golden is not a review claim, so the field is null (the wire
