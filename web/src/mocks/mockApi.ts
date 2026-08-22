@@ -908,6 +908,10 @@ const githubProjectLinks = new Map<string, ProjectSyncStatus>([
     },
   ],
 ]);
+// PRD #557: per-repo board visibility, keyed by repo id. A linked board defaults
+// to private (false) — GitHub creates ProjectV2 boards private — and the toggle
+// round-trips a mutable value here so the vitest toggle case is non-vacuous.
+const githubProjectVisibility = new Map<string, boolean>();
 
 // ── Scheduled runs (PRD #241) demo fixtures + helpers ──────────────────────
 // schedulePreviewCap mirrors the server's clamp on the preview N (PRD #241 M4).
@@ -2500,6 +2504,37 @@ export const mockApi = {
   // Unlink the repo from its project (empty 204 body).
   disableProjectSync: async (id: string) => {
     githubProjectLinks.delete(id);
+    githubProjectVisibility.delete(id);
+    return delay(null);
+  },
+
+  // ── Board access: visibility + write-only sharing (PRD #557) ────────────────
+  // Read the linked board's public flag. Mirrors the server: an unlinked repo
+  // 404s (same existence-hiding 404 as the status route); a linked one defaults
+  // to private until the toggle flips it.
+  getProjectSyncVisibility: async (id: string) => {
+    if (!githubProjectLinks.has(id))
+      throw new ApiError(404, "project sync not enabled for this repo");
+    return delay({ public: githubProjectVisibility.get(id) ?? false });
+  },
+  // Flip the board's public flag. The value is stored so the toggle round-trips.
+  setProjectSyncVisibility: async (id: string, isPublic: boolean) => {
+    githubProjectVisibility.set(id, isPublic);
+    return delay({ public: isPublic });
+  },
+  // Grant a GitHub user Reader access (empty 204 body). The designated login
+  // "nouser" 422s (ErrProjectSyncUserNotFound) so the bad-username inline-error
+  // vitest case exercises a real failure, not a resolved success.
+  shareProjectSync: async (id: string, username: string) => {
+    void id;
+    if (username.trim() === "nouser")
+      throw new ApiError(422, "no github user with that username");
+    return delay(null);
+  },
+  // Revoke a GitHub user's access (empty 204 body).
+  unshareProjectSync: async (id: string, username: string) => {
+    void id;
+    void username;
     return delay(null);
   },
 
