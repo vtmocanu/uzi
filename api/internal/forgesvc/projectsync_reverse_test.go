@@ -1347,3 +1347,88 @@ func TestReverseSyncReopenedIssueRestoresStatus(t *testing.T) {
 		}
 	})
 }
+
+// (invariant, PRD #584 M3) Reverse sync leaves the Done projection alone BY
+// CONSTRUCTION: the reserved Done option is NEVER a value in the link's status_options
+// map, so it is absent from the inverted optionColumn map reverseDiff builds — a live
+// item reading the Done option therefore hits the "option not in board map" skip (D5)
+// and drives no AutoMove, even for an OPEN issue that carries a real column label.
+//
+// This fixture is engineered to exercise the BY-CONSTRUCTION guard (skip (b): option not
+// in optionColumn), NOT the marker no-op (skip (a): live == marker):
+//
+//   - The live item reads Status == "opt_done" (the Done option).
+//   - Its issue is OPEN and labelled "In Progress" (a real, mapped column), so IF reverse
+//     ever classified this item the move would be DESTRUCTIVE — it would strip the
+//     existing "In Progress" label (currentColumn "In Progress" != target).
+//   - The stored marker is deliberately "" (NOT "opt_done"), so live ("opt_done") !=
+//     marker (""): execution passes THROUGH skip (a) and reaches skip (b). (A marker ==
+//     "opt_done" fixture would no-op via skip (a) and prove nothing about the
+//     construction invariant — that Done is never in the map.)
+//
+// Non-vacuity, by a call-site mutation against this fixture's link (do NOT leave it in):
+// temporarily add "Done": "opt_done" into the status_options map passed to doneLink,
+// making Done a MANAGED option. Two independent assertions then red, either of which
+// proves the zero-AutoMove is load-bearing:
+//
+//	(i)  the construction-invariant loop below Fatalfs — "opt_done" is now a
+//	     status_options value, which is precisely the state this test asserts can never
+//	     happen; AND
+//	(ii) were that loop removed, optionColumn would contain "opt_done" → "Done", so skip
+//	     (b) no longer fires: the open, "In Progress"-labelled item is classified as a
+//	     destructive remap to "Done" and one AutoMove(target="Done") executes, reddening
+//	     the zero-AutoMove assertion.
+//
+// That both hold ONLY while "opt_done" is absent from status_options is exactly the
+// construction invariant this test anchors.
+func TestReverseSyncLeavesDoneProjectionAlone(t *testing.T) {
+	repoID := uuid.New()
+	// status_options maps ONLY the real column "In Progress" → "opt_ip". done_option_id is
+	// "opt_done", which is NOT one of those values — the reserved Done option is never a
+	// managed column option.
+	link := doneLink(t, map[string]string{"In Progress": "opt_ip"}, "opt_done")
+
+	// The live board item sits on the Done option; its issue is OPEN with a real column
+	// label, and its stored marker is "" (not Done) to force past skip (a) into skip (b).
+	syncer := reverseSyncer(forge.ProjectV2ItemStatus{ItemID: "item7", IssueNumber: 7, OptionID: "opt_done"})
+	mover := &fakeMover{}
+	st := &fakeProjectStore{
+		repo:          githubRepoRow(repoID),
+		link:          link,
+		columns:       []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+		issues:        []store.Issue{{ForgeIssueIid: 7, State: "opened", Labels: labelsJSON(t, "In Progress")}},
+		existingItems: []store.GithubProjectItem{projectItem(repoID, 7, "item7", "")}, // marker NOT opt_done → past skip (a)
+	}
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	svc.SetMover(mover)
+
+	// Construction invariant (the non-vacuity anchor, PRD #584 M3 SC): the reserved Done
+	// option id is NOT a value in status_options, so it can never be in the reverse map.
+	var columnOption map[string]string
+	if err := json.Unmarshal(link.StatusOptions, &columnOption); err != nil {
+		t.Fatalf("unmarshal status_options: %v", err)
+	}
+	for column, optID := range columnOption {
+		if optID == link.DoneOptionID {
+			t.Fatalf("construction invariant broken: done_option_id %q is a status_options value (column %q); Done must never be a managed option", link.DoneOptionID, column)
+		}
+	}
+
+	if err := svc.ReverseSync(context.Background(), repoID); err != nil {
+		t.Fatalf("ReverseSync: %v", err)
+	}
+
+	// The Done-projected item drives ZERO AutoMove — the by-construction skip (b) fired,
+	// so the open issue's "In Progress" label was left intact (no destructive move).
+	if len(mover.calls) != 0 {
+		t.Errorf("a live Done-option item must drive no AutoMove (by-construction skip), got %v", mover.calls)
+	}
+	// It advanced no marker and was not upserted (skip (b) leaves the marker as-is).
+	if len(st.markerSets) != 0 || len(st.items) != 0 {
+		t.Errorf("skip (b) must not touch the marker, got sets=%v items=%v", st.markerSets, st.items)
+	}
+	// A skip is not an error: no last_error stamped for a (non-)destructive move.
+	if len(st.linkErrs) != 0 {
+		t.Errorf("leaving the Done projection alone must stamp no last_error, got %v", st.linkErrs)
+	}
+}

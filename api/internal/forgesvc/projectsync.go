@@ -1495,11 +1495,12 @@ func (s *ProjectSyncService) ReverseSync(ctx context.Context, repoID uuid.UUID) 
 	}
 
 	// Reconcile the item set BEFORE reading live statuses (M7): backfill open issues
-	// created since adopt (so they appear on the board and in the diff below) and prune
-	// items for issues that have since closed. reconcileItems mutates itemsByIID in
-	// place so the diff sees the reconciled set — a freshly-backfilled item carries
-	// marker == its seeded value == the live value the diff then reads, so the same-tick
-	// diff no-ops it (no oscillation).
+	// created since adopt (so they appear on the board and in the diff below), project
+	// since-closed issues to Done and KEEP their rows (PRD #584 M2; or prune them when
+	// the link has no Done option), and restore since-reopened issues off Done.
+	// reconcileItems mutates itemsByIID in place so the diff sees the reconciled set — a
+	// freshly-backfilled item carries marker == its seeded value == the live value the
+	// diff then reads, so the same-tick diff no-ops it (no oscillation).
 	s.reconcileItems(ctx, repo, syncer, link, issues, itemsByIID, columnOption, position)
 
 	live, err := syncer.ReadProjectV2ItemStatuses(ctx, link.ProjectNodeID, link.StatusFieldID)
@@ -1677,7 +1678,8 @@ func (s *ProjectSyncService) reconcileItems(ctx context.Context, repo store.GetR
 
 	// Pass 2 — backfill open untracked issues. Needs the repo slug (resolved lazily,
 	// once). A slug failure is a per-repo condition: no issue can be backfilled, so
-	// stamp and stop this pass — the close-prunes above already completed.
+	// stamp and stop this pass — Pass 1 (close→Done or close-prune) and Pass 1b (reopen
+	// restore) above already completed.
 	for _, issue := range issues {
 		if issue.State == "closed" {
 			continue
@@ -1831,7 +1833,9 @@ func (s *ProjectSyncService) reverseDiff(ctx context.Context, repo store.GetRepo
 
 		// The issue must be in uzi's cache (reconcile above backfills new open issues).
 		// A closed issue's board state is its issue state (D1) — skip; reconcile has
-		// already pruned its item row.
+		// either projected it to Done and KEPT its row (PRD #584 M2) or, when the link
+		// has no Done option, pruned it — either way reverse must not drive a label from
+		// a closed issue's card.
 		issue, ok := issuesByIID[it.IssueNumber]
 		if !ok {
 			s.log.Info("project sync: reverse skip, issue not in cache", "repo", repoID, "issue", it.IssueNumber)
