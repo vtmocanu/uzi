@@ -474,6 +474,13 @@ export class RunRunner {
           batcher.emit({ kind: "status", agent: "worker", payload: { text } }),
       },
     );
+    // issue #552 M3: a graceful `uzi run stop` (PRD #517 M4) consumed into the worker's
+    // stopRequested flag is lost if the worker dies before winding the park down. The
+    // server re-delivers the durable runs.stop_kind='stopped' fact as claim.stop_pending
+    // on every claim; seeding it here reconstructs the sticky stop state so the resumed
+    // run's interactive park ends `stopped` immediately (steering.awaitFollowUp's arm-time
+    // check) instead of waiting out the idle timeout. Absent ⇒ untouched (today's path).
+    if (claim.stop_pending) steering.seedStopRequested();
 
     // Last SDK session id the executor observed; carried on EVERY state report so
     // resume survives a lost report.

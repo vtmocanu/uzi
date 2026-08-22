@@ -83,6 +83,10 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 		// present). Non-default (true) here for the same "wired vs present-and-zero" reason
 		// as open_mr above, even though it is only meaningful for kind='task'.
 		Interactive: true,
+		// issue #552 M3: stop_pending rides every claim (a plain bool, no omitempty, always
+		// present). Non-default (true) here for the same "wired vs present-and-zero" reason as
+		// interactive above — the fixture is a coherent interactive, non-terminal, stopped run.
+		StopPending: true,
 		BaseBranch:  strptr("develop"),
 		// PRD #400 M4a: review_target_run_id rides every claim (a *string, no omitempty, so
 		// always present — null for a non-review run). This sample is NOT a review run, so it
@@ -249,6 +253,28 @@ func TestClaimCarriesTaskMrFields(t *testing.T) {
 		t.Error("claim must carry base_branch (PRD #400 M2); key absent")
 	} else if base != "develop" {
 		t.Errorf("base_branch = %v, want develop", base)
+	}
+}
+
+// TestClaimCarriesStopPending pins issue #552 M3's claim addition: stop_pending rides every
+// claim (a plain bool, no omitempty, always present). It re-delivers the durable
+// runs.stop_kind='stopped' fact so a graceful stop survives a worker crash. The sample models
+// an interactive, non-terminal, stopped run, so the key is present and true. Additive — an old
+// worker ignores the key and the idle timeout stays the backstop.
+func TestClaimCarriesStopPending(t *testing.T) {
+	b, err := json.Marshal(sampleClaimPayloadWithSkills())
+	if err != nil {
+		t.Fatalf("marshal claim: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal claim: %v", err)
+	}
+	got, ok := m["stop_pending"]
+	if !ok {
+		t.Error("claim must carry stop_pending (issue #552 M3); key absent")
+	} else if got != true {
+		t.Errorf("stop_pending = %v, want true", got)
 	}
 }
 

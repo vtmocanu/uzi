@@ -21931,7 +21931,11 @@ rationale in the Decision Log of `prds/done/517-interactive-task-runs.md`. <!-- 
   survives the `SetRunCompleted` transition. `--review` then composes via that completed
   transition. The `stop` kind is a distinct SQL enum value (`run_user_inputs.kind`, `00146`) — a
   genuinely new kind here, safe because the interactive worker is new code that recognises it
-  (contrast auto-stop, which reused `cancel` to stay safe on the older fleet).
+  (contrast auto-stop, which reused `cancel` to stay safe on the older fleet). A graceful stop now
+  survives a worker crash (issue #552 M3): the durable `stop_kind='stopped'` fact is re-delivered on
+  every claim as `stop_pending` (derived server-side from the run row, the OpenQuestionID
+  claim-redelivery precedent), so a resumed worker seeds `stopRequested` and winds the park down
+  immediately instead of re-parking at `awaiting_followup` and completing only on the idle timeout.
 
 - **Worker follow-up waiter: `awaitFollowUp` on the task-lane `SteeringChannel`.** A blocking
   wait with route-then-service / drain-after-arm discipline (no lost wakeup): a follow-up/stop/

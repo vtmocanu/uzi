@@ -578,6 +578,15 @@ export interface ClaimResponse {
    *  it. Read from the runs row, so re-delivered on every resume like `open_mr`/`auto_approve`.
    *  Absent on an older server ⇒ treat as false (a task finalizes on done, today's behavior). */
   interactive?: boolean;
+  /** issue #552 M3: the durable runs.stop_kind='stopped' fact, re-delivered on every claim
+   *  (derived server-side from the run row, like `open_question_id`). A graceful `uzi run
+   *  stop` is consumed into the worker's in-memory stopRequested flag, which is LOST if the
+   *  worker dies before winding the park down — the resumed worker's fresh SteeringChannel
+   *  starts stopRequested=false and the already-consumed stop input re-delivers nothing, so
+   *  the run re-parks at awaiting_followup and only completes on the ~30m idle timeout. When
+   *  true the resumed worker seeds stopRequested so the interactive park ends `stopped`
+   *  immediately. Absent/false on an older server ⇒ the idle timeout stays the backstop. */
+  stop_pending?: boolean;
   /** PRD #400 M2: the source ref a task run was branched from, for context/review.
    *  Meaningful only for kind="task" — the worker works the pre-seeded, server-named
    *  `branch` (uzi/task/<run-id>), not this ref; it is carried so an MR/review can name

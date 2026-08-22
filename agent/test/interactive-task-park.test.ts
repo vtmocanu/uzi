@@ -648,6 +648,30 @@ describe("SteeringChannel.awaitFollowUp (PRD #517 M3)", () => {
     assert.deepStrictEqual(outcome, { kind: "ended", reason: "stopped" });
     await ch.stop();
   });
+
+  it("ends the park with reason stopped from a SEEDED stop, with NO stop/follow-up input arriving (issue #552 M3 crash-recovery)", async () => {
+    // The crash-recovery path: a graceful `uzi run stop` was consumed into stopRequested on
+    // a prior worker that then DIED before winding the park down. On the requeue the fresh
+    // SteeringChannel starts stopRequested=false and the already-consumed stop input never
+    // re-delivers (empty input batch here) — so without the seed the park would idle for
+    // ~30m. The claim re-delivers the durable stop_kind='stopped' fact as stop_pending, and
+    // RunRunner calls seedStopRequested() from it, reconstructing the sticky stop state so
+    // awaitFollowUp's arm-time check resolves { kind:"ended", reason:"stopped" } immediately.
+    // Mutation: drop the seedStopRequested() call (or the `if (this.stopRequested)` arm in
+    // awaitFollowUp) → this park never ends and the test hangs (killed by --test-timeout).
+    const ch = new SteeringChannel(
+      fakeClient([[]]), // no inputs at all — the stop input was consumed pre-crash
+      "run-1",
+      1,
+      nullLogger(),
+      new AbortController(),
+    );
+    ch.seedStopRequested(); // what RunRunner does from claim.stop_pending
+    ch.start();
+    const outcome = await ch.awaitFollowUp(60_000);
+    assert.deepStrictEqual(outcome, { kind: "ended", reason: "stopped" });
+    await ch.stop();
+  });
 });
 
 // ── RunRunner's awaitFollowUp callback ───────────────────────────────────────

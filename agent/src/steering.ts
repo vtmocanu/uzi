@@ -175,6 +175,18 @@ export class SteeringChannel {
     this.now = opts.now ?? Date.now;
   }
 
+  /** Seed the sticky `stop` state at construction time (issue #552 M3), before the poll
+   *  loop starts. A graceful `uzi run stop` is stamped durably as runs.stop_kind='stopped'
+   *  (PRD #517 M4) but the steering input that carried it is consume-on-read, so a worker
+   *  that dies before winding the park down loses the in-memory flag and the input never
+   *  re-delivers. The claim re-delivers the durable fact as `stop_pending`; seeding it here
+   *  reconstructs the same state a live `stop` input would have set (~:454), so the next
+   *  interactive park resolves { kind:"ended", reason:"stopped" } immediately instead of
+   *  waiting out the idle timeout. Idempotent with a later live `stop` input. */
+  seedStopRequested(): void {
+    this.stopRequested = true;
+  }
+
   /** Start the poll loop (idempotent). Runs until stop(). */
   start(): void {
     if (this.loop) return;
