@@ -143,14 +143,14 @@ type Handler struct {
 	// the run-now handler nil-guards it.
 	scheduler *schedsvc.Scheduler
 	// projectSync adopts/links an existing GitHub Projects v2 board to a repo's label
-	// board and seeds it (PRD #364 M3). Reached only from the admin
+	// board and seeds it (PRD #364 M3). Reached only from the owner-or-admin
 	// github-project-sync routes; nil-guarded there so a struct-literal test handler
 	// (or a build without the service wired) returns a clean error rather than panics.
 	projectSync ProjectSyncer
 }
 
 // ProjectSyncer is the slice of the GitHub Projects v2 provisioning service the
-// admin github-project-sync handlers drive (PRD #364 M3). *forgesvc.ProjectSyncService
+// github-project-sync handlers drive (PRD #364 M3). *forgesvc.ProjectSyncService
 // satisfies it; kept as an interface so the handler test can inject a fake without
 // the forge/secretbox machinery.
 type ProjectSyncer interface {
@@ -169,7 +169,7 @@ type ProjectSyncer interface {
 
 // SetProjectSync wires the GitHub Projects v2 provisioning service in after
 // construction (built in main alongside the other forge collaborators), matching the
-// repo's pattern for optional post-New dependencies. Safe to leave unset — the admin
+// repo's pattern for optional post-New dependencies. Safe to leave unset — the
 // github-project-sync routes then return a clean 500 rather than panic.
 func (h *Handler) SetProjectSync(p ProjectSyncer) { h.projectSync = p }
 
@@ -975,13 +975,6 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// with it the position-to-name mapping the mount tests pin, for no behavioural
 				// gain.
 				r.With(authLimiter.PerUserMiddleware).Get("/cli-tokens", h.AdminListCLITokens)
-				// Admin GitHub Projects v2 sync health (PRD #364 M7): read the link
-				// status (project_number, owned_by_uzi, last_synced_at, last_error,
-				// item_count). A READ of the stored projection — no forge call, no spend —
-				// so it lives in the READ group beside the other admin reads, unlike the
-				// adopt/disable WRITES below. 404 when the repo has no link (= not
-				// sync-enabled). noLimiter, matching the sibling admin reads.
-				r.Get("/repos/{id}/github-project-sync", h.GetGithubProjectSyncStatus)
 			})
 			// WRITES: cookie-only (RequireAuth + RequireAdmin), unchanged.
 			r.Group(func(r chi.Router) {
@@ -1005,17 +998,6 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// route-around D8 forbids. Actor + timestamp from the session, never the body.
 				r.Post("/repos/{id}/guardrail-override", h.SetRepoGuardrailOverride)
 				r.Delete("/repos/{id}/guardrail-override", h.ClearRepoGuardrailOverride)
-				// Admin GitHub Projects v2 Status sync (PRD #364 M3): adopt/link an
-				// existing project + seed it, and tear the link down. Admin-only because
-				// the sync writes to a user's project board; repo target from the path,
-				// project coordinates from the body.
-				r.Post("/repos/{id}/github-project-sync", h.AdoptGithubProjectSync)
-				r.Delete("/repos/{id}/github-project-sync", h.DisableGithubProjectSync)
-				// Admin autonomous provisioning (PRD #364 M4): CREATE a project + uzi's own
-				// Status field, link + seed it (owned_by_uzi=true). Same admin-only, path-
-				// scoped write group; a separate static sub-path so it never shadows the
-				// adopt POST above.
-				r.Post("/repos/{id}/github-project-sync/provision", h.ProvisionGithubProjectSync)
 			})
 		})
 
@@ -1080,6 +1062,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				r.Put("/{id}", h.SetRepoEnabled)
 				// Repo-skills opt-in toggle (PRD #16): repo owner or admin.
 				r.Patch("/{id}", h.PatchRepo)
+				// GitHub Projects v2 sync, owner-or-admin (issue #534, PRD #364 follow-up):
+				// relocated out of /admin (D4). Owner path is guarded by a GetRepoForUser
+				// preflight inside each handler; admin skips it. Instance flag still gates.
+				r.Get("/{id}/github-project-sync", h.GetGithubProjectSyncStatus)
+				r.Post("/{id}/github-project-sync", h.AdoptGithubProjectSync)
+				r.Post("/{id}/github-project-sync/provision", h.ProvisionGithubProjectSync)
+				r.Delete("/{id}/github-project-sync", h.DisableGithubProjectSync)
 				// Per-repo tool profile (PRD #18 M4): the owner's tier-1 package list.
 				// Owner-only (a repo belongs to one user's connection).
 				r.Get("/{id}/tool-profile", h.GetRepoToolProfile)

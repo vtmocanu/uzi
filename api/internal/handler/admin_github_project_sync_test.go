@@ -82,7 +82,7 @@ func (f *fakeProjectSync) ProjectSyncStatus(_ context.Context, repoID uuid.UUID)
 func postAdopt(t *testing.T, h *Handler, repoID string, body []byte) *httptest.ResponseRecorder {
 	t.Helper()
 	admin := store.User{ID: uuid.New(), IsAdmin: true}
-	r := httptest.NewRequest(http.MethodPost, "/admin/repos/x/github-project-sync", bytes.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/repos/x/github-project-sync", bytes.NewReader(body))
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", repoID)
 	r = r.WithContext(context.WithValue(mw.ContextWithUser(r.Context(), admin), chi.RouteCtxKey, rctx))
@@ -218,7 +218,7 @@ func TestDisableRoute(t *testing.T) {
 	h := &Handler{projectSync: sync}
 	repoID := uuid.New()
 	admin := store.User{ID: uuid.New(), IsAdmin: true}
-	r := httptest.NewRequest(http.MethodDelete, "/admin/repos/x/github-project-sync", nil)
+	r := httptest.NewRequest(http.MethodDelete, "/repos/x/github-project-sync", nil)
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", repoID.String())
 	r = r.WithContext(context.WithValue(mw.ContextWithUser(r.Context(), admin), chi.RouteCtxKey, rctx))
@@ -236,7 +236,7 @@ func TestDisableRoute(t *testing.T) {
 func getStatus(t *testing.T, h *Handler, repoID string) *httptest.ResponseRecorder {
 	t.Helper()
 	admin := store.User{ID: uuid.New(), IsAdmin: true}
-	r := httptest.NewRequest(http.MethodGet, "/admin/repos/x/github-project-sync", nil)
+	r := httptest.NewRequest(http.MethodGet, "/repos/x/github-project-sync", nil)
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", repoID)
 	r = r.WithContext(context.WithValue(mw.ContextWithUser(r.Context(), admin), chi.RouteCtxKey, rctx))
@@ -323,7 +323,7 @@ func TestStatusRouteValidation(t *testing.T) {
 func postProvision(t *testing.T, h *Handler, repoID string, body []byte) *httptest.ResponseRecorder {
 	t.Helper()
 	admin := store.User{ID: uuid.New(), IsAdmin: true}
-	r := httptest.NewRequest(http.MethodPost, "/admin/repos/x/github-project-sync/provision", bytes.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/repos/x/github-project-sync/provision", bytes.NewReader(body))
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", repoID)
 	r = r.WithContext(context.WithValue(mw.ContextWithUser(r.Context(), admin), chi.RouteCtxKey, rctx))
