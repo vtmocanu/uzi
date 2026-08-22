@@ -18,6 +18,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Revert the no-op `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` env var (issue [#561](https://github.com/vtmocanu/uzi/issues/561), reverting [#550](https://github.com/vtmocanu/uzi/pull/550)).**
+  claude-agent-sdk 0.3.233 ships no runtime `TodoWrite` tool for any flag to surface — the symbol survives only in the `.d.ts` types — so the `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` #550 set in `buildSdkEnv` was a no-op with a now-inaccurate comment; removed it. The SDK 0.3.233 pin (#531) is unchanged, and `CLAUDE_CODE_ENABLE_TASKS` is deliberately not added since the Task tools already work as deferred tools.
+
 ## [0.53.1] - 2026-08-22
 <!-- release-title: automatic worker-image roll + interactive-task hardening -->
 
