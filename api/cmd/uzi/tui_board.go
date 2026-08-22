@@ -536,6 +536,26 @@ func (m tuiModel) boardSummary() string {
 // rateBarWidth is the mini rate-limit meter's fixed cell width.
 const rateBarWidth = 6
 
+// rateDangerPct / rateWarnPct are the shared tone-band cutoffs (mirror the web toneFor): a
+// rounded pct ≥ rateDangerPct is danger, ≥ rateWarnPct is warn, else ok. The per-group accent
+// bar reddens on a token's peak window pct ≥ rateDangerPct.
+const (
+	rateDangerPct = 85
+	rateWarnPct   = 40
+)
+
+// tokenPeakPct is the max .Pct across a token's non-nil windows; a nil window contributes
+// nothing, and a token with no window at all returns the sentinel -1 (stays faint).
+func tokenPeakPct(t apitypes.TokenRateLimitDTO) int {
+	peak := -1
+	for _, w := range []*apitypes.RateLimitWindow{t.Limits.FiveHour, t.Limits.SevenDay} {
+		if w != nil && w.Pct > peak {
+			peak = w.Pct
+		}
+	}
+	return peak
+}
+
 // selectedRateMeters applies the #519 board/sidebar selection to the model's own
 // per-token meters, shared by the board strip and the detail rail so the two surfaces
 // cannot disagree on which accounts show OR on showLabel. readable = Limits.Status "ok";
@@ -591,12 +611,23 @@ func (m tuiModel) boardRateLimitStrip() string {
 			seg = paintSeg(m.pal.faintC, nil, false, m.renderer.Plain(t.Label, 16)+" ")
 		}
 		seg += m.rateWindowCell("5h", t.Limits.FiveHour) + "   " + m.rateWindowCell("7d", t.Limits.SevenDay)
+		// Prefix a per-group accent bar TIGHT against the label: it both delimits the group and
+		// doubles as a status light — alarm when the token's peak window pct ≥ rateDangerPct,
+		// faint otherwise. Emitted unconditionally via paintSeg so the group DELIMITER survives
+		// colour stripping (NO_COLOR/Ascii); the tint is the danger cue and is stripped there, so
+		// danger legibility falls back on the always-present bar-fill + NN% text, not this glyph.
+		accent := m.pal.faintC
+		if tokenPeakPct(t) >= rateDangerPct {
+			accent = m.pal.alarm
+		}
+		seg = paintSeg(accent, nil, false, "▎") + seg
 		segs = append(segs, seg)
 	}
 	// A faint leading space aligns the strip under the brand block (the brand line starts " ").
-	// Tokens are joined with the board's faint dot separator (as boardSummary does) so each
-	// token's two windows group visually; the intra-token 5h↔7d gap stays 3 spaces.
-	strip := " " + strings.Join(segs, m.pal.faint.Render(" · "))
+	// Tokens are joined with three spaces; the per-group accent bar ▎ (prefixed above) is the
+	// group delimiter, so each token's two windows still read as a group; the intra-token 5h↔7d
+	// gap stays 3 spaces.
+	strip := " " + strings.Join(segs, "   ")
 	return clampVisual(strip, m.width)
 }
 
@@ -618,9 +649,9 @@ func (m tuiModel) rateWindowCell(label string, w *apitypes.RateLimitWindow) stri
 // warn ≥ 40, else ok.
 func (m tuiModel) rateTone(pct int) color.Color {
 	switch {
-	case pct >= 85:
+	case pct >= rateDangerPct:
 		return m.pal.alarm
-	case pct >= 40:
+	case pct >= rateWarnPct:
 		return m.pal.amber
 	default:
 		return m.pal.sage
