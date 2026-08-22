@@ -21921,7 +21921,13 @@ rationale in the Decision Log of `prds/done/517-interactive-task-runs.md`. <!-- 
   a watermark of the highest already-CONSUMED `follow_up` id, recomputed at each park by
   `SetRunAwaitingFollowup`, so the wake requires a consumed `follow_up` NEWER than the watermark —
   a stale pre-park `running` report on a run that has already iterated (cycle ≥2) can no longer un-park
-  an idle run.
+  an idle run. The worker completes the identity: the `awaiting_followup` report (which stamps the
+  watermark) is emitted ONLY when the run is genuinely going idle — `RunRunner.awaitFollowUp` first
+  checks `SteeringChannel.hasPendingFollowUpOutcome()` and, when a follow-up (or stop/cancel) arrived
+  MID-TURN and is already buffered, SKIPS the park report and services that outcome directly. Without
+  that skip the mid-turn follow-up would be folded into its own park's watermark (it is consumed but
+  not yet applied), so `MAX(consumed follow_up id)` at the park equals the last APPLIED follow-up and
+  the buffered one is genuinely newer.
 
 - **`run stop` = a new `stop` steering-input kind, not a cancel.** Owner-scoped via `SubmitInput`,
   written by `CreateStopVerdictInput` which stamps `stop_kind='stopped'` in the SAME statement as

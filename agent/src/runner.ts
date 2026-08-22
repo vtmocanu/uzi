@@ -937,19 +937,30 @@ export class RunRunner {
         // exists before `running` is reported, and the server admits the wake. This mirrors
         // askUser's settle discipline; the ordering is satisfied by construction here.
         awaitFollowUp: async (idleMs) => {
-          // Read the ACK the same way askUser and the limit park do: the park TOOK only if
-          // the server reports `awaiting_followup`. SetRunAwaitingFollowup (M2) matches
-          // nothing when the run went terminal under us or is no longer ours (or is not an
-          // interactive task) — without this check the worker would block on a follow-up no
-          // surface can produce, since the status never changed. Fail loudly instead.
-          const ack = await reportState({ status: "awaiting_followup" });
-          const parked = (ack as { status?: string } | undefined)?.status;
-          if (parked !== "awaiting_followup") {
-            throw new Error(
-              `${REASON_FOLLOWUP_NOT_PARKED} (server reports ${parked ?? "an unreadable status"})`,
-            );
+          // issue #552 M1 (mid-turn wake-guard bug): report `awaiting_followup` — which stamps
+          // the open_followup_id watermark to MAX(consumed follow_up id) — ONLY when the run is
+          // genuinely going idle. If a follow-up (or stop/cancel) arrived mid-turn and is
+          // already buffered, reporting the park would fold that already-consumed-but-not-yet-
+          // applied follow-up INTO the watermark, so its own wake `running` report would then
+          // fail the server's `id > watermark` guard and strand a live run at awaiting_followup.
+          // Skip the park report in that case and service the buffered outcome directly (the run
+          // stays `running`, no spurious park). A follow-up arriving AFTER this point is consumed
+          // after the stamp, so its id > watermark and it wakes normally.
+          if (!steering.hasPendingFollowUpOutcome()) {
+            // Read the ACK the same way askUser and the limit park do: the park TOOK only if
+            // the server reports `awaiting_followup`. SetRunAwaitingFollowup (M2) matches
+            // nothing when the run went terminal under us or is no longer ours (or is not an
+            // interactive task) — without this check the worker would block on a follow-up no
+            // surface can produce, since the status never changed. Fail loudly instead.
+            const ack = await reportState({ status: "awaiting_followup" });
+            const parked = (ack as { status?: string } | undefined)?.status;
+            if (parked !== "awaiting_followup") {
+              throw new Error(
+                `${REASON_FOLLOWUP_NOT_PARKED} (server reports ${parked ?? "an unreadable status"})`,
+              );
+            }
+            runLog.info("interactive task: awaiting follow-up", { run_id: runId });
           }
-          runLog.info("interactive task: awaiting follow-up", { run_id: runId });
           return steering.awaitFollowUp(idleMs);
         },
         // PRD #122 M2: carry the lead's live progress into the `running` report and return

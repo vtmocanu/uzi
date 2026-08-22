@@ -304,6 +304,24 @@ export class SteeringChannel {
   }
 
   /**
+   * True when awaitFollowUp would resolve SYNCHRONOUSLY — a cancel or stop is pending, or a
+   * follow-up is already buffered from mid-turn — i.e. the run is NOT actually going idle.
+   *
+   * issue #552 M1: the interactive park calls this BEFORE reporting `awaiting_followup`. That
+   * report stamps the open_followup_id wake-guard watermark to MAX(consumed follow_up id); a
+   * follow-up consumed MID-TURN (by the poll loop, while the agent worked) is already consumed
+   * but NOT yet applied, so folding it into the watermark would make its own wake `running`
+   * report fail the `id > watermark` guard and strand a live run at awaiting_followup. When an
+   * outcome is already in hand the park is skipped and the outcome serviced directly, so the
+   * watermark is stamped only when the run genuinely idles (MAX(consumed) == last APPLIED).
+   * Mirrors awaitFollowUp's own precedence (cancelled → stop → buffered follow-up) as a
+   * read-only peek that consumes nothing.
+   */
+  hasPendingFollowUpOutcome(): boolean {
+    return this.cancelled || this.stopRequested || this.followUps.length > 0;
+  }
+
+  /**
    * Park until the next follow-up for an INTERACTIVE task run (PRD #517 M3), or until the
    * park ENDS: idle after `idleMs` with no follow-up, or a cancel. Modeled on
    * ChatSteering.awaitFollowUp + serviceWaiter (route-then-service, drain-after-arm, single

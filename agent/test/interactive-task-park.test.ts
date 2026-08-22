@@ -623,6 +623,62 @@ describe("SteeringChannel.awaitFollowUp (PRD #517 M3)", () => {
     await ch.stop();
   });
 
+  it("hasPendingFollowUpOutcome reflects a buffered follow-up / stop / cancel without consuming it (issue #552 M1)", async () => {
+    // The peek the interactive park uses to decide whether to report awaiting_followup (and so
+    // stamp the open_followup_id watermark). Mutation: make it always return false → the park
+    // report is never skipped and the mid-turn wake-guard bug returns.
+    const ch = new SteeringChannel(
+      fakeClient([[inp("follow_up", "next task")]]),
+      "run-1",
+      1,
+      nullLogger(),
+      new AbortController(),
+    );
+    assert.strictEqual(ch.hasPendingFollowUpOutcome(), false, "empty channel: nothing pending");
+    ch.start();
+    await tick(); // poll consumes + buffers the follow-up
+    assert.strictEqual(
+      ch.hasPendingFollowUpOutcome(),
+      true,
+      "a buffered follow-up is pending — the run is NOT idle",
+    );
+    // Non-consuming: awaitFollowUp still returns the same buffered follow-up afterwards.
+    const outcome = await ch.awaitFollowUp(60_000);
+    assert.deepStrictEqual(outcome, { kind: "followup", body: "next task" });
+    assert.strictEqual(
+      ch.hasPendingFollowUpOutcome(),
+      false,
+      "after the buffer drained, nothing is pending again",
+    );
+    await ch.stop();
+  });
+
+  it("hasPendingFollowUpOutcome is true for a buffered stop and for a cancel (issue #552 M1)", async () => {
+    const stopCh = new SteeringChannel(
+      fakeClient([[inp("stop", "wind down")]]),
+      "run-1",
+      1,
+      nullLogger(),
+      new AbortController(),
+    );
+    stopCh.start();
+    await tick();
+    assert.strictEqual(stopCh.hasPendingFollowUpOutcome(), true, "a buffered stop is pending");
+    await stopCh.stop();
+
+    const cancelCh = new SteeringChannel(
+      fakeClient([[inp("cancel")]]),
+      "run-1",
+      1,
+      nullLogger(),
+      new AbortController(),
+    );
+    cancelCh.start();
+    await tick(); // poll routes the cancel → sticky `cancelled`
+    assert.strictEqual(cancelCh.hasPendingFollowUpOutcome(), true, "a cancel is pending");
+    await cancelCh.stop();
+  });
+
   it("ends the park with reason idle when no follow-up arrives within idleMs", async () => {
     // Mutation: drop the `now() - parkedAt >= idleMs` branch in serviceFollowUp → the park
     // never ends and the test hangs (a NAMED hang: the run would pin a slot forever).
@@ -889,6 +945,43 @@ describe("RunRunner interactive follow-up park (PRD #517 M3)", () => {
       statuses.at(-1),
       "completed",
       "the run resumed past the park and finalized",
+    );
+  });
+
+  it("skips the awaiting_followup park report when a follow-up is already buffered mid-turn (issue #552 M1)", async () => {
+    // A follow-up that arrived MID-TURN is consumed (consumed_at stamped) + buffered by the
+    // poll loop BEFORE the park. Reporting awaiting_followup here would stamp the
+    // open_followup_id watermark to MAX(consumed follow_up id) INCLUDING that follow-up, so its
+    // own wake `running` report would then fail the server's `id > watermark` guard and strand
+    // a live run at awaiting_followup. The callback must SKIP the park report and service the
+    // buffered follow-up directly (the run stays running, no spurious park). Mutation: drop the
+    // `if (!steering.hasPendingFollowUpOutcome())` guard around the park report → awaiting_followup
+    // is reported and the `!statuses.includes("awaiting_followup")` assert reddens.
+    const { gitlab } = fakeGitlab();
+    const log = { outcomes: [] as FollowUpOutcome[], checkpointed: false };
+    const claim = taskClaim();
+    // Seed the follow-up BEFORE the run starts: the 5ms poll loop consumes + buffers it during
+    // the executor's checkpoint (real git, >> 5ms), so it is in hand when the park callback fires.
+    api.setInputs(claim.run_id, [{ id: 1, kind: "follow_up", body: "keep going" }]);
+
+    await runner(parkingExecutor(log), gitlab).execute(claim);
+
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
+    assert.ok(
+      !statuses.includes("awaiting_followup"),
+      `a mid-turn-buffered follow-up must NOT trigger an awaiting_followup park; statuses were ${JSON.stringify(statuses)}`,
+    );
+    assert.deepStrictEqual(
+      log.outcomes,
+      [{ kind: "followup", body: "keep going" }],
+      "the buffered follow-up was serviced directly, without parking",
+    );
+    assert.strictEqual(
+      statuses.at(-1),
+      "completed",
+      "the run resumed past the skipped park and finalized",
     );
   });
 
