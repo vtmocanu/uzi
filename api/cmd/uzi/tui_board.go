@@ -5,6 +5,7 @@ import (
 	"image/color"
 	"slices"
 	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	lipgloss "charm.land/lipgloss/v2"
@@ -275,7 +276,7 @@ func (m tuiModel) renderBoard() string {
 	sb.WriteString(clampVisual(padVisual(" "+brand, m.width-visualWidth(summary)-1)+summary, m.width) + "\n")
 	// The viewer's own rate-limit meters, mirroring the web sidebar's selection. One line,
 	// only when at least one token is readable AND shown; otherwise nothing (no strip).
-	if strip := m.boardRateLimitStrip(); strip != "" {
+	if strip := m.boardRateLimitStrip(time.Now()); strip != "" {
 		sb.WriteString(strip + "\n")
 	}
 	sb.WriteString("\n")
@@ -458,7 +459,7 @@ func (m tuiModel) boardCapacity() int {
 	}
 	// The rate-limit strip, when present, adds one line between the wordmark and the blank
 	// below it. Recomputed here (cheap) so the row-window math matches renderBoard's layout.
-	if m.boardRateLimitStrip() != "" {
+	if m.boardRateLimitStrip(time.Now()) != "" {
 		chrome++
 	}
 	c := m.height - chrome
@@ -609,7 +610,7 @@ func (m tuiModel) selectedRateMeters() (shown []apitypes.TokenRateLimitDTO, show
 // NN% text. The NN% text is always present so an Ascii/NO_COLOR terminal (which strips the SGR
 // tone) keeps the legible signal — colour is never the only cue. Clamped to one physical line.
 // The Label is USER-AUTHORED and drawn through renderer.Plain (D7).
-func (m tuiModel) boardRateLimitStrip() string {
+func (m tuiModel) boardRateLimitStrip(now time.Time) string {
 	shown, showLabel := m.selectedRateMeters()
 	if len(shown) == 0 {
 		return ""
@@ -620,7 +621,7 @@ func (m tuiModel) boardRateLimitStrip() string {
 		if showLabel {
 			seg = paintSeg(m.pal.faintC, nil, false, m.renderer.Plain(t.Label, 16)+" ")
 		}
-		seg += m.rateWindowCell("5h", t.Limits.FiveHour, rateBarWidth, 0) + "   " + m.rateWindowCell("7d", t.Limits.SevenDay, rateBarWidth, 0)
+		seg += m.rateWindowCell("5h", t.Limits.FiveHour, rateBarWidth, 0, now) + "   " + m.rateWindowCell("7d", t.Limits.SevenDay, rateBarWidth, 0, now)
 		// Prefix a per-group accent bar TIGHT against the label: it both delimits the group and
 		// doubles as a status light — alarm when the token's peak window pct ≥ rateDangerPct,
 		// faint otherwise. Emitted unconditionally via paintSeg so the group DELIMITER survives
@@ -644,7 +645,7 @@ func (m tuiModel) boardRateLimitStrip() string {
 // rateWindowCell renders one rate-limit window as `label <bar> NN%`: a faint label ("5h"/"7d"),
 // a tone-coloured mini block-bar filled proportional to pct, then the server-rounded NN% text.
 // A nil window (Anthropic reported none) draws a faint `label -`, mirroring windowPct's "-".
-func (m tuiModel) rateWindowCell(label string, w *apitypes.RateLimitWindow, barW, pctW int) string {
+func (m tuiModel) rateWindowCell(label string, w *apitypes.RateLimitWindow, barW, pctW int, now time.Time) string {
 	if w == nil {
 		return paintSeg(m.pal.faintC, nil, false, label+" -")
 	}
@@ -654,6 +655,19 @@ func (m tuiModel) rateWindowCell(label string, w *apitypes.RateLimitWindow, barW
 	pctSeg := " " + windowPct(w) + "%"
 	if pctW > 0 {
 		pctSeg = " " + fmt.Sprintf("%*s", pctW, windowPct(w)+"%")
+	}
+	// Inline reset countdown after the percent, when Anthropic reported a reset time for this
+	// window (issue #588). shortDuration clamps a past reset to "0s". The strip is width-clamped
+	// downstream and the rail row is width-locked to laneRailWidth (26), which is why the two
+	// surfaces space the countdown differently: the board appends a single space + bare duration,
+	// the rail a 2-col gap + a 6-col right-aligned field (max real value "23h59m" = 6 cols).
+	if w.ResetsAt != nil {
+		reset := shortDuration(time.Duration(*w.ResetsAt-now.Unix()) * time.Second)
+		if pctW > 0 {
+			pctSeg += "  " + fmt.Sprintf("%6s", reset)
+		} else {
+			pctSeg += " " + reset
+		}
 	}
 	return paintSeg(m.pal.faintC, nil, false, label+" ") +
 		paintSeg(m.rateTone(w.Pct), nil, false, filled) +

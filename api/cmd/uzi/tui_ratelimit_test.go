@@ -9,6 +9,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/colorprofile"
@@ -195,7 +196,7 @@ func TestBoardRateLimitStripSingleLineAndClamps(t *testing.T) {
 	// Narrow terminal: one physical line, no wider than m.width.
 	next, _ := m.Update(tea.WindowSizeMsg{Width: 40, Height: 20})
 	m = next.(tuiModel)
-	strip := m.boardRateLimitStrip()
+	strip := m.boardRateLimitStrip(time.Now())
 	if strings.Contains(strip, "\n") {
 		t.Errorf("strip must be one physical line at width 40, got a newline:\n%q", strip)
 	}
@@ -206,7 +207,7 @@ func TestBoardRateLimitStripSingleLineAndClamps(t *testing.T) {
 	// Wide terminal: still one physical line.
 	next, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 20})
 	m = next.(tuiModel)
-	if strip := m.boardRateLimitStrip(); strings.Contains(strip, "\n") {
+	if strip := m.boardRateLimitStrip(time.Now()); strings.Contains(strip, "\n") {
 		t.Errorf("strip must be one physical line at width 120, got a newline:\n%q", strip)
 	}
 }
@@ -223,7 +224,7 @@ func TestBoardRateLimitStripAsciiSignalSurvives(t *testing.T) {
 	}, nil)
 	next, _ := m.Update(tea.ColorProfileMsg{Profile: colorprofile.Ascii})
 	m = next.(tuiModel)
-	strip := m.boardRateLimitStrip()
+	strip := m.boardRateLimitStrip(time.Now())
 	for _, want := range []string{"88%", "20%", "▰", "▱"} {
 		if !strings.Contains(strip, want) {
 			t.Errorf("Ascii-profile strip dropped the always-present cue %q:\n%q", want, strip)
@@ -235,7 +236,7 @@ func TestBoardRateLimitStripAsciiSignalSurvives(t *testing.T) {
 func TestBoardRateLimitStripEmptyCases(t *testing.T) {
 	// (a) no tokens at all.
 	none := stripModel(t, nil, nil)
-	if s := none.boardRateLimitStrip(); s != "" {
+	if s := none.boardRateLimitStrip(time.Now()); s != "" {
 		t.Errorf("no tokens must yield no strip, got %q", s)
 	}
 	// (b) all tokens unreadable (Status != "ok").
@@ -243,14 +244,14 @@ func TestBoardRateLimitStripEmptyCases(t *testing.T) {
 		{SecretID: "a", Label: "a", Limits: apitypes.RateLimitDTO{Status: "unavailable"}},
 		{SecretID: "b", Label: "b", IsDefault: true, Limits: apitypes.RateLimitDTO{Status: "no_token"}},
 	}, nil)
-	if s := allDown.boardRateLimitStrip(); s != "" {
+	if s := allDown.boardRateLimitStrip(time.Now()); s != "" {
 		t.Errorf("all-unreadable tokens must yield no strip, got %q", s)
 	}
 	// (c) readable but nothing shown (a single non-default token not in the sidebar).
 	hidden := stripModel(t, []apitypes.TokenRateLimitDTO{
 		okMeter("sec-x", "hiddenlabel", false, 40, 40),
 	}, nil)
-	if s := hidden.boardRateLimitStrip(); s != "" {
+	if s := hidden.boardRateLimitStrip(time.Now()); s != "" {
 		t.Errorf("readable-but-not-shown token must yield no strip, got %q", s)
 	}
 
@@ -400,7 +401,7 @@ func TestRailRateMetersAsciiSignalSurvives(t *testing.T) {
 func TestRailRateMetersEmptyCases(t *testing.T) {
 	assertNoBlock := func(t *testing.T, label string, m tuiModel) {
 		t.Helper()
-		if s := m.railRateMeters(3); s != "" {
+		if s := m.railRateMeters(time.Now(), 3); s != "" {
 			t.Errorf("%s: railRateMeters must be empty, got %q", label, s)
 		}
 		out := m.renderLaneRail()
@@ -534,7 +535,7 @@ func TestSelectedRateMetersSharedByBoardAndRail(t *testing.T) {
 	}
 	// The board strip renders exactly this selection: both shown labels present, the unlisted and
 	// the unreadable absent — proving the board consumes the same seam.
-	board := stripANSI(m.boardRateLimitStrip())
+	board := stripANSI(m.boardRateLimitStrip(time.Now()))
 	for _, want := range []string{"personal", "metaacct"} {
 		if !strings.Contains(board, want) {
 			t.Errorf("board strip missing shown token %q; it diverged from selectedRateMeters:\n%s", want, board)
@@ -547,11 +548,12 @@ func TestSelectedRateMetersSharedByBoardAndRail(t *testing.T) {
 	}
 }
 
-// TestRailRateMetersFullWidth — the full-rail account meters fill the whole laneRailWidth (26):
-// each 5h/7d line is exactly 26 visual cols, its ▰/▱ bar run is exactly railRateBarWidth (18)
-// glyphs, and the server pct is right-aligned so the line ends flush at the rail's right edge
-// (a line for pct 33 ends with "  33%"). This is the wider full-rail meter, distinct from the
-// board strip's fixed 6-wide bar.
+// TestRailRateMetersFullWidth — a full-rail account meter whose windows carry no reset time
+// (okMeter builds them with nil ResetsAt) renders no countdown: each 5h/7d line is 18 visual
+// cols (a railRateBarWidth (10) ▰/▱ bar + label + right-aligned percent), which stays within
+// laneRailWidth (26). The server pct is right-aligned so the line ends flush with "  33%".
+// The countdown case, where the row fills to the full 26, is TestRailRateMetersResetCountdown.
+// This is the wider full-rail meter, distinct from the board strip's fixed 6-wide bar.
 func TestRailRateMetersFullWidth(t *testing.T) {
 	m := railModel(t, []apitypes.TokenRateLimitDTO{
 		okMeter("sec-personal", "personal", true, 33, 61),
@@ -576,22 +578,99 @@ func TestRailRateMetersFullWidth(t *testing.T) {
 		if !found {
 			t.Fatalf("no %q account line in the rail:\n%s", tc.prefix, strings.Join(lines, "\n"))
 		}
-		if w := visualWidth(line); w != laneRailWidth {
-			t.Errorf("%q line width = %d, want the full laneRailWidth %d:\n%q", tc.prefix, w, laneRailWidth, line)
+		if w := visualWidth(line); w > laneRailWidth {
+			t.Errorf("%q line width %d exceeds the rail budget %d:\n%q", tc.prefix, w, laneRailWidth, line)
 		}
 		if bars := strings.Count(line, "▰") + strings.Count(line, "▱"); bars != railRateBarWidth {
 			t.Errorf("%q bar run = %d glyphs, want railRateBarWidth %d:\n%q", tc.prefix, bars, railRateBarWidth, line)
 		}
 		if !strings.HasSuffix(line, tc.endsPct) {
-			t.Errorf("%q line must end with the right-aligned percent %q (flush at col %d):\n%q",
-				tc.prefix, tc.endsPct, laneRailWidth, line)
+			t.Errorf("%q line must end with the right-aligned percent %q:\n%q",
+				tc.prefix, tc.endsPct, line)
 		}
+	}
+}
+
+// i64p returns a pointer to the given int64, for building RateLimitWindow.ResetsAt in tests.
+func i64p(v int64) *int64 { return &v }
+
+// TestRailRateMetersResetCountdown — issue #588: when a window carries a ResetsAt, the full-rail
+// meter appends a 2-col gap + 6-col right-aligned reset countdown after the percent, filling the
+// row to the full laneRailWidth (26). A window with no ResetsAt renders no countdown (shorter row).
+func TestRailRateMetersResetCountdown(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	m := railModel(t, []apitypes.TokenRateLimitDTO{
+		{
+			SecretID: "sec-personal", Label: "personal", IsDefault: true,
+			Limits: apitypes.RateLimitDTO{
+				Status:   "ok",
+				FiveHour: &apitypes.RateLimitWindow{Pct: 33, ResetsAt: i64p(now.Unix() + 2*3600 + 13*60)},
+				SevenDay: &apitypes.RateLimitWindow{Pct: 61},
+			},
+		},
+	}, nil)
+	block := stripANSI(m.railRateMeters(now, 3))
+	if !strings.Contains(block, "2h13m") {
+		t.Fatalf("rail block missing the 5h reset countdown %q:\n%s", "2h13m", block)
+	}
+	lines := strings.Split(block, "\n")
+	var five, seven string
+	for _, ln := range lines {
+		if strings.HasPrefix(ln, "5h ") {
+			five = ln
+		}
+		if strings.HasPrefix(ln, "7d ") {
+			seven = ln
+		}
+	}
+	if five == "" || seven == "" {
+		t.Fatalf("rail block missing a 5h/7d line:\n%s", block)
+	}
+	if w := visualWidth(five); w != laneRailWidth {
+		t.Errorf("5h line with a countdown width = %d, want the full laneRailWidth %d:\n%q", w, laneRailWidth, five)
+	}
+	if !strings.HasSuffix(five, " 2h13m") {
+		t.Errorf("5h line must end with the right-aligned countdown %q (6-col field):\n%q", " 2h13m", five)
+	}
+	// The 7d window has no ResetsAt: no countdown, ends with its right-aligned percent, within budget.
+	if !strings.HasSuffix(seven, "  61%") {
+		t.Errorf("7d line (nil ResetsAt) must end with its right-aligned percent %q:\n%q", "  61%", seven)
+	}
+	if w := visualWidth(seven); w > laneRailWidth {
+		t.Errorf("7d line (no countdown) width %d exceeds the rail budget %d:\n%q", w, laneRailWidth, seven)
+	}
+}
+
+// TestBoardRateLimitStripResetCountdown — issue #588: on the board strip a window with a ResetsAt
+// gets a single space + bare reset duration after its NN%; a window without one gets no countdown.
+func TestBoardRateLimitStripResetCountdown(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	m := stripModel(t, []apitypes.TokenRateLimitDTO{
+		{
+			SecretID: "sec-personal", Label: "personal", IsDefault: true,
+			Limits: apitypes.RateLimitDTO{
+				Status:   "ok",
+				FiveHour: &apitypes.RateLimitWindow{Pct: 72, ResetsAt: i64p(now.Unix() + 2*3600 + 13*60)},
+				SevenDay: &apitypes.RateLimitWindow{Pct: 30},
+			},
+		},
+	}, nil)
+	strip := stripANSI(m.boardRateLimitStrip(now))
+	if !strings.Contains(strip, "72% 2h13m") {
+		t.Errorf("board strip must show the 5h percent immediately followed by its countdown %q:\n%s", "72% 2h13m", strip)
+	}
+	// The 7d window has no ResetsAt, so its percent carries no trailing duration token.
+	if !strings.Contains(strip, "30%") {
+		t.Errorf("board strip missing the 7d percent %q:\n%s", "30%", strip)
+	}
+	if strings.Count(strip, "2h13m") != 1 {
+		t.Errorf("board strip must carry exactly one reset countdown (only the 5h window has ResetsAt):\n%s", strip)
 	}
 }
 
 // TestBoardRateLimitStripBarStaysSix — parametrizing the meter widths must NOT touch the board's
 // two-up rate strip: a 100%% window there is still exactly rateBarWidth (6) ▰ glyphs, never the
-// rail's 18-wide bar. Guards that rateWindowCell(barW=rateBarWidth, pctW=0) is byte-unchanged.
+// rail's railRateBarWidth (10) bar. Guards that rateWindowCell(barW=rateBarWidth, pctW=0) is byte-unchanged.
 func TestBoardRateLimitStripBarStaysSix(t *testing.T) {
 	m := stripModel(t, []apitypes.TokenRateLimitDTO{
 		okMeter("sec-personal", "personal", true, 100, 100),
