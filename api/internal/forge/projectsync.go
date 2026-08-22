@@ -138,6 +138,15 @@ type ProjectBoardSyncer interface {
 	// {id,name} option set (F2). It errors if no single-select field of that name
 	// exists.
 	ProjectV2StatusFieldByName(ctx context.Context, projectID, fieldName string) (ProjectV2StatusField, error)
+	// ProjectV2StatusFieldByID reads a single-select field by its node id — the
+	// rename-proof identity of the field (PRD #582) — and returns its id, name, and
+	// full {id,name} option set. Unlike ProjectV2StatusFieldByName, which resolves the
+	// currently-named "Status"/"uzi Status" field and so silently follows a rename or
+	// the wrong same-named field, this addresses the EXACT field the caller already
+	// holds an id for. It errors if the id resolves to no single-select field. The
+	// projectID param is accepted for signature symmetry/logging with the by-name
+	// method even though the field node id alone addresses the field.
+	ProjectV2StatusFieldByID(ctx context.Context, projectID, fieldID string) (ProjectV2StatusField, error)
 	// ResolveIssueNodeID resolves a repo issue to its content node id — the
 	// contentId AddProjectV2Item needs (F3).
 	ResolveIssueNodeID(ctx context.Context, owner, repo string, issueNumber int) (string, error)
@@ -324,6 +333,39 @@ func (g *github) ProjectV2StatusFieldByName(ctx context.Context, projectID, fiel
 		ID:      out.Node.Field.ID,
 		Name:    out.Node.Field.Name,
 		Options: toProjectV2Options(out.Node.Field.Options),
+	}, nil
+}
+
+func (g *github) ProjectV2StatusFieldByID(ctx context.Context, projectID, fieldID string) (ProjectV2StatusField, error) {
+	const query = `query($fieldId: ID!) {
+  node(id: $fieldId) {
+    ... on ProjectV2SingleSelectField {
+      id
+      name
+      options { id name }
+    }
+  }
+}`
+	var out struct {
+		Node struct {
+			ID      string `json:"id"`
+			Name    string `json:"name"`
+			Options []struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			} `json:"options"`
+		} `json:"node"`
+	}
+	if err := g.graphqlDo(ctx, query, map[string]any{"fieldId": fieldID}, &out); err != nil {
+		return ProjectV2StatusField{}, err
+	}
+	if out.Node.ID == "" {
+		return ProjectV2StatusField{}, fmt.Errorf("github: status field: no single-select field with id %q on project", fieldID)
+	}
+	return ProjectV2StatusField{
+		ID:      out.Node.ID,
+		Name:    out.Node.Name,
+		Options: toProjectV2Options(out.Node.Options),
 	}, nil
 }
 

@@ -153,6 +153,9 @@ func (p *statefulProject) ResolveProjectV2(context.Context, string, int, forge.P
 func (p *statefulProject) ProjectV2StatusFieldByName(context.Context, string, string) (forge.ProjectV2StatusField, error) {
 	return forge.ProjectV2StatusField{ID: "PVTSSF_1", Name: "Status"}, nil
 }
+func (p *statefulProject) ProjectV2StatusFieldByID(context.Context, string, string) (forge.ProjectV2StatusField, error) {
+	return forge.ProjectV2StatusField{ID: "PVTSSF_1", Name: "Status"}, nil
+}
 func (p *statefulProject) ResolveProjectV2OwnerID(context.Context, string, forge.ProjectV2OwnerKind) (string, error) {
 	return "owner-id", nil
 }
