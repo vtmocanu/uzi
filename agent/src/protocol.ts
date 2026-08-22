@@ -19,6 +19,12 @@ export type RunState =
    *  open_question_id; the api rejects it otherwise, because a park with no question
    *  identity can never satisfy SetRunRunning's resume guard. */
   | "awaiting_input"
+  /** PRD #517 M3: an INTERACTIVE task run parked after a clean signal_done, waiting for the
+   *  next follow-up. The server admits awaiting_followup only for kind==task && interactive
+   *  (SetState guard), and admits the awaiting_followup→running wake only once a follow_up
+   *  input has been consumed (SetRunRunning guard) — the worker satisfies that by obtaining
+   *  the follow-up through the normal poll/consume path before it reports running. */
+  | "awaiting_followup"
   | "limit_wait"
   | "completed"
   | "failed";
@@ -138,7 +144,10 @@ export type InputKind =
   | "reject_plan"
   | "cancel"
   | "revise_plan"
-  | "answer";
+  | "answer"
+  // PRD #517 M4: the graceful interactive wind-down. Consumed by the steering poll and
+  // routed to SteeringChannel.route("stop"), which sets the sticky stop flag.
+  | "stop";
 
 /** One question in an ask_user call (PRD #88 M1), mirroring the local
  *  AskUserQuestion tool's shape so the model has a familiar contract and the UI can
@@ -194,9 +203,15 @@ export interface AnswerBody {
  *  `repo` is set, and `issue_description` carries the schedule's stored task
  *  text; it opens a repo→MR run with no issue to close.
  *
+ *  "task" (PRD #400) is the handoff kind: repo-ful and ISSUE-LESS like "prompt",
+ *  carrying its inline context in `issue_description`, but it works a PRE-SEEDED,
+ *  server-named `uzi/task/<run-id>` branch (on `branch`) and, by default, opens NO
+ *  merge request — the deliverable is commits the user pulls. It opens one only when
+ *  `open_mr` is true (`uzi handoff --mr`).
+ *
  *  RUN_KINDS is mirrored from the DB `runs_kind_check` constraint (in DB CHECK
  *  order); agent/test/run-kind-db-parity.test.ts keeps the two in sync. */
-export const RUN_KINDS = ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt"] as const;
+export const RUN_KINDS = ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt", "task"] as const;
 export type RunKind = (typeof RUN_KINDS)[number];
 
 /** How a run's plan_md was produced (PRD #209 D4). "agent": the worker's own Phase-1
@@ -384,6 +399,12 @@ export interface ClaimSecrets {
 export interface ClaimConfig {
   run_timeout_seconds?: number;
   idle_timeout_seconds?: number;
+  /** PRD #517 M5: the interactive-task park idle backstop (env WORKER_TASK_IDLE_TIMEOUT).
+   *  How long a parked interactive task waits at awaiting_followup for the next follow-up
+   *  before the worker gracefully finalizes (push, MR iff open_mr) → completed. Present
+   *  only on an interactive task claim; absent ⇒ the worker's TASK_FOLLOWUP_IDLE_MS
+   *  constant (30m). Seconds, converted to ms at the park site. */
+  task_idle_timeout_seconds?: number;
   max_iterations?: number;
   /** Bound on plan-revision rounds at the approval gate (PRD #41, env
    *  PLAN_MAX_REVISIONS). The worker enforces the same cap the server does. */
@@ -470,6 +491,24 @@ export interface IterationBudget {
   wallSeconds?: number;
 }
 
+/** One human comment on the worked issue, snapshotted at run creation (PRD #381).
+ *  Bodies are UNTRUSTED, attacker-influenceable free text. */
+export interface IssueCommentSnapshot {
+  author_username: string;
+  author_forge_user_id: number;
+  /** RFC3339. */
+  created_at: string;
+  body: string;
+}
+
+/** The bounded, bot/system-filtered snapshot of the issue's human comments carried
+ *  on the claim (PRD #381). Absent for a comment-less issue, a non-issue kind, and a
+ *  connection with an unknown bot id (D9). `truncated` is set when the thread was clipped. */
+export interface IssueCommentsSnapshot {
+  comments: IssueCommentSnapshot[];
+  truncated: boolean;
+}
+
 /**
  * Response body of a successful (200) claim.
  *
@@ -490,6 +529,12 @@ export interface ClaimResponse {
    *  ci_fix run these carry a synthesized summary, not a real issue. */
   issue_title: string;
   issue_description: string;
+  /** PRD #381: the bounded, bot/system-filtered snapshot of the issue's human
+   *  comments, taken at run creation next to `issue_description`. Absent/null for a
+   *  comment-less issue, a non-issue kind, and a connection with an unknown bot id
+   *  (D9). The bodies are UNTRUSTED, multi-author, attacker-influenceable text;
+   *  prompt.ts renders them under a per-prompt nonce fence (D5). */
+  issue_comments?: IssueCommentsSnapshot | null;
   /** The failed-pipeline snapshot for a ci_fix run (PRD #6): what the agent
    *  diagnoses + fixes. Present only for kind="ci_fix". Log tails are UNTRUSTED
    *  data — quoted evidence, never instructions. */
@@ -520,6 +565,41 @@ export interface ClaimResponse {
    *  fact. Re-delivered on every resume/requeue of the same run (the server reads
    *  it from the row), so an unattended resume never hangs at the gate. */
   auto_approve?: boolean;
+  /** PRD #400 M2: gates whether a TASK run opens a merge request. Meaningful only for
+   *  kind="task": a task ALWAYS pushes its branch back (the deliverable is commits the
+   *  user pulls), but opens an MR only when this is true (`uzi handoff --mr`). Every
+   *  other kind ignores it. Read from the runs row, so re-delivered on every resume like
+   *  auto_approve. Absent on an older server ⇒ treat as false (no MR for a task). */
+  open_mr?: boolean;
+  /** PRD #517 M3: this TASK run is INTERACTIVE (`uzi handoff --interactive`). Meaningful
+   *  only for kind="task": on `signal_done` the worker checkpoint-pushes and PARKS at
+   *  `awaiting_followup` (instead of finalizing), blocking in-process for the next
+   *  follow-up and resuming the SAME SDK session when it arrives. Every other kind ignores
+   *  it. Read from the runs row, so re-delivered on every resume like `open_mr`/`auto_approve`.
+   *  Absent on an older server ⇒ treat as false (a task finalizes on done, today's behavior). */
+  interactive?: boolean;
+  /** issue #552 M3: the durable runs.stop_kind='stopped' fact, re-delivered on every claim
+   *  (derived server-side from the run row, like `open_question_id`). A graceful `uzi run
+   *  stop` is consumed into the worker's in-memory stopRequested flag, which is LOST if the
+   *  worker dies before winding the park down — the resumed worker's fresh SteeringChannel
+   *  starts stopRequested=false and the already-consumed stop input re-delivers nothing, so
+   *  the run re-parks at awaiting_followup and only completes on the ~30m idle timeout. When
+   *  true the resumed worker seeds stopRequested so the interactive park ends `stopped`
+   *  immediately. Absent/false on an older server ⇒ the idle timeout stays the backstop. */
+  stop_pending?: boolean;
+  /** PRD #400 M2: the source ref a task run was branched from, for context/review.
+   *  Meaningful only for kind="task" — the worker works the pre-seeded, server-named
+   *  `branch` (uzi/task/<run-id>), not this ref; it is carried so an MR/review can name
+   *  what the task diverged from. Null/absent for a run that has none. */
+  base_branch?: string | null;
+  /** PRD #400 M4b: set ⇒ this `task`-kind claim is a DIFF-REVIEW of that target task run
+   *  (its `run_id`). The worker routes such a claim to the ReviewRunner instead of the
+   *  normal task executor: it clones the reviewed `branch`, diffs it against `base_branch`,
+   *  runs a reviewer model over the diff, and POSTs structured findings to
+   *  `POST /worker/runs/{review_target_run_id}/task-review`. It pushes NOTHING and opens no
+   *  MR — a review run is report-only. Null/absent for every non-review claim. Read from
+   *  the runs row, so re-delivered on every resume like `open_mr`/`base_branch`. */
+  review_target_run_id?: string | null;
   /** PRD #88: the clarification question this run is ALREADY parked on, read from the
    *  runs row and so re-delivered on every resume — the same shape as auto_approve and
    *  for the same reason. A resumed worker re-parks with this SAME id rather than
@@ -532,6 +612,15 @@ export interface ClaimResponse {
   /** The model a judge run runs on (PRD #46), resolved from the judge_model setting.
    *  Present only for kind="judge". */
   judge_model?: string | null;
+  /** The model the inline run-summary generator runs on (PRD #362), resolved
+   *  user-value-wins from users.summary_model over the instance summary_model at
+   *  ISSUE-run claim assembly. Rides the issue-run claim (unlike judge_model, which
+   *  is judge-only); absent on older servers. */
+  summary_model?: string | null;
+  /** True when the run's INTENT summary is already set (PRD #362 M3c, Decision 3):
+   *  the executor then skips intent generation on a resume/re-claim so the owner's
+   *  token is not re-spent. Absent/false on a fresh run and on older servers. */
+  summary_intent_present?: boolean;
   /** The API's deterministic command-not-found pre-scan of the reviewed run's tool
    *  output (PRD #46 Decision 4). Present only for kind="judge" (omitted when empty).
    *  The judge interprets it; if the model call fails it is the fallback. */
@@ -687,6 +776,30 @@ export interface ReviewRequest {
   /** "complete" = a real LLM verdict; "failed" = the deterministic fallback. */
   status: "complete" | "failed";
   recommendations: ReviewRecommendation[];
+}
+
+/** One structured finding the diff-review reviewer posts back (PRD #400 M4b). Every
+ *  field is model-authored from an UNTRUSTED git diff; the server caps/scrubs and
+ *  validates `severity` against info|warning|error again. `line` is optional — a finding
+ *  the reviewer could not anchor to a line omits it. */
+export interface TaskReviewFinding {
+  file: string;
+  symbol: string;
+  line?: number;
+  severity: "info" | "warning" | "error";
+  summary: string;
+  rationale: string;
+}
+
+/** The diff-review POST body (POST /worker/runs/{target_run_id}/task-review, PRD #400
+ *  M4b). `status` is "complete" for a real reviewer verdict (including an empty-diff
+ *  "nothing to review"), "failed" for the graceful fallback (no token, malformed model
+ *  output, or an error before the post). The server caps the findings list and scrubs
+ *  every field. */
+export interface TaskReviewRequest {
+  status: "complete" | "failed";
+  summary: string;
+  findings: TaskReviewFinding[];
 }
 
 /**
@@ -883,8 +996,18 @@ export interface MemoryListResponse {
 // snake_case as the uzi API sends them (the API is built to this wire contract in
 // parallel). Every field is forge data — UNTRUSTED; the forge server nonce-fences it.
 
+/** One human issue comment (PRD #381), bot-authored and forge system notes filtered
+ *  out server-side, ordered oldest-first. UNTRUSTED evidence. */
+export interface IssueCommentDTO {
+  author: string;
+  created_at: string;
+  body: string;
+}
+
 /** One issue's detail (GET /worker/runs/:id/forge/issues/:iid). `description` may be
- *  truncated by the API, flagged by `description_truncated`. */
+ *  truncated by the API, flagged by `description_truncated`. `comments` are the issue's
+ *  bot/system-filtered, bounded human comments (PRD #381), oldest-first;
+ *  `comments_truncated` marks a thread clipped by the API's count or byte cap. */
 export interface IssueDTO {
   iid: number;
   title: string;
@@ -894,6 +1017,8 @@ export interface IssueDTO {
   updated_at: string;
   description: string;
   description_truncated: boolean;
+  comments: IssueCommentDTO[];
+  comments_truncated: boolean;
 }
 
 /** A lightweight issue row in a list (no description). */
@@ -1216,6 +1341,18 @@ export interface StateRequest {
    *  Never sent on any other report in M1. Reporting is fire-and-forget: the server
    *  validates the list (Decision 12) and an informational field never fails a run. */
   milestones?: Milestone[];
+  // PRD #84 M4: plan-time inferred requirement set (deterministic detectToolchain()).
+  /** Non-provisionable capabilities the run needs (closed vocab {docker, jvm}). Additive
+   *  + optional and OMITTED ENTIRELY when empty — never `null` or `[]`. Rides the same two
+   *  reports as `milestones` (candidate on awaiting_approval, frozen on the autopilot
+   *  running report). */
+  required_capabilities?: string[];
+  /** Provisionable toolchain names the run needs (e.g. go, node, python, rust, jvm).
+   *  Additive + optional, OMITTED ENTIRELY when empty, same discipline as above. */
+  required_tools?: string[];
+  /** A coarse, soft/display-only size bucket ("s"|"m"|"l") for the run's repo. Additive +
+   *  optional; may be sent whenever the deterministic scan computed one. */
+  size_class?: string;
   /** The lead's live milestone progress (PRD #122 M2, Decision 3). Additive + optional
    *  and OMITTED ENTIRELY when the lead has reported no progress — never `null` or `[]` —
    *  so an old worker's payload and a new worker's "no progress" payload stay the same
@@ -1256,6 +1393,14 @@ export interface StateRequest {
    *  the server allowlists it against its own closed enum and drops anything else,
    *  so the authoritative copy of the vocabulary stays on the trusted side. */
   fail_origin?: string;
+  /** failed (PRD #377 M1): the agent's branch diff, preserved for a human to land when a
+   *  GitHub run's branch touches `.github/workflows/**` — a path the bot's repo-only PAT
+   *  cannot push, so the run fails early with `fail_origin: "workflow_scope_missing"`
+   *  instead of face-planting into the push rejection and discarding the work. Additive +
+   *  optional and carried ONLY on that `failed` report (worker→api); the worker already
+   *  secret-scrubs and size-caps it (git.workflowScopeDiff + redactText), and the server
+   *  clamps it again before storing. Absent on every other report. */
+  preserved_patch?: string;
 }
 
 /**

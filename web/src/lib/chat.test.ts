@@ -40,6 +40,7 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
+    draining_since: null,
     ...over,
   };
 }
@@ -161,6 +162,17 @@ describe("chatIsEnded / conversationTitle / sortConversations", () => {
     const sorted = sortConversations([older, noMsg, newer]);
     expect(sorted.map((c) => c.id)).toEqual(["new", "nomsg", "old"]);
   });
+
+  it("sortConversations orders same-second stamps by instant, not string (Go trims fractional zeros)", () => {
+    // Go marshals the whole second as "…:00Z" and the sub-second as "…:00.5Z"; the
+    // latter is LATER but sorts as SMALLER under a string compare ('.' < 'Z'), so a
+    // string-keyed sort shows the more-recent conversation as older. Fails on
+    // localeCompare, passes on the instant compare.
+    const earlier = aChat({ id: "earlier", last_message_at: "2026-07-05T10:00:00Z" });
+    const later = aChat({ id: "later", last_message_at: "2026-07-05T10:00:00.5Z" });
+    const sorted = sortConversations([earlier, later]);
+    expect(sorted.map((c) => c.id)).toEqual(["later", "earlier"]);
+  });
 });
 
 describe("chatFromRun (create/continue runDTO → unified Chat view)", () => {
@@ -176,6 +188,7 @@ describe("chatFromRun (create/continue runDTO → unified Chat view)", () => {
       resume_of_run_id: null,
       forge_type: "gitlab",
       mr_web_url: null,
+      issue_web_url: null,
       status: "running",
       requeue_count: 0,
       iteration_count: 0,

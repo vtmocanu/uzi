@@ -271,14 +271,14 @@ func TestWorkerDTOCarriesBinding(t *testing.T) {
 	bound := workerDTOFromWorker(store.Worker{
 		AnthropicBindMode: workersvc.BindModePinned,
 		AnthropicSecretID: pgtype.UUID{Bytes: id, Valid: true},
-	}, 0, false, "console-key", "", time.Now(), time.Now())
+	}, 0, false, "console-key", "", "", time.Now(), time.Now())
 	if bound.AnthropicSecretID == nil || *bound.AnthropicSecretID != id.String() {
 		t.Fatalf("bound id = %v, want %s", bound.AnthropicSecretID, id)
 	}
 	if bound.AnthropicSecretLabel == nil || *bound.AnthropicSecretLabel != "console-key" {
 		t.Fatalf("bound label = %v, want console-key", bound.AnthropicSecretLabel)
 	}
-	unbound := workerDTOFromWorker(store.Worker{}, 0, false, "", "", time.Now(), time.Now())
+	unbound := workerDTOFromWorker(store.Worker{}, 0, false, "", "", "", time.Now(), time.Now())
 	if unbound.AnthropicSecretID != nil || unbound.AnthropicSecretLabel != nil {
 		t.Fatalf("unbound worker must serialize both fields as null, got %v/%v",
 			unbound.AnthropicSecretID, unbound.AnthropicSecretLabel)
@@ -484,7 +484,7 @@ func TestBindingIsSuppressedOffPinned(t *testing.T) {
 	for _, mode := range []string{workersvc.BindModeDefault, workersvc.BindModeAuto, workersvc.BindModePinned} {
 		dto := workerDTOFromWorker(store.Worker{
 			AnthropicBindMode: mode, AnthropicSecretID: bound,
-		}, 0, false, "console-key", "", time.Now(), time.Now())
+		}, 0, false, "console-key", "", "", time.Now(), time.Now())
 		if dto.AnthropicBindMode == workersvc.BindModePinned && dto.AnthropicSecretID == nil {
 			t.Errorf("mode %q: DTO says pinned with no credential", mode)
 		}

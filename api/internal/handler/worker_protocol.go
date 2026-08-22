@@ -216,13 +216,11 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		// column stays NULL. A pointer so absent (NULL) is distinct from a sent 0.
 		MaxConcurrentRuns *int `json:"max_concurrent_runs"`
 		// Capabilities is the worker's self-reported REACHABLE capability set (PRD #83
-		// Q1: today only ["docker"], meaning a daemon sidecar is reachable). Declared
-		// ONLY so DecodeJSON's DisallowUnknownFields does not 400 a register that
-		// carries it — the SAME accept-and-ignore reason as Name. In M1 nothing reads
-		// or stores it (accept-and-ignore, no column, no migration); #84 owns the
-		// capability vocabulary + the claim-time match predicate. The compat rule (the
-		// api must tolerate this field in the same release the worker starts sending it)
-		// is satisfied by declaring it here — do NOT thread it into wsvc.Register.
+		// Q1: today only ["docker"], meaning a daemon sidecar is reachable). Threaded
+		// into wsvc.Register (PRD #84 M1), which UNIONs it with the template-derived
+		// caps and passes the result through the server-owned capability.Filter before
+		// persisting to workers.capabilities — so an unknown/garbled name here is
+		// dropped, never stored, and the register never 400s over this field.
 		Capabilities []string `json:"capabilities"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
@@ -258,7 +256,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("worker reported an out-of-range max_concurrent_runs; dropping", "worker_id", wkr.ID.String(), "value", *advertisedCap)
 		advertisedCap = nil
 	}
-	updated, err := h.wsvc.Register(r.Context(), wkr, version, reported, advertisedCap)
+	updated, err := h.wsvc.Register(r.Context(), wkr, version, reported, advertisedCap, req.Capabilities)
 	if err != nil {
 		slog.Error("worker register", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -299,7 +297,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	// call comes from the Bearer token, never a URL path (M2 wire contract).
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"worker_id": updated.ID.String(),
-		"worker":    workerDTOFromWorker(updated, 0, false, "", h.version, h.clock(), h.startedAt),
+		"worker":    workerDTOFromWorker(updated, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt),
 	})
 }
 
@@ -344,7 +342,7 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(updated, 0, false, "", h.version, h.clock(), h.startedAt)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(updated, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)})
 }
 
 // parseWorkerStats is Decision 3's second-step defensive parse plus Decision 5's
@@ -575,7 +573,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 		case errors.Is(err, workersvc.ErrInvalidState):
-			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, limit_wait, completed, failed")
+			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, completed, failed")
 		default:
 			slog.Error("worker run state", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")

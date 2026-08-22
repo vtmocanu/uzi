@@ -169,6 +169,9 @@ func (g *gitLab) DefaultBranchProtection(ctx context.Context, projectID int64, b
 	}
 	bp := BranchProtection{Protected: true}
 	for _, pl := range pb.PushAccessLevels {
+		if pl == nil {
+			continue
+		}
 		lvl := int(pl.AccessLevel)
 		// A push level of 0 is "No one"; >= Maintainer (40) excludes a Developer
 		// bot. Only a nonzero level at or below Developer (30) lets the bot push.
@@ -188,6 +191,9 @@ func (g *gitLab) DefaultBranchProtection(ctx context.Context, projectID int64, b
 	// until now, delegating "the agent can only ever open an MR" to a sentence in
 	// the setup docs.
 	for _, ml := range pb.MergeAccessLevels {
+		if ml == nil {
+			continue
+		}
 		lvl := int(ml.AccessLevel)
 		if lvl > 0 && lvl <= developerAccessLevel {
 			bp.WriteRoleCanMerge = true
@@ -217,6 +223,9 @@ func (g *gitLab) ListProjects(ctx context.Context) ([]Project, error) {
 			return nil, g.redact.error(fmt.Errorf("gitlab: list projects: %w", err))
 		}
 		for _, p := range projects {
+			if p == nil {
+				continue
+			}
 			out = append(out, Project{
 				ForgeProjectID:    p.ID,
 				PathWithNamespace: p.PathWithNamespace,
@@ -249,6 +258,9 @@ func (g *gitLab) ListLabels(ctx context.Context, projectID int64) ([]Label, erro
 			return nil, g.redact.error(fmt.Errorf("gitlab: list labels: %w", err))
 		}
 		for _, l := range labels {
+			if l == nil {
+				continue
+			}
 			out = append(out, Label{Name: l.Name, Color: l.Color})
 		}
 		if len(out) > maxForgeItems {
@@ -319,6 +331,9 @@ func (g *gitLab) ListIssues(ctx context.Context, projectID int64, opts ListIssue
 			return nil, g.redact.error(fmt.Errorf("gitlab: list issues: %w", err))
 		}
 		for _, i := range issues {
+			if i == nil {
+				continue
+			}
 			out = append(out, toIssue(i))
 			// opts.Limit == 0 is the no-cap default (every pre-#158 caller); a positive
 			// Limit stops as soon as that many issues are collected, truncating this page.
@@ -421,6 +436,9 @@ func (g *gitLab) ListIssueLabelEvents(ctx context.Context, projectID, issueIID i
 			return nil, g.redact.error(fmt.Errorf("gitlab: list issue label events: %w", err))
 		}
 		for _, e := range events {
+			if e == nil {
+				continue
+			}
 			out = append(out, toLabelEvent(e))
 		}
 		if len(out) > maxForgeItems {
@@ -431,6 +449,54 @@ func (g *gitLab) ListIssueLabelEvents(ctx context.Context, projectID, issueIID i
 		}
 		if page >= maxForgePages {
 			return nil, g.redact.error(fmt.Errorf("gitlab: list issue label events: %w", forgePaginationCapErr("page", maxForgePages)))
+		}
+		opt.Page = resp.NextPage
+	}
+	return out, nil
+}
+
+// ListIssueComments returns an issue's human comments, oldest-first (PRD #381).
+// GitLab's ListIssueNotes returns comments AND system notes in one list and
+// defaults to created_at DESC, so the driver asks for ascending order (OrderBy/
+// Sort) and filters out System notes (D2) — leaving only human comments in
+// oldest-first order (D8).
+func (g *gitLab) ListIssueComments(ctx context.Context, projectID, issueIID int64) ([]IssueComment, error) {
+	opt := &gitlab.ListIssueNotesOptions{
+		ListOptions: gitlab.ListOptions{Page: 1, PerPage: perPage},
+		OrderBy:     gitlab.Ptr("created_at"),
+		Sort:        gitlab.Ptr("asc"),
+	}
+	var out []IssueComment
+	page := 0
+	for {
+		page++
+		notes, resp, err := g.client.Notes.ListIssueNotes(projectID, issueIID, opt, gitlab.WithContext(ctx))
+		if err != nil {
+			return nil, g.redact.error(fmt.Errorf("gitlab: list issue comments: %w", err))
+		}
+		for _, n := range notes {
+			if n == nil || n.System {
+				continue
+			}
+			var createdAt time.Time
+			if n.CreatedAt != nil {
+				createdAt = *n.CreatedAt
+			}
+			out = append(out, IssueComment{
+				AuthorForgeUserID: n.Author.ID,
+				AuthorUsername:    n.Author.Username,
+				Body:              n.Body,
+				CreatedAt:         createdAt,
+			})
+		}
+		if len(out) > maxForgeItems {
+			return nil, g.redact.error(fmt.Errorf("gitlab: list issue comments: %w", forgePaginationCapErr("item", maxForgeItems)))
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		if page >= maxForgePages {
+			return nil, g.redact.error(fmt.Errorf("gitlab: list issue comments: %w", forgePaginationCapErr("page", maxForgePages)))
 		}
 		opt.Page = resp.NextPage
 	}
@@ -518,6 +584,9 @@ func (g *gitLab) ListPipelineJobs(ctx context.Context, projectID, pipelineID int
 			return nil, g.redact.error(fmt.Errorf("gitlab: list pipeline jobs: %w", err))
 		}
 		for _, j := range jobs {
+			if j == nil {
+				continue
+			}
 			out = append(out, Job{ID: j.ID, Name: j.Name, Stage: j.Stage, Status: j.Status, WebURL: j.WebURL})
 		}
 		if len(out) > maxForgeItems {

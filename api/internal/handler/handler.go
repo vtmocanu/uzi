@@ -17,6 +17,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/config"
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
@@ -141,7 +142,62 @@ type Handler struct {
 	// instance is never started. nil when a test builds a Handler as a struct literal;
 	// the run-now handler nil-guards it.
 	scheduler *schedsvc.Scheduler
+	// projectSync adopts/links an existing GitHub Projects v2 board to a repo's label
+	// board and seeds it (PRD #364 M3). Reached only from the owner-or-admin
+	// github-project-sync routes; nil-guarded there so a struct-literal test handler
+	// (or a build without the service wired) returns a clean error rather than panics.
+	projectSync ProjectSyncer
 }
+
+// ProjectSyncer is the slice of the GitHub Projects v2 provisioning service the
+// github-project-sync handlers drive (PRD #364 M3). *forgesvc.ProjectSyncService
+// satisfies it; kept as an interface so the handler test can inject a fake without
+// the forge/secretbox machinery.
+type ProjectSyncer interface {
+	Adopt(ctx context.Context, repoID uuid.UUID, projectNumber int, ownerKind forge.ProjectV2OwnerKind) error
+	// Provision autonomously CREATES a project + uzi's own Status field, links, and
+	// seeds it (M4). owned_by_uzi is persisted true; title may be "" (defaulted).
+	Provision(ctx context.Context, repoID uuid.UUID, ownerKind forge.ProjectV2OwnerKind, title string) error
+	Disable(ctx context.Context, repoID uuid.UUID) error
+	// ForwardMove projects a uzi label move onto the linked project's Status (M5).
+	// Best-effort: the handler logs and continues on a returned error.
+	ForwardMove(ctx context.Context, repoID uuid.UUID, issueIID int64, targetColumn string) error
+	// ProjectSyncStatus reads a repo's link health for the GET status endpoint (M7).
+	// Returns pgx.ErrNoRows when the repo has no link, which the handler maps to 404.
+	ProjectSyncStatus(ctx context.Context, repoID uuid.UUID) (forgesvc.ProjectSyncStatus, error)
+	// GetVisibility reads the linked board's current public flag (PRD #557 M2/M3): a
+	// live forge round-trip, kept off the DB-only status endpoint (D4).
+	GetVisibility(ctx context.Context, repoID uuid.UUID) (bool, error)
+	// RepoOwnerType reports whether the repo's owner is a GitHub User or Organization
+	// (PRD #576 M1), for the sync panel's Provision feasibility nudge. A live forge
+	// round-trip; needs no link row (used before the repo is linked).
+	RepoOwnerType(ctx context.Context, repoID uuid.UUID) (forge.ProjectV2OwnerType, error)
+	// SetVisibility writes the linked board's public flag (PRD #557).
+	SetVisibility(ctx context.Context, repoID uuid.UUID, public bool) error
+	// ShareWithUser grants the named GitHub login Reader access to the linked board
+	// (PRD #557). Write-only: GitHub exposes no readable collaborator list, so the
+	// service grants but never enumerates. A non-existent login yields
+	// ErrProjectSyncUserNotFound (→ 422).
+	ShareWithUser(ctx context.Context, repoID uuid.UUID, username string) error
+	// Unshare revokes the named GitHub login's access to the linked board (PRD #557).
+	Unshare(ctx context.Context, repoID uuid.UUID, username string) error
+	// Resync re-runs the adopt seed against a repo's already-linked board (PRD #576
+	// M3), re-reading the Status field so newly-added options resolve and re-persisting
+	// the unmatched set. Needs no owner_kind/project_number (uses the stored node id).
+	// Returns ErrProjectSyncNotLinked when the repo has no link (the handler → 404).
+	Resync(ctx context.Context, repoID uuid.UUID) (string, error)
+	// AutoCreateColumns creates a FRESH uzi-owned Status field on an adopted board
+	// carrying all the repo's columns and switches the link to it (PRD #576 M6),
+	// turning skipped columns into synced ones with no destructive field replace.
+	// Returns ErrProjectSyncNotLinked when the repo has no link (the handler → 404).
+	AutoCreateColumns(ctx context.Context, repoID uuid.UUID) (string, error)
+}
+
+// SetProjectSync wires the GitHub Projects v2 provisioning service in after
+// construction (built in main alongside the other forge collaborators), matching the
+// repo's pattern for optional post-New dependencies. Safe to leave unset — the
+// github-project-sync routes then return a clean 500 rather than panic.
+func (h *Handler) SetProjectSync(p ProjectSyncer) { h.projectSync = p }
 
 // clock reads the classification clock seam, nil-safe.
 //
@@ -672,27 +728,23 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Put("/recommendations/disposition", h.BulkSetDispositions)
 		})
 
-		// Incidental Findings backlog (PRD #333 M4/M5, D7/D8): the per-repo, owner-scoped,
-		// coordinate-deduped backlog of off-task bugs the worker flagged mid-run, its issue
-		// draft, and the human-gated file/dismiss WRITES. Two sibling groups (the runs
-		// pattern): the READS are RequireUser (so `uzi findings list` works from a CLI token)
-		// and the WRITES are the stricter cookie+CSRF RequireAuth — a CLI token cannot drive a
-		// forge write.
+		// Incidental Findings backlog (PRD #333 M4/M5, D7/D8; PRD #365 M1): the per-repo,
+		// owner-scoped, coordinate-deduped backlog of off-task bugs the worker flagged mid-run,
+		// its issue draft, and the human-gated file/dismiss WRITES. All on RequireUser so the
+		// `uzi findings` CLI verbs work from a uzc_ Bearer token, while browser callers still
+		// carry a cookie with CSRF enforced via RequireUser's presence dispatch. Filing is a
+		// forge write, but an owner-scoped, reversible one behind the per-user forge limiter;
+		// dismiss is a LOCAL write (no forge call, no spend, no forge blast radius) and carries
+		// no limiter. Mints/reveals/consent routes stay cookie-only RequireAuth.
 		r.Route("/findings", func(r chi.Router) {
+			r.Use(mw.RequireUser(h.q, h.cfg))
 			// Reads: owner-scoped by the query's user_id filter, no forge write, no spend.
-			r.Group(func(r chi.Router) {
-				r.Use(mw.RequireUser(h.q, h.cfg))
-				r.Get("/", h.ListFindings)
-				r.Get("/{id}/issue-draft", h.GetFindingIssueDraft)
-			})
-			// Writes (M5): cookie+CSRF RequireAuth. Filing is a forge write, so it rides the
-			// per-user forge limiter (mirroring FileIssue); dismiss is a LOCAL write (no forge
-			// call, no spend) and carries no limiter, beside the reads.
-			r.Group(func(r chi.Router) {
-				r.Use(mw.RequireAuth(h.q, h.cfg))
-				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issue", h.FileFinding)
-				r.Post("/{id}/dismiss", h.DismissFinding)
-			})
+			r.Get("/", h.ListFindings)
+			r.Get("/{id}/issue-draft", h.GetFindingIssueDraft)
+			// Writes: filing rides the per-user forge limiter (mirroring FileIssue); dismiss is
+			// a local write and carries no limiter.
+			r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issue", h.FileFinding)
+			r.Post("/{id}/dismiss", h.DismissFinding)
 		})
 
 		// Per-user vault (PRD #32): unlock/lock/status for the password-wrapped
@@ -779,11 +831,14 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		})
 
 		// Current-user settings (non-secret, own-user only): the per-user default
-		// worker model (PRD #17). Session-authenticated, no admin path.
+		// worker model (PRD #17). Per-method auth so the READ is reachable by a CLI
+		// uzc_ token (RequireUser), mirroring GET /me/rate-limits (PRD #111 D23), so
+		// the CLI can read sidebar_token_ids et al; the PUT write path stays
+		// cookie-only (RequireAuth). No admin path either way. Kept as one Route so
+		// both verbs stay on the same `/me/settings/` pattern.
 		r.Route("/me/settings", func(r chi.Router) {
-			r.Use(mw.RequireAuth(h.q, h.cfg))
-			r.Get("/", h.GetMySettings)
-			r.Put("/", h.PutMySettings)
+			r.With(mw.RequireUser(h.q, h.cfg)).Get("/", h.GetMySettings)
+			r.With(mw.RequireAuth(h.q, h.cfg)).Put("/", h.PutMySettings)
 		})
 
 		// Current-user Slack linking (PRD #25 M3): the Notifications settings —
@@ -996,9 +1051,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			})
 		})
 
-		// Repos (PRD #64): GET / (uzi repo list) and POST /{id}/runs (uzi run create)
-		// are RequireUser; every other repo route is cookie-only. PATCH /{id} is the F1
-		// admin-write path (repo_skills_enabled / repo_devbox_opt_in via PatchRepo's
+		// Repos (PRD #64): GET / (uzi repo list), POST /{id}/runs (uzi run create) and
+		// POST /{id}/task-runs (uzi handoff) are RequireUser; every other repo route is
+		// cookie-only. PATCH /{id} is the F1 admin-write path (repo_skills_enabled /
+		// repo_devbox_opt_in via PatchRepo's
 		// IsAdmin branches), so it stays cookie-only — a Bearer credential 401s before
 		// those branches. Split WITHIN the sub-router (not two /repos mounts) so chi
 		// keeps one registration site per path+method.
@@ -1011,17 +1067,65 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// and falls back (silently) to a shared IP bucket if it runs before auth —
 				// so auth first, limiter second (B.4).
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/runs", h.CreateRun)
+				// Explicit per-repo remove (PRD #357). RequireUser (NOT the cookie-only
+				// RequireAuth group below) so the CLI's Bearer token is accepted — a
+				// cookie-only mount would 401 it (issue #428 regression). No forge limiter:
+				// the handler makes no forge call, like POST /{id}/schedules. Owner-scoped
+				// and guarded server-side (GetRepoForUser 404, enabled/active-run 409) inside
+				// the handler.
+				r.Delete("/{id}", h.DeleteRepo)
+				// Queue a task/handoff run (PRD #400): ephemeral, branch-scoped,
+				// issue-less. Same per-user forge budget as the other run creators.
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/task-runs", h.CreateTaskRun)
 				// Create a scheduled run on this repo (PRD #241 M4). Owner-scoped
 				// (GetRepoForUser inside the handler → 404 for a foreign repo). No forge
 				// limiter: create validates config and computes next_fire_at without a
 				// forge read (run-now, which does read the forge, carries the limiter).
 				r.Post("/{id}/schedules", h.CreateSchedule)
+				// GitHub Projects v2 sync READS + RESYNC for the CLI (PRD #576 M7):
+				// RequireUser (NOT the cookie-only RequireAuth group below) so the CLI's
+				// `uzc_` Bearer token is accepted — a cookie-only mount would 401 it
+				// (issue #428 regression). Both are owner-scoped and guarded server-side by
+				// the same GetRepoForUser preflight inside each handler (404 for a
+				// foreign/unknown repo); under the CLI token's IsAdmin=false ceiling they
+				// are correctly owner-only. No forge limiter: the status read hits only the
+				// stored projection, and resync re-seeds without charging the forge budget.
+				// The mutating link setup (Adopt/Provision/autocreate/disable) and the
+				// board-access controls stay on RequireAuth (cookie-only) below — web-only.
+				r.Get("/{id}/github-project-sync", h.GetGithubProjectSyncStatus)
+				r.Post("/{id}/github-project-sync/resync", h.ResyncGithubProjectSync)
 			})
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))
 				r.Put("/{id}", h.SetRepoEnabled)
 				// Repo-skills opt-in toggle (PRD #16): repo owner or admin.
 				r.Patch("/{id}", h.PatchRepo)
+				// GitHub Projects v2 sync, owner-or-admin (issue #534, PRD #364 follow-up):
+				// relocated out of /admin (D4). Owner path is guarded by a GetRepoForUser
+				// preflight inside each handler; admin skips it. Instance flag still gates.
+				// The status read and resync moved UP to the RequireUser group (PRD #576 M7)
+				// so the CLI's Bearer token reaches them; the mutating link setup below stays
+				// cookie-only (web-only — Adopt/Provision/autocreate/disable, D4).
+				// Owner-type read for the Adopt-first Provision nudge (PRD #576 M1):
+				// a live forge round-trip (repositoryOwner __typename), fetched for a
+				// not-yet-linked repo so it needs no link row. Web-only; the CLI does
+				// not use it.
+				r.Get("/{id}/github-project-sync/owner-type", h.GetGithubProjectOwnerType)
+				r.Post("/{id}/github-project-sync", h.AdoptGithubProjectSync)
+				r.Post("/{id}/github-project-sync/provision", h.ProvisionGithubProjectSync)
+				// Safe column auto-create (PRD #576 M6): create a fresh uzi-owned
+				// Status field with all the repo's columns and switch the link to it,
+				// turning skipped columns into synced ones with no destructive replace.
+				// Same owner-or-admin write group → noLimiter.
+				r.Post("/{id}/github-project-sync/autocreate-columns", h.AutoCreateGithubProjectColumns)
+				r.Delete("/{id}/github-project-sync", h.DisableGithubProjectSync)
+				// Board access controls (PRD #557): read/flip the board's visibility, and
+				// grant/revoke Reader access by username. Same owner-or-admin preflight +
+				// instance-flag gate as the routes above.
+				r.Get("/{id}/github-project-sync/visibility", h.GetGithubProjectVisibility)
+				r.Put("/{id}/github-project-sync/visibility", h.SetGithubProjectVisibility)
+				r.Post("/{id}/github-project-sync/collaborators", h.ShareGithubProjectSync)
+				r.Delete("/{id}/github-project-sync/collaborators", h.UnshareGithubProjectSync)
 				// Per-repo tool profile (PRD #18 M4): the owner's tier-1 package list.
 				// Owner-only (a repo belongs to one user's connection).
 				r.Get("/{id}/tool-profile", h.GetRepoToolProfile)
@@ -1103,11 +1207,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		})
 
 		// Runs (PRD #64): the core CLI loop is RequireUser — list/get/messages/inputs,
-		// and /{id}/review (Decision 21). POST /{id}/rejudge is the SOLE cookie-only
-		// route left in this group: it MINTS a token-spending judge run, excluded on the
-		// read-vs-spend line, NOT by inheritance. Do NOT wrap the whole /runs group in
-		// RequireUser — that shortcut passes the trio 404 and the admin checks while
-		// silently exposing rejudge; the inner split is the point.
+		// /{id}/review (Decision 21), and the forge FileIssue write (PRD #365 M1). The
+		// cookie-only routes left in this group are POST /{id}/rejudge and PUT
+		// /{id}/wait-on-limit: rejudge MINTS a token-spending judge run and wait-on-limit is
+		// a consent toggle, both excluded on the read/spend/consent line, NOT by inheritance.
+		// Do NOT wrap the whole /runs group in RequireUser — that shortcut passes the trio
+		// 404 and the admin checks while silently exposing those two; the inner split is the
+		// point.
 		r.Route("/runs", func(r chi.Router) {
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireUser(h.q, h.cfg))
@@ -1119,6 +1225,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// Accept-Encoding and transparently decompress, so no caller changes.
 				r.With(chimw.Compress(5)).Get("/{id}/messages", h.ListRunMessages)
 				r.Post("/{id}/inputs", h.CreateRunInput)
+				// Dispatch a task run (PRD #400 Decision 6): the CLI calls this after it
+				// pushes local HEAD to the run's uzi/task/<id> branch, which is what makes
+				// the run claimable. RequireUser + owner-scoped in the service, mirroring
+				// CreateRunInput's auth — no token spend, no forge write.
+				r.Post("/{id}/dispatch", h.DispatchTaskRun)
 				// Steer queue (PRD #95): the run's follow_up inputs with delivery status.
 				// Owner-only (GetRunByIDForUser) — a non-owner, incl. admin_ro, gets 404,
 				// closing a leak (follow-ups are never in run_messages). RequireUser so
@@ -1129,18 +1240,29 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// GetRunReviewPanel → GetRunForViewer-scoped, capped by the same
 				// RequireUser masking as GetRun.
 				r.Get("/{id}/review", h.GetRunReview)
+				// Task diff-review read (PRD #400 M4a): the handoff task's structured
+				// findings as JSON, for `uzi handoff review <id>`. Owner-or-admin, same
+				// GetRunForViewer scoping as the review read; no forge write, no token spend.
+				r.Get("/{id}/task-review", h.GetTaskReview)
 				// Issue-draft (PRD #68 M2): the templated, human-editable draft for
 				// filing a forge issue from one recommendation. A READ (owner-or-admin,
 				// same scoping as the review read); no forge write, no token spend. The
-				// file POST (M3) mounts separately on the cookie+CSRF RequireAuth path.
+				// file POST (PRD #68 M3; moved to RequireUser in PRD #365 M1) mounts just
+				// below in this same RequireUser group.
 				r.Get("/{id}/review/recommendations/{recID}/issue-draft", h.GetIssueDraft)
 				// Triage a recommendation (PRD #94 Decision 5): set/clear the caller's
 				// disposition. RequireUser (CLI-reachable, no token spend, no forge write) —
-				// NOT the cookie-only RequireAuth path rejudge/FileIssue sit on. OWNER-ONLY:
+				// NOT the cookie-only RequireAuth path rejudge/wait-on-limit sit on. OWNER-ONLY:
 				// the service resolves by strict caller-ownership, so a uza_ admin_ro token
 				// (which keeps IsAdmin) is refused on another user's review, like CreateRunInput.
 				r.Put("/{id}/review/recommendations/{recID}/disposition", h.SetDisposition)
 				r.Delete("/{id}/review/recommendations/{recID}/disposition", h.DeleteDisposition)
+				// File a forge issue from a recommendation (PRD #68 M3; PRD #365 M1): a forge
+				// WRITE, now RequireUser so `uzi review file` works from a uzc_ Bearer token
+				// (browser callers still carry a cookie with CSRF enforced via RequireUser's
+				// presence dispatch). Behind the per-user forge limiter; owner-or-admin to read
+				// the recommendation, caller-owns-repo to write, and reversible.
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/review/recommendations/{recID}/issue", h.FileIssue)
 				// Expedite / undo one queued run's manual priority override (PRD #320 D6/D7).
 				// RequireUser so the M5 `uzi run expedite` CLI verb (a CLI token) can reach it —
 				// NOT the cookie+CSRF RequireAuth group where wait-on-limit sits. Owner-scoped
@@ -1155,11 +1277,6 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// (service-enforced, audit H3); behind a DEDICATED per-user judge spend
 				// limiter (separate budget from chat).
 				r.With(judgeLimiter.PerUserMiddleware).Post("/{id}/rejudge", h.RerunJudge)
-				// File a forge issue from a recommendation (PRD #68 M3): a forge WRITE, so
-				// cookie+CSRF (this RequireAuth group) behind the per-user forge limiter,
-				// mirroring ConfirmProposal — not the RequireUser read group the draft GET
-				// sits in. Owner-or-admin to see the recommendation, caller-owns-repo to write.
-				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/review/recommendations/{recID}/issue", h.FileIssue)
 				// Per-run usage-limit opt-in (PRD #35 Decision 7, the surface the user chose
 				// over a start-run modal). Cookie-only, matching /me/wait-on-limit: the same
 				// consent, at a finer grain. Owner-scoped in SQL, spends nothing, mints
@@ -1324,6 +1441,12 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Get("/runs/{id}/trace", h.WorkerRunTrace)
 		r.Post("/runs/{id}/review", h.WorkerRunReview)
 
+		// Task diff-review (PRD #400 M4a): a review run (a task carrying
+		// review_target_run_id) posts its structured findings for the reviewed task.
+		// Review-run-scoped (the worker must own the active review run reviewing {id});
+		// {id} is the TARGET run, not the review run.
+		r.Post("/runs/{id}/task-review", h.WorkerTaskReview)
+
 		// Chat-agent read surface (PRD #39 M3, Decision 7): the chat agent
 		// investigates its OWNER'S runs. Every query is scoped to the worker's
 		// user_id (a foreign run id is 404), never a bare run_id lookup.
@@ -1340,6 +1463,13 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// reuses the per-worker proposal limiter to bound mass-creation; the per-run
 		// MaxFindingsPerRun cap is the other half.
 		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/findings", h.WorkerCreateFinding)
+		// Plain-English run summaries (PRD #362 M1): the run-lane executor posts the
+		// intent summary (idempotent-on-set) and the plan summary + deltas (stale-write
+		// guarded) back to the api, which persists them and emits a live-update WS frame.
+		// Both are worker→api writes scoped to the worker's own run; advisory, never a
+		// control (the generator is tool-less, the text renders inert).
+		r.Post("/runs/{id}/summary/intent", h.WorkerSetIntentSummary)
+		r.Post("/runs/{id}/summary/plan", h.WorkerSetPlanSummary)
 	})
 }
 
@@ -1361,5 +1491,11 @@ func (h *Handler) mountControllerRoutes(r chi.Router) {
 		r.Get("/poll", h.ControllerPoll)
 		// Roll-health report (PRD #113 M4). Display-only; see ControllerStatus.
 		r.Post("/status", h.ControllerStatus)
+		// Cordon control-write (PRD #422 M4). Marks a hosted worker draining so it
+		// drains before rolling; distinct from the display-only status report.
+		r.Post("/workers/{workerID}/drain", h.ControllerCordonWorker)
+		// Uncordon control-write (issue #458). Clears draining_since when drift was
+		// reverted so the worker resumes claiming; same path, different method.
+		r.Delete("/workers/{workerID}/drain", h.ControllerUncordonWorker)
 	})
 }

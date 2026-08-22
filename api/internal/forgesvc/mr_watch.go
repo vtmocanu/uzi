@@ -42,6 +42,13 @@ func (s *Service) SyncMRStates(ctx context.Context, repoID uuid.UUID, forgeProje
 
 // syncOneMRState reconciles one candidate's MR state against the stored value.
 //
+// As of #527 the candidate set (Lane B of ListMRWatchCandidates) also includes
+// CLOSED-issue runs, so a merged/closed terminal state can be recorded after the
+// merge closed the issue. These are handled move-free by the paths already here:
+// the NULL bootstrap records without moving, the merged/locked `default` arm
+// records without moving, and guardedMRMove skips a closed issue — no behavioral
+// or signature change is needed for the new lane.
+//
 // State-persistence contract (PRD #24 TD §3, review finding 4): mr_state advances
 // only on (a) a successful move, (b) a deliberate guard-skip (manual drag / closed
 // issue — the edge is consumed, we never re-fight a human), or (c) a no-op

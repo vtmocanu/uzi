@@ -3,6 +3,7 @@ import { RequestError } from "./client.js";
 import type { RunRunner } from "./runner.js";
 import type { ChatRunner } from "./chat-runner.js";
 import type { JudgeRunner } from "./judge-runner.js";
+import type { ReviewRunner } from "./review-runner.js";
 import type { Logger } from "./log.js";
 import type { Config } from "./config.js";
 import type { WorkerStats } from "./protocol.js";
@@ -30,6 +31,7 @@ export class Worker {
     private readonly runner: RunRunner,
     private readonly chatRunner: ChatRunner,
     private readonly judgeRunner: JudgeRunner,
+    private readonly reviewRunner: ReviewRunner,
     private readonly log: Logger,
     // PRD #92 M3: the boot toolchain preflight, injectable so the concurrency/semaphore
     // unit tests (which run on a non-image host with no `/opt/uzi-toolchain`) can pass a
@@ -174,11 +176,18 @@ export class Worker {
         const claim = await this.client.claimRun();
         if (claim) {
           claimed = true;
-          // PRD #46: a judge claim rides the same run lane (it counts toward worker
-          // capacity, Decision 8) but is executed by the slim JudgeRunner — no
-          // clone/worktree/git, just fetch the trace, call the model, post the review.
-          const exec =
-            claim.kind === "judge" ? this.judgeRunner.execute(claim) : this.runner.execute(claim);
+          // PRD #400 M4b: a DIFF-REVIEW claim is a `task`-kind claim carrying a non-null
+          // review_target_run_id — routed to the slim ReviewRunner (clone + diff + reviewer
+          // model, report-only) FIRST, before the kind switch, since it is a task by kind
+          // but must NOT run the normal task executor. PRD #46: a judge claim rides the same
+          // run lane (it counts toward worker capacity, Decision 8) but is executed by the
+          // slim JudgeRunner — no clone/worktree/git, just fetch the trace, call the model,
+          // post the review.
+          const exec = claim.review_target_run_id
+            ? this.reviewRunner.execute(claim)
+            : claim.kind === "judge"
+              ? this.judgeRunner.execute(claim)
+              : this.runner.execute(claim);
           const run = exec.catch((err) =>
             this.log.warn("claim/execute cycle failed", { error: errMessage(err) }),
           );

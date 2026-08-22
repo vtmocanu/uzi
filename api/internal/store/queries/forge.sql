@@ -86,10 +86,30 @@ ORDER BY r.path_with_namespace ASC;
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled,
        r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at,
-       c.forge_type, c.base_url, c.token_ciphertext, c.user_id
+       c.forge_type, c.base_url, c.token_ciphertext, c.user_id, c.bot_forge_user_id
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE r.id = $1 AND c.user_id = $2;
+
+-- name: GetRepoByID :one
+-- One repo plus the connection fields needed to build a forge client, UNSCOPED by
+-- user. Modeled on GetRepoForUser but WITHOUT the user_id filter. The GitHub
+-- Projects v2 sync (PRD #364 M3) that drives it is an OWNER-OR-ADMIN route as of
+-- issue #534 (relocated out of /admin): a non-admin caller is authorized by the
+-- handler's own GetRepoForUser preflight BEFORE this query runs, while an admin
+-- skips that preflight and targets a repo by id regardless of which user owns its
+-- connection. So the ownership guard for this unscoped query lives in the HANDLER
+-- (the preflight), not in the route being admin-only — do not add a caller that
+-- reaches this query without an equivalent ownership check (precedent:
+-- SetRepoGuardrailOverride is the unscoped admin write). Returns the joined
+-- connection fields the forge builder needs (forge_type, base_url, token_ciphertext)
+-- plus forge_project_id for slug/issue resolution.
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
+       r.default_branch, r.enabled,
+       c.forge_type, c.base_url, c.token_ciphertext, c.user_id
+FROM repos r
+JOIN forge_connections c ON c.id = r.connection_id
+WHERE r.id = $1;
 
 -- name: SetRepoGuardrailOverride :one
 -- PRD #66 M8 (D8): set the admin per-repo guardrail override. ADMIN-ONLY and
@@ -151,6 +171,27 @@ WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
 RETURNING *;
 
+-- name: DeleteRepoForUser :execrows
+-- Owner-scoped hard delete of a single repo (PRD #357). The `AND enabled = false`
+-- is the atomic race guard (D6): a concurrent enable between the handler's fetch
+-- and this delete must not let a tracked repo through. Cascades derived data
+-- (runs, cached issues, board columns, ...) via existing FKs.
+DELETE FROM repos
+WHERE repos.id = $1
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $2)
+  AND repos.enabled = false;
+
+-- name: CountActiveRunsForRepo :one
+-- Non-terminal run count for a repo (PRD #357 D7). "Disabled" is not "quiescent":
+-- disabling only drops the repo from the poll set, it does not cancel an in-flight
+-- run. Removal is refused while any run is in a non-terminal state. Uses the
+-- terminal complement (like CountActiveRunsWithBranch, ci_fix.sql) so it covers
+-- limit_wait (a parked run is still in flight, PRD #35) and any future non-terminal
+-- status without an edit here.
+SELECT count(*) FROM runs
+WHERE repo_id = @repo_id::uuid
+  AND status NOT IN ('completed', 'failed', 'cancelled');
+
 -- name: SetRepoDevboxOptInForUser :one
 -- Tier-2 repo devbox.json opt-in toggle (PRD #18 M5), authorized through the
 -- repo's owning connection. A non-owned or unknown id returns no rows (404).
@@ -163,6 +204,22 @@ RETURNING *;
 -- Admin path for the tier-2 opt-in toggle: not scoped to the owning user; gated on
 -- the caller being an admin in the handler.
 UPDATE repos SET repo_devbox_opt_in = $2 WHERE repos.id = $1 RETURNING *;
+
+-- name: SetRepoRequiredCapabilitiesForUser :one
+-- Static per-repo capability hint (PRD #84 M2), authorized through the repo's owning
+-- connection. A non-owned or unknown id returns no rows (404). The incoming list is
+-- Filter-ed against the server-owned vocabulary in the handler BEFORE it reaches here,
+-- so an unknown/spoofed name is dropped and never persisted.
+UPDATE repos SET required_capabilities = $2
+WHERE repos.id = $1
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
+RETURNING *;
+
+-- name: SetRepoRequiredCapabilities :one
+-- Admin path for the static per-repo capability hint (PRD #84 M2): not scoped to the
+-- owning user; gated on the caller being an admin in the handler. The list is
+-- Filter-ed against the vocabulary in the handler before it reaches here.
+UPDATE repos SET required_capabilities = $2 WHERE repos.id = $1 RETURNING *;
 
 -- name: SetRepoTrustFlags :one
 -- Atomic Trusted-repo (PRD #246) toggle: sets repo_skills_enabled and/or
@@ -408,16 +465,26 @@ LIMIT 1;
 -- suppressed), and a completed latest run whose own mr_iid is NULL yields none
 -- either (never fall back to an older run's MR).
 --
--- The issue must be open, and a COARSE column prefilter keeps the polled set
--- tiny: the card is either labelled Human Review (the close-edge watch) or the
--- run already recorded mr_state='closed' (the reopen-edge watch, Decision 10).
--- This prefilter is deliberately NOT board.ResolveColumn — highest-position-wins
--- across multiple column labels is not cheaply expressible in SQL, so the
--- authoritative source-column guard is the Go ResolveColumn check in the watcher;
--- this only bounds how many MRs get polled.
+-- The candidate set now spans TWO lanes. Lane A (UNCHANGED, PRD #24) is the
+-- open-issue board-move watch: the issue is open and a COARSE column prefilter
+-- keeps the polled set tiny — the card is either labelled Human Review (the
+-- close-edge watch) or the run already recorded mr_state='closed' (the
+-- reopen-edge watch, Decision 10). This prefilter is deliberately NOT
+-- board.ResolveColumn — highest-position-wins across multiple column labels is
+-- not cheaply expressible in SQL, so the authoritative source-column guard is the
+-- Go ResolveColumn check in the watcher; this only bounds how many MRs get polled.
+--
+-- Lane B (NEW, #527) is the closed-issue terminal-recording lane. A merge CLOSES
+-- the issue (via `Closes #N`) before SyncMRStates runs, so a merged state is only
+-- observable once i.state='closed' — Lane A would never see it. Lane B keeps
+-- polling a closed issue's latest run until its mr_state reaches a terminal value
+-- (merged/closed), recording that state; it moves NO card (bootstrap and the
+-- merged/locked transition are move-free, and the edge paths skip a closed issue),
+-- so it only backfills historical merged PRs and decays as each run settles to a
+-- terminal state. The Go ResolveColumn check remains authoritative for board moves.
 WITH latest AS (
     SELECT DISTINCT ON (r.issue_iid)
-           r.id, r.issue_iid, r.status, r.mr_iid, r.mr_state
+           r.id, r.issue_iid, r.status, r.mr_iid, r.mr_state, r.created_at
     FROM runs r
     WHERE r.repo_id = @repo_id
     ORDER BY r.issue_iid, r.created_at DESC
@@ -427,8 +494,29 @@ FROM latest l
 JOIN issues i ON i.repo_id = @repo_id AND i.forge_issue_iid = l.issue_iid
 WHERE l.status = 'completed'
   AND l.mr_iid IS NOT NULL
-  AND i.state = 'opened'
-  AND (jsonb_exists(i.labels, 'Human Review') OR l.mr_state = 'closed');
+  AND (
+    -- Lane A (UNCHANGED): open-issue board-move watch — card in Human Review
+    -- (close-edge) or run already recorded closed (reopen-edge, Decision 10).
+    (i.state = 'opened' AND (jsonb_exists(i.labels, 'Human Review') OR l.mr_state = 'closed'))
+    OR
+    -- Lane B (NEW, #527): closed-issue terminal-state recording. A merge CLOSES the
+    -- issue (Closes #N) before SyncMRStates runs, so the merged state is only
+    -- observable after i.state='closed'. Keep polling until mr_state is terminal
+    -- (merged/closed). Move-free by construction: bootstrap and the merged/locked
+    -- transition never move a card, and the edge paths skip a closed issue
+    -- (mr_watch.go syncOneMRState / guardedMRMove). `locked` is a transient
+    -- mid-merge state, kept polling so it settles to merged (Decision D5).
+    (i.state = 'closed' AND (l.mr_state IS NULL OR l.mr_state IN ('opened', 'locked')))
+  )
+-- Open-issue (Lane A) candidates first so the board-move watch is never deferred
+-- behind a closed-issue backfill burst; then newest runs first so recent merges
+-- record before old ones. Qualify l.created_at (not bare) — `issues` has none.
+-- LIMIT 100 is a hardcoded burst bound (Decision D4): not a sqlc param, so zero Go
+-- signature change; 100 comfortably exceeds any realistic Lane-A count. Keep this
+-- rationale ABOVE the statement — a comment trailing after the `;` is grabbed by
+-- sqlc as the leading doc of the NEXT query.
+ORDER BY (i.state = 'opened') DESC, l.created_at DESC
+LIMIT 100;
 
 -- name: GetIssueByIID :one
 SELECT * FROM issues WHERE repo_id = $1 AND forge_issue_iid = $2;
@@ -486,9 +574,11 @@ WHERE repo_id = $1 AND forge_issue_iid <> ALL(@keep_iids::bigint[]);
 --     whole point: a merge CLOSES the issue via the `Closes #N` in the MR
 --     description, and the poller runs the issue sync BEFORE SyncMRStates, so by the
 --     time a merge is observable the issue is already state='closed'.
---     ListMRWatchCandidates requires i.state = 'opened' and would therefore miss
---     this deterministically — which is why PRD #24's prefilter is not reused here
---     and must not be widened to cover it.
+--     ListMRWatchCandidates now has a closed-issue lane too (#527), BUT that lane
+--     only RECORDS mr_state — it performs no forge description write and no
+--     PRD-link patch — so ListPRDLinkPatchCandidates remains a SEPARATE query: it
+--     does a forge description WRITE with its own superseded-run and edge scoping
+--     (Decision 10), which #527's record-only lane does not and cannot supply.
 --
 -- issue_description is the run's QUEUE-TIME snapshot, pulled in the candidate scan
 -- rather than by a second read per candidate. It is what binds the patch target:

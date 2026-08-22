@@ -25,6 +25,7 @@ import {
   canOpenRunView,
   hasActiveRun,
   isAwaitingApproval,
+  isAwaitingFollowup,
   isAwaitingInput,
   needsHumanAttention,
   retryHint,
@@ -46,19 +47,23 @@ import {
   visibleCards,
 } from "../lib/boardCards";
 import {
+  DEFAULT_SORT_DIR,
   dropIntent,
   insertionEdgeFor,
+  isSortDir,
   isSortMode,
   neighbourAnchor,
   sortCards,
   SORT_MODES,
   type DropAnchor,
+  type SortDir,
   type SortMode,
 } from "../lib/boardOrder";
 import { prefs } from "../lib/prefs";
 import { Alert, Badge, Button, Card, cx, Field, Input, PageHeader, SectionTitle, Select, Skeleton, Textarea } from "../components/ui";
 import { FixCiButton, PipelineBadge } from "../components/PipelineBadge";
 import { MrChip } from "../components/MrChip";
+import { RunIssueRef } from "../components/RunIssueRef";
 import { forgePlatform } from "../lib/forgeNoun";
 import { ExternalLinkIcon, GripVerticalIcon, PlusIcon, XIcon } from "../components/icons";
 import { useAuth } from "../auth/AuthContext";
@@ -237,10 +242,49 @@ export function Board() {
     const v = prefs.get<string>(`uzi.board.${repoId}.sortMode`, "manual");
     setSortModeState(isSortMode(v) ? v : "manual");
   }, [repoId]);
+
+  // sortDir mirrors sortMode: a per-browser, per-repo view preference (Decision 3).
+  // Read through isSortDir so a stale or hand-edited localStorage value degrades to the
+  // mode's natural default instead of an invalid direction. The useEffect re-read is
+  // load-bearing for the same reason sortMode's is: the route swaps :id without
+  // remounting, so a lazy useState initialiser only ever runs for the first repo, and
+  // omitting the re-read would keep the previous repo's direction after a route swap.
+  const sortDirKey = `uzi.board.${repoId}.sortDir`;
+  const [sortDir, setSortDirState] = useState<SortDir>(() => {
+    const v = prefs.get<string>(sortDirKey, DEFAULT_SORT_DIR[sortMode]);
+    return isSortDir(v) ? v : DEFAULT_SORT_DIR[sortMode];
+  });
+  useEffect(() => {
+    // Read the persisted MODE from storage rather than closing over the sortMode state:
+    // on a route swap both [repoId] effects run in one commit pass and setSortModeState
+    // has not flushed yet, so the closed-over sortMode is the PREVIOUS repo's. Reading
+    // storage makes the DEFAULT_SORT_DIR fallback match the repo we are switching TO,
+    // which matters only for a pre-#412 prefs state (a persisted non-manual mode with no
+    // persisted sortDir); after #412 setSortMode/setSortDir always persist dir alongside.
+    const persistedMode = prefs.get<string>(`uzi.board.${repoId}.sortMode`, "manual");
+    const modeDefault = DEFAULT_SORT_DIR[isSortMode(persistedMode) ? persistedMode : "manual"];
+    const v = prefs.get<string>(`uzi.board.${repoId}.sortDir`, modeDefault);
+    setSortDirState(isSortDir(v) ? v : modeDefault);
+  }, [repoId]);
+  const setSortDir = useCallback(
+    (next: SortDir) => {
+      setSortDirState(next);
+      prefs.set(`uzi.board.${repoId}.sortDir`, next);
+    },
+    [repoId],
+  );
+
+  // Switching mode resets direction to that mode's natural default (Decision 4): a user
+  // picking Title expects A->Z, not a leftover direction from the previous mode; the
+  // toggle is then their explicit opt-out. Because applyDrop calls setSortMode("manual"),
+  // a drop resets direction too, which is harmless — manual ignores direction.
   const setSortMode = useCallback(
     (next: SortMode) => {
       setSortModeState(next);
       prefs.set(`uzi.board.${repoId}.sortMode`, next);
+      const nextDir = DEFAULT_SORT_DIR[next];
+      setSortDirState(nextDir);
+      prefs.set(`uzi.board.${repoId}.sortDir`, nextDir);
     },
     [repoId],
   );
@@ -356,6 +400,12 @@ export function Board() {
   // looking for a plan gate that is not there. Same visual treatment, different words —
   // which is the whole reason awaiting_input is its own status.
   const [questionRuns, setQuestionRuns] = useState<RunListItem[]>([]);
+  // PRD #517: the viewer's runs on this repo parked awaiting their next follow-up
+  // (awaiting_followup). Its OWN bucket, a sibling to questionRuns rather than folded into
+  // it: a follow-up park is not an unanswered question, so the strip names a distinct
+  // action ("awaiting follow-up"). Same needs-you classification and loud ring as the two
+  // parks above (needsHumanAttention), so it belongs in the "how many need me" tally.
+  const [followupRuns, setFollowupRuns] = useState<RunListItem[]>([]);
   // The viewer's runs on this repo the health detector flagged as looking stuck
   // (PRD #47): any non-ok flag on a run the two buckets above do not already carry.
   // Issue runs only (a ci_fix run has no board card to link to).
@@ -471,13 +521,19 @@ export function Board() {
       setHasToken(hasAnthropicToken(secrets));
       setAwaitingRuns(runs.filter((r) => isAwaitingApproval(r.status)));
       setQuestionRuns(runs.filter((r) => isAwaitingInput(r.status)));
+      setFollowupRuns(runs.filter((r) => isAwaitingFollowup(r.status)));
       setStuckRuns(
         runs.filter(
           (r) =>
             r.health !== "ok" &&
-            // Whatever the two buckets above already show, this one must not repeat.
+            // Whatever the three buckets above already show, this one must not repeat.
             !isAwaitingApproval(r.status) &&
             !isAwaitingInput(r.status) &&
+            // PRD #517: awaiting_followup has its OWN followupRuns bucket now, so exclude it
+            // here — otherwise a stale health flag on a parked run would both count in that
+            // bucket AND read "looks stuck", and the strip below spreads every bucket into
+            // one .map keyed on r.id, so a run in two buckets is a duplicate React key.
+            !isAwaitingFollowup(r.status) &&
             // Belt-and-braces for a STALE flag: the server's exit contract clears
             // health on every status transition, so an approval_idle on some other
             // status should not exist — but if one ever did, "looks stuck" would be
@@ -857,27 +913,31 @@ export function Board() {
 
   const cardsByColumn = useMemo(() => {
     const map = new Map<string, CardData[]>();
-    for (const c of sortCards(searchedCards, sortMode)) {
+    for (const c of sortCards(searchedCards, sortMode, sortDir)) {
       const key = columnKeyForCard(c);
       const arr = map.get(key) ?? [];
       arr.push(c);
       map.set(key, arr);
     }
-    // S4. THE CLOSED LANE IS ALWAYS iid ORDER, never the board's mode. Closed cards are
-    // excluded from the freeze by design (Decision 7b) and keep a NULL position, so the
-    // FIRST drop from any non-iid mode silently re-sorts the Closed lane underneath the
-    // user: the payload comes back ordered by the SQL fallback and the lane jumps.
+    // S4. THE CLOSED LANE NOW HONOURS mode+direction like every other lane (#412).
+    // Previously an INTENTIONAL pin here re-sorted Closed to iid order in ALL modes:
+    //   const closed = map.get(CLOSED_KEY);
+    //   if (closed) map.set(CLOSED_KEY, [...closed].sort((a, b) => a.iid - b.iid));
+    // #412 removed that pin so Closed flows through the same sortCards() bucketing as
+    // every other lane. In `manual` mode sortCards is identity, so Closed still renders
+    // issue-number ascending exactly as before — only the non-manual modes now reach it.
     //
-    // The browser pass showed it happening on a gesture that moved NOTHING — a card
-    // dropped back on itself, which is the natural "changed my mind" recovery — and the
-    // Closed lane still went 18 15 -> 15 18. A lane that reshuffles when the user
-    // deliberately cancelled is worse than one that ignores the sort control, and Closed
-    // is the one lane where the modes are least useful anyway (nothing there is running,
-    // and its cards are not draggable).
-    const closed = map.get(CLOSED_KEY);
-    if (closed) map.set(CLOSED_KEY, [...closed].sort((a, b) => a.iid - b.iid));
+    // ACCEPTED, KNOWN cost of removing the pin: a drop calls setSortMode("manual"), and
+    // because the drop-freeze excludes closed cards (Decision 7b), a drop taken from a
+    // non-manual mode leaves the OPEN lanes holding their just-frozen (unchanged) order
+    // while the CLOSED lane alone reverts from mode-order to iid-order — the exact
+    // isolated reshuffle the old pin used to hide. This is accepted because it fires only
+    // on an actual drop, manual-mode iid IS the correct Closed identity ordering, and the
+    // alternative (a permanent iid pin) is precisely the cross-lane inconsistency #412
+    // removes. An M3 test asserts this post-drop Closed state — DO NOT re-add the pin to
+    // "fix" it, as that silently reverts the feature.
     return map;
-  }, [searchedCards, sortMode]);
+  }, [searchedCards, sortMode, sortDir]);
 
   // applyDrop is THE single order-computing path. A pointer drop and a keyboard ↑/↓
   // both land here with the same three arguments, so the two gestures cannot drift:
@@ -929,6 +989,7 @@ export function Board() {
         payloadCards, // UNFILTERED — the payload-set rule (Decision 7b)
         columnKeys,
         sortMode,
+        sortDir,
         dragIid,
         destColumnKey: destKey,
         anchor,
@@ -966,7 +1027,7 @@ export function Board() {
     // move/setBoard/setError are stable enough for this callback's purpose; the state
     // it genuinely depends on is listed.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [payloadCards, columnKeys, sortMode, repoId, setSortMode],
+    [payloadCards, columnKeys, sortMode, sortDir, repoId, setSortMode],
   );
 
   // moveCard is the keyboard path (PRD #102 M5, lead ruling 1). It builds the anchor a
@@ -1100,6 +1161,24 @@ export function Board() {
                 ))}
               </Select>
             </label>
+            {/* Direction toggle (Decision 6). DISABLED (not hidden) in manual mode so the
+                toolbar layout stays stable and the control remains discoverable; manual
+                ignores direction. Carries an accessible name and aria-pressed for the
+                reversed state, plus a visible arrow and text label. When disabled in
+                manual mode aria-pressed is omitted, so the inert control does not advertise
+                a stale pressed state to a screen reader. */}
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              className="py-1 text-xs"
+              disabled={sortMode === "manual"}
+              aria-pressed={sortMode === "manual" ? undefined : sortDir === "desc"}
+              aria-label={`Sort direction: ${sortDir === "asc" ? "ascending" : "descending"}`}
+              onClick={() => setSortDir(sortDir === "asc" ? "desc" : "asc")}
+            >
+              {sortDir === "asc" ? "↑ Ascending" : "↓ Descending"}
+            </Button>
             {/* Per-lane density (PRD #304 M4), mirroring the Sort control's markup.
                 Changing it re-baselines every lane's shownCount (the effect on
                 [searchActive, perLane, repoId]). */}
@@ -1192,7 +1271,10 @@ export function Board() {
 
       {error && <Alert message={error} />}
 
-      {(awaitingRuns.length > 0 || questionRuns.length > 0 || stuckRuns.length > 0) && (
+      {(awaitingRuns.length > 0 ||
+        questionRuns.length > 0 ||
+        followupRuns.length > 0 ||
+        stuckRuns.length > 0) && (
         <div
           role="status"
           aria-live="polite"
@@ -1205,20 +1287,49 @@ export function Board() {
               // PRD #88: its own clause, so the strip says which action is owed.
               questionRuns.length > 0 &&
                 `${questionRuns.length} run${questionRuns.length > 1 ? "s" : ""} ${questionRuns.length > 1 ? "need" : "needs"} an answer`,
+              // PRD #517: its own clause too — a follow-up park owes a different action than
+              // an unanswered question, so it names "awaiting follow-up" rather than folding
+              // into the answer count.
+              followupRuns.length > 0 &&
+                `${followupRuns.length} run${followupRuns.length > 1 ? "s" : ""} awaiting follow-up`,
               stuckRuns.length > 0 &&
                 `${stuckRuns.length} run${stuckRuns.length > 1 ? "s" : ""} ${stuckRuns.length > 1 ? "look" : "looks"} stuck`,
             ]
               .filter(Boolean)
               .join(" · ")}
           </span>
-          {[...awaitingRuns, ...questionRuns, ...stuckRuns].map((r) => (
-            <Link
+          {[...awaitingRuns, ...questionRuns, ...followupRuns, ...stuckRuns].map((r) => (
+            // Issue #485 NB1: the forge issue anchor rendered by RunIssueRef is a real
+            // <a>, so it can no longer nest inside the navigational <Link> (also an <a> —
+            // invalid HTML). The pill span is a `relative` container; the run-details
+            // <Link> is a stretched absolute overlay, and the interactive ref is raised
+            // above it (relative z-10). The pill's hover-bg lives on the container, so
+            // hovering the transparent overlay (a descendant) still tints it.
+            <span
               key={r.id}
-              to={`/runs/${r.id}`}
-              className="rounded-md border border-warn/40 px-1.5 py-0.5 text-warn transition-colors hover:bg-warn/20"
+              className="relative inline-flex items-center gap-1 rounded-md border border-warn/40 px-1.5 py-0.5 text-warn transition-colors hover:bg-warn/20"
             >
-              #{r.issue_iid} →
-            </Link>
+              <Link
+                to={`/runs/${r.id}`}
+                // Issue #485 review FIX 2: name the link by the run's title so several
+                // issue-less runs in the strip get distinct, meaningful accessible names
+                // instead of a repeated bare "Open run". issue_title is untrusted forge
+                // text, so it stays sanitized via stripUnsafeChars.
+                aria-label={`Open run${r.issue_iid != null ? ` for issue #${r.issue_iid}` : ""}${
+                  r.issue_title.trim() ? `: ${stripUnsafeChars(r.issue_title)}` : ""
+                }`}
+                className="absolute inset-0 rounded-md"
+              />
+              <RunIssueRef
+                issueIid={r.issue_iid}
+                issueWebUrl={r.issue_web_url}
+                kind={r.kind}
+                forgeType={r.forge_type}
+                raised
+                tone="inherit"
+              />{" "}
+              →
+            </span>
           ))}
         </div>
       )}
@@ -1247,6 +1358,10 @@ export function Board() {
         />
       )}
 
+      {/* Issue #367 → #373: columns scroll HORIZONTALLY in one row (overflow-x-auto)
+          again; the page still scrolls vertically for tall columns. Reverts the
+          flex-wrap of Decision 2 (Option A), which stacked columns onto new rows when
+          they exceeded the width and killed horizontal card scroll. */}
       <div className="flex items-start gap-4 overflow-x-auto pb-4">
         {visible.map((col) => {
           const cards = cardsByColumn.get(col.key) ?? [];
@@ -1287,6 +1402,8 @@ export function Board() {
                 if (iid) applyDrop(iid, col.key, null);
               }}
               className={cx(
+                // Fixed-width, non-shrinking columns in one row; the row's overflow-x-auto
+                // gives back horizontal card scroll (#373, reverting Decision 2's grow-wrap).
                 "flex w-72 shrink-0 flex-col rounded-xl border p-2.5 transition-colors",
                 dragRevealed && "opacity-60",
                 isTarget
@@ -1296,6 +1413,10 @@ export function Board() {
                     : "border-edge bg-surface/60",
               )}
             >
+              {/* Static header (#373): sticky pinning is incompatible with the row's
+                  overflow-x-auto (a non-visible overflow-x forces overflow-y:auto, which
+                  makes the row — not the viewport — the sticky scroll context). We chose
+                  horizontal card scroll over pinned headers, so the header is plain again. */}
               <div className="mb-2.5 flex items-center gap-2 px-1">
                 <span aria-hidden="true" className={cx("h-2 w-2 rounded-full", col.accent)} />
                 <span className={cx("text-sm font-semibold", closedCol ? "text-faint" : "text-fg")}>
@@ -1307,10 +1428,12 @@ export function Board() {
                   {paging.countLabel || String(cards.length)}
                 </span>
               </div>
-              {/* When expanded past its baseline the lane scrolls INTERNALLY within a
-                  bounded height, so clicking Show more on a huge lane cannot grow the
-                  page to hundreds of rows tall (Decision 3). */}
-              <div className={cx("flex flex-col gap-2", paging.canCollapse && "max-h-[70vh] overflow-y-auto")}>
+              {/* Issue #367 (Decision 1): the per-lane max-h/overflow box is gone —
+                  the lane grows to fit its cards and the page scrolls as one plane, so
+                  an expanded lane ("Show N more") grows the page rather than opening an
+                  inner scrollbar. `paging.canCollapse` still drives the Show-more/Collapse
+                  controls; it just no longer gates a scroll box. */}
+              <div className="flex flex-col gap-2">
                 {shown.map((card, i) => {
                   // The extras this card carries are the "why this card is here"
                   // chips (PRD #196): hoisted ahead of MAX_CARD_CHIPS (Decision 11) so
@@ -1784,7 +1907,11 @@ export function IssueCard({
         <Link
           to={`/repos/${repoId}/issues/${card.iid}`}
           draggable={false}
-          className="font-medium leading-snug text-fg hover:text-brand-hover"
+          // min-w-0 break-words (issue #562): a title with a long unbreakable token
+          // (e.g. CLAUDE_CODE_ENABLE_TODO_TOOLS=1) must wrap within the fixed w-72
+          // lane. break-words lets the token wrap; min-w-0 overrides the flex child's
+          // default min-width:auto so it can shrink below the token's intrinsic width.
+          className="min-w-0 break-words font-medium leading-snug text-fg hover:text-brand-hover"
         >
           {/* Issue #124: the forge issue title, writable by anyone who can open an issue
               on the repo. Display only — the link targets card.iid, not this string.
@@ -2130,8 +2257,8 @@ function IssuesFilter({
 }: {
   open: boolean;
   onToggleOpen: () => void;
-  popRef: React.RefObject<HTMLDivElement>;
-  triggerRef: React.RefObject<HTMLButtonElement>;
+  popRef: React.RefObject<HTMLDivElement | null>;
+  triggerRef: React.RefObject<HTMLButtonElement | null>;
   prdLabel: string;
   membershipLabels: string[];
   defaultExtras: string[];

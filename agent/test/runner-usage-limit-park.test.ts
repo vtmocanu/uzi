@@ -11,6 +11,7 @@ import { Worker } from "../src/worker.js";
 import type { Config } from "../src/config.js";
 import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
+import type { ReviewRunner } from "../src/review-runner.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { LimitReachedError } from "../src/limit.js";
 import { nullLogger } from "./helpers.js";
@@ -109,7 +110,8 @@ function buildWorker(runner: RunRunner): Worker {
   } as unknown as Config;
   const noChat = { execute: async () => {} } as unknown as ChatRunner;
   const noJudge = { execute: async () => {} } as unknown as JudgeRunner;
-  return new Worker(config, client, runner, noChat, noJudge, nullLogger(), () => ({
+  const noReview = { execute: async () => {} } as unknown as ReviewRunner;
+  return new Worker(config, client, runner, noChat, noJudge, noReview, nullLogger(), () => ({
     ok: true,
     missing: [],
   }));
@@ -574,6 +576,43 @@ describe("RunRunner — durable park (PRD #218 M1/M2/M3)", () => {
         seen[0]?.priorWork,
         undefined,
         "nothing recovered ⇒ no prior-work note",
+      );
+      // issue #222: this is the measured harmful case — a resume (session id present) whose
+      // reseed fell to the default branch, so priorWork is empty and the feed status is the
+      // ONLY reseed signal. The runner must ALSO set ctx.resumed so the reseed warning can
+      // ride the implement prompt, the one thing the lead reads.
+      assert.strictEqual(
+        seen[0]?.resumed,
+        true,
+        "a resume claim (session id present) is flagged so the reseed warning renders",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("issue #222: a FRESH claim (no session id) is not flagged resumed — no prior tree was lost", async () => {
+    // A run that never executed before had no working tree to destroy, so the reseed warning
+    // must NOT fire. The discriminator is the raw claim session id.
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-222-fresh-"));
+    try {
+      const iid = 222;
+      const seen: RunContext[] = [];
+      const factory: ExecutorFactory = (runId) => ({
+        homeDir: path.join(homeRoot, runId),
+        executor: {
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            seen.push(ctx);
+            return { branch: ctx.branch };
+          },
+        },
+      });
+      // No session_id ⇒ a fresh run.
+      await runnerWith(factory, gitlab).execute(gitlabClaim(iid, {}));
+      assert.ok(
+        seen[0]?.resumed !== true,
+        `a fresh claim must not be flagged resumed, got ${String(seen[0]?.resumed)}`,
       );
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });

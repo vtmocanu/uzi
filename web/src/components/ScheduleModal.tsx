@@ -480,7 +480,7 @@ export function ScheduleModal({
     <div
       ref={dialogRef}
       tabIndex={-1}
-      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 p-4 outline-none sm:items-center"
+      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 p-4 outline-hidden sm:items-center"
       role="dialog"
       aria-modal="true"
       aria-label={isEdit ? "Edit schedule" : "New schedule"}
@@ -598,7 +598,7 @@ export function ScheduleModal({
                   }}
                   onBlur={addLabel}
                   placeholder="add label…"
-                  className="min-w-[120px] flex-1 rounded-md border border-edge bg-raised px-2 py-1 text-xs text-fg placeholder:text-faint outline-none focus:border-brand/70"
+                  className="min-w-[120px] flex-1 rounded-md border border-edge bg-raised px-2 py-1 text-xs text-fg placeholder:text-faint outline-hidden focus:border-brand/70"
                 />
               </div>
               <p className="text-[11px] text-faint">

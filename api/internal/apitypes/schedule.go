@@ -119,6 +119,10 @@ type LastFireStarted struct {
 	IssueIID *int64 `json:"issue_iid"` // nil for a prompt schedule
 	RunID    string `json:"run_id"`    // uuid string
 	Title    string `json:"title"`
+	// WebURL is the forge issue's web URL snapshotted at fire time (PRD #411). Empty for
+	// prompt schedules, for skips that never fetched the issue, and for pre-#411 persisted
+	// summaries (which lack the key → unmarshals to "").
+	WebURL string `json:"web_url"`
 }
 
 // LastFireSkip is one candidate a persisted fire considered but started nothing for, with
@@ -128,6 +132,10 @@ type LastFireSkip struct {
 	IssueIID *int64 `json:"issue_iid"`
 	Title    string `json:"title"`
 	Reason   string `json:"reason"`
+	// WebURL is the forge issue's web URL snapshotted at fire time (PRD #411). Empty for
+	// prompt schedules, for skips that never fetched the issue, and for pre-#411 persisted
+	// summaries (which lack the key → unmarshals to "").
+	WebURL string `json:"web_url"`
 }
 
 // LastFire is the top-level persisted summary of a schedule's last fire (PRD #308 M3).

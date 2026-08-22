@@ -19,6 +19,16 @@ type Milestone struct {
 	Title string `json:"title"`
 }
 
+// RunSummaryDelta is one entry of a run's plan-summary deltas list (PRD #362): how
+// the proposed plan diverged from the original ask. Kind is a closed enum
+// {added, changed, dropped} (validated-and-rejected on persist, Decision 6); Text is
+// UNTRUSTED, model-authored display text a consumer writing it to a terminal must
+// sanitize — the deltas are advisory and the human still reads the real plan.
+type RunSummaryDelta struct {
+	Kind string `json:"kind"`
+	Text string `json:"text"`
+}
+
 // RunDTO is the web view of a run. session_id and last_seq are intentionally
 // omitted — they are worker-internal (resume plumbing), not browser state.
 type RunDTO struct {
@@ -31,8 +41,11 @@ type RunDTO struct {
 	// DTO paths, which never render the MR affordance in a browser; set on the
 	// list/detail reads (ListRuns/AdminListRuns/GetRun) from the run's connection.
 	ForgeType string `json:"forge_type"`
-	// Kind is issue|ci_fix|chat. IssueIID is null for ci_fix (no issue) and chat
-	// runs; the ci_fix fields below carry pipeline context, chat carries Title.
+	// Kind is issue|ci_fix|chat|judge|self_improve|prompt|task (PRD #400 added the
+	// seventh, task). IssueIID is null for the issue-less kinds (ci_fix, chat, judge,
+	// prompt, task) and set for the issue-shaped kinds (issue, self_improve); the ci_fix
+	// fields below carry pipeline context, chat carries Title, and a task (uzi handoff)
+	// carries Branch/BaseBranch/OpenMr set at create.
 	Kind             string `json:"kind"`
 	IssueIID         *int64 `json:"issue_iid"`
 	IssueTitle       string `json:"issue_title"`
@@ -91,12 +104,32 @@ type RunDTO struct {
 	BudgetWallSeconds   *int    `json:"budget_wall_seconds"`
 	WorkerID            *string `json:"worker_id"`
 	Branch              *string `json:"branch"`
-	MrIID               *int64  `json:"mr_iid"`
+	// BaseBranch and OpenMr are the task/handoff columns (PRD #400), meaningful only
+	// for a kind='task' run. BaseBranch is the source ref the task branched from (null
+	// when it inherited the caller's local HEAD, and on every non-task run); OpenMr is
+	// whether the worker opens an MR at the end (false by default and for every
+	// non-task run — a plain handoff produces commits on the branch, not an MR).
+	BaseBranch *string `json:"base_branch"`
+	OpenMr     bool    `json:"open_mr"`
+	// Interactive marks a long-lived, conversational task run (PRD #517 M1): the worker
+	// keeps it alive (parking in awaiting_followup) after signal_done rather than
+	// terminating. Set at create from --interactive; false by default and for every
+	// non-task run. Always on the wire, like OpenMr above.
+	Interactive bool `json:"interactive"`
+	// DispatchedAt is when the CLI stamped a task run's dispatch gate (PRD #400
+	// Decision 6) — the moment it became claimable, after its uzi/task/<id> branch was
+	// seeded. Null on every non-task run and on a task run not yet dispatched. Mapped
+	// like ClaimedAt (a nullable timestamp), read-only.
+	DispatchedAt *time.Time `json:"dispatched_at"`
+	MrIID        *int64     `json:"mr_iid"`
 	// MrWebURL is the forge-supplied MR/PR web URL persisted by the worker at MR
 	// creation (PRD #65 D8), null on runs created before it landed. The web renders
 	// it directly through isHttpsUrl and only falls back to the legacy GitLab URL
 	// reconstruction for those null rows — it is the only correct link on Forgejo.
 	MrWebURL *string `json:"mr_web_url"`
+	// IssueWebURL is the forge-supplied issue web URL (PRD #411), nil for issue-less
+	// runs or when the issue is no longer cached; rendered through isHttpsUrl on the web.
+	IssueWebURL *string `json:"issue_web_url"`
 	// MrState is the last merge-request state the PRD #24 watcher observed for
 	// mr_iid (opened|closed|merged|locked), null when never observed. Display-only
 	// and best-effort (PRD #33 Decision 1): the chip treats merged/closed distinctly
@@ -104,10 +137,17 @@ type RunDTO struct {
 	// run's value can be stale, so freshness is scoped to the board card in the UI.
 	MrState       *string `json:"mr_state"`
 	FailureReason *string `json:"failure_reason"`
-	// StopKind is the server-stamped stop signal (PRD #33, widened by #108 M5):
+	// StopKind is the server-stamped stop signal (PRD #33, widened by #108 M5 and #517 M4):
 	// "cancelled" or "plan_rejected" for a deliberate HUMAN stop, "auto_stopped" when
-	// the SERVER stopped a run whose updates could not be saved, null for every other
-	// run. It — not the failure_reason text — is what clients read.
+	// the SERVER stopped a run whose updates could not be saved, "stopped" for a graceful
+	// `uzi run stop` of an interactive task run, null for every other run. It — not the
+	// failure_reason text — is what clients read.
+	//
+	// A "stopped" run's happy path lands `completed` (the worker finalizes — push + MR iff
+	// open_mr — and reports completed); on the edge where that finalize throws (or a
+	// cancel-then-stop let the cancel win) the worker reports `failed` and the server routes
+	// it to `cancelled`, never `agent_failure` and never judged. So a "stopped" stop_kind
+	// rides a `completed` or a `cancelled` run, not a `failed` one.
 	//
 	// Consumers must NOT treat the three alike, and the web's isStoppedRun is the
 	// worked example: it styles the two human kinds calm/neutral because a deliberate
@@ -133,6 +173,18 @@ type RunDTO struct {
 	// pointer — a pre-feature run reads "agent". The SPA's SeededPlanPanel keys on it to
 	// surface a seeded run's plan, which the approval UI would otherwise never render.
 	PlanSource string `json:"plan_source"`
+	// Plain-English run summaries (PRD #362), all null until the worker generates and
+	// posts them (and null forever on any generation failure — summaries are advisory
+	// and never block a run). SummaryIntent ("what this run will implement") lands early
+	// in `running`; SummaryPlan ("what the proposed plan will do") + SummaryDeltas (how
+	// the plan diverged from the ask) land at the plan gate. SummaryDeltas is
+	// tolerated-with-fallback on READ (Decision 6): a malformed stored value renders as
+	// nil ("no deltas"), never a crash — runToDTO logs and drops it. A nil slice
+	// marshals to JSON null, the back-compat contract for every pre-feature run. The
+	// delta Text is UNTRUSTED display text (see RunSummaryDelta).
+	SummaryIntent *string           `json:"summary_intent"`
+	SummaryPlan   *string           `json:"summary_plan"`
+	SummaryDeltas []RunSummaryDelta `json:"summary_deltas"`
 	// ci_fix context (PRD #6), all null for an issue run: the failing ref, the
 	// failing pipeline's web URL (from the frozen snapshot), and the fix verdict
 	// (verified|fix_failed|not_code|null-while-unverified).
@@ -146,6 +198,11 @@ type RunDTO struct {
 	// summary, already scrubbed server-side; nil unless report_only.
 	ReportOnly bool    `json:"report_only"`
 	ReportMd   *string `json:"report_md"`
+	// PreservedPatch is the agent's diff preserved on a workflow_scope_missing `failed`
+	// run (PRD #377 M1): the branch touched .github/workflows/** the bot PAT cannot push,
+	// so the work is surfaced here for a human to land instead of being discarded. Null on
+	// every other run (the column is nullable, set only on that failed path).
+	PreservedPatch *string `json:"preserved_patch"`
 	// PrdDonePath is the repo-relative path the run declared it moved a PRD to when it
 	// archived a completed PRD (e.g. prds/done/72-x.md), null for a run that moved none.
 	// Read-only surfacing of the runs.prd_done_path column so the issue's PRD link can be
@@ -315,6 +372,18 @@ type RunDTO struct {
 	// `normal` everything else. runToDTO takes it as an explicit param and stays pure —
 	// no now()/config reaches into the mapper (D8).
 	Priority string `json:"priority"`
+	// The run's inferred/hinted scheduling requirements (PRD #84): RequiredCapabilities is
+	// the claim-gating capability set (M2 repo hint UNION-merged with M4 plan-time
+	// inference), RequiredTools the DISPLAY-ONLY provisionable toolchain families (M4 4b),
+	// and SizeClass the clamped s/m/l estimate (M4 4b). All three are surfaced RAW so the
+	// web/CLI (4d) derive the readiness/mismatch display from them plus the worker caps they
+	// already fetch — there is deliberately no server-computed "capability_block" field; the
+	// authoritative enforcement is the 409 the approval gate returns. Capability/tool slices
+	// are non-nil ([] over null) via capsOrEmpty; SizeClass is "" for a run whose plan-time
+	// inference never set it (the column is NOT NULL DEFAULT '').
+	RequiredCapabilities []string `json:"required_capabilities"`
+	RequiredTools        []string `json:"required_tools"`
+	SizeClass            string   `json:"size_class"`
 }
 
 // RunListItemDTO is a run row for the Runs index and the admin Agents-status
@@ -372,6 +441,14 @@ type RunInputRequest struct {
 	// the server validates this against the run's real roster and writes its own
 	// canonical JSON encoding into that body.
 	Selection *AgentSelection `json:"selection"`
+	// OverrideCapabilities is the PRD #84 M4 4c user override ("run without the
+	// capability", Decision 12), meaningful ONLY with approve_plan and default false. When
+	// true the server clears the run's inferred/hinted required_capabilities before
+	// approving, so a plan the capability gate would otherwise 409-BLOCK (its owning worker
+	// cannot satisfy an inferred requirement) is approved anyway — the deliberate
+	// false-positive-inference correction. No runtime security boundary is bypassed: the
+	// §300 guardrail still denies docker USE on a daemon-less worker at run time.
+	OverrideCapabilities bool `json:"override_capabilities"`
 }
 
 // RunInputResponse is the POST /api/runs/{id}/inputs reply: server_side reports
@@ -438,10 +515,11 @@ type RunEventDTO struct {
 	CreatedAt     *time.Time      `json:"created_at,omitempty"`
 	// Status is set on "state" frames and is a CLOSED set enforced by a database
 	// CHECK constraint (runs.status, created by 00020_workers_runs.sql, widened with
-	// 'limit_wait' by 00091_run_limit_wait.sql and with 'awaiting_input' by
-	// 00092_run_awaiting_input.sql): queued, claimed, running, awaiting_approval,
-	// limit_wait, awaiting_input, completed, failed, cancelled — NINE values. It is
-	// the field that decides whether a run reads as still live, so an unrecognised
-	// value must never reach a consumer as-is.
+	// 'limit_wait' by 00091_run_limit_wait.sql, with 'awaiting_input' by
+	// 00092_run_awaiting_input.sql, and with 'awaiting_followup' by
+	// 00146_interactive_task_runs.sql): queued, claimed, running, awaiting_approval,
+	// limit_wait, awaiting_input, awaiting_followup, completed, failed, cancelled —
+	// TEN values. It is the field that decides whether a run reads as still live, so
+	// an unrecognised value must never reach a consumer as-is.
 	Status string `json:"status,omitempty"` // set on "state" frames
 }

@@ -36,6 +36,21 @@ test("claim wire contract: worker parses the server's skill shape", () => {
   // present here, so the parse is pinned across the language boundary.
   assert.equal(claim.repo.forge_type, "gitlab");
 
+  // PRD #381: the bounded, bot-filtered snapshot of the issue's human comments rides
+  // the claim next to issue_description. The golden carries one comment with truncated
+  // set, so the worker's parse of the whole snapshot (comment fields + truncated flag)
+  // is pinned across the language boundary; typing the parse as ClaimResponse also makes
+  // `npm run typecheck` fail if issue_comments is dropped from protocol.ts.
+  assert.equal(claim.issue_comments?.truncated, true);
+  assert.deepEqual(claim.issue_comments?.comments, [
+    {
+      author_username: "carol",
+      author_forge_user_id: 42,
+      created_at: "2026-07-04T09:00:00Z",
+      body: "please guard on Valid",
+    },
+  ]);
+
   // PRD #19's autopilot flag rides the same claim shape (post-landing merge): the
   // worker must still parse the skills fields alongside it.
   assert.equal(claim.auto_approve, true);
@@ -67,6 +82,22 @@ test("claim wire contract: worker parses the server's skill shape", () => {
   // agent/tsconfig.json includes `test` in the program. The Go half is gated
   // separately, by a byte-compare against MarshalIndent output.
   assert.equal(claim.wait_on_limit, true);
+  // PRD #400 M2: the task-run MR gate + source ref ride the same claim, top-level
+  // alongside auto_approve. Meaningful only for a task run, but the wire always
+  // carries them; pinned across the language boundary so typing the parse as
+  // ClaimResponse fails `npm run typecheck` if either is dropped from protocol.ts.
+  assert.equal(claim.open_mr, true);
+  // issue #552 M3: stop_pending re-delivers the durable stop_kind='stopped' fact so a
+  // graceful stop survives a worker crash. Pinned across the language boundary; typing the
+  // parse as ClaimResponse also makes `npm run typecheck` fail if it is dropped from
+  // protocol.ts. The golden models an interactive, non-terminal, stopped run, so it is true.
+  assert.equal(claim.stop_pending, true);
+  assert.equal(claim.base_branch, "develop");
+  // PRD #400 M4b: the diff-review target rides the same claim, top-level alongside
+  // base_branch. This golden is not a review claim, so the field is null (the wire
+  // carries it byte-for-byte); pinned across the language boundary so typing the parse
+  // as ClaimResponse fails `npm run typecheck` if it is dropped from protocol.ts.
+  assert.equal(claim.review_target_run_id, null);
   assert.equal(claim.plan_approved, true);
   assert.equal(claim.plan_md, "# Plan\n");
   // PRD #209: the plan_source discriminator rides the same claim, top-level alongside

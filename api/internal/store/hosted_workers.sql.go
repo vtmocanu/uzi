@@ -12,6 +12,26 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const cordonHostedWorker = `-- name: CordonHostedWorker :execrows
+UPDATE workers
+   SET draining_since = COALESCE(draining_since, now()), updated_at = now()
+ WHERE id = $1 AND kind = 'hosted'
+`
+
+// Controller cordon-write (PRD #422 M4): mark a hosted worker draining so the claim
+// gate (workersvc.Claim) idles it — it finishes its in-flight runs, then the controller
+// rolls it. COALESCE preserves the ORIGINAL cordon time so a repeat cordon is idempotent
+// and does NOT reset the M5 drain-deadline clock. Scoped to kind='hosted': the controller
+// manages only hosted workers and must never cordon an external one. Rows affected = 0
+// means no such hosted worker exists (the handler answers 404).
+func (q *Queries) CordonHostedWorker(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, cordonHostedWorker, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const countHostedWorkersForUser = `-- name: CountHostedWorkersForUser :one
 SELECT count(*) FROM workers WHERE user_id = $1 AND kind = 'hosted'
 `
@@ -54,7 +74,7 @@ func (q *Queries) CountHostedWorkersForUser(ctx context.Context, userID uuid.UUI
 const createHostedWorker = `-- name: CreateHostedWorker :one
 INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled)
 VALUES ($1, $2, $3, $4, 'hosted', $5, $6)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities
 `
 
 type CreateHostedWorkerParams struct {
@@ -117,6 +137,8 @@ func (q *Queries) CreateHostedWorker(ctx context.Context, arg CreateHostedWorker
 		&i.AnthropicSecretID,
 		&i.AnthropicBindMode,
 		&i.OnlineSince,
+		&i.DrainingSince,
+		&i.Capabilities,
 	)
 	return i, err
 }
@@ -168,6 +190,21 @@ SELECT w.id,
        w.hosted_size,
        w.hosted_generation,
        w.docker_enabled,
+       -- busy (PRD #422 M3, Decision 5): does this worker hold any non-terminal run? This
+       -- reuses the EXACT active-run predicate the DeleteWorker guard uses
+       -- (CountWorkerNonTerminalRuns), awaiting_approval included, because rolling a worker
+       -- that holds such a run would requeue it. Feeds the controller's cordon/defer-roll
+       -- decision (M4).
+       (SELECT count(*) FROM runs r
+          WHERE r.worker_id = w.id
+            AND r.status NOT IN ('completed', 'failed', 'cancelled')) > 0 AS busy,
+       -- draining_since (PRD #422 M3/M5): the raw nullable cordon timestamp — WHEN this
+       -- worker was cordoned, or NULL if it is not draining (draining == draining_since != nil).
+       -- M5 selects the timestamp itself rather than an ` + "`" + `IS NOT NULL` + "`" + ` boolean because the
+       -- controller's reconcile loop is stateless (it remembers nothing across ticks) and must
+       -- compute ` + "`" + `now - draining_since >= deadline` + "`" + ` to enforce the bounded drain deadline; the
+       -- bool it replaces could only answer "draining y/n", not "for how long".
+       w.draining_since,
        t.token_ciphertext
 FROM workers w
 LEFT JOIN hosted_worker_tokens t ON t.worker_id = w.id
@@ -176,12 +213,14 @@ ORDER BY w.created_at ASC
 `
 
 type ListHostedWorkersForControllerRow struct {
-	ID               uuid.UUID   `json:"id"`
-	TemplateDeclared pgtype.Text `json:"template_declared"`
-	HostedSize       pgtype.Text `json:"hosted_size"`
-	HostedGeneration int64       `json:"hosted_generation"`
-	DockerEnabled    pgtype.Bool `json:"docker_enabled"`
-	TokenCiphertext  []byte      `json:"token_ciphertext"`
+	ID               uuid.UUID          `json:"id"`
+	TemplateDeclared pgtype.Text        `json:"template_declared"`
+	HostedSize       pgtype.Text        `json:"hosted_size"`
+	HostedGeneration int64              `json:"hosted_generation"`
+	DockerEnabled    pgtype.Bool        `json:"docker_enabled"`
+	Busy             bool               `json:"busy"`
+	DrainingSince    pgtype.Timestamptz `json:"draining_since"`
+	TokenCiphertext  []byte             `json:"token_ciphertext"`
 }
 
 // Hosted workers (PRD #58) --------------------------------------------------
@@ -217,6 +256,8 @@ func (q *Queries) ListHostedWorkersForController(ctx context.Context) ([]ListHos
 			&i.HostedSize,
 			&i.HostedGeneration,
 			&i.DockerEnabled,
+			&i.Busy,
+			&i.DrainingSince,
 			&i.TokenCiphertext,
 		); err != nil {
 			return nil, err
@@ -297,6 +338,27 @@ type MarkHostedWorkerTokenDeliveredParams struct {
 // defence in depth against a future caller that does not.
 func (q *Queries) MarkHostedWorkerTokenDelivered(ctx context.Context, arg MarkHostedWorkerTokenDeliveredParams) (int64, error) {
 	result, err := q.db.Exec(ctx, markHostedWorkerTokenDelivered, arg.WorkerID, arg.ProvedTokenHash)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const uncordonHostedWorker = `-- name: UncordonHostedWorker :execrows
+UPDATE workers
+   SET draining_since = NULL, updated_at = now()
+ WHERE id = $1 AND kind = 'hosted'
+`
+
+// Controller uncordon-write (issue #458): clear draining_since so a worker that was
+// cordoned on drift but whose drift was then REVERTED (nothing to roll) resumes claiming.
+// draining_since is otherwise cleared ONLY by RegisterWorker on an actual roll, so a
+// reverted-drift worker would stay cordoned forever. Idempotent: NULL->NULL is harmless,
+// so no `draining_since IS NOT NULL` guard — that keeps rows-affected=0 meaning
+// unambiguously "no such hosted worker" (clean 404), not "already clear". kind='hosted'
+// mirrors CordonHostedWorker: never touch an external worker.
+func (q *Queries) UncordonHostedWorker(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, uncordonHostedWorker, id)
 	if err != nil {
 		return 0, err
 	}

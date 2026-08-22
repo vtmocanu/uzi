@@ -40,6 +40,7 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   judge_enforce_all: "false",
   judge_cooldown_seconds: "60",
   judge_daily_budget: "0",
+  summary_model: "haiku",
   health_enabled: "true",
   health_stall_seconds: "300",
   health_slow_seconds: "2700",
@@ -47,6 +48,8 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   health_approval_seconds: "3600",
   health_nudge_cooldown_seconds: "1800",
   docker_repo_allowlist: "",
+  capability_aware_scheduling: "true",
+  github_project_sync_enabled: "false",
   run_eligible_labels: "PRD,bug",
   board_extra_labels: "bug",
   eligible_label_waives_prd_link: "true",
@@ -135,6 +138,12 @@ describe("AdminSettings — vault migration (PRD #32)", () => {
 });
 
 describe("AdminSettings", () => {
+  it("renders the always-visible admin-settings guide link", async () => {
+    renderPage();
+    const link = await screen.findByRole("link", { name: "admin settings" });
+    expect(link.getAttribute("href")).toBe("/docs/admin-settings");
+  });
+
   it("loads the current labels into the fields", async () => {
     renderPage();
     const prd = (await screen.findByLabelText("PRD label")) as HTMLInputElement;
@@ -420,6 +429,33 @@ describe("AdminSettings — run judge (PRD #46)", () => {
   });
 });
 
+describe("AdminSettings — run summaries (PRD #362)", () => {
+  it("loads the current summary model", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ summary_model: "sonnet" }));
+    renderPage();
+    expect((await screen.findByLabelText("Summary model") as HTMLInputElement).value).toBe("sonnet");
+  });
+
+  it("saves the summary model through the settings update path", async () => {
+    mockApi.updateSettings.mockResolvedValue(response({ summary_model: "opus" }));
+    renderPage();
+    fireEvent.change(await screen.findByLabelText("Summary model"), { target: { value: "opus" } });
+    const btn = screen.getByRole("button", { name: /save run summary settings/i }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+    fireEvent.click(btn);
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ summary_model: "opus" }));
+  });
+
+  it("blocks an empty summary model client-side without calling the API", async () => {
+    renderPage();
+    await screen.findByLabelText("Summary model");
+    fireEvent.change(screen.getByLabelText("Summary model"), { target: { value: "  " } });
+    fireEvent.click(screen.getByRole("button", { name: /save run summary settings/i }));
+    expect(await screen.findByText(/summary model must not be empty/i)).toBeTruthy();
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+  });
+});
+
 describe("AdminSettings — self-improvement (PRD #46 M5)", () => {
   it("shows the token-consent copy and the connected repo in the picker", async () => {
     renderPage();
@@ -548,6 +584,116 @@ describe("AdminSettings — docker repo allowlist (PRD #89 M-allow)", () => {
     // promise a removal the admin can't perform.
     expect(await screen.findByText(/could not load repositories/i)).toBeTruthy();
     expect(screen.queryByText(/outside your visibility/i)).toBeNull();
+  });
+});
+
+describe("AdminSettings — capability-aware scheduling kill-switch (PRD #84 M2)", () => {
+  const toggle = () =>
+    screen.getByLabelText(/enable capability-aware scheduling/i) as HTMLInputElement;
+  const saveBtn = () =>
+    screen.getByRole("button", { name: /save capability scheduling/i }) as HTMLButtonElement;
+
+  it("renders the toggle checked (default ON) with Save disabled until changed", async () => {
+    renderPage();
+    await screen.findByText("Capability-aware scheduling");
+    expect(toggle().checked).toBe(true);
+    expect(saveBtn().disabled).toBe(true);
+
+    fireEvent.click(toggle());
+    expect(saveBtn().disabled).toBe(false);
+  });
+
+  it("saves the flag OFF through the settings PATCH", async () => {
+    mockApi.updateSettings.mockResolvedValue(response({ capability_aware_scheduling: "false" }));
+    renderPage();
+    await screen.findByText("Capability-aware scheduling");
+
+    fireEvent.click(toggle());
+    fireEvent.click(saveBtn());
+
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith({ capability_aware_scheduling: "false" }),
+    );
+  });
+
+  it("disables the toggle when the setting is fixed by the environment", async () => {
+    mockApi.getSettings.mockResolvedValue(
+      response({ capability_aware_scheduling: "true" }, {}, { capability_aware_scheduling: "env" }),
+    );
+    renderPage();
+    await screen.findByText("Capability-aware scheduling");
+    expect(toggle().disabled).toBe(true);
+    expect(saveBtn().disabled).toBe(true);
+  });
+});
+
+describe("AdminSettings — GitHub Projects sync kill-switch (issue #534 M2)", () => {
+  const toggle = () => screen.getByLabelText(/enable github projects sync/i) as HTMLInputElement;
+  const saveBtn = () =>
+    screen.getByRole("button", { name: /save github projects sync/i }) as HTMLButtonElement;
+
+  it("renders the toggle unchecked (default OFF) with Save disabled until changed", async () => {
+    // The fixture defaults github_project_sync_enabled to "false".
+    renderPage();
+    await screen.findByText("GitHub Projects sync");
+    expect(toggle().checked).toBe(false);
+    expect(saveBtn().disabled).toBe(true);
+
+    fireEvent.click(toggle());
+    expect(saveBtn().disabled).toBe(false);
+  });
+
+  it("reflects the served value ON when github_project_sync_enabled is \"true\"", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ github_project_sync_enabled: "true" }));
+    renderPage();
+    await screen.findByText("GitHub Projects sync");
+    expect(toggle().checked).toBe(true);
+    // Already at the served value, so nothing is dirty.
+    expect(saveBtn().disabled).toBe(true);
+  });
+
+  it("saves the flag ON through the settings PATCH, sending only that key", async () => {
+    mockApi.updateSettings.mockResolvedValue(response({ github_project_sync_enabled: "true" }));
+    renderPage();
+    await screen.findByText("GitHub Projects sync");
+
+    fireEvent.click(toggle());
+    fireEvent.click(saveBtn());
+
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith({ github_project_sync_enabled: "true" }),
+    );
+    expect(mockApi.updateSettings.mock.calls[0][0]).toEqual({ github_project_sync_enabled: "true" });
+  });
+
+  it("saves the flag back OFF when the served value is ON", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ github_project_sync_enabled: "true" }));
+    mockApi.updateSettings.mockResolvedValue(response({ github_project_sync_enabled: "false" }));
+    renderPage();
+    await screen.findByText("GitHub Projects sync");
+
+    fireEvent.click(toggle());
+    fireEvent.click(saveBtn());
+
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith({ github_project_sync_enabled: "false" }),
+    );
+  });
+
+  it("links to the GitHub Projects sync guide", async () => {
+    renderPage();
+    const link = await screen.findByRole("link", { name: "GitHub Projects v2 sync" });
+    expect(link.getAttribute("href")).toBe("/docs/github-project-sync");
+  });
+
+  it("disables the toggle when the setting is fixed by the environment", async () => {
+    mockApi.getSettings.mockResolvedValue(
+      response({ github_project_sync_enabled: "true" }, {}, { github_project_sync_enabled: "env" }),
+    );
+    renderPage();
+    await screen.findByText("GitHub Projects sync");
+    expect(toggle().disabled).toBe(true);
+    expect(saveBtn().disabled).toBe(true);
   });
 });
 

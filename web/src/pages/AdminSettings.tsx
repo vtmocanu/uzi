@@ -29,6 +29,8 @@ import {
   Skeleton,
 } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
+import { DocLink } from "../components/DocLink";
+import { DOC_ADMIN_SETTINGS, DOC_GITHUB_PROJECT_SYNC } from "../lib/doclinks";
 import { THEMES, THEME_LABELS } from "../lib/theme";
 
 // slackStatusChip renders the live Slack connection state (PRD #25 M2) as a
@@ -204,7 +206,7 @@ function TagInput({
               add();
             }
           }}
-          className="min-w-32 flex-1 bg-transparent px-2 py-1 text-sm text-fg placeholder:text-faint outline-none disabled:opacity-50"
+          className="min-w-32 flex-1 bg-transparent px-2 py-1 text-sm text-fg placeholder:text-faint outline-hidden disabled:opacity-50"
         />
         <Button type="button" variant="secondary" size="sm" onClick={add} disabled={disabled || !draft.trim()}>
           Add
@@ -393,12 +395,20 @@ export function AdminSettings() {
           { id: "slack", label: "Slack" },
           { id: "run-health", label: "Run health" },
           { id: "docker-allowlist", label: "Docker workers" },
+          { id: "capability-scheduling", label: "Capability scheduling" },
         ]
       : []),
   ];
 
   return (
-    <AdminShell description="Configuration shared across every user of this uzi instance.">
+    <AdminShell
+      description={
+        <>
+          Configuration shared across every user of this uzi instance. See the{" "}
+          <DocLink slug={DOC_ADMIN_SETTINGS}>admin settings</DocLink> guide.
+        </>
+      }
+    >
       {/* The section index: this tab is eight cards deep, and without an index the
           only way to learn what it holds is to scroll all of it. Quiet pill links,
           not a second tab row — tabs switch content, these just scroll it. */}
@@ -597,6 +607,12 @@ export function AdminSettings() {
         </section>
       )}
 
+      {!loading && saved && (
+        <section id="run-summaries" className="scroll-mt-6">
+          <SummarySettingsCard settings={saved} onSaved={applyResponse} />
+        </section>
+      )}
+
       {!loading && (
         <section id="self-improvement" className="scroll-mt-6">
           <SelfImproveSettingsCard />
@@ -641,6 +657,18 @@ export function AdminSettings() {
       {!loading && saved && (
         <section id="docker-allowlist" className="scroll-mt-6">
           <DockerAllowlistCard settings={saved} sources={sources} onSaved={applyResponse} />
+        </section>
+      )}
+
+      {!loading && saved && (
+        <section id="capability-scheduling" className="scroll-mt-6">
+          <CapabilitySchedulingCard settings={saved} sources={sources} onSaved={applyResponse} />
+        </section>
+      )}
+
+      {!loading && saved && (
+        <section id="github-project-sync" className="scroll-mt-6">
+          <GithubProjectSyncCard settings={saved} sources={sources} onSaved={applyResponse} />
         </section>
       )}
     </AdminShell>
@@ -819,6 +847,90 @@ function JudgeSettingsCard({
 
         <Button type="submit" disabled={busy || !dirty}>
           {busy ? "Saving…" : "Save run judge settings"}
+        </Button>
+      </form>
+    </Card>
+  );
+}
+
+// SummarySettingsCard is the admin surface for the run-summary model (PRD #362
+// Decision 8): the cheap model the inline plain-English run-summary generator runs
+// on. It mirrors the Judge model field exactly — a raw free-text model alias input —
+// but the value rides the ISSUE-run claim, not the judge claim, and a per-user
+// override wins where set. Saved independently through the same settings PUT.
+function SummarySettingsCard({
+  settings,
+  onSaved,
+}: {
+  settings: AppSettings;
+  onSaved: (resp: SettingsResponse) => void;
+}) {
+  const [model, setModel] = useState(settings.summary_model);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  const dirty = model !== settings.summary_model;
+
+  const save = async (e: FormEvent) => {
+    e.preventDefault();
+    setError("");
+    setNotice("");
+    if (model.trim() === "") {
+      setError("The summary model must not be empty.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const resp = await api.updateSettings({ summary_model: model });
+      onSaved(resp);
+      setModel(resp.settings.summary_model);
+      setNotice("Run summary settings saved.");
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to save run summary settings");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card className="space-y-5">
+      <div>
+        <SectionTitle>Run summaries</SectionTitle>
+        <p className="mt-2 text-sm text-muted">
+          Each run generates two short plain-English summaries — what it will implement, and what the
+          proposed plan will do — on{" "}
+          <strong className="text-fg">the run owner&rsquo;s own Anthropic token</strong>. This sets the
+          instance-default model; a user can override it under their own Settings. Summaries are advisory
+          and never block a run.
+        </p>
+      </div>
+
+      {error && <Alert message={error} />}
+      {notice && <Alert tone="success" message={notice} />}
+
+      <form onSubmit={save} className="space-y-4">
+        <div className="space-y-1.5">
+          <Field label="Summary model">
+            <Input
+              value={model}
+              maxLength={100}
+              autoComplete="off"
+              placeholder="haiku"
+              onChange={(e) => setModel(e.target.value)}
+            />
+          </Field>
+          <p className="text-xs text-faint">
+            The Claude model the run-summary generator runs on. The default is{" "}
+            <code className="rounded bg-raised px-1 py-0.5 text-fg">haiku</code> — fast and near-free, since
+            summaries are light and produced per run. Pin{" "}
+            <code className="rounded bg-raised px-1 py-0.5 text-fg">sonnet</code> or{" "}
+            <code className="rounded bg-raised px-1 py-0.5 text-fg">opus</code> for richer summaries.
+          </p>
+        </div>
+
+        <Button type="submit" disabled={busy || !dirty}>
+          {busy ? "Saving…" : "Save run summary settings"}
         </Button>
       </form>
     </Card>
@@ -1284,6 +1396,172 @@ function DockerAllowlistCard({
 
         <Button type="submit" disabled={!dirty || busy || isEnv}>
           {busy ? "Saving…" : "Save repo allowlist"}
+        </Button>
+      </form>
+    </Card>
+  );
+}
+
+// CapabilitySchedulingCard is the admin kill-switch for capability-aware scheduling
+// (PRD #84 M2, Decision 13). Default ON. It follows the bool-default-true toggle
+// precedent (health_enabled) and sends only capability_aware_scheduling on change.
+// Turning it OFF is an explicit, documented degraded mode: runs claim best-effort and
+// a capability mismatch degrades to the existing mid-run failure. It does NOT disable
+// the docker repo allowlist (that stays enforced regardless of this flag).
+function CapabilitySchedulingCard({
+  settings,
+  sources,
+  onSaved,
+}: {
+  settings: AppSettings;
+  sources: Record<string, SettingSource>;
+  onSaved: (resp: SettingsResponse) => void;
+}) {
+  const [enabled, setEnabled] = useState(settings.capability_aware_scheduling === "true");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  const isEnv = sources["capability_aware_scheduling"] === "env";
+
+  const dirty = (enabled ? "true" : "false") !== settings.capability_aware_scheduling;
+
+  const save = async (e: FormEvent) => {
+    e.preventDefault();
+    setError("");
+    setNotice("");
+    if (isEnv || !dirty) return;
+    setBusy(true);
+    try {
+      const resp = await api.updateSettings({
+        capability_aware_scheduling: enabled ? "true" : "false",
+      });
+      onSaved(resp);
+      setEnabled(resp.settings.capability_aware_scheduling === "true");
+      setNotice("Capability-aware scheduling setting saved.");
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to save the capability scheduling setting");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card className="space-y-5">
+      <div>
+        <SectionTitle>Capability-aware scheduling</SectionTitle>
+        <p className="mt-2 text-sm text-muted">
+          Capability-aware scheduling routes each run to a worker that can run it (e.g. a
+          Docker-needing run only to a Docker worker). Turning this OFF reverts to best-effort
+          claiming: a run may be claimed by a worker that lacks a required capability and fail
+          mid-run. This does NOT disable the Docker repo allowlist.
+        </p>
+      </div>
+
+      {error && <Alert message={error} />}
+      {notice && <Alert tone="success" message={notice} />}
+      {isEnv && (
+        <Alert tone="info" message="This setting is fixed by an environment variable and cannot be changed here." />
+      )}
+
+      <form onSubmit={save} className="space-y-4">
+        <label className="flex cursor-pointer select-none items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={enabled}
+            disabled={isEnv}
+            onChange={(e) => setEnabled(e.target.checked)}
+            className="h-4 w-4 rounded border-edge accent-brand"
+          />
+          Enable capability-aware scheduling
+        </label>
+
+        <Button type="submit" disabled={!dirty || busy || isEnv}>
+          {busy ? "Saving…" : "Save capability scheduling"}
+        </Button>
+      </form>
+    </Card>
+  );
+}
+
+// GithubProjectSyncCard is the instance-wide kill-switch for GitHub Projects v2 sync
+// (issue #534 M2). Default OFF — it initializes from the served value and never
+// hard-codes true, because the feature is a rate-limit / cost lever that ships off
+// until an admin arms it. When on, each run mirrors a card's board-column label onto a
+// linked GitHub Projects Status field (GitHub-only; GitLab/Forgejo are untouched). It
+// saves independently, sending only github_project_sync_enabled on change, and greys
+// when the value is fixed by an environment variable (the server rejects a write, 409).
+function GithubProjectSyncCard({
+  settings,
+  sources,
+  onSaved,
+}: {
+  settings: AppSettings;
+  sources: Record<string, SettingSource>;
+  onSaved: (resp: SettingsResponse) => void;
+}) {
+  const [enabled, setEnabled] = useState(settings.github_project_sync_enabled === "true");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  const isEnv = sources["github_project_sync_enabled"] === "env";
+
+  const dirty = (enabled ? "true" : "false") !== settings.github_project_sync_enabled;
+
+  const save = async (e: FormEvent) => {
+    e.preventDefault();
+    setError("");
+    setNotice("");
+    if (isEnv || !dirty) return;
+    setBusy(true);
+    try {
+      const resp = await api.updateSettings({
+        github_project_sync_enabled: enabled ? "true" : "false",
+      });
+      onSaved(resp);
+      setEnabled(resp.settings.github_project_sync_enabled === "true");
+      setNotice("GitHub Projects sync setting saved.");
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to save the GitHub Projects sync setting");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card className="space-y-5">
+      <div>
+        <SectionTitle>GitHub Projects sync</SectionTitle>
+        <p className="mt-2 text-sm text-muted">
+          When on, each run mirrors a board card&rsquo;s column label onto a linked GitHub
+          Projects v2 Status field, so a team that prefers GitHub&rsquo;s native board stays in
+          step. It is off by default because it spends GitHub API rate limit on every board
+          move — an instance-wide cost lever. GitLab and Forgejo repos are unaffected. See the{" "}
+          <DocLink slug={DOC_GITHUB_PROJECT_SYNC}>GitHub Projects v2 sync</DocLink> guide.
+        </p>
+      </div>
+
+      {error && <Alert message={error} />}
+      {notice && <Alert tone="success" message={notice} />}
+      {isEnv && (
+        <Alert tone="info" message="This setting is fixed by an environment variable and cannot be changed here." />
+      )}
+
+      <form onSubmit={save} className="space-y-4">
+        <label className="flex cursor-pointer select-none items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={enabled}
+            disabled={isEnv}
+            onChange={(e) => setEnabled(e.target.checked)}
+            className="h-4 w-4 rounded border-edge accent-brand"
+          />
+          Enable GitHub Projects sync
+        </label>
+
+        <Button type="submit" disabled={!dirty || busy || isEnv}>
+          {busy ? "Saving…" : "Save GitHub Projects sync"}
         </Button>
       </form>
     </Card>

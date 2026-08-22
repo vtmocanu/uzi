@@ -9,10 +9,13 @@
 // the next tick reconciles again from the same two sources, which is why neither
 // side needs to remember what the other was last told.
 //
-// It tells the api nothing. Token delivery is settled api-side by the worker's own
-// registration (proof of possession), so this component is never in the trust path
-// for destroying a token — which matters, because it is the component the PRD's
-// RBAC exists to bound.
+// The loop DOES tell the api things now — display-only roll-health (PRD #113,
+// swallowed on failure so an observability channel can never take down what it
+// observes) and cordon control-writes (PRD #422 M4, fail-safe: a failed cordon
+// DEFERS the roll rather than proceeding). But it is still never in the trust path
+// for DESTROYING a token: token delivery is settled api-side by the worker's own
+// registration (proof of possession), which is the property the PRD's RBAC exists
+// to bound and which neither of those writes touches.
 package reconcile
 
 import (

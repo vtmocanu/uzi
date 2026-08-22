@@ -120,13 +120,30 @@ SELECT judge_model FROM users WHERE id = $1;
 UPDATE users SET judge_model = @judge_model WHERE id = @id
 RETURNING judge_model;
 
+-- name: GetUserSummaryModel :one
+-- The current user's per-user run-summary model override (PRD #362 M2); NULL =
+-- inherit the instance summary_model. Read at ISSUE-run claim assembly, keyed on
+-- the run owner. Selects only the column: the claim needs no other user field, and
+-- a narrow read keeps resolution self-contained and cheap (Decision 8). Mirrors
+-- GetUserJudgeModel but rides the issue-run claim rather than the judge claim.
+SELECT summary_model FROM users WHERE id = $1;
+
+-- name: SetUserSummaryModel :one
+-- Sets (or clears, when @summary_model is NULL) the current user's per-user
+-- run-summary model. NULL inherits the instance summary_model. Own-user only;
+-- caller passes the session user's id.
+UPDATE users SET summary_model = @summary_model WHERE id = @id
+RETURNING summary_model;
+
 -- name: GetUserSettings :one
 -- The current user's own (non-secret) settings surface: default worker model
--- (PRD #17), per-user judge model override (PRD #69), UI theme override
--- (PRD #21), and the sidebar token-meter choice (00123). NULL = inherit / use
--- the instance default / default-token-only. Own-user only; the caller passes
--- the session user's id.
-SELECT default_model, judge_model, theme, sidebar_token_ids FROM users WHERE id = $1;
+-- (PRD #17), per-user judge model override (PRD #69), per-user run-summary model
+-- override (PRD #362 M2), UI theme override (PRD #21), and the sidebar token-meter
+-- choice (00123). NULL = inherit / use the instance default / default-token-only.
+-- Own-user only; the caller passes the session user's id. summary_model rides this
+-- one-row read for the settings surface (GetUserSummaryModel stays the narrow read
+-- for issue-run claim assembly), so the settings response needs no second query.
+SELECT default_model, judge_model, summary_model, theme, sidebar_token_ids FROM users WHERE id = $1;
 
 -- name: SetUserTheme :one
 -- Sets (or clears, when @theme is NULL) the current user's theme override.

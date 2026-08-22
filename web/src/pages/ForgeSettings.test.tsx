@@ -4,7 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { MemoryRouter } from "react-router-dom";
 import { ForgeSettings } from "./ForgeSettings";
 import { api, ApiError, type ForgeConnection, type PrivilegeReport } from "../lib/api";
-import { mockForgeConfigMultiForge } from "../mocks/data";
+import { mockForgeConfigMultiForge, mockForgeConfigSyncForges } from "../mocks/data";
 
 // Only the api object is swapped; ApiError and the types stay real so the page's
 // `instanceof ApiError` checks match what the mocked methods throw. The page loads
@@ -135,6 +135,15 @@ describe("ForgeSettings — forge identity mapping (PRD #19 M3)", () => {
     fireEvent.click(screen.getByRole("button", { name: /save username/i }));
 
     expect(await screen.findByText(/already mapped by another user/i)).toBeTruthy();
+  });
+});
+
+describe("ForgeSettings — always-visible bot-setup guide link (PRD #57 M2)", () => {
+  it("renders the happy-path connect-card bot-setup link on the default gitlab forge", async () => {
+    renderPage();
+    await screen.findByText("unchecked"); // page loaded, no over-privilege card shown
+    const docLink = screen.getByRole("link", { name: "bot setup" });
+    expect(docLink.getAttribute("href")).toBe("/docs/gitlab-bot-setup");
   });
 });
 
@@ -294,6 +303,137 @@ describe("ForgeSettings — forge-type picker (PRD #65 D11, lands dark)", () => 
         "forgejo",
       ),
     );
+  });
+});
+
+describe("ForgeSettings — base-URL ⇄ forge-type sync (PRD #337)", () => {
+  const baseUrlSelect = () => screen.getByLabelText("Forge base URL") as HTMLSelectElement;
+  const typeSelect = () => screen.getByLabelText("Forge type") as HTMLSelectElement;
+
+  it("URL → type: choosing a recognized github.com URL switches the type to github and the hints follow", async () => {
+    mockApi.forgeConfig.mockResolvedValue(mockForgeConfigSyncForges);
+    renderPage();
+    await screen.findByLabelText("Forge type");
+    // Landing pair is the first URL / gitlab (sync is change-only, D5).
+    expect(baseUrlSelect().value).toBe("https://gitlab.example.com");
+    expect(typeSelect().value).toBe("gitlab");
+
+    fireEvent.change(baseUrlSelect(), { target: { value: "https://github.com" } });
+
+    await waitFor(() => expect(typeSelect().value).toBe("github"));
+    // connectHints copy tracks the resulting github type.
+    expect(screen.getByText("Bot personal access token (scope: repo)")).toBeTruthy();
+    expect(screen.getByPlaceholderText("ghp_…")).toBeTruthy();
+  });
+
+  it("type → URL: choosing the github type moves the base URL to github.com", async () => {
+    mockApi.forgeConfig.mockResolvedValue(mockForgeConfigSyncForges);
+    renderPage();
+    await screen.findByLabelText("Forge type");
+    expect(baseUrlSelect().value).toBe("https://gitlab.example.com");
+
+    fireEvent.change(typeSelect(), { target: { value: "github" } });
+
+    await waitFor(() => expect(baseUrlSelect().value).toBe("https://github.com"));
+  });
+
+  it("forgejo round-trip: URL→type sets forgejo, and type→URL moves the URL to the forgejo host", async () => {
+    mockApi.forgeConfig.mockResolvedValue(mockForgeConfigSyncForges);
+    renderPage();
+    await screen.findByLabelText("Forge type");
+
+    // URL → type
+    fireEvent.change(baseUrlSelect(), { target: { value: "https://forgejo.example.com" } });
+    await waitFor(() => expect(typeSelect().value).toBe("forgejo"));
+
+    // Now from a gitlab URL, choosing the forgejo type moves the URL to the forgejo host.
+    fireEvent.change(baseUrlSelect(), { target: { value: "https://gitlab.example.com" } });
+    await waitFor(() => expect(typeSelect().value).toBe("gitlab"));
+    fireEvent.change(typeSelect(), { target: { value: "forgejo" } });
+    await waitFor(() => expect(baseUrlSelect().value).toBe("https://forgejo.example.com"));
+  });
+
+  it("null-target keep-URL (D8): choosing a type with no recognized allowlist URL keeps the current URL", async () => {
+    // mockForgeConfigMultiForge advertises forgejo, but its only non-gitlab host is
+    // the unrecognized forge.example.com (infers to null) — so there is no recognized
+    // forgejo URL. The current gitlab URL must be kept, not blanked or mis-set.
+    mockApi.forgeConfig.mockResolvedValue(mockForgeConfigMultiForge);
+    renderPage();
+    await screen.findByLabelText("Forge type");
+    expect(baseUrlSelect().value).toBe("https://gitlab.example.com");
+
+    fireEvent.change(typeSelect(), { target: { value: "forgejo" } });
+
+    await waitFor(() => expect(typeSelect().value).toBe("forgejo"));
+    // URL unchanged — no recognized forgejo target in the allowlist.
+    expect(baseUrlSelect().value).toBe("https://gitlab.example.com");
+  });
+
+  it("unrecognized host opts out of sync in both directions", async () => {
+    mockApi.forgeConfig.mockResolvedValue(mockForgeConfigSyncForges);
+    renderPage();
+    await screen.findByLabelText("Forge type");
+
+    // URL → type: an unrecognized/self-hosted host leaves the type on the manual pick.
+    fireEvent.change(baseUrlSelect(), { target: { value: "https://git.example.com" } });
+    await waitFor(() => expect(baseUrlSelect().value).toBe("https://git.example.com"));
+    expect(typeSelect().value).toBe("gitlab");
+
+    // type → URL: with the current host unrecognized, changing the type keeps the URL.
+    fireEvent.change(typeSelect(), { target: { value: "forgejo" } });
+    await waitFor(() => expect(typeSelect().value).toBe("forgejo"));
+    expect(baseUrlSelect().value).toBe("https://git.example.com");
+  });
+});
+
+describe("ForgeSettings — PAT reveal toggle (PRD #337)", () => {
+  const patInput = () => document.querySelector("#forge-bot-pat") as HTMLInputElement;
+
+  it("is masked on mount with a 'Show token' button (aria-pressed false)", async () => {
+    renderPage();
+    await screen.findByText("unchecked"); // page loaded
+    expect(patInput().getAttribute("type")).toBe("password");
+    const btn = screen.getByRole("button", { name: "Show token" });
+    expect(btn.getAttribute("aria-pressed")).toBe("false");
+    // No "Hide token" button while masked.
+    expect(screen.queryByRole("button", { name: "Hide token" })).toBeNull();
+  });
+
+  it("reveal flips the input type and aria, and hiding flips them back", async () => {
+    renderPage();
+    await screen.findByText("unchecked");
+    expect(patInput().getAttribute("type")).toBe("password");
+
+    fireEvent.click(screen.getByRole("button", { name: "Show token" }));
+    expect(patInput().getAttribute("type")).toBe("text");
+    const hideBtn = screen.getByRole("button", { name: "Hide token" });
+    expect(hideBtn.getAttribute("aria-pressed")).toBe("true");
+
+    fireEvent.click(hideBtn);
+    expect(patInput().getAttribute("type")).toBe("password");
+    const showBtn = screen.getByRole("button", { name: "Show token" });
+    expect(showBtn.getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("re-masks after a successful connect clears the token (D7 leak guard)", async () => {
+    mockApi.createConnection.mockResolvedValue({ connection: conn() });
+    renderPage();
+    await screen.findByText("unchecked");
+
+    // Reveal the field, then type a token into it.
+    fireEvent.click(screen.getByRole("button", { name: "Show token" }));
+    expect(patInput().getAttribute("type")).toBe("text");
+    fireEvent.change(patInput(), { target: { value: "glpat-secret" } });
+    expect(patInput().value).toBe("glpat-secret");
+
+    // Submit → connect resolves → setToken("") runs → the field re-masks.
+    fireEvent.submit(document.querySelector("form") as HTMLFormElement);
+    await waitFor(() =>
+      expect(mockApi.createConnection).toHaveBeenCalledWith("https://gitlab.example.com", "glpat-secret", "gitlab"),
+    );
+    await waitFor(() => expect(patInput().getAttribute("type")).toBe("password"));
+    expect(screen.getByRole("button", { name: "Show token" }).getAttribute("aria-pressed")).toBe("false");
+    expect(screen.queryByRole("button", { name: "Hide token" })).toBeNull();
   });
 });
 

@@ -43,6 +43,7 @@ All images are pulled/built by digest or pinned tag in `docker-compose.yml`, not
 - **nginx is the sole entry point and the sole source of truth for the client's identity.** `web/nginx.conf` sets `X-Forwarded-For: $remote_addr` (not `$proxy_add_x_forwarded_for`), which *overwrites* any `X-Forwarded-For` a client sent rather than appending to it. `api` then only trusts that header when the direct connection comes from a `TRUSTED_PROXIES` CIDR (the compose network's private ranges, by default) — see [docs/auth-design.md](docs/auth-design.md#rate-limiting-and-the-x-forwarded-for-trust-model). Net effect: a client cannot spoof its apparent IP by sending its own `X-Forwarded-For`.
 - **The session cookie is the only credential**, and it is `HttpOnly` — never readable by any JavaScript running in the SPA, including an XSS payload. See [docs/auth-design.md](docs/auth-design.md) for the full cookie/CSRF/revocation design.
 - **`GET /api/version` is the one endpoint that publishes a runtime fact, and it does so on purpose.** It is unauthenticated *and* unrate-limited: mounted directly under `r.Route("/api")` with only `Recoverer` + `RequestID` above it, pinned `noLimiter` by `route_limiter_mounts_test.go`, and in k8s reachable through `deploy/chart/templates/web-ingress.yaml`, which by default publishes the SPA origin at path `/` with no auth annotation (both are chart values, so a hardened override could narrow them; the enforced property is the route mount, not the chart). Most of the body is public by construction — the version *is* the chart's image tag, the commit is in the repo. `uptime_seconds` is not: it describes this **process**, not this image. It is published deliberately ([PRD #175](prds/done/175-build-info-popover.md), severity Low) because process age is worth real debugging time and discloses no identity, topology or schedule. Two things follow. "It carries no secret" is not the whole test — a field can be secret-free and still be a runtime disclosure. And **any new surface for this body republishes uptime by default**: an `/about` page or a signed-out footer, both named as follow-ups in that PRD, would widen the audience with nothing in the code to notice. Re-decide it there rather than inheriting this decision.
+- **The in-app changelog (issue #415) is not one of those new surfaces.** It is a build-time-bundled (`?raw` import) read of the repo-root `CHANGELOG.md`, rendered in a drawer opened from that same version popover; it adds no new service, no new API route, and no new trust boundary, and it reuses the `runningVersion` the popover already carries from `GET /api/version` rather than fetching it again — so it renders inside the same authenticated app, not a wider audience for that endpoint's body.
 
 ## Request flow: an authenticated API call
 
@@ -69,7 +70,7 @@ State-changing requests (POST/PATCH) additionally run CSRF validation inside `Re
 
 ## Forge integration
 
-uzi's second surface connects each user to a git forge (**GitLab, Forgejo, and GitHub**, behind a forge-generic interface) so the board has real work to show. The Forgejo driver (PRD #65) was the second driver; the GitHub driver (PRD #238) is the third, and — unlike Forgejo — landed with **no interface method-set change at all**, evidence the abstraction ADR-0065 built now genuinely scales to a new forge as "a driver file plus its per-forge seam arms." Every milestone but the last landed dark; the go-live flip (PRD #238's last milestone) now has `handler/forge.go` **advertise and accept `github`**, so a GitHub classic-PAT connection is connectable through the product. Neither driver adds a new service — everything below lives inside `api` — but each does confirm the same second trust boundary: `api` makes authenticated *outbound* calls to a third party (the forge) on top of the inbound boundary at the nginx edge described above. See [docs/gitlab-bot-setup.md](docs/gitlab-bot-setup.md), [docs/forgejo-bot-setup.md](docs/forgejo-bot-setup.md), and [docs/github-bot-setup.md](docs/github-bot-setup.md) for the per-forge operator/user procedure, [adr/0065-forgejo-driver.md](adr/0065-forgejo-driver.md) and [adr/0238-github-driver.md](adr/0238-github-driver.md) for the second- and third-driver design records, and the PRDs (`prds/done/2-forge-integration-kanban.md`, `prds/done/65-forgejo-support.md`, `prds/done/238-github-forge-support.md`) for the full rationale.
+uzi's second surface connects each user to a git forge (**GitLab, Forgejo, and GitHub**, behind a forge-generic interface) so the board has real work to show. The Forgejo driver (PRD #65) was the second driver; the GitHub driver (PRD #238) is the third, and — unlike Forgejo — landed with **no interface method-set change at all**, evidence the abstraction ADR-0065 built now genuinely scales to a new forge as "a driver file plus its per-forge seam arms." Every milestone but the last landed dark; the go-live flip (PRD #238's last milestone) now has `handler/forge.go` **advertise and accept `github`**, so a GitHub classic-PAT connection is connectable through the product. Neither driver adds a new service — everything below lives inside `api` — but each does confirm the same second trust boundary: `api` makes authenticated *outbound* calls to a third party (the forge) on top of the inbound boundary at the nginx edge described above. See [docs/gitlab-bot-setup.md](docs/gitlab-bot-setup.md), [docs/forgejo-bot-setup.md](docs/forgejo-bot-setup.md), and [docs/github-bot-setup.md](docs/github-bot-setup.md) for the per-forge operator/user procedure, [adr/0065-forgejo-driver.md](adr/0065-forgejo-driver.md) and [adr/0238-github-driver.md](adr/0238-github-driver.md) for the second- and third-driver design records, and the PRDs (`prds/done/2-forge-integration-kanban.md`, `prds/done/65-forgejo-support.md`, `prds/done/238-github-forge-support.md`) for the full rationale. A GitHub-only, label-canonical extension (PRD #364) projects the label board's columns onto a linked GitHub Projects v2 board's Status field, forward on every uzi-side move and reverse on the poll cadence — see [docs/github-project-sync.md](docs/github-project-sync.md).
 
 ### Forge abstraction
 
@@ -78,6 +79,12 @@ uzi's second surface connects each user to a git forge (**GitLab, Forgejo, and G
 The Forgejo driver (`code.gitea.io/sdk/gitea`, Forgejo ≥16.0.0 — [ADR-65](adr/0065-forgejo-driver.md) for why both) proved the abstraction was more than Go-deep by finding the three places it was **not**: (1) the worker held a second, un-abstracted GitLab client, now a minimal TS forge seam (`agent/src/forge.ts`, `GitLabClient`/`ForgejoClient`/`GitHubClient`); (2) the web reconstructed forge URLs by string surgery, now a per-card/run `forge_type` DTO field mapped only at `web/src/lib/forgeNoun.ts` (`forgeNoun`/`forgePlatform`, one Go twin in `slacksvc/notifier.go`, one CLI twin in `api/cmd/uzi/render.go`); (3) each forge stored its pipeline status verbatim, so `api/internal/pipelinestatus` is the one Go-side classifier that folds all three vocabularies — the domain twin of `web/src/lib/pipelineBadge.ts`, kept in sync by `TestMirrorsWebPipelineBadge`. Merge-permission is now modelled on all three forges (`BranchProtection.WriteRoleCanMerge`/`BotCanMerge`); the drivers **report** it, and **enforcement is implemented** — [PRD #66](prds/done/66-guardrail-enforcement.md) refuses a run whenever the bot could push or merge to the default branch, at repo-enable, at run creation, and at claim, live and fail-closed, with an admin-only per-repo override for the deliberate, audited exception.
 
 The GitHub driver (`github.com/google/go-github/v90`, github.com only, classic PAT — [ADR-238](adr/0238-github-driver.md) for the design) filled the same four per-forge seams: a `privcheck.requiredScopesFor(github)` scope rule (exactly `{repo}`, with a `workflow`-scoped token refused as over-privilege — a deliberate CI-integrity boundary), the Actions two-field (`status`/`conclusion`) status fold into `pipelinestatus`/`pipelineBadge`, the `forgeNoun`/`forgePlatform` "Pull Request"/"PR"/"#" vocabulary, and `agent/src/forge.ts`'s `GitHubClient` (whose one shared-base change was widening the worker's duplicate-PR detection to a **driver-declared** status set, since GitHub signals a duplicate PR with 422 rather than GitLab/Forgejo's 409). GitHub's branch-protection guardrail is materially weaker than Forgejo's: a write-role bot can read GitHub's newer *rulesets* but not classic branch protection, so on a classically-protected repo `BranchProtection` gains an additive `ProtectionUnverified` field rather than a fabricated safe/unsafe answer — see [ADR-238](adr/0238-github-driver.md) for the accepted limitation and the fail-closed requirement it places on PRD #66.
+
+### Issue comments as untrusted worker input (PRD #381)
+
+A worker's context is no longer just an issue's title + description: `api/internal/forge`'s `Forge` interface gained a fourth read, `ListIssueComments`, implemented across all three drivers — the GitLab driver drops forge **system** notes (`Note.System`), Forgejo and GitHub have no such notes to drop — and every driver normalizes to **oldest-first** regardless of the forge's native sort. At run creation, `workersvc.createRun` snapshots the issue's comments into a new nullable `runs.issue_comments` JSONB column via `buildIssueCommentsSnapshot` (`api/internal/workersvc/issue_comments.go`), carried structured on the worker claim next to the description. The snapshot excludes **uzi's own bot-authored comments**, matched against the connection's stored `bot_forge_user_id` — an unknown/zero bot id omits comments entirely rather than risk leaking uzi's own status chatter back into the prompt (see the security note below) — and is bounded to 200 newest comments and 32 KiB of body bytes, with a `truncated` flag when the cap clips the thread. The LEAD's plan prompt renders the snapshot in `agent/src/prompt.ts` (`buildIssueCommentsContext`) immediately after `<issue_description>`, under a per-prompt CSPRNG nonce fence — the same discipline the file already applies to cross-run memory and job logs — with uzi-owned `author`/`timestamp` headers and comment bodies as untrusted data; a comment-less run's prompt is byte-for-byte unchanged from before this landed. The live `get_issue` forge tool (`handler/worker_forge.go`, `assembleForgeIssueComments`) applies the same bot/system filtering and oldest-first ordering with its own 200-item/32 KiB cap, so a mid-run agent pull sees the same shape as the initial snapshot. See [prds/done/381-worker-reads-issue-comments.md](prds/done/381-worker-reads-issue-comments.md) for the full design and decision log.
+
+**Security note.** This widens the injection surface without opening a new trust boundary: a comment body is attacker-influenceable free text exactly like the issue description already was (see [adr/0246-trusted-repo-instructions.md](adr/0246-trusted-repo-instructions.md)) — the multi-author worst case of the same untrusted class, since each comment is independently attacker-authored and a body could otherwise embed a forged closing tag or a spoofed `author: admin (approved)` line. The per-prompt CSPRNG nonce fence defeats that breakout class the same way it already does for every other attacker-authored block: no comment body can predict the nonce, so none can forge the block's close delimiter or spoof the uzi-owned author/timestamp header around it. The numeric forge user id used for the bot filter is read server-side only and is never surfaced to the agent. The bot-exclusion filter and its zero/unknown-id fail-safe (skip the feature rather than risk exposing uzi's own comments) are what keep this from becoming a feedback loop where the agent reacts to uzi's own status notes.
 
 ### Bot PATs, encrypted at rest
 
@@ -92,7 +99,7 @@ The server making authenticated outbound calls to a `base_url` supplied at conne
 Migration `00002_forge.sql` adds four tables, all scoped down to `forge_connections.user_id` by FK cascade:
 
 - **`forge_connections`** — one row per (user, forge_type, base_url); carries the encrypted PAT and the verified bot identity.
-- **`repos`** — projects discovered via the bot's membership list, keyed by the forge's stable numeric project id (not the path, which can be renamed); upserted with `enabled=false` on every listing call so enable/disable always has a row to target.
+- **`repos`** — projects discovered via the bot's membership list, keyed by the forge's stable numeric project id (not the path, which can be renamed); upserted with `enabled=false` on every listing call so enable/disable always has a row to target. `ListProjects` never deletes a row absent from the fetch — it stays add/update-only **by design** (PRD #357 D1): `repos.id` is an `ON DELETE CASCADE` anchor for a dozen tables, so letting a routine, frequent membership read prune would cascade-delete runs/board/issues on a transient gap (a permissions blip, a paginated response). Removal is instead an explicit, owner-scoped `DELETE /api/repos/{id}` (D2: refused with 409 unless the repo is already `enabled=false`; D7: also refused with 409 while the repo has a non-terminal run) that deletes the `repos` row and cascades its derived data via the existing FKs — a bounded, owner-initiated action rather than a side effect of a read. This local `repos.id` is a distinct row from the forge's own project id: re-adding a repo (e.g. after moving it to a new forge) mints a **new** `repos.id`, so anything keyed by that id server-side — like the Docker-worker allowlist (see "queued → claimed" under [Run lifecycle](#run-lifecycle)) — silently drops it, with no auto-remediation ([PRD #361](prds/done/361-repo-setup-indicator.md)).
 - **`board_columns`** — ordered label names per repo; the implicit Open (no column label) and Closed (issue `state`) columns are never stored.
 - **`issues`** — a *cache*, never authoritative. uzi's own board state is limited to column configuration; every other field is overwritten from the forge on each sync. `has_prd_link` is computed at fetch time from the issue description (regex match on a `prds/*.md` reference) and stored as a bool — the description itself is never persisted.
 
@@ -467,7 +474,7 @@ provably the opened one. The label is snapshotted rather than joined because
 the composite FK nulls the id when a token is deleted — the run still names
 the account it billed afterwards. That record is the attribution join
 `run_usage` (PRD #40) could never make; see
-`prds/111-auto-select-anthropic-token.md` for the ranking's rationale.
+`prds/done/111-auto-select-anthropic-token.md` for the ranking's rationale.
 
 ### Run lifecycle
 
@@ -489,9 +496,26 @@ is its **ad-hoc prompt** target, which — like `ci_fix` — has no issue to
 seam through, so it lands via a dedicated INSERT as a new `prompt` run kind
 (`runs.kind`, beside `chat`/`ci_fix`/`self_improve`/`judge`/`issue`):
 repo-ful, issue-less, `schedule_id`-keyed for dedup (no issue to key
-`HasActiveRunForIssue` on), and MR-opening on the `ci_fix` shape. See
+`HasActiveRunForIssue` on), and MR-opening on the `ci_fix` shape. A **sweep**
+target fans out over the oldest open issues matching its label; its
+`max_issues` cap counts runs *started*, not candidates matched — a candidate
+it can't start is flagged and the fire backfills from the next eligible issue
+within a bounded scan window (`fireSweep`, issue #416), so a stale ineligible
+issue at the head no longer under-fills every fire. See
 [docs/scheduling.md](docs/scheduling.md) and
-`prds/done/241-schedule-runs.md`. Status is a linear state machine:
+`prds/done/241-schedule-runs.md`.
+
+`task` (PRD #400, `uzi handoff`/`uzi task`) is the **seventh** `runs.kind`,
+alongside `issue`/`ci_fix`/`chat`/`judge`/`self_improve`/`prompt` above. Like
+`prompt` it adds no new service — it rides the same worker/run machinery —
+but it is CLI-only and MR-less by default: the CLI (not the worker) pushes
+the user's own HEAD to a server-named `uzi/task/<run-id>` branch with the
+user's own git credentials, then dispatches the run so the worker can clone
+that branch, work the inline context, and push its commits back to it, with
+no forge issue and no merge request unless `--mr` is passed. See
+[prds/done/400-uzi-handoff.md](prds/done/400-uzi-handoff.md) for the full design and
+[docs/handoff.md](docs/handoff.md) / [docs/cli.md](docs/cli.md#uzi-handoff-ephemeral-branch-scoped-task-runs)
+for usage. Status is a linear state machine:
 
 ```
 queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiting_approval ⟲ (revise, PRD #41) → running → completed
@@ -553,6 +577,41 @@ chain in the diagram above, with no intervening `running`.
   waiting for a peer — see [adr/0216-fleet-aware-claim.md](adr/0216-fleet-aware-claim.md)
   for the eligibility seam and the placement/enforcement boundary against
   ADR-42.
+  The same `fn_worker_can_claim` predicate also gates a Docker-capable
+  worker against the `docker_repo_allowlist` admin setting ([PRD #361](prds/done/361-repo-setup-indicator.md)):
+  two read-only surfaces reuse it rather than re-deriving eligibility —
+  `RepoDTO.DockerAllowlisted`/`DockerBlocked` (`apitypes.RepoDTO`) are
+  computed, caller-scoped booleans about the caller's own repo, never the
+  list (the same shape as `GuardrailBlocked`), feeding the Repos page's
+  Setup chip; and the PRD #47 `queuedReason` resolver (`workersvc/health.go`)
+  adds `reasonRepoNotDockerAllowed`, mapped onto the existing
+  `waiting_worker` health enum, when every online worker is Docker-capable
+  and none is eligible for the run's repo. No migration — `runs.health_reason`
+  is free text.
+- **Capability-aware eligibility, claim through plan gate (PRD #84).** A
+  worker advertises a capability set (`workers.capabilities`, from the
+  closed `{docker, jvm}` vocabulary: `jvm` is template-derived from its
+  image, `docker` is worker-self-reported when a DinD sidecar answers, both
+  `capability.Filter`-ed at register so a worker can never spoof a
+  template-only name). A run carries `required_capabilities`, seeded from a
+  static per-repo hint (`repos.required_capabilities`, set in Repo settings)
+  and escalation-only unioned with what the lead's deterministic clone scan
+  (`agent/src/toolchain-detect.ts`) infers at plan time, plus a
+  display-only `required_tools` (provisionable toolchains) and
+  `size_class`. `fn_worker_can_claim` (migration `00142`) folds a worker's
+  `docker_enabled` flag into its capabilities and requires
+  `required ⊆ effective` before the claim query returns that run to it; the
+  same fold blocks plan-approval server-side (409, naming the unmet set) if
+  the run's assigned worker still can't satisfy it once a plan exists, with
+  an owner override that clears the run's requirement — correcting a
+  false-positive inference — rather than bypassing the runtime docker
+  guardrail. Both the claim clause and the approval block are gated by the
+  `capability_aware_scheduling` admin kill-switch (default on); off, the
+  pre-existing docker-worker→repo-allowlist enforcement (PRD #83/#89,
+  `docker_repo_allowlist`) is unaffected, but capability matching reverts to
+  best-effort claiming, so a mismatched run degrades to the pre-#84 mid-run
+  failure instead of being blocked up front. See
+  [docs/capability-scheduling.md](docs/capability-scheduling.md).
 - **claimed → running, before the plan turn** — once `provisionRunTools` has set up
   the run's tool env, the executor kicks off a lockfile-driven JS dependency
   install for the cloned repo, picked per discovered lockfile (monorepo
@@ -599,7 +658,11 @@ chain in the diagram above, with no intervening `running`.
   loop (`RUN_MAX_ITERATIONS`, default 5). See [PRD #41](prds/done/41-plan-revision-gate.md)
   for the epoch mechanism (Decisions 2/3) and
   [docs/run-activity.md](docs/run-activity.md#plan-approval-gate) for the
-  user-facing actions.
+  user-facing actions. The worker also generates a short plain-English intent
+  summary before planning and a plan summary + deltas at this gate, both
+  advisory (skipped on any failure, never blocking the run) and spent on the
+  run owner's own token — see [PRD #362](prds/done/362-run-summaries.md) and
+  [docs/run-summaries.md](docs/run-summaries.md).
 - **running ⇄ awaiting_input — the run's third human-in-the-loop channel**
   ([PRD #88](prds/done/88-ask-user-clarification.md)), beside the plan gate above
   and user-initiated steering below. The lead calls an in-process `ask_user`
@@ -664,7 +727,22 @@ chain in the diagram above, with no intervening `running`.
   Slack is not attempted, since the existing Slack ❌ DM already covers opted-in
   users) for the run's owner, gated on `stop_kind` so a deliberate cancel or
   plan-rejection stays silent and only genuine breakage notifies.
-- **Milestone tracker reconciliation** (PRD #122 M2 + PRD #265) — on a
+- **Finalize, GitHub only: align a behind-on-workflows branch before that push**
+  (PRD #456). GitHub rejects the bot's `repo`-only PAT push whenever the pushed
+  tip's `.github/workflows/**` tree differs from the *current* default branch —
+  even when the run's own branch never touched a workflow file, only fell
+  behind on one because main advanced it mid-run. Immediately before the push
+  above, uzi fetches the default branch's fresh tip and, only when the
+  workflow trees actually differ, aligns the branch to it: a SHA-preserving
+  merge first, falling back to a rebase (the mechanism proven to clear the
+  rejection) if the merged push is still refused. An unresolvable conflict
+  fails the run typed (`fail_origin = finalize_base_align_conflict`) with the
+  pre-align diff preserved on the failed-run card, via the same
+  `preserved_patch` mechanism PRD #377 built for a branch that *modifies* a
+  workflow file (a distinct, earlier-firing guard on the same finalize path).
+  See [ADR-456](adr/0456-rebase-before-finalize-push.md) for the mechanism and
+  why merge is tried before rebase.
+- **Milestone tracker reconciliation** (PRD #122 M2 + PRD #265 + PRD #390) — on a
   milestone-structured `issue` run the run view shows a *reported-complete*
   tracker (`runs.milestones_completed`, a monotone server-side union; never
   "verified"). Two sources feed it, both subset-validated against the frozen
@@ -680,7 +758,24 @@ chain in the diagram above, with no intervening `running`.
   union) is cleared on every terminal transition a milestone-bearing run can
   reach, since "in progress" is meaningless on a done/failed/cancelled run. The web renders a **null** tracker
   as "not reported" (`M–/N`), distinct from a genuine `0/N`, so a completed run
-  that simply never reported does not read as a failure.
+  that simply never reported does not read as a failure. PRD #390 is the
+  "make mid-run reporting truthful and enforced" step in that #122 → #265 → #390
+  progression: mid-run reporting is now **enforced**, not merely offered — the
+  per-turn prompt requires a `report_progress` declaration (`agent/src/prompt.ts`),
+  and the implement/review loop (`agent/src/sdk-executor.ts`) escalates the next
+  turn's prompt when a work turn leaves a milestone-bearing run with no milestone
+  marked in progress, then surfaces a feed-only `status` signal after K=2
+  consecutive misses so a silently-non-reporting lead is observable — while still
+  never failing the run (D4) and keeping `checkpoint` a durability boundary, not a
+  gate (D2): a cooperative checkpoint re-arms enforcement and clears the
+  in-progress latch instead of nagging past a milestone boundary. Complementing
+  that, an all-empty `report_progress` call (both sides empty after parsing) is
+  now a **no-op, not a signal** (D3, `agent/src/signals.ts`) — it never persists a
+  misleading `[]`, so the `milestones_completed` column stays `null` on a run that
+  truly never reported and the neutral `M–/N` render is what that run actually
+  shows. The CLI's `uzi run get` now renders that same neutral `–/N` numerator for
+  a never-reported run (PRD #390 D5/M4, `api/cmd/uzi/run.go`), bringing it to
+  display parity with the web badge and the TUI rail.
 - **Sweeper** (a goroutine beside the forge poller) enforces what workers
   can't be trusted to self-report: a claimed-but-never-started run older than
   5 minutes is re-queued; a running run older than `RUN_TIMEOUT` (default 2h)
@@ -965,6 +1060,13 @@ sanitize and render helpers it must reuse live there; that trade is recorded in
 [docs/cli.md](docs/cli.md); the plain `--json` verbs remain the agent-facing surface
 and are unchanged.
 
+The CLI can also hold several credentials at once as **named contexts**
+(`uzi context …`, PRD #427) and switch which one a command uses via a flag, an
+env var, or a sticky default. This is purely client-side credential selection —
+which already-stored `{URL, token}` pair a command sends — with no server, API,
+or scope change; authority is still the token's server-enforced scope. See
+[Config and credentials](docs/cli.md#config-and-credentials) for the mechanics.
+
 - **One new credential, one new middleware.** A `cli_tokens` row (`uzc_`
   user-scoped / `uza_` admin-scoped, sha256 at rest, mirroring the worker
   join-token posture) is presented as `Authorization: Bearer …`.
@@ -1076,8 +1178,12 @@ the design rationale (Decision Log, the compose→chart adaptations) is
   layered over the cluster-agnostic `deploy/chart/values.yaml`. ArgoCD deploys a
   **multi-source** app (the private GitOps repo's `apps/uzi/`): the released chart
   from an OCI registry + these values from that GitOps repo. Public URL
-  `https://uzi.example.com` behind ingress-nginx (a wildcard-TLS domain). Images + chart are versioned Model B (chart `version` ==
-  `appVersion` == the release git tag; see the runbook). **Optionally** (PRD
+  `https://uzi.example.com` behind ingress-nginx (a wildcard-TLS domain). The
+  `api`/`web`/chart triple is versioned Model B (chart `version` ==
+  `appVersion` == the release git tag; see the runbook) — the **worker** image
+  tag is deliberately decoupled from that lockstep (PRD #422; see
+  [Worker image tag](#worker-image-tag-decoupled-from-appversion-drained-instead-of-hard-killed-prd-422)
+  below). **Optionally** (PRD
   #58, off by default — `workers.enabled: false`) a `uzi-controller`
   Deployment and a dedicated `uzi-workers` namespace it renders hosted worker
   pods into; see [Worker controller](#worker-controller-k8s-only) below.
@@ -1250,15 +1356,63 @@ Rationale, the decision log, and the alternatives that were rejected are in
 `prds/done/113-worker-upgrade-status.md`. The user-facing behaviour is
 [docs/worker-upgrades.md](docs/worker-upgrades.md).
 
+### Worker image tag: decoupled from appVersion, drained instead of hard-killed (PRD #422)
+
+**The worker fleet no longer rolls on every release.** `workers.image.tag` is a
+concrete pinned version independent of `Chart.AppVersion` (`required` in the chart —
+a blank tag fails the render rather than silently following appVersion). An
+app-only release (an api/web/db/controller bump that advances `Chart.version`/
+`appVersion`) therefore renders an unchanged worker pod-spec hash, and the
+controller rolls **zero** worker pods; any run in flight keeps running on the old
+worker, which talks to the new api unchanged. Advancing the worker fleet is a
+deliberate operator step: bump `workers.image.tag` to a new concrete version.
+
+When that deliberate bump does move the tag, the controller does not hard-kill a
+busy worker. On spec-hash drift it first asks the api whether the worker has an
+active run; if so it **cordons** the worker over a new authenticated control-write
+endpoint (`POST /api/controller/workers/{id}/drain`, distinct from the existing
+display-only status report above) instead of rolling — the api stamps a `workers.
+draining_since` timestamp, an orthogonal column, not a `workers.status` value,
+because `status` is rewritten to `'online'` on every heartbeat and would clobber a
+drain flag stored there. A draining worker keeps heartbeating and finishes its
+in-flight run, but the claim gate treats it as a third "stop claiming" lever
+(alongside the vault gate and the concurrency cap) so it takes on nothing new; the
+controller performs the `Recreate` roll once the api reports it idle, and
+`RegisterWorker` clears `draining_since` on the worker's next registration after
+that roll. The wait is bounded by `workers.drainDeadline` (default `24h`) — past
+it the controller rolls the busy worker anyway and its run falls back to the
+existing requeue-resume path — and `workers.forceRoll` is the operator emergency
+override that rolls every drifted worker immediately regardless of busy-ness, for
+a fix that cannot wait on a drain. Any failure reading busy-ness or writing the
+cordon fails safe: the roll is deferred, never forced through.
+
+"Surge" here means the app stack surges forward on every release while old
+worker pods linger until their work is done — not overlapping worker pods.
+Workers hold RWO PVCs, so `Recreate` (not `RollingUpdate`) stays the worker roll
+strategy. The rendered worker Deployment also sets `RevisionHistoryLimit: 1`
+(`RenderDeployment`, re-asserted through `patchFor`'s drift merge patch so
+long-lived workers pick it up on their next roll), deliberately bounding
+superseded-ReplicaSet retention below the k8s default of 10: an init-wedged pod
+left behind on a scaled-to-0 old RS is otherwise never garbage-collected and
+holds its tier's ResourceQuota indefinitely (issue #360). The requeue-then-manual-vault-unlock fallback (a run that does get
+rolled — past the drain deadline, on force-roll, or by an uncontrolled pod loss)
+is unchanged by this PRD. Full rationale, the Decision Log, and what remains
+open (a CLI drain verb, live-cluster validation) are in
+[adr/0422-decouple-worker-version.md](adr/0422-decouple-worker-version.md).
+
 ## Not yet in scope
 
 Auto-starting a run from a GitLab label, a CI-status watching/fixing agent,
-WS wakeup for idle workers (a 3s poll is the MVP), **PRD #84's
-capability-aware pre-run readiness check** (the lead can already `ask_user`
-before planning — see [Run lifecycle](#run-lifecycle) — but nothing yet
-decides automatically that an issue is missing capability/tool/size and
-calls it; #88 ships the mechanism, #84 owns that trigger and remains
-Draft), **autoscaled/spawn-on-demand hosted workers** (PRD #58 delivered the
+WS wakeup for idle workers (a 3s poll is the MVP), **wiring PRD #84's
+capability-aware readiness pass into PRD #88's `ask_user` path** (#84's own
+infra-readiness scope — declare, match, gate — has shipped; see
+[Run lifecycle](#run-lifecycle) and
+[docs/capability-scheduling.md](docs/capability-scheduling.md). What remains
+open is the one-directional edge PRD #84 names for itself: auto-raising a
+pre-planning clarification question through #88's `ask_user` mechanism from
+a detected capability/tool/size gap, instead of today's plan-approval block.
+#84 without that edge is complete for its own infra-readiness scope),
+**autoscaled/spawn-on-demand hosted workers** (PRD #58 delivered the
 static-provisioning subset of the item decided 2026-07-10, specs/ai.md §168 —
 a user-triggered click provisions a persistent worker via the dedicated
 controller described [above](#worker-controller-k8s-only); the controller

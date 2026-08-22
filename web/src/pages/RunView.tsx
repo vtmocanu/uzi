@@ -25,6 +25,7 @@ import {
   type RunMessage,
   type RunReview,
   type TriageCounts,
+  type Worker,
 } from "../lib/api";
 import { coordKey, recommendationLabel, verdictLabel, verdictTone } from "../lib/judge";
 import { canToggleWaitOnLimit, formatCountdown, runWindowLabel } from "../lib/limitWait";
@@ -46,6 +47,7 @@ import { forgeNounLower, mrAbbrev, mrRefSymbol } from "../lib/forgeNoun";
 import { useRunStream } from "../lib/useRunStream";
 import { deriveRunUsage } from "../lib/runUsage";
 import { CIFixRunHeader } from "../components/CIFixRunHeader";
+import { RunIssueRef } from "../components/RunIssueRef";
 import { RunCredential } from "../components/RunCredential";
 import { RunPriorityBadge } from "../components/RunPriorityBadge";
 import { formatDuration } from "../components/RunEvent";
@@ -56,7 +58,8 @@ import { SteerQueueCard } from "../components/SteerQueueCard";
 import { QuestionPanel, UnreadableQuestion } from "../components/QuestionPanel";
 import { deriveOpenQuestion } from "../lib/runQuestion";
 import { Markdown } from "../components/Markdown";
-import { Alert, Badge, Button, Card, Input, PageHeader, Select, Spinner, StatusPill, Textarea, cx } from "../components/ui";
+import { Alert, Badge, Button, Card, Input, PageHeader, Select, Spinner, StatusPill, Textarea, cx, type BadgeTone } from "../components/ui";
+import { summaryCollapse } from "../lib/prefs";
 import { ExternalLinkIcon, FileTextIcon } from "../components/icons";
 
 // stageForMessages: latest-message → human stage label (multica's
@@ -243,6 +246,133 @@ export function MilestoneChecklist({ run }: { run: Run }) {
           );
         })}
       </ul>
+    </Card>
+  );
+}
+
+// PRD #362 M4: one delta's kind → its badge tone, glyph and label. added is a green +,
+// changed a blue ~, dropped a red − — so the three read apart by shape AND colour, not
+// colour alone (Decision 6 wants them "visually distinct"). An unexpected kind (the server
+// validates the enum on persist, Decision 6, so this should not happen) falls back to a
+// neutral bullet rather than crashing the list.
+const DELTA_KIND: Record<string, { tone: BadgeTone; glyph: string; label: string }> = {
+  added: { tone: "ok", glyph: "+", label: "added" },
+  changed: { tone: "info", glyph: "~", label: "changed" },
+  dropped: { tone: "danger", glyph: "−", label: "dropped" },
+};
+
+/**
+ * PRD #362 M4 (Decisions 2/6/9/10): the run-summary cards — the intent summary ("what this
+ * run will implement"), the plan summary (labelled proposed/approved from run status,
+ * Decision 2 — never regenerated), and the plan's deltas from the original ask (Decision 6).
+ *
+ * Rendered ONLY once a summary exists; until then this returns null and the issue-title
+ * header (RunHeading) stands as the fallback (Decision 1's accepted consequence, and the
+ * seeded/pre-approved intent-only shape of Decision 5). Live update rides the existing
+ * useRunStream: M1 emits a run-updated WS frame on summary persist, so refreshRun re-reads
+ * the DTO and this re-renders with no code here.
+ *
+ * The whole section is collapsible and the choice is remembered PER RUN for 7 days via
+ * summaryCollapse (Decision 9); default expanded. All summary text is UNTRUSTED — model
+ * output over an attacker-influenceable issue/PRD/plan. The intent and plan paragraphs
+ * render through the shared hardened <Markdown> sink (issue #423, revising the "rendered as
+ * text (web)" clause of Decision 10) — the same untrusted-LLM trust boundary the judge
+ * summary_md already crosses: stripUnsafeChars runs BEFORE the parse (bidi/zero-width gone,
+ * even inside fenced code) and there is NO rehype-raw, so raw HTML stays inert text. The
+ * deltas stay escaped plain text through stripUnsafeChars: they render inline next to a
+ * badge and <Markdown>'s block-level docs-prose <p> would break that tight layout. The rest
+ * of Decision 10 holds — the runner is still tool-less (untrusted text drives no action) and
+ * the CLI still routes every summary string through cellText (plain). report_md (a different
+ * surface, issue #279) remains escaped plain text; see its own comment below.
+ *
+ * Exported for a direct render test: RunView itself needs routing, a live stream and a dozen
+ * API mocks to mount, so the card states could not otherwise be asserted.
+ */
+export function RunSummary({ run }: { run: Run }) {
+  // The persisted per-run collapse choice, read once on mount (default expanded).
+  const [collapsed, setCollapsed] = useState(() => summaryCollapse.getCollapsed(run.id));
+
+  const intent = typeof run.summary_intent === "string" ? run.summary_intent.trim() : "";
+  const plan = typeof run.summary_plan === "string" ? run.summary_plan.trim() : "";
+  // Decision 6 (tolerate-on-read): anything that is not an array is treated as no-deltas,
+  // never a crash. The server already coerces malformed jsonb to null (M1); this is the
+  // defensive second line for a hand-built or future-shaped value reaching the renderer.
+  const deltas = Array.isArray(run.summary_deltas) ? run.summary_deltas : [];
+  const hasIntent = intent !== "";
+  const hasPlan = plan !== "";
+
+  // Nothing to show yet — the issue-title header stands (Decision 1/5).
+  if (!hasIntent && !hasPlan) return null;
+
+  const toggle = () => {
+    const next = !collapsed;
+    setCollapsed(next);
+    summaryCollapse.setCollapsed(run.id, next);
+  };
+
+  // Decision 2: label derived from run status, never regenerated. "Proposed" at the gate,
+  // "Approved" once the run is past it (a plan summary present on any non-gate status).
+  const planLabel = run.status === "awaiting_approval" ? "Proposed plan" : "Approved plan";
+
+  return (
+    <Card className="space-y-4 p-4">
+      <div className="flex items-center justify-between gap-2">
+        <h2 className="text-sm font-semibold text-fg">Run summary</h2>
+        <button
+          type="button"
+          onClick={toggle}
+          aria-expanded={!collapsed}
+          className="text-xs font-medium text-muted transition-colors hover:text-fg"
+        >
+          {collapsed ? "Expand" : "Collapse"}
+        </button>
+      </div>
+
+      {!collapsed && (
+        <div className="space-y-4">
+          {hasIntent && (
+            <section className="space-y-1">
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-faint">
+                What this run will implement
+              </h3>
+              <div className="judge-prose">
+                <Markdown content={intent} />
+              </div>
+            </section>
+          )}
+
+          {hasPlan && (
+            <section className="space-y-2">
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-faint">{planLabel}</h3>
+              <div className="judge-prose">
+                <Markdown content={plan} />
+              </div>
+
+              {/* Decision 6: the plan's deltas from the original ask, or a plain
+                  "no deviations" line when the plan matches it (empty array or null). */}
+              {deltas.length === 0 ? (
+                <p className="text-sm italic text-faint">No deviations — the plan matches the original ask</p>
+              ) : (
+                <ul className="space-y-1.5">
+                  {deltas.map((d, i) => {
+                    const kind = DELTA_KIND[d?.kind] ?? { tone: "neutral" as BadgeTone, glyph: "•", label: "note" };
+                    return (
+                      <li key={`${i}-${kind.label}`} className="flex items-start gap-2 text-sm">
+                        <Badge tone={kind.tone} title={kind.label}>
+                          <span aria-hidden="true">{kind.glyph}</span> {kind.label}
+                        </Badge>
+                        <span className="min-w-0 flex-1 whitespace-pre-wrap text-muted">
+                          {stripUnsafeChars(typeof d?.text === "string" ? d.text : "")}
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </section>
+          )}
+        </div>
+      )}
     </Card>
   );
 }
@@ -460,6 +590,7 @@ export function RunView() {
   const { id = "" } = useParams();
   const { run, messages, connected, error, submit, refreshRun, inputs, canSteer } = useRunStream(id);
   const [repoWebUrl, setRepoWebUrl] = useState<string | null>(null);
+  const [workers, setWorkers] = useState<Worker[]>([]);
   const [actionErr, setActionErr] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -475,6 +606,19 @@ export function RunView() {
       })
       .catch(() => setRepoWebUrl(null));
   }, [run]);
+
+  // PRD #84 M4 4d: the workers list backs the plan-gate readiness summary — a required
+  // capability is "met" when the run's ASSIGNED worker (run.worker_id) advertises it. Only
+  // needed at the approval gate; best-effort (an empty list just renders every required cap
+  // as unmet, which is the honest fail-closed reading). The Workers page owns the live poll;
+  // this is a one-shot fetch when a run reaches the gate.
+  useEffect(() => {
+    if (run?.status !== "awaiting_approval") return;
+    api
+      .listWorkers()
+      .then(({ workers }: { workers: Worker[] }) => setWorkers(workers))
+      .catch(() => setWorkers([]));
+  }, [run?.status]);
 
   const act = async (fn: () => Promise<unknown>) => {
     setActionErr("");
@@ -514,16 +658,29 @@ export function RunView() {
   // worst kind of accessibility bug: the markup looks right". Putting role="status" on
   // the QuestionPanel itself — which mounts with the park — would have been exactly that.
   const [parkAnnounce, setParkAnnounce] = useState("");
-  const parked = run?.status === "awaiting_input" ? (openQuestion?.question.questionId ?? "") : "";
+  // PRD #517: BOTH needs-you parks announce, not just awaiting_input — awaiting_followup is
+  // classified identically by needsHumanAttention and shows the same loud ring, so a
+  // screen-reader user parking into it must get a signal too. A single stable KEY drives
+  // the re-announce logic: awaiting_input keys on the question IDENTITY (a second question
+  // re-announces while a re-render of the same park stays quiet, and an unusable/absent
+  // question does not announce — the UnreadableQuestion branch owns that state), while
+  // awaiting_followup is one stable park. The text is derived from the key in the effect.
+  // NOTE this is PURELY the sr-only announcement; the QuestionPanel below stays
+  // awaiting_input-only.
+  const questionId = run?.status === "awaiting_input" ? (openQuestion?.question.questionId ?? "") : "";
+  const parkKey =
+    questionId !== "" ? `question:${questionId}` : run?.status === "awaiting_followup" ? "followup" : "";
   useEffect(() => {
-    // Keyed on the question IDENTITY, so a second question re-announces while a re-render
-    // of the same park stays quiet.
-    if (parked === "") {
+    if (parkKey === "") {
       setParkAnnounce("");
       return;
     }
-    setParkAnnounce("The agent is asking you a question. The run is parked until you answer.");
-  }, [parked]);
+    setParkAnnounce(
+      parkKey === "followup"
+        ? "The run is waiting for your next follow-up."
+        : "The agent is asking you a question. The run is parked until you answer.",
+    );
+  }, [parkKey]);
 
   if (!run) {
     return (
@@ -659,7 +816,12 @@ export function RunView() {
                   failing from the other side: not a false alarm, a false all-clear.
                   `awaiting_approval` has the same shape and keeps the chip, because a
                   human gate is minutes and someone is expected to be looking; a park
-                  is hours by design, which is what makes it different in kind. */}
+                  is hours by design, which is what makes it different in kind.
+
+                  PRD #517: `awaiting_followup` also KEEPS the chip — it is a needs-you
+                  gate (the user is expected to send the next follow-up), the same kind
+                  as awaiting_input, NOT the self-resuming clock park that limit_wait is.
+                  So only limit_wait is excluded here. */}
               {!terminal && run.status !== "limit_wait" && (
                 <span
                   title={connected ? "Live" : "Reconnecting…"}
@@ -744,6 +906,11 @@ export function RunView() {
           })
         }
       />
+
+      {/* PRD #362 M4: the plain-English run summary — intent, proposed/approved plan, and
+          deltas from the original ask. Self-hides until a summary lands (the issue-title
+          header carries the run until then), collapsible + remembered per run. */}
+      <RunSummary run={run} />
 
       {/* Terminal hero: the outcome, front and center. */}
       {run.status === "completed" && (
@@ -846,6 +1013,27 @@ export function RunView() {
               )
             )}
           </div>
+
+          {/* PRD #377 M2: a GitHub run whose branch touched .github/workflows/** cannot be
+              pushed by the bot's repo-only PAT, so it ends `failed` with the agent's diff
+              preserved here. This is VALID work uzi can't auto-land — framed as "here's the
+              diff to land as a human PR", NOT a crash. The authoritative next-step text lives
+              in failure_reason (rendered above); this block is just the labelled diff.
+
+              preserved_patch is UNTRUSTED worker/model-authored text, rendered as escaped
+              plain text through stripUnsafeChars (same footing as report_md/failure_reason),
+              never through <Markdown>. */}
+          {run.preserved_patch != null && run.preserved_patch.trim() !== "" && (
+            <div className="mt-3 space-y-2 border-t border-edge/60 pt-3">
+              <p className="text-xs text-muted">
+                This change is valid, but uzi&rsquo;s bot token can&rsquo;t push workflow files.
+                Here&rsquo;s the diff to land as a human PR:
+              </p>
+              <pre className="max-h-96 overflow-auto rounded-md bg-raised/60 p-3 font-mono text-xs leading-relaxed text-fg whitespace-pre">
+                {stripUnsafeChars(run.preserved_patch)}
+              </pre>
+            </div>
+          )}
         </div>
       )}
 
@@ -858,9 +1046,12 @@ export function RunView() {
         <PlanPanel
           run={run}
           messages={messages}
+          workers={workers}
           busy={busy}
           canSteer={canSteer}
-          onApprove={(selection) => act(() => submit("approve_plan", "", selection))}
+          onApprove={(selection, overrideCapabilities) =>
+            act(() => submit("approve_plan", "", selection, overrideCapabilities))
+          }
           onReject={(reason) => act(() => submit("reject_plan", reason))}
           onRequestChanges={(feedback) => act(() => submit("revise_plan", feedback))}
           onCancel={() => act(() => submit("cancel"))}
@@ -928,6 +1119,7 @@ export function RunView() {
           connected={connected}
           terminal={terminal}
           phaseUsageBySeq={usage.phaseUsageBySeq}
+          leadContext={usage.leadContext}
         />
       </Card>
 
@@ -1054,6 +1246,7 @@ function RevisionThread({ feedback, working = false }: { feedback: string | null
 export function PlanPanel({
   run,
   messages = [],
+  workers = [],
   busy,
   canSteer = true,
   onApprove,
@@ -1066,6 +1259,11 @@ export function PlanPanel({
   // (PRD #41 Decision 9). Optional so a caller/test that only exercises the base gate
   // can omit it — the derivation degrades to v1 / revision 0 of 3.
   messages?: RunMessage[];
+  // PRD #84 M4 4d: the fleet, so the readiness summary can look up the run's assigned
+  // worker (run.worker_id) and decide which required capabilities it satisfies. Optional
+  // + defaulted to [] so a base-gate-only caller/test need not wire it — an empty list
+  // simply renders every required capability as unmet (the honest fail-closed reading).
+  workers?: Worker[];
   busy: boolean;
   // False for a NON-OWNER viewer. PRE-EXISTING and unrelated to PRD #88: POST /inputs is
   // user-scoped, so a non-owner admin — who can legitimately OPEN this owner-or-admin run
@@ -1076,7 +1274,10 @@ export function PlanPanel({
   // prop, and it hides the ACTIONS only — the plan body stays readable, which is the whole
   // reason a non-owner admin opens this page.
   canSteer?: boolean;
-  onApprove: (selection: AgentSelectionInput) => void;
+  // PRD #84 M4 4d: onApprove takes an optional overrideCapabilities flag — the "run without
+  // the capability" false-positive correction. The normal Approve button omits it (undefined
+  // ≡ false); the readiness block's override button passes true.
+  onApprove: (selection: AgentSelectionInput, overrideCapabilities?: boolean) => void;
   onReject: (reason: string) => void;
   // Request-changes (PRD #41) and the revising-state Cancel-run affordance. Optional
   // with a no-op default so a base-gate-only caller need not wire them.
@@ -1118,6 +1319,35 @@ export function PlanPanel({
   const activeCount = activeRoster.length - selection.exclusions.length;
   const approveLabel =
     activeRoster.length > 0 ? `Approve plan · ${selectionLabel(selection.source, activeCount)}` : "Approve plan";
+
+  // PRD #84 M4 4d: the pre-run readiness summary. Requirements are inferred/hinted
+  // server-side and surfaced RAW on the run (run.required_*); "met" means the run's ASSIGNED
+  // worker (run.worker_id) advertises the capability. required_tools never block (they are
+  // provisioned at run time); size_class is advisory. An empty workers list (fetch not yet
+  // in, or a non-owner with no read) renders every required cap as unmet — the honest
+  // fail-closed reading, matching the 409 the approve gate would return.
+  const requiredCaps = useMemo(() => run.required_capabilities ?? [], [run.required_capabilities]);
+  const requiredTools = useMemo(() => run.required_tools ?? [], [run.required_tools]);
+  const sizeClass = run.size_class ?? "";
+  const workerCaps = useMemo(() => {
+    const w = run.worker_id ? workers.find((x) => x.id === run.worker_id) : undefined;
+    const caps = new Set(w?.capabilities ?? []);
+    // Fold docker_enabled in exactly as the server does (effectiveOwningWorkerCaps /
+    // fn_worker_can_claim: capabilities ∪ {docker if docker_enabled}). The worker DTO carries
+    // `docker` and `capabilities` as INDEPENDENT signals, so a provision-time docker worker
+    // whose self-report has not landed still satisfies a docker requirement — without this
+    // fold the panel would show a false "unmet" for a plan the approve gate accepts.
+    if (w?.docker === true) caps.add("docker");
+    return caps;
+  }, [run.worker_id, workers]);
+  const unmetCaps = useMemo(() => requiredCaps.filter((c) => !workerCaps.has(c)), [requiredCaps, workerCaps]);
+  // Whether to render the readiness panel at all. size_class is DELIBERATELY excluded: the
+  // agent's detectToolchain always emits a non-empty size_class (s/m/l), so including it here
+  // made the panel render for EVERY plan gate. size is advisory-only, so it never justifies the
+  // panel on its own — it is shown as a minor detail INSIDE the panel when a capability or tool
+  // already opened it, and simply not shown when nothing else was inferred. A block is a subset
+  // of requiredCaps, so "a capability, a tool, or a block" reduces to caps-or-tools here.
+  const hasRequirements = requiredCaps.length > 0 || requiredTools.length > 0;
 
   // The rounds counter is always shown at the head; MAX is the display default (the
   // server owns the real cap).
@@ -1228,6 +1458,84 @@ export function PlanPanel({
                 </li>
               ))}
             </ol>
+          </div>
+        )}
+
+        {/* PRD #84 M4 4d: the pre-run readiness summary — the run's inferred/hinted
+            requirements checked against the assigned worker, shown between the candidate
+            milestones and the plan body. Renders NOTHING when no CAPABILITY or TOOL was
+            inferred — size_class alone (always emitted) does not open it (see hasRequirements).
+            Capability/tool names are a server-Filter-ed vocabulary, but rendered through
+            stripUnsafeChars anyway (defense-in-depth, matching the candidate milestones above) —
+            this is an approval dialog. */}
+        {hasRequirements && (
+          <div className="rounded-lg border border-edge bg-surface/60 p-3">
+            <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-faint">Run requirements</p>
+
+            {requiredCaps.length > 0 && (
+              <div className="mb-2">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {requiredCaps.map((cap) => {
+                    const unmet = !workerCaps.has(cap);
+                    return (
+                      <Badge
+                        key={cap}
+                        tone={unmet ? "warning" : "ok"}
+                        title={
+                          unmet
+                            ? `The assigned worker does not advertise "${stripUnsafeChars(cap)}" — this plan cannot run here until one that does claims it, or you run without it.`
+                            : `The assigned worker advertises "${stripUnsafeChars(cap)}".`
+                        }
+                      >
+                        {unmet ? "⚠ " : "✓ "}
+                        {stripUnsafeChars(cap)}
+                      </Badge>
+                    );
+                  })}
+                </div>
+                {unmetCaps.length > 0 && (
+                  <p className="mt-1.5 text-xs text-warn">
+                    Provision or start a worker with:{" "}
+                    <span className="font-medium">{unmetCaps.map((c) => stripUnsafeChars(c)).join(", ")}</span>, or run
+                    without it.
+                  </p>
+                )}
+              </div>
+            )}
+
+            {requiredTools.length > 0 && (
+              <div className="mb-2 flex flex-wrap items-center gap-1.5">
+                {requiredTools.map((tool) => (
+                  <Badge key={tool} tone="neutral" title={`Toolchain provisioned at run time: ${tool}`}>
+                    {stripUnsafeChars(tool)}
+                  </Badge>
+                ))}
+                <span className="text-[11px] text-faint">will be provisioned</span>
+              </div>
+            )}
+
+            {sizeClass !== "" && (
+              <span className="inline-flex items-center rounded-md border border-edge bg-raised/50 px-1.5 py-px text-[11px] font-medium text-muted">
+                {`size: ${stripUnsafeChars(sizeClass)}`}
+              </span>
+            )}
+
+            {/* The false-positive override (PRD #84 M4 4c/4d, Decision 12): when a required
+                capability is unmet AND the viewer can steer, offer a distinct SECONDARY
+                approve that clears the inferred requirements server-side ("run without it").
+                Visually separated from the header's primary Approve so it never reads as the
+                default path. */}
+            {unmetCaps.length > 0 && canSteer && (
+              <div className="mt-2.5 border-t border-edge/60 pt-2.5">
+                <Button variant="secondary" size="sm" disabled={busy} onClick={() => onApprove(selection, true)}>
+                  Run without {unmetCaps.map((c) => stripUnsafeChars(c)).join(", ")}
+                </Button>
+                <p className="mt-1 text-[11px] text-faint">
+                  Approves the plan and drops the inferred capability requirement, in case the inference is a false
+                  positive. The runtime guardrail still refuses the capability&rsquo;s use on a worker that lacks it.
+                </p>
+              </div>
+            )}
           </div>
         )}
 
@@ -1446,7 +1754,13 @@ export function RunHeading({ run }: { run: Run }) {
   return (
     <div className="flex flex-wrap items-center gap-x-2">
       <h1 className="truncate text-xl font-semibold tracking-tight">{stripUnsafeChars(run.issue_title)}</h1>
-      {run.issue_iid != null && <span className="text-sm text-faint">#{run.issue_iid}</span>}
+      <RunIssueRef
+        issueIid={run.issue_iid}
+        issueWebUrl={run.issue_web_url}
+        kind={run.kind}
+        forgeType={run.forge_type}
+        className="text-sm text-faint"
+      />
     </div>
   );
 }
@@ -1556,7 +1870,19 @@ function JudgeUsageStrip({ judgeRun }: { judgeRun: NonNullable<RunReview["judge_
 // state survives a reload and is visible to anyone viewing the run.
 // All judge free text (summary, rationale, target) renders as escaped React text —
 // never markdown/HTML — since it is untrusted judge/worker output (audit carry-forward).
-export function JudgePanel({ run }: { run: Run }) {
+//
+// The poll's stop cap (PRD #119: 150 tries × 4s ≈ 10 min). Exposed as an injectable prop
+// so tests can drive the exact stop boundary in a handful of ticks instead of 149 real
+// event-loop turns (issue #227); production never passes it, so the default always holds.
+export const JUDGE_POLL_MAX_TRIES = 150;
+
+export function JudgePanel({
+  run,
+  pollMaxTries = JUDGE_POLL_MAX_TRIES,
+}: {
+  run: Run;
+  pollMaxTries?: number;
+}) {
   const [review, setReview] = useState<RunReview | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadErr, setLoadErr] = useState("");
@@ -1692,8 +2018,8 @@ export function JudgePanel({ run }: { run: Run }) {
   //   • the local `queued` window before the server reports a pending judge — the first
   //     response with pending_judge null ends it, same as before;
   //   • everything else — the 150-try cap.
-  // Cap is 150 tries × 4s ≈ 10 minutes — a real judge takes minutes, and the old 15-try
-  // (~1 min) cap gave up while the judge it was waiting on was still running.
+  // Cap is JUDGE_POLL_MAX_TRIES (150) tries × 4s ≈ 10 minutes — a real judge takes minutes,
+  // and the old 15-try (~1 min) cap gave up while the judge it was waiting on was still running.
   useEffect(() => {
     if (!polling) return;
     let tries = 0;
@@ -1713,7 +2039,7 @@ export function JudgePanel({ run }: { run: Run }) {
         // while pendingJudge holds its last non-null value, so the effect never re-runs
         // and never re-runs its cleanup — a permanently-failing endpoint would be
         // polled every 4s until unmount.
-        if (tries >= 150) {
+        if (tries >= pollMaxTries) {
           setQueued(false);
           clearInterval(id);
         }
@@ -1734,13 +2060,13 @@ export function JudgePanel({ run }: { run: Run }) {
         setReview(landed);
         baselineUpdatedAt.current = landed.updated_at;
       }
-      if (nextPending === null || tries >= 150) {
+      if (nextPending === null || tries >= pollMaxTries) {
         setQueued(false);
         clearInterval(id);
       }
     }, 4000);
     return () => clearInterval(id);
-  }, [polling, run.id]);
+  }, [polling, run.id, pollMaxTries]);
 
   const rerun = async () => {
     setActionErr("");

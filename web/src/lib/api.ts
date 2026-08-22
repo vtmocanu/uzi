@@ -83,6 +83,10 @@ export interface UserSettings {
    *  judge_model (which itself falls back to opus). Written through PUT /me/settings
    *  alongside default_model, validated by the same model rules. */
   judge_model: string | null;
+  /** Per-user run-summary model override (PRD #362 M2); null means inherit the
+   *  instance summary_model (which itself falls back to haiku). Written through
+   *  PUT /me/settings alongside judge_model, validated by the same model rules. */
+  summary_model: string | null;
   theme: string | null;
   /** Ids of NON-default tokens whose rate meters the user also wants on the
    *  sidebar rail. The default token always shows and is never listed here.
@@ -97,6 +101,8 @@ export interface UserSettingsPatch {
   default_model?: string | null;
   /** Per-user judge model (PRD #69 M2); present-null clears back to inherit. */
   judge_model?: string | null;
+  /** Per-user run-summary model (PRD #362 M2); present-null clears back to inherit. */
+  summary_model?: string | null;
   theme?: string | null;
   /** Replaces the whole sidebar-token set (null clears it); absent leaves it. */
   sidebar_token_ids?: string[] | null;
@@ -363,6 +369,11 @@ export interface Repo {
   // Tier-2 opt-in (PRD #18 M5): when true, a run on this repo also unions the
   // packages from the repo's own devbox.json (packages-only). Default false.
   repo_devbox_opt_in: boolean;
+  // Static per-repo capability hint (PRD #84 M2): a server-owned subset of the
+  // capability vocabulary ({docker, jvm}). A run on this repo inherits these as its
+  // required_capabilities, so the scheduler routes it only to a worker that has them.
+  // The server capability.Filters the list, so only valid names persist. Default [].
+  required_capabilities?: string[];
   // Default-branch CI status (PRD #6), null when there is no cached default-branch
   // pipeline (no CI, MR-only pipelines, or not yet synced).
   pipeline: PipelineStatus | null;
@@ -376,6 +387,25 @@ export interface Repo {
   // re-derives the waivable set. False on a never-checked connection is "unknown,
   // not safe" — the enable/run gates still fail closed server-side.
   guardrail_blocked: boolean;
+  // Computed, caller-scoped "is this repo on the global Docker-worker allowlist"
+  // (PRD #361): a boolean about the caller's own repo, never the list. Set by the
+  // list handlers, like guardrail_blocked. Drives the Repos-page Setup chip.
+  docker_allowlisted: boolean;
+  // Computed, caller-scoped "is a run on this repo actually blocked by the Docker-
+  // allowlist gap right now" (PRD #361): enabled repo, a queued run, ≥1 online worker,
+  // and zero eligible online workers. Drives the Setup chip's info escalation; computed
+  // from eligibility, not the sweeper's health text. Set by the list handlers.
+  docker_blocked: boolean;
+  // Caller-scoped GitHub Projects v2 sync-health summary (PRD #576 M2), null/absent
+  // when the repo is not linked. Drives the Sync badge tone: linked && healthy → green
+  // (ok), linked && !healthy (last_error set) → danger, absent → neutral. Derived from
+  // the github_project_links row (last_error/last_synced_at); set by the list handlers.
+  github_project_sync?: {
+    linked: boolean;
+    healthy: boolean;
+    last_error?: string;
+    last_synced_at?: string;
+  } | null;
 }
 
 // GuardrailOverrideMeta is the audit metadata for an active admin per-repo guardrail
@@ -385,6 +415,33 @@ export interface GuardrailOverrideMeta {
   reason: string;
   by: string;
   at: string;
+}
+
+// GitHub Projects v2 sync status for one repo (PRD #534). Returned by the
+// per-repo status endpoint when the repo is linked; a 404 means "not linked"
+// (indistinguishable from a non-owner probe — existence-hiding is intentional).
+export interface ProjectSyncStatus {
+  project_number: number;
+  owned_by_uzi: boolean;
+  last_synced_at: string | null;
+  last_error: string | null;
+  item_count: number;
+  // Board columns with no matching Status option at the last adopt/resync (PRD #576
+  // M3): the panel surfaces them with a Resync prompt. Always an array from the server
+  // (never null); optional here so a pre-M3 fixture without the field still typechecks.
+  unmatched_columns?: string[];
+}
+// Which GitHub owner a provision/adopt targets (PRD #534): the connecting user,
+// an org, or the token's own viewer. "user" is the default.
+export type ProjectSyncOwnerKind = "user" | "org" | "viewer";
+
+// Board visibility of a linked GitHub Project v2 (PRD #557). `public` round-trips
+// through the GET/PUT visibility routes — GitHub's `ProjectV2.public` is both
+// readable and writable, so the toggle reflects and writes true state.
+// Not exported: used only as the internal response type of the visibility client
+// methods below (no external consumer imports it by name).
+interface ProjectSyncVisibility {
+  public: boolean;
 }
 
 // BlockedRepo is one row of the admin cross-user blocked-repos list (PRD #66 M9,
@@ -600,6 +657,10 @@ export interface AppSettings {
   judge_enforce_all: string;
   judge_cooldown_seconds: string;
   judge_daily_budget: string;
+  // Run-summary model (PRD #362 Decision 8): the model alias the inline run-summary
+  // generator runs on (haiku by default), served as a raw string like every other
+  // setting. Mirrors judge_model's admin machinery but delivers on the issue-run claim.
+  summary_model: string;
   // Run-health detector keys (PRD #47). health_enabled is the text "true"/"false";
   // the rest are integer seconds as strings (the API serves every setting as a
   // string). 0 disables that one signal.
@@ -615,6 +676,16 @@ export interface AppSettings {
   // workers are unaffected. The admin UI edits it as a repo multiselect writing the
   // ids — admins pick paths, never paste UUIDs.
   docker_repo_allowlist: string;
+  // Capability-aware scheduling kill-switch (PRD #84 M2). The text "true"/"false"
+  // (default "true"). When on, a run is routed only to a worker that can run it
+  // (e.g. a docker-needing run only to a docker worker). Turning it OFF reverts to
+  // best-effort claiming; it does NOT disable the docker repo allowlist.
+  capability_aware_scheduling: string;
+  // GitHub Projects v2 sync instance kill-switch (PRD #534 / issue #534 M2). The
+  // text "true"/"false" (default "false"). When OFF, no run mirrors board-column
+  // labels to a linked GitHub Projects Status field — an instance-wide rate-limit /
+  // cost lever. GitLab and Forgejo repos are unaffected either way.
+  github_project_sync_enabled: string;
   // Configurable board-membership + run-eligible labels (PRD #196 M2). All three
   // are served as raw strings like every other setting. run_eligible_labels and
   // board_extra_labels are COMMA-SEPARATED lists (safe because ValidateLabel rejects
@@ -874,6 +945,9 @@ export interface LastFireStarted {
   issue_iid: number | null;
   run_id: string;
   title: string;
+  // Forge issue URL snapshotted at fire time (PRD #411). Optional + nullable so pre-#411
+  // persisted fires and existing mock entries degrade gracefully to a plain number.
+  web_url?: string | null;
 }
 
 // One candidate a persisted fire considered but started nothing for, with its typed
@@ -882,6 +956,9 @@ export interface LastFireSkip {
   issue_iid: number | null;
   title: string;
   reason: ScheduleSkipReason;
+  // Forge issue URL snapshotted at fire time (PRD #411). Optional + nullable so pre-#411
+  // persisted fires and existing mock entries degrade gracefully to a plain number.
+  web_url?: string | null;
 }
 
 // The structured summary of a schedule's most recent persisted fire (PRD #308). matched
@@ -1015,7 +1092,12 @@ export interface Worker {
   // Absent/undefined or null for an external worker (docker is not applicable),
   // false for a hosted worker without the sidecar, true for a docker-capable one.
   docker?: boolean;
-  busy: boolean; // derived: holds a claimed/running/awaiting_approval run (== active_runs > 0)
+  // Server-authoritative capability set (PRD #84 M1): the Filter-ed union of the
+  // worker's self-reported caps and its template-derived caps, v1 vocabulary
+  // {docker, jvm}. Read-only display. Optional so an older response (or a test
+  // fixture) without the field reads as "none".
+  capabilities?: string[];
+  busy: boolean; // derived: holds ANY run of ANY kind, so a chat-only worker is busy:true with active_runs:0 — NOT active_runs > 0
   // Bounded concurrency (PRD #42 Decision 10). active_runs is the live count of the
   // worker's claimed/running/awaiting_approval runs (busy is derived from it);
   // max_concurrent_runs is the worker's advertised slot cap, null when it advertises
@@ -1077,6 +1159,11 @@ export interface Worker {
   last_heartbeat_at: string | null;
   // api-owned anchor of when the worker became online (null offline); uptime = now − this, derived client-side.
   online_since?: string | null;
+  // Set (to when it was cordoned) while a hosted worker is draining/cordoned: it
+  // finishes its in-flight runs but claims nothing new (PRD #422/#496). null for a
+  // worker that will claim normally. Hosted-only by construction. draining is derived
+  // client-side as draining_since != null; it is ORTHOGONAL to upgrade_status/busy.
+  draining_since: string | null;
   created_at: string;
   // Latest container resource sample (PRD #49), all null until the worker reports
   // one (and re-nulled if it stops). stats_cpu_pct is a percentage of the worker's
@@ -1142,6 +1229,12 @@ export type RunStatus =
    *  to the person who owes the run an action. M1 lands the type; the badge, tone and
    *  composer are M2. */
   | "awaiting_input"
+  /** PRD #517: an interactive task run parked awaiting the owner's next
+   *  follow-up. NON-terminal — deliberately absent from TERMINAL_RUN_STATUSES
+   *  below — but unlike limit_wait it does NOT resume on its own; it needs the
+   *  user. Distinct from awaiting_input (a clarification question) because a
+   *  follow-up park is the run's turn-taking pause, not an unanswered question. */
+  | "awaiting_followup"
   /** Parked until the owner's Anthropic usage window reopens (PRD #35).
    *  NON-terminal — deliberately absent from TERMINAL_RUN_STATUSES below. */
   | "limit_wait"
@@ -1167,7 +1260,15 @@ export { TERMINAL_RUN_STATUSES, isTerminalRun } from "./runStatus";
 // This union crosses a JSON decode boundary, so an unlisted member is a silent lie
 // rather than a type error — TypeScript cannot catch a missing value here, only a
 // test can.
-export type StopKind = "cancelled" | "plan_rejected" | "auto_stopped";
+// PRD #517 M4: "stopped" is stamped on a completed interactive run that was
+// gracefully stopped (board.go). It is NOT a human-stopped failure/cancel — the
+// run lands status="completed" (green success) — so it is deliberately NOT in
+// runBadge's HUMAN_STOP_KINDS; see the note there.
+export type StopKind =
+  | "cancelled"
+  | "plan_rejected"
+  | "auto_stopped"
+  | "stopped";
 
 // RunHealth is the server-side run-health flag (PRD #47): a non-terminal,
 // self-clearing signal that a run looks slow, stuck, or looping. "ok" is the
@@ -1261,6 +1362,9 @@ export interface Run {
    *  null on runs created before it landed. Rendered directly through isHttpsUrl; a
    *  null falls back to the legacy GitLab reconstruction (forgeUrls.ts). */
   mr_web_url: string | null;
+  /** Forge-supplied issue web URL (PRD #411), null for issue-less runs or when the
+   *  issue is no longer cached. Rendered through isHttpsUrl into the #<iid> link. */
+  issue_web_url: string | null;
   /** Last MR state the PRD #24 watcher observed for mr_iid
    *  (opened|closed|merged|locked), null when never observed. Display-only hint
    *  (PRD #33); frozen per run, so a superseded run's value can be stale. */
@@ -1299,6 +1403,13 @@ export interface Run {
    *  report_only completion; rides the same embed (rendered only on the detail run view).
    *  UNTRUSTED — render as escaped plain text, never <Markdown>. */
   report_md?: string | null;
+  /** PRD #377: the worker-preserved branch diff on a workflow-scope failure — a GitHub run
+   *  whose branch touched `.github/workflows/**` cannot be pushed by the bot's `repo`-only PAT,
+   *  so the run ends `failed` and the agent's (scrubbed, size-capped) unified diff is preserved
+   *  here for a human to land as a PR. Non-null only on such a failed run; rides the same embed.
+   *  UNTRUSTED worker-authored text — render as escaped plain text through stripUnsafeChars,
+   *  never <Markdown>, exactly like report_md/failure_reason. */
+  preserved_patch?: string | null;
   /** issue #150: the repo-relative path the run declared it moved a completed PRD to
    *  (e.g. `prds/done/72-x.md`), and the RFC3339 instant its PRD-completion patch settled.
    *  Both null on a run that moved no PRD. OPTIONAL for the SAME api/web rollout skew as
@@ -1320,6 +1431,18 @@ export interface Run {
    *  never dereferenced, so an absent value reads as not-seeded and the seeded surfaces
    *  simply do not render (no `?? null` normalization needed, unlike pending_judge). */
   plan_source?: PlanSource;
+  /** PRD #362: plain-English run summaries. `summary_intent` ("what this run will
+   *  implement") lands early in `running`; `summary_plan` ("what the proposed plan will
+   *  do") and `summary_deltas` (how the plan diverged from the ask) land at the plan gate.
+   *  All null until the worker generates and posts them, and null forever on any
+   *  generation failure — summaries are advisory and the UI falls back to the issue title.
+   *  UNTRUSTED, model-authored text: render as escaped plain text, never <Markdown>. A
+   *  malformed `summary_deltas` is tolerated server-side and arrives as null ("no
+   *  deltas"). OPTIONAL for the SAME api/web rollout skew as plan_source — a mid-deploy api
+   *  pod that predates these fields omits the keys. */
+  summary_intent?: string | null;
+  summary_plan?: string | null;
+  summary_deltas?: { kind: string; text: string }[] | null;
   /** PRD #37: the roster the worker detected in the clone's `.claude/agents/`.
    *  null = no worker reported (a pre-feature run); `[]` = detection ran and found
    *  none (the plan gate's repo card is inert, NOT the same as null). Names +
@@ -1435,6 +1558,21 @@ export interface Run {
    *  vocabulary is the SDK's and a newer server can ship a member this build has not
    *  heard of. Null for a run that has never parked. */
   rate_limit_type: string | null;
+  /** PRD #84 M4: the run's inferred/hinted scheduling requirements, surfaced RAW so the
+   *  web derives the plan-gate readiness display from them plus the assigned worker's
+   *  capabilities (there is no server-computed "capability_block" field — the 409 the
+   *  approval gate returns is the authoritative enforcement). `required_capabilities` is
+   *  the claim-gating set (M2 repo hint UNION plan-time inference); `required_tools` are
+   *  DISPLAY-ONLY provisionable toolchain families that never block; `size_class` is the
+   *  clamped s/m/l estimate ("" when plan-time inference never set it).
+   *
+   *  OPTIONAL + back-compat, mirroring RepoDTO.required_capabilities: a mid-deploy api pod
+   *  that predates PRD #84 M4 omits the keys, and an absent value reads as "none inferred"
+   *  so the readiness block simply does not render. The server Filter-s the capability set
+   *  to the v1 vocabulary ({docker, jvm}), so a name here is always known. */
+  required_capabilities?: string[];
+  required_tools?: string[];
+  size_class?: string;
 }
 
 // RunUsage is a run's server-rolled token/cost totals (PRD #40). The run VIEW
@@ -2673,6 +2811,10 @@ const realApi = {
   listRepos: () => request<{ repos: Repo[] }>("GET", "/repos"),
   setRepoEnabled: (id: string, enabled: boolean) =>
     request<{ repo: Repo }>("PUT", `/repos/${id}`, { enabled }),
+  // Explicit per-repo remove (PRD #357). Owner-scoped; the server permits it only
+  // on a DISABLED repo with no in-flight run (409 otherwise), then deletes the
+  // repos row and cascades its board/run history. Empty 204 body.
+  deleteRepo: (id: string) => request<null>("DELETE", `/repos/${id}`),
   setRepoSkillsEnabled: (id: string, enabled: boolean) =>
     request<{ repo: Repo }>("PATCH", `/repos/${id}`, {
       repo_skills_enabled: enabled,
@@ -2695,6 +2837,14 @@ const realApi = {
     request<{ repo: Repo }>("PATCH", `/repos/${id}`, {
       repo_devbox_opt_in: enabled,
     }),
+  // Static per-repo capability hint (PRD #84 M2). Owner or admin. Mutually
+  // exclusive in one request with repo_devbox_opt_in and the trust flags, so it is
+  // sent alone. The server capability.Filters the list to the {docker, jvm}
+  // vocabulary, so only valid names persist.
+  setRepoRequiredCapabilities: (id: string, caps: string[]) =>
+    request<{ repo: Repo }>("PATCH", `/repos/${id}`, {
+      required_capabilities: caps,
+    }),
   // Admin per-repo guardrail override (PRD #66 D8). ADMIN-ONLY, no member path — a
   // dedicated route, not PatchRepo. Requires a non-empty reason; returns the repo.
   setRepoGuardrailOverride: (id: string, reason: string) =>
@@ -2704,6 +2854,93 @@ const realApi = {
   // Revoke the override (PRD #66 D8): NULLs it, re-arming the guardrail immediately.
   clearRepoGuardrailOverride: (id: string) =>
     request<{ repo: Repo }>("DELETE", `/admin/repos/${id}/guardrail-override`),
+
+  // GitHub Projects v2 sync (PRD #534). Owner-or-admin; the server 404s a
+  // non-linked or non-owner repo (existence-hiding). Read the current link
+  // status; a 404 is the caller's "not linked yet" signal.
+  getProjectSyncStatus: (id: string) =>
+    request<ProjectSyncStatus>("GET", `/repos/${id}/github-project-sync`),
+  // Provision a brand-new Project v2 for this repo (201 { status: "provisioned" }).
+  // An empty title lets the server pick a default.
+  provisionProjectSync: (
+    id: string,
+    body: { owner_kind: ProjectSyncOwnerKind; title?: string },
+  ) =>
+    request<{ status: string }>(
+      "POST",
+      `/repos/${id}/github-project-sync/provision`,
+      { owner_kind: body.owner_kind, title: body.title ?? "" },
+    ),
+  // Read the repo owner's GitHub type for the Adopt-first Provision nudge (PRD
+  // #576 M1): a live forge round-trip (repositoryOwner __typename), fetched for a
+  // not-yet-linked repo. "User" means Provision cannot own a project under a
+  // personal account (Adopt instead); "Organization" means Provision is available.
+  getProjectSyncOwnerType: (id: string) =>
+    request<{ owner_type: "User" | "Organization" }>(
+      "GET",
+      `/repos/${id}/github-project-sync/owner-type`,
+    ),
+  // Adopt an EXISTING Project v2 by number (200 { status: "linked" }).
+  adoptProjectSync: (
+    id: string,
+    body: { project_number: number; owner_kind: ProjectSyncOwnerKind },
+  ) => request<{ status: string }>("POST", `/repos/${id}/github-project-sync`, body),
+  // Re-seed an already-linked board (PRD #576 M3): re-reads the Status field so
+  // newly-added options resolve and re-persists the unmatched set. Idempotent (Adopt
+  // re-diffs every item); needs no body. 200 { status: "resynced" }; 404 when the repo
+  // has no link.
+  resyncProjectSync: (id: string) =>
+    request<{ status: string }>(
+      "POST",
+      `/repos/${id}/github-project-sync/resync`,
+    ),
+  // Safe column auto-create (PRD #576 M6): create a FRESH uzi-owned "uzi Status"
+  // field on the adopted board carrying ALL the repo's columns and switch the link to
+  // it, turning skipped columns into synced ones with no manual GitHub edit and no
+  // destructive field replace. Needs no body. 200 { status: "columns_created" }; 404
+  // when the repo has no link. Tradeoff: the board then carries two status-like fields.
+  autocreateProjectSyncColumns: (id: string) =>
+    request<{ status: string }>(
+      "POST",
+      `/repos/${id}/github-project-sync/autocreate-columns`,
+    ),
+  // Unlink the repo from its project (204, empty body). Idempotent server-side.
+  disableProjectSync: (id: string) =>
+    request<null>("DELETE", `/repos/${id}/github-project-sync`),
+
+  // Board access — visibility + write-only sharing (PRD #557). Owner-or-admin,
+  // GitHub-only; the server 404s a non-linked/non-owner repo (existence-hiding),
+  // 409s when the instance flag is off, and 422s a bad username / non-GitHub repo.
+
+  // Read the linked board's current public/private flag. A SEPARATE live-forge
+  // call (D4), issued lazily when the Board-access section opens — kept off the
+  // DB-only status GET so the common status open pays nothing.
+  getProjectSyncVisibility: (id: string) =>
+    request<ProjectSyncVisibility>(
+      "GET",
+      `/repos/${id}/github-project-sync/visibility`,
+    ),
+  // Flip the board's public flag (updateProjectV2). Returns the new state; the
+  // JSON key is `public`, matching the Go handler's setVisibilityRequest.
+  setProjectSyncVisibility: (id: string, isPublic: boolean) =>
+    request<ProjectSyncVisibility>(
+      "PUT",
+      `/repos/${id}/github-project-sync/visibility`,
+      { public: isPublic },
+    ),
+  // Grant a GitHub user Reader access to the board (204, empty body). WRITE-ONLY
+  // by necessity (D2): GitHub exposes no readable collaborator list, so uzi can
+  // grant but cannot enumerate current collaborators. A 422 means "no such user".
+  shareProjectSync: (id: string, username: string) =>
+    request<null>("POST", `/repos/${id}/github-project-sync/collaborators`, {
+      username,
+    }),
+  // Revoke a GitHub user's access (204, empty body). The DELETE carries a body —
+  // `request` JSON-stringifies it for any non-GET/HEAD method (D2, write-only).
+  unshareProjectSync: (id: string, username: string) =>
+    request<null>("DELETE", `/repos/${id}/github-project-sync/collaborators`, {
+      username,
+    }),
 
   getBoard: (repoId: string) =>
     request<{ board: Board }>("GET", `/repos/${repoId}/board`),
@@ -2870,6 +3107,13 @@ const realApi = {
     kind: RunInputKind,
     body = "",
     selection?: AgentSelectionInput,
+    // PRD #84 M4 4c: the "run without the capability" override, meaningful ONLY with
+    // approve_plan (the server ignores it on any other kind). When true the server clears
+    // the run's inferred/hinted required_capabilities before approving, so a plan the
+    // capability gate would otherwise 409-BLOCK is approved anyway — the deliberate
+    // false-positive-inference correction. Sent only when truthy so an ordinary approve
+    // body is unchanged (default false server-side).
+    overrideCapabilities?: boolean,
   ) =>
     request<{ server_side: boolean; id?: number; created_at?: string }>(
       "POST",
@@ -2881,6 +3125,7 @@ const realApi = {
         // server ignores/validates it per kind. Omitted entirely when absent so a
         // plain follow-up/cancel body is unchanged.
         ...(selection ? { selection } : {}),
+        ...(overrideCapabilities ? { override_capabilities: true } : {}),
       },
     ),
 

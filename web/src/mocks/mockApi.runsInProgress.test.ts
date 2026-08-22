@@ -52,6 +52,7 @@ describe("mockApi.runsInProgressCount parity (PRD #239 M2)", () => {
     expect(seeded.some(inProgress)).toBe(true); // an included, counted run
     expect(seeded.some((r) => r.status === "awaiting_approval" || r.status === "awaiting_input")).toBe(true);
     expect(seeded.some((r) => r.status === "limit_wait")).toBe(true);
+    expect(seeded.some((r) => r.status === "awaiting_followup")).toBe(true); // PRD #517 follow-up park (non-terminal, counted)
     // The excluded kinds must be present AND non-terminal, or excluding them changes nothing.
     expect(seeded.some((r) => r.kind === "chat" && !isTerminalRun(r.status))).toBe(true);
     expect(seeded.some((r) => r.kind === "judge" && !isTerminalRun(r.status))).toBe(true);

@@ -1,14 +1,41 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
+
+// realGit is the production Env.Git: it runs `git <args>` in dir, returning the
+// trimmed stdout on success. On failure the returned error carries git's stderr
+// so the caller can report a clean, actionable message. Stdin and stderr are
+// connected to the process so an interactive credential helper can prompt on a
+// push/delete (the user's own creds — PRD #400 Decision 6); stdout is captured so
+// a value read like `git remote get-url origin` is returned rather than printed.
+// stderr is BOTH streamed (so the prompt is visible) and captured (so the error
+// message is clean) via an io.MultiWriter.
+func realGit(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = io.MultiWriter(&stderr, os.Stderr)
+	cmd.Stdin = os.Stdin
+	if err := cmd.Run(); err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return "", fmt.Errorf("git %s: %w: %s", args[0], err, msg)
+		}
+		return "", fmt.Errorf("git %s: %w", args[0], err)
+	}
+	return strings.TrimSpace(stdout.String()), nil
+}
 
 // version is stamped at build time via -ldflags "-X main.version=vX.Y.Z"
 // (the brew formula does this). It equals the uzi v* tag the binary was built
@@ -32,6 +59,16 @@ type Env struct {
 	// real-client stub; tests inject a fake; M7 replaces the default with the
 	// live HTTP client.
 	NewClient func(uzicli.Settings) uzicli.Client
+
+	// Git runs `git <args>` in dir and returns its trimmed stdout, or an error
+	// whose message includes git's stderr on failure. It is the CLI's one
+	// shell-out seam (PRD #400 M3): `uzi handoff` uses it to detect the repo's
+	// origin and to push local HEAD to the server-named uzi/task/<id> branch with
+	// the USER's own credentials. DefaultEnv wires the real exec.Command (with
+	// stdin/stderr connected so a credential helper can prompt); tests inject a
+	// fake that records calls and returns canned output/errors, so no command test
+	// forks git. Same injection-seam contract as NewClient above.
+	Git func(dir string, args ...string) (string, error)
 
 	// Store reads config/credentials. May be nil (e.g. no home dir), in which
 	// case only env/flags supply settings.
@@ -70,6 +107,7 @@ func DefaultEnv() Env {
 		StdoutTTY:          uzicli.IsTerminal(os.Stdout),
 		StdinTTY:           uzicli.IsTerminal(os.Stdin),
 		NewClient:          func(s uzicli.Settings) uzicli.Client { return uzicli.NewHTTPClient(s) },
+		Git:                realGit,
 		Store:              store,
 		AutoUpgradeSkill:   true,
 		CheckServerVersion: true,
@@ -82,6 +120,7 @@ type globalFlags struct {
 	url     string
 	quiet   bool
 	noColor bool
+	context string
 }
 
 // Main builds the command tree, runs it, prints any error to stderr, and maps
@@ -100,7 +139,13 @@ func Main(env Env, args []string) int {
 		// CellText, not SanitizeTTY: this is a one-line report with a fixed "uzi: "
 		// prefix, so a newline in a server error would print a second line that carries
 		// no prefix and reads as the CLI's own voice.
-		_, _ = fmt.Fprintln(env.Stderr, "uzi:", uzicli.CellText(err.Error()))
+		//
+		// The LOCAL cellText, not uzicli.CellText: the server's {"error": "..."} body is
+		// read via a 32 MiB io.LimitReader in uzicli, and CellText does not truncate, so a
+		// hostile server's megabyte-long error would print here in full. The local helper
+		// adds compactText's 200-char cap on top of the SAME strip/fold, keeping this
+		// broadest untrusted-text line bounded (#220).
+		_, _ = fmt.Fprintln(env.Stderr, "uzi:", cellText(err.Error()))
 	}
 	return uzicli.ExitCodeFor(err)
 }
@@ -159,11 +204,13 @@ func newRootCmd(env Env) *cobra.Command {
 	pf.StringVar(&gf.url, "url", "", "uzi API base URL (overrides config and $UZI_URL)")
 	pf.BoolVar(&gf.quiet, "quiet", false, "suppress non-essential output")
 	pf.BoolVar(&gf.noColor, "no-color", false, "disable colour output")
+	pf.StringVarP(&gf.context, "context", "c", "", "named context to use (overrides $UZI_CONTEXT and config current)")
 
 	root.AddCommand(
 		newLoginCmd(env, gf),
 		newLogoutCmd(env, gf),
 		newAuthCmd(env, gf),
+		newContextCmd(env, gf),
 		newWhoamiCmd(env, gf),
 		newRunCmd(env, gf),
 		newScheduleCmd(env, gf),
@@ -174,6 +221,8 @@ func newRootCmd(env Env) *cobra.Command {
 		newTokenCmd(env, gf),
 		newMemoryCmd(env, gf),
 		newRepoCmd(env, gf),
+		newProjectSyncCmd(env, gf),
+		newHandoffCmd(env, gf),
 		newAdminCmd(env, gf),
 		newSkillCmd(env, gf),
 		newVersionCmd(env, gf),
@@ -181,29 +230,118 @@ func newRootCmd(env Env) *cobra.Command {
 	return root
 }
 
-// resolveSettings layers env vars and flags over the store-resolved context.
-// Precedence: --url > $UZI_URL > config file for the URL; $UZI_TOKEN >
-// credentials file for the token. There is deliberately no --token flag — a
-// credential must never land on argv (PRD #64).
+// resolveContextName returns the active context name and whether it was chosen
+// explicitly. Precedence (PRD #427 D1): --context/-c flag > $UZI_CONTEXT >
+// config.Current > "default". An empty flag or empty $UZI_CONTEXT is treated as
+// unset (the same `!= ""` "set" test resolveSettings uses for $UZI_URL), so
+// `-c ""` falls through. `explicit` is true when the name came from the flag,
+// $UZI_CONTEXT, or config.Current, and false only for the implicit "default"
+// fallback — D9's existence check keys on that bit.
+//
+// It resolves the NAME ONLY; it does not validate that the context exists. A
+// LoadConfig failure is surfaced as the error return rather than swallowed. When
+// env.Store is nil there is no config, so the implicit "default" is returned.
+func resolveContextName(env Env, gf *globalFlags) (string, bool, error) {
+	if gf.context != "" {
+		return gf.context, true, nil
+	}
+	if v := os.Getenv("UZI_CONTEXT"); v != "" {
+		return v, true, nil
+	}
+	if env.Store == nil {
+		return "default", false, nil
+	}
+	cfg, err := env.Store.LoadConfig()
+	if err != nil {
+		return "", false, err
+	}
+	if cfg.Current != "" {
+		return cfg.Current, true, nil
+	}
+	return "default", false, nil
+}
+
+// resolveSettings resolves the active context (PRD #427 D1), reads its stored
+// URL/token, applies D3 URL inheritance from the default context, then layers
+// env vars and flags on top. Precedence for the URL: --url > $UZI_URL > active
+// context URL > default context URL; for the token: $UZI_TOKEN > active context
+// token. There is deliberately no --token flag — a credential must never land on
+// argv (PRD #64).
 func resolveSettings(env Env, gf *globalFlags) (uzicli.Settings, error) {
+	name, explicit, err := resolveContextName(env, gf)
+	if err != nil {
+		return uzicli.Settings{}, uzicli.Exitf(uzicli.ExitAuth, "%v", err)
+	}
+
 	var s uzicli.Settings
 	if env.Store != nil {
-		var err error
-		s, err = env.Store.Resolve("default")
+		cfg, err := env.Store.LoadConfig()
+		if err != nil {
+			return s, uzicli.Exitf(uzicli.ExitAuth, "%v", err)
+		}
+		creds, err := env.Store.LoadCredentials()
+		if err != nil {
+			return s, uzicli.Exitf(uzicli.ExitAuth, "%v", err)
+		}
+		// D9: an explicitly named context that exists in neither map is an error
+		// before any client is built. The implicit "default" fallback must never
+		// error on absence — a fresh user's first `uzi --url … login` has no
+		// stored default context yet.
+		if explicit {
+			_, inCfg := cfg.Contexts[name]
+			_, inCreds := creds.Contexts[name]
+			if !inCfg && !inCreds {
+				return s, uzicli.Exitf(uzicli.ExitUsage, "unknown context %q", name)
+			}
+		}
+		s, err = env.Store.Resolve(name)
 		if err != nil {
 			return s, uzicli.Exitf(uzicli.ExitAuth, "%v", err)
 		}
 	}
-	if v := os.Getenv("UZI_URL"); v != "" {
-		s.URL = v
+	// URL layering — D3 inheritance plus $UZI_URL/--url — is factored into
+	// resolveURL so `login` (which must resolve a URL for a brand-new --context
+	// name that D9 would reject) shares the exact same precedence and cannot drift
+	// from it. The result overrides s.URL from Resolve above (resolveURL re-reads
+	// the same stored URL), so the two are equivalent for an existing context.
+	u, err := resolveURL(env, gf, name)
+	if err != nil {
+		return s, err
 	}
+	s.URL = u
 	if v := os.Getenv("UZI_TOKEN"); v != "" {
 		s.Token = v
 	}
-	if gf.url != "" {
-		s.URL = gf.url
-	}
 	return s, nil
+}
+
+// resolveURL resolves the API base URL for the named context with the same
+// precedence resolveSettings applies — --url > $UZI_URL > the context's own
+// stored URL > the default context's stored URL (D3 inheritance) — but WITHOUT
+// D9's existence gate and without touching credentials. `login` uses it: a login
+// is a WRITE that D4 lets CREATE a brand-new --context name, so it must resolve a
+// URL for a context resolveSettings would reject as unknown, and it needs only the
+// URL (the token comes fresh from the server).
+func resolveURL(env Env, gf *globalFlags, name string) (string, error) {
+	var u string
+	if env.Store != nil {
+		cfg, err := env.Store.LoadConfig()
+		if err != nil {
+			return "", uzicli.Exitf(uzicli.ExitAuth, "%v", err)
+		}
+		u = cfg.Contexts[name].URL
+		// D3: a context with no stored URL inherits the default context's URL.
+		if u == "" && name != "default" {
+			u = cfg.Contexts["default"].URL
+		}
+	}
+	if v := os.Getenv("UZI_URL"); v != "" {
+		u = v
+	}
+	if gf.url != "" {
+		u = gf.url
+	}
+	return u, nil
 }
 
 // client resolves settings and builds the API client.

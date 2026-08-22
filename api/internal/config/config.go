@@ -298,6 +298,7 @@ type Config struct {
 	// payload; the rest drive the server sweeper and claim affinity.
 	RunTimeout              time.Duration // wall clock before a running run is failed
 	RunIdleTimeout          time.Duration // worker-side no-message idle cap
+	WorkerTaskIdleTimeout   time.Duration // PRD #517 M5: interactive-task park idle cap (worker-side); rides the claim
 	RunMaxIterations        int           // implement⇄review loop cap (worker-side)
 	PlanMaxRevisions        int           // PRD #41 plan-revision cap at the approval gate (server + worker)
 	QuestionMax             int           // PRD #88 clarification-question cap per run (worker-enforced)
@@ -305,6 +306,7 @@ type Config struct {
 	RunMaxRequeues          int           // worker-death re-queues allowed before a run is failed
 	WorkerHeartbeatInterval time.Duration // how often a worker heartbeats
 	WorkerHeartbeatStale    time.Duration // no heartbeat past this ⇒ worker offline + runs re-queued
+	SweepInterval           time.Duration // run-liveness sweep cadence; 0 ⇒ sweeper's built-in 15s default
 	WorkerPollInterval      time.Duration // worker claim-poll cadence
 	WorkerAffinityGrace     time.Duration // a re-queued run waits this long for its prior worker
 	WorkerSpreadGrace       time.Duration // PRD #216: a queued run older than this is exempt from the fleet-aware spread
@@ -492,6 +494,14 @@ type Config struct {
 	// workers and then turned hosting off is exactly the case that would strand
 	// ciphertext, so the sweep — and therefore this knob — outlives the flag.
 	HostedTokenTTL time.Duration
+
+	// HostedWorkerVersion is the concrete pinned hosted-worker image tag (the deploy's
+	// workers.image.tag, PRD #422), used as the hosted-worker upgrade-badge target so a
+	// worker intentionally pinned behind appVersion is not flagged outdated once the
+	// api's own release (appVersion) has moved ahead of it. Optional and unvalidated at
+	// load (empty = unknown, handled at use): empty falls back to the api's own release,
+	// which is today's behavior.
+	HostedWorkerVersion string
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -680,6 +690,13 @@ func Load() (Config, error) {
 
 	cfg.RunTimeout = parseDuration("RUN_TIMEOUT", 2*time.Hour)
 	cfg.RunIdleTimeout = parseDuration("RUN_IDLE_TIMEOUT", 10*time.Minute)
+	// PRD #517 M5: the interactive-task park's worker-side idle backstop, delivered on
+	// the claim (like RunIdleTimeout). Shorter than chat's 60m because a parked task pins
+	// a git clone/HOME + worker slot; on idle the worker gracefully finalizes (push, MR
+	// iff open_mr) → completed. There is deliberately NO server-side park-age sweep: a
+	// dead-worker park is recovered by the existing stale-worker requeue (M2), not a new
+	// TASK_IDLE_TIMEOUT completing a run the server cannot push.
+	cfg.WorkerTaskIdleTimeout = parseDuration("WORKER_TASK_IDLE_TIMEOUT", 30*time.Minute)
 	cfg.RunMaxIterations = parseInt("RUN_MAX_ITERATIONS", 5)
 	cfg.PlanMaxRevisions = parseInt("PLAN_MAX_REVISIONS", 3)
 	cfg.QuestionMax = parseInt("QUESTION_MAX", 5)
@@ -687,6 +704,9 @@ func Load() (Config, error) {
 	cfg.RunMaxRequeues = parseNonNegInt("RUN_MAX_REQUEUES", 1)
 	cfg.WorkerHeartbeatInterval = parseDuration("WORKER_HEARTBEAT_INTERVAL", 15*time.Second)
 	cfg.WorkerHeartbeatStale = parseDuration("WORKER_HEARTBEAT_STALE", 45*time.Second)
+	// 0 (or unset) delegates to the sweeper's own built-in 15s default, so current
+	// behaviour is preserved unless SWEEP_INTERVAL is explicitly set.
+	cfg.SweepInterval = parseNonNegDuration("SWEEP_INTERVAL", 0)
 	cfg.WorkerPollInterval = parseDuration("WORKER_POLL_INTERVAL", 3*time.Second)
 	cfg.WorkerAffinityGrace = parseDuration("WORKER_AFFINITY_GRACE", 2*time.Minute)
 	// PRD #216: a queued run older than this grace is exempt from the fleet-aware
@@ -817,6 +837,10 @@ func Load() (Config, error) {
 	if err := loadWorkerHosting(&cfg); err != nil {
 		return Config{}, err
 	}
+	// PRD #422: the concrete pinned hosted-worker image tag (deploy's workers.image.tag),
+	// used as the hosted-worker upgrade-badge target. Optional, unvalidated at load (empty
+	// falls back to the api's own release at classification time — today's behavior).
+	cfg.HostedWorkerVersion = getenv("HOSTED_WORKER_VERSION", "")
 	// Must run after Addr and TLSAddr are set (it rejects the two colliding).
 	if err := loadTLS(&cfg); err != nil {
 		return Config{}, err

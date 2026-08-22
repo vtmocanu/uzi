@@ -92,6 +92,9 @@ func (f *fakeForge) UserExists(context.Context, string) (bool, error) { return f
 func (f *fakeForge) ListIssueLabelEvents(context.Context, int64, int64) ([]forge.LabelEvent, error) {
 	return nil, nil
 }
+func (f *fakeForge) ListIssueComments(context.Context, int64, int64) ([]forge.IssueComment, error) {
+	return nil, nil
+}
 func (f *fakeForge) CreateIssueNote(context.Context, int64, int64, string) (forge.IssueNote, error) {
 	return forge.IssueNote{}, nil
 }
@@ -223,8 +226,8 @@ func TestEvaluateToken(t *testing.T) {
 		wantWarning   string // substring expected in warnings, "" if none
 	}{
 		{"exactly api is clean", forge.TokenInfo{Scopes: []string{"api"}, Active: true}, false, "", ""},
-		{"extra scope is a violation", forge.TokenInfo{Scopes: []string{"api", "sudo"}, Active: true}, false, "are not exactly [api]", ""},
-		{"read_api instead of api is a violation", forge.TokenInfo{Scopes: []string{"read_api"}, Active: true}, false, "are not exactly [api]", ""},
+		{"extra scope is a violation", forge.TokenInfo{Scopes: []string{"api", "sudo"}, Active: true}, false, "are not acceptable", ""},
+		{"read_api instead of api is a violation", forge.TokenInfo{Scopes: []string{"read_api"}, Active: true}, false, "are not acceptable", ""},
 		{"instance admin is a violation", forge.TokenInfo{Scopes: []string{"api"}, Active: true}, true, "instance admin", ""},
 		{"inactive is a violation", forge.TokenInfo{Scopes: []string{"api"}, Active: false}, false, "not active", ""},
 		{"expired is a violation", forge.TokenInfo{Scopes: []string{"api"}, Active: true, ExpiresAt: expired}, false, "has expired", ""},
@@ -470,19 +473,25 @@ func TestScopesPerForge(t *testing.T) {
 		// set, with no attempt to expand it.
 		{"forgejo all literal violates", forge.TypeForgejo, []string{"all"}, true},
 		{"forgejo gitlab-api violates", forge.TypeForgejo, []string{"api"}, true},
-		// GitHub classic PAT: exactly {repo} (PRD #238 D7). The "exactly" set
-		// semantics make {repo, workflow} and {repo, delete_repo} over-privilege
-		// violations for free (D7a); {public_repo} alone is a subset and fails too.
+		// GitHub classic PAT: {repo} is REQUIRED (PRD #238 D7). Since PRD #364 the
+		// acceptance is a bounded superset, not exact equality: {repo, project} and
+		// {repo, read:project} PASS (the board↔Projects v2 sync needs `project`), while
+		// {repo, workflow} and {repo, delete_repo} still VIOLATE (D7a preserved), and
+		// {public_repo} alone is a subset that fails.
 		{"github exactly repo is clean", forge.TypeGitHub, []string{"repo"}, false},
+		{"github repo+project is clean", forge.TypeGitHub, []string{"repo", "project"}, false},
+		{"github repo+read:project is clean", forge.TypeGitHub, []string{"repo", "read:project"}, false},
+		{"github repo+project+read:project is clean", forge.TypeGitHub, []string{"repo", "project", "read:project"}, false},
 		{"github repo+workflow violates", forge.TypeGitHub, []string{"repo", "workflow"}, true},
 		{"github repo+delete_repo violates", forge.TypeGitHub, []string{"repo", "delete_repo"}, true},
+		{"github project without repo violates", forge.TypeGitHub, []string{"project"}, true},
 		{"github public_repo alone violates", forge.TypeGitHub, []string{"public_repo"}, true},
 		{"github gitlab-api violates", forge.TypeGitHub, []string{"api"}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tr := evaluateToken(tc.forgeType, forge.TokenInfo{Scopes: tc.scopes, Active: true}, false, now, warnWindow, "")
-			got := hasFinding(tr.Violations, "are not exactly")
+			got := hasFinding(tr.Violations, "are not acceptable")
 			if got != tc.wantViolation {
 				t.Errorf("scopes %v on %s: scope violation = %v, want %v (violations=%v)",
 					tc.scopes, tc.forgeType, got, tc.wantViolation, tr.Violations)
@@ -491,26 +500,54 @@ func TestScopesPerForge(t *testing.T) {
 	}
 }
 
-// TestRequiredScopesGitHub pins PRD #238 D7: the GitHub required set is exactly
-// {repo}, and the unordered set-equality accepts it while rejecting supersets and
-// subsets. GitLab {api} and Forgejo's three-scope set are unchanged (covered by
-// TestScopesPerForge); this asserts the rule primitives directly.
+// TestRequiredScopesGitHub pins PRD #238 D7 as reshaped by PRD #364: the GitHub
+// required set is still exactly {repo}, but the acceptance test (scopesAcceptable)
+// is a bounded superset — a superset of {repo} AND a subset of {repo} ∪
+// {project, read:project}. So {repo}, {repo, project} and {repo, read:project} pass
+// while supersets outside the optional allowance ({repo, workflow}) and subsets
+// ({public_repo}) fail. GitLab {api} and Forgejo's three-scope set are unchanged
+// (covered by TestScopesPerForge); this asserts the rule primitives directly.
 func TestRequiredScopesGitHub(t *testing.T) {
 	req := requiredScopesFor(forge.TypeGitHub)
 	if len(req) != 1 || req[0] != "repo" {
 		t.Fatalf("requiredScopesFor(github) = %v, want [repo]", req)
 	}
-	if !scopesEqualRequired(forge.TypeGitHub, []string{"repo"}) {
-		t.Errorf("{repo} should equal the github required set")
+	// The optional allowance is exactly {project, read:project} for GitHub, and empty
+	// for the other forges (their behavior must not change).
+	if opt := allowedOptionalScopesFor(forge.TypeGitHub); len(opt) != 2 || opt[0] != "project" || opt[1] != "read:project" {
+		t.Fatalf("allowedOptionalScopesFor(github) = %v, want [project read:project]", opt)
 	}
-	if scopesEqualRequired(forge.TypeGitHub, []string{"repo", "workflow"}) {
-		t.Errorf("{repo, workflow} is over-privilege, must not equal required")
+	if len(allowedOptionalScopesFor(forge.TypeGitLab)) != 0 || len(allowedOptionalScopesFor(forge.TypeForgejo)) != 0 {
+		t.Fatalf("gitlab/forgejo must have no optional scopes")
 	}
-	if scopesEqualRequired(forge.TypeGitHub, []string{"repo", "delete_repo"}) {
-		t.Errorf("{repo, delete_repo} is over-privilege, must not equal required")
+	if !scopesAcceptable(forge.TypeGitHub, []string{"repo"}) {
+		t.Errorf("{repo} should be accepted for github")
 	}
-	if scopesEqualRequired(forge.TypeGitHub, []string{"public_repo"}) {
-		t.Errorf("{public_repo} is a subset, must not equal required")
+	if !scopesAcceptable(forge.TypeGitHub, []string{"repo", "project"}) {
+		t.Errorf("{repo, project} should be accepted for github (PRD #364)")
+	}
+	if !scopesAcceptable(forge.TypeGitHub, []string{"repo", "read:project"}) {
+		t.Errorf("{repo, read:project} should be accepted for github (PRD #364)")
+	}
+	if scopesAcceptable(forge.TypeGitHub, []string{"repo", "workflow"}) {
+		t.Errorf("{repo, workflow} is over-privilege, must not be accepted")
+	}
+	if scopesAcceptable(forge.TypeGitHub, []string{"repo", "delete_repo"}) {
+		t.Errorf("{repo, delete_repo} is over-privilege, must not be accepted")
+	}
+	if scopesAcceptable(forge.TypeGitHub, []string{"public_repo"}) {
+		t.Errorf("{public_repo} is a subset, must not be accepted")
+	}
+	if scopesAcceptable(forge.TypeGitHub, []string{"project"}) {
+		t.Errorf("{project} without repo is missing the required scope, must not be accepted")
+	}
+	// GitLab acceptance is unchanged: {api} passes, {api, project} does not (project
+	// is not in GitLab's optional set).
+	if !scopesAcceptable(forge.TypeGitLab, []string{"api"}) {
+		t.Errorf("{api} should be accepted for gitlab")
+	}
+	if scopesAcceptable(forge.TypeGitLab, []string{"api", "project"}) {
+		t.Errorf("{api, project} is over-privilege for gitlab (optional set is empty)")
 	}
 }
 

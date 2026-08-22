@@ -188,7 +188,13 @@ export function buildSignalMcpServer(
   // option is set, so the `milestones` param is invisible to the model on a
   // non-issue run (Decision 13) rather than present-and-silently-dropped.
   const planShape: Record<string, z.ZodTypeAny> = {
-    plan_md: z.string().describe("The full implementation plan, as Markdown."),
+    plan_md: z
+      .string()
+      .describe(
+        "REQUIRED. The full implementation plan, as Markdown. Pass it as the top-level " +
+          "string argument named 'plan_md' (not 'plan', 'summary', 'body', or 'markdown'). " +
+          "This is the only required argument.",
+      ),
   };
   if (opts.milestones) {
     planShape["milestones"] = z
@@ -206,7 +212,7 @@ export function buildSignalMcpServer(
     tools: [
       tool(
         SUBMIT_PLAN_TOOL,
-        "Submit your implementation plan for human approval. Call this EXACTLY ONCE when the plan is ready, then STOP and end your turn — do not begin implementing. A human approves or rejects the plan out of band; you will be re-prompted to implement only after approval.",
+        "Submit your implementation plan for human approval. Call this EXACTLY ONCE when the plan is ready, then STOP and end your turn — do not begin implementing. A human approves or rejects the plan out of band; you will be re-prompted to implement only after approval. Pass the plan as the 'plan_md' argument (Markdown).",
         planShape,
         async () => ({
           content: [
@@ -622,13 +628,20 @@ export function scanSignals(message: unknown): ScannedSignals {
       // guards, for the SAME reason milestones is nested inside submit_plan's branch: a
       // subagent frame never reaches this loop, so a prompt-injected or buggy subagent can
       // NEVER move the run's progress. Both sides are defensively parsed (ids coerced,
-      // deduped, bad entries dropped, never throws). Last-wins within the turn if the lead
-      // reports twice — the latest snapshot is the one that describes where the run is.
+      // deduped, bad entries dropped, never throws).
+      //
+      // PRD #390 D3: an all-empty report_progress is NO SIGNAL. If neither side carries a
+      // real id after parsing (a `{}`, a defaulted, or a non-array-sided call), we assign
+      // nothing so out.progress stays undefined — the call never overwrites real progress
+      // and never persists a misleading `[]`. A call carrying ANY real id is still a
+      // signal. Last-wins within the turn holds for real reports (a later real call still
+      // overwrites), and a later all-empty call cannot wipe an earlier real one — that
+      // falls out naturally here because the empty call no longer assigns.
       const input = asRecord(block["input"]);
-      out.progress = {
-        completed: parseProgressIds(input?.["completed"]),
-        in_progress: parseProgressIds(input?.["in_progress"]),
-      };
+      const completed = parseProgressIds(input?.["completed"]);
+      const in_progress = parseProgressIds(input?.["in_progress"]);
+      if (completed.length > 0 || in_progress.length > 0)
+        out.progress = { completed, in_progress };
     } else if (name === CHECKPOINT_QUALIFIED) {
       // PRD #122 M6. Extracted HERE, inside the content loop that isSubagentFrame already
       // guards (the early return at the top of scanSignals), so it inherits the SAME

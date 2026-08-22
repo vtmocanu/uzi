@@ -51,6 +51,7 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
     repo_id: "repo-1",
     forge_type: "gitlab",
     mr_web_url: null,
+    issue_web_url: null,
     kind: "issue",
     issue_iid: 7,
     issue_title: "Live run row",
@@ -131,6 +132,7 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
+    draining_since: null,
     ...over,
   };
 }

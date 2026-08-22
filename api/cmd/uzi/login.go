@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/vtmocanu/uzi/api/internal/termsafe"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -43,14 +44,27 @@ func runLogin(cmd *cobra.Command, env Env, gf *globalFlags) error {
 	if env.Store == nil {
 		return uzicli.Exitf(uzicli.ExitGeneric, "no config directory available to store the token")
 	}
-	s, err := resolveSettings(env, gf)
+	// D4: login WRITES to the active/named context, and D4 lets an unknown
+	// --context name be CREATED. resolveSettings would reject a brand-new name
+	// under D9, so login resolves only the URL (via resolveURL, no existence
+	// gate) — it mints a fresh token from the server and never reads a stored one.
+	name, _, err := resolveContextName(env, gf)
+	if err != nil {
+		return uzicli.Exitf(uzicli.ExitAuth, "%v", err)
+	}
+	// Validate the target name before contacting the server: it is stored raw and
+	// later appears verbatim in `context list --json`.
+	if err := termsafe.Validate("context name", name); err != nil {
+		return uzicli.Exitf(uzicli.ExitUsage, "%v", err)
+	}
+	resolvedURL, err := resolveURL(env, gf, name)
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(s.URL) == "" {
+	if strings.TrimSpace(resolvedURL) == "" {
 		return uzicli.Exitf(uzicli.ExitUsage, "no uzi API URL configured: pass --url or set $UZI_URL")
 	}
-	c := env.NewClient(s)
+	c := env.NewClient(uzicli.Settings{URL: resolvedURL})
 	ctx := cmd.Context()
 
 	verifier, challenge, err := uzicli.GenerateVerifier()
@@ -62,14 +76,16 @@ func runLogin(cmd *cobra.Command, env Env, gf *globalFlags) error {
 		return err
 	}
 
-	consentURL := strings.TrimRight(s.URL, "/") + "/cli-auth?request=" + url.QueryEscape(start.RequestID)
+	consentURL := strings.TrimRight(resolvedURL, "/") + "/cli-auth?request=" + url.QueryEscape(start.RequestID)
 	// Instructions go to stderr so stdout stays clean for --json; the user_code and
 	// URL are essential, so they print even with --quiet. The token is NEVER printed.
 	_, _ = fmt.Fprintf(env.Stderr, "\nTo authorize this login, open:\n\n    %s\n\n", consentURL)
-	// user_code is server-supplied and printed outside the Printer (#180). consentURL
+	// user_code is server-supplied and printed outside the Printer (#180). The LOCAL
+	// cellText, not uzicli.CellText: it adds compactText's 200-char cap on top of the same
+	// strip, so a hostile server cannot flood the terminal here (#220). consentURL
 	// beside it needs nothing: its server-supplied half is url.QueryEscape'd, which
 	// percent-encodes every control byte.
-	_, _ = fmt.Fprintf(env.Stderr, "and enter this one-time code when asked:\n\n    %s\n\n", uzicli.CellText(start.UserCode))
+	_, _ = fmt.Fprintf(env.Stderr, "and enter this one-time code when asked:\n\n    %s\n\n", cellText(start.UserCode))
 	if err := openBrowser(consentURL); err != nil {
 		_, _ = fmt.Fprintln(env.Stderr, "(could not open a browser automatically — open the URL above)")
 	}
@@ -81,7 +97,7 @@ func runLogin(cmd *cobra.Command, env Env, gf *globalFlags) error {
 	if err != nil {
 		return err
 	}
-	return finishLogin(env, gf, s.URL, res)
+	return finishLogin(env, gf, name, resolvedURL, res)
 }
 
 // pollUntilDone polls at the server-returned cadence until the request is approved
@@ -133,9 +149,10 @@ func terminalReason(status string) string {
 }
 
 // finishLogin persists the resolved URL (config.toml) and the minted token
-// (credentials.toml, 0600) for the default context, then reports the identity. The
-// token is stored, never printed.
-func finishLogin(env Env, gf *globalFlags, resolvedURL string, res uzicli.CLIAuthPollResult) error {
+// (credentials.toml, 0600) for the active/named context (D4), then reports the
+// identity. The token is stored, never printed. `name` is already termsafe.Validate'd
+// by runLogin, so it is safe to interpolate into the confirmation line.
+func finishLogin(env Env, gf *globalFlags, name, resolvedURL string, res uzicli.CLIAuthPollResult) error {
 	// Persist the endpoint first (non-secret): a login is an explicit "configure this
 	// context" action, so subsequent commands work without --url / $UZI_URL.
 	cfg, err := env.Store.LoadConfig()
@@ -145,9 +162,9 @@ func finishLogin(env Env, gf *globalFlags, resolvedURL string, res uzicli.CLIAut
 	if cfg.Contexts == nil {
 		cfg.Contexts = map[string]uzicli.Context{}
 	}
-	cc := cfg.Contexts["default"]
+	cc := cfg.Contexts[name]
 	cc.URL = resolvedURL
-	cfg.Contexts["default"] = cc
+	cfg.Contexts[name] = cc
 	if err := env.Store.SaveConfig(cfg); err != nil {
 		return uzicli.Exitf(uzicli.ExitGeneric, "%v", err)
 	}
@@ -159,9 +176,9 @@ func finishLogin(env Env, gf *globalFlags, resolvedURL string, res uzicli.CLIAut
 	if creds.Contexts == nil {
 		creds.Contexts = map[string]uzicli.Credential{}
 	}
-	cr := creds.Contexts["default"]
+	cr := creds.Contexts[name]
 	cr.Token = res.Token
-	creds.Contexts["default"] = cr
+	creds.Contexts[name] = cr
 	if err := env.Store.SaveCredentials(creds); err != nil {
 		return uzicli.Exitf(uzicli.ExitGeneric, "%v", err)
 	}
@@ -171,15 +188,19 @@ func finishLogin(env Env, gf *globalFlags, resolvedURL string, res uzicli.CLIAut
 		return p.JSON(res.User)
 	}
 	if !gf.quiet {
-		// Server-supplied email, outside the Printer (#180).
-		_, _ = fmt.Fprintf(env.Stdout, "Logged in as %s. Token stored for context default.\n", uzicli.CellText(res.User.Email))
+		// Server-supplied email, outside the Printer (#180); name is validated. The LOCAL
+		// cellText (200-char cap) rather than the unbounded uzicli.CellText, so a hostile
+		// server's giant email cannot flood stdout here (#220).
+		_, _ = fmt.Fprintf(env.Stdout, "Logged in as %s. Token stored for context %s.\n", cellText(res.User.Email), name)
 	}
 	return nil
 }
 
 // newLogoutCmd — `uzi logout`. Local-only: removes the stored credential for the
-// default context. Revoking server-side is a webui action (Decision 16), so this
-// only clears the local file — it never calls the API.
+// ACTIVE context (D4/D8). Revoking server-side is a webui action (Decision 16), so
+// this only clears the local file — it never calls the API. D8: it touches ONLY
+// credentials, deleting the token entry; the context's config entry (its URL) is
+// left intact so a re-login works without reconfiguring the endpoint.
 func newLogoutCmd(env Env, gf *globalFlags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "logout",
@@ -189,22 +210,29 @@ func newLogoutCmd(env Env, gf *globalFlags) *cobra.Command {
 			if env.Store == nil {
 				return uzicli.Exitf(uzicli.ExitGeneric, "no config directory available")
 			}
+			name, _, err := resolveContextName(env, gf)
+			if err != nil {
+				return uzicli.Exitf(uzicli.ExitAuth, "%v", err)
+			}
 			creds, err := env.Store.LoadCredentials()
 			if err != nil {
 				return uzicli.Exitf(uzicli.ExitGeneric, "%v", err)
 			}
-			if cur, ok := creds.Contexts["default"]; !ok || cur.Token == "" {
+			if cur, ok := creds.Contexts[name]; !ok || cur.Token == "" {
 				if !gf.quiet {
-					_, _ = fmt.Fprintln(env.Stdout, "No stored credential for context default.")
+					// name may come from -c/$UZI_CONTEXT unvalidated; CellText strips
+					// any control bytes before it reaches the terminal.
+					_, _ = fmt.Fprintf(env.Stdout, "No stored credential for context %s.\n", uzicli.CellText(name))
 				}
 				return nil
 			}
-			delete(creds.Contexts, "default")
+			// D8: drop only the token entry; the config URL is deliberately untouched.
+			delete(creds.Contexts, name)
 			if err := env.Store.SaveCredentials(creds); err != nil {
 				return uzicli.Exitf(uzicli.ExitGeneric, "%v", err)
 			}
 			if !gf.quiet {
-				_, _ = fmt.Fprintln(env.Stdout, "Removed the stored credential for context default (not revoked server-side).")
+				_, _ = fmt.Fprintf(env.Stdout, "Removed the stored credential for context %s (not revoked server-side).\n", uzicli.CellText(name))
 			}
 			return nil
 		},

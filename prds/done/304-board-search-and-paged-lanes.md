@@ -145,6 +145,17 @@ line.
    "show all" on a 900-deep lane would rebuild the exact wall this PRD removes and
    land hundreds of nodes in the DOM at once.
 
+   > **Superseded in part by issue #367 (2026-08-18), amended by #373 (2026-08-19).**
+   > The "internal scroll within a bounded height" half of this decision — the
+   > `max-h-[70vh] overflow-y-auto` box on an expanded lane — was **removed on purpose**.
+   > The board now scrolls as one page: columns grow to fit their cards and the page
+   > scrolls vertically. The tall "wall" an expanded lane produces is now the intended
+   > behavior, not an accident. (#367 also pinned the lane headers under the toolbar and
+   > dropped horizontal column scroll; **#373 reverted both** — horizontal column scroll
+   > is back and the headers are static, while this page-scroll behavior is unchanged.)
+   > The **paged reveal** half (fixed page of 50, `shownCount`, no "show all") is
+   > unchanged throughout. See issues #367 / #373 and §557–§558 in `specs/ai.md`.
+
 4. **Per-lane default is a per-browser, per-repo *view* preference — default 10.**
    It is density, not policy, so it lives in `prefs` beside `hideEmpty`/`sortMode`,
    not in admin/server config. 10 was chosen in the design session: almost every

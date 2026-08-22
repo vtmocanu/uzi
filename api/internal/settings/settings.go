@@ -70,6 +70,18 @@ const (
 	// Runtime-tunable from the Admin Settings page; no env var.
 	KeyJudgeCooldownSeconds = "judge_cooldown_seconds"
 	KeyJudgeDailyBudget     = "judge_daily_budget"
+	// Run-summary model key (PRD #362 Decision 8). summary_model is the model the
+	// inline plain-English run-summary generator runs on (haiku by default — summaries
+	// are lighter and per-run, so the cheap/fast default is right). It mirrors
+	// judge_model's settings machinery (admin default + optional per-user override,
+	// validated with the PRD #17 model rules) but rides the ISSUE-RUN claim, not the
+	// judge claim. Admin-writable with a compiled-in default.
+	KeySummaryModel = "summary_model"
+	// GitHub Projects v2 Status sync (PRD #364). Instance-wide kill-switch
+	// (text "true"/"false"): OFF until an admin enables it, so the whole sync
+	// feature is a strict no-op on a fresh instance. Admin-writable with a
+	// compiled-in default; no seeded row (an absent row synthesizes to the default).
+	KeyGithubProjectSyncEnabled = "github_project_sync_enabled"
 	// Self-improvement keys (PRD #46 Decision 9). selfimprove_enabled/interval are
 	// admin-configurable (with defaults). selfimprove_repo/user_id/last_run_at are
 	// ENGINE-MANAGED state, NOT admin-writable through the generic settings PUT: they
@@ -86,7 +98,17 @@ const (
 	// the rest are integer seconds validated as {0} ∪ [60, 86400] — 0 disables that
 	// one signal, and the upper bound stops a fat-fingered value silently disabling
 	// it. No new env vars: these are runtime-tunable from the Admin Settings page.
-	KeyHealthEnabled              = "health_enabled"
+	KeyHealthEnabled = "health_enabled"
+	// Capability-aware scheduling kill-switch (PRD #84 Decision 13). A bool
+	// ("true"/"false"), default TRUE. It gates ONLY #84's added behavior — the
+	// capability-match clause on the claim predicate (M2), and downstream the plan-gate
+	// block (M4) and "no eligible worker" reason (M3). It does NOT gate the shipped
+	// docker repo allowlist / fn_worker_can_claim authorization clause (#83/#89), which
+	// stays enforced regardless: the extended function reads the new clause as
+	// `NOT capability_aware OR (required ⊆ caps)`, so "off" neutralizes only the added
+	// subset clause. OFF is an explicit, documented degraded mode (best-effort claiming;
+	// a docker-needing run may be claimed by a non-docker worker and fail mid-run).
+	KeyCapabilityAwareScheduling  = "capability_aware_scheduling"
 	KeyHealthStallSeconds         = "health_stall_seconds"
 	KeyHealthSlowSeconds          = "health_slow_seconds"
 	KeyHealthQueuedSeconds        = "health_queued_seconds"
@@ -154,6 +176,10 @@ const (
 	// M5's spend guards and the per-user override exist.
 	DefaultJudgeEnabled = "false"
 	DefaultJudgeModel   = "opus"
+	// PRD #364. The GitHub Projects v2 Status sync is OFF until an admin enables it
+	// (it writes to a user's project board), so the feature is a strict no-op on a
+	// fresh instance and on upgrade.
+	DefaultGithubProjectSyncEnabled = "false"
 	// PRD #69. Judge enforcement is OFF by default: the per-user opt-in gate stands
 	// until an admin flips this on, so the feature is a strict no-op on upgrade.
 	DefaultJudgeEnforceAll = "false"
@@ -163,6 +189,11 @@ const (
 	// count cap is opt-in because the generous cooldown already catches the loop case.
 	DefaultJudgeCooldownSeconds = "60"
 	DefaultJudgeDailyBudget     = "0"
+	// PRD #362 Decision 8. The run-summary generator defaults to haiku: summaries are
+	// lighter and produced per-run (1 intent + 1 plan + one per revise round), so the
+	// fast, near-free model is the right default — unlike the judge, which defaults to
+	// the strong opus because its recommendations feed self-improvement.
+	DefaultSummaryModel = "haiku"
 	// PRD #46 Decision 9. Self-improvement is OFF by default; when an admin enables
 	// it, the engine reviews uzi's own repo on the configured interval (2 days).
 	DefaultSelfimproveEnabled  = "false"
@@ -170,7 +201,12 @@ const (
 	// PRD #47 run-health defaults (Decision 5). On by default; a fresh instance with
 	// no seeded rows detects health out of the box. The thresholds mirror the table
 	// in the PRD's Solution Overview.
-	DefaultHealthEnabled              = "true"
+	DefaultHealthEnabled = "true"
+	// PRD #84 Decision 13: capability-aware scheduling is ON by default. Safe and cheap
+	// because on a homogeneous fleet the capability match is a no-op (every worker
+	// satisfies every run); it only helps heterogeneous fleets and acts as an escape
+	// hatch if inference false-positives start blocking runs.
+	DefaultCapabilityAwareScheduling  = "true"
 	DefaultHealthStallSeconds         = "300"  // 5m of silence (no tool in flight)
 	DefaultHealthSlowSeconds          = "2700" // 45m wall clock, clamped < RUN_TIMEOUT at read time
 	DefaultHealthQueuedSeconds        = "600"  // 10m stuck queued
@@ -266,12 +302,23 @@ var Defaults = map[string]string{
 	KeyJudgeEnforceAll:      DefaultJudgeEnforceAll,
 	KeyJudgeCooldownSeconds: DefaultJudgeCooldownSeconds,
 	KeyJudgeDailyBudget:     DefaultJudgeDailyBudget,
-	KeySelfimproveEnabled:   DefaultSelfimproveEnabled,
-	KeySelfimproveInterval:  DefaultSelfimproveInterval,
+	// PRD #364 GitHub Projects v2 Status sync kill-switch. Same no-seeded-row
+	// pattern as the judge keys: an absent row synthesizes to the default (off).
+	KeyGithubProjectSyncEnabled: DefaultGithubProjectSyncEnabled,
+	// PRD #362 Decision 8 run-summary model. Same no-seeded-row pattern as the judge
+	// keys: an absent row synthesizes to DefaultSummaryModel ("haiku"), so All/AdminView
+	// surface it to the settings page on every instance and no migration seeds it.
+	KeySummaryModel:        DefaultSummaryModel,
+	KeySelfimproveEnabled:  DefaultSelfimproveEnabled,
+	KeySelfimproveInterval: DefaultSelfimproveInterval,
 	// PRD #47 run-health keys. Same no-seeded-row pattern: an absent row synthesizes
 	// to these defaults, so All/AdminView surface them to the settings page and no
 	// migration seeds them.
-	KeyHealthEnabled:              DefaultHealthEnabled,
+	KeyHealthEnabled: DefaultHealthEnabled,
+	// PRD #84 capability-aware scheduling kill-switch. Same no-seeded-row pattern: an
+	// absent row synthesizes to the default (true), so All/AdminView surface it to the
+	// settings page on every instance and no migration seeds it.
+	KeyCapabilityAwareScheduling:  DefaultCapabilityAwareScheduling,
 	KeyHealthStallSeconds:         DefaultHealthStallSeconds,
 	KeyHealthSlowSeconds:          DefaultHealthSlowSeconds,
 	KeyHealthQueuedSeconds:        DefaultHealthQueuedSeconds,
@@ -578,6 +625,23 @@ func (c *Cache) JudgeEnabled(ctx context.Context) (bool, error) {
 	}
 }
 
+// GithubProjectSyncEnabled reports whether the GitHub Projects v2 Status sync is
+// enabled instance-wide (PRD #364): the global kill-switch. Stored as the text
+// "true"/"false"; any other value falls back to the compiled-in default (false) —
+// the same strict junk-tolerance as JudgeEnabled, so a malformed value never
+// silently starts writing to a user's project board.
+func (c *Cache) GithubProjectSyncEnabled(ctx context.Context) (bool, error) {
+	v, err := c.get(ctx, KeyGithubProjectSyncEnabled)
+	switch v {
+	case "true":
+		return true, err
+	case "false":
+		return false, err
+	default:
+		return DefaultGithubProjectSyncEnabled == "true", err
+	}
+}
+
 // JudgeEnforceAll reports whether the judge is enforced for every run (PRD #69),
 // bypassing the per-user judge_enabled opt-in gate. Stored as the text
 // "true"/"false"; any other value falls back to the compiled-in default (false) —
@@ -599,6 +663,14 @@ func (c *Cache) JudgeEnforceAll(ctx context.Context) (bool, error) {
 // back to the strong DefaultJudgeModel ("opus", PRD #69 Decision 1).
 func (c *Cache) JudgeModel(ctx context.Context) (string, error) {
 	return c.get(ctx, KeyJudgeModel)
+}
+
+// SummaryModel returns the model alias the inline run-summary generator runs on
+// (PRD #362 Decision 8). Falls back to DefaultSummaryModel ("haiku"). The per-user
+// override (users.summary_model) is resolved user-value-wins at issue-run claim
+// assembly, mirroring JudgeModel but on the issue-run claim rather than the judge.
+func (c *Cache) SummaryModel(ctx context.Context) (string, error) {
+	return c.get(ctx, KeySummaryModel)
 }
 
 // SelfimproveEnabled reports whether the self-improvement scheduler is enabled
@@ -673,6 +745,25 @@ func (c *Cache) HealthEnabled(ctx context.Context) (bool, error) {
 		return false, err
 	default:
 		return DefaultHealthEnabled == "true", err
+	}
+}
+
+// CapabilityAwareScheduling reports whether capability-aware scheduling is enabled
+// instance-wide (PRD #84 Decision 13). Stored as "true"/"false"; any other value falls
+// back to the compiled-in default (true), the same junk-tolerance as HealthEnabled and
+// defaulting ON — a malformed value never silently disables routing. The claim path
+// threads the result into ClaimRun as @capability_aware; false makes the capability
+// clause trivially true (best-effort claiming) while the docker allowlist clause stays
+// enforced.
+func (c *Cache) CapabilityAwareScheduling(ctx context.Context) (bool, error) {
+	v, err := c.get(ctx, KeyCapabilityAwareScheduling)
+	switch v {
+	case "true":
+		return true, err
+	case "false":
+		return false, err
+	default:
+		return DefaultCapabilityAwareScheduling == "true", err
 	}
 }
 
@@ -996,9 +1087,9 @@ func Validate(key, value string) error {
 	case KeyDefaultTheme:
 		return theme.Validate(value)
 	case KeyPrdlessEnabled, KeySlackEnabled, KeyJudgeEnabled, KeyJudgeEnforceAll, KeySelfimproveEnabled, KeyHealthEnabled,
-		KeyEligibleLabelWaivesPRDLink:
+		KeyCapabilityAwareScheduling, KeyEligibleLabelWaivesPRDLink, KeyGithubProjectSyncEnabled:
 		return validateBool(value)
-	case KeyJudgeModel:
+	case KeyJudgeModel, KeySummaryModel:
 		return validateModelAlias(value)
 	case KeySelfimproveInterval:
 		return validateDuration(value)

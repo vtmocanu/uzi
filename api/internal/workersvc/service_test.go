@@ -112,8 +112,14 @@ type fakeStore struct {
 	// the zero value is NULL/inherit, so existing judge fixtures resolve the
 	// instance value unchanged. judgeModelErr models a user-row read fault, which
 	// must fall back to the instance value best-effort (never an empty model).
-	judgeModel          pgtype.Text
-	judgeModelErr       error
+	judgeModel    pgtype.Text
+	judgeModelErr error
+	// summaryModel is the run owner's per-user summary_model override (PRD #362 M2);
+	// the zero value is NULL/inherit, so existing issue-run fixtures resolve the
+	// instance value unchanged. summaryModelErr models a user-row read fault, which
+	// must fall back to the instance value best-effort (never an empty model).
+	summaryModel        pgtype.Text
+	summaryModelErr     error
 	templates           []store.AgentTemplate
 	skillAllocations    []store.ListRunSkillAllocationsRow
 	skillAllocationsErr error
@@ -146,6 +152,11 @@ type fakeStore struct {
 	lastSeqUpdated   *int32
 	setRunningParams *store.SetRunRunningParams
 	setAwaiting      *store.SetRunAwaitingApprovalParams
+	// PRD #517 M2: captures the SetRunAwaitingFollowup arg (nil until the park query
+	// is reached) so a test can assert the accept path was taken and prove the
+	// interactive/task guard rejects BEFORE the query on a mismatched run.
+	setFollowup      *store.SetRunAwaitingFollowupParams
+	setFollowupRows  int64
 	setCompleted     *store.SetRunCompletedParams
 	setFailed        *store.SetRunFailedParams
 	reconciledMR     *store.ReconcileRunMRParams
@@ -265,7 +276,18 @@ type fakeStore struct {
 	createdStopVerdict *store.CreateStopVerdictInputParams
 	createdApproval    *store.CreateApprovePlanInputParams
 	cancelled          *store.CancelRunServerSideParams
-	rejected           *store.RejectRunServerSideParams
+	// cancelledByWorker captures the PRD #503 M1 live-worker cancel transition; SetState's
+	// failed arm calls it (instead of SetRunFailed) when the loaded run's stop_kind is
+	// 'cancelled'. cancelledByWorkerRows is the rows-affected it returns (defaults to 1 →
+	// applied, like the SetRunFailed fake).
+	cancelledByWorker     *store.CancelRunByWorkerParams
+	cancelledByWorkerRows int64
+	rejected              *store.RejectRunServerSideParams
+	// clearedCaps captures the PRD #84 M4 4c override clear (ClearRunRequiredCapabilities);
+	// clearCapsRows is the RowsAffected the fake returns. When cleared, the fake also empties
+	// runByID.RequiredCapabilities so a subsequent SubmitInput reload sees the override effect.
+	clearedCaps   *store.ClearRunRequiredCapabilitiesParams
+	clearCapsRows int64
 
 	// Create run.
 	repoRow         store.GetRepoForUserRow // repo GetRepoForUser returns (zero value = the pre-#191 empty row)
@@ -286,11 +308,42 @@ type fakeStore struct {
 
 	// Scheduled prompt (PRD #241). promptRunParams stays nil until CreatePromptRun's
 	// insert runs, so a #66 guardrail test can assert the gate blocked before the insert.
-	promptRunResult  store.Run
-	promptRunErr     error
-	promptRunParams  *store.CreatePromptRunParams
-	activeBranchRuns int64 // CountActiveRunsWithBranch
-	activeCIFixRuns  int64 // CountActiveCIFixForRef
+	promptRunResult store.Run
+	promptRunErr    error
+	promptRunParams *store.CreatePromptRunParams
+	// Task/handoff (PRD #400). taskRunParams stays nil until CreateTaskRun's insert
+	// runs, so a #66 guardrail test can assert the gate blocked before the insert.
+	taskRunResult store.Run
+	taskRunErr    error
+	taskRunParams *store.CreateTaskRunParams
+	// DispatchTaskRun (PRD #400 Decision 6): dispatchTaskParams stays nil until the
+	// stamp query runs; dispatchTaskErr = pgx.ErrNoRows models the idempotency/ownership
+	// guard matching 0 rows.
+	dispatchTaskResult store.Run
+	dispatchTaskErr    error
+	dispatchTaskParams *store.DispatchTaskRunParams
+	// Task diff-review (PRD #400 M4a). taskReviewRunParams stays nil until the review-run
+	// insert runs; the active-review + upsert + read fakes back PostTaskReview /
+	// GetTaskReviewPanel.
+	taskReviewRunResult store.Run
+	taskReviewRunErr    error
+	taskReviewRunParams *store.CreateTaskReviewRunParams
+	// Chained fix (PRD #400 M5). thenFixRunParams stays nil until CreateThenFixRun's insert
+	// runs; thenFixRunErr = a 23505 pgconn.PgError models the one-active-fix dedup.
+	thenFixRunResult       store.Run
+	thenFixRunErr          error
+	thenFixRunParams       *store.CreateThenFixRunParams
+	activeTaskReviewRun    store.Run
+	activeTaskReviewRunErr error
+	upsertTaskReviewID     uuid.UUID
+	upsertTaskReviewErr    error
+	upsertTaskReviewParams *store.UpsertTaskReviewWithFindingsParams
+	taskReviewForTarget    store.TaskReview
+	taskReviewForTargetErr error
+	taskReviewFindings     []store.TaskReviewFinding
+	taskReviewFindingsErr  error
+	activeBranchRuns       int64 // CountActiveRunsWithBranch
+	activeCIFixRuns        int64 // CountActiveCIFixForRef
 
 	// Create worker.
 	createWorkerResult store.Worker
@@ -553,6 +606,9 @@ func (f *fakeStore) GetUserDefaultModel(context.Context, uuid.UUID) (pgtype.Text
 func (f *fakeStore) GetUserJudgeModel(context.Context, uuid.UUID) (pgtype.Text, error) {
 	return f.judgeModel, f.judgeModelErr
 }
+func (f *fakeStore) GetUserSummaryModel(context.Context, uuid.UUID) (pgtype.Text, error) {
+	return f.summaryModel, f.summaryModelErr
+}
 func (f *fakeStore) ListClaimAgentTemplates(context.Context, pgtype.UUID) ([]store.AgentTemplate, error) {
 	return f.templates, nil
 }
@@ -610,6 +666,10 @@ func (f *fakeStore) SetRunRunning(_ context.Context, arg store.SetRunRunningPara
 func (f *fakeStore) SetRunAwaitingApproval(_ context.Context, arg store.SetRunAwaitingApprovalParams) (int64, error) {
 	f.setAwaiting = &arg
 	return 1, nil
+}
+func (f *fakeStore) SetRunAwaitingFollowup(_ context.Context, arg store.SetRunAwaitingFollowupParams) (int64, error) {
+	f.setFollowup = &arg
+	return f.setFollowupRows, nil
 }
 func (f *fakeStore) SetRunCompleted(_ context.Context, arg store.SetRunCompletedParams) (int64, error) {
 	f.setCompleted = &arg
@@ -785,6 +845,13 @@ func (f *fakeStore) ListJudgeTriageRowsForUser(_ context.Context, userID uuid.UU
 func (f *fakeStore) GetWorkerByID(context.Context, uuid.UUID) (store.Worker, error) {
 	return f.workerByID, f.workerByIDErr
 }
+func (f *fakeStore) ClearRunRequiredCapabilities(_ context.Context, arg store.ClearRunRequiredCapabilitiesParams) (int64, error) {
+	f.clearedCaps = &arg
+	// Mirror the real owner+status-guarded UPDATE: on a matching row, empty the run's
+	// required set so a subsequent SubmitInput reload observes the override.
+	f.runByID.RequiredCapabilities = nil
+	return f.clearCapsRows, nil
+}
 func (f *fakeStore) CreateRunInput(_ context.Context, arg store.CreateRunInputParams) (store.RunUserInput, error) {
 	f.createdInput = &arg
 	return store.RunUserInput{}, nil
@@ -812,6 +879,18 @@ func (f *fakeStore) CreateApprovePlanInput(_ context.Context, arg store.CreateAp
 }
 func (f *fakeStore) CancelRunServerSide(_ context.Context, arg store.CancelRunServerSideParams) (int64, error) {
 	f.cancelled = &arg
+	return 1, nil
+}
+
+// CancelRunByWorker (PRD #503 M1) records the live-worker cancel transition. Rows
+// defaults to 1 (applied) like the SetRunFailed fake, so a fixture that says nothing gets
+// an applied transition; a test wanting the no-op path sets cancelledByWorkerRows<0 — but
+// the common case is 0 meaning "unset", which we map to 1.
+func (f *fakeStore) CancelRunByWorker(_ context.Context, arg store.CancelRunByWorkerParams) (int64, error) {
+	f.cancelledByWorker = &arg
+	if f.cancelledByWorkerRows != 0 {
+		return f.cancelledByWorkerRows, nil
+	}
 	return 1, nil
 }
 func (f *fakeStore) RejectRunServerSide(_ context.Context, arg store.RejectRunServerSideParams) (int64, error) {
@@ -847,6 +926,35 @@ func (f *fakeStore) CreatePromptRun(_ context.Context, arg store.CreatePromptRun
 	f.promptRunParams = &arg
 	return f.promptRunResult, f.promptRunErr
 }
+func (f *fakeStore) CreateTaskRun(_ context.Context, arg store.CreateTaskRunParams) (store.Run, error) {
+	f.taskRunParams = &arg
+	return f.taskRunResult, f.taskRunErr
+}
+func (f *fakeStore) DispatchTaskRun(_ context.Context, arg store.DispatchTaskRunParams) (store.Run, error) {
+	f.dispatchTaskParams = &arg
+	return f.dispatchTaskResult, f.dispatchTaskErr
+}
+func (f *fakeStore) CreateTaskReviewRun(_ context.Context, arg store.CreateTaskReviewRunParams) (store.Run, error) {
+	f.taskReviewRunParams = &arg
+	return f.taskReviewRunResult, f.taskReviewRunErr
+}
+func (f *fakeStore) CreateThenFixRun(_ context.Context, arg store.CreateThenFixRunParams) (store.Run, error) {
+	f.thenFixRunParams = &arg
+	return f.thenFixRunResult, f.thenFixRunErr
+}
+func (f *fakeStore) GetActiveTaskReviewRunForWorkerTarget(context.Context, store.GetActiveTaskReviewRunForWorkerTargetParams) (store.Run, error) {
+	return f.activeTaskReviewRun, f.activeTaskReviewRunErr
+}
+func (f *fakeStore) UpsertTaskReviewWithFindings(_ context.Context, arg store.UpsertTaskReviewWithFindingsParams) (uuid.UUID, error) {
+	f.upsertTaskReviewParams = &arg
+	return f.upsertTaskReviewID, f.upsertTaskReviewErr
+}
+func (f *fakeStore) GetTaskReviewForTarget(context.Context, uuid.UUID) (store.TaskReview, error) {
+	return f.taskReviewForTarget, f.taskReviewForTargetErr
+}
+func (f *fakeStore) ListTaskReviewFindings(context.Context, uuid.UUID) ([]store.TaskReviewFinding, error) {
+	return f.taskReviewFindings, f.taskReviewFindingsErr
+}
 func (f *fakeStore) CountActiveRunsWithBranch(context.Context, store.CountActiveRunsWithBranchParams) (int64, error) {
 	return f.activeBranchRuns, nil
 }
@@ -877,6 +985,7 @@ func testParams() Params {
 	return Params{
 		RunTimeout:             2 * time.Hour,
 		RunIdleTimeout:         10 * time.Minute,
+		WorkerTaskIdleTimeout:  30 * time.Minute, // PRD #517 M5 interactive-task park idle cap
 		RunMaxIterations:       5,
 		PlanMaxRevisions:       3,
 		QuestionMax:            5,     // PRD #88 clarification-question cap
@@ -1008,6 +1117,203 @@ func TestClaimAssemblesPayloadWithDecryptedSecrets(t *testing.T) {
 	// The plaintext secrets must not appear in any log line.
 	if strings.Contains(logs.String(), pat) || strings.Contains(logs.String(), token) {
 		t.Fatal("a log line leaked a decrypted secret")
+	}
+}
+
+// TestClaimCarriesTaskOpenMrAndBaseBranch proves assembleClaim copies a task run's
+// runs.open_mr and runs.base_branch onto the claim payload (PRD #400 M2), so the
+// worker can gate MR-open and name the source ref. Constructs a task run row shaped
+// like CreateTaskRun leaves it (server-named uzi/task/<id> branch, issue-less,
+// open_mr=true, a base_branch set) and asserts both ride the payload.
+func TestClaimCarriesTaskOpenMrAndBaseBranch(t *testing.T) {
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-TASKTEST-abcdef1234567890"))
+	sealedTok, _ := box.Seal([]byte("anthropic-TASKTEST-abcdef1234567890"))
+
+	runID := uuid.New()
+	taskBranch := "uzi/task/" + runID.String()
+	fs := &fakeStore{
+		claimRun: store.Run{
+			ID: runID, Kind: "task", Status: "claimed",
+			IssueTitle: "Do the handoff", IssueDescription: "take this and run",
+			Branch:     pgText(taskBranch),
+			BaseBranch: pgText("develop"),
+			OpenMr:     true,
+		},
+		claimCtx: store.GetRunClaimContextRow{
+			RepoWebUrl: "https://gitlab.example.com/grp/proj", RepoPath: "grp/proj",
+			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
+		},
+		anthropic: sealedTok,
+	}
+
+	svc := New(fs, box, testParams())
+	payload, err := svc.Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload == nil {
+		t.Fatal("expected a payload, got idle")
+	}
+	if payload.Kind != "task" {
+		t.Fatalf("kind = %q, want task", payload.Kind)
+	}
+	if !payload.OpenMr {
+		t.Error("open_mr not carried onto the task claim payload")
+	}
+	if payload.BaseBranch == nil || *payload.BaseBranch != "develop" {
+		t.Errorf("base_branch = %v, want develop", payload.BaseBranch)
+	}
+	if payload.Branch == nil || *payload.Branch != taskBranch {
+		t.Errorf("branch = %v, want %s", payload.Branch, taskBranch)
+	}
+}
+
+// TestClaimCarriesTaskIdleTimeoutForInteractiveRun proves assembleClaim ships the
+// server-configured WORKER_TASK_IDLE_TIMEOUT (testParams: 30m) on an INTERACTIVE task
+// claim as Config.TaskIdleTimeoutSeconds, so the worker parks on the same idle bound the
+// server configured (no drift) — PRD #517 M5. Mirrors the RunTimeout/IdleTimeout claim
+// asserts above. MUTATION PROOF: omitting `TaskIdleTimeoutSeconds: taskIdleTimeoutSeconds`
+// from the ClaimConfig assembly reads back 0 (the zero value), reddening the ==1800 assert.
+func TestClaimCarriesTaskIdleTimeoutForInteractiveRun(t *testing.T) {
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-TASKIDLE-abcdef1234567890"))
+	sealedTok, _ := box.Seal([]byte("anthropic-TASKIDLE-abcdef1234567890"))
+
+	runID := uuid.New()
+	fs := &fakeStore{
+		claimRun: store.Run{
+			ID: runID, Kind: "task", Status: "claimed", Interactive: true,
+			IssueTitle: "Handoff: interactive", IssueDescription: "iterate with me",
+			Branch: pgText("uzi/task/" + runID.String()),
+		},
+		claimCtx: store.GetRunClaimContextRow{
+			RepoWebUrl: "https://gitlab.example.com/grp/proj", RepoPath: "grp/proj",
+			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
+		},
+		anthropic: sealedTok,
+	}
+
+	svc := New(fs, box, testParams())
+	payload, err := svc.Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload == nil {
+		t.Fatal("expected a payload, got idle")
+	}
+	// 30m == 1800s, the WorkerTaskIdleTimeout testParams sets.
+	if payload.Config.TaskIdleTimeoutSeconds != 1800 {
+		t.Fatalf("Config.TaskIdleTimeoutSeconds = %d, want 1800 — the interactive-task park idle "+
+			"timeout must ride the claim (WORKER_TASK_IDLE_TIMEOUT)", payload.Config.TaskIdleTimeoutSeconds)
+	}
+}
+
+// TestClaimOmitsTaskIdleTimeoutForNonInteractiveRun is the negative control that pins the
+// gating decision: a NON-interactive run's claim leaves TaskIdleTimeoutSeconds at zero, so
+// omitempty keeps its wire byte-identical to today's (an un-upgraded worker never sees a new
+// key). MUTATION PROOF: setting TaskIdleTimeoutSeconds unconditionally (dropping the
+// `if run.Interactive` guard) makes this read 1800, reddening the ==0 assert.
+func TestClaimOmitsTaskIdleTimeoutForNonInteractiveRun(t *testing.T) {
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-NOIDLE-abcdef1234567890"))
+	sealedTok, _ := box.Seal([]byte("anthropic-NOIDLE-abcdef1234567890"))
+
+	fs := &fakeStore{
+		claimRun: store.Run{
+			ID: uuid.New(), Kind: "issue", Status: "claimed",
+			IssueIid: pgtype.Int8{Int64: 7, Valid: true},
+		},
+		claimCtx: store.GetRunClaimContextRow{
+			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
+			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
+		},
+		anthropic: sealedTok,
+	}
+
+	svc := New(fs, box, testParams())
+	payload, err := svc.Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload == nil {
+		t.Fatal("expected a payload, got idle")
+	}
+	if payload.Config.TaskIdleTimeoutSeconds != 0 {
+		t.Fatalf("Config.TaskIdleTimeoutSeconds = %d, want 0 for a non-interactive run — the park idle "+
+			"timeout must be delivered ONLY on an interactive task claim", payload.Config.TaskIdleTimeoutSeconds)
+	}
+}
+
+// TestClaimDerivesStopPending pins issue #552 M3's server-side derivation: StopPending is
+// true iff the run is interactive AND carries the durable stop_kind='stopped' AND is
+// non-terminal. This re-delivers a graceful stop that was consumed into the worker's
+// in-memory flag and lost on a crash, so the resumed worker winds the park down instead of
+// waiting out the idle timeout. The negative rows pin that a non-interactive run, a non-stop
+// stop_kind (cancelled/plan_rejected/auto_stopped/NULL), and a terminal run all read false.
+func TestClaimDerivesStopPending(t *testing.T) {
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-STOPPEND-abcdef1234567890"))
+	sealedTok, _ := box.Seal([]byte("anthropic-STOPPEND-abcdef1234567890"))
+
+	stopKind := func(s string) pgtype.Text {
+		if s == "" {
+			return pgtype.Text{}
+		}
+		return pgtype.Text{String: s, Valid: true}
+	}
+
+	cases := []struct {
+		name        string
+		interactive bool
+		stopKind    string
+		status      string
+		want        bool
+	}{
+		{"interactive+stopped+non-terminal", true, "stopped", "awaiting_followup", true},
+		{"non-interactive", false, "stopped", "awaiting_followup", false},
+		{"stop_kind=cancelled", true, "cancelled", "awaiting_followup", false},
+		{"stop_kind=plan_rejected", true, "plan_rejected", "awaiting_followup", false},
+		{"stop_kind NULL", true, "", "awaiting_followup", false},
+		{"terminal completed", true, "stopped", "completed", false},
+		{"terminal failed", true, "stopped", "failed", false},
+		{"terminal cancelled", true, "stopped", "cancelled", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runID := uuid.New()
+			fs := &fakeStore{
+				claimRun: store.Run{
+					ID: runID, Kind: "task", Status: tc.status, Interactive: tc.interactive,
+					StopKind:   stopKind(tc.stopKind),
+					IssueTitle: "Handoff: interactive", IssueDescription: "iterate with me",
+					Branch: pgText("uzi/task/" + runID.String()),
+				},
+				claimCtx: store.GetRunClaimContextRow{
+					RepoWebUrl: "https://gitlab.example.com/grp/proj", RepoPath: "grp/proj",
+					DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+					BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
+				},
+				anthropic: sealedTok,
+			}
+
+			svc := New(fs, box, testParams())
+			payload, err := svc.Claim(context.Background(), worker())
+			if err != nil {
+				t.Fatalf("Claim: %v", err)
+			}
+			if payload == nil {
+				t.Fatal("expected a payload, got idle")
+			}
+			if payload.StopPending != tc.want {
+				t.Fatalf("StopPending = %v, want %v (interactive=%v stop_kind=%q status=%q)",
+					payload.StopPending, tc.want, tc.interactive, tc.stopKind, tc.status)
+			}
+		})
 	}
 }
 
@@ -1174,6 +1480,62 @@ func TestClaimNoScheduleModelUsesUserDefault(t *testing.T) {
 	}
 	if !strings.Contains(string(b), `"default_model":"sonnet"`) {
 		t.Fatalf("null run.model should leave the owner default untouched on the wire; got %s", b)
+	}
+}
+
+// PRD #362 M2: an ISSUE-run claim carries SummaryModel resolved from the instance
+// summary_model setting when the owner has no per-user override. Unlike judge_model,
+// this rides the issue-run claim (not the judge claim).
+func TestClaimCarriesSummaryModelFromInstanceDefault(t *testing.T) {
+	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
+	// summaryModel left NULL ⇒ inherit the instance value.
+	svc := New(fs, newBox(t), testParams())
+	svc.SetSettings(fakeSettings{summaryModel: "haiku"})
+
+	payload, err := svc.Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload.SummaryModel == nil || *payload.SummaryModel != "haiku" {
+		t.Fatalf("issue claim should carry the instance summary_model; got %+v", payload.SummaryModel)
+	}
+}
+
+// PRD #362 M2: the run owner's per-user summary_model override wins over the instance
+// default at issue-run claim assembly (user-value-wins, Decision 8).
+func TestClaimSummaryModelUserOverrideWins(t *testing.T) {
+	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
+	fs.summaryModel = pgText("opus") // per-user override
+	svc := New(fs, newBox(t), testParams())
+	svc.SetSettings(fakeSettings{summaryModel: "haiku"})
+
+	payload, err := svc.Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload.SummaryModel == nil || *payload.SummaryModel != "opus" {
+		t.Fatalf("per-user summary_model must beat the instance default; got %+v", payload.SummaryModel)
+	}
+}
+
+// PRD #362 M2: with no settings wired the issue claim omits summary_model entirely —
+// omitempty keeps the wire byte-identical for a deployment that has not wired settings.
+func TestClaimOmitsSummaryModelWhenNoSettings(t *testing.T) {
+	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
+	// New(...) leaves s.settings nil unless SetSettings is called.
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload.SummaryModel != nil {
+		t.Fatalf("no settings wired should leave SummaryModel nil; got %+v", payload.SummaryModel)
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if strings.Contains(string(b), "summary_model") {
+		t.Fatalf("unset summary_model must be omitted from the wire; got %s", b)
 	}
 }
 
@@ -1686,6 +2048,57 @@ func TestSetStateRejectsUnknownState(t *testing.T) {
 	}
 }
 
+// PRD #517 M2: an interactive task run parks in-process on signal_done. SetState must
+// ACCEPT the awaiting_followup report for such a run (reaching SetRunAwaitingFollowup),
+// and REJECT it as ErrInvalidState for any run that is not BOTH a task run AND
+// interactive — the status is meaningless there and accepting it would strand a
+// non-resumable run in a non-terminal status the follow-up path never wakes.
+func TestSetStateAwaitingFollowupAcceptsInteractiveTask(t *testing.T) {
+	w := worker()
+	fs := &fakeStore{
+		runOwned:        store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "running", Kind: RunKindTask, Interactive: true},
+		setFollowupRows: 1,
+	}
+	svc := New(fs, newBox(t), testParams())
+	_, applied, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{State: "awaiting_followup"})
+	if err != nil {
+		t.Fatalf("SetState(awaiting_followup) on an interactive task: %v", err)
+	}
+	if !applied {
+		t.Fatal("a legitimate interactive-task park must apply (handler answers 200)")
+	}
+	if fs.setFollowup == nil {
+		t.Fatal("SetRunAwaitingFollowup was never called — the accept path did not persist the park")
+	}
+}
+
+// Each fixture flips exactly ONE of the two guard conditions, so a test that dropped
+// either half of `kind == RunKindTask && interactive` would let one of these through;
+// a run holding both would satisfy the guard and could not observe the guard at all.
+// The setFollowup==nil assertion is what makes each case non-vacuous: it proves the
+// rejection happened BEFORE the park query, not that the query merely returned 0 rows.
+func TestSetStateAwaitingFollowupRejectsNonInteractiveOrNonTask(t *testing.T) {
+	w := worker()
+	cases := map[string]store.Run{
+		"task but not interactive":   {Kind: RunKindTask, Interactive: false},
+		"interactive but not a task": {Kind: RunKindIssue, Interactive: true},
+		"neither":                    {Kind: RunKindIssue, Interactive: false},
+	}
+	for name, r := range cases {
+		t.Run(name, func(t *testing.T) {
+			r.ID, r.WorkerID, r.Status = uuid.New(), pgUUID(w.ID), "running"
+			fs := &fakeStore{runOwned: r, setFollowupRows: 1}
+			svc := New(fs, newBox(t), testParams())
+			if _, _, err := svc.SetState(context.Background(), w, r.ID, StateRequest{State: "awaiting_followup"}); !errors.Is(err, ErrInvalidState) {
+				t.Fatalf("err = %v, want ErrInvalidState", err)
+			}
+			if fs.setFollowup != nil {
+				t.Fatal("SetRunAwaitingFollowup must NOT be called for a non-interactive/non-task run — the guard must reject BEFORE the query")
+			}
+		})
+	}
+}
+
 func TestSetStateRejectsForeignRun(t *testing.T) {
 	// A valid worker token but the run belongs to another worker/tenant: the
 	// ownership lookup misses, so the transition is refused (handler answers 404)
@@ -1833,7 +2246,7 @@ func TestRegisterRecoversOrphansThenComesOnline(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", intp(2)); err != nil {
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", intp(2), nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	want := []string{"fail_over_cap", "requeue_worker", "register"}
@@ -1857,6 +2270,60 @@ func TestRegisterRecoversOrphansThenComesOnline(t *testing.T) {
 	if !fs.registerParams.MaxConcurrentRuns.Valid || fs.registerParams.MaxConcurrentRuns.Int32 != 2 {
 		t.Fatalf("register max_concurrent_runs wrong: %+v", fs.registerParams.MaxConcurrentRuns)
 	}
+	// The jvm template implies {jvm}; with no self-report the stored set is exactly
+	// the template-derived capability (PRD #84 M1).
+	if got := fs.registerParams.Capabilities; len(got) != 1 || got[0] != "jvm" {
+		t.Fatalf("register capabilities = %v, want [jvm]", got)
+	}
+}
+
+func TestRegisterUnionsAndFiltersCapabilities(t *testing.T) {
+	// A worker self-reports docker plus an unknown name, on the jvm template. The
+	// stored set is the Filter-ed union: docker (self-reported) + jvm (template),
+	// with the unknown dropped, deduped, in vocabulary order (PRD #84 M1).
+	w := worker()
+	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", nil, []string{"docker", "gpu", "docker"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	got := fs.registerParams.Capabilities
+	if len(got) != 2 || got[0] != "docker" || got[1] != "jvm" {
+		t.Fatalf("register capabilities = %v, want [docker jvm]", got)
+	}
+}
+
+func TestRegisterBaseTemplateDropsSelfReportedJVM(t *testing.T) {
+	// A base worker self-reports ["jvm","docker"]. jvm is TEMPLATE-derived and not
+	// self-reportable, so the stored set is only ["docker"] — the base worker cannot
+	// spoof a jvm capability its template does not imply (PRD #84 M1).
+	w := worker()
+	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, []string{"jvm", "docker"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	got := fs.registerParams.Capabilities
+	if len(got) != 1 || got[0] != "docker" {
+		t.Fatalf("register capabilities = %v, want [docker] (self-reported jvm must be dropped)", got)
+	}
+}
+
+func TestRegisterBaseTemplateNoSelfReportEmptyCapabilities(t *testing.T) {
+	// A base-template worker that self-reports nothing stores the empty set (PRD #84
+	// M1 success criterion: base with no self-report → {}).
+	w := worker()
+	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, nil); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if got := fs.registerParams.Capabilities; len(got) != 0 {
+		t.Fatalf("register capabilities = %v, want empty", got)
+	}
 }
 
 func TestRegisterNilCapStoresNull(t *testing.T) {
@@ -1866,7 +2333,7 @@ func TestRegisterNilCapStoresNull(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil); err != nil {
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if fs.registerParams == nil || fs.registerParams.MaxConcurrentRuns.Valid {
@@ -1881,7 +2348,7 @@ func TestRegisterEmptyTemplateStoresNull(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil); err != nil {
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if fs.registerParams == nil || fs.registerParams.TemplateReported.Valid {
@@ -1994,7 +2461,7 @@ func TestSubmitInputEnqueuesWhenWorkerLive(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.now = func() time.Time { return fixed }
 
-	res, err := svc.SubmitInput(context.Background(), user, runID, "cancel", "", nil)
+	res, err := svc.SubmitInput(context.Background(), user, runID, "cancel", "operator changed their mind", nil)
 	if err != nil {
 		t.Fatalf("SubmitInput: %v", err)
 	}
@@ -2010,11 +2477,51 @@ func TestSubmitInputEnqueuesWhenWorkerLive(t *testing.T) {
 	if fs.createdStopVerdict.StopKind.String != "cancelled" || !fs.createdStopVerdict.StopKind.Valid {
 		t.Fatalf("live cancel must stamp stop_kind 'cancelled', got %+v", fs.createdStopVerdict.StopKind)
 	}
+	// PRD #503 M3: a live cancel carries the operator's optional reason into stop_reason.
+	if !fs.createdStopVerdict.StopReason.Valid || fs.createdStopVerdict.StopReason.String != "operator changed their mind" {
+		t.Fatalf("live cancel must stamp stop_reason with the operator reason, got %+v", fs.createdStopVerdict.StopReason)
+	}
 	if fs.createdInput != nil {
 		t.Fatal("a stop verdict must not use the plain CreateRunInput path")
 	}
 	if fs.cancelled != nil {
 		t.Fatal("server-side cancel must not run when a worker is live")
+	}
+}
+
+// TestSubmitInputLiveCancelStripsNULFromStopReason: PRD #503 M3 — the live-path cancel
+// (CreateStopVerdictInput) sanitizes the operator reason exactly like the server-side
+// path, stripping a NUL byte that would otherwise raise Postgres 22021 and abort the
+// cancel. Both cancel paths share stopReasonParam, so this pins the live side too.
+func TestSubmitInputLiveCancelStripsNULFromStopReason(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	wkrID := uuid.New()
+	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	fs := &fakeStore{
+		runByID:    store.Run{ID: runID, UserID: user, Status: "running", WorkerID: pgUUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)}, // fresh
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.now = func() time.Time { return fixed }
+
+	res, err := svc.SubmitInput(context.Background(), user, runID, "cancel", "x\x00y", nil)
+	if err != nil {
+		t.Fatalf("SubmitInput: %v", err)
+	}
+	if res.ServerSide {
+		t.Fatal("a live worker should consume the cancel; not server-side")
+	}
+	if fs.createdStopVerdict == nil || fs.createdStopVerdict.Kind != "cancel" {
+		t.Fatalf("stop verdict not enqueued for the worker: %+v", fs.createdStopVerdict)
+	}
+	if !fs.createdStopVerdict.StopReason.Valid || fs.createdStopVerdict.StopReason.String != "xy" {
+		t.Fatalf("live cancel must strip the NUL from stop_reason (want %q), got %+v", "xy", fs.createdStopVerdict.StopReason)
+	}
+	// The body co-written to run_user_inputs.body in the SAME INSERT must also be
+	// NUL-stripped, or the CTE would 22021 on that column before stop_reason ever mattered.
+	if fs.createdStopVerdict.Body.String != "xy" || strings.ContainsRune(fs.createdStopVerdict.Body.String, '\x00') {
+		t.Fatalf("live cancel must strip the NUL from run_user_inputs.body (want %q), got %+v", "xy", fs.createdStopVerdict.Body)
 	}
 }
 
@@ -2045,6 +2552,11 @@ func TestSubmitInputLiveRejectStampsStopKind(t *testing.T) {
 	if fs.createdStopVerdict.StopKind.String != "plan_rejected" || !fs.createdStopVerdict.StopKind.Valid {
 		t.Fatalf("live reject must stamp stop_kind 'plan_rejected', got %+v", fs.createdStopVerdict.StopKind)
 	}
+	// PRD #503 M3 shared-CTE split guard: a reject's reason lives in failure_reason (the
+	// M2 path), NOT in stop_reason — even though the reject carried a verbatim body above.
+	if fs.createdStopVerdict.StopReason.Valid {
+		t.Fatalf("live reject must leave stop_reason NULL (reason belongs to failure_reason), got %+v", fs.createdStopVerdict.StopReason)
+	}
 }
 
 func TestSubmitInputRejectServerSideWhenWorkerStale(t *testing.T) {
@@ -2068,6 +2580,195 @@ func TestSubmitInputRejectServerSideWhenWorkerStale(t *testing.T) {
 	}
 	if fs.rejected == nil {
 		t.Fatal("RejectRunServerSide not called")
+	}
+}
+
+// TestSubmitInputStopEnqueuesOnParkedRun: PRD #517 M4 — a graceful `stop` on a parked
+// interactive run (awaiting_followup, live worker) ALWAYS enqueues via the dedicated
+// CreateStopVerdictInput CTE, stamping stop_kind='stopped', and NEVER transitions the run
+// server-side. The worker consumes it and finalizes (push + MR iff open_mr → completed).
+//
+// MUTATION PROOF: route `stop` through CancelRunServerSide / RejectRunServerSide (or the
+// plain CreateRunInput path) and fs.createdStopVerdict is nil / fs.cancelled|rejected is
+// set — every assertion below flips.
+func TestSubmitInputStopEnqueuesOnParkedRun(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	wkrID := uuid.New()
+	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	fs := &fakeStore{
+		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: true, Status: "awaiting_followup", WorkerID: pgUUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)}, // fresh
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.now = func() time.Time { return fixed }
+
+	res, err := svc.SubmitInput(context.Background(), user, runID, "stop", "wind down please", nil)
+	if err != nil {
+		t.Fatalf("SubmitInput(stop): %v", err)
+	}
+	if res.ServerSide {
+		t.Fatal("a stop must ALWAYS enqueue (worker-finalized), never transition server-side")
+	}
+	if fs.createdStopVerdict == nil || fs.createdStopVerdict.Kind != "stop" {
+		t.Fatalf("stop verdict not enqueued: %+v", fs.createdStopVerdict)
+	}
+	if !fs.createdStopVerdict.StopKind.Valid || fs.createdStopVerdict.StopKind.String != "stopped" {
+		t.Fatalf("stop must stamp stop_kind 'stopped', got %+v", fs.createdStopVerdict.StopKind)
+	}
+	if fs.createdInput != nil {
+		t.Fatal("a stop verdict must not use the plain CreateRunInput path")
+	}
+	if fs.cancelled != nil || fs.rejected != nil {
+		t.Fatal("a stop must never reach CancelRunServerSide/RejectRunServerSide")
+	}
+}
+
+// TestSubmitInputStopEnqueuesEvenWithoutLivePoller: the design's core distinction from
+// cancel — a stop has NO server-side !live branch. A parked run whose worker is STALE
+// still enqueues the stop (M2's stale-heartbeat sweep requeues the park; it honors the
+// pending stop on resume). This is what would break if someone copied cancel's
+// hasLivePoller branch onto stop.
+func TestSubmitInputStopEnqueuesEvenWithoutLivePoller(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	wkrID := uuid.New()
+	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	fs := &fakeStore{
+		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: true, Status: "awaiting_followup", WorkerID: pgUUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed.Add(-2 * time.Minute))}, // stale
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.now = func() time.Time { return fixed }
+
+	res, err := svc.SubmitInput(context.Background(), user, runID, "stop", "", nil)
+	if err != nil {
+		t.Fatalf("SubmitInput(stop): %v", err)
+	}
+	if res.ServerSide {
+		t.Fatal("a stop must enqueue even with a stale worker — it has no server-side transition branch")
+	}
+	if fs.createdStopVerdict == nil || fs.createdStopVerdict.StopKind.String != "stopped" {
+		t.Fatalf("stop against a stale worker must still enqueue with stop_kind 'stopped', got %+v", fs.createdStopVerdict)
+	}
+	if fs.cancelled != nil || fs.rejected != nil {
+		t.Fatal("a stop must never reach CancelRunServerSide/RejectRunServerSide, even with a dead worker")
+	}
+}
+
+// TestSubmitInputStopForeignUserRejected: owner-scoping — a stop from a non-owner is a
+// 404 (ErrRunNotFound, via GetRun), so nothing is enqueued.
+func TestSubmitInputStopForeignUserRejected(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	fs := &fakeStore{runByIDErr: pgx.ErrNoRows} // GetRunByIDForUser finds no row for this user
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "stop", "", nil); err != ErrRunNotFound {
+		t.Fatalf("a foreign-user stop must return ErrRunNotFound, got %v", err)
+	}
+	if fs.createdStopVerdict != nil {
+		t.Fatal("no stop verdict may be enqueued for a run the caller does not own")
+	}
+}
+
+// TestSubmitInputStopRejectsTerminalRun: the terminal guard already 409s a stop on a
+// finished run (ErrRunTerminal → 409), before any row is written.
+func TestSubmitInputStopRejectsTerminalRun(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: user, Kind: RunKindTask, Status: "completed"}}
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "stop", "", nil); err != ErrRunTerminal {
+		t.Fatalf("a stop on a terminal run must return ErrRunTerminal, got %v", err)
+	}
+	if fs.createdStopVerdict != nil {
+		t.Fatal("no stop verdict may be enqueued on a terminal run")
+	}
+}
+
+// TestSubmitInputStopRejectsNonInteractiveTask: PRD #517 M4 review — a `stop` is honored
+// ONLY by the interactive-task park, so a stop on a NON-interactive task run is rejected
+// with ErrStopNotInteractive (→ 409) BEFORE any stop_kind is stamped. Otherwise it would
+// stamp a permanent, spurious stop_kind='stopped' and return a misleading success while
+// nothing winds the run down.
+//
+// MUTATION PROOF: remove the `run.Kind != RunKindTask || !run.Interactive` guard and this
+// run's stop is accepted — err becomes nil and fs.createdStopVerdict is stamped 'stopped'.
+func TestSubmitInputStopRejectsNonInteractiveTask(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	wkrID := uuid.New()
+	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	fs := &fakeStore{
+		// A task run, but NOT interactive — no park reads the stop flag.
+		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: false, Status: "running", WorkerID: pgUUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)},
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.now = func() time.Time { return fixed }
+
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "stop", "wind down", nil); err != ErrStopNotInteractive {
+		t.Fatalf("a stop on a non-interactive task must return ErrStopNotInteractive, got %v", err)
+	}
+	if fs.createdStopVerdict != nil {
+		t.Fatal("no stop verdict may be stamped on a non-interactive task run")
+	}
+}
+
+// TestSubmitInputStopRejectsNonTaskRun: the same guard rejects a stop on a non-task run
+// (here an interactive-flagged chat run — kind is what fails). Nothing is stamped.
+//
+// MUTATION PROOF: remove the guard's `run.Kind != RunKindTask` conjunct and this stop is
+// accepted and stamped.
+func TestSubmitInputStopRejectsNonTaskRun(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	wkrID := uuid.New()
+	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	fs := &fakeStore{
+		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindChat, Interactive: true, Status: "running", WorkerID: pgUUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)},
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.now = func() time.Time { return fixed }
+
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "stop", "", nil); err != ErrStopNotInteractive {
+		t.Fatalf("a stop on a non-task run must return ErrStopNotInteractive, got %v", err)
+	}
+	if fs.createdStopVerdict != nil {
+		t.Fatal("no stop verdict may be stamped on a non-task run")
+	}
+}
+
+// TestSubmitInputStopAcceptsRunningInteractiveTask: the guard keys on kind+interactive
+// only, NOT on status — a stop on a RUNNING (not yet parked) interactive task is a valid
+// wind-down and is accepted, stamping stop_kind='stopped'.
+//
+// MUTATION PROOF: tighten the guard to also require status=='awaiting_followup' and this
+// running-run stop is wrongly rejected.
+func TestSubmitInputStopAcceptsRunningInteractiveTask(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	wkrID := uuid.New()
+	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	fs := &fakeStore{
+		runByID:    store.Run{ID: runID, UserID: user, Kind: RunKindTask, Interactive: true, Status: "running", WorkerID: pgUUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)},
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.now = func() time.Time { return fixed }
+
+	res, err := svc.SubmitInput(context.Background(), user, runID, "stop", "", nil)
+	if err != nil {
+		t.Fatalf("a stop on a RUNNING interactive task must be accepted, got %v", err)
+	}
+	if res.ServerSide {
+		t.Fatal("a stop must always enqueue, never transition server-side")
+	}
+	if fs.createdStopVerdict == nil || fs.createdStopVerdict.StopKind.String != "stopped" {
+		t.Fatalf("a running interactive-task stop must stamp stop_kind 'stopped', got %+v", fs.createdStopVerdict)
 	}
 }
 

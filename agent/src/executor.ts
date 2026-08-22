@@ -13,6 +13,7 @@ import type {
   ClaimSkill,
   ClaimSkillDrop,
   FixVerdict,
+  IssueCommentsSnapshot,
   IterationBudget,
   MemoryEntry,
   MessageKind,
@@ -31,6 +32,30 @@ import { AGENT_GIT_IDENTITY, gitEnv } from "./git.js";
 import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * The resolution of an interactive-task follow-up park (PRD #517 M3). Returned by
+ * `RunContext.awaitFollowUp`. Discriminated so the loop can tell "keep going with a new
+ * follow-up" apart from every way a park can END:
+ *   - `followup` — the next user turn arrived; `body` is its text, folded into the next
+ *     implement turn exactly as a mid-run follow-up is.
+ *   - `ended` — the park is over. The disposition DEPENDS on `reason` — it is not one exit:
+ *       `idle`      — no follow-up arrived within the park's idle bound (M3); the run
+ *                     finalizes NORMALLY (reports `completed`, pushes its branch, opens an MR
+ *                     on `open_mr`), exactly as a non-interactive done;
+ *       `stopped`   — an explicit `stop` input ended the interactive run (SEAM: M4 wires
+ *                     the `stop` input kind + serviceFollowUp precedence; M3 never produces
+ *                     it). Reserved for a GRACEFUL stop (stop_kind='stopped'); for now it
+ *                     shares the idle normal-finalize;
+ *       `cancelled` — the run was cancelled (the existing steering cancel signal). This does
+ *                     NOT finalize as `completed`: the executor throws the cancel signal so
+ *                     the run reaches its terminal CANCEL path (reports `failed`; the server
+ *                     routes the stamped stop_kind='cancelled' to CancelRunByWorker). A parked
+ *                     cancel finalized as `completed` would wrongly push + open an MR.
+ */
+export type FollowUpOutcome =
+  | { kind: "followup"; body: string }
+  | { kind: "ended"; reason: "idle" | "stopped" | "cancelled" };
 
 /** A message the executor emits to the run stream (seq assigned downstream). */
 export interface EmittedMessage {
@@ -62,6 +87,12 @@ export interface RunContext {
   issueIid: number | null;
   issueTitle: string;
   issueDescription: string;
+  /** PRD #381: the bounded, bot/system-filtered snapshot of the issue's human
+   *  comments, snapshotted at run creation next to `issueDescription`. UNTRUSTED,
+   *  multi-author text; the SDK executor threads it to buildPlanPrompt, which renders
+   *  it under a per-prompt nonce fence. Absent/null ⇒ nothing is rendered (comment-less
+   *  issue, non-issue kind, or unknown bot id). */
+  issueComments?: IssueCommentsSnapshot | null;
   /** The failed-pipeline snapshot for a ci_fix run (PRD #6): what the agent
    *  diagnoses + fixes. Present only for kind="ci_fix". Log tails are UNTRUSTED. */
   pipeline?: ClaimPipeline | null;
@@ -78,10 +109,30 @@ export interface RunContext {
    *  alongside `baseCommit` because on a RESUME the two differ and name different diffs;
    *  the prompt is wrong on exactly the prior-work runs if it only ever sees one. */
   defaultBranchCommit?: string;
+  /** PRD #501 REC B: this run is auto-approved (autopilot, claim.auto_approve) — no
+   *  human in the loop. Threaded to the plan builders so the lead is told up front to
+   *  resolve open decisions on best judgment rather than calling `ask_user`. Optional;
+   *  absent ⇒ false (the stub executor and older callers ignore it). */
+  autoApprove?: boolean;
+  /** PRD #517 M3: this is an INTERACTIVE task run (claim.interactive). Only meaningful for
+   *  kind="task": when true the implement loop, on a clean `signal_done`, checkpoint-pushes
+   *  and PARKS (via `awaitFollowUp`) instead of finalizing, then resumes the same session on
+   *  the next follow-up. Absent ⇒ false (the stub/test executors and non-interactive runs
+   *  never enter the park). */
+  interactive?: boolean;
   /** Append a message to the run's live stream. */
   emit(msg: EmittedMessage): void;
   /** Anthropic subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN) for the SDK. */
   oauthToken?: string;
+  /** PRD #362 M3c: the model the inline run-summary generator runs on, resolved
+   *  user-value-wins from users.summary_model over the instance summary_model at
+   *  issue-run claim assembly. Absent ⇒ the generator uses the SDK/account default
+   *  model. Only the SDK executor's summary hooks read it; the stub ignores it. */
+  summaryModel?: string;
+  /** PRD #362 M3c (Decision 3): the run's INTENT summary is already set, so the
+   *  executor skips intent generation on a resume/re-claim rather than re-spending
+   *  the owner's token. Absent/false ⇒ generate the intent summary. */
+  summaryIntentPresent?: boolean;
   /** PRD #3 templates (lead + subagents) mapped to SDK AgentDefinitions. */
   agents?: AgentTemplate[];
   /** PRD #37: the roster the worker parsed out of the clone's `.claude/agents/`,
@@ -127,6 +178,14 @@ export interface RunContext {
    *  session-less seeded path there is no planning turn, so the sdk-executor forwards it to
    *  the IMPLEMENT prompt instead (first turn only). */
   priorWork?: PriorWork;
+  /** issue #222: this run was picked up again (a resume), so the runner clone was wiped
+   *  and re-seeded on this claim, destroying any local-only work an earlier attempt left in
+   *  the tree. Set by the RUNNER from the raw `claim.session_id` (a run that executed before
+   *  reported one) — the same discriminator the reseed feed-status uses, read raw so a
+   *  dropped-transcript resume still counts. Forwarded to the FIRST implement prompt so the
+   *  lead is warned before a queued follow-up written against the destroyed tree arrives.
+   *  Optional; absent ⇒ false (the stub executor and older callers ignore it). */
+  resumed?: boolean;
   /** PRD #35 Decision 6b + PRD #209 D4: this run's plan is ALREADY APPROVED, so the
    *  executor skips the Phase-1 planning turn and the gate and goes straight to
    *  implement⇄review with `approvedPlan` below.
@@ -174,8 +233,20 @@ export interface RunContext {
    * PRD #122 M1: the optional CANDIDATE milestone list rides the awaiting_approval
    * report so the human approves the breakdown too. Omitted/empty ⇒ no milestones on
    * the report (additive-optional; a run with no milestones is unchanged).
+   *
+   * PRD #362 M3c: `onAwaitingApproval` is an ADVISORY callback the gate invokes AFTER
+   * it persists `plan_md` (the awaiting_approval report) and BEFORE it blocks on the
+   * verdict. The plan-summary hook rides it: the summary's stale-write guard value is
+   * `runs.plan_md`, so the POST can only match once the gate has persisted it — posting
+   * before the gate always 409s against a NULL/previous plan_md and is silently dropped.
+   * It is NEVER invoked on the autopilot short-circuit (which never persists plan_md),
+   * so an auto-approved run generates no plan summary. The gate swallows any throw.
    */
-  gatePlan?(planMd: string, milestones?: Milestone[]): Promise<PlanVerdict>;
+  gatePlan?(
+    planMd: string,
+    milestones?: Milestone[],
+    onAwaitingApproval?: (planMd: string) => Promise<void>,
+  ): Promise<PlanVerdict>;
   /**
    * PRD #88 M1 clarification park. Called by the executor after a turn that made an
    * ask_user call: the runner emits the `question` run-message, posts /state
@@ -221,6 +292,24 @@ export interface RunContext {
    * failure so a checkpoint can never fail the run. Absent on the stub/test executors.
    */
   checkpoint?(opts: { reap: boolean; progress?: MilestoneProgress }): Promise<void>;
+  /**
+   * PRD #517 M3: park an INTERACTIVE task run after a clean `signal_done`, waiting for the
+   * next follow-up. The runner's implementation (a) reports `awaiting_followup` and verifies
+   * the ack (the park must actually take, mirroring askUser's ack check), then (b) blocks on
+   * the steering channel's `awaitFollowUp(idleMs)` and returns the outcome.
+   *
+   * CONSUME-BEFORE-REPORT ORDERING: the follow-up is delivered ONLY from the poll loop's
+   * post-route service step (serviceFollowUp), which runs after ConsumeRunInputs has stamped
+   * `consumed_at` in the same RETURNING that handed over the follow-up. So by the time this
+   * resolves `{kind:"followup"}`, the input is already consumed — and the loop's next
+   * `reportIteration` (`running`) passes the server's SetRunRunning wake guard by construction.
+   * This is the same discipline askUser uses; see runner.ts.
+   *
+   * The executor calls it OUTSIDE driveTurn (the idle watchdog lives inside driveTurn, so a
+   * parked run cannot trip REASON_IDLE), guarded on `ctx.interactive`. Absent on the
+   * stub/test/non-interactive executors, in which case the loop finalizes on done as today.
+   */
+  awaitFollowUp?(idleMs: number): Promise<FollowUpOutcome>;
 }
 
 export interface ExecutorResult {

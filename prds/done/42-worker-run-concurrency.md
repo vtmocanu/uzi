@@ -112,7 +112,7 @@ Everything `RunRunner` closes over that two concurrent `execute()` calls share, 
 |---|---|---|---|---|
 | 1 (parallel) | M1 (agent executor/HOME/registry), M3a (api migration+queries+web badge) | — | `agent/src/{sdk-executor,runner,main,log}.ts`, `agent/test/` · migration `00075`, `runtime.sql` list queries, register handler, `web/src/lib/api.ts`, `WorkersSettings.tsx` | agent · api+web |
 | 2 | M2 | M1 (executor must be concurrency-safe first) | `agent/src/worker.ts`, `agent/src/config.ts` | agent |
-| 3 (parallel) | M3b, M4 | M2 (M3b sizing needs the final slot model; M4 documents it) | `docker-compose.yml` · `docs/`, `specs/`, `ARCHITECTURE.md`, `prds/39-chat-agent.md` (wording) | root+docs |
+| 3 (parallel) | M3b, M4 | M2 (M3b sizing needs the final slot model; M4 documents it) | `docker-compose.yml` · `docs/`, `specs/`, `ARCHITECTURE.md`, `prds/done/39-chat-agent.md` (wording) | root+docs |
 | 4 | M5 | M2+M3a | `e2e/` | e2e |
 
 Coordination: PRD #39 Phase 2 touches `worker.ts`/`steering.ts` and its M2 edits the same compose agent service — the intended order is this PRD's M1/M2 first, then #39 builds its chat lane on the substrate and rebases its compose edit.

@@ -150,6 +150,9 @@ func (f *apForge) ListIssueLabelEvents(_ context.Context, _, iid int64) ([]forge
 	}
 	return f.events[iid], nil
 }
+func (f *apForge) ListIssueComments(context.Context, int64, int64) ([]forge.IssueComment, error) {
+	return nil, nil
+}
 func (f *apForge) GetIssue(context.Context, int64, int64) (forge.Issue, error) {
 	return f.issue, f.issueErr
 }

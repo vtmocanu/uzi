@@ -11,6 +11,7 @@ import { api, isTerminalRun, type AdminUsage, type RunListItem, type SelfUsage, 
 import { hasAnthropicToken } from "../lib/hasToken";
 import { effectiveRunStatus, milestoneBadge, milestoneBadgeText, mrChipState } from "../lib/runBadge";
 import { MrChip } from "../components/MrChip";
+import { RunIssueRef } from "../components/RunIssueRef";
 import { mrAbbrev } from "../lib/forgeNoun";
 import { YourUsageCard, FactoryTotalCard, PerUserUsageTable } from "../components/UsageCards";
 import { RunHealthBadge } from "../components/RunHealthBadge";
@@ -336,16 +337,38 @@ export function Dashboard() {
               const ms = milestoneBadge(r);
               const msBadge = ms ? milestoneBadgeText(ms) : null;
               return (
-              <li key={r.id}>
+              // Issue #485 NB1: RunIssueRef renders a real forge <a>, which cannot nest
+              // inside the row's navigational <Link> (also an <a> — invalid HTML). The
+              // <li> is a `group relative` container, the run-details <Link> is a
+              // stretched absolute overlay, and the content row sits in normal flow with
+              // the interactive ref raised above the overlay (relative z-10). The
+              // row-hover tint lives on the content layer via group-hover so the
+              // transparent overlay never paints over the content.
+              <li key={r.id} className="group relative">
                 <Link
                   to={`/runs/${r.id}`}
-                  className="flex items-center gap-3 py-2.5 transition-colors hover:bg-raised/40"
-                >
+                  // Issue #485 review FIX 2: name the link by the run's visible title so
+                  // multiple issue-less runs (all "Open run" otherwise) get distinct,
+                  // meaningful accessible names. issue_title is untrusted forge text, so it
+                  // stays sanitized (same stripUnsafeChars as the visible title).
+                  aria-label={`Open run${r.issue_iid != null ? ` for issue #${r.issue_iid}` : ""}${
+                    r.issue_title.trim() ? `: ${stripUnsafeChars(r.issue_title)}` : ""
+                  }`}
+                  className="absolute inset-0 rounded-md"
+                />
+                <div className="flex items-center gap-3 py-2.5 transition-colors group-hover:bg-raised/40">
                   <div className="min-w-0 flex-1">
                     {/* Issue #124: forge-supplied issue title, untrusted (see RunsList). */}
                     <p className="truncate text-sm font-medium text-fg">{stripUnsafeChars(r.issue_title)}</p>
-                    <p className="text-xs text-faint">
-                      {r.repo_path} #{r.issue_iid}
+                    <p className="flex flex-wrap items-center gap-x-1 text-xs text-faint">
+                      {r.repo_path}{" "}
+                      <RunIssueRef
+                        issueIid={r.issue_iid}
+                        issueWebUrl={r.issue_web_url}
+                        kind={r.kind}
+                        forgeType={r.forge_type}
+                        raised
+                      />
                       {r.mr_iid != null && (
                         <MrChip
                           variant="inline"
@@ -354,27 +377,38 @@ export function Dashboard() {
                           mrIid={r.mr_iid}
                           mrState={mrState}
                           href={null}
-                          className="ml-2"
+                          // Issue #485 review FIX 1: raised above the card overlay
+                          // (relative z-10) so its `title` (MR state) fires on hover.
+                          className="relative z-10 ml-2"
                         />
                       )}
                     </p>
                   </div>
-                  {r.iteration_count > 0 && (
-                    <Badge tone="neutral" title="implement ⇄ review iterations">
-                      iter {r.iteration_count}
-                    </Badge>
-                  )}
-                  {/* PRD #122: compact milestone progress next to the iter badge; a
-                      non-milestone run keeps only the iter badge. PRD #265 M2: an
-                      unreported tracker shows M–/N, not a 0/N that reads as failure. */}
-                  {msBadge && (
-                    <Badge tone="info" title={msBadge.title}>
-                      {msBadge.label}
-                    </Badge>
-                  )}
-                  <RunHealthBadge run={r} />
-                  <StatusPill status={effectiveRunStatus(r)} />
-                </Link>
+                  {/* Issue #485 review FIX 1: raise the right-side badge cluster above the
+                      card's stretched-link overlay (relative z-10) so each badge's native
+                      `title` tooltip fires on hover — the transparent overlay otherwise
+                      intercepts the pointer and carries no title. These status badges are
+                      not click-to-navigate targets, so the trade is correct; the title/body
+                      text stays under the overlay and still opens the run. The wrapper keeps
+                      the row's gap-3 spacing so the layout is unchanged. */}
+                  <div className="relative z-10 flex items-center gap-3">
+                    {r.iteration_count > 0 && (
+                      <Badge tone="neutral" title="implement ⇄ review iterations">
+                        iter {r.iteration_count}
+                      </Badge>
+                    )}
+                    {/* PRD #122: compact milestone progress next to the iter badge; a
+                        non-milestone run keeps only the iter badge. PRD #265 M2: an
+                        unreported tracker shows M–/N, not a 0/N that reads as failure. */}
+                    {msBadge && (
+                      <Badge tone="info" title={msBadge.title}>
+                        {msBadge.label}
+                      </Badge>
+                    )}
+                    <RunHealthBadge run={r} />
+                    <StatusPill status={effectiveRunStatus(r)} />
+                  </div>
+                </div>
               </li>
               );
             })}

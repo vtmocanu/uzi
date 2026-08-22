@@ -70,6 +70,23 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+describe("Agents page always-visible agent-templates guide link (PRD #57 M3)", () => {
+  it("renders the agent templates guide link in the page intro", async () => {
+    mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
+    mockApi.listAgentTemplates.mockResolvedValue({ templates: [] });
+    mockApi.getTemplateAllocations.mockResolvedValue({ templates: [] });
+
+    render(
+      <MemoryRouter>
+        <Agents />
+      </MemoryRouter>,
+    );
+
+    const docLink = await screen.findByRole("link", { name: "agent templates" });
+    expect(docLink.getAttribute("href")).toBe("/docs/agent-templates");
+  });
+});
+
 describe("Agents page shadowed hint (PRD #18 M7/M8)", () => {
   it("badges a user template whose name collides with a builtin, not a unique one", async () => {
     mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);

@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { Repos } from "./Repos";
-import { api, type ForgeConnection, type Repo } from "../lib/api";
+import { api, ApiError, type ForgeConnection, type Repo } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
 vi.mock("../lib/api", async (importOriginal) => {
@@ -14,6 +14,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       listConnections: vi.fn(),
       listProjects: vi.fn(),
       setRepoEnabled: vi.fn(),
+      deleteRepo: vi.fn(),
       setRepoSkillsEnabled: vi.fn(),
       setRepoClaudemdEnabled: vi.fn(),
       setRepoTrustFlags: vi.fn(),
@@ -21,8 +22,20 @@ vi.mock("../lib/api", async (importOriginal) => {
       listToolAllowlist: vi.fn(),
       setRepoToolProfile: vi.fn(),
       setRepoDevboxOptIn: vi.fn(),
+      setRepoRequiredCapabilities: vi.fn(),
       setRepoGuardrailOverride: vi.fn(),
       clearRepoGuardrailOverride: vi.fn(),
+      getProjectSyncStatus: vi.fn(),
+      getProjectSyncOwnerType: vi.fn(),
+      provisionProjectSync: vi.fn(),
+      adoptProjectSync: vi.fn(),
+      resyncProjectSync: vi.fn(),
+      autocreateProjectSyncColumns: vi.fn(),
+      disableProjectSync: vi.fn(),
+      getProjectSyncVisibility: vi.fn(),
+      setProjectSyncVisibility: vi.fn(),
+      shareProjectSync: vi.fn(),
+      unshareProjectSync: vi.fn(),
     },
   };
 });
@@ -63,6 +76,8 @@ function repo(over: Partial<Repo> & Pick<Repo, "id" | "path_with_namespace">): R
     repo_devbox_opt_in: false,
     pipeline: null,
     guardrail_blocked: false,
+    docker_allowlisted: false,
+    docker_blocked: false,
     ...over,
   };
 }
@@ -116,6 +131,15 @@ async function openTrustPanel(name: string): Promise<HTMLElement> {
   return screen.getByRole("group", { name: new RegExp(`Trusted repo for ${name}`) });
 }
 
+describe("Repos — always-visible repo-agents guide link (PRD #57 M3)", () => {
+  it("renders the repo agents guide link in the page intro", async () => {
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+    const docLink = screen.getByRole("link", { name: "repo agents" });
+    expect(docLink.getAttribute("href")).toBe("/docs/repo-agents");
+  });
+});
+
 describe("Repos — Trusted repo cell", () => {
   it("shows an Off badge + Manage on an enabled, untrusted repo", async () => {
     renderPage();
@@ -150,6 +174,23 @@ describe("Repos — Trusted repo panel", () => {
   it("renders the panel OUTSIDE the horizontal-scroll container (never clipped)", async () => {
     const panel = await openTrustPanel("vtmocanu/uzi");
     expect(panel.closest(".overflow-x-auto")).toBeNull();
+  });
+});
+
+describe("Repos — board list layout (issue #578)", () => {
+  it("puts the projects table in a bordered box like /schedules, not a padded Card", async () => {
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+    const table = screen.getByRole("table");
+    // The table sits in the /schedules-style wrapper: a rounded, bordered box on
+    // the surface — a positive assertion the Card wrapper was dropped for M3.
+    const wrapper = table.closest("div.overflow-x-auto");
+    expect(wrapper).not.toBeNull();
+    expect(wrapper!.className).toContain("rounded-xl");
+    expect(wrapper!.className).toContain("border-edge");
+    // The removed Card carried a p-0 padding override; nothing wrapping the table
+    // should still be that Card.
+    expect(table.closest(".p-0")).toBeNull();
   });
 
   it("moves focus into the panel when it opens", async () => {
@@ -346,11 +387,51 @@ describe("Repos — tier-2 devbox opt-in (PRD #18 M5)", () => {
 
     // Open the per-repo Tools panel.
     fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: "Tools" }));
-    // The trust toggle appears (allowlist is empty, so it's the only checkbox).
-    const toggle = await screen.findByRole("checkbox");
+    // The devbox trust toggle (distinct from the capability checkboxes below it).
+    const toggle = await screen.findByRole("checkbox", { name: /Also trust this repo/i });
     fireEvent.click(toggle);
 
     await waitFor(() => expect(mockApi.setRepoDevboxOptIn).toHaveBeenCalledWith("repo-uzi", true));
+  });
+});
+
+describe("Repos — static capability hint (PRD #84 M2)", () => {
+  it("ticks a capability and PATCHes required_capabilities alone", async () => {
+    mockApi.setRepoRequiredCapabilities.mockResolvedValue({
+      repo: { ...REPOS[0], required_capabilities: ["docker"] },
+    });
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+
+    fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: "Tools" }));
+    // The fixed vocabulary renders as two checkboxes; tick docker.
+    const docker = await screen.findByRole("checkbox", { name: "docker" });
+    expect((docker as HTMLInputElement).checked).toBe(false);
+    fireEvent.click(docker);
+
+    await waitFor(() =>
+      expect(mockApi.setRepoRequiredCapabilities).toHaveBeenCalledWith("repo-uzi", ["docker"]),
+    );
+  });
+
+  it("unticks a capability and PATCHes the shrunk list", async () => {
+    mockApi.listProjects.mockResolvedValue({
+      repos: [{ ...REPOS[0], required_capabilities: ["docker", "jvm"] }],
+    });
+    mockApi.setRepoRequiredCapabilities.mockResolvedValue({
+      repo: { ...REPOS[0], required_capabilities: ["jvm"] },
+    });
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+
+    fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: "Tools" }));
+    const docker = (await screen.findByRole("checkbox", { name: "docker" })) as HTMLInputElement;
+    expect(docker.checked).toBe(true);
+    fireEvent.click(docker);
+
+    await waitFor(() =>
+      expect(mockApi.setRepoRequiredCapabilities).toHaveBeenCalledWith("repo-uzi", ["jvm"]),
+    );
   });
 });
 
@@ -445,5 +526,728 @@ describe("Repos — admin per-repo override UI (PRD #66 M9, D8)", () => {
 
     fireEvent.keyDown(dialog, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+});
+
+describe("Repos — per-repo remove action (PRD #357 M2, D2/D3)", () => {
+  it("a disabled repo shows Remove; confirming calls deleteRepo and drops the row", async () => {
+    mockApi.deleteRepo.mockResolvedValue(null);
+    renderPage();
+    // example/website is the disabled repo in the fixture.
+    await screen.findByText("example/website");
+    const row = within(rowFor("example/website"));
+
+    // The Remove button reveals the row-inline confirm; nothing is deleted yet.
+    fireEvent.click(row.getByRole("button", { name: /^Remove$/ }));
+    expect(mockApi.deleteRepo).not.toHaveBeenCalled();
+    const confirm = screen.getByRole("group", { name: /Confirm removing example\/website/ });
+    // Confirm copy names the permanent consequence (board + run history).
+    expect(within(confirm).getByText(/permanent and deletes its board and run history/i)).toBeTruthy();
+
+    fireEvent.click(within(confirm).getByRole("button", { name: /Confirm remove/ }));
+    await waitFor(() => expect(mockApi.deleteRepo).toHaveBeenCalledWith("repo-www"));
+    // The row is gone from the list.
+    await waitFor(() => expect(screen.queryByText("example/website")).toBeNull());
+  });
+
+  it("an enabled repo shows NO Remove button", async () => {
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+    // Sanity: the enabled repo still offers Disable, so the row is really rendered.
+    const row = within(rowFor("vtmocanu/uzi"));
+    expect(row.getByRole("button", { name: /^Disable$/ })).toBeTruthy();
+    expect(row.queryByRole("button", { name: /^Remove$/ })).toBeNull();
+  });
+});
+
+describe("Repos — enable guardrail 422 violations (PRD #345)", () => {
+  it("renders the refusal violations and leaves the repo disabled, then clears on a later success", async () => {
+    mockApi.setRepoEnabled.mockRejectedValue(
+      new ApiError(422, "this repo was not enabled", {
+        violations: ["reason one", "reason two"],
+      }),
+    );
+    renderPage();
+    // example/website is the disabled repo in the fixture — it shows an Enable toggle.
+    await screen.findByText("example/website");
+    const row = () => within(rowFor("example/website"));
+    fireEvent.click(row().getByRole("button", { name: /^Enable$/ }));
+
+    // POSITIVE: both violation strings surface in the DOM.
+    expect(await screen.findByText("reason one")).toBeTruthy();
+    expect(screen.getByText("reason two")).toBeTruthy();
+
+    // NEGATIVE: the repo stayed disabled — its toggle still reads Enable, never Disable.
+    expect(row().getByRole("button", { name: /^Enable$/ })).toBeTruthy();
+    expect(row().queryByRole("button", { name: /^Disable$/ })).toBeNull();
+
+    // A subsequent successful toggle clears the violations from the DOM.
+    mockApi.setRepoEnabled.mockResolvedValue({
+      repo: { ...REPOS[2], enabled: true },
+    });
+    fireEvent.click(row().getByRole("button", { name: /^Enable$/ }));
+    await waitFor(() => expect(screen.queryByText("reason one")).toBeNull());
+    expect(screen.queryByText("reason two")).toBeNull();
+  });
+});
+
+describe("Repos — GitHub Projects sync (PRD #534 M3)", () => {
+  const GH_CONN: ForgeConnection = {
+    ...CONN,
+    id: "conn-gh",
+    forge_type: "github",
+    base_url: "https://github.com",
+  };
+  const GH_REPO: Repo = repo({
+    id: "repo-gh",
+    path_with_namespace: "vtmocanu/gh",
+    connection_id: "conn-gh",
+  });
+
+  const linkedStatus = {
+    project_number: 42,
+    owned_by_uzi: true,
+    last_synced_at: "2026-08-20T10:00:00Z",
+    last_error: null,
+    item_count: 7,
+  };
+
+  // Open the Project-sync panel for a GitHub repo row and return its group element.
+  async function openSyncPanel(name: string): Promise<HTMLElement> {
+    renderPage();
+    await screen.findByText(name);
+    fireEvent.click(within(rowFor(name)).getByRole("button", { name: /Project sync settings for/ }));
+    return screen.getByRole("group", { name: new RegExp(`Project sync for ${name}`) });
+  }
+
+  beforeEach(() => {
+    mockApi.listConnections.mockResolvedValue({ connections: [GH_CONN] });
+    mockApi.listProjects.mockResolvedValue({ repos: [{ ...GH_REPO }] });
+    // Default: not linked (404) so the panel opens on the provision/adopt state.
+    mockApi.getProjectSyncStatus.mockRejectedValue(new ApiError(404, "project sync not enabled for this repo"));
+    // Default visibility: private. Linked cases override; the not-linked default
+    // never reaches this call (loadSyncStatus fetches it only on a 200 status).
+    mockApi.getProjectSyncVisibility.mockResolvedValue({ public: false });
+  });
+
+  it("renders the Sync badge + Manage on an enabled GitHub repo", async () => {
+    renderPage();
+    await screen.findByText("vtmocanu/gh");
+    const row = within(rowFor("vtmocanu/gh"));
+    expect(row.getByText("Sync")).toBeTruthy();
+    expect(row.getByRole("button", { name: /Project sync settings for vtmocanu\/gh/ })).toBeTruthy();
+  });
+
+  it("renders — (no Manage) for a GitLab connection's repo", async () => {
+    // The default gitlab CONN with a gitlab repo: the cell is non-applicable.
+    mockApi.listConnections.mockResolvedValue({ connections: [CONN] });
+    mockApi.listProjects.mockResolvedValue({ repos: [repo({ id: "repo-gl", path_with_namespace: "vtmocanu/gl" })] });
+    renderPage();
+    await screen.findByText("vtmocanu/gl");
+    const row = within(rowFor("vtmocanu/gl"));
+    expect(row.queryByRole("button", { name: /Project sync settings/ })).toBeNull();
+    expect(row.queryByText("Sync")).toBeNull();
+  });
+
+  it("opening Manage fetches status; a 404 shows the Provision + Adopt forms", async () => {
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await waitFor(() => expect(mockApi.getProjectSyncStatus).toHaveBeenCalledWith("repo-gh"));
+    expect(within(panel).getByText("Not linked")).toBeTruthy();
+    expect(within(panel).getByRole("button", { name: /Provision/ })).toBeTruthy();
+    expect(within(panel).getByRole("button", { name: /Adopt/ })).toBeTruthy();
+  });
+
+  it("a 200 status shows the linked readout + Disable, and Disable calls disableProjectSync", async () => {
+    mockApi.getProjectSyncStatus.mockResolvedValue({ ...linkedStatus });
+    mockApi.disableProjectSync.mockResolvedValue(null);
+    const panel = await openSyncPanel("vtmocanu/gh");
+
+    await within(panel).findByText("Linked");
+    // The readout surfaces the project number, ownership, and item count.
+    expect(within(panel).getByText("#42")).toBeTruthy();
+    expect(within(panel).getByText("owned by uzi")).toBeTruthy();
+
+    fireEvent.click(within(panel).getByRole("button", { name: /Disable sync/ }));
+    await waitFor(() => expect(mockApi.disableProjectSync).toHaveBeenCalledWith("repo-gh"));
+  });
+
+  it("Provision calls provisionProjectSync with the chosen owner_kind + title", async () => {
+    mockApi.provisionProjectSync.mockResolvedValue({ status: "provisioned" });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Not linked");
+
+    fireEvent.change(within(panel).getByLabelText("Provision owner"), { target: { value: "org" } });
+    fireEvent.change(within(panel).getByLabelText("Project title"), { target: { value: "My board" } });
+    fireEvent.click(within(panel).getByRole("button", { name: /Provision/ }));
+
+    await waitFor(() =>
+      expect(mockApi.provisionProjectSync).toHaveBeenCalledWith("repo-gh", {
+        owner_kind: "org",
+        title: "My board",
+      }),
+    );
+  });
+
+  it("Adopt calls adoptProjectSync with the project number + owner_kind", async () => {
+    mockApi.adoptProjectSync.mockResolvedValue({ status: "linked" });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Not linked");
+
+    fireEvent.change(within(panel).getByLabelText("Adopt owner"), { target: { value: "viewer" } });
+    fireEvent.change(within(panel).getByLabelText("Project number"), { target: { value: "7" } });
+    fireEvent.click(within(panel).getByRole("button", { name: /Adopt/ }));
+
+    await waitFor(() =>
+      expect(mockApi.adoptProjectSync).toHaveBeenCalledWith("repo-gh", {
+        project_number: 7,
+        owner_kind: "viewer",
+      }),
+    );
+  });
+
+  it("a 409 from provision surfaces the 'ask an admin' message", async () => {
+    mockApi.provisionProjectSync.mockRejectedValue(new ApiError(409, "project sync disabled"));
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Not linked");
+
+    fireEvent.click(within(panel).getByRole("button", { name: /Provision/ }));
+    expect(
+      await within(panel).findByText(/turned off for this instance — ask an admin to enable it/i),
+    ).toBeTruthy();
+  });
+});
+
+describe("Repos — skipped columns + Resync (PRD #576 M3)", () => {
+  const GH_CONN: ForgeConnection = {
+    ...CONN,
+    id: "conn-gh",
+    forge_type: "github",
+    base_url: "https://github.com",
+  };
+  const GH_REPO: Repo = repo({
+    id: "repo-gh",
+    path_with_namespace: "vtmocanu/gh",
+    connection_id: "conn-gh",
+  });
+
+  const linkedWithUnmatched = {
+    project_number: 42,
+    owned_by_uzi: false,
+    last_synced_at: "2026-08-20T10:00:00Z",
+    last_error: null,
+    item_count: 7,
+    unmatched_columns: ["Planned", "bug"],
+  };
+
+  async function openSyncPanel(name: string): Promise<HTMLElement> {
+    renderPage();
+    await screen.findByText(name);
+    fireEvent.click(within(rowFor(name)).getByRole("button", { name: /Project sync settings for/ }));
+    return screen.getByRole("group", { name: new RegExp(`Project sync for ${name}`) });
+  }
+
+  beforeEach(() => {
+    mockApi.listConnections.mockResolvedValue({ connections: [GH_CONN] });
+    mockApi.listProjects.mockResolvedValue({ repos: [{ ...GH_REPO }] });
+    mockApi.getProjectSyncVisibility.mockResolvedValue({ public: false });
+  });
+
+  it("lists the skipped columns and renders a Resync button", async () => {
+    mockApi.getProjectSyncStatus.mockResolvedValue({ ...linkedWithUnmatched });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Linked");
+
+    // Both skipped column names appear in the advisory copy.
+    expect(within(panel).getByText(/Planned, bug/)).toBeTruthy();
+    expect(
+      within(panel).getByText(/no matching Status option and won.?t\s+sync/i),
+    ).toBeTruthy();
+    expect(within(panel).getByRole("button", { name: /Resync/ })).toBeTruthy();
+  });
+
+  it("clicking Resync calls resyncProjectSync with the repo id and reloads status", async () => {
+    mockApi.getProjectSyncStatus.mockResolvedValue({ ...linkedWithUnmatched });
+    mockApi.resyncProjectSync.mockResolvedValue({ status: "resynced" });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Linked");
+
+    mockApi.getProjectSyncStatus.mockClear();
+    fireEvent.click(within(panel).getByRole("button", { name: /Resync/ }));
+
+    await waitFor(() => expect(mockApi.resyncProjectSync).toHaveBeenCalledWith("repo-gh"));
+    // Status is reloaded after the resync so the readout reflects the result.
+    await waitFor(() => expect(mockApi.getProjectSyncStatus).toHaveBeenCalledWith("repo-gh"));
+  });
+
+  it("renders the auto-create button with the two-status-field tradeoff copy (PRD #576 M6)", async () => {
+    mockApi.getProjectSyncStatus.mockResolvedValue({ ...linkedWithUnmatched });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Linked");
+
+    // The tradeoff is documented near the button.
+    expect(within(panel).getByText(/two status-like fields/i)).toBeTruthy();
+    expect(
+      within(panel).getByRole("button", { name: /Auto-create the missing columns/ }),
+    ).toBeTruthy();
+  });
+
+  it("clicking Auto-create calls autocreateProjectSyncColumns and reloads status (PRD #576 M6)", async () => {
+    mockApi.getProjectSyncStatus.mockResolvedValue({ ...linkedWithUnmatched });
+    mockApi.autocreateProjectSyncColumns.mockResolvedValue({ status: "columns_created" });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Linked");
+
+    mockApi.getProjectSyncStatus.mockClear();
+    fireEvent.click(
+      within(panel).getByRole("button", { name: /Auto-create the missing columns/ }),
+    );
+
+    await waitFor(() =>
+      expect(mockApi.autocreateProjectSyncColumns).toHaveBeenCalledWith("repo-gh"),
+    );
+    // Status is reloaded so the (now empty) skipped-columns list reflects the result.
+    await waitFor(() => expect(mockApi.getProjectSyncStatus).toHaveBeenCalledWith("repo-gh"));
+  });
+});
+
+describe("Repos — Adopt-first sync (PRD #576 M1)", () => {
+  const GH_CONN: ForgeConnection = {
+    ...CONN,
+    id: "conn-gh",
+    forge_type: "github",
+    base_url: "https://github.com",
+  };
+  const GH_REPO: Repo = repo({
+    id: "repo-gh",
+    path_with_namespace: "vtmocanu/gh",
+    connection_id: "conn-gh",
+  });
+
+  async function openSyncPanel(name: string): Promise<HTMLElement> {
+    renderPage();
+    await screen.findByText(name);
+    fireEvent.click(within(rowFor(name)).getByRole("button", { name: /Project sync settings for/ }));
+    return screen.getByRole("group", { name: new RegExp(`Project sync for ${name}`) });
+  }
+
+  beforeEach(() => {
+    mockApi.listConnections.mockResolvedValue({ connections: [GH_CONN] });
+    mockApi.listProjects.mockResolvedValue({ repos: [{ ...GH_REPO }] });
+    // Not linked (404) so the panel opens on the provision/adopt state.
+    mockApi.getProjectSyncStatus.mockRejectedValue(new ApiError(404, "project sync not enabled for this repo"));
+    mockApi.getProjectSyncVisibility.mockResolvedValue({ public: false });
+  });
+
+  it("fetches owner type on open and renders the Adopt-first explainer, Adopt before Provision", async () => {
+    mockApi.getProjectSyncOwnerType.mockResolvedValue({ owner_type: "Organization" });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Not linked");
+    await waitFor(() => expect(mockApi.getProjectSyncOwnerType).toHaveBeenCalledWith("repo-gh"));
+
+    // The terse one-line explainer renders.
+    expect(
+      within(panel).getByText(/Adopt a Project you already created \(recommended\)/i),
+    ).toBeTruthy();
+
+    // Adopt is presented first (foreground): its heading precedes Provision's in DOM order.
+    const adoptHeading = within(panel).getByText("Adopt an existing project");
+    const provisionHeading = within(panel).getByText("Create a new project");
+    expect(
+      adoptHeading.compareDocumentPosition(provisionHeading) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("for a user-owned repo, Provision is disabled with its reason rendered", async () => {
+    mockApi.getProjectSyncOwnerType.mockResolvedValue({ owner_type: "User" });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Not linked");
+    await waitFor(() => expect(mockApi.getProjectSyncOwnerType).toHaveBeenCalledWith("repo-gh"));
+
+    // Provision is disabled...
+    await waitFor(() =>
+      expect(
+        (within(panel).getByRole("button", { name: /Provision/ }) as HTMLButtonElement).disabled,
+      ).toBe(true),
+    );
+    // ...and its reason text is in the DOM.
+    expect(
+      within(panel).getByText(/can.?t own a Project under a personal account/i),
+    ).toBeTruthy();
+    // Adopt stays available.
+    expect(
+      (within(panel).getByRole("button", { name: /Adopt/ }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+  });
+
+  it("for an org-owned repo, Provision is enabled", async () => {
+    mockApi.getProjectSyncOwnerType.mockResolvedValue({ owner_type: "Organization" });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Not linked");
+    await waitFor(() => expect(mockApi.getProjectSyncOwnerType).toHaveBeenCalledWith("repo-gh"));
+
+    expect(
+      (within(panel).getByRole("button", { name: /Provision/ }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+    expect(within(panel).queryByText(/personal account/i)).toBeNull();
+  });
+
+  it("on owner-type fetch rejection, both forms are enabled (fallback)", async () => {
+    mockApi.getProjectSyncOwnerType.mockRejectedValue(new ApiError(500, "boom"));
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Not linked");
+    await waitFor(() => expect(mockApi.getProjectSyncOwnerType).toHaveBeenCalledWith("repo-gh"));
+
+    expect(
+      (within(panel).getByRole("button", { name: /Provision/ }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+    expect(
+      (within(panel).getByRole("button", { name: /Adopt/ }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+    expect(within(panel).queryByText(/personal account/i)).toBeNull();
+  });
+});
+
+describe("Repos — sync-health badge (PRD #576 M2)", () => {
+  const GH_CONN: ForgeConnection = {
+    ...CONN,
+    id: "conn-gh",
+    forge_type: "github",
+    base_url: "https://github.com",
+  };
+
+  function ghRepo(over: Partial<Repo>): Repo {
+    return repo({
+      id: "repo-gh",
+      path_with_namespace: "vtmocanu/gh",
+      connection_id: "conn-gh",
+      ...over,
+    });
+  }
+
+  beforeEach(() => {
+    mockApi.listConnections.mockResolvedValue({ connections: [GH_CONN] });
+    mockApi.getProjectSyncStatus.mockRejectedValue(new ApiError(404, "project sync not enabled for this repo"));
+    mockApi.getProjectSyncVisibility.mockResolvedValue({ public: false });
+  });
+
+  // The Badge renders a single <span> whose className carries the tone hue class
+  // (text-ok / text-danger / text-neutral-fg). Assert on that rendered output, not
+  // component internals — the same technique the Setup-chip test uses.
+  function syncBadge(name: string): HTMLElement {
+    return within(rowFor(name)).getByText("Sync");
+  }
+
+  it("linked && healthy → ok (green) tone", async () => {
+    mockApi.listProjects.mockResolvedValue({
+      repos: [ghRepo({ github_project_sync: { linked: true, healthy: true, last_synced_at: "2026-08-20T10:00:00Z" } })],
+    });
+    renderPage();
+    await screen.findByText("vtmocanu/gh");
+    const badge = syncBadge("vtmocanu/gh");
+    expect(badge.className).toContain("text-ok");
+    // Paired negatives so the tone assertion is not vacuous.
+    expect(badge.className).not.toContain("text-danger");
+    expect(badge.className).not.toContain("text-neutral-fg");
+  });
+
+  it("linked && !healthy (last_error set) → danger tone, with the error surfaced", async () => {
+    mockApi.listProjects.mockResolvedValue({
+      repos: [
+        ghRepo({
+          github_project_sync: { linked: true, healthy: false, last_error: "provision failed: owner mismatch" },
+        }),
+      ],
+    });
+    renderPage();
+    await screen.findByText("vtmocanu/gh");
+    const badge = syncBadge("vtmocanu/gh");
+    expect(badge.className).toContain("text-danger");
+    expect(badge.className).not.toContain("text-ok");
+    // The error text is surfaced for the user (title/aria), not swallowed.
+    expect(badge.getAttribute("title")).toContain("provision failed: owner mismatch");
+    expect(badge.getAttribute("aria-label")).toContain("provision failed: owner mismatch");
+  });
+
+  it("not linked (field absent) → neutral tone (current look)", async () => {
+    mockApi.listProjects.mockResolvedValue({ repos: [ghRepo({})] });
+    renderPage();
+    await screen.findByText("vtmocanu/gh");
+    const badge = syncBadge("vtmocanu/gh");
+    expect(badge.className).toContain("text-neutral-fg");
+    expect(badge.className).not.toContain("text-ok");
+    expect(badge.className).not.toContain("text-danger");
+  });
+
+  it("linked but explicitly null field → neutral tone", async () => {
+    mockApi.listProjects.mockResolvedValue({ repos: [ghRepo({ github_project_sync: null })] });
+    renderPage();
+    await screen.findByText("vtmocanu/gh");
+    const badge = syncBadge("vtmocanu/gh");
+    expect(badge.className).toContain("text-neutral-fg");
+  });
+});
+
+describe("Repos — Board access (PRD #557 M4)", () => {
+  const GH_CONN: ForgeConnection = {
+    ...CONN,
+    id: "conn-gh",
+    forge_type: "github",
+    base_url: "https://github.com",
+  };
+  const GH_REPO: Repo = repo({
+    id: "repo-gh",
+    path_with_namespace: "vtmocanu/gh",
+    connection_id: "conn-gh",
+  });
+  const linkedStatus = {
+    project_number: 42,
+    owned_by_uzi: true,
+    last_synced_at: "2026-08-20T10:00:00Z",
+    last_error: null,
+    item_count: 7,
+  };
+
+  async function openSyncPanel(name: string): Promise<HTMLElement> {
+    renderPage();
+    await screen.findByText(name);
+    fireEvent.click(within(rowFor(name)).getByRole("button", { name: /Project sync settings for/ }));
+    return screen.getByRole("group", { name: new RegExp(`Project sync for ${name}`) });
+  }
+
+  beforeEach(() => {
+    mockApi.listConnections.mockResolvedValue({ connections: [GH_CONN] });
+    mockApi.listProjects.mockResolvedValue({ repos: [{ ...GH_REPO }] });
+    mockApi.getProjectSyncStatus.mockResolvedValue({ ...linkedStatus });
+    mockApi.getProjectSyncVisibility.mockResolvedValue({ public: false });
+  });
+
+  it("shows the Board-access block for a linked GitHub repo, with the write-only note", async () => {
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Board access");
+    // The visibility toggle is present…
+    expect(within(panel).getByRole("switch", { name: "Board visibility" })).toBeTruthy();
+    // …and the honesty note renders (POSITIVE assertion — not the absence of a list).
+    expect(
+      within(panel).getByText(/GitHub does not expose a board.s current sharing list/i),
+    ).toBeTruthy();
+    await waitFor(() => expect(mockApi.getProjectSyncVisibility).toHaveBeenCalledWith("repo-gh"));
+  });
+
+  it("is absent for a not-linked repo (provision/adopt forms show instead)", async () => {
+    mockApi.getProjectSyncStatus.mockRejectedValue(
+      new ApiError(404, "project sync not enabled for this repo"),
+    );
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Not linked");
+    expect(within(panel).queryByText("Board access")).toBeNull();
+    expect(within(panel).queryByRole("switch", { name: "Board visibility" })).toBeNull();
+    // Sanity: the not-linked entry state is really rendered.
+    expect(within(panel).getByRole("button", { name: /Provision/ })).toBeTruthy();
+    expect(within(panel).getByRole("button", { name: /Adopt/ })).toBeTruthy();
+  });
+
+  it("is absent for a GitLab connection's repo (no Manage trigger at all)", async () => {
+    mockApi.listConnections.mockResolvedValue({ connections: [CONN] });
+    mockApi.listProjects.mockResolvedValue({ repos: [repo({ id: "repo-gl", path_with_namespace: "vtmocanu/gl" })] });
+    renderPage();
+    await screen.findByText("vtmocanu/gl");
+    const row = within(rowFor("vtmocanu/gl"));
+    // No Project-sync Manage trigger → no path to a Board-access control.
+    expect(row.queryByRole("button", { name: /Project sync settings/ })).toBeNull();
+    expect(screen.queryByText("Board access")).toBeNull();
+    expect(screen.queryByRole("switch", { name: "Board visibility" })).toBeNull();
+  });
+
+  it("the visibility toggle reflects the fetched value and PUTs on change", async () => {
+    mockApi.setProjectSyncVisibility.mockResolvedValue({ public: true });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Board access");
+
+    const toggle = within(panel).getByRole("switch", { name: "Board visibility" });
+    // Fetched value is private → off, and no internet-visible caption yet.
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+    expect(within(panel).queryByText(/visible to anyone on the internet/i)).toBeNull();
+
+    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(mockApi.setProjectSyncVisibility).toHaveBeenCalledWith("repo-gh", true),
+    );
+    // The response's public:true drives the caption and the switch state.
+    expect(await within(panel).findByText(/visible to anyone on the internet/i)).toBeTruthy();
+    expect(within(panel).getByRole("switch", { name: "Board visibility" }).getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("Share calls the collaborators endpoint and shows a success confirmation", async () => {
+    mockApi.shareProjectSync.mockResolvedValue(null);
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Board access");
+
+    fireEvent.change(within(panel).getByLabelText("Share with a GitHub user (Reader)"), {
+      target: { value: "octocat" },
+    });
+    fireEvent.click(within(panel).getByRole("button", { name: /Share \(Reader\)/ }));
+
+    await waitFor(() => expect(mockApi.shareProjectSync).toHaveBeenCalledWith("repo-gh", "octocat"));
+    expect(await within(panel).findByText(/Shared with octocat as Reader/i)).toBeTruthy();
+    // The just-granted username gets a Revoke affordance.
+    expect(within(panel).getByRole("button", { name: /Revoke/ })).toBeTruthy();
+  });
+
+  it("Revoke calls the unshare endpoint and drops the entry from the session list", async () => {
+    mockApi.shareProjectSync.mockResolvedValue(null);
+    mockApi.unshareProjectSync.mockResolvedValue(null);
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Board access");
+
+    fireEvent.change(within(panel).getByLabelText("Share with a GitHub user (Reader)"), {
+      target: { value: "octocat" },
+    });
+    fireEvent.click(within(panel).getByRole("button", { name: /Share \(Reader\)/ }));
+    const revoke = await within(panel).findByRole("button", { name: /Revoke/ });
+
+    fireEvent.click(revoke);
+    await waitFor(() => expect(mockApi.unshareProjectSync).toHaveBeenCalledWith("repo-gh", "octocat"));
+    // The revoked username leaves the just-granted list.
+    await waitFor(() =>
+      expect(within(panel).queryByRole("button", { name: /Revoke/ })).toBeNull(),
+    );
+  });
+
+  it("a 422 bad username surfaces the bad-username copy inline, not a crash", async () => {
+    mockApi.shareProjectSync.mockRejectedValue(new ApiError(422, "no github user with that username"));
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Board access");
+
+    fireEvent.change(within(panel).getByLabelText("Share with a GitHub user (Reader)"), {
+      target: { value: "nouser" },
+    });
+    fireEvent.click(within(panel).getByRole("button", { name: /Share \(Reader\)/ }));
+
+    expect(await within(panel).findByText(/No GitHub user named "nouser"/i)).toBeTruthy();
+    // No success confirmation, and no Revoke affordance for a failed grant.
+    expect(within(panel).queryByText(/Shared with/i)).toBeNull();
+    expect(within(panel).queryByRole("button", { name: /Revoke/ })).toBeNull();
+  });
+
+  it("a 409 instance-disabled surfaces the 'ask an admin' copy inline", async () => {
+    mockApi.setProjectSyncVisibility.mockRejectedValue(new ApiError(409, "project sync disabled"));
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Board access");
+
+    fireEvent.click(within(panel).getByRole("switch", { name: "Board visibility" }));
+    expect(
+      await within(panel).findByText(/turned off for this instance — ask an admin to enable it/i),
+    ).toBeTruthy();
+    // The toggle stayed off — the failed PUT never flipped it.
+    expect(within(panel).getByRole("switch", { name: "Board visibility" }).getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("clears the just-granted session list when the board is re-linked in place (disable re-enters loadSyncStatus, bypassing the panel-open reset)", async () => {
+    mockApi.shareProjectSync.mockResolvedValue(null);
+    mockApi.disableProjectSync.mockResolvedValue(null);
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Board access");
+
+    // Grant octocat → a session-scoped Revoke affordance appears.
+    fireEvent.change(within(panel).getByLabelText("Share with a GitHub user (Reader)"), {
+      target: { value: "octocat" },
+    });
+    fireEvent.click(within(panel).getByRole("button", { name: /Share \(Reader\)/ }));
+    await within(panel).findByRole("button", { name: /Revoke/ });
+
+    // Disable re-enters loadSyncStatus WITHOUT the panel-open reset effect. With the
+    // status mock still linked (a board re-linked in place), the readout returns — and
+    // the stale "granted this session" entry must NOT survive onto it, else its Revoke
+    // would fire against a board octocat was never granted on (PRD #557 review finding).
+    fireEvent.click(within(panel).getByRole("button", { name: /Disable sync/ }));
+    await waitFor(() => expect(mockApi.disableProjectSync).toHaveBeenCalledWith("repo-gh"));
+    await waitFor(() => expect(within(panel).queryByRole("button", { name: /Revoke/ })).toBeNull());
+  });
+});
+
+describe("Repos — remembers the selected forge (issue #578)", () => {
+  // This jsdom build exposes no window.localStorage, and the file's top-level
+  // beforeEach installs none, so selectedForge.set/get would silently no-op and the
+  // test would pass for the wrong reason. Back it with a Map-based Storage stub
+  // (shape copied from lib/prefs.test.ts) scoped to THIS block — installed here and
+  // removed in afterEach — so it never leaks into the store-less tests elsewhere,
+  // which rely on there being no store.
+  function makeStorage(): Storage {
+    const m = new Map<string, string>();
+    return {
+      getItem: (k: string) => (m.has(k) ? m.get(k)! : null),
+      setItem: (k: string, v: string) => void m.set(k, String(v)),
+      removeItem: (k: string) => void m.delete(k),
+      clear: () => m.clear(),
+      key: (i: number) => [...m.keys()][i] ?? null,
+      get length() {
+        return m.size;
+      },
+    } as Storage;
+  }
+
+  const CONN_1: ForgeConnection = { ...CONN, id: "conn-1", bot_username: "bot-one" };
+  const CONN_2: ForgeConnection = { ...CONN, id: "conn-2", bot_username: "bot-two" };
+
+  beforeEach(() => {
+    Object.defineProperty(window, "localStorage", { configurable: true, value: makeStorage() });
+    // Two connections so the connection <Select> renders (it only shows when
+    // connections.length > 1). listProjects resolves for either selected id.
+    mockApi.listConnections.mockResolvedValue({ connections: [CONN_1, CONN_2] });
+    mockApi.listProjects.mockResolvedValue({ repos: [] });
+  });
+
+  afterEach(() => {
+    Reflect.deleteProperty(window, "localStorage");
+  });
+
+  it("restores the previously chosen connection after a remount", async () => {
+    renderPage();
+    // On mount, the select defaults to the first connection.
+    const select = (await screen.findByRole("combobox")) as HTMLSelectElement;
+    expect(select.value).toBe("conn-1");
+
+    // An explicit user change persists the choice (7-day TTL) via selectedForge.set.
+    fireEvent.change(select, { target: { value: "conn-2" } });
+    expect(select.value).toBe("conn-2");
+
+    // Simulate a fresh visit: unmount and render again. The localStorage stub
+    // survives across the two renders (it is not reset within a test body).
+    cleanup();
+    renderPage();
+
+    // The remembered connection is restored on mount.
+    const restored = (await screen.findByRole("combobox")) as HTMLSelectElement;
+    expect(restored.value).toBe("conn-2");
+  });
+});
+
+describe("Repos — Setup chip (PRD #361 M4)", () => {
+  it("renders only for enabled repos and reflects the flags (docker_blocked → info)", async () => {
+    // A docker_blocked enabled repo (escalates to info) plus the disabled fixture row.
+    mockApi.listProjects.mockResolvedValue({
+      repos: [
+        repo({ id: "repo-blocked", path_with_namespace: "vtmocanu/blocked", docker_blocked: true }),
+        repo({ id: "repo-off", path_with_namespace: "example/website", enabled: false }),
+      ],
+    });
+    renderPage();
+    await screen.findByText("vtmocanu/blocked");
+
+    // PRESENT on the enabled row, ABSENT on the disabled one.
+    const enabledChip = within(rowFor("vtmocanu/blocked")).getByRole("button", {
+      name: /^(Setup|Ready)$/,
+    });
+    expect(enabledChip).toBeTruthy();
+    expect(
+      within(rowFor("example/website")).queryByRole("button", { name: /^(Setup|Ready)$/ }),
+    ).toBeNull();
+
+    // Reflects the flag: a blocked repo's chip carries the info tone (positive)…
+    const badge = enabledChip.querySelector("span");
+    expect(badge?.className).toContain("text-info");
+    // …and never a red/amber warning (paired negative, so it is not vacuous).
+    expect(badge?.className).not.toContain("text-danger");
+    expect(badge?.className).not.toContain("text-warn");
   });
 });

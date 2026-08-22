@@ -14,9 +14,13 @@ import (
 // merge CLOSES the issue via the `Closes #N` in the MR description
 // (agent/src/runner.ts), and the poller runs the issue sync BEFORE SyncMRStates
 // (poller.syncRepo). So by the time a merge is observable the issue is already
-// `state='closed'`. Any `i.state = 'opened'` predicate — which is exactly what
-// ListMRWatchCandidates carries, and why PRD #24's prefilter is not reused here —
-// would miss every candidate DETERMINISTICALLY, not just sometimes.
+// `state='closed'`. Any `i.state = 'opened'` predicate would miss every candidate
+// DETERMINISTICALLY, not just sometimes. ListMRWatchCandidates now ALSO has a
+// closed-issue recording lane (#527), but it still keeps its open-issue predicate
+// for the board-move lane and its closed lane only RECORDS mr_state — so the reason
+// ListPRDLinkPatchCandidates joins no `issues` and filters no state is unchanged:
+// it does a forge description WRITE, not just an mr_state record, which is why PRD
+// #24's prefilter is not reused here.
 //
 // WHY THIS EXISTS AS A SOURCE-TEXT TEST RATHER THAN RELYING ON THE FIXTURE. The
 // property IS pinned by prd_link_patch_integration_test.go, but only INCIDENTALLY:

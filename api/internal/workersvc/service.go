@@ -35,6 +35,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/autoselectrow"
 	"github.com/vtmocanu/uzi/api/internal/board"
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	"github.com/vtmocanu/uzi/api/internal/planpolicy"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
@@ -134,6 +135,15 @@ var (
 	ErrInvalidPlannedCommit = errors.New("planned base commit is not a valid commit sha (hex, 7-64 chars)")
 	ErrActiveRunExists      = errors.New("a non-terminal run already exists for this issue")
 	ErrRunTerminal          = errors.New("run has already finished")
+	// ErrStopNotInteractive rejects a `stop` on a run that is not an interactive task
+	// (PRD #517 M4) → 409. A graceful stop is honored ONLY by the interactive-task park:
+	// no other run kind reads the stop flag, so a stop on a plan-gated / chat /
+	// non-interactive task run would stamp a permanent, spurious stop_kind='stopped' and
+	// return a misleading "stop sent" success while nothing actually winds the run down.
+	// Gated on kind+interactive alone, NOT on status: a stop on a RUNNING interactive task
+	// (not yet parked) is still valid. It is a run-state conflict, hence 409 (the CLI maps
+	// 409 → ExitConflict).
+	ErrStopNotInteractive = errors.New("run stop applies only to interactive task runs")
 	// ErrReviseCapReached rejects a revise_plan once the run has hit
 	// PLAN_MAX_REVISIONS persisted revisions (PRD #41). Counted over ALL
 	// revise_plan rows for the run (a consumed revise still counts), so the cap is
@@ -171,7 +181,14 @@ var (
 	// agent roster that breaks a cap, and a browser-submitted agent selection that
 	// names an agent the run does not have. Both map to 400.
 	ErrInvalidSelection = errors.New("invalid agent selection")
-	ErrWorkerNotFound   = errors.New("worker not found")
+	// ErrCapabilityUnmet is the sentinel for the PRD #84 M4 4c approval gate: a plan being
+	// approved requires capabilities its OWNING worker cannot satisfy, so the approve is
+	// blocked → 409. It is carried by a *CapabilityUnmetError, which names the unmet set for
+	// the handler to render; errors.Is against this sentinel matches (Unwrap), and errors.As
+	// on the struct extracts the names. Mirrors ErrInvalidSelection's role as the stable
+	// match target the handler switches on.
+	ErrCapabilityUnmet = errors.New("run requires capabilities the owning worker cannot satisfy")
+	ErrWorkerNotFound  = errors.New("worker not found")
 	// ErrWorkerHasActiveRuns rejects deletion of a worker that still owns a
 	// non-terminal run: the FK is ON DELETE SET NULL, so deleting would orphan the
 	// run past every sweep (and the one-active-run index would then block re-runs).
@@ -224,6 +241,18 @@ type GuardrailBlockedError struct{ Findings []string }
 func (e *GuardrailBlockedError) Error() string { return ErrGuardrailBlocked.Error() }
 func (e *GuardrailBlockedError) Unwrap() error { return ErrGuardrailBlocked }
 
+// CapabilityUnmetError is returned by capabilityGate when the PRD #84 M4 4c approval gate
+// blocks: Unmet carries the run's required capabilities the owning worker cannot satisfy,
+// in stable capability order, for the handler's 409 body. It wraps ErrCapabilityUnmet so
+// callers can errors.Is it for the status mapping and errors.As it to read Unmet — exactly
+// the GuardrailBlockedError pattern above.
+type CapabilityUnmetError struct{ Unmet []string }
+
+func (e *CapabilityUnmetError) Error() string {
+	return fmt.Sprintf("%s: %s", ErrCapabilityUnmet.Error(), strings.Join(e.Unmet, ", "))
+}
+func (e *CapabilityUnmetError) Unwrap() error { return ErrCapabilityUnmet }
+
 // Agent-memory caps (PRD #90, OQ-C). Server-enforced (not client-trusted) and the
 // single Go source of truth the SDK tool schema mirrors: at most
 // MemoryMaxTitleBytes/MemoryMaxBodyBytes/MemoryMaxEvidenceBytes per entry (all
@@ -272,6 +301,23 @@ type Store interface {
 	CreateSelfImproveRun(ctx context.Context, arg store.CreateSelfImproveRunParams) (store.Run, error)
 	// Scheduled prompt runs (PRD #241).
 	CreatePromptRun(ctx context.Context, arg store.CreatePromptRunParams) (store.Run, error)
+	// Task/handoff runs (PRD #400).
+	CreateTaskRun(ctx context.Context, arg store.CreateTaskRunParams) (store.Run, error)
+	// DispatchTaskRun stamps a task run's dispatch gate after the CLI seeds its branch
+	// (PRD #400 Decision 6), making it claimable; 0 rows → pgx.ErrNoRows.
+	DispatchTaskRun(ctx context.Context, arg store.DispatchTaskRunParams) (store.Run, error)
+	// Task-review runs + their persisted findings (PRD #400 M4a): the auto-enqueued
+	// diff-review run, its review-run-scoped POST authz, the atomic header+findings
+	// upsert, and the CLI/panel read side.
+	CreateTaskReviewRun(ctx context.Context, arg store.CreateTaskReviewRunParams) (store.Run, error)
+	// CreateThenFixRun inserts the chained fix run for a --then-fix handoff (PRD #400 M5):
+	// a NORMAL task (review_target_run_id NULL) on the original's branch; 23505 → the
+	// one-active-fix-per-target index tripped.
+	CreateThenFixRun(ctx context.Context, arg store.CreateThenFixRunParams) (store.Run, error)
+	GetActiveTaskReviewRunForWorkerTarget(ctx context.Context, arg store.GetActiveTaskReviewRunForWorkerTargetParams) (store.Run, error)
+	UpsertTaskReviewWithFindings(ctx context.Context, arg store.UpsertTaskReviewWithFindingsParams) (uuid.UUID, error)
+	GetTaskReviewForTarget(ctx context.Context, targetRunID uuid.UUID) (store.TaskReview, error)
+	ListTaskReviewFindings(ctx context.Context, reviewID uuid.UUID) ([]store.TaskReviewFinding, error)
 	CountActiveRunsWithBranch(ctx context.Context, arg store.CountActiveRunsWithBranchParams) (int64, error)
 	CountActiveCIFixForRef(ctx context.Context, arg store.CountActiveCIFixForRefParams) (int64, error)
 	GetRunByIDForUser(ctx context.Context, arg store.GetRunByIDForUserParams) (store.Run, error)
@@ -361,10 +407,21 @@ type Store interface {
 	UpdateDispositionLastTitle(ctx context.Context, arg store.UpdateDispositionLastTitleParams) (int64, error)
 	SetRunRunning(ctx context.Context, arg store.SetRunRunningParams) (int64, error)
 	SetRunAwaitingApproval(ctx context.Context, arg store.SetRunAwaitingApprovalParams) (int64, error)
+	// Plain-English run summaries (PRD #362 M1). Intent is a plain UPDATE (the
+	// idempotent-on-set decision lives in the service); the plan write carries the
+	// Decision 3 stale-write guard (updates only if plan_md still matches), returning
+	// rows-affected so the service detects a stale (0-row) write.
+	SetRunIntentSummary(ctx context.Context, arg store.SetRunIntentSummaryParams) (int64, error)
+	SetRunPlanSummary(ctx context.Context, arg store.SetRunPlanSummaryParams) (int64, error)
 	// SetRunAwaitingInput parks a run on a clarification question (PRD #88 M1) and
 	// stamps the question's identity. It clears health on entry, which is what makes
 	// leaving `awaiting_input` out of ListActiveRunsForHealth safe — see the query.
 	SetRunAwaitingInput(ctx context.Context, arg store.SetRunAwaitingInputParams) (int64, error)
+	// SetRunAwaitingFollowup parks an interactive task run in-process after signal_done
+	// (PRD #517 M2/M3, Decision 3), holding the worker slot/clone/session for `uzi run
+	// follow-up` to resume. Like SetRunAwaitingInput it clears health on entry (the same
+	// reason awaiting_followup is safe to leave out of ListActiveRunsForHealth).
+	SetRunAwaitingFollowup(ctx context.Context, arg store.SetRunAwaitingFollowupParams) (int64, error)
 	SetRunCompleted(ctx context.Context, arg store.SetRunCompletedParams) (int64, error)
 	SetRunFailed(ctx context.Context, arg store.SetRunFailedParams) (int64, error)
 	ReconcileRunMR(ctx context.Context, arg store.ReconcileRunMRParams) (int64, error)
@@ -377,6 +434,12 @@ type Store interface {
 	PromoteLimitWaitRuns(ctx context.Context, now pgtype.Timestamptz) ([]store.PromoteLimitWaitRunsRow, error)
 	MarkRunFailedByID(ctx context.Context, arg store.MarkRunFailedByIDParams) (int64, error)
 	CancelRunServerSide(ctx context.Context, arg store.CancelRunServerSideParams) (int64, error)
+	// CancelRunByWorker is the LIVE-worker cancel transition (PRD #503 M1). SetState's
+	// failed arm routes here (instead of SetRunFailed) when the loaded run carries
+	// stop_kind='cancelled', so an operator cancel ends 'cancelled'/NULL fail_origin —
+	// converging with CancelRunServerSide — rather than being mis-classified as
+	// agent_failure. Worker-scoped because SetState holds a worker, not a user.
+	CancelRunByWorker(ctx context.Context, arg store.CancelRunByWorkerParams) (int64, error)
 	RejectRunServerSide(ctx context.Context, arg store.RejectRunServerSideParams) (int64, error)
 	// FailRunAutoStop is the server-side half of PRD #108 M5's auto-stop. Unlike
 	// its two neighbours it takes no user_id: it is driven by the sweeper, not by a
@@ -403,6 +466,17 @@ type Store interface {
 	SetRunHealth(ctx context.Context, arg store.SetRunHealthParams) (int64, error)
 	CountOnlineWorkersForUser(ctx context.Context, userID uuid.UUID) (int64, error)
 	CountOnlineWorkersWithFreeSlotForUser(ctx context.Context, userID uuid.UUID) (int64, error)
+	// CountOnlineWorkersSatisfyingCaps backs PRD #84 M3: a queued run whose
+	// required_capabilities are not a subset of ANY online worker's effective caps gets
+	// a capability-specific "no eligible worker" reason. A per-run lookup like the two
+	// counts above, and off the hot path for the same reason — it runs only for a queued
+	// run already past its health threshold.
+	CountOnlineWorkersSatisfyingCaps(ctx context.Context, arg store.CountOnlineWorkersSatisfyingCapsParams) (int64, error)
+	// CountOnlineEligibleWorkersForRepo backs PRD #361's queued Docker-allowlist reason:
+	// how many of the caller's online workers fn_worker_can_claim accepts for this
+	// repo/kind, ignoring free slots. A result of 0 with online workers present means the
+	// repo is unrunnable without allowlisting (an all-Docker fleet, repo not allowlisted).
+	CountOnlineEligibleWorkersForRepo(ctx context.Context, arg store.CountOnlineEligibleWorkersForRepoParams) (int64, error)
 	// RunHasVerdictSinceGateOpened backs issue #182: an awaiting_approval run whose
 	// owner already answered THIS gate reports waiting_worker rather than
 	// approval_idle. A per-run lookup like ListRunToolWindow above, and for the same
@@ -443,6 +517,10 @@ type Store interface {
 	// CreateApprovePlanInput enqueues an approve_plan AND records the run's agent
 	// selection atomically (PRD #37).
 	CreateApprovePlanInput(ctx context.Context, arg store.CreateApprovePlanInputParams) (store.RunUserInput, error)
+	// ClearRunRequiredCapabilities wipes a run's inferred/hinted required_capabilities
+	// set (PRD #84 M4 4c), owner- and awaiting_approval-scoped. Backs the "run without the
+	// capability" user override so a capability-gated approve is no longer fenced.
+	ClearRunRequiredCapabilities(ctx context.Context, arg store.ClearRunRequiredCapabilitiesParams) (int64, error)
 	// CreateRunAnswerInput enqueues an `answer` and records the question it answers
 	// (PRD #88 M1). The question id is a column, not a JSON field, because
 	// SetRunRunning's resume guard compares it in SQL.
@@ -523,6 +601,9 @@ type Store interface {
 	// Per-user judge model override (PRD #69 M2): read at judge-claim assembly,
 	// keyed on the run owner. NULL ⇒ inherit the instance judge_model.
 	GetUserJudgeModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
+	// Per-user run-summary model override (PRD #362 M2): read at ISSUE-run claim
+	// assembly, keyed on the run owner. NULL ⇒ inherit the instance summary_model.
+	GetUserSummaryModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	// ListClaimAgentTemplates resolves template allocations for the run owner
 	// (PRD #18 M7): only the builtin/global defaults ± the owner's overlay + the
 	// owner's own allocated user templates ride the claim, not every template.
@@ -536,9 +617,14 @@ type Store interface {
 
 // Params are the runtime knobs the service needs, mirrored from config.
 type Params struct {
-	RunTimeout       time.Duration
-	RunIdleTimeout   time.Duration
-	RunMaxIterations int
+	RunTimeout     time.Duration
+	RunIdleTimeout time.Duration
+	// WorkerTaskIdleTimeout (PRD #517 M5, WORKER_TASK_IDLE_TIMEOUT) is the interactive-task
+	// park's worker-side idle backstop. Mirrored from config and shipped in the claim (like
+	// RunIdleTimeout) so the worker's own park idle timer matches what the server configured
+	// (no drift). Delivered only on an interactive task claim; every other claim omits it.
+	WorkerTaskIdleTimeout time.Duration
+	RunMaxIterations      int
 	// PlanMaxRevisions caps how many times a run's plan may be revised at the
 	// approval gate (PRD #41, PLAN_MAX_REVISIONS). Enforced server-side in
 	// SubmitInput and shipped in the claim so the worker enforces the same limit.
@@ -717,6 +803,10 @@ type SettingsReader interface {
 	JudgeCooldownSeconds(ctx context.Context) (int, error)
 	JudgeDailyBudget(ctx context.Context) (int, error)
 	JudgeModel(ctx context.Context) (string, error)
+	// SummaryModel is the instance-default model the inline run-summary generator
+	// runs on (PRD #362 Decision 8), the fallback when the run owner has no per-user
+	// summary_model override. Falls back to the compiled-in default ("haiku").
+	SummaryModel(ctx context.Context) (string, error)
 	// PRDLabel is the label an issue must carry to be runnable (PRD #102 Decision
 	// 14). It is read here rather than passed in by each caller because the gate is
 	// shared: the board handler and the poller's autopilot must be answering the same
@@ -761,6 +851,18 @@ type DockerAllowlistReader interface {
 	DockerRepoAllowlist(ctx context.Context) ([]uuid.UUID, error)
 }
 
+// CapabilityScheduleReader is the narrow settings view the claim gate reads for the
+// capability-aware scheduling kill-switch (PRD #84 Decision 13). *settings.Cache
+// satisfies it. Kept its own interface (interface segregation, like
+// DockerAllowlistReader) so a test exercises only what it uses. Optional (nil-safe):
+// a nil reader — or a read error — DEFAULTS the flag ON (capability_aware=true), the
+// safe default, so an unconfigured or momentarily-unreadable setting routes rather
+// than degrading to best-effort claiming. Existing tests construct the service
+// without it and are unaffected.
+type CapabilityScheduleReader interface {
+	CapabilityAwareScheduling(ctx context.Context) (bool, error)
+}
+
 // Service holds the store, the secret cipher, and the runtime params.
 type Service struct {
 	q   Store
@@ -801,6 +903,12 @@ type Service struct {
 	// claims no repo-bearing run); a non-docker worker never consults it, so tests and
 	// deployments without a settings cache are unaffected.
 	dockerAllowlist DockerAllowlistReader
+	// capabilitySettings reads the capability-aware scheduling kill-switch the claim
+	// gate threads into ClaimRun (PRD #84 Decision 13). Optional (nil-safe); set via
+	// SetCapabilitySettings with the same settings cache the HTTP handlers hold. Nil ⇒
+	// the flag DEFAULTS ON, so tests and deployments without a settings cache route
+	// capability-aware exactly as a live instance whose admin left the default in place.
+	capabilitySettings CapabilityScheduleReader
 	// lastSlowClampWarn is the last health_slow_seconds value the read-time clamp
 	// warned about (PRD #47), so the warning logs once per distinct misconfigured
 	// value instead of on every 15s sweep. Touched only by the sweeper goroutine
@@ -887,6 +995,13 @@ func (s *Service) SetHealthSettings(cfg Settings) { s.healthSettings = cfg }
 // workers wholly unaffected.
 func (s *Service) SetDockerAllowlist(r DockerAllowlistReader) { s.dockerAllowlist = r }
 
+// SetCapabilitySettings wires the capability-aware scheduling kill-switch reader the
+// claim gate threads into ClaimRun (PRD #84 Decision 13). Call once at startup, before
+// serving, with the same settings cache the HTTP handlers hold. Nil (the default in
+// tests) defaults the flag ON — capability matching is enforced — so the omission is
+// safe rather than a silent disable.
+func (s *Service) SetCapabilitySettings(r CapabilityScheduleReader) { s.capabilitySettings = r }
+
 // SetForgeBaseURLAllowed wires the SSRF gate for the M8 checkpoint-publish path
 // (PRD #122). Call once at startup with config.Config.ForgeBaseURLAllowed. Leaving
 // it unset (nil) makes Publish refuse — it is a loud misconfiguration, never
@@ -939,7 +1054,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 // awaiting_input forever, pointing at execution that no longer exists, with its
 // worker-held answer deadline gone and no user-visible signal — on the ordinary
 // restart path this comment already names.
-func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns *int) (store.Worker, error) {
+func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns *int, capabilities []string) (store.Worker, error) {
 	max := int32(s.p.RunMaxRequeues)
 	orphanFailed, err := s.q.FailWorkerRunsOverCap(ctx, store.FailWorkerRunsOverCapParams{
 		FailureReason: pgText("worker restarted; run orphaned and out of re-queue budget"),
@@ -967,9 +1082,19 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 	// maxConcurrentRuns is the worker's advertised concurrency cap (PRD #42); nil →
 	// NULL (an older image, or M3a before the M2 agent sends it). Observability
 	// only — the server never enforces it, so it is stored exactly as reported.
+	//
+	// capabilities is the STORED set (PRD #84 M1): the union of the worker's
+	// SELF-REPORTABLE caps and the template-derived caps. capability.SelfReportable
+	// restricts the self-report side to names a worker is allowed to announce (today
+	// only docker), so a base worker cannot spoof a template-only capability like jvm
+	// by self-reporting it. The union is passed through Filter for vocabulary
+	// validation, dedupe, and stable order — so the column stays authoritative and a
+	// later milestone's peer subquery can read workers.capabilities directly.
+	storedCaps := capability.Filter(append(capability.SelfReportable(capabilities), capability.TemplateCapabilities(template)...))
 	row, err := s.q.RegisterWorker(ctx, store.RegisterWorkerParams{
 		Version:           pgText(version),
 		TemplateReported:  pgText(template),
+		Capabilities:      storedCaps,
 		MaxConcurrentRuns: pgIntPtr(maxConcurrentRuns),
 		ID:                wkr.ID,
 	})
@@ -1038,6 +1163,15 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 		return nil, nil // idle: owner locked
 	}
 
+	// Drain gate (PRD #422 M3): a cordoned worker finishes its in-flight runs but
+	// claims nothing new, so the controller can roll it once idle. Like the vault
+	// gate this reports idle (nil,nil), not an error — the worker keeps heartbeating
+	// and reporting its running runs; only NEW claims are refused. draining_since is
+	// cleared on the worker's next register (after its roll), which re-enables claims.
+	if wkr.DrainingSince.Valid {
+		return nil, nil // idle: worker draining/cordoned
+	}
+
 	// Docker-worker repo allowlist (PRD #89 M-allow): a docker-enabled worker may
 	// claim ONLY runs whose repo is on the trusted allowlist. Repo-less JUDGE runs are
 	// exempt (the SQL narrows the exemption to kind='judge', so a future repo-less kind
@@ -1076,12 +1210,24 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 		}
 	}
 
+	// Capability-aware scheduling kill-switch (PRD #84 Decision 13). Threaded into
+	// ClaimRun as @capability_aware: the extended fn_worker_can_claim reads its new
+	// subset clause as `NOT capability_aware OR (required ⊆ caps)`, so a false flag makes
+	// the capability match trivially true (best-effort claiming) while the docker
+	// allowlist clause above stays enforced. capabilityAwareOn (shared with the health
+	// detector's queued-reason path) is DEFAULT ON: a nil reader (tests, or a deployment
+	// without a settings cache) or a read error both leave it true, so an unconfirmable
+	// flag routes rather than silently degrading to a mid-run crash.
+	capabilityAware := s.capabilityAwareOn(ctx)
+
 	run, err := s.q.ClaimRun(ctx, store.ClaimRunParams{
 		WorkerID:              pgUUID(wkr.ID),
 		UserID:                wkr.UserID,
 		AffinityCutoff:        pgTime(s.now().Add(-s.p.WorkerAffinityGrace)),
 		IsDockerWorker:        isDocker,
 		DockerRepoAllowlist:   allowlist,
+		WorkerCaps:            wkr.Capabilities,
+		CapabilityAware:       capabilityAware,
 		SpreadCutoff:          pgTime(s.now().Add(-s.p.WorkerSpreadGrace)),
 		BackgroundGraceCutoff: pgTime(s.now().Add(-s.p.WorkerBackgroundGrace)),
 		HeartbeatCutoff:       pgTime(s.now().Add(-s.p.WorkerHeartbeatStale)),
@@ -1830,22 +1976,91 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		milestones = nil
 	}
 
+	// PRD #381: replay the structured issue-comments snapshot captured at run
+	// creation. A malformed column degrades to nil-and-log rather than failing the
+	// claim, matching the milestone decode above — the column is data a prior write
+	// left, not an invariant of this claim.
+	var issueComments *IssueCommentsSnapshot
+	if len(run.IssueComments) > 0 {
+		var snap IssueCommentsSnapshot
+		if err := json.Unmarshal(run.IssueComments, &snap); err != nil {
+			slog.Error("workersvc: decode run issue comments", "run_id", run.ID, "error", err)
+		} else {
+			issueComments = &snap
+		}
+	}
+
+	// Run-summary model resolution is user-value-wins (PRD #362 Decision 8), the same
+	// shape as the judge model in assembleJudgeClaim but delivered on this ISSUE-run
+	// claim: the run owner's per-user summary_model overrides the instance
+	// summary_model; NULL/blank inherits the instance value. Guarded by s.settings !=
+	// nil — a nil-settings deployment leaves it nil (the summary generator is advisory
+	// and skips when no model rides). On a user-row read error we fall back to the
+	// instance value best-effort with a log; we never send an empty model.
+	var summaryModel *string
+	if s.settings != nil {
+		if um, uerr := s.q.GetUserSummaryModel(ctx, run.UserID); uerr != nil {
+			slog.Warn("issue claim: read user summary model", "user", run.UserID.String(), "error", uerr)
+		} else if um.Valid && strings.TrimSpace(um.String) != "" {
+			m := um.String
+			summaryModel = &m
+		}
+		if summaryModel == nil {
+			if m, merr := s.settings.SummaryModel(ctx); merr == nil && strings.TrimSpace(m) != "" {
+				summaryModel = &m
+			}
+		}
+	}
+
+	// PRD #517 M5: deliver the interactive-task park idle backstop ONLY on an interactive
+	// task claim (the sole path that parks on awaitFollowUp). Left zero for every other run
+	// so omitempty keeps its claim byte-identical to today's wire; the worker falls back to
+	// its own TASK_FOLLOWUP_IDLE_MS constant when the field is absent. run.Interactive is
+	// immutable from create, so a resumed interactive run re-delivers the same value.
+	taskIdleTimeoutSeconds := 0
+	if run.Interactive {
+		taskIdleTimeoutSeconds = int(s.p.WorkerTaskIdleTimeout.Seconds())
+	}
+
 	payload := &ClaimPayload{
 		RunID:            run.ID.String(),
 		Kind:             run.Kind,
 		IssueIID:         issueIID,
 		IssueTitle:       run.IssueTitle,
 		IssueDescription: run.IssueDescription,
-		Status:           run.Status,
-		Pipeline:         pipeline,
-		Branch:           textPtr(run.Branch),
-		SessionID:        textPtr(run.SessionID),
-		LastSeq:          run.LastSeq,
-		IterationCount:   run.IterationCount,
-		RequeueCount:     run.RequeueCount,
-		PlanMd:           textPtr(run.PlanMd),
-		AutoApprove:      run.AutoApprove,
-		OpenQuestionID:   textPtr(run.OpenQuestionID),
+		// PRD #381: the structured comments snapshot, decoded above. omitempty keeps a
+		// comment-less run's claim byte-identical to today's.
+		IssueComments:  issueComments,
+		Status:         run.Status,
+		Pipeline:       pipeline,
+		Branch:         textPtr(run.Branch),
+		SessionID:      textPtr(run.SessionID),
+		LastSeq:        run.LastSeq,
+		IterationCount: run.IterationCount,
+		RequeueCount:   run.RequeueCount,
+		PlanMd:         textPtr(run.PlanMd),
+		AutoApprove:    run.AutoApprove,
+		// PRD #400 M2: task-run MR gate + source ref. open_mr is a plain bool (false
+		// for every non-task run); base_branch is pgtype.Text (nil for a run that has
+		// none). Both re-read from the row on every claim, like AutoApprove above.
+		OpenMr:     run.OpenMr,
+		BaseBranch: textPtr(run.BaseBranch),
+		// PRD #517 M1: the interactive opt-in rides every claim (a plain bool, false for
+		// every non-interactive and non-task run), re-read from the row like OpenMr above so
+		// a resumed run re-delivers it unchanged. It tells the worker to keep the run alive
+		// (park in awaiting_followup) after signal_done rather than terminating.
+		Interactive: run.Interactive,
+		// issue #552 M3: re-deliver the durable stop_kind='stopped' fact so a graceful
+		// stop survives a worker crash. Derived from the loaded row, like OpenQuestionID
+		// below and for the same reason — the in-memory stopRequested flag is lost on a
+		// death, but the runs row keeps stop_kind='stopped', so the resumed worker winds
+		// the park down instead of waiting out the idle timeout. Never set for a terminal
+		// run (a finished run has nothing left to wind down).
+		StopPending: run.Interactive && run.StopKind.Valid && run.StopKind.String == "stopped" && !terminalStatuses[run.Status],
+		// PRD #400 M4a: when set, this task run is a diff-review of that target task, and
+		// the worker (M4b) routes on it. nil for a plain handoff and every non-task run.
+		ReviewTargetRunID: uuidPtr(run.ReviewTargetRunID),
+		OpenQuestionID:    textPtr(run.OpenQuestionID),
 		// PRD #35. Re-read from the row on EVERY claim, like AutoApprove above: a
 		// park-resume-park cycle must keep asking the row rather than remembering what
 		// the first claim said, so a per-run toggle flipped mid-flight takes effect on
@@ -1892,6 +2107,14 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// PRD #122 M1: the frozen milestone list, decoded above. omitempty keeps a
 		// milestone-less run's claim byte-identical to today's.
 		Milestones: milestones,
+		// PRD #362 Decision 8: the model the inline run-summary generator runs on,
+		// resolved user-value-wins above. nil (omitted) when settings are unwired, so
+		// an old worker's wire shape is unchanged.
+		SummaryModel: summaryModel,
+		// PRD #362 M3c (Decision 3): tell the worker whether the intent summary is
+		// already set, so a resume/re-claim skips INTENT generation rather than
+		// re-spending the owner's token. Derived straight off the run row.
+		SummaryIntentPresent: run.SummaryIntent.Valid,
 		Repo: ClaimRepo{
 			ID:              uuid.UUID(run.RepoID.Bytes).String(),
 			URL:             rc.RepoWebUrl,
@@ -1916,6 +2139,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// clock off the state-ack, but the claim carries it too for a fresh resume.
 			RunTimeoutSeconds:      coalesceInt(run.BudgetWallSeconds, int(s.p.RunTimeout.Seconds())),
 			IdleTimeoutSeconds:     int(s.p.RunIdleTimeout.Seconds()),
+			TaskIdleTimeoutSeconds: taskIdleTimeoutSeconds,
 			MaxIterations:          coalesceInt(run.BudgetMaxIterations, s.p.RunMaxIterations),
 			PlanMaxRevisions:       s.p.PlanMaxRevisions,
 			QuestionMax:            s.p.QuestionMax,
@@ -2870,6 +3094,32 @@ type StateRequest struct {
 	// the DB, exactly as it does RateLimitType. Ordinary agent failures omit it and the
 	// server defaults them to 'agent_failure'. Ignored on every non-`failed` state.
 	FailOrigin *string `json:"fail_origin"`
+	// PreservedPatch is the agent's branch diff (PRD #377 M1), carried ONLY on a
+	// `failed` report whose fail_origin is workflow_scope_missing: the run touched
+	// .github/workflows/** which the bot's repo-only PAT cannot push, so instead of
+	// discarding the work the worker preserves the diff for a human to land. UNTRUSTED
+	// worker text — the agent may have seen repo secrets during the run — so it is
+	// control-char-stripped and length-capped server-side (clampWirePreservedPatch)
+	// before storage. Absent on every other report; a dedicated column keeps report_md's
+	// report-only semantics untouched (PRD D3).
+	PreservedPatch *string `json:"preserved_patch"`
+	// RequiredCapabilities, RequiredTools and SizeClass are the plan-time INFERRED
+	// requirement set the lead emits on the `awaiting_approval` report (PRD #84 M4 4a),
+	// each a tri-state pointer for the same absent="say nothing" semantics as Milestones:
+	// absent (nil) = this report says nothing; a non-nil value = the inferred set. The
+	// worker sends each array only when non-empty. UNTRUSTED on arrival — every name is
+	// Filter-ed / FilterTools-ed against the server-owned vocabulary before storage
+	// (capability package), and SizeClass is clamped to {"s","m","l"}, so a garbled
+	// report cannot smuggle arbitrary strings into the requirement panel. Ignored on
+	// every non-`awaiting_approval` report.
+	//
+	// required_capabilities is UNION-MERGED onto the M2 repo hint (escalation-only:
+	// inference can add, never drop); required_tools is SET. size_class is SET the same
+	// way (PRD #84 M4 4b): the clamped value REPLACES the run's size_class column, and a
+	// nil / off-vocabulary value COALESCEs to a no-op. A later unit surfaces it on the DTO.
+	RequiredCapabilities *[]string `json:"required_capabilities"`
+	RequiredTools        *[]string `json:"required_tools"`
+	SizeClass            *string   `json:"size_class"`
 }
 
 // SetState applies a worker's state transition and returns the run's resulting
@@ -2909,15 +3159,39 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		runningParams.RunTimeoutSeconds = int32(s.p.RunTimeout.Seconds())
 		runningParams.MilestoneBudgetCap = milestoneBudgetCap
 		runningParams.BudgetWallCeilingSeconds = budgetWallCeilingSeconds
+		// PRD #84 M4: an AUTOPILOT run auto-approves its own plan and NEVER reports
+		// awaiting_approval, so it rides the plan-time INFERRED requirement set on this
+		// self-contained `running` report instead (runner.ts toolchainReportFields, the
+		// same fields the awaiting_approval case consumes). Persist it the SAME way — the
+		// shared inferredRequirementParams sanitiser feeding the query's absent-safe
+		// COALESCE guards (required_capabilities union-merged escalation-only,
+		// required_tools/size_class replaced) — so autopilot runs are not silently stripped
+		// of their inference (the SWEEP auto-approves, so this is the only path that carries
+		// it for them). Absent on every ordinary session-id/iteration heartbeat, so those
+		// stay no-ops.
+		runningParams.InferredCapabilities, runningParams.InferredTools, runningParams.SizeClass = inferredRequirementParams(req)
 		rows, err = s.q.SetRunRunning(ctx, runningParams)
 	case "awaiting_approval":
 		// PRD #122 M1: the CANDIDATE milestone list rides the pre-approval report.
 		// milestonesParam validates + kind-gates it (Decision 12/13) and returns NULL
 		// when the list is absent, rejected, or from a non-issue run — the query writes
 		// that directly, clearing the candidate (Decision 2: replaced each round).
+		//
+		// PRD #84 M4 4b: the plan-time INFERRED requirement set also rides this report.
+		// Each array is a tri-state pointer — absent (nil) means "no change", and the
+		// query's COALESCE makes a nil param a no-op (union with '{}' / keep-existing).
+		// A present set is Filter-ed / FilterTools-ed against the server-owned vocabulary
+		// so the worker cannot smuggle an unknown name into storage. size_class rides the
+		// same report (PRD #84 M4 4b): it is clamped to the {s,m,l} vocabulary and passed
+		// as an absent-safe pgtype.Text, so an off-vocabulary or absent value is an invalid
+		// (SQL NULL) param the query's COALESCE keeps out of the column.
+		inferredCaps, inferredTools, sizeClass := inferredRequirementParams(req)
 		rows, err = s.q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
 			PlanMd: stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
-			MilestonesCandidate: milestonesParam(owned.Kind, req.Milestones),
+			MilestonesCandidate:  milestonesParam(owned.Kind, req.Milestones),
+			InferredCapabilities: inferredCaps,
+			InferredTools:        inferredTools,
+			SizeClass:            sizeClass,
 		})
 	case "awaiting_input":
 		// PRD #88 M1: park on a clarification question. The question id is REQUIRED
@@ -2938,6 +3212,28 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		}
 		rows, err = s.q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
 			OpenQuestionID: pgText(qid), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+		})
+	case "awaiting_followup":
+		// PRD #517 M2/M3 (Decision 3): the interactive-task park. On signal_done an
+		// interactive task run parks IN-PROCESS here instead of finalizing to `completed`,
+		// so the SAME worker holds its slot, clone and SDK session alive for `uzi run
+		// follow-up` to resume with full context. No question requirement (unlike
+		// awaiting_input): the park is not gated on a clarification, and the resume rides a
+		// `follow_up` steering input that SetRunRunning's Decision-7 wake guard keys on.
+		//
+		// ONLY an interactive task run may park this way. The status is meaningless for any
+		// other kind, and accepting it for one would strand a non-resumable run in a
+		// non-terminal status the follow-up path never wakes — so a mismatched report is
+		// genuinely invalid input (a stale, buggy, or hostile worker) and is rejected loudly
+		// with ErrInvalidState, consistent with awaiting_input's missing-question rejection,
+		// rather than silently persisted. A legitimate park always satisfies both guards
+		// (the interactive opt-in is immutable from create, PRD #517 M1), so this never
+		// rejects a real one.
+		if owned.Kind != RunKindTask || !owned.Interactive {
+			return store.Run{}, false, fmt.Errorf("%w: awaiting_followup requires an interactive task run", ErrInvalidState)
+		}
+		rows, err = s.q.SetRunAwaitingFollowup(ctx, store.SetRunAwaitingFollowupParams{
+			SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "completed":
 		// PRD #265 M1: reconcile the milestone tracker from the lead's signal_done
@@ -2966,29 +3262,71 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	case "limit_wait":
 		rows, err = s.setLimitWait(ctx, owned, wkr, req, sessionID)
 	case "failed":
-		// PRD #69 M7a: stamp the TRUSTED failure class. The worker-reported origin is
-		// UNTRUSTED, so CoerceFailOrigin allowlists it (unknown → nil) before it reaches
-		// the DB. A classless (nil) failure is exactly the judgeable AGENT-FAILURE case —
-		// an ordinary agent death reports `failed` with no fail_origin — so it defaults to
-		// 'agent_failure' here rather than storing NULL (NULL is reserved for pre-feature /
-		// unclassified rows). The rate-limit opt-out path sends fail_origin='rate_limited'.
-		failOrigin := "agent_failure"
-		if o := CoerceFailOrigin(req.FailOrigin); o != nil {
-			failOrigin = *o
+		// PRD #503 M1 (REC A): a LIVE worker cannot report a `cancelled` terminal status —
+		// there is no `cancelled` case in this switch — so a consumed cancel or plan-reject
+		// verdict arrives here as `failed`. The run's stop_kind was stamped by
+		// CreateStopVerdictInput BEFORE this report, so it is already on the loaded `owned`
+		// row; branch on it BEFORE the agent_failure default so an operator's deliberate stop
+		// is not mis-classified as an agent failure (which would also get judged, contradicting
+		// "cancelled runs are not judged").
+		switch {
+		case owned.StopKind.Valid && owned.StopKind.String == "cancelled":
+			// Route to a `cancelled` transition (status 'cancelled', fail_origin NULL),
+			// converging with the server-side CancelRunServerSide path. SetRunFailed is NOT
+			// called. rows drives the same applied/not-applied logic below (execrows, like
+			// SetRunFailed).
+			rows, err = s.q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{
+				ID: runID, WorkerID: pgUUID(wkr.ID),
+			})
+		case owned.StopKind.Valid && owned.StopKind.String == "stopped":
+			// PRD #517 M4: a graceful stop stamped stop_kind='stopped' BEFORE this report.
+			// Its happy path is the worker finalizing (push + MR iff open_mr) and reporting
+			// `completed`; this arm is the EDGE where the worker instead reports `failed` —
+			// either the finalize (push/MR) threw, or a cancel-then-stop sequence let the
+			// cancel win in steering and the worker threw REASON_CANCELLED. Either way it is a
+			// deliberate wind-down, not an agent bug, so it must NOT default to
+			// fail_origin='agent_failure' and must NOT be judged. Route to CancelRunByWorker
+			// exactly like the 'cancelled' arm: status 'cancelled', fail_origin NULL (CHECK-safe,
+			// no new vocabulary value), which Gate 0 of maybeEnqueueJudge excludes from judging.
+			rows, err = s.q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{
+				ID: runID, WorkerID: pgUUID(wkr.ID),
+			})
+		case owned.StopKind.Valid && owned.StopKind.String == "plan_rejected":
+			// A live plan-reject: stamp fail_origin='plan_rejected' (overriding the untrusted
+			// req.FailOrigin, which the worker cannot forge), matching the server-side
+			// RejectRunServerSide path rather than defaulting to agent_failure.
+			rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
+				FailureReason:  limitAwareFailureReason(req),
+				FailOrigin:     pgText("plan_rejected"),
+				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
+				SessionID:      sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+			})
+		default:
+			// PRD #69 M7a: stamp the TRUSTED failure class. The worker-reported origin is
+			// UNTRUSTED, so CoerceFailOrigin allowlists it (unknown → nil) before it reaches
+			// the DB. A classless (nil) failure is exactly the judgeable AGENT-FAILURE case —
+			// an ordinary agent death reports `failed` with no fail_origin — so it defaults to
+			// 'agent_failure' here rather than storing NULL (NULL is reserved for pre-feature /
+			// unclassified rows). The rate-limit opt-out path sends fail_origin='rate_limited'.
+			failOrigin := "agent_failure"
+			if o := CoerceFailOrigin(req.FailOrigin); o != nil {
+				failOrigin = *o
+			}
+			rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
+				// PRD #35 §7.8: when a `failed` report carries the structured limit fields,
+				// the SERVER composes the sentence from its own allowlisted enum and replaces
+				// whatever text the worker sent. That is the opt-out path (a run with
+				// wait_on_limit=false reports failed directly), and letting the worker compose
+				// it would put the enum on the untrusted side of the wire — the criterion "a
+				// compromised worker cannot smuggle a non-enum rate_limit_type past the
+				// server" would then be false on exactly the path a human reads. When the
+				// fields are absent this is nil and every other failure path is untouched.
+				FailureReason:  limitAwareFailureReason(req),
+				FailOrigin:     pgText(failOrigin),
+				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
+				SessionID:      sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+			})
 		}
-		rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
-			// PRD #35 §7.8: when a `failed` report carries the structured limit fields,
-			// the SERVER composes the sentence from its own allowlisted enum and replaces
-			// whatever text the worker sent. That is the opt-out path (a run with
-			// wait_on_limit=false reports failed directly), and letting the worker compose
-			// it would put the enum on the untrusted side of the wire — the criterion "a
-			// compromised worker cannot smuggle a non-enum rate_limit_type past the
-			// server" would then be false on exactly the path a human reads. When the
-			// fields are absent this is nil and every other failure path is untouched.
-			FailureReason: limitAwareFailureReason(req),
-			FailOrigin:    pgText(failOrigin),
-			SessionID:     sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
-		})
 	default:
 		return store.Run{}, false, ErrInvalidState
 	}
@@ -3023,8 +3361,50 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// PRD #46 Decision 2: enqueue a judge on the COMMITTED terminal transition
 		// (rows>0), not the lossy notify seam. Best-effort — never fails the report.
 		s.maybeEnqueueJudge(ctx, run)
+		// PRD #400 M4a: auto-create a diff-review run for a just-completed --review task,
+		// on the SAME committed transition. Best-effort — never fails the report.
+		s.maybeEnqueueTaskReview(ctx, run)
+		// PRD #400 M5: auto-create a chained fix run when a --then-fix handoff's review
+		// completes with findings. Its gates fire ONLY for a completed review run, and
+		// maybeEnqueueTaskReview's review_target_run_id-null gate makes the two mutually
+		// exclusive. Best-effort — never fails the report.
+		s.maybeEnqueueThenFix(ctx, run)
 	}
 	return run, rows > 0, err
+}
+
+// inferredRequirementParams sanitises the plan-time INFERRED requirement set a worker
+// emits on a state report (PRD #84 M4 4b) into the three absent-safe params BOTH write
+// paths take: SetRunAwaitingApproval on a human-gated plan park, SetRunRunning on an
+// autopilot's self-contained running report (an autopilot run never reports
+// awaiting_approval). Shared so the two consumers can never drift in how they filter a
+// report against the server-owned vocabulary. Each return is absent-safe, matching the
+// queries' COALESCE guards:
+//   - inferredCaps: capability.Filter (unknown names dropped). An absent (nil) field or
+//     an all-unknown report yields nil/empty, which UNION-MERGES with '{}' — a no-op —
+//     so caps are never wiped; a present set escalates (adds), never replaces.
+//   - inferredTools: capability.FilterTools, but only passed through when NON-empty.
+//     required_tools is a COALESCE-guarded REPLACE, so a non-nil empty slice ({}) would
+//     WIPE a prior tool set; leaving it nil makes the query keep the existing column.
+//     The worker only emits required_tools when non-empty, so this loses no behaviour.
+//   - sizeClass: clamped to the {s,m,l} vocabulary; an absent or off-vocabulary value is
+//     an invalid pgtype.Text (SQL NULL) the query's COALESCE keeps out of the column.
+func inferredRequirementParams(req StateRequest) (inferredCaps, inferredTools []string, sizeClass pgtype.Text) {
+	if req.RequiredCapabilities != nil {
+		inferredCaps = capability.Filter(*req.RequiredCapabilities)
+	}
+	if req.RequiredTools != nil {
+		if filtered := capability.FilterTools(*req.RequiredTools); len(filtered) > 0 {
+			inferredTools = filtered
+		}
+	}
+	if req.SizeClass != nil {
+		switch *req.SizeClass {
+		case "s", "m", "l":
+			sizeClass = pgText(*req.SizeClass)
+		}
+	}
+	return inferredCaps, inferredTools, sizeClass
 }
 
 // runningStateParams builds the `running` update's PRD #37 columns from a worker's
@@ -3351,6 +3731,10 @@ type ForgeConn struct {
 	BaseUrl         string
 	TokenCiphertext []byte
 	ForgeProjectID  int64
+	// BotForgeUserID is the connection's stored bot user id, used by the get_issue
+	// route to drop uzi's own bot-authored comments (PRD #381 M4, D1). Zero when the
+	// legacy connection never recorded one, in which case comments are omitted (D9).
+	BotForgeUserID int64
 }
 
 // ForgeConnForRun authorizes a worker's forge read against a run it holds and returns
@@ -3383,13 +3767,15 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 		BaseUrl:         row.BaseUrl,
 		TokenCiphertext: row.TokenCiphertext,
 		ForgeProjectID:  row.ForgeProjectID,
+		BotForgeUserID:  row.BotForgeUserID,
 	}, nil
 }
 
 // PublishResult is the outcome of a checkpoint publish (PRD #122 M8). Published is
 // true only when the push landed. Skipped names the benign reason a publish did NOT
-// advance the ref ("no_ref" | "not_descendant" | "unsupported"); it is empty on a
-// successful publish. Either way Ref is the checkpoint ref the worker asked about.
+// advance the ref ("no_ref" | "not_descendant" | "unsupported" | "workflow_scope"); it
+// is empty on a successful publish. Either way Ref is the checkpoint ref the worker
+// asked about.
 type PublishResult struct {
 	Published bool
 	Ref       string
@@ -3493,6 +3879,14 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		return PublishResult{Published: true, Ref: ref}, nil
 	case errors.Is(err, pushbroker.ErrNotDescendant):
 		return PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}, nil
+	case errors.Is(err, pushbroker.ErrWorkflowScopeRejected):
+		// The branch is behind on .github/workflows/** relative to the default branch,
+		// so the bot's repo-only PAT cannot push the checkpoint (PRD #456 M4). This is a
+		// benign skip like ErrNotDescendant — nil error, so it never reaches the 5xx /
+		// slog.Error default arm and never fails the run. Checkpoints stay best-effort;
+		// the finalize base-align (PRD #456 M1) is the real safety net that saves this
+		// run's work.
+		return PublishResult{Published: false, Ref: ref, Skipped: "workflow_scope"}, nil
 	case errors.Is(err, pushbroker.ErrTipMissing),
 		errors.Is(err, pushbroker.ErrPackTooLarge),
 		errors.Is(err, pushbroker.ErrPackInvalid):
@@ -3997,6 +4391,21 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	if fixing > 0 {
 		return store.Run{}, ErrBranchInUse
 	}
+	// PRD #381: snapshot the issue's human comments alongside the description. One
+	// extra forge round-trip, centralized here so every issue-backed origin (manual,
+	// autopilot, scheduled) captures it (D6) without rippling the Create*Run seam.
+	// Best-effort: a forge glitch, a nil forge builder (tests), or an unknown bot id
+	// (D9) all degrade to a NULL snapshot rather than failing run creation.
+	var issueCommentsJSON []byte
+	if s.forges != nil {
+		if snap := s.fetchIssueCommentsSnapshot(ctx, row, issueIID); snap != nil {
+			if b, err := json.Marshal(snap); err != nil {
+				slog.Error("workersvc: marshal issue comments snapshot", "issue_iid", issueIID, "error", err)
+			} else {
+				issueCommentsJSON = b
+			}
+		}
+	}
 	run, err := s.q.CreateRun(ctx, store.CreateRunParams{
 		UserID:           userID,
 		RepoID:           repoID,
@@ -4030,6 +4439,10 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		// label-poller autopilot) → the default lane where subagent pins win. M1 stores
 		// it only; claim delivery (M3) and worker behaviour (M4) are separate milestones.
 		OverrideSubagentModel: overrideSubagentModel,
+		// PRD #381: the structured human-comments snapshot, fetched best-effort above.
+		// nil (→ NULL) for a non-issue kind, a comment-less issue, an unknown bot id
+		// (D9), or when no forge builder is wired (tests).
+		IssueComments: issueCommentsJSON,
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -4041,6 +4454,24 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// in the CreateRun statement; Notify performs the move.
 	s.notify(run.ID, "queued")
 	return run, nil
+}
+
+// fetchIssueCommentsSnapshot builds a forge driver from the run's repo connection,
+// reads the issue's comments, and returns the filtered/capped snapshot (PRD #381).
+// Returns nil (→ NULL) on any error or when the D1/D9 filter leaves nothing — a
+// comment snapshot is best-effort run CONTEXT, never a reason to fail creation.
+func (s *Service) fetchIssueCommentsSnapshot(ctx context.Context, row store.GetRepoForUserRow, issueIID int64) *IssueCommentsSnapshot {
+	f, err := s.forges.ForgeForConnection(row.ForgeType, row.BaseUrl, row.TokenCiphertext)
+	if err != nil {
+		slog.Error("workersvc: build forge for issue comments", "issue_iid", issueIID, "error", err)
+		return nil
+	}
+	comments, err := f.ListIssueComments(ctx, row.ForgeProjectID, issueIID)
+	if err != nil {
+		slog.Error("workersvc: list issue comments", "issue_iid", issueIID, "error", err) // err is PAT-redacted by the driver
+		return nil
+	}
+	return buildIssueCommentsSnapshot(comments, row.BotForgeUserID)
 }
 
 // prdLabel resolves the configured PRD label for the run-eligibility gate,
@@ -4340,7 +4771,27 @@ type SubmitInputResult struct {
 // awaiting approval because a live worker put it there, so an approve with no
 // poller is a race the worker's own gate timeout resolves. Only cancel/reject_plan
 // need the branch below.
+//
+// The capability approval gate (PRD #84 M4 4c) is ENFORCED here — use
+// SubmitInputWithCapabilityOverride for the owner "run without the capability" override.
 func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind, body string, sel *AgentSelection) (SubmitInputResult, error) {
+	return s.submitInput(ctx, userID, runID, kind, body, sel, false)
+}
+
+// SubmitInputWithCapabilityOverride is SubmitInput for the PRD #84 M4 4c owner override
+// ("run without the capability", Decision 12). It BYPASSES the capability approval gate and
+// clears the run's inferred/hinted required_capabilities — but ATOMICALLY with a successful
+// approve: the clear runs ONLY after the approve's own validation (selection roster check)
+// and enqueue succeed, so a FAILED approve (e.g. an invalid agent selection) leaves
+// required_capabilities INTACT and the retry stays gated. This closes the non-atomic drop
+// the old handler-side pre-clear had, where a failed approve permanently dropped the
+// requirement. The override is meaningful only for approve_plan; on any other kind the gate
+// never runs, so the flag is inert.
+func (s *Service) SubmitInputWithCapabilityOverride(ctx context.Context, userID, runID uuid.UUID, kind, body string, sel *AgentSelection) (SubmitInputResult, error) {
+	return s.submitInput(ctx, userID, runID, kind, body, sel, true)
+}
+
+func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind, body string, sel *AgentSelection, overrideCapabilities bool) (SubmitInputResult, error) {
 	run, err := s.GetRun(ctx, userID, runID)
 	if err != nil {
 		return SubmitInputResult{}, err
@@ -4360,8 +4811,41 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	if sel != nil && kind != "approve_plan" {
 		return SubmitInputResult{}, fmt.Errorf("%w: an agent selection is only valid when approving a plan", ErrInvalidSelection)
 	}
-	if kind == "approve_plan" && sel != nil {
-		return s.submitApproval(ctx, run, *sel)
+	// PRD #84 M4 4c: the AUTHORITATIVE capability approval gate runs here for EVERY
+	// approve_plan — both the selection-bearing dispatch and the nil-selection plain-enqueue
+	// path — so neither can approve a plan onto a worker that cannot run it. See
+	// capabilityGate.
+	//
+	// The owner OVERRIDE ("run without the capability", Decision 12) instead BYPASSES the
+	// gate and clears the run's required_capabilities — but the clear is ATOMIC with a
+	// successful approve: it runs ONLY after the approve's own validation (submitApproval's
+	// roster check) and enqueue have succeeded, so a FAILED approve (e.g. an invalid
+	// selection) leaves the requirement INTACT and the retry stays gated. Doing the clear
+	// here, after the enqueue, rather than in the handler BEFORE this call, is the fix for
+	// the non-atomic drop.
+	if kind == "approve_plan" {
+		if !overrideCapabilities {
+			if err := s.capabilityGate(ctx, run); err != nil {
+				return SubmitInputResult{}, err
+			}
+		}
+		var res SubmitInputResult
+		if sel != nil {
+			res, err = s.submitApproval(ctx, run, *sel)
+		} else {
+			res, err = s.enqueueRunInput(ctx, runID, kind, body)
+		}
+		if err != nil {
+			return SubmitInputResult{}, err
+		}
+		if overrideCapabilities {
+			// Only reached once the approve fully succeeded, so a failed approve above never
+			// clears the requirement. Owner- and awaiting_approval-scoped in SQL.
+			if err := s.OverrideRunRequiredCapabilities(ctx, userID, runID); err != nil {
+				return SubmitInputResult{}, err
+			}
+		}
+		return res, nil
 	}
 
 	// An `answer` resolves the clarification question the run is CURRENTLY parked on
@@ -4379,6 +4863,40 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		return s.submitAnswer(ctx, run, body)
 	}
 
+	// A graceful `stop` (PRD #517 M4) is the interactive-run wind-down: unlike cancel/
+	// reject_plan it has NO server-side !live transition branch, because only the worker can
+	// finalize it (push + open MR iff open_mr) and report `completed` with stop_kind='stopped'.
+	// So a stop ALWAYS enqueues via CreateStopVerdictInput, stamping stop_kind='stopped' in the
+	// same statement. A live parked/running worker consumes it and finalizes; a dead-worker
+	// parked run is requeued by M2's stale-heartbeat sweep (awaiting_followup is in
+	// RequeueRunsOfStaleWorkers) and honors the pending stop on resume. The terminal guard at
+	// the top of SubmitInput already 409s a stop on a finished run. Never routes through
+	// CancelRunServerSide/RejectRunServerSide.
+	//
+	// stop_reason carries the operator's OPTIONAL message (like a cancel's — a stop reason is
+	// helpful, not mandatory); the same message is co-written to run_user_inputs.body, NUL-
+	// stripped to avoid Postgres 22021 aborting the CTE.
+	if kind == "stop" {
+		// Only an interactive task run has a park that reads the stop flag, so a stop is
+		// meaningful ONLY there. Reject it on any other run BEFORE stamping, so a
+		// non-interactive-task / chat / plan-gated run cannot acquire a spurious permanent
+		// stop_kind='stopped' and return a misleading success. `run` came from GetRun (a
+		// SELECT *), so Kind and Interactive are populated. The guard is on kind+interactive
+		// only — a RUNNING interactive task (not yet parked) is still a legal stop target.
+		// The owner-scope (GetRun→404) and terminal (ErrRunTerminal→409) guards above run
+		// first and are unchanged.
+		if run.Kind != RunKindTask || !run.Interactive {
+			return SubmitInputResult{}, ErrStopNotInteractive
+		}
+		cleanBody, _ := stripNUL(body)
+		if _, err := s.q.CreateStopVerdictInput(ctx, store.CreateStopVerdictInputParams{
+			RunID: runID, Kind: kind, Body: pgText(cleanBody), StopKind: pgText(stopKindFor(kind)), StopReason: stopReasonParam(body),
+		}); err != nil {
+			return SubmitInputResult{}, err
+		}
+		return SubmitInputResult{ServerSide: false}, nil
+	}
+
 	if kind == "cancel" || kind == "reject_plan" {
 		live, err := s.hasLivePoller(ctx, run)
 		if err != nil {
@@ -4387,11 +4905,26 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		if !live {
 			status := "cancelled"
 			if kind == "cancel" {
-				_, err = s.q.CancelRunServerSide(ctx, store.CancelRunServerSideParams{ID: runID, UserID: userID})
+				// PRD #503 M3: persist the operator's OPTIONAL cancel reason; an empty
+				// body stores NULL (a cancel reason is helpful, not mandatory).
+				_, err = s.q.CancelRunServerSide(ctx, store.CancelRunServerSideParams{
+					ID: runID, UserID: userID, StopReason: stopReasonParam(body),
+				})
 			} else {
 				status = "failed"
+				// PRD #503 M2 — persist the operator's reject reason as failure_reason
+				// instead of the hardcoded literal; the CLI now requires it, but keep a
+				// fallback for non-CLI callers that may still send an empty body. Sanitize
+				// like the worker-reported failure_reason (strip NUL — a NUL in a text column
+				// raises 22021 and would abort the reject — then cap length).
+				reason, _ := stripNUL(body)
+				reason = strings.TrimSpace(reason)
+				if reason == "" {
+					reason = "plan rejected"
+				}
+				reason = truncateRunes(reason, maxFailureReasonRunes)
 				_, err = s.q.RejectRunServerSide(ctx, store.RejectRunServerSideParams{
-					ID: runID, UserID: userID, FailureReason: pgText("plan rejected"),
+					ID: runID, UserID: userID, FailureReason: pgText(reason),
 				})
 			}
 			if err != nil {
@@ -4414,8 +4947,21 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		// here (kind is cancel/reject_plan). The stamp lands while the run is still
 		// non-terminal; the client's terminal-guarded isStoppedRun ignores it until the
 		// run reaches failed/cancelled.
+		// PRD #503 M3: the shared CTE stamps stop_reason unconditionally, but the reason
+		// belongs on a CANCEL only. Pass the operator's optional reason for a cancel;
+		// NULL for reject_plan, whose reason lives in failure_reason via the M2 path (the
+		// server-side reject branch above) — double-writing would contradict that split.
+		var stopReason pgtype.Text // NULL for reject_plan
+		if kind == "cancel" {
+			stopReason = stopReasonParam(body)
+		}
+		// Strip NUL from the body co-written to run_user_inputs.body in the SAME INSERT:
+		// a NUL in a text column raises Postgres 22021, which would abort the whole CTE and
+		// silently drop the cancel/reject verdict (the stop_reason sanitizing above would be
+		// moot if this INSERT never lands). NUL is never meaningful in an operator message.
+		cleanBody, _ := stripNUL(body)
 		if _, err := s.q.CreateStopVerdictInput(ctx, store.CreateStopVerdictInputParams{
-			RunID: runID, Kind: kind, Body: pgText(body), StopKind: pgText(stopKindFor(kind)),
+			RunID: runID, Kind: kind, Body: pgText(cleanBody), StopKind: pgText(stopKindFor(kind)), StopReason: stopReason,
 		}); err != nil {
 			return SubmitInputResult{}, err
 		}
@@ -4471,9 +5017,16 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		return SubmitInputResult{ServerSide: false, ID: row.ID, CreatedAt: row.CreatedAt.Time}, nil
 	}
 
-	// A plain steering input (approve_plan / follow_up): enqueue for the worker with no
-	// stop signal and no runs-row touch. Return the created row (PRD #95 S2) so the
-	// handler can surface id + created_at for a follow_up's optimistic reconcile.
+	// A plain steering input (follow_up, or a nil-selection approve_plan handled above):
+	// enqueue for the worker with no stop signal and no runs-row touch.
+	return s.enqueueRunInput(ctx, runID, kind, body)
+}
+
+// enqueueRunInput writes a plain worker-bound input row (no stop signal, no runs-row
+// touch) and returns the created row (PRD #95 S2) so the handler can surface id +
+// created_at for a follow_up's optimistic reconcile. Shared by the follow_up path and the
+// nil-selection approve_plan path so both go through one enqueue.
+func (s *Service) enqueueRunInput(ctx context.Context, runID uuid.UUID, kind, body string) (SubmitInputResult, error) {
 	row, err := s.q.CreateRunInput(ctx, store.CreateRunInputParams{
 		RunID: runID, Kind: kind, Body: pgText(body),
 	})
@@ -4500,6 +5053,10 @@ func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSe
 	if err := validateSelection(sel, roster); err != nil {
 		return SubmitInputResult{}, err
 	}
+	// The capability approval gate (capabilityGate) is enforced UPSTREAM in SubmitInput for
+	// every approve_plan — both the selection-bearing path that reaches here and the
+	// nil-selection plain-enqueue path — so a plan can never be approved onto a worker that
+	// cannot run it, whichever path the client used.
 	exclusions, err := encodeJSONArray(sel.Exclusions)
 	if err != nil {
 		return SubmitInputResult{}, fmt.Errorf("encode agent exclusions: %w", err)
@@ -4524,6 +5081,71 @@ func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSe
 	// Populated AFTER validateSelection accepted the selection: only a valid, accepted
 	// guard-role exclusion warrants the owner heads-up (PRD #319 M3).
 	return SubmitInputResult{ServerSide: false, ExcludedGuardRoles: excludedGuardRoles(sel)}, nil
+}
+
+// capabilityGate is the AUTHORITATIVE, server-side PRD #84 M4 4c approval gate. A run at
+// awaiting_approval is owned by exactly one worker (run.WorkerID); if that worker's EFFECTIVE
+// capabilities do not satisfy the run's plan-time-inferred (and M2 repo-hinted)
+// required_capabilities, the approve is BLOCKED (a *CapabilityUnmetError → 409) so a plan can
+// never be approved onto a worker that cannot run it. The effective-caps fold —
+// worker.capabilities ∪ {docker if docker_enabled} — is the SAME one fn_worker_can_claim
+// (migration 00142) and CountOnlineWorkersSatisfyingCaps apply, so approve and claim never
+// disagree. Gated by the capability-aware kill-switch (default ON), identically to the
+// claim/health paths: with the flag OFF the fleet claims best-effort, so there is no
+// eligibility to enforce and this stays silent. Called from submitInput for every approve_plan
+// (both the selection and nil-selection paths) so the gate has no bypass — EXCEPT the owner
+// override path (SubmitInputWithCapabilityOverride), which skips this gate deliberately and
+// clears required_capabilities AFTER a successful approve (OverrideRunRequiredCapabilities).
+func (s *Service) capabilityGate(ctx context.Context, run store.Run) error {
+	if len(run.RequiredCapabilities) == 0 || !s.capabilityAwareOn(ctx) {
+		return nil
+	}
+	effective, err := s.effectiveOwningWorkerCaps(ctx, run)
+	if err != nil {
+		return err
+	}
+	if unmet := capability.Unmet(run.RequiredCapabilities, effective); len(unmet) > 0 {
+		return &CapabilityUnmetError{Unmet: unmet}
+	}
+	return nil
+}
+
+// effectiveOwningWorkerCaps folds the run's OWNING worker's effective capability set the
+// SAME way fn_worker_can_claim (migration 00142) and CountOnlineWorkersSatisfyingCaps do —
+// the worker's stored capabilities plus `docker` when docker_enabled — so the PRD #84 M4 4c
+// approval gate and the claim gate evaluate the identical set and can never disagree. A run
+// with no owning worker (no awaiting_approval run reaches submitApproval without one) folds
+// to the empty set, which fails CLOSED: every required capability is then unmet, matching
+// the claim path's fail direction. A GetWorkerByID error (including the worker having been
+// deleted) propagates as an error rather than silently opening the gate.
+func (s *Service) effectiveOwningWorkerCaps(ctx context.Context, run store.Run) ([]string, error) {
+	if !run.WorkerID.Valid {
+		return nil, nil
+	}
+	wkr, err := s.q.GetWorkerByID(ctx, uuid.UUID(run.WorkerID.Bytes))
+	if err != nil {
+		return nil, err
+	}
+	effective := append([]string{}, wkr.Capabilities...)
+	if wkr.DockerEnabled.Valid && wkr.DockerEnabled.Bool {
+		effective = append(effective, capability.Docker)
+	}
+	return effective, nil
+}
+
+// OverrideRunRequiredCapabilities backs the PRD #84 M4 4c user override ("run without the
+// capability", Decision 12): it clears the run's inferred/hinted required_capabilities. The
+// clear is owner- AND awaiting_approval-scoped in SQL, so a non-owner runID or a run outside
+// the plan gate is a silent no-op (0 rows). It is called from submitInput's override path
+// AFTER the approve has validated and enqueued (the gate is bypassed for that path), so the
+// clear runs ONLY on a successful approve — a failed approve leaves the requirement intact
+// and the retry stays gated. v1 clears the WHOLE set (repo hint + inferred); a
+// hint-vs-inference split is a future refinement (Decision 6/12), and no runtime security
+// boundary is bypassed — the §300 guardrail still denies docker USE on a daemon-less worker
+// at run time.
+func (s *Service) OverrideRunRequiredCapabilities(ctx context.Context, userID, runID uuid.UUID) error {
+	_, err := s.q.ClearRunRequiredCapabilities(ctx, store.ClearRunRequiredCapabilitiesParams{ID: runID, UserID: userID})
+	return err
 }
 
 // AnswerBody is the wire shape of an `answer` steering input (PRD #88 M1). It is
@@ -4623,16 +5245,18 @@ func orEmpty(v []string) []string {
 }
 
 // stopKindFor maps a deliberate-stop steering kind to the stop signal stamped on the
-// run (PRD #33): a cancel verdict is 'cancelled', a plan reject is 'plan_rejected'.
-// Only cancel/reject_plan reach it (the stop-verdict branch of SubmitInput); the
-// server owns this mapping so the signal never depends on the reason string the
-// worker later reports.
+// run (PRD #33): a cancel verdict is 'cancelled', a plan reject is 'plan_rejected', a
+// graceful interactive wind-down (PRD #517 M4) is 'stopped'. Only cancel/reject_plan/
+// stop reach it (the stop-verdict branches of SubmitInput); the server owns this mapping
+// so the signal never depends on the reason string the worker later reports.
 func stopKindFor(kind string) string {
 	switch kind {
 	case "cancel":
 		return "cancelled"
 	case "reject_plan":
 		return "plan_rejected"
+	case "stop":
+		return "stopped"
 	default:
 		return ""
 	}
@@ -4886,6 +5510,19 @@ func pgText(s string) pgtype.Text {
 	return pgtype.Text{String: s, Valid: true}
 }
 
+// stopReasonParam maps an operator's OPTIONAL cancel reason (PRD #503 M3) onto the nullable
+// runs.stop_reason column, sanitizing like sanitizeFailureReason (its failure-class
+// sibling): strip NUL — a NUL in a text column raises Postgres 22021 and would abort the
+// cancel — then trim and cap the length (the same 2048-rune bound as failure_reason). An
+// empty / whitespace-only / NUL-only body stores NULL, never an empty string. Shared by
+// both cancel paths (server-side + live) and, since PRD #517 M4, by the graceful `stop`
+// path, which carries the operator's OPTIONAL stop reason the same way a cancel does.
+func stopReasonParam(body string) pgtype.Text {
+	clean, _ := stripNUL(body)
+	clean = truncateRunes(strings.TrimSpace(clean), maxFailureReasonRunes)
+	return pgText(clean)
+}
+
 func textParam(s *string) pgtype.Text {
 	if s == nil {
 		return pgtype.Text{}
@@ -4915,6 +5552,29 @@ func sanitizeFailureReason(s *string) pgtype.Text {
 	}
 	clean, _ := stripNUL(*s)
 	clean = truncateRunes(clean, maxFailureReasonRunes)
+	return pgText(clean)
+}
+
+// PreservedPatchMaxBytes bounds runs.preserved_patch — the agent's branch diff carried
+// on a workflow_scope_missing `failed` report (PRD #377 M1). Generous headroom: the
+// motivating #188 workflow file was ~112 lines, but a run can touch several workflow
+// files, and this is a one-off column read on a single failed card, not an index key.
+// The agent already secret-scrubs and size-caps before sending; this is the server-side
+// bound that does not take the worker's word for the length.
+const PreservedPatchMaxBytes = 1 << 20 // 1 MiB
+
+// clampWirePreservedPatch maps the worker's preserved_patch onto the nullable
+// runs.preserved_patch column. nil/empty → NULL. Otherwise the untrusted worker text is
+// run through termsafe.SanitizeBounded, which strips NUL and every other control/bidi
+// rune (Trojan-Source defense) while SPARING \n and \t so the diff's line structure
+// survives, then applies the byte bound. A NUL would raise 22021 on this terminal
+// `failed` write exactly as it does for failure_reason (see stripNULParam); the byte cap
+// bounds a hostile or buggy worker. A value that sanitizes to empty maps to NULL.
+func clampWirePreservedPatch(s *string) pgtype.Text {
+	if s == nil {
+		return pgtype.Text{}
+	}
+	clean := termsafe.SanitizeBounded(*s, PreservedPatchMaxBytes)
 	return pgText(clean)
 }
 

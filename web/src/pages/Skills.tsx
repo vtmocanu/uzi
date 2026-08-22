@@ -28,6 +28,8 @@ import {
   Select,
 } from "../components/ui";
 import { PlusIcon, SkillIcon } from "../components/icons";
+import { DocLink } from "../components/DocLink";
+import { DOC_SKILLS } from "../lib/doclinks";
 
 type EditState =
   | { mode: "create" }
@@ -147,7 +149,13 @@ export function Skills() {
     <div className="space-y-6">
       <PageHeader
         title="Skills"
-        description="Reusable SKILL.md playbooks. Their one-line description sits cheaply in an agent's context; the body loads only when relevant. Allocate them to agents on an agent's page."
+        description={
+          <>
+            Reusable SKILL.md playbooks. Their one-line description sits cheaply in an agent's
+            context; the body loads only when relevant. Allocate them to agents on an agent's page.
+            See the <DocLink slug={DOC_SKILLS}>agent skills</DocLink> guide.
+          </>
+        }
         actions={
           <Button size="sm" onClick={() => setEdit({ mode: "create" })}>
             <PlusIcon /> New skill
@@ -601,7 +609,7 @@ function SkillEditor({
               rows={16}
               aria-label="Body (Markdown, SKILL.md)"
               placeholder={"# my-skill\n\nWhat this playbook covers and the steps to follow."}
-              className="w-full rounded-lg border border-edge bg-raised px-3 py-2 font-mono text-sm text-fg outline-none focus:border-brand/70"
+              className="w-full rounded-lg border border-edge bg-raised px-3 py-2 font-mono text-sm text-fg outline-hidden focus:border-brand/70"
             />
             {body.trim() !== "" && bErr && <p className="text-xs text-warn">{bErr}</p>}
           </div>

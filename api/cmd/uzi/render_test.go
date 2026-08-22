@@ -273,6 +273,56 @@ func TestRenderRunDetailPrdLifecycle(t *testing.T) {
 	}
 }
 
+// ---- PRD #84 M4 4d: inferred requirement set ------------------------------
+
+// TestRenderRunDetailRequirementSet pins `uzi run get`'s inferred requirement rows:
+// REQUIRED_CAPABILITIES (comma-joined), REQUIRED_TOOLS (comma-joined) and SIZE_CLASS.
+// All three are emit-only-when-set, so a run with none of them rendered must be
+// byte-for-byte the pre-feature output. The slices are UNTRUSTED inference output, so a
+// hostile family name must be neutralised before it reaches the terminal.
+func TestRenderRunDetailRequirementSet(t *testing.T) {
+	set := apitypes.RunDTO{
+		ID: "run-1", Kind: "issue", Status: "completed",
+		IssueTitle: "needs a toolchain", ForgeType: "gitlab", Health: "ok",
+		RequiredCapabilities: []string{"docker", "gpu"},
+		RequiredTools:        []string{"go", "node"},
+		SizeClass:            "l",
+	}
+	out := renderDetail(t, set)
+	for _, want := range []string{
+		"REQUIRED_CAPABILITIES", "docker,gpu",
+		"REQUIRED_TOOLS", "go,node",
+		"SIZE_CLASS", "l",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("a run with an inferred requirement set must render %q, got:\n%s", want, out)
+		}
+	}
+
+	// The families are inference output, so a hostile value must be neutralised: the escape
+	// and the bidi override are stripped, the printable text survives.
+	hostile := set
+	hostile.RequiredTools = []string{"go\u202e\x1b[31mrm", "node"}
+	hout := renderDetail(t, hostile)
+	for _, bad := range []string{"\u202e", "\x1b"} {
+		if strings.Contains(hout, bad) {
+			t.Errorf("a hostile required_tools value reached the terminal carrying %q, got:\n%q", bad, hout)
+		}
+	}
+	if !strings.Contains(hout, "node") {
+		t.Errorf("sanitizing dropped the printable tool too, got:\n%q", hout)
+	}
+
+	// All three empty ⇒ none of the rows, byte-for-byte the pre-4d output.
+	none := apitypes.RunDTO{ID: "run-2", Kind: "issue", Status: "completed", Health: "ok"}
+	nout := renderDetail(t, none)
+	for _, bad := range []string{"REQUIRED_CAPABILITIES", "REQUIRED_TOOLS", "SIZE_CLASS"} {
+		if strings.Contains(nout, bad) {
+			t.Errorf("a run with no inferred requirement set must render no %q row, got:\n%s", bad, nout)
+		}
+	}
+}
+
 // ---- PRD #122 M5: milestone progress + effective budget --------------------
 
 // milestoneRun is the fixture the milestone tests start from: a three-milestone frozen
@@ -358,6 +408,44 @@ func TestRenderRunDetailMilestones(t *testing.T) {
 	}
 }
 
+// TestRenderRunDetailMilestonesNeutral pins PRD #390 D5's null-vs-`[]` display contract
+// on `uzi run get`: a milestone run that NEVER reported progress (MilestonesCompleted nil ⇒
+// the milestones_completed column is SQL NULL) must render a NEUTRAL summary with an en-dash
+// numerator (`–/N`, matching the web badge's `M–/N`), NOT `0/N` (which reads as a failure).
+// A run that GENUINELY reported zero complete (non-nil empty `[]`) still shows `0/N`. The
+// distinction is nil vs empty, so it is exactly what a `len()==0` test would destroy.
+func TestRenderRunDetailMilestonesNeutral(t *testing.T) {
+	// Never reported: nil ⇒ neutral en-dash numerator, and NEVER the `0/N` failure read.
+	neverReported := milestoneRun()
+	neverReported.MilestonesCompleted = nil
+	neverReported.MilestonesInProgress = nil
+	out := renderDetail(t, neverReported)
+	if !strings.Contains(out, "–/3 reported complete") {
+		t.Errorf("a never-reported milestone run must render the neutral –/3, got:\n%s", out)
+	}
+	if strings.Contains(out, "0/3 reported complete") {
+		t.Errorf("a never-reported milestone run must NOT render 0/3 (reads as failure), got:\n%s", out)
+	}
+
+	// Genuinely reported zero: non-nil empty `[]` ⇒ 0/N, distinct from never-reported.
+	reportedZero := milestoneRun()
+	reportedZero.MilestonesCompleted = []string{}
+	reportedZero.MilestonesInProgress = nil
+	out = renderDetail(t, reportedZero)
+	if !strings.Contains(out, "0/3 reported complete") {
+		t.Errorf("a genuinely-reported zero-complete run must render 0/3, got:\n%s", out)
+	}
+	if strings.Contains(out, "–/3") {
+		t.Errorf("a reported (non-nil) run must NOT render the neutral en-dash, got:\n%s", out)
+	}
+
+	// The existing reported case (the milestoneRun default) still shows 1/N.
+	out = renderDetail(t, milestoneRun())
+	if !strings.Contains(out, "1/3 reported complete") {
+		t.Errorf("a run that reported m1 complete must render 1/3, got:\n%s", out)
+	}
+}
+
 // TestRenderRunDetailMilestoneTitleSanitized is the milestone twin of
 // TestRenderRunDetailAnthropicToken: a milestone TITLE is UNTRUSTED repo/agent-authored
 // text (apitypes.Milestone), so it must go through cellText — bidi override and CSI escape
@@ -389,6 +477,132 @@ func TestRenderRunDetailMilestoneTitleSanitized(t *testing.T) {
 	}
 	if !strings.Contains(out, "…") {
 		t.Errorf("an oversized milestone title was neither truncated nor ellipsised, got:\n%q", out)
+	}
+}
+
+// ---- PRD #362 M5: plain-English run summaries -------------------------------
+
+// TestRenderRunDetailSummaries pins `uzi run get`'s intent/plan/deltas block (PRD #362
+// M5): the INTENT row, the PLAN SUMMARY row, and one DELTA row per entry rendered as
+// `<glyph> <kind>: <text>`. All three are emit-only-when-set — a run with no summaries
+// (the common pre-feature / still-queued case) must render none of them and leave the
+// existing rows untouched.
+func TestRenderRunDetailSummaries(t *testing.T) {
+	intent := "Add rate-limit headroom to the scheduler poll."
+	plan := "Introduce a token-bucket guard and back off on 429s."
+	full := apitypes.RunDTO{
+		ID: "run-1", Kind: "issue", Status: "awaiting_approval",
+		IssueTitle: "do the thing", ForgeType: "gitlab", Health: "ok",
+		SummaryIntent: &intent,
+		SummaryPlan:   &plan,
+		SummaryDeltas: []apitypes.RunSummaryDelta{
+			{Kind: "added", Text: "a retry budget"},
+			{Kind: "changed", Text: "the poll cadence"},
+			{Kind: "dropped", Text: "the eager prefetch"},
+		},
+	}
+	out := renderDetail(t, full)
+
+	for _, want := range []string{
+		"INTENT", intent,
+		"PLAN SUMMARY", plan,
+		"DELTA",
+		"+ added: a retry budget",
+		"~ changed: the poll cadence",
+		"- dropped: the eager prefetch",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("a run with summaries must render %q, got:\n%s", want, out)
+		}
+	}
+
+	// A run with no summaries renders none of the rows — the back-compat contract the nil
+	// pointers and nil slice carry, so a pre-feature run's detail is unchanged.
+	none := apitypes.RunDTO{
+		ID: "run-2", Kind: "issue", Status: "running",
+		IssueTitle: "do the thing", ForgeType: "gitlab", Health: "ok",
+	}
+	bare := renderDetail(t, none)
+	for _, unwanted := range []string{"INTENT", "PLAN SUMMARY", "DELTA"} {
+		if strings.Contains(bare, unwanted) {
+			t.Errorf("a run with no summaries must not render %q, got:\n%s", unwanted, bare)
+		}
+	}
+
+	// Empty (non-nil) strings and a delta whose text is blank OR sanitizes to empty are
+	// the same as absent: no bare rows, no `+ added:` with nothing after it. The second
+	// delta's text is a lone bidi override — non-whitespace, so it must be dropped on the
+	// SANITIZED text (cellText), not on raw TrimSpace which would leak a bare-label row.
+	// Empty is reachable through the API as `""`.
+	empty := ""
+	edge := apitypes.RunDTO{
+		ID: "run-3", Kind: "issue", Status: "awaiting_approval",
+		IssueTitle: "do the thing", ForgeType: "gitlab", Health: "ok",
+		SummaryIntent: &empty,
+		SummaryPlan:   &empty,
+		SummaryDeltas: []apitypes.RunSummaryDelta{
+			{Kind: "added", Text: "   "},
+			{Kind: "changed", Text: "\u202e"},
+		},
+	}
+	edgeOut := renderDetail(t, edge)
+	for _, unwanted := range []string{"INTENT", "PLAN SUMMARY", "DELTA"} {
+		if strings.Contains(edgeOut, unwanted) {
+			t.Errorf("empty summaries must render no %q row, got:\n%s", unwanted, edgeOut)
+		}
+	}
+}
+
+// TestRenderRunDetailSummariesSanitized is the summary twin of
+// TestRenderRunDetailMilestoneTitleSanitized: intent, plan and delta text are all
+// model-authored UNTRUSTED strings (Decision 10), so each must go through cellText —
+// bidi override and CSI escape stripped, newline folded so the table rail holds, tab
+// folded, and an oversized value capped. The newline, tab and cap are the discriminating
+// probes (sanitizeTTY spares "\n" and "\t" and has no bound); a plain sanitizeTTY here
+// would leave all three and break the rail.
+func TestRenderRunDetailSummariesSanitized(t *testing.T) {
+	hostile := "safe\u202ednetsop\x1b[31m\nnext-line\tcol" + strings.Repeat("x", 250)
+	r := apitypes.RunDTO{
+		ID: "run-1", Kind: "issue", Status: "awaiting_approval",
+		IssueTitle: "do the thing", ForgeType: "gitlab", Health: "ok",
+		SummaryIntent: &hostile,
+		SummaryPlan:   &hostile,
+		SummaryDeltas: []apitypes.RunSummaryDelta{{Kind: "added", Text: hostile}},
+	}
+	out := renderDetail(t, r)
+
+	for _, bad := range []string{"\u202e", "\x1b", "\nnext-line", "\t"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("hostile summary text reached the terminal carrying %q, got:\n%q", bad, out)
+		}
+	}
+	if !strings.Contains(out, "safe") || !strings.Contains(out, "next-line") {
+		t.Errorf("sanitizing dropped the printable summary text too, got:\n%q", out)
+	}
+	// The cap: cellText's alone (Printer.Table's per-cell pass folds newlines but does not
+	// bound length), so an uncapped value would blow the table rail.
+	if strings.Contains(out, strings.Repeat("x", 250)) {
+		t.Errorf("a 250-char summary value reached the terminal uncapped, got:\n%q", out)
+	}
+	if !strings.Contains(out, "…") {
+		t.Errorf("an oversized summary value was neither truncated nor ellipsised, got:\n%q", out)
+	}
+}
+
+// TestDeltaGlyph pins the per-kind delta prefix, including the unknown-kind pass-through:
+// a newer server can send a delta kind this binary has never heard of, and it must render
+// a neutral bullet rather than being dropped.
+func TestDeltaGlyph(t *testing.T) {
+	for _, tc := range []struct{ kind, want string }{
+		{"added", "+"},
+		{"changed", "~"},
+		{"dropped", "-"},
+		{"resurrected", "•"},
+		{"", "•"},
+	} {
+		if got := deltaGlyph(tc.kind); got != tc.want {
+			t.Errorf("deltaGlyph(%q) = %q, want %q", tc.kind, got, tc.want)
+		}
 	}
 }
 
@@ -607,6 +821,14 @@ func TestRunAgeCell(t *testing.T) {
 			want: "10m",
 		},
 		{
+			// awaiting_followup (PRD #517) is a park like the other two — it anchors on
+			// UpdatedAt and renders a waiting duration, NOT "-" (the CLI twin of the web's
+			// runDuration, which added awaiting_followup too).
+			name: "awaiting_followup off UpdatedAt",
+			r:    apitypes.RunDTO{Status: "awaiting_followup", UpdatedAt: now.Add(-20 * time.Minute), CreatedAt: now.Add(-30 * time.Minute)},
+			want: "20m",
+		},
+		{
 			// Terminal is a static span FinishedAt−StartedAt, so a now far from either end
 			// does not change it: this run ran for 2h whenever it is listed.
 			name: "completed is a static ran-span",
@@ -756,6 +978,11 @@ func TestSteerStateOnAParkedRun(t *testing.T) {
 	}
 	if got := steerState(&consumed, "awaiting_approval"); got != "delivered (applies after approval)" {
 		t.Errorf("steerState(consumed, awaiting_approval) = %q — the gate label regressed", got)
+	}
+	// PRD #517: a delivered follow-up while the run is parked awaiting_followup gets the
+	// tailored "resumes the run" copy (the web twin's wording), not the generic "delivered".
+	if got := steerState(&consumed, "awaiting_followup"); got != "delivered (resumes the run)" {
+		t.Errorf("steerState(consumed, awaiting_followup) = %q, want the tailored follow-up label", got)
 	}
 	if got := steerState(nil, "completed"); got != "not delivered (run finished)" {
 		t.Errorf("steerState(unconsumed, completed) = %q — the terminal label regressed", got)

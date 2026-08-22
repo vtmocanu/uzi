@@ -28,7 +28,14 @@ import {
   Toggle,
   cx,
 } from "../components/ui";
-import { ChevronDownIcon, ClockIcon, PencilIcon, PlayIcon, PlusIcon } from "../components/icons";
+import {
+  ChevronDownIcon,
+  ClockIcon,
+  PencilIcon,
+  PlayIcon,
+  PlusIcon,
+} from "../components/icons";
+import { ForgeIssueAnchor } from "../components/ForgeIssueAnchor";
 
 // The COLSPAN of the schedules table, so the expandable "Last fire" detail row
 // stretches the full width (Target · When · Next run · Last run · Options · On).
@@ -347,7 +354,7 @@ function ScheduleRow({
 
 // LastRunOutcome is the enriched "Last run" cell for a schedule that has a
 // persisted fire (PRD #308 M4, mock §1): an outcome badge, a muted "{stamp} ·
-// matched N" line, and a disclosure that toggles the "Last fire" detail row.
+// examined N" line, and a disclosure that toggles the "Last fire" detail row.
 function LastRunOutcome({
   fire,
   expanded,
@@ -366,7 +373,7 @@ function LastRunOutcome({
         <OutcomeBadge fire={fire} />
       </span>
       <span className="text-[11px] text-faint tabular-nums">
-        {formatStamp(fire.fired_at)} · matched {fire.matched}
+        {formatStamp(fire.fired_at)} · examined {fire.matched}
       </span>
       {/* A DISCLOSURE, not a link (ux-tweaks item 2): it expands the detail row in
           place, so it must not wear the app's link costume (text-info + underline
@@ -415,7 +422,7 @@ function OutcomeBadge({ fire }: { fire: LastFire }) {
 }
 
 // LastFireDetail is the expandable "Last fire" panel (mock §2): a header with the
-// fire timestamp + a status badge, a matched/started/skipped/max-issues tally, one
+// fire timestamp + a status badge, an examined/started/skipped/max-issues tally, one
 // row per started run (linking to the run) and per skipped candidate (with its
 // typed reason), and the actionable cap hint when a capped fire started nothing.
 function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
@@ -455,7 +462,7 @@ function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
       </div>
 
       <div className="mb-3.5 flex flex-wrap gap-x-5 gap-y-2">
-        <Tally n={fire.matched} label="matched" tone="mut" />
+        <Tally n={fire.matched} label="examined" tone="mut" />
         <Tally n={fire.started.length} label="started" tone={fire.started.length > 0 ? "ok" : "mut"} />
         <Tally n={fire.skips.length} label="skipped" tone={fire.skips.length > 0 ? "warn" : "mut"} />
         <Tally
@@ -472,9 +479,7 @@ function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
               key={r.run_id}
               className="flex items-start gap-3 rounded-lg border border-edge bg-raised/50 px-3 py-2"
             >
-              <span className="min-w-[46px] shrink-0 pt-0.5 font-mono text-[12.5px] text-fg">
-                {r.issue_iid != null ? `#${r.issue_iid}` : "prompt"}
-              </span>
+              <IssueRef issueIID={r.issue_iid} webURL={r.web_url} />
               <div className="min-w-0 flex-1">
                 {r.title && <div className="text-[12.5px] text-muted">{r.title}</div>}
               </div>
@@ -529,14 +534,34 @@ function Tally({
   );
 }
 
+// IssueRef renders the fire row's issue ref (PRD #411): `#<iid>` as an external forge
+// link when the issue's web_url was snapshotted at fire time and is a valid https URL,
+// otherwise a plain `#<iid>`; an issue-less fire (null iid) renders the "prompt" marker.
+// The schedule DTO carries no forge_type on fire rows, so the accessible label uses a
+// generic "the forge". This span is a SIBLING of the row's run <Link>, so a plain anchor
+// is correct here (no nested-anchor, no stopPropagation needed).
+function IssueRef({ issueIID, webURL }: { issueIID: number | null; webURL?: string | null }) {
+  const cls = "min-w-[46px] shrink-0 pt-0.5 font-mono text-[12.5px] text-fg";
+  if (issueIID == null) {
+    return <span className={cls}>prompt</span>;
+  }
+  return (
+    <ForgeIssueAnchor
+      webUrl={webURL}
+      iid={issueIID}
+      label={`Open issue #${issueIID} on the forge`}
+      className={cx(cls, "hover:text-brand")}
+      fallbackClassName={cls}
+    />
+  );
+}
+
 // SkipRow renders one skipped candidate: its issue ref (or a prompt marker), its
 // title when present, and a tone-coded badge carrying the human reason label.
 function SkipRow({ skip }: { skip: LastFireSkip }) {
   return (
     <div className="flex items-start gap-3 rounded-lg border border-edge bg-raised/50 px-3 py-2">
-      <span className="min-w-[46px] shrink-0 pt-0.5 font-mono text-[12.5px] text-fg">
-        {skip.issue_iid != null ? `#${skip.issue_iid}` : "prompt"}
-      </span>
+      <IssueRef issueIID={skip.issue_iid} webURL={skip.web_url} />
       <div className="min-w-0 flex-1">
         {skip.title && <div className="text-[12.5px] text-muted">{skip.title}</div>}
       </div>

@@ -145,12 +145,32 @@ the judge through rather than silently going quiet. On trip, the judge is
 skipped the same way an ineligible run is: silently, with no notification
 and no queued run.
 
+## Run summaries
+
+The model [run summaries](./run-summaries.md) generate on, instance-wide
+(**Summary model**, `haiku` by default — summaries are cheap and run once or
+twice per run, so the default favors speed and cost over depth). Each user
+can override it for their own runs from **Settings → Run defaults → Run
+summaries → Summary model**; the admin default only applies while they
+haven't. Summary generation always spends the run owner's own Anthropic
+token, never the admin's, same as the judge above — there's no kill-switch
+here, since a failed or slow summary is skipped silently and never blocks a
+run.
+
 ## Self-improvement
 
 The [self-improvement job](./self-improvement.md)'s settings: enable/disable,
 the connected repo it targets, and its interval (default `48h`). Unlike the
 run judge, enabling this spends **the enabling admin's own token** on a
 standing basis — see the linked doc for what that means before turning it on.
+
+## GitHub Projects v2 sync
+
+Whether uzi keeps a GitHub repo's board columns synced with a linked GitHub
+Projects v2 board's Status field: the `github_project_sync_enabled` instance
+kill switch, off by default. See
+[GitHub Projects v2 sync](./github-project-sync.md) for what it does, the
+required PAT scope, and how a repo gets linked.
 
 ## Hosted worker quota
 
@@ -177,10 +197,23 @@ signal off, from **Admin → Instance settings → Run health**:
 |---|---|---|
 | Enable run-health detection | on | Turns the whole detector on or off. |
 | Stalled after | 300s (5m) | Seconds of silence, with no tool call in flight, before a running run is flagged stalled. |
-| Slow after | 2700s (45m) | Wall-clock seconds since start before a running run is flagged slow. |
+| Slow after | 2700s (45m) | Wall-clock seconds since start before a running run is flagged slow. For a milestone-scaled run (frozen `budget_wall_seconds`, PRD #122) this threshold scales up with the run's budget, so a long-budget run isn't flagged at the flat default while it is still working. |
 | Stuck queued after | 600s (10m) | Seconds a run may sit queued before it's flagged waiting for worker. |
 | Awaiting approval after | 3600s (1h) | Seconds a run may sit awaiting approval before it's flagged; skipped for autopilot runs. |
 | Slack nudge cooldown | 1800s (30m) | Minimum time between Slack DMs about the same run's flag — see [Slack notifications](./slack.md). |
+
+**A repo-bearing run stuck past "Stuck queued after" can also be waiting on
+the Docker worker repo allowlist.** If every online worker is Docker-capable
+and the run's repo isn't on that allowlist, the owner's reason names it
+directly, distinct from "no worker online" or "all workers busy" — see
+[Run health](./run-health.md#what-the-flags-mean). That allowlist is keyed
+by **repo id**, not path, so a repo re-added to uzi (say, after moving it to
+a new forge) gets a new id and silently drops off — nothing re-adds it for
+you. The Repos page's **Setup** chip surfaces each repo's optional
+capabilities (repo skills, repo instructions, tool profile, Docker workers)
+as on/off with where to set them, staying neutral while a repo sits on its
+safe defaults and escalating to an info tone only once a queued run is
+actually blocked this way.
 
 ## Guardrail override (per repo)
 

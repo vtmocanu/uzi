@@ -1,6 +1,11 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+/* The semantic design tokens (colors routed through CSS variables with the
+   rgb(var(--x) / <alpha-value>) pattern, the derived radius scale and the font
+   families) live in tailwind.config.js. v4 no longer auto-discovers a JS config,
+   so it is loaded explicitly here; the config's `content` globs drive class
+   detection. */
+@config "../tailwind.config.js";
 
 /* Semantic design tokens (multica-style: packages/ui/styles/tokens.css keeps
    every color behind CSS variables; we do the same, with color channels as
@@ -186,23 +191,52 @@ body {
   select:focus-visible,
   textarea:focus-visible,
   [tabindex]:not([tabindex="-1"]):focus-visible {
-    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-ink;
+    @apply outline-hidden ring-2 ring-ring ring-offset-2 ring-offset-ink;
+  }
+}
+
+/* Preflight compatibility (Tailwind v4): v4's reset follows the browser and sets
+   `cursor: default` on buttons, where v3's reset set `cursor: pointer`. Restore
+   the pointer on enabled buttons and role=button elements so every clickable in
+   the app keeps the affordance it had under v3. */
+@layer base {
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
   }
 }
 
 /* Respect prefers-reduced-motion (PRD #38 M4): neutralize the two Tailwind
    keyframe utilities the run feed animates — the running-tool spinner
-   (animate-spin) and the active-agent pulsing dot (animate-pulse). This wins by
-   SOURCE ORDER: Tailwind v3 flattens @layer into plain CSS (no native @layer in
-   the compiled output), so at equal specificity the later rule wins. This block
-   is placed after `@tailwind utilities` (where the animate-* utilities are
-   emitted), so it overrides them — and is deliberately kept OUT of `@layer base`,
-   whose contents Tailwind hoists ahead of the utilities (they would lose). */
+   (animate-spin) and the active-agent pulsing dot (animate-pulse). This block is
+   deliberately UNLAYERED (kept out of any @layer). Tailwind v4 emits its
+   utilities inside the native `utilities` cascade layer, and an unlayered rule
+   always wins over any layered rule regardless of source order — so these
+   overrides beat the animate-* utilities. Keeping it out of `@layer base` also
+   matters: base sorts below utilities, so a base rule would lose to them. */
 @media (prefers-reduced-motion: reduce) {
   .animate-spin,
-  .animate-pulse {
+  .animate-pulse,
+  .forge-flash {
     animation: none;
   }
+}
+
+/* Auto-change highlight for the connect-form base-URL ⇄ forge-type sync
+   (PRD #337 D9): when a sync handler moves the *other* field, this brief tint
+   flash makes the coupling legible. Purely cosmetic and cleared on animationend
+   (no setTimeout); neutralized under prefers-reduced-motion above. */
+@keyframes forge-flash {
+  from {
+    background-color: rgb(var(--ring) / 0.25);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+.forge-flash {
+  animation: forge-flash 0.6s ease-out;
+  border-radius: 0.5rem;
 }
 
 /* Typography for rendered docs markdown (DocMarkdown). Hand-rolled prose rules
@@ -281,13 +315,14 @@ body {
   @apply font-semibold text-fg;
 }
 
-/* Scoped wrapper for UNTRUSTED judge markdown (summary_md / rationale_md) rendered
-   through the shared <Markdown> (.docs-prose) inside the compact run-review panel.
-   Two jobs: (1) give the panel a text-sm base .docs-prose lacks, and (2) defend the
-   compact card against an untrusted heading — .docs-prose h1/h2 render at
-   text-3xl / bordered text-xl, which would blow out the card. Placed AFTER the whole
-   .docs-prose rule set: the heading override uses :is(...) so it matches .docs-prose h1
-   at the same specificity (0,1,1) and wins by source order. Do not edit .docs-prose. */
+/* Scoped wrapper for UNTRUSTED model markdown rendered through the shared <Markdown>
+   (.docs-prose) inside a compact card — the judge panel's summary_md / rationale_md and
+   the run-summary card's intent / plan (issue #423) both use it. Two jobs: (1) give the
+   card a text-sm base .docs-prose lacks, and (2) defend the compact card against an
+   untrusted heading — .docs-prose h1/h2 render at text-3xl / bordered text-xl, which would
+   blow out the card. Placed AFTER the whole .docs-prose rule set: the heading override uses
+   :is(...) so it matches .docs-prose h1 at the same specificity (0,1,1) and wins by source
+   order. Do not edit .docs-prose. */
 .judge-prose {
   @apply text-sm;
 }

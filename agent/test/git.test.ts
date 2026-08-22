@@ -114,6 +114,78 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
     assert.strictEqual(gitIn(fx.originPath, ["rev-parse", "refs/heads/agent/issue-7"]), agentSha, "branch landed at origin");
   });
 
+  // PRD #400 M7 — behavioral proof of the "worker push is NON-FORCED" guardrail. pushBranch
+  // builds a plain `<src>:refs/heads/<branch>` refspec (no `+`, no `--force`), so a push that
+  // is not a fast-forward MUST be refused rather than silently rewriting origin history — the
+  // property that stops a task run from clobbering a branch a human (or another run) advanced.
+  // This is the behavioral companion to the structural refspec; it drives real local git.
+  it("refuses a NON-fast-forward push — the worker push is non-forced, so it can never rewrite origin history (PRD #400 M7)", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.createOrAttachRunnerClone(bare, 400);
+
+    // Cycle 1: commit A in the clone, fetch it back, and push agent/issue-400 to origin.
+    fs.writeFileSync(path.join(rc.path, "A.txt"), "a\n");
+    gitIn(rc.path, ["add", "A.txt"]);
+    gitIn(rc.path, [...IDENT, "commit", "-m", "a"]);
+    const shaA = gitIn(rc.path, ["rev-parse", "HEAD"]);
+    await git.fetchAgentBranch(bare, rc.path, "agent/issue-400", "run-fixture");
+    await git.pushBranch(bare, "agent/issue-400", "", fx.originPath);
+    assert.strictEqual(
+      gitIn(fx.originPath, ["rev-parse", "refs/heads/agent/issue-400"]),
+      shaA,
+      "precondition: cycle 1 landed the branch at origin",
+    );
+
+    // Advance ORIGIN's copy of the branch to a DIVERGENT commit C (a child of A landed
+    // directly at origin — e.g. a human pushed meanwhile), so the worker's next push is no
+    // longer a fast-forward. Committed on the branch, then back to main so the push target
+    // is not the checked-out branch.
+    gitIn(fx.originPath, ["checkout", "agent/issue-400"]);
+    fs.writeFileSync(path.join(fx.originPath, "ORIGIN.txt"), "moved on at origin\n");
+    gitIn(fx.originPath, ["add", "ORIGIN.txt"]);
+    gitIn(fx.originPath, [...IDENT, "commit", "-m", "divergent origin commit"]);
+    const shaC = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+    gitIn(fx.originPath, ["checkout", "main"]);
+    assert.notStrictEqual(shaC, shaA, "precondition: origin's branch advanced past the pushed tip");
+
+    // The worker meanwhile advances its OWN work to a SIBLING commit B (also a child of A,
+    // NOT a descendant of C) and fetches it back, so the tracking ref pushBranch reads is B.
+    fs.writeFileSync(path.join(rc.path, "LOCAL.txt"), "local divergent work\n");
+    gitIn(rc.path, ["add", "LOCAL.txt"]);
+    gitIn(rc.path, [...IDENT, "commit", "-m", "divergent local commit"]);
+    const shaB = gitIn(rc.path, ["rev-parse", "HEAD"]);
+    await git.fetchAgentBranch(bare, rc.path, "agent/issue-400", "run-fixture");
+    assert.strictEqual(
+      gitIn(bare, ["rev-parse", "refs/uzi-runner/agent/issue-400"]),
+      shaB,
+      "precondition: the tracking ref pushBranch pushes FROM is the divergent local tip B",
+    );
+
+    // PRECONDITION: B and C genuinely diverge — both are direct children of A, so neither
+    // descends the other and pushing B onto origin@C can ONLY succeed by forcing. Checked
+    // via each commit's parent in the repo that actually holds it (C lives at origin, B in
+    // the bare) rather than a cross-repo merge-base, which would throw on a missing object
+    // and pass this precondition for the wrong reason.
+    assert.strictEqual(gitIn(fx.originPath, ["rev-parse", "agent/issue-400^"]), shaA, "precondition: C's parent is A");
+    assert.strictEqual(gitIn(bare, ["rev-parse", `${shaB}^`]), shaA, "precondition: B's parent is A");
+    assert.notStrictEqual(shaB, shaC, "precondition: B and C are distinct siblings — a genuine divergence");
+
+    // THE ASSERTION: pushBranch must REJECT rather than overwrite. A forced push would
+    // silently rewrite origin history; a plain (non-forced) push is refused as non-ff.
+    await assert.rejects(
+      git.pushBranch(bare, "agent/issue-400", "", fx.originPath),
+      /non-fast-forward|\[rejected\]|failed to push/i,
+      "a non-forced push MUST refuse a non-fast-forward update — no history rewrite is possible",
+    );
+
+    // …and origin's branch is UNTOUCHED — still C, never overwritten to the worker's B.
+    assert.strictEqual(
+      gitIn(fx.originPath, ["rev-parse", "refs/heads/agent/issue-400"]),
+      shaC,
+      "origin history must be intact after the refused push (no force was applied)",
+    );
+  });
+
   it("plants a git author identity so the agent's first commit succeeds with no ambient identity (#234)", async () => {
     const bare = await git.ensureClone(fx.originPath);
     const rc = await git.createOrAttachRunnerClone(bare, 234);
@@ -795,5 +867,66 @@ describe("gitEnv (M10: scrubbed replacement env + hook neutralization)", () => {
     for (const [k, v] of Object.entries(gitEnv("secret-pat"))) {
       if (!k.startsWith("GIT_CONFIG_VALUE_")) assert.ok(!String(v).includes("secret-pat"), `PAT leaked into ${k}`);
     }
+  });
+});
+
+describe("reviewDiff (PRD #400 M4b diff-review)", () => {
+  // Build a branch off main with N commits, pushed into the origin fixture BEFORE the
+  // bare clone so ensureClone mirrors it into refs/remotes/origin/<branch>.
+  function commitOnBranch(branch: string, files: Record<string, string>, message: string): void {
+    gitIn(fx.originPath, ["checkout", "-b", branch, "main"]);
+    for (const [rel, content] of Object.entries(files)) {
+      fs.writeFileSync(path.join(fx.originPath, rel), content);
+      gitIn(fx.originPath, ["add", rel]);
+    }
+    gitIn(fx.originPath, ["commit", "-m", message]);
+  }
+
+  it("returns the three-dot diff of a two-commit branch against its base", async () => {
+    gitIn(fx.originPath, ["checkout", "-b", "uzi/task/tgt", "main"]);
+    fs.writeFileSync(path.join(fx.originPath, "A.txt"), "alpha\n");
+    gitIn(fx.originPath, ["add", "A.txt"]);
+    gitIn(fx.originPath, ["commit", "-m", "add A"]);
+    fs.writeFileSync(path.join(fx.originPath, "B.txt"), "beta\n");
+    gitIn(fx.originPath, ["add", "B.txt"]);
+    gitIn(fx.originPath, ["commit", "-m", "add B"]);
+    gitIn(fx.originPath, ["checkout", "main"]); // leave origin on main
+
+    const bare = await git.ensureClone(fx.originPath);
+    const diff = await git.reviewDiff(bare, "main", "uzi/task/tgt");
+
+    // Both commits' changes are present (three-dot from the merge base), added content too.
+    assert.match(diff, /A\.txt/);
+    assert.match(diff, /B\.txt/);
+    assert.match(diff, /\+alpha/);
+    assert.match(diff, /\+beta/);
+    // The base's own README is unchanged on the branch, so it must NOT appear in the diff.
+    assert.ok(!diff.includes("README.md"), "unchanged base files are absent from the diff");
+  });
+
+  it("truncates past the byte cap with a marker", async () => {
+    // ~650 KiB of added content, comfortably past the 512 KiB cap.
+    const big = ("y".repeat(64) + "\n").repeat(10_000);
+    commitOnBranch("uzi/task/big", { "BIG.txt": big }, "add BIG");
+    gitIn(fx.originPath, ["checkout", "main"]);
+
+    const bare = await git.ensureClone(fx.originPath);
+    const diff = await git.reviewDiff(bare, "main", "uzi/task/big");
+
+    assert.match(diff, /diff truncated at \d+ bytes/);
+    // The kept payload is bounded near the cap (512 KiB + the short marker), not the full
+    // ~650 KiB diff.
+    assert.ok(
+      Buffer.byteLength(diff, "utf8") <= 512 * 1024 + 256,
+      `diff should be capped near 512 KiB, got ${Buffer.byteLength(diff, "utf8")} bytes`,
+    );
+  });
+
+  it("returns an empty string when the branch matches its base", async () => {
+    // A branch at the same commit as main — nothing changed.
+    gitIn(fx.originPath, ["branch", "uzi/task/same", "main"]);
+    const bare = await git.ensureClone(fx.originPath);
+    const diff = await git.reviewDiff(bare, "main", "uzi/task/same");
+    assert.equal(diff.trim(), "");
   });
 });

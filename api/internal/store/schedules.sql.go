@@ -171,7 +171,7 @@ INSERT INTO runs (
 ) VALUES (
     $1, $2::uuid, 'prompt', $3, $4, $5::uuid, $6, $7, $8, $9
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id
 `
 
 type CreatePromptRunParams struct {
@@ -283,6 +283,24 @@ func (q *Queries) CreatePromptRun(ctx context.Context, arg CreatePromptRunParams
 		&i.OverrideSubagentModel,
 		&i.FailOrigin,
 		&i.Priority,
+		&i.SummaryIntent,
+		&i.SummaryPlan,
+		&i.SummaryDeltas,
+		&i.IssueComments,
+		&i.BaseBranch,
+		&i.OpenMr,
+		&i.DispatchedAt,
+		&i.ReviewTargetRunID,
+		&i.ReviewRequested,
+		&i.ThenFixRequested,
+		&i.ThenFixOfRunID,
+		&i.PreservedPatch,
+		&i.RequiredCapabilities,
+		&i.StopReason,
+		&i.RequiredTools,
+		&i.SizeClass,
+		&i.Interactive,
+		&i.OpenFollowupID,
 	)
 	return i, err
 }
@@ -596,6 +614,62 @@ func (q *Queries) ListSweepCandidateIssues(ctx context.Context, arg ListSweepCan
 		return nil, err
 	}
 	return items, nil
+}
+
+const resumeRecurringSchedule = `-- name: ResumeRecurringSchedule :one
+UPDATE run_schedules
+SET enabled = $1, next_fire_at = $2, updated_at = now()
+WHERE id = $3 AND user_id = $4
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire
+`
+
+type ResumeRecurringScheduleParams struct {
+	Enabled    bool               `json:"enabled"`
+	NextFireAt pgtype.Timestamptz `json:"next_fire_at"`
+	ID         uuid.UUID          `json:"id"`
+	UserID     uuid.UUID          `json:"user_id"`
+}
+
+// Resume a recurring schedule (enabled-only PATCH, enabled→true): re-arm next_fire_at to
+// the next future cron occurrence AND set enabled in a SINGLE write, so no crash window
+// between two writes can leave an overdue next_fire_at behind (the exact bug of issue #396).
+// status is deliberately NOT touched: a pause/resume is status-orthogonal and must not
+// un-park a status='error' schedule (unlike UpdateRunSchedule, which revives to 'active').
+func (q *Queries) ResumeRecurringSchedule(ctx context.Context, arg ResumeRecurringScheduleParams) (RunSchedule, error) {
+	row := q.db.QueryRow(ctx, resumeRecurringSchedule,
+		arg.Enabled,
+		arg.NextFireAt,
+		arg.ID,
+		arg.UserID,
+	)
+	var i RunSchedule
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.RepoID,
+		&i.Target,
+		&i.IssueIid,
+		&i.Labels,
+		&i.Prompt,
+		&i.Timing,
+		&i.CronExpr,
+		&i.RunAt,
+		&i.Timezone,
+		&i.NextFireAt,
+		&i.LastFiredAt,
+		&i.AutoApprove,
+		&i.WaitOnLimit,
+		&i.Enabled,
+		&i.Status,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.MaxIssues,
+		&i.Guidance,
+		&i.Model,
+		&i.OverrideSubagentModel,
+		&i.LastFire,
+	)
+	return i, err
 }
 
 const setRunScheduleEnabled = `-- name: SetRunScheduleEnabled :one

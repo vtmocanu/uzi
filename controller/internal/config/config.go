@@ -126,6 +126,19 @@ type Config struct {
 	// semaphore, so this pod env is the only thing pinning a hosted worker to 1.
 	WorkerMaxConcurrentRuns int
 
+	// --- drain policy (PRD #422 M5) -------------------------------------------
+	// DrainDeadline bounds how long a cordoned BUSY hosted worker delays a deliberate
+	// image roll before the controller rolls it anyway and its in-flight run requeues
+	// (UZI_WORKER_DRAIN_DEADLINE). Default 24h. The reconcile loop is stateless, so the
+	// elapsed time is computed from the api-supplied draining_since; without this bound a
+	// worker parked at an approval gate would hold the old image forever.
+	DrainDeadline time.Duration
+	// ForceRoll, when true, rolls EVERY drifted worker immediately regardless of busy —
+	// the emergency override (UZI_WORKER_FORCE_ROLL, e.g. a CVE that must not wait on a
+	// drain). It only accelerates a PENDING roll (a drifted worker); it never invents one.
+	// Default false.
+	ForceRoll bool
+
 	// --- docker-capable workers (PRD #83 M3) ----------------------------------
 	// Both empty unless this instance offers docker workers. They travel TOGETHER:
 	// a docker worker is rendered into WorkerDockerNamespace with a DinD sidecar from
@@ -197,9 +210,25 @@ func Load() (Config, error) {
 	cfg := Config{
 		PollInterval: parseDuration("CONTROLLER_POLL_INTERVAL", 10*time.Second),
 		HTTPTimeout:  parseDuration("CONTROLLER_HTTP_TIMEOUT", 15*time.Second),
+		// The bounded drain deadline (PRD #422 M5). Default 24h; parseDuration falls back
+		// on empty or a non-positive value, the same tuning-not-security split as the
+		// interval knobs above.
+		DrainDeadline: parseDuration("UZI_WORKER_DRAIN_DEADLINE", 24*time.Hour),
 		// Safe default: rootless. Overridden (and REQUIRED explicit) when the docker tier
 		// is configured — see validateDockerTier.
 		WorkerDinDRootless: true,
+	}
+
+	// The emergency force-roll override (PRD #422 M5). Empty defaults false; a set but
+	// unparseable value is a BOOT error rather than a silent false, mirroring
+	// UZI_WORKER_DIND_ROOTLESS — an operator reaching for the emergency lever must not
+	// have it silently disarmed by a typo.
+	if raw := strings.TrimSpace(os.Getenv("UZI_WORKER_FORCE_ROLL")); raw != "" {
+		forceRoll, err := strconv.ParseBool(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("UZI_WORKER_FORCE_ROLL=%q is not a boolean (want true or false): %w", raw, err)
+		}
+		cfg.ForceRoll = forceRoll
 	}
 
 	base := strings.TrimSpace(os.Getenv("UZI_API_URL"))

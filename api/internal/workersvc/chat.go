@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
 
 // RunKindChat is the third run kind (PRD #39): a conversational session with the
@@ -599,15 +600,19 @@ func validateChatMessage(trimmed string) error {
 }
 
 // deriveChatTitle turns the first message into a short conversation title: the
-// first non-empty line, collapsed whitespace, truncated to maxChatTitleRunes with
-// an ellipsis. Empty input yields a stable fallback (the caller has already
+// first non-empty line, terminal-safety stripped, collapsed whitespace, truncated
+// to maxChatTitleRunes with an ellipsis. The termsafe.CellText strip removes
+// terminal-control and bidi runes (which strings.Fields does not, as they are not
+// IsSpace) so a crafted message cannot inject escapes into the cross-tenant admin
+// runs listing (#213). Empty input yields a stable fallback (the caller has already
 // rejected an empty message, so this only guards a whitespace-only first line).
 func deriveChatTitle(message string) string {
 	line := message
 	if i := strings.IndexByte(line, '\n'); i >= 0 {
 		line = line[:i]
 	}
-	line = strings.Join(strings.Fields(line), " ")
+	line = termsafe.CellText(line)                 // strip terminal-control/bidi runes; fold tab/newline to space (#213)
+	line = strings.Join(strings.Fields(line), " ") // collapse the resulting whitespace runs
 	if line == "" {
 		return "New chat"
 	}

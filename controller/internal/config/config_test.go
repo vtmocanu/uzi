@@ -134,6 +134,66 @@ func TestLoadParsesTheIntervalKnobs(t *testing.T) {
 	}
 }
 
+// The drain policy (PRD #422 M5): DrainDeadline defaults to 24h and ForceRoll to false
+// when the envs are unset, a set UZI_WORKER_DRAIN_DEADLINE parses, UZI_WORKER_FORCE_ROLL
+// "true" parses true, and an unparseable force-roll value is a boot error (the emergency
+// lever must never be silently disarmed by a typo).
+func TestLoadParsesTheDrainPolicy(t *testing.T) {
+	t.Run("defaults when unset", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.DrainDeadline != 24*time.Hour {
+			t.Errorf("DrainDeadline = %v, want the default 24h", cfg.DrainDeadline)
+		}
+		if cfg.ForceRoll {
+			t.Error("ForceRoll = true, want the default false when UZI_WORKER_FORCE_ROLL is unset")
+		}
+	})
+
+	t.Run("a set deadline parses", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_WORKER_DRAIN_DEADLINE", "1h")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.DrainDeadline != time.Hour {
+			t.Errorf("DrainDeadline = %v, want 1h", cfg.DrainDeadline)
+		}
+	})
+
+	t.Run("force-roll true parses true", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_WORKER_FORCE_ROLL", "true")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.ForceRoll {
+			t.Error("UZI_WORKER_FORCE_ROLL=true must set ForceRoll")
+		}
+	})
+
+	t.Run("an unparseable force-roll value is a boot error", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_WORKER_FORCE_ROLL", "maybe")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_FORCE_ROLL") {
+			t.Fatalf("err = %v, want a boot refusal naming UZI_WORKER_FORCE_ROLL", err)
+		}
+	})
+}
+
 // A malformed or non-positive knob falls back to the default rather than failing
 // boot: these are tuning values, not security controls, which is the same split the
 // api's config package draws.

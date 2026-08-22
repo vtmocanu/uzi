@@ -4,6 +4,17 @@
   "issue_iid": 42,
   "issue_title": "Extend the pipeline",
   "issue_description": "PRD: add a job",
+  "issue_comments": {
+    "comments": [
+      {
+        "author_username": "carol",
+        "author_forge_user_id": 42,
+        "created_at": "2026-07-04T09:00:00Z",
+        "body": "please guard on Valid"
+      }
+    ],
+    "truncated": true
+  },
   "status": "claimed",
   "branch": "agent/issue-42",
   "session_id": "sess-abc",
@@ -12,6 +23,11 @@
   "requeue_count": 0,
   "plan_md": "# Plan\n",
   "auto_approve": true,
+  "open_mr": true,
+  "interactive": true,
+  "stop_pending": true,
+  "base_branch": "develop",
+  "review_target_run_id": null,
   "wait_on_limit": true,
   "plan_approved": true,
   "plan_source": "seeded",

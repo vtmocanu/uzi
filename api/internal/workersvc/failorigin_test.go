@@ -63,7 +63,7 @@ func TestCoerceFailOrigin(t *testing.T) {
 // parses the migration rather than restating the list, because a second hand-typed copy
 // is exactly the drift it prevents.
 func TestFailOriginVocabularyMatchesCheck(t *testing.T) {
-	const path = "../store/migrations/00126_run_fail_origin.sql"
+	const path = "../store/migrations/00139_run_finalize_base_align_conflict.sql"
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
@@ -82,8 +82,9 @@ func TestFailOriginVocabularyMatchesCheck(t *testing.T) {
 	}
 	body := stripped.String()
 
-	// Scope to THIS CHECK's statement (from the fail_origin IN list to its closing
-	// paren), so the Down section's bare DROP contributes nothing.
+	// Scope to THIS CHECK's statement (from the FIRST fail_origin IN list — the Up's
+	// widened set — to its closing paren), so the Down section's narrower re-declared
+	// CHECK, which appears later in the file, contributes nothing.
 	start := strings.Index(body, "fail_origin IN (")
 	if start < 0 {
 		t.Fatalf("%s no longer declares a fail_origin IN (...) CHECK; the guard is reading "+
@@ -184,6 +185,92 @@ func TestSetStateFailedCoercesUnknownOriginToAgentFailure(t *testing.T) {
 	}
 	if got := fs.setFailed.FailOrigin; !got.Valid || got.String != "agent_failure" {
 		t.Fatalf("fail_origin = %+v, want agent_failure (unknown coerced away)", got)
+	}
+}
+
+// TestSetStateFailedCancelledRoutesToCancel (PRD #503 M1, REC A): a LIVE worker cannot
+// report a `cancelled` status, so a consumed cancel verdict arrives as `failed`. Because
+// the loaded run carries stop_kind='cancelled' (stamped by CreateStopVerdictInput before
+// the report), the failed arm must route to CancelRunByWorker (status 'cancelled',
+// fail_origin NULL) instead of SetRunFailed — so an operator cancel is not mis-classified
+// as agent_failure (and is not judged).
+func TestSetStateFailedCancelledRoutesToCancel(t *testing.T) {
+	run := runningRun(false)
+	run.StopKind = pgText("cancelled")
+	fs, svc, wkr := limitParkFixture(t, run)
+
+	worker := "run cancelled"
+	if _, _, err := svc.SetState(context.Background(), wkr, run.ID, StateRequest{
+		State: "failed", FailureReason: &worker,
+	}); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	if fs.cancelledByWorker == nil {
+		t.Fatal("CancelRunByWorker was never called for a stop_kind='cancelled' failed report")
+	}
+	if fs.cancelledByWorker.ID != run.ID {
+		t.Fatalf("CancelRunByWorker id = %v, want %v", fs.cancelledByWorker.ID, run.ID)
+	}
+	if fs.setFailed != nil {
+		t.Fatalf("SetRunFailed was called for a cancelled stop_kind (should route to cancel): %+v", fs.setFailed)
+	}
+}
+
+// TestSetStateFailedPlanRejectedStampsPlanRejected (PRD #503 M1, REC A): a live plan-reject
+// arrives as `failed` with stop_kind='plan_rejected'; the failed arm must stamp
+// fail_origin='plan_rejected' via SetRunFailed (matching the server-side RejectRunServerSide
+// path) rather than defaulting to agent_failure, and must NOT route to CancelRunByWorker.
+func TestSetStateFailedPlanRejectedStampsPlanRejected(t *testing.T) {
+	run := runningRun(false)
+	run.StopKind = pgText("plan_rejected")
+	fs, svc, wkr := limitParkFixture(t, run)
+
+	worker := "plan rejected: not aligned with the issue"
+	if _, _, err := svc.SetState(context.Background(), wkr, run.ID, StateRequest{
+		State: "failed", FailureReason: &worker,
+	}); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	if fs.setFailed == nil {
+		t.Fatal("SetRunFailed was never called for a stop_kind='plan_rejected' failed report")
+	}
+	if got := fs.setFailed.FailOrigin; !got.Valid || got.String != "plan_rejected" {
+		t.Fatalf("fail_origin = %+v, want plan_rejected", got)
+	}
+	if fs.cancelledByWorker != nil {
+		t.Fatalf("CancelRunByWorker was called for a plan_rejected stop_kind (should fail with plan_rejected): %+v", fs.cancelledByWorker)
+	}
+}
+
+// TestSetStateFailedStoppedRoutesToCancel (PRD #517 M4 review): a graceful stop stamped
+// stop_kind='stopped' before the report. Its happy path reports `completed`, but on the
+// edge where the worker's finalize (push/MR) throws — or a cancel-then-stop lets the cancel
+// win — the worker reports `failed`. The failed arm must route THAT to CancelRunByWorker
+// (status 'cancelled', fail_origin NULL) exactly like the cancelled arm, NOT to SetRunFailed:
+// so a deliberate wind-down is never labeled fail_origin='agent_failure' and, landing
+// 'cancelled', is excluded from judging by maybeEnqueueJudge's Gate 0.
+//
+// MUTATION PROOF: remove the `case "stopped"` arm and this report falls to the default,
+// calling SetRunFailed with fail_origin='agent_failure' (fs.setFailed set, fs.cancelledByWorker nil).
+func TestSetStateFailedStoppedRoutesToCancel(t *testing.T) {
+	run := runningRun(false)
+	run.StopKind = pgText("stopped")
+	fs, svc, wkr := limitParkFixture(t, run)
+
+	worker := "finalize failed: push rejected"
+	if _, _, err := svc.SetState(context.Background(), wkr, run.ID, StateRequest{
+		State: "failed", FailureReason: &worker,
+	}); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	if fs.cancelledByWorker == nil {
+		t.Fatal("CancelRunByWorker was never called for a stop_kind='stopped' failed report")
+	}
+	if fs.cancelledByWorker.ID != run.ID {
+		t.Fatalf("CancelRunByWorker id = %v, want %v", fs.cancelledByWorker.ID, run.ID)
+	}
+	if fs.setFailed != nil {
+		t.Fatalf("SetRunFailed was called for a stopped stop_kind (should route to cancel, never agent_failure): %+v", fs.setFailed)
 	}
 }
 

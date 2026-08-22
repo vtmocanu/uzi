@@ -73,10 +73,15 @@ uzi run list --json
 headless path. **In CI, keep `UZI_TOKEN` in a secret (e.g. a GitHub Actions
 secret), never a plain variable.**
 
+**Holding more than one credential?** Both `uzi login` and `uzi auth token`
+can target a *named context* instead of overwriting the one you already have —
+see [Named contexts](#named-contexts) below.
+
 ## Commands
 
 ```
-uzi login | logout | auth token [--with-token] | auth status | whoami
+uzi login | logout | auth token [--with-token] | auth status [--all] | whoami
+uzi context list | current | use <name> | set <name> --url <url> | rm <name>
 uzi run list | get <id> [--field <name> ...] | logs <id> [--follow] [--after <seq>]
 uzi run wait <id> [--until <status,...>] [--interval <dur>] [--timeout <dur>]
 uzi run create --repo <id> --issue <iid> [--plan-file <path>]
@@ -86,6 +91,7 @@ uzi run approve <id> [--agent-source own|repo] [--exclude-agents a,b]
 uzi run reject <id> [--message <text>]
 uzi run revise <id> [--message <text>]
 uzi run cancel <id>
+uzi run stop <id> [--message <text>]
 uzi run follow-up <id> [--message <text>]
 uzi run answer <id> [--message <text> ...]
 uzi run inputs <id> [--json]
@@ -100,19 +106,24 @@ uzi review show <id> | backlog [--bucket todo|filed|done|dismissed|all] [--categ
 uzi review resolve <id> <rec> | --category <c> --target <t>
 uzi review dismiss <id> <rec> | --category <c> --target <t> --reason wont-do|not-an-issue
 uzi review undo <id> <rec> | stats [--json]
+uzi review file <id> <rec> [--repo <repo-id>]
 uzi findings list [--repo <id>] [--bucket to_file|filed|dismissed|all] [--run <id>]
 uzi findings file <finding-id>
 uzi findings dismiss <finding-id> --reason wont-do|not-an-issue
+uzi handoff -m <text> | -f <path> [--base <ref>] [--mr] [--review] [--then-fix] [--interactive] [--repo <id>]
+uzi handoff rm <run-id> | review <run-id>
 uzi token list
 uzi worker list | rm <id> | set-token <worker-id> <label> | set-token <worker-id> --default
-uzi repo list
+uzi repo list | remove <id> [--force]
+uzi project-sync status <repo> | resync <repo>
 uzi admin users | runs | workers | usage | rate-limits | cli-tokens | guardrail-impact | blocked-repos
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi tui [run-id]
 uzi version
 ```
 
-Global flags: `--json`, `--url <url>`, `--quiet`, `--no-color`.
+Global flags: `--json`, `--url <url>`, `--quiet`, `--no-color`,
+`--context <name>`/`-c <name>`.
 
 A few worth knowing:
 
@@ -156,6 +167,16 @@ A few worth knowing:
   (`-m`/`--message`, or piped on stdin). Revisions are capped by the run's
   revision limit, and an exhausted limit — or a run that has already finished —
   is a 409 (exit 5).
+- **`run stop <id>`** gracefully winds down an **interactive** task run (one
+  created with `uzi handoff --interactive`; see [Interactive
+  mode](./handoff.md#interactive-mode)) — the current turn
+  finishes, the branch is pushed, an MR opens iff `--mr` was set at handoff,
+  and (via the server's `completed` transition) `--review` fires iff it was
+  requested, then the run lands `completed` with a distinct stop disposition.
+  Unlike `run cancel`, which aborts mid-turn, `stop` never discards in-flight
+  work. An optional `-m`/`--message` (or piped stdin) rides along with the
+  stop. A foreign or unknown run id is exit 4; a run that has already
+  finished is exit 5.
 - **`run answer <id>`** answers the clarifying question a run is parked on
   (`awaiting_input`) — see [Answering a
   question](./run-activity.md#answering-a-question). It reads the open
@@ -245,7 +266,8 @@ A few worth knowing:
   recommendations, and triage tally for a run — see
   [Run judge](./judge.md#reading-a-review-from-the-cli) for the full `--json`
   contract. The rest of the `review` group (`backlog`/`resolve`/`dismiss`/
-  `undo`/`stats`) triages recommendations, per run or across all of them — see
+  `undo`/`stats`, plus `file` to turn a recommendation into a forge issue)
+  triages recommendations, per run or across all of them — see
   [Reviewing and triaging from the CLI](#reviewing-and-triaging-from-the-cli)
   below. There's still no `rejudge` verb: re-running the judge spends the
   owner's Anthropic budget and stays a web action.
@@ -264,6 +286,10 @@ A few worth knowing:
   to its kind default priority (it does **not** demote it below normal). It
   prints the updated run; `--json` emits the run object, whose `priority` reads
   `expedited` after a bump.
+- **A message's content is under `payload`, not `body` or `content`.** Each
+  `--json` line carries the text under `payload` (raw per-kind JSON); there is no
+  `body`/`content` field, so reading either returns empty — indistinguishable from
+  a message that genuinely has no content. Read `payload`.
 - **`run logs <id>` names the invocation, not just the role.** The actor
   column reads `role[/<short id>][ · <task label>]`, so two `coder`
   subagents running in parallel are distinguishable instead of being two
@@ -348,9 +374,135 @@ A few worth knowing:
   warns and the JSON `checks_unknown` is true, so an empty list means "unknown",
   not "none blocked". The table has `OWNER`, `PATH`, `BLOCKED`, `ALLOWED BY`
   (the admin who allowed it, or `—`). Allowing/revoking is done from the web UI.
-- **`uzi logout` is local-only.** It removes the stored credential; it does
-  **not** revoke it server-side (see [Managing tokens](#managing-tokens)
-  below).
+- **`uzi repo remove <id>` deletes a single stale repo** — the surgical
+  counterpart to deleting a whole forge connection. It only works on a
+  **disabled** repo, so disable it first (`enabled` shows in `uzi repo list`);
+  the server refuses an enabled repo, or one with a run still in flight, with a
+  conflict. Removing a repo deletes its board and run history (the row and its
+  cascade), so it is destructive: it prompts `[y/N]` on stdin unless you pass
+  `--force`/`-f`. Note it is **not permanent for a repo the bot can still see** —
+  the next projects refresh re-adds it as a disabled row, because the projects
+  list reflects live membership. To keep a still-visible repo out for good,
+  remove the bot's access on the forge first; `remove` is meant for a repo the
+  bot no longer sees (a deleted/recreated project, the stale-duplicate case).
+- **`uzi project-sync status <repo>` and `uzi project-sync resync <repo>`** are the
+  CLI's read-and-fix-loop window onto a repo's GitHub Projects v2 sync. `<repo>` is a
+  path-with-namespace (`org/repo`, matched against `uzi repo list`) or a raw repo id.
+  `status` prints whether the repo is linked and, if so, the project number, whether the
+  board is uzi-owned, the last sync time, the last error (health), the synced item count,
+  and any board columns with no matching Status option; a repo that is **not linked** is
+  reported as normal output (`--json` returns `{"linked": false}`), not an error.
+  `resync` re-seeds an already-linked board, picking up newly-added Status columns — the
+  same operation the web panel's Resync button drives. Linking a repo to a project in the
+  first place (**Adopt**) and creating a fresh uzi-owned board (**Provision**) stay
+  **web-only** (D4): the CLI observes and re-seeds, it never mints a link or a project.
+- **`uzi logout` is local-only.** It removes **the active context's** stored
+  credential (its stored URL is left intact, so a later re-login needs no
+  re-typed URL); it does **not** revoke it server-side (see
+  [Managing tokens](#managing-tokens) below).
+
+## uzi handoff: ephemeral branch-scoped task runs
+
+```sh
+uzi handoff -m "<context>" [--file <path>] [--base <ref>] [--mr]
+            [--review] [--then-fix] [--repo <repo-id>]
+uzi handoff rm <run-id>
+uzi handoff review <run-id>
+```
+
+`uzi handoff` (alias `uzi task`) hands a throwaway task to a worker without a
+forge issue and without a PRD: no plan gate, no issue to file, no MR to
+review, unless you ask for one. Think of it as renting a remote worktree —
+you push it some work, watch it, pull the result, and throw the branch away.
+See [Handoff: renting a remote worktree](./handoff.md) for the full mental
+model; this section is the flag reference.
+
+Run from inside a checkout with an `origin` remote:
+
+```sh
+uzi handoff -m "add input validation to the signup form"
+```
+
+This does three things, in order, and stops before the third if either of the
+first two fails:
+
+1. **Create** — a new `task` run, on the repo matched from your `origin`
+   remote (`--repo <id>` overrides the auto-detection, see `uzi repo list`).
+   The server names the branch: `uzi/task/<run-id>`.
+2. **Push** — your local HEAD (or `--base <ref>`, if given) to that branch,
+   with **your own** git credentials — the same push you'd type by hand.
+   `--base` seeds the branch from a named ref instead of local HEAD.
+3. **Dispatch** — only now can a worker claim the run. If the push in step 2
+   fails, the run is left created but never dispatched — it has no seed
+   content, so nothing will claim it — and the error tells you to clean it up
+   with `uzi handoff rm <id>`.
+
+The worker clones `uzi/task/<id>`, works your inline context (from `-m`, or
+`-f <file>`/`-f -` for stdin, or piped bare stdin), commits, and pushes back
+to the same branch. There's no forge issue and no MR by default — pull the
+result yourself:
+
+```sh
+git fetch origin uzi/task/<run-id> && git switch uzi/task/<run-id>
+```
+
+Continuation is the same `uzi run follow-up <id>` you'd use on any other run;
+watch it with `uzi run get`/`uzi run logs --follow`, or drop into
+[`uzi tui`](#watching-runs-live-uzi-tui).
+
+A few things worth knowing before you rely on this:
+
+- **The push is non-forced, deliberately.** After your seed push, the worker
+  is the sole writer to the branch. If you push more local commits to a
+  *live* task branch mid-run, they're rejected non-fast-forward rather than
+  clobbering the worker's history — a mid-run user push is out of scope for
+  v1; use `uzi run follow-up <id>` to send the worker more context instead.
+- **A raw handoff has no forge record.** With no issue and no MR (no `--mr`),
+  there's nothing durable on the forge — the run transcript and your inline
+  context are still persisted in uzi (`uzi run get`/`uzi run logs`), but if
+  you want a forge-visible artifact, pass `--mr` or escalate later by opening
+  one yourself from the pulled branch.
+- **`--mr`** has the worker open an MR for the branch once it finishes, the
+  escalation path for a throwaway task that turns out to be keeper work. An
+  MR-opened branch is exempt from `uzi handoff rm` — delete it via the MR
+  instead.
+- **`--review`** runs a diff-review once the task completes: a fresh review of
+  `uzi/task/<id>` against its base, producing structured findings (file,
+  symbol, line, severity, summary, rationale). Fetch them with:
+
+  ```sh
+  uzi handoff review <run-id>          # human table: [severity] file:line — summary
+  uzi handoff review <run-id> --json   # the review DTO
+  ```
+
+  The findings are never committed to the branch — they're metadata you read,
+  not a diff the worker writes. If the task hasn't finished yet, or wasn't
+  launched with `--review`, this prints a hint instead of an error.
+- **`--then-fix`** implies `--review`: once the review's findings land, a
+  follow-on fix run auto-applies fixes for them and pushes to the same
+  `uzi/task/<id>` branch. Use it when you want the whole loop — task, review,
+  fix — without a manual step in between.
+- **`--interactive`** keeps the task alive after `signal_done` instead of
+  finalizing it: the run parks in `awaiting_followup` (session, clone and
+  branch held open) until `uzi run follow-up <id>` wakes it for another turn
+  or `uzi run stop <id>` winds it down. A forgotten park still finalizes on
+  its own after `WORKER_TASK_IDLE_TIMEOUT` (30 minutes by default).
+  `--review`/`--mr` compose at wind-down rather than at each park, and
+  `--interactive --then-fix` is a usage error (exit 2) — see [Interactive
+  mode](./handoff.md#interactive-mode) for the full loop.
+
+Cleaning up:
+
+```sh
+uzi handoff rm <run-id>
+```
+
+Deletes the remote `uzi/task/<id>` branch with your own git credentials
+(`git push origin --delete`). It only ever deletes inside the `uzi/task/*`
+namespace, and refuses a run that opened an MR (delete it via the MR
+instead) or one that isn't a `task` run at all. There's no server-side
+auto-prune of stale task branches yet — `rm` is the v1 cleanup story; run it
+once you've pulled what you need.
 
 ## Watching runs live: `uzi tui`
 
@@ -379,15 +531,35 @@ also the TUI's own fallback when the live channel is unreachable (below).
   `uza_` token; a `uzc_` token gets refused inline and stays on your own
   runs, never a crash). **The admin board isn't your own-runs list widened —
   it's a different shape**: active runs only (nothing completed), capped at
-  500, no judge-verdict or usage columns, titled "active runs (factory-wide)"
-  on screen so it never promises a row it can't show.
+  500, no judge-verdict or usage columns, titled `▚▚ uzi · active runs` on
+  screen so it never promises a row it can't show. A milestone-structured
+  run (one planned from a `PRD`-labelled issue) shows a compact `▰▱` milestone
+  micro-bar between AGE and TITLE (one `▰` per reported-complete milestone, `▱`
+  for the rest, or `–/N` text when nothing has been reported complete yet); the
+  micro-bar is hidden on a narrow terminal, and the full breakdown is on the run
+  detail view. `[h]` hides finished runs (completed/failed/cancelled), leaving
+  the active and needs-you runs. The rows are grouped into three triage bands
+  (NEEDS YOU, then ON THE FLOOR, then DONE) rather than one flat table, and each
+  row reads left to right as a `▌` andon strip and status glyph, the run id, the
+  status WORD in its own colour (a stalled run reads `▲ stalled`, because health
+  folds into the status token rather than a separate column), the AGE, the
+  milestone micro-bar, and the TITLE; there are no STATUS/HEALTH/MILE column
+  headers or full-width rules. The list windows to the terminal height so the
+  wordmark and key legend stay on screen however many runs there are, with the
+  visible run span (`lo–hi`) shown in the top-right summary cluster
+  (`⚑ N · ✎ N · ▲ N · T runs`); the whole board refreshes on the poll, so
+  status, health, milestones, age and the judge verdict stay live.
 - **Run detail** (`[enter]` from the board, or `uzi tui <run-id>` directly).
   A left rail of agent lanes — the lead plus each live subagent, one lane per
   invocation, each with a status dot — beside the selected lane's transcript,
   rendered as markdown. Lanes are built from the same per-invocation
   `agent`/`agent_instance`/`agent_label` attribution `run logs` prints; see
   [Run activity pane](./run-activity.md#lanes-one-per-actor-not-one-per-turn)
-  for what a lane's dot means.
+  for what a lane's dot means. For a milestone-structured run the rail also
+  shows a `MILESTONES {done}/{total}` block below the lanes, one row per
+  approved milestone in order, marked `✓` reported complete, `◐` in progress,
+  or `○` not started. The count reads "reported complete", not verified: uzi
+  shows what the run reported and does not itself check the work.
 - **Review overlay** (`[v]` from run detail). The judge's verdict, summary,
   and recommendations, with the same resolve/dismiss/undo triage described
   under [Reviewing and triaging from the CLI](#reviewing-and-triaging-from-the-cli).
@@ -401,6 +573,7 @@ g            detail: follow live — re-attach and jump to the newest output (li
 enter        open the selected run (board)
 /            filter the board
 a            toggle the factory-wide admin board (board only)
+h            hide finished runs — completed/failed/cancelled, keeps active + needs-you (board only; no-op on the admin board)
 r            refresh
 v            open/close the review overlay (detail)
 f            start a follow-up (detail, owner only)
@@ -408,7 +581,7 @@ y/n          approve/reject, at a plan gate (detail, owner only)
 x            cancel the run, asks to confirm (detail, owner only)
 esc          back out / dismiss
 ?            this help
-q            quit — asks to confirm; a second ctrl+c quits at once
+q            quit immediately; ctrl+c asks to confirm, and a second ctrl+c quits at once
 ```
 
 The run detail view has **two focusable panes**: the crew rail (one lane per
@@ -418,18 +591,19 @@ focused pane — moving the agent selection when the rail is focused, scrolling
 the transcript when it is. A run opens focused on the crew rail.
 
 The transcript **follows live** (tail -f): while a run is producing output the
-transcript auto-tails the newest frame and shows a `● FOLLOWING` badge.
-Scrolling up detaches it — the badge becomes `⏸ PAUSED ↓N new` (N is how many
+transcript auto-tails the newest frame and shows a `⇣ following` badge.
+Scrolling up detaches it — the badge becomes `⏸ N new · g ⇣` (N is how many
 lines are below the fold) and the view holds still so you can read — and `g`
 (or scrolling back to the bottom) re-attaches and jumps to the newest output.
 Only a live run follows; a finished run's transcript is static.
 
-Note what isn't here: there's no `[a]`-for-approve and no bare `[q]`-quits —
-early drafts of this feature used both, but `[a]` doubling as admin-toggle
+Note what isn't here: there's no `[a]`-for-approve —
+early drafts of this feature used it, but `[a]` doubling as admin-toggle
 *and* approve would put "approve a plan" one keystroke from `[x]` cancel on
 a live run, so approve/reject moved to `y`/`n` and `a` stayed admin-only.
-Quitting always asks first (`q` or `ctrl+c`); a second `ctrl+c` is the
-escape hatch when the confirm prompt itself is what's stuck.
+`[q]` quits immediately; `ctrl+c` asks first (so a stray `ctrl+c` can't drop a
+watched run), and a second `ctrl+c` is the escape hatch when the confirm
+prompt itself is what's stuck.
 
 **A run parked on a clarifying question (`awaiting_input`) has no in-TUI
 composer** — it renders the same "blocked on a human" waiting treatment a
@@ -486,6 +660,8 @@ uzi review dismiss <run-id> <rec-id> --reason wont-do        # valid, not worth 
 uzi review dismiss <run-id> <rec-id> --reason not-an-issue   # false positive
 uzi review undo <run-id> <rec-id>                            # clear a disposition
 uzi review stats [--json]                                    # your triage tally, across all runs
+uzi review file <run-id> <rec-id>                            # file this recommendation as a forge issue
+uzi review file <run-id> <rec-id> --repo <repo-id>           # file against a specific repo (ambiguous default)
 ```
 
 `show` is one run. `backlog` is every recommendation across **all** your runs,
@@ -551,8 +727,20 @@ Three things to know before acting on a group action's output:
 
 Passing only one of `--category`/`--target` is a usage error (exit 2). An empty
 half is a literal empty string, not a wildcard, so sending it would report a
-successful no-op. Filing an issue from a recommendation stays a web action:
-there is no `file` verb.
+successful no-op.
+
+`uzi review file <run-id> <rec-id>` files one recommendation as a real forge
+issue on **your own** connection. Title and description are server-templated
+defaults from the same draft the web filing UI shows — the CLI files the
+defaults; editing the draft before filing stays a web action. A successful
+file records the issue under the review's `filed_issues` and moves the
+recommendation to the `filed` bucket. `--repo <repo-id>` overrides the draft's
+default repo; when the default is ambiguous and no `--repo` is given, the CLI
+prints the server's picker note and exits with a usage error (exit 2) rather
+than guessing. Exit 5 if the recommendation is already filed or mid-filing,
+exit 4 if the run or recommendation is unknown or not yours. There is no
+group form — filing is one issue per recommendation, matching the web; only
+`resolve`/`dismiss` have a `--category`/`--target` group shape.
 
 `<rec-id>` is the short, git-style id `show` prints as the first column of
 each recommendation (or the full UUID from `--json`); an unambiguous prefix
@@ -799,23 +987,49 @@ every subagent).
 
 A run's PRD-completion declaration is readable the same way:
 `uzi run get <id> --field prd_done_path` (the repo-relative path the run
-declared it moved a completed PRD to, e.g. `prds/done/72-x.md`) and
+declared it moved a completed PRD to, e.g. `prds/done/72-x.md`) and <!-- check-docs:ignore-path: didactic example path, not a real PRD -->
 `uzi run get <id> --field prd_patch_settled_at` (an RFC3339 timestamp once
 the PRD-link patch lifecycle has settled, an empty line while still
 pending). Both are emit-only-when-set on the human view too — `run get`
 prints them as `PRD_MOVE` and `PRD_PATCH_SETTLED_AT` rows only when the run
 has declared a move — and appear the same way under `--json`.
 
+`run get` also prints the [run summaries](./run-summaries.md), when they've
+landed: an `INTENT` row (what the run will implement), a `PLAN SUMMARY` row
+(what the proposed or approved plan will do), and one `DELTA` row per way
+the plan diverged from the original ask. All three are emit-only-when-set —
+a pre-feature run or one still queued prints none of them, and a seeded run
+(one that skipped planning) prints its `INTENT` row but no `PLAN SUMMARY` or
+`DELTA` rows. The scalar two are readable individually with
+`--field summary_intent` / `--field summary_plan`; `summary_deltas` is an
+array, so read it with `--json` instead.
+
+`run get` also prints a run's inferred/hinted scheduling requirements (see
+[Capability-aware scheduling](./capability-scheduling.md)), emit-only-when-set
+like the rows above — a run predating the feature, or one whose plan-time
+inference produced nothing, carries none of them: a `REQUIRED_CAPABILITIES`
+row (the hard, closed-vocabulary set — today `docker`/`jvm` — a subset of
+which the run's worker must have to claim and to clear the plan-approval
+gate), a `REQUIRED_TOOLS` row (provisionable toolchains that will simply be
+installed at run time, never a blocker), and a `SIZE_CLASS` row (`s`/`m`/`l`,
+advisory only). All three are comma-joined where the value is a list, and
+readable the same way under `--json`.
+
 ### Run status, and what `--follow` waits for
 
-A run's `status` (on `run get` and `run list`) is one of exactly **nine** values:
+A run's `status` (on `run get` and `run list`) is one of exactly **ten** values:
 `queued`, `claimed`, `running`, `awaiting_approval`, `awaiting_input`,
-`limit_wait`, `completed`, `failed`, `cancelled`. Only the last three are
-**terminal**, and `uzi run logs --follow` returns **only** on those three. The
-three non-terminal parks it will *not* stop at:
+`awaiting_followup`, `limit_wait`, `completed`, `failed`, `cancelled`. Only the
+last three are **terminal**, and `uzi run logs --follow` returns **only** on
+those three. The four non-terminal parks it will *not* stop at:
 
 - `awaiting_approval` — the plan gate;
 - `awaiting_input` — a clarifying question, answered with `run answer`;
+- `awaiting_followup` — an interactive task (`uzi handoff --interactive`)
+  parked after a clean `signal_done`, awaiting your next `run follow-up`; it
+  does **not** auto-resume on its own — wind it down explicitly with `run
+  stop`, or let its worker-side idle timeout finalize it — see [Interactive
+  mode](./handoff.md#interactive-mode);
 - `limit_wait` — parked while an Anthropic usage limit resets, promoted back to
   `queued` once past its `retry_not_before`.
 
@@ -830,7 +1044,7 @@ A `running` run whose agent is still drafting its plan, pre-approval, reads
 **planning** instead — in the STATUS column of `run list`/`run get`, in the
 TUI board and detail header's status chip, and on `admin runs` — so you can
 tell "still proposing work" apart from "actively implementing" at a glance.
-It's still the same `running` value underneath, not a tenth status.
+It's still the same `running` value underneath, not an eleventh status.
 
 ### Waiting for a state: `uzi run wait`
 
@@ -838,9 +1052,10 @@ It's still the same `running` value underneath, not a tenth status.
 built-in primitive for driving a gated run headless, replacing the hand-rolled
 `while … run get … sleep` poll loop. With no `--until` it stops on any
 **actionable or terminal** state (`awaiting_approval`, `awaiting_input`,
-`completed`, `failed`, `cancelled`) and waits through the rest
-(`queued`/`claimed`/`running`/`limit_wait`), so a bare `run wait` means "wait for
-the plan gate **or** the end".
+`awaiting_followup`, `completed`, `failed`, `cancelled`) and waits through the
+rest (`queued`/`claimed`/`running`/`limit_wait`), so a bare `run wait` means
+"wait for the plan gate, a clarification, an interactive task's park, **or**
+the end".
 
 - It **exits 0** the moment a target state is reached — including if the run is
   already in one when you call it.
@@ -852,7 +1067,7 @@ the plan gate **or** the end".
   gate, so a bare wait cannot hang.
 - A single transient `6` (a server blip) is retried, not fatal; a `4` (not
   found) is immediate.
-- `--until <a,b>` overrides the stop set, validated against the nine statuses.
+- `--until <a,b>` overrides the stop set, validated against the ten statuses.
 
 **Narrow the wait after approving.** A run lingers at `awaiting_approval` for a
 beat after a successful `run approve` (the async flip to `running`), so the
@@ -919,6 +1134,58 @@ neither.
 `$XDG_CONFIG_HOME` — deliberately: on at least one machine on this team that
 variable points into a git-tracked, synced directory, and honouring it would
 write a live token into version control.
+
+### Named contexts
+
+Both files hold a **map** of contexts, not a single slot — `config.toml` has
+`[contexts.<name>]` (a URL) and `credentials.toml` has `[contexts.<name>]` (a
+token), keyed by the same names. This is what lets the CLI hold several
+credentials at once — say a `uzc_` owner token under `default` and a `uza_`
+admin-read token under a second context named `admin` — instead of forcing you
+to overwrite one with `uzi auth token` or juggle a `UZI_TOKEN=…` override per
+invocation.
+
+**Which context is active**, in order: the `--context`/`-c <name>` flag, then
+`$UZI_CONTEXT`, then the sticky current context (set by `uzi context use`),
+then `"default"`. An empty `--context`/`$UZI_CONTEXT` counts as unset. Only
+after that is resolved do the per-invocation overrides from
+[Authenticate](#3-authenticate) layer on top — `$UZI_TOKEN` still overrides
+whatever token the context resolved to, and `$UZI_URL`/`--url` still override
+the URL — so a headless job using plain `UZI_URL`+`UZI_TOKEN` behaves exactly
+as before, whether or not contexts exist.
+
+```
+uzi context list                       # every stored context, its URL, token stored?, current
+uzi context current                    # the sticky current context (or "default")
+uzi context use <name>                 # set the sticky current context
+uzi context set <name> --url <url>     # create/update a URL-only context
+uzi context rm <name>                  # remove a context; resets current to "default" if it was current
+```
+
+`uzi auth token --context <name>` and `uzi login --context <name>` store the
+credential under that context (an unknown name is **created** here — that's
+the only way a context comes into being besides `context set`). `uzi auth
+status --all` lists every stored context; a plain `uzi auth status` reports
+just the active one. `uzi logout` removes only the active context's token,
+leaving its URL in place.
+
+**URL inheritance.** A context with no URL of its own inherits the `default`
+context's URL (never its token), so the common case — two tokens against one
+server — needs the URL stored just once, on `default`. **Multi-server
+caution**: that inheritance is only right when every context talks to the same
+server. A context aimed at a *different* server needs its own URL
+(`uzi context set <name> --url <url>`) — otherwise it would send its token to
+the wrong host.
+
+**Security framing.** A context is pure client-side credential *selection* —
+switching contexts never changes what a token can do. Authority is still the
+token's server-enforced scope (a default `uzc_` token acts as your own user;
+an admin-scoped `uza_` token is what `uzi admin …` needs — see
+[Commands](#commands) above), so choosing the `admin` context above only works
+because that token already carries `admin_ro`; a context never grants
+capability it wasn't already given. The `0600` credentials-file rule and the
+no-token-on-`argv` rule (above) hold for every context — they share the one
+store.
 
 ## When your CLI is older than the server
 

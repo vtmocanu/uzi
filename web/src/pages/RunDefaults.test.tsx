@@ -96,8 +96,8 @@ function mockAuth(user: User, over: Partial<ReturnType<typeof useAuth>> = {}) {
 
 beforeEach(() => {
   mockApi.listSecrets.mockResolvedValue({ secrets: [] });
-  mockApi.getMySettings.mockResolvedValue({ settings: { default_model: null, judge_model: null, theme: null } });
-  mockApi.putMySettings.mockResolvedValue({ settings: { default_model: null, judge_model: null, theme: "mission" } });
+  mockApi.getMySettings.mockResolvedValue({ settings: { default_model: null, judge_model: null, summary_model: null, theme: null } });
+  mockApi.putMySettings.mockResolvedValue({ settings: { default_model: null, judge_model: null, summary_model: null, theme: "mission" } });
   mockApi.getMySlack.mockResolvedValue({
     slack: { member_id: null, notify: true, resolved_id: null, confirmed: false, state: "unlinked", workspace: "connected" },
   });
@@ -257,10 +257,10 @@ describe("Run defaults — judge enforced banner + per-user model (PRD #69 M4)",
 
   it("saves the per-user judge model through PUT /me/settings", async () => {
     mockApi.getMySettings.mockResolvedValue({
-      settings: { default_model: null, judge_model: null, theme: null },
+      settings: { default_model: null, judge_model: null, summary_model: null, theme: null },
     });
     mockApi.putMySettings.mockResolvedValue({
-      settings: { default_model: null, judge_model: "haiku", theme: null },
+      settings: { default_model: null, judge_model: "haiku", summary_model: null, theme: null },
     });
     render(
       <MemoryRouter>
@@ -273,6 +273,38 @@ describe("Run defaults — judge enforced banner + per-user model (PRD #69 M4)",
     fireEvent.change(select, { target: { value: "haiku" } });
     fireEvent.click(screen.getByText("Save judge model"));
     await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ judge_model: "haiku" }));
+  });
+});
+
+describe("Run defaults — per-user summary model (PRD #362 M2)", () => {
+  it("renders the Run summaries card with the summary-model picker", async () => {
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    await screen.findByText("Run summaries");
+    expect(screen.getByLabelText("Summary model")).toBeTruthy();
+  });
+
+  it("saves the per-user summary model through PUT /me/settings", async () => {
+    mockApi.getMySettings.mockResolvedValue({
+      settings: { default_model: null, judge_model: null, summary_model: null, theme: null },
+    });
+    mockApi.putMySettings.mockResolvedValue({
+      settings: { default_model: null, judge_model: null, summary_model: "haiku", theme: null },
+    });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    await screen.findByText("Run summaries");
+    // The summary-model picker offers a "haiku" option; selecting it dirties Save.
+    const select = screen.getByLabelText("Summary model") as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "haiku" } });
+    fireEvent.click(screen.getByText("Save summary model"));
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ summary_model: "haiku" }));
   });
 });
 
@@ -397,6 +429,19 @@ describe("Run defaults — usage-limit default (PRD #35 M3)", () => {
 
   it("reflects the current default", () => {
     mockAuth({ ...baseUser, wait_on_limit: true });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    expect(limitToggle().checked).toBe(true);
+  });
+
+  // Issue #520: the shipped column default is ON, so a field-absent response
+  // (the boolean missing from the user object) must render the toggle CHECKED,
+  // matching the DB default rather than assuming OFF.
+  it("assumes the shipped default-on when wait_on_limit is absent", () => {
+    mockAuth({ ...baseUser, wait_on_limit: undefined as unknown as boolean });
     render(
       <MemoryRouter>
         <RunDefaults />

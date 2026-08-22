@@ -77,11 +77,24 @@ type Mover interface {
 	AutoMove(ctx context.Context, f forge.Forge, forgeProjectID int64, issue store.Issue, columns []store.BoardColumn, target string) (store.Issue, error)
 }
 
+// Projector is an OPTIONAL collaborator that projects a uzi-originated column move
+// onto a linked GitHub Projects v2 Status (PRD #364 M5). *forgesvc.ProjectSyncService
+// satisfies it. It is nil unless wired via SetProjector; when nil the lifecycle
+// simply skips the projection. Best-effort: a returned error is logged, never
+// propagated (a failed projection must not fail a run's column move).
+type Projector interface {
+	ForwardMove(ctx context.Context, repoID uuid.UUID, issueIID int64, targetColumn string) error
+}
+
 // Lifecycle is the automation subscriber and reconcile loop.
 type Lifecycle struct {
 	q     Store
 	mover Mover
 	now   func() time.Time
+
+	// projector projects a successful uzi-originated move onto a linked GitHub
+	// Projects v2 Status (PRD #364 M5). Optional; nil skips the projection.
+	projector Projector
 
 	// frontendOrigin is the user-facing origin (config.FrontendOrigin) the
 	// terminal-comment hook builds run links from. Empty omits the link.
@@ -112,6 +125,12 @@ func New(q Store, mover Mover, frontendOrigin string) *Lifecycle {
 		batch:          defaultBatch,
 	}
 }
+
+// SetProjector wires the optional GitHub Projects v2 projector in after
+// construction (built in main alongside the other forge collaborators), mirroring
+// the repo's optional-collaborator pattern. Safe to leave unset — the lifecycle
+// then performs no Status projection.
+func (l *Lifecycle) SetProjector(p Projector) { l.projector = p }
 
 // moveContext is the run + connection facts one move needs, sourced identically
 // by the notifier (GetRunMoveContext) and the reconciler (re-read per run).
@@ -170,7 +189,13 @@ func reconcilerDecision(status string, origin pgtype.Text) decision {
 	//
 	// awaiting_input (PRD #88) is here for exactly the same reasons, and a
 	// clarification park outlasts 30 minutes just as routinely.
-	case "queued", "claimed", "running", "awaiting_approval", "awaiting_input", "limit_wait":
+	//
+	// awaiting_followup (PRD #517) is the interactive-task park and belongs here for
+	// the same reasons: a run parked after signal_done still holds its issue, session
+	// and branch, resumes on its own follow-up, and routinely idles past 30 minutes —
+	// so the default {act:false} arm would leave its pending move marker UNHEALED and
+	// trip the give-up warn as the normal case.
+	case "queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "limit_wait":
 		return decision{act: true, target: board.ColumnInProgress}
 	case "completed":
 		return decision{act: true, target: board.ColumnHumanReview}
@@ -343,6 +368,15 @@ func (l *Lifecycle) apply(ctx context.Context, runID uuid.UUID, mc moveContext, 
 		ID:          runID,
 	}); err != nil {
 		slog.Warn("run lifecycle: record column move", "run", runID, "error", err)
+	}
+
+	// Project the move onto a linked GitHub Projects v2 Status (PRD #364 M5),
+	// best-effort. Hooked here (a uzi-originated move) rather than inside AutoMove,
+	// which the reverse poller also calls. A projection error never fails the move.
+	if l.projector != nil {
+		if err := l.projector.ForwardMove(ctx, mc.repoID, mc.issueIID, dec.target); err != nil {
+			slog.Warn("run lifecycle: forward project sync", "run", runID, "repo", mc.repoID, "issue", mc.issueIID, "error", err)
+		}
 	}
 }
 

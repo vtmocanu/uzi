@@ -115,6 +115,12 @@ const GIT_CODE_EXEC_KEY_PINS: ReadonlyArray<readonly [key: string, value: string
 
 const GIT_TIMEOUT_MS = 10 * 60_000; // 10m — clones can be large on cold caches.
 
+// PRD #400 M4b — byte cap on the review diff a ReviewRunner feeds the reviewer model.
+// A huge diff must not blow the model's context window or the worker's memory, so the
+// diff is truncated at this size with a marker. 512 KiB is generous for a task-run diff
+// while staying an order of magnitude under runGit's 64 MiB maxBuffer.
+const REVIEW_DIFF_MAX_BYTES = 512 * 1024;
+
 // PRD #51 M3 — (b) separate-runner-clone: the worker-side tracking-ref namespace the
 // worker's fetch-back writes the agent branch into. Deliberately NOT refs/heads/* (B2
 // invariant 2: the runner's branch is admitted only into a demarcated worker-side
@@ -784,6 +790,284 @@ export class GitCache {
     }
   }
 
+  /**
+   * The unified diff of the reviewed `branch` against `base` (three-dot: the changes on
+   * `branch` since it diverged from `base`), for a PRD #400 M4b diff-review run. Both refs
+   * are resolved as the bare's remote-tracking refs (`refs/remotes/origin/<name>`, which
+   * every fetch updates — the same namespace `changedFiles` reads), so the caller must have
+   * fetched the bare (ensureClone) first; the reviewed task branch and its base are both
+   * pushed to origin (M2), so both exist there.
+   *
+   * The result is CAPPED at REVIEW_DIFF_MAX_BYTES with a truncation marker: a pathological
+   * diff must not blow the reviewer model's context or the worker's memory. `--no-color`
+   * keeps the text plain for the model, and `--no-ext-diff` is LOAD-BEARING: gitEnv pins
+   * `diff.external=true` (a code-exec-key neutralization), so a plain `git diff` would run
+   * that no-op external driver and emit NOTHING — `changedFiles` sidesteps it with
+   * `--name-only`; a real patch must disable it explicitly.
+   */
+  async reviewDiff(barePath: string, base: string, branch: string): Promise<string> {
+    const baseRef = `refs/remotes/origin/${base}`;
+    const branchRef = `refs/remotes/origin/${branch}`;
+    const out = await this.runGit(barePath, ["diff", "--no-color", "--no-ext-diff", `${baseRef}...${branchRef}`]);
+    const buf = Buffer.from(out, "utf8");
+    if (buf.byteLength <= REVIEW_DIFF_MAX_BYTES) return out;
+    const marker = `\n… diff truncated at ${REVIEW_DIFF_MAX_BYTES} bytes (${buf.byteLength} total) …\n`;
+    // Slice on a byte boundary so a giant diff cannot balloon the string we keep. A cut
+    // through a multi-byte rune yields at most one U+FFFD; harmless for review text.
+    return buf.subarray(0, REVIEW_DIFF_MAX_BYTES).toString("utf8") + marker;
+  }
+
+  /**
+   * PRD #377 M1 — the full unified diff of the agent branch (`trackingRef`) against the
+   * default-branch base, preserved on a `failed` report when a GitHub run's branch touches
+   * `.github/workflows/**` and the bot's repo-only PAT cannot push it. Mirrors
+   * `changedFiles`'s base resolution (`defaultBranchRef`, three-dot) but emits a REAL patch
+   * instead of a name list.
+   *
+   * `--no-ext-diff` is LOAD-BEARING for the same reason it is in `reviewDiff`: gitEnv pins
+   * `diff.external=true` (a code-exec-key neutralization — see GIT_CODE_EXEC_KEY_PINS), so a
+   * plain `git diff` runs that no-op external driver and emits NOTHING; a real patch must
+   * disable it explicitly. `changedFiles` sidesteps it via `--name-only`. `--no-color` keeps
+   * the text plain.
+   *
+   * The result is CAPPED at REVIEW_DIFF_MAX_BYTES with a truncation marker, sliced on a byte
+   * boundary (a cut through a multi-byte rune yields at most one U+FFFD). It is secret-scrubbed
+   * by the CALLER (redactText) before it leaves the worker — this method does not scrub. Returns
+   * `null` on ANY failure (try/catch), so the caller can still report the failed outcome without
+   * a patch rather than turning a diff-computation error into a second failure.
+   */
+  async workflowScopeDiff(barePath: string, trackingRef: string): Promise<string | null> {
+    try {
+      const baseRef = await this.defaultBranchRef(barePath);
+      const out = await this.runGit(barePath, [
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        `${baseRef}...${trackingRef}`,
+      ]);
+      const buf = Buffer.from(out, "utf8");
+      if (buf.byteLength <= REVIEW_DIFF_MAX_BYTES) return out;
+      const marker = `\n… diff truncated at ${REVIEW_DIFF_MAX_BYTES} bytes (${buf.byteLength} total) …\n`;
+      return buf.subarray(0, REVIEW_DIFF_MAX_BYTES).toString("utf8") + marker;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * PRD #456 M1 — fetch the CURRENT default-branch tip from origin into the worker bare
+   * and return its SHA. This is a WORKER-uid AUTHENTICATED op (mirrors `fetch` at the top
+   * of this class): the worker owns the bare and holds the PAT, and the agent never has a
+   * push/fetch credential, so this cannot run runner-uid.
+   *
+   * Why a fresh fetch at all: the finalize `fetchAgentBranch` is a LOCAL `file://` fetch,
+   * and the last origin contact was at claim time (`ensureClone`), so
+   * `refs/remotes/origin/<default>` in the bare still holds the CLAIM-TIME tip. The align
+   * target must be main's tip AS IT IS NOW (main may have advanced its `.github/workflows/**`
+   * since the clone base), so we re-fetch it here, immediately before the align.
+   *
+   * The returned SHA is the align TARGET and is the FRESHLY-FETCHED tip — NEVER
+   * `defaultBranchRef`'s frozen-mirror fallback rungs (N2): those can resolve to a stale
+   * `refs/heads/main` mirror fixed at first clone, which is exactly what this method exists
+   * to bypass. We read `refs/remotes/origin/<default>` (which this fetch just updated),
+   * falling back to `FETCH_HEAD`, and validate a 40-hex OID before returning.
+   */
+  async fetchDefaultTip(
+    barePath: string,
+    defaultBranch: string,
+    pat?: string,
+    cloneUrl?: string,
+    username?: string,
+  ): Promise<string> {
+    const scope = cloneUrl ? httpScopeForUrl(cloneUrl) : undefined;
+    return this.withLock(barePath, async () => {
+      await this.runGit(barePath, ["fetch", "origin", defaultBranch], pat, scope, username);
+      // The configured refspec (+refs/heads/*:refs/remotes/origin/*) means a named-branch
+      // fetch updates the remote-tracking ref; read the fresh tip off it.
+      let sha = (
+        await this.runGit(barePath, [
+          "rev-parse",
+          "--verify",
+          `refs/remotes/origin/${defaultBranch}^{commit}`,
+        ]).catch(() => "")
+      ).trim();
+      if (!/^[0-9a-f]{40}$/.test(sha)) {
+        // Fallback: some server/refspec shapes leave only FETCH_HEAD current.
+        sha = (
+          await this.runGit(barePath, ["rev-parse", "--verify", "FETCH_HEAD^{commit}"]).catch(
+            () => "",
+          )
+        ).trim();
+      }
+      if (!/^[0-9a-f]{40}$/.test(sha)) {
+        throw new Error(
+          `fetchDefaultTip: could not resolve a 40-hex tip for origin/${defaultBranch}`,
+        );
+      }
+      return sha;
+    });
+  }
+
+  /**
+   * PRD #456 M1 (D1) — true iff the branch tip's `.github/workflows/` tree DIFFERS from the
+   * freshly-fetched default tip. This is the precise trigger for the finalize align: only a
+   * behind-on-workflows branch (main moved those files after the clone base, or vice versa)
+   * needs realigning, and this keeps the align/conflict surface minimal.
+   *
+   * WORKER-uid, bare-only. A TWO-dot direct tree compare (`trackingRef` vs `defaultTip`), NOT
+   * three-dot — we want "do these two trees' workflow files differ right now", not "what did
+   * the branch change since a merge base". `--name-only` correctly sidesteps the pinned
+   * `diff.external` code-exec neutralizer (see GIT_CODE_EXEC_KEY_PINS / `changedFiles`), so no
+   * `--no-ext-diff` is needed. On ANY error this returns false (FAIL-OPEN to the normal push):
+   * a run must never be blocked on an inability to compute this.
+   */
+  async workflowTreeDiffers(
+    barePath: string,
+    trackingRef: string,
+    defaultTip: string,
+  ): Promise<boolean> {
+    try {
+      const out = await this.runGit(barePath, [
+        "diff",
+        "--name-only",
+        trackingRef,
+        defaultTip,
+        "--",
+        ".github/workflows/",
+      ]);
+      return out.trim() !== "";
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * PRD #456 M1 (B3) — align the run's branch with the fresh default IN THE RUNNER CLONE,
+   * never the worker bare. The clone is the ONLY working tree at finalize, and it is
+   * RUNNER-owned, so every git op here runs runner-uid (`runGitAsRunner`) — a worker-uid op
+   * in the runner clone would hit the B2 dubious-ownership boundary.
+   *
+   * `baseTip` is the agent's own committed tip BEFORE any align (captured by the caller from
+   * `branchTip`). We reset the clone's branch to it before each strategy so (a) leftover
+   * UNCOMMITTED artifacts cannot block the op, and (b) a rebase FALLBACK after a clean merge
+   * replays the ORIGINAL agent commits rather than the merge commit the merge left on
+   * `refs/heads/<branch>`. The committed work is never lost — it lives in the commit object;
+   * we only move the branch ref back to it. (This `baseTip` parameter is a small, deliberate
+   * deviation from the spec's 4-arg signature; without it a merge→rebase fallback would rebase
+   * the merge commit and the S3 commit-count assertion would spuriously fire.)
+   *
+   * `defaultTip`'s objects are reachable in the clone via its `--shared` alternate (the worker
+   * bare received them in `fetchDefaultTip`), so we anchor them under a fixed LOCAL ref via
+   * `update-ref` (no `file://` fetch, no PAT, no protocol.file.allow concern) and merge/rebase
+   * against that ref, deleting it in a `finally`.
+   *
+   * `git clean -fd`, NOT `-fdx`: `-x` also deletes IGNORED files (node_modules, build outputs,
+   * a local .env), which are not part of the committed work and may be needed / expensive to
+   * recreate; removing untracked-but-tracked-eligible files (`-fd`) is enough to unblock a
+   * merge/rebase, which only refuses when an UNtracked file would be overwritten.
+   *
+   * Returns `"aligned"` on a clean result. On a genuine CONFLICT it runs the matching abort
+   * and returns `"conflict"`; an unrelated (non-conflict) git failure is RETHROWN. For a
+   * rebase it uses `--empty=keep --no-autosquash` and asserts the branch's own commit count is
+   * preserved across the replay (S3) — a silent drop throws rather than pushing truncated work.
+   */
+  async alignBranchWithDefault(
+    clonePath: string,
+    branch: string,
+    baseTip: string,
+    defaultTip: string,
+    strategy: "merge" | "rebase",
+  ): Promise<"aligned" | "conflict"> {
+    const targetRef = "refs/uzi-align/target";
+    try {
+      // Anchor the fresh default under a local ref (objects reachable via the --shared
+      // alternate). Not under refs/heads/* so it never pollutes the branch namespace.
+      await this.runGitAsRunner(clonePath, ["update-ref", targetRef, defaultTip]);
+      // Rewind to the pre-align committed agent tip: clears uncommitted scratch AND undoes a
+      // prior merge's commit so each strategy starts from the original agent work.
+      await this.runGitAsRunner(clonePath, ["checkout", "--force", branch]);
+      await this.runGitAsRunner(clonePath, ["reset", "--hard", baseTip]);
+      await this.runGitAsRunner(clonePath, ["clean", "-fd"]);
+
+      if (strategy === "merge") {
+        try {
+          await this.runGitAsRunner(clonePath, ["merge", "--no-edit", targetRef]);
+          return "aligned";
+        } catch (err) {
+          if (await this.inMerge(clonePath)) {
+            await this.runGitAsRunner(clonePath, ["merge", "--abort"]).catch(() => undefined);
+            return "conflict";
+          }
+          throw err; // a non-conflict git failure — not ours to swallow.
+        }
+      }
+
+      // rebase: count the branch's own commits (ahead of the target) before and after so a
+      // silently dropped commit is caught (S3). `--reapply-cherry-picks` re-applies commits
+      // whose change already landed on the target (git drops these by default), so a branch
+      // whose work overlaps main's new commits keeps ITS commits and the count stays honest —
+      // otherwise the S3 count guard would false-trip on safe, landable work.
+      const before = await this.countAhead(clonePath, defaultTip, branch);
+      try {
+        await this.runGitAsRunner(clonePath, [
+          "rebase",
+          "--empty=keep",
+          "--no-autosquash",
+          "--reapply-cherry-picks",
+          targetRef,
+        ]);
+      } catch (err) {
+        if (await this.inRebase(clonePath)) {
+          await this.runGitAsRunner(clonePath, ["rebase", "--abort"]).catch(() => undefined);
+          return "conflict";
+        }
+        throw err; // a non-conflict git failure — rethrow.
+      }
+      const after = await this.countAhead(clonePath, defaultTip, branch);
+      if (after < before) {
+        throw new Error(
+          `alignBranchWithDefault: rebase dropped commits (${before} → ${after}) — refusing to push truncated work`,
+        );
+      }
+      return "aligned";
+    } finally {
+      await this.runGitAsRunner(clonePath, ["update-ref", "-d", targetRef]).catch(
+        () => undefined,
+      );
+    }
+  }
+
+  /** True while a merge is in progress in `clonePath` (a conflict left it mid-merge).
+   *  Checked via the on-disk `.git/MERGE_HEAD` marker rather than a git command so it is
+   *  uid-independent (the clone is runner-owned) and cannot be confused by a non-conflict
+   *  git failure. The runner clone's `.git` is a real directory (a `clone --shared`). */
+  private async inMerge(clonePath: string): Promise<boolean> {
+    return pathExists(path.join(clonePath, ".git", "MERGE_HEAD"));
+  }
+
+  /** True while a rebase is in progress in `clonePath` (a conflict paused the replay).
+   *  Either backend leaves its state dir behind: `rebase-merge` (the default merge backend)
+   *  or `rebase-apply` (the am backend). Marker-file check for the same reasons as inMerge. */
+  private async inRebase(clonePath: string): Promise<boolean> {
+    return (
+      (await pathExists(path.join(clonePath, ".git", "rebase-merge"))) ||
+      (await pathExists(path.join(clonePath, ".git", "rebase-apply")))
+    );
+  }
+
+  /** Count of commits reachable from `tip` but not from `base`, runner-uid in the clone.
+   *  Any failure answers 0 — the caller only compares before-vs-after, and a symmetric
+   *  failure (0 == 0) simply skips the assertion rather than false-failing a good rebase. */
+  private async countAhead(clonePath: string, base: string, tip: string): Promise<number> {
+    const out = await this.runGitAsRunner(clonePath, [
+      "rev-list",
+      "--count",
+      `${base}..${tip}`,
+    ]).catch(() => "0");
+    const n = Number.parseInt(out.trim(), 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  }
+
   private async cloneBare(repoUrl: string, dest: string, pat?: string, scope?: string, username?: string): Promise<void> {
     try {
       await this.runGit(undefined, ["clone", "--bare", repoUrl, dest], pat, scope, username);
@@ -1125,6 +1409,40 @@ export function gitBasicCredential(pat: string, username?: string): string {
  * Returns undefined for a hostless URL (local path / scp-style), where http.*
  * config does not apply.
  */
+/**
+ * PRD #456 M1 — true when a push error is GitHub's workflow-scope rejection: the bot's
+ * repo-only PAT is refused when the pushed tip's `.github/workflows/**` tree differs from
+ * the default branch. Matches the stable phrase `workflow scope` (case-insensitive), which
+ * appears in both `without workflow scope` and the full `refusing to allow a Personal Access
+ * Token to create or update workflow .github/workflows/<f> without workflow scope`. Used to
+ * decide whether a merge-aligned push that STILL failed warrants the rebase fallback (a
+ * genuine workflow-scope reject) versus an unrelated push failure (which rethrows).
+ */
+export function isWorkflowScopeRejection(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return msg.includes("workflow scope");
+}
+
+/**
+ * PRD #456 NB2 — true when a push error is a non-fast-forward rejection: the remote
+ * refused a non-forced push because the pushed tip is not a descendant of the branch's
+ * already-published tip. This is the resumed / rewritten-history case: when the finalize
+ * base-align rebase fallback rewinds to the original agent tip and replays the commits,
+ * it rewrites SHAs that were already published at origin (a resume, or the `self_improve`
+ * fixed branch), so the subsequent non-forced push cannot fast-forward. Force-push is
+ * denied by the guardrails by design, so the correct outcome is the typed
+ * base-align-conflict preserve path (preserved_patch + `finalize_base_align_conflict`),
+ * not a push retry — routing here keeps it off the generic catch (raw error, defaulted
+ * `fail_origin`, no preserved diff). Matches the stable git phrases `non-fast-forward` and
+ * `fetch first` (case-insensitive), the same phrases forge-retry treats as permanent
+ * push-failure patterns; deliberately does NOT match the bare `[rejected]` token, which is
+ * too broad.
+ */
+export function isNonFastForwardRejection(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return msg.includes("non-fast-forward") || msg.includes("fetch first");
+}
+
 export function httpScopeForUrl(rawUrl: string): string | undefined {
   try {
     const u = new URL(rawUrl);

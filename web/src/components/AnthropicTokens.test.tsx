@@ -5,6 +5,7 @@
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
+import { MemoryRouter } from "react-router-dom";
 import { AnthropicTokens } from "./AnthropicTokens";
 import { api, type SecretMeta, type Worker } from "../lib/api";
 
@@ -63,17 +64,19 @@ const baseWorker = {
 
 function renderList(secrets: SecretMeta[], reload = noop, judgeSecretId: string | null = null) {
   return render(
-    <AnthropicTokens
-      secrets={secrets}
-      loading={false}
-      busy={false}
-      reload={reload}
-      onError={() => {}}
-      onNotice={() => {}}
-      judgeSecretId={judgeSecretId}
-      sidebarTokenIds={[]}
-      onToggleSidebarToken={async () => {}}
-    />,
+    <MemoryRouter>
+      <AnthropicTokens
+        secrets={secrets}
+        loading={false}
+        busy={false}
+        reload={reload}
+        onError={() => {}}
+        onNotice={() => {}}
+        judgeSecretId={judgeSecretId}
+        sidebarTokenIds={[]}
+        onToggleSidebarToken={async () => {}}
+      />
+    </MemoryRouter>,
   );
 }
 
@@ -88,6 +91,16 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   vi.restoreAllMocks();
+});
+
+describe("AnthropicTokens — always-visible anthropic-token guide link (PRD #57 M2)", () => {
+  it("renders the in-app how-to-obtain-a-token link and drops the old external blob URL", () => {
+    const { container } = renderList([secret()]);
+    const docLink = screen.getByRole("link", { name: "How to obtain a token" });
+    expect(docLink.getAttribute("href")).toBe("/docs/anthropic-token");
+    // The old GitHub blob docs URL must be gone.
+    expect(container.innerHTML).not.toMatch(/github\.com\/vtmocanu\/uzi\/blob/);
+  });
 });
 
 describe("AnthropicTokens", () => {
@@ -264,32 +277,36 @@ describe("AnthropicTokens", () => {
   it("never names the first token from a field the user cannot see", async () => {
     mockApi.createAnthropicToken.mockResolvedValue({ secret: secret() });
     const { rerender } = render(
-      <AnthropicTokens
-        secrets={[secret()]}
-        loading={false}
-        busy={false}
-        reload={noop}
-        onError={() => {}}
-        onNotice={() => {}}
-        judgeSecretId={null}
-        sidebarTokenIds={[]}
-        onToggleSidebarToken={async () => {}}
-      />,
+      <MemoryRouter>
+        <AnthropicTokens
+          secrets={[secret()]}
+          loading={false}
+          busy={false}
+          reload={noop}
+          onError={() => {}}
+          onNotice={() => {}}
+          judgeSecretId={null}
+          sidebarTokenIds={[]}
+          onToggleSidebarToken={async () => {}}
+        />
+      </MemoryRouter>,
     );
     fireEvent.change(screen.getByLabelText("Token name"), { target: { value: "staging-key" } });
     // Every token goes away — the card collapses and the Name field unmounts.
     rerender(
-      <AnthropicTokens
-        secrets={[]}
-        loading={false}
-        busy={false}
-        reload={noop}
-        onError={() => {}}
-        onNotice={() => {}}
-        judgeSecretId={null}
-        sidebarTokenIds={[]}
-        onToggleSidebarToken={async () => {}}
-      />,
+      <MemoryRouter>
+        <AnthropicTokens
+          secrets={[]}
+          loading={false}
+          busy={false}
+          reload={noop}
+          onError={() => {}}
+          onNotice={() => {}}
+          judgeSecretId={null}
+          sidebarTokenIds={[]}
+          onToggleSidebarToken={async () => {}}
+        />
+      </MemoryRouter>,
     );
     expect(screen.queryByLabelText("Token name")).toBeNull();
     fireEvent.change(screen.getByPlaceholderText("Paste your Anthropic token"), {
@@ -304,33 +321,37 @@ describe("AnthropicTokens", () => {
   // web-ux D1's other half: the pasted VALUE must not survive the collapse either.
   it("clears a half-typed token value when the card changes mode", () => {
     const { rerender } = render(
-      <AnthropicTokens
-        secrets={[secret()]}
-        loading={false}
-        busy={false}
-        reload={noop}
-        onError={() => {}}
-        onNotice={() => {}}
-        judgeSecretId={null}
-        sidebarTokenIds={[]}
-        onToggleSidebarToken={async () => {}}
-      />,
+      <MemoryRouter>
+        <AnthropicTokens
+          secrets={[secret()]}
+          loading={false}
+          busy={false}
+          reload={noop}
+          onError={() => {}}
+          onNotice={() => {}}
+          judgeSecretId={null}
+          sidebarTokenIds={[]}
+          onToggleSidebarToken={async () => {}}
+        />
+      </MemoryRouter>,
     );
     fireEvent.change(screen.getByPlaceholderText("Paste your Anthropic token"), {
       target: { value: "sk-ant-half-typed" },
     });
     rerender(
-      <AnthropicTokens
-        secrets={[]}
-        loading={false}
-        busy={false}
-        reload={noop}
-        onError={() => {}}
-        onNotice={() => {}}
-        judgeSecretId={null}
-        sidebarTokenIds={[]}
-        onToggleSidebarToken={async () => {}}
-      />,
+      <MemoryRouter>
+        <AnthropicTokens
+          secrets={[]}
+          loading={false}
+          busy={false}
+          reload={noop}
+          onError={() => {}}
+          onNotice={() => {}}
+          judgeSecretId={null}
+          sidebarTokenIds={[]}
+          onToggleSidebarToken={async () => {}}
+        />
+      </MemoryRouter>,
     );
     expect(
       (screen.getByPlaceholderText("Paste your Anthropic token") as HTMLInputElement).value,

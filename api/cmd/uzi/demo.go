@@ -32,7 +32,7 @@ func runTUIDemo(ctx context.Context, env Env) error {
 // demoModel wraps the shipped tuiModel and adds a live ticker. It forwards every message to
 // the real model (re-wrapping the result), and on each tick injects one synthetic frame into
 // the currently-open LIVE run via the same streamEventsMsg a real socket would deliver — so
-// the transcript grows under the reader and follow-live (● FOLLOWING / ⏸ PAUSED ↓N new) is
+// the transcript grows under the reader and follow-live (⇣ following / ⏸ N new · g ⇣) is
 // actually drivable.
 type demoModel struct {
 	tuiModel
@@ -112,6 +112,28 @@ func newDemoClient() *uzicli.FakeClient {
 	}
 	return &uzicli.FakeClient{
 		Runs: runs, RunByID: byID, LogsByID: logs, InputsByID: inputs,
+		// Two Anthropic tokens so the own board clears the >1-token gate (PRD #295) and shows
+		// the credential column; the demo runs above carry meta/personal labels + reasons.
+		Secrets: []apitypes.SecretDTO{
+			{ID: "sec-personal", Kind: "anthropic", Label: "personal", IsDefault: true},
+			{ID: "sec-meta", Kind: "anthropic", Label: "meta"},
+		},
+		// The viewer's own per-token meters drive the factory-floor rate-limit strip (PRD #519
+		// F2), mirroring the web sidebar's selection. The default token always shows; the
+		// non-default "meta" shows because it is listed in SidebarTokenIds below; "unlisted" is
+		// readable but NOT shown (default:false and absent from the list), and "throttled" is
+		// dropped entirely (status != "ok"). Percentages land on each tone band (ok/warn/danger).
+		SelfMeters: []apitypes.TokenRateLimitDTO{
+			{SecretID: "sec-personal", Label: "personal", IsDefault: true, Limits: apitypes.RateLimitDTO{
+				Status: "ok", FiveHour: &apitypes.RateLimitWindow{Pct: 35}, SevenDay: &apitypes.RateLimitWindow{Pct: 62}}},
+			{SecretID: "sec-meta", Label: "meta", Limits: apitypes.RateLimitDTO{
+				Status: "ok", FiveHour: &apitypes.RateLimitWindow{Pct: 88}, SevenDay: &apitypes.RateLimitWindow{Pct: 44}}},
+			{SecretID: "sec-unlisted", Label: "unlisted", Limits: apitypes.RateLimitDTO{
+				Status: "ok", FiveHour: &apitypes.RateLimitWindow{Pct: 12}, SevenDay: &apitypes.RateLimitWindow{Pct: 20}}},
+			{SecretID: "sec-throttled", Label: "throttled", Limits: apitypes.RateLimitDTO{Status: "unavailable"}},
+		},
+		// Only "meta" is promoted into the sidebar selection; "unlisted" stays hidden.
+		Settings: apitypes.UserSettingsDTO{SidebarTokenIds: []string{"sec-meta"}},
 		// StreamEvents nil: NewRunStream emits nothing and stays OPEN (so the detail reads
 		// "live"); the ticker above supplies the live frames.
 		StreamEvents: nil,
@@ -120,21 +142,87 @@ func newDemoClient() *uzicli.FakeClient {
 
 func demoRuns(now time.Time) []apitypes.RunListItemDTO {
 	sp := func(s string) *string { return &s }
+	ip := func(n int64) *int64 { return &n }
 	mk := func(id, kind, status, title, health string, verdict *string, todo int, age time.Duration) apitypes.RunListItemDTO {
-		return apitypes.RunListItemDTO{
+		created := now.Add(-age)
+		r := apitypes.RunListItemDTO{
 			RunDTO: apitypes.RunDTO{ID: id, Kind: kind, Status: status, IssueTitle: title, Health: health,
-				CreatedAt: now.Add(-age)},
+				CreatedAt: created},
 			JudgeVerdict: verdict, JudgeTodoCount: todo,
 		}
+		// Give every mk-built run a start stamp so the detail header shows elapsed WORK time
+		// (`● running · 4m`): runDuration deliberately won't derive it from CreatedAt, which is
+		// queue-wait age, not work time. A terminal run also gets a FinishedAt, so its header
+		// shows a total wall time (`✓ done · 3h`) rather than a still-ticking clock. The
+		// pre-approval planning run below is built inline WITHOUT a start — its honest state, it
+		// has not begun implementing.
+		started := created
+		r.StartedAt = &started
+		if terminalRunStatuses[status] {
+			finished := now
+			r.FinishedAt = &finished
+		}
+		return r
 	}
+	// A milestone-structured run (PRD #122) so `tui --demo` exercises the crew rail's
+	// milestone block: 2 of 4 frozen milestones reported complete, one in progress.
+	scheduler := mk("a1b2c3d4-1111-2222-3333-444444444444", "issue", "running", "Add rate-limit headroom to the scheduler poll", "", nil, 0, 4*time.Minute)
+	scheduler.Milestones = []apitypes.Milestone{
+		{ID: "m1", Title: "Wire the rate-limit headroom into the poll loop"},
+		{ID: "m2", Title: "Clamp the near-cap branch at 10%"},
+		{ID: "m3", Title: "Add the regression sweep"},
+		{ID: "m4", Title: "Update the scheduler docs"},
+	}
+	scheduler.MilestonesCompleted = []string{"m1", "m2"}
+	scheduler.MilestonesInProgress = []string{"m3"}
+	// A realistic spread of credentials. The TUI board and detail show just the muted LABEL
+	// (meta/personal); the select reason/mode is surfaced only by `uzi run <id>`, not the TUI, so
+	// these reasons are realistic data rather than something the demo draws a dot or colour for.
+	// meta on an auto pick with headroom, the common case.
+	headroom := 27
+	scheduler.AnthropicSecretID = sp("sec-meta")
+	scheduler.AnthropicSecretLabel = sp("meta")
+	scheduler.AnthropicSelectReason = sp("auto")
+	scheduler.AnthropicHeadroomPct = &headroom
+	scheduler.IssueIID = ip(418)
+	scheduler.IssueWebURL = sp("https://github.com/vtmocanu/uzi/issues/418")
+
+	// personal on a stale-pool fallback (auto declined, the default paid).
+	sync := mk("c3d4e5f6-1111-2222-3333-444444444444", "issue", "running", "Refactor the forge sync loop for the GitHub driver", "stalled", nil, 0, 51*time.Minute)
+	sync.AnthropicSecretID = sp("sec-personal")
+	sync.AnthropicSecretLabel = sp("personal")
+	sync.AnthropicSelectReason = sp("pool_stale")
+	sync.IssueIID = ip(452)
+	sync.IssueWebURL = sp("https://github.com/vtmocanu/uzi/issues/452")
+
+	// personal on a best-of-pool pick (the pool is nearly exhausted).
+	portJudge := mk("f6a7b8c9-1111-2222-3333-444444444444", "issue", "limit_wait", "Port the judge to per-model usage folding", "", nil, 0, 22*time.Minute)
+	portJudge.AnthropicSecretID = sp("sec-personal")
+	portJudge.AnthropicSecretLabel = sp("personal")
+	portJudge.AnthropicSelectReason = sp("best_of_pool")
+	portJudge.IssueIID = ip(463)
+	portJudge.IssueWebURL = sp("https://github.com/vtmocanu/uzi/issues/463")
+
+	// The completed OIDC-login run and the failed vault run are ISSUE-kind, so they carry a
+	// clickable forge issue id too.
+	oidc := mk("e5f6a7b8-1111-2222-3333-444444444444", "issue", "completed", "Wire the OIDC login button into the header", "", sp("ideal"), 0, 3*time.Hour)
+	oidc.IssueIID = ip(519)
+	oidc.IssueWebURL = sp("https://github.com/vtmocanu/uzi/issues/519")
+	vault := mk("a7b8c9d0-1111-2222-3333-444444444444", "issue", "failed", "Migrate per-user secrets into the vault hierarchy", "", sp("issues"), 3, 5*time.Hour)
+	vault.IssueIID = ip(477)
+	vault.IssueWebURL = sp("https://github.com/vtmocanu/uzi/issues/477")
+
 	return []apitypes.RunListItemDTO{
-		{RunDTO: apitypes.RunDTO{ID: "d0e1f2a3-1111-2222-3333-444444444444", Kind: "issue", Status: "running", IsPlanning: true, IssueTitle: "Draft the plan for webhook delivery retries", CreatedAt: now.Add(-90 * time.Second)}},
-		mk("a1b2c3d4-1111-2222-3333-444444444444", "issue", "running", "Add rate-limit headroom to the scheduler poll", "", nil, 0, 4*time.Minute),
+		// The inline planning run carries an issue id but NO web URL — it exercises the
+		// "id shown but NOT clickable" path.
+		{RunDTO: apitypes.RunDTO{ID: "d0e1f2a3-1111-2222-3333-444444444444", Kind: "issue", Status: "running", IsPlanning: true, IssueTitle: "Draft the plan for webhook delivery retries", CreatedAt: now.Add(-90 * time.Second), IssueIID: ip(488)}},
+		scheduler,
+		// The ci_fix run keeps nil IssueIID/IssueWebURL — the no-issue (`#`-less) path.
 		mk("b2c3d4e5-1111-2222-3333-444444444444", "ci_fix", "awaiting_approval", "Fix flaky pipeline on main", "", nil, 0, 2*time.Minute),
-		mk("c3d4e5f6-1111-2222-3333-444444444444", "issue", "running", "Refactor the forge sync loop for the GitHub driver", "stalled", nil, 0, 51*time.Minute),
-		mk("e5f6a7b8-1111-2222-3333-444444444444", "issue", "completed", "Wire the OIDC login button into the header", "", sp("ideal"), 0, 3*time.Hour),
-		mk("f6a7b8c9-1111-2222-3333-444444444444", "issue", "limit_wait", "Port the judge to per-model usage folding", "", nil, 0, 22*time.Minute),
-		mk("a7b8c9d0-1111-2222-3333-444444444444", "issue", "failed", "Migrate per-user secrets into the vault hierarchy", "", sp("issues"), 3, 5*time.Hour),
+		sync,
+		oidc,
+		portJudge,
+		vault,
 	}
 }
 

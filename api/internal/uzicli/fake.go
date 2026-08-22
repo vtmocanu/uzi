@@ -84,8 +84,44 @@ type FakeClient struct {
 	LastInputBody      string
 	LastInputSelection *apitypes.AgentSelection
 
+	// CreateTaskRun / DispatchTaskRun capture (PRD #400 M3). CreatedTaskRun is the
+	// canned create reply (its Branch is what the handoff command pushes to);
+	// DispatchedRun is the canned dispatch reply. The Last* fields record the exact
+	// wire args so a test can assert repo/context/base/mr and the dispatched run id.
+	// TaskCalls records the ORDERED sequence of these two verbs (and can be shared
+	// with the fake Git recorder) so a test can prove create → push → dispatch
+	// ordering, which a per-verb capture alone cannot show. CreateTaskRunErr /
+	// DispatchTaskRunErr win over the blanket Err so a test can model a create 422 or
+	// a dispatch 404 on the specific verb while the capture still proves it was
+	// reached.
+	CreatedTaskRun            apitypes.RunDTO
+	LastCreateTaskRepoID      string
+	LastCreateTaskContext     string
+	LastCreateTaskBaseBranch  string
+	LastCreateTaskOpenMr      bool
+	LastCreateTaskInteractive bool
+	LastCreateTaskReview      bool
+	LastCreateTaskThenFix     bool
+	CreateTaskRunErr          error
+	DispatchedRun             apitypes.RunDTO
+	LastDispatchRunID         string
+	DispatchTaskRunErr        error
+	TaskCalls                 []string
+
+	// GetTaskReview capture (PRD #400 M4a). TaskReview is the canned reply (nil ⇒ the
+	// task has no review yet); GetTaskReviewErr wins over Err so a 404 can be modelled on
+	// this verb; LastTaskReviewID records the requested target run id.
+	TaskReview       *apitypes.TaskReviewDTO
+	GetTaskReviewErr error
+	LastTaskReviewID string
+
 	// DeleteWorker capture: records the id it was asked to delete.
 	LastDeletedWorkerID string
+
+	// DeleteRepo capture (PRD #357 M3): records the id `uzi repo remove` asked to
+	// delete. It stays empty when the confirm gate declines, which is what proves
+	// the gate blocked the call.
+	LastDeletedRepoID string
 
 	// SetTokenAutoEligible capture (PRD #111 M2): the secret id the command
 	// RESOLVED the label to, and the boolean it sent. The id is what proves the
@@ -108,6 +144,9 @@ type FakeClient struct {
 	// SelfMeters drives SelfRateLimits (PRD #111 D23): the caller's own per-token
 	// meters, each carrying the server-computed auto-selection status.
 	SelfMeters []apitypes.TokenRateLimitDTO
+
+	// Settings drives GetMySettings: the caller's own non-secret settings.
+	Settings apitypes.UserSettingsDTO
 
 	// Secrets drives ListSecrets (PRD #104 M2).
 	Secrets []apitypes.SecretDTO
@@ -217,6 +256,34 @@ type FakeClient struct {
 	LastDismissFindingID     string
 	LastDismissFindingReason string
 	DismissFindingErr        error
+
+	// Review issue filing (PRD #365 M2). ReviewIssueDraft is the canned issue-draft reply;
+	// ReviewFileResult / Last... capture the file write. *Err fields win over Err so a test can
+	// model a 404/409 on the write while the capture still proves it was reached.
+	ReviewIssueDraft       apitypes.IssueDraftDTO
+	GetReviewIssueDraftErr error
+	LastReviewDraftRunID   string
+	LastReviewDraftRecID   string
+
+	ReviewFileResult     ReviewIssueFileResult
+	FileReviewIssueErr   error
+	LastFileReviewRunID  string
+	LastFileReviewRecID  string
+	LastFileReviewRepoID string
+	LastFileReviewTitle  string
+	LastFileReviewDesc   string
+
+	// GitHub project sync CLI reads (PRD #576 M7). ProjectSyncStatusResult is the
+	// canned `project-sync status` reply and LastProjectSyncStatusRepoID records the
+	// repo id it was asked about. GetProjectSyncStatusErr wins over the blanket Err so
+	// a test can model the not-linked 404 (ExitNotFound) precisely while the capture
+	// still proves the read was reached. ResyncProjectSync records its repo id;
+	// ResyncProjectSyncErr wins over Err the same way for the resync 404.
+	ProjectSyncStatusResult     ProjectSyncStatus
+	LastProjectSyncStatusRepoID string
+	GetProjectSyncStatusErr     error
+	LastResyncProjectSyncRepoID string
+	ResyncProjectSyncErr        error
 
 	// GetRunHook, when non-nil, drives GetRun instead of the static RunByID map. It
 	// is the sequencing seam `uzi run wait`'s tests need: a poll loop calls GetRun
@@ -350,6 +417,13 @@ func (f *FakeClient) SelfRateLimits(context.Context) ([]apitypes.TokenRateLimitD
 	return f.SelfMeters, nil
 }
 
+func (f *FakeClient) GetMySettings(context.Context) (apitypes.UserSettingsDTO, error) {
+	if f.Err != nil {
+		return apitypes.UserSettingsDTO{}, f.Err
+	}
+	return f.Settings, nil
+}
+
 func (f *FakeClient) DeleteWorker(_ context.Context, id string) error {
 	f.LastDeletedWorkerID = id
 	return f.Err
@@ -435,6 +509,11 @@ func (f *FakeClient) ListRepos(context.Context) ([]apitypes.RepoDTO, error) {
 		return nil, f.Err
 	}
 	return f.Repos, nil
+}
+
+func (f *FakeClient) DeleteRepo(_ context.Context, id string) error {
+	f.LastDeletedRepoID = id
+	return f.Err
 }
 
 // BuildInfo returns Build, or BuildErr when set. BuildErr is SEPARATE from the
@@ -547,6 +626,59 @@ func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64,
 	return f.CreatedRun, nil
 }
 
+// CreateTaskRun records the handoff-create args and returns CreatedTaskRun. It
+// captures BEFORE the error branch (mirroring CreateRun) so a test asserting a
+// refusal still proves the write was reached; CreateTaskRunErr wins over Err so a
+// 422 can be modelled on this verb alone. It appends "create" to TaskCalls so the
+// create → push → dispatch ordering is observable.
+func (f *FakeClient) CreateTaskRun(_ context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool) (apitypes.RunDTO, error) {
+	f.LastCreateTaskRepoID = repoID
+	f.LastCreateTaskContext = taskContext
+	f.LastCreateTaskBaseBranch = baseBranch
+	f.LastCreateTaskOpenMr = openMR
+	f.LastCreateTaskInteractive = interactive
+	f.LastCreateTaskReview = reviewRequested
+	f.LastCreateTaskThenFix = thenFixRequested
+	f.TaskCalls = append(f.TaskCalls, "create")
+	if f.CreateTaskRunErr != nil {
+		return apitypes.RunDTO{}, f.CreateTaskRunErr
+	}
+	if f.Err != nil {
+		return apitypes.RunDTO{}, f.Err
+	}
+	return f.CreatedTaskRun, nil
+}
+
+// GetTaskReview returns the canned TaskReview (nil ⇒ "no review yet"). GetTaskReviewErr
+// wins over Err so a 404 can be modelled on this verb alone; LastTaskReviewID records the
+// requested target run id.
+func (f *FakeClient) GetTaskReview(_ context.Context, id string) (*apitypes.TaskReviewDTO, error) {
+	f.LastTaskReviewID = id
+	if f.GetTaskReviewErr != nil {
+		return nil, f.GetTaskReviewErr
+	}
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return f.TaskReview, nil
+}
+
+// DispatchTaskRun records the run id it was asked to dispatch and returns
+// DispatchedRun. DispatchTaskRunErr wins over Err so a 404 can be modelled on this
+// verb alone; it appends "dispatch" to TaskCalls (after the create and any push)
+// so a test can assert the Decision-6 ordering.
+func (f *FakeClient) DispatchTaskRun(_ context.Context, runID string) (apitypes.RunDTO, error) {
+	f.LastDispatchRunID = runID
+	f.TaskCalls = append(f.TaskCalls, "dispatch")
+	if f.DispatchTaskRunErr != nil {
+		return apitypes.RunDTO{}, f.DispatchTaskRunErr
+	}
+	if f.Err != nil {
+		return apitypes.RunDTO{}, f.Err
+	}
+	return f.DispatchedRun, nil
+}
+
 func (f *FakeClient) SubmitRunInput(_ context.Context, runID, kind, body string, sel *apitypes.AgentSelection) (apitypes.RunInputResponse, error) {
 	f.LastInputRunID = runID
 	f.LastInputKind = kind
@@ -657,6 +789,58 @@ func (f *FakeClient) DismissFinding(_ context.Context, id, reason string) error 
 	f.LastDismissFindingReason = reason
 	if f.DismissFindingErr != nil {
 		return f.DismissFindingErr
+	}
+	return f.Err
+}
+
+// GetReviewIssueDraft records the (run, rec) it was asked about and returns the canned draft.
+// GetReviewIssueDraftErr wins over the blanket Err so a test can model a 404 on the read while
+// the capture still proves the read was reached.
+func (f *FakeClient) GetReviewIssueDraft(_ context.Context, runID, recID string) (apitypes.IssueDraftDTO, error) {
+	f.LastReviewDraftRunID = runID
+	f.LastReviewDraftRecID = recID
+	if f.GetReviewIssueDraftErr != nil {
+		return apitypes.IssueDraftDTO{}, f.GetReviewIssueDraftErr
+	}
+	if f.Err != nil {
+		return apitypes.IssueDraftDTO{}, f.Err
+	}
+	return f.ReviewIssueDraft, nil
+}
+
+// FileReviewIssue records the (run, rec, repo, title, description) it was called with and returns
+// the canned result. FileReviewIssueErr wins over Err so a test can model a 409/404 on the WRITE
+// precisely, while the captures still prove the write was reached with the right arguments.
+func (f *FakeClient) FileReviewIssue(_ context.Context, runID, recID, repoID, title, description string) (ReviewIssueFileResult, error) {
+	f.LastFileReviewRunID = runID
+	f.LastFileReviewRecID = recID
+	f.LastFileReviewRepoID = repoID
+	f.LastFileReviewTitle = title
+	f.LastFileReviewDesc = description
+	if f.FileReviewIssueErr != nil {
+		return ReviewIssueFileResult{}, f.FileReviewIssueErr
+	}
+	if f.Err != nil {
+		return ReviewIssueFileResult{}, f.Err
+	}
+	return f.ReviewFileResult, nil
+}
+
+func (f *FakeClient) GetProjectSyncStatus(_ context.Context, repoID string) (ProjectSyncStatus, error) {
+	f.LastProjectSyncStatusRepoID = repoID
+	if f.GetProjectSyncStatusErr != nil {
+		return ProjectSyncStatus{}, f.GetProjectSyncStatusErr
+	}
+	if f.Err != nil {
+		return ProjectSyncStatus{}, f.Err
+	}
+	return f.ProjectSyncStatusResult, nil
+}
+
+func (f *FakeClient) ResyncProjectSync(_ context.Context, repoID string) error {
+	f.LastResyncProjectSyncRepoID = repoID
+	if f.ResyncProjectSyncErr != nil {
+		return f.ResyncProjectSyncErr
 	}
 	return f.Err
 }

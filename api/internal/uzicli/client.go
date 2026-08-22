@@ -100,7 +100,17 @@ type Client interface {
 	// half. The status string is computed server-side by autoselect.Classify and is
 	// RENDERED here, never re-derived (D21).
 	SelfRateLimits(ctx context.Context) ([]apitypes.TokenRateLimitDTO, error)
+	// GetMySettings returns the caller's own non-secret settings, including
+	// sidebar_token_ids: GET /api/me/settings. RequireUser (the GET was split out
+	// from the cookie-only /me/settings group so a uzc_ can read it).
+	GetMySettings(ctx context.Context) (apitypes.UserSettingsDTO, error)
 	ListRepos(ctx context.Context) ([]apitypes.RepoDTO, error)
+	// DeleteRepo removes a single repo: DELETE /api/repos/{id}, 204 on success
+	// (PRD #357 M3). The server only removes a DISABLED repo and refuses one that
+	// is enabled or has an in-flight run with 409 → ExitConflict; a foreign/absent
+	// id is 404 → ExitNotFound. It is destructive, so the `uzi repo remove` command
+	// gates it behind --force / a confirm prompt.
+	DeleteRepo(ctx context.Context, id string) error
 	// BuildInfo reads the server's build coordinates from the UNAUTHENTICATED
 	// GET /api/version (PRD #175 M4).
 	//
@@ -156,6 +166,32 @@ type Client interface {
 	// selection with no plan). The plan's size cap and empty-plan rejection are the
 	// SERVER's (422) — the client forwards the bytes so those rules live in one place.
 	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, seed *CreateRunSeed) (apitypes.RunDTO, error)
+	// CreateTaskRun queues an issue-less handoff/task run on a repo (PRD #400 M3):
+	// POST /api/repos/{id}/task-runs {context, base_branch?, open_mr}. The server
+	// names the branch (uzi/task/<run-id>) and the created-run response carries it in
+	// Branch — which is what the CLI then pushes local HEAD to. context is the inline
+	// instruction (reused as issue_description, so its 256 KiB cap + sanitization are
+	// the server's); baseBranch is the source ref to branch from, OMITTED when empty
+	// so the worker branches from the caller's seeded HEAD; openMR asks the worker to
+	// open an MR at the end (a branch exempt from `uzi handoff rm`); reviewRequested
+	// (--review) asks that a diff-review run be auto-created when the task completes,
+	// producing structured findings fetched via GetTaskReview; thenFixRequested
+	// (--then-fix) asks that, after that review, a chained fix run push fixes for its
+	// findings to the same branch (--then-fix implies --review); interactive
+	// (--interactive) asks the worker to keep the run alive after signal_done (parking in
+	// awaiting_followup to iterate) rather than terminating.
+	CreateTaskRun(ctx context.Context, repoID, context, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool) (apitypes.RunDTO, error)
+	// GetTaskReview fetches a handoff task's diff-review (PRD #400 M4a): GET
+	// /api/runs/{id}/task-review, whose envelope is {"task_review": <dto>|null}. A visible
+	// task with no review yet returns a nil DTO (the CLI prints "no review available yet");
+	// a run the caller can't see is a 404 (exit 4). id is the TARGET (task) run id.
+	GetTaskReview(ctx context.Context, id string) (*apitypes.TaskReviewDTO, error)
+	// DispatchTaskRun stamps a task run's dispatch gate (PRD #400 Decision 6): POST
+	// /api/runs/{id}/dispatch, empty body. The CLI calls it LAST — after the run is
+	// created and local HEAD has been pushed to uzi/task/<id> — which is the moment
+	// the worker may claim the run. Owner-scoped server-side: a foreign/absent run, a
+	// non-task run, or an already-dispatched one is a 404 (exit 4).
+	DispatchTaskRun(ctx context.Context, runID string) (apitypes.RunDTO, error)
 	// SubmitRunInput submits a steering input: POST /api/runs/{id}/inputs
 	// {kind, body, selection}. kind ∈ {approve_plan, reject_plan, cancel, follow_up}.
 	// sel is legal only with approve_plan; the server validates it against the run's
@@ -306,6 +342,52 @@ type Client interface {
 	// unknown/foreign id is a 404 (exit 4); a non-open coordinate (filed/filing/already
 	// dismissed) is a 409 (exit 5). 200 → nil.
 	DismissFinding(ctx context.Context, id, reason string) error
+	// GetReviewIssueDraft fetches the server-templated issue draft for one judge
+	// recommendation (PRD #365 M2): GET
+	// /api/runs/{runID}/review/recommendations/{recID}/issue-draft. Owner-or-admin to READ
+	// the recommendation, reachable from a CLI token on RequireUser. The reply is the
+	// {"draft": IssueDraftDTO} envelope; this returns the unwrapped draft carrying the
+	// default repo, title, description and picker note. A foreign/unknown run or rec is a
+	// 404 (exit 4).
+	GetReviewIssueDraft(ctx context.Context, runID, recID string) (apitypes.IssueDraftDTO, error)
+	// FileReviewIssue files a forge issue from one judge recommendation (PRD #365 M2): POST
+	// /api/runs/{runID}/review/recommendations/{recID}/issue with {repo_id,title,description}
+	// (all three required — unlike FileFinding's empty body, the CLI sends the draft defaults
+	// it just fetched). Owner-or-admin to READ the recommendation, caller-owns-repo to WRITE.
+	// Returns the created forge issue (iid/web_url/title) and any created-with-warning note.
+	// A foreign/unknown run or rec is a 404 (exit 4); an already-filed or mid-filing
+	// recommendation is a 409 (exit 5) — both come straight from statusError.
+	FileReviewIssue(ctx context.Context, runID, recID, repoID, title, description string) (ReviewIssueFileResult, error)
+
+	// GetProjectSyncStatus reads a repo's GitHub Projects v2 sync health (PRD #576
+	// M7): GET /api/repos/{id}/github-project-sync. RequireUser since M7 moved the
+	// route out of the cookie-only group, so a uzc_ Bearer reaches it (issue #428
+	// class). Owner-or-admin server-side (GetRepoForUser preflight) — a
+	// foreign/unknown repo is a 404 → *ExitError{ExitNotFound}, which the command
+	// softens to "not linked" (a repo with NO link row is the SAME 404, "not sync
+	// enabled"): both are the not-linked case for a read the CLI treats as normal
+	// output, never an error.
+	GetProjectSyncStatus(ctx context.Context, repoID string) (ProjectSyncStatus, error)
+	// ResyncProjectSync re-seeds an already-linked board, picking up newly-added
+	// Status options (PRD #576 M7): POST /api/repos/{id}/github-project-sync/resync.
+	// RequireUser (moved with the status read) so the CLI Bearer is accepted. A
+	// foreign/unknown repo, or one with no link row, is a 404 (exit 4) straight from
+	// statusError.
+	ResyncProjectSync(ctx context.Context, repoID string) error
+}
+
+// ProjectSyncStatus mirrors the handler's getGithubProjectSyncStatusResponse JSON
+// (PRD #576 M7): a repo's project link health snapshot. LastSyncedAt/LastError are
+// pointers so a never-synced or healthy link decodes them as nil rather than a zero
+// value; UnmatchedColumns is always a JSON array (never null) server-side, so `uzi
+// project-sync status` can range it unconditionally.
+type ProjectSyncStatus struct {
+	ProjectNumber    int64      `json:"project_number"`
+	OwnedByUzi       bool       `json:"owned_by_uzi"`
+	LastSyncedAt     *time.Time `json:"last_synced_at"`
+	LastError        *string    `json:"last_error"`
+	ItemCount        int        `json:"item_count"`
+	UnmatchedColumns []string   `json:"unmatched_columns"`
 }
 
 // ErrNoDisposition is returned by DeleteDisposition when the recommendation had
@@ -780,8 +862,22 @@ func (c *HTTPClient) SelfRateLimits(ctx context.Context) ([]apitypes.TokenRateLi
 	return env.Tokens, nil
 }
 
+func (c *HTTPClient) GetMySettings(ctx context.Context) (apitypes.UserSettingsDTO, error) {
+	var env struct {
+		Settings apitypes.UserSettingsDTO `json:"settings"`
+	}
+	if err := c.get(ctx, "/api/me/settings", &env); err != nil {
+		return apitypes.UserSettingsDTO{}, err
+	}
+	return env.Settings, nil
+}
+
 func (c *HTTPClient) DeleteWorker(ctx context.Context, id string) error {
 	return c.del(ctx, "/api/workers/"+url.PathEscape(id))
+}
+
+func (c *HTTPClient) DeleteRepo(ctx context.Context, id string) error {
+	return c.del(ctx, "/api/repos/"+url.PathEscape(id))
 }
 
 func (c *HTTPClient) SetWorkerBindMode(ctx context.Context, id, mode, label string) (apitypes.WorkerDTO, error) {
@@ -1147,6 +1243,52 @@ func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int6
 	return env.Run, nil
 }
 
+func (c *HTTPClient) CreateTaskRun(ctx context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool) (apitypes.RunDTO, error) {
+	var env struct {
+		Run apitypes.RunDTO `json:"run"`
+	}
+	// base_branch is `omitempty` so an unset --base sends no key and the worker
+	// branches from the caller's seeded HEAD — the CreateRun tri-state convention: an
+	// omitted field means "use the default", present means "this, explicitly". open_mr,
+	// review_requested and then_fix_requested are plain bools (a task defaults to no MR,
+	// no review, no fix; false is the common, correct value to send).
+	reqBody := struct {
+		Context          string `json:"context"`
+		BaseBranch       string `json:"base_branch,omitempty"`
+		OpenMr           bool   `json:"open_mr"`
+		Interactive      bool   `json:"interactive"`
+		ReviewRequested  bool   `json:"review_requested"`
+		ThenFixRequested bool   `json:"then_fix_requested"`
+	}{Context: taskContext, BaseBranch: baseBranch, OpenMr: openMR, Interactive: interactive, ReviewRequested: reviewRequested, ThenFixRequested: thenFixRequested}
+	if err := c.postJSON(ctx, "/api/repos/"+url.PathEscape(repoID)+"/task-runs", reqBody, &env); err != nil {
+		return apitypes.RunDTO{}, err
+	}
+	return env.Run, nil
+}
+
+func (c *HTTPClient) GetTaskReview(ctx context.Context, id string) (*apitypes.TaskReviewDTO, error) {
+	// The envelope is {"task_review": <dto>|null} — a 200 with task_review:null is a
+	// visible-but-unreviewed task, so a nil DTO is returned (the command exits 0 and
+	// prints the "no review yet" hint); a 404 arrives as *ExitError{ExitNotFound} from get.
+	var env struct {
+		TaskReview *apitypes.TaskReviewDTO `json:"task_review"`
+	}
+	if err := c.get(ctx, "/api/runs/"+url.PathEscape(id)+"/task-review", &env); err != nil {
+		return nil, err
+	}
+	return env.TaskReview, nil
+}
+
+func (c *HTTPClient) DispatchTaskRun(ctx context.Context, runID string) (apitypes.RunDTO, error) {
+	var env struct {
+		Run apitypes.RunDTO `json:"run"`
+	}
+	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(runID)+"/dispatch", nil, &env); err != nil {
+		return apitypes.RunDTO{}, err
+	}
+	return env.Run, nil
+}
+
 func (c *HTTPClient) SubmitRunInput(ctx context.Context, runID, kind, body string, sel *apitypes.AgentSelection) (apitypes.RunInputResponse, error) {
 	reqBody := apitypes.RunInputRequest{Kind: kind, Body: body, Selection: sel}
 	var out apitypes.RunInputResponse
@@ -1259,4 +1401,61 @@ func (c *HTTPClient) DismissFinding(ctx context.Context, id, reason string) erro
 	// reason is the wire enum, already mapped and validated by the command. postJSON discards
 	// the (200) body via a nil out and maps a non-2xx through statusError (404→4, 409→5).
 	return c.postJSON(ctx, "/api/findings/"+url.PathEscape(id)+"/dismiss", map[string]string{"reason": reason}, nil)
+}
+
+// ReviewFiledIssueDTO / ReviewIssueFileResult mirror the review file handler's wire shape
+// (POST .../review/recommendations/{recID}/issue): the created forge issue plus an optional
+// created-with-warning note. Defined here (not in apitypes) because the handler's response is
+// a handler-local type; the shape is pinned by TestFileIssueClientWireRoundtripLiveDB (decodes
+// a real server fileIssueResponse into this type) and TestReviewFileClientWireRoundtrip
+// (marshal/unmarshal json-tag parity incl. warning), both in api/internal/handler.
+type ReviewFiledIssueDTO struct {
+	IID    int64  `json:"iid"`
+	WebURL string `json:"web_url"`
+	Title  string `json:"title"`
+}
+
+type ReviewIssueFileResult struct {
+	Issue   ReviewFiledIssueDTO `json:"issue"`
+	Warning string              `json:"warning,omitempty"`
+}
+
+func (c *HTTPClient) GetReviewIssueDraft(ctx context.Context, runID, recID string) (apitypes.IssueDraftDTO, error) {
+	// The handler wraps the DTO in a {"draft": ...} envelope, so decode into a local envelope
+	// and hand back the unwrapped draft. Both ids are escaped — they are user input off the
+	// positionals. A non-2xx (404 for a foreign/unknown run or rec) maps through statusError.
+	var env struct {
+		Draft apitypes.IssueDraftDTO `json:"draft"`
+	}
+	path := "/api/runs/" + url.PathEscape(runID) + "/review/recommendations/" + url.PathEscape(recID) + "/issue-draft"
+	if err := c.get(ctx, path, &env); err != nil {
+		return apitypes.IssueDraftDTO{}, err
+	}
+	return env.Draft, nil
+}
+
+func (c *HTTPClient) FileReviewIssue(ctx context.Context, runID, recID, repoID, title, description string) (ReviewIssueFileResult, error) {
+	// Unlike FileFinding's empty body, the review file endpoint decodes fileIssueRequest
+	// {repo_id,title,description} — all three required — so the CLI sends the draft defaults it
+	// just fetched (the web is the rich editor). postJSON routes a non-2xx through statusError,
+	// so 404→ExitNotFound and 409→ExitConflict come for free.
+	body := map[string]string{"repo_id": repoID, "title": title, "description": description}
+	path := "/api/runs/" + url.PathEscape(runID) + "/review/recommendations/" + url.PathEscape(recID) + "/issue"
+	var out ReviewIssueFileResult
+	if err := c.postJSON(ctx, path, body, &out); err != nil {
+		return ReviewIssueFileResult{}, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) GetProjectSyncStatus(ctx context.Context, repoID string) (ProjectSyncStatus, error) {
+	var out ProjectSyncStatus
+	if err := c.get(ctx, "/api/repos/"+url.PathEscape(repoID)+"/github-project-sync", &out); err != nil {
+		return ProjectSyncStatus{}, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) ResyncProjectSync(ctx context.Context, repoID string) error {
+	return c.postJSON(ctx, "/api/repos/"+url.PathEscape(repoID)+"/github-project-sync/resync", nil, nil)
 }

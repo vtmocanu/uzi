@@ -26,16 +26,21 @@ type ClaimPayload struct {
 	// IssueIID is the worked issue for an issue run, null for a ci_fix run (which
 	// has no issue). IssueTitle/IssueDescription always carry a human summary (for
 	// ci_fix, a synthesized one) so the run stays displayable and self-contained.
-	IssueIID         *int64  `json:"issue_iid"`
-	IssueTitle       string  `json:"issue_title"`
-	IssueDescription string  `json:"issue_description"`
-	Status           string  `json:"status"`
-	Branch           *string `json:"branch"`     // resume: attach existing branch
-	SessionID        *string `json:"session_id"` // resume: continue SDK session
-	LastSeq          int32   `json:"last_seq"`   // resume: continue message numbering
-	IterationCount   int32   `json:"iteration_count"`
-	RequeueCount     int32   `json:"requeue_count"`
-	PlanMd           *string `json:"plan_md"` // resume: plan already captured
+	IssueIID         *int64 `json:"issue_iid"`
+	IssueTitle       string `json:"issue_title"`
+	IssueDescription string `json:"issue_description"`
+	// IssueComments is the structured, bot/system-filtered, bounded snapshot of the
+	// issue's HUMAN comments captured at run creation (PRD #381). nil for every
+	// non-issue kind, a comment-less issue, and a connection with an unknown bot id
+	// (D9). The agent renders it under a per-prompt nonce fence (M3).
+	IssueComments  *IssueCommentsSnapshot `json:"issue_comments,omitempty"`
+	Status         string                 `json:"status"`
+	Branch         *string                `json:"branch"`     // resume: attach existing branch
+	SessionID      *string                `json:"session_id"` // resume: continue SDK session
+	LastSeq        int32                  `json:"last_seq"`   // resume: continue message numbering
+	IterationCount int32                  `json:"iteration_count"`
+	RequeueCount   int32                  `json:"requeue_count"`
+	PlanMd         *string                `json:"plan_md"` // resume: plan already captured
 	// AutoApprove flags an autopilot run (PRD #19): the worker resolves the plan
 	// gate with an approve verdict instead of parking at awaiting_approval. It is
 	// top-level (read from the runs row), NOT in ClaimConfig — ClaimConfig is
@@ -43,6 +48,51 @@ type ClaimPayload struct {
 	// reads it from the row, a requeued/resumed autopilot run re-delivers it
 	// unchanged; without that an unattended resume would hang at the gate forever.
 	AutoApprove bool `json:"auto_approve"`
+	// OpenMr gates whether the worker opens a merge request for a task run (PRD #400
+	// M2). Meaningful only for kind='task': a task ALWAYS pushes its branch back (the
+	// deliverable is commits the user pulls), but opens an MR only when this is true
+	// (the caller passed --mr). Every other kind ignores it and keeps its own MR
+	// behaviour. Read from runs.open_mr (a plain bool, false for every non-task run),
+	// so it re-delivers unchanged on every resume like AutoApprove above.
+	OpenMr bool `json:"open_mr"`
+	// Interactive marks a long-lived, conversational task run (PRD #517 M1). When true the
+	// worker keeps the run alive after signal_done — parking it in awaiting_followup to
+	// iterate rather than terminating — until a 'uzi run stop' winds it down. Read from
+	// runs.interactive (a plain bool, false for every non-interactive and non-task run), so
+	// it re-delivers unchanged on every resume like OpenMr above. Additive on the wire — an
+	// old worker ignores the key and keeps its terminating behaviour.
+	Interactive bool `json:"interactive"`
+	// StopPending re-delivers the durable runs.stop_kind='stopped' fact on every claim
+	// (issue #552 M3), derived here from the already-loaded run row — the direct analog
+	// of what OpenQuestionID does for the stale-answer guard below.
+	//
+	// A graceful `uzi run stop` (PRD #517 M4) is consumed by the worker's steering poll
+	// into the in-memory stopRequested flag. That flag is LOST if the worker dies before
+	// winding the park down: on the requeue the fresh SteeringChannel starts with
+	// stopRequested=false, the stop steering input is already consumed_at so ConsumeInputs
+	// re-delivers nothing, and the run re-parks at awaiting_followup — completing only on
+	// the ~30m idle timeout. But stop_kind='stopped' is DURABLY stamped at submit time
+	// (CreateStopVerdictInput) and survives the death, independent of the consumed input.
+	// StopPending carries that surviving fact so the resumed worker seeds stopRequested
+	// and winds the park down immediately instead of waiting out the idle timeout.
+	// Additive on the wire — an old worker ignores the key and the idle timeout stays the
+	// backstop.
+	StopPending bool `json:"stop_pending"`
+	// BaseBranch is the source ref a task run was branched from (PRD #400 M2),
+	// meaningful only for kind='task'. It is carried for context/review — the worker
+	// works the pre-seeded, server-named Branch (uzi/task/<run-id>), not this ref —
+	// so an MR/review can name what the task diverged from. Read from runs.base_branch
+	// (pgtype.Text); nil/omitted for every run that has none.
+	BaseBranch *string `json:"base_branch"`
+	// ReviewTargetRunID is the reviewed TASK run when THIS task run is a diff-review
+	// (PRD #400 M4a). Non-nil ⇒ the worker (M4b) routes this claim to a review executor:
+	// it clones the shared Branch (the reviewed target's uzi/task/<id>), diffs it against
+	// BaseBranch, runs a reviewer agent, and POSTs structured findings back to
+	// /worker/runs/<review_target_run_id>/task-review instead of committing. nil for a
+	// plain handoff (and every non-task run), which the worker executes normally. Read
+	// from runs.review_target_run_id (pgtype.UUID); re-delivered unchanged on every claim
+	// like OpenMr/BaseBranch above.
+	ReviewTargetRunID *string `json:"review_target_run_id"`
 	// OpenQuestionID is the clarification question this run is already parked on
 	// (PRD #88 M1), read from the runs row and therefore re-delivered on every
 	// resume — the same reason AutoApprove is top-level rather than in ClaimConfig.
@@ -129,6 +179,18 @@ type ClaimPayload struct {
 	// JudgeModel is the model alias a JUDGE run runs on (PRD #46 Decision 7), resolved
 	// from the judge_model setting at claim assembly. Present only for kind=judge.
 	JudgeModel *string `json:"judge_model,omitempty"`
+	// SummaryModel is the model alias the inline run-summary generator runs on (PRD
+	// #362 Decision 8), resolved user-value-wins from users.summary_model over the
+	// instance summary_model at ISSUE-run claim assembly. Unlike JudgeModel it rides
+	// the issue-run claim, not the judge claim; nil (omitted) when unresolved so an
+	// old worker's wire shape is unchanged.
+	SummaryModel *string `json:"summary_model,omitempty"`
+	// SummaryIntentPresent tells the worker the run's intent summary is ALREADY set
+	// (PRD #362 M3c, Decision 3), so the executor skips INTENT generation on a
+	// resume/re-claim and does not re-spend the owner's token. Derived from
+	// runs.summary_intent at issue-run claim assembly; omitempty keeps a run that has
+	// none (the common case) byte-identical on the wire, and an old worker ignores it.
+	SummaryIntentPresent bool `json:"summary_intent_present,omitempty"`
 	// JudgeSignal is the API-side deterministic command-not-found pre-scan of the
 	// reviewed run's tool output (PRD #46 Decision 4). Present only for kind=judge (and
 	// omitted when the scan found nothing). The judge interprets it; if the model call
@@ -273,7 +335,14 @@ type ClaimAgent struct {
 type ClaimConfig struct {
 	RunTimeoutSeconds  int `json:"run_timeout_seconds"`
 	IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
-	MaxIterations      int `json:"max_iterations"`
+	// TaskIdleTimeoutSeconds is the interactive-task park idle backstop (PRD #517 M5,
+	// WORKER_TASK_IDLE_TIMEOUT): how long a parked interactive task waits at
+	// awaiting_followup for the next follow-up before the worker gracefully finalizes
+	// (push, MR iff open_mr) → completed. Delivered ONLY on an interactive task claim;
+	// omitempty keeps every other claim byte-identical to today's wire, and an older
+	// worker (or a missing field) falls back to its own TASK_FOLLOWUP_IDLE_MS constant.
+	TaskIdleTimeoutSeconds int `json:"task_idle_timeout_seconds,omitempty"`
+	MaxIterations          int `json:"max_iterations"`
 	// PlanMaxRevisions is the PRD #41 plan-revision cap the worker enforces at the
 	// approval gate (server-authoritative; the server also caps in SubmitInput).
 	PlanMaxRevisions int `json:"plan_max_revisions"`

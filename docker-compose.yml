@@ -208,6 +208,7 @@ services:
       RUN_LIMIT_MAX_WAITS: ${RUN_LIMIT_MAX_WAITS:-5}
       RUN_LIMIT_MAX_PARK: ${RUN_LIMIT_MAX_PARK:-192h}
       WORKER_HEARTBEAT_STALE: ${WORKER_HEARTBEAT_STALE:-45s}
+      SWEEP_INTERVAL: ${SWEEP_INTERVAL:-15s}
       WORKER_AFFINITY_GRACE: ${WORKER_AFFINITY_GRACE:-2m}
       WORKER_SPREAD_GRACE: ${WORKER_SPREAD_GRACE:-9s}
       RUN_BACKGROUND_GRACE: ${RUN_BACKGROUND_GRACE:-15m}
@@ -461,7 +462,7 @@ services:
     # docker-cli-compose) against this daemon, so the daemon image needs only to be a
     # working rootless dockerd. TESTER confirms the tag/digest boots rootless on the live
     # host and that `docker compose up` works end-to-end.
-    image: docker:28-dind-rootless@sha256:7c3e797187e43738220462658f4586572cbd3bf009f728b21e34d9c5c06ce431
+    image: docker:29-dind-rootless@sha256:8a213afdd096a44dff403aaf8eb58b7a96a63113f18a4b094b98b7d0ed7d948b
     profiles: ["agent-docker"]
     # Wait for the socket dir to be chowned writable-by-1000 (else rootless dockerd
     # refuses to start). dind-init keeps running (it also holds the socket 0666 open), so

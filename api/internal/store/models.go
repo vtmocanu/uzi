@@ -163,6 +163,30 @@ type ForgeConnection struct {
 	HumanUsername      pgtype.Text        `json:"human_username"`
 }
 
+type GithubProjectItem struct {
+	RepoID             uuid.UUID          `json:"repo_id"`
+	ForgeIssueIid      int64              `json:"forge_issue_iid"`
+	ItemNodeID         string             `json:"item_node_id"`
+	LastStatusOptionID pgtype.Text        `json:"last_status_option_id"`
+	LastSyncedAt       pgtype.Timestamptz `json:"last_synced_at"`
+}
+
+type GithubProjectLink struct {
+	ID               uuid.UUID          `json:"id"`
+	RepoID           uuid.UUID          `json:"repo_id"`
+	ProjectNodeID    string             `json:"project_node_id"`
+	ProjectNumber    int64              `json:"project_number"`
+	StatusFieldID    string             `json:"status_field_id"`
+	StatusOptions    []byte             `json:"status_options"`
+	OwnedByUzi       bool               `json:"owned_by_uzi"`
+	LastSyncedAt     pgtype.Timestamptz `json:"last_synced_at"`
+	LastError        pgtype.Text        `json:"last_error"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+	UnmatchedColumns []string           `json:"unmatched_columns"`
+	SeedingStartedAt pgtype.Timestamptz `json:"seeding_started_at"`
+}
+
 type HostedWorkerToken struct {
 	WorkerID        uuid.UUID          `json:"worker_id"`
 	TokenCiphertext []byte             `json:"token_ciphertext"`
@@ -277,6 +301,7 @@ type Repo struct {
 	GuardrailOverrideReason pgtype.Text        `json:"guardrail_override_reason"`
 	GuardrailOverrideBy     pgtype.UUID        `json:"guardrail_override_by"`
 	GuardrailOverrideAt     pgtype.Timestamptz `json:"guardrail_override_at"`
+	RequiredCapabilities    []string           `json:"required_capabilities"`
 }
 
 type RepoToolProfile struct {
@@ -379,6 +404,24 @@ type Run struct {
 	OverrideSubagentModel bool               `json:"override_subagent_model"`
 	FailOrigin            pgtype.Text        `json:"fail_origin"`
 	Priority              pgtype.Int2        `json:"priority"`
+	SummaryIntent         pgtype.Text        `json:"summary_intent"`
+	SummaryPlan           pgtype.Text        `json:"summary_plan"`
+	SummaryDeltas         []byte             `json:"summary_deltas"`
+	IssueComments         []byte             `json:"issue_comments"`
+	BaseBranch            pgtype.Text        `json:"base_branch"`
+	OpenMr                bool               `json:"open_mr"`
+	DispatchedAt          pgtype.Timestamptz `json:"dispatched_at"`
+	ReviewTargetRunID     pgtype.UUID        `json:"review_target_run_id"`
+	ReviewRequested       bool               `json:"review_requested"`
+	ThenFixRequested      bool               `json:"then_fix_requested"`
+	ThenFixOfRunID        pgtype.UUID        `json:"then_fix_of_run_id"`
+	PreservedPatch        pgtype.Text        `json:"preserved_patch"`
+	RequiredCapabilities  []string           `json:"required_capabilities"`
+	StopReason            pgtype.Text        `json:"stop_reason"`
+	RequiredTools         []string           `json:"required_tools"`
+	SizeClass             string             `json:"size_class"`
+	Interactive           bool               `json:"interactive"`
+	OpenFollowupID        pgtype.Int8        `json:"open_followup_id"`
 }
 
 type RunMessage struct {
@@ -490,6 +533,29 @@ type SlackRunMessage struct {
 	StatusTs                    pgtype.Text        `json:"status_ts"`
 }
 
+type TaskReview struct {
+	ID          uuid.UUID          `json:"id"`
+	TargetRunID uuid.UUID          `json:"target_run_id"`
+	ReviewRunID pgtype.UUID        `json:"review_run_id"`
+	UserID      uuid.UUID          `json:"user_id"`
+	Status      string             `json:"status"`
+	SummaryMd   string             `json:"summary_md"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+}
+
+type TaskReviewFinding struct {
+	ID          uuid.UUID          `json:"id"`
+	ReviewID    uuid.UUID          `json:"review_id"`
+	File        string             `json:"file"`
+	Symbol      string             `json:"symbol"`
+	Line        int32              `json:"line"`
+	Severity    string             `json:"severity"`
+	SummaryMd   string             `json:"summary_md"`
+	RationaleMd string             `json:"rationale_md"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
 type ToolAllowlist struct {
 	ID            uuid.UUID          `json:"id"`
 	Name          string             `json:"name"`
@@ -525,6 +591,7 @@ type User struct {
 	CiAutofixEnabled       bool               `json:"ci_autofix_enabled"`
 	SidebarTokenIds        []uuid.UUID        `json:"sidebar_token_ids"`
 	JudgeModel             pgtype.Text        `json:"judge_model"`
+	SummaryModel           pgtype.Text        `json:"summary_model"`
 }
 
 type UserSecret struct {
@@ -572,6 +639,8 @@ type Worker struct {
 	AnthropicSecretID  pgtype.UUID        `json:"anthropic_secret_id"`
 	AnthropicBindMode  string             `json:"anthropic_bind_mode"`
 	OnlineSince        pgtype.Timestamptz `json:"online_since"`
+	DrainingSince      pgtype.Timestamptz `json:"draining_since"`
+	Capabilities       []string           `json:"capabilities"`
 }
 
 type WorkerUpgradeMute struct {

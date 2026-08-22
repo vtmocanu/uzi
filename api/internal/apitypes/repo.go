@@ -21,6 +21,12 @@ type RepoDTO struct {
 	// repo also unions the packages from the repo's own devbox.json (packages-only,
 	// never its hooks/scripts). Default false.
 	RepoDevboxOptIn bool `json:"repo_devbox_opt_in"`
+	// RequiredCapabilities is the static per-repo capability hint (PRD #84 M2): the
+	// non-provisionable capabilities (e.g. docker) every run on this repo is routed to
+	// require. Copied onto each new issue run at enqueue and matched at claim time.
+	// Server-owned vocabulary — an unknown name is Filter-ed out before it is stored.
+	// Empty (the default) means no requirement, so runs claim anywhere.
+	RequiredCapabilities []string `json:"required_capabilities"`
 	// Pipeline is the repo's default-branch CI status (PRD #6), null when there is
 	// no cached default-branch pipeline (no CI configured, MR-only pipelines, or not
 	// yet synced). Set by the list handlers, which enrich from the pipeline cache.
@@ -39,6 +45,37 @@ type RepoDTO struct {
 	// enable/run gates still fail closed live (M4-M6); the admin blocked-repos list is
 	// where that unknown is surfaced explicitly (R1).
 	GuardrailBlocked bool `json:"guardrail_blocked"`
+	// DockerAllowlisted is the computed, caller-scoped "is THIS repo on the global
+	// Docker-worker repo allowlist" (PRD #361): membership-tested server-side against
+	// the docker_repo_allowlist admin setting in the owner-scoped list handlers. It is
+	// a boolean about the caller's OWN repo — never the list, which may hold other
+	// admins' repos. Not set by repoToDTO/PatchRepo (computed, like GuardrailBlocked).
+	DockerAllowlisted bool `json:"docker_allowlisted"`
+	// DockerBlocked is the computed, caller-scoped "is a run on this repo right now
+	// actually blocked by the Docker-allowlist gap" (PRD #361 M3): the repo is enabled,
+	// the caller has a queued run on it, at least one worker is online, and NO online
+	// worker is eligible to claim it (every online worker is a Docker worker and the repo
+	// is not allowlisted). Computed from eligibility directly (fn_worker_can_claim), NOT
+	// from the sweeper's health_reason text — so the Setup chip escalates immediately and
+	// independently of health_enabled/thresholds. Not set by repoToDTO/PatchRepo.
+	DockerBlocked bool `json:"docker_blocked"`
+	// GithubProjectSync is the caller-scoped sync-health summary for this repo's
+	// GitHub Projects v2 link (PRD #576 M2), or nil when the repo is not linked.
+	// Computed in the list handlers like GuardrailBlocked/DockerBlocked; never set
+	// by repoToDTO/PatchRepo. Derived purely from the github_project_links row's
+	// last_error/last_synced_at — a pure store read, no forge call.
+	GithubProjectSync *RepoProjectSyncHealth `json:"github_project_sync,omitempty"`
+}
+
+// RepoProjectSyncHealth is the health readout the sync badge reads (PRD #576 M2). It
+// exists only for a linked repo (nil otherwise), so Linked is always true when the
+// struct is present — kept as an explicit field for the frontend contract. Healthy is
+// "the last sync recorded no error" (github_project_links.last_error IS NULL/empty).
+type RepoProjectSyncHealth struct {
+	Linked       bool       `json:"linked"`
+	Healthy      bool       `json:"healthy"`
+	LastError    *string    `json:"last_error,omitempty"`
+	LastSyncedAt *time.Time `json:"last_synced_at,omitempty"`
 }
 
 // GuardrailOverrideDTO is the audit metadata for an active admin per-repo guardrail

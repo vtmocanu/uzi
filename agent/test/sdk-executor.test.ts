@@ -4,14 +4,22 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
-import { SdkExecutor, resolveLeadModel, embedSeededPlan, type SdkQueryFn, type SdkExecutorOptions } from "../src/sdk-executor.js";
+import { SdkExecutor, resolveLeadModel, embedSeededPlan, type SdkQueryFn, type SdkExecutorOptions, type ContextUsageReading } from "../src/sdk-executor.js";
 import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate, ClaimSkill, MilestoneProgress } from "../src/protocol.js";
 import type { JsDepsResult } from "../src/js-deps.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
-import { FINDINGS_SERVER_NAME } from "../src/findings-tools.js";
+import { FINDINGS_SERVER_NAME, reportIncidentalIssueToolName } from "../src/findings-tools.js";
+import { FINDINGS_NUDGE_APPEND } from "../src/prompt.js";
 import type { WorkerClient } from "../src/client.js";
+import type {
+  SummaryRunner,
+  IntentSummaryInput,
+  PlanSummaryInput,
+  PlanSummaryResult,
+  Delta,
+} from "../src/summary-runner.js";
 import { nullLogger } from "./helpers.js";
 
 // A worktree path that is UNIQUE PER PROCESS AND PER CALL, and that deliberately
@@ -40,6 +48,11 @@ function nonexistentWorktree(): string {
 const OAUTH = "dummy-oauth-token-do-not-scan-0000";
 const FAKE_PAT = "dummy-forge-pat-do-not-scan-1111";
 const FAKE_JOIN_TOKEN = "dummy-join-token-do-not-scan-2222";
+
+// PRD #457: toDefinition grants the findings tool to a non-empty allowlist and appends
+// the discovery nudge to every subagent prompt. Reference the helper, not a literal.
+const FINDINGS_TOOL = reportIncidentalIssueToolName();
+const withNudge = (body: string) => `${body}\n\n${FINDINGS_NUDGE_APPEND}`;
 
 const coder: AgentTemplate = { name: "coder", description: "writes code", prompt_body: "You implement.", tools: ["Read", "Edit", "Write", "Bash"] };
 const reviewer: AgentTemplate = { name: "reviewer", description: "reviews", prompt_body: "You review.", tools: ["Read", "Grep"] };
@@ -151,6 +164,10 @@ interface CtxProbe {
   sessionIds: string[];
   gated: string[];
   iterations: number[];
+  // PRD #362 M3c: the plan_md the fake gate has "persisted" (the awaiting_approval
+  // report). null until the first gate call. A guard-enforcing fake client reads this to
+  // model the server's stale-write guard (`plan_md = @expected`).
+  persisted: { planMd: string | null };
 }
 
 function makeCtx(
@@ -161,6 +178,7 @@ function makeCtx(
   const sessionIds: string[] = [];
   const gated: string[] = [];
   const iterations: number[] = [];
+  const persisted: { planMd: string | null } = { planMd: null };
   // A SEQUENCE of verdicts (PRD #41): the gate loop calls gatePlan once per round, so
   // tests script [revise, …, approve/reject/cancel]. The last entry sticks for any
   // further calls. A bare verdict behaves as a one-element sequence (unchanged).
@@ -179,8 +197,22 @@ function makeCtx(
     config: null,
     sessionId: null,
     onSessionId: (s) => sessionIds.push(s),
-    gatePlan: async (planMd) => {
+    // PRD #362 M3c: model the real gate's ordering — persist plan_md (the awaiting_approval
+    // report) THEN invoke the onAwaitingApproval hook (which posts the plan summary) BEFORE
+    // returning the verdict. The plan-summary POST's stale-write guard reads runs.plan_md,
+    // so it can only match once plan_md is persisted; this fake reproduces that ordering so
+    // the summary tests exercise the same sequence production does. The hook is swallowed
+    // here exactly as the real gate swallows it, so a throwing hook never fails the gate.
+    gatePlan: async (planMd, _milestones, onAwaitingApproval) => {
       gated.push(planMd);
+      persisted.planMd = planMd;
+      if (onAwaitingApproval) {
+        try {
+          await onAwaitingApproval(planMd);
+        } catch {
+          /* advisory — a summary failure never blocks the gate */
+        }
+      }
       const v = verdicts[Math.min(gateCall, verdicts.length - 1)]!;
       gateCall++;
       return v;
@@ -191,7 +223,7 @@ function makeCtx(
     },
     ...overrides,
   };
-  return { ctx, emits, sessionIds, gated, iterations };
+  return { ctx, emits, sessionIds, gated, iterations, persisted };
 }
 
 beforeEach(() => {
@@ -407,9 +439,9 @@ describe("SdkExecutor agent selection at the gate boundary (PRD #37)", () => {
     assert.deepStrictEqual(Object.keys(impl.agents ?? {}).sort(), ["auditor", "coder"]);
     // The repo coder's declared WebFetch is HONORED (Decision 2, policy reversed).
     assert.ok(impl.agents!.coder!.tools?.includes("WebFetch"), "repo agent keeps its declared WebFetch");
-    assert.deepStrictEqual(impl.agents!.coder!.tools, ["Read", "Edit", "Bash", "WebFetch"]);
-    // The repo body — not the own coder's — is what runs.
-    assert.strictEqual(impl.agents!.coder!.prompt, "REPO CODER BODY");
+    assert.deepStrictEqual(impl.agents!.coder!.tools, ["Read", "Edit", "Bash", "WebFetch", FINDINGS_TOOL]);
+    // The repo body — not the own coder's — is what runs (plus the findings nudge).
+    assert.strictEqual(impl.agents!.coder!.prompt, withNudge("REPO CODER BODY"));
     // The resolved roster is returned for the MR marker.
     assert.deepStrictEqual(result.agentSelection, { source: "repo", agents: ["coder", "auditor"] });
   });
@@ -459,7 +491,7 @@ describe("SdkExecutor agent selection at the gate boundary (PRD #37)", () => {
     const impl = turns[1]!.options;
     // `lead` is an invokable subagent...
     assert.ok(Object.keys(impl.agents ?? {}).includes("lead"), "repo lead is a subagent");
-    assert.strictEqual(impl.agents!.lead!.prompt, "REPO LEAD BODY");
+    assert.strictEqual(impl.agents!.lead!.prompt, withNudge("REPO LEAD BODY"));
     // ...and the MAIN-THREAD prompt is uzi's builtin lead, NOT the repo lead body.
     const append = appendOf(impl.systemPrompt);
     assert.ok(append.includes("LEAD SYSTEM PROMPT"), "the own builtin lead prompt runs the main thread");
@@ -524,6 +556,35 @@ describe("SdkExecutor agent selection at the gate boundary (PRD #37)", () => {
 
     const { turns: trimmed } = await runWith({}, approveWith("own", ["reviewer"]));
     assert.deepStrictEqual(Object.keys(trimmed[1]!.options.agents ?? {}), ["coder"]);
+  });
+
+  it("issue #581: mcpServers survives planTurnSubagents onto the PLAN turn's options.agents", async () => {
+    // End-to-end guard: toDefinition wires def.mcpServers for a forge-granted subagent,
+    // and the plan-turn write-strip (planTurnSubagents) + selection must NOT drop it on
+    // the way into options.agents. A fact-checker-shaped own template (read-only, so it
+    // survives the plan turn) carries the six mcp__forge__* read tools; the plan turn's
+    // options.agents["fact-checker"].mcpServers must still name "forge".
+    const factChecker: AgentTemplate = {
+      name: "fact-checker",
+      description: "verifies claims",
+      prompt_body: "You verify claims.",
+      tools: [
+        "Read",
+        "Grep",
+        "mcp__forge__get_issue",
+        "mcp__forge__list_issues",
+        "mcp__forge__get_merge_request",
+        "mcp__forge__get_pipeline_jobs",
+        "mcp__forge__latest_pipeline",
+        "mcp__forge__list_issue_label_events",
+      ],
+    };
+    const { turns } = await runWith({ agents: [lead, coder, reviewer, factChecker] }, approveWith("own"));
+    const plan = turns[0]!.options;
+    assert.ok(
+      plan.agents!["fact-checker"]!.mcpServers?.includes("forge"),
+      `fact-checker must keep its forge mcpServers on the plan turn: ${JSON.stringify(plan.agents!["fact-checker"]!.mcpServers)}`,
+    );
   });
 
   it("a malformed selection resolves to own, never the repo source", async () => {
@@ -1429,9 +1490,10 @@ describe("SdkExecutor skill delivery (PRD #16)", () => {
     const { turns, run } = runWithSkills();
     await run;
     const reviewerDef = turns[0]!.options.agents!["reviewer"] as { tools?: string[]; skills?: string[] };
-    // Read-only allowlist is untouched (no "Skill" added — the skills field is the
-    // enable switch, sdk.d.ts:44/1869), and the skill is scoped to this subagent.
-    assert.deepStrictEqual(reviewerDef.tools, ["Read", "Grep"]);
+    // Read-only allowlist gains only the (non-Skill) findings tool — no "Skill" added,
+    // the skills field is the enable switch (sdk.d.ts:44/1869) — and the skill is
+    // scoped to this subagent.
+    assert.deepStrictEqual(reviewerDef.tools, ["Read", "Grep", FINDINGS_TOOL]);
     assert.ok(!reviewerDef.tools!.includes("Skill"));
     assert.deepStrictEqual(reviewerDef.skills, ["uzi:team-kb"]);
   });
@@ -1578,8 +1640,9 @@ describe("SdkExecutor repo skills (PRD #16 M6)", () => {
     // Repo skills carry no allocation ⇒ enabled for every template (PRD §Worker 3).
     assert.deepStrictEqual(subagent(o, "coder").skills, ["uzi:deploy-notes"]);
     assert.deepStrictEqual(subagent(o, "reviewer").skills, ["uzi:deploy-notes"]);
-    // The read-only subagent's allowlist is NOT widened (no 'Skill' grant needed).
-    assert.deepStrictEqual(subagent(o, "reviewer").tools, ["Read", "Grep"]);
+    // The read-only subagent's allowlist is NOT widened by skills (no 'Skill' grant);
+    // it carries only the (non-write) findings tool PRD #457 grants.
+    assert.deepStrictEqual(subagent(o, "reviewer").tools, ["Read", "Grep", FINDINGS_TOOL]);
     assert.ok(!subagent(o, "reviewer").tools!.includes("Skill"));
   });
 
@@ -1801,8 +1864,9 @@ describe("SdkExecutor delivered skills on a repo-source run (PRD #72 M1)", () =>
         `repo subagent ${name} must receive the delivered skills its owner allocated`,
       );
     }
-    // The read-only shape is untouched: no `Skill` grant, declared tools verbatim.
-    assert.deepStrictEqual(subagent(impl, "coder").tools, ["Read", "Edit", "Bash", "WebFetch"]);
+    // The shape is untouched by skills (no `Skill` grant); declared tools verbatim plus
+    // the (non-write) findings tool PRD #457 grants.
+    assert.deepStrictEqual(subagent(impl, "coder").tools, ["Read", "Edit", "Bash", "WebFetch", FINDINGS_TOOL]);
     assert.strictEqual(subagent(impl, "auditor").tools, undefined, "inherit-all repo agent stays inherit-all");
   });
 
@@ -2910,8 +2974,10 @@ describe("plan-turn write-tool subtraction (#203)", () => {
     // in declaration order. This is the half that proves the scoping — the same
     // subtraction applied one key lower (baseOptions.disallowedTools) would be
     // inherited through the implementOptions spread and redden here.
-    assert.deepStrictEqual(impl.agents!.architect!.tools, architectA.tools);
-    assert.deepStrictEqual(impl.agents!.tester!.tools, testerA.tools);
+    // PRD #457: the implement roster carries each declared tool plus the granted
+    // findings tool (appended last).
+    assert.deepStrictEqual(impl.agents!.architect!.tools, [...architectA.tools!, FINDINGS_TOOL]);
+    assert.deepStrictEqual(impl.agents!.tester!.tools, [...testerA.tools!, FINDINGS_TOOL]);
     for (const role of ["architect", "tester"]) {
       assert.deepStrictEqual(
         impl.agents![role]!.disallowedTools,
@@ -2920,14 +2986,16 @@ describe("plan-turn write-tool subtraction (#203)", () => {
       );
     }
 
-    // Non-write tools are NOT collateral: only the four come off.
+    // Non-write tools are NOT collateral: only the four come off (the granted findings
+    // tool is non-write, so it survives too).
     assert.deepStrictEqual(
       plan.agents!.architect!.tools,
-      ["Bash", "Read", "Grep", "WebFetch"],
-      "reads, Bash and WebFetch survive the plan turn untouched",
+      ["Bash", "Read", "Grep", "WebFetch", FINDINGS_TOOL],
+      "reads, Bash, WebFetch and the findings tool survive the plan turn untouched",
     );
-    // A role that declared no write tool in the first place is unchanged.
-    assert.deepStrictEqual(plan.agents!.reviewer!.tools, reviewer.tools);
+    // A role that declared no write tool in the first place keeps its allowlist, plus
+    // the granted findings tool.
+    assert.deepStrictEqual(plan.agents!.reviewer!.tools, [...reviewer.tools!, FINDINGS_TOOL]);
   });
 
   it("the inherit-all role (no `tools:` line) is covered by the denial arm, and only on the plan turn", async () => {
@@ -2988,8 +3056,8 @@ describe("plan-turn write-tool subtraction (#203)", () => {
         assert.ok(opts.agents!.coder!.disallowedTools!.includes(t), `turn ${turnIdx}: coder must deny ${t}`);
       }
     }
-    // ...and the implement turn still restores them.
-    assert.deepStrictEqual(turns[2]!.options.agents!.architect!.tools, architectA.tools);
+    // ...and the implement turn still restores them (plus the granted findings tool).
+    assert.deepStrictEqual(turns[2]!.options.agents!.architect!.tools, [...architectA.tools!, FINDINGS_TOOL]);
   });
 });
 
@@ -3075,7 +3143,8 @@ describe("plan-turn drop of a write-only allowlist (#203)", () => {
     // 4. The IMPLEMENT turn is untouched — the drop is plan-turn-scoped, and
     //    `penman` gets its declared write tools back where writing is the job.
     assert.deepStrictEqual(Object.keys(impl.options.agents ?? {}).sort(), ["coder", "penman", "reviewer"]);
-    assert.deepStrictEqual(impl.options.agents!.penman!.tools, ["Edit", "Write"]);
+    // PRD #457: the implement roster grants the (non-write) findings tool too.
+    assert.deepStrictEqual(impl.options.agents!.penman!.tools, ["Edit", "Write", FINDINGS_TOOL]);
   });
 
   it("says so on the run feed rather than dropping it silently", async () => {
@@ -3092,5 +3161,623 @@ describe("plan-turn drop of a write-only allowlist (#203)", () => {
     const { probe } = await planAndImplement([lead, coder, reviewer]);
     const statuses = probe.emits.filter((m) => m.kind === "status").map((m) => String(m.payload["text"]));
     assert.ok(!statuses.some((t) => t.includes("file-writing only")), statuses.join("\n"));
+  });
+});
+
+describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
+  // A recording fake SummaryRunner + client. Both hooks are ADVISORY, so the fakes let
+  // each test drive the generator/post to succeed, return null, or throw, and prove the
+  // executor's terminal path is unchanged either way. `intentPosted` resolves the moment
+  // postIntentSummary is called, so the fire-and-forget intent hook can be awaited
+  // deterministically where a post is expected (never awaited where none is).
+  interface SummaryBehavior {
+    generateIntent?: () => Promise<string | null>;
+    generatePlan?: () => Promise<PlanSummaryResult | null>;
+    postIntent?: () => Promise<void>;
+    postPlan?: () => Promise<void>;
+  }
+  function summaryFakes(behavior: SummaryBehavior = {}) {
+    const rec = {
+      intentCalls: [] as IntentSummaryInput[],
+      planCalls: [] as PlanSummaryInput[],
+      intentPosts: [] as string[],
+      planPosts: [] as { summary: string; deltas: Delta[]; plan_md: string }[],
+    };
+    let resolveIntentPosted!: () => void;
+    const intentPosted = new Promise<void>((r) => {
+      resolveIntentPosted = r;
+    });
+    const runner = {
+      async generateIntentSummary(input: IntentSummaryInput): Promise<string | null> {
+        rec.intentCalls.push(input);
+        return behavior.generateIntent ? behavior.generateIntent() : "INTENT SUMMARY";
+      },
+      async generatePlanSummary(input: PlanSummaryInput): Promise<PlanSummaryResult | null> {
+        rec.planCalls.push(input);
+        return behavior.generatePlan
+          ? behavior.generatePlan()
+          : { summary: "PLAN SUMMARY", deltas: [{ kind: "added", text: "a caching layer" }] };
+      },
+    } as unknown as SummaryRunner;
+    const client = {
+      async postIntentSummary(_runId: string, summary: string): Promise<void> {
+        rec.intentPosts.push(summary);
+        if (behavior.postIntent) await behavior.postIntent();
+        resolveIntentPosted();
+      },
+      async postPlanSummary(
+        _runId: string,
+        body: { summary: string; deltas: Delta[]; plan_md: string },
+      ): Promise<void> {
+        rec.planPosts.push(body);
+        if (behavior.postPlan) await behavior.postPlan();
+      },
+    } as unknown as WorkerClient;
+    return { runner, client, rec, intentPosted };
+  }
+
+  // ── Failure isolation (Decision, criterion 4) — the load-bearing test ─────────
+  // A throwing generator / throwing (or 409/400) post on the BLOCKING plan path must
+  // NOT propagate: the run still reaches implement and reports the branch.
+  for (const [name, behavior] of [
+    ["the plan generator throws", { generatePlan: () => Promise.reject(new Error("model exploded")) }],
+    ["the intent generator throws", { generateIntent: () => Promise.reject(new Error("model exploded")) }],
+    ["postPlanSummary throws (e.g. 409 stale)", { postPlan: () => Promise.reject(new Error("409 stale plan")) }],
+    ["postIntentSummary throws (e.g. 400)", { postIntent: () => Promise.reject(new Error("400 bad")) }],
+  ] as [string, SummaryBehavior][]) {
+    it(`reaches implement/terminal unchanged when ${name}`, async () => {
+      const { queryFn } = fakeTurns([
+        [submitPlan("# The Plan\n- step 1"), resultSuccess()],
+        [assistantText("implementing"), signalDone(), resultSuccess()],
+      ]);
+      const { runner, client } = summaryFakes(behavior);
+      const probe = makeCtx({ agents: [lead, coder, reviewer] });
+      const result = await new SdkExecutor(nullLogger(), homeDir, {
+        queryFn,
+        client,
+        summaryRunner: runner,
+      }).run(probe.ctx);
+      // The run completed exactly as a summary-less run would.
+      assert.strictEqual(result.branch, "agent/issue-5");
+      assert.deepStrictEqual(probe.gated, ["# The Plan\n- step 1"], "the gate still saw the plan");
+      assert.deepStrictEqual(probe.iterations, [1], "the implement loop still ran");
+    });
+  }
+
+  // ── Intent skip on resume (Decision 3) ───────────────────────────────────────
+  it("does NOT generate or post an intent summary when one is already present", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const { runner, client, rec } = summaryFakes();
+    const probe = makeCtx({ agents: [lead, coder], summaryIntentPresent: true });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, client, summaryRunner: runner }).run(probe.ctx);
+    assert.deepStrictEqual(rec.intentCalls, [], "intent generation must be skipped on a resume");
+    assert.deepStrictEqual(rec.intentPosts, [], "no intent post on a resume");
+    // The plan hook is unaffected by the intent skip — it still ran.
+    assert.strictEqual(rec.planCalls.length, 1, "the plan hook still fires");
+  });
+
+  // ── Intent fires once, async, and posts the result ───────────────────────────
+  it("generates the intent summary and posts it on a fresh issue run", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const { runner, client, rec, intentPosted } = summaryFakes({
+      generateIntent: () => Promise.resolve("what this run will do"),
+    });
+    const probe = makeCtx({ agents: [lead, coder] });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, client, summaryRunner: runner }).run(probe.ctx);
+    // Fire-and-forget: awaited here only so the assertion is deterministic.
+    await intentPosted;
+    assert.strictEqual(rec.intentCalls.length, 1, "intent generated exactly once");
+    assert.deepStrictEqual(rec.intentPosts, ["what this run will do"], "posted the generated intent");
+    assert.strictEqual(rec.intentCalls[0]!.issueTitle, "Fix login");
+  });
+
+  it("does NOT delay planning on the intent generation (fire-and-forget)", async () => {
+    // The intent generator NEVER resolves. If the intent hook were awaited, the run
+    // could never reach the gate; it does, proving planning proceeds independently.
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const { runner, client, rec } = summaryFakes({
+      generateIntent: () => new Promise<string | null>(() => {}), // pending forever
+    });
+    const probe = makeCtx({ agents: [lead, coder] });
+    const result = await new SdkExecutor(nullLogger(), homeDir, {
+      queryFn,
+      client,
+      summaryRunner: runner,
+    }).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5", "the run completed despite a hung intent generator");
+    assert.strictEqual(rec.intentCalls.length, 1, "intent generation WAS kicked off");
+    assert.deepStrictEqual(rec.intentPosts, [], "but never posted (still pending) — planning did not wait");
+    // The plan summary still generated + posted (the blocking path is independent).
+    assert.strictEqual(rec.planPosts.length, 1);
+  });
+
+  // ── Plan hook fires per revise round (Decision 2) ─────────────────────────────
+  it("generates + posts a plan summary for the initial plan AND each revised plan", async () => {
+    const revise = (feedback: string): PlanVerdict => ({ kind: "revise", feedback });
+    const approve: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan v1"), resultSuccess()],
+      [submitPlan("# Plan v2"), resultSuccess()],
+      [assistantText("implementing"), signalDone(), resultSuccess()],
+    ]);
+    const { runner, client, rec } = summaryFakes();
+    const probe = makeCtx({ agents: [lead, coder, reviewer] }, [revise("add a rollback step"), approve]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, client, summaryRunner: runner }).run(probe.ctx);
+    // Two rounds → two generations + two posts, each carrying the plan_md the gate saw.
+    assert.strictEqual(rec.planCalls.length, 2, "one plan generation per revise round");
+    assert.deepStrictEqual(
+      rec.planPosts.map((p) => p.plan_md),
+      ["# Plan v1", "# Plan v2"],
+      "each post carries the corresponding plan_md as the stale-write guard value",
+    );
+    assert.deepStrictEqual(rec.planCalls.map((c) => c.planMd), ["# Plan v1", "# Plan v2"]);
+  });
+
+  // ── REGRESSION (code review PR #387, finding 1): POST after plan_md is persisted ──
+  // The plan summary carries `plan_md` as the server's stale-write guard value, so the
+  // write only lands once the gate has persisted plan_md (the awaiting_approval report).
+  // An earlier revision POSTed the summary BEFORE calling ctx.gatePlan, so the guard
+  // matched 0 rows (plan_md still NULL / the previous plan) → 409 → the whole plan-summary
+  // half of the feature was silently dropped, invisibly to CI. This models the guard: the
+  // fake client rejects a post whose plan_md is not the currently-persisted one. It passes
+  // only because the summary now fires from the gate's onAwaitingApproval callback, after
+  // persist. Move the POST back before the gate and this test 409s and fails.
+  it("posts the plan summary only AFTER plan_md is persisted, so a guard-enforcing server accepts it", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# The Plan\n- step 1"), resultSuccess()],
+      [assistantText("implementing"), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    const planPosts: { summary: string; deltas: Delta[]; plan_md: string }[] = [];
+    const runner = {
+      async generateIntentSummary(): Promise<string | null> {
+        return "INTENT";
+      },
+      async generatePlanSummary(): Promise<PlanSummaryResult | null> {
+        return { summary: "PLAN SUMMARY", deltas: [{ kind: "added", text: "a step" }] };
+      },
+    } as unknown as SummaryRunner;
+    const client = {
+      async postIntentSummary(): Promise<void> {},
+      async postPlanSummary(
+        _runId: string,
+        body: { summary: string; deltas: Delta[]; plan_md: string },
+      ): Promise<void> {
+        // Model the server's Decision-3 stale-write guard: `plan_md = @expected` matches
+        // only when the posted plan_md still equals the row's persisted plan_md.
+        if (probe.persisted.planMd !== body.plan_md) {
+          throw new Error(
+            `409 stale plan: posted ${JSON.stringify(body.plan_md)} but persisted ${JSON.stringify(probe.persisted.planMd)}`,
+          );
+        }
+        planPosts.push(body);
+      },
+    } as unknown as WorkerClient;
+    await new SdkExecutor(nullLogger(), homeDir, {
+      queryFn,
+      client,
+      summaryRunner: runner,
+    }).run(probe.ctx);
+    assert.strictEqual(
+      planPosts.length,
+      1,
+      "the plan summary landed — posted after plan_md was persisted, so the guard matched",
+    );
+    assert.strictEqual(planPosts[0]!.plan_md, "# The Plan\n- step 1");
+  });
+
+  // ── Seeded / pre-approved → intent only (Decision 5) ─────────────────────────
+  it("a seeded (pre-approved) run posts an intent summary but NEVER a plan summary", async () => {
+    const { queryFn } = fakeTurns([[signalDone(), resultSuccess()]]); // implement only, no planning
+    const { runner, client, rec, intentPosted } = summaryFakes();
+    const probe = makeCtx({
+      agents: [lead, coder],
+      planApproved: true,
+      seeded: true,
+      sessionId: null,
+      approvedPlan: "# User-authored plan\nship it",
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, client, summaryRunner: runner }).run(probe.ctx);
+    await intentPosted;
+    assert.deepStrictEqual(probe.gated, [], "a seeded run never reaches the gate");
+    assert.strictEqual(rec.intentPosts.length, 1, "the intent summary still lands (Decision 5)");
+    assert.deepStrictEqual(rec.planCalls, [], "no plan generation on a gate-less seeded run");
+    assert.deepStrictEqual(rec.planPosts, [], "and therefore no plan post");
+  });
+
+  // ── Issue-only (never on ci_fix / self_improve) ──────────────────────────────
+  for (const kind of ["ci_fix", "self_improve"] as const) {
+    it(`a ${kind} run posts NEITHER an intent nor a plan summary`, async () => {
+      const { queryFn } = fakeTurns([
+        [submitPlan("# Plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const { runner, client, rec } = summaryFakes();
+      // ci_fix needs a pipeline snapshot to be recognised as such; either way the
+      // summary guard keys on kind, so nothing is generated or posted.
+      const overrides: Partial<RunContext> =
+        kind === "ci_fix"
+          ? {
+              kind,
+              pipeline: {
+                id: 1,
+                ref: "main",
+                sha: "deadbeef",
+                web_url: "https://example.test/p/1",
+                failed_jobs: [
+                  { name: "test", stage: "test", web_url: "https://example.test/j/1", log_tail: "boom" },
+                ],
+              },
+            }
+          : { kind };
+      const probe = makeCtx(overrides);
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn, client, summaryRunner: runner }).run(probe.ctx);
+      assert.deepStrictEqual(rec.intentCalls, [], `${kind}: no intent generation`);
+      assert.deepStrictEqual(rec.intentPosts, [], `${kind}: no intent post`);
+      assert.deepStrictEqual(rec.planCalls, [], `${kind}: no plan generation`);
+      assert.deepStrictEqual(rec.planPosts, [], `${kind}: no plan post`);
+    });
+  }
+});
+
+// PRD #390 M3: mid-run milestone-reporting enforcement. On a milestone-bearing run, a
+// work turn that leaves the tracker with NO milestone in progress escalates the NEXT
+// turn's prompt (progressMissedLastTurn) and, after K=2 consecutive misses, emits a
+// feed-only status. Compliant leads (an in_progress declared, even spanning turns) are
+// never nagged; checkpoint and park turns are excluded and a checkpoint re-arms.
+describe("SdkExecutor milestone-reporting enforcement (PRD #390 M3)", () => {
+  /** A submit_plan that ALSO declares a milestone breakdown, so the run is milestone-bearing. */
+  function submitPlanWithMilestones(
+    plan: string,
+    milestones: Array<{ id: string; title: string }>,
+    sessionId = "sess-1",
+  ): SDKMessage {
+    return {
+      type: "assistant",
+      session_id: sessionId,
+      message: {
+        content: [
+          { type: "tool_use", id: "t1", name: "mcp__uzi__submit_plan", input: { plan_md: plan, milestones } },
+        ],
+      },
+    } as unknown as SDKMessage;
+  }
+
+  /** An ask_user tool_use (parks the run between turns, PRD #88). */
+  function askUser(question: string, sessionId = "sess-1"): SDKMessage {
+    return {
+      type: "assistant",
+      session_id: sessionId,
+      message: {
+        content: [
+          { type: "tool_use", id: "ta", name: "mcp__uzi__ask_user", input: { questions: [{ question }] } },
+        ],
+      },
+    } as unknown as SDKMessage;
+  }
+
+  const MILESTONES = [{ id: "m1", title: "First milestone" }];
+  const ESCALATION = "Your last turn marked no milestone in progress.";
+  const ENFORCE_RE = /not marked a milestone in progress|progress may be unreported/;
+
+  /** The enforcement status lines emitted (feed-only), if any. */
+  function enforcementStatuses(emits: EmittedMessage[]): string[] {
+    return emits
+      .filter((m) => m.kind === "status" && ENFORCE_RE.test(String((m.payload as { text?: unknown }).text ?? "")))
+      .map((m) => String((m.payload as { text?: string }).text));
+  }
+
+  /** Whether a captured turn's prompt carried the escalation line. */
+  function escalated(turn: Turn): boolean {
+    return (turn.promptText ?? "").includes(ESCALATION);
+  }
+
+  it("escalates from the 2nd work turn and emits a status after K=2 misses when the lead never reports (run still completes)", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlanWithMilestones("plan", MILESTONES), resultSuccess()], // plan → milestone-bearing
+      [assistantText("work 1"), resultSuccess()], // iter 1: no report → miss 1
+      [assistantText("work 2"), resultSuccess()], // iter 2: escalated, no report → miss 2 → emit
+      [assistantText("work 3"), signalDone(), resultSuccess()], // iter 3: escalated, done
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.strictEqual(result.branch, "agent/issue-5", "the run completes normally — enforcement never fails it");
+    // turns[0] = plan, turns[1..3] = work turns. The 1st work turn is not yet escalated
+    // (no prior miss); the 2nd and 3rd carry the escalation line.
+    assert.ok(!escalated(turns[1]!), "1st work turn is not escalated");
+    assert.ok(escalated(turns[2]!), "2nd work turn is escalated after the 1st turn's miss");
+    assert.ok(escalated(turns[3]!), "3rd work turn stays escalated");
+    // Exactly one enforcement status, emitted once the streak reaches K=2.
+    assert.deepStrictEqual(
+      enforcementStatuses(probe.emits),
+      ["milestone tracker: the lead has not marked a milestone in progress for 2 turns — progress may be unreported"],
+    );
+  });
+
+  it("never nags a compliant lead that declared an in_progress milestone that spans several work turns", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlanWithMilestones("plan", MILESTONES), resultSuccess()], // plan
+      [reportProgress([], ["m1"]), resultSuccess()], // iter 1: declares m1 in progress
+      [assistantText("still on m1"), resultSuccess()], // iter 2: keeps working, no re-report
+      [assistantText("still on m1"), resultSuccess()], // iter 3: still, no re-report
+      [assistantText("done now"), signalDone(), resultSuccess()], // iter 4: done
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.strictEqual(result.branch, "agent/issue-5");
+    // The in_progress latch stays non-empty across the un-reported turns, so no turn is a
+    // miss: no prompt is escalated and no enforcement status is emitted.
+    for (const t of turns.slice(1)) {
+      assert.ok(!escalated(t), "a compliant multi-turn milestone is never escalated");
+    }
+    assert.deepStrictEqual(enforcementStatuses(probe.emits), [], "a compliant lead is never nagged");
+  });
+
+  it("a checkpoint re-arms enforcement: after a checkpoint the streak restarts and escalation only reappears after 2 fresh misses", async () => {
+    const calls: Array<{ reap: boolean; progress?: MilestoneProgress }> = [];
+    const { queryFn, turns } = fakeTurns([
+      [submitPlanWithMilestones("plan", MILESTONES), resultSuccess()], // plan
+      [assistantText("work"), resultSuccess()], // iter 1: no report → miss 1
+      [reportProgress(["m1"], []), checkpointSignal(), resultSuccess()], // iter 2: report + checkpoint → re-arm, continue
+      [assistantText("work"), resultSuccess()], // iter 3: fresh miss 1 (NOT escalated yet)
+      [assistantText("work"), resultSuccess()], // iter 4: escalated, fresh miss 2 → emit
+      [assistantText("done now"), signalDone(), resultSuccess()], // iter 5: done
+    ]);
+    const probe = makeCtx({
+      agents: [lead, coder, reviewer],
+      checkpoint: async (opts) => {
+        calls.push(opts);
+      },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.strictEqual(result.branch, "agent/issue-5");
+    // Exactly one COOPERATIVE checkpoint (reap:true) fired — the others are the
+    // iteration-boundary fallbacks (reap:false) the plain work turns produce. The
+    // cooperative one carries the PRE-clear progress the lead reported this turn.
+    const cooperative = calls.filter((c) => c.reap);
+    assert.deepStrictEqual(cooperative, [{ reap: true, progress: { completed: ["m1"], in_progress: [] } }]);
+    // turns: [0]=plan, [1]=iter1, [2]=iter2(checkpoint), [3]=iter3, [4]=iter4, [5]=iter5.
+    // The checkpoint reset the escalation flag, so the FIRST post-checkpoint work turn is
+    // NOT escalated; escalation only reappears on the 2nd post-checkpoint miss.
+    assert.ok(!escalated(turns[3]!), "the checkpoint re-armed enforcement — the first fresh turn is not escalated");
+    assert.ok(escalated(turns[4]!), "escalation reappears only after 2 fresh misses");
+    // Exactly one enforcement status, emitted on the 2nd fresh miss (not immediately after the checkpoint).
+    assert.strictEqual(enforcementStatuses(probe.emits).length, 1);
+  });
+
+  it("a park (ask_user) turn is excluded from the miss count and never triggers the status emit", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlanWithMilestones("plan", MILESTONES), resultSuccess()], // plan
+      [askUser("which config?"), resultSuccess()], // iter 1: parks — NOT a miss
+      [assistantText("work"), resultSuccess()], // (re-entered) iter 1: no report → miss 1
+      [assistantText("done now"), signalDone(), resultSuccess()], // done
+    ]);
+    let asked = 0;
+    const probe = makeCtx({
+      agents: [lead, coder, reviewer],
+      askUser: async () => {
+        asked++;
+        return { kind: "answer", answers: ["use the default"] };
+      },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.strictEqual(result.branch, "agent/issue-5");
+    assert.strictEqual(asked, 1, "the run parked once to ask the human");
+    // Only ONE real work turn missed (the park is excluded). Had the park counted, the
+    // streak would have reached 2 and emitted — so an empty enforcement list proves exclusion.
+    assert.deepStrictEqual(enforcementStatuses(probe.emits), [], "the park turn is not counted as a miss");
+  });
+
+  it("a run with no milestone breakdown never escalates and never emits an enforcement status", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()], // plan with NO milestones → not milestone-bearing
+      [assistantText("work 1"), resultSuccess()], // iter 1
+      [assistantText("work 2"), resultSuccess()], // iter 2
+      [assistantText("done now"), signalDone(), resultSuccess()], // iter 3: done
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.strictEqual(result.branch, "agent/issue-5");
+    for (const t of turns.slice(1)) {
+      assert.ok(!escalated(t), "a 0-milestone run never escalates");
+    }
+    assert.deepStrictEqual(enforcementStatuses(probe.emits), [], "a 0-milestone run emits no enforcement status");
+  });
+
+  it("a checkpoint with nothing completed drops latestProgress to undefined — never persists an empty [] (M1 invariant, executor side)", async () => {
+    // The re-arm guard's `: undefined` arm: at the checkpoint latestProgress is
+    // {completed:[], in_progress:["m1"]} (in_progress declared, NOTHING really completed),
+    // so completed.length === 0 and the guard MUST drop latestProgress to undefined rather
+    // than carry an empty {completed:[], in_progress:[]} into the next running report. That
+    // is PRD #390 M1's no-signal invariant enforced on the executor side; every other
+    // checkpoint test here reports a non-empty completed, leaving this arm unexercised.
+    const seen: Array<{ iteration: number; progress?: MilestoneProgress }> = [];
+    const { queryFn } = fakeTurns([
+      [submitPlanWithMilestones("plan", MILESTONES), resultSuccess()], // plan → milestone-bearing
+      // iter 1: mark m1 IN PROGRESS but complete nothing, then checkpoint → the guard's
+      // `: undefined` arm fires (completed is empty).
+      [reportProgress([], ["m1"]), checkpointSignal(), resultSuccess()],
+      [assistantText("done now"), signalDone(), resultSuccess()], // iter 2 (post-checkpoint): done
+    ]);
+    const probe = makeCtx({
+      agents: [lead, coder, reviewer],
+      // Record every (iteration, progress) the loop reports, mirroring how the checkpoint
+      // tests record `checkpoint` opts. The shared makeCtx mock keeps only the iteration
+      // number, so this local override is what captures the progress argument.
+      reportIteration: (iteration, progress) => {
+        seen.push({ iteration, progress });
+      },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.strictEqual(result.branch, "agent/issue-5", "the run still completes");
+    // The iteration AFTER the checkpoint must receive undefined — NOT the empty
+    // {completed:[], in_progress:[]} and NOT the pre-clear {completed:[], in_progress:["m1"]}.
+    const postCheckpoint = seen.find((s) => s.iteration === 2);
+    assert.ok(postCheckpoint, "reportIteration ran again after the checkpoint");
+    assert.strictEqual(
+      postCheckpoint!.progress,
+      undefined,
+      "the checkpoint dropped latestProgress to undefined — no empty [] is persisted from the executor side",
+    );
+  });
+});
+
+// PRD #516 M1: the lead session's live context-window fill is read from the SDK
+// Query's `getContextUsage()` control method once per turn and co-attached to the
+// SAME lead assistant frame that latches `payload.usage`, as `payload.context =
+// { used, window, pct }`. On absence/error/timeout of the control method the frame
+// carries NO `context` key and the turn is unaffected (Risks R1/R2, SC5).
+describe("SdkExecutor lead context-window meter (PRD #516 M1)", () => {
+  const USAGE = { input_tokens: 100, output_tokens: 50 };
+
+  /** A lead assistant frame carrying per-call usage — the frame the usage latch
+   *  (and therefore the context co-attach) fires on. */
+  function leadUsageFrame(text: string): SDKMessage {
+    return {
+      type: "assistant",
+      session_id: "sess-1",
+      message: { usage: USAGE, content: [{ type: "text", text }] },
+    } as unknown as SDKMessage;
+  }
+
+  /** Like `fakeTurns`, but the returned query INSTANCE optionally carries a
+   *  `getContextUsage()` control method, mirroring the real SDK `Query`. */
+  function fakeTurnsWithContext(
+    scripts: Script[],
+    getContextUsage?: () => Promise<ContextUsageReading>,
+  ): { queryFn: SdkQueryFn; turns: Turn[] } {
+    const turns: Turn[] = [];
+    let i = 0;
+    const queryFn: SdkQueryFn = (params) => {
+      const script = scripts[Math.min(i, scripts.length - 1)]!;
+      i++;
+      const turn: Turn = { options: params.options };
+      turns.push(turn);
+      const gen = (async function* () {
+        for await (const p of params.prompt) {
+          const rec = p as { message?: { content?: unknown } };
+          const content = rec.message?.content;
+          turn.promptText = typeof content === "string" ? content : JSON.stringify(content);
+        }
+        const s = typeof script === "function" ? script(params.options.abortController!.signal) : script;
+        if (Array.isArray(s)) for (const m of s) yield m;
+        else yield* s as AsyncIterable<SDKMessage>;
+      })();
+      const instance: AsyncIterable<SDKMessage> & {
+        getContextUsage?: () => Promise<ContextUsageReading>;
+      } = gen;
+      if (getContextUsage) instance.getContextUsage = getContextUsage;
+      return instance;
+    };
+    return { queryFn, turns };
+  }
+
+  /** Emitted messages that carry an attached `context` payload key. */
+  function withContext(emits: EmittedMessage[]): EmittedMessage[] {
+    return emits.filter((m) => m.payload["context"] !== undefined);
+  }
+
+  it("attaches payload.context (mapped {used,window,pct}) to the SAME lead frame that carries usage", async () => {
+    const { queryFn } = fakeTurnsWithContext(
+      [
+        [submitPlan("plan"), resultSuccess()],
+        [leadUsageFrame("working"), signalDone(), resultSuccess()],
+      ],
+      async () => ({ totalTokens: 156000, rawMaxTokens: 200000, percentage: 78 }),
+    );
+    const probe = makeCtx();
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5");
+
+    const carriers = withContext(probe.emits);
+    assert.strictEqual(carriers.length, 1, "context attaches exactly once, on the lead usage frame");
+    assert.deepStrictEqual(carriers[0]!.payload["context"], {
+      used: 156000,
+      window: 200000,
+      pct: 78,
+    });
+    // Co-attached: the context rides the very frame that carries usage (the seam the
+    // web consumer reads inside its `"usage" in payload` branch).
+    assert.deepStrictEqual(carriers[0]!.payload["usage"], USAGE);
+  });
+
+  it("preserves an unclamped pct > 100 (near/over-compaction) verbatim", async () => {
+    const { queryFn } = fakeTurnsWithContext(
+      [
+        [submitPlan("plan"), resultSuccess()],
+        [leadUsageFrame("full"), signalDone(), resultSuccess()],
+      ],
+      async () => ({ totalTokens: 210000, rawMaxTokens: 200000, percentage: 105 }),
+    );
+    const probe = makeCtx();
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    const carriers = withContext(probe.emits);
+    assert.strictEqual(carriers.length, 1);
+    assert.strictEqual((carriers[0]!.payload["context"] as { pct: number }).pct, 105);
+  });
+
+  it("getContextUsage that THROWS: no context key, turn completes normally", async () => {
+    const { queryFn } = fakeTurnsWithContext(
+      [
+        [submitPlan("plan"), resultSuccess()],
+        [leadUsageFrame("working"), signalDone(), resultSuccess()],
+      ],
+      async () => {
+        throw new Error("control channel unsupported");
+      },
+    );
+    const probe = makeCtx();
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5", "the run completes despite the failed control call");
+    assert.strictEqual(withContext(probe.emits).length, 0, "no message carries a context key");
+    // The usage attach is untouched by the failed context read.
+    assert.ok(probe.emits.some((m) => m.payload["usage"] !== undefined), "usage still attaches");
+  });
+
+  it("getContextUsage that HANGS: the timeout fires, no context key, turn completes", async () => {
+    const { queryFn } = fakeTurnsWithContext(
+      [
+        [submitPlan("plan"), resultSuccess()],
+        [leadUsageFrame("working"), signalDone(), resultSuccess()],
+      ],
+      // Never resolves — only the executor's Promise.race timeout ends the wait.
+      () => new Promise<ContextUsageReading>(() => {}),
+    );
+    const probe = makeCtx();
+    // A short timeout keeps the test fast (default is 2s) while proving the race.
+    const result = await new SdkExecutor(nullLogger(), homeDir, {
+      queryFn,
+      contextUsageTimeoutMs: 50,
+    }).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5", "the hang does not block the turn");
+    assert.strictEqual(withContext(probe.emits).length, 0, "no message carries a context key");
+  });
+
+  it("NO getContextUsage method (existing fake shape): no context key, turn completes (graceful degradation)", async () => {
+    const { queryFn } = fakeTurnsWithContext([
+      [submitPlan("plan"), resultSuccess()],
+      [leadUsageFrame("working"), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx();
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5");
+    assert.strictEqual(withContext(probe.emits).length, 0, "an absent control method attaches no context");
+    assert.ok(probe.emits.some((m) => m.payload["usage"] !== undefined), "usage still attaches");
   });
 });

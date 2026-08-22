@@ -70,6 +70,14 @@ type runsStore struct {
 	createInputRow store.RunUserInput
 	// reviseCount is what CountRunReviseInputs returns (PRD #41 plan-revision cap).
 	reviseCount int64
+	// PRD #84 M4 4c capability approval gate: the run's owning worker (returned by
+	// GetWorkerByID), and the capture/return of the override clear. clearCapsRows is the
+	// RowsAffected ClearRunRequiredCapabilities returns; on a clear the fake also empties the
+	// run's required set so a subsequent GetRunByIDForUser reload observes the override.
+	worker          store.Worker
+	clearedCapsArg  *store.ClearRunRequiredCapabilitiesParams
+	clearCapsRows   int64
+	createdApproval *store.CreateApprovePlanInputParams
 }
 
 func (s *runsStore) GetRunByIDForUser(_ context.Context, arg store.GetRunByIDForUserParams) (store.Run, error) {
@@ -111,8 +119,19 @@ func (s *runsStore) ListActiveRunsAll(context.Context, pgtype.Timestamptz) ([]st
 func (s *runsStore) CreateRunInput(context.Context, store.CreateRunInputParams) (store.RunUserInput, error) {
 	return s.createInputRow, nil
 }
-func (s *runsStore) CreateApprovePlanInput(context.Context, store.CreateApprovePlanInputParams) (store.RunUserInput, error) {
+func (s *runsStore) CreateApprovePlanInput(_ context.Context, arg store.CreateApprovePlanInputParams) (store.RunUserInput, error) {
+	s.createdApproval = &arg
 	return store.RunUserInput{}, nil
+}
+func (s *runsStore) GetWorkerByID(context.Context, uuid.UUID) (store.Worker, error) {
+	return s.worker, nil
+}
+func (s *runsStore) ClearRunRequiredCapabilities(_ context.Context, arg store.ClearRunRequiredCapabilitiesParams) (int64, error) {
+	s.clearedCapsArg = &arg
+	// Mirror the real owner+status-guarded UPDATE: empty the run's required set so a
+	// subsequent GetRunByIDForUser reload (inside SubmitInput) observes the override.
+	s.run.RequiredCapabilities = nil
+	return s.clearCapsRows, nil
 }
 func (s *runsStore) CountRunReviseInputs(context.Context, uuid.UUID) (int64, error) {
 	return s.reviseCount, nil
@@ -207,6 +226,41 @@ func TestRunToDTOStopKind(t *testing.T) {
 	unstamped := runToDTO(store.Run{Status: "completed"}, "normal")
 	if unstamped.StopKind != nil {
 		t.Errorf("an unstamped stop_kind must map to nil, got %q", *unstamped.StopKind)
+	}
+}
+
+// TestRunToDTORequirementSet pins that PRD #84's inferred/hinted requirement set reaches the
+// RunDTO runToDTO builds: required_capabilities and required_tools surface their values and
+// are normalized to a non-nil empty slice ([] over null) when the column is empty, and
+// size_class surfaces the NOT NULL DEFAULT ” string. Covers the M4 4c DTO exposure the
+// web/CLI (4d) derive the readiness/mismatch display from.
+func TestRunToDTORequirementSet(t *testing.T) {
+	populated := runToDTO(store.Run{
+		Status:               "awaiting_approval",
+		RequiredCapabilities: []string{"docker"},
+		RequiredTools:        []string{"go", "node"},
+		SizeClass:            "m",
+	}, "normal")
+	if len(populated.RequiredCapabilities) != 1 || populated.RequiredCapabilities[0] != "docker" {
+		t.Errorf("required_capabilities = %v, want [docker]", populated.RequiredCapabilities)
+	}
+	if len(populated.RequiredTools) != 2 || populated.RequiredTools[0] != "go" {
+		t.Errorf("required_tools = %v, want [go node]", populated.RequiredTools)
+	}
+	if populated.SizeClass != "m" {
+		t.Errorf("size_class = %q, want m", populated.SizeClass)
+	}
+
+	// Empty columns ⇒ non-nil empty slices ([] over null) and "" for size_class.
+	empty := runToDTO(store.Run{Status: "queued"}, "normal")
+	if empty.RequiredCapabilities == nil || len(empty.RequiredCapabilities) != 0 {
+		t.Errorf("required_capabilities = %v, want non-nil empty", empty.RequiredCapabilities)
+	}
+	if empty.RequiredTools == nil || len(empty.RequiredTools) != 0 {
+		t.Errorf("required_tools = %v, want non-nil empty", empty.RequiredTools)
+	}
+	if empty.SizeClass != "" {
+		t.Errorf("size_class = %q, want empty", empty.SizeClass)
 	}
 }
 

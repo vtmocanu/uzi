@@ -19,7 +19,7 @@ export function isNearBottom(
 }
 
 export interface FollowScroll {
-  ref: React.RefObject<HTMLDivElement>;
+  ref: React.RefObject<HTMLDivElement | null>;
   onScroll: () => void;
   /** True while the user has scrolled up (follow paused). */
   paused: boolean;
@@ -82,7 +82,7 @@ export function useFollowScroll(itemCount: number): FollowScroll {
 // whole point of making follow opt-in. It also tails once on the false→true transition
 // so turning Follow on snaps to the newest line. Instant scroll, never smooth (a burst
 // of frames makes smooth scrolling lag), matching useFollowScroll.
-export function useTailOnAppend(count: number, enabled: boolean): React.RefObject<HTMLDivElement> {
+export function useTailOnAppend(count: number, enabled: boolean): React.RefObject<HTMLDivElement | null> {
   const ref = useRef<HTMLDivElement>(null);
   const prevCount = useRef(count);
   const prevEnabled = useRef(enabled);

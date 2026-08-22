@@ -133,6 +133,21 @@ describe("IssueCard — the forge title carries no format characters (#124)", ()
   });
 });
 
+// Issue #562. A title carrying a long unbreakable token (e.g. an env-var assignment)
+// overflowed the fixed w-72 lane because the title <Link> could neither wrap nor shrink.
+// jsdom does no layout, so pixel overflow is unassertable here; the enforceable unit-level
+// guard is that the two utilities the fix depends on are present on the title link. Both are
+// required together — break-words lets the token wrap, min-w-0 overrides the flex child's
+// default min-width:auto so the wrap can take effect — so both are asserted.
+describe("IssueCard — long-token title can wrap within the lane (#562)", () => {
+  it("gives the title link min-w-0 and break-words", () => {
+    renderCard({ title: "Revert #550: CLAUDE_CODE_ENABLE_TODO_TOOLS=1 is a no-op", iid: 7 });
+    const link = screen.getByRole("link", { name: /Revert #550/ });
+    expect(link.className).toContain("min-w-0");
+    expect(link.className).toContain("break-words");
+  });
+});
+
 // PRD #102 M4. The predicate itself is unit-tested in labelChips.test.ts; these cover
 // what the card does with the result, which is the half a pure test cannot see.
 describe("IssueCard label chips (PRD #102 M4)", () => {
@@ -209,8 +224,8 @@ describe("IssueCard label chips (PRD #102 M4)", () => {
   });
 
   it("caps the visible chips and reports the rest as +N rather than dropping them", () => {
-    // The lane is a fixed w-72; an issue wearing eight labels must not push the card
-    // several rows taller than its neighbours.
+    // The lane is a fixed w-72 (issue #373 reverted #367's flex-1 basis-72); an issue
+    // wearing eight labels must not push the card several rows taller than its neighbours.
     renderCard({}, ["a", "b", "c", "d", "e", "f"]);
     expect(screen.getByText("+2")).toBeTruthy();
     expect(screen.queryByText("e")).toBeNull();
@@ -939,37 +954,161 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
     release({ board: aBoard() });
   });
 
-  // S4 (browser pass). Closed cards keep a NULL position by design, so the payload
-  // returns them in the SQL fallback order and the lane jumped on the first drop from
-  // any non-iid mode — including a drop that moved nothing at all.
-  it("keeps the Closed lane in iid order whatever the board mode is", async () => {
-    const withClosed = () => [
-      ...cards(),
-      aCard({ iid: 15, title: "issue fifteen", column: "", closed: true, forge_updated_at: "2026-09-01T00:00:00Z" }),
-      aCard({ iid: 18, title: "issue eighteen", column: "", closed: true, forge_updated_at: "2026-08-01T00:00:00Z" }),
-    ];
-    mockApi.getBoard.mockResolvedValue({ board: aBoard({ cards: withClosed() }) });
-    renderBoard();
-    await screen.findByText("Backlog");
-
-    const closedIids = () =>
-      within(laneFor("Closed"))
-        .getAllByRole("link", { name: /^issue / })
-        .map((a) => a.textContent);
-
-    // Under `updated`, 15 is newer than 18 — so a mode-sorted Closed lane would put 15
-    // first. It must stay in iid order either way.
-    // 15, 18, 99 — the base fixture already contributes a closed card at iid 99.
-    expect(closedIids()).toEqual(["issue fifteen", "issue eighteen", "issue closed"]);
-    fireEvent.change(screen.getByRole("combobox", { name: "Sort" }), { target: { value: "updated" } });
-    expect(closedIids()).toEqual(["issue fifteen", "issue eighteen", "issue closed"]);
-  });
+  // NOTE (#412 M3): the pre-#412 test "keeps the Closed lane in iid order whatever the
+  // board mode is" lived here. #412 M2 REMOVED the Closed-lane iid pin (Board.tsx S4), so
+  // that assertion now contradicts the shipped feature — Closed flows through sortCards
+  // like every other lane. The behaviour is re-covered, at its new (de-pinned) contract,
+  // by the "direction toggle (#412)" describe below (Closed honours mode+direction, and
+  // the accepted post-drop revert to iid order). The stale test was left red by M2 and is
+  // removed here rather than kept asserting behaviour the code no longer has.
 
   it("degrades a corrupt persisted mode to Manual instead of breaking the board", async () => {
     store.set("uzi.board.repo-1.sortMode", '"not-a-mode"');
     renderBoard();
     await screen.findByText("Backlog");
     expect((screen.getByRole("combobox", { name: "Sort" }) as HTMLSelectElement).value).toBe("manual");
+  });
+
+  // The direction toggle (#412). Nested here so it reuses the outer harness: `store`,
+  // renderBoard(), laneFor(), moveBtn(), the cards()/aBoard() fixtures. sortDir persists
+  // at `uzi.board.<repo>.sortDir` as a JSON string ('"asc"'/'"desc"'); DEFAULT_SORT_DIR
+  // is iid:asc, run:desc, updated:desc, title:asc, manual:desc.
+  describe("direction toggle (#412)", () => {
+    // Local rendered-order reader (same shape as the outer suite's at :640). Closed cards
+    // DO render an anchor matching /^issue /, so this reads the Closed lane too.
+    const titlesIn = (lane: HTMLElement) =>
+      within(lane)
+        .getAllByRole("link", { name: /^issue / })
+        .map((a) => a.textContent);
+
+    const dirBtn = () => screen.getByRole("button", { name: /Sort direction/ }) as HTMLButtonElement;
+    const setSort = (value: string) =>
+      fireEvent.change(screen.getByRole("combobox", { name: "Sort" }), { target: { value } });
+
+    // A clean two-closed-card board: closed iids 15,18 in payload IID-ASCENDING order,
+    // plus open cards 1,2 in Backlog so a keyboard reorder has a valid neighbour. No card
+    // 99/9, so the Closed lane holds exactly [15,18] and the observation is unambiguous.
+    const twoClosed = (): Card[] => [
+      aCard({ iid: 1, title: "issue one", column: "", labels: ["PRD"], forge_updated_at: "2026-01-01T00:00:00Z" }),
+      aCard({ iid: 2, title: "issue two", column: "", labels: ["PRD"], forge_updated_at: "2026-02-01T00:00:00Z" }),
+      aCard({ iid: 15, title: "issue fifteen", column: "", closed: true, labels: ["PRD"], forge_updated_at: "2026-09-01T00:00:00Z" }),
+      aCard({ iid: 18, title: "issue eighteen", column: "", closed: true, labels: ["PRD"], forge_updated_at: "2026-08-01T00:00:00Z" }),
+    ];
+
+    // 1. Toggle renders; DISABLED in Manual, ENABLED once a non-manual mode is chosen.
+    // The disabled-negative is PAIRED with the enabled-positive on the SAME control, so
+    // neither half is vacuous (a control that never renders would fail the presence check).
+    it("renders disabled in Manual and enabled in a non-manual mode", async () => {
+      renderBoard();
+      await screen.findByText("Backlog");
+      // Default load is Manual: the control is present/visible but inert.
+      const btn = dirBtn();
+      expect(btn).not.toBeNull();
+      expect(btn.disabled).toBe(true);
+      // A non-manual mode enables the SAME control.
+      setSort("updated");
+      expect(dirBtn().disabled).toBe(false);
+    });
+
+    // 2. Clicking the toggle persists sortDir and REVERSES the open lane's rendered order.
+    it("persists sortDir and reverses the open lane on click", async () => {
+      renderBoard();
+      await screen.findByText("Backlog");
+      // updated defaults to desc → Backlog renders newest-first = reverse of iid order.
+      setSort("updated");
+      const desc = titlesIn(laneFor("Backlog"));
+      expect(desc).toEqual(["issue four", "issue three", "issue two", "issue one"]);
+      // Before the click: desc default, so aria-pressed is "true" and the label reads down.
+      expect(dirBtn().getAttribute("aria-pressed")).toBe("true");
+      expect(dirBtn().textContent).toBe("↓ Descending");
+
+      fireEvent.click(dirBtn());
+
+      // Persisted to asc…
+      expect(store.get("uzi.board.repo-1.sortDir")).toBe('"asc"');
+      // …the lane reversed to ascending…
+      const asc = titlesIn(laneFor("Backlog"));
+      expect(asc).toEqual(["issue one", "issue two", "issue three", "issue four"]);
+      // …and the reversal is REAL (non-vacuous): the two orders genuinely differ.
+      expect(asc).not.toEqual(desc);
+      // …and the control flipped its pressed state and its visible label/name.
+      expect(dirBtn().getAttribute("aria-pressed")).toBe("false");
+      expect(dirBtn().textContent).toBe("↑ Ascending");
+      expect(dirBtn().getAttribute("aria-label")).toBe("Sort direction: ascending");
+    });
+
+    // 3. Switching mode RESETS the persisted direction to the new mode's default. updated
+    // and run both default desc, so the reset is only observable if the current direction
+    // differs — hence: switch to updated, toggle to asc, then switch to run (default desc)
+    // so the reset desc≠asc actually changes state and the DOM.
+    it("resets the persisted direction to the new mode's default on a mode switch", async () => {
+      renderBoard();
+      await screen.findByText("Backlog");
+      setSort("updated");
+      fireEvent.click(dirBtn()); // updated desc → asc
+      expect(store.get("uzi.board.repo-1.sortDir")).toBe('"asc"');
+      expect(dirBtn().textContent).toBe("↑ Ascending");
+
+      // run defaults to desc: switching resets asc → desc.
+      setSort("run");
+      expect(store.get("uzi.board.repo-1.sortDir")).toBe('"desc"');
+      expect(dirBtn().textContent).toBe("↓ Descending");
+    });
+
+    // 4. The Closed lane honours mode + direction — a Manual/asc case and a desc case.
+    // Two closed cards (15,18) make the order observable, and the desc reversal proves the
+    // #412 pin removal: before M2 the Closed lane was permanently iid-pinned and would NOT
+    // reverse.
+    it("sorts the Closed lane by mode+direction, reversing on the toggle", async () => {
+      mockApi.getBoard.mockResolvedValue({ board: aBoard({ cards: twoClosed() }) });
+      renderBoard();
+      await screen.findByText("Backlog");
+
+      // Manual (default) is identity over the iid-ordered payload → [15,18] ascending.
+      expect(titlesIn(laneFor("Closed"))).toEqual(["issue fifteen", "issue eighteen"]);
+
+      // iid asc (its default) keeps [15,18]…
+      setSort("iid");
+      const closedAsc = titlesIn(laneFor("Closed"));
+      expect(closedAsc).toEqual(["issue fifteen", "issue eighteen"]);
+      // …and the toggle reverses Closed to desc [18,15]. This is the case the old iid pin
+      // could never produce (it re-sorted Closed to iid order in every mode).
+      fireEvent.click(dirBtn());
+      const closedDesc = titlesIn(laneFor("Closed"));
+      expect(closedDesc).toEqual(["issue eighteen", "issue fifteen"]);
+      // Non-vacuous: the reversal really changed the lane.
+      expect(closedDesc).not.toEqual(closedAsc);
+    });
+
+    // 5. Post-drop Closed transition — the accepted S4 behaviour (Design Decision 5, and
+    // the rewritten S4 comment in Board.tsx cardsByColumn). A drop calls setSortMode(
+    // "manual"); because the drop-freeze excludes closed cards, the OPEN lanes keep their
+    // just-frozen order while the CLOSED lane alone reverts from mode+dir order back to iid
+    // ascending. This isolated Closed reversion is the KNOWN, ACCEPTED cost of de-pinning —
+    // asserted here so a future reader does NOT re-add the pin to "fix" it (doing so
+    // silently reverts #412).
+    it("reverts the Closed lane to iid order after a drop flips the board to Manual", async () => {
+      // Both endpoints return the two-closed board so the closed cards survive the reorder.
+      mockApi.getBoard.mockResolvedValue({ board: aBoard({ cards: twoClosed() }) });
+      mockApi.reorderBoard.mockResolvedValue({ board: aBoard({ cards: twoClosed() }) });
+      renderBoard();
+      await screen.findByText("Backlog");
+
+      // iid + toggle → desc: Closed shows [18,15] (mode+dir applied).
+      setSort("iid");
+      fireEvent.click(dirBtn());
+      expect(titlesIn(laneFor("Closed"))).toEqual(["issue eighteen", "issue fifteen"]);
+
+      // Reorder an OPEN card. Backlog renders iid-desc here = [2,1], so card 1 is last and
+      // its "up" is the valid move (its "down" is disabled at the end of the lane).
+      fireEvent.click(moveBtn(1, "up"));
+      await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
+      // The board is now Manual…
+      await waitFor(() => expect(store.get("uzi.board.repo-1.sortMode")).toBe('"manual"'));
+      // …and the Closed lane has reverted to iid-ascending [15,18] — Manual is identity over
+      // the iid-ordered payload, so the desc order the toggle produced is gone. Accepted.
+      expect(titlesIn(laneFor("Closed"))).toEqual(["issue fifteen", "issue eighteen"]);
+    });
   });
 });
 
@@ -1395,7 +1534,11 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
   // Only the four fields the strip's predicates read. RunListItem extends Run and
   // carries ~30 more that no code path here touches.
   const aRun = (over: { id: string; status: string; health: string; issue_iid: number }) =>
-    over as unknown as import("../lib/api").RunListItem;
+    // Issue #485 review FIX 2: the strip's overlay <Link> is now named by the run title
+    // as well, so the fixture must carry an issue_title the way the real RunListItem does
+    // (RunListItem.issue_title is a non-optional string; this cast used to omit it because
+    // the strip never read it before).
+    ({ issue_title: "Fix the parser", ...over }) as unknown as import("../lib/api").RunListItem;
 
   beforeEach(() => {
     vi.mocked(useAuth).mockReturnValue({
@@ -1434,7 +1577,8 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
       </MemoryRouter>,
     );
 
-  const strip = () => screen.getByText(/needs approval|needs an answer|looks? stuck|look stuck/);
+  const strip = () =>
+    screen.getByText(/needs approval|needs an answer|awaiting follow-up|looks? stuck|look stuck/);
 
   it("does not double-list an awaiting_approval run flagged waiting_worker", async () => {
     mockApi.listRuns.mockResolvedValue({
@@ -1447,7 +1591,11 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
     expect(strip().textContent).toBe("1 run needs approval");
     // ...and one chip, not two. The strip spreads all three buckets into one .map keyed
     // on r.id, so a double-list is also a duplicate React key.
-    expect(screen.getAllByRole("link", { name: "#7 →" })).toHaveLength(1);
+    // Issue #485 NB1: the pill's navigational element is now a stretched-link overlay
+    // named by its aria-label (the forge ref anchor is a sibling, not a nested <a>), so
+    // the per-run chip is this "Open run for issue #7: Fix the parser" link (FIX 2 adds
+    // the title to the accessible name) — still exactly one.
+    expect(screen.getAllByRole("link", { name: "Open run for issue #7: Fix the parser" })).toHaveLength(1);
   });
 
   it("still lists a genuinely stuck run — the control", async () => {
@@ -1458,7 +1606,7 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
     });
     renderBoard();
     await screen.findByText("1 run looks stuck");
-    expect(screen.getAllByRole("link", { name: "#7 →" })).toHaveLength(1);
+    expect(screen.getAllByRole("link", { name: "Open run for issue #7: Fix the parser" })).toHaveLength(1);
   });
 
   it("keeps the buckets separate when two different runs are in different states", async () => {
@@ -1470,7 +1618,7 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
     });
     renderBoard();
     await screen.findByText("1 run needs approval · 1 run looks stuck");
-    expect(screen.getAllByRole("link", { name: /#(7|8) →/ })).toHaveLength(2);
+    expect(screen.getAllByRole("link", { name: /Open run for issue #(7|8)/ })).toHaveLength(2);
   });
 
   it("does not double-list an awaiting_input run that still carries a flag", async () => {
@@ -1483,7 +1631,35 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
     renderBoard();
     await screen.findByText("1 run needs an answer");
     expect(strip().textContent).toBe("1 run needs an answer");
-    expect(screen.getAllByRole("link", { name: "#7 →" })).toHaveLength(1);
+    expect(screen.getAllByRole("link", { name: "Open run for issue #7: Fix the parser" })).toHaveLength(1);
+  });
+
+  it("counts an awaiting_followup run and offers it a jump-chip (PRD #517)", async () => {
+    // A follow-up park is a needs-you state carrying the same loud ring (needsHumanAttention)
+    // as the two parks above, so the strip must tally it and jump-link it. Reverting the
+    // followupRuns bucket drops both the clause and the chip — the strip then undercounts the
+    // visible loud card.
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "run-4", status: "awaiting_followup", health: "ok", issue_iid: 7 })],
+    });
+    renderBoard();
+    await screen.findByText("1 run awaiting follow-up");
+    expect(strip().textContent).toBe("1 run awaiting follow-up");
+    expect(screen.getAllByRole("link", { name: "Open run for issue #7: Fix the parser" })).toHaveLength(1);
+  });
+
+  it("keeps awaiting_followup in its OWN clause, separate from the answer count (PRD #517)", async () => {
+    // A follow-up park is not an unanswered question, so it is its own bucket rather than
+    // folded into questionRuns: two distinct clauses, two distinct chips.
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "run-3", status: "awaiting_input", health: "ok", issue_iid: 7 }),
+        aRun({ id: "run-4", status: "awaiting_followup", health: "ok", issue_iid: 8 }),
+      ],
+    });
+    renderBoard();
+    await screen.findByText("1 run needs an answer · 1 run awaiting follow-up");
+    expect(screen.getAllByRole("link", { name: /Open run for issue #(7|8)/ })).toHaveLength(2);
   });
 });
 

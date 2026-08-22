@@ -126,7 +126,7 @@ SET guardrail_override_reason = NULL,
     guardrail_override_by     = NULL,
     guardrail_override_at     = NULL
 WHERE id = $1
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities
 `
 
 // PRD #66 M8 (D8): revoke the admin per-repo override, re-arming the guardrail
@@ -150,8 +150,28 @@ func (q *Queries) ClearRepoGuardrailOverride(ctx context.Context, id uuid.UUID) 
 		&i.GuardrailOverrideReason,
 		&i.GuardrailOverrideBy,
 		&i.GuardrailOverrideAt,
+		&i.RequiredCapabilities,
 	)
 	return i, err
+}
+
+const countActiveRunsForRepo = `-- name: CountActiveRunsForRepo :one
+SELECT count(*) FROM runs
+WHERE repo_id = $1::uuid
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+`
+
+// Non-terminal run count for a repo (PRD #357 D7). "Disabled" is not "quiescent":
+// disabling only drops the repo from the poll set, it does not cancel an in-flight
+// run. Removal is refused while any run is in a non-terminal state. Uses the
+// terminal complement (like CountActiveRunsWithBranch, ci_fix.sql) so it covers
+// limit_wait (a parked run is still in flight, PRD #35) and any future non-terminal
+// status without an edit here.
+func (q *Queries) CountActiveRunsForRepo(ctx context.Context, repoID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countActiveRunsForRepo, repoID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
 }
 
 const countBoardColumns = `-- name: CountBoardColumns :one
@@ -211,6 +231,30 @@ type DeleteIssuesNotInParams struct {
 // mean "the forge really is empty" rather than "one request timed out".
 func (q *Queries) DeleteIssuesNotIn(ctx context.Context, arg DeleteIssuesNotInParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteIssuesNotIn, arg.RepoID, arg.KeepIids)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteRepoForUser = `-- name: DeleteRepoForUser :execrows
+DELETE FROM repos
+WHERE repos.id = $1
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $2)
+  AND repos.enabled = false
+`
+
+type DeleteRepoForUserParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// Owner-scoped hard delete of a single repo (PRD #357). The `AND enabled = false`
+// is the atomic race guard (D6): a concurrent enable between the handler's fetch
+// and this delete must not let a tracked repo through. Cascades derived data
+// (runs, cached issues, board columns, ...) via existing FKs.
+func (q *Queries) DeleteRepoForUser(ctx context.Context, arg DeleteRepoForUserParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteRepoForUser, arg.ID, arg.UserID)
 	if err != nil {
 		return 0, err
 	}
@@ -354,11 +398,65 @@ func (q *Queries) GetLatestRunForIssue(ctx context.Context, arg GetLatestRunForI
 	return i, err
 }
 
+const getRepoByID = `-- name: GetRepoByID :one
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
+       r.default_branch, r.enabled,
+       c.forge_type, c.base_url, c.token_ciphertext, c.user_id
+FROM repos r
+JOIN forge_connections c ON c.id = r.connection_id
+WHERE r.id = $1
+`
+
+type GetRepoByIDRow struct {
+	ID                uuid.UUID   `json:"id"`
+	ConnectionID      uuid.UUID   `json:"connection_id"`
+	ForgeProjectID    int64       `json:"forge_project_id"`
+	PathWithNamespace string      `json:"path_with_namespace"`
+	WebUrl            string      `json:"web_url"`
+	DefaultBranch     pgtype.Text `json:"default_branch"`
+	Enabled           bool        `json:"enabled"`
+	ForgeType         string      `json:"forge_type"`
+	BaseUrl           string      `json:"base_url"`
+	TokenCiphertext   []byte      `json:"token_ciphertext"`
+	UserID            uuid.UUID   `json:"user_id"`
+}
+
+// One repo plus the connection fields needed to build a forge client, UNSCOPED by
+// user. Modeled on GetRepoForUser but WITHOUT the user_id filter. The GitHub
+// Projects v2 sync (PRD #364 M3) that drives it is an OWNER-OR-ADMIN route as of
+// issue #534 (relocated out of /admin): a non-admin caller is authorized by the
+// handler's own GetRepoForUser preflight BEFORE this query runs, while an admin
+// skips that preflight and targets a repo by id regardless of which user owns its
+// connection. So the ownership guard for this unscoped query lives in the HANDLER
+// (the preflight), not in the route being admin-only — do not add a caller that
+// reaches this query without an equivalent ownership check (precedent:
+// SetRepoGuardrailOverride is the unscoped admin write). Returns the joined
+// connection fields the forge builder needs (forge_type, base_url, token_ciphertext)
+// plus forge_project_id for slug/issue resolution.
+func (q *Queries) GetRepoByID(ctx context.Context, id uuid.UUID) (GetRepoByIDRow, error) {
+	row := q.db.QueryRow(ctx, getRepoByID, id)
+	var i GetRepoByIDRow
+	err := row.Scan(
+		&i.ID,
+		&i.ConnectionID,
+		&i.ForgeProjectID,
+		&i.PathWithNamespace,
+		&i.WebUrl,
+		&i.DefaultBranch,
+		&i.Enabled,
+		&i.ForgeType,
+		&i.BaseUrl,
+		&i.TokenCiphertext,
+		&i.UserID,
+	)
+	return i, err
+}
+
 const getRepoForUser = `-- name: GetRepoForUser :one
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled,
        r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at,
-       c.forge_type, c.base_url, c.token_ciphertext, c.user_id
+       c.forge_type, c.base_url, c.token_ciphertext, c.user_id, c.bot_forge_user_id
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE r.id = $1 AND c.user_id = $2
@@ -384,6 +482,7 @@ type GetRepoForUserRow struct {
 	BaseUrl                 string             `json:"base_url"`
 	TokenCiphertext         []byte             `json:"token_ciphertext"`
 	UserID                  uuid.UUID          `json:"user_id"`
+	BotForgeUserID          int64              `json:"bot_forge_user_id"`
 }
 
 // One repo plus the connection fields needed to build a forge client, scoped to
@@ -409,6 +508,7 @@ func (q *Queries) GetRepoForUser(ctx context.Context, arg GetRepoForUserParams) 
 		&i.BaseUrl,
 		&i.TokenCiphertext,
 		&i.UserID,
+		&i.BotForgeUserID,
 	)
 	return i, err
 }
@@ -505,7 +605,7 @@ func (q *Queries) ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]Boa
 }
 
 const listEnabledReposByConnection = `-- name: ListEnabledReposByConnection :many
-SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at FROM repos WHERE connection_id = $1 AND enabled = true
+SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities FROM repos WHERE connection_id = $1 AND enabled = true
 ORDER BY path_with_namespace ASC
 `
 
@@ -535,6 +635,7 @@ func (q *Queries) ListEnabledReposByConnection(ctx context.Context, connectionID
 			&i.GuardrailOverrideReason,
 			&i.GuardrailOverrideBy,
 			&i.GuardrailOverrideAt,
+			&i.RequiredCapabilities,
 		); err != nil {
 			return nil, err
 		}
@@ -547,7 +648,7 @@ func (q *Queries) ListEnabledReposByConnection(ctx context.Context, connectionID
 }
 
 const listEnabledReposForUser = `-- name: ListEnabledReposForUser :many
-SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at FROM repos r
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE c.user_id = $1 AND r.enabled = true
 ORDER BY r.path_with_namespace ASC
@@ -577,6 +678,7 @@ func (q *Queries) ListEnabledReposForUser(ctx context.Context, userID uuid.UUID)
 			&i.GuardrailOverrideReason,
 			&i.GuardrailOverrideBy,
 			&i.GuardrailOverrideAt,
+			&i.RequiredCapabilities,
 		); err != nil {
 			return nil, err
 		}
@@ -846,7 +948,7 @@ func (q *Queries) ListLatestRunsForRepo(ctx context.Context, repoID uuid.UUID) (
 const listMRWatchCandidates = `-- name: ListMRWatchCandidates :many
 WITH latest AS (
     SELECT DISTINCT ON (r.issue_iid)
-           r.id, r.issue_iid, r.status, r.mr_iid, r.mr_state
+           r.id, r.issue_iid, r.status, r.mr_iid, r.mr_state, r.created_at
     FROM runs r
     WHERE r.repo_id = $1
     ORDER BY r.issue_iid, r.created_at DESC
@@ -856,8 +958,22 @@ FROM latest l
 JOIN issues i ON i.repo_id = $1 AND i.forge_issue_iid = l.issue_iid
 WHERE l.status = 'completed'
   AND l.mr_iid IS NOT NULL
-  AND i.state = 'opened'
-  AND (jsonb_exists(i.labels, 'Human Review') OR l.mr_state = 'closed')
+  AND (
+    -- Lane A (UNCHANGED): open-issue board-move watch — card in Human Review
+    -- (close-edge) or run already recorded closed (reopen-edge, Decision 10).
+    (i.state = 'opened' AND (jsonb_exists(i.labels, 'Human Review') OR l.mr_state = 'closed'))
+    OR
+    -- Lane B (NEW, #527): closed-issue terminal-state recording. A merge CLOSES the
+    -- issue (Closes #N) before SyncMRStates runs, so the merged state is only
+    -- observable after i.state='closed'. Keep polling until mr_state is terminal
+    -- (merged/closed). Move-free by construction: bootstrap and the merged/locked
+    -- transition never move a card, and the edge paths skip a closed issue
+    -- (mr_watch.go syncOneMRState / guardedMRMove). ` + "`" + `locked` + "`" + ` is a transient
+    -- mid-merge state, kept polling so it settles to merged (Decision D5).
+    (i.state = 'closed' AND (l.mr_state IS NULL OR l.mr_state IN ('opened', 'locked')))
+  )
+ORDER BY (i.state = 'opened') DESC, l.created_at DESC
+LIMIT 100
 `
 
 type ListMRWatchCandidatesRow struct {
@@ -878,13 +994,30 @@ type ListMRWatchCandidatesRow struct {
 // suppressed), and a completed latest run whose own mr_iid is NULL yields none
 // either (never fall back to an older run's MR).
 //
-// The issue must be open, and a COARSE column prefilter keeps the polled set
-// tiny: the card is either labelled Human Review (the close-edge watch) or the
-// run already recorded mr_state='closed' (the reopen-edge watch, Decision 10).
-// This prefilter is deliberately NOT board.ResolveColumn — highest-position-wins
-// across multiple column labels is not cheaply expressible in SQL, so the
-// authoritative source-column guard is the Go ResolveColumn check in the watcher;
-// this only bounds how many MRs get polled.
+// The candidate set now spans TWO lanes. Lane A (UNCHANGED, PRD #24) is the
+// open-issue board-move watch: the issue is open and a COARSE column prefilter
+// keeps the polled set tiny — the card is either labelled Human Review (the
+// close-edge watch) or the run already recorded mr_state='closed' (the
+// reopen-edge watch, Decision 10). This prefilter is deliberately NOT
+// board.ResolveColumn — highest-position-wins across multiple column labels is
+// not cheaply expressible in SQL, so the authoritative source-column guard is the
+// Go ResolveColumn check in the watcher; this only bounds how many MRs get polled.
+//
+// Lane B (NEW, #527) is the closed-issue terminal-recording lane. A merge CLOSES
+// the issue (via `Closes #N`) before SyncMRStates runs, so a merged state is only
+// observable once i.state='closed' — Lane A would never see it. Lane B keeps
+// polling a closed issue's latest run until its mr_state reaches a terminal value
+// (merged/closed), recording that state; it moves NO card (bootstrap and the
+// merged/locked transition are move-free, and the edge paths skip a closed issue),
+// so it only backfills historical merged PRs and decays as each run settles to a
+// terminal state. The Go ResolveColumn check remains authoritative for board moves.
+// Open-issue (Lane A) candidates first so the board-move watch is never deferred
+// behind a closed-issue backfill burst; then newest runs first so recent merges
+// record before old ones. Qualify l.created_at (not bare) — `issues` has none.
+// LIMIT 100 is a hardcoded burst bound (Decision D4): not a sqlc param, so zero Go
+// signature change; 100 comfortably exceeds any realistic Lane-A count. Keep this
+// rationale ABOVE the statement — a comment trailing after the `;` is grabbed by
+// sqlc as the leading doc of the NEXT query.
 func (q *Queries) ListMRWatchCandidates(ctx context.Context, repoID uuid.UUID) ([]ListMRWatchCandidatesRow, error) {
 	rows, err := q.db.Query(ctx, listMRWatchCandidates, repoID)
 	if err != nil {
@@ -1005,9 +1138,11 @@ type ListPRDLinkPatchCandidatesRow struct {
 //     whole point: a merge CLOSES the issue via the `Closes #N` in the MR
 //     description, and the poller runs the issue sync BEFORE SyncMRStates, so by the
 //     time a merge is observable the issue is already state='closed'.
-//     ListMRWatchCandidates requires i.state = 'opened' and would therefore miss
-//     this deterministically — which is why PRD #24's prefilter is not reused here
-//     and must not be widened to cover it.
+//     ListMRWatchCandidates now has a closed-issue lane too (#527), BUT that lane
+//     only RECORDS mr_state — it performs no forge description write and no
+//     PRD-link patch — so ListPRDLinkPatchCandidates remains a SEPARATE query: it
+//     does a forge description WRITE with its own superseded-run and edge scoping
+//     (Decision 10), which #527's record-only lane does not and cannot supply.
 //
 // issue_description is the run's QUEUE-TIME snapshot, pulled in the candidate scan
 // rather than by a second read per candidate. It is what binds the patch target:
@@ -1040,7 +1175,7 @@ func (q *Queries) ListPRDLinkPatchCandidates(ctx context.Context, arg ListPRDLin
 }
 
 const listReposByConnectionForUser = `-- name: ListReposByConnectionForUser :many
-SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at FROM repos r
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE r.connection_id = $1 AND c.user_id = $2
 ORDER BY r.path_with_namespace ASC
@@ -1075,6 +1210,7 @@ func (q *Queries) ListReposByConnectionForUser(ctx context.Context, arg ListRepo
 			&i.GuardrailOverrideReason,
 			&i.GuardrailOverrideBy,
 			&i.GuardrailOverrideAt,
+			&i.RequiredCapabilities,
 		); err != nil {
 			return nil, err
 		}
@@ -1173,7 +1309,7 @@ func (q *Queries) SetForgeConnectionHumanUsername(ctx context.Context, arg SetFo
 }
 
 const setRepoDevboxOptIn = `-- name: SetRepoDevboxOptIn :one
-UPDATE repos SET repo_devbox_opt_in = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at
+UPDATE repos SET repo_devbox_opt_in = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities
 `
 
 type SetRepoDevboxOptInParams struct {
@@ -1200,6 +1336,7 @@ func (q *Queries) SetRepoDevboxOptIn(ctx context.Context, arg SetRepoDevboxOptIn
 		&i.GuardrailOverrideReason,
 		&i.GuardrailOverrideBy,
 		&i.GuardrailOverrideAt,
+		&i.RequiredCapabilities,
 	)
 	return i, err
 }
@@ -1208,7 +1345,7 @@ const setRepoDevboxOptInForUser = `-- name: SetRepoDevboxOptInForUser :one
 UPDATE repos SET repo_devbox_opt_in = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities
 `
 
 type SetRepoDevboxOptInForUserParams struct {
@@ -1236,6 +1373,7 @@ func (q *Queries) SetRepoDevboxOptInForUser(ctx context.Context, arg SetRepoDevb
 		&i.GuardrailOverrideReason,
 		&i.GuardrailOverrideBy,
 		&i.GuardrailOverrideAt,
+		&i.RequiredCapabilities,
 	)
 	return i, err
 }
@@ -1244,7 +1382,7 @@ const setRepoEnabledForUser = `-- name: SetRepoEnabledForUser :one
 UPDATE repos SET enabled = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities
 `
 
 type SetRepoEnabledForUserParams struct {
@@ -1270,6 +1408,7 @@ func (q *Queries) SetRepoEnabledForUser(ctx context.Context, arg SetRepoEnabledF
 		&i.GuardrailOverrideReason,
 		&i.GuardrailOverrideBy,
 		&i.GuardrailOverrideAt,
+		&i.RequiredCapabilities,
 	)
 	return i, err
 }
@@ -1280,7 +1419,7 @@ SET guardrail_override_reason = $2,
     guardrail_override_by     = $3,
     guardrail_override_at     = $4
 WHERE id = $1
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities
 `
 
 type SetRepoGuardrailOverrideParams struct {
@@ -1318,6 +1457,80 @@ func (q *Queries) SetRepoGuardrailOverride(ctx context.Context, arg SetRepoGuard
 		&i.GuardrailOverrideReason,
 		&i.GuardrailOverrideBy,
 		&i.GuardrailOverrideAt,
+		&i.RequiredCapabilities,
+	)
+	return i, err
+}
+
+const setRepoRequiredCapabilities = `-- name: SetRepoRequiredCapabilities :one
+UPDATE repos SET required_capabilities = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities
+`
+
+type SetRepoRequiredCapabilitiesParams struct {
+	ID                   uuid.UUID `json:"id"`
+	RequiredCapabilities []string  `json:"required_capabilities"`
+}
+
+// Admin path for the static per-repo capability hint (PRD #84 M2): not scoped to the
+// owning user; gated on the caller being an admin in the handler. The list is
+// Filter-ed against the vocabulary in the handler before it reaches here.
+func (q *Queries) SetRepoRequiredCapabilities(ctx context.Context, arg SetRepoRequiredCapabilitiesParams) (Repo, error) {
+	row := q.db.QueryRow(ctx, setRepoRequiredCapabilities, arg.ID, arg.RequiredCapabilities)
+	var i Repo
+	err := row.Scan(
+		&i.ID,
+		&i.ConnectionID,
+		&i.ForgeProjectID,
+		&i.PathWithNamespace,
+		&i.WebUrl,
+		&i.DefaultBranch,
+		&i.Enabled,
+		&i.RepoSkillsEnabled,
+		&i.RepoDevboxOptIn,
+		&i.RepoClaudemdEnabled,
+		&i.GuardrailOverrideReason,
+		&i.GuardrailOverrideBy,
+		&i.GuardrailOverrideAt,
+		&i.RequiredCapabilities,
+	)
+	return i, err
+}
+
+const setRepoRequiredCapabilitiesForUser = `-- name: SetRepoRequiredCapabilitiesForUser :one
+UPDATE repos SET required_capabilities = $2
+WHERE repos.id = $1
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities
+`
+
+type SetRepoRequiredCapabilitiesForUserParams struct {
+	ID                   uuid.UUID `json:"id"`
+	RequiredCapabilities []string  `json:"required_capabilities"`
+	UserID               uuid.UUID `json:"user_id"`
+}
+
+// Static per-repo capability hint (PRD #84 M2), authorized through the repo's owning
+// connection. A non-owned or unknown id returns no rows (404). The incoming list is
+// Filter-ed against the server-owned vocabulary in the handler BEFORE it reaches here,
+// so an unknown/spoofed name is dropped and never persisted.
+func (q *Queries) SetRepoRequiredCapabilitiesForUser(ctx context.Context, arg SetRepoRequiredCapabilitiesForUserParams) (Repo, error) {
+	row := q.db.QueryRow(ctx, setRepoRequiredCapabilitiesForUser, arg.ID, arg.RequiredCapabilities, arg.UserID)
+	var i Repo
+	err := row.Scan(
+		&i.ID,
+		&i.ConnectionID,
+		&i.ForgeProjectID,
+		&i.PathWithNamespace,
+		&i.WebUrl,
+		&i.DefaultBranch,
+		&i.Enabled,
+		&i.RepoSkillsEnabled,
+		&i.RepoDevboxOptIn,
+		&i.RepoClaudemdEnabled,
+		&i.GuardrailOverrideReason,
+		&i.GuardrailOverrideBy,
+		&i.GuardrailOverrideAt,
+		&i.RequiredCapabilities,
 	)
 	return i, err
 }
@@ -1327,7 +1540,7 @@ UPDATE repos SET
   repo_skills_enabled   = COALESCE($1, repo_skills_enabled),
   repo_claudemd_enabled = COALESCE($2, repo_claudemd_enabled)
 WHERE repos.id = $3
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities
 `
 
 type SetRepoTrustFlagsParams struct {
@@ -1357,6 +1570,7 @@ func (q *Queries) SetRepoTrustFlags(ctx context.Context, arg SetRepoTrustFlagsPa
 		&i.GuardrailOverrideReason,
 		&i.GuardrailOverrideBy,
 		&i.GuardrailOverrideAt,
+		&i.RequiredCapabilities,
 	)
 	return i, err
 }
@@ -1367,7 +1581,7 @@ UPDATE repos SET
   repo_claudemd_enabled = COALESCE($2, repo_claudemd_enabled)
 WHERE repos.id = $3
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $4)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities
 `
 
 type SetRepoTrustFlagsForUserParams struct {
@@ -1401,6 +1615,7 @@ func (q *Queries) SetRepoTrustFlagsForUser(ctx context.Context, arg SetRepoTrust
 		&i.GuardrailOverrideReason,
 		&i.GuardrailOverrideBy,
 		&i.GuardrailOverrideAt,
+		&i.RequiredCapabilities,
 	)
 	return i, err
 }
@@ -1634,7 +1849,7 @@ ON CONFLICT (connection_id, forge_project_id) DO UPDATE
 SET path_with_namespace = EXCLUDED.path_with_namespace,
     web_url             = EXCLUDED.web_url,
     default_branch      = EXCLUDED.default_branch
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities
 `
 
 type UpsertRepoParams struct {
@@ -1671,6 +1886,7 @@ func (q *Queries) UpsertRepo(ctx context.Context, arg UpsertRepoParams) (Repo, e
 		&i.GuardrailOverrideReason,
 		&i.GuardrailOverrideBy,
 		&i.GuardrailOverrideAt,
+		&i.RequiredCapabilities,
 	)
 	return i, err
 }

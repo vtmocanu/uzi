@@ -67,7 +67,24 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 147 as of this commit; it was 146 until PRD #66 M9 added GET
+// 158 as of this commit (PRD #576 M6 added POST
+// /api/repos/{id}/github-project-sync/autocreate-columns — create a fresh uzi-owned
+// Status field on an adopted board so skipped columns become synced ones).
+// It was 157 until then (PRD #576 M3 added POST
+// /api/repos/{id}/github-project-sync/resync — re-seed an already-linked board to pick
+// up newly-added Status options).
+// It was 156 until then (PRD #576 M1 added GET
+// /api/repos/{id}/github-project-sync/owner-type — the Adopt-first Provision nudge's
+// owner-type read).
+// It was 155 until then (PRD #557 added GET+PUT /api/repos/{id}/github-project-sync/
+// visibility and POST+DELETE /api/repos/{id}/github-project-sync/collaborators — the
+// four board-access routes).
+// It was 151 until then (issue #534 relocated the four github-project-sync routes
+// from /api/admin/repos/{id}/... to /api/repos/{id}/... — a move, not a count change).
+// It was 150 until PRD #364 M4 added POST
+// /api/admin/repos/{id}/github-project-sync/provision, 149 until PRD #364 M7 added GET
+// /api/admin/repos/{id}/github-project-sync, 147 until PRD #364 M3 added POST and DELETE
+// /api/admin/repos/{id}/github-project-sync, 146 until PRD #66 M9 added GET
 // /api/admin/blocked-repos, 144 until PRD #66 M8 added POST and DELETE
 // /api/admin/repos/{id}/guardrail-override, 143 until PRD #66 M3 added GET
 // /api/admin/guardrail-impact, 142 until PRD #122 M8 added POST
@@ -144,6 +161,17 @@ var wantRouteMounts = []routeMount{
 	{"DELETE", "/api/me/memory/{id}", noLimiter},
 	{"DELETE", "/api/me/secrets/anthropic_token", noLimiter},
 	{"DELETE", "/api/me/secrets/anthropic_token/{id}", noLimiter},
+	// Explicit per-repo remove (PRD #357): owner-scoped DB delete, no forge call →
+	// noLimiter, like the schedule/connection deletes it sits beside.
+	{"DELETE", "/api/repos/{id}", noLimiter},
+	// GitHub Projects v2 sync disable (issue #534, PRD #364 follow-up): relocated
+	// from /admin to the owner-or-admin /repos group (D4). Owner preflight + DB
+	// teardown, no user-spammable forge proxying → noLimiter, like the admin write
+	// group it left.
+	{"DELETE", "/api/repos/{id}/github-project-sync", noLimiter},
+	// PRD #557 board-access revoke: same owner-or-admin write group as the sibling
+	// github-project-sync routes → noLimiter.
+	{"DELETE", "/api/repos/{id}/github-project-sync/collaborators", noLimiter},
 	{"DELETE", "/api/runs/{id}/review/recommendations/{recID}/disposition", noLimiter},
 	// Schedule delete (PRD #241 M4): owner-scoped DB delete, no forge read → noLimiter.
 	{"DELETE", "/api/schedules/{id}", noLimiter},
@@ -224,6 +252,16 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/repos/", noLimiter},
 	{"GET", "/api/repos/{id}/board", noLimiter},
 	{"GET", "/api/repos/{id}/board/prefs", noLimiter},
+	// GitHub Projects v2 sync status read (issue #534, PRD #364 follow-up): relocated
+	// from the admin READ group to owner-or-admin /repos (D4). A read of the stored
+	// projection, no forge call → noLimiter.
+	{"GET", "/api/repos/{id}/github-project-sync", noLimiter},
+	// PRD #576 M1 owner-type read for the Adopt-first Provision nudge: a lazy forge
+	// round-trip on the same owner-or-admin group as the sibling routes → noLimiter.
+	{"GET", "/api/repos/{id}/github-project-sync/owner-type", noLimiter},
+	// PRD #557 board-access visibility read: a lazy forge round-trip on the same
+	// owner-or-admin group as the sibling routes → noLimiter, like the sibling reads.
+	{"GET", "/api/repos/{id}/github-project-sync/visibility", noLimiter},
 	{"GET", "/api/repos/{id}/issues/{iid}", limForge},
 	{"GET", "/api/repos/{id}/tool-profile", noLimiter},
 	{"GET", "/api/runs/", noLimiter},
@@ -231,6 +269,9 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/runs/{id}/inputs", noLimiter},
 	{"GET", "/api/runs/{id}/messages", noLimiter},
 	{"GET", "/api/runs/{id}/review", noLimiter},
+	// PRD #400 M4a: the handoff task diff-review read. No limiter — a plain owner-or-admin
+	// read, no forge write, no token spend, matching the /review read above it.
+	{"GET", "/api/runs/{id}/task-review", noLimiter},
 	{"GET", "/api/runs/{id}/review/recommendations/{recID}/issue-draft", noLimiter},
 	{"GET", "/api/skills/", noLimiter},
 	{"GET", "/api/skills/{id}", noLimiter},
@@ -313,6 +354,13 @@ var wantRouteMounts = []routeMount{
 	// carries no per-user limiter, like the recommendation disposition write.
 	{"POST", "/api/findings/{id}/dismiss", noLimiter},
 	{"POST", "/api/controller/status", noLimiter},
+	// Controller cordon control-write (PRD #422 M4): a fleet-scoped controller-only
+	// route behind RequireController, not a per-user credential, so no per-user
+	// limiter — like the poll and status routes above.
+	{"POST", "/api/controller/workers/{workerID}/drain", noLimiter},
+	// Controller uncordon control-write (issue #458): same fleet-scoped controller-only
+	// route (same path, DELETE) behind RequireController, so no per-user limiter either.
+	{"DELETE", "/api/controller/workers/{workerID}/drain", noLimiter},
 	{"POST", "/api/chats/{id}/proposals/{pid}/confirm", limForge},
 	{"POST", "/api/chats/{id}/proposals/{pid}/dismiss", noLimiter},
 	{"POST", "/api/forge/connections/", noLimiter},
@@ -324,6 +372,20 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/me/slack/test-dm", limSlackDM},
 	{"POST", "/api/notifications/{id}/read", noLimiter},
 	{"POST", "/api/repos/{id}/ci-fix-runs", limForge},
+	// GitHub Projects v2 sync adopt + autonomous provision (issue #534, PRD #364
+	// follow-up): relocated from /admin to owner-or-admin /repos (D4). Adopt/provision
+	// make forge calls but are infrequent manual actions, not user-spammable proxying,
+	// so they wear no per-user limiter → noLimiter, as in the admin write group they left.
+	{"POST", "/api/repos/{id}/github-project-sync", noLimiter},
+	{"POST", "/api/repos/{id}/github-project-sync/provision", noLimiter},
+	// PRD #576 M3 Resync: re-seed an already-linked board; infrequent manual action in
+	// the same owner-or-admin write group → noLimiter.
+	{"POST", "/api/repos/{id}/github-project-sync/resync", noLimiter},
+	// PRD #576 M6 auto-create columns: create a fresh uzi-owned Status field on the
+	// adopted board; infrequent manual action in the same owner-or-admin write group → noLimiter.
+	{"POST", "/api/repos/{id}/github-project-sync/autocreate-columns", noLimiter},
+	// PRD #557 board-access grant (Reader): same owner-or-admin write group → noLimiter.
+	{"POST", "/api/repos/{id}/github-project-sync/collaborators", noLimiter},
 	{"POST", "/api/repos/{id}/issues", limForge},
 	{"POST", "/api/repos/{id}/issues/{iid}/move", limForge},
 	{"POST", "/api/repos/{id}/issues/{iid}/prdless", limForge},
@@ -340,7 +402,13 @@ var wantRouteMounts = []routeMount{
 	// per-user forge limiter, matching CreateRun's posture.
 	{"POST", "/api/schedules/{id}/run-now", limForge},
 	{"POST", "/api/repos/{id}/sync", limForge},
+	// Task/handoff run (PRD #400): the create path pushes the same per-user forge
+	// budget as the other run creators (runs, ci-fix-runs).
+	{"POST", "/api/repos/{id}/task-runs", limForge},
 	{"POST", "/api/runs/{id}/inputs", noLimiter},
+	// PRD #400 Decision 6: the task dispatch gate. No limiter — no token spend, no
+	// forge write, mirroring CreateRunInput's posture.
+	{"POST", "/api/runs/{id}/dispatch", noLimiter},
 	{"POST", "/api/runs/{id}/rejudge", limJudge},
 	{"POST", "/api/runs/{id}/review/recommendations/{recID}/issue", limForge},
 	{"POST", "/api/skills/", noLimiter},
@@ -361,7 +429,15 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/proposals", noLimiter},
 	{"POST", "/api/worker/runs/{id}/publish", noLimiter},
 	{"POST", "/api/worker/runs/{id}/review", noLimiter},
+	// PRD #400 M4a: the review run's diff-findings POST. Worker-authenticated, no per-user
+	// limiter, matching the judge's worker review POST above it.
+	{"POST", "/api/worker/runs/{id}/task-review", noLimiter},
 	{"POST", "/api/worker/runs/{id}/state", noLimiter},
+	// PRD #362 M1: the run-lane executor posts its intent/plan summaries back. Worker
+	// writes scoped to the worker's own run, no forge call → noLimiter. Bounded by the
+	// intent idempotency + the plan stale-write guard rather than a per-user limiter.
+	{"POST", "/api/worker/runs/{id}/summary/intent", noLimiter},
+	{"POST", "/api/worker/runs/{id}/summary/plan", noLimiter},
 	{"POST", "/api/workers/", noLimiter},
 	{"POST", "/api/workers/hosted", limHosted},
 	{"PUT", "/api/admin/selfimprove", noLimiter},
@@ -402,6 +478,8 @@ var wantRouteMounts = []routeMount{
 	// merits above; it never needed that claim.
 	{"PUT", "/api/repos/{id}/board/order", limBoardOrder},
 	{"PUT", "/api/repos/{id}/board/prefs", noLimiter},
+	// PRD #557 board-access visibility write: same owner-or-admin group → noLimiter.
+	{"PUT", "/api/repos/{id}/github-project-sync/visibility", noLimiter},
 	{"PUT", "/api/repos/{id}/tool-profile", noLimiter},
 	// PRD #35 Decision 7, the per-run toggle. noLimiter for the same reason as
 	// /me/wait-on-limit: one owner-scoped boolean UPDATE, no spend, no forge write,

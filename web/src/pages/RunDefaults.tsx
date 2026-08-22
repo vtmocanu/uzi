@@ -121,6 +121,13 @@ export function RunDefaults() {
   const [savedJudgeModel, setSavedJudgeModel] = useState("");
   const [judgeModelBusy, setJudgeModelBusy] = useState(false);
 
+  // Per-user run-summary model (PRD #362 M2): "" = inherit the instance summary_model.
+  // Its own saved/busy pair, independent of the judge and worker models above — they
+  // write the same /me/settings endpoint but each sends only its own field.
+  const [summaryModel, setSummaryModel] = useState("");
+  const [savedSummaryModel, setSavedSummaryModel] = useState("");
+  const [summaryModelBusy, setSummaryModelBusy] = useState(false);
+
   // secrets feed the judge token picker; settings carry the saved worker model.
   const load = useCallback(async () => {
     try {
@@ -135,6 +142,9 @@ export function RunDefaults() {
       const jm = settings.judge_model ?? "";
       setJudgeModel(jm);
       setSavedJudgeModel(jm);
+      const sm = settings.summary_model ?? "";
+      setSummaryModel(sm);
+      setSavedSummaryModel(sm);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to load settings");
     } finally {
@@ -193,6 +203,33 @@ export function RunDefaults() {
       setError(err instanceof ApiError ? err.message : "Failed to save judge model");
     } finally {
       setJudgeModelBusy(false);
+    }
+  };
+
+  // Same validation path as the judge and worker models (PRD #362 M2): the shared
+  // modelFieldWarning gates Save, so a per-user summary model can't be saved to a
+  // shape the server rejects.
+  const summaryModelWarning = modelFieldWarning(summaryModel);
+  const summaryModelDirty = summaryModel.trim() !== savedSummaryModel;
+
+  const saveSummaryModel = async () => {
+    setError("");
+    setNotice("");
+    setSummaryModelBusy(true);
+    try {
+      const { settings } = await api.putMySettings({ summary_model: summaryModel.trim() || null });
+      const model = settings.summary_model ?? "";
+      setSummaryModel(model);
+      setSavedSummaryModel(model);
+      setNotice(
+        model === ""
+          ? "Summary model cleared. Your run summaries use the instance default model."
+          : `Summary model set to ${model}. It applies to your next run's summaries.`,
+      );
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to save summary model");
+    } finally {
+      setSummaryModelBusy(false);
     }
   };
 
@@ -263,7 +300,7 @@ export function RunDefaults() {
           <input
             type="checkbox"
             className="h-4 w-4 accent-brand"
-            checked={user?.wait_on_limit ?? false}
+            checked={user?.wait_on_limit ?? true}
             disabled={waitLimitBusy}
             onChange={(e) => toggleWaitOnLimit(e.target.checked)}
           />
@@ -362,6 +399,41 @@ export function RunDefaults() {
             onClick={saveJudgeModel}
           >
             Save judge model
+          </Button>
+        </div>
+      </Card>
+
+      {/* Per-user run-summary model (PRD #362 M2). Each run generates short
+          plain-English summaries on the run owner's own token; leave this on Inherit
+          to use the instance summary model the admin picked, or pin one here to
+          override it for YOUR runs only. Same picker + validation as the judge and
+          worker models, so a bad model blocks Save rather than failing on the next run. */}
+      <Card className="space-y-4">
+        <div>
+          <SectionTitle>Run summaries</SectionTitle>
+          <p className="mt-2 text-sm text-muted">
+            Each of your runs generates two short plain-English summaries — what it will implement, and
+            what the proposed plan will do — on <strong className="text-fg">your own Anthropic token</strong>.
+            Pinning a model here overrides the instance default for your own runs; other users are
+            unaffected. Summaries are advisory and never block a run.
+          </p>
+        </div>
+
+        <div className="space-y-3">
+          <Field label="Summary model" htmlFor="summary-model">
+            <ModelSelect id="summary-model" value={summaryModel} onChange={setSummaryModel} />
+          </Field>
+          <p className="text-xs text-faint">
+            The Claude model your run summaries are generated on. Leave it on <em>Inherit</em> to use the
+            instance default (haiku unless your admin changed it); pin another alias to trade cost for depth.
+          </p>
+          {summaryModelWarning && <Alert message={summaryModelWarning} tone="warning" />}
+          <Button
+            type="button"
+            disabled={summaryModelBusy || !summaryModelDirty || summaryModelWarning !== ""}
+            onClick={saveSummaryModel}
+          >
+            Save summary model
           </Button>
         </div>
       </Card>

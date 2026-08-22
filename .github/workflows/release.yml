@@ -12,11 +12,20 @@
 #   tagged. If we ever want true single-pipeline atomicity, make ci.yml
 #   `workflow_call`-able and add it as a `needs:` job below.
 #
-# TRUST BOUNDARY: read-only default token; the only writes are `packages: write`
-# (GHCR, via the built-in GITHUB_TOKEN) granted per-job. Every publish job declares
-# `environment: release`, so once the repo can carry environment protection rules
-# (blocked on the current Free/private plan) a required-reviewer / `v*`-only rule gates
-# all publishing at once. No `pull_request` job reads these scopes; never
+# TRUST BOUNDARY: read-only default token. Writes are per-job and of two kinds:
+# `packages: write` (GHCR, via the built-in GITHUB_TOKEN) on every image + chart job,
+# and `contents: write` on the lone `publish-release` job, which creates the GitHub
+# Release. ACCESS CONTROL for a release is the `protect-release-tags` tag ruleset:
+# only a repo admin can create/delete/move a `v*` tag, so the tag push itself IS the
+# authorization -- whoever is allowed to cut the tag is the only one who could publish.
+# The IMAGE/CHART publish jobs still declare `environment: release`, but that
+# environment carries NO required reviewer (removed 2026-08-20): it is kept only for
+# deployment TRACKING, not as a gate, so a `v*` tag publishes IMMEDIATELY with no
+# approval click. (An earlier design gated here on a required reviewer; on a solo repo
+# that was redundant with tag protection and was dropped -- see
+# `.claude/agents/release.md` for the flow.) `publish-release` carries NO
+# `environment: release` and only `needs:` the publish jobs, so it runs after the
+# images + chart are live. No `pull_request` job reads any of these scopes; never
 # `pull_request_target`.
 #
 # Model B: the git tag `vX.Y.Z` normalizes to `X.Y.Z` (== chart version/appVersion,
@@ -25,10 +34,11 @@
 # chart) never rolls a workload to an image tag that does not exist yet.
 #
 # Homebrew publishing is a SEPARATE workflow (.github/workflows/brew.yml), not a job
-# here: it renders + pushes the formula from the tag's public auto-archive, which 404s
-# while the repo is private, so it is workflow_dispatch-only until the public flip and
-# must not redden this image+chart release. It reuses vtmocanu/task's homebrew-tap.yml
-# via `task brew:formula` / `brew:publish`, the same mechanic the sibling formulae use.
+# here: it renders + pushes the formula from the tag's public auto-archive. Now that the
+# repo is public it is TAG-TRIGGERED -- it publishes on the same `v*` tag in its own run
+# (and must not redden this image+chart release). It reuses vtmocanu/task's
+# homebrew-tap.yml via `task brew:formula` / `brew:publish`, the same mechanic the
+# sibling formulae use.
 
 name: Release
 
@@ -70,7 +80,7 @@ jobs:
   assert-version:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Validate SemVer tag + Chart.yaml match
         run: |
           set -euo pipefail
@@ -102,12 +112,18 @@ jobs:
     steps:
       # Full history + tags: the script compares the release window against the
       # previous `v*` tag, and the commit count is over all of history.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           fetch-tags: true
       - name: Changelog covers release
         run: bash scripts/assert-changelog-covers-release.sh "${GITHUB_REF_NAME}"
+      # The Release notes are the CHANGELOG section verbatim, so the section's
+      # inline #N links and the compare-link footers must already be committed --
+      # publish-release does not generate them. A tag whose CHANGELOG links are
+      # stale is rejected here, the same way a missing section is.
+      - name: Changelog links + compare footers current
+        run: bash scripts/changelog-links.sh --check
       - name: Compute build-info counts
         id: counts
         run: |
@@ -130,6 +146,18 @@ jobs:
   # buildx builds on the runner and pushes to GHCR. provenance:false keeps the pushed
   # tag a single plain image manifest (no attestation index), matching the chart's
   # simple {repo}:{tag} image references. platforms: linux/amd64 -- amd64-only for now.
+  #
+  # SIGNING (cosign keyless / Sigstore). Every image is signed BY DIGEST after push,
+  # using the job's GitHub OIDC identity (id-token: write) -- no long-lived key to
+  # store or rotate. The signer identity is this workflow's ref
+  # (…/release.yml@refs/tags/vX.Y.Z), which is what a verifier pins with
+  # `cosign verify --certificate-identity-regexp … --certificate-oidc-issuer
+  # https://token.actions.githubusercontent.com`. A cosign signature is a SEPARATE
+  # OCI artifact (a `sha256-<digest>.sig` tag pushed to the same repo under the
+  # existing packages:write), so it does NOT change the image manifest and stays
+  # compatible with provenance:false. Signing by digest (not tag) is deliberate: the
+  # two tags a job pushes (:version and :short_sha) share one digest, so one signature
+  # covers both and there is no tag->digest TOCTOU window.
 
   publish-api:
     runs-on: ubuntu-latest
@@ -138,15 +166,24 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write   # cosign keyless: mint the OIDC token used to sign
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: sigstore/cosign-installer@v4.1.2
+        with:
+          # cosign 3.x uses the new default bundle format, which REQUIRES installer v4.
+          # The installer has NO floating v4 tag, so `@v4` does NOT resolve -- pin a full
+          # version (v4.1.2). Keep the installer and cosign-release bumped together
+          # (installer v4.x with cosign 3.x).
+          cosign-release: 'v3.1.3'
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - id: build
+        uses: docker/build-push-action@v7
         with:
           context: api
           file: api/Dockerfile
@@ -166,6 +203,9 @@ jobs:
             UZI_COMMIT_COUNT=${{ needs.assert-changelog.outputs.commit_count }}
             UZI_PRDS_DONE=${{ needs.assert-changelog.outputs.prds_done }}
             UZI_PRDS_OPEN=${{ needs.assert-changelog.outputs.prds_open }}
+      # Sign by digest (covers both pushed tags; no tag->digest TOCTOU).
+      - name: Sign image (cosign keyless)
+        run: cosign sign --yes ghcr.io/vtmocanu/uzi/api@${{ steps.build.outputs.digest }}
 
   publish-web:
     runs-on: ubuntu-latest
@@ -174,16 +214,25 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write   # cosign keyless: mint the OIDC token used to sign
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: sigstore/cosign-installer@v4.1.2
+        with:
+          # cosign 3.x uses the new default bundle format, which REQUIRES installer v4.
+          # The installer has NO floating v4 tag, so `@v4` does NOT resolve -- pin a full
+          # version (v4.1.2). Keep the installer and cosign-release bumped together
+          # (installer v4.x with cosign 3.x).
+          cosign-release: 'v3.1.3'
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       # Context is the repo ROOT: web/Dockerfile COPYs both web/ and docs/.
-      - uses: docker/build-push-action@v6
+      - id: build
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: web/Dockerfile
@@ -193,6 +242,8 @@ jobs:
           tags: |
             ghcr.io/vtmocanu/uzi/web:${{ needs.prep.outputs.version }}
             ghcr.io/vtmocanu/uzi/web:${{ needs.prep.outputs.short_sha }}
+      - name: Sign image (cosign keyless)
+        run: cosign sign --yes ghcr.io/vtmocanu/uzi/web@${{ steps.build.outputs.digest }}
 
   publish-controller:
     runs-on: ubuntu-latest
@@ -201,15 +252,24 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write   # cosign keyless: mint the OIDC token used to sign
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: sigstore/cosign-installer@v4.1.2
+        with:
+          # cosign 3.x uses the new default bundle format, which REQUIRES installer v4.
+          # The installer has NO floating v4 tag, so `@v4` does NOT resolve -- pin a full
+          # version (v4.1.2). Keep the installer and cosign-release bumped together
+          # (installer v4.x with cosign 3.x).
+          cosign-release: 'v3.1.3'
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - id: build
+        uses: docker/build-push-action@v7
         with:
           context: controller
           file: controller/Dockerfile
@@ -219,6 +279,8 @@ jobs:
           tags: |
             ghcr.io/vtmocanu/uzi/controller:${{ needs.prep.outputs.version }}
             ghcr.io/vtmocanu/uzi/controller:${{ needs.prep.outputs.short_sha }}
+      - name: Sign image (cosign keyless)
+        run: cosign sign --yes ghcr.io/vtmocanu/uzi/controller@${{ steps.build.outputs.digest }}
 
   # Per-template worker images. Destination is <prefix>/agent-<template>, which is what
   # makes the chart's workers.image.repository (ghcr.io/vtmocanu/uzi) + the controller's
@@ -231,14 +293,22 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write   # cosign keyless: mint the OIDC token used to sign
     strategy:
       fail-fast: false
       matrix:
         template: [base, jvm]
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: sigstore/cosign-installer@v4.1.2
+        with:
+          # cosign 3.x uses the new default bundle format, which REQUIRES installer v4.
+          # The installer has NO floating v4 tag, so `@v4` does NOT resolve -- pin a full
+          # version (v4.1.2). Keep the installer and cosign-release bumped together
+          # (installer v4.x with cosign 3.x).
+          cosign-release: 'v3.1.3'
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -248,7 +318,8 @@ jobs:
       # keeps the leading v (the Dockerfile strips it) and carries +g<short-sha> build
       # metadata; SemVer excludes build metadata from precedence, so the reported
       # version still classifies as the release.
-      - uses: docker/build-push-action@v6
+      - id: build
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: agent/templates/${{ matrix.template }}/Dockerfile
@@ -261,6 +332,8 @@ jobs:
           build-args: |
             UZI_SRC_SHA=${{ github.sha }}
             UZI_AGENT_VERSION=${{ github.ref_name }}+g${{ needs.prep.outputs.short_sha }}
+      - name: Sign image (cosign keyless)
+        run: cosign sign --yes ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}@${{ steps.build.outputs.digest }}
 
   # ----------------------------------------------------------------- chart ----
   # Package + push the Helm chart as an OCI artifact, LAST (after every image), so
@@ -273,19 +346,108 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write   # cosign keyless: mint the OIDC token used to sign
     steps:
-      - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
         with:
-          version: v3.21.3
+          version: v4.2.4
+      - uses: sigstore/cosign-installer@v4.1.2
+        with:
+          # cosign 3.x uses the new default bundle format, which REQUIRES installer v4.
+          # The installer has NO floating v4 tag, so `@v4` does NOT resolve -- pin a full
+          # version (v4.1.2). Keep the installer and cosign-release bumped together
+          # (installer v4.x with cosign 3.x).
+          cosign-release: 'v3.1.3'
       - name: helm registry login (GHCR)
-        # --password-stdin keeps the token out of the process argv.
+        # --password-stdin keeps the token out of the process argv. Authenticates
+        # `helm push` (helm's OWN registry cred store, ~/.config/helm/...).
         run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
-      - name: Package + push chart
+      # cosign reads the DOCKER cred store (~/.docker/config.json), which helm login
+      # does NOT populate -- so the chart job needs BOTH logins or `cosign sign` 401s
+      # pushing the signature (the image jobs only worked because they log in this way).
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Package + push + sign chart
         run: |
           set -euo pipefail
           # helm dependency build vendors the CNPG `cluster` subchart (Chart.lock) into
           # the package, so the published OCI artifact is self-contained for ArgoCD.
           helm dependency build deploy/chart
           helm package deploy/chart -d /tmp/chart
-          helm push /tmp/chart/uzi-*.tgz oci://ghcr.io/vtmocanu/uzi
+          # helm push writes "Pushed:" + "Digest: sha256:…" to STDOUT; the 2>&1 folds
+          # STDERR in too, and tee (not a captured $()) means a push FAILURE still
+          # prints its error before set -e/pipefail aborts the step. Then sign the chart
+          # BY DIGEST (same keyless flow and same packages:write as the images -- the
+          # chart is just another OCI artifact).
+          helm push /tmp/chart/uzi-*.tgz oci://ghcr.io/vtmocanu/uzi 2>&1 | tee /tmp/helm-push.log
+          digest="$(awk '/Digest:/ {print $2}' /tmp/helm-push.log)"
+          case "$digest" in
+            sha256:*) : ;;
+            *) echo "ERROR: could not parse chart digest from helm push output" >&2; exit 1 ;;
+          esac
+          cosign sign --yes "ghcr.io/vtmocanu/uzi/uzi@${digest}"
+
+  # --------------------------------------------------------------- release ----
+  # Create the GitHub Release from the tag's CHANGELOG section. The curated prose
+  # is the source of truth (already gated by assert-changelog). Title is
+  # `vX.Y.Z[: <marker>]` -- the optional `<!-- release-title: … -->` marker under the
+  # section heading.
+  #
+  # NOTE on autolinking: GitHub autolinks a bare `#N` in a Release body to THIS repo's
+  # PR/issue N. For uzi refs that is the desired behavior; for a CROSS-REPO ref it is
+  # WRONG, so cross-repo refs must be BACKTICKED in the CHANGELOG (a code span is not
+  # autolinked) -- the same convention scripts/changelog-links.sh follows to keep them
+  # unlinked in the file. That script already emits uzi citations as explicit
+  # `[#N](…)` links, which render identically on the file and the Release surface.
+  #
+  # Runs LAST: it `needs:` every publish job, so a Release exists only once the
+  # images AND the chart are actually live -- never advertising a version whose
+  # artifacts a puller cannot get. Uses the built-in `gh` CLI (no third-party
+  # action) with the default GITHUB_TOKEN; the only new grant is contents:write to
+  # create the release. It declares NO `environment: release` and simply `needs:` the
+  # publish jobs, so a Release appears only once the images AND chart are live. (There
+  # are no approval gates anywhere in this flow: the `environment: release` on the
+  # publish jobs has no reviewer -- access control is the `v*` tag ruleset, not an
+  # in-run approval. See the TRUST BOUNDARY note at the top.)
+  publish-release:
+    runs-on: ubuntu-latest
+    needs: [publish-api, publish-web, publish-controller, publish-agent, publish-chart]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build release notes from the CHANGELOG section
+        id: notes
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          bash scripts/changelog-section.sh body "$VERSION" > release-notes.md
+          {
+            echo "title=$(bash scripts/changelog-section.sh title "$VERSION")"
+          } >> "$GITHUB_OUTPUT"
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          TITLE: ${{ steps.notes.outputs.title }}
+        run: |
+          set -euo pipefail
+          # A SemVer prerelease tag (vX.Y.Z-rc.1) is flagged --prerelease and is NOT
+          # marked latest; a plain vX.Y.Z is --latest. assert-version permits the
+          # prerelease form, so a prerelease must not be advertised as the latest.
+          flags=(--title "$TITLE" --notes-file release-notes.md)
+          case "$TAG" in
+            *-*) flags+=(--prerelease) ;;
+            *)   flags+=(--latest) ;;
+          esac
+          # Idempotent: re-running a tag (e.g. after a transient publish failure)
+          # edits the existing Release instead of failing on "already exists".
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" "${flags[@]}"
+          else
+            gh release create "$TAG" "${flags[@]}" --verify-tag
+          fi

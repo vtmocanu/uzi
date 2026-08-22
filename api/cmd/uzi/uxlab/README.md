@@ -70,9 +70,9 @@ Every scene is rendered from the SHIPPED model, `-dark` and `-light`.
 | Frame | State it captures |
 |---|---|
 | `board-populated` / `board-empty` / `board-admin` / `board-filter` | the run board: mixed statuses/health, empty state, factory-wide admin (OWNER), and the `/` filter |
-| `detail-running` | detail, live, crew rail focused, ● FOLLOWING |
+| `detail-running` | detail, live, crew rail focused, ⇣ following |
 | `detail-focus-transcript` | detail with the transcript pane focused |
-| `detail-paused` | transcript scrolled back: ⏸ PAUSED ↓N new |
+| `detail-paused` | transcript scrolled back: ⏸ N new · g ⇣ |
 | `detail-stalled` | a stalled run (▲ stalled cue in the header) |
 | `detail-awaiting-approval` / `detail-awaiting-input` | the two attention banners |
 | `detail-limit-wait` / `detail-degraded` | usage-limit park / stream fell back to polling |

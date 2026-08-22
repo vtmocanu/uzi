@@ -8,6 +8,7 @@ import {
   healthBadge,
   healthFlagLabel,
   isAwaitingApproval,
+  isAwaitingFollowup,
   isAwaitingInput,
   isHealthFlaggableStatus,
   isPlanningRun,
@@ -25,7 +26,8 @@ import {
   shouldShowHealthFlag,
 } from "./runBadge";
 import { RUN_STATUS_TONES } from "../components/ui";
-import type { LatestRun, RunStatus } from "./api";
+import { isTerminalRun, TERMINAL_RUN_STATUSES } from "./runStatus";
+import type { LatestRun, RunStatus, StopKind } from "./api";
 
 // run builds a LatestRun with sane defaults, overridable per test.
 function run(over: Partial<LatestRun> = {}): LatestRun {
@@ -572,6 +574,55 @@ describe("milestoneBadgeText (not-reported vs 0/N, PRD #265 M2)", () => {
   });
 });
 
+// PRD #390 D5 / M4 guard. The two functions above are pinned in isolation; this threads
+// milestoneBadge → milestoneBadgeText so the null-vs-[] distinction is asserted END TO END,
+// on both the `reported` boolean AND the composed label. A regression that collapsed a null
+// tracker into [] (a genuinely-unreported run reading as a failure-looking M0/N) — or the
+// reverse — would keep each half locally plausible and only redden here. The tooltip wording
+// must differ between the two states too: it is the only thing that tells them apart on hover.
+describe("milestone progress null-vs-[] end to end (PRD #390 D5)", () => {
+  const ms = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({ id: `m${i + 1}`, title: `Milestone ${i + 1}` }));
+
+  it("a null tracker on a milestone-bearing run is NOT reported and composes to M–/N", () => {
+    const p = milestoneBadge({ milestones: ms(5), milestones_completed: null });
+    expect(p).not.toBeNull();
+    expect(p!.reported).toBe(false);
+    const text = milestoneBadgeText(p!);
+    expect(text.label).toBe("M–/5");
+    expect(text.label).not.toContain("0");
+    expect(text.title).toBe("No milestone completion reported for this run");
+  });
+
+  it("an ABSENT milestones_completed key behaves exactly like null (M–/N, not reported)", () => {
+    const p = milestoneBadge({ milestones: ms(5) });
+    expect(p).not.toBeNull();
+    expect(p!.reported).toBe(false);
+    expect(milestoneBadgeText(p!).label).toBe("M–/5");
+  });
+
+  it("an empty reported set IS reported and composes to a genuine M0/N, distinct from neutral", () => {
+    const reported = milestoneBadge({ milestones: ms(5), milestones_completed: [] });
+    expect(reported).not.toBeNull();
+    expect(reported!.reported).toBe(true);
+    const text = milestoneBadgeText(reported!);
+    expect(text.label).toBe("M0/5");
+    expect(text.title).toBe("Milestones reported complete of the approved plan");
+    // The neutral and the genuine-zero states must NOT share a tooltip — that is the whole
+    // distinction D5 exists to preserve.
+    const neutral = milestoneBadgeText(milestoneBadge({ milestones: ms(5), milestones_completed: null })!);
+    expect(text.title).not.toBe(neutral.title);
+    expect(text.label).not.toBe(neutral.label);
+  });
+
+  it("a single reported completion composes to M1/N and is reported", () => {
+    const p = milestoneBadge({ milestones: ms(5), milestones_completed: ["m1"] });
+    expect(p).not.toBeNull();
+    expect(p!.reported).toBe(true);
+    expect(milestoneBadgeText(p!).label).toBe("M1/5");
+  });
+});
+
 describe("priorityBadge (queue priority → pill, PRD #320 D8)", () => {
   it("background → a neutral 'Deprioritized' pill explaining it yields", () => {
     const b = priorityBadge("background");
@@ -603,13 +654,76 @@ describe("priorityBadge (queue priority → pill, PRD #320 D8)", () => {
   });
 });
 
-describe("needsHumanAttention (the shared treatment, PRD #88 D-O #4)", () => {
-  it("is the union of the two human-blocked statuses and nothing else", () => {
+describe("needsHumanAttention (the shared treatment, PRD #88 D-O #4, PRD #517)", () => {
+  it("is the union of the three human-blocked statuses and nothing else", () => {
     expect(needsHumanAttention("awaiting_approval")).toBe(true);
     expect(needsHumanAttention("awaiting_input")).toBe(true);
+    // PRD #517: awaiting_followup is the third member. Mutation guard: dropping it
+    // from needsHumanAttention makes this assert red (the card ring / favicon dot
+    // would stop firing for a run parked on the user's next follow-up).
+    expect(needsHumanAttention("awaiting_followup")).toBe(true);
     for (const s of ["queued", "claimed", "running", "completed", "failed", "cancelled", ""]) {
       expect(needsHumanAttention(s)).toBe(false);
     }
+  });
+});
+
+describe("isAwaitingFollowup (PRD #517, the third human-in-the-loop sibling)", () => {
+  it("matches only awaiting_followup, and the siblings do not absorb it", () => {
+    expect(isAwaitingFollowup("awaiting_followup")).toBe(true);
+    expect(isAwaitingFollowup("awaiting_input")).toBe(false);
+    expect(isAwaitingFollowup("awaiting_approval")).toBe(false);
+    expect(isAwaitingFollowup("running")).toBe(false);
+    // The split is deliberate (mirrors isAwaitingInput): a follow-up park is not an
+    // unanswered question, so neither existing predicate covers it.
+    expect(isAwaitingApproval("awaiting_followup")).toBe(false);
+    expect(isAwaitingInput("awaiting_followup")).toBe(false);
+  });
+});
+
+describe("awaiting_followup presentation (PRD #517)", () => {
+  it("gets the SAME warn tone as the other parks", () => {
+    expect(runStatusTone("awaiting_followup", null)).toBe("warning");
+    expect(runStatusTone("awaiting_followup", null)).toBe(
+      runStatusTone("awaiting_approval", null),
+    );
+  });
+
+  it("has its own badge case with distinct copy, not the neutral default", () => {
+    // Mutation guard: removing the awaiting_followup arm from runBadge's switch drops
+    // it to the default neutral chip (label "awaiting followup", tone neutral), which
+    // this assert catches — it must be the warn "awaiting follow-up" pill, and its
+    // label must NOT reuse awaiting_input's "needs your answer".
+    const badge = runBadge(run({ status: "awaiting_followup" }), NOW);
+    expect(badge).toEqual({
+      kind: "badge",
+      label: "awaiting follow-up",
+      tone: "warning",
+      pulse: false,
+      title: "Waiting for your next follow-up. Send one to continue the run.",
+    });
+    if (badge.kind === "badge") {
+      expect(badge.label).not.toBe("needs your answer");
+    }
+  });
+
+  it("is NOT terminal (isTerminalRun false) — it is a non-terminal park", () => {
+    expect(isTerminalRun("awaiting_followup")).toBe(false);
+    expect(TERMINAL_RUN_STATUSES).not.toContain("awaiting_followup");
+  });
+});
+
+describe("stop_kind='stopped' (PRD #517 M4, deliberate HUMAN_STOP_KINDS exclusion)", () => {
+  it("type-checks as a StopKind and does NOT render as a calm 'stopped' pill", () => {
+    // 'stopped' is a valid StopKind (compile-time: assigning it here fails to build
+    // if the union omits it).
+    const kind: StopKind = "stopped";
+    // Mutation guard: adding 'stopped' to HUMAN_STOP_KINDS would make a `failed` run
+    // carrying it style as a neutral "stopped" pill — this asserts it stays danger.
+    expect(isStoppedRun("failed", kind)).toBe(false);
+    expect(runStatusTone("failed", kind)).toBe("danger");
+    // A gracefully-stopped run lands status=completed, which is the success it is.
+    expect(runStatusTone("completed", kind)).toBe("ok");
   });
 });
 

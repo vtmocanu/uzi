@@ -8,8 +8,8 @@ type: application
 # version. api.image.tag / web.image.tag are left unset in values so the pod image
 # follows appVersion. Bump both per release; the cluster's ArgoCD auto-tracks the chart
 # (targetRevision `0.*`), so no per-release argo bump there (see deploy/README.md).
-version: 0.43.0
-appVersion: "0.43.0"
+version: 0.55.1
+appVersion: "0.55.1"
 
 # Umbrella chart (same umbrella-chart pattern): the CloudNativePG upstream `cluster`
 # chart ships as a subchart (aliased `postgres`) so one release brings up the api,
@@ -23,9 +23,17 @@ dependencies:
   - name: cluster
     alias: postgres
     # Pinned to the same `cluster` chart version the fleet's other CNPG apps use
-    # for fleet consistency, NOT the latest 0.7.x. Its
-    # rendered `postgresql.cnpg.io/v1 Cluster` uses only fields present in the CRD the
-    # cluster operator (1.23.5) ships. Bump together with the fleet.
+    # for fleet consistency, NOT the latest 0.7.x. Bump together with the fleet.
+    #
+    # NOTE (corrected 2026-08-20): this chart's rendered `postgresql.cnpg.io/v1
+    # Cluster` is NOT a strict subset of the CRD operator 1.23.5 ships -- it always
+    # emits `.spec.monitoring.tls.enabled`, a field 1.23.5's Cluster CRD does not
+    # declare. Under client-side apply (Helm 3, and ArgoCD -- the real deploy path)
+    # the apiserver prunes that unknown field, so it is harmless. It only bites under
+    # Helm 4's server-side-apply default, which validates strictly and rejects it;
+    # the kind-smoke `helm install` therefore passes `--server-side=false` to match
+    # the production apply semantics. Closing the mismatch for good means bumping the
+    # CNPG operator+subchart pair fleet-wide so the CRD gains the field.
     version: "0.6.1"
     repository: "oci://ghcr.io/cloudnative-pg/charts"
     condition: postgres.enabled

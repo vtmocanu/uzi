@@ -89,12 +89,12 @@ SELECT w.*,
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
-             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
        ) AS busy,
        (
            SELECT count(*) FROM runs r
            WHERE r.worker_id = w.id
-             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
              AND r.kind <> 'chat'
        ) AS active_runs,
        -- Roll health (PRD #113 M4), LEFT JOINed so a worker with no report — every
@@ -176,6 +176,13 @@ WITH prev AS (
         status              = 'online',
         version             = @version,
         template_reported   = @template_reported,
+        -- capabilities is the server-authoritative capability set (PRD #84 M1): the
+        -- Filter-ed union of the worker's self-report and its template-derived caps,
+        -- computed in Service.Register. Overwritten on every register (the fresh-start
+        -- signal), so a worker that stops self-reporting docker loses it here too.
+        -- COALESCE guards the NOT NULL column against a nil slice from any caller
+        -- (pgx encodes a nil []string as SQL NULL): a nil report stores '{}', not NULL.
+        capabilities        = COALESCE(@capabilities::text[], '{}'),
         max_concurrent_runs = sqlc.narg('max_concurrent_runs'),
         -- online_since is the api-owned uptime anchor (PRD #251 M1): PRESERVE it if the
         -- worker is already online with one, else STAMP now() — so a steady stream of
@@ -184,6 +191,13 @@ WITH prev AS (
         -- the OLD row, so workers.status/online_since here read the pre-update tuple (the
         -- same mechanism SetRunRunning's `health = CASE WHEN status='running'` relies on).
         online_since        = CASE WHEN workers.status = 'online' AND workers.online_since IS NOT NULL THEN workers.online_since ELSE now() END,
+        -- Clear-on-roll (PRD #422 M3, Decision 7 lifecycle): a rolled/restarted pod
+        -- re-registers under the same hosted id, and clearing draining_since here is what
+        -- lets a cordoned worker resume claiming after its roll (or a benign restart) —
+        -- without it, a drained worker stays cordoned forever. HeartbeatWorker deliberately
+        -- does NOT touch draining_since: a draining worker heartbeats and must STAY draining
+        -- until it actually rolls.
+        draining_since      = NULL,
         last_heartbeat_at   = now(),
         updated_at          = now()
     WHERE workers.id = @id
@@ -293,6 +307,9 @@ WHERE user_id = @user_id
 -- Sweeper: workers past the heartbeat-stale window go offline. online_since is CLEARED
 -- here (PRD #251 M1): an offline worker carries no uptime, so the next online transition
 -- starts a fresh anchor rather than reporting a session that spanned the outage.
+-- draining_since is DELIBERATELY NOT filtered here (PRD #422 Decision 7): draining is an
+-- orthogonal column, so a draining worker whose pod actually dies is still swept offline
+-- like any other — do not add a draining predicate.
 UPDATE workers SET status = 'offline', online_since = NULL, updated_at = now()
 WHERE status = 'online'
   AND (last_heartbeat_at IS NULL OR last_heartbeat_at < @cutoff);
@@ -340,8 +357,21 @@ WHERE status = 'online'
 -- omitted param silently opts OUT of the fail-on-divergence behaviour — the exact
 -- go-build-green trap the block above describes. planned_base_commit is nullable
 -- (sqlc.narg): a run with no planned commit stores NULL and the worker proceeds silently.
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model)
+--
+-- 🔴 issue_comments (PRD #381 D7) is named here for the SAME reason: it is another
+-- silently-omittable snapshot param. It is sqlc.narg (nullable jsonb) — an
+-- issue-less kind, a comment-less issue, and a connection with an unknown bot id
+-- (D9) all store NULL — so an omitted Go struct field would compile green and
+-- silently ship NULL for every run. The fetch is centralized in createRun.
+--
+-- 🔴 required_capabilities (PRD #84 M2) is NOT a Go struct param: it is copied
+-- atomically from the run's repo via a subquery, so the createRun path needs no
+-- extra Go read and cannot ship a stale hint. The repo's hint is already Filter-ed
+-- against the vocabulary at its write path, so no re-validation is needed here.
+-- Repo-less kinds (judge/chat/self_improve) INSERT elsewhere and keep the '{}'
+-- column default. Plan inference (M4) later union-merges via a separate UPDATE.
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, required_capabilities)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'))
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -417,6 +447,7 @@ WHERE r.id = @repo_id;
 -- and buckets them in Go (ListJudgeTriageRowsForRuns).
 SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name,
        c.forge_type,
+       i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link
        -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function, so the
        -- Runs-list pill and ClaimRun's ORDER BY are the same decision. @background_grace_cutoff
        -- (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag: a demoted run created
@@ -431,6 +462,7 @@ SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2); every repo has a connection
+LEFT JOIN issues i ON i.repo_id = r.repo_id AND i.forge_issue_iid = r.issue_iid   -- PRD #411: 1:1 (issues UNIQUE (repo_id, forge_issue_iid)); yields the issue web URL for the run's #<iid> link
 LEFT JOIN workers w ON w.id = r.worker_id
 LEFT JOIN run_reviews rv
        ON rv.target_run_id = r.id      -- UNIQUE target_run_id → at most one row (PRD #98 M4)
@@ -455,6 +487,7 @@ LIMIT 200;
 -- worker name, and owner email for the admin overview.
 SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
        c.forge_type,
+       i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link
        -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function (same as
        -- ListRunsForUser), so the admin overview pill and the claim order agree.
        -- @background_grace_cutoff (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag.
@@ -462,6 +495,7 @@ SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2)
+LEFT JOIN issues i ON i.repo_id = r.repo_id AND i.forge_issue_iid = r.issue_iid   -- PRD #411: 1:1 (issues UNIQUE (repo_id, forge_issue_iid)); yields the issue web URL for the run's #<iid> link
 LEFT JOIN workers w ON w.id = r.worker_id
 JOIN users u ON u.id = r.user_id
 WHERE r.status NOT IN ('completed', 'failed', 'cancelled')
@@ -482,12 +516,12 @@ SELECT sqlc.embed(w),
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
-             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
        ) AS busy,
        (
            SELECT count(*) FROM runs r
            WHERE r.worker_id = w.id
-             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
              AND r.kind <> 'chat'
        ) AS active_runs,
        u.email AS owner_email
@@ -538,12 +572,19 @@ WHERE id = (
     SELECT r.id FROM runs r
     WHERE r.user_id = @user_id
       AND r.kind <> 'chat'
+      -- PRD #400 Decision 6: a task run is claimable ONLY after the CLI has seeded its
+      -- uzi/task/<id> branch and stamped dispatched_at — otherwise a worker could claim
+      -- it before the branch exists (the claim-before-seed race). Every non-task kind is
+      -- unaffected (dispatched_at is only ever set on a task run).
+      AND (r.kind <> 'task' OR r.dispatched_at IS NOT NULL)
       AND r.status = 'queued'
       AND (r.worker_id IS NULL
            OR r.worker_id = @worker_id
            OR r.updated_at < @affinity_cutoff)
       -- PRD #216 D5: claiming-worker eligibility via the shared expression.
-      AND fn_worker_can_claim(@is_docker_worker::boolean, @docker_repo_allowlist::uuid[], r.repo_id, r.kind)
+      -- PRD #84 M2 extends it: the run's required_capabilities must be a subset of the
+      -- claiming worker's effective caps (@worker_caps ∪ docker), gated by @capability_aware.
+      AND fn_worker_can_claim(@is_docker_worker::boolean, @docker_repo_allowlist::uuid[], r.repo_id, r.kind, @worker_caps::text[], r.required_capabilities, @capability_aware::boolean)
       -- PRD #216 fleet-aware spread (D3/D4/D7/D8/R3). Defer this run to a peer
       -- ONLY when a strictly-better peer exists. Resume affinity (worker_id = me)
       -- and a run older than @spread_cutoff both BYPASS the spread, so the spread
@@ -569,20 +610,23 @@ WHERE id = (
                   SELECT count(*) AS active
                   FROM runs pr
                   WHERE pr.worker_id = p.id
-                    AND pr.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+                    AND pr.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
                     AND pr.kind <> 'chat'
               ) pa
               WHERE p.user_id = @user_id
                 AND p.id <> @worker_id
                 AND p.last_heartbeat_at IS NOT NULL
                 AND p.last_heartbeat_at >= @heartbeat_cutoff
+                -- A draining peer claims nothing (PRD #422 Decision 7), so never DEFER a
+                -- run to it — it would never pick the run up.
+                AND p.draining_since IS NULL
                 AND p.max_concurrent_runs IS NOT NULL
-                AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), @docker_repo_allowlist::uuid[], r.repo_id, r.kind)
+                AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), @docker_repo_allowlist::uuid[], r.repo_id, r.kind, p.capabilities, r.required_capabilities, @capability_aware::boolean)
                 AND pa.active < p.max_concurrent_runs
                 AND pa.active * (SELECT w.max_concurrent_runs FROM workers w WHERE w.id = @worker_id)
                     < (SELECT count(*) FROM runs mr
                         WHERE mr.worker_id = @worker_id
-                          AND mr.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+                          AND mr.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
                           AND mr.kind <> 'chat')
                       * p.max_concurrent_runs
           )
@@ -787,6 +831,30 @@ UPDATE runs SET
     repo_agents      = COALESCE(sqlc.narg('repo_agents')::jsonb, repo_agents),
     agent_source     = COALESCE(sqlc.narg('agent_source'), agent_source),
     agent_exclusions = COALESCE(sqlc.narg('agent_exclusions')::jsonb, agent_exclusions),
+    -- PRD #84 M4: persist the plan-time INFERRED requirement set an AUTOPILOT run emits
+    -- on this self-contained `running` report. An autopilot run auto-approves its own
+    -- plan and never reports awaiting_approval, so SetRunAwaitingApproval's identical
+    -- clauses are never reached on it — without these three the inference is silently
+    -- lost for every auto-approved run (the sweep uses auto-approve). ALL THREE are
+    -- ABSENT-SAFE so the ordinary session-id/iteration heartbeats (which omit them) never
+    -- disturb the columns, mirroring SetRunAwaitingApproval byte-for-byte:
+    --
+    -- required_capabilities is UNION-MERGED (escalation-only): the M2 enqueue seam already
+    -- copied the repo's static hint, and inference can only ADD. The COALESCE is
+    -- LOAD-BEARING — a nil text[] param encodes SQL NULL and `arr || NULL = NULL` would
+    -- WIPE the NOT-NULL column — so an absent param unions with '{}' (no change) and a
+    -- present set adds its members, deduped; `<@` is order-independent so it stays unsorted.
+    required_capabilities = ARRAY(SELECT DISTINCT unnest(
+        required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))),
+    -- required_tools is SET, absent-safe: a present set REPLACES (the run's single
+    -- authoritative inferred toolchain list), an absent (NULL) param COALESCEs back to the
+    -- existing column. The service only passes a non-empty filtered set, so a garbled/empty
+    -- report leaves the param nil rather than wiping the column.
+    required_tools = COALESCE(sqlc.narg('inferred_tools')::text[], required_tools),
+    -- size_class is SET, absent-safe like required_tools: a present (clamped s/m/l) value
+    -- REPLACES, an absent (NULL) param COALESCEs back. The service clamps to {s,m,l} before
+    -- passing, so a garbled report becomes a nil param (no change) rather than a bad value.
+    size_class = COALESCE(sqlc.narg('size_class'), size_class),
     -- PRD #122 M1: the FROZEN milestone list an AUTOPILOT run resolved for itself,
     -- with a SAFETY-NET fallback to milestones_candidate (issue #259). Written
     -- IMMUTABLY — COALESCE keeps the EXISTING value, so a later `running` report can
@@ -887,7 +955,51 @@ WHERE runs.id = @id AND worker_id = @worker_id
         WHERE run_user_inputs.run_id = @id
           AND run_user_inputs.kind = 'answer'
           AND run_user_inputs.consumed_at IS NOT NULL
-          AND run_user_inputs.question_id = runs.open_question_id));
+          AND run_user_inputs.question_id = runs.open_question_id))
+  -- awaiting_followup → running is guarded the SAME way and for the same reason as
+  -- awaiting_input above (PRD #517 Decision 7), as a THIRD, INDEPENDENT clause. The
+  -- interactive-task park (Decision 3) holds the run in-process at `awaiting_followup`
+  -- after signal_done; the worker resumes ONLY when a `follow_up` steering input has
+  -- been consumed (`uzi run follow-up`, Decision 4 waiter). Requiring a CONSUMED
+  -- follow_up is what ties the wake to the in-process worker on the current claim:
+  -- the outer `worker_id = @worker_id` already pins the worker, and this clause pins the
+  -- CAUSE — a delayed or duplicate PRE-PARK `running` report (the batcher retries, and
+  -- the pre-gate fire-and-forget reports already exist, so reordering is not
+  -- hypothetical) carries no consumed follow_up, so it cannot un-park an idle task and
+  -- re-arm the wall clock. Kept SEPARATE from the two clauses above, never merged into
+  -- a single `status NOT IN (...) OR kind IN (...)`: that would let a consumed `answer`
+  -- satisfy the FOLLOWUP gate (and vice-versa), re-opening #44 F2 sideways.
+  --
+  -- Like awaiting_input this clause IS now keyed on a per-park identity (issue #552 M1):
+  -- runs.open_followup_id, a WATERMARK of the highest follow_up the run had already
+  -- consumed at the moment it parked. The tie is therefore "a follow_up NEWER than the
+  -- watermark was consumed" — i.e. THIS park's follow_up — not "any follow_up was ever
+  -- consumed". Without it, on a run that has already iterated (cycle ≥2, an earlier
+  -- follow_up consumed) the bare EXISTS always found a consumed follow_up and degraded
+  -- to a no-op, so a stale pre-park `running` report un-parked an idle run: a real
+  -- awaiting_followup→running STATE CHANGE (the health CASE arms fire their ELSE branch),
+  -- re-arming the wall clock on a task sitting in the follow-up waiter.
+  --
+  -- runs.open_followup_id reads the OLD (pre-update) row here — Postgres evaluates the
+  -- WHERE, and every SET right-hand side, against the pre-update tuple — exactly as
+  -- runs.open_question_id does in the awaiting_input guard above. The setter's
+  -- COALESCE(MAX(id),0) floor stamps 0 (never NULL) on every park, so open_followup_id is
+  -- genuinely NULL only for a run that has never parked at all; that NULL COALESCEs to 0
+  -- here, so any consumed follow_up clears it: fail-open only in the one case where any
+  -- consumed follow_up genuinely IS new.
+  --
+  -- No clear-on-wake is needed, and a future reader must NOT "add the missing sibling
+  -- clear" the way open_question_id needs one. The watermark keys on CONSUMED-only rows
+  -- and is RECOMPUTED at each park (SetRunAwaitingFollowup) to the max already-consumed
+  -- follow_up: the follow_up that wakes a park is unconsumed until it wakes, so it never
+  -- counts toward the watermark that guards its own park, and the next park's recompute
+  -- rolls the watermark forward to include it. There is nothing to reset between parks.
+  AND (status <> 'awaiting_followup' OR EXISTS (
+        SELECT 1 FROM run_user_inputs
+        WHERE run_user_inputs.run_id = @id
+          AND run_user_inputs.kind = 'follow_up'
+          AND run_user_inputs.consumed_at IS NOT NULL
+          AND run_user_inputs.id > COALESCE(runs.open_followup_id, 0)));
 
 -- name: SetRunAwaitingApproval :execrows
 UPDATE runs SET
@@ -934,6 +1046,33 @@ UPDATE runs SET
     -- correct: the candidate reflects only the latest proposal. The immutable
     -- frozen list is untouched here (it is written at approve / by autopilot).
     milestones_candidate = sqlc.narg('milestones_candidate')::jsonb,
+    -- PRD #84 M4 (unit 4b): persist the plan-time INFERRED requirement set the worker
+    -- emits on this report. ALL THREE assignments are ABSENT-SAFE (a nil param must not
+    -- disturb the column). ESCALATION-ONLY applies to required_capabilities ALONE:
+    -- inference can ADD but never DROP what the M2 repo hint already established, via the
+    -- union-merge below. required_tools and size_class are absent-safe SET/REPLACE — a
+    -- present value REPLACES the column outright, an absent (nil) param COALESCEs to a
+    -- no-op.
+    --
+    -- required_capabilities is UNION-MERGED, not replaced: the M2 enqueue seam already
+    -- copied the repo's static hint onto this run, and the plan-time inference can only
+    -- ADD to it (Decision: escalation-only). The COALESCE is LOAD-BEARING — a nil text[]
+    -- param encodes SQL NULL, and `arr || NULL = NULL` would WIPE the NOT-NULL column
+    -- (the exact pgx trap the register path guards the same way, runtime.sql ~185). So an
+    -- ABSENT param unions with '{}' and changes nothing; a present set adds its members,
+    -- deduped. The claim predicate uses the order-independent `<@` subset test, so the
+    -- merged array is intentionally left unsorted.
+    required_capabilities = ARRAY(SELECT DISTINCT unnest(
+        required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))),
+    -- required_tools is SET, absent-safe: a present set REPLACES (it is the run's single
+    -- authoritative inferred toolchain list, not merged with a prior source), and an
+    -- absent (NULL) param COALESCEs back to the existing column, leaving it untouched.
+    required_tools = COALESCE(sqlc.narg('inferred_tools')::text[], required_tools),
+    -- size_class is SET, absent-safe like required_tools: a present (clamped s/m/l) value
+    -- REPLACES the column, and an absent (NULL) param COALESCEs back to the existing value,
+    -- leaving it untouched. The service clamps to the {s,m,l} vocabulary before passing it,
+    -- so a garbled worker report becomes a nil param (no change) rather than a bad value.
+    size_class = COALESCE(sqlc.narg('size_class'), size_class),
     session_id = COALESCE(sqlc.narg('session_id'), session_id),
     -- 🔴 INVARIANT, carried by TWO call sites and by nothing else:
     -- NO SETTER MAY LEAVE A RESOLVED open_question_id BEHIND. The sibling clear is in
@@ -1006,6 +1145,51 @@ WHERE id = @id AND worker_id = @worker_id
   -- then never reach the plan gate at all — it wedges every pre-run clarification
   -- permanently. Do not add it.
   AND status <> 'limit_wait';
+
+-- name: ClearRunRequiredCapabilities :execrows
+-- PRD #84 M4 (unit 4c): the user override ("run without the capability", Decision 12).
+-- When the owner approves a plan the capability gate would BLOCK — because plan-time
+-- inference (or the repo hint) attached a required capability the owning worker cannot
+-- satisfy — this clears the run's inferred/hinted requirement set so the subsequent
+-- approve is no longer fenced. v1 clears the WHOLE run set (repo hint + inferred); a
+-- hint-vs-inference split is a future refinement (Decision 6/12). No security boundary is
+-- crossed: the §300 guardrail still denies docker USE on a daemon-less worker at run time,
+-- so clearing the SCHEDULING requirement only removes the approval fence, never the
+-- runtime protection.
+--
+-- Owner-scoped (user_id) AND status-guarded (awaiting_approval only): the clear runs from
+-- the owner-authenticated approve path, and a run outside the plan gate is a no-op
+-- (0 rows), so a stray override on a running/terminal run changes nothing.
+UPDATE runs SET required_capabilities = '{}', updated_at = now()
+WHERE id = @id AND user_id = @user_id AND status = 'awaiting_approval';
+
+-- name: SetRunIntentSummary :execrows
+-- PRD #362 M1: persist a run's plain-English INTENT summary ("what this run will
+-- implement"), posted by the worker after the clone is provisioned and before it
+-- plans. A PLAIN UPDATE by run id: the idempotent-on-set decision (skip when
+-- summary_intent is already set, so a re-claim/resume does not re-spend the owner's
+-- token — Decision 3) lives in the service, which reads the run first for its
+-- owner/repo/non-terminal guards anyway. :execrows so the caller can confirm the row
+-- exists (a foreign/deleted run updates 0 rows), never for a stale-write guard.
+UPDATE runs SET
+    summary_intent = @summary_intent,
+    updated_at     = now()
+WHERE id = @id;
+
+-- name: SetRunPlanSummary :execrows
+-- PRD #362 M1: persist a run's PLAN summary + deltas with the Decision 3 stale-write
+-- guard. The worker sends the plan_md the summary was generated from; this writes
+-- summary_plan/summary_deltas ONLY IF that still matches runs.plan_md, so a slower
+-- earlier generation cannot overwrite the summary of a newer, revised plan
+-- (last-write-wins by PLAN VERSION, not by completion time — no extra hash column).
+-- :execrows returns the rows-affected count so the service detects a stale (0-row)
+-- write and rejects it as a conflict, distinct from a run-not-found. Matching on the
+-- full plan_md text is intentional (simplest correct guard).
+UPDATE runs SET
+    summary_plan   = @summary_plan,
+    summary_deltas = @summary_deltas::jsonb,
+    updated_at     = now()
+WHERE id = @id AND plan_md = @expected_plan_md;
 
 -- name: SetRunLimitWait :execrows
 -- Park a run until the owner's exhausted Anthropic usage window reopens (PRD #35
@@ -1160,6 +1344,47 @@ UPDATE runs SET
 WHERE id = @id AND worker_id = @worker_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
+-- name: SetRunAwaitingFollowup :execrows
+-- PRD #517 M2/M3: the interactive-task park. On signal_done an interactive task run
+-- parks here IN-PROCESS (Decision 3) rather than finalizing to `completed`, holding
+-- its worker slot, clone and session alive so `uzi run follow-up` can resume the SAME
+-- agent session with full context. Sibling of SetRunAwaitingInput/limit_wait, and it
+-- carries the same PRD #47 exit contract for the same reason.
+--
+-- Unlike SetRunAwaitingInput there is NO question requirement: the park is not gated
+-- on a clarification question, so it takes no open_question_id (the worker resumes on
+-- a `follow_up` steering input, which SetRunRunning's Decision-7 wake guard keys on).
+--
+-- The health clear is LOAD-BEARING, not cosmetic, exactly as on SetRunAwaitingInput:
+-- awaiting_followup is (like awaiting_input) not a stalled/looping state, so a run
+-- must enter the park with health='ok' or it would carry a stale flag through the
+-- entire park with nothing able to clear it.
+--
+-- The worker-side kind/interactive guard lives in SetState (workersvc): the park is
+-- accepted only for an interactive task run, so this statement stays a plain guarded
+-- status write like its siblings. status NOT IN (terminal) makes a report onto an
+-- already-terminal run (a cancel raced in) a no-op → 0 rows → "already terminal".
+UPDATE runs SET
+    status     = 'awaiting_followup',
+    session_id = COALESCE(sqlc.narg('session_id'), session_id),
+    -- Issue #552 M1: the park-scoped follow_up watermark. Stamp it, at EVERY park, to
+    -- the highest follow_up this run has ALREADY consumed. A later follow_up with a
+    -- higher id — the one the resuming worker will consume to wake THIS park — is what
+    -- SetRunRunning's Decision-7 guard requires to admit awaiting_followup → running,
+    -- so it discriminates "THIS park's follow_up" from "any follow_up ever consumed".
+    --
+    -- CONSUMED-only (consumed_at IS NOT NULL) is load-bearing: the follow_up that wakes
+    -- a park is UNCONSUMED until it wakes, so a consumed-only MAX never advances past
+    -- it. That makes recomputing the watermark at every re-park correct with NO claim
+    -- re-delivery, NO worker echo and NO clear-on-wake — the watermark simply names the
+    -- last follow_up already spent, and anything newer is a genuine new steer.
+    open_followup_id = (SELECT COALESCE(MAX(id), 0) FROM run_user_inputs
+                        WHERE run_id = @id AND kind = 'follow_up' AND consumed_at IS NOT NULL),
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND status NOT IN ('completed', 'failed', 'cancelled');
+
 -- name: SetRunCompleted :execrows
 -- completed is the terminal MR-opened event → Human Review. move_pending_since is
 -- stamped here (same statement as the status write) so a crash before the forge
@@ -1271,6 +1496,10 @@ UPDATE runs SET
     -- classless failure to 'agent_failure'; the limit-opt-out non-park path stamps
     -- 'rate_limited'). Never derived from failure_reason, which is never parsed.
     fail_origin        = @fail_origin,
+    -- PRD #377 M1: the agent's secret-scrubbed, size-capped branch diff, preserved on a
+    -- workflow_scope_missing failure so a human can apply the work the bot PAT could not
+    -- push. NULL on every other failed path (only that arm sends a non-nil value).
+    preserved_patch    = @preserved_patch,
     session_id         = COALESCE(sqlc.narg('session_id'), session_id),
     move_pending_since = now(),
     finished_at        = now(),
@@ -1312,12 +1541,39 @@ WHERE id = @id
 -- stamped 'cancelled' for uniformity (PRD #33 Decision 3), though isStoppedRun's
 -- status='cancelled' branch already treats this run as a deliberate stop.
 UPDATE runs SET status = 'cancelled', stop_kind = 'cancelled', move_pending_since = now(), finished_at = now(),
+    -- PRD #503 M3: persist the operator's OPTIONAL cancel reason. @stop_reason binds a
+    -- nullable pgtype.Text: an invalid/zero value stores NULL (no reason supplied).
+    stop_reason = @stop_reason,
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND user_id = @user_id
+  AND status NOT IN ('completed', 'failed', 'cancelled');
+
+-- name: CancelRunByWorker :execrows
+-- Live-worker cancel transition (PRD #503 M1). When a LIVE worker consumes a cancel
+-- verdict it reports `failed`; SetState's failed arm routes HERE off the run's already
+-- loaded stop_kind='cancelled' (stamped by CreateStopVerdictInput BEFORE this report)
+-- instead of SetRunFailed, so an operator cancellation is not mis-classified as
+-- 'agent_failure'. This converges the live cancel path with the server-side
+-- CancelRunServerSide: status 'cancelled', fail_origin NULL (a cancel is not a failure,
+-- so it is never judged — Gate 0). It is worker-scoped (@worker_id) because SetState holds
+-- a worker, not a user, so CancelRunServerSide (user_id-scoped) is unusable from it.
+-- stop_kind is left untouched (already 'cancelled'). Terminal-run cleanup + guard mirror
+-- SetRunFailed exactly, so a report onto an already-terminal run is a 0-row no-op.
+UPDATE runs SET
+    status             = 'cancelled',
+    fail_origin        = NULL,
+    move_pending_since = now(),
+    finished_at        = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at         = now()
+WHERE id = @id AND worker_id = @worker_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: FailRunAutoStop :execrows
@@ -1387,7 +1643,14 @@ WHERE id = @id
   -- in that line's own comment, and equally exposed if someone relaxes it. Equally
   -- inert today, and added for the same reason — a backstop belongs where the guard is
   -- enforced, not where it currently happens to be derived.
-  AND status <> 'awaiting_input';
+  AND status <> 'awaiting_input'
+  -- awaiting_followup (PRD #517) is the interactive-task park and the same argument
+  -- transfers verbatim once more: it is excluded today only by autostop.go's single
+  -- `if run.Status != "running"` line, unmentioned in that line's own comment, and
+  -- exposed the day someone relaxes it. An auto-stopped park would be wrong on the
+  -- merits — its message writes have STOPPED (the worker parked after signal_done,
+  -- awaiting a follow-up), not looped — so this is the SQL backstop for that day.
+  AND status <> 'awaiting_followup';
 
 -- name: RejectRunServerSide :execrows
 -- Server-side plan rejection → failed → origin restore → stamp. stop_kind is
@@ -1463,6 +1726,17 @@ WHERE id = @id AND status = 'claimed';
 -- and is bounded by its own runner-side timeout, so folding it in here would newly fail a
 -- slow judge (large trace / slow API) that would otherwise complete.
 --
+-- Interactive task runs are exempt too (PRD #517 Decision 6, `interactive = false`
+-- below). An interactive task is user-paced like a chat: it parks at awaiting_followup
+-- between follow-ups and, over many turns, can legitimately be alive far longer than
+-- RUN_TIMEOUT. started_at is stamped ONCE and never reset, so on the resume back to
+-- 'running' the ORIGINAL started_at is already past the wall budget and the first sweep
+-- tick would fail a legitimately-resumed long-lived run — the exact use case the feature
+-- exists for. The park itself is already exempt (status <> 'running'); it is the RESUME
+-- that re-exposes it, so the exemption must live on the run's kind, not its status. It is
+-- instead bounded by the M5 worker idle timeout. `interactive` is NOT NULL DEFAULT false,
+-- so this changes NOTHING for non-interactive runs.
+--
 -- PRD #122 M2 (Decision 5b): the cutoff is now PER-RUN, not a single global @cutoff.
 -- A run that froze a scaled budget carries budget_wall_seconds; the sweep honours it,
 -- falling back to global_timeout_seconds (RUN_TIMEOUT) for a NULL-budget run — so a
@@ -1487,6 +1761,7 @@ UPDATE runs SET status = 'failed', failure_reason = @failure_reason,
 WHERE status = 'running'
   AND started_at < (sqlc.arg('now')::timestamptz - make_interval(secs => COALESCE(budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)))
   AND kind NOT IN ('chat', 'judge')
+  AND interactive = false
 RETURNING id, user_id, status;
 
 -- name: FailRunsOfStaleWorkersOverCap :many
@@ -1503,7 +1778,7 @@ UPDATE runs SET status = 'failed', failure_reason = @failure_reason,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND requeue_count >= @max_requeues
   AND worker_id IN (
       SELECT id FROM workers WHERE last_heartbeat_at IS NULL OR last_heartbeat_at < @cutoff
@@ -1518,7 +1793,7 @@ UPDATE runs SET status = 'queued', requeue_count = requeue_count + 1,
     -- detector re-evaluates the queued signal from this transition's updated_at.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND requeue_count < @max_requeues
   AND worker_id IN (
       SELECT id FROM workers WHERE last_heartbeat_at IS NULL OR last_heartbeat_at < @cutoff
@@ -1544,7 +1819,7 @@ UPDATE runs SET status = 'failed', failure_reason = @failure_reason,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE worker_id = @worker_id
-  AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+  AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND requeue_count >= @max_requeues
 RETURNING id;
 
@@ -1557,7 +1832,7 @@ UPDATE runs SET status = 'queued', requeue_count = requeue_count + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE worker_id = @worker_id
-  AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+  AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND requeue_count < @max_requeues;
 
 -- Messages -----------------------------------------------------------------
@@ -1918,20 +2193,19 @@ VALUES (@run_id, 'approve_plan', @body)
 RETURNING *;
 
 -- name: CreateStopVerdictInput :one
--- Enqueue a deliberate-stop verdict (cancel / reject_plan) for the live worker AND
+-- Enqueue a deliberate-stop verdict (cancel / reject_plan / stop) for the live worker AND
 -- stamp runs.stop_kind in the SAME statement (PRD #33 Decision 3): a data-modifying
 -- CTE runs to completion exactly once, so the stop signal can never be lost
 -- independently of the input that requested it — which a second, non-transactional
 -- UPDATE would risk, reintroducing the failed-vs-stopped bug. workersvc.Store exposes
 -- no transaction seam, so this single combined statement IS the atomicity.
 --
--- THREE callers since PRD #108 M5, not two, and the third is not a human verdict:
--- the auto-stop evaluator enqueues kind='cancel' with stop_kind='auto_stopped' for a
--- run whose message writes are in a confirmed permanent-failure loop. The MECHANISM
--- is unchanged — every caller stamps, so the stamp stays unconditional (no
--- IS NOT NULL guard and thus no parameter-type-inference pitfall) — only the
--- enumeration in this comment was wrong, and it is corrected in the same commit that
--- made it wrong. The stamp lands while the run is still non-terminal
+-- FOUR callers now, not two, and one is not a human verdict: PRD #108 M5's auto-stop
+-- evaluator enqueues kind='cancel' with stop_kind='auto_stopped' for a run whose message
+-- writes are in a confirmed permanent-failure loop, and PRD #517 M4's graceful `stop`
+-- enqueues kind='stop' with stop_kind='stopped'. The MECHANISM is unchanged — every caller
+-- stamps, so the stamp stays unconditional (no IS NOT NULL guard and thus no
+-- parameter-type-inference pitfall). The stamp lands while the run is still non-terminal
 -- (awaiting_approval/running); the client's terminal-guarded isStoppedRun ignores it
 -- until the run actually reaches failed/cancelled.
 --
@@ -1942,8 +2216,17 @@ RETURNING *;
 -- kind would therefore be a silent no-op on exactly the older fleet Phase 2 exists
 -- to protect — and would need a second migration for run_user_inputs.kind's CHECK.
 -- The distinguishing information rides runs.stop_kind, which the worker never sees.
+--
+-- PRD #503 M3: @stop_reason is stamped UNCONDITIONALLY here (like @stop_kind), but its
+-- VALUE is decided by the Go caller and belongs on the CANCEL and STOP paths only. A cancel
+-- passes the operator's optional reason (or NULL when none was given); a graceful stop
+-- (PRD #517 M4) likewise passes the operator's optional stop reason; reject_plan passes
+-- NULL, because a reject's reason goes to failure_reason via the M2 path and double-writing
+-- would contradict that clean split; auto-stop passes NULL, its identity being
+-- stop_kind='auto_stopped'. The stamp stays unconditional to avoid the
+-- parameter-type-inference pitfall the comment above already warns about.
 WITH stamped AS (
-    UPDATE runs SET stop_kind = @stop_kind, updated_at = now()
+    UPDATE runs SET stop_kind = @stop_kind, stop_reason = @stop_reason, updated_at = now()
     WHERE id = @run_id
     RETURNING id
 )
@@ -2017,7 +2300,7 @@ WHERE r.id = @run_id;
 -- repo-less run has no repos row and returns no row too; the service checks repo_id
 -- off the owned run FIRST so it can tell that apart and answer 409.
 SELECT rp.forge_project_id,
-       c.forge_type, c.base_url, c.token_ciphertext
+       c.forge_type, c.base_url, c.token_ciphertext, c.bot_forge_user_id
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id
@@ -2106,10 +2389,16 @@ WHERE id = @id;
 -- PRD #122 M2 (Decision 5b): budget_wall_seconds rides this read so the running-run
 -- "slow" clamp uses the run's EFFECTIVE timeout, not the global one — a scaled run must
 -- not render slow for its whole extended life. NULL for a run on the global default.
+-- PRD #84 M3: repo_id, kind and required_capabilities ride this read so the queued
+-- arm can surface a capability-specific "no eligible worker" reason (required caps not
+-- a subset of any online worker's effective caps). kind was previously only a WHERE
+-- filter; it is projected now so the resolver can branch on it too. No sweeper change —
+-- a parked run stays queued and every sweep pass is scoped away from it by construction.
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at,
        health, health_reason, health_since, health_notified_at,
-       budget_wall_seconds
+       budget_wall_seconds,
+       repo_id, kind, required_capabilities
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat';
@@ -2152,7 +2441,61 @@ WHERE id = @id AND status = @status;
 -- How many of a user's workers are online — the queued-run reason resolver uses it
 -- to say "no worker is online" vs "waiting for a worker" (Decision 8). Only called
 -- for a queued run already past its threshold, so it is off the hot path.
+-- draining_since is DELIBERATELY NOT filtered here (PRD #422 Decision 7): a draining
+-- worker keeps status='online' and still counts as an online worker for "no worker is
+-- online" purposes — do not add a draining predicate.
 SELECT count(*) FROM workers WHERE user_id = @user_id AND status = 'online';
+
+-- name: CountOnlineEligibleWorkersForRepo :one
+-- How many of a user's ONLINE workers are ELIGIBLE to claim a run on this repo/kind
+-- per fn_worker_can_claim (migration 00113, extended in 00142), IGNORING free slots.
+-- PRD #361's queued Docker-allowlist reason uses it: with >0 online workers, a result of
+-- 0 means every online worker is a Docker worker the allowlist predicate rejects for this
+-- repo — the run is genuinely unrunnable without allowlisting, distinct from "all busy" (a
+-- free slot won't help). Params cast EXACTLY as ClaimRun passes them so a green sqlc
+-- generate is not mistaken for a query Postgres will accept. capability_aware is passed
+-- FALSE (worker_caps/required_capabilities empty) so this stays the pure docker→allowlist
+-- eligibility 00142's capability clause trivially satisfies — the capability notion is
+-- handled separately upstream by CountOnlineWorkersSatisfyingCaps. Only called for a
+-- queued run already past its health threshold, so it is off the hot path.
+SELECT count(*) FROM workers w
+WHERE w.user_id = @user_id
+  AND w.status = 'online'
+  AND fn_worker_can_claim(COALESCE(w.docker_enabled, false), @docker_repo_allowlist::uuid[], @repo_id::uuid, @kind::text, '{}'::text[], '{}'::text[], false);
+
+-- name: ListDockerBlockedReposForUser :many
+-- The caller's repo ids that a Docker-allowlist gap is ACTIVELY blocking (PRD #361 M3):
+-- an enabled repo with ≥1 of the caller's QUEUED runs, for which the caller has ≥1 online
+-- worker but ZERO online workers eligible to claim a repo-bearing run on it — i.e. every
+-- online worker is a Docker worker and the repo is not on the docker allowlist. Reuses the
+-- fn_worker_can_claim eligibility notion (migration 00113, extended in 00142); for a
+-- repo-bearing run the kind is irrelevant (the judge exemption needs repo_id IS NULL), so
+-- eligibility is per repo and the kind arg is a placeholder. capability_aware is passed
+-- FALSE (worker_caps/required_capabilities empty) so this stays the pure docker→allowlist
+-- eligibility notion. The "≥1 online AND zero eligible" pair already implies the
+-- repo is not allowlisted (an allowlisted repo makes every worker eligible), so no separate
+-- allowlist clause is needed. Requiring ≥1 online worker keeps this distinct from a
+-- no-worker-online block (mirrors the M2 queued reason). Drives the Setup chip's info
+-- escalation, computed from eligibility directly — independent of the sweeper's
+-- health_reason text and health_enabled/threshold gating.
+SELECT r.id
+FROM repos r
+JOIN forge_connections fc ON fc.id = r.connection_id
+WHERE fc.user_id = @user_id
+  AND r.enabled = true
+  AND EXISTS (
+    SELECT 1 FROM runs run
+    WHERE run.repo_id = r.id AND run.user_id = @user_id AND run.status = 'queued'
+  )
+  AND EXISTS (
+    SELECT 1 FROM workers w
+    WHERE w.user_id = @user_id AND w.status = 'online'
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM workers w
+    WHERE w.user_id = @user_id AND w.status = 'online'
+      AND fn_worker_can_claim(COALESCE(w.docker_enabled, false), @docker_repo_allowlist::uuid[], r.id, 'task'::text, '{}'::text[], '{}'::text[], false)
+  );
 
 -- name: CountOnlineWorkersWithFreeSlotForUser :one
 -- How many of a user's ONLINE workers plausibly have room for another run — the
@@ -2167,11 +2510,30 @@ SELECT count(*) FROM workers WHERE user_id = @user_id AND status = 'online';
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
+  -- A draining worker has no free slot for NEW work (it claims nothing), so the
+  -- queued-run reason resolver must not count it as an idle worker (PRD #422 Decision 7).
+  AND w.draining_since IS NULL
   AND (w.max_concurrent_runs IS NULL
        OR (SELECT count(*) FROM runs r
             WHERE r.worker_id = w.id
-              AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+              AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
               AND r.kind <> 'chat') < w.max_concurrent_runs);
+
+-- name: CountOnlineWorkersSatisfyingCaps :one
+-- How many of a user's ONLINE, non-draining workers have EFFECTIVE caps that are a
+-- SUPERSET of a given required set — the queued-run reason resolver (PRD #84 M3) uses
+-- it to tell "no online worker can run this" (a capability nothing in the fleet has)
+-- from the generic wait. The effective-caps fold is the SAME one fn_worker_can_claim
+-- (migration 00142) applies at claim time — capabilities plus `docker` when
+-- docker_enabled — so a run this returns 0 for is exactly a run no online worker can
+-- claim. draining_since IS NULL mirrors CountOnlineWorkersWithFreeSlotForUser: a
+-- draining worker claims nothing, so it cannot be the eligible worker. Only called for
+-- a queued run already past its health threshold, so it is off the hot path.
+SELECT count(*) FROM workers w
+WHERE w.user_id = @user_id
+  AND w.status = 'online'
+  AND w.draining_since IS NULL
+  AND @required_capabilities::text[] <@ (COALESCE(w.capabilities, '{}') || CASE WHEN COALESCE(w.docker_enabled, false) THEN ARRAY['docker'] ELSE ARRAY[]::text[] END);
 
 -- name: RunHasVerdictSinceGateOpened :one
 -- Has the owner already answered THIS approval gate, with the worker yet to act on it

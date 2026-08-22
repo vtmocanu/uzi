@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // wireContractFixture is the single shared golden file both sides validate
@@ -47,16 +48,53 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 		IssueIID:         i64ptr(42),
 		IssueTitle:       "Extend the pipeline",
 		IssueDescription: "PRD: add a job",
-		Status:           "claimed",
-		Branch:           strptr("agent/issue-42"),
-		SessionID:        strptr("sess-abc"),
-		LastSeq:          7,
-		IterationCount:   1,
-		RequeueCount:     0,
-		PlanMd:           strptr("# Plan\n"),
-		AutoApprove:      true, // PRD #19 autopilot; part of the same claim shape
-		WaitOnLimit:      true, // PRD #35 Decision 7: the run's usage-limit opt-in
-		PlanApproved:     true,
+		// PRD #381: the bounded, bot-filtered snapshot of the issue's HUMAN comments
+		// rides the claim so the worker sees the discussion, not just the description.
+		// NON-EMPTY on purpose (Truncated:true, one real comment) — an empty/absent
+		// snapshot here would agree with a producer that dropped the field, the same
+		// "wired vs present-and-nil" reason the values above carry non-default. The
+		// timestamp is FIXED so the golden stays byte-stable.
+		IssueComments: &IssueCommentsSnapshot{
+			Comments: []IssueCommentSnapshot{
+				{
+					AuthorUsername:    "carol",
+					AuthorForgeUserID: 42,
+					CreatedAt:         time.Date(2026, 7, 4, 9, 0, 0, 0, time.UTC),
+					Body:              "please guard on Valid",
+				},
+			},
+			Truncated: true,
+		},
+		Status:         "claimed",
+		Branch:         strptr("agent/issue-42"),
+		SessionID:      strptr("sess-abc"),
+		LastSeq:        7,
+		IterationCount: 1,
+		RequeueCount:   0,
+		PlanMd:         strptr("# Plan\n"),
+		AutoApprove:    true, // PRD #19 autopilot; part of the same claim shape
+		// PRD #400 M2: the task-run MR gate + source ref ride every claim. Both are
+		// NON-DEFAULT here (open_mr true, base_branch non-nil) for the same "wired vs
+		// present-and-zero" reason the flags above carry non-default — even though they
+		// are only meaningful for kind='task'. open_mr has no omitempty (always present,
+		// like auto_approve); base_branch is a pointer (nil ⇒ absent).
+		OpenMr: true,
+		// PRD #517 M1: interactive rides every claim (a plain bool, no omitempty, always
+		// present). Non-default (true) here for the same "wired vs present-and-zero" reason
+		// as open_mr above, even though it is only meaningful for kind='task'.
+		Interactive: true,
+		// issue #552 M3: stop_pending rides every claim (a plain bool, no omitempty, always
+		// present). Non-default (true) here for the same "wired vs present-and-zero" reason as
+		// interactive above — the fixture is a coherent interactive, non-terminal, stopped run.
+		StopPending: true,
+		BaseBranch:  strptr("develop"),
+		// PRD #400 M4a: review_target_run_id rides every claim (a *string, no omitempty, so
+		// always present — null for a non-review run). This sample is NOT a review run, so it
+		// is left nil/null here; the non-null delivery for an actual review run is pinned in
+		// TestClaimCarriesReviewTargetRunID (service_test.go), not by mutating this shared
+		// golden into a semantically-incoherent review-of-itself.
+		WaitOnLimit:  true, // PRD #35 Decision 7: the run's usage-limit opt-in
+		PlanApproved: true,
 		// PRD #209: plan_source rides every claim (NOT NULL, no omitempty). "seeded"
 		// here makes this a coherent seeded-run claim — approved, no session — and is a
 		// NON-DEFAULT value for the same "wired vs present-and-zero" reason the booleans
@@ -187,6 +225,94 @@ func TestClaimRepoCarriesForgeType(t *testing.T) {
 	}
 	if got, ok := m["forge_type"]; !ok || got != "gitlab" {
 		t.Errorf("claim repo must carry forge_type=\"gitlab\" (R8); got %v (present=%v)", got, ok)
+	}
+}
+
+// TestClaimCarriesTaskMrFields pins PRD #400 M2's two additions: open_mr and
+// base_branch ride every claim. open_mr has no omitempty (always present, like
+// auto_approve); base_branch is a pointer that is present when non-nil. Both are
+// meaningful only for a task run, but the wire always carries the key so a worker
+// never has to guess. Additive — an old worker ignores both keys.
+func TestClaimCarriesTaskMrFields(t *testing.T) {
+	b, err := json.Marshal(sampleClaimPayloadWithSkills())
+	if err != nil {
+		t.Fatalf("marshal claim: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal claim: %v", err)
+	}
+	got, ok := m["open_mr"]
+	if !ok {
+		t.Error("claim must carry open_mr (PRD #400 M2); key absent")
+	} else if got != true {
+		t.Errorf("open_mr = %v, want true", got)
+	}
+	base, ok := m["base_branch"]
+	if !ok {
+		t.Error("claim must carry base_branch (PRD #400 M2); key absent")
+	} else if base != "develop" {
+		t.Errorf("base_branch = %v, want develop", base)
+	}
+}
+
+// TestClaimCarriesStopPending pins issue #552 M3's claim addition: stop_pending rides every
+// claim (a plain bool, no omitempty, always present). It re-delivers the durable
+// runs.stop_kind='stopped' fact so a graceful stop survives a worker crash. The sample models
+// an interactive, non-terminal, stopped run, so the key is present and true. Additive — an old
+// worker ignores the key and the idle timeout stays the backstop.
+func TestClaimCarriesStopPending(t *testing.T) {
+	b, err := json.Marshal(sampleClaimPayloadWithSkills())
+	if err != nil {
+		t.Fatalf("marshal claim: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal claim: %v", err)
+	}
+	got, ok := m["stop_pending"]
+	if !ok {
+		t.Error("claim must carry stop_pending (issue #552 M3); key absent")
+	} else if got != true {
+		t.Errorf("stop_pending = %v, want true", got)
+	}
+}
+
+// TestClaimCarriesReviewTargetRunID pins PRD #400 M4a's claim addition: review_target_run_id
+// rides every claim (a *string, no omitempty) — null for a non-review run, and the reviewed
+// task's id for a review run, which is how the worker (M4b) routes a claim to its diff-review
+// executor. The sample (a non-review run) carries the key as null; a review-run payload carries
+// the target id as a string. Additive — an old worker ignores the key.
+func TestClaimCarriesReviewTargetRunID(t *testing.T) {
+	// Non-review run: key present, null.
+	b, err := json.Marshal(sampleClaimPayloadWithSkills())
+	if err != nil {
+		t.Fatalf("marshal claim: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal claim: %v", err)
+	}
+	if got, ok := m["review_target_run_id"]; !ok {
+		t.Error("claim must carry review_target_run_id (PRD #400 M4a); key absent")
+	} else if got != nil {
+		t.Errorf("review_target_run_id = %v, want null for a non-review run", got)
+	}
+
+	// Review run: the reviewed task's id rides the claim as a string.
+	const targetID = "33333333-3333-3333-3333-333333333333"
+	rev := sampleClaimPayloadWithSkills()
+	rev.ReviewTargetRunID = strPtr(targetID)
+	b2, err := json.Marshal(rev)
+	if err != nil {
+		t.Fatalf("marshal review claim: %v", err)
+	}
+	var m2 map[string]any
+	if err := json.Unmarshal(b2, &m2); err != nil {
+		t.Fatalf("unmarshal review claim: %v", err)
+	}
+	if got := m2["review_target_run_id"]; got != targetID {
+		t.Errorf("review_target_run_id = %v, want %s", got, targetID)
 	}
 }
 

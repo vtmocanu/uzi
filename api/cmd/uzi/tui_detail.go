@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"image/color"
 	"strings"
 	"time"
 
@@ -15,6 +16,10 @@ import (
 
 // laneRailWidth is the left rail's fixed column budget.
 const laneRailWidth = 26
+
+// railRateBarWidth is the full-rail account meter's bar: laneRailWidth minus the
+// "5h " label+space (3) and the " 100%" separator+right-aligned-percent field (5).
+const railRateBarWidth = laneRailWidth - 3 - 5 // 18
 
 // The detail view has two focusable panes (PRD #325 M4). ←/→ (and tab) move focus between
 // them; ↑/↓ act WITHIN the focused pane — between agents on the rail, scrolling the
@@ -41,13 +46,17 @@ type detailState struct {
 	// is true the window is pinned to the bottom (auto-tail) and scroll is recomputed on
 	// render; when paused, scroll is the fixed top so the view does not jump as frames
 	// arrive below it.
-	scroll    int
-	focus     int  // focusRail | focusTranscript — which pane ↑/↓ drives (M4)
-	follow    bool // M5: auto-tail the transcript (tail -f). Reset true on open / lane switch.
-	loaded    bool
-	loadErr   error
-	stream    *uzicli.RunStream
-	streamErr error
+	scroll int
+	focus  int  // focusRail | focusTranscript — which pane ↑/↓ drives (M4)
+	follow bool // M5: auto-tail the transcript (tail -f). Reset true on open / lane switch.
+	// railCollapsed folds the crew list to a one-line summary + the selected lane (`c`), so a
+	// tall roster cannot push the milestone block below the fold — the rail does not scroll,
+	// it is clamped to the transcript height (issue #379).
+	railCollapsed bool
+	loaded        bool
+	loadErr       error
+	stream        *uzicli.RunStream
+	streamErr     error
 	// polling is the D8 fallback: the socket is unusable, so the view re-reads over
 	// REST on the same 2s cadence `uzi run logs --follow` uses.
 	polling bool
@@ -75,6 +84,28 @@ func (d *detailState) applyLoaded(msg detailLoadedMsg) {
 	}
 	d.loaded = true
 	d.rebuild()
+}
+
+// applyMeta refreshes the run DTO from a periodic GetRun poll WITHOUT touching the frame
+// log — the transcript is fed by the stream/replay, this only refreshes the non-streamed
+// fields (milestones, health, kind, title, lifecycle stamps). Ignored until the initial
+// load has set the baseline, so a poll racing the first full load cannot flip `loaded`.
+//
+// Status is DELIBERATELY preserved rather than overwritten: the live stream owns it
+// (applyEvents sets it from authoritative `state` frames, including StreamRun's reconcile),
+// and applyMeta only runs while the stream is healthy (the dispatch guards on !polling).
+// Overwriting it would let a GetRun response that was in flight across a status transition
+// revert the status for up to one 2s tick — e.g. dropping the plan-gate banner and its owner
+// keys the instant a run enters awaiting_approval, or flipping a just-finished run back to
+// running. When the stream is down the poll-fallback path (loadDetailCmd/applyLoaded) owns
+// status instead, so nothing goes stale.
+func (d *detailState) applyMeta(run apitypes.RunDTO) {
+	if !d.loaded {
+		return
+	}
+	status := d.run.Status
+	d.run = run
+	d.run.Status = status
 }
 
 // applyEvents folds a batch in and reports whether the steer queue was signalled
@@ -117,7 +148,30 @@ func (d *detailState) addFrame(f laneFrame) {
 }
 
 func (d *detailState) rebuild() {
+	// The user's selection is tracked by lane KEY, not index: prepending the aggregated lane at
+	// index 0 (below) shifts every real lane down one the instant a run grows from 1 to ≥2 lanes,
+	// and re-pinning the same index would silently swap the transcript the user is reading for the
+	// firehose. Capture the selected key before the rebuild and restore it after.
+	var selKey string
+	if d.laneIdx >= 0 && d.laneIdx < len(d.lanes) {
+		selKey = d.lanes[d.laneIdx].Key
+	}
 	d.lanes = buildLanes(d.frames)
+	// Prepend the aggregated "all agents" lane once a run has ≥2 real lanes, so index 0 is the
+	// firehose and the individual lanes follow for isolating one. On the FIRST build there is no
+	// prior selection (selKey ""), so the restore below is skipped and the default index 0 lands on
+	// the firehose — the intended opening view for a multi-lane run.
+	if len(d.lanes) >= 2 {
+		d.lanes = append([]agentLane{allLane(d.frames)}, d.lanes...)
+	}
+	if selKey != "" {
+		for i, l := range d.lanes {
+			if l.Key == selKey {
+				d.laneIdx = i
+				break
+			}
+		}
+	}
 	if d.laneIdx >= len(d.lanes) {
 		d.laneIdx = len(d.lanes) - 1
 	}
@@ -131,6 +185,18 @@ func (d *detailState) selectedLane() (agentLane, bool) {
 		return agentLane{}, false
 	}
 	return d.lanes[d.laneIdx], true
+}
+
+// exitToBoard leaves the run detail and returns to the factory-floor board: it closes the live
+// stream, drops the detail state, and refetches the board. Shared by esc and by ← at the left
+// pane boundary so the two cannot drift.
+func (m tuiModel) exitToBoard() (tea.Model, tea.Cmd) {
+	if m.detail.stream != nil {
+		m.detail.stream.Close()
+	}
+	m.view = viewBoard
+	m.detail = detailState{}
+	return m, m.fetchRunsCmd(m.board.admin)
 }
 
 func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
@@ -153,19 +219,29 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 	}
 	switch k {
 	case keyEsc:
-		if m.detail.stream != nil {
-			m.detail.stream.Close()
-		}
-		m.view = viewBoard
-		m.detail = detailState{}
-		return m, m.fetchRunsCmd(m.board.admin)
+		return m.exitToBoard()
 	case keyRefresh:
 		return m, m.loadDetailCmd(m.detail.runID)
+	case keyCollapseCrew:
+		// Fold / unfold the crew list so the milestone block below it is always reachable
+		// (the rail is height-clamped and does not scroll). No-op with no lanes: there is
+		// nothing to fold and the caret/hint are hidden, so toggling would only leave a run
+		// that later gains lanes silently opening collapsed.
+		if len(m.detail.lanes) > 0 {
+			m.detail.railCollapsed = !m.detail.railCollapsed
+		}
+		return m, nil
 	case keyTab:
 		// tab cycles focus between the two panes.
 		m.detail.focus = 1 - m.detail.focus
 		return m, nil
 	case "h", keyLeft:
+		// ← from the transcript moves focus to the crew rail; ← again from the rail (the leftmost
+		// pane) backs out of the run and returns to the factory floor — the natural "back out" at
+		// the left boundary, the mirror of the board's → drill-in, and alongside esc.
+		if m.detail.focus == focusRail {
+			return m.exitToBoard()
+		}
 		m.detail.focus = focusRail
 		return m, nil
 	case "l", keyRight:
@@ -236,36 +312,105 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// joinTags joins the non-empty parts with sep, so an absent tag (no credential, no transport)
+// leaves no stray separator.
+func joinTags(sep string, parts ...string) string {
+	out := ""
+	for _, p := range parts {
+		if p == "" {
+			continue
+		}
+		if out != "" {
+			out += sep
+		}
+		out += p
+	}
+	return out
+}
+
+// detailHeaderLines builds the priority header (PRD #325 M3): the breadcrumb + run id + kind, the
+// run TITLE as the bold headline, WHICH Anthropic credential the run spent (PRD #295), the run
+// status token + duration, and the transport tag ("● live"). It returns ONE line when the terminal
+// is wide enough to hold the FULL title beside all of that (title and status on the same row), and
+// otherwise stays SPLIT across two lines so a long title never clips the status — the reason the
+// header was split in the first place. Each returned line is clamped to exactly one physical row
+// (the #379 invariant); transcriptViewport uses len() of this to keep its budget in step.
+func (m tuiModel) detailHeaderLines() []string {
+	d := &m.detail
+
+	crumb := m.pal.faint.Render("‹ floor") + m.pal.faint.Render("   run ") + m.pal.title.Render(shortRunID(d.runID))
+	if d.run.ID != "" && d.run.Kind != "" {
+		crumb += m.pal.faint.Render(" · " + m.renderer.Plain(d.run.Kind, 12))
+	}
+	if d.run.IssueIID != nil {
+		styledIID := m.pal.title.Render("#" + itoa(int(*d.run.IssueIID)))
+		crumb += m.pal.faint.Render(" · ") + m.issueLink(d.run, styledIID)
+	}
+
+	// The credential label (PRD #295, label only — reason/mode lives on `uzi run <id>`) and the
+	// healthy/transient transport tag; a transport DEGRADATION still takes its own line below.
+	credTag := m.detailCredTag()
+	transportTag := m.transportHeaderTag()
+	// The status token (glyph + human word, its state colour; the glyph is the NO_COLOR twin) plus
+	// elapsed time — a live run's runtime or a terminal run's total wall time.
+	statusTag := ""
+	if d.run.ID != "" {
+		tok := m.pal.stateToken(d.run.Status, d.run.Health, d.run.IsPlanning)
+		statusTag = lipgloss.NewStyle().Foreground(tok.color).Render(tok.glyph + " " + tok.word)
+		if dur := runDuration(d.run, time.Now()); dur != "" {
+			statusTag += m.pal.faint.Render(" · " + dur)
+		}
+	}
+
+	sep := m.pal.faint.Render("   ")
+	combinedRight := joinTags(sep, statusTag, credTag, transportTag) // one-line: status, credential, transport
+	title := m.renderer.Plain(runTitle(d.run), 80)                   // plain, capped at the 80-rune upper bound
+	titleW := visualWidth(title)
+
+	// Combine only when the FULL title fits on one row beside the crumb and the combined right
+	// block (3 = the "   " gap after the crumb; 1 = the trailing gap padVisual reserves). Below
+	// that, splitting gives the title its own near-full-width row so it truncates instead of the
+	// status — the field that must never be the one cut (padVisual never truncates).
+	if d.run.ID != "" && titleW > 0 && m.width-visualWidth(crumb)-3-visualWidth(combinedRight)-1 >= titleW {
+		left := crumb + sep + lipgloss.NewStyle().Bold(true).Render(title)
+		if combinedRight != "" {
+			left = padVisual(left, m.width-visualWidth(combinedRight)-1) + combinedRight
+		}
+		return []string{clampVisual(left, m.width)}
+	}
+
+	// Split. Line 1: crumb + credential/transport pinned right.
+	line1 := crumb
+	if r := joinTags(sep, credTag, transportTag); r != "" {
+		line1 = padVisual(crumb, m.width-visualWidth(r)-1) + r
+	}
+	// Line 2: the title (truncating with …) + the status pinned right, so the status renders in
+	// full. 4 = the 3-col "   " prefix + a 1-col gap; 80 stays the upper-bound rune cap.
+	line2 := ""
+	if d.run.ID != "" {
+		titleCap := m.width - visualWidth(statusTag) - 4
+		if titleCap < 10 {
+			titleCap = 10
+		}
+		if titleCap > 80 {
+			titleCap = 80
+		}
+		bt := lipgloss.NewStyle().Bold(true).Render(clampVisual(m.renderer.Plain(runTitle(d.run), titleCap), titleCap))
+		line2 = padVisual("   "+bt, m.width-visualWidth(statusTag)-1) + statusTag
+	}
+	return []string{clampVisual(line1, m.width), clampVisual(line2, m.width)}
+}
+
 func (m tuiModel) renderDetail() string {
 	d := &m.detail
 	var sb strings.Builder
 
-	// Header: id + a kind chip + a semantic STATUS chip (PRD #325 M3, reading M2's
-	// statusColor/chip seam). "stalled" already turns the status chip orange via the
-	// precedence rule; because that colour vanishes under NO_COLOR, M4 appends a
-	// NO_COLOR-safe cue for it (▲ + "stalled") as well as the word for any other non-ok
-	// health, so no health state is lost when colour is stripped.
-	head := m.pal.faint.Render("run ") + m.pal.title.Render(shortRunID(d.runID))
-	if d.run.ID != "" {
-		if d.run.Kind != "" {
-			head += "  " + m.pal.chip(m.renderer.Plain(d.run.Kind, 10), m.pal.title.GetForeground())
-		}
-		es := effectiveRunStatus(d.run.Status, d.run.IsPlanning)
-		head += "  " + m.pal.chip(m.renderer.Plain(es, 18), m.pal.statusColor(es, d.run.Health))
-		if h := d.run.Health; h != "" && h != "ok" {
-			// A NO_COLOR-safe health cue (M4 review nit): without it a stalled run's only
-			// header signal is the orange chip colour, which vanishes under an Ascii
-			// profile. "stalled" gets a ▲ glyph + word (the glyph survives the colour
-			// strip); any other non-ok health shows its word, as the board does.
-			if h == "stalled" {
-				head += "  " + lipgloss.NewStyle().Foreground(m.pal.statusStalled).Render("▲ "+m.renderer.Plain(h, 14))
-			} else {
-				head += "  " + m.renderer.Plain(h, 14)
-			}
-		}
-		head += "  " + m.pal.faint.Render(m.renderer.Plain(runTitle(d.run), 60))
+	// The priority header (PRD #325 M3), rendered as ONE or TWO physical rows depending on width
+	// (see detailHeaderLines). Each row is clamped to exactly one physical line: a wrap would make
+	// transcriptViewport under-count and push the footer off the bottom (the #379 invariant).
+	for _, hl := range m.detailHeaderLines() {
+		sb.WriteString(hl + "\n")
 	}
-	sb.WriteString(head + "\n")
 
 	// The park line (PRD #35). The status word alone is already in the header, and it
 	// is not enough: "limit_wait" tells a user their run stopped and nothing about
@@ -282,19 +427,13 @@ func (m tuiModel) renderDetail() string {
 		sb.WriteString(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 120)) + "\n")
 	}
 
-	// The transport line is never silent about a degradation: a user watching a stale
-	// pane must be able to see WHY it is stale.
-	switch {
-	case d.streamErr != nil && d.polling:
-		sb.WriteString(m.pal.faint.Render("live stream unavailable (" + fmtErr(d.streamErr) + ") — falling back to a 2s refresh"))
-	case d.polling:
-		sb.WriteString(m.pal.faint.Render("reconnecting — refreshing every 2s"))
-	case d.stream != nil:
-		sb.WriteString(m.pal.faint.Render("live"))
-	default:
-		sb.WriteString(m.pal.faint.Render("connecting…"))
+	// The transport line is never silent about a degradation: a user watching a stale pane
+	// must see WHY it is stale. The healthy/transient states ("live", "connecting…") are the
+	// header tag above; only a degradation takes a full row here, where its longer text fits.
+	if tline := m.transportLine(); tline != "" {
+		sb.WriteString(clampVisual(tline, m.width) + "\n") // one physical row (a long streamErr must not wrap)
 	}
-	sb.WriteString("\n\n")
+	sb.WriteString("\n")
 
 	if d.loadErr != nil {
 		sb.WriteString(m.pal.faint.Render("could not load this run: " + fmtErr(d.loadErr)))
@@ -311,9 +450,10 @@ func (m tuiModel) renderDetail() string {
 
 	rail := m.renderLaneRail()
 	body := m.renderTranscript()
-	sb.WriteString(joinColumns(rail, body, laneRailWidth))
-	// The attention banner (PRD #325 M3) shows regardless of ownership — it is
-	// informational. The owner-gated action keys live in the footer below it.
+	sb.WriteString(m.joinColumns(rail, body, laneRailWidth))
+	// The attention band (PRD #325 M3 redesigned) shows regardless of ownership — it is
+	// informational. At a plan gate the OWNER's action keys ride inline at the band's right
+	// edge, and detailFooter drops them so they are not duplicated.
 	if b := m.detailBanner(); b != "" {
 		sb.WriteString(b + "\n")
 	}
@@ -324,43 +464,104 @@ func (m tuiModel) renderDetail() string {
 		sb.WriteString(steer + "\n")
 	}
 	if m.detail.steer.mode == steerIdle {
-		sb.WriteString(m.detailFooter())
+		sb.WriteString(clampVisual(m.detailFooter(), m.width)) // one physical row on a narrow terminal
 	}
 	return sb.String()
 }
 
-// detailFooter is the single-line keymap (PRD #325 M4): pane/scroll navigation combined
-// with the owner's steer actions, with approve/reject leading at a plan gate. The steer
-// bar's interactive modes draw their own hints, so this is only emitted when idle.
+// detailCredTag renders WHICH Anthropic credential this run spent as a compact, muted LABEL for
+// the right of the header's first line (PRD #295), before the transport tag. Label only — no dot,
+// no reason/mode — matching the quiet board column; the full "label — mode, N% headroom" lives on
+// `uzi run <id>`. Empty when no credential was recorded (a run claimed before PRD #111 M1, or one
+// not yet claimed). The label is USER-AUTHORED and drawn through renderer.Plain (D7);
+// AnthropicSecretLabel is in d7UntrustedFields.
+func (m tuiModel) detailCredTag() string {
+	r := m.detail.run
+	if r.AnthropicSecretLabel == nil || *r.AnthropicSecretLabel == "" {
+		return ""
+	}
+	return m.pal.faint.Render(m.renderer.Plain(strOr(r.AnthropicSecretLabel, ""), 24))
+}
+
+// transportHeaderTag is the compact connection tag folded into the header for the healthy
+// and transient states ("● live", "connecting…"), so the steady case does not cost a whole
+// row. Empty in a degraded state — transportLine draws that on its own line instead, and the
+// two are mutually exclusive, so exactly one of them is non-empty for any transport state.
+func (m tuiModel) transportHeaderTag() string {
+	d := &m.detail
+	// A terminal run will never produce more output, so it carries no transport chrome at all
+	// (neither this tag nor transportLine): "connecting…"/"reconnecting…" on a completed run is
+	// noise. The stream still opens to replay history, then closes — that close must not read as
+	// a degradation here.
+	if isTerminalRunStatus(d.run.Status) {
+		return ""
+	}
+	switch {
+	case d.streamErr != nil && d.polling, d.polling:
+		return "" // degraded: shown on its own line by transportLine
+	case d.stream != nil:
+		return m.pal.state(crewWorking).Render("● live")
+	default:
+		return m.pal.faint.Render("connecting…")
+	}
+}
+
+// transportLine is the full-width transport line, drawn ONLY for a degradation (the socket
+// is unusable and the view fell back to REST polling): the healthy/transient states fold
+// into transportHeaderTag. Kept as its own line because the explanation is long and a user
+// watching a stale pane must be able to read WHY it is stale. Pure — transcriptViewport
+// calls it to keep the chrome accounting and the render in lockstep.
+func (m tuiModel) transportLine() string {
+	d := &m.detail
+	// A terminal run shows no transport chrome (see transportHeaderTag): its stream closing is
+	// expected, not a degradation to reconnect from.
+	if isTerminalRunStatus(d.run.Status) {
+		return ""
+	}
+	switch {
+	case d.streamErr != nil && d.polling:
+		return m.pal.faint.Render("live stream unavailable (" + fmtErr(d.streamErr) + "), falling back to a 2s refresh")
+	case d.polling:
+		return m.pal.faint.Render("reconnecting — refreshing every 2s")
+	default:
+		return ""
+	}
+}
+
+// detailFooter is the single-line keymap (PRD #325 M4, redesigned): pane/scroll navigation
+// combined with the owner's steer actions. At a plan gate the owner's y/n live inline in the
+// attention band, so the footer does NOT repeat them (no duplication). The steer bar's
+// interactive modes draw their own hints, so this is only emitted when idle.
 func (m tuiModel) detailFooter() string {
 	owner := m.detail.steer.access == steerAllowed
-	var parts []string
-	if owner && atPlanGate(m.detail.run) {
-		parts = append(parts, m.keyHint("y", "approve"), m.keyHint("n", "reject"),
-			m.keyHint("f", "follow-up"), m.keyHint("x", "cancel"),
-			m.keyHint("←→", "pane"), m.keyHint("↑↓", "move"))
-	} else {
-		parts = append(parts, m.keyHint("←→", "pane"), m.keyHint("↑↓", "move"))
-		if isLiveRunStatus(m.detail.run.Status) {
-			// g re-attaches the transcript follow (M5); it is a view affordance, so it shows
-			// for owner and non-owner alike, but only when there is live output to follow.
-			parts = append(parts, m.keyHint("g", "live"))
+	parts := []string{m.keyHint("←→", "pane"), m.keyHint("↑↓", "move")}
+	if len(m.detail.lanes) > 0 {
+		parts = append(parts, m.keyHint("c", "crew"))
+	}
+	if isLiveRunStatus(m.detail.run.Status) {
+		// g re-attaches the transcript follow (M5); it is a view affordance, so it shows for
+		// owner and non-owner alike, but only when there is live output to follow.
+		parts = append(parts, m.keyHint("g", "live"))
+	}
+	if owner {
+		// v review is meaningless at a plan gate (no verdict yet); everywhere else the owner
+		// gets it. y/n are inline in the band, so they are never here.
+		if !atPlanGate(m.detail.run) {
+			parts = append(parts, m.keyHint("v", "review"))
 		}
-		if owner {
-			parts = append(parts, m.keyHint("f", "follow-up"), m.keyHint("v", "review"), m.keyHint("x", "cancel"))
-		}
+		parts = append(parts, m.keyHint("f", "follow-up"), m.keyHint("x", "cancel"))
 	}
 	parts = append(parts, m.keyHint("esc", "back"), m.keyHint("?", "keys"))
 	return strings.Join(parts, m.pal.faint.Render(" · "))
 }
 
-// keyHint is a compact bright-key / muted-label footer hint.
+// keyHint is a compact tungsten-key / faint-label footer hint.
 func (m tuiModel) keyHint(k, label string) string {
 	return m.pal.title.Render(k) + m.pal.faint.Render(" "+label)
 }
 
-// paneTitle renders a detail pane's title with a focus indicator: a bright brand bar + bold
-// title when focused, a dim title otherwise (M4).
+// paneTitle renders a detail pane's eyebrow with a focus indicator: a tungsten ▎ focus bar +
+// bold CAPS when focused, faint CAPS otherwise.
 func (m tuiModel) paneTitle(title string, focused bool) string {
 	if focused {
 		return m.pal.title.Render("▎" + strings.ToUpper(title))
@@ -368,32 +569,52 @@ func (m tuiModel) paneTitle(title string, focused bool) string {
 	return " " + m.pal.faint.Render(strings.ToUpper(title))
 }
 
-// detailBanner is the S3 two-banner treatment: awaiting_approval gets the PLAN GATE banner
-// (approve/reject, owner-gated keys in the steer bar); awaiting_input gets a DISTINCT
-// needs-input banner that does NOT offer y/n — those keys do nothing at a clarification
-// park, which is answered off-TUI (run answer / web / Slack). It shows for owner and
-// non-owner alike; only the promoted keys below are gated.
+// detailBanner is the S3 attention-band treatment: awaiting_approval gets the PLAN GATE band with
+// the OWNER's approve/reject keys inline (dropped from the footer so they are not duplicated);
+// awaiting_input gets a DISTINCT needs-input band that never offers y/n — those keys do nothing
+// at a clarification park, which is answered off-TUI (run answer / web / Slack); awaiting_followup
+// (PRD #517) gets its OWN band, distinct from needs-input: an interactive task parked for the
+// user's next follow-up, which is NOT a y/n prompt — the owner sends a follow-up (the `f` key) or
+// stops the run. All bands show for owner and non-owner alike; the inline y/n keys are
+// ownership-gated, and the follow-up band's "with f" hint is too (the `f` key is owner-only, so a
+// read-only viewer is pointed at web/Slack instead of an inert key).
 func (m tuiModel) detailBanner() string {
+	owner := m.detail.steer.access == steerAllowed
 	switch m.detail.run.Status {
 	case "awaiting_approval":
-		return m.attentionBanner("⚑  PLAN GATE", "this run is waiting on your approval")
+		return m.attentionBanner("⚑ PLAN GATE", "the crew is waiting on your approval", owner)
 	case "awaiting_input":
-		return m.attentionBanner("✎  NEEDS INPUT", "the agent asked a question; answer it from another terminal, the web, or Slack")
+		return m.attentionBanner("✎ NEEDS INPUT", "the agent asked a question; answer it from another terminal, the web, or Slack", false)
+	case "awaiting_followup":
+		// The "with f" hint is owner-only: the `f` steer key is gated to the run owner
+		// (tui_steer.go), so a read-only viewer is pointed at the web/Slack surfaces
+		// instead of an inert key. Body kept under the awaiting_input banner's width so
+		// the amber band never truncates at the 100-col reference frame. Owners still see
+		// `f` in the footer regardless; withKeys stays false (a follow-up park is not a
+		// y/n prompt).
+		body := "parked for your follow-up — send one from the web or Slack"
+		if owner {
+			body = "parked for your follow-up — send one with f, web, or Slack"
+		}
+		return m.attentionBanner("➤ AWAITING FOLLOW-UP", body, false)
 	}
 	return ""
 }
 
-// attentionBanner draws a BORDERED amber banner. The border is the NO_COLOR fallback (D3):
-// under an Ascii profile the amber fill/foreground is stripped but the box and its bold
-// text survive, so the gate stays structurally unmissable (SC2) without colour.
-func (m tuiModel) attentionBanner(head, body string) string {
-	c := m.pal.statusColor("awaiting_approval", "") // the needs-you colour (amber)
-	inner := m.width - 4
-	if inner < 20 {
-		inner = 20
+// attentionBanner draws the ONE filled surface on the detail screen: a full-width amber band
+// with a ▌ cap, the head in bold caps, the body, and (when withKeys) the owner's approve/reject
+// keys pinned right. NO_COLOR fallback (D3): under an Ascii profile the amber fill and colour
+// are stripped, but the ▌ cap and the bold "⚑ PLAN GATE" caps survive, so the gate stays
+// structurally unmissable without colour.
+func (m tuiModel) attentionBanner(head, body string, withKeys bool) string {
+	amber, fg := m.pal.amber, m.pal.bandFg
+	seg := func(bold bool, s string) string { return paintSeg(fg, amber, bold, s) }
+	left := seg(true, "▌"+head) + seg(false, "  "+body)
+	if withKeys {
+		right := seg(true, "y") + seg(false, " approve") + seg(false, " · ") + seg(true, "n") + seg(false, " reject") + seg(false, " ")
+		return clampVisual(padSeg(left, m.width-visualWidth(right), amber)+right, m.width)
 	}
-	text := lipgloss.NewStyle().Bold(true).Foreground(c).Render(head) + m.pal.faint.Render("  ·  ") + body
-	return lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(c).Padding(0, 1).Width(inner).Render(text)
+	return clampVisual(padSeg(left, m.width, amber), m.width)
 }
 
 func (m tuiModel) renderLaneRail() string {
@@ -402,55 +623,619 @@ func (m tuiModel) renderLaneRail() string {
 	active := activeLaneKey(d.run.Status, d.frames)
 
 	var sb strings.Builder
-	sb.WriteString(m.paneTitle("crew", d.focus == focusRail) + "\n")
+	// A caret advertises the collapse state (`c`) once there is a roster to collapse: ▾ open,
+	// ▸ with the lane count when folded to a summary + the selected lane.
+	title := m.paneTitle("crew", d.focus == focusRail)
+	if len(d.lanes) > 0 {
+		if d.railCollapsed {
+			title += m.pal.faint.Render("  " + itoa(len(d.lanes)) + " ▸")
+		} else {
+			title += m.pal.faint.Render("  ▾")
+		}
+	}
+	sb.WriteString(title + "\n")
+
 	if len(d.lanes) == 0 {
 		sb.WriteString(m.pal.faint.Render("(no activity yet)"))
+		// A milestone-structured run has a frozen list before any frame arrives (queued /
+		// just-claimed), so the block must show even with no lanes yet.
+		if block := m.renderMilestones(); block != "" {
+			sb.WriteString("\n\n" + block)
+		}
+		if rb := m.railRateMeters(strings.Count(sb.String(), "\n") + 1); rb != "" {
+			sb.WriteString("\n\n" + rb)
+		}
 		return sb.String()
 	}
-	for i, l := range d.lanes {
-		st := crewStateFor(d.run.Status, d.run.Health, l.Key, active, l.LastActivity, now)
-		// Role and label are model-authored: plain, clamped, never markdown.
-		name := m.renderer.Plain(l.Role, 14)
-		if l.Key != l.Role {
-			// The instance id is UNTRUSTED like everything else on this rail: it is the
-			// SDK's parent_tool_use_id, forwarded verbatim. shortInstanceID only takes a
-			// tail — it does not sanitize — so the result goes through Plain like every
-			// other cell. Rendering it raw was a real hole, caught by
-			// TestTUIViewsStripControlBytesFromUntrustedText.
-			name += m.pal.faint.Render("·" + m.renderer.Plain(shortInstanceID(l.Key), 8))
+
+	suffixes := laneSuffixes(d.lanes)
+	// The ALL row wears a fixed neutral ◉ (laneRow ignores the state it is handed), so short-circuit
+	// it here rather than computing a crew state nothing reads. Every real row is a plain per-key
+	// ladder — no rollup.
+	st := func(l agentLane) crewState {
+		if l.Key == laneAllKey {
+			return crewIdle
 		}
-		row := m.pal.state(st).Render(laneDot(st)) + " " + name
-		if i == d.laneIdx {
-			sb.WriteString(m.pal.sel.Render("▸" + row))
-		} else {
-			sb.WriteString(" " + row)
+		return crewStateFor(d.run.Status, d.run.Health, l.Key, active, l.LastActivity, now)
+	}
+	// The lead's context-window meter (#565): latest-wins across LEAD frames only, computed once
+	// and shown ONLY on the lead lane. A subagent lane and the synthetic ALL lane never get it.
+	fill, hasCtx := leadContextFill(d.lanes)
+	if d.railCollapsed {
+		// Just the selected lane, so the reader still knows whose transcript is on screen while
+		// the milestones get the rest of the column.
+		if l, ok := d.selectedLane(); ok {
+			sb.WriteString(m.laneRow(l, true, st(l), suffixes[l.Key], fill, hasCtx && l.Key == laneLead))
 		}
-		sb.WriteString("\n")
-		if l.Label != "" {
-			sb.WriteString("   " + m.pal.faint.Render(m.renderer.Plain(l.Label, laneLabelCap)) + "\n")
+	} else {
+		for i, l := range d.lanes {
+			sb.WriteString(m.laneRow(l, i == d.laneIdx, st(l), suffixes[l.Key], fill, hasCtx && l.Key == laneLead))
 		}
+	}
+	if block := m.renderMilestones(); block != "" {
+		sb.WriteString("\n" + block)
+	}
+	if rb := m.railRateMeters(strings.Count(sb.String(), "\n") + 1); rb != "" {
+		sb.WriteString("\n\n" + rb)
 	}
 	return sb.String()
 }
 
-// buildTranscriptLines renders the selected lane's frames to display lines (no windowing),
-// so the follow/scroll windowing and the line-count extent share one layout.
-func (m tuiModel) buildTranscriptLines(lane agentLane) []string {
+// laneIdentities maps each real lane's key to the identity string the crew rail shows for it,
+// so the aggregated transcript can tag every frame with the SAME token its lane row carries:
+// the role, plus a ·N ordinal suffix (laneSuffixes) only when the run has two lanes of one
+// role. The ALL lane itself is skipped. The role goes through Plain (D7) at the same cap
+// laneRow uses, so the tag and the rail row are byte-identical.
+func (m tuiModel) laneIdentities() map[string]string {
+	suffixes := laneSuffixes(m.detail.lanes)
+	out := make(map[string]string, len(m.detail.lanes))
+	for _, l := range m.detail.lanes {
+		if l.Key == laneAllKey {
+			continue
+		}
+		out[l.Key] = m.renderer.Plain(l.Role, 14) + suffixes[l.Key]
+	}
+	return out
+}
+
+// laneRow renders one crew-rail row: the ▸ cursor, the status dot, the model-authored role and
+// an optional ·N disambiguating ordinal, and the optional italic label line beneath it. A
+// selected lane rides the warm selection bar (like the board). The role and label are UNTRUSTED
+// and go through renderer.Plain (D7); the ordinal suffix is derived, not untrusted. Keeping
+// every cell's sanitizing in this one helper is why the collapsed and expanded paths share it.
+//
+// When showMeter is set (the lead lane, and only when leadContextFill found a valid reading) the
+// row carries the inline context-window meter AFTER the role/suffix. The meter is DERIVED, not
+// untrusted (no Plain needed), and is built here so it rides this row's own selection bg.
+func (m tuiModel) laneRow(l agentLane, selected bool, st crewState, suffix string, fill contextFill, showMeter bool) string {
+	var bg color.Color
+	if selected {
+		bg = m.pal.selBg
+	}
+	dotC := m.pal.state(st).GetForeground()
+	dot := laneDot(st)
+	if l.Key == laneAllKey {
+		// The aggregated row is a META lane, not an actor, so it wears a neutral tungsten ◉ (a
+		// circle-family glyph, distinct from the plain ● state dot) rather than a crew state
+		// dot — it never flashes the alarming ▲ a worst-state rollup would put on the whole run.
+		dot, dotC = "◉", m.pal.tungsten
+	}
+	cursor := paintSeg(nil, bg, false, " ")
+	if selected {
+		cursor = paintSeg(m.pal.tungsten, bg, true, "▸")
+	}
+	line := cursor + paintSeg(dotC, bg, false, dot) + paintSeg(nil, bg, false, " "+m.renderer.Plain(l.Role, 14))
+	if suffix != "" {
+		// A ·N ordinal disambiguates two lanes of one role (laneSuffixes). It is DERIVED, not
+		// the opaque SDK invocation id, so the id tail never reaches the rail — a lone role
+		// shows no suffix at all — and there is nothing untrusted here to sanitize.
+		line += paintSeg(m.pal.faintC, bg, false, suffix)
+	}
+	if showMeter {
+		// The bar fills whatever the rail has left after the ▸● <role><suffix> prefix,
+		// the meter's own leading space, its separator space, and the 4-col percent (=6).
+		barW := laneRailWidth - visualWidth(line) - 6
+		if barW < 0 {
+			barW = 0
+		}
+		line += m.contextMeterCell(bg, fill, barW)
+	}
 	var sb strings.Builder
-	for _, f := range lane.Frames {
-		sb.WriteString(m.pal.faint.Render("#"+itoa(int(f.Seq))+" "+m.renderer.Plain(f.Kind, 16)) + "\n")
-		sb.WriteString(m.renderer.Markdown(transcriptText(f)) + "\n\n")
+	sb.WriteString(padSeg(line, laneRailWidth, bg) + "\n")
+	if l.Label != "" {
+		// The machine's own words about its task: italic (degrading to plain under NO_COLOR),
+		// faint. Still UNTRUSTED → renderer.Plain.
+		lst := lipgloss.NewStyle().Foreground(m.pal.faintC).Italic(true)
+		if bg != nil {
+			lst = lst.Background(bg)
+		}
+		label := paintSeg(nil, bg, false, "   ") + lst.Render(m.renderer.Plain(l.Label, laneLabelCap))
+		sb.WriteString(padSeg(label, laneRailWidth, bg) + "\n")
+	}
+	return sb.String()
+}
+
+// milestoneTitleCap is the per-row title budget in the crew rail (laneRailWidth 26 minus
+// the " ✓ " glyph prefix). joinColumns clamps the whole left column anyway, but Plain must
+// cap the UNTRUSTED title itself (D7), so it caps at the width the rail can actually show.
+const milestoneTitleCap = 22
+
+// milestoneProgress folds a run's frozen milestone list into (done, total, reported), shared by
+// the crew-rail block and the board badge so their COUNTS cannot disagree. `done` counts frozen
+// MEMBERS present in the completed set (immune to a duplicate id and to a completed id naming a
+// milestone dropped after it was ticked). `reported` is whether ANY completion was ever reported:
+// a nil completed slice (JSON null) means never. The crew rail and the board's text fallback use
+// it to read `–/N` rather than a `0/N` that looks like failure; the board's own micro-bar instead
+// draws an all-empty ▱ bar for an unreported run (see milestoneMarker), trading the never/zero
+// distinction for an at-a-glance bar. total is 0 for a run with no frozen list — caller renders
+// nothing.
+func milestoneProgress(run apitypes.RunDTO) (done, total int, reported bool) {
+	total = len(run.Milestones)
+	if total == 0 {
+		return 0, 0, false
+	}
+	completed := make(map[string]bool, len(run.MilestonesCompleted))
+	for _, id := range run.MilestonesCompleted {
+		completed[id] = true
+	}
+	for _, mi := range run.Milestones {
+		if completed[mi.ID] {
+			done++
+		}
+	}
+	return done, total, run.MilestonesCompleted != nil
+}
+
+// milestoneCount is the compact `2/4` (or `–/4` when nothing was reported) shared by the
+// crew-rail block's summary and the board's `M…` badge.
+func milestoneCount(done, total int, reported bool) string {
+	if !reported {
+		return "–/" + itoa(total)
+	}
+	return itoa(done) + "/" + itoa(total)
+}
+
+// renderMilestones is the crew rail's milestone progress block (the TUI twin of the web's
+// MilestoneChecklist and the CLI `uzi run get` milestoneRows): a compact `{done}/{total}`
+// summary and one glyph-marked row per milestone in FROZEN order — done ✓, in progress ◐,
+// not started ○.
+//
+// Empty for a run with no frozen milestone list, so a pre-#122 (or non-milestone) run's
+// rail is byte-for-byte unchanged — the same back-compat contract the nil Milestones slice
+// carries elsewhere.
+//
+// The count says neither "verified" nor "complete" (PRD #122 Decision 6): the worker only
+// REPORTS a milestone done and nothing in uzi has verified it, so the bare N/M and the ✓
+// glyph must not imply verification. A run that has reported nothing shows `–/N`, not a
+// `0/N` that reads as failure (matching the web's `–/N` treatment). `done` counts frozen
+// members present in the completed set, immune to a duplicate id and to a completed id
+// that names a milestone dropped after it was ticked — the same rule milestoneBadge uses.
+//
+// Titles are UNTRUSTED repo/agent-authored text (apitypes.Milestone.Title), so each goes
+// through renderer.Plain — the D7 obligation the lane rail's Role/Label already carry, and
+// why "Title" is in d7UntrustedFields.
+func (m tuiModel) renderMilestones() string {
+	ms := m.detail.run.Milestones
+	if len(ms) == 0 {
+		return ""
+	}
+	completed := make(map[string]bool, len(m.detail.run.MilestonesCompleted))
+	for _, id := range m.detail.run.MilestonesCompleted {
+		completed[id] = true
+	}
+	inProgress := make(map[string]bool, len(m.detail.run.MilestonesInProgress))
+	for _, id := range m.detail.run.MilestonesInProgress {
+		inProgress[id] = true
+	}
+	done, total, reported := milestoneProgress(m.detail.run)
+
+	var sb strings.Builder
+	// The eyebrow gets a milestone micro-bar (▰ done / ▱ remaining) beside the count, the rail
+	// twin of the board's micro-bar. Dropped for a very long list, where the per-milestone rows
+	// below carry the detail anyway.
+	bar := ""
+	if reported && total <= boardMileCap {
+		bar = lipgloss.NewStyle().Foreground(m.pal.tungsten).Render(strings.Repeat("▰", done)) +
+			m.pal.faint.Render(strings.Repeat("▱", total-done)) + " "
+	}
+	sb.WriteString(m.pal.faint.Render("MILESTONES") + " " + bar + m.pal.faint.Render(milestoneCount(done, total, reported)) + "\n")
+	for _, mi := range ms {
+		glyph := m.pal.faint.Render("○") // not started
+		style := m.pal.faint
+		switch {
+		case completed[mi.ID]:
+			glyph = m.pal.state(crewWorking).Render("✓")
+			// done → muted, like the web's text-muted; the ✓ glyph carries completion, so no
+			// strikethrough (which lipgloss emits per-rune, bloating the frame for no signal).
+			style = m.pal.faint
+		case inProgress[mi.ID]:
+			glyph = m.pal.state(crewWaiting).Render("◐")
+			style = lipgloss.NewStyle() // current — plain terminal fg, like the web's text-fg
+		}
+		sb.WriteString(" " + glyph + " " + style.Render(m.renderer.Plain(mi.Title, milestoneTitleCap)) + "\n")
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+// railRateMeters renders the stacked per-account rate-limit block for the crew rail, or ""
+// when the selection is empty. It appends WHOLE account entries only while they fit within
+// the remaining rail height (transcriptViewport() minus usedRows minus the blank separator
+// the caller adds), because joinColumns clamps the rail to the transcript height by dropping
+// its BOTTOM lines one at a time — an uncapped block would leave a half-drawn entry (label +
+// 5h, no 7d). Dropping whole entries keeps every visible entry complete. Reuses rateWindowCell
+// so the bar/percent/tone and the nil-window "-" are identical to the board strip.
+//
+// Deploy-ordering note (#519): the meters populate only when GET /api/me/settings and
+// /api/me/rate-limits answer over the CLI uzc_ Bearer token. /me/settings GET moved to
+// RequireUser in #519; against a server that predates that the settings fetch 401s (error
+// swallowed) and this falls back to default-token-only, exactly as the board strip does. No
+// server change here.
+func (m tuiModel) railRateMeters(usedRows int) string {
+	shown, showLabel := m.selectedRateMeters()
+	if len(shown) == 0 {
+		return ""
+	}
+	// budget is the rail height left below the content already built; the -1 is the blank
+	// separator the caller prepends via "\n\n" before this block.
+	budget := m.transcriptViewport() - usedRows - 1
+
+	// Each account entry is a \n-joined string of an optional faint label eyebrow + the two
+	// window cells; entries are added whole while they fit under the ACCOUNTS header.
+	const headerRow = 1
+	var fitted []string
+	accumulated := 0
+	for _, t := range shown {
+		var lines []string
+		if showLabel {
+			lines = append(lines, m.pal.faint.Render(m.renderer.Plain(t.Label, laneRailWidth)))
+		}
+		lines = append(lines,
+			m.rateWindowCell("5h", t.Limits.FiveHour, railRateBarWidth, 4),
+			m.rateWindowCell("7d", t.Limits.SevenDay, railRateBarWidth, 4),
+		)
+		entry := strings.Join(lines, "\n")
+		rows := len(lines)
+		if headerRow+accumulated+rows > budget {
+			break
+		}
+		fitted = append(fitted, entry)
+		accumulated += rows
+	}
+	if len(fitted) == 0 {
+		return ""
+	}
+	return m.pal.faint.Render("ACCOUNTS") + "\n" + strings.Join(fitted, "\n")
+}
+
+// buildTranscriptLines renders the selected lane's frames to display lines (no windowing),
+// so the follow/scroll windowing and the line-count extent share one layout. A speaker frame is
+// a ▪ header (tungsten) over its markdown body; a tool frame compresses to a single faint
+// `⚙ <tool> #seq` line. f.Kind and the tool name are drawn through renderer.Plain (D7); the body
+// through renderer.Markdown.
+// buildTranscriptLines renders a lane's frames to human-readable display lines (no windowing),
+// so the follow/scroll windowing and the line-count extent share one layout. The presentation
+// is written for a person, not a log reader:
+//   - text           the message body (markdown), with NO "text #123" header — the body is the
+//     message. In the aggregated lane it gets a tungsten "▪ <who>" speaker line so interleaved
+//     turns stay attributable; a single-lane view needs none (the pane title names the lane).
+//   - thinking       the same, but marked "thinking" (faint) so the model's INTERNAL reasoning is
+//     never read as its output.
+//   - tool_use       "⚙ <Tool>  <what it ran>" — the tool plus a compact arg preview (the
+//     command / path / pattern), never the internal seq.
+//   - tool_result    a faint "  ↳ <summary>" folded UNDER its own call (paired by id), flattened
+//     to one readable line (resultSummary). A failed call (is_error) gets a ✗; an ORPHAN result —
+//     a parallel call's result seq-interleaved away from its use — names its own tool + actor.
+//   - anything else  a humanized "▪ <kind>" header (no seq) over its body.
+//
+// Every model-authored string is UNTRUSTED and passes through Plain/Markdown (D7); the whole
+// palette stays ANDON's two intensities (tungsten accent over faint body), no per-frame colour.
+func (m tuiModel) buildTranscriptLines(lane agentLane) []string {
+	aggregated := lane.Key == laneAllKey
+	var ids map[string]string
+	if aggregated {
+		ids = m.laneIdentities()
+	}
+	tungsten := lipgloss.NewStyle().Foreground(m.pal.tungsten)
+	tungstenB := tungsten.Bold(true)
+	width := m.transcriptWidth()
+	// who returns the aggregated lane's per-frame identity tag (empty in a single-lane view).
+	who := func(f laneFrame) string {
+		if !aggregated {
+			return ""
+		}
+		id := ids[laneKeyOf(f)]
+		if id == "" {
+			id = m.renderer.Plain(frameAgentTag(f), 16)
+		}
+		return id
+	}
+	// tightNext[i] is true when frame i is a tool_use IMMEDIATELY followed by ITS OWN result
+	// (matched by id, not merely by the next frame being a tool_result). A single assistant turn
+	// with parallel tool calls persists as [use A, use B, result A, result B]; keying the pair off
+	// the next frame's kind alone would fold result A under call B and mis-title it. names resolves
+	// a result's tool by its use id, so an ORPHAN result (its call not directly above it) can still
+	// name the tool it belongs to.
+	tightNext := make([]bool, len(lane.Frames))
+	names := map[string]string{}
+	for i, f := range lane.Frames {
+		if f.Kind != "tool_use" {
+			continue
+		}
+		id := toolUseID(f)
+		if id == "" {
+			continue
+		}
+		if n, ok := toolFrameName(f); ok {
+			names[id] = n
+		}
+		if i+1 < len(lane.Frames) {
+			if nx := lane.Frames[i+1]; nx.Kind == "tool_result" && resultUseID(nx) == id {
+				tightNext[i] = true
+			}
+		}
+	}
+	var sb strings.Builder
+	for i, f := range lane.Frames {
+		var block string
+		switch f.Kind {
+		case "tool_use":
+			name, ok := toolFrameName(f)
+			if !ok {
+				name = "tool"
+			}
+			// The tool NAME is the scannable anchor of a busy tool run (many ⚙ Bash lines in a
+			// row), so it gets the bold tungsten accent; the ⚙ glyph and the arg preview stay
+			// faint. The ·<who> comes BEFORE the command, not after: a long command is the
+			// truncatable tail, and in the aggregated view the attribution must never be the
+			// thing clampVisual cuts off (it did, on long greps).
+			line := m.pal.faint.Render("⚙ ") + tungstenB.Render(m.renderer.Plain(name, 24))
+			if w := who(f); w != "" {
+				line += m.pal.faint.Render(" · ") + tungsten.Render(w)
+			}
+			if arg := toolArgPreview(f.Payload); arg != "" {
+				line += m.pal.faint.Render("  " + m.renderer.Plain(arg, 200))
+			}
+			block = clampVisual(line, width)
+		case "tool_result":
+			sum := resultSummary(f.Payload)
+			if sum == "" {
+				sum = "(no output)"
+			}
+			// ✗ marks a FAILED tool call (is_error) — a glyph, not just a colour, so the failure
+			// survives a NO_COLOR/Ascii profile the way the header's ▲ does; the alarm colour rides
+			// on top for a colour terminal. The web shows the same signal as a red "✗ error" chip
+			// (PRD #116 classifyResultState), and dropping it made a failing run read like a passing
+			// one.
+			line := m.pal.faint.Render("  ↳ ")
+			if resultIsError(f.Payload) {
+				line += lipgloss.NewStyle().Foreground(m.pal.alarm).Render("✗ ")
+			}
+			// A result folded UNDER its own call (tightNext[i-1]) inherits that call's
+			// "⚙ <Tool> · <who>" line, so it repeats nothing. An ORPHAN result — a parallel call's
+			// result seq-separated from its use, or a result whose use is missing — carries its own
+			// tool name + actor so it stays attributable (the aggregated lane's whole purpose).
+			if i == 0 || !tightNext[i-1] {
+				seg := ""
+				if name := names[resultUseID(f)]; name != "" {
+					seg = tungstenB.Render(m.renderer.Plain(name, 24))
+				}
+				if w := who(f); w != "" {
+					if seg != "" {
+						seg += m.pal.faint.Render(" · ")
+					}
+					seg += tungsten.Render(w)
+				}
+				if seg != "" {
+					line += seg + m.pal.faint.Render("  ")
+				}
+			}
+			line += m.pal.faint.Render(m.renderer.Plain(sum, 200))
+			block = clampVisual(line, width)
+		case "text", "thinking":
+			// TrimLeft drops Glamour's document top-margin so the body sits directly under the
+			// "▪ <who>" speaker line instead of a blank line below it.
+			body := strings.TrimLeft(m.renderer.Markdown(transcriptText(f)), "\n")
+			head := ""
+			if w := who(f); w != "" {
+				head = tungsten.Render("▪ " + w)
+			}
+			if f.Kind == "thinking" {
+				// The model's INTERNAL reasoning, not its output: mark it so a reader never mistakes
+				// a private deliberation for something the agent "said". Faint, riding the speaker
+				// header when aggregated, else a lone faint eyebrow (text keeps none — the pane title
+				// names the lane).
+				if head != "" {
+					head += m.pal.faint.Render(" · thinking")
+				} else {
+					head = m.pal.faint.Render("▪ thinking")
+				}
+			}
+			if head != "" {
+				block = head + "\n"
+			}
+			block += body
+		default:
+			head := tungsten.Render("▪ " + m.renderer.Plain(f.Kind, 16))
+			if w := who(f); w != "" {
+				head += m.pal.faint.Render("  · ") + tungsten.Render(w)
+			}
+			block = clampVisual(head, width) + "\n" + strings.TrimLeft(m.renderer.Markdown(transcriptText(f)), "\n")
+		}
+		// Blocks are blank-line separated, EXCEPT a tool_use and ITS OWN result (tightNext, matched
+		// by id) pair tight (a single newline), so a call and its output read as one unit.
+		sep := "\n\n"
+		if tightNext[i] {
+			sep = "\n"
+		}
+		sb.WriteString(block + sep)
 	}
 	return strings.Split(strings.TrimRight(sb.String(), "\n"), "\n")
 }
 
+// toolFrameName pulls a tool-use frame's tool name from its payload, so the transcript can
+// compress it to one line. Returns ok=false for a non-tool frame or one with no name.
+func toolFrameName(f laneFrame) (string, bool) {
+	if f.Kind != "tool_use" || len(f.Payload) == 0 {
+		return "", false
+	}
+	var p struct {
+		Name string `json:"name"`
+	}
+	if json.Unmarshal(f.Payload, &p) == nil && p.Name != "" {
+		return p.Name, true
+	}
+	return "", false
+}
+
+// toolUseID pulls a tool_use frame's SDK id ("id"), the key a tool_result references back via
+// "tool_use_id". Empty for a non-tool_use frame or one carrying no id — in which case the pairing
+// falls back to unpaired (blank-line separated) rather than guessing.
+func toolUseID(f laneFrame) string {
+	if f.Kind != "tool_use" || len(f.Payload) == 0 {
+		return ""
+	}
+	var p struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(f.Payload, &p) == nil {
+		return p.ID
+	}
+	return ""
+}
+
+// toolArgPreview renders a tool_use's arguments as a compact one-liner for the transcript, so a
+// reader sees WHAT ran, not just the tool name: the command for Bash, the path for a file tool,
+// the pattern/url otherwise, else the whole input folded. The value is model-authored and
+// UNTRUSTED — compactText folds newlines/tabs, strips control bytes and caps the length.
+func toolArgPreview(payload json.RawMessage) string {
+	var p struct {
+		Input map[string]any `json:"input"`
+	}
+	if json.Unmarshal(payload, &p) != nil || len(p.Input) == 0 {
+		return ""
+	}
+	for _, k := range []string{"command", "file_path", "path", "pattern", "query", "url", "description"} {
+		if v, ok := p.Input[k].(string); ok && strings.TrimSpace(v) != "" {
+			return compactText(v)
+		}
+	}
+	b, err := json.Marshal(p.Input)
+	if err != nil {
+		return ""
+	}
+	return compactText(string(b))
+}
+
+// resultSummary flattens a tool_result payload's content into ONE readable line — the TUI twin
+// of the web's resultToText (RunEvent.tsx). Content is a string or an SDK array of
+// {type:"text",text:…} blocks; compactText turns the escaped newlines that made the raw JSON
+// dump unreadable into spaces and caps the length. Non-text blocks (images) are dropped, and an
+// empty/unknown shape yields "" so the caller can show "(no output)".
+func resultSummary(payload json.RawMessage) string {
+	var p struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(payload, &p) != nil || len(p.Content) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(p.Content, &s) == nil {
+		return compactText(s)
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(p.Content, &blocks) == nil {
+		parts := make([]string, 0, len(blocks))
+		for _, b := range blocks {
+			if b.Type == "text" && b.Text != "" {
+				parts = append(parts, b.Text)
+			}
+		}
+		return compactText(strings.Join(parts, " "))
+	}
+	return ""
+}
+
+// resultUseID pulls a tool_result frame's "tool_use_id" — the id of the tool_use it answers, used
+// to pair a result with its own call (buildTranscriptLines) instead of with whatever frame happens
+// to sit above it in seq order.
+func resultUseID(f laneFrame) string {
+	if f.Kind != "tool_result" || len(f.Payload) == 0 {
+		return ""
+	}
+	var p struct {
+		ToolUseID string `json:"tool_use_id"`
+	}
+	if json.Unmarshal(f.Payload, &p) == nil {
+		return p.ToolUseID
+	}
+	return ""
+}
+
+// resultIsError reports whether a tool_result payload carries is_error:true — a failed (or
+// guardrail-denied) tool call. The flag is passed through verbatim from the upstream SDK
+// (agent/src/sdk-messages.ts); a malformed or absent flag reads as not-an-error.
+func resultIsError(payload json.RawMessage) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	var p struct {
+		IsError bool `json:"is_error"`
+	}
+	return json.Unmarshal(payload, &p) == nil && p.IsError
+}
+
 // transcriptViewport is the transcript's visible line budget (the pane title is a fixed
 // header above it, so it is one row shorter than the pane).
+//
+// The budget is the terminal height minus every OTHER row the detail view draws, so the
+// two-pane body fills the screen down to the footer (issue #379) rather than stopping at the
+// last line of content and leaving a tall terminal with dead space below the footer. It
+// counts the SAME chrome renderDetail emits — header (1 or 2 rows, detailHeaderLines), optional
+// park line, an optional degraded
+// transport line (a healthy "live"/"connecting…" folds into the header), the blank separator,
+// the pane title row, an optional attention banner, an optional steer bar, and the footer — so
+// this and the render cannot disagree; both the window render and the scroll clamp read it.
+// renderSteerBar/detailBanner/transportLine are pure and never call back here (no recursion).
 func (m tuiModel) transcriptViewport() int {
-	if h := m.height - 11; h > 3 {
+	lineCount := func(s string) int {
+		if s == "" {
+			return 0
+		}
+		return strings.Count(s, "\n") + 1
+	}
+	chrome := len(m.detailHeaderLines()) // the priority header: 1 or 2 rows depending on width (detailHeaderLines)
+	if limitWaitLine(m.detail.run, time.Now()) != "" {
+		chrome++ // the park / limit-wait line
+	}
+	if m.transportLine() != "" {
+		chrome++ // the degraded transport line (a healthy "live"/"connecting…" folds into the header)
+	}
+	chrome++ // the blank separator line before the body
+	chrome++ // the transcript pane's own title row (the first line of the body column)
+	chrome += lineCount(m.detailBanner())
+	chrome += lineCount(m.renderSteerBar())
+	if m.detail.steer.mode == steerIdle {
+		chrome++ // the footer (suppressed while the steer bar owns the key hints)
+	}
+	if h := m.height - chrome; h > 3 {
 		return h
 	}
 	return 3
+}
+
+// padLinesToViewport joins lines and pads with blank lines to exactly vp rows, so the
+// transcript column always fills the viewport height and the pane divider joinColumns draws
+// beside it reaches the footer even when the run has fewer lines than the viewport (#379).
+func padLinesToViewport(lines []string, vp int) string {
+	out := make([]string, 0, vp)
+	out = append(out, lines...)
+	for len(out) < vp {
+		out = append(out, "")
+	}
+	return strings.Join(out, "\n")
 }
 
 // transcriptExtent gives the selected lane's total line count and the viewport, so the key
@@ -466,8 +1251,14 @@ func (m tuiModel) transcriptExtent() (total, viewport int) {
 func (m tuiModel) renderTranscript() string {
 	focused := m.detail.focus == focusTranscript
 	lane, ok := m.detail.selectedLane()
+	// The pane title names WHOSE lane is on screen: TRANSCRIPT · <role>.
+	title := m.paneTitle("transcript", focused)
+	if ok && lane.Role != "" {
+		title += m.pal.faint.Render(" · " + m.renderer.Plain(lane.Role, 16))
+	}
 	if !ok {
-		return m.paneTitleBadge("transcript", focused, "") + "\n" + m.pal.faint.Render("no lane selected")
+		return m.padPaneTitle(title, "") + "\n" +
+			padLinesToViewport([]string{m.pal.faint.Render("no lane selected")}, m.transcriptViewport())
 	}
 	lines := m.buildTranscriptLines(lane)
 	vp := m.transcriptViewport()
@@ -490,37 +1281,38 @@ func (m tuiModel) renderTranscript() string {
 	if end > len(lines) {
 		end = len(lines)
 	}
-	window := strings.Join(lines[top:end], "\n")
+	// Pad to the full viewport so the transcript column, and the pane divider beside it,
+	// reach the bottom of the screen even when the content is shorter than the viewport (#379).
+	window := padLinesToViewport(lines[top:end], vp)
 
-	return m.paneTitleBadge("transcript", focused, m.followBadge(top, maxTop)) + "\n" + window
+	return m.padPaneTitle(title, m.followBadge(top, maxTop)) + "\n" + window
 }
 
 // followBadge is the transcript's live-follow affordance (M5) — distinct from the transport
 // line, which is about THIS CLIENT's connection. Only a LIVE run tails: a terminal run's
-// transcript is complete, so it carries no badge. FOLLOWING while auto-tailing; PAUSED with
-// a "↓N new" count (N = lines below the fold) once the reader has scrolled back.
+// transcript is complete, so it carries no badge. `⇣ following` while auto-tailing; when paused,
+// `⏸ N new · g ⇣` — the count of lines below the fold, plus the key that teaches its own remedy.
 func (m tuiModel) followBadge(top, maxTop int) string {
 	if !isLiveRunStatus(m.detail.run.Status) {
 		return ""
 	}
 	if m.detail.follow {
-		return lipgloss.NewStyle().Foreground(m.pal.statusColor("running", "")).Bold(true).Render("● FOLLOWING")
+		return lipgloss.NewStyle().Foreground(m.pal.sage).Render("⇣ following")
 	}
-	badge := lipgloss.NewStyle().Foreground(m.pal.statusColor("awaiting_approval", "")).Bold(true).Render("⏸ PAUSED")
+	badge := lipgloss.NewStyle().Foreground(m.pal.amber).Bold(true).Render("⏸")
 	if below := maxTop - top; below > 0 {
-		badge += m.pal.faint.Render(" ↓" + itoa(below) + " new")
+		badge += m.pal.faint.Render(" " + itoa(below) + " new")
 	}
-	return badge
+	return badge + m.pal.faint.Render(" · ") + m.keyHint("g", "⇣")
 }
 
-// paneTitleBadge is paneTitle with a right-aligned badge (the follow indicator) padded to
-// the transcript column width.
-func (m tuiModel) paneTitleBadge(title string, focused bool, badge string) string {
-	t := m.paneTitle(title, focused)
+// padPaneTitle right-aligns a badge (the follow indicator) against a pre-rendered pane title,
+// padded to the transcript column width.
+func (m tuiModel) padPaneTitle(title, badge string) string {
 	if badge == "" {
-		return t
+		return title
 	}
-	return padVisual(t, m.transcriptWidth()-visualWidth(badge)) + badge
+	return padVisual(title, m.transcriptWidth()-visualWidth(badge)) + badge
 }
 
 // isLiveRunStatus reports whether a run is actively producing output, so follow-live
@@ -552,14 +1344,18 @@ func transcriptText(f laneFrame) string {
 	return compactText(string(f.Payload))
 }
 
-// joinColumns places the rail beside the body at a fixed gutter.
-func joinColumns(left, right string, width int) string {
+// joinColumns places the rail beside the body at a fixed gutter. The row count is the RIGHT
+// (transcript) column's height, NOT max(left, right): the transcript is padded to exactly the
+// viewport (padLinesToViewport), so it is the height budget for the whole two-pane body. A
+// rail TALLER than that — a run with many lanes plus a long milestone block — is truncated to
+// it rather than pushing the total past the terminal height and clipping the footer below the
+// body (issue #379: the footer carries pane nav / esc / ? and must always render). A shorter
+// rail is padded, which is what fills the divider to the bottom.
+func (m tuiModel) joinColumns(left, right string, width int) string {
 	l := strings.Split(left, "\n")
 	r := strings.Split(right, "\n")
-	n := len(l)
-	if len(r) > n {
-		n = len(r)
-	}
+	n := len(r)
+	div := " " + m.pal.faint.Render("▏") + " " // a faint hairline replaces the old │ rule
 	var sb strings.Builder
 	for i := 0; i < n; i++ {
 		var lv, rv string
@@ -569,7 +1365,7 @@ func joinColumns(left, right string, width int) string {
 		if i < len(r) {
 			rv = r[i]
 		}
-		sb.WriteString(padVisual(clampVisual(lv, width), width) + " │ " + rv + "\n")
+		sb.WriteString(padVisual(clampVisual(lv, width), width) + div + rv + "\n")
 	}
 	return sb.String()
 }
@@ -605,6 +1401,57 @@ func padVisual(s string, n int) string {
 // already a direct dependency — the correct implementation was linked into the binary
 // the whole time.
 func visualWidth(s string) int { return lipgloss.Width(s) }
+
+// runDuration is the run's elapsed WORK time for the header: a live run's time since it
+// started, or a terminal run's total from start to finish. Start is StartedAt, or ClaimedAt
+// during the brief claimed-but-not-started window; end is FinishedAt when set, else now.
+//
+// CreatedAt is deliberately NOT a fallback: it would turn a queued run's header into its
+// queue-WAIT age dressed up as run-elapsed time (and a just-created run into a literal "0s"),
+// conflating two different clocks. A run with no start stamp yet (queued) shows nothing.
+func runDuration(run apitypes.RunDTO, now time.Time) string {
+	var start time.Time
+	switch {
+	case run.StartedAt != nil && !run.StartedAt.IsZero():
+		start = *run.StartedAt
+	case run.ClaimedAt != nil && !run.ClaimedAt.IsZero():
+		start = *run.ClaimedAt
+	default:
+		return "" // not started yet: no work-elapsed time to show
+	}
+	end := now
+	if run.FinishedAt != nil && !run.FinishedAt.IsZero() {
+		end = *run.FinishedAt
+	}
+	return shortDuration(end.Sub(start))
+}
+
+// shortDuration formats an elapsed duration compactly for the header: "45s", "12m", "3h4m",
+// "2d5h". Negative clamps to "0s". It carries the second unit (unlike relAge, which is
+// single-unit for the queue-age column) because a run's total reads better as "3h4m" than "3h".
+func shortDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	switch {
+	case d < time.Minute:
+		return itoa(int(d.Seconds())) + "s"
+	case d < time.Hour:
+		return itoa(int(d.Minutes())) + "m"
+	case d < 24*time.Hour:
+		h := int(d.Hours())
+		if mins := int(d.Minutes()) % 60; mins != 0 {
+			return itoa(h) + "h" + itoa(mins) + "m"
+		}
+		return itoa(h) + "h"
+	default:
+		days := int(d.Hours()) / 24
+		if h := int(d.Hours()) % 24; h != 0 {
+			return itoa(days) + "d" + itoa(h) + "h"
+		}
+		return itoa(days) + "d"
+	}
+}
 
 func itoa(n int) string {
 	if n == 0 {

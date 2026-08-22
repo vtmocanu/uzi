@@ -40,6 +40,7 @@ interface TopUsage {
 }
 interface ResultFrame {
   event: string;
+  num_turns: number;
   usage: TopUsage;
   modelUsage: Record<string, ModelUsage>;
 }
@@ -108,4 +109,27 @@ describe("PRD #311 result-frame realism guard (issue #195)", () => {
       expect(exceedsTopLevel(frame.usage, frame.modelUsage)).toBe(true);
     });
   }
+
+  // issue #199 (defect 4): `num_turns` is PER-INVOCATION, not a running total
+  // (runUsage.ts:11). The run-view usage panel sums per-phase turns beside each
+  // frame's own count (RunUsage.tsx:171,232-244), so a multi-frame fixture whose
+  // num_turns RISES across successive frames reads as a cumulative total and once
+  // manufactured a false "turns double-counted" report against deriveRunUsage. A
+  // STRICTLY DECREASING sequence is the one shape a cumulative counter cannot
+  // produce, so it makes the per-invocation semantics unambiguous in the demo.
+  //
+  // SCOPE, like the guard above: this pins a DELIBERATE FIXTURE CHOICE, not a
+  // universal invariant — real per-invocation turns may legitimately rise (9 → 61
+  // is valid; it is just ambiguous). The assertion reddens on a drift back to a
+  // monotone-increasing sequence, which is exactly the ambiguous shape #199 retired.
+  it("mockDoneMessages result frames are strictly decreasing in num_turns (per-invocation, not cumulative)", () => {
+    expect(doneResults.length).toBeGreaterThanOrEqual(2);
+    for (let i = 1; i < doneResults.length; i++) {
+      expect(doneResults[i].num_turns).toBeLessThan(doneResults[i - 1].num_turns);
+    }
+  });
+
+  it("engine PLAN_RESULT_FRAME.num_turns exceeds RUN_RESULT_FRAME.num_turns (the frame that caused the false report)", () => {
+    expect(PLAN_RESULT_FRAME.num_turns).toBeGreaterThan(RUN_RESULT_FRAME.num_turns);
+  });
 });

@@ -12,7 +12,18 @@ import {
   subagentCanWrite,
   subagentWriteCapabilities,
 } from "../src/agents.js";
+import { reportIncidentalIssueToolName, FINDINGS_SERVER_NAME } from "../src/findings-tools.js";
+import { FORGE_SERVER_NAME } from "../src/forge-tools.js";
+import { MEMORY_SERVER_NAME } from "../src/memory-tools.js";
+import { SIGNAL_SERVER_NAME } from "../src/signals.js";
+import { FINDINGS_NUDGE_APPEND } from "../src/prompt.js";
 import type { AgentTemplate } from "../src/protocol.js";
+
+// PRD #457: toDefinition now grants the incidental-findings tool to every non-empty
+// allowlist and appends the discovery nudge to every subagent prompt. Reference the
+// helper rather than hardcoding the string.
+const FINDINGS_TOOL = reportIncidentalIssueToolName();
+const withNudge = (body: string) => `${body}\n\n${FINDINGS_NUDGE_APPEND}`;
 
 const coder: AgentTemplate = {
   name: "coder",
@@ -41,10 +52,27 @@ describe("assembleAgents", () => {
   it("maps every non-lead template to an invokable subagent AgentDefinition", () => {
     const { subagents } = assembleAgents([coder, reviewer]);
     assert.deepStrictEqual(Object.keys(subagents).sort(), ["coder", "reviewer"]);
-    assert.strictEqual(subagents.coder?.prompt, "You implement changes.");
+    assert.strictEqual(subagents.coder?.prompt, withNudge("You implement changes."));
     assert.strictEqual(subagents.coder?.description, "writes code");
-    assert.deepStrictEqual(subagents.coder?.tools, ["Read", "Edit", "Write", "Bash", "Grep", "Glob"]);
+    assert.deepStrictEqual(subagents.coder?.tools, ["Read", "Edit", "Write", "Bash", "Grep", "Glob", FINDINGS_TOOL]);
     assert.strictEqual(subagents.reviewer?.model, "opus");
+  });
+
+  it("PRD #457: grants the findings tool to a non-empty allowlist and appends the nudge (own/builtin path)", () => {
+    const { subagents } = assembleAgents([coder, reviewer]);
+    // Capability: the tool is appended once, at the end, on a restricted allowlist.
+    assert.ok(subagents.reviewer?.tools?.includes(FINDINGS_TOOL), "reviewer gains the findings tool");
+    assert.strictEqual(
+      subagents.reviewer?.tools?.filter((t) => t === FINDINGS_TOOL).length,
+      1,
+      "no duplicate findings tool",
+    );
+    // Discovery: the nudge is appended to the subagent prompt.
+    assert.ok(
+      subagents.reviewer?.prompt?.includes(FINDINGS_TOOL),
+      "the nudge naming the findings tool is in the subagent prompt",
+    );
+    assert.strictEqual(subagents.reviewer?.prompt, withNudge("You review changes."));
   });
 
   it("blocks nested Agent spawning, the workflow-signal MCP server, and the memory MCP server on every subagent", () => {
@@ -145,7 +173,7 @@ describe("subagentsFromTemplates (PRD #37 repo source)", () => {
     assert.deepStrictEqual(Object.keys(subagents).sort(), ["auditor", "lead"]);
     // A repo `lead` is an ordinary subagent — its body is the subagent prompt, NOT
     // hoisted to a main-thread system prompt (that is assembleAgents' job for own).
-    assert.strictEqual(subagents.lead!.prompt, "REPO LEAD BODY");
+    assert.strictEqual(subagents.lead!.prompt, withNudge("REPO LEAD BODY"));
     // Structural denial still applies via toDefinition — including for
     // repo-sourced (custom) subagents: no nested Agent, no uzi signal server, no memory server.
     for (const name of ["lead", "auditor"]) {
@@ -156,6 +184,140 @@ describe("subagentsFromTemplates (PRD #37 repo source)", () => {
   it("drops excluded names", () => {
     const subagents = subagentsFromTemplates([repoLead, repoAuditor], new Set(["lead"]));
     assert.deepStrictEqual(Object.keys(subagents), ["auditor"]);
+  });
+
+  it("PRD #457: grants the findings tool to a restricted repo allowlist and appends the nudge (repo path)", () => {
+    const repoReviewer: AgentTemplate = {
+      name: "reviewer",
+      description: "repo reviewer",
+      prompt_body: "REVIEW BODY",
+      tools: ["Read", "Grep", "Glob"],
+    };
+    const subagents = subagentsFromTemplates([repoReviewer], new Set());
+    assert.deepStrictEqual(subagents.reviewer!.tools, ["Read", "Grep", "Glob", FINDINGS_TOOL]);
+    assert.strictEqual(subagents.reviewer!.prompt, withNudge("REVIEW BODY"));
+    // Inherit-all (absent tools) is untouched — the tool is already available.
+    const inherit = subagentsFromTemplates([repoAuditor], new Set());
+    assert.strictEqual(inherit.auditor!.tools, undefined, "inherit-all is not materialized into an allowlist");
+    assert.strictEqual(inherit.auditor!.prompt, withNudge("audit body"), "inherit-all subagent's prompt still carries the nudge");
+  });
+});
+
+describe("issue #581: in-process MCP server wiring for subagents", () => {
+  // toDefinition derives def.mcpServers (SDK string-reference form) from the RESOLVED
+  // tools allowlist: for the servers ["forge","findings"] in that order, it names the
+  // server when any allowlist entry starts with `mcp__${server}__`. It runs AFTER the
+  // findings-tool append, so any non-empty allowlist already carries the findings tool
+  // and therefore always wires the findings server. This is the ONLY thing that lets an
+  // allowlisted subagent reach an in-process MCP server registered on options.mcpServers.
+
+  // Parse a builtin's frontmatter `tools:` line exactly as the spec prescribes: the line
+  // starting with `tools:`, minus the prefix, split on `,`, each trimmed, empties dropped.
+  const parseToolsLine = (raw: string): string[] => {
+    const line = raw.split("\n").find((l) => l.startsWith("tools:"));
+    assert.ok(line, "builtin must declare a tools: line in its frontmatter");
+    return line!
+      .slice("tools:".length)
+      .split(",")
+      .map((t) => t.trim())
+      .filter((t) => t.length > 0);
+  };
+
+  const factCheckerPath = join(
+    import.meta.dirname,
+    "..",
+    "..",
+    "api",
+    "internal",
+    "agenttmpl",
+    "builtins",
+    "fact-checker.md",
+  );
+  const factCheckerTools = parseToolsLine(readFileSync(factCheckerPath, "utf8"));
+  const factChecker: AgentTemplate = {
+    name: "fact-checker",
+    description: "verifies claims",
+    prompt_body: "You verify claims.",
+    tools: factCheckerTools,
+    model: null,
+  };
+
+  it("the real fact-checker builtin resolves to mcpServers ['forge','findings'] in deterministic order", () => {
+    // Anchor to the shipped builtin so the test breaks if it ever drops the forge grant:
+    // the fact-checker is the whole reason this wiring exists (issue #581).
+    assert.ok(
+      factCheckerTools.some((t) => t.startsWith("mcp__forge__")),
+      "the shipped fact-checker must still grant at least one mcp__forge__* tool",
+    );
+    const { subagents } = assembleAgents([factChecker]);
+    // forge is named because the allowlist has mcp__forge__* tools; findings is named
+    // because toDefinition appended the findings tool before deriving this list. The
+    // order is the loop's fixed [forge, findings], not the allowlist's order.
+    assert.deepStrictEqual(subagents["fact-checker"]?.mcpServers, [FORGE_SERVER_NAME, FINDINGS_SERVER_NAME]);
+    assert.deepStrictEqual(subagents["fact-checker"]?.mcpServers, ["forge", "findings"]);
+  });
+
+  it("a read-only role granted NO forge tool wires only the findings server", () => {
+    // reviewer declares Read/Grep/Glob — no mcp__forge__* — so forge is NOT named, but
+    // the findings tool appended to every non-empty allowlist wires the findings server.
+    const { subagents } = assembleAgents([reviewer]);
+    assert.deepStrictEqual(subagents.reviewer?.mcpServers, [FINDINGS_SERVER_NAME]);
+  });
+
+  it("an inherit-all subagent (null/[]/undefined tools) leaves mcpServers UNSET", () => {
+    // Inherit-all subagents get no allowlist, so toDefinition never derives mcpServers —
+    // the top-level options.mcpServers already reaches them via the lead session path.
+    for (const tools of [null, [] as string[], undefined]) {
+      const { subagents } = assembleAgents([{ ...coder, tools }]);
+      assert.strictEqual(subagents.coder?.mcpServers, undefined);
+    }
+  });
+
+  it("never wires the memory or signal servers, even when a template names their tools", () => {
+    // memory/signal are server-DENIED to every subagent (MEMORY_SERVER_DENY /
+    // SIGNAL_SERVER_DENY); the wiring loop is deliberately limited to the hardcoded
+    // [forge, findings] set — it does NOT naively name every `mcp__<server>__` prefix in
+    // the allowlist. A fixture that explicitly lists mcp__memory__* / mcp__uzi__* tools is
+    // what makes this a real guard: widening the loop to derive from those prefixes would
+    // redden it. (Those tools stay non-callable via the server-level deny regardless.)
+    const namesDeniedServers: AgentTemplate = {
+      name: "greedy",
+      description: "names denied servers in its allowlist",
+      prompt_body: "greedy",
+      tools: ["Read", "mcp__memory__save_memory", "mcp__uzi__submit_plan", "mcp__forge__get_issue"],
+    };
+    const { subagents } = assembleAgents([coder, reviewer, factChecker, namesDeniedServers]);
+    // The greedy fixture names memory + signal tools AND a forge tool: forge is wired,
+    // findings is wired (appended tool), memory/signal are NOT — despite being named.
+    assert.deepStrictEqual(subagents.greedy?.mcpServers, [FORGE_SERVER_NAME, FINDINGS_SERVER_NAME]);
+    for (const [name, def] of Object.entries(subagents)) {
+      if (!def.mcpServers) continue;
+      assert.ok(!def.mcpServers.includes(MEMORY_SERVER_NAME), `${name} must not wire the memory server`);
+      assert.ok(!def.mcpServers.includes(SIGNAL_SERVER_NAME), `${name} must not wire the signal server`);
+      // Positively: the only servers ever wired are forge and findings.
+      for (const s of def.mcpServers) {
+        assert.ok(
+          s === FORGE_SERVER_NAME || s === FINDINGS_SERVER_NAME,
+          `${name} wired an unexpected server ${s}`,
+        );
+      }
+    }
+  });
+
+  it("the repo-source path derives the same wiring (also flows through toDefinition)", () => {
+    // Acknowledged, plan-approved: subagentsFromTemplates (repo path) also derives
+    // mcpServers, so a repo agent naming a mcp__forge__* tool reaches the forge server.
+    const factCheckerRepoTemplate: AgentTemplate = {
+      name: "fact-checker",
+      description: "repo fact-checker",
+      prompt_body: "REPO FACT CHECKER",
+      tools: ["Read", "Grep", "mcp__forge__get_issue"],
+    };
+    const subagents = subagentsFromTemplates([factCheckerRepoTemplate], new Set());
+    assert.ok(
+      subagents["fact-checker"]?.mcpServers?.includes(FORGE_SERVER_NAME),
+      "a repo agent naming a mcp__forge__* tool wires the forge server",
+    );
   });
 });
 
@@ -174,8 +336,9 @@ describe("selectSubagents (PRD #37)", () => {
     const repo = selectSubagents("repo", own, [repoCoder, repoAuditor], []);
     assert.deepStrictEqual(Object.keys(repo).sort(), ["auditor", "coder"]);
     // The repo coder's WebFetch survives (policy reversed) and its repo body runs.
-    assert.deepStrictEqual(repo.coder!.tools, ["Read", "WebFetch"]);
-    assert.strictEqual(repo.coder!.prompt, "REPO CODER");
+    // PRD #457: a restricted repo allowlist also gains the findings tool + nudge.
+    assert.deepStrictEqual(repo.coder!.tools, ["Read", "WebFetch", FINDINGS_TOOL]);
+    assert.strictEqual(repo.coder!.prompt, withNudge("REPO CODER"));
     // Exclusions apply to the repo roster too.
     assert.deepStrictEqual(Object.keys(selectSubagents("repo", own, [repoCoder, repoAuditor], ["auditor"])), ["coder"]);
   });
@@ -312,7 +475,9 @@ describe("planTurnSubagents (#203)", () => {
     const { subagents } = assembleAgents([architect, reviewer]);
     const { subagents: planned } = planTurnSubagents(subagents);
 
-    assert.deepStrictEqual(planned.architect?.tools, ["Bash", "Read", "WebFetch"]);
+    // PRD #457: the non-write findings tool is granted by toDefinition and survives the
+    // write-strip, so it rides the plan-turn allowlist alongside the surviving reads.
+    assert.deepStrictEqual(planned.architect?.tools, ["Bash", "Read", "WebFetch", FINDINGS_TOOL]);
     for (const t of WRITE_TOOLS) {
       assert.ok(planned.architect?.disallowedTools?.includes(t), `${t} denied`);
     }
@@ -323,9 +488,9 @@ describe("planTurnSubagents (#203)", () => {
       "mcp__memory",
       ...WRITE_TOOLS,
     ]);
-    // A role declaring no write tool keeps its allowlist verbatim and still gains the
-    // denials (unconditional means unconditional).
-    assert.deepStrictEqual(planned.reviewer?.tools, ["Read", "Grep", "Glob"]);
+    // A role declaring no write tool keeps its allowlist verbatim (plus the findings
+    // tool) and still gains the denials (unconditional means unconditional).
+    assert.deepStrictEqual(planned.reviewer?.tools, ["Read", "Grep", "Glob", FINDINGS_TOOL]);
     for (const t of WRITE_TOOLS) assert.ok(planned.reviewer?.disallowedTools?.includes(t));
   });
 
@@ -354,7 +519,7 @@ describe("planTurnSubagents (#203)", () => {
       assert.notDeepStrictEqual(def.tools, [], `${name} must not carry an empty allowlist`);
     }
     // The agents that keep a non-write tool are unaffected by the drop.
-    assert.deepStrictEqual(planned.architect?.tools, ["Bash", "Read", "WebFetch"]);
+    assert.deepStrictEqual(planned.architect?.tools, ["Bash", "Read", "WebFetch", FINDINGS_TOOL]);
   });
 
   it("reports every dropped name, in input order, and drops the whole roster when every agent is write-only", () => {
@@ -368,11 +533,27 @@ describe("planTurnSubagents (#203)", () => {
   it("does NOT drop an agent that keeps even one non-write tool", () => {
     // The boundary: one surviving tool is the difference between a narrowed agent
     // and no agent, so it is pinned rather than left to the filter's shape.
+    // PRD #457 R1: after the grant + write-strip `barely` is `["Read", findingsTool]`
+    // (a real read tool survives besides the findings tool), so it must NOT drop.
     const barely: AgentTemplate = { ...writeOnly, name: "barely", tools: ["Edit", "Write", "Read"] };
     const { subagents } = assembleAgents([barely]);
     const { subagents: planned, dropped } = planTurnSubagents(subagents);
     assert.deepStrictEqual(dropped, []);
-    assert.deepStrictEqual(planned.barely?.tools, ["Read"]);
+    assert.deepStrictEqual(planned.barely?.tools, ["Read", FINDINGS_TOOL]);
+  });
+
+  it("PRD #457 R1: a write-only allowlist STILL drops even though the grant adds the (non-write) findings tool", () => {
+    // The naive emptiness test would see `kept = [findingsTool]` (non-empty) after the
+    // grant and WRONGLY keep the agent; the meaningful-tool test excludes the findings
+    // tool so a write-only agent drops exactly as before the grant landed.
+    const { subagents } = assembleAgents([writeOnly, reviewer]);
+    // Precondition: the grant really did add the findings tool to the write-only agent.
+    assert.ok(subagents.penman?.tools?.includes(FINDINGS_TOOL), "write-only agent gained the findings tool");
+    const { subagents: planned, dropped } = planTurnSubagents(subagents);
+    assert.deepStrictEqual(dropped, ["penman"], "write-only agent drops despite the findings-tool grant");
+    assert.ok(!("penman" in planned), "the dropped write-only agent is absent from the plan roster");
+    // And the read-only agent RETAINS the findings tool through the plan turn.
+    assert.ok(planned.reviewer?.tools?.includes(FINDINGS_TOOL), "read-only agent keeps the findings tool on the plan turn");
   });
 
   it("BUILDS NEW OBJECTS: the input map, its definitions and their arrays are untouched", () => {

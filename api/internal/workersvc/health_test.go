@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -27,6 +28,11 @@ type healthFakeStore struct {
 	// #216): how many online workers still have room. 0 with onlineWorkers>0 is the
 	// saturated fleet that drives reasonAllWorkersBusy.
 	freeSlotWorkers int64
+	// eligibleWorkers is the canned CountOnlineEligibleWorkersForRepo answer (PRD #361):
+	// how many online workers fn_worker_can_claim accepts for the run's repo/kind. 0 with
+	// onlineWorkers>0 and a non-allowlisted repo drives reasonRepoNotDockerAllowed.
+	eligibleWorkers int64
+	eligibleErr     error
 	writes          []store.SetRunHealthParams
 	// leftStatus marks run ids whose SetRunHealth returns 0 rows — the exit race,
 	// where the run changed status between the list read and the health write.
@@ -59,6 +65,18 @@ type healthFakeStore struct {
 	// the cutoff from WorkerBackgroundGrace and that the queued-threshold guard
 	// short-circuits ahead of it (no query for a freshly-queued run).
 	priorityCalls []store.RunPriorityClassForRunParams
+	// satisfyingCaps is the canned CountOnlineWorkersSatisfyingCaps answer (PRD #84 M3):
+	// how many online, non-draining workers have effective caps covering the run's
+	// required set. 0 with a non-empty requirement is the unplaceable run that drives
+	// reasonNoEligibleWorker. satisfyingCapsErr forces the read to fail (falls through to
+	// the generic queuedReason). The subset predicate itself is NOT reimplemented here —
+	// it is pinned against a real Postgres by store.TestCountOnlineWorkersSatisfyingCaps*
+	// LiveDB; this side pins the ARM (flag/count → reason mapping).
+	satisfyingCaps    int64
+	satisfyingCapsErr error
+	// capsCalls records every lookup's params, so a test can prove the arm asks about
+	// THIS run's user and required set, and that the guards ahead of it short-circuit.
+	capsCalls []store.CountOnlineWorkersSatisfyingCapsParams
 }
 
 func (f *healthFakeStore) ListActiveRunsForHealth(context.Context) ([]store.ListActiveRunsForHealthRow, error) {
@@ -76,6 +94,16 @@ func (f *healthFakeStore) CountOnlineWorkersForUser(context.Context, uuid.UUID) 
 }
 func (f *healthFakeStore) CountOnlineWorkersWithFreeSlotForUser(context.Context, uuid.UUID) (int64, error) {
 	return f.freeSlotWorkers, nil
+}
+func (f *healthFakeStore) CountOnlineWorkersSatisfyingCaps(_ context.Context, arg store.CountOnlineWorkersSatisfyingCapsParams) (int64, error) {
+	f.capsCalls = append(f.capsCalls, arg)
+	if f.satisfyingCapsErr != nil {
+		return 0, f.satisfyingCapsErr
+	}
+	return f.satisfyingCaps, nil
+}
+func (f *healthFakeStore) CountOnlineEligibleWorkersForRepo(context.Context, store.CountOnlineEligibleWorkersForRepoParams) (int64, error) {
+	return f.eligibleWorkers, f.eligibleErr
 }
 func (f *healthFakeStore) RunHasVerdictSinceGateOpened(_ context.Context, arg store.RunHasVerdictSinceGateOpenedParams) (bool, error) {
 	f.verdictCalls = append(f.verdictCalls, arg)
@@ -116,6 +144,26 @@ func (s fakeHealthSettings) HealthApprovalSeconds(context.Context) (int, error) 
 func (s fakeHealthSettings) HealthNudgeCooldownSeconds(context.Context) (int, error) {
 	return s.cooldown, nil
 }
+
+// fakeAllowlistReader is a static DockerAllowlistReader (PRD #361): ids is the canned
+// docker-worker repo allowlist, err forces the read to fail so the arm's degrade path
+// can be exercised.
+type fakeAllowlistReader struct {
+	ids []uuid.UUID
+	err error
+}
+
+func (f fakeAllowlistReader) DockerRepoAllowlist(context.Context) ([]uuid.UUID, error) {
+	return f.ids, f.err
+}
+
+// Sentinel errors for the queued-reason degrade-path cases (PRD #361): an allowlist
+// read failure and an eligible-count failure must each fall through to the generic
+// free-slot logic, never a spurious docker reason.
+var (
+	errFakeAllowlist = errors.New("fake allowlist read error")
+	errFakeEligible  = errors.New("fake eligible-count error")
+)
 
 // defaultHealthSettings mirrors the compiled-in defaults (5m / 45m / 10m / 1h / 30m).
 func defaultHealthSettings() fakeHealthSettings {
@@ -315,6 +363,72 @@ func TestHealthQueuedReasons(t *testing.T) {
 
 			svc.detectRunHealth(context.Background(), t0)
 			w := lastWrite(t, fs, r.ID)
+			if w.Health != healthWaitingWorker {
+				t.Fatalf("health = %q, want waiting_worker", w.Health)
+			}
+			if w.HealthReason.String != tc.want {
+				t.Fatalf("reason = %q, want %q", w.HealthReason.String, tc.want)
+			}
+		})
+	}
+}
+
+// TestHealthQueuedRepoNotDockerAllowed drives PRD #361's new queued arm through
+// detectRunHealth: a repo-bearing run no online worker is eligible to claim (all-Docker
+// fleet, repo off the allowlist) reports reasonRepoNotDockerAllowed, while a merely-busy
+// eligible worker, an idle eligible worker, and a repo-less run all fall through. The
+// FLAG stays healthWaitingWorker in every case (the enum never changes).
+func TestHealthQueuedRepoNotDockerAllowed(t *testing.T) {
+	validRepo := pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	cases := []struct {
+		name            string
+		repoID          pgtype.UUID
+		kind            string
+		onlineWorkers   int64
+		eligibleWorkers int64
+		freeSlotWorkers int64
+		allowIDs        []uuid.UUID
+		allowErr        error
+		eligibleErr     error
+		want            string
+	}{
+		// (a) all-Docker fleet, repo not allowlisted: no eligible worker → the new reason.
+		{"all-docker not allowlisted", validRepo, "task", 1, 0, 0, nil, nil, nil, reasonRepoNotDockerAllowed},
+		// (b) an eligible worker exists but is busy: eligible>0 must NOT fire the docker
+		// reason, and with no free slot it falls through to all-busy.
+		{"eligible worker busy", validRepo, "task", 2, 1, 0, nil, nil, nil, reasonAllWorkersBusy},
+		// (b2) an eligible worker is idle: eligible>0, free slot → plain wait.
+		{"eligible worker idle", validRepo, "task", 1, 1, 1, nil, nil, nil, reasonWaitingWorker},
+		// (c) repo-less/judge run: repoID invalid, so the arm is guarded out and the
+		// eligibleWorkers=0 is never consulted → plain wait.
+		{"repo-less judge run", pgtype.UUID{}, "judge", 1, 0, 1, nil, nil, nil, reasonWaitingWorker},
+		// (d) allowlist read error: the arm degrades (never a spurious docker reason)
+		// and falls through to the generic free-slot logic. eligibleWorkers=0 is set but
+		// must never be consulted (the read failed before the count) → all-busy.
+		{"allowlist read error degrades", validRepo, "task", 1, 0, 0, nil, errFakeAllowlist, nil, reasonAllWorkersBusy},
+		// (e) eligible-count error: same degrade — the arm falls through rather than
+		// firing the docker reason on a failed count → all-busy.
+		{"eligible count error degrades", validRepo, "task", 1, 0, 0, nil, nil, errFakeEligible, reasonAllWorkersBusy},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := runRow("queued")
+			r.UpdatedAt = ago(15 * time.Minute) // > 10m queued
+			r.RepoID = tc.repoID
+			r.Kind = tc.kind
+			fs := &healthFakeStore{
+				active:          []store.ListActiveRunsForHealthRow{r},
+				onlineWorkers:   tc.onlineWorkers,
+				freeSlotWorkers: tc.freeSlotWorkers,
+				eligibleWorkers: tc.eligibleWorkers,
+				eligibleErr:     tc.eligibleErr,
+			}
+			svc := healthSvc(fs, defaultHealthSettings()) // vlt nil → treated unlocked
+			svc.SetDockerAllowlist(fakeAllowlistReader{ids: tc.allowIDs, err: tc.allowErr})
+
+			svc.detectRunHealth(context.Background(), t0)
+			w := lastWrite(t, fs, r.ID)
+			// Positive control: the enum never changes across any of these reasons.
 			if w.Health != healthWaitingWorker {
 				t.Fatalf("health = %q, want waiting_worker", w.Health)
 			}
@@ -531,8 +645,10 @@ func TestClampSlow(t *testing.T) {
 // NULL budget (global 2h) started the same 3h ago IS slow.
 func TestHealthSlowClampsPerRunBudget(t *testing.T) {
 	// Raw slow = 4h: above the global 2h RUN_TIMEOUT (misconfig path exercised) and above
-	// the 3h elapsed, but below the 8h scaled ceiling — so the scaled run's clamped
-	// threshold (4h) has not fired at 3h, while the unscaled run's (clamped to ~2h) has.
+	// the 3h elapsed. For the scaled run (8h budget) issue #323 first scales the raw
+	// threshold by the budget ratio (4h × 8h/2h = 16h), which clampSlow then pulls to the
+	// 8h ceiling (~8h after scaling) — so it has not fired at 3h, while the unscaled run's
+	// (clamped to ~2h) has.
 	settings := fakeHealthSettings{enabled: true, slow: 4 * 60 * 60}
 
 	scaled := runRow("running")
@@ -556,6 +672,52 @@ func TestHealthSlowClampsPerRunBudget(t *testing.T) {
 		t.Fatalf("changed = %d, want 1 (an unscaled run 3h in is slow)", n)
 	}
 	if w := lastWrite(t, fs2, unscaled.ID); w.Health != healthSlow {
+		t.Fatalf("health = %q, want slow for the NULL-budget run", w.Health)
+	}
+}
+
+// TestHealthSlowScalesWithBudget (issue #323): the raw health_slow_seconds threshold is
+// scaled UP by a run's budget ratio (effTimeout / RUN_TIMEOUT) before the per-run clamp,
+// so a milestone-scaled run is not flagged "slow" at the flat default while it is still
+// working. testParams RunTimeout is 2h; an 8h budget → scaled slow = 2700 × 8h/2h = 3h.
+func TestHealthSlowScalesWithBudget(t *testing.T) {
+	// 1. A scaled run active 90m in — well past the flat 45m default, but under the 3h
+	//    scaled threshold — must NOT flag. Fails before the ratio scaling.
+	scaledOK := runRow("running")
+	scaledOK.BudgetWallSeconds = pgtype.Int4{Int32: 8 * 60 * 60, Valid: true}
+	scaledOK.StartedAt = ago(90 * time.Minute)
+	scaledOK.LastActivityAt = ago(1 * time.Minute) // recent → not stalled
+	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{scaledOK}}
+	svc := healthSvc(fs, defaultHealthSettings())
+	if n := svc.detectRunHealth(context.Background(), t0); n != 0 {
+		w := lastWrite(t, fs, scaledOK.ID)
+		t.Fatalf("a scaled run 90m into an 8h budget must not flag; wrote %q", w.Health)
+	}
+
+	// 2. The same scaled run past the 3h scaled threshold IS slow.
+	scaledSlow := runRow("running")
+	scaledSlow.BudgetWallSeconds = pgtype.Int4{Int32: 8 * 60 * 60, Valid: true}
+	scaledSlow.StartedAt = ago(5 * time.Hour)        // past the 3h scaled threshold
+	scaledSlow.LastActivityAt = ago(1 * time.Minute) // recent → not stalled
+	fs2 := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{scaledSlow}}
+	svc2 := healthSvc(fs2, defaultHealthSettings())
+	if n := svc2.detectRunHealth(context.Background(), t0); n != 1 {
+		t.Fatalf("changed = %d, want 1 (a scaled run 5h in is slow)", n)
+	}
+	if w := lastWrite(t, fs2, scaledSlow.ID); w.Health != healthSlow {
+		t.Fatalf("health = %q, want slow for the scaled run past 3h", w.Health)
+	}
+
+	// 3. An unscaled (NULL budget) run is unchanged: flagged slow at the flat 45m.
+	unscaled := runRow("running")
+	unscaled.StartedAt = ago(50 * time.Minute) // > 45m flat default
+	unscaled.LastActivityAt = ago(1 * time.Minute)
+	fs3 := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{unscaled}}
+	svc3 := healthSvc(fs3, defaultHealthSettings())
+	if n := svc3.detectRunHealth(context.Background(), t0); n != 1 {
+		t.Fatalf("changed = %d, want 1 (an unscaled run 50m in is slow)", n)
+	}
+	if w := lastWrite(t, fs3, unscaled.ID); w.Health != healthSlow {
 		t.Fatalf("health = %q, want slow for the NULL-budget run", w.Health)
 	}
 }

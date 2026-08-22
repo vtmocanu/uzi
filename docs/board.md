@@ -84,6 +84,16 @@ every column:
 - **Last updated**: most recently changed on GitLab first.
 - **Title**: alphabetical.
 
+An **ascending/descending** toggle sits right beside **Sort** and reverses
+whichever mode is active. Each mode starts in the direction that makes
+sense for it — issue number and title low-to-high / A-to-Z, recent run
+activity and last updated newest-first — and switching modes resets the
+toggle back to that default; it flips from there if you want the opposite.
+It's disabled for **Manual**, which is your own hand-set order and has no
+direction to flip. The chosen mode and direction now apply to **every**
+column, including **Closed** (under Manual, Closed stays issue-number
+order, as before).
+
 The sort choice is remembered per board, on this browser. The order itself is
 different: it is stored with your account, so it follows you to any browser or
 device you sign in from. It is yours, not the team's; another person looking at
@@ -153,9 +163,9 @@ issue onto the board first if you need it to be findable.
 
 A column with more cards than its cap renders only the cap; the rest sit
 behind a **`Show N more · N left`** button at the bottom of the column.
-Each click reveals one more page (up to 50) of cards, and an expanded
-column scrolls internally instead of growing the page. **Collapse** puts
-it back to the cap. The cap applies to every column, including **Closed**.
+Each click reveals one more page (up to 50) of cards; the column grows to
+fit and the whole page scrolls, rather than the column scrolling inside a
+fixed box. **Collapse** puts it back to the cap. The cap applies to every column, including **Closed**.
 Past a couple of pages of hidden remainder, a nudge suggests searching
 instead of paging through everything (the **Show more** button stays, so
 you can still page if you prefer).

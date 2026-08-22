@@ -101,7 +101,7 @@ const maxWorkerNameBytes = 200
 // runInputKinds is the accepted steering-input set (mirrors the DB CHECK).
 var runInputKinds = map[string]bool{
 	"follow_up": true, "approve_plan": true, "reject_plan": true, "cancel": true, "revise_plan": true,
-	"answer": true,
+	"answer": true, "stop": true,
 }
 
 // -------------------------------------------------------------------------
@@ -165,20 +165,25 @@ func bindingForMode(mode string, secretID pgtype.UUID, label string) (*string, *
 // the Handler because that is this file's convention for these builders, and because
 // it keeps the classification a pure function of its inputs. Passing "" yields
 // `unknown`, which is also what a genuinely unstamped build produces.
+// pinnedWorkerVersion is the deploy's concrete pinned hosted-worker image tag
+// (h.cfg.HostedWorkerVersion / workers.image.tag, PRD #422) — the hosted-worker upgrade
+// target, so a worker intentionally pinned behind appVersion is not flagged `outdated`.
+// Passing "" falls back to cpVersion (today's behavior for an unconfigured deploy).
 //
 // NO ROLL SIGNAL on this path, deliberately (PRD #113 M4). The bare-row callers —
 // register, heartbeat, create, admin list — hold a worker row with no roll-health
 // join, so they classify by version comparison alone. That is honest rather than
 // degraded: passing a nil signal says "this row carries no controller report", which
 // is exactly what it carries. The per-user LIST path has the join and folds it.
-func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel, cpVersion string, now, apiStartedAt time.Time) apitypes.WorkerDTO {
+func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel, cpVersion, pinnedWorkerVersion string, now, apiStartedAt time.Time) apitypes.WorkerDTO {
 	upgradeStatus, upgradeDetail, upgradeTarget := workersvc.ClassifyUpgradeWithTarget(workersvc.UpgradeInput{
-		Reported:     w.Version.String,
-		Kind:         w.Kind,
-		CPVersion:    cpVersion,
-		Signal:       nil,
-		Now:          now,
-		APIStartedAt: apiStartedAt,
+		Reported:            w.Version.String,
+		Kind:                w.Kind,
+		CPVersion:           cpVersion,
+		PinnedWorkerVersion: pinnedWorkerVersion,
+		Signal:              nil,
+		Now:                 now,
+		APIStartedAt:        apiStartedAt,
 	}, workersvc.UpgradeParams{})
 	bindingID, bindingLabel := bindingForMode(w.AnthropicBindMode, w.AnthropicSecretID, secretLabel)
 	return apitypes.WorkerDTO{
@@ -194,6 +199,7 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 		Kind:                 w.Kind,
 		HostedSize:           textPtrValue(w.HostedSize.Valid, w.HostedSize.String),
 		Docker:               boolPtrValue(w.DockerEnabled),
+		Capabilities:         w.Capabilities,
 		Busy:                 busy,
 		ActiveRuns:           activeRuns,
 		MaxConcurrentRuns:    intPtrValue(w.MaxConcurrentRuns),
@@ -202,6 +208,7 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 		Version:              textPtrValue(w.Version.Valid, w.Version.String),
 		LastHeartbeatAt:      timePtr(w.LastHeartbeatAt.Valid, w.LastHeartbeatAt.Time),
 		OnlineSince:          timePtr(w.OnlineSince.Valid, w.OnlineSince.Time),
+		DrainingSince:        timePtr(w.DrainingSince.Valid, w.DrainingSince.Time),
 		CreatedAt:            w.CreatedAt.Time,
 		StatsCPUPct:          float4PtrValue(w.StatsCpuPct),
 		StatsMemBytes:        int8PtrValue(w.StatsMemBytes),
@@ -210,14 +217,15 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 	}
 }
 
-func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion string, now, apiStartedAt time.Time) apitypes.WorkerDTO {
+func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersion string, now, apiStartedAt time.Time) apitypes.WorkerDTO {
 	upgradeStatus, upgradeDetail, upgradeTarget := workersvc.ClassifyUpgradeWithTarget(workersvc.UpgradeInput{
-		Reported:     w.Version.String,
-		Kind:         w.Kind,
-		CPVersion:    cpVersion,
-		Signal:       rollSignalFromRow(w),
-		Now:          now,
-		APIStartedAt: apiStartedAt,
+		Reported:            w.Version.String,
+		Kind:                w.Kind,
+		CPVersion:           cpVersion,
+		PinnedWorkerVersion: pinnedWorkerVersion,
+		Signal:              rollSignalFromRow(w),
+		Now:                 now,
+		APIStartedAt:        apiStartedAt,
 	}, workersvc.UpgradeParams{})
 	rowBindingID, rowBindingLabel := bindingForMode(
 		w.AnthropicBindMode, w.AnthropicSecretID, w.AnthropicSecretLabel.String)
@@ -239,6 +247,7 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion string, now, apiSt
 		Kind:                     w.Kind,
 		HostedSize:               textPtrValue(w.HostedSize.Valid, w.HostedSize.String),
 		Docker:                   boolPtrValue(w.DockerEnabled),
+		Capabilities:             w.Capabilities,
 		Busy:                     w.Busy,
 		ActiveRuns:               int(w.ActiveRuns),
 		MaxConcurrentRuns:        intPtrValue(w.MaxConcurrentRuns),
@@ -247,6 +256,7 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion string, now, apiSt
 		Version:                  textPtrValue(w.Version.Valid, w.Version.String),
 		LastHeartbeatAt:          timePtr(w.LastHeartbeatAt.Valid, w.LastHeartbeatAt.Time),
 		OnlineSince:              timePtr(w.OnlineSince.Valid, w.OnlineSince.Time),
+		DrainingSince:            timePtr(w.DrainingSince.Valid, w.DrainingSince.Time),
 		CreatedAt:                w.CreatedAt.Time,
 		StatsCPUPct:              float4PtrValue(w.StatsCpuPct),
 		StatsMemBytes:            int8PtrValue(w.StatsMemBytes),
@@ -357,8 +367,14 @@ func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
 		IterationCount:   r.IterationCount,
 		IsPlanning: isPlanningPhase(r.Kind, r.Status, r.IterationCount,
 			r.PlanMd.Valid && strings.TrimSpace(r.PlanMd.String) != ""),
-		AutoApprove:   r.AutoApprove,
-		Branch:        textPtrValue(r.Branch.Valid, r.Branch.String),
+		AutoApprove: r.AutoApprove,
+		Branch:      textPtrValue(r.Branch.Valid, r.Branch.String),
+		BaseBranch:  textPtrValue(r.BaseBranch.Valid, r.BaseBranch.String),
+		OpenMr:      r.OpenMr,
+		Interactive: r.Interactive,
+		// PRD #400 Decision 6: when the task run's dispatch gate was stamped (null until
+		// then, and on every non-task run). Mapped like ClaimedAt.
+		DispatchedAt:  timePtr(r.DispatchedAt.Valid, r.DispatchedAt.Time),
 		MrWebURL:      textPtrValue(r.MrWebUrl.Valid, r.MrWebUrl.String),
 		MrState:       textPtrValue(r.MrState.Valid, r.MrState.String),
 		FailureReason: textPtrValue(r.FailureReason.Valid, r.FailureReason.String),
@@ -368,10 +384,16 @@ func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
 		HealthSince:   timePtr(r.HealthSince.Valid, r.HealthSince.Time),
 		PlanMd:        textPtrValue(r.PlanMd.Valid, r.PlanMd.String),
 		PlanSource:    r.PlanSource,
+		// PRD #362 M1: plain-English summaries. Intent/plan are nullable text; deltas
+		// are decoded below (tolerate-on-read) so a malformed value cannot fail the read.
+		SummaryIntent: textPtrValue(r.SummaryIntent.Valid, r.SummaryIntent.String),
+		SummaryPlan:   textPtrValue(r.SummaryPlan.Valid, r.SummaryPlan.String),
 		PipelineRef:   textPtrValue(r.PipelineRef.Valid, r.PipelineRef.String),
 		FixVerdict:    textPtrValue(r.FixVerdict.Valid, r.FixVerdict.String),
 		ReportOnly:    r.ReportOnly,
 		ReportMd:      textPtrValue(r.ReportMd.Valid, r.ReportMd.String),
+		// PRD #377 M1: the preserved agent diff on a workflow_scope_missing failed run.
+		PreservedPatch: textPtrValue(r.PreservedPatch.Valid, r.PreservedPatch.String),
 		// PRD-link reconciliation (read-only): the path the run declared it archived a
 		// completed PRD to, and when that patch lifecycle settled (null = still pending).
 		PrdDonePath:       textPtrValue(r.PrdDonePath.Valid, r.PrdDonePath.String),
@@ -399,6 +421,13 @@ func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
 		// PRD #320 D8: the display priority class, supplied by the caller (a list-query
 		// column or h.runPriorityClass) so this mapper stays pure.
 		Priority: priorityClass,
+		// PRD #84: the run's inferred/hinted scheduling requirements, surfaced RAW for the
+		// web/CLI (4d) readiness/mismatch display. Capability/tool slices are normalized to
+		// a non-nil empty slice ([] over null), mirroring the repo DTO; size_class is the
+		// NOT NULL DEFAULT '' string (empty for a run whose inference never set it).
+		RequiredCapabilities: capsOrEmpty(r.RequiredCapabilities),
+		RequiredTools:        capsOrEmpty(r.RequiredTools),
+		SizeClass:            r.SizeClass,
 	}
 	if r.RepoID.Valid {
 		s := uuid.UUID(r.RepoID.Bytes).String()
@@ -493,6 +522,15 @@ func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
 	if r.BudgetWallSeconds.Valid {
 		v := int(r.BudgetWallSeconds.Int32)
 		dto.BudgetWallSeconds = &v
+	}
+	// PRD #362 M1, Decision 6 (tolerate-on-read): decode the summary_deltas jsonb into
+	// the typed slice; a malformed or unexpected value renders as NO deltas (nil), logged
+	// and never a panic — the deltas are advisory and a prior write's data, not an
+	// invariant of this read. Mirrors the milestones decode above.
+	if deltas, err := workersvc.DecodeSummaryDeltas(r.SummaryDeltas); err != nil {
+		slog.Error("decode run summary deltas", "run_id", r.ID, "error", err)
+	} else {
+		dto.SummaryDeltas = deltas
 	}
 	// The failing pipeline's URL rides the frozen snapshot, not a column (the
 	// pipeline cache row is transient). Best-effort decode; a ci_fix run always has
@@ -596,7 +634,7 @@ func (h *Handler) CreateWorker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, map[string]any{
-		"worker": workerDTOFromWorker(wkr, 0, false, tokenLabel, h.version, h.clock(), h.startedAt),
+		"worker": workerDTOFromWorker(wkr, 0, false, tokenLabel, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt),
 		"token":  token,
 	})
 }
@@ -616,7 +654,7 @@ func (h *Handler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]apitypes.WorkerDTO, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, workerDTOFromRow(row, h.version, h.clock(), h.startedAt))
+		out = append(out, workerDTOFromRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt))
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"workers": out})
 }
@@ -769,7 +807,7 @@ func (h *Handler) PatchWorker(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(wkr, 0, false, token.label, h.version, h.clock(), h.startedAt)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(wkr, 0, false, token.label, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)})
 }
 
 // -------------------------------------------------------------------------
@@ -870,6 +908,86 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run))})
 }
 
+// CreateTaskRunRequest is the POST /repos/{id}/task-runs body (PRD #400): the inline
+// handoff context (reused as the run's issue_description), an optional source ref to
+// branch from, and whether the worker should open an MR at the end. Context is
+// required; the other two default to "branch from local HEAD" and "no MR".
+type CreateTaskRunRequest struct {
+	Context    string `json:"context"`
+	BaseBranch string `json:"base_branch"`
+	OpenMr     bool   `json:"open_mr"`
+	// Interactive asks that the worker keep the run alive after signal_done (--interactive,
+	// PRD #517 M1), parking it in awaiting_followup to iterate conversationally rather than
+	// terminating; wound down with 'uzi run stop'. Defaults false (a plain handoff).
+	Interactive bool `json:"interactive"`
+	// ReviewRequested asks that a diff-review run be auto-created when this task completes
+	// (--review, PRD #400 M4a): the review clones the finished branch, diffs it, and posts
+	// structured findings the CLI fetches. Defaults false (a plain handoff).
+	ReviewRequested bool `json:"review_requested"`
+	// ThenFixRequested asks that, after the auto-review completes with findings, a chained
+	// fix run push fixes to the same branch (--then-fix, PRD #400 M5). It implies a review;
+	// the CLI sends both flags. Defaults false.
+	ThenFixRequested bool `json:"then_fix_requested"`
+}
+
+// CreateTaskRun queues a task/handoff run (PRD #400). Unlike CreateRun it takes no
+// forge issue: a task is issue-less and repo-ful, carrying its inline instruction
+// directly. The server names the branch (uzi/task/<run-id>) and the created-run
+// response carries it (runToDTO maps Branch), which is exactly what the CLI needs to
+// push local HEAD to the seeded branch.
+func (h *Handler) CreateTaskRun(w http.ResponseWriter, r *http.Request) {
+	repo, ok := h.repoForRequest(w, r)
+	if !ok {
+		return
+	}
+	user, _ := mw.UserFromContext(r.Context())
+	var req CreateTaskRunRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if strings.TrimSpace(req.Context) == "" {
+		httpx.Error(w, http.StatusBadRequest, "context is required")
+		return
+	}
+	run, err := h.wsvc.CreateTaskRun(r.Context(), user.ID, repo.ID, req.Context, req.BaseBranch, req.OpenMr, req.ReviewRequested, req.ThenFixRequested, req.Interactive)
+	if err != nil {
+		h.writeStartRunError(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run))})
+}
+
+// DispatchTaskRun stamps a task run's dispatch gate (PRD #400 Decision 6): the CLI
+// calls this AFTER it has pushed local HEAD to the run's uzi/task/<id> branch, which is
+// the moment the run becomes claimable (ClaimRun gates task claimability on
+// dispatched_at). Owner-scoped in the service; a run the caller does not own, a
+// non-task run, or an already-dispatched run all map to 404 rather than confirming the
+// run exists or re-broadcasting a claimable signal.
+func (h *Handler) DispatchTaskRun(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+		return
+	}
+	run, err := h.wsvc.DispatchTaskRun(r.Context(), user.ID, id)
+	if err != nil {
+		if errors.Is(err, workersvc.ErrRunNotFound) {
+			httpx.Error(w, http.StatusNotFound, "run not found")
+			return
+		}
+		slog.Error("dispatch task run", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run))})
+}
+
 // writeStartRunError maps the StartRunForUser* sentinels to an HTTP status + message.
 // Shared by the board start button (CreateRun) and the chat start-run card
 // (StartChatRun, PRD #191 M5) so both surfaces refuse an issue for the SAME reason with
@@ -931,6 +1049,16 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 			msg = fmt.Sprintf("issue has no PRD link; add a prds/*.md link (or the %s label) before starting a run", prdlessLabel)
 		}
 		httpx.Error(w, http.StatusUnprocessableEntity, msg)
+	case errors.Is(err, workersvc.ErrTaskBaseBranchTooLong):
+		// PRD #400: the optional base_branch exceeded its dedicated cap. A caller error
+		// (a git ref cannot legitimately be this long) → 400.
+		httpx.Error(w, http.StatusBadRequest, "base branch is too long")
+	case errors.Is(err, workersvc.ErrTaskBranchUnsafe):
+		// PRD #400 Decision 8: the create-time namespace/default-branch assertion
+		// failed. The server names the branch uzi/task/<uuid> itself, so this is an
+		// internal invariant violation, never a caller error — 500, logged.
+		slog.Error("create task run: branch-safety assertion failed", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
 	case errors.Is(err, workersvc.ErrActiveRunExists):
 		httpx.Error(w, http.StatusConflict, "a run is already in progress for this issue")
 	case errors.Is(err, workersvc.ErrBranchInUse):
@@ -973,6 +1101,23 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 			slog.Error("resolve run forge type", "run_id", run.ID, "error", err)
 		} else {
 			dto.ForgeType = ft
+		}
+	}
+	// PRD #411: stamp the run's originating forge issue web URL for the run-view #<iid>
+	// link, resolved best-effort from the cached issues row — a join on GetRunByID* would
+	// flip its return type and ripple through ~15 callers (Design Decision 2). Guarded on
+	// BOTH a repo AND an issue: issue-less runs (task/ci_fix/prompt/chat) carry a NULL
+	// issue_iid. A lookup miss (issue no longer cached) leaves issue_web_url nil, never
+	// failing the read of an otherwise-fine run.
+	if run.RepoID.Valid && run.IssueIid.Valid {
+		if issue, err := h.q.GetIssueByIID(r.Context(), store.GetIssueByIIDParams{
+			RepoID:        uuid.UUID(run.RepoID.Bytes),
+			ForgeIssueIid: run.IssueIid.Int64,
+		}); err != nil {
+			slog.Debug("resolve run issue web url", "run_id", run.ID, "error", err)
+		} else {
+			webURL := issue.WebUrl
+			dto.IssueWebURL = &webURL
 		}
 	}
 	// PRD #37 M4-fix: resolve the owner's OWN-source roster here, on the detail read,
@@ -1088,17 +1233,33 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !runInputKinds[req.Kind] {
-		httpx.Error(w, http.StatusBadRequest, "kind must be one of follow_up, approve_plan, reject_plan, cancel, revise_plan, answer")
+		httpx.Error(w, http.StatusBadRequest, "kind must be one of follow_up, approve_plan, reject_plan, cancel, revise_plan, answer, stop")
 		return
 	}
 
-	res, err := h.wsvc.SubmitInput(r.Context(), user.ID, id, req.Kind, req.Body, req.Selection)
+	// PRD #84 M4 4c: the "run without the capability" user override (Decision 12). When the
+	// owner approves WITH override_capabilities, the override entry point BYPASSES the
+	// capability approval gate and clears the run's inferred/hinted required_capabilities —
+	// but ATOMICALLY with a successful approve: the clear runs only AFTER the approve's own
+	// validation and enqueue succeed, so a failed approve (e.g. an invalid selection) leaves
+	// the requirement INTACT and the retry stays gated. Owner- and awaiting_approval-scoped in
+	// SQL, and inert for any kind other than approve_plan (the gate only runs for approve_plan).
+	var res workersvc.SubmitInputResult
+	if req.OverrideCapabilities {
+		res, err = h.wsvc.SubmitInputWithCapabilityOverride(r.Context(), user.ID, id, req.Kind, req.Body, req.Selection)
+	} else {
+		res, err = h.wsvc.SubmitInput(r.Context(), user.ID, id, req.Kind, req.Body, req.Selection)
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRunNotFound):
 			httpx.Error(w, http.StatusNotFound, "run not found")
 		case errors.Is(err, workersvc.ErrRunTerminal):
 			httpx.Error(w, http.StatusConflict, "run has already finished")
+		case errors.Is(err, workersvc.ErrStopNotInteractive):
+			// 409: a run-state conflict. Only an interactive task run's park honors a
+			// graceful stop; on any other run nothing would wind it down.
+			httpx.Error(w, http.StatusConflict, "run stop applies only to interactive task runs")
 		case errors.Is(err, workersvc.ErrReviseCapReached):
 			httpx.Error(w, http.StatusConflict, "plan revision limit reached")
 		case errors.Is(err, workersvc.ErrChatInputNotAllowed):
@@ -1116,6 +1277,20 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrInvalidSelection):
 			httpx.Error(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, workersvc.ErrCapabilityUnmet):
+			// PRD #84 M4 4c: the server-side capability approval gate blocked — the run's
+			// owning worker cannot satisfy an inferred/hinted required capability → 409, with
+			// the unmet names and a remediation hint in the error body (same {"error": ...}
+			// envelope as the sibling cases). The web/CLI (4d) can also derive the mismatch
+			// from the run DTO's required_capabilities + the worker caps it already fetches;
+			// this 409 is the authoritative enforcement, and its message names the fix.
+			var unmet *workersvc.CapabilityUnmetError
+			names := "the required capabilities"
+			if errors.As(err, &unmet) {
+				names = strings.Join(unmet.Unmet, ", ")
+			}
+			httpx.Error(w, http.StatusConflict, "the plan requires capabilities the assigned worker cannot satisfy: "+names+
+				". Provision or start a worker with: "+names+"; or approve with override_capabilities to run without it")
 		default:
 			slog.Error("submit run input", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")

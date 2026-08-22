@@ -73,6 +73,16 @@ describe("ToolAllowlist admin page", () => {
     );
   });
 
+  it("renders the always-visible worker-tools guide link", async () => {
+    render(
+    <MemoryRouter>
+      <ToolAllowlist />
+    </MemoryRouter>,
+  );
+    const link = await screen.findByRole("link", { name: "per-repo tools" });
+    expect(link.getAttribute("href")).toBe("/docs/worker-tools");
+  });
+
   it("removes a package", async () => {
     render(
     <MemoryRouter>

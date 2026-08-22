@@ -547,11 +547,46 @@ non-fatal (see §24).
   (allowlisted base URLs for the dropdown).
 - `GET /api/forge/connections/:id/projects` — live membership; upserts `repos`
   (`enabled=false`).
-- `PUT /api/repos/:id` (enable/disable) · `GET /api/repos` (enabled repos).
+- `PUT /api/repos/:id` (enable/disable) · `DELETE /api/repos/:id` (remove;
+  owner-scoped, disabled-only, cascades — see the per-repo remove note below) ·
+  `GET /api/repos` (enabled repos).
 - `GET /api/repos/:id/board` · `PUT /api/repos/:id/board/columns` · `POST
   /api/repos/:id/issues/:iid/move {to_column}` · `POST /api/repos/:id/sync`.
 - Every repo/board endpoint authorizes through the owning connection's `user_id`
   (bottega's membership-authz shape) — a user only ever sees their own bot's world.
+
+**Per-repo remove (`DELETE /api/repos/:id`, PRD #357).** Owner-scoped explicit
+removal of a single tracked repo: deletes the `repos` row and lets existing FKs
+cascade its derived data (runs, cached issues, board columns, ...). No migration —
+pure query + handler + route + client + CLI (D5).
+
+- **Explicit remove, not refresh-prune (D1).** `ListProjects` stays add/update-only
+  and never prunes. Auto-deleting rows absent from a live membership fetch is
+  rejected because `repos.id` is an `ON DELETE CASCADE` anchor for ~a dozen tables,
+  so a transient membership gap (permissions blip, token-scope loss, paginated
+  response) would cascade-delete runs/board/issues on a routine read. Remove is a
+  bounded, explicit, owner-initiated action instead.
+- **Disabled-only server guard (D2).** The server rejects DELETE unless the repo is
+  `enabled = false` (409 otherwise) — the real safety, not the UI confirm, because
+  two of the three callers are non-interactive (CLI, auto-approving sweep worker).
+  The DELETE also folds `AND enabled = false` into the statement itself (D6) as the
+  atomic race guard against a concurrent enable between the handler's fetch and the
+  delete.
+- **Active-run guard (D7).** Removal is also refused (409) while the repo has a
+  non-terminal run — "disabled" is not "quiescent": disabling only drops the repo
+  from the poll set, it does not cancel an in-flight run. Implemented as a count over
+  the terminal complement (`status NOT IN ('completed','failed','cancelled')`) so it
+  covers `limit_wait` (a parked run is still in flight) and any future non-terminal
+  status.
+- **Removal is transient for a still-visible repo (D3).** If the bot still has forge
+  access, the next `ListProjects` refresh re-adds the repo as a disabled row. This is
+  correct (the list reflects live membership); remove targets STALE repos the bot no
+  longer sees (a deleted/recreated project gets a new numeric id → a duplicate row).
+  To keep a still-visible repo out permanently, remove the bot's access on the forge
+  first.
+- Mounted in the **RequireUser** group (cookie OR `uzc_` Bearer), not the cookie-only
+  RequireAuth group, so the CLI's Bearer token is accepted — a cookie-only mount would
+  401 it.
 
 ## 27. Compose worktree isolation
 
@@ -737,7 +772,7 @@ Sections below cover only what ships in M1 (server: schema, join tokens, worker
 protocol, sweeper, web-facing run/worker API) and M2 (worker: TS skeleton, git
 worktree lifecycle, run state machine driven by a stub executor). The SDK
 executor, plan-gate/MR workflow, live web UI, E2E, and docs (M3–M7) are designed
-in the PRD (`prds/4-agent-runtime-workers.md`) but are **not** realized in code
+in the PRD (`prds/done/4-agent-runtime-workers.md`) but are **not** realized in code
 yet; where a decision here anticipates them it says so.
 
 Two moving parts split along plan.md's server/client trust boundary: the **api**
@@ -1353,6 +1388,17 @@ the only gate).
   versions reached the right conclusion from a mechanism that does not carry it,
   and the mechanism is the half a reader reasons from when deciding whether adding
   a directory to `extraLinkFiles` is safe.)*
+- **Outside-`docs/` scope (full checkout only)**: `ARCHITECTURE.md`, `README.md`,
+  `CLAUDE.md`, `.claude/rules/**` (recursive, symlink-following), `specs/*.md`,
+  `adr/*.md` (both flat), and **`prds/**/*.md`** get the relative-link existence
+  check plus a backticked-artifact-path check (issue #189 — a `` `prds/…md` ``/
+  `` `adr/…md` `` written in backticks is not a markdown link, so the link check is
+  blind to it; strict real-filename shape only, opt a line out with
+  `check-docs:ignore-path`). `prds/` is walked **recursively including `prds/done/`**
+  (issue #343): a PRD archived by `git mv prds/X.md prds/done/X.md` silently rots
+  its inbound relative + backticked links, and the earlier flat walk was blind to
+  the whole `prds/done/` population (MR !354 had to repair 16 such links by hand
+  with no CI signal). This reverses the deliberate flat scoping of 2026-08-03.
 
 ## 59. Screenshots: placeholders now, real captures as one final commit
 
@@ -1564,7 +1610,7 @@ Serves human Feature #12 — wires the PRD #2 board and the PRD #4 runtime toget
 the board reflects run state without hand-dragging. **Status: M1–M4 built, reviewed,
 audited APPROVED (2026-07-04/05); M5 (docs + live validation + spec sync + MR) in
 progress.** Adds one migration (`00021`) and one leaf package; no new
-services/containers/env vars. Full rationale + Decision Log: `prds/12-board-run-lifecycle.md`.
+services/containers/env vars. Full rationale + Decision Log: `prds/done/12-board-run-lifecycle.md`.
 
 ## 67. Lifecycle notifier + column automation
 
@@ -1786,7 +1832,7 @@ start-run action); GitLab reachable via an explicit icon".
 Serves human Feature #14 — reskins the whole web UI to the selected "ember" design.
 **Status: M1–M5 built, reviewed, audited, browser- and real-stack-validated; M6
 (review gate + merge) landed on `main` as `2efd83b`.** `web/` + docs only; no
-backend/schema/env changes. Full rationale + milestone log: `prds/14-multica-ui-redesign.md`.
+backend/schema/env changes. Full rationale + milestone log: `prds/done/14-multica-ui-redesign.md`.
 
 ## 76. Ember design tokens (CSS-variable theme layer)
 
@@ -1916,7 +1962,7 @@ Serves human Feature #23 (the three UX gaps observed during the issue-#20 smoke 
 human.md entry pending user confirmation). **Status: M1–M4 built, reviewed, audited,
 and browser-validated on branch `prd-23-web-ux-polish`.** `web/` + `docs/` only — no
 API, schema, agent, env, or Go change anywhere. Full rationale + Decision Log:
-`prds/23-web-ux-live-dashboard-sidebar-board.md`.
+`prds/done/23-web-ux-live-dashboard-sidebar-board.md`.
 
 ## 85. Shared visibility-aware poll hook + live dashboard
 
@@ -2034,7 +2080,7 @@ adds an edge-triggered MR-state watcher that moves the card back to In Progress 
 close, and symmetrically restores it on reopen. Merged MRs trigger nothing — the
 existing `Closes #N` → issue-close → sync path (§22) owns that outcome. Section
 numbers continue past PRD #23's #88; the numbered decisions below realize the PRD's
-Decision Log (`prds/24-mr-close-rework.md`).
+Decision Log (`prds/done/24-mr-close-rework.md`).
 
 ## 89. Detection: poller-based, edge-triggered on `runs.mr_state`
 
@@ -2091,6 +2137,31 @@ Serves human Feature #24; extends the forge seam (§16) and runtime schema (§37
   `ResolveColumn` check in the watcher is authoritative (§91).
 - **`SetRunMRState`** — the sole `mr_state` writer; touches `mr_state` + `updated_at`
   only, never the run's status.
+- **Closed-issue terminal-recording lane (#527).** The candidate `WHERE` is now a
+  union of two lanes. **Lane A** is the open-issue board-move watch above,
+  byte-identical. **Lane B** (`i.state='closed' AND (l.mr_state IS NULL OR l.mr_state
+  IN ('opened','locked'))`) exists because a merge **closes the issue** (via `Closes
+  #N`) and the poller runs the issue sync **before** `SyncMRStates`, so the `merged`
+  state is only ever observable once the issue is already `closed` — Lane A would
+  never see it, which is why `mr_state` froze at `NULL`/`opened` for cleanly-merged
+  PRs and the "merged" badge (`MrChip.tsx`, `runBadge.ts`) almost never appeared.
+  Lane B keeps a closed issue's latest completed run polled while its `mr_state` is
+  **non-terminal**, records the terminal state, and **moves no card** — proven
+  move-free by the existing paths (§91): NULL bootstrap and the `merged`/`locked`
+  `default` arm record without moving, and `guardedMRMove` skips a closed issue
+  before any `AutoMove`. It also **backfills** historical merged PRs (`mr_state`
+  NULL): each is polled once, records `merged`, then **decays out** of the set once
+  terminal (`merged`/`closed` are excluded). No new writer (`SetRunMRState` stays
+  sole), no schema/migration/DTO/web change, and — because the burst bound is a
+  literal `LIMIT 100`, not a `sqlc` param — no change to the `ListMRWatchCandidates`
+  signature or generated row struct (Decision D4). The query orders open-issue
+  (Lane A) rows first (`ORDER BY (i.state='opened') DESC, l.created_at DESC`) so a
+  backfill burst never defers Lane A. **Caveat (accepted, R4):** the `LIMIT 100` now
+  bounds the *total* returned set, Lane A included — previously the query was
+  unbounded — so a repo with >100 simultaneous open Lane-A candidates (Human-Review
+  + reopen cards) would defer the oldest board moves each tick. 100 far exceeds any
+  realistic Lane-A count, so this is defense-in-depth, not an operational limit;
+  raise the constant if a deployment ever approaches it.
 
 ## 91. Watcher: edges, guards, state-persistence contract (`forgesvc.SyncMRStates`)
 
@@ -2173,7 +2244,7 @@ failure-comment wording were **approved by the user (2026-07-05)** and are recor
 settings store whose first two tenants are the configurable `prd_label` and
 `autopilot_label`, and an autopilot path where adding a label in GitLab runs a PRD
 issue end to end with zero uzi interaction. Section numbers continue past PRD #24's
-#92. Full rationale + Decision Log: `prds/19-admin-settings-and-autopilot.md`.
+#92. Full rationale + Decision Log: `prds/done/19-admin-settings-and-autopilot.md`.
 
 ## 93. app_settings: generic KV store + cached accessor (`api/internal/settings`)
 
@@ -2480,7 +2551,7 @@ tighten who registers, and verify the bot PAT can do no more than open MRs — m
 PRD #4's "GitLab-side bot = Developer + protected main" guardrail (§50) *checked*
 instead of hoped. Sections are **§403-§408**; they were authored as 93-98 "continuing past
 PRD #24's #92" and renumbered by issue #156 — see the numbering note above. Realizes
-`prds/5-access-control-pat-hardening.md`.
+`prds/done/5-access-control-pat-hardening.md`.
 
 ## 403. Registration controls (server)
 
@@ -2636,7 +2707,7 @@ they were authored as 93-100 "continuing past PRD #24's #92" and renumbered by i
 (see the numbering note above) — §409-§414 are this PRD, §415-§416 begin PRD #16's skills
 work and used to run straight into §101-§104, which they no longer do.
 The decisions below realize the PRD's Design Decisions
-(`prds/17-lead-template-and-model-selection.md`), whose per-decision attributions
+(`prds/done/17-lead-template-and-model-selection.md`), whose per-decision attributions
 carry provenance. Builds on PRD #3 (agent templates) and PRD #4 (runtime/claim).
 
 ## 409. Decouple builtins from `.claude/agents/`; lead is the eighth builtin
@@ -2790,7 +2861,7 @@ only `name`+`description` sit in context always, the body loads on demand
 PRD #3 (agent-template store + reconciler), PRD #4 (claim payload, SDK executor,
 guardrail layers), and PRD #17 (decoupled-builtins convention, `lead` as an
 existing builtin routed to the main thread). Full rationale in
-`prds/16-agent-skills.md` (Decision Log); user-facing guide in `docs/skills.md`;
+`prds/done/16-agent-skills.md` (Decision Log); user-facing guide in `docs/skills.md`;
 cross-service map in ARCHITECTURE.md "Agent skills".
 
 ## 415. Skill scopes + storage schema (`skills`, `agent_skill_allocations`)
@@ -3070,7 +3141,7 @@ ember as the sole theme with all look-and-feel in CSS variables precisely so
 alternate identities could ship later as `data-theme` overrides; this PRD builds
 the switching mechanism and ports the mission-control prototype onto ember's token
 slots. Section numbers continue past PRD #16's #110. Realizes
-`prds/21-mission-control-theme.md` (its Decision Log carries build-time provenance);
+`prds/done/21-mission-control-theme.md` (its Decision Log carries build-time provenance);
 builds on PRD #14 (tokens), PRD #17 (`/api/me/settings`), and PRD #19 (`app_settings`).
 
 ## 111. Theme = tokens only; the no-branch rule; base-selector hardening
@@ -3251,7 +3322,7 @@ Serves human Feature #22 (an admin-controlled escape-hatch label that lets an is
 without a `prds/*.md` link — configurable name, feature on/off, both in admin settings;
 enabled out of the box; default name `PRDLESS`; the label can be added/removed directly
 from the uzi web UI). User-stated 2026-07-05. Section numbers continue past PRD #21's
-#118. Full rationale + Decision Log: `prds/22-prdless-label.md`.
+#118. Full rationale + Decision Log: `prds/done/22-prdless-label.md`.
 
 **Status (branch `prd-22-prdless-label`):** prd-21 landed on main and is merged into this
 branch. M1 (strict per-key validation + admin-settings toggle/name UI), M2 (gate bypass,
@@ -3384,7 +3455,7 @@ Serves human Feature #6 (CI status visible in uzi + an agent that fixes broken C
 and uzi verifies the fix) and the "uzi keeps its own dummy CI" item. Two halves along
 the PRD #4 dependency boundary: a display half on PRD #2 machinery only (M1–M3), and a
 fix-agent half riding PRD #4's run machinery (M4–M7). Section numbers continue past PRD
-#22's #122. Realizes `prds/6-ci-status-integration.md` (its Decision Log carries the
+#22's #122. Realizes `prds/done/6-ci-status-integration.md` (its Decision Log carries the
 user-vs-AI provenance and full rationale); builds on PRD #2 (forge layer + poller), PRD
 #4 (runs, worker protocol, plan gate, MR flow), and PRD #12 (`runs.mr_iid`/`mr_state`).
 
@@ -3687,7 +3758,7 @@ Serves human Feature #32 (an operator with the DB + env/Infisical/etcd master ke
 not recover any user's Anthropic token; each user's secrets keyed by their own login
 password; auto-unlock at login with the key in server memory until restart/lock; locked
 runs queue; forgotten password ⇒ unrecoverable). **Status: built (PRD #32,
-`prds/32-user-vault-password-wrapped-secrets.md` carries the full Decision Log +
+`prds/done/32-user-vault-password-wrapped-secrets.md` carries the full Decision Log +
 user-vs-AI provenance). These sections record the as-built system; where implementation
 diverged from the design, the as-built decision and its reason are called out inline
 ("as-built").** Builds on PRD #3 (`user_secrets` + `secretbox`, §29–30) and gates PRD #19
@@ -3968,7 +4039,7 @@ Serves human: "Users only learn that an agent run finished, failed, or is parked
 plan-approval gate by keeping the webui open... There is no push channel of any kind"
 (PRD #25 Problem statement, no dedicated human.md Feature entry yet — this PRD originated
 directly from GitLab issue vtmocanu/uzi#25, reviewed by a 3-agent design/fact-check/security
-pass before build). Realizes `prds/25-slack-integration.md` (its Decision Log carries the
+pass before build). Realizes `prds/done/25-slack-integration.md` (its Decision Log carries the
 full user-vs-AI provenance); builds on PRD #4 (runs, steering inputs), PRD #19
 (`app_settings`), and `secretbox`. Section numbers continue past PRD #6's #132.
 
@@ -4284,7 +4355,7 @@ in git, per-repo devbox tool tiers, and agent-template scopes+allocation. Sectio
 numbers continue past PRD #25's #153. Builds on PRD #4 (worker runtime, claim
 payload, guardrails), #16 (skills scope+allocation shapes reused here), and #17
 (claim plumbing, decoupled builtins). Migrations landed `00045`–`00049` (renumbered above main's `00044_slack`; prior live head
-was `00043`). Full rationale in `prds/18-worker-templates-and-agent-scopes.md`;
+was `00043`). Full rationale in `prds/done/18-worker-templates-and-agent-scopes.md`;
 user guides in `docs/worker-setup.md` + `docs/worker-tools.md` + `docs/agent-templates.md`.
 
 ## 154. Worker image templates in git (agent + compose)
@@ -4769,7 +4840,7 @@ inherits the decision.
 Serves human Feature #11 (run-view UX) and the PRD #38 additions (feed redesigned to
 the approved mock, bash as highlighted code, per-agent collapse). Web-only: no API,
 schema, agent, or message-shape change — a pure `web/src` render refactor. Full
-rationale + Decision Log: `prds/38-activity-feed-redesign.md`; the design contract is
+rationale + Decision Log: `prds/done/38-activity-feed-redesign.md`; the design contract is
 `prds/mockups/38-activity-feed-mock.html`.
 
 - **Full command is the source of truth; truncation is display-only** (`RunEvent.tsx`):
@@ -4834,7 +4905,7 @@ rationale + Decision Log: `prds/38-activity-feed-redesign.md`; the design contra
 
 Serves the primary safety posture: tool commands and results are attacker-influenced LLM
 output rendered verbatim, so the render path is bounded against DoS. All in
-`prds/38-activity-feed-redesign.md`.
+`prds/done/38-activity-feed-redesign.md`.
 
 - **Tokenizer fan-out cap** (`highlightShell`, `RunEvent.tsx`): stops at
   `HIGHLIGHT_MAX_CHARS` (8 KB) or `HIGHLIGHT_MAX_NODES` (2000) and appends the exact
@@ -4851,7 +4922,7 @@ output rendered verbatim, so the render path is bounded against DoS. All in
 ## 171. Feed accessibility (WCAG pass)
 
 Serves human Feature #11's usability intent, extended to a11y. See
-`prds/38-activity-feed-redesign.md` (M4).
+`prds/done/38-activity-feed-redesign.md` (M4).
 
 - **Scoped live region** (`ActivityFeed.tsx`): the scroll container keeps `role="log"` but
   is forced `aria-live="off"` — `role="log"` carries an implicit `aria-live="polite"`, so
@@ -4878,7 +4949,7 @@ Serves human Feature #11's usability intent, extended to a11y. See
 
 ## 172. PRD #38 scope boundaries, mock-as-contract & recorded deferrals
 
-See `prds/38-activity-feed-redesign.md` (Out of Scope, Decisions 11/13).
+See `prds/done/38-activity-feed-redesign.md` (Out of Scope, Decisions 11/13).
 
 - **The mock is the contract, with named illustrative exceptions** (M6, web-ux browser
   pass): structure/color/interaction are contractual; literal string formatting follows the
@@ -4896,7 +4967,7 @@ See `prds/38-activity-feed-redesign.md` (Out of Scope, Decisions 11/13).
 ## 173. Worker ↔ run concurrency model — ADR-42 (decided; implementation via PRD #42)
 
 See `adr/0042-worker-run-concurrency.md` (the full ADR: research context, options, residuals)
-and `prds/42-worker-run-concurrency.md` (implementation design + milestones).
+and `prds/done/42-worker-run-concurrency.md` (implementation design + milestones).
 
 - **Decision**: a worker may execute multiple runs concurrently, bounded by a worker-side
   slot semaphore (`WORKER_MAX_CONCURRENT_RUNS`, default 1 — default behavior unchanged);
@@ -4924,7 +4995,7 @@ lead-only stays approvable), and Decision 10 (Slack two-button source picker) �
 `specs/human.md` gains one requirement (choose agents at the gate; repo default; own
 fallback; Slack source choice), recorded there pending user ratification. Migration
 `00052` (nullable `runs.agent_source`/`agent_exclusions`/`repo_agents`; renumber at
-land). PRD `prds/37-run-agent-selection.md` is the full decision log.
+land). PRD `prds/done/37-run-agent-selection.md` is the full decision log.
 
 ## 174. Repo agents are worker-parsed, never SDK-loaded; capped worker-side AND API-validated
 
@@ -5105,7 +5176,7 @@ no fake can make is proven empirically.
 Serves human: user-requested (2026-07-10) — a conversational surface where a user chats
 with uzi in the web UI (on their own Anthropic token, worker invisible to them), the agent
 knows uzi's own code, can investigate the user's runs, and can create GitLab issues on
-request via the user's bot credentials. Full rationale + Decision Log: `prds/39-chat-agent.md`
+request via the user's bot credentials. Full rationale + Decision Log: `prds/done/39-chat-agent.md`
 (3-agent-reviewed; the `↳review` decisions are binding). Architecture map: ARCHITECTURE.md
 "Chat with uzi (the fifth surface)". This section records the load-bearing AI decisions; the
 PRD carries the complete set (1–15) and the review corrections.
@@ -5243,7 +5314,7 @@ PRD carries the complete set (1–15) and the review corrections.
   knob in `docs/worker-setup.md`); the real fix is the k8s uid-split/container-per-run
   era (§168), where each operator-spawned pod is a single-slot worker and this design
   composes unchanged. Full research, options, and rationale: `adr/0042-worker-run-concurrency.md`;
-  implementation design and milestones: `prds/42-worker-run-concurrency.md`.
+  implementation design and milestones: `prds/done/42-worker-run-concurrency.md`.
 - **Per-run `HOME` cleanup residual**: cleanup runs whenever `execute()` reaches a local
   terminal outcome, even if the terminal `/state` report itself failed to reach the
   server (`runner.ts`'s `finally`, logged not thrown) — so a run stuck `running`
@@ -5258,7 +5329,7 @@ Serves human: the primary directive (agents never touch `main`) — the M2 signa
 closes a real serial-flow hole in it; the parallelism is a wall-clock/throughput improvement
 strictly within existing constraints (PRD #3 templates §29, PRD #4 runtime §40–§53) and adds
 **no new user-stated requirement** (human.md unchanged). All decisions here are AI design
-within the pre-reviewed PRD (`prds/43-intra-run-parallel-subagents.md`, drafted 2026-07-10,
+within the pre-reviewed PRD (`prds/done/43-intra-run-parallel-subagents.md`, drafted 2026-07-10,
 3-agent-reviewed on 2026-07-10/11; the `↳review` decisions are binding). The user's only input
 to the 2026-07-12 build session was "work on PRD #43, worktree mode, with the agent team." Full
 Decision Log (1–8) + residuals live in the PRD; this section records the load-bearing decisions
@@ -5553,7 +5624,7 @@ and fact-check findings.
 Serves human: Feature #47 — detect too-slow / stuck runs and flag them in the web UI
 and on Slack (plan.md line 68), as a non-terminal, self-clearing signal that never kills
 a run (user-ratified surface). Full decision log + review/audit trail:
-`prds/47-loop-hang-detection.md`. Migration landed as `00057_run_health.sql` (PRD draft
+`prds/done/47-loop-hang-detection.md`. Migration landed as `00057_run_health.sql` (PRD draft
 said 00054; the live head had moved — renumber again if main moved at land). This section
 records the load-bearing AI decisions; the PRD carries the complete set (Decisions 1-11)
 with the review/audit findings folded in.
@@ -5906,7 +5977,7 @@ with the review/audit findings folded in.
 
 # PRD #40 — Token usage & cost reporting (per run / per user / factory-wide)
 
-Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisions:
+Full Decision Log in `prds/done/40-token-usage-reporting.md`. The load-bearing decisions:
 
 ## 222. Result-frame usage is CUMULATIVE-across-resume (M1 verdict b)
 
@@ -6009,7 +6080,7 @@ Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisi
 
 Serves the human requirement: live per-worker CPU/memory visibility in the web UI, per-worker
 granularity (no per-run attribution), working identically under docker-compose today and k8s later.
-Full Decision Log in `prds/49-worker-resource-stats.md`. The load-bearing decisions:
+Full Decision Log in `prds/done/49-worker-resource-stats.md`. The load-bearing decisions:
 
 ## 228. Self-reported cgroup v2 on the existing heartbeat — never pulled from outside
 
@@ -6464,7 +6535,7 @@ Serves human Feature #55: the IdP owns who is admin (and optionally who may log 
 deployment, replacing the first-login-race / env-seed model; authoritative grant-and-demote sync on
 every OIDC login; fail-safe on an absent claim; OIDC-only scope; works with Keycloak and Pocket ID.
 Extends PRD #45 (§195-201); no schema migration (a query-only change). Full decision log +
-review/audit trail: `prds/55-oidc-group-mapping.md` (Design Decisions there TAG provenance). This
+review/audit trail: `prds/done/55-oidc-group-mapping.md` (Design Decisions there TAG provenance). This
 block records the load-bearing AI decisions.
 
 ## 253. Groups from the verified ID token only; `GroupsClaimPresent` as the fail-safe discriminator
@@ -7508,7 +7579,7 @@ favicon and was deliberately NOT touched. Full decision log: [prds/done/70-statu
 ## 277. uzi CLI — in the api module at `api/cmd/uzi/`, importing only stdlib-leaf `apitypes`
 
 Serves human: Feature #64 (uzi CLI) — a terminal control surface for the factory, driven identically
-by humans and headless agents. Design record: `prds/64-uzi-cli.md` (Decisions 1, 11, 12; Success
+by humans and headless agents. Design record: `prds/done/64-uzi-cli.md` (Decisions 1, 11, 12; Success
 Criteria 1, 8). Supersedes PRD #4's "no CLI after worker setup" for the *control plane* (not for the
 worker-execution protocol, which stays `/api/worker/*`).
 
@@ -7642,9 +7713,10 @@ table + Decisions 5, 16, 18, 21. M2 splits existing chi groups so only the enume
   - `POST /api/auth/logout` — shares a group with `/auth/me` but must **split**: logout bumps
     `token_version`, which would kill the user's **browser** sessions from a CLI call.
   - `POST /api/runs/{id}/rejudge` — mints a token-spending run; excluded on the read-vs-spend
-    distinction (D21), **not** by inheritance. After the `/review` swap it is the **only** cookie-only
-    route left in the `/runs` group, so "wrap the whole `/runs` group in `RequireUser`" is the single
-    most tempting M2 shortcut — pinned by a dedicated Bearer-reject test (Criterion 4).
+    distinction (D21), **not** by inheritance. After the `/review` and `FileIssue` (PRD #365) swaps it
+    and `PUT /api/runs/{id}/wait-on-limit` (an unattended-spend consent toggle) are the cookie-only
+    routes left in the `/runs` group, so "wrap the whole `/runs` group in `RequireUser`" is a tempting
+    shortcut that would silently widen them — pinned by a dedicated Bearer-reject test (Criterion 4).
   - **`POST /api/workers`** — mints a plaintext `uzw_` join token whose claim response carries
     **decrypted** `ForgePAT` + `AnthropicOAuthToken`. A non-admin `uzc_` reaching it could exfiltrate a
     forge PAT and a paid credential over HTTPS, defeating `secretbox` + PRD #32's vault, and the minted
@@ -8000,7 +8072,7 @@ guardrail" posture for forensic controls.
 # PRD #65 — Forgejo support (the second forge driver)
 
 Serves human Feature #2 ("forge-generic design, GitLab first, Forgejo later"). PRD at
-`prds/65-forgejo-support.md` (Decision Log D1–D11 is the provenance record). This PRD
+`prds/done/65-forgejo-support.md` (Decision Log D1–D11 is the provenance record). This PRD
 lands the second driver at full parity and corrects the false blocker that deferred it
 (see §16/§15). **Every milestone lands dark**: until M6b flips the handler gate, a
 `forgejo` connection is unreachable, and **no run is refused and no save is rejected**
@@ -8226,7 +8298,7 @@ Serves human Feature #2 (connect a forge) and the testing-credentials policy.
 Serves human Feature #4 (the worker runs the agent) + the user requirement that workers be
 able to run Docker/Compose projects — uzi's own `./e2e/run-e2e.sh` / `./scripts/smoke.sh`
 need `docker compose up`, so a worker that cannot run containers cannot dogfood uzi. PRD at
-`prds/83-docker-capable-worker.md` (Decision Log D1–D9 + resolved questions Q-A…Q-D). Design
+`prds/done/83-docker-capable-worker.md` (Decision Log D1–D9 + resolved questions Q-A…Q-D). Design
 grounding: the architecture note was written to `.claude/agent-team-tasks/`, which `.gitignore`'s
 `.claude/agent-team-tasks/` entry deliberately excludes, so it did not survive its worktree — `prds/done/83-docker-capable-worker.md`
 is the surviving design record (corrected 2026-07-21; this line used to cite the dead path as if
@@ -8313,9 +8385,38 @@ Serves human Feature #4; scoped so #83 does not pre-empt #84's capability vocabu
   register (the same reason `Name` is declared-but-ignored); it is NOT threaded into `wsvc.Register`.
   **No column, no DTO, no sqlc/migration in #83** (Q-A: no-persist). Nothing in #83 reads it — the
   guardrail keys on `DOCKER_HOST` (§300), not the registered capability, and a homogeneous dogfood
-  fleet needs no claim-time filter. Storage + the claim-time match predicate are **PRD #84's** to
-  own (it owns the vocabulary + the consuming query); persisting now would bake a shape #84 should
-  define.
+  fleet needs no claim-time filter. Storage + the claim-time match predicate were **PRD #84's** to
+  own (it owns the vocabulary + the consuming query); persisting in #83 would bake a shape #84
+  should define. **RESOLVED by PRD #84 M1–M3 (see next bullet); M4/M5 remain deferred.**
+- **PRD #84 M1–M3 fulfilled the reservation — the register self-report is now PERSISTED, not
+  ignored** (this bullet supersedes "accepts-and-ignores" above for the storage/consuming-query
+  dimension; the #83 wire + compat decisions above stand).
+  - **M1 — vocabulary + persistence.** Server-owned capability vocabulary `{docker, jvm}` and a
+    `template→capabilities` map live in `api/internal/capability/capability.go` (code constant, not
+    a DB table). Register no longer ignores the report: `wsvc.Register`
+    (`api/internal/workersvc/service.go`, ~L1040) stores
+    `capability.Filter(SelfReportable(reported) ∪ TemplateCapabilities(template))` into
+    `workers.capabilities text[]` (migration `00141_worker_capabilities.sql`). Only `docker` is
+    self-reportable; `jvm` is template-derived (`SelfReportable` strips a worker's spoofed `jvm`).
+    Surfaced on `WorkerDTO.Capabilities` (`api/internal/apitypes/worker.go`).
+  - **M2 — run/repo requirements + claim gate + kill-switch.** `runs.required_capabilities` and
+    `repos.required_capabilities` (`text[]`, migration `00142_capability_scheduling.sql`); the repo
+    static hint is copied onto every new issue run at the `CreateRun` INSERT (subquery in
+    `runtime.sql` `CreateRun`, not a Go param). `fn_worker_can_claim` is EXTENDED (drop + recreate,
+    same 00142) from 4 args to 7 — adding `worker_caps`, `run_required_capabilities`,
+    `capability_aware` — AND-ing a `required ⊆ effective_worker_caps` subset clause onto the existing
+    docker→allowlist clause (effective caps fold `docker_enabled` into the stored caps). Global admin
+    kill-switch `settings.KeyCapabilityAwareScheduling` (bool, default `true`, mirrors
+    `KeyHealthEnabled`) gates ONLY the new subset clause; off reverts #84's addition while the
+    docker→allowlist authorization clause stays enforced.
+  - **M3 — unplaceable-run health reason.** `reasonNoEligibleWorker`
+    (`api/internal/workersvc/health.go`) is a `health_reason` projection over the existing `queued`
+    status (no new `runs.status`, no migration; maps to the existing `waiting_worker` enum), emitted
+    when a queued run's `required_capabilities` are a subset of no online worker's effective caps.
+    Backed by a new `CountOnlineWorkersSatisfyingCaps` query using the same docker-fold.
+  - **Still DEFERRED (NOT shipped):** M4 (plan-time `detect()` inference + the plan-approval-gate
+    block; `runs.required_tools` provisionable column) and M5 (jvm retrofit as a matched routing
+    capability beyond the map, user docs page, CLI parity, ARCHITECTURE.md).
 - **Compat rule (load-bearing):** the api MUST declare `capabilities` in the SAME release the worker
   starts sending it — an older DisallowUnknownFields api would 400 the register and wedge the fleet's
   retry loop. Both land in M1, same MR; never split across releases.
@@ -8555,7 +8656,7 @@ Serves human Feature #49-adjacent (worker sizing) + the docs requirement.
 Serves human: the judge's recommendations must be **fileable as forge issues, the human choosing
 which to file** (GitLab issue #68). *(The user-stated requirement line is proposed for human.md's
 "Run retrospective (LLM judge)" feature and is pending approval; this section records the mechanism
-the AI chose to satisfy it.)* Design record: `prds/68-judge-file-issue.md`.
+the AI chose to satisfy it.)* Design record: `prds/done/68-judge-file-issue.md`.
 
 - **The issue body is templated server-side from rows already stored; the click spends no Anthropic
   token.** Everything a useful issue needs is on hand: `category`, `target`, `rationale_md`,
@@ -8593,11 +8694,13 @@ admin-can-file** (not restrict to the owner), conditioned on prominent provenanc
     (that would inflate every run-page load to serve a draft usually never opened).
 - **Routing is split, not uniform, because of the CLI (Interactions).** The judge-review *read* is
   already CLI-reachable, so the draft **GET mounts on `RequireUser`** (session **or** admin-scoped
-  CLI Bearer, CSRF-safe, mirroring the review read). Filing is **browser-only in this PRD** (no CLI
-  verb), so the **POST mounts on the cookie+CSRF `RequireAuth` path behind
-  `forgeLimiter.PerUserMiddleware`**, mirroring `ConfirmProposal` — never on the cookie-only
-  `RequireAdmin` write group. Pinned so a future reader does not mistake the CLI omission for an
-  oversight.
+  CLI Bearer, CSRF-safe, mirroring the review read). Filing was browser-only under PRD #68 (no CLI
+  verb then); **PRD #365 M1 moved it**, so the file **POST now mounts on `RequireUser` behind
+  `forgeLimiter.PerUserMiddleware`** — `uzi review file` reaches it from a CLI `uzc_` Bearer token,
+  while a browser caller stays on the cookie path with CSRF preserved via `RequireUser`'s
+  presence-dispatch (cookie request → CSRF-checked, Bearer request → no cookie to forge). Still
+  behind the per-user forge limiter, and still **never on the cookie-only `RequireAdmin` write
+  group**.
 - **Authorization: owner-or-admin to read, caller-owns-repo to write (D8).** The draft is
   owner-or-admin scoped via `GetRunForViewer` (non-owner → not-found), exactly like `GetRunReview`.
   The write additionally requires the *caller* to own the target repo via `GetRepoForUser`
@@ -8933,7 +9036,7 @@ A durable, per-(user, repo) store the lead writes a bounded learning into and a
 FUTURE run on the same repo reads back — sanctioned, structured, and user-visible,
 where prior runs had no such mechanism (a stray cross-run Bash write, the accepted
 PRD #42 residual, was never re-read into context). Owner decisions are recorded in
-`prds/90-agent-memory-persistence.md`'s Decision Log and are NOT duplicated into
+`prds/done/90-agent-memory-persistence.md`'s Decision Log and are NOT duplicated into
 `specs/human.md` (an implementation/design record, not a new user-binding
 requirement, per the PRD #89 precedent). The independent fable-model review that
 shaped this PRD is summarized there too; what follows is the AI/implementation
@@ -9304,7 +9407,7 @@ rule (Feature #64). PRD #95 Decisions 9 + 10, chat caveat N3.
 Serves human: extends the Run retrospective (LLM judge) feature
 (`specs/human.md:280`) — a judged recommendation reached only one settled
 state ("filed", PRD #68) and had no way to record "handled", "won't do", or
-"the judge is wrong here". Design record: `prds/94-judge-triage.md`.
+"the judge is wrong here". Design record: `prds/done/94-judge-triage.md`.
 
 ## 331. New coordinate-keyed side-table, not columns on either existing recommendation row (D1)
 
@@ -9396,8 +9499,12 @@ state ("filed", PRD #68) and had no way to record "handled", "won't do", or
 - `PUT/DELETE /api/runs/{id}/review/recommendations/{recID}/disposition`
   mount on **`RequireUser`** (`handler.go`), mirroring `POST /{id}/inputs`
   (`CreateRunInput`) — CLI-reachable, no token spend, no forge write —
-  **not** the cookie-only `RequireAuth` path `rejudge`/`FileIssue` sit on
-  (those mint a spend / write a forge; this does neither).
+  **not** the cookie-only `RequireAuth` path `rejudge`/`wait-on-limit` sit
+  on (`rejudge` mints a token-spending judge run; `wait-on-limit` is an
+  unattended-spend consent toggle — this does neither). `FileIssue` itself
+  moved to `RequireUser` in PRD #365 M1: it is a forge write, but a
+  rate-limited, owner-scoped, reversible one — the same tier as these
+  disposition routes.
 - **The load-bearing authz correction, found on review**: an owner-**or**-admin
   write here would be a hole. `RequireUser` degrades a non-`admin_ro` CLI
   token to `IsAdmin=false` for free — **but a `uza_ admin_ro` token keeps
@@ -9566,7 +9673,7 @@ steering wire), PRD #33 (`stop_kind` semantics), and rides §51's SDK session re
 The single user decision is Decision 10 (Slack gets full gate parity — see and steer
 the plan from Slack — a deliberate, user-approved 2026-07-10 reversal of PRD #25's
 plan-content minimization); the rest is AI design within the "steer, don't kill"
-constraint. Full rationale + accepted residuals: `prds/41-plan-revision-gate.md`.
+constraint. Full rationale + accepted residuals: `prds/done/41-plan-revision-gate.md`.
 Migration is draft `00070` — renumber above the merged head at landing (live head
 `00051`, PRD #37 holds `00061`, PRD #39 holds `00065`).
 
@@ -10942,9 +11049,9 @@ shipped as `[y]`/`[n]`, not `[a]`/`[r]`: `[a]` doubling as the board's admin tog
 *and* approve would put "approve a plan" one keystroke from `[x]` cancel-a-live-run,
 and `[r]` is refresh everywhere else in the app. Both destructive verbs (`cancel`,
 `reject_plan`) require the affirmative key — "not escape" is not consent — while
-approve is unconfirmed and offered only while the run is actually at its gate. Quit is
-confirmed for both `[q]` and `ctrl+c`, with a second `ctrl+c` as the escape hatch for a
-stuck confirm prompt; a stray keystroke must not drop a watched run.
+approve is unconfirmed and offered only while the run is actually at its gate. `[q]` quits
+immediately (user preference); `ctrl+c` is confirmed, with a second `ctrl+c` as the escape
+hatch for a stuck confirm prompt, so a stray `ctrl+c` cannot drop a watched run.
 
 See [prds/done/112-uzi-tui.md](../prds/done/112-uzi-tui.md) D4/D5/D8, R2, and the M3/M4
 milestone corrections.
@@ -16268,7 +16375,7 @@ is one new read plus one normalization, and each has exactly one correctness pro
 Serves human: the best-practice bar, plus Feature #52's "real CI/CD: a working pipeline" —
 the toolchain gate jobs M1 rewires live in that pipeline. **`human.md` untouched and no entry
 proposed**: this is contributor tooling and nothing about the product changes — no API, no
-schema, no worker behaviour, no UI. Design record: `prds/103-dev-loop-quality-gates.md`
+schema, no worker behaviour, no UI. Design record: `prds/done/103-dev-loop-quality-gates.md`
 (Decisions 1–11).
 
 **Numbering note.** These start at 464, not 461, because 461–463 were reserved by the then-unmerged
@@ -18898,7 +19005,7 @@ Serves human.md: reduce CI wall-clock **without weakening any gate/test/coverage
 local==CI byte-identical recipes (§464, PRD #103 SC-1), release atomicity — a red gate blocks every
 publish (SC-5) — and the MR trust boundary (§245). Pure dev-CI infrastructure: **no product-behavior
 or user-contract change**, which is why `human.md` is untouched. Full rationale, review findings and
-measured deltas live in `prds/230-ci-pipeline-speedup.md` (Decision log D0-D7); this is the terse
+measured deltas live in `prds/done/230-ci-pipeline-speedup.md` (Decision log D0-D7); this is the terse
 contract, not a duplicate of it. All six landed milestones are CI-orchestration-only **except M5**,
 which is the sole `Taskfile.yml` change (SC-1's one exception).
 
@@ -19036,7 +19143,7 @@ auto-expands a terminal or single-actor run so reading a done N-agent run is not
 
 Serves human.md Feature #46 (the judge-recommendation backlog: "Recommendations land in an
 inbox/notifications surface", §358's cross-run worklist) and the verdict taxonomy enumerated at
-`specs/human.md:300-303`. Design record: `prds/235-judge-label-filter.md`. Adds a `?category=` /
+`specs/human.md:300-303`. Design record: `prds/done/235-judge-label-filter.md`. Adds a `?category=` /
 `--category` filter over the same six-label taxonomy already rendered on every group's badge
 (`web/src/lib/judge.ts`), with no new product contract — the taxonomy and the group shape are
 unchanged; this only adds a way to narrow which groups come back.
@@ -19088,7 +19195,7 @@ unchanged; this only adds a way to narrow which groups come back.
 
 Serves the live-run-visibility surface of human.md Feature #4 ("which agents are live/idle") as
 ambient navigation, alongside the existing Judge (§482) and Workers (§Feature #113 M6) nav badges.
-Design record: `prds/239-runs-in-progress-badge.md`. Adds an at-a-glance count of the caller's
+Design record: `prds/done/239-runs-in-progress-badge.md`. Adds an at-a-glance count of the caller's
 in-flight runs on the Runs `NavItem`; no new product contract beyond one owner-scoped count endpoint.
 
 - **"In progress" = every NON-terminal status, not the narrower "actively working" set (Decision 1).**
@@ -19921,7 +20028,7 @@ and `prds/216-worker-load-balancing.md`.
 
 ## 509. PRD #158 — forge read tools: a run-scoped, worker-mediated, read-only `forge` MCP server the agent reaches WITHOUT holding a credential
 
-Design record: `prds/158-forge-read-tools.md`. Gives the fact-checker subagent structured
+Design record: `prds/done/158-forge-read-tools.md`. Gives the fact-checker subagent structured
 read access to the run's own forge (issues, MRs, pipelines) so it can verify claims against
 the source, without ever exposing the forge token or coordinates to the model.
 
@@ -20304,10 +20411,13 @@ filters — instant view state, not a sync setting a poll-cycle away.
   lanes show `N/M`, and a board-level result count renders through the EXISTING `sr-only role=status`
   live region (debounced, last-writer-wins — it is the single-string channel `pushToast` shares).
 - **Paged reveal, never "show all" (Decision 3).** A page is 50; the expander advances `shownCount`
-  by one page and an expanded lane scrolls within a bounded height, so a 900-deep lane never lands
-  hundreds of nodes in the DOM at once. Past two pages of remainder the lane nudges toward search
-  instead of a "show all" that would rebuild the wall. Virtualization (react-window / IO sentinel) is
-  deferred behind the same `shownCount` affordance — an implementation swap, not a UX change.
+  by one page, so a 900-deep lane never lands hundreds of nodes in the DOM at once. Past two pages of
+  remainder the lane nudges toward search instead of a "show all" that would rebuild the wall.
+  Virtualization (react-window / IO sentinel) is deferred behind the same `shownCount` affordance — an
+  implementation swap, not a UX change. **Issue #367 (2026-08-18) removed the "expanded lane scrolls
+  within a bounded height" clause this bullet used to carry** — see §557.
+- **Board scrolls as one page with pinned column headers (issue #367, supersedes PRD #304 Decision 3's
+  bounded-scroll half).** §557.
 - **Per-lane default (10) is a per-browser, per-repo VIEW preference**, stored in `prefs` as
   `uzi.board.${repoId}.perLane` beside `hideEmpty`/`sortMode` (§87/§88/§443) — density, not
   admin/server policy. It re-reads on `repoId` change via `useEffect` (the route swaps `:id` without
@@ -20457,7 +20567,7 @@ marker — to the three Claude rate-limit meter surfaces: admin table (`web/src/
 
 # PRD #308 — Schedule fire outcomes (surface why a fire started nothing)
 
-Decision Log with the richer rationale: `prds/308-schedule-fire-outcome.md`.
+Decision Log with the richer rationale: `prds/done/308-schedule-fire-outcome.md`.
 
 ## 524. PRD #308 Decision 1 — last fire only, a single JSONB column, not a history table
 
@@ -20890,23 +21000,25 @@ colour-coded status board. TUI/CLI-only — no API, DB, worker or web change; bl
   clean-fixture screenshots pass whether or not the sanitization survives the port (golden-fixture
   trap), so the hostile-`OwnerEmail` admin-board render test is the only guard, not the PNGs. The ⚖
   judge-verdict marker shows on the **own-runs board only** (admin rows carry no `JudgeVerdict`);
-  the admin board keeps its honest "active runs (factory-wide)" label rather than being relabelled.
+  the admin board keeps its honest `▚▚ uzi · active runs` label rather than being relabelled.
 - **Two distinct gate banners (M3).** `awaiting_approval` → amber `PLAN GATE` banner with promoted
   `[y]`/`[n]` keycaps; `awaiting_input` (PRD #88 clarification park) → a distinct follow-up banner
   with **no** y/n. factoryui conflated them (`needsHuman = approval || input`), which would tell
   `awaiting_input` users to press inert keys. The banner is informational and shows regardless of
   ownership; the promoted keycaps are owner-gated (`steerAccess`, defense-in-depth with the
   `steerKey` gate so leaked keycaps are inert anyway).
-- **NO_COLOR fallback is scope, not polish (D3).** The spine and the plan-gate banner carry
+- **NO_COLOR fallback is scope, not polish (D3).** The status token and the plan-gate band carry
   colour-only fill that lipgloss strips under `NO_COLOR`/an Ascii profile. Fallbacks:
-  `statusGlyph(status)` puts a per-status marker in the spine column, and the banner is bordered
-  independent of fill; chip *text* survives on its own. The success criteria "the spine is
-  scannable in one pass" and "the gate is unmissable" depend on these, so `NO_COLOR` is honoured.
-  The detail header also keeps a stalled **word** cue (folded from an M3 nit), matching the board
-  keeping the health words.
+  `stateToken(status, health, isPlanning)` pairs each colour with a per-state **glyph** (● running,
+  ⚑ plan gate, ▲ stalled, ✓ done, …), so the state survives a colour strip on the board's `▌` andon
+  strip and the detail header's status word alike; and the one-row amber attention band keeps its
+  `▌` cap and bold-CAPS head independent of fill. The success criteria "the status is scannable in
+  one pass" and "the gate is unmissable" depend on these, so `NO_COLOR` is honoured. The detail
+  header also keeps a stalled **word** cue (folded from an M3 nit), matching the board keeping the
+  health words.
 - **Follow-live windowing inverted (M5).** The transcript went from top-anchored (`out[scroll:]`)
-  to bottom-anchored + follow, mirroring the web's `useFollowScroll`: `● FOLLOWING` auto-tail,
-  `⏸ PAUSED ↓N new` on scroll-up (N = `maxTop − top`, exactly the lines below the fold), `g`
+  to bottom-anchored + follow, mirroring the web's `useFollowScroll`: `⇣ following` auto-tail,
+  `⏸ N new · g ⇣` on scroll-up (N = `maxTop − top`, exactly the lines below the fold), `g`
   re-attaches and jumps to newest (`g` chosen because `f` is already follow-up), scroll-to-bottom
   also re-attaches, and only live runs follow. Render and the key-handler clamp share ONE layout
   (`buildTranscriptLines` + `transcriptViewport`) so a stale scroll can't blank the view; the
@@ -21347,3 +21459,651 @@ section records only the durable design shape.
 schedule can be created already-paused; `uzi schedule edit` gained `--repo` for the repoint above. The
 server already honored a supplied `Enabled` on create — this exposed it on the two clients, no API/schema
 change.
+
+## 557. Issue #367 — board switches from per-column scroll to full-page scroll with pinned column headers (supersedes PRD #304 Decision 3's bounded-scroll half)
+
+> **Superseded in part by §558 (issue #373, 2026-08-19):** Decision 2 (Option A / `flex-wrap`)
+> and the sticky-header mechanism below were reverted — horizontal column scroll is restored and
+> the lane headers are static again. Decision 1 (no bounded box, page scrolls vertically) stays.
+
+Single-file UI change in `web/src/pages/Board.tsx`; no API/DTO/DB change and the paging layer
+(`lanePaging` in `boardColumns.ts`, the cap-10/page-50 model, Show-more/Collapse, the `N/M` count
+pill) is untouched. Two required decisions, both recorded in the issue and the PRD #304 Decision Log:
+
+- **Decision 1 — the per-lane `max-h-[70vh] overflow-y-auto` box is removed on purpose (reverses PRD
+  #304 §521 Decision 3's bounded-scroll clause).** Lists grow to fit their cards; the page scrolls as
+  one plane; an expanded lane ("Show 50 more") grows the page rather than filling an inner scroll box.
+  The tall "wall" is now intended, not an accident. The paged-reveal half of Decision 3 is unchanged.
+- **Decision 2 = Option A — columns fit the width, no horizontal scroller.** The board row dropped
+  `overflow-x-auto` (a non-`visible` `overflow-x` silently forces `overflow-y:auto`, which would make
+  the row — not the viewport — the sticky scroll context and defeat the pin) and gained `flex-wrap`;
+  lanes went from `w-72 shrink-0` to `flex-1 basis-72 min-w-0`, so columns fill each row evenly and
+  wrap to full width on narrow screens instead of scrolling horizontally. Option B (keep the horizontal
+  strip) was rejected: pinning inside a horizontal scroller needs a bounded height again — the design
+  being removed.
+- **Headers pin to the viewport under the dynamic-height toolbar.** Each lane header is `position:
+  sticky`; its `top` reads a `--board-head-top` CSS custom property published on the board root from
+  the toolbar's live height (measured by a `ResizeObserver` wired through a callback ref, because the
+  toolbar mounts behind the `loading` early return). On mobile the offset adds the 49px shell bar
+  (`calc(var(--board-head-top) + 49px)`); on `lg` it pins at the toolbar's bottom edge exactly. The
+  header carries an opaque `bg-surface` (the lane's own `bg-surface/60` is translucent) with negative
+  `-mx-2.5`/`-mt-2.5` so the backing spans the lane's `p-2.5` padding, and `z-[5]` sits below the
+  toolbar's `z-10` so a taller wrapped toolbar paints over it. Browser-validated at narrow (toolbar
+  332px tall) and wide (220px) widths: headers pin at the toolbar's exact bottom edge, one scroll
+  plane, no horizontal scrollbar, cards scroll cleanly under the header.
+
+## 558. Issue #373 — board restores horizontal column scroll, drops the pinned headers (reverts §557's Decision 2 + sticky-header half; keeps Decision 1)
+
+#367 (§557) shipped in v0.44.0 and regressed the board: with `flex-wrap` + `flex-1 basis-72
+min-w-0` columns, more columns than fit the width wrapped onto new rows and horizontal card scroll
+was gone entirely (a broken multi-row grid with ragged gaps). #373 reverts that half while keeping
+the page-scroll behavior:
+
+- **Board row** back to `flex items-start gap-4 overflow-x-auto pb-4` — columns in one row with
+  horizontal scroll — and **lanes** back to `w-72 shrink-0` (fixed width, non-shrinking).
+- **Lane header is static again** (`mb-2.5 flex items-center gap-2 px-1`); the `--board-head-top`
+  CSS var + `ResizeObserver` toolbar-measuring machinery from #367 is removed.
+- **Decision 1 stays:** the per-lane `max-h-[70vh] overflow-y-auto` box is still gone, so the page
+  still scrolls vertically for tall columns and the paging layer (`lanePaging`, cap-10/page-50,
+  Show-more/Collapse, the `N/M` pill) is still untouched.
+
+Why not keep both: `overflow-x` on the row forces `overflow-y:auto` (CSS spec), making the row —
+not the viewport — the sticky scroll context, so in-board horizontal scroll and viewport-pinned
+headers are mutually exclusive without a larger change (page-level horizontal scroll, or JS-pinned
+headers). We chose horizontal scroll over pinned headers. Accepted trade-off: the row's horizontal
+scrollbar sits below the fold when a column is taller than the viewport, so a mouse-only user must
+scroll the page down to reach it; two-finger/shift-scroll and the partially-cut right column
+mitigate it. Browser-validated in mock mode (columns one row, horizontal scroll works, page scrolls
+vertically, headers static).
+
+## 559. PRD #379 — milestone progress on the two TUI surfaces, and the run viewer fills the terminal height
+
+The web (`MilestoneChecklist`/`MilestoneBadge`) and `uzi run get` (`milestoneRows`) already
+surfaced a milestone-structured run's progress; the interactive TUI (`uzi tui`) showed none of
+it. #379 adds it to both TUI surfaces and fixes an unrelated layout gap the work exposed.
+
+- **One shared fold, so three surfaces cannot disagree.** `milestoneProgress(run) → (done,
+  total, reported)` + `milestoneCount` in `api/cmd/uzi/tui_detail.go` are the TUI twin of the
+  web's `milestoneBadge`. `done` counts frozen MEMBERS present in the completed set (immune to a
+  duplicate id and to a completed id naming a milestone dropped after it was ticked). `reported`
+  is `MilestonesCompleted != nil`: a nil completed slice (JSON `null`) means nothing was ever
+  reported, so the run reads `–/N`, not a `0/N` that looks like failure (matches the web's PRD
+  #265 M2). The board badge and the detail block both read this fold.
+
+- **Board: a fixed `MILE` column, width-conditional.** `M{done}/{total}` (or `M–/N`) sits in a
+  fixed 6-col cell between AGE and TITLE (`milestoneMarker`, `boardMileWidth`), blank for a run
+  with no frozen list, on both the own and admin boards. A fixed column (not a float after the
+  title) keeps the badge in one place down the board. It adds 8 cols to the fixed prefix, which
+  at ~80 cols squeezed marker rows past the edge and clipped the judge marker, so the column is
+  DROPPED below `boardMileMinWidth` (90) and the board reverts to the pre-#379 layout; milestone
+  progress is still on the detail view. The count says neither "verified" nor "complete" (PRD
+  #122 Decision 6): the worker only reports a milestone done and nothing in uzi verifies it.
+
+- **Board titles trim** (`boardTitleMax` 60): long titles are capped and padded to a tidy column
+  so the trailing judge marker aligns, instead of running the full width of a wide terminal.
+
+- **Detail: a crew-rail milestone block.** `renderMilestones` appends `MILESTONES {count}` plus
+  one glyph-marked row per milestone in frozen order (`✓` done / `◐` in progress / `○` not
+  started, the web `MilestoneMark` glyphs), on both the lanes and the no-activity paths (so a
+  queued/just-claimed run shows it before its first frame). Done rows are muted, not struck
+  through (lipgloss emits strikethrough per-rune; the `✓` carries completion). Titles are
+  UNTRUSTED repo/agent text, drawn through `renderer.Plain`, and `"Title"` joins
+  `d7UntrustedFields` with the hostile-value render test extended.
+
+- **The run viewer fills the terminal height.** Previously the two-pane body was only as tall as
+  its content, so the pane divider stopped mid-screen and a tall terminal showed dead space below
+  the footer. `transcriptViewport` now computes the body height from the ACTUAL chrome
+  renderDetail draws (header, park line, transport, banner, steer bar, footer) and
+  `padLinesToViewport` pads the window to fill it; one value feeds both the render and the scroll
+  clamp. `joinColumns` clamps the joined body to the transcript (viewport) height rather than
+  `max(rail, transcript)`, so a rail taller than the viewport (a milestone run with many lanes)
+  truncates rather than pushing the footer — which carries the only nav keys — off-screen.
+
+No server or DTO change: `ListRuns`/`AdminListRuns` already decode the milestone fields via
+`runToDTO`. Read-only presentation; no change to how milestones are created, frozen, or reported.
+
+## 560. PRD #400 — `uzi handoff`: the `task` run kind (ephemeral, branch-scoped, MR-less), plus `--review` / `--then-fix`
+
+Handoff is the CLI-native dev loop: a "rented remote worktree" you push work to, watch, and
+pull commits from — no forge issue, no PRD, no MR by default. It ships as one new run kind,
+`task`, modeled on `prompt` rather than as a family of new kinds; a review and a fix are both
+`task` runs, distinguished by provenance columns, not by kind. Serves human.md's handoff
+requirement; the `main`-never-touched invariant is unchanged.
+
+- **`task` is the SEVENTH `runs.kind`, modeled on `prompt`.** Repo-ful and issue-less, reusing
+  the existing `issue_description` column for its inline context (inheriting the 256 KiB cap +
+  sanitization) — no new context column, exactly as `prompt`/`self_improve` do. `chat` was the
+  wrong model (repo-less, branch-less). A review is NOT a new kind and neither is a fix: both
+  are `task` runs, a review distinguished by `review_target_run_id`, a fix by `then_fix_of_run_id`.
+  Kind domain and per-kind shape widen the same drop/re-add way `00104`/`00058` did
+  (`00134_run_task_kind.sql`); the stale `issue|ci_fix|chat` doc comment in `apitypes/run.go` is fixed.
+
+- **Branch known at CREATE (the first such kind).** The task shape clause in `runs_kind_shape`
+  is `kind='task' AND repo_id IS NOT NULL AND issue_iid IS NULL AND branch IS NOT NULL` — the
+  first kind requiring `branch NOT NULL` at INSERT, where every existing kind writes `branch`
+  only at completion. The destination is server-named `uzi/task/<run-id>`, never caller-controlled
+  (safe by construction: it can never be a protected/default branch). Non-circular because the run
+  id is minted in Go first (`uuid.New()` in `workersvc/task.go`) and the branch derived from it,
+  then both handed to a caller-supplied-id insert (the `CreateChatRun` precedent). `base_branch`
+  (source ref, nullable) and `open_mr` are the only other new columns on `runs`.
+
+- **The dispatch gate (`dispatched_at`).** A task is created NOT-yet-claimable; `ClaimRun`'s task
+  predicate requires `dispatched_at IS NOT NULL`, so a worker never claims a task before the CLI
+  has seeded its branch. Decision-6 ordering: CLI creates the run → CLI pushes local HEAD to
+  `uzi/task/<id>` with the USER's own credentials → CLI stamps `dispatched_at` (dispatch) → worker
+  claims, clones, works, pushes back with the single PAT git path. `dispatched_at` is only ever set
+  on task runs, so other kinds are unaffected.
+
+- **No MR by default.** `open_mr` gates MR-open in the worker exactly as `chat`/`judge` already
+  skip it; the deliverable is commits on `uzi/task/<id>` that the user pulls. A task always pushes
+  its branch with the existing NON-FORCED `pushBranch` (a divergent mid-run user push is rejected
+  non-fast-forward — fail-closed, out of scope for v1). `--mr` is the escalation bridge and exempts
+  the branch from cleanup.
+
+- **`--review`: a diff-review `task` run.** Set on a plain task at create (`review_requested`);
+  at the reviewed task's terminal `completed` transition, `maybeEnqueueTaskReview` auto-creates a
+  review run (`review_target_run_id` → the target), placed beside `maybeEnqueueJudge` in
+  `judge_enqueue.go` inside the rows>0 block; a partial unique index enforces one active review per
+  target. The worker's ReviewRunner (`agent/src/review-runner.ts`) clones the branch, diffs it
+  against `base_branch`, and feeds the diff TEXT to a text-only reviewer model (no repo tools) —
+  the difference from the judge, whose input is a trace and which never clones. It POSTs structured
+  findings to new tables `task_reviews` / `task_review_findings` (file/symbol/line/severity/summary/
+  rationale), fetched as JSON via the CLI and NEVER committed to the branch. The `line`-bearing
+  schema is deliberate: a single-diff review does not have the judge's cross-run line-drift problem,
+  so it carries a line (`0` = whole-file), unlike the judge's line-less symbol-anchored recommendations.
+
+- **`--then-fix` implies `--review`.** Set on the original task (`then_fix_requested`); when the
+  review run completes with findings, `maybeEnqueueThenFix` (beside `maybeEnqueueTaskReview`) reads
+  the original's flag and composes the findings — untrusted framing, the `selfimprove` precedent —
+  into a NORMAL, auto-approved task (`then_fix_of_run_id` → the original) on the SAME `uzi/task/<id>`
+  branch, implemented by the ordinary worker path (no new kind, no new worker code). The chain
+  provably terminates: a fix run has `review_target_run_id` NULL (so it triggers no review hook) and
+  is not itself a review (so it triggers no fix hook).
+
+- **Guardrails.** The `main`-never-touched invariant is unchanged and defended in depth: a task
+  targets `uzi/task/*` (safe by construction, Decision 4), plus a create-time namespace +
+  default-branch assertion (reusing `guardDefaultBranch`), plus the forge's own protected-ref
+  rejection backed by the non-forced push (no history rewrite possible). Cleanup is client-side:
+  `uzi handoff rm <id>` deletes only within the `uzi/task/*` namespace (a CLI-side guard refuses any
+  other branch), with the user's own credentials, exempting an `--mr`-opened branch. Server-side
+  auto-prune (a new `Forge.DeleteBranch`) is deferred to Later.
+
+## 561. Issue #416 — sweep backfill: the `max_issues` cap counts runs STARTED, not candidates matched
+
+A label-sweep fire (`api/internal/schedsvc`, `fireSweep`) used to cap the candidates it
+*considered* at `max_issues`: it fetched the `max_issues` oldest matching open issues and fired
+each, so a candidate it could not start (no PRD link, already running, transient fetch) simply
+lost its slot and the fire started fewer than `max_issues`. A permanently ineligible issue at the
+head of the backlog could under-fill every fire indefinitely while newer eligible issues waited.
+This change makes the cap count runs **started**: the fire walks oldest-first past a skip and
+starts the next eligible candidate until `max_issues` runs fire, bounded by a scan window so
+per-fire cost stays bounded. It lives in the shared `fireSweep` path, so it applies to every
+sweep (`bug`, `Planned`, any future sweep) with no per-schedule code. Aligns behaviour with
+the intent `SKILL.md` already documented ("how many issues one `--sweep` fire *starts*").
+
+- **Bounded scan window, additive headroom.** When `max_issues` is set, the fetch widens to
+  `max_issues + backfillHeadroom` (a `schedsvc` package constant, default **10**); the widened
+  limit is computed in Go and threaded into the existing `ListSweepCandidateIssues` `MaxIssues`
+  param — no SQL/sqlc change. The loop stops (early break) once `max_issues` runs have started, so
+  dense eligibility examines exactly `max_issues` and a wall of ineligible head issues costs at
+  most the window in forge `GetIssue` / DB `HasActiveRunForIssue` calls. An additive constant
+  (not a multiplier) keeps per-fire cost predictable for small caps. A NULL cap stays unlimited
+  with no started ceiling, exactly as before.
+
+- **`Matched` redefined as "examined", no wire change.** `FireOutcome.Matched` now counts the
+  candidates a fire actually examined (`len(Started) + len(Skips)`), so the invariant
+  `Matched == started + skipped` still holds by construction; the value may now exceed
+  `max_issues`. The `last_fire` json tag, `apitypes.LastFire.Matched`, the web `LastFire` type,
+  and the skip-reason contract are all untouched at the wire level. Four count-*display* sites are
+  relabeled "matched N" → "examined N" (web `Schedules.tsx` collapsed cell + tally; CLI
+  `schedule get` / `run-now`); the two "matched 0" zero-candidate badges keep their wording.
+
+- **`Capped` redefined to "beyond the scan window".** Because the fetch widened, `Capped` now
+  means "more matching open issues than the scan window reached" rather than "more than
+  `max_issues`". Kept (not dropped) because the started-nothing hint still needs it; the shift is
+  documented in `docs/scheduling.md`.
+
+- **No new skip reason and no new `last_fire` field.** A skipped candidate is still flagged
+  exactly as before (the typed skip record is the flag). A silent partial-under-fill mode
+  (`0 < started < max_issues`, window exhausted by ineligible candidates) is acknowledged as a v1
+  limitation; a `scan_exhausted` fire-level signal to surface it is a possible follow-up, not
+  shipped here. SQL-side eligibility pre-filtering and a user-configurable `backfillHeadroom` are
+  likewise out of scope. Full rationale in the Decision Log of `prds/done/416-sweep-backfill-skipped-slots.md`.
+
+## 562. PRD #415 — in-app changelog / release-notes panel: a build-time bundle read from the build-info popover, synced by gates not a copy
+
+An owner-approved user-facing feature (no human.md item yet; proposed to the owner). Extends
+Feature #175's build-info popover: the version button's popover gains a **Changelog** button
+that opens a panel showing the repo's `CHANGELOG.md`, with running-version markers derived from
+the existing `GET /api/version`. Full rationale in the Decision Log of
+`prds/done/415-in-app-changelog.md`.
+
+- **Delivery is a build-time bundle, not a runtime endpoint.** The panel reads repo-root
+  `CHANGELOG.md` bundled at build time via the same `import.meta.glob(..., {query:"?raw"})`
+  mechanism the docs viewer (`web/src/lib/docs.ts`) uses — new module `web/src/lib/changelog.ts`.
+  No new API route, no runtime service, no committed second copy. `web/Dockerfile` gained
+  `COPY CHANGELOG.md /app/CHANGELOG.md` so the glob resolves inside the image build context.
+  Why: a static, versioned artifact needs no request path and cannot drift from the shipped image.
+
+- **Left-side drawer on the shared `Modal`, mounted once at `AppShell`.** `web/src/components/
+  ChangelogDrawer.tsx` is a left-side drawer built on the existing `Modal`, mounted at `AppShell`
+  level and opened from the popover's new Changelog button. Why AppShell and not inside the
+  popover: there are two `SidebarContent` mounts, so a drawer living inside the popover would be
+  double-mounted — hoisting it to the shell keeps a single instance.
+
+- **Popover close-semantics changed `onBlur`→focus-within; the `role="tooltip"` interactive-control
+  limitation is an ACCEPTED tradeoff, not an oversight.** To make an interactive control inside the
+  panel keyboard-reachable, the popover now closes on focus-leaving-the-subtree (focus-within)
+  rather than on `onBlur`. The panel keeps PRD #175's `role="tooltip"` + `aria-describedby` so the
+  build coordinates remain the version button's accessible description. Putting interactive controls
+  (the Changelog button, the PRDs link) inside a `role="tooltip"` is a known ARIA imperfection that
+  two independent reviewers flagged NON-BLOCKING (not a keyboard trap — focus flows in and out
+  correctly). Kept as-is rather than re-rolling the panel to a dialog/menu role, which would regress
+  the deliberate coordinates-as-description behavior. Recorded as an accepted limitation.
+
+- **Running-version markers derive from `GET /api/version`, guarded for non-semver; no wire/schema
+  change.** A small `X.Y.Z` comparator (`web/src/lib/semver.ts`) marks the matching release
+  "You're running this" and strictly-greater released versions "Newer", with a running-vs-latest
+  banner. A `dev`/`demo`/absent version renders a NEUTRAL panel: no markers, no banner. `[Unreleased]`
+  and `[NOT RELEASED]` sections are never marker-eligible. No new wire field, no DB/schema/migration.
+  `-rc.N` prereleases are unsupported (Model B is plain semver) — a documented limitation.
+
+- **`PRD #N` linkifies to the GitHub issue, only in rendered output; raw stays plain.** The transform
+  (`web/src/lib/changelogLinks.ts`) turns `PRD #N` into a link to `/issues/N` in rendered output
+  only — `CHANGELOG.md` keeps `PRD #N` plain and the transform does NOT touch the raw parity `body`
+  (so the parity gate below stays byte-exact). Repo base is overridable at build time via
+  `VITE_UZI_CHANGELOG_REPO_URL` (default `https://github.com/vtmocanu/uzi`) for forks.
+
+- **Sync is guaranteed by two gates, not a shared copy.** (1) A version-match check
+  (`web/scripts/check-changelog.mjs`, pure text: newest released CHANGELOG section ==
+  `Chart.yaml` version, self-skips outside a full checkout) wired into `task gate:web`. (2) A parity
+  vitest (`web/src/lib/changelog.parity.test.ts`) asserting each version's `Release.body` is
+  byte-identical to `scripts/changelog-section.sh body <ver>`. Why two: one pins the newest section
+  to the release version, the other pins every parsed section to its canonical source text.
+
+- **No CLI change.** The feature renders a repo file already visible via git/GitHub; a `uzi changelog`
+  verb is possible future scope, not built (`api/cmd/uzi/` untouched).
+
+- **CI wiring for the version-match gate is deferred to a maintainer follow-up.** The worker's git
+  token lacks `workflow` scope, so this run could not edit `.github/workflows/` to add the
+  `check-changelog.mjs` step. The parity gate already runs in CI via the existing `test:web` job.
+## 563. PRD #422 — surge upgrade: hosted-worker image version DECOUPLED from `Chart.AppVersion`, so an app-only release rolls zero workers and never kills in-flight runs
+
+Serves issue #422 — "release without killing in-flight runs": releasing the stack
+during active work must not interrupt runs or force a manual vault unlock. Reverses the
+earlier Model-B lockstep in which the hosted-worker image tag defaulted to
+`Chart.AppVersion`, so every release Recreate-rolled the whole worker fleet and hard-killed
+in-flight runs — which then requeue and strand on the vault-unlock gate (OIDC vaults do not
+auto-unlock across restart, a PRD non-goal we keep). Full rationale in the Decision Log of
+`prds/done/422-surge-upgrade.md`.
+
+- **Worker tag pinned to a CONCRETE version, independent of appVersion.** The hosted-worker
+  image tag is `workers.image.tag` (`deploy/chart/values.yaml`), a concrete pin the
+  controller-deployment template `required`-wraps
+  (`deploy/chart/templates/controller-deployment.yaml`) so an empty tag refuses to render —
+  the pin can never silently fall back to appVersion. An app-only release (api/web/db/
+  controller) renders an UNCHANGED worker spec-hash, so the controller
+  (`controller/internal/kube/materializer.go`) rolls ZERO worker pods; in-flight runs keep
+  running on the old worker, which talks to the new API unchanged. Advancing the fleet is a
+  deliberate operator step (bump `workers.image.tag`), not a side effect of releasing.
+
+- **N-1 worker↔API skew is a MAINTAINED contract, not a tolerated accident.** The worker↔API
+  protocol is additive and version-agnostic: the API never gates on the worker version and
+  requests decode leniently in our direction. This is guarded by an additive-migration check
+  and an old-worker skew LiveDB test (PRD #422 M6), so a breaking change to the wire contract
+  is caught rather than shipped.
+
+- **A deliberate worker-image roll cordons a BUSY worker instead of killing it.** Cordon state
+  is a new orthogonal `workers.draining_since` column (migration `00138_worker_draining.sql`),
+  distinct from the heartbeat-derived `workers.status`: a cordoned worker keeps heartbeating
+  and finishing its runs but claims nothing new. The controller writes cordon via a new
+  control-write endpoint (`api/internal/handler/controller_cordon.go`) and rolls the worker
+  only once idle, bounded by a configurable drain deadline (`workers.drainDeadline`, default
+  24h) with an operator force-roll override; past the deadline the run takes the unchanged
+  requeue-resume path. Drain-gate logic lives in `api/internal/workersvc/`.
+
+- **The PRD #113 upgrade badge compares against the PIN, not appVersion.** The hosted-worker
+  upgrade target is `PinnedWorkerVersion` (`api/internal/workersvc/upgrade.go`), so a worker
+  intentionally pinned behind appVersion is not flagged outdated fleet-wide.
+
+- **Non-goals respected (per the PRD):** no auto-unlock of OIDC vaults across restart; no
+  RollingUpdate/surge worker pods (RWO PVCs — Recreate stays); single-replica API assumption
+  unchanged.
+
+## 564. Issue #520 — usage-limit park defaults ON: the per-user (and schedule) default flips OFF→ON, the per-run column stays OFF
+
+Serves issue #520 ("make wait-on-limit default ON"). Reverses the original opt-in-default
+posture of PRD #35 (`prds/done/35-run-limit-retry.md`, `adr/0035-run-limit-retry.md`), where a
+run failed on a mid-run usage limit unless the user had opted in. Rationale: this is a
+single-operator self-host, and nobody should have to opt in for a run to survive a usage limit
+the account will recover from on its own. The flip is a later, deliberate user directive that sits
+in tension with Feature #35's "two opt-in scopes" wording — see the provenance note below.
+
+- **The DEFAULT flipped OFF→ON, scoped to the per-user and schedule defaults, not the per-run
+  column.** Migration `00144_wait_on_limit_default_on.sql` flips `users.wait_on_limit` column
+  DEFAULT false→true and aligns `run_schedules.wait_on_limit` DEFAULT to true (schedules were
+  already default-on at the handler, `applyCreateDefaults`, PRD #274 D1a; the migration only makes
+  the DB column agree). No creation-path Go changed: every origin resolves the per-user default via
+  `resolveWaitOnLimit` (`api/internal/workersvc/limitwait.go`), so manual `CreateRun`,
+  `CreateAutopilotRun`, `ci_fix` and `self_improve` all follow the flipped default with no per-path
+  edit (the four-writer trap §438 warned about is avoided precisely because the effective flag is
+  resolved in one Go seam, never defaulted per-path in SQL). The CLI `--wait-on-limit` stays
+  three-way and inherits the default when unset.
+
+- **`runs.wait_on_limit` column DEFAULT stays FALSE — the judge invariant is preserved.** The flip
+  is the per-user/schedule default, NOT the per-run column. Judge runs must never park (§433, PRD
+  #35 Decision 14), and stay double-guarded: `CreateJudgeRun` never stamps `wait_on_limit`, and
+  `SetRunLimitWait` carries `AND kind <> 'judge'`. Flipping the per-run column default would have
+  parked judge runs; leaving it false keeps them off.
+
+- **Existing users ARE backfilled, and it is intentionally ONE-WAY.** The migration runs
+  `UPDATE users SET wait_on_limit = true WHERE wait_on_limit = false`, so users predating the flip
+  get the new default rather than being stranded on the old one. Tradeoff, accepted for a
+  single-operator instance: this overrides any prior *deliberate* opt-out, and it cannot be undone
+  by the goose Down — Down restores only the column DEFAULT, not the data, because a backfilled
+  `true` is indistinguishable from a user-chosen `true`. Down-then-up does not round-trip a user's
+  original value; that is by design, not a migration bug.
+
+- **The resource-hold tradeoff, recorded because #520 asked for it.** A parked run keeps holding its
+  issue (board card stays In Progress) and its worker disk until the usage window reopens, instead
+  of failing fast and freeing them. Default-on trades that hold for never losing an in-flight run's
+  work to a mid-run limit — the right default when work-loss is the expensive outcome and disk is
+  cheap. Operators who want the old fail-fast behaviour opt out per user or per run (§438 toggle);
+  the retry budget cap (`RUN_LIMIT_MAX_WAITS`, default 5) still bounds how long a run may park.
+
+- **PROVENANCE / tension with `specs/human.md`.** Feature #35 in `specs/human.md` still records
+  "two opt-in scopes: a per-user default in Settings, and a per-run choice" (the PRD #35
+  requirement, opt-in-by-default). Issue #520 is a later user directive that changes that default to
+  ON. `specs/human.md` was NOT edited here — a human-contract change needs explicit user approval and
+  is being surfaced separately at the review gate. This entry records the AI/design mechanics of the
+  flip; the contract wording awaits the owner's ratification.
+
+- **Web (per issue #520):** the RunDefaults settings toggle fallback is `?? true` and the mock
+  session user is flipped on, so the UI reflects the new default rather than showing OFF for a user
+  whose stored value is unset.
+
+## 565. PRD #84 M4/M5 — plan-time inference is a DETERMINISTIC function feeding an authoritative, no-bypass approval gate; jvm is a retrofit with no new code
+
+Closes the M4/M5 half of the reservation §299 left open (M1–M3 recorded there). M4 adds
+plan-time capability/tool inference plus a plan-approval-gate block; M5 retrofits `jvm` as a
+verified routing capability and surfaces the requirement set. Richer rationale lives in PRD #84's
+Decision Log; this is the terse contract.
+
+- **Plan-time inference is a DETERMINISTIC function, not LLM prose.**
+  `agent/src/toolchain-detect.ts#detectToolchain(clonePath)` scans manifests (`go.mod`,
+  `package.json`, `pyproject.toml`/`requirements.txt`, `Cargo.toml`, `pom.xml`/`build.gradle`) +
+  docker markers (Dockerfile/compose/testcontainers) + root build/test scripts and returns
+  `{required_capabilities (server vocab {docker,jvm}), required_tools (go/node/python/rust/jvm),
+  size_class (s/m/l)}` (the `ToolchainDetection` interface). It is the tested unit; the lead may
+  narrate the toolchain but the gate acts on this structured output, never on prose.
+
+- **Persistence: two new run columns, escalation-only capability merge.** `runs.required_tools` +
+  `runs.size_class` (migration `00145_run_required_tools.sql`). `SetRunAwaitingApproval`
+  (`api/internal/store/queries/runtime.sql`) persists the inferred set on the plan report:
+  `required_capabilities` is UNION-MERGED (escalation-only — inference ADDs, never drops the M2
+  repo hint), `required_tools` is SET/replaced (the run's single authoritative inferred list),
+  `size_class` is SET. All three are ABSENT-SAFE via `COALESCE` — a nil param never wipes the
+  column (a nil `text[]` would `arr || NULL = NULL`-wipe the NOT-NULL column without it). The
+  server owns the tool vocabulary: `capability.FilterTools` (`api/internal/capability/capability.go`)
+  gates which tool names are accepted.
+
+- **The gate formula's `−provisionable` term lives ONLY in the M4 approval gate, NOT the claim
+  clause.** The claim predicate (`fn_worker_can_claim`, migration 00142, unchanged by 00145) reads
+  `required_capabilities ⊆ worker_effective_caps` with NO subtraction —
+  `required_capabilities` is non-provisionable by construction. The approval-gate residual is
+  `unmet = required_capabilities − worker_effective_caps` and is capability-only. `size_class` is
+  SOFT (advisory, never blocks); `required_tools` are provisionable (surfaced as "will provision",
+  never a block).
+
+- **The approval gate is AUTHORITATIVE and has no bypass.** `capabilityGate`
+  (`api/internal/workersvc/service.go`) is enforced inside `SubmitInput` for EVERY approve_plan —
+  both the selection-bearing and the nil-selection path — using the SAME effective-caps fold as
+  `fn_worker_can_claim` (`capabilities ∪ {docker if docker_enabled}`), so approve and claim can
+  never disagree. It fails CLOSED: no owning worker → empty caps → every requirement unmet; a
+  worker-load error PROPAGATES (never opens the gate). Gated by
+  `settings.KeyCapabilityAwareScheduling` (default ON, same kill-switch as M2); OFF ⇒ no block and
+  the system degrades to the old mid-run failure.
+
+- **The user override (Decision 12) is the ONLY user removal of a requirement.**
+  `override_capabilities` on approve clears the run's `required_capabilities`
+  (`ClearRunRequiredCapabilities`, scoped owner + `awaiting_approval`) and proceeds. Inference can
+  only ADD; this is the sole path that REMOVES. It bypasses no security boundary — the §300
+  guardrail still denies docker USE on a daemon-less worker, so the override changes scheduling
+  preference, not containment.
+
+- **M5 jvm retrofit is verification, not new code.** `jvm` was already a matched capability via the
+  M1 `template→caps` map (`{jvm}→{jvm}`, `api/internal/capability/capability.go`). M5 confirmed the
+  claim routing with the live-DB `api/internal/store/claim_capability_integration_test.go` jvm case
+  (a base worker is fenced, a jvm worker claims). No new production code shipped for the routing
+  itself.
+
+- **Surfacing.** The run DTO (`api/internal/apitypes/run.go`) carries
+  `required_capabilities`/`required_tools`/`size_class`; the web plan-gate readiness summary renders
+  them with an override button; the CLI (`api/cmd/uzi/run.go`, `uzi run get`) shows them in its rows.
+
+## 566. PRD #517 — interactive, long-lived task runs: opt-in park at a new `awaiting_followup`, `run stop` wind-down, worker-side idle backstop
+
+Extends PRD #400's `task` kind with an opt-in conversational mode: a task marked
+`--interactive` does NOT terminate on a clean `signal_done` — it parks in-process at a NEW
+non-terminal status and resumes the SAME SDK session on the next `uzi run follow-up`,
+iterating until `uzi run stop` winds it down to `completed`. Serves human.md's interactive-run
+requirement; the `main`-never-touched invariant and the `task` guardrails are unchanged. Full
+rationale in the Decision Log of `prds/done/517-interactive-task-runs.md`. <!-- check-docs:ignore-path: PRD is being moved to prds/done/ this milestone; cite the destination path -->
+
+
+- **`runs.interactive`, threaded like `open_mr`.** A `boolean NOT NULL DEFAULT false` column
+  (migration `00146`), false for every existing and non-interactive run, riding create→row→claim
+  exactly as PRD #400's `open_mr` does — a plain bool that re-delivers unchanged on every claim
+  (`--interactive` on `uzi handoff`). `--interactive --then-fix` is REJECTED at the CLI (exit 2,
+  `ExitUsage`): `--then-fix` winds a run down into a chained review+fix while `--interactive`
+  keeps it alive, so they are mutually exclusive rather than silently reconciled.
+
+- **A NEW non-terminal status `awaiting_followup`, not a reuse.** `00146` widens
+  `runs_status_check` to a tenth value (verbatim carry of the live nine from `00092`, the
+  drop+re-add discipline). It is deliberately distinct: `awaiting_input` means "answer a
+  question" and fails on timeout, and staying `running` would hide the park — a user-visible
+  "your turn" park is the feature. `SetRunAwaitingFollowup` is a sibling of
+  `SetRunAwaitingInput`/limit_wait (same PRD #47 exit contract, same load-bearing health clear)
+  but takes NO `open_question_id`: the park is not gated on a question, it resumes on a consumed
+  `follow_up`. The worker-side kind/interactive guard lives in `SetState`, so the park is
+  accepted only for an interactive task run.
+
+- **The full SQL status-set placement of `awaiting_followup`** (each decided on the merits, not
+  reflexively): added to the recovery IN-lists (both the register-time orphan sweeps and the
+  stale-heartbeat `RequeueRunsOfStaleWorkers`), the concurrency/load reads, and the credential
+  in-flight counter (`anthropic_rate_limits.sql`); EXCLUDED from autostop (SQL backstop in
+  `RejectRunServerSide`'s sibling, since the park's message writes have stopped, not looped) and
+  from `SweepRunningTimeout`; kept OUT of `terminalStatuses` (`workersvc/service.go`). A
+  Decision-7 WAKE GUARD on `SetRunRunning`: the `awaiting_followup`→`running` transition is
+  admitted only when a CONSUMED `follow_up` input exists, as a third independent clause beside
+  the `answer` gate — so a stale/duplicate pre-park `running` report cannot un-park an idle task
+  and re-arm the wall clock. It is now keyed on a per-park identity (issue #552): `runs.open_followup_id`,
+  a watermark of the highest already-CONSUMED `follow_up` id, recomputed at each park by
+  `SetRunAwaitingFollowup`, so the wake requires a consumed `follow_up` NEWER than the watermark —
+  a stale pre-park `running` report on a run that has already iterated (cycle ≥2) can no longer un-park
+  an idle run. The worker completes the identity: the `awaiting_followup` report (which stamps the
+  watermark) is emitted ONLY when the run is genuinely going idle — `RunRunner.awaitFollowUp` first
+  checks `SteeringChannel.hasPendingFollowUpOutcome()` and, when a follow-up (or stop/cancel) arrived
+  MID-TURN and is already buffered, SKIPS the park report and services that outcome directly. Without
+  that skip the mid-turn follow-up would be folded into its own park's watermark (it is consumed but
+  not yet applied), so `MAX(consumed follow_up id)` at the park equals the last APPLIED follow-up and
+  the buffered one is genuinely newer.
+
+- **`run stop` = a new `stop` steering-input kind, not a cancel.** Owner-scoped via `SubmitInput`,
+  written by `CreateStopVerdictInput` which stamps `stop_kind='stopped'` in the SAME statement as
+  the input (PRD #33 atomicity), a fourth `stop_kind` value that folds in with the human stops
+  (`cancelled`/`plan_rejected`), NOT with `auto_stopped`. Unlike `cancel`, stop finalizes
+  GRACEFULLY: the worker pushes, opens an MR iff `open_mr`, and reports `completed`; `stop_kind`
+  survives the `SetRunCompleted` transition. `--review` then composes via that completed
+  transition. The `stop` kind is a distinct SQL enum value (`run_user_inputs.kind`, `00146`) — a
+  genuinely new kind here, safe because the interactive worker is new code that recognises it
+  (contrast auto-stop, which reused `cancel` to stay safe on the older fleet). A graceful stop now
+  survives a worker crash (issue #552 M3): the durable `stop_kind='stopped'` fact is re-delivered on
+  every claim as `stop_pending` (derived server-side from the run row, the OpenQuestionID
+  claim-redelivery precedent), so a resumed worker seeds `stopRequested` and winds the park down
+  immediately instead of re-parking at `awaiting_followup` and completing only on the idle timeout.
+
+- **Worker follow-up waiter: `awaitFollowUp` on the task-lane `SteeringChannel`.** A blocking
+  wait with route-then-service / drain-after-arm discipline (no lost wakeup): a follow-up/stop/
+  cancel that arrived before the executor armed the waiter is buffered and delivered on arm.
+  `serviceFollowUp` precedence is cancelled → stop → buffered follow-up → idle. CRITICALLY, the
+  park's idle clock is evaluated on EVERY poll tick even when `getInputs` fails: `serviceFollowUp`
+  is called OUTSIDE the fetch `try` (it operates purely on in-memory state), so a persistent
+  run-scoped input-fetch outage cannot strand the park as a heartbeat-invisible zombie.
+
+- **Checkpoint-push at every park.** On each `signal_done` park the worker best-effort
+  checkpoint-pushes the branch tip (reap-then-git) before blocking, so a dead-worker recovery is
+  a requeue-and-resume, not commit loss. Best-effort by design (PRD Decision 4: "a park that
+  fails is worse than a park that loses work") — the park proceeds even if the push failed, with
+  the worker PVC and a later re-push as backstops.
+
+- **Idle timeout (M5): worker-side is primary; NO separate server park-age sweep.** The primary
+  backstop is `WORKER_TASK_IDLE_TIMEOUT` (default 30m, `parseDuration` in api config), delivered
+  on the claim as `task_idle_timeout_seconds` and consumed by the worker's `awaitFollowUp` (with
+  a compiled fallback for an older server) → graceful finalize → `completed`. The server-side
+  "requeue a dead-worker park" backstop is the EXISTING `RequeueRunsOfStaleWorkers` (park added
+  to its IN-list), NOT a new park-age `TASK_IDLE_TIMEOUT` sweep — that separate sweep was
+  deliberately NOT built: redundant for a dead worker (the stale-worker requeue already covers
+  it) and unsafe for a live-but-stuck worker (it would race a second worker onto the same run).
+
+- **Wall-clock exemption.** Interactive runs are exempted from `SweepRunningTimeout` on their
+  KIND (`interactive = false` filter), covering both the park (already `status <> 'running'`) and
+  the resumed `running` state. `started_at` is stamped once and never reset, so a legitimately
+  resumed long-lived session would sit past `RUN_TIMEOUT` and be wall-clock-killed on the first
+  tick — the exact use case the feature exists for. Interactive runs are user-paced like chat and
+  are bounded instead by the M5 idle timeout, so the exemption must live on kind, not status.
+
+## 567. PRD #337 — connect-form base-URL ⇄ forge-type sync + a reusable reveal-token input
+
+Frontend-only UX polish on Settings → Forge → connect. Richer rationale lives in PRD #337's
+Decision Log (D1–D9); this is the terse contract.
+
+- **Two-way, host-inferred, recognized-only sync.** The base-URL `<Select>` and the forge-type
+  `<Select>` are kept consistent in BOTH directions on user change, but ONLY for recognized hosts.
+  *This changes the connect form's prior stance*, recorded as the code comment that read `Base URL
+  and type are independent choices (D11a): a mismatch is caught by VerifyToken` (in `ForgeSettings.tsx`,
+  reworded by M2's fix-the-doc): the form now keeps the pair consistent and VerifyToken is the backstop,
+  not the first line of defense. This refines — it does not contradict — §296's connect-picker design,
+  where the forge-type pick was an independent choice reconciled by save-time scope/version validation.
+- **Recognition lives in `web/src/lib/forgeInfer.ts`** (a sibling to `forgeNoun.ts`, kept separate so
+  forgeNoun's "exactly one GitLab-noun literal" acceptance test stays clean — D2).
+  `inferForgeType(baseUrl, forgeTypes)` parses the host, does a case-insensitive substring match
+  (`github`/`gitlab`/`forgejo`) plus a tiny alias map (`codeberg.org`/`*.codeberg.org` → forgejo), and
+  returns the type ONLY if it is advertised in `forgeTypes` (the D4 guard — inference can never select
+  a forge the instance did not enable). Unrecognized host → `null` ("user chooses").
+- **Direction rules.** URL→type switches the type when the inferred type is recognized, advertised,
+  and different. type→URL moves the URL only when the CURRENT host is a recognized forge of a
+  different type AND `defaultUrlForType(type, allowedUrls)` returns a recognized target; when it
+  returns `null` (the chosen type has no recognized allowlist URL — e.g. a self-hosted
+  `git.example.com`), KEEP the current URL rather than blank or mis-set it (D8). An
+  unrecognized/self-hosted host is left under full manual control in both directions (D4/D5). *Why:*
+  sync fires on user change events only, never on mount (D5), so the landing pair is byte-identical to
+  before this change.
+- **Frontend-only, no backend touch.** No API/DB/worker change; `createConnection(baseUrl, token,
+  forgeType)` still carries all three values and VerifyToken is unchanged. The auto-changed field gets
+  a cosmetic CSS-only highlight (D9) that carries no behavioral assertion.
+- **Reusable `PasswordInput`** (`web/src/components/ui.tsx`) with `EyeIcon`/`EyeOffIcon`
+  (`icons.tsx`): a masked secret input with a reveal (eye) toggle. Masked by default; the toggle is
+  `type="button"` (never submits), carries a toggling `aria-label`/`aria-pressed` and a visible focus
+  ring, and forwards `id` to the inner input so a `Field htmlFor` associates the label with the input,
+  not the composite. *Why the re-mask:* a `useEffect` re-masks when the value is externally cleared
+  (D7 leak guard) — a revealed field must not display the NEXT pasted token in clear. Applied to the
+  forge PAT field now; rolling it out to the other six `type="password"` sites is a deliberate
+  out-of-scope follow-up (D6). This is client-only and does NOT touch the secretbox no-reveal
+  invariant, which governs STORED tokens (D7) — there is still no reveal endpoint.
+
+## 568. PRD #534 — GitHub Projects sync web UI: the deferred surface, plus a split authorization (instance kill-switch stays admin, per-repo writes go owner-or-admin)
+
+Builds the web UI that PRD #364 D10 deferred and splits the feature's authorization along its
+two axes. No new SQL/migration/forge code — purely a routing/auth relocation plus web wiring
+over PRD #364's existing service. Richer rationale in PRD #534's / #364's Decision Logs; this is
+the terse contract.
+
+- **Instance kill-switch keeps its admin-only shape.** `github_project_sync_enabled` (settings key
+  `KeyGithubProjectSyncEnabled`, default `false`) gets a toggle card in Admin → Instance settings
+  (`web/src/pages/AdminSettings.tsx#GithubProjectSyncCard`, sends only its own key on save). It is
+  the whole-instance master gate and stays ADMIN-only via the unchanged `PUT /api/admin/settings`.
+  A GitHub-only feature; GitLab/Forgejo repos are untouched.
+
+- **The four per-repo routes RELOCATED out of `/admin`, re-authorized OWNER-OR-ADMIN.** GET status,
+  POST adopt, POST `…/provision`, DELETE disable now mount under the per-repo
+  `/repos/{id}/github-project-sync*` `RequireAuth` group instead of the admin group (was admin-only
+  under PRD #364). The change is auth scope + mount point only; the handler bodies
+  (`api/internal/handler/admin_github_project_sync.go`, file name unchanged) are the same code.
+
+- **Member path forks on `user.IsAdmin`, existence-hiding 404, never 403.** A non-admin caller runs
+  a `GetRepoForUser(id, user.ID)` preflight first and gets a 404 ("repo not found") on `pgx.ErrNoRows`
+  — the same existence-hiding owner-scoping precedent as `PatchRepo`/`DeleteRepo`, deliberately not a
+  403 that would confirm the repo exists. An admin SKIPS the preflight and can target any repo. The
+  preflight ALONE authorizes: the service (`forgesvc.ProjectSyncService`) resolves the connection,
+  token, and project link from the `repoID` internally, so no further ownership check is needed
+  downstream.
+
+- **The instance flag gates the two forge-writing entry points — adopt and provision — not all
+  four.** Only `Adopt` and `Provision` route through `projectSyncPreamble` (`forgesvc/projectsync.go`),
+  which returns `forgesvc.ErrProjectSyncDisabled` when the master toggle is off; that maps to 409 in
+  `writeProjectSyncError`. `Disable` and `ProjectSyncStatus` deliberately do NOT check the flag — they
+  touch only uzi's own local link rows (teardown / read), so tearing down or viewing an existing link
+  stays reachable while the feature is off. The flag is orthogonal to and layered under the per-repo
+  owner-or-admin check.
+
+- **Web-only; the CLI is deliberately excluded.** These are state-changing writes that require the
+  browser's cookie + CSRF posture, whereas the CLI authenticates with a `uzc_` bearer token — and
+  `RequireUser` forces `IsAdmin=false` for CLI tokens, so an owner-or-admin path could not grant a
+  CLI caller the admin arm anyway. Repos-page UI lives in `web/src/pages/Repos.tsx` (per-repo sync
+  panel: adopt / provision / disable / status).
+
+## 569. PRD #557 — GitHub Projects sync board visibility + write-only collaborator sharing (github-only follow-up over #534's panel)
+
+Adds a **Board access** section to #534's linked-board panel: a visibility toggle and
+write-only Reader sharing, both github-only and reusing #534's owner-or-admin
+authorization. No change to provision/adopt/disable, the poller, or reverse sync.
+Terse contract; richer rationale is in PRD #557's Decision Log.
+
+- **Four github-only driver methods on `ProjectBoardSyncer`** (`api/internal/forge/projectsync.go`):
+  `GetProjectV2Visibility`/`SetProjectV2Visibility` round-trip `ProjectV2.public` via
+  `node(id){...on ProjectV2{public}}` / `updateProjectV2`; `SetProjectV2Collaborator`
+  sets `RoleReaderCollaborator`/`RoleNoneCollaborator` (`READER`/`NONE`) via
+  `updateProjectV2Collaborators`; `ResolveUserNodeID` resolves `user(login){id}`. All
+  four live on the optional capability interface, not the neutral `Forge` interface,
+  so `gitlab.go`/`forgejo.go` and the six `Forge` fakes are untouched — only the two
+  test *syncer* fakes gained stubs.
+- **Typed not-found, not a string match.** `graphqlDo` (`api/internal/forge/github.go`)
+  now captures the GraphQL error envelope's `type` field and, only when it is
+  `NOT_FOUND`, wraps the redacted error with `forge.ErrGitHubUserNotFound` (`errors.Is`-able);
+  every other GraphQL error stays a plain redacted error, unchanged for existing
+  callers. `ResolveUserNodeID` is the only caller that inspects it.
+- **The not-found mapping is scoped to the resolve step, not the whole surface.**
+  `forgesvc/projectsync.go`'s `ShareWithUser`/`Unshare` translate
+  `forge.ErrGitHubUserNotFound` → the new sentinel `ErrProjectSyncUserNotFound` (422 via
+  `writeProjectSyncError`) only around the username→node-id resolve call.
+  `GetVisibility`/`SetVisibility` share the same preamble and link-row read but never
+  touch that translation, so a stale/bad board node id on the visibility path still
+  surfaces as a generic 500, never a false "user not found" 422.
+- **Four service methods** (`forgesvc/projectsync.go`): `GetVisibility`, `SetVisibility`,
+  `ShareWithUser`, `Unshare` — each through the existing `projectSyncPreamble` (instance
+  flag + GitHub-only + `ProjectBoardSyncer` assertion + scope check) and the link row's
+  `ProjectNodeID` (`GetGithubProjectLinkByRepo`), reusing #364/#534's plumbing rather than
+  adding new preflight logic.
+- **Four routes**, all on #534's per-repo `RequireAuth` owner-or-admin group
+  (`api/internal/handler/handler.go`): `GET`/`PUT /repos/{id}/github-project-sync/visibility`
+  (`{"public": bool}` in/out) and `POST`/`DELETE /repos/{id}/github-project-sync/collaborators`
+  (`{"username": string}`, grant/revoke Reader, 204). Same owner-or-admin preflight,
+  existence-hiding 404, and instance-flag gate as #534's four routes;
+  `writeProjectSyncError` is extended for the new 422. Role is fixed to Reader in v1 —
+  the request shape has no `role` field, deliberately leaving room to add one later
+  without a breaking change.
+- **Write-only sharing is API-forced, not a design preference (D2).** `ProjectV2`
+  exposes no collaborators connection in GitHub's GraphQL schema, so uzi cannot render
+  an authoritative current-collaborator list at all. The web panel shows only
+  session-granted usernames plus an explicit note, rather than a uzi-owned
+  collaborator side-table — no new migration, no source-of-truth drift to maintain.
+- **Web-only; CLI stays excluded**, same reasoning as #534 (`RequireAuth` needs cookie +
+  CSRF; a CLI bearer token cannot carry either, and `RequireUser` forces
+  `IsAdmin=false` for CLI tokens regardless).
+- **No automated live-forge test in scope.** Every Go test drives a fake syncer or an
+  httptest GraphQL server; nothing exercises the real `updateProjectV2` /
+  `updateProjectV2Collaborators` / `node(...ProjectV2{public})` calls against GitHub, so
+  the GraphQL field/enum facts this design rests on are unverified by any gate — a
+  manual smoke test against a throwaway project is recommended before relying on this
+  in production.

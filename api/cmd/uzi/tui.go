@@ -7,6 +7,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/colorprofile"
 	"github.com/spf13/cobra"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -30,6 +31,12 @@ import (
 // disproportionate.
 var boardPollInterval = 2 * time.Second
 
+// rateLimitPollInterval is the strip's own cadence: re-fetch the per-token meters and
+// settings on ~60s, matching the web sidebar's useMyRateLimits(60_000). The server
+// recomputes meters only every ~5m (UZI_USAGE_POLL_INTERVAL), so polling faster
+// re-serves the same value. A var (not const) so a test can shrink it.
+var rateLimitPollInterval = 60 * time.Second
+
 // tuiView is which screen has focus.
 type tuiView int
 
@@ -47,6 +54,32 @@ type boardRunsMsg struct {
 }
 
 type boardTickMsg struct{}
+
+// stripTickMsg fires on the 60s rateLimitPollInterval to refresh the rate-limit strip's
+// meters + settings, independently of the 2s boardTickMsg runs cadence.
+type stripTickMsg struct{}
+
+// secretsMsg carries the viewer's Anthropic token count (from ListSecrets), fetched once
+// at Init to gate the board credential column on PRD #295's more-than-one-token rule.
+type secretsMsg struct {
+	count int
+	err   error
+}
+
+// rateLimitsMsg carries the viewer's own per-token rate-limit meters (from SelfRateLimits),
+// which drive the factory-floor rate-limit strip. Fetched at Init, on the 60s strip ticker
+// (stripTickMsg), and on manual refresh.
+type rateLimitsMsg struct {
+	tokens []apitypes.TokenRateLimitDTO
+	err    error
+}
+
+// settingsMsg carries the viewer's own non-secret settings (from GetMySettings); only
+// SidebarTokenIds is used, to mirror the web sidebar's non-default-token selection.
+type settingsMsg struct {
+	settings apitypes.UserSettingsDTO
+	err      error
+}
 
 type detailLoadedMsg struct {
 	run  apitypes.RunDTO
@@ -75,6 +108,17 @@ type streamEventsMsg struct {
 // view falls back to the same 2s REST poll `uzi run logs --follow` uses.
 type pollFallbackMsg struct{}
 
+// detailMetaMsg carries a fresh run DTO for the drilled-in run, so the detail view's
+// non-streamed fields (milestones, health, kind, title, duration) stay current while the
+// live socket is connected. The socket only carries transcript frames and status, so
+// without this the milestone checklist is frozen at open-time — the board badge polls, the
+// detail did not.
+type detailMetaMsg struct {
+	runID string
+	run   apitypes.RunDTO
+	err   error
+}
+
 // ---- model ----------------------------------------------------------------
 
 type tuiModel struct {
@@ -90,20 +134,45 @@ type tuiModel struct {
 	board  boardState
 	detail detailState
 
-	// quitting is the confirm modal (both q and ctrl+c route through it); ctrlCSeen
-	// makes a second ctrl+c quit immediately, which is the escape hatch a user reaches
-	// for when the modal itself is what is wrong.
+	// quitting is the ctrl+c confirm modal (q quits immediately and does NOT route through
+	// it); ctrlCSeen makes a second ctrl+c quit immediately, which is the escape hatch a user
+	// reaches for when the modal itself is what is wrong.
 	quitting  bool
 	ctrlCSeen bool
 	showHelp  bool
+
+	// tokenCount is how many Anthropic tokens the viewer holds (from ListSecrets, fetched
+	// once at Init). It gates the board's credential column exactly as the web RunsList
+	// does (PRD #295): the own board shows WHICH token a run spent only when there is more
+	// than one to disambiguate. 0 until the probe returns, so the column stays hidden until
+	// then rather than flashing in.
+	tokenCount int
+
+	// profile is the terminal's colour profile (tea.ColorProfileMsg, set at program
+	// start). It gates OSC-8 hyperlink emission: links are emitted only at ANSI or
+	// richer, so a NO_COLOR/Ascii terminal gets plain #<iid> text (the colorprofile
+	// Writer strips SGR under Ascii but passes OSC-8 through unchanged, so links must
+	// self-gate). Defaults to TrueColor so the first frame and untouched test models
+	// emit links, mirroring the dark:true default.
+	profile colorprofile.Profile
+
+	// rateLimits and sidebarTokenIds drive the factory-floor rate-limit strip
+	// (mirrors the web sidebar selection: default token + sidebar_token_ids,
+	// status=="ok"). Fetched at Init, on the 60s strip ticker (stripTickMsg), and on
+	// manual refresh (r) — NOT on the 2s board tick: a meter changes at most once per
+	// ~5m server poll, so 60s already re-serves the same value and the 2s runs cadence
+	// would only multiply the API load. A fetch failure is swallowed: the strip just hides.
+	rateLimits      []apitypes.TokenRateLimitDTO
+	sidebarTokenIds []string
 }
 
 func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel {
 	m := tuiModel{
 		client: c, ctx: ctx,
 		width: 100, height: 30, dark: true,
-		pal:  newPalette(true),
-		view: viewBoard,
+		profile: colorprofile.TrueColor,
+		pal:     newPalette(true),
+		view:    viewBoard,
 	}
 	m.renderer, _ = newTUIRenderer(m.width, m.dark)
 	m.board = newBoardState()
@@ -115,7 +184,8 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 }
 
 func (m tuiModel) Init() tea.Cmd {
-	cmds := []tea.Cmd{m.fetchRunsCmd(m.board.admin), tickCmd()}
+	cmds := []tea.Cmd{m.fetchRunsCmd(m.board.admin), m.fetchSecretsCmd(),
+		m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), tickCmd(), stripTickCmd()}
 	if m.view == viewDetail {
 		cmds = append(cmds, m.loadDetailCmd(m.detail.runID), m.openStreamCmd(m.detail.runID))
 	}
@@ -124,6 +194,10 @@ func (m tuiModel) Init() tea.Cmd {
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(boardPollInterval, func(time.Time) tea.Msg { return boardTickMsg{} })
+}
+
+func stripTickCmd() tea.Cmd {
+	return tea.Tick(rateLimitPollInterval, func(time.Time) tea.Msg { return stripTickMsg{} })
 }
 
 func (m tuiModel) fetchRunsCmd(admin bool) tea.Cmd {
@@ -140,6 +214,38 @@ func (m tuiModel) fetchRunsCmd(admin bool) tea.Cmd {
 	}
 }
 
+// fetchSecretsCmd reads the viewer's Anthropic tokens once so the board can gate the
+// credential column on holding more than one (PRD #295). A failure is swallowed — the
+// column just stays hidden, and never blocks the board.
+func (m tuiModel) fetchSecretsCmd() tea.Cmd {
+	c, ctx := m.client, m.ctx
+	return func() tea.Msg {
+		secrets, err := c.ListSecrets(ctx)
+		return secretsMsg{count: len(secrets), err: err}
+	}
+}
+
+// fetchRateLimitsCmd reads the viewer's own per-token rate-limit meters so the board can
+// draw the factory-floor rate-limit strip. A failure is swallowed — the strip just hides,
+// and never blocks the board.
+func (m tuiModel) fetchRateLimitsCmd() tea.Cmd {
+	c, ctx := m.client, m.ctx
+	return func() tea.Msg {
+		tokens, err := c.SelfRateLimits(ctx)
+		return rateLimitsMsg{tokens: tokens, err: err}
+	}
+}
+
+// fetchSettingsCmd reads the viewer's own settings so the strip mirrors the web sidebar's
+// non-default-token selection (sidebar_token_ids). Swallowed on failure like the meters.
+func (m tuiModel) fetchSettingsCmd() tea.Cmd {
+	c, ctx := m.client, m.ctx
+	return func() tea.Msg {
+		s, err := c.GetMySettings(ctx)
+		return settingsMsg{settings: s, err: err}
+	}
+}
+
 func (m tuiModel) loadDetailCmd(runID string) tea.Cmd {
 	c, ctx := m.client, m.ctx
 	return func() tea.Msg {
@@ -149,6 +255,17 @@ func (m tuiModel) loadDetailCmd(runID string) tea.Cmd {
 		}
 		msgs, err := c.RunLogs(ctx, runID, 0)
 		return detailLoadedMsg{run: run, msgs: msgs, err: err}
+	}
+}
+
+// refreshRunMetaCmd re-reads only the run DTO (no transcript replay), so the periodic
+// detail refresh is cheap: the socket already carries the frames, this just refreshes the
+// milestone / health / duration fields the stream does not send.
+func (m tuiModel) refreshRunMetaCmd(runID string) tea.Cmd {
+	c, ctx := m.client, m.ctx
+	return func() tea.Msg {
+		run, err := c.GetRun(ctx, runID)
+		return detailMetaMsg{runID: runID, run: run, err: err}
 	}
 }
 
@@ -205,6 +322,10 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.renderer, _ = newTUIRenderer(m.transcriptWidth(), m.dark)
 		return m, nil
 
+	case tea.ColorProfileMsg:
+		m.profile = msg.Profile
+		return m, nil
+
 	case tea.KeyPressMsg:
 		return m.handleKey(keyString(msg))
 
@@ -212,16 +333,55 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.quitting {
 			return m, tickCmd()
 		}
-		return m, tea.Batch(m.fetchRunsCmd(m.board.admin), tickCmd())
+		cmds := []tea.Cmd{m.fetchRunsCmd(m.board.admin), tickCmd()}
+		// Keep the drilled-in run's non-streamed fields (milestones, health, duration) fresh
+		// on the same 2s cadence the board polls at: the live socket carries transcript frames
+		// and status only. Skipped while the D8 fallback (pollFallbackMsg) is already reloading
+		// the whole DTO every 2s, so the two never double up.
+		if m.view == viewDetail && !m.detail.polling && m.detail.run.ID != "" {
+			cmds = append(cmds, m.refreshRunMetaCmd(m.detail.runID))
+		}
+		return m, tea.Batch(cmds...)
+
+	case stripTickMsg:
+		if m.quitting {
+			return m, stripTickCmd()
+		}
+		return m, tea.Batch(m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), stripTickCmd())
 
 	case boardRunsMsg:
 		m.board.apply(msg)
+		return m, nil
+
+	case secretsMsg:
+		if msg.err == nil {
+			m.tokenCount = msg.count
+		}
+		return m, nil
+
+	case rateLimitsMsg:
+		if msg.err == nil {
+			m.rateLimits = msg.tokens
+		}
+		return m, nil
+
+	case settingsMsg:
+		if msg.err == nil {
+			m.sidebarTokenIds = msg.settings.SidebarTokenIds
+		}
 		return m, nil
 
 	case detailLoadedMsg:
 		m.detail.applyLoaded(msg)
 		// The ownership probe rides the same call the queue indicator needs.
 		return m, m.fetchInputsCmd(m.detail.runID)
+
+	case detailMetaMsg:
+		if msg.runID != m.detail.runID || msg.err != nil {
+			return m, nil
+		}
+		m.detail.applyMeta(msg.run)
+		return m, nil
 
 	case runInputsMsg:
 		if msg.runID != m.detail.runID {
@@ -320,9 +480,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m tuiModel) handleKey(k string) (tea.Model, tea.Cmd) {
-	// Quit routes through a confirm modal for BOTH q and ctrl+c, so a stray keystroke
-	// cannot drop a watched run. A second ctrl+c quits at once — the escape hatch for
-	// when the modal is what is broken.
+	// q quits immediately (user preference). ctrl+c still routes through a confirm modal so a
+	// stray ctrl+c cannot drop a watched run; a second ctrl+c quits at once.
 	if k == keyCtrlC {
 		if m.ctrlCSeen || m.quitting {
 			return m, tea.Quit
@@ -345,8 +504,7 @@ func (m tuiModel) handleKey(k string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if k == keyQuit && !m.filtering() {
-		m.quitting = true
-		return m, nil
+		return m, tea.Quit
 	}
 	if k == keyHelp && !m.filtering() {
 		m.showHelp = true

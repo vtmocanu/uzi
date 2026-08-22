@@ -56,6 +56,7 @@ func (j judgeSwitch) JudgeEnforceAll(context.Context) (bool, error)     { return
 func (j judgeSwitch) JudgeCooldownSeconds(context.Context) (int, error) { return 0, nil }
 func (j judgeSwitch) JudgeDailyBudget(context.Context) (int, error)     { return 0, nil }
 func (j judgeSwitch) JudgeModel(context.Context) (string, error)        { return "", nil }
+func (j judgeSwitch) SummaryModel(context.Context) (string, error)      { return "", nil }
 func (j judgeSwitch) PRDLabel(context.Context) (string, error)          { return "", nil }
 func (j judgeSwitch) RunEligibleLabels(context.Context) ([]string, error) {
 	return nil, nil

@@ -22,6 +22,7 @@ import { api, ApiError, isTerminalRun, type AdminWorker, type RunListItem, type 
 import { Alert, Badge, Card, EmptyState, Input, ListSkeleton, PageHeader, SectionTitle, StatusPill, cx } from "../components/ui";
 import { ActivityIcon } from "../components/icons";
 import { MrChip } from "../components/MrChip";
+import { RunIssueRef } from "../components/RunIssueRef";
 import { mrAbbrev } from "../lib/forgeNoun";
 import { effectiveRunStatus, isStoppedRun, milestoneBadge, milestoneBadgeText, mrChipState } from "../lib/runBadge";
 import { RunPriorityBadge } from "../components/RunPriorityBadge";
@@ -36,6 +37,7 @@ import { RunCredential } from "../components/RunCredential";
 import { stripUnsafeChars } from "../lib/safeText";
 import { formatUptimeSince } from "../lib/formatUptimeSince";
 import { anthropicTokenCount } from "../lib/hasToken";
+import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { lanePaging } from "../lib/boardColumns";
 import { groupRuns, runMatchesQuery } from "../lib/runGroups";
 
@@ -56,8 +58,17 @@ function pastAnchor(r: RunListItem): string {
   return r.finished_at ?? r.updated_at;
 }
 
-function sortPast(a: RunListItem, b: RunListItem): number {
-  const t = pastAnchor(b).localeCompare(pastAnchor(a));
+// pastInstant parses the anchor to an epoch-ms instant. Date.parse and NOT a string
+// compare: Go trims trailing zeros from the fractional seconds, so same-second stamps
+// of differing precision ("…:00Z" vs "…:00.5Z") order correctly as instants and
+// INCORRECTLY as strings (see lib/boardOrder.ts's timeKey).
+function pastInstant(r: RunListItem): number {
+  const t = Date.parse(pastAnchor(r));
+  return Number.isNaN(t) ? -Infinity : t;
+}
+
+export function sortPast(a: RunListItem, b: RunListItem): number {
+  const t = pastInstant(b) - pastInstant(a);
   if (t !== 0) return t;
   return (PAST_STATUS_RANK[a.status] ?? 3) - (PAST_STATUS_RANK[b.status] ?? 3);
 }
@@ -79,7 +90,8 @@ interface RunsData {
   tokenCount: number;
   // PRD #320 M6: re-run the layout's one runs fetch, so an Expedite/undo on a queued
   // row can refresh the priority pill + queue ordering the way RunView's refreshRun
-  // does — the list otherwise loads once with no poll.
+  // does — on top of the 10s visibility-gated background poll (PRD #518) that keeps
+  // the list live without a manual reload.
   reload: () => void;
 }
 
@@ -132,6 +144,24 @@ export function RunsLayout() {
       alive = false;
     };
   }, [load]);
+
+  // Liveness (PRD #518): re-fetch only the volatile runs list every 10s while the
+  // tab is visible (catching up immediately on focus), so runs moving queued →
+  // running → completed/failed, and new runs appearing, show without a manual
+  // browser refresh — matching Board and Dashboard. A transient poll failure keeps
+  // the last-good rows: unlike the first load, this swallows its error and never
+  // routes through setError/setLoading, so a blip cannot re-flash the skeleton or
+  // pop an error banner. The credential-badge secrets/tokenCount stay mount-only
+  // (they change rarely), so the poll re-fetches api.listRuns() alone.
+  const poll = useCallback(async () => {
+    try {
+      const { runs } = await api.listRuns();
+      setRuns(runs);
+    } catch {
+      // keep the last-good list
+    }
+  }, []);
+  usePollWhileVisible(poll, 10000);
 
   const pastCount = loading ? null : runs.filter((r) => isTerminalRun(r.status)).length;
   const tabs = [
@@ -236,11 +266,27 @@ function RunRow({
     }
   };
   return (
-    <li>
+    // Issue #485 NB1: RunIssueRef and the Expedite control are real interactive elements,
+    // so they can no longer nest inside the card's navigational <Link> (an <a>; a nested
+    // <a> is invalid HTML). The <li> is a `group relative` container, the run-details
+    // <Link> is a stretched absolute overlay, and the card content sits in normal flow
+    // with each genuinely-interactive descendant raised above the overlay (relative
+    // z-10). The card's hover border/bg live on the content layer via group-hover so the
+    // transparent overlay never paints over the content.
+    <li className="group relative">
       <Link
         to={`/runs/${run.id}`}
-        className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 transition-colors hover:border-edge-strong hover:bg-raised/70"
-      >
+        // Issue #485 review FIX 2: name the link by the run's visible title so multiple
+        // issue-less runs (task/ci_fix/chat/self-improve, all "Open run" otherwise) get
+        // distinct, meaningful accessible names — the title now sits under the overlay
+        // and no longer contributes to the link name on its own. issue_title is untrusted
+        // forge text, so it stays sanitized (same stripUnsafeChars as the visible title).
+        aria-label={`Open run${run.issue_iid != null ? ` for issue #${run.issue_iid}` : ""}${
+          run.issue_title.trim() ? `: ${stripUnsafeChars(run.issue_title)}` : ""
+        }`}
+        className="absolute inset-0 rounded-lg"
+      />
+      <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 transition-colors group-hover:border-edge-strong group-hover:bg-raised/70">
         {/* w-full below sm stacks the badge cluster UNDER the title (review-wave
             fix 1): with min-w-0 alone the title column could shrink to nothing, so
             at 390px the unshrinkable badges starved it to a few characters before
@@ -250,9 +296,24 @@ function RunRow({
               can open an issue on the target repo, so it is untrusted free text on the same
               footing as judge output. Display-only here; the raw value stays the identity. */}
           <p className="truncate text-sm font-medium text-fg">{stripUnsafeChars(run.issue_title)}</p>
+          {/* PRD #362 M4: a one-line intent preview ("what this run will implement"),
+              shown once the summary lands. UNTRUSTED model output over an
+              attacker-influenceable issue/PRD, so it goes through stripUnsafeChars and is
+              truncated to one line like the title — never <Markdown>. Absent until the
+              worker posts the intent summary, so a pre-feature/early run shows only the title. */}
+          {run.summary_intent && run.summary_intent.trim() !== "" && (
+            <p className="mt-0.5 truncate text-xs text-muted">{stripUnsafeChars(run.summary_intent)}</p>
+          )}
           <p className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint">
-            <span>
-              {run.repo_path} #{run.issue_iid}
+            <span className="inline-flex items-center gap-1">
+              {run.repo_path}{" "}
+              <RunIssueRef
+                issueIid={run.issue_iid}
+                issueWebUrl={run.issue_web_url}
+                kind={run.kind}
+                forgeType={run.forge_type}
+                raised
+              />
             </span>
             {run.worker_name && <span>· {run.worker_name}</span>}
             {showOwner && run.owner_email && <span>· {run.owner_email}</span>}
@@ -266,7 +327,10 @@ function RunRow({
                 mrIid={run.mr_iid}
                 mrState={mrState}
                 href={null}
-                className="font-medium"
+                // Issue #485 review FIX 1: raised above the card's stretched-link overlay
+                // (relative z-10) so its native `title` (MR state) fires on hover; the
+                // href-less chip is not click-to-navigate, which is fine for a status chip.
+                className="relative z-10 font-medium"
               />
             )}
             {/* PRD #40: tokens + cost join the meta line; hidden for a run with no
@@ -285,7 +349,15 @@ function RunRow({
             )}
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
+        {/* Issue #485 review FIX 1: raise the whole right-side badge cluster above the
+            card's stretched-link overlay (relative z-10) so every badge's native `title`
+            tooltip fires on hover — the transparent overlay otherwise intercepts the
+            pointer and its title is empty. These are status badges nobody clicks to open
+            a run, so trading their click-to-navigate for working tooltips is correct; the
+            title/body text stays under the overlay and still navigates. The Expedite
+            button (already relative z-10, stopPropagation) is unaffected by a raised
+            ancestor. */}
+        <div className="relative z-10 flex flex-wrap items-center gap-2">
           {run.auto_approve && (
             <Badge tone="brand" title="Autopilot: started from the label, plan auto-approved">
               autopilot
@@ -314,9 +386,11 @@ function RunRow({
                   self-hiding on a normal or non-queued run. */}
               <RunPriorityBadge priority={run.priority} status={run.status} />
               <StatusPill status={pillStatus} />
-              {/* PRD #320 M6: the owner-only Expedite/undo control, queued rows only. It
-                  lives inside the row <Link>, so it preventDefaults + stopPropagates before
-                  firing the mutation; a non-owner never reaches this branch (owned gate). */}
+              {/* PRD #320 M6: the owner-only Expedite/undo control, queued rows only. It is
+                  raised above the card's stretched-link overlay (relative z-10, issue #485
+                  NB1) so the click hits the button rather than the run-details Link; it
+                  still preventDefaults + stopPropagates defensively before firing the
+                  mutation. A non-owner never reaches this branch (owned gate). */}
               {canExpedite && (
                 <button
                   type="button"
@@ -331,7 +405,7 @@ function RunRow({
                       ? "Return this run to its natural queue position."
                       : "Bump this run to the front of the queue."
                   }
-                  className="rounded-md border border-edge bg-raised px-2 py-1 text-xs font-medium text-muted transition-colors hover:border-edge-strong hover:text-fg disabled:opacity-50"
+                  className="relative z-10 rounded-md border border-edge bg-raised px-2 py-1 text-xs font-medium text-muted transition-colors hover:border-edge-strong hover:text-fg disabled:opacity-50"
                 >
                   {isExpedited ? "Undo" : "Expedite"}
                 </button>
@@ -343,7 +417,7 @@ function RunRow({
             </>
           )}
         </div>
-      </Link>
+      </div>
     </li>
   );
 }
@@ -355,8 +429,9 @@ function RunRow({
 export function RunsList() {
   const { user, vaultUnlocked } = useAuth();
   const isAdmin = !!user?.is_admin;
-  // Issue #256 M3: a 1s tick drives the live duration token on every row; the page
-  // otherwise loads once (no poll), so the token would freeze without this clock.
+  // Issue #256 M3: a 1s tick drives the live duration token on every row; the 10s
+  // data poll (PRD #518) refreshes the rows but does not re-derive the token between
+  // fetches, so it would freeze without this finer clock.
   const now = useNow(1000);
 
   const { runs, loading, error, tokenCount, reload } = useRunsData();
@@ -384,6 +459,27 @@ export function RunsList() {
       alive = false;
     };
   }, [isAdmin]);
+
+  // Liveness (PRD #518): the admin Factory card re-fetches its own volatile lists
+  // (runs + workers) on the same 10s visibility-gated cadence, so other users' runs
+  // and worker online/offline state update live. The hook is called unconditionally
+  // (React rules of hooks); the callback self-gates on isAdmin, mirroring the mount
+  // effect's early return, so no admin endpoint is hit for a normal user. A blip is
+  // swallowed to keep last-good — it must NOT route through setAdminError/
+  // setAdminLoading, or a transient failure would pop the in-card Alert over working
+  // data. This is happy-path setState only, separate from the mount effect's
+  // first-load semantics.
+  const pollAdmin = useCallback(async () => {
+    if (!isAdmin) return;
+    try {
+      const [r, w] = await Promise.all([api.adminListRuns(), api.adminListWorkers()]);
+      setAdminRuns(r.runs);
+      setAdminWorkers(w.workers);
+    } catch {
+      // keep the last-good factory data
+    }
+  }, [isAdmin]);
+  usePollWhileVisible(pollAdmin, 10000);
 
   const active = runs.filter((r) => !isTerminalRun(r.status));
   const past = runs.filter((r) => isTerminalRun(r.status));

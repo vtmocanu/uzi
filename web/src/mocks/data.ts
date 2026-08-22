@@ -64,7 +64,7 @@ export const mockAdmin: User = {
   autopilot_enabled: false,
   judge_enabled: false,
   ci_autofix_enabled: false,
-  wait_on_limit: false,
+  wait_on_limit: true,
   judge_anthropic_secret_id: null,
   judge_anthropic_secret_label: null,
   created_at: daysAgo(41),
@@ -1046,6 +1046,19 @@ export const mockForgeConfigAllForges = {
   forge_types: ["gitlab", "forgejo", "github"],
 };
 
+// PRD #337 M2: a multi-forge config exercising the connect-form URL⇄type sync —
+// three recognized hosts (github/gitlab/forgejo) plus one unrecognized self-hosted
+// host that stays under manual control in both directions.
+export const mockForgeConfigSyncForges = {
+  allowed_base_urls: [
+    "https://gitlab.example.com",
+    "https://forgejo.example.com",
+    "https://github.com",
+    "https://git.example.com",
+  ],
+  forge_types: ["gitlab", "forgejo", "github"],
+};
+
 // PRD #66 M9 (D8): the atlas repo's admin override, shared by the Boards repo fixture
 // and the admin blocked-repos list so both read ONE literal. Typed as the wire
 // GuardrailOverrideMeta (the same shape RepoDTO.guardrail_override and
@@ -1081,6 +1094,11 @@ export const mockRepos: Repo[] = [
     guardrail_override: null,
     // PRD #66 M9 (D8): not refused by the guardrail (server-computed).
     guardrail_blocked: false,
+    // PRD #361 M1: this repo is on the global Docker-worker allowlist (the fully
+    // set-up row), so its Setup chip's Docker capability reads on.
+    docker_allowlisted: true,
+    // PRD #361 M3: not blocked (an allowlisted repo makes every worker eligible).
+    docker_blocked: false,
   },
   {
     id: "repo-atlas",
@@ -1104,6 +1122,11 @@ export const mockRepos: Repo[] = [
     // guardrail — the "allowed by admin" badge + Revoke path in the demo.
     guardrail_override: { ...mockAtlasOverride },
     guardrail_blocked: false,
+    // PRD #361 M1: not on the Docker-worker allowlist.
+    docker_allowlisted: false,
+    // PRD #361 M3: actively blocked — an enabled repo with a queued run whose only
+    // online workers are Docker workers, so its Setup chip escalates to the info tone.
+    docker_blocked: true,
   },
   {
     // PRD #66 M9 (D8): a repo the push/merge guardrail REFUSES right now
@@ -1124,6 +1147,10 @@ export const mockRepos: Repo[] = [
     pipeline: null,
     guardrail_override: null,
     guardrail_blocked: true,
+    // PRD #361 M1: not on the Docker-worker allowlist.
+    docker_allowlisted: false,
+    // PRD #361 M3: not actively blocked by the Docker-allowlist gap.
+    docker_blocked: false,
   },
   {
     id: "repo-www",
@@ -1139,6 +1166,36 @@ export const mockRepos: Repo[] = [
     pipeline: null,
     guardrail_override: null,
     guardrail_blocked: false,
+    // PRD #361 M1: not on the Docker-worker allowlist.
+    docker_allowlisted: false,
+    // PRD #361 M3: not actively blocked by the Docker-allowlist gap.
+    docker_blocked: false,
+  },
+  {
+    // PRD #345 M2: the disabled+blocked row that makes the refused-enable demo
+    // reachable under VITE_UZI_MOCK=1. No pre-existing fixture was BOTH
+    // enabled:false AND guardrail_blocked:true, so clicking Enable here is the
+    // one-click path that trips mockApi.setRepoEnabled's 422 guardrail block
+    // (reasons from mockBlockedRepoMeta below). We add this row rather than
+    // flipping repo-payments, whose enabled:true state the Boards "runs blocked"
+    // badge and admin Allow-anyway demo depend on.
+    id: "repo-ledger",
+    connection_id: "conn-1",
+    forge_project_id: 641,
+    path_with_namespace: "team-beta/ledger-service",
+    web_url: "https://gitlab.example.com/team-beta/ledger-service",
+    default_branch: "main",
+    enabled: false,
+    repo_skills_enabled: false,
+    repo_claudemd_enabled: false,
+    repo_devbox_opt_in: false,
+    pipeline: null,
+    guardrail_override: null,
+    guardrail_blocked: true,
+    // PRD #361 M1: not on the Docker-worker allowlist.
+    docker_allowlisted: false,
+    // PRD #361 M3: not actively blocked by the Docker-allowlist gap.
+    docker_blocked: false,
   },
 ];
 
@@ -1172,6 +1229,20 @@ export const mockBlockedRepoMeta: Record<string, MockBlockedRepoMeta> = {
     block_messages: [
       "the default branch is protected but the write role (Developer) may push to it",
       "the write role (Developer) may merge to the default branch",
+    ],
+    privilege_status: "violations",
+    privilege_checked_at: minsAgo(18),
+  },
+  // PRD #345 M2: the disabled+blocked row (repo-ledger) whose enable is refused.
+  // These block_messages are the enable-guardrail (privcheck) reasons rendered as
+  // the 422 violations when a member clicks Enable on it under VITE_UZI_MOCK=1.
+  "repo-ledger": {
+    owner_id: "u-dana",
+    owner_email: "dana@example.com",
+    forge_type: "gitlab",
+    block_messages: [
+      "could not read default-branch protection on this repo",
+      "the default branch is protected but the write role (Developer) may push to it",
     ],
     privilege_status: "violations",
     privilege_checked_at: minsAgo(18),
@@ -1431,6 +1502,32 @@ const boardFixtures: Record<string, Board> = {
           worker_name: "laptop",
           created_at: minsAgo(10),
           updated_at: minsAgo(6),
+        }),
+        pipeline: null,
+      },
+      {
+        // PRD #517: the board's only follow-up-parked card. It is what makes runBadge's
+        // `awaiting_followup` arm and the board's follow-up attention strip reachable in
+        // mock mode. A parked-awaiting-you run, so it sits alongside the awaiting_approval
+        // sibling in Review.
+        iid: 25,
+        title: "Debounce the board poll while a drag is in flight",
+        state: "opened",
+        labels: ["PRD", "Review"],
+        web_url: uziUrl(25),
+        author: "mira",
+        forge_type: "gitlab",
+        has_prd_link: true,
+        column: "Review",
+        closed: false,
+        conflict: false,
+        forge_updated_at: minsAgo(19),
+        latest_run: latestRun({
+          id: "run-awaiting-followup",
+          status: "awaiting_followup",
+          worker_name: "laptop",
+          created_at: minsAgo(19),
+          updated_at: minsAgo(3),
         }),
         pipeline: null,
       },
@@ -1742,6 +1839,7 @@ export const mockWorkers: Worker[] = [
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
+    draining_since: null,
   },
   {
     // Declared jvm at issuance but the running image is base → drift badge demo.
@@ -1773,6 +1871,7 @@ export const mockWorkers: Worker[] = [
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
+    draining_since: null,
   },
   {
     // PRD #113 M5: the FAILED upgrade. Present so the demo can show the failed-worker
@@ -1820,6 +1919,7 @@ export const mockWorkers: Worker[] = [
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
+    draining_since: null,
   },
   {
     // Un-quota'd / cgroup-v1 host → process fallback: no known limit (absolute mem,
@@ -1851,6 +1951,7 @@ export const mockWorkers: Worker[] = [
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
+    draining_since: null,
   },
   {
     // A hosted worker (PRD #58): the controller runs this one in the cluster. Seeded
@@ -1864,6 +1965,10 @@ export const mockWorkers: Worker[] = [
     kind: "hosted",
     hosted_size: "m",
     docker: true,
+    // PRD #84 M1/M4: the server-authoritative capability set. This docker-capable hosted
+    // worker advertises "docker", so the Workers page shows the capability chip AND — were a
+    // docker-requiring run assigned here — the plan-gate readiness summary would read it MET.
+    capabilities: ["docker"],
     busy: false,
     active_runs: 0,
     max_concurrent_runs: null,
@@ -1886,6 +1991,75 @@ export const mockWorkers: Worker[] = [
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
+    draining_since: null,
+  },
+  {
+    // The #365 scenario (PRD #496): online, one free slot (1/2), cordoned for a roll
+    // (so also `outdated`), so it claims nothing new. It shows the `draining` label
+    // beside the amber outdated badge — demonstrating the pill is visually distinct
+    // (dashed neutral, not solid amber) and keyed on draining_since, NOT upgrade_status.
+    id: "w-cordon-eu",
+    name: "base.m-9f3c",
+    status: "online",
+    kind: "hosted",
+    hosted_size: "m",
+    docker: true,
+    capabilities: ["docker"],
+    busy: true,
+    active_runs: 1,
+    max_concurrent_runs: 2,
+    template_declared: "base",
+    template_reported: "base",
+    version: "0.4.1",
+    upgrade_status: "outdated",
+    upgrade_detail: "running 0.4.1, target 0.4.2",
+    upgrade_target: "0.4.2",
+    upgrade_blocking_container: null,
+    upgrade_blocking_reason: null,
+    upgrade_last_exit_code: null,
+    last_heartbeat_at: minsAgo(0.3),
+    online_since: minsAgo(48),
+    created_at: daysAgo(4),
+    stats_cpu_pct: 21.5,
+    stats_mem_bytes: 1181116006, // 1.1 GiB
+    stats_mem_limit_bytes: 4294967296, // 4 GiB → ~27%
+    stats_source: "cgroup",
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
+    anthropic_bind_mode: "default",
+    draining_since: minsAgo(6),
+  },
+  {
+    // An idle cordoned worker (no runs in flight) → shows the `cordoned` label.
+    id: "w-cordon-idle",
+    name: "base.s-4d7a",
+    status: "online",
+    kind: "hosted",
+    hosted_size: "s",
+    docker: false,
+    busy: false,
+    active_runs: 0,
+    max_concurrent_runs: 2,
+    template_declared: "base",
+    template_reported: "base",
+    version: "0.4.2",
+    upgrade_status: "up_to_date",
+    upgrade_detail: null,
+    upgrade_target: "0.4.2",
+    upgrade_blocking_container: null,
+    upgrade_blocking_reason: null,
+    upgrade_last_exit_code: null,
+    last_heartbeat_at: minsAgo(0.5),
+    online_since: minsAgo(90),
+    created_at: daysAgo(5),
+    stats_cpu_pct: 21.5,
+    stats_mem_bytes: 1181116006, // 1.1 GiB
+    stats_mem_limit_bytes: 4294967296, // 4 GiB → ~27%
+    stats_source: "cgroup",
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
+    anthropic_bind_mode: "default",
+    draining_since: minsAgo(20),
   },
 ];
 
@@ -1924,6 +2098,7 @@ export const mockAdminWorkers: AdminWorker[] = [
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
+    draining_since: null,
     owner_email: "mira@uzi.local",
   },
 ];
@@ -2274,6 +2449,7 @@ export const mockRuns: Run[] = [
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: null,
+    issue_web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/26",
     mr_iid: null,
     mr_state: null,
     failure_reason: null,
@@ -2303,6 +2479,61 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(1),
   },
   {
+    // PRD #411: an issue-LESS run (kind "task", from `uzi handoff`) so the muted
+    // kind chip renders in place of a "#<iid>" in mock mode, and the M4 tests have a
+    // positive fixture for the issue-less branch. issue_iid + issue_web_url are null.
+    id: "run-task-handoff",
+    repo_id: "repo-uzi",
+    issue_iid: null,
+    issue_title: "Wire up worker heartbeat retry backoff",
+    issue_description: "A handoff task run — repo + branch, no forge issue.",
+    // PRD #411: this issue-less task run is flagged stuck (health below) so it also
+    // surfaces in the board needs-attention strip, exercising the kind-chip branch there.
+    kind: "task",
+    title: null,
+    resume_of_run_id: null,
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
+    status: "running",
+    requeue_count: 0,
+    iteration_count: 0,
+    auto_approve: false,
+    worker_id: "w-laptop",
+    branch: "agent/handoff-heartbeat",
+    model: null,
+    override_subagent_model: false,
+    forge_type: "gitlab",
+    mr_web_url: null,
+    issue_web_url: null,
+    mr_iid: null,
+    mr_state: null,
+    failure_reason: null,
+    stop_kind: null,
+    health: "looping",
+    health_reason: "No output for several minutes.",
+    health_since: minsAgo(2),
+    plan_md: null,
+    repo_agents: null,
+    agent_source: null,
+    agent_exclusions: null,
+    own_agents: null,
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
+    anthropic_select_reason: null,
+    anthropic_headroom_pct: null,
+    wait_on_limit: false,
+    limit_resets_at: null,
+    retry_not_before: null,
+    limit_wait_count: 0,
+    rate_limit_type: null,
+    claimed_at: minsAgo(3),
+    started_at: minsAgo(3),
+    finished_at: null,
+    created_at: minsAgo(3),
+    updated_at: minsAgo(2),
+  },
+  {
     // PRD #320 M6 demo: a DEMOTED background run — a self_improve sweep yielding to
     // interactive work while it waits, so its "Deprioritized" pill and the owner's
     // Expedite control are visible on /runs in mock mode. Owned by the session (absent
@@ -2329,6 +2560,7 @@ export const mockRuns: Run[] = [
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: null,
+    issue_web_url: null,
     mr_iid: null,
     mr_state: null,
     failure_reason: null,
@@ -2381,6 +2613,7 @@ export const mockRuns: Run[] = [
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: null,
+    issue_web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/41",
     mr_iid: null,
     mr_state: null,
     failure_reason: null,
@@ -2435,6 +2668,7 @@ export const mockRuns: Run[] = [
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: null,
+    issue_web_url: null,
     mr_iid: null,
     mr_state: null,
     failure_reason: null,
@@ -2490,6 +2724,7 @@ export const mockRuns: Run[] = [
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: null,
+    issue_web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/24",
     mr_iid: null,
     mr_state: null,
     failure_reason: null,
@@ -2550,6 +2785,9 @@ export const mockRuns: Run[] = [
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: null,
+    // PRD #411: a real forge issue URL so the board needs-attention strip's forge-link
+    // branch (this awaiting_approval run) renders under VITE_UZI_MOCK=1.
+    issue_web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/21",
     mr_iid: null,
     mr_state: null,
     failure_reason: null,
@@ -2580,6 +2818,14 @@ export const mockRuns: Run[] = [
     milestones_completed: null,
     milestones_in_progress: null,
     milestones_candidate: APPROVAL_NOTIFY_CANDIDATES,
+    // PRD #84 M4 4d: plan-time inference tagged this run as needing docker, so the plan
+    // gate's readiness summary renders. Its assigned worker (w-laptop, external) advertises
+    // NO capabilities, so `docker` shows UNMET (warn badge + remediation + the "run without
+    // it" override) — the docker-blocked scenario. required_tools are display-only ("will be
+    // provisioned"); size_class is the advisory estimate.
+    required_capabilities: ["docker"],
+    required_tools: ["node", "go"],
+    size_class: "m",
     budget_max_iterations: 8,
     budget_wall_seconds: 5400,
     anthropic_secret_id: "sec-default",
@@ -2629,6 +2875,7 @@ export const mockRuns: Run[] = [
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: null,
+    issue_web_url: null,
     mr_iid: null,
     mr_state: null,
     failure_reason: null,
@@ -2691,6 +2938,7 @@ export const mockRuns: Run[] = [
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: null,
+    issue_web_url: null,
     mr_iid: null,
     mr_state: null,
     failure_reason: null,
@@ -2733,6 +2981,75 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(14),
   },
   {
+    // run-awaiting-followup is parked on a follow-up (PRD #517): the interactive run
+    // finished the turn it was steered to and stopped to wait for its owner's NEXT
+    // follow-up, holding its worker slot open the whole time. It is the ONLY
+    // awaiting_followup fixture, so it is what makes the follow-up park reachable under
+    // VITE_UZI_MOCK=1 — the board's follow-up attention strip, the run view's park
+    // announcement, and SteerQueueCard's "Delivered — resumes the run" chip render
+    // nowhere without it.
+    id: "run-awaiting-followup",
+    repo_id: "repo-uzi",
+    issue_iid: 25,
+    issue_title: "Debounce the board poll while a drag is in flight",
+    issue_description: "See prds/25-board-drag-poll.md.",
+    kind: "issue",
+    title: null,
+    resume_of_run_id: null,
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
+    status: "awaiting_followup",
+    requeue_count: 0,
+    iteration_count: 3,
+    auto_approve: false,
+    // The park holds its worker slot, so it still names a live worker (like the
+    // awaiting_input sibling).
+    worker_id: "w-laptop",
+    branch: null,
+    model: null,
+    override_subagent_model: false,
+    forge_type: "gitlab",
+    mr_web_url: null,
+    issue_web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/25",
+    mr_iid: null,
+    mr_state: null,
+    failure_reason: null,
+    stop_kind: null,
+    // The server CLEARS health on park entry (a data.test.ts invariant pins this for
+    // parked runs).
+    health: "ok",
+    health_reason: null,
+    health_since: null,
+    // PRD #517: a follow-up park is independent of the usage-limit park, so it carries
+    // no limit state at all — same as the awaiting_input sibling.
+    wait_on_limit: false,
+    limit_resets_at: null,
+    retry_not_before: null,
+    limit_wait_count: 0,
+    rate_limit_type: null,
+    plan_md: null,
+    repo_agents: null,
+    agent_source: "own",
+    agent_exclusions: null,
+    own_agents: null,
+    milestones: null,
+    milestones_completed: null,
+    milestones_in_progress: null,
+    milestones_candidate: null,
+    budget_max_iterations: 6,
+    budget_wall_seconds: null,
+    anthropic_secret_id: "sec-default",
+    anthropic_secret_label: "default",
+    anthropic_select_reason: "default",
+    anthropic_headroom_pct: null,
+    claimed_at: minsAgo(18),
+    started_at: minsAgo(18),
+    finished_at: null,
+    created_at: minsAgo(19),
+    updated_at: minsAgo(3),
+  },
+  {
     id: "run-done",
     repo_id: "repo-uzi",
     issue_iid: 18,
@@ -2757,6 +3074,7 @@ export const mockRuns: Run[] = [
     override_subagent_model: true,
     forge_type: "gitlab",
     mr_web_url: "https://gitlab.example.com/myorg/uzi/-/merge_requests/42",
+    issue_web_url: null,
     mr_iid: 42,
     mr_state: "merged",
     failure_reason: null,
@@ -2834,6 +3152,7 @@ export const mockRuns: Run[] = [
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: null,
+    issue_web_url: null,
     mr_iid: null,
     mr_state: null,
     failure_reason: null,
@@ -2907,6 +3226,7 @@ export const mockRuns: Run[] = [
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: "https://gitlab.example.com/myorg/uzi/-/merge_requests/39",
+    issue_web_url: null,
     mr_iid: 39,
     mr_state: "merged",
     failure_reason: null,
@@ -2959,6 +3279,7 @@ export const mockRuns: Run[] = [
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: null,
+    issue_web_url: null,
     mr_iid: 8,
     mr_state: "closed",
     failure_reason: null,
@@ -3013,6 +3334,7 @@ export const mockRuns: Run[] = [
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: null,
+    issue_web_url: null,
     mr_iid: null,
     mr_state: null,
     failure_reason: "run timed out after 2h0m0s (RUN_TIMEOUT)",
@@ -3056,6 +3378,87 @@ export const mockRuns: Run[] = [
     updated_at: daysAgo(1.1),
   },
   {
+    // PRD #377 M2: a GitHub run whose branch touched .github/workflows/** — the bot's
+    // repo-only PAT can't push workflow files, so uzi fails the run early with a typed
+    // reason and PRESERVES the agent's diff (preserved_patch) for a human to land as a PR.
+    // The diff is an in-memory synthetic string, NOT a real workflow file.
+    id: "run-workflow-scope",
+    repo_id: "repo-atlas",
+    issue_iid: 9,
+    issue_title: "Add a main-branch guard workflow",
+    issue_description: "See prds/9-main-guard.md.",
+    kind: "issue",
+    title: null,
+    resume_of_run_id: null,
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
+    status: "failed",
+    requeue_count: 0,
+    iteration_count: 2,
+    auto_approve: false,
+    worker_id: "w-ci",
+    branch: "agent/issue-9",
+    model: null,
+    override_subagent_model: false,
+    forge_type: "github",
+    mr_web_url: null,
+    issue_web_url: null,
+    mr_iid: null,
+    mr_state: null,
+    failure_reason:
+      "The agent's change is valid but touches .github/workflows/main-guard.yml, which " +
+      "uzi's bot token can't push (it is scoped to `repo`, not `workflow`, by design). " +
+      "Land the preserved diff below as a human PR; see docs/github-bot-setup.md.",
+    preserved_patch:
+      "diff --git a/.github/workflows/main-guard.yml b/.github/workflows/main-guard.yml\n" +
+      "new file mode 100644\n" +
+      "index 0000000..a1b2c3d\n" +
+      "--- /dev/null\n" +
+      "+++ b/.github/workflows/main-guard.yml\n" +
+      "@@ -0,0 +1,12 @@\n" +
+      "+name: main-guard\n" +
+      "+on:\n" +
+      "+  pull_request:\n" +
+      "+    branches: [main]\n" +
+      "+jobs:\n" +
+      "+  guard:\n" +
+      "+    runs-on: ubuntu-latest\n" +
+      "+    steps:\n" +
+      "+      - uses: actions/checkout@v4\n" +
+      "+      - name: Block direct pushes\n" +
+      "+        run: ./scripts/assert-not-direct-push.sh\n",
+    stop_kind: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
+    plan_md: null,
+    repo_agents: null,
+    agent_source: null,
+    agent_exclusions: null,
+    own_agents: null,
+    milestones: null,
+    milestones_completed: null,
+    milestones_in_progress: null,
+    milestones_candidate: null,
+    budget_max_iterations: 4,
+    budget_wall_seconds: 7200,
+    anthropic_secret_id: "sec-default",
+    anthropic_secret_label: "default",
+    anthropic_select_reason: "pinned",
+    anthropic_headroom_pct: null,
+    wait_on_limit: false,
+    limit_resets_at: null,
+    retry_not_before: null,
+    limit_wait_count: 0,
+    rate_limit_type: null,
+    claimed_at: daysAgo(0.6),
+    started_at: daysAgo(0.6),
+    finished_at: daysAgo(0.55),
+    created_at: daysAgo(0.62),
+    updated_at: daysAgo(0.55),
+  },
+  {
     id: "run-cancelled",
     repo_id: "repo-atlas",
     issue_iid: 5,
@@ -3077,6 +3480,7 @@ export const mockRuns: Run[] = [
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: null,
+    issue_web_url: null,
     mr_iid: null,
     mr_state: null,
     failure_reason: null,
@@ -3146,6 +3550,7 @@ export const mockRuns: Run[] = [
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: null,
+    issue_web_url: null,
     mr_iid: null,
     mr_state: null,
     failure_reason: null,
@@ -3218,6 +3623,7 @@ export const mockRuns: Run[] = [
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: null,
+    issue_web_url: null,
     mr_iid: null,
     mr_state: null,
     failure_reason: null,
@@ -3317,6 +3723,7 @@ function histRun(i: number, minsBack: number): Run {
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: hasMr ? `https://gitlab.example.com/demo/-/merge_requests/${900 + i}` : null,
+    issue_web_url: null,
     mr_iid: hasMr ? 900 + i : null,
     mr_state: hasMr ? (merged ? "merged" : status === "completed" ? "opened" : "closed") : null,
     failure_reason: status === "failed" ? "gate red: vitest — 2 failed" : null,
@@ -3397,6 +3804,7 @@ export const mockOtherUserRuns: Run[] = [
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: null,
+    issue_web_url: null,
     mr_iid: null,
     mr_state: null,
     failure_reason: null,
@@ -3450,6 +3858,7 @@ export const mockOtherUserRuns: Run[] = [
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: null,
+    issue_web_url: null,
     mr_iid: null,
     mr_state: null,
     failure_reason: null,
@@ -3604,11 +4013,15 @@ export const mockDoneMessages: RunMessage[] = [
   dm("tool_result", "lead", { tool_use_id: "tu-2", content: "web/src/components/RunEvent.tsx:12\nweb/src/components/ActivityFeed.tsx:44" }, 217),
   dm("plan", "lead", { text: SAMPLE_PLAN() }, 216),
   // PRD #40: the plan turn's own result frame → a distinct "Plan" per-phase row.
+  // issue #199 (defect 4): `num_turns` is PER-INVOCATION, not a running total, so the
+  // plan frame (16) deliberately EXCEEDS the implement frame (11) below. A decreasing
+  // sequence is the one shape a cumulative counter cannot produce, so it disambiguates
+  // the per-phase table's summed total — a rising pair reads as a double-count.
   dm("status", null, {
     event: "result",
     subtype: "success",
     duration_ms: 5 * 60_000,
-    num_turns: 9,
+    num_turns: 16,
     total_cost_usd: 0.24,
     usage: { input_tokens: 21_400, cache_read_input_tokens: 188_000, cache_creation_input_tokens: 0, output_tokens: 6_100 },
     modelUsage: {
@@ -3645,11 +4058,14 @@ export const mockDoneMessages: RunMessage[] = [
     confidence: "high",
   }, 187),
   dm("status", null, { text: "pushing branch agent/issue-18 and opening the MR" }, 185),
+  // issue #199 (defect 4): implement `num_turns` (11) sits BELOW the plan frame's (16) —
+  // per-invocation, not cumulative. Heavier tokens/cost in fewer turns is legitimate
+  // (turns ≠ tokens): the implement burst ran larger turns than the plan exploration.
   dm("status", null, {
     event: "result",
     subtype: "success",
     duration_ms: 2_100_000,
-    num_turns: 38,
+    num_turns: 11,
     total_cost_usd: 1.87,
     usage: { input_tokens: 114_400, cache_read_input_tokens: 1_170_000, cache_creation_input_tokens: 0, output_tokens: 48_200 },
     modelUsage: {
@@ -3875,6 +4291,7 @@ function demoIssueRun(over: Partial<Run> & Pick<Run, "id" | "status" | "health">
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: null,
+    issue_web_url: null,
     mr_iid: null,
     mr_state: null,
     failure_reason: null,
@@ -4203,6 +4620,11 @@ export const mockRunInputs: Record<string, SteerInput[]> = {
   ],
   // At the gate: a follow-up consumed while parked → "Delivered — applies after approval".
   "run-awaiting": [steerInput(3, "prefer email over Slack for the first cut", 5, 4)],
+  // PRD #517: parked awaiting a follow-up. The follow-up was consumed (non-null
+  // consumed_at) so SteerQueueCard renders the "Delivered — resumes the run" parked chip.
+  "run-awaiting-followup": [
+    steerInput(7, "also skip the poll while the drag preview is animating out", 4, 2),
+  ],
   // Finished run: a follow-up that was never consumed → "Not delivered — run finished".
   "run-done": [steerInput(4, "one more nit: memoize the tool index", 186, null)],
   "run-crew": [
@@ -4240,6 +4662,7 @@ function chatRun(over: Partial<Run> & { id: string; title: string; status: Run["
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: null,
+    issue_web_url: null,
     mr_iid: null,
     mr_state: null,
     failure_reason: null,

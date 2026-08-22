@@ -4,22 +4,25 @@
 // state instead of one page-wide busy flag.
 
 import { Fragment, useCallback, useEffect, useState } from "react";
-import { Link } from "react-router-dom";
 import { api, ApiError, type ForgeConnection, type PrivilegeReport } from "../lib/api";
 import { privilegeBadge } from "../lib/privilege";
 import { forgePlatform } from "../lib/forgeNoun";
-import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Select, Skeleton } from "../components/ui";
+import { inferForgeType, defaultUrlForType } from "../lib/forgeInfer";
+import { DOC_BOT_SETUP_FORGEJO, DOC_BOT_SETUP_GITHUB, DOC_BOT_SETUP_GITLAB } from "../lib/doclinks";
+import { Alert, Badge, Button, Card, EmptyState, Field, Input, PasswordInput, SectionTitle, Select, Skeleton } from "../components/ui";
 import { SettingsShell } from "../components/SettingsShell";
+import { DocLink } from "../components/DocLink";
 import { BranchIcon } from "../components/icons";
 
 // botSetupDoc is the in-app bot-setup guide for a forge (PRD #65 M6b). Each forge
 // has its own guide (both audience: user); the over-privilege violation card links
-// to the one for the forge the user is connecting, not always GitLab's. gitlab (and
-// any unknown/absent type — the only kind pre-M6b) keeps the exact GitLab path.
+// to the one for the forge the user is connecting, not always GitLab's. It returns
+// a BARE slug from the doclinks registry (PRD #57) — DocLink prepends "/docs/".
+// gitlab (and any unknown/absent type — the only kind pre-M6b) keeps GitLab's guide.
 function botSetupDoc(forgeType: string): string {
-  if (forgeType === "forgejo") return "/docs/forgejo-bot-setup";
-  if (forgeType === "github") return "/docs/github-bot-setup";
-  return "/docs/gitlab-bot-setup";
+  if (forgeType === "forgejo") return DOC_BOT_SETUP_FORGEJO;
+  if (forgeType === "github") return DOC_BOT_SETUP_GITHUB;
+  return DOC_BOT_SETUP_GITLAB;
 }
 
 // ConnectHints is the connect form's inline token guidance for one forge. On a
@@ -83,6 +86,10 @@ export function ForgeSettings() {
   // connect form behaves exactly as before — the milestone lands dark.
   const [forgeTypes, setForgeTypes] = useState<string[]>([]);
   const [forgeType, setForgeType] = useState("gitlab");
+  // Cosmetic auto-change highlight (PRD #337 D9): when a sync handler moves the
+  // *other* field, mark it so a CSS keyframe flashes it, making the coupling
+  // legible. CSS-only, no setTimeout — cleared in the wrapper's onAnimationEnd.
+  const [flash, setFlash] = useState<"url" | "type" | null>(null);
   const [token, setToken] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -227,6 +234,35 @@ export function ForgeSettings() {
     }
   };
 
+  // Two-way base-URL ⇄ forge-type sync (PRD #337 Feature A). Both directions only
+  // act when the *relevant* host is a RECOGNIZED forge; an unrecognized/self-hosted
+  // host (inferForgeType → null) is left under manual control (D4/D5).
+  const onBaseUrlChange = (url: string) => {
+    setBaseUrl(url);
+    const inferred = inferForgeType(url, forgeTypes);
+    if (inferred !== null && inferred !== forgeType) {
+      setForgeType(inferred);
+      setFlash("type"); // flash the auto-changed type field (cosmetic)
+    }
+  };
+
+  const onForgeTypeChange = (type: string) => {
+    setForgeType(type);
+    const currentInferred = inferForgeType(baseUrl, forgeTypes);
+    // Only move the URL if the current host is recognized (non-null) and is a
+    // different forge than the newly chosen type. An unrecognized/self-hosted host
+    // (null) is left under manual control (D4/D5).
+    if (currentInferred !== null && currentInferred !== type) {
+      const target = defaultUrlForType(type, allowedUrls);
+      if (target !== null) {
+        setBaseUrl(target);
+        setFlash("url"); // flash the auto-changed url field (cosmetic)
+      }
+      // target === null (no recognized allowlist URL for this type): keep the
+      // current URL (D8) — VerifyToken backstops the possibly-mismatched pair.
+    }
+  };
+
   // The connect form's token hints follow the selected forge (M6b): pre-M6b the
   // picker is hidden and forgeType is "gitlab", so these are the exact GitLab strings.
   const hints = connectHints(forgeType);
@@ -246,9 +282,7 @@ export function ForgeSettings() {
             Mint a least-privilege token ({hints.scopeWord}{" "}
             <code className="rounded bg-raised px-1 py-0.5 text-fg">{hints.scopeCode}</code> only,
             non-admin bot) — see the{" "}
-            <Link to={botSetupDoc(forgeType)} className="text-brand hover:underline">
-              bot setup guide
-            </Link>
+            <DocLink slug={botSetupDoc(forgeType)}>bot setup guide</DocLink>
             .
           </p>
         </Card>
@@ -262,36 +296,50 @@ export function ForgeSettings() {
           Create a bot account, give it a personal access token with the{" "}
           <code className="rounded bg-raised px-1 py-0.5 text-fg">{hints.scopeCode}</code> {hints.scopeWord}, and add
           it {hints.roleClause} to the projects uzi should see. The token is stored encrypted and never
-          shown again.
+          shown again.{" "}Step-by-step instructions are in the{" "}
+          <DocLink slug={botSetupDoc(forgeType)}>bot setup</DocLink> guide.
         </p>
         <form className="mt-4 space-y-4" onSubmit={connect}>
           <Field label="Forge base URL">
-            <Select value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)}>
-              {allowedUrls.map((u) => (
-                <option key={u} value={u}>
-                  {u}
-                </option>
-              ))}
-            </Select>
+            <div
+              className={flash === "url" ? "forge-flash" : undefined}
+              onAnimationEnd={() => setFlash(null)}
+            >
+              <Select value={baseUrl} onChange={(e) => onBaseUrlChange(e.target.value)}>
+                {allowedUrls.map((u) => (
+                  <option key={u} value={u}>
+                    {u}
+                  </option>
+                ))}
+              </Select>
+            </div>
           </Field>
           {/* Forge-type picker (PRD #65 D11): shown only when the API advertises more
               than one type. While it advertises just ["gitlab"] the picker is hidden
               and forgeType stays "gitlab", so the form is unchanged. Base URL and type
-              are independent choices (D11a): a mismatch is caught by VerifyToken. */}
+              are kept consistent for RECOGNIZED hosts — host-inferred in both
+              directions (PRD #337 Feature A / D8). An unrecognized/self-hosted host
+              stays under manual control, and VerifyToken remains the backstop for a
+              recognized-but-mismatched or self-hosted pair. */}
           {forgeTypes.length > 1 && (
             <Field label="Forge type">
-              <Select value={forgeType} onChange={(e) => setForgeType(e.target.value)}>
-                {forgeTypes.map((t) => (
-                  <option key={t} value={t}>
-                    {forgePlatform(t)}
-                  </option>
-                ))}
-              </Select>
+              <div
+                className={flash === "type" ? "forge-flash" : undefined}
+                onAnimationEnd={() => setFlash(null)}
+              >
+                <Select value={forgeType} onChange={(e) => onForgeTypeChange(e.target.value)}>
+                  {forgeTypes.map((t) => (
+                    <option key={t} value={t}>
+                      {forgePlatform(t)}
+                    </option>
+                  ))}
+                </Select>
+              </div>
             </Field>
           )}
-          <Field label={`Bot personal access token (${hints.scopeLabel})`}>
-            <Input
-              type="password"
+          <Field label={`Bot personal access token (${hints.scopeLabel})`} htmlFor="forge-bot-pat">
+            <PasswordInput
+              id="forge-bot-pat"
               autoComplete="off"
               placeholder={hints.placeholder}
               value={token}

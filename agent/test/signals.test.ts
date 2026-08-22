@@ -420,6 +420,20 @@ describe("buildSignalMcpServer milestones schema gate (PRD #122 M1)", () => {
     assert.ok("milestones" in shape, `expected milestones; got ${Object.keys(shape).join(", ")}`);
     assert.ok("plan_md" in shape);
   });
+
+  it("names the plan_md key in the property description and the tool description (#502)", () => {
+    const server = buildSignalMcpServer();
+    // Property .describe() -> inputSchema property description.
+    const propDesc = (planToolShape(server).plan_md as { description?: string }).description;
+    assert.ok(propDesc, "expected a description on the plan_md property");
+    assert.ok(propDesc!.includes("plan_md"), `plan_md property description must name the key; got: ${propDesc}`);
+    // Tool-level description read off the same registered-tool object the helper indexes.
+    const s = server as { instance?: unknown };
+    const tools = (s.instance as { _registeredTools?: Record<string, { description?: string }> } | undefined)?._registeredTools;
+    const toolDesc = tools?.["submit_plan"]?.description;
+    assert.ok(toolDesc, "expected a submit_plan tool description");
+    assert.ok(toolDesc!.includes("plan_md"), `submit_plan tool description must name the key; got: ${toolDesc}`);
+  });
 });
 
 describe("scanSignals report_progress (PRD #122 M2)", () => {
@@ -456,16 +470,14 @@ describe("scanSignals report_progress (PRD #122 M2)", () => {
     );
   });
 
-  it("drops malformed input without throwing (empty arrays, never a throw)", () => {
-    // A completely empty call still sets progress with two empty arrays (the tool fired).
-    assert.deepStrictEqual(scanSignals(toolUse(PROGRESS, {})).progress, {
-      completed: [],
-      in_progress: [],
-    });
-    // Non-array sides ⇒ empty arrays.
-    assert.deepStrictEqual(
+  it("drops malformed input without throwing (all-empty = no signal, PRD #390 D3)", () => {
+    // PRD #390 D3: a completely empty call is NO SIGNAL — it must not persist a
+    // misleading `[]`, so progress stays undefined.
+    assert.strictEqual(scanSignals(toolUse(PROGRESS, {})).progress, undefined);
+    // Non-array sides parse to two empty arrays ⇒ still no signal ⇒ undefined.
+    assert.strictEqual(
       scanSignals(toolUse(PROGRESS, { completed: "nope", in_progress: 42 })).progress,
-      { completed: [], in_progress: [] },
+      undefined,
     );
     // Junk entries dropped, blanks removed, ids trimmed, numbers/booleans coerced, deduped.
     assert.deepStrictEqual(
@@ -499,6 +511,23 @@ describe("scanSignals report_progress (PRD #122 M2)", () => {
     assert.deepStrictEqual(scanSignals(msg).progress, {
       completed: ["m1", "m2"],
       in_progress: [],
+    });
+  });
+
+  it("a later all-empty report does NOT wipe an earlier real one (PRD #390 D3)", () => {
+    const msg = {
+      type: "assistant",
+      session_id: "s",
+      message: {
+        content: [
+          { type: "tool_use", id: "a", name: PROGRESS, input: { completed: ["m1"], in_progress: ["m2"] } },
+          { type: "tool_use", id: "b", name: PROGRESS, input: {} },
+        ],
+      },
+    };
+    assert.deepStrictEqual(scanSignals(msg).progress, {
+      completed: ["m1"],
+      in_progress: ["m2"],
     });
   });
 });

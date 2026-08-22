@@ -1,8 +1,10 @@
 import { describe, it, expect } from "vitest";
 import {
   boardOrderAfterDrop,
+  DEFAULT_SORT_DIR,
   dropIntent,
   insertionEdgeFor,
+  isSortDir,
   isSortMode,
   neighbourAnchor,
   sortCards,
@@ -202,6 +204,160 @@ describe("sortCards", () => {
   });
 });
 
+describe("isSortDir", () => {
+  it("accepts exactly asc and desc", () => {
+    expect(isSortDir("asc")).toBe(true);
+    expect(isSortDir("desc")).toBe(true);
+  });
+
+  it("rejects anything else, so a stale localStorage value degrades", () => {
+    for (const v of ["", "ascending", "ASC", null, undefined, 1, {}]) {
+      expect(isSortDir(v)).toBe(false);
+    }
+  });
+});
+
+describe("sortCards direction", () => {
+  // Each mode gets an explicit asc AND desc case whose expected orders differ, so the
+  // dir plumbing cannot pass by ignoring dir (that would make asc === desc, vacuous).
+
+  it("iid: asc is ascending, desc is the reverse", () => {
+    const cards = [aCard({ iid: 30 }), aCard({ iid: 10 }), aCard({ iid: 20 })];
+    const asc = iidsOf(sortCards(cards, "iid", "asc"));
+    const desc = iidsOf(sortCards(cards, "iid", "desc"));
+    expect(asc).toEqual([10, 20, 30]);
+    expect(desc).toEqual([30, 20, 10]);
+    expect(asc).not.toEqual(desc); // non-vacuous: the two directions really differ
+  });
+
+  it("run: asc is oldest-first, desc is newest-first; nulls stay LAST in both", () => {
+    const cards = [
+      aCard({ iid: 40 }), // never run
+      aCard({ iid: 10, latest_run: aRun("2026-01-01T10:00:00Z") }),
+      aCard({ iid: 30 }), // never run
+      aCard({ iid: 20, latest_run: aRun("2026-01-02T10:00:00Z") }),
+    ];
+    const asc = iidsOf(sortCards(cards, "run", "asc"));
+    const desc = iidsOf(sortCards(cards, "run", "desc"));
+    // Only the run-bearing cards flip; 30 and 40 (never run) stay last in iid order.
+    expect(asc).toEqual([10, 20, 30, 40]);
+    expect(desc).toEqual([20, 10, 30, 40]);
+    expect(asc).not.toEqual(desc);
+  });
+
+  it("updated: asc is oldest-first, desc is newest-first", () => {
+    const cards = [
+      aCard({ iid: 10, forge_updated_at: "2026-01-01T00:00:00Z" }),
+      aCard({ iid: 20, forge_updated_at: "2026-03-01T00:00:00Z" }),
+      aCard({ iid: 30, forge_updated_at: "2026-02-01T00:00:00Z" }),
+    ];
+    const asc = iidsOf(sortCards(cards, "updated", "asc"));
+    const desc = iidsOf(sortCards(cards, "updated", "desc"));
+    expect(asc).toEqual([10, 30, 20]);
+    expect(desc).toEqual([20, 30, 10]);
+    expect(asc).not.toEqual(desc);
+  });
+
+  it("title: asc is A→Z, desc is Z→A", () => {
+    const cards = [
+      aCard({ iid: 10, title: "beta" }),
+      aCard({ iid: 20, title: "Alpha" }),
+      aCard({ iid: 30, title: "gamma" }),
+    ];
+    const asc = iidsOf(sortCards(cards, "title", "asc"));
+    const desc = iidsOf(sortCards(cards, "title", "desc"));
+    expect(asc).toEqual([20, 10, 30]); // Alpha, beta, gamma
+    expect(desc).toEqual([30, 10, 20]); // gamma, beta, Alpha
+    expect(asc).not.toEqual(desc);
+  });
+
+  it("keeps never-run cards LAST under BOTH directions (nulls-last is direction-independent)", () => {
+    // Only ONE never-run card, so its LAST position is the assertion, not a tiebreak.
+    const cards = [
+      aCard({ iid: 40 }), // never run
+      aCard({ iid: 10, latest_run: aRun("2026-01-01T10:00:00Z") }),
+      aCard({ iid: 20, latest_run: aRun("2026-01-02T10:00:00Z") }),
+    ];
+    const asc = iidsOf(sortCards(cards, "run", "asc"));
+    const desc = iidsOf(sortCards(cards, "run", "desc"));
+    // The never-run card is last in BOTH; a dir that floated it to the top is the bug
+    // this test exists to catch.
+    expect(asc[asc.length - 1]).toBe(40);
+    expect(desc[desc.length - 1]).toBe(40);
+    // ...and only the run-bearing cards reordered between the two directions.
+    expect(asc.slice(0, 2)).toEqual([10, 20]);
+    expect(desc.slice(0, 2)).toEqual([20, 10]);
+  });
+
+  it("keeps the byIID tiebreak ASCENDING even under desc", () => {
+    // Two cards share the same updated key; only the tiebreak decides. It must stay
+    // ascending under desc, NOT reverse to [30, 10] — equal-key rows keep a stable
+    // order regardless of direction.
+    const cards = [
+      aCard({ iid: 30, forge_updated_at: "2026-01-01T00:00:00Z" }),
+      aCard({ iid: 10, forge_updated_at: "2026-01-01T00:00:00Z" }),
+    ];
+    expect(iidsOf(sortCards(cards, "updated", "desc"))).toEqual([10, 30]);
+    expect(iidsOf(sortCards(cards, "updated", "asc"))).toEqual([10, 30]);
+  });
+
+  it("manual ignores dir entirely", () => {
+    const cards = [aCard({ iid: 30 }), aCard({ iid: 10 }), aCard({ iid: 20 })];
+    expect(iidsOf(sortCards(cards, "manual", "asc"))).toEqual([30, 10, 20]);
+    expect(iidsOf(sortCards(cards, "manual", "desc"))).toEqual([30, 10, 20]);
+  });
+
+  it("the 2-arg call equals passing DEFAULT_SORT_DIR[mode] explicitly, for every mode", () => {
+    // Proves the default-param wiring: omitting dir uses the mode's natural direction,
+    // so every existing 2-arg call site stays byte-identical.
+    const mixed = [
+      aCard({ iid: 30, title: "beta", forge_updated_at: "2026-02-01T00:00:00Z", latest_run: aRun("2026-02-01T10:00:00Z") }),
+      aCard({ iid: 10, title: "Alpha", forge_updated_at: "2026-01-01T00:00:00Z", latest_run: aRun("2026-01-01T10:00:00Z") }),
+      aCard({ iid: 20, title: "gamma", forge_updated_at: "2026-03-01T00:00:00Z" }), // never run
+    ];
+    for (const { value } of SORT_MODES) {
+      expect(iidsOf(sortCards(mixed, value))).toEqual(iidsOf(sortCards(mixed, value, DEFAULT_SORT_DIR[value])));
+    }
+  });
+});
+
+describe("dropIntent direction", () => {
+  it("freezes the displayed order of the ACTIVE direction, not the mode default", () => {
+    // Same fixture as the freeze-mode test, but sortDir asc reverses the displayed
+    // order the freeze captures. Displayed under updated+asc is 10,30,20; move 20 above
+    // 10 → 20,10,30.
+    const cards = [
+      aCard({ iid: 10, column: "", forge_updated_at: "2026-01-01T00:00:00Z" }),
+      aCard({ iid: 20, column: "", forge_updated_at: "2026-03-01T00:00:00Z" }),
+      aCard({ iid: 30, column: "", forge_updated_at: "2026-02-01T00:00:00Z" }),
+    ];
+    const asc = dropIntent({
+      payloadCards: cards,
+      columnKeys: [""],
+      sortMode: "updated",
+      sortDir: "asc",
+      dragIid: 20,
+      destColumnKey: "",
+      anchor: { iid: 10, before: true },
+    })!;
+    const desc = dropIntent({
+      payloadCards: cards,
+      columnKeys: [""],
+      sortMode: "updated",
+      sortDir: "desc",
+      dragIid: 20,
+      destColumnKey: "",
+      anchor: { iid: 10, before: true },
+    })!;
+    // asc displayed = 10,30,20 → move 20 above 10 → 20,10,30.
+    expect(asc.iids).toEqual([20, 10, 30]);
+    // desc displayed = 20,30,10 → move 20 above 10 → 30,20,10.
+    expect(desc.iids).toEqual([30, 20, 10]);
+    // Non-vacuous: the direction actually changed the frozen order.
+    expect(asc.iids).not.toEqual(desc.iids);
+  });
+});
+
 describe("boardOrderAfterDrop", () => {
   const columnKeys = ["", "Planned", "In Progress"];
   // Displayed order deliberately differs from iid order, so a fold that reconstructs
@@ -336,14 +492,14 @@ describe("dropIntent", () => {
   ];
 
   it("flags a cross-column drop and not a within-column one", () => {
-    expect(dropIntent({ payloadCards, columnKeys, sortMode: "manual", dragIid: 30, destColumnKey: "Planned", anchor: null })!.columnChanged).toBe(true);
-    expect(dropIntent({ payloadCards, columnKeys, sortMode: "manual", dragIid: 30, destColumnKey: "", anchor: null })!.columnChanged).toBe(false);
+    expect(dropIntent({ payloadCards, columnKeys, sortMode: "manual", sortDir: "desc", dragIid: 30, destColumnKey: "Planned", anchor: null })!.columnChanged).toBe(true);
+    expect(dropIntent({ payloadCards, columnKeys, sortMode: "manual", sortDir: "desc", dragIid: 30, destColumnKey: "", anchor: null })!.columnChanged).toBe(false);
   });
 
   it("EXCLUDES closed cards from the freeze", () => {
     // A frozen position on a closed card would ride an issue that later reopens and
     // drop it at an arbitrary rank in its new column.
-    const out = dropIntent({ payloadCards, columnKeys, sortMode: "manual", dragIid: 30, destColumnKey: "", anchor: null })!;
+    const out = dropIntent({ payloadCards, columnKeys, sortMode: "manual", sortDir: "desc", dragIid: 30, destColumnKey: "", anchor: null })!;
     expect(out.iids).not.toContain(99);
     expect(out.iids).toHaveLength(3);
   });
@@ -365,8 +521,8 @@ describe("dropIntent", () => {
     // "freezes the cards the viewer cannot see" (wiring). Mutating Board.tsx to pass
     // the rendered set left all 1316 tests green while this one passed.
     const rendered = payloadCards.filter((c) => c.iid !== 20);
-    const full = dropIntent({ payloadCards, columnKeys, sortMode: "manual", dragIid: 30, destColumnKey: "", anchor: null })!;
-    const partial = dropIntent({ payloadCards: rendered, columnKeys, sortMode: "manual", dragIid: 30, destColumnKey: "", anchor: null })!;
+    const full = dropIntent({ payloadCards, columnKeys, sortMode: "manual", sortDir: "desc", dragIid: 30, destColumnKey: "", anchor: null })!;
+    const partial = dropIntent({ payloadCards: rendered, columnKeys, sortMode: "manual", sortDir: "desc", dragIid: 30, destColumnKey: "", anchor: null })!;
     expect(full.iids).toContain(20);
     expect(partial.iids).not.toContain(20);
     expect(full.iids.length).toBe(partial.iids.length + 1);
@@ -380,14 +536,14 @@ describe("dropIntent", () => {
       aCard({ iid: 20, column: "", forge_updated_at: "2026-03-01T00:00:00Z" }),
       aCard({ iid: 30, column: "", forge_updated_at: "2026-02-01T00:00:00Z" }),
     ];
-    const out = dropIntent({ payloadCards: cards, columnKeys: [""], sortMode: "updated", dragIid: 20, destColumnKey: "", anchor: { iid: 10, before: false } })!;
+    const out = dropIntent({ payloadCards: cards, columnKeys: [""], sortMode: "updated", sortDir: "desc", dragIid: 20, destColumnKey: "", anchor: { iid: 10, before: false } })!;
     // Displayed under `updated` is 20,30,10. Move 20 below 10 → 30,10,20.
     expect(out.iids).toEqual([30, 10, 20]);
   });
 
   it("returns null when the dragged card is gone from the payload or is closed", () => {
-    expect(dropIntent({ payloadCards, columnKeys, sortMode: "manual", dragIid: 12345, destColumnKey: "", anchor: null })).toBeNull();
-    expect(dropIntent({ payloadCards, columnKeys, sortMode: "manual", dragIid: 99, destColumnKey: "", anchor: null })).toBeNull();
+    expect(dropIntent({ payloadCards, columnKeys, sortMode: "manual", sortDir: "desc", dragIid: 12345, destColumnKey: "", anchor: null })).toBeNull();
+    expect(dropIntent({ payloadCards, columnKeys, sortMode: "manual", sortDir: "desc", dragIid: 99, destColumnKey: "", anchor: null })).toBeNull();
   });
 });
 
@@ -426,6 +582,7 @@ describe("freeze-test 3: a freeze taken with cards hidden", () => {
       payloadCards, // UNFILTERED — this is the rule under test
       columnKeys,
       sortMode: "manual",
+      sortDir: "desc",
       dragIid: 50,
       destColumnKey: "",
       anchor: { iid: 10, before: true },
@@ -447,6 +604,7 @@ describe("freeze-test 3: a freeze taken with cards hidden", () => {
       payloadCards: visibleCards(payloadCards, ["PRD"], false),
       columnKeys,
       sortMode: "manual",
+      sortDir: "desc",
       dragIid: 50,
       destColumnKey: "",
       anchor: { iid: 10, before: true },

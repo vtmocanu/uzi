@@ -86,6 +86,14 @@ var (
 	// a best-effort "unsupported" skip (200), NOT a 5xx: worker input must not
 	// 500-storm the shared api.
 	ErrPackInvalid = errors.New("pushbroker: pack is malformed")
+	// ErrWorkflowScopeRejected means GitHub refused the checkpoint push because the
+	// pushed tip's `.github/workflows/` tree differs from the current default branch and
+	// the bot's `repo`-only PAT lacks the `workflow` scope (a deliberate supply-chain
+	// guardrail — a worker that could rewrite CI is a risk). This is NOT an infra fault:
+	// the branch is merely behind on workflow files, so the caller skips the checkpoint
+	// cleanly (checkpoints are best-effort — PRD #456 M4) and never fails the run. The
+	// finalize base-align (PRD #456 M1) is the real safety net for such a run's work.
+	ErrWorkflowScopeRejected = errors.New("pushbroker: checkpoint push rejected for missing workflow scope")
 )
 
 // Pack inflation budget (PRD #122 M8 hardening). The handler caps the COMPRESSED
@@ -268,6 +276,12 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 		// origin advanced its checkpoint between our fetch and our push. The
 		// non-forced push refused it — exactly the protocol-level guarantee we want.
 		return Result{}, ErrNotDescendant
+	case isWorkflowScopeRejection(pushErr):
+		// The branch is behind on .github/workflows/** relative to the default branch
+		// and the bot PAT lacks the `workflow` scope. Not an infra fault — the caller
+		// skips the checkpoint cleanly (best-effort; PRD #456 M4). Must be checked
+		// before the default arm so it does not surface as a 5xx.
+		return Result{}, ErrWorkflowScopeRejected
 	default:
 		return Result{}, fmt.Errorf("pushbroker: push: %w", pushErr)
 	}
@@ -560,4 +574,24 @@ func isNonFastForward(err error) bool {
 		return false
 	}
 	return strings.Contains(err.Error(), "non-fast-forward")
+}
+
+// isWorkflowScopeRejection matches GitHub's remote rejection of a push whose
+// `.github/workflows/` tree differs from the current default branch when the PAT lacks
+// the `workflow` scope. The observed message is a `remote rejected` line reading
+// "refusing to allow a Personal Access Token to create or update workflow
+// `.github/workflows/<file>` without workflow scope" (PRD #456). go-git surfaces the
+// remote's rejection text formatted into the push error, so — as with isNonFastForward
+// — the message text is the only discriminator. Match tolerantly and case-insensitively
+// on the stable substrings so a wording drift on GitHub's side does not miss it: any of
+// "workflow scope" (the short form), "without workflow scope", or the fuller "refusing
+// to allow a personal access token to create or update workflow" clause counts.
+func isWorkflowScopeRejection(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "workflow scope") ||
+		strings.Contains(msg, "without workflow scope") ||
+		strings.Contains(msg, "refusing to allow a personal access token to create or update workflow")
 }

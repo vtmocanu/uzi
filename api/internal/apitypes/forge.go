@@ -15,17 +15,29 @@ package apitypes
 // nanoseconds, no zero-value marshaling surprises, and this stays a stdlib-only leaf
 // with no time dependency.
 
-// ForgeIssueDTO is a single issue with its (possibly truncated) description. Returned
-// by GET /worker/runs/{id}/forge/issues/{iid}.
+// ForgeIssueDTO is a single issue with its (possibly truncated) description and its
+// bounded, bot/system-filtered human comments (PRD #381 M4). Returned by
+// GET /worker/runs/{id}/forge/issues/{iid}.
 type ForgeIssueDTO struct {
-	IID                  int64    `json:"iid"`
-	Title                string   `json:"title"`
-	State                string   `json:"state"`
-	Labels               []string `json:"labels"`
-	Author               string   `json:"author"`
-	UpdatedAt            string   `json:"updated_at"`
-	Description          string   `json:"description"`
-	DescriptionTruncated bool     `json:"description_truncated"`
+	IID                  int64                  `json:"iid"`
+	Title                string                 `json:"title"`
+	State                string                 `json:"state"`
+	Labels               []string               `json:"labels"`
+	Author               string                 `json:"author"`
+	UpdatedAt            string                 `json:"updated_at"`
+	Description          string                 `json:"description"`
+	DescriptionTruncated bool                   `json:"description_truncated"`
+	Comments             []ForgeIssueCommentDTO `json:"comments"`
+	CommentsTruncated    bool                   `json:"comments_truncated"`
+}
+
+// ForgeIssueCommentDTO is one HUMAN issue comment (PRD #381). Bot-authored and forge
+// system notes are excluded server-side; no forge coordinates are exposed (the author
+// forge user id used for the bot filter is deliberately NOT on the wire).
+type ForgeIssueCommentDTO struct {
+	Author    string `json:"author"`
+	CreatedAt string `json:"created_at"` // RFC3339
+	Body      string `json:"body"`
 }
 
 // ForgeIssueSummaryDTO is a list-row issue: no description (the list never carries

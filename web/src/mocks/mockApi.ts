@@ -44,6 +44,8 @@ import {
   type NotificationList,
   type PendingJudge,
   type PrivilegeReport,
+  type ProjectSyncOwnerKind,
+  type ProjectSyncStatus,
   type RecommendationCategory,
   type Run,
   type RunPriority,
@@ -144,6 +146,7 @@ const MOCK_SETTINGS_KEY = "uzi.mock.v3";
 const SEED_USER_SETTINGS: UserSettings = {
   default_model: null,
   judge_model: null,
+  summary_model: null,
   theme: null,
   sidebar_token_ids: [],
 };
@@ -162,6 +165,8 @@ const SEED_APP_SETTINGS: AppSettings = {
   judge_enforce_all: "false",
   judge_cooldown_seconds: "60",
   judge_daily_budget: "0",
+  // PRD #362 Decision 8: the run-summary generator model, haiku by default.
+  summary_model: "haiku",
   health_enabled: "true",
   health_stall_seconds: "300",
   health_slow_seconds: "2700",
@@ -169,6 +174,10 @@ const SEED_APP_SETTINGS: AppSettings = {
   health_approval_seconds: "3600",
   health_nudge_cooldown_seconds: "1800",
   docker_repo_allowlist: "",
+  // PRD #84 M2: capability-aware scheduling kill-switch, default ON.
+  capability_aware_scheduling: "true",
+  // Issue #534 M2: GitHub Projects v2 sync instance kill-switch, default OFF.
+  github_project_sync_enabled: "false",
   // PRD #196 M2: comma-separated label lists (run_eligible always contains the
   // primary) and the PRD-link waiver bool, mirroring the server defaults.
   run_eligible_labels: "PRD,bug",
@@ -207,6 +216,8 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     (u.default_model === null || typeof u.default_model === "string") &&
     // Optional so a pre-#69 blob stays valid; absent reads as inherit.
     (u.judge_model === undefined || u.judge_model === null || typeof u.judge_model === "string") &&
+    // Optional so a pre-#362 blob stays valid; absent reads as inherit.
+    (u.summary_model === undefined || u.summary_model === null || typeof u.summary_model === "string") &&
     (u.theme === null || typeof u.theme === "string") &&
     // Optional so a pre-feature blob stays valid; absent reads as default-only.
     (u.sidebar_token_ids === undefined ||
@@ -225,6 +236,9 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     typeof a.judge_enforce_all === "string" &&
     typeof a.judge_cooldown_seconds === "string" &&
     typeof a.judge_daily_budget === "string" &&
+    // Optional so a pre-#362 blob stays valid; a missing summary_model is filled
+    // from the seed default ("haiku") on load.
+    (a.summary_model === undefined || typeof a.summary_model === "string") &&
     typeof a.health_enabled === "string" &&
     typeof a.health_stall_seconds === "string" &&
     typeof a.health_slow_seconds === "string" &&
@@ -245,8 +259,10 @@ function loadSettings(): { userSettings: UserSettings; appSettings: AppSettings 
       const parsed: unknown = JSON.parse(raw);
       if (isPersistedSettings(parsed)) {
         return {
-          userSettings: { ...parsed.userSettings },
-          appSettings: { ...parsed.appSettings },
+          // Merge over the seed so a pre-#362 blob (no summary_model on either
+          // side) still yields a complete shape; the persisted values win where present.
+          userSettings: { ...SEED_USER_SETTINGS, ...parsed.userSettings },
+          appSettings: { ...SEED_APP_SETTINGS, ...parsed.appSettings },
         };
       }
     }
@@ -837,6 +853,65 @@ let userSettings: UserSettings = loadedSettings.userSettings;
 let workers = mockWorkers.map((w) => ({ ...w }));
 let connections = [{ ...mockConnection }];
 let repos = mockRepos.map((r) => ({ ...r }));
+// PRD #534: a GitHub connection plus two GitHub repos so the Boards "Project
+// sync" cell renders and its linked/unlinked panel states are exercisable under
+// VITE_UZI_MOCK=1. gitlab (conn-1) stays FIRST so it remains the demo's default
+// selection and the existing gitlab-oriented flows are untouched — select the
+// GitHub bot to reach these rows. The sync cell keys off the SELECTED
+// connection's forge_type, so both repos read as GitHub once conn-gh is picked.
+connections = [
+  ...connections,
+  {
+    ...mockConnection,
+    id: "conn-gh",
+    forge_type: "github",
+    base_url: "https://github.com",
+    bot_username: "uzi-bot-gh",
+  },
+];
+repos = [
+  ...repos,
+  {
+    ...repos[0],
+    id: "repo-gh-linked",
+    connection_id: "conn-gh",
+    path_with_namespace: "vtmocanu/gh-linked",
+    web_url: "https://github.com/vtmocanu/gh-linked",
+    pipeline: null,
+    guardrail_override: null,
+    guardrail_blocked: false,
+  },
+  {
+    ...repos[0],
+    id: "repo-gh-unlinked",
+    connection_id: "conn-gh",
+    path_with_namespace: "vtmocanu/gh-unlinked",
+    web_url: "https://github.com/vtmocanu/gh-unlinked",
+    pipeline: null,
+    guardrail_override: null,
+    guardrail_blocked: false,
+  },
+];
+// PRD #534: in-memory GitHub Projects v2 links, keyed by repo id. Seeded with
+// repo-gh-linked so the "linked" readout is visible; repo-gh-unlinked is left
+// absent so the provision/adopt state shows. Mirrors the server: getStatus 404s
+// an unlinked repo, provision/adopt set the entry, disable deletes it.
+const githubProjectLinks = new Map<string, ProjectSyncStatus>([
+  [
+    "repo-gh-linked",
+    {
+      project_number: 42,
+      owned_by_uzi: true,
+      last_synced_at: new Date(Date.now() - 5 * 60_000).toISOString(),
+      last_error: null,
+      item_count: 7,
+    },
+  ],
+]);
+// PRD #557: per-repo board visibility, keyed by repo id. A linked board defaults
+// to private (false) — GitHub creates ProjectV2 boards private — and the toggle
+// round-trips a mutable value here so the vitest toggle case is non-vacuous.
+const githubProjectVisibility = new Map<string, boolean>();
 
 // ── Scheduled runs (PRD #241) demo fixtures + helpers ──────────────────────
 // schedulePreviewCap mirrors the server's clamp on the preview N (PRD #241 M4).
@@ -938,6 +1013,7 @@ let schedules: Schedule[] = [
           issue_iid: 96,
           title: "Mid-run worker restart discards all un-pushed commits on resume",
           reason: "no_prd_link",
+          web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/96",
         },
       ],
     },
@@ -962,6 +1038,7 @@ let schedules: Schedule[] = [
           issue_iid: 142,
           run_id: "3f1a2b7c-9d4e-4a1b-8c6d-1e2f3a4b5c6d",
           title: "RunKind (TypeScript) omits 'chat', which the DB CHECK allows",
+          web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/142",
         },
       ],
       skips: [],
@@ -1011,7 +1088,7 @@ let schedules: Schedule[] = [
     last_fire: {
       fired_at: daysFromNow(-3, 18), matched: 3, capped: false,
       started: [
-        { issue_iid: 124, run_id: "a20b4e51-77c8-4d2a-9f10-2b3c4d5e6f70", title: "web: judge free text renders without Unicode Cf stripping" },
+        { issue_iid: 124, run_id: "a20b4e51-77c8-4d2a-9f10-2b3c4d5e6f70", title: "web: judge free text renders without Unicode Cf stripping", web_url: "https://gitlab.example.com/vtmocanu/atlas-api/-/issues/124" },
         { issue_iid: 139, run_id: "c7d5f0a2-1e34-4b56-88a9-0c1d2e3f4a5b", title: "Poller sync timeouts against forge-fake in the e2e stack" },
         { issue_iid: 151, run_id: "e91f6b03-42d7-4c88-b1a2-3c4d5e6f7a80", title: "Board card CI badge flickers on refetch" },
       ],
@@ -1533,12 +1610,12 @@ export const mockApi = {
         (nonSecret as Record<string, string>)[key] = tokens.join(",");
         continue;
       }
-      // judge_model is a model alias (PRD #46): non-empty single token, mirroring the
-      // server's PRD #17 ValidateModel rules.
-      if (key === "judge_model") {
-        if (value.trim() === "") throw new ApiError(400, "judge_model: must not be empty");
-        if (/\s/.test(value)) throw new ApiError(400, "judge_model: must be a single token with no spaces");
-        nonSecret.judge_model = value;
+      // judge_model (PRD #46) and summary_model (PRD #362) are model aliases: non-empty
+      // single token, mirroring the server's PRD #17 ValidateModel rules.
+      if (key === "judge_model" || key === "summary_model") {
+        if (value.trim() === "") throw new ApiError(400, `${key}: must not be empty`);
+        if (/\s/.test(value)) throw new ApiError(400, `${key}: must be a single token with no spaces`);
+        (nonSecret as Record<string, string>)[key] = value;
         continue;
       }
       // public_base_url must be http(s) (PRD #25).
@@ -1913,6 +1990,15 @@ export const mockApi = {
         throw new ApiError(400, "judge_model must be a single token with no spaces");
       }
       userSettings = { ...userSettings, judge_model: trimmed === "" ? null : trimmed };
+    }
+    if (patch.summary_model !== undefined) {
+      // Same rules as judge_model (PRD #362 M2): blank clears to inherit, a value with
+      // internal whitespace is rejected, mirroring the server's ValidateModel.
+      const trimmed = patch.summary_model?.trim() ?? "";
+      if (trimmed !== "" && /\s/.test(trimmed)) {
+        throw new ApiError(400, "summary_model must be a single token with no spaces");
+      }
+      userSettings = { ...userSettings, summary_model: trimmed === "" ? null : trimmed };
     }
     if (patch.theme !== undefined) {
       const t = patch.theme?.trim() ?? "";
@@ -2292,8 +2378,29 @@ export const mockApi = {
   setRepoEnabled: async (id: string, enabled: boolean) => {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");
+    // PRD #345 M2: mirror the server, which runs the enable guardrail (privcheck)
+    // ONLY on the enable path (forge.go SetRepoEnabled). A refused enable returns
+    // 422 { error, violations[] }; a disable is never gated. This makes the
+    // refused-enable UX (Repos.tsx) reproducible under VITE_UZI_MOCK=1.
+    if (enabled && r.guardrail_blocked) {
+      const violations = mockBlockedRepoMeta[id]?.block_messages ?? [
+        "this repository cannot be enabled until its guardrail violations are resolved",
+      ];
+      throw new ApiError(422, "repository cannot be enabled — guardrail violations", { violations });
+    }
     r.enabled = enabled;
     return delay({ repo: { ...r } });
+  },
+  // Explicit per-repo remove (PRD #357). Mirrors deleteConnection: drops the repo
+  // from the in-memory list so demo/browser mode reflects the deletion. Enforces
+  // the server's disabled-only guard (409 on an enabled repo) so the flow behaves
+  // like the real endpoint without any /api/ call escaping the mock.
+  deleteRepo: async (id: string) => {
+    const r = repos.find((x) => x.id === id);
+    if (!r) throw new ApiError(404, "repo not found");
+    if (r.enabled) throw new ApiError(409, "disable this repo before removing it");
+    repos = repos.filter((x) => x.id !== id);
+    return delay(null);
   },
   setRepoSkillsEnabled: async (id: string, enabled: boolean) => {
     const r = repos.find((x) => x.id === id);
@@ -2325,6 +2432,15 @@ export const mockApi = {
     r.repo_devbox_opt_in = enabled;
     return delay({ repo: { ...r } });
   },
+  // PRD #84 M2: static per-repo capability hint. Mirrors the server's
+  // capability.Filter to the {docker, jvm} vocabulary so only valid names persist.
+  setRepoRequiredCapabilities: async (id: string, caps: string[]) => {
+    const r = repos.find((x) => x.id === id);
+    if (!r) throw new ApiError(404, "repo not found");
+    const vocab = new Set(["docker", "jvm"]);
+    r.required_capabilities = caps.filter((c) => vocab.has(c));
+    return delay({ repo: { ...r } });
+  },
   // PRD #66 M9 (D8): admin per-repo guardrail override. Requires a non-empty reason
   // (mirrors the server 400). Setting it clears guardrail_blocked in the demo (the
   // override downgrades the waivable findings); revoking re-arms it as blocked.
@@ -2345,6 +2461,104 @@ export const mockApi = {
     // messages). This is what makes Revoke round-trip back to "runs blocked".
     r.guardrail_blocked = (mockBlockedRepoMeta[id]?.block_messages.length ?? 0) > 0;
     return delay({ repo: { ...r } });
+  },
+
+  // ── GitHub Projects v2 sync (PRD #534) ───────────────────────────────────────
+  // Read the repo's link status. Mirrors the server: a linked repo returns its
+  // status object; an unlinked one 404s ("project sync not enabled for this repo"),
+  // the same 404 the server uses to hide existence from a non-owner.
+  getProjectSyncStatus: async (id: string) => {
+    const link = githubProjectLinks.get(id);
+    if (!link) throw new ApiError(404, "project sync not enabled for this repo");
+    return delay({ ...link });
+  },
+  // Owner type for the Adopt-first Provision nudge (PRD #576 M1). The mock treats
+  // every repo as org-owned so Provision stays available in the demo/offline mode.
+  getProjectSyncOwnerType: async (id: string) => {
+    void id;
+    return delay<{ owner_type: "User" | "Organization" }>({ owner_type: "Organization" });
+  },
+  // Provision a fresh project: record a uzi-owned link and return the created status.
+  provisionProjectSync: async (
+    id: string,
+    body: { owner_kind: ProjectSyncOwnerKind; title?: string },
+  ) => {
+    void body;
+    githubProjectLinks.set(id, {
+      project_number: 1000 + githubProjectLinks.size,
+      owned_by_uzi: true,
+      last_synced_at: null,
+      last_error: null,
+      item_count: 0,
+    });
+    return delay({ status: "provisioned" });
+  },
+  // Adopt an existing project by number: record an adopted (not uzi-owned) link.
+  adoptProjectSync: async (
+    id: string,
+    body: { project_number: number; owner_kind: ProjectSyncOwnerKind },
+  ) => {
+    githubProjectLinks.set(id, {
+      project_number: body.project_number,
+      owned_by_uzi: false,
+      last_synced_at: null,
+      last_error: null,
+      item_count: 0,
+    });
+    return delay({ status: "linked" });
+  },
+  // Re-seed an already-linked board (PRD #576 M3). A 404 when not linked, mirroring
+  // the server's not-linked sentinel; otherwise a no-op idempotent re-seed.
+  resyncProjectSync: async (id: string) => {
+    if (!githubProjectLinks.has(id))
+      throw new ApiError(404, "this repo has no linked project to resync");
+    return delay({ status: "resynced" });
+  },
+  // Safe column auto-create (PRD #576 M6): create a fresh uzi-owned field with all the
+  // repo's columns and switch the link to it. In the mock, clear the unmatched set so the
+  // panel reflects "all columns now sync".
+  autocreateProjectSyncColumns: async (id: string) => {
+    const link = githubProjectLinks.get(id);
+    if (!link)
+      throw new ApiError(404, "this repo has no linked project to auto-create columns for");
+    githubProjectLinks.set(id, { ...link, unmatched_columns: [] });
+    return delay({ status: "columns_created" });
+  },
+  // Unlink the repo from its project (empty 204 body).
+  disableProjectSync: async (id: string) => {
+    githubProjectLinks.delete(id);
+    githubProjectVisibility.delete(id);
+    return delay(null);
+  },
+
+  // ── Board access: visibility + write-only sharing (PRD #557) ────────────────
+  // Read the linked board's public flag. Mirrors the server: an unlinked repo
+  // 404s (same existence-hiding 404 as the status route); a linked one defaults
+  // to private until the toggle flips it.
+  getProjectSyncVisibility: async (id: string) => {
+    if (!githubProjectLinks.has(id))
+      throw new ApiError(404, "project sync not enabled for this repo");
+    return delay({ public: githubProjectVisibility.get(id) ?? false });
+  },
+  // Flip the board's public flag. The value is stored so the toggle round-trips.
+  setProjectSyncVisibility: async (id: string, isPublic: boolean) => {
+    githubProjectVisibility.set(id, isPublic);
+    return delay({ public: isPublic });
+  },
+  // Grant a GitHub user Reader access (empty 204 body). The designated login
+  // "nouser" 422s (ErrProjectSyncUserNotFound) so the bad-username inline-error
+  // vitest case exercises a real failure, not a resolved success.
+  shareProjectSync: async (id: string, username: string) => {
+    void id;
+    if (username.trim() === "nouser")
+      throw new ApiError(422, "no github user with that username");
+    return delay(null);
+  },
+  // Revoke a GitHub user's access (empty 204 body).
+  unshareProjectSync: async (id: string, username: string) => {
+    void id;
+    void username;
+    return delay(null);
   },
 
   // ── Tool allowlist + repo tool profiles (PRD #18 M4) ─────────────────────────
@@ -2610,6 +2824,7 @@ export const mockApi = {
       anthropic_secret_id: null,
       anthropic_secret_label: null,
       anthropic_bind_mode: "default" as const,
+      draining_since: null,
     };
     workers.push(w);
     const token = `uzi_wk_${Array.from(crypto.getRandomValues(new Uint8Array(18)), (b) => b.toString(16).padStart(2, "0")).join("")}`;
@@ -2656,7 +2871,8 @@ export const mockApi = {
   // is not a demo — and quota 2 against one seeded hosted worker puts the whole
   // journey three clicks away: provision → 2 of 2 → the button disables → delete →
   // it enables again.
-  // Quota 3 against TWO seeded hosted workers (PRD #113 M5 raised both by one). The
+  // Quota 5 against FOUR seeded hosted workers (PRD #496 added two cordoned demo
+  // workers, w-cordon-eu and w-cordon-idle, on top of the two PRD #113 M5 seeded). The
   // load-bearing property is unchanged and is why the numbers moved together: there is
   // exactly ONE slot of headroom, so web-ux can still drive provision -> at quota ->
   // button disables -> delete -> it enables again, which is the only way to prove the
@@ -2664,7 +2880,7 @@ export const mockApi = {
   //
   // The second seeded worker is the failed roller, which the demo previously could not
   // show at all — so a browser pass could only ever validate the healthy path.
-  hostedConfig: async () => delay({ enabled: true, quota: 3 }),
+  hostedConfig: async () => delay({ enabled: true, quota: 5 }),
   provisionHostedWorker: async (template: string, size: string, docker = false, name?: string) => {
     const w = {
       id: `w-hosted-${++workerCounter}`,
@@ -2706,6 +2922,7 @@ export const mockApi = {
       anthropic_secret_id: null,
       anthropic_secret_label: null,
       anthropic_bind_mode: "default" as const,
+      draining_since: null,
     };
     workers.push(w);
     // { worker } and NOTHING ELSE. Do not mint a token here the way createWorker does
@@ -2731,6 +2948,7 @@ export const mockApi = {
       repo_id: repoId,
       forge_type: "gitlab",
       mr_web_url: null,
+      issue_web_url: null,
       kind: "issue",
       issue_iid: issueIid,
       issue_title: card.title,
@@ -2799,6 +3017,7 @@ export const mockApi = {
       repo_id: repoId,
       forge_type: "gitlab",
       mr_web_url: null,
+      issue_web_url: null,
       kind: "ci_fix",
       issue_iid: null,
       issue_title: `Fix CI: ${ref} pipeline`,
@@ -3284,7 +3503,13 @@ export const mockApi = {
     const inputs = (mockRunInputs[id] ?? []).map((i) => ({ ...i }));
     return delay({ inputs }, 60);
   },
-  submitRunInput: async (id: string, kind: RunInputKind, body = "", selection?: AgentSelectionInput) => {
+  submitRunInput: async (
+    id: string,
+    kind: RunInputKind,
+    body = "",
+    selection?: AgentSelectionInput,
+    overrideCapabilities?: boolean,
+  ) => {
     if (!getRun(id)) throw new ApiError(404, "run not found");
     // PRD #88: the engine returns the refusals the real api answers with (a 409 for an
     // answer to a question that has moved on, a 400 for a malformed body) rather than
@@ -3296,6 +3521,12 @@ export const mockApi = {
     // post-approval view has something to show.
     if (kind === "approve_plan" && selection) {
       patchRun(id, { agent_source: selection.source, agent_exclusions: selection.exclusions });
+    }
+    // PRD #84 M4 4c/4d: the "run without the capability" override clears the run's inferred
+    // required_capabilities before approving, mirroring the server (the false-positive
+    // correction). required_tools/size_class are display-only and untouched.
+    if (kind === "approve_plan" && overrideCapabilities) {
+      patchRun(id, { required_capabilities: [] });
     }
     return delay({ server_side: false }, 150);
   },
@@ -3357,6 +3588,7 @@ export const mockApi = {
       repo_id: null,
       forge_type: "",
       mr_web_url: null,
+      issue_web_url: null,
       kind: "chat",
       issue_iid: null,
       issue_title: truncateChatTitle(message),

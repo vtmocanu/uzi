@@ -23,6 +23,21 @@ SELECT w.id,
        w.hosted_size,
        w.hosted_generation,
        w.docker_enabled,
+       -- busy (PRD #422 M3, Decision 5): does this worker hold any non-terminal run? This
+       -- reuses the EXACT active-run predicate the DeleteWorker guard uses
+       -- (CountWorkerNonTerminalRuns), awaiting_approval included, because rolling a worker
+       -- that holds such a run would requeue it. Feeds the controller's cordon/defer-roll
+       -- decision (M4).
+       (SELECT count(*) FROM runs r
+          WHERE r.worker_id = w.id
+            AND r.status NOT IN ('completed', 'failed', 'cancelled')) > 0 AS busy,
+       -- draining_since (PRD #422 M3/M5): the raw nullable cordon timestamp — WHEN this
+       -- worker was cordoned, or NULL if it is not draining (draining == draining_since != nil).
+       -- M5 selects the timestamp itself rather than an `IS NOT NULL` boolean because the
+       -- controller's reconcile loop is stateless (it remembers nothing across ticks) and must
+       -- compute `now - draining_since >= deadline` to enforce the bounded drain deadline; the
+       -- bool it replaces could only answer "draining y/n", not "for how long".
+       w.draining_since,
        t.token_ciphertext
 FROM workers w
 LEFT JOIN hosted_worker_tokens t ON t.worker_id = w.id
@@ -189,3 +204,26 @@ WHERE worker_id = @worker_id
 UPDATE hosted_worker_tokens SET token_ciphertext = NULL
 WHERE token_ciphertext IS NOT NULL
   AND created_at < @cutoff;
+
+-- name: CordonHostedWorker :execrows
+-- Controller cordon-write (PRD #422 M4): mark a hosted worker draining so the claim
+-- gate (workersvc.Claim) idles it — it finishes its in-flight runs, then the controller
+-- rolls it. COALESCE preserves the ORIGINAL cordon time so a repeat cordon is idempotent
+-- and does NOT reset the M5 drain-deadline clock. Scoped to kind='hosted': the controller
+-- manages only hosted workers and must never cordon an external one. Rows affected = 0
+-- means no such hosted worker exists (the handler answers 404).
+UPDATE workers
+   SET draining_since = COALESCE(draining_since, now()), updated_at = now()
+ WHERE id = @id AND kind = 'hosted';
+
+-- name: UncordonHostedWorker :execrows
+-- Controller uncordon-write (issue #458): clear draining_since so a worker that was
+-- cordoned on drift but whose drift was then REVERTED (nothing to roll) resumes claiming.
+-- draining_since is otherwise cleared ONLY by RegisterWorker on an actual roll, so a
+-- reverted-drift worker would stay cordoned forever. Idempotent: NULL->NULL is harmless,
+-- so no `draining_since IS NOT NULL` guard — that keeps rows-affected=0 meaning
+-- unambiguously "no such hosted worker" (clean 404), not "already clear". kind='hosted'
+-- mirrors CordonHostedWorker: never touch an external worker.
+UPDATE workers
+   SET draining_since = NULL, updated_at = now()
+ WHERE id = @id AND kind = 'hosted';

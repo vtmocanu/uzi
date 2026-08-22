@@ -3,13 +3,22 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, ApiError, isHttpsUrl, type ForgeConnection, type Repo, type ToolAllowlistEntry } from "../lib/api";
+import { api, ApiError, isHttpsUrl, type ForgeConnection, type ProjectSyncOwnerKind, type ProjectSyncStatus, type Repo, type ToolAllowlistEntry } from "../lib/api";
 import { repoFindings } from "../lib/privilege";
 import { useAuth } from "../auth/AuthContext";
-import { Alert, Badge, Button, Card, EmptyState, ListSkeleton, PageHeader, Select, Textarea, Toggle } from "../components/ui";
+import { Alert, Badge, Button, Card, EmptyState, Input, ListSkeleton, PageHeader, Select, Textarea, Toggle } from "../components/ui";
 import { PipelineBadge } from "../components/PipelineBadge";
+import { RepoSetupChip } from "../components/RepoSetupChip";
 import { Modal } from "../components/Modal";
 import { BoardIcon, XIcon } from "../components/icons";
+import { DocLink } from "../components/DocLink";
+import { DOC_GITHUB_PROJECT_SYNC, DOC_REPO_AGENTS } from "../lib/doclinks";
+import { selectedForge } from "../lib/prefs";
+
+// The server-owned capability vocabulary (PRD #84). The repo hint offers only these
+// names; the server capability.Filters anything else, so free-form entry is not
+// allowed. Keep in sync with api/internal/capability's Vocabulary.
+const CAPABILITY_VOCABULARY = ["docker", "jvm"] as const;
 
 export function Repos() {
   // The guardrail override write is admin-only (PRD #66 D8): a member sees the block
@@ -23,6 +32,9 @@ export function Repos() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
+  // A 422 enable-guardrail refusal carries a violation list we render below the
+  // page Alert, mirroring the identical 422 contract in ForgeSettings (PRD #345).
+  const [enableViolations, setEnableViolations] = useState<string[] | null>(null);
   // The repo whose "Trusted repo" panel is currently expanded. The panel groups a
   // master control over two independently-revocable capabilities — Repo skills and
   // Repo instructions (PRD #246). It renders OUTSIDE the horizontally-scrolling
@@ -32,6 +44,11 @@ export function Repos() {
   // this holds the repo whose enable-confirm is showing. Disabling (master or a
   // sub-toggle) is immediate, matching the existing opt-in patterns.
   const [confirmTrustId, setConfirmTrustId] = useState<string | null>(null);
+  // Explicit per-repo remove (PRD #357): the disabled repo whose row-inline
+  // "Confirm remove / Cancel" affordance is showing. Its own state, distinct from
+  // confirmTrustId — that confirm renders in the panel OUTSIDE the table, this one
+  // stays in the row's action cell.
+  const [confirmRemoveId, setConfirmRemoveId] = useState<string | null>(null);
   // Per-capability busy state so each PATCH disables only its own control.
   const [skillsBusyId, setSkillsBusyId] = useState<string | null>(null);
   const [claudemdBusyId, setClaudemdBusyId] = useState<string | null>(null);
@@ -43,6 +60,45 @@ export function Repos() {
   const [allowlist, setAllowlist] = useState<ToolAllowlistEntry[] | null>(null);
   const [toolSelection, setToolSelection] = useState<Set<string>>(new Set());
   const [toolsBusy, setToolsBusy] = useState(false);
+  // GitHub Projects v2 sync panel (PRD #534): the repo whose sync panel is open,
+  // the fetched status (null until loaded, or when the repo is not linked), and
+  // the load/action flags. The panel renders OUTSIDE the table like the Trusted/
+  // Tools panels. syncLinked distinguishes a 200 (linked → readout) from a 404
+  // (not linked → provision/adopt forms); a non-404 fetch error goes in syncError.
+  const [syncRepoId, setSyncRepoId] = useState<string | null>(null);
+  const [syncStatus, setSyncStatus] = useState<ProjectSyncStatus | null>(null);
+  const [syncLinked, setSyncLinked] = useState(false);
+  const [syncLoading, setSyncLoading] = useState(false);
+  const [syncBusy, setSyncBusy] = useState(false);
+  // Inline error for the sync panel (load or action). 409 → "ask an admin" copy;
+  // 422 → GitHub-only/scope copy. Rendered inside the panel, not the page Alert.
+  const [syncError, setSyncError] = useState("");
+  // Provision + Adopt form fields, reset each time the panel opens.
+  const [provisionOwnerKind, setProvisionOwnerKind] = useState<ProjectSyncOwnerKind>("user");
+  const [provisionTitle, setProvisionTitle] = useState("");
+  const [adoptOwnerKind, setAdoptOwnerKind] = useState<ProjectSyncOwnerKind>("user");
+  const [adoptProjectNumber, setAdoptProjectNumber] = useState("");
+  // Owner type of the repo, for the Adopt-first Provision feasibility nudge (PRD
+  // #576 M1): fetched (resiliently) when the panel opens for a NOT-linked repo.
+  // "User" → Provision is infeasible (disabled with a reason); "Organization" →
+  // Provision is available; null → unresolved/error → fall back to both enabled.
+  const [syncOwnerType, setSyncOwnerType] = useState<"User" | "Organization" | null>(null);
+  // Board access (PRD #557), inside the linked readout. Visibility is fetched
+  // lazily when the panel opens, in its OWN call (D4): null = not-yet-loaded or
+  // unavailable (toggle disabled), true/false = the board's public flag.
+  // A visibility fetch/toggle failure lands in syncVisibilityError — a small
+  // inline caption — so it never blows away the whole linked readout.
+  const [syncPublic, setSyncPublic] = useState<boolean | null>(null);
+  const [syncVisibilityError, setSyncVisibilityError] = useState("");
+  const [syncVisibilityBusy, setSyncVisibilityBusy] = useState(false);
+  // Write-only sharing (D2): GitHub exposes no collaborator list, so we grant/
+  // revoke by username and remember just the usernames granted THIS session so a
+  // revoke affordance and a transient confirmation can show for them.
+  const [shareUsername, setShareUsername] = useState("");
+  const [sharedThisSession, setSharedThisSession] = useState<string[]>([]);
+  const [shareBusy, setShareBusy] = useState(false);
+  const [shareError, setShareError] = useState("");
+  const [shareConfirmation, setShareConfirmation] = useState("");
   // The guardrail Allow-anyway modal (PRD #66 M9, D8): the repo whose modal is open,
   // the admin's reason, and the in-flight POST. Revoke reuses overrideBusyId.
   const [allowRepoId, setAllowRepoId] = useState<string | null>(null);
@@ -60,12 +116,23 @@ export function Repos() {
   // ("Mark as trusted", the first button inside) so a screen-reader user hears it —
   // the master switch's aria-checked stays false until the PATCH lands.
   const confirmTrustRef = useRef<HTMLDivElement | null>(null);
+  // The row-inline remove-confirm block; when it opens, focus moves to its primary
+  // button ("Confirm remove", the first button inside) for screen-reader users —
+  // same a11y pattern as the trust confirm above.
+  const confirmRemoveRef = useRef<HTMLDivElement | null>(null);
+  // Focus management for the Project-sync panel (PRD #534): remember its cell
+  // trigger so focus returns to it on close, and move focus into the panel on open.
+  const syncTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const syncPanelRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     if (trustRepoId) trustPanelRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
   }, [trustRepoId]);
   useEffect(() => {
     if (confirmTrustId) confirmTrustRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
   }, [confirmTrustId]);
+  useEffect(() => {
+    if (confirmRemoveId) confirmRemoveRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+  }, [confirmRemoveId]);
 
   const closeTrust = () => {
     setTrustRepoId(null);
@@ -73,12 +140,254 @@ export function Repos() {
     trustTriggerRef.current?.focus();
   };
 
+  // Load the repo's Projects-sync status (PRD #534). A 404 is the expected "not
+  // linked yet" signal — treated as a state, not an error — so the panel shows
+  // the provision/adopt forms. Any other failure lands in syncError.
+  const loadSyncStatus = useCallback(async (repoId: string) => {
+    setSyncError("");
+    // Board-access state is per-board; reset it on every (re)load so state from a
+    // previously linked board never bleeds onto a re-linked one. provision/adopt/
+    // disable re-enter here WITHOUT the panel-open reset effect, so this — not that
+    // effect — is the single place that clears it (PRD #557 review).
+    setSyncPublic(null);
+    setSyncVisibilityError("");
+    setShareUsername("");
+    setSharedThisSession([]);
+    setShareError("");
+    setShareConfirmation("");
+    setSyncOwnerType(null);
+    setSyncLoading(true);
+    try {
+      const status = await api.getProjectSyncStatus(repoId);
+      setSyncStatus(status);
+      setSyncLinked(true);
+      // Board visibility is a SEPARATE live-forge call (D4), only worth making
+      // once we know the repo is linked. Its own try/catch: a failure sets a
+      // small inline caption and leaves syncPublic=null (toggle disabled) — it
+      // must NOT set the big syncError alert or break the rest of the readout.
+      try {
+        const vis = await api.getProjectSyncVisibility(repoId);
+        setSyncPublic(vis.public);
+      } catch (visErr) {
+        setSyncPublic(null);
+        setSyncVisibilityError(
+          visErr instanceof ApiError ? visErr.message : "Couldn't read the board's visibility.",
+        );
+      }
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) {
+        setSyncStatus(null);
+        setSyncLinked(false);
+        // Not linked: resolve the owner type for the Provision feasibility nudge
+        // (PRD #576 M1). Resilient — any failure leaves it null, which falls back
+        // to showing BOTH paths fully enabled (current behavior).
+        try {
+          const ot = await api.getProjectSyncOwnerType(repoId);
+          setSyncOwnerType(ot?.owner_type ?? null);
+        } catch {
+          setSyncOwnerType(null);
+        }
+      } else {
+        setSyncStatus(null);
+        setSyncLinked(false);
+        setSyncError(err instanceof ApiError ? err.message : "Failed to load the sync status");
+      }
+    } finally {
+      setSyncLoading(false);
+    }
+  }, []);
+
+  // On open, reset the forms and (re)load status; move focus into the panel.
+  useEffect(() => {
+    if (!syncRepoId) return;
+    setSyncError("");
+    setProvisionOwnerKind("user");
+    setProvisionTitle("");
+    setAdoptOwnerKind("user");
+    setAdoptProjectNumber("");
+    // Board-access state is reset inside loadSyncStatus (the single place that owns
+    // it, so provision/adopt/disable re-entries clear it too — PRD #557 review).
+    loadSyncStatus(syncRepoId);
+    syncPanelRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+  }, [syncRepoId, loadSyncStatus]);
+
+  const closeSync = () => {
+    setSyncRepoId(null);
+    syncTriggerRef.current?.focus();
+  };
+
+  // Map a sync-action failure to inline copy. 409 is ErrProjectSyncDisabled (the
+  // instance flag is off — v1 also folds already-linked into this copy per D3);
+  // 422 is not-GitHub / unsupported / missing-scope.
+  const syncErrorMessage = (err: unknown): string => {
+    if (err instanceof ApiError) {
+      if (err.status === 409)
+        return "Projects sync is turned off for this instance — ask an admin to enable it.";
+      if (err.status === 422)
+        return (
+          err.message ||
+          "This repo can't use Projects sync (GitHub repos only, and your token needs project scope)."
+        );
+      return err.message;
+    }
+    return "Something went wrong. Please try again.";
+  };
+
+  const provisionSync = async (repoId: string) => {
+    setSyncError("");
+    setSyncBusy(true);
+    try {
+      await api.provisionProjectSync(repoId, {
+        owner_kind: provisionOwnerKind,
+        title: provisionTitle.trim() || undefined,
+      });
+      await loadSyncStatus(repoId);
+    } catch (err) {
+      setSyncError(syncErrorMessage(err));
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
+  const adoptSync = async (repoId: string) => {
+    const num = Number(adoptProjectNumber);
+    if (!Number.isInteger(num) || num <= 0) {
+      setSyncError("Enter the project's number (a positive whole number).");
+      return;
+    }
+    setSyncError("");
+    setSyncBusy(true);
+    try {
+      await api.adoptProjectSync(repoId, { project_number: num, owner_kind: adoptOwnerKind });
+      await loadSyncStatus(repoId);
+    } catch (err) {
+      setSyncError(syncErrorMessage(err));
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
+  // Re-seed an already-linked board (PRD #576 M3): re-reads the Status field so
+  // newly-added options resolve, then reloads status so the skipped-columns list and
+  // health reflect the result. Reuses the syncBusy pattern from adopt/provision.
+  const resyncSync = async (repoId: string) => {
+    setSyncError("");
+    setSyncBusy(true);
+    try {
+      await api.resyncProjectSync(repoId);
+      await loadSyncStatus(repoId);
+    } catch (err) {
+      setSyncError(syncErrorMessage(err));
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
+  // Safe column auto-create (PRD #576 M6): create a fresh uzi-owned "uzi Status" field
+  // carrying every board column and switch the link to it, so the skipped columns start
+  // syncing without a manual GitHub edit. Reuses the syncBusy pattern; reloads status so
+  // the (now empty) skipped-columns list and health reflect the result.
+  const autocreateSyncColumns = async (repoId: string) => {
+    setSyncError("");
+    setSyncBusy(true);
+    try {
+      await api.autocreateProjectSyncColumns(repoId);
+      await loadSyncStatus(repoId);
+    } catch (err) {
+      setSyncError(syncErrorMessage(err));
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
+  const disableSync = async (repoId: string) => {
+    setSyncError("");
+    setSyncBusy(true);
+    try {
+      await api.disableProjectSync(repoId);
+      await loadSyncStatus(repoId);
+    } catch (err) {
+      setSyncError(syncErrorMessage(err));
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
+  // Board access — visibility toggle + write-only sharing (PRD #557). All three
+  // route failures through inline copy near their control, never the top Alert.
+
+  // Flip the board's public flag. Awaits the PUT and adopts the response's
+  // `public` (authoritative), so the toggle reflects true state; an error keeps
+  // the last-known value and shows an inline caption.
+  const toggleVisibility = async (repoId: string, next: boolean) => {
+    setSyncVisibilityError("");
+    setSyncVisibilityBusy(true);
+    try {
+      const vis = await api.setProjectSyncVisibility(repoId, next);
+      setSyncPublic(vis.public);
+    } catch (err) {
+      setSyncVisibilityError(syncErrorMessage(err));
+    } finally {
+      setSyncVisibilityBusy(false);
+    }
+  };
+
+  // Map a share/unshare failure to inline copy. 422 is a bad username
+  // (ErrProjectSyncUserNotFound); everything else reuses the shared mapping.
+  const shareErrorMessage = (err: unknown, username: string): string => {
+    if (err instanceof ApiError && err.status === 422)
+      return `No GitHub user named "${username}".`;
+    return syncErrorMessage(err);
+  };
+
+  const shareSync = async (repoId: string) => {
+    const username = shareUsername.trim();
+    setShareError("");
+    setShareConfirmation("");
+    if (!username) {
+      setShareError("Enter a GitHub username.");
+      return;
+    }
+    setShareBusy(true);
+    try {
+      await api.shareProjectSync(repoId, username);
+      setSharedThisSession((prev) => (prev.includes(username) ? prev : [...prev, username]));
+      setShareUsername("");
+      setShareConfirmation(`Shared with ${username} as Reader.`);
+    } catch (err) {
+      setShareError(shareErrorMessage(err, username));
+    } finally {
+      setShareBusy(false);
+    }
+  };
+
+  const unshareSync = async (repoId: string, username: string) => {
+    setShareError("");
+    setShareConfirmation("");
+    setShareBusy(true);
+    try {
+      await api.unshareProjectSync(repoId, username);
+      setSharedThisSession((prev) => prev.filter((u) => u !== username));
+      setShareConfirmation(`Revoked ${username}'s access.`);
+    } catch (err) {
+      setShareError(shareErrorMessage(err, username));
+    } finally {
+      setShareBusy(false);
+    }
+  };
+
   useEffect(() => {
     (async () => {
       try {
         const { connections } = await api.listConnections();
         setConnections(connections);
-        if (connections.length > 0) setConnectionId(connections[0].id);
+        if (connections.length > 0) {
+          // Prefer the remembered connection, but validate it against the live
+          // list — a since-deleted connection falls back to the first (issue #578).
+          const remembered = selectedForge.get();
+          const match = remembered && connections.some((c) => c.id === remembered) ? remembered : connections[0].id;
+          setConnectionId(match);
+        }
       } catch (err) {
         setError(err instanceof ApiError ? err.message : "Failed to load connections");
       } finally {
@@ -107,12 +416,38 @@ export function Repos() {
 
   const toggle = async (repo: Repo) => {
     setError("");
+    setEnableViolations(null);
     setBusyId(repo.id);
     try {
       const { repo: updated } = await api.setRepoEnabled(repo.id, !repo.enabled);
       setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+      setEnableViolations(null);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Update failed");
+      if (err instanceof ApiError && err.status === 422) {
+        const body = err.body as { violations?: string[] } | null;
+        setError(err.message);
+        setEnableViolations(body?.violations ?? []);
+      } else {
+        setError(err instanceof ApiError ? err.message : "Update failed");
+      }
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  // Explicit per-repo remove (PRD #357), modeled on `toggle`: clear any error,
+  // DELETE the repo, then drop it from local state so the row disappears. On a
+  // failure (e.g. the server's 409 for an enabled/in-flight repo) surface the
+  // message the same way `toggle` does. Reachable only from the row-inline confirm.
+  const removeRepo = async (repo: Repo) => {
+    setError("");
+    setBusyId(repo.id);
+    try {
+      await api.deleteRepo(repo.id);
+      setRepos((prev) => prev.filter((r) => r.id !== repo.id));
+      setConfirmRemoveId(null);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Remove failed");
     } finally {
       setBusyId(null);
     }
@@ -241,6 +576,23 @@ export function Repos() {
     }
   };
 
+  // Static per-repo capability hint (PRD #84 M2): route this repo's runs only to
+  // workers that have the ticked capabilities. Applied immediately like the devbox
+  // toggle; the server capability.Filters the list, so the response is authoritative
+  // and reflected in repo state so the checkboxes stay in sync.
+  const setRepoRequiredCapabilities = async (repo: Repo, nextCaps: string[]) => {
+    setError("");
+    setToolsBusy(true);
+    try {
+      const { repo: updated } = await api.setRepoRequiredCapabilities(repo.id, nextCaps);
+      setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Update failed");
+    } finally {
+      setToolsBusy(false);
+    }
+  };
+
   // Open the Allow-anyway modal for a blocked repo (admin only). Resets the reason.
   const openAllow = (repo: Repo) => {
     setError("");
@@ -297,6 +649,13 @@ export function Repos() {
   // findings badges (null until a check has run).
   const privilegeReport = connections.find((c) => c.id === connectionId)?.privilege_report ?? null;
 
+  // GitHub Projects v2 sync (PRD #534) applies only to GitHub connections. Derive
+  // GitHub-ness from the SELECTED connection's forge_type — never by parsing
+  // web_url. The Project-sync cell renders only when this is true.
+  const isGithub = connections.find((c) => c.id === connectionId)?.forge_type === "github";
+  // The repo whose Project-sync panel is expanded (rendered below the table).
+  const syncRepo = repos.find((r) => r.id === syncRepoId) ?? null;
+
   // The repo whose Trusted-repo panel is expanded (rendered below the table,
   // outside its horizontal scroll container).
   const trustRepo = repos.find((r) => r.id === trustRepoId) ?? null;
@@ -319,7 +678,12 @@ export function Repos() {
     <div className="space-y-6">
       <PageHeader
         title="Boards"
-        description="Projects your bot can see. Enable one to track its PRD issues on a board."
+        description={
+          <>
+            Projects your bot can see. Enable one to track its PRD issues on a board. See the{" "}
+            <DocLink slug={DOC_REPO_AGENTS}>repo agents</DocLink> guide.
+          </>
+        }
         actions={
           connectionId ? (
             <Button variant="secondary" size="sm" disabled={refreshing} onClick={() => loadProjects(connectionId)}>
@@ -330,6 +694,24 @@ export function Repos() {
       />
 
       {error && <Alert message={error} />}
+      {enableViolations && (
+        <Card className="border-danger/40 bg-danger/5">
+          {/* role="alert" so the reasons are announced to assistive tech when they
+              appear; Card does not forward a role, so it sits on the wrapper (PRD #345 M3). */}
+          <div role="alert">
+            <p className="text-sm font-medium text-danger">This repository was not enabled — the guardrail refused it:</p>
+            <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-fg">
+              {enableViolations.map((v, i) => (
+                <li key={i}>{v}</li>
+              ))}
+            </ul>
+            <p className="mt-3 text-sm text-muted">
+              Fix the repository's default-branch protection on the forge so the bot cannot push or
+              merge to it directly, then click Enable again.
+            </p>
+          </div>
+        </Card>
+      )}
 
       {loading ? (
         <ListSkeleton rows={4} />
@@ -348,7 +730,14 @@ export function Repos() {
         <>
           {connections.length > 1 && (
             <div className="max-w-md">
-              <Select value={connectionId} onChange={(e) => setConnectionId(e.target.value)}>
+              <Select
+                value={connectionId}
+                onChange={(e) => {
+                  setConnectionId(e.target.value);
+                  // Persist ONLY on an explicit user change, not the mount fallback (issue #578).
+                  selectedForge.set(e.target.value);
+                }}
+              >
                 {connections.map((c) => (
                   <option key={c.id} value={c.id}>
                     {c.bot_username} — {c.base_url}
@@ -358,8 +747,13 @@ export function Repos() {
             </div>
           )}
 
-          <Card className="p-0">
-            <div className="overflow-x-auto">
+          {/* Grouping div, not a Card: the board list grows down the page like
+              /schedules rather than reading as a padded scroll container (issue
+              #578). The table and its three detail panels are siblings here — the
+              panels stay OUTSIDE the table's horizontal-scroll box so their copy is
+              never clipped; a 16px gap (space-y-4) separates them. */}
+          <div className="space-y-4">
+            <div className="overflow-x-auto rounded-xl border border-edge bg-surface">
               <table className="w-full text-left text-sm">
                 <thead className="border-b border-edge text-muted">
                   <tr>
@@ -368,13 +762,14 @@ export function Repos() {
                     <th className="px-4 py-3 font-medium">Status</th>
                     <th className="px-4 py-3 font-medium">Trusted repo</th>
                     <th className="px-4 py-3 font-medium">Tools</th>
+                    <th className="px-4 py-3 font-medium">Project sync</th>
                     <th className="px-4 py-3 text-right font-medium">Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-edge">
                   {repos.length === 0 ? (
                     <tr>
-                      <td colSpan={6} className="px-4 py-6 text-center text-faint">
+                      <td colSpan={7} className="px-4 py-6 text-center text-faint">
                         {refreshing ? "Loading…" : "No projects found for this bot."}
                       </td>
                     </tr>
@@ -485,6 +880,11 @@ export function Repos() {
                                 </Badge>
                               );
                             })()}
+                            {/* PRD #361 M4: the neutral per-repo Setup chip, appended
+                                after the guardrail badges. Enabled-only, matching the
+                                Trusted/Tools cells' `!r.enabled` guards — a disabled
+                                repo has no capabilities to report. */}
+                            {r.enabled && <RepoSetupChip repo={r} />}
                           </div>
                         </td>
                         <td className="px-4 py-3">
@@ -526,24 +926,126 @@ export function Repos() {
                             </Button>
                           )}
                         </td>
+                        <td className="px-4 py-3">
+                          {/* Project sync (PRD #534) is GitHub-only, and — like the
+                              Trusted/Tools cells — offered only on an enabled repo. A
+                              non-GitHub or disabled repo shows nothing actionable. */}
+                          {!isGithub || !r.enabled ? (
+                            <span className="text-xs text-faint">—</span>
+                          ) : (
+                            <div className="flex flex-wrap items-center gap-2">
+                              {/* Health-aware sync badge (PRD #576 M2): green when the
+                                  repo is linked and the last sync recorded no error,
+                                  danger when a last_error is set (with the error in the
+                                  title/aria), neutral when the repo is not linked. */}
+                              {(() => {
+                                const sync = r.github_project_sync;
+                                if (sync && sync.linked && !sync.healthy) {
+                                  return (
+                                    <Badge
+                                      tone="danger"
+                                      dot
+                                      title={sync.last_error ?? "Sync error"}
+                                      aria-label={`Sync error: ${sync.last_error ?? "unknown"}`}
+                                    >
+                                      Sync
+                                    </Badge>
+                                  );
+                                }
+                                if (sync && sync.linked) {
+                                  return (
+                                    <Badge tone="ok" dot title="Sync healthy">
+                                      Sync
+                                    </Badge>
+                                  );
+                                }
+                                return (
+                                  <Badge tone="neutral" dot>
+                                    Sync
+                                  </Badge>
+                                );
+                              })()}
+                              <Button
+                                variant="secondary"
+                                size="sm"
+                                aria-expanded={syncRepoId === r.id}
+                                aria-label={`Project sync settings for ${r.path_with_namespace}`}
+                                onClick={(e) => {
+                                  syncTriggerRef.current = e.currentTarget;
+                                  setSyncRepoId((id) => (id === r.id ? null : r.id));
+                                }}
+                              >
+                                {syncRepoId === r.id ? "Close" : "Manage"}
+                              </Button>
+                            </div>
+                          )}
+                        </td>
                         <td className="px-4 py-3 text-right">
-                          <div className="flex justify-end gap-2">
-                            {r.enabled && (
-                              <Link to={`/repos/${r.id}/board`}>
-                                <Button variant="secondary" size="sm">
-                                  Open board
-                                </Button>
-                              </Link>
-                            )}
-                            <Button
-                              variant={r.enabled ? "danger" : "primary"}
-                              size="sm"
-                              disabled={busyId === r.id}
-                              onClick={() => toggle(r)}
+                          {/* Remove is reachable only from the disabled state (PRD #357
+                              D2); confirming it is permanent. The confirm is row-inline
+                              (its own state), replacing the action buttons in place. */}
+                          {confirmRemoveId === r.id ? (
+                            <div
+                              ref={confirmRemoveRef}
+                              role="group"
+                              aria-label={`Confirm removing ${r.path_with_namespace}`}
+                              className="ml-auto max-w-xs space-y-2 rounded-md border border-danger/40 bg-danger/5 p-3 text-left"
                             >
-                              {r.enabled ? "Disable" : "Enable"}
-                            </Button>
-                          </div>
+                              <p className="text-xs text-fg">
+                                <span className="font-medium">Remove {r.path_with_namespace}?</span> This is
+                                permanent and deletes its board and run history. If the bot still has access to
+                                the project, a refresh re-adds it as a disabled repo.
+                              </p>
+                              <div className="flex justify-end gap-2">
+                                <Button
+                                  variant="danger"
+                                  size="sm"
+                                  disabled={busyId === r.id}
+                                  onClick={() => removeRepo(r)}
+                                >
+                                  {busyId === r.id ? "Removing…" : "Confirm remove"}
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  disabled={busyId === r.id}
+                                  onClick={() => setConfirmRemoveId(null)}
+                                >
+                                  Cancel
+                                </Button>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="flex justify-end gap-2">
+                              {r.enabled && (
+                                <Link to={`/repos/${r.id}/board`}>
+                                  <Button variant="secondary" size="sm">
+                                    Open board
+                                  </Button>
+                                </Link>
+                              )}
+                              <Button
+                                variant={r.enabled ? "danger" : "primary"}
+                                size="sm"
+                                disabled={busyId === r.id}
+                                onClick={() => toggle(r)}
+                              >
+                                {r.enabled ? "Disable" : "Enable"}
+                              </Button>
+                              {/* Remove only on a DISABLED repo (PRD #357 D2). An enabled
+                                  repo shows no Remove button; disable it first. */}
+                              {!r.enabled && (
+                                <Button
+                                  variant="danger"
+                                  size="sm"
+                                  disabled={busyId === r.id}
+                                  onClick={() => setConfirmRemoveId(r.id)}
+                                >
+                                  Remove
+                                </Button>
+                              )}
+                            </div>
+                          )}
                         </td>
                       </tr>
                     ))
@@ -561,7 +1063,7 @@ export function Repos() {
                 ref={trustPanelRef}
                 role="group"
                 aria-label={`Trusted repo for ${trustRepo.path_with_namespace}`}
-                className="space-y-4 border-t border-edge bg-raised/20 p-4"
+                className="space-y-4 rounded-xl border border-edge bg-raised/20 p-4"
               >
                 {/* Header: what "trusted" means, plus the master switch. */}
                 <div className="flex items-start gap-4">
@@ -715,7 +1217,7 @@ export function Repos() {
               <div
                 role="group"
                 aria-label={`Tool profile for ${toolsRepo.path_with_namespace}`}
-                className="space-y-3 border-t border-edge bg-raised/20 p-4"
+                className="space-y-3 rounded-xl border border-edge bg-raised/20 p-4"
               >
                 <p className="text-sm text-fg">
                   <span className="font-medium">Tools for {toolsRepo.path_with_namespace}</span> — the worker installs
@@ -775,9 +1277,354 @@ export function Repos() {
                     conflict.
                   </p>
                 </div>
+
+                {/* Static per-repo capability hint (PRD #84 M2): route this repo's
+                    runs only to workers with the ticked capabilities. Fixed
+                    vocabulary, no free-form entry. */}
+                <div
+                  role="group"
+                  aria-label="Required capabilities"
+                  className="space-y-1.5 border-t border-edge pt-3"
+                >
+                  <p className="text-sm text-fg">Required capabilities</p>
+                  <p className="text-xs text-muted">
+                    Route this repo&rsquo;s runs only to workers that have them.
+                  </p>
+                  <div className="flex flex-wrap gap-x-6 gap-y-2 pt-1">
+                    {CAPABILITY_VOCABULARY.map((cap) => {
+                      const current = toolsRepo.required_capabilities ?? [];
+                      const checked = current.includes(cap);
+                      return (
+                        <label key={cap} className="flex items-center gap-2 text-sm text-fg">
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            disabled={toolsBusy}
+                            onChange={(e) => {
+                              const next = e.target.checked
+                                ? [...current, cap]
+                                : current.filter((c) => c !== cap);
+                              setRepoRequiredCapabilities(toolsRepo, next);
+                            }}
+                          />
+                          <span className="font-mono text-xs">{cap}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
               </div>
             )}
-          </Card>
+
+            {/* GitHub Projects v2 sync panel (PRD #534). Rendered OUTSIDE the
+                overflow-x-auto table above, like the Trusted/Tools panels, so its
+                forms are never clipped. Opening it fetches the repo's link status:
+                a 404 means "not linked" (the provision/adopt entry state, not an
+                error); a 200 is the linked readout + Disable. */}
+            {syncRepo && (
+              <div
+                ref={syncPanelRef}
+                role="group"
+                aria-label={`Project sync for ${syncRepo.path_with_namespace}`}
+                className="space-y-4 rounded-xl border border-edge bg-raised/20 p-4"
+              >
+                <div className="min-w-0 space-y-1">
+                  <h3 className="flex items-center gap-2 text-sm font-semibold text-fg">
+                    GitHub Projects sync
+                    <Badge tone={syncLinked ? "ok" : "neutral"} dot>
+                      {syncLinked ? "Linked" : "Not linked"}
+                    </Badge>
+                  </h3>
+                  <p className="max-w-2xl text-sm text-muted">
+                    Mirror {syncRepo.path_with_namespace}&rsquo;s board onto a GitHub Projects v2
+                    board. See the{" "}
+                    <DocLink slug={DOC_GITHUB_PROJECT_SYNC}>GitHub Projects v2 sync</DocLink> guide.
+                  </p>
+                </div>
+
+                {syncError && <Alert message={syncError} />}
+
+                {syncLoading ? (
+                  <p className="text-sm text-faint">Loading…</p>
+                ) : syncLinked && syncStatus ? (
+                  // Linked: a readout of the current link + a Disable (unlink) control.
+                  <div className="space-y-3">
+                    <dl className="grid gap-x-6 gap-y-1.5 rounded-md border border-edge bg-raised p-3 text-sm sm:grid-cols-2">
+                      <div className="flex justify-between gap-2 sm:block">
+                        <dt className="text-muted">Project number</dt>
+                        <dd className="font-mono text-fg">#{syncStatus.project_number}</dd>
+                      </div>
+                      <div className="flex justify-between gap-2 sm:block">
+                        <dt className="text-muted">Ownership</dt>
+                        <dd className="text-fg">{syncStatus.owned_by_uzi ? "owned by uzi" : "adopted"}</dd>
+                      </div>
+                      <div className="flex justify-between gap-2 sm:block">
+                        <dt className="text-muted">Items</dt>
+                        <dd className="text-fg">{syncStatus.item_count}</dd>
+                      </div>
+                      <div className="flex justify-between gap-2 sm:block">
+                        <dt className="text-muted">Last synced</dt>
+                        <dd className="text-fg">
+                          {syncStatus.last_synced_at
+                            ? new Date(syncStatus.last_synced_at).toLocaleString()
+                            : "never"}
+                        </dd>
+                      </div>
+                      <div className="flex justify-between gap-2 sm:col-span-2 sm:block">
+                        <dt className="text-muted">Last error</dt>
+                        <dd className="text-fg">{syncStatus.last_error ?? "none"}</dd>
+                      </div>
+                    </dl>
+
+                    {/* Skipped columns advisory (PRD #576 M3): board columns with no
+                        matching Status option never sync. Surface them with a Resync
+                        loop — add the options in GitHub, then Resync to pick them up. */}
+                    {syncStatus.unmatched_columns &&
+                      syncStatus.unmatched_columns.length > 0 && (
+                        <div
+                          role="alert"
+                          className="space-y-2 rounded-md border border-warn/40 bg-warn/10 p-3 text-sm"
+                        >
+                          <p className="text-fg">
+                            These board columns have no matching Status option and won&rsquo;t
+                            sync: {syncStatus.unmatched_columns.join(", ")}. Add them as Status
+                            options in GitHub, then Resync.
+                          </p>
+                          {/* Safe auto-create (PRD #576 M6): create uzi's own field with all
+                              columns rather than editing the user's field (no data-loss risk).
+                              Document the two-status-field tradeoff. */}
+                          <p className="text-muted">
+                            Or let uzi create its own &ldquo;uzi Status&rdquo; field with all your
+                            columns; your board will then show two status-like fields.
+                          </p>
+                          <Button
+                            size="sm"
+                            disabled={syncBusy}
+                            onClick={() => autocreateSyncColumns(syncRepo.id)}
+                          >
+                            {syncBusy ? "Working…" : "Auto-create the missing columns"}
+                          </Button>
+                        </div>
+                      )}
+
+                    <Button
+                      size="sm"
+                      disabled={syncBusy}
+                      onClick={() => resyncSync(syncRepo.id)}
+                    >
+                      {syncBusy ? "Working…" : "Resync"}
+                    </Button>
+
+                    {/* Board access (PRD #557): visibility toggle + write-only
+                        sharing. GitHub-gated already (linked implies GitHub). */}
+                    <div className="space-y-3 rounded-md border border-edge bg-raised p-3">
+                      <h4 className="text-sm font-semibold text-fg">Board access</h4>
+
+                      {/* Visibility toggle. syncPublic===null (and no error) reads
+                          as loading/unavailable → disabled. */}
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2">
+                          <Toggle
+                            label="Board visibility"
+                            checked={syncPublic === true}
+                            disabled={syncPublic === null || syncVisibilityBusy}
+                            onChange={(next) => toggleVisibility(syncRepo.id, next)}
+                          />
+                          <span className="text-sm text-fg">
+                            {syncVisibilityError
+                              ? "Visibility unavailable"
+                              : syncPublic === null
+                                ? "Loading visibility…"
+                                : syncPublic === true
+                                  ? "Public board"
+                                  : "Private board"}
+                          </span>
+                        </div>
+                        {syncPublic === true && (
+                          <p className="text-xs text-warn">
+                            This board is visible to anyone on the internet.
+                          </p>
+                        )}
+                        {syncVisibilityError && (
+                          <p role="alert" className="text-xs text-danger">
+                            {syncVisibilityError}
+                          </p>
+                        )}
+                      </div>
+
+                      {/* Share field (write-only). */}
+                      <div className="space-y-2">
+                        <div className="flex flex-wrap items-end gap-2">
+                          <label className="block flex-1 space-y-1">
+                            {/* The visible label IS the input's accessible name
+                                (no overriding aria-label) — WCAG 2.5.3 label-in-name. */}
+                            <span className="text-xs text-muted">Share with a GitHub user (Reader)</span>
+                            <Input
+                              value={shareUsername}
+                              disabled={shareBusy}
+                              placeholder="octocat"
+                              onChange={(e) => setShareUsername(e.target.value)}
+                            />
+                          </label>
+                          <Button size="sm" disabled={shareBusy} onClick={() => shareSync(syncRepo.id)}>
+                            {shareBusy ? "Working…" : "Share (Reader)"}
+                          </Button>
+                        </div>
+                        {/* Async grant/revoke outcomes announce to assistive tech:
+                            errors assertively (role=alert), confirmations politely
+                            (role=status), matching the panel's <Alert> precedent. */}
+                        {shareError && (
+                          <p role="alert" className="text-xs text-danger">
+                            {shareError}
+                          </p>
+                        )}
+                        {shareConfirmation && (
+                          <p role="status" className="text-xs text-ok">
+                            {shareConfirmation}
+                          </p>
+                        )}
+                        {sharedThisSession.length > 0 && (
+                          <div className="space-y-1">
+                            {/* Scope this list so it is not misread as an
+                                authoritative current-collaborators list (D2). */}
+                            <p className="text-xs text-muted">Granted this session:</p>
+                            <ul
+                              className="space-y-1"
+                              aria-label="Users granted access this session (GitHub does not expose the full current list)"
+                            >
+                              {sharedThisSession.map((name) => (
+                                <li key={name} className="flex items-center justify-between gap-2 text-sm">
+                                  <span className="font-mono text-fg">{name}</span>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    disabled={shareBusy}
+                                    onClick={() => unshareSync(syncRepo.id, name)}
+                                  >
+                                    Revoke
+                                  </Button>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                        {/* The honesty note (SC-5): a positive, always-present
+                            element — GitHub exposes no readable collaborator list. */}
+                        <p className="text-xs text-muted">
+                          GitHub does not expose a board&rsquo;s current sharing list, so uzi grants
+                          and revokes access by username rather than showing who currently has it.
+                        </p>
+                      </div>
+                    </div>
+
+                    <Button
+                      variant="danger"
+                      size="sm"
+                      disabled={syncBusy}
+                      onClick={() => disableSync(syncRepo.id)}
+                    >
+                      {syncBusy ? "Disabling…" : "Disable sync"}
+                    </Button>
+                  </div>
+                ) : (
+                  // Not linked: Adopt is the recommended default (PRD #576 M1);
+                  // Provision stays available but is nudged to secondary and, for a
+                  // user-owned repo, disabled with a reason (uzi can't own a Project
+                  // under a personal account — F-A). syncOwnerType null → both enabled.
+                  <div className="space-y-3">
+                    <p className="text-sm text-muted">
+                      Adopt a Project you already created (recommended); Provision only if
+                      uzi should create one for you (org repos).
+                    </p>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div className="space-y-2 rounded-md border border-edge bg-raised p-3">
+                        <h4 className="text-sm font-semibold text-fg">Adopt an existing project</h4>
+                        <p className="text-sm text-muted">
+                          Link an existing Project v2 by its number.
+                        </p>
+                        <label className="block space-y-1">
+                          <span className="text-xs text-muted">Owner</span>
+                          <Select
+                            aria-label="Adopt owner"
+                            value={adoptOwnerKind}
+                            disabled={syncBusy}
+                            onChange={(e) => setAdoptOwnerKind(e.target.value as ProjectSyncOwnerKind)}
+                          >
+                            <option value="user">User</option>
+                            <option value="org">Org</option>
+                            <option value="viewer">Viewer</option>
+                          </Select>
+                        </label>
+                        <label className="block space-y-1">
+                          <span className="text-xs text-muted">Project number</span>
+                          <Input
+                            type="number"
+                            aria-label="Project number"
+                            value={adoptProjectNumber}
+                            disabled={syncBusy}
+                            placeholder="42"
+                            onChange={(e) => setAdoptProjectNumber(e.target.value)}
+                          />
+                        </label>
+                        <Button size="sm" disabled={syncBusy} onClick={() => adoptSync(syncRepo.id)}>
+                          {syncBusy ? "Working…" : "Adopt"}
+                        </Button>
+                      </div>
+
+                      <div className="space-y-2 rounded-md border border-edge bg-raised p-3 opacity-90">
+                        <h4 className="text-sm font-semibold text-fg">Create a new project</h4>
+                        <p className="text-sm text-muted">
+                          uzi provisions a fresh Project v2 for this repo and owns it.
+                        </p>
+                        {syncOwnerType === "User" && (
+                          <p className="text-xs text-warn" role="note">
+                            uzi can&rsquo;t own a Project under a personal account — Adopt instead.
+                          </p>
+                        )}
+                        <label className="block space-y-1">
+                          <span className="text-xs text-muted">Owner</span>
+                          <Select
+                            aria-label="Provision owner"
+                            value={provisionOwnerKind}
+                            disabled={syncBusy || syncOwnerType === "User"}
+                            onChange={(e) => setProvisionOwnerKind(e.target.value as ProjectSyncOwnerKind)}
+                          >
+                            <option value="user">User</option>
+                            <option value="org">Org</option>
+                            <option value="viewer">Viewer</option>
+                          </Select>
+                        </label>
+                        <label className="block space-y-1">
+                          <span className="text-xs text-muted">Title (optional)</span>
+                          <Input
+                            aria-label="Project title"
+                            value={provisionTitle}
+                            disabled={syncBusy || syncOwnerType === "User"}
+                            placeholder="uzi board"
+                            onChange={(e) => setProvisionTitle(e.target.value)}
+                          />
+                        </label>
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          disabled={syncBusy || syncOwnerType === "User"}
+                          onClick={() => provisionSync(syncRepo.id)}
+                        >
+                          {syncBusy ? "Working…" : "Provision"}
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                <div className="flex">
+                  <Button variant="ghost" size="sm" onClick={closeSync}>
+                    Close
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
         </>
       )}
 

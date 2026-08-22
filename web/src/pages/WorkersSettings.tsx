@@ -14,10 +14,13 @@ import { ServerIcon } from "../components/icons";
 import { DEFAULT_WORKER_TEMPLATE, WORKER_TEMPLATES, hasTemplateDrift } from "../lib/workerTemplates";
 import { HostedWorkers } from "../components/HostedWorkers";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
-import { WorkerStatGauges } from "../components/WorkerStats";
+import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
+import { WorkerStatGauges, formatBytes } from "../components/WorkerStats";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { stripUnsafeChars } from "../lib/safeText";
 import { formatUptimeSince } from "../lib/formatUptimeSince";
+import { DocLink } from "../components/DocLink";
+import { DOC_WORKER_SETUP } from "../lib/doclinks";
 
 // Stable per-row ids: the delete button is a focus target after a dismissed confirm,
 // and the warning is the confirm group's aria-description (PRD #58).
@@ -291,7 +294,12 @@ export function WorkersSettings() {
     <div className="space-y-6">
       <PageHeader
         title="Workers"
-        description="Workers are your uzi-agent containers: they claim your runs and stream them back."
+        description={
+          <>
+            Workers are your uzi-agent containers: they claim your runs and stream them back. See the{" "}
+            <DocLink slug={DOC_WORKER_SETUP}>worker setup</DocLink> guide.
+          </>
+        }
       />
       {error && <Alert message={error} />}
 
@@ -393,7 +401,7 @@ export function WorkersSettings() {
           a different reason: it holds a SECRET that should not linger on screen.) */}
       {notice && (
         // tabIndex -1: focusable programmatically, never a tab stop of its own.
-        <div ref={noticeRef} tabIndex={-1} className="outline-none">
+        <div ref={noticeRef} tabIndex={-1} className="outline-hidden">
           <Alert tone={notice.tone} message={notice.text} />
         </div>
       )}
@@ -453,6 +461,12 @@ export function WorkersSettings() {
                         <span>template {w.template_reported}</span>
                       ) : (
                         w.template_declared && <span>template {w.template_declared} (awaiting report)</span>
+                      )}
+                      {/* Size envelope (PRD #84 M1): the container mem ceiling from the
+                          latest stats sample. Null when unlimited / process-fallback /
+                          no sample yet — then say nothing rather than "0". Read-only. */}
+                      {w.stats_mem_limit_bytes != null && w.stats_mem_limit_bytes > 0 && (
+                        <span>· {formatBytes(w.stats_mem_limit_bytes)} limit</span>
                       )}
                       {/* Issue #124: worker self-reported (sanitizeSelfReported at ingest). */}
                       {w.version && <span>· v{stripUnsafeChars(w.version)}</span>}
@@ -561,9 +575,19 @@ export function WorkersSettings() {
                         template drift
                       </Badge>
                     )}
+                    {/* Server-authoritative capability set (PRD #84 M1), rendered as
+                        small read-only chips beside the template/drift badge. The set is
+                        Filter-ed server-side to the {docker, jvm} vocabulary, so a name
+                        here is always known; empty/absent renders nothing. */}
+                    {w.capabilities?.map((cap) => (
+                      <Badge key={cap} title={`Worker capability: ${cap}`}>
+                        {cap}
+                      </Badge>
+                    ))}
                     <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
                       {w.status}
                     </Badge>
+                    <WorkerCordonBadge worker={w} />
                     <WorkerRunBadge worker={w} />
                     {/* Hosted deletes confirm; external ones stay one click, and that
                         asymmetry is the whole point. Deleting an EXTERNAL worker
@@ -670,7 +694,7 @@ export function WorkersSettings() {
                     onKeyDown={(e) => {
                       if (e.key === "Escape") dismissConfirm(w.id);
                     }}
-                    className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 outline-none"
+                    className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 outline-hidden"
                   >
                     <p id={deleteWarningId(w.id)} className="text-xs text-warn">
                       Delete is not a restart: a hosted worker’s disks go with it, permanently —{" "}

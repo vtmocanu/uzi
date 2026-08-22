@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -29,6 +30,11 @@ type fakeSettings struct {
 	dailyBudget     int
 	spendGuardErr   error // read error for the PRD #69 M5 spend-guard accessors (fail-open)
 	model           string
+	// summaryModel is the instance-default run-summary model (PRD #362 M2); the zero
+	// value ("") reads as "no instance model", so an issue-run claim leaves SummaryModel
+	// nil unless a test sets it. summaryModelErr models a settings read fault.
+	summaryModel    string
+	summaryModelErr error
 	prdLabel        string
 	eligibleLabels  []string
 	waivesPRDLink   bool
@@ -46,7 +52,10 @@ func (f fakeSettings) JudgeDailyBudget(context.Context) (int, error) {
 	return f.dailyBudget, f.spendGuardErr
 }
 func (f fakeSettings) JudgeModel(context.Context) (string, error) { return f.model, f.err }
-func (f fakeSettings) PRDLabel(context.Context) (string, error)   { return f.prdLabel, f.err }
+func (f fakeSettings) SummaryModel(context.Context) (string, error) {
+	return f.summaryModel, f.summaryModelErr
+}
+func (f fakeSettings) PRDLabel(context.Context) (string, error) { return f.prdLabel, f.err }
 func (f fakeSettings) RunEligibleLabels(context.Context) ([]string, error) {
 	return f.eligibleLabels, f.err
 }
@@ -157,7 +166,7 @@ func TestRegisterEnqueuesJudgeForOrphanFailedRuns(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 
-	if _, err := svc.Register(context.Background(), worker(), "v1", "", nil); err != nil {
+	if _, err := svc.Register(context.Background(), worker(), "v1", "", nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if fs.createdJudgeRun == nil {
@@ -411,6 +420,51 @@ func TestSubmitInputRejectServerSideEnqueuesJudge(t *testing.T) {
 	}
 }
 
+// TestSubmitInputRejectServerSidePersistsReason: PRD #503 M2 — a server-side reject
+// must persist the caller's real reason as failure_reason (not the hardcoded literal),
+// and fall back to "plan rejected" only when the body is empty.
+func TestSubmitInputRejectServerSidePersistsReason(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "concrete reason", body: "some concrete reason", want: "some concrete reason"},
+		{name: "empty body falls back", body: "", want: "plan rejected"},
+		{name: "whitespace body falls back", body: "   ", want: "plan rejected"},
+		// PRD #503 M2 sanitization: a NUL byte in the reason must be stripped (a NUL in a
+		// text column raises Postgres 22021 and would abort the reject), matching the
+		// worker-reported failure_reason path (sanitizeFailureReason).
+		{name: "strips NUL bytes", body: "bad\x00reason", want: "badreason"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user, runID := uuid.New(), uuid.New()
+			fs := &fakeStore{
+				runByID:      store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},          // GetRun + no worker ⇒ no live poller
+				runByIDPlain: store.Run{ID: runID, UserID: user, Status: "failed", Kind: RunKindIssue}, // post-reject reload
+				userByID:     store.User{JudgeEnabled: true},
+				anthropic:    []byte("sealed"),
+			}
+			svc := New(fs, newBox(t), testParams())
+			svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
+
+			res, err := svc.SubmitInput(context.Background(), user, runID, "reject_plan", tc.body, nil)
+			if err != nil {
+				t.Fatalf("SubmitInput: %v", err)
+			}
+			if !res.ServerSide {
+				t.Fatal("a reject with no live poller must be applied server-side")
+			}
+			if fs.rejected == nil {
+				t.Fatal("RejectRunServerSide not called")
+			}
+			if !fs.rejected.FailureReason.Valid || fs.rejected.FailureReason.String != tc.want {
+				t.Fatalf("FailureReason = %+v, want %q", fs.rejected.FailureReason, tc.want)
+			}
+		})
+	}
+}
+
 // TestSubmitInputCancelServerSideDoesNotEnqueueJudge: a server-side CANCEL commits
 // 'cancelled', which is never judged (Decision 2).
 func TestSubmitInputCancelServerSideDoesNotEnqueueJudge(t *testing.T) {
@@ -428,6 +482,117 @@ func TestSubmitInputCancelServerSideDoesNotEnqueueJudge(t *testing.T) {
 	}
 	if fs.createdJudgeRun != nil {
 		t.Fatal("a cancelled run must never be judged")
+	}
+}
+
+// TestSubmitInputCancelServerSidePersistsStopReason: a server-side CANCEL persists the
+// operator's OPTIONAL reason to runs.stop_reason (PRD #503 M3). Unlike reject, an empty
+// body is not an error — it stores NULL rather than a fallback string.
+func TestSubmitInputCancelServerSidePersistsStopReason(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		body      string
+		wantValid bool
+		want      string
+	}{
+		{name: "concrete reason", body: "superseded by a newer run", wantValid: true, want: "superseded by a newer run"},
+		{name: "trims surrounding whitespace", body: "  changed my mind  ", wantValid: true, want: "changed my mind"},
+		{name: "empty body stores NULL", body: "", wantValid: false},
+		{name: "whitespace-only body stores NULL", body: "   ", wantValid: false},
+		// PRD #503 M3 sanitization: a NUL byte in the reason must be stripped (a NUL in a
+		// text column raises Postgres 22021 and would abort the cancel), mirroring
+		// sanitizeFailureReason (its failure-class sibling).
+		{name: "strips NUL bytes", body: "before\x00after", wantValid: true, want: "beforeafter"},
+		{name: "NUL-only body stores NULL", body: "\x00\x00", wantValid: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user, runID := uuid.New(), uuid.New()
+			fs := &fakeStore{
+				runByID:      store.Run{ID: runID, UserID: user, Status: "queued"}, // GetRun + no worker ⇒ no live poller
+				runByIDPlain: store.Run{ID: runID, UserID: user, Status: "cancelled", Kind: RunKindIssue},
+			}
+			svc := New(fs, newBox(t), testParams())
+
+			res, err := svc.SubmitInput(context.Background(), user, runID, "cancel", tc.body, nil)
+			if err != nil {
+				t.Fatalf("SubmitInput: %v", err)
+			}
+			if !res.ServerSide {
+				t.Fatal("a cancel with no live poller must be applied server-side")
+			}
+			if fs.cancelled == nil {
+				t.Fatal("CancelRunServerSide not called")
+			}
+			if fs.cancelled.StopReason.Valid != tc.wantValid {
+				t.Fatalf("StopReason.Valid = %v, want %v (%+v)", fs.cancelled.StopReason.Valid, tc.wantValid, fs.cancelled.StopReason)
+			}
+			if tc.wantValid && fs.cancelled.StopReason.String != tc.want {
+				t.Fatalf("StopReason.String = %q, want %q", fs.cancelled.StopReason.String, tc.want)
+			}
+		})
+	}
+}
+
+// TestSubmitInputCancelServerSideCapsStopReason: PRD #503 M3 — an over-long operator
+// cancel reason is capped to maxFailureReasonRunes before it lands in runs.stop_reason,
+// the same bound sanitizeFailureReason enforces on failure_reason.
+func TestSubmitInputCancelServerSideCapsStopReason(t *testing.T) {
+	user, runID := uuid.New(), uuid.New()
+	fs := &fakeStore{
+		runByID:      store.Run{ID: runID, UserID: user, Status: "queued"}, // GetRun + no worker ⇒ no live poller
+		runByIDPlain: store.Run{ID: runID, UserID: user, Status: "cancelled", Kind: RunKindIssue},
+	}
+	svc := New(fs, newBox(t), testParams())
+
+	body := strings.Repeat("z", maxFailureReasonRunes+512) // well over the 2048-rune cap
+	res, err := svc.SubmitInput(context.Background(), user, runID, "cancel", body, nil)
+	if err != nil {
+		t.Fatalf("SubmitInput: %v", err)
+	}
+	if !res.ServerSide {
+		t.Fatal("a cancel with no live poller must be applied server-side")
+	}
+	if fs.cancelled == nil {
+		t.Fatal("CancelRunServerSide not called")
+	}
+	if !fs.cancelled.StopReason.Valid {
+		t.Fatalf("StopReason must be present for an over-long reason, got %+v", fs.cancelled.StopReason)
+	}
+	if got := len([]rune(fs.cancelled.StopReason.String)); got != maxFailureReasonRunes {
+		t.Fatalf("StopReason capped to %d runes, want %d", got, maxFailureReasonRunes)
+	}
+}
+
+// TestSubmitInputRejectServerSideCapsReason: PRD #503 M2 — an over-long reject reason is
+// capped to maxFailureReasonRunes before it lands in failure_reason, matching
+// sanitizeFailureReason.
+func TestSubmitInputRejectServerSideCapsReason(t *testing.T) {
+	user, runID := uuid.New(), uuid.New()
+	fs := &fakeStore{
+		runByID:      store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},          // GetRun + no worker ⇒ no live poller
+		runByIDPlain: store.Run{ID: runID, UserID: user, Status: "failed", Kind: RunKindIssue}, // post-reject reload
+		userByID:     store.User{JudgeEnabled: true},
+		anthropic:    []byte("sealed"),
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
+
+	body := strings.Repeat("z", maxFailureReasonRunes+512) // well over the 2048-rune cap
+	res, err := svc.SubmitInput(context.Background(), user, runID, "reject_plan", body, nil)
+	if err != nil {
+		t.Fatalf("SubmitInput: %v", err)
+	}
+	if !res.ServerSide {
+		t.Fatal("a reject with no live poller must be applied server-side")
+	}
+	if fs.rejected == nil {
+		t.Fatal("RejectRunServerSide not called")
+	}
+	if !fs.rejected.FailureReason.Valid {
+		t.Fatalf("FailureReason must be present for an over-long reason, got %+v", fs.rejected.FailureReason)
+	}
+	if got := len([]rune(fs.rejected.FailureReason.String)); got != maxFailureReasonRunes {
+		t.Fatalf("FailureReason capped to %d runes, want %d", got, maxFailureReasonRunes)
 	}
 }
 

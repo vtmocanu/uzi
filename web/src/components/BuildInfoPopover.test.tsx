@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import {
   BuildInfoPopover,
@@ -427,5 +427,137 @@ describe("BuildInfoPopover — open on hover AND focus AND tap", () => {
     expect(ids[0]).toBeTruthy();
     expect(ids[0]).not.toBe(ids[1]);
     for (const id of ids) expect(document.getElementById(id!)).not.toBeNull();
+  });
+});
+
+describe("BuildInfoPopover — PRDs row links to the repo prds/ directory (PRD #415 M2)", () => {
+  // A directory is served under /tree/, not /blob/ (PRD #415 M3 review nit).
+  const PRDS_URL = "https://github.com/vtmocanu/uzi/tree/main/prds";
+
+  it("renders the PRDs count as an external link, keeping the `N done · M open` text", () => {
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} />);
+    const link = screen.getByRole("link", { name: /80 done.*32 open/ });
+    expect(link.getAttribute("href")).toBe(PRDS_URL);
+    // External target → new tab + a dropped opener, the app's rule for off-app links.
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toBe("noopener noreferrer");
+    // The Variant-A visual is unchanged, just wrapped in the anchor.
+    expect(link.textContent).toContain("80 done");
+    expect(link.textContent).toContain("32 open");
+  });
+
+  it("renders no PRDs link when the counts are absent", () => {
+    render(<BuildInfoPopover info={mockBuildInfoUnstamped} now={NOW} />);
+    expect(screen.queryByRole("link")).toBeNull();
+  });
+});
+
+describe("BuildInfoPopover — Changelog button + focus-within (PRD #415 M2)", () => {
+  const trigger = () => screen.getByRole("button", { name: "v0.4.2" });
+  const changelogButton = () => screen.getByRole("button", { name: "Changelog" });
+
+  it("renders no Changelog button when no handler is wired", () => {
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} />);
+    expect(screen.queryByRole("button", { name: "Changelog" })).toBeNull();
+  });
+
+  it("renders a Changelog button inside the popover panel when a handler is wired", () => {
+    const onOpen = vi.fn();
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} onOpenChangelog={onOpen} />);
+    // The button lives INSIDE the popover panel (the role="tooltip" node), not
+    // loose in the footer — that is where the drawer opener belongs.
+    expect(popover().contains(changelogButton())).toBe(true);
+  });
+
+  it("mouse path: hover opens the panel and clicking Changelog fires the callback", () => {
+    const onOpen = vi.fn();
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} onOpenChangelog={onOpen} />);
+    const host = popover().parentElement!;
+    fireEvent.mouseEnter(host);
+    expect(popover().getAttribute("data-open")).toBe("true");
+    fireEvent.click(changelogButton());
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it("keyboard path: Tab from the version button reaches Changelog WITHOUT the panel closing, and activating it fires the callback", () => {
+    const onOpen = vi.fn();
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} onOpenChangelog={onOpen} />);
+    // Focus the trigger — the host's focus-within opens the panel.
+    fireEvent.focus(trigger());
+    expect(popover().getAttribute("data-open")).toBe("true");
+    // Tab moves focus from the trigger to the Changelog button. Before the fix, the
+    // trigger's own onBlur fired first and closed the panel, so the button could
+    // never take focus. With focus-within on the host, a blur whose relatedTarget is
+    // still inside the host keeps it open.
+    fireEvent.blur(trigger(), { relatedTarget: changelogButton() });
+    expect(popover().getAttribute("data-open")).toBe("true");
+    fireEvent.focus(changelogButton());
+    expect(popover().getAttribute("data-open")).toBe("true");
+    // Activating the (now focused) button opens the drawer.
+    fireEvent.click(changelogButton());
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes the panel only when focus leaves the whole host", () => {
+    const onOpen = vi.fn();
+    render(
+      <>
+        <button type="button">outside</button>
+        <BuildInfoPopover info={mockBuildInfo} now={NOW} onOpenChangelog={onOpen} />
+      </>,
+    );
+    fireEvent.focus(trigger());
+    expect(popover().getAttribute("data-open")).toBe("true");
+    // Focus moving to a control OUTSIDE the host closes it.
+    const outside = screen.getByRole("button", { name: "outside" });
+    fireEvent.blur(trigger(), { relatedTarget: outside });
+    expect(popover().getAttribute("data-open")).toBe("false");
+  });
+
+  it("puts a hover bridge INSIDE the panel, so it is a host descendant", () => {
+    // The mb-2 gap between the panel bottom and the trigger top is over neither the
+    // host's in-flow button nor the out-of-flow panel, so a pointer crossing it fires
+    // the host's onMouseLeave and the panel closes mid-transit. The bridge is a
+    // transparent child of the panel that fills that gap: because it is a DESCENDANT
+    // of the host, moving onto it produces no host mouseleave. jsdom can't measure the
+    // pixel gap, so assert the mechanism — the bridge exists inside the panel.
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} onOpenChangelog={vi.fn()} />);
+    const bridge = popover().querySelector("[data-hover-bridge]");
+    expect(bridge).not.toBeNull();
+    expect(popover().contains(bridge)).toBe(true);
+  });
+
+  it("mouse transit onto the bridge keeps the panel open and Changelog reachable", () => {
+    const onOpen = vi.fn();
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} onOpenChangelog={onOpen} />);
+    const host = popover().parentElement!;
+    fireEvent.mouseEnter(host);
+    expect(popover().getAttribute("data-open")).toBe("true");
+    // Moving onto the bridge is a move onto a host descendant, so no host mouseLeave
+    // is produced — the panel stays open and the Changelog button is reachable.
+    const bridge = popover().querySelector("[data-hover-bridge]")!;
+    fireEvent.mouseEnter(bridge);
+    expect(popover().getAttribute("data-open")).toBe("true");
+    expect(changelogButton()).toBeTruthy();
+    fireEvent.click(changelogButton());
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the bridge inside the CLOSED panel, so it inherits pointer-events-none", () => {
+    // On initial render the panel is closed and carries pointer-events-none opacity-0.
+    // The bridge adds NO pointer-events class of its own, so a closed panel makes it
+    // non-interactive too — it is not a hover target while the popover is shut.
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} onOpenChangelog={vi.fn()} />);
+    const pop = popover();
+    expect(pop.getAttribute("data-open")).toBe("false");
+    expect(pop.className).toContain("pointer-events-none");
+    expect(pop.className).toContain("opacity-0");
+    const bridge = pop.querySelector("[data-hover-bridge]")!;
+    expect(pop.contains(bridge)).toBe(true);
+    // The inheritance only holds because the bridge sets NO pointer-events class of
+    // its own — a future `pointer-events-auto` on it would make the shut popover a
+    // hover target again, defeating the fix while this test's panel-level checks
+    // stayed green. Guard the invariant directly.
+    expect(bridge.className).not.toContain("pointer-events");
   });
 });

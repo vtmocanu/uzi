@@ -131,7 +131,7 @@ public artifact directory (`fixtures/`). The wave's own repeated lesson is that 
 was sound and the certifying layer was not — and right now there is no certifying layer at all for
 this tier.
 
-**The design is COMPLETE**: `prds/98-judge-menu-m8-design.md` on `feature/prd-98-t2-fid` @
+**The design is COMPLETE**: `prds/done/98-judge-menu-m8-design.md` on `feature/prd-98-t2-fid` @
 `2befec6f` covers Part A (seam 6), Part B v2 (M8b) and Part C (backstop), all rulings folded in.
 **Read it before resuming any of the three in-flight branches** — it is the specification, and
 three places in it are known to be under-specified in practice: `expected.json` authoring for cases

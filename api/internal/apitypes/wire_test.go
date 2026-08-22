@@ -82,15 +82,37 @@ var runDTOKeys = []string{
 	// budget (nil ⇒ null ⇒ the global default). All four always present; a client
 	// branches per field. budget_* are load-bearing on the state-ack, not just display.
 	"milestones_completed", "milestones_in_progress", "budget_max_iterations", "budget_wall_seconds",
-	"worker_id", "branch", "mr_iid", "mr_web_url", "mr_state", "failure_reason",
+	"worker_id", "branch",
+	// PRD #400 (uzi handoff): the task/handoff columns, meaningful only on a
+	// kind='task' run. base_branch is null on every non-task run; open_mr is false by
+	// default and on every non-task run. Always on the wire.
+	"base_branch", "open_mr",
+	// PRD #517 M1: interactive marks a long-lived task run; false by default and on every
+	// non-task run. Always on the wire, like open_mr above.
+	"interactive",
+	// PRD #400 Decision 6: when a task run's dispatch gate was stamped (null on every
+	// non-task run and on a task run not yet dispatched). Always on the wire.
+	"dispatched_at",
+	"mr_iid", "mr_web_url", "mr_state", "failure_reason",
+	// PRD #411: the forge issue's web URL for the run's clickable #<iid> link. Null for
+	// issue-less runs and when the issue is no longer cached. Always on the wire.
+	"issue_web_url",
 	"stop_kind", "health", "health_reason", "health_since", "plan_md",
 	// PRD #209: plan_md's provenance ("agent"|"seeded"), NOT NULL so always on the wire.
 	"plan_source",
+	// PRD #362 M1: plain-English run summaries. All three null until the worker posts
+	// them (and null forever on any generation failure); summary_deltas is
+	// tolerated-on-read (a malformed stored value arrives as null). Always on the wire.
+	"summary_intent", "summary_plan", "summary_deltas",
 	"pipeline_ref", "pipeline_web_url", "fix_verdict",
 	// issue #279: a completed run that opened NO merge request (report-only/evidence
 	// completion) and its persisted findings summary. report_only is NOT NULL so always
 	// on the wire; report_md is null unless report_only.
 	"report_only", "report_md",
+	// PRD #377 M1: the agent's diff preserved on a workflow_scope_missing failed run
+	// (the branch touched .github/workflows/** the bot PAT cannot push). Nullable, set
+	// only on that failed path, but the key is always on the wire.
+	"preserved_patch",
 	// PRD-link reconciliation (read-only): the path the run declared it archived a PRD
 	// to, and when that patch lifecycle settled (null while pending). Both always on the
 	// wire — prd_done_path null for a run that moved no PRD, prd_patch_settled_at null
@@ -126,6 +148,12 @@ var runDTOKeys = []string{
 	// restored}), computed by fn_run_priority_class. NOT omitempty — always a real
 	// value on the wire, so it is asserted on the zero value here.
 	"priority",
+	// PRD #84: the run's inferred/hinted scheduling requirements, surfaced RAW for the
+	// web/CLI readiness/mismatch display. required_capabilities (M2 hint ∪ M4 inference)
+	// and required_tools (M4 4b, display-only) are non-nil slices ([] over null); size_class
+	// (M4 4b) is the NOT NULL DEFAULT '' string. All three always on the wire, and — via the
+	// RunListItemDTO embed pin — on both the list and detail reads.
+	"required_capabilities", "required_tools", "size_class",
 }
 
 func TestRunDTOTags(t *testing.T) {
@@ -159,7 +187,9 @@ func TestMessageDTOTags(t *testing.T) {
 }
 
 func TestRunInputTags(t *testing.T) {
-	assertTags(t, "RunInputRequest", RunInputRequest{}, "kind", "body", "selection")
+	// PRD #84 M4 4c: override_capabilities is a plain bool (not omitempty), so it is always
+	// on the wire; meaningful only with approve_plan, default false.
+	assertTags(t, "RunInputRequest", RunInputRequest{}, "kind", "body", "selection", "override_capabilities")
 	// id + created_at are omitempty (nil on approve/cancel/reject): the zero value is
 	// still just server_side (PRD #95 S2).
 	assertTags(t, "RunInputResponse", RunInputResponse{}, "server_side")
@@ -192,6 +222,18 @@ func TestReviewDTOTags(t *testing.T) {
 		"id", "target_run_id", "verdict", "summary_md", "judge_model", "status",
 		"created_at", "updated_at", "recommendations", "filed_issues",
 		"dispositions", "triage", "judge_run")
+}
+
+func TestTaskReviewDTOTags(t *testing.T) {
+	// PRD #400 M4a: review_run_id is a *string present-with-null (nil when the review run
+	// was deleted), so it is NOT omitempty — every key is always on the wire.
+	assertTags(t, "TaskReviewDTO", TaskReviewDTO{},
+		"target_run_id", "review_run_id", "status", "summary_md", "findings", "created_at")
+}
+
+func TestTaskReviewFindingDTOTags(t *testing.T) {
+	assertTags(t, "TaskReviewFindingDTO", TaskReviewFindingDTO{},
+		"file", "symbol", "line", "severity", "summary", "rationale")
 }
 
 func TestJudgeRunDTOTags(t *testing.T) {
@@ -437,13 +479,21 @@ func TestSecretDTOTags(t *testing.T) {
 func TestRepoDTOTags(t *testing.T) {
 	assertTags(t, "RepoDTO", RepoDTO{},
 		"id", "connection_id", "forge_project_id", "path_with_namespace", "web_url",
-		"default_branch", "enabled", "repo_skills_enabled", "repo_claudemd_enabled", "repo_devbox_opt_in", "pipeline",
+		"default_branch", "enabled", "repo_skills_enabled", "repo_claudemd_enabled", "repo_devbox_opt_in",
+		// PRD #84 M2: the static per-repo capability hint routed onto each run.
+		"required_capabilities", "pipeline",
 		// PRD #66 M8 (D8): admin per-repo guardrail override metadata, null when no
 		// override is active. Display-only surfacing for M9's badge.
 		"guardrail_override",
 		// PRD #66 M9 (D8): the server-computed "would a run be refused now" bool the
 		// web reads for the badge STATE (override already applied, single Go rule).
-		"guardrail_blocked")
+		"guardrail_blocked",
+		// PRD #361 M1: the computed, caller-scoped "is this repo on the global Docker-
+		// worker allowlist" bool. Never the list itself.
+		"docker_allowlisted",
+		// PRD #361 M3: the computed, caller-scoped "is a run on this repo actually
+		// blocked by the Docker-allowlist gap right now" bool, from eligibility directly.
+		"docker_blocked")
 }
 
 func TestGuardrailOverrideDTOTags(t *testing.T) {
@@ -460,6 +510,10 @@ func TestPipelineDTOTags(t *testing.T) {
 // WorkerDTO pin and the AdminWorkerDTO embed pin.
 var workerDTOKeys = []string{
 	"id", "name", "status", "kind", "hosted_size", "docker", "busy", "active_runs",
+	// PRD #84 M1: the server-authoritative capability set (Filter-ed union of the
+	// worker's self-report and its template-derived caps, v1 vocabulary {docker, jvm}).
+	// Read-only display for the workers UI.
+	"capabilities",
 	"max_concurrent_runs", "template_declared", "template_reported", "version",
 	// PRD #113: derived upgrade health, computed at read time from `version` against
 	// the control-plane release. Derived rather than stored, so nothing in the store
@@ -470,6 +524,9 @@ var workerDTOKeys = []string{
 	// PRD #251: api-owned anchor of when the worker became online; null when offline or
 	// never online. Uptime is derived client-side as now − online_since; display-only.
 	"online_since",
+	// PRD #422/#496: when a hosted worker was cordoned/began draining (finishes in-flight
+	// runs, claims nothing new); null for a worker that will claim normally. Hosted-only.
+	"draining_since",
 	"created_at", "stats_cpu_pct", "stats_mem_bytes",
 	"stats_mem_limit_bytes", "stats_source",
 	// PRD #104 M3: which Anthropic credential this worker's run-lane claims spend.
@@ -552,6 +609,14 @@ func TestTokenRateLimitDTOTags(t *testing.T) {
 func TestAdminRateLimitRowDTOTags(t *testing.T) {
 	assertTags(t, "AdminRateLimitRowDTO", AdminRateLimitRowDTO{},
 		"id", "email", "name", "vault_locked", "tokens")
+}
+
+// TestUserSettingsDTOTags pins the CLI's decoding mirror of GET /api/me/settings
+// against the handler's own userSettingsDTO — a divergence in either type's tag
+// set fails here rather than silently dropping a field on decode.
+func TestUserSettingsDTOTags(t *testing.T) {
+	assertTags(t, "UserSettingsDTO", UserSettingsDTO{},
+		"default_model", "judge_model", "summary_model", "theme", "sidebar_token_ids")
 }
 
 // TestAgentMemoryWriteRequestTags pins the worker save body: {title, body} plus the

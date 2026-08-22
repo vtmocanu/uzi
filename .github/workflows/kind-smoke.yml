@@ -1,0 +1,199 @@
+# uzi e2e: KinD chart-install smoke (ported from the retired GitLab `e2e:kind-smoke`,
+# PRD #52 M8). Installs the uzi Helm chart into an ephemeral KinD cluster and runs
+# scripts/smoke.sh through the web nginx -> api reverse proxy, catching chart / CRD /
+# wiring / boot breaks that `helm template` cannot.
+#
+# FULLY CREDENTIAL-LESS: no secrets, no registry. The api + web images are built
+# locally and `kind load`ed; the CNPG operator + postgres image are public. Hence
+# top-level `permissions: contents: read`, no `secrets:`, no `environment:`.
+#
+# PROTECTED-REF EQUIVALENT: runs on push to main and on `v*` tags (the refs the
+# GitLab job's `CI_COMMIT_REF_PROTECTED` gate covered), plus manual dispatch to smoke
+# a branch on demand. ALSO on pull_request, but PATH-FILTERED: the heavy `kind-smoke`
+# job runs on a PR only when it touches chart/deploy surfaces (`deploy/**`, this
+# workflow, `scripts/smoke.sh`) -- the class of change that can break the actual
+# install, which `helm template` and the ci.yml `--no-push` build cannot catch. A
+# PR that touches none of those skips the smoke (the `changes` job below), so an
+# unrelated Go/web PR pays nothing. This was added after a helm v3->v4 bump (#446)
+# passed ci.yml but broke `helm install` on main, where nothing gated it pre-merge.
+# The `kind-smoke-gate` job is the stable status context that can be marked REQUIRED:
+# it always reports (green when the smoke passed OR was legitimately skipped), so a
+# required check never wedges a non-chart PR in a permanent Pending state.
+# On GitHub-hosted runners kind runs on the runner's own Docker (no privileged DinD
+# service), so the GitLab job's DinD host-rewrite is not needed.
+#
+# The GitLab job had a tar-artifact fast path (build:api/web published kind-loadable
+# tars on main; e2e loaded them). GitHub runs each workflow in its own VM, so there is
+# no cross-workflow artifact to reuse here without extra plumbing -- this job builds
+# both images itself, which is exactly what the GitLab job's tag/local FALLBACK did.
+
+name: KinD Smoke
+
+# Quoted so yamllint's `truthy` rule does not read the key as the boolean `on`.
+"on":
+  pull_request: {}
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kind-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Path filter (PR only): decide whether this PR touches chart/deploy surfaces. On
+  # push/tag/dispatch this job is skipped and `kind-smoke` runs unconditionally.
+  changes:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      chart: ${{ steps.filter.outputs.chart }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            chart:
+              - 'deploy/**'
+              - 'scripts/smoke.sh'
+              - '.github/workflows/kind-smoke.yml'
+
+  kind-smoke:
+    needs: changes
+    # Run on every push/tag/dispatch; on a PR only when chart surfaces changed.
+    # always() ignores the `changes` job being skipped on non-PR events.
+    if: |
+      always() &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.chart == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Build the api + web images the chart runs. api context is api/ (its own
+      # .dockerignore); web context is the repo ROOT so the Dockerfile can bundle
+      # docs/ (the root .dockerignore applies). Both tagged :kind, which
+      # deploy/values/kind-smoke.yaml pins with imagePullPolicy: IfNotPresent so no
+      # registry is ever consulted.
+      - name: Build api + web images for kind
+        run: |
+          set -euo pipefail
+          docker build -t uzi-api:kind ./api
+          docker build -t uzi-web:kind -f web/Dockerfile .
+
+      # kind cluster on the runner's Docker. node_image is digest-pinned to the same
+      # v1.34.0 node the GitLab job used.
+      - name: Create KinD cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: uzi-e2e
+          node_image: kindest/node:v1.34.0@sha256:7416a61b42b1662ca6ca89f02028ac133a309a2a30ba309614e8ec94d976dc5a
+          wait: 150s
+
+      - name: Load images into kind
+        run: |
+          set -euo pipefail
+          kind load docker-image uzi-api:kind --name uzi-e2e
+          kind load docker-image uzi-web:kind --name uzi-e2e
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v4.2.4
+
+      # Public CNPG operator, the SAME minor dev-cluster runs, pinned to a fixed
+      # release-asset URL (not a moving branch). Wait for the controller before the
+      # chart creates the Cluster CR.
+      - name: Install CNPG operator
+        run: |
+          set -euo pipefail
+          kubectl apply --server-side -f \
+            "https://github.com/cloudnative-pg/cloudnative-pg/releases/download/v1.23.5/cnpg-1.23.5.yaml"
+          kubectl -n cnpg-system rollout status deploy/cnpg-controller-manager --timeout=180s
+
+      # existing-secrets mode: pre-create uzi-secrets with RANDOM valid keys (the api
+      # refuses placeholder keys). The CNPG operator generates the -app DB secret.
+      - name: Create namespace + secrets
+        run: |
+          set -euo pipefail
+          kubectl create namespace uzi
+          kubectl -n uzi create secret generic uzi-secrets \
+            --from-literal=UZI_SECRET_KEY="$(openssl rand -base64 32)" \
+            --from-literal=JWT_SECRET="$(openssl rand -hex 64)"
+
+      - name: helm install
+        run: |
+          set -euo pipefail
+          # Vendor the CNPG subchart (gitignored; Chart.lock pins it) before install.
+          helm dependency build deploy/chart
+          # --server-side=false: Helm 4 defaults `install` to server-side apply, which
+          # strictly validates every field against the target CRD schema. The pinned
+          # CNPG `cluster` subchart (0.6.1) unconditionally renders
+          # `.spec.monitoring.tls.enabled` on the Cluster CR, but the fleet-pinned CNPG
+          # operator (1.23.5) ships a CRD that does not declare that field yet, so SSA
+          # rejects the install ("field not declared in schema"). Helm 3 and the real
+          # deploy path (ArgoCD) both use client-side apply, where the apiserver prunes
+          # the unknown field -- harmless. Forcing client-side here makes the smoke
+          # match production apply semantics instead of testing a stricter path nothing
+          # ships. Bumping the CNPG operator+subchart pair (so the CRD gains the field)
+          # is the alternative, but that is a fleet-wide change; tracked separately.
+          helm install uzi deploy/chart -n uzi -f deploy/values/kind-smoke.yaml \
+            --server-side=false
+
+      - name: Wait for workloads
+        run: |
+          set -euo pipefail
+          kubectl -n uzi wait --for=condition=Ready cluster/postgres-uzi-cluster --timeout=300s
+          kubectl -n uzi wait --for=condition=Available deploy/uzi-api --timeout=300s
+          kubectl -n uzi wait --for=condition=Available deploy/uzi-web --timeout=180s
+
+      # Smoke through the web nginx -> api reverse proxy (validates the k8s nginx.conf).
+      - name: Smoke
+        run: |
+          set -euo pipefail
+          kubectl -n uzi port-forward svc/uzi-web 8088:80 >/tmp/pf.log 2>&1 &
+          for _ in $(seq 1 40); do
+            curl -fsS http://127.0.0.1:8088/api/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+          BASE=http://127.0.0.1:8088 bash scripts/smoke.sh
+
+      # On failure, dump what the cluster looked like -- there is no interactive
+      # kubeconfig to poke at after the job ends.
+      - name: Diagnostics (on failure)
+        if: failure()
+        run: |
+          kubectl -n uzi get pods -o wide || true
+          kubectl -n uzi describe pods || true
+          kubectl -n uzi get events --sort-by=.lastTimestamp || true
+          kubectl -n uzi logs -l app.kubernetes.io/name=uzi --all-containers --tail=200 || true
+          cat /tmp/pf.log || true
+
+  # Stable REQUIRED status context. Always reports, so a required check never wedges
+  # a PR that legitimately skipped the smoke: green when `kind-smoke` succeeded OR was
+  # skipped (non-chart PR), red only when it actually failed. Mark THIS context
+  # required in the branch ruleset, never `kind-smoke` itself (which is absent on a
+  # non-chart PR and would leave the PR Pending forever).
+  kind-smoke-gate:
+    needs: [changes, kind-smoke]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate on the kind-smoke result
+        run: |
+          set -euo pipefail
+          result="${{ needs.kind-smoke.result }}"
+          echo "kind-smoke result: ${result}"
+          if [ "${result}" = "success" ] || [ "${result}" = "skipped" ]; then
+            echo "gate: pass"
+            exit 0
+          fi
+          echo "gate: fail (kind-smoke did not pass)"
+          exit 1

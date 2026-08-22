@@ -620,3 +620,84 @@ func TestTerminalCommentRecordFailsNoComment(t *testing.T) {
 		t.Fatalf("a failed claim must not post a comment, got %d", len(fm.forge.notes))
 	}
 }
+
+// ── projector (PRD #364 M5) ───────────────────────────────────────────────────
+
+type fakeProjector struct {
+	calls []projectorCall
+	err   error
+}
+
+type projectorCall struct {
+	repoID   uuid.UUID
+	issueIID int64
+	target   string
+}
+
+func (p *fakeProjector) ForwardMove(_ context.Context, repoID uuid.UUID, issueIID int64, target string) error {
+	p.calls = append(p.calls, projectorCall{repoID: repoID, issueIID: issueIID, target: target})
+	return p.err
+}
+
+// A successful apply calls the injected projector with the move's (repo, issue,
+// target).
+func TestNotifyCallsProjectorOnSuccess(t *testing.T) {
+	runID, repoID := uuid.New(), uuid.New()
+	fs := &fakeStore{
+		moveCtx: moveCtx(repoID, 4, "queued", txt("Later"), nullText()),
+		issue:   issueWith(repoID, 4, "opened", "PRD", "Later"),
+		columns: defaultCols(),
+	}
+	fm := &fakeMover{}
+	l := newTestLifecycle(fs, fm)
+	proj := &fakeProjector{}
+	l.SetProjector(proj)
+
+	l.notifyOnce(context.Background(), runID, "queued")
+
+	if len(proj.calls) != 1 {
+		t.Fatalf("want projector called once, got %d", len(proj.calls))
+	}
+	got := proj.calls[0]
+	if got.repoID != repoID || got.issueIID != 4 || got.target != board.ColumnInProgress {
+		t.Errorf("projector call = %+v, want repo=%v issue=4 target=%q", got, repoID, board.ColumnInProgress)
+	}
+}
+
+// A projector error is logged and never fails the move (board_column still
+// recorded).
+func TestNotifyProjectorErrorNonFatal(t *testing.T) {
+	runID, repoID := uuid.New(), uuid.New()
+	fs := &fakeStore{
+		moveCtx: moveCtx(repoID, 4, "queued", txt("Later"), nullText()),
+		issue:   issueWith(repoID, 4, "opened", "PRD", "Later"),
+		columns: defaultCols(),
+	}
+	fm := &fakeMover{}
+	l := newTestLifecycle(fs, fm)
+	l.SetProjector(&fakeProjector{err: errors.New("sync boom")})
+
+	l.notifyOnce(context.Background(), runID, "queued")
+
+	if len(fs.recorded) != 1 || fs.recorded[0].BoardColumn.String != board.ColumnInProgress {
+		t.Fatalf("a projector error must not prevent recording the move, got %+v", fs.recorded)
+	}
+}
+
+// A nil projector is safe: apply proceeds and never panics.
+func TestNotifyNilProjectorSafe(t *testing.T) {
+	runID, repoID := uuid.New(), uuid.New()
+	fs := &fakeStore{
+		moveCtx: moveCtx(repoID, 4, "queued", txt("Later"), nullText()),
+		issue:   issueWith(repoID, 4, "opened", "PRD", "Later"),
+		columns: defaultCols(),
+	}
+	fm := &fakeMover{}
+	l := newTestLifecycle(fs, fm) // no SetProjector
+
+	l.notifyOnce(context.Background(), runID, "queued")
+
+	if len(fm.moves) != 1 {
+		t.Fatalf("nil projector must not block the move, got %v", fm.moves)
+	}
+}

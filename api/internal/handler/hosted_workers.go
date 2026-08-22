@@ -164,7 +164,7 @@ func (h *Handler) ProvisionHostedWorker(w http.ResponseWriter, r *http.Request) 
 	// same one the worker list returns, so the caller sees kind/hosted_size and can
 	// render the row it just created.
 	httpx.JSON(w, http.StatusCreated, map[string]any{
-		"worker": workerDTOFromWorker(wkr, 0, false, "", h.version, h.clock(), h.startedAt),
+		"worker": workerDTOFromWorker(wkr, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt),
 	})
 }
 

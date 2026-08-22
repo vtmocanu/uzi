@@ -14,6 +14,7 @@ import {
   SeededPlanPanel,
   AgentRosterSummary,
   JudgePanel,
+  JUDGE_POLL_MAX_TRIES,
   MilestoneBadge,
   MilestoneChecklist,
   RunHeading,
@@ -22,6 +23,7 @@ import {
   HealthFlag,
   LimitWaitPanel,
   RunView,
+  RunSummary,
   derivePlanRevision,
 } from "./RunView";
 import { useRunStream } from "../lib/useRunStream";
@@ -39,6 +41,7 @@ import {
   type Run,
   type RunMessage,
   type RunReview,
+  type Worker,
 } from "../lib/api";
 
 // The picker no longer fetches the template list (PRD #37 M4-fix — it reads the
@@ -91,6 +94,7 @@ function run(over: Partial<Run>): Run {
     repo_id: "repo1",
     forge_type: "gitlab",
     mr_web_url: null,
+    issue_web_url: null,
     kind: "issue",
     issue_iid: 87,
     issue_title: "Add rate limiting",
@@ -254,6 +258,290 @@ describe("PlanPanel agent picker (PRD #37 M4)", () => {
       />,
     );
     expect(await screen.findByText("step one")).toBeTruthy();
+  });
+});
+
+// PRD #84 M4 4d: the plan-gate readiness summary — the run's inferred requirements checked
+// against its ASSIGNED worker's capabilities, plus the false-positive "run without it"
+// override. Rendered inside the awaiting_approval PlanPanel, so these drive the panel
+// directly with the workers prop (the whole page needs a live stream + a dozen mocks).
+describe("PlanPanel readiness summary (PRD #84 M4 4d)", () => {
+  // The readiness code reads only w.id + w.capabilities; a cast keeps the fixture terse
+  // without filling the whole Worker shape (the test file already casts elsewhere).
+  function worker(id: string, capabilities: string[]): Worker {
+    return { id, capabilities } as unknown as Worker;
+  }
+
+  it("marks a required capability UNMET when the assigned worker lacks it, with remediation", async () => {
+    render(
+      <PlanPanel
+        run={run({ worker_id: "w1", required_capabilities: ["docker"], repo_agents: [], own_agents: [] })}
+        workers={[worker("w1", [])]}
+        busy={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
+    expect(await screen.findByText("Run requirements")).toBeTruthy();
+    // The unmet badge is identified by its title (the warn-toned "does not advertise" copy).
+    expect(screen.getByTitle(/does not advertise "docker"/)).toBeTruthy();
+    // The remediation line names the missing cap and the escape hatch.
+    expect(screen.getByText(/Provision or start a worker with/i)).toBeTruthy();
+  });
+
+  it("marks a required capability MET (ok-toned) and offers NO override when the worker advertises it", async () => {
+    render(
+      <PlanPanel
+        run={run({ worker_id: "w1", required_capabilities: ["docker"], repo_agents: [], own_agents: [] })}
+        workers={[worker("w1", ["docker"])]}
+        busy={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
+    expect(await screen.findByTitle(/advertises "docker"/)).toBeTruthy();
+    // Nothing unmet → no remediation, no override button.
+    expect(screen.queryByText(/Provision or start a worker with/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /Run without/i })).toBeNull();
+  });
+
+  it("marks docker MET via the docker_enabled fold even when capabilities[] omits it", async () => {
+    // A provision-time docker worker whose self-report has not landed: docker=true but
+    // capabilities=[]. The server folds docker_enabled into effective caps, so the panel must
+    // too — otherwise it shows a false UNMET for a plan the approve gate accepts (no 409).
+    const w = { id: "w1", capabilities: [], docker: true } as unknown as Worker;
+    render(
+      <PlanPanel
+        run={run({ worker_id: "w1", required_capabilities: ["docker"], repo_agents: [], own_agents: [] })}
+        workers={[w]}
+        busy={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
+    expect(await screen.findByTitle(/advertises "docker"/)).toBeTruthy();
+    expect(screen.queryByTitle(/does not advertise "docker"/)).toBeNull();
+    expect(screen.queryByRole("button", { name: /Run without/i })).toBeNull();
+  });
+
+  it("renders required_tools ('will be provisioned') and the size_class label", async () => {
+    render(
+      <PlanPanel
+        run={run({
+          worker_id: "w1",
+          required_capabilities: [],
+          required_tools: ["node", "go"],
+          size_class: "m",
+          repo_agents: [],
+          own_agents: [],
+        })}
+        workers={[worker("w1", [])]}
+        busy={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
+    expect(await screen.findByText("Run requirements")).toBeTruthy();
+    expect(screen.getByText("node")).toBeTruthy();
+    expect(screen.getByText("go")).toBeTruthy();
+    expect(screen.getByText("will be provisioned")).toBeTruthy();
+    expect(screen.getByText("size: m")).toBeTruthy();
+    // Tools never block, so even with no capability check there is no override affordance.
+    expect(screen.queryByRole("button", { name: /Run without/i })).toBeNull();
+  });
+
+  it("renders NO requirements block when nothing was inferred (all three empty)", async () => {
+    render(
+      <PlanPanel
+        run={run({ required_capabilities: [], required_tools: [], size_class: "", repo_agents: [], own_agents: [] })}
+        workers={[worker("w1", [])]}
+        busy={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
+    // Positive anchor first so the absence check is not vacuous.
+    expect(await screen.findByText("step one")).toBeTruthy();
+    expect(screen.queryByText("Run requirements")).toBeNull();
+  });
+
+  // Review fix: size_class alone must NOT open the panel. detectToolchain ALWAYS emits a
+  // non-empty size_class (s/m/l), so with the old `sizeClass !== ""` term the panel rendered
+  // for EVERY plan gate. size is advisory-only: with no capability and no tool the panel — and
+  // the "size:" label with it — is suppressed entirely.
+  it("does NOT render the panel when only size_class is set (no capability, no tool)", async () => {
+    render(
+      <PlanPanel
+        run={run({ required_capabilities: [], required_tools: [], size_class: "l", repo_agents: [], own_agents: [] })}
+        workers={[worker("w1", [])]}
+        busy={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
+    // Positive anchor first so the absence checks are not vacuous.
+    expect(await screen.findByText("step one")).toBeTruthy();
+    expect(screen.queryByText("Run requirements")).toBeNull();
+    expect(screen.queryByText("size: l")).toBeNull();
+  });
+
+  it("the override button approves with overrideCapabilities=true (the false-positive correction)", async () => {
+    const onApprove = vi.fn();
+    render(
+      <PlanPanel
+        run={run({ worker_id: "w1", required_capabilities: ["docker"], repo_agents: [], own_agents: [] })}
+        workers={[worker("w1", [])]}
+        busy={false}
+        onApprove={onApprove}
+        onReject={() => {}}
+      />,
+    );
+    const override = await screen.findByRole("button", { name: /Run without docker/i });
+    fireEvent.click(override);
+    // Default selection for a lead-only run (no repo/own agents) is source "own", no exclusions,
+    // and the override flag rides as the second arg.
+    expect(onApprove).toHaveBeenCalledWith({ source: "own", exclusions: [] }, true);
+  });
+
+  it("hides the override from a NON-OWNER (canSteer=false) even when a cap is unmet", async () => {
+    render(
+      <PlanPanel
+        run={run({ worker_id: "w1", required_capabilities: ["docker"], repo_agents: [], own_agents: [] })}
+        workers={[worker("w1", [])]}
+        busy={false}
+        canSteer={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
+    // The unmet state still renders (read-only), but the action does not.
+    expect(await screen.findByTitle(/does not advertise "docker"/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Run without/i })).toBeNull();
+  });
+});
+
+// PRD #362 M4: the run-summary cards (intent / proposed-approved plan / deltas) and their
+// per-run collapse. Rendered directly (RunView needs a live stream + a dozen mocks); a
+// Map-backed localStorage stub backs the collapse pref, since this jsdom build ships none.
+describe("RunSummary (PRD #362 M4)", () => {
+  function makeStorage(): Storage {
+    const m = new Map<string, string>();
+    return {
+      getItem: (k: string) => (m.has(k) ? m.get(k)! : null),
+      setItem: (k: string, v: string) => void m.set(k, String(v)),
+      removeItem: (k: string) => void m.delete(k),
+      clear: () => m.clear(),
+      key: (i: number) => [...m.keys()][i] ?? null,
+      get length() {
+        return m.size;
+      },
+    } as Storage;
+  }
+  beforeEach(() => {
+    Object.defineProperty(window, "localStorage", { configurable: true, value: makeStorage() });
+  });
+
+  it("renders nothing when the run carries no summary (issue-title header stands)", () => {
+    const { container } = render(<RunSummary run={run({})} />);
+    expect(container.innerHTML).toBe("");
+  });
+
+  it("shows the intent card when summary_intent is present", () => {
+    render(<RunSummary run={run({ summary_intent: "Add a token-bucket rate limiter to the API." })} />);
+    expect(screen.getByText("What this run will implement")).toBeTruthy();
+    expect(screen.getByText("Add a token-bucket rate limiter to the API.")).toBeTruthy();
+  });
+
+  it("labels the plan 'Proposed plan' while awaiting_approval", () => {
+    render(
+      <RunSummary
+        run={run({ status: "awaiting_approval", summary_plan: "Introduce middleware and a store.", summary_deltas: [] })}
+      />,
+    );
+    expect(screen.getByText("Proposed plan")).toBeTruthy();
+    expect(screen.queryByText("Approved plan")).toBeNull();
+  });
+
+  it("labels the plan 'Approved plan' once past the gate (e.g. running/completed)", () => {
+    render(<RunSummary run={run({ status: "running", summary_plan: "Introduce middleware and a store." })} />);
+    expect(screen.getByText("Approved plan")).toBeTruthy();
+    expect(screen.queryByText("Proposed plan")).toBeNull();
+  });
+
+  it("renders deltas tagged by kind", () => {
+    render(
+      <RunSummary
+        run={run({
+          status: "awaiting_approval",
+          summary_plan: "A plan.",
+          summary_deltas: [
+            { kind: "added", text: "Add a metrics endpoint." },
+            { kind: "changed", text: "Use Redis instead of in-memory." },
+            { kind: "dropped", text: "Skip the admin dashboard." },
+          ],
+        })}
+      />,
+    );
+    expect(screen.getByText("added")).toBeTruthy();
+    expect(screen.getByText("changed")).toBeTruthy();
+    expect(screen.getByText("dropped")).toBeTruthy();
+    expect(screen.getByText("Add a metrics endpoint.")).toBeTruthy();
+    expect(screen.getByText("Use Redis instead of in-memory.")).toBeTruthy();
+    expect(screen.getByText("Skip the admin dashboard.")).toBeTruthy();
+  });
+
+  it("shows the no-deviations line for an empty deltas array", () => {
+    render(<RunSummary run={run({ status: "awaiting_approval", summary_plan: "A plan.", summary_deltas: [] })} />);
+    expect(screen.getByText("No deviations — the plan matches the original ask")).toBeTruthy();
+  });
+
+  it("shows the no-deviations line for null deltas", () => {
+    render(<RunSummary run={run({ status: "running", summary_plan: "A plan.", summary_deltas: null })} />);
+    expect(screen.getByText("No deviations — the plan matches the original ask")).toBeTruthy();
+  });
+
+  it("tolerates a non-array summary_deltas without crashing (renders no-deviations)", () => {
+    // Server coerces malformed jsonb to null (M1); this is the defensive second line for a
+    // value that somehow reaches the renderer as a non-array.
+    const bad = { kind: "added", text: "not a list" } as unknown as Run["summary_deltas"];
+    render(<RunSummary run={run({ status: "running", summary_plan: "A plan.", summary_deltas: bad })} />);
+    expect(screen.getByText("No deviations — the plan matches the original ask")).toBeTruthy();
+  });
+
+  it("renders intent markdown as elements while keeping raw HTML inert and stripping bidi (issue #423)", () => {
+    // Intent/plan now render through the shared hardened <Markdown> (issue #423, revising the
+    // "rendered as text (web)" clause of Decision 10): markdown syntax becomes real elements,
+    // but raw HTML stays INERT text (the pipeline carries NO rehype-raw) and bidi/format chars
+    // are still stripped BEFORE the parse. RLO is written as an escape sequence, never a raw byte.
+    const RLO = String.fromCodePoint(0x202e);
+    const { container } = render(
+      <RunSummary
+        run={run({ summary_intent: `Call \`fireSweep\` with **max_issues** <script>alert(1)</script> ${RLO}rate limiting` })}
+      />,
+    );
+    // Markdown parsed to real elements.
+    expect(container.querySelector("code")?.textContent).toBe("fireSweep");
+    expect(container.querySelector("strong")?.textContent).toBe("max_issues");
+    // Raw HTML did NOT become a live node (no rehype-raw)…
+    expect(container.querySelector("script")).toBeNull();
+    // …but survives as inert text on the page.
+    expect(container.textContent ?? "").toContain("<script>alert(1)</script>");
+    // Bidi/format characters are still stripped.
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+  });
+
+  it("collapses on toggle and remembers the choice per run across a remount", () => {
+    const r = run({ id: "run-collapse", summary_intent: "Some intent." });
+    const { unmount } = render(<RunSummary run={r} />);
+    // Expanded by default: the intent text is visible.
+    expect(screen.getByText("Some intent.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Collapse" }));
+    expect(screen.queryByText("Some intent.")).toBeNull();
+    unmount();
+    // A fresh mount reads the persisted per-run choice → still collapsed.
+    render(<RunSummary run={r} />);
+    expect(screen.queryByText("Some intent.")).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand" })).toBeTruthy();
   });
 });
 
@@ -793,6 +1081,77 @@ describe("RunView report-only surfaces (issue #279)", () => {
     expect(link.textContent).toContain("Open merge request");
     expect(screen.queryByText("report only")).toBeNull();
     expect(screen.queryByText("Findings")).toBeNull();
+  });
+});
+
+// PRD #377 M2: the failed card surfaces the worker-preserved diff for a GitHub run whose
+// branch touched .github/workflows/** (the bot's repo-only PAT can't push it). The block is
+// gated on run.preserved_patch on a terminal, non-completed run — the same gate as
+// failure_reason — and must read as "valid work preserved", not a crash.
+describe("RunView preserved-patch surface (PRD #377)", () => {
+  const FRAMING = "Here’s the diff to land as a human PR:";
+  const PATCH =
+    "diff --git a/.github/workflows/main-guard.yml b/.github/workflows/main-guard.yml\n" +
+    "+name: main-guard\n";
+
+  function renderPage(over: Partial<Run>) {
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: false,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    return render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+  }
+
+  it("renders the framing label and the diff on a failed run with a preserved patch", async () => {
+    const { container } = renderPage({
+      status: "failed",
+      forge_type: "github",
+      failure_reason: "Land the preserved diff as a human PR; see docs/github-bot-setup.md.",
+      preserved_patch: PATCH,
+    });
+    // The framing reads as "valid work preserved", not an error.
+    expect(await screen.findByText(FRAMING, { exact: false })).toBeTruthy();
+    // The diff renders in a monospace <pre> block, verbatim.
+    const pre = container.querySelector("pre");
+    expect(pre).not.toBeNull();
+    expect(pre?.textContent).toContain("diff --git a/.github/workflows/main-guard.yml");
+    expect(pre?.textContent).toContain("+name: main-guard");
+  });
+
+  it("does not render the diff block on a failed run without a preserved patch", async () => {
+    const { container } = renderPage({
+      status: "failed",
+      forge_type: "github",
+      failure_reason: "run timed out after 2h0m0s (RUN_TIMEOUT)",
+      preserved_patch: null,
+    });
+    // Wait for the failure card (the reason) to mount before asserting absence.
+    expect(await screen.findByText("run timed out after 2h0m0s (RUN_TIMEOUT)")).toBeTruthy();
+    expect(screen.queryByText(FRAMING, { exact: false })).toBeNull();
+    expect(container.querySelector("pre")).toBeNull();
+  });
+
+  it("does not render the diff block on a completed run even if a patch is present", async () => {
+    const { container } = renderPage({
+      status: "completed",
+      forge_type: "github",
+      branch: "agent/issue-87",
+      preserved_patch: PATCH,
+    });
+    expect(await screen.findByText("Run completed")).toBeTruthy();
+    expect(screen.queryByText(FRAMING, { exact: false })).toBeNull();
+    expect(container.querySelector("pre")).toBeNull();
   });
 });
 
@@ -1486,80 +1845,56 @@ describe("JudgePanel (PRD #46 M4)", () => {
     }
   });
 
-  // ── The 150-try cap (#119) ────────────────────────────────────────────────────────────
+  // ── The poll-try cap (#119) ───────────────────────────────────────────────────────────
   // The cap is the LAST stop condition: a judge that neither produces a verdict nor leaves
-  // the active set would otherwise be polled every 4s for the life of the tab. 150 × 4s ≈
-  // 10 minutes, chosen because the old 15-try (~1 min) cap gave up on judges that were
-  // still running. Both tests below assert the exact bound — 1 mount fetch + 150 ticks =
-  // 151 — rather than "eventually stops", because an off-by-a-lot cap still "stops".
+  // the active set would otherwise be polled every 4s for the life of the tab. In
+  // production it is JUDGE_POLL_MAX_TRIES = 150 (× 4s ≈ 10 minutes, chosen because the old
+  // 15-try (~1 min) cap gave up on judges that were still running). The two tests below
+  // assert the EXACT stop boundary — 1 mount fetch + N ticks, then one more tick trips the
+  // cap and no later tick fires — rather than "eventually stops", because an off-by-a-lot
+  // cap still "stops".
   //
-  // 🔴 BOTH TESTS BELOW CARRY A PER-TEST TIMEOUT (the third argument to `it`), and the
-  // other 1658 tests in this suite keep the 20000 default (PRD #103 M5 MR-C). They are
-  // the two slowest tests here by a wide margin, and the reason is structural rather
-  // than environmental: each awaits `advanceTimersByTimeAsync(149 * 4000)` inside ONE
-  // `it()`, which is 149 sequential real event-loop turns, every one of them flushing a
-  // mocked promise and a React `act`. Measured 2026-08-04 under vitest 4.1.10 with the
-  // JSON reporter: 4228 ms mean inside the full 118-file suite, and 5416 ms mean running
-  // this file SOLO. Solo is the limit of splitting — zero competing files — and it is
-  // SLOWER, so splitting this file cannot fix it and the chain moves intact into
-  // whatever file it lands in. Under CPU contention that chain has been observed to
-  // exceed 20000, and when it does, everything after it in this file fails too — 48
-  // further failures in the archived run, which are missing-element and empty-string
-  // assertions rather than the single "empty-container cascade" signature this comment
-  // used to name (`probes/prd-103-mrc-lead/cascade-characterisation.txt`).
-  //
-  // A PER-TEST CAP RATHER THAN RAISING THE SUITE DEFAULT, deliberately: this MR first
-  // took `testTimeout` to 60000 in `vite.config.ts` and that was reverted, because it
-  // weakened the hang-detection ceiling for 1658 tests to accommodate two. Do not
-  // "simplify" these back to the default; do fix the 149-turn chain, after which they
-  // come off.
-  //
-  // 🔴 THE CAP IS 120000 AND IT WAS 60000 FOR ABOUT A DAY. 60000 was set against a rate
-  // that a 73-run study then refuted, and the same study measured what the cap actually
-  // has to clear: **49869 ms**, this test's sibling below, passing at **83.1% of a 60000
-  // ceiling** — and **49065 ms** inside a fully green run. A 1.20x margin over the worst
-  // thing you have ever seen is not margin on a starvation tail. Raw data and the
-  // pre-registered predictions in `probes/prd-103-mrc-tester-tt/`.
-  //
-  // WHY THAT IS NOT JUST "THE NUMBER THAT MAKES IT PASS", which is the objection this
-  // change has to answer: 60000 sat at the same position relative to the worst excursion
-  // of its day that the old suite-wide 20000 sat at relative to the excursion which
-  // failed it. Setting a ceiling just above the largest observation is the move that had
-  // already failed once here. What bounds this one instead is what the cap is FOR: these
-  // two tests do a fixed, deterministic 149 turns of work, so the cap is a hang detector,
-  // not a performance budget, and its cost is bounded to the two tests that carry it —
-  // the other 1658 keep 20000, and no assertion anywhere is loosened. Doubling the wait
-  // before a genuinely hung one of these two reports is the whole price.
-  //
-  // AND THE HONEST LIMIT: every figure above is one laptop under an agent-team load.
-  // **There is no measured rate for CI**, which is a different machine under different
-  // contention and is where this bites. 120000 is chosen to survive a tail nobody has
-  // characterised there, not to clear a number somebody measured here.
-  it("stops after the 150-try cap when a pending judge never clears (#119)", async () => {
+  // 🔴 THEY DRIVE THE CAP THROUGH THE `pollMaxTries` PROP AT 5, NOT THE PRODUCTION 150
+  // (issue #227). The stop MECHANISM is identical at any cap, and exercising it at 5 costs
+  // ~5 fake-timer turns instead of 149. That 149-turn chain — one `advanceTimersByTimeAsync(149
+  // * 4000)` inside a single `it()`, each turn flushing a mocked promise + a React `act` —
+  // was these two tests' whole cost: ~4228 ms mean in the full suite, >49000 ms under CPU
+  // contention (PRD #103 M5 MR-C, `probes/prd-103-mrc-tester-tt/`), and it forced a per-test
+  // 120000 timeout while the other 1658 tests kept the 20000 default. Splitting the file did
+  // not help (solo was SLOWER); reducing the ITERATION COUNT is the fix, so with it gone the
+  // per-test caps come off and these inherit the suite-wide 20000. The production value 150 is
+  // no longer asserted through timers here — it is pinned directly by the timer-free test
+  // below, so a change to the default still reddens the suite.
+  it("pins the production poll-try cap default", () => {
+    // Guards the value the mechanism tests deliberately do NOT drive (they use pollMaxTries=5).
+    expect(JUDGE_POLL_MAX_TRIES).toBe(150);
+  });
+
+  it("stops after the poll-try cap when a pending judge never clears (#119)", async () => {
     vi.useFakeTimers();
     try {
       // ONE object, reused for every response: setPendingJudge with an identical reference
-      // lets React bail out of the re-render, so this is 150 ticks of poll, not 150 renders.
+      // lets React bail out of the re-render, so this is ticks of poll, not re-renders.
       const stuck = { review: null, pending_judge: pending("running") };
       mockApi.getRunReview.mockResolvedValue(stuck);
-      render(<JudgePanel run={run({ status: "failed" })} />);
+      render(<JudgePanel run={run({ status: "failed" })} pollMaxTries={5} />);
       await act(async () => {
         await vi.advanceTimersByTimeAsync(0);
       });
       // The mount fetch, and nothing else yet.
       expect(mockApi.getRunReview).toHaveBeenCalledTimes(1);
 
-      // One tick short of the cap: still polling.
+      // One tick short of the cap (4 ticks → tries=4 < 5): still polling.
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(149 * 4000);
+        await vi.advanceTimersByTimeAsync(4 * 4000);
       });
-      expect(mockApi.getRunReview).toHaveBeenCalledTimes(150);
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(5);
 
-      // The 150th tick trips the cap.
+      // The 5th tick (tries=5 >= 5) trips the cap.
       await act(async () => {
         await vi.advanceTimersByTimeAsync(4000);
       });
-      expect(mockApi.getRunReview).toHaveBeenCalledTimes(151);
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(6);
 
       // And it is really over — half an hour of ticks adds nothing. Without the cap the
       // interval would keep firing, because `polling` stays true while pendingJudge holds
@@ -1567,11 +1902,11 @@ describe("JudgePanel (PRD #46 M4)", () => {
       await act(async () => {
         await vi.advanceTimersByTimeAsync(30 * 60_000);
       });
-      expect(mockApi.getRunReview).toHaveBeenCalledTimes(151);
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(6);
     } finally {
       vi.useRealTimers();
     }
-  }, 120000);
+  });
 
   // The same bound on the FETCH-FAILURE path, which is a separate `clearInterval` in the
   // `!next` branch — and one that could not have existed before #119. The effect used to
@@ -1580,14 +1915,14 @@ describe("JudgePanel (PRD #46 M4)", () => {
   // over a permanently-failing endpoint (pendingJudge keeps its last non-null value and no
   // response ever arrives to change it). The explicit clearInterval there is the ONLY thing
   // that ever stops a /review that fails forever.
-  it("stops after the same 150-try cap when every poll tick FAILS (#119)", async () => {
+  it("stops after the same poll-try cap when every poll tick FAILS (#119)", async () => {
     vi.useFakeTimers();
     try {
       // The mount fetch must SUCCEED and report a pending judge, or the poll never arms.
       mockApi.getRunReview
         .mockResolvedValueOnce({ review: null, pending_judge: pending("running") })
         .mockRejectedValue(new Error("network down"));
-      render(<JudgePanel run={run({ status: "failed" })} />);
+      render(<JudgePanel run={run({ status: "failed" })} pollMaxTries={5} />);
       await act(async () => {
         await vi.advanceTimersByTimeAsync(0);
       });
@@ -1597,25 +1932,25 @@ describe("JudgePanel (PRD #46 M4)", () => {
       expect(screen.getAllByText("Judge in progress…")).toHaveLength(2);
 
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(149 * 4000);
+        await vi.advanceTimersByTimeAsync(4 * 4000);
       });
-      expect(mockApi.getRunReview).toHaveBeenCalledTimes(150);
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(5);
 
       await act(async () => {
         await vi.advanceTimersByTimeAsync(4000);
       });
-      expect(mockApi.getRunReview).toHaveBeenCalledTimes(151);
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(6);
 
       // 🔴 This is the assertion that reddens if the `clearInterval` in the `!next` branch
       // is dropped: setQueued(false) alone does not stop this timer.
       await act(async () => {
         await vi.advanceTimersByTimeAsync(30 * 60_000);
       });
-      expect(mockApi.getRunReview).toHaveBeenCalledTimes(151);
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(6);
     } finally {
       vi.useRealTimers();
     }
-  }, 120000);
+  });
 
   // The rollout-skew normalization has TWO sites, and this is the POLL one. The mount-fetch
   // site is covered by "treats an absent pending_judge…" below; this covers the case where
@@ -1735,6 +2070,8 @@ describe("JudgePanel (PRD #46 M4)", () => {
       repo_devbox_opt_in: false,
       pipeline: null,
       guardrail_blocked: false,
+      docker_allowlisted: false,
+      docker_blocked: false,
     };
   }
   function draftFixture(over: Partial<IssueDraft> = {}): IssueDraft {
@@ -3133,6 +3470,53 @@ describe("the park announcement does not live inside the panel (PRD #88 M2, a11y
   });
 });
 
+// PRD #517 (a11y): a run parking into awaiting_followup is a needs-you state classified
+// identically by needsHumanAttention, so it must announce too — not only awaiting_input.
+// These render the whole page (useRunStream mocked) and read the ALWAYS-MOUNTED sr-only
+// region's CONTENT, which is the actual fix (a region born holding text is silent; the
+// content change is what assistive tech narrates). The parkAnnounce region is a <div>;
+// HealthFlag's is a <span>, so `div.sr-only[role="status"]` targets parkAnnounce uniquely.
+describe("RunView park announcement — awaiting_followup (PRD #517, a11y)", () => {
+  function renderPage(over: Partial<Run>) {
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: true,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    return render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+  }
+
+  it("announces the follow-up park through the always-mounted sr-only region", async () => {
+    renderPage({ status: "awaiting_followup" });
+    const region = await waitFor(() => {
+      const el = document.querySelector('div.sr-only[role="status"]') as HTMLElement | null;
+      if (!el || el.textContent === "") throw new Error("not announced yet");
+      return el;
+    });
+    expect(region.getAttribute("aria-live")).toBe("polite");
+    expect(region.textContent).toBe("The run is waiting for your next follow-up.");
+    // Mutation guard: it is the follow-up copy, NOT the awaiting_input question copy.
+    expect(region.textContent).not.toContain("asking you a question");
+  });
+
+  it("leaves the region empty on a plain running run (nothing to announce)", async () => {
+    renderPage({ status: "running" });
+    await screen.findByText("Add rate limiting");
+    const region = document.querySelector('div.sr-only[role="status"]') as HTMLElement;
+    expect(region.textContent).toBe("");
+  });
+});
+
 // PRD #122: the milestone header badge, the checklist, and the plan-gate candidate list.
 describe("MilestoneBadge (compact M{done}/{total}, PRD #122)", () => {
   const ms = (n: number) =>
@@ -3157,6 +3541,19 @@ describe("MilestoneBadge (compact M{done}/{total}, PRD #122)", () => {
   it("still renders M0/N when an empty completion set WAS reported (genuine zero)", () => {
     render(<MilestoneBadge run={run({ milestones: ms(4), milestones_completed: [] })} />);
     expect(screen.getByText("M0/4")).toBeTruthy();
+  });
+
+  // PRD #390 D5 / M4. The two cases above assert the visible LABEL; the tooltip that tells the
+  // states apart on hover is a `title` ATTRIBUTE, invisible to a text query — so a regression
+  // that handed the neutral state the "reported complete" wording (or the reverse) would slip
+  // past them. Assert the attribute on both states directly.
+  it("carries the 'not reported' tooltip on the neutral state and 'reported complete' on a genuine zero (PRD #390 D5)", () => {
+    const { rerender } = render(<MilestoneBadge run={run({ milestones: ms(4), milestones_completed: null })} />);
+    const neutral = screen.getByText("M–/4");
+    expect(neutral.getAttribute("title")).toBe("No milestone completion reported for this run");
+    rerender(<MilestoneBadge run={run({ milestones: ms(4), milestones_completed: [] })} />);
+    const zero = screen.getByText("M0/4");
+    expect(zero.getAttribute("title")).toBe("Milestones reported complete of the approved plan");
   });
 });
 

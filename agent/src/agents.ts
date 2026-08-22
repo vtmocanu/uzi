@@ -50,6 +50,9 @@ import { NESTED_AGENT_TOOL, WRITE_PATH_TOOLS } from "./guardrails.js";
 import { SIGNAL_SERVER_NAME } from "./signals.js";
 import { MEMORY_SERVER_NAME } from "./memory-tools.js";
 import { qualifiedSkillName } from "./skills-plugin.js";
+import { reportIncidentalIssueToolName, FINDINGS_SERVER_NAME } from "./findings-tools.js";
+import { FORGE_SERVER_NAME } from "./forge-tools.js";
+import { FINDINGS_NUDGE_APPEND } from "./prompt.js";
 
 // Server-level MCP denial (PRD #43 M2 / Decision 3). A `mcp__<server>` entry in
 // disallowedTools removes EVERY tool the named in-process MCP server exposes
@@ -73,6 +76,9 @@ const SIGNAL_SERVER_DENY = `mcp__${SIGNAL_SERVER_NAME}`;
 // writing cross-run memory. Defense-in-depth: the entry is still per-(user,repo)
 // scoped and server-capped, but provenance stays "the lead saved this".
 const MEMORY_SERVER_DENY = `mcp__${MEMORY_SERVER_NAME}`;
+
+// PRD #457: the incidental-findings tool name is a pure constant; compute once.
+const FINDINGS_TOOL_NAME = reportIncidentalIssueToolName();
 
 /** Membership form of WRITE_PATH_TOOLS, for planTurnSubagents' filter. Derived,
  *  never re-typed — guardrails.ts owns the list (#203). */
@@ -144,7 +150,10 @@ function toDefinition(
 ): AgentDefinition {
   const def: AgentDefinition = {
     description: t.description,
-    prompt: t.prompt_body,
+    // PRD #457 M3: append the findings discovery nudge to every subagent's prompt,
+    // so shared-library repo agents get it WITHOUT editing their files. Same constant
+    // as the lead nudge (buildLeadSystemPrompt) — one source of wording.
+    prompt: `${t.prompt_body}\n\n${FINDINGS_NUDGE_APPEND}`,
     // No subagent may spawn nested agents (defense-in-depth over the fact that
     // `agents` + settingSources:[] already limit spawnable agents to these), reach
     // the run's workflow-signal MCP tools (SIGNAL_SERVER_DENY — the plan gate and
@@ -159,6 +168,30 @@ function toDefinition(
   // sdk.d.ts:44 a tools-`Skill` grant is deprecated), so a read-only subagent
   // (reviewer/auditor) still expands a repo skill without any tools widening.
   if (t.tools && t.tools.length > 0) def.tools = [...t.tools];
+  // PRD #457 M1: grant the incidental-findings tool to any subagent with a non-empty
+  // allowlist (the broad-reading read-only roles that would otherwise be unable to
+  // call it). When `tools` is unset (inherit-all, e.g. coder) the tool is already
+  // available — do NOT materialize an allowlist. Dedup-guarded. NOT a write tool, so
+  // it survives the plan-turn write-strip (planTurnSubagents).
+  if (def.tools && !def.tools.includes(FINDINGS_TOOL_NAME)) def.tools = [...def.tools, FINDINGS_TOOL_NAME];
+  // PRD #158 / issue #581: an in-process MCP server (forge, findings) is registered
+  // once in the top-level options.mcpServers (sdk-executor.ts); on the pinned SDK that
+  // map reaches only the LEAD session. To let an allowlisted subagent (e.g. the
+  // fact-checker, granted the mcp__forge__* read tools) actually reach it, name the
+  // server on this AgentDefinition via the string form of mcpServers (sdk.d.ts:59,120)
+  // — the only way to attach an in-process instance to a subagent. Derived from the
+  // resolved allowlist (which now already includes the findings tool from the line
+  // above), so it self-tracks whatever the template declares. Inherit-all subagents
+  // (no `tools`) are left untouched. memory/signal are DELIBERATELY excluded — they are
+  // server-denied to every subagent above (MEMORY_SERVER_DENY / SIGNAL_SERVER_DENY).
+  if (def.tools) {
+    const servers: string[] = [];
+    for (const server of [FORGE_SERVER_NAME, FINDINGS_SERVER_NAME]) {
+      const prefix = `mcp__${server}__`;
+      if (def.tools.some((name) => name.startsWith(prefix))) servers.push(server);
+    }
+    if (servers.length > 0) def.mcpServers = servers;
+  }
   if (t.model) def.model = t.model;
   // Skill scoping (PRD #16): a subagent preloads its own ALLOCATED delivered
   // skills (filtered to the materialized survivors, so it never lists a skill
@@ -375,7 +408,13 @@ export function planTurnSubagents(subagents: Record<string, AgentDefinition>): P
     // to whatever this function happened to think the full toolset was.
     if (def.tools) {
       const kept = def.tools.filter((t) => !WRITE_TOOL_SET.has(t));
-      if (kept.length === 0) {
+      // PRD #457 M1 R1: toDefinition now grants the (non-write) findings tool to every
+      // allowlist, so a write-ONLY custom agent reaches here as `[Edit, Write,
+      // FINDINGS_TOOL_NAME]` and `kept` becomes `[FINDINGS_TOOL_NAME]` — non-empty. Exclude
+      // the findings tool from the emptiness test so such an agent still DROPS (unchanged
+      // behaviour), while a read-only agent keeps the findings tool through the plan turn.
+      const meaningful = kept.filter((t) => t !== FINDINGS_TOOL_NAME);
+      if (meaningful.length === 0) {
         dropped.push(name);
         continue;
       }

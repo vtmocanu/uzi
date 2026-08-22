@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { RunsHistory, RunsLayout, RunsList } from "./RunsList";
+import { RunsHistory, RunsLayout, RunsList, sortPast } from "./RunsList";
 import { api, type RunListItem, type SecretMeta } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
@@ -78,6 +78,7 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
     repo_id: "repo-1",
     forge_type: "gitlab",
     mr_web_url: null,
+    issue_web_url: null,
     kind: "issue",
     issue_iid: 7,
     issue_title: "A run",
@@ -130,11 +131,34 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
   };
 }
 
+describe("sortPast (archive ordering)", () => {
+  it("orders same-second finished_at by instant, not string (Go trims fractional zeros)", () => {
+    // "…:00.5Z" is LATER than "…:00Z" but sorts as SMALLER under a string compare
+    // ('.' < 'Z'). A string-keyed sort would put the earlier run first; the instant
+    // compare puts the more-recent run first. Fails on localeCompare, passes on the fix.
+    const earlier = aRun({ id: "earlier", status: "completed", finished_at: "2026-07-05T10:00:00Z" });
+    const later = aRun({ id: "later", status: "completed", finished_at: "2026-07-05T10:00:00.5Z" });
+    expect([earlier, later].sort(sortPast).map((r) => r.id)).toEqual(["later", "earlier"]);
+  });
+
+  it("falls back to updated_at when finished_at is null, and breaks exact-anchor ties by status rank", () => {
+    // Equal anchors ⇒ the primary key is 0, so the failed < cancelled < completed
+    // status rank decides. This keeps the secondary tie-break covered.
+    const done = aRun({ id: "done", status: "completed", finished_at: null, updated_at: "2026-07-05T10:00:00Z" });
+    const failed = aRun({ id: "failed", status: "failed", finished_at: null, updated_at: "2026-07-05T10:00:00Z" });
+    expect([done, failed].sort(sortPast).map((r) => r.id)).toEqual(["failed", "done"]);
+  });
+});
+
 beforeEach(() => {
   vi.mocked(useAuth).mockReturnValue({ user: { is_admin: false } } as unknown as ReturnType<typeof useAuth>);
 });
 afterEach(() => {
   cleanup();
+  // Restore real timers so the fake-timer poll tests below cannot leak fake timers
+  // into the ~40 real-timer waitFor(...) tests (which would hang their waits). The
+  // Dashboard.test.tsx afterEach does the same for the same reason.
+  vi.useRealTimers();
   vi.clearAllMocks();
 });
 
@@ -191,6 +215,46 @@ describe("RunsList — the run title carries no format characters (#124)", () =>
     await waitFor(() => expect(screen.getByText("running")).toBeTruthy());
     expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
     expect(screen.getByText("Fix the parser bug")).toBeTruthy();
+  });
+});
+
+// PRD #362 M4: a one-line intent preview under the title, shown once the worker posts the
+// intent summary. Absent (pre-feature / early run) leaves only the title.
+describe("RunsList — intent preview (PRD #362 M4)", () => {
+  beforeEach(() => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: false },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+  });
+
+  it("shows the intent preview when summary_intent is present", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "r", issue_title: "Add rate limiting", summary_intent: "Throttle the API with a token bucket." })],
+    });
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("Add rate limiting")).toBeTruthy());
+    expect(screen.getByText("Throttle the API with a token bucket.")).toBeTruthy();
+  });
+
+  it("shows no preview when summary_intent is absent (only the title)", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "r", issue_title: "Add rate limiting", summary_intent: null })],
+    });
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("Add rate limiting")).toBeTruthy());
+    // The title is the only text row for this run; no second preview line.
+    expect(screen.queryByText("Throttle the API with a token bucket.")).toBeNull();
+  });
+
+  it("strips bidi/format characters out of the untrusted intent preview", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "r", issue_title: "Add rate limiting", summary_intent: "Throttle ‮the API​" })],
+    });
+    const { container } = renderRuns();
+    await waitFor(() => expect(screen.getByText("Add rate limiting")).toBeTruthy());
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(screen.getByText("Throttle the API")).toBeTruthy();
   });
 });
 
@@ -360,6 +424,55 @@ describe("RunsList milestone badge (PRD #122)", () => {
     renderRuns();
     await waitFor(() => expect(screen.getByText("Plain run")).toBeTruthy());
     expect(screen.queryByText(/^M\d+\/\d+$/)).toBeNull();
+  });
+
+  // PRD #390 D5 / M4 guard. A milestone-bearing run whose tracker was never reported
+  // (milestones_completed null) must render the NEUTRAL M–/N ("not reported") on the row,
+  // distinct from a genuine M0/N — so a run that reported nothing never reads as a
+  // failure-looking zero. This is the row-surface counterpart of the RunView header guard.
+  it("renders the neutral M–/N (never M0/N) on a milestone run whose tracker was never reported", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "unrep",
+          issue_title: "Unreported run",
+          status: "running",
+          milestones: [
+            { id: "a", title: "A" },
+            { id: "b", title: "B" },
+            { id: "c", title: "C" },
+          ],
+          milestones_completed: null,
+        }),
+      ],
+    });
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("Unreported run")).toBeTruthy());
+    // The badge is present, and it is the neutral en-dash numerator, never a 0.
+    expect(screen.getByText("M–/3")).toBeTruthy();
+    expect(screen.queryByText("M0/3")).toBeNull();
+  });
+
+  it("renders a genuine M0/N when an empty completion set WAS reported (distinct from neutral)", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "zero",
+          issue_title: "Reported-zero run",
+          status: "running",
+          milestones: [
+            { id: "a", title: "A" },
+            { id: "b", title: "B" },
+            { id: "c", title: "C" },
+          ],
+          milestones_completed: [],
+        }),
+      ],
+    });
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("Reported-zero run")).toBeTruthy());
+    expect(screen.getByText("M0/3")).toBeTruthy();
+    expect(screen.queryByText("M–/3")).toBeNull();
   });
 });
 
@@ -851,5 +964,102 @@ describe("RunsList — queue priority pill + Expedite action (PRD #320 M6)", () 
     expect(screen.queryByText("Expedited")).toBeNull();
     expect(screen.queryByRole("button", { name: "Expedite" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
+  });
+});
+
+// PRD #518: the Runs list live-updates by re-fetching every 10s while the tab is
+// visible (usePollWhileVisible), matching Board and Dashboard. These use fake timers
+// + advanceTimersByTimeAsync(10000) — the afterEach restores real timers so they do
+// not leak into the real-timer waitFor tests above. useNow is a mocked constant, so
+// advancing 10000ms fires only the poll, never the 1s duration clock.
+describe("RunsList — live poll (PRD #518)", () => {
+  beforeEach(() => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: false },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+  });
+
+  it("re-fetches the runs list every 10s and re-renders updated run state", async () => {
+    vi.useFakeTimers();
+    // First load shows a queued run; the 10s poll returns it running.
+    mockApi.listRuns
+      .mockResolvedValueOnce({ runs: [aRun({ id: "r", issue_title: "First title", status: "queued" })] })
+      .mockResolvedValue({ runs: [aRun({ id: "r", issue_title: "Second title", status: "running" })] });
+
+    renderRuns();
+    // Flush the first load.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText("First title")).toBeTruthy();
+    expect(screen.getByText("queued")).toBeTruthy();
+
+    // The 10s poll re-fetches listRuns() and the row reflects the new state.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10000);
+    });
+    expect(mockApi.listRuns).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("Second title")).toBeTruthy();
+    expect(screen.getByText("running")).toBeTruthy();
+    // The mount-only credential secrets fetch does NOT re-fire on a poll (design
+    // invariant 2: poll only the volatile endpoint).
+    expect(mockApi.listSecrets).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the last-good list when a poll fails — no skeleton re-flash, no error banner", async () => {
+    vi.useFakeTimers();
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "r", issue_title: "Steady run", status: "running" })],
+    });
+
+    renderRuns();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText("Steady run")).toBeTruthy();
+
+    // The next poll rejects; the poll must swallow it and keep last-good.
+    mockApi.listRuns.mockRejectedValueOnce(new Error("poll blip"));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10000);
+    });
+
+    expect(mockApi.listRuns).toHaveBeenCalledTimes(2); // first load + one poll
+    expect(screen.getByText("Steady run")).toBeTruthy(); // last-good rows intact
+    // No error banner over the working list (the poll never routes through setError).
+    expect(screen.queryByText(/Failed to load runs/)).toBeNull();
+  });
+
+  it("re-polls the admin factory lists (runs + workers) when the viewer is admin", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: true, email: "me@uzi.test" },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListWorkers.mockResolvedValue({ workers: [] });
+    mockApi.adminListRuns
+      .mockResolvedValueOnce({
+        runs: [aRun({ id: "a", issue_title: "First factory run", status: "running", owner_email: "other@uzi.test" })],
+      })
+      .mockResolvedValue({
+        runs: [aRun({ id: "b", issue_title: "Second factory run", status: "running", owner_email: "other@uzi.test" })],
+      });
+
+    vi.useFakeTimers();
+    renderRuns();
+    // Flush the first admin load so the card renders (!adminLoading).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText("First factory run")).toBeTruthy();
+
+    // The 10s poll re-fetches both admin lists and the card reflects the new run.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10000);
+    });
+    expect(mockApi.adminListRuns).toHaveBeenCalledTimes(2);
+    expect(mockApi.adminListWorkers).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("Second factory run")).toBeTruthy();
   });
 });

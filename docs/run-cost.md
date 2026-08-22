@@ -13,6 +13,15 @@ sides run on the same tier. The saving is structural, and it comes from four
 places uzi's runtime differs from a local multi-agent session. This page
 names them, then asks the harder question: is the cheaper run as good?
 
+> **This page is about token spend, which is a different number from context
+> fill.** Everything below tallies tokens *consumed* — what a run cost. The
+> [lead context meter](./run-activity.md#lead-context-meter) in the Activity
+> panel shows something else: how full the **lead's** live context window is
+> *right now*, the fill that predicts the SDK's autocompaction. It's read
+> once per lead turn from `query.getContextUsage()` and is lead-only — the
+> SDK exposes a window for the main-loop session, not for subagents, so
+> there's no context-fill number to add to a subagent's cost row.
+
 ## The model tier is not the difference
 
 `override_subagent_model` (added by migration `00119_schedule_run_override_subagent_model.sql`,

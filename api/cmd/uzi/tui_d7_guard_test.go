@@ -94,14 +94,25 @@ var d7UntrustedFields = []string{
 	"Target",
 	"IssueTitle",
 	"IssueDescription",
+	// IssueWebURL is the forge-authored issue URL drawn as an OSC-8 hyperlink target via
+	// oscLink; it must reach a draw only inside a sanitizeTTY(...) call (issueLink does so).
+	"IssueWebURL",
 	"AgentLabel",
 	"HealthReason",
 	"FailureReason",
+	// Milestone titles are repo/agent-authored free text drawn in the crew rail's
+	// milestone block (renderMilestones). apitypes.Milestone.Title is the wire field;
+	// the rail draws it through renderer.Plain.
+	"Title",
 	// OwnerEmail is forge-authored and shown on the admin board (PRD #325 M2, B1). It
 	// must be drawn only through a sanitizer (renderer.Plain); the clean-fixture
 	// screenshots cannot catch a raw draw, so this guard + the hostile-OwnerEmail render
 	// test in TestTUIViewsStripControlBytesFromUntrustedText are the defence.
 	"OwnerEmail",
+	// AnthropicSecretLabel is the USER-AUTHORED token label shown in the board credential cell
+	// (boardCredSeg) and on the run-detail header's first line (detailCredTag), both via
+	// renderer.Plain (PRD #295). Same defence: this guard + the hostile-label case in the render test.
+	"AnthropicSecretLabel",
 }
 
 // d7Writers are the calls that put a string on the screen. lipgloss's Render is one:

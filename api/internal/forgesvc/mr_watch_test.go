@@ -435,3 +435,110 @@ func TestMRCandidateListErrorPropagates(t *testing.T) {
 		t.Fatal("no MR reads when candidates could not be listed")
 	}
 }
+
+// ── closed-issue terminal recording (Lane B, #527) ──────────────────────────
+//
+// A merge CLOSES the issue (via `Closes #N`) before SyncMRStates runs, so a
+// merged/closed terminal state is only ever observed once i.state='closed'. Lane B
+// of ListMRWatchCandidates admits those closed-issue runs; the watcher must RECORD
+// the terminal state but never MOVE a card (Closed is terminal, not a workflow
+// column). These pin that watcher-side behaviour with a closed issue in the cache.
+
+func TestMRClosedIssueMergedRecordsNeverMoves(t *testing.T) {
+	// stored="opened" exercises the merged `default` arm (stored valid, observed
+	// merged is a KNOWN non-edge transition): record, never move — and the issue is
+	// closed so guardedMRMove would skip anyway.
+	runID, repoID := uuid.New(), uuid.New()
+	st := &fakeStore{
+		candidates: []store.ListMRWatchCandidatesRow{candidate(runID, 9, 13, mrTxt("opened"))},
+		issue:      mrIssue(repoID, 9, "closed", "PRD", board.ColumnHumanReview),
+		columns:    mrCols(),
+	}
+	f := &fakeForge{mr: forgeMR(13, "merged")}
+
+	run(t, st, f)
+
+	assertNoMove(t, f)
+	assertRecorded(t, st, runID, "merged")
+}
+
+func TestMRClosedIssueMergedBootstrapRecords(t *testing.T) {
+	// stored=NULL: the bootstrap arm records the first observation without moving.
+	// This is the historical-backfill path — a merged PR whose merge closed the
+	// issue before uzi ever recorded an mr_state.
+	runID, repoID := uuid.New(), uuid.New()
+	st := &fakeStore{
+		candidates: []store.ListMRWatchCandidatesRow{candidate(runID, 9, 13, mrNull())},
+		issue:      mrIssue(repoID, 9, "closed", "PRD", board.ColumnHumanReview),
+		columns:    mrCols(),
+	}
+	f := &fakeForge{mr: forgeMR(13, "merged")}
+
+	run(t, st, f)
+
+	assertNoMove(t, f)
+	assertRecorded(t, st, runID, "merged")
+}
+
+func TestMRClosedIssueClosedRecordsNeverMoves(t *testing.T) {
+	// stored=NULL, observed "closed": the bootstrap arm short-circuits BEFORE the
+	// close-edge switch, so a closed issue never reaches guardedMRMove for the
+	// close edge on the bootstrap path. Records "closed", moves nothing.
+	runID, repoID := uuid.New(), uuid.New()
+	st := &fakeStore{
+		candidates: []store.ListMRWatchCandidatesRow{candidate(runID, 9, 13, mrNull())},
+		issue:      mrIssue(repoID, 9, "closed", "PRD", board.ColumnHumanReview),
+		columns:    mrCols(),
+	}
+	f := &fakeForge{mr: forgeMR(13, "closed")}
+
+	run(t, st, f)
+
+	assertNoMove(t, f)
+	assertRecorded(t, st, runID, "closed")
+}
+
+// TestMRClosedIssueBackfillDecayIsIdempotent models two poller ticks over one
+// historical closed-issue merged run. Tick 1 backfills the terminal state; tick 2
+// (were the run still returned) must be a no-op, so re-polling a settled run costs
+// nothing.
+//
+// In production Lane B's `l.mr_state IN ('opened','locked')` exclusion means a
+// terminal run is NOT even returned by the query after tick 1 — the LiveDB
+// fixtures 110/111 pin that query-side decay. This test pins the complementary
+// watcher-side idempotency: even if the row WERE returned, observed==stored yields
+// no write.
+func TestMRClosedIssueBackfillDecayIsIdempotent(t *testing.T) {
+	runID, repoID := uuid.New(), uuid.New()
+
+	// Tick 1: fresh candidate with NULL mr_state (never recorded), closed issue,
+	// MR observed merged → exactly one "merged" write and exactly one MR read.
+	st1 := &fakeStore{
+		candidates: []store.ListMRWatchCandidatesRow{candidate(runID, 9, 13, mrNull())},
+		issue:      mrIssue(repoID, 9, "closed", "PRD", board.ColumnHumanReview),
+		columns:    mrCols(),
+	}
+	f1 := &fakeForge{mr: forgeMR(13, "merged")}
+
+	run(t, st1, f1)
+
+	assertNoMove(t, f1)
+	assertRecorded(t, st1, runID, "merged")
+	if len(f1.mrCalls) != 1 || f1.mrCalls[0] != 13 {
+		t.Fatalf("tick 1: expected one GetMergeRequest(13), got %v", f1.mrCalls)
+	}
+
+	// Tick 2: the DB now holds mr_state='merged' (what tick 1 wrote). Model the row
+	// the query WOULD return if it still selected the run — observed==stored → no-op.
+	st2 := &fakeStore{
+		candidates: []store.ListMRWatchCandidatesRow{candidate(runID, 9, 13, mrTxt("merged"))},
+		issue:      mrIssue(repoID, 9, "closed", "PRD", board.ColumnHumanReview),
+		columns:    mrCols(),
+	}
+	f2 := &fakeForge{mr: forgeMR(13, "merged")}
+
+	run(t, st2, f2)
+
+	assertNoMove(t, f2)
+	assertNoRecord(t, st2) // observed=="merged"==stored → idempotent, no second write
+}

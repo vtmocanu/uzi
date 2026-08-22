@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
@@ -119,6 +120,38 @@ func guardrailBlockedForRepo(rep *privcheck.Report, repoID string, overridden bo
 	return false
 }
 
+// syncHealthForLink maps a github_project_links row to the caller-scoped sync-health
+// DTO (PRD #576 M2), mirroring the pure guardrailBlockedForRepo seam so the badge
+// state is offline-unit-testable. It is called ONLY for a repo that actually has a
+// link row, so Linked is always true; Healthy is "the last sync recorded no error"
+// (last_error IS NULL/empty). LastError/LastSyncedAt copy through from the pgtype
+// fields when present. No forge call — purely the stored row.
+func syncHealthForLink(link store.GithubProjectLink) *apitypes.RepoProjectSyncHealth {
+	h := &apitypes.RepoProjectSyncHealth{Linked: true}
+	if link.LastError.Valid && link.LastError.String != "" {
+		msg := link.LastError.String
+		h.LastError = &msg
+	} else {
+		h.Healthy = true
+	}
+	if link.LastSyncedAt.Valid {
+		ts := link.LastSyncedAt.Time
+		h.LastSyncedAt = &ts
+	}
+	return h
+}
+
+// capsOrEmpty normalizes a repo/run capability slice to a non-nil empty slice so the
+// DTO marshals `[]` rather than `null` when the column holds the empty set. The column
+// is NOT NULL DEFAULT '{}', but pgx can hand back a nil slice for a zero-length array,
+// and the web/CLI want a stable array shape.
+func capsOrEmpty(caps []string) []string {
+	if caps == nil {
+		return []string{}
+	}
+	return caps
+}
+
 // repoDTO (apitypes.RepoDTO) moved to the stdlib-only apitypes leaf (PRD #64 M1);
 // repoToDTO stays here as the store→DTO mapper.
 func repoToDTO(r store.Repo) apitypes.RepoDTO {
@@ -132,6 +165,10 @@ func repoToDTO(r store.Repo) apitypes.RepoDTO {
 		RepoSkillsEnabled:   r.RepoSkillsEnabled,
 		RepoClaudemdEnabled: r.RepoClaudemdEnabled,
 		RepoDevboxOptIn:     r.RepoDevboxOptIn,
+		// PRD #84 M2: the static per-repo capability hint. Filter-ed at the write path,
+		// so what the DTO surfaces is always a vocabulary-legal set. Normalized to a
+		// non-nil empty slice ([] over null) so the JSON shape is stable for the web.
+		RequiredCapabilities: capsOrEmpty(r.RequiredCapabilities),
 	}
 	if r.DefaultBranch.Valid {
 		dto.DefaultBranch = &r.DefaultBranch.String
@@ -543,13 +580,81 @@ func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
 	// The badge STATE (PRD #66 M9) comes from this connection's stored report, run
 	// through the single shared downgrade — parsed once for the whole page.
 	report := parsePrivilegeReport(conn.PrivilegeReport, conn.ID)
+	// PRD #361: read the Docker-worker allowlist once per request. M1's per-repo
+	// docker_allowlisted flag membership-tests it; M3's docker_blocked reuses it to ask
+	// the DB which of the caller's repos a Docker-allowlist gap is actively blocking. The
+	// list itself is never sent — both fields are booleans about the caller's own repos.
+	var allowlist []uuid.UUID
+	allowlistOK := false
+	if al, err := h.settings.DockerRepoAllowlist(r.Context()); err != nil {
+		// Non-fatal: the chip is enrichment. Degrade to "not allowlisted" (false).
+		slog.Warn("list projects: docker allowlist", "error", err)
+	} else {
+		allowlist = al
+		allowlistOK = true
+	}
+	allowSet := map[uuid.UUID]bool{}
+	for _, id := range allowlist {
+		allowSet[id] = true
+	}
+	// docker_blocked reuses the same allowlist to ask the DB which repos a gap is actively
+	// blocking. Only run it when the allowlist read SUCCEEDED: with an untrustworthy
+	// (empty) allowlist the eligibility test fails closed and would over-escalate an
+	// actually-allowlisted repo to blocked — the opposite of docker_allowlisted's
+	// degrade-to-false. On a read failure, degrade to neutral (empty blockedSet, no
+	// escalation) instead, matching M1's direction.
+	blockedSet := map[uuid.UUID]bool{}
+	if allowlistOK {
+		if ids, err := h.q.ListDockerBlockedReposForUser(r.Context(), store.ListDockerBlockedReposForUserParams{
+			UserID:              user.ID,
+			DockerRepoAllowlist: allowlist,
+		}); err != nil {
+			// Non-fatal: the chip degrades to neutral (no escalation) on error.
+			slog.Warn("list projects: docker-blocked repos", "error", err)
+		} else {
+			for _, id := range ids {
+				blockedSet[id] = true
+			}
+		}
+	}
+	// PRD #576 M2: batch-load each repo's GitHub Projects v2 sync-health once per
+	// request and map it caller-scoped, alongside the docker/guardrail enrichments.
+	// A store error degrades gracefully (empty map → field stays nil), never failing
+	// the whole list, matching the docker-allowlist direction.
+	syncLinks := syncLinksForRepos(r.Context(), h.q, repoIDs, "list projects")
 	for _, rp := range repos {
 		d := repoToDTO(rp)
 		d.Pipeline = pipelines[rp.ID]
 		d.GuardrailBlocked = guardrailBlockedForRepo(report, rp.ID.String(), rp.GuardrailOverrideReason.Valid)
+		d.DockerAllowlisted = allowSet[rp.ID]
+		d.DockerBlocked = blockedSet[rp.ID]
+		if link, ok := syncLinks[rp.ID]; ok {
+			d.GithubProjectSync = syncHealthForLink(link)
+		}
 		out = append(out, d)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"repos": out})
+}
+
+// syncLinksForRepos batch-loads the GitHub Projects v2 link rows for a set of repo
+// ids and returns them keyed by repo id, for the caller-scoped sync-health badge
+// (PRD #576 M2). A query error is non-fatal — the badge is enrichment, so it logs and
+// returns an empty map (every repo's field stays nil), mirroring how the docker
+// enrichments degrade rather than failing the whole list.
+func syncLinksForRepos(ctx context.Context, q *store.Queries, repoIDs []uuid.UUID, logPrefix string) map[uuid.UUID]store.GithubProjectLink {
+	out := map[uuid.UUID]store.GithubProjectLink{}
+	if len(repoIDs) == 0 {
+		return out
+	}
+	links, err := q.ListGithubProjectLinksByRepoIDs(ctx, repoIDs)
+	if err != nil {
+		slog.Warn(logPrefix+": github project sync links", "error", err)
+		return out
+	}
+	for _, l := range links {
+		out[l.RepoID] = l
+	}
+	return out
 }
 
 // ── Repos ───────────────────────────────────────────────────────────────────
@@ -588,10 +693,55 @@ func (h *Handler) ListRepos(w http.ResponseWriter, r *http.Request) {
 			reports[c.ID] = parsePrivilegeReport(c.PrivilegeReport, c.ID)
 		}
 	}
+	// PRD #361: read the Docker-worker allowlist once per request. M1's per-repo
+	// docker_allowlisted flag membership-tests it; M3's docker_blocked reuses it to ask
+	// the DB which of the caller's repos a Docker-allowlist gap is actively blocking. The
+	// list itself is never sent — both fields are booleans about the caller's own repos.
+	var allowlist []uuid.UUID
+	allowlistOK := false
+	if al, err := h.settings.DockerRepoAllowlist(r.Context()); err != nil {
+		// Non-fatal: the chip is enrichment. Degrade to "not allowlisted" (false).
+		slog.Warn("list repos: docker allowlist", "error", err)
+	} else {
+		allowlist = al
+		allowlistOK = true
+	}
+	allowSet := map[uuid.UUID]bool{}
+	for _, id := range allowlist {
+		allowSet[id] = true
+	}
+	// docker_blocked reuses the same allowlist to ask the DB which repos a gap is actively
+	// blocking. Only run it when the allowlist read SUCCEEDED: with an untrustworthy
+	// (empty) allowlist the eligibility test fails closed and would over-escalate an
+	// actually-allowlisted repo to blocked — the opposite of docker_allowlisted's
+	// degrade-to-false. On a read failure, degrade to neutral (empty blockedSet, no
+	// escalation) instead, matching M1's direction.
+	blockedSet := map[uuid.UUID]bool{}
+	if allowlistOK {
+		if ids, err := h.q.ListDockerBlockedReposForUser(r.Context(), store.ListDockerBlockedReposForUserParams{
+			UserID:              user.ID,
+			DockerRepoAllowlist: allowlist,
+		}); err != nil {
+			// Non-fatal: the chip degrades to neutral (no escalation) on error.
+			slog.Warn("list repos: docker-blocked repos", "error", err)
+		} else {
+			for _, id := range ids {
+				blockedSet[id] = true
+			}
+		}
+	}
+	// PRD #576 M2: batch-load each repo's GitHub Projects v2 sync-health once, keyed by
+	// repo id, degrading gracefully on a store error (see syncLinksForRepos).
+	syncLinks := syncLinksForRepos(r.Context(), h.q, repoIDs, "list repos")
 	for _, rp := range repos {
 		d := repoToDTO(rp)
 		d.Pipeline = pipelines[rp.ID]
 		d.GuardrailBlocked = guardrailBlockedForRepo(reports[rp.ConnectionID], rp.ID.String(), rp.GuardrailOverrideReason.Valid)
+		d.DockerAllowlisted = allowSet[rp.ID]
+		d.DockerBlocked = blockedSet[rp.ID]
+		if link, ok := syncLinks[rp.ID]; ok {
+			d.GithubProjectSync = syncHealthForLink(link)
+		}
 		out = append(out, d)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"repos": out})
@@ -696,6 +846,63 @@ func (h *Handler) SetRepoEnabled(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"repo": repoToDTO(repo)})
 }
 
+// DeleteRepo removes a single repo row (PRD #357), cascading its derived data
+// (runs, cached issues, board columns, ...) via existing FKs. Owner-scoped: a
+// non-owned or unknown id is a 404. Two structural guards keep this from nuking an
+// actively-tracked repo's board/history: an ENABLED repo is refused with 409 (D2 —
+// disable is the "I've stopped tracking this" state removal is reachable from), and
+// a repo with a non-terminal run is refused with 409 (D7 — disabling drops the repo
+// from the poll set but does not cancel an in-flight run). The DELETE itself also
+// carries `AND enabled = false` (D6), so a concurrent enable between the fetch and
+// the delete cannot slip a tracked repo through — the fetch drives the precise
+// status code, the predicate is the atomic guard. 204 on success, mirroring
+// DeleteConnection.
+func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
+		return
+	}
+	row, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.Error(w, http.StatusNotFound, "repo not found")
+			return
+		}
+		slog.Error("get repo for delete", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if row.Enabled {
+		httpx.JSON(w, http.StatusConflict, map[string]any{"error": "disable this repo before removing it"})
+		return
+	}
+	active, err := h.q.CountActiveRunsForRepo(r.Context(), id)
+	if err != nil {
+		slog.Error("count active runs for delete", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if active > 0 {
+		httpx.JSON(w, http.StatusConflict, map[string]any{"error": "this repo has a run in progress; wait for it to finish before removing"})
+		return
+	}
+	// The :execrows return may be 0 if a concurrent enable slipped in between the
+	// fetch above and this delete — that is the D6 `enabled = false` guard working, so
+	// treat 0 rows as an already-gone no-op and still return 204, never 500.
+	if _, err := h.q.DeleteRepoForUser(r.Context(), store.DeleteRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
+		slog.Error("delete repo", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 type patchRepoRequest struct {
 	// RepoSkillsEnabled is the repo-skills opt-in (PRD #16): load skills from the
 	// repo's own .claude/skills at run time. Pointer so an omitted field is a
@@ -710,6 +917,13 @@ type patchRepoRequest struct {
 	// devbox.json packages (packages-only) into provisioning. Pointer = omitted is a
 	// no-op. Its own exclusive path — cannot be combined with the trust flags.
 	RepoDevboxOptIn *bool `json:"repo_devbox_opt_in"`
+	// RepoRequiredCapabilities is the static per-repo capability hint (PRD #84 M2): the
+	// non-provisionable capabilities every run on this repo requires (today {docker}).
+	// Pointer so an omitted field is a no-op; a present (possibly empty) slice replaces
+	// the stored set. Its own exclusive path. The list is Filter-ed against the
+	// server-owned vocabulary before storage, so an unknown/spoofed name is dropped and
+	// never persisted (enqueue-time validation, Decision 4).
+	RepoRequiredCapabilities *[]string `json:"required_capabilities"`
 }
 
 // optBoolToPgtype maps an optional request bool to a pgtype.Bool: a nil pointer is
@@ -722,13 +936,14 @@ func optBoolToPgtype(v *bool) pgtype.Bool {
 	return pgtype.Bool{Bool: *v, Valid: true}
 }
 
-// PatchRepo updates a repo's mutable opt-in settings. Two disjoint paths: the
+// PatchRepo updates a repo's mutable opt-in settings. Three disjoint paths: the
 // trust flags (repo_skills_enabled and/or repo_claudemd_enabled, PRD #16/#246) —
 // which may be set together or individually in one atomic round-trip
-// (SetRepoTrustFlags) — and repo_devbox_opt_in (PRD #18), which is its own exclusive
-// path. The two paths cannot be combined in one request. At least one field must be
-// present. Authorization: the repo owner (via the owning connection) or an admin. A
-// non-owned, unknown id returns 404 for a non-admin; an admin may target any repo.
+// (SetRepoTrustFlags) — repo_devbox_opt_in (PRD #18), and required_capabilities (the
+// static per-repo capability hint, PRD #84 M2). Each of the three is its own exclusive
+// path and no two can be combined in one request. At least one field must be present.
+// Authorization: the repo owner (via the owning connection) or an admin. A non-owned,
+// unknown id returns 404 for a non-admin; an admin may target any repo.
 func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -747,12 +962,22 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 	}
 	devboxSet := req.RepoDevboxOptIn != nil
 	trustSet := req.RepoSkillsEnabled != nil || req.RepoClaudemdEnabled != nil
-	if devboxSet && trustSet {
-		httpx.Error(w, http.StatusBadRequest, "repo_devbox_opt_in cannot be combined with repo_skills_enabled or repo_claudemd_enabled")
+	capsSet := req.RepoRequiredCapabilities != nil
+	// Each of the three settings groups is its own exclusive path — at most one per
+	// request. b2i counts how many are present so a combined request is rejected
+	// uniformly rather than pairwise.
+	b2i := func(b bool) int {
+		if b {
+			return 1
+		}
+		return 0
+	}
+	if b2i(devboxSet)+b2i(trustSet)+b2i(capsSet) > 1 {
+		httpx.Error(w, http.StatusBadRequest, "repo_devbox_opt_in, required_capabilities, and the trust flags cannot be combined in one request")
 		return
 	}
-	if !devboxSet && !trustSet {
-		httpx.Error(w, http.StatusBadRequest, "provide repo_devbox_opt_in, or at least one of repo_skills_enabled or repo_claudemd_enabled")
+	if !devboxSet && !trustSet && !capsSet {
+		httpx.Error(w, http.StatusBadRequest, "provide repo_devbox_opt_in, required_capabilities, or at least one of repo_skills_enabled or repo_claudemd_enabled")
 		return
 	}
 
@@ -774,6 +999,16 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 			repo, err = h.q.SetRepoDevboxOptIn(r.Context(), store.SetRepoDevboxOptInParams{ID: id, RepoDevboxOptIn: *req.RepoDevboxOptIn})
 		} else {
 			repo, err = h.q.SetRepoDevboxOptInForUser(r.Context(), store.SetRepoDevboxOptInForUserParams{ID: id, RepoDevboxOptIn: *req.RepoDevboxOptIn, UserID: user.ID})
+		}
+	case capsSet:
+		// Filter against the server-owned vocabulary BEFORE storage (Decision 4): an
+		// unknown/spoofed name is dropped and never persisted, and the stored set is
+		// deduped in stable vocabulary order.
+		caps := capability.Filter(*req.RepoRequiredCapabilities)
+		if user.IsAdmin {
+			repo, err = h.q.SetRepoRequiredCapabilities(r.Context(), store.SetRepoRequiredCapabilitiesParams{ID: id, RequiredCapabilities: caps})
+		} else {
+			repo, err = h.q.SetRepoRequiredCapabilitiesForUser(r.Context(), store.SetRepoRequiredCapabilitiesForUserParams{ID: id, RequiredCapabilities: caps, UserID: user.ID})
 		}
 	}
 	if err != nil {

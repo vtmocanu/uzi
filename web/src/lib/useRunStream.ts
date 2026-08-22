@@ -188,7 +188,14 @@ export function useRunStream(runId: string) {
   }, [runId, replay, refreshRun, refreshInputs, commit]);
 
   const submit = useCallback(
-    async (kind: RunInputKind, body = "", selection?: AgentSelectionInput) => {
+    async (
+      kind: RunInputKind,
+      body = "",
+      selection?: AgentSelectionInput,
+      // PRD #84 M4 4c: the "run without the capability" override, threaded through to
+      // submitRunInput. Meaningful only with approve_plan; the server ignores it otherwise.
+      overrideCapabilities?: boolean,
+    ) => {
       // A follow-up shows in the steer queue immediately as Queued (PRD #95 S2):
       // optimistically prepend a temp entry (the queue is newest-first), then adopt
       // the real id + created_at the write returns so a later refetch — which replaces
@@ -220,7 +227,7 @@ export function useRunStream(runId: string) {
         void refreshRun();
         return;
       }
-      await api.submitRunInput(runId, kind, body, selection);
+      await api.submitRunInput(runId, kind, body, selection, overrideCapabilities);
       void refreshRun();
     },
     [runId, refreshRun],

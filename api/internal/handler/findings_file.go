@@ -33,8 +33,9 @@ type fileFindingRequest struct {
 }
 
 // FileFinding files a forge issue from one incidental finding (PRD #333 M5, D4/D5). It is the
-// human-gated forge write: mounted on the cookie+CSRF RequireAuth path behind
-// forgeLimiter.PerUserMiddleware, mirroring FileIssue. Authorization is owner-scoped in one
+// human-gated forge write: mounted on RequireUser (CLI-reachable via Bearer; CSRF preserved
+// on the browser cookie path) behind forgeLimiter.PerUserMiddleware, mirroring FileIssue.
+// Authorization is owner-scoped in one
 // step — GetIncidentalFinding((id, user.ID)) gives the coordinate (user_id, repo_id, location)
 // AND proves ownership (a foreign/unknown id is a 404, no existence oracle) — plus
 // caller-owns-repo (GetRepoForUser) to WRITE.
@@ -336,8 +337,9 @@ var findingDismissReasons = map[string]struct{}{
 }
 
 // DismissFinding triages one finding coordinate to `dismissed` with a reason (PRD #333 M5). It is
-// a LOCAL write — no forge call, no token spend — so it mounts on RequireAuth WITHOUT the forge
-// limiter, beside the M4 reads. Owner-scoped via GetIncidentalFinding (a foreign/unknown id is a
+// a LOCAL write — no forge call, no token spend — so it mounts on RequireUser WITHOUT the forge
+// limiter (a local write; CLI-reachable via Bearer, CSRF preserved on the cookie path), beside
+// the M4 reads. Owner-scoped via GetIncidentalFinding (a foreign/unknown id is a
 // 404). The DismissFinding query is guarded to status='open' (the to_file bucket only shows open
 // rows): a 0-row result on a filed/filing coordinate is a 409 — the user reverts/handles the
 // filing first — and dismiss-from-open-only keeps a dismissed bug from silently reopening a

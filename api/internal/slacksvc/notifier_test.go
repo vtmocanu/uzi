@@ -1292,6 +1292,11 @@ func TestStatusGlyph(t *testing.T) {
 		{"running", baseRun("running"), "▶️", "Running"},
 		{"awaiting_approval", baseRun("awaiting_approval"), "⏸️", "Needs your approval"},
 		{"awaiting_input", baseRun("awaiting_input"), "❓", "Needs your answer"},
+		// PRD #517: an interactive task parked awaiting the user's next follow-up. Reddening
+		// mutation: remove the awaiting_followup case from statusGlyph → the default arm
+		// returns ("", "awaiting_followup"), the raw enum with no emoji, so this row fails.
+		// Distinct emoji + label from awaiting_input's ❓ "Needs your answer".
+		{"awaiting_followup", baseRun("awaiting_followup"), "💬", "Awaiting your follow-up"},
 		{"limit_wait", baseRun("limit_wait"), "⏸️", "Paused · usage limit"},
 		{"completed", baseRun("completed"), "✅", "Completed"},
 		{"failed", baseRun("failed"), "❌", "Failed"},

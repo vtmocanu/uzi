@@ -3,7 +3,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import type { WorkerClient } from "./client.js";
 import type { GitCache } from "./git.js";
-import { gitBasicCredential } from "./git.js";
+import {
+  gitBasicCredential,
+  isNonFastForwardRejection,
+  isWorkflowScopeRejection,
+} from "./git.js";
 import type { Executor, RunContext } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
 import { skillsPluginDir } from "./skills-plugin.js";
@@ -51,6 +55,7 @@ import {
   type CheckRunner,
 } from "./self-improve.js";
 import { installJsDeps } from "./js-deps.js";
+import { detectToolchain, type ToolchainDetection } from "./toolchain-detect.js";
 import { isCIConfigPlan } from "./prompt.js";
 import { flagCIConfigPaths, DEFAULT_CI_CONFIG_PATHS } from "./ci-config-guard.js";
 import { REASON_PROVISION_FAILED } from "./provision-run.js";
@@ -71,6 +76,82 @@ export function failOriginForReason(rawReason: string): string | undefined {
   if (rawReason.startsWith(REASON_PROVISION_FAILED)) return "provisioning_failed";
   if (rawReason.startsWith(REASON_NO_TOKEN)) return "credential_unavailable";
   return undefined;
+}
+
+/**
+ * PRD #377 M1 — compose the actionable `failure_reason` for a GitHub run whose branch
+ * touches `.github/workflows/**`, a path the bot's repo-only PAT cannot push. It names the
+ * offending path(s) and points at `docs/github-bot-setup.md`.
+ *
+ * The path LIST is truncated to fit MAX_FAILURE_REASON_LEN (showing the first paths + an
+ * "and N more" tail) — but the doc link, which lives in the fixed suffix, is NEVER cut. The
+ * truncation math is done BEFORE assembly (against the budget left after the fixed prefix +
+ * suffix), not by blindly slicing the whole string at the end. Exported for a direct
+ * truncation unit test. The caller still applies `.slice(0, MAX_FAILURE_REASON_LEN)` as a
+ * belt-and-braces net after the doc link is guaranteed to fit.
+ */
+export function composeWorkflowScopeReason(paths: string[]): string {
+  const prefix =
+    "This run's branch changes workflow files that uzi's GitHub bot token cannot push " +
+    "(its scope is exactly `repo`, without `workflow`, by design): ";
+  const suffix =
+    ". The change is valid; land it as a human PR (commit the file yourself with a " +
+    "workflow-scoped token). See docs/github-bot-setup.md. Your diff is preserved below.";
+  const budget = MAX_FAILURE_REASON_LEN - prefix.length - suffix.length;
+  let list = paths.join(", ");
+  if (list.length > budget) {
+    // Drop trailing paths (replaced by an "and N more" tail) until the list fits the
+    // budget. The doc link is in `suffix`, so it is untouched by this truncation.
+    let shown = paths.length;
+    for (; shown > 0; shown--) {
+      const more = paths.length - shown;
+      const candidate =
+        paths.slice(0, shown).join(", ") + (more > 0 ? `, and ${more} more` : "");
+      if (candidate.length <= budget) {
+        list = candidate;
+        break;
+      }
+    }
+    if (shown === 0) {
+      // Pathological: even one path overflows the budget (a single very long path). Keep a
+      // hard-truncated first entry so the fixed suffix — and its doc link — still fits.
+      list = paths[0]!.slice(0, Math.max(0, budget - 1)) + "…";
+    }
+  }
+  return prefix + list + suffix;
+}
+
+/**
+ * PRD #456 M2 — the actionable `failure_reason` for a GitHub run whose branch could not be
+ * aligned with the current default branch before the finalize push: its `.github/workflows/**`
+ * files are BEHIND the default (main advanced them after this run's clone base), the bot's
+ * repo-only PAT cannot push while they differ, and uzi's attempt to merge and then rebase the
+ * current default into the branch either BOTH conflicted, or the aligned branch could not be
+ * pushed without rewriting already-published history (a non-fast-forward the bot cannot
+ * force-push — NB2). The run fails without pushing and the agent's diff is preserved (#377's
+ * `preserved_patch`) for a human to rebase-and-land.
+ *
+ * Names the default branch once and points at docs/github-bot-setup.md. The branch name is
+ * the only variable part and is clamped against a computed budget (MAX_FAILURE_REASON_LEN
+ * minus the fixed prefix + suffix lengths), so the fixed suffix — the doc link and the
+ * "Your diff is preserved below." pointer — always fits MAX_FAILURE_REASON_LEN and is never
+ * truncated. Exported for a direct length-cap unit test.
+ */
+export function composeBaseAlignConflictReason(defaultBranch: string): string {
+  const db = defaultBranch || "the default branch";
+  const prefix = "This run's branch is behind the default branch (";
+  const suffix =
+    ") on .github/workflows files, which uzi's GitHub bot token cannot push while they " +
+    "differ from the default (its scope is `repo`, without `workflow`, by design). uzi tried " +
+    "to merge then rebase the current default into the branch to realign those files, but could " +
+    "not realign and safely push it, so the run failed without pushing. The work is valid; a " +
+    "human can rebase and land it. See docs/github-bot-setup.md. Your diff is preserved below.";
+  // Clamp the branch name (the only variable part) against the budget left after the fixed
+  // prefix + suffix, so the doc link + preserved-diff pointer in `suffix` always survive.
+  const budget = MAX_FAILURE_REASON_LEN - prefix.length - suffix.length;
+  const branch = db.length > budget ? db.slice(0, Math.max(0, budget - 1)) + "…" : db;
+  // Belt-and-braces final net, mirroring composeWorkflowScopeReason's caller.
+  return (prefix + branch + suffix).slice(0, MAX_FAILURE_REASON_LEN);
 }
 
 /**
@@ -393,6 +474,13 @@ export class RunRunner {
           batcher.emit({ kind: "status", agent: "worker", payload: { text } }),
       },
     );
+    // issue #552 M3: a graceful `uzi run stop` (PRD #517 M4) consumed into the worker's
+    // stopRequested flag is lost if the worker dies before winding the park down. The
+    // server re-delivers the durable runs.stop_kind='stopped' fact as claim.stop_pending
+    // on every claim; seeding it here reconstructs the sticky stop state so the resumed
+    // run's interactive park ends `stopped` immediately (steering.awaitFollowUp's arm-time
+    // check) instead of waiting out the idle timeout. Absent ⇒ untouched (today's path).
+    if (claim.stop_pending) steering.seedStopRequested();
 
     // Last SDK session id the executor observed; carried on EVERY state report so
     // resume survives a lost report.
@@ -672,6 +760,20 @@ export class RunRunner {
         );
       }
 
+      // PRD #84 M4: infer the run's requirement set from the checked-out clone with the
+      // deterministic scan, ONCE, best-effort. A scan failure must never break a run, so
+      // it is caught and yields `undefined` ("emit nothing"). The result rides the same
+      // two reports as `milestones` — the CANDIDATE set on the awaiting_approval report and
+      // the FROZEN set on the autopilot running report — threaded through gatePlan below.
+      let toolchainDetection: ToolchainDetection | undefined;
+      try {
+        toolchainDetection = await detectToolchain(runnerClone.path);
+      } catch (err) {
+        runLog.warn("toolchain detection failed; continuing without a requirement set", {
+          error: errMessage(err),
+        });
+      }
+
       // Cross-run memory (PRD #90): fetch this run's (user, repo) memory so the
       // executor can compose it into the lead's plan prompt as inert, nonce-fenced,
       // untrusted-advisory context. Guarded HARD — a fetch failure (older API, repo-
@@ -701,15 +803,33 @@ export class RunRunner {
         issueIid: claim.issue_iid,
         issueTitle: claim.issue_title,
         issueDescription: claim.issue_description,
+        // PRD #381: carry the snapshotted issue-comment set onto the ctx; the SDK
+        // executor threads it to buildPlanPrompt for nonce-fenced rendering. Absent/
+        // null ⇒ nothing is rendered.
+        issueComments: claim.issue_comments,
         pipeline: claim.pipeline,
         worktreePath: runnerClone.path,
         branch: runnerClone.branch,
+        // PRD #501 REC B: thread the autopilot flag to plan-build time so the plan
+        // builders render the no-human-in-the-loop note. Absent ⇒ false.
+        autoApprove: claim.auto_approve ?? false,
+        // PRD #517 M3: an interactive task run parks at awaiting_followup on signal_done
+        // instead of finalizing (see the awaitFollowUp callback below). Absent ⇒ false, so
+        // every non-interactive run (and every older server) is byte-identical to today.
+        interactive: claim.interactive ?? false,
         // The seed resolved this in the bare; forwarding it is what stops the lead from
         // guessing the branch's parent (judge rec, run 51757591).
         baseCommit: runnerClone.baseCommit,
         defaultBranchCommit: runnerClone.defaultBranchCommit,
         emit: (m) => batcher.emit(m),
         oauthToken: claim.secrets.anthropic_oauth_token,
+        // PRD #362 M3c: the run-summary model resolved server-side (user-value-wins),
+        // and whether the intent summary is already set so the executor skips
+        // re-generating it on a resume/re-claim (Decision 3). Both absent on older
+        // servers, which the summary hooks tolerate (undefined model → account default,
+        // false present → generate).
+        summaryModel: claim.summary_model ?? undefined,
+        summaryIntentPresent: claim.summary_intent_present ?? false,
         agents: claim.agents,
         repoAgents,
         skills: claim.skills,
@@ -724,6 +844,12 @@ export class RunRunner {
         // on this worker (issue #105).
         sessionId,
         priorWork,
+        // issue #222: this run executed before (it reported a session), so this claim's
+        // reseed wiped whatever an earlier attempt left in the tree. Read the RAW
+        // claim.session_id, not the `sessionId` var cleared above on a dropped transcript —
+        // a dropped-session resume still had its tree destroyed. Same discriminator the
+        // reseed feed-status uses (this.emit "starting from the default branch" above).
+        resumed: claim.session_id != null,
         // PRD #35 Decision 6b + PRD #209 D4. The RUNNER is the only layer that knows
         // all the facts, which is why it resolves them here rather than the executor
         // reading the claim: the server said the plan is approved, and EITHER a session
@@ -758,7 +884,7 @@ export class RunRunner {
         // verdict the steering channel resolves (bounded so an abandoned plan
         // fails rather than wedging the worker). An autopilot claim short-circuits
         // to an approve verdict (see gatePlan) — the run never parks at the gate.
-        gatePlan: async (planMd, milestones) => {
+        gatePlan: async (planMd, milestones, onAwaitingApproval) => {
           // PRD #71 M5: a CI-config-classified ci_fix plan must NOT take the auto-approve
           // short-circuit — it parks for human review even on an auto-triggered run. We
           // force the gate by passing autoApprove=false for that case; gatePlan is otherwise
@@ -775,6 +901,8 @@ export class RunRunner {
             runLog,
             effectiveAutoApprove,
             repoAgents,
+            toolchainDetection,
+            onAwaitingApproval,
           );
           // Human-in-the-loop iff the plan reached an approve verdict via the PARK path
           // (not the auto short-circuit). Read by the pre-push guard below.
@@ -796,6 +924,45 @@ export class RunRunner {
             claim.config ?? null,
           ),
         pullFollowUp: () => steering.pullFollowUp(),
+        // PRD #517 M3: the interactive-task follow-up park. The executor calls this after a
+        // clean signal_done on an interactive run (it has already checkpoint-pushed): report
+        // awaiting_followup, verify the park took, then BLOCK on the steering channel until
+        // the next follow-up (or an idle/cancel end).
+        //
+        // CONSUME-BEFORE-REPORT ORDERING (the server's SetRunRunning wake guard): the report
+        // of `running` that un-parks the run is the loop's NEXT reportIteration, which the
+        // executor only reaches AFTER this resolves with a follow-up. steering.awaitFollowUp
+        // resolves that follow-up ONLY from the poll loop's post-route service step, i.e.
+        // after ConsumeRunInputs stamped consumed_at — so a consumed follow_up input always
+        // exists before `running` is reported, and the server admits the wake. This mirrors
+        // askUser's settle discipline; the ordering is satisfied by construction here.
+        awaitFollowUp: async (idleMs) => {
+          // issue #552 M1 (mid-turn wake-guard bug): report `awaiting_followup` — which stamps
+          // the open_followup_id watermark to MAX(consumed follow_up id) — ONLY when the run is
+          // genuinely going idle. If a follow-up (or stop/cancel) arrived mid-turn and is
+          // already buffered, reporting the park would fold that already-consumed-but-not-yet-
+          // applied follow-up INTO the watermark, so its own wake `running` report would then
+          // fail the server's `id > watermark` guard and strand a live run at awaiting_followup.
+          // Skip the park report in that case and service the buffered outcome directly (the run
+          // stays `running`, no spurious park). A follow-up arriving AFTER this point is consumed
+          // after the stamp, so its id > watermark and it wakes normally.
+          if (!steering.hasPendingFollowUpOutcome()) {
+            // Read the ACK the same way askUser and the limit park do: the park TOOK only if
+            // the server reports `awaiting_followup`. SetRunAwaitingFollowup (M2) matches
+            // nothing when the run went terminal under us or is no longer ours (or is not an
+            // interactive task) — without this check the worker would block on a follow-up no
+            // surface can produce, since the status never changed. Fail loudly instead.
+            const ack = await reportState({ status: "awaiting_followup" });
+            const parked = (ack as { status?: string } | undefined)?.status;
+            if (parked !== "awaiting_followup") {
+              throw new Error(
+                `${REASON_FOLLOWUP_NOT_PARKED} (server reports ${parked ?? "an unreadable status"})`,
+              );
+            }
+            runLog.info("interactive task: awaiting follow-up", { run_id: runId });
+          }
+          return steering.awaitFollowUp(idleMs);
+        },
         // PRD #122 M2: carry the lead's live progress into the `running` report and return
         // the server-computed effective budget from the ack. Async (unlike M4's fire-and-
         // forget void) so the loop can apply the budget — but still fire-and-forget in
@@ -1217,34 +1384,328 @@ export class RunRunner {
         }
       }
 
+      // PRD #377 M1: a GitHub run whose branch touches .github/workflows/** cannot be
+      // pushed by the bot's repo-only PAT (privcheck forbids the workflow scope by design).
+      // Detect it here, BEFORE the doomed push, and end the run in a typed `failed` outcome
+      // that preserves the agent's diff for a human to land — instead of face-planting into
+      // GitHub's opaque "without workflow scope" rejection and discarding the committed work.
+      // Serves every forge-pushing kind (the failed path is not issue-gated).
+      if (claim.repo.forge_type === "github") {
+        // Capture the narrowed bare path in a const the SAME way the push block does
+        // (barePath is an outer `let string | undefined` and TS drops the narrowing here).
+        const wfBarePath = barePath;
+        const changedForWf = await this.git.changedFiles(wfBarePath, trackingRef);
+        // D6: a null diff (diff-computation failure) fails OPEN to the normal push — do not
+        // fail a possibly-legitimate non-workflow run on an inability to compute the diff.
+        const wfHits =
+          changedForWf === null
+            ? null
+            : flagCIConfigPaths(changedForWf, [".github/workflows/**"]);
+        if (wfHits && wfHits.length > 0) {
+          // Compose an actionable, capped failure_reason that names the offending path(s)
+          // (truncating the path LIST if needed, never the doc link) and points at
+          // docs/github-bot-setup.md.
+          const reason = composeWorkflowScopeReason(wfHits);
+          // Preserve the agent's diff so a human can land it without re-deriving it from the
+          // transcript. redactText scrubs the run's secrets before it reaches the api; a null
+          // diff (best-effort failure) just omits the patch — the typed failure still lands.
+          const rawPatch = await this.git.workflowScopeDiff(wfBarePath, trackingRef);
+          const patch = rawPatch === null ? undefined : redactText(rawPatch);
+          batcher.emit({
+            kind: "status",
+            agent: "worker",
+            payload: {
+              text:
+                "branch changes .github/workflows, which the bot token cannot push; failing early and preserving the diff for a human to land",
+            },
+          });
+          runLog.info(
+            "run failed: branch touches .github/workflows which the bot PAT cannot push; preserving diff",
+            { run_id: runId, paths: wfHits },
+          );
+          await batcher.close();
+          await reportState({
+            status: "failed",
+            failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
+            fail_origin: "workflow_scope_missing",
+            preserved_patch: patch,
+          });
+          return;
+        }
+      }
+
+      // The single authenticated finalize push (PAT-bearing, worker-owned; the agent never
+      // has a credential). Captured once as a closure so the align path (below) and the
+      // normal path push through EXACTLY ONE code path — the run must never push twice.
+      // PRD #284 Layer A: a transient push failure (a dropped HTTP/2 stream, a 5xx, a
+      // connection reset) retries rather than discarding the agent's already-committed work;
+      // a permanent rejection (auth, protected branch, non-fast-forward) fails fast and
+      // propagates to the catch below. The push is idempotent on retry (non-forced, same
+      // commits → "Everything up-to-date"). Capture the narrowed bare path: barePath is an
+      // outer `let` (string | undefined) and TS drops the narrowing inside the closure.
+      const finalizeBarePath = barePath;
+      const pushToOrigin = () =>
+        withForgeRetry(
+          () =>
+            this.git.pushBranch(
+              finalizeBarePath,
+              result.branch,
+              claim.secrets.forge_pat,
+              claim.repo.clone_url,
+              claim.secrets.forge_username,
+            ),
+          { log: runLog },
+        );
+
+      // PRD #456 M1: a GitHub run can be merely BEHIND the default branch on
+      // .github/workflows/** (main advanced those files after this run's clone base) WITHOUT
+      // having touched them. The bot's repo-only PAT push is then rejected atomically —
+      // losing ALL the run's work — even though #377's guard above (which fires only when the
+      // BRANCH modifies a workflow) did not trip. Align the branch's workflow tree with the
+      // FRESH default before pushing: merge first (SHA-preserving, D2), and if the merged push
+      // is STILL workflow-scope-rejected fall back to a rebase (the empirically proven #422
+      // recovery). On an unresolvable conflict, fail the run typed + preserve the diff (M2)
+      // rather than face-plant into GitHub's opaque rejection and discard the committed work.
+      // GitHub-only: GitLab/Forgejo impose no workflow-scope rule.
+      let alignPushed = false;
+      if (claim.repo.forge_type === "github") {
+        const alignBarePath = barePath;
+        const alignDefaultBranch =
+          claim.repo.default_branch?.trim() ||
+          (await this.git.defaultBranchName(alignBarePath)) ||
+          "main";
+        // Detection is best-effort (N2/D6 posture): a fetch/diff failure must NOT block a push
+        // that may well succeed (the branch may not actually be behind) — fall through to the
+        // normal push, never fail a run on an inability to compute the align target.
+        let defaultTip: string | undefined;
+        let differs = false;
+        try {
+          defaultTip = await this.git.fetchDefaultTip(
+            alignBarePath,
+            alignDefaultBranch,
+            claim.secrets.forge_pat,
+            claim.repo.clone_url,
+            claim.secrets.forge_username,
+          );
+          differs = await this.git.workflowTreeDiffers(
+            alignBarePath,
+            trackingRef,
+            defaultTip,
+          );
+        } catch (e) {
+          runLog.warn(
+            "finalize base-align: could not compute the align target; pushing without aligning",
+            { run_id: runId, error: errMessage(e) },
+          );
+        }
+        if (defaultTip && differs) {
+          // The pre-align committed agent tip — the base every align strategy starts from, so
+          // a rebase FALLBACK after a clean merge replays the ORIGINAL commits, not the merge.
+          const originalAgentTip = await this.git.branchTip(
+            runnerClone.path,
+            result.branch,
+          );
+          if (!originalAgentTip) {
+            runLog.warn(
+              "finalize base-align: could not resolve the branch tip; pushing without aligning",
+              { run_id: runId },
+            );
+          } else {
+            // The conflict-failure path (M2). The abort already ran inside
+            // alignBranchWithDefault; here we preserve the pre-align diff via #377's
+            // preserved_patch and fail typed. `trackingRef` still points at the agent's
+            // committed work when a merge conflicted first (we re-fetchAgentBranch only after
+            // a SUCCESSFUL align), so workflowScopeDiff captures the human-landable diff.
+            const defTip = defaultTip;
+            const failBaseAlignConflict = async () => {
+              const rawPatch = await this.git.workflowScopeDiff(alignBarePath, trackingRef);
+              const patch = rawPatch === null ? undefined : redactText(rawPatch);
+              batcher.emit({
+                kind: "status",
+                agent: "worker",
+                payload: {
+                  text: "could not realign the branch with the updated default branch and safely push it (merge and rebase conflicted, or the aligned branch could not be fast-forwarded); failing and preserving the diff for a human to land",
+                },
+              });
+              runLog.info("run failed: finalize base-align conflict; preserving diff", {
+                run_id: runId,
+              });
+              await batcher.close();
+              await reportState({
+                status: "failed",
+                failure_reason: composeBaseAlignConflictReason(alignDefaultBranch),
+                fail_origin: "finalize_base_align_conflict",
+                preserved_patch: patch,
+              });
+            };
+
+            // Run one align STRATEGY, treating an UNEXPECTED throw (the S3 count-mismatch
+            // guard, or any git error) exactly like a `"conflict"` return. This is the whole
+            // point of the feature: the agent's work must be PRESERVED on failure, so an
+            // unexpected align error must route to failBaseAlignConflict (typed fail + diff),
+            // NOT escape to the generic catch below (raw message, no preserved_patch, defaulted
+            // fail_origin). Scoped to the align OPERATION only — the push keeps its own
+            // handling (workflow-scope → rebase fallback; any other push error rethrows).
+            const alignOp = async (strategy: "merge" | "rebase"): Promise<"aligned" | "conflict"> => {
+              try {
+                return await this.git.alignBranchWithDefault(
+                  runnerClone.path,
+                  result.branch,
+                  originalAgentTip,
+                  defTip,
+                  strategy,
+                );
+              } catch (e) {
+                runLog.warn(
+                  "finalize base-align: unexpected error during align; preserving diff and failing typed",
+                  { run_id: runId, strategy, error: errMessage(e) },
+                );
+                return "conflict";
+              }
+            };
+
+            // Re-fetch the aligned tip into the worker bare's tracking ref, then push once.
+            const fetchAndPush = async () => {
+              await this.git.fetchAgentBranch(
+                alignBarePath,
+                runnerClone.path,
+                result.branch,
+                runId,
+              );
+              await pushToOrigin();
+              alignPushed = true;
+            };
+
+            // Push the aligned branch. Two rejections here are the base-align-conflict path,
+            // not a mislabel: a REPEAT workflow-scope rejection means the default's workflow
+            // files moved again DURING our align (double-TOCTOU); a NON-FAST-FORWARD rejection
+            // means the rebase fallback rewrote the history of an already-published branch (a
+            // resume, or the self_improve fixed branch) so this non-forced push cannot
+            // fast-forward, and force-push is denied by the guardrails by design. Both preserve
+            // the diff and fail typed rather than lose it to the generic catch. Any OTHER push
+            // error still rethrows unchanged (a genuine auth/transient/protected-branch failure
+            // must not be mislabelled as a base-align conflict). Returns true if it
+            // preserved-and-failed (the caller must then `return`), false on a successful push.
+            const pushAlignedOrPreserve = async (): Promise<boolean> => {
+              try {
+                await fetchAndPush();
+                return false;
+              } catch (e) {
+                const nonFf = isNonFastForwardRejection(e);
+                if (!isWorkflowScopeRejection(e) && !nonFf) throw e;
+                // Record WHICH cause fired so an operator reading logs can tell the two apart:
+                // a repeat workflow-scope rejection (the default's workflow files moved again
+                // DURING our align) versus a non-fast-forward (the rebase rewrote an
+                // already-published branch's history, a resume or the self_improve fixed
+                // branch, that the bot cannot force-push).
+                runLog.info(
+                  nonFf
+                    ? "finalize base-align: aligned push rejected non-fast-forward (rebase rewrote an already-published branch's history the bot cannot force-push); preserving diff and failing typed"
+                    : "finalize base-align: aligned push STILL workflow-scope-rejected (default moved again during align); preserving diff and failing typed",
+                  { run_id: runId },
+                );
+                await failBaseAlignConflict();
+                return true;
+              }
+            };
+
+            batcher.emit({
+              kind: "status",
+              agent: "worker",
+              payload: {
+                text: "branch is behind the default branch on .github/workflows; aligning before pushing",
+              },
+            });
+            const mergeRes = await alignOp("merge");
+            if (mergeRes === "aligned") {
+              try {
+                await fetchAndPush();
+              } catch (e) {
+                if (!isWorkflowScopeRejection(e)) throw e;
+                // The merge did NOT clear GitHub's workflow-scope rejection → the proven
+                // rebase fallback (#422). alignBranchWithDefault rewinds to originalAgentTip
+                // first, so the rebase replays the ORIGINAL agent commits onto the fresh
+                // default rather than the merge commit.
+                runLog.info(
+                  "finalize base-align: merge push still workflow-scope-rejected; trying rebase fallback",
+                  { run_id: runId },
+                );
+                const rebaseRes = await alignOp("rebase");
+                if (rebaseRes === "aligned") {
+                  if (await pushAlignedOrPreserve()) return;
+                } else {
+                  await failBaseAlignConflict();
+                  return;
+                }
+              }
+            } else {
+              // The merge conflicted (or errored) — a rebase may still replay cleanly where a
+              // single merge did not, so try it before giving up.
+              runLog.info("finalize base-align: merge conflicted; trying rebase", {
+                run_id: runId,
+              });
+              const rebaseRes = await alignOp("rebase");
+              if (rebaseRes === "aligned") {
+                if (await pushAlignedOrPreserve()) return;
+              } else {
+                await failBaseAlignConflict();
+                return;
+              }
+            }
+          }
+        }
+      }
+
+      // PRD #400 M2: a TASK run always pushes its branch back (the deliverable is the
+      // commits the user pulls from uzi/task/<id>) but opens a merge request only when
+      // it opted in (`uzi handoff --mr` → runs.open_mr → claim.open_mr). Every non-task
+      // kind keeps its current MR behaviour unconditionally. This is a distinct
+      // kind+flag gate on MR-OPEN only — a no-MR task still pushes, so it does NOT take
+      // the report_only path above (which pushes nothing).
+      const openMr = claim.kind !== "task" || claim.open_mr === true;
+
       // The agent signalled done. The WORKER now performs the authenticated push
-      // + MR with the PAT — the agent never had a credential.
+      // (+ MR when openMr) with the PAT — the agent never had a credential.
       batcher.emit({
         kind: "status",
         agent: "worker",
         payload: {
-          text: "work complete; pushing branch and opening merge request",
+          text: openMr
+            ? "work complete; pushing branch and opening merge request"
+            : "work complete; pushing branch (no merge request — pull the branch)",
         },
       });
-      // PRD #284 Layer A: a transient push failure (a dropped HTTP/2 stream, a 5xx,
-      // a connection reset) must retry rather than discard the agent's already-
-      // committed work; a permanent rejection (auth, protected branch, non-fast-
-      // forward) still fails fast and propagates to the catch below. The push is
-      // idempotent on retry (non-forced, same commits → "Everything up-to-date").
-      // Capture the narrowed bare path in a const: barePath is an outer `let`
-      // (string | undefined) and TS drops the narrowing inside the retry closure.
-      const pushBarePath = barePath;
-      await withForgeRetry(
-        () =>
-          this.git.pushBranch(
-            pushBarePath,
-            result.branch,
-            claim.secrets.forge_pat,
-            claim.repo.clone_url,
-            claim.secrets.forge_username,
-          ),
-        { log: runLog },
-      );
+      // The finalize push. Skipped when the PRD #456 align path above already pushed the
+      // aligned branch — the run pushes through EXACTLY ONE code path (`pushToOrigin`), so a
+      // successful align-push and the normal push converge here without ever double-pushing.
+      if (!alignPushed) {
+        await pushToOrigin();
+      }
+
+      // PRD #400 M2: a no-MR task completes HERE — the branch is pushed, there is
+      // nothing more to open. Report the branch on the completion payload (the same
+      // `branch: result.branch` the MR path reports below) so runs.branch carries
+      // uzi/task/<id> and the user knows exactly what to pull. No mr_iid/mr_web_url:
+      // there is no merge request.
+      if (!openMr) {
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: `task complete; pushed ${result.branch} (no merge request — pull the branch)`,
+          },
+        });
+        await batcher.close();
+        await reportState({
+          status: "completed",
+          branch: result.branch,
+          prd_done_path: result.prdDonePath,
+          milestones_completed: result.milestonesCompleted,
+        });
+        runLog.info("task run completed (no MR)", { branch: result.branch });
+        return;
+      }
+
       const targetBranch =
         claim.repo.default_branch?.trim() ||
         (await this.git.defaultBranchName(barePath)) ||
@@ -1840,6 +2301,26 @@ export class RunRunner {
         runId,
       );
     }
+    if (claim.kind === "task") {
+      // PRD #400 M2: a handoff task works a PRE-SEEDED, server-named branch. The CLI
+      // (M3) created the run, received the server-assigned `uzi/task/<run-id>` name,
+      // and pushed the user's local HEAD to it with the user's own credentials BEFORE
+      // this claim — so `claim.branch` is authoritative and already exists on origin.
+      // runnerCloneForBranch seeds off `refs/remotes/origin/<branch>` when that ref
+      // exists, so the pre-seeded content is picked up automatically. A task MUST carry
+      // its branch (the destination is never worker-derived, unlike prompt above); a
+      // missing/empty branch is a create-time bug, so fail loudly rather than inventing
+      // a name that would push somewhere the user is not watching.
+      const taskBranch = claim.branch?.trim();
+      if (!taskBranch)
+        throw new Error("task run claim is missing its branch (uzi/task/<run-id>)");
+      return this.git.runnerCloneForBranch(
+        barePath,
+        taskBranch,
+        "task-" + claim.run_id,
+        runId,
+      );
+    }
     if (claim.issue_iid == null)
       throw new Error("issue run claim is missing issue_iid");
     return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId);
@@ -1876,6 +2357,15 @@ export class RunRunner {
     runLog: Logger,
     autoApprove: boolean,
     repoAgents: AgentTemplate[],
+    // PRD #84 M4: the plan-time inferred requirement set (deterministic detectToolchain()),
+    // or undefined when the scan failed. Rides the same two reports as `milestones` — the
+    // CANDIDATE set on the awaiting_approval report and the FROZEN set on the autopilot
+    // running report — each field emitted only when its array is non-empty.
+    toolchainDetection: ToolchainDetection | undefined,
+    // PRD #362 M3c: advisory hook fired AFTER the awaiting_approval report persists
+    // plan_md, BEFORE the verdict wait (see the RunContext.gatePlan doc). Never reached
+    // on the autopilot branch, which returns above without persisting plan_md.
+    onAwaitingApproval?: (planMd: string) => Promise<void>,
   ): Promise<PlanVerdict> {
     batcher.emit({ kind: "plan", agent: "lead", payload: { plan_md: planMd } });
     // Get the plan message onto the stream regardless of mode — it is the audit
@@ -1912,6 +2402,10 @@ export class RunRunner {
       // mirroring the repo_agents conditional above. Only when non-empty (additive-
       // optional, never []). Reporting stays fire-and-forget via the .catch below.
       if (milestones?.length) autopilotState.milestones = milestones;
+      // PRD #84 M4: the FROZEN requirement set rides this same self-contained running
+      // report (an autopilot run never reports awaiting_approval), each field only when
+      // non-empty — same conditional-spread discipline as milestones/repo_agents above.
+      Object.assign(autopilotState, toolchainReportFields(toolchainDetection));
       await reportState(autopilotState).catch((e) =>
         runLog.warn("could not persist autopilot agent selection", {
           error: errMessage(e),
@@ -1945,6 +2439,10 @@ export class RunRunner {
       status: "awaiting_approval",
       plan_md: planMd,
       ...(milestones?.length ? { milestones } : {}),
+      // PRD #84 M4: the CANDIDATE requirement set rides the awaiting_approval report so
+      // the server can gate plan-approval on worker eligibility. Each field only when
+      // non-empty (additive-optional), matching the milestones conditional above.
+      ...toolchainReportFields(toolchainDetection),
     });
     if (this.gatedRuns.has(runId)) steering.bumpEpoch();
     else this.gatedRuns.add(runId);
@@ -1953,6 +2451,23 @@ export class RunRunner {
       run_id: runId,
       gate_epoch: epoch,
     });
+
+    // PRD #362 M3c: plan_md is now persisted (the awaiting_approval report above), so the
+    // plan-summary POST's stale-write guard (`plan_md = @expected`) can match. Fire the
+    // hook HERE — after persist, before the verdict wait — never on the autopilot branch,
+    // which returned above without persisting plan_md. ADVISORY: swallow any throw so a
+    // summary failure can never wedge the gate or change the run's outcome (the hook
+    // itself also swallows internally; this is belt-and-suspenders).
+    if (onAwaitingApproval) {
+      try {
+        await onAwaitingApproval(planMd);
+      } catch (e) {
+        runLog.warn("plan summary hook failed", {
+          run_id: runId,
+          error: errMessage(e),
+        });
+      }
+    }
 
     // A terminal verdict ends the gate → clear the shared per-run gate state. A revise
     // keeps the shared budget/epoch state running; the re-report above does the bump.
@@ -2182,6 +2697,31 @@ export const REASON_QUESTION_TIMEOUT = "clarification timed out";
 export const REASON_QUESTION_NOT_PARKED =
   "could not park the run to ask a question";
 
+/** The server declined the interactive-task follow-up park (PRD #517 M3). Mirrors
+ *  REASON_QUESTION_NOT_PARKED: the run went terminal or changed hands mid-turn, or the
+ *  run is not an interactive task, so the awaiting_followup transition matched nothing and
+ *  no surface can produce a follow-up. Fail loudly rather than block on a park that never
+ *  took. */
+export const REASON_FOLLOWUP_NOT_PARKED =
+  "could not park the interactive task to await a follow-up";
+
+/** PRD #84 M4: the additive `StateRequest` fields for a plan-time toolchain detection.
+ *  Each array field is included ONLY when non-empty — mirroring the `milestones?.length ?
+ *  {milestones} : {}` conditional-spread discipline, so a run that detected nothing (or
+ *  whose scan failed and passed `undefined`) reports byte-for-byte as before. `size_class`
+ *  is included whenever a detection was computed (it is soft/display-only). */
+function toolchainReportFields(
+  detection: ToolchainDetection | undefined,
+): Partial<StateRequest> {
+  if (!detection) return {};
+  const fields: Partial<StateRequest> = { size_class: detection.size_class };
+  if (detection.required_capabilities.length)
+    fields.required_capabilities = detection.required_capabilities;
+  if (detection.required_tools.length)
+    fields.required_tools = detection.required_tools;
+  return fields;
+}
+
 /** The effective answer deadline: the server-configured claim value when it is
  *  present and positive, else the worker default. An older server omits it (R8). */
 function questionTimeoutMs(
@@ -2203,6 +2743,10 @@ function mrTitle(claim: ClaimResponse): string {
   // the trimmed-title branch above almost always wins; this is the empty-title
   // fallback.
   if (claim.kind === "prompt") return "Scheduled prompt run";
+  // A handoff task (PRD #400) is ISSUE-LESS: its issue_title is derived from the
+  // inline context's first line, so the trimmed-title branch above almost always
+  // wins; this is the empty-context fallback, never `Resolve issue #null`.
+  if (claim.kind === "task") return "Handoff task";
   return `Resolve issue #${claim.issue_iid}`;
 }
 
@@ -2268,6 +2812,23 @@ function mrDescription(
       "this MR references the task but closes nothing.",
       ...repoMarker,
       promptGuardSection ?? "",
+      "",
+      "---",
+      footer,
+    ].join("\n");
+  }
+  if (claim.kind === "task") {
+    // A handoff task (PRD #400) opens an MR only when the caller passed --mr
+    // (open_mr). Like the prompt/self_improve arms above it is ISSUE-LESS, so it
+    // references the task and `Closes` nothing — the issue fallback below would render
+    // `#null`. When present, base_branch names the source ref the task diverged from,
+    // for the reviewer's context.
+    const base = claim.base_branch?.trim();
+    return [
+      "Handoff task (PRD #400). This run worked inline context on the server-named",
+      `\`${branch}\` branch${base ? ` (branched from \`${base}\`)` : ""} and opened this merge request because it was created with \`--mr\`.`,
+      "There is no tracking issue, so this MR closes nothing.",
+      ...repoMarker,
       "",
       "---",
       footer,

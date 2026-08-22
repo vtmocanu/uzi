@@ -5,7 +5,7 @@
 # a Helm lint/template, and -- on pull requests, path-filtered -- `push:false` image
 # VALIDATION builds (does each Dockerfile still build?). It pushes NO images, uses
 # NO secrets, and runs NO release logic: image publishing + the chart/brew release
-# land in release.yml, and the KinD smoke in e2e.yml.
+# land in release.yml, and the KinD smoke in kind-smoke.yml.
 #
 # R1 TRUST BOUNDARY: these jobs must run clean on an untrusted (fork) PR with zero
 # secret exposure. Hence top-level `permissions: contents: read` (a read-only
@@ -43,13 +43,18 @@ jobs:
   validate-api:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
           # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
           # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
+          # check-latest is load-bearing: without it setup-go resolves "1.26" to
+          # whatever patch the assigned runner image happens to preinstall (observed
+          # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
+          # above only holds when we force the manifest lookup here.
           go-version: "1.26"
+          check-latest: true
           cache-dependency-path: api/go.sum
       - uses: ./.github/actions/setup-task
       - name: go mod download
@@ -73,15 +78,20 @@ jobs:
       # (.golangci.yml `new-from-merge-base: origin/main`) needs a reachable common
       # ancestor. If origin/main does not resolve, the target's pre-flight exits 2
       # rather than reporting the whole unfiltered backlog as this branch's findings.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
           # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
           # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
+          # check-latest is load-bearing: without it setup-go resolves "1.26" to
+          # whatever patch the assigned runner image happens to preinstall (observed
+          # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
+          # above only holds when we force the manifest lookup here.
           go-version: "1.26"
+          check-latest: true
           cache-dependency-path: api/go.sum
       - uses: ./.github/actions/setup-task
       - name: go mod download
@@ -98,13 +108,18 @@ jobs:
   test-api:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
           # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
           # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
+          # check-latest is load-bearing: without it setup-go resolves "1.26" to
+          # whatever patch the assigned runner image happens to preinstall (observed
+          # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
+          # above only holds when we force the manifest lookup here.
           go-version: "1.26"
+          check-latest: true
           cache-dependency-path: api/go.sum
       - uses: ./.github/actions/setup-task
       - name: go mod download
@@ -142,13 +157,18 @@ jobs:
     env:
       UZI_TEST_DATABASE_URL: postgres://uzi:uzi-ci@localhost:5432/uzi?sslmode=disable
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
           # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
           # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
+          # check-latest is load-bearing: without it setup-go resolves "1.26" to
+          # whatever patch the assigned runner image happens to preinstall (observed
+          # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
+          # above only holds when we force the manifest lookup here.
           go-version: "1.26"
+          check-latest: true
           cache-dependency-path: api/go.sum
       - name: go mod download
         working-directory: api
@@ -176,10 +196,11 @@ jobs:
   validate-controller:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26"
+          check-latest: true
           cache-dependency-path: controller/go.sum
       - uses: ./.github/actions/setup-task
       - name: go mod download
@@ -194,12 +215,13 @@ jobs:
   lint-controller:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26"
+          check-latest: true
           cache-dependency-path: controller/go.sum
       - uses: ./.github/actions/setup-task
       - name: go mod download
@@ -216,10 +238,11 @@ jobs:
   test-controller:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26"
+          check-latest: true
           cache-dependency-path: controller/go.sum
       - uses: ./.github/actions/setup-task
       - name: go mod download
@@ -234,8 +257,8 @@ jobs:
   validate-web:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: npm
@@ -244,7 +267,7 @@ jobs:
       - name: npm ci
         working-directory: web
         run: npm ci
-      - name: lint + deadcode + vulncheck + check-docs + check-styles + typecheck
+      - name: lint + deadcode + vulncheck + check-docs + check-changelog + check-styles + typecheck
         env:
           # Turns the deadcode wrapper's loud-SKIP (when knip is absent) into exit 2:
           # CI always installs knip, so a skip here means the image regressed.
@@ -254,14 +277,15 @@ jobs:
           task deadcode:web
           task vulncheck:web
           task check-docs:web
+          task check-changelog:web
           task check-styles:web
           task typecheck:web
 
   test-web:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: npm
@@ -277,8 +301,8 @@ jobs:
   validate-agent:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: npm
@@ -299,8 +323,8 @@ jobs:
   test-agent:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: npm
@@ -321,14 +345,19 @@ jobs:
   lint-repo:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Go is needed for scan:secrets (gitleaks via `go run pkg@version`).
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
           # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
           # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
+          # check-latest is load-bearing: without it setup-go resolves "1.26" to
+          # whatever patch the assigned runner image happens to preinstall (observed
+          # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
+          # above only holds when we force the manifest lookup here.
           go-version: "1.26"
+          check-latest: true
           cache-dependency-path: api/go.sum
       - uses: ./.github/actions/setup-task
       - name: Install shellcheck 0.11.0 (pinned, sha256-verified)
@@ -365,10 +394,10 @@ jobs:
   helm-chart:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
         with:
-          version: v3.21.3
+          version: v4.2.4
       - name: helm dependency build
         # Bundles the CNPG `cluster` subchart (oci://ghcr.io/cloudnative-pg/charts,
         # public) per Chart.lock, so the render below is self-contained.
@@ -402,7 +431,7 @@ jobs:
   # kaniko `--no-push` jobs, PRD #230). PULL-REQUEST ONLY and path-filtered: the
   # heavy builds (agent especially) run only when their inputs change. They touch NO
   # registry and NO secrets, so the R1 trust boundary is unchanged. On push to main
-  # the real images are built by e2e.yml (api/web) and by release.yml (tags); this
+  # the real images are built by kind-smoke.yml (api/web) and by release.yml (tags); this
   # section is pure pre-merge validation.
   #
   # `changes` runs on PRs and exposes one boolean per component; each build job gates
@@ -420,8 +449,8 @@ jobs:
       controller: ${{ steps.filter.outputs.controller }}
       agent: ${{ steps.filter.outputs.agent }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
         id: filter
         with:
           filters: |
@@ -442,9 +471,9 @@ jobs:
     needs: [changes, validate-api, test-api, lint-api]
     if: needs.changes.outputs.api == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
         with:
           context: api
           file: api/Dockerfile
@@ -458,9 +487,9 @@ jobs:
     needs: [changes, validate-web, test-web]
     if: needs.changes.outputs.web == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
         with:
           context: .
           file: web/Dockerfile
@@ -475,9 +504,9 @@ jobs:
     needs: [changes, validate-web, test-web]
     if: needs.changes.outputs.web == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
         with:
           context: .
           file: web/Dockerfile.mock
@@ -490,9 +519,9 @@ jobs:
     needs: [changes, validate-controller, test-controller, lint-controller]
     if: needs.changes.outputs.controller == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
         with:
           context: controller
           file: controller/Dockerfile
@@ -513,9 +542,9 @@ jobs:
       matrix:
         template: [base, jvm]
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
         with:
           context: .
           file: agent/templates/${{ matrix.template }}/Dockerfile

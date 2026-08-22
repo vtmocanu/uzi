@@ -22,6 +22,7 @@ import {
   type WorkerRunMessage,
   type JudgeTraceResponse,
   type ReviewRequest,
+  type TaskReviewRequest,
   type WorkerStats,
   type SaveMemoryRequest,
   type MemoryEntry,
@@ -306,6 +307,14 @@ export class WorkerClient {
     await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(targetRunId)}/review`, review);
   }
 
+  /** Post a diff-review's structured findings (POST /worker/runs/:id/task-review, PRD
+   *  #400 M4b). `targetRunId` is the reviewed task run (claim.review_target_run_id). The
+   *  server caps/scrubs the findings and validates `severity`; report-only — nothing is
+   *  pushed. Mirrors postReview. */
+  async postTaskReview(targetRunId: string, review: TaskReviewRequest): Promise<void> {
+    await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(targetRunId)}/task-review`, review);
+  }
+
   /** Create a PENDING issue proposal on a chat run (POST /worker/runs/:id/proposals).
    *  NEVER writes the forge — the browser confirm does. Returns the created proposal. */
   async createProposal(runId: string, body: CreateProposalRequest): Promise<WorkerProposal> {
@@ -326,6 +335,31 @@ export class WorkerClient {
       id: string;
     };
     return res.id;
+  }
+
+  // ── Inline run summaries (PRD #362 M3c) ────────────────────────────────────
+  // Two thin POSTs mirroring reportFinding/saveMemory: the api derives (user, repo)
+  // from the CLAIMED run and re-validates + sanitises everything (it, not the worker,
+  // is the security boundary). Both throw RequestError on >=400 (the executor hook
+  // wraps them in try/catch — a 409 stale-plan and a 400 bad-deltas are expected-
+  // benign, and a summary is ADVISORY so it must NEVER fail the run).
+
+  /** Persist the run's INTENT summary (POST /worker/runs/:id/summary/intent). The
+   *  server is idempotent-on-set: a second post for a run that already has one is a
+   *  no-op success (Decision 3). Throws RequestError on non-2xx. */
+  async postIntentSummary(runId: string, summary: string): Promise<void> {
+    await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/summary/intent`, { summary });
+  }
+
+  /** Persist the run's PLAN summary + deltas (POST /worker/runs/:id/summary/plan).
+   *  `plan_md` is the stale-write guard value (Decision 3): the server writes ONLY if
+   *  it still matches runs.plan_md, else 409 (a superseded plan, not a run failure).
+   *  Invalid deltas are a 400. Throws RequestError on non-2xx. */
+  async postPlanSummary(
+    runId: string,
+    body: { summary: string; deltas: { kind: "added" | "changed" | "dropped"; text: string }[]; plan_md: string },
+  ): Promise<void> {
+    await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/summary/plan`, body);
   }
 
   // ── Cross-run agent memory (PRD #90) ───────────────────────────────────────

@@ -86,7 +86,7 @@ export function Modal({
       tabIndex={-1}
       className={
         className ??
-        "fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 p-4 outline-none sm:items-center"
+        "fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 p-4 outline-hidden sm:items-center"
       }
       role="dialog"
       aria-modal="true"

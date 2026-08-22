@@ -34,6 +34,33 @@ type IssueDraftDTO struct {
 	DefaultNote string `json:"default_note"`
 }
 
+// TaskReviewDTO is a handoff task's diff-review: the header plus its structured findings
+// (PRD #400 M4a). summary_md and each finding's summary/rationale were scrubbed + capped at
+// the review POST; a client renders them as escaped text. review_run_id is the review run
+// that produced it (nil for a header whose review run was deleted). The CLI fetches this as
+// JSON via `uzi handoff review <task-run-id>`.
+type TaskReviewDTO struct {
+	TargetRunID string                 `json:"target_run_id"`
+	ReviewRunID *string                `json:"review_run_id"`
+	Status      string                 `json:"status"`
+	SummaryMd   string                 `json:"summary_md"`
+	Findings    []TaskReviewFindingDTO `json:"findings"`
+	CreatedAt   time.Time              `json:"created_at"`
+}
+
+// TaskReviewFindingDTO is one structured diff-review finding (PRD #400 M4a): a file +
+// symbol + line location, a closed-enum severity, and the scrubbed summary/rationale free
+// text. Unlike the judge's symbol-only recommendation this carries a line number — a
+// single-diff review does not dedup across runs, so line drift is not a concern.
+type TaskReviewFindingDTO struct {
+	File      string `json:"file"`
+	Symbol    string `json:"symbol"`
+	Line      int32  `json:"line"`
+	Severity  string `json:"severity"`
+	Summary   string `json:"summary"`
+	Rationale string `json:"rationale"`
+}
+
 // FiledIssueDTO is a SETTLED recommendation→forge-issue link for the run-page panel
 // (PRD #68 M4): the coordinate it covers, the created issue, and when it was filed so the
 // panel can render a filed row (with an issue link) instead of the File-issue button and

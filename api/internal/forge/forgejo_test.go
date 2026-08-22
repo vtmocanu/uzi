@@ -941,6 +941,49 @@ func TestForgejoLabelActionConvention(t *testing.T) {
 	}
 }
 
+// TestForgejoListIssueComments pins PRD #381 M1 for Forgejo: a two-comment
+// response maps to two neutral IssueComments in oldest-first order (gitea's list
+// is already ASC and human-only, so no filter is needed) with author id/username/
+// body carried through.
+func TestForgejoListIssueComments(t *testing.T) {
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/issues/11/comments": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				t.Errorf("expected GET, got %s", r.Method)
+			}
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"id": 601, "body": "please guard on Valid",
+					"user":       map[string]any{"id": 42, "login": "carol"},
+					"created_at": "2026-07-04T09:00:00Z", "updated_at": "2026-07-04T09:00:00Z"},
+				{"id": 602, "body": "and revise the existing test",
+					"user":       map[string]any{"id": 43, "login": "dave"},
+					"created_at": "2026-07-04T10:00:00Z", "updated_at": "2026-07-04T10:00:00Z"},
+			})
+		},
+	})
+	d := newForgejoDriver(t, m, "forgejo-abcdefabcdef")
+
+	comments, err := d.ListIssueComments(context.Background(), 7, 11)
+	if err != nil {
+		t.Fatalf("ListIssueComments: %v", err)
+	}
+	if len(comments) != 2 {
+		t.Fatalf("expected 2 comments, got %d: %+v", len(comments), comments)
+	}
+	if comments[0].AuthorForgeUserID != 42 || comments[0].AuthorUsername != "carol" || comments[0].Body != "please guard on Valid" {
+		t.Fatalf("unexpected first comment: %+v", comments[0])
+	}
+	if comments[0].CreatedAt.IsZero() {
+		t.Error("expected a non-zero CreatedAt on the first comment")
+	}
+	if comments[1].AuthorUsername != "dave" || comments[1].Body != "and revise the existing test" {
+		t.Fatalf("unexpected second comment: %+v", comments[1])
+	}
+	if !comments[0].CreatedAt.Before(comments[1].CreatedAt) {
+		t.Errorf("comments not oldest-first: %v then %v", comments[0].CreatedAt, comments[1].CreatedAt)
+	}
+}
+
 func TestForgejoCreateIssueNoteSendsBody(t *testing.T) {
 	var gotBody string
 	m := newMockForgejo(t, map[string]http.HandlerFunc{

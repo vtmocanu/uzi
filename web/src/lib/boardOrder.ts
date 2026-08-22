@@ -26,6 +26,25 @@ export function isSortMode(v: unknown): v is SortMode {
   return typeof v === "string" && SORT_MODES.some((m) => m.value === v);
 }
 
+export type SortDir = "asc" | "desc";
+
+// Each mode's default direction is exactly the direction it uses today, so the
+// board is unchanged until a user flips the toggle. `manual` ignores direction;
+// its value here is a harmless placeholder.
+export const DEFAULT_SORT_DIR: Record<SortMode, SortDir> = {
+  manual: "desc",
+  iid: "asc",
+  run: "desc",
+  updated: "desc",
+  title: "asc",
+};
+
+// isSortDir guards the persisted preference, mirroring isSortMode: a stale or
+// hand-edited localStorage value must degrade rather than reach sortCards.
+export function isSortDir(v: unknown): v is SortDir {
+  return v === "asc" || v === "desc";
+}
+
 // byIID is every mode's tiebreak. Every non-manual comparator MUST fall through to it:
 // a comparator that can return 0 leaves the render at the mercy of the engine's sort,
 // and "stable relative to an order that itself came from somewhere else" is not a
@@ -42,17 +61,20 @@ function timeKey(v: string | null | undefined): number | null {
   return Number.isNaN(t) ? null : t;
 }
 
-// descWithNullsLast orders by a numeric key descending, with "no value" rows last in
-// iid order — mirroring the NULLS LAST rule the SQL side uses, so the two halves of
-// the feature agree about where a card with nothing to sort on belongs.
-function descWithNullsLast(key: (c: Card) => number | null) {
+// keyedWithNullsLast orders by a numeric key, with "no value" rows last in iid
+// order — mirroring the SQL NULLS LAST rule — INDEPENDENT of direction. Only the
+// keyed rows flip: asc = ka - kb, desc = kb - ka. Nulls stay last and the byIID
+// tiebreak stays ascending in both directions, so reversing direction never
+// floats a never-run card to the top and never scrambles equal-key rows.
+function keyedWithNullsLast(key: (c: Card) => number | null, dir: SortDir) {
+  const sign = dir === "asc" ? 1 : -1;
   return (a: Card, b: Card) => {
     const ka = key(a);
     const kb = key(b);
     if (ka === null && kb === null) return byIID(a, b);
     if (ka === null) return 1;
     if (kb === null) return -1;
-    if (ka !== kb) return kb - ka;
+    if (ka !== kb) return sign * (ka - kb);
     return byIID(a, b);
   };
 }
@@ -67,36 +89,45 @@ function descWithNullsLast(key: (c: Card) => number | null) {
 // board_position never rides cardDTO. The cost is a coupling to a SQL clause in
 // another language: it is pinned by TestListIssuesByRepoBoardOrderLiveDB, and if that
 // ORDER BY changes, this function is what breaks.
-export function sortCards(cards: readonly Card[], mode: SortMode): Card[] {
+export function sortCards(
+  cards: readonly Card[],
+  mode: SortMode,
+  dir: SortDir = DEFAULT_SORT_DIR[mode],
+): Card[] {
   const out = [...cards];
+  const sign = dir === "asc" ? 1 : -1;
   switch (mode) {
     case "manual":
-      return out;
+      return out; // direction is not applicable to the server-authored order
     case "iid":
-      return out.sort(byIID);
+      // The byIID tiebreak is deliberately NOT sign-flipped anywhere else, but iid
+      // mode IS byIID, so here the direction does flip it: asc = today's order.
+      return out.sort((a, b) => sign * byIID(a, b));
     case "run":
       // latest_run is a POINTER and is null on every card that has never run — on a
       // real board, most of them. Never-run cards go last, in iid order among
       // themselves. Note the key is the newest run's updated_at, not the max across
       // the issue's runs: ListLatestRunsForRepo picks by created_at DESC. Intended.
-      return out.sort(descWithNullsLast((c) => timeKey(c.latest_run?.updated_at)));
+      return out.sort(keyedWithNullsLast((c) => timeKey(c.latest_run?.updated_at), dir));
     case "updated":
       // forge_updated_at is NOT NULL server-side, so the null arm here is defence
       // against a malformed value rather than an expected state — one bad row must
       // sink, not scramble the board.
-      return out.sort(descWithNullsLast((c) => timeKey(c.forge_updated_at)));
+      return out.sort(keyedWithNullsLast((c) => timeKey(c.forge_updated_at), dir));
     case "title":
       // Sort the string that is DISPLAYED. The board renders stripUnsafeChars(title)
       // (issue #124), so sorting the raw one puts a title beginning with a bidi or
       // zero-width character in a visibly wrong place. The locale is EXPLICIT because
       // the default is environment-dependent, which would make an exact-order
-      // assertion a latent cross-environment flake.
+      // assertion a latent cross-environment flake. Only the title comparison flips
+      // with dir; the byIID tiebreak is deliberately NOT sign-flipped, so equal-title
+      // rows keep a stable ascending order in both directions.
       return out.sort((a, b) => {
         const cmp = stripUnsafeChars(a.title).localeCompare(stripUnsafeChars(b.title), "en", {
           sensitivity: "base",
           numeric: true,
         });
-        return cmp !== 0 ? cmp : byIID(a, b);
+        return cmp !== 0 ? sign * cmp : byIID(a, b);
       });
   }
 }
@@ -241,18 +272,22 @@ export function dropIntent(args: {
   payloadCards: readonly Card[];
   columnKeys: readonly string[];
   sortMode: SortMode;
+  sortDir: SortDir;
   dragIid: number;
   destColumnKey: string;
   anchor: DropAnchor | null;
 }): DropIntent | null {
-  const { payloadCards, columnKeys, sortMode, dragIid, destColumnKey, anchor } = args;
+  const { payloadCards, columnKeys, sortMode, sortDir, dragIid, destColumnKey, anchor } = args;
   const dragged = payloadCards.find((c) => c.iid === dragIid);
   // Nothing to do: the card is gone from the payload (evicted between render and drop),
   // or it is closed and therefore not draggable.
   if (!dragged || dragged.closed) return null;
 
   const openCards = payloadCards.filter((c) => !c.closed);
-  const displayed = sortCards(openCards, sortMode);
+  // The displayed order the freeze captures must reflect the active direction, so a
+  // drop taken while the board is reversed writes positions that match what the user
+  // sees rather than the mode's default direction.
+  const displayed = sortCards(openCards, sortMode, sortDir);
   return {
     columnChanged: columnKeyOf(dragged) !== destColumnKey,
     iids: boardOrderAfterDrop(displayed, columnKeys, dragIid, destColumnKey, anchor),
