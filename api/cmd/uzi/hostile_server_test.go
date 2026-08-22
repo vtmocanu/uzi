@@ -128,6 +128,24 @@ func TestHostileServerCannotDriveTheTerminal(t *testing.T) {
 		}
 	})
 
+	t.Run("error-message-bounded", func(t *testing.T) {
+		// The strip alone is not enough here: uzicli.CellText does NOT truncate, and the
+		// server error is read via a 32 MiB io.LimitReader, so a megabyte-long body would
+		// print in full. root.go uses the LOCAL cellText, whose 200-char cap bounds it (#220).
+		fc := &uzicli.FakeClient{Err: uzicli.Exitf(uzicli.ExitNotFound, "%s", "no such run: "+strings.Repeat("A", 1<<20))}
+		out, errOut, code := runCLI(t, fakeEnv(fc), "run", "list")
+		if code != uzicli.ExitNotFound {
+			t.Fatalf("exit = %d, want %d; stdout=%q", code, uzicli.ExitNotFound, out)
+		}
+		if len(errOut) > 4096 {
+			t.Errorf("stderr is %d bytes; the server error string reached the terminal unbounded", len(errOut))
+		}
+		// Positive: the legitimate prefix rendered, so the payload actually reached this path.
+		if !strings.Contains(errOut, "uzi: no such run") {
+			t.Errorf("the error lost its legitimate text: %q", errOut)
+		}
+	})
+
 	t.Run("json-mode-is-untouched", func(t *testing.T) {
 		// The other side of the contract, asserted through a real command rather than the
 		// Printer: --json must carry the server's bytes verbatim so an agent sees what was
