@@ -982,10 +982,11 @@ WHERE runs.id = @id AND worker_id = @worker_id
   --
   -- runs.open_followup_id reads the OLD (pre-update) row here — Postgres evaluates the
   -- WHERE, and every SET right-hand side, against the pre-update tuple — exactly as
-  -- runs.open_question_id does in the awaiting_input guard above. A NULL watermark (a run
-  -- that never parked, or a first park with nothing consumed) COALESCEs to 0, so any
-  -- consumed follow_up clears it: fail-open only in the one case where any consumed
-  -- follow_up genuinely IS new.
+  -- runs.open_question_id does in the awaiting_input guard above. The setter's
+  -- COALESCE(MAX(id),0) floor stamps 0 (never NULL) on every park, so open_followup_id is
+  -- genuinely NULL only for a run that has never parked at all; that NULL COALESCEs to 0
+  -- here, so any consumed follow_up clears it: fail-open only in the one case where any
+  -- consumed follow_up genuinely IS new.
   --
   -- No clear-on-wake is needed, and a future reader must NOT "add the missing sibling
   -- clear" the way open_question_id needs one. The watermark keys on CONSUMED-only rows

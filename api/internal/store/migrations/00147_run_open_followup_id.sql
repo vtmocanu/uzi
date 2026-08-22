@@ -8,8 +8,10 @@
 -- follow_up NEWER than the watermark, which is the follow_up that should wake THIS park.
 --
 -- run_user_inputs.id is a monotone bigserial PRIMARY KEY (00020), so a plain bigint holds
--- it. Nullable, no default, no backfill: a run that has never parked (or is on its FIRST
--- park with nothing consumed) has watermark NULL, which the guard reads as 0 via COALESCE.
+-- it. Nullable, no default, no backfill: the setter's COALESCE(MAX(id),0) floor stamps 0
+-- (never NULL) on EVERY park, including a first park with nothing consumed. The column is
+-- genuinely NULL only for a run that has never parked at all (incl. rows parked before this
+-- migration, since there is no backfill); the guard reads that NULL as 0 via COALESCE.
 ALTER TABLE runs ADD COLUMN open_followup_id bigint;
 
 -- +goose Down
