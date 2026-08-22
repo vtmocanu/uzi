@@ -166,6 +166,30 @@ export function parseChangelog(raw: string): Release[] {
   }
 }
 
+export interface BulletTitleSplit {
+  /** The bold title text WITHOUT the surrounding `**`, or null if the bullet has no leading bold span. */
+  title: string | null;
+  /** The remaining description; "" when the bullet is title-only. */
+  description: string;
+}
+
+// A changelog bullet is authored as a bold title followed by its description
+// (folded to one string by parseGroups). Split the LEADING bold span off as the
+// title so the drawer can render it on its own line. Both bullet shapes fold to
+// the same string, so this handles the current title-line-then-description form
+// and the legacy single-physical-line inline form identically. A bullet with no
+// leading bold span has no separable title (title = null) and renders as-is.
+//
+// The inner capture is NON-GREEDY (`[\s\S]+?`) so it stops at the FIRST closing
+// `**`, capturing only the leading bold span as the title even when the
+// description itself contains later `**bold**` runs — a greedy match would
+// swallow everything up to the last `**` and mis-split the bullet.
+export function splitBulletTitle(bullet: string): BulletTitleSplit {
+  const m = /^\*\*([\s\S]+?)\*\*\s*([\s\S]*)$/.exec(bullet);
+  if (!m) return { title: null, description: bullet };
+  return { title: m[1].trim(), description: m[2].trim() };
+}
+
 // Browser-only bundle: the repo-root CHANGELOG.md, resolved relative to this file
 // (there is exactly one match). Kept fail-safe if the glob is empty.
 const rawChangelog = import.meta.glob("../../../CHANGELOG.md", {
