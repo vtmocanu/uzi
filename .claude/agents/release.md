@@ -133,15 +133,15 @@ short SHA BEFORE tagging, and run it locally against your release commit first:
 `bash scripts/assert-changelog-covers-release.sh HEAD v<prev> X.Y.Z`.
 
 **That same `## [X.Y.Z]` section becomes the GitHub Release notes, so write it for a reader.**
-Format each bullet as a bold title on its own physical line, then a blank line, then the description
-as ONE physical line (no mid-description newlines), the description indented two spaces so it stays
-inside the list item across the blank line. GitHub renders the release body's single newlines as hard
-`<br>` breaks, so a hard-wrapped description shows as short, ragged lines in the published Release;
-keeping it on one physical line lets GitHub reflow to width, and the blank line after the title
-renders as a paragraph break so the title stands alone. The CHANGELOG header states this too.
-(Title-then-blank-then-description established 2026-08-22; one-physical-line-per-bullet was the rule
-from 2026-08-21 through `[0.52.0]`; older already-published sections stay as they were and were edited
-in place.)
+Format each bullet as a bold title on its own physical line, then the description directly on the
+next physical line with NO blank line between them, the description on ONE physical line (no
+mid-description newlines) indented two spaces so it stays inside the list item. GitHub renders the
+release body's single newlines as hard `<br>` breaks, so the title and its description show on
+consecutive lines with nothing between; a hard-wrapped description would show as short, ragged lines,
+and a blank line after the title would open a gap. Keeping the description on one physical line lets
+GitHub reflow to width. The CHANGELOG header states this too. (Title-line-then-description established
+2026-08-22, applied back across earlier sections; one-physical-line-per-bullet was the interim rule
+from 2026-08-21 through `[0.52.0]`.)
 Optionally give the Release a one-line title by placing an HTML marker on the line directly under
 the heading — `## [X.Y.Z] - <date>` then `<!-- release-title: readable run transcript + all-agents
 lane -->`; absent it, the Release is titled `vX.Y.Z`. Then run `bash scripts/changelog-links.sh` in

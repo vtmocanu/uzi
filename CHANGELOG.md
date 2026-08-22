@@ -4,17 +4,17 @@ Notable changes to uzi, loosely following [Keep a Changelog](https://keepachange
 Versions are release git tags (`deploy/chart/Chart.yaml`'s `version`/`appVersion`, Model B) — this
 file is not bumped per-commit; `[Unreleased]` collects everything since the last tag.
 
-Format each bullet as a bold title on its own physical line, then a blank line, then the description
-as ONE physical line (no mid-description newlines): a release's notes are this file's `## [X.Y.Z]`
-section verbatim (`scripts/changelog-section.sh body`), and GitHub renders single newlines in a
-release body as hard `<br>` breaks, so a hard-wrapped description shows as short, ragged lines in the
-published Release. Keeping the description on one physical line lets GitHub reflow it to the reader's
-width, and the blank line after the title renders as a paragraph break so the title stands alone.
-Indent the description two spaces so it stays inside the list item across the blank line. Blank lines
-between bullets and `###` subsection headers are unaffected. (Title-then-blank-then-description
-established 2026-08-22; one-physical-line-per-bullet was the rule from 2026-08-21 through `[0.52.0]`;
-sections at or before `[0.50.0]` stay hard-wrapped, their Releases already published and edited in
-place.)
+Format each bullet as a bold title on its own physical line, then the description directly on the
+next physical line (NO blank line between them), the description on ONE physical line (no
+mid-description newlines) indented two spaces so it stays inside the list item: a release's notes are
+this file's `## [X.Y.Z]` section verbatim (`scripts/changelog-section.sh body`), and GitHub renders
+single newlines in a release body as hard `<br>` breaks, so the title and its description render on
+consecutive lines with nothing between them, while a hard-wrapped description would show as short,
+ragged lines and a blank line after the title would open a gap. Keeping the description on one
+physical line lets GitHub reflow it to the reader's width. Blank lines between bullets and `###`
+subsection headers are unaffected. (Title-line-then-description established 2026-08-22, applied
+back across earlier sections too; one-physical-line-per-bullet was the interim rule from 2026-08-21
+through `[0.52.0]`.)
 
 ## [Unreleased]
 
@@ -24,22 +24,18 @@ place.)
 ### Added
 
 - **GitHub Projects sync: admin kill-switch and per-repo web UI ([#555](https://github.com/vtmocanu/uzi/pull/555), PRD #364).**
-
   The per-repo Projects-sync routes (status, adopt, provision, disable) move off the `/admin` group to the per-repo `/repos/{id}/github-project-sync*` group behind an owner-or-admin guard, a new admin Instance-settings toggle (`github_project_sync_enabled`, default off) gates the feature instance-wide, and the Repos page gains the per-repo sync controls.
 
 ### Fixed
 
 - **Record "merged" MR state for cleanly-merged PRs ([#551](https://github.com/vtmocanu/uzi/pull/551), issue [#527](https://github.com/vtmocanu/uzi/pull/527)).**
-
   A run's "merged" badge almost never appeared because `runs.mr_state` was only written while the issue was still open, yet merging a PR closes the issue before the state is recorded; MR-watch now keeps observing a completed run's MR after its issue closes (a new Lane B) so `merged`/`closed` is recorded, and backfills historical merged PRs.
 - **Restore SDK todo/task tools dropped by claude-agent-sdk 0.3.233 ([#550](https://github.com/vtmocanu/uzi/pull/550), issue [#549](https://github.com/vtmocanu/uzi/pull/549)).**
-
   claude-agent-sdk 0.3.233 removes the todo/task-tracking tools (TodoWrite, TaskCreate/Get/Update/List) from the default surface on newer models, silently stripping them from the lead and its inherit-all subagents; `buildSdkEnv` now sets `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` to restore the pre-0.3.233 surface everywhere, inert where a strict allowlist or deny hook already constrains the surface.
 
 ### Internal
 
 - **Dependency bump ([#531](https://github.com/vtmocanu/uzi/pull/531)).**
-
   `@anthropic-ai/claude-agent-sdk` to v0.3.233.
 
 ## [0.52.0] - 2026-08-22
@@ -47,59 +43,88 @@ place.)
 
 ### Added
 
-- **Interactive, long-lived task runs ([#540](https://github.com/vtmocanu/uzi/pull/540), PRD #517).** `uzi handoff --interactive` keeps a task run alive past a clean `signal_done` instead of finalizing it: the run checkpoint-pushes its branch and parks in a new non-terminal `awaiting_followup` status, holding the same agent session, clone and branch open. `uzi run follow-up <id>` wakes it for another turn with full context (no history replay); the new `uzi run stop <id>` winds it down gracefully (finalize, optional MR) as a distinct alternative to the hard-abort `run cancel`; a forgotten park is finalized by a 30-minute worker-side idle timeout (`WORKER_TASK_IDLE_TIMEOUT`), with the existing stale-worker requeue as the dead-worker backstop.
-- **Lead context-window meter ([#538](https://github.com/vtmocanu/uzi/pull/538), PRD #516).** The run Activity panel shows the lead session's live context-window fill (read from the SDK once per lead turn) as a meter on the lead lane plus a micro-meter on the lead crew chip, predicting autocompaction. Subagent lanes get no meter (the SDK exposes only the main-loop window). This is window fill, distinct from the token spend the run page already tallies.
-- **TUI run-detail account meters ([#536](https://github.com/vtmocanu/uzi/pull/536), PRD #530).** The `uzi tui` run-detail view renders per-account 5h/7d rate-limit meters under the milestone block, mirroring the board strip and web sidebar selection.
-- **TUI rate-limit auto-refresh ([#539](https://github.com/vtmocanu/uzi/pull/539), PRD #533).** The TUI rate-limit strip now polls its meters on its own 60s ticker instead of freezing at launch, matching the web sidebar cadence.
-- **Board sort direction toggle ([#544](https://github.com/vtmocanu/uzi/pull/544), PRD #412).** The board's Sort control gains an ascending/descending toggle (disabled for Manual); each mode keeps its previous direction as default. The chosen sort applies to every lane including Closed, which was previously always pinned to issue-number order.
-- **Forge connect base-URL and type sync ([#542](https://github.com/vtmocanu/uzi/pull/542), PRD #337).** The connect form two-way-syncs the base URL and forge type (selecting a type fills the default URL; a recognized URL infers the type), and the PAT field gains a reveal/hide toggle. The reveal is client-only over what the user is typing; no stored secret is ever surfaced.
-- **Worker cordon/drain signal ([#546](https://github.com/vtmocanu/uzi/pull/546), PRD #496).** The Workers list and `uzi worker list` now show when a hosted worker is draining/cordoned (finishing its current runs but not claiming new ones), so an online worker with a free slot that is not picking up a queued run reads as an in-progress roll rather than a bug.
+- **Interactive, long-lived task runs ([#540](https://github.com/vtmocanu/uzi/pull/540), PRD #517).**
+  `uzi handoff --interactive` keeps a task run alive past a clean `signal_done` instead of finalizing it: the run checkpoint-pushes its branch and parks in a new non-terminal `awaiting_followup` status, holding the same agent session, clone and branch open. `uzi run follow-up <id>` wakes it for another turn with full context (no history replay); the new `uzi run stop <id>` winds it down gracefully (finalize, optional MR) as a distinct alternative to the hard-abort `run cancel`; a forgotten park is finalized by a 30-minute worker-side idle timeout (`WORKER_TASK_IDLE_TIMEOUT`), with the existing stale-worker requeue as the dead-worker backstop.
+- **Lead context-window meter ([#538](https://github.com/vtmocanu/uzi/pull/538), PRD #516).**
+  The run Activity panel shows the lead session's live context-window fill (read from the SDK once per lead turn) as a meter on the lead lane plus a micro-meter on the lead crew chip, predicting autocompaction. Subagent lanes get no meter (the SDK exposes only the main-loop window). This is window fill, distinct from the token spend the run page already tallies.
+- **TUI run-detail account meters ([#536](https://github.com/vtmocanu/uzi/pull/536), PRD #530).**
+  The `uzi tui` run-detail view renders per-account 5h/7d rate-limit meters under the milestone block, mirroring the board strip and web sidebar selection.
+- **TUI rate-limit auto-refresh ([#539](https://github.com/vtmocanu/uzi/pull/539), PRD #533).**
+  The TUI rate-limit strip now polls its meters on its own 60s ticker instead of freezing at launch, matching the web sidebar cadence.
+- **Board sort direction toggle ([#544](https://github.com/vtmocanu/uzi/pull/544), PRD #412).**
+  The board's Sort control gains an ascending/descending toggle (disabled for Manual); each mode keeps its previous direction as default. The chosen sort applies to every lane including Closed, which was previously always pinned to issue-number order.
+- **Forge connect base-URL and type sync ([#542](https://github.com/vtmocanu/uzi/pull/542), PRD #337).**
+  The connect form two-way-syncs the base URL and forge type (selecting a type fills the default URL; a recognized URL infers the type), and the PAT field gains a reveal/hide toggle. The reveal is client-only over what the user is typing; no stored secret is ever surfaced.
+- **Worker cordon/drain signal ([#546](https://github.com/vtmocanu/uzi/pull/546), PRD #496).**
+  The Workers list and `uzi worker list` now show when a hosted worker is draining/cordoned (finishing its current runs but not claiming new ones), so an online worker with a free slot that is not picking up a queued run reads as an in-progress roll rather than a bug.
 
 ### Changed
 
-- **TUI floor-strip account separator ([#537](https://github.com/vtmocanu/uzi/pull/537), issue [#532](https://github.com/vtmocanu/uzi/pull/532)).** The factory-floor rate-limit strip replaces the faint " · " token separator with a per-account left accent bar, tinted alarm-red when the account's peak 5h/7d window is at or above the danger threshold and faint otherwise.
+- **TUI floor-strip account separator ([#537](https://github.com/vtmocanu/uzi/pull/537), issue [#532](https://github.com/vtmocanu/uzi/pull/532)).**
+  The factory-floor rate-limit strip replaces the faint " · " token separator with a per-account left accent bar, tinted alarm-red when the account's peak 5h/7d window is at or above the danger threshold and faint otherwise.
 
 ### Fixed
 
-- **Bound server-controlled strings at the terminal ([#541](https://github.com/vtmocanu/uzi/pull/541), issue [#220](https://github.com/vtmocanu/uzi/pull/220)).** Three server-controlled strings that reached the terminal unbounded (an error body and the device-login user-code and email) now pass through the truncating `cellText` (200-byte cap), so a hostile server response cannot flood the CLI output.
-- **Warn the lead when a resume re-clone destroyed the tree ([#543](https://github.com/vtmocanu/uzi/pull/543), issue [#222](https://github.com/vtmocanu/uzi/pull/222)).** On a resumed run whose re-clone rebuilt the working tree, the first implement turn now warns the lead that a queued follow-up written against the old tree may not reflect surviving work, so a stale steer input is not acted on as if that work were present.
+- **Bound server-controlled strings at the terminal ([#541](https://github.com/vtmocanu/uzi/pull/541), issue [#220](https://github.com/vtmocanu/uzi/pull/220)).**
+  Three server-controlled strings that reached the terminal unbounded (an error body and the device-login user-code and email) now pass through the truncating `cellText` (200-byte cap), so a hostile server response cannot flood the CLI output.
+- **Warn the lead when a resume re-clone destroyed the tree ([#543](https://github.com/vtmocanu/uzi/pull/543), issue [#222](https://github.com/vtmocanu/uzi/pull/222)).**
+  On a resumed run whose re-clone rebuilt the working tree, the first implement turn now warns the lead that a queued follow-up written against the old tree may not reflect surviving work, so a stale steer input is not acted on as if that work were present.
 
 ### Internal
 
-- **Web suite flake fix ([#545](https://github.com/vtmocanu/uzi/pull/545), issue [#227](https://github.com/vtmocanu/uzi/pull/227)).** The JudgePanel poll-cap tests no longer drive a 149-turn timer chain (the cap is now an injectable prop), removing the per-test timeout bumps and the CI-contention flake without loosening coverage.
+- **Web suite flake fix ([#545](https://github.com/vtmocanu/uzi/pull/545), issue [#227](https://github.com/vtmocanu/uzi/pull/227)).**
+  The JudgePanel poll-cap tests no longer drive a 149-turn timer chain (the cap is now an injectable prop), removing the per-test timeout bumps and the CI-contention flake without loosening coverage.
 
 ## [0.51.0] - 2026-08-21
 <!-- release-title: capability-aware scheduling, wait-on-limit on by default, live runs list -->
 
 ### Added
 
-- **Capability-aware run scheduling and plan gate ([#510](https://github.com/vtmocanu/uzi/pull/510), [#523](https://github.com/vtmocanu/uzi/pull/523), PRD #84).** Runs now carry a required-capability set ({docker, jvm}) inferred at plan time, and repos carry a static hint; both the worker-claim predicate and an authoritative approval-gate check route a run only to a worker whose effective capabilities satisfy it. A queued run with no eligible worker surfaces a capability-specific health reason instead of the generic "waiting for a worker", the plan-approval gate shows met/unmet capability chips with a "run without <caps>" override, and `uzi run get` prints the requirement rows. Gated by a `capability_aware_scheduling` admin kill-switch (default on).
-- **Contextual in-app documentation links ([#497](https://github.com/vtmocanu/uzi/pull/497), PRD #57).** Settings, management, and admin surfaces now link directly to their in-app guide, via a shared DocLink component and a slug registry.
-- **Per-repo Setup indicator ([#508](https://github.com/vtmocanu/uzi/pull/508), PRD #361).** The Repos page shows a Setup chip and popover for a repo that is not yet Docker-allowlisted, and a run queued behind that restriction now surfaces the specific reason.
-- **Live-updating runs list ([#522](https://github.com/vtmocanu/uzi/pull/522), PRD #518).** The /runs list refreshes on its own while the tab is visible instead of needing a manual browser reload.
-- **`uzi review file`: file judge recommendations from the CLI ([#504](https://github.com/vtmocanu/uzi/pull/504), [#507](https://github.com/vtmocanu/uzi/pull/507), PRD #365).** A new CLI command files a judge recommendation as a forge issue or a run finding; the underlying file/dismiss endpoints move to Bearer-capable `RequireUser` auth.
-- **TUI: clickable issue link and rate-limit meters ([#528](https://github.com/vtmocanu/uzi/pull/528)).** The factory-floor board and the run-detail header render the forge issue id as an OSC-8 hyperlink (plain text under NO_COLOR/Ascii terminals), and the board shows the viewer's own Anthropic 5h/7d rate-limit meters, mirroring the web sidebar.
+- **Capability-aware run scheduling and plan gate ([#510](https://github.com/vtmocanu/uzi/pull/510), [#523](https://github.com/vtmocanu/uzi/pull/523), PRD #84).**
+  Runs now carry a required-capability set ({docker, jvm}) inferred at plan time, and repos carry a static hint; both the worker-claim predicate and an authoritative approval-gate check route a run only to a worker whose effective capabilities satisfy it. A queued run with no eligible worker surfaces a capability-specific health reason instead of the generic "waiting for a worker", the plan-approval gate shows met/unmet capability chips with a "run without <caps>" override, and `uzi run get` prints the requirement rows. Gated by a `capability_aware_scheduling` admin kill-switch (default on).
+- **Contextual in-app documentation links ([#497](https://github.com/vtmocanu/uzi/pull/497), PRD #57).**
+  Settings, management, and admin surfaces now link directly to their in-app guide, via a shared DocLink component and a slug registry.
+- **Per-repo Setup indicator ([#508](https://github.com/vtmocanu/uzi/pull/508), PRD #361).**
+  The Repos page shows a Setup chip and popover for a repo that is not yet Docker-allowlisted, and a run queued behind that restriction now surfaces the specific reason.
+- **Live-updating runs list ([#522](https://github.com/vtmocanu/uzi/pull/522), PRD #518).**
+  The /runs list refreshes on its own while the tab is visible instead of needing a manual browser reload.
+- **`uzi review file`: file judge recommendations from the CLI ([#504](https://github.com/vtmocanu/uzi/pull/504), [#507](https://github.com/vtmocanu/uzi/pull/507), PRD #365).**
+  A new CLI command files a judge recommendation as a forge issue or a run finding; the underlying file/dismiss endpoints move to Bearer-capable `RequireUser` auth.
+- **TUI: clickable issue link and rate-limit meters ([#528](https://github.com/vtmocanu/uzi/pull/528)).**
+  The factory-floor board and the run-detail header render the forge issue id as an OSC-8 hyperlink (plain text under NO_COLOR/Ascii terminals), and the board shows the viewer's own Anthropic 5h/7d rate-limit meters, mirroring the web sidebar.
 
 ### Changed
 
-- **wait-on-limit now defaults ON ([#526](https://github.com/vtmocanu/uzi/pull/526), [#520](https://github.com/vtmocanu/uzi/pull/520)).** New and existing users default to parking-and-resuming a run that hits an Anthropic usage limit instead of failing it; judge runs still never park. The change is a one-way backfill via migration.
-- **Lead agent run-context guidance ([#511](https://github.com/vtmocanu/uzi/pull/511), PRD #501).** The builtin `lead` template and the autopilot plan prompts now tell the lead three things it previously learned too late: (A) the Bash working directory persists across tool calls and the run starts at the worktree root, so relative-path greps and `cd`s should use absolute paths or re-`cd` from root (generalized from the integration-gate-only note); (B) on an autopilot run (no human in the loop) it is told up front, at planning time, to resolve open decisions on best judgment and record the assumption rather than spending an `ask_user` round-trip; and (C) any commit landing after a clean review, including the lead's own edits, re-opens a read-only validator wave over the new range before the run is signalled done.
-- **Cancel/reject steering reason is now captured ([#521](https://github.com/vtmocanu/uzi/pull/521), PRD #503).** `uzi run reject` now requires a reason (pass `-m`, or pipe it on stdin) instead of accepting an empty one, and the reason is persisted as the run's `failure_reason` on every reject path (it was previously dropped and replaced by a hardcoded "plan rejected" on the server-side path). `uzi run cancel` gains an optional `-m/--message`, stored on the run in a new nullable `runs.stop_reason` column on both cancel paths.
-- **`submit_plan` names the `plan_md` key ([#515](https://github.com/vtmocanu/uzi/pull/515), [#502](https://github.com/vtmocanu/uzi/pull/502)).** The plan-submission tool schema and description now name the markdown key explicitly.
-- **Dependency majors:** `@anthropic-ai/claude-agent-sdk` ([#493](https://github.com/vtmocanu/uzi/pull/493)), `golang.org/x/mod` ([#494](https://github.com/vtmocanu/uzi/pull/494)), and the Babel monorepo ([#495](https://github.com/vtmocanu/uzi/pull/495)).
+- **wait-on-limit now defaults ON ([#526](https://github.com/vtmocanu/uzi/pull/526), [#520](https://github.com/vtmocanu/uzi/pull/520)).**
+  New and existing users default to parking-and-resuming a run that hits an Anthropic usage limit instead of failing it; judge runs still never park. The change is a one-way backfill via migration.
+- **Lead agent run-context guidance ([#511](https://github.com/vtmocanu/uzi/pull/511), PRD #501).**
+  The builtin `lead` template and the autopilot plan prompts now tell the lead three things it previously learned too late: (A) the Bash working directory persists across tool calls and the run starts at the worktree root, so relative-path greps and `cd`s should use absolute paths or re-`cd` from root (generalized from the integration-gate-only note); (B) on an autopilot run (no human in the loop) it is told up front, at planning time, to resolve open decisions on best judgment and record the assumption rather than spending an `ask_user` round-trip; and (C) any commit landing after a clean review, including the lead's own edits, re-opens a read-only validator wave over the new range before the run is signalled done.
+- **Cancel/reject steering reason is now captured ([#521](https://github.com/vtmocanu/uzi/pull/521), PRD #503).**
+  `uzi run reject` now requires a reason (pass `-m`, or pipe it on stdin) instead of accepting an empty one, and the reason is persisted as the run's `failure_reason` on every reject path (it was previously dropped and replaced by a hardcoded "plan rejected" on the server-side path). `uzi run cancel` gains an optional `-m/--message`, stored on the run in a new nullable `runs.stop_reason` column on both cancel paths.
+- **`submit_plan` names the `plan_md` key ([#515](https://github.com/vtmocanu/uzi/pull/515), [#502](https://github.com/vtmocanu/uzi/pull/502)).**
+  The plan-submission tool schema and description now name the markdown key explicitly.
+- **Dependency majors:**
+  `@anthropic-ai/claude-agent-sdk` ([#493](https://github.com/vtmocanu/uzi/pull/493)), `golang.org/x/mod` ([#494](https://github.com/vtmocanu/uzi/pull/494)), and the Babel monorepo ([#495](https://github.com/vtmocanu/uzi/pull/495)).
 
 ### Fixed
 
-- **Operator cancellations are no longer classified as agent failures or judged ([#521](https://github.com/vtmocanu/uzi/pull/521), PRD #503).** A run cancelled or plan-rejected while a live worker held it used to end `failed` with `fail_origin='agent_failure'`, so an operator cancellation was judged and blamed on the agent (polluting per-agent reliability signal). A live cancel now ends `cancelled` (and is never judged), and a live plan-rejection carries `fail_origin='plan_rejected'`, both matching the existing server-side paths.
-- **Card issue-ref anchors ([#491](https://github.com/vtmocanu/uzi/pull/491), PRD #411).** Issue-ref links on run cards and the needs-attention strip are now valid sibling anchors, with restored badge tooltips and distinct link names under the stretched-link overlay.
-- **GitHub Projects sync cleanup ([#489](https://github.com/vtmocanu/uzi/pull/489), PRD #364).** Dropped an orphan `ListGithubProjectSyncedRepos` query and a redundant clear on the forward-move item-missing branch.
-- **Judge pre-scan false positives on repo shell functions ([#513](https://github.com/vtmocanu/uzi/pull/513)).** The command-not-found pre-scan no longer flags a repo's own shell functions (anchored to column-0 or a `;&|` boundary, excluding indented methods and IIFEs).
+- **Operator cancellations are no longer classified as agent failures or judged ([#521](https://github.com/vtmocanu/uzi/pull/521), PRD #503).**
+  A run cancelled or plan-rejected while a live worker held it used to end `failed` with `fail_origin='agent_failure'`, so an operator cancellation was judged and blamed on the agent (polluting per-agent reliability signal). A live cancel now ends `cancelled` (and is never judged), and a live plan-rejection carries `fail_origin='plan_rejected'`, both matching the existing server-side paths.
+- **Card issue-ref anchors ([#491](https://github.com/vtmocanu/uzi/pull/491), PRD #411).**
+  Issue-ref links on run cards and the needs-attention strip are now valid sibling anchors, with restored badge tooltips and distinct link names under the stretched-link overlay.
+- **GitHub Projects sync cleanup ([#489](https://github.com/vtmocanu/uzi/pull/489), PRD #364).**
+  Dropped an orphan `ListGithubProjectSyncedRepos` query and a redundant clear on the forward-move item-missing branch.
+- **Judge pre-scan false positives on repo shell functions ([#513](https://github.com/vtmocanu/uzi/pull/513)).**
+  The command-not-found pre-scan no longer flags a repo's own shell functions (anchored to column-0 or a `;&|` boundary, excluding indented methods and IIFEs).
 
 ### Internal
 
-- **Run-liveness sweep interval is now configurable ([#506](https://github.com/vtmocanu/uzi/pull/506), PRD #97).** A `SWEEP_INTERVAL` knob for the run-liveness sweeper, plus e2e-suite speedups.
-- **Two `gate:repo` structural checks ([#514](https://github.com/vtmocanu/uzi/pull/514), PRD #500):** migration-number collision and binary/control-byte text-file detection.
-- **Dev-team/product role-parity nudge ([#490](https://github.com/vtmocanu/uzi/pull/490)).** A non-gating nudge reporting any role present on one roster and absent from the other.
+- **Run-liveness sweep interval is now configurable ([#506](https://github.com/vtmocanu/uzi/pull/506), PRD #97).**
+  A `SWEEP_INTERVAL` knob for the run-liveness sweeper, plus e2e-suite speedups.
+- **Two `gate:repo` structural checks ([#514](https://github.com/vtmocanu/uzi/pull/514), PRD #500):**
+  migration-number collision and binary/control-byte text-file detection.
+- **Dev-team/product role-parity nudge ([#490](https://github.com/vtmocanu/uzi/pull/490)).**
+  A non-gating nudge reporting any role present on one roster and absent from the other.
 
 ## [0.50.0] - 2026-08-21
 <!-- release-title: board + Projects v2 sync, worker fleet roll, dependency majors -->
