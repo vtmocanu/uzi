@@ -18,6 +18,14 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.55.1] - 2026-08-22
+<!-- release-title: forge read tools reach the fact-checker -->
+
+### Fixed
+
+- **Forge read tools (`mcp__forge__*`) now reach the fact-checker subagent ([#583](https://github.com/vtmocanu/uzi/pull/583), issue [#581](https://github.com/vtmocanu/uzi/pull/581)).**
+  The run-lane forge read tools shipped in PRD #158 only worked from the lead session; the fact-checker, the one agent granted them, got "No such tool available" because the SDK exposes the top-level in-process MCP server map to the lead only. Each allowlisted subagent that names a forge or findings tool now receives the in-process server by reference through its AgentDefinition.mcpServers, so the fact-checker can verify a claim against live forge issue, MR and CI state instead of the repo's own restatement of it.
+
 ## [0.55.0] - 2026-08-22
 <!-- release-title: GitHub Projects sync adopt-first UX + safe column auto-create -->
 
@@ -3117,7 +3125,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.55.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.55.1...HEAD
+[0.55.1]: https://github.com/vtmocanu/uzi/compare/v0.55.0...v0.55.1
 [0.55.0]: https://github.com/vtmocanu/uzi/compare/v0.54.0...v0.55.0
 [0.54.0]: https://github.com/vtmocanu/uzi/compare/v0.53.1...v0.54.0
 [0.53.1]: https://github.com/vtmocanu/uzi/compare/v0.53.0...v0.53.1

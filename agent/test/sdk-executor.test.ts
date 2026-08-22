@@ -558,6 +558,35 @@ describe("SdkExecutor agent selection at the gate boundary (PRD #37)", () => {
     assert.deepStrictEqual(Object.keys(trimmed[1]!.options.agents ?? {}), ["coder"]);
   });
 
+  it("issue #581: mcpServers survives planTurnSubagents onto the PLAN turn's options.agents", async () => {
+    // End-to-end guard: toDefinition wires def.mcpServers for a forge-granted subagent,
+    // and the plan-turn write-strip (planTurnSubagents) + selection must NOT drop it on
+    // the way into options.agents. A fact-checker-shaped own template (read-only, so it
+    // survives the plan turn) carries the six mcp__forge__* read tools; the plan turn's
+    // options.agents["fact-checker"].mcpServers must still name "forge".
+    const factChecker: AgentTemplate = {
+      name: "fact-checker",
+      description: "verifies claims",
+      prompt_body: "You verify claims.",
+      tools: [
+        "Read",
+        "Grep",
+        "mcp__forge__get_issue",
+        "mcp__forge__list_issues",
+        "mcp__forge__get_merge_request",
+        "mcp__forge__get_pipeline_jobs",
+        "mcp__forge__latest_pipeline",
+        "mcp__forge__list_issue_label_events",
+      ],
+    };
+    const { turns } = await runWith({ agents: [lead, coder, reviewer, factChecker] }, approveWith("own"));
+    const plan = turns[0]!.options;
+    assert.ok(
+      plan.agents!["fact-checker"]!.mcpServers?.includes("forge"),
+      `fact-checker must keep its forge mcpServers on the plan turn: ${JSON.stringify(plan.agents!["fact-checker"]!.mcpServers)}`,
+    );
+  });
+
   it("a malformed selection resolves to own, never the repo source", async () => {
     const verdict: PlanVerdict = { kind: "approve", selection: { status: "invalid" } };
     const { turns, probe, result } = await runWith({ repoAgents: [repoCoder, repoAuditor] }, verdict);

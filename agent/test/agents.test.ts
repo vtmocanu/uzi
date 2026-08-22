@@ -12,7 +12,10 @@ import {
   subagentCanWrite,
   subagentWriteCapabilities,
 } from "../src/agents.js";
-import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
+import { reportIncidentalIssueToolName, FINDINGS_SERVER_NAME } from "../src/findings-tools.js";
+import { FORGE_SERVER_NAME } from "../src/forge-tools.js";
+import { MEMORY_SERVER_NAME } from "../src/memory-tools.js";
+import { SIGNAL_SERVER_NAME } from "../src/signals.js";
 import { FINDINGS_NUDGE_APPEND } from "../src/prompt.js";
 import type { AgentTemplate } from "../src/protocol.js";
 
@@ -197,6 +200,124 @@ describe("subagentsFromTemplates (PRD #37 repo source)", () => {
     const inherit = subagentsFromTemplates([repoAuditor], new Set());
     assert.strictEqual(inherit.auditor!.tools, undefined, "inherit-all is not materialized into an allowlist");
     assert.strictEqual(inherit.auditor!.prompt, withNudge("audit body"), "inherit-all subagent's prompt still carries the nudge");
+  });
+});
+
+describe("issue #581: in-process MCP server wiring for subagents", () => {
+  // toDefinition derives def.mcpServers (SDK string-reference form) from the RESOLVED
+  // tools allowlist: for the servers ["forge","findings"] in that order, it names the
+  // server when any allowlist entry starts with `mcp__${server}__`. It runs AFTER the
+  // findings-tool append, so any non-empty allowlist already carries the findings tool
+  // and therefore always wires the findings server. This is the ONLY thing that lets an
+  // allowlisted subagent reach an in-process MCP server registered on options.mcpServers.
+
+  // Parse a builtin's frontmatter `tools:` line exactly as the spec prescribes: the line
+  // starting with `tools:`, minus the prefix, split on `,`, each trimmed, empties dropped.
+  const parseToolsLine = (raw: string): string[] => {
+    const line = raw.split("\n").find((l) => l.startsWith("tools:"));
+    assert.ok(line, "builtin must declare a tools: line in its frontmatter");
+    return line!
+      .slice("tools:".length)
+      .split(",")
+      .map((t) => t.trim())
+      .filter((t) => t.length > 0);
+  };
+
+  const factCheckerPath = join(
+    import.meta.dirname,
+    "..",
+    "..",
+    "api",
+    "internal",
+    "agenttmpl",
+    "builtins",
+    "fact-checker.md",
+  );
+  const factCheckerTools = parseToolsLine(readFileSync(factCheckerPath, "utf8"));
+  const factChecker: AgentTemplate = {
+    name: "fact-checker",
+    description: "verifies claims",
+    prompt_body: "You verify claims.",
+    tools: factCheckerTools,
+    model: null,
+  };
+
+  it("the real fact-checker builtin resolves to mcpServers ['forge','findings'] in deterministic order", () => {
+    // Anchor to the shipped builtin so the test breaks if it ever drops the forge grant:
+    // the fact-checker is the whole reason this wiring exists (issue #581).
+    assert.ok(
+      factCheckerTools.some((t) => t.startsWith("mcp__forge__")),
+      "the shipped fact-checker must still grant at least one mcp__forge__* tool",
+    );
+    const { subagents } = assembleAgents([factChecker]);
+    // forge is named because the allowlist has mcp__forge__* tools; findings is named
+    // because toDefinition appended the findings tool before deriving this list. The
+    // order is the loop's fixed [forge, findings], not the allowlist's order.
+    assert.deepStrictEqual(subagents["fact-checker"]?.mcpServers, [FORGE_SERVER_NAME, FINDINGS_SERVER_NAME]);
+    assert.deepStrictEqual(subagents["fact-checker"]?.mcpServers, ["forge", "findings"]);
+  });
+
+  it("a read-only role granted NO forge tool wires only the findings server", () => {
+    // reviewer declares Read/Grep/Glob — no mcp__forge__* — so forge is NOT named, but
+    // the findings tool appended to every non-empty allowlist wires the findings server.
+    const { subagents } = assembleAgents([reviewer]);
+    assert.deepStrictEqual(subagents.reviewer?.mcpServers, [FINDINGS_SERVER_NAME]);
+  });
+
+  it("an inherit-all subagent (null/[]/undefined tools) leaves mcpServers UNSET", () => {
+    // Inherit-all subagents get no allowlist, so toDefinition never derives mcpServers —
+    // the top-level options.mcpServers already reaches them via the lead session path.
+    for (const tools of [null, [] as string[], undefined]) {
+      const { subagents } = assembleAgents([{ ...coder, tools }]);
+      assert.strictEqual(subagents.coder?.mcpServers, undefined);
+    }
+  });
+
+  it("never wires the memory or signal servers, even when a template names their tools", () => {
+    // memory/signal are server-DENIED to every subagent (MEMORY_SERVER_DENY /
+    // SIGNAL_SERVER_DENY); the wiring loop is deliberately limited to the hardcoded
+    // [forge, findings] set — it does NOT naively name every `mcp__<server>__` prefix in
+    // the allowlist. A fixture that explicitly lists mcp__memory__* / mcp__uzi__* tools is
+    // what makes this a real guard: widening the loop to derive from those prefixes would
+    // redden it. (Those tools stay non-callable via the server-level deny regardless.)
+    const namesDeniedServers: AgentTemplate = {
+      name: "greedy",
+      description: "names denied servers in its allowlist",
+      prompt_body: "greedy",
+      tools: ["Read", "mcp__memory__save_memory", "mcp__uzi__submit_plan", "mcp__forge__get_issue"],
+    };
+    const { subagents } = assembleAgents([coder, reviewer, factChecker, namesDeniedServers]);
+    // The greedy fixture names memory + signal tools AND a forge tool: forge is wired,
+    // findings is wired (appended tool), memory/signal are NOT — despite being named.
+    assert.deepStrictEqual(subagents.greedy?.mcpServers, [FORGE_SERVER_NAME, FINDINGS_SERVER_NAME]);
+    for (const [name, def] of Object.entries(subagents)) {
+      if (!def.mcpServers) continue;
+      assert.ok(!def.mcpServers.includes(MEMORY_SERVER_NAME), `${name} must not wire the memory server`);
+      assert.ok(!def.mcpServers.includes(SIGNAL_SERVER_NAME), `${name} must not wire the signal server`);
+      // Positively: the only servers ever wired are forge and findings.
+      for (const s of def.mcpServers) {
+        assert.ok(
+          s === FORGE_SERVER_NAME || s === FINDINGS_SERVER_NAME,
+          `${name} wired an unexpected server ${s}`,
+        );
+      }
+    }
+  });
+
+  it("the repo-source path derives the same wiring (also flows through toDefinition)", () => {
+    // Acknowledged, plan-approved: subagentsFromTemplates (repo path) also derives
+    // mcpServers, so a repo agent naming a mcp__forge__* tool reaches the forge server.
+    const factCheckerRepoTemplate: AgentTemplate = {
+      name: "fact-checker",
+      description: "repo fact-checker",
+      prompt_body: "REPO FACT CHECKER",
+      tools: ["Read", "Grep", "mcp__forge__get_issue"],
+    };
+    const subagents = subagentsFromTemplates([factCheckerRepoTemplate], new Set());
+    assert.ok(
+      subagents["fact-checker"]?.mcpServers?.includes(FORGE_SERVER_NAME),
+      "a repo agent naming a mcp__forge__* tool wires the forge server",
+    );
   });
 });
 

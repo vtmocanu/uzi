@@ -1,10 +1,16 @@
 # PRD #111: Auto-select the Anthropic token per run by rate-limit headroom, and record which token each run used
 
 **GitLab Issue**: [#111](https://github.com/vtmocanu/uzi/-/issues/111)
-**Status**: **DONE — merged 2026-07-27 (MR !139), with one success criterion UNMET** (created
-2026-07-22; implemented 2026-07-27 on `feature/prd-111-auto-select-token`). The unmet criterion is
-the dev-cluster k8s validation, deferred by user decision and tracked as **issue #168** — see
-"Status at PR time" at the foot of this file for why the compose e2e does not substitute for it.
+**Status**: **DONE — merged 2026-07-27 (MR !139); the one deferred success criterion (dev-cluster
+k8s validation) was VALIDATED 2026-08-22 and issue #168 closed** (created 2026-07-22; implemented
+2026-07-27 on `feature/prd-111-auto-select-token`). That criterion (the dev-cluster hosted-worker
+validation) was deferred by user decision and tracked as **issue #168**; it was met by ~3 weeks of
+real dev-02 usage rather than a one-off spend. A read-only DB check confirmed all four assertions:
+227/229 `auto` runs claimed on `kind=hosted` workers, 31 concurrent auto-run pairs landed on
+different tokens (in-flight bias), headroom 15–100% recorded against a live poller gauge (no
+seeding), and the `pool_stale` (7×) and `best_of_pool` (15×) fallbacks fired for real. Evidence in
+the [#168 close comment](https://github.com/vtmocanu/uzi/issues/168#issuecomment-5381295684); see
+"Status at PR time" at the foot of this file for why the compose e2e did not substitute for it.
 Other follow-ups from this PRD: **#169** (user-authored names in admin terminals), **#170**
 (`check-styles`), **#171** (the live-DB harness's Postgres wait).
 **Priority**: Medium
@@ -541,6 +547,9 @@ M1–M7 are implemented and gated. Two things a reader needs that the milestone 
 above does not say.
 
 ### The k8s validation is UNMET, not narrowed
+
+> **Resolved 2026-08-22:** this was validated on dev-02 and issue #168 was closed — see the file
+> header for the evidence. The snapshot below is preserved verbatim as the state *at PR time*.
 
 "the auto path validated on dev-cluster hosted workers" is a success criterion and it
 did not happen. It is deferred to a follow-up issue rather than dropped, because three
