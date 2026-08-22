@@ -45,6 +45,19 @@ type fakeProjectSync struct {
 	status      forgesvc.ProjectSyncStatus
 	statusErr   error
 	statusCalls int
+
+	// PRD #557 board-access methods: record args + scripted err, mirroring above.
+	visibilityReturn   bool
+	visibilityErr      error
+	visibilityCalls    int
+	setVisibilityErr   error
+	gotPublic          bool
+	setVisibilityCalls int
+	shareErr           error
+	unshareErr         error
+	gotUsername        string
+	shareCalls         int
+	unshareCalls       int
 }
 
 func (f *fakeProjectSync) Adopt(_ context.Context, repoID uuid.UUID, number int, kind forge.ProjectV2OwnerKind) error {
@@ -75,6 +88,30 @@ func (f *fakeProjectSync) ProjectSyncStatus(_ context.Context, repoID uuid.UUID)
 	f.statusCalls++
 	f.gotRepoID = repoID
 	return f.status, f.statusErr
+}
+
+func (f *fakeProjectSync) GetVisibility(_ context.Context, repoID uuid.UUID) (bool, error) {
+	f.visibilityCalls++
+	f.gotRepoID = repoID
+	return f.visibilityReturn, f.visibilityErr
+}
+
+func (f *fakeProjectSync) SetVisibility(_ context.Context, repoID uuid.UUID, public bool) error {
+	f.setVisibilityCalls++
+	f.gotRepoID, f.gotPublic = repoID, public
+	return f.setVisibilityErr
+}
+
+func (f *fakeProjectSync) ShareWithUser(_ context.Context, repoID uuid.UUID, username string) error {
+	f.shareCalls++
+	f.gotRepoID, f.gotUsername = repoID, username
+	return f.shareErr
+}
+
+func (f *fakeProjectSync) Unshare(_ context.Context, repoID uuid.UUID, username string) error {
+	f.unshareCalls++
+	f.gotRepoID, f.gotUsername = repoID, username
+	return f.unshareErr
 }
 
 // postAdopt drives AdoptGithubProjectSync with an admin actor and the given repo id
@@ -446,3 +483,200 @@ var errAny = errAnyErr{}
 type errAnyErr struct{}
 
 func (errAnyErr) Error() string { return "boom" }
+
+// driveBoardAccess drives one of the four PRD #557 board-access handlers with an admin
+// actor, the given repo id, method + path, and raw body.
+func driveBoardAccess(t *testing.T, hfn http.HandlerFunc, repoID, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	admin := store.User{ID: uuid.New(), IsAdmin: true}
+	r := httptest.NewRequest(method, path, bytes.NewReader([]byte(body)))
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", repoID)
+	r = r.WithContext(context.WithValue(mw.ContextWithUser(r.Context(), admin), chi.RouteCtxKey, rctx))
+	w := httptest.NewRecorder()
+	hfn(w, r)
+	return w
+}
+
+// TestGetVisibilityRoute: the GET visibility route delegates and renders {"public":...}.
+func TestGetVisibilityRoute(t *testing.T) {
+	sync := &fakeProjectSync{visibilityReturn: true}
+	h := &Handler{projectSync: sync}
+	repoID := uuid.New()
+	w := driveBoardAccess(t, h.GetGithubProjectVisibility, repoID.String(), http.MethodGet, "/repos/x/github-project-sync/visibility", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if sync.visibilityCalls != 1 || sync.gotRepoID != repoID {
+		t.Errorf("GetVisibility not delegated with the path repo id: calls=%d id=%v", sync.visibilityCalls, sync.gotRepoID)
+	}
+	var body struct {
+		Public bool `json:"public"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response not JSON: %v", err)
+	}
+	if !body.Public {
+		t.Errorf("public = %v, want true", body.Public)
+	}
+}
+
+// TestSetVisibilityRoute: PUT {"public":false} delegates the flag and echoes it back.
+func TestSetVisibilityRoute(t *testing.T) {
+	sync := &fakeProjectSync{}
+	h := &Handler{projectSync: sync}
+	repoID := uuid.New()
+	w := driveBoardAccess(t, h.SetGithubProjectVisibility, repoID.String(), http.MethodPut, "/repos/x/github-project-sync/visibility", `{"public":false}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if sync.setVisibilityCalls != 1 {
+		t.Fatalf("want 1 SetVisibility call, got %d", sync.setVisibilityCalls)
+	}
+	if sync.gotPublic {
+		t.Errorf("gotPublic = %v, want false", sync.gotPublic)
+	}
+	if sync.gotRepoID != repoID {
+		t.Errorf("repo id = %v, want %v (must come from the path)", sync.gotRepoID, repoID)
+	}
+	var body struct {
+		Public bool `json:"public"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response not JSON: %v", err)
+	}
+	if body.Public {
+		t.Errorf("echoed public = %v, want false", body.Public)
+	}
+}
+
+// TestShareRoute: POST {"username":"octocat"} grants Reader and returns 204.
+func TestShareRoute(t *testing.T) {
+	sync := &fakeProjectSync{}
+	h := &Handler{projectSync: sync}
+	repoID := uuid.New()
+	w := driveBoardAccess(t, h.ShareGithubProjectSync, repoID.String(), http.MethodPost, "/repos/x/github-project-sync/collaborators", `{"username":"octocat"}`)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", w.Code)
+	}
+	if sync.shareCalls != 1 || sync.gotUsername != "octocat" {
+		t.Errorf("ShareWithUser not delegated: calls=%d username=%q", sync.shareCalls, sync.gotUsername)
+	}
+	if sync.gotRepoID != repoID {
+		t.Errorf("repo id = %v, want %v (must come from the path)", sync.gotRepoID, repoID)
+	}
+}
+
+// TestUnshareRoute: DELETE {"username":"octocat"} revokes and returns 204 (a DELETE
+// with a JSON body is read fine by net/http + chi).
+func TestUnshareRoute(t *testing.T) {
+	sync := &fakeProjectSync{}
+	h := &Handler{projectSync: sync}
+	repoID := uuid.New()
+	w := driveBoardAccess(t, h.UnshareGithubProjectSync, repoID.String(), http.MethodDelete, "/repos/x/github-project-sync/collaborators", `{"username":"octocat"}`)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", w.Code)
+	}
+	if sync.unshareCalls != 1 || sync.gotUsername != "octocat" {
+		t.Errorf("Unshare not delegated: calls=%d username=%q", sync.unshareCalls, sync.gotUsername)
+	}
+}
+
+// TestCollaboratorEmptyUsername: an empty/blank username is a 400 on both share and
+// unshare, BEFORE the service is called.
+func TestCollaboratorEmptyUsername(t *testing.T) {
+	cases := []struct {
+		name   string
+		hfn    func(h *Handler) http.HandlerFunc
+		method string
+		body   string
+	}{
+		{"share empty", func(h *Handler) http.HandlerFunc { return h.ShareGithubProjectSync }, http.MethodPost, `{"username":""}`},
+		{"share whitespace", func(h *Handler) http.HandlerFunc { return h.ShareGithubProjectSync }, http.MethodPost, `{"username":"   "}`},
+		{"unshare empty", func(h *Handler) http.HandlerFunc { return h.UnshareGithubProjectSync }, http.MethodDelete, `{"username":""}`},
+		{"unshare whitespace", func(h *Handler) http.HandlerFunc { return h.UnshareGithubProjectSync }, http.MethodDelete, `{"username":"  "}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sync := &fakeProjectSync{}
+			h := &Handler{projectSync: sync}
+			w := driveBoardAccess(t, tc.hfn(h), uuid.New().String(), tc.method, "/repos/x/github-project-sync/collaborators", tc.body)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", w.Code)
+			}
+			if sync.shareCalls != 0 || sync.unshareCalls != 0 {
+				t.Errorf("service must not be called on an empty username: share=%d unshare=%d", sync.shareCalls, sync.unshareCalls)
+			}
+		})
+	}
+}
+
+// TestBoardAccessErrorMapping: each service sentinel maps to its documented status on
+// every new route, including the new ErrProjectSyncUserNotFound → 422 (asserted on the
+// share/unshare routes, where a bad username is the natural failure).
+func TestBoardAccessErrorMapping(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"disabled", forgesvc.ErrProjectSyncDisabled, http.StatusConflict},
+		{"not github", forgesvc.ErrProjectSyncNotGitHub, http.StatusUnprocessableEntity},
+		{"user not found", forgesvc.ErrProjectSyncUserNotFound, http.StatusUnprocessableEntity},
+		{"internal", errAny, http.StatusInternalServerError},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// GET visibility.
+			gv := &fakeProjectSync{visibilityErr: tc.err}
+			if w := driveBoardAccess(t, (&Handler{projectSync: gv}).GetGithubProjectVisibility, uuid.New().String(), http.MethodGet, "/repos/x/github-project-sync/visibility", ""); w.Code != tc.want {
+				t.Errorf("GET visibility err %v → %d, want %d", tc.err, w.Code, tc.want)
+			}
+			// PUT visibility.
+			sv := &fakeProjectSync{setVisibilityErr: tc.err}
+			if w := driveBoardAccess(t, (&Handler{projectSync: sv}).SetGithubProjectVisibility, uuid.New().String(), http.MethodPut, "/repos/x/github-project-sync/visibility", `{"public":true}`); w.Code != tc.want {
+				t.Errorf("PUT visibility err %v → %d, want %d", tc.err, w.Code, tc.want)
+			}
+			// POST collaborators (share).
+			sh := &fakeProjectSync{shareErr: tc.err}
+			shw := driveBoardAccess(t, (&Handler{projectSync: sh}).ShareGithubProjectSync, uuid.New().String(), http.MethodPost, "/repos/x/github-project-sync/collaborators", `{"username":"octocat"}`)
+			if shw.Code != tc.want {
+				t.Errorf("POST collaborators err %v → %d, want %d", tc.err, shw.Code, tc.want)
+			}
+			if tc.want == http.StatusInternalServerError && strings.Contains(shw.Body.String(), "boom") {
+				t.Errorf("500 body leaked the raw error text: %s", shw.Body.String())
+			}
+			// DELETE collaborators (unshare).
+			un := &fakeProjectSync{unshareErr: tc.err}
+			if w := driveBoardAccess(t, (&Handler{projectSync: un}).UnshareGithubProjectSync, uuid.New().String(), http.MethodDelete, "/repos/x/github-project-sync/collaborators", `{"username":"octocat"}`); w.Code != tc.want {
+				t.Errorf("DELETE collaborators err %v → %d, want %d", tc.err, w.Code, tc.want)
+			}
+		})
+	}
+}
+
+// TestBoardAccessServiceNotWired: a nil projectSync returns a clean 500 on every new
+// route rather than panics.
+func TestBoardAccessServiceNotWired(t *testing.T) {
+	cases := []struct {
+		name   string
+		hfn    func(h *Handler) http.HandlerFunc
+		method string
+		path   string
+		body   string
+	}{
+		{"get visibility", func(h *Handler) http.HandlerFunc { return h.GetGithubProjectVisibility }, http.MethodGet, "/repos/x/github-project-sync/visibility", ""},
+		{"put visibility", func(h *Handler) http.HandlerFunc { return h.SetGithubProjectVisibility }, http.MethodPut, "/repos/x/github-project-sync/visibility", `{"public":true}`},
+		{"share", func(h *Handler) http.HandlerFunc { return h.ShareGithubProjectSync }, http.MethodPost, "/repos/x/github-project-sync/collaborators", `{"username":"octocat"}`},
+		{"unshare", func(h *Handler) http.HandlerFunc { return h.UnshareGithubProjectSync }, http.MethodDelete, "/repos/x/github-project-sync/collaborators", `{"username":"octocat"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &Handler{}
+			w := driveBoardAccess(t, tc.hfn(h), uuid.New().String(), tc.method, tc.path, tc.body)
+			if w.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want 500", w.Code)
+			}
+		})
+	}
+}

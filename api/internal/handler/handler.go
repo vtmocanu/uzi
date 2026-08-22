@@ -165,6 +165,18 @@ type ProjectSyncer interface {
 	// ProjectSyncStatus reads a repo's link health for the GET status endpoint (M7).
 	// Returns pgx.ErrNoRows when the repo has no link, which the handler maps to 404.
 	ProjectSyncStatus(ctx context.Context, repoID uuid.UUID) (forgesvc.ProjectSyncStatus, error)
+	// GetVisibility reads the linked board's current public flag (PRD #557 M2/M3): a
+	// live forge round-trip, kept off the DB-only status endpoint (D4).
+	GetVisibility(ctx context.Context, repoID uuid.UUID) (bool, error)
+	// SetVisibility writes the linked board's public flag (PRD #557).
+	SetVisibility(ctx context.Context, repoID uuid.UUID, public bool) error
+	// ShareWithUser grants the named GitHub login Reader access to the linked board
+	// (PRD #557). Write-only: GitHub exposes no readable collaborator list, so the
+	// service grants but never enumerates. A non-existent login yields
+	// ErrProjectSyncUserNotFound (→ 422).
+	ShareWithUser(ctx context.Context, repoID uuid.UUID, username string) error
+	// Unshare revokes the named GitHub login's access to the linked board (PRD #557).
+	Unshare(ctx context.Context, repoID uuid.UUID, username string) error
 }
 
 // SetProjectSync wires the GitHub Projects v2 provisioning service in after
@@ -1069,6 +1081,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				r.Post("/{id}/github-project-sync", h.AdoptGithubProjectSync)
 				r.Post("/{id}/github-project-sync/provision", h.ProvisionGithubProjectSync)
 				r.Delete("/{id}/github-project-sync", h.DisableGithubProjectSync)
+				// Board access controls (PRD #557): read/flip the board's visibility, and
+				// grant/revoke Reader access by username. Same owner-or-admin preflight +
+				// instance-flag gate as the routes above.
+				r.Get("/{id}/github-project-sync/visibility", h.GetGithubProjectVisibility)
+				r.Put("/{id}/github-project-sync/visibility", h.SetGithubProjectVisibility)
+				r.Post("/{id}/github-project-sync/collaborators", h.ShareGithubProjectSync)
+				r.Delete("/{id}/github-project-sync/collaborators", h.UnshareGithubProjectSync)
 				// Per-repo tool profile (PRD #18 M4): the owner's tier-1 package list.
 				// Owner-only (a repo belongs to one user's connection).
 				r.Get("/{id}/tool-profile", h.GetRepoToolProfile)
