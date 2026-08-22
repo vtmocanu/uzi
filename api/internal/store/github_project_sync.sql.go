@@ -361,8 +361,8 @@ type UpsertGithubProjectLinkParams struct {
 // never becomes SQL NULL and violates the NOT NULL constraint; the same guard is
 // applied on both the INSERT and the conflict update.
 // done_option_id (PRD #584 M1) is the reserved "Done" projection option id (empty =
-// none) captured create-path-only; it is overwritten on the conflict update like every
-// other mutable column.
+// none) captured on link setup (create AND adopt paths); it is overwritten on the
+// conflict update like every other mutable column.
 func (q *Queries) UpsertGithubProjectLink(ctx context.Context, arg UpsertGithubProjectLinkParams) (GithubProjectLink, error) {
 	row := q.db.QueryRow(ctx, upsertGithubProjectLink,
 		arg.RepoID,

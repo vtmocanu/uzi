@@ -12,8 +12,8 @@
 -- never becomes SQL NULL and violates the NOT NULL constraint; the same guard is
 -- applied on both the INSERT and the conflict update.
 -- done_option_id (PRD #584 M1) is the reserved "Done" projection option id (empty =
--- none) captured create-path-only; it is overwritten on the conflict update like every
--- other mutable column.
+-- none) captured on link setup (create AND adopt paths); it is overwritten on the
+-- conflict update like every other mutable column.
 INSERT INTO github_project_links (
     repo_id, project_node_id, project_number, status_field_id, status_options, owned_by_uzi,
     unmatched_columns, done_option_id

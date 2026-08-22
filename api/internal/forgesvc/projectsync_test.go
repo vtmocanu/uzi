@@ -2109,3 +2109,104 @@ func TestAdoptAsyncSeedFailureStampsError(t *testing.T) {
 		t.Errorf("(c) a failed seed must not clear last_error, got %d", st.linkErrCleared)
 	}
 }
+
+// (seedItems re-seed, PRD #584 M2) A manual Adopt re-seed projects a CLOSED issue to the
+// reserved Done option: the item is ADDED (if missing) and Set to Done, and its marker is
+// persisted as Done. With NO Done option on the field the closed issue is SKIPPED (no add,
+// no Set) — the pre-M2 D1 behavior.
+//
+// Non-vacuity: revert seedItems' closed branch to the old unconditional `continue` and the
+// "Done option present" sub-case reds — the closed issue is neither added nor Set to Done.
+func TestSeedItemsClosedIssueProjectsToDone(t *testing.T) {
+	t.Run("field has a Done option: add + Set closed issue to Done", func(t *testing.T) {
+		repoID := uuid.New()
+		syncer := &fakeProjectSyncer{
+			fakeForge: &fakeForge{},
+			scopes:    []string{"repo", "project"},
+			slugOwner: "acme", slugRepo: "widgets",
+			project:    forge.ProjectV2Ref{ID: "PVT_1", Number: 7, Title: "Board"},
+			repoNodeID: "REPO_1",
+			fields: map[string]forge.ProjectV2StatusField{
+				"Status": {ID: "PVTSSF_1", Name: "Status", Options: []forge.ProjectV2Option{
+					{ID: "opt_ip", Name: "In Progress"},
+					{ID: "opt_done", Name: "Done"}, // reserved Done option already on the field
+				}},
+			},
+			live:      nil, // closed issue not on the board yet → added
+			issueNode: map[int]string{3: "content3"},
+		}
+		st := &fakeProjectStore{
+			repo:    githubRepoRow(repoID),
+			columns: []store.BoardColumn{{LabelName: "In Progress", Position: 1}}, // no "Done" board column
+			issues: []store.Issue{
+				{ForgeIssueIid: 3, State: "closed", Labels: labelsJSON(t, "In Progress")}, // → Done
+			},
+		}
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		svc.background = syncBackground
+
+		if err := svc.Adopt(context.Background(), repoID, 7, forge.OwnerUser); err != nil {
+			t.Fatalf("Adopt: %v", err)
+		}
+		// The link captured the field's existing Done option id.
+		if len(st.links) != 1 || st.links[0].DoneOptionID != "opt_done" {
+			t.Fatalf("want link done_option_id opt_done, got %+v", st.links)
+		}
+		// The closed issue was added once, then Set to Done.
+		if len(syncer.addCalls) != 1 || syncer.addCalls[0] != "content3" {
+			t.Errorf("want closed issue content3 added once, got %v", syncer.addCalls)
+		}
+		if len(syncer.setCalls) != 1 || syncer.setCalls[0].itemID != "item-content3" || syncer.setCalls[0].optionID != "opt_done" {
+			t.Errorf("want one Set item-content3->opt_done, got %v", syncer.setCalls)
+		}
+		// The persisted marker is Done.
+		if m := st.items[3].LastStatusOptionID; !m.Valid || m.String != "opt_done" {
+			t.Errorf("issue 3 marker = %+v, want opt_done", m)
+		}
+	})
+
+	t.Run("field has no Done option: closed issue skipped", func(t *testing.T) {
+		repoID := uuid.New()
+		syncer := &fakeProjectSyncer{
+			fakeForge: &fakeForge{},
+			scopes:    []string{"repo", "project"},
+			slugOwner: "acme", slugRepo: "widgets",
+			project:    forge.ProjectV2Ref{ID: "PVT_1", Number: 7, Title: "Board"},
+			repoNodeID: "REPO_1",
+			fields: map[string]forge.ProjectV2StatusField{
+				"Status": {ID: "PVTSSF_1", Name: "Status", Options: []forge.ProjectV2Option{
+					{ID: "opt_ip", Name: "In Progress"}, // no Done option
+				}},
+			},
+			issueNode: map[int]string{3: "content3"},
+		}
+		st := &fakeProjectStore{
+			repo:    githubRepoRow(repoID),
+			columns: []store.BoardColumn{{LabelName: "In Progress", Position: 1}},
+			issues: []store.Issue{
+				{ForgeIssueIid: 3, State: "closed", Labels: labelsJSON(t, "In Progress")}, // skipped
+			},
+		}
+		svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+		svc.background = syncBackground
+
+		if err := svc.Adopt(context.Background(), repoID, 7, forge.OwnerUser); err != nil {
+			t.Fatalf("Adopt: %v", err)
+		}
+		if len(st.links) != 1 || st.links[0].DoneOptionID != "" {
+			t.Fatalf("want empty done_option_id, got %+v", st.links)
+		}
+		// The closed issue is neither added nor Set, and has no persisted item.
+		for _, c := range syncer.addCalls {
+			if c == "content3" {
+				t.Errorf("closed issue must not be added when there is no Done option, got adds %v", syncer.addCalls)
+			}
+		}
+		if len(syncer.setCalls) != 0 {
+			t.Errorf("closed issue must not be Set when there is no Done option, got %v", syncer.setCalls)
+		}
+		if _, ok := st.items[3]; ok {
+			t.Errorf("closed issue must not persist an item when skipped, got %+v", st.items[3])
+		}
+	})
+}
