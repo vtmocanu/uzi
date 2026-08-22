@@ -139,9 +139,13 @@ side — nothing is guessed or silently dropped elsewhere.
 Two ways to fix it, both offered from the same panel:
 
 - **Add the matching Status option in GitHub, then click Resync.** Resync
-  re-runs Adopt against the already-linked board — it re-diffs every
-  column and issue, so it picks up anything you've since added or
-  renamed. It's idempotent, so it's safe to run any time.
+  re-reads the *same* field the link already points at — by its stored
+  field id, never by re-resolving the name — and re-maps your board
+  columns against that field's current options, so it picks up anything
+  you've since added there. It never switches fields: on a board synced
+  via uzi's own "uzi Status" field, Resync keeps using "uzi Status" and
+  will not fall back to the built-in Status. It's idempotent, so it's
+  safe to run any time.
 - **Auto-create the missing columns.** uzi creates its own fresh "uzi
   Status" field on the Project, containing every one of your board
   columns as an option, and points sync at that field instead. This never
@@ -151,6 +155,15 @@ Two ways to fix it, both offered from the same panel:
   Project ends up carrying **two** status-like fields (the original
   Status, and uzi's own "uzi Status"), since the old one is left alone
   rather than edited in place.
+
+  If a board's link was already mis-pointed back to the built-in Status
+  field by an older uzi version — the symptom is most columns showing as
+  unmatched/"won't sync" after a Resync, with sync writing to the wrong
+  field — re-running auto-create (or **Provision** on an org repo)
+  re-establishes the link to "uzi Status" and is the recommended way
+  back. A secondary, manual option: temporarily rename the built-in
+  Status field in GitHub, click Resync once, then rename it back — only
+  relevant on an uzi version old enough to still resolve by name.
 
 **After auto-create (or Provision), point the board view at "uzi Status".**
 Because "uzi Status" is a *separate* field, your GitHub board keeps grouping
