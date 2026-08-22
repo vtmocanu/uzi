@@ -2309,22 +2309,27 @@ pass "no forge write + no token spend for the follow_up path (MR count unchanged
 # Delivered follow_up is still readable on the now-terminal run (it lives in
 # run_user_inputs, not the composer's unmounted component state).
 #
-# Terminal status is `failed`, NOT `cancelled`: a cancel consumed by a LIVE worker
-# aborts the executor's AbortController with reason "run cancelled", and the runner
-# reports every aborted run as failed (runner.ts:348-353 — its terminal ladder is
-# completed|failed only). `cancelled` is exclusively the server-side no-poller path
-# (SubmitInput's hasLivePoller=false branch, used by the queued-run cancel phase
-# above). This run is at the gate with a live worker, so the cancel is enqueued and
-# worker-consumed → failed(run cancelled), deterministically. The failure_reason
-# assertion keeps this non-vacuous: it proves the run ended because of THIS cancel,
-# not a coincidental failure.
+# Terminal status is `cancelled`, NOT `failed` (PRD #503 M1, landed in #521): a cancel
+# consumed by a LIVE worker is reported as `failed`, but SetState's failed arm routes off
+# the run's already-stamped stop_kind='cancelled' to CancelRunByWorker — status
+# 'cancelled', fail_origin NULL, never judged — so an operator cancellation is no longer
+# misclassified as an agent failure. The server-side no-poller path (CancelRunServerSide,
+# used by the queued-run cancel phase above) converges on the SAME 'cancelled' status, so
+# this assertion no longer depends on which path the cancel takes.
+#
+# stop_kind keeps this non-vacuous: it is the server-stamped deliberate-stop signal
+# (PRD #33), so 'cancelled' proves the run ended because of THIS cancel, not a coincidental
+# failure (which would surface as status 'failed', caught by wait_status). The reason text
+# moved too: CancelRunByWorker touches neither failure_reason nor stop_reason, and this
+# cancel carries an empty body (no operator -m message), so there is no reason string to
+# assert — the old failure_reason="run cancelled" check would now be vacuously empty.
 apipost "/api/runs/$RUN_S/inputs" '{"kind":"cancel","body":""}' >/dev/null
-wait_status "$RUN_S" failed
-[ "$(apiget "/api/runs/$RUN_S" | jq -r '.run.failure_reason // empty')" = "run cancelled" ] \
-  || fail "a live-worker cancel must terminate the run as failed(reason=run cancelled), got reason='$(apiget "/api/runs/$RUN_S" | jq -r '.run.failure_reason // empty')'"
+wait_status "$RUN_S" cancelled
+[ "$(apiget "/api/runs/$RUN_S" | jq -r '.run.stop_kind // empty')" = "cancelled" ] \
+  || fail "a live-worker cancel must terminate the run as cancelled(stop_kind=cancelled), got status='$(apiget "/api/runs/$RUN_S" | jq -r '.run.status')' stop_kind='$(apiget "/api/runs/$RUN_S" | jq -r '.run.stop_kind // empty')'"
 [ "$(apiget "/api/runs/$RUN_S/inputs" | jq -r '.inputs[0].consumed_at')" != null ] \
   || fail "the delivered follow_up must remain readable (and Delivered) after the run goes terminal (B1 survive-terminal)"
-pass "steer queue survives terminal: the Delivered follow_up is still listed on the now-terminal (failed: run cancelled) run (B1)"
+pass "steer queue survives terminal: the Delivered follow_up is still listed on the now-terminal (cancelled) run (B1)"
 
 # =============================================================================
 # ⛔ DO NOT DROP — PRD #97 M4 guard list. ⛔
