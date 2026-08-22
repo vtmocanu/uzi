@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -523,30 +524,46 @@ func TestGetVisibilityRoute(t *testing.T) {
 
 // TestSetVisibilityRoute: PUT {"public":false} delegates the flag and echoes it back.
 func TestSetVisibilityRoute(t *testing.T) {
-	sync := &fakeProjectSync{}
-	h := &Handler{projectSync: sync}
-	repoID := uuid.New()
-	w := driveBoardAccess(t, h.SetGithubProjectVisibility, repoID.String(), http.MethodPut, "/repos/x/github-project-sync/visibility", `{"public":false}`)
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", w.Code)
+	// Drive both directions with the fake pre-seeded to the OPPOSITE of what is sent,
+	// so each case proves the handler overwrote the seed with the decoded flag — not
+	// a zero value, and not a value hardcoded in either direction (a single false→false
+	// send could not distinguish delegation from a hardcoded false).
+	cases := []struct {
+		name string
+		seed bool
+		send bool
+	}{
+		{"false-overwrites-seeded-true", true, false},
+		{"true-overwrites-seeded-false", false, true},
 	}
-	if sync.setVisibilityCalls != 1 {
-		t.Fatalf("want 1 SetVisibility call, got %d", sync.setVisibilityCalls)
-	}
-	if sync.gotPublic {
-		t.Errorf("gotPublic = %v, want false", sync.gotPublic)
-	}
-	if sync.gotRepoID != repoID {
-		t.Errorf("repo id = %v, want %v (must come from the path)", sync.gotRepoID, repoID)
-	}
-	var body struct {
-		Public bool `json:"public"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
-		t.Fatalf("response not JSON: %v", err)
-	}
-	if body.Public {
-		t.Errorf("echoed public = %v, want false", body.Public)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sync := &fakeProjectSync{gotPublic: tc.seed}
+			h := &Handler{projectSync: sync}
+			repoID := uuid.New()
+			w := driveBoardAccess(t, h.SetGithubProjectVisibility, repoID.String(), http.MethodPut, "/repos/x/github-project-sync/visibility", fmt.Sprintf(`{"public":%t}`, tc.send))
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", w.Code)
+			}
+			if sync.setVisibilityCalls != 1 {
+				t.Fatalf("want 1 SetVisibility call, got %d", sync.setVisibilityCalls)
+			}
+			if sync.gotPublic != tc.send {
+				t.Errorf("gotPublic = %v, want %v (the decoded flag, overwriting the %v seed)", sync.gotPublic, tc.send, tc.seed)
+			}
+			if sync.gotRepoID != repoID {
+				t.Errorf("repo id = %v, want %v (must come from the path)", sync.gotRepoID, repoID)
+			}
+			var body struct {
+				Public bool `json:"public"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatalf("response not JSON: %v", err)
+			}
+			if body.Public != tc.send {
+				t.Errorf("echoed public = %v, want %v", body.Public, tc.send)
+			}
+		})
 	}
 }
 
