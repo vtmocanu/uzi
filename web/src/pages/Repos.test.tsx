@@ -851,6 +851,28 @@ describe("Repos — Board access (PRD #557 M4)", () => {
     // The toggle stayed off — the failed PUT never flipped it.
     expect(within(panel).getByRole("switch", { name: "Board visibility" }).getAttribute("aria-checked")).toBe("false");
   });
+
+  it("clears the just-granted session list when the board is re-linked in place (disable re-enters loadSyncStatus, bypassing the panel-open reset)", async () => {
+    mockApi.shareProjectSync.mockResolvedValue(null);
+    mockApi.disableProjectSync.mockResolvedValue(null);
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Board access");
+
+    // Grant octocat → a session-scoped Revoke affordance appears.
+    fireEvent.change(within(panel).getByLabelText("Share with a GitHub user (Reader)"), {
+      target: { value: "octocat" },
+    });
+    fireEvent.click(within(panel).getByRole("button", { name: /Share \(Reader\)/ }));
+    await within(panel).findByRole("button", { name: /Revoke/ });
+
+    // Disable re-enters loadSyncStatus WITHOUT the panel-open reset effect. With the
+    // status mock still linked (a board re-linked in place), the readout returns — and
+    // the stale "granted this session" entry must NOT survive onto it, else its Revoke
+    // would fire against a board octocat was never granted on (PRD #557 review finding).
+    fireEvent.click(within(panel).getByRole("button", { name: /Disable sync/ }));
+    await waitFor(() => expect(mockApi.disableProjectSync).toHaveBeenCalledWith("repo-gh"));
+    await waitFor(() => expect(within(panel).queryByRole("button", { name: /Revoke/ })).toBeNull());
+  });
 });
 
 describe("Repos — Setup chip (PRD #361 M4)", () => {

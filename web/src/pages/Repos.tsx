@@ -139,6 +139,16 @@ export function Repos() {
   // the provision/adopt forms. Any other failure lands in syncError.
   const loadSyncStatus = useCallback(async (repoId: string) => {
     setSyncError("");
+    // Board-access state is per-board; reset it on every (re)load so state from a
+    // previously linked board never bleeds onto a re-linked one. provision/adopt/
+    // disable re-enter here WITHOUT the panel-open reset effect, so this — not that
+    // effect — is the single place that clears it (PRD #557 review).
+    setSyncPublic(null);
+    setSyncVisibilityError("");
+    setShareUsername("");
+    setSharedThisSession([]);
+    setShareError("");
+    setShareConfirmation("");
     setSyncLoading(true);
     try {
       const status = await api.getProjectSyncStatus(repoId);
@@ -179,13 +189,8 @@ export function Repos() {
     setProvisionTitle("");
     setAdoptOwnerKind("user");
     setAdoptProjectNumber("");
-    // Board-access resets, alongside the existing form resets (PRD #557).
-    setSyncPublic(null);
-    setSyncVisibilityError("");
-    setShareUsername("");
-    setSharedThisSession([]);
-    setShareError("");
-    setShareConfirmation("");
+    // Board-access state is reset inside loadSyncStatus (the single place that owns
+    // it, so provision/adopt/disable re-entries clear it too — PRD #557 review).
     loadSyncStatus(syncRepoId);
     syncPanelRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
   }, [syncRepoId, loadSyncStatus]);
