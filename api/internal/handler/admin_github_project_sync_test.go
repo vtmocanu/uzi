@@ -356,6 +356,40 @@ func TestStatusRouteReturnsFields(t *testing.T) {
 	}
 }
 
+// TestStatusRouteNoDoneOption (PRD #584 M4): the status body carries the no_done_option
+// wire flag straight from the service status — true when the synced Status field has no
+// "Done" option, and false (the JSON default) otherwise.
+func TestStatusRouteNoDoneOption(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		noDoneOption bool
+	}{
+		{"no done option", true},
+		{"has done option", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sync := &fakeProjectSync{status: forgesvc.ProjectSyncStatus{
+				ProjectNumber: 7,
+				NoDoneOption:  tc.noDoneOption,
+			}}
+			h := &Handler{projectSync: sync}
+			w := getStatus(t, h, uuid.New().String())
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", w.Code)
+			}
+			var body struct {
+				NoDoneOption bool `json:"no_done_option"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatalf("response not JSON: %v", err)
+			}
+			if body.NoDoneOption != tc.noDoneOption {
+				t.Errorf("no_done_option = %v, want %v", body.NoDoneOption, tc.noDoneOption)
+			}
+		})
+	}
+}
+
 // getOwnerType drives GetGithubProjectOwnerType with an admin actor and the given repo id.
 func getOwnerType(t *testing.T, h *Handler, repoID string) *httptest.ResponseRecorder {
 	t.Helper()

@@ -1308,6 +1308,39 @@ func TestProjectSyncStatusReturnsUnmatchedColumns(t *testing.T) {
 	}
 }
 
+// TestProjectSyncStatusReportsNoDoneOption (PRD #584 M4): the status DTO's NoDoneOption
+// is a pure store read of link.DoneOptionID — true when the linked Status field has no
+// reserved "Done" option (empty id), false when it has one. No forge call (D5).
+func TestProjectSyncStatusReportsNoDoneOption(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		doneOptionID string
+		wantNoDone   bool
+	}{
+		{"empty id => no Done option", "", true},
+		{"non-empty id => has Done option", "opt_done", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repoID := uuid.New()
+			st := &fakeProjectStore{
+				link: store.GithubProjectLink{
+					RepoID:        repoID,
+					ProjectNumber: 42,
+					DoneOptionID:  tc.doneOptionID,
+				},
+			}
+			svc := NewProjectSync(st, fakeForgeBuilder{}, fakeSyncSettings{enabled: true}, nil)
+			got, err := svc.ProjectSyncStatus(context.Background(), repoID)
+			if err != nil {
+				t.Fatalf("ProjectSyncStatus: %v", err)
+			}
+			if got.NoDoneOption != tc.wantNoDone {
+				t.Errorf("NoDoneOption = %v, want %v (done_option_id %q)", got.NoDoneOption, tc.wantNoDone, tc.doneOptionID)
+			}
+		})
+	}
+}
+
 // TestResyncReseedsAndRepersists (SC (c)): with a stored link, Resync re-seeds items
 // (seedItems ran — an item was added and set) and re-persists the link against the
 // STORED project coordinates (not any caller-supplied owner_kind/number), recomputing

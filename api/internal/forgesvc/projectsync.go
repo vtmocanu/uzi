@@ -1945,6 +1945,12 @@ type ProjectSyncStatus struct {
 	// this stays a pure store read with no forge call (D5). Empty when every column
 	// matched.
 	UnmatchedColumns []string
+	// NoDoneOption is true when the linked Status field has no reserved "Done" option
+	// (link.done_option_id == ""), so a CLOSED issue cannot be projected to Done (PRD
+	// #584 M4). The panel surfaces an advisory: add a "Done" option and Resync, or
+	// re-provision. False for an adopted built-in Status (which ships a Done option) and
+	// for any uzi-created field (which appends one). A pure store read — no forge call.
+	NoDoneOption bool
 }
 
 // ProjectSyncStatus reads a repo's link row + tracked-item count for the admin health
@@ -1969,6 +1975,7 @@ func (s *ProjectSyncService) ProjectSyncStatus(ctx context.Context, repoID uuid.
 		LastError:        link.LastError,
 		ItemCount:        len(items),
 		UnmatchedColumns: link.UnmatchedColumns,
+		NoDoneOption:     link.DoneOptionID == "",
 	}, nil
 }
 
