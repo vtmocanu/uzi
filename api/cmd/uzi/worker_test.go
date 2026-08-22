@@ -310,6 +310,96 @@ func TestWorkerListShowsUptime(t *testing.T) {
 	}
 }
 
+// TestStatusCell covers statusCell's three branches (PRD #496 M4): a non-cordoned
+// worker passes its raw status through untouched, and a cordoned one is annotated
+// (draining) vs (cordoned) keyed on ActiveRuns, NOT on Status. The offline+draining
+// row is the reason the helper never hardcodes "online": a cordoned worker whose pod
+// dies is swept offline WITHOUT clearing draining_since, so `offline (draining)` is a
+// real, reachable state (Decision 5).
+func TestStatusCell(t *testing.T) {
+	ts := time.Now()
+	for _, tc := range []struct {
+		name string
+		w    apitypes.WorkerDTO
+		want string
+	}{
+		{"online not cordoned", apitypes.WorkerDTO{Status: "online"}, "online"},
+		{"offline not cordoned", apitypes.WorkerDTO{Status: "offline"}, "offline"},
+		{"online draining", apitypes.WorkerDTO{Status: "online", DrainingSince: &ts, ActiveRuns: 1}, "online (draining)"},
+		{"online idle cordoned", apitypes.WorkerDTO{Status: "online", DrainingSince: &ts, ActiveRuns: 0}, "online (cordoned)"},
+		// The hardcode-"online" guard: an offline worker whose pod died mid-run was swept
+		// offline without clearing draining_since, so this must read from the raw status.
+		{"offline draining", apitypes.WorkerDTO{Status: "offline", DrainingSince: &ts, ActiveRuns: 1}, "offline (draining)"},
+		// Chat-only cordoned: a `busy` worker with zero in-flight runs reads (cordoned).
+		// statusCell keys on ActiveRuns, not on Busy — there is no way to set Busy on the
+		// DTO to change this output, which is the point: ActiveRuns:0 IS the cordoned case.
+		{"chat-only cordoned (ActiveRuns 0)", apitypes.WorkerDTO{Status: "online", DrainingSince: &ts, ActiveRuns: 0}, "online (cordoned)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusCell(tc.w); got != tc.want {
+				t.Errorf("statusCell(%+v) = %q, want %q", tc.w, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestWorkerListShowsCordon asserts the STATUS column carries the cordon annotation
+// through the full render (PRD #496 M4), and that the offline+draining fixture renders
+// `offline (draining)` and never `online ...` — the raw-status guard end to end.
+//
+// The STATUS cell now contains a space for annotated rows, so strings.Fields row parsing
+// would split `online (draining)` into two fields; this asserts with strings.Contains on
+// each worker's row line instead. Each fixture gets a distinct NAME to locate its row.
+func TestWorkerListShowsCordon(t *testing.T) {
+	ts := time.Now()
+	fc := &uzicli.FakeClient{Workers: []apitypes.WorkerDTO{
+		{ID: "w1", Name: "drainer", Status: "online", AnthropicBindMode: "default", DrainingSince: &ts, ActiveRuns: 1},
+		{ID: "w2", Name: "cordoned", Status: "online", AnthropicBindMode: "default", DrainingSince: &ts, ActiveRuns: 0},
+		{ID: "w3", Name: "deadpod", Status: "offline", AnthropicBindMode: "default", DrainingSince: &ts, ActiveRuns: 1},
+		{ID: "w4", Name: "plain", Status: "online", AnthropicBindMode: "default"},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "worker", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	rowOf := func(name string) string {
+		t.Helper()
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, name) {
+				return line
+			}
+		}
+		t.Fatalf("no row for %s in %q", name, out)
+		return ""
+	}
+	if got := rowOf("drainer"); !strings.Contains(got, "online (draining)") {
+		t.Errorf("drainer row = %q, want it to contain %q", got, "online (draining)")
+	}
+	if got := rowOf("cordoned"); !strings.Contains(got, "online (cordoned)") {
+		t.Errorf("cordoned row = %q, want it to contain %q", got, "online (cordoned)")
+	}
+	deadpod := rowOf("deadpod")
+	if !strings.Contains(deadpod, "offline (draining)") {
+		t.Errorf("deadpod row = %q, want it to contain %q", deadpod, "offline (draining)")
+	}
+	if strings.Contains(deadpod, "online") {
+		t.Errorf("deadpod row = %q must not read online — its raw status is offline", deadpod)
+	}
+	// The plain worker carries no cordon annotation: bare status, no (draining)/(cordoned).
+	plain := rowOf("plain")
+	if strings.Contains(plain, "(draining)") || strings.Contains(plain, "(cordoned)") {
+		t.Errorf("plain row = %q must show its bare status with no cordon annotation", plain)
+	}
+	// --json carries the raw draining_since field for scripting, untouched by the cell.
+	jout, _, jcode := runCLI(t, fakeEnv(fc), "worker", "list", "--json")
+	if jcode != uzicli.ExitOK {
+		t.Fatalf("worker list --json exit = %d, want 0", jcode)
+	}
+	if !strings.Contains(jout, "draining_since") {
+		t.Errorf("worker list --json = %q, want it to carry the draining_since field", jout)
+	}
+}
+
 // TestBindModeCellUnknownPassesThrough: the CLI ships separately from the API, so a
 // newer server can send a fourth mode. Printing it as itself is honest; mapping it to
 // "default" would state something false about where a worker's money goes.
