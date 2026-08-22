@@ -261,6 +261,10 @@ uzi version
   run reaches a terminal state (then exits 0, so a `--follow` on a finished run
   does not hang); `--after <seq>` resumes after a sequence number. In `--json`
   mode each message is one JSON object per line (NDJSON), so `--follow` streams.
+  **A message's text content lives under `payload` (raw per-kind JSON) — there is
+  no `body` or `content` field, so reading either returns empty. An empty result
+  from the wrong key is indistinguishable from a message with no content; read
+  `payload`.**
 
   **The ten `status` values, and what `--follow` actually waits for.** A run's
   `status` (on `run get` and `run list`) is one of exactly ten values:

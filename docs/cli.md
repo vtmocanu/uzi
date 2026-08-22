@@ -286,6 +286,10 @@ A few worth knowing:
   to its kind default priority (it does **not** demote it below normal). It
   prints the updated run; `--json` emits the run object, whose `priority` reads
   `expedited` after a bump.
+- **A message's content is under `payload`, not `body` or `content`.** Each
+  `--json` line carries the text under `payload` (raw per-kind JSON); there is no
+  `body`/`content` field, so reading either returns empty — indistinguishable from
+  a message that genuinely has no content. Read `payload`.
 - **`run logs <id>` names the invocation, not just the role.** The actor
   column reads `role[/<short id>][ · <task label>]`, so two `coder`
   subagents running in parallel are distinguishable instead of being two
