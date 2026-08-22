@@ -29,6 +29,15 @@ import (
 // and the Decision 10 reopen watch (mr_state='closed' keeps a card watched after
 // the close edge moved it out of Human Review).
 //
+// It ALSO pins Lane B (#527), the closed-issue terminal-recording lane: a merge
+// CLOSES the issue before the watcher runs, so the merged state is only observable
+// once i.state='closed'. Lane B keeps a closed issue's latest completed run polled
+// while its mr_state is non-terminal (NULL / opened / locked) — those ARE
+// candidates so the watcher can backfill the terminal state move-free — and DROPS
+// it once mr_state is terminal (merged / closed), which is the decay bound that
+// stops the backfill. Lane A's open-issue selection is UNCHANGED, guarded here by
+// an open, non-Human-Review card that neither lane admits.
+//
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; the e2e
 // runner (e2e/run-store-it.sh) provides one. `go test ./...` without it SKIPs.
 func TestListMRWatchCandidatesLiveDB(t *testing.T) {
@@ -108,12 +117,16 @@ func TestListMRWatchCandidatesLiveDB(t *testing.T) {
 	run(103, 203, "completed", "", 1*time.Minute)
 	run(103, -1, "completed", "", 2*time.Minute) // newer completed, NULL mr_iid
 
-	// 104 — closed issue: never a candidate (Closed is terminal, not a workflow column).
+	// 104 — Lane B (#527): closed issue, completed run, MR present, mr_state=NULL →
+	// terminal-recording candidate (bootstrap records merged/closed, no board move).
 	issue(104, "closed", hr)
 	run(104, 204, "completed", "", 1*time.Minute)
 
-	// 105 — coarse prefilter excludes it: open, completed, MR present, but the card
-	// is neither in Human Review nor recorded mr_state='closed'.
+	// 105 — Lane A UNCHANGED / Lane B closed-only guard: open, non-Human-Review,
+	// prd-only card with a completed run and MR present. Lane A rejects it (not in
+	// Human Review, mr_state != 'closed') and Lane B rejects it (Lane B is
+	// closed-issue-only). Neither lane admits it, so it is the explicit pin that the
+	// closed-issue lane did not widen open-issue selection.
 	issue(105, "opened", prdOnly)
 	run(105, 205, "completed", "", 1*time.Minute)
 
@@ -126,6 +139,29 @@ func TestListMRWatchCandidatesLiveDB(t *testing.T) {
 	issue(107, "opened", hr)
 	run(107, -1, "completed", "", 1*time.Minute)
 
+	// 108 — Lane B (#527) non-terminal 'opened': closed issue, completed run,
+	// mr_state='opened' → candidate. Pins the IN ('opened') branch of Lane B, so a
+	// closed issue whose MR is still open keeps polling until the merge settles it.
+	issue(108, "closed", hr)
+	run(108, 208, "completed", "opened", 1*time.Minute)
+
+	// 109 — Lane B (#527) non-terminal 'locked': closed issue, completed run,
+	// mr_state='locked' (transient mid-merge) → candidate. Pins the IN ('locked')
+	// branch; kept polling so it settles to merged.
+	issue(109, "closed", hr)
+	run(109, 209, "completed", "locked", 1*time.Minute)
+
+	// 110 — Lane B decay bound: closed issue but mr_state already terminal
+	// ('merged') → NOT a candidate. The whole point of the lane is that backfill
+	// stops once a run has settled to a terminal state.
+	issue(110, "closed", hr)
+	run(110, 210, "completed", "merged", 1*time.Minute)
+
+	// 111 — Lane B decay bound: closed issue, mr_state terminal ('closed') → NOT a
+	// candidate (symmetric with 110).
+	issue(111, "closed", hr)
+	run(111, 211, "completed", "closed", 1*time.Minute)
+
 	rows, err := q.ListMRWatchCandidates(ctx, repoID)
 	if err != nil {
 		t.Fatalf("ListMRWatchCandidates: %v", err)
@@ -135,7 +171,7 @@ func TestListMRWatchCandidatesLiveDB(t *testing.T) {
 		got[r.IssueIid.Int64] = r
 	}
 
-	for _, iid := range []int64{101, 106} {
+	for _, iid := range []int64{101, 104, 106, 108, 109} {
 		if _, ok := got[iid]; !ok {
 			t.Errorf("issue %d should be a watch candidate but was not (rows: %+v)", iid, rows)
 		}
@@ -143,17 +179,18 @@ func TestListMRWatchCandidatesLiveDB(t *testing.T) {
 	absent := map[int64]string{
 		102: "rework suppression: latest run is non-completed (Decision 4)",
 		103: "no superseded-MR fallback: latest completed run has NULL mr_iid",
-		104: "issue is closed",
-		105: "coarse prefilter: not in Human Review and mr_state != 'closed'",
+		105: "Lane A unchanged / Lane B closed-only: open, non-Human-Review, mr_state != 'closed'",
 		107: "completed run has NULL mr_iid",
+		110: "Lane B decay: closed issue but mr_state already terminal (merged)",
+		111: "Lane B decay: closed issue, mr_state terminal (closed)",
 	}
 	for iid, why := range absent {
 		if _, ok := got[iid]; ok {
 			t.Errorf("issue %d must NOT be a candidate — %s", iid, why)
 		}
 	}
-	if len(rows) != 2 {
-		t.Errorf("expected exactly 2 candidates {101,106}, got %d: %+v", len(rows), rows)
+	if len(rows) != 5 {
+		t.Errorf("expected exactly 5 candidates {101,104,106,108,109}, got %d: %+v", len(rows), rows)
 	}
 
 	// The candidate rows must carry the LATEST run's MR facts.
@@ -162,6 +199,17 @@ func TestListMRWatchCandidatesLiveDB(t *testing.T) {
 	}
 	if c := got[106]; c.MrIid.Int64 != 206 || c.MrState.String != "closed" {
 		t.Errorf("candidate 106 = {mr_iid:%d mr_state:%q}, want {206 \"closed\"}", c.MrIid.Int64, c.MrState.String)
+	}
+	// Lane B (#527) candidates carry the LATEST run's MR facts too: 104 bootstraps
+	// from NULL mr_state; 108/109 carry the non-terminal states that keep them polled.
+	if c := got[104]; c.MrIid.Int64 != 204 || c.MrState.Valid {
+		t.Errorf("candidate 104 = {mr_iid:%d mr_state:%q valid:%t}, want {204 NULL}", c.MrIid.Int64, c.MrState.String, c.MrState.Valid)
+	}
+	if c := got[108]; c.MrIid.Int64 != 208 || c.MrState.String != "opened" {
+		t.Errorf("candidate 108 = {mr_iid:%d mr_state:%q}, want {208 \"opened\"}", c.MrIid.Int64, c.MrState.String)
+	}
+	if c := got[109]; c.MrIid.Int64 != 209 || c.MrState.String != "locked" {
+		t.Errorf("candidate 109 = {mr_iid:%d mr_state:%q}, want {209 \"locked\"}", c.MrIid.Int64, c.MrState.String)
 	}
 }
 

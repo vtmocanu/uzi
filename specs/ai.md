@@ -2137,6 +2137,31 @@ Serves human Feature #24; extends the forge seam (§16) and runtime schema (§37
   `ResolveColumn` check in the watcher is authoritative (§91).
 - **`SetRunMRState`** — the sole `mr_state` writer; touches `mr_state` + `updated_at`
   only, never the run's status.
+- **Closed-issue terminal-recording lane (#527).** The candidate `WHERE` is now a
+  union of two lanes. **Lane A** is the open-issue board-move watch above,
+  byte-identical. **Lane B** (`i.state='closed' AND (l.mr_state IS NULL OR l.mr_state
+  IN ('opened','locked'))`) exists because a merge **closes the issue** (via `Closes
+  #N`) and the poller runs the issue sync **before** `SyncMRStates`, so the `merged`
+  state is only ever observable once the issue is already `closed` — Lane A would
+  never see it, which is why `mr_state` froze at `NULL`/`opened` for cleanly-merged
+  PRs and the "merged" badge (`MrChip.tsx`, `runBadge.ts`) almost never appeared.
+  Lane B keeps a closed issue's latest completed run polled while its `mr_state` is
+  **non-terminal**, records the terminal state, and **moves no card** — proven
+  move-free by the existing paths (§91): NULL bootstrap and the `merged`/`locked`
+  `default` arm record without moving, and `guardedMRMove` skips a closed issue
+  before any `AutoMove`. It also **backfills** historical merged PRs (`mr_state`
+  NULL): each is polled once, records `merged`, then **decays out** of the set once
+  terminal (`merged`/`closed` are excluded). No new writer (`SetRunMRState` stays
+  sole), no schema/migration/DTO/web change, and — because the burst bound is a
+  literal `LIMIT 100`, not a `sqlc` param — no change to the `ListMRWatchCandidates`
+  signature or generated row struct (Decision D4). The query orders open-issue
+  (Lane A) rows first (`ORDER BY (i.state='opened') DESC, l.created_at DESC`) so a
+  backfill burst never defers Lane A. **Caveat (accepted, R4):** the `LIMIT 100` now
+  bounds the *total* returned set, Lane A included — previously the query was
+  unbounded — so a repo with >100 simultaneous open Lane-A candidates (Human-Review
+  + reopen cards) would defer the oldest board moves each tick. 100 far exceeds any
+  realistic Lane-A count, so this is defense-in-depth, not an operational limit;
+  raise the constant if a deployment ever approaches it.
 
 ## 91. Watcher: edges, guards, state-persistence contract (`forgesvc.SyncMRStates`)
 
