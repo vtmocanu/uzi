@@ -1109,7 +1109,7 @@ describe("SdkExecutor guardrail options", () => {
       const env = t.options.env!;
       // Core keys + TMPDIR (5-bis per-uid scratch, when the ambient env has one) — never a
       // worker secret. TMPDIR is not a secret.
-      const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]);
+      const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_ENABLE_TODO_TOOLS"]);
       if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expected.add("TMPDIR");
       assert.deepStrictEqual(new Set(Object.keys(env)), expected);
       const serialized = JSON.stringify(env);
