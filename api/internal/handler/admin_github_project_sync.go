@@ -296,11 +296,12 @@ type getGithubProjectSyncStatusResponse struct {
 
 // GetGithubProjectSyncStatus is the sync-health read (PRD #364 M7, owner-or-admin by
 // issue #534 D4): report a repo's project link status (project number, ownership,
-// last_synced_at, last_error, item_count). Mounted under the per-repo RequireAuth
-// group — it is a read of the stored projection, no forge call. Authorization is
-// owner-or-admin: a non-admin must own the repo (GetRepoForUser preflight, 404 for a
-// foreign/unknown id), while an admin skips it. A repo with no link row is a
-// (different) 404: "no link = not sync-enabled".
+// last_synced_at, last_error, item_count). Mounted under the per-repo RequireUser
+// group (moved there from RequireAuth by PRD #576 M7) so the CLI's uzc_ Bearer token
+// is accepted alongside the session cookie — it is a read of the stored projection,
+// no forge call. Authorization is owner-or-admin: a non-admin must own the repo
+// (GetRepoForUser preflight, 404 for a foreign/unknown id), while an admin skips it.
+// A repo with no link row is a (different) 404: "no link = not sync-enabled".
 func (h *Handler) GetGithubProjectSyncStatus(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {

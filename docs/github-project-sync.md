@@ -57,8 +57,9 @@ There's still no `uzi` CLI verb for Adopting, Provisioning, or the board-
 access controls below. The per-repo and instance writes require a cookie
 session plus a CSRF token, while the CLI authenticates with a bearer token
 and never carries either — so it can't reach those routes structurally,
-not merely by policy. A read-only `uzi project-sync status`/`resync` CLI
-does exist for checking and re-running an already-linked repo — see the
+not merely by policy. A small `uzi project-sync status`/`resync` CLI
+does exist for checking, and re-running the sync of, an already-linked
+repo (it never creates or removes a link) — see the
 [CLI reference](./cli.md).
 
 ## Sync health at a glance
