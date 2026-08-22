@@ -1082,6 +1082,18 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// limiter: create validates config and computes next_fire_at without a
 				// forge read (run-now, which does read the forge, carries the limiter).
 				r.Post("/{id}/schedules", h.CreateSchedule)
+				// GitHub Projects v2 sync READS + RESYNC for the CLI (PRD #576 M7):
+				// RequireUser (NOT the cookie-only RequireAuth group below) so the CLI's
+				// `uzc_` Bearer token is accepted — a cookie-only mount would 401 it
+				// (issue #428 regression). Both are owner-scoped and guarded server-side by
+				// the same GetRepoForUser preflight inside each handler (404 for a
+				// foreign/unknown repo); under the CLI token's IsAdmin=false ceiling they
+				// are correctly owner-only. No forge limiter: the status read hits only the
+				// stored projection, and resync re-seeds without charging the forge budget.
+				// The mutating link setup (Adopt/Provision/autocreate/disable) and the
+				// board-access controls stay on RequireAuth (cookie-only) below — web-only.
+				r.Get("/{id}/github-project-sync", h.GetGithubProjectSyncStatus)
+				r.Post("/{id}/github-project-sync/resync", h.ResyncGithubProjectSync)
 			})
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))
@@ -1091,7 +1103,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// GitHub Projects v2 sync, owner-or-admin (issue #534, PRD #364 follow-up):
 				// relocated out of /admin (D4). Owner path is guarded by a GetRepoForUser
 				// preflight inside each handler; admin skips it. Instance flag still gates.
-				r.Get("/{id}/github-project-sync", h.GetGithubProjectSyncStatus)
+				// The status read and resync moved UP to the RequireUser group (PRD #576 M7)
+				// so the CLI's Bearer token reaches them; the mutating link setup below stays
+				// cookie-only (web-only — Adopt/Provision/autocreate/disable, D4).
 				// Owner-type read for the Adopt-first Provision nudge (PRD #576 M1):
 				// a live forge round-trip (repositoryOwner __typename), fetched for a
 				// not-yet-linked repo so it needs no link row. Web-only; the CLI does
@@ -1099,10 +1113,6 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				r.Get("/{id}/github-project-sync/owner-type", h.GetGithubProjectOwnerType)
 				r.Post("/{id}/github-project-sync", h.AdoptGithubProjectSync)
 				r.Post("/{id}/github-project-sync/provision", h.ProvisionGithubProjectSync)
-				// Resync re-seeds an already-linked board, picking up newly-added Status
-				// options (PRD #576 M3). Same owner-or-admin group; the CLI move to
-				// RequireUser is M7's job, not now.
-				r.Post("/{id}/github-project-sync/resync", h.ResyncGithubProjectSync)
 				// Safe column auto-create (PRD #576 M6): create a fresh uzi-owned
 				// Status field with all the repo's columns and switch the link to it,
 				// turning skipped columns into synced ones with no destructive replace.

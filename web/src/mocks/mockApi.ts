@@ -2519,7 +2519,8 @@ export const mockApi = {
   // panel reflects "all columns now sync".
   autocreateProjectSyncColumns: async (id: string) => {
     const link = githubProjectLinks.get(id);
-    if (!link) throw new ApiError(404, "this repo has no linked project to resync");
+    if (!link)
+      throw new ApiError(404, "this repo has no linked project to auto-create columns for");
     githubProjectLinks.set(id, { ...link, unmatched_columns: [] });
     return delay({ status: "columns_created" });
   },

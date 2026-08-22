@@ -107,6 +107,17 @@ Read, not Admin). Write is a hard requirement: uzi's project discovery only sees
 repos where the bot has at least Write access, and Admin would hand the bot power
 it doesn't need — including reading the branch protection rule you just set up.
 
+## Project sync: invite the bot onto the Project (GitHub Projects v2 only)
+
+If you plan to use [GitHub Projects v2 sync](./github-project-sync.md),
+there's a **second, separate invite** beyond step 4 above. A Project has
+its own membership, distinct from the repo's collaborator list — adding
+the bot to the repo does not by itself let it read or move the Project's
+Status field. On the Project itself, open its **⋯ menu → Manage access**
+(or **Settings → Manage access**), add the bot account, and grant it
+**Write**. Do this before running Adopt — see [The Adopt flow, step by
+step](./github-project-sync.md#the-adopt-flow-step-by-step).
+
 ## 5. Connect the bot in uzi
 
 1. Log in and open **Settings → Forge**.

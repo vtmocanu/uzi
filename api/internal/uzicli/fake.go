@@ -273,6 +273,18 @@ type FakeClient struct {
 	LastFileReviewTitle  string
 	LastFileReviewDesc   string
 
+	// GitHub project sync CLI reads (PRD #576 M7). ProjectSyncStatusResult is the
+	// canned `project-sync status` reply and LastProjectSyncStatusRepoID records the
+	// repo id it was asked about. GetProjectSyncStatusErr wins over the blanket Err so
+	// a test can model the not-linked 404 (ExitNotFound) precisely while the capture
+	// still proves the read was reached. ResyncProjectSync records its repo id;
+	// ResyncProjectSyncErr wins over Err the same way for the resync 404.
+	ProjectSyncStatusResult     ProjectSyncStatus
+	LastProjectSyncStatusRepoID string
+	GetProjectSyncStatusErr     error
+	LastResyncProjectSyncRepoID string
+	ResyncProjectSyncErr        error
+
 	// GetRunHook, when non-nil, drives GetRun instead of the static RunByID map. It
 	// is the sequencing seam `uzi run wait`'s tests need: a poll loop calls GetRun
 	// repeatedly, so a test scripts a per-call STATUS SEQUENCE (and injects a
@@ -812,6 +824,25 @@ func (f *FakeClient) FileReviewIssue(_ context.Context, runID, recID, repoID, ti
 		return ReviewIssueFileResult{}, f.Err
 	}
 	return f.ReviewFileResult, nil
+}
+
+func (f *FakeClient) GetProjectSyncStatus(_ context.Context, repoID string) (ProjectSyncStatus, error) {
+	f.LastProjectSyncStatusRepoID = repoID
+	if f.GetProjectSyncStatusErr != nil {
+		return ProjectSyncStatus{}, f.GetProjectSyncStatusErr
+	}
+	if f.Err != nil {
+		return ProjectSyncStatus{}, f.Err
+	}
+	return f.ProjectSyncStatusResult, nil
+}
+
+func (f *FakeClient) ResyncProjectSync(_ context.Context, repoID string) error {
+	f.LastResyncProjectSyncRepoID = repoID
+	if f.ResyncProjectSyncErr != nil {
+		return f.ResyncProjectSyncErr
+	}
+	return f.Err
 }
 
 func (f *FakeClient) StreamRun(ctx context.Context, runID string) (*RunStream, error) {
