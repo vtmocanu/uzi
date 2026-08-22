@@ -19,6 +19,13 @@ mkdir -p "$FAKEBIN"
 LOG="$TMP/down.log"
 CURRENT="uzi-e2e-$$"
 
+# A pid that is provably dead at test time: spawn a trivial child and reap it,
+# rather than hardcoding a high number (which could be a live process on a host
+# with a raised kernel.pid_max, spuriously reddening this gate).
+sleep 0 & DEAD_PID=$!
+wait "$DEAD_PID" 2>/dev/null || true
+DEAD="uzi-e2e-$DEAD_PID"
+
 # Fake docker. The candidate list is emitted for `docker ps`; `docker compose -p
 # <proj> down ...` appends <proj> to the log so we can assert exactly what got
 # torn down. UNquoted heredoc: $LOG and $CURRENT expand now (test time), while the
@@ -27,7 +34,7 @@ cat > "$FAKEBIN/docker" <<EOF
 #!/usr/bin/env bash
 case "\$1" in
   ps)
-    printf '%s\n' 'uzi-e2e-999999' 'uzi-e2e-1' '$CURRENT' 'uzi' 'uzi-store-it-12345'
+    printf '%s\n' '$DEAD' 'uzi-e2e-1' '$CURRENT' 'uzi' 'uzi-store-it-12345'
     ;;
   volume)
     : ;;
@@ -54,10 +61,10 @@ check_absent() {
 : > "$LOG"
 bash "$SCRIPT" "$CURRENT" >/dev/null
 
-if grep -qx 'uzi-e2e-999999' "$LOG"; then
-  printf 'PASS: dead-pid project uzi-e2e-999999 was reclaimed\n'
+if grep -qx "$DEAD" "$LOG"; then
+  printf 'PASS: dead-pid project %s was reclaimed\n' "$DEAD"
 else
-  printf 'FAIL: dead-pid project uzi-e2e-999999 was NOT reclaimed\n'
+  printf 'FAIL: dead-pid project %s was NOT reclaimed\n' "$DEAD"
   fails=$((fails + 1))
 fi
 
