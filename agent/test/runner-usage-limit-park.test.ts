@@ -577,6 +577,43 @@ describe("RunRunner — durable park (PRD #218 M1/M2/M3)", () => {
         undefined,
         "nothing recovered ⇒ no prior-work note",
       );
+      // issue #222: this is the measured harmful case — a resume (session id present) whose
+      // reseed fell to the default branch, so priorWork is empty and the feed status is the
+      // ONLY reseed signal. The runner must ALSO set ctx.resumed so the reseed warning can
+      // ride the implement prompt, the one thing the lead reads.
+      assert.strictEqual(
+        seen[0]?.resumed,
+        true,
+        "a resume claim (session id present) is flagged so the reseed warning renders",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("issue #222: a FRESH claim (no session id) is not flagged resumed — no prior tree was lost", async () => {
+    // A run that never executed before had no working tree to destroy, so the reseed warning
+    // must NOT fire. The discriminator is the raw claim session id.
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-222-fresh-"));
+    try {
+      const iid = 222;
+      const seen: RunContext[] = [];
+      const factory: ExecutorFactory = (runId) => ({
+        homeDir: path.join(homeRoot, runId),
+        executor: {
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            seen.push(ctx);
+            return { branch: ctx.branch };
+          },
+        },
+      });
+      // No session_id ⇒ a fresh run.
+      await runnerWith(factory, gitlab).execute(gitlabClaim(iid, {}));
+      assert.ok(
+        seen[0]?.resumed !== true,
+        `a fresh claim must not be flagged resumed, got ${String(seen[0]?.resumed)}`,
+      );
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }

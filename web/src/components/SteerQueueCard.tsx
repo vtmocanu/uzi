@@ -38,6 +38,14 @@ const PARKED_COPY: Record<string, Delivery> = {
     tone: "warning",
     title: "Handed to the worker, but it takes effect only after you answer its question.",
   },
+  // PRD #517: an interactive run parked awaiting the owner's next follow-up. Sending
+  // one here is the WHOLE point — it is consumed immediately and IS what resumes the
+  // run — so the copy names the resuming action rather than a blocking gate.
+  awaiting_followup: {
+    label: "Delivered — resumes the run",
+    tone: "warning",
+    title: "Handed to the worker; it picks this up as the next turn and continues the run.",
+  },
 };
 
 // deliveryFor maps one follow-up to its chip. Order matters: the unconsumed→terminal
@@ -126,6 +134,12 @@ export function SteerQueueCard({
           (which it never is — a non-owner's /inputs 404s, leaving the queue empty). */}
       {!terminal && canSteer && (
         <>
+          {/* PRD #517: awaiting_followup is non-terminal, so the composer shows and Send
+              is enabled — sending a follow-up is exactly how a follow-up park resumes.
+              It is deliberately NOT `parked`: unlike limit_wait (which self-resumes hours
+              later, so its placeholder says "queued until the run resumes"), a follow-up
+              here IS the next turn, so the default "resumes the agent" placeholder is the
+              honest one. Only limit_wait sets parked. */}
           <FollowUpComposer busy={busy} onSend={onSend} parked={status === "limit_wait"} />
           <Button variant="danger" disabled={busy} onClick={onStop}>
             Stop run

@@ -15,7 +15,7 @@ import {
   type TextareaHTMLAttributes,
 } from "react";
 import { Link } from "react-router-dom";
-import { ArrowLeftIcon } from "./icons";
+import { ArrowLeftIcon, EyeIcon, EyeOffIcon } from "./icons";
 
 export function cx(...parts: (string | false | null | undefined)[]): string {
   return parts.filter(Boolean).join(" ");
@@ -161,6 +161,48 @@ export function Input({
   ...props
 }: InputHTMLAttributes<HTMLInputElement>) {
   return <input className={cx(INPUT_CLASS, className)} {...props} />;
+}
+
+// A masked secret input with a reveal (eye) toggle. Reusable: forge PAT today,
+// the other type="password" sites later (PRD #337 Feature B, D6). Defaults to
+// masked; the toggle button never submits the form (type="button"), carries a
+// toggling aria-label + aria-pressed, and forwards `id` to the inner input so a
+// Field htmlFor associates the label with the input, not the composite. The
+// focus-visible outline gives the icon-button its own visible keyboard ring
+// (the inner Input keeps the global :focus-visible ring from index.css).
+export function PasswordInput({
+  id,
+  value,
+  className = "",
+  ...props
+}: InputHTMLAttributes<HTMLInputElement>) {
+  const [revealed, setRevealed] = useState(false);
+  // Re-mask when the value is externally cleared (e.g. setToken("") after a
+  // successful connect), so a revealed field never shows the NEXT pasted token
+  // in clear (D7 leak guard).
+  useEffect(() => {
+    if (value === "") setRevealed(false);
+  }, [value]);
+  return (
+    <div className="relative">
+      <Input
+        id={id}
+        type={revealed ? "text" : "password"}
+        value={value}
+        className={cx("pr-10", className)}
+        {...props}
+      />
+      <button
+        type="button"
+        onClick={() => setRevealed((r) => !r)}
+        aria-label={revealed ? "Hide token" : "Show token"}
+        aria-pressed={revealed}
+        className="absolute inset-y-0 right-0 flex items-center rounded-r-lg px-3 text-muted outline-hidden hover:text-fg focus-visible:outline-2 focus-visible:outline-brand"
+      >
+        {revealed ? <EyeOffIcon /> : <EyeIcon />}
+      </button>
+    </div>
+  );
 }
 
 export function Select({
@@ -338,6 +380,12 @@ export const RUN_STATUS_TONES: Record<
   // worker is held), and the PRD frames it as the third human-in-the-loop channel
   // alongside the plan gate (D-O #4). The label distinguishes them; the tone must not.
   awaiting_input: { tone: "warning", pulse: true },
+  /** PRD #517: an interactive task run parked awaiting the owner's next follow-up.
+   *  Warn-toned like the other parks (a human owes the run its next turn), and
+   *  deliberately NOT pulsing: like limit_wait it does nothing until the user acts,
+   *  and a pulse reads as live work. The label overrides to "awaiting follow-up"
+   *  below so the pill does not echo the raw enum. */
+  awaiting_followup: { tone: "warning" },
   /** PRD #35: parked until the owner's Anthropic usage window reopens. Warn-toned
    *  like the other "blocked on something outside the run" state, and deliberately
    *  NOT pulsing: a pulse reads as live work, and a parked run does nothing at all
@@ -361,6 +409,10 @@ export const RUN_STATUS_TONES: Record<
 // fine de-underscored. Keep the two in step for any status added here.
 const RUN_STATUS_LABELS: Record<string, string> = {
   awaiting_input: "needs your answer",
+  // PRD #517: distinct copy from awaiting_input — a follow-up park is the run's
+  // turn-taking pause, not an unanswered question. Kept in step with runBadge's
+  // "awaiting follow-up" label.
+  awaiting_followup: "awaiting follow-up",
 };
 
 export function StatusPill({ status }: { status: string }) {

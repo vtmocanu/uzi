@@ -14,6 +14,7 @@ import {
   SeededPlanPanel,
   AgentRosterSummary,
   JudgePanel,
+  JUDGE_POLL_MAX_TRIES,
   MilestoneBadge,
   MilestoneChecklist,
   RunHeading,
@@ -1844,80 +1845,56 @@ describe("JudgePanel (PRD #46 M4)", () => {
     }
   });
 
-  // ── The 150-try cap (#119) ────────────────────────────────────────────────────────────
+  // ── The poll-try cap (#119) ───────────────────────────────────────────────────────────
   // The cap is the LAST stop condition: a judge that neither produces a verdict nor leaves
-  // the active set would otherwise be polled every 4s for the life of the tab. 150 × 4s ≈
-  // 10 minutes, chosen because the old 15-try (~1 min) cap gave up on judges that were
-  // still running. Both tests below assert the exact bound — 1 mount fetch + 150 ticks =
-  // 151 — rather than "eventually stops", because an off-by-a-lot cap still "stops".
+  // the active set would otherwise be polled every 4s for the life of the tab. In
+  // production it is JUDGE_POLL_MAX_TRIES = 150 (× 4s ≈ 10 minutes, chosen because the old
+  // 15-try (~1 min) cap gave up on judges that were still running). The two tests below
+  // assert the EXACT stop boundary — 1 mount fetch + N ticks, then one more tick trips the
+  // cap and no later tick fires — rather than "eventually stops", because an off-by-a-lot
+  // cap still "stops".
   //
-  // 🔴 BOTH TESTS BELOW CARRY A PER-TEST TIMEOUT (the third argument to `it`), and the
-  // other 1658 tests in this suite keep the 20000 default (PRD #103 M5 MR-C). They are
-  // the two slowest tests here by a wide margin, and the reason is structural rather
-  // than environmental: each awaits `advanceTimersByTimeAsync(149 * 4000)` inside ONE
-  // `it()`, which is 149 sequential real event-loop turns, every one of them flushing a
-  // mocked promise and a React `act`. Measured 2026-08-04 under vitest 4.1.10 with the
-  // JSON reporter: 4228 ms mean inside the full 118-file suite, and 5416 ms mean running
-  // this file SOLO. Solo is the limit of splitting — zero competing files — and it is
-  // SLOWER, so splitting this file cannot fix it and the chain moves intact into
-  // whatever file it lands in. Under CPU contention that chain has been observed to
-  // exceed 20000, and when it does, everything after it in this file fails too — 48
-  // further failures in the archived run, which are missing-element and empty-string
-  // assertions rather than the single "empty-container cascade" signature this comment
-  // used to name (`probes/prd-103-mrc-lead/cascade-characterisation.txt`).
-  //
-  // A PER-TEST CAP RATHER THAN RAISING THE SUITE DEFAULT, deliberately: this MR first
-  // took `testTimeout` to 60000 in `vite.config.ts` and that was reverted, because it
-  // weakened the hang-detection ceiling for 1658 tests to accommodate two. Do not
-  // "simplify" these back to the default; do fix the 149-turn chain, after which they
-  // come off.
-  //
-  // 🔴 THE CAP IS 120000 AND IT WAS 60000 FOR ABOUT A DAY. 60000 was set against a rate
-  // that a 73-run study then refuted, and the same study measured what the cap actually
-  // has to clear: **49869 ms**, this test's sibling below, passing at **83.1% of a 60000
-  // ceiling** — and **49065 ms** inside a fully green run. A 1.20x margin over the worst
-  // thing you have ever seen is not margin on a starvation tail. Raw data and the
-  // pre-registered predictions in `probes/prd-103-mrc-tester-tt/`.
-  //
-  // WHY THAT IS NOT JUST "THE NUMBER THAT MAKES IT PASS", which is the objection this
-  // change has to answer: 60000 sat at the same position relative to the worst excursion
-  // of its day that the old suite-wide 20000 sat at relative to the excursion which
-  // failed it. Setting a ceiling just above the largest observation is the move that had
-  // already failed once here. What bounds this one instead is what the cap is FOR: these
-  // two tests do a fixed, deterministic 149 turns of work, so the cap is a hang detector,
-  // not a performance budget, and its cost is bounded to the two tests that carry it —
-  // the other 1658 keep 20000, and no assertion anywhere is loosened. Doubling the wait
-  // before a genuinely hung one of these two reports is the whole price.
-  //
-  // AND THE HONEST LIMIT: every figure above is one laptop under an agent-team load.
-  // **There is no measured rate for CI**, which is a different machine under different
-  // contention and is where this bites. 120000 is chosen to survive a tail nobody has
-  // characterised there, not to clear a number somebody measured here.
-  it("stops after the 150-try cap when a pending judge never clears (#119)", async () => {
+  // 🔴 THEY DRIVE THE CAP THROUGH THE `pollMaxTries` PROP AT 5, NOT THE PRODUCTION 150
+  // (issue #227). The stop MECHANISM is identical at any cap, and exercising it at 5 costs
+  // ~5 fake-timer turns instead of 149. That 149-turn chain — one `advanceTimersByTimeAsync(149
+  // * 4000)` inside a single `it()`, each turn flushing a mocked promise + a React `act` —
+  // was these two tests' whole cost: ~4228 ms mean in the full suite, >49000 ms under CPU
+  // contention (PRD #103 M5 MR-C, `probes/prd-103-mrc-tester-tt/`), and it forced a per-test
+  // 120000 timeout while the other 1658 tests kept the 20000 default. Splitting the file did
+  // not help (solo was SLOWER); reducing the ITERATION COUNT is the fix, so with it gone the
+  // per-test caps come off and these inherit the suite-wide 20000. The production value 150 is
+  // no longer asserted through timers here — it is pinned directly by the timer-free test
+  // below, so a change to the default still reddens the suite.
+  it("pins the production poll-try cap default", () => {
+    // Guards the value the mechanism tests deliberately do NOT drive (they use pollMaxTries=5).
+    expect(JUDGE_POLL_MAX_TRIES).toBe(150);
+  });
+
+  it("stops after the poll-try cap when a pending judge never clears (#119)", async () => {
     vi.useFakeTimers();
     try {
       // ONE object, reused for every response: setPendingJudge with an identical reference
-      // lets React bail out of the re-render, so this is 150 ticks of poll, not 150 renders.
+      // lets React bail out of the re-render, so this is ticks of poll, not re-renders.
       const stuck = { review: null, pending_judge: pending("running") };
       mockApi.getRunReview.mockResolvedValue(stuck);
-      render(<JudgePanel run={run({ status: "failed" })} />);
+      render(<JudgePanel run={run({ status: "failed" })} pollMaxTries={5} />);
       await act(async () => {
         await vi.advanceTimersByTimeAsync(0);
       });
       // The mount fetch, and nothing else yet.
       expect(mockApi.getRunReview).toHaveBeenCalledTimes(1);
 
-      // One tick short of the cap: still polling.
+      // One tick short of the cap (4 ticks → tries=4 < 5): still polling.
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(149 * 4000);
+        await vi.advanceTimersByTimeAsync(4 * 4000);
       });
-      expect(mockApi.getRunReview).toHaveBeenCalledTimes(150);
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(5);
 
-      // The 150th tick trips the cap.
+      // The 5th tick (tries=5 >= 5) trips the cap.
       await act(async () => {
         await vi.advanceTimersByTimeAsync(4000);
       });
-      expect(mockApi.getRunReview).toHaveBeenCalledTimes(151);
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(6);
 
       // And it is really over — half an hour of ticks adds nothing. Without the cap the
       // interval would keep firing, because `polling` stays true while pendingJudge holds
@@ -1925,11 +1902,11 @@ describe("JudgePanel (PRD #46 M4)", () => {
       await act(async () => {
         await vi.advanceTimersByTimeAsync(30 * 60_000);
       });
-      expect(mockApi.getRunReview).toHaveBeenCalledTimes(151);
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(6);
     } finally {
       vi.useRealTimers();
     }
-  }, 120000);
+  });
 
   // The same bound on the FETCH-FAILURE path, which is a separate `clearInterval` in the
   // `!next` branch — and one that could not have existed before #119. The effect used to
@@ -1938,14 +1915,14 @@ describe("JudgePanel (PRD #46 M4)", () => {
   // over a permanently-failing endpoint (pendingJudge keeps its last non-null value and no
   // response ever arrives to change it). The explicit clearInterval there is the ONLY thing
   // that ever stops a /review that fails forever.
-  it("stops after the same 150-try cap when every poll tick FAILS (#119)", async () => {
+  it("stops after the same poll-try cap when every poll tick FAILS (#119)", async () => {
     vi.useFakeTimers();
     try {
       // The mount fetch must SUCCEED and report a pending judge, or the poll never arms.
       mockApi.getRunReview
         .mockResolvedValueOnce({ review: null, pending_judge: pending("running") })
         .mockRejectedValue(new Error("network down"));
-      render(<JudgePanel run={run({ status: "failed" })} />);
+      render(<JudgePanel run={run({ status: "failed" })} pollMaxTries={5} />);
       await act(async () => {
         await vi.advanceTimersByTimeAsync(0);
       });
@@ -1955,25 +1932,25 @@ describe("JudgePanel (PRD #46 M4)", () => {
       expect(screen.getAllByText("Judge in progress…")).toHaveLength(2);
 
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(149 * 4000);
+        await vi.advanceTimersByTimeAsync(4 * 4000);
       });
-      expect(mockApi.getRunReview).toHaveBeenCalledTimes(150);
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(5);
 
       await act(async () => {
         await vi.advanceTimersByTimeAsync(4000);
       });
-      expect(mockApi.getRunReview).toHaveBeenCalledTimes(151);
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(6);
 
       // 🔴 This is the assertion that reddens if the `clearInterval` in the `!next` branch
       // is dropped: setQueued(false) alone does not stop this timer.
       await act(async () => {
         await vi.advanceTimersByTimeAsync(30 * 60_000);
       });
-      expect(mockApi.getRunReview).toHaveBeenCalledTimes(151);
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(6);
     } finally {
       vi.useRealTimers();
     }
-  }, 120000);
+  });
 
   // The rollout-skew normalization has TWO sites, and this is the POLL one. The mount-fetch
   // site is covered by "treats an absent pending_judge…" below; this covers the case where
@@ -3490,6 +3467,53 @@ describe("the park announcement does not live inside the panel (PRD #88 M2, a11y
   it("QuestionPanel declares no live region of its own", () => {
     expect(questionPanelSource).not.toContain("aria-live");
     expect(questionPanelSource).not.toContain('role="status"');
+  });
+});
+
+// PRD #517 (a11y): a run parking into awaiting_followup is a needs-you state classified
+// identically by needsHumanAttention, so it must announce too — not only awaiting_input.
+// These render the whole page (useRunStream mocked) and read the ALWAYS-MOUNTED sr-only
+// region's CONTENT, which is the actual fix (a region born holding text is silent; the
+// content change is what assistive tech narrates). The parkAnnounce region is a <div>;
+// HealthFlag's is a <span>, so `div.sr-only[role="status"]` targets parkAnnounce uniquely.
+describe("RunView park announcement — awaiting_followup (PRD #517, a11y)", () => {
+  function renderPage(over: Partial<Run>) {
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: true,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    return render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+  }
+
+  it("announces the follow-up park through the always-mounted sr-only region", async () => {
+    renderPage({ status: "awaiting_followup" });
+    const region = await waitFor(() => {
+      const el = document.querySelector('div.sr-only[role="status"]') as HTMLElement | null;
+      if (!el || el.textContent === "") throw new Error("not announced yet");
+      return el;
+    });
+    expect(region.getAttribute("aria-live")).toBe("polite");
+    expect(region.textContent).toBe("The run is waiting for your next follow-up.");
+    // Mutation guard: it is the follow-up copy, NOT the awaiting_input question copy.
+    expect(region.textContent).not.toContain("asking you a question");
+  });
+
+  it("leaves the region empty on a plain running run (nothing to announce)", async () => {
+    renderPage({ status: "running" });
+    await screen.findByText("Add rate limiting");
+    const region = document.querySelector('div.sr-only[role="status"]') as HTMLElement;
+    expect(region.textContent).toBe("");
   });
 });
 

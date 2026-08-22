@@ -135,6 +135,15 @@ var (
 	ErrInvalidPlannedCommit = errors.New("planned base commit is not a valid commit sha (hex, 7-64 chars)")
 	ErrActiveRunExists      = errors.New("a non-terminal run already exists for this issue")
 	ErrRunTerminal          = errors.New("run has already finished")
+	// ErrStopNotInteractive rejects a `stop` on a run that is not an interactive task
+	// (PRD #517 M4) → 409. A graceful stop is honored ONLY by the interactive-task park:
+	// no other run kind reads the stop flag, so a stop on a plan-gated / chat /
+	// non-interactive task run would stamp a permanent, spurious stop_kind='stopped' and
+	// return a misleading "stop sent" success while nothing actually winds the run down.
+	// Gated on kind+interactive alone, NOT on status: a stop on a RUNNING interactive task
+	// (not yet parked) is still valid. It is a run-state conflict, hence 409 (the CLI maps
+	// 409 → ExitConflict).
+	ErrStopNotInteractive = errors.New("run stop applies only to interactive task runs")
 	// ErrReviseCapReached rejects a revise_plan once the run has hit
 	// PLAN_MAX_REVISIONS persisted revisions (PRD #41). Counted over ALL
 	// revise_plan rows for the run (a consumed revise still counts), so the cap is
@@ -408,6 +417,11 @@ type Store interface {
 	// stamps the question's identity. It clears health on entry, which is what makes
 	// leaving `awaiting_input` out of ListActiveRunsForHealth safe — see the query.
 	SetRunAwaitingInput(ctx context.Context, arg store.SetRunAwaitingInputParams) (int64, error)
+	// SetRunAwaitingFollowup parks an interactive task run in-process after signal_done
+	// (PRD #517 M2/M3, Decision 3), holding the worker slot/clone/session for `uzi run
+	// follow-up` to resume. Like SetRunAwaitingInput it clears health on entry (the same
+	// reason awaiting_followup is safe to leave out of ListActiveRunsForHealth).
+	SetRunAwaitingFollowup(ctx context.Context, arg store.SetRunAwaitingFollowupParams) (int64, error)
 	SetRunCompleted(ctx context.Context, arg store.SetRunCompletedParams) (int64, error)
 	SetRunFailed(ctx context.Context, arg store.SetRunFailedParams) (int64, error)
 	ReconcileRunMR(ctx context.Context, arg store.ReconcileRunMRParams) (int64, error)
@@ -603,9 +617,14 @@ type Store interface {
 
 // Params are the runtime knobs the service needs, mirrored from config.
 type Params struct {
-	RunTimeout       time.Duration
-	RunIdleTimeout   time.Duration
-	RunMaxIterations int
+	RunTimeout     time.Duration
+	RunIdleTimeout time.Duration
+	// WorkerTaskIdleTimeout (PRD #517 M5, WORKER_TASK_IDLE_TIMEOUT) is the interactive-task
+	// park's worker-side idle backstop. Mirrored from config and shipped in the claim (like
+	// RunIdleTimeout) so the worker's own park idle timer matches what the server configured
+	// (no drift). Delivered only on an interactive task claim; every other claim omits it.
+	WorkerTaskIdleTimeout time.Duration
+	RunMaxIterations      int
 	// PlanMaxRevisions caps how many times a run's plan may be revised at the
 	// approval gate (PRD #41, PLAN_MAX_REVISIONS). Enforced server-side in
 	// SubmitInput and shipped in the claim so the worker enforces the same limit.
@@ -1993,6 +2012,16 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		}
 	}
 
+	// PRD #517 M5: deliver the interactive-task park idle backstop ONLY on an interactive
+	// task claim (the sole path that parks on awaitFollowUp). Left zero for every other run
+	// so omitempty keeps its claim byte-identical to today's wire; the worker falls back to
+	// its own TASK_FOLLOWUP_IDLE_MS constant when the field is absent. run.Interactive is
+	// immutable from create, so a resumed interactive run re-delivers the same value.
+	taskIdleTimeoutSeconds := 0
+	if run.Interactive {
+		taskIdleTimeoutSeconds = int(s.p.WorkerTaskIdleTimeout.Seconds())
+	}
+
 	payload := &ClaimPayload{
 		RunID:            run.ID.String(),
 		Kind:             run.Kind,
@@ -2016,6 +2045,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// none). Both re-read from the row on every claim, like AutoApprove above.
 		OpenMr:     run.OpenMr,
 		BaseBranch: textPtr(run.BaseBranch),
+		// PRD #517 M1: the interactive opt-in rides every claim (a plain bool, false for
+		// every non-interactive and non-task run), re-read from the row like OpenMr above so
+		// a resumed run re-delivers it unchanged. It tells the worker to keep the run alive
+		// (park in awaiting_followup) after signal_done rather than terminating.
+		Interactive: run.Interactive,
 		// PRD #400 M4a: when set, this task run is a diff-review of that target task, and
 		// the worker (M4b) routes on it. nil for a plain handoff and every non-task run.
 		ReviewTargetRunID: uuidPtr(run.ReviewTargetRunID),
@@ -2098,6 +2132,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// clock off the state-ack, but the claim carries it too for a fresh resume.
 			RunTimeoutSeconds:      coalesceInt(run.BudgetWallSeconds, int(s.p.RunTimeout.Seconds())),
 			IdleTimeoutSeconds:     int(s.p.RunIdleTimeout.Seconds()),
+			TaskIdleTimeoutSeconds: taskIdleTimeoutSeconds,
 			MaxIterations:          coalesceInt(run.BudgetMaxIterations, s.p.RunMaxIterations),
 			PlanMaxRevisions:       s.p.PlanMaxRevisions,
 			QuestionMax:            s.p.QuestionMax,
@@ -3171,6 +3206,28 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		rows, err = s.q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
 			OpenQuestionID: pgText(qid), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
+	case "awaiting_followup":
+		// PRD #517 M2/M3 (Decision 3): the interactive-task park. On signal_done an
+		// interactive task run parks IN-PROCESS here instead of finalizing to `completed`,
+		// so the SAME worker holds its slot, clone and SDK session alive for `uzi run
+		// follow-up` to resume with full context. No question requirement (unlike
+		// awaiting_input): the park is not gated on a clarification, and the resume rides a
+		// `follow_up` steering input that SetRunRunning's Decision-7 wake guard keys on.
+		//
+		// ONLY an interactive task run may park this way. The status is meaningless for any
+		// other kind, and accepting it for one would strand a non-resumable run in a
+		// non-terminal status the follow-up path never wakes — so a mismatched report is
+		// genuinely invalid input (a stale, buggy, or hostile worker) and is rejected loudly
+		// with ErrInvalidState, consistent with awaiting_input's missing-question rejection,
+		// rather than silently persisted. A legitimate park always satisfies both guards
+		// (the interactive opt-in is immutable from create, PRD #517 M1), so this never
+		// rejects a real one.
+		if owned.Kind != RunKindTask || !owned.Interactive {
+			return store.Run{}, false, fmt.Errorf("%w: awaiting_followup requires an interactive task run", ErrInvalidState)
+		}
+		rows, err = s.q.SetRunAwaitingFollowup(ctx, store.SetRunAwaitingFollowupParams{
+			SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+		})
 	case "completed":
 		// PRD #265 M1: reconcile the milestone tracker from the lead's signal_done
 		// declaration. progressParams subset-validates the declared ids against the run's
@@ -3211,6 +3268,19 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// converging with the server-side CancelRunServerSide path. SetRunFailed is NOT
 			// called. rows drives the same applied/not-applied logic below (execrows, like
 			// SetRunFailed).
+			rows, err = s.q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{
+				ID: runID, WorkerID: pgUUID(wkr.ID),
+			})
+		case owned.StopKind.Valid && owned.StopKind.String == "stopped":
+			// PRD #517 M4: a graceful stop stamped stop_kind='stopped' BEFORE this report.
+			// Its happy path is the worker finalizing (push + MR iff open_mr) and reporting
+			// `completed`; this arm is the EDGE where the worker instead reports `failed` —
+			// either the finalize (push/MR) threw, or a cancel-then-stop sequence let the
+			// cancel win in steering and the worker threw REASON_CANCELLED. Either way it is a
+			// deliberate wind-down, not an agent bug, so it must NOT default to
+			// fail_origin='agent_failure' and must NOT be judged. Route to CancelRunByWorker
+			// exactly like the 'cancelled' arm: status 'cancelled', fail_origin NULL (CHECK-safe,
+			// no new vocabulary value), which Gate 0 of maybeEnqueueJudge excludes from judging.
 			rows, err = s.q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{
 				ID: runID, WorkerID: pgUUID(wkr.ID),
 			})
@@ -4786,6 +4856,40 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		return s.submitAnswer(ctx, run, body)
 	}
 
+	// A graceful `stop` (PRD #517 M4) is the interactive-run wind-down: unlike cancel/
+	// reject_plan it has NO server-side !live transition branch, because only the worker can
+	// finalize it (push + open MR iff open_mr) and report `completed` with stop_kind='stopped'.
+	// So a stop ALWAYS enqueues via CreateStopVerdictInput, stamping stop_kind='stopped' in the
+	// same statement. A live parked/running worker consumes it and finalizes; a dead-worker
+	// parked run is requeued by M2's stale-heartbeat sweep (awaiting_followup is in
+	// RequeueRunsOfStaleWorkers) and honors the pending stop on resume. The terminal guard at
+	// the top of SubmitInput already 409s a stop on a finished run. Never routes through
+	// CancelRunServerSide/RejectRunServerSide.
+	//
+	// stop_reason carries the operator's OPTIONAL message (like a cancel's — a stop reason is
+	// helpful, not mandatory); the same message is co-written to run_user_inputs.body, NUL-
+	// stripped to avoid Postgres 22021 aborting the CTE.
+	if kind == "stop" {
+		// Only an interactive task run has a park that reads the stop flag, so a stop is
+		// meaningful ONLY there. Reject it on any other run BEFORE stamping, so a
+		// non-interactive-task / chat / plan-gated run cannot acquire a spurious permanent
+		// stop_kind='stopped' and return a misleading success. `run` came from GetRun (a
+		// SELECT *), so Kind and Interactive are populated. The guard is on kind+interactive
+		// only — a RUNNING interactive task (not yet parked) is still a legal stop target.
+		// The owner-scope (GetRun→404) and terminal (ErrRunTerminal→409) guards above run
+		// first and are unchanged.
+		if run.Kind != RunKindTask || !run.Interactive {
+			return SubmitInputResult{}, ErrStopNotInteractive
+		}
+		cleanBody, _ := stripNUL(body)
+		if _, err := s.q.CreateStopVerdictInput(ctx, store.CreateStopVerdictInputParams{
+			RunID: runID, Kind: kind, Body: pgText(cleanBody), StopKind: pgText(stopKindFor(kind)), StopReason: stopReasonParam(body),
+		}); err != nil {
+			return SubmitInputResult{}, err
+		}
+		return SubmitInputResult{ServerSide: false}, nil
+	}
+
 	if kind == "cancel" || kind == "reject_plan" {
 		live, err := s.hasLivePoller(ctx, run)
 		if err != nil {
@@ -5134,16 +5238,18 @@ func orEmpty(v []string) []string {
 }
 
 // stopKindFor maps a deliberate-stop steering kind to the stop signal stamped on the
-// run (PRD #33): a cancel verdict is 'cancelled', a plan reject is 'plan_rejected'.
-// Only cancel/reject_plan reach it (the stop-verdict branch of SubmitInput); the
-// server owns this mapping so the signal never depends on the reason string the
-// worker later reports.
+// run (PRD #33): a cancel verdict is 'cancelled', a plan reject is 'plan_rejected', a
+// graceful interactive wind-down (PRD #517 M4) is 'stopped'. Only cancel/reject_plan/
+// stop reach it (the stop-verdict branches of SubmitInput); the server owns this mapping
+// so the signal never depends on the reason string the worker later reports.
 func stopKindFor(kind string) string {
 	switch kind {
 	case "cancel":
 		return "cancelled"
 	case "reject_plan":
 		return "plan_rejected"
+	case "stop":
+		return "stopped"
 	default:
 		return ""
 	}
@@ -5402,7 +5508,8 @@ func pgText(s string) pgtype.Text {
 // sibling): strip NUL — a NUL in a text column raises Postgres 22021 and would abort the
 // cancel — then trim and cap the length (the same 2048-rune bound as failure_reason). An
 // empty / whitespace-only / NUL-only body stores NULL, never an empty string. Shared by
-// both cancel paths (server-side + live).
+// both cancel paths (server-side + live) and, since PRD #517 M4, by the graceful `stop`
+// path, which carries the operator's OPTIONAL stop reason the same way a cancel does.
 func stopReasonParam(body string) pgtype.Text {
 	clean, _ := stripNUL(body)
 	clean = truncateRunes(strings.TrimSpace(clean), maxFailureReasonRunes)

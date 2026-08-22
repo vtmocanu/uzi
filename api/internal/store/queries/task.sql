@@ -10,15 +10,17 @@
 -- uses). auto_approve is baked true — handoff is the no-plan-gate "just do it" mode
 -- (like self_improve bakes it in), so it is deliberately NOT a parameter. base_branch
 -- is the optional source ref (sqlc.narg → NULL when absent); open_mr rides straight
--- from the caller (--mr).
+-- from the caller (--mr). interactive rides straight from the caller (--interactive, PRD
+-- #517 M1): the worker keeps the run alive (parking in awaiting_followup) after
+-- signal_done rather than terminating; false for an ordinary handoff.
 -- review_requested rides from the caller (--review, PRD #400 M4a): set on this PLAIN task
 -- so that its terminal 'completed' transition auto-creates a diff-review run
 -- (maybeEnqueueTaskReview); false for an ordinary handoff.
 -- then_fix_requested rides from the caller (--then-fix, PRD #400 M5): set on this ORIGINAL
 -- task so that when its auto-spawned review run completes, maybeEnqueueThenFix composes the
 -- review findings into a fix run on the same branch; false for an ordinary handoff.
-INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, open_mr, review_requested, then_fix_requested, issue_title, issue_description, auto_approve)
-VALUES (@run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'), @open_mr, @review_requested, @then_fix_requested, @issue_title, @issue_description, true)
+INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, open_mr, interactive, review_requested, then_fix_requested, issue_title, issue_description, auto_approve)
+VALUES (@run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'), @open_mr, @interactive, @review_requested, @then_fix_requested, @issue_title, @issue_description, true)
 RETURNING *;
 
 -- name: CreateThenFixRun :one

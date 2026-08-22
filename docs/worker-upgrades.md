@@ -25,7 +25,10 @@ by watching the pod rather than by asking the worker.
 | *(no badge)* | Nothing usable to compare | none |
 
 **outdated** — hosted workers are rolled for you when a release changes the image tag, so this
-usually means a roll has not happened yet or did not finish. **External workers are never
+usually means a roll has not happened yet or did not finish. If the worker is still busy when
+its roll starts, the cluster may **cordon/drain** it first — it keeps finishing its current
+runs but stops claiming new ones until the roll completes; see
+[Draining and cordoned](hosted-workers.md#draining-and-cordoned). **External workers are never
 upgraded automatically**, since nothing in uzi can restart a container on your machine: there
 it is a reminder to pull and restart, not a fault. **no badge** — nothing to compare and
 nothing claimed: a locally built worker reports no version, and an api built outside a release

@@ -658,16 +658,29 @@ export function RunView() {
   // worst kind of accessibility bug: the markup looks right". Putting role="status" on
   // the QuestionPanel itself — which mounts with the park — would have been exactly that.
   const [parkAnnounce, setParkAnnounce] = useState("");
-  const parked = run?.status === "awaiting_input" ? (openQuestion?.question.questionId ?? "") : "";
+  // PRD #517: BOTH needs-you parks announce, not just awaiting_input — awaiting_followup is
+  // classified identically by needsHumanAttention and shows the same loud ring, so a
+  // screen-reader user parking into it must get a signal too. A single stable KEY drives
+  // the re-announce logic: awaiting_input keys on the question IDENTITY (a second question
+  // re-announces while a re-render of the same park stays quiet, and an unusable/absent
+  // question does not announce — the UnreadableQuestion branch owns that state), while
+  // awaiting_followup is one stable park. The text is derived from the key in the effect.
+  // NOTE this is PURELY the sr-only announcement; the QuestionPanel below stays
+  // awaiting_input-only.
+  const questionId = run?.status === "awaiting_input" ? (openQuestion?.question.questionId ?? "") : "";
+  const parkKey =
+    questionId !== "" ? `question:${questionId}` : run?.status === "awaiting_followup" ? "followup" : "";
   useEffect(() => {
-    // Keyed on the question IDENTITY, so a second question re-announces while a re-render
-    // of the same park stays quiet.
-    if (parked === "") {
+    if (parkKey === "") {
       setParkAnnounce("");
       return;
     }
-    setParkAnnounce("The agent is asking you a question. The run is parked until you answer.");
-  }, [parked]);
+    setParkAnnounce(
+      parkKey === "followup"
+        ? "The run is waiting for your next follow-up."
+        : "The agent is asking you a question. The run is parked until you answer.",
+    );
+  }, [parkKey]);
 
   if (!run) {
     return (
@@ -803,7 +816,12 @@ export function RunView() {
                   failing from the other side: not a false alarm, a false all-clear.
                   `awaiting_approval` has the same shape and keeps the chip, because a
                   human gate is minutes and someone is expected to be looking; a park
-                  is hours by design, which is what makes it different in kind. */}
+                  is hours by design, which is what makes it different in kind.
+
+                  PRD #517: `awaiting_followup` also KEEPS the chip — it is a needs-you
+                  gate (the user is expected to send the next follow-up), the same kind
+                  as awaiting_input, NOT the self-resuming clock park that limit_wait is.
+                  So only limit_wait is excluded here. */}
               {!terminal && run.status !== "limit_wait" && (
                 <span
                   title={connected ? "Live" : "Reconnecting…"}
@@ -1101,6 +1119,7 @@ export function RunView() {
           connected={connected}
           terminal={terminal}
           phaseUsageBySeq={usage.phaseUsageBySeq}
+          leadContext={usage.leadContext}
         />
       </Card>
 
@@ -1851,7 +1870,19 @@ function JudgeUsageStrip({ judgeRun }: { judgeRun: NonNullable<RunReview["judge_
 // state survives a reload and is visible to anyone viewing the run.
 // All judge free text (summary, rationale, target) renders as escaped React text —
 // never markdown/HTML — since it is untrusted judge/worker output (audit carry-forward).
-export function JudgePanel({ run }: { run: Run }) {
+//
+// The poll's stop cap (PRD #119: 150 tries × 4s ≈ 10 min). Exposed as an injectable prop
+// so tests can drive the exact stop boundary in a handful of ticks instead of 149 real
+// event-loop turns (issue #227); production never passes it, so the default always holds.
+export const JUDGE_POLL_MAX_TRIES = 150;
+
+export function JudgePanel({
+  run,
+  pollMaxTries = JUDGE_POLL_MAX_TRIES,
+}: {
+  run: Run;
+  pollMaxTries?: number;
+}) {
   const [review, setReview] = useState<RunReview | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadErr, setLoadErr] = useState("");
@@ -1987,8 +2018,8 @@ export function JudgePanel({ run }: { run: Run }) {
   //   • the local `queued` window before the server reports a pending judge — the first
   //     response with pending_judge null ends it, same as before;
   //   • everything else — the 150-try cap.
-  // Cap is 150 tries × 4s ≈ 10 minutes — a real judge takes minutes, and the old 15-try
-  // (~1 min) cap gave up while the judge it was waiting on was still running.
+  // Cap is JUDGE_POLL_MAX_TRIES (150) tries × 4s ≈ 10 minutes — a real judge takes minutes,
+  // and the old 15-try (~1 min) cap gave up while the judge it was waiting on was still running.
   useEffect(() => {
     if (!polling) return;
     let tries = 0;
@@ -2008,7 +2039,7 @@ export function JudgePanel({ run }: { run: Run }) {
         // while pendingJudge holds its last non-null value, so the effect never re-runs
         // and never re-runs its cleanup — a permanently-failing endpoint would be
         // polled every 4s until unmount.
-        if (tries >= 150) {
+        if (tries >= pollMaxTries) {
           setQueued(false);
           clearInterval(id);
         }
@@ -2029,13 +2060,13 @@ export function JudgePanel({ run }: { run: Run }) {
         setReview(landed);
         baselineUpdatedAt.current = landed.updated_at;
       }
-      if (nextPending === null || tries >= 150) {
+      if (nextPending === null || tries >= pollMaxTries) {
         setQueued(false);
         clearInterval(id);
       }
     }, 4000);
     return () => clearInterval(id);
-  }, [polling, run.id]);
+  }, [polling, run.id, pollMaxTries]);
 
   const rerun = async () => {
     setActionErr("");

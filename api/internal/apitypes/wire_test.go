@@ -87,6 +87,9 @@ var runDTOKeys = []string{
 	// kind='task' run. base_branch is null on every non-task run; open_mr is false by
 	// default and on every non-task run. Always on the wire.
 	"base_branch", "open_mr",
+	// PRD #517 M1: interactive marks a long-lived task run; false by default and on every
+	// non-task run. Always on the wire, like open_mr above.
+	"interactive",
 	// PRD #400 Decision 6: when a task run's dispatch gate was stamped (null on every
 	// non-task run and on a task run not yet dispatched). Always on the wire.
 	"dispatched_at",
@@ -521,6 +524,9 @@ var workerDTOKeys = []string{
 	// PRD #251: api-owned anchor of when the worker became online; null when offline or
 	// never online. Uptime is derived client-side as now − online_since; display-only.
 	"online_since",
+	// PRD #422/#496: when a hosted worker was cordoned/began draining (finishes in-flight
+	// runs, claims nothing new); null for a worker that will claim normally. Hosted-only.
+	"draining_since",
 	"created_at", "stats_cpu_pct", "stats_mem_bytes",
 	"stats_mem_limit_bytes", "stats_source",
 	// PRD #104 M3: which Anthropic credential this worker's run-lane claims spend.

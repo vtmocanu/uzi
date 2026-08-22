@@ -25,6 +25,7 @@ import {
   canOpenRunView,
   hasActiveRun,
   isAwaitingApproval,
+  isAwaitingFollowup,
   isAwaitingInput,
   needsHumanAttention,
   retryHint,
@@ -399,6 +400,12 @@ export function Board() {
   // looking for a plan gate that is not there. Same visual treatment, different words —
   // which is the whole reason awaiting_input is its own status.
   const [questionRuns, setQuestionRuns] = useState<RunListItem[]>([]);
+  // PRD #517: the viewer's runs on this repo parked awaiting their next follow-up
+  // (awaiting_followup). Its OWN bucket, a sibling to questionRuns rather than folded into
+  // it: a follow-up park is not an unanswered question, so the strip names a distinct
+  // action ("awaiting follow-up"). Same needs-you classification and loud ring as the two
+  // parks above (needsHumanAttention), so it belongs in the "how many need me" tally.
+  const [followupRuns, setFollowupRuns] = useState<RunListItem[]>([]);
   // The viewer's runs on this repo the health detector flagged as looking stuck
   // (PRD #47): any non-ok flag on a run the two buckets above do not already carry.
   // Issue runs only (a ci_fix run has no board card to link to).
@@ -514,13 +521,19 @@ export function Board() {
       setHasToken(hasAnthropicToken(secrets));
       setAwaitingRuns(runs.filter((r) => isAwaitingApproval(r.status)));
       setQuestionRuns(runs.filter((r) => isAwaitingInput(r.status)));
+      setFollowupRuns(runs.filter((r) => isAwaitingFollowup(r.status)));
       setStuckRuns(
         runs.filter(
           (r) =>
             r.health !== "ok" &&
-            // Whatever the two buckets above already show, this one must not repeat.
+            // Whatever the three buckets above already show, this one must not repeat.
             !isAwaitingApproval(r.status) &&
             !isAwaitingInput(r.status) &&
+            // PRD #517: awaiting_followup has its OWN followupRuns bucket now, so exclude it
+            // here — otherwise a stale health flag on a parked run would both count in that
+            // bucket AND read "looks stuck", and the strip below spreads every bucket into
+            // one .map keyed on r.id, so a run in two buckets is a duplicate React key.
+            !isAwaitingFollowup(r.status) &&
             // Belt-and-braces for a STALE flag: the server's exit contract clears
             // health on every status transition, so an approval_idle on some other
             // status should not exist — but if one ever did, "looks stuck" would be
@@ -1258,7 +1271,10 @@ export function Board() {
 
       {error && <Alert message={error} />}
 
-      {(awaitingRuns.length > 0 || questionRuns.length > 0 || stuckRuns.length > 0) && (
+      {(awaitingRuns.length > 0 ||
+        questionRuns.length > 0 ||
+        followupRuns.length > 0 ||
+        stuckRuns.length > 0) && (
         <div
           role="status"
           aria-live="polite"
@@ -1271,13 +1287,18 @@ export function Board() {
               // PRD #88: its own clause, so the strip says which action is owed.
               questionRuns.length > 0 &&
                 `${questionRuns.length} run${questionRuns.length > 1 ? "s" : ""} ${questionRuns.length > 1 ? "need" : "needs"} an answer`,
+              // PRD #517: its own clause too — a follow-up park owes a different action than
+              // an unanswered question, so it names "awaiting follow-up" rather than folding
+              // into the answer count.
+              followupRuns.length > 0 &&
+                `${followupRuns.length} run${followupRuns.length > 1 ? "s" : ""} awaiting follow-up`,
               stuckRuns.length > 0 &&
                 `${stuckRuns.length} run${stuckRuns.length > 1 ? "s" : ""} ${stuckRuns.length > 1 ? "look" : "looks"} stuck`,
             ]
               .filter(Boolean)
               .join(" · ")}
           </span>
-          {[...awaitingRuns, ...questionRuns, ...stuckRuns].map((r) => (
+          {[...awaitingRuns, ...questionRuns, ...followupRuns, ...stuckRuns].map((r) => (
             // Issue #485 NB1: the forge issue anchor rendered by RunIssueRef is a real
             // <a>, so it can no longer nest inside the navigational <Link> (also an <a> —
             // invalid HTML). The pill span is a `relative` container; the run-details

@@ -118,6 +118,10 @@ describe("StatusPill", () => {
     // loop names about itself.
     expect(checked).toContain("awaiting_input");
     expect(checked).toContain("limit_wait");
+    // PRD #517: the follow-up park must render one word on both surfaces too — a missing
+    // RUN_STATUS_LABELS entry would leave StatusPill printing "awaiting followup" against
+    // runBadge's "awaiting follow-up", which this loop then catches.
+    expect(checked).toContain("awaiting_followup");
     expect(checked.length).toBeGreaterThanOrEqual(5);
   });
 });

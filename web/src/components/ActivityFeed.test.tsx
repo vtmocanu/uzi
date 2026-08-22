@@ -1220,3 +1220,122 @@ describe("ActivityFeed — usage-limit park (PRD #35)", () => {
     expect(container.textContent).not.toContain("unrenderable");
   });
 });
+
+// ── Lead context-window meter (PRD #516) ──────────────────────────────────────
+// A lead assistant frame that co-carries `payload.context` (window FILL) alongside
+// `payload.usage`, exactly as the agent attaches it. `agent_instance` stays null so the
+// lane keys to LEAD (the lead lane); a subagent frame passes a distinct instance/agent.
+type Ctx = { used: number; window: number; pct: number };
+function leadCtx(seq: number, ctx: Ctx): RunMessage {
+  return {
+    seq,
+    kind: "text",
+    agent: "lead",
+    agent_instance: null,
+    agent_label: null,
+    payload: { text: "working", usage: { input_tokens: 100, output_tokens: 10 }, context: ctx },
+    created_at: "2026-07-04T00:00:00.000Z",
+  };
+}
+// A distinct subagent instance (its own lane), to force the role rollup (a doubled role
+// makes showRollup true) and to prove no subagent lane/chip ever carries a meter.
+function workerInst(seq: number, id: string): RunMessage {
+  return {
+    seq,
+    kind: "text",
+    agent: "worker",
+    agent_instance: id,
+    agent_label: null,
+    payload: { text: "implementing" },
+    created_at: "2026-07-04T00:00:00.000Z",
+  };
+}
+
+describe("ActivityFeed lead context-window meter", () => {
+  it("renders no meter when no lead frame carries a context", () => {
+    const { queryByTestId } = renderFeed(leadWorkerLead());
+    expect(queryByTestId("lead-context-meter")).toBeNull();
+    expect(queryByTestId("lead-context-micrometer")).toBeNull();
+  });
+
+  it("renders the lane meter on the LEAD lane with the true label", () => {
+    const { getAllByTestId, container } = renderFeed([
+      leadCtx(1, { used: 156_000, window: 200_000, pct: 78 }),
+    ]);
+    const meters = getAllByTestId("lead-context-meter");
+    expect(meters).toHaveLength(1);
+    // The accessible label carries the true percentage and the token detail.
+    expect(meters[0].getAttribute("aria-label")).toBe(
+      "lead context 78% — 156.0k/200.0k tokens",
+    );
+    expect(container.textContent).toContain("78%");
+  });
+
+  it("draws the meter on the LEAD lane ONLY — never on a subagent lane, chip, or lead", () => {
+    // Lead lane carries context; two worker instances make a subagent lane AND double the
+    // worker role so the crew rollup (and thus the lead chip) renders.
+    const { getAllByTestId, queryAllByTestId } = renderFeed([
+      leadCtx(1, { used: 156_000, window: 200_000, pct: 78 }),
+      workerInst(2, "w-1"),
+      workerInst(3, "w-2"),
+    ]);
+    // Exactly one lane meter (the lead lane), never one per subagent lane.
+    expect(getAllByTestId("lead-context-meter")).toHaveLength(1);
+    // Exactly one crew micro-meter (the lead chip), never on a worker chip.
+    expect(getAllByTestId("lead-context-micrometer")).toHaveLength(1);
+    // Sanity: the worker crew chip exists (rollup is showing) but carries no meter.
+    expect(queryAllByTestId("lead-context-meter")).toHaveLength(1);
+  });
+
+  it("ignores a context attached only to a subagent frame (lead-only guard)", () => {
+    // The subagent frame carries a synthetic context; deriveRunUsage drops it, so nothing
+    // renders a meter — the real defense of lead-only scope, not just placement.
+    const subWithCtx: RunMessage = {
+      ...workerInst(1, "w-1"),
+      payload: {
+        text: "implementing",
+        usage: { input_tokens: 500, output_tokens: 50 },
+        context: { used: 190_000, window: 200_000, pct: 95 },
+      },
+    };
+    const { queryByTestId } = renderFeed([subWithCtx, workerInst(2, "w-2")]);
+    expect(queryByTestId("lead-context-meter")).toBeNull();
+    expect(queryByTestId("lead-context-micrometer")).toBeNull();
+  });
+
+  it("ramps cool → molten → near across the three thresholds", () => {
+    const cases: [number, string][] = [
+      [40, "cool"],
+      [69, "cool"],
+      [70, "molten"],
+      [94, "molten"],
+      [95, "near"],
+      [100, "near"],
+      [110, "near"],
+    ];
+    for (const [pct, expected] of cases) {
+      const { getAllByTestId, unmount } = renderFeed([
+        leadCtx(1, { used: Math.round(2_000 * pct), window: 200_000, pct }),
+      ]);
+      const meter = getAllByTestId("lead-context-meter")[0];
+      expect(meter.getAttribute("data-context-state"), `pct=${pct}`).toBe(expected);
+      unmount();
+    }
+  });
+
+  it("clamps the bar width to 100% while the label keeps the true over-100 number", () => {
+    const { getAllByTestId, container } = renderFeed([
+      leadCtx(1, { used: 220_000, window: 200_000, pct: 110 }),
+    ]);
+    const meter = getAllByTestId("lead-context-meter")[0];
+    const fill = getAllByTestId("lead-context-meter-fill")[0] as HTMLElement;
+    // Bar width clamps…
+    expect(fill.style.width).toBe("100%");
+    expect(meter.getAttribute("aria-valuenow")).toBe("100");
+    // …while the label/aria still shows the TRUE unclamped number.
+    expect(meter.getAttribute("aria-valuetext")).toBe("110%");
+    expect(container.textContent).toContain("110%");
+    // Over-100 is near-compaction (danger), the fill saturating the channel.
+    expect(meter.getAttribute("data-context-state")).toBe("near");
+  });
+});

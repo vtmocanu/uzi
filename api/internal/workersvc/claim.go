@@ -55,6 +55,13 @@ type ClaimPayload struct {
 	// behaviour. Read from runs.open_mr (a plain bool, false for every non-task run),
 	// so it re-delivers unchanged on every resume like AutoApprove above.
 	OpenMr bool `json:"open_mr"`
+	// Interactive marks a long-lived, conversational task run (PRD #517 M1). When true the
+	// worker keeps the run alive after signal_done — parking it in awaiting_followup to
+	// iterate rather than terminating — until a 'uzi run stop' winds it down. Read from
+	// runs.interactive (a plain bool, false for every non-interactive and non-task run), so
+	// it re-delivers unchanged on every resume like OpenMr above. Additive on the wire — an
+	// old worker ignores the key and keeps its terminating behaviour.
+	Interactive bool `json:"interactive"`
 	// BaseBranch is the source ref a task run was branched from (PRD #400 M2),
 	// meaningful only for kind='task'. It is carried for context/review — the worker
 	// works the pre-seeded, server-named Branch (uzi/task/<run-id>), not this ref —
@@ -312,7 +319,14 @@ type ClaimAgent struct {
 type ClaimConfig struct {
 	RunTimeoutSeconds  int `json:"run_timeout_seconds"`
 	IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
-	MaxIterations      int `json:"max_iterations"`
+	// TaskIdleTimeoutSeconds is the interactive-task park idle backstop (PRD #517 M5,
+	// WORKER_TASK_IDLE_TIMEOUT): how long a parked interactive task waits at
+	// awaiting_followup for the next follow-up before the worker gracefully finalizes
+	// (push, MR iff open_mr) → completed. Delivered ONLY on an interactive task claim;
+	// omitempty keeps every other claim byte-identical to today's wire, and an older
+	// worker (or a missing field) falls back to its own TASK_FOLLOWUP_IDLE_MS constant.
+	TaskIdleTimeoutSeconds int `json:"task_idle_timeout_seconds,omitempty"`
+	MaxIterations          int `json:"max_iterations"`
 	// PlanMaxRevisions is the PRD #41 plan-revision cap the worker enforces at the
 	// approval gate (server-authoritative; the server also caps in SubmitInput).
 	PlanMaxRevisions int `json:"plan_max_revisions"`

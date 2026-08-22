@@ -418,6 +418,7 @@ type Run struct {
 	StopReason            pgtype.Text        `json:"stop_reason"`
 	RequiredTools         []string           `json:"required_tools"`
 	SizeClass             string             `json:"size_class"`
+	Interactive           bool               `json:"interactive"`
 }
 
 type RunMessage struct {

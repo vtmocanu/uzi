@@ -208,6 +208,18 @@ func TestAutoSelectCandidatesLiveDB(t *testing.T) {
 	mkIssueRun(owner, busy, "running", "auto")
 	mkIssueRun(owner, busy, "awaiting_approval", "pool_stale")
 	mkChatRun(owner, busy, "running")
+	// awaiting_followup (PRD #517): the interactive-task park is an in-process hold on
+	// the SAME credential (SetRunAwaitingFollowup does not clear anthropic_secret_id)
+	// that resumes in-process on that token, so its directed load is real and MUST count
+	// — the same reason awaiting_approval counts (D18c). Inserted as a real interactive
+	// task-run park (kind='task', issue_iid NULL + branch set, per runs_kind_shape) so
+	// the case exercises the exact shape the feature produces.
+	followupRunID := uuid.New()
+	mustExec(ctx, t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, kind, interactive, branch, issue_title, issue_description, status,
+		                   anthropic_secret_id, anthropic_secret_label, anthropic_select_reason)
+		 VALUES ($1, $2, $3, 'task', true, $4, 't', 'd', 'awaiting_followup', $5, 'lbl', 'auto')`,
+		followupRunID, owner, repoID, "uzi/task/"+followupRunID.String(), busy)
 	// NOT counted: not concurrent spend.
 	mkIssueRun(owner, busy, "queued", "auto")
 	mkIssueRun(owner, busy, "completed", "auto")
@@ -263,11 +275,14 @@ func TestAutoSelectCandidatesLiveDB(t *testing.T) {
 		t.Fatalf("never-polled token in_flight_runs = %d, want 0", un.InFlightRuns)
 	}
 
-	// --- 5. Four counted, five not.
-	if got := byID[busy].InFlightRuns; got != 4 {
-		t.Fatalf("busy token in_flight_runs = %d, want 4 (claimed + running + awaiting_approval + chat).\n"+
-			"queued/completed/failed/cancelled must not count (they are not concurrent spend), and "+
-			"awaiting_approval MUST (the worker holds the session and resumes on the same token, D18c)", got)
+	// --- 5. Five counted, five not.
+	if got := byID[busy].InFlightRuns; got != 5 {
+		t.Fatalf("busy token in_flight_runs = %d, want 5 (claimed + running + awaiting_approval + chat + "+
+			"awaiting_followup).\n"+
+			"queued/completed/failed/cancelled must not count (they are not concurrent spend); "+
+			"awaiting_approval MUST (the worker holds the session and resumes on the same token, D18c); and "+
+			"awaiting_followup MUST too (PRD #517 — the interactive-task park is an in-process hold on the "+
+			"same credential that resumes on the same token; drop it from the rollup's IN-list and this reads 4)", got)
 	}
 
 	// --- 6, second scope. The stranger's own list is theirs alone, and their

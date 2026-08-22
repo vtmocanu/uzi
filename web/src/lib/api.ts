@@ -1055,7 +1055,7 @@ export interface Worker {
   // {docker, jvm}. Read-only display. Optional so an older response (or a test
   // fixture) without the field reads as "none".
   capabilities?: string[];
-  busy: boolean; // derived: holds a claimed/running/awaiting_approval run (== active_runs > 0)
+  busy: boolean; // derived: holds ANY run of ANY kind, so a chat-only worker is busy:true with active_runs:0 — NOT active_runs > 0
   // Bounded concurrency (PRD #42 Decision 10). active_runs is the live count of the
   // worker's claimed/running/awaiting_approval runs (busy is derived from it);
   // max_concurrent_runs is the worker's advertised slot cap, null when it advertises
@@ -1117,6 +1117,11 @@ export interface Worker {
   last_heartbeat_at: string | null;
   // api-owned anchor of when the worker became online (null offline); uptime = now − this, derived client-side.
   online_since?: string | null;
+  // Set (to when it was cordoned) while a hosted worker is draining/cordoned: it
+  // finishes its in-flight runs but claims nothing new (PRD #422/#496). null for a
+  // worker that will claim normally. Hosted-only by construction. draining is derived
+  // client-side as draining_since != null; it is ORTHOGONAL to upgrade_status/busy.
+  draining_since: string | null;
   created_at: string;
   // Latest container resource sample (PRD #49), all null until the worker reports
   // one (and re-nulled if it stops). stats_cpu_pct is a percentage of the worker's
@@ -1182,6 +1187,12 @@ export type RunStatus =
    *  to the person who owes the run an action. M1 lands the type; the badge, tone and
    *  composer are M2. */
   | "awaiting_input"
+  /** PRD #517: an interactive task run parked awaiting the owner's next
+   *  follow-up. NON-terminal — deliberately absent from TERMINAL_RUN_STATUSES
+   *  below — but unlike limit_wait it does NOT resume on its own; it needs the
+   *  user. Distinct from awaiting_input (a clarification question) because a
+   *  follow-up park is the run's turn-taking pause, not an unanswered question. */
+  | "awaiting_followup"
   /** Parked until the owner's Anthropic usage window reopens (PRD #35).
    *  NON-terminal — deliberately absent from TERMINAL_RUN_STATUSES below. */
   | "limit_wait"
@@ -1207,7 +1218,15 @@ export { TERMINAL_RUN_STATUSES, isTerminalRun } from "./runStatus";
 // This union crosses a JSON decode boundary, so an unlisted member is a silent lie
 // rather than a type error — TypeScript cannot catch a missing value here, only a
 // test can.
-export type StopKind = "cancelled" | "plan_rejected" | "auto_stopped";
+// PRD #517 M4: "stopped" is stamped on a completed interactive run that was
+// gracefully stopped (board.go). It is NOT a human-stopped failure/cancel — the
+// run lands status="completed" (green success) — so it is deliberately NOT in
+// runBadge's HUMAN_STOP_KINDS; see the note there.
+export type StopKind =
+  | "cancelled"
+  | "plan_rejected"
+  | "auto_stopped"
+  | "stopped";
 
 // RunHealth is the server-side run-health flag (PRD #47): a non-terminal,
 // self-clearing signal that a run looks slow, stuck, or looping. "ok" is the
