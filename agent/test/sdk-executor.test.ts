@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
-import { SdkExecutor, resolveLeadModel, embedSeededPlan, type SdkQueryFn, type SdkExecutorOptions } from "../src/sdk-executor.js";
+import { SdkExecutor, resolveLeadModel, embedSeededPlan, type SdkQueryFn, type SdkExecutorOptions, type ContextUsageReading } from "../src/sdk-executor.js";
 import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate, ClaimSkill, MilestoneProgress } from "../src/protocol.js";
@@ -3605,5 +3605,150 @@ describe("SdkExecutor milestone-reporting enforcement (PRD #390 M3)", () => {
       undefined,
       "the checkpoint dropped latestProgress to undefined — no empty [] is persisted from the executor side",
     );
+  });
+});
+
+// PRD #516 M1: the lead session's live context-window fill is read from the SDK
+// Query's `getContextUsage()` control method once per turn and co-attached to the
+// SAME lead assistant frame that latches `payload.usage`, as `payload.context =
+// { used, window, pct }`. On absence/error/timeout of the control method the frame
+// carries NO `context` key and the turn is unaffected (Risks R1/R2, SC5).
+describe("SdkExecutor lead context-window meter (PRD #516 M1)", () => {
+  const USAGE = { input_tokens: 100, output_tokens: 50 };
+
+  /** A lead assistant frame carrying per-call usage — the frame the usage latch
+   *  (and therefore the context co-attach) fires on. */
+  function leadUsageFrame(text: string): SDKMessage {
+    return {
+      type: "assistant",
+      session_id: "sess-1",
+      message: { usage: USAGE, content: [{ type: "text", text }] },
+    } as unknown as SDKMessage;
+  }
+
+  /** Like `fakeTurns`, but the returned query INSTANCE optionally carries a
+   *  `getContextUsage()` control method, mirroring the real SDK `Query`. */
+  function fakeTurnsWithContext(
+    scripts: Script[],
+    getContextUsage?: () => Promise<ContextUsageReading>,
+  ): { queryFn: SdkQueryFn; turns: Turn[] } {
+    const turns: Turn[] = [];
+    let i = 0;
+    const queryFn: SdkQueryFn = (params) => {
+      const script = scripts[Math.min(i, scripts.length - 1)]!;
+      i++;
+      const turn: Turn = { options: params.options };
+      turns.push(turn);
+      const gen = (async function* () {
+        for await (const p of params.prompt) {
+          const rec = p as { message?: { content?: unknown } };
+          const content = rec.message?.content;
+          turn.promptText = typeof content === "string" ? content : JSON.stringify(content);
+        }
+        const s = typeof script === "function" ? script(params.options.abortController!.signal) : script;
+        if (Array.isArray(s)) for (const m of s) yield m;
+        else yield* s as AsyncIterable<SDKMessage>;
+      })();
+      const instance: AsyncIterable<SDKMessage> & {
+        getContextUsage?: () => Promise<ContextUsageReading>;
+      } = gen;
+      if (getContextUsage) instance.getContextUsage = getContextUsage;
+      return instance;
+    };
+    return { queryFn, turns };
+  }
+
+  /** Emitted messages that carry an attached `context` payload key. */
+  function withContext(emits: EmittedMessage[]): EmittedMessage[] {
+    return emits.filter((m) => m.payload["context"] !== undefined);
+  }
+
+  it("attaches payload.context (mapped {used,window,pct}) to the SAME lead frame that carries usage", async () => {
+    const { queryFn } = fakeTurnsWithContext(
+      [
+        [submitPlan("plan"), resultSuccess()],
+        [leadUsageFrame("working"), signalDone(), resultSuccess()],
+      ],
+      async () => ({ totalTokens: 156000, rawMaxTokens: 200000, percentage: 78 }),
+    );
+    const probe = makeCtx();
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5");
+
+    const carriers = withContext(probe.emits);
+    assert.strictEqual(carriers.length, 1, "context attaches exactly once, on the lead usage frame");
+    assert.deepStrictEqual(carriers[0]!.payload["context"], {
+      used: 156000,
+      window: 200000,
+      pct: 78,
+    });
+    // Co-attached: the context rides the very frame that carries usage (the seam the
+    // web consumer reads inside its `"usage" in payload` branch).
+    assert.deepStrictEqual(carriers[0]!.payload["usage"], USAGE);
+  });
+
+  it("preserves an unclamped pct > 100 (near/over-compaction) verbatim", async () => {
+    const { queryFn } = fakeTurnsWithContext(
+      [
+        [submitPlan("plan"), resultSuccess()],
+        [leadUsageFrame("full"), signalDone(), resultSuccess()],
+      ],
+      async () => ({ totalTokens: 210000, rawMaxTokens: 200000, percentage: 105 }),
+    );
+    const probe = makeCtx();
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    const carriers = withContext(probe.emits);
+    assert.strictEqual(carriers.length, 1);
+    assert.strictEqual((carriers[0]!.payload["context"] as { pct: number }).pct, 105);
+  });
+
+  it("getContextUsage that THROWS: no context key, turn completes normally", async () => {
+    const { queryFn } = fakeTurnsWithContext(
+      [
+        [submitPlan("plan"), resultSuccess()],
+        [leadUsageFrame("working"), signalDone(), resultSuccess()],
+      ],
+      async () => {
+        throw new Error("control channel unsupported");
+      },
+    );
+    const probe = makeCtx();
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5", "the run completes despite the failed control call");
+    assert.strictEqual(withContext(probe.emits).length, 0, "no message carries a context key");
+    // The usage attach is untouched by the failed context read.
+    assert.ok(probe.emits.some((m) => m.payload["usage"] !== undefined), "usage still attaches");
+  });
+
+  it("getContextUsage that HANGS: the timeout fires, no context key, turn completes", async () => {
+    const { queryFn } = fakeTurnsWithContext(
+      [
+        [submitPlan("plan"), resultSuccess()],
+        [leadUsageFrame("working"), signalDone(), resultSuccess()],
+      ],
+      // Never resolves — only the executor's Promise.race timeout ends the wait.
+      () => new Promise<ContextUsageReading>(() => {}),
+    );
+    const probe = makeCtx();
+    // A short timeout keeps the test fast (default is 2s) while proving the race.
+    const result = await new SdkExecutor(nullLogger(), homeDir, {
+      queryFn,
+      contextUsageTimeoutMs: 50,
+    }).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5", "the hang does not block the turn");
+    assert.strictEqual(withContext(probe.emits).length, 0, "no message carries a context key");
+  });
+
+  it("NO getContextUsage method (existing fake shape): no context key, turn completes (graceful degradation)", async () => {
+    const { queryFn } = fakeTurnsWithContext([
+      [submitPlan("plan"), resultSuccess()],
+      [leadUsageFrame("working"), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx();
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5");
+    assert.strictEqual(withContext(probe.emits).length, 0, "an absent control method attaches no context");
+    assert.ok(probe.emits.some((m) => m.payload["usage"] !== undefined), "usage still attaches");
   });
 });

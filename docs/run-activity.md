@@ -171,6 +171,36 @@ The `waiting`/`idle` split is a recency heuristic (no precise handoff signal
 exists yet), so it can lag up to 30 seconds — cosmetic only, it never affects
 the `working`/`stalled`/`done` states above.
 
+## Lead context meter
+
+A molten "steel channel" meter shows how full the **lead's** live context
+window is right now — the fill that predicts the SDK's autocompaction, not
+token spend (see [why a hosted run costs less](./run-cost.md) for the spend
+side). It lives on the **lead lane header** in By-agent view (`sm` screens
+and up, next to the timestamp), and as a small micro-meter + `%` on the
+**lead's crew chip** whenever the crew rollup is showing (a doubled role or
+more lanes than fit a glance, see Crew roster above) — on a small run with no
+rollup, the lane meter is the one that's always there.
+
+Three states track how close the lead is to compaction:
+
+| State | Fill | Meaning |
+|---|---|---|
+| cool | `< 70%` | Plenty of room — a quiet steel bar, no glow. |
+| molten | `70–95%` | Filling toward the line — an orange glow. |
+| near-compaction | `≥ 95%` | Into the danger wash — a pulsing rose glow (steady, not pulsing, under reduced motion). |
+
+**100% is the compaction line**, not a 90% warning tick: the SDK's
+`rawMaxTokens` already *is* the autocompact window, so the channel spans the
+whole budget and the top of it is where the SDK summarizes older turns. The
+bar clamps at 100% width; the label keeps showing the true number if the
+reading comes back over 100.
+
+**Subagent lanes carry no meter.** The SDK only exposes the main-loop
+window — the lead's — so a Task subagent's own context fill isn't
+observable at all, not just hidden. If a future SDK release exposes it,
+the same lane treatment would extend to those lanes.
+
 ## Logs: collapsed by default, opt-in Follow
 
 Each lane's log is an accordion, **closed by default**, with a live
