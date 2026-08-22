@@ -25,6 +25,10 @@ vi.mock("../lib/api", async (importOriginal) => {
       setRepoRequiredCapabilities: vi.fn(),
       setRepoGuardrailOverride: vi.fn(),
       clearRepoGuardrailOverride: vi.fn(),
+      getProjectSyncStatus: vi.fn(),
+      provisionProjectSync: vi.fn(),
+      adoptProjectSync: vi.fn(),
+      disableProjectSync: vi.fn(),
     },
   };
 });
@@ -560,6 +564,129 @@ describe("Repos — enable guardrail 422 violations (PRD #345)", () => {
     fireEvent.click(row().getByRole("button", { name: /^Enable$/ }));
     await waitFor(() => expect(screen.queryByText("reason one")).toBeNull());
     expect(screen.queryByText("reason two")).toBeNull();
+  });
+});
+
+describe("Repos — GitHub Projects sync (PRD #534 M3)", () => {
+  const GH_CONN: ForgeConnection = {
+    ...CONN,
+    id: "conn-gh",
+    forge_type: "github",
+    base_url: "https://github.com",
+  };
+  const GH_REPO: Repo = repo({
+    id: "repo-gh",
+    path_with_namespace: "vtmocanu/gh",
+    connection_id: "conn-gh",
+  });
+
+  const linkedStatus = {
+    project_number: 42,
+    owned_by_uzi: true,
+    last_synced_at: "2026-08-20T10:00:00Z",
+    last_error: null,
+    item_count: 7,
+  };
+
+  // Open the Project-sync panel for a GitHub repo row and return its group element.
+  async function openSyncPanel(name: string): Promise<HTMLElement> {
+    renderPage();
+    await screen.findByText(name);
+    fireEvent.click(within(rowFor(name)).getByRole("button", { name: /Project sync settings for/ }));
+    return screen.getByRole("group", { name: new RegExp(`Project sync for ${name}`) });
+  }
+
+  beforeEach(() => {
+    mockApi.listConnections.mockResolvedValue({ connections: [GH_CONN] });
+    mockApi.listProjects.mockResolvedValue({ repos: [{ ...GH_REPO }] });
+    // Default: not linked (404) so the panel opens on the provision/adopt state.
+    mockApi.getProjectSyncStatus.mockRejectedValue(new ApiError(404, "project sync not enabled for this repo"));
+  });
+
+  it("renders the Sync badge + Manage on an enabled GitHub repo", async () => {
+    renderPage();
+    await screen.findByText("vtmocanu/gh");
+    const row = within(rowFor("vtmocanu/gh"));
+    expect(row.getByText("Sync")).toBeTruthy();
+    expect(row.getByRole("button", { name: /Project sync settings for vtmocanu\/gh/ })).toBeTruthy();
+  });
+
+  it("renders — (no Manage) for a GitLab connection's repo", async () => {
+    // The default gitlab CONN with a gitlab repo: the cell is non-applicable.
+    mockApi.listConnections.mockResolvedValue({ connections: [CONN] });
+    mockApi.listProjects.mockResolvedValue({ repos: [repo({ id: "repo-gl", path_with_namespace: "vtmocanu/gl" })] });
+    renderPage();
+    await screen.findByText("vtmocanu/gl");
+    const row = within(rowFor("vtmocanu/gl"));
+    expect(row.queryByRole("button", { name: /Project sync settings/ })).toBeNull();
+    expect(row.queryByText("Sync")).toBeNull();
+  });
+
+  it("opening Manage fetches status; a 404 shows the Provision + Adopt forms", async () => {
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await waitFor(() => expect(mockApi.getProjectSyncStatus).toHaveBeenCalledWith("repo-gh"));
+    expect(within(panel).getByText("Not linked")).toBeTruthy();
+    expect(within(panel).getByRole("button", { name: /Provision/ })).toBeTruthy();
+    expect(within(panel).getByRole("button", { name: /Adopt/ })).toBeTruthy();
+  });
+
+  it("a 200 status shows the linked readout + Disable, and Disable calls disableProjectSync", async () => {
+    mockApi.getProjectSyncStatus.mockResolvedValue({ ...linkedStatus });
+    mockApi.disableProjectSync.mockResolvedValue(null);
+    const panel = await openSyncPanel("vtmocanu/gh");
+
+    await within(panel).findByText("Linked");
+    // The readout surfaces the project number, ownership, and item count.
+    expect(within(panel).getByText("#42")).toBeTruthy();
+    expect(within(panel).getByText("owned by uzi")).toBeTruthy();
+
+    fireEvent.click(within(panel).getByRole("button", { name: /Disable sync/ }));
+    await waitFor(() => expect(mockApi.disableProjectSync).toHaveBeenCalledWith("repo-gh"));
+  });
+
+  it("Provision calls provisionProjectSync with the chosen owner_kind + title", async () => {
+    mockApi.provisionProjectSync.mockResolvedValue({ status: "provisioned" });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Not linked");
+
+    fireEvent.change(within(panel).getByLabelText("Provision owner"), { target: { value: "org" } });
+    fireEvent.change(within(panel).getByLabelText("Project title"), { target: { value: "My board" } });
+    fireEvent.click(within(panel).getByRole("button", { name: /Provision/ }));
+
+    await waitFor(() =>
+      expect(mockApi.provisionProjectSync).toHaveBeenCalledWith("repo-gh", {
+        owner_kind: "org",
+        title: "My board",
+      }),
+    );
+  });
+
+  it("Adopt calls adoptProjectSync with the project number + owner_kind", async () => {
+    mockApi.adoptProjectSync.mockResolvedValue({ status: "linked" });
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Not linked");
+
+    fireEvent.change(within(panel).getByLabelText("Adopt owner"), { target: { value: "viewer" } });
+    fireEvent.change(within(panel).getByLabelText("Project number"), { target: { value: "7" } });
+    fireEvent.click(within(panel).getByRole("button", { name: /Adopt/ }));
+
+    await waitFor(() =>
+      expect(mockApi.adoptProjectSync).toHaveBeenCalledWith("repo-gh", {
+        project_number: 7,
+        owner_kind: "viewer",
+      }),
+    );
+  });
+
+  it("a 409 from provision surfaces the 'ask an admin' message", async () => {
+    mockApi.provisionProjectSync.mockRejectedValue(new ApiError(409, "project sync disabled"));
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Not linked");
+
+    fireEvent.click(within(panel).getByRole("button", { name: /Provision/ }));
+    expect(
+      await within(panel).findByText(/turned off for this instance — ask an admin to enable it/i),
+    ).toBeTruthy();
   });
 });
 

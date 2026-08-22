@@ -407,6 +407,20 @@ export interface GuardrailOverrideMeta {
   at: string;
 }
 
+// GitHub Projects v2 sync status for one repo (PRD #534). Returned by the
+// per-repo status endpoint when the repo is linked; a 404 means "not linked"
+// (indistinguishable from a non-owner probe — existence-hiding is intentional).
+export interface ProjectSyncStatus {
+  project_number: number;
+  owned_by_uzi: boolean;
+  last_synced_at: string | null;
+  last_error: string | null;
+  item_count: number;
+}
+// Which GitHub owner a provision/adopt targets (PRD #534): the connecting user,
+// an org, or the token's own viewer. "user" is the default.
+export type ProjectSyncOwnerKind = "user" | "org" | "viewer";
+
 // BlockedRepo is one row of the admin cross-user blocked-repos list (PRD #66 M9,
 // D8): a repo that is blocked by the guardrail OR carries an active admin override.
 export interface BlockedRepo {
@@ -2812,6 +2826,31 @@ const realApi = {
   // Revoke the override (PRD #66 D8): NULLs it, re-arming the guardrail immediately.
   clearRepoGuardrailOverride: (id: string) =>
     request<{ repo: Repo }>("DELETE", `/admin/repos/${id}/guardrail-override`),
+
+  // GitHub Projects v2 sync (PRD #534). Owner-or-admin; the server 404s a
+  // non-linked or non-owner repo (existence-hiding). Read the current link
+  // status; a 404 is the caller's "not linked yet" signal.
+  getProjectSyncStatus: (id: string) =>
+    request<ProjectSyncStatus>("GET", `/repos/${id}/github-project-sync`),
+  // Provision a brand-new Project v2 for this repo (201 { status: "provisioned" }).
+  // An empty title lets the server pick a default.
+  provisionProjectSync: (
+    id: string,
+    body: { owner_kind: ProjectSyncOwnerKind; title?: string },
+  ) =>
+    request<{ status: string }>(
+      "POST",
+      `/repos/${id}/github-project-sync/provision`,
+      { owner_kind: body.owner_kind, title: body.title ?? "" },
+    ),
+  // Adopt an EXISTING Project v2 by number (200 { status: "linked" }).
+  adoptProjectSync: (
+    id: string,
+    body: { project_number: number; owner_kind: ProjectSyncOwnerKind },
+  ) => request<{ status: string }>("POST", `/repos/${id}/github-project-sync`, body),
+  // Unlink the repo from its project (204, empty body). Idempotent server-side.
+  disableProjectSync: (id: string) =>
+    request<null>("DELETE", `/repos/${id}/github-project-sync`),
 
   getBoard: (repoId: string) =>
     request<{ board: Board }>("GET", `/repos/${repoId}/board`),

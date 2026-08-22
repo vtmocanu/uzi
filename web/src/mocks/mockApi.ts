@@ -44,6 +44,8 @@ import {
   type NotificationList,
   type PendingJudge,
   type PrivilegeReport,
+  type ProjectSyncOwnerKind,
+  type ProjectSyncStatus,
   type RecommendationCategory,
   type Run,
   type RunPriority,
@@ -851,6 +853,61 @@ let userSettings: UserSettings = loadedSettings.userSettings;
 let workers = mockWorkers.map((w) => ({ ...w }));
 let connections = [{ ...mockConnection }];
 let repos = mockRepos.map((r) => ({ ...r }));
+// PRD #534: a GitHub connection plus two GitHub repos so the Boards "Project
+// sync" cell renders and its linked/unlinked panel states are exercisable under
+// VITE_UZI_MOCK=1. gitlab (conn-1) stays FIRST so it remains the demo's default
+// selection and the existing gitlab-oriented flows are untouched — select the
+// GitHub bot to reach these rows. The sync cell keys off the SELECTED
+// connection's forge_type, so both repos read as GitHub once conn-gh is picked.
+connections = [
+  ...connections,
+  {
+    ...mockConnection,
+    id: "conn-gh",
+    forge_type: "github",
+    base_url: "https://github.com",
+    bot_username: "uzi-bot-gh",
+  },
+];
+repos = [
+  ...repos,
+  {
+    ...repos[0],
+    id: "repo-gh-linked",
+    connection_id: "conn-gh",
+    path_with_namespace: "vtmocanu/gh-linked",
+    web_url: "https://github.com/vtmocanu/gh-linked",
+    pipeline: null,
+    guardrail_override: null,
+    guardrail_blocked: false,
+  },
+  {
+    ...repos[0],
+    id: "repo-gh-unlinked",
+    connection_id: "conn-gh",
+    path_with_namespace: "vtmocanu/gh-unlinked",
+    web_url: "https://github.com/vtmocanu/gh-unlinked",
+    pipeline: null,
+    guardrail_override: null,
+    guardrail_blocked: false,
+  },
+];
+// PRD #534: in-memory GitHub Projects v2 links, keyed by repo id. Seeded with
+// repo-gh-linked so the "linked" readout is visible; repo-gh-unlinked is left
+// absent so the provision/adopt state shows. Mirrors the server: getStatus 404s
+// an unlinked repo, provision/adopt set the entry, disable deletes it.
+const githubProjectLinks = new Map<string, ProjectSyncStatus>([
+  [
+    "repo-gh-linked",
+    {
+      project_number: 42,
+      owned_by_uzi: true,
+      last_synced_at: new Date(Date.now() - 5 * 60_000).toISOString(),
+      last_error: null,
+      item_count: 7,
+    },
+  ],
+]);
 
 // ── Scheduled runs (PRD #241) demo fixtures + helpers ──────────────────────
 // schedulePreviewCap mirrors the server's clamp on the preview N (PRD #241 M4).
@@ -2400,6 +2457,50 @@ export const mockApi = {
     // messages). This is what makes Revoke round-trip back to "runs blocked".
     r.guardrail_blocked = (mockBlockedRepoMeta[id]?.block_messages.length ?? 0) > 0;
     return delay({ repo: { ...r } });
+  },
+
+  // ── GitHub Projects v2 sync (PRD #534) ───────────────────────────────────────
+  // Read the repo's link status. Mirrors the server: a linked repo returns its
+  // status object; an unlinked one 404s ("project sync not enabled for this repo"),
+  // the same 404 the server uses to hide existence from a non-owner.
+  getProjectSyncStatus: async (id: string) => {
+    const link = githubProjectLinks.get(id);
+    if (!link) throw new ApiError(404, "project sync not enabled for this repo");
+    return delay({ ...link });
+  },
+  // Provision a fresh project: record a uzi-owned link and return the created status.
+  provisionProjectSync: async (
+    id: string,
+    body: { owner_kind: ProjectSyncOwnerKind; title?: string },
+  ) => {
+    void body;
+    githubProjectLinks.set(id, {
+      project_number: 1000 + githubProjectLinks.size,
+      owned_by_uzi: true,
+      last_synced_at: null,
+      last_error: null,
+      item_count: 0,
+    });
+    return delay({ status: "provisioned" });
+  },
+  // Adopt an existing project by number: record an adopted (not uzi-owned) link.
+  adoptProjectSync: async (
+    id: string,
+    body: { project_number: number; owner_kind: ProjectSyncOwnerKind },
+  ) => {
+    githubProjectLinks.set(id, {
+      project_number: body.project_number,
+      owned_by_uzi: false,
+      last_synced_at: null,
+      last_error: null,
+      item_count: 0,
+    });
+    return delay({ status: "linked" });
+  },
+  // Unlink the repo from its project (empty 204 body).
+  disableProjectSync: async (id: string) => {
+    githubProjectLinks.delete(id);
+    return delay(null);
   },
 
   // ── Tool allowlist + repo tool profiles (PRD #18 M4) ─────────────────────────

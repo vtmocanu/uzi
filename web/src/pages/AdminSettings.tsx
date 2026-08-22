@@ -30,7 +30,7 @@ import {
 } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
 import { DocLink } from "../components/DocLink";
-import { DOC_ADMIN_SETTINGS } from "../lib/doclinks";
+import { DOC_ADMIN_SETTINGS, DOC_GITHUB_PROJECT_SYNC } from "../lib/doclinks";
 import { THEMES, THEME_LABELS } from "../lib/theme";
 
 // slackStatusChip renders the live Slack connection state (PRD #25 M2) as a
@@ -1538,7 +1538,7 @@ function GithubProjectSyncCard({
           Projects v2 Status field, so a team that prefers GitHub&rsquo;s native board stays in
           step. It is off by default because it spends GitHub API rate limit on every board
           move — an instance-wide cost lever. GitLab and Forgejo repos are unaffected. See the{" "}
-          <DocLink slug="github-project-sync">GitHub Projects v2 sync</DocLink> guide.
+          <DocLink slug={DOC_GITHUB_PROJECT_SYNC}>GitHub Projects v2 sync</DocLink> guide.
         </p>
       </div>
 
