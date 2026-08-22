@@ -388,6 +388,7 @@ type ProjectSyncStatus struct {
 	LastError        *string    `json:"last_error"`
 	ItemCount        int        `json:"item_count"`
 	UnmatchedColumns []string   `json:"unmatched_columns"`
+	NoDoneOption     bool       `json:"no_done_option"`
 }
 
 // ErrNoDisposition is returned by DeleteDisposition when the recommendation had
