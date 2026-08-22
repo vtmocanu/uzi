@@ -77,6 +77,22 @@ export function Repos() {
   const [provisionTitle, setProvisionTitle] = useState("");
   const [adoptOwnerKind, setAdoptOwnerKind] = useState<ProjectSyncOwnerKind>("user");
   const [adoptProjectNumber, setAdoptProjectNumber] = useState("");
+  // Board access (PRD #557), inside the linked readout. Visibility is fetched
+  // lazily when the panel opens, in its OWN call (D4): null = not-yet-loaded or
+  // unavailable (toggle disabled), true/false = the board's public flag.
+  // A visibility fetch/toggle failure lands in syncVisibilityError — a small
+  // inline caption — so it never blows away the whole linked readout.
+  const [syncPublic, setSyncPublic] = useState<boolean | null>(null);
+  const [syncVisibilityError, setSyncVisibilityError] = useState("");
+  const [syncVisibilityBusy, setSyncVisibilityBusy] = useState(false);
+  // Write-only sharing (D2): GitHub exposes no collaborator list, so we grant/
+  // revoke by username and remember just the usernames granted THIS session so a
+  // revoke affordance and a transient confirmation can show for them.
+  const [shareUsername, setShareUsername] = useState("");
+  const [sharedThisSession, setSharedThisSession] = useState<string[]>([]);
+  const [shareBusy, setShareBusy] = useState(false);
+  const [shareError, setShareError] = useState("");
+  const [shareConfirmation, setShareConfirmation] = useState("");
   // The guardrail Allow-anyway modal (PRD #66 M9, D8): the repo whose modal is open,
   // the admin's reason, and the in-flight POST. Revoke reuses overrideBusyId.
   const [allowRepoId, setAllowRepoId] = useState<string | null>(null);
@@ -123,11 +139,34 @@ export function Repos() {
   // the provision/adopt forms. Any other failure lands in syncError.
   const loadSyncStatus = useCallback(async (repoId: string) => {
     setSyncError("");
+    // Board-access state is per-board; reset it on every (re)load so state from a
+    // previously linked board never bleeds onto a re-linked one. provision/adopt/
+    // disable re-enter here WITHOUT the panel-open reset effect, so this — not that
+    // effect — is the single place that clears it (PRD #557 review).
+    setSyncPublic(null);
+    setSyncVisibilityError("");
+    setShareUsername("");
+    setSharedThisSession([]);
+    setShareError("");
+    setShareConfirmation("");
     setSyncLoading(true);
     try {
       const status = await api.getProjectSyncStatus(repoId);
       setSyncStatus(status);
       setSyncLinked(true);
+      // Board visibility is a SEPARATE live-forge call (D4), only worth making
+      // once we know the repo is linked. Its own try/catch: a failure sets a
+      // small inline caption and leaves syncPublic=null (toggle disabled) — it
+      // must NOT set the big syncError alert or break the rest of the readout.
+      try {
+        const vis = await api.getProjectSyncVisibility(repoId);
+        setSyncPublic(vis.public);
+      } catch (visErr) {
+        setSyncPublic(null);
+        setSyncVisibilityError(
+          visErr instanceof ApiError ? visErr.message : "Couldn't read the board's visibility.",
+        );
+      }
     } catch (err) {
       if (err instanceof ApiError && err.status === 404) {
         setSyncStatus(null);
@@ -150,6 +189,8 @@ export function Repos() {
     setProvisionTitle("");
     setAdoptOwnerKind("user");
     setAdoptProjectNumber("");
+    // Board-access state is reset inside loadSyncStatus (the single place that owns
+    // it, so provision/adopt/disable re-entries clear it too — PRD #557 review).
     loadSyncStatus(syncRepoId);
     syncPanelRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
   }, [syncRepoId, loadSyncStatus]);
@@ -220,6 +261,69 @@ export function Repos() {
       setSyncError(syncErrorMessage(err));
     } finally {
       setSyncBusy(false);
+    }
+  };
+
+  // Board access — visibility toggle + write-only sharing (PRD #557). All three
+  // route failures through inline copy near their control, never the top Alert.
+
+  // Flip the board's public flag. Awaits the PUT and adopts the response's
+  // `public` (authoritative), so the toggle reflects true state; an error keeps
+  // the last-known value and shows an inline caption.
+  const toggleVisibility = async (repoId: string, next: boolean) => {
+    setSyncVisibilityError("");
+    setSyncVisibilityBusy(true);
+    try {
+      const vis = await api.setProjectSyncVisibility(repoId, next);
+      setSyncPublic(vis.public);
+    } catch (err) {
+      setSyncVisibilityError(syncErrorMessage(err));
+    } finally {
+      setSyncVisibilityBusy(false);
+    }
+  };
+
+  // Map a share/unshare failure to inline copy. 422 is a bad username
+  // (ErrProjectSyncUserNotFound); everything else reuses the shared mapping.
+  const shareErrorMessage = (err: unknown, username: string): string => {
+    if (err instanceof ApiError && err.status === 422)
+      return `No GitHub user named "${username}".`;
+    return syncErrorMessage(err);
+  };
+
+  const shareSync = async (repoId: string) => {
+    const username = shareUsername.trim();
+    setShareError("");
+    setShareConfirmation("");
+    if (!username) {
+      setShareError("Enter a GitHub username.");
+      return;
+    }
+    setShareBusy(true);
+    try {
+      await api.shareProjectSync(repoId, username);
+      setSharedThisSession((prev) => (prev.includes(username) ? prev : [...prev, username]));
+      setShareUsername("");
+      setShareConfirmation(`Shared with ${username} as Reader.`);
+    } catch (err) {
+      setShareError(shareErrorMessage(err, username));
+    } finally {
+      setShareBusy(false);
+    }
+  };
+
+  const unshareSync = async (repoId: string, username: string) => {
+    setShareError("");
+    setShareConfirmation("");
+    setShareBusy(true);
+    try {
+      await api.unshareProjectSync(repoId, username);
+      setSharedThisSession((prev) => prev.filter((u) => u !== username));
+      setShareConfirmation(`Revoked ${username}'s access.`);
+    } catch (err) {
+      setShareError(shareErrorMessage(err, username));
+    } finally {
+      setShareBusy(false);
     }
   };
 
@@ -1176,6 +1280,109 @@ export function Repos() {
                         <dd className="text-fg">{syncStatus.last_error ?? "none"}</dd>
                       </div>
                     </dl>
+
+                    {/* Board access (PRD #557): visibility toggle + write-only
+                        sharing. GitHub-gated already (linked implies GitHub). */}
+                    <div className="space-y-3 rounded-md border border-edge bg-raised p-3">
+                      <h4 className="text-sm font-semibold text-fg">Board access</h4>
+
+                      {/* Visibility toggle. syncPublic===null (and no error) reads
+                          as loading/unavailable → disabled. */}
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2">
+                          <Toggle
+                            label="Board visibility"
+                            checked={syncPublic === true}
+                            disabled={syncPublic === null || syncVisibilityBusy}
+                            onChange={(next) => toggleVisibility(syncRepo.id, next)}
+                          />
+                          <span className="text-sm text-fg">
+                            {syncVisibilityError
+                              ? "Visibility unavailable"
+                              : syncPublic === null
+                                ? "Loading visibility…"
+                                : syncPublic === true
+                                  ? "Public board"
+                                  : "Private board"}
+                          </span>
+                        </div>
+                        {syncPublic === true && (
+                          <p className="text-xs text-warn">
+                            This board is visible to anyone on the internet.
+                          </p>
+                        )}
+                        {syncVisibilityError && (
+                          <p role="alert" className="text-xs text-danger">
+                            {syncVisibilityError}
+                          </p>
+                        )}
+                      </div>
+
+                      {/* Share field (write-only). */}
+                      <div className="space-y-2">
+                        <div className="flex flex-wrap items-end gap-2">
+                          <label className="block flex-1 space-y-1">
+                            {/* The visible label IS the input's accessible name
+                                (no overriding aria-label) — WCAG 2.5.3 label-in-name. */}
+                            <span className="text-xs text-muted">Share with a GitHub user (Reader)</span>
+                            <Input
+                              value={shareUsername}
+                              disabled={shareBusy}
+                              placeholder="octocat"
+                              onChange={(e) => setShareUsername(e.target.value)}
+                            />
+                          </label>
+                          <Button size="sm" disabled={shareBusy} onClick={() => shareSync(syncRepo.id)}>
+                            {shareBusy ? "Working…" : "Share (Reader)"}
+                          </Button>
+                        </div>
+                        {/* Async grant/revoke outcomes announce to assistive tech:
+                            errors assertively (role=alert), confirmations politely
+                            (role=status), matching the panel's <Alert> precedent. */}
+                        {shareError && (
+                          <p role="alert" className="text-xs text-danger">
+                            {shareError}
+                          </p>
+                        )}
+                        {shareConfirmation && (
+                          <p role="status" className="text-xs text-ok">
+                            {shareConfirmation}
+                          </p>
+                        )}
+                        {sharedThisSession.length > 0 && (
+                          <div className="space-y-1">
+                            {/* Scope this list so it is not misread as an
+                                authoritative current-collaborators list (D2). */}
+                            <p className="text-xs text-muted">Granted this session:</p>
+                            <ul
+                              className="space-y-1"
+                              aria-label="Users granted access this session (GitHub does not expose the full current list)"
+                            >
+                              {sharedThisSession.map((name) => (
+                                <li key={name} className="flex items-center justify-between gap-2 text-sm">
+                                  <span className="font-mono text-fg">{name}</span>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    disabled={shareBusy}
+                                    onClick={() => unshareSync(syncRepo.id, name)}
+                                  >
+                                    Revoke
+                                  </Button>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                        {/* The honesty note (SC-5): a positive, always-present
+                            element — GitHub exposes no readable collaborator list. */}
+                        <p className="text-xs text-muted">
+                          GitHub does not expose a board&rsquo;s current sharing list, so uzi grants
+                          and revokes access by username rather than showing who currently has it.
+                        </p>
+                      </div>
+                    </div>
+
                     <Button
                       variant="danger"
                       size="sm"

@@ -67,7 +67,10 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 151 as of this commit (issue #534 relocated the four github-project-sync routes
+// 155 as of this commit (PRD #557 added GET+PUT /api/repos/{id}/github-project-sync/
+// visibility and POST+DELETE /api/repos/{id}/github-project-sync/collaborators — the
+// four board-access routes).
+// It was 151 until then (issue #534 relocated the four github-project-sync routes
 // from /api/admin/repos/{id}/... to /api/repos/{id}/... — a move, not a count change).
 // It was 150 until PRD #364 M4 added POST
 // /api/admin/repos/{id}/github-project-sync/provision, 149 until PRD #364 M7 added GET
@@ -157,6 +160,9 @@ var wantRouteMounts = []routeMount{
 	// teardown, no user-spammable forge proxying → noLimiter, like the admin write
 	// group it left.
 	{"DELETE", "/api/repos/{id}/github-project-sync", noLimiter},
+	// PRD #557 board-access revoke: same owner-or-admin write group as the sibling
+	// github-project-sync routes → noLimiter.
+	{"DELETE", "/api/repos/{id}/github-project-sync/collaborators", noLimiter},
 	{"DELETE", "/api/runs/{id}/review/recommendations/{recID}/disposition", noLimiter},
 	// Schedule delete (PRD #241 M4): owner-scoped DB delete, no forge read → noLimiter.
 	{"DELETE", "/api/schedules/{id}", noLimiter},
@@ -241,6 +247,9 @@ var wantRouteMounts = []routeMount{
 	// from the admin READ group to owner-or-admin /repos (D4). A read of the stored
 	// projection, no forge call → noLimiter.
 	{"GET", "/api/repos/{id}/github-project-sync", noLimiter},
+	// PRD #557 board-access visibility read: a lazy forge round-trip on the same
+	// owner-or-admin group as the sibling routes → noLimiter, like the sibling reads.
+	{"GET", "/api/repos/{id}/github-project-sync/visibility", noLimiter},
 	{"GET", "/api/repos/{id}/issues/{iid}", limForge},
 	{"GET", "/api/repos/{id}/tool-profile", noLimiter},
 	{"GET", "/api/runs/", noLimiter},
@@ -357,6 +366,8 @@ var wantRouteMounts = []routeMount{
 	// so they wear no per-user limiter → noLimiter, as in the admin write group they left.
 	{"POST", "/api/repos/{id}/github-project-sync", noLimiter},
 	{"POST", "/api/repos/{id}/github-project-sync/provision", noLimiter},
+	// PRD #557 board-access grant (Reader): same owner-or-admin write group → noLimiter.
+	{"POST", "/api/repos/{id}/github-project-sync/collaborators", noLimiter},
 	{"POST", "/api/repos/{id}/issues", limForge},
 	{"POST", "/api/repos/{id}/issues/{iid}/move", limForge},
 	{"POST", "/api/repos/{id}/issues/{iid}/prdless", limForge},
@@ -449,6 +460,8 @@ var wantRouteMounts = []routeMount{
 	// merits above; it never needed that claim.
 	{"PUT", "/api/repos/{id}/board/order", limBoardOrder},
 	{"PUT", "/api/repos/{id}/board/prefs", noLimiter},
+	// PRD #557 board-access visibility write: same owner-or-admin group → noLimiter.
+	{"PUT", "/api/repos/{id}/github-project-sync/visibility", noLimiter},
 	{"PUT", "/api/repos/{id}/tool-profile", noLimiter},
 	// PRD #35 Decision 7, the per-run toggle. noLimiter for the same reason as
 	// /me/wait-on-limit: one owner-scoped boolean UPDATE, no spend, no forge write,

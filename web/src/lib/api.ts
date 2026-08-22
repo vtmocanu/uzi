@@ -421,6 +421,15 @@ export interface ProjectSyncStatus {
 // an org, or the token's own viewer. "user" is the default.
 export type ProjectSyncOwnerKind = "user" | "org" | "viewer";
 
+// Board visibility of a linked GitHub Project v2 (PRD #557). `public` round-trips
+// through the GET/PUT visibility routes — GitHub's `ProjectV2.public` is both
+// readable and writable, so the toggle reflects and writes true state.
+// Not exported: used only as the internal response type of the visibility client
+// methods below (no external consumer imports it by name).
+interface ProjectSyncVisibility {
+  public: boolean;
+}
+
 // BlockedRepo is one row of the admin cross-user blocked-repos list (PRD #66 M9,
 // D8): a repo that is blocked by the guardrail OR carries an active admin override.
 export interface BlockedRepo {
@@ -2856,6 +2865,40 @@ const realApi = {
   // Unlink the repo from its project (204, empty body). Idempotent server-side.
   disableProjectSync: (id: string) =>
     request<null>("DELETE", `/repos/${id}/github-project-sync`),
+
+  // Board access — visibility + write-only sharing (PRD #557). Owner-or-admin,
+  // GitHub-only; the server 404s a non-linked/non-owner repo (existence-hiding),
+  // 409s when the instance flag is off, and 422s a bad username / non-GitHub repo.
+
+  // Read the linked board's current public/private flag. A SEPARATE live-forge
+  // call (D4), issued lazily when the Board-access section opens — kept off the
+  // DB-only status GET so the common status open pays nothing.
+  getProjectSyncVisibility: (id: string) =>
+    request<ProjectSyncVisibility>(
+      "GET",
+      `/repos/${id}/github-project-sync/visibility`,
+    ),
+  // Flip the board's public flag (updateProjectV2). Returns the new state; the
+  // JSON key is `public`, matching the Go handler's setVisibilityRequest.
+  setProjectSyncVisibility: (id: string, isPublic: boolean) =>
+    request<ProjectSyncVisibility>(
+      "PUT",
+      `/repos/${id}/github-project-sync/visibility`,
+      { public: isPublic },
+    ),
+  // Grant a GitHub user Reader access to the board (204, empty body). WRITE-ONLY
+  // by necessity (D2): GitHub exposes no readable collaborator list, so uzi can
+  // grant but cannot enumerate current collaborators. A 422 means "no such user".
+  shareProjectSync: (id: string, username: string) =>
+    request<null>("POST", `/repos/${id}/github-project-sync/collaborators`, {
+      username,
+    }),
+  // Revoke a GitHub user's access (204, empty body). The DELETE carries a body —
+  // `request` JSON-stringifies it for any non-GET/HEAD method (D2, write-only).
+  unshareProjectSync: (id: string, username: string) =>
+    request<null>("DELETE", `/repos/${id}/github-project-sync/collaborators`, {
+      username,
+    }),
 
   getBoard: (repoId: string) =>
     request<{ board: Board }>("GET", `/repos/${repoId}/board`),

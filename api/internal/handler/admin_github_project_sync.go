@@ -4,6 +4,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -267,6 +268,204 @@ func (h *Handler) GetGithubProjectSyncStatus(w http.ResponseWriter, r *http.Requ
 	httpx.JSON(w, http.StatusOK, resp)
 }
 
+// setVisibilityRequest is the PUT body for the visibility toggle: the desired public
+// flag. The repo target is taken from the path, never the body (audit), like adopt.
+type setVisibilityRequest struct {
+	Public bool `json:"public"`
+}
+
+// collaboratorRequest is the POST/DELETE body for the share/unshare routes: the GitHub
+// login to grant/revoke Reader access. Reused for both because the shape is identical;
+// the role is fixed to Reader in v1 (PRD #557 D3), so there is no role field. The repo
+// target is taken from the path, never the body (audit).
+type collaboratorRequest struct {
+	Username string `json:"username"`
+}
+
+// GetGithubProjectVisibility is the visibility read (PRD #557 M3, owner-or-admin by
+// issue #534 D4): report the linked board's current public flag. Unlike the DB-only
+// status route it makes a live forge round-trip (ProjectV2.public), so it is a
+// separate lazy GET issued only when the Board-access section opens (D4). Same
+// owner-or-admin, path-scoped shape as the status route: a non-admin must own the repo
+// (GetRepoForUser preflight, 404 for a foreign/unknown id), an admin skips it. The
+// preflight runs BEFORE the nil-guard so a non-owner is 404'd regardless.
+func (h *Handler) GetGithubProjectVisibility(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
+		return
+	}
+	if !user.IsAdmin {
+		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				httpx.Error(w, http.StatusNotFound, "repo not found")
+				return
+			}
+			slog.Error("github project sync: owner preflight", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+	if h.projectSync == nil {
+		slog.Error("github project sync visibility: service not wired")
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	public, err := h.projectSync.GetVisibility(r.Context(), id)
+	if err != nil {
+		writeProjectSyncError(w, "visibility", err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"public": public})
+}
+
+// SetGithubProjectVisibility is the visibility write (PRD #557 M3, owner-or-admin):
+// flip the linked board's public flag through updateProjectV2. Same owner-or-admin,
+// path-scoped shape as the status route; the body carries only the desired flag. The
+// owner-or-admin preflight runs BEFORE the body decode and BEFORE the nil-guard, so a
+// non-owner is 404'd even with an empty/absent body.
+func (h *Handler) SetGithubProjectVisibility(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
+		return
+	}
+	if !user.IsAdmin {
+		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				httpx.Error(w, http.StatusNotFound, "repo not found")
+				return
+			}
+			slog.Error("github project sync: owner preflight", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+	var req setVisibilityRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if h.projectSync == nil {
+		slog.Error("github project sync visibility: service not wired")
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if err := h.projectSync.SetVisibility(r.Context(), id, req.Public); err != nil {
+		writeProjectSyncError(w, "visibility", err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"public": req.Public})
+}
+
+// ShareGithubProjectSync is the grant-Reader write (PRD #557 M3, owner-or-admin):
+// grant the named GitHub login Reader access to the linked board via
+// updateProjectV2Collaborators. This is WRITE-ONLY by necessity (D2): GitHub's
+// ProjectV2 exposes no readable collaborators field, so uzi grants/revokes but never
+// enumerates the current list. A non-existent login surfaces as
+// ErrProjectSyncUserNotFound → 422 (not a 500). Same owner-or-admin, path-scoped shape
+// as the status route; the preflight runs BEFORE body decode and the nil-guard.
+func (h *Handler) ShareGithubProjectSync(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
+		return
+	}
+	if !user.IsAdmin {
+		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				httpx.Error(w, http.StatusNotFound, "repo not found")
+				return
+			}
+			slog.Error("github project sync: owner preflight", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+	var req collaboratorRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if strings.TrimSpace(req.Username) == "" {
+		httpx.Error(w, http.StatusBadRequest, "username is required")
+		return
+	}
+	if h.projectSync == nil {
+		slog.Error("github project sync share: service not wired")
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if err := h.projectSync.ShareWithUser(r.Context(), id, req.Username); err != nil {
+		writeProjectSyncError(w, "share", err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// UnshareGithubProjectSync is the revoke write (PRD #557 M3, owner-or-admin): set the
+// named GitHub login's role back to none via updateProjectV2Collaborators. Reuses the
+// same collaboratorRequest body as share (a DELETE with a JSON body — chi/net-http
+// reads it fine). Same owner-or-admin, path-scoped shape; the preflight runs BEFORE
+// body decode and the nil-guard.
+func (h *Handler) UnshareGithubProjectSync(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
+		return
+	}
+	if !user.IsAdmin {
+		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				httpx.Error(w, http.StatusNotFound, "repo not found")
+				return
+			}
+			slog.Error("github project sync: owner preflight", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+	var req collaboratorRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if strings.TrimSpace(req.Username) == "" {
+		httpx.Error(w, http.StatusBadRequest, "username is required")
+		return
+	}
+	if h.projectSync == nil {
+		slog.Error("github project sync unshare: service not wired")
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if err := h.projectSync.Unshare(r.Context(), id, req.Username); err != nil {
+		writeProjectSyncError(w, "unshare", err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // writeProjectSyncError maps a provisioning error to an HTTP status + clean body.
 // The forgesvc sentinels are user-actionable preconditions (4xx); an unknown repo
 // id is a 404; anything else is an internal error whose raw text is logged, not
@@ -280,7 +479,8 @@ func writeProjectSyncError(w http.ResponseWriter, op string, err error) {
 		httpx.Error(w, http.StatusConflict, err.Error())
 	case errors.Is(err, forgesvc.ErrProjectSyncNotGitHub),
 		errors.Is(err, forgesvc.ErrProjectSyncUnsupported),
-		errors.Is(err, forgesvc.ErrProjectSyncMissingScope):
+		errors.Is(err, forgesvc.ErrProjectSyncMissingScope),
+		errors.Is(err, forgesvc.ErrProjectSyncUserNotFound):
 		httpx.Error(w, http.StatusUnprocessableEntity, err.Error())
 	default:
 		slog.Error("github project sync "+op, "error", err)

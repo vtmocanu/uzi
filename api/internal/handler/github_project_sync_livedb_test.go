@@ -35,6 +35,10 @@ func gpsStatusPath(repoID uuid.UUID) string {
 	return "/api/repos/" + repoID.String() + "/github-project-sync"
 }
 
+// gpsVisibilityPath / gpsCollaboratorsPath build the PRD #557 board-access route URLs.
+func gpsVisibilityPath(repoID uuid.UUID) string    { return gpsStatusPath(repoID) + "/visibility" }
+func gpsCollaboratorsPath(repoID uuid.UUID) string { return gpsStatusPath(repoID) + "/collaborators" }
+
 // (a) The repo OWNER (a non-admin member) reaches the preflight-guarded handler for
 // their OWN repo: the preflight PASSES, so the request is NOT 404'd by it — it falls
 // through to the service-not-wired 500 (projectSync is nil in this harness). A foreign
@@ -134,5 +138,103 @@ func TestGithubProjectSyncAdminSkipsPreflightLiveDB(t *testing.T) {
 	}
 	if rec := cookieReq(t, router, http.MethodDelete, gpsStatusPath(foreign), adminJWT, ""); rec.Code != http.StatusInternalServerError {
 		t.Fatalf("admin DELETE foreign repo = %d, want 500 (admin skips the preflight), NOT the preflight 404\nbody: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// PRD #557 M3 — the SAME authorization boundary, extended to the four new board-access
+// routes (GET/PUT visibility, POST/DELETE collaborators). Same discriminator as above:
+// projectSync == nil, so a request PAST the preflight hits the nil-guard 500 and a
+// BLOCKED request is 404. These prove the 404-vs-500 boundary only; behavior (409/422,
+// the actual forge call) is the httptest tier's job.
+
+// TestGithubProjectVisibilityAuthLiveDB: owner/admin reach the visibility routes past
+// the preflight (500), a foreign non-owner is existence-hidden (404), and the foreign
+// repo survives — for both the GET read and the PUT write.
+func TestGithubProjectVisibilityAuthLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	admin := cliSeedUser(t, pool, true)
+	owner := cliSeedUser(t, pool, false)
+	member := cliSeedUser(t, pool, false)
+	adminJWT := cliMintJWT(t, pool, admin)
+	ownerJWT := cliMintJWT(t, pool, owner)
+	memberJWT := cliMintJWT(t, pool, member)
+
+	ownerConn := rmSeedConn(t, pool, owner)
+	ownRepo := rmSeedRepo(t, pool, ownerConn, 557101, false)
+
+	// Owner passes the preflight on their own repo ⇒ nil-guard 500, NOT the preflight 404.
+	if rec := cookieReq(t, router, http.MethodGet, gpsVisibilityPath(ownRepo), ownerJWT, ""); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("owner GET visibility own repo = %d, want 500 (preflight passes)\nbody: %s", rec.Code, rec.Body.String())
+	}
+	if rec := cookieReq(t, router, http.MethodPut, gpsVisibilityPath(ownRepo), ownerJWT, `{"public":true}`); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("owner PUT visibility own repo = %d, want 500 (preflight passes)\nbody: %s", rec.Code, rec.Body.String())
+	}
+
+	// A non-owner member is existence-hidden ⇒ 404 for both the READ and the WRITE. The
+	// preflight runs before body decode, so a `{}` body still 404s for a non-owner.
+	if rec := cookieReq(t, router, http.MethodGet, gpsVisibilityPath(ownRepo), memberJWT, ""); rec.Code != http.StatusNotFound {
+		t.Fatalf("member GET visibility foreign repo = %d, want 404 (existence-hiding)\nbody: %s", rec.Code, rec.Body.String())
+	}
+	if rec := cookieReq(t, router, http.MethodPut, gpsVisibilityPath(ownRepo), memberJWT, `{}`); rec.Code != http.StatusNotFound {
+		t.Fatalf("member PUT visibility foreign repo = %d, want 404 (existence-hiding)\nbody: %s", rec.Code, rec.Body.String())
+	}
+
+	// The admin skips the preflight on the SAME repo (foreign to the admin) ⇒ 500, the
+	// differential that proves the admin bypass is real.
+	if rec := cookieReq(t, router, http.MethodGet, gpsVisibilityPath(ownRepo), adminJWT, ""); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("admin GET visibility foreign repo = %d, want 500 (admin skips preflight)\nbody: %s", rec.Code, rec.Body.String())
+	}
+	if rec := cookieReq(t, router, http.MethodPut, gpsVisibilityPath(ownRepo), adminJWT, `{"public":false}`); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("admin PUT visibility foreign repo = %d, want 500 (admin skips preflight)\nbody: %s", rec.Code, rec.Body.String())
+	}
+
+	if !rmRepoExists(t, pool, ownRepo) {
+		t.Errorf("the repo must survive the authorization checks")
+	}
+}
+
+// TestGithubProjectCollaboratorsAuthLiveDB: owner/admin reach the collaborator routes
+// past the preflight (500), a foreign non-owner is existence-hidden (404), and the
+// foreign repo survives — for both the POST share and the DELETE unshare.
+func TestGithubProjectCollaboratorsAuthLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	admin := cliSeedUser(t, pool, true)
+	owner := cliSeedUser(t, pool, false)
+	member := cliSeedUser(t, pool, false)
+	adminJWT := cliMintJWT(t, pool, admin)
+	ownerJWT := cliMintJWT(t, pool, owner)
+	memberJWT := cliMintJWT(t, pool, member)
+
+	ownerConn := rmSeedConn(t, pool, owner)
+	ownRepo := rmSeedRepo(t, pool, ownerConn, 557102, false)
+
+	// Owner passes the preflight ⇒ nil-guard 500. A `{"username":"x"}` body reaches the
+	// nil-guard (ShareWithUser/Unshare never run because projectSync is nil).
+	if rec := cookieReq(t, router, http.MethodPost, gpsCollaboratorsPath(ownRepo), ownerJWT, `{"username":"x"}`); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("owner POST collaborators own repo = %d, want 500 (preflight passes)\nbody: %s", rec.Code, rec.Body.String())
+	}
+	if rec := cookieReq(t, router, http.MethodDelete, gpsCollaboratorsPath(ownRepo), ownerJWT, `{"username":"x"}`); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("owner DELETE collaborators own repo = %d, want 500 (preflight passes)\nbody: %s", rec.Code, rec.Body.String())
+	}
+
+	// A non-owner member is existence-hidden ⇒ 404. The preflight runs before body
+	// decode, so an empty body still 404s for a non-owner.
+	if rec := cookieReq(t, router, http.MethodPost, gpsCollaboratorsPath(ownRepo), memberJWT, `{}`); rec.Code != http.StatusNotFound {
+		t.Fatalf("member POST collaborators foreign repo = %d, want 404 (existence-hiding)\nbody: %s", rec.Code, rec.Body.String())
+	}
+	if rec := cookieReq(t, router, http.MethodDelete, gpsCollaboratorsPath(ownRepo), memberJWT, `{}`); rec.Code != http.StatusNotFound {
+		t.Fatalf("member DELETE collaborators foreign repo = %d, want 404 (existence-hiding)\nbody: %s", rec.Code, rec.Body.String())
+	}
+
+	// The admin skips the preflight on the SAME repo ⇒ 500 for both writes.
+	if rec := cookieReq(t, router, http.MethodPost, gpsCollaboratorsPath(ownRepo), adminJWT, `{"username":"x"}`); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("admin POST collaborators foreign repo = %d, want 500 (admin skips preflight)\nbody: %s", rec.Code, rec.Body.String())
+	}
+	if rec := cookieReq(t, router, http.MethodDelete, gpsCollaboratorsPath(ownRepo), adminJWT, `{"username":"x"}`); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("admin DELETE collaborators foreign repo = %d, want 500 (admin skips preflight)\nbody: %s", rec.Code, rec.Body.String())
+	}
+
+	if !rmRepoExists(t, pool, ownRepo) {
+		t.Errorf("the repo must survive the authorization checks")
 	}
 }

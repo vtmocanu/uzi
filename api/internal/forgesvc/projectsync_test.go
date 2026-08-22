@@ -67,6 +67,29 @@ type fakeProjectSyncer struct {
 
 	setCalls []setStatusCall
 	setErr   error
+
+	// Board access (PRD #557 M1): scripted returns + recorded calls for the
+	// visibility/sharing capability methods.
+	visibilityReturn   bool
+	visibilityErr      error
+	setVisibilityCalls []setVisibilityCall
+	setVisibilityErr   error
+	collaboratorCalls  []collaboratorCall
+	collaboratorErr    error
+	resolveUserID      string
+	resolveUserCalls   []string // logins resolved
+	resolveUserErr     error
+}
+
+type setVisibilityCall struct {
+	projectID string
+	public    bool
+}
+
+type collaboratorCall struct {
+	projectID string
+	userID    string
+	role      forge.ProjectV2CollaboratorRole
 }
 
 type setStatusCall struct {
@@ -177,6 +200,28 @@ func (f *fakeProjectSyncer) CreateProjectV2Field(_ context.Context, _, name stri
 func (f *fakeProjectSyncer) LinkProjectV2ToRepository(context.Context, string, string) error {
 	f.linkCalls++
 	return nil
+}
+
+func (f *fakeProjectSyncer) GetProjectV2Visibility(context.Context, string) (bool, error) {
+	return f.visibilityReturn, f.visibilityErr
+}
+
+func (f *fakeProjectSyncer) SetProjectV2Visibility(_ context.Context, projectID string, public bool) error {
+	f.setVisibilityCalls = append(f.setVisibilityCalls, setVisibilityCall{projectID: projectID, public: public})
+	return f.setVisibilityErr
+}
+
+func (f *fakeProjectSyncer) SetProjectV2Collaborator(_ context.Context, projectID, userID string, role forge.ProjectV2CollaboratorRole) error {
+	f.collaboratorCalls = append(f.collaboratorCalls, collaboratorCall{projectID: projectID, userID: userID, role: role})
+	return f.collaboratorErr
+}
+
+func (f *fakeProjectSyncer) ResolveUserNodeID(_ context.Context, login string) (string, error) {
+	f.resolveUserCalls = append(f.resolveUserCalls, login)
+	if f.resolveUserErr != nil {
+		return "", f.resolveUserErr
+	}
+	return f.resolveUserID, nil
 }
 
 // fakeForgeBuilder returns a fixed forge for ForgeForConnection.
@@ -1240,4 +1285,238 @@ func TestForwardMoveForgeErrorSwallowed(t *testing.T) {
 	if len(st.markerSets) != 0 {
 		t.Errorf("a failed write must not advance the marker, got %v", st.markerSets)
 	}
+}
+
+// --- Board access: visibility + sharing (PRD #557 M2) ------------------------
+
+// boardAccessSyncer builds a ProjectBoardSyncer fake with the project scope so the
+// preamble passes, scripted for the visibility/sharing capability methods.
+func boardAccessSyncer() *fakeProjectSyncer {
+	return &fakeProjectSyncer{
+		fakeForge: &fakeForge{},
+		scopes:    []string{"repo", "project"},
+	}
+}
+
+// boardAccessStore builds a store whose link row carries the given board node id, so
+// the service reads it and passes it to the syncer.
+func boardAccessStore(repoID uuid.UUID, projectNodeID string) *fakeProjectStore {
+	return &fakeProjectStore{
+		repo: githubRepoRow(repoID),
+		link: store.GithubProjectLink{RepoID: repoID, ProjectNodeID: projectNodeID},
+	}
+}
+
+// GetVisibility returns the fake's configured bool for the linked board.
+func TestGetVisibilityReturnsForgeValue(t *testing.T) {
+	repoID := uuid.New()
+	syncer := boardAccessSyncer()
+	syncer.visibilityReturn = true
+	st := boardAccessStore(repoID, "PVT_1")
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+
+	public, err := svc.GetVisibility(context.Background(), repoID)
+	if err != nil {
+		t.Fatalf("GetVisibility: %v", err)
+	}
+	if !public {
+		t.Errorf("want public=true from the forge, got %v", public)
+	}
+}
+
+// SetVisibility(true) calls the syncer with the link's ProjectNodeID and public=true.
+func TestSetVisibilityWritesThrough(t *testing.T) {
+	repoID := uuid.New()
+	syncer := boardAccessSyncer()
+	st := boardAccessStore(repoID, "PVT_1")
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+
+	if err := svc.SetVisibility(context.Background(), repoID, true); err != nil {
+		t.Fatalf("SetVisibility: %v", err)
+	}
+	if len(syncer.setVisibilityCalls) != 1 {
+		t.Fatalf("want 1 SetProjectV2Visibility call, got %d", len(syncer.setVisibilityCalls))
+	}
+	call := syncer.setVisibilityCalls[0]
+	if call.projectID != "PVT_1" || !call.public {
+		t.Errorf("SetProjectV2Visibility call = %+v, want {PVT_1 true}", call)
+	}
+}
+
+// ShareWithUser resolves the username and grants READER against the link's board id.
+func TestShareWithUserGrantsReader(t *testing.T) {
+	repoID := uuid.New()
+	syncer := boardAccessSyncer()
+	syncer.resolveUserID = "U_octocat"
+	st := boardAccessStore(repoID, "PVT_1")
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+
+	if err := svc.ShareWithUser(context.Background(), repoID, "octocat"); err != nil {
+		t.Fatalf("ShareWithUser: %v", err)
+	}
+	if len(syncer.resolveUserCalls) != 1 || syncer.resolveUserCalls[0] != "octocat" {
+		t.Fatalf("want the username resolved once, got %v", syncer.resolveUserCalls)
+	}
+	if len(syncer.collaboratorCalls) != 1 {
+		t.Fatalf("want 1 SetProjectV2Collaborator call, got %d", len(syncer.collaboratorCalls))
+	}
+	call := syncer.collaboratorCalls[0]
+	if call.projectID != "PVT_1" || call.userID != "U_octocat" || call.role != forge.RoleReaderCollaborator {
+		t.Errorf("collaborator call = %+v, want {PVT_1 U_octocat READER}", call)
+	}
+}
+
+// Unshare resolves the username and sets NONE against the link's board id.
+func TestUnshareSetsNone(t *testing.T) {
+	repoID := uuid.New()
+	syncer := boardAccessSyncer()
+	syncer.resolveUserID = "U_octocat"
+	st := boardAccessStore(repoID, "PVT_1")
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+
+	if err := svc.Unshare(context.Background(), repoID, "octocat"); err != nil {
+		t.Fatalf("Unshare: %v", err)
+	}
+	if len(syncer.collaboratorCalls) != 1 {
+		t.Fatalf("want 1 SetProjectV2Collaborator call, got %d", len(syncer.collaboratorCalls))
+	}
+	call := syncer.collaboratorCalls[0]
+	if call.projectID != "PVT_1" || call.userID != "U_octocat" || call.role != forge.RoleNoneCollaborator {
+		t.Errorf("collaborator call = %+v, want {PVT_1 U_octocat NONE}", call)
+	}
+}
+
+// A non-GitHub repo trips the preamble on every board-access method.
+func TestBoardAccessNonGitHub(t *testing.T) {
+	repoID := uuid.New()
+	row := githubRepoRow(repoID)
+	row.ForgeType = string(forge.TypeGitLab)
+	newSvc := func() (*ProjectSyncService, *fakeProjectSyncer) {
+		s := boardAccessSyncer()
+		st := &fakeProjectStore{repo: row, link: store.GithubProjectLink{RepoID: repoID, ProjectNodeID: "PVT_1"}}
+		return NewProjectSync(st, fakeForgeBuilder{f: s}, fakeSyncSettings{enabled: true}, nil), s
+	}
+
+	t.Run("GetVisibility", func(t *testing.T) {
+		svc, s := newSvc()
+		if _, err := svc.GetVisibility(context.Background(), repoID); !errors.Is(err, ErrProjectSyncNotGitHub) {
+			t.Fatalf("want ErrProjectSyncNotGitHub, got %v", err)
+		}
+		if len(s.setVisibilityCalls) != 0 || len(s.collaboratorCalls) != 0 {
+			t.Errorf("non-github must make no forge call")
+		}
+	})
+	t.Run("SetVisibility", func(t *testing.T) {
+		svc, s := newSvc()
+		if err := svc.SetVisibility(context.Background(), repoID, true); !errors.Is(err, ErrProjectSyncNotGitHub) {
+			t.Fatalf("want ErrProjectSyncNotGitHub, got %v", err)
+		}
+		if len(s.setVisibilityCalls) != 0 {
+			t.Errorf("non-github must make no forge call")
+		}
+	})
+	t.Run("ShareWithUser", func(t *testing.T) {
+		svc, s := newSvc()
+		if err := svc.ShareWithUser(context.Background(), repoID, "octocat"); !errors.Is(err, ErrProjectSyncNotGitHub) {
+			t.Fatalf("want ErrProjectSyncNotGitHub, got %v", err)
+		}
+		if len(s.resolveUserCalls) != 0 || len(s.collaboratorCalls) != 0 {
+			t.Errorf("non-github must make no forge call")
+		}
+	})
+	t.Run("Unshare", func(t *testing.T) {
+		svc, s := newSvc()
+		if err := svc.Unshare(context.Background(), repoID, "octocat"); !errors.Is(err, ErrProjectSyncNotGitHub) {
+			t.Fatalf("want ErrProjectSyncNotGitHub, got %v", err)
+		}
+		if len(s.resolveUserCalls) != 0 || len(s.collaboratorCalls) != 0 {
+			t.Errorf("non-github must make no forge call")
+		}
+	})
+}
+
+// A bad username (ResolveUserNodeID → forge.ErrGitHubUserNotFound) maps to the 422
+// sentinel ErrProjectSyncUserNotFound on the share path, and no collaborator write fires.
+func TestShareWithUserNotFoundMaps422(t *testing.T) {
+	repoID := uuid.New()
+	syncer := boardAccessSyncer()
+	syncer.resolveUserErr = forge.ErrGitHubUserNotFound
+	st := boardAccessStore(repoID, "PVT_1")
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+
+	err := svc.ShareWithUser(context.Background(), repoID, "nouser")
+	if !errors.Is(err, ErrProjectSyncUserNotFound) {
+		t.Fatalf("want ErrProjectSyncUserNotFound, got %v", err)
+	}
+	if len(syncer.collaboratorCalls) != 0 {
+		t.Errorf("a bad username must not issue a collaborator write, got %v", syncer.collaboratorCalls)
+	}
+}
+
+// Unshare against a bad username maps to 422 the same way.
+func TestUnshareNotFoundMaps422(t *testing.T) {
+	repoID := uuid.New()
+	syncer := boardAccessSyncer()
+	syncer.resolveUserErr = forge.ErrGitHubUserNotFound
+	st := boardAccessStore(repoID, "PVT_1")
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+
+	err := svc.Unshare(context.Background(), repoID, "nouser")
+	if !errors.Is(err, ErrProjectSyncUserNotFound) {
+		t.Fatalf("want ErrProjectSyncUserNotFound, got %v", err)
+	}
+	if len(syncer.collaboratorCalls) != 0 {
+		t.Errorf("a bad username must not issue a collaborator write, got %v", syncer.collaboratorCalls)
+	}
+}
+
+// The scoping guard (non-vacuous): a NOT_FOUND surfaced by the VISIBILITY path
+// (a deleted board node id — graphqlDo wraps it as forge.ErrGitHubUserNotFound too)
+// must NOT be laundered into ErrProjectSyncUserNotFound. It stays a generic non-nil
+// error so the handler renders 500, never a false 422 for a board that is not a user.
+func TestGetVisibilityNotFoundDoesNotMap422(t *testing.T) {
+	repoID := uuid.New()
+	syncer := boardAccessSyncer()
+	syncer.visibilityErr = forge.ErrGitHubUserNotFound // deleted board, wrapped by graphqlDo
+	st := boardAccessStore(repoID, "PVT_stale")
+	svc := NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+
+	_, err := svc.GetVisibility(context.Background(), repoID)
+	if err == nil {
+		t.Fatalf("want a non-nil error from a NOT_FOUND board")
+	}
+	if errors.Is(err, ErrProjectSyncUserNotFound) {
+		t.Fatalf("a NOT_FOUND on the visibility path must NOT map to the user-not-found 422 sentinel: %v", err)
+	}
+}
+
+// A repo with no link row surfaces pgx.ErrNoRows on every board-access method (the
+// handler's 404 "not sync-enabled" path), after the preamble passes.
+func TestBoardAccessNoLinkRow(t *testing.T) {
+	repoID := uuid.New()
+	newSvc := func() *ProjectSyncService {
+		syncer := boardAccessSyncer()
+		st := &fakeProjectStore{repo: githubRepoRow(repoID), linkErr: pgx.ErrNoRows}
+		return NewProjectSync(st, fakeForgeBuilder{f: syncer}, fakeSyncSettings{enabled: true}, nil)
+	}
+	t.Run("GetVisibility", func(t *testing.T) {
+		if _, err := newSvc().GetVisibility(context.Background(), repoID); !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("want pgx.ErrNoRows, got %v", err)
+		}
+	})
+	t.Run("SetVisibility", func(t *testing.T) {
+		if err := newSvc().SetVisibility(context.Background(), repoID, true); !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("want pgx.ErrNoRows, got %v", err)
+		}
+	})
+	t.Run("ShareWithUser", func(t *testing.T) {
+		if err := newSvc().ShareWithUser(context.Background(), repoID, "octocat"); !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("want pgx.ErrNoRows, got %v", err)
+		}
+	})
+	t.Run("Unshare", func(t *testing.T) {
+		if err := newSvc().Unshare(context.Background(), repoID, "octocat"); !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("want pgx.ErrNoRows, got %v", err)
+		}
+	})
 }
