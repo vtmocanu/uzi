@@ -14,6 +14,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // adoptGithubProjectSyncRequest is the POST body: which existing Projects v2 board
@@ -42,14 +43,16 @@ func parseOwnerKind(s string) (forge.ProjectV2OwnerKind, bool) {
 	}
 }
 
-// AdoptGithubProjectSync is the admin adopt/link write (PRD #364 M3): link an
-// EXISTING GitHub Projects v2 board to this repo's label board and seed it. Mounted
-// under the admin WRITE group (RequireAuth + RequireAdmin), so it is cookie-only and
-// admin-only — the sync writes to a user's project board, an instance-admin decision.
-// The actor is authorized by RequireAdmin and the repo target comes from the path;
-// the body carries only the project coordinates.
+// AdoptGithubProjectSync is the adopt/link write (PRD #364 M3, relocated to
+// owner-or-admin by issue #534 D4): link an EXISTING GitHub Projects v2 board to this
+// repo's label board and seed it. Mounted under the per-repo RequireAuth group, so it
+// is cookie-only; authorization is owner-or-admin — a non-admin must own the repo
+// (GetRepoForUser preflight below, 404 for a foreign/unknown id), while an admin skips
+// the preflight. The repo target comes from the path; the body carries only the
+// project coordinates.
 func (h *Handler) AdoptGithubProjectSync(w http.ResponseWriter, r *http.Request) {
-	if _, ok := mw.UserFromContext(r.Context()); !ok {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
@@ -57,6 +60,17 @@ func (h *Handler) AdoptGithubProjectSync(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
 		return
+	}
+	if !user.IsAdmin {
+		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				httpx.Error(w, http.StatusNotFound, "repo not found")
+				return
+			}
+			slog.Error("github project sync: owner preflight", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
 	}
 	var req adoptGithubProjectSyncRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
@@ -94,13 +108,15 @@ type provisionGithubProjectSyncRequest struct {
 	Title     string `json:"title"`
 }
 
-// ProvisionGithubProjectSync is the admin autonomous-provision write (PRD #364 M4):
-// CREATE a GitHub Projects v2 board with uzi's OWN "uzi Status" field, link it to
-// this repo, and seed it — zero manual GitHub-UI clicks. Same admin-only, path-scoped
-// shape as the adopt route (RequireAuth + RequireAdmin), and the same error mapping;
-// it persists owned_by_uzi=true. Success is 201 Created (a new board was made).
+// ProvisionGithubProjectSync is the autonomous-provision write (PRD #364 M4,
+// owner-or-admin by issue #534 D4): CREATE a GitHub Projects v2 board with uzi's OWN
+// "uzi Status" field, link it to this repo, and seed it — zero manual GitHub-UI
+// clicks. Same owner-or-admin, path-scoped shape as the adopt route, and the same
+// error mapping; it persists owned_by_uzi=true. Success is 201 Created (a new board
+// was made).
 func (h *Handler) ProvisionGithubProjectSync(w http.ResponseWriter, r *http.Request) {
-	if _, ok := mw.UserFromContext(r.Context()); !ok {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
@@ -108,6 +124,17 @@ func (h *Handler) ProvisionGithubProjectSync(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
 		return
+	}
+	if !user.IsAdmin {
+		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				httpx.Error(w, http.StatusNotFound, "repo not found")
+				return
+			}
+			slog.Error("github project sync: owner preflight", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
 	}
 	var req provisionGithubProjectSyncRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
@@ -131,11 +158,13 @@ func (h *Handler) ProvisionGithubProjectSync(w http.ResponseWriter, r *http.Requ
 	httpx.JSON(w, http.StatusCreated, map[string]any{"status": "provisioned"})
 }
 
-// DisableGithubProjectSync is the admin teardown (PRD #364 M3): drop the repo's
-// project link + item projection rows. Same admin-only, path-scoped shape as the
-// adopt route. It does not touch the project board itself (M7 refines that).
+// DisableGithubProjectSync is the teardown (PRD #364 M3, owner-or-admin by issue #534
+// D4): drop the repo's project link + item projection rows. Same owner-or-admin,
+// path-scoped shape as the adopt route. It does not touch the project board itself
+// (M7 refines that).
 func (h *Handler) DisableGithubProjectSync(w http.ResponseWriter, r *http.Request) {
-	if _, ok := mw.UserFromContext(r.Context()); !ok {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
@@ -143,6 +172,17 @@ func (h *Handler) DisableGithubProjectSync(w http.ResponseWriter, r *http.Reques
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
 		return
+	}
+	if !user.IsAdmin {
+		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				httpx.Error(w, http.StatusNotFound, "repo not found")
+				return
+			}
+			slog.Error("github project sync: owner preflight", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
 	}
 	if h.projectSync == nil {
 		slog.Error("github project sync disable: service not wired")
@@ -167,13 +207,16 @@ type getGithubProjectSyncStatusResponse struct {
 	ItemCount     int        `json:"item_count"`
 }
 
-// GetGithubProjectSyncStatus is the admin sync-health read (PRD #364 M7): report a
-// repo's project link status (project number, ownership, last_synced_at, last_error,
-// item_count). Mounted under the admin READ group (RequireUser + RequireAdminRO) — it
-// is a read of the stored projection, no forge call — unlike the adopt/disable writes.
-// A repo with no link row is 404: "no link = not sync-enabled".
+// GetGithubProjectSyncStatus is the sync-health read (PRD #364 M7, owner-or-admin by
+// issue #534 D4): report a repo's project link status (project number, ownership,
+// last_synced_at, last_error, item_count). Mounted under the per-repo RequireAuth
+// group — it is a read of the stored projection, no forge call. Authorization is
+// owner-or-admin: a non-admin must own the repo (GetRepoForUser preflight, 404 for a
+// foreign/unknown id), while an admin skips it. A repo with no link row is a
+// (different) 404: "no link = not sync-enabled".
 func (h *Handler) GetGithubProjectSyncStatus(w http.ResponseWriter, r *http.Request) {
-	if _, ok := mw.UserFromContext(r.Context()); !ok {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
@@ -181,6 +224,17 @@ func (h *Handler) GetGithubProjectSyncStatus(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
 		return
+	}
+	if !user.IsAdmin {
+		if _, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				httpx.Error(w, http.StatusNotFound, "repo not found")
+				return
+			}
+			slog.Error("github project sync: owner preflight", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
 	}
 	if h.projectSync == nil {
 		slog.Error("github project sync status: service not wired")

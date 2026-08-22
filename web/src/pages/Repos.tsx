@@ -3,16 +3,16 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, ApiError, isHttpsUrl, type ForgeConnection, type Repo, type ToolAllowlistEntry } from "../lib/api";
+import { api, ApiError, isHttpsUrl, type ForgeConnection, type ProjectSyncOwnerKind, type ProjectSyncStatus, type Repo, type ToolAllowlistEntry } from "../lib/api";
 import { repoFindings } from "../lib/privilege";
 import { useAuth } from "../auth/AuthContext";
-import { Alert, Badge, Button, Card, EmptyState, ListSkeleton, PageHeader, Select, Textarea, Toggle } from "../components/ui";
+import { Alert, Badge, Button, Card, EmptyState, Input, ListSkeleton, PageHeader, Select, Textarea, Toggle } from "../components/ui";
 import { PipelineBadge } from "../components/PipelineBadge";
 import { RepoSetupChip } from "../components/RepoSetupChip";
 import { Modal } from "../components/Modal";
 import { BoardIcon, XIcon } from "../components/icons";
 import { DocLink } from "../components/DocLink";
-import { DOC_REPO_AGENTS } from "../lib/doclinks";
+import { DOC_GITHUB_PROJECT_SYNC, DOC_REPO_AGENTS } from "../lib/doclinks";
 
 // The server-owned capability vocabulary (PRD #84). The repo hint offers only these
 // names; the server capability.Filters anything else, so free-form entry is not
@@ -59,6 +59,24 @@ export function Repos() {
   const [allowlist, setAllowlist] = useState<ToolAllowlistEntry[] | null>(null);
   const [toolSelection, setToolSelection] = useState<Set<string>>(new Set());
   const [toolsBusy, setToolsBusy] = useState(false);
+  // GitHub Projects v2 sync panel (PRD #534): the repo whose sync panel is open,
+  // the fetched status (null until loaded, or when the repo is not linked), and
+  // the load/action flags. The panel renders OUTSIDE the table like the Trusted/
+  // Tools panels. syncLinked distinguishes a 200 (linked → readout) from a 404
+  // (not linked → provision/adopt forms); a non-404 fetch error goes in syncError.
+  const [syncRepoId, setSyncRepoId] = useState<string | null>(null);
+  const [syncStatus, setSyncStatus] = useState<ProjectSyncStatus | null>(null);
+  const [syncLinked, setSyncLinked] = useState(false);
+  const [syncLoading, setSyncLoading] = useState(false);
+  const [syncBusy, setSyncBusy] = useState(false);
+  // Inline error for the sync panel (load or action). 409 → "ask an admin" copy;
+  // 422 → GitHub-only/scope copy. Rendered inside the panel, not the page Alert.
+  const [syncError, setSyncError] = useState("");
+  // Provision + Adopt form fields, reset each time the panel opens.
+  const [provisionOwnerKind, setProvisionOwnerKind] = useState<ProjectSyncOwnerKind>("user");
+  const [provisionTitle, setProvisionTitle] = useState("");
+  const [adoptOwnerKind, setAdoptOwnerKind] = useState<ProjectSyncOwnerKind>("user");
+  const [adoptProjectNumber, setAdoptProjectNumber] = useState("");
   // The guardrail Allow-anyway modal (PRD #66 M9, D8): the repo whose modal is open,
   // the admin's reason, and the in-flight POST. Revoke reuses overrideBusyId.
   const [allowRepoId, setAllowRepoId] = useState<string | null>(null);
@@ -80,6 +98,10 @@ export function Repos() {
   // button ("Confirm remove", the first button inside) for screen-reader users —
   // same a11y pattern as the trust confirm above.
   const confirmRemoveRef = useRef<HTMLDivElement | null>(null);
+  // Focus management for the Project-sync panel (PRD #534): remember its cell
+  // trigger so focus returns to it on close, and move focus into the panel on open.
+  const syncTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const syncPanelRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     if (trustRepoId) trustPanelRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
   }, [trustRepoId]);
@@ -94,6 +116,111 @@ export function Repos() {
     setTrustRepoId(null);
     setConfirmTrustId(null);
     trustTriggerRef.current?.focus();
+  };
+
+  // Load the repo's Projects-sync status (PRD #534). A 404 is the expected "not
+  // linked yet" signal — treated as a state, not an error — so the panel shows
+  // the provision/adopt forms. Any other failure lands in syncError.
+  const loadSyncStatus = useCallback(async (repoId: string) => {
+    setSyncError("");
+    setSyncLoading(true);
+    try {
+      const status = await api.getProjectSyncStatus(repoId);
+      setSyncStatus(status);
+      setSyncLinked(true);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) {
+        setSyncStatus(null);
+        setSyncLinked(false);
+      } else {
+        setSyncStatus(null);
+        setSyncLinked(false);
+        setSyncError(err instanceof ApiError ? err.message : "Failed to load the sync status");
+      }
+    } finally {
+      setSyncLoading(false);
+    }
+  }, []);
+
+  // On open, reset the forms and (re)load status; move focus into the panel.
+  useEffect(() => {
+    if (!syncRepoId) return;
+    setSyncError("");
+    setProvisionOwnerKind("user");
+    setProvisionTitle("");
+    setAdoptOwnerKind("user");
+    setAdoptProjectNumber("");
+    loadSyncStatus(syncRepoId);
+    syncPanelRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+  }, [syncRepoId, loadSyncStatus]);
+
+  const closeSync = () => {
+    setSyncRepoId(null);
+    syncTriggerRef.current?.focus();
+  };
+
+  // Map a sync-action failure to inline copy. 409 is ErrProjectSyncDisabled (the
+  // instance flag is off — v1 also folds already-linked into this copy per D3);
+  // 422 is not-GitHub / unsupported / missing-scope.
+  const syncErrorMessage = (err: unknown): string => {
+    if (err instanceof ApiError) {
+      if (err.status === 409)
+        return "Projects sync is turned off for this instance — ask an admin to enable it.";
+      if (err.status === 422)
+        return (
+          err.message ||
+          "This repo can't use Projects sync (GitHub repos only, and your token needs project scope)."
+        );
+      return err.message;
+    }
+    return "Something went wrong. Please try again.";
+  };
+
+  const provisionSync = async (repoId: string) => {
+    setSyncError("");
+    setSyncBusy(true);
+    try {
+      await api.provisionProjectSync(repoId, {
+        owner_kind: provisionOwnerKind,
+        title: provisionTitle.trim() || undefined,
+      });
+      await loadSyncStatus(repoId);
+    } catch (err) {
+      setSyncError(syncErrorMessage(err));
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
+  const adoptSync = async (repoId: string) => {
+    const num = Number(adoptProjectNumber);
+    if (!Number.isInteger(num) || num <= 0) {
+      setSyncError("Enter the project's number (a positive whole number).");
+      return;
+    }
+    setSyncError("");
+    setSyncBusy(true);
+    try {
+      await api.adoptProjectSync(repoId, { project_number: num, owner_kind: adoptOwnerKind });
+      await loadSyncStatus(repoId);
+    } catch (err) {
+      setSyncError(syncErrorMessage(err));
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
+  const disableSync = async (repoId: string) => {
+    setSyncError("");
+    setSyncBusy(true);
+    try {
+      await api.disableProjectSync(repoId);
+      await loadSyncStatus(repoId);
+    } catch (err) {
+      setSyncError(syncErrorMessage(err));
+    } finally {
+      setSyncBusy(false);
+    }
   };
 
   useEffect(() => {
@@ -363,6 +490,13 @@ export function Repos() {
   // findings badges (null until a check has run).
   const privilegeReport = connections.find((c) => c.id === connectionId)?.privilege_report ?? null;
 
+  // GitHub Projects v2 sync (PRD #534) applies only to GitHub connections. Derive
+  // GitHub-ness from the SELECTED connection's forge_type — never by parsing
+  // web_url. The Project-sync cell renders only when this is true.
+  const isGithub = connections.find((c) => c.id === connectionId)?.forge_type === "github";
+  // The repo whose Project-sync panel is expanded (rendered below the table).
+  const syncRepo = repos.find((r) => r.id === syncRepoId) ?? null;
+
   // The repo whose Trusted-repo panel is expanded (rendered below the table,
   // outside its horizontal scroll container).
   const trustRepo = repos.find((r) => r.id === trustRepoId) ?? null;
@@ -457,13 +591,14 @@ export function Repos() {
                     <th className="px-4 py-3 font-medium">Status</th>
                     <th className="px-4 py-3 font-medium">Trusted repo</th>
                     <th className="px-4 py-3 font-medium">Tools</th>
+                    <th className="px-4 py-3 font-medium">Project sync</th>
                     <th className="px-4 py-3 text-right font-medium">Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-edge">
                   {repos.length === 0 ? (
                     <tr>
-                      <td colSpan={6} className="px-4 py-6 text-center text-faint">
+                      <td colSpan={7} className="px-4 py-6 text-center text-faint">
                         {refreshing ? "Loading…" : "No projects found for this bot."}
                       </td>
                     </tr>
@@ -618,6 +753,32 @@ export function Repos() {
                             >
                               {toolsRepoId === r.id ? "Close" : "Tools"}
                             </Button>
+                          )}
+                        </td>
+                        <td className="px-4 py-3">
+                          {/* Project sync (PRD #534) is GitHub-only, and — like the
+                              Trusted/Tools cells — offered only on an enabled repo. A
+                              non-GitHub or disabled repo shows nothing actionable. */}
+                          {!isGithub || !r.enabled ? (
+                            <span className="text-xs text-faint">—</span>
+                          ) : (
+                            <div className="flex flex-wrap items-center gap-2">
+                              <Badge tone="neutral" dot>
+                                Sync
+                              </Badge>
+                              <Button
+                                variant="secondary"
+                                size="sm"
+                                aria-expanded={syncRepoId === r.id}
+                                aria-label={`Project sync settings for ${r.path_with_namespace}`}
+                                onClick={(e) => {
+                                  syncTriggerRef.current = e.currentTarget;
+                                  setSyncRepoId((id) => (id === r.id ? null : r.id));
+                                }}
+                              >
+                                {syncRepoId === r.id ? "Close" : "Manage"}
+                              </Button>
+                            </div>
                           )}
                         </td>
                         <td className="px-4 py-3 text-right">
@@ -952,6 +1113,154 @@ export function Repos() {
                       );
                     })}
                   </div>
+                </div>
+              </div>
+            )}
+
+            {/* GitHub Projects v2 sync panel (PRD #534). Rendered OUTSIDE the
+                overflow-x-auto table above, like the Trusted/Tools panels, so its
+                forms are never clipped. Opening it fetches the repo's link status:
+                a 404 means "not linked" (the provision/adopt entry state, not an
+                error); a 200 is the linked readout + Disable. */}
+            {syncRepo && (
+              <div
+                ref={syncPanelRef}
+                role="group"
+                aria-label={`Project sync for ${syncRepo.path_with_namespace}`}
+                className="space-y-4 border-t border-edge bg-raised/20 p-4"
+              >
+                <div className="min-w-0 space-y-1">
+                  <h3 className="flex items-center gap-2 text-sm font-semibold text-fg">
+                    GitHub Projects sync
+                    <Badge tone={syncLinked ? "ok" : "neutral"} dot>
+                      {syncLinked ? "Linked" : "Not linked"}
+                    </Badge>
+                  </h3>
+                  <p className="max-w-2xl text-sm text-muted">
+                    Mirror {syncRepo.path_with_namespace}&rsquo;s board onto a GitHub Projects v2
+                    board. See the{" "}
+                    <DocLink slug={DOC_GITHUB_PROJECT_SYNC}>GitHub Projects v2 sync</DocLink> guide.
+                  </p>
+                </div>
+
+                {syncError && <Alert message={syncError} />}
+
+                {syncLoading ? (
+                  <p className="text-sm text-faint">Loading…</p>
+                ) : syncLinked && syncStatus ? (
+                  // Linked: a readout of the current link + a Disable (unlink) control.
+                  <div className="space-y-3">
+                    <dl className="grid gap-x-6 gap-y-1.5 rounded-md border border-edge bg-raised p-3 text-sm sm:grid-cols-2">
+                      <div className="flex justify-between gap-2 sm:block">
+                        <dt className="text-muted">Project number</dt>
+                        <dd className="font-mono text-fg">#{syncStatus.project_number}</dd>
+                      </div>
+                      <div className="flex justify-between gap-2 sm:block">
+                        <dt className="text-muted">Ownership</dt>
+                        <dd className="text-fg">{syncStatus.owned_by_uzi ? "owned by uzi" : "adopted"}</dd>
+                      </div>
+                      <div className="flex justify-between gap-2 sm:block">
+                        <dt className="text-muted">Items</dt>
+                        <dd className="text-fg">{syncStatus.item_count}</dd>
+                      </div>
+                      <div className="flex justify-between gap-2 sm:block">
+                        <dt className="text-muted">Last synced</dt>
+                        <dd className="text-fg">
+                          {syncStatus.last_synced_at
+                            ? new Date(syncStatus.last_synced_at).toLocaleString()
+                            : "never"}
+                        </dd>
+                      </div>
+                      <div className="flex justify-between gap-2 sm:col-span-2 sm:block">
+                        <dt className="text-muted">Last error</dt>
+                        <dd className="text-fg">{syncStatus.last_error ?? "none"}</dd>
+                      </div>
+                    </dl>
+                    <Button
+                      variant="danger"
+                      size="sm"
+                      disabled={syncBusy}
+                      onClick={() => disableSync(syncRepo.id)}
+                    >
+                      {syncBusy ? "Disabling…" : "Disable sync"}
+                    </Button>
+                  </div>
+                ) : (
+                  // Not linked: two ways to link — provision a new project, or adopt one.
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="space-y-2 rounded-md border border-edge bg-raised p-3">
+                      <h4 className="text-sm font-semibold text-fg">Create a new project</h4>
+                      <p className="text-sm text-muted">
+                        uzi provisions a fresh Project v2 for this repo and owns it.
+                      </p>
+                      <label className="block space-y-1">
+                        <span className="text-xs text-muted">Owner</span>
+                        <Select
+                          aria-label="Provision owner"
+                          value={provisionOwnerKind}
+                          disabled={syncBusy}
+                          onChange={(e) => setProvisionOwnerKind(e.target.value as ProjectSyncOwnerKind)}
+                        >
+                          <option value="user">User</option>
+                          <option value="org">Org</option>
+                          <option value="viewer">Viewer</option>
+                        </Select>
+                      </label>
+                      <label className="block space-y-1">
+                        <span className="text-xs text-muted">Title (optional)</span>
+                        <Input
+                          aria-label="Project title"
+                          value={provisionTitle}
+                          disabled={syncBusy}
+                          placeholder="uzi board"
+                          onChange={(e) => setProvisionTitle(e.target.value)}
+                        />
+                      </label>
+                      <Button size="sm" disabled={syncBusy} onClick={() => provisionSync(syncRepo.id)}>
+                        {syncBusy ? "Working…" : "Provision"}
+                      </Button>
+                    </div>
+
+                    <div className="space-y-2 rounded-md border border-edge bg-raised p-3">
+                      <h4 className="text-sm font-semibold text-fg">Adopt an existing project</h4>
+                      <p className="text-sm text-muted">
+                        Link an existing Project v2 by its number.
+                      </p>
+                      <label className="block space-y-1">
+                        <span className="text-xs text-muted">Owner</span>
+                        <Select
+                          aria-label="Adopt owner"
+                          value={adoptOwnerKind}
+                          disabled={syncBusy}
+                          onChange={(e) => setAdoptOwnerKind(e.target.value as ProjectSyncOwnerKind)}
+                        >
+                          <option value="user">User</option>
+                          <option value="org">Org</option>
+                          <option value="viewer">Viewer</option>
+                        </Select>
+                      </label>
+                      <label className="block space-y-1">
+                        <span className="text-xs text-muted">Project number</span>
+                        <Input
+                          type="number"
+                          aria-label="Project number"
+                          value={adoptProjectNumber}
+                          disabled={syncBusy}
+                          placeholder="42"
+                          onChange={(e) => setAdoptProjectNumber(e.target.value)}
+                        />
+                      </label>
+                      <Button size="sm" disabled={syncBusy} onClick={() => adoptSync(syncRepo.id)}>
+                        {syncBusy ? "Working…" : "Adopt"}
+                      </Button>
+                    </div>
+                  </div>
+                )}
+
+                <div className="flex">
+                  <Button variant="ghost" size="sm" onClick={closeSync}>
+                    Close
+                  </Button>
                 </div>
               </div>
             )}

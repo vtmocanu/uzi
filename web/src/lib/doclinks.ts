@@ -18,6 +18,7 @@ export const DOC_RATE_LIMITS = "rate-limits";
 export const DOC_BOT_SETUP_GITLAB = "gitlab-bot-setup";
 export const DOC_BOT_SETUP_FORGEJO = "forgejo-bot-setup";
 export const DOC_BOT_SETUP_GITHUB = "github-bot-setup";
+export const DOC_GITHUB_PROJECT_SYNC = "github-project-sync";
 
 // Every slug above, so doclinks.test.ts can iterate and assert validity.
 export const ALL_DOC_SLUGS = [
@@ -33,4 +34,5 @@ export const ALL_DOC_SLUGS = [
   DOC_BOT_SETUP_GITLAB,
   DOC_BOT_SETUP_FORGEJO,
   DOC_BOT_SETUP_GITHUB,
+  DOC_GITHUB_PROJECT_SYNC,
 ] as const;

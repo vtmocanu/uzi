@@ -21998,3 +21998,44 @@ Decision Log (D1–D9); this is the terse contract.
   forge PAT field now; rolling it out to the other six `type="password"` sites is a deliberate
   out-of-scope follow-up (D6). This is client-only and does NOT touch the secretbox no-reveal
   invariant, which governs STORED tokens (D7) — there is still no reveal endpoint.
+
+## 568. PRD #534 — GitHub Projects sync web UI: the deferred surface, plus a split authorization (instance kill-switch stays admin, per-repo writes go owner-or-admin)
+
+Builds the web UI that PRD #364 D10 deferred and splits the feature's authorization along its
+two axes. No new SQL/migration/forge code — purely a routing/auth relocation plus web wiring
+over PRD #364's existing service. Richer rationale in PRD #534's / #364's Decision Logs; this is
+the terse contract.
+
+- **Instance kill-switch keeps its admin-only shape.** `github_project_sync_enabled` (settings key
+  `KeyGithubProjectSyncEnabled`, default `false`) gets a toggle card in Admin → Instance settings
+  (`web/src/pages/AdminSettings.tsx#GithubProjectSyncCard`, sends only its own key on save). It is
+  the whole-instance master gate and stays ADMIN-only via the unchanged `PUT /api/admin/settings`.
+  A GitHub-only feature; GitLab/Forgejo repos are untouched.
+
+- **The four per-repo routes RELOCATED out of `/admin`, re-authorized OWNER-OR-ADMIN.** GET status,
+  POST adopt, POST `…/provision`, DELETE disable now mount under the per-repo
+  `/repos/{id}/github-project-sync*` `RequireAuth` group instead of the admin group (was admin-only
+  under PRD #364). The change is auth scope + mount point only; the handler bodies
+  (`api/internal/handler/admin_github_project_sync.go`, file name unchanged) are the same code.
+
+- **Member path forks on `user.IsAdmin`, existence-hiding 404, never 403.** A non-admin caller runs
+  a `GetRepoForUser(id, user.ID)` preflight first and gets a 404 ("repo not found") on `pgx.ErrNoRows`
+  — the same existence-hiding owner-scoping precedent as `PatchRepo`/`DeleteRepo`, deliberately not a
+  403 that would confirm the repo exists. An admin SKIPS the preflight and can target any repo. The
+  preflight ALONE authorizes: the service (`forgesvc.ProjectSyncService`) resolves the connection,
+  token, and project link from the `repoID` internally, so no further ownership check is needed
+  downstream.
+
+- **The instance flag gates the two forge-writing entry points — adopt and provision — not all
+  four.** Only `Adopt` and `Provision` route through `projectSyncPreamble` (`forgesvc/projectsync.go`),
+  which returns `forgesvc.ErrProjectSyncDisabled` when the master toggle is off; that maps to 409 in
+  `writeProjectSyncError`. `Disable` and `ProjectSyncStatus` deliberately do NOT check the flag — they
+  touch only uzi's own local link rows (teardown / read), so tearing down or viewing an existing link
+  stays reachable while the feature is off. The flag is orthogonal to and layered under the per-repo
+  owner-or-admin check.
+
+- **Web-only; the CLI is deliberately excluded.** These are state-changing writes that require the
+  browser's cookie + CSRF posture, whereas the CLI authenticates with a `uzc_` bearer token — and
+  `RequireUser` forces `IsAdmin=false` for CLI tokens, so an owner-or-admin path could not grant a
+  CLI caller the admin arm anyway. Repos-page UI lives in `web/src/pages/Repos.tsx` (per-repo sync
+  panel: adopt / provision / disable / status).

@@ -93,9 +93,14 @@ WHERE r.id = $1 AND c.user_id = $2;
 
 -- name: GetRepoByID :one
 -- One repo plus the connection fields needed to build a forge client, UNSCOPED by
--- user. Modeled on GetRepoForUser but WITHOUT the user_id filter — the GitHub
--- Projects v2 sync (PRD #364 M3) is driven from an ADMIN-only route, targeting a
--- repo by id regardless of which user owns its connection (precedent:
+-- user. Modeled on GetRepoForUser but WITHOUT the user_id filter. The GitHub
+-- Projects v2 sync (PRD #364 M3) that drives it is an OWNER-OR-ADMIN route as of
+-- issue #534 (relocated out of /admin): a non-admin caller is authorized by the
+-- handler's own GetRepoForUser preflight BEFORE this query runs, while an admin
+-- skips that preflight and targets a repo by id regardless of which user owns its
+-- connection. So the ownership guard for this unscoped query lives in the HANDLER
+-- (the preflight), not in the route being admin-only — do not add a caller that
+-- reaches this query without an equivalent ownership check (precedent:
 -- SetRepoGuardrailOverride is the unscoped admin write). Returns the joined
 -- connection fields the forge builder needs (forge_type, base_url, token_ciphertext)
 -- plus forge_project_id for slug/issue resolution.
