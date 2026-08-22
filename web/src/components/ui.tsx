@@ -15,7 +15,7 @@ import {
   type TextareaHTMLAttributes,
 } from "react";
 import { Link } from "react-router-dom";
-import { ArrowLeftIcon } from "./icons";
+import { ArrowLeftIcon, EyeIcon, EyeOffIcon } from "./icons";
 
 export function cx(...parts: (string | false | null | undefined)[]): string {
   return parts.filter(Boolean).join(" ");
@@ -161,6 +161,48 @@ export function Input({
   ...props
 }: InputHTMLAttributes<HTMLInputElement>) {
   return <input className={cx(INPUT_CLASS, className)} {...props} />;
+}
+
+// A masked secret input with a reveal (eye) toggle. Reusable: forge PAT today,
+// the other type="password" sites later (PRD #337 Feature B, D6). Defaults to
+// masked; the toggle button never submits the form (type="button"), carries a
+// toggling aria-label + aria-pressed, and forwards `id` to the inner input so a
+// Field htmlFor associates the label with the input, not the composite. The
+// focus-visible outline gives the icon-button its own visible keyboard ring
+// (the inner Input keeps the global :focus-visible ring from index.css).
+export function PasswordInput({
+  id,
+  value,
+  className = "",
+  ...props
+}: InputHTMLAttributes<HTMLInputElement>) {
+  const [revealed, setRevealed] = useState(false);
+  // Re-mask when the value is externally cleared (e.g. setToken("") after a
+  // successful connect), so a revealed field never shows the NEXT pasted token
+  // in clear (D7 leak guard).
+  useEffect(() => {
+    if (value === "") setRevealed(false);
+  }, [value]);
+  return (
+    <div className="relative">
+      <Input
+        id={id}
+        type={revealed ? "text" : "password"}
+        value={value}
+        className={cx("pr-10", className)}
+        {...props}
+      />
+      <button
+        type="button"
+        onClick={() => setRevealed((r) => !r)}
+        aria-label={revealed ? "Hide token" : "Show token"}
+        aria-pressed={revealed}
+        className="absolute inset-y-0 right-0 flex items-center rounded-r-lg px-3 text-muted outline-hidden hover:text-fg focus-visible:outline-2 focus-visible:outline-brand"
+      >
+        {revealed ? <EyeOffIcon /> : <EyeIcon />}
+      </button>
+    </div>
+  );
 }
 
 export function Select({

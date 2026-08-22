@@ -430,6 +430,46 @@ function priorWorkNote(prior: PriorWork | undefined): string {
   ].join("\n");
 }
 
+// ─── The reseed warning (issue #222) ─────────────────────────────────────────
+// The runner clone is wiped and re-seeded on EVERY claim (git.ts `runnerCloneForBranch`
+// opens with an unconditional `fs.rm`). On a RESUME that destroys any work an earlier
+// attempt left in the tree but never pushed. A follow-up the user QUEUED against the
+// pre-reseed tree survives the wipe (it is cleared only by the worker's consume-on-read
+// `GET /inputs`) and is delivered on a later implement turn, so the lead can act on a
+// correction whose premise — the files/commits it names — no longer exists, with nothing
+// to tell it the tree changed. `priorWorkNote` does not cover this: it fires only when
+// COMMITTED work was recovered (`priorCommits > 0`), and the default-branch reseed leg
+// carries none. The reseed IS surfaced today, but only as a feed-facing worker status
+// (runner.ts) an issue-run lead cannot read — so it must also ride the one thing the lead
+// does read, the implement prompt.
+//
+// FIRST TURN ONLY, and that is what makes it land BEFORE any queued follow-up: the queued
+// channel drains at the END of an implement iteration (sdk-executor.ts), so turn 1 never
+// carries one, and the note persists in the resumed session to be in context when the
+// follow-up arrives on turn 2+. Plain and outside every untrusted fence, like the notes
+// above — uzi's own statement of fact about the clone. It does not restate the base commit:
+// baseCommitNote renders that immediately after, in the same first-turn block.
+
+/** The reseed warning: the working tree was rebuilt on this resume, so local-only prior
+ *  work is gone and a later correction may reference work that is no longer here. Renders
+ *  only when `resumed` is true; a fresh run (no prior tree to lose) adds nothing. */
+function reseedNote(resumed: boolean | undefined): string {
+  if (!resumed) return "";
+  // Worded to be TRUE on every reseed leg, so it never contradicts a co-rendered
+  // priorWorkNote. Uncommitted edits are lost on ANY reseed; committed work survives ONLY
+  // where the reseed recovered it (the tracking/checkpoint legs) — on the default-branch
+  // leg nothing is recovered, and "only if it was recovered" then correctly means none.
+  return [
+    `IMPORTANT — this run was picked up again after an interruption, and its working tree`,
+    `was rebuilt at the start of this attempt. Any UNCOMMITTED changes an earlier attempt`,
+    `made did not survive that rebuild, and its committed work is present only if it was`,
+    `recovered onto this branch. So if a correction you receive later refers to files or`,
+    `commits you cannot find, do not assume they are still here — inspect the tree`,
+    `(\`git status\`, \`git log\`) and treat its actual state as authoritative before acting`,
+    `on it.`,
+  ].join("\n");
+}
+
 // ─── The clone's base commit (judge rec, run 51757591) ───────────────────────
 // The lead handed a subagent `git diff main...HEAD` as "the branch diff" and got a
 // multi-megabyte diff across ~100 unrelated commits. The worker has always known the real
@@ -809,6 +849,12 @@ export interface ImplementPromptInput {
   subagentCanWrite?: Record<string, boolean>;
   /** True for the first implementation turn (right after approval). */
   first: boolean;
+  /** issue #222: this run was picked up again (a resume), so the runner clone was wiped
+   *  and re-seeded and any local-only work from an earlier attempt is gone. FIRST TURN
+   *  ONLY, like the facts below; drives the reseed warning so a queued follow-up written
+   *  against the destroyed tree cannot be acted on as if that work is still present.
+   *  Absent/false ⇒ no note (a fresh run had no prior tree to lose). See reseedNote. */
+  resumed?: boolean;
   /** The current implement⇄review iteration (1-based). */
   iteration: number;
   /** PRD #209 (Decision A): this run's plan was supplied by the user at create time,
@@ -934,6 +980,12 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
     ? depsProvisionImplementNote(input.deps, input.depsTruncated)
     : "";
   if (depsNote) lines.push("", depsNote);
+  // issue #222: the reseed warning, first turn only. Placed BEFORE baseNote so the two read
+  // together — "the tree was rebuilt at the start of this attempt" then "your branch was
+  // created at <base>". A queued follow-up cannot land on turn 1 (it drains at iteration
+  // end), so this is in context by the time one arrives. Empty on a fresh run ⇒ nothing added.
+  const reseed = input.first ? reseedNote(input.resumed) : "";
+  if (reseed) lines.push("", reseed);
   // The base commit, first turn only — this is the phase where the lead delegates a
   // "review the diff" task to a subagent, which is where the wrong diff spec was observed.
   const baseNote = input.first

@@ -360,58 +360,44 @@ describe("repo agents are structurally denied Agent by the assembly path", () =>
   });
 });
 
-describe("repo agents: uzi's own .claude/agents", () => {
-  // KNOWN COUPLING, tracked in #62 — this is an interim unblock, not the fix.
+describe("repo agents: committed fixture roster", () => {
+  // A committed corpus of REAL, hand-authored role frontmatter that this test OWNS.
   //
   // detectRepoAgents is a PRODUCT function: it parses agents out of a USER'S cloned
-  // repo (runner.ts calls it with the worktree path). This test points it at uzi's
+  // repo (runner.ts calls it with the worktree path). It used to be pointed at uzi's
   // OWN `.claude/agents/` — the repo's dev-team roster, which CLAUDE.md declares
-  // "decoupled — it is free to drift and product changes must never touch it", and
-  // which is a DIFFERENT set from the product's builtin roles in
-  // api/internal/agenttmpl/builtins/ (that one has `lead`; this one has
-  // `architect`/`web-ux`). Reading that directory from a product test is the
-  // coupling itself; #62 replaces it with a committed fixture, which is the proper
-  // fix.
+  // "decoupled — it is free to drift and product changes must never touch it". That
+  // was a layering violation (#62): a dev-team member authoring a malformed or
+  // denied-tool role file reddened a product parser test. The fix keeps the value of
+  // reading genuine hand-authored frontmatter — the files below are verbatim copies
+  // of real role files — while freezing them into a fixture the test controls, so no
+  // roster change anywhere can touch this test.
   //
-  // What changed here was only the worst of it: the test used to `deepEqual` the
-  // exact roster, so every dev-team role change turned a product test red (that is
-  // how `architect` broke it). The expectations are now derived from the directory
-  // and assert properties only, so the roster may drift freely. Residual coupling
-  // remains and is deliberate-for-now: these assertions still constrain what the
-  // dev team may put in its own files (a role declaring a denied tool, or one that
-  // fails to parse, reds this test), which a directory declared free to drift
-  // should not have to care about. Hence #62.
+  // The fixture is chosen to exercise the real-world shapes: an inherit-all role
+  // (`coder`, no `tools:` key), a role declaring WebFetch/WebSearch alongside
+  // unknown-to-SDK team tools that are kept but silently unavailable
+  // (`researcher`: TaskUpdate/TaskList/… ), and a normal declared allowlist
+  // (`reviewer`). The role-specific parsing rules themselves are proven above
+  // against controlled fixtures; this block proves those rules hold against what a
+  // human actually writes.
   //
-  // This is NOT the place for an appear/vanish guard. A role vanishing is an
-  // ALLOWED event here, not a defect, and how many roles our dev team happens to
-  // have is no business of the product parser. That signal — with an actionable
-  // message rather than an array diff — belongs to #63's dev-team/product parity
-  // nudge.
-  //
-  // Naming a specific role here would also be redundant: the role-specific
-  // behaviours this used to assert live above, against controlled fixtures —
-  // inherit-all when no `tools:` key ("keeps a declared tools allowlist, and
-  // inherits when no tools key is present") and WebFetch/WebSearch survival
-  // ("strips the denylisted tools, keeps WebFetch/WebSearch and unknown names").
-  // Duplicating them here bought nothing and cost the coupling.
-  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+  // This is NOT an appear/vanish guard on any roster — a role appearing or vanishing
+  // is not this test's business. The dev-team/product parity signal belongs to #63's
+  // nudge, with an actionable message rather than an array diff.
+  const fixtureRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "repoagents");
 
-  it("parses every real authored agent file cleanly, whatever the roster is", async (t) => {
-    // Fail-not-skip when the checkout is present but the agents dir moved: skipping
-    // silently would disarm this guard on a rename. CLAUDE.md is the stable anchor.
-    if (!fs.existsSync(path.join(repoRoot, "CLAUDE.md"))) return t.skip("not in a source checkout");
-    const agentsDir = path.join(repoRoot, ".claude", "agents");
-    assert.ok(fs.existsSync(agentsDir), `checkout present but ${agentsDir} is missing — did .claude/agents move?`);
+  it("parses every fixture agent file cleanly", async () => {
+    const agentsDir = repoAgentsDir(fixtureRoot);
+    assert.ok(fs.existsSync(agentsDir), `committed fixture missing: ${agentsDir}`);
 
     const onDisk = fs.readdirSync(agentsDir).filter((f) => f.endsWith(".md"));
-    assert.ok(onDisk.length > 0, `${agentsDir} has no .md files — the corpus this canary reads is gone`);
+    assert.ok(onDisk.length > 0, `${agentsDir} has no .md files — the fixture this test reads is gone`);
 
-    const { agents, notes } = await detectRepoAgents(repoRoot);
+    const { agents, notes } = await detectRepoAgents(fixtureRoot);
 
-    // EVERY authored file yields exactly one agent. This is the real canary: a file
-    // the parser chokes on would be missing here, whatever it is called. Deriving
-    // the count from the directory is what lets the roster drift freely while still
-    // catching a file that silently fails to parse.
+    // EVERY fixture file yields exactly one agent: the real canary that a file the
+    // parser chokes on would be missing here, whatever it is called. The count is
+    // read from the directory so adding a fixture file never needs a magic number.
     assert.equal(agents.length, onDisk.length, `parsed ${agents.length} agents from ${onDisk.length} files in ${agentsDir}`);
 
     // Nothing stripped, skipped, duplicated, or over-cap. This single assertion is
@@ -422,6 +408,15 @@ describe("repo agents: uzi's own .claude/agents", () => {
     // Properties that hold for any roster, of any size.
     assert.ok(agents.every((a) => a.description.length > 0 && a.prompt_body.trim().length > 0));
     assert.ok(agents.every((a) => !(a.tools ?? []).some((tool) => REPO_AGENT_DENIED_TOOLS.includes(tool))));
+
+    // The fixture is only meaningful if it actually carries the real-world shapes it
+    // was chosen for: an inherit-all role, and WebFetch/WebSearch surviving on real
+    // hand-authored frontmatter.
+    assert.ok(agents.some((a) => a.tools === undefined), "fixture exercises an inherit-all role (no tools: key)");
+    assert.ok(
+      agents.some((a) => (a.tools ?? []).includes("WebFetch") && (a.tools ?? []).includes("WebSearch")),
+      "fixture exercises WebFetch/WebSearch survival",
+    );
   });
 });
 

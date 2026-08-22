@@ -2137,6 +2137,31 @@ Serves human Feature #24; extends the forge seam (§16) and runtime schema (§37
   `ResolveColumn` check in the watcher is authoritative (§91).
 - **`SetRunMRState`** — the sole `mr_state` writer; touches `mr_state` + `updated_at`
   only, never the run's status.
+- **Closed-issue terminal-recording lane (#527).** The candidate `WHERE` is now a
+  union of two lanes. **Lane A** is the open-issue board-move watch above,
+  byte-identical. **Lane B** (`i.state='closed' AND (l.mr_state IS NULL OR l.mr_state
+  IN ('opened','locked'))`) exists because a merge **closes the issue** (via `Closes
+  #N`) and the poller runs the issue sync **before** `SyncMRStates`, so the `merged`
+  state is only ever observable once the issue is already `closed` — Lane A would
+  never see it, which is why `mr_state` froze at `NULL`/`opened` for cleanly-merged
+  PRs and the "merged" badge (`MrChip.tsx`, `runBadge.ts`) almost never appeared.
+  Lane B keeps a closed issue's latest completed run polled while its `mr_state` is
+  **non-terminal**, records the terminal state, and **moves no card** — proven
+  move-free by the existing paths (§91): NULL bootstrap and the `merged`/`locked`
+  `default` arm record without moving, and `guardedMRMove` skips a closed issue
+  before any `AutoMove`. It also **backfills** historical merged PRs (`mr_state`
+  NULL): each is polled once, records `merged`, then **decays out** of the set once
+  terminal (`merged`/`closed` are excluded). No new writer (`SetRunMRState` stays
+  sole), no schema/migration/DTO/web change, and — because the burst bound is a
+  literal `LIMIT 100`, not a `sqlc` param — no change to the `ListMRWatchCandidates`
+  signature or generated row struct (Decision D4). The query orders open-issue
+  (Lane A) rows first (`ORDER BY (i.state='opened') DESC, l.created_at DESC`) so a
+  backfill burst never defers Lane A. **Caveat (accepted, R4):** the `LIMIT 100` now
+  bounds the *total* returned set, Lane A included — previously the query was
+  unbounded — so a repo with >100 simultaneous open Lane-A candidates (Human-Review
+  + reopen cards) would defer the oldest board moves each tick. 100 far exceeds any
+  realistic Lane-A count, so this is defense-in-depth, not an operational limit;
+  raise the constant if a deployment ever approaches it.
 
 ## 91. Watcher: edges, guards, state-persistence contract (`forgesvc.SyncMRStates`)
 
@@ -21935,7 +21960,46 @@ rationale in the Decision Log of `prds/done/517-interactive-task-runs.md`. <!-- 
   tick — the exact use case the feature exists for. Interactive runs are user-paced like chat and
   are bounded instead by the M5 idle timeout, so the exemption must live on kind, not status.
 
-## 567. PRD #534 — GitHub Projects sync web UI: the deferred surface, plus a split authorization (instance kill-switch stays admin, per-repo writes go owner-or-admin)
+## 567. PRD #337 — connect-form base-URL ⇄ forge-type sync + a reusable reveal-token input
+
+Frontend-only UX polish on Settings → Forge → connect. Richer rationale lives in PRD #337's
+Decision Log (D1–D9); this is the terse contract.
+
+- **Two-way, host-inferred, recognized-only sync.** The base-URL `<Select>` and the forge-type
+  `<Select>` are kept consistent in BOTH directions on user change, but ONLY for recognized hosts.
+  *This changes the connect form's prior stance*, recorded as the code comment that read `Base URL
+  and type are independent choices (D11a): a mismatch is caught by VerifyToken` (in `ForgeSettings.tsx`,
+  reworded by M2's fix-the-doc): the form now keeps the pair consistent and VerifyToken is the backstop,
+  not the first line of defense. This refines — it does not contradict — §296's connect-picker design,
+  where the forge-type pick was an independent choice reconciled by save-time scope/version validation.
+- **Recognition lives in `web/src/lib/forgeInfer.ts`** (a sibling to `forgeNoun.ts`, kept separate so
+  forgeNoun's "exactly one GitLab-noun literal" acceptance test stays clean — D2).
+  `inferForgeType(baseUrl, forgeTypes)` parses the host, does a case-insensitive substring match
+  (`github`/`gitlab`/`forgejo`) plus a tiny alias map (`codeberg.org`/`*.codeberg.org` → forgejo), and
+  returns the type ONLY if it is advertised in `forgeTypes` (the D4 guard — inference can never select
+  a forge the instance did not enable). Unrecognized host → `null` ("user chooses").
+- **Direction rules.** URL→type switches the type when the inferred type is recognized, advertised,
+  and different. type→URL moves the URL only when the CURRENT host is a recognized forge of a
+  different type AND `defaultUrlForType(type, allowedUrls)` returns a recognized target; when it
+  returns `null` (the chosen type has no recognized allowlist URL — e.g. a self-hosted
+  `git.example.com`), KEEP the current URL rather than blank or mis-set it (D8). An
+  unrecognized/self-hosted host is left under full manual control in both directions (D4/D5). *Why:*
+  sync fires on user change events only, never on mount (D5), so the landing pair is byte-identical to
+  before this change.
+- **Frontend-only, no backend touch.** No API/DB/worker change; `createConnection(baseUrl, token,
+  forgeType)` still carries all three values and VerifyToken is unchanged. The auto-changed field gets
+  a cosmetic CSS-only highlight (D9) that carries no behavioral assertion.
+- **Reusable `PasswordInput`** (`web/src/components/ui.tsx`) with `EyeIcon`/`EyeOffIcon`
+  (`icons.tsx`): a masked secret input with a reveal (eye) toggle. Masked by default; the toggle is
+  `type="button"` (never submits), carries a toggling `aria-label`/`aria-pressed` and a visible focus
+  ring, and forwards `id` to the inner input so a `Field htmlFor` associates the label with the input,
+  not the composite. *Why the re-mask:* a `useEffect` re-masks when the value is externally cleared
+  (D7 leak guard) — a revealed field must not display the NEXT pasted token in clear. Applied to the
+  forge PAT field now; rolling it out to the other six `type="password"` sites is a deliberate
+  out-of-scope follow-up (D6). This is client-only and does NOT touch the secretbox no-reveal
+  invariant, which governs STORED tokens (D7) — there is still no reveal endpoint.
+
+## 568. PRD #534 — GitHub Projects sync web UI: the deferred surface, plus a split authorization (instance kill-switch stays admin, per-repo writes go owner-or-admin)
 
 Builds the web UI that PRD #364 D10 deferred and splits the feature's authorization along its
 two axes. No new SQL/migration/forge code — purely a routing/auth relocation plus web wiring

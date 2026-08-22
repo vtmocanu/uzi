@@ -49,10 +49,12 @@ describe("buildSdkEnv", () => {
     assert.strictEqual(env.PATH, process.env.PATH);
     assert.strictEqual(env.ANTHROPIC_API_KEY, undefined);
     assert.strictEqual(env.ANTHROPIC_AUTH_TOKEN, undefined);
+    // Restores the pre-0.3.233 default tool surface (issue #549): todo/task tools.
+    assert.strictEqual(env.CLAUDE_CODE_ENABLE_TODO_TOOLS, "1");
 
     // Exactly the core keys (+ TMPDIR, the 5-bis per-uid scratch dir, when the ambient
     // env has one) — no other WORKER env is spread in. TMPDIR is not a secret.
-    const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]);
+    const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_ENABLE_TODO_TOOLS"]);
     if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expected.add("TMPDIR");
     assert.deepStrictEqual(new Set(Object.keys(env)), expected);
   });

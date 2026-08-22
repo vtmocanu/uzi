@@ -97,6 +97,7 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     stats_mem_bytes: null,
     stats_mem_limit_bytes: null,
     stats_source: null,
+    draining_since: null,
     ...over,
   };
 }
@@ -298,6 +299,47 @@ describe("WorkersSettings hosted workers (PRD #58 M5)", () => {
     mockApi.listWorkers.mockResolvedValue({ workers: [...fleet, hosted] });
     renderPage();
     expect(await screen.findByText(/1 of 2 used/)).toBeTruthy();
+  });
+
+  it("renders the cordon pill AFTER the status badge, and none for a non-cordoned row (PRD #496 M3)", async () => {
+    // The cluster only renders where the row does, so this is the place — not the
+    // component test — where DOM ORDER is a real property: the pill must sit after the
+    // status badge, not replace or precede it.
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [
+        aWorker({
+          id: "w-cordon",
+          name: "cordoned-one",
+          kind: "hosted",
+          hosted_size: "m",
+          draining_since: "2026-08-21T12:00:00Z",
+          active_runs: 0,
+        }),
+      ],
+    });
+    renderPage();
+    await screen.findByText("cordoned-one");
+
+    const pill = screen.getByText("cordoned");
+    // The status badge span carries the status word exactly ("online"), which never
+    // collides with the "· up …" uptime token — a loose /online/ match would.
+    const status = screen.getByText("online");
+    // The pill FOLLOWS the status badge in document order.
+    expect(status.compareDocumentPosition(pill) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(pill.getAttribute("title")).toBe("Cordoned — not claiming new runs.");
+  });
+
+  it("renders NO cordon pill for a non-cordoned hosted worker (paired with the positive above)", async () => {
+    // The negative half of the ordering test above: a hosted row that is not draining
+    // (draining_since null) shows neither pill wording. Vacuous on its own — meaningful
+    // only alongside the positive case that proves the pill renders at all.
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [aWorker({ id: "w-plain", name: "plain-one", kind: "hosted", hosted_size: "m", draining_since: null })],
+    });
+    renderPage();
+    await screen.findByText("plain-one");
+    expect(screen.queryByText("cordoned")).toBeNull();
+    expect(screen.queryByText("draining")).toBeNull();
   });
 
   it("still shows the one-time token card for an EXTERNAL worker (the hand-run flow is untouched)", async () => {

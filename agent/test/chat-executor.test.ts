@@ -305,7 +305,7 @@ describe("ChatExecutor session env + assembly", () => {
     assert.strictEqual(turns.length, 1);
     const o = turns[0]!.options;
     // Core keys + TMPDIR (5-bis per-uid scratch, when the ambient env has one); TMPDIR is not a secret.
-    const expectedEnvKeys = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]);
+    const expectedEnvKeys = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_ENABLE_TODO_TOOLS"]);
     if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expectedEnvKeys.add("TMPDIR");
     assert.deepStrictEqual(new Set(Object.keys(o.env!)), expectedEnvKeys);
     assert.deepStrictEqual(o.tools, [...CHAT_BASE_TOOLS]);

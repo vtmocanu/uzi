@@ -84,6 +84,16 @@ every column:
 - **Last updated**: most recently changed on GitLab first.
 - **Title**: alphabetical.
 
+An **ascending/descending** toggle sits right beside **Sort** and reverses
+whichever mode is active. Each mode starts in the direction that makes
+sense for it — issue number and title low-to-high / A-to-Z, recent run
+activity and last updated newest-first — and switching modes resets the
+toggle back to that default; it flips from there if you want the opposite.
+It's disabled for **Manual**, which is your own hand-set order and has no
+direction to flip. The chosen mode and direction now apply to **every**
+column, including **Closed** (under Manual, Closed stays issue-number
+order, as before).
+
 The sort choice is remembered per board, on this browser. The order itself is
 different: it is stored with your account, so it follows you to any browser or
 device you sign in from. It is yours, not the team's; another person looking at

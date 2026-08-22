@@ -1870,7 +1870,19 @@ function JudgeUsageStrip({ judgeRun }: { judgeRun: NonNullable<RunReview["judge_
 // state survives a reload and is visible to anyone viewing the run.
 // All judge free text (summary, rationale, target) renders as escaped React text —
 // never markdown/HTML — since it is untrusted judge/worker output (audit carry-forward).
-export function JudgePanel({ run }: { run: Run }) {
+//
+// The poll's stop cap (PRD #119: 150 tries × 4s ≈ 10 min). Exposed as an injectable prop
+// so tests can drive the exact stop boundary in a handful of ticks instead of 149 real
+// event-loop turns (issue #227); production never passes it, so the default always holds.
+export const JUDGE_POLL_MAX_TRIES = 150;
+
+export function JudgePanel({
+  run,
+  pollMaxTries = JUDGE_POLL_MAX_TRIES,
+}: {
+  run: Run;
+  pollMaxTries?: number;
+}) {
   const [review, setReview] = useState<RunReview | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadErr, setLoadErr] = useState("");
@@ -2006,8 +2018,8 @@ export function JudgePanel({ run }: { run: Run }) {
   //   • the local `queued` window before the server reports a pending judge — the first
   //     response with pending_judge null ends it, same as before;
   //   • everything else — the 150-try cap.
-  // Cap is 150 tries × 4s ≈ 10 minutes — a real judge takes minutes, and the old 15-try
-  // (~1 min) cap gave up while the judge it was waiting on was still running.
+  // Cap is JUDGE_POLL_MAX_TRIES (150) tries × 4s ≈ 10 minutes — a real judge takes minutes,
+  // and the old 15-try (~1 min) cap gave up while the judge it was waiting on was still running.
   useEffect(() => {
     if (!polling) return;
     let tries = 0;
@@ -2027,7 +2039,7 @@ export function JudgePanel({ run }: { run: Run }) {
         // while pendingJudge holds its last non-null value, so the effect never re-runs
         // and never re-runs its cleanup — a permanently-failing endpoint would be
         // polled every 4s until unmount.
-        if (tries >= 150) {
+        if (tries >= pollMaxTries) {
           setQueued(false);
           clearInterval(id);
         }
@@ -2048,13 +2060,13 @@ export function JudgePanel({ run }: { run: Run }) {
         setReview(landed);
         baselineUpdatedAt.current = landed.updated_at;
       }
-      if (nextPending === null || tries >= 150) {
+      if (nextPending === null || tries >= pollMaxTries) {
         setQueued(false);
         clearInterval(id);
       }
     }, 4000);
     return () => clearInterval(id);
-  }, [polling, run.id]);
+  }, [polling, run.id, pollMaxTries]);
 
   const rerun = async () => {
     setActionErr("");

@@ -460,16 +460,26 @@ LIMIT 1;
 -- suppressed), and a completed latest run whose own mr_iid is NULL yields none
 -- either (never fall back to an older run's MR).
 --
--- The issue must be open, and a COARSE column prefilter keeps the polled set
--- tiny: the card is either labelled Human Review (the close-edge watch) or the
--- run already recorded mr_state='closed' (the reopen-edge watch, Decision 10).
--- This prefilter is deliberately NOT board.ResolveColumn — highest-position-wins
--- across multiple column labels is not cheaply expressible in SQL, so the
--- authoritative source-column guard is the Go ResolveColumn check in the watcher;
--- this only bounds how many MRs get polled.
+-- The candidate set now spans TWO lanes. Lane A (UNCHANGED, PRD #24) is the
+-- open-issue board-move watch: the issue is open and a COARSE column prefilter
+-- keeps the polled set tiny — the card is either labelled Human Review (the
+-- close-edge watch) or the run already recorded mr_state='closed' (the
+-- reopen-edge watch, Decision 10). This prefilter is deliberately NOT
+-- board.ResolveColumn — highest-position-wins across multiple column labels is
+-- not cheaply expressible in SQL, so the authoritative source-column guard is the
+-- Go ResolveColumn check in the watcher; this only bounds how many MRs get polled.
+--
+-- Lane B (NEW, #527) is the closed-issue terminal-recording lane. A merge CLOSES
+-- the issue (via `Closes #N`) before SyncMRStates runs, so a merged state is only
+-- observable once i.state='closed' — Lane A would never see it. Lane B keeps
+-- polling a closed issue's latest run until its mr_state reaches a terminal value
+-- (merged/closed), recording that state; it moves NO card (bootstrap and the
+-- merged/locked transition are move-free, and the edge paths skip a closed issue),
+-- so it only backfills historical merged PRs and decays as each run settles to a
+-- terminal state. The Go ResolveColumn check remains authoritative for board moves.
 WITH latest AS (
     SELECT DISTINCT ON (r.issue_iid)
-           r.id, r.issue_iid, r.status, r.mr_iid, r.mr_state
+           r.id, r.issue_iid, r.status, r.mr_iid, r.mr_state, r.created_at
     FROM runs r
     WHERE r.repo_id = @repo_id
     ORDER BY r.issue_iid, r.created_at DESC
@@ -479,8 +489,29 @@ FROM latest l
 JOIN issues i ON i.repo_id = @repo_id AND i.forge_issue_iid = l.issue_iid
 WHERE l.status = 'completed'
   AND l.mr_iid IS NOT NULL
-  AND i.state = 'opened'
-  AND (jsonb_exists(i.labels, 'Human Review') OR l.mr_state = 'closed');
+  AND (
+    -- Lane A (UNCHANGED): open-issue board-move watch — card in Human Review
+    -- (close-edge) or run already recorded closed (reopen-edge, Decision 10).
+    (i.state = 'opened' AND (jsonb_exists(i.labels, 'Human Review') OR l.mr_state = 'closed'))
+    OR
+    -- Lane B (NEW, #527): closed-issue terminal-state recording. A merge CLOSES the
+    -- issue (Closes #N) before SyncMRStates runs, so the merged state is only
+    -- observable after i.state='closed'. Keep polling until mr_state is terminal
+    -- (merged/closed). Move-free by construction: bootstrap and the merged/locked
+    -- transition never move a card, and the edge paths skip a closed issue
+    -- (mr_watch.go syncOneMRState / guardedMRMove). `locked` is a transient
+    -- mid-merge state, kept polling so it settles to merged (Decision D5).
+    (i.state = 'closed' AND (l.mr_state IS NULL OR l.mr_state IN ('opened', 'locked')))
+  )
+-- Open-issue (Lane A) candidates first so the board-move watch is never deferred
+-- behind a closed-issue backfill burst; then newest runs first so recent merges
+-- record before old ones. Qualify l.created_at (not bare) — `issues` has none.
+-- LIMIT 100 is a hardcoded burst bound (Decision D4): not a sqlc param, so zero Go
+-- signature change; 100 comfortably exceeds any realistic Lane-A count. Keep this
+-- rationale ABOVE the statement — a comment trailing after the `;` is grabbed by
+-- sqlc as the leading doc of the NEXT query.
+ORDER BY (i.state = 'opened') DESC, l.created_at DESC
+LIMIT 100;
 
 -- name: GetIssueByIID :one
 SELECT * FROM issues WHERE repo_id = $1 AND forge_issue_iid = $2;
@@ -538,9 +569,11 @@ WHERE repo_id = $1 AND forge_issue_iid <> ALL(@keep_iids::bigint[]);
 --     whole point: a merge CLOSES the issue via the `Closes #N` in the MR
 --     description, and the poller runs the issue sync BEFORE SyncMRStates, so by the
 --     time a merge is observable the issue is already state='closed'.
---     ListMRWatchCandidates requires i.state = 'opened' and would therefore miss
---     this deterministically — which is why PRD #24's prefilter is not reused here
---     and must not be widened to cover it.
+--     ListMRWatchCandidates now has a closed-issue lane too (#527), BUT that lane
+--     only RECORDS mr_state — it performs no forge description write and no
+--     PRD-link patch — so ListPRDLinkPatchCandidates remains a SEPARATE query: it
+--     does a forge description WRITE with its own superseded-run and edge scoping
+--     (Decision 10), which #527's record-only lane does not and cannot supply.
 --
 -- issue_description is the run's QUEUE-TIME snapshot, pulled in the candidate scan
 -- rather than by a second read per candidate. It is what binds the patch target:

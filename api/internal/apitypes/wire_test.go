@@ -524,6 +524,9 @@ var workerDTOKeys = []string{
 	// PRD #251: api-owned anchor of when the worker became online; null when offline or
 	// never online. Uptime is derived client-side as now − online_since; display-only.
 	"online_since",
+	// PRD #422/#496: when a hosted worker was cordoned/began draining (finishes in-flight
+	// runs, claims nothing new); null for a worker that will claim normally. Hosted-only.
+	"draining_since",
 	"created_at", "stats_cpu_pct", "stats_mem_bytes",
 	"stats_mem_limit_bytes", "stats_source",
 	// PRD #104 M3: which Anthropic credential this worker's run-lane claims spend.

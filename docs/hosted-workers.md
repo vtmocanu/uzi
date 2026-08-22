@@ -70,6 +70,25 @@ once and then failed an upgrade DOES have one now — see
 [Worker versions and upgrades](worker-upgrades.md).)
 (`kubectl -n <worker namespace> get pods`).
 
+## Draining and cordoned
+
+When the cluster needs to roll a hosted worker that is still busy, it doesn't
+kill it out from under your runs. Instead it **cordons** (drains) the worker:
+the worker keeps finishing the runs it already has, but stops claiming new
+ones, then the cluster restarts it once it's idle.
+
+A cordoned worker shows a dashed **draining** or **cordoned** pill next to its
+status in the Workers list — **draining** while it's still finishing runs,
+**cordoned** once it's idle and just holding until the restart. `uzi worker
+list` shows the same thing folded into the STATUS column, e.g. `online
+(draining)` or `offline (draining)`.
+
+This is what explains an otherwise confusing moment: a worker that's online
+and shows a free run slot, but isn't picking up a run sitting in the queue.
+That's expected while it's cordoned — it isn't a bug, and it isn't stuck. It
+resumes claiming runs on its own once the roll finishes. There's no manual
+way to cordon a worker yourself; it's driven entirely by the cluster.
+
 ## How this differs from running your own worker
 
 A worker you run yourself is a container on hardware you control: you copy a

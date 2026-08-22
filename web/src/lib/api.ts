@@ -1074,7 +1074,7 @@ export interface Worker {
   // {docker, jvm}. Read-only display. Optional so an older response (or a test
   // fixture) without the field reads as "none".
   capabilities?: string[];
-  busy: boolean; // derived: holds a claimed/running/awaiting_approval run (== active_runs > 0)
+  busy: boolean; // derived: holds ANY run of ANY kind, so a chat-only worker is busy:true with active_runs:0 — NOT active_runs > 0
   // Bounded concurrency (PRD #42 Decision 10). active_runs is the live count of the
   // worker's claimed/running/awaiting_approval runs (busy is derived from it);
   // max_concurrent_runs is the worker's advertised slot cap, null when it advertises
@@ -1136,6 +1136,11 @@ export interface Worker {
   last_heartbeat_at: string | null;
   // api-owned anchor of when the worker became online (null offline); uptime = now − this, derived client-side.
   online_since?: string | null;
+  // Set (to when it was cordoned) while a hosted worker is draining/cordoned: it
+  // finishes its in-flight runs but claims nothing new (PRD #422/#496). null for a
+  // worker that will claim normally. Hosted-only by construction. draining is derived
+  // client-side as draining_since != null; it is ORTHOGONAL to upgrade_status/busy.
+  draining_since: string | null;
   created_at: string;
   // Latest container resource sample (PRD #49), all null until the worker reports
   // one (and re-nulled if it stops). stats_cpu_pct is a percentage of the worker's
