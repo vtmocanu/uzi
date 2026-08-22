@@ -336,3 +336,21 @@ export const ScaleIcon = (p: SVGProps<SVGSVGElement>) => (
     <path d="M7 21h10M12 3v18M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2" />
   </Icon>
 );
+
+// EyeIcon / EyeOffIcon (lucide) — the reveal/hide affordance on PasswordInput
+// (PRD #337 Feature B): eye = "show the secret", eye-off = "hide it again".
+export const EyeIcon = (p: SVGProps<SVGSVGElement>) => (
+  <Icon {...p}>
+    <path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z" />
+    <circle cx="12" cy="12" r="3" />
+  </Icon>
+);
+
+export const EyeOffIcon = (p: SVGProps<SVGSVGElement>) => (
+  <Icon {...p}>
+    <path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68" />
+    <path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61" />
+    <path d="M9.88 9.88a3 3 0 1 0 4.24 4.24" />
+    <line x1="2" x2="22" y1="2" y2="22" />
+  </Icon>
+);
