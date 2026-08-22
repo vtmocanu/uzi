@@ -25,14 +25,28 @@ on uzi's regular poll cadence instead — eventually consistent, not instant.
 
 ## Enabling it
 
-Two admin-only switches: the `github_project_sync_enabled` **instance kill
-switch** (see [Admin settings](./admin-settings.md)), off by default and a
-strict no-op while off; then, **per repo**, an admin links it to a Projects
-v2 board by either **adopting** an existing one or having uzi **provision**
-a new one — the link is the per-repo enabled state, no separate flag. Both
-are admin-only API actions today: no `uzi` CLI verb (the CLI admin surface
-is read-only by design — the write endpoints are cookie-only) and no
-dedicated settings-page control yet.
+Two switches, held by two different people. An admin flips the
+`github_project_sync_enabled` **instance kill switch** in **Admin →
+Instance settings** (see [Admin settings](./admin-settings.md)), off by
+default and a strict no-op while off — nothing below works until this is
+on. Then, **per repo**, the repo's connection owner (or an admin) links it
+to a Projects v2 board from the **Boards** page: the repo row's "Project
+sync" cell opens a Manage panel with **Adopt** (link an existing board) or
+**Provision** (have uzi create one) — the link itself is the per-repo
+enabled state, no separate flag.
+
+That's a two-tier authorization model: the admin holds the one instance-
+wide lever, while each repo's own sync is managed by whoever owns its
+forge connection, or by an admin. A user who is neither never sees the
+Manage control and can't reach the routes behind it either — the API
+existence-hides them (404) rather than exposing a 403 that would confirm
+the repo exists. GitHub only; GitLab and Forgejo repos never show the
+cell.
+
+There's still no `uzi` CLI verb for any of this. The per-repo and
+instance writes require a cookie session plus a CSRF token, while the CLI
+authenticates with a bearer token and never carries either — so it can't
+reach these routes structurally, not merely by policy.
 
 ## Adopt vs. provision
 
