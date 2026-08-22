@@ -13,7 +13,9 @@
 #   - It NEVER globs `uzi-`. Only names matching ^uzi-e2e-<digits>$ (the PID-suffixed
 #     DEFAULT project name) are eligible. It never matches the real dev stack `uzi`
 #     (containers uzi-db-1 ...), store-it's `uzi-store-it-*`, or a custom
-#     UZI_E2E_COMPOSE_PROJECT.
+#     UZI_E2E_COMPOSE_PROJECT not shaped like `uzi-e2e-<digits>`. A custom name
+#     that IS shaped that way matches the regex, but is still protected by the
+#     current-project name-exclusion ($1) and the pid-liveness check below.
 #   - The PID is embedded in the name. A project is reclaimed ONLY when `kill -0 <pid>`
 #     proves the process is GONE (ESRCH). A concurrent live run (alive pid) and the
 #     current run (own pid alive + name-excluded via $1) are always skipped. EPERM
@@ -55,11 +57,14 @@ pid_dead() {
   esac
 }
 
+# The trailing `|| true` keeps a docker-daemon-unreachable failure from aborting
+# under `set -euo pipefail`: enumeration then yields an empty set and we fall
+# through to the "no leaked e2e projects found" line rather than exiting silently.
 candidates="$(
   {
     docker ps -a --format '{{.Label "com.docker.compose.project"}}'
     docker volume ls --format '{{.Label "com.docker.compose.project"}}'
-  } 2>/dev/null | sort -u
+  } 2>/dev/null | sort -u || true
 )"
 
 reclaimed=0

@@ -61,7 +61,7 @@ else
   fails=$((fails + 1))
 fi
 
-check_absent 'uzi-e2e-1'         # pid 1 -> EPERM for non-root -> alive
+check_absent 'uzi-e2e-1'         # pid 1: EPERM (non-root) or signal-delivered (root) -> alive
 check_absent "$CURRENT"          # own run: alive + name-excluded
 check_absent 'uzi'               # regex miss (real dev stack)
 check_absent 'uzi-store-it-12345' # regex miss (store-it)
