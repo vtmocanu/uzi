@@ -14,20 +14,31 @@ place.)
 
 ## [Unreleased]
 
+## [0.52.0] - 2026-08-22
+<!-- release-title: interactive task runs, context + rate-limit meters, board sort, forge-connect UX -->
+
 ### Added
 
-- **Board sort direction toggle ([#412](https://github.com/vtmocanu/uzi/issues/412), PRD #412).** The board's Sort control gains an ascending/descending toggle beside it, so any mode can run either direction (it is disabled for Manual); each mode keeps its previous direction as its default. The chosen sort (mode and direction) now applies to every lane, including **Closed**, which was previously always pinned to issue-number order.
-- **Draining/cordoned worker signal ([#496](https://github.com/vtmocanu/uzi/pull/496), PRD #496).** The Workers list and `uzi worker list` now show when a hosted worker is draining/cordoned — finishing its current runs but not claiming new ones — so an online worker with a free slot that isn't picking up a queued run reads as an in-progress roll rather than a bug.
-- **Interactive, long-lived task runs (PRD #517, issue [#517](https://github.com/vtmocanu/uzi/issues/517)).**
-  `uzi handoff --interactive` keeps a task run alive past a clean `signal_done` instead of
-  finalizing it: the run checkpoint-pushes its branch and parks in a new non-terminal
-  status, `awaiting_followup`, holding the same agent session, clone and branch open.
-  `uzi run follow-up <id>` wakes it for another turn with full context (no history
-  replay); the new `uzi run stop <id>` winds it down gracefully (finalize, optional MR)
-  as a distinct alternative to the hard-abort `run cancel`; and a forgotten park is
-  finalized on its own by a 30-minute worker-side idle timeout
-  (`WORKER_TASK_IDLE_TIMEOUT`), with the existing stale-worker requeue as the dead-worker
-  backstop so no checkpoint-pushed work is ever lost.
+- **Interactive, long-lived task runs ([#540](https://github.com/vtmocanu/uzi/pull/540), PRD #517).** `uzi handoff --interactive` keeps a task run alive past a clean `signal_done` instead of finalizing it: the run checkpoint-pushes its branch and parks in a new non-terminal `awaiting_followup` status, holding the same agent session, clone and branch open. `uzi run follow-up <id>` wakes it for another turn with full context (no history replay); the new `uzi run stop <id>` winds it down gracefully (finalize, optional MR) as a distinct alternative to the hard-abort `run cancel`; a forgotten park is finalized by a 30-minute worker-side idle timeout (`WORKER_TASK_IDLE_TIMEOUT`), with the existing stale-worker requeue as the dead-worker backstop.
+- **Lead context-window meter ([#538](https://github.com/vtmocanu/uzi/pull/538), PRD #516).** The run Activity panel shows the lead session's live context-window fill (read from the SDK once per lead turn) as a meter on the lead lane plus a micro-meter on the lead crew chip, predicting autocompaction. Subagent lanes get no meter (the SDK exposes only the main-loop window). This is window fill, distinct from the token spend the run page already tallies.
+- **TUI run-detail account meters ([#536](https://github.com/vtmocanu/uzi/pull/536), PRD #530).** The `uzi tui` run-detail view renders per-account 5h/7d rate-limit meters under the milestone block, mirroring the board strip and web sidebar selection.
+- **TUI rate-limit auto-refresh ([#539](https://github.com/vtmocanu/uzi/pull/539), PRD #533).** The TUI rate-limit strip now polls its meters on its own 60s ticker instead of freezing at launch, matching the web sidebar cadence.
+- **Board sort direction toggle ([#544](https://github.com/vtmocanu/uzi/pull/544), PRD #412).** The board's Sort control gains an ascending/descending toggle (disabled for Manual); each mode keeps its previous direction as default. The chosen sort applies to every lane including Closed, which was previously always pinned to issue-number order.
+- **Forge connect base-URL and type sync ([#542](https://github.com/vtmocanu/uzi/pull/542), PRD #337).** The connect form two-way-syncs the base URL and forge type (selecting a type fills the default URL; a recognized URL infers the type), and the PAT field gains a reveal/hide toggle. The reveal is client-only over what the user is typing; no stored secret is ever surfaced.
+- **Worker cordon/drain signal ([#546](https://github.com/vtmocanu/uzi/pull/546), PRD #496).** The Workers list and `uzi worker list` now show when a hosted worker is draining/cordoned (finishing its current runs but not claiming new ones), so an online worker with a free slot that is not picking up a queued run reads as an in-progress roll rather than a bug.
+
+### Changed
+
+- **TUI floor-strip account separator ([#537](https://github.com/vtmocanu/uzi/pull/537), issue [#532](https://github.com/vtmocanu/uzi/pull/532)).** The factory-floor rate-limit strip replaces the faint " · " token separator with a per-account left accent bar, tinted alarm-red when the account's peak 5h/7d window is at or above the danger threshold and faint otherwise.
+
+### Fixed
+
+- **Bound server-controlled strings at the terminal ([#541](https://github.com/vtmocanu/uzi/pull/541), issue [#220](https://github.com/vtmocanu/uzi/pull/220)).** Three server-controlled strings that reached the terminal unbounded (an error body and the device-login user-code and email) now pass through the truncating `cellText` (200-byte cap), so a hostile server response cannot flood the CLI output.
+- **Warn the lead when a resume re-clone destroyed the tree ([#543](https://github.com/vtmocanu/uzi/pull/543), issue [#222](https://github.com/vtmocanu/uzi/pull/222)).** On a resumed run whose re-clone rebuilt the working tree, the first implement turn now warns the lead that a queued follow-up written against the old tree may not reflect surviving work, so a stale steer input is not acted on as if that work were present.
+
+### Internal
+
+- **Web suite flake fix ([#545](https://github.com/vtmocanu/uzi/pull/545), issue [#227](https://github.com/vtmocanu/uzi/pull/227)).** The JudgePanel poll-cap tests no longer drive a 149-turn timer chain (the cap is now an injectable prop), removing the per-test timeout bumps and the CI-contention flake without loosening coverage.
 
 ## [0.51.0] - 2026-08-21
 <!-- release-title: capability-aware scheduling, wait-on-limit on by default, live runs list -->
@@ -3004,7 +3015,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.51.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.52.0...HEAD
+[0.52.0]: https://github.com/vtmocanu/uzi/compare/v0.51.0...v0.52.0
 [0.51.0]: https://github.com/vtmocanu/uzi/compare/v0.50.0...v0.51.0
 [0.50.0]: https://github.com/vtmocanu/uzi/compare/v0.49.0...v0.50.0
 [0.49.0]: https://github.com/vtmocanu/uzi/compare/v0.48.0...v0.49.0
