@@ -17,9 +17,12 @@ import (
 // laneRailWidth is the left rail's fixed column budget.
 const laneRailWidth = 26
 
-// railRateBarWidth is the full-rail account meter's bar: laneRailWidth minus the
-// "5h " label+space (3) and the " 100%" separator+right-aligned-percent field (5).
-const railRateBarWidth = laneRailWidth - 3 - 5 // 18
+// railRateBarWidth is the full-rail account meter's bar. The rail row is width-locked to
+// laneRailWidth (26); its budget is: "5h " label+space (3) + bar + " NN%" percent field (5) +
+// 2-col gap (2) + 6-col right-aligned reset countdown (6). The bar takes what is left (issue #588
+// shrank it from 18 to 10 to make room for the inline reset). A window with no reset time renders
+// no countdown and the row is simply shorter (still <= 26).
+const railRateBarWidth = laneRailWidth - 3 - 5 - 2 - 6 // 10
 
 // The detail view has two focusable panes (PRD #325 M4). ←/→ (and tab) move focus between
 // them; ↑/↓ act WITHIN the focused pane — between agents on the rail, scrolling the
@@ -642,7 +645,7 @@ func (m tuiModel) renderLaneRail() string {
 		if block := m.renderMilestones(); block != "" {
 			sb.WriteString("\n\n" + block)
 		}
-		if rb := m.railRateMeters(strings.Count(sb.String(), "\n") + 1); rb != "" {
+		if rb := m.railRateMeters(now, strings.Count(sb.String(), "\n")+1); rb != "" {
 			sb.WriteString("\n\n" + rb)
 		}
 		return sb.String()
@@ -675,7 +678,7 @@ func (m tuiModel) renderLaneRail() string {
 	if block := m.renderMilestones(); block != "" {
 		sb.WriteString("\n" + block)
 	}
-	if rb := m.railRateMeters(strings.Count(sb.String(), "\n") + 1); rb != "" {
+	if rb := m.railRateMeters(now, strings.Count(sb.String(), "\n")+1); rb != "" {
 		sb.WriteString("\n\n" + rb)
 	}
 	return sb.String()
@@ -870,7 +873,7 @@ func (m tuiModel) renderMilestones() string {
 // RequireUser in #519; against a server that predates that the settings fetch 401s (error
 // swallowed) and this falls back to default-token-only, exactly as the board strip does. No
 // server change here.
-func (m tuiModel) railRateMeters(usedRows int) string {
+func (m tuiModel) railRateMeters(now time.Time, usedRows int) string {
 	shown, showLabel := m.selectedRateMeters()
 	if len(shown) == 0 {
 		return ""
@@ -890,8 +893,8 @@ func (m tuiModel) railRateMeters(usedRows int) string {
 			lines = append(lines, m.pal.faint.Render(m.renderer.Plain(t.Label, laneRailWidth)))
 		}
 		lines = append(lines,
-			m.rateWindowCell("5h", t.Limits.FiveHour, railRateBarWidth, 4),
-			m.rateWindowCell("7d", t.Limits.SevenDay, railRateBarWidth, 4),
+			m.rateWindowCell("5h", t.Limits.FiveHour, railRateBarWidth, 4, now),
+			m.rateWindowCell("7d", t.Limits.SevenDay, railRateBarWidth, 4, now),
 		)
 		entry := strings.Join(lines, "\n")
 		rows := len(lines)
