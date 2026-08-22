@@ -13,6 +13,7 @@ import { Modal } from "../components/Modal";
 import { BoardIcon, XIcon } from "../components/icons";
 import { DocLink } from "../components/DocLink";
 import { DOC_GITHUB_PROJECT_SYNC, DOC_REPO_AGENTS } from "../lib/doclinks";
+import { selectedForge } from "../lib/prefs";
 
 // The server-owned capability vocabulary (PRD #84). The repo hint offers only these
 // names; the server capability.Filters anything else, so free-form entry is not
@@ -332,7 +333,13 @@ export function Repos() {
       try {
         const { connections } = await api.listConnections();
         setConnections(connections);
-        if (connections.length > 0) setConnectionId(connections[0].id);
+        if (connections.length > 0) {
+          // Prefer the remembered connection, but validate it against the live
+          // list — a since-deleted connection falls back to the first (issue #578).
+          const remembered = selectedForge.get();
+          const match = remembered && connections.some((c) => c.id === remembered) ? remembered : connections[0].id;
+          setConnectionId(match);
+        }
       } catch (err) {
         setError(err instanceof ApiError ? err.message : "Failed to load connections");
       } finally {
@@ -675,7 +682,14 @@ export function Repos() {
         <>
           {connections.length > 1 && (
             <div className="max-w-md">
-              <Select value={connectionId} onChange={(e) => setConnectionId(e.target.value)}>
+              <Select
+                value={connectionId}
+                onChange={(e) => {
+                  setConnectionId(e.target.value);
+                  // Persist ONLY on an explicit user change, not the mount fallback (issue #578).
+                  selectedForge.set(e.target.value);
+                }}
+              >
                 {connections.map((c) => (
                   <option key={c.id} value={c.id}>
                     {c.bot_username} — {c.base_url}
