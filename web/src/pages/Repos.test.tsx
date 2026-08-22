@@ -792,7 +792,7 @@ describe("Repos — Board access (PRD #557 M4)", () => {
     const panel = await openSyncPanel("vtmocanu/gh");
     await within(panel).findByText("Board access");
 
-    fireEvent.change(within(panel).getByLabelText("GitHub username to share with"), {
+    fireEvent.change(within(panel).getByLabelText("Share with a GitHub user (Reader)"), {
       target: { value: "octocat" },
     });
     fireEvent.click(within(panel).getByRole("button", { name: /Share \(Reader\)/ }));
@@ -803,12 +803,32 @@ describe("Repos — Board access (PRD #557 M4)", () => {
     expect(within(panel).getByRole("button", { name: /Revoke/ })).toBeTruthy();
   });
 
+  it("Revoke calls the unshare endpoint and drops the entry from the session list", async () => {
+    mockApi.shareProjectSync.mockResolvedValue(null);
+    mockApi.unshareProjectSync.mockResolvedValue(null);
+    const panel = await openSyncPanel("vtmocanu/gh");
+    await within(panel).findByText("Board access");
+
+    fireEvent.change(within(panel).getByLabelText("Share with a GitHub user (Reader)"), {
+      target: { value: "octocat" },
+    });
+    fireEvent.click(within(panel).getByRole("button", { name: /Share \(Reader\)/ }));
+    const revoke = await within(panel).findByRole("button", { name: /Revoke/ });
+
+    fireEvent.click(revoke);
+    await waitFor(() => expect(mockApi.unshareProjectSync).toHaveBeenCalledWith("repo-gh", "octocat"));
+    // The revoked username leaves the just-granted list.
+    await waitFor(() =>
+      expect(within(panel).queryByRole("button", { name: /Revoke/ })).toBeNull(),
+    );
+  });
+
   it("a 422 bad username surfaces the bad-username copy inline, not a crash", async () => {
     mockApi.shareProjectSync.mockRejectedValue(new ApiError(422, "no github user with that username"));
     const panel = await openSyncPanel("vtmocanu/gh");
     await within(panel).findByText("Board access");
 
-    fireEvent.change(within(panel).getByLabelText("GitHub username to share with"), {
+    fireEvent.change(within(panel).getByLabelText("Share with a GitHub user (Reader)"), {
       target: { value: "nouser" },
     });
     fireEvent.click(within(panel).getByRole("button", { name: /Share \(Reader\)/ }));

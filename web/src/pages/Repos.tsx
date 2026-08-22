@@ -1294,7 +1294,9 @@ export function Repos() {
                           <span className="text-sm text-fg">
                             {syncPublic === null && !syncVisibilityError
                               ? "Loading visibility…"
-                              : "Public board"}
+                              : syncPublic === true
+                                ? "Public board"
+                                : "Private board"}
                           </span>
                         </div>
                         {syncPublic === true && (
@@ -1303,7 +1305,9 @@ export function Repos() {
                           </p>
                         )}
                         {syncVisibilityError && (
-                          <p className="text-xs text-danger">{syncVisibilityError}</p>
+                          <p role="alert" className="text-xs text-danger">
+                            {syncVisibilityError}
+                          </p>
                         )}
                       </div>
 
@@ -1311,9 +1315,10 @@ export function Repos() {
                       <div className="space-y-2">
                         <div className="flex flex-wrap items-end gap-2">
                           <label className="block flex-1 space-y-1">
+                            {/* The visible label IS the input's accessible name
+                                (no overriding aria-label) — WCAG 2.5.3 label-in-name. */}
                             <span className="text-xs text-muted">Share with a GitHub user (Reader)</span>
                             <Input
-                              aria-label="GitHub username to share with"
                               value={shareUsername}
                               disabled={shareBusy}
                               placeholder="octocat"
@@ -1324,24 +1329,43 @@ export function Repos() {
                             {shareBusy ? "Working…" : "Share (Reader)"}
                           </Button>
                         </div>
-                        {shareError && <p className="text-xs text-danger">{shareError}</p>}
-                        {shareConfirmation && <p className="text-xs text-ok">{shareConfirmation}</p>}
+                        {/* Async grant/revoke outcomes announce to assistive tech:
+                            errors assertively (role=alert), confirmations politely
+                            (role=status), matching the panel's <Alert> precedent. */}
+                        {shareError && (
+                          <p role="alert" className="text-xs text-danger">
+                            {shareError}
+                          </p>
+                        )}
+                        {shareConfirmation && (
+                          <p role="status" className="text-xs text-ok">
+                            {shareConfirmation}
+                          </p>
+                        )}
                         {sharedThisSession.length > 0 && (
-                          <ul className="space-y-1">
-                            {sharedThisSession.map((name) => (
-                              <li key={name} className="flex items-center justify-between gap-2 text-sm">
-                                <span className="font-mono text-fg">{name}</span>
-                                <Button
-                                  variant="ghost"
-                                  size="sm"
-                                  disabled={shareBusy}
-                                  onClick={() => unshareSync(syncRepo.id, name)}
-                                >
-                                  Revoke
-                                </Button>
-                              </li>
-                            ))}
-                          </ul>
+                          <div className="space-y-1">
+                            {/* Scope this list so it is not misread as an
+                                authoritative current-collaborators list (D2). */}
+                            <p className="text-xs text-muted">Granted this session:</p>
+                            <ul
+                              className="space-y-1"
+                              aria-label="Users granted access this session (GitHub does not expose the full current list)"
+                            >
+                              {sharedThisSession.map((name) => (
+                                <li key={name} className="flex items-center justify-between gap-2 text-sm">
+                                  <span className="font-mono text-fg">{name}</span>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    disabled={shareBusy}
+                                    onClick={() => unshareSync(syncRepo.id, name)}
+                                  >
+                                    Revoke
+                                  </Button>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
                         )}
                         {/* The honesty note (SC-5): a positive, always-present
                             element — GitHub exposes no readable collaborator list. */}
