@@ -1,9 +1,9 @@
 # PRD #582 — Resync must re-read the LINKED Status field, not re-resolve by name
 
 **Issue**: [#582](https://github.com/vtmocanu/uzi/issues/582)
-**Status**: Draft
+**Status**: Done — shipped on branch `agent/issue-582` (M1–M4 complete)
 **Priority**: High (data-integrity: silently mis-points a working sync)
-**Owner**: TBD
+**Owner**: uzi agent
 
 > Fixes a bug in PRD #576 (GitHub Projects v2 sync, adopt-first + auto-create). Read `api/internal/forgesvc/projectsync.go` first.
 
