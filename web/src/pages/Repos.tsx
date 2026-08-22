@@ -13,6 +13,7 @@ import { Modal } from "../components/Modal";
 import { BoardIcon, XIcon } from "../components/icons";
 import { DocLink } from "../components/DocLink";
 import { DOC_GITHUB_PROJECT_SYNC, DOC_REPO_AGENTS } from "../lib/doclinks";
+import { selectedForge } from "../lib/prefs";
 
 // The server-owned capability vocabulary (PRD #84). The repo hint offers only these
 // names; the server capability.Filters anything else, so free-form entry is not
@@ -380,7 +381,13 @@ export function Repos() {
       try {
         const { connections } = await api.listConnections();
         setConnections(connections);
-        if (connections.length > 0) setConnectionId(connections[0].id);
+        if (connections.length > 0) {
+          // Prefer the remembered connection, but validate it against the live
+          // list — a since-deleted connection falls back to the first (issue #578).
+          const remembered = selectedForge.get();
+          const match = remembered && connections.some((c) => c.id === remembered) ? remembered : connections[0].id;
+          setConnectionId(match);
+        }
       } catch (err) {
         setError(err instanceof ApiError ? err.message : "Failed to load connections");
       } finally {
@@ -723,7 +730,14 @@ export function Repos() {
         <>
           {connections.length > 1 && (
             <div className="max-w-md">
-              <Select value={connectionId} onChange={(e) => setConnectionId(e.target.value)}>
+              <Select
+                value={connectionId}
+                onChange={(e) => {
+                  setConnectionId(e.target.value);
+                  // Persist ONLY on an explicit user change, not the mount fallback (issue #578).
+                  selectedForge.set(e.target.value);
+                }}
+              >
                 {connections.map((c) => (
                   <option key={c.id} value={c.id}>
                     {c.bot_username} — {c.base_url}
@@ -733,8 +747,13 @@ export function Repos() {
             </div>
           )}
 
-          <Card className="p-0">
-            <div className="overflow-x-auto">
+          {/* Grouping div, not a Card: the board list grows down the page like
+              /schedules rather than reading as a padded scroll container (issue
+              #578). The table and its three detail panels are siblings here — the
+              panels stay OUTSIDE the table's horizontal-scroll box so their copy is
+              never clipped; a 16px gap (space-y-4) separates them. */}
+          <div className="space-y-4">
+            <div className="overflow-x-auto rounded-xl border border-edge bg-surface">
               <table className="w-full text-left text-sm">
                 <thead className="border-b border-edge text-muted">
                   <tr>
@@ -1044,7 +1063,7 @@ export function Repos() {
                 ref={trustPanelRef}
                 role="group"
                 aria-label={`Trusted repo for ${trustRepo.path_with_namespace}`}
-                className="space-y-4 border-t border-edge bg-raised/20 p-4"
+                className="space-y-4 rounded-xl border border-edge bg-raised/20 p-4"
               >
                 {/* Header: what "trusted" means, plus the master switch. */}
                 <div className="flex items-start gap-4">
@@ -1198,7 +1217,7 @@ export function Repos() {
               <div
                 role="group"
                 aria-label={`Tool profile for ${toolsRepo.path_with_namespace}`}
-                className="space-y-3 border-t border-edge bg-raised/20 p-4"
+                className="space-y-3 rounded-xl border border-edge bg-raised/20 p-4"
               >
                 <p className="text-sm text-fg">
                   <span className="font-medium">Tools for {toolsRepo.path_with_namespace}</span> — the worker installs
@@ -1307,7 +1326,7 @@ export function Repos() {
                 ref={syncPanelRef}
                 role="group"
                 aria-label={`Project sync for ${syncRepo.path_with_namespace}`}
-                className="space-y-4 border-t border-edge bg-raised/20 p-4"
+                className="space-y-4 rounded-xl border border-edge bg-raised/20 p-4"
               >
                 <div className="min-w-0 space-y-1">
                   <h3 className="flex items-center gap-2 text-sm font-semibold text-fg">
@@ -1605,7 +1624,7 @@ export function Repos() {
                 </div>
               </div>
             )}
-          </Card>
+          </div>
         </>
       )}
 

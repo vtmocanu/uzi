@@ -175,6 +175,23 @@ describe("Repos — Trusted repo panel", () => {
     const panel = await openTrustPanel("vtmocanu/uzi");
     expect(panel.closest(".overflow-x-auto")).toBeNull();
   });
+});
+
+describe("Repos — board list layout (issue #578)", () => {
+  it("puts the projects table in a bordered box like /schedules, not a padded Card", async () => {
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+    const table = screen.getByRole("table");
+    // The table sits in the /schedules-style wrapper: a rounded, bordered box on
+    // the surface — a positive assertion the Card wrapper was dropped for M3.
+    const wrapper = table.closest("div.overflow-x-auto");
+    expect(wrapper).not.toBeNull();
+    expect(wrapper!.className).toContain("rounded-xl");
+    expect(wrapper!.className).toContain("border-edge");
+    // The removed Card carried a p-0 padding override; nothing wrapping the table
+    // should still be that Card.
+    expect(table.closest(".p-0")).toBeNull();
+  });
 
   it("moves focus into the panel when it opens", async () => {
     await openTrustPanel("vtmocanu/uzi");
@@ -1145,6 +1162,63 @@ describe("Repos — Board access (PRD #557 M4)", () => {
     fireEvent.click(within(panel).getByRole("button", { name: /Disable sync/ }));
     await waitFor(() => expect(mockApi.disableProjectSync).toHaveBeenCalledWith("repo-gh"));
     await waitFor(() => expect(within(panel).queryByRole("button", { name: /Revoke/ })).toBeNull());
+  });
+});
+
+describe("Repos — remembers the selected forge (issue #578)", () => {
+  // This jsdom build exposes no window.localStorage, and the file's top-level
+  // beforeEach installs none, so selectedForge.set/get would silently no-op and the
+  // test would pass for the wrong reason. Back it with a Map-based Storage stub
+  // (shape copied from lib/prefs.test.ts) scoped to THIS block — installed here and
+  // removed in afterEach — so it never leaks into the store-less tests elsewhere,
+  // which rely on there being no store.
+  function makeStorage(): Storage {
+    const m = new Map<string, string>();
+    return {
+      getItem: (k: string) => (m.has(k) ? m.get(k)! : null),
+      setItem: (k: string, v: string) => void m.set(k, String(v)),
+      removeItem: (k: string) => void m.delete(k),
+      clear: () => m.clear(),
+      key: (i: number) => [...m.keys()][i] ?? null,
+      get length() {
+        return m.size;
+      },
+    } as Storage;
+  }
+
+  const CONN_1: ForgeConnection = { ...CONN, id: "conn-1", bot_username: "bot-one" };
+  const CONN_2: ForgeConnection = { ...CONN, id: "conn-2", bot_username: "bot-two" };
+
+  beforeEach(() => {
+    Object.defineProperty(window, "localStorage", { configurable: true, value: makeStorage() });
+    // Two connections so the connection <Select> renders (it only shows when
+    // connections.length > 1). listProjects resolves for either selected id.
+    mockApi.listConnections.mockResolvedValue({ connections: [CONN_1, CONN_2] });
+    mockApi.listProjects.mockResolvedValue({ repos: [] });
+  });
+
+  afterEach(() => {
+    Reflect.deleteProperty(window, "localStorage");
+  });
+
+  it("restores the previously chosen connection after a remount", async () => {
+    renderPage();
+    // On mount, the select defaults to the first connection.
+    const select = (await screen.findByRole("combobox")) as HTMLSelectElement;
+    expect(select.value).toBe("conn-1");
+
+    // An explicit user change persists the choice (7-day TTL) via selectedForge.set.
+    fireEvent.change(select, { target: { value: "conn-2" } });
+    expect(select.value).toBe("conn-2");
+
+    // Simulate a fresh visit: unmount and render again. The localStorage stub
+    // survives across the two renders (it is not reset within a test body).
+    cleanup();
+    renderPage();
+
+    // The remembered connection is restored on mount.
+    const restored = (await screen.findByRole("combobox")) as HTMLSelectElement;
+    expect(restored.value).toBe("conn-2");
   });
 });
 
