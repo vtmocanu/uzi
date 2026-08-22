@@ -159,9 +159,11 @@ Two ways to fix it, both offered from the same panel:
   If a board's link was already mis-pointed back to the built-in Status
   field by an older uzi version — the symptom is most columns showing as
   unmatched/"won't sync" after a Resync, with sync writing to the wrong
-  field — re-running auto-create (or **Provision** on an org repo)
-  re-establishes the link to "uzi Status" and is the recommended way
-  back. A secondary, manual option: temporarily rename the built-in
+  field — re-running **auto-create** re-establishes the link to "uzi
+  Status" on the *same* board and is the recommended way back. (On an org
+  repo, **Provision** also lands you on a "uzi Status" field, but it spins
+  up a *fresh* board rather than re-pointing the current one.) A
+  secondary, manual option: temporarily rename the built-in
   Status field in GitHub, click Resync once, then rename it back — only
   relevant on an uzi version old enough to still resolve by name.
 
