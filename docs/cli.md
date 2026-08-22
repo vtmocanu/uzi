@@ -390,8 +390,11 @@ A few worth knowing:
   path-with-namespace (`org/repo`, matched against `uzi repo list`) or a raw repo id.
   `status` prints whether the repo is linked and, if so, the project number, whether the
   board is uzi-owned, the last sync time, the last error (health), the synced item count,
-  and any board columns with no matching Status option; a repo that is **not linked** is
-  reported as normal output (`--json` returns `{"linked": false}`), not an error.
+  any board columns with no matching Status option, and whether the synced field has no
+  `Done` option to project a closed issue onto (see [Closed issues and the Done
+  status](./github-project-sync.md#closed-issues-and-the-done-status)); a repo that is
+  **not linked** is reported as normal output (`--json` returns `{"linked": false}`), not
+  an error.
   `resync` re-seeds an already-linked board, picking up newly-added Status columns — the
   same operation the web panel's Resync button drives. Linking a repo to a project in the
   first place (**Adopt**) and creating a fresh uzi-owned board (**Provision**) stay

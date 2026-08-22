@@ -18,6 +18,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **GitHub Projects sync: closed issues land in a Done status, and reopening restores the card (issue [#584](https://github.com/vtmocanu/uzi/issues/584), PRD #584).**
+  Closing an issue now sets its linked board card's Status to a dedicated `Done` option and keeps the card tracked instead of leaving it stranded at its last-known Status; reopening the issue restores the card to its current column (or clears it to No Status). A uzi-created field (Provision or auto-create) and an adopted built-in GitHub Status field both get the `Done` option automatically; a `uzi Status` or custom field without one gets an advisory in the sync panel and `uzi project-sync status` instead, since uzi never adds an option to an existing field. Reverse sync is unchanged: a Done card never reopens or closes the issue.
+
 ## [0.55.1] - 2026-08-22
 <!-- release-title: forge read tools reach the fact-checker -->
 

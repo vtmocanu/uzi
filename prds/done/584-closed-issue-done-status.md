@@ -1,7 +1,7 @@
 # PRD #584 — Reflect closed issues as a Done status on the GitHub Projects board
 
 **Issue**: [#584](https://github.com/vtmocanu/uzi/issues/584)
-**Status**: Draft
+**Status**: Done
 **Priority**: Medium
 **Owner**: TBD
 
@@ -34,11 +34,13 @@ On issue **close**, forward-sync sets the linked item's Status to a dedicated **
 - **F-1 — The safe option surface is CREATE-ONLY.** `CreateProjectV2Field(projectID, name, options)` creates a field with a full option list (`api/internal/forge/projectsync.go`); there is **no** add-option-to-existing-field method (`updateProjectV2Field` does not exist in this codebase — PRD #576 D3/F-B). So a `Done` option can be *created as part of a new field* but **cannot be safely appended** to an existing field. This is why "auto-create Done if missing" is achievable for uzi-created fields and is a manual/advisory step for pre-existing ones.
 - **F-2 — Forward sync sets item Status via `SetProjectV2ItemStatus`.** The target option is computed per item from its column (`seedItems` `:907-917`; the single-item forward path `:1239`; the reconcile path `:1531`). An empty target clears to "No Status" (D2). A closed issue currently yields "skip".
 - **F-3 — The link row stores the column→option map (`status_options`) and field id (`status_field_id`).** Adding a `done_option_id` needs one new nullable column (a goose migration); the existing `00148`/`00149` (from #576) are on `main`, so this PRD drafts **`00150`**, renumbered above the live head at merge (repo convention).
-- **F-4 — Reopen "just works" TODAY only because close DELETES the item row.** A reopened issue is untracked again, so Pass 2 backfill (`:1490-1559`, which handles untracked *open* issues) re-adds it and sets its column Status. **The moment close keeps the row (required to hold a Done status), this stops being automatic** — Pass 2 skips *tracked* items (`:1493`), `reverseDiff` no-ops when `live == marker == done_option_id` (`:1619`), and nothing else reacts to the state change. So keeping a Done row REQUIRES adding explicit reopen restoration (see M2). This corrects an earlier assumption that reopen needed no code.
+- **F-4 — Reopen "just works" TODAY only because close DELETES the item row.** A reopened issue is untracked again, so Pass 2 backfill (`:1490-1559`, which handles untracked *open* issues) re-adds it and sets its column Status. **The moment close keeps the row (required to hold a Done status), this stops being automatic** — Pass 2 skips *tracked* items (`:1493`), `reverseDiff` no-ops when `live == marker == done_option_id` (`:1813`), and nothing else reacts to the state change. So keeping a Done row REQUIRES adding explicit reopen restoration (see M2). This corrects an earlier assumption that reopen needed no code.
 - **F-6 — An adopted BUILT-IN `Status` field already has a `Done` option.** GitHub's default Status ships `Todo` / `In Progress` / `Done` / `No Status` (`docs/github-project-sync.md`). So the adopt/resync path populates `done_option_id` automatically for a built-in Status board — the feature works there with no user action. The advisory (M4) is for a **`uzi Status`** field (built from board columns only, which are `Planned/In Progress/bug/Human Review/Later` — no `Done`) or a custom field lacking a `Done` option. `vtmocanu/uzi`'s board uses `uzi Status`, so it is exactly the advisory case.
 - **F-5 — Field-creation option sets are built from board columns today.** `provisionAndSeed` (`:402-409`) and `AutoCreateColumns` (`:776`) build `newOptions` from the columns and call `CreateProjectV2Field`; appending one `Done` option there and capturing its id is the create-path mechanism for F-1.
 
 ## Milestones
+
+All milestones (M1-M5) implemented on branch `agent/issue-584`.
 
 ### M1 — Resolve and store the `Done` option
 - Add a nullable `done_option_id text` column to `github_project_links` (goose migration draft `00150`, renumber at merge) + `sqlc generate`. It is written by `UpsertGithubProjectLink` (`:603-611`) and read by `GetGithubProjectLinkByRepo`.
@@ -53,11 +55,6 @@ On issue **close**, forward-sync sets the linked item's Status to a dedicated **
 - **Also update `seedItems`' closed branch** (both guards: `:874` and the `board.ResolveColumn`-driven `:884`) so a manual Resync/Adopt/Provision re-seed projects closed issues to Done too, consistent with the periodic path. This is the one site that already has `issue.State` in hand.
 - **Success criteria** (offline, one test PER path — a single shared test would pass via `seedItems` while the periodic path stays broken): (1) a `reconcileItems` fixture with a newly-closed tracked issue and `done_option_id` set asserts Pass 1 calls `SetProjectV2ItemStatus(done_option_id)`, keeps the row, and advances the marker — and with `done_option_id` empty still deletes (prove BOTH non-vacuous with call-site mutations: revert to unconditional delete → the set-Done case reddens; force done set → the empty case reddens); (2) a reopen fixture starts with a tracked item at `marker == done_option_id` and issue `opened`, and asserts its Status moves to the column and the marker advances off Done; (3) a `seedItems` re-seed test asserts a closed issue is set to Done. The `fakeProjectStore` already records `SetProjectV2ItemStatus` (`setCalls`) and item rows; add a per-issue state read only if the chosen reopen shape needs one.
 
-### M2 — Forward sync: closed issue → Done
-- Replace the "skip closed" branches on the forward path with "map closed → `done_option_id`": at `seedItems` (`:874`), the single-item forward path (`:1239` region), and the reconcile path (`:1490-1531`), when `issue.State == "closed"` **and** `done_option_id != ""`, set the target option to `done_option_id` (and advance the marker to it) instead of `continue`. When `done_option_id == ""`, keep the current skip (no Done option to use). Centralize in a shared `targetOptionForIssue(issue, columnOption, doneOptionID)` helper so all forward sites agree.
-- **Reopen** needs no new code (F-4) — verify a reopened issue's marker/Status returns to its column via an explicit test.
-- **Success criteria** (offline): a fixture with a closed issue and a set `done_option_id` asserts forward sync calls `SetProjectV2ItemStatus(..., done_option_id)` and stores that marker; with `done_option_id` empty it still skips. A reopen test asserts the Status returns to the issue's column. Prove the close→Done assertion non-vacuous with a call-site mutation (revert to `continue` → test reddens), per `.claude/agent-team.md`.
-
 ### M3 — Reverse sync leaves the Done projection alone (mostly a guard + invariant test)
 - Because M1 keeps `Done` **out of `status_options`**, `reverseDiff` already skips a live Done item via the unknown-option skip (the option-map miss at `:1630-1638`), so it makes no `AutoMove` and is never destructive-counted — R3 largely holds **by construction**, not by new code. M3's job is to (a) make that a deliberate, tested invariant (Done is never in `status_options`; a live Done item yields zero `AutoMove` and zero destructive count), and (b) keep the existing closed-issue skip (`:1648`).
 - **Known edge, document it (narrow):** if a user manually **clears** a Done card's Status, it reads `live == ""` (not `done_option_id`), so the skip above misses it; if that card's issue is meanwhile reopened and carries a column label, `reverseDiff` would classify the clear as destructive (`:1664-1665`) and could strip the label / count toward #576's cap. This requires manual-clear + reopen together; v1 documents it as a limitation rather than special-casing an empty-live-on-a-Done-item.
@@ -69,7 +66,7 @@ On issue **close**, forward-sync sets the linked item's Status to a dedicated **
 
 ### M5 — Docs, tests, gate
 - `docs/github-project-sync.md`: document closed→Done (uzi-created fields get `Done` automatically; existing fields need a `Done` option added manually or via re-provision), the reopen behavior, and that reverse never reopens/closes an issue. Update the "What the model does and doesn't cover" section, which currently states closed issues stop being tracked (that decision is being revised — D1 below).
-- `web/scripts/check-docs.mjs` passes. `task gate:api` and `task gate:web` green. Verify `api/cmd/uzi/` needs no change (the CLI `project-sync status` may optionally surface the new advisory — decide and note).
+- `web/scripts/check-docs.mjs` passes. `task gate:api` and `task gate:web` green. Verify `api/cmd/uzi/` needs no change (the CLI `project-sync status` may optionally surface the new advisory — decide and note). **Decided: yes** — `uzi project-sync status` now surfaces it as the `NO_DONE_OPTION` table row / `no_done_option` JSON field (`api/cmd/uzi/project_sync.go`).
 - **Heads-up**: the Go lint ratchet is `whole-files: true` (`.golangci.yml`); editing `projectsync.go` gates pre-existing findings in that whole file too — read `.claude/rules/go.md` before treating one as a regression.
 
 ## Risks & mitigations
