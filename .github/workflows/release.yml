@@ -130,7 +130,11 @@ jobs:
           set -euo pipefail
           # Each value is shape-guarded numeric before it becomes a build-arg (it is
           # expanded into an -ldflags string; a non-numeric would corrupt the build).
-          N="$(git rev-list --count HEAD)"
+          # COMMIT_BASELINE carries the project's commit history that predates this
+          # repository's root commit, so build-info's commit count stays continuous
+          # rather than restarting from the root. Bump only if the root ever moves.
+          COMMIT_BASELINE=4263
+          N="$(( COMMIT_BASELINE + $(git rev-list --count HEAD) ))"
           case "$N" in ''|*[!0-9]*) echo "ERROR: commit count '$N' is not numeric" >&2; exit 1;; esac
           DONE="$(find prds/done -maxdepth 1 -name '*.md' | wc -l | tr -d ' ')"
           OPEN="$(find prds -maxdepth 1 -name '*.md' | wc -l | tr -d ' ')"
