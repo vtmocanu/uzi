@@ -5,7 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/hex"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -257,7 +257,10 @@ func cliCSRFHeader(t *testing.T, jwt string) string {
 	}
 	mac := hmac.New(sha256.New, []byte(jwt))
 	mac.Write(nonce)
-	return hex.EncodeToString(nonce) + "." + hex.EncodeToString(mac.Sum(nil))
+	// Encoding must match production generateCSRFToken (base64url, "." separator);
+	// ValidateCSRF base64url-decodes both halves before recomputing the MAC.
+	enc := base64.RawURLEncoding
+	return enc.EncodeToString(nonce) + "." + enc.EncodeToString(mac.Sum(nil))
 }
 
 // -------------------------------------------------------------------------
