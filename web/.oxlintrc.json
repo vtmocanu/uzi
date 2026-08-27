@@ -1,0 +1,108 @@
+// oxlint for web/ (PRD #103 M3).
+//
+// JSONC, DELIBERATELY. oxlint parses this file as JSONC (verified at 1.76.0:
+// both `//` and `/* */` are accepted), which is the only way to document a
+// config whose every trap below is invisible in a clean run. A `"//": [...]`
+// comment KEY does NOT work - oxlint's schema rejects unknown top-level fields
+// and exits 1 naming the field, which is the right direction but is not a
+// comment mechanism.
+//
+// Run it via `task lint:web` -> `npm run lint` -> oxlint --config THIS FILE.
+// Read that chain before changing anything here.
+//
+// 🔴 FORBIDDEN IN THIS FILE, and a diff adding either reads as a policy
+// violation rather than a configuration change: `jsPlugins` (oxlint's own docs
+// describe the value as a "Path or package name of the plugin" - an executable
+// the runner then loads) and `extends` (which indirects the effective ruleset
+// out of the reviewed file). Reviewers do not read config files the way they
+// read code, so the ban lives where the diff lands. Same ban as
+// `linters.settings.custom` in .golangci.yml - see that file's header, which
+// also records the weaker sibling neither ban closes: a branch author can
+// NEUTER this gate from this file (an empty plugin list, an ignorePatterns
+// swallowing everything) and the pipeline stays green because the linter
+// genuinely found nothing. CODEOWNERS is the only structural fix and is out of
+// scope for M3.
+//
+// 🔴 `plugins` REPLACES THE DEFAULT LIST, IT DOES NOT EXTEND IT. All three
+// defaults (unicorn, typescript, oxc) are re-listed below alongside react for
+// exactly that reason. Measured on web/src at oxlint 1.76.0, 2026-08-02:
+//
+//   plugins: ["react"]                                 5 findings
+//   plugins: ["react","unicorn","typescript","oxc"]    6 findings
+//
+// The narrowing is invisible in the verdict - it shows up only in the count,
+// which is the one thing nobody re-derives.
+//
+// 🔴 NAMING A RULE WITHOUT DECLARING ITS PLUGIN IS A SILENT NO-OP, and it is
+// precisely the case a reviewer reading this file would pass, because the
+// config visibly names the rule. Measured the same day:
+//
+//   {plugins:["react"], rules:{"react-hooks/rules-of-hooks":"error"}}  exit 1, FIRES
+//   {                   rules:{"react-hooks/rules-of-hooks":"error"}}  exit 0, SILENT
+//   {plugins:["react"], rules:{"react-hooks/rules-of-hookz":"error"}}  exit 1, LOUD
+//
+// A TYPO IS LOUD; A MISSING PLUGIN IS SILENT. That asymmetry is why the plugin
+// list is the load-bearing half, not the rules block.
+//
+// 🔴 AND `rules-of-hooks` NEEDS EXPLICIT RULE-LEVEL PROMOTION, NEVER A
+// CATEGORY. It is `pedantic`, not `correctness`, so the correctness tier cannot
+// reach it:
+//
+//   oxlint --react-plugin src                    exit 0, silent
+//   oxlint --react-plugin -D correctness src     exit 0, SILENT   <- the trap
+//   ... plus -D react-hooks/rules-of-hooks       exit 1, fires
+//
+// Line 2 is this whole milestone going green over the rule it exists for. The
+// correctness TIER (now `categories.correctness` in the body below - moved off
+// the CLI `-D correctness` for the oxlint-1.79 adoption, see that note) governs
+// the tier and is NOT the guard for this rule; the rule-level entry below is.
+//
+// 🔴 NOTHING HERE MAY SHIP AT "warn". A rule at warn PRINTS its violation and
+// EXITS 0 (measured), so a warn-severity gate is a report that always passes.
+// That is the same silent-green shape PRD #103 exists to remove.
+//
+// 🔴 THE CORRECTNESS TIER LIVES HERE (`categories`), NOT ON THE CLI (oxlint
+// 1.79 adoption, supersedes #718). It used to ride `-D correctness` in
+// package.json's `lint` script. Measured at 1.79: a CLI `-D <category>`
+// OVERRIDES a config-file per-rule "off" - with `-D correctness` on the command
+// line, setting a correctness rule to "off" below does NOTHING, it still fires.
+// Moving the tier into the config as a category lets the per-rule "off" entries
+// below win, which is the ONLY way to defer a correctness-tier rule. The tier
+// promotion is equivalent to the old CLI flag in SEVERITY and EXIT-CODE
+// semantics: `categories.correctness:"error"` reproduces what `-D correctness`
+// did to the tier (measured 2026-08-26 on the UN-DEFERRED config - categories
+// only, no rule offs: all 65 findings at error, rc=1). The rule-level "off"
+// entries below THEN defer specific 1.79 rules, so the SHIPPED config
+// intentionally reports fewer. The `lint` script therefore keeps only `--config`
+// and `--report-unused-disable-directives-severity=error`; `-D correctness` is gone
+// from it. `task lint:web` delegates to that script (Taskfile lint:web), so the
+// tier is governed here for CLI, gate and CI alike.
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["react", "unicorn", "typescript", "oxc"],
+  "categories": { "correctness": "error" },
+  "rules": {
+    "react-hooks/rules-of-hooks": "error",
+    // oxlint 1.79 promoted these four react rules into the correctness tier.
+    // Each one flags a React-ENDORSED pattern in THIS codebase (triaged site by
+    // site, 2026-08-26), so they are set "off" to DEFER adoption - not because
+    // the rule is unsound. Re-adopting any of them (fix the code, drop the
+    // "off") is a follow-up, not this bump. NEVER "warn" here (a warn prints and
+    // exits 0 - see the header). What each flags here:
+    //   set-state-in-effect - fetch-on-mount effects
+    //     (`useEffect(() => { load() }, [load])`, load = a useCallback hitting
+    //     the API) and reset-form-on-open effects. 47 sites, all endorsed.
+    //   refs                - the documented latest-ref mirror
+    //     (`unreadRef.current = unread` in lib/useFavicon.ts, comment says so)
+    //     and hook-returned refs read in render (ChatMessages). 12 sites.
+    //   purity              - deliberate `Date.now()` in render for the 10s-poll
+    //     status badges (Board.tsx/PipelineBadge/RunHealthBadge, commented). 4.
+    //   immutability        - a callback forward-referenced inside a useCallback
+    //     but only invoked from an effect, so fully initialized before it runs
+    //     (SkillAllocationPanel). 1 site.
+    "react/set-state-in-effect": "off",
+    "react/refs": "off",
+    "react/purity": "off",
+    "react/immutability": "off"
+  }
+}

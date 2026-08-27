@@ -1,0 +1,89 @@
+{
+  "run_id": "33333333-3333-3333-3333-333333333333",
+  "kind": "ci_fix",
+  "issue_iid": null,
+  "issue_title": "Fix CI: main pipeline #4200",
+  "issue_description": "Diagnose and fix the failed pipeline for `main`.",
+  "status": "claimed",
+  "branch": null,
+  "session_id": null,
+  "last_seq": 0,
+  "iteration_count": 0,
+  "requeue_count": 0,
+  "plan_md": null,
+  "auto_approve": false,
+  "open_mr": false,
+  "interactive": false,
+  "stop_pending": false,
+  "base_branch": null,
+  "review_target_run_id": null,
+  "wait_on_limit": false,
+  "plan_approved": false,
+  "plan_source": "agent",
+  "require_base_match": false,
+  "pipeline": {
+    "id": 4200,
+    "ref": "main",
+    "sha": "deadbeef",
+    "web_url": "https://gitlab.example.com/g/p/-/pipelines/4200",
+    "failed_jobs": [
+      {
+        "name": "unit",
+        "stage": "test",
+        "web_url": "https://gitlab.example.com/g/p/-/jobs/1",
+        "log_tail": "--- FAIL: TestFoo\n"
+      }
+    ]
+  },
+  "repo": {
+    "id": "22222222-2222-2222-2222-222222222222",
+    "url": "https://gitlab.example.com/g/p",
+    "clone_url": "https://gitlab.example.com/g/p.git",
+    "default_branch": "main",
+    "forge_type": "gitlab",
+    "skills_enabled": false,
+    "claudemd_enabled": false
+  },
+  "secrets": {
+    "forge_username": "uzi-bot",
+    "forge_pat": "FORGE-PAT-PLACEHOLDER",
+    "anthropic_oauth_token": "ANTHROPIC-OAUTH-PLACEHOLDER"
+  },
+  "agents": [],
+  "config": {
+    "run_timeout_seconds": 7200,
+    "idle_timeout_seconds": 600,
+    "max_iterations": 5,
+    "plan_max_revisions": 3,
+    "question_max": 5,
+    "question_timeout_seconds": 86400,
+    "skill_max_bytes": 65536,
+    "skills_max_per_run": 32,
+    "tool_packages": [],
+    "repo_devbox_opt_in": false,
+    "denied_tool_packages": [
+      "_1password-cli",
+      "aws-sam-cli",
+      "awscli",
+      "awscli2",
+      "azure-cli",
+      "bitwarden-cli",
+      "bw",
+      "doctl",
+      "flyctl",
+      "gcloud",
+      "gh",
+      "glab",
+      "google-cloud-sdk",
+      "heroku",
+      "hub",
+      "kubelogin",
+      "oci-cli",
+      "op",
+      "tea",
+      "vault"
+    ]
+  },
+  "skills": [],
+  "skills_dropped": []
+}

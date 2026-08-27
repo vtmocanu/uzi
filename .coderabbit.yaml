@@ -1,0 +1,115 @@
+# CodeRabbit Configuration
+# Documentation: https://docs.coderabbit.ai/guides/configure-coderabbit
+# Adapted from vfarcic/dot-ai + dot-ai-controller for uzi (Go api/controller + TS web/agent).
+
+# Reduce review noise by focusing on actionable issues
+reviews:
+  # Request changes only for critical/major issues
+  request_changes_workflow: true
+
+  # Reduce comment verbosity
+  high_level_summary: true
+  poem: false
+  review_status: false
+
+  # Collapse less important sections
+  collapse_walkthrough: true
+
+  # Leaner walkthrough (defaults are on; uzi PRs don't need the effort estimate)
+  estimate_code_review_effort: false
+  review_details: false
+
+  # Don't re-run linters uzi's own gate already owns (pinned + ratcheted in CI:
+  # golangci-lint v2.12.2 with .golangci.yml new-from-merge-base, plus gate:repo's
+  # shellcheck/yamllint/scan:secrets). CodeRabbit's unpinned, un-ratcheted copies
+  # would surface backlog/version-skew findings CI does not — pure noise.
+  tools:
+    golangci-lint:
+      enabled: false
+    shellcheck:
+      enabled: false
+    yamllint:
+      enabled: false
+    gitleaks:
+      enabled: false
+
+  # Skip generated, vendored, and build output
+  path_filters:
+    - "!**/package-lock.json"                 # lock files
+    - "!**/dist/**"                           # build output
+    - "!**/node_modules/**"
+    - "!api/internal/store/*.sql.go"          # sqlc-generated query code
+    - "!api/internal/store/models.go"         # sqlc-generated
+    - "!api/internal/store/querier.go"        # sqlc-generated
+    - "!api/internal/store/db.go"             # sqlc-generated
+    - "!**/*_generated.go"
+    - "!**/zz_generated*.go"
+    - "!inspiration/**"                       # gitignored prior-art symlinks
+    - "!probes/**"                            # archived measurement evidence, imported by nothing
+
+  auto_review:
+    enabled: true
+    drafts: false
+    # Only auto-review PRs whose base is one of these. Add more (or a regex like
+    # "release/.*") if you open PRs against non-default branches.
+    base_branches:
+      - main
+    # Skip dependency bots: CI is the correct validator for a version bump, and a
+    # lockfile/version diff review is noise. Username covers the Mend GitHub App;
+    # the title keywords are the belt-and-braces fallback (renovate.json uses
+    # :semanticCommits, so PRs are titled chore(deps)/fix(deps)/build(deps)).
+    ignore_usernames:
+      - "renovate[bot]"
+    ignore_title_keywords:
+      - "chore(deps)"
+      - "fix(deps)"
+      - "build(deps)"
+
+  # Reduce nitpick comments
+  tone_instructions: "Focus only on critical bugs, security issues, and architectural concerns. Skip style nitpicks and minor improvements unless they significantly impact code quality or maintainability."
+
+  # Path-specific instructions
+  path_instructions:
+    # Tests: correctness/coverage only, and specifically hunt the vacuous-assertion
+    # trap this repo cares about — an assertion against the zero value or mere
+    # absence-of-error passes even when the behavior regressed.
+    - path: "**/*_test.go"
+      instructions: "Focus on test correctness and coverage gaps only; skip style. Flag vacuous assertions: a test must assert the meaningful value (e.g. IsAdmin == true), not merely the zero value or the absence of an error, which would still pass if the behavior regressed."
+
+    - path: "web/**/*.test.{ts,tsx}"
+      instructions: "Focus on test correctness and coverage gaps only; skip style. Flag vacuous assertions: assert the meaningful value, not merely a falsy/zero default or that no error was thrown, which would still pass if the behavior regressed."
+
+    - path: "agent/**/*.test.ts"
+      instructions: "Focus on test correctness and coverage gaps only; skip style. Flag vacuous assertions: assert the meaningful value, not merely a falsy/zero default or that no error was thrown, which would still pass if the behavior regressed."
+
+    # API handlers: the two runtime traps a naive read misses (see CLAUDE.md /
+    # .claude/rules/go.md).
+    - path: "api/internal/handler/**"
+      instructions: "Flag any new API route that a CLI (uzi) command consumes if it is mounted in the cookie-only RequireAuth group instead of RequireUser (which accepts a session cookie OR a uzc_ Bearer) — the CLI authenticates with a Bearer and will 401 at runtime. Verify forge PATs and per-user Anthropic tokens are never logged or returned unredacted, and that settings/config reads fail closed (treat an error as disabled) rather than defaulting a gate to enabled."
+
+    # Mocks are demo/dev scaffolding, not production — do not flag prod-fidelity gaps.
+    - path: "web/src/mocks/**"
+      instructions: "This is demo/mock data for local dev and tests, not production code. Flag only bugs that would mislead a developer using mock mode (wrong response shape, a handler that contradicts the real API contract). Do NOT flag fidelity gaps with the production backend (e.g. state not persisted across a mock login, a hardcoded demo value) as issues."
+
+    - path: "prds/**"
+      instructions: "Only review for clarity and completeness. Skip markdown style suggestions."
+
+    - path: "docs/**"
+      instructions: "Only review for clarity and completeness. Skip markdown style suggestions."
+
+    # Idea files (e.g. the feature-bingo schedule's weekly proposal) are design
+    # sketches, not implementations — reviewing them at implementation altitude
+    # produces "Major" findings about mechanisms the proposal has not built yet.
+    - path: "ideas/**"
+      instructions: "These are design proposals, not implementations. Review only for clarity, scope, and whether the idea duplicates an existing one or something already shipped. Do NOT flag missing implementation, unhandled edge cases, or data-integrity/security concerns about mechanisms the proposal has not built yet - the whole file is a sketch by definition."
+
+    - path: "deploy/**"
+      instructions: "Focus on correctness of Kubernetes manifests, Helm charts, and Kustomize configurations."
+
+# Limit review scope
+language: "en-US"
+early_access: false
+
+# Custom review instructions
+chat:
+  auto_reply: false

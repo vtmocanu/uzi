@@ -1,0 +1,118 @@
+{
+  "run_id": "11111111-1111-1111-1111-111111111111",
+  "kind": "issue",
+  "issue_iid": 42,
+  "issue_title": "Extend the pipeline",
+  "issue_description": "PRD: add a job",
+  "issue_comments": {
+    "comments": [
+      {
+        "author_username": "carol",
+        "author_forge_user_id": 42,
+        "created_at": "2026-07-04T09:00:00Z",
+        "body": "please guard on Valid"
+      }
+    ],
+    "truncated": true
+  },
+  "status": "claimed",
+  "branch": "agent/issue-42",
+  "session_id": "sess-abc",
+  "last_seq": 7,
+  "iteration_count": 1,
+  "requeue_count": 0,
+  "plan_md": "# Plan\n",
+  "auto_approve": true,
+  "open_mr": true,
+  "interactive": true,
+  "stop_pending": true,
+  "base_branch": "develop",
+  "review_target_run_id": null,
+  "wait_on_limit": true,
+  "plan_approved": true,
+  "plan_source": "seeded",
+  "planned_base_commit": "abc123def4567890abc123def4567890abc12345",
+  "require_base_match": true,
+  "agent_selection": {
+    "source": "repo",
+    "exclusions": [
+      "reviewer"
+    ]
+  },
+  "repo": {
+    "id": "22222222-2222-2222-2222-222222222222",
+    "url": "https://gitlab.example.com/g/p",
+    "clone_url": "https://gitlab.example.com/g/p.git",
+    "default_branch": "main",
+    "forge_type": "gitlab",
+    "skills_enabled": true,
+    "claudemd_enabled": true
+  },
+  "secrets": {
+    "forge_username": "uzi-bot",
+    "forge_pat": "FORGE-PAT-PLACEHOLDER",
+    "anthropic_oauth_token": "ANTHROPIC-OAUTH-PLACEHOLDER"
+  },
+  "agents": [
+    {
+      "name": "coder",
+      "description": "writes code",
+      "prompt_body": "you code",
+      "tools": [
+        "Read",
+        "Edit"
+      ],
+      "model": "opus",
+      "skills": [
+        "team-runbook",
+        "team-kb"
+      ]
+    },
+    {
+      "name": "reviewer",
+      "description": "reviews",
+      "prompt_body": "you review",
+      "tools": null,
+      "model": null,
+      "skills": []
+    }
+  ],
+  "config": {
+    "run_timeout_seconds": 7200,
+    "idle_timeout_seconds": 600,
+    "max_iterations": 5,
+    "plan_max_revisions": 3,
+    "question_max": 5,
+    "question_timeout_seconds": 86400,
+    "default_model": "sonnet",
+    "skill_max_bytes": 65536,
+    "skills_max_per_run": 32,
+    "tool_packages": [
+      "kubectl@1.31",
+      "jq"
+    ],
+    "repo_devbox_opt_in": false,
+    "denied_tool_packages": [
+      "glab",
+      "vault"
+    ]
+  },
+  "skills": [
+    {
+      "name": "team-runbook",
+      "description": "the team runbook.",
+      "body": "# Team Runbook\n"
+    },
+    {
+      "name": "team-kb",
+      "description": "the team knowledge base.",
+      "body": "# Team KB\n"
+    }
+  ],
+  "skills_dropped": [
+    {
+      "name": "team-runbook",
+      "reason": "shadowed"
+    }
+  ]
+}

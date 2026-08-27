@@ -1,0 +1,49 @@
+# Fail-closed build guard map for the baked worker toolchain.
+#
+# One row per package in the sibling devbox.json, TAB-separated:
+#
+#     <devbox package>  <binary to resolve, or - >  <smoke command, or - >
+#
+# assert-toolchain.sh cross-checks column 1 against what `devbox global install`
+# ACTUALLY installed, so this file cannot silently fall behind devbox.json: adding a
+# package there without adding a row here FAILS THE BUILD, which is the whole point.
+# That drift is not hypothetical -- it is why this file exists. The guard it replaces
+# was a hardcoded `command -v python3 && ... && command -v openssl` line that stopped
+# tracking the manifest, and by 0.11.11 five baked packages (file, perl, coreutils,
+# kubernetes-helm, kubeconform) had no coverage at all while CI stayed green.
+#
+# Column 2 is `-` when a package legitimately ships NO binary in the profile. Do not
+# guess this column: MEASURE it against a built image. `fontconfig` is the trap --
+# it sounds like it brings `fc-cache`/`fc-list` and it does not (both measured
+# MISSING on /opt/uzi-toolchain/bin, 2026-07-27), which is exactly why the
+# font-cache warm at the bottom of each Dockerfile wraps `fc-cache` in a
+# `command -v` conditional. A guard that assumed the binary would fail every build.
+#
+# Column 3 runs the tool rather than merely resolving it, because resolving proves a
+# symlink exists and nothing more. The openssl.bin lesson (see devbox.json) is the
+# reason: a package can land its libs and man pages while the CLI never appears.
+# `-` when there is no cheap non-interactive smoke, or when a later, better guard
+# already covers it -- chromium is smoke-tested properly by the `--dump-dom` guard
+# further down each Dockerfile, so duplicating a weaker check here would buy nothing.
+go	go	go version
+gcc	gcc	gcc --version
+python3	python3	python3 --version
+python3Packages.pip	pip	pip --version
+chromium	chromium	-
+fontconfig	-	-
+dejavu_fonts	-	-
+openssl.bin	openssl	openssl version
+file.out	file	file --version
+perl	perl	perl -e exit
+coreutils	fmt	fmt --version
+kubernetes-helm	helm	helm version --short
+kubeconform	kubeconform	kubeconform -v
+go-task	task	task --version
+jq.bin	jq	jq --version
+shellcheck.bin	shellcheck	shellcheck --version
+fd	fd	fd --version
+yq-go	yq	yq --version
+gnumake	make	make --version
+ripgrep	rg	rg --version
+opentofu	tofu	tofu version
+yamllint	yamllint	yamllint --version

@@ -1,0 +1,31 @@
+{
+  "lockfile_version": "1",
+  "packages": {
+    "github:NixOS/nixpkgs/nixpkgs-unstable": {
+      "last_modified": "2026-07-18T08:47:58Z",
+      "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957?lastModified=1784364478"
+    },
+    "go": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#go", "source": "nixpkg" },
+    "gcc": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#gcc", "source": "nixpkg" },
+    "python3": { "plugin_version": "0.0.5", "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#python3", "source": "nixpkg" },
+    "python3Packages.pip": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#python3Packages.pip", "source": "nixpkg" },
+    "chromium": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#chromium", "source": "nixpkg" },
+    "fontconfig": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#fontconfig", "source": "nixpkg" },
+    "dejavu_fonts": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#dejavu_fonts", "source": "nixpkg" },
+    "openssl.bin": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#openssl.bin", "source": "nixpkg" },
+    "file.out": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#file.out", "source": "nixpkg" },
+    "perl": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#perl", "source": "nixpkg" },
+    "coreutils": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#coreutils", "source": "nixpkg" },
+    "kubernetes-helm": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#kubernetes-helm", "source": "nixpkg" },
+    "kubeconform": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#kubeconform", "source": "nixpkg" },
+    "go-task": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#go-task", "source": "nixpkg" },
+    "jq.bin": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#jq.bin", "source": "nixpkg" },
+    "shellcheck.bin": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#shellcheck.bin", "source": "nixpkg" },
+    "fd": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#fd", "source": "nixpkg" },
+    "yq-go": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#yq-go", "source": "nixpkg" },
+    "gnumake": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#gnumake", "source": "nixpkg" },
+    "ripgrep": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#ripgrep", "source": "nixpkg" },
+    "opentofu": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#opentofu", "source": "nixpkg" },
+    "yamllint": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#yamllint", "source": "nixpkg" }
+  }
+}

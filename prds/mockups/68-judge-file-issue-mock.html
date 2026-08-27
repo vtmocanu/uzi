@@ -1,0 +1,475 @@
+<title>uzi · File a GitLab issue from a judge recommendation</title>
+<style>
+  :root {
+    --page-bg: #f5f4f1;
+    --page-fg: #23262e;
+    --page-muted: #6b7280;
+    --page-edge: #ddd9d2;
+    --annot: #b45309;
+    --annot-bg: #b4530918;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page-bg: #101319;
+      --page-fg: #e4e8f0;
+      --page-muted: #949eb0;
+      --page-edge: #272d3c;
+      --annot: #fb923c;
+      --annot-bg: #fb923c1a;
+    }
+  }
+  :root[data-theme="dark"] {
+    --page-bg: #101319; --page-fg: #e4e8f0; --page-muted: #949eb0;
+    --page-edge: #272d3c; --annot: #fb923c; --annot-bg: #fb923c1a;
+  }
+  :root[data-theme="light"] {
+    --page-bg: #f5f4f1; --page-fg: #23262e; --page-muted: #6b7280;
+    --page-edge: #ddd9d2; --annot: #b45309; --annot-bg: #b4530918;
+  }
+
+  body {
+    background: var(--page-bg);
+    color: var(--page-fg);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.5;
+    margin: 0;
+    padding: 2.5rem 1.25rem 4rem;
+  }
+  .wrap { max-width: 78rem; margin: 0 auto; }
+  header.intro { max-width: 48rem; margin-bottom: 2.5rem; }
+  header.intro h1 { font-size: 1.5rem; margin: 0 0 .5rem; letter-spacing: -.01em; text-wrap: balance; }
+  header.intro p { color: var(--page-muted); margin: .4rem 0; font-size: .95rem; }
+  header.intro code, .plan li code, .states code.k {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: .85em; background: var(--annot-bg); padding: .1em .35em; border-radius: .3em;
+  }
+
+  .states { display: grid; grid-template-columns: repeat(auto-fit, minmax(24rem, 1fr)); gap: 1.75rem; }
+  .state h2 {
+    font-size: .75rem; text-transform: uppercase; letter-spacing: .09em;
+    color: var(--page-muted); margin: 0 0 .3rem; font-weight: 600;
+  }
+  .state h2 b { color: var(--page-fg); font-weight: 700; }
+  .state > p.when { font-size: .82rem; color: var(--page-muted); margin: 0 0 .8rem; min-height: 3.6em; }
+
+  /* ---- the uzi app card, faithful to web/src/index.css ember tokens (dark-only app) ---- */
+  .app {
+    --bg: rgb(8 10 15); --surface: rgb(15 18 26); --raised: rgb(23 27 38);
+    --edge: rgb(39 45 60); --edge-strong: rgb(55 63 82);
+    --fg: rgb(228 232 240); --muted: rgb(148 158 176);
+    --faint: rgb(122 133 154); --brand: rgb(251 146 60); --on-brand: rgb(26 16 8);
+    --ok: rgb(52 211 153); --warn: rgb(251 191 36); --danger: rgb(251 113 133); --info: rgb(56 189 248);
+    --radius: .625rem;
+    background: var(--surface);
+    border: 1px solid var(--edge);
+    border-radius: var(--radius);
+    padding: 1rem;
+    color: var(--fg);
+    font-size: .875rem;
+    display: flex; flex-direction: column; gap: 1rem;
+    box-shadow: 0 8px 24px rgb(0 0 0 / .35);
+  }
+  .app .sect { font-size: .7rem; text-transform: uppercase; letter-spacing: .1em; color: var(--faint); font-weight: 600; }
+  .app p { margin: 0; color: var(--muted); font-size: .8rem; }
+  .app .row { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+  .app .head { display: flex; align-items: center; justify-content: space-between; gap: .5rem; flex-wrap: wrap; }
+  .app .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--raised); color: var(--fg); padding: .1rem .35rem; border-radius: .25rem; font-size: .72rem;
+  }
+
+  /* Badge — mirrors ui.tsx Badge: rounded-md border px-1.5 py-0.5 text-[11px] */
+  .badge {
+    display: inline-flex; align-items: center; gap: .25rem; white-space: nowrap;
+    border: 1px solid var(--edge); background: var(--raised); color: var(--muted);
+    border-radius: .375rem; padding: .1rem .375rem; font-size: 11px; font-weight: 500;
+  }
+  .badge.info { color: var(--info); border-color: rgb(56 189 248 / .35); background: rgb(56 189 248 / .08); }
+  .badge.warn { color: var(--warn); border-color: rgb(251 191 36 / .35); background: rgb(251 191 36 / .08); }
+  .badge.ok { color: var(--ok); border-color: rgb(52 211 153 / .35); background: rgb(52 211 153 / .08); }
+  .badge.brand { color: var(--brand); border-color: rgb(251 146 60 / .35); background: rgb(251 146 60 / .08); }
+
+  /* recommendation <li> — mirrors RunView.tsx:699 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 */
+  .rec { border: 1px solid var(--edge); background: rgb(23 27 38 / .4); border-radius: .5rem; padding: .6rem .75rem; }
+  .rec + .rec { margin-top: .5rem; }
+  .rec .top { display: flex; align-items: flex-start; justify-content: space-between; gap: .5rem; }
+  .rec .meta { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+  .rec p.why { margin-top: .375rem; color: var(--muted); font-size: .8rem; white-space: pre-wrap; }
+  .rec .conf { font-size: .72rem; color: var(--faint); }
+
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: .25rem; flex: none;
+    border-radius: .5rem; height: 1.75rem; padding: 0 .625rem; font-size: .75rem; font-weight: 500;
+    background: var(--brand); color: var(--on-brand); border: 1px solid transparent;
+  }
+  .btn.sec { background: var(--raised); color: var(--fg); border-color: var(--edge); }
+  .btn.md { height: 2.25rem; padding: 0 1rem; font-size: .875rem; }
+  .btn.dis { opacity: .5; }
+  .hint { color: var(--faint); font-size: .72rem; }
+
+  /* draft panel — ProposalCard shape (brand-tinted, human-gated) */
+  .draft { border: 1px solid rgb(251 146 60 / .4); background: rgb(251 146 60 / .06); border-radius: .5rem; overflow: hidden; margin-top: .625rem; }
+  .draft .dhead {
+    display: flex; align-items: center; justify-content: space-between; gap: .5rem;
+    border-bottom: 1px solid rgb(251 146 60 / .2); background: rgb(251 146 60 / .1);
+    padding: .4rem .625rem;
+  }
+  .draft .dhead span.t { color: var(--brand); font-size: .72rem; font-weight: 600; }
+  .draft .dbody { padding: .625rem; display: flex; flex-direction: column; gap: .625rem; }
+  .field label { display: block; color: var(--muted); font-size: .72rem; margin-bottom: .25rem; }
+  .input {
+    background: var(--raised); border: 1px solid var(--edge); border-radius: .5rem;
+    color: var(--fg); padding: .4rem .6rem; font-size: .78rem;
+  }
+  .input.ph { color: var(--faint); }
+  .input.area {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: .68rem; line-height: 1.5; white-space: pre-wrap; max-height: 15rem; overflow: auto; color: var(--muted);
+  }
+  .input.sel { display: flex; align-items: center; justify-content: space-between; }
+  .input.sel::after { content: "▾"; color: var(--faint); }
+  .filed { border: 1px solid rgb(52 211 153 / .4); background: rgb(52 211 153 / .1); border-radius: .5rem; padding: .5rem .75rem; font-size: .8rem; color: var(--ok); margin-top: .625rem; }
+  .filed a { color: var(--ok); text-decoration: underline; text-underline-offset: 2px; font-weight: 500; }
+  .alert {
+    display: flex; gap: .5rem; align-items: flex-start; border-radius: .5rem; padding: .5rem .625rem; font-size: .75rem;
+    border: 1px solid rgb(251 113 133 / .4); background: rgb(251 113 133 / .1); color: var(--danger);
+  }
+  .alert.info { border-color: rgb(56 189 248 / .4); background: rgb(56 189 248 / .1); color: var(--info); }
+
+  /* ---- annotation callouts ---- */
+  .new { position: relative; outline: 1.5px dashed var(--annot); outline-offset: 3px; border-radius: .5rem; }
+  .tag {
+    position: absolute; top: -0.7rem; right: -.4rem;
+    background: var(--annot); color: #fff;
+    font-size: .6rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+    padding: .1rem .45rem; border-radius: 999px;
+  }
+  .legend { display: flex; gap: .5rem; align-items: center; font-size: .82rem; color: var(--page-muted); margin-top: 1rem; }
+  .legend .swatch { width: 1.1rem; height: .9rem; border: 1.5px dashed var(--annot); border-radius: .25rem; }
+
+  .plan { max-width: 48rem; margin-top: 3rem; border-top: 1px solid var(--page-edge); padding-top: 1.5rem; }
+  .plan h2 { font-size: 1.05rem; margin: 0 0 .75rem; }
+  .plan ol, .plan ul { padding-left: 1.2rem; margin: 0; }
+  .plan li { margin-bottom: .7rem; font-size: .92rem; }
+  .plan .note { color: var(--page-muted); font-size: .85rem; }
+  table.map { border-collapse: collapse; font-size: .85rem; margin-top: .5rem; }
+  table.map th, table.map td { border: 1px solid var(--page-edge); padding: .35rem .6rem; text-align: left; }
+  table.map th { color: var(--page-muted); font-weight: 600; font-size: .78rem; }
+  table.map code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85em; }
+</style>
+
+<div class="wrap">
+  <header class="intro">
+    <h1>File a GitLab issue from a judge recommendation</h1>
+    <p>Today the judge's recommendations (PRD #46) are a dead end: the run page lists them, and acting on one means copying the text into GitLab by hand. Only the <code>improve_uzi</code> subset ever reaches a forge, and only aggregated into the self-improvement engine's tracking issue.</p>
+    <p>Proposal: every recommendation gets a <b>File issue</b> button. It opens an editable draft the API templates from data it already has (no extra LLM call, no token spend), pre-targeted at the right repo, labelled <code>PRD</code> + <code>PRDLESS</code> so the issue lands on the board and is startable in one click. The filed issue's link is persisted on the recommendation, so the button becomes a link and the same row can't be filed twice.</p>
+    <p><b>Nothing auto-starts.</b> No <code>autopilot</code> label is added: filing an issue and spending tokens on a run stay separate decisions.</p>
+    <div class="legend"><span class="swatch"></span> new element or copy</div>
+  </header>
+
+  <div class="states">
+
+    <!-- STATE A -->
+    <section class="state">
+      <h2><b>A · Idle</b> — today's panel, plus one button per row</h2>
+      <p class="when">The run page's Run review card (<code class="k">RunView.tsx:577</code> JudgePanel) as it renders today. Everything except the per-row button already exists.</p>
+      <div class="app">
+        <div class="head">
+          <div class="row">
+            <span class="sect">Run review</span>
+            <span class="badge warn">Issues found</span>
+            <span class="hint">via sonnet</span>
+          </div>
+          <span class="btn sec">Re-run judge</span>
+        </div>
+        <p>The run delivered a working MR in two review iterations, but the reviewer lost lint coverage silently and the plan under-scoped the migration. Two of three iterations were spent rediscovering the same missing tool.</p>
+
+        <div class="rec">
+          <div class="top">
+            <div class="meta">
+              <span class="badge info">Install a worker tool</span>
+              <span class="mono">shellcheck</span>
+              <span class="conf">high confidence</span>
+            </div>
+            <span class="btn new"><span class="tag">new</span>File issue</span>
+          </div>
+          <p class="why">The reviewer agent invoked `shellcheck e2e/run-e2e.sh` in iterations 1 and 2; both returned `command not found`. The reviewer continued without lint coverage and never reported the gap, so the MR shipped unlinted.</p>
+        </div>
+
+        <div class="rec">
+          <div class="top">
+            <div class="meta">
+              <span class="badge info">Improve an agent</span>
+              <span class="mono">reviewer</span>
+              <span class="conf">medium confidence</span>
+            </div>
+            <span class="btn new"><span class="tag">new</span>File issue</span>
+          </div>
+          <p class="why">The reviewer treats a failed tool call as a skipped check rather than a finding. Its template should require reporting any check it could not run, so a missing tool surfaces instead of silently narrowing the review.</p>
+        </div>
+
+        <div class="rec">
+          <div class="top">
+            <div class="meta">
+              <span class="badge info">Improve uzi</span>
+              <span class="mono">api/internal/poller</span>
+              <span class="conf">low confidence</span>
+            </div>
+            <span class="btn new"><span class="tag">new</span>File issue</span>
+          </div>
+          <p class="why">The run waited 4m for the first poll tick after the label was applied. A webhook path would cut the queue-to-claim latency, though the polling interval may simply be misconfigured on this instance.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- STATE B -->
+    <section class="state">
+      <h2><b>B · Draft open</b> — human-gated, editable, no write yet</h2>
+      <p class="when">Clicking <b>File issue</b> expands an inline draft (the <code class="k">ProposalCard</code> shape from PRD #39: brand-tinted, nothing written to the forge until the human clicks Create). The API templated every field.</p>
+      <div class="app">
+        <div class="head">
+          <div class="row">
+            <span class="sect">Run review</span>
+            <span class="badge warn">Issues found</span>
+            <span class="hint">via sonnet</span>
+          </div>
+          <span class="btn sec">Re-run judge</span>
+        </div>
+
+        <div class="rec">
+          <div class="top">
+            <div class="meta">
+              <span class="badge info">Install a worker tool</span>
+              <span class="mono">shellcheck</span>
+              <span class="conf">high confidence</span>
+            </div>
+            <span class="btn dis">File issue</span>
+          </div>
+          <p class="why">The reviewer agent invoked `shellcheck e2e/run-e2e.sh` in iterations 1 and 2; both returned `command not found`. The reviewer continued without lint coverage and never reported the gap, so the MR shipped unlinted.</p>
+
+          <div class="draft new"><span class="tag">new</span>
+            <div class="dhead">
+              <span class="t">▤ Draft issue</span>
+              <span class="badge brand">needs your review</span>
+            </div>
+            <div class="dbody">
+              <div class="field">
+                <label>Repo</label>
+                <div class="input sel"><span>vtmocanu/uzi</span></div>
+                <p class="hint" style="margin-top:.25rem">Defaulted from the category — a worker tool is installed by uzi's own image. Pick any repo you have connected.</p>
+              </div>
+              <div class="field">
+                <label>Title</label>
+                <div class="input">Install shellcheck in the worker image</div>
+              </div>
+              <div class="field">
+                <label>Description</label>
+                <div class="input area">## What the judge found
+
+The reviewer agent invoked `shellcheck e2e/run-e2e.sh` in iterations 1
+and 2; both returned `command not found`. The reviewer continued without
+lint coverage and never reported the gap, so the MR shipped unlinted.
+
+## Context
+
+- Recommendation: **Install a worker tool** — `shellcheck` (high confidence)
+- Verdict on the judged run: **Issues found**
+- Judged run: [issue run on vtmocanu/uzi#58](https://uzi.example/runs/8f2c1d04) (completed)
+- Retrospective by `sonnet`, 2026-07-17
+
+## Judge's summary of the run
+
+````text
+The run delivered a working MR in two review iterations, but the
+reviewer lost lint coverage silently and the plan under-scoped the
+migration. Two of three iterations were spent rediscovering the same
+missing tool.
+````
+
+---
+Opened by uzi on behalf of @vlad, from a run retrospective. The
+quoted text above is LLM-authored and unverified, and is fenced (not
+blockquoted) so links, image beacons and quick-actions render inert.</div>
+              </div>
+              <div class="field">
+                <label>Labels</label>
+                <div class="row">
+                  <span class="badge">PRD</span>
+                  <span class="badge">PRDLESS</span>
+                </div>
+                <p class="hint" style="margin-top:.25rem">Lands on the board and is startable without a PRD file. No <b>autopilot</b> label — nothing runs until you click Start.</p>
+              </div>
+              <div class="row">
+                <span class="btn">Create issue</span>
+                <span class="btn sec">Cancel</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- STATE C -->
+    <section class="state">
+      <h2><b>C · Filed</b> — persisted, one issue per recommendation</h2>
+      <p class="when">The link is stored on the <code class="k">review_recommendations</code> row, so it survives reload and the row can't be double-filed. The button becomes the link; the draft collapses.</p>
+      <div class="app">
+        <div class="head">
+          <div class="row">
+            <span class="sect">Run review</span>
+            <span class="badge warn">Issues found</span>
+            <span class="hint">via sonnet</span>
+          </div>
+          <span class="btn sec">Re-run judge</span>
+        </div>
+
+        <div class="rec">
+          <div class="top">
+            <div class="meta">
+              <span class="badge info">Install a worker tool</span>
+              <span class="mono">shellcheck</span>
+              <span class="conf">high confidence</span>
+            </div>
+            <span class="badge ok new" style="height:1.75rem;padding:0 .5rem"><span class="tag">new</span>filed</span>
+          </div>
+          <p class="why">The reviewer agent invoked `shellcheck e2e/run-e2e.sh` in iterations 1 and 2; both returned `command not found`. The reviewer continued without lint coverage and never reported the gap, so the MR shipped unlinted.</p>
+          <div class="filed new"><span class="tag">new</span>
+            <b>Issue created.</b> <a href="#">vtmocanu/uzi#71 ↗</a> — open it on the board to start a run.
+          </div>
+        </div>
+
+        <div class="rec">
+          <div class="top">
+            <div class="meta">
+              <span class="badge info">Improve an agent</span>
+              <span class="mono">reviewer</span>
+              <span class="conf">medium confidence</span>
+            </div>
+            <span class="btn">File issue</span>
+          </div>
+          <p class="why">The reviewer treats a failed tool call as a skipped check rather than a finding. Its template should require reporting any check it could not run, so a missing tool surfaces instead of silently narrowing the review.</p>
+        </div>
+      </div>
+      <p class="hint" style="color:var(--page-muted);margin-top:.6rem">Re-running the judge replaces the recommendation rows (upsert semantics, PRD #46 Decision 8), but the filed link lives in its own table keyed by (review, category, target), so it survives. If the re-judge re-emits the same recommendation with a changed rationale, the row is flagged "filed for an earlier version" rather than silently refiled.</p>
+    </section>
+
+    <!-- STATE D -->
+    <section class="state">
+      <h2><b>D · No default repo</b> — <code class="k">improve_uzi</code>, uzi repo not connected</h2>
+      <p class="when"><code class="k">selfimprove_repo</code> is an admin setting that may be unset (self-improvement is off by default). Then an <code class="k">improve_uzi</code> row has nothing to default to, and the draft opens with the picker empty rather than guessing.</p>
+      <div class="app">
+        <div class="rec">
+          <div class="top">
+            <div class="meta">
+              <span class="badge info">Improve uzi</span>
+              <span class="mono">api/internal/poller</span>
+              <span class="conf">low confidence</span>
+            </div>
+            <span class="btn dis">File issue</span>
+          </div>
+          <p class="why">The run waited 4m for the first poll tick after the label was applied. A webhook path would cut the queue-to-claim latency, though the polling interval may simply be misconfigured on this instance.</p>
+
+          <div class="draft new"><span class="tag">new</span>
+            <div class="dhead">
+              <span class="t">▤ Draft issue</span>
+              <span class="badge brand">needs your review</span>
+            </div>
+            <div class="dbody">
+              <div class="alert info">
+                <span>ⓘ</span>
+                <span>No uzi repo is configured on this instance, so there's no default for an "Improve uzi" recommendation. Pick the repo this should be filed against.</span>
+              </div>
+              <div class="field">
+                <label>Repo</label>
+                <div class="input sel ph"><span>Select a repo…</span></div>
+              </div>
+              <div class="field">
+                <label>Title</label>
+                <div class="input">Reduce queue-to-claim latency in the issue poller</div>
+              </div>
+              <div class="row">
+                <span class="btn dis">Create issue</span>
+                <span class="btn sec">Cancel</span>
+              </div>
+              <p class="hint">Create stays disabled until a repo is selected.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- STATE E -->
+    <section class="state">
+      <h2><b>E · Forge rejected the write</b></h2>
+      <p class="when">The PAT lost issue-write scope, the project moved, the label is protected. The draft stays open with its edits intact so the user can retry or switch repo — the forge is the source of truth, so nothing local is written on failure.</p>
+      <div class="app">
+        <div class="rec">
+          <div class="top">
+            <div class="meta">
+              <span class="badge info">Improve an agent</span>
+              <span class="mono">reviewer</span>
+              <span class="conf">medium confidence</span>
+            </div>
+            <span class="btn dis">File issue</span>
+          </div>
+          <p class="why">The reviewer treats a failed tool call as a skipped check rather than a finding. Its template should require reporting any check it could not run, so a missing tool surfaces instead of silently narrowing the review.</p>
+
+          <div class="draft new"><span class="tag">new</span>
+            <div class="dhead">
+              <span class="t">▤ Draft issue</span>
+              <span class="badge brand">needs your review</span>
+            </div>
+            <div class="dbody">
+              <div class="alert">
+                <span>⚠</span>
+                <span>Couldn't create the issue on vtmocanu/uzi: the forge rejected the request (403). Your draft is kept — retry, or pick another repo.</span>
+              </div>
+              <div class="field">
+                <label>Repo</label>
+                <div class="input sel"><span>vtmocanu/uzi</span></div>
+              </div>
+              <div class="field">
+                <label>Title</label>
+                <div class="input">Make the reviewer report checks it could not run</div>
+              </div>
+              <div class="row">
+                <span class="btn">Create issue</span>
+                <span class="btn sec">Cancel</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </div>
+
+  <div class="plan">
+    <h2>How the repo is defaulted</h2>
+    <p class="note">The category already says where the change lives. The picker is always there to override.</p>
+    <table class="map">
+      <tr><th>Category</th><th>Default repo</th><th>Why</th></tr>
+      <tr><td><code>improve_agent</code>, <code>add_agent</code></td><td>the judged run's repo</td><td>repo agents live in that repo's <code>.claude/agents/</code></td></tr>
+      <tr><td><code>improve_uzi</code>, <code>install_worker_tool</code></td><td><code>selfimprove_repo</code></td><td>uzi's own code; the worker image is built from it</td></tr>
+      <tr><td><code>adjust_template</code></td><td><code>selfimprove_repo</code></td><td>builtin templates are <code>go:embed</code>-shipped from uzi — debatable, see below</td></tr>
+      <tr><td><code>enable_tool</code></td><td><code>selfimprove_repo</code></td><td>weakest fit: often a pure admin toggle, not a code change — see below</td></tr>
+    </table>
+
+    <h2 style="margin-top:1.5rem">Resolved after review (3× fable: architect, fact-checker, auditor)</h2>
+    <ol>
+      <li><b>Re-judge no longer wipes filed links.</b> The link moves to its own table keyed <code>(review_id, category, target)</code>, which survives the recommendation delete-reinsert and makes a duplicate-file structurally impossible — <code>(category, target)</code> is not unique on the recommendation row, so the originally-drafted carry-forward LEFT JOIN would have fanned out.</li>
+      <li><b><code>enable_tool</code> / <code>adjust_template</code> keep the button.</b> The ask was a button on <i>each</i> improvement; the human reads the draft before any write, and special-casing 2 of 6 categories buys a rule to learn against a mis-click that's already visible and cancellable. Revisit if these dominate the filed mix and get closed invalid.</li>
+      <li><b>Who may file: owner + admin, with provenance shown.</b> The bot authors the issue (uzi has no per-user forge identity), and the picker lists only repos you connected. An admin reading another user's review can file too — so the draft shows "from user X's worker, run &lt;id&gt;" prominently, because that text is attacker-influencable (worker-forged).</li>
+      <li><b>Untrusted text is fenced, not blockquoted.</b> A markdown blockquote does not neutralize inline links/images or GitLab quick-actions; the filed body puts every untrusted field in a code block and strips leading <code>/</code>-command lines, plus a broader secret-shape scan at draft time (the ingest scrub only covers 4 secret families, and this flow can write to a different project than the run's repo).</li>
+      <li><b>Concurrent filing is claim-first.</b> A read-then-write 409 only catches sequential re-clicks; the row is claimed atomically before the forge write, mirroring the chat-proposal flow uzi already audited into that shape.</li>
+    </ol>
+
+    <h2 style="margin-top:1.5rem">What this does not change</h2>
+    <ul>
+      <li class="note">Untrusted text stays untrusted. <code>rationale_md</code> / <code>summary_md</code> render as escaped plain text in the panel (<code>RunView.tsx:688</code>) and go into the issue body as data. The agent-side fence already covers the consequence: issue title/description are wrapped in <code>UNTRUSTED_FRAME</code> in the planning turn (<code>prompt.ts:112</code>), so a filed issue is exactly as untrusted as any other forge issue.</li>
+      <li class="note">No new token spend. The API templates the body from rows it already has; the judge prompt and the worker are untouched.</li>
+      <li class="note">No new forge capability. <code>CreateIssue</code> exists (<code>forge/forge.go:225</code>) and is already called from three places.</li>
+      <li class="note">No new forge identity. The issue is authored by the connection's bot, exactly like every other write uzi makes. The filed issue says so in its footer, so a reader on GitLab isn't left wondering why the bot opened it.</li>
+    </ul>
+  </div>
+</div>

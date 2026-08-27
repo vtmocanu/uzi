@@ -1,0 +1,99 @@
+# Secrets / local env
+.env
+
+# Node
+# No trailing slash on node_modules, deliberately: a trailing slash matches a
+# DIRECTORY only, and CLAUDE.md tells you to symlink node_modules from another
+# worktree rather than run `npm ci` (its postinstall clobbers the host's
+# agent-browser). A symlink is not a directory, so `web/node_modules/` left the
+# symlink untracked and one `git add -A` staged a link pointing outside the repo.
+# The bare pattern matches file, dir and symlink alike; agent/ and the bare form
+# are here because the same symlink trick is used for both other workspaces.
+#
+# The bare `node_modules` alone would cover all three -- a gitignore pattern with no
+# slash matches at ANY depth, so `git check-ignore -v` attributes both specific paths
+# to that last line rather than to the two above it. They are kept anyway: the two
+# named workspaces are the ones this repo actually has, and a reader scanning for
+# "is web/node_modules ignored?" should find the answer written down rather than have
+# to know the any-depth rule. Redundant, not wrong.
+web/node_modules
+agent/node_modules
+node_modules
+web/dist/
+# Rendered Homebrew formula output (task brew:formula); the template is Formula/uzi-cli.rb
+/dist/
+
+# Machine-local scratch dir, never committed (e.g. symlinks to reference checkouts
+# kept outside the repo). No trailing slash, for the same reason node_modules above
+# has none: a symlink is not a directory, so `inspiration/` would leave the links
+# untracked-but-not-ignored and one `git add -A` would commit an absolute path off
+# this machine into the repo.
+inspiration
+
+# Go
+api/server
+api/uzi
+*.test
+# golangci-lint on-disk cache — regenerated on every lint run; was accidentally
+# tracked (4757 blobs) until the public-migration hygiene pass removed it.
+.golangci-cache/
+
+# Editor / OS
+.DS_Store
+*.swp
+# IDEs
+.cursor
+.vscode
+# Python
+__pycache__/
+*.py[cod]
+# Env files
+# Devbox
+.devbox/
+# Task remote-include cache
+.task/
+# Claude
+.claude/agent-team-tasks/
+.claude/scheduled_tasks.lock
+.claude/skill-stats.json
+.claude/worktrees/
+# Local, per-machine memory (never committed — see CONTRIBUTING.md; keeps
+# internal-only notes out of this public repo).
+CLAUDE.local.md
+# just & task
+juster
+task-repo
+# Helm — vendored subcharts are re-fetched via `helm dependency build` (Chart.lock
+# pins the version + digest); only Chart.lock is committed (umbrella-chart parity).
+helm/charts/*.tgz
+charts/*.tgz
+deploy/chart/charts/*.tgz
+# Infisical
+.infisical.json
+# Terraform
+.terraform
+# Ansible
+.ansible/.lock
+# Renovate
+renovate-local.log
+renovate-packages.csv
+# Coverage (PRD #103 M6). `coverage.out` was VESTIGIAL until this milestone -- it
+# named tooling nothing produced, and the PRD's fix-the-doc list said M6 must either
+# make it real or delete it. It is real now: `task test:api` and `task
+# test:controller` write api/coverage.out and controller/coverage.out, and this
+# pattern is unanchored so it matches both.
+coverage.out
+# ...and the two artifacts derived from them, plus vitest's. The Go .xml files are
+# written beside their profiles by the cobertura conversion in the CI test jobs;
+# vitest writes web/coverage/cobertura-coverage.xml (reportsDirectory in
+# web/vite.config.ts). Nothing here is committed -- CI regenerates all of it, and
+# `scan:secrets` walks TRACKED files only, so an ignored directory is out of its
+# scope by construction.
+coverage.xml
+web/coverage/
+# dot-ai agent deck
+.dot-agent-deck/
+# ignoreme folder
+ignoreme/
+# CI dotenv report: publish:assert-changelog writes the commit count here (PRD #175 M3)
+commit_count.env

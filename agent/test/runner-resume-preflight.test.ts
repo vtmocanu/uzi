@@ -1,0 +1,306 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { type RunContext, type ExecutorResult } from "../src/executor.js";
+import {
+  type ExecutorFactory,
+  RESUME_CONTINUED_EVENT,
+  RESUME_LINEAGE_BREAK_EVENT,
+} from "../src/runner.js";
+import {
+  api,
+  fakeGitlab,
+  fx,
+  gitlabClaim,
+  installHarness,
+  runnerWith,
+} from "./runner-harness.js";
+
+installHarness();
+
+// ── Resume preflight (issue #105) ────────────────────────────────────────────
+//
+// The run lane pins a per-run HOME (`agent-home/<runId>`) that lives on the CLAIMING
+// worker's data volume. A requeued run whose affinity grace lapsed can be claimed by a
+// DIFFERENT worker, where that HOME never existed — the claim still carries the session
+// id, but the transcript it names does not. Because the SDK resolves a resume LOCALLY
+// (verified against the shipped CLI: exit 1, "No conversation found with session ID",
+// duration_api_ms 0), passing that id through did not start a fresh run — it killed the
+// run on its first turn with `error_during_execution`.
+describe("RunRunner — resume preflight (issue #105)", () => {
+  const SID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+  /** A factory with a per-run HOME under `homeRoot`, capturing the RunContext. */
+  function capturingFactory(
+    homeRoot: string,
+    seen: RunContext[],
+  ): ExecutorFactory {
+    return (runId) => ({
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          seen.push(ctx);
+          return { branch: ctx.branch };
+        },
+      },
+      homeDir: path.join(homeRoot, runId),
+    });
+  }
+
+  /** Plant a transcript under this run's HOME. The preflight globs the HOME's project
+   *  dirs (sdk-session.ts), so the exact dir name does not matter — a per-run HOME holds
+   *  only this run's own, so any project dir stands in for it. */
+  function plantTranscript(runHome: string, sessionId: string): void {
+    const dir = path.join(
+      runHome,
+      ".claude",
+      "projects",
+      "-data-runner-repo-issue-x",
+    );
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `${sessionId}.jsonl`), "{}\n");
+  }
+
+  it("drops the resume and says so when the transcript is not on this worker", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-resume-"));
+    const seen: RunContext[] = [];
+    const claim = gitlabClaim(70, { session_id: SID });
+    try {
+      await runnerWith(capturingFactory(homeRoot, seen), gitlab).execute(claim);
+      assert.strictEqual(
+        seen[0]?.sessionId,
+        undefined,
+        "the dead session id must not reach the executor",
+      );
+      const texts = api
+        .messages(claim.run_id)
+        .filter((m) => m.kind === "status")
+        .map((m) => String(m.payload.text));
+      const notice = texts.find((t) =>
+        /earlier session could not be found/.test(t),
+      );
+      assert.ok(
+        notice,
+        `expected an honest resume notice, got ${JSON.stringify(texts)}`,
+      );
+      // Both facts the user needs to make sense of the feed: context is gone, AND that
+      // is why the agent may re-tread ground. A bare "session not found" is not enough.
+      assert.match(notice, /WITHOUT its earlier context/);
+      assert.match(notice, /work may be repeated/);
+      // The same dropped-resume path also carries a stable, low-cardinality tag so a
+      // maintainer can aggregate lineage-break frequency from the run feed (issue #334).
+      const events = api
+        .messages(claim.run_id)
+        .filter((m) => m.kind === "status")
+        .map((m) => m.payload.event);
+      assert.ok(
+        events.includes(RESUME_LINEAGE_BREAK_EVENT),
+        `expected a queryable ${RESUME_LINEAGE_BREAK_EVENT} status event, got ${JSON.stringify(events)}`,
+      );
+      // The two signals are mutually exclusive: a DROPPED resume must NOT also emit the
+      // positive resume_continued event (PRD #556 M2).
+      assert.ok(
+        !events.includes(RESUME_CONTINUED_EVENT),
+        `a dropped resume must record no ${RESUME_CONTINUED_EVENT} event, got ${JSON.stringify(events)}`,
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the resume and emits resume_continued when the transcript IS on this worker", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-resume-"));
+    const seen: RunContext[] = [];
+    const claim = gitlabClaim(71, { session_id: SID });
+    try {
+      plantTranscript(path.join(homeRoot, claim.run_id), SID);
+      await runnerWith(capturingFactory(homeRoot, seen), gitlab).execute(claim);
+      assert.strictEqual(
+        seen[0]?.sessionId,
+        SID,
+        "a resolvable session must still resume",
+      );
+      const texts = api
+        .messages(claim.run_id)
+        .filter((m) => m.kind === "status")
+        .map((m) => String(m.payload.text));
+      assert.ok(
+        !texts.some((t) => /earlier session could not be found/.test(t)),
+        "must not cry wolf",
+      );
+      const events = api
+        .messages(claim.run_id)
+        .filter((m) => m.kind === "status")
+        .map((m) => m.payload.event);
+      assert.ok(
+        !events.includes(RESUME_LINEAGE_BREAK_EVENT),
+        "a resolved resume must record no lineage-break event",
+      );
+      // PRD #556 M2 (D5): a re-claim that RESOLVES its prior session emits the positive
+      // resume_continued signal so operators can tell "resumed cleanly" from "re-planned".
+      assert.ok(
+        events.includes(RESUME_CONTINUED_EVENT),
+        `expected a queryable ${RESUME_CONTINUED_EVENT} status event, got ${JSON.stringify(events)}`,
+      );
+      const notice = texts.find((t) =>
+        /earlier session was found/.test(t),
+      );
+      assert.ok(
+        notice,
+        `expected a positive resume notice, got ${JSON.stringify(texts)}`,
+      );
+      assert.match(notice, /continuing WITH its prior context/);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("does not preflight a run with no per-run HOME (the stub lane is untouched)", async () => {
+    // The stub executor persists no SDK session, so main.ts gives it no per-run HOME.
+    // That absence is the discriminator — no executor-kind check lives in the runner.
+    const { gitlab } = fakeGitlab();
+    const seen: RunContext[] = [];
+    const claim = gitlabClaim(72, { session_id: SID });
+    await runnerWith(
+      () => ({
+        executor: {
+          run: async (ctx: RunContext) => {
+            seen.push(ctx);
+            return { branch: ctx.branch };
+          },
+        },
+      }),
+      gitlab,
+    ).execute(claim);
+    assert.strictEqual(
+      seen[0]?.sessionId,
+      SID,
+      "no HOME to check ⇒ the claim's id passes through unchanged",
+    );
+    // With no per-run HOME there is no transcript to resolve, so neither the negative
+    // (lineage-break) nor the positive (resume_continued) signal fires (PRD #556 M2).
+    const events = api
+      .messages(claim.run_id)
+      .filter((m) => m.kind === "status")
+      .map((m) => m.payload.event);
+    assert.ok(
+      !events.includes(RESUME_LINEAGE_BREAK_EVENT) &&
+        !events.includes(RESUME_CONTINUED_EVENT),
+      `absent HOME must emit neither resume event, got ${JSON.stringify(events)}`,
+    );
+  });
+
+  it("warns the lead about prior commits on the branch whenever they exist (PRD #218 M3)", async () => {
+    // The honest degradation must not become silently redone work: if the branch already
+    // carries commits this turn did not make, say so in the prompt. PRD #218 M3 widened
+    // this from "only when the resume was DROPPED" to "whenever prior commits exist",
+    // because the case this PRD is about — the session survives but the tree was lost and
+    // recovered — carries prior commits with a LIVE session, which the old guard missed.
+    const { gitlab } = fakeGitlab();
+    const env = {
+      ...process.env,
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_SYSTEM: "/dev/null",
+    };
+    const gitFx = (args: string[]): void => {
+      execFileSync("git", ["-C", fx.originPath, ...args], {
+        env,
+        stdio: "pipe",
+      });
+    };
+    // A previous COMPLETED run's pushed work: two commits on the issue branch. (An
+    // attempt requeued mid-flight leaves nothing — a run pushes once, at the end.)
+    gitFx(["checkout", "-b", "agent/issue-73"]);
+    fs.writeFileSync(path.join(fx.originPath, "a.txt"), "a\n");
+    gitFx(["add", "."]);
+    gitFx(["commit", "-m", "prior work 1"]);
+    fs.writeFileSync(path.join(fx.originPath, "b.txt"), "b\n");
+    gitFx(["add", "."]);
+    gitFx(["commit", "-m", "prior work 2"]);
+    gitFx(["checkout", "main"]);
+
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-resume-"));
+    try {
+      const dropped: RunContext[] = [];
+      const droppedClaim = gitlabClaim(73, { session_id: SID });
+      await runnerWith(capturingFactory(homeRoot, dropped), gitlab).execute(
+        droppedClaim,
+      );
+      assert.deepStrictEqual(
+        dropped[0]?.priorWork,
+        { commits: 2 },
+        "counted against the default branch",
+      );
+
+      // Same branch, same prior commits, and a resolvable (live) session. Post-#218 the
+      // lead is STILL told: prior commits it did not make this turn are worth surfacing
+      // whether or not the session survived — the branch is not empty either way.
+      const kept: RunContext[] = [];
+      const keptClaim = gitlabClaim(73, { session_id: SID });
+      plantTranscript(path.join(homeRoot, keptClaim.run_id), SID);
+      await runnerWith(capturingFactory(homeRoot, kept), gitlab).execute(
+        keptClaim,
+      );
+      assert.deepStrictEqual(
+        kept[0]?.priorWork,
+        { commits: 2 },
+        "a live resume with prior commits is now told about them too (PRD #218 M3)",
+      );
+
+      // And a fresh run (no session at all) on a branch with no prior work gets none.
+      const fresh: RunContext[] = [];
+      await runnerWith(capturingFactory(homeRoot, fresh), gitlab).execute(
+        gitlabClaim(74),
+      );
+      assert.strictEqual(fresh[0]?.priorWork, undefined);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("emits neither resume event on a fresh first attempt (no prior session)", async () => {
+    // A brand-new first attempt has claim.session_id == null — there was never a session
+    // to resolve — so it must emit NEITHER the negative nor the positive resume signal
+    // (PRD #556 M2), matching how the tree-loss/seeded_from_default reports gate on a
+    // prior session too.
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-resume-"));
+    const seen: RunContext[] = [];
+    const claim = gitlabClaim(75);
+    try {
+      await runnerWith(capturingFactory(homeRoot, seen), gitlab).execute(claim);
+      assert.strictEqual(
+        seen[0]?.sessionId,
+        undefined,
+        "a fresh attempt carries no session id",
+      );
+      const events = api
+        .messages(claim.run_id)
+        .filter((m) => m.kind === "status")
+        .map((m) => m.payload.event);
+      assert.ok(
+        !events.includes(RESUME_LINEAGE_BREAK_EVENT) &&
+          !events.includes(RESUME_CONTINUED_EVENT),
+        `a fresh attempt must emit neither resume event, got ${JSON.stringify(events)}`,
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("pins the lineage-break event key", () => {
+    // The literal is an aggregation key a maintainer queries by; a silent rename would
+    // break `payload->>'event' = 'resume_lineage_break'` counts (issue #334).
+    assert.strictEqual(RESUME_LINEAGE_BREAK_EVENT, "resume_lineage_break");
+  });
+
+  it("pins the resume_continued event key", () => {
+    // The positive counterpart is queried the same way (`payload->>'event' =
+    // 'resume_continued'`) by the server/web; a silent rename would break it (PRD #556 M2).
+    assert.strictEqual(RESUME_CONTINUED_EVENT, "resume_continued");
+  });
+});

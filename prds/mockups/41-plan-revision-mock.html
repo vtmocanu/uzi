@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>uzi Plan revision gate — mock</title>
+<style>
+  /* ── ember design tokens (values copied from web/src/index.css) ───────── */
+  :root {
+    --bg: 8 10 15;
+    --surface: 15 18 26;
+    --raised: 23 27 38;
+    --edge: 39 45 60;
+    --edge-strong: 58 66 86;
+    --fg: 228 232 240;
+    --muted: 148 158 176;
+    --faint: 100 110 130;
+    --brand: 251 146 60;
+    --brand-hover: 253 186 116;
+    --ok: 52 211 153;
+    --warn: 251 191 36;
+    --danger: 251 113 133;
+    --info: 56 189 248;
+    --radius: 0.625rem;
+    --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  /* This mock deliberately stays single-theme: it reproduces the app's dark "ember" palette. */
+  * { box-sizing: border-box; scrollbar-width: thin; scrollbar-color: rgb(var(--edge)) transparent; }
+  body {
+    margin: 0; padding: 32px 16px 64px;
+    background: rgb(var(--bg));
+    color: rgb(var(--fg));
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    display: flex; justify-content: center;
+  }
+  .wrap { width: 100%; max-width: 760px; }
+  .mock-note { font-size: 12px; color: rgb(var(--faint)); margin: 0 0 12px; }
+  .mock-note code { font-family: var(--font-mono); font-size: 11px; color: rgb(var(--muted)); }
+
+  /* ── State divider between mock stages ────────────────────────────────── */
+  .stage {
+    display: flex; align-items: center; gap: 10px;
+    margin: 40px 0 14px;
+    font-size: 12px; color: rgb(var(--muted));
+  }
+  .stage:first-of-type { margin-top: 18px; }
+  .stage::before, .stage::after { content: ""; height: 1px; flex: 1; background: rgb(var(--edge)); }
+  .stage .k { color: rgb(var(--fg)); font-weight: 600; }
+
+  /* ── Buttons (mirror ui.tsx Button) ───────────────────────────────────── */
+  .btn {
+    border: 0; cursor: pointer; font-family: inherit;
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 13px; font-weight: 500;
+    border-radius: 8px; padding: 6px 14px;
+    background: rgb(var(--brand)); color: rgb(26 16 8);
+  }
+  .btn:hover { background: rgb(var(--brand-hover)); }
+  .btn--secondary {
+    background: rgb(var(--raised)); color: rgb(var(--fg));
+    border: 1px solid rgb(var(--edge-strong));
+  }
+  .btn--secondary:hover { background: rgb(var(--edge) / .6); }
+  .btn--ghost-danger {
+    background: none; color: rgb(var(--danger));
+    border: 1px solid rgb(var(--danger) / .35);
+  }
+  .btn--ghost-danger:hover { background: rgb(var(--danger) / .1); }
+  .btn[disabled] { opacity: .45; cursor: default; }
+
+  /* ── PlanPanel (mirrors RunView PlanPanel, warn-toned) ────────────────── */
+  .plan {
+    overflow: hidden; border-radius: 12px;
+    border: 1px solid rgb(var(--warn) / .5);
+    background: rgb(var(--warn) / .05);
+  }
+  .plan--parked { border-color: rgb(var(--info) / .4); background: rgb(var(--info) / .05); }
+  .plan-head {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px;
+    border-bottom: 1px solid rgb(var(--warn) / .3);
+    background: rgb(var(--warn) / .1);
+    padding: 12px 16px;
+  }
+  .plan--parked .plan-head { border-color: rgb(var(--info) / .25); background: rgb(var(--info) / .08); }
+  .plan-title { margin: 0; font-size: 14px; font-weight: 600; color: rgb(var(--warn)); display: flex; align-items: center; gap: 8px; }
+  .plan--parked .plan-title { color: rgb(var(--info)); }
+  .plan-sub { margin: 2px 0 0; font-size: 12px; color: rgb(var(--muted)); }
+  .plan-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .vchip {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11px; font-weight: 600; font-family: var(--font-mono);
+    border: 1px solid rgb(var(--warn) / .4); background: rgb(var(--warn) / .12);
+    color: rgb(var(--warn)); border-radius: 6px; padding: 1px 7px;
+  }
+  .plan--parked .vchip { border-color: rgb(var(--info) / .4); background: rgb(var(--info) / .12); color: rgb(var(--info)); }
+  .rounds { font-size: 11px; color: rgb(var(--faint)); align-self: center; }
+
+  .plan-body { padding: 16px; }
+  .plan-md {
+    max-height: 340px; overflow: auto;
+    border: 1px solid rgb(var(--edge));
+    background: rgb(var(--surface));
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    font-size: 13.5px; line-height: 1.55;
+  }
+  .plan-md h3 { margin: 0 0 8px; font-size: 14px; }
+  .plan-md ol { margin: 8px 0 0; padding-left: 22px; }
+  .plan-md li { margin: 5px 0; }
+  .plan-md li.changed {
+    background: rgb(var(--ok) / .09);
+    border-left: 2px solid rgb(var(--ok) / .6);
+    margin-left: -10px; padding: 3px 6px 3px 8px; border-radius: 4px;
+  }
+  .plan-md li.changed::after { content: " changed"; font-size: 10px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: rgb(var(--ok)); margin-left: 6px; }
+  .plan-md li.removed { color: rgb(var(--faint)); text-decoration: line-through; }
+  .plan-md li.removed::after { content: " dropped"; font-size: 10px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: rgb(var(--danger)); margin-left: 6px; text-decoration: none; }
+  .plan-md code { font-family: var(--font-mono); font-size: 12px; background: rgb(var(--raised)); border-radius: 4px; padding: 1px 5px; }
+
+  /* ── Revision thread under the plan ───────────────────────────────────── */
+  .thread { margin-top: 14px; display: flex; flex-direction: column; gap: 10px; }
+  .thread-label { font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: rgb(var(--faint)); }
+  .bubble {
+    border-radius: var(--radius);
+    padding: 10px 12px; font-size: 13.5px; line-height: 1.5;
+    max-width: 85%;
+  }
+  .bubble--user {
+    align-self: flex-end;
+    background: rgb(var(--brand) / .12);
+    border: 1px solid rgb(var(--brand) / .3);
+  }
+  .bubble--user .who { color: rgb(var(--brand)); }
+  .bubble--agent {
+    align-self: flex-start;
+    background: rgb(var(--surface));
+    border: 1px solid rgb(var(--edge));
+  }
+  .bubble--agent .who { color: rgb(var(--info)); }
+  .bubble .who { display: block; font-size: 11px; font-weight: 600; margin-bottom: 3px; }
+  .bubble .ts { font-weight: 400; color: rgb(var(--faint)); font-size: 10px; margin-left: 6px; font-variant-numeric: tabular-nums; }
+
+  /* ── Feedback composer (request-changes) ──────────────────────────────── */
+  .composer { margin-top: 14px; }
+  .composer textarea {
+    width: 100%; min-height: 74px; resize: vertical;
+    font-family: inherit; font-size: 13.5px; line-height: 1.5;
+    color: rgb(var(--fg));
+    background: rgb(var(--surface));
+    border: 1px solid rgb(var(--edge-strong));
+    border-radius: var(--radius);
+    padding: 10px 12px;
+  }
+  .composer textarea:focus { outline: 2px solid rgb(var(--brand) / .5); outline-offset: 1px; }
+  .composer-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 8px; }
+  .composer-hint { font-size: 11px; color: rgb(var(--faint)); }
+
+  /* ── Revising (in-progress) state ─────────────────────────────────────── */
+  .working { display: flex; align-items: center; gap: 10px; padding: 4px 2px; font-size: 13px; color: rgb(var(--muted)); font-style: italic; }
+  .spinner {
+    width: 14px; height: 14px; border-radius: 999px;
+    border: 2px solid rgb(var(--info) / .25); border-top-color: rgb(var(--info));
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+
+  /* ── Status chip (run header) ─────────────────────────────────────────── */
+  .runchip {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11px; font-weight: 500; border: 1px solid; border-radius: 6px; padding: 2px 8px;
+  }
+  .runchip--warn { color: rgb(var(--warn)); border-color: rgb(var(--warn) / .4); background: rgb(var(--warn) / .1); }
+  .runchip--info { color: rgb(var(--info)); border-color: rgb(var(--info) / .4); background: rgb(var(--info) / .1); }
+  .dot { width: 6px; height: 6px; border-radius: 999px; background: currentColor; }
+  .runchip--info .dot { animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
+  @media (prefers-reduced-motion: reduce) { .runchip--info .dot { animation: none; } }
+  .runhead { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .runhead h1 { margin: 0; font-size: 16px; font-weight: 600; }
+  .runhead .issue { font-family: var(--font-mono); font-size: 12px; color: rgb(var(--faint)); }
+
+  /* ── History accordion (collapsed v1) ─────────────────────────────────── */
+  .history {
+    margin-top: 14px;
+    border: 1px solid rgb(var(--edge));
+    border-radius: var(--radius);
+    background: rgb(var(--surface) / .5);
+  }
+  .history summary {
+    cursor: pointer; list-style: none;
+    display: flex; align-items: center; gap: 8px;
+    padding: 9px 12px; font-size: 12px; color: rgb(var(--muted));
+  }
+  .history summary::-webkit-details-marker { display: none; }
+  .history summary .chev { display: inline-flex; transition: transform .15s ease; color: rgb(var(--faint)); }
+  .history[open] summary .chev { transform: rotate(90deg); }
+  .history-body { border-top: 1px solid rgb(var(--edge)); padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+  .history-plan { font-size: 12.5px; color: rgb(var(--muted)); border-left: 2px solid rgb(var(--edge-strong)); padding-left: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p class="mock-note">
+    Mock — plan revision at the approval gate (follow-up PRD to #39). Three states of the same run, top to bottom.
+    New pieces vs. today: the <strong>Request changes</strong> action (composer disclosed only after
+    selecting it — same pattern as today's "Reject with reason"), the revision thread, the
+    <code>revising_plan</code>-flavored parked state, the <code>v2</code> chip, and the collapsed v1 history.
+    Approve / Reject semantics are unchanged.
+  </p>
+
+  <!-- ════════════════ STATE 1 ════════════════ -->
+  <div class="stage"><span>state 1 — <span class="k">gate open (default)</span></span></div>
+
+  <div class="runhead">
+    <h1>Add CSV export to the token usage report</h1>
+    <span class="issue">run #61 · issue #40</span>
+    <span class="runchip runchip--warn"><span class="dot"></span> awaiting approval</span>
+  </div>
+
+  <div class="plan">
+    <div class="plan-head">
+      <div>
+        <h2 class="plan-title">Plan awaiting your approval <span class="vchip">v1</span></h2>
+        <p class="plan-sub">The run is parked until you decide. Approve, request changes, or reject.</p>
+      </div>
+      <div class="plan-actions">
+        <span class="rounds">revision 0 of 3</span>
+        <button class="btn">Approve plan</button>
+        <button class="btn btn--secondary">Request changes</button>
+        <button class="btn btn--ghost-danger">Reject</button>
+      </div>
+    </div>
+    <div class="plan-body">
+      <div class="plan-md">
+        <h3>Plan</h3>
+        <ol>
+          <li>Add <code>GET /api/reports/usage.csv</code> — a new endpoint streaming the report as CSV.</li>
+          <li>Extend <code>usage_report</code> query with a per-run breakdown row set.</li>
+          <li>Add an admin toggle <code>REPORT_CSV_ENABLED</code> gating the endpoint.</li>
+          <li>Web: an <em>Export CSV</em> button on the Usage page calling the new endpoint.</li>
+          <li>Tests: handler test for the CSV shape, vitest for the button state.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <!-- ════════════════ STATE 1b ════════════════ -->
+  <div class="stage"><span>state 1b — <span class="k">"Request changes" selected: composer revealed</span></span></div>
+
+  <div class="runhead">
+    <h1>Add CSV export to the token usage report</h1>
+    <span class="issue">run #61 · issue #40</span>
+    <span class="runchip runchip--warn"><span class="dot"></span> awaiting approval</span>
+  </div>
+
+  <div class="plan">
+    <div class="plan-head">
+      <div>
+        <h2 class="plan-title">Plan awaiting your approval <span class="vchip">v1</span></h2>
+        <p class="plan-sub">Describe what should change; the other actions return if you cancel. (Same disclosure pattern as today's "Reject with reason".)</p>
+      </div>
+      <div class="plan-actions">
+        <span class="rounds">revision 0 of 3</span>
+      </div>
+    </div>
+    <div class="plan-body">
+      <div class="plan-md">
+        <h3>Plan</h3>
+        <ol>
+          <li>Add <code>GET /api/reports/usage.csv</code> — a new endpoint streaming the report as CSV.</li>
+          <li>Extend <code>usage_report</code> query with a per-run breakdown row set.</li>
+          <li>Add an admin toggle <code>REPORT_CSV_ENABLED</code> gating the endpoint.</li>
+          <li>Web: an <em>Export CSV</em> button on the Usage page calling the new endpoint.</li>
+          <li>Tests: handler test for the CSV shape, vitest for the button state.</li>
+        </ol>
+      </div>
+
+      <div class="composer">
+        <textarea>Don't add a new endpoint — the report data is already in the browser via GET /api/reports/usage; build the CSV client-side and drop step 1. Also skip the admin toggle, we don't gate read-only exports.</textarea>
+        <div class="composer-row">
+          <span class="composer-hint">Feedback goes to the planning session; the agent revises and the plan returns here for approval. 3 revision rounds max.</span>
+          <div style="display:flex; gap:8px;">
+            <button class="btn btn--secondary">Cancel</button>
+            <button class="btn">Send &amp; revise</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ════════════════ STATE 2 ════════════════ -->
+  <div class="stage"><span>state 2 — <span class="k">agent revising</span></span></div>
+
+  <div class="runhead">
+    <h1>Add CSV export to the token usage report</h1>
+    <span class="issue">run #61 · issue #40</span>
+    <span class="runchip runchip--info"><span class="dot"></span> revising plan</span>
+  </div>
+
+  <div class="plan plan--parked">
+    <div class="plan-head">
+      <div>
+        <h2 class="plan-title">Revising the plan <span class="vchip">v1 → v2</span></h2>
+        <p class="plan-sub">Your feedback was sent to the planning session. The updated plan will return here for approval.</p>
+      </div>
+      <div class="plan-actions">
+        <span class="rounds">revision 1 of 3</span>
+        <button class="btn btn--ghost-danger">Cancel run</button>
+      </div>
+    </div>
+    <div class="plan-body">
+      <div class="thread">
+        <span class="thread-label">Revision thread</span>
+        <div class="bubble bubble--user">
+          <span class="who">vlad <span class="ts">14:02</span></span>
+          Don't add a new endpoint — the report data is already in the browser via <code>GET /api/reports/usage</code>; build the CSV client-side and drop step 1. Also skip the admin toggle, we don't gate read-only exports.
+        </div>
+        <div class="working"><span class="spinner"></span> planner is reworking the plan…</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ════════════════ STATE 3 ════════════════ -->
+  <div class="stage"><span>state 3 — <span class="k">gate re-opened with plan v2</span></span></div>
+
+  <div class="runhead">
+    <h1>Add CSV export to the token usage report</h1>
+    <span class="issue">run #61 · issue #40</span>
+    <span class="runchip runchip--warn"><span class="dot"></span> awaiting approval</span>
+  </div>
+
+  <div class="plan">
+    <div class="plan-head">
+      <div>
+        <h2 class="plan-title">Updated plan awaiting your approval <span class="vchip">v2</span></h2>
+        <p class="plan-sub">Revised after your feedback. Approve, request more changes, or reject.</p>
+      </div>
+      <div class="plan-actions">
+        <span class="rounds">revision 1 of 3</span>
+        <button class="btn">Approve plan</button>
+        <button class="btn btn--secondary">Request changes</button>
+        <button class="btn btn--ghost-danger">Reject</button>
+      </div>
+    </div>
+    <div class="plan-body">
+      <div class="plan-md">
+        <h3>Plan (v2)</h3>
+        <ol>
+          <li class="removed">Add <code>GET /api/reports/usage.csv</code> — a new endpoint streaming the report as CSV.</li>
+          <li class="changed">Web: build the CSV client-side from the data already returned by <code>GET /api/reports/usage</code> (no new endpoint, no extra query).</li>
+          <li class="removed">Add an admin toggle <code>REPORT_CSV_ENABLED</code> gating the endpoint.</li>
+          <li>Web: an <em>Export CSV</em> button on the Usage page triggering the client-side download.</li>
+          <li class="changed">Tests: vitest for the CSV serializer (escaping, delimiters) and the button state; no handler test needed.</li>
+        </ol>
+      </div>
+
+      <div class="thread">
+        <span class="thread-label">Revision thread</span>
+        <div class="bubble bubble--user">
+          <span class="who">vlad <span class="ts">14:02</span></span>
+          Don't add a new endpoint — the report data is already in the browser via <code>GET /api/reports/usage</code>; build the CSV client-side and drop step 1. Also skip the admin toggle, we don't gate read-only exports.
+        </div>
+        <div class="bubble bubble--agent">
+          <span class="who">planner <span class="ts">14:04</span></span>
+          Reworked: dropped the endpoint and the toggle. The CSV is now serialized in the browser from the existing report payload — steps 2 and 5 adjusted accordingly. One trade-off to flag: very large reports (&gt;50k rows) will serialize in the main thread; acceptable for the current report sizes.
+        </div>
+      </div>
+
+      <details class="history">
+        <summary>
+          <span class="chev">❯</span>
+          Plan v1 · superseded 14:04 · 1 revision round used
+        </summary>
+        <div class="history-body">
+          <div class="history-plan">
+            1. Add <code>GET /api/reports/usage.csv</code> — a new endpoint streaming the report as CSV.<br>
+            2. Extend <code>usage_report</code> query with a per-run breakdown row set.<br>
+            3. Add an admin toggle <code>REPORT_CSV_ENABLED</code> gating the endpoint.<br>
+            4. Web: an <em>Export CSV</em> button on the Usage page calling the new endpoint.<br>
+            5. Tests: handler test for the CSV shape, vitest for the button state.
+          </div>
+        </div>
+      </details>
+    </div>
+  </div>
+</div>
+</body>
+</html>

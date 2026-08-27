@@ -1,0 +1,1160 @@
+# uzi Helm chart — GENERIC defaults (cluster-agnostic).
+#
+# Per-cluster values (image registry overrides, the public host, FRONTEND_ORIGIN,
+# TRUSTED_PROXIES, the CNPG image/storageClass/backup target) live in a
+# per-cluster values file in your own GitOps repo, layered on top by BOTH deploy paths:
+#   - an ArgoCD Application (multi-source: the OCI chart + a $values ref to that
+#     per-cluster values file in your GitOps repo)
+#   - a manual `helm upgrade -f <cluster-values>.yaml`
+# So this file MUST stay deployable to any cluster: do NOT put a concrete host /
+# endpoint / storageClass / image tag here.
+#
+# SECRETS: nothing secret lives in this file or in any values file. JWT_SECRET,
+# UZI_SECRET_KEY, the optional UZI_SEED_* seeds, and the Postgres/Harbor creds all
+# arrive from Infisical (infisicalList below) or are CNPG-generated. The api's
+# refuse-to-start-on-placeholder-key guard is the backstop.
+
+nameOverride: ""
+fullnameOverride: "uzi"
+
+# How the runtime Secrets are provided.
+#   existing (default): the chart creates NO secret-management CRs; it assumes
+#     `uzi-secrets` (and, for a private image registry, a pull secret) already exist
+#     as plain k8s Secrets. Provide them however you like — `kubectl create secret`,
+#     External Secrets Operator, Sealed Secrets, SOPS, or your CD tool. The api reads
+#     `uzi-secrets` by secretKeyRef. Turnkey for a public install: the GHCR images
+#     need no pull secret, so you only supply `uzi-secrets` (JWT_SECRET, UZI_SECRET_KEY,
+#     plus any optional Slack/OIDC/seed keys).
+#   infisical: ALSO create the InfisicalSecret CRs from `infisicalList` below so a
+#     cluster running the Infisical operator syncs `uzi-secrets` + any pull secret.
+#     Opt-in; a per-cluster values file selects it. The KinD smoke uses `existing`.
+# The CNPG `-app` DB secret is operator-generated in both modes.
+secrets:
+  mode: existing
+
+# Image pull secret (dockerconfigjson) for a PRIVATE image registry. EMPTY by default:
+# the public images (`ghcr.io/vtmocanu/uzi/*`) are anonymous-pullable and need none, and
+# the api/web/controller pod specs omit `imagePullSecrets` when this is empty. Set it to
+# the NAME of a pre-created dockerconfigjson Secret (or, under secrets.mode: infisical, a
+# name an infisicalList entry syncs) when the images live in a private registry.
+imagePullSecret:
+  name: ""
+
+# --- imageVerification: cosign signature enforcement (OFF by default) ------------
+# A Kyverno ClusterPolicy that admits an image only if it carries a valid cosign
+# keyless signature from uzi's release workflow (release.yml signs every image + the
+# chart by digest). OFF by default and gated, exactly like workers.enabled: this
+# template renders NOTHING unless you turn it on.
+#
+# PREREQUISITE (read before enabling): the policy is a `kyverno.io/v1 ClusterPolicy`,
+# so KYVERNO MUST ALREADY BE INSTALLED in the cluster. If it is not, the kind is
+# unknown and `helm install`/ArgoCD sync FAILS on this object — it is not a no-op.
+# This chart deliberately does NOT bundle Kyverno.
+#
+# START IN Audit. `enforce: Audit` logs violations without blocking admission; flip to
+# `Enforce` only once you have confirmed every uzi image verifies (`cosign verify`,
+# see docs/container-signing.md). Enforcing before signatures are in place — or with a
+# wrong identity/issuer — will block the very pods this chart deploys.
+imageVerification:
+  enabled: false
+  # Audit (log only, safe default) | Enforce (block unsigned/unverified admission).
+  enforce: Audit
+  # Which images the policy checks. Defaults to uzi's own image namespace; a fork that
+  # re-signs under its own registry overrides this glob.
+  imageGlob: "ghcr.io/vtmocanu/uzi/*"
+  # Keyless (Sigstore) verification pins WHO signed and via WHICH OIDC issuer.
+  #   identityRegexp — a regex matched against the signer certificate identity, i.e.
+  #     uzi's release workflow at any release tag. A fork sets this to its own
+  #     …/release.yml ref.
+  #   issuer — the OIDC issuer; GitHub Actions' is the constant below.
+  keyless:
+    # Single-quoted: the backslash-escaped dots are literal regex, not YAML escapes.
+    identityRegexp: '^https://github\.com/vtmocanu/uzi/\.github/workflows/release\.yml@refs/tags/.*$'
+    issuer: "https://token.actions.githubusercontent.com"
+
+# --- api: the Go backend (sole holder of secrets/keys, the DB client) -----------
+api:
+  enabled: true
+  image:
+    repository: ghcr.io/vtmocanu/uzi/api
+    # Unset => follows Chart.appVersion (Model B). Pin only to override per-cluster.
+    tag: ""
+    pullPolicy: IfNotPresent
+  # HARD SINGLETON (do NOT raise): FOUR independent reasons the api cannot run
+  # >1 replica today — the forge poller + run sweeper hold single-goroutine
+  # in-memory state (two replicas double-poll/double-sweep), the Slack Socket Mode
+  # manager would double-handle events, store.Migrate runs goose at boot with
+  # NO advisory lock (two pods booting concurrently race the migrations), and PRD
+  # #108 M4/M5's persistence-failure streak counters plus their "other runs are
+  # succeeding on THIS instance" comparison set are in-process
+  # (api/internal/workersvc/persistfail.go).
+  #
+  # That fourth one is worth the extra sentence because it fails SILENTLY where the
+  # other three fail loudly. Split traffic means neither pod's streak reaches the
+  # threshold and each pod's comparison set is a fraction of reality, so auto-stop
+  # simply STOPS FIRING — it does not misfire. A guard that quietly disarms looks
+  # exactly like a healthy fleet, which is why it is written down here rather than
+  # left to be discovered.
+  #
+  # Paired with strategy: Recreate below (RollingUpdate's surge would briefly run two).
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      # 512Mi -> 1Gi (PRD #122 M8). The api's steady state is tiny (~37Mi measured),
+      # but the M8 checkpoint push broker (pushbroker) spikes ~194 MB RSS per publish
+      # (a shallow go-git base fetch + thin-pack apply + push; the pre-shallow full
+      # fetch spiked 742 MB and OOM-killed this pod). 1Gi is headroom for a few
+      # CONCURRENT publishes (single-publish already fits under 512Mi post-shallow-fix).
+      # A publish-concurrency semaphore in the api would let this drop back; tracked as
+      # a follow-up.
+      memory: 1Gi
+  # The api Service. Named "api" (see uzi.apiServiceName) so the web nginx
+  # `proxy_pass http://api:8080` resolves it — same-origin, no CORS.
+  service:
+    name: api
+    port: 8080
+  # DB connection Secret for database.mode cnpg / external (IGNORED under simple, which
+  # points the api at its own generated <fullname>-postgres Secret — see database.mode).
+  # Under cnpg this is the CNPG-generated <cluster>-app Secret's `uri` key: secretName
+  # follows the CNPG cluster's fullnameOverride (postgres-uzi-cluster) + "-app". Under
+  # external, set these to your own pre-created Secret + DSN key. REQUIRED at boot
+  # (config.Load errors on an empty DATABASE_URL), so it is NOT optional: the pod waits
+  # for the secret (under cnpg, created at sync-wave -5, before the api at wave 0).
+  database:
+    secretName: postgres-uzi-cluster-app
+    secretKey: uri
+  # Non-secret env -> ConfigMap (envFrom). Only keys that differ from config.go's
+  # safe defaults need setting; the environment-specific ones (FRONTEND_ORIGIN,
+  # TRUSTED_PROXIES, FORGE_ALLOWED_BASE_URLS) live in deploy/values/<cluster>.yaml.
+  config:
+    API_ADDR: ":8080"
+    # OIDC group-based roles/access (PRD #55) — all NON-secret ConfigMap values
+    # (group names are not secrets, so they live here, not in secretEnv). Require
+    # OIDC configured (issuer/client-id in api.config per-cluster + the client secret
+    # in secretEnv above). Uncomment + set per-cluster to enable; empty admin/allowed
+    # groups = feature dormant. Matching is exact + case-sensitive. See docs/oidc.md.
+    # UZI_OIDC_GROUPS_CLAIM: groups
+    # UZI_OIDC_ADMIN_GROUPS: uzi-admins
+    # UZI_OIDC_ALLOWED_GROUPS: uzi-users
+    # Ephemeral hosted workers (PRD #529) — auto-provision a throwaway hosted
+    # worker for a run whose capability no online worker satisfies, torn down
+    # when the run finishes. OFF by default: requires hosted-worker hosting
+    # enabled (the controller must run — uzi.apiHostingEnabled) AND the admin DB
+    # setting `ephemeral_workers_enabled` turned on (PUT /settings) AND the
+    # per-user opt-in. These env knobs only TUNE an already-enabled feature;
+    # leave them unset to use config.go's defaults. Uncomment to override.
+    # UZI_EPHEMERAL_MAX_PER_USER: "2"          # per-user concurrent-ephemeral cap
+    # UZI_EPHEMERAL_DEFAULT_SIZE: m            # provision size preset: s|m|l
+    # UZI_EPHEMERAL_PROVISION_DEADLINE: 10m    # GC deadline for never-booted / idle-stolen workers
+  # Infisical-synced secret env: ENV_VAR -> the key in the `uzi-secrets` Secret.
+  # JWT_SECRET and UZI_SECRET_KEY are REQUIRED (the api refuses to boot without
+  # them — that guard is the backstop, so the k8s secretKeyRef stays optional:true
+  # and a missing key surfaces as a clear boot error, not a stuck ContainerCreating).
+  # The UZI_SEED_* entries are OPTIONAL one-time seeds: uncomment an entry AND add
+  # the matching key to the Infisical /uzi folder to use it. Slack/OIDC secrets
+  # follow the same add-a-line pattern (see docs/ + config.go for the full set).
+  secretEnv:
+    JWT_SECRET: JWT_SECRET
+    UZI_SECRET_KEY: UZI_SECRET_KEY
+    # Optional startup seeds (all belong to the seed admin; see config.go):
+    # UZI_SEED_EMAIL: UZI_SEED_EMAIL
+    # UZI_SEED_PASSWORD: UZI_SEED_PASSWORD
+    # UZI_SEED_NAME: UZI_SEED_NAME
+    # UZI_SEED_FORGE_PAT: UZI_SEED_FORGE_PAT
+    # UZI_SEED_ANTHROPIC_TOKEN: UZI_SEED_ANTHROPIC_TOKEN
+    # Slack integration (PRD #25) — overlay tokens or one-time seeds:
+    # SLACK_BOT_TOKEN: SLACK_BOT_TOKEN
+    # SLACK_APP_TOKEN: SLACK_APP_TOKEN
+    # OIDC SSO (PRD #45) — client secret is env-only (never DB):
+    # UZI_OIDC_CLIENT_SECRET: UZI_OIDC_CLIENT_SECRET
+  # Probes. Startup covers the goose boot migration (nothing listens until it
+  # finishes, then /api/health 200s); readiness gates serving on DB reachability
+  # (/api/health pings the pool); liveness is a dumb socket check so a transient DB
+  # blip does NOT restart the singleton (a restart cannot fix an upstream DB
+  # outage — it only churns).
+  startupProbe:
+    httpGet:
+      path: /api/health
+      port: http
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 60
+  readinessProbe:
+    httpGet:
+      path: /api/health
+      port: http
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  livenessProbe:
+    tcpSocket:
+      port: http
+    periodSeconds: 20
+    timeoutSeconds: 3
+    failureThreshold: 6
+  # --- Optional TLS listener on the api (PRD #58 Decision 4) -------------------
+  #
+  # WHAT IT IS FOR: the hosted workers and the worker controller dial the api
+  # DIRECTLY (no nginx in the path), and a claim response carries the user's
+  # DECRYPTED forge PAT and Anthropic token. dev-cluster is a shared cluster
+  # running arbitrary dev pods, so that plaintext does not cross the pod network.
+  # Nothing else changes: users still reach uzi through the ingress -> web -> the
+  # PLAIN api port, which never leaves the namespace and is policed by
+  # networkPolicy above.
+  #
+  # ADDITIVE, NEVER A REPLACEMENT. Off (this default) the api binds :8080 alone and
+  # behaves exactly as it always has — compose is unaffected by all of this. On, it
+  # binds BOTH: :8080 for web's nginx and the kubelet probes, and this port for the
+  # workers. Turn it on together with the hosted-worker feature; on its own it just
+  # opens a port nothing dials.
+  #
+  # The api reads PATHS (API_TLS_CERT/API_TLS_KEY) from a mounted Secret and
+  # re-reads them when they change, so a cert-manager renewal needs no restart.
+  tls:
+    enabled: false
+    port: 8443
+    # The Secret holding tls.crt + tls.key (and ca.crt, which is what the clients
+    # mount). Empty => <fullname>-api-tls, which is what the Certificate below
+    # writes. Set it to a PRE-CREATED Secret when certManager.enabled is false.
+    secretName: ""
+    # The cluster's DNS domain, for the FQDN on the certificate. The hosted workers
+    # live in another namespace and can only dial the api by FQDN, so this is the
+    # name that actually gets verified.
+    clusterDomain: cluster.local
+    # Extra SANs, if something dials the api by a name the four Service names below
+    # do not cover (see api-certificate.yaml).
+    extraDNSNames: []
+    certManager:
+      # false => the chart creates no Certificate and you supply tls.secretName
+      # yourself (an external PKI, or a cluster with no cert-manager).
+      enabled: true
+      # WHICH ISSUER. Empty (the default) => the chart ships its own
+      # selfSigned -> CA -> leaf chain, scoped to this release.
+      #
+      # This is not a fallback, it is the correct answer for this hop: the name
+      # being certified is `api.<ns>.svc.cluster.local`, and dev-cluster's only
+      # ClusterIssuer is ACME (letsencrypt-prod, DNS-01 on the dev.example.com
+      # zone), which cannot issue for a cluster-internal name — no public challenge
+      # can validate one. Per-app selfsigned chains are what the rest of the cluster
+      # already does for internal hops (ingress-nginx, keycloak, otel).
+      #
+      # Point this at a real internal CA (Issuer or ClusterIssuer) if one ever
+      # exists; the chart then issues from it and skips its own chain.
+      issuerRef:
+        name: ""
+        kind: Issuer
+        group: cert-manager.io
+      # Leaf lifetime: the ordinary 90/30. Renewal is picked up live by the api.
+      duration: 2160h
+      renewBefore: 720h
+      # CA lifetime. Long, because rotating the ROOT means re-trusting it in the
+      # controller and every hosted worker pod at once — it is not the routine
+      # rotation, the leaf is.
+      caDuration: 43800h
+      caRenewBefore: 2160h
+
+  # Default-deny ingress on the api pods, allowing ONLY the web pods (the reverse
+  # proxy) to reach api:8080. This is the LOAD-BEARING control on a shared cluster
+  # like dev-cluster: without it any pod (e.g. coder.example.com runs
+  # arbitrary dev code) could hit the api ClusterIP directly, bypass web nginx, and
+  # spoof X-Forwarded-For to defeat the per-IP auth rate limit. (Rate limiting is the
+  # whole impact: uzi persists no client IP, so there are no "audit IPs" to forge —
+  # this comment used to claim otherwise. Verified 2026-07-17: ClientIP has three call
+  # sites, all in ratelimit.go, and no migration defines an IP column.)
+  # example-app has no such policy (it runs on the non-shared mgmt cluster).
+  networkPolicy:
+    enabled: true
+    # kubelet liveness/readiness/startup probes originate from the NODE IP (host
+    # network), which no podSelector can match. On CNIs that subject probe traffic
+    # to NetworkPolicy (Antrea, Calico), the node CIDR must be allowed here or
+    # the api never goes Ready (startup probe dropped -> CrashLoop). Set per-cluster
+    # to the dev-cluster node InternalIP CIDR(s). Empty = rely on the CNI exempting
+    # host->pod probe traffic; CONFIRM at M6 before trusting empty.
+    probeCIDRs: []
+
+# --- hosted workers: the namespace, its RBAC, its policies, the controller -------
+#
+# M3 built the security ENVELOPE (namespace, RBAC, quotas, policies); M6 added the
+# CONTROLLER that fills it and the api-side hosting flags. `workers.enabled` now
+# turns on a working feature rather than an inert namespace — except with
+# `controller.enabled: false`, which keeps M3's envelope-only shape (the KinD smoke
+# is the one consumer).
+#
+# SHIPS DISABLED. Compose deployments are zero-diff by construction (they render no
+# chart), and a cluster that has not opted in gets no extra namespace.
+workers:
+  # TURNING THIS ON REQUIRES api.tls.enabled: true. Not a convention — the chart
+  # REFUSES TO RENDER otherwise (uzi.workerAPIPort), because the two flags live in
+  # separate blocks and nothing else couples them. With TLS off, hosted workers get
+  # admitted to the api's plaintext 8080, which serves the FULL router and does not
+  # strip X-Forwarded-For: /api/auth/* comes back into a worker's reach, and a worker
+  # pod's IP is inside TRUSTED_PROXIES so it can forge its own rate-limit key. That
+  # combination works perfectly and is silently insecure, which is exactly why it is
+  # a template error rather than a line of advice.
+  enabled: false
+  # The escape hatch for the ONE case that legitimately has no TLS: a throwaway test
+  # cluster with no cert-manager (deploy/values/kind-smoke.yaml). NEVER set this on a
+  # real deployment — a cluster without cert-manager still sets api.tls.enabled: true
+  # and supplies a pre-created api.tls.secretName. It exists so that deviation is
+  # VISIBLE in the values file that chose it, instead of being an inherited default.
+  allowPlaintextAPI: false
+  # The DEDICATED namespace, which must contain NOTHING but hosted workers. A Role
+  # that can create pods in a namespace can mount any Secret and impersonate any
+  # ServiceAccount in it — RBAC cannot scope `create` by label — so this namespace's
+  # emptiness is precisely what bounds a compromised controller. Do not park anything
+  # else here.
+  namespace: uzi-workers
+  # The workers' own zero-permission ServiceAccount (worker namespace), bound to no
+  # Role anywhere, token never automounted.
+  serviceAccountName: uzi-hosted-worker
+  # The controller's ServiceAccount (RELEASE namespace) — the only kube credential in
+  # uzi. The identity + Role were created together in M3 so the boundary is one
+  # reviewable unit; M6's Deployment below is what runs under it.
+  controllerServiceAccountName: uzi-controller
+
+  # --- the controller Deployment (M6) -------------------------------------------
+  #
+  # The component that turns the envelope above into running workers. It is the ONLY
+  # thing in uzi holding a kube credential (Decision 1) — the api holds none and must
+  # never hold one.
+  controller:
+    # Off with workers.enabled: true = M3's envelope-only shape: the namespace, RBAC,
+    # quotas and policies exist and nothing runs in them. The api's hosting flags
+    # follow this flag, not workers.enabled, and that coupling is deliberate: hosting
+    # on with no controller means users provision workers that no process ever
+    # materializes — a row that sits pending until its token expires, visible only as
+    # a worker that never comes online (Decision 10).
+    #
+    # The KinD smoke is the one place false is right: it exercises what KinD can
+    # prove (admission, the /nix seed, object rendering) and has neither a controller
+    # image nor a controller token.
+    enabled: true
+    image:
+      repository: ghcr.io/vtmocanu/uzi/controller
+      # Unset => follows Chart.appVersion (Model B), exactly like api/web.
+      tag: ""
+      pullPolicy: IfNotPresent
+    # HARD SINGLETON, for the same class of reason the api is one: two controllers
+    # would poll and reconcile the same fleet concurrently, racing each other's
+    # create/patch/delete against one namespace. Paired with strategy: Recreate.
+    # The reconcile is idempotent, so this is about avoiding pointless churn and
+    # duplicate work, not about correctness of a single pass.
+    replicaCount: 1
+    # It polls, renders and applies — no compilation, no large payloads. The api's
+    # own requests are 50m/128Mi and it does far more.
+    resources:
+      requests:
+        cpu: 25m
+        memory: 64Mi
+      limits:
+        memory: 256Mi
+    # Empty => the controller's own defaults (10s poll, 15s HTTP timeout). Both are
+    # ordinary Go durations ("30s", "1m").
+    pollInterval: ""
+    httpTimeout: ""
+    # --- the controller's bearer credential (Decision 2) --------------------------
+    #
+    # TWO values, ONE secret, and they MUST be kept in sync by whoever sets them:
+    #   * tokenSecretKey     — the PLAINTEXT token. Mounted as a FILE into the
+    #                          controller (never an env var: /proc/<pid>/environ is
+    #                          the leak docs/proc-hardening.md closed for the worker,
+    #                          and the same argument applies to this credential).
+    #   * tokenHashSecretKey — its sha256, HEX-encoded. Read by the API as an env var.
+    #                          A hash is not a credential: holding it does not let you
+    #                          authenticate, so env is fine for this half.
+    #
+    # Generate the pair:
+    #   TOKEN=$(openssl rand -base64 32)
+    #   printf '%s' "$TOKEN" | shasum -a 256      # the hex hash
+    # then put BOTH in Infisical /uzi (or the pre-created uzi-secrets under
+    # secrets.mode: existing).
+    #
+    # THE CHART DELIBERATELY DOES NOT GENERATE THIS. A `randAlphaNum` default would
+    # re-render on every `helm upgrade` and silently rotate the credential, which is
+    # the one failure an operator cannot see coming. Sourcing it like every other
+    # secret keeps rotation an explicit act.
+    #
+    # A rotation that updates only ONE of the two FAILS CLOSED, in both directions:
+    # the controller's polls 401 and it stops reconciling. Nothing is admitted that
+    # should not be — the cost is an outage (hosted workers stop being created,
+    # rolled or torn down; existing ones keep running on their own join tokens), never
+    # a bypass. Rotate both, then restart the controller so it re-reads the file.
+    tokenSecretKey: UZI_CONTROLLER_TOKEN
+    tokenHashSecretKey: WORKER_HOSTING_CONTROLLER_TOKEN_SHA256
+
+  # --- the drain policy (PRD #422 M5) ---------------------------------------------
+  #
+  # How the controller resolves a deliberate image roll (advancing workers.image.tag)
+  # of a worker that is BUSY. The default M4 behaviour cordons the busy worker and
+  # DEFERS the roll until it finishes its run(s); these two knobs bound and override
+  # that so a run parked at an approval gate can never hold the old image forever.
+  #
+  # drainDeadline: how long a cordoned busy worker delays the roll before the controller
+  #   rolls it ANYWAY and its in-flight run requeues (Decision 4). An ordinary Go
+  #   duration ("24h", "1h", "30m"). The reconcile loop is stateless, so the elapsed time
+  #   is measured from the api-supplied draining_since, not from any controller memory.
+  drainDeadline: "24h"
+  # forceRoll: the EMERGENCY override — roll every drifted worker immediately regardless
+  #   of busy, accepting the in-flight requeue (e.g. a CVE that must not wait on a drain).
+  #   It only accelerates a PENDING roll (a drifted worker); it never invents one. Leave
+  #   false in normal operation and flip it true only for the duration of the emergency.
+  forceRoll: false
+
+  # --- the per-template agent images the controller renders (M6) ------------------
+  #
+  # The REPO PREFIX only. The controller appends "/agent-<template>:<tag>"
+  # (controller/internal/preset), so this must equal what CI publishes: the GitHub
+  # Actions publish (.github/workflows/release.yml) pushes the agent images under this
+  # value + "/agent".
+  #
+  # A template the product offers (api/internal/workertmpl) but CI never published
+  # provisions a worker that sits in ImagePullBackOff forever — which in v1 surfaces
+  # only as a worker that never comes online. The two lists are kept equal by review,
+  # not by a gate.
+  image:
+    repository: ghcr.io/vtmocanu/uzi
+    # A CONCRETE pinned worker version, decoupled from Chart.appVersion (PRD #422
+    # Decision 1/3). This reverses the old Model B lockstep (tag "" => appVersion): an
+    # app-only release (bumping Chart.version/appVersion for an api/web/chart change)
+    # does NOT move this tag, so it rolls ZERO worker pods. Advancing it is a deliberate
+    # operator step and is what rolls every hosted worker onto a new agent release
+    # (Decision 9) — the controller stamps this literal string into the pod-spec hash,
+    # so the fleet rolls as its workers finish their runs. It must be concrete: the
+    # controller-deployment template wraps it in `required`, so a blank tag fails the
+    # render loudly rather than shipping an empty image reference.
+    tag: "0.65.1"
+  # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
+  # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
+  # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image
+  # is kind-loaded). Materialized by worker-pull-secret.yaml — deliberately its own
+  # template rather than an infisicalList entry, since its lifecycle is workers.enabled
+  # and not the release's.
+  imagePullSecretName: ""
+  # Where that robot comes from. The SHARED k8s-clusters project, exactly like the
+  # release namespace's copy (uzi's own runtime secrets live in the app-secrets project;
+  # only the Harbor robot is shared — the same split infisicalList already makes).
+  pullSecretSource:
+    projectSlug: your-infisical-project
+    envSlug: prod
+    secretsPath: /registry-robot
+  # StorageClass for the worker PVCs. Empty = the cluster default.
+  #
+  # Worth a moment at rollout: dev-cluster's standard is volumeBindingMode Immediate,
+  # while standard-latebinding (WaitForFirstConsumer) is safer for a 2-PVC pod. uzi's
+  # own CNPG already runs on standard here, so this is a default worth thinking about,
+  # not a blocker.
+  storageClass: ""
+  # The per-hosted-worker run-slot cap (→ UZI_WORKER_MAX_CONCURRENT_RUNS → the pod's
+  # WORKER_MAX_CONCURRENT_RUNS). Default 1 (safe): a hosted worker takes ONE run at a
+  # time regardless of size. Raising it opts into the intra-user concurrency residuals
+  # documented in docs/worker-setup.md (PRD #58 Decision 7) and means a busy worker no
+  # longer leaves a user's other runs queued behind it — so size the preset to fit that
+  # many concurrent runs. The controller rejects a non-integer or a value < 1 at boot.
+  #
+  # This is still a per-worker cap, not a fleet placement policy — since PRD #216
+  # the server itself spreads queued runs across idle workers inside the claim, so
+  # you no longer need to lower this to 1 to get one-run-per-worker spread. Raising
+  # it for burst capacity on one worker no longer risks piling two simultaneously
+  # queued runs onto whichever worker happens to poll first while a sibling sits idle.
+  maxConcurrentRuns: 1
+  # The WORKER container's requests.ephemeral-storage (issue #224 →
+  # UZI_WORKER_EPHEMERAL_REQUEST). Docker workers get workers.docker.ephemeralRequest
+  # INSTEAD of this, not on top of it.
+  #
+  # Why it exists: a worker pod that declares nothing is ranked as using infinitely
+  # more than it requested, so it is the FIRST thing kubelet evicts under node disk
+  # pressure — and an evicted worker's in-flight run loses its entire working tree,
+  # silently. Declaring a request buys scheduler placement and eviction RANKING.
+  #
+  # Read this before tuning it, because the two directions fail very differently:
+  #   - TOO LOW is today's behaviour. Probabilistic, recoverable, and visible in a
+  #     kubelet message that names the cause.
+  #   - TOO HIGH is UNSCHEDULABLE: total, deterministic and SILENT, presenting as a
+  #     worker that provisions and never appears. The quota cannot warn you, because
+  #     a quota on this resource cannot bind (see the docker tier's ephemeralStorage
+  #     comment). So when unsure, err LOW.
+  #
+  # 512Mi is ~10x kubelet's default per-container log-rotation ceiling (10Mi x 5),
+  # which is essentially all a plain worker keeps on ephemeral storage: its working
+  # tree lives on the /data PVC, not on an emptyDir.
+  #
+  # NEVER add a matching LIMIT, here or in limitRange. A limit on ANY container makes
+  # kubelet enforce the SUM of declared limits against pod usage that includes the
+  # emptyDirs, which is a new deterministic eviction path that fires with no node
+  # pressure at all — the exact failure this value exists to reduce, arriving on
+  # schedule instead of by luck. The controller's render.go states the three
+  # mechanisms and a unit test enforces it.
+  ephemeralRequest: 512Mi
+  # Namespace ResourceQuota (Decision 8). Defense in depth under the api's per-user
+  # quota: an app-level bug must not noisy-neighbour a shared cluster.
+  #
+  # Sized for the 20 workers `deployments` below advertises, at the WORST-CASE size:
+  # 10 CPU / 40Gi requested, and 20 x (20Gi data + 20Gi nix) = 800Gi of PVC. STORAGE
+  # is the binding constraint, not CPU or memory. dev-cluster's real budget is M6's
+  # rollout conversation.
+  #
+  # WORST CASE MEANS `l`, NOT `m`, AND THAT IS THE WHOLE POINT OF THE NUMBER. Nothing
+  # scopes a size to a tier — preset.SizeNames() is global and render.go feeds
+  # spec.Size.DataSize to both tiers — so any of these 20 workers may be an `l` with a
+  # 20Gi /data. Sizing on `m` (10Gi) gave 600Gi, which caps at 15 `l` workers against
+  # a tier advertising 20: the 16th is refused with a QUOTA error rather than a
+  # scheduling one, and no test in this repo can see it. If `l` should not be
+  # available here, the fix is to scope it off the tier, not to under-budget.
+  #
+  # THE NIX TERM IS 20Gi, NOT THE 4Gi THIS COMMENT CARRIED UNTIL ISSUE #224. PRD #87
+  # bumped nixSize (controller/internal/preset/preset.go) for the prebaked Chromium
+  # closure and did not follow the value into this arithmetic, so the quota was
+  # 2.86x too small for the fleet its own comment claimed to size — at 280Gi this
+  # tier held 7 `l` workers, not 20. Raising a quota PROVISIONS NOTHING (it is a
+  # ceiling on claims, not a reservation), so the correction costs zero storage until
+  # the workers actually exist. If nixSize or a preset's DataSize moves again, this
+  # number moves with it.
+  #
+  # SIDE EFFECT, and it is load-bearing: a quota on requests.CPU or requests.MEMORY
+  # makes admission reject any pod with a container declaring no requests —
+  # initContainers included. The controller renders them explicitly for exactly this
+  # reason.
+  #
+  # THOSE TWO RESOURCES ONLY. This comment said "requests.*" until issue #224, which
+  # is false: the quota evaluator intersects a quota's tracked resources against a
+  # hardcoded set of cpu and memory, and upstream calls that a frozen mistake it will
+  # not extend. Every other requests.* key here is a CEILING that is counted, never a
+  # rule that is enforced — a pod declaring nothing for it is admitted and counted as
+  # zero. The docker tier's ephemeralStorage key is the live example of what that
+  # costs.
+  quota:
+    enabled: true
+    requestsCPU: "10"
+    requestsMemory: 40Gi
+    requestsStorage: 800Gi
+    persistentVolumeClaims: "40"
+    # READ BY A CONTROLLER TEST, not merely documented here. This is the restricted
+    # tier's fleet size, and TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes
+    # (controller/internal/kube) parses it out of this file to check that a full fleet
+    # of workers' ephemeral-storage requests still fits the node pool. Changing it here
+    # changes what that test asserts, which is the point: it used to hold a hardcoded
+    # copy, so raising a fleet size left it green while the fleet no longer fit.
+    deployments: "20"
+  # The backstop, never the source: every hosted worker pod arrives from the
+  # controller with explicit requests + limits from its size preset.
+  #
+  # `max` MUST stay >= the LARGEST preset's limits (l = 4 CPU / 12Gi) or that preset
+  # stops being admissible — which would surface as a worker that provisions and never
+  # appears. maxPVCStorage likewise >= l's /data (20Gi).
+  #
+  # maxPVCStorage IS AT ITS CEILING ON EVERY CLAIMANT TODAY: nixSize is 20Gi and `l`'s
+  # DataSize is 20Gi, so LOWERING this value makes every worker's claim inadmissible and
+  # nothing renders red — the rejection happens at admission, in the cluster, and the
+  # worker simply never appears. The two guards that catch it are
+  # TestPresetPVCSizesFitTheChartsLimitRangeMax (controller/internal/preset, for the two
+  # sizes compiled into the controller, which carries this number as a constant and must
+  # be edited with it) and the chart's own worker-invariants.yaml (for chart-supplied
+  # PVC sizes). Raise quota.requestsStorage above whenever you raise this.
+  limitRange:
+    enabled: true
+    default:
+      cpu: "2"
+      memory: 4Gi
+    defaultRequest:
+      cpu: 500m
+      memory: 2Gi
+    max:
+      cpu: "4"
+      memory: 12Gi
+    maxPVCStorage: 20Gi
+  # --- the docker-capable worker tier (PRD #83 M3, PRD #89) ---------------------
+  #
+  # A SECOND, DEDICATED namespace running `pod-security.kubernetes.io/enforce:
+  # privileged`, for workers that opted into a Docker-in-Docker sidecar so their agent
+  # can run `docker`/`docker compose`. It is a SEPARATE namespace on purpose: the
+  # privileged tier's blast radius must never touch the restricted default above
+  # (Decision 7 / Q-B). The restricted `namespace` stays exactly as it is — nothing
+  # here weakens it.
+  #
+  # OFF by default. The DinD posture is a PER-CLUSTER toggle (PRD #89, `rootless` below):
+  #   - rootless:true (default) — the PRD #83 rootless-DinD sidecar (unprivileged uid
+  #     inside a privileged, fenced namespace); the recommended stance, and it needs
+  #     nodes with unprivileged userns (kernel.unprivileged_userns_clone=1).
+  #   - rootless:false — a NON-ROOTLESS privileged sidecar (dockerd as REAL ROOT on
+  #     pod-loopback TCP), for clusters whose nodes cannot do rootless. dev-cluster
+  #     (unprivileged userns off at the node kernel) is one, so it sets rootless:false. Its residual is
+  #     node root, gated behind acknowledgeNonRootlessNodeRoot (see below).
+  # sysbox (runtimeClassName: sysbox-runc) remains the documented path to a
+  # non-privileged tier once a cluster can run it; it is NOT installed and NOT required.
+  docker:
+    # Turning this on creates the privileged namespace, its quota/limits, the worker
+    # SA + pull secret in it, and the controller's Role there. It also makes the
+    # controller render docker workers (UZI_WORKER_DOCKER_NAMESPACE + the sidecar
+    # image). With it off, a worker provisioned with docker=true is SKIPPED by the
+    # controller (a loud error, never rendered into the restricted default).
+    enabled: false
+    # The dedicated privileged namespace. MUST differ from workers.namespace — the
+    # controller refuses to boot if they are equal (the separation is the point).
+    namespace: uzi-workers-docker
+    # --- DinD posture (PRD #89): the per-cluster rootless toggle -------------------
+    #
+    # Default ROOTLESS (the safe, recommended stance — PRD #83). Set false ONLY on
+    # clusters whose nodes cannot run rootless dockerd (no unprivileged userns, e.g.
+    # dev-cluster (unprivileged userns off at the node kernel): the controller then renders a
+    # NON-ROOTLESS privileged DinD sidecar — dockerd as REAL ROOT bound to pod-loopback
+    # TCP (127.0.0.1:2375). Nothing changes on any cluster that keeps rootless.
+    #
+    # The residual under rootless:false is NODE ROOT reachable by untrusted repo
+    # content (a prompt-injectable agent reaches the root daemon and can `docker run
+    # --privileged` out to the node) — the owner-accepted risk. So it is refused unless
+    # acknowledgeNonRootlessNodeRoot is ALSO true (worker-invariants.yaml), mirroring
+    # the networkPolicy.acknowledgeUnfenced idiom: a loud, visible operator choice.
+    rootless: true
+    # The acknowledgement of the node-root residual, REQUIRED to render rootless:false.
+    # An opt-in in the values file that chose it, never an inherited default. Ignored
+    # while rootless:true.
+    acknowledgeNonRootlessNodeRoot: false
+    # The pinned DinD sidecar images, ONE PER POSTURE (OQ-A resolved: hybrid). The chart
+    # SELECTS by `rootless` (uzi.workerDinDImage) and passes the winner to the controller
+    # as UZI_WORKER_DIND_IMAGE, so a cluster flips posture with a bare `rootless:false`
+    # and no second image line — while digest pinning is preserved. Both are
+    # digest-pinned and share the other tracks' pins: rootlessImage == docker-compose.yml
+    # `dind`; nonRootlessImage is a plain `docker:*-dind` image (the retired GitLab pipeline used a `docker:28-dind` service for the same purpose).
+    # One image ref serves both the sidecar and the tiny root socket-prep helper.
+    rootlessImage: docker:29-dind-rootless@sha256:8a213afdd096a44dff403aaf8eb58b7a96a63113f18a4b094b98b7d0ed7d948b
+    nonRootlessImage: docker:29-dind@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07
+    # Explicit image override: non-empty is used VERBATIM instead of the posture
+    # selection above (still subject to the coherence fail-guard, which rejects a
+    # -dind-rootless image with rootless:false, or a plain -dind image with
+    # rootless:true). Empty selects rootlessImage/nonRootlessImage by `rootless`.
+    image: ""
+    # The docker tier's OWN NetworkPolicy (auditor MUST, blocking for LIVE enablement).
+    # The restricted ns's worker-networkpolicy.yaml + worker-fqdn-egress.yaml hardcode
+    # workers.namespace, so this namespace would otherwise be default-ALLOW — and a
+    # privileged DinD worker could `docker run --network=host` to reach CNPG / other
+    # ClusterIPs / the apiserver, and expose the dind daemon port cluster-wide. This
+    # vanilla networking.k8s.io/v1 policy closes IN-CLUSTER lateral egress + ALL ingress
+    # (Half A). EXTERNAL egress filtering — the Anthropic-token / repo-exfil residual —
+    # stays PRD #50's job (Half B), NOT closed here.
+    #
+    # Default enabled:false so it renders nothing when the docker tier is off. It MUST
+    # be set true, with the cluster's REAL CIDRs, BEFORE enabling docker workers live —
+    # argo-apps:apps/uzi/values/dev-cluster.yaml pre-stages dev-cluster's CIDRs + enables it.
+    networkPolicy:
+      enabled: false
+      # The escape hatch for the fail-guard (worker-invariants.yaml): with docker on and
+      # this NetworkPolicy off, the chart REFUSES TO RENDER, because a privileged docker
+      # tier with no in-cluster egress fence is the "on by accident, unfenced" posture.
+      # Set this true ONLY to deliberately run unfenced — a throwaway cluster whose CNI
+      # enforces no NetworkPolicy (kind), where the policy would be created and silently
+      # ignored anyway. NEVER on a real deployment: enable networkPolicy with real CIDRs
+      # instead. Visible in the values file that chose it, not an inherited default.
+      acknowledgeUnfenced: false
+      # The in-cluster ranges EXCLUDED from the 0.0.0.0/0 egress allow, so a docker
+      # worker can pull images from the internet but cannot reach in-cluster ClusterIPs,
+      # pod IPs, the apiserver, or the metadata/link-local IP. CLUSTER-SPECIFIC — the
+      # defaults below are common guesses; set the real values per cluster.
+      podCIDR: 10.244.0.0/16
+      serviceCIDR: 10.96.0.0/12
+      linkLocalCIDR: 169.254.0.0/16
+      # Extra CIDRs to also exclude from the internet allow (appended to the three
+      # above). The node CIDR belongs here — reaching a node IP is reaching the kubelet,
+      # which the restricted tier's Antrea policy already drops. Per-cluster.
+      extraExcept: []
+    # Namespace ResourceQuota for the docker tier (Decision 8's floor, per-tier).
+    # Docker workers cost MORE than a plain one: the worker preset PLUS the DinD
+    # sidecar (~1-2 GiB / ~1 CPU, arch §Q4) PLUS the daemon's image/build cache — which
+    # since issue #224 M-a is its OWN PVC (dindDataSize below), not an emptyDir on node
+    # ephemeral storage.
+    #
+    # Sized for the 10 workers `deployments` advertises, at THREE PVCs each:
+    # 10 x (20Gi data + 20Gi nix + 20Gi dind) = 600Gi, and 10 x 3 = 30 claims. The data
+    # term is `l`'s, the worst case. STORAGE is the binding constraint here too — and it
+    # already was before M-a: at 140Gi / 20 claims this tier held 3 `l` workers against
+    # the 10 it advertises, so the triple was never self-consistent. Raising a quota
+    # PROVISIONS NOTHING (a ceiling on claims, not a reservation), so this costs zero
+    # storage until the workers exist.
+    quota:
+      enabled: true
+      requestsCPU: "8"
+      requestsMemory: 32Gi
+      requestsStorage: 600Gi
+      # BOTH CLAUSES OF WHAT THIS COMMENT USED TO SAY WERE FALSE, and issue #224 M-a
+      # falsified the first of them a second time over. It read: "emptyDir dind data
+      # roots land on node ephemeral storage; bound it so a runaway image pull cannot
+      # fill a node."
+      #
+      #   - The dind data root is a PVC as of M-a, charged to requests.storage above.
+      #     It is not on node ephemeral storage at all. (And while it WAS an emptyDir,
+      #     a ResourceQuota never observed its usage either — quota accounts declared
+      #     requests, not consumption.)
+      #   - This key cannot bound a runaway image pull, and could not have. Unlike
+      #     requests.cpu / requests.memory it can never FORCE a container to declare
+      #     the resource: the quota evaluator's validation set is cpu and memory only,
+      #     which upstream calls a frozen mistake and explicitly says not to extend.
+      #     So `used` reads "0" for any pod that declares nothing — exactly the
+      #     situation that let a node fill up and get a worker EVICTED (issue #224).
+      #
+      # It is kept as an honest ceiling on what workers DECLARE, which is what the
+      # controller's per-worker requests.ephemeral-storage feeds. It is not a guard
+      # against consumption, and nothing should be sized on the belief that it is.
+      ephemeralStorage: 200Gi
+      persistentVolumeClaims: "30"
+      # READ BY A CONTROLLER TEST — see the restricted tier's `deployments` above.
+      # TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes parses this value to
+      # check a full fleet's ephemeral-storage requests against the node pool, and
+      # docker workers are the expensive half (4Gi each against the plain tier's
+      # 512Mi). Raising this to 20 makes a full fleet need 90 GiB against a 70.2 GiB
+      # pool, and that test is what says so.
+      deployments: "10"
+    # The backstop, never the source (the controller renders explicit requests+limits
+    # on every container, sidecars included). `max` must stay >= the largest worker
+    # preset's limits PLUS the sidecar's, or the biggest docker worker stops being
+    # admissible.
+    limitRange:
+      enabled: true
+      default:
+        cpu: "2"
+        memory: 4Gi
+      defaultRequest:
+        cpu: 500m
+        memory: 2Gi
+      max:
+        cpu: "4"
+        memory: 12Gi
+      # THREE claimants sit exactly on this ceiling: dindDataSize below, nixSize (20Gi)
+      # and `l`'s DataSize (20Gi). Raising any of them without raising this makes that
+      # claim inadmissible, and nothing renders red — the LimitRange rejects it at
+      # admission and the worker provisions and never appears. dindDataSize is guarded
+      # against this value in worker-invariants.yaml; the other two are Go constants a
+      # chart cannot read and are guarded by TestPresetPVCSizesFitTheChartsLimitRangeMax
+      # (controller/internal/preset), which carries this number as a constant and must be
+      # edited alongside it. Raise quota.requestsStorage above whenever you raise this.
+      maxPVCStorage: 20Gi
+    # The DinD sidecar's resource requests + limits (PRD #89 0.8.1). The controller renders
+    # the sidecar with these (flattened to UZI_WORKER_DIND_{REQUEST,LIMIT}_{CPU,MEMORY}).
+    # The default (250m/256Mi req, 2/2Gi lim) is enough for `docker`/compose that pulls
+    # prebuilt images, but IN-DAEMON image BUILDS OOM it (uzi's own e2e builds 5 images
+    # inside the daemon), so a cluster that runs real docker work raises them per-cluster
+    # (dev-cluster sets 500m/2Gi req, 4/6Gi lim). RAISE THE REQUEST alongside the limit:
+    # a large limit with a tiny request lets the scheduler place the pod on a node without
+    # the memory and OOM it under contention. Limits must stay within limitRange.max above
+    # (per-container ceiling: 4 CPU / 12Gi). Any field left empty falls back to the
+    # controller's built-in default.
+    dindResources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      limits:
+        cpu: "2"
+        memory: 2Gi
+    # The DinD daemon's data root — its image and build cache — as a PER-WORKER PVC
+    # (issue #224 M-a → UZI_WORKER_DIND_DATA_SIZE). It was an emptyDir, and an
+    # emptyDir's bytes are charged to the POD's ephemeral-storage usage, so a large
+    # image pull made the worker the pod kubelet EVICTED under node disk pressure —
+    # which destroys the in-flight run's working tree with no trace beyond a normal-
+    # looking re-claim. On a PVC the daemon just runs out of room: the docker step
+    # fails with ENOSPC, the pod lives, the tree lives.
+    #
+    # 20Gi is also the CEILING, not just the default: limitRange.maxPVCStorage above
+    # is 20Gi and the limitranger validates PVC creates, so a larger value is rejected
+    # at admission. Raise both together, and raise quota.requestsStorage with them.
+    # worker-invariants.yaml refuses to render the mismatched pair, so this is a
+    # `helm install` error rather than a worker that provisions and never appears.
+    #
+    # RAISING THIS ON A LIVE CLUSTER IS A NO-OP FOR EVERY EXISTING DOCKER WORKER, and
+    # that is by design rather than a bug to report. The pod's spec hash covers the
+    # claim's NAME and never its size, and PVCs here are never patched (a size change
+    # is delete + reprovision), so nothing rolls and nothing errors. New workers get
+    # the new size; existing ones keep theirs until they are reprovisioned.
+    #
+    # THE CACHE NOW PERSISTS ACROSS ROLLS AND NOTHING GC's IT — the same residual the
+    # controller documents for /nix. The emptyDir at least died with the pod; this
+    # only grows into a fixed volume. `docker system prune` is the remedy (an agent
+    # can run it); otherwise it is delete + reprovision, as everywhere else here.
+    # Empty falls back to the controller's built-in 20Gi.
+    dindDataSize: 20Gi
+    # The DOCKER worker container's requests.ephemeral-storage (issue #224 →
+    # UZI_WORKER_DOCKER_EPHEMERAL_REQUEST). It REPLACES workers.ephemeralRequest for
+    # this tier rather than adding to it; read that key's comment first, all of which
+    # applies here, including the never-a-limit rule.
+    #
+    # Larger than the plain tier's 512Mi for one structural reason: the run-workdir
+    # emptyDir is mounted ONLY for a docker worker, and it holds the run's entire
+    # working tree — one clone per run, times maxConcurrentRuns, with $TMPDIR pointed
+    # at the same volume. A plain worker's working tree is on the /data PVC instead
+    # and never touches ephemeral storage at all. uzi's own repo is a ~170 MiB runner
+    # clone before a single dependency install; 4Gi covers roughly two concurrent
+    # heavy runs.
+    #
+    # It is 4Gi rather than the larger figure an emptyDir-based design needed because
+    # dindDataSize above moved the daemon's image cache to a PVC, which was ~99% of
+    # the measured footprint. Re-derive what is left on ephemeral storage before
+    # raising it.
+    ephemeralRequest: 4Gi
+  # The CNI-INDEPENDENT floor: default-deny both directions, plus the two in-cluster
+  # destinations an FQDN rule structurally cannot express (AntreaProxy rewrites a
+  # ClusterIP before policy enforcement, so FQDN cannot match a Service).
+  networkPolicy:
+    enabled: true
+    dns:
+      # Where the cluster's DNS runs. DNS egress is NOT optional: Antrea learns an
+      # FQDN's addresses by snooping DNS RESPONSES, so blocking DNS makes every FQDN
+      # rule below match nothing at all.
+      namespace: kube-system
+      podSelector:
+        k8s-app: kube-dns
+    # Allow workers to reach uzi's OWN in-cluster web Service (PRD #87 §5 / M5). A
+    # browser-capable worker running `web-ux` drives uzi's web UI, which this floor
+    # otherwise denies (it allows only DNS + the api). Selector-based, NOT an FQDN
+    # rule: Antrea's FQDN ANNP cannot match an in-cluster Service — AntreaProxy
+    # rewrites the ClusterIP to a pod IP BEFORE policy enforcement (the same reason
+    # the api allow above is selector-based). OFF by default so a cluster opts in
+    # explicitly; dev-cluster turns it on. TIGHT by construction — the web component
+    # in the release namespace, on the web pod port only (worker-networkpolicy.yaml).
+    allowWebService: false
+    # Extra egress rules, appended verbatim. For a cluster that needs an in-cluster
+    # destination the two rules above do not cover (a substituter mirror, a proxy).
+    extraEgress: []
+  # Named egress, Antrea-native (crd.antrea.io). OFF by default: it needs Antrea, and
+  # a cluster without it would just get a rejected manifest.
+  #
+  # Off is FAIL-CLOSED, not fail-open — the k8s floor still denies everything but DNS
+  # and the api, so a worker without this simply cannot reach its forge.
+  #
+  # dev-cluster turns it on (argo-apps:apps/uzi/values/dev-cluster.yaml); the KinD smoke leaves it
+  # off (no Antrea there, and kindnet enforces no NetworkPolicy whatsoever).
+  fqdnEgress:
+    enabled: false
+    tier: application
+    priority: 5
+    # DROPPED FIRST, and not redundant with the default-deny floor: an FQDN rule
+    # programs the datapath with whatever IPs the DNS RESPONSE carried, so a poisoned
+    # answer for an allowed name mapping to the metadata IP would open egress to it
+    # THROUGH the allow rule. Per-cluster (the apiserver/node CIDRs differ).
+    denyCIDRs:
+      - name: drop-cloud-metadata
+        cidr: 169.254.169.254/32
+    # Expand from a REAL provisioning failure, never from prediction. Values-driven so
+    # a missing name does not need a code change and a release to fix.
+    #
+    # NOTE: this list is REPLACED, not merged, by any per-cluster values that define
+    # their own `allowFQDNs` (argo-apps:apps/uzi/values/dev-cluster.yaml does). Helm does not merge
+    # arrays — an entry added here alone reaches no cluster that overrides the list.
+    # Add to BOTH.
+    allowFQDNs:
+      - name: allow-anthropic
+        fqdn: "*.anthropic.com"
+        ports: [443]
+      - name: allow-nix-substituters
+        fqdn: "cache.nixos.org"
+        ports: [443]
+      # `helm dependency build` for THIS chart's CNPG `cluster` subchart, so an agent
+      # editing deploy/chart/ can render it in-worker instead of committing blind and
+      # learning from CI's helm_chart job minutes later. This IS the "expand from a REAL
+      # provisioning failure" the note above asks for: the measured failure is `helm
+      # template` refusing with "found in Chart.yaml, but missing in charts/ directory:
+      # cluster" on a worker (2026-07-27). The subchart is now fetched from the OCI
+      # registry oci://ghcr.io/cloudnative-pg/charts (pinned in Chart.yaml + Chart.lock).
+      #
+      # TWO hosts, not one — the OCI pull splits across a registry and a blob CDN, proven
+      # by a live pull (issue #285):
+      #   ghcr.io                              -> manifest + anonymous pull token
+      #   pkg-containers.githubusercontent.com -> 307 target for the blob layers
+      #                                           (config + the cluster-0.6.1.tgz)
+      # BOTH are needed — a manifest-only reachability check against ghcr.io alone passes
+      # while the actual layer pull still fails at the blob host.
+      #
+      # This REPLACED the previous four GitHub-ish hosts (cloudnative-pg.github.io,
+      # cloudnative-pg.io, github.com, release-assets.githubusercontent.com). Notably
+      # github.com — the general-purpose "any repo, any release asset" host, the widest
+      # entry this list ever carried — is gone, swapped for a registry + blob-CDN pair
+      # with no arbitrary repo or code access.
+      - name: allow-cnpg-oci-registry
+        fqdn: "ghcr.io"
+        ports: [443]
+      - name: allow-cnpg-oci-blobs
+        fqdn: "pkg-containers.githubusercontent.com"
+        ports: [443]
+
+# --- web: nginx serving the SPA + reverse-proxying /api/* to the api Service -----
+web:
+  enabled: true
+  image:
+    repository: ghcr.io/vtmocanu/uzi/web
+    tag: ""
+    pullPolicy: IfNotPresent
+  # Stateless (SPA + reverse proxy): safe to run >1 for availability. 2 gives a
+  # rolling update without a blip.
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
+  service:
+    port: 80
+  # nginx reverse-proxy config, rendered into a ConfigMap (web-configmap.yaml) and
+  # mounted over the image's compiled-in /etc/nginx/conf.d/default.conf. This is the
+  # k8s variant of web/nginx.conf: it APPENDS X-Forwarded-For
+  # ($proxy_add_x_forwarded_for) instead of OVERWRITING it ($remote_addr) — in k8s
+  # the immediate client is the ingress-nginx controller, so overwriting would
+  # collapse every user into one per-IP rate-limit bucket and lose client IPs. The
+  # compose web/nginx.conf stays overwrite (its immediate client IS the browser).
+  nginx:
+    # api upstream Service name + port (must equal the api Service).
+    apiServiceName: api
+    apiPort: 8080
+    # Upstream resolution mode:
+    #  - false (default): `proxy_pass http://<apiService>:<port>` — nginx resolves
+    #    the Service name ONCE at worker start. Safe here because the api Service is
+    #    applied together with the Deployment (ArgoCD) and its ClusterIP is stable;
+    #    the only wrinkle is that DELETING+recreating the api Service strands the
+    #    cached ClusterIP until the web pods restart (documented, rare).
+    #  - true: emit an nginx `resolver` + a variable upstream so the Service name is
+    #    re-resolved at request time (survives a Service recreate). REQUIRES
+    #    web.nginx.resolver set to the cluster's kube-dns/CoreDNS ClusterIP.
+    dynamicResolution: false
+    # The cluster DNS resolver IP (only used when dynamicResolution: true). Find it
+    # with `kubectl -n kube-system get svc kube-dns -o jsonpath={.spec.clusterIP}`.
+    resolver: ""
+  ingress:
+    enabled: true
+    className: nginx
+    # Per-cluster: the public host (deploy/values/<cluster>.yaml).
+    host: ""
+    path: /
+    pathType: Prefix
+    annotations:
+      # WS idle timeout: web nginx allows 3600s on /api/ws, but ingress-nginx
+      # defaults proxy-read-timeout to 60s and would cull idle live-run sockets at
+      # the controller. Raise both so a quiet-but-live socket survives (REST replay
+      # self-heals, but churn is avoided).
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # dev-cluster serves a *.example.com default wildcard cert at the
+    # controller, so no per-host TLS block is needed there. Set tls.enabled: true +
+    # a secretName (and a cert-manager annotation) for a cluster without one.
+    tls:
+      enabled: false
+      secretName: uzi-tls
+
+# --- Runtime secrets via Infisical (opt-in; used only when secrets.mode: infisical) ---
+# When selected, the chart renders InfisicalSecret CRs (from infisicalList) so a cluster
+# running the Infisical operator syncs `uzi-secrets` + any pull secret. Dormant under the
+# default secrets.mode: existing. Point hostAPI at your own Infisical instance.
+infisical:
+  enabled: true
+  hostAPI: https://infisical.example.com/api
+  resyncInterval: 600
+  authSecretName: universal-auth-credentials
+  authSecretNamespace: infisical-operator
+  # The Opaque Secret the api reads its secret env from (secretKeyRef). MUST equal
+  # the infisicalList entry that creates it (secretName: uzi-secrets).
+  app:
+    managedSecretName: uzi-secrets
+
+# One InfisicalSecret per entry (rendered only under secrets.mode: infisical). To add a
+# secret, append an entry — no new template. `secretName` values MUST match what the
+# workloads reference: `uzi-secrets` == infisical.app.managedSecretName (the api's secret
+# env); a pull-secret entry's `secretName` == imagePullSecret.name.
+#
+# This is an EXAMPLE — a per-cluster values file typically REPLACES the whole list (Helm
+# does not merge lists) with its own project/env/path scopes. The example syncs the api's
+# runtime secrets from `/uzi`; a cluster using a private image registry adds a second
+# dockerconfigjson entry whose secretName it sets as imagePullSecret.name. syncWave "-10"
+# applies the InfisicalSecrets before the workloads so `uzi-secrets` exists on first
+# deploy instead of a transient api CrashLoop (self-heal is the real recovery; this just
+# cuts the churn).
+infisicalList:
+  - name: infsec-uzi
+    projectSlug: your-infisical-project
+    envSlug: prod
+    secretsPath: /uzi
+    secretName: uzi-secrets
+    secretType: Opaque
+    syncWave: "-10"
+
+# Restricted-PodSecurity contexts (satisfy the `restricted` standard everywhere;
+# harmless where it is not enforced).
+#
+# api: distroless static-nonroot image (uid/gid 65532); the server writes nothing
+# to disk, so its root fs is read-only (a small emptyDir covers /tmp for TLS/temp).
+api_podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+api_containerSecurityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# controller: same distroless static-nonroot base as the api (uid/gid 65532), same
+# posture. It writes nothing to disk (a small emptyDir covers /tmp).
+#
+# fsGroup is what makes its two mounted files readable: a secret volume's files are
+# owned by ROOT with the group set to fsGroup, never by runAsUser (measured on a real
+# kubelet in M3). Without it the controller cannot read its own bearer token.
+controller_podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+controller_containerSecurityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# web: nginx-unprivileged (uid/gid 101). Root fs left writable: nginx writes its
+# pid, cache and temp under /var and /tmp at runtime.
+web_podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 101
+  runAsGroup: 101
+  fsGroup: 101
+  seccompProfile:
+    type: RuntimeDefault
+web_containerSecurityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  capabilities:
+    drop: ["ALL"]
+
+# --- Database backend selector --------------------------------------------------
+# uzi REQUIRES Postgres. Choose exactly ONE backend with database.mode; all three
+# converge on the api's single DATABASE_URL secret ref (api.database), so the api
+# Deployment is identical across modes.
+#   simple   (DEFAULT — public / self-host): the chart runs a single plain
+#            postgres:17 StatefulSet + PVC in-namespace and auto-generates the
+#            password, so a stranger's `helm install` just works with no operator and
+#            no external deps. NOT highly available (one replica).
+#   cnpg     (production): the CloudNativePG operator subchart (postgres.* below).
+#            Requires the CNPG operator in the cluster; set postgres.enabled: true.
+#            The internal per-cluster values use this.
+#   external (bring your own): pre-create a Secret holding a DATABASE_URL DSN and point
+#            api.database.secretName / secretKey at it; the chart runs no DB of its own.
+# A mode/postgres.enabled mismatch fails the render (see uzi.validateDatabaseMode).
+database:
+  mode: simple
+  simple:
+    image:
+      repository: postgres
+      tag: "17"
+      pullPolicy: IfNotPresent
+    # DB name + owning role, created on first boot by the postgres image entrypoint.
+    user: uzi
+    database: uzi
+    # Empty => a random 32-char alphanumeric password is generated on first install and
+    # PRESERVED across `helm upgrade` (via a lookup of the existing Secret). Set a value
+    # for GitOps / reproducible installs — it MUST be URL-safe (it is embedded in the DSN).
+    password: ""
+    storage:
+      size: 8Gi
+      # "" => the cluster's default StorageClass. On a multi-node cluster prefer a
+      # WaitForFirstConsumer class so the PVC binds to the pod's node.
+      storageClass: ""
+    # /dev/shm size (k8s defaults it to 64Mi; postgres parallel query / large sorts want more).
+    shmSize: 256Mi
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 1Gi
+    # Stock postgres runs as uid/gid 999; match the restricted PodSecurity standard.
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 999
+      runAsGroup: 999
+      fsGroup: 999
+      seccompProfile:
+        type: RuntimeDefault
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      privileged: false
+      capabilities:
+        drop: ["ALL"]
+
+# --- CloudNativePG Postgres (subchart, aliased `postgres`) ----------------------
+# Used ONLY with database.mode: cnpg. uzi REQUIRES a database (unlike example-app, which wired CNPG for a future feature).
+# SHIPS DISABLED here (generic default, so the chart stays cluster-agnostic — no
+# concrete image/storageClass/S3 target); every cluster that deploys uzi turns it on
+# in deploy/values/<cluster>.yaml and supplies those. The api's DATABASE_URL is
+# wired to the CNPG-generated postgres-uzi-cluster-app Secret (api.database above).
+#
+# Postgres image: the per-cluster values pin a specific tag from a private registry
+# mirror (cloudnative-pg). dev-cluster standardizes on 16.x (fleet-consistent
+# + confirmed mirrored); do NOT copy example-app's PG18 image here. (dev-cluster's CNPG
+# operator 1.23.5 supports up to PG17, so 16.x is a fleet-convention choice, not an
+# operator-imposed ceiling.)
+postgres:
+  enabled: false
+  type: postgresql
+  # standalone = a single primary + in-cluster HA replicas; NO cross-site standby.
+  mode: standalone
+  # The CNPG `Cluster` object name. Stable; the generated secrets
+  # (postgres-uzi-cluster-app, ...) and the S3 serverName follow it.
+  fullnameOverride: postgres-uzi-cluster
+  version:
+    # Major series; the pinned imageName in the per-cluster values is authoritative
+    # for the exact tag. Keep this major in sync with that tag.
+    postgresql: "16"
+  cluster:
+    # Protect the DB from ArgoCD prune: without Prune=false a chart refactor /
+    # rollback / disabling postgres would let Argo delete the Cluster + its PVCs.
+    # sync-wave -5 brings the DB (and its -app secret) up before the api (wave 0).
+    annotations:
+      argocd.argoproj.io/sync-wave: "-5"
+      argocd.argoproj.io/sync-options: Prune=false
+    # Dev sizing: single instance (no HA). Raise per-cluster for stage/prod.
+    instances: 1
+    # Cluster-specific (a private registry mirror) -> set in deploy/values/<cluster>.yaml.
+    imageName: ""
+    imagePullSecrets: []
+    storage:
+      size: 5Gi
+      storageClass: ""        # per-cluster (e.g. standard)
+    walStorage:
+      enabled: true
+      size: 5Gi
+      storageClass: ""        # per-cluster
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 1Gi
+    primaryUpdateMethod: switchover
+    primaryUpdateStrategy: unsupervised
+    # No superuser secret: the app connects as the `-app` role (DATABASE_URL from
+    # the postgres-uzi-cluster-app secret), so the unused `postgres` superuser
+    # credential is dead weight / extra attack surface.
+    enableSuperuserAccess: false
+    # Single-instance dev cluster: a PodDisruptionBudget (subchart default true)
+    # has no failover target and would wedge node drains/upgrades. Disable it.
+    enablePDB: false
+    # Off by default: dev-cluster does not necessarily ship the PodMonitor /
+    # PrometheusRule CRDs. A cluster with the Prometheus operator can flip these on.
+    monitoring:
+      enabled: false
+      podMonitor:
+        enabled: false
+      prometheusRule:
+        enabled: false
+    initdb:
+      # The application database + owning role created at bootstrap.
+      database: uzi
+      owner: uzi
+  # Backups OFF by default (M5 open question: confirm the s3://postgres-<cluster>
+  # bucket exists + wire the barman S3 creds from Infisical before enabling). The
+  # per-cluster values decide; see argo-apps:apps/uzi/values/dev-cluster.yaml.
+  backups:
+    enabled: false

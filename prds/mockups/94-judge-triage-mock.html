@@ -1,0 +1,381 @@
+<title>Judge triage — mock</title>
+<style>
+  :root {
+    color-scheme: dark;
+    /* uzi "ember" tokens (web/src/index.css), verbatim */
+    --bg: 8 10 15;
+    --surface: 15 18 26;
+    --raised: 23 27 38;
+    --edge: 39 45 60;
+    --edge-strong: 58 66 86;
+    --fg: 228 232 240;
+    --muted: 148 158 176;
+    --faint: 122 133 154;
+    --brand: 251 146 60;
+    --brand-hover: 253 186 116;
+    --on-brand: 26 16 8;
+    --ok: 52 211 153;
+    --warn: 251 191 36;
+    --danger: 251 113 133;
+    --info: 56 189 248;
+    --radius: 0.625rem;
+    --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1100px 620px at 50% -12%, rgb(var(--brand) / 0.05), transparent 60%),
+      rgb(var(--bg));
+    color: rgb(var(--fg));
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    line-height: 1.5;
+    padding: 40px 20px 72px;
+  }
+
+  .wrap { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 22px; }
+
+  .lede { display: flex; flex-direction: column; gap: 6px; margin-bottom: 2px; }
+  .lede h1 { margin: 0; font-size: 1.05rem; font-weight: 650; letter-spacing: -0.01em; }
+  .lede p { margin: 0; color: rgb(var(--faint)); font-size: 0.8rem; max-width: 60ch; }
+
+  .card {
+    background: rgb(var(--surface));
+    border: 1px solid rgb(var(--edge));
+    border-radius: var(--radius);
+    padding: 16px;
+  }
+
+  .eyebrow {
+    font-size: 0.68rem; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.09em; color: rgb(var(--faint));
+  }
+
+  /* ── NEW marker (only in this mock, not shipped chrome) ── */
+  .new {
+    font-size: 0.56rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em;
+    color: rgb(var(--brand)); border: 1px dashed rgb(var(--brand) / 0.55);
+    border-radius: 999px; padding: 1px 7px; line-height: 1.6; white-space: nowrap;
+  }
+
+  /* ── Badges (tinted pills, ember Badge component) ── */
+  .badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 0.7rem; font-weight: 600; line-height: 1;
+    padding: 4px 9px; border-radius: 999px; border: 1px solid;
+  }
+  .b-info    { color: rgb(var(--info));   background: rgb(var(--info) / 0.12);   border-color: rgb(var(--info) / 0.3); }
+  .b-warn    { color: rgb(var(--warn));   background: rgb(var(--warn) / 0.12);   border-color: rgb(var(--warn) / 0.3); }
+  .b-ok      { color: rgb(var(--ok));     background: rgb(var(--ok) / 0.12);     border-color: rgb(var(--ok) / 0.3); }
+  .b-danger  { color: rgb(var(--danger)); background: rgb(var(--danger) / 0.12); border-color: rgb(var(--danger) / 0.3); }
+  .b-neutral { color: rgb(var(--muted));  background: rgb(var(--raised));        border-color: rgb(var(--edge)); }
+
+  code, .mono { font-family: var(--font-mono); }
+  .target {
+    font-family: var(--font-mono); font-size: 0.72rem; color: rgb(var(--fg));
+    background: rgb(var(--raised)); border-radius: 5px; padding: 2px 6px;
+  }
+
+  .row-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .spacer { flex: 1 1 auto; }
+  .via { font-size: 0.72rem; color: rgb(var(--faint)); }
+
+  /* ── Segmented triage meter ── */
+  .meter { display: flex; height: 8px; border-radius: 999px; overflow: hidden; background: rgb(var(--raised)); margin-top: 4px; }
+  .meter span { display: block; height: 100%; }
+  .seg-todo      { background: rgb(var(--edge-strong)); }
+  .seg-filed     { background: rgb(var(--info)); }
+  .seg-done      { background: rgb(var(--ok)); }
+  .seg-dismissed { background: rgb(var(--muted) / 0.55); }
+
+  .counts { display: flex; flex-wrap: wrap; gap: 16px 20px; margin-top: 12px; }
+  .count { display: flex; align-items: baseline; gap: 7px; }
+  .count b { font-size: 1.02rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .count small { font-size: 0.72rem; color: rgb(var(--faint)); text-transform: uppercase; letter-spacing: 0.05em; }
+  .dot { width: 8px; height: 8px; border-radius: 999px; display: inline-block; }
+  .d-todo { background: rgb(var(--edge-strong)); }
+  .d-filed { background: rgb(var(--info)); }
+  .d-done { background: rgb(var(--ok)); }
+  .d-dismissed { background: rgb(var(--muted) / 0.55); }
+
+  /* ── Recommendation rows ── */
+  .recs { display: flex; flex-direction: column; gap: 10px; margin-top: 4px; }
+  .rec {
+    border: 1px solid rgb(var(--edge)); border-radius: 9px;
+    background: rgb(var(--raised) / 0.45); padding: 12px 13px;
+    display: flex; flex-direction: column; gap: 9px;
+  }
+  .rec.settled { opacity: 0.62; }
+  .rec .rationale { margin: 0; font-size: 0.82rem; color: rgb(var(--muted)); }
+
+  .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+
+  .btn {
+    font: inherit; font-size: 0.74rem; font-weight: 600; cursor: pointer;
+    border-radius: 7px; padding: 6px 11px; border: 1px solid transparent;
+    display: inline-flex; align-items: center; gap: 6px; line-height: 1;
+  }
+  .btn-primary { background: rgb(var(--brand)); color: rgb(var(--on-brand)); }
+  .btn-primary:hover { background: rgb(var(--brand-hover)); }
+  .btn-ghost { background: transparent; color: rgb(var(--muted)); border-color: rgb(var(--edge-strong)); }
+  .btn-ghost:hover { color: rgb(var(--fg)); border-color: rgb(var(--faint)); }
+  .btn-link { background: none; border: none; padding: 4px 2px; color: rgb(var(--faint)); font-size: 0.72rem; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+  .btn-link:hover { color: rgb(var(--fg)); }
+  .caret { font-size: 0.6rem; opacity: 0.8; }
+
+  .filed-note { font-size: 0.74rem; color: rgb(var(--muted)); display: inline-flex; align-items: center; gap: 6px; }
+  .filed-note a { color: rgb(var(--info)); text-decoration: none; }
+  .filed-note a:hover { text-decoration: underline; }
+
+  /* ── Dismiss dropdown (shown open on one row) ── */
+  .menu-anchor { position: relative; }
+  .menu {
+    margin-top: 6px; width: 232px;
+    background: rgb(var(--surface)); border: 1px solid rgb(var(--edge-strong));
+    border-radius: 9px; padding: 5px; box-shadow: 0 14px 34px rgb(0 0 0 / 0.5);
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .menu button {
+    text-align: left; background: none; border: none; cursor: pointer; font: inherit;
+    color: rgb(var(--fg)); font-size: 0.76rem; padding: 8px 9px; border-radius: 6px;
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .menu button:hover { background: rgb(var(--raised)); }
+  .menu button span { font-size: 0.68rem; color: rgb(var(--faint)); }
+
+  .toggle-row { display: flex; align-items: center; gap: 8px; margin-top: 2px; }
+  .hr { border: none; border-top: 1px solid rgb(var(--edge)); margin: 2px 0; }
+
+  /* ── CLI block ── */
+  .term {
+    background: rgb(var(--bg)); border: 1px solid rgb(var(--edge));
+    border-radius: var(--radius); padding: 14px 15px;
+    font-family: var(--font-mono); font-size: 0.76rem; line-height: 1.85;
+    overflow-x: auto;
+  }
+  .term .p { color: rgb(var(--brand)); }
+  .term .c { color: rgb(var(--faint)); }
+  .term .f { color: rgb(var(--info)); }
+  .term .s { color: rgb(var(--ok)); }
+  .term .out { color: rgb(var(--muted)); }
+
+  .foot { font-size: 0.74rem; color: rgb(var(--faint)); display: flex; flex-wrap: wrap; gap: 6px 14px; }
+  .foot b { color: rgb(var(--muted)); font-weight: 600; }
+</style>
+
+<div class="wrap">
+
+  <div class="lede">
+    <h1>Judge review — triage</h1>
+    <p>Mock of the redesigned <b style="color:rgb(var(--muted))">Run review</b> panel. Dashed <span class="new">new</span> pills mark what this feature adds; everything else is shipped UI. Dark-only, matching uzi's ember theme.</p>
+  </div>
+
+  <!-- ══ GLOBAL STRIP (new) ══ -->
+  <div class="card">
+    <div class="row-head" style="margin-bottom:10px;">
+      <span class="eyebrow">Judge recommendations · all your runs</span>
+      <span class="new">new</span>
+      <span class="spacer"></span>
+      <span class="via">all time</span>
+    </div>
+    <div class="meter" aria-hidden="true">
+      <span class="seg-todo"      style="width:38%"></span>
+      <span class="seg-filed"     style="width:19%"></span>
+      <span class="seg-done"      style="width:26%"></span>
+      <span class="seg-dismissed" style="width:17%"></span>
+    </div>
+    <div class="counts">
+      <div class="count"><span class="dot d-todo"></span><b>18</b><small>to triage</small></div>
+      <div class="count"><span class="dot d-filed"></span><b>9</b><small>filed</small></div>
+      <div class="count"><span class="dot d-done"></span><b>12</b><small>done</small></div>
+      <div class="count"><span class="dot d-dismissed"></span><b>8</b><small>dismissed</small></div>
+      <div class="count" style="margin-left:auto;"><small style="text-transform:none;">3 of 8 dismissed were false positives</small></div>
+    </div>
+  </div>
+
+  <!-- ══ PER-RUN REVIEW PANEL ══ -->
+  <div class="card">
+    <!-- header (shipped) -->
+    <div class="row-head">
+      <span class="eyebrow">Run review</span>
+      <span class="badge b-warn">issues</span>
+      <span class="via">via claude-opus-4</span>
+      <span class="spacer"></span>
+      <button class="btn btn-ghost">Re-run judge</button>
+    </div>
+
+    <p style="font-size:0.85rem;color:rgb(var(--muted));margin:12px 0 4px;">
+      The run reached a working MR, but leaned on slow fallbacks and shipped one type error the reviewer missed. A few toolchain and template tweaks would meaningfully speed the next run of this kind.
+    </p>
+
+    <!-- ══ TRIAGE BAR (new) ══ -->
+    <div style="margin:16px 0 6px;padding:12px 13px;border:1px solid rgb(var(--edge));border-radius:9px;background:rgb(var(--bg) / 0.5);">
+      <div class="row-head">
+        <span class="eyebrow">Triage</span>
+        <span class="new">new</span>
+        <span class="spacer"></span>
+        <span class="via">4 of 6 handled</span>
+      </div>
+      <div class="meter" style="margin-top:9px;" aria-hidden="true">
+        <span class="seg-todo"      style="width:33.33%"></span>
+        <span class="seg-filed"     style="width:16.66%"></span>
+        <span class="seg-done"      style="width:16.66%"></span>
+        <span class="seg-dismissed" style="width:33.33%"></span>
+      </div>
+      <div class="counts">
+        <div class="count"><span class="dot d-todo"></span><b>2</b><small>to do</small></div>
+        <div class="count"><span class="dot d-filed"></span><b>1</b><small>filed</small></div>
+        <div class="count"><span class="dot d-done"></span><b>1</b><small>done</small></div>
+        <div class="count"><span class="dot d-dismissed"></span><b>2</b><small>dismissed</small></div>
+      </div>
+    </div>
+
+    <!-- ══ RECOMMENDATION ROWS ══ -->
+    <div class="recs">
+
+      <!-- OPEN -->
+      <div class="rec">
+        <div class="row-head">
+          <span class="badge b-info">Adjust template</span>
+          <span class="target">coder</span>
+          <span class="via">medium confidence</span>
+          <span class="spacer"></span>
+          <span class="badge b-neutral">To do</span>
+        </div>
+        <p class="rationale">The coder template never says to run <code>go build ./...</code> / typecheck before reporting done — this run handed off a package that failed to compile. Add a "verify before done" step.</p>
+        <div class="actions">
+          <button class="btn btn-primary">File issue</button>
+          <button class="btn btn-ghost">Mark done</button>
+          <button class="btn btn-ghost">Dismiss <span class="caret">▾</span></button>
+        </div>
+      </div>
+
+      <!-- OPEN with dismiss menu OPEN -->
+      <div class="rec">
+        <div class="row-head">
+          <span class="badge b-info">Improve agent</span>
+          <span class="target">reviewer</span>
+          <span class="via">low confidence</span>
+          <span class="spacer"></span>
+          <span class="badge b-neutral">To do</span>
+        </div>
+        <p class="rationale">The reviewer approved a change with a nil-deref on the empty-slice path. Consider strengthening its checklist for boundary/empty inputs.</p>
+        <div class="actions">
+          <button class="btn btn-primary">File issue</button>
+          <button class="btn btn-ghost">Mark done</button>
+          <div class="menu-anchor">
+            <button class="btn btn-ghost" style="border-color:rgb(var(--faint));color:rgb(var(--fg));">Dismiss <span class="caret">▾</span></button>
+            <div class="menu" role="menu">
+              <button role="menuitem">Won't do<span>Valid, but not worth acting on</span></button>
+              <button role="menuitem">Not an issue<span>False positive — judge got it wrong</span></button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- FILED -->
+      <div class="rec">
+        <div class="row-head">
+          <span class="badge b-info">Enable tool</span>
+          <span class="target">WebSearch</span>
+          <span class="via">medium confidence</span>
+          <span class="spacer"></span>
+          <span class="badge b-info">Filed</span>
+        </div>
+        <p class="rationale">The agent guessed a library API that had changed; web access would have let it check current docs instead of failing twice.</p>
+        <div class="actions">
+          <span class="filed-note">Issue <a href="#">#142</a> created in <code>vtmocanu/uzi</code></span>
+          <span class="spacer"></span>
+          <button class="btn btn-ghost">Mark done</button>
+          <button class="btn btn-ghost">Dismiss <span class="caret">▾</span></button>
+        </div>
+      </div>
+
+      <!-- DONE (settled) -->
+      <div class="rec settled">
+        <div class="row-head">
+          <span class="badge b-info">Install worker tool</span>
+          <span class="target">ripgrep</span>
+          <span class="via">high confidence</span>
+          <span class="spacer"></span>
+          <span class="badge b-ok">✓ Done</span>
+        </div>
+        <p class="rationale">The agent fell back to <code>grep -r</code> repeatedly across a large clone; baking <code>rg</code> into the worker image would cut search time substantially.</p>
+        <div class="actions">
+          <span class="via">resolved · 2h ago</span>
+          <span class="badge b-warn" title="The judge re-ran and this recommendation's rationale changed since you resolved it.">rec changed since</span>
+          <span class="spacer"></span>
+          <button class="btn-link">Undo</button>
+        </div>
+      </div>
+
+      <!-- Dismissed group toggle (new) -->
+      <div class="toggle-row">
+        <button class="btn-link" style="text-decoration:none;">▾ Dismissed (2)</button>
+        <span class="new">new</span>
+      </div>
+
+      <!-- DISMISSED · won't do -->
+      <div class="rec settled">
+        <div class="row-head">
+          <span class="badge b-info">Add agent</span>
+          <span class="target">db-migrator</span>
+          <span class="spacer"></span>
+          <span class="badge b-neutral">Dismissed · Won't do</span>
+        </div>
+        <p class="rationale">Suggested a dedicated migration subagent. Coder already owns goose migrations by convention — no separate role wanted.</p>
+        <div class="actions">
+          <span class="via">stays dismissed across re-judges</span>
+          <span class="spacer"></span>
+          <button class="btn-link">Undo</button>
+        </div>
+      </div>
+
+      <!-- DISMISSED · false positive -->
+      <div class="rec settled">
+        <div class="row-head">
+          <span class="badge b-info">Improve uzi</span>
+          <span class="target">run timeout too aggressive</span>
+          <span class="spacer"></span>
+          <span class="badge b-danger">Dismissed · Not an issue</span>
+        </div>
+        <p class="rationale">Judge read the run as timing out; it was a deliberate cancel from the approval gate. False positive.</p>
+        <div class="actions">
+          <span class="via">counts toward "false positives"</span>
+          <span class="spacer"></span>
+          <button class="btn-link">Undo</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ══ CLI (new verbs) ══ -->
+  <div class="card">
+    <div class="row-head" style="margin-bottom:11px;">
+      <span class="eyebrow">CLI — matching verbs</span>
+      <span class="new">new</span>
+      <span class="spacer"></span>
+      <span class="via">api/cmd/uzi</span>
+    </div>
+    <div class="term">
+      <div><span class="p">$</span> uzi review show <span class="f">&lt;run&gt;</span>            <span class="c"># verdict + recs with status</span></div>
+      <div><span class="p">$</span> uzi review resolve <span class="f">&lt;run&gt; &lt;rec&gt;</span>    <span class="c"># mark done</span></div>
+      <div><span class="p">$</span> uzi review dismiss <span class="f">&lt;run&gt; &lt;rec&gt;</span> <span class="f">--reason</span> not-an-issue</div>
+      <div><span class="p">$</span> uzi review undo <span class="f">&lt;run&gt; &lt;rec&gt;</span>       <span class="c"># clear disposition</span></div>
+      <div><span class="p">$</span> uzi review stats <span class="c"># global counters, --json</span></div>
+      <div style="margin-top:8px;"><span class="out">to triage 18 · filed 9 · done 12 · dismissed 8 (3 false positives)</span></div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <span><b>Sticky:</b> dismissals persist across re-judges (like filed links)</span>
+    <span><b>Storage:</b> side-table keyed on (review_id, category, target)</span>
+    <span><b>Undo:</b> every settle is reversible</span>
+  </div>
+
+</div>

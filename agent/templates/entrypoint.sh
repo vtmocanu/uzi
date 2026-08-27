@@ -1,0 +1,326 @@
+#!/bin/sh
+# uzi worker container entrypoint (PRD #51 M2, mechanism A1; PRD #58 non-root start).
+#
+# On a ROOT start (the compose / A1 path) it runs a minimal root startup window and
+# then drops to the unprivileged, credential-holding `worker` uid, retaining ONLY
+# CAP_SETUID/CAP_SETGID as AMBIENT capabilities. The worker keeps those two caps for
+# the run lifetime so it can later (M4) spawn the untrusted code-execution surfaces
+# (SDK agent, self-improve checks, provision hooks) under the distinct, cap-less
+# `runner` uid. The startup-only caps (CAP_SETPCAP/CAP_CHOWN/CAP_DAC_OVERRIDE, granted
+# by the compose `cap_add`) are NOT carried across the drop: the setuid-to-non-root
+# transition clears the permitted set and only the two ambient caps are re-raised, so
+# CHOWN/DAC_OVERRIDE/SETPCAP are absent from the worker's permitted AND bounding sets
+# afterwards (Decision 7). Verified on the built image via /proc/<pid>/status.
+#
+# On a NON-ROOT start (PRD #58: a hosted-k8s consumer runs this image in a PodSecurity
+# RESTRICTED namespace with runAsUser: 10001 and no addable capabilities) the A1 root
+# window is both unnecessary and impossible, so the entrypoint skips it and runs
+# single-uid as the started user — see the branch below.
+#
+# Root-window hygiene (Decision 7 / audit M5): every command in the root window is an
+# image-baked, root-owned binary invoked by ABSOLUTE PATH; PATH excludes the
+# runner-writable volumes (/nix, /data) so root never resolves a binary from a volume;
+# no untrusted env/arg is interpolated into a command; and the drop happens before
+# anything resolves from a volume, regardless of volume contents.
+#
+# NOTE: the runtime cap set has NO CAP_FOWNER, so root can chmod a file only while it
+# still owns it (chmod-before-chown for the token) and can otherwise only chown (not
+# chmod) already-owned paths during the B4 migration.
+set -eu
+
+# Absolute, root-owned, image-baked binaries (no /nix, no /data). Defined BEFORE the
+# non-root branch so BOTH paths use absolute paths — never a volume-resolved binary,
+# even here where PATH still has /nix first (a persisted /nix could carry a
+# runner-planted trojan; resolving `id`/`tini` by absolute path avoids it).
+ID=/usr/bin/id
+TINI=/sbin/tini
+SETPRIV=/bin/setpriv
+CHOWN=/bin/chown
+CHMOD=/bin/chmod
+MKDIR=/bin/mkdir
+
+# --- PRD #58: tolerate a NON-ROOT start ---------------------------------------
+# Started non-root (k8s runAsUser: 10001, PRD #58 single-uid v1)? Then there is no
+# root window: the B4 volume migration is unnecessary (a fresh PVC + fsGroup, and the
+# image-layer ownership /nix=worker:runner + /data=worker:worker already lets uid 10001
+# write) and both the token chmod and the A1 setpriv drop need root/caps we do not have
+# (an unconditional `setpriv --reuid` would EPERM -> CrashLoopBackOff). Run single-uid
+# as the started user; tini stays PID 1 for clean SIGTERM. PATH is still the image's
+# full worker PATH here (untouched below), so nix/devbox + the jvm JDK resolve. This
+# does NOT weaken A1: the #51 uid-split containment applies on the ROOT-started
+# (compose/A1) path; the non-root path is the #58 consumer's own accepted single-uid
+# posture (the two-container split lands later via (C)).
+# Read the uid via the ABSOLUTE id binary and validate it is a clean, non-empty number
+# BEFORE branching, so BOTH paths fail CLOSED under `set -eu`: a failed or garbled `id`
+# must NOT let a ROOT start slip into the non-root branch (which would run a root start
+# single-uid with the token unhardened + full cap_add — asymmetric with the fail-closed
+# setpriv drop below).
+uid="$("$ID" -u)"
+case "$uid" in
+  ''|*[!0-9]*) echo "uzi-entrypoint: cannot determine uid (got '$uid'); refusing to start" >&2; exit 1 ;;
+esac
+if [ "$uid" != "0" ]; then
+  echo "uzi-entrypoint: single-uid non-root mode (PRD #58) — no A1 uid-split on this start" >&2
+  # Fail-safe against operator misconfig (audit M4 LOW): only the ROOT path below sets
+  # these, but if a non-root deploy carries a stray UZI_UID_SPLIT=1 (compose env), the
+  # single-uid worker would try to setpriv-wrap runner spawns → EPERM (no CAP_SETUID
+  # non-root) → every spawn fails → DoS. Clear them so single-uid mode is robust to a
+  # stray value. Not attacker-reachable (the runner cannot set the worker's env).
+  unset UZI_UID_SPLIT UZI_RUNNER_PATH UZI_RUNNER_TMPDIR
+  # PRD #120 / issue #120: pin the RUNNER PATH here too, AFTER the unset above (so a stray
+  # operator value is still cleared and the value that survives is the entrypoint's own).
+  #
+  # Why: leaving it unset made `runnerPath()` (agent/src/runner-uid.ts) fall back to
+  # `env.PATH` — and the CMD is `npm run start`, so npm's run-script PREPENDS
+  # /app/node_modules/.bin, /node_modules/.bin and @npmcli/run-script/lib/node-gyp-bin to
+  # the PATH the worker process actually sees. Every runner child (SDK agent, provision,
+  # checks, git) then inherited a PATH on which the real npm `agent-browser` CLI shadowed
+  # the crash-close + launch-config shim baked at /usr/local/bin (PRD #87), so browser
+  # launches silently lost `--no-sandbox` and Chromium aborted on the setuid sandbox that
+  # the PRD #51 hardening makes impossible. The ROOT/A1 path never had this: it captures
+  # IMAGE_PATH below BEFORE the CMD runs and hands it over at the drop. The two modes
+  # disagreeing was the defect; this makes them agree.
+  #
+  # `$PATH` is still the untouched image PATH at this point (the entrypoint runs BEFORE the
+  # CMD), so this is exactly the value IMAGE_PATH captures on the root path.
+  #
+  # This does NOT weaken the #58 single-uid posture. UZI_UID_SPLIT stays unset, so
+  # `uidSplitActive()` is false and every runner-uid.ts primitive remains a passthrough (no
+  # setpriv wrap, no cross-uid kill) — that is what the unset above exists for, and it is
+  # untouched. Nor does it widen anything: single-uid means worker == runner, and the
+  # worker's own PATH already carries /nix here (only the ROOT path strips it, because only
+  # there is /nix owned by a *different*, untrusted uid). It is also strictly safer than the
+  # old fallback — a stray operator value used to be replaced by whatever npm produced, and
+  # is now replaced by the image's own PATH.
+  #
+  # BEHAVIOUR DELTA worth naming: runner children lose ALL of /app/node_modules/.bin, not
+  # just its agent-browser. That dir also holds tsx, tsc, tsserver, esbuild and friends, so
+  # an agent on k8s that previously resolved a bare `tsc`/`tsx` from the WORKER's own
+  # node_modules now gets command-not-found. That is the correct outcome — the agent should
+  # never resolve the worker's toolchain — and nothing breaks: the SDK's own CLI is
+  # module-resolved rather than PATH-resolved, and node/npm/npx sit at /usr/local/bin on the
+  # image PATH. Stated here because it is a real change on the primary runtime.
+  #
+  # UZI_RUNNER_TMPDIR is deliberately NOT re-exported: controller/internal/kube/render.go
+  # sets a pod-spec TMPDIR for docker workers and relies on this branch leaving it unset so
+  # `runnerTmpdir()` (= UZI_RUNNER_TMPDIR || TMPDIR) returns the pod-spec value.
+  export UZI_RUNNER_PATH="$PATH"
+  exec "$TINI" -- "$@"
+fi
+echo "uzi-entrypoint: A1 uid-split active (root-started) — dropping to worker after the startup window" >&2
+
+# --- ROOT-started (compose / A1): root startup window, then the setpriv drop ---
+# The image's full runtime PATH (the nix profile bin + the JDK bin for jvm) becomes the
+# RUNNER PATH (PRD #51 M4): the untrusted execution surfaces run as `runner` and need
+# `/nix`, but the credential-holding worker must NOT resolve any binary from `/nix` (now
+# runner-writable — a runner could plant a trojan the PAT-holding worker would run). So
+# the dropped WORKER keeps only the stripped root-owned PATH (below), and the full image
+# PATH is handed to the runner via UZI_RUNNER_PATH at the drop. The root window itself
+# runs on the same stripped PATH.
+#
+# PROHIBITION (PRD #92): `/opt/uzi-toolchain/bin` (the M1 stable toolchain handle) must
+# NEVER be added to the worker's stripped PATH below — it dereferences into the now
+# runner-writable `/nix` store, so putting it on the worker PATH would let a runner plant
+# a binary the PAT-holding worker resolves, piercing the PRD #51 M2-audit invariant. The
+# baked toolchain belongs ONLY on the image PATH that becomes UZI_RUNNER_PATH (handed to
+# the runner). The M3 boot preflight resolves it against UZI_RUNNER_PATH, never here.
+IMAGE_PATH="${PATH}"
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+WORKER_USER=worker
+WORKER_OWNER=worker:worker   # /data, /app: worker-owned (the worker's own trees)
+# /nix: runner-OWNED under the A1 split (PRD #51 M4) — provisioning moves to `runner`, so
+# it realizes packages as the /nix owner and the worker needs nothing from /nix. The
+# worker→runner OWNER change re-triggers migrate_tree's sentinel (a new owner => a new
+# sentinel name), which also fixes the group (handling the owner-keyed-guard note). On a
+# #58 non-root start this whole root window is skipped, so /nix stays worker:runner from
+# the image layer and the single-uid worker still provisions.
+NIX_OWNER=runner:runner
+
+# --- (a) B4: migrate persisted named volumes to the current uid layout --------
+# agentnix (/nix) and agentdata (/data) seed from the image on first use and then
+# persist their ORIGINAL ownership. When an existing install upgrades to this image the
+# execution uid changed (uzi -> worker), so the volumes stay owned by the old uid and
+# every write EACCESes. Re-own them here with CAP_CHOWN (held only during this root
+# window). Ownership only — the finer runner-OWNED carve-out under /data (the separate
+# runner clone/store, agent-home, provision) and /nix group-write for the runner are
+# M3/M4 (they seed those paths and move the spawn); M2 migrates ownership so the worker,
+# which still performs all work pre-split, operates.
+migrate_tree() {
+  # $1 = path, $2 = owner:group. One-time volume ownership migration, robust to the base
+  # image's `chown -R` traversal order. The skip decision is a per-owner sentinel written
+  # ONLY AFTER the chown COMPLETES — NOT the top-level owner, whose validity relied on
+  # busybox chown -R being depth-first (top-level chowned LAST); a future swap to a
+  # pre-order chown could leave a partial migration looking complete and be skipped. When
+  # the sentinel is absent the chown runs UNCONDITIONALLY, so an interrupted migration
+  # re-runs fully regardless of order (idempotent), and a later milestone that re-owns a
+  # tree uses a new owner => a new sentinel name => it re-migrates. The only cost on a
+  # fresh (already-correct) volume is one redundant chown on first boot. The sentinel is
+  # NOT a security control. DELETING it only forces a redundant idempotent chown. FORGING
+  # it (writing the sentinel before an upgrade so the migration is skipped) is the more
+  # interesting direction: a pre-split, /data-owning agent could plant the next milestone's
+  # sentinel so the post-upgrade chown skips, leaving the volume owned by the old uid ->
+  # the worker cannot write /data -> the container fails to operate. That is an
+  # AVAILABILITY DoS only (no confidentiality/integrity gain, operator-visible as a broken
+  # boot), by a PRE-split attacker who already had same-uid /data write — accepted, since
+  # the split's containment is about the POST-upgrade world and a clean install (down -v)
+  # or a manual chown recovers it.
+  path="$1"; owner="$2"
+  [ -e "$path" ] || return 0
+  sentinel="$path/.uzi-migrated-${owner%:*}-${owner#*:}"
+  [ -f "$sentinel" ] && return 0
+  echo "uzi-entrypoint: ensuring $path ownership -> $owner [one-time]" >&2
+  "$CHOWN" -R "$owner" "$path"
+  : > "$sentinel" 2>/dev/null && "$CHOWN" "$owner" "$sentinel" 2>/dev/null \
+    || echo "uzi-entrypoint: warning: could not persist $sentinel (re-runs next boot)" >&2
+}
+migrate_tree /nix "$NIX_OWNER"
+migrate_tree /data "$WORKER_OWNER"
+
+# --- (a2) PRD #51 M4: runner-owned /data subtree carve-out ((b) ownership model) --
+# Under (b) separate-runner-clone the RUNNER clone store + the SDK/provision HOMEs are
+# runner-owned trees (the agent checks out + commits there as uid `runner`), while the
+# WORKER bare cache repos/ stays worker-only (its config/hooks/refs are the B2 code-exec
+# surface — the runner must never write it). migrate_tree above set ALL of /data to
+# worker:worker, so own these subtree ROOTS worker:runner + setgid/group-write (2775) so
+# children inherit group `runner` and the runner (a `runner`-group member) can create its
+# per-run dirs under them; the worker runs umask 002 (main.ts) so those worker-created
+# per-run dirs are group-`runner`-writable. repos/ is deliberately NOT in this list.
+#
+# RESTART-SAFE + resume guard (two independent fixes, same block — reviewer flag B +
+# tester e2e crash-on-restart):
+#   * chmod ONLY while root still OWNS the dir (a fresh dir this boot, `[ -O ]` = owned by
+#     the effective uid = root here). The runtime cap set has NO CAP_FOWNER (deliberate),
+#     so root CANNOT chmod a dir it already handed to `worker` on a prior boot — an
+#     UNCONDITIONAL chmod EPERMs there, and `set -eu` turns that into a DETERMINISTIC
+#     crash on every restart/recreate over the persisted agentdata volume. The setgid +
+#     group-write is set once, when the dir is first created (root-owned); it need not be
+#     re-applied. (chown does NOT clear a directory's setgid on Linux, so it persists.)
+#   * NON-RECURSIVE chown (runs every boot — cheap, CAP_CHOWN needs no FOWNER): a
+#     `chown -R worker:runner` would re-own the runner's OWN per-run resume state
+#     (agent-home/<runId> a requeued run resumes from) runner->worker on every restart.
+#     Owning only the ROOTS leaves runner-owned content untouched; a fresh volume's roots
+#     are empty, and an upgrade's stale content was re-owned by migrate_tree /data above.
+RUNNER_TREE_OWNER=worker:runner
+for d in runner agent-home provision; do
+  "$MKDIR" -p "/data/$d"
+  # 🔴 SC3067 IS A TRUE PORTABILITY STATEMENT AND A FALSE BUG REPORT AGAINST THIS
+  # IMAGE, AND IT STOPS BEING FALSE THE MOMENT THE SHEBANG OR THE BASE IMAGE MOVES.
+  # This file is `#!/bin/sh` and both worker Dockerfiles ship it on the same
+  # digest-pinned node:22-alpine with an exec-form ENTRYPOINT
+  # (controller/internal/kube/render.go sets no `Command:` ON THE WORKER CONTAINER,
+  # so k8s uses the image's own ENTRYPOINT. That file has five `Command:` fields on
+  # OTHER containers, so the unqualified version of this sentence invited a reader
+  # to grep, find them, and doubt the paragraph). There /bin/sh is busybox ash
+  # 1.37.0, which implements `-O` with correct semantics -- measured 2026-08-03,
+  # with a control proving the probe could have detected an unsupported operator
+  # (`[ -Q dir ]` -> rc=2 "unknown operand").
+  #
+  # WHY THIS IS A PER-INSTANCE DISABLE AND NOT A `.shellcheckrc` LINE OR A
+  # `# shellcheck shell=busybox` HEADER (PRD #103 M5, ruled): on a shell where `-O`
+  # is undefined, `[ -O x ]` is false, the `&&` short-circuits, THE CHMOD IS SKIPPED,
+  # and `set -eu` does not fire -- POSIX exempts the left-hand side of an AND-list
+  # from errexit. So the failure mode of changing the interpreter is a permission
+  # that is never applied. That warning belongs at the three call sites where
+  # someone would need it; an rc file would blanket every tracked script and a
+  # whole-file dialect declaration would go on silently asserting busybox after the
+  # shebang changed.
+  #
+  # TWO BOUNDS ON THAT CLAIM, because this comment is the entire recorded
+  # justification for the ruling and an overstated one is worth less than a narrow
+  # one (both re-measured 2026-08-03 in Debian's dash, which is /bin/sh there):
+  #
+  #   * IT IS NOT LITERALLY SILENT. An unsupported operator writes one line to
+  #     stderr -- `[: -Q: unexpected operator`, 39 bytes -- which for THIS file
+  #     means it lands in the pod's logs. What is silent is the EXIT STATUS: the
+  #     same run printed `SURVIVED` at rc=0 under `sh -eu`, so nothing fails and
+  #     nothing retries. A line in a log nobody greps is not a gate.
+  #   * THE HYPOTHETICAL SHELL IS NONE OF THE OBVIOUS ONES. dash implements `-O`,
+  #     and so do bash, ksh and busybox ash -- measured, dash and bash both return
+  #     0 on `[ -O /tmp ]`. So this guards against a future interpreter that is not
+  #     any shell currently plausible here. That is a bound on the scenario, not a
+  #     refutation: the comment is explicitly conditional on the shebang or base
+  #     image moving, and the cost of being wrong is a permission mode that is
+  #     never applied on a tree nobody is looking at.
+  # shellcheck disable=SC3067
+  [ -O "/data/$d" ] && "$CHMOD" 2775 "/data/$d"   # only on a fresh (root-owned) dir
+  "$CHOWN" "$RUNNER_TREE_OWNER" "/data/$d"
+done
+
+# --- (a3) PRD #51 M3 / 5-bis: distinct per-uid TMPDIR on 0700 trees -------------
+# git/npm/node scratch writes would otherwise share a sticky /tmp (symlink races +
+# exposure of any worker temp write across the uid boundary). Give the worker and the
+# runner each a private 0700 tmp. The worker's is exported as TMPDIR below; the runner's
+# is exported as UZI_RUNNER_TMPDIR (the runner env builders put it on the agent/checks/
+# provision children — runner-uid.ts). Its 0700/runner mode is owner-only, so the worker
+# (a `runner`-GROUP member) still cannot read it. The chmod is guarded on root-ownership
+# for the same restart-safety reason as the carve-out above: /tmp is the container's
+# writable layer (NOT a named volume), so a `docker restart` reuses it — an unconditional
+# chmod on the now-worker/runner-owned dir would EPERM (no CAP_FOWNER) -> set -eu crash.
+WORKER_TMPDIR=/tmp/uzi-worker
+RUNNER_TMPDIR=/tmp/uzi-runner
+"$MKDIR" -p "$WORKER_TMPDIR" "$RUNNER_TMPDIR"
+# SC3067: `-O` is undefined in POSIX sh and implemented by busybox ash 1.37.0, the
+# /bin/sh this file actually runs under in the pinned node:22-alpine (measured
+# 2026-08-03, with an unsupported-operator control). Per-instance rather than an rc
+# entry because the hazard is LOCAL: change the interpreter and `[ -O ... ]` goes
+# false, the `&&` short-circuits, this chmod never runs, and `set -eu` cannot see it
+# (POSIX exempts the left of an AND-list from errexit). A 0700 that silently became
+# 0755 is the whole point of the line. See the (a2) block above for the full argument.
+# shellcheck disable=SC3067
+[ -O "$WORKER_TMPDIR" ] && "$CHMOD" 0700 "$WORKER_TMPDIR"; "$CHOWN" "$WORKER_OWNER" "$WORKER_TMPDIR"
+# runner:runner 0700 — owner-only, so even the worker (a `runner`-GROUP member) cannot
+# reach it (0700 grants the group nothing); true per-uid isolation.
+# SC3067: same operator, same shell, same reason as the line above -- busybox ash
+# 1.37.0 in the pinned node:22-alpine implements `-O` (measured 2026-08-03 with an
+# unsupported-operator control), POSIX does not. Per-instance because a changed
+# interpreter turns this into a SKIPPED chmod with no error: `[ -O ... ]` is false,
+# `&&` short-circuits, and errexit does not apply to the left of an AND-list. Here
+# that would leave the runner's private tmp readable by the worker uid, which is the
+# isolation this line exists to create.
+# shellcheck disable=SC3067
+[ -O "$RUNNER_TMPDIR" ] && "$CHMOD" 0700 "$RUNNER_TMPDIR"; "$CHOWN" runner:runner "$RUNNER_TMPDIR"
+
+# --- (b) token: force 0400 worker on the join-token secret ---------------------
+# Compose delivers the env-sourced `worker_token` secret 0444 root:root (world-readable
+# — the runner uid could read it), and an env-sourced secret's uid/gid/mode are
+# unreliable (audit L2), so enforce it here rather than trusting compose. chmod BEFORE
+# chown: the runtime cap set has no CAP_FOWNER, so root can chmod the file only while
+# root still owns it; 0400 carries no setuid/setgid bit for chown to strip, so the final
+# mode is 0400 worker:worker. The e2e stack (PRD #51 M5) delivers its token via THIS
+# same Docker-secret path (UZI_WORKER_TOKEN_FILE=/run/secrets/worker_token, sourced from
+# the minted UZI_WORKER_TOKEN), so this hardening covers it too — that is exactly what
+# makes the e2e's runner-uid read-denial assertion non-vacuous.
+TOKEN=/run/secrets/worker_token
+if [ -e "$TOKEN" ]; then
+  "$CHMOD" 0400 "$TOKEN"
+  "$CHOWN" "$WORKER_OWNER" "$TOKEN"
+fi
+
+# --- (c) drop root -> worker, keeping ONLY setuid/setgid (ambient) -------------
+# --init-groups picks up worker's supplementary membership of group `runner` (from
+# /etc/group) so the worker can access runner-group trees. tini stays PID 1 (now as
+# `worker`) to reap and forward SIGTERM, preserving clean shutdown. The CMD
+# (npm run start) arrives as "$@" and is passed as argv (no shell re-parse).
+#
+# The dropped worker's env activates the PRD #51 M4 uid split for the worker process:
+#   - PATH stays the STRIPPED root-owned set (set above, still exported) — NOT the image
+#     PATH — so no worker-side exec ever resolves from the runner-writable /nix (M2-audit
+#     MEDIUM). The worker's own tools (git/node/npm/setpriv/tini) are all in these dirs.
+#   - UZI_UID_SPLIT=1 tells runner-uid.ts to setpriv-wrap every untrusted spawn as `runner`
+#     and to reap runner groups via a setpriv-to-runner kill. Its ABSENCE (a #58 non-root
+#     start, which never reaches this line) = single-uid, no split.
+#   - UZI_RUNNER_PATH = the full image PATH (nix + JDK) the runner env builders put on the
+#     agent/checks/provision children; UZI_RUNNER_TMPDIR = the runner's private 0700 tmp.
+#   - TMPDIR = the worker's own private 0700 tmp (5-bis), inherited by its git children.
+export TMPDIR="$WORKER_TMPDIR"
+export UZI_UID_SPLIT=1
+export UZI_RUNNER_PATH="$IMAGE_PATH"
+export UZI_RUNNER_TMPDIR="$RUNNER_TMPDIR"
+exec "$SETPRIV" \
+  --reuid "$WORKER_USER" --regid "$WORKER_USER" --init-groups \
+  --bounding-set -all,+setuid,+setgid \
+  --inh-caps -all,+setuid,+setgid \
+  --ambient-caps -all,+setuid,+setgid \
+  -- "$TINI" -- "$@"

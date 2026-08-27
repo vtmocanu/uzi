@@ -1,0 +1,765 @@
+<title>Configurable board membership labels — mock (PRD TBD)</title>
+<style>
+  /* uzi "ember" dark-factory palette, lifted from web/src/index.css :root.
+     The product ships two dark themes and no light one; this mock commits to that
+     one visual world rather than inventing a light variant (same choice as
+     194-live-cost-mock.html and 113-worker-upgrade-status-mock.html).
+
+     Layout tracks the SHIPPING Board page rather than inventing one: PageHeader
+     with description + actions row, lanes of w-72 cards, card anatomy of
+     title / badges row / chips row / footer / action button. */
+  :root {
+    --bg: 8 10 15;
+    --surface: 15 18 26;
+    --raised: 23 27 38;
+    --edge: 39 45 60;
+    --edge-strong: 58 66 86;
+    --fg: 228 232 240;
+    --muted: 148 158 176;
+    --faint: 122 133 154;
+    --ok: 52 211 153;
+    --warn: 251 191 36;
+    --info: 56 189 248;
+    --danger: 251 113 133;
+    --brand: 251 146 60;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: rgb(var(--bg)); color: rgb(var(--fg));
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 14px; line-height: 1.6; -webkit-font-smoothing: antialiased;
+    display: flex; justify-content: center; padding: 40px 20px 90px;
+  }
+  .wrap { width: 100%; max-width: 1120px; display: flex; flex-direction: column; gap: 42px; }
+  h1, h2, h3 { margin: 0; font-weight: 600; text-wrap: balance; }
+  p { margin: 0; }
+  code, .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  code { font-size: .92em; color: rgb(var(--muted)); }
+
+  .mock-note {
+    border: 1px solid rgb(var(--edge)); border-left: 3px solid rgb(var(--brand));
+    background: rgb(var(--surface)); border-radius: 8px; padding: 14px 16px;
+    font-size: 13px; color: rgb(var(--muted));
+  }
+  .mock-note strong { color: rgb(var(--fg)); }
+
+  .where {
+    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+    padding-bottom: 10px; margin-bottom: 14px; border-bottom: 1px solid rgb(var(--edge));
+  }
+  .where h2 { font-size: 15px; }
+  .where span { font-size: 12px; color: rgb(var(--faint)); font-family: var(--font-mono); }
+
+  .panel {
+    background: rgb(var(--surface)); border: 1px solid rgb(var(--edge));
+    border-radius: 12px; padding: 16px;
+    display: flex; flex-direction: column; gap: 14px;
+  }
+
+  /* ---- page header, as PageHeader renders it ---- */
+  .hdr { display: flex; flex-direction: column; gap: 8px; }
+  .hdr-top { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; justify-content: space-between; }
+  .hdr h1 { font-size: 19px; letter-spacing: -.01em; }
+  .hdr .desc { font-size: 12.5px; color: rgb(var(--muted)); max-width: 74ch; }
+  .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+
+  .ctl { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: rgb(var(--muted)); padding: 5px 0; }
+  .ctl input[type=checkbox] { width: 14px; height: 14px; accent-color: rgb(var(--brand)); margin: 0; }
+  select.mini, .btn {
+    background: rgb(var(--raised)); color: rgb(var(--fg));
+    border: 1px solid rgb(var(--edge)); border-radius: 7px;
+    font-size: 12px; padding: 4px 9px; font-family: inherit;
+  }
+  .btn.primary { background: rgb(var(--brand)); border-color: rgb(var(--brand)); color: rgb(12 12 12); font-weight: 600; }
+  .btn.filter { display: inline-flex; align-items: center; gap: 6px; }
+  .btn.filter.on { border-color: rgb(var(--brand) / .6); }
+  .btn .caret { color: rgb(var(--faint)); font-size: 9px; }
+
+  /* ---- lanes ---- */
+  .lanes { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 6px; }
+  .lane { width: 264px; flex: none; display: flex; flex-direction: column; gap: 8px; }
+  .lane-hd {
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+    color: rgb(var(--faint)); font-weight: 600; padding: 0 2px;
+  }
+  .lane-hd .n { font-family: var(--font-mono); }
+  .lane-body { display: flex; flex-direction: column; gap: 8px; min-height: 40px; }
+
+  .card {
+    background: rgb(var(--raised)); border: 1px solid rgb(var(--edge));
+    border-radius: 9px; padding: 10px 11px;
+  }
+  .card.new { border-color: rgb(var(--brand) / .55); box-shadow: 0 0 0 1px rgb(var(--brand) / .18); }
+  .card-top { display: flex; align-items: flex-start; gap: 8px; justify-content: space-between; }
+  .card-title { font-size: 12.5px; line-height: 1.4; color: rgb(var(--fg)); }
+  .iid { font-family: var(--font-mono); font-size: 11px; color: rgb(var(--faint)); flex: none; }
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 7px; }
+  .row.chips { margin-top: 6px; gap: 4px; }
+  .chip {
+    border: 1px solid rgb(var(--edge)); background: rgb(var(--surface));
+    border-radius: 6px; padding: 1px 6px; font-size: 10.5px; color: rgb(var(--muted));
+  }
+  .chip.hit { border-color: rgb(var(--brand) / .5); color: rgb(var(--brand)); background: rgb(var(--brand) / .1); }
+  .badge {
+    border-radius: 999px; padding: 1px 7px; font-size: 9.5px; font-weight: 600;
+    letter-spacing: .05em; text-transform: uppercase; border: 1px solid;
+  }
+  .badge.ok { color: rgb(var(--ok)); border-color: rgb(var(--ok) / .45); background: rgb(var(--ok) / .12); }
+  .badge.info { color: rgb(var(--info)); border-color: rgb(var(--info) / .45); background: rgb(var(--info) / .12); }
+  .badge.warn { color: rgb(var(--warn)); border-color: rgb(var(--warn) / .45); background: rgb(var(--warn) / .12); }
+  .badge.brand { color: rgb(var(--brand)); border-color: rgb(var(--brand) / .45); background: rgb(var(--brand) / .12); }
+  .card-foot { margin-top: 6px; font-size: 11px; color: rgb(var(--faint)); }
+  .cardbtn {
+    display: block; width: 100%; margin-top: 9px; text-align: center;
+    border-radius: 7px; padding: 5px 0; font-size: 11.5px; font-weight: 600;
+    border: 1px solid rgb(var(--edge-strong)); background: rgb(var(--surface)); color: rgb(var(--fg));
+  }
+  .cardbtn.primary { background: rgb(var(--brand)); border-color: rgb(var(--brand)); color: rgb(12 12 12); }
+  .ghost { color: rgb(var(--faint)); font-size: 11.5px; font-style: italic; padding: 6px 2px; }
+
+  /* ---- the popover ---- */
+  .pop {
+    width: 292px; background: rgb(var(--surface)); border: 1px solid rgb(var(--edge-strong));
+    border-radius: 10px; padding: 6px; box-shadow: 0 14px 40px rgb(0 0 0 / .55);
+  }
+  .pop .ph {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .09em;
+    color: rgb(var(--faint)); font-weight: 600; padding: 7px 9px 5px;
+  }
+  .pop .opt {
+    display: flex; align-items: center; gap: 8px; padding: 5px 9px;
+    border-radius: 6px; font-size: 12.5px;
+  }
+  .pop .opt:hover { background: rgb(var(--raised)); }
+  .pop .opt input { width: 14px; height: 14px; accent-color: rgb(var(--brand)); margin: 0; flex: none; }
+  .pop .opt .cnt { margin-left: auto; font-family: var(--font-mono); font-size: 11px; color: rgb(var(--faint)); }
+  .pop .opt.pinned { color: rgb(var(--muted)); }
+  .pop .opt.pinned .lock { margin-left: auto; font-size: 10px; color: rgb(var(--faint)); text-transform: none; letter-spacing: 0; }
+  .pop hr { border: 0; border-top: 1px solid rgb(var(--edge)); margin: 6px 0; }
+  .pop .pf {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 7px 9px 5px; font-size: 11px; color: rgb(var(--faint)); border-top: 1px solid rgb(var(--edge)); margin-top: 4px;
+  }
+  .pop .pf a { color: rgb(var(--brand)); text-decoration: none; }
+
+  .side { display: flex; gap: 22px; align-items: flex-start; flex-wrap: wrap; }
+  .side > .grow { flex: 1 1 380px; min-width: 320px; }
+
+  /* ---- settings form ---- */
+  .field { display: flex; flex-direction: column; gap: 5px; }
+  .field label { font-size: 12px; color: rgb(var(--muted)); font-weight: 600; }
+  .input {
+    background: rgb(var(--raised)); border: 1px solid rgb(var(--edge)); border-radius: 8px;
+    padding: 7px 10px; font-size: 13px; color: rgb(var(--fg));
+  }
+  .input.tags { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .tag {
+    display: inline-flex; align-items: center; gap: 6px; border-radius: 6px;
+    border: 1px solid rgb(var(--edge-strong)); background: rgb(var(--surface));
+    padding: 2px 5px 2px 8px; font-size: 12px;
+  }
+  .tag .x { color: rgb(var(--faint)); font-size: 12px; }
+  .tag .ph { color: rgb(var(--faint)); }
+  .hint { font-size: 11.5px; color: rgb(var(--faint)); }
+
+  .anno {
+    display: flex; gap: 10px; align-items: flex-start;
+    font-size: 12px; color: rgb(var(--muted));
+    border-left: 2px solid rgb(var(--info)); padding-left: 11px;
+  }
+  .anno.ok { border-left-color: rgb(var(--ok)); }
+  .anno.bad { border-left-color: rgb(var(--danger)); }
+  .anno.warn { border-left-color: rgb(var(--warn)); }
+  .anno b { color: rgb(var(--fg)); font-weight: 600; }
+
+  .callout { display: flex; gap: 12px; align-items: flex-start; border-radius: 8px; padding: 14px 16px; border: 1px solid; }
+  .callout.warn { border-color: rgb(var(--warn) / .4); background: rgb(var(--warn) / .07); }
+  .callout.bad  { border-color: rgb(var(--danger) / .4); background: rgb(var(--danger) / .07); }
+  .callout.ok   { border-color: rgb(var(--ok) / .4); background: rgb(var(--ok) / .07); }
+  .callout h3 { font-size: 13px; margin-bottom: 3px; }
+  .callout p { font-size: 12.5px; color: rgb(var(--muted)); }
+  .callout p + p { margin-top: 7px; }
+  .stripe { width: 3px; align-self: stretch; border-radius: 2px; flex: none; }
+  .stripe.warn { background: rgb(var(--warn)); }
+  .stripe.bad { background: rgb(var(--danger)); }
+  .stripe.ok { background: rgb(var(--ok)); }
+
+  table.copy { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table.copy th, table.copy td { text-align: left; padding: 8px; border-bottom: 1px solid rgb(var(--edge)); vertical-align: top; }
+  table.copy thead th { color: rgb(var(--faint)); font-size: 10px; text-transform: uppercase; letter-spacing: .07em; }
+  table.copy tbody tr:last-child td { border-bottom: 0; }
+  .was { color: rgb(var(--danger)); text-decoration: line-through; text-decoration-color: rgb(var(--danger) / .5); }
+  .now { color: rgb(var(--ok)); }
+</style>
+
+<div class="wrap">
+
+  <p class="mock-note"><strong>Mock — configurable board membership labels.</strong>
+  Today a board renders only <code>PRD</code>-labelled issues, plus an all-or-nothing
+  <em>Show other issues</em> checkbox. This proposes a per-user label filter with an
+  admin-set default, so a repo can show <code>bug</code> alongside <code>PRD</code> out of the box.
+  Sections&nbsp;1&ndash;2 are today; <b>3&ndash;6 are visibility</b> (which cards appear);
+  <b>§7 is eligibility</b> (which cards can start a run). <code>bug</code> ships in <b>both</b>
+  default lists, so out of the box a bug card appears on every board <i>and</i> offers
+  <b>Start&nbsp;run</b>. Fixture repo below has
+  <span class="num">20</span> open issues:
+  <span class="num">5</span> <code>PRD</code>, <span class="num">6</span> <code>bug</code>,
+  <span class="num">3</span> <code>enhancement</code>, <span class="num">2</span> <code>documentation</code>,
+  <span class="num">1</span> <code>security</code>, <span class="num">3</span> unlabelled.</p>
+
+  <!-- ═════════ 1 ═════════ -->
+  <section>
+    <div class="where"><h2>1 &middot; Today &mdash; the toolbar</h2><span>Board.tsx:756 &middot; one boolean</span></div>
+    <div class="panel">
+      <div class="hdr">
+        <div class="hdr-top">
+          <h1>vtmocanu/uzi</h1>
+          <div class="actions">
+            <span class="ctl">Sort <select class="mini"><option>Manual</option></select></span>
+            <label class="ctl"><input type="checkbox"> Show other issues</label>
+            <label class="ctl"><input type="checkbox"> Hide empty</label>
+            <button class="btn primary">+ Create issue</button>
+            <button class="btn">Columns</button>
+            <button class="btn">Refresh</button>
+          </div>
+        </div>
+        <p class="desc">Columns are GitLab labels. Cards move automatically as their runs progress;
+        you can still drag a card to change its label on the forge. <b>PRD-labelled issues always
+        appear here; turn on "Show other issues" to see the repo's other open issues alongside them.</b></p>
+      </div>
+
+      <div class="anno"><b>Two states, no middle.</b>
+        <span>Off: <span class="num">5</span> cards. On: <span class="num">20</span> cards &mdash;
+        every stray unlabelled issue, every doc typo. There is no way to say
+        <i>"PRD and bug, nothing else"</i>, which is the state most people actually want.</span></div>
+      <div class="anno"><b>Per browser, not per user.</b>
+        <span>The choice lives in <code>localStorage</code> under
+        <code>uzi.board.&lt;repoId&gt;.showNonPRD</code>. A second machine, a cleared cache, or a
+        colleague on the same instance starts from scratch.</span></div>
+    </div>
+  </section>
+
+  <!-- ═════════ 2 ═════════ -->
+  <section>
+    <div class="where"><h2>2 &middot; Today &mdash; the board</h2><span>the six bug issues are cached, fetched, and invisible</span></div>
+    <div class="panel">
+      <div class="lanes">
+        <div class="lane">
+          <div class="lane-hd"><span>Open</span><span class="n">2</span></div>
+          <div class="lane-body">
+            <div class="card">
+              <div class="card-top"><span class="card-title">Configurable board membership labels</span><span class="iid">#201</span></div>
+              <div class="row"><span class="badge warn">no PRD link</span></div>
+              <button class="cardbtn primary">Start run</button>
+            </div>
+            <div class="card">
+              <div class="card-top"><span class="card-title">Slack chat surface</span><span class="iid">#191</span></div>
+              <div class="row chips"><span class="chip">enhancement</span></div>
+              <button class="cardbtn primary">Start run</button>
+            </div>
+          </div>
+        </div>
+        <div class="lane">
+          <div class="lane-hd"><span>Planned</span><span class="n">1</span></div>
+          <div class="lane-body">
+            <div class="card">
+              <div class="card-top"><span class="card-title">Live cost estimate in the usage panel</span><span class="iid">#194</span></div>
+              <div class="row"><span class="badge brand">PRDLESS</span></div>
+              <button class="cardbtn primary">Start run</button>
+            </div>
+          </div>
+        </div>
+        <div class="lane">
+          <div class="lane-hd"><span>In Progress</span><span class="n">1</span></div>
+          <div class="lane-body">
+            <div class="card">
+              <div class="card-top"><span class="card-title">Judge triage queue</span><span class="iid">#94</span></div>
+              <div class="row"><span class="badge info">running</span><span style="font-size:11px;color:rgb(var(--faint))">2 runs</span></div>
+              <div class="card-foot">wrk-01 &middot; view run</div>
+            </div>
+          </div>
+        </div>
+        <div class="lane">
+          <div class="lane-hd"><span>Human Review</span><span class="n">1</span></div>
+          <div class="lane-body">
+            <div class="card">
+              <div class="card-top"><span class="card-title">Worker upgrade status</span><span class="iid">#113</span></div>
+              <div class="row"><span class="badge ok">!144 merged</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="lane">
+          <div class="lane-hd"><span>Later</span><span class="n">0</span></div>
+          <div class="lane-body"><div class="ghost">no cards</div></div>
+        </div>
+      </div>
+
+      <div class="anno warn"><b>Nothing needs fetching.</b>
+        <span><code>api/internal/handler/board.go:205</code> already ships <em>every</em> cached open
+        issue, labelled or not. The six <code>bug</code> cards are in the payload on this very page load
+        &mdash; <code>visibleCards()</code> drops them at render. So this whole PRD is a filter change,
+        not a sync change.</span></div>
+    </div>
+  </section>
+
+  <!-- ═════════ 3 ═════════ -->
+  <section>
+    <div class="where"><h2>3 &middot; Proposed &mdash; the control</h2><span>the checkbox becomes a label filter</span></div>
+    <div class="panel">
+      <div class="hdr">
+        <div class="hdr-top">
+          <h1>vtmocanu/uzi</h1>
+          <div class="actions">
+            <span class="ctl">Sort <select class="mini"><option>Manual</option></select></span>
+            <button class="btn filter on">Issues: <b style="color:rgb(var(--fg))">PRD, bug</b> <span class="caret">▾</span></button>
+            <label class="ctl"><input type="checkbox"> Hide empty</label>
+            <button class="btn primary">+ Create issue</button>
+            <button class="btn">Columns</button>
+            <button class="btn">Refresh</button>
+          </div>
+        </div>
+        <p class="desc">Columns are GitLab labels. Cards move automatically as their runs progress;
+        you can still drag a card to change its label on the forge. <b>PRD-labelled issues always appear
+        here; use "Issues" to bring other labels onto the board alongside them.</b></p>
+      </div>
+
+      <div class="side">
+        <div class="pop">
+          <div class="ph">Show issues labelled</div>
+          <div class="opt pinned"><input type="checkbox" checked disabled> PRD <span class="lock">always shown</span></div>
+          <div class="opt"><input type="checkbox" checked> bug <span class="cnt">6</span></div>
+          <div class="opt"><input type="checkbox"> enhancement <span class="cnt">3</span></div>
+          <div class="opt"><input type="checkbox"> documentation <span class="cnt">2</span></div>
+          <div class="opt"><input type="checkbox"> security <span class="cnt">1</span></div>
+          <hr>
+          <div class="opt"><input type="checkbox"> Show all other issues <span class="cnt">15</span></div>
+          <div class="pf"><span>Default: PRD, bug</span><a href="#">Reset to default</a></div>
+        </div>
+
+        <div class="grow" style="display:flex;flex-direction:column;gap:12px;">
+          <div class="anno"><b>Options come from the payload.</b>
+            <span>Same source the <code>Columns</code> suggester already uses
+            (<code>Board.tsx:1591-1600</code>): the distinct labels on the issues in hand. No typos, nothing
+            offered that matches zero cards, and the list grows as the repo does.</span></div>
+          <div class="anno"><b>Counts are what the row <i>adds</i>.</b>
+            <span><code>bug 6</code>, not <code>7</code> &mdash; the seventh bug issue also carries
+            <code>PRD</code> and is on the board already. The number answers "how much bigger does my
+            board get", which is the only question anyone asks of it.</span></div>
+          <div class="anno"><b>Only the PRIMARY label is pinned &mdash; and <code>bug</code> deliberately is not.</b>
+            <span>Membership is <code>primary ∪ extras</code>, <b>not</b> <code>eligible ∪ extras</code>.
+            <code>bug</code> ships run-eligible (§7), and if eligibility implied visibility it could
+            never be unticked &mdash; the "untick <code>bug</code> where they are noise" case below
+            would be impossible. So the two lists stay orthogonal, and only <code>PRD</code> renders
+            disabled, with the reason inline.</span></div>
+          <div class="anno ok"><b>The old boolean survives as the last row.</b>
+            <span><i>Show all other issues</i> is exactly today's <code>showNonPRD</code>, kept as the
+            escape hatch for "I do not know what label it has". Checking it greys the per-label rows.</span></div>
+          <div class="anno ok"><b>Reset to default closes the drift gap.</b>
+            <span>A user's set is absolute once saved, so an admin adding <code>security</code> later
+            will not reach anyone who has customised. This link is how they opt back in, and the footer
+            names the current default so they can see they have diverged.</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═════════ 4 ═════════ -->
+  <section>
+    <div class="where"><h2>4 &middot; Proposed &mdash; the board</h2><span>PRD + bug &middot; 11 cards, 9 drawn &middot; bug is runnable</span></div>
+    <div class="callout ok" style="margin-bottom:14px;">
+      <span class="stripe ok"></span>
+      <div>
+        <h3>Bug cards are visible <i>and</i> runnable, out of the box</h3>
+        <p><b>Decided:</b> <code>bug</code> ships in both default lists &mdash; visible on every board,
+        and run-eligible. So a bug card offers <b>Start run</b> directly, with no Promote step and no
+        PRDLESS step. That is the workflow this PRD exists for. §7 is the machinery underneath.</p>
+        <p><b>The cost, stated once and carried into the changelog:</b> both defaults land on every
+        existing instance at upgrade with no admin action, and the second one widens the
+        run-eligibility gate. What does <i>not</i> widen is autopilot &mdash; it keeps matching the
+        primary label only (<code>autopilot.sql:27</code>), so nothing new can start unattended. A
+        human still clicks Start.</p>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="lanes">
+        <div class="lane">
+          <div class="lane-hd"><span>Open</span><span class="n">5</span></div>
+          <div class="lane-body">
+            <div class="card">
+              <div class="card-top"><span class="card-title">Configurable board membership labels</span><span class="iid">#201</span></div>
+              <div class="row"><span class="badge warn">no PRD link</span></div>
+              <button class="cardbtn primary">Start run</button>
+            </div>
+            <div class="card new">
+              <div class="card-top"><span class="card-title">Board drag drops the card on Safari 17</span><span class="iid">#188</span></div>
+              <div class="row chips"><span class="chip hit">bug</span><span class="chip">web</span></div>
+              <div class="card-foot">vlad</div>
+              <button class="cardbtn primary">Start run</button>
+            </div>
+            <div class="card new">
+              <div class="card-top"><span class="card-title">Judge verdict panel overflows on narrow viewports</span><span class="iid">#186</span></div>
+              <div class="row chips"><span class="chip hit">bug</span></div>
+              <button class="cardbtn primary">Start run</button>
+            </div>
+            <div class="card new">
+              <div class="card-top"><span class="card-title">Worker heartbeat gap after a node drain</span><span class="iid">#181</span></div>
+              <div class="row chips"><span class="chip hit">bug</span><span class="chip">k8s</span></div>
+              <button class="cardbtn primary">Start run</button>
+            </div>
+            <div class="card">
+              <div class="card-top"><span class="card-title">Slack chat surface</span><span class="iid">#191</span></div>
+              <div class="row chips"><span class="chip">enhancement</span></div>
+              <button class="cardbtn primary">Start run</button>
+            </div>
+          </div>
+        </div>
+        <div class="lane">
+          <div class="lane-hd"><span>Planned</span><span class="n">2</span></div>
+          <div class="lane-body">
+            <div class="card">
+              <div class="card-top"><span class="card-title">Live cost estimate in the usage panel</span><span class="iid">#194</span></div>
+              <div class="row"><span class="badge brand">PRDLESS</span></div>
+              <button class="cardbtn primary">Start run</button>
+            </div>
+            <div class="card new">
+              <div class="card-top"><span class="card-title">Stale run rows after a sweeper restart</span><span class="iid">#177</span></div>
+              <div class="row chips"><span class="chip hit">bug</span></div>
+              <button class="cardbtn primary">Start run</button>
+            </div>
+          </div>
+        </div>
+        <div class="lane">
+          <div class="lane-hd"><span>In Progress</span><span class="n">1</span></div>
+          <div class="lane-body">
+            <div class="card">
+              <div class="card-top"><span class="card-title">Judge triage queue</span><span class="iid">#94</span></div>
+              <div class="row"><span class="badge info">running</span><span style="font-size:11px;color:rgb(var(--faint))">2 runs</span></div>
+              <div class="card-foot">wrk-01 &middot; view run</div>
+            </div>
+          </div>
+        </div>
+        <div class="lane">
+          <div class="lane-hd"><span>Human Review</span><span class="n">1</span></div>
+          <div class="lane-body">
+            <div class="card">
+              <div class="card-top"><span class="card-title">Worker upgrade status</span><span class="iid">#113</span></div>
+              <div class="row"><span class="badge ok">!144 merged</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="lane">
+          <div class="lane-hd"><span>Later</span><span class="n">0</span></div>
+          <div class="lane-body"><div class="ghost">no cards</div></div>
+        </div>
+      </div>
+
+      <div class="anno ok"><b>A matched label is a chip, and it is highlighted.</b>
+        <span>Unlike <code>PRD</code>, <code>bug</code> is real content, so it stays out of
+        <code>labelChips.ts</code>'s exclusion set and renders as an ordinary chip &mdash; tinted to
+        show <i>this</i> is why the card is here. <code>web</code> and <code>k8s</code> ride along plain.</span></div>
+      <div class="anno ok"><b>One click, and this is what the whole PRD buys.</b>
+        <span>Compare today: a bug issue needs <b>Promote → Mark PRDLESS → Start run</b>, three forge
+        writes that cannot even be reordered, because the PRDLESS toggle is itself gated on
+        <code>isPRD</code> (<code>Board.tsx:1491</code>). <i>Promote</i> is also not what its name
+        suggests &mdash; it writes the <code>PRD</code> <i>label</i> and nothing else
+        (<code>handler/board.go:946</code>); uzi cannot generate a PRD document, and never rewrites an
+        issue description (<code>docs/prdless.md:63</code>).</span></div>
+      <div class="anno bad"><b>Which means the PRD-link waiver must default ON.</b>
+        <span>A <code>bug</code> issue has no <code>prds/*.md</code> link, so without the waiver it
+        still dies at the second gate (<code>service.go:2879</code>) and you are back to two clicks with
+        a differently-worded button. <b>Eligible-by-a-non-primary-label ⇒ PRD link not required</b> is
+        therefore not a nicety in §5's settings panel, it is load-bearing for the screenshot above.</span></div>
+      <div class="anno"><b>Promote survives, for the labels that are visible but not eligible.</b>
+        <span><code>documentation</code> in §7 is the worked example: on the board, no <i>Start run</i>,
+        still one click to <i>Promote to PRD</i>. So the button keeps its job and its bad name &mdash;
+        renaming it to <b>Add PRD label</b> is a two-word fix worth folding in.</span></div>
+      <div class="anno"><b>No column label ⇒ the implicit Open lane.</b>
+        <span>Most <code>bug</code> issues carry no kanban label, so they pile into Open. #177 has
+        <code>Planned</code> and sorts there. Dragging one still writes the column label to the forge,
+        exactly as today.</span></div>
+    </div>
+  </section>
+
+  <!-- ═════════ 5 ═════════ -->
+  <section>
+    <div class="where"><h2>5 &middot; Proposed &mdash; the instance default</h2><span>Admin &rsaquo; Settings &rsaquo; Labels</span></div>
+    <div class="side">
+      <div class="panel grow">
+        <div>
+          <h3 style="font-size:14px;">Labels</h3>
+          <p class="hint" style="margin-top:3px;">Which GitLab labels this factory reacts to. Changing a
+          label never creates it on the forge &mdash; create the label in GitLab yourself. The labels
+          must all differ.</p>
+        </div>
+        <div class="field">
+          <label>PRD label</label>
+          <div class="input">PRD</div>
+          <p class="hint">Marks an issue as factory work. Only issues carrying this label can be run by an agent.</p>
+        </div>
+        <div class="field">
+          <label>Also show on boards <span style="font-weight:400;color:rgb(var(--faint))">(optional)</span></label>
+          <div class="input tags">
+            <span class="tag">bug <span class="x">×</span></span>
+            <span class="ph">add a label…</span>
+          </div>
+          <p class="hint">The default set of extra labels every board starts with. Issues carrying one
+          appear alongside PRD issues, but still cannot start a run until promoted. Each user can
+          override this for themselves per repo.</p>
+        </div>
+        <div class="field">
+          <label>Autopilot label</label>
+          <div class="input">autopilot</div>
+          <p class="hint">Adding this label to a PRD issue lets an opted-in user run it end to end, with no plan-approval step.</p>
+        </div>
+      </div>
+
+      <div class="grow" style="display:flex;flex-direction:column;gap:12px;">
+        <div class="anno"><b>Free text here, picker there.</b>
+          <span>Admin is a text-entry tag input, because an operator legitimately pre-configures a label
+          before any issue carries it. The per-user popover in §3 is a picker over labels actually
+          present &mdash; different jobs, different affordances.</span></div>
+        <div class="anno warn"><b>Validated like its siblings.</b>
+          <span><code>settings.go:1017</code> already rejects a <code>prdless_label</code> colliding
+          with <code>prd_label</code> or <code>autopilot_label</code>. The new list gets the same
+          treatment: no duplicates, none equal to the three workflow labels, and a cap on list length.</span></div>
+        <div class="anno ok"><b>Decided: <code>bug</code> ships in BOTH default lists.</b>
+          <span>Visible <i>and</i> run-eligible (§7), not empty and not visibility-only. A board is more
+          useful with bugs on it than without, and a bug you can see but cannot start is the friction
+          this PRD set out to remove. An operator who disagrees clears one tag.</span></div>
+        <div class="anno warn"><b>So every existing instance changes on upgrade, in two ways.</b>
+          <span>Compiled defaults apply to any instance that never set the key
+          (<code>settings.go:176</code>): boards gain their <code>bug</code> cards <i>and</i> those
+          cards gain a <b>Start run</b> button, with no admin action. The visibility half is cosmetic
+          and per-user reversible; <b>the eligibility half is a run-gate change and needs to be called
+          out in the changelog and the release notes</b>, not discovered.</span></div>
+        <div class="anno bad"><b>Autopilot is the line that does not move.</b>
+          <span>Its candidate query keeps matching the <b>primary</b> label only
+          (<code>autopilot.sql:27</code>), so no issue becomes startable <i>unattended</i> that was not
+          already. Everything above requires a human to click. That asymmetry is what makes an
+          opinionated default defensible at all, and it must be an explicit non-change in the diff, with
+          a test that fails if someone "tidies" it into the set.</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═════════ 6 ═════════ -->
+  <section>
+    <div class="where"><h2>6 &middot; Rules, and two sentences that are already wrong</h2><span>precedence &middot; product copy</span></div>
+
+    <div class="callout ok" style="margin-bottom:14px;">
+      <span class="stripe ok"></span>
+      <div>
+        <h3>Precedence, stated once</h3>
+        <p>The membership set is <b>always</b> <code>prd_label</code> ∪ <i>extras</i>. Extras resolve
+        as: the user's saved set for this repo if one exists, otherwise the admin default. A user's set
+        is <b>absolute</b>, not a delta &mdash; simpler to reason about than a diff model, at the price
+        that later admin changes do not reach a customised user, which <i>Reset to default</i> answers.</p>
+        <p>Storage is server-side per user, per repo, so it follows the account rather than the browser.
+        There is no per-user settings table today, so this is new surface: a migration, a small
+        read/write endpoint pair, and the board reading it at load.</p>
+        <p>Note the left operand is the <b>primary</b> label, not the run-eligible set. Eligibility
+        does <b>not</b> imply visibility &mdash; otherwise <code>bug</code>, which ships eligible by
+        default (§7), could never be unticked, and the "untick <code>bug</code> on a repo where they
+        are noise" journey in §3 would be impossible. The two lists stay orthogonal.</p>
+        <p>Unchanged in every case: the <code>uzi-self-improve</code> tracker is never rendered.
+        <b>Closed issues are NOT excluded</b> &mdash; the board has a Closed column
+        (<code>Board.tsx:57,502</code>) and <code>visibleCards</code> has no state filter, so closed
+        <code>PRD</code> cards keep appearing there exactly as today.</p>
+      </div>
+    </div>
+
+    <div class="callout bad" style="margin-bottom:14px;">
+      <span class="stripe bad"></span>
+      <div>
+        <h3>Two shipped strings are already false, before this PRD touches anything</h3>
+        <p>Both are rendered product copy &mdash; invisible to any sweep of <code>docs/</code> or code
+        comments, and the only sentences a user actually reads about what a board contains. They went
+        stale when PRD #102 M6 added the <i>Show other issues</i> toggle, so fixing them is owed
+        regardless of whether this proposal ships.</p>
+      </div>
+    </div>
+
+    <div class="panel">
+      <table class="copy">
+        <thead><tr><th style="width:230px">Where</th><th>Copy</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>AdminSettings.tsx:278</code><br><span class="hint">under the PRD label field</span></td>
+            <td><p class="was">Marks an issue as factory work. The board only shows issues carrying this label.</p>
+                <p class="now">Marks an issue as factory work. Only issues carrying this label can be run by an agent.</p>
+                <p class="hint" style="margin-top:5px;">False since the toggle landed: a board can already show issues without it. The replacement states the invariant that <i>is</i> true and stays true after this PRD.</p></td>
+          </tr>
+          <tr>
+            <td><code>Board.tsx:708-711</code><br><span class="hint">the board description</span></td>
+            <td><p class="was">…turn on "Show other issues" to see the repo's other open issues alongside them.</p>
+                <p class="now">…use "Issues" to bring other labels onto the board alongside them.</p>
+                <p class="hint" style="margin-top:5px;">Accurate today; becomes wrong the moment the control is renamed. Flagged because the source comment at <code>:704</code> records that this exact sentence was already missed once.</p></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout warn" style="margin-top:14px;">
+      <span class="stripe warn"></span>
+      <div>
+        <h3>Phase 1 &mdash; decided</h3>
+        <p><b>1. <span class="now">Answered</span>:</b> <code>bug</code> ships in <b>both</b> default lists &mdash; extras <code>["bug"]</code> and run-eligible <code>["PRD","bug"]</code>. See §5 and §7.</p>
+        <p><b>2.</b> Per-repo per-user, taken as proposed: it matches today's <code>uzi.board.&lt;repoId&gt;.showNonPRD</code> key shape, and a monorepo and a docs repo do not want the same labels. More rows, more clicks; say so if you would rather have one set per user.</p>
+        <p><b>3.</b> Does the CLI need it? <code>uzi board</code> renders the same cards; the CLI-parity convention says check, and the answer is likely "read the setting, no flag".</p>
+        <p><b>4.</b> <code>showNonPRD: true</code> should <b>migrate</b>, not lapse: seed that user's set with <i>Show all other issues</i> checked. Letting it lapse silently narrows the board of the only users who had deliberately widened it.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═════════ 7 ═════════ -->
+  <section>
+    <div class="where"><h2>7 &middot; The machinery under §4's Start-run button</h2><span>eligibility is a different list from visibility</span></div>
+
+    <div class="callout ok" style="margin-bottom:14px;">
+      <span class="stripe ok"></span>
+      <div>
+        <h3>Why loosening the run gate is defensible here</h3>
+        <p>Today's gate (<code>workersvc/service.go:2872</code>, PRD #102 Decision 14) has a narrow
+        stated purpose: it exists so <i>"a non-PRD issue that happens to contain a
+        <code>prds/*.md</code> link would [not] become runnable <b>by accident</b>"</i>
+        (<code>prds/done/102-board-v2.md:501</code>). A human clicking Start on a card carrying a label
+        an admin deliberately configured as run-eligible is not that accident.</p>
+        <p>And the autonomous path is gated separately, not by this: autopilot's candidate query
+        requires <b>both</b> the autopilot label <b>and</b> the primary label
+        (<code>store/queries/autopilot.sql:26-27</code>). So this changes what a human may point uzi at,
+        and nothing about what uzi picks up by itself.</p>
+        <p><b>The one structural rule:</b> eligibility is a <b>separate list with a different owner</b>
+        &mdash; never the §3 visibility list made runnable. A per-user view preference must not be able
+        to widen what an agent can be told to work on a shared instance.</p>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-bottom:14px;">
+      <table class="copy">
+        <thead><tr><th style="width:210px">List</th><th style="width:230px">Means</th><th>Who sets it</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><b>Run-eligible labels</b><br><span class="hint"><code>prd_label</code> generalised from one string to a set &mdash; default <code>["PRD","bug"]</code></span></td>
+            <td>"uzi may work this"</td>
+            <td><b class="now">Admin only.</b> It decides what an agent can be pointed at, so it is instance policy. A user granting it to themselves on a shared instance is the thing to prevent.</td>
+          </tr>
+          <tr>
+            <td><b>Board extra labels</b><br><span class="hint">§3 / §5</span></td>
+            <td>"show me these too"</td>
+            <td>Admin default + <b>per-user</b> override. A view preference; costs nothing to get wrong.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="side">
+      <div class="panel grow" style="flex:1 1 420px;">
+        <div class="lane" style="width:100%;">
+          <div class="lane-hd"><span>Open &mdash; eligible vs visible-only</span><span class="n">3</span></div>
+          <div class="lane-body">
+            <div class="card new">
+              <div class="card-top"><span class="card-title">Board drag drops the card on Safari 17</span><span class="iid">#188</span></div>
+              <div class="row chips"><span class="chip hit">bug</span><span class="chip">web</span></div>
+              <div class="card-foot">vlad</div>
+              <button class="cardbtn primary">Start run</button>
+            </div>
+            <div class="card new">
+              <div class="card-top"><span class="card-title">Worker heartbeat gap after a node drain</span><span class="iid">#181</span></div>
+              <div class="row chips"><span class="chip hit">bug</span><span class="chip">k8s</span></div>
+              <button class="cardbtn primary">Start run</button>
+            </div>
+            <div class="card">
+              <div class="card-top"><span class="card-title">Docs: fix the smoke.sh port example</span><span class="iid">#173</span></div>
+              <div class="row chips"><span class="chip">documentation</span></div>
+              <button class="cardbtn">Promote to PRD</button>
+            </div>
+          </div>
+        </div>
+        <p class="hint" style="margin-top:2px;">The contrast, on one lane. <code>bug</code> is in the
+        eligibility set, so those cards get <b>Start run</b>. <code>documentation</code> is
+        visibility-only, so #173 still gets <b>Promote to PRD</b> &mdash; the two lists producing two
+        different cards is the whole point of keeping them separate.</p>
+      </div>
+
+      <div class="panel grow" style="flex:1 1 380px;">
+        <div>
+          <h3 style="font-size:14px;">Labels</h3>
+          <p class="hint" style="margin-top:3px;">Admin &rsaquo; Settings &rsaquo; Labels</p>
+        </div>
+        <div class="field">
+          <label>Run-eligible labels</label>
+          <div class="input tags">
+            <span class="tag" style="border-color:rgb(var(--brand) / .55)">PRD <span class="ph" style="font-size:10px">primary</span></span>
+            <span class="tag">bug <span class="x">×</span></span>
+            <span class="ph">add a label…</span>
+          </div>
+          <p class="hint">Shipped default: <code>PRD</code>, <code>bug</code>. An issue carrying any of
+          these can be started by a user. The <b>primary</b> is the one uzi <i>writes</i> — on Promote,
+          and when the judge files an issue — and the only one autopilot matches. It cannot be removed.</p>
+        </div>
+        <div class="field">
+          <label>Also show on boards <span style="font-weight:400;color:rgb(var(--faint))">(optional)</span></label>
+          <div class="input tags">
+            <span class="tag">documentation <span class="x">×</span></span>
+            <span class="ph">add a label…</span>
+          </div>
+          <p class="hint">Visible on boards, but still not runnable until promoted. Run-eligible labels
+          are shown automatically and need no entry here.</p>
+        </div>
+        <label class="ctl" style="font-size:12.5px;"><input type="checkbox" checked> A non-primary eligible label waives the PRD-link requirement</label>
+        <p class="hint" style="margin-top:-6px;"><b>Defaults ON, and §4 depends on it.</b> Off: a
+        <code>bug</code> issue still needs a <code>prds/*.md</code> link or <code>PRDLESS</code>, so the
+        one-click Start becomes two clicks with a differently-worded button.</p>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:14px;">
+      <div class="anno ok"><b>Autopilot does not widen. At all.</b>
+        <span><code>autopilot.sql:27</code> keeps matching the <b>primary</b> label only, so unattended
+        pickup is exactly as narrow as today. Manual start widens; autonomous start does not. One line
+        of deliberate non-change, and it is the half that makes the rest safe.</span></div>
+      <div class="anno bad"><b>Writers use the primary; readers use the set. Getting this backwards is the bug this design invites.</b>
+        <span>Ten server-side consumers of <code>settings.PRDLabel</code> today. Gates become set
+        checks: <code>workersvc/service.go:2872</code>. <b>Writers must not</b>: Promote
+        (<code>board.go:981</code>), the judge filing an issue
+        (<code>review_issue_draft.go:102</code>, <code>review_issue_file.go:131</code>), issue creation
+        (<code>issues.go:62</code>). A writer that picks "the first label in the set" starts labelling
+        new issues <code>bug</code>.</span></div>
+      <div class="anno"><b>The PRDLESS toggle's gate loosens with it.</b>
+        <span><code>Board.tsx:1491</code> shows it only when <code>isPRD</code>. That becomes "is
+        run-eligible", or the checkbox above makes it moot for eligible labels. Decision 16's reasoning
+        survives untouched: the button must not appear where it grants nothing.</span></div>
+      <div class="anno warn"><b>Open questions &mdash; eligibility</b>
+        <span><b>5.</b> Is the PRD-link waiver per-instance (the checkbox above) or per-label?
+        <b>6.</b> Does a run started from a <code>bug</code> issue still get asked to update a
+        <code>prds/*.md</code> file, or does the lead prompt branch? Today's instruction already opens
+        on <i>"if the issue description links a <code>prds/*.md</code> file"</i>
+        (<code>docs/prdless.md:57</code>), so this may already be answered.
+        <b>7.</b> <code>uzi run start</code> hits the same endpoint and is covered server-side &mdash;
+        but does <code>uzi board</code> need to render the new button state?
+        <b>8.</b> Does <code>PRDLESS</code> still earn its keep once a whole label can waive the PRD
+        link, or does it become the one-off version of the same idea?</span></div>
+    </div>
+
+    <div class="callout bad" style="margin-top:14px;">
+      <span class="stripe bad"></span>
+      <div>
+        <h3>What this half costs, stated plainly</h3>
+        <p>The visibility half is a render filter plus a settings row: it cannot break a run. This half
+        edits the run-eligibility gate, which is guardrail-adjacent, and touches ten call sites where
+        the read/write distinction above is <b>invisible to the type system</b> &mdash; every one of
+        them is a bare <code>string</code> today, so nothing fails to compile if a writer is handed the
+        set.</p>
+        <p>Recommendation: <b>one PRD, two milestones, the eligibility milestone reviewed on its own</b>
+        with the autopilot non-change asserted by a test. Splitting into two PRDs would ship the first
+        half into exactly the three-click friction that prompted the second; merging them into one
+        milestone hides a run-gate change inside a UI change.</p>
+      </div>
+    </div>
+  </section>
+
+</div>

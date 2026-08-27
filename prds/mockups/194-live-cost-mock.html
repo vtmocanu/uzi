@@ -1,0 +1,286 @@
+<title>Live cost estimate — mock (PRD #194)</title>
+<style>
+  /* uzi "ember" dark-factory palette, lifted from web/src/index.css :root.
+     The product ships two dark themes and no light one; this mock deliberately
+     commits to that one visual world rather than inventing a light variant
+     (same choice as 113-worker-upgrade-status-mock.html).
+
+     Layout tracks the SHIPPING RunUsagePanel rather than inventing one: stat
+     strip, per-phase breakdown, per-agent breakdown, footnote. */
+  :root {
+    --bg: 8 10 15;
+    --surface: 15 18 26;
+    --raised: 23 27 38;
+    --edge: 39 45 60;
+    --edge-strong: 58 66 86;
+    --fg: 228 232 240;
+    --muted: 148 158 176;
+    --faint: 122 133 154;
+    --ok: 52 211 153;
+    --warn: 251 191 36;
+    --info: 56 189 248;
+    --danger: 251 113 133;
+    --brand: 251 146 60;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: rgb(var(--bg)); color: rgb(var(--fg));
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 14px; line-height: 1.6; -webkit-font-smoothing: antialiased;
+    display: flex; justify-content: center; padding: 40px 20px 90px;
+  }
+  .wrap { width: 100%; max-width: 980px; display: flex; flex-direction: column; gap: 42px; }
+  h1, h2, h3 { margin: 0; font-weight: 600; text-wrap: balance; }
+  p { margin: 0; }
+  .num, code { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+
+  .mock-note {
+    border: 1px solid rgb(var(--edge)); border-left: 3px solid rgb(var(--brand));
+    background: rgb(var(--surface)); border-radius: 8px; padding: 14px 16px;
+    font-size: 13px; color: rgb(var(--muted));
+  }
+  .mock-note strong { color: rgb(var(--fg)); }
+
+  .where {
+    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+    padding-bottom: 10px; margin-bottom: 14px; border-bottom: 1px solid rgb(var(--edge));
+  }
+  .where h2 { font-size: 15px; }
+  .where span { font-size: 12px; color: rgb(var(--faint)); font-family: var(--font-mono); }
+
+  .panel {
+    background: rgb(var(--surface)); border: 1px solid rgb(var(--edge));
+    border-radius: 12px; padding: 16px;
+    display: flex; flex-direction: column; gap: 16px;
+  }
+
+  /* stat strip — mirrors the shipping component */
+  .strip {
+    display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+    border: 1px solid rgb(var(--edge)); border-radius: 9px; overflow: hidden;
+    background: rgb(var(--raised) / 0.45);
+  }
+  @media (max-width: 720px) { .strip { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+  .stat { padding: 12px 14px; border-right: 1px solid rgb(var(--edge)); }
+  .stat:last-child { border-right: 0; }
+  .stat .k {
+    font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+    color: rgb(var(--faint)); font-weight: 600;
+  }
+  .stat .v {
+    font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+    font-size: 23px; line-height: 1.25; margin-top: 2px;
+  }
+  .stat .d { font-size: 11px; color: rgb(var(--muted)); }
+  .stat .d2 { font-size: 11px; color: rgb(var(--faint)); }
+  .cost .v { color: rgb(var(--brand)); }
+  .cachebar { margin-top: 6px; display: flex; height: 4px; border-radius: 3px; overflow: hidden; background: rgb(var(--edge)); }
+  .cachebar i { display: block; height: 100%; }
+  .cachebar .hit { background: rgb(var(--info)); }
+  .cachebar .miss { background: rgb(var(--warn) / .8); }
+
+  .tilde { color: rgb(var(--faint)); }
+  .pill {
+    display: inline-flex; align-items: center; gap: 5px; border-radius: 999px;
+    padding: 1px 7px; font-size: 9.5px; font-weight: 600; letter-spacing: .06em;
+    text-transform: uppercase; border: 1px solid; vertical-align: middle;
+  }
+  .pill.est  { color: rgb(var(--warn)); border-color: rgb(var(--warn) / .45); background: rgb(var(--warn) / .12); }
+  .pill.conf { color: rgb(var(--ok));   border-color: rgb(var(--ok) / .45);   background: rgb(var(--ok) / .12); }
+  .pill.bad  { color: rgb(var(--danger)); border-color: rgb(var(--danger) / .45); background: rgb(var(--danger) / .12); }
+
+  .sect { font-size: 12.5px; color: rgb(var(--muted)); }
+  .sect::before { content: "▾ "; color: rgb(var(--faint)); }
+
+  .tablewrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: right; padding: 7px 8px; border-bottom: 1px solid rgb(var(--edge)); white-space: nowrap; }
+  th:first-child, td:first-child, th.l, td.l { text-align: left; }
+  thead th {
+    color: rgb(var(--faint)); font-weight: 600; font-size: 10px;
+    text-transform: uppercase; letter-spacing: .07em;
+  }
+  tbody tr:last-child td { border-bottom: 0; }
+  tfoot td { border-top: 1px solid rgb(var(--edge-strong)); border-bottom: 0; font-weight: 600; }
+  td.n, th.n { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  td.mdl { font-family: var(--font-mono); color: rgb(var(--muted)); font-size: 12px; }
+  .swatch { display: inline-block; width: 7px; height: 7px; border-radius: 2px; margin-right: 7px; }
+  .foot { font-size: 11.5px; color: rgb(var(--faint)); }
+
+  .anno {
+    display: flex; gap: 10px; align-items: flex-start;
+    font-size: 12px; color: rgb(var(--muted));
+    border-left: 2px solid rgb(var(--danger)); padding-left: 11px;
+  }
+  .anno.ok { border-left-color: rgb(var(--ok)); }
+  .anno b { color: rgb(var(--fg)); font-weight: 600; }
+
+  .callout { display: flex; gap: 12px; align-items: flex-start; border-radius: 8px; padding: 14px 16px; border: 1px solid; }
+  .callout.warn { border-color: rgb(var(--warn) / .4); background: rgb(var(--warn) / .07); }
+  .callout.bad  { border-color: rgb(var(--danger) / .4); background: rgb(var(--danger) / .07); }
+  .callout.ok   { border-color: rgb(var(--ok) / .4); background: rgb(var(--ok) / .07); }
+  .callout h3 { font-size: 13px; margin-bottom: 3px; }
+  .callout p { font-size: 12.5px; color: rgb(var(--muted)); }
+  .stripe { width: 3px; align-self: stretch; border-radius: 2px; flex: none; }
+  .stripe.warn { background: rgb(var(--warn)); }
+  .stripe.bad { background: rgb(var(--danger)); }
+  .stripe.ok { background: rgb(var(--ok)); }
+</style>
+
+<div class="wrap">
+
+  <p class="mock-note"><strong>Mock — live cost in the run usage panel (PRD #194).</strong>
+  Layout follows the shipping <code>RunUsagePanel</code>. Every figure is real, from run
+  <code>84b6a933</code> (PRD #119) at <span class="num">10:57Z</span> on 2026-07-29 &mdash; still on
+  <span class="num">1 phase</span> after nearly two hours, which is the condition this PRD exists for.
+  Section&nbsp;1 reproduces what the panel shows today; sections&nbsp;2&ndash;3 are the proposal.</p>
+
+  <!-- ═════════ 1 ═════════ -->
+  <section>
+    <div class="where"><h2>1 &middot; Today</h2><span>three populations on one screen</span></div>
+    <div class="panel">
+      <div class="strip">
+        <div class="stat">
+          <div class="k">Tokens in</div><div class="v">725.2k</div>
+          <div class="d">90% from cache</div>
+          <div class="cachebar"><i class="hit" style="width:90%"></i><i class="miss" style="width:10%"></i></div>
+        </div>
+        <div class="stat"><div class="k">Tokens out</div><div class="v">16.9k</div><div class="d">1 phase &middot; 19 turns</div></div>
+        <div class="stat"><div class="k">Duration</div><div class="v">9m 27s</div><div class="d">claude-opus-5</div></div>
+        <div class="stat cost"><div class="k">Cost</div><div class="v">$3.53</div><div class="d">your Anthropic token</div></div>
+      </div>
+
+      <div class="sect">Per-phase breakdown</div>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Phase</th><th class="n">Turns</th><th class="n">In (fresh)</th><th class="n">In (cached)</th><th class="n">Out</th><th class="n">Cost</th></tr></thead>
+        <tbody><tr><td>Plan</td><td class="n">19</td><td class="n">72.1k</td><td class="n">653.1k</td><td class="n">16.9k</td><td class="n">$3.53</td></tr></tbody>
+        <tfoot><tr><td>Run total</td><td class="n">19</td><td class="n">72.1k</td><td class="n">653.1k</td><td class="n">16.9k</td><td class="n">$3.53</td></tr></tfoot>
+      </table></div>
+
+      <div class="sect">Per-agent breakdown</div>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Agent</th><th class="l">Model</th><th class="n">In (fresh)</th><th class="n">In (cached)</th><th class="n">Out</th></tr></thead>
+        <tbody>
+          <tr><td><span class="swatch" style="background:rgb(var(--brand))"></span>lead</td><td class="mdl">claude-opus-5</td><td class="n">292.9k</td><td class="n">10.8M</td><td class="n">1.3k</td></tr>
+          <tr><td><span class="swatch" style="background:rgb(var(--info))"></span>coder</td><td class="mdl">claude-opus-5</td><td class="n">910.6k</td><td class="n">29.6M</td><td class="n">9.2k</td></tr>
+          <tr><td colspan="5" style="color:rgb(var(--faint));font-style:italic;">… 8 more roles …</td></tr>
+        </tbody>
+        <tfoot><tr><td>Attributed total</td><td class="mdl">2 models</td><td class="n">2.69M</td><td class="n">75.46M</td><td class="n">19.7k</td></tr></tfoot>
+      </table></div>
+
+      <p class="foot">Attributed from each agent's assistant messages; may not sum to the run total
+      (tokens only &mdash; per-agent cost is not available).</p>
+
+      <div class="anno"><b>725.2k</b>
+        <span>strip and phase table read the result frame's <b>top-level <code>usage</code></b>.</span></div>
+      <div class="anno"><b>2.32M</b>
+        <span>the board, <code>uzi run list</code> and admin read <b><code>modelUsage</code></b> for the same frame &mdash; issue #195.</span></div>
+      <div class="anno"><b>78.15M</b>
+        <span>per-agent reads <b>raw assistant frames</b>, undeduped, and covers the whole run rather than just the finished phase.</span></div>
+    </div>
+  </section>
+
+  <!-- ═════════ 2 ═════════ -->
+  <section>
+    <div class="where"><h2>2 &middot; After #195, dedupe, and the cost column</h2><span>each dollar figure gets its own breakdown</span></div>
+    <div class="panel">
+      <div class="strip">
+        <div class="stat">
+          <div class="k">Tokens in</div>
+          <div class="v"><span class="tilde">~</span>67.7M</div>
+          <div class="d">97% from cache</div>
+          <div class="cachebar"><i class="hit" style="width:97%"></i><i class="miss" style="width:3%"></i></div>
+          <div class="d2">2.32M confirmed through Plan</div>
+        </div>
+        <div class="stat">
+          <div class="k">Tokens out</div>
+          <div class="v"><span class="tilde">~</span>18.1k</div>
+          <div class="d">844 calls &middot; 1 phase done</div>
+          <div class="d2">41.8k confirmed through Plan</div>
+        </div>
+        <div class="stat"><div class="k">Duration</div><div class="v">1h 56m</div><div class="d">2 models</div></div>
+        <div class="stat cost">
+          <div class="k">Cost</div>
+          <div class="v"><span class="tilde">~</span>$45.11 <span class="pill est">Est</span></div>
+          <div class="d2">$3.53 confirmed through Plan</div>
+        </div>
+      </div>
+
+      <div class="sect">Per-phase breakdown &mdash; <span class="pill conf">Confirmed</span> billed, from result frames</div>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Phase</th><th class="n">Turns</th><th class="n">In (fresh)</th><th class="n">In (cached)</th><th class="n">Out</th><th class="n">Cost</th></tr></thead>
+        <tbody><tr><td>Plan</td><td class="n">19</td><td class="n">188.8k</td><td class="n">2.13M</td><td class="n">41.8k</td><td class="n">$3.53</td></tr></tbody>
+        <tfoot><tr><td>Confirmed total</td><td class="n">19</td><td class="n">188.8k</td><td class="n">2.13M</td><td class="n">41.8k</td><td class="n">$3.53</td></tr></tfoot>
+      </table></div>
+
+      <div class="sect">Per-agent breakdown &mdash; <span class="pill est">Estimate</span> live, from assistant frames</div>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Agent</th><th class="l">Model</th><th class="n">Calls</th><th class="n">In (fresh)</th><th class="n">In (cached)</th><th class="n">Out</th><th class="n">Est. cost</th></tr></thead>
+        <tbody>
+          <tr><td><span class="swatch" style="background:rgb(var(--info))"></span>coder</td><td class="mdl">opus-5</td><td class="n">336</td><td class="n">637.8k</td><td class="n">27.9M</td><td class="n">8.6k</td><td class="n">$18.14</td></tr>
+          <tr><td><span class="swatch" style="background:rgb(var(--brand))"></span>lead</td><td class="mdl">opus-5</td><td class="n">64</td><td class="n">292.9k</td><td class="n">8.8M</td><td class="n">1.3k</td><td class="n">$7.38</td></tr>
+          <tr><td><span class="swatch" style="background:rgb(var(--info))"></span>tester</td><td class="mdl">opus-5</td><td class="n">88</td><td class="n">124.9k</td><td class="n">7.1M</td><td class="n">2.8k</td><td class="n">$4.40</td></tr>
+          <tr><td><span class="swatch" style="background:rgb(var(--info))"></span>fact-checker</td><td class="mdl">opus-5</td><td class="n">65</td><td class="n">148.2k</td><td class="n">5.9M</td><td class="n">1.0k</td><td class="n">$3.91</td></tr>
+          <tr><td><span class="swatch" style="background:rgb(var(--info))"></span>reviewer</td><td class="mdl">opus-5</td><td class="n">53</td><td class="n">150.6k</td><td class="n">4.8M</td><td class="n">672</td><td class="n">$3.35</td></tr>
+          <tr><td><span class="swatch" style="background:rgb(var(--info))"></span>spec-keeper</td><td class="mdl">opus-5</td><td class="n">73</td><td class="n">171.6k</td><td class="n">4.1M</td><td class="n">1.6k</td><td class="n">$3.19</td></tr>
+          <tr><td><span class="swatch" style="background:rgb(var(--info))"></span>researcher</td><td class="mdl">opus-5</td><td class="n">38</td><td class="n">110.2k</td><td class="n">1.4M</td><td class="n">431</td><td class="n">$1.38</td></tr>
+          <tr><td><span class="swatch" style="background:rgb(var(--info))"></span>auditor</td><td class="mdl">opus-5</td><td class="n">36</td><td class="n">71.2k</td><td class="n">1.8M</td><td class="n">518</td><td class="n">$1.38</td></tr>
+          <tr><td><span class="swatch" style="background:rgb(var(--info))"></span>web-ux</td><td class="mdl">opus-5</td><td class="n">40</td><td class="n">59.5k</td><td class="n">1.5M</td><td class="n">613</td><td class="n">$1.16</td></tr>
+          <tr><td><span class="swatch" style="background:rgb(var(--info))"></span>documenter</td><td class="mdl">sonnet-5</td><td class="n">51</td><td class="n">132.0k</td><td class="n">2.4M</td><td class="n">569</td><td class="n">$0.82</td></tr>
+        </tbody>
+        <tfoot><tr><td>Estimated total</td><td class="mdl">2 models</td><td class="n">844</td><td class="n">1.9M</td><td class="n">65.8M</td><td class="n">18.1k</td><td class="n">$45.11</td></tr></tfoot>
+      </table></div>
+
+      <p class="foot">The estimate covers every model call so far; the confirmed figure covers only phases
+      that have reported. The estimate runs ahead by design &mdash; that gap is work in flight, not an error.</p>
+
+      <div class="anno ok"><b>Why this reads straight:</b>
+        <span>each dollar figure now owns a table. <b>Confirmed $3.53</b> is the per-phase table;
+        <b>estimated $45.11</b> is the per-agent table. Today they sit in one panel with a footnote
+        between them and no way to tell which is which.</span></div>
+    </div>
+  </section>
+
+  <!-- ═════════ 3 ═════════ -->
+  <section>
+    <div class="where"><h2>3 &middot; The thing that blocks section 2</h2><span>visible in the strip above, not just in the cost</span></div>
+    <div class="callout bad" style="margin-bottom:16px;">
+      <span class="stripe bad"></span>
+      <div>
+        <h3>Estimated <em>tokens out</em> is lower than confirmed tokens out</h3>
+        <p>Look at the second stat in section&nbsp;2: <span class="num">~18.1k</span> estimated across the
+        whole run against <span class="num">41.8k</span> confirmed for the <em>Plan phase alone</em>. A
+        live figure that covers more work cannot legitimately be smaller. Per-call
+        <code>output_tokens</code> reads p50&nbsp;3, max&nbsp;73 &mdash; a <code>message_start</code>
+        snapshot, not a final count.</p>
+        <p style="margin-top:8px;">This is why M0 gates the PRD, and it is worse than a pricing error:
+        it makes the panel <b>self-contradictory in a way a user can see without knowing anything about
+        our data paths</b>. Ship section&nbsp;2 with this unresolved and the first question is not "is
+        the estimate accurate", it is "why does your own panel disagree with itself".</p>
+      </div>
+    </div>
+    <div class="callout warn">
+      <span class="stripe warn"></span>
+      <div>
+        <h3>And it understates cost by roughly a third</h3>
+        <p>On the Plan phase, where both numbers exist: deduped estimate
+        <span class="num">$2.37</span> against billed <span class="num">$3.53</span>, <b>&minus;33%</b>.
+        Feed the same estimator a real output count and it lands at <span class="num">$3.40</span>,
+        <b>&minus;3.9%</b>. The missing output is worth 29% of the phase.</p>
+      </div>
+    </div>
+    <div class="callout ok" style="margin-top:16px;">
+      <span class="stripe ok"></span>
+      <div>
+        <h3>Nothing else here is in doubt</h3>
+        <p>The rate table reproduces the SDK's own <code>total_cost_usd</code> to
+        <span class="num">8.9e-16</span>, and the per-agent attribution is the existing shipped
+        reduction with a dedupe on top. Sequencing is #195, then dedupe, then this column.</p>
+      </div>
+    </div>
+  </section>
+
+</div>

@@ -1,0 +1,24 @@
+{{- if and .Values.api.enabled (or .Values.api.config (include "uzi.apiHostingEnabled" .)) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "uzi.fullname" . }}-api-config
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+data:
+  {{- range $k, $v := .Values.api.config }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
+  {{- if include "uzi.apiHostingEnabled" . }}
+  # Hosted workers (PRD #58 Decision 12). Rendered from the chart rather than left to
+  # api.config so the api's feature flag CANNOT drift from the controller that serves
+  # it: the two are one switch (uzi.apiHostingEnabled). Set by hand in api.config,
+  # this is exactly the pair an operator flips half of.
+  #
+  # Off (every compose stack, and any cluster that has not opted in) the api reports
+  # hosting disabled and the UI hides the provision affordance — existing hosted rows
+  # stay visible and deletable, which is Decision 12's point.
+  WORKER_HOSTING_ENABLED: "true"
+  {{- end }}
+{{- end }}

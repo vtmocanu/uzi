@@ -1,0 +1,87 @@
+# uzi nightly compose E2E: runs e2e/run-e2e.sh, the full agent-runtime end-to-end
+# harness (isolated compose stack, DUMMY credentials, STUB executor) that NO other
+# CI job runs. ci.yml only builds the images --no-push and exercises store SQL;
+# kind-smoke.yml is a KinD chart-install smoke through nginx -> api. Neither drives the run
+# lifecycle (worker join -> plan gate -> approve -> stub implement -> MR open ->
+# restart-resilience/SIGKILL -> cancel -> MR-close watcher -> bounded concurrency),
+# which is exactly the path this harness covers. Since the team went k8s-first
+# (2026-07-18) the compose path is exercised less by hand, so a nightly guards it
+# against silent bit-rot.
+#
+# FULLY CREDENTIAL-LESS: the stub executor needs no Anthropic token and no real
+# forge (forge-fake stands in), so no `secrets:` beyond the built-in GITHUB_TOKEN,
+# which is used ONLY to open/update a single failure-tracking issue (issues: write).
+# The optional live `sdk` capstone (UZI_E2E_EXECUTOR=sdk) stays manual.
+#
+# Scheduled (deep night, Europe/Bucharest) plus manual dispatch. Deliberately NOT on
+# push/pull_request: the harness builds four images and runs a multi-phase suite, far
+# too heavy for a per-change gate.
+
+name: E2E
+
+# Quoted so yamllint's `truthy` rule does not read the key as the boolean `on`.
+"on":
+  schedule:
+    # 01:17 UTC == 03:17 EET / 04:17 EEST. Off the top of the hour to avoid the
+    # scheduler's high-load contention. Adjust freely.
+    - cron: "17 1 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: e2e-nightly
+  cancel-in-progress: false
+
+jobs:
+  compose-e2e:
+    runs-on: ubuntu-latest
+    # A hung stack must not burn the runner budget; a healthy run is well under this.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      # run-e2e.sh's PRD #97 M2 CLI leg builds api/cmd/uzi on the host, so `go` must
+      # be on PATH. Pinned to the same toolchain ci.yml uses. node/docker/compose/jq/
+      # curl/openssl are all preinstalled on ubuntu-latest.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
+        with:
+          go-version: "1.26"
+          check-latest: true
+
+      - name: Run compose E2E (stub executor)
+        run: ./e2e/run-e2e.sh
+
+      # On failure, keep exactly ONE open issue: comment on the existing one, else open
+      # it. Uses the built-in GITHUB_TOKEN (no PAT). The label is upserted first so the
+      # `gh issue list --label` lookup cannot error on a missing label.
+      - name: Open or update failure issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          LABEL="nightly-e2e"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          gh label create "$LABEL" \
+            --description "Nightly compose E2E (e2e/run-e2e.sh) failures" \
+            --color B60205 --force
+
+          existing="$(gh issue list --state open --label "$LABEL" \
+            --json number --jq '.[0].number // empty')"
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" \
+              --body "Nightly compose E2E failed again on \`${GITHUB_SHA}\`. Run: ${RUN_URL}"
+          else
+            gh issue create \
+              --title "Nightly compose E2E (run-e2e.sh) failing" \
+              --label "$LABEL" \
+              --body "$(printf '%s\n\n%s\n%s\n' \
+                'The nightly compose E2E harness (e2e/run-e2e.sh) failed. This path is not covered by any per-change CI job (see the workflow header).' \
+                "First failing run: ${RUN_URL}" \
+                "Commit: ${GITHUB_SHA}")"
+          fi

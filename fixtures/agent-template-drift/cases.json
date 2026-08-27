@@ -1,0 +1,89 @@
+{
+  "note": "Shared drift-predicate contract (issue #223 item 3). Each case's `shipped` and `stored` are the four mutable columns of an agent template. `expected.differs` pins the two boolean predicates -- agenttmpl.SameContent (Go) and mockApi.sameContent (TS) -- as `differs == !same`. `expected.columns` pins driftedColumns (TS) exactly, in display order and label spelling (note `prompt body`, a space, not `prompt_body`). The Go half has no column notion, so it reads `differs` only. See README.md before editing -- the cases are load-bearing and must not be tidied. Do not add an -update flag on either side.",
+  "cases": [
+    {
+      "name": "identical",
+      "shipped": { "description": "Implements features.", "model": "opus", "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder.\n" },
+      "stored":  { "description": "Implements features.", "model": "opus", "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder.\n" },
+      "expected": { "differs": false, "columns": [] }
+    },
+    {
+      "name": "description-edit",
+      "shipped": { "description": "Implements features.", "model": "opus", "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder.\n" },
+      "stored":  { "description": "Implements features and fixes bugs.", "model": "opus", "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder.\n" },
+      "expected": { "differs": true, "columns": ["description"] }
+    },
+    {
+      "name": "description-trailing-space-not-trimmed",
+      "shipped": { "description": "Implements features.", "model": "opus", "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder.\n" },
+      "stored":  { "description": "Implements features. ", "model": "opus", "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder.\n" },
+      "expected": { "differs": true, "columns": ["description"] }
+    },
+    {
+      "name": "model-value-change",
+      "shipped": { "description": "Implements features.", "model": "opus", "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder.\n" },
+      "stored":  { "description": "Implements features.", "model": "sonnet", "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder.\n" },
+      "expected": { "differs": true, "columns": ["model"] }
+    },
+    {
+      "name": "model-null-vs-empty-agree",
+      "shipped": { "description": "Implements features.", "model": null, "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder.\n" },
+      "stored":  { "description": "Implements features.", "model": "", "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder.\n" },
+      "expected": { "differs": false, "columns": [] }
+    },
+    {
+      "name": "model-set-to-inherit",
+      "shipped": { "description": "Implements features.", "model": "opus", "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder.\n" },
+      "stored":  { "description": "Implements features.", "model": null, "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder.\n" },
+      "expected": { "differs": true, "columns": ["model"] }
+    },
+    {
+      "name": "model-whitespace-not-trimmed",
+      "shipped": { "description": "Implements features.", "model": "opus", "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder.\n" },
+      "stored":  { "description": "Implements features.", "model": " opus", "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder.\n" },
+      "expected": { "differs": true, "columns": ["model"] }
+    },
+    {
+      "name": "tools-reorder",
+      "shipped": { "description": "Implements features.", "model": "opus", "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder.\n" },
+      "stored":  { "description": "Implements features.", "model": "opus", "tools": ["Read", "Bash", "Edit"], "prompt_body": "You are the coder.\n" },
+      "expected": { "differs": true, "columns": ["tools"] }
+    },
+    {
+      "name": "tools-null-vs-empty-agree",
+      "shipped": { "description": "Implements features.", "model": "opus", "tools": null, "prompt_body": "You are the coder.\n" },
+      "stored":  { "description": "Implements features.", "model": "opus", "tools": [], "prompt_body": "You are the coder.\n" },
+      "expected": { "differs": false, "columns": [] }
+    },
+    {
+      "name": "tools-length-change",
+      "shipped": { "description": "Implements features.", "model": "opus", "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder.\n" },
+      "stored":  { "description": "Implements features.", "model": "opus", "tools": ["Bash", "Read"], "prompt_body": "You are the coder.\n" },
+      "expected": { "differs": true, "columns": ["tools"] }
+    },
+    {
+      "name": "tools-element-change",
+      "shipped": { "description": "Implements features.", "model": "opus", "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder.\n" },
+      "stored":  { "description": "Implements features.", "model": "opus", "tools": ["Bash", "Read", "Grep"], "prompt_body": "You are the coder.\n" },
+      "expected": { "differs": true, "columns": ["tools"] }
+    },
+    {
+      "name": "prompt-body-edit",
+      "shipped": { "description": "Implements features.", "model": "opus", "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder.\n" },
+      "stored":  { "description": "Implements features.", "model": "opus", "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder. Be terse.\n" },
+      "expected": { "differs": true, "columns": ["prompt body"] }
+    },
+    {
+      "name": "prompt-body-trailing-newline-not-trimmed",
+      "shipped": { "description": "Implements features.", "model": "opus", "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder.\n" },
+      "stored":  { "description": "Implements features.", "model": "opus", "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder.\n\n" },
+      "expected": { "differs": true, "columns": ["prompt body"] }
+    },
+    {
+      "name": "all-four-differ-in-display-order",
+      "shipped": { "description": "Implements features.", "model": "opus", "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder.\n" },
+      "stored":  { "description": "Implements everything.", "model": "sonnet", "tools": ["Read", "Bash", "Edit"], "prompt_body": "You are the coder. Be terse.\n" },
+      "expected": { "differs": true, "columns": ["description", "model", "tools", "prompt body"] }
+    }
+  ]
+}

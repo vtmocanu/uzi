@@ -1,0 +1,111 @@
+# uzi main guard: a scheduled, skip-ci-immune re-validation of `main`.
+#
+# WHY THIS EXISTS (issue #188, second instance of the hazard #178 fixed for the
+# release-tag case). `[skip ci]` is used here on docs/PRD commits pushed straight
+# to `main`. On GitHub Actions a skip marker (`[skip ci]`, `[ci skip]`, `[no ci]`,
+# `[skip actions]`, `[actions skip]`) in a push's commit prevents the workflow run
+# from being created AT ALL -- the YAML is never evaluated, so unlike GitLab there
+# is NO in-workflow rule that can force a run on a protected ref. So a docs commit
+# that changes a gate's input (e.g. archiving a PRD that ARCHITECTURE.md links to)
+# can land on `main` unvalidated, and the red only surfaces later on an unrelated
+# PR that merges `main` -- the cost landing on the wrong author.
+#
+# `schedule` and `workflow_dispatch` events are NOT subject to skip-ci, so this
+# workflow re-runs the bypassed gate on `main` regardless of any skip marker,
+# fails ON `main` when the tree is broken, and opens/updates a single tracking
+# issue so the failure is attributed to the ref that broke -- not to whoever next
+# touches the branch. Note this DETECTS rather than PREVENTS: true prevention is a
+# branch-protection "require status checks" setting (repo-admin config, not a repo
+# file), which this workflow does not replace.
+#
+# SCOPE: `task check-docs:web`, the exact gate that was bypassed in #188. It is
+# node-only (web/scripts/check-docs.mjs imports only node builtins), needs no DB,
+# no Go and no secrets, matching the only class of commit that carries `[skip ci]`
+# here. Extending it to `task gate:repo` or the full `task gate` is a one-line
+# addition to the run step below.
+#
+# FULLY CREDENTIAL-LESS: no `secrets:` beyond the built-in GITHUB_TOKEN, which is
+# used ONLY to open/update a single failure-tracking issue (issues: write).
+
+name: Main Guard
+
+# Quoted so yamllint's `truthy` rule does not read the key as the boolean `on`.
+"on":
+  schedule:
+    # 05:43 UTC, off the top of the hour to avoid the scheduler's high-load
+    # contention and distinct from e2e.yml's 01:17 slot. Daily is a deliberate
+    # cadence choice, not a floor -- raise it (or add more hours) freely if faster
+    # detection is worth the runner minutes.
+    - cron: "43 5 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: main-guard
+  cancel-in-progress: false
+
+jobs:
+  check-docs:
+    runs-on: ubuntu-latest
+    # A healthy run is well under a minute; this only bounds a pathological hang.
+    timeout-minutes: 15
+    steps:
+      # No `ref:` -- a scheduled run checks out the default branch (main) HEAD,
+      # which is exactly the tree a skipped commit may have left broken.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      # No npm cache: check-docs.mjs imports only node builtins and `task
+      # check-docs:web` runs `npm run check-docs` (which reads web/package.json but
+      # installs nothing), so this guard needs the node RUNTIME but no node_modules.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+        with:
+          node-version: "24"
+      - uses: ./.github/actions/setup-task
+      # No `npm ci`: check-docs has no third-party deps (its own comment in ci.yml
+      # says so), so installing web/node_modules here was ~15-30s of pure waste on
+      # this daily scheduled job. `task check-docs:web` runs `npm run check-docs`,
+      # which needs only web/package.json (checked out) + the node builtins.
+      - name: check-docs (frontmatter + relative links)
+        id: checkdocs
+        run: task check-docs:web
+
+      # On failure, keep exactly ONE open issue: comment on the existing one, else
+      # open it. Uses the built-in GITHUB_TOKEN (no PAT). The label is upserted
+      # first so the `gh issue list --label` lookup cannot error on a missing
+      # label. Mirrors e2e.yml's failure-tracking step.
+      #
+      # Gated on the check-docs step SPECIFICALLY, not a bare `failure()`: an infra
+      # flake (checkout / setup-node / npm ci / setup-task) must not file an issue
+      # that accuses `main` of carrying a broken tree. If check-docs is skipped
+      # because an earlier step failed, its conclusion is not `failure` and this
+      # step does not run -- the infra failure stays visible in the Actions tab.
+      - name: Open or update failure issue
+        if: failure() && steps.checkdocs.conclusion == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          LABEL="main-guard"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          gh label create "$LABEL" \
+            --description "Scheduled main-guard (task check-docs:web) failures" \
+            --color B60205 --force
+
+          existing="$(gh issue list --state open --label "$LABEL" \
+            --json number --jq '.[0].number // empty')"
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" \
+              --body "main-guard failed again on \`${GITHUB_SHA}\` -- \`main\` is carrying an unvalidated change (a \`[skip ci]\` commit likely bypassed the gate). Run: ${RUN_URL}"
+          else
+            gh issue create \
+              --title "main-guard: check-docs failing on main" \
+              --label "$LABEL" \
+              --body "$(printf '%s\n\n%s\n%s\n' \
+                'The scheduled main-guard (task check-docs:web) failed on main. A commit likely reached main with a [skip ci] marker, bypassing the per-change gate (issue #188). Fix the tree on main via an MR.' \
+                "First failing run: ${RUN_URL}" \
+                "Commit: ${GITHUB_SHA}")"
+          fi

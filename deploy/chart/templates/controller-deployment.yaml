@@ -1,0 +1,331 @@
+{{- if and .Values.workers.enabled .Values.workers.controller.enabled }}
+{{- /*
+  The hosted-worker controller (PRD #58 M6).
+
+  The component M3's envelope was built for, and the ONLY thing in uzi that holds a
+  kube credential. The api holds none and must never hold one (Decision 1): a Role
+  that can create pods in a namespace can mount any Secret and impersonate any
+  ServiceAccount in it, so the api holding that power would turn any api compromise
+  into namespace-wide secret exfiltration. That is why this is a separate image, a
+  separate Deployment and a separate identity rather than a goroutine in the api.
+
+  It listens on NOTHING. Every exchange is outbound to the api (Decision 2), which is
+  what lets it run with no Service, no inbound port and no ingress surface at all.
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "uzi.fullname" . }}-controller
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+spec:
+  replicas: {{ .Values.workers.controller.replicaCount }}
+  strategy:
+    # 🔴 Recreate, never RollingUpdate, AND THIS IS LOAD-BEARING FOR CORRECTNESS.
+    #
+    # It used to say "this buys quiet rather than correctness", which was true until the
+    # controller gained a boot-time check that refuses to start when a worker PVC exceeds
+    # its tier's LimitRange ceiling (issue #224, kube.ValidatePVCCeilings). Refusing to
+    # boot only helps if the refusing pod is the ONLY one.
+    #
+    # Under RollingUpdate a new pod that EXITS AT BOOT never becomes Available, so the
+    # old pod is never retired: it runs indefinitely, holding the OLD ceiling, against
+    # the NEW LimitRange this same upgrade already applied. The check fires and is
+    # DEFEATED, with a crash-looping pod beside it that reads like the guard working.
+    #
+    # This holds at ANY replicaCount, and with or WITHOUT probes — a crash-looping
+    # container is never Ready either way. Said that way on purpose: an earlier draft
+    # reasoned from "replicaCount is 1 and there are no probes, SO ...", which invites
+    # someone adding a readinessProbe to conclude the concern is handled. It is not.
+    #
+    # Recreate deletes the old pod FIRST: the failure is fail-STOPPED (no controller runs
+    # at all) rather than fail-STALE. The original reason still holds too — two
+    # controllers reconciling one fleet is pointless overlap for a pod that serves no
+    # traffic — it is simply no longer the only reason.
+    #
+    # scripts/assert-controller-strategy.sh fails the render if this changes. A comment
+    # alone did not hold this coupling: the previous one disclaimed its own importance,
+    # and anyone adding HA would have read it and switched.
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "uzi.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      labels:
+        {{- include "uzi.selectorLabels" . | nindent 8 }}
+        # LOAD-BEARING, not cosmetic: api-networkpolicy.yaml admits the controller to
+        # the api's TLS port by exactly this selector + component label. Change either
+        # and every poll is silently dropped by the default-deny — which looks like an
+        # api outage from here, not a policy mismatch.
+        app.kubernetes.io/component: controller
+    spec:
+      # TRUE — the one workload in uzi where it is. This SA's whole purpose is the
+      # kube API (its Role is in the worker namespace, see worker-rbac.yaml); api and
+      # web both set this false and must keep doing so.
+      automountServiceAccountToken: true
+      serviceAccountName: {{ .Values.workers.controllerServiceAccountName }}
+      {{- with .Values.imagePullSecret.name }}
+      imagePullSecrets:
+        - name: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.controller_podSecurityContext | nindent 8 }}
+      containers:
+        - name: controller
+          image: "{{ .Values.workers.controller.image.repository }}:{{ .Values.workers.controller.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.workers.controller.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.controller_containerSecurityContext | nindent 12 }}
+          # No ports: it listens on nothing (Decision 2). No probes either — there is
+          # no endpoint to probe, and a controller whose poll loop has wedged is not
+          # something an HTTP check on a port it does not open would notice. Its
+          # liveness signal is the fleet reconciling, i.e. workers coming online.
+          env:
+            # --- this process's own hop to the api ---------------------------------
+            - name: UZI_API_URL
+              value: {{ include "uzi.apiInClusterURL" . | quote }}
+            - name: UZI_CONTROLLER_TOKEN_FILE
+              value: {{ printf "%s/token" (include "uzi.controllerTokenDir" .) | quote }}
+            {{- if .Values.api.tls.enabled }}
+            # The CA that verifies the api's cert. Pinned EXCLUSIVELY by the
+            # controller (the system roots are not also trusted), which is right: the
+            # api is one operator-set destination with one known issuer, and trusting
+            # every public CA on top would only widen who can impersonate the hop that
+            # hands out join tokens. There is no skip-verify knob in this path.
+            - name: UZI_API_CA_FILE
+              value: {{ printf "%s/ca.crt" (include "uzi.controllerCADir" .) | quote }}
+            {{- end }}
+            {{- with .Values.workers.controller.pollInterval }}
+            - name: CONTROLLER_POLL_INTERVAL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.workers.controller.httpTimeout }}
+            - name: CONTROLLER_HTTP_TIMEOUT
+              value: {{ . | quote }}
+            {{- end }}
+            # --- the pods it renders ----------------------------------------------
+            # All required, none defaulted by the controller: the api sends NAMES and
+            # this side owns every mapping to a concrete pod-spec value (Decision 1),
+            # so none of it can come off the wire, and a controller that cannot
+            # describe the pods it renders refuses to boot rather than guess.
+            - name: UZI_WORKER_NAMESPACE
+              value: {{ .Values.workers.namespace | quote }}
+            - name: UZI_WORKER_SERVICE_ACCOUNT
+              value: {{ .Values.workers.serviceAccountName | quote }}
+            - name: UZI_WORKER_IMAGE_REPO
+              value: {{ .Values.workers.image.repository | quote }}
+            # The hosted-worker agent tag, PINNED INDEPENDENTLY of Chart.AppVersion
+            # (PRD #422 Decision 1/3). This reverses the old Model B lockstep where the
+            # tag defaulted to appVersion: an app-only release (api/web/chart bump) must
+            # NOT move the worker fleet, so the tag is a concrete value in values.yaml
+            # (workers.image.tag), never .Chart.AppVersion. Advancing it is a deliberate
+            # operator step, and that is what rolls the fleet (Decision 9): the controller
+            # stamps the literal tag string into each worker's pod-spec hash, so a drifted
+            # worker rolls once it holds no non-terminal run. The spec hash is over the
+            # literal string, so the tag MUST be concrete — `required` refuses to render
+            # a blank tag rather than silently emit an empty (":latest"-adjacent) image.
+            - name: UZI_WORKER_IMAGE_TAG
+              value: {{ required "workers.image.tag must be a concrete pinned worker version (PRD #422 Decision 3)" .Values.workers.image.tag | quote }}
+            # The api URL a WORKER dials — the same FQDN this process uses, and
+            # necessarily the API's RELEASE namespace, not the worker's. See
+            # uzi.apiInClusterURL for why both halves matter.
+            - name: UZI_WORKER_API_URL
+              value: {{ include "uzi.apiInClusterURL" . | quote }}
+            {{- with .Values.workers.storageClass }}
+            - name: UZI_WORKER_STORAGE_CLASS
+              value: {{ . | quote }}
+            {{- end }}
+            # The per-worker run-slot cap. NOT with-gated: it always has a chart default
+            # (workers.maxConcurrentRuns: 1), so the controller always receives it and
+            # the default (1) is explicit in the rendered pod rather than implied by the
+            # env being absent. The controller rejects a non-integer or a value < 1.
+            - name: UZI_WORKER_MAX_CONCURRENT_RUNS
+              value: {{ .Values.workers.maxConcurrentRuns | quote }}
+            # PRD #422 M5 drain knobs. The deadline bounds how long a cordoned BUSY worker
+            # delays a deliberate roll before the controller rolls it anyway (its run
+            # requeues); force-roll is the emergency override that rolls every drifted
+            # worker regardless of busy. The deadline is with-gated (empty leaves the
+            # controller's built-in 24h default); force-roll is unconditional so the
+            # rendered pod carries the explicit false rather than an implied one.
+            {{- with .Values.workers.drainDeadline }}
+            - name: UZI_WORKER_DRAIN_DEADLINE
+              value: {{ . | quote }}
+            {{- end }}
+            - name: UZI_WORKER_FORCE_ROLL
+              value: {{ .Values.workers.forceRoll | default false | quote }}
+            # The worker container's requests.ephemeral-storage (issue #224). Without
+            # it a worker pod declares nothing for the resource and is therefore the
+            # first thing kubelet evicts under node disk pressure, which destroys the
+            # in-flight run's working tree. The controller validates it as a k8s
+            # quantity at boot and falls back to its built-in 512Mi when unset. Docker
+            # workers use the docker tier's own value INSTEAD (below).
+            {{- with .Values.workers.ephemeralRequest }}
+            - name: UZI_WORKER_EPHEMERAL_REQUEST
+              value: {{ . | quote }}
+            {{- end }}
+            # The RESTRICTED tier's PVC admission ceiling (issue #224). The controller
+            # constructs every worker PVC and is the only place in the system where all
+            # the claimants exist at once — nixSize, each preset's DataSize and the dind
+            # data root — but it has no way to know the LimitRange that will reject them.
+            # Injecting the ceiling makes that a missing INPUT rather than a layering
+            # violation (it already takes workers.storageClass the same way), and the
+            # controller then REFUSES TO BOOT rather than provisioning workers whose
+            # claims are rejected at admission, which presents as a worker that never
+            # appears with the reason only in a controller log.
+            #
+            # Only rendered when the LimitRange is: with no LimitRange there is no
+            # ceiling, and the controller correctly skips the check for that tier.
+            {{- if .Values.workers.limitRange.enabled }}
+            {{- with .Values.workers.limitRange.maxPVCStorage }}
+            - name: UZI_WORKER_MAX_PVC_STORAGE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.workers.docker.enabled }}
+            # The docker tier (PRD #83 M3, PRD #89). Namespace + image are required
+            # together — the controller refuses to boot with one set and not the other —
+            # and the namespace must differ from UZI_WORKER_NAMESPACE (the privileged tier
+            # is a SEPARATE namespace, which is the whole point). The posture var below is
+            # also required when the tier is on. With docker off, none are set and the
+            # controller renders no docker workers (a docker worker in the poll is skipped,
+            # never rendered into the restricted default).
+            - name: UZI_WORKER_DOCKER_NAMESPACE
+              value: {{ .Values.workers.docker.namespace | quote }}
+            # The DinD posture (PRD #89): true (default) = rootless; false = non-rootless
+            # privileged (dockerd as real root, the node-root residual gated by
+            # acknowledgeNonRootlessNodeRoot in worker-invariants.yaml). The controller's
+            # config reads + validates it and threads it to the render branch.
+            - name: UZI_WORKER_DIND_ROOTLESS
+              value: {{ .Values.workers.docker.rootless | quote }}
+            # The pinned DinD sidecar image, SELECTED by posture (OQ-A hybrid): the
+            # explicit `image` override wins, else rootlessImage/nonRootlessImage by
+            # `rootless`. worker-invariants.yaml's coherence fail-guard rejects an
+            # image/posture mismatch, so this value is always coherent with the flag above.
+            - name: UZI_WORKER_DIND_IMAGE
+              value: {{ include "uzi.workerDinDImage" . | quote }}
+            # The DinD sidecar's resource requests + limits (PRD #89 0.8.1). Optional: the
+            # controller validates each as a k8s quantity at boot and falls back to its
+            # built-in default (250m/256Mi req, 2/2Gi lim) for any left unset. A cluster
+            # raises them (request in lockstep with the limit) because in-daemon image
+            # builds OOM the 2Gi default.
+            {{- with .Values.workers.docker.dindResources.requests.cpu }}
+            - name: UZI_WORKER_DIND_REQUEST_CPU
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.workers.docker.dindResources.requests.memory }}
+            - name: UZI_WORKER_DIND_REQUEST_MEMORY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.workers.docker.dindResources.limits.cpu }}
+            - name: UZI_WORKER_DIND_LIMIT_CPU
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.workers.docker.dindResources.limits.memory }}
+            - name: UZI_WORKER_DIND_LIMIT_MEMORY
+              value: {{ . | quote }}
+            {{- end }}
+            # The DinD daemon's data-root PVC size (issue #224 M-a). Optional, same shape
+            # as the four above: the controller validates it as a k8s quantity at boot and
+            # falls back to its built-in 20Gi when unset. It must stay <= the docker
+            # tier's limitRange.maxPVCStorage or the apiserver rejects the claim.
+            {{- with .Values.workers.docker.dindDataSize }}
+            - name: UZI_WORKER_DIND_DATA_SIZE
+              value: {{ . | quote }}
+            {{- end }}
+            # The DOCKER worker container's requests.ephemeral-storage (issue #224). It
+            # REPLACES UZI_WORKER_EPHEMERAL_REQUEST for this tier, and is larger because
+            # a docker worker's run-workdir emptyDir carries the run's whole working
+            # tree while a plain worker's lives on the /data PVC. Same validation and
+            # the same never-a-limit rule.
+            {{- with .Values.workers.docker.ephemeralRequest }}
+            - name: UZI_WORKER_DOCKER_EPHEMERAL_REQUEST
+              value: {{ . | quote }}
+            {{- end }}
+            # The DOCKER tier's PVC admission ceiling — see the restricted tier's key
+            # above. Injected separately because the two tiers are separate namespaces
+            # with separate LimitRanges, so the ceiling is a per-tier fact; the docker
+            # tier additionally carries the dind data-root claim, which the restricted
+            # tier does not have at all.
+            {{- if .Values.workers.docker.limitRange.enabled }}
+            {{- with .Values.workers.docker.limitRange.maxPVCStorage }}
+            - name: UZI_WORKER_DOCKER_MAX_PVC_STORAGE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.workers.controller.resources | nindent 12 }}
+          volumeMounts:
+            - name: controller-token
+              mountPath: {{ include "uzi.controllerTokenDir" . }}
+              readOnly: true
+            {{- if .Values.api.tls.enabled }}
+            - name: api-ca
+              mountPath: {{ include "uzi.controllerCADir" . }}
+              readOnly: true
+            {{- end }}
+            # Writable /tmp for the read-only-root-fs container, mirroring the api's.
+            # Nothing in the controller is known to need it; it is here because a
+            # read-only root with no scratch is a failure mode that surfaces only at
+            # runtime, and this is the one component whose first real run is on a
+            # cluster (the rollout), not in any test we can run before it.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # The bearer credential, projected BY KEY out of the shared uzi-secrets
+        # Secret so this pod's filesystem carries that one value and not every
+        # other secret uzi holds (JWT_SECRET, UZI_SECRET_KEY, the OIDC client
+        # secret...). A whole-Secret mount here would hand the component whose blast
+        # radius this PRD exists to bound the api's master key.
+        #
+        # optional: true is deliberate. The key missing means an operator has not
+        # populated Infisical yet, and the controller's own boot error names the file
+        # and the variable — which is a better diagnostic than a pod stuck in
+        # ContainerCreating with the reason buried in kubelet events. Same reasoning
+        # the api's secretKeyRefs already use.
+        - name: controller-token
+          secret:
+            secretName: {{ .Values.infisical.app.managedSecretName }}
+            optional: true
+            items:
+              - key: {{ .Values.workers.controller.tokenSecretKey | quote }}
+                path: token
+            # 0440, landing as root:<fsGroup>. Not 0400: a secret volume's files are
+            # owned by ROOT, not by runAsUser, so the group bit is what makes them
+            # readable at all (M3 measured this on a real kubelet with the worker's
+            # join token). The kubelet ORs 0040 onto read-only secret volumes anyway,
+            # so this is what 0400 would become — spelled out rather than inherited
+            # from a quirk.
+            defaultMode: 0440
+        {{- if .Values.api.tls.enabled }}
+        # THE `items:` PROJECTION, and it is not a style preference (PRD #58 M4/M6).
+        #
+        # This Deployment is the FIRST client of the api's leaf Secret, and that Secret
+        # holds tls.crt + tls.key + ca.crt. Mounting it WHOLE would put the api's
+        # PRIVATE KEY into this pod's filesystem — the one component with a kube
+        # credential — for no reason at all: a client needs the CA and nothing else.
+        # cert-manager writing ca.crt alongside the pair is exactly what makes this
+        # Secret the CA distribution point, so no second Certificate exists to publish
+        # the root.
+        #
+        # And do NOT "simplify" this by mounting the uzi-ca Secret instead: that one
+        # holds the CA PRIVATE KEY, which is strictly worse than the leaf's.
+        #
+        # Hosted workers never mount this Secret at all — they are in another namespace
+        # and cannot. The controller relays ca.crt into each per-worker Secret it
+        # already creates (no new RBAC verb; Decision 1 stays verbatim).
+        - name: api-ca
+          secret:
+            secretName: {{ include "uzi.apiTLSSecretName" . }}
+            items:
+              - key: ca.crt
+                path: ca.crt
+            defaultMode: 0440
+        {{- end }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Mi
+{{- end }}

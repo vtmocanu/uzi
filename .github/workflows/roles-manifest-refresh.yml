@@ -1,0 +1,185 @@
+# uzi role-manifest refresh: notice when the upstream skills library moves.
+#
+# WHY THIS EXISTS (issue #601 item 2, the maintenance half of PRD #85). PRD #85
+# vendors api/internal/agenttmpl/library/manifest.json -- a distilled
+# name->version snapshot of the 11 shipped builtin roles -- and a Go test
+# (TestBuiltinLibraryDrift, inside the required test-api check) that reddens when
+# a builtin's version stamp falls BEHIND that manifest. That closes half the loop:
+# it catches a builtin we forgot to port. The other half is noticing that upstream
+# roles.yaml itself moved, which nothing watches -- a human has to remember to
+# check. This weekly job removes that toil: it fetches upstream roles.yaml, and
+# when a shipped role's version moved FORWARD it bumps the manifest and opens a PR.
+# The bump makes the drift test red until a human ports the changed bodies (per
+# api/internal/agenttmpl/library/README.md). The gate itself stays hermetic -- the
+# manifest is still vendored; only the refresh is automated.
+#
+# IT NEVER ADDS AN UPSTREAM-ONLY ROLE. Upstream ships 14 roles; uzi ships 11 by
+# design, omitting release / tui-ux / skill-reviewer (PRD #85 M4). The roster is a
+# deliberate product decision, so this bot only tracks forward version bumps for
+# roles that already ship; a human adds a new builtin (and its manifest entry) by
+# hand. Anything the bot cannot resolve with a forward bump -- a shipped role gone
+# from upstream, a non-integer version, or upstream moving backward -- is surfaced
+# as a tracking issue, never silently applied.
+#
+# TOKEN / CI-ON-PR NOTE. A PR opened with the default GITHUB_TOKEN does NOT trigger
+# other workflows (GitHub's recursion guard), so test-api will not auto-run on the
+# bump PR unless a workflow-scoped PAT is supplied as the ROLES_REFRESH_TOKEN
+# secret (contents + pull-requests write). Opening a PR with GITHUB_TOKEN also
+# requires the repo setting "Allow GitHub Actions to create and approve pull
+# requests"; when that is off, this job falls back to opening a tracking ISSUE (the
+# credential-less pattern main-guard.yml uses) so the drift signal is never lost.
+# With the PAT, the PR is opened and its drift check runs immediately.
+#
+# DETECTS rather than PREVENTS, exactly like main-guard.yml: it surfaces upstream
+# movement; a human still reviews and ports.
+
+name: Roles Manifest Refresh
+
+# Quoted so yamllint's `truthy` rule does not read the key as the boolean `on`.
+"on":
+  schedule:
+    # 06:27 UTC Mondays, off the top of the hour to dodge scheduler contention and
+    # distinct from e2e.yml (01:17) and main-guard.yml (05:43). Weekly is a
+    # deliberate cadence: upstream roles.yaml moves rarely, and a late notice costs
+    # only a few days of staleness the drift test would catch anyway.
+    - cron: "27 6 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: roles-manifest-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    # A healthy run is seconds; this only bounds a pathological hang.
+    timeout-minutes: 15
+    steps:
+      - name: Checkout uzi
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          # The PAT (if set) is what lets the bump PR trigger its own CI; else the
+          # built-in token, which can still push and open a PR where the repo
+          # setting allows it, and otherwise the issue fallback runs.
+          token: ${{ secrets.ROLES_REFRESH_TOKEN || github.token }}
+
+      - name: Fetch upstream roles.yaml
+        id: upstream
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/vtmocanu/skills.git "${RUNNER_TEMP}/skills"
+          echo "sha=$(git -C "${RUNNER_TEMP}/skills" rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Compare and rewrite the manifest
+        id: refresh
+        run: |
+          set -euo pipefail
+          scripts/refresh-role-manifest.sh \
+            "${RUNNER_TEMP}/skills/skills/agent-kit/agent-team/roles.yaml" \
+            "${{ steps.upstream.outputs.sha }}"
+
+      - name: Surface drift (bump PR, warnings, issue fallback)
+        if: steps.refresh.outputs.changed == 'true' || steps.refresh.outputs.warned == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.ROLES_REFRESH_TOKEN || github.token }}
+          CHANGED: ${{ steps.refresh.outputs.changed }}
+          SUMMARY: ${{ steps.refresh.outputs.summary }}
+          WARNINGS: ${{ steps.refresh.outputs.warnings }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          set -euo pipefail
+          BRANCH="chore/roles-manifest-refresh"
+          LABEL="roles-manifest-refresh"
+          MANIFEST="api/internal/agenttmpl/library/manifest.json"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          HEADER="$(printf 'Automated by the weekly roles-manifest-refresh workflow (issue #601). Upstream skills at %s. Run: %s' "${UPSTREAM_SHA}" "${RUN_URL}")"
+
+          PR_BODY="${HEADER}"
+          if [ -n "${SUMMARY}" ]; then
+            PR_BODY="$(printf '%s\n\nManifest bumped:\n\n%s\n\nThis reddens TestBuiltinLibraryDrift (the required test-api check). For each bumped role, port the builtin body and bump its `version:` stamp in the same commit, per api/internal/agenttmpl/library/README.md.' "${PR_BODY}" "${SUMMARY}")"
+          fi
+          if [ -n "${WARNINGS}" ]; then
+            PR_BODY="$(printf '%s\n\nRoster changes that need a human (not an automated bump):\n\n%s' "${PR_BODY}" "${WARNINGS}")"
+          fi
+          WARN_BODY="$(printf '%s\n\nRoster changes that need a human (not an automated bump):\n\n%s' "${HEADER}" "${WARNINGS}")"
+
+          # Open a tracking issue only if none is open (no weekly duplicate nag).
+          upsert_issue() {
+            gh label create "${LABEL}" \
+              --description "Upstream role-library drift detected by the weekly refresh" \
+              --color 1D76DB --force
+            existing="$(gh issue list --state open --label "${LABEL}" --json number --jq '.[0].number // empty')"
+            if [ -n "${existing}" ]; then
+              echo "Tracking issue #${existing} already open; not adding a duplicate comment."
+            else
+              gh issue create --title "Upstream role library drift: refresh the manifest" \
+                --label "${LABEL}" --body "$1"
+            fi
+          }
+
+          close_tracking_issues() {
+            gh issue list --state open --label "${LABEL}" --json number --jq '.[].number' \
+              | while read -r n; do
+                  [ -n "${n}" ] || continue
+                  gh issue close "${n}" \
+                    --comment "Superseded by the refresh PR on ${BRANCH}. Run: ${RUN_URL}"
+                done
+          }
+
+          # Warnings must always be surfaced, no matter what the bump path does.
+          surface_warnings() {
+            [ -n "${WARNINGS}" ] && upsert_issue "${WARN_BODY}" || true
+          }
+
+          # No forward bump: warnings-only. Surface and stop.
+          if [ "${CHANGED}" != "true" ]; then
+            surface_warnings
+            exit 0
+          fi
+
+          # A forward bump exists. NEVER clobber human work on the branch: an open
+          # PR backs it, OR the remote branch carries commits touching files other
+          # than the manifest (a maintainer's body-port, PR open or not). Either
+          # way leave the branch alone and still surface any warnings.
+          protected=false
+          if [ -n "$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')" ]; then
+            protected=true
+          else
+            git fetch --no-tags origin \
+              "+refs/heads/main:refs/remotes/origin/main" \
+              "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}" 2>/dev/null || true
+            if git rev-parse --verify --quiet "refs/remotes/origin/${BRANCH}" >/dev/null; then
+              others="$(git diff --name-only "refs/remotes/origin/main...refs/remotes/origin/${BRANCH}" \
+                | grep -Fxv "${MANIFEST}" || true)"
+              [ -n "${others}" ] && protected=true
+            fi
+          fi
+          if [ "${protected}" = true ]; then
+            echo "Branch ${BRANCH} carries human commits (open PR or non-manifest changes); not clobbering."
+            surface_warnings
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "${BRANCH}"
+          git add "${MANIFEST}"
+          git commit -m "chore(agenttmpl): refresh role manifest from upstream ${UPSTREAM_SHA:0:12}"
+          git push --force origin "${BRANCH}"
+
+          # On a successful PR, clear any stale tracking issue from a prior fallback.
+          if gh pr create --base main --head "${BRANCH}" \
+               --title "chore(agenttmpl): refresh role manifest from upstream" \
+               --body "${PR_BODY}"; then
+            echo "Opened refresh PR."
+            close_tracking_issues
+            exit 0
+          fi
+
+          echo "PR creation failed; filing a tracking issue instead." >&2
+          upsert_issue "${PR_BODY}"

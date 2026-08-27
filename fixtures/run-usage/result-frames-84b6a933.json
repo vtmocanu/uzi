@@ -1,0 +1,140 @@
+{
+    "note": "Recorded from dev-cluster uzi DB on 2026-08-02 for issue #195. Two result frames of one real run. claude-haiku-4-5-20251001 appears in seq 173 and is ABSENT from seq 2470 - the server keeps it via GREATEST-per-model, so any client that sums modelUsage per frame and telescopes deltas loses it.",
+    "frames": [
+        {
+            "seq": 173,
+            "kind": "status",
+            "payload": {
+                "event": "result",
+                "usage": {
+                    "speed": "standard",
+                    "iterations": [
+                        {
+                            "type": "message",
+                            "input_tokens": 2,
+                            "output_tokens": 577,
+                            "cache_creation": {
+                                "ephemeral_1h_input_tokens": 5909,
+                                "ephemeral_5m_input_tokens": 0
+                            },
+                            "cache_read_input_tokens": 80042,
+                            "cache_creation_input_tokens": 5909
+                        }
+                    ],
+                    "input_tokens": 23,
+                    "service_tier": "standard",
+                    "inference_geo": "not_available",
+                    "output_tokens": 16854,
+                    "cache_creation": {
+                        "ephemeral_1h_input_tokens": 72077,
+                        "ephemeral_5m_input_tokens": 0
+                    },
+                    "server_tool_use": {
+                        "web_fetch_requests": 0,
+                        "web_search_requests": 0
+                    },
+                    "cache_read_input_tokens": 653081,
+                    "cache_creation_input_tokens": 72077
+                },
+                "subtype": "success",
+                "num_turns": 19,
+                "modelUsage": {
+                    "claude-opus-5": {
+                        "costUSD": 3.528472249999999,
+                        "provider": "firstParty",
+                        "inputTokens": 97,
+                        "outputTokens": 41747,
+                        "contextWindow": 1000000,
+                        "canonicalModel": "claude-opus-5",
+                        "maxOutputTokens": 64000,
+                        "webSearchRequests": 0,
+                        "cacheReadInputTokens": 2134247,
+                        "cacheCreationInputTokens": 183504
+                    },
+                    "claude-haiku-4-5-20251001": {
+                        "costUSD": 0.005242,
+                        "provider": "firstParty",
+                        "inputTokens": 5162,
+                        "outputTokens": 16,
+                        "contextWindow": 200000,
+                        "canonicalModel": "claude-haiku-4-5",
+                        "maxOutputTokens": 32000,
+                        "webSearchRequests": 0,
+                        "cacheReadInputTokens": 0,
+                        "cacheCreationInputTokens": 0
+                    }
+                },
+                "duration_ms": 566591,
+                "total_cost_usd": 3.533714249999999
+            }
+        },
+        {
+            "seq": 2470,
+            "kind": "status",
+            "payload": {
+                "event": "result",
+                "usage": {
+                    "speed": "standard",
+                    "iterations": [
+                        {
+                            "type": "message",
+                            "input_tokens": 2,
+                            "output_tokens": 1013,
+                            "cache_creation": {
+                                "ephemeral_1h_input_tokens": 216,
+                                "ephemeral_5m_input_tokens": 0
+                            },
+                            "cache_read_input_tokens": 268603,
+                            "cache_creation_input_tokens": 216
+                        }
+                    ],
+                    "input_tokens": 123,
+                    "service_tier": "standard",
+                    "inference_geo": "not_available",
+                    "output_tokens": 71738,
+                    "cache_creation": {
+                        "ephemeral_1h_input_tokens": 254945,
+                        "ephemeral_5m_input_tokens": 0
+                    },
+                    "server_tool_use": {
+                        "web_fetch_requests": 0,
+                        "web_search_requests": 0
+                    },
+                    "cache_read_input_tokens": 11579690,
+                    "cache_creation_input_tokens": 254945
+                },
+                "subtype": "success",
+                "num_turns": 77,
+                "modelUsage": {
+                    "claude-opus-5": {
+                        "costUSD": 67.45905024999998,
+                        "provider": "firstParty",
+                        "inputTokens": 1770,
+                        "outputTokens": 592895,
+                        "contextWindow": 1000000,
+                        "canonicalModel": "claude-opus-5",
+                        "maxOutputTokens": 64000,
+                        "webSearchRequests": 0,
+                        "cacheReadInputTokens": 78119788,
+                        "cacheCreationInputTokens": 2017902
+                    },
+                    "claude-sonnet-5": {
+                        "costUSD": 1.69669395,
+                        "provider": "firstParty",
+                        "inputTokens": 104,
+                        "outputTokens": 28108,
+                        "contextWindow": 1000000,
+                        "canonicalModel": "claude-sonnet-5",
+                        "maxOutputTokens": 64000,
+                        "webSearchRequests": 0,
+                        "cacheReadInputTokens": 2529269,
+                        "cacheCreationInputTokens": 137595
+                    }
+                },
+                "duration_ms": 8578823,
+                "total_cost_usd": 69.1557442
+            }
+        }
+    ],
+    "run_id": "84b6a933-ceea-4f6e-9f29-75143555ec0f"
+}

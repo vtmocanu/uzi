@@ -1,0 +1,3 @@
+# Workflow and CI configuration changes require the repository owner's review.
+# R1 hardening: the gate defines the trust boundary, so its own edits are gated.
+/.github/ @vtmocanu

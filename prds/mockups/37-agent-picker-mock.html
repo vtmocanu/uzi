@@ -1,0 +1,387 @@
+<title>uzi · Plan approval — agent picker mock</title>
+<style>
+  /* ember tokens, lifted from web/src/index.css — this page deliberately stays
+     dark-only, matching uzi's "dark factory" single-theme identity. */
+  :root {
+    color-scheme: dark;
+    --bg: 8 10 15;
+    --surface: 15 18 26;
+    --raised: 23 27 38;
+    --edge: 39 45 60;
+    --edge-strong: 58 66 86;
+    --fg: 228 232 240;
+    --muted: 148 158 176;
+    --faint: 100 110 130;
+    --brand: 251 146 60;
+    --brand-hover: 253 186 116;
+    --on-brand: 26 16 8;
+    --ok: 52 211 153;
+    --warn: 251 191 36;
+    --info: 56 189 248;
+    --radius: 0.625rem;
+    --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: rgb(var(--bg));
+    color: rgb(var(--fg));
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .page { max-width: 880px; margin: 0 auto; padding: 40px 20px 80px; display: flex; flex-direction: column; gap: 16px; }
+
+  /* mock chrome */
+  .mock-note {
+    font-size: 12px; color: rgb(var(--faint));
+    border: 1px dashed rgb(var(--edge-strong));
+    border-radius: var(--radius);
+    padding: 10px 14px;
+  }
+  .mock-note strong { color: rgb(var(--muted)); font-weight: 600; }
+  .state-label {
+    display: flex; align-items: center; gap: 10px;
+    margin-top: 24px;
+    font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+    color: rgb(var(--faint));
+  }
+  .state-label::after { content: ""; flex: 1; height: 1px; background: rgb(var(--edge)); }
+
+  /* run header (abbreviated RunView chrome) */
+  .run-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+  .run-head h1 { font-size: 18px; font-weight: 700; letter-spacing: -0.01em; margin: 0; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11px; font-weight: 600;
+    padding: 2px 9px; border-radius: 999px;
+    border: 1px solid rgb(var(--warn) / 0.45);
+    background: rgb(var(--warn) / 0.10);
+    color: rgb(var(--warn));
+    white-space: nowrap;
+  }
+  .badge.neutral { border-color: rgb(var(--edge)); background: rgb(var(--raised)); color: rgb(var(--muted)); }
+  .run-sub { font-size: 12px; color: rgb(var(--muted)); margin: 0; }
+  .run-sub code { font-family: var(--font-mono); font-size: 11px; color: rgb(var(--fg)); background: rgb(var(--raised)); padding: 1px 6px; border-radius: 5px; }
+
+  /* PlanPanel — mirrors RunView.tsx PlanPanel structure */
+  .plan-panel {
+    overflow: hidden;
+    border-radius: calc(var(--radius) + 2px);
+    border: 1px solid rgb(var(--warn) / 0.5);
+    background: rgb(var(--warn) / 0.05);
+  }
+  .plan-head {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px;
+    border-bottom: 1px solid rgb(var(--warn) / 0.3);
+    background: rgb(var(--warn) / 0.10);
+    padding: 12px 16px;
+  }
+  .plan-head h2 { margin: 0; font-size: 14px; font-weight: 600; color: rgb(var(--warn)); }
+  .plan-head p { margin: 0; font-size: 12px; color: rgb(var(--muted)); }
+  .plan-body { padding: 16px; display: flex; flex-direction: column; gap: 16px; }
+
+  .btn {
+    font: inherit; font-size: 13px; font-weight: 600;
+    border-radius: var(--radius);
+    padding: 7px 14px;
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: background-color .12s, border-color .12s, color .12s;
+  }
+  .btn.primary { background: rgb(var(--brand)); color: rgb(var(--on-brand)); }
+  .btn.primary:hover { background: rgb(var(--brand-hover)); }
+  .btn.secondary { background: rgb(var(--raised)); color: rgb(var(--fg)); border-color: rgb(var(--edge-strong)); }
+  .btn.secondary:hover { border-color: rgb(var(--faint)); }
+  .btn-row { display: flex; gap: 8px; }
+  .btn:focus-visible { outline: 2px solid rgb(var(--brand)); outline-offset: 2px; }
+
+  /* ── Agent source picker ── */
+  .agents-section { display: flex; flex-direction: column; gap: 10px; }
+  .agents-section > header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .agents-section h3 { margin: 0; font-size: 13px; font-weight: 600; color: rgb(var(--fg)); }
+  .agents-section .hint { font-size: 12px; color: rgb(var(--faint)); }
+  .lead-note { font-size: 12px; color: rgb(var(--muted)); }
+  .lead-note code { font-family: var(--font-mono); font-size: 11px; background: rgb(var(--raised)); padding: 1px 6px; border-radius: 5px; color: rgb(var(--fg)); }
+
+  .source-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  @media (max-width: 640px) { .source-grid { grid-template-columns: 1fr; } }
+
+  .source-card {
+    position: relative;
+    border: 1px solid rgb(var(--edge));
+    background: rgb(var(--surface));
+    border-radius: var(--radius);
+    padding: 14px;
+    cursor: pointer;
+    display: flex; flex-direction: column; gap: 10px;
+    transition: border-color .12s, background-color .12s;
+  }
+  .source-card:hover { border-color: rgb(var(--edge-strong)); }
+  .source-card.selected { border-color: rgb(var(--brand) / 0.7); background: rgb(var(--brand) / 0.05); }
+  .source-card.disabled { cursor: not-allowed; opacity: 0.55; }
+  .source-card input { position: absolute; opacity: 0; pointer-events: none; }
+  .source-card:has(input:focus-visible) { outline: 2px solid rgb(var(--brand)); outline-offset: 2px; }
+
+  .source-top { display: flex; align-items: center; gap: 10px; }
+  .radio-dot {
+    width: 16px; height: 16px; border-radius: 999px; flex: none;
+    border: 1.5px solid rgb(var(--edge-strong));
+    display: grid; place-items: center;
+  }
+  .selected .radio-dot { border-color: rgb(var(--brand)); }
+  .selected .radio-dot::after { content: ""; width: 8px; height: 8px; border-radius: 999px; background: rgb(var(--brand)); }
+  .source-title { font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .source-desc { font-size: 12px; color: rgb(var(--muted)); margin: 0; }
+  .source-desc code { font-family: var(--font-mono); font-size: 11px; color: rgb(var(--fg)); }
+
+  .pill {
+    font-size: 10px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+    padding: 1.5px 8px; border-radius: 999px; white-space: nowrap;
+  }
+  .pill.detected { color: rgb(var(--ok)); border: 1px solid rgb(var(--ok) / 0.4); background: rgb(var(--ok) / 0.10); }
+  .pill.default { color: rgb(var(--brand)); border: 1px solid rgb(var(--brand) / 0.4); background: rgb(var(--brand) / 0.10); }
+  .pill.none { color: rgb(var(--faint)); border: 1px solid rgb(var(--edge)); background: rgb(var(--raised)); }
+
+  .chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    font-family: var(--font-mono); font-size: 11.5px;
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    border: 1px solid rgb(var(--edge-strong));
+    background: rgb(var(--raised));
+    color: rgb(var(--fg));
+    cursor: pointer; user-select: none;
+    transition: border-color .12s, background-color .12s, color .12s, opacity .12s;
+  }
+  .chip .tick { font-size: 10px; color: rgb(var(--ok)); }
+  .chip.off { opacity: 0.45; border-style: dashed; }
+  .chip.off .tick { visibility: hidden; }
+  .chip:hover { border-color: rgb(var(--brand) / 0.6); }
+  .chip.fixed { cursor: default; border-color: rgb(var(--brand) / 0.45); background: rgb(var(--brand) / 0.08); }
+  .chip.fixed:hover { border-color: rgb(var(--brand) / 0.45); }
+  .chip.fixed .tick { color: rgb(var(--brand)); }
+  .chip-caption { font-size: 11px; color: rgb(var(--faint)); }
+
+  .summary-line {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    font-size: 12px; color: rgb(var(--muted));
+    border-top: 1px solid rgb(var(--edge));
+    padding-top: 12px;
+  }
+  .summary-line b { color: rgb(var(--fg)); font-weight: 600; }
+
+  /* plan body box */
+  .plan-md {
+    max-height: 200px; overflow: auto;
+    border: 1px solid rgb(var(--edge));
+    background: rgb(var(--surface));
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    font-size: 13px; color: rgb(var(--muted));
+  }
+  .plan-md h4 { margin: 0 0 6px; font-size: 13px; color: rgb(var(--fg)); }
+  .plan-md ol { margin: 6px 0; padding-left: 20px; }
+  .plan-md li { margin: 3px 0; }
+  .plan-md code { font-family: var(--font-mono); font-size: 11.5px; background: rgb(var(--raised)); padding: 1px 5px; border-radius: 4px; color: rgb(var(--fg)); }
+</style>
+
+<div class="page">
+  <p class="mock-note"><strong>Mock</strong> — agent selection at the plan-approval gate. Interactive: switch the source, click chips to include/exclude agents; the approve button reflects the selection. State B shows the same panel for a repo with no <code style="font-family:var(--font-mono)">.claude/agents/</code>.</p>
+
+  <div class="state-label">State A · repo agents detected (default)</div>
+
+  <div class="run-head">
+    <h1>Run #142 · Add rate limiting to webhook endpoint</h1>
+    <span class="badge">awaiting approval</span>
+    <span class="badge neutral">issue #87</span>
+  </div>
+  <p class="run-sub">Repo <code>vtmocanu/uzi</code> · branch <code>uzi/issue-87-rate-limit</code> · model claude-sonnet-5</p>
+
+  <!-- PlanPanel -->
+  <div class="plan-panel">
+    <div class="plan-head">
+      <div>
+        <h2>Plan awaiting your approval</h2>
+        <p>The run is parked until you decide. Agent choice locks in on approval.</p>
+      </div>
+      <div class="btn-row">
+        <button class="btn primary" id="approveA">Approve plan · 8 repo agents</button>
+        <button class="btn secondary">Reject with reason</button>
+      </div>
+    </div>
+
+    <div class="plan-body">
+
+      <!-- Agent source picker -->
+      <section class="agents-section" id="stateA">
+        <header>
+          <h3>Agents for this run</h3>
+          <span class="hint">Detected during clone, before planning</span>
+        </header>
+
+        <div class="source-grid">
+          <label class="source-card selected" data-src="repo">
+            <input type="radio" name="srcA" value="repo" checked>
+            <div class="source-top">
+              <span class="radio-dot"></span>
+              <span class="source-title">Repo agents <span class="pill detected">detected · 8</span> <span class="pill default">default</span></span>
+            </div>
+            <p class="source-desc">Found in the repo's <code>.claude/agents/</code>. The project team defined these for this codebase.</p>
+            <div class="chip-row" id="repoChips">
+              <span class="chip"><span class="tick">●</span>coder</span>
+              <span class="chip"><span class="tick">●</span>reviewer</span>
+              <span class="chip"><span class="tick">●</span>tester</span>
+              <span class="chip"><span class="tick">●</span>auditor</span>
+              <span class="chip"><span class="tick">●</span>documenter</span>
+              <span class="chip"><span class="tick">●</span>spec-keeper</span>
+              <span class="chip"><span class="tick">●</span>fact-checker</span>
+              <span class="chip"><span class="tick">●</span>web-ux</span>
+            </div>
+            <span class="chip-caption">Click a chip to exclude it from the run.</span>
+          </label>
+
+          <label class="source-card" data-src="own">
+            <input type="radio" name="srcA" value="own">
+            <div class="source-top">
+              <span class="radio-dot"></span>
+              <span class="source-title">My agent templates</span>
+            </div>
+            <p class="source-desc">Your uzi templates — builtins plus any you customized under Settings → Agents.</p>
+            <div class="chip-row" id="ownChipsA">
+              <span class="chip"><span class="tick">●</span>coder</span>
+              <span class="chip"><span class="tick">●</span>reviewer</span>
+              <span class="chip"><span class="tick">●</span>tester</span>
+              <span class="chip"><span class="tick">●</span>auditor</span>
+              <span class="chip"><span class="tick">●</span>documenter</span>
+              <span class="chip"><span class="tick">●</span>spec-keeper</span>
+              <span class="chip"><span class="tick">●</span>fact-checker</span>
+              <span class="chip off"><span class="tick">●</span>go-perf <span style="color:rgb(var(--info));font-size:10px">custom</span></span>
+            </div>
+            <span class="chip-caption">Click a chip to include or exclude it.</span>
+          </label>
+        </div>
+
+        <div class="summary-line" id="summaryA">
+          <span class="chip fixed"><span class="tick">●</span>lead</span>
+          <span>orchestrates every run (uzi builtin, not selectable) · delegating to</span>
+          <b id="countA">8 repo agents</b>
+        </div>
+      </section>
+
+      <!-- plan markdown -->
+      <div class="plan-md">
+        <h4>Plan: rate-limit the webhook endpoint</h4>
+        <ol>
+          <li>Add a token-bucket limiter in <code>api/internal/middleware/ratelimit.go</code> keyed by forge project ID.</li>
+          <li>Wire it onto <code>POST /api/webhooks/forge</code> only; health and auth routes untouched.</li>
+          <li>Config via <code>WEBHOOK_RATE_LIMIT</code> (default 60/min), validated at boot.</li>
+          <li>Tests: burst over limit → 429 with Retry-After; steady state under limit unaffected.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+
+  <div class="state-label">State B · no repo agents in this repo</div>
+
+  <div class="plan-panel">
+    <div class="plan-head">
+      <div>
+        <h2>Plan awaiting your approval</h2>
+        <p>The run is parked until you decide. Agent choice locks in on approval.</p>
+      </div>
+      <div class="btn-row">
+        <button class="btn primary">Approve plan · 7 agents</button>
+        <button class="btn secondary">Reject with reason</button>
+      </div>
+    </div>
+    <div class="plan-body">
+      <section class="agents-section">
+        <header>
+          <h3>Agents for this run</h3>
+          <span class="hint">Detected during clone, before planning</span>
+        </header>
+        <div class="source-grid">
+          <label class="source-card disabled" title="No .claude/agents/ directory in this repo">
+            <input type="radio" name="srcB" value="repo" disabled>
+            <div class="source-top">
+              <span class="radio-dot"></span>
+              <span class="source-title">Repo agents <span class="pill none">none detected</span></span>
+            </div>
+            <p class="source-desc">This repo has no <code>.claude/agents/</code> directory. Nothing to load.</p>
+          </label>
+          <label class="source-card selected">
+            <input type="radio" name="srcB" value="own" checked>
+            <div class="source-top">
+              <span class="radio-dot"></span>
+              <span class="source-title">My agent templates <span class="pill default">default</span></span>
+            </div>
+            <p class="source-desc">Your uzi templates — builtins plus any you customized under Settings → Agents.</p>
+            <div class="chip-row">
+              <span class="chip"><span class="tick">●</span>coder</span>
+              <span class="chip"><span class="tick">●</span>reviewer</span>
+              <span class="chip"><span class="tick">●</span>tester</span>
+              <span class="chip"><span class="tick">●</span>auditor</span>
+              <span class="chip"><span class="tick">●</span>documenter</span>
+              <span class="chip"><span class="tick">●</span>spec-keeper</span>
+              <span class="chip"><span class="tick">●</span>fact-checker</span>
+            </div>
+            <span class="chip-caption">Click a chip to include or exclude it.</span>
+          </label>
+        </div>
+        <div class="summary-line">
+          <span class="chip fixed"><span class="tick">●</span>lead</span>
+          <span>orchestrates every run (uzi builtin, not selectable) · delegating to</span>
+          <b>7 of your templates</b>
+        </div>
+      </section>
+      <div class="plan-md">
+        <h4>Plan: …</h4>
+        <ol><li>Same panel, fallback state: the repo card is inert, your templates are preselected.</li></ol>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  // State A interactivity: source switch + chip toggles + live approve label.
+  const stateA = document.getElementById("stateA");
+  const cards = stateA.querySelectorAll(".source-card");
+  const approveA = document.getElementById("approveA");
+  const countA = document.getElementById("countA");
+
+  function refresh() {
+    const repoSelected = stateA.querySelector('input[value="repo"]').checked;
+    cards.forEach(c => c.classList.toggle("selected", c.querySelector("input").checked));
+    const activeChips = stateA.querySelectorAll(
+      (repoSelected ? "#repoChips" : "#ownChipsA") + " .chip:not(.off)"
+    ).length;
+    const label = repoSelected
+      ? activeChips + " repo agent" + (activeChips === 1 ? "" : "s")
+      : activeChips + " of your templates";
+    approveA.textContent = "Approve plan · " + label;
+    countA.textContent = label;
+  }
+
+  stateA.querySelectorAll('input[name="srcA"]').forEach(r =>
+    r.addEventListener("change", refresh));
+
+  stateA.querySelectorAll(".chip-row .chip").forEach(chip => {
+    chip.addEventListener("click", e => {
+      e.preventDefault();
+      // selecting a chip in the other card also switches the source to it
+      const card = chip.closest(".source-card");
+      const input = card.querySelector("input");
+      if (!input.checked) { input.checked = true; }
+      chip.classList.toggle("off");
+      // never allow zero agents: re-enable if it was the last one
+      const row = chip.closest(".chip-row");
+      if (row.querySelectorAll(".chip:not(.off)").length === 0) chip.classList.remove("off");
+      refresh();
+    });
+  });
+  refresh();
+</script>

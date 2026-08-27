@@ -1,0 +1,153 @@
+<title>uzi — Rate limits: Utilization column (mock, PRD #240)</title>
+<style>
+  /* Single-theme by design: reproduces uzi's ember dark chrome (the real app is
+     color-scheme: dark, dark-only). Colours are painted from the app's own tokens
+     (web/src/index.css); meters/badges mirror Meter.tsx + ui.tsx 1:1. */
+  :root {
+    --bg: 8 10 15; --surface: 15 18 26; --raised: 23 27 38;
+    --edge: 39 45 60; --edge-strong: 58 66 86;
+    --fg: 228 232 240; --muted: 148 158 176; --faint: 122 133 154;
+    --brand: 251 146 60; --ok: 52 211 153; --warn: 251 191 36; --danger: 251 113 133;
+    --radius: 0.75rem;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { color-scheme: dark; }
+  body {
+    margin: 0; min-height: 100vh; font-size: 15px; line-height: 1.5;
+    font-family: var(--sans); -webkit-font-smoothing: antialiased;
+    color: rgb(var(--fg));
+    background: radial-gradient(1200px 640px at 8% -12%, rgb(var(--brand) / 0.06), transparent 58%), rgb(var(--bg));
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 48px 28px 96px; }
+  .eyebrow { font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: 0.16em; text-transform: uppercase; color: rgb(var(--brand)); margin: 0 0 12px; }
+  h1 { margin: 0; font-size: 28px; font-weight: 650; letter-spacing: -0.02em; text-wrap: balance; }
+  .lede { margin: 14px 0 0; max-width: 68ch; color: rgb(var(--muted)); font-size: 15px; }
+  .lede code { font-family: var(--mono); font-size: 0.86em; color: rgb(var(--fg)); background: rgb(var(--raised)); padding: 1px 5px; border-radius: 5px; }
+  section { margin-top: 52px; }
+  h2 { margin: 0 0 4px; font-size: 15px; font-family: var(--mono); font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: rgb(var(--faint)); }
+  .sub { margin: 0 0 16px; font-size: 13.5px; color: rgb(var(--muted)); max-width: 72ch; }
+
+  .frame { position: relative; border: 1px dashed rgb(var(--edge-strong)); border-radius: 14px; padding: 26px 22px 22px; background: rgb(var(--bg) / 0.4); }
+  .frame::before { content: attr(data-w); position: absolute; top: -9px; left: 20px; font-family: var(--mono); font-size: 10.5px; color: rgb(var(--faint)); background: rgb(var(--bg)); padding: 0 8px; }
+  .col { max-width: 900px; }
+
+  .card { border: 1px solid rgb(var(--edge)); background: rgb(var(--surface)); border-radius: var(--radius); overflow: hidden; }
+  table { width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; }
+  thead th { font-weight: 500; color: rgb(var(--muted)); padding: 12px 16px; border-bottom: 1px solid rgb(var(--edge)); white-space: nowrap; font-size: 13px; }
+  tbody td { padding: 12px 16px; vertical-align: middle; }
+  tbody tr + tr td { border-top: 1px solid rgb(var(--edge)); }
+  .uname { font-weight: 500; color: rgb(var(--fg)); }
+  .umail { font-size: 12px; color: rgb(var(--faint)); margin-top: 1px; }
+  .tok { font-size: 13px; font-weight: 500; color: rgb(var(--fg)); }
+  .pct { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; color: rgb(var(--muted)); }
+  .reset { font-size: 12px; color: rgb(var(--muted)); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .dash { color: rgb(var(--faint)); }
+  .badge { display: inline-flex; align-items: center; gap: 5px; border-radius: 6px; border: 1px solid; padding: 2px 7px; font-size: 11px; font-weight: 500; white-space: nowrap; }
+  .badge .dot { width: 6px; height: 6px; border-radius: 999px; background: currentColor; flex: none; }
+  .badge.ok { color: rgb(var(--ok)); background: rgb(var(--ok) / 0.1); border-color: rgb(var(--ok) / 0.4); }
+  .badge.danger { color: rgb(var(--danger)); background: rgb(var(--danger) / 0.1); border-color: rgb(var(--danger) / 0.4); }
+  .badge.neutral { color: rgb(var(--muted)); background: rgb(var(--raised)); border-color: rgb(var(--edge)); }
+  .chip { display: inline-flex; align-items: center; border-radius: 6px; border: 1px solid rgb(var(--edge)); background: rgb(var(--raised)); color: rgb(var(--muted)); font-size: 11px; padding: 1px 6px; }
+  .track { background: rgb(var(--raised)); border-radius: 999px; overflow: hidden; height: 6px; }
+  .fill { height: 100%; border-radius: 999px; }
+  .fill.ok { background: rgb(var(--ok)); } .fill.warn { background: rgb(var(--warn)); } .fill.danger { background: rgb(var(--danger)); }
+  .fill.dim { opacity: 0.4; }
+  .wlab { font-family: var(--mono); font-size: 10.5px; font-weight: 600; color: rgb(var(--faint)); letter-spacing: 0.02em; width: 18px; flex: none; }
+  .mrow { display: grid; grid-template-columns: 18px 1fr 40px auto; align-items: center; gap: 9px; }
+  .updated { font-size: 12px; color: rgb(var(--faint)); margin-top: 6px; font-variant-numeric: tabular-nums; }
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">Admin › Rate limits — PRD #240</p>
+  <h1 style="max-width: 22ch;">One “Utilization” column, both windows stacked</h1>
+  <p class="lede">
+    The 5-hour and 7-day meters move from two ~280px side-by-side columns into one column with two thin
+    stacked rows, and “Updated” folds under the Status pill. The table drops from six columns to four,
+    halving its width so it fits its card — no <code>overflow-x-auto</code> scrollbar, no clipped pill,
+    every number still visible. Meters, badges, tones and palette are the real components.
+  </p>
+
+  <section>
+    <h2>Before — today</h2>
+    <p class="sub">Six columns; the two window columns are the culprit. Squeezed into the real content width, the scrollbar appears and <b style="color:rgb(var(--danger))">7d nearly out</b> clips.</p>
+    <div class="frame" data-w="≈ 900px content column">
+      <div class="col"><div class="card"><div style="overflow-x:auto;">
+        <table style="min-width:1080px;">
+          <thead><tr><th>User</th><th>Token</th><th>5-hour window</th><th>7-day window</th><th>Status</th><th>Updated</th></tr></thead>
+          <tbody>
+            <tr>
+              <td rowspan="2" style="vertical-align:top;"><div class="uname">Alex Rivera</div><div class="umail">alex.rivera@example.com</div></td>
+              <td><span class="tok">personal</span> <span class="chip">default</span></td>
+              <td><div style="display:grid;grid-template-columns:minmax(80px,144px) 42px 84px;align-items:center;gap:10px;"><div class="track"><div class="fill ok" style="width:1%"></div></div><span class="pct">1%</span><span class="reset">27m</span></div></td>
+              <td><div style="display:grid;grid-template-columns:minmax(80px,144px) 42px 84px;align-items:center;gap:10px;"><div class="track"><div class="fill danger" style="width:98%"></div></div><span class="pct">98%</span><span class="reset">8h 7m</span></div></td>
+              <td><span class="badge danger"><span class="dot"></span>7d nearly out</span></td><td class="reset">2m ago</td>
+            </tr>
+            <tr>
+              <td><span class="tok">meta</span></td>
+              <td><div style="display:grid;grid-template-columns:minmax(80px,144px) 42px 84px;align-items:center;gap:10px;"><div class="track"><div class="fill ok" style="width:38%"></div></div><span class="pct">38%</span><span class="reset">1h 47m</span></div></td>
+              <td><div style="display:grid;grid-template-columns:minmax(80px,144px) 42px 84px;align-items:center;gap:10px;"><div class="track"><div class="fill danger" style="width:96%"></div></div><span class="pct">96%</span><span class="reset">1d 1h</span></div></td>
+              <td><span class="badge danger"><span class="dot"></span>7d nearly out</span></td><td class="reset">2m ago</td>
+            </tr>
+          </tbody>
+        </table>
+      </div></div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>After — Option A</h2>
+    <p class="sub">Four columns. The two windows stack in one Utilization cell (aria-labels stay the full “5-hour window” / “7-day window”); the reset countdown rides each meter; “updated Nm ago” sits under the pill.</p>
+    <div class="frame" data-w="≈ 900px content column — no scroll">
+      <div class="col"><div class="card">
+        <table>
+          <thead><tr><th style="width:34%;">User</th><th>Token</th><th style="width:40%;">Utilization</th><th>Status</th></tr></thead>
+          <tbody>
+            <tr>
+              <td rowspan="2" style="vertical-align:top;"><div class="uname">Alex Rivera</div><div class="umail">alex.rivera@example.com</div></td>
+              <td style="vertical-align:top;padding-top:14px;"><span class="tok">personal</span> <span class="chip">default</span></td>
+              <td><div style="display:flex;flex-direction:column;gap:9px;max-width:340px;">
+                <div class="mrow"><span class="wlab">5h</span><div class="track"><div class="fill ok" style="width:1%"></div></div><span class="pct">1%</span><span class="reset">27m</span></div>
+                <div class="mrow"><span class="wlab">7d</span><div class="track"><div class="fill danger" style="width:98%"></div></div><span class="pct">98%</span><span class="reset">8h&nbsp;7m</span></div>
+              </div></td>
+              <td style="vertical-align:top;padding-top:12px;"><span class="badge danger"><span class="dot"></span>7d nearly out</span><div class="updated">updated 2m ago</div></td>
+            </tr>
+            <tr>
+              <td style="vertical-align:top;padding-top:14px;"><span class="tok">meta</span></td>
+              <td><div style="display:flex;flex-direction:column;gap:9px;max-width:340px;">
+                <div class="mrow"><span class="wlab">5h</span><div class="track"><div class="fill ok" style="width:38%"></div></div><span class="pct">38%</span><span class="reset">1h&nbsp;47m</span></div>
+                <div class="mrow"><span class="wlab">7d</span><div class="track"><div class="fill danger" style="width:96%"></div></div><span class="pct">96%</span><span class="reset">1d&nbsp;1h</span></div>
+              </div></td>
+              <td style="vertical-align:top;padding-top:12px;"><span class="badge danger"><span class="dot"></span>7d nearly out</span><div class="updated">updated 2m ago</div></td>
+            </tr>
+            <tr>
+              <td style="vertical-align:top;"><div class="uname">Jordan Lee</div><div class="umail">jordan.lee@example.com</div></td>
+              <td style="vertical-align:top;padding-top:14px;"><span class="tok">work</span> <span class="chip">default</span></td>
+              <td><div style="display:flex;flex-direction:column;gap:9px;max-width:340px;">
+                <div class="mrow"><span class="wlab">5h</span><div class="track"><div class="fill warn" style="width:71%"></div></div><span class="pct">71%</span><span class="reset">2h&nbsp;3m</span></div>
+                <div class="mrow"><span class="wlab">7d</span><div class="track"><div class="fill warn" style="width:44%"></div></div><span class="pct">44%</span><span class="reset">5d&nbsp;2h</span></div>
+              </div></td>
+              <td style="vertical-align:top;padding-top:12px;"><span class="badge ok"><span class="dot"></span>Live</span><div class="updated">updated 1m ago</div></td>
+            </tr>
+            <tr>
+              <td style="vertical-align:top;"><div class="uname">Sam Chen</div><div class="umail">sam.chen@example.com</div></td>
+              <td style="vertical-align:top;padding-top:14px;"><span class="tok">default</span></td>
+              <td><div style="display:flex;flex-direction:column;gap:9px;max-width:340px;">
+                <div class="mrow"><span class="wlab">5h</span><div class="track"><div class="fill warn dim" style="width:52%"></div></div><span class="pct" style="color:rgb(var(--faint))">52%</span><span class="reset" style="color:rgb(var(--faint))">stale</span></div>
+                <div class="mrow"><span class="wlab">7d</span><div class="track"><div class="fill danger dim" style="width:88%"></div></div><span class="pct" style="color:rgb(var(--faint))">88%</span><span class="reset" style="color:rgb(var(--faint))">stale</span></div>
+              </div></td>
+              <td style="vertical-align:top;padding-top:12px;"><span class="badge neutral">stale</span><div class="updated">updated 42m ago</div></td>
+            </tr>
+            <tr>
+              <td style="vertical-align:top;"><div class="uname">Priya Patel</div><div class="umail">priya.patel@example.com</div></td>
+              <td class="dash">—</td>
+              <td class="dash">—</td>
+              <td><span class="badge neutral">no token</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div></div>
+    </div>
+  </section>
+</div>

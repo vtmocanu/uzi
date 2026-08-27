@@ -1,0 +1,68 @@
+# yamllint configuration for the uzi repo (PRD #103 M5).
+#
+# READ THIS BEFORE ADDING A LINE. Every entry below is a SUPPRESSION and owes a
+# reason, the same convention `api/.deadcode-baseline` ships under. yamllint's
+# default rule set is the baseline; the routine fix for a finding is to fix the
+# YAML, not to add a rule here.
+#
+# 🔴 THIS FILE IS PASSED WITH `-c`, NEVER DISCOVERED. yamllint auto-discovers
+# `.yamllint` / `.yamllint.yaml` / `.yamllint.yml` from the working directory,
+# which means a stray config anywhere up the tree could silently govern the gate
+# -- the same hazard `web/package.json`'s `oxlint --config .oxlintrc.json` exists
+# to close, and the same reason `scripts/lint-yaml.sh` asserts this file EXISTS
+# before invoking: `-c` pointing at a missing file exits 1, which is
+# indistinguishable from "there are findings".
+#
+# 🔴 AND THE GATE RUNS `--strict`, WHICH IS NOT OPTIONAL. Measured 2026-08-03 at
+# yamllint 1.38.0 over the gated scope: WITHOUT `--strict` the run printed three
+# findings and exited 0, because yamllint puts most style rules at `warning`
+# severity and warnings do not set the exit code. That is oxlint's severity trap
+# arriving in a second tool, and shipping it would make this file's whole rule set
+# advisory forever -- "a warning nobody must act on", which PRD #103 Decision 3
+# rejects as an end state. `--strict` also INVERTS this repo's exit convention
+# (yamllint: 2 = warnings only, 1 = errors), which is why the wrapper maps both to
+# 1 rather than passing yamllint's status through.
+#
+# SCOPE lives in `scripts/lint-yaml.sh`, not here: every tracked *.yml/*.yaml
+# except `deploy/chart/templates/`. Helm templates are not YAML (239 findings, the
+# first a hard syntax error), and that exclusion is argued at the script.
+#
+# 🔴 AND THAT SENTENCE IS NOW ENFORCED RATHER THAN MERELY STATED. `scripts/
+# lint-yaml.sh` refuses to run if this file contains an `ignore:`, an
+# `ignore-from-file:`, or a per-rule `ignore:` -- exit 2, before yamllint is
+# invoked. Measured: one live `trailing-spaces` error in `api/sqlc.yaml` plus an
+# ignore key naming that file gave rc=0 AND a success line still reading "11
+# tracked YAML files", while yamllint had checked ten. The count comes from the
+# script's git query, so the output asserted a number that had become false --
+# worse than printing none, because it reads as confirmation. All three spellings
+# did it. Take a file out of scope by editing the pathspec in the script, where
+# the count is computed and where a reviewer will look for it.
+#
+# WHAT STAYS AT DEFAULT, stated because a config is read for what it turns OFF and
+# the important half is what it leaves ON: `syntax` and `key-duplicates` both stay
+# at ERROR. `key-duplicates` is the one that matters operationally here -- a
+# duplicated key in `deploy/chart/values.yaml` or `docker-compose.yml` is silently
+# last-wins in every YAML parser, which is precisely how this repo lost a
+# ServiceAccount from the chart for days (`.claude/rules/stack.md` records it). `truthy` also
+# stays on: it fires on nothing in this repo today, which is a property of the
+# DATA and not of the rule, and it is exactly the rule you want the first time
+# somebody writes an `on:` key.
+extends: default
+
+rules:
+  # 1622 findings on the gated scope, and every one of them is prose. This repo's
+  # YAML carries long argued comments by design -- docker-compose.yml, Taskfile.yml
+  # and .github/workflows/ci.yml are more comment than data, and that is the house style
+  # PRD #103 is itself written in. Re-wrapping them to 80 columns would be a
+  # several-thousand-line diff that makes the comments harder to read in order to
+  # satisfy a rule about columns. Disabled rather than widened: any limit picked
+  # here would be a number nobody can defend, and a limit set high enough to pass
+  # today gates nothing tomorrow.
+  line-length: disable
+
+  # 10 findings, one per file: "missing document start '---'". No YAML file in
+  # this repo opens with `---`, including the ones that predate this PRD by a year,
+  # so enabling it is a 10-file edit to adopt a convention nothing here uses and
+  # nothing here needs (none of these files is a multi-document stream). Disabled
+  # to match the tree rather than editing the tree to match a default.
+  document-start: disable

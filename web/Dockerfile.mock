@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1
+# MOCK build of the uzi SPA: the entire app runs on in-browser demo data
+# (VITE_UZI_MOCK=1) and is served as pure static files — no api service, no
+# proxy, no backend anywhere. Build context is the REPO ROOT (same as
+# web/Dockerfile) so the in-app docs viewer can bundle docs/ as a sibling of
+# web/.
+#
+#   docker build -f web/Dockerfile.mock -t uzi-ux-mock .
+#   docker run -d --name uzi-ux-mock -p 127.0.0.1:8081:8080 uzi-ux-mock
+
+# --- build stage ---
+FROM node:24-alpine@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43 AS build
+WORKDIR /app/web
+
+COPY web/package.json web/package-lock.json ./
+# --ignore-scripts: same supply-chain control as web/Dockerfile (see the long note
+# there). This stage installs the identical web/package-lock.json, and PRD #311 M1
+# is what first builds this Dockerfile in CI — including the protected-ref path
+# where Harbor cache creds sit on the kaniko fs — so a dependency postinstall must
+# not execute here any more than it does in the production build.
+RUN npm ci --ignore-scripts
+
+COPY web/ ./
+COPY docs/ /app/docs/
+ENV VITE_UZI_MOCK=1
+RUN npm run build
+
+# --- runtime stage ---
+# nginx-unprivileged runs as a non-root user (uid 101) and listens on 8080.
+FROM nginxinc/nginx-unprivileged:1.30-alpine@sha256:44e36330f74d4f3a1d4e222acca9e23b401fb87811a7597024502bb759c4dd49
+COPY web/nginx.mock.conf /etc/nginx/conf.d/default.conf
+COPY --from=build /app/web/dist /usr/share/nginx/html
+EXPOSE 8080

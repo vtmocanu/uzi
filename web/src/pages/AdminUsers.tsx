@@ -1,0 +1,193 @@
+import { useCallback, useEffect, useState } from "react";
+import { useAuth } from "../auth/AuthContext";
+import { api, ApiError, type User } from "../lib/api";
+import { Alert, Badge, Button, Card, ListSkeleton } from "../components/ui";
+import { AdminShell } from "../components/AdminShell";
+
+export function AdminUsers() {
+  const { user: me } = useAuth();
+  const [users, setUsers] = useState<User[]>([]);
+  const [error, setError] = useState("");
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [judgeBusyId, setJudgeBusyId] = useState<string | null>(null);
+  const [ciAutofixBusyId, setCiAutofixBusyId] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  // Whether the admin has ENFORCED the judge instance-wide (PRD #69 M4). Under
+  // enforced mode the per-user judge flag is bypassed at enqueue (Decision 3), so the
+  // per-user toggle in this table is INERT — greyed and annotated, not removed. Read
+  // best-effort from the admin settings alongside the user list; a failed read leaves
+  // it false so the toggle stays live rather than falsely claiming to be inert.
+  const [judgeEnforceAll, setJudgeEnforceAll] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      // The user list is the page; a failure here is fatal. The settings read is
+      // best-effort per the judgeEnforceAll comment above: it only decides whether the
+      // per-user toggle is annotated inert, so a settings-endpoint blip must NOT blank
+      // the whole table. Keep it OUT of the fatal path — leave enforce=false on error.
+      const { users } = await api.listUsers();
+      setUsers(users);
+      try {
+        const { settings } = await api.getSettings();
+        setJudgeEnforceAll(settings.judge_enforce_all === "true");
+      } catch {
+        setJudgeEnforceAll(false);
+      }
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to load users");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const toggle = async (u: User) => {
+    setError("");
+    setBusyId(u.id);
+    try {
+      const { user } = await api.setUserActive(u.id, !u.is_active);
+      setUsers((prev) => prev.map((x) => (x.id === user.id ? user : x)));
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Update failed");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  // Admin per-user run-judge toggle (PRD #46 Decision 7): force any user's opt-in on
+  // or off. The server sets the flag on the TARGET's own account, so the judge still
+  // only ever spends that user's tokens — this is the "force-disable per user" control.
+  const toggleJudge = async (u: User) => {
+    setError("");
+    setJudgeBusyId(u.id);
+    try {
+      const { user } = await api.setUserJudgeEnabled(u.id, !u.judge_enabled);
+      setUsers((prev) => prev.map((x) => (x.id === user.id ? user : x)));
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Update failed");
+    } finally {
+      setJudgeBusyId(null);
+    }
+  };
+
+  // Admin per-user CI-autofix toggle (PRD #71): force any user's opt-in on or off.
+  // The server sets the flag on the TARGET's own account, so the auto-fix still only
+  // ever spends that user's tokens — this is the "force-disable per user" control.
+  const toggleCIAutofix = async (u: User) => {
+    setError("");
+    setCiAutofixBusyId(u.id);
+    try {
+      const { user } = await api.setUserCIAutofixEnabled(u.id, !u.ci_autofix_enabled);
+      setUsers((prev) => prev.map((x) => (x.id === user.id ? user : x)));
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Update failed");
+    } finally {
+      setCiAutofixBusyId(null);
+    }
+  };
+
+  return (
+    <AdminShell description="Deactivating a user blocks their login and immediately ends every active session.">
+      {error && <Alert message={error} />}
+      {loading ? (
+        <ListSkeleton rows={4} />
+      ) : (
+        <Card className="p-0">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead className="border-b border-edge text-muted">
+                <tr>
+                  <th className="px-4 py-3 font-medium">Email</th>
+                  <th className="px-4 py-3 font-medium">Name</th>
+                  <th className="px-4 py-3 font-medium">Role</th>
+                  <th className="px-4 py-3 font-medium">Status</th>
+                  <th className="px-4 py-3 font-medium" title="Run-judge opt-in: reviews this user's finished runs on their Anthropic token">
+                    Judge
+                  </th>
+                  <th className="px-4 py-3 font-medium" title="CI-autofix opt-in: auto-fixes this user's failed pipelines on their Anthropic token">
+                    CI autofix
+                  </th>
+                  <th className="px-4 py-3 font-medium">Last login</th>
+                  <th className="px-4 py-3 text-right font-medium">Action</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-edge">
+                {users.map((u) => (
+                  <tr key={u.id} className="transition-colors hover:bg-raised/30">
+                    <td className="px-4 py-3 text-fg">{u.email}</td>
+                    {/* ?? only catches null/undefined; an empty-string name would
+                        render blank, so fall back on a trimmed-empty name too. */}
+                    <td className="px-4 py-3 text-muted">{u.display_name?.trim() || "—"}</td>
+                    <td className="px-4 py-3">
+                      {u.is_admin ? <Badge tone="brand">Admin</Badge> : <Badge>User</Badge>}
+                    </td>
+                    <td className="px-4 py-3">
+                      <Badge tone={u.is_active ? "ok" : "danger"} dot>
+                        {u.is_active ? "Active" : "Deactivated"}
+                      </Badge>
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className={`flex items-center gap-2 ${judgeEnforceAll ? "opacity-50" : ""}`}>
+                        <Badge tone={u.judge_enabled ? "ok" : "neutral"} dot>
+                          {u.judge_enabled ? "On" : "Off"}
+                        </Badge>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          disabled={judgeBusyId === u.id || judgeEnforceAll}
+                          onClick={() => toggleJudge(u)}
+                        >
+                          {u.judge_enabled ? "Disable" : "Enable"}
+                        </Button>
+                      </div>
+                      {judgeEnforceAll && (
+                        <p className="mt-1 text-xs text-faint">
+                          Inert: enforced mode judges every run regardless of this flag.
+                        </p>
+                      )}
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="flex items-center gap-2">
+                        <Badge tone={u.ci_autofix_enabled ? "ok" : "neutral"} dot>
+                          {u.ci_autofix_enabled ? "On" : "Off"}
+                        </Badge>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          disabled={ciAutofixBusyId === u.id}
+                          onClick={() => toggleCIAutofix(u)}
+                        >
+                          {u.ci_autofix_enabled ? "Disable" : "Enable"}
+                        </Button>
+                      </div>
+                    </td>
+                    <td className="px-4 py-3 text-muted">
+                      {u.last_login ? new Date(u.last_login).toLocaleString() : "—"}
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      {u.id === me?.id ? (
+                        <span className="text-xs text-faint">you</span>
+                      ) : (
+                        <Button
+                          variant={u.is_active ? "danger" : "secondary"}
+                          size="sm"
+                          disabled={busyId === u.id}
+                          onClick={() => toggle(u)}
+                        >
+                          {u.is_active ? "Deactivate" : "Activate"}
+                        </Button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+    </AdminShell>
+  );
+}

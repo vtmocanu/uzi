@@ -1,0 +1,571 @@
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/google/uuid"
+
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/schedtmpl"
+)
+
+// Handler-level end-to-end coverage for the PRD #589 M2 default-schedule endpoints against
+// a real Postgres (owner-scoping and idempotency live in the SQL). Skipped unless
+// UZI_TEST_DATABASE_URL is set; ./e2e/run-store-it.sh provides one.
+
+// enableCatalog POSTs to /api/repos/{id}/schedule-catalog/{slug} and returns the decoded DTO.
+func (f scheduleFixture) enableCatalog(t *testing.T, user, repoID uuid.UUID, slug string) (apitypes.ScheduleDTO, int) {
+	t.Helper()
+	req := userReq(http.MethodPost, "/api/repos/"+repoID.String()+"/schedule-catalog/"+slug, "",
+		user, map[string]string{"id": repoID.String(), "slug": slug})
+	rec := httptest.NewRecorder()
+	f.h.EnableCatalogSchedule(rec, req)
+	var dto apitypes.ScheduleDTO
+	if rec.Code == http.StatusCreated || rec.Code == http.StatusOK {
+		if err := json.Unmarshal(rec.Body.Bytes(), &dto); err != nil {
+			t.Fatalf("decode enable response: %v (body %s)", err, rec.Body.String())
+		}
+	}
+	return dto, rec.Code
+}
+
+func TestScheduleCatalogLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	req := userReq(http.MethodGet, "/api/schedule-catalog", "", f.owner.ID, nil)
+	rec := httptest.NewRecorder()
+	f.h.ScheduleCatalog(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("catalog status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+	var resp apitypes.ScheduleCatalogResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode catalog: %v", err)
+	}
+	if len(resp.Entries) != len(schedtmpl.Catalog()) {
+		t.Fatalf("catalog entries = %d, want %d", len(resp.Entries), len(schedtmpl.Catalog()))
+	}
+	if len(resp.Enablements) != 0 {
+		t.Fatalf("enablements = %d, want 0 before any enable", len(resp.Enablements))
+	}
+
+	// After enabling one, its (repo, slug) appears in the enablement state.
+	dto, code := f.enableCatalog(t, f.owner.ID, f.repoID, "docs-hygiene")
+	if code != http.StatusCreated {
+		t.Fatalf("enable status = %d, want 201", code)
+	}
+	rec2 := httptest.NewRecorder()
+	f.h.ScheduleCatalog(rec2, userReq(http.MethodGet, "/api/schedule-catalog", "", f.owner.ID, nil))
+	var resp2 apitypes.ScheduleCatalogResponse
+	if err := json.Unmarshal(rec2.Body.Bytes(), &resp2); err != nil {
+		t.Fatalf("decode catalog 2: %v", err)
+	}
+	if len(resp2.Enablements) != 1 {
+		t.Fatalf("enablements = %d, want 1 after enable", len(resp2.Enablements))
+	}
+	en := resp2.Enablements[0]
+	if en.Slug != "docs-hygiene" || en.RepoID != f.repoID.String() || en.ScheduleID != dto.ID {
+		t.Fatalf("enablement = %+v, want docs-hygiene on this repo/schedule", en)
+	}
+}
+
+func TestEnableCatalogScheduleIdempotentLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	want, _ := schedtmpl.BySlug("docs-hygiene")
+	first, code := f.enableCatalog(t, f.owner.ID, f.repoID, "docs-hygiene")
+	if code != http.StatusCreated {
+		t.Fatalf("first enable status = %d, want 201", code)
+	}
+	if first.Origin != "default" || first.CatalogSlug == nil || *first.CatalogSlug != "docs-hygiene" {
+		t.Fatalf("enabled dto origin/slug = %q/%v, want default/docs-hygiene", first.Origin, first.CatalogSlug)
+	}
+	// The DTO surfaces the RESOLVED catalog prompt (never stored on the row).
+	if first.Prompt != want.Prompt {
+		t.Fatalf("dto prompt = %q, want the resolved catalog prompt", first.Prompt)
+	}
+	if first.Customized {
+		t.Fatal("newly enabled default is customized, want false")
+	}
+
+	// A repeat enable is idempotent: 200 with the SAME schedule id.
+	second, code := f.enableCatalog(t, f.owner.ID, f.repoID, "docs-hygiene")
+	if code != http.StatusOK {
+		t.Fatalf("second enable status = %d, want 200 (idempotent)", code)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("idempotent enable returned a different schedule: %s vs %s", second.ID, first.ID)
+	}
+
+	// An unknown slug is a 404.
+	_, code = f.enableCatalog(t, f.owner.ID, f.repoID, "no-such-slug")
+	if code != http.StatusNotFound {
+		t.Fatalf("unknown slug enable status = %d, want 404", code)
+	}
+}
+
+func TestResetScheduleLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	dto, code := f.enableCatalog(t, f.owner.ID, f.repoID, "docs-hygiene")
+	if code != http.StatusCreated {
+		t.Fatalf("enable status = %d, want 201", code)
+	}
+	job, _ := schedtmpl.BySlug("docs-hygiene")
+
+	// Diverge the cron via a config PATCH → the row becomes customized.
+	patched := f.patchDefault(t, f.owner.ID, dto.ID, `{"cron_expr":"15 3 * * 4"}`)
+	if !patched.Customized {
+		t.Fatalf("after a divergent patch, customized = false, want true")
+	}
+
+	// Reset restores the catalog cron and clears customized.
+	resetReq := userReq(http.MethodPost, "/api/schedules/"+dto.ID+"/reset", "", f.owner.ID, map[string]string{"id": dto.ID})
+	resetRec := httptest.NewRecorder()
+	f.h.ResetSchedule(resetRec, resetReq)
+	if resetRec.Code != http.StatusOK {
+		t.Fatalf("reset status = %d, want 200 (body %s)", resetRec.Code, resetRec.Body.String())
+	}
+	var reset apitypes.ScheduleDTO
+	if err := json.Unmarshal(resetRec.Body.Bytes(), &reset); err != nil {
+		t.Fatalf("decode reset: %v", err)
+	}
+	if reset.Customized {
+		t.Fatal("reset row customized = true, want false")
+	}
+	if reset.CronExpr != job.Cron {
+		t.Fatalf("reset cron = %q, want the catalog default %q", reset.CronExpr, job.Cron)
+	}
+
+	// Resetting a user-origin schedule is a 409.
+	userDTO, code := f.createSchedule(t, f.owner.ID, f.repoID,
+		`{"target":"prompt","prompt":"my own prompt","timing":"recurring","cron_expr":"0 2 * * *","timezone":"UTC"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create user schedule status = %d, want 201", code)
+	}
+	rReq := userReq(http.MethodPost, "/api/schedules/"+userDTO.ID+"/reset", "", f.owner.ID, map[string]string{"id": userDTO.ID})
+	rRec := httptest.NewRecorder()
+	f.h.ResetSchedule(rRec, rReq)
+	if rRec.Code != http.StatusConflict {
+		t.Fatalf("reset user schedule status = %d, want 409", rRec.Code)
+	}
+}
+
+func TestPatchDefaultScheduleCustomizedLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	dto, code := f.enableCatalog(t, f.owner.ID, f.repoID, "docs-hygiene")
+	if code != http.StatusCreated {
+		t.Fatalf("enable status = %d, want 201", code)
+	}
+	job, _ := schedtmpl.BySlug("docs-hygiene")
+
+	// A divergent editable field sets customized.
+	diverged := f.patchDefault(t, f.owner.ID, dto.ID, `{"cron_expr":"15 3 * * 4"}`)
+	if !diverged.Customized {
+		t.Fatal("divergent patch: customized = false, want true")
+	}
+	// Its prompt stays the RESOLVED catalog prompt (never editable).
+	if diverged.Prompt != job.Prompt {
+		t.Fatalf("patched default prompt = %q, want catalog prompt unchanged", diverged.Prompt)
+	}
+
+	// Patching every editable field back to the catalog values clears customized.
+	restored := f.patchDefault(t, f.owner.ID, dto.ID, `{"cron_expr":"`+job.Cron+`"}`)
+	if restored.Customized {
+		t.Fatal("catalog-matching patch: customized = true, want false")
+	}
+
+	// A default row's prompt is catalog-owned and cannot be patched: 400.
+	badReq := userReq(http.MethodPatch, "/api/schedules/"+dto.ID, `{"prompt":"hijack the baked prompt"}`, f.owner.ID, map[string]string{"id": dto.ID})
+	badRec := httptest.NewRecorder()
+	f.h.PatchSchedule(badRec, badReq)
+	if badRec.Code != http.StatusBadRequest {
+		t.Fatalf("patch default prompt status = %d, want 400", badRec.Code)
+	}
+}
+
+// cloneSchedule POSTs to /api/schedules/{id}/clone with the given (possibly empty) body and
+// returns the decoded DTO plus the status code.
+func (f scheduleFixture) cloneSchedule(t *testing.T, user uuid.UUID, id, body string) (apitypes.ScheduleDTO, int) {
+	t.Helper()
+	req := userReq(http.MethodPost, "/api/schedules/"+id+"/clone", body, user, map[string]string{"id": id})
+	rec := httptest.NewRecorder()
+	f.h.CloneSchedule(rec, req)
+	var dto apitypes.ScheduleDTO
+	if rec.Code == http.StatusCreated {
+		if err := json.Unmarshal(rec.Body.Bytes(), &dto); err != nil {
+			t.Fatalf("decode clone response: %v (body %s)", err, rec.Body.String())
+		}
+	}
+	return dto, rec.Code
+}
+
+// TestCloneDefaultPromptUnlocksLiveDB is the M3 flagship: cloning a default PROMPT schedule
+// produces a fully-editable user row whose prompt column equals the catalog's baked prompt
+// (the lock is lifted), with catalog_slug NULL and customized false.
+func TestCloneDefaultPromptUnlocksLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	src, code := f.enableCatalog(t, f.owner.ID, f.repoID, "docs-hygiene")
+	if code != http.StatusCreated {
+		t.Fatalf("enable status = %d, want 201", code)
+	}
+	job, _ := schedtmpl.BySlug("docs-hygiene")
+
+	clone, code := f.cloneSchedule(t, f.owner.ID, src.ID, "")
+	if code != http.StatusCreated {
+		t.Fatalf("clone status = %d, want 201", code)
+	}
+	if clone.ID == src.ID {
+		t.Fatal("clone returned the same schedule id as the source")
+	}
+	if clone.Origin != "user" {
+		t.Fatalf("clone origin = %q, want user", clone.Origin)
+	}
+	if clone.CatalogSlug != nil {
+		t.Fatalf("clone catalog_slug = %v, want nil (lock lifted)", clone.CatalogSlug)
+	}
+	if clone.Customized {
+		t.Fatal("clone customized = true, want false")
+	}
+	// The lock-lift: the baked catalog prompt is now stored on the user row (the DTO of a
+	// user row surfaces the stored column, not a resolved catalog value).
+	if clone.Prompt != job.Prompt {
+		t.Fatalf("clone prompt = %q, want the baked catalog prompt", clone.Prompt)
+	}
+	// It landed in the source's own repo (no repo_id given).
+	if clone.RepoID != f.repoID.String() {
+		t.Fatalf("clone repo = %q, want the source repo %q", clone.RepoID, f.repoID.String())
+	}
+
+	// The clone is now freely editable: a prompt PATCH that a default row rejects (400)
+	// succeeds on the user clone.
+	patched := f.patchDefault(t, f.owner.ID, clone.ID, `{"prompt":"my own edited prompt"}`)
+	if patched.Prompt != "my own edited prompt" {
+		t.Fatalf("edited clone prompt = %q, want the new text (clone is editable)", patched.Prompt)
+	}
+}
+
+// TestCloneDefaultSweepCopiesSelectorLiveDB: cloning a default SWEEP copies the catalog's
+// labels and guidance into the new user row.
+func TestCloneDefaultSweepCopiesSelectorLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	src, code := f.enableCatalog(t, f.owner.ID, f.repoID, "bug-triage")
+	if code != http.StatusCreated {
+		t.Fatalf("enable status = %d, want 201", code)
+	}
+	job, _ := schedtmpl.BySlug("bug-triage")
+
+	clone, code := f.cloneSchedule(t, f.owner.ID, src.ID, "")
+	if code != http.StatusCreated {
+		t.Fatalf("clone status = %d, want 201", code)
+	}
+	if clone.Origin != "user" || clone.CatalogSlug != nil {
+		t.Fatalf("clone origin/slug = %q/%v, want user/nil", clone.Origin, clone.CatalogSlug)
+	}
+	if clone.Target != "sweep" {
+		t.Fatalf("clone target = %q, want sweep", clone.Target)
+	}
+	if len(clone.Labels) != len(job.Labels) {
+		t.Fatalf("clone labels = %v, want the catalog labels %v", clone.Labels, job.Labels)
+	}
+	for i := range job.Labels {
+		if clone.Labels[i] != job.Labels[i] {
+			t.Fatalf("clone labels = %v, want %v", clone.Labels, job.Labels)
+		}
+	}
+	if job.Guidance != "" {
+		if clone.Guidance == nil || *clone.Guidance != job.Guidance {
+			t.Fatalf("clone guidance = %v, want the catalog guidance", clone.Guidance)
+		}
+	}
+	if clone.MaxIssues == nil || *clone.MaxIssues != job.MaxIssues {
+		t.Fatalf("clone max_issues = %v, want the catalog cap %d", clone.MaxIssues, job.MaxIssues)
+	}
+}
+
+// TestCloneUserScheduleCopiesFieldsLiveDB: cloning a user-origin schedule copies its stored
+// fields as-is.
+func TestCloneUserScheduleCopiesFieldsLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	src, code := f.createSchedule(t, f.owner.ID, f.repoID,
+		`{"target":"prompt","prompt":"the original text","timing":"recurring","cron_expr":"0 2 * * *","timezone":"UTC"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201", code)
+	}
+
+	clone, code := f.cloneSchedule(t, f.owner.ID, src.ID, "")
+	if code != http.StatusCreated {
+		t.Fatalf("clone status = %d, want 201", code)
+	}
+	if clone.ID == src.ID {
+		t.Fatal("clone returned the same id as the source user schedule")
+	}
+	if clone.Origin != "user" || clone.Prompt != "the original text" || clone.CronExpr != "0 2 * * *" {
+		t.Fatalf("clone = %+v, want a copy of the user schedule fields", clone)
+	}
+}
+
+// TestCloneToDifferentRepoLiveDB: a {"repo_id"} body clones into a second owned repo; a
+// foreign/absent target repo is a 404.
+func TestCloneToDifferentRepoLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	src, code := f.enableCatalog(t, f.owner.ID, f.repoID, "docs-hygiene")
+	if code != http.StatusCreated {
+		t.Fatalf("enable status = %d, want 201", code)
+	}
+	targetRepo := f.insertRepo(ctx, t, f.owner, 2, "g/sched-two")
+
+	clone, code := f.cloneSchedule(t, f.owner.ID, src.ID, `{"repo_id":"`+targetRepo.String()+`"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("clone-to-repo status = %d, want 201", code)
+	}
+	if clone.RepoID != targetRepo.String() {
+		t.Fatalf("clone repo = %q, want the target repo %q", clone.RepoID, targetRepo.String())
+	}
+
+	// A repo the caller does not own is a 404.
+	strangerRepo := f.insertRepo(ctx, t, f.stranger, 3, "g/sched-stranger")
+	req := userReq(http.MethodPost, "/api/schedules/"+src.ID+"/clone", `{"repo_id":"`+strangerRepo.String()+`"}`,
+		f.owner.ID, map[string]string{"id": src.ID})
+	rec := httptest.NewRecorder()
+	f.h.CloneSchedule(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("clone to a foreign repo status = %d, want 404", rec.Code)
+	}
+}
+
+// TestEnableCatalogTwoReposLiveDB pins the SERVER invariant the CLI's client-side multi-repo
+// fan-out relies on: enabling the same slug on two different repos yields two independent
+// default rows.
+func TestEnableCatalogTwoReposLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	repoB := f.insertRepo(ctx, t, f.owner, 2, "g/sched-b")
+
+	a, code := f.enableCatalog(t, f.owner.ID, f.repoID, "docs-hygiene")
+	if code != http.StatusCreated {
+		t.Fatalf("enable on repoA status = %d, want 201", code)
+	}
+	b, code := f.enableCatalog(t, f.owner.ID, repoB, "docs-hygiene")
+	if code != http.StatusCreated {
+		t.Fatalf("enable on repoB status = %d, want 201", code)
+	}
+	if a.ID == b.ID {
+		t.Fatal("enabling the same slug on two repos returned the same schedule id")
+	}
+	if a.RepoID != f.repoID.String() || b.RepoID != repoB.String() {
+		t.Fatalf("rows landed on the wrong repos: a=%q b=%q", a.RepoID, b.RepoID)
+	}
+}
+
+// guidanceVal dereferences a DTO's guidance pointer to a plain string ("" when nil). A
+// default row's DTO surfaces the catalog guidance (a non-nil pointer, even when the catalog
+// guidance is empty), so tests compare the effective value, not the pointer.
+func guidanceVal(dto apitypes.ScheduleDTO) string {
+	if dto.Guidance == nil {
+		return ""
+	}
+	return *dto.Guidance
+}
+
+// jsonString JSON-encodes s to a quoted, escaped string literal for embedding in a request
+// body (so arbitrary content, e.g. an oversized filler, is a valid JSON value).
+func jsonString(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
+// patchStatus PATCHes a schedule and returns only the HTTP status code (for the rejection
+// paths where the body is an error, not a DTO).
+func (f scheduleFixture) patchStatus(t *testing.T, user uuid.UUID, id, body string) int {
+	t.Helper()
+	req := userReq(http.MethodPatch, "/api/schedules/"+id, body, user, map[string]string{"id": id})
+	rec := httptest.NewRecorder()
+	f.h.PatchSchedule(rec, req)
+	return rec.Code
+}
+
+// TestPatchDefaultPromptGuidanceLiveDB (issue #662) is the flagship for the owner-guidance
+// overlay: a PROMPT default accepts an owner guidance PATCH, persists it (round-trips through
+// the DTO over the catalog's empty guidance), sets customized, and an exact-restore (clearing
+// guidance back to empty) un-customizes.
+func TestPatchDefaultPromptGuidanceLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	dto, code := f.enableCatalog(t, f.owner.ID, f.repoID, "docs-hygiene")
+	if code != http.StatusCreated {
+		t.Fatalf("enable status = %d, want 201", code)
+	}
+	job, _ := schedtmpl.BySlug("docs-hygiene")
+	// A freshly enabled default surfaces the catalog baseline guidance (empty for a prompt
+	// catalog job), never any owner guidance yet.
+	if got := guidanceVal(dto); got != job.Guidance {
+		t.Fatalf("fresh prompt default guidance = %q, want the catalog baseline %q", got, job.Guidance)
+	}
+
+	const guidance = "Prefer small, reviewable diffs and skip generated files."
+	patched := f.patchDefault(t, f.owner.ID, dto.ID, `{"guidance":`+jsonString(guidance)+`}`)
+	if patched.Guidance == nil || *patched.Guidance != guidance {
+		t.Fatalf("patched guidance = %v, want the owner guidance persisted", patched.Guidance)
+	}
+	if !patched.Customized {
+		t.Fatal("guidance divergence: customized = false, want true")
+	}
+	// The prompt stays the RESOLVED catalog prompt (guidance does not touch it).
+	if patched.Prompt != job.Prompt {
+		t.Fatalf("patched prompt = %q, want catalog prompt unchanged", patched.Prompt)
+	}
+
+	// It really persisted: re-read via GET surfaces the stored guidance.
+	got, gcode := f.getSchedule(t, f.owner.ID, dto.ID)
+	if gcode != http.StatusOK {
+		t.Fatalf("re-read status = %d, want 200", gcode)
+	}
+	if got.Guidance == nil || *got.Guidance != guidance {
+		t.Fatalf("re-read guidance = %v, want the persisted owner guidance", got.Guidance)
+	}
+
+	// Clearing guidance back to empty un-customizes (exact-restore to the catalog baseline).
+	restored := f.patchDefault(t, f.owner.ID, dto.ID, `{"guidance":""}`)
+	if got := guidanceVal(restored); got != job.Guidance {
+		t.Fatalf("cleared guidance = %q, want the catalog baseline %q", got, job.Guidance)
+	}
+	if restored.Customized {
+		t.Fatal("cleared guidance: customized = true, want false (exact-restore un-customizes)")
+	}
+}
+
+// TestPatchDefaultSweepGuidanceRejectedLiveDB (issue #662): guidance stays catalog-owned for
+// a SWEEP default — a guidance PATCH is a 400.
+func TestPatchDefaultSweepGuidanceRejectedLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	dto, code := f.enableCatalog(t, f.owner.ID, f.repoID, "bug-triage")
+	if code != http.StatusCreated {
+		t.Fatalf("enable status = %d, want 201", code)
+	}
+	if got := f.patchStatus(t, f.owner.ID, dto.ID, `{"guidance":"owner tweak"}`); got != http.StatusBadRequest {
+		t.Fatalf("sweep guidance patch status = %d, want 400", got)
+	}
+}
+
+// TestPatchDefaultPromptGuidanceTooLargeLiveDB (issue #662): a prompt default's guidance is
+// still capped at MaxGuidanceBytes — over the cap is a 422.
+func TestPatchDefaultPromptGuidanceTooLargeLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	dto, code := f.enableCatalog(t, f.owner.ID, f.repoID, "docs-hygiene")
+	if code != http.StatusCreated {
+		t.Fatalf("enable status = %d, want 201", code)
+	}
+	huge := strings.Repeat("x", MaxGuidanceBytes+1)
+	if got := f.patchStatus(t, f.owner.ID, dto.ID, `{"guidance":`+jsonString(huge)+`}`); got != http.StatusUnprocessableEntity {
+		t.Fatalf("oversized guidance patch status = %d, want 422", got)
+	}
+}
+
+// TestPatchDefaultPromptLocksNonGuidanceLiveDB (issue #662): opening guidance on a prompt
+// default does not unlock the other catalog-owned fields — prompt/labels/target still 400.
+func TestPatchDefaultPromptLocksNonGuidanceLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	dto, code := f.enableCatalog(t, f.owner.ID, f.repoID, "docs-hygiene")
+	if code != http.StatusCreated {
+		t.Fatalf("enable status = %d, want 201", code)
+	}
+	for _, body := range []string{
+		`{"prompt":"hijack the baked prompt"}`,
+		`{"labels":["bug"]}`,
+		`{"target":"sweep"}`,
+	} {
+		if got := f.patchStatus(t, f.owner.ID, dto.ID, body); got != http.StatusBadRequest {
+			t.Fatalf("patch %s status = %d, want 400", body, got)
+		}
+	}
+}
+
+// TestResetPromptDefaultClearsGuidanceLiveDB (issue #662): Reset of a prompt default with
+// stored owner guidance drops it back to the catalog baseline (NULL).
+func TestResetPromptDefaultClearsGuidanceLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	dto, code := f.enableCatalog(t, f.owner.ID, f.repoID, "docs-hygiene")
+	if code != http.StatusCreated {
+		t.Fatalf("enable status = %d, want 201", code)
+	}
+	patched := f.patchDefault(t, f.owner.ID, dto.ID, `{"guidance":"owner guidance to be reset"}`)
+	if patched.Guidance == nil {
+		t.Fatal("precondition: guidance did not persist before reset")
+	}
+
+	resetReq := userReq(http.MethodPost, "/api/schedules/"+dto.ID+"/reset", "", f.owner.ID, map[string]string{"id": dto.ID})
+	resetRec := httptest.NewRecorder()
+	f.h.ResetSchedule(resetRec, resetReq)
+	if resetRec.Code != http.StatusOK {
+		t.Fatalf("reset status = %d, want 200 (body %s)", resetRec.Code, resetRec.Body.String())
+	}
+	var reset apitypes.ScheduleDTO
+	if err := json.Unmarshal(resetRec.Body.Bytes(), &reset); err != nil {
+		t.Fatalf("decode reset: %v", err)
+	}
+	job, _ := schedtmpl.BySlug("docs-hygiene")
+	// Reset drops the stored owner guidance, so the DTO falls back to the catalog baseline.
+	if got := guidanceVal(reset); got != job.Guidance {
+		t.Fatalf("reset guidance = %q, want the catalog baseline %q", got, job.Guidance)
+	}
+	if reset.Customized {
+		t.Fatal("reset customized = true, want false")
+	}
+
+	// And a fresh GET confirms the stored column is truly cleared (not merely a resolved DTO).
+	got, gcode := f.getSchedule(t, f.owner.ID, dto.ID)
+	if gcode != http.StatusOK {
+		t.Fatalf("re-read status = %d, want 200", gcode)
+	}
+	if v := guidanceVal(got); v != job.Guidance {
+		t.Fatalf("re-read guidance = %q, want the catalog baseline %q", v, job.Guidance)
+	}
+}
+
+// patchDefault PATCHes a schedule and returns the decoded DTO, failing on a non-200.
+func (f scheduleFixture) patchDefault(t *testing.T, user uuid.UUID, id, body string) apitypes.ScheduleDTO {
+	t.Helper()
+	req := userReq(http.MethodPatch, "/api/schedules/"+id, body, user, map[string]string{"id": id})
+	rec := httptest.NewRecorder()
+	f.h.PatchSchedule(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("patch status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+	var dto apitypes.ScheduleDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &dto); err != nil {
+		t.Fatalf("decode patch: %v", err)
+	}
+	return dto
+}

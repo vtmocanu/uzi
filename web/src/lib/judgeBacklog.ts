@@ -1,0 +1,143 @@
+// Judge menu display helpers (PRD #98 M3). Pure, so the bucket-tab wiring, the group
+// rollup labels, and the zero-state verdict tally are unit-tested without the DOM. None
+// of these render untrusted text — they map closed enums (buckets, verdicts) to fixed UI
+// copy; the untrusted free text (rationale_preview, target, run_title) is rendered
+// separately as escaped React text on the page, through lib/safeText's stripUnsafeChars —
+// escaping alone does not touch bidi overrides (issue #124).
+
+import type {
+  BadgeTone,
+} from "../components/ui";
+import type {
+  JudgeBacklogBucket,
+  JudgeRecommendationGroup,
+  ReviewVerdict,
+  TriageCounts,
+} from "./api";
+
+// The bucket tabs, in ladder order. "To triage" is the landing tab (the backlog's
+// reason to exist); "All" is the unfiltered view. The order matches the #94 ladder plus
+// the catch-all last.
+export const JUDGE_BUCKETS = ["todo", "filed", "done", "dismissed", "all"] as const satisfies readonly JudgeBacklogBucket[];
+
+// Exhaustiveness, enforced HERE rather than asserted (PRD #98 review N-a).
+//
+// `JUDGE_BUCKETS: JudgeBacklogBucket[]` — the previous annotation — checks only that every
+// ELEMENT is a legal bucket, never that every bucket is an element: a 5-element array stays
+// assignable when the union grows to 6. Measured: adding a sixth rung produced four errors,
+// all in this file's Record maps and exhaustive switch, and NONE at the array. So the
+// comment on isBucket that credited the array with catching it was crediting the wrong site
+// — the same state-the-invariant-where-it-is-enforced inversion this PRD keeps finding, and
+// a live risk, because replacing those Record maps with a lookup-plus-fallback (a natural
+// refactor) would have removed the only real guard while the comment still promised one.
+//
+// The tuple wrapper is load-bearing: `JudgeBacklogBucket extends …` would DISTRIBUTE over
+// the union and collapse the missing case to `never`, which vanishes in a union and yields
+// `true` regardless. `[A] extends [B]` compares the unions whole.
+type AllBucketsListed = [JudgeBacklogBucket] extends [(typeof JUDGE_BUCKETS)[number]] ? true : false;
+const _judgeBucketsAreExhaustive: AllBucketsListed = true;
+void _judgeBucketsAreExhaustive;
+
+const BUCKET_LABELS: Record<JudgeBacklogBucket, string> = {
+  todo: "To triage",
+  filed: "Filed",
+  done: "Done",
+  dismissed: "Dismissed",
+  all: "All",
+};
+
+export function bucketTabLabel(bucket: JudgeBacklogBucket): string {
+  return BUCKET_LABELS[bucket];
+}
+
+// bucketTabCount reads a tab's number STRAIGHT from the canonical triage aggregate —
+// never from the groups on screen (PRD #98: the To-triage tab must agree with the nav
+// badge and the notification to the digit, which only holds if it reads triage.todo
+// rather than re-tallying a possibly-truncated, possibly-filtered group list). "all" is
+// the recommendation-row denominator (triage.total), matching #94's strip.
+export function bucketTabCount(triage: TriageCounts, bucket: JudgeBacklogBucket): number {
+  switch (bucket) {
+    case "todo":
+      return triage.todo;
+    case "filed":
+      return triage.filed;
+    case "done":
+      return triage.done;
+    case "dismissed":
+      return triage.dismissed;
+    case "all":
+      return triage.total;
+  }
+}
+
+// rollupTone tints a group's rollup badge by the #94 ladder tone: todo is a plain
+// neutral "to do", filed is info, done is ok, dismissed is muted/neutral. A group
+// rollup is never "all" (that is a filter, not a member state), but the map is total so
+// the type stays exhaustive.
+const ROLLUP_TONE: Record<JudgeBacklogBucket, BadgeTone> = {
+  todo: "neutral",
+  filed: "info",
+  done: "ok",
+  dismissed: "neutral",
+  all: "neutral",
+};
+
+export function rollupTone(bucket: JudgeBacklogBucket): BadgeTone {
+  return ROLLUP_TONE[bucket];
+}
+
+const ROLLUP_LABEL: Record<JudgeBacklogBucket, string> = {
+  todo: "To do",
+  filed: "Filed",
+  done: "Done",
+  dismissed: "Dismissed",
+  all: "All",
+};
+
+export function rollupLabel(bucket: JudgeBacklogBucket): string {
+  return ROLLUP_LABEL[bucket];
+}
+
+// seenInRunsLabel is the frequency evidence chip. Singular/plural so "seen in 1 run"
+// never reads wrong — a group can legitimately be a single run (it just is not deduped
+// across any yet).
+export function seenInRunsLabel(runCount: number): string {
+  return `seen in ${runCount} ${runCount === 1 ? "run" : "runs"}`;
+}
+
+// VerdictTrend is the zero-state's verdict summary: a per-verdict count over the DISTINCT
+// runs the caller has judged, ALL TIME. Distinct-by-run because a run carries one
+// verdict (its review's), while a group lists it once per occurrence — tallying raw
+// occurrences would over-count a verdict for every recommendation it recurred in.
+export interface VerdictTrend {
+  ideal: number;
+  ok: number;
+  issues: number;
+  total: number;
+}
+
+// verdictTrend tallies each judged run's verdict once, from the occurrences a backlog
+// carries. It reads a closed enum (verdict), never free text. Fed the bucket=all snapshot on
+// the zero-state so it reflects the whole history, not the (empty) todo view.
+//
+// It was called recentVerdictTrend, and the name asserted something the body contradicts two
+// lines down: there is no recency window here, and there could not be — the occurrence DTO
+// carries no disposition timestamp, so nothing on this page can order by when (PRD #98
+// review N6). Renamed rather than given a fake window, and the zero-state heading changed to
+// match. A label that overstates what it measures is worse than a plainer one.
+export function verdictTrend(groups: JudgeRecommendationGroup[]): VerdictTrend {
+  const byRun = new Map<string, ReviewVerdict>();
+  for (const g of groups) {
+    for (const occ of g.occurrences) {
+      // First writer wins is fine: a run's verdict is the same on every occurrence of
+      // it, since they all come from that run's one review.
+      if (!byRun.has(occ.run_id)) byRun.set(occ.run_id, occ.verdict);
+    }
+  }
+  const trend: VerdictTrend = { ideal: 0, ok: 0, issues: 0, total: 0 };
+  for (const v of byRun.values()) {
+    trend[v] += 1;
+    trend.total += 1;
+  }
+  return trend;
+}

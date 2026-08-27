@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>uzi Activity feed — redesign mock</title>
+<style>
+  /* ── ember design tokens (values copied from web/src/index.css) ───────── */
+  :root {
+    --bg: 8 10 15;
+    --surface: 15 18 26;
+    --raised: 23 27 38;
+    --edge: 39 45 60;
+    --edge-strong: 58 66 86;
+    --fg: 228 232 240;
+    --muted: 148 158 176;
+    --faint: 100 110 130;
+    --brand: 251 146 60;
+    --brand-hover: 253 186 116;
+    --ok: 52 211 153;
+    --warn: 251 191 36;
+    --danger: 251 113 133;
+    --info: 56 189 248;
+    --radius: 0.625rem;
+    /* proposed new syntax tokens (alias existing palette/status tokens) */
+    --syn-cmd: var(--brand);
+    --syn-flag: var(--info);
+    --syn-str: var(--ok);
+    --syn-op: var(--brand-hover);
+    --syn-comment: var(--faint);
+    --syn-arg: var(--fg);
+    --tool-rail: var(--edge);
+    --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  /* This mock deliberately stays single-theme: it reproduces the app's dark "ember" palette. */
+  * { box-sizing: border-box; scrollbar-width: thin; scrollbar-color: rgb(var(--edge)) transparent; }
+  body {
+    margin: 0; padding: 32px 16px;
+    background: rgb(var(--bg));
+    color: rgb(var(--fg));
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    display: flex; justify-content: center;
+  }
+  .wrap { width: 100%; max-width: 760px; }
+  .mock-note { font-size: 12px; color: rgb(var(--faint)); margin: 0 0 12px; }
+
+  /* ── Card (mirrors ui.tsx Card) ───────────────────────────────────────── */
+  .card {
+    border: 1px solid rgb(var(--edge));
+    background: rgb(var(--surface));
+    border-radius: calc(var(--radius) + 2px);
+    padding: 20px;
+  }
+  .feed-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  .feed-title { font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: rgb(var(--faint)); margin: 0; }
+  .feed-right { display: flex; align-items: center; gap: 8px; }
+  .count { font-size: 12px; color: rgb(var(--faint)); }
+  .newpill {
+    border: 0; cursor: pointer; font-family: inherit;
+    background: rgb(var(--brand)); color: rgb(26 16 8);
+    font-size: 12px; font-weight: 500; border-radius: 999px; padding: 2px 10px;
+  }
+
+  /* ── Log scroll container ─────────────────────────────────────────────── */
+  .log {
+    max-height: 68vh; overflow: auto; overscroll-behavior: contain;
+    border: 1px solid rgb(var(--edge));
+    background: rgb(var(--bg) / .6);
+    border-radius: var(--radius);
+    padding: 12px;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+
+  /* ── System / meta divider line ───────────────────────────────────────── */
+  .meta {
+    display: flex; align-items: center; gap: 10px;
+    font-size: 12px; font-style: italic; color: rgb(var(--muted)); /* was --faint: bumped for contrast */
+    padding: 2px 4px;
+  }
+  .meta::before, .meta::after { content: ""; height: 1px; flex: 1; background: rgb(var(--edge)); }
+  .meta .k { color: rgb(var(--fg)); font-style: normal; font-family: var(--font-mono); font-size: 11px; }
+
+  /* ── Agent block ──────────────────────────────────────────────────────── */
+  .agent {
+    border-left: 2px solid; border-radius: var(--radius);
+    background: rgb(var(--surface) / .6);
+    padding: 12px 12px 12px 12px;
+  }
+  .agent--worker { border-color: rgb(var(--info) / .5); }
+  .agent--lead   { border-color: rgb(var(--brand) / .45); }
+  .agent-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .agent-toggle {
+    appearance: none; border: 0; background: none; cursor: pointer; font-family: inherit;
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 24px; height: 24px; margin: -4px 0 -4px -4px; border-radius: 6px;
+    color: rgb(var(--muted));
+  }
+  .agent-toggle:hover { color: rgb(var(--fg)); background: rgb(var(--raised) / .6); }
+  .agent-toggle .chev { display: inline-flex; transition: transform .15s ease; }
+  .agent-toggle[aria-expanded="true"] .chev { transform: rotate(90deg); }
+  .agent-summary { font-size: 12px; color: rgb(var(--muted)); font-style: italic; }
+  .agent.collapsed .agent-head { margin-bottom: 0; }
+  .agent-name { font-size: 14px; font-weight: 600; }
+  .agent--worker .agent-name { color: rgb(var(--info)); }
+  .agent--lead   .agent-name { color: rgb(var(--brand)); }
+  .chip {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11px; font-weight: 500; border: 1px solid; border-radius: 6px; padding: 1px 7px;
+  }
+  .chip--active { color: rgb(var(--warn)); border-color: rgb(var(--warn) / .4); background: rgb(var(--warn) / .1); }
+  .chip--idle   { color: rgb(var(--muted)); border-color: rgb(var(--edge)); background: rgb(var(--raised)); }
+  .dot { width: 6px; height: 6px; border-radius: 999px; background: currentColor; }
+  .chip--active .dot { animation: pulse 1.6s ease-in-out infinite; }
+  .ts { margin-left: auto; font-size: 11px; color: rgb(var(--faint)); font-variant-numeric: tabular-nums; }
+
+  /* ── Agent prose (PRIMARY hierarchy) ──────────────────────────────────── */
+  .prose { color: rgb(var(--fg)); font-size: 14px; line-height: 1.55; margin: 0 0 4px; }
+  .prose + .prose { margin-top: 8px; }
+
+  /* ── Tool rail (SUBORDINATE hierarchy) ────────────────────────────────── */
+  .tools {
+    margin: 6px 0 2px; padding-left: 12px;
+    border-left: 1px solid rgb(var(--tool-rail) / .7);
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .tool { font-size: 13px; }
+  .tool-head { display: flex; align-items: center; gap: 8px; flex-wrap: nowrap; }
+  .tool-ico { color: rgb(var(--faint)); flex-shrink: 0; display: inline-flex; }
+  .tool-name { font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: rgb(var(--muted)); flex-shrink: 0; }
+  .tool-arg { font-family: var(--font-mono); font-size: 12px; color: rgb(var(--fg)); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* duration is inline + shrink-0 so it never floats to its own line */
+  .dur { margin-left: auto; flex-shrink: 0; font-size: 11px; font-variant-numeric: tabular-nums; color: rgb(var(--muted)); }
+  .dur--slow { color: rgb(var(--warn)); }
+  .dur--run  { color: rgb(var(--warn)); display: inline-flex; align-items: center; gap: 6px; }
+
+  /* ── Command code surface (highlighted) ───────────────────────────────── */
+  .cmd {
+    margin-top: 6px; position: relative;
+    border: 1px solid rgb(var(--edge));
+    background: rgb(var(--bg));
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-family: var(--font-mono); font-size: 12px; line-height: 1.5;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .cmd .prompt { color: rgb(var(--faint)); user-select: none; margin-right: 8px; }
+  /* Clamp via max-height on a padding-free inner wrapper (2 lines at line-height
+     1.5 = 3em), NOT -webkit-line-clamp: line-clamp forces display:-webkit-box on
+     its target, which drops the inline ❯ prompt onto its own line above the text.
+     Keeping the prompt inline in both states is a user-approved deviation from the
+     earlier line-clamp treatment (PRD #38 follow-up). */
+  .cmd.clamp .cmd-code { max-height: 3em; overflow: hidden; }
+  .t-cmd { color: rgb(var(--syn-cmd)); }
+  .t-flag { color: rgb(var(--syn-flag)); }
+  .t-str { color: rgb(var(--syn-str)); }
+  .t-op  { color: rgb(var(--syn-op)); }
+  .t-cmt { color: rgb(var(--syn-comment)); font-style: italic; }
+  .t-arg { color: rgb(var(--syn-arg)); }
+
+  /* ── Buttons: expanders (>=24px target, muted contrast) ───────────────── */
+  .xbtn {
+    appearance: none; border: 0; background: none; cursor: pointer; font-family: inherit;
+    color: rgb(var(--muted)); font-size: 11px; font-weight: 500;
+    display: inline-flex; align-items: center; gap: 4px;
+    min-height: 24px; padding: 2px 6px; margin: 2px 0 0 -6px; border-radius: 6px;
+  }
+  .xbtn:hover { color: rgb(var(--fg)); background: rgb(var(--raised) / .6); }
+  .xbtn .chev { transition: transform .15s ease; display: inline-flex; }
+  .xbtn[aria-expanded="true"] .chev { transform: rotate(90deg); }
+  .showfull { margin-top: 4px; }
+
+  /* ── Result: collapsed inline chip → expands to code block ────────────── */
+  .res { margin-top: 6px; }
+  .res-chip {
+    appearance: none; cursor: pointer; font-family: inherit;
+    display: inline-flex; align-items: center; gap: 6px;
+    min-height: 24px; padding: 2px 8px; border-radius: 6px;
+    font-size: 11px; font-weight: 500;
+    border: 1px solid rgb(var(--edge)); background: rgb(var(--raised) / .5); color: rgb(var(--muted));
+  }
+  .res-chip .mark { font-weight: 700; }
+  .res-chip.ok .mark { color: rgb(var(--ok)); }
+  .res-chip.err { border-color: rgb(var(--danger) / .4); background: rgb(var(--danger) / .1); color: rgb(var(--danger)); }
+  .res-chip:hover { border-color: rgb(var(--edge-strong)); }
+  .res-body {
+    margin-top: 6px; max-height: 260px; overflow: auto;
+    border: 1px solid rgb(var(--edge)); border-radius: 8px;
+    background: rgb(var(--bg)); padding: 8px 10px;
+    font-family: var(--font-mono); font-size: 12px; line-height: 1.5; color: rgb(var(--muted));
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .res-body.err { border-color: rgb(var(--danger) / .4); background: rgb(var(--danger) / .08); }
+  .res-body:focus-visible { outline: 2px solid rgb(var(--brand)); outline-offset: 2px; }
+  .hidden { display: none; }
+
+  /* ── Spinner ──────────────────────────────────────────────────────────── */
+  .spin { width: 12px; height: 12px; border-radius: 999px; border: 2px solid rgb(var(--warn) / .3); border-top-color: rgb(var(--warn)); animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+
+  /* focus ring parity with index.css :focus-visible rule */
+  button:focus-visible { outline: 2px solid rgb(var(--brand)); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) { .spin, .chip--active .dot { animation: none; } }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p class="mock-note">Static mock of the redesigned run Activity feed (uzi web, ember dark theme). Result chips and "Show full command" are clickable.</p>
+  <div class="card">
+    <div class="feed-head">
+      <h2 class="feed-title">Activity</h2>
+      <div class="feed-right">
+        <button class="newpill" type="button">2 new &darr;</button>
+        <span class="count">30 messages</span>
+      </div>
+    </div>
+
+    <!-- polite live region: only meaningful transitions, not every shell frame -->
+    <div class="sr-only" aria-live="polite" aria-atomic="true">worker is now active. Running command: npm run build.</div>
+
+    <div class="log" role="log" aria-live="off" aria-label="Run activity">
+
+      <!-- ─────────────── LEAD (idle) ─────────────── -->
+      <div class="agent agent--lead">
+        <div class="agent-head">
+          <button class="agent-toggle" type="button" aria-expanded="true" aria-controls="body-lead" aria-label="Collapse lead activity" data-agent="body-lead">
+            <span class="chev" aria-hidden="true">&#10095;</span>
+          </button>
+          <span class="agent-name">lead</span>
+          <span class="chip chip--idle"><span class="dot" aria-hidden="true"></span>idle</span>
+          <span class="agent-summary hidden" data-summary="body-lead">2 messages, 2 tool calls hidden</span>
+          <span class="ts" title="2026-07-10T15:41:58Z">6m ago</span>
+        </div>
+
+        <div class="agent-body" id="body-lead">
+        <div class="meta"><span class="k">worktree ready</span> on agent/issue-9</div>
+        <div class="meta"><span class="k">agent started</span> (claude-opus-4-8)</div>
+
+        <p class="prose">Reading the issue and the current metrics wiring to scope the worker-heartbeat endpoint. I will pair the freshness gauge to the existing registry rather than standing up a second one.</p>
+
+        <div class="tools">
+          <!-- Read: file-type icon, path inline, tiny result chip -->
+          <div class="tool">
+            <div class="tool-head">
+              <span class="tool-ico" aria-hidden="true">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+              </span>
+              <span class="tool-name">Read</span>
+              <span class="tool-arg">prds/13-worker-metrics.md</span>
+              <span class="dur">0.2s</span>
+            </div>
+            <div class="res">
+              <button class="res-chip ok" type="button" aria-expanded="false"
+                      aria-label="Show 48 lines of Read output" data-target="r-read1">
+                <span class="mark">&checkmark;</span> 48 lines
+              </button>
+              <pre id="r-read1" class="res-body hidden" tabindex="0" role="group" aria-label="Read output"># PRD 13 — Worker heartbeat metrics
+Expose heartbeat freshness as a Prometheus gauge on /metrics/worker.
+Reuse the registry in internal/metrics; do not create a second one.
+...</pre>
+            </div>
+          </div>
+
+          <!-- Grep: search-type icon -->
+          <div class="tool">
+            <div class="tool-head">
+              <span class="tool-ico" aria-hidden="true">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+              </span>
+              <span class="tool-name">Grep</span>
+              <span class="tool-arg">heartbeat_at in api/internal</span>
+              <span class="dur">0.4s</span>
+            </div>
+            <div class="res">
+              <button class="res-chip ok" type="button" aria-expanded="false"
+                      aria-label="Show 3 lines of Grep output" data-target="r-grep1">
+                <span class="mark">&checkmark;</span> 3 lines
+              </button>
+              <pre id="r-grep1" class="res-body hidden" tabindex="0" role="group" aria-label="Grep output">api/internal/store/queries/workers.sql:14
+api/internal/poller/sweeper.go:88
+api/internal/metrics/registry.go:31</pre>
+            </div>
+          </div>
+        </div>
+        </div>
+      </div>
+
+      <!-- ─────────────── WORKER (active) ─────────────── -->
+      <div class="agent agent--worker">
+        <div class="agent-head">
+          <button class="agent-toggle" type="button" aria-expanded="true" aria-controls="body-worker" aria-label="Collapse worker activity" data-agent="body-worker">
+            <span class="chev" aria-hidden="true">&#10095;</span>
+          </button>
+          <span class="agent-name">worker</span>
+          <span class="chip chip--active"><span class="dot" aria-hidden="true"></span>active</span>
+          <span class="agent-summary hidden" data-summary="body-worker">1 message, 6 tool calls hidden</span>
+          <span class="ts" title="2026-07-10T15:47:02Z">just now</span>
+        </div>
+
+        <div class="agent-body" id="body-worker">
+        <p class="prose">Implementing the <code style="font-family:var(--font-mono);font-size:12px;background:rgb(var(--raised));padding:1px 5px;border-radius:4px;color:rgb(var(--fg))">/metrics/worker</code> endpoint and wiring the freshness gauge into the existing registry. Building, then running the web and api suites.</p>
+
+        <div class="tools">
+          <!-- Bash: instant command, NO duration shown (fixes the "0.0s" noise) -->
+          <div class="tool">
+            <div class="tool-head">
+              <span class="tool-ico" aria-hidden="true">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6M12 19h8"/></svg>
+              </span>
+              <span class="tool-name">Bash</span>
+              <span class="dur" title="under 100ms">instant</span>
+            </div>
+            <div class="cmd"><span class="prompt" aria-hidden="true">&#10095;</span><span class="code"><span class="t-cmd">git</span> <span class="t-arg">status</span> <span class="t-flag">--short</span></span></div>
+            <div class="res">
+              <button class="res-chip ok" type="button" aria-expanded="false"
+                      aria-label="Show 2 lines of Bash output" data-target="r-b0">
+                <span class="mark">&checkmark;</span> 2 lines
+              </button>
+              <pre id="r-b0" class="res-body hidden" tabindex="0" role="group" aria-label="Bash output"> M api/internal/metrics/registry.go
+?? api/internal/api/metrics_worker.go</pre>
+            </div>
+          </div>
+
+          <!-- Bash: real duration inline, result collapsed -->
+          <div class="tool">
+            <div class="tool-head">
+              <span class="tool-ico" aria-hidden="true">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6M12 19h8"/></svg>
+              </span>
+              <span class="tool-name">Bash</span>
+              <span class="dur">4.1s</span>
+            </div>
+            <div class="cmd"><span class="prompt" aria-hidden="true">&#10095;</span><span class="code"><span class="t-cmd">cd</span> <span class="t-arg">api</span> <span class="t-op">&amp;&amp;</span> <span class="t-cmd">go</span> <span class="t-arg">build</span> <span class="t-arg">./...</span></span></div>
+            <div class="res">
+              <button class="res-chip ok" type="button" aria-expanded="false"
+                      aria-label="Show 1 line of Bash output" data-target="r-b1">
+                <span class="mark">&checkmark;</span> ok
+              </button>
+              <pre id="r-b1" class="res-body hidden" tabindex="0" role="group" aria-label="Bash output">(no output — exit 0)</pre>
+            </div>
+          </div>
+
+          <!-- Bash: result pre-EXPANDED to show the code-block treatment -->
+          <div class="tool">
+            <div class="tool-head">
+              <span class="tool-ico" aria-hidden="true">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6M12 19h8"/></svg>
+              </span>
+              <span class="tool-name">Bash</span>
+              <span class="dur">12.4s</span>
+            </div>
+            <div class="cmd"><span class="prompt" aria-hidden="true">&#10095;</span><span class="code"><span class="t-cmd">cd</span> <span class="t-arg">web</span> <span class="t-op">&amp;&amp;</span> <span class="t-cmd">npx</span> <span class="t-arg">vitest</span> <span class="t-arg">run</span> <span class="t-arg">src/components/RunEvent.test.tsx</span></span></div>
+            <div class="res">
+              <button class="res-chip ok" type="button" aria-expanded="true"
+                      aria-label="Hide Bash output" data-target="r-b2">
+                <span class="mark">&checkmark;</span> 9 lines
+              </button>
+              <pre id="r-b2" class="res-body" tabindex="0" role="group" aria-label="Bash output"> RUN  v1.6.0  /work/web
+
+ &checkmark; src/components/RunEvent.test.tsx (14)
+   &checkmark; toolSummary keeps full multi-line command
+   &checkmark; formatDuration suppresses sub-100ms
+   &checkmark; pairs results to calls by id
+
+ Test Files  1 passed (1)
+      Tests  14 passed (14)
+   Duration  11.9s</pre>
+            </div>
+          </div>
+
+          <!-- Bash: LONG command, clamped to 2 lines + "Show full command" -->
+          <div class="tool">
+            <div class="tool-head">
+              <span class="tool-ico" aria-hidden="true">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6M12 19h8"/></svg>
+              </span>
+              <span class="tool-name">Bash</span>
+              <span class="dur dur--slow">1m 12s</span>
+            </div>
+            <div class="cmd clamp" id="cmd-long"><div class="cmd-code"><span class="prompt" aria-hidden="true">&#10095;</span><span class="code"><span class="t-cmd">env</span> <span class="t-arg">-i</span> <span class="t-arg">HOME=$HOME</span> <span class="t-arg">PATH=$PATH</span> <span class="t-cmd">docker</span> <span class="t-arg">compose</span> <span class="t-flag">--env-file</span> <span class="t-arg">.env.dummy</span> <span class="t-flag">-p</span> <span class="t-arg">uzi-pr-142</span> <span class="t-arg">run</span> <span class="t-flag">--rm</span> <span class="t-arg">api</span> <span class="t-cmd">go</span> <span class="t-arg">test</span> <span class="t-arg">./internal/...</span> <span class="t-flag">-run</span> <span class="t-arg">TestForgeSyncColumnMoveSnapBack</span> <span class="t-flag">-count=1</span> <span class="t-flag">-race</span> <span class="t-op">|</span> <span class="t-cmd">tee</span> <span class="t-arg">/tmp/out.log</span> <span class="t-cmt"># full suite</span></span></div></div>
+            <button class="xbtn showfull" type="button" aria-expanded="false"
+                    aria-label="Show full command" data-clamp="cmd-long">
+              <span class="chev" aria-hidden="true">&#10095;</span> Show full command
+            </button>
+            <div class="res">
+              <button class="res-chip ok" type="button" aria-expanded="false"
+                      aria-label="Show 6 lines of Bash output" data-target="r-b3">
+                <span class="mark">&checkmark;</span> 6 lines
+              </button>
+              <pre id="r-b3" class="res-body hidden" tabindex="0" role="group" aria-label="Bash output">ok  	github.com/vtmocanu/uzi/internal/forgesvc	1.204s
+ok  	github.com/vtmocanu/uzi/internal/poller	0.933s
+--- PASS: TestForgeSyncColumnMoveSnapBack (0.41s)
+PASS</pre>
+            </div>
+          </div>
+
+          <!-- Bash: ERROR result auto-expanded, danger tint -->
+          <div class="tool">
+            <div class="tool-head">
+              <span class="tool-ico" aria-hidden="true">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6M12 19h8"/></svg>
+              </span>
+              <span class="tool-name">Bash</span>
+              <span class="dur dur--slow">40m 3s</span>
+            </div>
+            <div class="cmd"><span class="prompt" aria-hidden="true">&#10095;</span><span class="code"><span class="t-cmd">go</span> <span class="t-arg">test</span> <span class="t-flag">-bench=Pool</span> <span class="t-arg">./internal/store/...</span></span></div>
+            <div class="res">
+              <button class="res-chip err" type="button" aria-expanded="true"
+                      aria-label="Hide Bash error output" data-target="r-b4">
+                <span class="mark">&cross;</span> error
+              </button>
+              <pre id="r-b4" class="res-body err" tabindex="0" role="group" aria-label="Bash error output">benchmark hung — no output after 40m
+signal: killed</pre>
+            </div>
+          </div>
+
+          <!-- Bash: RUNNING, spinner + live elapsed, no result yet -->
+          <div class="tool">
+            <div class="tool-head">
+              <span class="tool-ico" aria-hidden="true">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6M12 19h8"/></svg>
+              </span>
+              <span class="tool-name">Bash</span>
+              <span class="dur dur--run"><span class="spin" aria-hidden="true"></span>running&hellip; 8.6s</span>
+            </div>
+            <div class="cmd"><span class="prompt" aria-hidden="true">&#10095;</span><span class="code"><span class="t-cmd">cd</span> <span class="t-arg">web</span> <span class="t-op">&amp;&amp;</span> <span class="t-cmd">npm</span> <span class="t-arg">run</span> <span class="t-arg">build</span></span></div>
+          </div>
+        </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<script>
+  // Result chip toggle
+  document.querySelectorAll('.res-chip').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var body = document.getElementById(btn.getAttribute('data-target'));
+      var open = btn.getAttribute('aria-expanded') === 'true';
+      btn.setAttribute('aria-expanded', String(!open));
+      body.classList.toggle('hidden', open);
+      if (!open) body.focus();
+    });
+  });
+  // Agent block collapse/expand
+  document.querySelectorAll('.agent-toggle').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var id = btn.getAttribute('data-agent');
+      var body = document.getElementById(id);
+      var summary = document.querySelector('[data-summary="' + id + '"]');
+      var open = btn.getAttribute('aria-expanded') === 'true';
+      btn.setAttribute('aria-expanded', String(!open));
+      btn.setAttribute('aria-label', (open ? 'Expand ' : 'Collapse ') + id.replace('body-', '') + ' activity');
+      body.classList.toggle('hidden', open);
+      if (summary) summary.classList.toggle('hidden', !open);
+      btn.closest('.agent').classList.toggle('collapsed', open);
+    });
+  });
+  // "Show full command" clamp toggle
+  document.querySelectorAll('[data-clamp]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var box = document.getElementById(btn.getAttribute('data-clamp'));
+      var open = btn.getAttribute('aria-expanded') === 'true';
+      btn.setAttribute('aria-expanded', String(!open));
+      box.classList.toggle('clamp', open);
+      btn.lastChild.textContent = open ? ' Show full command' : ' Show less';
+    });
+  });
+</script>
+</body>
+</html>

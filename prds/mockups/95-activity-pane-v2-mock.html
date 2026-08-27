@@ -1,0 +1,517 @@
+<title>Activity pane — redesign proposal</title>
+<style>
+  /* ─── ember tokens, lifted from web/src/index.css so this reads as a real uzi
+        screen, not a generic mock. uzi is deliberately dark-only ("a dark
+        factory"), so this page commits to one visual world on purpose. ─── */
+  :root {
+    --bg: 8 10 15;
+    --surface: 15 18 26;
+    --raised: 23 27 38;
+    --edge: 39 45 60;
+    --edge-strong: 58 66 86;
+    --fg: 228 232 240;
+    --muted: 148 158 176;
+    --faint: 122 133 154;
+    --brand: 251 146 60;
+    --brand-hover: 253 186 116;
+    --on-brand: 26 16 8;
+    --ok: 52 211 153;
+    --warn: 251 191 36;
+    --danger: 251 113 133;
+    --info: 56 189 248;
+    --radius: 0.625rem;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  .c-bg { background: rgb(var(--bg)); }
+  .c-surface { background: rgb(var(--surface)); }
+  .c-raised { background: rgb(var(--raised)); }
+
+  body {
+    margin: 0;
+    background: rgb(var(--bg));
+    color: rgb(var(--fg));
+    font-family: var(--sans);
+    -webkit-font-smoothing: antialiased;
+    line-height: 1.5;
+    /* faint molten glow, top-left, to give the near-black steel some depth */
+    background-image:
+      radial-gradient(120% 90% at 8% -10%, rgb(var(--brand) / 0.07), transparent 55%),
+      radial-gradient(90% 80% at 100% 0%, rgb(var(--info) / 0.04), transparent 50%);
+    background-attachment: fixed;
+  }
+
+  .wrap { max-width: 900px; margin: 0 auto; padding: 40px 20px 96px; }
+
+  /* ── page chrome ── */
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: rgb(var(--brand));
+    margin: 0 0 10px;
+  }
+  h1 { font-size: 30px; line-height: 1.15; margin: 0 0 12px; font-weight: 650; text-wrap: balance; letter-spacing: -0.01em; }
+  .lede { color: rgb(var(--muted)); font-size: 15px; max-width: 62ch; margin: 0 0 8px; }
+  .sub { color: rgb(var(--faint)); font-size: 13px; max-width: 68ch; }
+
+  .problems { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 22px 0 34px; }
+  @media (max-width: 680px) { .problems { grid-template-columns: 1fr; } }
+  .problem {
+    border: 1px solid rgb(var(--edge));
+    border-radius: calc(var(--radius) * 0.8);
+    background: rgb(var(--surface) / 0.6);
+    padding: 12px 13px;
+  }
+  .problem .tag { font-family: var(--mono); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: rgb(var(--danger)); }
+  .problem .now { color: rgb(var(--muted)); font-size: 12.5px; margin: 5px 0 0; }
+  .problem .fix { color: rgb(var(--fg)); font-size: 12.5px; margin: 8px 0 0; padding-top: 8px; border-top: 1px dashed rgb(var(--edge)); }
+  .problem .fix b { color: rgb(var(--ok)); font-weight: 600; }
+
+  .section-label {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.16em;
+    text-transform: uppercase; color: rgb(var(--faint));
+    display: flex; align-items: center; gap: 10px; margin: 30px 0 12px;
+  }
+  .section-label::after { content: ""; flex: 1; height: 1px; background: rgb(var(--edge)); }
+
+  /* ── card (matches web Card) ── */
+  .card {
+    border: 1px solid rgb(var(--edge));
+    border-radius: var(--radius);
+    background: rgb(var(--surface));
+    padding: 16px;
+  }
+  .card + .card { margin-top: 14px; }
+
+  .pane-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+  .pane-title { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: rgb(var(--faint)); margin: 0; }
+  .pane-tools { display: flex; align-items: center; gap: 10px; }
+  .msgcount { font-size: 12px; color: rgb(var(--muted)); font-variant-numeric: tabular-nums; }
+
+  /* follow-live toggle */
+  .toggle { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; font-size: 12px; color: rgb(var(--muted)); }
+  .toggle .sw { width: 34px; height: 19px; border-radius: 999px; background: rgb(var(--raised)); border: 1px solid rgb(var(--edge-strong)); position: relative; transition: background .15s, border-color .15s; }
+  .toggle .sw::after { content: ""; position: absolute; top: 1px; left: 1px; width: 15px; height: 15px; border-radius: 50%; background: rgb(var(--muted)); transition: transform .15s, background .15s; }
+  .toggle.on .sw { background: rgb(var(--brand) / 0.25); border-color: rgb(var(--brand)); }
+  .toggle.on .sw::after { transform: translateX(15px); background: rgb(var(--brand)); }
+  .toggle.on { color: rgb(var(--fg)); }
+
+  /* ── crew strip: the "who is alive" summary ── */
+  .crew {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px;
+    padding: 10px; margin-bottom: 12px;
+    border: 1px solid rgb(var(--edge)); border-radius: calc(var(--radius) * 0.8);
+    background: rgb(var(--bg) / 0.55);
+  }
+  .crew-chip {
+    display: flex; align-items: center; gap: 8px; padding: 6px 9px; border-radius: 8px;
+    background: rgb(var(--surface) / 0.7); border: 1px solid rgb(var(--edge)); cursor: pointer;
+    transition: border-color .12s, background .12s;
+  }
+  .crew-chip:hover { border-color: rgb(var(--edge-strong)); }
+  .crew-chip.sel { border-color: rgb(var(--brand) / 0.7); background: rgb(var(--brand) / 0.06); }
+  .crew-chip .who { display: flex; flex-direction: column; min-width: 0; }
+  .crew-chip .nm { font-size: 12.5px; font-weight: 600; line-height: 1.25; }
+  .crew-chip .st { font-size: 10.5px; color: rgb(var(--faint)); font-family: var(--mono); letter-spacing: 0.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* status dot */
+  .dot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; position: relative; }
+  .dot.working { background: rgb(var(--ok)); box-shadow: 0 0 0 0 rgb(var(--ok) / 0.55); animation: pulse 1.8s infinite; }
+  .dot.waiting { background: rgb(var(--warn)); }
+  .dot.idle    { background: transparent; border: 1.5px solid rgb(var(--faint)); }
+  .dot.done    { background: rgb(var(--info)); }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgb(var(--ok) / 0.5);} 70% { box-shadow: 0 0 0 6px rgb(var(--ok) / 0);} 100% { box-shadow: 0 0 0 0 rgb(var(--ok) / 0);} }
+  @media (prefers-reduced-motion: reduce) { .dot.working { animation: none; } }
+
+  /* ── agent blocks (accordion) ── */
+  .stream { display: flex; flex-direction: column; gap: 8px; }
+  .agent {
+    border: 1px solid rgb(var(--edge));
+    border-left: 2px solid var(--accent, rgb(var(--edge-strong)));
+    border-radius: calc(var(--radius) * 0.8);
+    background: rgb(var(--surface) / 0.6);
+    overflow: hidden;
+  }
+  .agent-head {
+    display: flex; align-items: center; gap: 10px; padding: 9px 11px; cursor: pointer;
+    background: transparent; border: 0; width: 100%; text-align: left; color: inherit; font: inherit;
+  }
+  .agent-head:hover { background: rgb(var(--raised) / 0.4); }
+  .chev { width: 14px; height: 14px; color: rgb(var(--muted)); transition: transform .15s; flex: 0 0 auto; }
+  .agent.open .chev { transform: rotate(90deg); }
+  .agent-name { font-size: 13px; font-weight: 650; color: var(--accent, rgb(var(--fg))); }
+  .statechip {
+    font-family: var(--mono); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
+    padding: 2px 7px; border-radius: 999px; border: 1px solid; white-space: nowrap;
+  }
+  .statechip.working { color: rgb(var(--ok)); border-color: rgb(var(--ok) / 0.4); background: rgb(var(--ok) / 0.08); }
+  .statechip.waiting { color: rgb(var(--warn)); border-color: rgb(var(--warn) / 0.4); background: rgb(var(--warn) / 0.08); }
+  .statechip.idle    { color: rgb(var(--faint)); border-color: rgb(var(--edge)); background: rgb(var(--raised)); }
+  .statechip.done    { color: rgb(var(--info)); border-color: rgb(var(--info) / 0.4); background: rgb(var(--info) / 0.08); }
+  .oneliner { font-size: 12px; color: rgb(var(--muted)); font-family: var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
+  .age { font-size: 11px; color: rgb(var(--faint)); font-variant-numeric: tabular-nums; flex: 0 0 auto; }
+
+  .agent-body { display: none; padding: 0 11px 11px 22px; }
+  .agent.open .agent-body { display: block; }
+  .log { max-height: 240px; overflow-y: auto; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 6px; padding-right: 4px; }
+  .log::-webkit-scrollbar { width: 8px; }
+  .log::-webkit-scrollbar-thumb { background: rgb(var(--edge)); border-radius: 8px; }
+
+  .row { font-family: var(--mono); font-size: 12px; display: flex; gap: 8px; align-items: baseline; color: rgb(var(--fg)); }
+  .row .k { color: rgb(var(--brand)); font-weight: 600; flex: 0 0 auto; }
+  .row .k.read { color: rgb(var(--info)); }
+  .row .k.think { color: rgb(var(--faint)); }
+  .row .arg { color: rgb(var(--muted)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row .dur { margin-left: auto; color: rgb(var(--faint)); flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+  .row.text { font-family: var(--sans); color: rgb(var(--fg)); display: block; }
+  .spin { display: inline-block; width: 10px; height: 10px; border: 1.5px solid rgb(var(--faint)); border-top-color: rgb(var(--brand)); border-radius: 50%; animation: sp .7s linear infinite; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+
+  /* new-since-collapsed badge */
+  .newpill { font-family: var(--mono); font-size: 10px; padding: 1px 6px; border-radius: 999px; background: rgb(var(--brand) / 0.15); color: rgb(var(--brand-hover)); border: 1px solid rgb(var(--brand) / 0.35); }
+
+  /* ── steer composer + queue ── */
+  .queue { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+  .qmsg { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 8px; border: 1px solid rgb(var(--edge)); background: rgb(var(--raised) / 0.5); }
+  .qmsg .txt { font-size: 13px; color: rgb(var(--fg)); flex: 1; min-width: 0; }
+  .qmsg .qstat { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.04em; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .qmsg.queued { border-left: 2px solid rgb(var(--warn)); }
+  .qmsg.queued .qstat { color: rgb(var(--warn)); }
+  .qmsg.delivered { border-left: 2px solid rgb(var(--ok)); opacity: .92; }
+  .qmsg.delivered .qstat { color: rgb(var(--ok)); }
+  .qmsg .you { font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; color: rgb(var(--faint)); flex: 0 0 auto; }
+
+  textarea.compose {
+    width: 100%; resize: vertical; min-height: 52px; padding: 10px 12px; font-family: var(--sans); font-size: 13.5px;
+    color: rgb(var(--fg)); background: rgb(var(--raised)); border: 1px solid rgb(var(--edge-strong)); border-radius: 8px;
+  }
+  textarea.compose:focus { outline: none; border-color: rgb(var(--brand)); box-shadow: 0 0 0 2px rgb(var(--brand) / 0.25); }
+  textarea.compose::placeholder { color: rgb(var(--faint)); }
+  .compose-row { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
+  .btn { font: inherit; font-size: 13px; font-weight: 600; padding: 8px 14px; border-radius: 8px; border: 1px solid transparent; cursor: pointer; }
+  .btn.primary { background: rgb(var(--brand)); color: rgb(var(--on-brand)); }
+  .btn.primary:hover { background: rgb(var(--brand-hover)); }
+  .btn.primary:disabled { opacity: .45; cursor: default; }
+  .btn.ghost { background: transparent; border-color: rgb(var(--edge-strong)); color: rgb(var(--muted)); }
+  .btn.danger { background: transparent; border-color: rgb(var(--danger) / 0.5); color: rgb(var(--danger)); }
+  .hint { font-size: 11.5px; color: rgb(var(--faint)); margin-left: auto; }
+
+  /* annotations */
+  .note { display: flex; gap: 10px; align-items: flex-start; margin-top: 10px; padding: 10px 12px; border-radius: 8px; background: rgb(var(--info) / 0.06); border: 1px solid rgb(var(--info) / 0.25); font-size: 12.5px; color: rgb(var(--muted)); }
+  .note b { color: rgb(var(--info)); }
+  .note.build { background: rgb(var(--brand) / 0.05); border-color: rgb(var(--brand) / 0.22); }
+  .note.build b { color: rgb(var(--brand-hover)); }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 14px 0 0; padding: 12px 14px; border: 1px dashed rgb(var(--edge)); border-radius: 8px; }
+  .legend .li { display: flex; align-items: center; gap: 7px; font-size: 12px; color: rgb(var(--muted)); }
+
+  .footlist { margin: 12px 0 0; padding-left: 0; list-style: none; display: flex; flex-direction: column; gap: 8px; }
+  .footlist li { display: flex; gap: 10px; font-size: 13px; color: rgb(var(--muted)); }
+  .footlist .n { font-family: var(--mono); font-size: 11px; color: rgb(var(--brand)); border: 1px solid rgb(var(--brand) / 0.3); border-radius: 6px; padding: 1px 7px; height: fit-content; flex: 0 0 auto; }
+  .footlist code { font-family: var(--mono); font-size: 12px; color: rgb(var(--fg)); background: rgb(var(--raised)); padding: 1px 5px; border-radius: 4px; }
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">uzi · RunView · design proposal</p>
+  <h1>Activity pane, rebuilt around the crew — not the scroll</h1>
+  <p class="lede">Right now the pane is one live-tailing log that yanks to the bottom on every websocket frame, and your own follow-ups vanish into a worker queue you can't see. This reframes it: a <strong>crew roster</strong> you scan at a glance, <strong>logs collapsed by default</strong>, and a <strong>steer queue that shows delivery</strong>.</p>
+  <p class="sub">Rendered in uzi's real <span style="font-family:var(--mono);color:rgb(var(--brand))">ember</span> tokens. The mock is live — toggle Follow, expand agents, send a follow-up.</p>
+
+  <div class="problems">
+    <div class="problem">
+      <div class="tag">Problem 1</div>
+      <p class="now">Every WS frame hard-jumps the pane to the bottom (<code style="font-family:var(--mono);font-size:11px">el.scrollTop = scrollHeight</code>, no batching). A tool burst = visible jerking.</p>
+      <p class="fix"><b>Fix:</b> logs collapse by default; auto-tail is opt-in and contained to one expanded agent.</p>
+    </div>
+    <div class="problem">
+      <div class="tag">Problem 2</div>
+      <p class="now">"Active" = whichever role authored the newest message. A stalled agent still reads active; there's no real idle / waiting / done.</p>
+      <p class="fix"><b>Fix:</b> a crew strip with true per-agent state derived from last-activity + handoffs + worker heartbeat.</p>
+    </div>
+    <div class="problem">
+      <div class="tag">Problem 3</div>
+      <p class="now">Follow-ups go to <code style="font-family:var(--mono);font-size:11px">run_inputs</code>, never <code style="font-family:var(--mono);font-size:11px">run_messages</code>. You never see your message, or whether the agent picked it up.</p>
+      <p class="fix"><b>Fix:</b> your message shows instantly as <b>Queued</b>, flips to <b>Delivered</b> when the worker consumes it.</p>
+    </div>
+  </div>
+
+  <div class="section-label">The pane</div>
+
+  <!-- ═══ Activity card ═══ -->
+  <div class="card">
+    <div class="pane-head">
+      <h2 class="pane-title">Activity</h2>
+      <div class="pane-tools">
+        <div id="followToggle" class="toggle" role="switch" aria-checked="false" tabindex="0" title="When off, the log never scrolls on its own">
+          <span class="sw"></span><span>Follow live</span>
+        </div>
+        <span class="msgcount"><span id="msgCount">142</span> msgs</span>
+      </div>
+    </div>
+
+    <!-- crew strip -->
+    <div class="crew" id="crew"></div>
+
+    <!-- agent accordion -->
+    <div class="stream" id="stream"></div>
+  </div>
+
+  <div class="note">
+    <span>ℹ</span>
+    <div><b>Why the crew strip.</b> It answers "who's alive?" in one row without opening a single log. Click a chip to jump to that agent; the pulsing green dot is the only thing that ever animates when you're not looking at logs — no scrolling required.</div>
+  </div>
+
+  <div class="section-label">Steering &amp; the follow-up queue</div>
+
+  <!-- ═══ Steer card ═══ -->
+  <div class="card">
+    <h2 class="pane-title" style="margin-bottom:12px">Steer this run</h2>
+    <div class="queue" id="queue"></div>
+    <textarea class="compose" id="compose" rows="2" placeholder="Send a follow-up — resumes the agent as its next turn"></textarea>
+    <div class="compose-row">
+      <button class="btn primary" id="sendBtn" disabled>Send follow-up</button>
+      <button class="btn danger">Stop run</button>
+      <span class="hint">Enter to send · Shift+Enter for newline</span>
+    </div>
+  </div>
+
+  <div class="note build">
+    <span>⚙</span>
+    <div><b>What this needs under the hood.</b> Persist a follow-up as a real <code style="font-family:var(--mono);font-size:11px;color:rgb(var(--fg))">run_message</code> (kind <code style="font-family:var(--mono);font-size:11px;color:rgb(var(--fg))">user_message</code>) the instant it's sent, carrying a <code style="font-family:var(--mono);font-size:11px;color:rgb(var(--fg))">delivery</code> field. The worker flips it <b>queued → delivered</b> when it drains <code style="font-family:var(--mono);font-size:11px;color:rgb(var(--fg))">run_inputs</code> into a turn (a one-line consume-ack over the existing <code style="font-family:var(--mono);font-size:11px;color:rgb(var(--fg))">state</code>/message channel). No new socket.</div>
+  </div>
+
+  <div class="legend">
+    <div class="li"><span class="dot working"></span> working — producing now</div>
+    <div class="li"><span class="dot waiting"></span> waiting — handed off / at a gate</div>
+    <div class="li"><span class="dot idle"></span> idle — no recent activity</div>
+    <div class="li"><span class="dot done"></span> done — finished its part</div>
+  </div>
+
+  <div class="section-label">Data honesty — what's real vs. what's a small new signal</div>
+  <ul class="footlist">
+    <li><span class="n">have</span><div><b style="color:rgb(var(--fg))">working / done</b> are derivable today from message attribution + run status. <code>done</code> = an agent that emitted a result and hasn't spoken since a later agent started.</div></li>
+    <li><span class="n">add</span><div><b style="color:rgb(var(--fg))">idle vs waiting</b> needs a per-agent <code>last_activity_at</code> (idle after ~Ns of silence) and an explicit <code>handoff</code> / subagent-start event to say "blocked on lead" vs "just quiet."</div></li>
+    <li><span class="n">have</span><div><b style="color:rgb(var(--fg))">true liveness</b> — <code>run.health</code> (PRD #47) already derives worker liveness server-side (<code>waiting_worker</code> / <code>stalled</code>) from the heartbeat; the crew maps those states, so a dead or quiet worker greys the crew with no new plumbing.</div></li>
+    <li><span class="n">add</span><div><b style="color:rgb(var(--fg))">delivery status</b> — the <code>queued → delivered</code> flip for follow-ups (Problem 3), read from <code>run_user_inputs.consumed_at</code> via a data-less WS <code>input</code> frame. The one genuinely new bit of plumbing (no migration).</div></li>
+  </ul>
+</div>
+
+<script>
+(function () {
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // ── model ──────────────────────────────────────────────────────────────
+  const agents = [
+    { name: "lead", accent: "251 146 60", state: "working",
+      oneliner: "running `go test ./...`", age: "3m", open: true, unseen: 0,
+      log: [
+        { k: "Read", cls: "read", arg: "internal/store/service.go", dur: "instant" },
+        { k: "Grep", cls: "read", arg: '"SubmitInput" internal/**', dur: "0.4s" },
+        { t: "Wiring the consume-ack into the worker's input drain. Running the suite to confirm nothing regressed." },
+        { k: "Bash", cls: "", arg: "go test ./...", dur: "live" },
+      ] },
+    { name: "coder", accent: "56 189 248", state: "waiting",
+      oneliner: "handed back to lead · awaiting review", age: "5m", open: false, unseen: 0,
+      log: [
+        { k: "Edit", arg: "workersvc/service.go", dur: "instant" },
+        { k: "Write", arg: "store/queries/runtime.sql", dur: "instant" },
+        { t: "Added CreateRunInput delivery column + query. Returning to lead." },
+      ] },
+    { name: "reviewer", accent: "52 211 153", state: "done",
+      oneliner: "flagged 2 files · approved with notes", age: "8m", open: false, unseen: 0,
+      log: [
+        { k: "Read", cls: "read", arg: "handler/workers.go", dur: "0.3s" },
+        { t: "Two nits: missing terminal-run guard on ack, and the DTO needs the new field. Otherwise sound." },
+      ] },
+    { name: "tester", accent: "122 133 154", state: "idle",
+      oneliner: "not started", age: "—", open: false, unseen: 0, log: [] },
+  ];
+
+  let follow = false;
+  let selected = "lead";
+  let msgCount = 142;
+
+  // ── crew strip ─────────────────────────────────────────────────────────
+  const crewEl = document.getElementById("crew");
+  const streamEl = document.getElementById("stream");
+  const msgCountEl = document.getElementById("msgCount");
+
+  function renderCrew() {
+    crewEl.innerHTML = "";
+    agents.forEach((a) => {
+      const chip = document.createElement("div");
+      chip.className = "crew-chip" + (a.name === selected ? " sel" : "");
+      chip.tabIndex = 0;
+      chip.setAttribute("role", "button");
+      chip.innerHTML =
+        '<span class="dot ' + a.state + '"></span>' +
+        '<span class="who"><span class="nm" style="color:rgb(' + a.accent + ')">' + a.name + '</span>' +
+        '<span class="st">' + a.state + (a.state === "idle" ? "" : " · " + stripTicks(a.oneliner)) + '</span></span>';
+      chip.addEventListener("click", () => { selected = a.name; openOnly(a.name); });
+      crewEl.appendChild(chip);
+    });
+  }
+
+  function stripTicks(s) { return s.replace(/`/g, ""); }
+
+  function openOnly(name) {
+    agents.forEach((a) => { a.open = a.name === name; if (a.open) a.unseen = 0; });
+    render();
+    const node = document.querySelector('[data-agent="' + name + '"]');
+    if (node) node.scrollIntoView({ block: "nearest", behavior: reduce ? "auto" : "smooth" });
+  }
+
+  // ── agent accordion ──────────────────────────────────────────────────────
+  function renderStream() {
+    streamEl.innerHTML = "";
+    agents.forEach((a) => {
+      const wrap = document.createElement("div");
+      wrap.className = "agent" + (a.open ? " open" : "");
+      wrap.style.setProperty("--accent", "rgb(" + a.accent + ")");
+      wrap.dataset.agent = a.name;
+
+      const head = document.createElement("button");
+      head.className = "agent-head";
+      head.setAttribute("aria-expanded", a.open ? "true" : "false");
+      head.innerHTML =
+        '<svg class="chev" viewBox="0 0 16 16" fill="none"><path d="M6 4l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
+        '<span class="agent-name">' + a.name + '</span>' +
+        '<span class="statechip ' + a.state + '">' + a.state + '</span>' +
+        (a.open ? '' : '<span class="oneliner">' + escapeHtml(a.oneliner) + '</span>') +
+        (!a.open && a.unseen > 0 ? '<span class="newpill">+' + a.unseen + '</span>' : '') +
+        '<span class="age">' + a.age + '</span>';
+      head.addEventListener("click", () => { a.open = !a.open; if (a.open) { a.unseen = 0; selected = a.name; } render(); });
+      wrap.appendChild(head);
+
+      const body = document.createElement("div");
+      body.className = "agent-body";
+      const logEl = document.createElement("div");
+      logEl.className = "log";
+      logEl.dataset.log = a.name;
+      a.log.forEach((r) => logEl.appendChild(renderRow(r)));
+      if (a.log.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "row"; empty.style.color = "rgb(var(--faint))";
+        empty.textContent = "no activity yet";
+        logEl.appendChild(empty);
+      }
+      body.appendChild(logEl);
+      wrap.appendChild(body);
+      streamEl.appendChild(wrap);
+
+      if (a.open && follow) logEl.scrollTop = logEl.scrollHeight;
+    });
+  }
+
+  function renderRow(r) {
+    const row = document.createElement("div");
+    if (r.t !== undefined) {
+      row.className = "row text";
+      row.textContent = r.t;
+      return row;
+    }
+    row.className = "row";
+    const live = r.dur === "live";
+    row.innerHTML =
+      '<span class="k ' + (r.cls || "") + '">' + r.k + '</span>' +
+      '<span class="arg">' + escapeHtml(r.arg) + '</span>' +
+      '<span class="dur">' + (live ? '<span class="spin"></span>' : r.dur) + '</span>';
+    return row;
+  }
+
+  function escapeHtml(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+
+  function render() { renderCrew(); renderStream(); msgCountEl.textContent = msgCount; }
+
+  // ── follow toggle ────────────────────────────────────────────────────────
+  const followToggle = document.getElementById("followToggle");
+  function setFollow(v) {
+    follow = v;
+    followToggle.classList.toggle("on", v);
+    followToggle.setAttribute("aria-checked", v ? "true" : "false");
+    if (v) renderStream();
+  }
+  followToggle.addEventListener("click", () => setFollow(!follow));
+  followToggle.addEventListener("keydown", (e) => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); setFollow(!follow); } });
+
+  // ── simulated live lead agent (the "no spam" demo) ───────────────────────
+  const ticks = [
+    { k: "Bash", arg: "go test ./internal/workersvc/...", dur: "8.1s", one: "running workersvc tests" },
+    { t: "workersvc green. Running the handler suite." },
+    { k: "Bash", arg: "go test ./internal/handler/...", dur: "live", one: "running `go test ./internal/handler`" },
+    { k: "Read", cls: "read", arg: "handler/runs_test.go", dur: "0.2s", one: "reading runs_test.go" },
+    { t: "Adding a delivery-ack assertion so a regressed consume-ack fails loudly." },
+    { k: "Edit", arg: "handler/runs_test.go", dur: "instant", one: "editing runs_test.go" },
+  ];
+  let ti = 0;
+  function tick() {
+    const lead = agents[0];
+    const step = ticks[ti % ticks.length];
+    ti++;
+    // resolve the previous 'live' row if any
+    const prevLive = lead.log.find((r) => r.dur === "live");
+    if (prevLive) prevLive.dur = (6 + (ti % 7)) + "." + (ti % 10) + "s";
+    lead.log.push(step);
+    if (lead.log.length > 14) lead.log.shift();
+    if (step.one) lead.oneliner = step.one;
+    msgCount++;
+    if (!lead.open) lead.unseen++;
+    render();
+    // KEY BEHAVIOUR: only tail the expanded stream, and only if Follow is on.
+    if (lead.open && follow) {
+      const el = document.querySelector('[data-log="lead"]');
+      if (el) el.scrollTop = el.scrollHeight;
+    }
+  }
+  if (!reduce) setInterval(tick, 2200);
+
+  // ── steer queue ──────────────────────────────────────────────────────────
+  const queueEl = document.getElementById("queue");
+  const queue = [
+    { txt: "focus on the api package first", state: "delivered", meta: "Delivered · picked up 1m ago" },
+    { txt: "also update the changelog", state: "queued", meta: "Queued · waiting for next turn" },
+  ];
+  function renderQueue() {
+    queueEl.innerHTML = "";
+    queue.forEach((m) => {
+      const el = document.createElement("div");
+      el.className = "qmsg " + m.state;
+      const icon = m.state === "delivered" ? "✓" : "⏳";
+      el.innerHTML =
+        '<span class="you">you</span>' +
+        '<span class="txt">' + escapeHtml(m.txt) + '</span>' +
+        '<span class="qstat">' + icon + " " + m.meta + '</span>';
+      queueEl.appendChild(el);
+    });
+  }
+
+  const compose = document.getElementById("compose");
+  const sendBtn = document.getElementById("sendBtn");
+  compose.addEventListener("input", () => { sendBtn.disabled = compose.value.trim() === ""; });
+  compose.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+  sendBtn.addEventListener("click", send);
+  function send() {
+    const t = compose.value.trim();
+    if (!t) return;
+    const msg = { txt: t, state: "queued", meta: "Queued · just now" };
+    queue.push(msg);
+    compose.value = ""; sendBtn.disabled = true;
+    renderQueue();
+    // simulate the worker consuming it at its next turn boundary
+    setTimeout(() => {
+      msg.state = "delivered"; msg.meta = "Delivered · picked up just now";
+      renderQueue();
+    }, 3500);
+  }
+
+  render();
+  renderQueue();
+})();
+</script>

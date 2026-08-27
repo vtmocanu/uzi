@@ -1,0 +1,124 @@
+{{- if and .Values.workers.enabled .Values.workers.docker.enabled .Values.workers.docker.networkPolicy.enabled }}
+{{- /*
+  The docker tier's NetworkPolicy (PRD #83 M3, auditor MUST — blocking for LIVE
+  enablement).
+
+  WHY THIS EXISTS SEPARATELY. The restricted namespace's floor lives in
+  worker-networkpolicy.yaml (+ worker-fqdn-egress.yaml), and BOTH hardcode
+  `.Values.workers.namespace`. So the docker namespace has NO policy from them and is
+  default-ALLOW in both directions. That is not acceptable for a PRIVILEGED tier: a
+  compromised docker worker could `docker run --network=host` (privileged sidecar) and
+  reach CNPG, other ClusterIPs, or the apiserver, and the dind daemon's own port would
+  be reachable cluster-wide. This closes that.
+
+  WHAT IT CLOSES (Half A): all INGRESS (the worker never listens), and in-cluster
+  LATERAL egress. Egress is allowed to exactly three destinations: cluster DNS, the api
+  TLS port, and the INTERNET-BUT-NOT-THE-CLUSTER (a 0.0.0.0/0 allow with the pod,
+  service, link-local — and any operator-added — CIDRs subtracted). That last rule is
+  what lets a docker worker still pull images (registry, Anthropic, nix substituters)
+  for the DoD, while denying every in-cluster address and the metadata IP.
+
+  WHAT IT DOES NOT CLOSE (Half B, PRD #50's residual): EXTERNAL egress is filtered by
+  CIDR, not by name, so a docker worker can still reach arbitrary internet hosts — the
+  Anthropic-token / repo exfil-over-egress residual is #50's egress proxy to close, NOT
+  this policy. This is deliberate: name-based external filtering needs Antrea FQDN
+  (worker-fqdn-egress.yaml), and this floor is CNI-independent vanilla NetworkPolicy.
+
+  ENFORCEMENT is CNI-dependent, same caveat as the restricted floor: kindnet enforces
+  no NetworkPolicy at all, so a green kind run says nothing about this file. The cluster
+  (Antrea) enforces it; that is where the first real docker worker either stays fenced
+  or does not.
+*/ -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "uzi.fullname" . }}-worker-docker-default-deny
+  namespace: {{ .Values.workers.docker.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-docker
+spec:
+  # Empty podSelector: EVERY pod in the docker namespace, including anything that
+  # arrives later. The floor must not depend on a label the controller remembers to set.
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  # Deny ALL inbound — the worker (and the dind sidecar) listen for nobody; they are
+  # outbound-only. This is also what closes the cluster-wide exposure of the dind
+  # daemon's port for free.
+  ingress: []
+  egress:
+    # DNS — without it every name resolution fails. Selector-based (kube-dns is
+    # in-cluster, so the internet rule below deliberately excludes it). Reuses the
+    # restricted tier's DNS location: it is the same cluster's DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.workers.networkPolicy.dns.namespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.workers.networkPolicy.dns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # The api's TLS port, selector-based (an in-cluster Service — the internet rule
+    # excludes it). A claim response carries the user's decrypted forge PAT + Anthropic
+    # token, so this is the ONE in-cluster service a worker legitimately dials.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              {{- include "uzi.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: api
+      ports:
+        - protocol: TCP
+          port: {{ include "uzi.workerAPIPort" . }}
+    # INTERNET-BUT-NOT-CLUSTER: allow egress to everything EXCEPT the cluster's own
+    # ranges + link-local. NetworkPolicy egress rules are OR'd, so DNS + api above are
+    # still allowed via their selectors even though their pod IPs fall inside the
+    # excluded pod CIDR. This is what keeps registry/Anthropic/nix pulls working (the
+    # DoD) while fencing off all OTHER in-cluster addresses and the metadata IP.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - {{ .Values.workers.docker.networkPolicy.podCIDR }}
+              - {{ .Values.workers.docker.networkPolicy.serviceCIDR }}
+              - {{ .Values.workers.docker.networkPolicy.linkLocalCIDR }}
+              {{- range .Values.workers.docker.networkPolicy.extraExcept }}
+              - {{ . }}
+              {{- end }}
+    {{- if .Values.workers.networkPolicy.allowWebService }}
+    # The in-cluster uzi web Service (PRD #87 §5 / M5), mirrored here from
+    # worker-networkpolicy.yaml. Added 2026-07-25 after a live M7 attempt found the
+    # docker tier could not reach it: the restricted tier got this rule and the docker
+    # tier never did, so `web-ux` on a docker-capable worker had no target. Same flag,
+    # same default (off), same selector + CONTAINER port (8080) reasoning as the
+    # restricted tier's copy — read that comment for why an FQDN ANNP cannot express it.
+    #
+    # THIS IS A DELIBERATE WIDENING, not a no-op, and the header's "WHAT IT CLOSES"
+    # paragraph is why it needs saying. The internet rule above allows 0.0.0.0/0 EXCEPT
+    # every in-cluster CIDR — so before this rule the docker tier could reach exactly two
+    # in-cluster destinations, DNS and the api. This makes it three. On the PRIVILEGED
+    # tier (dind; a compromised worker can `docker run --network=host`) each in-cluster
+    # address added is real lateral reach, so the justification has to be the feature,
+    # not "it already has internet". It is scoped to one component, one port, one
+    # namespace, and stays off unless a cluster opts in.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              {{- include "uzi.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: web
+      ports:
+        - protocol: TCP
+          port: 8080
+    {{- end }}
+{{- end }}

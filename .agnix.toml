@@ -1,0 +1,14 @@
+# agnix (agent-spec linter) configuration.
+# Run: `agnix .claude/skills/<name>/SKILL.md` when authoring a skill.
+
+[rules]
+# AS-013 ("file reference deeper than one level") flags any backtick/prose token
+# shaped like `a/b/c`. Our skills legitimately document GIT REFS in that shape
+# (e.g. `refs/uzi-runner/agent/issue-N`, `refs/uzi-checkpoints/agent/issue-N` in
+# the uzi-watcher PVC-recovery runbook), which are not bundled-file references at
+# all. agnix has no per-line/per-file suppression and the rule matches plain text
+# too, so a git ref cannot be reworded to escape it without mangling the ref. The
+# rule's real value here is marginal (our skills reference at most one level, e.g.
+# `scripts/watch-run.sh`), so disable it repo-wide rather than corrupt correct
+# git-ref documentation. Revisit if agnix gains scoped suppression.
+disabled_rules = ["AS-013"]

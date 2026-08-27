@@ -1,0 +1,439 @@
+<title>uzi · Rate-limit meters UI polish (#54) — before / after mock</title>
+<style>
+  /* uzi "ember" tokens, verbatim from web/src/index.css (dark theme). The app is
+     dark-only (a dark factory), so this mock commits to dark. --faint is shown
+     TWICE below: the live app value and the #54 proposal, side by side. */
+  :root {
+    --bg: 8 10 15;
+    --surface: 15 18 26;
+    --raised: 23 27 38;
+    --edge: 39 45 60;
+    --edge-strong: 58 66 86;
+    --fg: 228 232 240;
+    --muted: 148 158 176;
+    --faint: 100 110 130;        /* live app value → ~3.5:1 on card (fails AA) */
+    --faint-proposed: 122 133 154; /* #54 candidate → measured live below */
+    --brand: 251 146 60;
+    --brand-hover: 253 186 116;
+    --on-brand: 26 16 8;
+    --ok: 52 211 153;
+    --warn: 251 191 36;
+    --danger: 251 113 133;
+    --info: 56 189 248;
+    --radius: 0.625rem;
+    --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color-scheme: dark;
+  }
+  html { background: rgb(var(--bg)); }
+  body {
+    margin: 0; padding: 2.5rem 1.25rem 4rem;
+    background: rgb(var(--bg));
+    color: rgb(var(--fg));
+    font-family: var(--font-sans);
+    font-size: 15px; line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 62rem; margin: 0 auto; display: flex; flex-direction: column; gap: 2.75rem; }
+
+  /* ── page header ── */
+  .eyebrow {
+    font-size: 0.6875rem; letter-spacing: 0.14em; text-transform: uppercase;
+    color: rgb(var(--brand)); font-weight: 600; margin: 0 0 0.5rem;
+  }
+  h1 { font-size: 1.75rem; font-weight: 700; margin: 0 0 0.625rem; text-wrap: balance; letter-spacing: -0.01em; }
+  .lede { color: rgb(var(--muted)); max-width: 48rem; margin: 0; }
+  .lede code, .p code { font-family: var(--font-mono); font-size: 0.85em; background: rgb(var(--raised)); border: 1px solid rgb(var(--edge)); border-radius: 4px; padding: 0.05em 0.35em; }
+
+  /* ── mock frames ── */
+  .frame { display: flex; flex-direction: column; gap: 0.875rem; }
+  .frame-cap { display: flex; align-items: baseline; gap: 0.625rem; flex-wrap: wrap; }
+  .frame-cap .where {
+    font-family: var(--font-mono); font-size: 0.6875rem; letter-spacing: 0.08em;
+    text-transform: uppercase; color: rgb(var(--on-brand));
+    background: rgb(var(--brand)); border-radius: 999px; padding: 0.2rem 0.65rem; font-weight: 700;
+  }
+  .frame-cap h2 { font-size: 1.0625rem; font-weight: 650; margin: 0; }
+  .frame-cap .note { color: rgb(var(--muted)); font-size: 0.8125rem; }
+
+  /* ── before / after split ── */
+  .ba { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; align-items: stretch; }
+  @media (max-width: 780px) { .ba { grid-template-columns: 1fr; } }
+  .stage {
+    background: rgb(var(--surface));
+    border: 1px solid rgb(var(--edge));
+    border-radius: calc(var(--radius) + 4px);
+    padding: 1.5rem; overflow-x: auto;
+    display: flex; flex-direction: column; gap: 1rem;
+  }
+  .stage.before { border-color: rgb(var(--danger) / 0.4); }
+  .stage.after  { border-color: rgb(var(--ok) / 0.4); }
+  .tag { align-self: flex-start; font-family: var(--font-mono); font-size: 0.625rem; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 700; border-radius: 999px; padding: 0.15rem 0.6rem; border: 1px solid; }
+  .tag.b { color: rgb(var(--danger)); border-color: rgb(var(--danger) / 0.4); background: rgb(var(--danger) / 0.10); }
+  .tag.a { color: rgb(var(--ok)); border-color: rgb(var(--ok) / 0.4); background: rgb(var(--ok) / 0.10); }
+  .caption { color: rgb(var(--muted)); font-size: 0.8125rem; margin: 0; }
+  .caption b { color: rgb(var(--fg)); font-weight: 600; }
+
+  /* ── uzi primitives (Card, SectionTitle, Badge) ── */
+  .card {
+    background: rgb(var(--raised) / 0.55);
+    border: 1px solid rgb(var(--edge));
+    border-radius: var(--radius);
+    padding: 1.25rem 1.375rem;
+  }
+  .sect { font-size: 0.8125rem; font-weight: 650; letter-spacing: 0.06em; text-transform: uppercase; color: rgb(var(--muted)); margin: 0 0 0.25rem; }
+  .sub { color: rgb(var(--muted)); font-size: 0.8125rem; margin: 0 0 1.125rem; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 0.35rem;
+    font-size: 0.6875rem; font-weight: 600; border-radius: 999px;
+    padding: 0.125rem 0.55rem; border: 1px solid; white-space: nowrap;
+  }
+  .badge .dot { width: 6px; height: 6px; border-radius: 999px; background: currentColor; }
+  .badge.ok      { color: rgb(var(--ok));     border-color: rgb(var(--ok) / 0.35);     background: rgb(var(--ok) / 0.10); }
+  .badge.warn    { color: rgb(var(--warn));   border-color: rgb(var(--warn) / 0.35);   background: rgb(var(--warn) / 0.10); }
+  .badge.danger  { color: rgb(var(--danger)); border-color: rgb(var(--danger) / 0.35); background: rgb(var(--danger) / 0.10); }
+  .badge.neutral { color: rgb(var(--muted));  border-color: rgb(var(--edge));          background: rgb(var(--raised)); }
+
+  /* ── the meter (adapted from RateLimitMeters) ── */
+  .meter { display: flex; flex-direction: column; gap: 0.375rem; }
+  .meter + .meter { margin-top: 1rem; }
+  .meter .row { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
+  .meter .win { font-size: 0.8125rem; font-weight: 600; color: rgb(var(--fg)); }
+  .meter .val { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 0.8125rem; color: rgb(var(--muted)); white-space: nowrap; }
+  .meter .val b { color: rgb(var(--fg)); font-weight: 650; }
+  .track { height: 8px; border-radius: 999px; background: rgb(var(--raised)); border: 1px solid rgb(var(--edge) / 0.6); overflow: hidden; }
+  .fill { height: 100%; border-radius: 999px; }
+  .fill.ok     { background: rgb(var(--ok)); }
+  .fill.warn   { background: rgb(var(--warn)); }
+  .fill.danger { background: rgb(var(--danger)); }
+  .synced { display: flex; align-items: center; gap: 0.5rem; margin-top: 1.125rem; color: rgb(var(--muted)); font-size: 0.75rem; }
+
+  /* callout arrow annotating a disagreement/fix */
+  .annot { display: inline-flex; align-items: center; gap: 0.4rem; font-size: 0.75rem; font-weight: 600; }
+  .annot.bad  { color: rgb(var(--danger)); }
+  .annot.good { color: rgb(var(--ok)); }
+
+  /* ── aria-live region viz ── */
+  .live-region {
+    border: 1px dashed rgb(var(--info) / 0.55); border-radius: var(--radius);
+    background: rgb(var(--info) / 0.06); padding: 0.75rem 0.875rem;
+    display: flex; align-items: center; gap: 0.625rem;
+  }
+  .live-region .ico { font-size: 1rem; }
+  .live-region .lbl { font-family: var(--font-mono); font-size: 0.625rem; letter-spacing: 0.08em; text-transform: uppercase; color: rgb(var(--info)); font-weight: 700; }
+  .live-region .say { color: rgb(var(--fg)); font-size: 0.8125rem; }
+  .live-region.silent { border-color: rgb(var(--edge)); background: transparent; }
+  .live-region.silent .lbl { color: rgb(var(--faint)); }
+  .live-region.silent .say { color: rgb(var(--faint)); font-style: italic; }
+
+  .timeline { display: flex; flex-direction: column; gap: 0; margin: 0; padding: 0; list-style: none; }
+  .timeline li { display: grid; grid-template-columns: 3.2rem 4.2rem 1fr; gap: 0.625rem; align-items: center; padding: 0.4rem 0; border-top: 1px solid rgb(var(--edge) / 0.5); font-size: 0.75rem; }
+  .timeline li:first-child { border-top: 0; }
+  .timeline .t { font-family: var(--font-mono); color: rgb(var(--muted)); }
+  .timeline .pct { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-weight: 650; }
+  .timeline .say { color: rgb(var(--fg)); }
+  .timeline .mute { color: rgb(var(--faint)); font-style: italic; }
+  .pill { font-size: 0.625rem; font-weight: 700; padding: 0.05rem 0.4rem; border-radius: 999px; }
+  .pill.ok { color: rgb(var(--ok)); background: rgb(var(--ok) / 0.12); }
+  .pill.warn { color: rgb(var(--warn)); background: rgb(var(--warn) / 0.12); }
+  .pill.danger { color: rgb(var(--danger)); background: rgb(var(--danger) / 0.12); }
+
+  /* ── contrast swatches ── */
+  .swatches { display: grid; grid-template-columns: 1fr; gap: 0.75rem; }
+  .swatch { background: rgb(var(--raised) / 0.55); border: 1px solid rgb(var(--edge)); border-radius: var(--radius); padding: 0.875rem 1rem; }
+  .swatch .hd { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; margin-bottom: 0.5rem; }
+  .swatch .tok { font-family: var(--font-mono); font-size: 0.75rem; color: rgb(var(--fg)); }
+  .swatch .tok em { color: rgb(var(--muted)); font-style: normal; }
+  .ratio { font-family: var(--font-mono); font-size: 0.6875rem; font-weight: 700; padding: 0.1rem 0.5rem; border-radius: 999px; white-space: nowrap; }
+  .ratio.pass { color: rgb(var(--ok)); background: rgb(var(--ok) / 0.12); border: 1px solid rgb(var(--ok) / 0.3); }
+  .ratio.fail { color: rgb(var(--danger)); background: rgb(var(--danger) / 0.12); border: 1px solid rgb(var(--danger) / 0.3); }
+  .sample-faint    { color: rgb(var(--faint)); font-size: 0.75rem; }
+  .sample-proposed { color: rgb(var(--faint-proposed)); font-size: 0.75rem; }
+  .sample-muted    { color: rgb(var(--muted)); font-size: 0.75rem; }
+
+  /* ── mini admin table for the empty-name nit ── */
+  table { border-collapse: collapse; width: 100%; font-size: 0.8125rem; }
+  tbody td { padding: 0.7rem 0.75rem; border-bottom: 1px solid rgb(var(--edge) / 0.55); vertical-align: middle; }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.user .nm { font-weight: 600; color: rgb(var(--fg)); display: block; min-height: 1.2em; }
+  td.user .nm.empty { background: rgb(var(--danger) / 0.10); border-radius: 3px; }
+  td.user .nm.noname { color: rgb(var(--faint)); font-weight: 400; font-style: italic; }
+  td.user .em { color: rgb(var(--muted)); font-size: 0.72rem; }
+
+  /* ── code map strip ── */
+  .how { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: 0.875rem; }
+  .how .step { background: rgb(var(--surface)); border: 1px solid rgb(var(--edge)); border-radius: var(--radius); padding: 1rem 1.125rem; }
+  .how .k { font-family: var(--font-mono); font-size: 0.6875rem; color: rgb(var(--brand)); letter-spacing: 0.06em; text-transform: uppercase; font-weight: 700; margin: 0 0 0.375rem; }
+  .how p { margin: 0; color: rgb(var(--muted)); font-size: 0.8125rem; }
+  .how code { font-family: var(--font-mono); font-size: 0.85em; color: rgb(var(--fg)); }
+
+  .oq { border-left: 3px solid rgb(var(--brand)); background: rgb(var(--brand) / 0.06); border-radius: 0 var(--radius) var(--radius) 0; padding: 0.75rem 1rem; margin: 0; }
+  .oq .k { font-size: 0.6875rem; letter-spacing: 0.1em; text-transform: uppercase; color: rgb(var(--brand)); font-weight: 700; }
+  .oq p { margin: 0.25rem 0 0; color: rgb(var(--muted)); font-size: 0.8125rem; }
+  .oq b { color: rgb(var(--fg)); }
+
+  @media (max-width: 640px) { .stage { padding: 1rem; } body { padding-top: 1.5rem; } }
+</style>
+
+<div class="wrap">
+
+  <header>
+    <p class="eyebrow">vtmocanu/uzi · issue #54 · design mock · before / after · not implemented yet</p>
+    <h1>Rate-limit meters UI polish</h1>
+    <p class="lede">Three deliberately out-of-scope findings from PRD&nbsp;#53's web-ux passes, parked in <a href="https://github.com/vtmocanu/uzi/-/issues/54" style="color: rgb(var(--brand))">#54</a>. None are bugs — current behavior is intentional and vitest-pinned. This mock shows the <b style="color:rgb(var(--fg))">current</b> state beside the <b style="color:rgb(var(--fg))">proposed</b> state so the change can be reviewed and signed off before any code. Thresholds follow uzi's one <code>toneFor</code> vocabulary: <span class="badge ok"><span class="dot"></span>ok &lt;80%</span> <span class="badge warn"><span class="dot"></span>warn ≥80%</span> <span class="badge danger"><span class="dot"></span>danger ≥95%</span>.</p>
+  </header>
+
+  <!-- ═══ 1. Settings-card badge escalation ═══ -->
+  <section class="frame">
+    <div class="frame-cap">
+      <span class="where">every user</span>
+      <h2>1 · Settings-card badge escalates on danger</h2>
+      <span class="note">Settings → Account &amp; token · <code>web/src/components/RateLimitMeters.tsx</code></span>
+    </div>
+    <div class="ba">
+      <!-- BEFORE -->
+      <div class="stage before">
+        <span class="tag b">current</span>
+        <div class="card">
+          <p class="sect">Claude limits</p>
+          <p class="sub">Live utilization of your Anthropic account's two rate-limit windows. Runs queue when a window is exhausted and resume after it resets.</p>
+          <div class="meter">
+            <div class="row">
+              <span class="win">5-hour window</span>
+              <span class="val"><b>97%</b> · resets in 12m</span>
+            </div>
+            <div class="track"><div class="fill danger" style="width: 97%"></div></div>
+          </div>
+          <div class="meter">
+            <div class="row">
+              <span class="win">7-day window</span>
+              <span class="val"><b>71%</b> · resets in 4d 1h</span>
+            </div>
+            <div class="track"><div class="fill ok" style="width: 71%"></div></div>
+          </div>
+          <div class="synced">
+            <span class="badge ok"><span class="dot"></span>Live</span>
+            <span>updated 1 min ago · refreshes every few minutes</span>
+          </div>
+        </div>
+        <p class="caption"><span class="annot bad">▲ mismatch</span> — the bar is <b>red</b> at 97% but the badge stays green <b>“Live”</b>. Badge and bar disagree; the at-a-glance signal understates the danger.</p>
+      </div>
+      <!-- AFTER -->
+      <div class="stage after">
+        <span class="tag a">proposed</span>
+        <div class="card">
+          <p class="sect">Claude limits</p>
+          <p class="sub">Live utilization of your Anthropic account's two rate-limit windows. Runs queue when a window is exhausted and resume after it resets.</p>
+          <div class="meter">
+            <div class="row">
+              <span class="win">5-hour window</span>
+              <span class="val"><b>97%</b> · resets in 12m</span>
+            </div>
+            <div class="track"><div class="fill danger" style="width: 97%"></div></div>
+          </div>
+          <div class="meter">
+            <div class="row">
+              <span class="win">7-day window</span>
+              <span class="val"><b>71%</b> · resets in 4d 1h</span>
+            </div>
+            <div class="track"><div class="fill ok" style="width: 71%"></div></div>
+          </div>
+          <div class="synced">
+            <span class="badge danger"><span class="dot"></span>5h nearly out</span>
+            <span>updated 1 min ago · refreshes every few minutes</span>
+          </div>
+        </div>
+        <p class="caption"><span class="annot good">✓ agrees</span> — badge escalates to the danger tone/label via the existing <code>statusBadge()</code> in <code>lib/rateLimits.ts</code> (same “5h / 7d / 5h &amp; 7d nearly out” vocabulary the admin table already shows).</p>
+      </div>
+    </div>
+
+    <p class="oq">
+      <span class="k">Open design question — warn (80–94%)</span>
+    </p>
+    <div class="ba">
+      <div class="stage before">
+        <span class="tag b">current (pinned)</span>
+        <div class="card">
+          <div class="meter">
+            <div class="row"><span class="win">5-hour window</span><span class="val"><b>83%</b> · resets in 44m</span></div>
+            <div class="track"><div class="fill warn" style="width: 83%"></div></div>
+          </div>
+          <div class="synced"><span class="badge ok"><span class="dot"></span>Live</span><span>amber bar carries the signal; badge stays Live</span></div>
+        </div>
+        <p class="caption">A warn window keeps <b>“Live”</b> today — pinned by a vitest and matches the #53 mockup. The amber bar carries the “running low” signal on its own.</p>
+      </div>
+      <div class="stage after">
+        <span class="tag a">alternative (needs a call)</span>
+        <div class="card">
+          <div class="meter">
+            <div class="row"><span class="win">5-hour window</span><span class="val"><b>83%</b> · resets in 44m</span></div>
+            <div class="track"><div class="fill warn" style="width: 83%"></div></div>
+          </div>
+          <div class="synced"><span class="badge warn"><span class="dot"></span>5h running low</span><span>badge also escalates on warn</span></div>
+        </div>
+        <p class="caption">Should warn <b>also</b> escalate the badge (amber “running low”), or only danger? Escalating warn too changes pinned tests and the #53 contract. <b>Recommendation: danger-only</b> for #54 (smallest, test-aligned change); revisit warn separately.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ 2. aria-live announcement ═══ -->
+  <section class="frame">
+    <div class="frame-cap">
+      <span class="where">every user</span>
+      <h2>2 · Screen-reader announcement on threshold crossings</h2>
+      <span class="note">Settings card and/or sidebar · new visually-hidden <code>aria-live="polite"</code> region</span>
+    </div>
+    <div class="ba">
+      <!-- BEFORE -->
+      <div class="stage before">
+        <span class="tag b">current</span>
+        <div class="card">
+          <p class="sect">Claude limits</p>
+          <div class="meter" style="margin-top:.5rem">
+            <div class="row"><span class="win">5-hour window</span><span class="val"><b>96%</b> · resets in 40m</span></div>
+            <div class="track"><div class="fill danger" style="width: 96%"></div></div>
+          </div>
+        </div>
+        <div class="live-region silent">
+          <span class="ico">🔇</span>
+          <span><span class="lbl">screen reader</span><br><span class="say">(silence — bar turned red, nothing announced)</span></span>
+        </div>
+        <p class="caption">The meters poll silently every 60s. A sighted user sees the bar turn amber/red; a screen-reader user gets <b>nothing</b>.</p>
+      </div>
+      <!-- AFTER -->
+      <div class="stage after">
+        <span class="tag a">proposed</span>
+        <div class="card">
+          <p class="sect">Claude limits</p>
+          <div class="meter" style="margin-top:.5rem">
+            <div class="row"><span class="win">5-hour window</span><span class="val"><b>96%</b> · resets in 40m</span></div>
+            <div class="track"><div class="fill danger" style="width: 96%"></div></div>
+          </div>
+        </div>
+        <div class="live-region">
+          <span class="ico">🔊</span>
+          <span><span class="lbl">aria-live="polite" · sr-only</span><br><span class="say">“5-hour window at 96%, resets in 40m”</span></span>
+        </div>
+        <p class="caption">A visually-hidden live region announces <b>only on tone transitions</b> (ok→warn, warn→danger), never on every poll. The region is invisible on screen (shown here dashed for illustration).</p>
+      </div>
+    </div>
+
+    <div class="stage" style="border-color: rgb(var(--edge));">
+      <span class="tag" style="color:rgb(var(--info));border-color:rgb(var(--info) / .4);background:rgb(var(--info) / .1)">debounce — announces on tone change only</span>
+      <ol class="timeline">
+        <li><span class="t">10:00</span><span class="pct" style="color:rgb(var(--ok))">79%</span><span class="mute">ok — no announcement (first read / already ok)</span></li>
+        <li><span class="t">10:01</span><span class="pct" style="color:rgb(var(--warn))">82% <span class="pill warn">→ warn</span></span><span class="say">🔊 “5-hour window at 82%, resets in 44m”</span></li>
+        <li><span class="t">10:02</span><span class="pct" style="color:rgb(var(--warn))">84%</span><span class="mute">still warn — silent (no tone change)</span></li>
+        <li><span class="t">10:03</span><span class="pct" style="color:rgb(var(--danger))">96% <span class="pill danger">→ danger</span></span><span class="say">🔊 “5-hour window at 96%, resets in 40m”</span></li>
+        <li><span class="t">10:04</span><span class="pct" style="color:rgb(var(--danger))">97%</span><span class="mute">still danger — silent</span></li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- ═══ 3. --faint contrast token ═══ -->
+  <section class="frame">
+    <div class="frame-cap">
+      <span class="where">app-wide</span>
+      <h2>3 · <code>--faint</code> token lifted to WCAG AA</h2>
+      <span class="note">design-system decision · <code>web/src/index.css</code> · blast radius = all de-emphasised text</span>
+    </div>
+    <div class="swatches">
+      <div class="swatch">
+        <div class="hd">
+          <span class="tok"><em>current</em> --faint: 100 110 130 <em>(#646E82)</em></span>
+          <span class="ratio fail" data-fg="faint">measuring…</span>
+        </div>
+        <div class="sample-faint">radu@example.com&nbsp;&nbsp;·&nbsp;&nbsp;stale&nbsp;&nbsp;·&nbsp;&nbsp;updated 2m ago&nbsp;&nbsp;·&nbsp;&nbsp;44m</div>
+      </div>
+      <div class="swatch">
+        <div class="hd">
+          <span class="tok"><em>proposed #54</em> --faint: 122 133 154 <em>(#7A859A)</em></span>
+          <span class="ratio pass" data-fg="proposed">measuring…</span>
+        </div>
+        <div class="sample-proposed">radu@example.com&nbsp;&nbsp;·&nbsp;&nbsp;stale&nbsp;&nbsp;·&nbsp;&nbsp;updated 2m ago&nbsp;&nbsp;·&nbsp;&nbsp;44m</div>
+      </div>
+      <div class="swatch">
+        <div class="hd">
+          <span class="tok"><em>reference</em> --muted: 148 158 176 <em>(already AA, used for #53 data nodes)</em></span>
+          <span class="ratio pass" data-fg="muted">measuring…</span>
+        </div>
+        <div class="sample-muted">radu@example.com&nbsp;&nbsp;·&nbsp;&nbsp;stale&nbsp;&nbsp;·&nbsp;&nbsp;updated 2m ago&nbsp;&nbsp;·&nbsp;&nbsp;44m</div>
+      </div>
+    </div>
+    <p class="caption">Ratios are <b>measured live</b> in your browser by compositing the rgba layers (card = <code>--raised</code>/0.55 over <code>--surface</code>), matching the #53 methodology. AA small-text bar is <b>4.5:1</b>. The proposed value clears it while staying visibly “fainter” than <code>--muted</code>.</p>
+
+    <!-- cosmetic nit: empty name line -->
+    <div class="frame-cap" style="margin-top:.5rem">
+      <span class="where">admins only</span>
+      <h2 style="font-size:.95rem">Cosmetic nit · empty name line above the email</h2>
+      <span class="note">applies to Admin → Rate limits AND Admin → Users</span>
+    </div>
+    <div class="ba">
+      <div class="stage before">
+        <span class="tag b">current</span>
+        <table>
+          <tbody>
+            <tr><td class="user"><span class="nm empty">&nbsp;</span><span class="em">irina@example.com</span></td></tr>
+            <tr><td class="user"><span class="nm">radu</span><span class="em">radu@example.com</span></td></tr>
+          </tbody>
+        </table>
+        <p class="caption">A user with no display name renders an <b>empty name line</b> (highlighted) above the email — a floating gap.</p>
+      </div>
+      <div class="stage after">
+        <span class="tag a">proposed</span>
+        <table>
+          <tbody>
+            <tr><td class="user"><span class="nm noname">no name</span><span class="em">irina@example.com</span></td></tr>
+            <tr><td class="user"><span class="nm">radu</span><span class="em">radu@example.com</span></td></tr>
+          </tbody>
+        </table>
+        <p class="caption">Fall back to a faint <b>“no name”</b> placeholder (or collapse the line to just the email). Keeps rows aligned; no floating gap.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ how it maps to code ═══ -->
+  <section class="frame">
+    <div class="frame-cap"><h2>Where each change lands</h2></div>
+    <div class="how">
+      <div class="step">
+        <p class="k">1 · badge</p>
+        <p><code>RateLimitCard</code> swaps its inline <code>stale ? Stale : Live</code> for <code>statusBadge(data, vaultLocked)</code> — the same helper the admin table calls. Zero new logic; danger-only keeps the pinned warn test green.</p>
+      </div>
+      <div class="step">
+        <p class="k">2 · aria-live</p>
+        <p>A tiny <code>sr-only</code> <code>aria-live="polite"</code> region + a <code>useRef</code> of the last tone; announce only when <code>toneFor()</code> steps up. No new polling.</p>
+      </div>
+      <div class="step">
+        <p class="k">3 · token + nit</p>
+        <p>Bump <code>--faint</code> in <code>index.css</code> (both theme blocks), re-measure the app-wide callers. Name fallback is a one-liner in the two admin tables.</p>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<script>
+  // Measure WCAG contrast live by compositing the rgba layers, same method the
+  // #53 web-ux pass used. Card surface = --raised at 0.55 over the opaque --surface.
+  const T = {
+    bg:      [8, 10, 15],
+    surface: [15, 18, 26],
+    raised:  [23, 27, 38],
+    faint:    [100, 110, 130],
+    proposed: [122, 133, 154],
+    muted:    [148, 158, 176],
+  };
+  const over = (fg, a, bg) => fg.map((c, i) => Math.round(a * c + (1 - a) * bg[i]));
+  const cardBg = over(T.raised, 0.55, T.surface); // card sits on the opaque stage/surface
+  const lin = (c) => { c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+  const lum = ([r, g, b]) => 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+  const ratio = (fg, bg) => { const a = lum(fg) + 0.05, b = lum(bg) + 0.05; return (Math.max(a, b) / Math.min(a, b)); };
+  document.querySelectorAll('.ratio[data-fg]').forEach((el) => {
+    const r = ratio(T[el.dataset.fg], cardBg);
+    const pass = r >= 4.5;
+    el.textContent = r.toFixed(2) + ':1 ' + (pass ? 'AA ✓' : 'fails AA');
+    el.classList.toggle('pass', pass);
+    el.classList.toggle('fail', !pass);
+  });
+</script>

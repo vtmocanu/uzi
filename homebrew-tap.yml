@@ -1,0 +1,133 @@
+---
+# homebrew-tap.yml - Render a Homebrew formula from a template and publish it to a tap.
+#
+# 🔴 VENDORED COPY. Upstream is github.com/vtmocanu/task/homebrew-tap.yml at commit
+# bccb39125de3f275e9451c4963d23f6afb31b342 (the same mechanic the sibling formulae
+# cc-statusline / fj-queue use). uzi VENDORS it rather than remote-including it: uzi's
+# Taskfile.yml runs the GATE via `task` in CI, and Task resolves an include EAGERLY on
+# every `task` call -- a `{{if .CI}}` remote include would therefore fetch over the
+# network on every gate job and break them without TASK_X_REMOTE_TASKFILES. A local
+# vendored copy resolves identically in CI and locally, with no network and no remote
+# code (see Taskfile.yml rule 3). To update: diff against the upstream file and bump the
+# SHA above in the same change.
+#
+# A reusable Taskfile. The generic release mechanics live here: compute the
+# release tarball's sha256, guard against an empty/404 digest, render a
+# consumer-owned formula template, then clone the tap and push the updated
+# formula. The formula *body* stays in the consumer repo as a template file
+# with @@URL@@ / @@SHA256@@ / @@VERSION@@ placeholders, so this file references
+# no project-specific name and is reusable across projects.
+#
+# A consumer repo includes it and overrides vars:
+#
+#   includes:
+#     brew:
+#       taskfile: "{{if .CI}}https://raw.githubusercontent.com/vtmocanu/task/main/homebrew-tap.yml{{else}}/path/to/task/homebrew-tap.yml{{end}}"
+#       vars:
+#         NAME: my-tool                    # binary / formula file name
+#         GH_REPO: youruser/my-tool        # owner/repo the release tarball comes from
+#         TAP_REPO: youruser/homebrew-tap  # owner/repo of the tap to publish into
+#
+# The consumer keeps a formula template (default ./Formula.rb.tmpl), e.g.:
+#
+#   class MyTool < Formula
+#     url "@@URL@@"
+#     sha256 "@@SHA256@@"
+#     ...
+#   end
+#
+# Then:
+#   task brew:formula VERSION=v1.2.3                                  # render dist/my-tool.rb
+#   task brew:publish VERSION=v1.2.3 HOMEBREW_TAP_TOKEN=<pat>         # push to the tap
+#
+# NAME / GH_REPO / TAP_REPO identify the project and have no universal default,
+# so the tasks declare them (plus VERSION, HOMEBREW_TAP_TOKEN) via `requires`.
+# Every other var is defaulted and overridable. Paths are resolved relative to
+# the consumer's root Taskfile dir ({{.ROOT_DIR}}), never this file's location,
+# so a remote include works the same as a local one.
+
+version: "3"
+
+vars:
+  # Optional knobs (all defaulted). Paths relative to the consumer root, where
+  # an included task always runs ({{.ROOT_DIR}}). NAME-dependent defaults
+  # (FORMULA_OUT, TAP_FORMULA_PATH) are set per task, not here: include-provided
+  # vars like NAME are in scope for task-level vars but not for this file's
+  # top-level vars, where .NAME would render as "<nil>".
+  FORMULA_TEMPLATE: '{{.FORMULA_TEMPLATE | default "Formula.rb.tmpl"}}'
+  GIT_USER_NAME: '{{.GIT_USER_NAME | default "github-actions[bot]"}}'
+  GIT_USER_EMAIL: '{{.GIT_USER_EMAIL | default "41898282+github-actions[bot]@users.noreply.github.com"}}'
+
+tasks:
+  default:
+    desc: "List available homebrew-tap tasks"
+    cmds:
+      - task --list
+
+  formula:
+    desc: "Render the Homebrew formula for VERSION (computes the tarball sha256)"
+    requires:
+      vars: [VERSION, NAME, GH_REPO]
+    vars:
+      FORMULA_OUT: '{{.FORMULA_OUT | default (printf "dist/%s.rb" .NAME)}}'
+      TARBALL_URL: '{{.TARBALL_URL | default (printf "https://github.com/%s/archive/refs/tags/%s.tar.gz" .GH_REPO .VERSION)}}'
+      SHA256:
+        sh: curl -fsSL "{{.TARBALL_URL}}" | shasum -a 256 | awk '{print $1}'
+    cmds:
+      # Guard: a curl|shasum pipe cannot pipefail inside a var, so a 404 yields
+      # the empty-input digest. Refuse to emit a formula with a bogus sha.
+      - |
+        if [ -z "{{.SHA256}}" ] || [ "{{.SHA256}}" = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ]; then
+          echo "error: empty/invalid sha256 for {{.VERSION}} (bad tag or network failure): {{.TARBALL_URL}}" >&2
+          exit 1
+        fi
+      - |
+        if [ ! -f "{{.FORMULA_TEMPLATE}}" ]; then
+          echo "error: formula template not found: {{.FORMULA_TEMPLATE}}" >&2
+          exit 1
+        fi
+        mkdir -p "$(dirname "{{.FORMULA_OUT}}")"
+        # Substitute placeholders; escape sed-special chars (& | \) so any
+        # URL / version / sha is handled literally.
+        esc() { printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'; }
+        sed -e "s|@@VERSION@@|$(esc '{{.VERSION}}')|g" \
+            -e "s|@@URL@@|$(esc '{{.TARBALL_URL}}')|g" \
+            -e "s|@@SHA256@@|$(esc '{{.SHA256}}')|g" \
+            "{{.FORMULA_TEMPLATE}}" > "{{.FORMULA_OUT}}"
+      - echo "Rendered {{.FORMULA_OUT}} for {{.VERSION}} (sha256 {{.SHA256}})"
+
+  publish:
+    desc: "Clone the tap, copy the rendered formula, commit and push"
+    # silent: Task echoes each command before running it, and the git clone URL
+    # embeds HOMEBREW_TAP_TOKEN. GitHub Actions' secret masking should redact
+    # it, but a public repo's CI log must not rely on masking alone; suppress
+    # the echo entirely. The script's own echo lines still print.
+    silent: true
+    requires:
+      vars: [VERSION, NAME, TAP_REPO, HOMEBREW_TAP_TOKEN]
+    vars:
+      FORMULA_OUT: '{{.FORMULA_OUT | default (printf "dist/%s.rb" .NAME)}}'
+      TAP_FORMULA_PATH: '{{.TAP_FORMULA_PATH | default (printf "Formula/%s.rb" .NAME)}}'
+    cmds:
+      - |
+        set -eu
+        if [ ! -f "{{.FORMULA_OUT}}" ]; then
+          echo "error: {{.FORMULA_OUT}} missing; run the formula task first (e.g. task brew:formula VERSION={{.VERSION}})" >&2
+          exit 1
+        fi
+        WORK_DIR="$(mktemp -d)"
+        trap 'rm -rf "$WORK_DIR"' EXIT
+        git clone --quiet "https://x-access-token:{{.HOMEBREW_TAP_TOKEN}}@github.com/{{.TAP_REPO}}.git" "$WORK_DIR"
+        mkdir -p "$(dirname "$WORK_DIR/{{.TAP_FORMULA_PATH}}")"
+        cp "{{.ROOT_DIR}}/{{.FORMULA_OUT}}" "$WORK_DIR/{{.TAP_FORMULA_PATH}}"
+        cd "$WORK_DIR"
+        git add "{{.TAP_FORMULA_PATH}}"
+        git config user.name "{{.GIT_USER_NAME}}"
+        git config user.email "{{.GIT_USER_EMAIL}}"
+        if git diff --cached --quiet; then
+          echo "{{.NAME}} formula already current for {{.VERSION}}; nothing to publish."
+        else
+          git commit -q -m "Update {{.NAME}} formula to {{.VERSION}}"
+          git push --quiet origin main
+          echo "Published {{.NAME}} {{.VERSION}} to {{.TAP_REPO}}."
+        fi

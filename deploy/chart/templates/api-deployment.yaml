@@ -1,0 +1,160 @@
+{{- include "uzi.validateDatabaseMode" . }}
+{{- if .Values.api.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "uzi.fullname" . }}-api
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  replicas: {{ .Values.api.replicaCount }}
+  strategy:
+    # HARD SINGLETON: Recreate (never RollingUpdate) so the surge never runs a
+    # second api pod. Two would double-poll the forge, double-sweep runs,
+    # double-handle Slack Socket Mode events, and race the goose boot migration
+    # (no advisory lock). See values.yaml api.replicaCount.
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "uzi.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      annotations:
+        # Roll the pod when the non-secret config (ConfigMap) changes. Secret
+        # changes are synced by the Infisical operator (restart the pod to pick up).
+        checksum/config: {{ include (print $.Template.BasePath "/api-configmap.yaml") . | sha256sum }}
+      labels:
+        {{- include "uzi.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: api
+    spec:
+      # The api never calls the k8s API; drop the auto-mounted SA token.
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecret.name }}
+      imagePullSecrets:
+        - name: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.api_podSecurityContext | nindent 8 }}
+      containers:
+        - name: api
+          image: "{{ .Values.api.image.repository }}:{{ .Values.api.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.api.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.api_containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            {{- if .Values.api.tls.enabled }}
+            # The worker/controller hop (PRD #58 Decision 4). A SECOND port, not a
+            # replacement: the plain one above still serves web's nginx and the
+            # kubelet probes, and keeping them apart is what lets the NetworkPolicy
+            # admit the worker namespace to this one and nothing else.
+            - name: https
+              containerPort: {{ .Values.api.tls.port }}
+              protocol: TCP
+            {{- end }}
+          {{- if or .Values.api.config (include "uzi.apiHostingEnabled" .) }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "uzi.fullname" . }}-api-config
+          {{- end }}
+          env:
+            {{- if .Values.api.tls.enabled }}
+            # PATHS to the mounted pair, never the material: cert-manager renews the
+            # cert in place and the api re-reads the files, so nothing here goes
+            # stale and no rollout is needed to pick up a renewal.
+            - name: API_TLS_ADDR
+              value: ":{{ .Values.api.tls.port }}"
+            - name: API_TLS_CERT
+              value: {{ printf "%s/tls.crt" (include "uzi.apiTLSDir" .) | quote }}
+            - name: API_TLS_KEY
+              value: {{ printf "%s/tls.key" (include "uzi.apiTLSDir" .) | quote }}
+            {{- end }}
+            # DATABASE_URL DSN, from the Secret the selected database.mode produces
+            # (simple: the chart's <fullname>-postgres/`uri`; cnpg: the CNPG-generated
+            # <cluster>-app/`uri`; external: the user-supplied api.database.*). Required
+            # at boot (config.Load errors on empty), so NOT optional: the pod waits for
+            # the secret (under cnpg, CNPG creates it at sync-wave -5).
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "uzi.database.secretName" . | quote }}
+                  key: {{ include "uzi.database.secretKey" . | quote }}
+            {{- range $envName, $secretKey := .Values.api.secretEnv }}
+            # {{ $envName }} <- Infisical key "{{ $secretKey }}"
+            - name: {{ $envName }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.infisical.app.managedSecretName }}
+                  key: {{ $secretKey | quote }}
+                  optional: true
+            {{- end }}
+            {{- if include "uzi.apiHostingEnabled" . }}
+            # The controller's bearer credential, as a HASH (PRD #58 Decision 2). The
+            # api only ever compares sha256(presented) against this, so the hash is not
+            # itself a credential and env is the right shape for it — unlike the
+            # controller's plaintext half, which is file-mounted precisely because env
+            # is readable through /proc/<pid>/environ.
+            #
+            # Rendered ONLY with hosting on, and that is not tidiness: the api REFUSES
+            # TO BOOT if this is set while WORKER_HOSTING_ENABLED is false ("the api
+            # would ignore the credential and every controller poll would 404"). So it
+            # cannot live in the static api.secretEnv map — the moment an operator put
+            # the key in Infisical, every hosting-off stack would CrashLoop.
+            #
+            # optional: true, so a missing key surfaces as the api's own boot error
+            # naming the variable (hosting on REQUIRES it) rather than a pod wedged in
+            # ContainerCreating. Same convention as JWT_SECRET/UZI_SECRET_KEY above.
+            - name: WORKER_HOSTING_CONTROLLER_TOKEN_SHA256
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.infisical.app.managedSecretName }}
+                  key: {{ .Values.workers.controller.tokenHashSecretKey | quote }}
+                  optional: true
+            {{- end }}
+            # The api compares hosted workers' reported version against this pinned tag
+            # for the upgrade badge (PRD #422), so an intentionally-pinned worker is not
+            # flagged `outdated` when appVersion has moved ahead. workers.image.tag is a
+            # concrete pinned value after M1, so this is always non-empty in a normal deploy.
+            - name: HOSTED_WORKER_VERSION
+              value: {{ .Values.workers.image.tag | quote }}
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+          {{- with .Values.api.startupProbe }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.api.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.api.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            # Writable /tmp for the read-only-root-fs container (TLS/temp scratch).
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.api.tls.enabled }}
+            - name: api-tls
+              mountPath: {{ include "uzi.apiTLSDir" . }}
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        {{- if .Values.api.tls.enabled }}
+        # NOT marked optional: an api told to serve TLS refuses to boot without the
+        # pair, so waiting in ContainerCreating for cert-manager to issue is the
+        # honest failure mode. It resolves itself within seconds on a first deploy.
+        - name: api-tls
+          secret:
+            secretName: {{ include "uzi.apiTLSSecretName" . }}
+            defaultMode: 0400
+        {{- end }}
+{{- end }}

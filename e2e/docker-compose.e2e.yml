@@ -1,0 +1,240 @@
+# M6 E2E overlay. Layered on the base docker-compose.yml:
+#   docker compose -f docker-compose.yml -f e2e/docker-compose.e2e.yml ...
+#
+# It adds a fake GitLab (forge-fake) and rewires api + agent to use it with
+# dummy credentials and the stub executor. Everything the harness needs at
+# runtime (self-signed cert, the worker-token file, the local bare git remote,
+# the insteadOf gitconfig) lives under ${E2E_RUN_DIR}, a per-run scratch dir the
+# driver bind-mounts in. See e2e/run-e2e.sh and e2e/README.md.
+
+services:
+  # Fake GitLab: HTTPS v4 API subset + MR recorder. Reachable in-network as
+  # forge-fake.e2e (the api SSRF allowlist + the worker MR guard both require an
+  # https base, and NormalizeForgeBaseURL drops the port — so it must be :443).
+  forge-fake:
+    build: ./e2e/forge-fake
+    environment:
+      # Used only by the optional git smart-HTTP endpoint (E2E_GIT_SMART_HTTP): the
+      # worker's git-over-HTTPS Basic credential must decode to this user:pat, or
+      # forge-fake 401s the clone/push. Dormant in the default (local-remote) run.
+      FORGE_FAKE_EXPECT_USER: uzi-bot
+      FORGE_FAKE_EXPECT_PAT: e2e-dummy-forge-pat-000000
+      # A SECOND served project for the PRD #42 M5 bounded-concurrency scenario:
+      # two issues on two DIFFERENT repos so a cap-2 worker's two runs get
+      # independent git bare-caches. Every other phase uses only group/repo (the
+      # first project), and the seed enables only group/repo (UZI_SEED_FORGE_REPOS),
+      # so repo2 stays a disabled, invisible row until that scenario enables it.
+      FORGE_FAKE_PROJECT2: group/repo2
+      # Persist recorded state to a bind mount so it survives the restart-resilience
+      # down/up. The fake is otherwise in-memory; a real forge does not forget its
+      # issues/MRs when uzi restarts, and the MR-close phase reconciles against it.
+      FORGE_FAKE_STATE: /state/state.json
+    volumes:
+      - ${E2E_RUN_DIR}/certs:/certs:ro
+      # The bare repo served over git smart-HTTP (E2E_GIT_SMART_HTTP variant).
+      - ${E2E_RUN_DIR}/fakeremote:/gitroot
+      # Recorded issues/MRs, persisted across container recreate (see FORGE_FAKE_STATE).
+      - ${E2E_RUN_DIR}/forge-fake-state:/state
+    networks:
+      default:
+        aliases:
+          - forge-fake.e2e
+    # Publish the fake on a per-run loopback port so the harness drives the /_e2e
+    # mutators/introspection with plain curl (no `compose exec` per call).
+    ports:
+      - "127.0.0.1:${E2E_FAKE_PORT}:443"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('https').get({host:'127.0.0.1',port:443,path:'/_e2e/health',rejectUnauthorized:false},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      start_period: 3s
+      # PRD #97 M5: probe every 1s DURING start_period (Docker Engine >=25), so a
+      # container that is ready in ~1s is marked healthy at the next second instead of
+      # waiting for the first `interval` probe. Trims the first-probe floor off the two
+      # full-stack `up -d --wait db api web forge-fake` boots (overlay-only; base
+      # healthcheck cadence is untouched). See e2e/README.md.
+      start_interval: 1s
+
+  # Publish the SPA/nginx origin on a per-run high port so the harness never
+  # collides with the user's own `uzi` stack on 8080. `!override` replaces the
+  # base ports list (compose would otherwise append and keep 8080 bound).
+  web:
+    ports: !override
+      - "127.0.0.1:${E2E_WEB_PORT}:8080"
+
+  db:
+    # PRD #97 M5: merge start_interval into the base db healthcheck (pg_isready test etc.
+    # stay in docker-compose.yml). db is first in the `--wait` chain, so a 1s start probe
+    # shortens the whole boot (api depends_on db: service_healthy). Needs Engine >=25.
+    healthcheck:
+      start_interval: 1s
+
+  api:
+    # PRD #97 M5: merge start_interval into the base api healthcheck (test/interval/etc.
+    # come from docker-compose.yml). Probing every 1s during start_period lets api go
+    # healthy as soon as the db→api chain is up, cutting the first-probe floor off the two
+    # `up -d --wait db api web forge-fake` boots. Needs Docker Engine >=25. Overlay-only.
+    healthcheck:
+      start_interval: 1s
+    environment:
+      # Hermetic master key (a fixed dummy, base64 of "e2e-dummy-secret-key-not-real!!!").
+      # A literal here overrides the base's ${UZI_SECRET_KEY} for THIS container, so the
+      # stack no longer depends on the developer's shell (Compose ranks a shell-exported
+      # UZI_SECRET_KEY above --env-file — CLAUDE.md), matching how the seed vars below are
+      # pinned. Keeps the whole e2e sealing/opening under one known key. This file
+      # is a TEST harness, NOT a deployment template: never copy this literal into a
+      # real stack. (It is a weak but varied key — it only passes secretbox.LoadKey's
+      # low-entropy placeholder check; a real key is `openssl rand -base64 32`.)
+      UZI_SECRET_KEY: "ZTJlLWR1bW15LXNlY3JldC1rZXktbm90LXJlYWwhISE="  # gitleaks:allow (fixed dummy: base64 of "e2e-dummy-secret-key-not-real!!!", for the throwaway e2e stack only, never a real key -- see the note above)
+      # Trust forge-fake's self-signed cert (Go honors SSL_CERT_FILE; the api
+      # makes no other outbound TLS call in the E2E).
+      SSL_CERT_FILE: /certs/cert.pem
+      # Match the per-run published web port (base default is :8080).
+      FRONTEND_ORIGIN: http://127.0.0.1:${E2E_WEB_PORT}
+      # Give the restart-resilience step head-room to re-queue the orphaned run.
+      RUN_MAX_REQUEUES: "3"
+      # Heartbeat-stale window: no heartbeat past this ⇒ the worker goes offline and
+      # its non-terminal runs re-queue (the sweeper's worker-loss recovery). run-e2e.sh
+      # sets E2E_WORKER_HEARTBEAT_STALE=15s in the env-file from BOOT (was tightened
+      # mid-suite via a dedicated api recreate before #100), so the sweeper-driven
+      # requeue in the PRD #42 M5 mid-run-kill step is bounded with no extra recreate,
+      # still 3× the 5s heartbeat interval so a live worker is never spuriously swept.
+      WORKER_HEARTBEAT_STALE: ${E2E_WORKER_HEARTBEAT_STALE:-45s}
+      # Run-liveness sweep cadence (PRD #97 M6 / #100): shrunk from the shipped 15s
+      # default so stall/loop detection latency (threshold + one tick) and the #42
+      # worker-loss requeue are bounded by ~2s rather than ~15s. Product knob added in
+      # the same change; unset ⇒ the api's built-in 15s default.
+      SWEEP_INTERVAL: 2s
+      # Point the SSRF allowlist + the boot seed at the fake forge.
+      FORGE_ALLOWED_BASE_URLS: https://forge-fake.e2e
+      # Poll rarely by DEFAULT: the harness drives issues/runs directly, and a long
+      # interval keeps a reconcile pass from racing the run-lifecycle assertions.
+      # The MR-close phase (PRD #24) overrides this to ~2s via E2E_FORGE_POLL_INTERVAL
+      # and recreates the api, so the MR-state watcher actually ticks. Overlay-only;
+      # the production default (config.go) is untouched.
+      FORGE_POLL_INTERVAL: ${E2E_FORGE_POLL_INTERVAL:-24h}
+      # Chat idle backstop (PRD #39): the server-side not-trusting-the-worker sweep,
+      # set ABOVE the worker's own idle window (WORKER_CHAT_IDLE_TIMEOUT, agent below) so
+      # the WORKER completes an idle chat first and the backstop only fires if it never
+      # does. Seconds here (vs the 70m/60m prod defaults) so the e2e observes idle-completion
+      # without a minutes-long wait. The worker's idle window ITSELF is delivered in the
+      # claim config from the api's WORKER_CHAT_IDLE_TIMEOUT (chat.go -> ClaimConfig, which
+      # the ChatRunner prefers over the agent env), so it MUST be set here, short, for the
+      # worker to idle-complete before this server backstop. 20s -> 15s (#100) to shave the
+      # idle-completion wait while keeping a safe margin over realistic step latency. The
+      # chat scenario's own intermediate waits (the proposal-card poll,
+      # wait_msg_*/wait_tool_result) carry 20s GIVE-UP ceilings, not expected times — under
+      # the stub, turns settle sub-second — but a 10s idle window could still idle-complete
+      # the chat mid-scenario if one step legitimately took 10-20s under load, after which
+      # the next apipost against the completed chat fails. 15s clears the observed latency
+      # with headroom (M9 margin report: chat waits kept 19-20s of their 20s ceiling).
+      # CHAT_IDLE_TIMEOUT (90s) stays well above it so the worker still completes an idle
+      # chat before the server backstop fires.
+      WORKER_CHAT_IDLE_TIMEOUT: 15s
+      CHAT_IDLE_TIMEOUT: 90s
+      # Deterministic bootstrap (no registration race): seed the admin, the
+      # Anthropic token (dummy), and the forge connection + repo at boot. All
+      # dummy per the testing-credentials policy.
+      UZI_SEED_EMAIL: admin@uzi.e2e
+      UZI_SEED_PASSWORD: e2e-admin-password-000000
+      UZI_SEED_NAME: E2E Admin
+      UZI_SEED_ANTHROPIC_TOKEN: sk-ant-e2e-dummy-do-not-use-000000
+      UZI_SEED_FORGE_PAT: e2e-dummy-forge-pat-000000
+      UZI_SEED_FORGE_BASE_URL: https://forge-fake.e2e
+      UZI_SEED_FORGE_REPOS: group/repo
+      # PRD #53: disable the rate-limit poller. The isolated stack has no live
+      # Anthropic, and the client's base URL is a hardcoded const (no env knob, an
+      # SSRF-guard decision), so there is nothing to point at a fake — leaving the
+      # poller on would only fire pointless outbound calls with the dummy token.
+      # The harness seeds a gauge row directly (like the master-sealed row it stages
+      # for user2) and asserts the read endpoints; disabled ⇒ readings serve stale.
+      UZI_USAGE_POLL_INTERVAL: "0"
+      # PRD #111 M6: PIN the auto-selection freshness window instead of inheriting it.
+      #
+      # The shipped default is 3x UZI_USAGE_POLL_INTERVAL, and the line above disables
+      # the poller — so the default computes to ZERO here, nothing is ever fresh, and an
+      # `auto` worker can only ever fall back. That is correct behaviour (R2) and it is
+      # also why the HAPPY path cannot be driven in this stack without this line: the two
+      # cases are the same knob, so one stack cannot both have "the default is 0" and "a
+      # fresh reading is fresh".
+      #
+      # Pinning it lets the harness drive BOTH outcomes from synced_at, which exercises
+      # the freshness mechanism itself rather than a side effect of the poll interval. The
+      # default's arithmetic (interval 0 => staleness 0) is pinned exactly in config's own
+      # unit test, where an arithmetic default belongs.
+      #
+      # This is a deliberate exception to "the harness asserts the SHIPPED defaults", and
+      # it is the only autoselect knob overridden: MIN_HEADROOM, HEADROOM_TIE_PCT and
+      # INFLIGHT_PENALTY all stay at their shipped values so the phase ranks against the
+      # policy a real deployment gets.
+      UZI_AUTOSELECT_MAX_STALENESS: 10m
+    volumes:
+      - ${E2E_RUN_DIR}/certs:/certs:ro
+    depends_on:
+      forge-fake:
+        condition: service_healthy
+
+  agent:
+    environment:
+      # stub by default (no live session); the harness can flip this to `sdk` for
+      # the OPTIONAL user-gated live capstone (UZI_E2E_EXECUTOR=sdk — see README).
+      UZI_EXECUTOR: ${UZI_E2E_EXECUTOR:-stub}
+      # Drive the M4 plan gate from the stub (no live Anthropic session). The SDK
+      # executor ignores this flag, so it is harmless in `sdk` mode.
+      UZI_STUB_PLAN_GATE: "1"
+      # PRD #51 M5: the join token rides the SAME delivery as production — the base
+      # compose `worker_token` Docker secret at /run/secrets/worker_token (base sets
+      # UZI_WORKER_TOKEN_FILE there; no overlay override), sourced from UZI_WORKER_TOKEN
+      # which run-e2e.sh exports to the freshly-minted value before each `up`. This
+      # keeps BOTH structural properties the M6 /proc-hardening + M4 uid-split need,
+      # non-vacuously: (1) the token is delivered by FILE not env, so it is absent from
+      # every process's /proc/<pid>/environ; and (2) the entrypoint forces that secret
+      # to 0400 worker:worker (container-native tmpfs — reliable chown, unlike a
+      # Docker-Desktop bind mount), so the runner uid CANNOT read it — the real
+      # containment the boundary assertion exercises. It is RO and not-unlinked, exactly
+      # like prod (the earlier writable /worker-secret bind mount let the runner read the
+      # world-readable token and the worker unlink it, making the boundary vacuous).
+      HOME: /home/worker
+      # Trust forge-fake's cert for the worker's MR fetch (Node) and any git-over-
+      # https (git). The git remote is actually local (insteadOf below), so git
+      # never does TLS here — GIT_SSL_CAINFO is belt-and-suspenders.
+      NODE_EXTRA_CA_CERTS: /certs/cert.pem
+      GIT_SSL_CAINFO: /certs/cert.pem
+      # Rewrite the https clone/push URL the api hands out to the local bare repo
+      # standing in for GitLab's git server (a real remote the worker pushes to).
+      GIT_CONFIG_GLOBAL: /e2e-git/gitconfig
+      WORKER_HEARTBEAT_INTERVAL: 5s
+      # Fast claim pickup for the stub path (prod default 3s). This same interval
+      # drives the parked run's input poll (runner pollMs), so approve_plan pickup
+      # at the gate is also ~500ms instead of seconds — the suite runs ~19 full
+      # gate->approve->complete cycles, so this compounds.
+      WORKER_POLL_INTERVAL: 500ms
+      # RUN-lane concurrency cap (PRD #42). Default 1 = the pre-#42 serial loop, so
+      # every phase except the M5 bounded-concurrency scenario runs the worker
+      # exactly as before; that scenario sets UZI_E2E_MAX_CONCURRENT_RUNS=2 and
+      # recreates the agent to prove two runs execute concurrently.
+      WORKER_MAX_CONCURRENT_RUNS: ${UZI_E2E_MAX_CONCURRENT_RUNS:-1}
+      # Chat lane (PRD #39): fast turn pickup + a SHORT worker-driven idle window so the
+      # e2e sees idle-completion in seconds instead of the 60m default. This agent-side
+      # value is only the FALLBACK — the effective window is the api's claim-config
+      # WORKER_CHAT_IDLE_TIMEOUT (above), which the ChatRunner prefers — but keep the two
+      # in lockstep. 20s -> 15s (#100); still comfortably over realistic turn latency (the
+      # scenario's 20s intermediate waits are give-up ceilings, not expected times) so the
+      # chat can't idle out during a mid-scenario issue-run step (validated via the M9
+      # margin report: chat waits kept 19-20s headroom).
+      WORKER_CHAT_POLL_MS: "500"
+      WORKER_CHAT_IDLE_TIMEOUT: 15s
+    volumes:
+      - ${E2E_RUN_DIR}/certs:/certs:ro
+      - ${E2E_RUN_DIR}/agent-gitconfig:/e2e-git:ro
+      - ${E2E_RUN_DIR}/fakeremote:/fakeremote
+      # Stub `devbox` over the baked-in binary (PRD #18 M8 tool-provisioning
+      # scenario): the isolated stack has NO substituter egress, so a real
+      # `devbox install` is neither possible nor wanted. Only invoked when a run
+      # has tier-1 packages, so every other scenario is unaffected.
+      - ${E2E_RUN_DIR}/fake-devbox:/usr/local/bin/devbox:ro

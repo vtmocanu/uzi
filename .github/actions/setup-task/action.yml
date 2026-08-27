@@ -1,0 +1,42 @@
+name: Setup Task
+description: >-
+  Install the pinned go-task binary. Version and checksum are a single pinned
+  pair (bump both together). Mirrors the retired GitLab `.task_setup` exactly.
+
+runs:
+  using: composite
+  steps:
+    - name: Install go-task (pinned, sha256-verified)
+      shell: bash
+      run: |
+        set -euo pipefail
+        # go-task, the gate runner. 3.51.1 is the version PRD #103's Taskfile
+        # behaviour was measured on. TASK_VERSION is the v-prefixed git tag and
+        # TASK_SHA256 is the task_linux_amd64.tar.gz sha256; Renovate bumps BOTH
+        # together via the github-release-attachments datasource (the
+        # `# renovate-tarball:` marker below + the customManager in renovate.json),
+        # so a version-bump PR arrives with the sha already recomputed -- the sha is
+        # still the whole control on this fetch, just no longer hand-maintained.
+        # linux/amd64 is hardcoded: GitHub-hosted ubuntu runners are amd64. On a
+        # future arm64 runner this fails LOUDLY at `task --version`, which is the
+        # honest failure mode; adding arm64 needs a SECOND checksum literal.
+        # renovate-tarball: depName=go-task/task
+        TASK_VERSION="v3.53.1"
+        # Renovate keeps TASK_SHA256 in lockstep with TASK_VERSION (it resolves the
+        # new tag's task_linux_amd64.tar.gz sha256 from the release's checksums).
+        TASK_SHA256="a54a408f6861ff921f6e87774180db31bacd8c1e7c944ca696db9fea49a82fc7"
+        # Retry transient network failures (e.g. `curl: (35) Connection reset by
+        # peer` mid-download). --retry-all-errors (curl >= 7.71, ubuntu-latest has
+        # >= 7.81) covers connection resets that plain --retry does not; the sha256
+        # check below is unchanged, so resilience never weakens the integrity gate.
+        curl -fsSLo /tmp/task.tar.gz \
+          --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 15 \
+          "https://github.com/go-task/task/releases/download/${TASK_VERSION}/task_linux_amd64.tar.gz"
+        echo "${TASK_SHA256}  /tmp/task.tar.gz" | sha256sum -c -
+        mkdir -p "${HOME}/.task-bin"
+        tar -xzf /tmp/task.tar.gz -C "${HOME}/.task-bin" task
+        rm -f /tmp/task.tar.gz
+        echo "${HOME}/.task-bin" >> "${GITHUB_PATH}"
+        # Positive control: a step whose only evidence is the absence of an error
+        # cannot tell a working install from one that never ran.
+        "${HOME}/.task-bin/task" --version

@@ -1,0 +1,300 @@
+{
+  "bidi-description.md": {
+    "name": "bidi-description",
+    "ok": false,
+    "skip": "invalid"
+  },
+  "block-scalar-description.md": {
+    "name": "block-scalar-desc",
+    "ok": false,
+    "skip": "invalid"
+  },
+  "block-scalar-model.md": {
+    "description": "Model line opens a block scalar and is dropped.",
+    "model": "",
+    "name": "block-scalar-model",
+    "notes": [],
+    "ok": true,
+    "prompt_body": "body\n",
+    "tools": null
+  },
+  "body-cf-kept.md": {
+    "description": "Clean description.",
+    "model": "",
+    "name": "body-cf-kept",
+    "notes": [],
+    "ok": true,
+    "prompt_body": "before\u202eafter\n",
+    "tools": null
+  },
+  "bom-crlf.md": {
+    "description": "From Windows.",
+    "model": "",
+    "name": "bom-crlf",
+    "notes": [],
+    "ok": true,
+    "prompt_body": "body\n",
+    "tools": null
+  },
+  "canon-task.md": {
+    "description": "Canonicalizes Task to Agent.",
+    "model": "",
+    "name": "canon-task",
+    "notes": [
+      {
+        "name": "canon-task",
+        "reason": "tools_filtered",
+        "tools": [
+          "Task"
+        ]
+      }
+    ],
+    "ok": true,
+    "prompt_body": "body\n",
+    "tools": [
+      "Bash",
+      "Read"
+    ]
+  },
+  "column-zero-tools.md": {
+    "description": "Zero-indent block sequence tools.",
+    "model": "",
+    "name": "column-zero-tools",
+    "notes": [],
+    "ok": true,
+    "prompt_body": "body\n",
+    "tools": [
+      "Bash",
+      "Read"
+    ]
+  },
+  "control-description.md": {
+    "name": "control-description",
+    "ok": false,
+    "skip": "invalid"
+  },
+  "description-1024.md": {
+    "description": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "model": "",
+    "name": "description-1024",
+    "notes": [],
+    "ok": true,
+    "prompt_body": "body\n",
+    "tools": null
+  },
+  "empty-body.md": {
+    "name": "empty-body",
+    "ok": false,
+    "skip": "invalid"
+  },
+  "feff-body.md": {
+    "name": "feff-body",
+    "ok": false,
+    "skip": "invalid"
+  },
+  "inline-bracket-tools.md": {
+    "description": "Bracket inline tools.",
+    "model": "",
+    "name": "inline-bracket-tools",
+    "notes": [],
+    "ok": true,
+    "prompt_body": "body\n",
+    "tools": [
+      "Bash",
+      "Read"
+    ]
+  },
+  "inline-plain-tools.md": {
+    "description": "Plain inline tools.",
+    "model": "",
+    "name": "inline-plain-tools",
+    "notes": [],
+    "ok": true,
+    "prompt_body": "body\n",
+    "tools": [
+      "Bash",
+      "Read"
+    ]
+  },
+  "model-honored-full.md": {
+    "description": "Honors a full model id.",
+    "model": "claude-opus-4-8",
+    "name": "model-honored-full",
+    "notes": [],
+    "ok": true,
+    "prompt_body": "body\n",
+    "tools": null
+  },
+  "model-ignored.md": {
+    "description": "Model has interior whitespace.",
+    "model": "",
+    "name": "model-ignored",
+    "notes": [
+      {
+        "name": "model-ignored",
+        "reason": "model_ignored"
+      }
+    ],
+    "ok": true,
+    "prompt_body": "body\n",
+    "tools": null
+  },
+  "name-invalid.md": {
+    "name": "name-invalid",
+    "ok": false,
+    "skip": "invalid"
+  },
+  "oversized-description.md": {
+    "name": "oversized-description",
+    "ok": false,
+    "skip": "invalid"
+  },
+  "quote-stripping.md": {
+    "description": "Quoted description.",
+    "model": "",
+    "name": "quote-stripping",
+    "notes": [],
+    "ok": true,
+    "prompt_body": "body\n",
+    "tools": null
+  },
+  "slug-fallback.md": {
+    "description": "Falls back to the filename slug.",
+    "model": "",
+    "name": "slug-fallback",
+    "notes": [],
+    "ok": true,
+    "prompt_body": "Body here.\n",
+    "tools": null
+  },
+  "tool-token-too-long.md": {
+    "description": "Oversized tool token is dropped.",
+    "model": "",
+    "name": "tool-token-too-long",
+    "notes": [],
+    "ok": true,
+    "prompt_body": "body\n",
+    "tools": [
+      "Bash",
+      "Read"
+    ]
+  },
+  "tools-all-denied.md": {
+    "name": "tools-all-denied",
+    "ok": false,
+    "skip": "tools_all_denied"
+  },
+  "tools-malformed-token.md": {
+    "description": "Malformed tool token is dropped.",
+    "model": "",
+    "name": "tools-malformed-token",
+    "notes": [],
+    "ok": true,
+    "prompt_body": "body\n",
+    "tools": [
+      "Bash",
+      "Read"
+    ]
+  },
+  "tools-over-limit.md": {
+    "description": "Only the first 64 tools are considered.",
+    "model": "",
+    "name": "tools-over-limit",
+    "notes": [],
+    "ok": true,
+    "prompt_body": "body\n",
+    "tools": [
+      "Tool01",
+      "Tool02",
+      "Tool03",
+      "Tool04",
+      "Tool05",
+      "Tool06",
+      "Tool07",
+      "Tool08",
+      "Tool09",
+      "Tool10",
+      "Tool11",
+      "Tool12",
+      "Tool13",
+      "Tool14",
+      "Tool15",
+      "Tool16",
+      "Tool17",
+      "Tool18",
+      "Tool19",
+      "Tool20",
+      "Tool21",
+      "Tool22",
+      "Tool23",
+      "Tool24",
+      "Tool25",
+      "Tool26",
+      "Tool27",
+      "Tool28",
+      "Tool29",
+      "Tool30",
+      "Tool31",
+      "Tool32",
+      "Tool33",
+      "Tool34",
+      "Tool35",
+      "Tool36",
+      "Tool37",
+      "Tool38",
+      "Tool39",
+      "Tool40",
+      "Tool41",
+      "Tool42",
+      "Tool43",
+      "Tool44",
+      "Tool45",
+      "Tool46",
+      "Tool47",
+      "Tool48",
+      "Tool49",
+      "Tool50",
+      "Tool51",
+      "Tool52",
+      "Tool53",
+      "Tool54",
+      "Tool55",
+      "Tool56",
+      "Tool57",
+      "Tool58",
+      "Tool59",
+      "Tool60",
+      "Tool61",
+      "Tool62",
+      "Tool63",
+      "Tool64"
+    ]
+  },
+  "trailing-feff-desc.md": {
+    "description": "Clean description.",
+    "model": "",
+    "name": "trailing-feff-desc",
+    "notes": [],
+    "ok": true,
+    "prompt_body": "body\n",
+    "tools": null
+  },
+  "unknown-keys.md": {
+    "description": "Has unknown keys.",
+    "model": "",
+    "name": "unknown-keys",
+    "notes": [],
+    "ok": true,
+    "prompt_body": "body\n",
+    "tools": null
+  },
+  "valid-minimal.md": {
+    "description": "A minimal valid role.",
+    "model": "",
+    "name": "valid-minimal",
+    "notes": [],
+    "ok": true,
+    "prompt_body": "Do the thing.\n",
+    "tools": null
+  }
+}

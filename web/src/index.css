@@ -1,0 +1,336 @@
+@import "tailwindcss";
+
+/* The semantic design tokens (colors routed through CSS variables with the
+   rgb(var(--x) / <alpha-value>) pattern, the derived radius scale and the font
+   families) live in tailwind.config.js. v4 no longer auto-discovers a JS config,
+   so it is loaded explicitly here; the config's `content` globs drive class
+   detection. */
+@config "../tailwind.config.js";
+
+/* Semantic design tokens: every color lives behind a CSS variable, with color
+   channels as space-separated RGB so Tailwind opacity modifiers work.
+   Components carry
+   STRUCTURE only; all look-and-feel lives here, so an alternative redesign can
+   ship as a second `[data-theme="…"]` block overriding these variables over
+   the same component tree. This default theme is "ember": uzi is deliberately
+   dark-only — a dark factory — with molten-metal orange against near-black
+   steel. The `:not([data-theme])` guard means a set data-theme (e.g. mission)
+   fully replaces this block instead of racing it on source order. */
+:root:not([data-theme]),
+[data-theme="ember"] {
+  color-scheme: dark;
+
+  /* Palette */
+  --bg: 8 10 15;
+  --surface: 15 18 26;
+  --raised: 23 27 38;
+  --edge: 39 45 60;
+  --edge-strong: 58 66 86;
+  --fg: 228 232 240;
+  --muted: 148 158 176;
+  /* #7A859A, ~5.0:1 on the ember bg-surface card (PRD #54, Decision 5): app-wide
+     de-emphasised text (text-faint) must clear WCAG AA 4.5:1. Stays visibly
+     fainter than --muted (#949EB0, ~6.9:1). Also backs --syn-comment below. */
+  --faint: 122 133 154;
+  --brand: 251 146 60;
+  --brand-hover: 253 186 116;
+  --on-brand: 26 16 8;
+
+  /* Keyboard focus ring: brand-tinted so it reads as on-theme and stays
+     high-contrast against the near-black surfaces. */
+  --ring: var(--brand);
+
+  /* Status colors */
+  --ok: 52 211 153;
+  --warn: 251 191 36;
+  --danger: 251 113 133;
+  --info: 56 189 248;
+  /* issue #321: planning-phase badge, indigo-400 — a bright status tone like the sky
+     --info / emerald --ok siblings so text-plan clears WCAG AA on the near-black card
+     (~6.3:1; the darker indigo-600 first tried here measured only ~3:1), while staying a
+     distinct hue from sky --info and the gray --queue triple. */
+  --plan: 129 140 248;
+
+  /* Queue + idle/stopped status tones. Unlike the four tinted tones above
+     (a single hue at low opacity for border/bg/text), these reproduce ember's
+     solid neutral pill — border/surface/fg mapped onto edge/raised/muted, so
+     the queued and stopped badges stay pixel-identical to before. Split out as
+     their own slots (which a hardcoded neutral could not be) so a theme
+     (mission) can recolor just these pills — violet queue — with no component
+     branching. */
+  --queue-fg: var(--muted);
+  --queue-border: var(--edge);
+  --queue-surface: var(--raised);
+  --neutral-fg: var(--muted);
+  --neutral-border: var(--edge);
+  --neutral-surface: var(--raised);
+
+  /* Shell syntax highlighting (PRD #38). Each --syn-* aliases a palette/status
+     token, so a theme recolours the tool-command and prose code surfaces for
+     free — same aliasing approach as the --queue-* tokens above. --tool-rail is
+     the indent border under a run of tool events. */
+  --syn-cmd: var(--brand);
+  --syn-flag: var(--info);
+  --syn-str: var(--ok);
+  --syn-op: var(--brand-hover);
+  --syn-comment: var(--faint);
+  --syn-arg: var(--fg);
+  --tool-rail: var(--edge);
+
+  /* Radii: one base value, everything derived. */
+  --radius: 0.625rem;
+
+  /* Typography */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* Backdrop grid: ember has none. The body rule consumes these tokens; a theme
+     (mission) supplies a blueprint grid without touching any component. */
+  --grid-image: none;
+  --grid-size: auto;
+}
+
+/* ── Mission-control theme ─────────────────────────────────────────────────
+   The ops-console identity ported from the `prototype/mission-control` branch
+   (PRD #21): near-black ink, a faint cyan blueprint grid, a six-tone status
+   language with a violet queue, sharpened 0.25rem corners, cyan accent.
+   Mission's *values* mapped onto ember's existing slots — same component tree,
+   no per-theme component logic. This is a full token set: the base block above
+   does NOT apply once data-theme is set, so every token the app reads is
+   redefined here. */
+[data-theme="mission"] {
+  color-scheme: dark;
+
+  /* Palette: near-black ink, layered panels, hairline slate borders, cyan accent */
+  --bg: 5 8 15;
+  --surface: 11 17 32;
+  --raised: 16 26 48;
+  --edge: 28 42 69;
+  --edge-strong: 71 85 105;
+  --fg: 241 245 249;
+  --muted: 148 163 184;
+  /* #74849B, ~4.95:1 on the mission bg-surface rgb(11,17,32) (PRD #54, Decision
+     5): slate-500 (#64748B) was sub-AA (~3.96:1). A lightened slate between
+     slate-500 and slate-400 that keeps the ramp's blue bias (b−r=39), NOT the
+     ember grey. Also backs --syn-comment below. */
+  --faint: 116 132 155;
+  --brand: 34 211 238;
+  --brand-hover: 103 232 249;
+  --on-brand: 2 6 23;
+
+  --ring: var(--brand);
+
+  /* Status colors. Mission's cyan run and sky info both collapse onto --info
+     (Decision 3); danger is mission's rose-500. */
+  --ok: 52 211 153;
+  --warn: 251 191 36;
+  --danger: 244 63 94;
+  --info: 34 211 238;
+  --plan: 129 140 248;
+
+  /* The signature violet queue and a lighter slate idle/stopped. */
+  --queue-fg: 196 181 253;
+  --queue-border: 91 33 182;
+  --queue-surface: 46 16 101;
+  --neutral-fg: 203 213 225;
+  --neutral-border: 51 65 85;
+  --neutral-surface: 30 41 59;
+
+  /* Shell syntax highlighting (PRD #38) — mission's palette via the same aliases
+     as the ember block, EXCEPT --syn-flag/--syn-op: mission's --info and
+     --brand-hover both collapse onto the cyan --brand, which would make command,
+     flag, and operator render as one indistinct cyan. Re-point flags to amber
+     (--warn) and operators to slate (--muted) so the three stay legible. Ember,
+     whose --info/--brand-hover are already distinct hues, keeps the plain aliases. */
+  --syn-cmd: var(--brand);
+  --syn-flag: var(--warn);
+  --syn-str: var(--ok);
+  --syn-op: var(--muted);
+  --syn-comment: var(--faint);
+  --syn-arg: var(--fg);
+  --tool-rail: var(--edge);
+
+  /* Sharper corners (every radius derives from this one value). */
+  --radius: 0.25rem;
+
+  /* Typography */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+
+  /* Faint blueprint grid, drawn by the body rule; reads as "console" while
+     staying far below content contrast. */
+  --grid-line: rgb(var(--brand) / 0.025);
+  --grid-image:
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  --grid-size: 36px 36px;
+}
+
+body {
+  @apply bg-ink text-fg antialiased;
+  font-family: var(--font-sans);
+  /* Theme-supplied backdrop grid (none for ember); mission draws a blueprint. */
+  background-image: var(--grid-image, none);
+  background-size: var(--grid-size, auto);
+}
+
+/* Thin, unobtrusive scrollbars for the activity feed / board overflow areas. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(var(--edge)) transparent;
+}
+
+/* One themed keyboard-focus ring for every interactive surface (nav items,
+   cards-as-links, buttons, inputs), replacing the default UA outline. Scoped to
+   :focus-visible so it appears for keyboard/AT users, not on mouse click. */
+@layer base {
+  a:focus-visible,
+  button:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible,
+  [tabindex]:not([tabindex="-1"]):focus-visible {
+    @apply outline-hidden ring-2 ring-ring ring-offset-2 ring-offset-ink;
+  }
+}
+
+/* Preflight compatibility (Tailwind v4): v4's reset follows the browser and sets
+   `cursor: default` on buttons, where v3's reset set `cursor: pointer`. Restore
+   the pointer on enabled buttons and role=button elements so every clickable in
+   the app keeps the affordance it had under v3. */
+@layer base {
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+}
+
+/* Respect prefers-reduced-motion (PRD #38 M4): neutralize the two Tailwind
+   keyframe utilities the run feed animates — the running-tool spinner
+   (animate-spin) and the active-agent pulsing dot (animate-pulse). This block is
+   deliberately UNLAYERED (kept out of any @layer). Tailwind v4 emits its
+   utilities inside the native `utilities` cascade layer, and an unlayered rule
+   always wins over any layered rule regardless of source order — so these
+   overrides beat the animate-* utilities. Keeping it out of `@layer base` also
+   matters: base sorts below utilities, so a base rule would lose to them. */
+@media (prefers-reduced-motion: reduce) {
+  .animate-spin,
+  .animate-pulse,
+  .forge-flash {
+    animation: none;
+  }
+}
+
+/* Auto-change highlight for the connect-form base-URL ⇄ forge-type sync
+   (PRD #337 D9): when a sync handler moves the *other* field, this brief tint
+   flash makes the coupling legible. Purely cosmetic and cleared on animationend
+   (no setTimeout); neutralized under prefers-reduced-motion above. */
+@keyframes forge-flash {
+  from {
+    background-color: rgb(var(--ring) / 0.25);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+.forge-flash {
+  animation: forge-flash 0.6s ease-out;
+  border-radius: 0.5rem;
+}
+
+/* Typography for rendered docs markdown (DocMarkdown). Hand-rolled prose rules
+   consistent with the dark theme — the @tailwindcss/typography plugin is not a
+   dependency. Interactive/asset elements (a, img, table) are handled in
+   DocMarkdown; everything else is styled here. */
+.docs-prose {
+  @apply max-w-none text-muted;
+}
+.docs-prose > :first-child {
+  @apply mt-0;
+}
+.docs-prose h1 {
+  @apply mb-4 mt-8 text-3xl font-bold tracking-tight text-fg;
+}
+.docs-prose h2 {
+  @apply mb-3 mt-8 border-b border-edge pb-1.5 text-xl font-semibold text-fg;
+}
+.docs-prose h3 {
+  @apply mb-2 mt-6 text-lg font-semibold text-fg;
+}
+.docs-prose h4 {
+  @apply mb-2 mt-4 text-base font-semibold text-fg;
+}
+.docs-prose p {
+  @apply my-4 leading-7;
+}
+.docs-prose a {
+  @apply text-brand underline underline-offset-2 hover:text-brand-hover;
+}
+.docs-prose strong {
+  @apply font-semibold text-fg;
+}
+.docs-prose ul {
+  @apply my-4 list-disc space-y-1.5 pl-6;
+}
+.docs-prose ol {
+  @apply my-4 list-decimal space-y-1.5 pl-6;
+}
+.docs-prose li {
+  @apply leading-7;
+}
+.docs-prose li > ul,
+.docs-prose li > ol {
+  @apply my-1.5;
+}
+.docs-prose blockquote {
+  @apply my-4 border-l-2 border-edge-strong pl-4 italic text-muted;
+}
+.docs-prose hr {
+  @apply my-8 border-edge;
+}
+.docs-prose code {
+  @apply rounded bg-raised px-1.5 py-0.5 text-[0.85em] text-fg;
+}
+.docs-prose pre {
+  @apply my-4 overflow-x-auto rounded-lg border border-edge bg-ink p-4 text-sm leading-6;
+}
+.docs-prose pre code {
+  @apply bg-transparent p-0 text-fg;
+}
+.docs-prose img {
+  @apply my-4 max-w-full rounded-lg border border-edge;
+}
+.docs-prose table {
+  @apply my-0 w-full border-collapse text-sm;
+}
+.docs-prose thead {
+  @apply bg-raised;
+}
+.docs-prose th,
+.docs-prose td {
+  @apply border border-edge px-3 py-2 text-left align-top;
+}
+.docs-prose th {
+  @apply font-semibold text-fg;
+}
+
+/* Scoped wrapper for UNTRUSTED model markdown rendered through the shared <Markdown>
+   (.docs-prose) inside a compact card — the judge panel's summary_md / rationale_md and
+   the run-summary card's intent / plan (issue #423) both use it. Two jobs: (1) give the
+   card a text-sm base .docs-prose lacks, and (2) defend the compact card against an
+   untrusted heading — .docs-prose h1/h2 render at text-3xl / bordered text-xl, which would
+   blow out the card. Placed AFTER the whole .docs-prose rule set: the heading override uses
+   :is(...) so it matches .docs-prose h1 at the same specificity (0,1,1) and wins by source
+   order. Do not edit .docs-prose. */
+.judge-prose {
+  @apply text-sm;
+}
+.judge-prose > :first-child {
+  @apply mt-0;
+}
+.judge-prose :is(h1, h2, h3, h4) {
+  @apply my-2 border-0 pb-0 text-base font-semibold text-fg;
+}
+.judge-prose p {
+  @apply my-2 leading-6;
+}

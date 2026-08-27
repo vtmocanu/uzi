@@ -1,0 +1,72 @@
+{{- if .Values.imageVerification.enabled }}
+{{- /*
+  Kyverno ClusterPolicy: admit a uzi image only if it carries a valid cosign keyless
+  signature produced by uzi's release workflow (release.yml signs every image + the
+  chart by digest via GitHub OIDC). OFF by default (imageVerification.enabled) and
+  gated exactly like workers.enabled — this file renders NOTHING unless enabled.
+
+  PREREQUISITE: `kyverno.io/v1` is a Kyverno CRD, so KYVERNO MUST ALREADY BE INSTALLED.
+  With it absent the kind is unknown and `helm install`/ArgoCD sync FAILS on this
+  object — it is not a no-op. This chart does not bundle Kyverno on purpose.
+
+  Audit vs Enforce (imageVerification.enforce -> validationFailureAction): Audit logs a
+  policy report and admits the pod; Enforce blocks admission of an unsigned/unverified
+  image. START IN Audit and flip to Enforce only after confirming every uzi image
+  verifies — enforcing before the signatures exist, or with a wrong identity/issuer,
+  blocks the very pods this chart deploys.
+
+  SCOPING is by imageReferences, not by namespace: only images matching
+  imageVerification.imageGlob (uzi's own namespace by default) are checked. A pod
+  pulling postgres, the CNPG operator, the DinD sidecar, or Kyverno itself does NOT
+  match the glob and is admitted untouched — `required: true` requires a signature only
+  for images that DO match. So this policy can be cluster-wide without touching
+  third-party workloads.
+
+  mutateDigest/verifyDigest are BOTH false: uzi's own workloads reference images by tag
+  (the app tier by Chart.appVersion under Model B; hosted workers by the independently
+  pinned workers.image.tag since PRD #422 — either way a tag, not a digest), so
+  requiring a digest reference (verifyDigest) would
+  reject them, and rewriting the tag to a digest at admission (mutateDigest) would fight
+  ArgoCD's desired state. We verify the signature and leave the reference as-is. Flip
+  mutateDigest on (matching Pods, so the Deployment ArgoCD manages is untouched) if you
+  later want tag->digest immutability.
+*/}}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: {{ include "uzi.fullname" . }}-verify-images
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+spec:
+  # Audit (log only) | Enforce (block admission). Sourced from values; defaults to Audit.
+  validationFailureAction: {{ .Values.imageVerification.enforce }}
+  # Image verification is evaluated at admission against the live registry, not in
+  # background policy scans.
+  background: false
+  # Signature lookups hit the registry + Rekor; give the webhook room over the default.
+  webhookTimeoutSeconds: 30
+  rules:
+    - name: verify-uzi-image-signatures
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      verifyImages:
+        - imageReferences:
+            - {{ .Values.imageVerification.imageGlob | quote }}
+          # Require a valid signature for every matching image; do not rewrite or
+          # require digest references (uzi refs by tag — see header).
+          required: true
+          mutateDigest: false
+          verifyDigest: false
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    # WHO signed (the release workflow) and via WHICH OIDC issuer.
+                    subjectRegExp: {{ .Values.imageVerification.keyless.identityRegexp | quote }}
+                    issuer: {{ .Values.imageVerification.keyless.issuer | quote }}
+                    rekor:
+                      url: https://rekor.sigstore.dev
+{{- end }}

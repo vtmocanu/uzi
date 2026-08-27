@@ -1,0 +1,29 @@
+{
+  "name": "uzi-agent",
+  "version": "0.1.0-m4",
+  "private": true,
+  "type": "module",
+  "description": "uzi worker: outbound-only agent runtime that claims runs, works in an isolated git worktree, and reports back to the uzi API.",
+  "main": "src/main.ts",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "lint": "oxlint --config .oxlintrc.json -D correctness --report-unused-disable-directives-severity=error src test",
+    "knip": "knip",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test --test-timeout=120000 test/*.test.ts",
+    "deps-check": "npm ls --depth=0",
+    "audit": "npm audit --audit-level=high --include=dev"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.235",
+    "agent-browser": "0.34.0",
+    "tsx": "^4.19.2",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "knip": "6.32.2",
+    "oxlint": "1.78.0",
+    "typescript": "^7.0.0"
+  }
+}

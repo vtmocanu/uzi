@@ -1,0 +1,134 @@
+import { useState } from "react";
+import { api, ApiError, isHttpsUrl, type CreatedIssue, type IssueProposal, type ProposalStatus } from "../lib/api";
+import { Badge, Button } from "./ui";
+import { ExternalLinkIcon, FileTextIcon } from "./icons";
+import { stripUnsafeChars } from "../lib/safeText";
+
+// ProposalCard renders a chat agent's issue draft (PRD #39 Decision 8) as a
+// human-gated card. The load-bearing rule: title/description/labels come from the
+// immutable `proposal` run-message payload and are MODEL-authored + untrusted, so
+// they render as plain INERT JSX text — never through Markdown — and no
+// model-supplied link is ever clickable (the same rule PRD #37 applies to
+// repo-agent descriptions). The card holds no forge tool; the write happens only
+// on the human's Create click, and the resulting issue link comes from the confirm
+// response (CreatedIssue), not from any model text.
+export function ProposalCard({ chatId, proposal }: { chatId: string; proposal: IssueProposal }) {
+  // The payload's status is the initial state; Create/Dismiss resolve it locally
+  // (the run-message payload itself is immutable, and dismiss returns 204 no body).
+  const [status, setStatus] = useState<ProposalStatus>(proposal.status);
+  const [issue, setIssue] = useState<CreatedIssue | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const confirm = async () => {
+    setErr("");
+    setBusy(true);
+    try {
+      const { issue } = await api.confirmProposal(chatId, proposal.id);
+      setIssue(issue);
+      setStatus("confirmed");
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : "Action failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const dismiss = async () => {
+    setErr("");
+    setBusy(true);
+    try {
+      await api.dismissProposal(chatId, proposal.id); // 204, no body
+      setStatus("dismissed");
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : "Action failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="overflow-hidden rounded-xl border border-brand/40 bg-brand/[0.06]">
+      <div className="flex items-center justify-between gap-2 border-b border-brand/20 bg-brand/10 px-3 py-2">
+        <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-brand">
+          <span aria-hidden="true">
+            <FileTextIcon />
+          </span>
+          Proposed issue
+        </span>
+        <ProposalStatusBadge status={status} />
+      </div>
+
+      <div className="space-y-3 px-3 py-3">
+        {/* Every field below is inert model text: rendered as escaped JSX, never
+            Markdown, so a link in the title/description is not clickable — and passed
+            through stripUnsafeChars first, because escaping does not touch a bidi
+            override (issue #124). Display only: confirm/dismiss post `proposal.id`,
+            never these strings, so the raw values still round-trip. */}
+        <div className="space-y-1">
+          {proposal.repo_path && (
+            <p className="font-mono text-[11px] text-faint">{stripUnsafeChars(proposal.repo_path)}</p>
+          )}
+          <p className="text-sm font-semibold text-fg">{stripUnsafeChars(proposal.title)}</p>
+        </div>
+        {proposal.description && (
+          <p className="whitespace-pre-wrap break-words text-sm text-muted">
+            {stripUnsafeChars(proposal.description)}
+          </p>
+        )}
+        {proposal.labels.length > 0 && (
+          <div className="flex flex-wrap gap-1">
+            {proposal.labels.map((l) => (
+              <Badge key={l} tone="neutral">
+                {l}
+              </Badge>
+            ))}
+          </div>
+        )}
+
+        {err && <p className="text-xs text-danger">{err}</p>}
+
+        {status === "pending" && (
+          <div className="flex flex-wrap gap-2 pt-0.5">
+            <Button size="sm" disabled={busy} onClick={confirm}>
+              Create issue
+            </Button>
+            <Button size="sm" variant="secondary" disabled={busy} onClick={dismiss}>
+              Dismiss
+            </Button>
+          </div>
+        )}
+
+        {status === "confirmed" && (
+          <div className="rounded-lg border border-ok/40 bg-ok/10 px-3 py-2 text-sm text-ok">
+            <span className="font-medium">Issue created.</span>{" "}
+            {/* The link is app-rendered from the confirm response, not model text,
+                and only turned into an anchor when it is a real https URL. */}
+            {issue && isHttpsUrl(issue.web_url) ? (
+              <a
+                href={issue.web_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1 font-medium underline underline-offset-2 hover:text-ok"
+              >
+                #{issue.iid} <ExternalLinkIcon />
+              </a>
+            ) : (
+              issue && <span className="font-medium">#{issue.iid}</span>
+            )}
+          </div>
+        )}
+
+        {status === "dismissed" && (
+          <p className="text-sm text-faint">Dismissed. Nothing was written to the forge.</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ProposalStatusBadge({ status }: { status: ProposalStatus }) {
+  if (status === "confirmed") return <Badge tone="ok">created</Badge>;
+  if (status === "dismissed") return <Badge tone="neutral">dismissed</Badge>;
+  return <Badge tone="brand">needs your review</Badge>;
+}

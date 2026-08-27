@@ -1,0 +1,63 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits",
+    ":dependencyDashboard",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "labels": ["dependencies", "renovate"],
+  "postUpdateOptions": ["gomodTidy"],
+  "prHourlyLimit": 5,
+  "minimumReleaseAge": "7 days",
+  "internalChecksFilter": "strict",
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "uzi CI tool pins carrying a `# renovate: datasource=.. depName=..` annotation on the line directly above the version literal, for pins WITHOUT a companion sha256 (currently zizmor in ci.yml). config:recommended already tracks go.mod / package-lock / Dockerfile FROM / GHA uses:; this covers versions pinned inline in shell that no built-in manager sees, VERSION only. Pins that DO have a companion sha256 (go-task, sqlc, actionlint) use the `# renovate-tarball:` marker + the github-release-attachments manager below instead, so their sha bumps in lockstep -- do NOT give a sha-carrying pin the `datasource=` marker or both managers would match it.",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/[^/]+\\.ya?ml$/",
+        "/^\\.github/actions/[^/]+/action\\.ya?ml$/",
+        "/^scripts/[^/]+\\.sh$/",
+        "/(^|/)Taskfile\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "#\\s*renovate:\\s*datasource=(?<datasource>\\S+)\\s+depName=(?<depName>\\S+)(?:\\s+packageName=(?<packageName>\\S+))?(?:\\s+versioning=(?<versioning>\\S+))?(?:\\s+extractVersion=(?<extractVersion>\\S+))?[^\\n]*\\n[^\\n]*?(?<currentValue>\\d+\\.\\d+\\.\\d+[0-9A-Za-z._-]*)"
+      ],
+      "datasourceTemplate": "{{{datasource}}}",
+      "depNameTemplate": "{{{depName}}}",
+      "packageNameTemplate": "{{#if packageName}}{{{packageName}}}{{else}}{{{depName}}}{{/if}}",
+      "versioningTemplate": "{{#if versioning}}{{{versioning}}}{{else}}semver{{/if}}",
+      "extractVersionTemplate": "{{#if extractVersion}}{{{extractVersion}}}{{else}}^v?(?<version>.+)${{/if}}"
+    },
+    {
+      "customType": "regex",
+      "description": "uzi CI tool pins that curl a GitHub release tarball and `sha256sum -c` it (go-task in .github/actions/setup-task, sqlc + actionlint in ci.yml). The github-release-attachments datasource makes Renovate bump the VERSION and the companion sha256 together in one PR -- it resolves the tarball's sha256 for the new tag from the release's checksums asset, or by hashing it. The *_VERSION literal MUST be the v-prefixed git tag: getDigest fetches releases/tags/<value> verbatim, and the shell strips the leading v (${VAR#v}) where the asset filename is versionless. Marked `# renovate-tarball:` so the version-only generic manager above does NOT also match these. Linter/codegen pins (sqlc drift, actionlint findings) still arrive red-with-work by design; only go-task arrives green.",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/[^/]+\\.ya?ml$/",
+        "/^\\.github/actions/[^/]+/action\\.ya?ml$/",
+        "/^scripts/[^/]+\\.sh$/",
+        "/(^|/)Taskfile\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "#\\s*renovate-tarball:\\s*depName=(?<depName>\\S+)(?:\\s+versioning=(?<versioning>\\S+))?[^\\n]*\\n[\\s\\S]*?_VERSION=\"(?<currentValue>v[0-9][^\"]*)\"[\\s\\S]*?_SHA256=\"(?<currentDigest>[0-9a-f]{64})\""
+      ],
+      "datasourceTemplate": "github-release-attachments",
+      "depNameTemplate": "{{{depName}}}",
+      "versioningTemplate": "{{#if versioning}}{{{versioning}}}{{else}}semver{{/if}}"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "workers.image.repository is a PREFIX (controller appends /agent-<template>), not a resolvable image; and the worker tag is operator-advanced/decoupled from appVersion (PRD #422 Decision 1/3), so it must not be Renovate-tracked.",
+      "matchFileNames": ["deploy/chart/values.yaml"],
+      "matchPackageNames": ["ghcr.io/vtmocanu/uzi"],
+      "enabled": false
+    },
+    {
+      "description": "shellcheck is pinned in two managers (ci.yml tarball+sha via github-release-attachments; Taskfile lint:shell arg via github-releases). Group so a bump moves both in lockstep in one PR.",
+      "matchDepNames": ["koalaman/shellcheck"],
+      "groupName": "shellcheck"
+    }
+  ]
+}

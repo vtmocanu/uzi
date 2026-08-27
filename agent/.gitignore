@@ -1,0 +1,5 @@
+# No trailing slash: see the note in the repo-root .gitignore. This directory is
+# the one CLAUDE.md most often tells you to symlink instead of `npm ci`-ing.
+node_modules
+dist/
+*.log

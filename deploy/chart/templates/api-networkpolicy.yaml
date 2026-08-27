@@ -1,0 +1,106 @@
+{{- if and .Values.api.enabled .Values.api.networkPolicy.enabled }}
+# Default-deny ingress on the api pods: the only allowed source is the web pods
+# (the same-origin reverse proxy) on 8080. LOAD-BEARING on a shared cluster
+# (dev-cluster): without it any pod could reach the api ClusterIP directly, bypass
+# web nginx, and spoof X-Forwarded-For to defeat the per-IP auth rate limit /
+# (api trusts XFF from TRUSTED_PROXIES CIDRs; the rate limiter is the whole impact —
+# uzi persists no client IP, so there are no "audit IPs" to forge, despite what this
+# comment used to say). Egress is left
+# unrestricted (the api dials the DB, forge, OIDC, Slack) — only Ingress is policed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "uzi.fullname" . }}-api
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "uzi.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  policyTypes:
+    - Ingress
+  ingress:
+    # web pods (same namespace) -> api:8080.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "uzi.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: web
+      ports:
+        - protocol: TCP
+          port: 8080
+    {{- with .Values.api.networkPolicy.probeCIDRs }}
+    # kubelet health probes come from the node IP (host network) which no
+    # podSelector can match; allow the node CIDR(s) on 8080 so probes aren't
+    # dropped by the default-deny (see values.yaml api.networkPolicy.probeCIDRs).
+    - from:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 8080
+    {{- end }}
+    {{- if .Values.workers.enabled }}
+    # --- PRD #58 Decision 5(a): the hosted-worker clients ----------------------
+    #
+    # TWO rules, not one. Decision 5(a) names only the worker namespace, and taken
+    # literally it would ship a controller that CANNOT WORK: the controller runs in
+    # THIS namespace and polls the api, so the default-deny above drops every poll.
+    # Nothing has caught it because the chart shipped no controller until now. The
+    # PRD is corrected in the same commit as this fix.
+    #
+    # Both dial the port uzi.workerAPIPort selects — the TLS listener once
+    # api.tls.enabled is on, since a claim response carries the user's decrypted
+    # forge PAT and Anthropic token and the cluster is shared, running
+    # arbitrary dev pods. Neither is admitted to any other port.
+
+    # 1. The controller (this namespace) -> api. It polls for desired state.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "uzi.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: controller
+      ports:
+        - protocol: TCP
+          port: {{ include "uzi.workerAPIPort" . }}
+
+    # 2. Hosted worker pods (the worker namespace) -> api. They register, claim,
+    #    heartbeat. Matched by namespace AND pod label: both selectors in ONE `from`
+    #    entry, which is an AND — a separate entry would be an OR and would admit
+    #    every pod in that namespace, plus this pod label in every namespace.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.workers.namespace }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: uzi-hosted-worker
+      ports:
+        - protocol: TCP
+          port: {{ include "uzi.workerAPIPort" . }}
+
+    {{- if .Values.workers.docker.enabled }}
+    # 3. Docker-tier hosted worker pods (the SEPARATE docker worker namespace) -> api.
+    #    Same AND-scoping as rule 2 (namespace + pod label in ONE `from`). PRD #83 gave
+    #    the docker tier its own namespace but never extended this ingress, so a docker
+    #    worker's register/claim/heartbeat was silently dropped by the api's default-deny
+    #    — surfaced only once 0.8.1 fixed the dind crash that had kept workers from ever
+    #    reaching the register step. The pod label (uzi-hosted-worker) is identical across
+    #    tiers; only the namespace differs.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.workers.docker.namespace }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: uzi-hosted-worker
+      ports:
+        - protocol: TCP
+          port: {{ include "uzi.workerAPIPort" . }}
+    {{- end }}
+    {{- end }}
+{{- end }}

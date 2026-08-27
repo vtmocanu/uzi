@@ -1,0 +1,39 @@
+apiVersion: v2
+name: uzi
+description: uzi (Uzinele Întunecate) — AI dark factory. web (SPA + reverse proxy) + api (Go) + CloudNativePG, for Kubernetes.
+type: application
+# Release coupling (Model B): version == appVersion == the release git tag. A tag
+# pipeline publishes the images (api/web:<tag>) AND this chart
+# (oci://ghcr.io/vtmocanu/uzi/uzi:<version>); ArgoCD deploys that
+# version. api.image.tag / web.image.tag are left unset in values so the pod image
+# follows appVersion. Bump both per release; the cluster's ArgoCD auto-tracks the chart
+# (targetRevision `0.*`), so no per-release argo bump there (see deploy/README.md).
+version: 0.65.1
+appVersion: "0.65.1"
+
+# Umbrella chart (same umbrella-chart pattern): the CloudNativePG upstream `cluster`
+# chart ships as a subchart (aliased `postgres`) so one release brings up the api,
+# the web SPA, and the Postgres cluster in one namespace. CI bundles the subchart
+# into the published OCI artifact (`helm dependency build` at package time), so
+# ArgoCD pulls a self-contained chart and never fetches it at render time. The
+# postgres CONTAINER image is overridden to a private registry mirror in the per-cluster
+# values. Gated on `postgres.enabled` (chart default OFF; the per-cluster values
+# turn it on). NO qdrant, NO agent/worker, NO MCP-http (uzi is not a full platform).
+dependencies:
+  - name: cluster
+    alias: postgres
+    # Pinned to the same `cluster` chart version the fleet's other CNPG apps use
+    # for fleet consistency, NOT the latest 0.7.x. Bump together with the fleet.
+    #
+    # NOTE (corrected 2026-08-20): this chart's rendered `postgresql.cnpg.io/v1
+    # Cluster` is NOT a strict subset of the CRD operator 1.23.5 ships -- it always
+    # emits `.spec.monitoring.tls.enabled`, a field 1.23.5's Cluster CRD does not
+    # declare. Under client-side apply (Helm 3, and ArgoCD -- the real deploy path)
+    # the apiserver prunes that unknown field, so it is harmless. It only bites under
+    # Helm 4's server-side-apply default, which validates strictly and rejects it;
+    # the kind-smoke `helm install` therefore passes `--server-side=false` to match
+    # the production apply semantics. Closing the mismatch for good means bumping the
+    # CNPG operator+subchart pair fleet-wide so the CRD gains the field.
+    version: "0.6.1"
+    repository: "oci://ghcr.io/cloudnative-pg/charts"
+    condition: postgres.enabled

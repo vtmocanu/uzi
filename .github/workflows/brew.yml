@@ -1,0 +1,97 @@
+# Regenerate Formula/uzi-cli.rb for a v* tag and push it to vtmocanu/homebrew-tap.
+#
+# Mirrors the sibling formulae (cc-statusline, fj-queue): `task brew:formula` computes
+# the tag tarball's sha256 and renders Formula/uzi-cli.rb (its url/sha256 placeholders),
+# then `task brew:publish` pushes the rendered copy into the tap. The mechanics live in
+# the reusable homebrew-tap.yml from github.com/vtmocanu/task, included by uzi's
+# Taskfile.yml under `brew:` (the one sanctioned remote include, SHA-pinned; see that
+# file's rule 3).
+#
+# TRIGGERS: a `v*` tag push (auto-publish the formula on release, matching release.yml)
+# AND workflow_dispatch (re-publish for any existing tag by hand). Both feed the same job
+# through INPUT_TAG below. brew:formula fetches the ANONYMOUS auto-archive
+# (https://github.com/vtmocanu/uzi/archive/refs/tags/<tag>.tar.gz), which 404s while the
+# repo is private -- so the tag trigger was intentionally withheld until the public flip
+# (the reusable task guards the empty-input digest and refuses to render on a 404). The
+# repo is public now and the tag trigger is live: a release tags vX.Y.Z, release.yml
+# publishes the images + chart, and this publishes the matching formula. brew stays a
+# SEPARATE workflow from release.yml because it needs that public archive, and a failed
+# tap push must not redden the image+chart release.
+#
+# The default GITHUB_TOKEN cannot write to a second repo, so the cross-repo push uses
+# HOMEBREW_TAP_TOKEN (a fine-grained PAT scoped to vtmocanu/homebrew-tap, contents:write),
+# from the `release` environment. The `environment: release` below is REQUIRED for that
+# reason -- it scopes the token as an environment secret -- NOT as an approval gate: that
+# environment carries no required reviewer (removed 2026-08-20), so this publishes
+# immediately on the tag with no approval click. Access control is the `v*` tag ruleset
+# (only a repo admin can create the tag), same as release.yml. No GitHub Release is
+# created (the auto-archive needs none), so permissions stay read-only -- matching
+# cc-statusline.
+
+name: Brew
+
+# Quoted so yamllint's `truthy` rule does not read the key as the boolean `on`.
+"on":
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish the uzi-cli formula for (e.g. v0.42.1)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: brew-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish-formula:
+    runs-on: ubuntu-latest
+    environment: release
+    env:
+      # Passed via env, never string-interpolated into a run script: a workflow_dispatch
+      # input is untrusted, and git ref names allow shell metacharacters. On a v* tag push
+      # inputs.tag is empty, so fall back to the tag ref name; the Validate step below
+      # rejects anything that is not strict SemVer either way.
+      INPUT_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      # Only strict SemVer tags may proceed. $INPUT_TAG flows into a URL + Task template
+      # substitution where quoting cannot be relied on; the guard is injection-safe
+      # because $INPUT_TAG is shell-expanded from env, never a GH expression.
+      - name: Validate tag format
+        id: tag
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$INPUT_TAG" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "refusing to publish: tag '$INPUT_TAG' is not vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: arduino/setup-task@c0bc642852239c2689f73f4ea6459c29405f3c52  # v3.0.0
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Renders dist/uzi-cli.rb (auto-archive url + computed sha256). Fails loudly on the
+      # empty-input digest, i.e. while the repo is still private. VERSION flows via
+      # env: (never string-interpolated into the run body), matching this repo's
+      # zizmor template-injection convention -- release.yml uses env: the same way.
+      # The value is already regex-gated to strict SemVer by the Validate step, so
+      # this is consistency/future-proofing, not a live injection fix.
+      - name: Render formula
+        env:
+          VERSION: ${{ steps.tag.outputs.tag }}
+        run: task --yes brew:formula VERSION="$VERSION"
+
+      # Clones the tap with HOMEBREW_TAP_TOKEN, copies the rendered formula, commits + pushes.
+      - name: Publish to tap
+        env:
+          VERSION: ${{ steps.tag.outputs.tag }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: task --yes brew:publish VERSION="$VERSION" HOMEBREW_TAP_TOKEN="$HOMEBREW_TAP_TOKEN"

@@ -1,0 +1,348 @@
+<title>Judge · filter by recommendation label</title>
+<style>
+  /* uzi "ember" theme — dark-only by design (a dark factory). Single-theme on
+     purpose: mirrors web/src/index.css tokens so the mock reads as the real app. */
+  :root {
+    --bg: 8 10 15;
+    --surface: 15 18 26;
+    --raised: 23 27 38;
+    --edge: 39 45 60;
+    --edge-strong: 58 66 86;
+    --fg: 228 232 240;
+    --muted: 148 158 176;
+    --faint: 122 133 154;
+    --brand: 251 146 60;
+    --brand-hover: 253 186 116;
+    --on-brand: 26 16 8;
+    --ok: 52 211 153;
+    --warn: 251 191 36;
+    --info: 56 189 248;
+    --radius: 0.625rem;
+    --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; scrollbar-width: thin; scrollbar-color: rgb(var(--edge)) transparent; }
+
+  body {
+    margin: 0;
+    background: rgb(var(--bg));
+    color: rgb(var(--fg));
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    line-height: 1.5;
+  }
+
+  .wrap { max-width: 64rem; margin: 0 auto; padding: 1.75rem 1.25rem 6rem; }
+
+  /* mock banner */
+  .mockbar {
+    display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;
+    font-size: .8rem; color: rgb(var(--faint));
+    border: 1px dashed rgb(var(--edge-strong));
+    border-radius: var(--radius);
+    padding: .55rem .8rem; margin-bottom: 1.5rem;
+    background: rgb(var(--surface) / .5);
+  }
+  .mockbar b { color: rgb(var(--muted)); font-weight: 600; }
+  .mockbar .tag {
+    font-size: .68rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+    color: rgb(var(--brand)); background: rgb(var(--brand) / .12);
+    border: 1px solid rgb(var(--brand) / .3);
+    border-radius: 999px; padding: .1rem .5rem;
+  }
+
+  /* page header */
+  .page-head { border-bottom: 1px solid rgb(var(--edge)); padding-bottom: 1rem; margin-bottom: 1.25rem; }
+  h1 { display: flex; align-items: center; gap: .5rem; font-size: 1.25rem; font-weight: 600; letter-spacing: -.01em; margin: 0; }
+  h1 .icon { color: rgb(var(--brand)); display: inline-flex; }
+  .page-head p { margin: .4rem 0 0; font-size: .875rem; color: rgb(var(--muted)); max-width: 60ch; }
+
+  /* triage summary strip */
+  .triage {
+    display: flex; align-items: baseline; flex-wrap: wrap; gap: 1.25rem;
+    border: 1px solid rgb(var(--edge)); border-radius: var(--radius);
+    background: rgb(var(--surface) / .4); padding: .85rem 1rem; margin-bottom: 1.25rem;
+  }
+  .triage .title { font-size: .8rem; font-weight: 600; color: rgb(var(--fg)); margin-right: .25rem; }
+  .triage .aside { margin-left: auto; font-size: .72rem; color: rgb(var(--faint)); }
+  .stat { display: inline-flex; align-items: baseline; gap: .4rem; font-size: .8rem; }
+  .stat b { font-size: 1rem; font-variant-numeric: tabular-nums; color: rgb(var(--fg)); }
+  .stat .lbl { color: rgb(var(--faint)); text-transform: uppercase; letter-spacing: .03em; font-size: .68rem; }
+
+  /* ---- NEW: recommendation-label filter ---- */
+  .filter {
+    border: 1px solid rgb(var(--brand) / .35);
+    border-radius: var(--radius);
+    background: rgb(var(--brand) / .05);
+    padding: .8rem .9rem; margin-bottom: 1.1rem;
+  }
+  .filter-head {
+    display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
+    margin-bottom: .65rem;
+  }
+  .filter-head .lbl {
+    font-size: .7rem; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+    color: rgb(var(--muted));
+  }
+  .filter-head .new {
+    font-size: .62rem; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+    color: rgb(var(--brand)); background: rgb(var(--brand) / .14);
+    border: 1px solid rgb(var(--brand) / .35); border-radius: 999px; padding: .05rem .45rem;
+  }
+  .filter-head .clear {
+    margin-left: auto; font: inherit; font-size: .78rem; font-weight: 500;
+    color: rgb(var(--brand)); background: none; border: none; cursor: pointer;
+    text-decoration: underline; text-underline-offset: 2px; padding: 0;
+    opacity: 0; pointer-events: none; transition: opacity .12s;
+  }
+  .filter-head .clear.show { opacity: 1; pointer-events: auto; }
+  .chips { display: flex; flex-wrap: wrap; gap: .5rem; }
+  .chip {
+    display: inline-flex; align-items: center; gap: .45rem;
+    font: inherit; font-size: .8rem; font-weight: 500;
+    color: rgb(var(--muted));
+    background: rgb(var(--raised));
+    border: 1px solid rgb(var(--edge)); border-radius: 999px;
+    padding: .32rem .7rem; cursor: pointer;
+    transition: border-color .12s, color .12s, background .12s;
+  }
+  .chip:hover { border-color: rgb(var(--edge-strong)); color: rgb(var(--fg)); }
+  .chip .dot { width: .5rem; height: .5rem; border-radius: 999px; background: rgb(var(--info)); flex: none; }
+  .chip .n {
+    font-size: .68rem; font-variant-numeric: tabular-nums;
+    color: rgb(var(--faint)); background: rgb(var(--bg) / .6);
+    border-radius: 999px; padding: .02rem .38rem;
+  }
+  .chip[aria-pressed="true"] {
+    color: rgb(var(--brand)); background: rgb(var(--brand) / .13);
+    border-color: rgb(var(--brand) / .55);
+  }
+  .chip[aria-pressed="true"] .dot { background: rgb(var(--brand)); }
+  .chip[aria-pressed="true"] .n { color: rgb(var(--brand-hover)); background: rgb(var(--brand) / .12); }
+  .chip:focus-visible { outline: none; box-shadow: 0 0 0 2px rgb(var(--bg)), 0 0 0 4px rgb(var(--brand)); }
+
+  /* bucket tabs */
+  .tabs { display: flex; flex-wrap: wrap; gap: .25rem; border-bottom: 1px solid rgb(var(--edge)); margin-bottom: 1rem; }
+  .tab {
+    font: inherit; font-size: .82rem; font-weight: 500; color: rgb(var(--faint));
+    background: none; border: none; border-bottom: 2px solid transparent;
+    margin-bottom: -1px; padding: .5rem .75rem; cursor: pointer;
+  }
+  .tab:hover { color: rgb(var(--muted)); border-bottom-color: rgb(var(--edge-strong)); }
+  .tab.active { color: rgb(var(--fg)); border-bottom-color: rgb(var(--brand)); }
+  .tab .n { margin-left: .4rem; font-variant-numeric: tabular-nums; color: rgb(var(--faint)); }
+
+  .resultline { font-size: .78rem; color: rgb(var(--faint)); margin: 0 0 .75rem; min-height: 1rem; }
+  .resultline b { color: rgb(var(--muted)); font-weight: 600; }
+
+  /* group rows */
+  ul.groups { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .5rem; }
+  .group {
+    border: 1px solid rgb(var(--edge)); border-radius: var(--radius);
+    background: rgb(var(--raised) / .4);
+  }
+  .group-main { display: flex; align-items: flex-start; gap: .6rem; padding: .7rem .75rem; }
+  .group input[type=checkbox] { margin-top: .28rem; width: 1rem; height: 1rem; accent-color: rgb(var(--brand)); flex: none; }
+  .group-body { min-width: 0; flex: 1; }
+  .group-line { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
+  .badge {
+    font-size: .72rem; font-weight: 500; border-radius: 999px; padding: .1rem .5rem;
+    border: 1px solid transparent; white-space: nowrap;
+  }
+  .badge.info { color: rgb(var(--info)); background: rgb(var(--info) / .12); border-color: rgb(var(--info) / .3); }
+  .badge.ok   { color: rgb(var(--ok));   background: rgb(var(--ok) / .12);   border-color: rgb(var(--ok) / .3); }
+  .badge.neutral { color: rgb(var(--muted)); background: rgb(var(--raised)); border-color: rgb(var(--edge)); }
+  code.target {
+    font-family: var(--font-mono); font-size: .74rem; color: rgb(var(--fg));
+    background: rgb(var(--raised)); border-radius: .3rem; padding: .1rem .4rem;
+  }
+  .seen { font-size: .72rem; color: rgb(var(--faint)); }
+  .rationale {
+    margin: .4rem 0 0; font-size: .82rem; color: rgb(var(--muted));
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .group-actions { display: flex; align-items: center; gap: .4rem; flex: none; }
+  .btn {
+    font: inherit; font-size: .78rem; font-weight: 500; color: rgb(var(--fg));
+    background: rgb(var(--raised)); border: 1px solid rgb(var(--edge)); border-radius: .45rem;
+    padding: .28rem .6rem; cursor: pointer; white-space: nowrap;
+  }
+  .btn:hover { border-color: rgb(var(--edge-strong)); }
+  .caret { color: rgb(var(--faint)); background: none; border: none; cursor: pointer; padding: .2rem; display: inline-flex; }
+
+  .empty {
+    text-align: center; border: 1px solid rgb(var(--edge)); border-radius: var(--radius);
+    padding: 2.5rem 1rem; color: rgb(var(--muted));
+  }
+  .empty .icon { color: rgb(var(--faint)); display: inline-flex; margin-bottom: .5rem; }
+  .empty h3 { margin: 0 0 .3rem; font-size: .95rem; color: rgb(var(--fg)); font-weight: 600; }
+  .empty p { margin: 0; font-size: .82rem; }
+  .hidden { display: none !important; }
+</style>
+
+<div class="wrap">
+  <div class="mockbar">
+    <span class="tag">Mockup</span>
+    <span><b>Judge</b> · proposed “filter by recommendation label”. The label chips below are live — click to filter the list.</span>
+  </div>
+
+  <div class="page-head">
+    <h1>
+      <span class="icon" aria-hidden="true">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><path d="M6 7h12"/><path d="m3 11 3-4 3 4a3 3 0 0 1-6 0Z"/><path d="m15 11 3-4 3 4a3 3 0 0 1-6 0Z"/><path d="M5 21h14"/></svg>
+      </span>
+      Judge
+    </h1>
+    <p>Recommendations across all your runs, deduped by target. Triage a whole group in one action.</p>
+  </div>
+
+  <div class="triage">
+    <span class="title">Recommendations · all your runs</span>
+    <span class="stat"><b id="stat-total">7</b><span class="lbl">groups</span></span>
+    <span class="stat"><b>5</b><span class="lbl">to triage</span></span>
+    <span class="stat"><b>18</b><span class="lbl">occurrences</span></span>
+    <span class="aside">all time</span>
+  </div>
+
+  <!-- NEW: filter by recommendation label -->
+  <section class="filter" aria-label="Filter by recommendation label">
+    <div class="filter-head">
+      <span class="lbl">Filter by label</span>
+      <span class="new">New</span>
+      <button type="button" class="clear" id="clear">Clear ✕</button>
+    </div>
+    <div class="chips" id="chips" role="group" aria-label="Recommendation labels"></div>
+  </section>
+
+  <div class="tabs" role="tablist" aria-label="Backlog bucket">
+    <button class="tab active" role="tab" aria-selected="true">To triage <span class="n">5</span></button>
+    <button class="tab" role="tab" aria-selected="false">Filed <span class="n">1</span></button>
+    <button class="tab" role="tab" aria-selected="false">Done <span class="n">1</span></button>
+    <button class="tab" role="tab" aria-selected="false">Dismissed <span class="n">0</span></button>
+    <button class="tab" role="tab" aria-selected="false">All <span class="n">7</span></button>
+  </div>
+
+  <p class="resultline" id="resultline"></p>
+
+  <ul class="groups" id="groups"></ul>
+
+  <div class="empty hidden" id="empty">
+    <span class="icon" aria-hidden="true">
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><path d="M6 7h12"/><path d="m3 11 3-4 3 4a3 3 0 0 1-6 0Z"/><path d="m15 11 3-4 3 4a3 3 0 0 1-6 0Z"/></svg>
+    </span>
+    <h3>No recommendations match those labels</h3>
+    <p>Clear a label or pick another to see more groups.</p>
+  </div>
+</div>
+
+<script>
+  // Category taxonomy — mirrors web/src/lib/judge.ts RECOMMENDATION_LABELS.
+  const LABELS = {
+    enable_tool: "Enable a tool or skill",
+    install_worker_tool: "Install a worker tool",
+    adjust_template: "Adjust an agent template",
+    improve_agent: "Improve an agent",
+    add_agent: "Add a missing agent",
+    improve_uzi: "Improve uzi",
+  };
+
+  // Deduped (category, target) recommendation groups — realistic sample content.
+  const GROUPS = [
+    { cat: "improve_uzi", target: "judge backlog pagination", runs: 6, rollup: null,
+      rationale: "Six runs produced backlogs large enough to truncate. The judge page should paginate rather than silently drop groups, so counts stay trustworthy." },
+    { cat: "adjust_template", target: "coder.md", runs: 5, rollup: null,
+      rationale: "The coder template does not pass -buildvcs=false, so first builds in a linked worktree fail on VCS stamping. Add it to the local build step." },
+    { cat: "install_worker_tool", target: "ripgrep", runs: 3, rollup: null,
+      rationale: "Workers repeatedly fell back to `grep -r` over large trees and timed out. Preinstalling ripgrep in the worker image would cut search time sharply." },
+    { cat: "improve_agent", target: "reviewer", runs: 3, rollup: null,
+      rationale: "The reviewer agent missed a null-dereference in two separate runs. Its checklist should call out unchecked optional chaining before approving." },
+    { cat: "enable_tool", target: "mcp: playwright", runs: 4, rollup: null,
+      rationale: "Four runs needed to verify a UI change but had no browser. Enabling the Playwright MCP would let workers self-verify frontend work end to end." },
+    { cat: "add_agent", target: "security-auditor", runs: 2, rollup: "filed",
+      rationale: "No agent owns dependency CVE triage; two runs shipped with a known-vulnerable transitive dep. A dedicated security-auditor would gate this." },
+    { cat: "enable_tool", target: "skill: sibling-app-taskfile", runs: 2, rollup: "done",
+      rationale: "Workers hand-wrote Taskfiles that drifted from the org convention. Enabling the taskfile skill gives them the house patterns for free." },
+  ];
+
+  const active = new Set();
+  const chipsEl = document.getElementById("chips");
+  const groupsEl = document.getElementById("groups");
+  const emptyEl = document.getElementById("empty");
+  const clearBtn = document.getElementById("clear");
+  const resultLine = document.getElementById("resultline");
+
+  function countFor(cat) { return GROUPS.filter(g => g.cat === cat).length; }
+
+  // Build a chip per category (only categories that actually have groups).
+  Object.keys(LABELS).forEach(cat => {
+    const n = countFor(cat);
+    if (n === 0) return;
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "chip";
+    b.setAttribute("aria-pressed", "false");
+    b.dataset.cat = cat;
+    b.innerHTML = `<span class="dot" aria-hidden="true"></span>${LABELS[cat]}<span class="n">${n}</span>`;
+    b.addEventListener("click", () => {
+      if (active.has(cat)) active.delete(cat); else active.add(cat);
+      b.setAttribute("aria-pressed", active.has(cat) ? "true" : "false");
+      render();
+    });
+    chipsEl.appendChild(b);
+  });
+
+  function badge(g) {
+    if (g.rollup === "filed") return '<span class="badge info">Filed #218</span>';
+    if (g.rollup === "done") return '<span class="badge ok">✓ Done</span>';
+    return "";
+  }
+
+  function render() {
+    const shown = GROUPS.filter(g => active.size === 0 || active.has(g.cat));
+    groupsEl.innerHTML = shown.map(g => `
+      <li class="group">
+        <div class="group-main">
+          <input type="checkbox" aria-label="Select ${LABELS[g.cat]} ${g.target}">
+          <div class="group-body">
+            <div class="group-line">
+              <span class="badge info">${LABELS[g.cat]}</span>
+              <code class="target">${g.target}</code>
+              <span class="seen">seen in ${g.runs} runs</span>
+              ${badge(g)}
+            </div>
+            <p class="rationale">${g.rationale}</p>
+          </div>
+          <div class="group-actions">
+            <button class="btn">Mark done</button>
+            <button class="btn">Dismiss ▾</button>
+            <button class="caret" aria-label="Expand occurrences">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>
+            </button>
+          </div>
+        </div>
+      </li>
+    `).join("");
+
+    const hasResults = shown.length > 0;
+    groupsEl.classList.toggle("hidden", !hasResults);
+    emptyEl.classList.toggle("hidden", hasResults);
+
+    clearBtn.classList.toggle("show", active.size > 0);
+
+    if (active.size === 0) {
+      resultLine.innerHTML = `Showing <b>all ${GROUPS.length}</b> groups`;
+    } else {
+      const names = [...active].map(c => LABELS[c]).join(", ");
+      resultLine.innerHTML = `<b>${shown.length}</b> of ${GROUPS.length} groups · ${names}`;
+    }
+  }
+
+  clearBtn.addEventListener("click", () => {
+    active.clear();
+    chipsEl.querySelectorAll(".chip").forEach(c => c.setAttribute("aria-pressed", "false"));
+    render();
+  });
+
+  render();
+</script>

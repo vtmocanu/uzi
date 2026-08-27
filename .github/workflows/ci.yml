@@ -1,0 +1,661 @@
+# uzi CI gate (ported from the retired GitLab pipeline, PRD #103 / #230).
+#
+# THIS WORKFLOW IS THE PR/main GATE: validate + lint + test across the four
+# toolchains (Go api, Go controller, Vite/React web, Node agent), repo-wide checks,
+# a Helm lint/template, and -- on pull requests, path-filtered -- `push:false` image
+# VALIDATION builds (does each Dockerfile still build?). It pushes NO images, uses
+# NO secrets, and runs NO release logic: image publishing + the chart/brew release
+# land in release.yml, and the KinD smoke in kind-smoke.yml.
+#
+# R1 TRUST BOUNDARY: these jobs must run clean on an untrusted (fork) PR with zero
+# secret exposure. Hence top-level `permissions: contents: read` (a read-only
+# GITHUB_TOKEN), no `secrets:`, no `environment:`, and no `pull_request_target`. The
+# image-validation builds are `push:false` and touch no registry, so they add no
+# secret and no write scope -- the boundary is unchanged.
+#
+# Each job runs the SAME leaf `task` targets the GitLab gate jobs ran -- one job
+# per gate, flat parallelism (no `needs:` between them), mirroring GitLab's
+# `needs: []`. The recipes live in Taskfile.yml so local and CI cannot diverge;
+# `lint-repo` invokes the composed `task gate:repo` because its members are
+# repo-wide checks with no component of their own.
+
+name: CI
+
+# Quoted so yamllint's `truthy` rule does not read the key as the boolean `on`
+# (GitHub Actions treats "on" and on identically).
+"on":
+  pull_request: {}
+  push:
+    branches: [main]
+
+# Read-only token. Do not add scopes here: a gate needs none.
+permissions:
+  contents: read
+
+# Cancel a superseded run's still-running jobs when a newer commit lands on the
+# same ref -- mirrors GitLab's workflow.auto_cancel over interruptible gate jobs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------- Go api ----
+  validate-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
+        with:
+          # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
+          # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
+          # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
+          # check-latest is load-bearing: without it setup-go resolves "1.26" to
+          # whatever patch the assigned runner image happens to preinstall (observed
+          # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
+          # above only holds when we force the manifest lookup here.
+          go-version: "1.26"
+          check-latest: true
+          cache-dependency-path: api/go.sum
+      - uses: ./.github/actions/setup-task
+      - name: go mod download
+        working-directory: api
+        run: go mod download
+      - name: fmt-check + vet + build
+        run: |
+          task fmt-check:api
+          task vet:api
+          task build:api
+      # sqlc as a PINNED RELEASE BINARY, not `go run .../sqlc@v1.31.1 generate`. The
+      # go-run form COMPILES sqlc from source every run (~57-61s measured): all api
+      # jobs share one setup-go cache key (api/go.sum), so only one job's GOCACHE
+      # persists and it is never the one that compiled sqlc -> perpetual recompile.
+      # A downloaded release binary skips the compile. Same VERSION (1.30.0) => byte-
+      # identical codegen, so the drift check is unchanged; the version pin is the
+      # arg; the sha256 is the whole control on this fetch, and Renovate keeps it in
+      # lockstep with the version via the github-release-attachments datasource (the
+      # `# renovate-tarball:` marker + the customManager in renovate.json). A sqlc
+      # bump PR reddens the drift step below (regenerate must be a no-op) until the
+      # committed codegen is regenerated -- that red is the signal, not a chore.
+      # linux/amd64 (GitHub-hosted ubuntu runners are amd64); local `sqlc generate`
+      # stays on `go run` per .claude/rules/go.md and is unaffected.
+      - name: Install sqlc (pinned, sha256-verified)
+        run: |
+          set -euo pipefail
+          # renovate-tarball: depName=sqlc-dev/sqlc
+          SQLC_VERSION="v1.31.1"        # v-prefixed git tag (getDigest fetches releases/tags/<value>)
+          SQLC_V="${SQLC_VERSION#v}"    # tarball filename is versionless
+          # Renovate keeps SQLC_SHA256 in lockstep with SQLC_VERSION (it resolves the
+          # new tag's linux_amd64 tarball sha256 from the release's checksums).
+          SQLC_SHA256="497ae4fcdfa64c5b0c311ffe4c2bd991e43991e82e5367792ed78bc2dca27354"
+          curl -fsSLo /tmp/sqlc.tar.gz \
+            --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 15 \
+            "https://github.com/sqlc-dev/sqlc/releases/download/${SQLC_VERSION}/sqlc_${SQLC_V}_linux_amd64.tar.gz"
+          echo "${SQLC_SHA256}  /tmp/sqlc.tar.gz" | sha256sum -c -
+          mkdir -p "${HOME}/.local/bin"
+          tar -xzf /tmp/sqlc.tar.gz -C "${HOME}/.local/bin" sqlc
+          rm -f /tmp/sqlc.tar.gz
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+          # Positive control: a bare install proves nothing until the binary runs.
+          "${HOME}/.local/bin/sqlc" version
+      - name: sqlc drift (regenerate must be a no-op)
+        working-directory: api
+        run: |
+          sqlc generate
+          git diff --exit-code -- internal/store
+
+  lint-api:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth 0 + an explicit fetch of origin/main: the golangci ratchet
+      # (.golangci.yml `new-from-merge-base: origin/main`) needs a reachable common
+      # ancestor. If origin/main does not resolve, the target's pre-flight exits 2
+      # rather than reporting the whole unfiltered backlog as this branch's findings.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
+        with:
+          # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
+          # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
+          # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
+          # check-latest is load-bearing: without it setup-go resolves "1.26" to
+          # whatever patch the assigned runner image happens to preinstall (observed
+          # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
+          # above only holds when we force the manifest lookup here.
+          go-version: "1.26"
+          check-latest: true
+          cache-dependency-path: api/go.sum
+      - uses: ./.github/actions/setup-task
+      - name: go mod download
+        working-directory: api
+        run: go mod download
+      - name: Fetch origin/main for the ratchet
+        run: git fetch --quiet origin +refs/heads/main:refs/remotes/origin/main
+      - name: lint + deadcode + vulncheck
+        run: |
+          task lint:api
+          task deadcode:api
+          task vulncheck:api
+
+  test-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
+        with:
+          # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
+          # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
+          # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
+          # check-latest is load-bearing: without it setup-go resolves "1.26" to
+          # whatever patch the assigned runner image happens to preinstall (observed
+          # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
+          # above only holds when we force the manifest lookup here.
+          go-version: "1.26"
+          check-latest: true
+          cache-dependency-path: api/go.sum
+      - uses: ./.github/actions/setup-task
+      - name: go mod download
+        working-directory: api
+        run: go mod download
+      - name: test:api (-race -count=1)
+        run: task test:api
+      - name: coverage-xml:api
+        run: task coverage-xml:api
+
+  # The live-DB gate. The *LiveDB tests self-skip unless UZI_TEST_DATABASE_URL is
+  # set, so `go test` above prints a green `ok` while every one of them is skipped.
+  # This job runs them against a real Postgres and asserts they actually ran.
+  test-api-store-it:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # Same digest docker-compose.yml pins, so CI tests the engine the stack
+        # runs. GitHub service containers cannot override the image command, so the
+        # GitLab job's fsync=off/full_page_writes=off/synchronous_commit=off perf
+        # tuning is dropped -- those are crash-recovery knobs, behaviour-identical.
+        image: postgres:17@sha256:5c855ad7b85e68e48a62f34662853f38b57c1c1d80f3a927ab58034fd6d31c5e
+        env:
+          POSTGRES_USER: uzi
+          POSTGRES_DB: uzi
+          # Throwaway per-job database, reachable only from this job -- never a credential.
+          POSTGRES_PASSWORD: uzi-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U uzi -d uzi"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      UZI_TEST_DATABASE_URL: postgres://uzi:uzi-ci@localhost:5432/uzi?sslmode=disable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
+        with:
+          # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
+          # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
+          # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
+          # check-latest is load-bearing: without it setup-go resolves "1.26" to
+          # whatever patch the assigned runner image happens to preinstall (observed
+          # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
+          # above only holds when we force the manifest lookup here.
+          go-version: "1.26"
+          check-latest: true
+          cache-dependency-path: api/go.sum
+      - name: go mod download
+        working-directory: api
+        run: go mod download
+      - name: LiveDB tests (gate on the gate)
+        working-directory: api
+        run: |
+          set -euo pipefail
+          # -run filters to the *LiveDB tests; -p 1 is load-bearing (the two packages
+          # share one database and race goose without it). The trailing check is the
+          # gate on the gate: a rename, a lost DSN or an unreachable service silently
+          # turns this back into a green no-op.
+          go test -count=1 -v -race -p 1 -run 'LiveDB$' ./internal/store/... ./internal/handler/... 2>&1 | tee livedb.log
+          ran=$(grep -c '^--- PASS' livedb.log || true)
+          skipped=$(grep -c '^--- SKIP' livedb.log || true)
+          echo "LiveDB: $ran passed, $skipped skipped"
+          if [ "$ran" -eq 0 ] || [ "$skipped" -gt 0 ]; then
+            echo "FAIL: the live-DB tests did not actually run against Postgres. They skip when"
+            echo "UZI_TEST_DATABASE_URL is unset or the service is unreachable, and 'go test' still"
+            echo "prints ok -- so this job would be green while testing nothing."
+            exit 1
+          fi
+
+  # --------------------------------------------------------- Go controller ----
+  validate-controller:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
+        with:
+          go-version: "1.26"
+          check-latest: true
+          cache-dependency-path: controller/go.sum
+      - uses: ./.github/actions/setup-task
+      - name: go mod download
+        working-directory: controller
+        run: go mod download
+      - name: fmt-check + vet + build
+        run: |
+          task fmt-check:controller
+          task vet:controller
+          task build:controller
+
+  lint-controller:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
+        with:
+          go-version: "1.26"
+          check-latest: true
+          cache-dependency-path: controller/go.sum
+      - uses: ./.github/actions/setup-task
+      - name: go mod download
+        working-directory: controller
+        run: go mod download
+      - name: Fetch origin/main for the ratchet
+        run: git fetch --quiet origin +refs/heads/main:refs/remotes/origin/main
+      - name: lint + deadcode + vulncheck
+        run: |
+          task lint:controller
+          task deadcode:controller
+          task vulncheck:controller
+
+  test-controller:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
+        with:
+          go-version: "1.26"
+          check-latest: true
+          cache-dependency-path: controller/go.sum
+      - uses: ./.github/actions/setup-task
+      - name: go mod download
+        working-directory: controller
+        run: go mod download
+      - name: test:controller (-race -count=1)
+        run: task test:controller
+      - name: coverage-xml:controller
+        run: task coverage-xml:controller
+
+  # ---------------------------------------------------------- Vite/React web ----
+  validate-web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: ./.github/actions/setup-task
+      - name: npm ci
+        working-directory: web
+        run: npm ci
+      - name: lint + deadcode + vulncheck + check-docs + check-changelog + check-styles + typecheck
+        env:
+          # Turns the deadcode wrapper's loud-SKIP (when knip is absent) into exit 2:
+          # CI always installs knip, so a skip here means the image regressed.
+          UZI_DEADCODE_WEB_REQUIRED: "1"
+        run: |
+          task lint:web
+          task deadcode:web
+          task vulncheck:web
+          task check-docs:web
+          task check-changelog:web
+          task check-styles:web
+          task typecheck:web
+
+  test-web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: ./.github/actions/setup-task
+      - name: npm ci
+        working-directory: web
+        run: npm ci
+      - name: test:web (vitest --coverage)
+        run: task test:web
+
+  # -------------------------------------------------------------- Node agent ----
+  validate-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: agent/package-lock.json
+      - uses: ./.github/actions/setup-task
+      - name: npm ci
+        working-directory: agent
+        run: npm ci
+      - name: lint + deadcode + vulncheck + typecheck
+        env:
+          UZI_DEADCODE_AGENT_REQUIRED: "1"
+        run: |
+          task lint:agent
+          task deadcode:agent
+          task vulncheck:agent
+          task typecheck:agent
+
+  test-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: agent/package-lock.json
+      - uses: ./.github/actions/setup-task
+      - name: npm ci
+        working-directory: agent
+        run: npm ci
+      # The agent tests shell out to `git init`/clone and bash; ubuntu-latest ships
+      # both (the GitLab alpine job had to `apk add git bash`).
+      - name: test:agent
+        run: task test:agent
+
+  # ------------------------------------------------------------- repo-wide ----
+  # shellcheck (pinned, Renovate-tracked) + yamllint + ruby formula syntax +
+  # actionlint/zizmor (pinned) + gitleaks. Invokes the composed `task gate:repo`;
+  # the *_REQUIRED flags
+  # turn each check's fail-open SKIP into exit 2 so a missing tool in CI cannot pass
+  # silently.
+  lint-repo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      # Go is needed for scan:secrets (gitleaks via `go run pkg@version`).
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
+        with:
+          # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
+          # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
+          # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
+          # check-latest is load-bearing: without it setup-go resolves "1.26" to
+          # whatever patch the assigned runner image happens to preinstall (observed
+          # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
+          # above only holds when we force the manifest lookup here.
+          go-version: "1.26"
+          check-latest: true
+          cache-dependency-path: api/go.sum
+      - uses: ./.github/actions/setup-task
+      - name: Install shellcheck (pinned, sha256-verified)
+        run: |
+          set -euo pipefail
+          # lint:shell asserts this exact version and exits 2 on any mismatch;
+          # 0.10.0 and 0.11.0 are different gates (0.10.0 does not emit SC3067).
+          # Renovate tracks this via the `renovate-tarball` marker below
+          # (github-release-attachments datasource) and bumps SHELLCHECK_VERSION and
+          # SHELLCHECK_SHA256 together in one PR. The *_VERSION literal MUST be the
+          # v-prefixed git tag: getDigest fetches releases/tags/<value> verbatim, and
+          # the tag, the .tar.xz asset filename and the extracted dir all carry the v.
+          # The linux.x86_64 asset ships as .tar.xz for BOTH 0.10.0 and 0.11.0
+          # (0.10.0 has NO .tar.gz), so the extension is stable across the bump and
+          # only the version substring changes -- which is exactly what
+          # github-release-attachments maps on. linux.x86_64 is hardcoded: GitHub
+          # ubuntu runners are amd64; a future arm64 runner fails LOUDLY at --version.
+          #
+          # TEMP: pinned to v0.10.0 (below the latest v0.11.0) to force a live
+          # Renovate bump-back PR that proves this wiring; Renovate restores v0.11.0.
+          #
+          # Retry transient network failures (connection reset mid-download);
+          # --retry-all-errors covers resets plain --retry does not. The sha256
+          # check below is unchanged, so integrity is unaffected.
+          # renovate-tarball: depName=koalaman/shellcheck
+          SHELLCHECK_VERSION="v0.11.0"
+          SHELLCHECK_SHA256="8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"
+          curl -fsSLo /tmp/shellcheck.tar.xz \
+            --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 15 \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          echo "${SHELLCHECK_SHA256}  /tmp/shellcheck.tar.xz" | sha256sum -c -
+          mkdir -p "${HOME}/.local/bin"
+          tar -xJf /tmp/shellcheck.tar.xz -C /tmp "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
+          install -m 0755 "/tmp/shellcheck-${SHELLCHECK_VERSION}/shellcheck" "${HOME}/.local/bin/shellcheck"
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+          "${HOME}/.local/bin/shellcheck" --version
+      - name: Install yamllint
+        # lint-yaml.sh carries no version pin (1.37.1 and 1.38.0 both measured
+        # clean), so a current yamllint is fine. Ruby (for the formula syntax lint)
+        # ships preinstalled on ubuntu-latest at >= 3.1.
+        run: pipx install yamllint
+      - name: Install actionlint + zizmor (pinned)
+        run: |
+          set -euo pipefail
+          # actionlint as a PINNED RELEASE BINARY (curl + sha256), not `go install
+          # @v1.7.7`. The go-install form COMPILES actionlint from source each run
+          # (~10-20s) using the shared api/go.sum GOCACHE; a downloaded release binary
+          # skips the compile, the same win the pinned-shellcheck block above and
+          # scripts/golangci-lint.sh already take. Its embedded shellcheck is the
+          # same 0.11.0 installed above, so shell findings match lint:shell's tool.
+          # (Do NOT start a comment line with the word shellcheck: shellcheck reads
+          # `# shellcheck <word>` as a directive and SC1072/SC1073-fails the parse.)
+          # Pins EXACTLY: the sha256 is the whole control on this fetch, and Renovate
+          # keeps it in lockstep with the version via the github-release-attachments
+          # datasource (the `# renovate-tarball:` marker + the customManager in
+          # renovate.json). actionlint is a linter, so a bump PR may redden lint-repo
+          # with new workflow findings -- that red is the signal to fix them, by
+          # design. linux/amd64 tarball; it extracts `actionlint` (+ docs/man) at root.
+          # renovate-tarball: depName=rhysd/actionlint
+          ACTIONLINT_VERSION="v1.7.12"          # v-prefixed git tag (getDigest fetches releases/tags/<value>)
+          ACTIONLINT_V="${ACTIONLINT_VERSION#v}" # tarball filename is versionless
+          # Renovate keeps ACTIONLINT_SHA256 in lockstep with ACTIONLINT_VERSION (it
+          # resolves the new tag's linux_amd64 tarball sha256 from the release).
+          ACTIONLINT_SHA256="8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+          curl -fsSLo /tmp/actionlint.tar.gz \
+            --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 15 \
+            "https://github.com/rhysd/actionlint/releases/download/${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_V}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  /tmp/actionlint.tar.gz" | sha256sum -c -
+          mkdir -p "${HOME}/.local/bin"
+          tar -xzf /tmp/actionlint.tar.gz -C "${HOME}/.local/bin" actionlint
+          rm -f /tmp/actionlint.tar.gz
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+          "${HOME}/.local/bin/actionlint" --version
+          # zizmor: a Python-packaged (PyPI) tool, so pipx mirrors the yamllint install.
+          # Pinned exactly: a newer zizmor can add audits that would redden the gate on
+          # an unrelated PR, the drift lint:shell pins shellcheck against. No sha to
+          # maintain (pip verifies from PyPI), so Renovate bumps this fully automatically.
+          # renovate: datasource=pypi depName=zizmor versioning=pep440
+          pipx install zizmor==1.29.0
+      - name: gate:repo (shell + yaml + formula + actions + secrets)
+        env:
+          UZI_LINT_SHELL_REQUIRED: "1"
+          UZI_LINT_YAML_REQUIRED: "1"
+          UZI_LINT_FORMULA_REQUIRED: "1"
+          UZI_LINT_ACTIONS_REQUIRED: "1"
+        run: task gate:repo
+
+  # ------------------------------------------------------------- Helm chart ----
+  helm-chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5
+        with:
+          version: v4.2.4
+      - name: helm dependency build
+        # Bundles the CNPG `cluster` subchart (oci://ghcr.io/cloudnative-pg/charts,
+        # public) per Chart.lock, so the render below is self-contained.
+        run: helm dependency build deploy/chart
+      - name: helm lint
+        run: helm lint deploy/chart
+      - name: Render and assert chart well-formedness
+        run: |
+          helm template uzi deploy/chart -f deploy/values/ci-render.yaml --namespace uzi > /tmp/uzi-rendered.yaml
+          sh scripts/assert-chart-render.sh /tmp/uzi-rendered.yaml
+      - name: Render and assert controller strategy
+        run: |
+          helm template uzi deploy/chart -f deploy/values/ci-render.yaml --namespace uzi \
+            --show-only templates/controller-deployment.yaml > /tmp/uzi-controller.yaml
+          sh scripts/assert-controller-strategy.sh /tmp/uzi-controller.yaml
+      - name: Docker-tier fail-guards
+        run: |
+          # (1) docker on + NetworkPolicy off + no acknowledge -> MUST refuse to render.
+          if helm template uzi deploy/chart --set workers.enabled=true --set api.tls.enabled=true --set workers.docker.enabled=true >/dev/null 2>/tmp/guard.err; then
+            echo "FAIL: the docker tier rendered UNFENCED (NetworkPolicy off, no acknowledgeUnfenced) -- the fail-guard did not fire"; exit 1
+          fi
+          grep -q "workers.docker.networkPolicy.enabled" /tmp/guard.err || { echo "FAIL: render aborted but NOT with the docker fail-guard message:"; cat /tmp/guard.err; exit 1; }
+          echo "OK: docker fail-guard fires when the tier would be unfenced"
+          # (2) docker on + NetworkPolicy on -> renders fine.
+          helm template uzi deploy/chart --set workers.enabled=true --set api.tls.enabled=true --set workers.docker.enabled=true --set workers.docker.networkPolicy.enabled=true >/dev/null
+          # (3) docker on + explicit acknowledgeUnfenced opt-out -> renders fine.
+          helm template uzi deploy/chart --set workers.enabled=true --set api.tls.enabled=true --set workers.docker.enabled=true --set workers.docker.networkPolicy.acknowledgeUnfenced=true >/dev/null
+
+  # ------------------------------------------------ PR image validation ----
+  # `push:false` buildx builds proving each Dockerfile still builds (the retired
+  # kaniko `--no-push` jobs, PRD #230). PULL-REQUEST ONLY and path-filtered: the
+  # heavy builds (agent especially) run only when their inputs change. They touch NO
+  # registry and NO secrets, so the R1 trust boundary is unchanged. On push to main
+  # the real images are built by kind-smoke.yml (api/web) and by release.yml (tags); this
+  # section is pure pre-merge validation.
+  #
+  # `changes` runs on PRs and exposes one boolean per component; each build job gates
+  # on its own flag AND on that component's validate/test/lint gates, so a broken
+  # source never reaches a (slow) image build.
+  changes:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      api: ${{ steps.filter.outputs.api }}
+      web: ${{ steps.filter.outputs.web }}
+      controller: ${{ steps.filter.outputs.controller }}
+      agent: ${{ steps.filter.outputs.agent }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4
+        id: filter
+        with:
+          filters: |
+            api:
+              - 'api/**'
+            web:
+              - 'web/**'
+              - 'docs/**'
+            controller:
+              - 'controller/**'
+            agent:
+              - 'agent/**'
+              - '.dockerignore'
+              - '.github/workflows/ci.yml'
+
+  build-api:
+    runs-on: ubuntu-latest
+    needs: [changes, validate-api, test-api, lint-api]
+    if: needs.changes.outputs.api == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7
+        with:
+          context: api
+          file: api/Dockerfile
+          push: false
+          platforms: linux/amd64
+          tags: uzi-api:pr
+
+  # Context is the repo ROOT: web/Dockerfile COPYs both web/ and docs/.
+  build-web:
+    runs-on: ubuntu-latest
+    needs: [changes, validate-web, test-web]
+    if: needs.changes.outputs.web == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7
+        with:
+          context: .
+          file: web/Dockerfile
+          push: false
+          platforms: linux/amd64
+          tags: uzi-web:pr
+
+  # The backend-free demo/mock SPA image (web/Dockerfile.mock, PRD #311 M1). Same
+  # inputs as build-web; validation-only, never published.
+  build-web-mock:
+    runs-on: ubuntu-latest
+    needs: [changes, validate-web, test-web]
+    if: needs.changes.outputs.web == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7
+        with:
+          context: .
+          file: web/Dockerfile.mock
+          push: false
+          platforms: linux/amd64
+          tags: uzi-web-mock:pr
+
+  build-controller:
+    runs-on: ubuntu-latest
+    needs: [changes, validate-controller, test-controller, lint-controller]
+    if: needs.changes.outputs.controller == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7
+        with:
+          context: controller
+          file: controller/Dockerfile
+          push: false
+          platforms: linux/amd64
+          tags: uzi-controller:pr
+
+  # One job per template (base, jvm). Context is the repo ROOT (the image bakes uzi's
+  # own source at /opt/uzi-src); buildx honours the per-Dockerfile
+  # agent/templates/<t>/Dockerfile.dockerignore and auto-populates TARGETARCH, so
+  # unlike the retired kaniko jobs no --build-arg TARGETARCH is needed.
+  #
+  # LAYER CACHE (cache-from only, no cache-to). The agent base is by far the most
+  # expensive image (~2.6 GiB of pinned nix + devbox + Chromium realizes before any
+  # uzi source is copied), and this validation build otherwise rebuilds it from
+  # scratch every agent PR (~215s, the PR critical path). release.yml already pushes a
+  # registry buildcache to ghcr.io/vtmocanu/uzi/agent-<t>:buildcache (release.yml
+  # `cache-to`); reading it here reuses those nix/Chromium layers so only the cheap
+  # trailing layers (COPY . /opt/uzi-src, version stamps) rebuild. It is READ-ONLY:
+  # no `cache-to`, so this job never writes the release cache and cannot touch the
+  # GHA 10 GB cap (registry cache lives in GHCR). The agent-<t> packages are PUBLIC
+  # (gh api /users/vtmocanu/packages/container/uzi%2Fagent-base -> visibility: public),
+  # so cache-from pulls ANONYMOUSLY -- NO GHCR login and NO packages: read, so the R1
+  # trust boundary (PR builds touch no registry credential, no secret) is UNCHANGED.
+  # A cache miss (the :buildcache tag absent -- e.g. before the first release that
+  # builds the agent, or a fork PR) is tolerated by build-push-action: the build just
+  # runs cold, exactly as before this line existed.
+  build-agent:
+    runs-on: ubuntu-latest
+    needs: [changes, validate-agent, test-agent]
+    if: needs.changes.outputs.agent == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        template: [base, jvm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7
+        with:
+          context: .
+          file: agent/templates/${{ matrix.template }}/Dockerfile
+          push: false
+          platforms: linux/amd64
+          cache-from: type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache
+          build-args: |
+            UZI_SRC_SHA=${{ github.sha }}
+          tags: uzi-agent-${{ matrix.template }}:pr

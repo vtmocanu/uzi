@@ -1,0 +1,38 @@
+{
+  // Repo tier-2 devbox packages (PRD #18 M5). ONLY the `packages` field is read by
+  // the worker (agent/src/repo-tools.ts extractRepoDevboxPackages) — and ONLY when the
+  // repo owner has enabled `repo_devbox_opt_in`. init_hook/scripts/env/flakes here are
+  // NEVER executed by a run.
+  //
+  // CORRECTION (2026-07-25, PRD #123): this comment used to add "AND each package is on
+  // the admin tool_allowlist". That is FALSE and was load-bearing in the wrong direction.
+  // Tier-2 is bounded by SHAPE ONLY — `PKG_RE` (name / name@version), a 128-char cap and
+  // a 64-package cap in repo-tools.ts. Evidence is the CALL GRAPH, not any one package:
+  // `toolprofile.Resolve`/`Denied` have exactly three callers, all API-side and all tier-1
+  // — tool_allowlist.go:123,129 (admin add), tool_profiles.go:107 (profile write) and
+  // service.go:963 (claim). The worker merges tier-2 in provision-run.ts:54-64 without
+  // consulting any rule set, and provision.ts:57 describes its input as "the resolved
+  // TIER-1 package list (already allowlist-validated server-side)".
+  //
+  // The consequence the wrong comment hid: tier-2 is an UNBOUNDED package set, so an image
+  // seed can never be a superset of it. That is why PRD #123 treats tier-1 and tier-2 as
+  // two different problems instead of one.
+  //
+  // (An earlier draft of this note cited `ruby@3.3` below as the proof, on the reasoning
+  // that ruby is absent from 00046_tool_profiles.sql:38-40 and provisions anyway. WRONG:
+  // that migration is the INITIAL seed, and admins add entries at runtime — ruby is in fact
+  // on the live allowlist, added for this formula's `ruby -c` lint. A live-DB fact cannot be
+  // read off a migration. The claim above never depended on it; the illustration did.)
+  //
+  // ruby: this repo ships a Homebrew formula (Formula/uzi-cli.rb); without ruby a run
+  // editing it can't even `ruby -c` syntax-check it before shipping (judge rec, run
+  // e2d7427b). ruby is genuinely repo-specific (only formula-shipping repos need it),
+  // so it lives here as tier-2 rather than in the baked worker image.
+  //
+  // NOTE: openssl was briefly declared here (run dd06c0ed) but promoted to the baked
+  // worker toolchain (agent/devbox-global/devbox.json) instead — it is a broadly-useful
+  // base crypto/TLS CLI, not a repo-specific extra like ruby, so every worker gets it.
+  "packages": [
+    "ruby@4.0.6"
+  ]
+}

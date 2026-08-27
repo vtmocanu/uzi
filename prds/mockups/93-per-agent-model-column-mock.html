@@ -1,0 +1,188 @@
+<title>uzi run usage — per-agent Model column (mock)</title>
+<style>
+  :root {
+    --bg: 8 10 15;
+    --surface: 15 18 26;
+    --raised: 23 27 38;
+    --edge: 39 45 60;
+    --edge-strong: 58 66 86;
+    --fg: 228 232 240;
+    --muted: 148 158 176;
+    --faint: 122 133 154;
+    --brand: 251 146 60;
+    --info: 56 189 248;
+    --warn: 251 191 36;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: rgb(var(--bg));
+    color: rgb(var(--fg));
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 40px 24px 64px; }
+  .intro { margin: 0 0 24px; }
+  .intro h1 { font-size: 17px; font-weight: 600; margin: 0 0 6px; letter-spacing: -0.01em; }
+  .intro p { margin: 0; font-size: 13px; color: rgb(var(--muted)); max-width: 66ch; }
+  .intro .scope {
+    display: inline-block; margin-top: 10px; font-size: 12px; color: rgb(var(--brand));
+    border: 1px solid rgb(var(--brand) / 0.4); border-radius: 6px; padding: 3px 9px;
+    background: rgb(var(--brand) / 0.08);
+  }
+
+  /* ---- the panel (replica of RunUsagePanel) ---- */
+  .panel {
+    border: 1px solid rgb(var(--edge)); border-radius: 14px;
+    background: rgb(var(--surface) / 0.5); padding: 18px;
+  }
+  .strip {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px;
+    background: rgb(var(--edge)); border: 1px solid rgb(var(--edge));
+    border-radius: 10px; overflow: hidden;
+  }
+  .stat { background: rgb(var(--raised) / 0.75); padding: 10px 14px; }
+  .k { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.07em; color: rgb(var(--faint)); }
+  .v { margin-top: 2px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .v.cost { color: rgb(var(--brand)); }
+  .sub { font-size: 11px; color: rgb(var(--muted)); margin-top: 1px; }
+  .cachebar { margin-top: 6px; display: flex; height: 4px; border-radius: 3px; overflow: hidden; background: rgb(var(--edge)); }
+  .cachebar span:first-child { background: rgb(var(--info)); }
+  .cachebar span:last-child { background: rgb(var(--warn) / 0.8); }
+
+  .section { margin-top: 16px; }
+  .summary { font-size: 12px; color: rgb(var(--muted)); }
+  .summary .tri { color: rgb(var(--faint)); }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 8px; }
+  th, td { padding: 6px 10px; }
+  th {
+    border-bottom: 1px solid rgb(var(--edge)); font-size: 10.5px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.06em; color: rgb(var(--faint)); text-align: right;
+  }
+  th.left, td.left { text-align: left; }
+  td { text-align: right; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; color: rgb(var(--muted)); border-bottom: 1px solid rgb(var(--edge) / 0.5); }
+  td.left { font-family: ui-sans-serif, system-ui, sans-serif; color: rgb(var(--fg)); }
+  tr.total td { font-weight: 600; color: rgb(var(--fg)); border-bottom: none; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 2px; margin-right: 8px; vertical-align: middle; }
+  .dot.lead { background: rgb(var(--brand)); }
+  .dot.sub { background: rgb(var(--info)); }
+  .agent { display: inline-flex; align-items: center; }
+  .foot { margin-top: 6px; font-size: 11px; color: rgb(var(--faint)); }
+
+  /* ---- the NEW model column highlight ---- */
+  th.model, td.model { text-align: left; background: rgb(var(--brand) / 0.06); }
+  th.model { color: rgb(var(--brand)); position: relative; }
+  td.model { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: rgb(var(--fg)); font-size: 12px; }
+  td.model.dim { color: rgb(var(--faint)); }
+  .newpill {
+    display: inline-block; margin-left: 6px; font-size: 8.5px; font-weight: 700; letter-spacing: 0.08em;
+    color: rgb(var(--bg)); background: rgb(var(--brand)); border-radius: 3px; padding: 1px 4px; vertical-align: middle;
+  }
+  .callout {
+    margin-top: 20px; border: 1px dashed rgb(var(--brand) / 0.4); border-radius: 10px;
+    padding: 14px 16px; background: rgb(var(--brand) / 0.04); font-size: 13px; color: rgb(var(--muted));
+  }
+  .callout b { color: rgb(var(--fg)); font-weight: 600; }
+  .callout ul { margin: 8px 0 0; padding-left: 18px; }
+  .callout li { margin: 3px 0; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.92em; color: rgb(var(--fg)); background: rgb(var(--raised)); padding: 1px 5px; border-radius: 4px; }
+</style>
+
+<div class="wrap">
+  <div class="intro">
+    <h1>Run usage — per-agent breakdown, with a Model column</h1>
+    <p>Faithful replica of the run-view usage panel (ember theme). Everything is the shipping layout except the one addition: a <b style="color:rgb(var(--brand))">Model</b> column in the per-agent table, so you can see which model each agent ran on without inferring it from the single model shown in the top strip.</p>
+    <span class="scope">Scope: this column only. No cost, no other change.</span>
+  </div>
+
+  <div class="panel">
+    <!-- strip: unchanged -->
+    <div class="strip">
+      <div class="stat">
+        <div class="k">Tokens in</div>
+        <div class="v">250.0k</div>
+        <div class="sub">70% from cache</div>
+        <div class="cachebar"><span style="width:70%"></span><span style="width:30%"></span></div>
+      </div>
+      <div class="stat">
+        <div class="k">Tokens out</div>
+        <div class="v">12.3k</div>
+        <div class="sub">1 phase · 12 turns</div>
+      </div>
+      <div class="stat">
+        <div class="k">Duration</div>
+        <div class="v">4m 52s</div>
+        <div class="sub">claude-opus-4-8</div>
+      </div>
+      <div class="stat">
+        <div class="k">Cost</div>
+        <div class="v cost">$2.62</div>
+        <div class="sub">your Anthropic token</div>
+      </div>
+    </div>
+
+    <!-- per-phase: unchanged -->
+    <div class="section">
+      <div class="summary"><span class="tri">▾ </span>Per-phase breakdown</div>
+      <table>
+        <thead>
+          <tr>
+            <th class="left">Phase</th><th>Turns</th><th>In (fresh)</th><th>In (cached)</th><th>Out</th><th>Cost</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td class="left">Plan</td><td>12</td><td>75.1k</td><td>174.9k</td><td>12.3k</td><td>$2.62</td></tr>
+          <tr class="total"><td class="left">Run total</td><td>12</td><td>75.1k</td><td>174.9k</td><td>12.3k</td><td>$2.62</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- per-agent: the ONLY change is the Model column -->
+    <div class="section">
+      <div class="summary"><span class="tri">▾ </span>Per-agent breakdown</div>
+      <table>
+        <thead>
+          <tr>
+            <th class="left">Agent</th>
+            <th class="model">Model<span class="newpill">NEW</span></th>
+            <th>In (fresh)</th><th>In (cached)</th><th>Out</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="left"><span class="agent"><span class="dot lead"></span>lead</span></td>
+            <td class="model">claude-opus-4-8</td>
+            <td>266.5k</td><td>1.12M</td><td>80</td>
+          </tr>
+          <tr>
+            <td class="left"><span class="agent"><span class="dot sub"></span>researcher</span></td>
+            <td class="model">claude-opus-4-8</td>
+            <td>237.7k</td><td>893.6k</td><td>188</td>
+          </tr>
+          <tr>
+            <td class="left"><span class="agent"><span class="dot sub"></span>coder</span></td>
+            <td class="model">claude-sonnet-5</td>
+            <td>130.4k</td><td>251.9k</td><td>146</td>
+          </tr>
+          <tr class="total">
+            <td class="left">Attributed total</td>
+            <td class="model dim">2 models</td>
+            <td>634.7k</td><td>2.27M</td><td>414</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="foot">Attributed from each agent's assistant messages; may not sum to the run total (tokens only — per-agent cost is not available).</div>
+    </div>
+  </div>
+
+  <div class="callout">
+    <b>What you'd be approving</b>
+    <ul>
+      <li>A <b>Model</b> column in the per-agent table only (placed right after Agent). The strip, per-phase table, and everything else stay untouched.</li>
+      <li>Value = the model each agent's assistant frames actually ran on (e.g. a subagent that pinned <code>claude-sonnet-5</code> shows it, even though the strip's run model is <code>claude-opus-4-8</code>).</li>
+      <li>Open question for the PRD, shown here as one option: if an agent used more than one model across the run, the total row reads <code>2 models</code>; a per-agent cell could show <code>claude-opus-4-8 +1</code>. (Rare — subagents normally use one.)</li>
+    </ul>
+  </div>
+</div>

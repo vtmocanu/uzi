@@ -1,0 +1,547 @@
+# No hardcoded `name:`. Compose derives the project name from the directory, so
+# each git worktree gets its own isolated stack + pgdata volume. (A pinned
+# `name: uzi` made every worktree share containers and the pgdata volume with
+# the main `uzi` checkout, so a `down -v` in one wiped another's data.) The main
+# checkout dir is `uzi`, so its volume name stays `uzi_pgdata`.
+
+# Local laptop demo. Every published port is bound to 127.0.0.1 so nothing is
+# exposed on the network.
+
+services:
+  db:
+    image: postgres:17@sha256:5c855ad7b85e68e48a62f34662853f38b57c1c1d80f3a927ab58034fd6d31c5e
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-uzi}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-uzi}
+    # Not published to the host: the DB is reachable only over the compose
+    # network (by the api service). Nothing on the laptop can reach it.
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-uzi} -d ${POSTGRES_DB:-uzi}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  api:
+    build: ./api
+    environment:
+      API_ADDR: ":8080"
+      DATABASE_URL: "postgres://${POSTGRES_USER:-uzi}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-uzi}?sslmode=disable"
+      JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET in .env - generate with openssl rand -hex 64}"
+      UZI_SECRET_KEY: "${UZI_SECRET_KEY:?set UZI_SECRET_KEY in .env - generate with openssl rand -base64 32}"
+      AUTH_TOKEN_TTL: ${AUTH_TOKEN_TTL:-168h}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://127.0.0.1:8080}
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-10}
+      RATE_LIMIT_WINDOW: ${RATE_LIMIT_WINDOW:-1m}
+      # Registration policy. Without these lines both vars are inert — config.Load
+      # reads the api container env, so the .env allowlist that fences OIDC JIT
+      # provisioning (audit M2) would silently do nothing. Empty allowlist = no domain
+      # restriction (config.parseEmailDomains -> nil, emailDomainAllowed allows all);
+      # registration defaults on. Defaults match config.go.
+      UZI_ALLOWED_EMAIL_DOMAINS: ${UZI_ALLOWED_EMAIL_DOMAINS:-}
+      UZI_REGISTRATION_ENABLED: ${UZI_REGISTRATION_ENABLED:-true}
+      # OIDC single sign-on (PRD #45). Without these lines every UZI_OIDC_*/
+      # UZI_PASSWORD_LOGIN_ENABLED var in .env is inert — config.Load reads the api
+      # container env, which compose must wire in from .env. Setting the issuer (plus
+      # client id/secret, all-or-nothing) enables "Sign in with SSO"; the redirect URI
+      # is FRONTEND_ORIGIN + /api/auth/oidc/callback. See docs/oidc.md.
+      UZI_PASSWORD_LOGIN_ENABLED: ${UZI_PASSWORD_LOGIN_ENABLED:-true}
+      UZI_OIDC_ISSUER_URL: ${UZI_OIDC_ISSUER_URL:-}
+      UZI_OIDC_CLIENT_ID: ${UZI_OIDC_CLIENT_ID:-}
+      UZI_OIDC_CLIENT_SECRET: ${UZI_OIDC_CLIENT_SECRET:-}
+      UZI_OIDC_SCOPES: ${UZI_OIDC_SCOPES:-openid profile email}
+      UZI_OIDC_PROVIDER_NAME: ${UZI_OIDC_PROVIDER_NAME:-SSO}
+      UZI_OIDC_HTTP_TIMEOUT: ${UZI_OIDC_HTTP_TIMEOUT:-15s}
+      # Group-based roles/access (PRD #55). Non-secret. The GATING vars
+      # (UZI_OIDC_ADMIN_GROUPS / UZI_OIDC_ALLOWED_GROUPS) require OIDC configured above
+      # — setting either while OIDC is off refuses to start. Empty admin/allowed groups
+      # = feature dormant. UZI_OIDC_GROUPS_CLAIM is a dormant format knob (ships with a
+      # default) that never blocks boot on its own. Exact + case-sensitive. See docs/oidc.md.
+      UZI_OIDC_GROUPS_CLAIM: ${UZI_OIDC_GROUPS_CLAIM:-groups}
+      UZI_OIDC_ADMIN_GROUPS: ${UZI_OIDC_ADMIN_GROUPS:-}
+      UZI_OIDC_ALLOWED_GROUPS: ${UZI_OIDC_ALLOWED_GROUPS:-}
+      # Forge integration (PRD #2). Base URLs are an SSRF allowlist; the sync
+      # engine polls each enabled repo on FORGE_POLL_INTERVAL.
+      FORGE_ALLOWED_BASE_URLS: ${FORGE_ALLOWED_BASE_URLS:-https://gitlab.example.com}
+      FORGE_POLL_INTERVAL: ${FORGE_POLL_INTERVAL:-60s}
+      FORGE_RECONCILE_EVERY: ${FORGE_RECONCILE_EVERY:-10}
+      FORGE_HTTP_TIMEOUT: ${FORGE_HTTP_TIMEOUT:-15s}
+      # Per-user budget on the forge-proxying endpoints (verify/projects/sync/move).
+      FORGE_RATE_LIMIT_MAX: ${FORGE_RATE_LIMIT_MAX:-30}
+      FORGE_RATE_LIMIT_WINDOW: ${FORGE_RATE_LIMIT_WINDOW:-1m}
+      # Optional startup admin seed. Unset => no seeding. If set, the API creates
+      # this admin after migrations (only if absent) and refuses to boot on an
+      # invalid seed password.
+      UZI_SEED_EMAIL: ${UZI_SEED_EMAIL:-}
+      UZI_SEED_PASSWORD: ${UZI_SEED_PASSWORD:-}
+      UZI_SEED_NAME: ${UZI_SEED_NAME:-}
+      # Optional startup forge-connection seed (belongs to the admin above).
+      # Unset UZI_SEED_FORGE_PAT => no forge seeding. A forge outage at seed time
+      # is non-fatal (logged and skipped); a bad static config (PAT without email,
+      # non-allowlisted base URL) refuses to boot.
+      UZI_SEED_FORGE_PAT: ${UZI_SEED_FORGE_PAT:-}
+      UZI_SEED_FORGE_BASE_URL: ${UZI_SEED_FORGE_BASE_URL:-}
+      UZI_SEED_FORGE_REPOS: ${UZI_SEED_FORGE_REPOS:-}
+      # Optional startup Anthropic-token seed (belongs to the admin above), so a
+      # local `down -v` doesn't force re-pasting it. Unset => no seeding. Seeds the
+      # operator's EXISTING token; never mints one (testing-credentials policy).
+      # Without this line the boot-seed is inert — config.Load reads it from the
+      # api container env, which compose must wire in from .env.
+      UZI_SEED_ANTHROPIC_TOKEN: ${UZI_SEED_ANTHROPIC_TOKEN:-}
+      # Slack integration (PRD #25). Without these lines every SLACK_*/seed var in
+      # .env is inert — config.Load reads the api container env, which compose must
+      # wire in from .env. Overlay vars pin + grey the admin UI fields; the
+      # UZI_SEED_SLACK_* vars instead seed the DB create-only on first boot and
+      # leave the UI editable. A seed var and its overlay counterpart together
+      # refuse to boot.
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
+      SLACK_APP_TOKEN: ${SLACK_APP_TOKEN:-}
+      UZI_PUBLIC_BASE_URL: ${UZI_PUBLIC_BASE_URL:-}
+      SLACK_HTTP_TIMEOUT: ${SLACK_HTTP_TIMEOUT:-15s}
+      SLACK_DM_RATE_LIMIT_MAX: ${SLACK_DM_RATE_LIMIT_MAX:-6}
+      SLACK_DM_RATE_LIMIT_WINDOW: ${SLACK_DM_RATE_LIMIT_WINDOW:-1m}
+      SLACK_SOCKET_DEBUG: ${SLACK_SOCKET_DEBUG:-}
+      UZI_SEED_SLACK_BOT_TOKEN: ${UZI_SEED_SLACK_BOT_TOKEN:-}
+      UZI_SEED_SLACK_APP_TOKEN: ${UZI_SEED_SLACK_APP_TOKEN:-}
+      UZI_SEED_PUBLIC_BASE_URL: ${UZI_SEED_PUBLIC_BASE_URL:-}
+      # EMPTY BY DEFAULT: never trust X-Forwarded-For. This matches the api's own
+      # Go default, which config.go calls "the conservative default" — compose was
+      # what widened it.
+      #
+      # The old default trusted the whole private RFC1918 space "so the real client
+      # IP is read from the XFF nginx sets". That reasoning does not survive contact
+      # with this topology, in BOTH directions:
+      #
+      #  * It bought nothing. `web` publishes on 127.0.0.1 only, so every browser
+      #    connection arrives through Docker's userland proxy and nginx sees the
+      #    BRIDGE GATEWAY as $remote_addr — an address itself inside 172.16.0.0/12.
+      #    ClientIP looks for the rightmost NON-trusted XFF entry, finds none, and
+      #    falls through to RemoteAddr = the nginx container IP. That is exactly what
+      #    an empty set produces. Same bucket key, shorter path. (docs/auth-design.md
+      #    already documents and accepts this shared bucket on compose.)
+      #  * Its only live effect was the exploit. The one address the filter does NOT
+      #    swallow is an attacker's invented public IP (203.0.113.x) — non-trusted,
+      #    therefore returned and used as the rate-limit key. The `agent` container
+      #    shares this network and runs a model against a user's cloned repo, i.e.
+      #    semi-hostile code BY DESIGN (see agent/src/guardrails.ts). It could POST
+      #    /api/auth/login with a rotating XFF, land in a fresh per-IP bucket every
+      #    time, and defeat the brute-force control on the admin login outright.
+      #
+      # The previous comment here claimed "a direct hit that bypasses nginx from a
+      # non-trusted source has its XFF ignored". True of an outside attacker, and
+      # FALSE of the agent container — the one caller that runs untrusted code, and
+      # the only one that was inside the trusted set.
+      #
+      # THE ONE THING THE CHANGE DOES COST, stated because "bought nothing" is scoped
+      # to the topology above and one topology sits outside it: if you publish `web`
+      # on a PUBLIC interface with no proxy in front, the old broad default did give
+      # per-public-IP rate-limit buckets (a browser's public XFF entry is non-trusted,
+      # so ClientIP returns it), and the empty default collapses every browser into the
+      # single shared bucket keyed on the nginx container IP. Brute force is still
+      # capped — the limit holds, which is why this is the right default anyway — but
+      # the cap is now SHARED, so one noisy client can exhaust the login bucket for
+      # everyone else. That is an availability trade, not a security one, and it lands
+      # only on a self-exposed stack, which is off the supported path (the fix is a
+      # real proxy and the narrow value below, not a wider CIDR — which would hand the
+      # agent container XFF forgery to buy it back).
+      #
+      # SET THIS ONLY for a real reverse proxy you run in front of uzi, and set it to
+      # THAT PROXY'S ADDRESS, narrowly. Any CIDR broad enough to be typed by hand
+      # (10.0.0.0/8, 172.16.0.0/12) covers the agent container too and hands it XFF
+      # forgery — no IP-based scheme can separate them, because they share a network.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      # Agent-runtime knobs (PRD #4), read by the API's config.Load (server side).
+      # RUN_TIMEOUT and RUN_MAX_REQUEUES drive the run sweeper; WORKER_HEARTBEAT_STALE
+      # WORKER_AFFINITY_GRACE and WORKER_SPREAD_GRACE drive worker liveness + claim
+      # affinity + fleet-aware run spread (PRD #216); RUN_BACKGROUND_GRACE
+      # (PRD #320) is the run-age fail-open — a demoted judge/self_improve run older
+      # than it collapses to normal priority so background work never starves;
+      # RUN_IDLE_TIMEOUT
+      # and RUN_MAX_ITERATIONS are read here and shipped to the worker in the claim
+      # payload (enforced worker-side); PLAN_MAX_REVISIONS (PRD #41) likewise rides
+      # the claim config and is enforced both server-side and worker-side. Without
+      # these lines, setting them in .env is
+      # inert and the API falls back to its Go defaults. (WORKER_HEARTBEAT_INTERVAL and
+      # WORKER_POLL_INTERVAL are worker cadences consumed by the agent service, not here.)
+      RUN_TIMEOUT: ${RUN_TIMEOUT:-2h}
+      RUN_IDLE_TIMEOUT: ${RUN_IDLE_TIMEOUT:-10m}
+      RUN_MAX_ITERATIONS: ${RUN_MAX_ITERATIONS:-5}
+      PLAN_MAX_REVISIONS: ${PLAN_MAX_REVISIONS:-3}
+      # PRD #88 clarification bounds. Read here and shipped in the claim (enforced
+      # worker-side) for the same reason PLAN_MAX_REVISIONS is: a worker env var is
+      # unreachable on hosted k8s, where the controller renders exactly one tuning var
+      # into a worker pod.
+      #
+      # NEITHER bound is durable, and that applies to BOTH of them for one reason:
+      # each is held in worker memory (a park counter and a park timer), so a worker
+      # death re-queues the run and both restart. Both are per RUN-ATTEMPT, not per
+      # park: questionDeadlines is set once on the first park and cleared only by the
+      # terminal finally, so N questions in one attempt SHARE one deadline. The lifetime
+      # ceilings are each value x (RUN_MAX_REQUEUES + 1) — on defaults, 10 questions
+      # and 48h of waiting, not 5 and 24h.
+      QUESTION_MAX: ${QUESTION_MAX:-5}
+      QUESTION_TIMEOUT_SECONDS: ${QUESTION_TIMEOUT_SECONDS:-86400}
+      RUN_MAX_REQUEUES: ${RUN_MAX_REQUEUES:-1}
+      # PRD #108 M5's auto-stop kill switch. Passed through explicitly because the
+      # comment above is load-bearing here in a way it is not for a tuning knob:
+      # docs/run-auto-stopped.md TELLS an operator to set this to disable a behaviour
+      # that terminates runs, and without this line that instruction silently does
+      # nothing on compose — config.go's `true` default wins and the operator
+      # believes they disarmed something they did not. That is the exact failure the
+      # abort-on-malformed-value choice in config.go exists to prevent, arriving by
+      # a different route.
+      UZI_AUTOSTOP_ENABLED: ${UZI_AUTOSTOP_ENABLED:-true}
+      # PRD #35's usage-limit park caps. RUN_LIMIT_MAX_WAITS is how many times ONE run
+      # may park waiting for the owner's Anthropic window to reopen before it fails
+      # instead ("never park" at 0, which is the pre-feature behaviour); RUN_LIMIT_MAX_PARK
+      # is how far out a single park may reach, past which the run fails rather than
+      # waiting. They COMPOSE: a run can hold its issue's one-active lock for at most
+      # the product of the two, ~40 days at these defaults.
+      #
+      # Passed through for the same reason as UZI_AUTOSTOP_ENABLED above rather than as
+      # a tuning nicety: both bound how long uzi may sit on a user's issue and a
+      # worker's disk, so an operator who lowers either in .env and sees no effect has
+      # been silently overruled by config.go's default.
+      RUN_LIMIT_MAX_WAITS: ${RUN_LIMIT_MAX_WAITS:-5}
+      RUN_LIMIT_MAX_PARK: ${RUN_LIMIT_MAX_PARK:-192h}
+      WORKER_HEARTBEAT_STALE: ${WORKER_HEARTBEAT_STALE:-45s}
+      SWEEP_INTERVAL: ${SWEEP_INTERVAL:-15s}
+      WORKER_AFFINITY_GRACE: ${WORKER_AFFINITY_GRACE:-2m}
+      WORKER_SPREAD_GRACE: ${WORKER_SPREAD_GRACE:-9s}
+      RUN_BACKGROUND_GRACE: ${RUN_BACKGROUND_GRACE:-15m}
+    # Not published to the host: reached only by web over the compose network.
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/server", "-health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  web:
+    # Context is the repo root (not ./web) so the docs viewer can bundle docs/
+    # as a sibling of web/ at build time; see web/Dockerfile and the root
+    # .dockerignore that keeps the context lean while preserving docs/*.md.
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # Per-user worker (PRD #4). Opt-in via `docker compose --profile agent up`, so
+  # the base stack (db/api/web) runs without it. Outbound-only: no published
+  # ports; it reaches the api over the compose network with a join token. The
+  # bare-clone cache + worktrees live on a persistent volume.
+  #
+  # Capability + uid hardening (PRD #46 audit item 6 + PRD #51 A1). cap_drop: ALL +
+  # no-new-privileges shrink the blast radius of a prompt-injected agent (its Bash
+  # tool runs in this container). PRD #51 splits the single container uid in two: the
+  # credential-holding `worker` (join token, forge PAT, Anthropic token) and a
+  # distinct, cap-less `runner` the worker spawns the untrusted code-execution
+  # surfaces under (SDK agent, self-improve checks, provision hooks). The image runs
+  # as ROOT and the entrypoint (agent/templates/entrypoint.sh) setpriv-drops to
+  # `worker` keeping only CAP_SETUID/SETGID (ambient), and forces the join token to
+  # 0400 worker so the `runner` uid cannot read it off disk.
+  # M6 /proc hardening: the join token is a FILE secret (mounted at
+  # /run/secrets/worker_token from UZI_WORKER_TOKEN), not an env var, so it is not in
+  # the worker's /proc/<pid>/environ. Under the uid split the runner also cannot read
+  # the worker's /proc environ (different uid; root-owned once the worker is
+  # non-dumpable), structurally closing the PAT push-window environ race PRD #46 left
+  # as a residual. The worker spawns every untrusted surface as the `runner` uid
+  # (agent/src/runner-uid.ts, M4), which completes the read-denied boundary. This
+  # applies because the compose stack ROOT-starts (the entrypoint drops root->worker);
+  # the SAME image on a #58 restricted-namespace non-root start runs single-uid, no
+  # split. The k8s form is separate containers with per-container runAsUser (docs-only
+  # here). See docs/proc-hardening.md, prds/51-worker-uid-split.md, and killAgentTree in
+  # agent/src/sdk-executor.ts.
+  agent:
+    # Worker template selection (PRD #18): WORKER_TEMPLATE picks which curated
+    # Dockerfile under agent/templates/<name>/ builds the worker image. Default
+    # `base` (today's minimal image); `jvm` adds a JDK. Each template's Dockerfile
+    # bakes its own name as ENV UZI_WORKER_TEMPLATE (a fixed literal, distinct from
+    # this WORKER_TEMPLATE build var), self-reported at register so the server can
+    # badge drift from the per-worker declared choice. `docker compose
+    # build` with no env set still works (defaults to base).
+    #
+    # Context is the REPO ROOT (PRD #39 Decision 5), not ./agent: the worker image
+    # bakes uzi's own read-only source at /opt/uzi-src for the `chat` run kind, and
+    # the per-Dockerfile ignore (agent/templates/<name>/Dockerfile.dockerignore) keeps
+    # secrets/.git/inspiration/node_modules out while KEEPING api/ web/ agent/ docs/…
+    # UZI_SRC_SHA stamps BUILD_INFO with the deployed commit; export it before build
+    # (e.g. `UZI_SRC_SHA=$(git rev-parse HEAD) docker compose build agent`), empty ok.
+    build:
+      context: .
+      dockerfile: agent/templates/${WORKER_TEMPLATE:-base}/Dockerfile
+      args:
+        UZI_SRC_SHA: ${UZI_SRC_SHA:-}
+    profiles: ["agent"]
+    security_opt:
+      # Blocks suid privilege GAIN; does NOT block the entrypoint's root -> worker
+      # drop (a setuid to a LOWER uid). Stays on post-drop.
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    # PRD #51 A1: re-grant ONLY the caps the root entrypoint's startup window needs.
+    # It uses CHOWN + DAC_OVERRIDE to migrate the persisted volumes to the worker uid
+    # (B4) and force the join token to 0400 worker, SETPCAP to tighten the bounding
+    # set, then setpriv-drops root -> worker keeping only SETUID/SETGID as AMBIENT caps
+    # (so the worker can spawn runner-uid children in M4). The setuid-to-non-root
+    # transition clears the permitted set, so CHOWN/DAC_OVERRIDE/SETPCAP do NOT survive
+    # the drop — the run-lifetime worker holds only SETUID/SETGID (Decision 7). The
+    # control is the worker DROPPING the extras, not this bounding-set budget.
+    cap_add:
+      - SETUID
+      - SETGID
+      - SETPCAP
+      - CHOWN
+      - DAC_OVERRIDE
+    # Resource limits (PRD #42 Decision 9). The worker is ONE shared cgroup: the
+    # run lane and the #39 chat lane draw from this single cpus/mem_limit budget —
+    # there is no per-run fairness on compose (that needs per-run cgroups, deferred).
+    # SIZING FORMULA:
+    #   mem_limit = (WORKER_MAX_CONCURRENT_RUNS + WORKER_CHAT_SESSIONS) × per-slot
+    #               budget + headroom
+    # A slot ≈ one SDK CLI subprocess (node) + git + optional devbox/nix provisioning;
+    # budget it at ~1.5 GiB / 1.0 CPU each. The DEFAULT config is 1 run slot + 1 chat
+    # session = 2 slots → 2×1.5 GiB = 3 GiB + ~1 GiB headroom (worker supervisor, git,
+    # provisioning bursts) = 4 GiB, and 2×1.0 = 2 CPUs. To RAISE the run cap, add one
+    # per-slot budget (~1.5 GiB, ~1 CPU) to AGENT_MEM_LIMIT / AGENT_CPUS for each extra
+    # run (WORKER_CHAT_SESSIONS is not compose-tunable here, so chat stays 1 slot).
+    # OOM is a SHARED-cgroup event: an over-budget run OOM-kills the whole container,
+    # requeuing ALL its in-flight runs together — safe for `main`, but after
+    # RUN_MAX_REQUEUES (api env above, default 1) an innocent sibling FAILS instead of
+    # requeuing. Raise RUN_MAX_REQUEUES alongside any cap>1. Full guidance: docs/worker-setup.md.
+    cpus: ${AGENT_CPUS:-2}
+    mem_limit: ${AGENT_MEM_LIMIT:-4g}
+    environment:
+      UZI_API_URL: ${UZI_API_URL:-http://api:8080}
+      # /proc hardening (M6): read the join token from the mounted secret file, not
+      # an env var, so it never lands in the worker's /proc/<pid>/environ. The value
+      # comes from UZI_WORKER_TOKEN (.env) via the `worker_token` secret below; the
+      # worker also accepts UZI_WORKER_TOKEN directly as a backward-compat fallback.
+      # PRD #51 M2: the entrypoint forces this file to 0400 worker (compose delivers
+      # it 0444 root:root) so the runner uid cannot read it — see the secrets comment.
+      UZI_WORKER_TOKEN_FILE: /run/secrets/worker_token
+      UZI_DATA_DIR: /data
+      UZI_WORKER_NAME: ${UZI_WORKER_NAME:-}
+      WORKER_HEARTBEAT_INTERVAL: ${WORKER_HEARTBEAT_INTERVAL:-15s}
+      WORKER_POLL_INTERVAL: ${WORKER_POLL_INTERVAL:-3s}
+      # Cap on how long a run may sit at the plan-approval gate before it is failed
+      # (M4 resolution of the PRD's open awaiting_approval cap): generous so a human
+      # has time, finite so an abandoned plan never wedges the single-run worker.
+      WORKER_PLAN_APPROVAL_TIMEOUT: ${WORKER_PLAN_APPROVAL_TIMEOUT:-24h}
+      # RUN-lane concurrency cap (PRD #42 Decision 3): how many issue/ci_fix runs
+      # this worker executes AT ONCE (chat is a separate lane). Default 1 = the
+      # pre-#42 serial behavior; soft ceiling 8 (above that the worker still honors
+      # it but warns at boot). Raising it multiplies memory/CPU/token pressure — size
+      # cpus/mem_limit above and RUN_MAX_REQUEUES with it. See docs/worker-setup.md.
+      WORKER_MAX_CONCURRENT_RUNS: ${WORKER_MAX_CONCURRENT_RUNS:-1}
+      # PRD #83 M2: the DinD sidecar socket the worker probes. Unset by DEFAULT (empty):
+      # a plain `--profile agent` worker then does ONE fast probe of the default path and
+      # NEVER blocks. When you run `--profile agent-docker`, SET this (to
+      # /run/dind/docker.sock) so the worker EXPECTS the sidecar and its keystone bounded-
+      # wait bridges the daemon-vs-worker start race (else a slow dind can cost the docker
+      # capability). See docs/worker-docker.md (M4). The agent always mounts the socket
+      # volume; this only controls the readiness WAIT + capability self-report.
+      UZI_DIND_SOCKET: ${UZI_DIND_SOCKET:-}
+      UZI_LOG_LEVEL: ${UZI_LOG_LEVEL:-info}
+    volumes:
+      - agentdata:/data
+      # Persist the nix store across container recreation so per-run tool
+      # provisioning warm-starts (PRD #18 M3). The store stays at its default /nix
+      # path (relocating it forfeits cache.nixos.org substitution); Docker seeds
+      # this named volume from the image's build-time /nix on first use.
+      #
+      # PRD #92 M2 — STALENESS: Docker auto-seeds a named volume from the image ONLY
+      # when the volume is EMPTY, and there is no sentinel/version marker here to catch
+      # a toolchain-changing image roll (the k8s seed is version-aware; compose is not,
+      # by decision — no reseed machinery is built for compose). So after rolling to an
+      # image whose baked toolchain changed (go/python3/gcc/pip), you MUST force a
+      # re-seed: `docker compose down -v` (or `docker volume rm <project>_agentnix`)
+      # before `up`, or the worker runs against the OLD store with a dead PATH. The M3
+      # boot toolchain preflight converts any such staleness into a LOUD boot failure
+      # rather than a silent mid-run 127.
+      - agentnix:/nix
+      # PRD #83 M2: mount the shared DinD socket volume UNCONDITIONALLY (even on the
+      # plain `--profile agent` path). Empty when the `dind` sidecar is down = harmless:
+      # M1's resolveDockerWiring probes /run/dind/docker.sock, finds nothing, and docker
+      # stays inert + guardrail-denied. Bring the sidecar up (`--profile agent-docker`)
+      # and the socket appears at exactly that path, so the worker auto-detects it — no
+      # per-profile conditional DOCKER_HOST env is needed. The volume carries ONLY the
+      # socket (Decision 3). rw (not :ro): the docker CLIENT connect(2)s the socket.
+      - dindsock:/run/dind
+    secrets:
+      - worker_token
+    # NOTE (M2 follow-up): the agent does NOT `depends_on: dind`. On the pinned engine
+    # (Docker Compose 5.1.2) a `depends_on` whose target is disabled by the active profiles
+    # ERRORS the whole project ("service agent depends on undefined service dind: invalid
+    # compose project") rather than being skipped — so a plain `--profile agent` (non-docker)
+    # run would fail to start. Instead the readiness is handled WORKER-SIDE by the keystone
+    # bounded-wait (agent/src/docker-wiring.ts): when a sidecar is expected (UZI_DIND_SOCKET
+    # / DOCKER_HOST set) the worker retries the probe until the daemon is up. The e2e names
+    # `dind` in its `up` so the daemon starts; the `dind` healthcheck makes `up --wait dind`
+    # meaningful.
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # PRD #83 M2: socket-permission helper for the rootless DinD sidecar. Two problems the
+  # rootless daemon cannot solve for itself, both established live (see the M2 commit /
+  # PRD Decision Log — this is the recorded day-1 set, tester validates + reduces):
+  #   1. The shared `dindsock` named volume mounts root-owned 0755, but rootless dockerd
+  #      runs as uid 1000 and REFUSES to start without a WRITABLE XDG_RUNTIME_DIR
+  #      ("need writable ... XDG_RUNTIME_DIR (/run/dind) for user 1000"). Only root can
+  #      chown it, and the sidecar has no root window (image USER=rootless), so this
+  #      helper (root) chowns /run/dind → 1000:1000 + 0711 (traversable by others) BEFORE
+  #      the daemon starts. `dind` gates on this via depends_on: service_healthy.
+  #   2. The daemon creates docker.sock 0660 owned by uid 1000 + a userns-REMAPPED gid.
+  #      The worker probes as uid 10001 and the agent runs docker as the `runner` uid
+  #      10002; a `group_add` would reach the worker but the #51 uid split spawns runner
+  #      children with setpriv `--init-groups`, which DROPS supplementary groups — so the
+  #      agent's own `docker` would still be denied. Making the socket 0666 lets BOTH uids
+  #      connect with no group dependency (validated: uid 10002 ran a container via the
+  #      sidecar). The socket is on a volume only this trio mounts, and mount-ns
+  #      (Decision 3) — not the socket mode — is the containment, so 0666 is acceptable.
+  #   The loop re-applies 0666 so a `dind` restart (new socket inode) stays reachable.
+  dind-init:
+    image: alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+    profiles: ["agent-docker"]
+    # Runs as root (default) — the chown/chmod of a root-owned volume needs it.
+    # SECURITY (auditor LOW): `0711` on /run/dind is deliberate, not lax — others get
+    # traverse-ONLY (x), never write (w), so a non-owner (the runner uid) can reach the
+    # daemon socket the rootless uid owns but CANNOT create/replace/squat a file in the dir
+    # (e.g. plant a rogue docker.sock). Do NOT loosen it to 0777. Only the socket itself is
+    # 0666, and only because both the probe uid and the split runner uid must connect.
+    command:
+      - "sh"
+      - "-c"
+      - "chown 1000:1000 /run/dind && chmod 0711 /run/dind && touch /tmp/dir-ready
+         && while :; do [ -S /run/dind/docker.sock ] && chmod 0666 /run/dind/docker.sock; sleep 2; done"
+    volumes:
+      - dindsock:/run/dind
+    healthcheck:
+      # Healthy once the socket dir is prepared, so `dind` waits for a writable runtime dir.
+      test: ["CMD-SHELL", "[ -f /tmp/dir-ready ]"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+
+  # PRD #83 M2: opt-in rootless Docker-in-Docker SIDECAR (the laptop dev loop). It
+  # supplies the actual daemon for a worker whose repo tests need docker/`docker
+  # compose` — uzi's own e2e/smoke do `docker compose up`. The docker CLIENT already
+  # lives in `base` (M1, inert without a daemon); this is the daemon, in its OWN
+  # container with its OWN mount namespace (Decision 3), so a hijacked agent doing
+  # `docker run -v /run/secrets/worker_token:/x` binds THIS container's fs — which holds
+  # none of the worker's secret/`/data`/`/nix`. Profile-gated: the plain `--profile
+  # agent` path is UNCHANGED; bring the daemon up with `--profile agent-docker`.
+  dind:
+    # Namespace isolation (auditor E1/E2 — MUST): an ORDINARY sibling service. NO
+    # `network_mode: "service:agent"`, no `pid:`/`ipc:` sharing. The worker reaches the
+    # daemon ONLY through the shared socket volume. A shared netns would put the daemon's
+    # socket on the worker's own loopback and defeat the separate-mount-ns isolation's intent.
+    #
+    # CROSS-UID socket access (arch §Q4) is SOLVED by dind-init above (chown /run/dind →
+    # 1000:1000 0711 so the rootless daemon starts, then hold the socket at 0666 so both the
+    # worker probe uid 10001 and the runner-uid 10002 agent reach it — validated live). The
+    # remaining tester day-1 item is the minimal privileged/security set (Decision 2), NOT the
+    # socket wiring.
+    #
+    # Rootless DinD (Decision 2): a breakout lands as an unprivileged, userns-mapped host
+    # uid — the same rootless stance as our nix/devbox engine, never host root, never a
+    # host docker.sock. Pinned by digest (multi-arch: amd64 + Apple-Silicon). The
+    # `docker compose` v2 subcommand runs CLIENT-side in the `agent` (M1's
+    # docker-cli-compose) against this daemon, so the daemon image needs only to be a
+    # working rootless dockerd. TESTER confirms the tag/digest boots rootless on the live
+    # host and that `docker compose up` works end-to-end.
+    image: docker:29-dind-rootless@sha256:8a213afdd096a44dff403aaf8eb58b7a96a63113f18a4b094b98b7d0ed7d948b
+    profiles: ["agent-docker"]
+    # Wait for the socket dir to be chowned writable-by-1000 (else rootless dockerd
+    # refuses to start). dind-init keeps running (it also holds the socket 0666 open), so
+    # gate on service_healthy, not completed.
+    depends_on:
+      dind-init:
+        condition: service_healthy
+    # Decision 2 (RECORDED, not hidden): `docker:dind-rootless` normally still needs
+    # `privileged: true` on the OUTER container even in the rootless variant (mount/userns/
+    # sysfs ops the default seccomp/AppArmor profile blocks). The userns REMAP inside the
+    # rootless image is the security property, not the flag's absence. Accepted for a
+    # private factory. DAY-1 (tester): try to REDUCE to `security_opt: [seccomp=unconfined,
+    # apparmor=unconfined]` + `devices: [/dev/fuse]` WITHOUT privileged and record the exact
+    # minimal set that actually brings the daemon up. This informs but does NOT bind k8s
+    # (M3 cannot use privileged under PodSecurity baseline — see PRD Decision 7).
+    privileged: true
+    environment:
+      # rootless dockerd writes its API socket to $XDG_RUNTIME_DIR/docker.sock. Point it at
+      # the shared volume so the socket lands at /run/dind/docker.sock — EXACTLY the path
+      # M1's keystone resolver probes (UZI_DIND_SOCKET default). The socket is the
+      # transport; DOCKER_TLS_CERTDIR is left at the image default (/certs) ON PURPOSE.
+      # The rootless entrypoint force-adds an internal daemon listener regardless of a
+      # dockerd --host override (verified live): with the default it is TLS 2376
+      # (mutual-auth, client certs in the sidecar's own /certs the agent never mounts);
+      # setting DOCKER_TLS_CERTDIR="" only DOWNGRADES it to PLAIN 2375. So the default is
+      # the safest achievable posture. That 2376 listener is UNPUBLISHED (no `ports:`) and
+      # NOT on the agent's netns (no network_mode: service:agent), so it is not the
+      # "always-on UNAUTHENTICATED daemon port" the review warns against — it is a benign
+      # cert-gated residual. Tester day-1: try to fully suppress it via the entrypoint if
+      # cheap; low priority given it is TLS + unpublished + off the agent netns.
+      XDG_RUNTIME_DIR: /run/dind
+    volumes:
+      # Socket-share (the DEFAULT; TCP is a documented fallback only — an always-on
+      # unauthenticated `tcp://dind:2375` is a standing daemon-takeover surface, so we do
+      # NOT expose one). The rootless daemon writes docker.sock here; the `agent` mounts the
+      # SAME volume and auto-detects it. Carries ONLY the socket.
+      - dindsock:/run/dind
+      # The daemon's OWN data root (pulled images, layers, build cache) — the ONLY
+      # worker-adjacent state it holds, in its own mount namespace. Decision 3: `dind` mounts
+      # NONE of agentdata/`/data`, agentnix/`/nix`, or the worker_token secret, so a
+      # container it launches can bind-mount nothing of the worker's. Sizing (PRD #42, → M4
+      # docs): ~5-20 GiB for uzi-e2e-in-dind (pulls postgres:17, builds api/web/agent);
+      # budget the sidecar ~1-2 GiB / ~1 CPU on top of the agent. Needs a GC/retention story.
+      - dinddata:/home/rootless/.local/share/docker
+    # Daemon-readiness healthcheck (M2 follow-up): the daemon answers `docker info` over its
+    # own socket. This makes `dind` a real readiness gate so `docker compose up --wait dind`
+    # waits for the DAEMON (not just the container) — the e2e names `dind` in its `up` and the
+    # worker's keystone bounded-wait handles the residual start race worker-side. `-H` is
+    # explicit because the dind image's client defaults to /var/run/docker.sock, not our
+    # /run/dind. start_period covers the rootless userns bring-up (~5-15s).
+    healthcheck:
+      test: ["CMD-SHELL", "docker -H unix:///run/dind/docker.sock info >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+volumes:
+  pgdata:
+  agentdata:
+  # The worker's nix store (PRD #18): seeded from the image on first use, then
+  # persisted so provisioning is a first-run-only fetch. PRD #92 M2: this auto-seed
+  # is EMPTY-only and has no version marker, so a toolchain-changing image roll leaves
+  # it stale — `docker compose down -v` (or `docker volume rm <project>_agentnix`) to
+  # force a re-seed; the M3 boot preflight makes any staleness a loud boot failure.
+  agentnix:
+  # PRD #83 M2: the DinD socket-share (carries ONLY the daemon socket) and the DinD data
+  # root (images/layers/build cache — its own isolated store, Decision 3). Both are
+  # sidecar-scoped; neither is ever mounted into a container the agent launches.
+  dindsock:
+  dinddata:
+
+secrets:
+  # The worker join token, delivered to the agent as a FILE (mounted at
+  # /run/secrets/worker_token) rather than an env var, so it is absent from the
+  # container's environ (the M6 /proc close). Sourced from UZI_WORKER_TOKEN (.env);
+  # if unset, the secret is empty and the worker fails fast with a clear error.
+  # PRD #51 M2: an env-sourced compose secret mounts 0444 root:root (world-readable —
+  # the runner uid could read it) and its uid/gid/mode are unreliable (audit L2), so
+  # the entrypoint forces it to 0400 worker at startup rather than trusting compose.
+  worker_token:
+    environment: UZI_WORKER_TOKEN

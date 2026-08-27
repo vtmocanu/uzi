@@ -1,0 +1,300 @@
+import os from "node:os";
+import fs from "node:fs";
+import type { LogLevel } from "./log.js";
+import type { DockerWiring } from "./docker-wiring.js";
+import { errMessage } from "./util.js";
+
+// Worker configuration, parsed from env (PRD #4 §Configuration).
+//
+// Interval envs accept either a Go-style duration string ("15s", "3s", "500ms",
+// "2h") — matching how the same knobs are expressed server-side and in
+// docker-compose — or a bare integer read as milliseconds.
+
+/** Which executor drives a claimed run. */
+export type ExecutorKind = "sdk" | "stub";
+
+export interface Config {
+  apiUrl: string;
+  workerToken: string;
+  dataDir: string;
+  workerName: string;
+  /**
+   * The worker template this image was built from (PRD #18), baked in as
+   * ENV UZI_WORKER_TEMPLATE by each agent/templates/<name>/Dockerfile (a hardcoded
+   * literal per template, not the WORKER_TEMPLATE build arg). Reported at register
+   * so the server can badge drift from the declared choice. Defaults to "base"
+   * when the env is unset (the minimal image). Observability only: never a trust
+   * boundary — the server re-validates it and the join token is the sole authn.
+   */
+  workerTemplate: string;
+  version: string;
+  /** `sdk` = Claude Agent SDK (default, product path); `stub` = M2 no-AI stub. */
+  executor: ExecutorKind;
+  /**
+   * When true (UZI_STUB_PLAN_GATE), the `stub` executor drives the M4 plan gate
+   * (emit plan → awaiting_approval → await verdict) before committing, so the
+   * full plan-approval workflow can be exercised end-to-end with no live SDK.
+   * Off by default: the bare M2 stub goes straight to a local commit.
+   */
+  stubPlanGate: boolean;
+  /**
+   * PRD #108 M6: sweep `agent-home/<runId>` trees stranded by the old cleanup once
+   * at startup. On by default — the leak is on every fleet volume already and the
+   * sweep deletes only run ids the API positively reports terminal. `UZI_HOME_RECLAIM=0`
+   * turns it off, because a destructive startup sweep an operator cannot disable is
+   * a bad thing to ship even when its guards are right.
+   */
+  homeReclaimEnabled: boolean;
+  /**
+   * The UZI_WORKER_TOKEN_FILE path, if the join token was delivered by file. The
+   * shipping compose default is a read-only secret mount the entrypoint forces to
+   * 0400 worker-owned, so it persists (the post-read unlink no-ops) and the cap-less
+   * `runner` uid cannot read it (PRD #51); the Bash guardrail denies a `cat` of this
+   * path (defense-in-depth, symmetric with its /proc deny). Undefined for env-var
+   * delivery.
+   */
+  workerTokenFile?: string;
+  heartbeatIntervalMs: number;
+  pollIntervalMs: number;
+  /** How long messages accumulate before a batched POST (PRD: 500ms). */
+  messageBatchMs: number;
+  /** Per-request HTTP timeout for control-plane calls. */
+  httpTimeoutMs: number;
+  /**
+   * Bound on how long a run may sit at the plan-approval gate before it is failed
+   * (M4 resolution of the PRD's open "awaiting_approval wall-clock cap"). Generous
+   * by default so a human has ample time, but finite so an abandoned plan never
+   * pins its slot indefinitely: a gated run holds its slot the whole time it is
+   * parked (PRD #42 Decision 2), so at the default cap of 1 an abandoned plan
+   * wedges the whole run lane until this fires, and at a higher cap it pins one of
+   * N slots. This timeout is the self-heal either way.
+   */
+  planApprovalTimeoutMs: number;
+  /**
+   * PRD #267: minimum interval between time-based origin checkpoint publishes on the
+   * `reap:false` iteration-boundary path. Default 20m; `0` disables the time-based
+   * origin publish entirely, restoring milestone-only checkpoint behaviour. Read from
+   * CHECKPOINT_INTERVAL as a Go-style duration string (e.g. "20m", "0").
+   */
+  checkpointIntervalMs: number;
+  /**
+   * Chat run (PRD #39) lifecycle knobs. Chat rides the run machinery as a third
+   * kind but has its own clocks (Decision 3): a per-conversation turn cap, a
+   * per-turn wall-clock backstop, an idle window that completes a parked chat, and
+   * a faster poll cadence for input pickup (Decision 2, latency floor). The turn
+   * cap default matches the server-side ceiling; a claim's own config may push a
+   * lower per-run value, which the ChatRunner prefers over this worker default.
+   */
+  chatMaxTurns: number;
+  chatTurnTimeoutMs: number;
+  chatIdleTimeoutMs: number;
+  chatPollMs: number;
+  /** How many chat sessions the worker runs CONCURRENTLY with the run slot
+   *  (Decision 4). Default 1 — one live conversation per user-worker; a second chat
+   *  queues until the first ends. The run lane is always a separate concurrent slot. */
+  chatSessions: number;
+  /**
+   * How many issue/ci_fix RUNS the worker executes CONCURRENTLY (PRD #42 Decision
+   * 3), bounded by the slot semaphore in worker.ts. Default 1 — the pre-#42 serial
+   * behavior (one run at a time), identical at the observable level. Validated ≥ 1;
+   * a value above MAX_CONCURRENT_RUNS_SOFT_CEILING is honored but warned at boot (a
+   * fat-fingered cap should shout before the OOM killer does). This is the RUN lane
+   * only — the chat lane has its own, distinct ceiling (chatSessions above).
+   */
+  maxConcurrentRuns: number;
+  /**
+   * The worker's resolved docker wiring (PRD #83 M1 keystone). `loadConfig` leaves it
+   * `{}` — resolution runs a bounded liveness PROBE (async), so it cannot happen in the
+   * sync env parse; main.ts calls `resolveDockerWiring` ONCE at startup and populates
+   * this before the worker registers. `dockerHost` present ⇒ a daemon sidecar is
+   * reachable, so the worker reports the `docker` capability, the guardrail allows
+   * docker, and DOCKER_HOST reaches the SDK env; `{}` ⇒ none of that. In M1 there is no
+   * daemon, so this stays `{}` in practice.
+   */
+  dockerWiring: DockerWiring;
+  /**
+   * Readiness-wait knobs for the docker-wiring probe (PRD #83 M2 follow-up,
+   * UZI_DOCKER_READY_INTERVAL / UZI_DOCKER_READY_TIMEOUT). When a sidecar is EXPECTED
+   * (DOCKER_HOST or UZI_DIND_SOCKET set), the startup probe is retried every
+   * `dockerReadyIntervalMs` up to `dockerReadyTimeoutMs` before degrading to unwired — so a
+   * daemon container a few seconds slower than the worker does not cost the capability. A
+   * worker with NO sidecar expected ignores these (one fast probe, never blocks).
+   */
+  dockerReadyIntervalMs: number;
+  dockerReadyTimeoutMs: number;
+  logLevel: LogLevel;
+}
+
+/** Documented soft ceiling for WORKER_MAX_CONCURRENT_RUNS (PRD #42 Decision 3):
+ *  above this the worker still honors the value but warns at boot, so a
+ *  fat-fingered per-worker cap should be flagged before it OOMs the shared
+ *  container. Advisory only, never enforced. */
+export const MAX_CONCURRENT_RUNS_SOFT_CEILING = 8;
+
+const DURATION_RE = /^(\d+)\s*(ms|s|m|h)?$/;
+
+/** Parse "15s" / "500ms" / "2h" / "15000" into milliseconds. */
+function parseDuration(value: string): number {
+  const m = DURATION_RE.exec(value.trim());
+  if (!m) throw new Error(`invalid duration: ${JSON.stringify(value)}`);
+  const n = Number(m[1]);
+  switch (m[2]) {
+    case "h": return n * 3_600_000;
+    case "m": return n * 60_000;
+    case "s": return n * 1_000;
+    case "ms":
+    case undefined: return n; // bare number = milliseconds
+    default: throw new Error(`invalid duration unit in ${JSON.stringify(value)}`);
+  }
+}
+
+function required(env: NodeJS.ProcessEnv, key: string): string {
+  const v = env[key];
+  if (v === undefined || v.trim() === "") {
+    throw new Error(`missing required env ${key}`);
+  }
+  return v.trim();
+}
+
+function duration(env: NodeJS.ProcessEnv, key: string, fallback: string): number {
+  return parseDuration(env[key]?.trim() || fallback);
+}
+
+/** Parse a positive-integer env (e.g. CHAT_MAX_TURNS) with a fallback; a blank or
+ *  non-positive value falls back rather than throwing, matching duration()'s lenient
+ *  shape for operator-tunable knobs. */
+function positiveInt(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
+  const raw = env[key]?.trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
+function isLogLevel(v: string): v is LogLevel {
+  return v === "debug" || v === "info" || v === "warn" || v === "error";
+}
+
+function parseExecutor(v: string | undefined): ExecutorKind {
+  const kind = v?.trim().toLowerCase();
+  if (kind === "stub") return "stub";
+  if (kind === "sdk" || kind === undefined || kind === "") return "sdk";
+  throw new Error(`invalid UZI_EXECUTOR ${JSON.stringify(v)} (expected "sdk" or "stub")`);
+}
+
+function parseBool(v: string | undefined): boolean {
+  const s = v?.trim().toLowerCase();
+  return s === "1" || s === "true" || s === "yes";
+}
+
+/**
+ * Like `parseBool` but for a flag that ships ON: absent OR empty means the
+ * default. Only an explicit falsy value turns it off.
+ *
+ * The empty case is the one that matters. A compose `${VAR:-}` or a Helm value
+ * defaulting to `""` delivers a set-but-empty variable, and under `parseBool` that
+ * reads as "off" — silently disabling a default-ON feature that nobody asked to
+ * disable. Kept separate from `parseBool` rather than changing it, because the
+ * default-OFF flags want the opposite treatment: for those, empty genuinely is off.
+ */
+function parseBoolDefaultTrue(v: string | undefined): boolean {
+  const s = v?.trim().toLowerCase();
+  if (s === undefined || s === "") return true;
+  return !(s === "0" || s === "false" || s === "no" || s === "off");
+}
+
+/**
+ * Resolve the worker join token. UZI_WORKER_TOKEN_FILE (a path) is preferred: it is
+ * the STRUCTURAL /proc hardening (PRD #46 M6) — delivering the token via a file rather
+ * than an env var keeps it out of every process's `/proc/<pid>/environ`. Under the
+ * PRD #51 uid split the file is 0400 worker-owned, so the cap-less `runner` uid (which
+ * runs the agent + checks + provision) cannot read it — the on-disk copy is protected
+ * by the uid boundary, not by removal. The best-effort post-read unlink stays (it
+ * no-ops on a read-only secret mount, the shipping compose default), but the uid
+ * boundary is the close. Falls back to UZI_WORKER_TOKEN (env) for backward compatibility.
+ */
+function resolveWorkerToken(env: NodeJS.ProcessEnv): string {
+  const file = env.UZI_WORKER_TOKEN_FILE?.trim();
+  if (file) {
+    let raw: string;
+    try {
+      raw = fs.readFileSync(file, "utf8");
+    } catch (err) {
+      throw new Error(`cannot read UZI_WORKER_TOKEN_FILE ${file}: ${errMessage(err)}`);
+    }
+    const token = raw.trim();
+    if (token === "") throw new Error(`UZI_WORKER_TOKEN_FILE ${file} is empty`);
+    try {
+      fs.unlinkSync(file);
+    } catch {
+      // Read-only mount or already gone: the token is no longer in environ, which
+      // is the primary win; the on-disk residue is only a defense-in-depth extra.
+    }
+    return token;
+  }
+  return required(env, "UZI_WORKER_TOKEN");
+}
+
+export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+  const apiUrl = required(env, "UZI_API_URL").replace(/\/+$/, "");
+  const rawLevel = env.UZI_LOG_LEVEL?.trim().toLowerCase() ?? "info";
+  return {
+    apiUrl,
+    workerToken: resolveWorkerToken(env),
+    dataDir: env.UZI_DATA_DIR?.trim() || "/data",
+    workerName: env.UZI_WORKER_NAME?.trim() || os.hostname(),
+    workerTemplate: env.UZI_WORKER_TEMPLATE?.trim() || "base",
+    // Build-stamped by CI (`publish:agent` passes the release tag as the
+    // UZI_AGENT_VERSION build arg; the templates turn it into image ENV), so a
+    // worker's reported version IS the release it runs (PRD #113 M1).
+    //
+    // UNSET STAYS EMPTY, and that is the load-bearing half. The retired
+    // "0.1.0-m4" default made every worker report a release it had not been
+    // running since M4, and a plausible-looking SemVer is worse than no answer:
+    // the api's version compare cannot tell a frozen literal from a real report,
+    // so it would confidently classify a current worker as years behind. Empty
+    // reaches the api as NULL (pgText("") -> NULL) and classifies as `unknown`.
+    version: env.UZI_AGENT_VERSION?.trim() ?? "",
+    executor: parseExecutor(env.UZI_EXECUTOR),
+    stubPlanGate: parseBool(env.UZI_STUB_PLAN_GATE),
+    // Default ON, so unset means enabled — hence the explicit check rather than
+    // parseBool, whose false-by-default is the wrong way round here.
+    //
+    // EMPTY counts as unset, and that is the load-bearing half. parseBool accepts
+    // only 1|true|yes, so `UZI_HOME_RECLAIM=""` would otherwise read as "off" and
+    // silently disable a default-ON safety feature — and empty is exactly how the
+    // value arrives from a compose `${UZI_HOME_RECLAIM:-}` or a Helm value that
+    // defaults to `""`. Set-but-empty means "the deployment mentions this var and
+    // expressed no opinion", which is the default, not the opposite of it.
+    homeReclaimEnabled: parseBoolDefaultTrue(env.UZI_HOME_RECLAIM),
+    workerTokenFile: env.UZI_WORKER_TOKEN_FILE?.trim() || undefined,
+    heartbeatIntervalMs: duration(env, "WORKER_HEARTBEAT_INTERVAL", "15s"),
+    pollIntervalMs: duration(env, "WORKER_POLL_INTERVAL", "3s"),
+    messageBatchMs: duration(env, "WORKER_MESSAGE_BATCH_INTERVAL", "500ms"),
+    httpTimeoutMs: duration(env, "WORKER_HTTP_TIMEOUT", "30s"),
+    planApprovalTimeoutMs: duration(env, "WORKER_PLAN_APPROVAL_TIMEOUT", "24h"),
+    // PRD #267: min interval between time-based origin checkpoint publishes on the
+    // reap:false path. Default 20m; `0` disables the time-based origin publish
+    // (milestone-only). A Go-style duration string, NOT a `_SECONDS` variant.
+    checkpointIntervalMs: duration(env, "CHECKPOINT_INTERVAL", "20m"),
+    // Chat lifecycle (PRD #39 Decisions 2/3). Defaults raised from the earlier
+    // 15/20m draft because idle-death discards the conversation; poll is faster
+    // than the run lane so a turn starts within ~1s of a user message.
+    chatMaxTurns: positiveInt(env, "CHAT_MAX_TURNS", 50),
+    chatTurnTimeoutMs: duration(env, "WORKER_CHAT_TURN_TIMEOUT", "10m"),
+    chatIdleTimeoutMs: duration(env, "WORKER_CHAT_IDLE_TIMEOUT", "60m"),
+    chatPollMs: duration(env, "WORKER_CHAT_POLL_MS", "1000"),
+    chatSessions: positiveInt(env, "WORKER_CHAT_SESSIONS", 1),
+    // RUN-lane concurrency cap (PRD #42 Decision 3). positiveInt already enforces
+    // integer ≥ 1 with fallback to 1, so a blank/zero/negative/fractional value is
+    // the safe default. The soft-ceiling warn lives in main.ts (needs the logger,
+    // built after this parse) — see MAX_CONCURRENT_RUNS_SOFT_CEILING.
+    maxConcurrentRuns: positiveInt(env, "WORKER_MAX_CONCURRENT_RUNS", 1),
+    // Populated by main.ts after an async liveness probe (see the field doc); the sync
+    // parse cannot probe, so the default is "no daemon wired".
+    dockerWiring: {},
+    // Readiness wait for an EXPECTED docker sidecar (M2 follow-up). ~1s poll, ~30s budget.
+    dockerReadyIntervalMs: duration(env, "UZI_DOCKER_READY_INTERVAL", "1s"),
+    dockerReadyTimeoutMs: duration(env, "UZI_DOCKER_READY_TIMEOUT", "30s"),
+    logLevel: isLogLevel(rawLevel) ? rawLevel : "info",
+  };
+}

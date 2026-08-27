@@ -1,0 +1,89 @@
+package agenttmpl
+
+import (
+	"strings"
+	"testing"
+)
+
+// PROTOTYPE — evaluation only, not for merge. Compares region-scoped phrase
+// assertions against the shipped whole-body ones.
+
+const regionMarker = "Dispatch independent subagents in parallel in a single turn:"
+
+type rcase struct {
+	behavior string
+	phrase   string
+}
+
+// Deliberately SHORT phrases: the region carries the position, so the phrase
+// only has to carry the meaning. No anchors, no overlaps, all disjoint.
+var planCases = []rcase{
+	{"citation anchored on submit_plan", "Before you call `submit_plan`"},
+	{"every mechanism cited by file and line", "name the file that implements it and quote the line"},
+	{"plan text, not a diff", "the artifact under review is the plan text, not a diff"},
+	{"no-write rule is RELAYED", "tell each of them the wave must not change anything"},
+	{"no-write binds the PLAN TURN", "an edit made during the plan turn"},
+	{"revise turn re-cites only what changed", "On a revise turn, re-cite only the mechanisms your revision changed"},
+	{"never a judgement about issue text", "never as a judgement about the issue text"},
+}
+
+var bulletCases = []rcase{
+	{"post-impl wave retained, is a REPEAT", "fans out again after an implementation unit lands"},
+}
+
+// naiveSplit is the form someone would most naturally write.
+func naiveSplit(body string) (plan, bullet string) {
+	before, after, _ := strings.Cut(body, regionMarker)
+	return before, after
+}
+
+// TestProtoRegionNaive: region-scoped, NO guard on the split.
+func TestProtoRegionNaive(t *testing.T) {
+	lead, _ := BuiltinByName("lead")
+	body := flatten(string(Render(lead)))
+	plan, bullet := naiveSplit(body)
+	t.Logf("REGION SIZES: whole=%d plan=%d bullet=%d", len(body), len(plan), len(bullet))
+	for _, c := range planCases {
+		if !strings.Contains(plan, c.phrase) {
+			t.Errorf("PLAN region lost %q: missing %q", c.behavior, c.phrase)
+		}
+	}
+	for _, c := range bulletCases {
+		if !strings.Contains(bullet, c.phrase) {
+			t.Errorf("BULLET region lost %q: missing %q", c.behavior, c.phrase)
+		}
+	}
+}
+
+// TestProtoRegionGuarded: same, but the split is asserted first.
+func TestProtoRegionGuarded(t *testing.T) {
+	lead, _ := BuiltinByName("lead")
+	body := flatten(string(Render(lead)))
+
+	if n := strings.Count(body, regionMarker); n != 1 {
+		t.Fatalf("region boundary %q occurs %d times, want exactly 1 — "+
+			"the split this test depends on is not well defined", regionMarker, n)
+	}
+	plan, bullet := naiveSplit(body)
+	if len(plan) < 200 || len(bullet) < 200 {
+		t.Fatalf("region degenerate: plan=%d bullet=%d (want both >200)", len(plan), len(bullet))
+	}
+	// Neither region may contain the other's landmark content.
+	if strings.Contains(plan, "Implementation work fans out only when") {
+		t.Error("plan region swallowed bullet content — boundary moved")
+	}
+	if strings.Contains(bullet, "Before you call `submit_plan`") {
+		t.Error("bullet region swallowed plan content — boundary moved")
+	}
+
+	for _, c := range planCases {
+		if !strings.Contains(plan, c.phrase) {
+			t.Errorf("PLAN region lost %q: missing %q", c.behavior, c.phrase)
+		}
+	}
+	for _, c := range bulletCases {
+		if !strings.Contains(bullet, c.phrase) {
+			t.Errorf("BULLET region lost %q: missing %q", c.behavior, c.phrase)
+		}
+	}
+}
