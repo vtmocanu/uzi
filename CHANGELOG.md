@@ -18,6 +18,13 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.66.0] - 2026-08-27
+
+### Changed
+
+- **Maintenance release; no functional changes since 0.65.1.**
+  Republished the container images and Helm chart from a fresh repository baseline; application behavior is unchanged from 0.65.1.
+
 ## [0.65.1] - 2026-08-25
 
 ### Changed
@@ -3358,7 +3365,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.65.1...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.66.0...HEAD
+[0.66.0]: https://github.com/vtmocanu/uzi/compare/v0.65.1...v0.66.0
 [0.65.1]: https://github.com/vtmocanu/uzi/compare/v0.65.0...v0.65.1
 [0.65.0]: https://github.com/vtmocanu/uzi/compare/v0.64.0...v0.65.0
 [0.64.0]: https://github.com/vtmocanu/uzi/compare/v0.63.0...v0.64.0
