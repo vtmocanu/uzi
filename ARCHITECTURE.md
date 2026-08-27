@@ -1538,7 +1538,7 @@ an approve-time capability denial, is deferred), per-user
 skills-management UI, encrypting secrets with the user's
 own password instead of a shared server key, PAT least-privilege
 verification, and a second (e.g. OpenAI) execution provider are all
-deliberately deferred — see [plan.md](plan.md), the PRDs' Risks sections, and
+deliberately deferred — see [plan.md](prds/done/initial-plan.md), the PRDs' Risks sections, and
 `prds/done/4-agent-runtime-workers.md`'s "Out of scope". This document will grow
 new sections (additional services, data flows, trust boundaries) as those
 land.

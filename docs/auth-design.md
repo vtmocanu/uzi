@@ -5,7 +5,7 @@ audience: design
 
 # Auth design
 
-uzi's auth is a hand-rolled email+password flow, deliberately compared against bottega ([bottega](https://github.com/vdaubry/bottega) — vendored as a submodule under `inspiration/` when this was written, removed 2026-08-03) and designed to beat it. No OTP, no email verification for password accounts, for this MVP (see [plan.md](../plan.md) "later stuff" and the PRD's "Out of scope"). SSO is covered separately below (PRD #45).
+uzi's auth is a hand-rolled email+password flow, deliberately compared against bottega ([bottega](https://github.com/vdaubry/bottega) — vendored as a submodule under `inspiration/` when this was written, removed 2026-08-03) and designed to beat it. No OTP, no email verification for password accounts, for this MVP (see [plan.md](../prds/done/initial-plan.md) "later stuff" and the PRD's "Out of scope"). SSO is covered separately below (PRD #45).
 
 ## Comparison with bottega
 
@@ -86,6 +86,6 @@ Set `TRUSTED_PROXIES` only for a reverse proxy you actually run, at *that proxy'
 
 - **Email enumeration on duplicate registration.** `POST /api/auth/register` returns `409` with "an account with this email already exists" for a taken email, which lets a caller confirm whether an address is registered. Accepted for an internal/local MVP (falls short of OWASP ASVS L1 on this point); login itself gives no such signal.
 - **Shared rate-limit bucket in local compose.** Docker's port publishing NATs every host connection to `127.0.0.1:8080` through its userland proxy before it reaches nginx, so nginx (and therefore the API, via the trusted `X-Forwarded-For` hop) sees one source IP for all traffic on a given laptop, regardless of which browser tab or process originated it. In this topology the register/login rate limit is effectively shared across everything hitting the local stack. This is fail-safe (stricter than intended, never more permissive) and only affects the single-operator local demo; a real deployment behind a proper reverse proxy sees distinct client IPs per `TRUSTED_PROXIES` design.
-- **No password reset.** There is no "forgot password" flow (no email sending in this MVP) — see [plan.md](../plan.md) "later stuff".
+- **No password reset.** There is no "forgot password" flow (no email sending in this MVP) — see [plan.md](../prds/done/initial-plan.md) "later stuff".
 - **No email verification.** Registration accepts any syntactically valid address; nothing is sent to confirm ownership.
 - **No 2FA.** Single factor (password) only.
