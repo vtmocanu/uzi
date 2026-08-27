@@ -252,6 +252,10 @@ ENV UZI_DATA_DIR=/data
 ARG UZI_AGENT_VERSION=
 ENV UZI_AGENT_VERSION=${UZI_AGENT_VERSION#v}
 
+# Links this package to the repository on the registry (GHCR reads this label).
+# Kept below the expensive nix/Chromium layers with the version stamp above.
+LABEL org.opencontainers.image.source="https://github.com/vtmocanu/uzi"
+
 # Bake the template identity into the image so the worker self-reports the image
 # it was actually built from (PRD #18 register `template`). Hardcoded literal, not
 # the build arg echoed back — see templates/base.

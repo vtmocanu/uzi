@@ -20,6 +20,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -ldflags="-s -w" -o /out/c
 
 # --- runtime stage ---
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:1b7b9f0f0e0a1d2155f531db587cc48ec26aaf97ab64364225f5bf18a054e66a
+# Links this package to the repository on the registry (GHCR reads this label).
+LABEL org.opencontainers.image.source="https://github.com/vtmocanu/uzi"
 COPY --from=build /out/controller /controller
 # No EXPOSE: the controller listens on nothing. Every exchange is outbound to the
 # api (Decision 2), which is what lets it run with no inbound surface at all.

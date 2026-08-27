@@ -51,6 +51,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -ldflags="-s -w -X main.ve
 
 # --- runtime stage ---
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:1b7b9f0f0e0a1d2155f531db587cc48ec26aaf97ab64364225f5bf18a054e66a
+# Links this package to the repository on the registry (GHCR reads this label).
+LABEL org.opencontainers.image.source="https://github.com/vtmocanu/uzi"
 COPY --from=build /out/server /server
 EXPOSE 8080
 USER nonroot:nonroot

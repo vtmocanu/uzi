@@ -41,6 +41,8 @@ RUN npm run build
 # --- runtime stage ---
 # nginx-unprivileged runs as a non-root user (uid 101) and listens on 8080.
 FROM nginxinc/nginx-unprivileged:1.30-alpine@sha256:44e36330f74d4f3a1d4e222acca9e23b401fb87811a7597024502bb759c4dd49
+# Links this package to the repository on the registry (GHCR reads this label).
+LABEL org.opencontainers.image.source="https://github.com/vtmocanu/uzi"
 COPY web/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /app/web/dist /usr/share/nginx/html
 EXPOSE 8080
