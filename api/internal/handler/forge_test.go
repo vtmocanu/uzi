@@ -63,6 +63,15 @@ func (f *fakeUserForge) CreateIssueNote(context.Context, int64, int64, string) (
 func (f *fakeUserForge) GetMergeRequest(context.Context, int64, int64) (forge.MergeRequest, error) {
 	return forge.MergeRequest{}, nil
 }
+func (f *fakeUserForge) ListMergeRequestComments(context.Context, int64, int64) ([]forge.MRComment, error) {
+	return nil, nil
+}
+func (f *fakeUserForge) ReplyMergeRequestComment(context.Context, int64, int64, string, string) error {
+	return nil
+}
+func (f *fakeUserForge) ResolveMergeRequestThread(context.Context, int64, int64, string) error {
+	return nil
+}
 func (f *fakeUserForge) TokenInfo(context.Context) (forge.TokenInfo, error) {
 	return forge.TokenInfo{}, nil
 }

@@ -42,6 +42,7 @@ const wireContractFixture = "testdata/claim_skills_wire.json"
 func sampleClaimPayloadWithSkills() ClaimPayload {
 	strptr := func(s string) *string { return &s }
 	i64ptr := func(v int64) *int64 { return &v }
+	intptr := func(v int) *int { return &v }
 	return ClaimPayload{
 		RunID:            "11111111-1111-1111-1111-111111111111",
 		Kind:             RunKindIssue,
@@ -61,6 +62,31 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 					AuthorForgeUserID: 42,
 					CreatedAt:         time.Date(2026, 7, 4, 9, 0, 0, 0, time.UTC),
 					Body:              "please guard on Valid",
+				},
+			},
+			Truncated: true,
+		},
+		// PRD #700 M2: the MR review-comments snapshot rides an mr_rework claim (carries
+		// omitempty). NON-EMPTY on purpose (Truncated:true, one inline comment with its
+		// anchors + monotonic ID populated) for the same "wired vs present-and-nil" reason
+		// IssueComments above carries a real comment — an empty/absent snapshot here would
+		// agree with a producer that dropped the field. A separate test asserts the KEY is
+		// ABSENT when the field is nil (the omitempty contract). Timestamp FIXED for a
+		// byte-stable golden.
+		ReviewComments: &ReviewCommentsSnapshot{
+			Comments: []ReviewCommentSnapshot{
+				{
+					ID:                5001,
+					AuthorUsername:    "coderabbit",
+					AuthorForgeUserID: 43,
+					CreatedAt:         time.Date(2026, 7, 4, 10, 0, 0, 0, time.UTC),
+					Body:              "guard nil here",
+					Path:              strptr("api/x.go"),
+					Line:              intptr(42),
+					ReplyID:           "5001",
+					ResolveID:         "PRRT_thread1",
+					HeadSHA:           "headsha999",
+					ReviewState:       "inline",
 				},
 			},
 			Truncated: true,
@@ -275,6 +301,59 @@ func TestClaimCarriesStopPending(t *testing.T) {
 		t.Error("claim must carry stop_pending (issue #552 M3); key absent")
 	} else if got != true {
 		t.Errorf("stop_pending = %v, want true", got)
+	}
+}
+
+// TestClaimReviewCommentsOmitemptyContract pins PRD #700 M2's claim addition:
+// review_comments rides an mr_rework claim and carries `omitempty`, so the wire key
+// is PRESENT when a snapshot is set and ABSENT when the field is nil. This is the
+// non-vacuous form the milestone requires — it marshals real JSON and checks the KEY,
+// not a `== nil` on the Go struct (which would pass however the tags were written).
+func TestClaimReviewCommentsOmitemptyContract(t *testing.T) {
+	// Set: the sample carries a non-empty snapshot, so the key is present and decodes
+	// to the same shape.
+	b, err := json.Marshal(sampleClaimPayloadWithSkills())
+	if err != nil {
+		t.Fatalf("marshal claim: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal claim: %v", err)
+	}
+	rc, ok := m["review_comments"]
+	if !ok {
+		t.Fatal("claim must carry review_comments when the snapshot is set (PRD #700 M2); key absent")
+	}
+	rcMap, ok := rc.(map[string]any)
+	if !ok {
+		t.Fatalf("review_comments should decode to an object, got %T", rc)
+	}
+	if rcMap["truncated"] != true {
+		t.Errorf("review_comments.truncated = %v, want true", rcMap["truncated"])
+	}
+	comments, ok := rcMap["comments"].([]any)
+	if !ok || len(comments) != 1 {
+		t.Fatalf("review_comments.comments = %v, want one comment", rcMap["comments"])
+	}
+	c0 := comments[0].(map[string]any)
+	if c0["id"] != float64(5001) || c0["reply_id"] != "5001" || c0["resolve_id"] != "PRRT_thread1" {
+		t.Errorf("review_comments.comments[0] anchors wrong: id=%v reply_id=%v resolve_id=%v", c0["id"], c0["reply_id"], c0["resolve_id"])
+	}
+
+	// Nil: with the field cleared, omitempty must DROP the key entirely — the omitempty
+	// contract this test exists to pin (not a `=== undefined` check on a present-but-null).
+	p := sampleClaimPayloadWithSkills()
+	p.ReviewComments = nil
+	bn, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal nil-review-comments claim: %v", err)
+	}
+	var mn map[string]any
+	if err := json.Unmarshal(bn, &mn); err != nil {
+		t.Fatalf("unmarshal nil-review-comments claim: %v", err)
+	}
+	if _, present := mn["review_comments"]; present {
+		t.Error("review_comments key must be ABSENT when the field is nil (omitempty contract); key present")
 	}
 }
 

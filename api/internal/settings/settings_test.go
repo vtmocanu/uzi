@@ -215,6 +215,128 @@ func TestJudgeAccessors(t *testing.T) {
 	}
 }
 
+// TestMrReworkAccessors pins the PRD #700 M5 admin gates (Decision 5): the
+// kill-switch defaults ON (the OPPOSITE of the judge's default-off), the cap defaults
+// to 5, a stored value is honored, and a junk bool row falls back to the default ON.
+// The cap returns a PARSE ERROR on a junk row rather than silently reading 5.
+func TestMrReworkAccessors(t *testing.T) {
+	ctx := context.Background()
+
+	// Empty table → compiled-in defaults: ON and cap 5.
+	c := New(&fakeStore{}, time.Minute)
+	if got, err := c.MrReworkEnabled(ctx); err != nil || got != true {
+		t.Fatalf("MrReworkEnabled default = %v, %v; want true (absent → ON)", got, err)
+	}
+	if got, err := c.MrReworkCap(ctx); err != nil || got != 5 {
+		t.Fatalf("MrReworkCap default = %d, %v; want 5", got, err)
+	}
+	// Pin the literal defaults so an accidental flip is caught: default-ON is an
+	// announced behavior change, and a silent flip to off would be a regression.
+	if DefaultMrReworkEnabled != "true" || DefaultMrReworkCap != "5" {
+		t.Fatalf("defaults = (%q, %q), want (\"true\", \"5\")", DefaultMrReworkEnabled, DefaultMrReworkCap)
+	}
+
+	// present-true / present-false honored; any OTHER value → default ON. A malformed
+	// row never silently turns a default-on feature off.
+	for _, tc := range []struct {
+		stored string
+		want   bool
+	}{
+		{"true", true},
+		{"false", false},
+		{"", true},       // empty → default ON
+		{"banana", true}, // junk → default ON
+		{"TRUE", true},   // non-canonical → default, not a lenient parse
+		{"0", true},
+	} {
+		c := New(&fakeStore{rows: []store.AppSetting{row(KeyMrReworkEnabled, tc.stored)}}, time.Minute)
+		if got, _ := c.MrReworkEnabled(ctx); got != tc.want {
+			t.Errorf("MrReworkEnabled(stored=%q) = %v, want %v", tc.stored, got, tc.want)
+		}
+	}
+
+	// A set cap is honored; a blank/whitespace row falls to the default; a junk row
+	// (hand-edited, bypassing write validation) returns a PARSE ERROR the caller
+	// decides on — NOT a silent fallback to 5.
+	for _, tc := range []struct {
+		stored  string
+		want    int
+		wantErr bool
+	}{
+		{"3", 3, false},
+		{"10", 10, false},
+		{"", 5, false},    // empty → default 5
+		{"   ", 5, false}, // whitespace → default 5
+		{"abc", 0, true},  // junk → parse error returned, not silently 5
+	} {
+		c := New(&fakeStore{rows: []store.AppSetting{row(KeyMrReworkCap, tc.stored)}}, time.Minute)
+		got, err := c.MrReworkCap(ctx)
+		if tc.wantErr && err == nil {
+			t.Errorf("MrReworkCap(stored=%q) err = nil, want a parse error", tc.stored)
+		}
+		if !tc.wantErr && err != nil {
+			t.Errorf("MrReworkCap(stored=%q) err = %v, want nil", tc.stored, err)
+		}
+		if got != tc.want {
+			t.Errorf("MrReworkCap(stored=%q) = %d, want %d", tc.stored, got, tc.want)
+		}
+	}
+}
+
+// TestMrReworkEnabledFailClosed pins Decision 5's fail-closed reconciliation: a
+// genuine store READ ERROR must be PROPAGATED, not collapsed into the value. An
+// absent row reads ON (default), but the caller (the M3 detector) must be able to
+// tell an error apart from absent so it maps error → OFF. This exercises a REAL
+// cold-cache read error, not merely an absent row (the fail-open trap R3 named).
+func TestMrReworkEnabledFailClosed(t *testing.T) {
+	ctx := context.Background()
+
+	// Cold cache + store error: the reader RETURNS the error so the caller fails
+	// closed. Contrast with the absent-row case above, which returns (true, nil).
+	c := New(&fakeStore{err: errors.New("db down")}, time.Minute)
+	if _, err := c.MrReworkEnabled(ctx); err == nil {
+		t.Fatal("MrReworkEnabled on a cold store error must propagate the error (caller maps it to OFF)")
+	}
+	if _, err := c.MrReworkCap(ctx); err == nil {
+		t.Fatal("MrReworkCap on a cold store error must propagate the error")
+	}
+}
+
+// TestMrReworkValidation pins the PRD #700 M5 write-time gates: the enabled key
+// routes to the strict bool parse; the cap routes to the [1, maxMrReworkCap] integer
+// gate. Both MUST have explicit Validate cases — the default branch (ValidateLabel)
+// would accept junk that then reads as the default (enabled) or a per-read parse
+// error (cap).
+func TestMrReworkValidation(t *testing.T) {
+	for _, ok := range []string{"true", "false"} {
+		if err := Validate(KeyMrReworkEnabled, ok); err != nil {
+			t.Errorf("Validate(mr_rework_enabled, %q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "yes", "1", "TRUE", "on"} {
+		if err := Validate(KeyMrReworkEnabled, bad); err == nil {
+			t.Errorf("Validate(mr_rework_enabled, %q) = nil, want a non-bool rejection", bad)
+		}
+	}
+	// cap: [1, 100] accepted at the edges; 0 (use the kill-switch instead),
+	// negatives, non-ints, over-cap, and empty are rejected.
+	for _, ok := range []string{"1", "5", "100"} {
+		if err := Validate(KeyMrReworkCap, ok); err != nil {
+			t.Errorf("Validate(mr_rework_cap, %q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"0", "-1", "101", "abc", ""} {
+		if err := Validate(KeyMrReworkCap, bad); err == nil {
+			t.Errorf("Validate(mr_rework_cap, %q) = nil, want a rejection", bad)
+		}
+	}
+	for _, k := range []string{KeyMrReworkEnabled, KeyMrReworkCap} {
+		if !Known(k) {
+			t.Errorf("%s should be Known (admin-writable)", k)
+		}
+	}
+}
+
 // TestJudgeSpendGuardAccessors pins the PRD #69 M5 Decision 9 per-user spend-guard
 // accessors: the cooldown defaults ON (60s), the daily budget OFF (0), and a stored
 // value is returned verbatim while an unparseable row falls back to the default

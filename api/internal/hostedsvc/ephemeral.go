@@ -25,6 +25,20 @@ import (
 // frequently, so eventual coverage is fine and the per-tick footprint stays bounded.
 const ephemeralProvisionBatch int32 = 50
 
+// The two trigger paths, emitted as the `trigger` field on each provision log line so a
+// saturation burst is distinguishable from a capability-gap provision in logs (issue #747).
+const (
+	triggerCapabilityGap = "capability_gap"
+	triggerSaturation    = "saturation"
+)
+
+// durationToInterval converts a Go duration to a pgtype.Interval for the saturation
+// query's @saturation_delay param. Microseconds carries the whole duration (the debounce
+// is well under a day), matching how Postgres compares now() - status_since to the interval.
+func durationToInterval(d time.Duration) pgtype.Interval {
+	return pgtype.Interval{Microseconds: d.Microseconds(), Valid: true}
+}
+
 // EphemeralSettings is the narrow settings dependency of the provisioner: the
 // instance-wide kill-switch. *settings.Cache satisfies it via EphemeralWorkersEnabled.
 type EphemeralSettings interface {
@@ -45,7 +59,24 @@ type EphemeralConfig struct {
 	// (online_since still NULL past the deadline) and (c) idle-stolen (online past the
 	// deadline but its bound run is being served by a sibling). There is deliberately no
 	// separate idle-grace knob: one deadline keeps the config surface to the approved set.
+	//
+	// The saturation trigger path (issue #747) relies on this SAME (c) idle-stolen arm:
+	// when a burst worker loses the race and a freed base slot claims its bound run, the
+	// now-idle burst pod is reaped here. That race resolves in seconds while this grace is
+	// 10m, so a lost-race burst pod (DinD, 20Gi PVC) can sit fully provisioned and idle for
+	// up to the deadline before GC. This cost is ACCEPTED (issue #747 M3): the debounce
+	// lowers the race probability, and a shorter idle-grace for the saturation arm would
+	// require a second knob, which collides with the "one deadline" decision above — so the
+	// saturation path deliberately shares the 10m grace rather than adding config surface.
 	ProvisionDeadline time.Duration
+	// SaturationDelay is the queue-wait debounce for the saturation trigger path
+	// (UZI_EPHEMERAL_SATURATION_DELAY, default 90s). It is threaded to
+	// ListSaturationQueuedRunsForEphemeral as its @saturation_delay interval param, so
+	// the debounce is evaluated in-query against runs.status_since rather than off the
+	// provisioner's private clock. A run capability-placeable but slot-blocked provisions
+	// a burst worker only once queued longer than this — roughly worker cold-start — so a
+	// freeing slot claims it first and a transient claim-cycle queue does not churn pods.
+	SaturationDelay time.Duration
 }
 
 // EphemeralProvisioner is the background pass that auto-provisions run-bound ephemeral
@@ -77,11 +108,11 @@ func NewEphemeralProvisioner(pool *pgxpool.Pool, q *store.Queries, box *secretbo
 // returns the number of ephemeral workers actually created this tick.
 //
 // Flag-off footprint is exactly ONE settings read: with the instance kill-switch off it
-// returns (0, nil) before touching the database. When on, it lists the unplaceable
-// queued runs of opted-in users and, for each, provisions one run-bound ephemeral worker
-// under the per-user cap. A hard error on one run is logged and does not abort the whole
-// pass — the sibling sweeper passes have the same resilience — so one bad run cannot
-// starve the rest of the backlog.
+// returns (0, nil) before touching the database. When on, it unions the capability-gap and
+// saturation trigger sets for opted-in users and, for each, provisions one run-bound
+// ephemeral worker under the per-user cap. A hard error on one run is logged and does not
+// abort the whole pass — the sibling sweeper passes have the same resilience — so one bad
+// run cannot starve the rest of the backlog.
 func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error) {
 	enabled, err := p.settings.EphemeralWorkersEnabled(ctx)
 	if err != nil {
@@ -96,33 +127,74 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 	// a large backlog cannot monopolize every batch. It is an unlocked snapshot, so it is
 	// only an optimization — provisionOne's advisory-locked count remains the authoritative
 	// cap and is what actually prevents over-provisioning.
-	runs, err := p.q.ListUnplaceableQueuedRunsForEphemeral(ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{
+	//
+	// Two trigger paths feed one provision loop (issue #747). Capability-gap: a run
+	// nothing online can satisfy — provision immediately (permanent gap). Saturation: a
+	// run some worker COULD claim but every capable worker is at its cap — provision only
+	// after the queue-wait debounce (transient; a freeing slot may claim it first). Both
+	// query LIMITs are ephemeralProvisionBatch, but the UNION could hold up to 2× that, so
+	// we dedup by run id and re-apply the per-tick LIMIT to the combined set — a run cannot
+	// legitimately be in both sets, but the guard keeps one run from consuming two slots.
+	gapRuns, err := p.q.ListUnplaceableQueuedRunsForEphemeral(ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{
 		MaxRows:    ephemeralProvisionBatch,
 		MaxPerUser: int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
 	})
 	if err != nil {
 		return 0, fmt.Errorf("hostedsvc: list unplaceable queued runs: %w", err)
 	}
+	satRuns, err := p.q.ListSaturationQueuedRunsForEphemeral(ctx, store.ListSaturationQueuedRunsForEphemeralParams{
+		SaturationDelay: durationToInterval(p.cfg.SaturationDelay),
+		MaxRows:         ephemeralProvisionBatch,
+		MaxPerUser:      int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
+	})
+	if err != nil {
+		return 0, fmt.Errorf("hostedsvc: list saturation queued runs: %w", err)
+	}
 
-	var created int64
-	for _, run := range runs {
-		template, docker, rerr := capability.ResolveEphemeralSpec(run.RequiredCapabilities)
-		if rerr != nil {
-			// Unprovisionable: no template or the docker dimension can satisfy the run's
-			// capabilities. Skip it — no ephemeral worker could ever help — and log so the
-			// gap is visible rather than silently churning the trigger query every tick.
-			slog.Warn("ephemeral provisioner: run has unprovisionable capabilities; skipping",
-				"run_id", run.ID, "required_capabilities", run.RequiredCapabilities, "error", rerr)
+	// Capability-gap first: it is permanent starvation (nothing can ever serve the run),
+	// so under a full batch it takes priority over saturation runs, which are transient and
+	// may still be claimed by a freeing slot.
+	type ephemeralCandidate struct {
+		id      uuid.UUID
+		userID  uuid.UUID
+		caps    []string
+		trigger string
+	}
+	candidates := make([]ephemeralCandidate, 0, len(gapRuns)+len(satRuns))
+	seen := make(map[uuid.UUID]struct{}, len(gapRuns)+len(satRuns))
+	for _, run := range gapRuns {
+		seen[run.ID] = struct{}{}
+		candidates = append(candidates, ephemeralCandidate{id: run.ID, userID: run.UserID, caps: run.RequiredCapabilities, trigger: triggerCapabilityGap})
+	}
+	for _, run := range satRuns {
+		if _, dup := seen[run.ID]; dup {
 			continue
 		}
-		ok, perr := p.provisionOne(ctx, run.UserID, run.ID, template, docker)
+		seen[run.ID] = struct{}{}
+		candidates = append(candidates, ephemeralCandidate{id: run.ID, userID: run.UserID, caps: run.RequiredCapabilities, trigger: triggerSaturation})
+	}
+	if len(candidates) > int(ephemeralProvisionBatch) {
+		candidates = candidates[:ephemeralProvisionBatch]
+	}
+
+	var created int64
+	for _, c := range candidates {
+		template, docker, rerr := capability.ResolveEphemeralSpec(c.caps)
+		if rerr != nil {
+			slog.Warn("ephemeral provisioner: run has unprovisionable capabilities; skipping",
+				"run_id", c.id, "trigger", c.trigger, "required_capabilities", c.caps, "error", rerr)
+			continue
+		}
+		ok, perr := p.provisionOne(ctx, c.userID, c.id, template, docker)
 		if perr != nil {
 			slog.Error("ephemeral provisioner: provision failed; continuing with the rest of the pass",
-				"run_id", run.ID, "error", perr)
+				"run_id", c.id, "trigger", c.trigger, "error", perr)
 			continue
 		}
 		if ok {
 			created++
+			slog.Info("ephemeral provisioner: provisioned run-bound worker",
+				"run_id", c.id, "trigger", c.trigger, "template", template, "docker", docker)
 		}
 	}
 	return created, nil

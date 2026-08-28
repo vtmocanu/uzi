@@ -211,15 +211,21 @@ func (p palette) state(s crewState) lipgloss.Style {
 // HEALTH OVERRIDE: a WARN health flag (stalled/looping/slow) replaces the status token
 // entirely with ▲ + the health word, because a run that needs attention is what the board
 // is FOR. ok/empty health shows the status token.
-func stateGlyphWord(status, health string, isPlanning bool) (glyph, word string) {
+func stateGlyphWord(status, health string, isPlanning, isRevising bool) (glyph, word string) {
 	if stalledHealth[health] {
 		return "▲", health
 	}
-	switch effectiveRunStatus(status, isPlanning) {
+	switch effectiveRunStatus(status, isPlanning, isRevising) {
 	case "running":
 		return "●", "running"
 	case "planning":
 		return "○", "planning"
+	case "revising":
+		// issue #750: a "revise" replan is in flight while status stays awaiting_approval.
+		// The ↻ glyph reads "re-planning" and is a calm sibling of planning's ○ (NOT the
+		// ⚑ plan-gate glyph), so a revising run reads as working, not needing-you. Legible
+		// under NO_COLOR/Ascii: the word "revising" carries the meaning without colour.
+		return "↻", "revising"
 	case "awaiting_approval":
 		return "⚑", "plan gate"
 	case "awaiting_input":
@@ -250,14 +256,17 @@ func stateGlyphWord(status, health string, isPlanning bool) (glyph, word string)
 
 // stateColor is the colour half of the state token, resolved from the same ANDON tokens.
 // Health warn wins (→ stall orange); otherwise the status maps to its material.
-func (p palette) stateColor(status, health string, isPlanning bool) color.Color {
+func (p palette) stateColor(status, health string, isPlanning, isRevising bool) color.Color {
 	if stalledHealth[health] {
 		return p.stall
 	}
-	switch effectiveRunStatus(status, isPlanning) {
+	switch effectiveRunStatus(status, isPlanning, isRevising) {
 	case "running":
 		return p.sage
-	case "planning":
+	case "planning", "revising":
+		// issue #750: revising is a calm/info state like planning (indigo), NOT the amber
+		// attention colour awaiting_approval draws — a run re-planning is working, not
+		// waiting on the human.
 		return p.indigo
 	case "awaiting_approval", "awaiting_input", "awaiting_followup":
 		// awaiting_followup (PRD #517) is a needs-you park like the other two: amber.
@@ -283,9 +292,9 @@ type runToken struct {
 // stateToken is the ONE shared helper the design mandates: (glyph, colour, word) from a
 // run's status/health/planning, used on the board row, the board strip and the detail
 // header so they cannot render one run three ways.
-func (p palette) stateToken(status, health string, isPlanning bool) runToken {
-	g, w := stateGlyphWord(status, health, isPlanning)
-	return runToken{glyph: g, word: w, color: p.stateColor(status, health, isPlanning)}
+func (p palette) stateToken(status, health string, isPlanning, isRevising bool) runToken {
+	g, w := stateGlyphWord(status, health, isPlanning, isRevising)
+	return runToken{glyph: g, word: w, color: p.stateColor(status, health, isPlanning, isRevising)}
 }
 
 // verdictColor maps a judge verdict to a severity colour: issues → alarm red, everything

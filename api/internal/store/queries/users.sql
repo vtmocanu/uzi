@@ -67,6 +67,15 @@ RETURNING *;
 UPDATE users SET judge_enabled = $2 WHERE id = $1
 RETURNING *;
 
+-- name: SetUserMrReworkEnabled :one
+-- Set (or clear, when @mr_rework_enabled is NULL) the current user's MR review-watcher
+-- opt-in (PRD #700 M5, Decision 5). This feature ships ON, so the column is nullable
+-- and a NULL/absent value reads as ENABLED: clearing back to NULL restores the
+-- default-on state, and a user opts OUT by setting it explicitly to false. Own-user
+-- only for PUT /api/me/settings; the caller passes the session user's id.
+UPDATE users SET mr_rework_enabled = @mr_rework_enabled WHERE id = @id
+RETURNING mr_rework_enabled;
+
 -- name: SetUserEphemeralWorkersEnabled :one
 -- Flip a user's ephemeral worker auto-provisioning opt-in (PRD #529 M2). Per-user
 -- consent to have the api spin a run-bound throwaway hosted worker when one of the
@@ -165,8 +174,9 @@ RETURNING summary_model;
 -- use the instance default / default-token-only. Own-user only; the caller passes
 -- the session user's id. summary_model rides this one-row read for the settings
 -- surface (GetUserSummaryModel stays the narrow read for issue-run claim
--- assembly), so the settings response needs no second query.
-SELECT default_model, default_effort, judge_model, summary_model, theme, sidebar_token_ids FROM users WHERE id = $1;
+-- assembly), so the settings response needs no second query. mr_rework_enabled
+-- (PRD #700 M5) rides it too; NULL there means the default-ON per-user opt-in.
+SELECT default_model, default_effort, judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled FROM users WHERE id = $1;
 
 -- name: SetUserTheme :one
 -- Sets (or clears, when @theme is NULL) the current user's theme override.

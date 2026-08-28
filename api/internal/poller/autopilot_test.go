@@ -193,6 +193,15 @@ func (f *apForge) UserExists(context.Context, string) (bool, error) { return fal
 func (f *apForge) GetMergeRequest(context.Context, int64, int64) (forge.MergeRequest, error) {
 	return forge.MergeRequest{}, nil
 }
+func (f *apForge) ListMergeRequestComments(context.Context, int64, int64) ([]forge.MRComment, error) {
+	return nil, nil
+}
+func (f *apForge) ReplyMergeRequestComment(context.Context, int64, int64, string, string) error {
+	return nil
+}
+func (f *apForge) ResolveMergeRequestThread(context.Context, int64, int64, string) error {
+	return nil
+}
 func (f *apForge) TokenInfo(context.Context) (forge.TokenInfo, error) { return forge.TokenInfo{}, nil }
 func (f *apForge) ProjectRole(context.Context, int64, int64) (forge.Role, bool, error) {
 	return forge.RoleNone, false, nil

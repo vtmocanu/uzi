@@ -364,14 +364,19 @@ WHERE status = 'online'
 -- (D9) all store NULL — so an omitted Go struct field would compile green and
 -- silently ship NULL for every run. The fetch is centralized in createRun.
 --
+-- 🔴 review_comments (PRD #700 M2) is named here for the SAME reason: another
+-- silently-omittable snapshot param, sqlc.narg (nullable jsonb). Issue runs never
+-- carry MR comments (this createRun path always passes NULL); M3's
+-- CreateAutoMRReworkRun populates it explicitly for an mr_rework run.
+--
 -- 🔴 required_capabilities (PRD #84 M2) is NOT a Go struct param: it is copied
 -- atomically from the run's repo via a subquery, so the createRun path needs no
 -- extra Go read and cannot ship a stale hint. The repo's hint is already Filter-ed
 -- against the vocabulary at its write path, so no re-validation is needed here.
 -- Repo-less kinds (judge/chat/self_improve) INSERT elsewhere and keep the '{}'
 -- column default. Plan inference (M4) later union-merges via a separate UPDATE.
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, required_capabilities)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'))
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'))
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -481,6 +486,16 @@ ORDER BY r.created_at DESC
 -- (PRD #98 M4). A SQL literal is not importable, so the two are coupled by comment only —
 -- raise this without raising that and the badge counts start truncating silently.
 LIMIT 200;
+
+-- name: ListPlanRevisionStateForRuns :many
+-- The plan-ish message rows ({plan, plan_revising}) for a page of runs, so the
+-- "latest by seq is plan_revising ⇒ revising" fold happens in Go (planRevisingSet),
+-- mirroring web derivePlanRevision. Backed by run_messages UNIQUE (run_id, seq).
+SELECT run_id, seq, kind
+FROM run_messages
+WHERE run_id = ANY(@run_ids::uuid[])
+  AND kind IN ('plan', 'plan_revising')
+ORDER BY run_id, seq;
 
 -- name: ListActiveRunsAll :many
 -- Admin Agents-status: every non-terminal run across all users, with repo path,
@@ -2760,7 +2775,7 @@ WHERE fc.user_id = @user_id
 -- worker that simply has not claimed yet. A NULL cap advertises no bound, so such a
 -- worker is treated as always having room. Active count uses the SAME run-lane
 -- definition as ListWorkersByUser.active_runs (status claimed/running/
--- awaiting_approval/awaiting_input, kind <> 'chat'). Only called for a queued run
+-- awaiting_approval/awaiting_input/awaiting_followup, kind <> 'chat'). Only called for a queued run
 -- already past its health threshold, so it is off the hot path.
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
@@ -2869,6 +2884,103 @@ WHERE r.status = 'queued'
   AND (SELECT count(*) FROM workers wc
        WHERE wc.user_id = r.user_id AND wc.kind = 'hosted' AND wc.ephemeral) < @max_per_user::int
 ORDER BY r.created_at ASC
+LIMIT @max_rows;
+
+-- name: ListSaturationQueuedRunsForEphemeral :many
+-- The SATURATION sibling of ListUnplaceableQueuedRunsForEphemeral (issue #747 M1).
+-- Where the capability-gap query above fires for runs NOTHING online can satisfy, THIS
+-- query fires for the opposite shape: runs that ARE capability-placeable (a capable
+-- worker exists) but are slot-BLOCKED because every capable worker is at its run-lane
+-- cap — the fleet is saturated for this run. It returns the same columns and drives the
+-- same run-bound ephemeral auto-provisioner (PRD #529), for a user who opted in and is
+-- not already served by an ephemeral worker.
+--
+-- Each predicate, and why it is here:
+--   * u.ephemeral_workers_enabled — the per-user opt-in (users column). The JOIN also
+--     drops runs whose owner row is gone. The instance kill-switch is checked in Go
+--     before this query runs, so a flag-off pass never reaches here.
+--   * r.status = 'queued' AND r.kind <> 'chat' — the pre-claim trigger: a run nothing has
+--     claimed yet, excluding the chat lane (served by ClaimChatRun).
+--   * now() - r.status_since > @saturation_delay::interval — the DEBOUNCE. We gate on
+--     time-spent-in-queued using runs.status_since (migration 00163), NOT created_at, so a
+--     run that has only just been re-queued does not immediately trip a provision: a
+--     transiently-full fleet is given @saturation_delay to free a slot on its own before we
+--     spend an ephemeral worker on it.
+--   * DELIBERATELY NO cardinality(r.required_capabilities) > 0 GUARD (Decision 2). Unlike
+--     the capability-gap sibling, a plain zero-capability run MUST qualify here: a saturated
+--     fleet blocks a zero-cap run just as it blocks a cap-carrying one. This needs no special
+--     case — an empty required set is a subset of EVERY worker's effective caps, so
+--     `r.required_capabilities <@ fn_effective_worker_caps(...)` is trivially true and the
+--     "a capable worker exists" test below degenerates to "any online non-draining
+--     non-ephemeral worker exists", which is exactly right.
+--   * EXISTS (≥1 CAPABLE worker) — an online, non-draining, NON-ephemeral worker of the
+--     user whose EFFECTIVE caps are a superset of the run's, using the SAME
+--     fn_effective_worker_caps fold as CountOnlineWorkersSatisfyingCaps / fn_worker_can_claim
+--     (capabilities plus `docker` when docker_enabled). This is what makes the run
+--     capability-PLACEABLE and distinguishes this path from the capability-gap sibling.
+--     `AND NOT w.ephemeral` because a run-bound ephemeral worker serves only its own run.
+--   * NOT EXISTS (a capable worker with a FREE slot) — the SATURATION test. Over the SAME
+--     capable-worker set, none has room. The free-slot definition is reused VERBATIM from
+--     CountOnlineWorkersWithFreeSlotForUser: the five-status active-run set
+--     (claimed/running/awaiting_approval/awaiting_input/awaiting_followup, kind <> 'chat')
+--     and `max_concurrent_runs IS NULL OR (active count) < max_concurrent_runs`. A NULL-cap
+--     worker advertises UNBOUNDED room, so it always HAS a free slot → the NOT EXISTS is
+--     false → the run is NOT slot-blocked and is correctly excluded (that worker will claim
+--     it; provisioning an ephemeral would be wrong).
+--   * NOT EXISTS (an ephemeral worker already bound to this run) — the one-per-run skip.
+--     The partial UNIQUE index uq_workers_ephemeral_run is the hard guarantee; this is the
+--     cheap pre-filter so the steady state does not churn the provision tx each tick.
+--   * (SELECT count(...)) < @max_per_user — cross-user FAIRNESS: exclude runs whose owner is
+--     ALREADY at/over the per-user ephemeral cap (kind = 'hosted' AND ephemeral, matching
+--     CountEphemeralHostedWorkersForUser), so one user cannot monopolize every batch and
+--     starve others.
+--
+--     🔴 THIS FILTER IS A FAIRNESS OPTIMIZATION ONLY, NEVER THE CAP. It is an UNLOCKED
+--     snapshot read, so it is a TOCTOU by construction — the AUTHORITATIVE cap is still the
+--     advisory-locked CountEphemeralHostedWorkersForUser check in provisionOne. A race here
+--     can therefore never over-provision: the worst it can do is, harmlessly, let an
+--     about-to-be-capped user's run into the batch, where provisionOne then rejects it under
+--     the lock. It can also transiently exclude a run whose owner has just dropped below the
+--     cap; the next tick surfaces it, so no run is lost.
+--
+-- ORDER BY r.status_since ASC so the longest-waiting run is provisioned first; note the
+-- sibling orders by created_at, but THIS path's clock is status_since (the same column the
+-- debounce gates on), so we order by it for consistency. LIMIT @max_rows bounds the work
+-- per tick.
+SELECT r.id, r.user_id, r.required_capabilities
+FROM runs r
+JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
+WHERE r.status = 'queued'
+  AND r.kind <> 'chat'
+  AND now() - r.status_since > @saturation_delay::interval
+  AND EXISTS (
+      SELECT 1 FROM workers w
+      WHERE w.user_id = r.user_id
+        AND w.status = 'online'
+        AND w.draining_since IS NULL
+        AND NOT w.ephemeral
+        AND r.required_capabilities <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false))
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM workers w
+      WHERE w.user_id = r.user_id
+        AND w.status = 'online'
+        AND w.draining_since IS NULL
+        AND NOT w.ephemeral
+        AND r.required_capabilities <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false))
+        AND (w.max_concurrent_runs IS NULL
+             OR (SELECT count(*) FROM runs r2
+                  WHERE r2.worker_id = w.id
+                    AND r2.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+                    AND r2.kind <> 'chat') < w.max_concurrent_runs)
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM workers w2
+      WHERE w2.ephemeral AND w2.ephemeral_run_id = r.id
+  )
+  AND (SELECT count(*) FROM workers wc
+       WHERE wc.user_id = r.user_id AND wc.kind = 'hosted' AND wc.ephemeral) < @max_per_user::int
+ORDER BY r.status_since ASC
 LIMIT @max_rows;
 
 -- name: RunHasVerdictSinceGateOpened :one

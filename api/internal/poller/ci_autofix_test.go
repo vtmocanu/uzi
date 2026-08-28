@@ -251,6 +251,15 @@ func (f *cfForge) UserExists(context.Context, string) (bool, error) { return fal
 func (f *cfForge) GetMergeRequest(context.Context, int64, int64) (forge.MergeRequest, error) {
 	return forge.MergeRequest{}, nil
 }
+func (f *cfForge) ListMergeRequestComments(context.Context, int64, int64) ([]forge.MRComment, error) {
+	return nil, nil
+}
+func (f *cfForge) ReplyMergeRequestComment(context.Context, int64, int64, string, string) error {
+	return nil
+}
+func (f *cfForge) ResolveMergeRequestThread(context.Context, int64, int64, string) error {
+	return nil
+}
 func (f *cfForge) TokenInfo(context.Context) (forge.TokenInfo, error) { return forge.TokenInfo{}, nil }
 func (f *cfForge) ProjectRole(context.Context, int64, int64) (forge.Role, bool, error) {
 	return forge.RoleNone, false, nil

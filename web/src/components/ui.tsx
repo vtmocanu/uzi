@@ -375,6 +375,12 @@ export const RUN_STATUS_TONES: Record<
   // just pre-approval. StatusPill's default label `status.replace(/_/g," ")` already
   // yields "planning", so no RUN_STATUS_LABELS entry is needed.
   planning: { tone: "plan", pulse: true },
+  // issue #750: the plan-revise phase, a derived effective status (not a real runs.status
+  // value). Calm `info` tone (NOT the awaiting warn — the run is re-planning, not waiting
+  // on the human right now), pulsing like `planning` since it IS live work. StatusPill's
+  // default label `status.replace(/_/g," ")` already yields "revising", so no
+  // RUN_STATUS_LABELS entry is needed. Kept in step with runStatusTone (agreement test).
+  revising: { tone: "info", pulse: true },
   awaiting_approval: { tone: "warning", pulse: true },
   // PRD #88: parked on a clarification question. Deliberately IDENTICAL to
   // awaiting_approval — same shape of debt (a human owes the run an action while a

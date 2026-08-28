@@ -1,6 +1,6 @@
-// AdminShell: one header + tab bar shared by the five admin surfaces (Users,
-// Rate limits, Tool allowlist, Blocked repos, Instance). The same treatment
-// SettingsShell gives the user-scoped settings: the five pages used to be five
+// AdminShell: one header + tab bar shared by the admin surfaces (Users,
+// Rate limits, Tool allowlist, Blocked repos, Instance, Branding). The same treatment
+// SettingsShell gives the user-scoped settings: the pages used to be separate
 // top-level sidebar entries wired together only by proximity, which crowded the
 // sidebar for admins and hid that they are one area — this instance's controls.
 // The sidebar now carries a single "Admin" entry; the tabs carry the rest.
@@ -15,6 +15,7 @@ const TABS = [
   { to: "/admin/tool-allowlist", label: "Tool allowlist" },
   { to: "/admin/blocked-repos", label: "Blocked repos" },
   { to: "/admin/settings", label: "Instance" },
+  { to: "/admin/branding", label: "Branding" },
 ];
 
 export function AdminShell({ description, children }: { description: ReactNode; children: ReactNode }) {

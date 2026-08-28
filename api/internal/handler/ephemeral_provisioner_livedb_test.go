@@ -104,15 +104,55 @@ func (fx *ephemeralFixture) queuedRun(caps []string) uuid.UUID {
 }
 
 // provisioner builds the real provisioner with a settings cache reflecting the instance
-// kill-switch and the given cap/default size.
+// kill-switch and the given cap/default size. It delegates to provisionerWithDelay with
+// delay 0 (past by construction), so the existing capability-gap tests are unchanged.
 func (fx *ephemeralFixture) provisioner(instanceEnabled bool, maxPerUser int) *hostedsvc.EphemeralProvisioner {
+	return fx.provisionerWithDelay(instanceEnabled, maxPerUser, 0)
+}
+
+// provisionerWithDelay is provisioner plus the saturation debounce knob. provisioner
+// delegates with delay 0 (past by construction) so the existing capability-gap tests are
+// unchanged; the saturation tests flip this to gate the debounce deterministically without
+// any wall-clock sleep.
+func (fx *ephemeralFixture) provisionerWithDelay(instanceEnabled bool, maxPerUser int, saturationDelay time.Duration) *hostedsvc.EphemeralProvisioner {
 	sc := settings.New(&settingsStore{rows: []store.AppSetting{
 		{Key: settings.KeyEphemeralWorkersEnabled, Value: fmt.Sprintf("%t", instanceEnabled)},
 	}}, time.Minute)
 	return hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, sc, hostedsvc.EphemeralConfig{
-		MaxPerUser:  maxPerUser,
-		DefaultSize: "m",
+		MaxPerUser:      maxPerUser,
+		DefaultSize:     "m",
+		SaturationDelay: saturationDelay,
 	})
+}
+
+// onlineWorkerWithCap inserts an online worker with an explicit max_concurrent_runs cap
+// (the sibling onlineWorker leaves it NULL = unbounded). docker toggles docker_enabled.
+func (fx *ephemeralFixture) onlineWorkerWithCap(name string, docker bool, maxConcurrent int) uuid.UUID {
+	fx.t.Helper()
+	id := uuid.New()
+	a, b := uuid.New(), uuid.New()
+	if _, err := fx.pool.Exec(fx.ctx,
+		`INSERT INTO workers (id, user_id, name, token_hash, status, last_heartbeat_at, docker_enabled, max_concurrent_runs)
+		 VALUES ($1, $2, $3, $4, 'online', now(), $5, $6)`,
+		id, fx.userID, name, append(a[:], b[:]...), docker, maxConcurrent); err != nil {
+		fx.t.Fatalf("seed capped worker: %v", err)
+	}
+	return id
+}
+
+// activeRunOn seeds a running (slot-occupying) run bound to workerID, so the worker's
+// free-slot count drops by one. kind defaults to 'issue' (non-chat), which the free-slot
+// subquery counts.
+func (fx *ephemeralFixture) activeRunOn(workerID uuid.UUID) uuid.UUID {
+	fx.t.Helper()
+	id := uuid.New()
+	if _, err := fx.pool.Exec(fx.ctx,
+		`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, worker_id)
+		 VALUES ($1, $2, $3, $4, 't', 'd', 'running', $5)`,
+		id, fx.userID, fx.repoID, fx.nextIID(), workerID); err != nil {
+		fx.t.Fatalf("seed active run: %v", err)
+	}
+	return id
 }
 
 // ephemeralRows reads the fixture user's ephemeral worker rows as (runID -> row).
@@ -283,5 +323,199 @@ func TestEphemeralProvisionPassPlaceableRunLiveDB(t *testing.T) {
 	}
 	if n := len(fx.ephemeralRows()); n != 0 {
 		t.Errorf("ephemeral rows for fixture user = %d, want 0 (an online docker worker can claim the run)", n)
+	}
+}
+
+// TestEphemeralProvisionPassSaturationBurstLiveDB: a capability-placeable but slot-blocked
+// run past the debounce provisions exactly one run-bound worker; the SAME run under the
+// debounce provisions nothing (the flip proves the zero is the debounce). (M4 a+b)
+func TestEphemeralProvisionPassSaturationBurstLiveDB(t *testing.T) {
+	fx := newEphemeralFixture(t, true)
+	w := fx.onlineWorkerWithCap("docker-full", true, 1) // capable of docker, cap 1
+	fx.activeRunOn(w)                                   // 1 active -> 0 free slots -> saturated
+	runID := fx.queuedRun([]string{"docker"})           // placeable by w, but w is full
+
+	// Under the debounce (delay 1h, run is fresh): provisions nothing.
+	blocked := fx.provisionerWithDelay(true, 2, time.Hour)
+	if _, err := blocked.ProvisionPass(fx.ctx); err != nil {
+		t.Fatalf("ProvisionPass (blocked): %v", err)
+	}
+	if n := len(fx.ephemeralRows()); n != 0 {
+		t.Fatalf("under debounce: ephemeral rows = %d, want 0", n)
+	}
+
+	// Flip ONE variable — delay 0 (past by construction), same run + fleet: provisions one.
+	burst := fx.provisionerWithDelay(true, 2, 0)
+	if _, err := burst.ProvisionPass(fx.ctx); err != nil {
+		t.Fatalf("ProvisionPass (burst): %v", err)
+	}
+	rows := fx.ephemeralRows()
+	if len(rows) != 1 {
+		t.Fatalf("past debounce: ephemeral rows = %d, want 1", len(rows))
+	}
+	if rows[0].runID != runID {
+		t.Errorf("ephemeral_run_id = %s, want %s", rows[0].runID, runID)
+	}
+	if !rows[0].docker {
+		t.Errorf("docker_enabled = false, want true (the run needed docker)")
+	}
+	if rows[0].template != "base" {
+		t.Errorf("template = %q, want base", rows[0].template)
+	}
+	if rows[0].size != "m" {
+		t.Errorf("hosted_size = %q, want m (configured default)", rows[0].size)
+	}
+}
+
+// TestEphemeralProvisionPassSaturationFreeSlotLiveDB: a capable worker with a FREE slot
+// makes the run placeable -> nothing; filling that slot (flip one variable) makes it
+// slot-blocked -> provisions. (M4 c)
+func TestEphemeralProvisionPassSaturationFreeSlotLiveDB(t *testing.T) {
+	fx := newEphemeralFixture(t, true)
+	w := fx.onlineWorkerWithCap("docker-cap2", true, 2) // capable, cap 2
+	fx.activeRunOn(w)                                   // 1 active -> 1 free slot remains
+	fx.queuedRun([]string{"docker"})
+
+	// One free slot: not slot-blocked -> nothing (delay 0 so only the free slot gates it).
+	prov := fx.provisionerWithDelay(true, 2, 0)
+	if _, err := prov.ProvisionPass(fx.ctx); err != nil {
+		t.Fatalf("ProvisionPass (free slot): %v", err)
+	}
+	if n := len(fx.ephemeralRows()); n != 0 {
+		t.Fatalf("with a free slot: ephemeral rows = %d, want 0 (run is placeable)", n)
+	}
+
+	// Flip ONE variable — occupy the second slot so the worker is full -> provisions.
+	fx.activeRunOn(w) // 2 active -> 0 free
+	if _, err := prov.ProvisionPass(fx.ctx); err != nil {
+		t.Fatalf("ProvisionPass (now full): %v", err)
+	}
+	if n := len(fx.ephemeralRows()); n != 1 {
+		t.Fatalf("with no free slot: ephemeral rows = %d, want 1", n)
+	}
+}
+
+// TestEphemeralProvisionPassSaturationKillSwitchLiveDB: instance kill-switch off gates the
+// saturation path too; flipping it on (one variable) provisions. (M4 d)
+func TestEphemeralProvisionPassSaturationKillSwitchLiveDB(t *testing.T) {
+	fx := newEphemeralFixture(t, true)
+	w := fx.onlineWorkerWithCap("docker-full", true, 1)
+	fx.activeRunOn(w)
+	fx.queuedRun([]string{"docker"})
+
+	off := fx.provisionerWithDelay(false, 2, 0) // kill-switch OFF
+	if _, err := off.ProvisionPass(fx.ctx); err != nil {
+		t.Fatalf("ProvisionPass (kill-switch off): %v", err)
+	}
+	if n := len(fx.ephemeralRows()); n != 0 {
+		t.Fatalf("kill-switch off: ephemeral rows = %d, want 0", n)
+	}
+
+	on := fx.provisionerWithDelay(true, 2, 0) // flip ON
+	if _, err := on.ProvisionPass(fx.ctx); err != nil {
+		t.Fatalf("ProvisionPass (kill-switch on): %v", err)
+	}
+	if n := len(fx.ephemeralRows()); n != 1 {
+		t.Fatalf("kill-switch on: ephemeral rows = %d, want 1", n)
+	}
+}
+
+// TestEphemeralProvisionPassSaturationNotOptedInLiveDB: a not-opted-in user gets no
+// saturation burst; opting in (one variable) provisions. (M4 e)
+func TestEphemeralProvisionPassSaturationNotOptedInLiveDB(t *testing.T) {
+	fx := newEphemeralFixture(t, false) // NOT opted in
+	w := fx.onlineWorkerWithCap("docker-full", true, 1)
+	fx.activeRunOn(w)
+	fx.queuedRun([]string{"docker"})
+
+	prov := fx.provisionerWithDelay(true, 2, 0)
+	if _, err := prov.ProvisionPass(fx.ctx); err != nil {
+		t.Fatalf("ProvisionPass (not opted in): %v", err)
+	}
+	if n := len(fx.ephemeralRows()); n != 0 {
+		t.Fatalf("not opted in: ephemeral rows = %d, want 0", n)
+	}
+
+	// Flip ONE variable — opt the user in -> provisions.
+	if _, err := fx.pool.Exec(fx.ctx, `UPDATE users SET ephemeral_workers_enabled = true WHERE id = $1`, fx.userID); err != nil {
+		t.Fatalf("opt user in: %v", err)
+	}
+	if _, err := prov.ProvisionPass(fx.ctx); err != nil {
+		t.Fatalf("ProvisionPass (opted in): %v", err)
+	}
+	if n := len(fx.ephemeralRows()); n != 1 {
+		t.Fatalf("opted in: ephemeral rows = %d, want 1", n)
+	}
+}
+
+// TestEphemeralProvisionPassSaturationOverCapLiveDB: a user already at the per-user
+// ephemeral cap gets no saturation burst; raising the cap (one variable) provisions. (M4 f)
+func TestEphemeralProvisionPassSaturationOverCapLiveDB(t *testing.T) {
+	fx := newEphemeralFixture(t, true)
+	w := fx.onlineWorkerWithCap("docker-full", true, 1)
+	fx.activeRunOn(w)
+
+	// Pre-seed one ephemeral worker bound to an unrelated run so the user sits at cap 1.
+	otherRun := fx.queuedRun([]string{"docker"})
+	a, b := uuid.New(), uuid.New()
+	if _, err := fx.pool.Exec(fx.ctx,
+		`INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled, ephemeral, ephemeral_run_id)
+		 VALUES ($1, 'pre-ephemeral', $2, 'base', 'hosted', 'm', true, true, $3)`,
+		fx.userID, append(a[:], b[:]...), otherRun); err != nil {
+		t.Fatalf("seed pre-existing ephemeral worker: %v", err)
+	}
+	fx.queuedRun([]string{"docker"}) // a fresh saturation-eligible run
+
+	atCap := fx.provisionerWithDelay(true, 1, 0) // cap 1, already at 1
+	if _, err := atCap.ProvisionPass(fx.ctx); err != nil {
+		t.Fatalf("ProvisionPass (at cap): %v", err)
+	}
+	if n := len(fx.ephemeralRows()); n != 1 {
+		t.Fatalf("at cap: ephemeral rows = %d, want 1 (only the pre-seeded)", n)
+	}
+
+	// Flip ONE variable — raise the cap to 2 -> the fresh run provisions.
+	raised := fx.provisionerWithDelay(true, 2, 0)
+	if _, err := raised.ProvisionPass(fx.ctx); err != nil {
+		t.Fatalf("ProvisionPass (cap raised): %v", err)
+	}
+	if n := len(fx.ephemeralRows()); n != 2 {
+		t.Fatalf("cap raised: ephemeral rows = %d, want 2", n)
+	}
+}
+
+// TestEphemeralProvisionPassSaturationPlainRunLiveDB: a PLAIN run (zero required
+// capabilities) under saturation provisions (Decision 2 — no cardinality>0 guard); the
+// same run under the debounce provisions nothing. (M4 g)
+func TestEphemeralProvisionPassSaturationPlainRunLiveDB(t *testing.T) {
+	fx := newEphemeralFixture(t, true)
+	w := fx.onlineWorkerWithCap("base-full", false, 1) // plain base worker, cap 1
+	fx.activeRunOn(w)                                  // saturated
+	runID := fx.queuedRun([]string{})                  // zero required capabilities (NOT NULL '{}')
+
+	blocked := fx.provisionerWithDelay(true, 2, time.Hour)
+	if _, err := blocked.ProvisionPass(fx.ctx); err != nil {
+		t.Fatalf("ProvisionPass (blocked): %v", err)
+	}
+	if n := len(fx.ephemeralRows()); n != 0 {
+		t.Fatalf("plain run under debounce: ephemeral rows = %d, want 0", n)
+	}
+
+	burst := fx.provisionerWithDelay(true, 2, 0)
+	if _, err := burst.ProvisionPass(fx.ctx); err != nil {
+		t.Fatalf("ProvisionPass (burst): %v", err)
+	}
+	rows := fx.ephemeralRows()
+	if len(rows) != 1 {
+		t.Fatalf("plain run past debounce: ephemeral rows = %d, want 1", len(rows))
+	}
+	if rows[0].runID != runID {
+		t.Errorf("ephemeral_run_id = %s, want %s", rows[0].runID, runID)
+	}
+	if rows[0].docker {
+		t.Errorf("docker_enabled = true, want false (plain run)")
+	}
+	if rows[0].template != "base" {
+		t.Errorf("template = %q, want base (plain run)", rows[0].template)
 	}
 }

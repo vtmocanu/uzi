@@ -67,7 +67,7 @@ func TestCardLabelsNeverMarshalAsNull(t *testing.T) {
 				}
 			})
 			t.Run("assembleCards", func(t *testing.T) {
-				cards := assembleCards([]store.Issue{is}, nil, nil, nil, uuid.Nil, "gitlab")
+				cards := assembleCards([]store.Issue{is}, nil, nil, nil, uuid.Nil, "gitlab", nil)
 				if len(cards) != 1 {
 					t.Fatalf("expected one card, got %d", len(cards))
 				}

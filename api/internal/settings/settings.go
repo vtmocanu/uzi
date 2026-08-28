@@ -29,6 +29,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/termsafe"
 	"github.com/vtmocanu/uzi/api/internal/theme"
 )
 
@@ -207,6 +208,29 @@ const (
 	KeyAgentSourceLatestRef       = "agent_source_latest_ref"        // newest IsValid semver tag advertised by the source ("" if none)
 	KeyAgentSourceRemoteTipSHA    = "agent_source_remote_tip_sha"    // advertised tip SHA of the configured ref (or HEAD)
 	KeyAgentSourceUpdateCheckedAt = "agent_source_update_checked_at" // RFC3339 timestamp of the last update check
+	// Instance branding keys (PRD #685 M1). All NON-SECRET public config → they live
+	// in Defaults (never SecretKeys), round-trip through PUT /admin/settings, and are
+	// served — allowlisted, never via All/AdminView — through the public GET
+	// /api/branding. Logo BYTES are NOT keys: they live in the branding_assets table
+	// (Decision D7), so nothing here carries a blob and the settings cache stays small.
+	KeyAppLogoMode     = "app_logo_mode"      // "default" | "custom"
+	KeyAppLogoKeepName = "app_logo_keep_name" // "true" | "false"
+	KeyBrandMode       = "brand_mode"         // "none" | "text" | "logo"
+	KeyBrandCompany    = "brand_company"      // ≤64-rune company text (may be ""), rendered to every principal incl. signed-out
+	KeyBrandPlacement  = "brand_placement"    // "below" | "topright"
+	KeyBrandPlaque     = "brand_plaque"       // "true" | "false"
+	// MR review-watcher admin gates (PRD #700 M5, Decision 5). mr_rework_enabled is
+	// the global kill-switch (text "true"/"false"); mr_rework_cap is the admin cap on
+	// rework cycles per MR (a positive integer, mirroring ci-autofix's maxAttempts).
+	// BOTH default ON/5 — this feature ships enabled, the opposite of the judge's
+	// default-off (Decision 5) — so the enabled read is a THREE-STATE read
+	// (present-true / present-false / absent → the default ON) that PROPAGATES a store
+	// read error rather than collapsing it into the value: the caller (the M3
+	// detector) maps that error to OFF (fail closed). Admin-writable with compiled-in
+	// defaults; no seeded row (an absent row synthesizes to the default). The per-user
+	// opt-in lives on users.mr_rework_enabled, not here.
+	KeyMrReworkEnabled = "mr_rework_enabled"
+	KeyMrReworkCap     = "mr_rework_cap"
 )
 
 // Compiled-in defaults, used when a row is absent so a fresh or partially
@@ -307,6 +331,24 @@ const (
 	// sourceAgentsDir (".claude/agents"), so an install with no folder set reads
 	// role files from exactly the same subtree as before.
 	DefaultAgentSourceFolder = ".claude/agents"
+	// PRD #685 M1 instance-branding defaults. A fresh install is UNBRANDED (Decision
+	// D4): the app mark stays the uzi FactoryIcon + literals (app_logo_mode=default,
+	// keep-name on) and there is no POWERED BY brand (brand_mode=none). brand_company
+	// is empty and the plaque is off. Same no-seeded-row pattern as the judge keys —
+	// an absent row synthesizes to these defaults, so no migration seeds them.
+	DefaultAppLogoMode     = "default"
+	DefaultAppLogoKeepName = "true"
+	DefaultBrandMode       = "none"
+	DefaultBrandCompany    = ""
+	DefaultBrandPlacement  = "below"
+	DefaultBrandPlaque     = "false"
+	// PRD #700 M5 Decision 5. The MR review watcher ships ON: an admin global
+	// kill-switch (default true — the OPPOSITE of the judge's default-off, an
+	// announced behavior change) and a per-MR rework-cycle cap (default 5, mirroring
+	// ci-autofix's maxAttempts). Both are the admin-side gates; the per-user opt-in
+	// (also default-on) lives on users.mr_rework_enabled.
+	DefaultMrReworkEnabled = "true"
+	DefaultMrReworkCap     = "5"
 )
 
 // healthSecondsMin / healthSecondsMax bound the integer health settings (Decision
@@ -332,6 +374,12 @@ const maxHostedWorkerQuota = 20
 // runs thousands of judges a day — so an admin meaning 50 and typing 50000 gets a
 // rejected write instead of an effectively-unlimited guard.
 const maxJudgeDailyBudget = 10000
+
+// maxMrReworkCap bounds the per-MR rework-cycle cap (PRD #700 M5 Decision 2). The
+// cap is a small loop guard (default 5, mirroring ci-autofix's maxAttempts), so the
+// upper bound only catches a fat-fingered value — no MR legitimately needs hundreds
+// of automated rework cycles.
+const maxMrReworkCap = 100
 
 // maxLabelLen is Decision 8's length cap (runes, not bytes).
 const maxLabelLen = 64
@@ -428,6 +476,22 @@ var Defaults = map[string]string{
 	// synthesizes to DefaultAgentSourceFolder, so Known()/admin-writable with no
 	// migration and existing installs read the historical ".claude/agents" subtree.
 	KeyAgentSourceFolder: DefaultAgentSourceFolder,
+	// PRD #685 M1 instance-branding config keys. Same no-seeded-row pattern: an absent
+	// row synthesizes to these defaults, so a fresh install renders unbranded and the
+	// public GET /api/branding reports the default shape. NON-SECRET (here, not in
+	// SecretKeys) — they are served to everyone incl. signed-out. Logo bytes are NOT
+	// here (branding_assets table, D7).
+	KeyAppLogoMode:     DefaultAppLogoMode,
+	KeyAppLogoKeepName: DefaultAppLogoKeepName,
+	KeyBrandMode:       DefaultBrandMode,
+	KeyBrandCompany:    DefaultBrandCompany,
+	KeyBrandPlacement:  DefaultBrandPlacement,
+	KeyBrandPlaque:     DefaultBrandPlaque,
+	// PRD #700 M5 MR review-watcher admin gates. Same no-seeded-row pattern as the
+	// judge keys: an absent row synthesizes to these defaults, so All/AdminView
+	// surface them to the settings page on every instance and no migration seeds them.
+	KeyMrReworkEnabled: DefaultMrReworkEnabled,
+	KeyMrReworkCap:     DefaultMrReworkCap,
 }
 
 // SecretKeys is the set of settings whose values are secrets (PRD #25): sealed
@@ -686,6 +750,51 @@ func (c *Cache) SlackEnabled(ctx context.Context) (bool, error) {
 	}
 }
 
+// BrandingConfig is the allowlisted instance-branding config (PRD #685 M1): EXACTLY
+// the six branding keys, coerced to their typed form. It is the only thing the public
+// GET /api/branding reads from settings — built key-by-key here rather than from
+// All/AdminView so that anonymous read cannot leak any other settings key (Risk R1).
+type BrandingConfig struct {
+	AppLogoMode     string
+	AppLogoKeepName bool
+	BrandMode       string
+	BrandCompany    string
+	BrandPlacement  string
+	BrandPlaque     bool
+}
+
+// Branding returns the effective branding config (PRD #685 M1), reading each of the
+// six keys individually through the same ENV-over-DB-over-default precedence every
+// other accessor uses. The two bools apply the PrdlessEnabled junk-tolerance: only
+// "true"/"false" are honored and any other stored value falls back to the compiled-in
+// default rather than silently reading false. A cold-refresh error is returned
+// alongside a defaults-filled struct so a best-effort caller can ignore err.
+//
+// It DELIBERATELY does not range over Defaults (as All/AdminView do): the public
+// endpoint that consumes this serves anonymous callers, so it must expose only these
+// six fields and never the rest of the non-secret settings surface (Risk R1).
+func (c *Cache) Branding(ctx context.Context) (BrandingConfig, error) {
+	m, err := c.snapshot(ctx)
+	boolOf := func(key string) bool {
+		switch c.effective(key, m) {
+		case "true":
+			return true
+		case "false":
+			return false
+		default:
+			return Defaults[key] == "true"
+		}
+	}
+	return BrandingConfig{
+		AppLogoMode:     c.effective(KeyAppLogoMode, m),
+		AppLogoKeepName: boolOf(KeyAppLogoKeepName),
+		BrandMode:       c.effective(KeyBrandMode, m),
+		BrandCompany:    c.effective(KeyBrandCompany, m),
+		BrandPlacement:  c.effective(KeyBrandPlacement, m),
+		BrandPlaque:     boolOf(KeyBrandPlaque),
+	}, err
+}
+
 // PublicBaseURL returns the base URL used to build webui deep links in Slack
 // messages (PRD #25). ENV (UZI_PUBLIC_BASE_URL) over the DB row over the
 // loopback default.
@@ -744,6 +853,53 @@ func (c *Cache) EphemeralWorkersEnabled(ctx context.Context) (bool, error) {
 	default:
 		return DefaultEphemeralWorkersEnabled == "true", err
 	}
+}
+
+// MrReworkEnabled reports whether the MR review-watcher auto-rework feature is
+// enabled instance-wide (PRD #700 M5 Decision 5): the admin global kill-switch.
+// Stored as the text "true"/"false"; any OTHER value falls back to the compiled-in
+// default (true). This feature ships ON — the opposite of JudgeEnabled — so a
+// malformed row never silently turns a default-on feature off.
+//
+// The read is DELIBERATELY three-state and error-propagating, not the best-effort
+// swallow the other bool readers use. Decision 5 (review-fix R3) requires reconciling
+// default-ON with fail-closed by distinguishing present-true / present-false / absent
+// (all a value) from a store READ ERROR: absent → ON (the default), but a genuine
+// error must NOT be misread as absent→ON, which fails OPEN. So this reader PROPAGATES
+// its error to the caller and must not collapse it to false itself; the CALLER (the
+// M3 detector) is the one that maps a non-nil error to OFF. Do not "helpfully" swallow
+// the error to false here — that would move the fail-closed decision away from the
+// caller that owns it.
+func (c *Cache) MrReworkEnabled(ctx context.Context) (bool, error) {
+	v, err := c.get(ctx, KeyMrReworkEnabled)
+	switch v {
+	case "true":
+		return true, err
+	case "false":
+		return false, err
+	default:
+		return DefaultMrReworkEnabled == "true", err
+	}
+}
+
+// MrReworkCap returns the admin-configured cap on rework cycles per MR (PRD #700 M5
+// Decision 2), the loop guard mirroring ci-autofix's maxAttempts. An absent or blank
+// value falls back to DefaultMrReworkCap (5). Unlike intSetting — which swallows an
+// unparseable value to the compiled-in default — a PARSE ERROR is returned so the
+// caller decides what to do with a cap it cannot read (a hand-edited junk row is not
+// silently treated as 5). A cold store read error is propagated too.
+func (c *Cache) MrReworkCap(ctx context.Context) (int, error) {
+	v, err := c.get(ctx, KeyMrReworkCap)
+	s := strings.TrimSpace(v)
+	if s == "" {
+		n, _ := strconv.Atoi(DefaultMrReworkCap)
+		return n, err
+	}
+	n, perr := strconv.Atoi(s)
+	if perr != nil {
+		return 0, perr
+	}
+	return n, err
 }
 
 // JudgeEnforceAll reports whether the judge is enforced for every run (PRD #69),
@@ -1261,8 +1417,19 @@ func Validate(key, value string) error {
 		return theme.Validate(value)
 	case KeyPrdlessEnabled, KeySlackEnabled, KeyJudgeEnabled, KeyJudgeEnforceAll, KeyHealthEnabled,
 		KeyCapabilityAwareScheduling, KeyEligibleLabelWaivesPRDLink, KeyGithubProjectSyncEnabled,
-		KeyEphemeralWorkersEnabled, KeyAgentSourceEnabled:
+		KeyEphemeralWorkersEnabled, KeyAgentSourceEnabled, KeyMrReworkEnabled,
+		KeyAppLogoKeepName, KeyBrandPlaque:
 		return validateBool(value)
+	case KeyMrReworkCap:
+		return validateMrReworkCap(value)
+	case KeyAppLogoMode:
+		return validateEnum(value, "default", "custom")
+	case KeyBrandMode:
+		return validateEnum(value, "none", "text", "logo")
+	case KeyBrandPlacement:
+		return validateEnum(value, "below", "topright")
+	case KeyBrandCompany:
+		return validateBrandCompany(value)
 	case KeyJudgeModel, KeySummaryModel:
 		return validateModelAlias(value)
 	case KeyAgentSourceInterval:
@@ -1525,6 +1692,44 @@ func validateBool(value string) error {
 	return nil
 }
 
+// validateEnum is the write-time gate for a closed-set string setting (PRD #685 M1:
+// the branding enums app_logo_mode / brand_mode / brand_placement). Like the int
+// validators, an explicit Validate case backed by this is load-bearing: Validate's
+// default branch falls through to ValidateLabel, which accepts ANY non-empty ≤64-char
+// string — so an enum key missing from the switch would accept "wat", and the reader
+// would then silently fall back to the compiled-in default. An enum must fail the
+// WRITE, the only moment a human is present to be told. The error names the allowed
+// set so the admin can fix it.
+func validateEnum(value string, allowed ...string) error {
+	for _, a := range allowed {
+		if value == a {
+			return nil
+		}
+	}
+	return fmt.Errorf("must be one of: %s", strings.Join(allowed, ", "))
+}
+
+// maxBrandCompanyLen caps the POWERED BY company text (PRD #685 M1). 64 runes, the
+// same visual cap as a label; unlike ValidateLabel this is measured in RUNES via
+// utf8.RuneCountInString so a multibyte name is not undercounted.
+const maxBrandCompanyLen = 64
+
+// validateBrandCompany is the DEDICATED write-time gate for brand_company (PRD #685
+// M1). It deliberately does NOT reuse ValidateLabel: the branding company text may be
+// empty (the default) and may contain commas ("Acme, Inc."), both of which
+// ValidateLabel rejects. It DOES enforce a 64-rune cap and — because this text is
+// admin-authored yet rendered into every user's chrome, including signed-out
+// (the "rendered to a principal other than the author" class .claude/rules/web.md
+// governs) — it rejects control and Unicode-format runes via termsafe.Validate, so an
+// RTL-override or zero-width rune cannot mangle the chrome for everyone. The empty
+// value passes termsafe.Validate (no runes to reject), so no special case is needed.
+func validateBrandCompany(value string) error {
+	if utf8.RuneCountInString(value) > maxBrandCompanyLen {
+		return fmt.Errorf("must be at most %d characters", maxBrandCompanyLen)
+	}
+	return termsafe.Validate("brand_company", value)
+}
+
 // validateHealthSeconds is the write-time gate for an integer run-health threshold
 // (PRD #47 Decision 5): a base-10 integer that is either 0 (disable that signal) or
 // within [healthSecondsMin, healthSecondsMax]. Negatives, non-integers, 1–59, and
@@ -1567,6 +1772,27 @@ func validateHostedWorkerQuota(value string) error {
 	}
 	if n < 0 || n > maxHostedWorkerQuota {
 		return fmt.Errorf("must be 0 (self-service disabled) or between 1 and %d workers", maxHostedWorkerQuota)
+	}
+	return nil
+}
+
+// validateMrReworkCap is the write-time gate for the per-MR rework-cycle cap (PRD
+// #700 M5 Decision 2): a base-10 integer in [1, maxMrReworkCap]. It must be at least
+// 1 — the admin kill-switch (mr_rework_enabled), not a zero cap, is how the feature
+// is turned off. Negatives, non-integers, and values above the cap are refused.
+//
+// Like validateHostedWorkerQuota, this explicit Validate case is load-bearing: the
+// default branch falls through to ValidateLabel, which accepts any non-empty
+// ≤64-char string — so an integer key missing from the switch would accept "abc",
+// and MrReworkCap would then return a parse error on every read of an admin value it
+// was told saved fine.
+func validateMrReworkCap(value string) error {
+	n, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return errors.New("must be a whole number of rework cycles")
+	}
+	if n < 1 || n > maxMrReworkCap {
+		return fmt.Errorf("must be between 1 and %d rework cycles", maxMrReworkCap)
 	}
 	return nil
 }

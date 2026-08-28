@@ -5765,6 +5765,34 @@ apiget /api/workers \
   || fail "deleting a bound token nulled workers.user_id — the composite FK's SET NULL is missing its column list"
 pass "D5 live: deleting a bound token unbinds the worker and leaves workers.user_id intact"
 
+# Binding-phase cleanup — terminate the three claimed-but-unfinished runs so they
+# cannot leak into the next phase's queue. RUN_B1/B2/B3 were CLAIMED by the synthetic
+# BINDW worker (claim_token reads the delivered token and stops there; it never drives
+# them to a terminal state), and BINDW is not a container, so it runs no poller and
+# they sit `claimed` on it. Once BINDW's last heartbeat ages past the stale window
+# (E2E_WORKER_HEARTBEAT_STALE=15s), the sweeper's RequeueRunsOfStaleWorkers moves them
+# back to `queued` (runtime.sql), where the very next phase's user-scoped worker can
+# claim them. The PRD #108 M5 auto-stop phase below depends on "the two runs we create
+# are the only queued rows for the admin" (see its header) and fails with a dirty-queue
+# claim when a requeued B-run leaks in — the timing-dependent nightly failure this
+# cleanup fixes.
+#
+# A `{"kind":"cancel"}` input (as the PRD #111 M6 phase uses) does NOT work here:
+# SubmitInput cancels server-side only when the run has NO live poller
+# (workersvc/service.go, the `!live` branch), and those M6 runs were still `queued`
+# with no worker. BINDW's heartbeat is fresh at this point, so a cancel would merely
+# enqueue a verdict BINDW never consumes. Write the terminal state directly (the
+# harness's db_psql-write pattern) so the runs leave every requeue/claim predicate
+# deterministically, regardless of BINDW's liveness.
+CANCELLED_N="$(db_psql "WITH c AS (
+  UPDATE runs SET status = 'cancelled', status_since = now(), finished_at = now(), updated_at = now()
+  WHERE id IN ('$RUN_B1', '$RUN_B2', '$RUN_B3') AND status NOT IN ('completed', 'failed', 'cancelled')
+  RETURNING 1
+) SELECT count(*) FROM c")"
+[ "$CANCELLED_N" = 3 ] \
+  || fail "binding phase cleanup: expected to terminate 3 leftover claimed runs, cancelled $CANCELLED_N (B1=$RUN_B1 B2=$RUN_B2 B3=$RUN_B3)"
+pass "binding-phase cleanup: the three claimed binding runs terminated so they cannot dirty the auto-stop queue"
+
 # --- PRD #108 M5: auto-stop kills a run whose messages can't be saved ------------
 # The real stub agent cannot prove this end-to-end: it never emits a permanently-
 # unstorable payload and its in-flight hold is not abort-aware, so it cannot poison
@@ -5772,7 +5800,8 @@ pass "D5 live: deleting a bound token unbinds the worker and leaves workers.user
 # protocol by hand with curl (the PRD #104 binding phase above is the proven pattern
 # for a Bearer-token worker the api cannot tell from a container). The agent
 # container was `compose stop`ped by the binding phase, so this worker is the ONLY
-# claimant — the two runs we create are the only queued rows for the admin.
+# claimant — and the binding phase's own three claimed runs were just terminated (see
+# the cleanup above), so the two runs we create are the only queued rows for the admin.
 #
 # Mechanism the asserts below depend on (workersvc/autostop.go + persistfail.go +
 # health.go), so the failure messages name a cause that was actually measured:

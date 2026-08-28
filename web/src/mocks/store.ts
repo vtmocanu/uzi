@@ -216,6 +216,11 @@ const CARD_MIRRORED_FIELDS = [
 const CARD_OWN_FIELDS = [
   "id",
   "updated_at",
+  // issue #750: is_revising is a board/list projection the server computes (it rides the
+  // card DTO and RunListItemDTO, NOT RunDTO — see api.ts), so it is deliberately absent
+  // from the Run patch type and a run patch must never write it. It lives on the OWN side
+  // of the partition, unlike is_planning (which IS on Run and so is mirrored).
+  "is_revising",
   "owner_name",
   "worker_name",
   "is_mine",

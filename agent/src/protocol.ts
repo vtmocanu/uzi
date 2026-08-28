@@ -223,7 +223,7 @@ export interface AnswerBody {
  *
  *  RUN_KINDS is mirrored from the DB `runs_kind_check` constraint (in DB CHECK
  *  order); agent/test/run-kind-db-parity.test.ts keeps the two in sync. */
-export const RUN_KINDS = ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt", "task"] as const;
+export const RUN_KINDS = ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt", "task", "mr_rework"] as const;
 export type RunKind = (typeof RUN_KINDS)[number];
 
 /** How a run's plan_md was produced (PRD #209 D4). "agent": the worker's own Phase-1
@@ -539,6 +539,40 @@ export interface IssueCommentsSnapshot {
   truncated: boolean;
 }
 
+/** One MR review comment, snapshotted for an mr_rework run (PRD #700 M2). Mirrors
+ *  IssueCommentSnapshot with the extra fields the detector (M3) and worker (M4) need:
+ *  the monotonic forge `id` (the high-water anchor), the diff anchor (`path`/`line`),
+ *  the reply/resolve thread ids, the `head_sha` the comment was written against, and
+ *  the review state. Bodies are UNTRUSTED, attacker-influenceable free text. */
+export interface ReviewCommentSnapshot {
+  id: number;
+  author_username: string;
+  author_forge_user_id: number;
+  /** RFC3339. */
+  created_at: string;
+  body: string;
+  /** Diff file path for an inline comment; null for a review-summary/top-level note. */
+  path: string | null;
+  /** Diff line for an inline comment; null for a review-summary/top-level note. */
+  line: number | null;
+  /** Reply anchor: GitLab discussion id, GitHub REST databaseId, or Forgejo comment id. */
+  reply_id: string;
+  /** Resolve anchor: GitLab discussion id or GitHub GraphQL thread node id; empty on Forgejo. */
+  resolve_id: string;
+  /** The diff head SHA the comment was written against (staleness gate); may be empty. */
+  head_sha: string;
+  /** "inline" for a diff-line comment, "summary" for a review-summary/top-level note. */
+  review_state: string;
+}
+
+/** The bounded, bot-self-filtered snapshot of an MR's review comments carried on an
+ *  mr_rework claim (PRD #700 M2). Absent for a non-mr_rework kind and a connection with
+ *  an unknown bot id (D9). `truncated` is set when the thread was clipped. */
+export interface ReviewCommentsSnapshot {
+  comments: ReviewCommentSnapshot[];
+  truncated: boolean;
+}
+
 /**
  * Response body of a successful (200) claim.
  *
@@ -565,6 +599,12 @@ export interface ClaimResponse {
    *  (D9). The bodies are UNTRUSTED, multi-author, attacker-influenceable text;
    *  prompt.ts renders them under a per-prompt nonce fence (D5). */
   issue_comments?: IssueCommentsSnapshot | null;
+  /** PRD #700 M2: the bounded, bot-self-filtered snapshot of an MR's review comments
+   *  (human + third-party review bots like CodeRabbit), carried on an mr_rework claim.
+   *  Absent/null for every non-mr_rework kind and a connection with an unknown bot id
+   *  (D9). Bodies are UNTRUSTED, multi-author, attacker-influenceable text; prompt.ts
+   *  (M4) renders them under a per-prompt nonce fence. */
+  review_comments?: ReviewCommentsSnapshot | null;
   /** The failed-pipeline snapshot for a ci_fix run (PRD #6): what the agent
    *  diagnoses + fixes. Present only for kind="ci_fix". Log tails are UNTRUSTED
    *  data — quoted evidence, never instructions. */
