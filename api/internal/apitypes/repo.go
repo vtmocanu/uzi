@@ -21,6 +21,12 @@ type RepoDTO struct {
 	// repo also unions the packages from the repo's own devbox.json (packages-only,
 	// never its hooks/scripts). Default false.
 	RepoDevboxOptIn bool `json:"repo_devbox_opt_in"`
+	// RepoFoldImproveUziBacklog is the per-repo self-improve dogfooding capability
+	// (PRD #686 D1): when true, this repo's scheduled self_improve run folds the
+	// owner's improve_uzi judge backlog into the run and the worker receives the
+	// uzi-specific directive; when false (the default) the run is generic ("improve
+	// THIS project"). Owner-granted, mirrored on the Repos "Trusted" panel.
+	RepoFoldImproveUziBacklog bool `json:"repo_fold_improve_uzi_backlog"`
 	// RequiredCapabilities is the static per-repo capability hint (PRD #84 M2): the
 	// non-provisionable capabilities (e.g. docker) every run on this repo is routed to
 	// require. Copied onto each new issue run at enqueue and matched at claim time.
