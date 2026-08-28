@@ -83,6 +83,7 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"board-admin":              boardAdmin,
 		"board-filter":             func(d bool) string { return boardFilter(d, now) },
 		"board-planning":           func(d bool) string { return boardPlanning(d, now) },
+		"board-revising":           func(d bool) string { return boardRevising(d, now) },
 		"board-milestones":         func(d bool) string { return boardMilestones(d, now) },
 		"detail-running":           func(d bool) string { return detailRunning(d, now) },
 		"detail-planning":          func(d bool) string { return detailPlanning(d, now) },
@@ -268,6 +269,21 @@ func boardPlanning(dark bool, now time.Time) string {
 		{RunDTO: apitypes.RunDTO{ID: "d0e1f2a3-1111-2222-3333-444444444444", Kind: "issue", Status: "running", IsPlanning: true, IssueTitle: "Draft the plan for webhook delivery retries", CreatedAt: now.Add(-90 * time.Second)}},
 		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111-2222-3333-444444444444", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll", CreatedAt: now.Add(-4 * time.Minute)}},
 		{RunDTO: apitypes.RunDTO{ID: "c3d4e5f6-1111-2222-3333-444444444444", Kind: "issue", Status: "running", Health: "stalled", IssueTitle: "Refactor the forge sync loop for the GitHub driver", CreatedAt: now.Add(-51 * time.Minute)}},
+	}})
+	return m.View().Content
+}
+
+// boardRevising renders a board carrying a mid-"revise" replan run (issue #750: status stays
+// awaiting_approval but IsRevising is true) beside a genuine plan-gate run. The revising run
+// drops to ON THE FLOOR and is excluded from the ⚑ summary count, so the frame shows the fixed
+// treatment — the cluster reads ⚑ 1 with two awaiting_approval runs on the board.
+func boardRevising(dark bool, now time.Time) string {
+	fake := &uzicli.FakeClient{}
+	m := uxModel(fake, "", dark)
+	m = step(m, boardRunsMsg{runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "b2c3d4e5-1111-2222-3333-444444444444", Kind: "ci_fix", Status: "awaiting_approval", IssueTitle: "Fix flaky pipeline on main", CreatedAt: now.Add(-2 * time.Minute)}},
+		{RunDTO: apitypes.RunDTO{ID: "d0e1f2a3-1111-2222-3333-444444444444", Kind: "issue", Status: "awaiting_approval", IssueTitle: "Re-plan webhook delivery retries after steer", CreatedAt: now.Add(-90 * time.Second)}, IsRevising: true},
+		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111-2222-3333-444444444444", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll", CreatedAt: now.Add(-4 * time.Minute)}},
 	}})
 	return m.View().Content
 }

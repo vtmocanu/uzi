@@ -620,7 +620,13 @@ func (m tuiModel) boardSummary() string {
 	for _, r := range m.board.runs {
 		switch r.Status {
 		case "awaiting_approval":
-			approvals++
+			// issue #750: a run mid-"revise" replan keeps status == awaiting_approval but is
+			// NOT the user's turn (the agent is re-planning and will re-gate itself), so it must
+			// not inflate the ⚑ counter — mirror runBand's !isRevising gate so the cluster count
+			// matches the NEEDS YOU band header.
+			if !r.IsRevising {
+				approvals++
+			}
 		case "awaiting_input":
 			inputs++
 		case "awaiting_followup":
