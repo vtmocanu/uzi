@@ -12,8 +12,8 @@ import {
   guardCriticalMrSection,
   missingDeclaredDeps,
   runSelfImproveChecks,
+  selfImproveBranch,
   selfImproveMrSection,
-  SELF_IMPROVE_BRANCH,
   SELF_IMPROVE_CHECKS,
   type CheckResult,
   type CheckRunner,
@@ -453,6 +453,8 @@ describe("selfImproveMrSection skip disclosure (M8)", () => {
 });
 
 describe("buildSelfImprovePlanPrompt", () => {
+  // Fresh-per-cycle branch (#686 M8): derived from the run id, no longer a fixed const.
+  const SELF_IMPROVE_BRANCH = selfImproveBranch("run-123");
   const prompt = buildSelfImprovePlanPrompt({
     branch: SELF_IMPROVE_BRANCH,
     recommendations: "1. [worker] install jq\n2. improve the poller",

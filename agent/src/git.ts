@@ -158,7 +158,8 @@ export interface RunnerClone {
    *
    *  WHAT IT COUNTS DEPENDS ON `seededFrom`, and PRD #218 made that split load-bearing:
    *   - `"origin"`  — prior PUSHED work the clone was based off: an earlier completed
-   *     run on the same issue, the self_improve fixed branch's previous cycles, or a
+   *     run on the same issue, a RESUMED self_improve cycle's own previously-pushed
+   *     commits (its branch is fresh-per-cycle, keyed on runId — #686 M8), or a
    *     human's commits. This is the original contract (issue #105): a run pushes
    *     exactly once, after the executor returns, and a fresh seed `fs.rm`s and
    *     re-clones, so a fresh claim never sees THIS attempt's commits here.
@@ -1792,8 +1793,9 @@ export function isWorkflowScopeRejection(err: unknown): boolean {
  * refused a non-forced push because the pushed tip is not a descendant of the branch's
  * already-published tip. This is the resumed / rewritten-history case: when the finalize
  * base-align rebase fallback rewinds to the original agent tip and replays the commits,
- * it rewrites SHAs that were already published at origin (a resume, or the `self_improve`
- * fixed branch), so the subsequent non-forced push cannot fast-forward. Force-push is
+ * it rewrites SHAs that were already published at origin (a resume — including a resumed
+ * `self_improve` cycle reattaching to its own fresh-per-cycle branch), so the subsequent
+ * non-forced push cannot fast-forward. Force-push is
  * denied by the guardrails by design, so the correct outcome is the typed
  * base-align-conflict preserve path (preserved_patch + `finalize_base_align_conflict`),
  * not a push retry — routing here keeps it off the generic catch (raw error, defaulted

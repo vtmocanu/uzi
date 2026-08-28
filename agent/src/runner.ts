@@ -50,8 +50,8 @@ import {
   flagGuardPaths,
   guardCriticalMrSection,
   runSelfImproveChecks,
+  selfImproveBranch,
   selfImproveMrSection,
-  SELF_IMPROVE_BRANCH,
   type CheckRunner,
 } from "./self-improve.js";
 import { installJsDeps } from "./js-deps.js";
@@ -2690,25 +2690,30 @@ export class RunRunner {
       );
     }
     if (claim.kind === "self_improve") {
-      // The FIXED branch (PRD #46 Decision 10): reused every cycle so the worker's
-      // idempotent createMergeRequest extends one open MR rather than opening a new
-      // one, and successive cycles are tested together.
+      // A FRESH-PER-CYCLE branch (PRD #46 Decision 10, #686 M8): each cycle branches
+      // off current main and derives a distinct `uzi/self-improve/<runId>` name, so the
+      // worker's idempotent createMergeRequest opens a NEW merge request each cycle —
+      // no long-lived fixed branch accreting across cycles. This mirrors the prompt
+      // block below: the run_id makes the branch unique and collision-free, and it also
+      // seeds the tracking-ref ownership anchor, so a RESUMED cycle reuses its own
+      // branch while a new cycle gets its own.
+      const selfImproveBranchName = selfImproveBranch(runId);
       return this.git.runnerCloneForBranch(
         barePath,
-        SELF_IMPROVE_BRANCH,
-        SELF_IMPROVE_BRANCH.replace(/\//g, "-"),
+        selfImproveBranchName,
+        selfImproveBranchName.replace(/\//g, "-"),
         runId,
       );
     }
     if (claim.kind === "prompt") {
       // An ad-hoc SCHEDULED prompt run (PRD #241 Decision 10) is repo-ful and
       // ISSUE-LESS — the ci_fix shape, not self_improve (which carries a tracking
-      // issue and reuses a FIXED branch across cycles). With no issue_iid there is
-      // no agent/issue-{iid} branch to key on, so derive a stable branch from the
-      // run id. Each fired prompt run is a distinct run, so `uzi/prompt-{runId}` is
-      // unique and collision-free — the worker's idempotent createMergeRequest opens
-      // exactly one MR for it (no fixed-branch reuse, unlike self_improve). The
-      // run_id also seeds the tracking-ref ownership anchor above.
+      // issue, though both now derive a fresh-per-cycle branch from the run id). With
+      // no issue_iid there is no agent/issue-{iid} branch to key on, so derive a stable
+      // branch from the run id. Each fired prompt run is a distinct run, so
+      // `uzi/prompt-{runId}` is unique and collision-free — the worker's idempotent
+      // createMergeRequest opens exactly one MR for it. The run_id also seeds the
+      // tracking-ref ownership anchor above.
       const promptBranch = `uzi/prompt-${runId}`;
       return this.git.runnerCloneForBranch(
         barePath,

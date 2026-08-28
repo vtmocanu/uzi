@@ -41,7 +41,7 @@ const SelfImproveTrackingLabel = "uzi-self-improve"
 const selfImproveTrackingTitle = "uzi self-improvement"
 
 const selfImproveTrackingBody = "Autonomous self-improvement tracking issue (PRD #46). Each cycle, " +
-	"uzi opens or extends one merge request on the `uzi/self-improve` branch against this " +
+	"uzi opens a fresh merge request against this " +
 	"repo, picking one top improvement. The bot never merges to `main` — a human reviews and merges. " +
 	"This issue is a container; see its linked runs and MR for each cycle's plan and changes."
 

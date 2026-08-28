@@ -1467,8 +1467,7 @@ export function buildSelfImprovePlanPrompt(
       : "";
   return [
     "You are running an AUTONOMOUS self-improvement task on uzi's own repository.",
-    `You are on the fixed branch \`${input.branch}\`, which may already carry an open`,
-    "merge request from a previous cycle — extend it rather than starting over.",
+    `You are on this cycle's branch \`${input.branch}\`; open a new merge request for your change.`,
     ...(priorNote ? ["", priorNote] : []),
     ...(baseNote ? ["", baseNote] : []),
     "",
