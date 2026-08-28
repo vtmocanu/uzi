@@ -67,7 +67,15 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 164 as of this commit (PRD #702 M4 added POST /api/admin/agent-source/update-check —
+// 165 as of this commit — but NOT because the API gained a route. The go-chi/chi
+// v5.3.2 bump (PR go-chi/chi#1148, "don't drop handlers that collide with a
+// Mount()/Route() pattern") made chi.Walk enumerate PUT /api/me/judge, an existing
+// route (SetJudgeEnabled, PRD #46) whose pattern collides with the Route("/me/judge")
+// read subrouter; Walk silently skipped the colliding handler through v5.3.1. The
+// route always SERVED (verified 200 on both versions) — only its visibility to this
+// table changed. This is the sole case in this list where the count moved without a
+// route being added.
+// It was 164 until then (PRD #702 M4 added POST /api/admin/agent-source/update-check —
 // the cookie-only admin ls-remote of the CONFIGURED source that persists remote facts;
 // GET/status DERIVE "update available" from those facts with no egress).
 // It was 163 until then (PRD #702 M2 added POST /api/admin/agent-source/resolve-latest —
@@ -503,6 +511,14 @@ var wantRouteMounts = []routeMount{
 	// and mints nothing — none of the three things the per-user limiters exist to
 	// bound. Cookie+CSRF already gates it, matching /me/autopilot beside it.
 	{"PUT", "/api/me/wait-on-limit", noLimiter},
+	// PRD #46: the run-judge consent toggle (SetJudgeEnabled). A single boolean
+	// UPDATE on the caller's own users row, spends no Anthropic token at toggle time
+	// — noLimiter, matching /me/autopilot and /me/ci-autofix beside it. Its route
+	// pattern collides with the Route("/me/judge") read subrouter; chi < 5.3.2
+	// dropped this colliding handler from chi.Walk's enumeration (it still SERVED,
+	// verified 200 on both versions), so this row was invisible until the v5.3.2
+	// bump (PR go-chi/chi#1148) made Walk report it.
+	{"PUT", "/api/me/judge", noLimiter},
 	{"PUT", "/api/me/judge/recommendations/disposition", noLimiter},
 	{"PUT", "/api/me/secrets/anthropic_token", noLimiter},
 	{"PUT", "/api/me/settings/", noLimiter},
