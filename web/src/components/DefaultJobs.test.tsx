@@ -152,20 +152,54 @@ describe("DefaultJobs — catalog row", () => {
     ).toBeTruthy();
   });
 
-  it("Enable is DISABLED with no repo picked and ENABLES once a repo is selected", async () => {
+  it("row Enable is ABSENT with no repo picked and APPEARS once an actionable repo is selected", async () => {
     renderTab();
-    const enable = screen.getByRole("button", { name: /Enable/ });
-    // Guardrail: disabled until a repo is chosen (success criterion 1).
-    expect(enable.hasAttribute("disabled")).toBe(true);
+    // No repo picked and the row is collapsed: the row Enable button does not render (it
+    // only appears when clicking it would do something). EnableAnotherRepo's "Enable" lives
+    // in the expanded children, and the disclosure is named "Show repos for …", so neither
+    // matches /Enable/ here.
+    expect(screen.queryByRole("button", { name: /Enable/ })).toBeNull();
 
-    // Pick a repo via the multi-select checkbox (labelled by its path).
+    // Pick an actionable repo via the multi-select checkbox (labelled by its path).
     fireEvent.click(screen.getByLabelText("vtmocanu/uzi"));
 
-    // The SAME button transitions to enabled — the disabled→enabled transition, not a
-    // vacuous single-state check.
-    await waitFor(() => expect(enable.hasAttribute("disabled")).toBe(false));
+    // The row Enable button now appears and is not disabled.
+    const enable = await screen.findByRole("button", { name: /Enable/ });
+    expect(enable.hasAttribute("disabled")).toBe(false);
     // The "N repos → N schedules" hint reflects the pick.
     expect(screen.getByText(/1 repo → 1 schedule/)).toBeTruthy();
+  });
+
+  it("no row Enable when the only selected repo is already enabled on the job", () => {
+    // The job is already enabled on repo-uzi; picking only repo-uzi leaves the actionable
+    // set empty, so the row Enable button must not render.
+    renderTab({
+      schedules: [defRow({ id: "sch-uzi", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi" })],
+    });
+    fireEvent.click(screen.getByLabelText("vtmocanu/uzi"));
+
+    // Collapsed row: the disclosure toggle is named "Show repos for …", so it won't match
+    // /Enable/. No actionable repo → no row Enable button.
+    expect(screen.queryByRole("button", { name: /Enable/ })).toBeNull();
+  });
+
+  it("row Enable fans out only the actionable subset of the selection", async () => {
+    // The job is already enabled on repo-uzi. Picking BOTH repos should enable only the
+    // actionable one (repo-atlas), never re-enable the already-materialized repo-uzi.
+    const onEnable = vi.fn(async () => {});
+    renderTab({
+      schedules: [defRow({ id: "sch-uzi", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi" })],
+      onEnable,
+    });
+
+    // Select both repos before clicking Enable (the top picker re-renders per pick).
+    fireEvent.click(screen.getByLabelText("vtmocanu/uzi"));
+    fireEvent.click(screen.getByLabelText("vtmocanu/atlas-api"));
+
+    fireEvent.click(screen.getByRole("button", { name: /Enable/ }));
+    await waitFor(() =>
+      expect(onEnable).toHaveBeenCalledWith(expect.anything(), ["repo-atlas"]),
+    );
   });
 });
 
