@@ -146,6 +146,9 @@ func classifyByVersion(reported, target string) (status string, detail string) {
 
 // -------------------------------------------------------------------------
 // The full decision table (PRD #113 M4): version compare + controller roll health.
+// R7.5 (issue #738) adds a settled-only, outdated-only softener below the compare rows:
+// a hosted worker the controller confirms is on the target image reads up_to_date even
+// when its baked version trails the tag (a reuse-retagged image, PRD #422).
 // -------------------------------------------------------------------------
 
 // RollSignal is a persisted controller report, as the classifier reads it. Nil means
@@ -340,6 +343,10 @@ func (p UpgradeParams) withDefaults() UpgradeParams {
 //     a version stamp would throw away the incident's own signal.
 //   - R8 (no-signal grace) sits BELOW the compare rows, so it can only ever soften
 //     `outdated` — never override `up_to_date` or `unknown`.
+//   - R7.5 (issue #738), a `settled`-only, `outdated`-only softener, sits just below
+//     the compare rows too: it clears a hosted worker the controller confirms is on the
+//     target image despite a trailing baked version (a reuse-retagged image, PRD #422).
+//     Like R8 it can only soften `outdated`, never override `up_to_date` or `unknown`.
 func ClassifyUpgrade(in UpgradeInput, p UpgradeParams) (status string, detail string) {
 	status, detail, _ = classifyWithTarget(in, p)
 	return status, detail
@@ -438,6 +445,34 @@ func classifyWithTarget(in UpgradeInput, p UpgradeParams) (status string, detail
 
 	// R4-R7, R9: the version-compare core.
 	status, detail = classifyByVersion(in.Reported, target)
+
+	// R7.5 (issue #738) — the controller has CONFIRMED this hosted worker's
+	// current-generation pod is running its Deployment's pinned target image
+	// (phase == settled means the current-spec-hash pod is Ready). So an `outdated`
+	// from the version compare above is the baked UZI_AGENT_VERSION lying under a
+	// reuse-retagged image (PRD #422): the tag advanced to a new release that points
+	// at a PRIOR release's digest, so the baked version trails the tag while the
+	// worker is, in fact, running the target. Trust the controller's direct
+	// observation over the self-reported string. Softener only: it fires solely when
+	// the compare already said `outdated`, so it can never override `unknown`, a
+	// dev-plane, or an ahead/equal worker. Phase-settled only: a `rolling` worker
+	// past the INV-5 ceiling (which falls through R2 to here) stays `outdated`.
+	//
+	// Valid-RolledTag only (the semver.IsValid guard): `settled` only proves the
+	// current-gen pod runs the tag the controller RENDERED FROM, which the classifier
+	// sees as RolledTag. When RolledTag is unparseable/absent the target falls back to
+	// CPVersion/pin (see the hosted target-resolution block above) and `settled` no
+	// longer confirms the worker is on that fallback coordinate, so we defer to the
+	// version-compare fail-safe (`outdated`) rather than assert a false `up_to_date`
+	// and hide real drift. Because R7.5 already requires signalFresh, a valid RolledTag
+	// means the target-resolution block above already set target == RolledTag, so the
+	// guard fires exactly where "settled ⟹ on target" holds.
+	if status == UpgradeStatusOutdated && hosted && signalFresh &&
+		s.Phase == PhaseSettled && semver.IsValid(normSemver(s.RolledTag)) {
+		return UpgradeStatusUpToDate,
+			fmt.Sprintf("running the target image (%s); reported %s trails it (re-tagged image)", target, in.Reported),
+			target
+	}
 
 	// R8 — behind, hosted, and NO fresh signal, within the grace after api start.
 	// Model B rolls the api in the same release, so a recently started api means a

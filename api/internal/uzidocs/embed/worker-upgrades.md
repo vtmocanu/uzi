@@ -83,3 +83,15 @@ reports rolling to, so a pinned worker reads *up to date* at its pinned tag. `uz
 carries the same states in an `UPGRADE` column rendered for that surface (`FAILED`, and `-` for
 no badge), documented in [uzi CLI](cli.md#upgrade-status) — a second definition rather than a
 deferral, so a state added or renamed must be edited in both.
+
+**A reused agent image reads *up to date*, not *outdated*.** Recall the version is baked at
+build time and reported at registration. When a release leaves the worker agent unchanged, the
+build is skipped and the new tag simply re-points at the previous release's image, so that image
+still reports the *older* version even though it is exactly the pinned release. For a hosted
+worker this would otherwise read *outdated* forever: its reported version trails the tag it is
+pinned to. It does not, because the cluster reports the worker's roll as *settled* — a direct
+confirmation that the worker's current pod is running the image its deployment pins — and that
+confirmation is trusted over the baked version string. So a hosted worker the cluster has
+confirmed is on its target image reads *up to date* even when its reported version looks a
+release behind. This applies only to hosted workers with a live controller signal; an external
+worker, which has no such signal, is still read by its version string alone.

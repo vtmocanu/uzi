@@ -153,14 +153,14 @@ offline.
 
 ## Milestones
 
-- [ ] **M1 — The classifier rule.** Add R7.5 to `classifyWithTarget`
+- [x] **M1 — The classifier rule.** Add R7.5 to `classifyWithTarget`
   (`api/internal/workersvc/upgrade.go`) exactly as specified above: between the
   `classifyByVersion` call (`:440`) and R8 (`:447`), gated on `status ==
   UpgradeStatusOutdated && hosted && signalFresh && s.Phase == PhaseSettled`, returning
   `up_to_date` with a detail naming the resolved target and the trailing reported
   version. Update the decision-table doc comment (`:147-149`, `:332-342`) to describe
   the new row and its rationale. No wire, migration, controller, or DTO change.
-- [ ] **M2 — Tests, both directions, in `upgrade_ceiling_test.go`.** Prove:
+- [x] **M2 — Tests, both directions, in `upgrade_ceiling_test.go`.** Prove:
   (a) **reuse case** — `Kind:"hosted"`, fresh `settled` signal, `target` a release
   ABOVE a **genuinely-behind** `Reported` (so that without R7.5 the worker reads
   `outdated`) → now `up_to_date`; (b) **genuine-outdated controls still red** — a
@@ -174,7 +174,7 @@ offline.
   worker no longer counts). Calibrate every fixture on a genuinely-behind version per
   the semver-trap discipline in `.claude/rules/go.md` — an all-current fixture passes
   against the broken code and proves nothing.
-- [ ] **M3 — Docs + decision record.** Update the worker upgrade-status doc (the PRD
+- [x] **M3 — Docs + decision record.** Update the worker upgrade-status doc (the PRD
   #113 page under `docs/`) to describe the `settled`-trumps-version rule and the
   reuse-retag interaction it fixes. Add a decision entry (Decision 3 below; an ADR
   `0738-*.md` if it warrants durability) recording that hosted-worker classification
@@ -193,8 +193,14 @@ offline.
    and a hosted worker with **no** fresh signal still reads `outdated` via the semver
    path. R7.5 does not blind the real signal.
 3. External workers, a `dev` control plane, and any worker without a fresh controller
-   signal behave exactly as today — zero change to the existing `upgrade_test.go` /
-   `upgrade_ceiling_test.go` results beyond the new rows.
+   signal behave exactly as today — beyond the new rows, the only pre-existing result
+   that changed is `TestFreshRolledTagOverridesTheStaticPin` (`upgrade_pinned_test.go`),
+   which necessarily FLIPPED from `outdated` to `up_to_date`: its scenario (fresh
+   `settled`, parseable RolledTag one step ahead of the reported version, past the R3
+   grace) is indistinguishable from the reuse-retag case, so #738's design overturns its
+   old expectation; its target-governance assertion (`target == "0.49.0"`, Decision 9) is
+   unchanged. `TestHostedTargetIsTheRolledTagWithFallback`'s unparseable-tag assertion was
+   PRESERVED by the Decision-5 narrowing guard.
 4. The change contains **zero** `.github/workflows/**` edits and no migration/wire/DTO
    change — `git diff --name-only <base>..HEAD` touches only
    `api/internal/workersvc/` and `docs/` (plus an `adr/` file if written).
@@ -267,3 +273,20 @@ offline.
   but optional defense-in-depth for a trust boundary this PRD does not widen; it is
   deferred rather than built here, keeping the fix a single-function change with no
   schema or wire surface.
+- **Decision 5 — Narrow R7.5 to a parseable `RolledTag` (added during implementation).**
+  The rule as originally specified above fired on `status == outdated && hosted &&
+  signalFresh && s.Phase == PhaseSettled` alone. Implementation review found that too
+  broad on the fallback path: `settled` proves only that the worker runs the tag the
+  controller RENDERED FROM (`RolledTag`), so "settled ⟹ on target" holds only when
+  `target == RolledTag`. When `RolledTag` is unparseable/absent, `target` falls back to
+  CPVersion/pin and `settled` no longer confirms that coordinate — a genuinely-behind
+  worker on a stale non-semver pinned tag (e.g. `nightly`) would be falsely cleared to
+  `up_to_date` with a lying "running the target image" detail. The shipped guard adds
+  `&& semver.IsValid(normSemver(s.RolledTag))`, so R7.5 fires only where the resolved
+  target is the controller-confirmed rendered tag; an unparseable `RolledTag` correctly
+  falls through to the version-compare fail-safe (`outdated`). This preserves the
+  `TestHostedTargetIsTheRolledTagWithFallback` fail-safe and is why Success Criterion 3
+  changed only `TestFreshRolledTagOverridesTheStaticPin` (which is genuinely the reuse
+  case and flips regardless of the guard). Cross-references Decision 4 — the guard is the
+  reason a digest comparison is unnecessary: `settled` + parseable `RolledTag` already
+  pins "on target" without one. Recorded durably in [adr/0738-hosted-worker-settled-trumps-version.md](../../adr/0738-hosted-worker-settled-trumps-version.md).
