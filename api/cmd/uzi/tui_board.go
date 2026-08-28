@@ -101,9 +101,9 @@ func (b *boardState) visible() []apitypes.RunListItemDTO {
 			// #321 hides) plus the human word, so a user can filter by either "awaiting_approval"
 			// or "plan gate". The truly-raw r.Status is deliberately NOT included: it would let
 			// "running" match a planning run again, the exact thing #321 fixed.
-			_, word := stateGlyphWord(r.Status, r.Health, r.IsPlanning)
+			_, word := stateGlyphWord(r.Status, r.Health, r.IsPlanning, r.IsRevising)
 			hay := strings.ToLower(strings.Join([]string{
-				r.ID, r.Kind, effectiveRunStatus(r.Status, r.IsPlanning),
+				r.ID, r.Kind, effectiveRunStatus(r.Status, r.IsPlanning, r.IsRevising),
 				word, r.Health, cellText(runTitle(r.RunDTO)),
 			}, " "))
 			if strings.Contains(hay, q) {
@@ -125,8 +125,16 @@ const (
 
 var bandNames = [numBands]string{"NEEDS YOU", "ON THE FLOOR", "DONE"}
 
-// runBand places a run in its triage band from its status alone.
-func runBand(status string) int {
+// runBand places a run in its triage band from its status (plus is_revising).
+//
+// issue #750: a run mid-"revise" replan keeps status == awaiting_approval but is NOT the
+// user's turn — the agent is re-planning (~90s) and will re-gate itself — so it drops to
+// ON THE FLOOR instead of sitting in NEEDS YOU. is_revising is NOT status-gated
+// server-side, so the awaiting_approval check is applied here (mirroring effectiveRunStatus).
+func runBand(status string, isRevising bool) int {
+	if status == "awaiting_approval" && isRevising {
+		return bandFloor
+	}
 	switch status {
 	case "awaiting_approval", "awaiting_input", "awaiting_followup":
 		// awaiting_followup (PRD #517) is the user's turn — an interactive task parked for
@@ -144,7 +152,7 @@ func runBand(status string) int {
 func bandOrder(runs []apitypes.RunListItemDTO) []apitypes.RunListItemDTO {
 	var buckets [numBands][]apitypes.RunListItemDTO
 	for _, r := range runs {
-		b := runBand(r.Status)
+		b := runBand(r.Status, r.IsRevising)
 		buckets[b] = append(buckets[b], r)
 	}
 	out := make([]apitypes.RunListItemDTO, 0, len(runs))
@@ -335,12 +343,12 @@ const (
 func (m tuiModel) buildBoardItems(rows []apitypes.RunListItemDTO) []boardItem {
 	var counts [numBands]int
 	for _, r := range rows {
-		counts[runBand(r.Status)]++
+		counts[runBand(r.Status, r.IsRevising)]++
 	}
 	items := make([]boardItem, 0, len(rows)+numBands*2)
 	prevBand := -1
 	for i, r := range rows {
-		if b := runBand(r.Status); b != prevBand {
+		if b := runBand(r.Status, r.IsRevising); b != prevBand {
 			if prevBand != -1 {
 				items = append(items, boardItem{kind: biSpacer})
 			}
@@ -863,9 +871,9 @@ func padSeg(s string, n int, bg color.Color) string {
 // selected row rides the full-width warm selection bar with a ▸ cursor; a DONE-band row is
 // faint end to end.
 func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCols) string {
-	band := runBand(r.Status)
+	band := runBand(r.Status, r.IsRevising)
 	terminal := band == bandDone
-	tok := m.pal.stateToken(r.Status, r.Health, r.IsPlanning)
+	tok := m.pal.stateToken(r.Status, r.Health, r.IsPlanning, r.IsRevising)
 	showCred := m.boardShowCred()
 
 	var bg color.Color

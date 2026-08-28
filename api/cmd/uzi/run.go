@@ -53,12 +53,19 @@ const (
 // terminal would make `--follow` exit on a run that is about to produce more messages.
 const statusLimitWait = "limit_wait"
 
-// effectiveRunStatus is the status a run should RENDER as: "planning" while it is in its
-// pre-approval planning phase (issue #321), else its raw status. is_planning is a server-
-// computed display predicate meaningful only while running (chat/judge excluded server-
-// side), so this only maps the running→planning case. Mirrors the web helper of the same
-// name so the CLI and SPA name the phase identically.
-func effectiveRunStatus(status string, isPlanning bool) string {
+// effectiveRunStatus is the status a run should RENDER as: "revising" while a "revise"
+// replan is in flight (issue #750), "planning" while it is in its pre-approval planning
+// phase (issue #321), else its raw status. is_planning and is_revising are server-computed
+// display predicates, each meaningful only in one status: is_planning while running
+// (chat/judge excluded server-side), is_revising while awaiting_approval (a revise replan
+// leaves runs.status at awaiting_approval). CRITICAL: is_revising is NOT status-gated
+// server-side, so the awaiting_approval gate is applied HERE — mirroring how is_planning is
+// only honoured while running. Mirrors the web helper of the same name so the CLI and SPA
+// name the phase identically.
+func effectiveRunStatus(status string, isPlanning, isRevising bool) string {
+	if isRevising && status == "awaiting_approval" {
+		return "revising"
+	}
 	if isPlanning && status == "running" {
 		return "planning"
 	}
@@ -226,7 +233,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 			rows := make([][]string, 0, len(runs))
 			now := time.Now()
 			for _, r := range runs {
-				rows = append(rows, []string{r.ID, r.Kind, effectiveRunStatus(r.Status, r.IsPlanning), runAgeCell(r.RunDTO, now), runTitle(r.RunDTO)})
+				rows = append(rows, []string{r.ID, r.Kind, effectiveRunStatus(r.Status, r.IsPlanning, r.IsRevising), runAgeCell(r.RunDTO, now), runTitle(r.RunDTO)})
 			}
 			return p.Table([]string{"ID", "KIND", "STATUS", "AGE", "TITLE"}, rows)
 		},
@@ -1333,7 +1340,9 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	rows := [][]string{
 		{"ID", r.ID},
 		{"KIND", r.Kind},
-		{"STATUS", effectiveRunStatus(r.Status, r.IsPlanning)},
+		// RunDTO carries no is_revising (issue #750): the detail page keeps its own
+		// derivePlanRevision panel, so revising is never surfaced through this helper here.
+		{"STATUS", effectiveRunStatus(r.Status, r.IsPlanning, false)},
 		{"TITLE", runTitle(r)},
 		{"BRANCH", strOr(r.Branch, "-")},
 		{mrAbbrev(r.ForgeType), int64Or(r.MrIID, "-")},

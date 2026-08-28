@@ -1537,7 +1537,7 @@ func TestTUIBoardSemanticStatusAndSummary(t *testing.T) {
 		t.Errorf("board has no background-fill SGR; the warm selection bar is missing\n%s", out)
 	}
 	// The NO_COLOR-safe state glyph for a running run survives independent of colour.
-	if g, _ := stateGlyphWord("running", "", false); !strings.Contains(out, g) {
+	if g, _ := stateGlyphWord("running", "", false, false); !strings.Contains(out, g) {
 		t.Errorf("running state glyph %q absent from the board\n%s", g, out)
 	}
 }
