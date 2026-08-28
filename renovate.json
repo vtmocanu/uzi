@@ -11,6 +11,10 @@
   "prHourlyLimit": 5,
   "minimumReleaseAge": "7 days",
   "internalChecksFilter": "strict",
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "labels": ["dependencies", "renovate", "security"]
+  },
   "customManagers": [
     {
       "customType": "regex",
