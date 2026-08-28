@@ -139,16 +139,19 @@ api:
     # UZI_OIDC_GROUPS_CLAIM: groups
     # UZI_OIDC_ADMIN_GROUPS: uzi-admins
     # UZI_OIDC_ALLOWED_GROUPS: uzi-users
-    # Ephemeral hosted workers (PRD #529) — auto-provision a throwaway hosted
-    # worker for a run whose capability no online worker satisfies, torn down
-    # when the run finishes. OFF by default: requires hosted-worker hosting
-    # enabled (the controller must run — uzi.apiHostingEnabled) AND the admin DB
-    # setting `ephemeral_workers_enabled` turned on (PUT /settings) AND the
-    # per-user opt-in. These env knobs only TUNE an already-enabled feature;
-    # leave them unset to use config.go's defaults. Uncomment to override.
+    # Ephemeral hosted workers (PRD #529, #747) — auto-provision a throwaway
+    # hosted worker for a queued run that no online worker can serve — either
+    # its capability is unmet (immediate) or the capable fleet is saturated at
+    # its per-worker cap (debounced) — torn down when the run finishes. OFF by
+    # default: requires hosted-worker hosting enabled (the controller must
+    # run — uzi.apiHostingEnabled) AND the admin DB setting
+    # `ephemeral_workers_enabled` turned on (PUT /settings) AND the per-user
+    # opt-in. These env knobs only TUNE an already-enabled feature; leave them
+    # unset to use config.go's defaults. Uncomment to override.
     # UZI_EPHEMERAL_MAX_PER_USER: "2"          # per-user concurrent-ephemeral cap
     # UZI_EPHEMERAL_DEFAULT_SIZE: m            # provision size preset: s|m|l
     # UZI_EPHEMERAL_PROVISION_DEADLINE: 10m    # GC deadline for never-booted / idle-stolen workers
+    # UZI_EPHEMERAL_SATURATION_DELAY: 90s     # debounce before bursting on a saturated (all capable workers full) fleet
   # Infisical-synced secret env: ENV_VAR -> the key in the `uzi-secrets` Secret.
   # JWT_SECRET and UZI_SECRET_KEY are REQUIRED (the api refuses to boot without
   # them — that guard is the backstop, so the k8s secretKeyRef stays optional:true
