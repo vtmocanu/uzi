@@ -944,8 +944,13 @@ export function RunView() {
                   PRD #517: `awaiting_followup` also KEEPS the chip — it is a needs-you
                   gate (the user is expected to send the next follow-up), the same kind
                   as awaiting_input, NOT the self-resuming clock park that limit_wait is.
-                  So only limit_wait is excluded here. */}
-              {!terminal && run.status !== "limit_wait" && (
+
+                  Issue #754: `pool_wait` is excluded for the SAME reason as limit_wait —
+                  it is a self-resuming hold (blocked on a pooled token, resumes on its
+                  own hours later), so a green "live" chip beside its amber wait pill is
+                  the same false all-clear. The two self-resuming holds are excluded; the
+                  needs-you gates keep the chip. */}
+              {!terminal && run.status !== "limit_wait" && run.status !== "pool_wait" && (
                 <span
                   title={connected ? "Live" : "Reconnecting…"}
                   className={cx(
@@ -1010,6 +1015,18 @@ export function RunView() {
       {error && <Alert message={error} />}
       {actionErr && <Alert message={actionErr} />}
 
+      {/* Issue #754: the pool-empty hold + Resume-now. Ordered ABOVE the usage-limit
+          strip deliberately (web-ux should-fix): on a pool_wait run the strip below
+          renders its NON-parked "Wait out future Anthropic usage limits" toggle, and
+          two Anthropic controls stacked let a user read that usage-limit checkbox as
+          the way to un-wait the pool hold, which it is not. Putting the pool panel
+          first makes the hold read as one self-contained unit (its own Resume-now is
+          the action), with the unrelated future-limit toggle clearly beneath it. This
+          does NOT disturb the limit_wait layout: PoolWaitPanel self-hides on every
+          status but pool_wait, so on a limit_wait run the strip below is still the
+          first thing rendered here. */}
+      <PoolWaitPanel run={run} canSteer={canSteer} onResumed={refreshRun} />
+
       {/* PRD #35: the usage-limit strip. High in the stack because on a parked run it
           carries the only thing the user came to find out — when it resumes — and low
           in weight otherwise, where it is just the per-run opt-in. Renders nothing at
@@ -1029,11 +1046,6 @@ export function RunView() {
           })
         }
       />
-
-      {/* Issue #754: the pool-empty hold + Resume-now. Sits directly under the
-          usage-limit strip because on a parked run it carries the one action the
-          user came for; it self-hides on every other status. */}
-      <PoolWaitPanel run={run} canSteer={canSteer} onResumed={refreshRun} />
 
       {/* PRD #362 M4: the plain-English run summary — intent, proposed/approved plan, and
           deltas from the original ask. Self-hides until a summary lands (the issue-title
