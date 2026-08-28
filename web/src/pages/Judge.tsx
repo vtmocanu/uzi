@@ -125,6 +125,12 @@ export function Judge() {
   // though NOT on a bucket-tab or category toggle since all buckets arrive in one payload.
   // Defaults to {} so a slow or failed fetch renders 0-count chips rather than crashing.
   const [categoryStats, setCategoryStats] = useState<JudgeCategoryStats["counts_by_bucket"]>({});
+  // Whether `categoryStats` reflects the LATEST issued fetch. A disposition installs the new
+  // `triage` (recommendation totals) synchronously but refetches the matrix async, so between
+  // the two the bridge line would reconcile the new recommendation count against the STALE
+  // group total. Gate the bridge on this: false while a matrix fetch is in flight (or after it
+  // failed), true only once the current fetch lands — so the reconciliation is never shown mid-flight.
+  const [categoryStatsFresh, setCategoryStatsFresh] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [actionErr, setActionErr] = useState("");
@@ -186,9 +192,16 @@ export function Judge() {
   const categoryStatsGen = useRef(0);
   const loadCategoryStats = useCallback(async () => {
     const gen = ++categoryStatsGen.current;
+    // The matrix in hand no longer matches the latest issued fetch — hide the bridge until this
+    // fetch lands (or keep it hidden if it fails). Reset every call so a post-mutation refetch
+    // suppresses the transient new-recs-vs-old-groups reconciliation.
+    setCategoryStatsFresh(false);
     try {
       const stats = await api.getJudgeCategoryStats(runAnchor || undefined);
-      if (gen === categoryStatsGen.current) setCategoryStats(stats.counts_by_bucket);
+      if (gen === categoryStatsGen.current) {
+        setCategoryStats(stats.counts_by_bucket);
+        setCategoryStatsFresh(true);
+      }
     } catch {
       /* chips render with 0 counts — a progressive enhancement, never a blocker */
     }
@@ -539,8 +552,10 @@ export function Judge() {
           (`?run=`): the recommendation half (`triage`) is whole-account, computed with no run
           argument, while the group half is run-anchor scoped, so the two cannot honestly
           reconcile there either. The "Showing N groups" line below stays unchanged and covers
-          the filtered/on-screen scope. */}
-      {!loading && backlog && !showZeroState && !runAnchor && triage && categories.length === 0 && !backlog.truncated && bridgeGroupTotal > 0 && (
+          the filtered/on-screen scope. Also gated on categoryStatsFresh: a disposition installs
+          the new triage synchronously but refetches the matrix async, so without this the bridge
+          would briefly reconcile the new recommendation count against the stale group total. */}
+      {!loading && backlog && !showZeroState && !runAnchor && triage && categories.length === 0 && !backlog.truncated && categoryStatsFresh && bridgeGroupTotal > 0 && (
         <p className="text-sm text-muted">
           {judgeBridgeLine(bucketTabCount(triage, bucket), bridgeGroupTotal, bucket)}
         </p>

@@ -1049,6 +1049,40 @@ describe("Judge — the row-vs-group bridge line (#620)", () => {
     // subtitle.
     expect(screen.queryByText(/recommendations across/)).toBeNull();
   });
+
+  it("is withheld while a post-mutation category-stats refetch is pending, then restored", async () => {
+    // A disposition installs the new `triage` (recommendation totals) synchronously but refetches
+    // the category-stats matrix async. Without the freshness gate the bridge would briefly show
+    // the NEW recommendation count against the STALE group total — a false reconciliation. Deferred
+    // promise, no timers: the second (post-dispose) stats fetch parks until released.
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog({ groups: [group()], triage }));
+    let releaseStats: (() => void) | undefined;
+    mockApi.getJudgeCategoryStats
+      .mockResolvedValueOnce({ counts_by_bucket }) // mount: bridge shows
+      .mockImplementationOnce(
+        () => new Promise((resolve) => { releaseStats = () => resolve({ counts_by_bucket }); }),
+      );
+    mockApi.bulkSetJudgeDisposition.mockResolvedValue({
+      updated: 1,
+      settled: [{ run_id: "run-1", rec_id: "rec-1" }],
+      groups: [group({ bucket: "done", open_count: 0 })],
+      truncated: false,
+      triage: { ...triage, todo: 40, done: 9 }, // rec half drops 42 → 40
+    });
+
+    renderJudge();
+    expect(await screen.findByText("42 to-do recommendations across 18 groups")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /Mark done/ }));
+
+    // Matrix refetch in flight → the bridge is withheld rather than reconciling the new
+    // recommendation total (40) against the stale group total.
+    await waitFor(() => expect(screen.queryByText(/recommendations across/)).toBeNull());
+
+    // Once the refetch lands, the bridge returns with the updated recommendation half.
+    releaseStats?.();
+    expect(await screen.findByText("40 to-do recommendations across 18 groups")).toBeTruthy();
+  });
 });
 
 describe("Judge — the subtitle and filter-panel caption copy (#620)", () => {
