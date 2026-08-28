@@ -192,6 +192,14 @@ const SEED_APP_SETTINGS: AppSettings = {
   run_eligible_labels: "PRD,bug",
   board_extra_labels: "bug",
   eligible_label_waives_prd_link: "true",
+  // PRD #685: instance branding config, all string-space. Fresh installs are
+  // unbranded (app_logo_mode "default", brand_mode "none").
+  app_logo_mode: "default",
+  app_logo_keep_name: "true",
+  brand_mode: "none",
+  brand_company: "",
+  brand_placement: "below",
+  brand_plaque: "false",
 };
 
 // parseLabels splits a comma-separated settings value into trimmed non-empty
@@ -1395,6 +1403,10 @@ let allocations: Record<string, { shared: string[]; mine: string[] }> = Object.f
   Object.entries(mockAllocations).map(([k, v]) => [k, { shared: [...v.shared], mine: [...v.mine] }]),
 );
 let appSettings: AppSettings = loadedSettings.appSettings;
+// PRD #685: whether a logo asset exists for each slot. The demo tracks only
+// presence (a bool), never bytes — mirroring how the public /api/branding read
+// exposes app_logo_present/brand_logo_present. Fresh install: neither uploaded.
+const brandingAssets: { app: boolean; brand: boolean } = { app: false, brand: false };
 // Slack secret tokens (PRD #25) are write-only: the demo tracks only whether one
 // is configured, never a value, mirroring the real API's `secrets` map. There is
 // no ENV overlay in the demo, so every key's source is db/default.
@@ -1771,6 +1783,44 @@ export const mockApi = {
   // either in a browser, point this line at it. `typeof realApi` cannot enforce any
   // of it, since every field but version and founded is optional.
   version: async () => delay(mockBuildInfo),
+  // PRD #685: public branding read. Coerces the string-space settings to the typed
+  // (bool) chrome shape and derives the two *_present flags from the tracked assets.
+  branding: async () =>
+    delay({
+      app_logo_mode: appSettings.app_logo_mode,
+      app_logo_present: brandingAssets.app,
+      app_logo_keep_name: appSettings.app_logo_keep_name === "true",
+      brand_mode: appSettings.brand_mode,
+      brand_company: appSettings.brand_company,
+      brand_placement: appSettings.brand_placement,
+      brand_plaque: appSettings.brand_plaque === "true",
+      brand_logo_present: brandingAssets.brand,
+    }),
+  // Admin logo upload/delete. The demo enforces the same type allowlist and 256 KiB
+  // cap the server does, then records presence (never bytes).
+  uploadBrandingLogo: async (slot: string, file: File) => {
+    requireSession();
+    if (slot !== "app" && slot !== "brand") {
+      throw new ApiError(404, "unknown logo slot");
+    }
+    const allowed = ["image/png", "image/webp", "image/svg+xml"];
+    if (!allowed.includes(file.type)) {
+      throw new ApiError(400, "logo must be a PNG, WebP or SVG image");
+    }
+    if (file.size > 262144) {
+      throw new ApiError(400, "logo must be at most 262144 bytes");
+    }
+    brandingAssets[slot] = true;
+    await delay(undefined, 40);
+  },
+  deleteBrandingLogo: async (slot: string) => {
+    requireSession();
+    if (slot !== "app" && slot !== "brand") {
+      throw new ApiError(404, "unknown logo slot");
+    }
+    brandingAssets[slot] = false;
+    return delay({ status: "ok" });
+  },
   logout: async () => {
     state.session = null;
     return delay({ status: "ok" });
@@ -2082,6 +2132,45 @@ export const mockApi = {
           throw new ApiError(400, "public_base_url: must use http or https");
         }
         nonSecret.public_base_url = value;
+        continue;
+      }
+      // PRD #685 branding config. Enum keys are checked against their allowed sets;
+      // the two flags are strict bools; brand_company is free text (may be "", may
+      // contain commas — mirrors the server's dedicated termsafe validator), capped
+      // at 64 runes.
+      if (key === "app_logo_mode") {
+        if (value !== "default" && value !== "custom") {
+          throw new ApiError(400, 'app_logo_mode: must be "default" or "custom"');
+        }
+        nonSecret.app_logo_mode = value;
+        continue;
+      }
+      if (key === "brand_mode") {
+        if (value !== "none" && value !== "text" && value !== "logo") {
+          throw new ApiError(400, 'brand_mode: must be "none", "text" or "logo"');
+        }
+        nonSecret.brand_mode = value;
+        continue;
+      }
+      if (key === "brand_placement") {
+        if (value !== "below" && value !== "topright") {
+          throw new ApiError(400, 'brand_placement: must be "below" or "topright"');
+        }
+        nonSecret.brand_placement = value;
+        continue;
+      }
+      if (key === "app_logo_keep_name" || key === "brand_plaque") {
+        if (value !== "true" && value !== "false") {
+          throw new ApiError(400, `${key}: must be "true" or "false"`);
+        }
+        (nonSecret as Record<string, string>)[key] = value;
+        continue;
+      }
+      if (key === "brand_company") {
+        if ([...value].length > 64) {
+          throw new ApiError(400, "brand_company: must be at most 64 characters");
+        }
+        nonSecret.brand_company = value;
         continue;
       }
       if (key !== "prd_label" && key !== "autopilot_label" && key !== "prdless_label") {

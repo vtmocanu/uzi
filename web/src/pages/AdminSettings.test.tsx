@@ -57,6 +57,13 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   run_eligible_labels: "PRD,bug",
   board_extra_labels: "bug",
   eligible_label_waives_prd_link: "true",
+  // PRD #685 branding config keys (owned by the Branding tab; unbranded defaults).
+  app_logo_mode: "default",
+  app_logo_keep_name: "true",
+  brand_mode: "none",
+  brand_company: "",
+  brand_placement: "below",
+  brand_plaque: "false",
   ...over,
 });
 

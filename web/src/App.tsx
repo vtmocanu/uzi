@@ -9,6 +9,7 @@ import { Dashboard } from "./pages/Dashboard";
 import { AdminUsers } from "./pages/AdminUsers";
 import { AdminRateLimits } from "./pages/AdminRateLimits";
 import { AdminSettings } from "./pages/AdminSettings";
+import { AdminBranding } from "./pages/AdminBranding";
 import { Settings } from "./pages/Settings";
 import { RunDefaults } from "./pages/RunDefaults";
 import { AccessSettings } from "./pages/AccessSettings";
@@ -127,6 +128,7 @@ export const APP_ROUTES: AppRoute[] = [
   { path: "/admin/users", element: <AdminUsers />, guard: "admin" },
   { path: "/admin/rate-limits", element: <AdminRateLimits />, guard: "admin" },
   { path: "/admin/settings", element: <AdminSettings />, guard: "admin" },
+  { path: "/admin/branding", element: <AdminBranding />, guard: "admin" },
   { path: "/admin/tool-allowlist", element: <ToolAllowlist />, guard: "admin" },
   { path: "/admin/blocked-repos", element: <AdminBlockedRepos />, guard: "admin" },
 ];
