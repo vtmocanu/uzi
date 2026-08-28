@@ -848,6 +848,59 @@ export class GitCache {
   }
 
   /**
+   * PRD #759 M1 — commit the runner clone's uncommitted work to a clearly-marked
+   * THROWAWAY commit on the park path, so the existing fetch-back + #628 checkpoint
+   * broker carry that work off the tree before the reseed's `fs.rm` wipes it. This is
+   * the one thing run #685 lacked: every durability layer captures committed commits
+   * only, so ~4h of mid-milestone work that had never been committed was lost on park.
+   *
+   * Runs AS THE RUNNER UID (runGitAsRunner) in the runner-owned clone — never a
+   * worker-uid git op. `git status`/`add`/`commit` touch the working tree and can fire
+   * attacker-chosen .gitattributes filter drivers that exec as the running uid; a
+   * worker-uid write would re-open code-exec as the PAT holder (PRD #51 M0). A runner-uid
+   * write in the runner-owned clone is the untrusted uid exec'ing in its own tree — not a
+   * boundary crossing (git.ts topology comment ~:39-48). The AGENT_GIT_IDENTITY and
+   * `commit.gpgsign=false` planted at seed (~:536-538) mean the commit needs no identity
+   * flags and cannot be blocked by a signing config.
+   *
+   * The subject is prefixed WIP_PARK_COMMIT_PREFIX so it is a recognizable throwaway:
+   * M2 detects it on the adopted tip and `git reset --soft <parent>` restores the content
+   * to UNCOMMITTED at adopt time, so the marker never enters the history the agent builds
+   * on and never reaches the MR. This deliberately reverses PRD #218 D6's "no auto-commit
+   * on park" — a decision the maintainer explicitly asked to revisit (PRD #759 M1 / D3):
+   * a marked throwaway stripped back to uncommitted at adopt time never masquerades as
+   * reviewed work, so #218 D6's "a half-applied edit that survives is worse than one that
+   * does not" no longer applies.
+   *
+   * BEST-EFFORT: every error is caught, logged, and returns `false` rather than thrown —
+   * a commit failure must NEVER propagate, because parking is the state that preserves the
+   * tree and a failed park loses MORE than a missing WIP commit (D4). Returns `true` only
+   * when a marker commit was actually created (an already-clean tree returns `false` —
+   * nothing to commit).
+   */
+  async commitWipMarker(clonePath: string): Promise<boolean> {
+    try {
+      const status = await this.runGitAsRunner(clonePath, ["status", "--porcelain"]);
+      if (status.split("\n").filter((l) => l.length > 0).length === 0) {
+        return false; // clean tree — nothing to save
+      }
+      await this.runGitAsRunner(clonePath, ["add", "-A"]);
+      await this.runGitAsRunner(clonePath, [
+        "commit",
+        "-m",
+        `${WIP_PARK_COMMIT_PREFIX} interrupted work auto-saved on usage-limit park (throwaway; restored uncommitted on resume)`,
+      ]);
+      return true;
+    } catch (err) {
+      this.log.warn("WIP park auto-commit failed (best-effort → not committed)", {
+        cwd: clonePath,
+        error: gitErrorMessage(err),
+      });
+      return false;
+    }
+  }
+
+  /**
    * The unified diff of the reviewed `branch` against `base` (three-dot: the changes on
    * `branch` since it diverged from `base`), for a PRD #400 M4b diff-review run. Both refs
    * are resolved as the bare's remote-tracking refs (`refs/remotes/origin/<name>`, which
@@ -1389,6 +1442,23 @@ function withDir(cwd: string | undefined, args: string[]): string[] {
 /** The git author identity planted on every runner clone (issue #234) and used by the
  *  M2 stub executor's own commit, kept in one place so the two paths cannot drift. */
 export const AGENT_GIT_IDENTITY = { name: "uzi-agent", email: "uzi-agent@uzi.local" } as const;
+
+/**
+ * PRD #759 M1 — subject prefix of the throwaway "work-in-progress" commit that
+ * `commitWipMarker` plants on the park path so uncommitted work survives the reseed.
+ * Kept in one place because the recognition side reads it too: M2 detects this prefix
+ * on the adopted tip to `git reset --soft <parent>` the content back to uncommitted (so
+ * the marker never enters the history the agent builds on, never reaches finalize, and
+ * never lands in the MR), and M5 uses it to distinguish a recovered WIP snapshot from a
+ * recovered committed milestone. Do NOT inline the literal string anywhere else.
+ *
+ * @public — the recognition side (M2 reset-at-adopt, M5 feed event) lands in later
+ * milestones, so there is no cross-file static consumer YET; exported here in M1 so
+ * those milestones import the one definition rather than re-inlining the literal
+ * (issue #597 convention for a deliberately-exported symbol knip cannot yet see a use
+ * for, mirroring protocol.ts's @public wire DTOs).
+ */
+export const WIP_PARK_COMMIT_PREFIX = "wip(park):" as const;
 
 /**
  * git subprocess env. safe.directory=* trusts the daemon-managed dirs

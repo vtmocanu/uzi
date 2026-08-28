@@ -2084,6 +2084,18 @@ export class RunRunner {
           // done path and the shutdown branch — safe today (the executor's run() finally
           // reaps first) but kept consistent across all three fetch-back sites.
           executor.killAgentTree?.();
+          // PRD #759 M1: before the fetch-back, commit any uncommitted work in the
+          // runner-owned clone to a clearly-marked THROWAWAY commit (subject-prefixed
+          // wip(park):), run as the runner uid in the clone. This is the one thing run
+          // #685 lacked — every durability layer below captures COMMITTED commits only,
+          // so mid-milestone uncommitted edits were `fs.rm`'d on the next claim. Making a
+          // durable marked commit exist means the fetch-back just below carries it to the
+          // local tracking ref, and the #628 broker further down publishes it to
+          // refs/uzi-checkpoints/<branch>; M2 strips it back to uncommitted at adopt time
+          // so it never reaches the MR. commitWipMarker already swallows every error
+          // (best-effort — a park that loses work is worse than a missing WIP commit, D4);
+          // the .catch is belt-and-braces so nothing on this line can undo the park.
+          await this.git.commitWipMarker(worktreePath).catch(() => false);
           await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
           // PRD #628 M2: publish a checkpoint to origin on the park path so a DIFFERENT
           // worker re-claiming this limit_wait run can recover the committed tree from
