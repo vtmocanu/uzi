@@ -223,7 +223,7 @@ export interface AnswerBody {
  *
  *  RUN_KINDS is mirrored from the DB `runs_kind_check` constraint (in DB CHECK
  *  order); agent/test/run-kind-db-parity.test.ts keeps the two in sync. */
-export const RUN_KINDS = ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt", "task"] as const;
+export const RUN_KINDS = ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt", "task", "mr_rework"] as const;
 export type RunKind = (typeof RUN_KINDS)[number];
 
 /** How a run's plan_md was produced (PRD #209 D4). "agent": the worker's own Phase-1

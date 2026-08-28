@@ -311,6 +311,10 @@ type Store interface {
 	CreateRun(ctx context.Context, arg store.CreateRunParams) (store.Run, error)
 	// CI-fix runs (PRD #6).
 	CreateCIFixRun(ctx context.Context, arg store.CreateCIFixRunParams) (store.Run, error)
+	// MR review-watcher rework runs (PRD #700 M3): the create path + its create-time
+	// cross-kind branch guard.
+	CreateAutoMRReworkRun(ctx context.Context, arg store.CreateAutoMRReworkRunParams) (store.Run, error)
+	CountActiveBranchRunsForRef(ctx context.Context, arg store.CountActiveBranchRunsForRefParams) (int64, error)
 	// Self-improvement runs (PRD #46 Decision 10).
 	CreateSelfImproveRun(ctx context.Context, arg store.CreateSelfImproveRunParams) (store.Run, error)
 	// Scheduled prompt runs (PRD #241).
@@ -3979,6 +3983,16 @@ type ForgeConn struct {
 	// route to drop uzi's own bot-authored comments (PRD #381 M4, D1). Zero when the
 	// legacy connection never recorded one, in which case comments are omitted (D9).
 	BotForgeUserID int64
+	// MRIID is the run's source merge-request iid (PRD #700 M4), nil when the run
+	// carries none. The mr_rework write-back endpoints resolve/reply against THIS iid
+	// — never a client-supplied one — so an injected id cannot redirect a write to a
+	// different MR.
+	MRIID *int64
+	// ReviewComments is the run's raw runs.review_comments JSONB (PRD #700 M4), nil/
+	// empty when the run has no MR review snapshot. The mr_rework write-back endpoints
+	// unmarshal it into a ReviewCommentsSnapshot and reject any reply/resolve id not
+	// present in it (the Decision-11 server-side scope check).
+	ReviewComments []byte
 }
 
 // ForgeConnForRun authorizes a worker's forge read against a run it holds and returns
@@ -4006,12 +4020,22 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 		}
 		return ForgeConn{}, err
 	}
+	// PRD #700 M4: carry the run's source mr_iid and raw review-comments snapshot from
+	// the SAME owned run read, so the mr_rework write-back endpoints can enforce the
+	// Decision-11 scope check without a second (unscoped) run read.
+	var mrIID *int64
+	if run.MrIid.Valid {
+		v := run.MrIid.Int64
+		mrIID = &v
+	}
 	return ForgeConn{
 		ForgeType:       row.ForgeType,
 		BaseUrl:         row.BaseUrl,
 		TokenCiphertext: row.TokenCiphertext,
 		ForgeProjectID:  row.ForgeProjectID,
 		BotForgeUserID:  row.BotForgeUserID,
+		MRIID:           mrIID,
+		ReviewComments:  run.ReviewComments,
 	}, nil
 }
 

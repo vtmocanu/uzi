@@ -37,7 +37,7 @@ type ReviewCommentsSnapshot struct {
 	Truncated bool                    `json:"truncated"`
 }
 
-// buildReviewCommentsSnapshot filters, caps, and orders an MR's review comments
+// BuildReviewCommentsSnapshot filters, caps, and orders an MR's review comments
 // into the structured snapshot the mr_rework run carries (PRD #700 M2). It REUSES
 // the #381 issue-comment caps (maxIssueCommentsBytes / maxIssueCommentsCount) and
 // the same D1 bot self-filter and D9 unknown-bot-id bail, so the two untrusted-input
@@ -50,7 +50,12 @@ type ReviewCommentsSnapshot struct {
 // Input is oldest-first (the M1 driver guarantee) and the output stays oldest-first
 // among kept comments; the byte cap charges body bytes only, same truncation semantics
 // as buildIssueCommentsSnapshot.
-func buildReviewCommentsSnapshot(comments []forge.MRComment, botForgeUserID int64) *ReviewCommentsSnapshot {
+//
+// It is exported because the M3 poller detector (poller/mr_review_watch.go) builds the
+// snapshot itself — it needs the kept comments to compute the high-water mark and gate
+// on review-landedness — then passes it to CreateAutoMRReworkRun, mirroring how the
+// ci-autofix detector builds a FailureSnapshot and passes it to CreateAutoCIFixRun.
+func BuildReviewCommentsSnapshot(comments []forge.MRComment, botForgeUserID int64) *ReviewCommentsSnapshot {
 	// D9 fail-safe: an unknown/zero bot id cannot power the D1 self-filter, so omit
 	// the feature rather than risk feeding uzi its own comments back into the prompt.
 	if botForgeUserID == 0 {
@@ -145,5 +150,5 @@ func (s *Service) fetchReviewCommentsSnapshot(ctx context.Context, row store.Get
 		slog.Error("workersvc: list merge request comments", "mr_iid", mrIID, "error", err) // err is PAT-redacted by the driver
 		return nil
 	}
-	return buildReviewCommentsSnapshot(comments, row.BotForgeUserID)
+	return BuildReviewCommentsSnapshot(comments, row.BotForgeUserID)
 }

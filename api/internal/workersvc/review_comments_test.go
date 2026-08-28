@@ -24,7 +24,7 @@ func TestBuildReviewCommentsSnapshotByteCap(t *testing.T) {
 		{ID: 3, AuthorForgeUserID: 3, AuthorUsername: "r2", Body: body, CreatedAt: commentTS(30)},
 		{ID: 4, AuthorForgeUserID: 4, AuthorUsername: "r3", Body: body, CreatedAt: commentTS(40)},
 	}
-	got := buildReviewCommentsSnapshot(in, bot)
+	got := BuildReviewCommentsSnapshot(in, bot)
 	if got == nil {
 		t.Fatal("want a snapshot, got nil")
 	}
@@ -65,7 +65,7 @@ func TestBuildReviewCommentsSnapshotBotFilterBothHalves(t *testing.T) {
 		{ID: 12, AuthorForgeUserID: coderabbit, AuthorUsername: "coderabbit", Body: "guard nil here",
 			Path: &path, Line: &line, ReplyID: "5001", ResolveID: "PRRT_thread1", HeadSHA: "headsha999", ReviewState: forge.ReviewCommentInline, CreatedAt: commentTS(3)},
 	}
-	got := buildReviewCommentsSnapshot(in, ownBot)
+	got := BuildReviewCommentsSnapshot(in, ownBot)
 	if got == nil {
 		t.Fatal("want a snapshot with the human + third-party bot comments, got nil")
 	}
@@ -103,7 +103,7 @@ func TestBuildReviewCommentsSnapshotZeroBotID(t *testing.T) {
 	in := []forge.MRComment{
 		{ID: 1, AuthorForgeUserID: 43, AuthorUsername: "coderabbit", Body: "nit", CreatedAt: commentTS(1)},
 	}
-	if got := buildReviewCommentsSnapshot(in, 0); got != nil {
+	if got := BuildReviewCommentsSnapshot(in, 0); got != nil {
 		t.Fatalf("want nil for a zero bot id (D9), got %+v", got)
 	}
 }

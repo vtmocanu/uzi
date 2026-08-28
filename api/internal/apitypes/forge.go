@@ -81,6 +81,38 @@ type ForgeMergeRequestDTO struct {
 	State string `json:"state"`
 }
 
+// Forge WRITE DTOs (PRD #700 M4). The mr_rework run's write-back: reply in and resolve
+// the MR review threads it addressed. The request carries ONLY the thread anchor (and a
+// body for a reply) — never the mr_iid or any forge coordinate; the endpoint derives the
+// mr_iid from the OWNED run and validates the anchor against THIS run's review snapshot
+// server-side (Decision 11), so an out-of-snapshot id is rejected.
+
+// ForgeMRThreadReplyRequest is the body of POST /worker/runs/{id}/forge/mr-threads/reply.
+// ReplyID is an MRComment.ReplyID from this run's review snapshot.
+type ForgeMRThreadReplyRequest struct {
+	ReplyID string `json:"reply_id"`
+	Body    string `json:"body"`
+}
+
+// ForgeMRThreadReplyDTO is the reply write's result. Replied is true when the driver
+// posted the reply.
+type ForgeMRThreadReplyDTO struct {
+	Replied bool `json:"replied"`
+}
+
+// ForgeMRThreadResolveRequest is the body of POST /worker/runs/{id}/forge/mr-threads/
+// resolve. ResolveID is an MRComment.ResolveID from this run's review snapshot.
+type ForgeMRThreadResolveRequest struct {
+	ResolveID string `json:"resolve_id"`
+}
+
+// ForgeMRThreadResolveDTO is the resolve write's result. Resolved is true when the driver
+// resolved the thread; false is the tolerated Forgejo no-op (the forge has no resolvable-
+// thread concept, so reply-only is the documented contract and the run does not fail).
+type ForgeMRThreadResolveDTO struct {
+	Resolved bool `json:"resolved"`
+}
+
 // ForgeJobDTO is one pipeline job.
 type ForgeJobDTO struct {
 	ID     int64  `json:"id"`

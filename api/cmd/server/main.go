@@ -526,6 +526,16 @@ func run() error {
 	// simply NOT wiring it; per-user ci_autofix_enabled (default-OFF) and the
 	// pipelineMaxRefs>0 gate control activation. notifier lands the inbox rows.
 	engine.SetCIAutoFix(poller.NewCIAutoFix(q, wsvc, notifier, cfg.CIFixMaxJobs, cfg.CIFixLogTailBytes, cfg.CIAutofixMaxAttempts, cfg.CIAutofixConfigPaths))
+	// MR review watcher (PRD #700 M3): the poller's post-SyncMRStates detector turns an
+	// opted-in completed run's MR that gained new review comments on a green head
+	// pipeline into an automatic mr_rework run, through the workersvc create path and
+	// the M3 loop-guard ledger. Wired unconditionally — the instance kill-switch is
+	// simply NOT wiring it; the admin kill-switch (settings mr_rework_enabled, default
+	// on), the per-user opt-in (users.mr_rework_enabled, default on), the per-MR cap and
+	// the pipelineMaxRefs>0 gate control activation. The two literals mirror
+	// settings.DefaultMrReworkCap (5, the admin-read fallback used only on a cap-read
+	// error) and the review-landed quiet-period debounce (Decision 6).
+	engine.SetMRReviewWatch(poller.NewMRReviewWatch(q, wsvc, notifier, settingsCache, 5, 3*time.Minute))
 	// Reverse GitHub Projects v2 sync (PRD #364 M6): a per-tick poller sibling for
 	// GitHub synced repos that reads item Statuses, diffs each against the stored
 	// marker, and writes the matching column label via AutoMove for GitHub-side
