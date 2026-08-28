@@ -1684,11 +1684,14 @@ func deltaGlyph(kind string) string {
 // compatibility path also creates a row labelled literally `default`, so the label is
 // not even a reliable hint at the mode.
 //
-// The three FALLBACK reasons are rendered as `default (auto: …)` rather than as their
-// own thing, because that is what actually happened: the worker is configured for
-// auto, the selector declined to pick, and the owner's default paid. A user reading
-// `default` alone on an auto worker would reasonably think their configuration had
-// been lost.
+// Since #754 the two live non-pick reasons name a POOLED token, not the default:
+// `pool_stale` renders `auto (pooled token, no fresh readings)` and `open_failed`
+// `auto (fell to another pooled token; …)` — the auto lane floors onto a pooled token
+// and never spends the out-of-pool default. Only the LEGACY `pool_empty` still renders
+// `default (auto: …)`, and only on pre-#754 rows where the default genuinely was spent
+// (an empty pool now HOLDS in pool_wait instead). The mode is spelled out rather than
+// left as a bare label because an auto pick and a legacy default can name the same
+// token, so the label alone cannot say which account paid or why.
 //
 // An UNRECOGNISED reason prints as itself. The CLI is versioned separately from the
 // API, so a newer server can ship a ninth reason this binary has never heard of, and

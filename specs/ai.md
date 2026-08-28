@@ -13704,11 +13704,16 @@ ranking query and the open — kills a run the owner default would have complete
 newly fail runs that static binding finished, which is the one outcome D7 exists to forbid.
 
 **D14 was drafted as "on `auto` mode and `errCredentialUnavailable`, retry once". That wording is
-wrong and the implementation is deliberately narrower.** An auto worker whose pool was empty or
-entirely stale carries `pool_empty`/`pool_stale` with a **nil** id — it is already running on the
-owner default. Under the literal text it would retry, and that retry would re-open **the identical
-credential that just failed**. The correct gate is *only a credential the selector itself named*
-(reason `auto` or `best_of_pool`, with a non-nil id).
+wrong and the implementation is deliberately narrower.** [**Superseded in part by PRD #754 (§580)** —
+the two clauses about running on the owner default no longer hold: `pool_stale` now carries a
+**non-nil pooled** id (the floor spends a pooled token, not the default) and `pool_empty` is no
+longer recorded at all (an empty pool HOLDS in `pool_wait`). The retry-gate reshaped by #754
+(`autoLaneRetryable`, now covering `pool_stale` too) re-floors onto **another pooled** token, never
+the default. The historical reasoning below is kept as the PRD #111 record.] An auto worker whose
+pool was empty or entirely stale carries `pool_empty`/`pool_stale` with a **nil** id — it is already
+running on the owner default. Under the literal text it would retry, and that retry would re-open
+**the identical credential that just failed**. The correct gate is *only a credential the selector
+itself named* (reason `auto` or `best_of_pool`, with a non-nil id).
 
 Three axes, each with its own reason:
 

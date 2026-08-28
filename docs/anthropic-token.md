@@ -184,8 +184,8 @@ view and an `ANTHROPIC_TOKEN` row in `uzi run get`:
 | `console-key — default` | nothing named a token, so your default paid |
 | `review-key — judge binding` | your judge setting chose it, not a worker's |
 | `console-key — auto (pooled token, no fresh readings)` | no pooled token had a usable reading to rank, so auto floored onto this pooled token as a last resort — still one of yours, never your default |
-| `console-key — auto (fell to another pooled token)` | auto's first pick would not decrypt, so it floored onto this other pooled token instead — never your default |
-| `default (auto: pool was empty — legacy)` | historical only, from a run claimed before this floor/hold behavior shipped, when an empty pool really did spend the default. A new run never shows this: an empty pool [holds instead](#waiting-for-a-token) |
+| `console-key — auto (fell to another pooled token; the chosen one would not open)` | auto's first pick would not decrypt, so it floored onto this other pooled token instead — never your default (the run-view chip shortens this to `auto (fell to another pooled token)`) |
+| `meta — default (auto: pool was empty — legacy)` | historical only, from a run claimed before this floor/hold behavior shipped, when an empty pool really did spend the default (`meta` here is that default). A new run never shows this: an empty pool [holds instead](#waiting-for-a-token) |
 
 The two floor reasons are shown in amber and linked to this page, because
 the worker is set to auto and its pool needed to fall back to a weaker
