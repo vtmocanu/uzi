@@ -310,12 +310,25 @@ PR's to fix at all — if it is worth doing, it is a separate CI-only PR (your t
 before merging.** Every push to an `agent/issue-*` branch retriggers CodeRabbit's `auto_review`,
 which posts an *incremental* review of just the new commits (async, a few minutes; the
 `CodeRabbit` PR check flips to pending then back to "Review completed"). So the merge sequence
-per fixed PR is: push fix → **wait for the re-review to land** (`gh pr checks PR` shows
-CodeRabbit `pass` again; re-read its new review/comments) → confirm it is clean or only
-acknowledgements → then merge. Do not merge a PR whose CodeRabbit re-review is still pending
-after a fix push — the re-review can surface a defect in the fix itself, and merging first
-defeats the point of fixing. A re-review that raises something new re-enters this same triage
+per fixed PR is: push fix → **wait for the incremental review of THAT commit to land** → confirm
+it is clean or only acknowledgements → then merge. Do not merge a PR whose CodeRabbit re-review is
+still pending after a fix push — the re-review can surface a defect in the fix itself, and merging
+first defeats the point of fixing. A re-review that raises something new re-enters this same triage
 flow (assess → decide → fix/skip), not an automatic merge.
+
+**Do NOT treat the `CodeRabbit` PR check flipping back to "Review completed" (`gh pr checks PR`
+showing CodeRabbit `pass`) as proof the re-review landed.** Measured 2026-08-28 on PR#756: the
+check went green and every CI job was green while the latest CodeRabbit *review object* still only
+covered the PREVIOUS commit — a poller keyed on the check reported "re-review done" when the
+incremental review of the just-pushed fix had not posted. Confirm the re-review landed one of two
+robust ways instead: (a) a new CodeRabbit review whose **Commits** range covers your latest SHA
+(`gh api repos/OWNER/REPO/pulls/PR/reviews` — compare its `submitted_at`/range to your push time),
+or (b) the specific findings you fixed now render **outdated** — their inline comments report
+`line: null` with `original_line` set (`gh api repos/OWNER/REPO/pulls/PR/comments`), i.e. CodeRabbit
+no longer anchors them to live code. And know that **CodeRabbit often does NOT post a fresh APPROVED
+for a trivial fix**, so `reviewDecision` can stay `CHANGES_REQUESTED` even after every finding is
+resolved; once (a) or (b) plus green CI confirm the current head is clean, `--admin` merges past
+that stale verdict rather than waiting for a flip that never comes.
 
 **The shared `main` worktree is a multi-writer tree — never assert it is clean.** Other
 sessions leave modified files in it and advance `main` mid-review (measured 2026-08-20:
