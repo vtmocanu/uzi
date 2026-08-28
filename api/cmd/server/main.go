@@ -552,6 +552,7 @@ func run() error {
 		MaxPerUser:        cfg.EphemeralMaxPerUser,
 		DefaultSize:       cfg.EphemeralDefaultSize,
 		ProvisionDeadline: cfg.EphemeralProvisionDeadline,
+		SaturationDelay:   cfg.EphemeralSaturationDelay,
 	})
 
 	sweep := sweeper.New(wsvc, cfg.SweepInterval,

@@ -817,7 +817,7 @@ WHERE w.user_id = $1
 // worker that simply has not claimed yet. A NULL cap advertises no bound, so such a
 // worker is treated as always having room. Active count uses the SAME run-lane
 // definition as ListWorkersByUser.active_runs (status claimed/running/
-// awaiting_approval/awaiting_input, kind <> 'chat'). Only called for a queued run
+// awaiting_approval/awaiting_input/awaiting_followup, kind <> 'chat'). Only called for a queued run
 // already past its health threshold, so it is off the hot path.
 func (q *Queries) CountOnlineWorkersWithFreeSlotForUser(ctx context.Context, userID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersWithFreeSlotForUser, userID)
@@ -3693,6 +3693,144 @@ func (q *Queries) ListRunsForWorkerUser(ctx context.Context, arg ListRunsForWork
 			&i.RepoPath,
 			&i.RepoWebUrl,
 		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSaturationQueuedRunsForEphemeral = `-- name: ListSaturationQueuedRunsForEphemeral :many
+SELECT r.id, r.user_id, r.required_capabilities
+FROM runs r
+JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
+WHERE r.status = 'queued'
+  AND r.kind <> 'chat'
+  AND now() - r.status_since > $1::interval
+  AND EXISTS (
+      SELECT 1 FROM workers w
+      WHERE w.user_id = r.user_id
+        AND w.status = 'online'
+        AND w.draining_since IS NULL
+        AND NOT w.ephemeral
+        AND r.required_capabilities <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false))
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM workers w
+      WHERE w.user_id = r.user_id
+        AND w.status = 'online'
+        AND w.draining_since IS NULL
+        AND NOT w.ephemeral
+        AND r.required_capabilities <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false))
+        AND (w.max_concurrent_runs IS NULL
+             OR (SELECT count(*) FROM runs r2
+                  WHERE r2.worker_id = w.id
+                    AND r2.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+                    AND r2.kind <> 'chat') < w.max_concurrent_runs)
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM workers w2
+      WHERE w2.ephemeral AND w2.ephemeral_run_id = r.id
+  )
+  AND (SELECT count(*) FROM workers wc
+       WHERE wc.user_id = r.user_id AND wc.kind = 'hosted' AND wc.ephemeral) < $2::int
+ORDER BY r.status_since ASC
+LIMIT $3
+`
+
+type ListSaturationQueuedRunsForEphemeralParams struct {
+	SaturationDelay pgtype.Interval `json:"saturation_delay"`
+	MaxPerUser      int32           `json:"max_per_user"`
+	MaxRows         int32           `json:"max_rows"`
+}
+
+type ListSaturationQueuedRunsForEphemeralRow struct {
+	ID                   uuid.UUID `json:"id"`
+	UserID               uuid.UUID `json:"user_id"`
+	RequiredCapabilities []string  `json:"required_capabilities"`
+}
+
+// The SATURATION sibling of ListUnplaceableQueuedRunsForEphemeral (issue #747 M1).
+// Where the capability-gap query above fires for runs NOTHING online can satisfy, THIS
+// query fires for the opposite shape: runs that ARE capability-placeable (a capable
+// worker exists) but are slot-BLOCKED because every capable worker is at its run-lane
+// cap — the fleet is saturated for this run. It returns the same columns and drives the
+// same run-bound ephemeral auto-provisioner (PRD #529), for a user who opted in and is
+// not already served by an ephemeral worker.
+//
+// Each predicate, and why it is here:
+//
+//   - u.ephemeral_workers_enabled — the per-user opt-in (users column). The JOIN also
+//     drops runs whose owner row is gone. The instance kill-switch is checked in Go
+//     before this query runs, so a flag-off pass never reaches here.
+//
+//   - r.status = 'queued' AND r.kind <> 'chat' — the pre-claim trigger: a run nothing has
+//     claimed yet, excluding the chat lane (served by ClaimChatRun).
+//
+//   - now() - r.status_since > @saturation_delay::interval — the DEBOUNCE. We gate on
+//     time-spent-in-queued using runs.status_since (migration 00163), NOT created_at, so a
+//     run that has only just been re-queued does not immediately trip a provision: a
+//     transiently-full fleet is given @saturation_delay to free a slot on its own before we
+//     spend an ephemeral worker on it.
+//
+//   - DELIBERATELY NO cardinality(r.required_capabilities) > 0 GUARD (Decision 2). Unlike
+//     the capability-gap sibling, a plain zero-capability run MUST qualify here: a saturated
+//     fleet blocks a zero-cap run just as it blocks a cap-carrying one. This needs no special
+//     case — an empty required set is a subset of EVERY worker's effective caps, so
+//     `r.required_capabilities <@ fn_effective_worker_caps(...)` is trivially true and the
+//     "a capable worker exists" test below degenerates to "any online non-draining
+//     non-ephemeral worker exists", which is exactly right.
+//
+//   - EXISTS (≥1 CAPABLE worker) — an online, non-draining, NON-ephemeral worker of the
+//     user whose EFFECTIVE caps are a superset of the run's, using the SAME
+//     fn_effective_worker_caps fold as CountOnlineWorkersSatisfyingCaps / fn_worker_can_claim
+//     (capabilities plus `docker` when docker_enabled). This is what makes the run
+//     capability-PLACEABLE and distinguishes this path from the capability-gap sibling.
+//     `AND NOT w.ephemeral` because a run-bound ephemeral worker serves only its own run.
+//
+//   - NOT EXISTS (a capable worker with a FREE slot) — the SATURATION test. Over the SAME
+//     capable-worker set, none has room. The free-slot definition is reused VERBATIM from
+//     CountOnlineWorkersWithFreeSlotForUser: the five-status active-run set
+//     (claimed/running/awaiting_approval/awaiting_input/awaiting_followup, kind <> 'chat')
+//     and `max_concurrent_runs IS NULL OR (active count) < max_concurrent_runs`. A NULL-cap
+//     worker advertises UNBOUNDED room, so it always HAS a free slot → the NOT EXISTS is
+//     false → the run is NOT slot-blocked and is correctly excluded (that worker will claim
+//     it; provisioning an ephemeral would be wrong).
+//
+//   - NOT EXISTS (an ephemeral worker already bound to this run) — the one-per-run skip.
+//     The partial UNIQUE index uq_workers_ephemeral_run is the hard guarantee; this is the
+//     cheap pre-filter so the steady state does not churn the provision tx each tick.
+//
+//   - (SELECT count(...)) < @max_per_user — cross-user FAIRNESS: exclude runs whose owner is
+//     ALREADY at/over the per-user ephemeral cap (kind = 'hosted' AND ephemeral, matching
+//     CountEphemeralHostedWorkersForUser), so one user cannot monopolize every batch and
+//     starve others.
+//
+//     🔴 THIS FILTER IS A FAIRNESS OPTIMIZATION ONLY, NEVER THE CAP. It is an UNLOCKED
+//     snapshot read, so it is a TOCTOU by construction — the AUTHORITATIVE cap is still the
+//     advisory-locked CountEphemeralHostedWorkersForUser check in provisionOne. A race here
+//     can therefore never over-provision: the worst it can do is, harmlessly, let an
+//     about-to-be-capped user's run into the batch, where provisionOne then rejects it under
+//     the lock. It can also transiently exclude a run whose owner has just dropped below the
+//     cap; the next tick surfaces it, so no run is lost.
+//
+// ORDER BY r.status_since ASC so the longest-waiting run is provisioned first; note the
+// sibling orders by created_at, but THIS path's clock is status_since (the same column the
+// debounce gates on), so we order by it for consistency. LIMIT @max_rows bounds the work
+// per tick.
+func (q *Queries) ListSaturationQueuedRunsForEphemeral(ctx context.Context, arg ListSaturationQueuedRunsForEphemeralParams) ([]ListSaturationQueuedRunsForEphemeralRow, error) {
+	rows, err := q.db.Query(ctx, listSaturationQueuedRunsForEphemeral, arg.SaturationDelay, arg.MaxPerUser, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListSaturationQueuedRunsForEphemeralRow{}
+	for rows.Next() {
+		var i ListSaturationQueuedRunsForEphemeralRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.RequiredCapabilities); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

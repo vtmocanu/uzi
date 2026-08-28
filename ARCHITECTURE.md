@@ -669,11 +669,12 @@ chain in the diagram above, with no intervening `running`.
   best-effort claiming, so a mismatched run degrades to the pre-#84 mid-run
   failure instead of being blocked up front. See
   [docs/capability-scheduling.md](docs/capability-scheduling.md).
-- **Ephemeral, run-bound hosted workers on an unmet capability (PRD #529,
-  Path 1 of #84's Decision-9 remediation spectrum).** When the reason above
-  fires with zero online workers satisfying the run's capabilities, and the
-  owner has opted in (`users.ephemeral_workers_enabled`) with the admin
-  instance kill-switch also on, a background api pass
+- **Ephemeral, run-bound hosted workers on an unmet capability OR a
+  saturated fleet (PRD #529, Path 1 of #84's Decision-9 remediation
+  spectrum; second trigger PRD #747).** When the reason above fires with
+  zero online workers satisfying the run's capabilities, and the owner has
+  opted in (`users.ephemeral_workers_enabled`) with the admin instance
+  kill-switch also on, a background api pass
   (`api/internal/hostedsvc/ephemeral.go`) auto-provisions ONE hosted worker
   bound to that run: `kind='hosted'`, `ephemeral=true`,
   `ephemeral_run_id=<run>` — two columns added to `workers` by migration
@@ -703,7 +704,24 @@ chain in the diagram above, with no intervening `running`.
   hosted-worker section of the Workers page
   (`web/src/components/HostedWorkers.tsx`), gated on the hosted-config
   `ephemeral_enabled` derived signal, and an `ephemeral` badge in the fleet
-  list marking a bound worker while it exists.
+  list marking a bound worker while it exists. A **second trigger** (issue
+  #747) reuses this same machinery for a run that is capability-*placeable*
+  but slot-*blocked* — some online worker could claim it, but every
+  capability-matching worker is pinned at `max_concurrent_runs` (fleet
+  saturated). Unlike the capability-gap path above, which provisions
+  immediately (a gap is permanent), this path is **debounced** on
+  `UZI_EPHEMERAL_SATURATION_DELAY` (default 90s ≈ worker cold-start),
+  measured against `runs.status_since` (the same queued-age clock the
+  health "fleet saturated" display reason uses), because saturation is
+  transient: a slot freeing before the debounce elapses may claim the run
+  first, avoiding a pod that turns out to be unneeded. A burst pod that
+  loses that race is idle and shares the same 10m reaper grace as the
+  cold-start-loss case above rather than a second knob (accepted cost, PRD
+  #747 M3). The debounce is deliberately independent of `health_enabled`
+  and the queued-health threshold that gates the "fleet saturated" *display*
+  reason — burst is a capacity action, not a UI state, though both clocks
+  read `status_since`. See
+  `prds/done/747-ephemeral-saturation-burst.md` for the full Decision Log.
 - **claimed → running, before the plan turn** — once `provisionRunTools` has set up
   the run's tool env, the executor kicks off a lockfile-driven JS dependency
   install for the cloned repo, picked per discovered lockfile (monorepo

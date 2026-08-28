@@ -529,9 +529,20 @@ type Config struct {
 	EphemeralDefaultSize string
 
 	// EphemeralProvisionDeadline bounds how long a freshly provisioned ephemeral worker
-	// may sit before reaching status='online' before the M5 reaper deletes it
-	// (UZI_EPHEMERAL_PROVISION_DEADLINE, default 10m). Defined now, consumed by M5.
+	// may sit before reaching status='online' before the reaper deletes it
+	// (UZI_EPHEMERAL_PROVISION_DEADLINE, default 10m). Consumed by ReapPass (ephemeral.go),
+	// which deletes an ephemeral worker that makes no progress within it.
 	EphemeralProvisionDeadline time.Duration
+
+	// EphemeralSaturationDelay is the queue-wait debounce for the SATURATION trigger
+	// path (UZI_EPHEMERAL_SATURATION_DELAY, default 90s ≈ worker cold-start). A run
+	// that is capability-placeable but slot-blocked (every capable worker at its
+	// max_concurrent_runs cap) provisions a burst worker only once it has been queued
+	// longer than this, so transient claim-cycle queueing does not churn pods and a
+	// freeing slot claims the run first. Threaded to the saturation query's interval
+	// param. parseDuration's >0 guard means =0 falls back to 90s (anti-churn safety),
+	// so the path cannot be accidentally disabled via env.
+	EphemeralSaturationDelay time.Duration
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -887,6 +898,7 @@ func Load() (Config, error) {
 	// non-positive or malformed cap falls back to the default 2.
 	cfg.EphemeralMaxPerUser = parseInt("UZI_EPHEMERAL_MAX_PER_USER", 2)
 	cfg.EphemeralProvisionDeadline = parseDuration("UZI_EPHEMERAL_PROVISION_DEADLINE", 10*time.Minute)
+	cfg.EphemeralSaturationDelay = parseDuration("UZI_EPHEMERAL_SATURATION_DELAY", 90*time.Second)
 	// The default size must be a preset the controller can resolve — an unknown value
 	// would provision a worker that never renders and sits pending until its token
 	// expires (workersize's own doc). Reject a bad value at load rather than at use, and
