@@ -18,6 +18,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Instance branding (Admin → Branding, [#685](https://github.com/vtmocanu/uzi/issues/685)).**
+  Replace the app mark with a custom logo or full white-label, add an optional "POWERED BY" brand in the sidebar, and surface a fixed MIT/author credit that no branding setting can remove — all runtime admin settings, no redeploy; fresh installs stay unbranded.
+
 ### Changed
 
 - **MR review comments are now auto-reworked in place, on by default, for every opted-in user ([#700](https://github.com/vtmocanu/uzi/issues/700)).**
