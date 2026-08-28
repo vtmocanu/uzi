@@ -153,6 +153,9 @@ const SEED_USER_SETTINGS: UserSettings = {
   summary_model: null,
   theme: null,
   sidebar_token_ids: [],
+  // PRD #700 M6: MR review watcher per-user opt-in. null = the default-ON state;
+  // an explicit false opts the account out.
+  mr_rework_enabled: null,
 };
 const SEED_APP_SETTINGS: AppSettings = {
   prd_label: "PRD",
@@ -228,6 +231,10 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // Optional so a pre-#362 blob stays valid; absent reads as inherit.
     (u.summary_model === undefined || u.summary_model === null || typeof u.summary_model === "string") &&
     (u.theme === null || typeof u.theme === "string") &&
+    // Optional so a pre-#700 blob stays valid; absent/null reads as the default-ON state.
+    (u.mr_rework_enabled === undefined ||
+      u.mr_rework_enabled === null ||
+      typeof u.mr_rework_enabled === "boolean") &&
     // Optional so a pre-feature blob stays valid; absent reads as default-only.
     (u.sidebar_token_ids === undefined ||
       (Array.isArray(u.sidebar_token_ids) &&
@@ -2482,6 +2489,12 @@ export const mockApi = {
       // value; null clears back to default-only. Ids are stored as given — a
       // stale id (deleted token) is harmless, it just matches nothing.
       userSettings = { ...userSettings, sidebar_token_ids: patch.sidebar_token_ids ?? [] };
+    }
+    if (patch.mr_rework_enabled !== undefined) {
+      // Tri-state (PRD #700 M6): present-false opts out, present-true re-enables,
+      // present-null clears back to the default-ON state (stored as null). Mirrors
+      // the server treating an absent/null value as ON.
+      userSettings = { ...userSettings, mr_rework_enabled: patch.mr_rework_enabled ?? null };
     }
     persistSettings();
     return delay({ settings: { ...userSettings } });

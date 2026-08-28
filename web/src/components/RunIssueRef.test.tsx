@@ -68,6 +68,10 @@ describe("runKindLabel", () => {
     expect(runKindLabel("task")).toBe("task");
     expect(runKindLabel("self_improve")).toBe("self improve");
   });
+
+  it("maps mr_rework to the legible 'MR rework' label (PRD #700)", () => {
+    expect(runKindLabel("mr_rework")).toBe("MR rework");
+  });
 });
 
 describe("RunIssueRef — raised scopes z-10 to the interactive anchor only (#485 NB1)", () => {

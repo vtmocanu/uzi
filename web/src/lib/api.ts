@@ -101,6 +101,11 @@ export interface UserSettings {
    *  sidebar rail. The default token always shows and is never listed here.
    *  Absent (older server) reads as []: default-only, the pre-feature look. */
   sidebar_token_ids?: string[];
+  /** Per-user opt-in for the MR review watcher (PRD #700 M5/M6); default ON.
+   *  null/absent reads as enabled (the default-ON state); an explicit false means
+   *  the user opted this account out, so the watcher stops auto-reworking their MRs.
+   *  The admin global kill-switch is separate. */
+  mr_rework_enabled?: boolean | null;
 }
 
 // UserSettingsPatch is the PATCH-like body of PUT /me/settings: a field present
@@ -117,6 +122,9 @@ export interface UserSettingsPatch {
   theme?: string | null;
   /** Replaces the whole sidebar-token set (null clears it); absent leaves it. */
   sidebar_token_ids?: string[] | null;
+  /** Per-user MR-review-watcher opt-in (PRD #700 M6); present-false opts out,
+   *  present-true (or null clearing back to the default-ON) re-enables. */
+  mr_rework_enabled?: boolean | null;
 }
 
 // AgentTemplateScope mirrors the skill scopes (PRD #18 M6): builtin (shipped),
