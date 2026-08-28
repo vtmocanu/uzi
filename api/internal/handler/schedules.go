@@ -60,7 +60,10 @@ const MaxSweepIssues = 10000
 // self_improve schedule is catalog-enable-only, so a DIRECT create (POST /schedules) must
 // keep returning the same "target must be one of: issue, sweep, prompt" 400 (pass false),
 // while a user-origin CLONE reconfiguring its own row routes its config PATCH through this
-// validator and must be accepted (pass true). It is true only on the patch/merge caller.
+// validator and must be accepted. The patch/merge caller passes true ONLY when the row is
+// already self_improve (cur.Target == "self_improve"), so editing an existing self_improve
+// row is allowed but CONVERTING an issue/sweep/prompt row into one via PATCH stays a 400 —
+// a create-by-patch the direct POST path also blocks.
 func validateScheduleConfig(req apitypes.ScheduleRequest, now time.Time, allowSelfImprove bool) (apitypes.ScheduleRequest, int, string) {
 	n := req
 	n.Timezone = strings.TrimSpace(n.Timezone)
@@ -327,7 +330,12 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		m, status, msg := validateScheduleConfig(merged, h.clock(), true)
+		// self_improve is catalog-enable-only (defense in depth): a config PATCH may edit an
+		// EXISTING self_improve row (a catalog-enabled default or a clone of one) but must not
+		// CONVERT an issue/sweep/prompt row into one — that would be a create-by-patch the
+		// direct POST path deliberately blocks. So allow the self_improve arm only when the row
+		// is already self_improve (PRD #590 follow-up, item 1).
+		m, status, msg := validateScheduleConfig(merged, h.clock(), cur.Target == "self_improve")
 		if status != 0 {
 			httpx.Error(w, status, msg)
 			return

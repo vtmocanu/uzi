@@ -395,6 +395,18 @@ func TestSelfImproveScheduleReconfigureLiveDB(t *testing.T) {
 	if !defFalse.AutoApprove {
 		t.Fatalf("default-origin self_improve auto_approve after false patch = %v, want true (forced)", defFalse.AutoApprove)
 	}
+
+	// Item 1 defense-in-depth: a PATCH must not CONVERT a non-self_improve row into a
+	// self_improve one (that would be a create-by-patch the direct POST path blocks). Create a
+	// plain sweep schedule, then try to repoint its target to self_improve → 400.
+	sweep, code := f.createSchedule(t, f.owner.ID, f.repoID,
+		`{"target":"sweep","timing":"recurring","cron_expr":"0 3 * * *","timezone":"UTC"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create sweep status = %d, want 201", code)
+	}
+	if _, cc := f.patchSchedule(t, f.owner.ID, sweep.ID, `{"target":"self_improve"}`); cc != http.StatusBadRequest {
+		t.Fatalf("convert sweep→self_improve via PATCH status = %d, want 400 (conversion blocked)", cc)
+	}
 }
 
 // TestCloneToDifferentRepoLiveDB: a {"repo_id"} body clones into a second owned repo; a
