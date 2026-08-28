@@ -959,6 +959,150 @@ describe("Judge — per-category chip counts (PRD #270)", () => {
   });
 });
 
+// Issue #620 — the bridge line reconciling the page's two count units: the whole-backlog
+// recommendation-ROW count for the active bucket (the tab number) against the whole-backlog
+// deduped GROUP total for that bucket (the category-stats matrix slice SUM). It sits directly
+// above the "Showing N groups" line, and is deliberately suppressed whenever the rec half (a
+// whole-backlog count) could not honestly reconcile against the group half: a category filter
+// is active, the backlog is truncated, or the group total is 0.
+describe("Judge — the row-vs-group bridge line (#620)", () => {
+  // todo slice sums to 18, done slice to 4; triage.todo is 42 and triage.done is 7, so the two
+  // halves of the bridge line come from genuinely different sources and a wrong-bucket read
+  // would be visible.
+  const counts_by_bucket = {
+    todo: { improve_uzi: 10, install_worker_tool: 8 },
+    filed: {},
+    done: { improve_uzi: 3, install_worker_tool: 1 },
+    dismissed: {},
+    all: { improve_uzi: 13, install_worker_tool: 9 },
+  };
+  const triage = { total: 60, todo: 42, filed: 5, done: 7, dismissed: 6, false_positives: 0 };
+
+  it("renders both counts for the active tab, the group half from the category-stats sum", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog({ triage }));
+    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts_by_bucket });
+    renderJudge();
+
+    // triage.todo (42) is the rec half; the todo matrix slice (10+8) is the group half.
+    expect(await screen.findByText("42 to-do recommendations across 18 groups")).toBeTruthy();
+  });
+
+  it("re-scopes to the active bucket on a tab switch (Done → done count and done sum)", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog({ triage }));
+    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts_by_bucket });
+    renderJudge();
+
+    expect(await screen.findByText("42 to-do recommendations across 18 groups")).toBeTruthy();
+
+    // /Done/ addresses the Done tab only — "Dismissed" does not contain "Done".
+    fireEvent.click(screen.getByRole("tab", { name: /Done/ }));
+
+    // triage.done (7) against the done matrix slice (3+1).
+    expect(await screen.findByText("7 done recommendations across 4 groups")).toBeTruthy();
+  });
+
+  it("is suppressed when a category filter is active (the rec half is whole-backlog)", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog({ triage }));
+    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts_by_bucket });
+    renderJudge(["/judge?category=improve_uzi"]);
+
+    // The filtered "Showing N groups matching …" line still renders; the bridge does not.
+    await waitFor(() => expect(screen.getByText(/Showing/)).toBeTruthy());
+    expect(screen.queryByText(/recommendations across/)).toBeNull();
+  });
+
+  it("is suppressed when the backlog is truncated (the truncation Alert owns the caveat)", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog({ triage, truncated: true }));
+    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts_by_bucket });
+    renderJudge();
+
+    expect(await screen.findByText(/backlog is large and was truncated/i)).toBeTruthy();
+    expect(screen.queryByText(/recommendations across/)).toBeNull();
+  });
+
+  it("is suppressed when the category-stats sum is 0 (a failed/empty aggregate)", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog({ triage }));
+    mockApi.getJudgeCategoryStats.mockResolvedValue({
+      counts_by_bucket: { todo: {}, filed: {}, done: {}, dismissed: {}, all: {} },
+    });
+    renderJudge();
+
+    // The "Showing N groups" line still renders off the returned groups, so the page settled…
+    await waitFor(() => expect(screen.getByText(/Showing/)).toBeTruthy());
+    // …but the bridge would read "across 0 groups", so it is withheld entirely.
+    expect(screen.queryByText(/recommendations across/)).toBeNull();
+  });
+
+  it("is suppressed under a run anchor (the rec half is whole-account, the group half run-scoped)", async () => {
+    // Absent the fix the bridge WOULD render: triage is non-zero (whole-account, no run arg on
+    // the server) and the run-anchor category-stats sum is non-zero, so both guard terms pass.
+    // But `triage` is "across all your runs" while the group half is scoped to this one run, so
+    // the two cannot honestly reconcile under `?run=` and the bridge must be withheld.
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog({ bucket: "all", run: "run-1", triage }));
+    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts_by_bucket });
+    renderJudge(["/judge?run=run-1"]);
+
+    // The run-anchor filter banner renders, so the page settled under the anchor…
+    await waitFor(() => expect(screen.getByText(/Filtered to one run's recommendations/i)).toBeTruthy());
+    // …but the whole-account/run-scoped mismatch means the bridge is withheld. The lowercase
+    // regex deliberately does not match the capital-R "Recommendations across all your runs"
+    // subtitle.
+    expect(screen.queryByText(/recommendations across/)).toBeNull();
+  });
+
+  it("is withheld while a post-mutation category-stats refetch is pending, then restored", async () => {
+    // A disposition installs the new `triage` (recommendation totals) synchronously but refetches
+    // the category-stats matrix async. Without the freshness gate the bridge would briefly show
+    // the NEW recommendation count against the STALE group total — a false reconciliation. Deferred
+    // promise, no timers: the second (post-dispose) stats fetch parks until released.
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog({ groups: [group()], triage }));
+    let releaseStats: (() => void) | undefined;
+    mockApi.getJudgeCategoryStats
+      .mockResolvedValueOnce({ counts_by_bucket }) // mount: bridge shows
+      .mockImplementationOnce(
+        () => new Promise((resolve) => { releaseStats = () => resolve({ counts_by_bucket }); }),
+      );
+    mockApi.bulkSetJudgeDisposition.mockResolvedValue({
+      updated: 1,
+      settled: [{ run_id: "run-1", rec_id: "rec-1" }],
+      groups: [group({ bucket: "done", open_count: 0 })],
+      truncated: false,
+      triage: { ...triage, todo: 40, done: 9 }, // rec half drops 42 → 40
+    });
+
+    renderJudge();
+    expect(await screen.findByText("42 to-do recommendations across 18 groups")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /Mark done/ }));
+
+    // Matrix refetch in flight → the bridge is withheld rather than reconciling the new
+    // recommendation total (40) against the stale group total.
+    await waitFor(() => expect(screen.queryByText(/recommendations across/)).toBeNull());
+
+    // Once the refetch lands, the bridge returns with the updated recommendation half.
+    releaseStats?.();
+    expect(await screen.findByText("40 to-do recommendations across 18 groups")).toBeTruthy();
+  });
+});
+
+describe("Judge — the subtitle and filter-panel caption copy (#620)", () => {
+  it("drops the 'deduped by target' clause from the page subtitle", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog());
+    renderJudge();
+
+    const subtitle = await screen.findByText(/Recommendations across all your runs/);
+    expect(subtitle.textContent).toBe("Recommendations across all your runs. Triage a whole group in one action.");
+    expect(subtitle.textContent).not.toContain("deduped by target");
+  });
+
+  it("explains the count unit on the filter panel with a distinct caption", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog());
+    renderJudge();
+
+    expect(await screen.findByText("counts are groups, deduped by target")).toBeTruthy();
+  });
+});
+
 // Issue #204: the fixed bulk-action bar used `inset-x-0`, spanning full width UNDER the
 // w-60 (240px) z-30 sidebar and clipping its "N groups selected" label at desktop widths.
 // jsdom has no layout engine, so this asserts the class contract rather than a measured
