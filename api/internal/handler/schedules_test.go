@@ -150,7 +150,7 @@ func TestValidateScheduleConfig(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, status, msg := validateScheduleConfig(tc.req, fixedNow)
+			_, status, msg := validateScheduleConfig(tc.req, fixedNow, false)
 			if status != tc.wantStatus {
 				t.Fatalf("status = %d (%q), want %d", status, msg, tc.wantStatus)
 			}
@@ -163,7 +163,7 @@ func TestValidateScheduleConfig(t *testing.T) {
 func TestValidateScheduleConfigNormalizes(t *testing.T) {
 	n, status, _ := validateScheduleConfig(apitypes.ScheduleRequest{
 		Target: "sweep", Labels: []string{"  ", "bug", ""}, Timing: "recurring", CronExpr: "0 2 * * *",
-	}, fixedNow)
+	}, fixedNow, false)
 	if status != 0 {
 		t.Fatalf("status = %d, want 0", status)
 	}
@@ -367,7 +367,7 @@ func TestValidateScheduleConfigGuidance(t *testing.T) {
 	big := strings.Repeat("g", MaxGuidanceBytes+1)
 	if _, status, _ := validateScheduleConfig(apitypes.ScheduleRequest{
 		Target: "issue", IssueIID: i64(7), Guidance: sptr(big), Timing: "recurring", CronExpr: "0 2 * * *",
-	}, fixedNow); status != http.StatusUnprocessableEntity {
+	}, fixedNow, false); status != http.StatusUnprocessableEntity {
 		t.Fatalf("oversize guidance status = %d, want 422", status)
 	}
 
@@ -375,28 +375,28 @@ func TestValidateScheduleConfigGuidance(t *testing.T) {
 	atCap := strings.Repeat("g", MaxGuidanceBytes)
 	if _, status, _ := validateScheduleConfig(apitypes.ScheduleRequest{
 		Target: "sweep", Guidance: sptr(atCap), Timing: "recurring", CronExpr: "0 9 * * 1",
-	}, fixedNow); status != 0 {
+	}, fixedNow, false); status != 0 {
 		t.Fatalf("at-cap guidance status = %d, want 0", status)
 	}
 
 	// Guidance on the prompt target → 400.
 	if _, status, _ := validateScheduleConfig(apitypes.ScheduleRequest{
 		Target: "prompt", Prompt: "do the thing", Guidance: sptr("steer me"), Timing: "recurring", CronExpr: "0 9 * * 1",
-	}, fixedNow); status != http.StatusBadRequest {
+	}, fixedNow, false); status != http.StatusBadRequest {
 		t.Fatalf("guidance-on-prompt status = %d, want 400", status)
 	}
 
 	// A blank/whitespace guidance on prompt is NOT a rejection — it normalizes to nil first.
 	if n, status, _ := validateScheduleConfig(apitypes.ScheduleRequest{
 		Target: "prompt", Prompt: "do the thing", Guidance: sptr("   \n\t "), Timing: "recurring", CronExpr: "0 9 * * 1",
-	}, fixedNow); status != 0 || n.Guidance != nil {
+	}, fixedNow, false); status != 0 || n.Guidance != nil {
 		t.Fatalf("blank guidance on prompt: status=%d guidance=%v, want status 0 and nil guidance", status, n.Guidance)
 	}
 
 	// A real value on issue is accepted and preserved.
 	if n, status, _ := validateScheduleConfig(apitypes.ScheduleRequest{
 		Target: "issue", IssueIID: i64(7), Guidance: sptr("keep the diff small"), Timing: "recurring", CronExpr: "0 2 * * *",
-	}, fixedNow); status != 0 || n.Guidance == nil || *n.Guidance != "keep the diff small" {
+	}, fixedNow, false); status != 0 || n.Guidance == nil || *n.Guidance != "keep the diff small" {
 		t.Fatalf("valid issue guidance: status=%d guidance=%v, want status 0 and preserved value", status, n.Guidance)
 	}
 }
@@ -482,14 +482,14 @@ func TestValidateScheduleConfigModel(t *testing.T) {
 	// A valid alias is accepted and normalized (trimmed) on issue.
 	if n, status, _ := validateScheduleConfig(apitypes.ScheduleRequest{
 		Target: "issue", IssueIID: i64(7), Model: sptr("  fable  "), Timing: "recurring", CronExpr: "0 2 * * *",
-	}, fixedNow); status != 0 || n.Model == nil || *n.Model != "fable" {
+	}, fixedNow, false); status != 0 || n.Model == nil || *n.Model != "fable" {
 		t.Fatalf("valid alias: status=%d model=%v, want status 0 and normalized \"fable\"", status, n.Model)
 	}
 
 	// A valid custom ID (a full model identifier) is accepted.
 	if n, status, _ := validateScheduleConfig(apitypes.ScheduleRequest{
 		Target: "sweep", Model: sptr("us.anthropic.claude-opus-4-1-20250805-v1:0"), Timing: "recurring", CronExpr: "0 9 * * 1",
-	}, fixedNow); status != 0 || n.Model == nil || *n.Model != "us.anthropic.claude-opus-4-1-20250805-v1:0" {
+	}, fixedNow, false); status != 0 || n.Model == nil || *n.Model != "us.anthropic.claude-opus-4-1-20250805-v1:0" {
 		t.Fatalf("valid custom ID: status=%d model=%v, want status 0 and preserved value", status, n.Model)
 	}
 
@@ -503,7 +503,7 @@ func TestValidateScheduleConfigModel(t *testing.T) {
 		{"sweep", apitypes.ScheduleRequest{Target: "sweep", Model: sptr("fable"), Timing: "recurring", CronExpr: "0 9 * * 1"}},
 		{"issue", apitypes.ScheduleRequest{Target: "issue", IssueIID: i64(7), Model: sptr("fable"), Timing: "recurring", CronExpr: "0 2 * * *"}},
 	} {
-		if n, status, _ := validateScheduleConfig(tc.req, fixedNow); status != 0 || n.Model == nil || *n.Model != "fable" {
+		if n, status, _ := validateScheduleConfig(tc.req, fixedNow, false); status != 0 || n.Model == nil || *n.Model != "fable" {
 			t.Fatalf("model on %s target: status=%d model=%v, want status 0 and \"fable\" (model is not target-scoped)", tc.name, status, n.Model)
 		}
 	}
@@ -511,7 +511,7 @@ func TestValidateScheduleConfigModel(t *testing.T) {
 	// A malformed token (interior whitespace) → 400 with a "model:" message.
 	if _, status, msg := validateScheduleConfig(apitypes.ScheduleRequest{
 		Target: "issue", IssueIID: i64(7), Model: sptr("two words"), Timing: "recurring", CronExpr: "0 2 * * *",
-	}, fixedNow); status != http.StatusBadRequest || !strings.HasPrefix(msg, "model:") {
+	}, fixedNow, false); status != http.StatusBadRequest || !strings.HasPrefix(msg, "model:") {
 		t.Fatalf("malformed model: status=%d msg=%q, want 400 and a \"model:\" message", status, msg)
 	}
 
@@ -519,14 +519,14 @@ func TestValidateScheduleConfigModel(t *testing.T) {
 	tooLong := strings.Repeat("m", 101)
 	if _, status, msg := validateScheduleConfig(apitypes.ScheduleRequest{
 		Target: "sweep", Model: sptr(tooLong), Timing: "recurring", CronExpr: "0 9 * * 1",
-	}, fixedNow); status != http.StatusBadRequest || !strings.HasPrefix(msg, "model:") {
+	}, fixedNow, false); status != http.StatusBadRequest || !strings.HasPrefix(msg, "model:") {
 		t.Fatalf("oversize model: status=%d msg=%q, want 400 and a \"model:\" message", status, msg)
 	}
 
 	// A blank/whitespace model normalizes to nil (inherit), status 0.
 	if n, status, _ := validateScheduleConfig(apitypes.ScheduleRequest{
 		Target: "issue", IssueIID: i64(7), Model: sptr("   \n\t "), Timing: "recurring", CronExpr: "0 2 * * *",
-	}, fixedNow); status != 0 || n.Model != nil {
+	}, fixedNow, false); status != 0 || n.Model != nil {
 		t.Fatalf("blank model: status=%d model=%v, want status 0 and nil model", status, n.Model)
 	}
 }

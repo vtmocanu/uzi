@@ -51,7 +51,7 @@ const selfImproveTrackingBody = "Autonomous self-improvement tracking issue (PRD
 const selfImproveBacklogCap = 50
 
 // fireSelfImprove fires one self_improve schedule: it resolves the owner's repo, skips
-// benignly if the vault is locked or a run is already active for the repo, files (or
+// benignly if a run is already active for the repo or the vault is locked, files (or
 // reuses) the tracking issue, folds the owner's improve_uzi backlog into an auto-approved
 // self_improve run, marks that backlog addressed, and notifies the owner. It is the
 // relocated runCycle from selfimprove/engine.go, adapted to the fire-per-schedule model
@@ -68,19 +68,13 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 		return FireOutcome{}, err // transient DB error: retry next tick
 	}
 
-	// 2. Vault-lock skip (benign): the owner's DEK is not cached, so the autonomous run can't
-	// spend their token this cycle. Notify + advance normally; the cadence re-fires on schedule
-	// once the vault is unlocked. A nil vault is treated as always unlocked (a deployment
-	// without the vault), mirroring the bespoke engine.
-	if e.vault != nil && !e.vault.Unlocked(sched.UserID) {
-		e.notifySelfImprove(ctx, sched.UserID, "selfimprove_skipped", "Self-improvement cycle skipped",
-			"Your vault is locked, so the self-improvement run can't spend your token this cycle. Unlock your vault to resume.", nil)
-		return FireOutcome{Matched: 1, Skips: []Skip{{Reason: SkipVaultLocked}}}, nil
-	}
-
-	// 3. Active-run pre-check, per repo. On a DB error retry next tick (transient). If a run
+	// 2. Active-run pre-check, per repo. On a DB error retry next tick (transient). If a run
 	// is already active for this repo, benign skip — no notification (mirrors firePrompt's
 	// active skip); the per-repo unique index is the hard guard, this just skips the forge work.
+	// This precedes the vault-lock check (PRD #590 follow-up, item 5): if a cycle is already
+	// running for the repo, the fire is a no-op regardless of vault state, so skipping quietly
+	// here avoids emitting a spurious "vault locked" notification for a cycle that was never
+	// going to start anyway.
 	active, err := e.store.CountActiveSelfImproveRunsForRepo(ctx, sched.RepoID)
 	if err != nil {
 		return FireOutcome{}, err // transient DB error
@@ -88,6 +82,16 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 	if active > 0 {
 		e.logger.Info("scheduler: self_improve run active for repo, skipping fire", "schedule", sched.ID.String())
 		return FireOutcome{Matched: 1, Skips: []Skip{{Reason: SkipAlreadyRunning}}}, nil
+	}
+
+	// 3. Vault-lock skip (benign): the owner's DEK is not cached, so the autonomous run can't
+	// spend their token this cycle. Notify + advance normally; the cadence re-fires on schedule
+	// once the vault is unlocked. A nil vault is treated as always unlocked (a deployment
+	// without the vault), mirroring the bespoke engine.
+	if e.vault != nil && !e.vault.Unlocked(sched.UserID) {
+		e.notifySelfImprove(ctx, sched.UserID, "selfimprove_skipped", "Self-improvement cycle skipped",
+			"Your vault is locked, so this self-improvement cycle was skipped — it can't spend your token while locked. It will try again at the next scheduled time; unlock your vault before then so it isn't skipped again.", nil)
+		return FireOutcome{Matched: 1, Skips: []Skip{{Reason: SkipVaultLocked}}}, nil
 	}
 
 	// 4. Build the forge driver. A build failure (decrypt/driver) is transient — retry next

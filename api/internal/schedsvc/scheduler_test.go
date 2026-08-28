@@ -2144,6 +2144,11 @@ func TestTickSelfImproveVaultLockedSkipsAndAdvances(t *testing.T) {
 	if got := h.countKind("selfimprove_skipped"); got != 1 {
 		t.Fatalf("vault locked: selfimprove_skipped notifications = %d, want 1", got)
 	}
+	// Item 4 (PRD #590 follow-up): the reworded body no longer implies unlocking resumes the
+	// cycle soon — it must not carry the old "to resume" phrasing.
+	if body := selfImproveSkippedBody(t, h); strings.Contains(body, "to resume") {
+		t.Fatalf("vault-lock body must not imply unlocking resumes it (no %q): %q", "to resume", body)
+	}
 	// The skip precedes any forge work.
 	if h.fb.f.createCount != 0 {
 		t.Fatalf("vault locked: tracking issue created %d, want 0", h.fb.f.createCount)
@@ -2176,6 +2181,65 @@ func TestTickSelfImproveActiveRunSkipsQuietly(t *testing.T) {
 	}
 	if len(h.st.advanceCalls) != 1 {
 		t.Fatalf("active run: advance calls = %d, want 1 (benign skip advances)", len(h.st.advanceCalls))
+	}
+}
+
+// selfImproveSkippedBody returns the body of the single selfimprove_skipped notification,
+// failing the test if there is not exactly one.
+func selfImproveSkippedBody(t *testing.T, h *harness) string {
+	t.Helper()
+	var bodies []string
+	for _, notif := range h.notif.notifications {
+		if notif.Kind == "selfimprove_skipped" && notif.Slack != nil {
+			bodies = append(bodies, notif.Slack.Body)
+		}
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("selfimprove_skipped notifications = %d, want exactly 1", len(bodies))
+	}
+	return bodies[0]
+}
+
+// TestTickSelfImproveActiveRunWinsOverVaultLocked pins item 5's ordering (PRD #590
+// follow-up): when a run is ALREADY active for the repo AND the vault is locked, the
+// active-run pre-check runs first, so the fire is a quiet already_running skip — NOT a
+// vault-locked skip. No selfimprove_skipped notification is emitted, no run is created, and
+// the schedule still advances (benign skip). A regression that reordered these back would
+// emit a spurious vault-locked notification here.
+func TestTickSelfImproveActiveRunWinsOverVaultLocked(t *testing.T) {
+	h := newHarness()
+	h.vault.unlocked = false // vault locked
+	h.st.activeSelfImprove = 1
+	h.st.due = []store.RunSchedule{h.selfImproveSchedule()}
+
+	h.sched.Boot(context.Background())
+
+	if len(h.runs.selfImprove) != 0 {
+		t.Fatalf("active run wins: created %d runs, want 0", len(h.runs.selfImprove))
+	}
+	if got := h.countKind("selfimprove_skipped"); got != 0 {
+		t.Fatalf("active run wins: selfimprove_skipped notifications = %d, want 0 (active-run skip precedes vault-lock)", got)
+	}
+	if len(h.notif.notifications) != 0 {
+		t.Fatalf("active run wins: sent %d notifications, want 0", len(h.notif.notifications))
+	}
+	if h.fb.f.createCount != 0 {
+		t.Fatalf("active run wins: tracking issue created %d, want 0 (skip precedes forge work)", h.fb.f.createCount)
+	}
+	// Benign skip still advances, and its recorded skip reason is already_running, not the
+	// vault-lock reason.
+	if len(h.st.advanceCalls) != 1 {
+		t.Fatalf("active run wins: advance calls = %d, want 1 (benign skip advances)", len(h.st.advanceCalls))
+	}
+	var rec lastFireRecord
+	if err := json.Unmarshal(h.st.advanceCalls[0].LastFire, &rec); err != nil {
+		t.Fatalf("last_fire not valid JSON: %v", err)
+	}
+	if len(rec.Skips) != 1 || rec.Skips[0].Reason != string(SkipAlreadyRunning) {
+		t.Fatalf("last_fire = %+v, want exactly one already_running skip", rec)
+	}
+	if len(h.st.statusCalls) != 0 {
+		t.Fatalf("active run wins must not park: statusCalls = %+v", h.st.statusCalls)
 	}
 }
 

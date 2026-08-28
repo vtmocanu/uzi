@@ -55,7 +55,13 @@ const MaxSweepIssues = 10000
 // stripped of blanks — and returns the normalized request plus an HTTP status/message
 // (status 0 == valid). It never touches the forge or the store; the per-target field
 // invariants it enforces mirror the DB CHECK the row would otherwise fail on insert.
-func validateScheduleConfig(req apitypes.ScheduleRequest, now time.Time) (apitypes.ScheduleRequest, int, string) {
+//
+// allowSelfImprove gates the self_improve target (PRD #590 follow-up, item 1): a
+// self_improve schedule is catalog-enable-only, so a DIRECT create (POST /schedules) must
+// keep returning the same "target must be one of: issue, sweep, prompt" 400 (pass false),
+// while a user-origin CLONE reconfiguring its own row routes its config PATCH through this
+// validator and must be accepted (pass true). It is true only on the patch/merge caller.
+func validateScheduleConfig(req apitypes.ScheduleRequest, now time.Time, allowSelfImprove bool) (apitypes.ScheduleRequest, int, string) {
 	n := req
 	n.Timezone = strings.TrimSpace(n.Timezone)
 	if n.Timezone == "" {
@@ -130,6 +136,25 @@ func validateScheduleConfig(req apitypes.ScheduleRequest, now time.Time) (apityp
 		if n.Guidance != nil {
 			return n, http.StatusBadRequest, "guidance is not valid for a prompt schedule"
 		}
+	case "self_improve":
+		// A self_improve schedule is catalog-enable-only: a DIRECT create (POST /schedules)
+		// stays rejected (defense in depth), but a user-origin CLONE (CloneSchedule) is a valid
+		// row the owner may reconfigure, so its config PATCH (which routes through this validator)
+		// must be accepted. allowSelfImprove is true only on the patch/merge caller.
+		// (PRD #590 follow-up, item 1.)
+		if !allowSelfImprove {
+			return n, http.StatusBadRequest, "target must be one of: issue, sweep, prompt"
+		}
+		// A self_improve row carries only cadence/model — no issue_iid/labels/prompt and no
+		// sweep cap (mirrors the issue/prompt arms rejecting a stray max_issues).
+		if n.MaxIssues != nil {
+			return n, http.StatusBadRequest, "max_issues is only valid for a sweep schedule"
+		}
+		// Item 2: a self_improve run is ALWAYS auto-approved (CreateSelfImproveRun hardcodes
+		// auto_approve=true, selfimprove.sql). Force the stored flag true so it can never
+		// misrepresent as manual-approve; do not honor a user-set false.
+		approve := true
+		n.AutoApprove = &approve
 	default:
 		return n, http.StatusBadRequest, "target must be one of: issue, sweep, prompt"
 	}
@@ -173,7 +198,7 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 	applyCreateDefaults(&req)
 
-	m, status, msg := validateScheduleConfig(req, h.clock())
+	m, status, msg := validateScheduleConfig(req, h.clock(), false)
 	if status != 0 {
 		httpx.Error(w, status, msg)
 		return
@@ -302,7 +327,7 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		m, status, msg := validateScheduleConfig(merged, h.clock())
+		m, status, msg := validateScheduleConfig(merged, h.clock(), true)
 		if status != 0 {
 			httpx.Error(w, status, msg)
 			return
@@ -1028,6 +1053,14 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 	autoApprove := cur.AutoApprove
 	if req.AutoApprove != nil {
 		autoApprove = *req.AutoApprove
+	}
+	// Item 2 (PRD #590 follow-up): a self_improve run is always auto-approved
+	// (CreateSelfImproveRun hardcodes auto_approve=true, selfimprove.sql); force the schedule's
+	// stored flag true regardless of the request so the DTO/modal never misrepresent it as
+	// manual-approve. The catalog default is auto_approve=true, so this keeps the row from
+	// spuriously flagging customized.
+	if cur.Target == "self_improve" {
+		autoApprove = true
 	}
 	waitOnLimit := cur.WaitOnLimit
 	if req.WaitOnLimit != nil {
