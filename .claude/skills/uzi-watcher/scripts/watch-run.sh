@@ -29,8 +29,12 @@
 set -u
 RID="${1:?usage: watch-run.sh <run-id> [stop-csv] [interval] [max] [min-plan-seq]}"
 STOP="${2:-completed,failed,cancelled,awaiting_approval,awaiting_input}"
-INT="${3:-45}"
-MAX="${4:-160}"
+# 30s default balances gate-detection latency against poll volume; MAX 240 keeps
+# total coverage at ~2h (30*240=7200s) so a long implementation phase still fits.
+# Pass a coarser interval (e.g. 60) for a to-completion watch where the state you
+# await is hours off and snappy detection buys nothing.
+INT="${3:-30}"
+MAX="${4:-240}"
 MIN_PLAN_SEQ="${5:-}"
 
 max_plan_seq() {
