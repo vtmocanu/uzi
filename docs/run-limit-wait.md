@@ -29,7 +29,7 @@ The run's status stays visibly "waiting" the whole time — never "stalled" — 
 
 ## What happens automatically
 
-Once the window resets, the run resumes on the same worker, in the same session, keeping its branch and its history — including any edits it hadn't committed yet when it paused, which come back exactly as they were and never show up as their own commit in the eventual merge request. If you had already approved its plan before the pause, it goes straight back to work instead of asking you to approve the plan again.
+Once the window resets, the run usually resumes on the same worker, in the same session, keeping its branch and its history — including any edits it hadn't committed yet when it paused, which come back exactly as they were and never show up as their own commit in the eventual merge request. If you had already approved its plan before the pause, it goes straight back to work instead of asking you to approve the plan again. In the uncommon case it has to come back on a different worker, it still recovers those uncommitted edits whenever it cleanly can and resumes just the same; only when it genuinely cannot restore them will an already-approved run ask you to approve a fresh plan, so nothing is ever built on a tree that could not be fully brought back.
 
 That's the trade: a parked run keeps holding its issue and its worker's disk for as long as it waits, which is the price of never losing work to a mid-run limit.
 

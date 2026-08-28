@@ -1140,6 +1140,55 @@ describe("RunRunner — M4 resume-reviewed-plan predicate (PRD #759 M4)", () => 
     }
   });
 
+  it("(b2) human-approved DIVERGED-leg WIP recovery (seededFrom 'default' + wipRecovered) RESUMES, not re-gates", async () => {
+    // The exact claim of (b) — human-approved, dropped session, seededFrom 'default' — but the
+    // diverged cross-worker cherry-pick leg recovered the WIP onto the advanced floor, so
+    // wipRecovered is true. ADR-0759 and the reseed-feed path both call that a successful
+    // recovery, so the #209 loss-detection re-gate must NOT fire: the human's work came back.
+    // The ONLY delta from (b) is wipRecovered, and it must flip planApproved/reviewedPlanResume
+    // from false to true. This pins the recoveryFailed predicate — dropping its
+    // `&& wipRecovered !== true` clause (so a recovered-WIP run is treated as a lost tree)
+    // reddens this. Force wipRecovered on the reseed's return exactly as the feed test does; the
+    // git-level diverged leg is proved end to end in git-cross-worker-recovery.test.ts.
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-759-m4-wip-resume-"));
+    const origReseed = git.runnerCloneForBranch.bind(git);
+    (git as unknown as { runnerCloneForBranch: unknown }).runnerCloneForBranch = async (
+      ...args: unknown[]
+    ) => {
+      const rc = await (origReseed as unknown as (
+        ...a: unknown[]
+      ) => Promise<Record<string, unknown>>)(...args);
+      assert.strictEqual(rc.seededFrom, "default", "precondition: nothing committed recoverable → default floor");
+      return { ...rc, wipRecovered: true };
+    };
+    try {
+      const iid = 774;
+      const seen: RunContext[] = [];
+      await runnerWith(capturingM4(homeRoot, seen), gitlab).execute(
+        gitlabClaim(iid, {
+          wait_on_limit: true,
+          session_id: M4_SID,
+          plan_approved: true,
+          plan_source: "agent",
+          plan_md: "# reviewed plan\n- ship it",
+          auto_approve: false, // a human saw the gate
+        }),
+      );
+      assert.strictEqual(seen[0]?.sessionId, undefined, "dropped session");
+      assert.strictEqual(seen[0]?.wipRecovered, true, "precondition: the diverged leg recovered the WIP");
+      assert.strictEqual(
+        seen[0]?.planApproved,
+        true,
+        "a human-approved run whose WIP recovered on the diverged leg RESUMES — dropping `&& wipRecovered !== true` from recoveryFailed reddens this",
+      );
+      assert.strictEqual(seen[0]?.reviewedPlanResume, true);
+    } finally {
+      (git as unknown as { runnerCloneForBranch: unknown }).runnerCloneForBranch = origReseed;
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
   it("(c) autopilot recovery-FAILED dropped-session resume still RESUMES (no human gate to protect)", async () => {
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-759-m4-auto-"));

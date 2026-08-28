@@ -903,12 +903,18 @@ export class RunRunner {
       // humanApproved is computed FRESH from claim.auto_approve here (NOT reused from the
       // mutable ciFixHumanApproved, which the gate closure reassigns): the server clears
       // auto_approve when a run parks at the plan gate, so auto_approve!==true ⟺ a human saw
-      // the gate. recoveryFailed ⟺ the reseed recovered no tree (empty clone). The re-gate
-      // fallback (FLAG D) needs BOTH: an autopilot recovery-failed resume has no human at the
-      // gate to protect, but a human-approved recovery-failed run RE-GATES so the human
-      // notices the lost tree — #209's loss-detection gate, kept exactly where #209 put it.
+      // the gate. recoveryFailed ⟺ the reseed recovered NOTHING: no committed tree AND no WIP
+      // snapshot. seededFrom "default" ALONE is not loss — the diverged cross-worker cherry-pick
+      // leg recovers the WIP onto the advanced floor with seededFrom "default" + wipRecovered
+      // true (ADR-0759; the reseed-feed block above special-cases the same pair as a WIP
+      // recovery, not total loss). So wipRecovered is folded in here too — without it a
+      // human-approved run whose WIP came back cleanly on the diverged leg would FALSELY re-gate.
+      // The re-gate fallback (FLAG D) needs BOTH: an autopilot recovery-failed resume has no
+      // human at the gate to protect, but a human-approved recovery-failed run RE-GATES so the
+      // human notices the lost tree — #209's loss-detection gate, kept exactly where #209 put it.
       const humanApproved = (claim.auto_approve ?? false) !== true; // false ⟺ a human saw the gate
-      const recoveryFailed = runnerClone.seededFrom === "default"; // empty tree / recovery failed
+      const recoveryFailed =
+        runnerClone.seededFrom === "default" && runnerClone.wipRecovered !== true; // no tree AND no WIP
       const m4ResumeReviewedPlan =
         (claim.plan_approved ?? false) &&
         claim.plan_source === "agent" &&
