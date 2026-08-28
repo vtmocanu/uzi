@@ -3476,6 +3476,41 @@ func TestCreateRunMapsDuplicateToActiveRunExists(t *testing.T) {
 	}
 }
 
+// TestCreateRunPreCheckBlocksDuplicateOnHeldIssue covers the #754 M4 dedup pre-check
+// that replaces the index guard for a held issue: uq_runs_one_active_per_issue now
+// EXCLUDES pool_wait, so a held run no longer raises 23505 on a fresh insert — the
+// HasActiveRunForIssue pre-check in createRun is the ONLY thing that still refuses a
+// duplicate. This exercises that branch (the 23505 test above cannot: with pool_wait
+// excluded the index would let the second run through).
+func TestCreateRunPreCheckBlocksDuplicateOnHeldIssue(t *testing.T) {
+	user, repo := uuid.New(), uuid.New()
+	fs := &fakeStore{
+		issueByID:            store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true},
+		hasActiveRunForIssue: true, // a pool_wait (or any non-terminal) run already exists
+		createRunResult:      store.Run{ID: uuid.New()},
+	}
+	svc := New(fs, newBox(t), testParams())
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", false, nil, nil); err != ErrActiveRunExists {
+		t.Fatalf("err = %v, want ErrActiveRunExists — the pre-check must refuse a second run on a held issue", err)
+	}
+}
+
+// TestCreateRunPreCheckErrorPropagates: a DB error from the pre-check fails the create
+// (it must not be swallowed into "no active run" and let a duplicate through).
+func TestCreateRunPreCheckErrorPropagates(t *testing.T) {
+	user, repo := uuid.New(), uuid.New()
+	sentinel := errors.New("pre-check boom")
+	fs := &fakeStore{
+		issueByID:               store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true},
+		hasActiveRunForIssueErr: sentinel,
+		createRunResult:         store.Run{ID: uuid.New()},
+	}
+	svc := New(fs, newBox(t), testParams())
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", false, nil, nil); !errors.Is(err, sentinel) {
+		t.Fatalf("err = %v, want the pre-check error to propagate", err)
+	}
+}
+
 func TestCreateRunRepoNotOwned(t *testing.T) {
 	fs := &fakeStore{repoErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())

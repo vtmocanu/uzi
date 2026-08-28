@@ -55,7 +55,7 @@ func TestRunPoolWaitQueriesLiveDB(t *testing.T) {
 	// user_secrets(user_id, id), and the hold must PRESERVE it (M3's exclude-relax reads
 	// it on resume). A NULL here would make the preservation assertion vacuous.
 	mustExec(ctx, t, pool,
-		`INSERT INTO user_secrets (id, user_id, kind, ciphertext) VALUES ($1, $2, 'anthropic_token', $3)`,
+		`INSERT INTO user_secrets (id, user_id, kind, label, ciphertext) VALUES ($1, $2, 'anthropic_token', 'poolwait-key', $3)`,
 		secretID, userID, []byte{0x2})
 
 	wkr, err := q.CreateWorker(ctx, store.CreateWorkerParams{
