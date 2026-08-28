@@ -125,12 +125,31 @@ export function isPlanningRun(run: { status: string; is_planning?: boolean }): b
   return run.status === "running" && run.is_planning === true;
 }
 
+// isRevisingRun reports whether a run is actively RE-PLANNING after a revise (issue
+// #750). It trusts the server-computed is_revising boolean but only treats it as
+// revising while the run is still `awaiting_approval` — mirroring isPlanningRun's
+// status guard. This gate is load-bearing: the server flag is NOT status-gated (it can
+// linger on a run whose status has since moved), so combining it with the status is what
+// keeps a revising run out of the human-attention grouping while it re-plans, and returns
+// it to needs-approval the moment the next `plan` lands (is_revising flips false
+// server-side). An absent value — rollout skew — reads as not-revising (`=== true`).
+export function isRevisingRun(run: { status: string; is_revising?: boolean }): boolean {
+  return run.status === "awaiting_approval" && run.is_revising === true;
+}
+
 // effectiveRunStatus is the status a run should RENDER as: "planning" while it is in
-// its planning phase, else its raw status. This is the single seam every status
-// surface flows through so the planning phase renders consistently (board card,
-// StatusPill, list rows, issue-view history) without any surface re-deriving.
-export function effectiveRunStatus(run: { status: string; is_planning?: boolean }): string {
-  return isPlanningRun(run) ? "planning" : run.status;
+// its planning phase, "revising" while it is re-planning after a revise, else its raw
+// status. This is the single seam every status surface flows through so the planning and
+// revising phases render consistently (board card, StatusPill, list rows, issue-view
+// history) without any surface re-deriving. planning is status=running and revising is
+// status=awaiting_approval, so the two are mutually exclusive — order does not matter,
+// but each is checked explicitly against its own guard.
+export function effectiveRunStatus(
+  run: { status: string; is_planning?: boolean; is_revising?: boolean },
+): string {
+  if (isPlanningRun(run)) return "planning";
+  if (isRevisingRun(run)) return "revising";
+  return run.status;
 }
 
 // priorityBadge is the pure class→pill map for a run's queue priority (PRD #320 D8),
@@ -188,6 +207,10 @@ export function runStatusTone(
   stopKind: StopKind | null | undefined,
 ): BadgeTone {
   if (status === "planning") return "plan";
+  // issue #750: a run re-planning after a revise. Calm INFO tone (like claimed/running
+  // and the run-view VersionChip's parked state), deliberately NOT the awaiting warn:
+  // the run is not waiting on the human right now, the planner is reworking the plan.
+  if (status === "revising") return "info";
   if (status === "awaiting_approval" || status === "awaiting_input")
     return "warning";
   // PRD #517: an interactive run parked awaiting the owner's next follow-up.
@@ -363,6 +386,14 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
     // just pre-approval — in the indigo `plan` tone.
     case "planning":
       return { kind: "badge", label: "planning", tone: "plan", pulse: true };
+    // issue #750: a run re-planning after a revise, derived by effectiveRunStatus from
+    // the server's is_revising flag (gated on status === awaiting_approval). Calm info
+    // tone — matching the run-view VersionChip's parked/revising visual language — and
+    // pulsing like `planning` because it IS live work (the planner is reworking). This
+    // drops the run out of the awaiting-approval warn treatment while it re-plans; the
+    // next `plan` flips is_revising false server-side and it returns to awaiting_approval.
+    case "revising":
+      return { kind: "badge", label: "revising", tone: "info", pulse: true };
     case "running":
       // The running elapsed moved OUT of the badge to the uniform per-card duration
       // token (issue #256 M4, Decision 4) — the board now renders `running <elapsed>`

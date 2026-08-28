@@ -12,6 +12,7 @@ import {
   isAwaitingInput,
   isHealthFlaggableStatus,
   isPlanningRun,
+  isRevisingRun,
   isStoppedRun,
   milestoneBadge,
   milestoneBadgeText,
@@ -228,6 +229,83 @@ describe("planning phase (issue #321)", () => {
 
   it("runStatusTone maps the effective 'planning' status to the indigo plan tone", () => {
     expect(runStatusTone("planning", null)).toBe("plan");
+  });
+});
+
+// issue #750. A run re-planning after a revise keeps status === "awaiting_approval"
+// server-side, but its derived is_revising flag flips it to the "revising" effective
+// status so it drops out of the human-attention grouping while the planner reworks the
+// plan. The web TRUSTS the server's is_revising boolean but — because the server does NOT
+// status-gate it — combines it with status (isRevisingRun requires awaiting_approval),
+// exactly mirroring isPlanningRun's running-guard. These pin that combination.
+describe("revising phase (issue #750)", () => {
+  it("isRevisingRun: awaiting_approval + is_revising true ⇒ revising", () => {
+    expect(isRevisingRun({ status: "awaiting_approval", is_revising: true })).toBe(true);
+  });
+
+  it("isRevisingRun: is_revising true but NOT awaiting_approval ⇒ NOT revising", () => {
+    // The server flag is not status-gated, so it can linger on a run whose status has
+    // moved. A terminal/other status must never read as revising on the strength of it.
+    expect(isRevisingRun({ status: "completed", is_revising: true })).toBe(false);
+    expect(isRevisingRun({ status: "running", is_revising: true })).toBe(false);
+    expect(isRevisingRun({ status: "failed", is_revising: true })).toBe(false);
+  });
+
+  it("isRevisingRun: awaiting_approval but is_revising false/absent ⇒ NOT revising", () => {
+    expect(isRevisingRun({ status: "awaiting_approval", is_revising: false })).toBe(false);
+    // Absent (rollout skew) reads as not-revising — the `=== true` guard.
+    expect(isRevisingRun({ status: "awaiting_approval" })).toBe(false);
+  });
+
+  it("effectiveRunStatus: 'revising' while revising, else the raw status", () => {
+    expect(effectiveRunStatus({ status: "awaiting_approval", is_revising: true })).toBe("revising");
+    // is_revising true but not awaiting_approval → its raw status, never "revising".
+    expect(effectiveRunStatus({ status: "completed", is_revising: true })).toBe("completed");
+    // A plain awaiting_approval run (no revise in flight) stays awaiting_approval.
+    expect(effectiveRunStatus({ status: "awaiting_approval", is_revising: false })).toBe("awaiting_approval");
+    expect(effectiveRunStatus({ status: "awaiting_approval" })).toBe("awaiting_approval");
+  });
+
+  it("planning and revising are mutually exclusive (distinct status guards)", () => {
+    // is_planning is only meaningful while running; is_revising only while
+    // awaiting_approval. A run cannot be both, so effectiveRunStatus never has to choose.
+    expect(effectiveRunStatus({ status: "running", is_planning: true, is_revising: true })).toBe("planning");
+    expect(effectiveRunStatus({ status: "awaiting_approval", is_planning: true, is_revising: true })).toBe("revising");
+  });
+
+  it("runBadge: a revising run → pulsing info 'revising' badge (not the awaiting warn)", () => {
+    expect(runBadge(run({ status: "awaiting_approval", is_revising: true }), NOW)).toEqual({
+      kind: "badge",
+      label: "revising",
+      tone: "info",
+      pulse: true,
+    });
+  });
+
+  it("runBadge: the SAME run without is_revising still reads as 'awaiting approval'", () => {
+    // The revising wiring must not disturb an ordinary awaiting_approval run — is_revising
+    // false OR absent both fall through to the existing warn-toned awaiting badge.
+    const off = runBadge(run({ status: "awaiting_approval", is_revising: false }), NOW);
+    expect(off).toMatchObject({ kind: "badge", label: "awaiting approval", tone: "warning" });
+    const absent = runBadge(run({ status: "awaiting_approval" }), NOW);
+    expect(absent).toMatchObject({ kind: "badge", label: "awaiting approval", tone: "warning" });
+  });
+
+  it("runStatusTone maps the effective 'revising' status to the calm info tone", () => {
+    expect(runStatusTone("revising", null)).toBe("info");
+  });
+
+  it("a revising run is NOT in the human-attention grouping (via effective status)", () => {
+    // The board strip, card ring and favicon dot all classify from effectiveRunStatus.
+    // isAwaitingApproval / needsHumanAttention on the EFFECTIVE status is what drops a
+    // revising run out — the raw status would still read awaiting_approval.
+    const revising = { status: "awaiting_approval", is_revising: true };
+    expect(isAwaitingApproval(effectiveRunStatus(revising))).toBe(false);
+    expect(needsHumanAttention(effectiveRunStatus(revising))).toBe(false);
+    // Once the next plan lands (is_revising false), it returns to the grouping.
+    const approved = { status: "awaiting_approval", is_revising: false };
+    expect(isAwaitingApproval(effectiveRunStatus(approved))).toBe(true);
+    expect(needsHumanAttention(effectiveRunStatus(approved))).toBe(true);
   });
 });
 
