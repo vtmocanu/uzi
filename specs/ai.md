@@ -913,7 +913,7 @@ Serves human: "server/client; agents work an issue"; secret-at-rest (server hold
   `draining_since IS NULL`). It **falls open to peers IMMEDIATELY** the moment the prior
   worker goes heartbeat-stale or draining (a dead/draining owner never resumes it, so pinning
   is strictly worse than re-claiming), and a new run-lane ceiling `WORKER_AFFINITY_CEILING`
-  (default 30m) bounds the one live-but-wedged case (vault-locked / stuck-in-assembly yet
+  (default 2h; raised 30m→2h, PRD #759 M3) bounds the one live-but-wedged case (vault-locked / stuck-in-assembly yet
   still heartbeating). This **replaces** the old fixed `WORKER_AFFINITY_GRACE` (2m) window on
   the run lane, which was far too short for a `limit_wait` park (§432) that can last hours. The
   change is **universal** to the shared `ClaimRun` affinity leg — every requeue-with-`worker_id`
@@ -1111,7 +1111,7 @@ Server-side (defaults): `RUN_TIMEOUT` 2h, `RUN_IDLE_TIMEOUT` 10m (worker-enforce
 shipped in the claim), `RUN_MAX_ITERATIONS` 5 (worker-enforced), `RUN_MAX_REQUEUES`
 1 (`0` = never re-queue), `WORKER_HEARTBEAT_INTERVAL` 15s, `WORKER_HEARTBEAT_STALE`
 45s, `WORKER_POLL_INTERVAL` 3s, `WORKER_AFFINITY_GRACE` 2m (chat lane), `WORKER_AFFINITY_CEILING`
-30m (run lane, §573). Claimed-never-started
+2h (run lane, §573). Claimed-never-started
 grace is fixed at 5m in code, not an env var. Invalid numeric/duration values fall
 back to defaults (PRD #1/#2 convention). Worker-side: `UZI_API_URL`,
 `UZI_WORKER_TOKEN`, `UZI_DATA_DIR`, `UZI_WORKER_NAME`, and the interval knobs above
@@ -22834,3 +22834,54 @@ Cross-refs: PRD #111 D7 / D14 / D20 (§425, §426, §427, §431), PRD #217 M2 (�
 park). Reason-chip wire strings for `pool_stale`/`pool_empty`/`open_failed` in §426's table describe
 the pre-#754 default-resolution outcomes; the rendering changes are M-scoped and recorded with those
 milestones, not duplicated here.
+
+# PRD #759 — Protect in-flight run work across a usage-limit park
+
+## 582. PRD #759 — a marked-throwaway WIP auto-commit survives the park and is restored to uncommitted at adopt time; a provenance-gated resume skips the re-gate
+
+Closes the last gap the #628 checkpoint left open: #628 brokers only **committed** work across a
+cross-worker park, so uncommitted mid-milestone edits were `fs.rm`'d on the next claim and lost. This
+PRD makes uncommitted work durable too, and lets a provably-reviewed run resume without re-planning.
+Terse contract here; `adr/0759-protect-run-work-usage-limit-park.md` is the authoritative record
+(threat model, the ADR #456 / #218 / #209 reconciliations) and PRD #759's Decision Log is the richer
+rationale. The M3 affinity-ceiling raise (30m→2h) is recorded at §40/§49, not here.
+
+- **Marked WIP auto-commit on the park path (M1/M2).** On a `limit_wait` park with a dirty tree, the
+  worker commits the working tree to a clearly-marked throwaway `wip(park):` commit
+  (`WIP_PARK_COMMIT_PREFIX`, runner-uid, in the runner clone). The existing fetch-back carries it to
+  the worker tracking ref and #628's broker publishes it to `refs/uzi-checkpoints/<branch>` (still
+  join-token only, no PAT). On resume the reseed detects the marker and `git reset --soft`s it back to
+  **uncommitted** at adopt time, so the marker never enters the history the agent builds on, never
+  reaches finalize, and never lands in the MR. **The guarantee is the adopt-time reset, deliberately
+  NOT a finalize-time rewrite** — a finalize-time strip would collide with ADR #456's finalize-align,
+  so the marker is gone before the agent's first turn. This **revisits PRD #218 D6**
+  (no-auto-commit-on-park) at the maintainer's request; the reconciliation is that the survivor is a
+  marked throwaway restored to uncommitted, never reviewed work masquerading as a milestone.
+
+- **Recovery legs, loss-safe (M2).** Two legs recover the WIP by `reset --soft`: the same-worker
+  **tracking** leg and the cross-worker **strict-descendant checkpoint** leg. The cross-worker
+  **DIVERGED** case (main advanced during the park, marker not a descendant of the new floor) is
+  best-effort: cherry-pick the WIP delta onto the floor **only** when the marker's parent is an
+  ancestor of the floor (no committed milestone dropped) AND the pick is clean; otherwise recovery
+  **reports failure** (set aside) rather than force a conflicted tree or silently drop committed work.
+  A root-commit marker (no parent) is treated as not-recovered. `RunnerClone.wipRecovered` surfaces the
+  recovery to the executor and prompt layers.
+
+- **Resume-without-regate, provenance-gated (M4).** A dropped-session cross-worker resume skips the
+  re-plan/re-gate **only** for a provably-reviewed plan — a POSITIVE allowlist:
+  `plan_approved && plan_source==='agent'` (per #209 D8 `plan_source` tracks `plan_md` provenance) AND
+  the persisted `plan_md` is present AND recovery succeeded (`seededFrom!=='default'`). Driven runner-
+  side via `reviewedPlanResume` (only the runner knows `sessionId` was cleared and whether the reseed
+  recovered a tree); it both relaxes the `preApproved` SDK-session guard and extends the
+  `embedSeededPlan` gate so the plan BODY reaches the first implement turn (a bare `planApproved` flip
+  leaves `seededPlanBody` undefined and the model falls back to the issue — the #209 M2 gap). This
+  **NARROWS, does not reverse, #209 D4 row 3**: a human-approved run (`auto_approve` false) whose
+  recovery FAILED still re-gates (the human's loss-detection gate stays exactly there); an autopilot
+  run resumes (no human at the gate). `plan_source`/`auto_approve` already ride the claim wire; the
+  change is agent-side threading only, no schema change.
+
+- **Feed transparency (M5).** The reseed feed **distinguishes** an uncommitted-WIP-snapshot recovery
+  from a committed-milestone recovery (the `wip(park):` marker recognition drives it; `wipRecovered`
+  supersedes the #218 M3 reseed note whose "uncommitted changes did not survive" wording is false on
+  this path). The #218 M3 loss notice fires **only when nothing — committed or WIP — was recovered**,
+  so a partial WIP recovery no longer reads as total loss.

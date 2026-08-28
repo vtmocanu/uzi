@@ -241,6 +241,16 @@ export interface RunnerClone {
    *  divergence — never a silent merge or discard — and the runner emits a LOUD worker
    *  notice so the set-aside work is not lost silently. Absent/false on every other leg. */
   checkpointSetAside?: boolean;
+  /** PRD #759 M2 — true when a `wip(park):` marker (WIP_PARK_COMMIT_PREFIX) was adopted as
+   *  the base tip and `git reset --soft`'d back to uncommitted at adopt time, so the
+   *  recovered content is present in the working tree as UNCOMMITTED changes and the marker
+   *  is NOT in the history the agent builds on. Set on two legs: the same-worker /
+   *  cross-worker-clean tracking/checkpoint leg (the adopted tip IS the marker, reset --soft
+   *  onto its parent), and the cross-worker DIVERGED leg (the checkpoint marker's delta was
+   *  cherry-pick --no-commit'd onto the new floor). Consumed by M5 (feed event distinguishing
+   *  WIP-snapshot recovery from committed-milestone recovery) and M4 (recovery-success signal
+   *  for the re-gate decision). Absent/false on every other leg. */
+  wipRecovered?: boolean;
 }
 
 /**
@@ -490,16 +500,49 @@ export class GitCache {
         }
       }
       const baseSha = (await this.runGit(barePath, ["rev-parse", "--verify", `${baseRef}^{commit}`])).trim();
+      // PRD #759 M2 — same-worker + cross-worker-clean recovery. On the tracking leg
+      // (same-worker) and the checkpoint leg (cross-worker strict-descendant), `baseSha`
+      // itself is the adopted tip, and that tip may be a `wip(park):` marker M1 planted:
+      // the throwaway commit auto-saving the pre-park uncommitted tree. When it is, the
+      // REAL branch base is the marker's PARENT (the last real commit), so the counts and
+      // the ratchet clamp below must sit on the parent, not on the marker (M5 requires the
+      // recovered-commit count exclude the marker — it is not committed work). We detect
+      // the marker HERE, before those counts are computed, and `reset --soft` the checkout
+      // back to the parent after `checkout -b` below, so the marker's tree lands as
+      // uncommitted changes and the marker never enters the history the agent builds on.
+      const adoptedMarker = (seededFrom === "tracking" || seededFrom === "checkpoint")
+        && await this.isWipParkMarker(barePath, baseSha);
+      const markerParent = adoptedMarker
+        ? (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${baseSha}^^{commit}`])).trim()
+        : "";
+      // A root-commit marker (no parent) or a failed parent read leaves markerParent empty:
+      // there is nothing to reset onto, so treat it as NOT-recovered — keep the marker as
+      // the base (byte-identical to today's behaviour), do not reset, and log. Vanishingly
+      // rare (the clone base is never empty), but handled rather than crashed.
+      if (adoptedMarker && markerParent === "") {
+        this.log.warn("runner clone: adopted wip(park) marker has no parent — not recovering (root-commit marker)", {
+          branch,
+          baseSha,
+          seeded_from: seededFrom,
+        });
+      }
+      const willRecoverMarker = adoptedMarker && markerParent !== "";
+      // The effective base the branch will actually sit on after the `reset --soft` below.
+      // When there is no marker (every non-park leg), effectiveBase === baseSha and every
+      // downstream computation is byte-identical to today.
+      const effectiveBase = willRecoverMarker ? markerParent : baseSha;
       // How many commits the seed carries ahead of the default branch. On the origin
       // leg that is prior PUSHED work (issue #105); on the tracking leg it is the
       // interrupted attempt's RECOVERED work (PRD #218 M3). Counted in the BARE, which
       // holds every ref. Best-effort by construction — a repo with no resolvable default
       // branch, or any rev-list failure, yields 0 rather than failing a run over colour.
+      // Counted from effectiveBase so a recovered wip(park) marker (which reset --soft
+      // strips out of history) is never counted (PRD #759 M2/M5).
       const isResumeLeg = seededFrom !== "default";
-      const priorCommits = isResumeLeg ? await this.commitsAheadOfDefault(barePath, baseSha) : 0;
+      const priorCommits = isResumeLeg ? await this.commitsAheadOfDefault(barePath, effectiveBase) : 0;
       // On the default leg the seed already IS the default tip, so no second lookup. On a
       // resume leg they differ, and the difference is exactly what the lead cannot infer.
-      const defaultBranchCommit = isResumeLeg ? await this.defaultBranchSha(barePath) : baseSha;
+      const defaultBranchCommit = isResumeLeg ? await this.defaultBranchSha(barePath) : effectiveBase;
       this.log.info("runner clone: seeding", { branch, base: baseRef, seeded_from: seededFrom, prior_commits: priorCommits, path: clonePath });
 
       // The seed clone + checkout run as the RUNNER uid (PRD #51 M4), so the clone +
@@ -537,6 +580,125 @@ export class GitCache {
       await this.runGitAsRunner(clonePath, ["config", "user.email", AGENT_GIT_IDENTITY.email]);
       await this.runGitAsRunner(clonePath, ["config", "commit.gpgsign", "false"]);
       await this.runGitAsRunner(clonePath, ["checkout", "-b", branch, baseSha]);
+      // PRD #759 M2 — restore a recovered WIP tree to UNCOMMITTED at adopt time. Exactly
+      // ONE of the two branches below can run: #3 fires on the tracking/checkpoint legs
+      // where `baseSha` IS the marker (adoptedMarker); #4 fires on the not-ownedHere floor
+      // leg where the checkpoint DIVERGED and was set aside (checkpointSetAside). They are
+      // mutually exclusive by construction — adoptedMarker requires seededFrom
+      // tracking|checkpoint, while checkpointSetAside is only ever set on the else floor leg
+      // (seededFrom origin|default) — so the structure below can pick at most one.
+      let wipRecovered = false;
+      if (willRecoverMarker) {
+        // #3 — SAME-WORKER + CROSS-WORKER-CLEAN. The checkout materialized the marker's
+        // tree at HEAD; `reset --soft` moves HEAD back to the marker's parent while leaving
+        // the index + working tree at the marker's tree, so the WIP content is present as
+        // staged/uncommitted changes and the marker commit is no longer in history — it
+        // never enters what the agent builds on, never reaches finalize, never lands in the
+        // MR (PRD #759 D3, without the finalize-time rewrite that would collide with ADR
+        // #456). runGitAsRunner: a working-tree write in the runner-owned clone.
+        await this.runGitAsRunner(clonePath, ["reset", "--soft", markerParent]);
+        wipRecovered = true;
+        this.log.info("runner clone: recovered wip(park) marker to uncommitted (reset --soft)", {
+          branch,
+          marker: baseSha,
+          parent: markerParent,
+          seeded_from: seededFrom,
+        });
+      } else if (checkpointSetAside && checkpointExists && await this.isWipParkMarker(barePath, checkpointRef)) {
+        // #4 — CROSS-WORKER DIVERGED. `main` advanced during the park, so the mirrored
+        // checkpoint is not a strict descendant of the floor and the strict-descendant guard
+        // set it aside (baseSha = floor). When the checkpoint tip is a `wip(park):` marker we
+        // MAY recover just the WIP tree onto the new floor — but only when doing so drops NO
+        // committed work. Two things the naive `cherry-pick --no-commit <ref>` got wrong,
+        // both fixed here (PRD #759 M2):
+        //
+        //  (1) DOA — the ref never resolves in the clone. The runner clone is created above
+        //      with `git clone --shared --no-checkout`, which copies NONE of the bare's
+        //      custom refs, so `refs/uzi-checkpoints/*` is absent from the clone and a
+        //      cherry-pick BY REF NAME always `fatal: bad revision`d — this leg could never
+        //      recover. The OBJECTS are reachable via the `--shared` alternate; only the ref
+        //      NAME is missing. So resolve the marker to a 40-char SHA against the BARE
+        //      (mirroring the strict-descendant guard's rev-parse ~:483) and cherry-pick the
+        //      SHA, which the clone can name through its alternate.
+        //  (2) Silent milestone drop. `cherry-pick --no-commit <marker>` applies ONLY the
+        //      marker's diff against ITS OWN parent (the WIP delta). If the diverged
+        //      checkpoint carries committed-but-unpushed milestones between the fork point
+        //      and the marker (`fork → m1 → wip-marker`, the exact #628 shape), picking only
+        //      the tip DROPS m1's content — silently, when m1 touches files disjoint from the
+        //      WIP so the pick still applies clean — AND flips checkpointSetAside=false,
+        //      suppressing the loud set-aside notice. So gate the recovery on there being NO
+        //      committed work below the marker: the marker's PARENT must be an ancestor of the
+        //      floor (isAncestor is true at equality — the #685 zero-commit shape where the
+        //      marker sits directly on floor_at_park, itself an ancestor of the advanced
+        //      floor). If the parent is NOT an ancestor of the floor, committed divergence
+        //      lives below the marker: leave it set aside for a human, do NOT cherry-pick.
+        const checkpointMarkerSha = (
+          await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${checkpointRef}^{commit}`])
+        ).trim();
+        const checkpointMarkerParentSha = checkpointMarkerSha === ""
+          ? ""
+          : (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${checkpointMarkerSha}^^{commit}`])).trim();
+        if (checkpointMarkerParentSha === "") {
+          // A root-commit marker (no parent), or a failed tip/parent read: no fork point to
+          // test against the floor, so we cannot prove that no committed work would be
+          // dropped. Keep it set aside (the loud notice is preserved), do not cherry-pick.
+          this.log.warn("runner clone: diverged wip(park) checkpoint has no readable parent — left set aside (no recovery)", {
+            branch,
+            checkpoint: checkpointRef,
+            floor: baseSha,
+          });
+        } else if (await this.isAncestor(barePath, checkpointMarkerParentSha, baseSha)) {
+          // The marker sits directly on a floor-ancestor: no committed milestones live below
+          // it, so recovering just the WIP delta drops nothing. Cherry-pick the resolved SHA
+          // (NOT the ref name — see (1)) `--no-commit` so the WIP tree lands staged/uncommitted
+          // on the floor.
+          try {
+            await this.runGitAsRunner(clonePath, ["cherry-pick", "--no-commit", checkpointMarkerSha]);
+            // SUCCESS — the WIP is recovered as uncommitted on the floor. It rides on top of
+            // the floor base (priorCommits stays 0 for this leg: no committed work recovered),
+            // so seededFrom stays the floor leg. It was recovered, not set aside.
+            wipRecovered = true;
+            checkpointSetAside = false;
+            this.log.info("runner clone: recovered diverged wip(park) checkpoint onto new floor (cherry-pick --no-commit)", {
+              branch,
+              checkpoint: checkpointRef,
+              marker: checkpointMarkerSha,
+              floor: baseSha,
+              seeded_from: seededFrom,
+            });
+          } catch (err) {
+            // FAILURE (merge conflict) — a WIP that touches files main also moved conflicts
+            // even with a floor-ancestor parent; that is the genuine unclean case. Guarantee a
+            // pristine floor tree (abort the half-applied pick, hard-reset to the floor, clean
+            // untracked) and report failure: checkpointSetAside stays true, wipRecovered false,
+            // seededFrom unchanged. Required SAFE FAILURE (SC#1(b)): reports failure rather than
+            // silently dropping OR force-applying work.
+            await this.runGitAsRunner(clonePath, ["cherry-pick", "--abort"]).catch(() => undefined);
+            await this.runGitAsRunner(clonePath, ["reset", "--hard", baseSha]).catch(() => undefined);
+            await this.runGitAsRunner(clonePath, ["clean", "-fd"]).catch(() => undefined);
+            this.log.warn("runner clone: diverged wip(park) checkpoint did NOT apply cleanly onto new floor — recovery failed (set aside)", {
+              branch,
+              checkpoint: checkpointRef,
+              floor: baseSha,
+              error: gitErrorMessage(err),
+            });
+          }
+        } else {
+          // The marker's parent is NOT an ancestor of the floor: committed-but-unpushed work
+          // (m1…mN) lives between the fork point and the marker. Cherry-picking only the tip
+          // would silently drop it AND flip off the set-aside notice, reporting a partial
+          // recovery as full success. Leave it set aside (checkpointSetAside stays true,
+          // wipRecovered false, seededFrom unchanged) so the loud notice tells the human that
+          // committed work was left behind.
+          this.log.warn("runner clone: diverged wip(park) checkpoint carries committed divergence below the marker — left set aside for a human (no cherry-pick)", {
+            branch,
+            checkpoint: checkpointRef,
+            marker: checkpointMarkerSha,
+            markerParent: checkpointMarkerParentSha,
+            floor: baseSha,
+          });
+        }
+      }
       // Issue #262 — refresh the clone's default remote-tracking ref to the FRESH default
       // head. The clone's `refs/remotes/origin/<default>` is copied from the bare's
       // `refs/heads/*` (cloneBare rewrites the fetch refspec to
@@ -567,10 +729,12 @@ export class GitCache {
       // clone, exactly as #262. The no-resolvable-default-branch edge keeps today's skip (origin/main
       // keeps whatever the plain clone copied); it is governed by the Taskfile merge-base pre-flight,
       // out of scope here.
+      // PRD #759 M2: clamp against effectiveBase — the real fork point after a wip(park)
+      // reset --soft (== baseSha on every non-marker leg, so byte-identical there).
       const defaultBranch = await this.defaultBranchName(barePath);
       let ratchetBase = defaultBranchCommit;
-      if (ratchetBase && (await this.isAncestor(barePath, ratchetBase, baseSha))) {
-        ratchetBase = baseSha;
+      if (ratchetBase && (await this.isAncestor(barePath, ratchetBase, effectiveBase))) {
+        ratchetBase = effectiveBase;
       }
       if (defaultBranch && ratchetBase) {
         await this.runGitAsRunner(clonePath, ["update-ref", `refs/remotes/origin/${defaultBranch}`, ratchetBase]);
@@ -583,7 +747,11 @@ export class GitCache {
           });
         }
       }
-      return { path: clonePath, branch, priorCommits, baseCommit: baseSha, defaultBranchCommit, seededFrom, checkpointSetAside };
+      // PRD #759 M2: baseCommit is the REAL fork point — effectiveBase, which is the
+      // marker's parent when a wip(park) marker was reset --soft'd back to uncommitted, and
+      // baseSha (byte-identical) on every other leg. wipRecovered surfaces the recovery to
+      // M4/M5.
+      return { path: clonePath, branch, priorCommits, baseCommit: effectiveBase, defaultBranchCommit, seededFrom, checkpointSetAside, wipRecovered };
     });
   }
 
@@ -844,6 +1012,59 @@ export class GitCache {
         error: gitErrorMessage(err),
       });
       return null;
+    }
+  }
+
+  /**
+   * PRD #759 M1 — commit the runner clone's uncommitted work to a clearly-marked
+   * THROWAWAY commit on the park path, so the existing fetch-back + #628 checkpoint
+   * broker carry that work off the tree before the reseed's `fs.rm` wipes it. This is
+   * the one thing run #685 lacked: every durability layer captures committed commits
+   * only, so ~4h of mid-milestone work that had never been committed was lost on park.
+   *
+   * Runs AS THE RUNNER UID (runGitAsRunner) in the runner-owned clone — never a
+   * worker-uid git op. `git status`/`add`/`commit` touch the working tree and can fire
+   * attacker-chosen .gitattributes filter drivers that exec as the running uid; a
+   * worker-uid write would re-open code-exec as the PAT holder (PRD #51 M0). A runner-uid
+   * write in the runner-owned clone is the untrusted uid exec'ing in its own tree — not a
+   * boundary crossing (git.ts topology comment ~:39-48). The AGENT_GIT_IDENTITY and
+   * `commit.gpgsign=false` planted at seed (~:536-538) mean the commit needs no identity
+   * flags and cannot be blocked by a signing config.
+   *
+   * The subject is prefixed WIP_PARK_COMMIT_PREFIX so it is a recognizable throwaway:
+   * M2 detects it on the adopted tip and `git reset --soft <parent>` restores the content
+   * to UNCOMMITTED at adopt time, so the marker never enters the history the agent builds
+   * on and never reaches the MR. This deliberately reverses PRD #218 D6's "no auto-commit
+   * on park" — a decision the maintainer explicitly asked to revisit (PRD #759 M1 / D3):
+   * a marked throwaway stripped back to uncommitted at adopt time never masquerades as
+   * reviewed work, so #218 D6's "a half-applied edit that survives is worse than one that
+   * does not" no longer applies.
+   *
+   * BEST-EFFORT: every error is caught, logged, and returns `false` rather than thrown —
+   * a commit failure must NEVER propagate, because parking is the state that preserves the
+   * tree and a failed park loses MORE than a missing WIP commit (D4). Returns `true` only
+   * when a marker commit was actually created (an already-clean tree returns `false` —
+   * nothing to commit).
+   */
+  async commitWipMarker(clonePath: string): Promise<boolean> {
+    try {
+      const status = await this.runGitAsRunner(clonePath, ["status", "--porcelain"]);
+      if (status.split("\n").filter((l) => l.length > 0).length === 0) {
+        return false; // clean tree — nothing to save
+      }
+      await this.runGitAsRunner(clonePath, ["add", "-A"]);
+      await this.runGitAsRunner(clonePath, [
+        "commit",
+        "-m",
+        `${WIP_PARK_COMMIT_PREFIX} interrupted work auto-saved on usage-limit park (throwaway; restored uncommitted on resume)`,
+      ]);
+      return true;
+    } catch (err) {
+      this.log.warn("WIP park auto-commit failed (best-effort → not committed)", {
+        cwd: clonePath,
+        error: gitErrorMessage(err),
+      });
+      return false;
     }
   }
 
@@ -1272,6 +1493,16 @@ export class GitCache {
     return (await this.tryGit(barePath, ["merge-base", "--is-ancestor", ancestorRef, descendantRef])) === 0;
   }
 
+  /** PRD #759 M2 — is the commit `sha` a `wip(park):` marker (WIP_PARK_COMMIT_PREFIX)?
+   *  Reads the commit SUBJECT from the worker-owned bare with a read-only object read
+   *  (`log -1 --format=%s`, worker-uid — no working-tree touch, so no filter-driver
+   *  fire, safe). Best-effort: any failure (a missing/broken commit) answers false, so a
+   *  bad read never routes the reseed onto the reset-soft / cherry-pick recovery path. */
+  private async isWipParkMarker(barePath: string, sha: string): Promise<boolean> {
+    const subject = await this.tryGitStdout(barePath, ["log", "-1", "--format=%s", `${sha}^{commit}`]);
+    return subject.startsWith(WIP_PARK_COMMIT_PREFIX);
+  }
+
   // --- git subprocess plumbing -------------------------------------------------
 
   private async runGit(cwd: string | undefined, args: string[], pat?: string, scope?: string, username?: string): Promise<string> {
@@ -1389,6 +1620,23 @@ function withDir(cwd: string | undefined, args: string[]): string[] {
 /** The git author identity planted on every runner clone (issue #234) and used by the
  *  M2 stub executor's own commit, kept in one place so the two paths cannot drift. */
 export const AGENT_GIT_IDENTITY = { name: "uzi-agent", email: "uzi-agent@uzi.local" } as const;
+
+/**
+ * PRD #759 M1 — subject prefix of the throwaway "work-in-progress" commit that
+ * `commitWipMarker` plants on the park path so uncommitted work survives the reseed.
+ * Kept in one place because the recognition side reads it too: M2 detects this prefix
+ * on the adopted tip to `git reset --soft <parent>` the content back to uncommitted (so
+ * the marker never enters the history the agent builds on, never reaches finalize, and
+ * never lands in the MR), and M5 uses it to distinguish a recovered WIP snapshot from a
+ * recovered committed milestone. Do NOT inline the literal string anywhere else.
+ *
+ * @public — the recognition side (M2 reset-at-adopt, M5 feed event) lands in later
+ * milestones, so there is no cross-file static consumer YET; exported here in M1 so
+ * those milestones import the one definition rather than re-inlining the literal
+ * (issue #597 convention for a deliberately-exported symbol knip cannot yet see a use
+ * for, mirroring protocol.ts's @public wire DTOs).
+ */
+export const WIP_PARK_COMMIT_PREFIX = "wip(park):" as const;
 
 /**
  * git subprocess env. safe.directory=* trusts the daemon-managed dirs

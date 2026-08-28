@@ -217,6 +217,24 @@ export interface RunContext {
    *  and the seeded implement-prompt opening (Decision A). Absent/false ⇒ today's
    *  behaviour, byte-for-byte. */
   seeded?: boolean;
+  /** PRD #759 M4: this is a dropped-session cross-worker resume of a PROVABLY-REVIEWED
+   *  approved run (plan_approved && plan_source==='agent' && plan_md, recovery succeeded),
+   *  so the executor skips the re-plan/re-gate and implements from the persisted plan —
+   *  narrowing #209 D4 row 3, which otherwise re-plans a dropped-session non-seeded run.
+   *  Set by the RUNNER (the only layer that knows sessionId was cleared and whether the
+   *  reseed recovered a tree). It both relaxes the preApproved session guard and, crucially,
+   *  extends the embedSeededPlan gate so the plan BODY reaches the first implement turn
+   *  (a bare planApproved flip leaves seededPlanBody undefined and the model falls back to
+   *  the issue — the #209 M2 gap). Absent/false ⇒ today's behaviour, byte-for-byte. */
+  reviewedPlanResume?: boolean;
+  /** PRD #759 M2: the reseed recovered an uncommitted WIP snapshot (a wip(park): marker
+   *  reset --soft back to the working tree at adopt time), so the tree carries uncommitted
+   *  mid-edit changes rather than a clean checkout. Set by the RUNNER from the runner clone.
+   *  Forwarded to the FIRST implement prompt so a cold resumed lead inspects and reconciles
+   *  the dirty tree against the plan instead of assuming the recovered edits are complete or
+   *  reviewed (R1), and it supersedes the reseedNote (whose "uncommitted changes did not
+   *  survive" wording is false on this path). Absent/false ⇒ no note. */
+  wipRecovered?: boolean;
   /** The already-approved plan text to seed the implement loop with (PRD #35). Only
    *  meaningful with `planApproved`; the executor refuses to skip the gate without
    *  it, because an empty plan would enter implement with no instructions. */
@@ -813,13 +831,19 @@ export class StubExecutor implements Executor {
     // no instructions to implement, and `planApproved` alone does not imply one.
     //
     // `ctx.sessionId` is deliberately NOT re-checked here, though SdkExecutor does
-    // check it (relaxed for seeded, PRD #209). The runner sets ctx.planApproved only
-    // when the claim's plan_approved holds AND (a surviving session id OR the run is
-    // SEEDED), so the only "approved but no session" run that reaches this branch is a
-    // seeded one (PRD #209 D4 row 2) — which never had a session to lose. A NON-seeded
-    // run whose transcript was dropped is set planApproved=false by the runner and
-    // re-plans (D4 row 3), so it still never reaches this branch. Either way the stub has
-    // no SDK conversation to resume, so a session id would be a proxy for nothing it uses.
+    // check it (relaxed for seeded, PRD #209; and for a reviewed cross-worker resume,
+    // PRD #759 M4). The runner sets ctx.planApproved only when the claim's plan_approved
+    // holds AND one of: a surviving session id, the run is SEEDED (PRD #209 D4 row 2), OR
+    // it is a PRD #759 M4 provably-reviewed cross-worker resume (plan_approved &&
+    // plan_source==='agent' && plan_md present && recovery succeeded). So an "approved but
+    // no session" run reaching this branch is either a seeded run — which never had a
+    // session to lose — or that reviewed-resume run, whose transcript lived on the original
+    // worker and so has no session by construction. The stub correctly relaxes for ANY
+    // `planApproved && approvedPlan`, so the reviewed-resume path works here identically to
+    // seeded: the stub has no SDK conversation to resume in either case, so a session id
+    // would be a proxy for nothing it uses. A dropped-session run that is NOT
+    // provably-reviewed (a recovery-failed human-approved run) is still set
+    // planApproved=false by the runner and re-plans (D4 row 3), so it never reaches here.
     //
     // Without this the stub re-enters ctx.gatePlan on the resumed run and parks it at
     // awaiting_approval a SECOND time, waiting on a human verdict that the unattended

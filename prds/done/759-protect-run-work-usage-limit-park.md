@@ -2,7 +2,7 @@
 
 **Issue**: #759
 **Priority**: High
-**Status**: Draft
+**Status**: Done
 
 ## Problem
 
@@ -113,7 +113,7 @@ harder best-effort fallback.
 
 ## Milestones
 
-- [ ] **M1 — Marked WIP auto-commit of uncommitted work on the park path.** When a run parks on a
+- [x] **M1 — Marked WIP auto-commit of uncommitted work on the park path.** When a run parks on a
   usage limit and its runner clone has uncommitted changes, commit them to a **clearly-marked
   throwaway commit** (subject-prefixed `wip(park):`) run as the **runner uid** in the clone
   (`runGitAsRunner`, after `killAgentTree`, using the clone's existing `AGENT_GIT_IDENTITY`), inserted
@@ -124,7 +124,7 @@ harder best-effort fallback.
   edits leaves a `wip(park):` commit on its local tracking ref, and (best-effort) on the remote
   checkpoint ref.
 
-- [ ] **M2 — Recover the WIP tree on resume via `reset --soft` at adopt time.** On reseed, when the
+- [x] **M2 — Recover the WIP tree on resume via `reset --soft` at adopt time.** On reseed, when the
   adopted tip (tracking-ref leg for same-worker, checkpoint leg for cross-worker) is a `wip(park):`
   marker, `git reset --soft <parent>` so the WIP content returns to the working tree **uncommitted**
   and the branch tip is the last real commit — the marker **never enters the history the agent builds
@@ -138,7 +138,7 @@ harder best-effort fallback.
   `wip(park):` commit; the cross-worker clean-rebase case likewise recovers, and the diverged
   non-clean case reports failure instead of silently dropping work.
 
-- [ ] **M3 — Keep long parks on their original worker (the primary recovery path).** Raise the
+- [x] **M3 — Keep long parks on their original worker (the primary recovery path).** Raise the
   **flat** `WORKER_AFFINITY_CEILING` (`config.go:755`) so a multi-hour park resumes on the original,
   still-live worker, where the SDK session is intact (no re-plan) and the tracking-ref leg recovers
   the WIP commit with no ancestry test. Do **NOT** make it park-duration-aware — ADR #628 D3a rejected
@@ -148,7 +148,7 @@ harder best-effort fallback.
   limit window. *Success*: a park shorter than the new ceiling resumes same-worker with the session
   preserved and the WIP recovered.
 
-- [ ] **M4 — Resume an approved run without re-gating — safely.** When a dropped-session run would
+- [x] **M4 — Resume an approved run without re-gating — safely.** When a dropped-session run would
   today re-plan (cross-worker resume), skip the re-plan/re-gate and implement from the persisted plan
   **only when the plan is provably reviewed**: extend `planApproved` (`runner.ts:924`) /`preApproved`
   (`sdk-executor.ts:981-984`) to hold for `plan_approved && plan_md` **gated on `plan_source`
@@ -162,7 +162,7 @@ harder best-effort fallback.
   provably-reviewed approved run with a recovered tree continues implementing (plan body present, no
   re-gate); a recovery-failed human-approved run still re-gates.
 
-- [ ] **M5 — Make recovery and loss transparent in the run feed.** Emit a feed event that
+- [x] **M5 — Make recovery and loss transparent in the run feed.** Emit a feed event that
   **distinguishes** recovering an *uncommitted WIP snapshot* from recovering a *committed milestone*
   (the existing "recovered N commit(s)" wording, `git.ts:170`, would otherwise mislead — and would
   **over-count by one** while the WIP marker is a commit, so compute the count after the `reset
@@ -171,7 +171,7 @@ harder best-effort fallback.
   #685 shape produces a feed event that correctly says whether uncommitted work was recovered or lost —
   no PVC forensics.
 
-- [ ] **M6 — Tests, docs, ADR, close-out.** A cross-worker + same-worker recovery test that is
+- [x] **M6 — Tests, docs, ADR, close-out.** A cross-worker + same-worker recovery test that is
   **calibrated to fail against pre-fix code**: the fixture writes files into the worktree **without
   `git add`/`git commit`** (a dirty tree — the single deviation from the existing park factories, all
   of which commit) then throws `LimitReachedError`; the discriminating assertion is **file content

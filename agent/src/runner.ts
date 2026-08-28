@@ -575,23 +575,39 @@ export class RunRunner {
         payload: { text: `runner clone ready on ${runnerClone.branch}` },
       });
 
-      // PRD #218 M3: say what a resume recovered, in a WORKER status rather than by the
-      // lead noticing the tree changed under it. Two honest outcomes:
-      //   - the tracking-ref leg fired with commits ahead of default. That leg is reached
-      //     ONLY when the ref's owner stamp matches THIS run (M2), so the work provably
-      //     belongs to this run's own interrupted attempt — the message says so without
-      //     hedging about "an earlier run".
-      //   - a RESUME (session id present) fell all the way back to the default branch:
-      //     no origin branch and no tracking ref THIS run owns was here — a cross-worker
-      //     resume (R1) or a ref that belongs to a different run. The tree is lost for
-      //     this run; admit it (the session may still resume with full context, a
-      //     separate signal above — this keeps the TREE honest too).
+      // PRD #218 M3 / #759 M5: say what a resume recovered, in a WORKER status rather than by
+      // the lead noticing the tree changed under it. Two axes cross here — WHAT kind of work
+      // was recovered, committed vs. uncommitted, and each is honest about a distinct outcome:
+      //   - COMMITTED work (priorCommits > 0): the tracking-ref leg (same-worker, its owner
+      //     stamp matched THIS run — M2) or the checkpoint leg (cross-worker, #122 M8). The
+      //     message says which and names the count.
+      //   - UNCOMMITTED WIP (runnerClone.wipRecovered — #759 M2): a `wip(park):` marker was
+      //     `reset --soft` back to the working tree, so its edits returned UNCOMMITTED and the
+      //     marker never enters the history. priorCommits was computed AFTER that reset (off
+      //     the marker's parent), so it NEVER counts the marker — a pure WIP recovery has
+      //     priorCommits === 0. This is a PARTIAL, unreviewed snapshot, NOT a committed
+      //     milestone, so its wording says to verify it against the plan.
+      //   - NOTHING recovered on a RESUME (session id present, seededFrom "default", no WIP):
+      //     no origin branch, no tracking ref THIS run owns, no recoverable WIP — a
+      //     cross-worker resume (R1) or a diverged checkpoint that could not be applied. The
+      //     tree is lost for this run; admit it (the #218 M3 loss notice, unchanged wording).
+      //
+      // Branch order is load-bearing: the pure-WIP branch (3) MUST precede the loss branch (4).
+      // A cross-worker DIVERGED WIP recovery (#759 M2 leg #4) recovers the WIP tree onto the new
+      // floor but leaves seededFrom === "default" (the base is the floor, not the checkpoint) with
+      // wipRecovered === true. If the loss branch ran first it would FALSELY fire "no earlier work
+      // could be recovered" on exactly that successful recovery. With branch 3 ahead of it, the
+      // loss notice fires only when NOTHING — committed or WIP — was recovered: the residual
+      // #218-M3 loss case.
+      const wipRecovered = runnerClone.wipRecovered === true;
       if (runnerClone.seededFrom === "tracking" && runnerClone.priorCommits > 0) {
         batcher.emit({
           kind: "status",
           agent: "worker",
           payload: {
-            text: `recovered ${runnerClone.priorCommits} commit(s) of work from this run's interrupted attempt`,
+            text: wipRecovered
+              ? `recovered ${runnerClone.priorCommits} commit(s) plus your uncommitted work-in-progress from this run's interrupted attempt`
+              : `recovered ${runnerClone.priorCommits} commit(s) of work from this run's interrupted attempt`,
           },
         });
       } else if (runnerClone.seededFrom === "checkpoint" && runnerClone.priorCommits > 0) {
@@ -599,12 +615,33 @@ export class RunRunner {
         // refs/uzi-checkpoints/<branch>) — a cross-worker recovery the lead cannot infer
         // from the tree alone. priorCommits counts what the checkpoint carries. Gated on
         // priorCommits > 0 (like the tracking notice above) so it never claims to have
-        // "recovered 0 commit(s) from a checkpoint".
+        // "recovered 0 commit(s) from a checkpoint". #759 M5: a checkpoint can ALSO carry a
+        // reset-soft'd WIP tree alongside its commits — mention it when it did.
         batcher.emit({
           kind: "status",
           agent: "worker",
           payload: {
-            text: `recovered ${runnerClone.priorCommits} commit(s) from a checkpoint on another worker`,
+            text: wipRecovered
+              ? `recovered ${runnerClone.priorCommits} commit(s) plus your uncommitted work-in-progress from a checkpoint on another worker`
+              : `recovered ${runnerClone.priorCommits} commit(s) from a checkpoint on another worker`,
+          },
+        });
+      } else if (wipRecovered) {
+        // PRD #759 M5: a PURE uncommitted-WIP recovery — no committed milestones came back
+        // (priorCommits === 0). This is the #685 shape and covers same-worker tracking with
+        // zero commits, a cross-worker clean checkpoint with zero commits, AND the
+        // cross-worker DIVERGED cherry-pick leg (seededFrom stays "default"/origin). The
+        // recovered content is an UNCOMMITTED, PARTIAL snapshot from an interrupted attempt,
+        // NOT a committed milestone — so tell the agent to verify it against the plan before
+        // building on it. This branch precedes the loss notice so the diverged case
+        // (seededFrom === "default" + wipRecovered) never falsely reports total loss.
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text:
+              "recovered your uncommitted work-in-progress from this run's interrupted attempt — " +
+              "a partial snapshot, so verify it against the plan before continuing",
           },
         });
       } else if (claim.session_id != null && runnerClone.seededFrom === "default") {
@@ -859,6 +896,33 @@ export class RunRunner {
       // human-approved. A fresh run's gate closure overwrites this precisely.
       let ciFixHumanApproved = (claim.auto_approve ?? false) !== true;
 
+      // PRD #759 M4: resume a provably-reviewed approved run without re-plan/re-gate on a
+      // dropped-session cross-worker resume. plan_source==='agent' is a POSITIVE allowlist
+      // (worker-authored-but-gated; #209 D8 makes plan_source track plan_md provenance) — do
+      // NOT write `!== "seeded"`, which fails OPEN on any future unreviewed provenance value.
+      // humanApproved is computed FRESH from claim.auto_approve here (NOT reused from the
+      // mutable ciFixHumanApproved, which the gate closure reassigns): the server clears
+      // auto_approve when a run parks at the plan gate, so auto_approve!==true ⟺ a human saw
+      // the gate. recoveryFailed ⟺ the reseed recovered NOTHING: no committed tree AND no WIP
+      // snapshot. seededFrom "default" ALONE is not loss — the diverged cross-worker cherry-pick
+      // leg recovers the WIP onto the advanced floor with seededFrom "default" + wipRecovered
+      // true (ADR-0759; the reseed-feed block above special-cases the same pair as a WIP
+      // recovery, not total loss). So wipRecovered is folded in here too — without it a
+      // human-approved run whose WIP came back cleanly on the diverged leg would FALSELY re-gate.
+      // The re-gate fallback (FLAG D) needs BOTH: an autopilot recovery-failed resume has no
+      // human at the gate to protect, but a human-approved recovery-failed run RE-GATES so the
+      // human notices the lost tree — #209's loss-detection gate, kept exactly where #209 put it.
+      const humanApproved = (claim.auto_approve ?? false) !== true; // false ⟺ a human saw the gate
+      const recoveryFailed =
+        runnerClone.seededFrom === "default" && runnerClone.wipRecovered !== true; // no tree AND no WIP
+      const m4ResumeReviewedPlan =
+        (claim.plan_approved ?? false) &&
+        claim.plan_source === "agent" &&
+        !!claim.plan_md?.trim() &&
+        !sessionId &&
+        !seeded && // the D4-row-3 dropped-session case
+        !(humanApproved && recoveryFailed); // re-gate a human-approved run that lost its tree
+
       const ctx: RunContext = {
         runId,
         kind: claim.kind ?? "issue",
@@ -926,7 +990,17 @@ export class RunRunner {
         // run whose session is gone — the one case (D4 row 3) where it must re-plan. A
         // seeded run (D4 row 2) is approved with no session by construction, and that is
         // fine because there was never a session to lose.
-        planApproved: (claim.plan_approved ?? false) && (!!sessionId || seeded),
+        planApproved:
+          (claim.plan_approved ?? false) &&
+          (!!sessionId || seeded || m4ResumeReviewedPlan),
+        // PRD #759 M4: a provably-reviewed cross-worker resume skips the re-gate and
+        // embeds the persisted plan body on the implement turn. Drives the relaxed
+        // preApproved session guard and the embedSeededPlan reviewedResume term.
+        reviewedPlanResume: m4ResumeReviewedPlan,
+        // PRD #759 M2: the reseed recovered an uncommitted WIP snapshot (a wip(park):
+        // marker reset --soft back to the tree), so a cold resumed lead is told to treat
+        // the dirty tree as mid-edit and reconcile it against the plan (R1).
+        wipRecovered: runnerClone.wipRecovered,
         // PRD #209: the executor relaxes its own session guard for a seeded run and
         // emits the "plan supplied externally" feed line off this.
         seeded,
@@ -2089,6 +2163,18 @@ export class RunRunner {
           // done path and the shutdown branch — safe today (the executor's run() finally
           // reaps first) but kept consistent across all three fetch-back sites.
           executor.killAgentTree?.();
+          // PRD #759 M1: before the fetch-back, commit any uncommitted work in the
+          // runner-owned clone to a clearly-marked THROWAWAY commit (subject-prefixed
+          // wip(park):), run as the runner uid in the clone. This is the one thing run
+          // #685 lacked — every durability layer below captures COMMITTED commits only,
+          // so mid-milestone uncommitted edits were `fs.rm`'d on the next claim. Making a
+          // durable marked commit exist means the fetch-back just below carries it to the
+          // local tracking ref, and the #628 broker further down publishes it to
+          // refs/uzi-checkpoints/<branch>; M2 strips it back to uncommitted at adopt time
+          // so it never reaches the MR. commitWipMarker already swallows every error
+          // (best-effort — a park that loses work is worse than a missing WIP commit, D4);
+          // the .catch is belt-and-braces so nothing on this line can undo the park.
+          await this.git.commitWipMarker(worktreePath).catch(() => false);
           await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
           // PRD #628 M2: publish a checkpoint to origin on the park path so a DIFFERENT
           // worker re-claiming this limit_wait run can recover the committed tree from

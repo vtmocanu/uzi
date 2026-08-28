@@ -28,6 +28,11 @@ through `[0.52.0]`.)
 - **MR review comments are now auto-reworked in place, on by default, for every opted-in user ([#700](https://github.com/vtmocanu/uzi/issues/700)).**
   When a completed run's merge request gets new review comments on a green pipeline, uzi starts an `mr_rework` run that treats each finding as untrusted data, implements the ones still valid, and replies to (and, where the forge supports it, resolves) each thread on the existing branch and MR, capped at 5 rework cycles per MR by default. This is an announced behavior change: after upgrading, opted-in users' MRs (including unattended nightly-sweep MRs) get reworked automatically on their own Anthropic token, unless they opt out from Settings ("Auto-rework MR review comments on my runs") or an admin turns off the instance-wide `mr_rework_enabled` kill-switch.
 
+### Fixed
+
+- **A gated run no longer loses in-progress work across an Anthropic usage-limit park ([#759](https://github.com/vtmocanu/uzi/issues/759)).**
+  On park, any uncommitted edits are auto-committed to a clearly-marked throwaway `wip(park):` commit before the tree is wiped, so the existing checkpoint machinery carries them off the worker; on resume the reseed restores that snapshot to uncommitted (never entering the branch history or the merge request), exactly for a same-worker resume and best-effort for a cross-worker one. `WORKER_AFFINITY_CEILING` is raised from 30 minutes to 2 hours so a long park stays pinned to its original, still-alive worker, where the SDK session and the recovery are both exact; a resumed run whose plan was provably human-reviewed and whose work recovered cleanly keeps implementing instead of re-planning from scratch, while a recovery failure still re-gates for human review; and the run feed now says whether it recovered an uncommitted snapshot or a committed milestone instead of leaving the loss to PVC forensics.
+
 ## [0.66.3] - 2026-08-27
 
 ### Changed

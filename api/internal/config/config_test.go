@@ -117,7 +117,7 @@ func TestLoadAgentRuntimeDefaults(t *testing.T) {
 		{"SweepInterval", cfg.SweepInterval, time.Duration(0)},
 		{"WorkerPollInterval", cfg.WorkerPollInterval, 3 * time.Second},
 		{"WorkerAffinityGrace", cfg.WorkerAffinityGrace, 2 * time.Minute},
-		{"WorkerAffinityCeiling", cfg.WorkerAffinityCeiling, 30 * time.Minute},
+		{"WorkerAffinityCeiling", cfg.WorkerAffinityCeiling, 2 * time.Hour},
 	}
 	for _, c := range checks {
 		if c.got != c.want {

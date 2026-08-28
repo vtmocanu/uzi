@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { type ExecutorResult, type RunContext } from "../src/executor.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
-import { GitCache } from "../src/git.js";
+import { GitCache, WIP_PARK_COMMIT_PREFIX } from "../src/git.js";
 import { Worker } from "../src/worker.js";
 import type { Config } from "../src/config.js";
 import type { ChatRunner } from "../src/chat-runner.js";
@@ -681,6 +681,573 @@ describe("RunRunner — durable park (PRD #218 M1/M2/M3)", () => {
         texts.some((t) => /no earlier work could be recovered/.test(t)),
         "B honestly reports its own tree could not be recovered",
       );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── PRD #759 M5 — the recovery feed distinguishes WIP from committed ──────────
+//
+// M5 makes an uncommitted-WIP recovery legible in the run feed, distinct from a
+// committed-milestone recovery, and — the ordering crux — keeps the #218 M3 loss
+// notice from FALSELY firing on a cross-worker DIVERGED WIP recovery (which leaves
+// seededFrom==='default' but wipRecovered===true). Driven on the REAL runner emission:
+//   (a)/(c) via a genuinely-dirty park + same-worker resume — the runner's own M1
+//     commitWipMarker plants the wip(park): marker, the reseed resets it back to
+//     uncommitted, and the emission reads the resulting RunnerClone end to end.
+//   (b) via a plain cross-worker resume (no recoverable ref → seededFrom 'default')
+//     with wipRecovered forced true on the reseed's return — exactly the shape the
+//     git-level diverged leg produces (proved end to end in
+//     git-cross-worker-recovery.test.ts). It is the direct A/B of the existing loss
+//     test above: same claim, plus wipRecovered, must flip the loss notice OFF and the
+//     WIP notice ON. That is the whole ordering fix.
+describe("RunRunner — WIP-vs-committed recovery feed (PRD #759 M5)", () => {
+  const WIP_MSG =
+    /uncommitted work-in-progress from this run's interrupted attempt — a partial snapshot/;
+  const LOSS_MSG = /no earlier work could be recovered/;
+
+  const feedTexts = (runId: string): string[] =>
+    api
+      .messages(runId)
+      .filter((m) => m.kind === "status")
+      .map((m) => String(m.payload.text));
+
+  /** A factory that leaves a genuinely UNCOMMITTED edit in the clone (no `git add` /
+   *  commit — the single deviation from commitThenParkFactory) then parks. The runner's
+   *  M1 commitWipMarker turns it into a wip(park): marker, fetched back to the tracking
+   *  ref; the same-worker resume's reseed resets it back to uncommitted (wipRecovered). */
+  function dirtyThenParkFactory(homeRoot: string, dirty: string): ExecutorFactory {
+    return (runId) => ({
+      homeDir: path.join(homeRoot, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          fs.writeFileSync(path.join(ctx.worktreePath, dirty), "in-progress, uncommitted\n");
+          fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
+          throw new LimitReachedError({
+            resetsAtMs: Date.now() + 5 * 3600_000,
+            rateLimitType: "five_hour",
+          });
+        },
+      },
+    });
+  }
+
+  /** Like above but ALSO commits `committed` first, so the resume recovers a committed
+   *  milestone AND the uncommitted WIP (the "plus your uncommitted work-in-progress"
+   *  wording, priorCommits > 0 && wipRecovered). */
+  function commitAndDirtyThenParkFactory(
+    homeRoot: string,
+    committed: string,
+    dirty: string,
+  ): ExecutorFactory {
+    return (runId) => ({
+      homeDir: path.join(homeRoot, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          commitInTree(ctx.worktreePath, committed, "committed milestone\n");
+          fs.writeFileSync(path.join(ctx.worktreePath, dirty), "in-progress, uncommitted\n");
+          fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
+          throw new LimitReachedError({
+            resetsAtMs: Date.now() + 5 * 3600_000,
+            rateLimitType: "five_hour",
+          });
+        },
+      },
+    });
+  }
+
+  /** A no-op resume executor that records whether `probe` was restored to the tree. */
+  function resumeProbeFactory(
+    homeRoot: string,
+    probe: string,
+    onSeen: (present: boolean) => void,
+  ): ExecutorFactory {
+    return (runId) => ({
+      homeDir: path.join(homeRoot, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          onSeen(fs.existsSync(path.join(ctx.worktreePath, probe)));
+          return { branch: ctx.branch };
+        },
+      },
+    });
+  }
+
+  it("(a) a PURE uncommitted-WIP recovery says 'partial snapshot' and NOT the loss notice", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-759-wip-pure-"));
+    try {
+      const iid = 759;
+      const runId = "75900000-0000-4000-8000-0000000759aa";
+      // Park with a genuinely dirty (never-committed) tree → wip(park): marker on the
+      // tracking ref (no committed work: priorCommits stays 0).
+      await runnerWith(dirtyThenParkFactory(homeRoot, "WIP.txt"), gitlab).execute(
+        gitlabClaim(iid, { run_id: runId, wait_on_limit: true }),
+      );
+      // Same-worker resume: the reseed reset --soft's the marker back to uncommitted.
+      // PRD #759 M6: this drives the FULL park→resume flow via LimitReachedError through the
+      // runner's park path (not the git.ts reseed in isolation) and asserts the two
+      // discriminating properties together, in ONE end-to-end test — the M6 requirement the
+      // split coverage (runner (a) had content-present; git-cross-worker-recovery had the
+      // marker-free branch) did not satisfy on a single LimitReachedError-driven path:
+      //   1. the WIP file CONTENT is present in the resumed clone (pre-fix it is ABSENT — the
+      //      reseed fs.rm's the dirty tree and seedsFrom 'default'), and
+      //   2. the resumed branch history carries NO wip(park): subject (the marker was
+      //      reset --soft'd to uncommitted at adopt time, so it never reaches finalize / the MR).
+      let sawWip = false;
+      let wipContent: string | null = null;
+      let logSubjects: string[] = [];
+      await runnerWith(
+        (rid) => ({
+          homeDir: path.join(homeRoot, rid),
+          executor: {
+            run: async (ctx: RunContext): Promise<ExecutorResult> => {
+              const p = path.join(ctx.worktreePath, "WIP.txt");
+              sawWip = fs.existsSync(p);
+              wipContent = sawWip ? fs.readFileSync(p, "utf8") : null;
+              logSubjects = execFileSync(
+                "git",
+                ["-C", ctx.worktreePath, "log", "--format=%s"],
+                { env: GIT_ENV, encoding: "utf8" },
+              )
+                .trim()
+                .split("\n");
+              return { branch: ctx.branch };
+            },
+          },
+        }),
+        gitlab,
+      ).execute(
+        gitlabClaim(iid, {
+          run_id: runId,
+          wait_on_limit: true,
+          session_id: SID,
+          last_seq: 1000,
+        }),
+      );
+      assert.strictEqual(sawWip, true, "the uncommitted WIP file is restored to the resumed tree");
+      // The discriminating assertion (PRD #759 M6): the file's CONTENT is present, not merely
+      // "a checkpoint ref appeared". Pre-fix the file is absent, so this reads null and fails.
+      assert.strictEqual(
+        wipContent,
+        "in-progress, uncommitted\n",
+        "the pre-park WIP content is restored verbatim to the resumed clone",
+      );
+      // The finalized branch shows NO wip(park): subject — the marker never enters the history
+      // the agent builds on (R4). Non-vacuity: logSubjects is populated (the log ran), so an
+      // empty-history false pass cannot slip through.
+      assert.ok(logSubjects.length > 0 && logSubjects[0] !== "", "the resumed branch has a real history to inspect");
+      assert.ok(
+        logSubjects.every((s) => !s.startsWith(WIP_PARK_COMMIT_PREFIX)),
+        `no wip(park): commit in the resumed branch history, got ${JSON.stringify(logSubjects)}`,
+      );
+      const texts = feedTexts(runId);
+      assert.ok(
+        texts.some((t) => WIP_MSG.test(t)),
+        `expected the WIP-recovery notice, got ${JSON.stringify(texts)}`,
+      );
+      assert.strictEqual(
+        texts.some((t) => LOSS_MSG.test(t)),
+        false,
+        "the loss notice must NOT fire when uncommitted WIP was recovered",
+      );
+      assert.strictEqual(
+        texts.some((t) => /recovered \d+ commit/.test(t)),
+        false,
+        "a pure-WIP recovery must not claim any committed recovery",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(b) a DIVERGED WIP recovery (seededFrom 'default' + wipRecovered) fires the WIP notice, not the loss notice", async () => {
+    // The ordering crux. A cross-worker diverged recovery leaves seededFrom==='default'
+    // (the base is the advanced floor, not a checkpoint) with wipRecovered===true. This is
+    // the EXACT claim of the existing loss test ("a resume that recovers nothing"), so the
+    // ONLY delta is wipRecovered — and it must flip the loss notice OFF and the WIP notice
+    // ON. Force wipRecovered on the reseed's return, the git-level diverged leg being proved
+    // end to end in git-cross-worker-recovery.test.ts.
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-759-wip-diverged-"));
+    const origReseed = git.runnerCloneForBranch.bind(git);
+    (git as unknown as { runnerCloneForBranch: unknown }).runnerCloneForBranch = async (
+      ...args: unknown[]
+    ) => {
+      const rc = await (origReseed as unknown as (
+        ...a: unknown[]
+      ) => Promise<Record<string, unknown>>)(...args);
+      // A plain cross-worker resume already yields seededFrom 'default' / priorCommits 0;
+      // add the diverged leg's wipRecovered signal.
+      assert.strictEqual(rc.seededFrom, "default", "precondition: nothing recoverable → default floor");
+      return { ...rc, wipRecovered: true };
+    };
+    try {
+      const iid = 763;
+      const claim = gitlabClaim(iid, { wait_on_limit: true, session_id: SID });
+      await runnerWith(
+        (runId) => ({
+          homeDir: path.join(homeRoot, runId),
+          executor: { run: async (ctx: RunContext) => ({ branch: ctx.branch }) },
+        }),
+        gitlab,
+      ).execute(claim);
+      const texts = feedTexts(claim.run_id);
+      assert.ok(
+        texts.some((t) => WIP_MSG.test(t)),
+        `expected the WIP-recovery notice on the diverged recovery, got ${JSON.stringify(texts)}`,
+      );
+      assert.strictEqual(
+        texts.some((t) => LOSS_MSG.test(t)),
+        false,
+        "the loss notice must NOT fire on a diverged WIP recovery — the crux of the ordering fix",
+      );
+    } finally {
+      (git as unknown as { runnerCloneForBranch: unknown }).runnerCloneForBranch = origReseed;
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(c) a committed + WIP recovery mentions BOTH the commit count and the uncommitted work", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-759-wip-both-"));
+    try {
+      const iid = 764;
+      const runId = "76400000-0000-4000-8000-0000000764aa";
+      // Commit one milestone AND leave an uncommitted edit, then park: the marker sits on
+      // top of the committed work, so the resume recovers 1 commit + the WIP.
+      await runnerWith(
+        commitAndDirtyThenParkFactory(homeRoot, "M1.txt", "WIP.txt"),
+        gitlab,
+      ).execute(gitlabClaim(iid, { run_id: runId, wait_on_limit: true }));
+      let sawWip = false;
+      await runnerWith(
+        resumeProbeFactory(homeRoot, "WIP.txt", (p) => {
+          sawWip = p;
+        }),
+        gitlab,
+      ).execute(
+        gitlabClaim(iid, {
+          run_id: runId,
+          wait_on_limit: true,
+          session_id: SID,
+          last_seq: 1000,
+        }),
+      );
+      assert.strictEqual(sawWip, true, "the uncommitted WIP file is restored alongside the committed work");
+      const texts = feedTexts(runId);
+      assert.ok(
+        texts.some((t) =>
+          /recovered 1 commit\(s\) plus your uncommitted work-in-progress from this run's interrupted attempt/.test(
+            t,
+          )),
+        `expected the combined committed+WIP notice, got ${JSON.stringify(texts)}`,
+      );
+      assert.strictEqual(
+        texts.some((t) => LOSS_MSG.test(t)),
+        false,
+        "the loss notice must not fire when work was recovered",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(d) regression: a committed-only recovery keeps the byte-identical pre-M5 wording", async () => {
+    // The !wipRecovered branch must be untouched: a park that COMMITS its work (no dirty
+    // tree, so no marker) recovers exactly as before. (The pure-loss byte-identical case is
+    // covered by "a resume that recovers nothing admits the loss in the feed" above.)
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-759-committed-only-"));
+    try {
+      const iid = 765;
+      const runId = "76500000-0000-4000-8000-0000000765aa";
+      const { factory } = commitThenParkFactoryLocal(homeRoot, "WORK.txt");
+      await runnerWith(factory, gitlab).execute(
+        gitlabClaim(iid, { run_id: runId, wait_on_limit: true }),
+      );
+      await runnerWith(
+        resumeProbeFactory(homeRoot, "WORK.txt", () => {}),
+        gitlab,
+      ).execute(
+        gitlabClaim(iid, {
+          run_id: runId,
+          wait_on_limit: true,
+          session_id: SID,
+          last_seq: 1000,
+        }),
+      );
+      const texts = feedTexts(runId);
+      assert.ok(
+        texts.some(
+          (t) => t === "recovered 1 commit(s) of work from this run's interrupted attempt",
+        ),
+        `expected the byte-identical committed-only wording, got ${JSON.stringify(texts)}`,
+      );
+      assert.strictEqual(
+        texts.some((t) => WIP_MSG.test(t)),
+        false,
+        "a committed-only recovery must not mention uncommitted work-in-progress",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  /** A committing park factory local to this block (a duplicate of the durable-park
+   *  block's private helper), so (d) can commit real work without a dirty tree. */
+  function commitThenParkFactoryLocal(homeRoot: string, file: string): {
+    factory: ExecutorFactory;
+  } {
+    const factory: ExecutorFactory = (runId) => ({
+      homeDir: path.join(homeRoot, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          commitInTree(ctx.worktreePath, file, "work before the park\n");
+          fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
+          throw new LimitReachedError({
+            resetsAtMs: Date.now() + 5 * 3600_000,
+            rateLimitType: "five_hour",
+          });
+        },
+      },
+    });
+    return { factory };
+  }
+});
+
+// ── PRD #759 M4 — the runner-level resume-reviewed-plan predicate ─────────────
+//
+// embedSeededPlan (sdk-executor.test.ts) pins the plan-BODY gate as a pure function;
+// these pin the RUNNER's m4ResumeReviewedPlan → { planApproved, reviewedPlanResume }
+// resolution — the layer that owns the facts (dropped session, recovery success, the
+// plan_source allowlist, and the human-approved-recovery-failed re-gate). Each captures
+// the RunContext the executor receives, exactly as runner-seeded-plan.test.ts does for
+// the D4 rows; the question here is only what the runner RESOLVES, not what the run then
+// does (the capturing executor never calls gatePlan, so ctx.planApproved is read raw).
+//
+// Calibrated against the safety clauses the PRD names (R2, D4):
+//   (a) reddens if `m4ResumeReviewedPlan` is removed entirely (planApproved → false).
+//   (b) reddens if the `!(humanApproved && recoveryFailed)` re-gate clause is removed
+//       (planApproved would flip to true, re-implementing onto a lost human-approved tree).
+//   (c) reddens if the guard wrongly re-gated an autopilot recovery-failed resume.
+//   (d) reddens if the `plan_source === "agent"` allowlist is loosened to `!== "seeded"`
+//       (a future unreviewed provenance would then fail OPEN — R2's exact warning).
+describe("RunRunner — M4 resume-reviewed-plan predicate (PRD #759 M4)", () => {
+  const M4_SID = "aaaaaaaa-bbbb-cccc-dddd-ffffffffffff";
+
+  /** Park factory: commit `file` in the clone then park — leaves a tracking ref owned by
+   *  the run, which the same-worker resume recovers (seededFrom 'tracking' ⇒ recovery
+   *  SUCCEEDED, recoveryFailed=false). */
+  function commitThenParkM4(homeRoot: string, file: string): ExecutorFactory {
+    return (runId) => ({
+      homeDir: path.join(homeRoot, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          commitInTree(ctx.worktreePath, file, "committed before the park\n");
+          fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
+          throw new LimitReachedError({
+            resetsAtMs: Date.now() + 5 * 3600_000,
+            rateLimitType: "five_hour",
+          });
+        },
+      },
+    });
+  }
+
+  /** A capturing resume factory. No transcript is planted under its per-run HOME, so the
+   *  issue #105 preflight DROPS the session — the dropped-session (cross-worker) shape M4
+   *  keys on. It records the RunContext and returns without calling the gate. */
+  function capturingM4(homeRoot: string, seen: RunContext[]): ExecutorFactory {
+    return (runId) => ({
+      homeDir: path.join(homeRoot, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          seen.push(ctx);
+          return { branch: ctx.branch };
+        },
+      },
+    });
+  }
+
+  it("(a) recovery-succeeded human-approved dropped-session agent run is approved without a re-gate", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-759-m4-ok-"));
+    try {
+      const iid = 770;
+      const runId = "77000000-0000-4000-8000-0000000770aa";
+      // Park with a committed milestone → a tracking ref owned by runId.
+      await runnerWith(commitThenParkM4(homeRoot, "WORK.txt"), gitlab).execute(
+        gitlabClaim(iid, { run_id: runId, wait_on_limit: true }),
+      );
+      // Resume: SAME run_id, a dropped session (session_id present, no transcript), an
+      // agent-provenance approved plan, NOT autopilot (a human saw the gate). Recovery
+      // succeeds off the tracking ref, so the re-gate fallback does not fire.
+      const seen: RunContext[] = [];
+      await runnerWith(capturingM4(homeRoot, seen), gitlab).execute(
+        gitlabClaim(iid, {
+          run_id: runId,
+          wait_on_limit: true,
+          session_id: M4_SID,
+          last_seq: 1000,
+          plan_approved: true,
+          plan_source: "agent",
+          plan_md: "# reviewed plan\n- ship it",
+          auto_approve: false,
+        }),
+      );
+      assert.strictEqual(seen[0]?.sessionId, undefined, "the cross-worker transcript was dropped by the preflight");
+      // Precondition — recovery genuinely SUCCEEDED (else planApproved would be false via the
+      // re-gate fallback and the positive assertions below would be vacuous).
+      assert.deepStrictEqual(seen[0]?.priorWork, { commits: 1 }, "the parked commit was recovered off the tracking ref");
+      assert.strictEqual(seen[0]?.planApproved, true, "a provably-reviewed recovered resume is approved (no re-plan)");
+      assert.strictEqual(seen[0]?.reviewedPlanResume, true, "reviewedPlanResume drives the plan-body embed + gate skip");
+      assert.strictEqual(seen[0]?.seeded, false, "an agent-provenance plan is not seeded");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(b) human-approved but recovery-FAILED dropped-session run RE-GATES (the loss-detection gate)", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-759-m4-regate-"));
+    try {
+      // A fresh iid ⇒ no tracking ref, so the dropped-session reseed falls to the default
+      // branch (seededFrom 'default' ⇒ recovery FAILED, empty tree).
+      const iid = 771;
+      const seen: RunContext[] = [];
+      await runnerWith(capturingM4(homeRoot, seen), gitlab).execute(
+        gitlabClaim(iid, {
+          wait_on_limit: true,
+          session_id: M4_SID,
+          plan_approved: true,
+          plan_source: "agent",
+          plan_md: "# reviewed plan\n- ship it",
+          auto_approve: false, // a human saw the gate
+        }),
+      );
+      assert.strictEqual(seen[0]?.sessionId, undefined, "dropped session");
+      assert.strictEqual(seen[0]?.priorWork, undefined, "precondition: recovery FAILED (empty tree)");
+      assert.strictEqual(
+        seen[0]?.planApproved,
+        false,
+        "a human-approved run that lost its tree RE-GATES — removing !(humanApproved && recoveryFailed) reddens this",
+      );
+      assert.strictEqual(seen[0]?.reviewedPlanResume, false);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(b2) human-approved DIVERGED-leg WIP recovery (seededFrom 'default' + wipRecovered) RESUMES, not re-gates", async () => {
+    // The exact claim of (b) — human-approved, dropped session, seededFrom 'default' — but the
+    // diverged cross-worker cherry-pick leg recovered the WIP onto the advanced floor, so
+    // wipRecovered is true. ADR-0759 and the reseed-feed path both call that a successful
+    // recovery, so the #209 loss-detection re-gate must NOT fire: the human's work came back.
+    // The ONLY delta from (b) is wipRecovered, and it must flip planApproved/reviewedPlanResume
+    // from false to true. This pins the recoveryFailed predicate — dropping its
+    // `&& wipRecovered !== true` clause (so a recovered-WIP run is treated as a lost tree)
+    // reddens this. Force wipRecovered on the reseed's return exactly as the feed test does; the
+    // git-level diverged leg is proved end to end in git-cross-worker-recovery.test.ts.
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-759-m4-wip-resume-"));
+    const origReseed = git.runnerCloneForBranch.bind(git);
+    (git as unknown as { runnerCloneForBranch: unknown }).runnerCloneForBranch = async (
+      ...args: unknown[]
+    ) => {
+      const rc = await (origReseed as unknown as (
+        ...a: unknown[]
+      ) => Promise<Record<string, unknown>>)(...args);
+      assert.strictEqual(rc.seededFrom, "default", "precondition: nothing committed recoverable → default floor");
+      return { ...rc, wipRecovered: true };
+    };
+    try {
+      const iid = 774;
+      const seen: RunContext[] = [];
+      await runnerWith(capturingM4(homeRoot, seen), gitlab).execute(
+        gitlabClaim(iid, {
+          wait_on_limit: true,
+          session_id: M4_SID,
+          plan_approved: true,
+          plan_source: "agent",
+          plan_md: "# reviewed plan\n- ship it",
+          auto_approve: false, // a human saw the gate
+        }),
+      );
+      assert.strictEqual(seen[0]?.sessionId, undefined, "dropped session");
+      assert.strictEqual(seen[0]?.wipRecovered, true, "precondition: the diverged leg recovered the WIP");
+      assert.strictEqual(
+        seen[0]?.planApproved,
+        true,
+        "a human-approved run whose WIP recovered on the diverged leg RESUMES — dropping `&& wipRecovered !== true` from recoveryFailed reddens this",
+      );
+      assert.strictEqual(seen[0]?.reviewedPlanResume, true);
+    } finally {
+      (git as unknown as { runnerCloneForBranch: unknown }).runnerCloneForBranch = origReseed;
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(c) autopilot recovery-FAILED dropped-session resume still RESUMES (no human gate to protect)", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-759-m4-auto-"));
+    try {
+      const iid = 772;
+      const seen: RunContext[] = [];
+      await runnerWith(capturingM4(homeRoot, seen), gitlab).execute(
+        gitlabClaim(iid, {
+          wait_on_limit: true,
+          session_id: M4_SID,
+          plan_approved: true,
+          plan_source: "agent",
+          plan_md: "# reviewed plan\n- ship it",
+          auto_approve: true, // autopilot: no human ever saw the gate
+        }),
+      );
+      assert.strictEqual(seen[0]?.sessionId, undefined, "dropped session");
+      assert.strictEqual(seen[0]?.priorWork, undefined, "recovery FAILED, but autopilot has no human gate to protect");
+      assert.strictEqual(
+        seen[0]?.planApproved,
+        true,
+        "an autopilot recovery-failed resume implements from its plan (the re-gate fallback needs a HUMAN)",
+      );
+      assert.strictEqual(seen[0]?.reviewedPlanResume, true);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(d) a future non-agent, non-seeded provenance FAILS CLOSED even when recovery would resume (R2 allowlist)", async () => {
+    // Models a server sending a plan_source the worker's enum does not yet know — a future
+    // unreviewed provenance. Same shape as (c) (autopilot, recovery-failed, so the re-gate
+    // clause is satisfied and cannot be the thing that keeps it out); the ONLY discriminator
+    // is the provenance. The POSITIVE allowlist `=== "agent"` rejects it, so planApproved is
+    // false; loosening it to `!== "seeded"` would fail OPEN and flip this to true.
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-759-m4-fail-closed-"));
+    try {
+      const iid = 773;
+      const seen: RunContext[] = [];
+      await runnerWith(capturingM4(homeRoot, seen), gitlab).execute(
+        gitlabClaim(iid, {
+          wait_on_limit: true,
+          session_id: M4_SID,
+          plan_approved: true,
+          // A provenance value outside the {agent, seeded} enum the worker knows today.
+          plan_source: "future_unreviewed_provenance",
+          plan_md: "# an UNREVIEWED worker plan\n- do it",
+          auto_approve: true,
+        }),
+      );
+      assert.strictEqual(seen[0]?.sessionId, undefined, "dropped session");
+      assert.strictEqual(seen[0]?.seeded, false, "not seeded");
+      assert.strictEqual(
+        seen[0]?.planApproved,
+        false,
+        "an unknown provenance is NOT on the agent allowlist ⇒ re-gate; loosening to !== 'seeded' reddens this",
+      );
+      assert.strictEqual(seen[0]?.reviewedPlanResume, false);
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }

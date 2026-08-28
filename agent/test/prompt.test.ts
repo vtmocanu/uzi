@@ -808,6 +808,48 @@ describe("buildImplementPrompt", () => {
     assert.ok(!/picked up again after an interruption/i.test(absent));
     assert.strictEqual(absent, explicitFalse, "resumed:false must change nothing");
   });
+
+  // PRD #759 M2/R1: on the WIP-recovered path the reseed restored the pre-park uncommitted
+  // edits, so the reseedNote claim ("UNCOMMITTED changes ... did not survive that rebuild")
+  // is FALSE. The wip note supersedes it, and the two must never co-render.
+  it("PRD #759 M2: wipRecovered replaces the reseed note with a reconcile-the-dirty-tree note", () => {
+    const p = buildImplementPrompt({
+      branch: "b",
+      subagentNames: ["coder"],
+      first: true,
+      iteration: 1,
+      resumed: true,
+      wipRecovered: true,
+    });
+    // The new note tells a cold resumed lead the tree is a mid-edit to reconcile, not done.
+    assert.match(p, /UNCOMMITTED changes recovered from an earlier attempt/i);
+    assert.match(p, /reconcile them against the plan/i);
+    assert.match(p, /which plan steps are already done/i);
+    // The reseed note is SUPPRESSED — its now-false "did not survive that rebuild" claim must
+    // not co-render, or the prompt contradicts itself.
+    assert.ok(
+      !/did not survive that rebuild/i.test(p),
+      "the reseed note's false claim must not co-render with the wip note",
+    );
+  });
+
+  it("PRD #759 M2: the wip note is first-turn-only and absent without wipRecovered", () => {
+    const later = buildImplementPrompt({
+      branch: "b",
+      subagentNames: ["coder"],
+      first: false,
+      iteration: 2,
+      resumed: true,
+      wipRecovered: true,
+    });
+    assert.ok(!/recovered from an earlier attempt/i.test(later), "not repeated on later turns");
+    // Without wipRecovered a plain resume keeps the original reseed note, byte-identical.
+    const plainResume = buildImplementPrompt({ branch: "b", subagentNames: ["coder"], first: true, iteration: 1, resumed: true });
+    const wipFalse = buildImplementPrompt({ branch: "b", subagentNames: ["coder"], first: true, iteration: 1, resumed: true, wipRecovered: false });
+    assert.ok(!/recovered from an earlier attempt/i.test(plainResume), "no wip note without wipRecovered");
+    assert.match(plainResume, /did not survive that rebuild/i, "the reseed note still renders on a non-WIP resume");
+    assert.strictEqual(plainResume, wipFalse, "wipRecovered:false must change nothing");
+  });
 });
 
 describe("buildImplementPrompt — milestone note (PRD #122 M6)", () => {

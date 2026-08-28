@@ -631,6 +631,38 @@ chain in the diagram above, with no intervening `running`.
   across the whole credential pool. See [adr/0035-run-limit-retry.md](adr/0035-run-limit-retry.md)
   for why that timing could not be deferred to the claim, and
   `prds/done/35-run-limit-retry.md` for the fourteen decisions.
+  **Only committed history survives a park by itself** — the on-disk clone
+  above carries whatever the branch's tracking ref already has, but nothing
+  about parking commits anything, so uncommitted mid-milestone edits were
+  lost outright (incident #685). PRD #759 closes that gap: on park, the
+  runner auto-commits any uncommitted changes to a clearly-marked throwaway
+  `wip(park):` commit (as the runner uid, before the tree is wiped) so the
+  existing fetch-back and [PRD #628](prds/done/628-cross-worker-resume-durability.md)
+  checkpoint broker carry it off the worker the same as any real commit; on
+  adopt, the reseed recognizes a `wip(park):` tip and `git reset --soft`s it
+  back to *uncommitted*, so the marker never enters the history the agent
+  builds on and never reaches the merge request — deliberately not a
+  finalize-time rewrite, which would collide with
+  [ADR-456](adr/0456-rebase-before-finalize-push.md). Recovery is exact for a
+  **same-worker** resume (the tracking-ref leg carries no ancestry test); for
+  a **cross-worker** resume it is **best-effort** — a clean `cherry-pick
+  --no-commit` of the WIP tree onto the new floor recovers it, a diverged,
+  non-clean tree fails safely (the WIP is not restored — `wipRecovered` false —
+  and `seededFrom` stays the fallback floor: the run's own `origin` branch when
+  it still exists, else `default`) rather than forcing it. `WORKER_AFFINITY_CEILING`
+  (raised 30m→2h) is what makes same-worker the common case: it bounds how
+  long a *promoted, still-queued* run stays pinned to an alive-but-busy
+  original worker before a peer may steal it — a queue-dwell ceiling, not a
+  cover for the park duration itself ([ADR-628](adr/0628-cross-worker-resume-durability.md)
+  D3a rejected duration-awareness outright). A resumed run whose plan is **provably reviewed**
+  (`plan_source` provenance, not bare `plan_approved`) and whose work
+  recovered — committed progress OR a WIP snapshot — continues implementing
+  from the persisted plan without re-gating; a human-approved run re-gates
+  only on a TOTAL loss (neither recovered: `seededFrom` `default` and
+  `wipRecovered` false), preserving
+  [PRD #209](prds/done/209-seeded-plan-runs.md)'s loss-detection safety property. The run feed distinguishes recovering this uncommitted
+  snapshot from recovering a committed milestone. See
+  `adr/0759-protect-run-work-usage-limit-park.md` for the full Decision Log. <!-- check-docs:ignore-path -->
 
 - **queued → claimed** — `POST /api/worker/runs/claim` atomically claims the
   oldest queued run belonging to the caller's user (`FOR UPDATE SKIP LOCKED`),

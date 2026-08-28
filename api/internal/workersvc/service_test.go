@@ -1130,7 +1130,7 @@ func testParams() Params {
 		RunMaxRequeues:         1,
 		WorkerHeartbeatStale:   45 * time.Second,
 		WorkerAffinityGrace:    2 * time.Minute,
-		WorkerAffinityCeiling:  25 * time.Minute, // PRD #628 run-lane ceiling — deliberately != grace (2m) and != default (30m) so a test proves the run lane reads the ceiling
+		WorkerAffinityCeiling:  25 * time.Minute, // PRD #628 run-lane ceiling — deliberately != grace (2m) and != default (2h) so a test proves the run lane reads the ceiling
 		WorkerSpreadGrace:      9 * time.Second,
 		WorkerBackgroundGrace:  15 * time.Minute,
 		ClaimGrace:             5 * time.Minute,
