@@ -59,6 +59,15 @@ type EphemeralConfig struct {
 	// (online_since still NULL past the deadline) and (c) idle-stolen (online past the
 	// deadline but its bound run is being served by a sibling). There is deliberately no
 	// separate idle-grace knob: one deadline keeps the config surface to the approved set.
+	//
+	// The saturation trigger path (issue #747) relies on this SAME (c) idle-stolen arm:
+	// when a burst worker loses the race and a freed base slot claims its bound run, the
+	// now-idle burst pod is reaped here. That race resolves in seconds while this grace is
+	// 10m, so a lost-race burst pod (DinD, 20Gi PVC) can sit fully provisioned and idle for
+	// up to the deadline before GC. This cost is ACCEPTED (issue #747 M3): the debounce
+	// lowers the race probability, and a shorter idle-grace for the saturation arm would
+	// require a second knob, which collides with the "one deadline" decision above — so the
+	// saturation path deliberately shares the 10m grace rather than adding config surface.
 	ProvisionDeadline time.Duration
 	// SaturationDelay is the queue-wait debounce for the saturation trigger path
 	// (UZI_EPHEMERAL_SATURATION_DELAY, default 90s). It is threaded to
