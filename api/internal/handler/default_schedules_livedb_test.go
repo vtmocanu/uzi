@@ -321,6 +321,94 @@ func TestCloneUserScheduleCopiesFieldsLiveDB(t *testing.T) {
 	}
 }
 
+// TestSelfImproveScheduleReconfigureLiveDB (PRD #590 follow-up, items 1 & 2) pins the
+// self_improve schedule lifecycle end to end against a real DB:
+//   - a DIRECT POST /schedules with target=self_improve stays a 400 (catalog-enable-only);
+//   - a user-origin CLONE of an enabled self_improve default is a valid row whose config
+//     PATCH (cron) is accepted (item 1);
+//   - auto_approve is force-true on BOTH the user-origin clone and the default row, so a
+//     PATCH setting it false is ignored and it stays true (item 2).
+func TestSelfImproveScheduleReconfigureLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	// Item 1 invariant: a direct create of a self_improve schedule is rejected with the
+	// unchanged target message (self_improve is not a directly-creatable target).
+	req := userReq(http.MethodPost, "/api/repos/"+f.repoID.String()+"/schedules",
+		`{"target":"self_improve","timing":"recurring","cron_expr":"0 4 */2 * *","timezone":"UTC"}`,
+		f.owner.ID, map[string]string{"id": f.repoID.String()})
+	rec := httptest.NewRecorder()
+	f.h.CreateSchedule(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("direct self_improve create status = %d, want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "target must be one of: issue, sweep, prompt") {
+		t.Fatalf("direct self_improve create body = %q, want the unchanged target message", rec.Body.String())
+	}
+
+	// Enable the self_improve default, then clone it into a second owned repo → a user-origin
+	// self_improve row the owner may reconfigure.
+	def, code := f.enableCatalog(t, f.owner.ID, f.repoID, "self-improve")
+	if code != http.StatusCreated {
+		t.Fatalf("enable self-improve status = %d, want 201", code)
+	}
+	if def.Target != "self_improve" || def.Origin != "default" {
+		t.Fatalf("enabled self_improve dto = target %q origin %q, want self_improve/default", def.Target, def.Origin)
+	}
+	if !def.AutoApprove {
+		t.Fatalf("enabled self_improve default auto_approve = false, want true (catalog default)")
+	}
+
+	targetRepo := f.insertRepo(ctx, t, f.owner, 2, "g/sched-si")
+	clone, code := f.cloneSchedule(t, f.owner.ID, def.ID, `{"repo_id":"`+targetRepo.String()+`"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("clone self_improve status = %d, want 201", code)
+	}
+	if clone.Target != "self_improve" || clone.Origin != "user" || clone.CatalogSlug != nil {
+		t.Fatalf("clone = target %q origin %q slug %v, want self_improve/user/nil", clone.Target, clone.Origin, clone.CatalogSlug)
+	}
+
+	// Item 1: a config PATCH (new cron) on the user-origin clone is ACCEPTED (200) and persists.
+	const newCron = "30 5 */3 * *"
+	patched := f.patchDefault(t, f.owner.ID, clone.ID, `{"cron_expr":"`+newCron+`"}`)
+	if patched.CronExpr != newCron {
+		t.Fatalf("patched clone cron = %q, want %q", patched.CronExpr, newCron)
+	}
+	// It really persisted.
+	got, gcode := f.getSchedule(t, f.owner.ID, clone.ID)
+	if gcode != http.StatusOK {
+		t.Fatalf("re-read clone status = %d, want 200", gcode)
+	}
+	if got.CronExpr != newCron {
+		t.Fatalf("re-read clone cron = %q, want the persisted %q", got.CronExpr, newCron)
+	}
+
+	// Item 2 (user-origin path): a PATCH trying to set auto_approve=false is ignored — a
+	// self_improve run is always auto-approved, so the stored flag stays true.
+	userFalse := f.patchDefault(t, f.owner.ID, clone.ID, `{"auto_approve":false}`)
+	if !userFalse.AutoApprove {
+		t.Fatalf("user-origin self_improve auto_approve after false patch = %v, want true (forced)", userFalse.AutoApprove)
+	}
+
+	// Item 2 (default-origin path): the same on the enabled default row stays true.
+	defFalse := f.patchDefault(t, f.owner.ID, def.ID, `{"auto_approve":false}`)
+	if !defFalse.AutoApprove {
+		t.Fatalf("default-origin self_improve auto_approve after false patch = %v, want true (forced)", defFalse.AutoApprove)
+	}
+
+	// Item 1 defense-in-depth: a PATCH must not CONVERT a non-self_improve row into a
+	// self_improve one (that would be a create-by-patch the direct POST path blocks). Create a
+	// plain sweep schedule, then try to repoint its target to self_improve → 400.
+	sweep, code := f.createSchedule(t, f.owner.ID, f.repoID,
+		`{"target":"sweep","timing":"recurring","cron_expr":"0 3 * * *","timezone":"UTC"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create sweep status = %d, want 201", code)
+	}
+	if _, cc := f.patchSchedule(t, f.owner.ID, sweep.ID, `{"target":"self_improve"}`); cc != http.StatusBadRequest {
+		t.Fatalf("convert sweep→self_improve via PATCH status = %d, want 400 (conversion blocked)", cc)
+	}
+}
+
 // TestCloneToDifferentRepoLiveDB: a {"repo_id"} body clones into a second owned repo; a
 // foreign/absent target repo is a 404.
 func TestCloneToDifferentRepoLiveDB(t *testing.T) {

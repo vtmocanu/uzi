@@ -324,6 +324,43 @@ describe("the create-only Enabled toggle (PRD #344 Feature B)", () => {
   });
 });
 
+describe("auto-approve is hidden for a self_improve schedule (PRD #590 follow-up 2)", () => {
+  it("hides the Auto-approve toggle and drops the approve segment from the footer", () => {
+    render(
+      <MemoryRouter>
+        <ScheduleModal
+          editing={schedFixture({ target: "self_improve", origin: "user", auto_approve: true })}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    // A self_improve run is always server-forced to auto_approve, so the toggle must not
+    // render (showing it would misrepresent a fixed value as a user choice).
+    expect(screen.queryByRole("switch", { name: "Auto-approve the plan" })).toBeNull();
+
+    // The footer summary drops the approve segment entirely but still names the target.
+    const footer = screen.getByText(/self-improve/);
+    expect(footer.textContent).not.toMatch(/auto-approve/);
+    expect(footer.textContent).not.toMatch(/manual approve/);
+  });
+
+  it("still renders the Auto-approve toggle for a non-self_improve schedule (control)", () => {
+    render(
+      <MemoryRouter>
+        <ScheduleModal
+          editing={schedFixture({ target: "sweep", auto_approve: true })}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole("switch", { name: "Auto-approve the plan" })).toBeTruthy();
+  });
+});
+
 describe("the edit-mode repo selector (PRD #344 Feature A)", () => {
   // Two repos so an edit can pick a different one than the schedule's current repo.
   function twoRepos() {

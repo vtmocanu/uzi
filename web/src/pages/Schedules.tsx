@@ -520,6 +520,9 @@ function ScheduleRow({
   const off = !s.enabled;
   const fired = s.timing === "once" && s.status === "fired";
   const parked = s.status === "error";
+  // A self_improve schedule is always auto-approved (server-forced), so it is not a
+  // user option — suppress the chip and let the "defaults" fallback show instead.
+  const showApprove = s.auto_approve && s.target !== "self_improve";
   const [expanded, setExpanded] = useState(false);
   const [addingRepo, setAddingRepo] = useState(false);
   return (
@@ -616,8 +619,8 @@ function ScheduleRow({
       <td className="px-4 py-3">
         <div className="flex flex-wrap gap-1">
           {s.wait_on_limit && <OptionChip>wait-on-limit</OptionChip>}
-          {s.auto_approve && <OptionChip>auto-approve</OptionChip>}
-          {!s.wait_on_limit && !s.auto_approve && <span className="text-[12px] text-faint">defaults</span>}
+          {showApprove && <OptionChip>auto-approve</OptionChip>}
+          {!s.wait_on_limit && !showApprove && <span className="text-[12px] text-faint">defaults</span>}
         </div>
       </td>
 
