@@ -18,20 +18,46 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.67.0] - 2026-08-28
+
 ### Added
 
 - **Instance branding (Admin → Branding, [#685](https://github.com/vtmocanu/uzi/issues/685)).**
-  Replace the app mark with a custom logo or full white-label, add an optional "POWERED BY" brand in the sidebar, and surface a fixed MIT/author credit that no branding setting can remove — all runtime admin settings, no redeploy; fresh installs stay unbranded.
+  Replace the app mark with a custom logo or full white-label, add an optional "POWERED BY" brand in the sidebar, and surface a fixed MIT/author credit that no branding setting can remove, all runtime admin settings, no redeploy; fresh installs stay unbranded.
+- **Default jobs tab shows each repo's last-run outcome ([#752](https://github.com/vtmocanu/uzi/pull/752)).**
+  The Default jobs tab now surfaces the per-repo last-run status the My schedules tab already showed, so an enabled default's most recent result is visible at a glance.
 
 ### Changed
 
 - **MR review comments are now auto-reworked in place, on by default, for every opted-in user ([#700](https://github.com/vtmocanu/uzi/issues/700)).**
   When a completed run's merge request gets new review comments on a green pipeline, uzi starts an `mr_rework` run that treats each finding as untrusted data, implements the ones still valid, and replies to (and, where the forge supports it, resolves) each thread on the existing branch and MR, capped at 5 rework cycles per MR by default. This is an announced behavior change: after upgrading, opted-in users' MRs (including unattended nightly-sweep MRs) get reworked automatically on their own Anthropic token, unless they opt out from Settings ("Auto-rework MR review comments on my runs") or an admin turns off the instance-wide `mr_rework_enabled` kill-switch.
+- **Auto lane never spends a non-pooled token ([#754](https://github.com/vtmocanu/uzi/pull/754)).**
+  Auto worker selection now floors to the shared pool and holds when the pool is empty, instead of falling back to a non-pooled token, so an auto-lane run cannot consume a user's personal token by accident.
+- **Ephemeral workers burst on saturation, not only on capability gaps ([#757](https://github.com/vtmocanu/uzi/pull/757)).**
+  A saturated fleet now spins up ephemeral workers to absorb the backlog, matching the burst behavior previously reserved for capability gaps.
+- **self_improve schedules are editable, plus PRD #590 follow-ups ([#753](https://github.com/vtmocanu/uzi/pull/753)).**
+  self_improve schedules can now be edited, the auto_approve no-op is corrected, and vault-skip handling was polished.
+- **Release and CI image builds tolerate transient network blips ([#739](https://github.com/vtmocanu/uzi/pull/739)).**
+  The image build steps now retry through transient network failures, so a registry or network hiccup no longer fails a release or CI run.
+- **Dependency updates.**
+  Bubble Tea v2 ([#734](https://github.com/vtmocanu/uzi/pull/734)), the Kubernetes client-go monorepo ([#733](https://github.com/vtmocanu/uzi/pull/733)), chi to v5.3.2 ([#741](https://github.com/vtmocanu/uzi/pull/741)), and the Claude Agent SDK to 0.3.239 ([#769](https://github.com/vtmocanu/uzi/pull/769)).
 
 ### Fixed
 
 - **A gated run no longer loses in-progress work across an Anthropic usage-limit park ([#759](https://github.com/vtmocanu/uzi/issues/759)).**
   On park, any uncommitted edits are auto-committed to a clearly-marked throwaway `wip(park):` commit before the tree is wiped, so the existing checkpoint machinery carries them off the worker; on resume the reseed restores that snapshot to uncommitted (never entering the branch history or the merge request), exactly for a same-worker resume and best-effort for a cross-worker one. `WORKER_AFFINITY_CEILING` is raised from 30 minutes to 2 hours so a long park stays pinned to its original, still-alive worker, where the SDK session and the recovery are both exact; a resumed run whose plan was provably human-reviewed and whose work recovered cleanly keeps implementing instead of re-planning from scratch, while a recovery failure still re-gates for human review; and the run feed now says whether it recovered an uncommitted snapshot or a committed milestone instead of leaving the loss to PVC forensics.
+- **A run stays in the "needs approval" grouping while it re-plans after a revise ([#758](https://github.com/vtmocanu/uzi/pull/758)).**
+  A run actively re-planning after a revise no longer drops out of the needs-approval grouping mid-replan.
+- **Hosted-worker upgrade classifier no longer flags a reuse-retagged worker as "outdated" ([#755](https://github.com/vtmocanu/uzi/pull/755)).**
+  When `workers.image.tag` points at a reuse-retagged agent image, the upgrade classifier now reads the worker as current instead of perpetually "outdated".
+- **Judge page label counts reconcile with the To-triage count ([#749](https://github.com/vtmocanu/uzi/pull/749)).**
+  The Judge page's per-label group counts now match the To-triage recommendations count.
+- **Default jobs Enable button shows only when it can act ([#746](https://github.com/vtmocanu/uzi/pull/746)).**
+  The per-row Enable button now appears only when enabling is possible, replacing the dimmed, unactionable wall.
+- **Schedule edit modal Delete button no longer overlaps the footer at narrow width ([#743](https://github.com/vtmocanu/uzi/pull/743)).**
+  The Delete button and the footer summary no longer collide when the schedule edit modal is narrow.
+- **uzi TUI no longer panics on exit ([#751](https://github.com/vtmocanu/uzi/pull/751)).**
+  A stale detail load is dropped, so exiting the TUI board can no longer hit a nil-map panic.
 
 ## [0.66.3] - 2026-08-27
 
@@ -3403,7 +3429,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.66.3...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.67.0...HEAD
+[0.67.0]: https://github.com/vtmocanu/uzi/compare/v0.66.3...v0.67.0
 [0.66.3]: https://github.com/vtmocanu/uzi/compare/v0.66.2...v0.66.3
 [0.66.2]: https://github.com/vtmocanu/uzi/compare/v0.66.1...v0.66.2
 [0.66.1]: https://github.com/vtmocanu/uzi/compare/v0.66.0...v0.66.1
