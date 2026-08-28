@@ -42,9 +42,10 @@ var knownRunEventTypes = map[string]struct{}{
 }
 
 // knownRunStatuses is closed because the database enforces it: runs.status carries a
-// CHECK constraint over exactly these TEN values (runs_status_check, declared inline
+// CHECK constraint over exactly these ELEVEN values (runs_status_check, declared inline
 // in 00020_workers_runs.sql, widened with 'limit_wait' by PRD #35, with
-// 'awaiting_input' by PRD #88, and with 'awaiting_followup' by PRD #517). A value
+// 'awaiting_input' by PRD #88, with 'awaiting_followup' by PRD #517, and with
+// 'pool_wait' by PRD #754). A value
 // outside the set cannot be stored, so one
 // arriving on the wire means the server is newer than this binary — which is precisely
 // when it must not be trusted to mean "active".
@@ -81,9 +82,10 @@ var knownRunStatuses = map[string]struct{}{
 	// limit_wait (PRD #35): parked until the owner's Anthropic usage window reopens.
 	// awaiting_input (PRD #88): parked on a clarification question the owner must
 	// answer. awaiting_followup (PRD #517): an interactive task run kept alive after
-	// signal_done to iterate conversationally. ALL THREE are NON-terminal and are
-	// deliberately absent from terminalRunStatuses below.
-	"limit_wait": {}, "awaiting_input": {}, "awaiting_followup": {},
+	// signal_done to iterate conversationally. pool_wait (PRD #754): an auto run held
+	// while its token pool is empty, resumed when a token is pooled. ALL FOUR are
+	// NON-terminal and are deliberately absent from terminalRunStatuses below.
+	"limit_wait": {}, "awaiting_input": {}, "awaiting_followup": {}, "pool_wait": {},
 	"completed": {}, "failed": {}, "cancelled": {},
 }
 

@@ -788,7 +788,7 @@ describe("WorkersSettings token binding (PRD #104)", () => {
   // console-key is POOLED, and that is a correction rather than a detail. Two tests
   // below assert that an auto worker reads as auto-selecting — and with an entirely
   // un-pooled fixture that copy is now (correctly) suppressed by web-ux F18's guard,
-  // because such a worker resolves pool_empty on every claim and spends the default.
+  // because such a worker HOLDS every claim in pool_wait rather than spending the default.
   // The old fixture made those tests assert the misleading string; pooling one token
   // restores what they were actually about, which is the auto MODE's rendering.
   const twoTokens = [
@@ -970,12 +970,12 @@ describe("WorkersSettings auto-mode over an empty pool (web-ux F18)", () => {
       workers: [aWorker({ anthropic_bind_mode: "auto" })],
     });
     renderPage();
-    // Every claim resolves pool_empty and spends the owner's default. Saying
-    // "auto-selects from your token pool" here is R7's silent no-op moved up one
+    // Every claim HOLDS in pool_wait rather than spending the owner's default (#754).
+    // Saying "auto-selects from your token pool" here is R7's silent no-op moved up one
     // level, on the surface where the choice is actually made.
     // Matched on ONE text node: `token pool` is a <Link>, so the sentence is split
     // across elements and a regex spanning them finds nothing.
-    expect(await screen.findByText(/is empty — its runs spend your default token/i)).toBeTruthy();
+    expect(await screen.findByText(/is empty — its runs will hold until you add a token/i)).toBeTruthy();
   });
 
   it("says it auto-selects once ONE token is pooled", async () => {
@@ -1034,7 +1034,7 @@ describe("WorkersSettings auto-mode over an empty pool (web-ux F18)", () => {
     mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({ anthropic_bind_mode: "default" })] });
     renderPage();
     expect(await screen.findByText(/spends your default token/i)).toBeTruthy();
-    expect(screen.queryByText(/is empty — its runs spend/i)).toBeNull();
+    expect(screen.queryByText(/is empty — its runs will hold/i)).toBeNull();
   });
 
   // F18's other half. A correct row summary beside a cheerful announcement would
@@ -1053,15 +1053,17 @@ describe("WorkersSettings auto-mode over an empty pool (web-ux F18)", () => {
     // string no user label can collide with.
     fireEvent.change(picker, { target: { value: "\u0000auto" } });
     await waitFor(() => {
-      expect(screen.getByText(/token pool is empty, so its runs spend your default token/i)).toBeTruthy();
+      expect(
+        screen.getByText(/token pool is empty, so its runs will hold until you add a token/i),
+      ).toBeTruthy();
     });
     // 🔴 AND IT IS AMBER, NOT GREEN. F18 made the two channels agree in WORDS and left
     // them disagreeing in COLOUR: the row span was text-warn while the announcement
     // went through one unconditional success Alert, so a GREEN banner read "your token
-    // pool is empty, so its runs spend your default token". That is the same category
-    // error one level down from the one F18 fixed, and this file's own argument is
-    // that the visible and the announced must not disagree.
-    const banner = screen.getByText(/token pool is empty, so its runs spend your default token/i);
+    // pool is empty, so its runs will hold until you add a token to the pool". That is
+    // the same category error one level down from the one F18 fixed, and this file's own
+    // argument is that the visible and the announced must not disagree.
+    const banner = screen.getByText(/token pool is empty, so its runs will hold until you add a token/i);
     expect(banner.className, "a success-toned banner cannot carry a warning").toMatch(/text-warn\b/);
     expect(banner.className).not.toMatch(/text-ok\b/);
   });

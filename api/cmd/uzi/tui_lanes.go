@@ -335,7 +335,13 @@ func crewStateFor(runStatus, runHealth, actor, activeActor string, lastActivity,
 	// waiting rung: a follow-up park routinely outlasts the recency window (it waits on a
 	// human), and reading it as `idle` or `stalled` would both be wrong for the same
 	// reasons the two parks above are.
-	if runStatus == "awaiting_approval" || runStatus == "awaiting_input" || runStatus == "awaiting_followup" || runStatus == statusLimitWait || runHealth == "waiting_worker" {
+	// pool_wait (PRD #754) is an auto run HELD on an empty token pool. It rides this same
+	// waiting rung for the identical reasons as limit_wait: a hold routinely outlasts the
+	// recency window (so the split below would wrongly read `idle`), and health cannot be
+	// revisited on a held run (ListActiveRunsForHealth is a positive allowlist that omits
+	// it), so the active-speaker rung would read a FROZEN flag as `stalled`. One rung
+	// placed high fixes both.
+	if runStatus == "awaiting_approval" || runStatus == "awaiting_input" || runStatus == "awaiting_followup" || runStatus == statusLimitWait || runStatus == statusPoolWait || runHealth == "waiting_worker" {
 		return crewWaiting
 	}
 	if activeActor != "" && actor == activeActor {

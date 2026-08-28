@@ -1380,6 +1380,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// (foreign run → 404) and QUEUED-ONLY (non-queued → 409); no token spend, no
 				// forge write, no status touch.
 				r.Patch("/{id}/priority", h.SetRunPriority)
+				// Manually resume ONE run held in pool_wait (PRD #754 M5), for when the
+				// owner does not want to wait for the reactive sweeper to notice a token
+				// pooled. RequireUser so the `uzi run resume-now` CLI verb (a uzc_ Bearer)
+				// can reach it — NOT the cookie+CSRF RequireAuth group. Owner-scoped
+				// (foreign run → 404) and POOL_WAIT-ONLY (non-held → 409); it only flips the
+				// hold to queued, so no token spend and no forge write.
+				r.Post("/{id}/resume-now", h.ResumeRunNow)
 			})
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))

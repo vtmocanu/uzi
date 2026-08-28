@@ -473,6 +473,10 @@ var wantRouteMounts = []routeMount{
 	// forge write, mirroring CreateRunInput's posture.
 	{"POST", "/api/runs/{id}/dispatch", noLimiter},
 	{"POST", "/api/runs/{id}/rejudge", limJudge},
+	// Manually resume a pool_wait hold (PRD #754 M5): one owner-scoped, pool_wait-only
+	// UPDATE of runs (status → queued), no token spend, no forge write → noLimiter,
+	// mirroring the priority verb's posture.
+	{"POST", "/api/runs/{id}/resume-now", noLimiter},
 	{"POST", "/api/runs/{id}/review/recommendations/{recID}/issue", limForge},
 	{"POST", "/api/skills/", noLimiter},
 	{"POST", "/api/skills/{id}/reset", noLimiter},

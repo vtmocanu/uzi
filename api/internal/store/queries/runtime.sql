@@ -979,6 +979,12 @@ WHERE runs.id = @id AND worker_id = @worker_id
   -- is what makes THIS statement dangerous.
   -- Resume is unaffected: a promoted run is 'claimed' when the worker reports running.
   AND status <> 'limit_wait'
+  -- pool_wait is the SAME shape of park (PRD #754 M5): now that it is resumable, a
+  -- reordered pre-hold `running` report must not un-hold a run the same way it must not
+  -- un-park a limit_wait one. The negative predicate above admits it, so it is excluded
+  -- explicitly here alongside limit_wait — a held run resumes only via the server-side
+  -- promote (reactive or resume-now), which lands it at 'queued' before the worker reports.
+  AND status <> 'pool_wait'
   AND (status <> 'awaiting_approval' OR EXISTS (
         SELECT 1 FROM run_user_inputs
         WHERE run_user_inputs.run_id = @id
@@ -1203,7 +1209,14 @@ WHERE id = @id AND worker_id = @worker_id
   -- TestSetRunAwaitingApprovalClearsOpenQuestionLiveDB, because the pre-run park can
   -- then never reach the plan gate at all — it wedges every pre-run clarification
   -- permanently. Do not add it.
-  AND status <> 'limit_wait';
+  --
+  -- pool_wait IS excluded (PRD #754 M5), on the same reasoning as limit_wait above and
+  -- UNLIKE awaiting_input: a held run's only exit is a server-side promote to 'queued', so
+  -- a re-delivered gate report must not flip it to awaiting_approval. The awaiting_input
+  -- argument (its legitimate pre-run path passes THROUGH awaiting_approval) does not apply
+  -- to a held run, which never gates.
+  AND status <> 'limit_wait'
+  AND status <> 'pool_wait';
 
 -- name: ClearRunRequiredCapabilities :execrows
 -- PRD #84 M4 (unit 4c): the user override ("run without the capability", Decision 12).
@@ -1742,7 +1755,13 @@ WHERE id = @id
   -- exposed the day someone relaxes it. An auto-stopped park would be wrong on the
   -- merits — its message writes have STOPPED (the worker parked after signal_done,
   -- awaiting a follow-up), not looped — so this is the SQL backstop for that day.
-  AND status <> 'awaiting_followup';
+  AND status <> 'awaiting_followup'
+  -- pool_wait (PRD #754 M5) is the fourth park and the same argument transfers verbatim: a
+  -- held run's writes have STOPPED (the worker parked on an empty pool, awaiting a pooled
+  -- token), not looped, so auto-stopping one would be wrong on the merits. It is excluded
+  -- today only by autostop.go's single `if run.Status != "running"` line, unmentioned in
+  -- that line's comment, and exposed the day someone relaxes it — so this is its SQL backstop.
+  AND status <> 'pool_wait';
 
 -- name: RejectRunServerSide :execrows
 -- Server-side plan rejection → failed → origin restore → stamp. stop_kind is
@@ -1805,6 +1824,99 @@ UPDATE runs SET status = 'queued', status_since = now(),
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND status = 'claimed';
+
+-- name: SetRunPoolWait :execrows
+-- Hold an `auto` run whose token pool is genuinely empty (PRD #754 M4). claimed →
+-- pool_wait, NON-TERMINAL and NON-LOCKING: the run keeps its worker_id affinity, and
+-- M5 resumes it (reactively when a token is pooled, or manually). This REPLACES M2's
+-- interim requeue (RequeueClaimedRunToQueued on errAutoPoolEmpty): the auto lane must
+-- never spend the non-pooled owner default and must not hard-fail a holdable run, so
+-- a distinct status is the hold rather than churning the queue.
+--
+-- 🔴 THE SOURCE GUARD IS POSITIVE (status = 'claimed'), like SetRunLimitWait's
+-- status='running' and unlike the negative sibling guards above. A held run only ever
+-- comes from a JUST-CLAIMED run in assembleClaim (recoverClaimAssembly runs on the
+-- claim path, before the worker starts), so 'claimed' is the only legitimate source.
+-- Every other transition is a 0-row no-op, so a re-delivered or out-of-order report
+-- cannot re-hold a run that a concurrent path already advanced. kind <> 'judge'
+-- mirrors SetRunLimitWait: a judge never holds (Decision 14).
+--
+-- 🔴 THIS IS NOT A USAGE PARK (PRD Decision 9). An empty pool is not a usage-limit
+-- event, so the limit-wait budget must be untouched: limit_wait_count is NOT bumped,
+-- and limit_resets_at / retry_not_before / rate_limit_type are NOT set. Folding an
+-- empty-pool hold into the usage-limit machinery would let a pooling gap consume the
+-- RUN_LIMIT_MAX_WAITS budget a genuine limit event needs.
+--
+-- limit_dead_secret_id is LEFT AS-IS (deliberately not cleared): M3's exclude-relax
+-- reads it on resume to know which just-parked credential's window is still closed, so
+-- clearing it here would lose the exclusion across the hold.
+--
+-- started_at = NULL so a later resume gets a FRESH RUN_TIMEOUT wall (Decision 6d, same
+-- as PromoteLimitWaitRuns): without it SweepRunningTimeout would measure the resumed
+-- run against a started_at from before a hold that may have lasted a long time.
+--
+-- Health reset (health='ok', health_reason=NULL, health_since=NULL) exactly as
+-- SetRunLimitWait does: ListActiveRunsForHealth is a POSITIVE allowlist that never
+-- revisits a held run, so whatever flag was live at hold time would freeze for the
+-- whole hold with nothing to clear it. The DISTINCT STATUS is the signal — do NOT
+-- write a human sentence into health_reason (that would break the detector's
+-- single-writer invariant; the UI/CLI render the "add a token to the pool" copy as
+-- fixed text keyed on the status). worker_id is kept for resume affinity.
+UPDATE runs SET
+    status       = 'pool_wait',
+    status_since = now(),
+    started_at   = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at   = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND status = 'claimed'
+  AND kind <> 'judge';
+
+-- name: ListPoolWaitRuns :many
+-- The reactive-resume worklist (PRD #754 M5): every run currently held in pool_wait,
+-- oldest first (status_since ASC), so the reactive pass promotes the LONGEST-waiting
+-- run of each owner first. The sweeper groups the result by user_id and, for a user
+-- whose token pool is now non-empty, promotes exactly the first (oldest) held run it
+-- sees for that user — the anti-stampede stagger lives in Go, not here.
+--
+-- Backed by the partial index idx_runs_pool_wait (`ON runs (status_since) WHERE
+-- status = 'pool_wait'`, migration 00166), so this is an index scan of only the held
+-- subset — never a sequential scan of the whole (unbounded) runs table — and the
+-- oldest-first ORDER BY is index-ordered. The held set is expected to be tiny (a run
+-- holds only while an auto owner's whole pool is genuinely empty, a transient state M5
+-- resumes out of); the index mirrors limit_wait's idx_runs_limit_wait_retry.
+SELECT id, user_id, status_since FROM runs
+WHERE status = 'pool_wait'
+ORDER BY status_since ASC;
+
+-- name: PromotePoolWaitRun :execrows
+-- Owner-scoped promote of ONE held run: pool_wait → queued (PRD #754 M5). Used by BOTH
+-- the reactive sweeper pass (which passes the run's own user_id) and the manual
+-- `uzi run resume-now` verb (which passes the authenticated caller's id) — the
+-- user_id predicate is what makes resume-now unable to promote a foreign run, and what
+-- scopes the reactive pass to the run it selected for that user.
+--
+-- Field handling mirrors PromoteLimitWaitRuns: started_at = NULL so the resumed run gets
+-- a FRESH RUN_TIMEOUT wall (Decision 6d) — without it SweepRunningTimeout would measure
+-- the resume against a started_at from before a hold that may have lasted a long time, and
+-- fail it on its first tick back. Health is reset (health='ok'/NULL/NULL) because the
+-- detector's allowlist includes 'queued', so it re-evaluates from this transition's fresh
+-- status_since rather than inheriting a flag that froze at hold time (ListActiveRunsForHealth
+-- never revisited the held run to clear it). session_id, last_seq and worker_id are left
+-- intact for resume affinity, exactly as PromoteLimitWaitRuns leaves them.
+--
+-- 🔴 THE SOURCE GUARD IS POSITIVE (status = 'pool_wait'): a run that is not currently held
+-- is a 0-row no-op, which is exactly what lets resume-now's handler tell "not held" (409)
+-- apart from "not yours / absent" (404) by re-reading the run after a 0-row result. The
+-- status predicate also makes a re-delivered or racing promote inert once the run has moved.
+UPDATE runs SET
+    status       = 'queued',
+    status_since = now(),
+    started_at   = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at   = now()
+WHERE id = @id AND user_id = @user_id
+  AND status = 'pool_wait';
 
 -- name: SweepRunningTimeout :many
 -- running past RUN_TIMEOUT → failed (a hung agent is failed without a human).

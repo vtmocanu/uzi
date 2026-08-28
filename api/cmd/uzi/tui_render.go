@@ -238,6 +238,11 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool) (glyph, 
 		return "➤", "follow-up"
 	case statusLimitWait:
 		return "~", "rate-limited"
+	case statusPoolWait:
+		// PRD #754: an auto run held on an empty token pool. Same wait-family glyph as
+		// limit_wait (both are non-terminal holds), distinct word so a user can tell the
+		// two apart at a glance.
+		return "~", "pool wait"
 	case "completed":
 		return "✓", "done"
 	case "failed":
@@ -266,7 +271,9 @@ func (p palette) stateColor(status, health string, isPlanning, isRevising bool) 
 	case "awaiting_approval", "awaiting_input", "awaiting_followup":
 		// awaiting_followup (PRD #517) is a needs-you park like the other two: amber.
 		return p.amber
-	case statusLimitWait:
+	case statusLimitWait, statusPoolWait:
+		// pool_wait (PRD #754) is a non-terminal hold like limit_wait, so it shares the
+		// wait colour — the glyph word distinguishes them, not the ink.
 		return p.wait
 	case "failed":
 		return p.alarm

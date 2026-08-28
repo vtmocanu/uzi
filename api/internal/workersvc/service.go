@@ -11,7 +11,6 @@
 package workersvc
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -463,6 +462,12 @@ type Store interface {
 	// second park.
 	SetRunLimitWait(ctx context.Context, arg store.SetRunLimitWaitParams) (int64, error)
 	PromoteLimitWaitRuns(ctx context.Context, now pgtype.Timestamptz) ([]store.PromoteLimitWaitRunsRow, error)
+	// The reactive-resume pass (PRD #754 M5): ListPoolWaitRuns is the pool_wait worklist
+	// (oldest first), and PromotePoolWaitRun promotes ONE held run (pool_wait → queued),
+	// owner-scoped so the sweeper passes each run's own user_id and resume-now cannot
+	// promote a foreign run.
+	ListPoolWaitRuns(ctx context.Context) ([]store.ListPoolWaitRunsRow, error)
+	PromotePoolWaitRun(ctx context.Context, arg store.PromotePoolWaitRunParams) (int64, error)
 	MarkRunFailedByID(ctx context.Context, arg store.MarkRunFailedByIDParams) (int64, error)
 	CancelRunServerSide(ctx context.Context, arg store.CancelRunServerSideParams) (int64, error)
 	// CancelRunByWorker is the LIVE-worker cancel transition (PRD #503 M1). SetState's
@@ -483,6 +488,18 @@ type Store interface {
 	// RequeueClaimedRunToQueued resets one just-claimed run to queued when its
 	// owner's vault locked between the claim gate and the token open (PRD #32 M3).
 	RequeueClaimedRunToQueued(ctx context.Context, id uuid.UUID) (int64, error)
+	// SetRunPoolWait holds one just-claimed `auto` run whose token pool is genuinely
+	// empty (PRD #754 M4). claimed → pool_wait, a non-locking hold; positive source
+	// guard (status='claimed'), keeps worker_id for affinity, and does NOT touch the
+	// usage-limit budget (an empty pool is not a usage park). M5 resumes it.
+	SetRunPoolWait(ctx context.Context, arg store.SetRunPoolWaitParams) (int64, error)
+	// HasActiveRunForIssue reports whether the issue already has a non-terminal run.
+	// CreateRun uses it as the manual-path dedup pre-check that replaces the
+	// uq_runs_one_active_per_issue index for pool_wait runs (PRD #754 M4 Decision 8):
+	// the index no longer counts a held run as active, so the structural backstop it
+	// gave the manual/board/Slack path is restored here (this SELECT still counts
+	// pool_wait as active).
+	HasActiveRunForIssue(ctx context.Context, arg store.HasActiveRunForIssueParams) (bool, error)
 	SweepRunningTimeout(ctx context.Context, arg store.SweepRunningTimeoutParams) ([]store.SweepRunningTimeoutRow, error)
 	FailRunsOfStaleWorkersOverCap(ctx context.Context, arg store.FailRunsOfStaleWorkersOverCapParams) ([]store.FailRunsOfStaleWorkersOverCapRow, error)
 	RequeueRunsOfStaleWorkers(ctx context.Context, arg store.RequeueRunsOfStaleWorkersParams) ([]store.RequeueRunsOfStaleWorkersRow, error)
@@ -1324,6 +1341,21 @@ func (s *Service) recoverClaimAssembly(ctx context.Context, run store.Run, err e
 			return rerr
 		}
 		return nil // idle; the run is queued again, awaiting unlock
+	case errors.Is(err, errAutoPoolEmpty):
+		// An auto claim with a genuinely empty pool must not spend the non-pooled default
+		// nor hard-fail (PRD #754). It is HELD in the non-locking pool_wait status (M4,
+		// replacing M2's interim requeue): SetRunPoolWait keeps worker_id for affinity,
+		// does not touch the usage-limit budget, and — unlike the requeue — does not churn
+		// the queue. The run is idle (nil payload) exactly as before; M5 adds the reactive
+		// + manual resume off pool_wait. Still "never spends the default, never hard-fails".
+		// Positive source guard (status='claimed'), so a re-delivered claim is a no-op.
+		if _, rerr := s.q.SetRunPoolWait(ctx, store.SetRunPoolWaitParams{
+			ID:       run.ID,
+			WorkerID: run.WorkerID,
+		}); rerr != nil {
+			return rerr
+		}
+		return nil // idle; the run is held in pool_wait, awaiting a pooled token
 	case errors.Is(err, errCredentialUnavailable) || errors.Is(err, errToolPackagesRejected) || errors.Is(err, errGuardrailBlockedClaim):
 		// A guardrail block at claim (D1 layer 3) is TERMINAL — fail-closed even on a
 		// forge blip (R4; the user restarts after fixing protection), matching
@@ -1383,6 +1415,15 @@ var errGuardrailBlockedClaim = errors.New("run refused by the default-branch gua
 // queued to be retried after the next unlock (PRD #32 success criteria 3 & 5).
 var errVaultLocked = errors.New("vault locked during claim")
 
+// errAutoPoolEmpty marks an auto claim that found genuinely nothing pooled to spend:
+// an empty pool, or a resuming run whose only pooled token is the excluded dead
+// credential (#754 M2). The auto lane must NEVER spend the non-pooled owner default,
+// and it must NOT hard-fail a run for a transient/holdable condition — so this is
+// HOLDABLE like errVaultLocked, and recoverClaimAssembly HOLDS the run in the
+// non-locking pool_wait status (PRD #754 M4, via SetRunPoolWait) rather than failing
+// it — M5 resumes it reactively or manually. Its message carries no secret bytes.
+var errAutoPoolEmpty = errors.New("auto pool is empty")
+
 // claimCred is the concrete Anthropic credential ONE claim spends: the identity to
 // record on the run, the label to snapshot alongside it, and the plaintext to ship
 // in the claim payload. It exists because openAnthropic used to hand back only
@@ -1432,15 +1473,28 @@ type secretChoice struct {
 	headroom *int16
 }
 
-// autoPicked reports whether the SELECTOR named this credential, as opposed to a
-// binding or a fallback. It is the precise gate on D14's retry: only a credential
-// auto chose gets a second attempt on the owner default, because only auto has an
-// alternative the user did not ask for. A pinned worker or a judge binding that will
-// not open must still fail terminally — the user named that credential, and silently
-// billing a different one is the R4 failure this PRD is otherwise built to avoid.
-func (c secretChoice) autoPicked() bool {
+// autoLaneRetryable reports whether a credential the AUTO lane resolved and then
+// failed to open earns ONE floor-retry onto ANOTHER pooled token (D14, reshaped by
+// #754 M2). It is the precise gate on that retry, and it covers the three auto-lane
+// picks that have a pooled alternative to fall to:
+//
+//   - a selector pick (auto / best_of_pool), and
+//   - a floor pick (pool_stale) — #754 made the floor a real pooled spend, so a
+//     floored token that will not open must ALSO get one retry onto the next pooled
+//     token rather than dying terminally on the first undecryptable row.
+//
+// It deliberately EXCLUDES open_failed, which is the reason autoFloorRetry itself
+// records: a second open failure therefore fails this gate on its REASON conjunct and
+// is terminal by STRUCTURE — no counter, and no dependency on an invariant enforced
+// three files away. It also excludes pinned / default / judge: the user named those
+// credentials, and silently billing a different one is the R4 failure this PRD is
+// otherwise built to avoid. The nil-secretID guard keeps the empty-pool hold
+// (errAutoPoolEmpty, which never reaches an open) out of the retry entirely.
+func (c secretChoice) autoLaneRetryable() bool {
 	return c.secretID != nil &&
-		(c.reason == string(autoselect.ReasonAuto) || c.reason == string(autoselect.ReasonBestOfPool))
+		(c.reason == string(autoselect.ReasonAuto) ||
+			c.reason == string(autoselect.ReasonBestOfPool) ||
+			c.reason == string(autoselect.ReasonPoolStale))
 }
 
 // staticChoice names the mode that produced a claim's secretID override for the two
@@ -1681,12 +1735,46 @@ func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store
 		return staticChoice(id, selectReasonJudge), nil
 	}
 	if wkr.AnthropicBindMode == BindModeAuto {
-		return s.autoChoice(ctx, wkr, run)
+		return s.autoChoice(ctx, run)
 	}
 	return staticChoice(workerSecretID(wkr), selectReasonPinned), nil
 }
 
-// autoChoice runs the selector for an `auto` worker (PRD #111 M4).
+// claimExclude is the credential this claim must NOT resolve onto: the run's
+// just-parked dead credential (PRD #217), but only WHILE it is not yet due to retry.
+// retry_not_before is the run's retry CADENCE, not a proof the token's real Anthropic
+// window has reopened — decideLimitPark can set it below the true reset (Decision 6e
+// lowers it to a pooled alternative's availability; the report-less fallback is a
+// 15m-doubling guess, limitwait.go). So once retry_not_before has passed — which is
+// exactly what let PromoteLimitWaitRuns return the run to queued — the run is DUE for
+// another attempt, and #754 M3 relaxes the exclusion so the resume re-picks or floors
+// onto that very token instead of holding or switching accounts. That is how a
+// single-pooled-token user "continues on cristi": each cadence it re-floors onto the
+// token; if the window is genuinely still closed the worker re-parks with a fresh
+// real-reset report, and the thrash converges in ~one cycle (bounded overall by
+// RUN_LIMIT_MAX_WAITS, whose terminus is a failed run, not a mis-spend — the
+// deliberate #754 tradeoff). A run with no dead credential (every non-resume claim)
+// excludes nothing.
+//
+// The "still excluding" branch (a claimable run whose retry_not_before is still in the
+// future) is DEFENSIVE: limit_wait's only production exit is PromoteLimitWaitRuns at
+// retry_not_before <= now, so no normal resume reaches this function with a future
+// stamp. It is kept because excluding is the safe answer should any future transition
+// ever hand a not-yet-due run to the claim path, and the M2 exclusion tests inject a
+// future stamp to exercise it.
+func (s *Service) claimExclude(run store.Run) uuid.UUID {
+	if !run.LimitDeadSecretID.Valid {
+		return uuid.Nil
+	}
+	// Window still closed → keep excluding. Relax (Nil) once it has reopened, and also
+	// when there is no reset stamp to wait on (nothing says the window is closed).
+	if run.RetryNotBefore.Valid && run.RetryNotBefore.Time.After(s.now()) {
+		return uuid.UUID(run.LimitDeadSecretID.Bytes)
+	}
+	return uuid.Nil
+}
+
+// autoChoice runs the selector for an `auto` worker (PRD #111 M4, #754 M2).
 //
 // It is BEHIND claimSecretID, never beside it. PRD #104's R4 is that three copies of
 // credential resolution drift and a wrong fallback spends the wrong account silently;
@@ -1704,39 +1792,38 @@ func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store
 // nothing. The run is retried; a silent mis-spend is not retried, because nobody
 // learns it happened.
 //
-// A fallback (pool_empty / pool_stale) resolves workerSecretID(wkr), which for an
-// auto worker is nil ⇒ the owner's default (D9). It is written as the CALL rather
-// than as a literal nil so the rule stated in workerSecretID stays the single source
-// of what "this worker's non-auto binding" means — the current answer happens to be
-// nil for every auto worker, and the rule is what survives the next mode.
+// # The pooled-only invariant (#754)
 //
-// # The dead-credential exclusion (PRD #217 M2), on BOTH exits
+// An auto worker NEVER spends a non-pooled credential — the owner default is NOT
+// auto-eligible unless the user pooled it, and an auto lane that quietly bills it is
+// the exact bug #754 fixes. That reshapes the old D7 fallback (which resolved
+// workerSecretID(wkr) ⇒ the owner default) into a three-rung ladder, every rung of
+// which stays inside the pool:
 //
-// When this run is resuming from a usage-limit park, runs.limit_dead_secret_id names
-// the credential it just parked on and this claim must not re-pick it. `exclude`
-// carries that id (uuid.Nil when there is nothing to exclude — every non-resume
-// claim).
+//   - Ranking exit (out.Picked): the selector named a measurable pooled token. Record
+//     it with its reason and measured headroom. `exclude` (the run's just-parked
+//     dead credential, PRD #217 M2) is passed to Select, which drops it from the
+//     ranking so it can be neither picked nor the anchor.
+//   - Floor (out not Picked, but a pooled token remains): the pool has tokens but none
+//     is measurable — a measurable one would have been Picked as best_of_pool — so
+//     autoselect.Floor spends the best pooled token anyway (stale/unmeasured
+//     included), recorded as pool_stale with no headroom. Floor honours `exclude`
+//     exactly as Select does, so the dead credential is never floored onto.
+//   - Empty-pool hold (Floor.ok == false): there is genuinely nothing pooled to spend
+//     — an empty pool, or the only pooled token is the excluded dead credential. Do NOT
+//     spend the non-pooled default and do NOT hard-fail; signal errAutoPoolEmpty, which
+//     recoverClaimAssembly holds in the non-locking pool_wait status (PRD #754 M4) so
+//     the run waits rather than billing an account the user did not pool.
 //
-//   - Ranking exit: `exclude` is passed to Select, which drops the dead credential
-//     from the ranking so it can be neither picked nor the anchor.
-//   - Fallback exit (!out.Picked): Select never named a pick, so the exclusion has to
-//     be applied to what the fallback would RESOLVE. This branch is CONDITIONAL, and
-//     the reason is D7/SC4: auto never fails a run. workerSecretID(wkr) is nil for an
-//     auto worker ⇒ the owner default, which for a single-token user IS the dead
-//     credential — so an unconditional "refuse the excluded credential" would leave a
-//     single-token run with nothing to spend. The rule is therefore: exclude the dead
-//     credential ONLY when a DIFFERENT credential can actually be resolved; otherwise
-//     spend the dead one, because a run that cannot be placed must still run. Resolving
-//     what the fallback would spend costs a fetch (GetDefaultUserSecretMeta) when the
-//     binding is nil, because secretChoice{secretID: nil} does not NAME a credential —
-//     it is the same query openAnthropic resolves the nil case with, so the two agree
-//     on which id "the owner default" means.
-func (s *Service) autoChoice(ctx context.Context, wkr store.Worker, run store.Run) (secretChoice, error) {
+// Floor.ok, not Select's PoolNonEmpty, decides floor-vs-hold: they diverge in the
+// excluded-sole-token case (PoolNonEmpty counts before the exclude skip, Floor.ok
+// after), and the credential we may actually spend NOW is Floor's question.
+func (s *Service) autoChoice(ctx context.Context, run store.Run) (secretChoice, error) {
 	userID := run.UserID
-	exclude := uuid.Nil
-	if run.LimitDeadSecretID.Valid {
-		exclude = uuid.UUID(run.LimitDeadSecretID.Bytes)
-	}
+	// exclude comes from claimExclude (window-aware): the just-parked dead credential
+	// while its window is still closed, uuid.Nil once retry_not_before has reopened it
+	// (#754 M3 exclude-relax) or when there is no dead credential.
+	exclude := s.claimExclude(run)
 
 	rows, err := s.q.ListAutoSelectCandidates(ctx, userID)
 	if err != nil {
@@ -1747,76 +1834,63 @@ func (s *Service) autoChoice(ctx context.Context, wkr store.Worker, run store.Ru
 		cands = append(cands, autoselectrow.FromCandidateRow(row))
 	}
 	out := autoselect.Select(cands, exclude, s.p.Autoselect, s.now())
-	if !out.Picked {
-		// D7: auto never fails a run. An empty or unmeasurable pool resolves the
-		// worker's non-auto behaviour and records WHY, so "auto was on and I still got
-		// the default" is a fact the run view states rather than one a user infers.
-		base := workerSecretID(wkr)
-		if exclude == uuid.Nil {
-			return secretChoice{secretID: base, reason: string(out.Reason)}, nil
-		}
-		// Resolve what `base` would actually spend so it can be compared against the
-		// exclusion. A nil binding is the owner default, resolved with the SAME query
-		// openAnthropic uses for the nil case.
-		resolved := base
-		if resolved == nil {
-			meta, err := s.q.GetDefaultUserSecretMeta(ctx, store.GetDefaultUserSecretMetaParams{
-				UserID: userID,
-				Kind:   store.KindAnthropicToken,
-			})
-			if err != nil {
-				// No default at all (ErrNoRows) means there is nothing to compare the
-				// exclusion against: fall through to spending `base`, which the token-less
-				// user's claim already fails downstream with its existing reason. Do NOT
-				// fail the claim here (D7).
-				if errors.Is(err, pgx.ErrNoRows) {
-					return secretChoice{secretID: base, reason: string(out.Reason)}, nil
-				}
-				return secretChoice{}, fmt.Errorf("resolve owner default for dead-credential exclusion: %w", err)
-			}
-			id := meta.ID
-			resolved = &id
-		}
-		if *resolved == exclude {
-			// The fallback would spend the very credential this run just parked on. Pick a
-			// deterministic alternative — the auto-eligible candidate with the lowest
-			// secret-id bytes that is not the excluded one — so the choice is stable across
-			// claims and testable. Restricted to AutoEligible: never spend a token the user
-			// kept out of auto.
-			if alt, ok := lowestAltCandidate(cands, exclude); ok {
-				return secretChoice{secretID: &alt, reason: string(out.Reason)}, nil
-			}
-		}
-		// `resolved` differs from the exclusion, or no alternative exists: spend the
-		// default (SC4 — auto never fails a run).
-		return secretChoice{secretID: base, reason: string(out.Reason)}, nil
+	if out.Picked {
+		id := out.SecretID
+		// The gauge is a SMALLINT 0..100 and headroom is derived from it by subtraction,
+		// so the value is in range by construction and the narrowing cannot truncate.
+		// runs.anthropic_headroom_pct carries a CHECK BETWEEN 0 AND 100 as the backstop.
+		h := int16(out.Headroom)
+		return secretChoice{secretID: &id, reason: string(out.Reason), headroom: &h}, nil
 	}
-	id := out.SecretID
-	// The gauge is a SMALLINT 0..100 and headroom is derived from it by subtraction,
-	// so the value is in range by construction and the narrowing cannot truncate.
-	// runs.anthropic_headroom_pct carries a CHECK BETWEEN 0 AND 100 as the backstop.
-	h := int16(out.Headroom)
-	return secretChoice{secretID: &id, reason: string(out.Reason), headroom: &h}, nil
+	// NOT picked. The auto lane NEVER resolves the non-pooled owner default (#754).
+	// Floor spends the best pooled token — always unmeasured here, since a measurable
+	// one would have been Picked as best_of_pool — recorded as pool_stale, no headroom.
+	if floorID, ok := autoselect.Floor(cands, exclude, s.now()); ok {
+		id := floorID
+		return secretChoice{secretID: &id, reason: string(autoselect.ReasonPoolStale)}, nil
+	}
+	// Genuinely nothing pooled to spend (empty pool, or the only pooled token is the
+	// excluded dead credential). Do NOT spend the default and do NOT hard-fail — signal
+	// an empty-pool hold that recoverClaimAssembly holds in pool_wait (PRD #754 M4).
+	return secretChoice{}, errAutoPoolEmpty
 }
 
-// lowestAltCandidate returns the auto-eligible candidate with the lowest secret-id
-// bytes that is NOT the excluded credential (PRD #217 M2's conditional fallback). The
-// lowest-bytes rule is a total order over ids that are unique per row, so the pick is
-// deterministic across claims — which is what makes it assertable in a test — and
-// mirrors tieLess's final leg in autoselect. AutoEligible-only: the fallback must
-// never spend a token the user excluded from the auto pool.
-func lowestAltCandidate(cands []autoselect.Candidate, exclude uuid.UUID) (uuid.UUID, bool) {
-	var best uuid.UUID
-	found := false
-	for _, c := range cands {
-		if !c.AutoEligible || c.SecretID == exclude {
-			continue
-		}
-		if !found || bytes.Compare(c.SecretID[:], best[:]) < 0 {
-			best, found = c.SecretID, true
-		}
+// autoFloorRetry recomputes an auto credential after a picked (or floored) token
+// failed to open (D14, #754 M2). It re-lists the user's pooled candidates, drops
+// failedID (the token that just would not decrypt), and floors over the rest — still
+// honouring the run's just-parked dead credential — so an undecryptable pooled pick
+// falls to ANOTHER pooled token, NEVER the non-pooled owner default.
+//
+// It records reason=open_failed, which fails autoLaneRetryable, so a second open
+// failure is terminal by structure. Returns errCredentialUnavailable when no other
+// pooled token is available (terminal; the caller fails the run rather than spending
+// the default). A candidate-query error propagates as-is — a DB blip is not "the pool
+// is empty", the same reasoning autoChoice uses.
+func (s *Service) autoFloorRetry(ctx context.Context, run store.Run, failedID uuid.UUID) (secretChoice, error) {
+	// exclude comes from claimExclude (window-aware): the just-parked dead credential
+	// while its window is still closed, uuid.Nil once retry_not_before has reopened it
+	// (#754 M3 exclude-relax) or when there is no dead credential.
+	exclude := s.claimExclude(run)
+	rows, err := s.q.ListAutoSelectCandidates(ctx, run.UserID)
+	if err != nil {
+		return secretChoice{}, fmt.Errorf("auto-floor-retry candidates: %w", err)
 	}
-	return best, found
+	cands := make([]autoselect.Candidate, 0, len(rows))
+	for _, row := range rows {
+		c := autoselectrow.FromCandidateRow(row)
+		if c.SecretID == failedID {
+			continue // the pick that just failed to open must not be re-floored onto
+		}
+		cands = append(cands, c)
+	}
+	floorID, ok := autoselect.Floor(cands, exclude, s.now())
+	if !ok {
+		// No OTHER pooled token to spend — terminal. Never fall to the non-pooled
+		// default (#754); recoverClaimAssembly fails the run on errCredentialUnavailable.
+		return secretChoice{}, fmt.Errorf("%w: no other pooled Anthropic token after open failure", errCredentialUnavailable)
+	}
+	id := floorID
+	return secretChoice{secretID: &id, reason: string(autoselect.ReasonOpenFailed)}, nil
 }
 
 // workerSecretID is a worker's Anthropic binding as openAnthropic's override: nil
@@ -1923,33 +1997,39 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 	cred, err := s.openAnthropic(ctx, run.UserID, choice.secretID)
 	if err != nil {
-		// 🔴 D14. Without this arm, D7's "auto never fails a run" is simply untrue.
-		// recoverClaimAssembly maps errCredentialUnavailable to MarkRunFailedByID — a
-		// TERMINAL failure — so a token that passes the gauge gate and then will not
-		// decrypt (a rotated UZI_SECRET_KEY, a corrupt row, a token deleted between the
-		// ranking query and the open) kills a run the owner default would have
-		// completed. That is the optimizer newly failing runs that static binding
-		// finished, which is the one outcome D7 exists to forbid.
+		// 🔴 D14, reshaped by #754 M2. Without this arm, "auto never fails a run" is
+		// simply untrue. recoverClaimAssembly maps errCredentialUnavailable to
+		// MarkRunFailedByID — a TERMINAL failure — so a token that passes the gauge gate
+		// and then will not decrypt (a rotated UZI_SECRET_KEY, a corrupt row, a token
+		// deleted between the ranking query and the open) kills a run another POOLED
+		// token could have completed.
+		//
+		// #754: the retry NEVER lands on workerSecretID(wkr)/nil/the non-pooled owner
+		// default. autoFloorRetry re-floors onto ANOTHER pooled token (excluding the
+		// pick that just failed, and still honouring the run's dead-secret exclude); when
+		// no other pooled token remains it returns errCredentialUnavailable and the run
+		// fails terminally rather than spending the default.
 		//
 		// Scoped as tightly as it can be, on three axes:
-		//   - only a credential the SELECTOR named (choice.autoPicked) — a pinned or
-		//     judge binding that will not open still fails, because the user named it;
+		//   - only a credential the AUTO lane resolved (choice.autoLaneRetryable) — a
+		//     selector pick or a floor pick, never pinned/default/judge, which the user
+		//     named and whose failure is how they learn the token is broken;
 		//   - only errCredentialUnavailable. NOT errVaultLocked: that path already
 		//     requeues the run, which is transient and correct, and retrying it would
 		//     convert a wait into a spend on the wrong account;
-		//   - exactly ONCE, and the code is safer than the first version of this comment.
-		//     That version argued from the ID: the retry target is workerSecretID(wkr),
-		//     nil for an auto worker, so it cannot satisfy autoPicked. True, but it rests
-		//     on the `auto ⇒ id IS NULL` invariant, which a future third writer of
-		//     workers.anthropic_secret_id could break without touching this line. The
-		//     STRONGER reason, and the one that holds regardless: the retry sets
-		//     reason=open_failed, so autoPicked fails on its REASON conjunct whatever the
-		//     id turns out to be. The structure forbids a second round; no counter, and
-		//     no dependency on an invariant enforced three files away.
-		if !choice.autoPicked() || !errors.Is(err, errCredentialUnavailable) {
+		//   - exactly ONCE, by STRUCTURE. autoFloorRetry records reason=open_failed, which
+		//     fails autoLaneRetryable on its REASON conjunct whatever the id turns out to
+		//     be — so a second open failure is terminal with no counter and no dependency
+		//     on an invariant enforced three files away.
+		if !choice.autoLaneRetryable() || !errors.Is(err, errCredentialUnavailable) {
 			return nil, err
 		}
-		choice = secretChoice{secretID: workerSecretID(wkr), reason: string(autoselect.ReasonOpenFailed)}
+		// autoLaneRetryable guarantees a non-nil secretID; read it BEFORE overwriting.
+		failedID := *choice.secretID
+		choice, err = s.autoFloorRetry(ctx, run, failedID)
+		if err != nil {
+			return nil, err
+		}
 		cred, err = s.openAnthropic(ctx, run.UserID, choice.secretID)
 		if err != nil {
 			return nil, err
@@ -4662,6 +4742,26 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	if fixing > 0 {
 		return store.Run{}, ErrBranchInUse
 	}
+	// Manual-path dedup pre-check (PRD #754 M4 Decision 8). The uq_runs_one_active_per_issue
+	// index — the ONLY dedup the manual/board/Slack path had (it relies solely on the index
+	// catching 23505 → ErrActiveRunExists below) — now EXCLUDES pool_wait so a held run is
+	// non-locking. That would let a second manual start slip past the index while a run is
+	// held, so the gate is restored HERE for the issue kind: HasActiveRunForIssue still
+	// counts pool_wait as active (it is a `status NOT IN terminal` SELECT), and mirrors the
+	// poller's own pre-check (same repo_id, issue_iid params). Scoped to the index's
+	// kind='issue' domain — createRun is the issue-kind path, so this gate matches it and
+	// leaves ci_fix/chat/etc. ungated. It returns the SAME sentinel the index path returns,
+	// so a caller cannot tell which layer caught the duplicate.
+	active, err := s.q.HasActiveRunForIssue(ctx, store.HasActiveRunForIssueParams{
+		RepoID:   repoID,
+		IssueIid: pgtype.Int8{Int64: issueIID, Valid: true},
+	})
+	if err != nil {
+		return store.Run{}, err
+	}
+	if active {
+		return store.Run{}, ErrActiveRunExists
+	}
 	// PRD #381: snapshot the issue's human comments alongside the description. One
 	// extra forge round-trip, centralized here so every issue-backed origin (manual,
 	// autopilot, scheduled) captures it (D6) without rippling the Create*Run seam.
@@ -5671,7 +5771,13 @@ func (s *Service) hasLivePoller(ctx context.Context, run store.Run) (bool, error
 	// for its OTHER runs, so both conditions above are false and the cancel would be
 	// enqueued for a poller that is not polling this run and never will again. It
 	// would then sit unconsumed until the promotion pass, i.e. potentially for days.
-	if run.Status == "queued" || run.Status == "limit_wait" || !run.WorkerID.Valid {
+	//
+	// PRD #754 M4: pool_wait is HELD for the identical reason and so rides the same arm.
+	// A held run keeps its worker_id for affinity and its worker keeps heartbeating for
+	// other runs, but it is never polling this held run, so a cancel routed to a poller
+	// would sit unconsumed (worse than limit_wait — there is no promotion pass in M4).
+	// It must go server-side, so it must read as "no live poller" here too.
+	if run.Status == "queued" || run.Status == "limit_wait" || run.Status == "pool_wait" || !run.WorkerID.Valid {
 		return false, nil
 	}
 	wkr, err := s.q.GetWorkerByID(ctx, uuid.UUID(run.WorkerID.Bytes))
@@ -5712,6 +5818,11 @@ type SweepResult struct {
 	// partial index this reads covers only parked runs, a set that is empty on a
 	// healthy instance.
 	LimitPromoted int64
+	// PoolResumed is the number of runs this pass reactively resumed from pool_wait to
+	// queued because their owner's token pool became non-empty (PRD #754 M5). At most
+	// ONE per distinct held-run owner per tick (the anti-stampede stagger), so on a
+	// busy resume it climbs one owner at a time across ticks. Normally 0.
+	PoolResumed int64
 }
 
 // Sweep enforces the liveness rules the workers cannot: stale workers go offline
@@ -5861,6 +5972,15 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		s.publishSwept(r.ID, r.Status)
 	}
 
+	// Reactive pool resume (PRD #754 M5): a pool_wait hold is released the moment its
+	// owner's Anthropic token pool becomes non-empty again. Scoped to pool_wait ONLY —
+	// never folded into PromoteLimitWaitRuns, whose clock-based predicate is a different
+	// hold. Placed here for the same reason the limit promote is: transitions first, a
+	// run resumed before the detector runs is health-visible in THIS tick.
+	if res.PoolResumed, err = s.resumePoolWaitRuns(ctx); err != nil {
+		return res, fmt.Errorf("resume pool-wait runs: %w", err)
+	}
+
 	// Bound the in-process persistence-failure tracker (PRD #108 M4). This is the
 	// memory bound for the one case no other eviction path reaches: a run whose
 	// worker vanished without the run ever reaching terminal. Pruned BEFORE the
@@ -5881,6 +6001,89 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// belt-and-braces rather than the mechanism.
 	res.AutoStopped = s.autoStopWedgedRuns(ctx, now)
 	return res, nil
+}
+
+// resumePoolWaitRuns is the reactive half of the pool_wait lifecycle (PRD #754 M5): it
+// promotes held runs back to 'queued' once their owner's Anthropic token pool is
+// non-empty again. Returns the number promoted this tick and fans each out through
+// publishSwept, exactly like the limit promote above.
+//
+// 🔴 AT MOST ONE HELD RUN PER OWNER PER TICK. The live case had three runs held on one
+// user's single token; promoting all of them the instant a token pools would thundering-
+// herd that one credential — every resumed run would re-claim, and all but one would find
+// the pool empty again and re-hold, a churn the hold exists to avoid. So the pass promotes
+// only the OLDEST held run for each user with a now-non-empty pool, and lets the next tick
+// (~15s later) take the next one once the first has actually claimed a token. ListPoolWaitRuns
+// returns oldest-first, so the FIRST run seen for a user is the one to promote.
+//
+// The candidate query is issued at most once per distinct held-run owner per tick (users
+// are deduped as the list is walked), bounding its cost regardless of how many runs a user
+// holds. A per-user candidate-query error is logged and skipped — one user's read fault must
+// not fail the whole sweep — mirroring how the sweep treats its other best-effort sub-steps.
+// A ListPoolWaitRuns error, by contrast, is returned to fail the pass, matching the limit
+// promote's own read.
+func (s *Service) resumePoolWaitRuns(ctx context.Context) (int64, error) {
+	held, err := s.q.ListPoolWaitRuns(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("list pool-wait runs: %w", err)
+	}
+	// seen records users already handled this tick: the first (oldest) held run for a user
+	// is the one considered, and no user's candidate pool is read twice.
+	seen := make(map[uuid.UUID]bool, len(held))
+	var resumed int64
+	for _, r := range held {
+		if seen[r.UserID] {
+			continue
+		}
+		seen[r.UserID] = true
+
+		rows, err := s.q.ListAutoSelectCandidates(ctx, r.UserID)
+		if err != nil {
+			// Best-effort: skip this user, keep sweeping the rest. The run stays held and
+			// the next tick retries it.
+			slog.Error("sweeper: pool-resume candidate read failed", "user", r.UserID, "error", err)
+			continue
+		}
+		// The pool is "non-empty / resumable" iff at least one candidate is AutoEligible.
+		// This is Select's PoolNonEmpty (membership counted with NO exclude), whereas the
+		// re-claim decides with autoselect.Floor(cands, claimExclude(run)) — Floor.ok, counted
+		// AFTER the run's dead-credential exclude. They can only diverge when a run's SOLE
+		// AutoEligible token is its own still-excluded dead credential, i.e. claimExclude
+		// returns non-Nil. But claimExclude excludes only while retry_not_before is in the
+		// FUTURE, and a pool_wait run can never carry a future stamp: SetRunPoolWait does not
+		// set retry_not_before, and the claim it came from was itself claimable, so the run's
+		// stamp was already NULL (never parked) or in the past (promoted out of limit_wait at
+		// retry_not_before <= now). So claimExclude relaxes to Nil at every real resume, making
+		// PoolNonEmpty here exactly Floor.ok at re-claim — this trigger never resumes a run that
+		// would immediately re-hold.
+		poolNonEmpty := false
+		for _, row := range rows {
+			if autoselectrow.FromCandidateRow(row).AutoEligible {
+				poolNonEmpty = true
+				break
+			}
+		}
+		if !poolNonEmpty {
+			continue
+		}
+		promoted, err := s.q.PromotePoolWaitRun(ctx, store.PromotePoolWaitRunParams{ID: r.ID, UserID: r.UserID})
+		if err != nil {
+			// Same best-effort stance: a single promote fault does not sink the sweep.
+			slog.Error("sweeper: pool-resume promote failed", "run", r.ID, "user", r.UserID, "error", err)
+			continue
+		}
+		if promoted == 0 {
+			// The run moved out of pool_wait between the list and the promote (e.g. a
+			// concurrent cancel). Nothing to resume; do not broadcast a transition that
+			// did not happen.
+			continue
+		}
+		resumed++
+		// Same fan-out as the limit promote: broadcast the queued transition so live
+		// browsers and the board's In-Progress column follow the resume.
+		s.publishSwept(r.ID, "queued")
+	}
+	return resumed, nil
 }
 
 // publishSwept fans a sweeper-driven run transition out to the same seams a

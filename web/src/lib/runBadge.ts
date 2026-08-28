@@ -220,6 +220,10 @@ export function runStatusTone(
   // other "blocked on something outside the run" state — never danger: it has not
   // failed and it resumes by itself.
   if (status === "limit_wait") return "warning";
+  // Issue #754: an auto-lane run parked on an empty token pool. Warn, like the
+  // other "blocked on something outside the run" holds — never danger: it has not
+  // failed and it resumes on its own when a token is pooled (or on demand).
+  if (status === "pool_wait") return "warning";
   if (isStoppedRun(status, stopKind)) return "neutral";
   if (status === "failed") return "danger";
   if (status === "completed") return "ok";
@@ -460,6 +464,21 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
         pulse: false,
         title:
           "Paused on an Anthropic usage limit. It resumes on its own when the window reopens.",
+      };
+    // Issue #754: an auto-lane run parked because the owner's token pool is empty.
+    // STATIC — no countdown and no elapsed: unlike limit_wait there is no reset
+    // window, so the only honest thing the pill says is THAT it is waiting. The
+    // label is "waiting for pool" (matching StatusPill's RUN_STATUS_LABELS), not
+    // the bare enum. Resumes automatically when a token is pooled, so warn-toned,
+    // never danger.
+    case "pool_wait":
+      return {
+        kind: "badge",
+        label: "waiting for pool",
+        tone: "warning",
+        pulse: false,
+        title:
+          "Waiting for a pooled Anthropic token. It resumes automatically once one is added to the pool.",
       };
     case "failed":
       return {

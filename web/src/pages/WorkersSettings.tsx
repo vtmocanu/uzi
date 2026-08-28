@@ -47,9 +47,9 @@ export function WorkersSettings() {
   // alongside the workers so a rebind can offer labels without a second round trip.
   const [tokens, setTokens] = useState<SecretMeta[]>([]);
   // How many of them are opted into the auto-selection pool (web-ux F18). An `auto`
-  // worker with ZERO pooled tokens resolves pool_empty on every claim and spends the
-  // owner's default, so the page must not say it auto-selects. Derived rather than
-  // fetched: auto_eligible already rides SecretMeta.
+  // worker with ZERO pooled tokens HOLDS every claim in pool_wait (spending nothing,
+  // #754) rather than falling back to the owner's default, so the page must not say it
+  // auto-selects. Derived rather than fetched: auto_eligible already rides SecretMeta.
   const pooledCount = tokens.filter((t) => t.auto_eligible).length;
   // Which worker's rebind is in flight, so only that row's picker disables.
   const [tokenBusy, setTokenBusy] = useState("");
@@ -88,9 +88,9 @@ export function WorkersSettings() {
   //
   // It also carries a TONE, because F18 made the two channels agree in WORDS and left
   // them disagreeing in COLOUR: a green success banner reading "your token pool is
-  // empty, so its runs spend your default token" is the same category error one level
-  // down from the one F18 fixed, and this file's own comment argues that the visible
-  // and the announced must not disagree.
+  // empty, so its runs will hold until you add a token" is the same category error one
+  // level down from the one F18 fixed, and this file's own comment argues that the
+  // visible and the announced must not disagree.
   const [notice, setNotice] = useState<{ text: string; tone: "success" | "warning" } | null>(null);
   const noticeRef = useRef<HTMLDivElement>(null);
   const announce = useCallback((text: string, tone: "success" | "warning" = "success") => {
@@ -131,7 +131,7 @@ export function WorkersSettings() {
           // one place a screen-reader user actually HEARS it — and the visual and the
           // announced would then disagree, which is worse than not fixing either.
           mode === "auto" && pooledCount === 0
-            ? `${worker.name} is set to auto-select, but your token pool is empty, so its runs spend your default token.`
+            ? `${worker.name} is set to auto-select, but your token pool is empty, so its runs will hold until you add a token to the pool rather than spending your default token.`
             : mode === "auto"
               ? `${worker.name} now auto-selects from your token pool, from its next claim.`
               : mode === "default"
@@ -568,15 +568,16 @@ export function WorkersSettings() {
                     <div className="min-w-0 text-xs text-muted">
                       {/* auto is checked FIRST and independently of the id, because an
                           auto worker holds no pin at all — reading the id first would
-                          fall through to "spends your default token", which is what an
-                          auto worker does only when its pool is empty, not what it IS.
-                          The server already resolves a pinned-but-idless worker to
-                          `default` (D9), so no rule is re-derived here. */}
+                          fall through to "spends your default token", which an auto
+                          worker never does: with an empty pool its runs HOLD (#754),
+                          not spend the default. The server already resolves a
+                          pinned-but-idless worker to `default` (D9), so no rule is
+                          re-derived here. */}
                       {w.anthropic_bind_mode === "auto" && pooledCount === 0 ? (
                         // web-ux F18. An auto worker whose owner has pooled NOTHING
-                        // resolves pool_empty on every claim and spends the default —
-                        // and the page said "auto-selects from your token pool" with a
-                        // straight face. That is R7's silent no-op moved up one level:
+                        // HOLDS every claim in pool_wait (#754) rather than spending the
+                        // default — and the page said "auto-selects from your token pool"
+                        // with a straight face. That is R7's silent no-op moved up one level:
                         // M2 closed it on the TOKEN surface (a pooled token that can
                         // never be picked shows why), and it stayed open on the WORKER
                         // surface, which is where the choice is actually made.
@@ -592,7 +593,7 @@ export function WorkersSettings() {
                           <Link to="/settings" className="underline hover:text-fg">
                             token pool
                           </Link>{" "}
-                          is empty — its runs spend your default token
+                          is empty — its runs will hold until you add a token
                         </span>
                       ) : w.anthropic_bind_mode === "auto" ? (
                         <span>
