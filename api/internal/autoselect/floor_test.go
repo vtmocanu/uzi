@@ -119,8 +119,10 @@ func TestFloorHonoursExclude(t *testing.T) {
 }
 
 // TestFloorEmptyPool: ok is false when no pooled AutoEligible candidate remains. Both
-// the no-candidate and the none-eligible cases, plus the excluded-sole-token case,
-// which must agree with Select's PoolNonEmpty under the same exclude.
+// the no-candidate and the none-eligible cases, plus the excluded-sole-token case —
+// which is exactly where Floor.ok and Select.PoolNonEmpty DIVERGE (PoolNonEmpty is
+// counted before the exclude skip, Floor.ok after), so a caller must read Floor's ok
+// directly rather than infer it from PoolNonEmpty.
 func TestFloorEmptyPool(t *testing.T) {
 	unpooled := cand(1, 80, at(time.Hour))
 	unpooled.AutoEligible = false
@@ -132,11 +134,11 @@ func TestFloorEmptyPool(t *testing.T) {
 		t.Fatalf("Floor over a non-pooled candidate ok = true, want false")
 	}
 
-	// The excluded-sole-token case: Floor's ok must equal Select's PoolNonEmpty under
-	// the same exclude — here both say the pool is NOT empty (one AutoEligible token),
-	// but Floor drops it on exclusion, so ok=false while PoolNonEmpty=true. The
-	// agreement the PRD names is on the underlying pool membership, read through the
-	// same exclude: Floor returns ok=false exactly because that one token is excluded.
+	// The excluded-sole-token case: Floor.ok and Select.PoolNonEmpty DIVERGE here.
+	// The pool has one AutoEligible member, so Select.PoolNonEmpty=true; Floor honours
+	// the exclude and drops that member, so Floor.ok=false. This is the intended
+	// distinct-signal design — PoolNonEmpty says "the user pooled something", Floor.ok
+	// says "there is a token I may spend right now".
 	only := cand(1, 90, at(time.Hour))
 	if _, ok := Floor([]Candidate{only}, id(1), now); ok {
 		t.Fatalf("Floor over the excluded sole token ok = true, want false")

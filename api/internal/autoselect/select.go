@@ -312,8 +312,12 @@ func Select(cands []Candidate, exclude uuid.UUID, p Policy, now time.Time) Outco
 //
 // exclude is honoured exactly as in Select: a candidate whose SecretID == exclude is
 // skipped, and uuid.Nil (which never equals a real id) excludes nothing. ok is false
-// ONLY when no pooled AutoEligible candidate remains after exclusion — the same
-// condition under which Select reports PoolNonEmpty == false for the same exclude.
+// ONLY when no pooled AutoEligible candidate remains AFTER exclusion. This is NOT
+// the same condition as Select's PoolNonEmpty, which is counted BEFORE the exclude
+// skip: excluding the user's sole pooled token gives PoolNonEmpty == true yet Floor
+// ok == false. So a caller must consult Floor's own ok return to decide empty-vs-
+// floorable — do not infer it from PoolNonEmpty. (PoolNonEmpty answers "did the user
+// pool anything at all"; Floor.ok answers "is there a pooled token I may spend now".)
 //
 // Floor records no Reason: the caller decides what the recorded reason is.
 func Floor(cands []Candidate, exclude uuid.UUID, now time.Time) (secretID uuid.UUID, ok bool) {
