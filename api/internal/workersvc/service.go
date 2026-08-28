@@ -403,6 +403,9 @@ type Store interface {
 	// /runs judge badge (PRD #98 M4): per-recommendation triage facts for the runs on one
 	// page, bucketed in Go by the shared BucketOf — never counted in SQL.
 	ListJudgeTriageRowsForRuns(ctx context.Context, arg store.ListJudgeTriageRowsForRunsParams) ([]store.ListJudgeTriageRowsForRunsRow, error)
+	// /runs + board plan-revise flag (issue #750): the plan-ish message rows for a page of
+	// runs, folded into the is_revising set in Go by planRevisingSet — never in SQL.
+	ListPlanRevisionStateForRuns(ctx context.Context, runIds []uuid.UUID) ([]store.ListPlanRevisionStateForRunsRow, error)
 	ListOwnedRecommendationsForCoords(ctx context.Context, arg store.ListOwnedRecommendationsForCoordsParams) ([]store.ListOwnedRecommendationsForCoordsRow, error)
 	// The fan-out write itself: ONE multi-row upsert over the RESOLVED coordinates, so a
 	// bulk call is a single round-trip that cannot half-apply (PRD #98 M2, audit NB-A).

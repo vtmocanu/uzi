@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -129,7 +130,14 @@ type latestRunDTO struct {
 	// IsPlanning is issue #321's planning-phase display flag on the board card;
 	// non-sensitive, rides the shared card unconditionally like Status. Server-computed
 	// (running, iteration_count 0, no persisted plan yet; chat/judge excluded).
-	IsPlanning bool    `json:"is_planning"`
+	IsPlanning bool `json:"is_planning"`
+	// IsRevising is issue #750's plan-revise display flag on the board card: true when
+	// the run's latest plan-ish message ({plan, plan_revising}) is a plan_revising — a
+	// "revise" replan in flight. Non-sensitive, rides the shared card unconditionally
+	// like IsPlanning/Status. Server-computed (planRevisingSet), meaningful only while
+	// status == "awaiting_approval". Set by assembleCards after mapLatestRun, since the
+	// signal needs a batched per-run message fetch mapLatestRun's columns do not carry.
+	IsRevising bool    `json:"is_revising"`
 	OwnerName  string  `json:"owner_name"`
 	WorkerName *string `json:"worker_name"`
 	IsMine     bool    `json:"is_mine"`
@@ -182,6 +190,24 @@ func mapLatestRun(runID, ownerID uuid.UUID, status string, kind string, iteratio
 		dto.OwnerName = ownerName.String
 	}
 	return dto
+}
+
+// setLatestRunRevising stamps issue #750's derived is_revising flag on a
+// single-card latest-run DTO. The board-wide path (assembleCards) uses the batch
+// PlanRevisingForRuns map; the single-card refresh responses (drag, prdless toggle,
+// promote) go through here so a revising run keeps the flag — otherwise the card
+// would blank it and pop the attention ring back until the next full board poll.
+// Best-effort like the batch path: the flag is decoration, so a query error just
+// leaves it false rather than failing the response.
+func (h *Handler) setLatestRunRevising(ctx context.Context, dto *latestRunDTO, runID uuid.UUID) {
+	if dto == nil {
+		return
+	}
+	if m, err := h.wsvc.PlanRevisingForRuns(ctx, []uuid.UUID{runID}); err == nil {
+		dto.IsRevising = m[runID]
+	} else {
+		slog.Warn("single-card plan revising state", "error", err)
+	}
 }
 
 type boardDTO struct {
@@ -393,10 +419,23 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 	repoPipeline := h.defaultBranchPipeline(r, repo)
 	cardPipelines := h.cardPipelines(r, repo.ID)
 
+	// Plan-revise display flag per card's latest run (issue #750). Best-effort like the
+	// pipeline badges above: the card is decoration, so a failure logs and leaves every
+	// flag false (a nil map indexes to false) rather than failing the board.
+	revisingIDs := make([]uuid.UUID, 0, len(runRows))
+	for _, rr := range runRows {
+		revisingIDs = append(revisingIDs, rr.ID)
+	}
+	revising, err := h.wsvc.PlanRevisingForRuns(r.Context(), revisingIDs)
+	if err != nil {
+		slog.Error("board plan revising states", "error", err)
+		revising = nil
+	}
+
 	// repo.UserID is the board viewer (the connection owner); IsMine gates the
 	// owner-only run-view link. repo.ForgeType stamps every card's forge for the
 	// per-card MR/PR noun (all cards on one board share the repo's connection).
-	cards := assembleCards(issues, runRows, cardPipelines, position, repo.UserID, repo.ForgeType)
+	cards := assembleCards(issues, runRows, cardPipelines, position, repo.UserID, repo.ForgeType, revising)
 
 	// Board membership extras default (PRD #196), best-effort like the other
 	// settings reads: the admin default the client falls back to when the user has
@@ -492,13 +531,17 @@ func nonNilLabels(labels []string) []string {
 // per issue (runRows, one row per issue that has run), the column position map,
 // and the board viewer. It is the pure, DB-free core of the board payload: it
 // keys each issue's latest_run by issue_iid (issues with no run get null), and
-// resolves each card's column. viewerID drives IsMine.
-func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRow, cardPipelines map[int64]*apitypes.PipelineDTO, position map[string]int, viewerID uuid.UUID, forgeType string) []cardDTO {
+// resolves each card's column. viewerID drives IsMine. revising is the set of run
+// ids whose latest plan-ish message is a plan_revising (issue #750); a nil map leaves
+// every IsRevising false.
+func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRow, cardPipelines map[int64]*apitypes.PipelineDTO, position map[string]int, viewerID uuid.UUID, forgeType string, revising map[uuid.UUID]bool) []cardDTO {
 	latestByIID := make(map[int64]*latestRunDTO, len(runRows))
 	for _, rr := range runRows {
-		latestByIID[rr.IssueIid.Int64] = mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.Kind, rr.IterationCount, rr.HasPlanMd.Bool, rr.MrIid, rr.MrWebUrl,
+		dto := mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.Kind, rr.IterationCount, rr.HasPlanMd.Bool, rr.MrIid, rr.MrWebUrl,
 			rr.MrState, rr.FailureReason, rr.StopKind, rr.Health, rr.HealthReason, rr.HealthSince,
 			rr.OwnerName, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID)
+		dto.IsRevising = revising[rr.ID] // nil map ⇒ false (issue #750)
+		latestByIID[rr.IssueIid.Int64] = dto
 	}
 
 	cards := make([]cardDTO, 0, len(issues))
@@ -850,6 +893,7 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.Kind, lr.IterationCount, lr.HasPlanMd.Bool, lr.MrIid, lr.MrWebUrl,
 			lr.MrState, lr.FailureReason, lr.StopKind, lr.Health, lr.HealthReason, lr.HealthSince,
 			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
+		h.setLatestRunRevising(r.Context(), card.LatestRun, lr.ID) // issue #750
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("latest run for moved card", "error", err)
 	}
@@ -949,6 +993,7 @@ func (h *Handler) SetIssuePrdless(w http.ResponseWriter, r *http.Request) {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.Kind, lr.IterationCount, lr.HasPlanMd.Bool, lr.MrIid, lr.MrWebUrl,
 			lr.MrState, lr.FailureReason, lr.StopKind, lr.Health, lr.HealthReason, lr.HealthSince,
 			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
+		h.setLatestRunRevising(r.Context(), card.LatestRun, lr.ID) // issue #750
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("latest run for prdless card", "error", err)
 	}
@@ -1054,6 +1099,7 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.Kind, lr.IterationCount, lr.HasPlanMd.Bool, lr.MrIid, lr.MrWebUrl,
 			lr.MrState, lr.FailureReason, lr.StopKind, lr.Health, lr.HealthReason, lr.HealthSince,
 			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
+		h.setLatestRunRevising(r.Context(), card.LatestRun, lr.ID) // issue #750
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("latest run for promoted card", "error", err)
 	}

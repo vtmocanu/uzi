@@ -1533,7 +1533,13 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
 
   // Only the four fields the strip's predicates read. RunListItem extends Run and
   // carries ~30 more that no code path here touches.
-  const aRun = (over: { id: string; status: string; health: string; issue_iid: number }) =>
+  const aRun = (over: {
+    id: string;
+    status: string;
+    health: string;
+    issue_iid: number;
+    is_revising?: boolean;
+  }) =>
     // Issue #485 review FIX 2: the strip's overlay <Link> is now named by the run title
     // as well, so the fixture must carry an issue_title the way the real RunListItem does
     // (RunListItem.issue_title is a non-optional string; this cast used to omit it because
@@ -1645,6 +1651,32 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
     renderBoard();
     await screen.findByText("1 run awaiting follow-up");
     expect(strip().textContent).toBe("1 run awaiting follow-up");
+    expect(screen.getAllByRole("link", { name: "Open run for issue #7: Fix the parser" })).toHaveLength(1);
+  });
+
+  it("drops a REVISING run out of the attention strip, then returns it (issue #750)", async () => {
+    // A run re-planning after a revise keeps status === "awaiting_approval" server-side,
+    // but its derived is_revising flag flips the EFFECTIVE status to "revising", so the
+    // strip's isAwaitingApproval(effectiveRunStatus(r)) predicate excludes it. With
+    // nothing else parked, the whole strip is absent.
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "run-5", status: "awaiting_approval", health: "ok", issue_iid: 7, is_revising: true })],
+    });
+    const view = renderBoard();
+    // The board card for issue #7 renders (the fixture card), so wait on it rather than the strip.
+    await screen.findByText("#7");
+    expect(
+      screen.queryByText(/needs approval|needs an answer|awaiting follow-up|looks? stuck|look stuck/),
+    ).toBeNull();
+    expect(screen.queryByRole("link", { name: "Open run for issue #7: Fix the parser" })).toBeNull();
+
+    // Once the next plan lands (is_revising false), the SAME run returns to needs-approval.
+    view.unmount();
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "run-5", status: "awaiting_approval", health: "ok", issue_iid: 7, is_revising: false })],
+    });
+    renderBoard();
+    await screen.findByText("1 run needs approval");
     expect(screen.getAllByRole("link", { name: "Open run for issue #7: Fix the parser" })).toHaveLength(1);
   });
 
