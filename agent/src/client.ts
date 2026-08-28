@@ -63,6 +63,20 @@ export interface ClientOptions {
   httpTimeoutMs?: number;
 }
 
+/** Response of the MR-thread reply write (PRD #700 M4). `replied` is true when the
+ *  driver posted the reply. */
+export interface ReplyMRThreadDTO {
+  replied: boolean;
+}
+
+/** Response of the MR-thread resolve write (PRD #700 M4). `resolved` is true when the
+ *  driver resolved the thread; false is the tolerated Forgejo no-op (the forge has no
+ *  resolvable-thread concept, so the reply stands alone — reply-only is the documented
+ *  Forgejo contract). */
+export interface ResolveMRThreadDTO {
+  resolved: boolean;
+}
+
 /** Transport for the worker→API control plane (PRD §Worker protocol). */
 export class WorkerClient {
   private readonly sleep: (ms: number) => Promise<void>;
@@ -452,6 +466,33 @@ export class WorkerClient {
     return (await this.getJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/forge/latest-pipeline${q}`,
     )) as LatestPipelineDTO;
+  }
+
+  // Forge WRITE surface (PRD #700 M4): the only worker-mediated forge WRITES besides
+  // git push + MR create + label — an MR-thread reply and resolve, for the mr_rework
+  // run's write-back. Both derive (repo, connection, project id, mr_iid) from the OWNED
+  // run inside the API, and the API enforces the Decision-11 scope check server-side
+  // (the reply/resolve id MUST belong to a thread in THIS run's review snapshot for
+  // THIS run's mr_iid). A rejected id is a 4xx (mapped to non-fatal tool text by
+  // forge-tools.ts). Neither touches `main`.
+
+  /** Reply in the MR review thread keyed on replyId, scoped to this run
+   *  (POST /worker/runs/:id/forge/mr-threads/reply). */
+  async replyMRThread(runId: string, replyId: string, body: string): Promise<ReplyMRThreadDTO> {
+    return (await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/forge/mr-threads/reply`,
+      { reply_id: replyId, body },
+    )) as ReplyMRThreadDTO;
+  }
+
+  /** Resolve the MR review thread keyed on resolveId, scoped to this run
+   *  (POST /worker/runs/:id/forge/mr-threads/resolve). `resolved:false` is the
+   *  tolerated Forgejo no-op (the forge cannot resolve; the reply still stands). */
+  async resolveMRThread(runId: string, resolveId: string): Promise<ResolveMRThreadDTO> {
+    return (await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/forge/mr-threads/resolve`,
+      { resolve_id: resolveId },
+    )) as ResolveMRThreadDTO;
   }
 
   /** A 4xx body mentioning "terminal": the server already finalized the run, so the

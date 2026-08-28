@@ -869,6 +869,11 @@ export class RunRunner {
         // executor threads it to buildPlanPrompt for nonce-fenced rendering. Absent/
         // null ⇒ nothing is rendered.
         issueComments: claim.issue_comments,
+        // PRD #700 M4: carry the mr_rework run's snapshotted MR review comments onto
+        // the ctx, exactly like issueComments; the SDK executor threads it to
+        // buildPlanPrompt for nonce-fenced rendering. Absent/null (every non-mr_rework
+        // kind) ⇒ nothing is rendered.
+        reviewComments: claim.review_comments,
         pipeline: claim.pipeline,
         worktreePath: runnerClone.path,
         branch: runnerClone.branch,
