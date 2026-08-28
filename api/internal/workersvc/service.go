@@ -1710,6 +1710,25 @@ func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store
 	return staticChoice(workerSecretID(wkr), selectReasonPinned), nil
 }
 
+// claimExclude is the credential this claim must NOT resolve onto: the run's
+// just-parked dead credential (PRD #217), but only WHILE its usage window is still
+// closed. Once retry_not_before has passed — which is what let PromoteLimitWaitRuns
+// return the run to queued — the window has reopened and the resume is free to
+// re-pick or floor onto that very token (#754 M3 exclude-relax), which is how a
+// single-pooled-token user "continues on cristi" instead of holding. A run with no
+// dead credential (every non-resume claim) excludes nothing.
+func (s *Service) claimExclude(run store.Run) uuid.UUID {
+	if !run.LimitDeadSecretID.Valid {
+		return uuid.Nil
+	}
+	// Window still closed → keep excluding. Relax (Nil) once it has reopened, and also
+	// when there is no reset stamp to wait on (nothing says the window is closed).
+	if run.RetryNotBefore.Valid && run.RetryNotBefore.Time.After(s.now()) {
+		return uuid.UUID(run.LimitDeadSecretID.Bytes)
+	}
+	return uuid.Nil
+}
+
 // autoChoice runs the selector for an `auto` worker (PRD #111 M4, #754 M2).
 //
 // It is BEHIND claimSecretID, never beside it. PRD #104's R4 is that three copies of
@@ -1757,10 +1776,10 @@ func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store
 // after), and the credential we may actually spend NOW is Floor's question.
 func (s *Service) autoChoice(ctx context.Context, wkr store.Worker, run store.Run) (secretChoice, error) {
 	userID := run.UserID
-	exclude := uuid.Nil
-	if run.LimitDeadSecretID.Valid {
-		exclude = uuid.UUID(run.LimitDeadSecretID.Bytes)
-	}
+	// exclude comes from claimExclude (window-aware): the just-parked dead credential
+	// while its window is still closed, uuid.Nil once retry_not_before has reopened it
+	// (#754 M3 exclude-relax) or when there is no dead credential.
+	exclude := s.claimExclude(run)
 
 	rows, err := s.q.ListAutoSelectCandidates(ctx, userID)
 	if err != nil {
@@ -1805,10 +1824,10 @@ func (s *Service) autoChoice(ctx context.Context, wkr store.Worker, run store.Ru
 // the default). A candidate-query error propagates as-is — a DB blip is not "the pool
 // is empty", the same reasoning autoChoice uses.
 func (s *Service) autoFloorRetry(ctx context.Context, run store.Run, failedID uuid.UUID) (secretChoice, error) {
-	exclude := uuid.Nil
-	if run.LimitDeadSecretID.Valid {
-		exclude = uuid.UUID(run.LimitDeadSecretID.Bytes)
-	}
+	// exclude comes from claimExclude (window-aware): the just-parked dead credential
+	// while its window is still closed, uuid.Nil once retry_not_before has reopened it
+	// (#754 M3 exclude-relax) or when there is no dead credential.
+	exclude := s.claimExclude(run)
 	rows, err := s.q.ListAutoSelectCandidates(ctx, run.UserID)
 	if err != nil {
 		return secretChoice{}, fmt.Errorf("auto-floor-retry candidates: %w", err)

@@ -33,6 +33,9 @@ import (
 func TestAutoChoiceRankingExitExcludesDeadCredential(t *testing.T) {
 	f := newAutoFixture(t)
 	f.fs.claimRun.LimitDeadSecretID = pgtype.UUID{Bytes: f.fullID, Valid: true}
+	// The window is still CLOSED (retry_not_before in the future), so #754 M3's relax does
+	// NOT fire and the dead credential stays excluded — that is the state this test exercises.
+	f.fs.claimRun.RetryNotBefore = pgtype.Timestamptz{Time: autoNow.Add(time.Hour), Valid: true}
 	// The gap must exceed the tie tolerance (T=5), or the tie-break would hand the pick
 	// to the sooner-reset token regardless of the exclusion and the test would not
 	// discriminate it. 95 vs 80 is 15 points apart, so the dead token is ALONE in the
@@ -73,8 +76,10 @@ func TestAutoChoiceFloorExcludesDeadDefaultWhenAnotherPooledTokenExists(t *testi
 	altLow := uuid.UUID{0x01}
 	altHigh := uuid.UUID{0x02}
 
-	// The resuming run parked on its owner default.
+	// The resuming run parked on its owner default, window still CLOSED (retry_not_before
+	// in the future) so #754 M3's relax does not fire and the exclusion applies.
 	f.fs.claimRun.LimitDeadSecretID = pgtype.UUID{Bytes: def, Valid: true}
+	f.fs.claimRun.RetryNotBefore = pgtype.Timestamptz{Time: autoNow.Add(time.Hour), Valid: true}
 	// A STALE pool ⇒ Select names no pick; the rows stay auto-eligible, so Floor can
 	// still choose among them.
 	f.fs.autoCandidates = []store.ListAutoSelectCandidatesRow{
@@ -116,6 +121,9 @@ func TestAutoChoiceHoldsWhenTheOnlyPooledTokenIsTheDeadCredential(t *testing.T) 
 	f := newAutoFixture(t)
 	def := f.fs.defaultCredID()
 	f.fs.claimRun.LimitDeadSecretID = pgtype.UUID{Bytes: def, Valid: true}
+	// Window still CLOSED (retry_not_before in the future), so #754 M3's relax does not
+	// fire — re-picking would immediately re-hit the limit — and the exclusion holds.
+	f.fs.claimRun.RetryNotBefore = pgtype.Timestamptz{Time: autoNow.Add(time.Hour), Valid: true}
 	// The only pooled row IS the dead default. Floor excludes it ⇒ ok false ⇒ hold.
 	f.fs.autoCandidates = []store.ListAutoSelectCandidatesRow{
 		candRow(def, "default-pooled", true, 90, 99*time.Hour, 0),
@@ -146,8 +154,10 @@ func TestAutoChoiceHoldsWhenTheOnlyPooledTokenIsTheDeadCredential(t *testing.T) 
 // exit → the survivor is skipped and the default is spent.
 func TestAutoChoiceFloorSkipsTheDeadTokenAndSpendsTheSurvivingPooledToken(t *testing.T) {
 	f := newAutoFixture(t)
-	// The run parked on a non-default pooled token (fullID), not the owner default.
+	// The run parked on a non-default pooled token (fullID), not the owner default, with
+	// its window still CLOSED (retry_not_before in the future) so the exclusion applies.
 	f.fs.claimRun.LimitDeadSecretID = pgtype.UUID{Bytes: f.fullID, Valid: true}
+	f.fs.claimRun.RetryNotBefore = pgtype.Timestamptz{Time: autoNow.Add(time.Hour), Valid: true}
 	// A stale pool ⇒ the floor exit. The survivor (emptyID) is the only non-excluded
 	// pooled token and must be spent; the owner default must NOT appear.
 	f.fs.autoCandidates = []store.ListAutoSelectCandidatesRow{
