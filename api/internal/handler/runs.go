@@ -61,6 +61,14 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		slog.Error("judge todo counts", "error", err)
 		todo = nil
 	}
+	// Plan-revise display flag for the runs on this page (issue #750). Same best-effort
+	// contract as the judge badge above: it is decoration, so a failure logs and leaves
+	// every flag false (nil map indexes to false) rather than failing the run list.
+	revising, err := h.wsvc.PlanRevisingForRuns(r.Context(), runIDs)
+	if err != nil {
+		slog.Error("plan revising states", "error", err)
+		revising = nil
+	}
 
 	out := make([]apitypes.RunListItemDTO, 0, len(rows))
 	for _, row := range rows {
@@ -76,6 +84,7 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		// nil stays nil for an unjudged run — absent, not a neutral verdict.
 		item.JudgeVerdict = textPtrValue(row.JudgeVerdict.Valid, row.JudgeVerdict.String)
 		item.JudgeTodoCount = todo[row.Run.ID]
+		item.IsRevising = revising[row.Run.ID] // nil map ⇒ false (issue #750)
 		out = append(out, item)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"runs": out})

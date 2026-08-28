@@ -39,6 +39,12 @@ type runsStore struct {
 	judgeTriageRunArg  *store.ListJudgeTriageRowsForRunsParams
 	judgeTriageRunErr  error
 
+	// issue #750 plan-revise flag: scripted plan-ish message rows for the page's runs,
+	// and the run ids the handler passed.
+	planRevisionRunRows []store.ListPlanRevisionStateForRunsRow
+	planRevisionRunArg  []uuid.UUID
+	planRevisionRunErr  error
+
 	workersvc.Store
 	ownerID uuid.UUID
 	run     store.Run
@@ -1031,4 +1037,12 @@ func TestServeWSRejectsCrossOrigin(t *testing.T) {
 func (s *runsStore) ListJudgeTriageRowsForRuns(_ context.Context, arg store.ListJudgeTriageRowsForRunsParams) ([]store.ListJudgeTriageRowsForRunsRow, error) {
 	s.judgeTriageRunArg = &arg
 	return s.judgeTriageRunRows, s.judgeTriageRunErr
+}
+
+// ListPlanRevisionStateForRuns backs the /runs plan-revise flag (issue #750). The
+// default is an empty set — no run revising — so every pre-existing run-list test keeps
+// its meaning; planRevisionRunRows lets a test script plan-ish message rows.
+func (s *runsStore) ListPlanRevisionStateForRuns(_ context.Context, runIds []uuid.UUID) ([]store.ListPlanRevisionStateForRunsRow, error) {
+	s.planRevisionRunArg = runIds
+	return s.planRevisionRunRows, s.planRevisionRunErr
 }

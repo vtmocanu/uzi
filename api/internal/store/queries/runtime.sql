@@ -482,6 +482,16 @@ ORDER BY r.created_at DESC
 -- raise this without raising that and the badge counts start truncating silently.
 LIMIT 200;
 
+-- name: ListPlanRevisionStateForRuns :many
+-- The plan-ish message rows ({plan, plan_revising}) for a page of runs, so the
+-- "latest by seq is plan_revising ⇒ revising" fold happens in Go (planRevisingSet),
+-- mirroring web derivePlanRevision. Backed by run_messages UNIQUE (run_id, seq).
+SELECT run_id, seq, kind
+FROM run_messages
+WHERE run_id = ANY(@run_ids::uuid[])
+  AND kind IN ('plan', 'plan_revising')
+ORDER BY run_id, seq;
+
 -- name: ListActiveRunsAll :many
 -- Admin Agents-status: every non-terminal run across all users, with repo path,
 -- worker name, and owner email for the admin overview.

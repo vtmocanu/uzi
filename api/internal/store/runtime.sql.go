@@ -3202,6 +3202,43 @@ func (q *Queries) ListPendingColumnMoves(ctx context.Context, arg ListPendingCol
 	return items, nil
 }
 
+const listPlanRevisionStateForRuns = `-- name: ListPlanRevisionStateForRuns :many
+SELECT run_id, seq, kind
+FROM run_messages
+WHERE run_id = ANY($1::uuid[])
+  AND kind IN ('plan', 'plan_revising')
+ORDER BY run_id, seq
+`
+
+type ListPlanRevisionStateForRunsRow struct {
+	RunID uuid.UUID `json:"run_id"`
+	Seq   int32     `json:"seq"`
+	Kind  string    `json:"kind"`
+}
+
+// The plan-ish message rows ({plan, plan_revising}) for a page of runs, so the
+// "latest by seq is plan_revising ⇒ revising" fold happens in Go (planRevisingSet),
+// mirroring web derivePlanRevision. Backed by run_messages UNIQUE (run_id, seq).
+func (q *Queries) ListPlanRevisionStateForRuns(ctx context.Context, runIds []uuid.UUID) ([]ListPlanRevisionStateForRunsRow, error) {
+	rows, err := q.db.Query(ctx, listPlanRevisionStateForRuns, runIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListPlanRevisionStateForRunsRow{}
+	for rows.Next() {
+		var i ListPlanRevisionStateForRunsRow
+		if err := rows.Scan(&i.RunID, &i.Seq, &i.Kind); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRunMessagesAfter = `-- name: ListRunMessagesAfter :many
 SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
 FROM run_messages
