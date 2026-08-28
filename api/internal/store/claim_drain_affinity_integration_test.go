@@ -20,11 +20,14 @@ import (
 // fixed 2-minute window. It now pins ONLY while W is a live, non-draining claim target
 // (the NOT EXISTS worker-liveness leg, reusing the same @heartbeat_cutoff the fleet
 // spread uses), and a generous ceiling (@affinity_cutoff = now-WORKER_AFFINITY_CEILING,
-// 30m) bounds the one live-but-wedged pathology a pure liveness test would strand.
+// whose config default is 2h) bounds the one live-but-wedged pathology a pure liveness
+// test would strand.
 //
-// The four cases below drive the real params: @affinity_cutoff = now-30m (the ceiling)
-// and @heartbeat_cutoff = now-45s (WORKER_HEARTBEAT_STALE), exactly as service.go wires
-// them. Each has a positive control — a worker actually claims the run (or W reclaims
+// The four cases below drive their OWN self-consistent cutoff as a model of "a ceiling":
+// @affinity_cutoff = now-30m (a chosen cutoff, independent of the production default,
+// which is 2h) and @heartbeat_cutoff = now-45s (WORKER_HEARTBEAT_STALE). The test proves
+// ClaimRun's SQL reads whatever @affinity_cutoff it is passed — not that 30m is the
+// default. Each has a positive control — a worker actually claims the run (or W reclaims
 // its own) — so none passes vacuously.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres (the store e2e
@@ -93,7 +96,7 @@ func (fx *drainAffinityFixture) worker(name string, heartbeatAge time.Duration, 
 
 // pinnedRun inserts a queued repo-bearing run owned by ownerID (worker_id = ownerID) whose
 // updated_at is stamped updatedAge in the PAST, and returns its id. updatedAge = 0 models a
-// just-promoted run (within the ceiling); a value past the 30m ceiling models the wedged case.
+// just-promoted run (within the ceiling); a value past the test's 30m cutoff models the wedged case.
 func (fx *drainAffinityFixture) pinnedRun(ownerID uuid.UUID, updatedAge time.Duration) uuid.UUID {
 	fx.t.Helper()
 	id := uuid.New()
@@ -104,8 +107,9 @@ func (fx *drainAffinityFixture) pinnedRun(ownerID uuid.UUID, updatedAge time.Dur
 	return id
 }
 
-// claim runs ClaimRun as workerID with the real M1 cutoffs: @affinity_cutoff = now-30m
-// (the WORKER_AFFINITY_CEILING) and @heartbeat_cutoff = now-45s (WORKER_HEARTBEAT_STALE).
+// claim runs ClaimRun as workerID with the test's chosen cutoffs: @affinity_cutoff = now-30m
+// (a modeled ceiling, not the config default, which is 2h) and @heartbeat_cutoff = now-45s
+// (WORKER_HEARTBEAT_STALE).
 func (fx *drainAffinityFixture) claim(workerID uuid.UUID) (store.Run, error) {
 	return fx.q.ClaimRun(fx.ctx, store.ClaimRunParams{
 		WorkerID:        pgtype.UUID{Bytes: workerID, Valid: true},
