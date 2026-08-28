@@ -177,6 +177,13 @@ func TestBrandingLogoUploadServeDeleteLiveDB(t *testing.T) {
 		if cc := rec.Header().Get("Cache-Control"); cc == "" {
 			t.Errorf("logo GET %s: no Cache-Control", tc.slot)
 		}
+		// Defense-in-depth headers on the 200 path (admin-uploaded bytes, svg allowed).
+		if xcto := rec.Header().Get("X-Content-Type-Options"); xcto != "nosniff" {
+			t.Errorf("logo GET %s X-Content-Type-Options = %q, want nosniff", tc.slot, xcto)
+		}
+		if cd := rec.Header().Get("Content-Disposition"); cd != "inline" {
+			t.Errorf("logo GET %s Content-Disposition = %q, want inline", tc.slot, cd)
+		}
 
 		// If-None-Match with the same ETag is a 304 with no body.
 		req := userReq(http.MethodGet, "/api/branding/logo/"+tc.slot, "", admin, map[string]string{"slot": tc.slot})
