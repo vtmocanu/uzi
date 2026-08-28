@@ -50,6 +50,18 @@ const selfImproveTrackingBody = "Autonomous self-improvement tracking issue (PRD
 // oldest lead and the rest wait for the next cycle.
 const selfImproveBacklogCap = 50
 
+// selfImproveMaxOpenMRs caps concurrent OPEN self-improve MRs per repo (PRD #686 D10):
+// at or above this many OPEN self-improve MRs on the repo, a cycle skips (does NO forge
+// write); below it, the cycle fires. "Open" is sourced LIVE from the forge per candidate,
+// never from runs.mr_state (unreliable for this multi-MR-per-tracking-issue lane — D12).
+const selfImproveMaxOpenMRs = 2
+
+// selfImproveMRCandidateWindow bounds how many recent MR-bearing self_improve runs the cap
+// checks live against the forge (PRD #686 D12). Cycles are ~2 days apart and the cap is
+// small, so a tiny window covers every plausibly-open MR without an unbounded historical
+// scan.
+const selfImproveMRCandidateWindow = 10
+
 // genericSelfImproveDescription is the run description for a repo that has NOT opted
 // into uzi dogfooding (repos.fold_improve_uzi_backlog = false, PRD #686 D1): the run
 // reviews the enabling repo itself and folds no product-specific backlog.
@@ -104,6 +116,44 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 	f, err := e.forge.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		return FireOutcome{}, fmt.Errorf("build forge driver: %w", err) // transient
+	}
+
+	// 4b. Cap concurrent OPEN self-improve MRs per repo (PRD #686 D10/D12). This runs BEFORE
+	// ensureTrackingIssue so a capped cycle does NO forge write. Open-state is resolved LIVE
+	// from the forge per candidate (D12): runs.mr_state is unreliable for this
+	// multi-MR-per-tracking-issue lane, so we do NOT trust it. We inspect only a small window
+	// of recent MR-bearing runs — the cap is small and cycles are days apart, so a tiny window
+	// covers every plausibly-open MR (selfImproveMRCandidateWindow).
+	candidates, err := e.store.RecentSelfImproveMRRunsForRepo(ctx, store.RecentSelfImproveMRRunsForRepoParams{
+		RepoID: sched.RepoID,
+		Lim:    selfImproveMRCandidateWindow,
+	})
+	if err != nil {
+		return FireOutcome{}, err // transient DB error: retry next tick
+	}
+	openMRs := 0
+	for _, c := range candidates {
+		// The WHERE guarantees mr_iid IS NOT NULL, but sqlc still types it nullable; skip a row
+		// that somehow scanned NULL rather than dereferencing an invalid pgtype.Int8.
+		if !c.MrIid.Valid {
+			continue
+		}
+		mr, err := f.GetMergeRequest(ctx, repo.ForgeProjectID, c.MrIid.Int64)
+		if err != nil {
+			// TRANSIENT — retry next tick. We neither fail-closed (counting an errored MR as
+			// open would wedge the cap forever) nor fail-open (skipping the check would breach
+			// the cap), so on any error we abandon the whole cycle and let the next tick retry.
+			return FireOutcome{}, fmt.Errorf("check self-improve MR open-state: %w", err)
+		}
+		if mr.State == forge.MRStateOpened {
+			openMRs++
+		}
+	}
+	if openMRs >= selfImproveMaxOpenMRs {
+		e.notifySelfImprove(ctx, sched.UserID, "selfimprove_skipped", "Self-improvement cycle skipped",
+			"This self-improvement cycle was skipped: the open-MR cap reached its limit for this repo. Review and merge or close an outstanding self-improvement merge request, and the next scheduled cycle will fire.", nil)
+		e.logger.Info("scheduler: self_improve open-MR cap reached, skipping fire", "schedule", sched.ID.String(), "open_mrs", openMRs)
+		return FireOutcome{Matched: 1, Skips: []Skip{{Reason: SkipSelfImproveMRCapReached}}}, nil
 	}
 
 	// 5. File (or reuse) the tracking issue. A forge error here is transient.

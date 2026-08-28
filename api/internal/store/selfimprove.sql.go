@@ -301,3 +301,54 @@ func (q *Queries) MarkImproveUziRecommendationsAddressed(ctx context.Context, ar
 	}
 	return result.RowsAffected(), nil
 }
+
+const recentSelfImproveMRRunsForRepo = `-- name: RecentSelfImproveMRRunsForRepo :many
+SELECT id, mr_iid, branch, plan_md, issue_description
+FROM runs
+WHERE kind = 'self_improve' AND repo_id = $1::uuid AND mr_iid IS NOT NULL
+ORDER BY created_at DESC
+LIMIT $2
+`
+
+type RecentSelfImproveMRRunsForRepoParams struct {
+	RepoID uuid.UUID `json:"repo_id"`
+	Lim    int32     `json:"lim"`
+}
+
+type RecentSelfImproveMRRunsForRepoRow struct {
+	ID               uuid.UUID   `json:"id"`
+	MrIid            pgtype.Int8 `json:"mr_iid"`
+	Branch           pgtype.Text `json:"branch"`
+	PlanMd           pgtype.Text `json:"plan_md"`
+	IssueDescription string      `json:"issue_description"`
+}
+
+// The repo's most-recent completed self_improve runs that opened an MR (mr_iid set),
+// bounded (PRD #686 D12). Feeds the forge-sourced open-MR cap (D10) and the picker's
+// open-MR context (D11/M10). "Open" is resolved LIVE from the forge per row, NOT from
+// runs.mr_state (unreliable for this multi-MR-per-tracking-issue lane — see D12).
+func (q *Queries) RecentSelfImproveMRRunsForRepo(ctx context.Context, arg RecentSelfImproveMRRunsForRepoParams) ([]RecentSelfImproveMRRunsForRepoRow, error) {
+	rows, err := q.db.Query(ctx, recentSelfImproveMRRunsForRepo, arg.RepoID, arg.Lim)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RecentSelfImproveMRRunsForRepoRow{}
+	for rows.Next() {
+		var i RecentSelfImproveMRRunsForRepoRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.MrIid,
+			&i.Branch,
+			&i.PlanMd,
+			&i.IssueDescription,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}

@@ -89,6 +89,10 @@ type Store interface {
 	// owner-scoped improve_uzi backlog, and the addressed-stamp write, relocated from the
 	// bespoke selfimprove engine's Store surface.
 	CountActiveSelfImproveRunsForRepo(ctx context.Context, repoID uuid.UUID) (int64, error)
+	// RecentSelfImproveMRRunsForRepo feeds the forge-sourced open-MR cap (PRD #686 D10/D12):
+	// the small window of recent MR-bearing self_improve runs whose live open-state the fire
+	// path checks against the forge before firing a new cycle.
+	RecentSelfImproveMRRunsForRepo(ctx context.Context, arg store.RecentSelfImproveMRRunsForRepoParams) ([]store.RecentSelfImproveMRRunsForRepoRow, error)
 	ListOpenImproveUziRecommendationsForUser(ctx context.Context, arg store.ListOpenImproveUziRecommendationsForUserParams) ([]store.ListOpenImproveUziRecommendationsForUserRow, error)
 	MarkImproveUziRecommendationsAddressed(ctx context.Context, arg store.MarkImproveUziRecommendationsAddressedParams) (int64, error)
 }

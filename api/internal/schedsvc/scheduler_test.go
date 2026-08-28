@@ -53,7 +53,10 @@ type fakeStore struct {
 	// self_improve fire path (PRD #590 M1).
 	activeSelfImprove      int64
 	activeSelfImproveErr   error
-	activeSelfImproveRepos []uuid.UUID // repo ids the per-repo active-run pre-check was called with
+	activeSelfImproveRepos []uuid.UUID                               // repo ids the per-repo active-run pre-check was called with
+	siMRRuns               []store.RecentSelfImproveMRRunsForRepoRow // candidates for the open-MR cap (PRD #686 D10/D12)
+	siMRRunsErr            error
+	siMRRunsRepos          []uuid.UUID // repo ids the open-MR cap candidate query was called with
 	siRecs                 []store.ListOpenImproveUziRecommendationsForUserRow
 	siRecsErr              error
 	siRecsUserParam        uuid.UUID // the user_id the backlog was scoped to
@@ -106,6 +109,10 @@ func (f *fakeStore) GetRepoForUser(_ context.Context, _ store.GetRepoForUserPara
 func (f *fakeStore) CountActiveSelfImproveRunsForRepo(_ context.Context, repoID uuid.UUID) (int64, error) {
 	f.activeSelfImproveRepos = append(f.activeSelfImproveRepos, repoID)
 	return f.activeSelfImprove, f.activeSelfImproveErr
+}
+func (f *fakeStore) RecentSelfImproveMRRunsForRepo(_ context.Context, arg store.RecentSelfImproveMRRunsForRepoParams) ([]store.RecentSelfImproveMRRunsForRepoRow, error) {
+	f.siMRRunsRepos = append(f.siMRRunsRepos, arg.RepoID)
+	return f.siMRRuns, f.siMRRunsErr
 }
 func (f *fakeStore) ListOpenImproveUziRecommendationsForUser(_ context.Context, arg store.ListOpenImproveUziRecommendationsForUserParams) ([]store.ListOpenImproveUziRecommendationsForUserRow, error) {
 	f.siRecsUserParam = arg.UserID
@@ -752,9 +759,10 @@ func TestSkipReasonForErr(t *testing.T) {
 			t.Fatalf("skipReasonForErr(%v) = (%q,%v), want (%q,%v)", c.err, got, ok, c.want, c.ok)
 		}
 	}
-	// AllSkipReasons enumerates the full closed set (PRD #590 M1 added vault_locked).
-	if len(AllSkipReasons) != 6 {
-		t.Fatalf("AllSkipReasons has %d reasons, want 6", len(AllSkipReasons))
+	// AllSkipReasons enumerates the full closed set (PRD #590 M1 added vault_locked;
+	// PRD #686 D10 added self_improve_mr_cap_reached).
+	if len(AllSkipReasons) != 7 {
+		t.Fatalf("AllSkipReasons has %d reasons, want 7", len(AllSkipReasons))
 	}
 }
 
