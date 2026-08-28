@@ -89,7 +89,7 @@ ORDER BY rr.created_at ASC
 LIMIT @lim;
 
 -- name: RecentSelfImproveMRRunsForRepo :many
--- The repo's most-recent completed self_improve runs that opened an MR (mr_iid set),
+-- The repo's most-recent self_improve runs that opened an MR (mr_iid set),
 -- bounded (PRD #686 D12). Feeds the forge-sourced open-MR cap (D10) and the picker's
 -- open-MR context (D11/M10). "Open" is resolved LIVE from the forge per row, NOT from
 -- runs.mr_state (unreliable for this multi-MR-per-tracking-issue lane — see D12).

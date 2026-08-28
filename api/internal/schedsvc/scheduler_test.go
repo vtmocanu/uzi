@@ -362,7 +362,7 @@ func newHarness() *harness {
 	owner := uuid.New()
 	repoID := uuid.New()
 	h := &harness{
-		st:     &fakeStore{repoRow: store.GetRepoForUserRow{ID: repoID, UserID: owner, ForgeProjectID: 42, ForgeType: "gitlab"}},
+		st:     &fakeStore{repoRow: store.GetRepoForUserRow{ID: repoID, UserID: owner, ForgeProjectID: 42, ForgeType: "gitlab", PathWithNamespace: "vtmocanu/uzi", FoldImproveUziBacklog: true}},
 		runs:   &fakeRuns{},
 		fb:     &fakeBuilder{f: &fakeForge{issue: forge.Issue{IID: 7, Description: "body", Labels: []string{"PRD"}}, createdIID: 7}},
 		set:    &fakeSettings{prdLabel: "PRD"},
