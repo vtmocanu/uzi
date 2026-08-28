@@ -53,7 +53,7 @@ jobs:
           # whatever patch the assigned runner image happens to preinstall (observed
           # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
           # above only holds when we force the manifest lookup here.
-          go-version: "1.26"
+          go-version: "1.27"
           check-latest: true
           cache-dependency-path: api/go.sum
       - uses: ./.github/actions/setup-task
@@ -122,7 +122,7 @@ jobs:
           # whatever patch the assigned runner image happens to preinstall (observed
           # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
           # above only holds when we force the manifest lookup here.
-          go-version: "1.26"
+          go-version: "1.27"
           check-latest: true
           cache-dependency-path: api/go.sum
       - uses: ./.github/actions/setup-task
@@ -150,7 +150,7 @@ jobs:
           # whatever patch the assigned runner image happens to preinstall (observed
           # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
           # above only holds when we force the manifest lookup here.
-          go-version: "1.26"
+          go-version: "1.27"
           check-latest: true
           cache-dependency-path: api/go.sum
       - uses: ./.github/actions/setup-task
@@ -199,7 +199,7 @@ jobs:
           # whatever patch the assigned runner image happens to preinstall (observed
           # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
           # above only holds when we force the manifest lookup here.
-          go-version: "1.26"
+          go-version: "1.27"
           check-latest: true
           cache-dependency-path: api/go.sum
       - name: go mod download
@@ -231,7 +231,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          go-version: "1.26"
+          go-version: "1.27"
           check-latest: true
           cache-dependency-path: controller/go.sum
       - uses: ./.github/actions/setup-task
@@ -252,7 +252,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          go-version: "1.26"
+          go-version: "1.27"
           check-latest: true
           cache-dependency-path: controller/go.sum
       - uses: ./.github/actions/setup-task
@@ -273,7 +273,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          go-version: "1.26"
+          go-version: "1.27"
           check-latest: true
           cache-dependency-path: controller/go.sum
       - uses: ./.github/actions/setup-task
@@ -390,7 +390,7 @@ jobs:
           # whatever patch the assigned runner image happens to preinstall (observed
           # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
           # above only holds when we force the manifest lookup here.
-          go-version: "1.26"
+          go-version: "1.27"
           check-latest: true
           cache-dependency-path: api/go.sum
       - uses: ./.github/actions/setup-task

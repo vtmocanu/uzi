@@ -48,7 +48,7 @@ jobs:
       # curl/openssl are all preinstalled on ubuntu-latest.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          go-version: "1.26"
+          go-version: "1.27"
           check-latest: true
 
       - name: Run compose E2E (stub executor)

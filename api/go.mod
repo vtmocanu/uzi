@@ -5,7 +5,7 @@ go 1.26.4
 // Build with the patched 1.26.x that fixes the stdlib CVEs govulncheck gates on
 // (net/http, crypto/tls, net/url, encoding/asn1, ...). Go auto-downloads it; the
 // renovate operator keeps this current. `go 1.26.4` above stays the language floor.
-toolchain go1.26.6
+toolchain go1.27.0
 
 require (
 	charm.land/bubbletea/v2 v2.0.8

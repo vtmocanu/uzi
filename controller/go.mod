@@ -22,7 +22,7 @@ go 1.26.4
 
 // Patched 1.26.x for the stdlib CVEs govulncheck gates on (auto-downloaded; renovate
 // keeps it current). `go 1.26.4` above stays the language floor.
-toolchain go1.26.6
+toolchain go1.27.0
 
 require (
 	k8s.io/api v0.36.3
