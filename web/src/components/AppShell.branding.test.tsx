@@ -271,6 +271,19 @@ describe("AppShell branding — POWERED BY block", () => {
     expect(screen.queryByText(POWERED_BY_RE)).toBeNull();
   });
 
+  it("text mode ignores a stale topright placement and renders below (with the label)", async () => {
+    // Top-right is logo-only (D6); a topright left over from a prior logo config
+    // must not strand a bare company label in the header row — text always renders
+    // the below block, matching the admin live preview.
+    mockApi.branding.mockResolvedValue(
+      brandingWith({ brand_mode: "text", brand_company: "Acme, Inc.", brand_placement: "topright" }),
+    );
+    renderShell();
+    expect((await screen.findAllByText(POWERED_BY_RE)).length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Acme, Inc.").length).toBeGreaterThan(0);
+    expect(screen.queryAllByTestId("brand-logo-img")).toHaveLength(0);
+  });
+
   it("plaque on: adds the light plaque background; off: does not", async () => {
     mockApi.branding.mockResolvedValue(brandingWith({ brand_mode: "logo", brand_plaque: true }));
     const { container } = renderShell();

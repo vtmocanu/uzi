@@ -304,7 +304,9 @@ function brandLogoImgSrc(branding: Branding): string {
 //   "below"    — a separate row UNDER the header carrying a faint uppercase POWERED
 //                BY label + the company text or the logo (the default placement).
 //   "topright" — logo-only (~96px max, ~26px tall), NO label, sharing the header
-//                row; text mode falls back to a compact company label.
+//                row. Top-right is a LOGO-only option (Decision D6), so text mode
+//                always renders below regardless of brand_placement — this keeps the
+//                chrome in step with the admin live preview, which shows text below.
 //
 // A custom brand logo is ALWAYS an <img> (uploaded → /api/branding/logo/brand, else
 // the shipped preset /brand-default.svg), never inline SVG — the XSS control. The
@@ -320,10 +322,13 @@ function PoweredBy({
   slot: "below" | "topright";
 }) {
   if (collapsed || !branding || branding.brand_mode === "none") return null;
-  const placement = branding.brand_placement === "topright" ? "topright" : "below";
+  const isLogo = branding.brand_mode === "logo";
+  // Top-right is logo-only (D6); text mode always renders below, so a stale
+  // "topright" left over from a prior logo config never strands a bare company
+  // label in the header row.
+  const placement = isLogo && branding.brand_placement === "topright" ? "topright" : "below";
   if (placement !== slot) return null;
 
-  const isLogo = branding.brand_mode === "logo";
   const logoImg = (
     <img
       src={brandLogoImgSrc(branding)}
@@ -334,15 +339,13 @@ function PoweredBy({
   );
 
   if (slot === "topright") {
+    // Reached only for logo mode (see the placement guard above), so this is
+    // always the logo — top-right never carries text.
     return (
       <span className="ml-auto flex max-w-[96px] items-center">
-        {isLogo ? (
-          <span className={branding.brand_plaque ? "rounded-md bg-[#f6f6f8] px-1.5 py-1" : undefined}>
-            {logoImg}
-          </span>
-        ) : (
-          <span className="truncate text-[11px] text-faint">{branding.brand_company}</span>
-        )}
+        <span className={branding.brand_plaque ? "rounded-md bg-[#f6f6f8] px-1.5 py-1" : undefined}>
+          {logoImg}
+        </span>
       </span>
     );
   }
