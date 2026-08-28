@@ -96,6 +96,15 @@ func newAutoFixture(t *testing.T) autoFixture {
 		},
 		byIDLabels: map[uuid.UUID]string{emptyID: "spare-key", fullID: "console-key"},
 	}
+	// A default pool of ONE fresh, eligible, openable pooled token (#754 M2). An auto
+	// worker with a genuinely empty pool now HOLDS (errAutoPoolEmpty ⇒ requeue) rather
+	// than spending the non-pooled owner default, so a fixture with no pool would leave
+	// every claim idle. Tests that exercise the pool set autoCandidates themselves,
+	// overriding this default; tests that only need a working run-lane payload (the
+	// limit-park suite) inherit it and resolve to emptyID.
+	fs.autoCandidates = []store.ListAutoSelectCandidatesRow{
+		candRow(emptyID, "spare-key", true, 90, time.Minute, 0),
+	}
 	svc := New(fs, box, autoParams())
 	svc.now = func() time.Time { return autoNow }
 	return autoFixture{
@@ -273,71 +282,102 @@ func TestSelfImproveIgnoresTheWorkerBindMode(t *testing.T) {
 
 // --- the fallback chain, from the claim path's side ----------------------------
 
-// TestAutoFallsBackToTheOwnerDefaultAndSaysWhy is D7: auto never fails a run. Both
-// non-picking outcomes resolve the worker's non-auto binding — nil for an auto
-// worker, i.e. the owner's default (D9) — and record the reason, so "auto was on and
-// I still got the default" is stated rather than inferred.
+// TestAutoFloorsOntoAPooledTokenNeverTheDefault is the #754 M2 core fix: an auto
+// worker NEVER spends a non-pooled credential. It replaces the old D7 fallback, which
+// resolved the owner default on an empty or stale pool — the exact bug this PRD fixes.
+// The ladder now has two non-picking rungs, and NEITHER touches the default:
 //
-// MUTATION THIS CATCHES: recording selectReasonDefault on the fallback (the "it IS
-// the default, after all" simplification), which collapses pool_empty and pool_stale
-// into a value that cannot be told from a plain default-mode worker.
-func TestAutoFallsBackToTheOwnerDefaultAndSaysWhy(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		rows  func(f autoFixture) []store.ListAutoSelectCandidatesRow
-		want  autoselect.Reason
-		stale bool
-	}{
-		{
-			name: "the user has opted no token in",
-			rows: func(f autoFixture) []store.ListAutoSelectCandidatesRow {
-				return []store.ListAutoSelectCandidatesRow{candRow(f.emptyID, "spare-key", false, 90, time.Minute, 0)}
+//   - a pool with tokens but none measurable FLOORS onto the best pooled token,
+//     recorded as pool_stale with no headroom — the SPENT id is the pooled token, not
+//     f.fs.defaultCredID();
+//   - a GENUINELY empty pool holds: the claim requeues (errAutoPoolEmpty), records no
+//     credential at all, and above all never records the default.
+//
+// MUTATION THIS CATCHES: reinstating the owner-default fallback on either rung — the
+// stale case would record defaultCredID() (caught by the explicit != default assert),
+// and the empty case would record defaultCredID() instead of going idle.
+func TestAutoFloorsOntoAPooledTokenNeverTheDefault(t *testing.T) {
+	t.Run("a stale pool floors onto the pooled token, recorded pool_stale", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			rows func(f autoFixture) []store.ListAutoSelectCandidatesRow
+		}{
+			{
+				name: "every pooled reading has aged out",
+				rows: func(f autoFixture) []store.ListAutoSelectCandidatesRow {
+					return []store.ListAutoSelectCandidatesRow{candRow(f.emptyID, "spare-key", true, 90, 99*time.Hour, 0)}
+				},
 			},
-			want: autoselect.ReasonPoolEmpty,
-		},
-		{
-			name: "the user holds no anthropic_token rows at all",
-			rows: func(autoFixture) []store.ListAutoSelectCandidatesRow { return nil },
-			want: autoselect.ReasonPoolEmpty,
-		},
-		{
-			name: "every pooled reading has aged out",
-			rows: func(f autoFixture) []store.ListAutoSelectCandidatesRow {
-				return []store.ListAutoSelectCandidatesRow{candRow(f.emptyID, "spare-key", true, 90, 99*time.Hour, 0)}
+			{
+				name: "a pooled token has never been polled",
+				rows: func(f autoFixture) []store.ListAutoSelectCandidatesRow {
+					r := candRow(f.emptyID, "spare-key", true, 90, time.Minute, 0)
+					r.SyncedAt, r.FiveHourPct, r.SevenDayPct = pgtype.Timestamptz{}, pgtype.Int2{}, pgtype.Int2{}
+					return []store.ListAutoSelectCandidatesRow{r}
+				},
 			},
-			want: autoselect.ReasonPoolStale,
-		},
-		{
-			name: "a pooled token has never been polled",
-			rows: func(f autoFixture) []store.ListAutoSelectCandidatesRow {
-				r := candRow(f.emptyID, "spare-key", true, 90, time.Minute, 0)
-				r.SyncedAt, r.FiveHourPct, r.SevenDayPct = pgtype.Timestamptz{}, pgtype.Int2{}, pgtype.Int2{}
-				return []store.ListAutoSelectCandidatesRow{r}
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				f := newAutoFixture(t)
+				f.fs.autoCandidates = tc.rows(f)
+				if payload := f.claim(t); payload == nil {
+					t.Fatal("a floorable pool went idle; M2 floors onto the pooled token, it does not hold")
+				}
+				rec := onlyRecord(t, f.fs)
+				if uuid.UUID(rec.AnthropicSecretID.Bytes) == f.fs.defaultCredID() {
+					t.Fatal("floored onto the owner default — the auto lane must NEVER spend the non-pooled default (#754)")
+				}
+				if uuid.UUID(rec.AnthropicSecretID.Bytes) != f.emptyID {
+					t.Fatalf("floored onto %v, want the pooled token %v",
+						uuid.UUID(rec.AnthropicSecretID.Bytes), f.emptyID)
+				}
+				if rec.AnthropicSelectReason.String != string(autoselect.ReasonPoolStale) {
+					t.Fatalf("reason = %q, want %q — a floor records pool_stale, not `default`",
+						rec.AnthropicSelectReason.String, autoselect.ReasonPoolStale)
+				}
+				if rec.AnthropicHeadroomPct.Valid {
+					t.Fatalf("a floor recorded headroom %+v; nothing measured the credential it spent",
+						rec.AnthropicHeadroomPct)
+				}
+			})
+		}
+	})
+
+	t.Run("a genuinely empty pool holds — requeues, records nothing, never the default", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			rows func(f autoFixture) []store.ListAutoSelectCandidatesRow
+		}{
+			{
+				name: "the user has opted no token in",
+				rows: func(f autoFixture) []store.ListAutoSelectCandidatesRow {
+					return []store.ListAutoSelectCandidatesRow{candRow(f.emptyID, "spare-key", false, 90, time.Minute, 0)}
+				},
 			},
-			want: autoselect.ReasonPoolStale,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newAutoFixture(t)
-			f.fs.autoCandidates = tc.rows(f)
-			if payload := f.claim(t); payload == nil {
-				t.Fatal("auto fell back and the claim went idle; D7 says a run never fails for this")
-			}
-			rec := onlyRecord(t, f.fs)
-			if uuid.UUID(rec.AnthropicSecretID.Bytes) != f.fs.defaultCredID() {
-				t.Fatalf("fell back to %v, want the owner default %v",
-					uuid.UUID(rec.AnthropicSecretID.Bytes), f.fs.defaultCredID())
-			}
-			if rec.AnthropicSelectReason.String != string(tc.want) {
-				t.Fatalf("reason = %q, want %q — the fallback must name WHY, not just say `default`",
-					rec.AnthropicSelectReason.String, tc.want)
-			}
-			if rec.AnthropicHeadroomPct.Valid {
-				t.Fatalf("a fallback recorded headroom %+v; nothing measured the credential it spent",
-					rec.AnthropicHeadroomPct)
-			}
-		})
-	}
+			{
+				name: "the user holds no anthropic_token rows at all",
+				rows: func(autoFixture) []store.ListAutoSelectCandidatesRow { return nil },
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				f := newAutoFixture(t)
+				f.fs.autoCandidates = tc.rows(f)
+				if payload := f.claim(t); payload != nil {
+					t.Fatal("a genuinely empty pool returned a payload; M2 holds (requeues) rather than spending the default")
+				}
+				if len(f.fs.recordedCreds) != 0 {
+					t.Fatalf("an empty-pool hold recorded a credential: %+v — it must spend nothing, above all not the default",
+						f.fs.recordedCreds)
+				}
+				if f.fs.requeuedRun == nil || *f.fs.requeuedRun != f.runID {
+					t.Fatalf("run not requeued: %v — the empty-pool hold is transient like a locked vault", f.fs.requeuedRun)
+				}
+				if f.fs.markedFailed != nil {
+					t.Fatalf("the run was failed terminally (%v); an empty pool must not hard-fail (M2 interim)", f.fs.markedFailed)
+				}
+			})
+		}
+	})
 }
 
 // TestAutoBestOfPoolSpendsAPooledToken is D10 through the claim path: when every
@@ -392,16 +432,17 @@ func TestAutoCandidateQueryErrorFailsTheClaim(t *testing.T) {
 
 // --- D14: the open-failure retry ------------------------------------------------
 
-// TestAutoRetriesOnceWhenThePickWillNotOpen is D14, and without it D7's "auto never
-// fails a run" is simply false. recoverClaimAssembly maps errCredentialUnavailable to
-// a TERMINAL run failure, so a token that clears the gauge gate and then will not
-// decrypt — a rotated UZI_SECRET_KEY, a corrupt row, a token deleted between the
-// ranking query and the open — kills a run the owner default would have completed.
-// That is the optimizer newly failing runs that static binding finished.
+// TestAutoRetriesOnceOntoAnotherPooledTokenWhenThePickWillNotOpen is D14 reshaped by
+// #754 M2. recoverClaimAssembly maps errCredentialUnavailable to a TERMINAL run
+// failure, so a token that clears the gauge gate and then will not decrypt — a rotated
+// UZI_SECRET_KEY, a corrupt row, a token deleted between the ranking query and the
+// open — would kill a run another POOLED token could complete. The retry now floors
+// onto that OTHER pooled token, NEVER the non-pooled owner default.
 //
-// MUTATION THIS CATCHES: deleting the retry arm → the run is marked failed and no
-// payload is returned.
-func TestAutoRetriesOnceWhenThePickWillNotOpen(t *testing.T) {
+// MUTATION THIS CATCHES: retrying on workerSecretID(wkr)/the owner default instead of
+// re-flooring (the pre-#754 behaviour) → the second open is defaultCredID(), caught by
+// the explicit "second open is the pooled token, not the default" asserts below.
+func TestAutoRetriesOnceOntoAnotherPooledTokenWhenThePickWillNotOpen(t *testing.T) {
 	f := newAutoFixture(t)
 	// The pick's ciphertext is not sealed by this box: secretopen.ErrUndecryptable →
 	// errCredentialUnavailable, which is exactly the terminal path D14 intercepts.
@@ -409,28 +450,39 @@ func TestAutoRetriesOnceWhenThePickWillNotOpen(t *testing.T) {
 		UserID: f.owner, Kind: store.KindAnthropicToken,
 		Ciphertext: []byte("not-sealed-by-this-box"), SealedWith: store.SealedWithMaster,
 	}
+	// Two pooled tokens: emptyID (headroom 90) is the selector's pick and won't open;
+	// fullID (headroom 20, still eligible) is the SECOND pooled token the floor-retry
+	// must fall to. fullID's ciphertext is the fixture's openable sealed console-key.
 	f.fs.autoCandidates = []store.ListAutoSelectCandidatesRow{
 		candRow(f.emptyID, "spare-key", true, 90, time.Minute, 0),
+		candRow(f.fullID, "console-key", true, 20, time.Minute, 0),
 	}
 
 	payload := f.claim(t)
 	if payload == nil {
-		t.Fatal("an undecryptable auto pick went idle; the owner default was openable")
+		t.Fatal("an undecryptable auto pick went idle; the second pooled token was openable")
 	}
 	if f.fs.markedFailed != nil {
 		t.Fatalf("the run was failed terminally (%v); D14 exists so auto never does that", f.fs.markedFailed)
 	}
-	// Two opens, in order: the pick that failed, then the owner default. The second
-	// is what proves it retried rather than having skipped the pick.
+	// Two opens, in order: the pick that failed, then the SECOND POOLED token. The
+	// second must be fullID, NOT the owner default — that is the whole #754 fix.
 	if len(f.fs.byIDLookups) != 2 ||
 		f.fs.byIDLookups[0].ID != f.emptyID ||
-		f.fs.byIDLookups[1].ID != f.fs.defaultCredID() {
-		t.Fatalf("by-id opens = %+v, want the pick then the owner default", f.fs.byIDLookups)
+		f.fs.byIDLookups[1].ID != f.fullID {
+		t.Fatalf("by-id opens = %+v, want the pick then the second pooled token %v (never the default)",
+			f.fs.byIDLookups, f.fullID)
+	}
+	if f.fs.byIDLookups[1].ID == f.fs.defaultCredID() {
+		t.Fatal("the floor-retry opened the owner default — the auto lane must NEVER spend the non-pooled default (#754)")
 	}
 	rec := onlyRecord(t, f.fs)
-	if uuid.UUID(rec.AnthropicSecretID.Bytes) != f.fs.defaultCredID() {
-		t.Fatalf("recorded %v, want the fallback %v — the record names what was SPENT",
-			uuid.UUID(rec.AnthropicSecretID.Bytes), f.fs.defaultCredID())
+	if uuid.UUID(rec.AnthropicSecretID.Bytes) != f.fullID {
+		t.Fatalf("recorded %v, want the floored pooled token %v — the record names what was SPENT",
+			uuid.UUID(rec.AnthropicSecretID.Bytes), f.fullID)
+	}
+	if uuid.UUID(rec.AnthropicSecretID.Bytes) == f.fs.defaultCredID() {
+		t.Fatal("recorded the owner default after a floor-retry — #754 forbids spending the non-pooled default")
 	}
 	if rec.AnthropicSelectReason.String != string(autoselect.ReasonOpenFailed) {
 		t.Fatalf("reason = %q, want %q", rec.AnthropicSelectReason.String, autoselect.ReasonOpenFailed)
@@ -443,29 +495,43 @@ func TestAutoRetriesOnceWhenThePickWillNotOpen(t *testing.T) {
 	}
 }
 
-// TestAutoRetryIsOnceOnly: when the fallback ALSO fails to open, the claim fails
-// terminally rather than looping. The bound is structural — the retry target is
-// workerSecretID(wkr), which for an auto worker is nil, and a nil choice can never
-// satisfy autoPicked — so this test pins the structure, not a counter.
+// TestAutoRetryIsOnceOnly: when the floor-retry target ALSO fails to open, the claim
+// fails terminally rather than looping. The bound is structural — autoFloorRetry
+// records reason=open_failed, which fails autoLaneRetryable, so the second open
+// failure is returned directly and never earns a third attempt. It pins the structure,
+// not a counter. Crucially the owner default is NEVER opened or recorded (#754): the
+// two opens are the two POOLED tokens, and when both are corrupt the run fails.
 func TestAutoRetryIsOnceOnly(t *testing.T) {
 	f := newAutoFixture(t)
-	f.fs.byIDSecrets[f.emptyID] = store.GetUserSecretCiphertextByIDRow{
+	// Both pooled tokens are undecryptable: emptyID is the pick, fullID the floor-retry
+	// target. The owner default is deliberately left OPENABLE — if the code fell back to
+	// it (the pre-#754 bug) the run would wrongly succeed on the non-pooled default.
+	corrupt := store.GetUserSecretCiphertextByIDRow{
 		UserID: f.owner, Kind: store.KindAnthropicToken,
 		Ciphertext: []byte("not-sealed-by-this-box"), SealedWith: store.SealedWithMaster,
 	}
-	f.fs.anthropic = []byte("the-default-is-also-corrupt")
+	f.fs.byIDSecrets[f.emptyID] = corrupt
+	f.fs.byIDSecrets[f.fullID] = corrupt
 	f.fs.autoCandidates = []store.ListAutoSelectCandidatesRow{
 		candRow(f.emptyID, "spare-key", true, 90, time.Minute, 0),
+		candRow(f.fullID, "console-key", true, 20, time.Minute, 0),
 	}
 
 	if payload := f.claim(t); payload != nil {
-		t.Fatal("expected idle when neither credential opens")
+		t.Fatal("expected idle when neither pooled token opens")
 	}
+	// Exactly two opens — the pick, then one floor-retry — and NEITHER is the owner
+	// default. A third open (or the default appearing here) is the structural break.
 	if len(f.fs.byIDLookups) != 2 {
-		t.Fatalf("by-id opens = %d, want exactly 2 (the pick, then one retry)", len(f.fs.byIDLookups))
+		t.Fatalf("by-id opens = %d, want exactly 2 (the pick, then one floor-retry)", len(f.fs.byIDLookups))
+	}
+	for i, l := range f.fs.byIDLookups {
+		if l.ID == f.fs.defaultCredID() {
+			t.Fatalf("open #%d spent the owner default; the auto lane must NEVER open the non-pooled default (#754)", i)
+		}
 	}
 	if f.fs.markedFailed == nil {
-		t.Fatal("neither credential opened and the run was not failed; it would sit claimed forever")
+		t.Fatal("neither pooled token opened and the run was not failed; it would sit claimed forever")
 	}
 	if len(f.fs.recordedCreds) != 0 {
 		t.Fatalf("recorded a credential nothing opened: %+v", f.fs.recordedCreds)
@@ -633,12 +699,16 @@ func TestEveryProducedReasonIsInTheVocabulary(t *testing.T) {
 		known[string(r)] = true
 	}
 	f := newAutoFixture(t)
+	// The pick won't open, so the claim floors onto a SECOND pooled token and records
+	// D14's open_failed — the literal this test exists to pin (#754 M2: the retry lands
+	// on another pooled token, never the non-pooled default).
 	f.fs.byIDSecrets[f.emptyID] = store.GetUserSecretCiphertextByIDRow{
 		UserID: f.owner, Kind: store.KindAnthropicToken,
 		Ciphertext: []byte("not-sealed-by-this-box"), SealedWith: store.SealedWithMaster,
 	}
 	f.fs.autoCandidates = []store.ListAutoSelectCandidatesRow{
 		candRow(f.emptyID, "spare-key", true, 90, time.Minute, 0),
+		candRow(f.fullID, "console-key", true, 20, time.Minute, 0),
 	}
 	f.claim(t)
 	got := onlyRecord(t, f.fs).AnthropicSelectReason.String

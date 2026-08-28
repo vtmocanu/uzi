@@ -11,10 +11,17 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// PRD #217 M2 — autoChoice's dead-credential exclusion, from the claim path's side.
-// autoselect's own tests own the RANKING exclusion; these own the WIRING: that
-// runs.limit_dead_secret_id reaches Select on the ranking exit, and that the
-// CONDITIONAL fallback exclusion resolves the owner default before comparing it.
+// PRD #217 M2 + #754 M2 — autoChoice's dead-credential exclusion, from the claim
+// path's side. autoselect's own tests own the RANKING exclusion; these own the WIRING:
+// that runs.limit_dead_secret_id reaches BOTH Select (ranking exit) and Floor (the
+// #754 floor exit), so the just-parked credential is never re-picked NOR re-floored.
+//
+// #754 M2 reshaped the non-picking exits: the old D7 fallback resolved the owner
+// default (and swapped off it when it was the dead credential), which is the bug #754
+// fixes. The auto lane now stays inside the pool — it floors onto another POOLED token
+// or, when none remains, HOLDS (errAutoPoolEmpty ⇒ requeue). It never resolves the
+// non-pooled owner default, so these tests assert the SPENT credential is a pooled one
+// or that the claim held with nothing recorded.
 
 // TestAutoChoiceRankingExitExcludesDeadCredential drives the RANKING exit. Both
 // tokens are fresh and eligible and the dead one carries MORE headroom, so without
@@ -49,27 +56,27 @@ func TestAutoChoiceRankingExitExcludesDeadCredential(t *testing.T) {
 	}
 }
 
-// TestAutoChoiceFallbackExcludesDeadDefaultWhenAlternativeExists drives the FALLBACK
-// exit with an alternative available. The pool is stale (so Select returns
-// pool_stale and never names a pick) but the rows are still auto-eligible, and the
-// dead credential is the owner default. The fallback resolves that default, sees it
-// IS the excluded credential, and picks the deterministic lowest-id alternative
-// instead of re-spending the dead token.
+// TestAutoChoiceFloorExcludesDeadDefaultWhenAnotherPooledTokenExists drives the FLOOR
+// exit with the dead credential pooled among others. The pool is stale (so Select
+// names no pick and the ladder falls to Floor) and the dead credential is the pooled
+// owner default. Floor honours `exclude`, so it skips the dead default and spends the
+// deterministic tie-break winner among the OTHER pooled tokens — never the dead one,
+// and never the non-pooled default resolution (which #754 removed entirely).
 //
-// MUTATION THIS CATCHES: the fallback ignoring `exclude` (returning the owner default
-// unconditionally) → the dead default is re-spent.
-func TestAutoChoiceFallbackExcludesDeadDefaultWhenAlternativeExists(t *testing.T) {
+// MUTATION THIS CATCHES: Floor ignoring `exclude` → the dead default (soonest-reset /
+// lowest-id among equals) could be re-floored onto.
+func TestAutoChoiceFloorExcludesDeadDefaultWhenAnotherPooledTokenExists(t *testing.T) {
 	f := newAutoFixture(t)
 	def := f.fs.defaultCredID()
-	// Two known low ids so "the lowest-id alternative" is unambiguous, and both below
-	// the default's 0xd0… first byte.
+	// Two known low ids so the tie-break winner is unambiguous: equal (stale) resets
+	// fall through to the secret id, and 0x01 < 0x02.
 	altLow := uuid.UUID{0x01}
 	altHigh := uuid.UUID{0x02}
 
 	// The resuming run parked on its owner default.
 	f.fs.claimRun.LimitDeadSecretID = pgtype.UUID{Bytes: def, Valid: true}
-	// A STALE pool ⇒ Select falls back (pool_stale); the rows stay auto-eligible, so
-	// lowestAltCandidate can still choose among them.
+	// A STALE pool ⇒ Select names no pick; the rows stay auto-eligible, so Floor can
+	// still choose among them.
 	f.fs.autoCandidates = []store.ListAutoSelectCandidatesRow{
 		candRow(altHigh, "alt-high", true, 90, 99*time.Hour, 0),
 		candRow(altLow, "alt-low", true, 90, 99*time.Hour, 0),
@@ -84,67 +91,65 @@ func TestAutoChoiceFallbackExcludesDeadDefaultWhenAlternativeExists(t *testing.T
 	f.claim(t)
 	rec := onlyRecord(t, f.fs)
 	if uuid.UUID(rec.AnthropicSecretID.Bytes) != altLow {
-		t.Fatalf("fallback spent %v, want the lowest-id alternative %v, NOT the dead default %v",
+		t.Fatalf("floor spent %v, want the tie-break winner %v, NOT the dead default %v",
 			uuid.UUID(rec.AnthropicSecretID.Bytes), altLow, def)
 	}
 	if rec.AnthropicSelectReason.String != string(autoselect.ReasonPoolStale) {
-		t.Fatalf("reason = %q, want %q — the fallback reason is preserved even when the resolved "+
-			"credential changes", rec.AnthropicSelectReason.String, autoselect.ReasonPoolStale)
+		t.Fatalf("reason = %q, want %q — a floor records pool_stale", rec.AnthropicSelectReason.String, autoselect.ReasonPoolStale)
 	}
-	// A fallback measured nothing, so no headroom is recorded.
+	// A floor measured nothing, so no headroom is recorded.
 	if rec.AnthropicHeadroomPct.Valid {
-		t.Fatalf("headroom = %+v, want NULL — a fallback measured no credential", rec.AnthropicHeadroomPct)
+		t.Fatalf("headroom = %+v, want NULL — a floor measured no credential", rec.AnthropicHeadroomPct)
 	}
 }
 
-// TestAutoChoiceFallbackSpendsDeadDefaultWhenNoAlternative is SC4: a single-token
-// user's resume still runs. The dead default is the only pooled token, so there is
-// no alternative to resolve to and the dead credential is spent anyway — auto never
-// fails a run.
+// TestAutoChoiceHoldsWhenTheOnlyPooledTokenIsTheDeadCredential is #754 M2's change to
+// the old SC4 behaviour. When the resuming run's ONLY pooled token is the excluded
+// dead credential, there is nothing else pooled to spend — and the auto lane must NOT
+// fall to the non-pooled owner default (the #754 bug). Floor.ok is false (the sole
+// pooled candidate is excluded), so autoChoice signals errAutoPoolEmpty and the claim
+// HOLDS: it requeues, records nothing, and never spends the default.
 //
-// The reason is pool_EMPTY, not pool_stale, and that is the exclusion's own doing:
-// Select skips the dead credential BEFORE `pooled` is set, so a pool whose only
-// member is the excluded token reads as empty. The point of the test is which
-// credential is SPENT, and it is the dead default because there is nothing else.
-//
-// MUTATION THIS CATCHES: making the fallback exclusion UNCONDITIONAL → a single-token
-// user's resume has nothing to spend and the claim breaks.
-func TestAutoChoiceFallbackSpendsDeadDefaultWhenNoAlternative(t *testing.T) {
+// MUTATION THIS CATCHES: reinstating the owner-default fallback here → the dead
+// default (or the plain default) is re-spent instead of the run holding.
+func TestAutoChoiceHoldsWhenTheOnlyPooledTokenIsTheDeadCredential(t *testing.T) {
 	f := newAutoFixture(t)
 	def := f.fs.defaultCredID()
 	f.fs.claimRun.LimitDeadSecretID = pgtype.UUID{Bytes: def, Valid: true}
-	// The only pooled row IS the dead default. Excluded before `pooled` is set, so
-	// Select sees an empty pool and never names a pick ⇒ the fallback exit.
+	// The only pooled row IS the dead default. Floor excludes it ⇒ ok false ⇒ hold.
 	f.fs.autoCandidates = []store.ListAutoSelectCandidatesRow{
 		candRow(def, "default-pooled", true, 90, 99*time.Hour, 0),
 	}
 
-	f.claim(t)
-	rec := onlyRecord(t, f.fs)
-	if uuid.UUID(rec.AnthropicSecretID.Bytes) != def {
-		t.Fatalf("a single-token user's resume spent %v, want the dead default %v — auto never "+
-			"fails a run (SC4)", uuid.UUID(rec.AnthropicSecretID.Bytes), def)
+	if payload := f.claim(t); payload != nil {
+		t.Fatal("the only pooled token was the dead credential, yet the claim produced a payload; " +
+			"M2 holds rather than spending the non-pooled default")
 	}
-	if rec.AnthropicSelectReason.String != string(autoselect.ReasonPoolEmpty) {
-		t.Fatalf("reason = %q, want %q — the sole pooled token is the excluded dead one, which "+
-			"Select drops before `pooled` is set", rec.AnthropicSelectReason.String, autoselect.ReasonPoolEmpty)
+	if len(f.fs.recordedCreds) != 0 {
+		t.Fatalf("recorded a credential when the only pooled token was dead: %+v — above all it must not be the default",
+			f.fs.recordedCreds)
+	}
+	if f.fs.requeuedRun == nil || *f.fs.requeuedRun != f.runID {
+		t.Fatalf("run not requeued: %v — an empty-pool hold is transient", f.fs.requeuedRun)
+	}
+	if f.fs.markedFailed != nil {
+		t.Fatalf("the run was failed terminally (%v); the empty-pool hold must not hard-fail (M2 interim)", f.fs.markedFailed)
 	}
 }
 
-// TestAutoChoiceFallbackKeepsDefaultWhenItIsNotTheDeadCredential pins the FALSE arm
-// of the conditional exclusion. The dead credential is a non-default pooled token, so
-// the fallback's resolved owner default differs from the exclusion — and the rule is
-// to spend that default, NOT to swap to an alternative. The exclusion fires only when
-// the fallback WOULD otherwise spend the dead credential.
+// TestAutoChoiceFloorSkipsTheDeadTokenAndSpendsTheSurvivingPooledToken drives the
+// floor exit when the dead credential is a NON-default pooled token. The dead token is
+// excluded from the floor, so the OTHER pooled token (the survivor) is spent — a
+// pooled credential, never the non-pooled owner default (#754).
 //
-// MUTATION THIS CATCHES: making the fallback swap unconditional (or inverting the
-// `resolved == exclude` guard) → an alternative is spent when the default was fine.
-func TestAutoChoiceFallbackKeepsDefaultWhenItIsNotTheDeadCredential(t *testing.T) {
+// MUTATION THIS CATCHES: reinstating the owner-default resolution on the non-picking
+// exit → the survivor is skipped and the default is spent.
+func TestAutoChoiceFloorSkipsTheDeadTokenAndSpendsTheSurvivingPooledToken(t *testing.T) {
 	f := newAutoFixture(t)
 	// The run parked on a non-default pooled token (fullID), not the owner default.
 	f.fs.claimRun.LimitDeadSecretID = pgtype.UUID{Bytes: f.fullID, Valid: true}
-	// A stale pool ⇒ fallback. An alternative (emptyID) exists and must NOT be chosen,
-	// because the owner default the fallback resolves is not the dead credential.
+	// A stale pool ⇒ the floor exit. The survivor (emptyID) is the only non-excluded
+	// pooled token and must be spent; the owner default must NOT appear.
 	f.fs.autoCandidates = []store.ListAutoSelectCandidatesRow{
 		candRow(f.emptyID, "spare-key", true, 90, 99*time.Hour, 0),
 		candRow(f.fullID, "console-key", true, 90, 99*time.Hour, 0),
@@ -152,30 +157,34 @@ func TestAutoChoiceFallbackKeepsDefaultWhenItIsNotTheDeadCredential(t *testing.T
 
 	f.claim(t)
 	rec := onlyRecord(t, f.fs)
-	if uuid.UUID(rec.AnthropicSecretID.Bytes) != f.fs.defaultCredID() {
-		t.Fatalf("fallback spent %v, want the owner default %v — the resolved default is NOT the "+
-			"dead credential, so the exclusion must not fire", uuid.UUID(rec.AnthropicSecretID.Bytes), f.fs.defaultCredID())
+	if uuid.UUID(rec.AnthropicSecretID.Bytes) == f.fs.defaultCredID() {
+		t.Fatal("floored onto the owner default — the auto lane must NEVER spend the non-pooled default (#754)")
+	}
+	if uuid.UUID(rec.AnthropicSecretID.Bytes) != f.emptyID {
+		t.Fatalf("floored onto %v, want the surviving pooled token %v",
+			uuid.UUID(rec.AnthropicSecretID.Bytes), f.emptyID)
 	}
 	if rec.AnthropicSelectReason.String != string(autoselect.ReasonPoolStale) {
 		t.Fatalf("reason = %q, want %q", rec.AnthropicSelectReason.String, autoselect.ReasonPoolStale)
 	}
 }
 
-// TestAutoChoiceNilDeadSecretIsUnchanged: a claim that is NOT resuming from a park
-// (limit_dead_secret_id NULL) takes the exclude==uuid.Nil early return — today's
-// behaviour exactly, a stale pool falling back to the owner default with no
-// GetDefaultUserSecretMeta comparison in the exclusion path.
-func TestAutoChoiceNilDeadSecretIsUnchanged(t *testing.T) {
+// TestAutoChoiceNilDeadSecretFloorsOntoThePooledToken: a claim that is NOT resuming
+// from a park (limit_dead_secret_id NULL) takes the exclude==uuid.Nil path — a stale
+// pool floors onto its pooled token (pool_stale), NOT the owner default (#754).
+func TestAutoChoiceNilDeadSecretFloorsOntoThePooledToken(t *testing.T) {
 	f := newAutoFixture(t) // claimRun.LimitDeadSecretID left invalid
 	f.fs.autoCandidates = []store.ListAutoSelectCandidatesRow{
-		candRow(f.emptyID, "spare-key", true, 90, 99*time.Hour, 0), // stale ⇒ fallback
+		candRow(f.emptyID, "spare-key", true, 90, 99*time.Hour, 0), // stale ⇒ floor
 	}
 
 	f.claim(t)
 	rec := onlyRecord(t, f.fs)
-	if uuid.UUID(rec.AnthropicSecretID.Bytes) != f.fs.defaultCredID() {
-		t.Fatalf("with no dead-secret id, fell back to %v, want the owner default %v",
-			uuid.UUID(rec.AnthropicSecretID.Bytes), f.fs.defaultCredID())
+	if uuid.UUID(rec.AnthropicSecretID.Bytes) == f.fs.defaultCredID() {
+		t.Fatal("floored onto the owner default with no dead-secret id — #754 forbids spending the non-pooled default")
+	}
+	if uuid.UUID(rec.AnthropicSecretID.Bytes) != f.emptyID {
+		t.Fatalf("floored onto %v, want the pooled token %v", uuid.UUID(rec.AnthropicSecretID.Bytes), f.emptyID)
 	}
 	if rec.AnthropicSelectReason.String != string(autoselect.ReasonPoolStale) {
 		t.Fatalf("reason = %q, want %q", rec.AnthropicSelectReason.String, autoselect.ReasonPoolStale)

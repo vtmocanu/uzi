@@ -11,7 +11,6 @@
 package workersvc
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1317,6 +1316,16 @@ func (s *Service) recoverClaimAssembly(ctx context.Context, run store.Run, err e
 			return rerr
 		}
 		return nil // idle; the run is queued again, awaiting unlock
+	case errors.Is(err, errAutoPoolEmpty):
+		// M2 interim — an auto claim with a genuinely empty pool must not spend the
+		// non-pooled default nor hard-fail; requeue and wait. M4 replaces this with the
+		// non-locking pool_wait hold state. Handled exactly like the vault-locked
+		// transient: RequeueClaimedRunToQueued keeps worker_id for affinity and does not
+		// bump requeue_count, so a persistently empty pool can't trip the requeue cap.
+		if _, rerr := s.q.RequeueClaimedRunToQueued(ctx, run.ID); rerr != nil {
+			return rerr
+		}
+		return nil // idle; the run is queued again, awaiting a pooled token
 	case errors.Is(err, errCredentialUnavailable) || errors.Is(err, errToolPackagesRejected) || errors.Is(err, errGuardrailBlockedClaim):
 		// A guardrail block at claim (D1 layer 3) is TERMINAL — fail-closed even on a
 		// forge blip (R4; the user restarts after fixing protection), matching
@@ -1376,6 +1385,15 @@ var errGuardrailBlockedClaim = errors.New("run refused by the default-branch gua
 // queued to be retried after the next unlock (PRD #32 success criteria 3 & 5).
 var errVaultLocked = errors.New("vault locked during claim")
 
+// errAutoPoolEmpty marks an auto claim that found genuinely nothing pooled to spend:
+// an empty pool, or a resuming run whose only pooled token is the excluded dead
+// credential (#754 M2). The auto lane must NEVER spend the non-pooled owner default,
+// and it must NOT hard-fail a run for a transient/holdable condition — so this is
+// TRANSIENT like errVaultLocked, and recoverClaimAssembly requeues the run rather
+// than failing it. (M4 replaces this interim requeue with a non-locking pool_wait
+// hold state.) Its message carries no secret bytes.
+var errAutoPoolEmpty = errors.New("auto pool is empty")
+
 // claimCred is the concrete Anthropic credential ONE claim spends: the identity to
 // record on the run, the label to snapshot alongside it, and the plaintext to ship
 // in the claim payload. It exists because openAnthropic used to hand back only
@@ -1425,15 +1443,28 @@ type secretChoice struct {
 	headroom *int16
 }
 
-// autoPicked reports whether the SELECTOR named this credential, as opposed to a
-// binding or a fallback. It is the precise gate on D14's retry: only a credential
-// auto chose gets a second attempt on the owner default, because only auto has an
-// alternative the user did not ask for. A pinned worker or a judge binding that will
-// not open must still fail terminally — the user named that credential, and silently
-// billing a different one is the R4 failure this PRD is otherwise built to avoid.
-func (c secretChoice) autoPicked() bool {
+// autoLaneRetryable reports whether a credential the AUTO lane resolved and then
+// failed to open earns ONE floor-retry onto ANOTHER pooled token (D14, reshaped by
+// #754 M2). It is the precise gate on that retry, and it covers the three auto-lane
+// picks that have a pooled alternative to fall to:
+//
+//   - a selector pick (auto / best_of_pool), and
+//   - a floor pick (pool_stale) — #754 made the floor a real pooled spend, so a
+//     floored token that will not open must ALSO get one retry onto the next pooled
+//     token rather than dying terminally on the first undecryptable row.
+//
+// It deliberately EXCLUDES open_failed, which is the reason autoFloorRetry itself
+// records: a second open failure therefore fails this gate on its REASON conjunct and
+// is terminal by STRUCTURE — no counter, and no dependency on an invariant enforced
+// three files away. It also excludes pinned / default / judge: the user named those
+// credentials, and silently billing a different one is the R4 failure this PRD is
+// otherwise built to avoid. The nil-secretID guard keeps the empty-pool hold
+// (errAutoPoolEmpty, which never reaches an open) out of the retry entirely.
+func (c secretChoice) autoLaneRetryable() bool {
 	return c.secretID != nil &&
-		(c.reason == string(autoselect.ReasonAuto) || c.reason == string(autoselect.ReasonBestOfPool))
+		(c.reason == string(autoselect.ReasonAuto) ||
+			c.reason == string(autoselect.ReasonBestOfPool) ||
+			c.reason == string(autoselect.ReasonPoolStale))
 }
 
 // staticChoice names the mode that produced a claim's secretID override for the two
@@ -1679,7 +1710,7 @@ func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store
 	return staticChoice(workerSecretID(wkr), selectReasonPinned), nil
 }
 
-// autoChoice runs the selector for an `auto` worker (PRD #111 M4).
+// autoChoice runs the selector for an `auto` worker (PRD #111 M4, #754 M2).
 //
 // It is BEHIND claimSecretID, never beside it. PRD #104's R4 is that three copies of
 // credential resolution drift and a wrong fallback spends the wrong account silently;
@@ -1697,33 +1728,33 @@ func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store
 // nothing. The run is retried; a silent mis-spend is not retried, because nobody
 // learns it happened.
 //
-// A fallback (pool_empty / pool_stale) resolves workerSecretID(wkr), which for an
-// auto worker is nil ⇒ the owner's default (D9). It is written as the CALL rather
-// than as a literal nil so the rule stated in workerSecretID stays the single source
-// of what "this worker's non-auto binding" means — the current answer happens to be
-// nil for every auto worker, and the rule is what survives the next mode.
+// # The pooled-only invariant (#754)
 //
-// # The dead-credential exclusion (PRD #217 M2), on BOTH exits
+// An auto worker NEVER spends a non-pooled credential — the owner default is NOT
+// auto-eligible unless the user pooled it, and an auto lane that quietly bills it is
+// the exact bug #754 fixes. That reshapes the old D7 fallback (which resolved
+// workerSecretID(wkr) ⇒ the owner default) into a three-rung ladder, every rung of
+// which stays inside the pool:
 //
-// When this run is resuming from a usage-limit park, runs.limit_dead_secret_id names
-// the credential it just parked on and this claim must not re-pick it. `exclude`
-// carries that id (uuid.Nil when there is nothing to exclude — every non-resume
-// claim).
+//   - Ranking exit (out.Picked): the selector named a measurable pooled token. Record
+//     it with its reason and measured headroom. `exclude` (the run's just-parked
+//     dead credential, PRD #217 M2) is passed to Select, which drops it from the
+//     ranking so it can be neither picked nor the anchor.
+//   - Floor (out not Picked, but a pooled token remains): the pool has tokens but none
+//     is measurable — a measurable one would have been Picked as best_of_pool — so
+//     autoselect.Floor spends the best pooled token anyway (stale/unmeasured
+//     included), recorded as pool_stale with no headroom. Floor honours `exclude`
+//     exactly as Select does, so the dead credential is never floored onto.
+//   - Empty-pool hold (Floor.ok == false): there is genuinely nothing pooled to spend
+//     — an empty pool, or the only pooled token is the excluded dead credential. M2
+//     interim: do NOT spend the non-pooled default and do NOT hard-fail; signal
+//     errAutoPoolEmpty, which recoverClaimAssembly requeues (like a locked vault) so
+//     the run waits rather than billing an account the user did not pool. (M4 replaces
+//     this hold with a non-locking pool_wait state.)
 //
-//   - Ranking exit: `exclude` is passed to Select, which drops the dead credential
-//     from the ranking so it can be neither picked nor the anchor.
-//   - Fallback exit (!out.Picked): Select never named a pick, so the exclusion has to
-//     be applied to what the fallback would RESOLVE. This branch is CONDITIONAL, and
-//     the reason is D7/SC4: auto never fails a run. workerSecretID(wkr) is nil for an
-//     auto worker ⇒ the owner default, which for a single-token user IS the dead
-//     credential — so an unconditional "refuse the excluded credential" would leave a
-//     single-token run with nothing to spend. The rule is therefore: exclude the dead
-//     credential ONLY when a DIFFERENT credential can actually be resolved; otherwise
-//     spend the dead one, because a run that cannot be placed must still run. Resolving
-//     what the fallback would spend costs a fetch (GetDefaultUserSecretMeta) when the
-//     binding is nil, because secretChoice{secretID: nil} does not NAME a credential —
-//     it is the same query openAnthropic resolves the nil case with, so the two agree
-//     on which id "the owner default" means.
+// Floor.ok, not Select's PoolNonEmpty, decides floor-vs-hold: they diverge in the
+// excluded-sole-token case (PoolNonEmpty counts before the exclude skip, Floor.ok
+// after), and the credential we may actually spend NOW is Floor's question.
 func (s *Service) autoChoice(ctx context.Context, wkr store.Worker, run store.Run) (secretChoice, error) {
 	userID := run.UserID
 	exclude := uuid.Nil
@@ -1740,76 +1771,64 @@ func (s *Service) autoChoice(ctx context.Context, wkr store.Worker, run store.Ru
 		cands = append(cands, autoselectrow.FromCandidateRow(row))
 	}
 	out := autoselect.Select(cands, exclude, s.p.Autoselect, s.now())
-	if !out.Picked {
-		// D7: auto never fails a run. An empty or unmeasurable pool resolves the
-		// worker's non-auto behaviour and records WHY, so "auto was on and I still got
-		// the default" is a fact the run view states rather than one a user infers.
-		base := workerSecretID(wkr)
-		if exclude == uuid.Nil {
-			return secretChoice{secretID: base, reason: string(out.Reason)}, nil
-		}
-		// Resolve what `base` would actually spend so it can be compared against the
-		// exclusion. A nil binding is the owner default, resolved with the SAME query
-		// openAnthropic uses for the nil case.
-		resolved := base
-		if resolved == nil {
-			meta, err := s.q.GetDefaultUserSecretMeta(ctx, store.GetDefaultUserSecretMetaParams{
-				UserID: userID,
-				Kind:   store.KindAnthropicToken,
-			})
-			if err != nil {
-				// No default at all (ErrNoRows) means there is nothing to compare the
-				// exclusion against: fall through to spending `base`, which the token-less
-				// user's claim already fails downstream with its existing reason. Do NOT
-				// fail the claim here (D7).
-				if errors.Is(err, pgx.ErrNoRows) {
-					return secretChoice{secretID: base, reason: string(out.Reason)}, nil
-				}
-				return secretChoice{}, fmt.Errorf("resolve owner default for dead-credential exclusion: %w", err)
-			}
-			id := meta.ID
-			resolved = &id
-		}
-		if *resolved == exclude {
-			// The fallback would spend the very credential this run just parked on. Pick a
-			// deterministic alternative — the auto-eligible candidate with the lowest
-			// secret-id bytes that is not the excluded one — so the choice is stable across
-			// claims and testable. Restricted to AutoEligible: never spend a token the user
-			// kept out of auto.
-			if alt, ok := lowestAltCandidate(cands, exclude); ok {
-				return secretChoice{secretID: &alt, reason: string(out.Reason)}, nil
-			}
-		}
-		// `resolved` differs from the exclusion, or no alternative exists: spend the
-		// default (SC4 — auto never fails a run).
-		return secretChoice{secretID: base, reason: string(out.Reason)}, nil
+	if out.Picked {
+		id := out.SecretID
+		// The gauge is a SMALLINT 0..100 and headroom is derived from it by subtraction,
+		// so the value is in range by construction and the narrowing cannot truncate.
+		// runs.anthropic_headroom_pct carries a CHECK BETWEEN 0 AND 100 as the backstop.
+		h := int16(out.Headroom)
+		return secretChoice{secretID: &id, reason: string(out.Reason), headroom: &h}, nil
 	}
-	id := out.SecretID
-	// The gauge is a SMALLINT 0..100 and headroom is derived from it by subtraction,
-	// so the value is in range by construction and the narrowing cannot truncate.
-	// runs.anthropic_headroom_pct carries a CHECK BETWEEN 0 AND 100 as the backstop.
-	h := int16(out.Headroom)
-	return secretChoice{secretID: &id, reason: string(out.Reason), headroom: &h}, nil
+	// NOT picked. The auto lane NEVER resolves the non-pooled owner default (#754).
+	// Floor spends the best pooled token — always unmeasured here, since a measurable
+	// one would have been Picked as best_of_pool — recorded as pool_stale, no headroom.
+	if floorID, ok := autoselect.Floor(cands, exclude, s.now()); ok {
+		id := floorID
+		return secretChoice{secretID: &id, reason: string(autoselect.ReasonPoolStale)}, nil
+	}
+	// Genuinely nothing pooled to spend (empty pool, or the only pooled token is the
+	// excluded dead credential). M2 interim: do NOT spend the default and do NOT
+	// hard-fail — signal an empty-pool hold that recoverClaimAssembly requeues.
+	// (M4 will replace this with the pool_wait state.)
+	return secretChoice{}, errAutoPoolEmpty
 }
 
-// lowestAltCandidate returns the auto-eligible candidate with the lowest secret-id
-// bytes that is NOT the excluded credential (PRD #217 M2's conditional fallback). The
-// lowest-bytes rule is a total order over ids that are unique per row, so the pick is
-// deterministic across claims — which is what makes it assertable in a test — and
-// mirrors tieLess's final leg in autoselect. AutoEligible-only: the fallback must
-// never spend a token the user excluded from the auto pool.
-func lowestAltCandidate(cands []autoselect.Candidate, exclude uuid.UUID) (uuid.UUID, bool) {
-	var best uuid.UUID
-	found := false
-	for _, c := range cands {
-		if !c.AutoEligible || c.SecretID == exclude {
-			continue
-		}
-		if !found || bytes.Compare(c.SecretID[:], best[:]) < 0 {
-			best, found = c.SecretID, true
-		}
+// autoFloorRetry recomputes an auto credential after a picked (or floored) token
+// failed to open (D14, #754 M2). It re-lists the user's pooled candidates, drops
+// failedID (the token that just would not decrypt), and floors over the rest — still
+// honouring the run's just-parked dead credential — so an undecryptable pooled pick
+// falls to ANOTHER pooled token, NEVER the non-pooled owner default.
+//
+// It records reason=open_failed, which fails autoLaneRetryable, so a second open
+// failure is terminal by structure. Returns errCredentialUnavailable when no other
+// pooled token is available (terminal; the caller fails the run rather than spending
+// the default). A candidate-query error propagates as-is — a DB blip is not "the pool
+// is empty", the same reasoning autoChoice uses.
+func (s *Service) autoFloorRetry(ctx context.Context, run store.Run, failedID uuid.UUID) (secretChoice, error) {
+	exclude := uuid.Nil
+	if run.LimitDeadSecretID.Valid {
+		exclude = uuid.UUID(run.LimitDeadSecretID.Bytes)
 	}
-	return best, found
+	rows, err := s.q.ListAutoSelectCandidates(ctx, run.UserID)
+	if err != nil {
+		return secretChoice{}, fmt.Errorf("auto-floor-retry candidates: %w", err)
+	}
+	cands := make([]autoselect.Candidate, 0, len(rows))
+	for _, row := range rows {
+		c := autoselectrow.FromCandidateRow(row)
+		if c.SecretID == failedID {
+			continue // the pick that just failed to open must not be re-floored onto
+		}
+		cands = append(cands, c)
+	}
+	floorID, ok := autoselect.Floor(cands, exclude, s.now())
+	if !ok {
+		// No OTHER pooled token to spend — terminal. Never fall to the non-pooled
+		// default (#754); recoverClaimAssembly fails the run on errCredentialUnavailable.
+		return secretChoice{}, fmt.Errorf("%w: no other pooled Anthropic token after open failure", errCredentialUnavailable)
+	}
+	id := floorID
+	return secretChoice{secretID: &id, reason: string(autoselect.ReasonOpenFailed)}, nil
 }
 
 // workerSecretID is a worker's Anthropic binding as openAnthropic's override: nil
@@ -1916,33 +1935,39 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 	cred, err := s.openAnthropic(ctx, run.UserID, choice.secretID)
 	if err != nil {
-		// 🔴 D14. Without this arm, D7's "auto never fails a run" is simply untrue.
-		// recoverClaimAssembly maps errCredentialUnavailable to MarkRunFailedByID — a
-		// TERMINAL failure — so a token that passes the gauge gate and then will not
-		// decrypt (a rotated UZI_SECRET_KEY, a corrupt row, a token deleted between the
-		// ranking query and the open) kills a run the owner default would have
-		// completed. That is the optimizer newly failing runs that static binding
-		// finished, which is the one outcome D7 exists to forbid.
+		// 🔴 D14, reshaped by #754 M2. Without this arm, "auto never fails a run" is
+		// simply untrue. recoverClaimAssembly maps errCredentialUnavailable to
+		// MarkRunFailedByID — a TERMINAL failure — so a token that passes the gauge gate
+		// and then will not decrypt (a rotated UZI_SECRET_KEY, a corrupt row, a token
+		// deleted between the ranking query and the open) kills a run another POOLED
+		// token could have completed.
+		//
+		// #754: the retry NEVER lands on workerSecretID(wkr)/nil/the non-pooled owner
+		// default. autoFloorRetry re-floors onto ANOTHER pooled token (excluding the
+		// pick that just failed, and still honouring the run's dead-secret exclude); when
+		// no other pooled token remains it returns errCredentialUnavailable and the run
+		// fails terminally rather than spending the default.
 		//
 		// Scoped as tightly as it can be, on three axes:
-		//   - only a credential the SELECTOR named (choice.autoPicked) — a pinned or
-		//     judge binding that will not open still fails, because the user named it;
+		//   - only a credential the AUTO lane resolved (choice.autoLaneRetryable) — a
+		//     selector pick or a floor pick, never pinned/default/judge, which the user
+		//     named and whose failure is how they learn the token is broken;
 		//   - only errCredentialUnavailable. NOT errVaultLocked: that path already
 		//     requeues the run, which is transient and correct, and retrying it would
 		//     convert a wait into a spend on the wrong account;
-		//   - exactly ONCE, and the code is safer than the first version of this comment.
-		//     That version argued from the ID: the retry target is workerSecretID(wkr),
-		//     nil for an auto worker, so it cannot satisfy autoPicked. True, but it rests
-		//     on the `auto ⇒ id IS NULL` invariant, which a future third writer of
-		//     workers.anthropic_secret_id could break without touching this line. The
-		//     STRONGER reason, and the one that holds regardless: the retry sets
-		//     reason=open_failed, so autoPicked fails on its REASON conjunct whatever the
-		//     id turns out to be. The structure forbids a second round; no counter, and
-		//     no dependency on an invariant enforced three files away.
-		if !choice.autoPicked() || !errors.Is(err, errCredentialUnavailable) {
+		//   - exactly ONCE, by STRUCTURE. autoFloorRetry records reason=open_failed, which
+		//     fails autoLaneRetryable on its REASON conjunct whatever the id turns out to
+		//     be — so a second open failure is terminal with no counter and no dependency
+		//     on an invariant enforced three files away.
+		if !choice.autoLaneRetryable() || !errors.Is(err, errCredentialUnavailable) {
 			return nil, err
 		}
-		choice = secretChoice{secretID: workerSecretID(wkr), reason: string(autoselect.ReasonOpenFailed)}
+		// autoLaneRetryable guarantees a non-nil secretID; read it BEFORE overwriting.
+		failedID := *choice.secretID
+		choice, err = s.autoFloorRetry(ctx, run, failedID)
+		if err != nil {
+			return nil, err
+		}
 		cred, err = s.openAnthropic(ctx, run.UserID, choice.secretID)
 		if err != nil {
 			return nil, err
