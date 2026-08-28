@@ -76,6 +76,14 @@ type Engine struct {
 	// same tick populates.
 	ciAutoFix *CIAutoFix
 
+	// mrReviewWatch runs the post-SyncMRStates MR-review-rework detection (PRD #700 M3)
+	// as a sibling of the CI-autofix detector. Optional (nil-safe): nil disables
+	// detection — the instance kill-switch — so tests and any deployment without
+	// MR-review-watcher wiring keep the plain sync behaviour. Set via SetMRReviewWatch.
+	// Like ciAutoFix it fires only when the pipeline watch is on (pipelineMaxRefs > 0),
+	// since it reads the same pipeline cache for the green-head-pipeline gate.
+	mrReviewWatch *MRReviewWatch
+
 	// projectReverse runs the per-tick GitHub Projects v2 reverse (Status → label)
 	// sync (PRD #364 M6) as a sibling of the other post-sync steps. Optional
 	// (nil-safe): nil disables reverse sync — a deployment or test without
@@ -139,6 +147,13 @@ func (e *Engine) SetAutopilot(a *Autopilot) { e.autopilot = a }
 // sync still runs, no automatic ci_fix runs are created and no autofix comments are
 // posted. NOT wiring it is the instance kill-switch, exactly like SetAutopilot.
 func (e *Engine) SetCIAutoFix(d *CIAutoFix) { e.ciAutoFix = d }
+
+// SetMRReviewWatch wires the post-SyncMRStates MR-review-rework detector (PRD #700
+// M3). Call once at startup, before Run. A nil detector (the default) disables the
+// MR-review watcher: the sync still runs, no automatic mr_rework runs are created and
+// no rework comments are posted. NOT wiring it is the instance kill-switch, exactly
+// like SetCIAutoFix.
+func (e *Engine) SetMRReviewWatch(d *MRReviewWatch) { e.mrReviewWatch = d }
 
 // SetProjectReverseSync wires the per-tick GitHub Projects v2 reverse (Status →
 // label) sync (PRD #364 M6). Call once at startup, before Run. A nil syncer (the
@@ -411,6 +426,18 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	// errors are handled inside; nothing surfaces here.
 	if e.pipelineMaxRefs > 0 && e.ciAutoFix != nil {
 		e.ciAutoFix.detect(ctx, r, f)
+	}
+
+	// MR-review-rework detection (PRD #700 M3): also post-sync, a sibling of the
+	// CI-autofix detector. It runs AFTER SyncMRStates above (Decision 10 — a fresh
+	// close/merge is authoritative for the card move, and the detector gates on the
+	// watcher-owned mr_state, so it never reworks a just-closed MR) and beside the
+	// CI-autofix detect, reading the same fresh pipeline-status cache for the
+	// green-head-pipeline gate. Gated on the pipeline watch being on and the detector
+	// being wired (the instance kill-switch); the admin kill-switch + per-user opt-in +
+	// per-MR cap gate activation inside it. All per-candidate errors are handled inside.
+	if e.pipelineMaxRefs > 0 && e.mrReviewWatch != nil {
+		e.mrReviewWatch.detect(ctx, r, f)
 	}
 
 	// Reverse Status→label sync (PRD #364 M6): a genuine per-tick sibling (NOT gated

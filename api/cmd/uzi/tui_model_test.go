@@ -1537,7 +1537,7 @@ func TestTUIBoardSemanticStatusAndSummary(t *testing.T) {
 		t.Errorf("board has no background-fill SGR; the warm selection bar is missing\n%s", out)
 	}
 	// The NO_COLOR-safe state glyph for a running run survives independent of colour.
-	if g, _ := stateGlyphWord("running", "", false); !strings.Contains(out, g) {
+	if g, _ := stateGlyphWord("running", "", false, false); !strings.Contains(out, g) {
 		t.Errorf("running state glyph %q absent from the board\n%s", g, out)
 	}
 }
@@ -1556,6 +1556,31 @@ func TestTUIBoardSummaryCountsFollowupPark(t *testing.T) {
 	m = next.(tuiModel)
 	if got := m.boardSummary(); !strings.Contains(got, "➤ 1") {
 		t.Errorf("board summary omits the follow-up park (want a ➤ 1 segment): %q", got)
+	}
+}
+
+// TestTUIBoardSummaryExcludesRevisingApproval pins issue #750 in the summary cluster: a run
+// mid-"revise" replan keeps status == awaiting_approval but is NOT the user's turn, so it must
+// not inflate the ⚑ counter. With one genuine plan-gate run and one revising run the cluster
+// must read "⚑ 1" (not "⚑ 2"), matching the NEEDS YOU band — where the revising run does NOT
+// belong. Mutation that reddens this: dropping the !r.IsRevising gate in boardSummary.
+func TestTUIBoardSummaryExcludesRevisingApproval(t *testing.T) {
+	genuine := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "awaiting_approval", IssueTitle: "plan gate"}}
+	revising := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "awaiting_approval", IssueTitle: "re-planning"}, IsRevising: true}
+	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{genuine, revising}}
+	m := tuiTestModel(t, fake, "")
+	next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
+	m = next.(tuiModel)
+	got := m.boardSummary()
+	if !strings.Contains(got, "⚑ 1") || strings.Contains(got, "⚑ 2") {
+		t.Errorf("board summary must count only the genuine plan gate (want ⚑ 1, not ⚑ 2): %q", got)
+	}
+	// The revising run drops to ON THE FLOOR; only the genuine plan gate sits in NEEDS YOU.
+	if b := runBand(revising.Status, revising.IsRevising); b == bandNeedsYou {
+		t.Errorf("revising awaiting_approval run must not be in NEEDS YOU, got band %d", b)
+	}
+	if b := runBand(genuine.Status, genuine.IsRevising); b != bandNeedsYou {
+		t.Errorf("genuine awaiting_approval run must be in NEEDS YOU, got band %d", b)
 	}
 }
 

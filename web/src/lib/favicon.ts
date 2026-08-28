@@ -6,7 +6,7 @@
 // not unit-tested). The favicon is ALWAYS the ember brand mark, theme-independent:
 // a tab has no theme context, so it must read on any browser chrome.
 
-import { isStoppedRun, needsHumanAttention } from "./runBadge";
+import { effectiveRunStatus, isStoppedRun, needsHumanAttention } from "./runBadge";
 import type { StopKind } from "./api";
 
 // FaviconState is the derived tab signal, most-urgent first in the priority ladder.
@@ -15,7 +15,14 @@ export type FaviconState = "failed" | "attention" | "running" | "idle";
 
 // FaviconRun is the minimal run shape the derivation reads — satisfied by
 // RunListItem, so the hook can pass its poll result straight through without a map.
-export type FaviconRun = { id: string; status: string; stop_kind: StopKind | null };
+// is_revising (issue #750) rides along so the attention check can classify from the
+// EFFECTIVE status: a run re-planning after a revise must not light the attention dot.
+export type FaviconRun = {
+  id: string;
+  status: string;
+  stop_kind: StopKind | null;
+  is_revising?: boolean;
+};
 
 // The non-terminal, actively-progressing statuses that make the mark "running".
 const RUNNING_STATUSES = new Set<string>(["queued", "claimed", "running"]);
@@ -52,7 +59,11 @@ export function deriveFaviconState(
   baselineFailedIds: Set<string>,
 ): FaviconState {
   if (runs.some((r) => isFreshFailure(r, baselineFailedIds))) return "failed";
-  if (unread > 0 || runs.some((r) => needsHumanAttention(r.status))) return "attention";
+  // issue #750: classify from the EFFECTIVE status so a run re-planning after a revise
+  // (status still "awaiting_approval" server-side, but effectiveRunStatus → "revising")
+  // does NOT light the attention dot. The failure and running branches are unaffected.
+  if (unread > 0 || runs.some((r) => needsHumanAttention(effectiveRunStatus(r))))
+    return "attention";
   if (runs.some((r) => RUNNING_STATUSES.has(r.status))) return "running";
   return "idle";
 }

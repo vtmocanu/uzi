@@ -257,6 +257,15 @@ type IssueProposal struct {
 	ConfirmingSince pgtype.Timestamptz `json:"confirming_since"`
 }
 
+type MrReworkLedger struct {
+	RepoID       uuid.UUID          `json:"repo_id"`
+	Ref          string             `json:"ref"`
+	AttemptCount int32              `json:"attempt_count"`
+	HighWater    int64              `json:"high_water"`
+	HaltNotified bool               `json:"halt_notified"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+}
+
 type Notification struct {
 	ID        uuid.UUID          `json:"id"`
 	UserID    uuid.UUID          `json:"user_id"`
@@ -446,6 +455,7 @@ type Run struct {
 	PlanChangedFiles      []string           `json:"plan_changed_files"`
 	ScopeCeiling          pgtype.Int4        `json:"scope_ceiling"`
 	StatusSince           pgtype.Timestamptz `json:"status_since"`
+	ReviewComments        []byte             `json:"review_comments"`
 }
 
 type RunMessage struct {
@@ -623,6 +633,7 @@ type User struct {
 	SummaryModel            pgtype.Text        `json:"summary_model"`
 	EphemeralWorkersEnabled bool               `json:"ephemeral_workers_enabled"`
 	DefaultEffort           pgtype.Text        `json:"default_effort"`
+	MrReworkEnabled         pgtype.Bool        `json:"mr_rework_enabled"`
 }
 
 type UserSecret struct {

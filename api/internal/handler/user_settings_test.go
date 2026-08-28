@@ -36,6 +36,7 @@ type fakeSettingsDB struct {
 	judge      pgtype.Text
 	summary    pgtype.Text
 	theme      pgtype.Text
+	mrRework   pgtype.Bool
 	sidebarIDs []uuid.UUID
 }
 
@@ -69,6 +70,10 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		if t, ok := args[0].(pgtype.Text); ok {
 			f.theme = t // SetUserTheme: $1 = theme
 		}
+	case strings.Contains(sql, "UPDATE users SET mr_rework_enabled") && len(args) >= 1:
+		if b, ok := args[0].(pgtype.Bool); ok {
+			f.mrRework = b // SetUserMrReworkEnabled: $1 = mr_rework_enabled
+		}
 	case strings.Contains(sql, "UPDATE users SET sidebar_token_ids") && len(args) >= 1:
 		if ids, ok := args[0].([]uuid.UUID); ok {
 			f.sidebarIDs = ids // SetUserSidebarTokens: $1 = sidebar_token_ids
@@ -80,6 +85,7 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		judge:      f.judge,
 		summary:    f.summary,
 		theme:      f.theme,
+		mrRework:   f.mrRework,
 		sidebarIDs: f.sidebarIDs,
 	}
 }
@@ -90,20 +96,24 @@ type fakeSettingsRow struct {
 	judge      pgtype.Text
 	summary    pgtype.Text
 	theme      pgtype.Text
+	mrRework   pgtype.Bool
 	sidebarIDs []uuid.UUID
 }
 
 func (r fakeSettingsRow) Scan(dest ...any) error {
 	switch len(dest) {
 	case 1:
-		// The only single-column reads left are write-path RETURNINGs (SetUser*),
-		// which the handler discards, so any Text suffices.
+		// Single-column reads are write-path RETURNINGs (SetUser*), which the handler
+		// discards. Most return a Text column; SetUserMrReworkEnabled returns a Bool.
 		if p, ok := dest[0].(*pgtype.Text); ok {
 			*p = r.model
 		}
-	case 6:
+		if p, ok := dest[0].(*pgtype.Bool); ok {
+			*p = r.mrRework
+		}
+	case 7:
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
-		// summary_model, theme, sidebar_token_ids.
+		// summary_model, theme, sidebar_token_ids, mr_rework_enabled.
 		if p, ok := dest[0].(*pgtype.Text); ok {
 			*p = r.model
 		}
@@ -121,6 +131,9 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		}
 		if p, ok := dest[5].(*[]uuid.UUID); ok {
 			*p = r.sidebarIDs
+		}
+		if p, ok := dest[6].(*pgtype.Bool); ok {
+			*p = r.mrRework
 		}
 	}
 	return nil
@@ -709,5 +722,119 @@ func TestPutMySettingsModelOnlyLeavesEffortUntouched(t *testing.T) {
 	}
 	if got := decodeEffort(t, rec.Body.Bytes()); got == nil || *got != "high" {
 		t.Fatalf("response default_effort = %v, want the untouched \"high\"", got)
+	}
+}
+
+// decodeMrRework pulls the mr_rework_enabled field out of a /me/settings response.
+func decodeMrRework(t *testing.T, body []byte) *bool {
+	t.Helper()
+	var resp struct {
+		Settings struct {
+			MrReworkEnabled *bool `json:"mr_rework_enabled"`
+		} `json:"settings"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode settings response %s: %v", body, err)
+	}
+	return resp.Settings.MrReworkEnabled
+}
+
+// A NULL mr_rework_enabled column (the default-ON, opted-in state) serializes as
+// JSON null so the client distinguishes "unset" from an explicit false (PRD #700 M5).
+func TestGetMySettingsNullMrReworkSerializesAsNull(t *testing.T) {
+	h := &Handler{q: store.New(&fakeSettingsDB{})} // mrRework zero ⇒ NULL
+	rec := httptest.NewRecorder()
+	h.GetMySettings(rec, authed(httptest.NewRequest(http.MethodGet, "/api/me/settings", nil)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := decodeMrRework(t, rec.Body.Bytes()); got != nil {
+		t.Fatalf("mr_rework_enabled = %v, want null (unset = default-ON)", *got)
+	}
+}
+
+// A stored explicit false (the opt-OUT) is surfaced verbatim.
+func TestGetMySettingsReturnsStoredMrRework(t *testing.T) {
+	h := &Handler{q: store.New(&fakeSettingsDB{mrRework: pgtype.Bool{Bool: false, Valid: true}})}
+	rec := httptest.NewRecorder()
+	h.GetMySettings(rec, authed(httptest.NewRequest(http.MethodGet, "/api/me/settings", nil)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	got := decodeMrRework(t, rec.Body.Bytes())
+	if got == nil || *got != false {
+		t.Fatalf("mr_rework_enabled = %v, want explicit false (opted out)", got)
+	}
+}
+
+// PUT of an explicit false stores the opt-out and round-trips it back.
+func TestPutMySettingsMrReworkRoundTrip(t *testing.T) {
+	db := &fakeSettingsDB{}
+	h := &Handler{q: store.New(db)}
+	rec := httptest.NewRecorder()
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"mr_rework_enabled":false}`))))
+	h.PutMySettings(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := decodeMrRework(t, rec.Body.Bytes()); got == nil || *got != false {
+		t.Fatalf("response mr_rework_enabled = %v, want false", got)
+	}
+	if !db.mrRework.Valid || db.mrRework.Bool != false {
+		t.Fatalf("stored mr_rework_enabled = %+v, want a set false (opt-out)", db.mrRework)
+	}
+}
+
+// PUT of a present-null clears the opt-out back to NULL = the default-ON state.
+func TestPutMySettingsNullMrReworkClearsToDefault(t *testing.T) {
+	db := &fakeSettingsDB{mrRework: pgtype.Bool{Bool: false, Valid: true}}
+	h := &Handler{q: store.New(db)}
+	rec := httptest.NewRecorder()
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"mr_rework_enabled":null}`))))
+	h.PutMySettings(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := decodeMrRework(t, rec.Body.Bytes()); got != nil {
+		t.Fatalf("response mr_rework_enabled = %v, want null after clearing to default-ON", *got)
+	}
+	if db.mrRework.Valid {
+		t.Fatalf("stored mr_rework_enabled should be NULL after a null clear, got %+v", db.mrRework)
+	}
+}
+
+// A non-bool mr_rework_enabled body is a 400 and does not touch the stored value.
+func TestPutMySettingsRejectsNonBoolMrRework(t *testing.T) {
+	db := &fakeSettingsDB{mrRework: pgtype.Bool{Bool: false, Valid: true}}
+	h := &Handler{q: store.New(db)}
+	rec := httptest.NewRecorder()
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"mr_rework_enabled":"yes"}`))))
+	h.PutMySettings(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a non-bool mr_rework_enabled; body=%s", rec.Code, rec.Body.String())
+	}
+	if !db.mrRework.Valid || db.mrRework.Bool != false {
+		t.Fatalf("stored mr_rework_enabled must be untouched by a rejected value, got %+v", db.mrRework)
+	}
+}
+
+// An mr_rework-only PUT must not clobber the stored default_model (PATCH-like).
+func TestPutMySettingsMrReworkOnlyLeavesModelUntouched(t *testing.T) {
+	db := &fakeSettingsDB{model: pgtype.Text{String: "opus", Valid: true}}
+	h := &Handler{q: store.New(db)}
+	rec := httptest.NewRecorder()
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"mr_rework_enabled":false}`))))
+	h.PutMySettings(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !db.model.Valid || db.model.String != "opus" {
+		t.Fatalf("default_model must be untouched by an mr_rework-only PUT, got %+v", db.model)
 	}
 }

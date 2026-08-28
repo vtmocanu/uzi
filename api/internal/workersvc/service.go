@@ -311,6 +311,10 @@ type Store interface {
 	CreateRun(ctx context.Context, arg store.CreateRunParams) (store.Run, error)
 	// CI-fix runs (PRD #6).
 	CreateCIFixRun(ctx context.Context, arg store.CreateCIFixRunParams) (store.Run, error)
+	// MR review-watcher rework runs (PRD #700 M3): the create path + its create-time
+	// cross-kind branch guard.
+	CreateAutoMRReworkRun(ctx context.Context, arg store.CreateAutoMRReworkRunParams) (store.Run, error)
+	CountActiveBranchRunsForRef(ctx context.Context, arg store.CountActiveBranchRunsForRefParams) (int64, error)
 	// Self-improvement runs (PRD #46 Decision 10).
 	CreateSelfImproveRun(ctx context.Context, arg store.CreateSelfImproveRunParams) (store.Run, error)
 	// Scheduled prompt runs (PRD #241).
@@ -403,6 +407,9 @@ type Store interface {
 	// /runs judge badge (PRD #98 M4): per-recommendation triage facts for the runs on one
 	// page, bucketed in Go by the shared BucketOf — never counted in SQL.
 	ListJudgeTriageRowsForRuns(ctx context.Context, arg store.ListJudgeTriageRowsForRunsParams) ([]store.ListJudgeTriageRowsForRunsRow, error)
+	// /runs + board plan-revise flag (issue #750): the plan-ish message rows for a page of
+	// runs, folded into the is_revising set in Go by planRevisingSet — never in SQL.
+	ListPlanRevisionStateForRuns(ctx context.Context, runIds []uuid.UUID) ([]store.ListPlanRevisionStateForRunsRow, error)
 	ListOwnedRecommendationsForCoords(ctx context.Context, arg store.ListOwnedRecommendationsForCoordsParams) ([]store.ListOwnedRecommendationsForCoordsRow, error)
 	// The fan-out write itself: ONE multi-row upsert over the RESOLVED coordinates, so a
 	// bulk call is a single round-trip that cannot half-apply (PRD #98 M2, audit NB-A).
@@ -2049,6 +2056,19 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		}
 	}
 
+	// PRD #700 M2: replay the structured MR review-comments snapshot captured at
+	// mr_rework run creation. A malformed column degrades to nil-and-log rather than
+	// failing the claim, exactly like the issue-comments decode above.
+	var reviewComments *ReviewCommentsSnapshot
+	if len(run.ReviewComments) > 0 {
+		var snap ReviewCommentsSnapshot
+		if err := json.Unmarshal(run.ReviewComments, &snap); err != nil {
+			slog.Error("workersvc: decode run review comments", "run_id", run.ID, "error", err)
+		} else {
+			reviewComments = &snap
+		}
+	}
+
 	// Run-summary model resolution is user-value-wins (PRD #362 Decision 8), the same
 	// shape as the judge model in assembleJudgeClaim but delivered on this ISSUE-run
 	// claim: the run owner's per-user summary_model overrides the instance
@@ -2089,7 +2109,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		IssueDescription: run.IssueDescription,
 		// PRD #381: the structured comments snapshot, decoded above. omitempty keeps a
 		// comment-less run's claim byte-identical to today's.
-		IssueComments:  issueComments,
+		IssueComments: issueComments,
+		// PRD #700 M2: the MR review-comments snapshot, decoded above. omitempty keeps
+		// every non-mr_rework run's claim byte-identical to today's wire.
+		ReviewComments: reviewComments,
 		Status:         run.Status,
 		Pipeline:       pipeline,
 		Branch:         textPtr(run.Branch),
@@ -3963,6 +3986,16 @@ type ForgeConn struct {
 	// route to drop uzi's own bot-authored comments (PRD #381 M4, D1). Zero when the
 	// legacy connection never recorded one, in which case comments are omitted (D9).
 	BotForgeUserID int64
+	// MRIID is the run's source merge-request iid (PRD #700 M4), nil when the run
+	// carries none. The mr_rework write-back endpoints resolve/reply against THIS iid
+	// — never a client-supplied one — so an injected id cannot redirect a write to a
+	// different MR.
+	MRIID *int64
+	// ReviewComments is the run's raw runs.review_comments JSONB (PRD #700 M4), nil/
+	// empty when the run has no MR review snapshot. The mr_rework write-back endpoints
+	// unmarshal it into a ReviewCommentsSnapshot and reject any reply/resolve id not
+	// present in it (the Decision-11 server-side scope check).
+	ReviewComments []byte
 }
 
 // ForgeConnForRun authorizes a worker's forge read against a run it holds and returns
@@ -3990,12 +4023,22 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 		}
 		return ForgeConn{}, err
 	}
+	// PRD #700 M4: carry the run's source mr_iid and raw review-comments snapshot from
+	// the SAME owned run read, so the mr_rework write-back endpoints can enforce the
+	// Decision-11 scope check without a second (unscoped) run read.
+	var mrIID *int64
+	if run.MrIid.Valid {
+		v := run.MrIid.Int64
+		mrIID = &v
+	}
 	return ForgeConn{
 		ForgeType:       row.ForgeType,
 		BaseUrl:         row.BaseUrl,
 		TokenCiphertext: row.TokenCiphertext,
 		ForgeProjectID:  row.ForgeProjectID,
 		BotForgeUserID:  row.BotForgeUserID,
+		MRIID:           mrIID,
+		ReviewComments:  run.ReviewComments,
 	}, nil
 }
 
@@ -4671,6 +4714,10 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		// nil (→ NULL) for a non-issue kind, a comment-less issue, an unknown bot id
 		// (D9), or when no forge builder is wired (tests).
 		IssueComments: issueCommentsJSON,
+		// PRD #700 M2: issue runs never carry MR review comments — always NULL here.
+		// The mr_rework create path (M3's CreateAutoMRReworkRun) fetches the MR review
+		// snapshot via fetchReviewCommentsSnapshot and populates this itself.
+		ReviewComments: nil,
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

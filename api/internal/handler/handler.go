@@ -1546,6 +1546,15 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Get("/runs/{id}/forge/pipelines/{pipeline_id}/jobs", h.WorkerForgePipelineJobs)
 		r.Get("/runs/{id}/forge/latest-pipeline", h.WorkerForgeLatestPipeline)
 
+		// Forge WRITE surface (PRD #700 M4): the mr_rework run's write-back — reply in
+		// and resolve the MR review threads it addressed. The only worker-mediated forge
+		// WRITES besides git push + MR create + label. Each derives the mr_iid from the
+		// OWNED run and enforces the Decision-11 scope check server-side (the reply/
+		// resolve id must belong to a thread in THIS run's review snapshot), so an
+		// injected "resolve all open threads" is a no-op. Neither touches `main`.
+		r.Post("/runs/{id}/forge/mr-threads/reply", h.WorkerForgeReplyMRThread)
+		r.Post("/runs/{id}/forge/mr-threads/resolve", h.WorkerForgeResolveMRThread)
+
 		// Run judge (PRD #46 M3): a judge run reads the run it reviews and posts a
 		// verdict. Both are judge-run-scoped (the worker must own the active judge
 		// run reviewing {id}); {id} is the TARGET run, not the judge run.

@@ -61,6 +61,14 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		slog.Error("judge todo counts", "error", err)
 		todo = nil
 	}
+	// Plan-revise display flag for the runs on this page (issue #750). Same best-effort
+	// contract as the judge badge above: it is decoration, so a failure logs and leaves
+	// every flag false (nil map indexes to false) rather than failing the run list.
+	revising, err := h.wsvc.PlanRevisingForRuns(r.Context(), runIDs)
+	if err != nil {
+		slog.Error("plan revising states", "error", err)
+		revising = nil
+	}
 
 	out := make([]apitypes.RunListItemDTO, 0, len(rows))
 	for _, row := range rows {
@@ -76,6 +84,7 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		// nil stays nil for an unjudged run — absent, not a neutral verdict.
 		item.JudgeVerdict = textPtrValue(row.JudgeVerdict.Valid, row.JudgeVerdict.String)
 		item.JudgeTodoCount = todo[row.Run.ID]
+		item.IsRevising = revising[row.Run.ID] // nil map ⇒ false (issue #750)
 		out = append(out, item)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"runs": out})
@@ -90,6 +99,20 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	runIDs := make([]uuid.UUID, 0, len(rows))
+	for _, row := range rows {
+		runIDs = append(runIDs, row.Run.ID)
+	}
+	// Plan-revise display flag, same best-effort contract as ListRuns (issue #750): the
+	// admin CLI renders status through effectiveRunStatus(..., IsRevising), so without this
+	// a revising run would show as awaiting_approval here while the owner's own list says
+	// "revising". Decoration only — a failure logs and leaves every flag false.
+	revising, err := h.wsvc.PlanRevisingForRuns(r.Context(), runIDs)
+	if err != nil {
+		slog.Error("plan revising states", "error", err)
+		revising = nil
+	}
+
 	out := make([]apitypes.RunListItemDTO, 0, len(rows))
 	for _, row := range rows {
 		email := row.OwnerEmail
@@ -102,6 +125,7 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 		item.ForgeType = row.ForgeType // per-run MR/PR noun (PRD #65 D2)
 		// PRD #411: the joined forge issue web URL, nil for issue-less/uncached runs.
 		item.IssueWebURL = textPtrValue(row.IssueWebUrl.Valid, row.IssueWebUrl.String)
+		item.IsRevising = revising[row.Run.ID] // nil map ⇒ false (issue #750)
 		out = append(out, item)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"runs": out})

@@ -33,14 +33,20 @@ type ClaimPayload struct {
 	// issue's HUMAN comments captured at run creation (PRD #381). nil for every
 	// non-issue kind, a comment-less issue, and a connection with an unknown bot id
 	// (D9). The agent renders it under a per-prompt nonce fence (M3).
-	IssueComments  *IssueCommentsSnapshot `json:"issue_comments,omitempty"`
-	Status         string                 `json:"status"`
-	Branch         *string                `json:"branch"`     // resume: attach existing branch
-	SessionID      *string                `json:"session_id"` // resume: continue SDK session
-	LastSeq        int32                  `json:"last_seq"`   // resume: continue message numbering
-	IterationCount int32                  `json:"iteration_count"`
-	RequeueCount   int32                  `json:"requeue_count"`
-	PlanMd         *string                `json:"plan_md"` // resume: plan already captured
+	IssueComments *IssueCommentsSnapshot `json:"issue_comments,omitempty"`
+	// ReviewComments is the structured, bot-self-filtered, bounded snapshot of an MR's
+	// review comments (human + third-party review bots like CodeRabbit) captured for an
+	// mr_rework run (PRD #700 M2). nil for every non-mr_rework kind (issue runs never
+	// carry MR comments) and a connection with an unknown bot id (D9). The agent renders
+	// it under a per-prompt nonce fence (M4).
+	ReviewComments *ReviewCommentsSnapshot `json:"review_comments,omitempty"`
+	Status         string                  `json:"status"`
+	Branch         *string                 `json:"branch"`     // resume: attach existing branch
+	SessionID      *string                 `json:"session_id"` // resume: continue SDK session
+	LastSeq        int32                   `json:"last_seq"`   // resume: continue message numbering
+	IterationCount int32                   `json:"iteration_count"`
+	RequeueCount   int32                   `json:"requeue_count"`
+	PlanMd         *string                 `json:"plan_md"` // resume: plan already captured
 	// AutoApprove flags an autopilot run (PRD #19): the worker resolves the plan
 	// gate with an approve verdict instead of parking at awaiting_approval. It is
 	// top-level (read from the runs row), NOT in ClaimConfig — ClaimConfig is

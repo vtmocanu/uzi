@@ -3,9 +3,9 @@
 // inside SettingsShell so tokens/forge/access are one discoverable area. The
 // token LIST itself is AnthropicTokens (PRD #104 M6) — this page owns the fetch
 // so the list and the rate-limit meters refresh together. Run-behavior defaults
-// (autopilot, usage-limit park, judge, CI autofix, worker model) moved to the
-// Run defaults tab (RunDefaults.tsx): this tab is who you are and what you
-// hold, that one is how your runs behave.
+// (autopilot, usage-limit park, judge, CI autofix, MR review rework, worker
+// model) moved to the Run defaults tab (RunDefaults.tsx): this tab is who you
+// are and what you hold, that one is how your runs behave.
 
 import { useCallback, useEffect, useState } from "react";
 import { useAuth } from "../auth/AuthContext";

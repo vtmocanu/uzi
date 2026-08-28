@@ -200,6 +200,15 @@ always wins here too. A card stuck in Human Review from before this
 behavior existed (an MR close uzi never observed) needs one manual drag to
 unstick; automation keeps it in sync from then on.
 
+Closing the MR is the coarse version of "needs rework" — it throws away the
+review in place of starting over. For opted-in users there's a finer path
+too: the [MR review watcher](./mr-review-watcher.md) reacts to new review
+comments directly, without anyone closing anything, folding fixes onto the
+same branch and MR and replying to (and, where the forge allows it,
+resolving) each thread. Its runs don't move the card at all — it stays in
+**Human Review** the whole time, since the point is to settle the open
+findings before a human looks again, not to reopen the review cycle.
+
 ## Run badges
 
 Each card shows its latest run at a glance: **queued**/**claimed** while

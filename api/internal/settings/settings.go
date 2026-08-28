@@ -219,6 +219,18 @@ const (
 	KeyBrandCompany    = "brand_company"      // ≤64-rune company text (may be ""), rendered to every principal incl. signed-out
 	KeyBrandPlacement  = "brand_placement"    // "below" | "topright"
 	KeyBrandPlaque     = "brand_plaque"       // "true" | "false"
+	// MR review-watcher admin gates (PRD #700 M5, Decision 5). mr_rework_enabled is
+	// the global kill-switch (text "true"/"false"); mr_rework_cap is the admin cap on
+	// rework cycles per MR (a positive integer, mirroring ci-autofix's maxAttempts).
+	// BOTH default ON/5 — this feature ships enabled, the opposite of the judge's
+	// default-off (Decision 5) — so the enabled read is a THREE-STATE read
+	// (present-true / present-false / absent → the default ON) that PROPAGATES a store
+	// read error rather than collapsing it into the value: the caller (the M3
+	// detector) maps that error to OFF (fail closed). Admin-writable with compiled-in
+	// defaults; no seeded row (an absent row synthesizes to the default). The per-user
+	// opt-in lives on users.mr_rework_enabled, not here.
+	KeyMrReworkEnabled = "mr_rework_enabled"
+	KeyMrReworkCap     = "mr_rework_cap"
 )
 
 // Compiled-in defaults, used when a row is absent so a fresh or partially
@@ -330,6 +342,13 @@ const (
 	DefaultBrandCompany    = ""
 	DefaultBrandPlacement  = "below"
 	DefaultBrandPlaque     = "false"
+	// PRD #700 M5 Decision 5. The MR review watcher ships ON: an admin global
+	// kill-switch (default true — the OPPOSITE of the judge's default-off, an
+	// announced behavior change) and a per-MR rework-cycle cap (default 5, mirroring
+	// ci-autofix's maxAttempts). Both are the admin-side gates; the per-user opt-in
+	// (also default-on) lives on users.mr_rework_enabled.
+	DefaultMrReworkEnabled = "true"
+	DefaultMrReworkCap     = "5"
 )
 
 // healthSecondsMin / healthSecondsMax bound the integer health settings (Decision
@@ -355,6 +374,12 @@ const maxHostedWorkerQuota = 20
 // runs thousands of judges a day — so an admin meaning 50 and typing 50000 gets a
 // rejected write instead of an effectively-unlimited guard.
 const maxJudgeDailyBudget = 10000
+
+// maxMrReworkCap bounds the per-MR rework-cycle cap (PRD #700 M5 Decision 2). The
+// cap is a small loop guard (default 5, mirroring ci-autofix's maxAttempts), so the
+// upper bound only catches a fat-fingered value — no MR legitimately needs hundreds
+// of automated rework cycles.
+const maxMrReworkCap = 100
 
 // maxLabelLen is Decision 8's length cap (runes, not bytes).
 const maxLabelLen = 64
@@ -462,6 +487,11 @@ var Defaults = map[string]string{
 	KeyBrandCompany:    DefaultBrandCompany,
 	KeyBrandPlacement:  DefaultBrandPlacement,
 	KeyBrandPlaque:     DefaultBrandPlaque,
+	// PRD #700 M5 MR review-watcher admin gates. Same no-seeded-row pattern as the
+	// judge keys: an absent row synthesizes to these defaults, so All/AdminView
+	// surface them to the settings page on every instance and no migration seeds them.
+	KeyMrReworkEnabled: DefaultMrReworkEnabled,
+	KeyMrReworkCap:     DefaultMrReworkCap,
 }
 
 // SecretKeys is the set of settings whose values are secrets (PRD #25): sealed
@@ -823,6 +853,53 @@ func (c *Cache) EphemeralWorkersEnabled(ctx context.Context) (bool, error) {
 	default:
 		return DefaultEphemeralWorkersEnabled == "true", err
 	}
+}
+
+// MrReworkEnabled reports whether the MR review-watcher auto-rework feature is
+// enabled instance-wide (PRD #700 M5 Decision 5): the admin global kill-switch.
+// Stored as the text "true"/"false"; any OTHER value falls back to the compiled-in
+// default (true). This feature ships ON — the opposite of JudgeEnabled — so a
+// malformed row never silently turns a default-on feature off.
+//
+// The read is DELIBERATELY three-state and error-propagating, not the best-effort
+// swallow the other bool readers use. Decision 5 (review-fix R3) requires reconciling
+// default-ON with fail-closed by distinguishing present-true / present-false / absent
+// (all a value) from a store READ ERROR: absent → ON (the default), but a genuine
+// error must NOT be misread as absent→ON, which fails OPEN. So this reader PROPAGATES
+// its error to the caller and must not collapse it to false itself; the CALLER (the
+// M3 detector) is the one that maps a non-nil error to OFF. Do not "helpfully" swallow
+// the error to false here — that would move the fail-closed decision away from the
+// caller that owns it.
+func (c *Cache) MrReworkEnabled(ctx context.Context) (bool, error) {
+	v, err := c.get(ctx, KeyMrReworkEnabled)
+	switch v {
+	case "true":
+		return true, err
+	case "false":
+		return false, err
+	default:
+		return DefaultMrReworkEnabled == "true", err
+	}
+}
+
+// MrReworkCap returns the admin-configured cap on rework cycles per MR (PRD #700 M5
+// Decision 2), the loop guard mirroring ci-autofix's maxAttempts. An absent or blank
+// value falls back to DefaultMrReworkCap (5). Unlike intSetting — which swallows an
+// unparseable value to the compiled-in default — a PARSE ERROR is returned so the
+// caller decides what to do with a cap it cannot read (a hand-edited junk row is not
+// silently treated as 5). A cold store read error is propagated too.
+func (c *Cache) MrReworkCap(ctx context.Context) (int, error) {
+	v, err := c.get(ctx, KeyMrReworkCap)
+	s := strings.TrimSpace(v)
+	if s == "" {
+		n, _ := strconv.Atoi(DefaultMrReworkCap)
+		return n, err
+	}
+	n, perr := strconv.Atoi(s)
+	if perr != nil {
+		return 0, perr
+	}
+	return n, err
 }
 
 // JudgeEnforceAll reports whether the judge is enforced for every run (PRD #69),
@@ -1340,9 +1417,11 @@ func Validate(key, value string) error {
 		return theme.Validate(value)
 	case KeyPrdlessEnabled, KeySlackEnabled, KeyJudgeEnabled, KeyJudgeEnforceAll, KeyHealthEnabled,
 		KeyCapabilityAwareScheduling, KeyEligibleLabelWaivesPRDLink, KeyGithubProjectSyncEnabled,
-		KeyEphemeralWorkersEnabled, KeyAgentSourceEnabled,
+		KeyEphemeralWorkersEnabled, KeyAgentSourceEnabled, KeyMrReworkEnabled,
 		KeyAppLogoKeepName, KeyBrandPlaque:
 		return validateBool(value)
+	case KeyMrReworkCap:
+		return validateMrReworkCap(value)
 	case KeyAppLogoMode:
 		return validateEnum(value, "default", "custom")
 	case KeyBrandMode:
@@ -1693,6 +1772,27 @@ func validateHostedWorkerQuota(value string) error {
 	}
 	if n < 0 || n > maxHostedWorkerQuota {
 		return fmt.Errorf("must be 0 (self-service disabled) or between 1 and %d workers", maxHostedWorkerQuota)
+	}
+	return nil
+}
+
+// validateMrReworkCap is the write-time gate for the per-MR rework-cycle cap (PRD
+// #700 M5 Decision 2): a base-10 integer in [1, maxMrReworkCap]. It must be at least
+// 1 — the admin kill-switch (mr_rework_enabled), not a zero cap, is how the feature
+// is turned off. Negatives, non-integers, and values above the cap are refused.
+//
+// Like validateHostedWorkerQuota, this explicit Validate case is load-bearing: the
+// default branch falls through to ValidateLabel, which accepts any non-empty
+// ≤64-char string — so an integer key missing from the switch would accept "abc",
+// and MrReworkCap would then return a parse error on every read of an admin value it
+// was told saved fine.
+func validateMrReworkCap(value string) error {
+	n, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return errors.New("must be a whole number of rework cycles")
+	}
+	if n < 1 || n > maxMrReworkCap {
+		return fmt.Errorf("must be between 1 and %d rework cycles", maxMrReworkCap)
 	}
 	return nil
 }

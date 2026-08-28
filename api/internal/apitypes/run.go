@@ -418,6 +418,15 @@ type RunListItemDTO struct {
 	// bucketed in Go. See queries/runtime.sql for why the count cannot ride the join.
 	JudgeVerdict   *string `json:"judge_verdict"`
 	JudgeTodoCount int     `json:"judge_todo_count"`
+	// IsRevising is a server-computed display predicate (issue #750): true when the run's
+	// latest plan-ish message ({plan, plan_revising}) is a plan_revising — i.e. a "revise"
+	// replan is in flight. Like IsPlanning it is derived, not stored (no new column or
+	// status value), and meaningful only while status == "awaiting_approval": a plan
+	// revise leaves runs.status at awaiting_approval, so surfaces classifying from status
+	// alone need this to keep the run out of the human-attention grouping. It is
+	// deliberately NOT on RunDTO (the detail page keeps its own derivePlanRevision panel).
+	// A pre-feature api pod omits it; clients treat absent as false.
+	IsRevising bool `json:"is_revising"`
 }
 
 // MessageDTO is one persisted run message (the replay source a reconnecting

@@ -15,6 +15,24 @@
     ],
     "truncated": true
   },
+  "review_comments": {
+    "comments": [
+      {
+        "id": 5001,
+        "author_username": "coderabbit",
+        "author_forge_user_id": 43,
+        "created_at": "2026-07-04T10:00:00Z",
+        "body": "guard nil here",
+        "path": "api/x.go",
+        "line": 42,
+        "reply_id": "5001",
+        "resolve_id": "PRRT_thread1",
+        "head_sha": "headsha999",
+        "review_state": "inline"
+      }
+    ],
+    "truncated": true
+  },
   "status": "claimed",
   "branch": "agent/issue-42",
   "session_id": "sess-abc",

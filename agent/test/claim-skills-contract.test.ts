@@ -22,6 +22,22 @@ const fixture = join(
   "claim_skills_wire.json",
 );
 
+// A second golden that genuinely OMITS review_comments: the ci_fix claim wire, which
+// the Go producer (api/internal/workersvc/ci_fix_test.go) pins byte-for-byte to
+// json.MarshalIndent of a real ci_fix claim whose ReviewComments is nil. The nil +
+// `omitempty` tag drops the key entirely — so this file, not a hand-built copy, is
+// what carries the omitempty contract across the language boundary.
+const ciFixFixture = join(
+  import.meta.dirname,
+  "..",
+  "..",
+  "api",
+  "internal",
+  "workersvc",
+  "testdata",
+  "claim_ci_fix_wire.json",
+);
+
 test("claim wire contract: worker parses the server's skill shape", () => {
   const claim = JSON.parse(readFileSync(fixture, "utf8")) as ClaimResponse;
 
@@ -50,6 +66,46 @@ test("claim wire contract: worker parses the server's skill shape", () => {
       body: "please guard on Valid",
     },
   ]);
+
+  // PRD #700 M2: the bot-self-filtered snapshot of an MR's review comments rides an
+  // mr_rework claim. The golden carries one inline comment with truncated set, so the
+  // worker's parse of the whole snapshot (comment fields incl. the anchors + monotonic
+  // id, plus the truncated flag) is pinned across the language boundary; typing the
+  // parse as ClaimResponse also makes `npm run typecheck` fail if review_comments is
+  // dropped from protocol.ts.
+  assert.equal(claim.review_comments?.truncated, true);
+  assert.deepEqual(claim.review_comments?.comments, [
+    {
+      id: 5001,
+      author_username: "coderabbit",
+      author_forge_user_id: 43,
+      created_at: "2026-07-04T10:00:00Z",
+      body: "guard nil here",
+      path: "api/x.go",
+      line: 42,
+      reply_id: "5001",
+      resolve_id: "PRRT_thread1",
+      head_sha: "headsha999",
+      review_state: "inline",
+    },
+  ]);
+
+  // The omitempty contract: a claim WITHOUT an mr_rework review snapshot omits the
+  // key entirely (the Go side tags review_comments `omitempty`). Assert against a
+  // GOLDEN that genuinely omits it — the ci_fix wire, byte-pinned to a real ci_fix
+  // claim (ReviewComments nil). This is the non-vacuous key-presence check on the
+  // parse side: if the Go side ever stopped omitting the field, that golden would
+  // gain a `review_comments` key and this assertion would break. (The prior version
+  // copied `claim` and `delete`d the key from the copy, which only exercised the JS
+  // `delete` operator and passed regardless of the Go contract.)
+  const withoutReview = JSON.parse(
+    readFileSync(ciFixFixture, "utf8"),
+  ) as Record<string, unknown>;
+  assert.equal("review_comments" in withoutReview, false);
+  assert.equal(
+    (withoutReview as Partial<ClaimResponse>).review_comments,
+    undefined,
+  );
 
   // PRD #19's autopilot flag rides the same claim shape (post-landing merge): the
   // worker must still parse the skills fields alongside it.

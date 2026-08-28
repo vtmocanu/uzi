@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -52,6 +53,11 @@ const (
 	forgeErrNoRepo      = "run has no repository"
 	forgeErrInvalid     = "invalid request"
 	forgeErrUpstream    = "could not read from the forge"
+	// forgeErrMRThreadScope is the fixed, coordinate-free rejection for the Decision-11
+	// scope check on the MR-thread write endpoints: the supplied reply/resolve id is not
+	// a thread in THIS run's review snapshot (or the run carries no MR to write to). It
+	// is the server-side guard that makes an injected "resolve all open threads" a no-op.
+	forgeErrMRThreadScope = "thread is not part of this run's review"
 )
 
 // resolveForgeRun authorizes the worker against the run named by the {id} path param
@@ -464,6 +470,131 @@ func (h *Handler) WorkerForgeLatestPipeline(w http.ResponseWriter, r *http.Reque
 		UpdatedAt: rfc3339(pipe.UpdatedAt),
 	}
 	httpx.JSON(w, http.StatusOK, apitypes.ForgeLatestPipelineDTO{Pipeline: &dto})
+}
+
+// mrReworkThreadScope resolves the run's MR review snapshot and mr_iid for the Decision-11
+// scope check on the reply/resolve write endpoints (PRD #700 M4). Both come from the SAME
+// worker-owned run read resolveForgeRun already performed (ForgeConnForRun carries them on
+// ForgeConn), so there is no second, unscoped run read. It writes the response and returns
+// ok=false when the run carries no mr_iid (it is not an mr_rework run with a source MR to
+// write to → 422) or the snapshot JSON is corrupt.
+func (h *Handler) mrReworkThreadScope(w http.ResponseWriter, conn workersvc.ForgeConn) (workersvc.ReviewCommentsSnapshot, int64, bool) {
+	if conn.MRIID == nil {
+		// No source MR on this run → there is nothing this run may write back to.
+		httpx.Error(w, http.StatusUnprocessableEntity, forgeErrMRThreadScope)
+		return workersvc.ReviewCommentsSnapshot{}, 0, false
+	}
+	var snap workersvc.ReviewCommentsSnapshot
+	if len(conn.ReviewComments) > 0 {
+		if err := json.Unmarshal(conn.ReviewComments, &snap); err != nil {
+			slog.Error("worker forge mr thread unmarshal snapshot", "error", err)
+			httpx.Error(w, http.StatusBadGateway, forgeErrUpstream)
+			return workersvc.ReviewCommentsSnapshot{}, 0, false
+		}
+	}
+	// An absent/empty snapshot leaves snap.Comments nil, so every scope check below fails
+	// closed: a run with no review snapshot can write back to nothing.
+	return snap, *conn.MRIID, true
+}
+
+// snapshotHasReplyID reports whether replyID matches a thread present in the run's review
+// snapshot (Decision 11). An empty ReplyID never matches, so a non-repliable comment
+// cannot be used as an anchor.
+func snapshotHasReplyID(snap workersvc.ReviewCommentsSnapshot, replyID string) bool {
+	for _, c := range snap.Comments {
+		if c.ReplyID != "" && c.ReplyID == replyID {
+			return true
+		}
+	}
+	return false
+}
+
+// snapshotHasResolveID reports whether resolveID matches a thread present in the run's
+// review snapshot (Decision 11). An empty ResolveID never matches, so a non-resolvable
+// comment (e.g. every Forgejo comment) cannot be used as an anchor.
+func snapshotHasResolveID(snap workersvc.ReviewCommentsSnapshot, resolveID string) bool {
+	for _, c := range snap.Comments {
+		if c.ResolveID != "" && c.ResolveID == resolveID {
+			return true
+		}
+	}
+	return false
+}
+
+// WorkerForgeReplyMRThread posts a reply in an MR review thread the mr_rework run
+// addressed. POST /worker/runs/{id}/forge/mr-threads/reply (PRD #700 M4, Decision 11).
+// The endpoint derives the mr_iid from the OWNED run and rejects any reply_id not present
+// in THIS run's review snapshot for THIS run's mr_iid — so an injected "reply/resolve
+// everything" instruction can only ever act on threads that were genuinely part of this
+// MR's review.
+func (h *Handler) WorkerForgeReplyMRThread(w http.ResponseWriter, r *http.Request) {
+	conn, f, ok := h.resolveForgeRun(w, r)
+	if !ok {
+		return
+	}
+	var req apitypes.ForgeMRThreadReplyRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, forgeErrInvalid)
+		return
+	}
+	if strings.TrimSpace(req.ReplyID) == "" || strings.TrimSpace(req.Body) == "" {
+		httpx.Error(w, http.StatusBadRequest, forgeErrInvalid)
+		return
+	}
+	snap, mrIID, ok := h.mrReworkThreadScope(w, conn)
+	if !ok {
+		return
+	}
+	if !snapshotHasReplyID(snap, req.ReplyID) {
+		httpx.Error(w, http.StatusForbidden, forgeErrMRThreadScope)
+		return
+	}
+	if err := f.ReplyMergeRequestComment(r.Context(), conn.ForgeProjectID, mrIID, req.ReplyID, req.Body); err != nil {
+		h.forgeDriverError(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, apitypes.ForgeMRThreadReplyDTO{Replied: true})
+}
+
+// WorkerForgeResolveMRThread resolves an MR review thread the mr_rework run addressed.
+// POST /worker/runs/{id}/forge/mr-threads/resolve (PRD #700 M4, Decision 11). Same scope
+// check as reply. A driver that cannot resolve (Forgejo → forge.ErrResolveUnsupported) is
+// TOLERATED: the endpoint returns 200 with resolved=false so the worker's reply still
+// stands and the run does not fail (reply-only is the documented Forgejo contract).
+func (h *Handler) WorkerForgeResolveMRThread(w http.ResponseWriter, r *http.Request) {
+	conn, f, ok := h.resolveForgeRun(w, r)
+	if !ok {
+		return
+	}
+	var req apitypes.ForgeMRThreadResolveRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, forgeErrInvalid)
+		return
+	}
+	if strings.TrimSpace(req.ResolveID) == "" {
+		httpx.Error(w, http.StatusBadRequest, forgeErrInvalid)
+		return
+	}
+	snap, mrIID, ok := h.mrReworkThreadScope(w, conn)
+	if !ok {
+		return
+	}
+	if !snapshotHasResolveID(snap, req.ResolveID) {
+		httpx.Error(w, http.StatusForbidden, forgeErrMRThreadScope)
+		return
+	}
+	err := f.ResolveMergeRequestThread(r.Context(), conn.ForgeProjectID, mrIID, req.ResolveID)
+	if errors.Is(err, forge.ErrResolveUnsupported) {
+		// Forgejo has no resolvable-thread concept: reply-only is the documented contract,
+		// so a resolve is a tolerated no-op rather than a run failure.
+		httpx.JSON(w, http.StatusOK, apitypes.ForgeMRThreadResolveDTO{Resolved: false})
+		return
+	}
+	if err != nil {
+		h.forgeDriverError(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, apitypes.ForgeMRThreadResolveDTO{Resolved: true})
 }
 
 // truncateForgeBody caps s at MaxForgeBodyBytes without splitting a UTF-8 rune,

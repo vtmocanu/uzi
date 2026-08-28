@@ -390,3 +390,82 @@ describe("forge tools — wrapEvidence nonce fence construction (PRD #158 M4 inj
     assert.match(a!, /^[0-9a-f]{16}$/, "the nonce is 8 CSPRNG bytes in hex");
   });
 });
+
+// PRD #700 M4: the two MR-thread WRITE tools (reply + resolve). The server-side scope
+// check lives in the API (worker_forge.go); at the tool layer the contract is that a
+// scope rejection (403/422) maps to NON-FATAL text (never thrown, never leaks a URL) so
+// an injected "resolve everything" reads as a bounded no-op, and the Forgejo no-op
+// (resolved:false) surfaces distinctly from a real resolve.
+describe("forge write tools — reply_mr_thread / resolve_mr_thread (PRD #700 M4)", () => {
+  interface WriteCall {
+    runId: string;
+    replyId?: string;
+    resolveId?: string;
+    body?: string;
+  }
+  function writeClient(over: {
+    replied?: boolean;
+    resolved?: boolean;
+    throws?: unknown;
+  } = {}): { client: WorkerClient; calls: WriteCall[] } {
+    const calls: WriteCall[] = [];
+    const client = {
+      async replyMRThread(runId: string, replyId: string, body: string) {
+        calls.push({ runId, replyId, body });
+        if (over.throws) throw over.throws;
+        return { replied: over.replied ?? true };
+      },
+      async resolveMRThread(runId: string, resolveId: string) {
+        calls.push({ runId, resolveId });
+        if (over.throws) throw over.throws;
+        return { resolved: over.resolved ?? true };
+      },
+    } as unknown as WorkerClient;
+    return { client, calls };
+  }
+
+  it("reply_mr_thread forwards the run id + anchor + body and confirms on success", async () => {
+    const { client, calls } = writeClient();
+    const res = await buildHandlers(client, "run-current").reply_mr_thread!({ reply_id: "disc-9", body: "done in abc123" });
+    assert.notStrictEqual(res.isError, true, "a successful reply is not an error result");
+    assert.match(bodyText(res), /replied/i);
+    assert.deepStrictEqual(calls, [{ runId: "run-current", replyId: "disc-9", body: "done in abc123" }]);
+  });
+
+  it("resolve_mr_thread confirms a real resolve (resolved:true)", async () => {
+    const { client, calls } = writeClient({ resolved: true });
+    const res = await buildHandlers(client, "run-current").resolve_mr_thread!({ resolve_id: "disc-9" });
+    assert.notStrictEqual(res.isError, true);
+    assert.match(bodyText(res), /resolved the review thread/i);
+    assert.deepStrictEqual(calls, [{ runId: "run-current", resolveId: "disc-9" }]);
+  });
+
+  it("resolve_mr_thread reports the Forgejo no-op distinctly (resolved:false)", async () => {
+    const { client } = writeClient({ resolved: false });
+    const res = await buildHandlers(client, "run-current").resolve_mr_thread!({ resolve_id: "comment-7" });
+    assert.notStrictEqual(res.isError, true, "a tolerated no-op is not an error");
+    const t = bodyText(res);
+    assert.match(t, /no-op|cannot resolve|left unresolved/i, "the no-op is surfaced, not a success claim");
+    assert.match(t, /reply still stands/i);
+  });
+
+  it("a scope rejection (403) is NON-FATAL text that reads as a no-op and leaks no URL", async () => {
+    const LEAKY = "POST https://gitlab.example.com/api/v4/projects/1/merge_requests/2/discussions/x returned junk";
+    for (const name of ["reply_mr_thread", "resolve_mr_thread"] as const) {
+      const { client } = writeClient({ throws: new RequestError("POST", "/forge/mr-threads", 403, LEAKY) });
+      const args = name === "reply_mr_thread" ? { reply_id: "x", body: "y" } : { resolve_id: "x" };
+      const res = await buildHandlers(client)[name]!(args);
+      assert.strictEqual(res.isError, true, `${name} 403 is flagged isError, never a silent success`);
+      const t = bodyText(res);
+      assert.match(t, /not part of this run's review snapshot/i, `${name} 403 reads as a scope no-op`);
+      assert.doesNotMatch(t, /gitlab\.example\.com/, `${name} never surfaces the raw URL`);
+    }
+  });
+
+  it("a 422 (run carries no MR) maps to the same scope-rejection text", async () => {
+    const { client } = writeClient({ throws: new RequestError("POST", "/forge/mr-threads", 422, "no mr") });
+    const res = await buildHandlers(client).resolve_mr_thread!({ resolve_id: "x" });
+    assert.strictEqual(res.isError, true);
+    assert.match(bodyText(res), /not part of this run's review snapshot/i);
+  });
+});

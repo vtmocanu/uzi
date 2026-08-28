@@ -208,6 +208,38 @@ The remote `refs/uzi-checkpoints/agent/issue-N` ref is the other recovery source
 behind-on-workflows run leaves none (its checkpoint push hit the same rejection). The PVC
 tracking ref is the reliable source.
 
+### Proactive backups (before anything goes wrong)
+
+The recovery above is reactive — after a push rejection or a lost run. When you are
+driving runs through a shaky window (a rate-limited Anthropic token that keeps parking at
+`limit_wait`, an edge-case being hardened, anything where a resume might not come back
+cleanly), snapshot the in-flight work on a timer so a fallback always exists. Two bundled
+scripts do this, capturing from the **live runner working clone** (so uncommitted work is
+caught too, not just the checkpointed tracking ref):
+
+- **`scripts/backup-runs.sh <RUN_ID>...`** — one snapshot per run into
+  `$UZI_BACKUP_DIR` (default `/tmp/uzi-backups/<ts>/`): `issue-N.tgz` (git **bundle** of
+  commits not on `origin/main` + `uncommitted.patch` + `untracked.tar.gz` + `meta.txt`),
+  plus a self-describing status set (`run.json`, `plan.md`, `progress.txt` with milestones
+  DONE vs LEFT, `log-tail.ndjson`). It resolves worker→pod FRESH each call, so it follows a
+  worker roll or a cross-worker migration. Deployment coordinates come from env
+  (`UZI_CTX`, `UZI_WORKER_NS`, `UZI_REPO_SLUG` — the last derived from `origin` if unset),
+  never hard-coded.
+- **`scripts/backup-loop.sh <RUN_ID>...`** — runs `backup-runs.sh` every
+  `UZI_BACKUP_INTERVAL` (default 900s), **detached** so it outlives the session (`setsid`
+  on Linux, a `( nohup … & )` subshell on macOS). It self-terminates when every run is
+  terminal, after `UZI_BACKUP_MAX_HOURS` (default 12), or on `touch $UZI_BACKUP_DIR/STOP`.
+  It rides through `limit_wait` (keeps snapshotting while a run is parked). This is a
+  session-independent safety net; it is NOT a substitute for the pollers — keep those too.
+
+To recover from a snapshot: `tar xzf <ts>/issue-N.tgz -C r/`, then
+`git fetch r/issue-N.bundle 'agent/issue-N:refs/heads/recover/issue-N'` and
+`git worktree add DIR recover/issue-N`. In `DIR`, restore the uncommitted state the
+tracking ref never held: `git apply r/issue-N.uncommitted.patch` if that file is present,
+**and `tar xzf r/issue-N.untracked.tar.gz -C DIR` if that one is** (it carries new,
+not-yet-added files, which the patch does not). Then `git rebase origin/main` and gate +
+PR + admin-merge as above.
+
 ## Reviewing the diff
 
 The watcher's merge-gate review is a **third** pass, not a first: uzi already ran its own
@@ -310,12 +342,25 @@ PR's to fix at all — if it is worth doing, it is a separate CI-only PR (your t
 before merging.** Every push to an `agent/issue-*` branch retriggers CodeRabbit's `auto_review`,
 which posts an *incremental* review of just the new commits (async, a few minutes; the
 `CodeRabbit` PR check flips to pending then back to "Review completed"). So the merge sequence
-per fixed PR is: push fix → **wait for the re-review to land** (`gh pr checks PR` shows
-CodeRabbit `pass` again; re-read its new review/comments) → confirm it is clean or only
-acknowledgements → then merge. Do not merge a PR whose CodeRabbit re-review is still pending
-after a fix push — the re-review can surface a defect in the fix itself, and merging first
-defeats the point of fixing. A re-review that raises something new re-enters this same triage
+per fixed PR is: push fix → **wait for the incremental review of THAT commit to land** → confirm
+it is clean or only acknowledgements → then merge. Do not merge a PR whose CodeRabbit re-review is
+still pending after a fix push — the re-review can surface a defect in the fix itself, and merging
+first defeats the point of fixing. A re-review that raises something new re-enters this same triage
 flow (assess → decide → fix/skip), not an automatic merge.
+
+**Do NOT treat the `CodeRabbit` PR check flipping back to "Review completed" (`gh pr checks PR`
+showing CodeRabbit `pass`) as proof the re-review landed.** Measured 2026-08-28 on PR#756: the
+check went green and every CI job was green while the latest CodeRabbit *review object* still only
+covered the PREVIOUS commit — a poller keyed on the check reported "re-review done" when the
+incremental review of the just-pushed fix had not posted. Confirm the re-review landed one of two
+robust ways instead: (a) a new CodeRabbit review whose **Commits** range covers your latest SHA
+(`gh api repos/OWNER/REPO/pulls/PR/reviews` — compare its `submitted_at`/range to your push time),
+or (b) the specific findings you fixed now render **outdated** — their inline comments report
+`line: null` with `original_line` set (`gh api repos/OWNER/REPO/pulls/PR/comments`), i.e. CodeRabbit
+no longer anchors them to live code. And know that **CodeRabbit often does NOT post a fresh APPROVED
+for a trivial fix**, so `reviewDecision` can stay `CHANGES_REQUESTED` even after every finding is
+resolved; once (a) or (b) plus green CI confirm the current head is clean, `--admin` merges past
+that stale verdict rather than waiting for a flip that never comes.
 
 **The shared `main` worktree is a multi-writer tree — never assert it is clean.** Other
 sessions leave modified files in it and advance `main` mid-review (measured 2026-08-20:
@@ -450,7 +495,8 @@ die with its session. When you close, hand any still-in-flight run ids on the sa
 ## Keep this skill (and its scripts) current
 
 This skill and its `scripts/` (`watch-run.sh` for uzi runs, `watch-ci.sh` for GitHub
-Actions, `pr-findings.sh` to gather CodeRabbit findings across PRs) are living documents —
+Actions, `pr-findings.sh` to gather CodeRabbit findings across PRs, `backup-runs.sh` /
+`backup-loop.sh` to snapshot in-flight run work from worker PVCs) are living documents —
 **update them in the same session you find them wanting.**
 When a run surprises you with a new failure mode, a plan trap this list does not name,
 changed merge/ruleset behaviour, a CLI verb that moved, or a poller needs a new

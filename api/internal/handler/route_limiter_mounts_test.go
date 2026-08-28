@@ -487,6 +487,12 @@ var wantRouteMounts = []routeMount{
 	// proposalLimiter.PerWorkerMiddleware (a per-WORKER, IP-fallback mount), which this
 	// per-USER probe reads as noLimiter — same as the proposals route below it.
 	{"POST", "/api/worker/runs/{id}/findings", noLimiter},
+	// PRD #700 M4: the mr_rework run's MR-thread write-back (reply + resolve). Worker-
+	// authenticated and scoped to the worker's own run, with the Decision-11 snapshot
+	// scope check enforced in the handler; no per-user limiter → noLimiter, matching the
+	// worker forge READ routes above.
+	{"POST", "/api/worker/runs/{id}/forge/mr-threads/reply", noLimiter},
+	{"POST", "/api/worker/runs/{id}/forge/mr-threads/resolve", noLimiter},
 	{"POST", "/api/worker/runs/{id}/memory", noLimiter},
 	{"POST", "/api/worker/runs/{id}/messages", noLimiter},
 	{"POST", "/api/worker/runs/{id}/proposals", noLimiter},

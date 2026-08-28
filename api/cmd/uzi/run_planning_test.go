@@ -17,15 +17,25 @@ func TestEffectiveRunStatus(t *testing.T) {
 	for _, tc := range []struct {
 		status     string
 		isPlanning bool
+		isRevising bool
 		want       string
 	}{
-		{"running", true, "planning"},
-		{"running", false, "running"},
-		{"completed", true, "completed"}, // only running maps
-		{"queued", false, "queued"},
+		{"running", true, false, "planning"},
+		{"running", false, false, "running"},
+		{"completed", true, false, "completed"}, // only running maps
+		{"queued", false, false, "queued"},
+		// issue #750: is_revising maps awaiting_approval → "revising", and ONLY there.
+		{"awaiting_approval", false, true, "revising"},
+		{"awaiting_approval", false, false, "awaiting_approval"},
+		// is_revising is not status-gated server-side; a running+planning run is still
+		// "planning" even with is_revising set, and is_revising has no effect off
+		// awaiting_approval.
+		{"running", true, true, "planning"},
+		{"running", false, true, "running"},
+		{"completed", false, true, "completed"},
 	} {
-		if got := effectiveRunStatus(tc.status, tc.isPlanning); got != tc.want {
-			t.Errorf("effectiveRunStatus(%q, %v) = %q, want %q", tc.status, tc.isPlanning, got, tc.want)
+		if got := effectiveRunStatus(tc.status, tc.isPlanning, tc.isRevising); got != tc.want {
+			t.Errorf("effectiveRunStatus(%q, %v, %v) = %q, want %q", tc.status, tc.isPlanning, tc.isRevising, got, tc.want)
 		}
 	}
 }
@@ -36,8 +46,8 @@ func TestEffectiveRunStatus(t *testing.T) {
 func TestPlanningStatusColour(t *testing.T) {
 	p := newPalette(true)
 
-	planning := p.stateColor("running", "", true) // running + is_planning → planning
-	running := p.stateColor("running", "", false)
+	planning := p.stateColor("running", "", true, false) // running + is_planning → planning
+	running := p.stateColor("running", "", false, false)
 	if bgFillSGR(planning) == bgFillSGR(running) {
 		t.Error("planning and running resolve to the same colour; the planning phase is not visually distinct")
 	}
@@ -45,7 +55,7 @@ func TestPlanningStatusColour(t *testing.T) {
 		t.Error("planning resolved to the faint default; its own indigo entry is not being read")
 	}
 	// Health precedence: a stalled planning run is still the stall colour (triage wins).
-	if bgFillSGR(p.stateColor("running", "stalled", true)) != bgFillSGR(p.stall) {
+	if bgFillSGR(p.stateColor("running", "stalled", true, false)) != bgFillSGR(p.stall) {
 		t.Error("stalled health no longer overrides the planning bucket; the precedence rule regressed")
 	}
 }
@@ -53,10 +63,10 @@ func TestPlanningStatusColour(t *testing.T) {
 // TestStatusGlyphPlanning pins the NO_COLOR-safe state glyph (D3): planning is a hollow circle
 // ("nothing committed yet"), distinct from running's filled dot.
 func TestStatusGlyphPlanning(t *testing.T) {
-	if got, _ := stateGlyphWord("running", "", true); got != "○" {
+	if got, _ := stateGlyphWord("running", "", true, false); got != "○" {
 		t.Errorf("planning glyph = %q, want %q", got, "○")
 	}
-	if got, _ := stateGlyphWord("running", "", false); got != "●" {
+	if got, _ := stateGlyphWord("running", "", false, false); got != "●" {
 		t.Errorf("running glyph = %q, want %q", got, "●")
 	}
 }
