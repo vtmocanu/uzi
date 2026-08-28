@@ -286,6 +286,88 @@ function LicenseCredit({ className }: { className?: string }) {
   );
 }
 
+// The custom brand-logo <img> src for the POWERED BY block (PRD #685 M3b). Serves
+// the uploaded brand logo when present, else the shipped preset /brand-default.svg.
+// Only called in logo mode; like the app mark it is ALWAYS an <img> so an uploaded
+// SVG stays passive (never inline SVG).
+function brandLogoImgSrc(branding: Branding): string {
+  return branding.brand_logo_present ? "/api/branding/logo/brand" : "/brand-default.svg";
+}
+
+// The POWERED BY brand block (PRD #685 M3b), reading the same module-memoised
+// useBranding() the app mark uses. Renders ONLY in the expanded signed-in sidebar:
+// a null/pending branding, brand_mode "none", or a collapsed rail all render
+// nothing (the unbranded default — never throws).
+//
+// `slot` fixes where the block sits, and the component self-selects by
+// brand_placement so each mount renders only when its slot matches:
+//   "below"    — a separate row UNDER the header carrying a faint uppercase POWERED
+//                BY label + the company text or the logo (the default placement).
+//   "topright" — logo-only (~96px max, ~26px tall), NO label, sharing the header
+//                row; text mode falls back to a compact company label.
+//
+// A custom brand logo is ALWAYS an <img> (uploaded → /api/branding/logo/brand, else
+// the shipped preset /brand-default.svg), never inline SVG — the XSS control. The
+// logo dims to opacity-80 (a CSS constant, not a setting); brand_plaque adds a light
+// rounded plaque behind it (bg-[#f6f6f8]) for dark-ink uploads.
+function PoweredBy({
+  branding,
+  collapsed = false,
+  slot,
+}: {
+  branding: Branding | null;
+  collapsed?: boolean;
+  slot: "below" | "topright";
+}) {
+  if (collapsed || !branding || branding.brand_mode === "none") return null;
+  const placement = branding.brand_placement === "topright" ? "topright" : "below";
+  if (placement !== slot) return null;
+
+  const isLogo = branding.brand_mode === "logo";
+  const logoImg = (
+    <img
+      src={brandLogoImgSrc(branding)}
+      alt="brand logo"
+      data-testid="brand-logo-img"
+      className={cx("w-auto object-contain opacity-80", slot === "topright" ? "h-[26px]" : "h-6")}
+    />
+  );
+
+  if (slot === "topright") {
+    return (
+      <span className="ml-auto flex max-w-[96px] items-center">
+        {isLogo ? (
+          <span className={branding.brand_plaque ? "rounded-md bg-[#f6f6f8] px-1.5 py-1" : undefined}>
+            {logoImg}
+          </span>
+        ) : (
+          <span className="truncate text-[11px] text-faint">{branding.brand_company}</span>
+        )}
+      </span>
+    );
+  }
+
+  return (
+    <div className="border-b border-edge px-4 py-3">
+      <span className="block text-[10px] font-medium uppercase tracking-wider text-faint">
+        POWERED BY
+      </span>
+      {isLogo ? (
+        <span
+          className={cx(
+            "mt-1 inline-block",
+            branding.brand_plaque && "rounded-md bg-[#f6f6f8] px-1.5 py-1",
+          )}
+        >
+          {logoImg}
+        </span>
+      ) : (
+        <span className="mt-1 block text-sm text-fg">{branding.brand_company}</span>
+      )}
+    </div>
+  );
+}
+
 function isNavActive(pathname: string, href: string): boolean {
   return pathname === href || pathname.startsWith(href + "/");
 }
@@ -571,7 +653,15 @@ function SidebarContent({
             )}
           </>
         )}
+        {/* POWERED BY, top-right placement (PRD #685 M3b): logo-only, no label,
+            sharing the header row. Self-gates on placement/mode/collapsed. */}
+        <PoweredBy branding={branding} collapsed={collapsed} slot="topright" />
       </Link>
+
+      {/* POWERED BY, below-wordmark placement (PRD #685 M3b, the default): a row
+          under the header carrying the faint uppercase label + text or logo.
+          Self-gates on placement/mode/collapsed. */}
+      <PoweredBy branding={branding} collapsed={collapsed} slot="below" />
 
       <nav className="flex-1 space-y-1 overflow-y-auto px-2 pb-4 lg:space-y-0.5 lg:pb-2">
         <div className="space-y-0.5 pt-3 lg:pt-2">

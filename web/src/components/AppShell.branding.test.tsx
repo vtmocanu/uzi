@@ -208,3 +208,95 @@ describe("AppShell branding — white-label hides the name on all four surfaces"
     expect(screen.getAllByText(NAME_RE).length).toBeGreaterThan(0);
   });
 });
+
+// The POWERED BY brand block (PRD #685 M3b). Property assertions on named channels:
+// the "POWERED BY" label text, the company string, and the brand <img> handle
+// (data-testid="brand-logo-img") with its `src` — never a pixel snapshot. Each case
+// drives a DIFFERENT branding through the reset memo (beforeEach clears it).
+const POWERED_BY_RE = /POWERED BY/;
+
+describe("AppShell branding — POWERED BY block", () => {
+  it("text mode: renders the POWERED BY label and the company string", async () => {
+    mockApi.branding.mockResolvedValue(brandingWith({ brand_mode: "text", brand_company: "Acme, Inc." }));
+    renderShell();
+    expect((await screen.findAllByText(POWERED_BY_RE)).length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Acme, Inc.").length).toBeGreaterThan(0);
+    // Text mode never renders a brand <img>.
+    expect(screen.queryAllByTestId("brand-logo-img")).toHaveLength(0);
+  });
+
+  it("logo mode, no asset: falls back to the preset <img src='/brand-default.svg'>", async () => {
+    mockApi.branding.mockResolvedValue(brandingWith({ brand_mode: "logo", brand_logo_present: false }));
+    renderShell();
+    const imgs = await screen.findAllByTestId("brand-logo-img");
+    expect(imgs.length).toBeGreaterThan(0);
+    for (const img of imgs) expect(img.getAttribute("src")).toBe("/brand-default.svg");
+  });
+
+  it("logo mode, asset present: renders <img src='/api/branding/logo/brand'>", async () => {
+    mockApi.branding.mockResolvedValue(brandingWith({ brand_mode: "logo", brand_logo_present: true }));
+    renderShell();
+    const imgs = await screen.findAllByTestId("brand-logo-img");
+    expect(imgs.length).toBeGreaterThan(0);
+    for (const img of imgs) expect(img.getAttribute("src")).toBe("/api/branding/logo/brand");
+  });
+
+  it("XSS control: an uploaded brand logo renders as <img>, never inline <svg>", async () => {
+    mockApi.branding.mockResolvedValue(brandingWith({ brand_mode: "logo", brand_logo_present: true }));
+    renderShell();
+    const imgs = await screen.findAllByTestId("brand-logo-img");
+    for (const img of imgs) {
+      // The brand channel is the HTML <img>, not inlined SVG bytes.
+      expect(img.tagName).toBe("IMG");
+      // No inline <svg> injected into the brand block alongside the <img>.
+      expect(img.parentElement?.querySelector("svg")).toBeNull();
+    }
+  });
+
+  it("placement below (default): shows the POWERED BY label", async () => {
+    mockApi.branding.mockResolvedValue(
+      brandingWith({ brand_mode: "logo", brand_logo_present: true, brand_placement: "below" }),
+    );
+    renderShell();
+    await screen.findAllByTestId("brand-logo-img");
+    expect(screen.getAllByText(POWERED_BY_RE).length).toBeGreaterThan(0);
+  });
+
+  it("placement topright: hides the POWERED BY label", async () => {
+    mockApi.branding.mockResolvedValue(
+      brandingWith({ brand_mode: "logo", brand_logo_present: true, brand_placement: "topright" }),
+    );
+    renderShell();
+    await screen.findAllByTestId("brand-logo-img");
+    expect(screen.queryByText(POWERED_BY_RE)).toBeNull();
+  });
+
+  it("plaque on: adds the light plaque background; off: does not", async () => {
+    mockApi.branding.mockResolvedValue(brandingWith({ brand_mode: "logo", brand_plaque: true }));
+    const { container } = renderShell();
+    await screen.findAllByTestId("brand-logo-img");
+    expect(container.querySelector('[class*="f6f6f8"]')).not.toBeNull();
+    cleanup();
+    __resetBrandingForTests();
+    mockApi.branding.mockResolvedValue(brandingWith({ brand_mode: "logo", brand_plaque: false }));
+    const { container: c2 } = renderShell();
+    await screen.findAllByTestId("brand-logo-img");
+    expect(c2.querySelector('[class*="f6f6f8"]')).toBeNull();
+  });
+
+  it("none / default: no brand <img> and no POWERED BY label", async () => {
+    renderShell();
+    await waitFor(() => expect(mockApi.branding).toHaveBeenCalled());
+    expect(screen.queryAllByTestId("brand-logo-img")).toHaveLength(0);
+    expect(screen.queryByText(POWERED_BY_RE)).toBeNull();
+  });
+
+  it("collapsed rail: the POWERED BY block does not render", async () => {
+    window.localStorage.setItem("uzi.sidebar.collapsed", "true");
+    mockApi.branding.mockResolvedValue(brandingWith({ brand_mode: "logo", brand_logo_present: true }));
+    renderShell();
+    await waitFor(() => expect(mockApi.branding).toHaveBeenCalled());
+    expect(screen.queryAllByTestId("brand-logo-img")).toHaveLength(0);
+    expect(screen.queryByText(POWERED_BY_RE)).toBeNull();
+  });
+});
