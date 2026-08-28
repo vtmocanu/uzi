@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -519,6 +520,99 @@ func (g *gitLab) GetMergeRequest(ctx context.Context, projectID, mrIID int64) (M
 		return MergeRequest{}, g.redact.error(fmt.Errorf("gitlab: get merge request: %w", err))
 	}
 	return toMergeRequest(mr), nil
+}
+
+// ListMergeRequestComments returns an MR's human + review-bot comments oldest-first
+// (PRD #700). GitLab models MR review as DISCUSSIONS (each a resolvable thread of
+// notes), so the driver lists ListMergeRequestDiscussions and flattens each
+// Discussion.Notes into MRComments, dropping System notes (D2) exactly as
+// ListIssueComments does. The discussion id is BOTH the reply anchor and the
+// resolve anchor. A note carrying a diff Position is inline (Path/Line/HeadSHA
+// populated); one without is a summary/top-level note. The discussions endpoint has
+// no sort option, so the driver sorts the flattened list by CreatedAt to guarantee
+// oldest-first (D8).
+func (g *gitLab) ListMergeRequestComments(ctx context.Context, projectID, mrIID int64) ([]MRComment, error) {
+	opt := &gitlab.ListMergeRequestDiscussionsOptions{ListOptions: gitlab.ListOptions{Page: 1, PerPage: perPage}}
+	var out []MRComment
+	page := 0
+	for {
+		page++
+		discussions, resp, err := g.client.Discussions.ListMergeRequestDiscussions(projectID, mrIID, opt, gitlab.WithContext(ctx))
+		if err != nil {
+			return nil, g.redact.error(fmt.Errorf("gitlab: list merge request comments: %w", err))
+		}
+		for _, d := range discussions {
+			if d == nil {
+				continue
+			}
+			for _, n := range d.Notes {
+				if n == nil || n.System {
+					continue
+				}
+				var createdAt time.Time
+				if n.CreatedAt != nil {
+					createdAt = *n.CreatedAt
+				}
+				c := MRComment{
+					AuthorForgeUserID: n.Author.ID,
+					AuthorUsername:    n.Author.Username,
+					Body:              n.Body,
+					CreatedAt:         createdAt,
+					// The discussion id is both anchors on GitLab.
+					ReplyID:     d.ID,
+					ResolveID:   d.ID,
+					ReviewState: ReviewCommentSummary,
+				}
+				if p := n.Position; p != nil {
+					c.HeadSHA = p.HeadSHA
+					if p.NewPath != "" {
+						path := p.NewPath
+						c.Path = &path
+						c.ReviewState = ReviewCommentInline
+					}
+					if p.NewLine != 0 {
+						line := int(p.NewLine)
+						c.Line = &line
+					}
+				}
+				out = append(out, c)
+			}
+		}
+		if len(out) > maxForgeItems {
+			return nil, g.redact.error(fmt.Errorf("gitlab: list merge request comments: %w", forgePaginationCapErr("item", maxForgeItems)))
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		if page >= maxForgePages {
+			return nil, g.redact.error(fmt.Errorf("gitlab: list merge request comments: %w", forgePaginationCapErr("page", maxForgePages)))
+		}
+		opt.Page = resp.NextPage
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out, nil
+}
+
+// ReplyMergeRequestComment adds a note to the discussion (thread) identified by
+// replyID (a discussion id from ListMergeRequestComments).
+func (g *gitLab) ReplyMergeRequestComment(ctx context.Context, projectID, mrIID int64, replyID, body string) error {
+	_, _, err := g.client.Discussions.AddMergeRequestDiscussionNote(projectID, mrIID, replyID,
+		&gitlab.AddMergeRequestDiscussionNoteOptions{Body: gitlab.Ptr(body)}, gitlab.WithContext(ctx))
+	if err != nil {
+		return g.redact.error(fmt.Errorf("gitlab: reply merge request comment: %w", err))
+	}
+	return nil
+}
+
+// ResolveMergeRequestThread marks the discussion (thread) identified by resolveID
+// resolved. On GitLab the resolve anchor equals the reply anchor (the discussion id).
+func (g *gitLab) ResolveMergeRequestThread(ctx context.Context, projectID, mrIID int64, resolveID string) error {
+	_, _, err := g.client.Discussions.ResolveMergeRequestDiscussion(projectID, mrIID, resolveID,
+		&gitlab.ResolveMergeRequestDiscussionOptions{Resolved: gitlab.Ptr(true)}, gitlab.WithContext(ctx))
+	if err != nil {
+		return g.redact.error(fmt.Errorf("gitlab: resolve merge request thread: %w", err))
+	}
+	return nil
 }
 
 func (g *gitLab) LatestPipeline(ctx context.Context, projectID int64, ref string) (Pipeline, error) {

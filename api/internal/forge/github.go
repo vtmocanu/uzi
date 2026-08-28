@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"net/textproto"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -738,6 +740,260 @@ func (g *github) CreateIssueNote(ctx context.Context, projectID, issueIID int64,
 		return IssueNote{}, g.wrapErr("create issue note", err)
 	}
 	return IssueNote{ID: c.GetID(), Body: c.GetBody()}, nil
+}
+
+// ListMergeRequestComments returns a PR's human + review-bot comments oldest-first
+// (PRD #700). GitHub has no single endpoint for this, so the driver STITCHES three
+// REST sources with a GraphQL read (Resolved facts):
+//   - Issues.ListComments → the PR's top-level conversation notes (summary state,
+//     no diff anchor, no reply/resolve thread).
+//   - PullRequests.ListComments → inline review comments, each carrying Path/Line,
+//     a REST ID that IS the databaseId (the reply anchor), and CommitID (HeadSHA).
+//   - PullRequests.ListReviews → review-summary bodies (non-empty Body only).
+//   - the GraphQL reviewThreads query → each thread's node id (the RESOLVE anchor)
+//     joined to the REST inline comments on the shared databaseId.
+//
+// So an inline comment carries TWO anchors: ReplyID (REST databaseId) for
+// CreateCommentInReplyTo and ResolveID (GraphQL thread node id) for
+// resolveReviewThread. GitHub's issue/PR-comment and review endpoints return no
+// forge system notes (those live on the separate events/timeline endpoints uzi
+// never calls), so no D2 filter is needed; the driver sorts the merged list by
+// CreatedAt for oldest-first (D8).
+func (g *github) ListMergeRequestComments(ctx context.Context, projectID, mrIID int64) ([]MRComment, error) {
+	slug, err := g.repoSlugFor(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	number := int(mrIID)
+
+	var out []MRComment
+
+	// Source A: top-level PR conversation notes.
+	icOpt := &gh.IssueListCommentsOptions{ListOptions: gh.ListOptions{PerPage: githubPerPage}}
+	for page := 0; ; {
+		page++
+		comments, resp, err := g.client.Issues.ListComments(ctx, slug.owner, slug.repo, number, icOpt)
+		if err != nil {
+			return nil, g.wrapErr("list merge request comments", err)
+		}
+		for _, c := range comments {
+			if c == nil {
+				continue
+			}
+			mc := MRComment{
+				Body:        c.GetBody(),
+				CreatedAt:   c.GetCreatedAt().Time,
+				ReviewState: ReviewCommentSummary,
+			}
+			if u := c.GetUser(); u != nil {
+				mc.AuthorForgeUserID = u.GetID()
+				mc.AuthorUsername = u.GetLogin()
+			}
+			out = append(out, mc)
+		}
+		if len(out) > maxForgeItems {
+			return nil, g.wrapErr("list merge request comments", forgePaginationCapErr("item", maxForgeItems))
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		if page >= maxForgePages {
+			return nil, g.wrapErr("list merge request comments", forgePaginationCapErr("page", maxForgePages))
+		}
+		icOpt.Page = resp.NextPage
+	}
+
+	// Source B: inline review comments. Record where each databaseId landed in out
+	// so the GraphQL stitch can set its ResolveID.
+	idxByDBID := map[int64]int{}
+	prOpt := &gh.PullRequestListCommentsOptions{ListOptions: gh.ListOptions{PerPage: githubPerPage}}
+	for page := 0; ; {
+		page++
+		comments, resp, err := g.client.PullRequests.ListComments(ctx, slug.owner, slug.repo, number, prOpt)
+		if err != nil {
+			return nil, g.wrapErr("list merge request comments", err)
+		}
+		for _, c := range comments {
+			if c == nil {
+				continue
+			}
+			mc := MRComment{
+				Body:        c.GetBody(),
+				CreatedAt:   c.GetCreatedAt().Time,
+				HeadSHA:     c.GetCommitID(),
+				ReviewState: ReviewCommentInline,
+			}
+			if u := c.GetUser(); u != nil {
+				mc.AuthorForgeUserID = u.GetID()
+				mc.AuthorUsername = u.GetLogin()
+			}
+			if dbID := c.GetID(); dbID != 0 {
+				mc.ReplyID = strconv.FormatInt(dbID, 10)
+				idxByDBID[dbID] = len(out)
+			}
+			if p := c.Path; p != nil {
+				path := *p
+				mc.Path = &path
+			}
+			if c.Line != nil {
+				line := *c.Line
+				mc.Line = &line
+			}
+			out = append(out, mc)
+		}
+		if len(out) > maxForgeItems {
+			return nil, g.wrapErr("list merge request comments", forgePaginationCapErr("item", maxForgeItems))
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		if page >= maxForgePages {
+			return nil, g.wrapErr("list merge request comments", forgePaginationCapErr("page", maxForgePages))
+		}
+		prOpt.Page = resp.NextPage
+	}
+
+	// Source C: review-summary bodies (a review with only inline comments has an
+	// empty Body and is skipped — its comments already came from source B).
+	revOpt := &gh.ListOptions{PerPage: githubPerPage}
+	for page := 0; ; {
+		page++
+		reviews, resp, err := g.client.PullRequests.ListReviews(ctx, slug.owner, slug.repo, number, revOpt)
+		if err != nil {
+			return nil, g.wrapErr("list merge request comments", err)
+		}
+		for _, r := range reviews {
+			if r == nil || r.GetBody() == "" {
+				continue
+			}
+			mc := MRComment{
+				Body:        r.GetBody(),
+				CreatedAt:   r.GetSubmittedAt().Time,
+				HeadSHA:     r.GetCommitID(),
+				ReviewState: ReviewCommentSummary,
+			}
+			if u := r.GetUser(); u != nil {
+				mc.AuthorForgeUserID = u.GetID()
+				mc.AuthorUsername = u.GetLogin()
+			}
+			out = append(out, mc)
+		}
+		if len(out) > maxForgeItems {
+			return nil, g.wrapErr("list merge request comments", forgePaginationCapErr("item", maxForgeItems))
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		if page >= maxForgePages {
+			return nil, g.wrapErr("list merge request comments", forgePaginationCapErr("page", maxForgePages))
+		}
+		revOpt.Page = resp.NextPage
+	}
+
+	// GraphQL stitch: map each inline comment's databaseId → its thread node id
+	// (the resolve anchor REST does not expose) and fold it onto the source-B
+	// MRComments already collected.
+	threadByDBID, err := g.reviewThreadIDsByDatabaseID(ctx, slug, number)
+	if err != nil {
+		return nil, err
+	}
+	for dbID, idx := range idxByDBID {
+		if threadID, ok := threadByDBID[dbID]; ok {
+			out[idx].ResolveID = threadID
+		}
+	}
+
+	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out, nil
+}
+
+// reviewThreadIDsByDatabaseID runs the GraphQL reviewThreads query and returns a
+// map from each thread comment's REST databaseId to the thread's node id — the
+// join key ListMergeRequestComments uses to attach a resolve anchor to a REST
+// inline comment (Resolved facts). It reuses the driver's graphqlDo helper (auth +
+// endpoint + redaction), never a hand-rolled POST.
+func (g *github) reviewThreadIDsByDatabaseID(ctx context.Context, slug repoSlug, number int) (map[int64]string, error) {
+	const query = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes {
+          id
+          isResolved
+          isOutdated
+          path
+          line
+          comments(first: 100) { nodes { databaseId } }
+        }
+      }
+    }
+  }
+}`
+	var out struct {
+		Repository struct {
+			PullRequest struct {
+				ReviewThreads struct {
+					Nodes []struct {
+						ID       string `json:"id"`
+						Comments struct {
+							Nodes []struct {
+								DatabaseID int64 `json:"databaseId"`
+							} `json:"nodes"`
+						} `json:"comments"`
+					} `json:"nodes"`
+				} `json:"reviewThreads"`
+			} `json:"pullRequest"`
+		} `json:"repository"`
+	}
+	vars := map[string]any{"owner": slug.owner, "name": slug.repo, "number": number}
+	if err := g.graphqlDo(ctx, query, vars, &out); err != nil {
+		return nil, err
+	}
+	m := map[int64]string{}
+	for _, node := range out.Repository.PullRequest.ReviewThreads.Nodes {
+		if node.ID == "" {
+			continue
+		}
+		for _, cn := range node.Comments.Nodes {
+			if cn.DatabaseID != 0 {
+				m[cn.DatabaseID] = node.ID
+			}
+		}
+	}
+	return m, nil
+}
+
+// ReplyMergeRequestComment posts an in-thread reply keyed on replyID, the REST
+// databaseId of the review comment it answers (an MRComment.ReplyID).
+func (g *github) ReplyMergeRequestComment(ctx context.Context, projectID, mrIID int64, replyID, body string) error {
+	slug, err := g.repoSlugFor(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	commentID, err := strconv.ParseInt(strings.TrimSpace(replyID), 10, 64)
+	if err != nil {
+		return fmt.Errorf("github: reply merge request comment: invalid reply id %q", replyID)
+	}
+	if _, _, err := g.client.PullRequests.CreateCommentInReplyTo(ctx, slug.owner, slug.repo, int(mrIID), body, commentID); err != nil {
+		return g.wrapErr("reply merge request comment", err)
+	}
+	return nil
+}
+
+// ResolveMergeRequestThread resolves the review thread keyed on resolveID, the
+// GraphQL thread node id (an MRComment.ResolveID). go-github ships no GraphQL
+// client, so this issues the resolveReviewThread mutation through graphqlDo — the
+// same authenticated, redacted endpoint path the read stitch uses (Resolved facts).
+func (g *github) ResolveMergeRequestThread(ctx context.Context, _, _ int64, resolveID string) error {
+	if strings.TrimSpace(resolveID) == "" {
+		return fmt.Errorf("github: resolve merge request thread: empty resolve id")
+	}
+	const mutation = `mutation($threadId: ID!) {
+  resolveReviewThread(input: {threadId: $threadId}) {
+    thread { id isResolved }
+  }
+}`
+	return g.graphqlDo(ctx, mutation, map[string]any{"threadId": resolveID}, nil)
 }
 
 func (g *github) TokenInfo(ctx context.Context) (TokenInfo, error) {

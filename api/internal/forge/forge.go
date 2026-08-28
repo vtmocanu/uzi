@@ -43,6 +43,16 @@ var ErrNoPipeline = errors.New("forge: no pipeline for ref")
 // not one driver's implementation.
 var ErrForgeVersionUnsupported = errors.New("forge: server version is older than this driver's minimum")
 
+// ErrResolveUnsupported is returned by ResolveMergeRequestThread on a driver
+// whose forge has no resolvable review-thread concept (Forgejo/Gitea — PRD #700
+// Resolved facts). It is a distinct sentinel — not a redacted generic error — so
+// the MR-review-rework worker can errors.Is it and swallow it (reply-only is the
+// documented Forgejo contract), while a real resolve failure on GitLab/GitHub
+// surfaces as an ordinary error. A never-resolved thread does not affect
+// termination (that keys on the high-water mark); the only cost is UX. It carries
+// no secret material.
+var ErrResolveUnsupported = errors.New("forge: resolve is not supported on this forge")
+
 // Type identifies a forge driver. It maps 1:1 to the forge_connections.forge_type
 // column, which is CHECK-constrained to the same set.
 type Type string
@@ -276,6 +286,62 @@ type MergeRequest struct {
 	WebURL string
 }
 
+// ReviewComment states classify an MRComment as either an inline diff comment
+// (carries Path/Line) or a review-summary / top-level note (no Path/Line). It is
+// a small closed vocabulary the snapshot layer uses to tell a review-summary body
+// apart from an inline finding; a driver never invents another value.
+const (
+	// ReviewCommentInline is a comment anchored to a specific diff line — it
+	// carries Path and Line, and (on a forge that supports threads) ReplyID /
+	// ResolveID anchors.
+	ReviewCommentInline = "inline"
+	// ReviewCommentSummary is a review-summary body or a top-level MR note: no
+	// Path/Line, and typically no resolvable thread.
+	ReviewCommentSummary = "summary"
+)
+
+// MRComment is one comment on a merge request as ListMergeRequestComments returns
+// it oldest-first (PRD #700): a human or third-party review-bot comment, with the
+// forge's own system notes filtered out driver-side (mirroring IssueComment's D2/
+// D8 contract). The MR-review-rework watcher reasons about each as UNTRUSTED data
+// (same class as IssueComment.Body / Issue.Description) and never follows
+// instructions embedded in Body. The bot self-filter — dropping uzi's own bot
+// notes while KEEPING third-party review bots — is the snapshot layer's job, not
+// the driver's, so drivers return every non-system comment.
+//
+// It carries TWO thread anchors because on GitHub the reply target and the resolve
+// target are different ids (Resolved facts): ReplyID is the REST databaseId while
+// ResolveID is the GraphQL review-thread node id. On GitLab both are the single
+// discussion id; on Forgejo ReplyID is the review-comment id and ResolveID is
+// empty (Forgejo cannot resolve — see ErrResolveUnsupported).
+type MRComment struct {
+	AuthorForgeUserID int64     // stable forge user id of the comment author
+	AuthorUsername    string    // author login, may be empty
+	Body              string    // comment body (untrusted)
+	CreatedAt         time.Time // when the comment was created
+	// Path is the diff file path an inline comment is anchored to; nil for a
+	// review-summary body or a top-level MR note.
+	Path *string
+	// Line is the diff line an inline comment is anchored to; nil for a
+	// review-summary body or a top-level MR note.
+	Line *int
+	// ReplyID is the REPLY anchor ReplyMergeRequestComment keys on: the GitLab
+	// discussion id, the GitHub REST comment databaseId (as a string), or the
+	// Forgejo review-comment id. Empty when the comment is not a repliable thread.
+	ReplyID string
+	// ResolveID is the RESOLVE anchor ResolveMergeRequestThread keys on: the
+	// GitLab discussion id or the GitHub GraphQL review-thread node id. EMPTY on
+	// Forgejo (no resolvable-thread concept) and for non-thread comments.
+	ResolveID string
+	// HeadSHA is the diff head SHA the comment was written against, for the
+	// staleness gate (Decision 6). Empty when the driver cannot supply one (e.g. a
+	// top-level note that carries no diff position).
+	HeadSHA string
+	// ReviewState is one of the ReviewComment* constants: "inline" for a diff-line
+	// comment, "summary" for a review-summary body or top-level note.
+	ReviewState string
+}
+
 // IsKnownMRState reports whether s is one of the MR states this integration
 // recognizes. The MR-close watcher records and acts on known states only; an
 // unrecognized or empty value is ignored so a transient forge glitch cannot
@@ -435,6 +501,30 @@ type Forge interface {
 	// MR-close watcher (PRD #24) polls this for cards parked in Human Review to
 	// detect an opened→closed (reviewer rejected the MR) edge.
 	GetMergeRequest(ctx context.Context, projectID, mrIID int64) (MergeRequest, error)
+	// ListMergeRequestComments returns an MR's HUMAN and third-party review-bot
+	// comments oldest-first (PRD #700), paginated internally and bounded by the
+	// shared forge sanity ceilings (maxForgeItems/maxForgePages). Each driver drops
+	// the forge's own system/timeline notes (D2) and normalizes ordering to
+	// oldest-first (D8), and populates the reply/resolve anchors, HeadSHA, and
+	// Path/Line wherever the SDK exposes them. It does NOT filter bot authors — the
+	// snapshot layer does that against the connection's own bot id, so a
+	// third-party review bot (CodeRabbit) stays readable. Bodies are untrusted free
+	// text. GitHub stitches three REST sources with a GraphQL reviewThreads read to
+	// supply both anchors (Resolved facts). No caller until PRD #700's plumbing.
+	ListMergeRequestComments(ctx context.Context, projectID, mrIID int64) ([]MRComment, error)
+	// ReplyMergeRequestComment posts a reply in the thread keyed on replyID (an
+	// MRComment.ReplyID: the GitLab discussion id, the GitHub REST databaseId, or
+	// the Forgejo review-comment id). The MR-review-rework worker uses it to answer
+	// each finding ("done in <sha>" / "skipped because X"). No caller until PRD
+	// #700's plumbing.
+	ReplyMergeRequestComment(ctx context.Context, projectID, mrIID int64, replyID, body string) error
+	// ResolveMergeRequestThread resolves the review thread keyed on resolveID (an
+	// MRComment.ResolveID: the GitLab discussion id or the GitHub GraphQL thread
+	// node id). Returns ErrResolveUnsupported on Forgejo, whose forge has no
+	// resolvable-thread concept — the worker swallows that sentinel and keeps the
+	// reply (reply-only is the documented Forgejo contract). No caller until PRD
+	// #700's plumbing.
+	ResolveMergeRequestThread(ctx context.Context, projectID, mrIID int64, resolveID string) error
 	// TokenInfo returns introspection data for the PAT the client authenticates
 	// with: its scopes, whether it is active, and its expiry. GitLab: GET
 	// /personal_access_tokens/self. Returns ErrTokenIntrospectionUnsupported when

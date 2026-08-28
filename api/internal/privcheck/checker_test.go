@@ -88,6 +88,15 @@ func (f *fakeForge) UpdateIssueLabels(context.Context, int64, int64, []string, [
 func (f *fakeForge) GetMergeRequest(context.Context, int64, int64) (forge.MergeRequest, error) {
 	return forge.MergeRequest{}, nil
 }
+func (f *fakeForge) ListMergeRequestComments(context.Context, int64, int64) ([]forge.MRComment, error) {
+	return nil, nil
+}
+func (f *fakeForge) ReplyMergeRequestComment(context.Context, int64, int64, string, string) error {
+	return nil
+}
+func (f *fakeForge) ResolveMergeRequestThread(context.Context, int64, int64, string) error {
+	return nil
+}
 func (f *fakeForge) UserExists(context.Context, string) (bool, error) { return false, nil }
 func (f *fakeForge) ListIssueLabelEvents(context.Context, int64, int64) ([]forge.LabelEvent, error) {
 	return nil, nil
