@@ -62,6 +62,10 @@ describe("MR-review-watcher differential fixture (PRD #700 M6)", () => {
     const run = mockRuns.find((r) => r.id === id);
     expect(run, `mockRuns is missing the reworking run "${id}"`).toBeTruthy();
     expect(run?.kind).toBe("mr_rework");
+    // Issue-LESS, matching the backend: CreateAutoMRReworkRun leaves issue_iid NULL,
+    // so RunIssueRef renders the "MR rework" kind chip rather than a forge #anchor.
+    expect(run?.issue_iid).toBeNull();
+    expect(run?.issue_web_url).toBeNull();
     // Folds onto the EXISTING branch + MR rather than opening a new one.
     expect(run?.branch).toBeTruthy();
     expect(run?.mr_iid).not.toBeNull();

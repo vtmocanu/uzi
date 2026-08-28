@@ -2726,15 +2726,16 @@ export const mockRuns: Run[] = [
   },
   {
     // PRD #700 M6: an mr_rework run, the "reworking" branch of the MR-review
-    // watcher. It is issue-backed (a completed run's MR gained new review comments
-    // on a green pipeline), so it folds the fixes onto the EXISTING branch and MR
-    // rather than opening a new one — hence branch/mr_iid/mr_state are populated and
-    // status is running. RunIssueRef labels the kind "MR rework". The per-MR cap is
-    // NOT a run status; a capped MR surfaces via the halt inbox notification
-    // (ntf-mr-rework-capped), mirroring M3's ci-autofix halt path.
+    // watcher. It is issue-LESS — CreateAutoMRReworkRun leaves issue_iid NULL and
+    // carries the human summary in issue_title/issue_description — so RunIssueRef
+    // takes its issue-less branch and renders the "MR rework" kind chip (not a
+    // forge #anchor). It folds the fixes onto the EXISTING branch and MR rather than
+    // opening a new one, hence branch/mr_iid/mr_state are populated and status is
+    // running. The per-MR cap is NOT a run status; a capped MR surfaces via the halt
+    // inbox notification (ntf-mr-rework-capped), mirroring M3's ci-autofix halt path.
     id: "run-mr-rework",
     repo_id: "repo-uzi",
-    issue_iid: 700,
+    issue_iid: null,
     issue_title: "MR review watcher: auto-rework review comments until merge",
     issue_description: "See prds/700-mr-review-watcher.md.",
     kind: "mr_rework",
@@ -2753,7 +2754,7 @@ export const mockRuns: Run[] = [
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: "https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/57",
-    issue_web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/700",
+    issue_web_url: null,
     mr_iid: 57,
     mr_state: "opened",
     failure_reason: null,

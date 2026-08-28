@@ -3,9 +3,9 @@
 // inside SettingsShell so tokens/forge/access are one discoverable area. The
 // token LIST itself is AnthropicTokens (PRD #104 M6) — this page owns the fetch
 // so the list and the rate-limit meters refresh together. Run-behavior defaults
-// (autopilot, usage-limit park, judge, CI autofix, worker model) moved to the
-// Run defaults tab (RunDefaults.tsx): this tab is who you are and what you
-// hold, that one is how your runs behave.
+// (autopilot, usage-limit park, judge, CI autofix, MR review rework, worker
+// model) moved to the Run defaults tab (RunDefaults.tsx): this tab is who you
+// are and what you hold, that one is how your runs behave.
 
 import { useCallback, useEffect, useState } from "react";
 import { useAuth } from "../auth/AuthContext";
@@ -49,13 +49,6 @@ export function Settings() {
   // load and reload together.
   const [sidebarTokenIds, setSidebarTokenIds] = useState<string[]>([]);
 
-  // MR review watcher opt-in (PRD #700 M6). Default ON: null/absent reads as
-  // enabled, only an explicit false opts the account out. Stored as the raw
-  // tri-state so the checkbox reflects "!== false".
-  const [mrReworkEnabled, setMrReworkEnabled] = useState<boolean | null>(null);
-  const [mrReworkBusy, setMrReworkBusy] = useState(false);
-  const [mrReworkError, setMrReworkError] = useState("");
-
   const load = useCallback(async () => {
     try {
       const [{ secrets: rows }, { settings }] = await Promise.all([
@@ -64,7 +57,6 @@ export function Settings() {
       ]);
       setSecrets(rows.filter((s) => s.kind === "anthropic_token"));
       setSidebarTokenIds(settings.sidebar_token_ids ?? []);
-      setMrReworkEnabled(settings.mr_rework_enabled ?? null);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to load settings");
     } finally {
@@ -89,23 +81,6 @@ export function Settings() {
       emitSidebarTokensChanged();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to update the sidebar meters");
-    }
-  };
-
-  // MR review watcher opt-in toggle. Persists the boolean through PUT
-  // /me/settings; a failed save leaves the last-loaded value untouched.
-  const toggleMrRework = async (next: boolean) => {
-    setMrReworkError("");
-    setMrReworkBusy(true);
-    try {
-      const { settings } = await api.putMySettings({ mr_rework_enabled: next });
-      setMrReworkEnabled(settings.mr_rework_enabled ?? null);
-    } catch (err) {
-      setMrReworkError(
-        err instanceof ApiError ? err.message : "Failed to update the MR review setting",
-      );
-    } finally {
-      setMrReworkBusy(false);
     }
   };
 
@@ -229,32 +204,6 @@ export function Settings() {
             </Select>
           </Field>
         </div>
-      </Card>
-
-      <Card className="space-y-4">
-        <div>
-          <SectionTitle>MR review rework</SectionTitle>
-          <p className="mt-2 text-sm text-muted">
-            When a completed run's merge request gets new review comments on a green pipeline, uzi
-            can automatically rework the branch to address them, then reply and resolve each thread.
-            On by default. Opting out stops the watcher from auto-reworking{" "}
-            <strong className="text-fg">your</strong> MRs — the admin kill-switch that turns the
-            feature off for the whole instance is separate.
-          </p>
-        </div>
-
-        {mrReworkError && <Alert message={mrReworkError} />}
-
-        <label className="flex items-center gap-3 text-sm">
-          <input
-            type="checkbox"
-            className="h-4 w-4 accent-brand"
-            checked={mrReworkEnabled !== false}
-            disabled={mrReworkBusy}
-            onChange={(e) => toggleMrRework(e.target.checked)}
-          />
-          <span className="text-fg">Auto-rework MR review comments on my runs</span>
-        </label>
       </Card>
 
       <SlackNotifications />

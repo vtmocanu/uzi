@@ -7,6 +7,7 @@
 import { afterEach, describe, it, expect } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { RunIssueRef, runKindLabel } from "./RunIssueRef";
+import { mockRuns } from "../mocks/data";
 
 afterEach(cleanup);
 
@@ -60,6 +61,36 @@ describe("RunIssueRef — kind chip (branch 1, guards the dangling-# regression)
       expect(container.textContent).not.toContain("#");
     });
   }
+});
+
+describe("RunIssueRef — mr_rework fixture renders the chip, not a forge anchor (PRD #700 M6)", () => {
+  // A real mr_rework run is issue-LESS (CreateAutoMRReworkRun leaves issue_iid NULL),
+  // so RunIssueRef must take its issue-less branch and render the "MR rework" chip.
+  // Drive it from the shipped mock fixture so a fixture that regains an issue_iid —
+  // which would silently switch this to a forge #anchor and never exercise the label —
+  // fails here rather than passing on a hand-built prop set.
+  it("renders the 'MR rework' chip for the issue-less run-mr-rework fixture", () => {
+    const run = mockRuns.find((r) => r.id === "run-mr-rework");
+    expect(run, "mockRuns is missing run-mr-rework").toBeTruthy();
+    // The fixture must be genuinely issue-less for the chip branch to fire.
+    expect(run?.issue_iid).toBeNull();
+    expect(run?.issue_web_url).toBeNull();
+
+    const { container } = render(
+      <RunIssueRef
+        issueIid={run!.issue_iid}
+        issueWebUrl={run!.issue_web_url}
+        kind={run!.kind}
+        forgeType={run!.forge_type}
+      />,
+    );
+    // The legible label appears as a chip...
+    expect(screen.getByText("MR rework")).toBeTruthy();
+    // ...with no forge anchor and no dangling "#".
+    expect(screen.queryByRole("link")).toBeNull();
+    expect(container.querySelector("a")).toBeNull();
+    expect(container.textContent).not.toContain("#");
+  });
 });
 
 describe("runKindLabel", () => {

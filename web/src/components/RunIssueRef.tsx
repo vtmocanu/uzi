@@ -2,9 +2,10 @@ import { forgePlatform } from "../lib/forgeNoun";
 import { ForgeIssueAnchor } from "./ForgeIssueAnchor";
 
 // runKindLabel maps an issue-less run's kind to a short human label for the chip
-// (PRD #411). The three issue-less kinds that reach the runs list are task, ci_fix,
-// prompt; mr_rework (PRD #700) is issue-backed but its chip still wants a legible
-// label; others degrade to the raw kind with underscores spaced.
+// (PRD #411). The issue-less kinds that reach the runs list are task, ci_fix,
+// prompt, and mr_rework (PRD #700 — CreateAutoMRReworkRun leaves issue_iid NULL, so
+// it renders the chip, not a forge #anchor); others degrade to the raw kind with
+// underscores spaced.
 export function runKindLabel(kind: string): string {
   switch (kind) {
     case "ci_fix":
