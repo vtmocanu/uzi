@@ -101,6 +101,11 @@ export interface UserSettings {
    *  sidebar rail. The default token always shows and is never listed here.
    *  Absent (older server) reads as []: default-only, the pre-feature look. */
   sidebar_token_ids?: string[];
+  /** Per-user opt-in for the MR review watcher (PRD #700 M5/M6); default ON.
+   *  null/absent reads as enabled (the default-ON state); an explicit false means
+   *  the user opted this account out, so the watcher stops auto-reworking their MRs.
+   *  The admin global kill-switch is separate. */
+  mr_rework_enabled?: boolean | null;
 }
 
 // UserSettingsPatch is the PATCH-like body of PUT /me/settings: a field present
@@ -117,6 +122,9 @@ export interface UserSettingsPatch {
   theme?: string | null;
   /** Replaces the whole sidebar-token set (null clears it); absent leaves it. */
   sidebar_token_ids?: string[] | null;
+  /** Per-user MR-review-watcher opt-in (PRD #700 M6); present-false opts out,
+   *  present-true (or null clearing back to the default-ON) re-enables. */
+  mr_rework_enabled?: boolean | null;
 }
 
 // AgentTemplateScope mirrors the skill scopes (PRD #18 M6): builtin (shipped),
@@ -549,6 +557,13 @@ export interface LatestRun {
   // predates the field omits the key, and an absent value reads as not-planning
   // (isPlanningRun requires `=== true`). Derived, not a real runs.status value.
   is_planning?: boolean;
+  // issue #750: server-computed plan-revise display flag (true while the run's latest
+  // {plan, plan_revising} message is a plan_revising — a "revise" replan in flight). The
+  // server does NOT status-gate it, so the client combines it with status
+  // (isRevisingRun requires status === "awaiting_approval" AND `=== true`). OPTIONAL for
+  // the SAME rollout skew as is_planning: a pre-feature api pod omits the key, and an
+  // absent value reads as not-revising. Derived, not a real runs.status value.
+  is_revising?: boolean;
   // Run-health flag (PRD #47). health + health_since are non-sensitive (like
   // stop_kind) and always present. health_reason can name owner state ("your vault
   // is locked"), so the server sends it only to the run's owner (is_mine); a
@@ -1860,6 +1875,15 @@ export interface RunListItem extends Run {
    *  appends it only when > 0. */
   judge_verdict: JudgeVerdict | null;
   judge_todo_count: number;
+
+  /** issue #750: server-computed plan-revise display flag on the LIST row (it rides
+   *  RunListItemDTO, deliberately NOT RunDTO — the detail page keeps its own
+   *  derivePlanRevision panel). True while the run's latest {plan, plan_revising} message
+   *  is a plan_revising — a "revise" replan in flight. The server does NOT status-gate
+   *  it, so a client combines it with status (isRevisingRun requires status ===
+   *  "awaiting_approval" AND `=== true`). OPTIONAL for rollout skew: a pre-feature api
+   *  pod omits the key, and an absent value reads as not-revising. */
+  is_revising?: boolean;
 
   repo_path: string;
   worker_name: string | null;

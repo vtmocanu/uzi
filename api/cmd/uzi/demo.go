@@ -98,6 +98,10 @@ var demoLiveLines = []string{
 
 // ---- seeded fixtures ------------------------------------------------------
 
+// boolPtr returns a pointer to b, for the nullable *bool DTO fields (e.g.
+// UserSettingsDTO.MrReworkEnabled, where nil = the default-ON state).
+func boolPtr(b bool) *bool { return &b }
+
 func newDemoClient() *uzicli.FakeClient {
 	now := time.Now()
 	runs := demoRuns(now)
@@ -133,7 +137,13 @@ func newDemoClient() *uzicli.FakeClient {
 			{SecretID: "sec-throttled", Label: "throttled", Limits: apitypes.RateLimitDTO{Status: "unavailable"}},
 		},
 		// Only "meta" is promoted into the sidebar selection; "unlisted" stays hidden.
-		Settings: apitypes.UserSettingsDTO{SidebarTokenIds: []string{"sec-meta"}},
+		// MrReworkEnabled false is the explicit opt-out (PRD #700 M6); a nil pointer
+		// would be the default-ON state. Carried for decode fidelity — the TUI does
+		// not render it, matching the DTO's other fidelity-only fields.
+		Settings: apitypes.UserSettingsDTO{
+			SidebarTokenIds: []string{"sec-meta"},
+			MrReworkEnabled: boolPtr(false),
+		},
 		// StreamEvents nil: NewRunStream emits nothing and stays OPEN (so the detail reads
 		// "live"); the ticker above supplies the live frames.
 		StreamEvents: nil,

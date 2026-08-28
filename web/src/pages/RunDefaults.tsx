@@ -109,6 +109,32 @@ export function RunDefaults() {
     }
   };
 
+  // MR review rework opt-in (PRD #700 M6). Default ON: null/absent reads as
+  // enabled, only an explicit false opts the account out. Stored as the raw
+  // tri-state so the checkbox reflects "!== false". Unlike autopilot/judge/CI-autofix
+  // — which live on the User session and write dedicated endpoints — this is a
+  // UserSettings field, so it loads from settings below and PATCHes via putMySettings.
+  const [mrReworkEnabled, setMrReworkEnabled] = useState<boolean | null>(null);
+  const [mrReworkBusy, setMrReworkBusy] = useState(false);
+  const [mrReworkError, setMrReworkError] = useState("");
+
+  // Persists the boolean through PUT /me/settings; a failed save leaves the
+  // last-loaded value untouched.
+  const toggleMrRework = async (next: boolean) => {
+    setMrReworkError("");
+    setMrReworkBusy(true);
+    try {
+      const { settings } = await api.putMySettings({ mr_rework_enabled: next });
+      setMrReworkEnabled(settings.mr_rework_enabled ?? null);
+    } catch (err) {
+      setMrReworkError(
+        err instanceof ApiError ? err.message : "Failed to update the MR review setting",
+      );
+    } finally {
+      setMrReworkBusy(false);
+    }
+  };
+
   // Worker model: "" = inherit. savedModel is the persisted value, so Save is
   // only offered when the picker differs from what is stored.
   const [defaultModel, setDefaultModel] = useState("");
@@ -158,6 +184,7 @@ export function RunDefaults() {
       const eff = settings.default_effort ?? "";
       setDefaultEffort(eff);
       setSavedEffort(eff);
+      setMrReworkEnabled(settings.mr_rework_enabled ?? null);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to load settings");
     } finally {
@@ -498,6 +525,36 @@ export function RunDefaults() {
             onChange={(e) => toggleCIAutofix(e.target.checked)}
           />
           <span className="text-fg">Automatically fix my failed CI pipelines</span>
+        </label>
+      </Card>
+
+      {/* MR review rework opt-in (PRD #700 M6). A run-behavior default, so it lives
+          here beside autopilot/judge/CI-autofix rather than on Account & tokens. */}
+      <Card className="space-y-4">
+        <div>
+          <SectionTitle>MR review rework</SectionTitle>
+          <p id="mr-rework-help" className="mt-2 text-sm text-muted">
+            When a completed run's merge request gets new review comments on a green pipeline, uzi
+            can automatically rework the branch to address them, then reply to each thread, and
+            resolve it on forges that support resolvable threads (GitLab, GitHub). On by default.
+            Opting out stops the watcher from auto-reworking{" "}
+            <strong className="text-fg">your</strong> MRs — the admin kill-switch that turns the
+            feature off for the whole instance is separate.
+          </p>
+        </div>
+
+        {mrReworkError && <Alert message={mrReworkError} />}
+
+        <label className="flex items-center gap-3 text-sm">
+          <input
+            type="checkbox"
+            className="h-4 w-4 accent-brand"
+            checked={mrReworkEnabled !== false}
+            disabled={mrReworkBusy}
+            aria-describedby="mr-rework-help"
+            onChange={(e) => toggleMrRework(e.target.checked)}
+          />
+          <span className="text-fg">Auto-rework MR review comments on my runs</span>
         </label>
       </Card>
 

@@ -22,6 +22,7 @@ import { hasAnthropicToken } from "../lib/hasToken";
 import { startRunGate, type StartRunGate } from "../lib/runStream";
 import {
   canOpenRunView,
+  effectiveRunStatus,
   hasActiveRun,
   isAwaitingApproval,
   isAwaitingFollowup,
@@ -518,7 +519,12 @@ export function Board() {
       ]);
       setHasWorker(workers.length > 0);
       setHasToken(hasAnthropicToken(secrets));
-      setAwaitingRuns(runs.filter((r) => isAwaitingApproval(r.status)));
+      // issue #750: classify from the EFFECTIVE status, not the raw one. A run
+      // re-planning after a revise keeps status === "awaiting_approval" server-side, but
+      // effectiveRunStatus returns "revising" for it (is_revising true), so
+      // isAwaitingApproval reads false and it drops out of the attention strip. The next
+      // `plan` flips is_revising false server-side and it returns to this bucket.
+      setAwaitingRuns(runs.filter((r) => isAwaitingApproval(effectiveRunStatus(r))));
       setQuestionRuns(runs.filter((r) => isAwaitingInput(r.status)));
       setFollowupRuns(runs.filter((r) => isAwaitingFollowup(r.status)));
       setStuckRuns(
@@ -1804,7 +1810,11 @@ export function IssueCard({
   // PRD #88 D-O #4 puts awaiting_input on exactly this treatment — same debt, and the
   // PRD's own framing is that it is the third human-in-the-loop channel. The ring is
   // presentation, so the two share it; the STRIP above still names them separately.
-  const loud = needsHumanAttention(run?.status ?? "");
+  // issue #750: feed the EFFECTIVE status so a run re-planning after a revise loses the
+  // loud attention ring. Such a run keeps status === "awaiting_approval" server-side, but
+  // effectiveRunStatus returns "revising" for it, so needsHumanAttention reads false. Its
+  // badge (runBadge → effectiveRunStatus) already reads "revising" in the calm info tone.
+  const loud = needsHumanAttention(effectiveRunStatus(run ?? { status: "" }));
   // The MR/PR link (PRD #65 D8): prefer the forge-supplied URL the worker persisted
   // (the only correct link on Forgejo), guarded through isHttpsUrl by preferForgeUrl
   // before it becomes an anchor. A null (rows created before it landed — all GitLab)

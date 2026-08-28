@@ -367,7 +367,9 @@ func (m tuiModel) detailHeaderLines() []string {
 	// elapsed time — a live run's runtime or a terminal run's total wall time.
 	statusTag := ""
 	if d.run.ID != "" {
-		tok := m.pal.stateToken(d.run.Status, d.run.Health, d.run.IsPlanning)
+		// RunDTO carries no is_revising (issue #750): the detail header keeps its own
+		// derivePlanRevision panel, so revising is not surfaced through this token here.
+		tok := m.pal.stateToken(d.run.Status, d.run.Health, d.run.IsPlanning, false)
 		statusTag = lipgloss.NewStyle().Foreground(tok.color).Render(tok.glyph + " " + tok.word)
 		if dur := runDuration(d.run, time.Now()); dur != "" {
 			statusTag += m.pal.faint.Render(" · " + dur)

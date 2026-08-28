@@ -2,9 +2,18 @@ import { describe, it, expect } from "vitest";
 import { deriveFaviconState, failedRunIds, type FaviconRun } from "./favicon";
 import type { StopKind } from "./api";
 
-// run builds a minimal FaviconRun (just the id/status/stop_kind the derivation reads).
-function run(status: string, over: { id?: string; stop_kind?: StopKind | null } = {}): FaviconRun {
-  return { id: over.id ?? `run-${status}`, status, stop_kind: over.stop_kind ?? null };
+// run builds a minimal FaviconRun (just the id/status/stop_kind/is_revising the
+// derivation reads).
+function run(
+  status: string,
+  over: { id?: string; stop_kind?: StopKind | null; is_revising?: boolean } = {},
+): FaviconRun {
+  return {
+    id: over.id ?? `run-${status}`,
+    status,
+    stop_kind: over.stop_kind ?? null,
+    is_revising: over.is_revising,
+  };
 }
 
 const NONE = new Set<string>(); // empty baseline
@@ -24,6 +33,19 @@ describe("deriveFaviconState — the four states in isolation", () => {
   // out would make the one status designed to be noticed the only one the tab ignores.
   it("attention for a run awaiting the user's ANSWER too", () => {
     expect(deriveFaviconState([run("awaiting_input")], 0, NONE)).toBe("attention");
+  });
+  // issue #750. A run re-planning after a revise keeps status === "awaiting_approval"
+  // server-side, but its is_revising flag flips the EFFECTIVE status to "revising", so it
+  // is NOT the blocker right now and must not light the attention dot — the whole point
+  // of the derived flag is to keep it out of the human-attention grouping while the
+  // planner reworks. With nothing else live it falls through to idle.
+  it("NOT attention for a run re-planning after a revise (idle instead)", () => {
+    expect(deriveFaviconState([run("awaiting_approval", { is_revising: true })], 0, NONE)).toBe("idle");
+  });
+  it("attention returns once the next plan lands (is_revising false)", () => {
+    expect(deriveFaviconState([run("awaiting_approval", { is_revising: false })], 0, NONE)).toBe("attention");
+    // Absent (rollout skew) reads as not-revising, so an ordinary awaiting_approval still lights.
+    expect(deriveFaviconState([run("awaiting_approval")], 0, NONE)).toBe("attention");
   });
   it("running for a run in flight", () => {
     expect(deriveFaviconState([run("running")], 0, NONE)).toBe("running");

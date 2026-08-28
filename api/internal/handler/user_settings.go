@@ -28,11 +28,15 @@ import (
 // tokens whose rate meters the user surfaced on the sidebar rail — the default
 // token always shows and is never listed; empty means default-only.
 type userSettingsDTO struct {
-	DefaultModel    *string  `json:"default_model"`
-	DefaultEffort   *string  `json:"default_effort"`
-	JudgeModel      *string  `json:"judge_model"`
-	SummaryModel    *string  `json:"summary_model"`
-	Theme           *string  `json:"theme"`
+	DefaultModel  *string `json:"default_model"`
+	DefaultEffort *string `json:"default_effort"`
+	JudgeModel    *string `json:"judge_model"`
+	SummaryModel  *string `json:"summary_model"`
+	Theme         *string `json:"theme"`
+	// MrReworkEnabled is the per-user opt-in to the MR review watcher (PRD #700 M5),
+	// which ships ON. null means "unset" = inherit the default-ON semantics (a
+	// NULL/absent user value is read as enabled); an explicit false is the opt-OUT.
+	MrReworkEnabled *bool    `json:"mr_rework_enabled"`
 	SidebarTokenIds []string `json:"sidebar_token_ids"`
 }
 
@@ -57,6 +61,7 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 			JudgeModel:      textPtrValue(s.JudgeModel.Valid, s.JudgeModel.String),
 			SummaryModel:    textPtrValue(s.SummaryModel.Valid, s.SummaryModel.String),
 			Theme:           textPtrValue(s.Theme.Valid, s.Theme.String),
+			MrReworkEnabled: boolPtrValue(s.MrReworkEnabled),
 			SidebarTokenIds: uuidStrings(s.SidebarTokenIds),
 		},
 	})
@@ -96,6 +101,7 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		JudgeModel      json.RawMessage `json:"judge_model"`
 		SummaryModel    json.RawMessage `json:"summary_model"`
 		Theme           json.RawMessage `json:"theme"`
+		MrReworkEnabled json.RawMessage `json:"mr_rework_enabled"`
 		SidebarTokenIds json.RawMessage `json:"sidebar_token_ids"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
@@ -207,6 +213,30 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			Theme: themeVal,
 		}); err != nil {
 			slog.Error("set user theme", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if req.MrReworkEnabled != nil {
+		// PATCH semantics like the model fields: present-bool sets the opt-in,
+		// present-null clears back to NULL = the default-ON state (PRD #700 M5). A
+		// non-bool body is a 400. There is no closed-enum to validate — a bool is a
+		// bool — so the value maps straight to a nullable column.
+		var raw *bool
+		if err := json.Unmarshal(req.MrReworkEnabled, &raw); err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid mr_rework_enabled")
+			return
+		}
+		var val pgtype.Bool
+		if raw != nil {
+			val = pgtype.Bool{Bool: *raw, Valid: true}
+		}
+		if _, err := h.q.SetUserMrReworkEnabled(r.Context(), store.SetUserMrReworkEnabledParams{
+			ID:              user.ID,
+			MrReworkEnabled: val,
+		}); err != nil {
+			slog.Error("set user mr rework enabled", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}

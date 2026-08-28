@@ -18,6 +18,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **MR review comments are now auto-reworked in place, on by default, for every opted-in user ([#700](https://github.com/vtmocanu/uzi/issues/700)).**
+  When a completed run's merge request gets new review comments on a green pipeline, uzi starts an `mr_rework` run that treats each finding as untrusted data, implements the ones still valid, and replies to (and, where the forge supports it, resolves) each thread on the existing branch and MR, capped at 5 rework cycles per MR by default. This is an announced behavior change: after upgrading, opted-in users' MRs (including unattended nightly-sweep MRs) get reworked automatically on their own Anthropic token, unless they opt out from Settings ("Auto-rework MR review comments on my runs") or an admin turns off the instance-wide `mr_rework_enabled` kill-switch.
+
 ### Fixed
 
 - **A gated run no longer loses in-progress work across an Anthropic usage-limit park ([#759](https://github.com/vtmocanu/uzi/issues/759)).**

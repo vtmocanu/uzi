@@ -2,7 +2,7 @@
 
 **Issue**: #700
 **Seeded by**: the idea doc `ideas/bingo/2026-08-25-mr-review-rework-runs.md` (merged in #698)
-**Status**: Planned — queued for the `Planned` sweep
+**Status**: Done — M1–M7 landed on `agent/issue-700`
 **Priority**: Medium
 
 ## Problem
@@ -99,8 +99,12 @@ resolved fact so no milestone depends on an online lookup.
 - **Forgejo/Gitea** (`code.gitea.io/sdk/gitea`) — read + reply, **no resolve**:
   - read: pull-review + issue-comment listing (mirror the existing
     `forgejo.CreateIssueNote` at `forgejo.go:832` and `ListIssueComments` at `:908`).
-  - **Gitea/Forgejo has no resolvable review-thread concept** (verified via `go doc`:
-    the SDK exposes no resolve/thread type beyond `NotificationThread`). So on this
+  - **Thread resolution is not available on released Gitea/Forgejo** (correction found
+    during M1: the vendored `code.gitea.io/sdk/gitea` DOES expose
+    `ResolvePullReviewComment`/`UnresolvePullReviewComment`, but they are documented as
+    "Available on Gitea main/nightly", so a released server may not back them). The
+    original claim that the SDK "exposes no resolve type" was inaccurate; the reply-only
+    decision stands as a server-compatibility choice, not an SDK limitation. So on this
     driver **resolve is a documented no-op** — reply-only — and the interface must
     tolerate a driver that cannot resolve (return a sentinel `ErrResolveUnsupported`
     that the worker swallows, or a capability flag). Termination does not depend on
@@ -350,7 +354,7 @@ catches a collision).
 
 ## Milestones
 
-- [ ] **M1 — Forge layer.** `MRComment` type (both anchors + `HeadSHA`) +
+- [x] **M1 — Forge layer.** `MRComment` type (both anchors + `HeadSHA`) +
   `ListMergeRequestComments` (read), `ReplyMergeRequestComment` (reply),
   `ResolveMergeRequestThread` (resolve, no-op on Forgejo) added to the interface and all
   three drivers using the Resolved-facts method surface (GitHub read stitches REST +
@@ -360,7 +364,7 @@ catches a collision).
   (stitched, not just REST); reply and resolve hit the right SDK call keyed on the right
   anchor (table-driven per driver); Forgejo resolve returns `ErrResolveUnsupported`.
 
-- [ ] **M2 — Snapshot + carry.** `fetchReviewCommentsSnapshot` (reusing #381 caps + bot
+- [x] **M2 — Snapshot + carry.** `fetchReviewCommentsSnapshot` (reusing #381 caps + bot
   self-filter), `runs.review_comments jsonb`, the `CreateRun` INSERT field, and the
   `ClaimPayload.ReviewComments` field. sqlc regenerated with the **pinned version in
   `api/sqlc.yaml` (v1.31.1 as of this writing, bumped from v1.30.0 by #679)** as a
@@ -373,7 +377,7 @@ catches a collision).
   extending the `claim_wire_contract_test.go` golden — NOT a `== nil`/`=== undefined`
   check, which is vacuous for an `omitempty` field.
 
-- [ ] **M3 — Run kind, ledger, and poller detector.** `mr_rework` kind + `runs_kind_shape`
+- [x] **M3 — Run kind, ledger, and poller detector.** `mr_rework` kind + `runs_kind_shape`
   CHECK + same-kind `uq_runs_one_active_mr_rework` index + the **cross-kind create-time
   branch guard** (Decision 6) + `mr_rework_ledger` (monotonic high-water). `CreateAutoMRReworkRun`
   (explicit MR snapshot fetch per Decision 8; **writes `pipeline_ref`/`branch` at INSERT**
@@ -391,7 +395,7 @@ catches a collision).
   (the test must exercise the create-time-populated column, not a fake that back-fills
   `branch`).
 
-- [ ] **M4 — Worker apply + write-back + injection defense.** `buildReviewCommentsContext`
+- [x] **M4 — Worker apply + write-back + injection defense.** `buildReviewCommentsContext`
   (nonce-fenced) + rework framing + Decision-12 untrusted-data rule in the prompt;
   worker `reply_mr_thread` / `resolve_mr_thread` tools + endpoints with the Decision-11
   server-side scope check; the run reasons per finding, implements valid ones, replies +
@@ -409,7 +413,7 @@ catches a collision).
   documented Forgejo contract). A skipped finding gets a reason reply and (where supported)
   the thread is resolved.
 
-- [ ] **M5 — Gates & enablement.** Admin global kill-switch (default on) + per-user
+- [x] **M5 — Gates & enablement.** Admin global kill-switch (default on) + per-user
   opt-in (default on) + admin-configurable cap (default 5). The settings read is the
   **three-state** form (present-true / present-false / absent), reconciling default-ON
   with fail-closed: **absent → ON, error → OFF** (Decision 5). Note the M5 *settings
@@ -419,12 +423,12 @@ catches a collision).
   *error* (not merely an absent row — the fail-open trap R3 named); the cap value is
   honored. The detector-no-op-when-off cases live in M3.
 
-- [ ] **M6 — Web + CLI + mock.** Settings opt-in toggle + card watch/rework/capped
+- [x] **M6 — Web + CLI + mock.** Settings opt-in toggle + card watch/rework/capped
   status; `api.ts` DTOs; CLI decode + `uzi run get`/`list` watch state; mock parity
   with the differential fixture (all four branches) and the fixture-completeness
   assertion. `gate:web` (incl. knip `exports:error`) green.
 
-- [ ] **M7 — Docs.** `docs/board.md` extended; a user page documenting the setting, the
+- [x] **M7 — Docs.** `docs/board.md` extended; a user page documenting the setting, the
   untrusted-data trust model, the per-MR cap, the Forgejo silent-resolve no-op, and the
   default-ON announced behavior change; CHANGELOG "Changed" (no em dashes);
   ARCHITECTURE.md updated (detector + run kind + forge-write surface). specs/ai.md

@@ -429,6 +429,70 @@ export const mockNotifications: MockNotification[] = [
     owner_email: mockAdmin.email,
     owner_display_name: mockAdmin.display_name,
   },
+  {
+    // PRD #700 M6: the "capped" branch of the MR-review watcher. Hitting the per-MR
+    // rework cap (default 5) is NOT a new run/watch-state endpoint (out of scope) —
+    // it halts and flags the card via the existing inbox halt notification, mirroring
+    // M3's ci-autofix halt path. Deep-links to the reworking run.
+    id: "ntf-mr-rework-capped",
+    user_id: mockAdmin.id,
+    kind: "mr_rework_capped",
+    payload: {
+      title: "MR rework capped",
+      body: "!57 hit the per-MR rework cap (5) — review the remaining comments by hand.",
+    },
+    run_id: "run-mr-rework",
+    review_id: null,
+    read_at: null,
+    created_at: minsAgo(4),
+    owner_email: mockAdmin.email,
+    owner_display_name: mockAdmin.display_name,
+  },
+];
+
+// ── PRD #700 M6: MR-review-watcher differential fixture ──────────────────────
+// Enumerates every branch the PRD names so the mock exercises each and the
+// completeness test (mockApi.mrRework.test.ts) fails the moment one is dropped:
+//   - opted-in : the per-user opt-in default-ON state (mr_rework_enabled null/absent).
+//   - opted-out: an explicit false, which stops the watcher for this user.
+//   - reworking: an mr_rework run folding review comments onto the open MR
+//                (mockRuns "run-mr-rework").
+//   - capped   : the per-MR cap hit, surfaced via the halt inbox notification
+//                (mockNotifications "ntf-mr-rework-capped"), NOT a new watch-state
+//                endpoint (out of scope, PRD Decision 13 / M6).
+export type MrReworkBranch = "opted-in" | "opted-out" | "reworking" | "capped";
+
+export interface MrReworkFixtureBranch {
+  branch: MrReworkBranch;
+  description: string;
+  // Present for the two settings branches: the mr_rework_enabled value that
+  // represents it (null = default-ON). Absent for the run/notification branches.
+  settingsValue?: boolean | null;
+  // Present for the run/notification branches: the fixture id backing it.
+  fixtureId?: string;
+}
+
+export const mockMrReworkFixture: MrReworkFixtureBranch[] = [
+  {
+    branch: "opted-in",
+    description: "Default ON: a null/absent mr_rework_enabled reads as enabled.",
+    settingsValue: null,
+  },
+  {
+    branch: "opted-out",
+    description: "An explicit false opts this user out; the watcher skips their MRs.",
+    settingsValue: false,
+  },
+  {
+    branch: "reworking",
+    description: "An mr_rework run folding review comments onto the existing branch/MR.",
+    fixtureId: "run-mr-rework",
+  },
+  {
+    branch: "capped",
+    description: "Per-MR cap hit — flagged via the halt inbox notification (M3).",
+    fixtureId: "ntf-mr-rework-capped",
+  },
 ];
 
 // ── Incidental Findings backlog (PRD #333 M7) ────────────────────────────────
@@ -2659,6 +2723,64 @@ export const mockRuns: Run[] = [
     finished_at: null,
     created_at: minsAgo(3),
     updated_at: minsAgo(2),
+  },
+  {
+    // PRD #700 M6: an mr_rework run, the "reworking" branch of the MR-review
+    // watcher. It is issue-LESS — CreateAutoMRReworkRun leaves issue_iid NULL and
+    // carries the human summary in issue_title/issue_description — so RunIssueRef
+    // takes its issue-less branch and renders the "MR rework" kind chip (not a
+    // forge #anchor). It folds the fixes onto the EXISTING branch and MR rather than
+    // opening a new one, hence branch/mr_iid/mr_state are populated and status is
+    // running. The per-MR cap is NOT a run status; a capped MR surfaces via the halt
+    // inbox notification (ntf-mr-rework-capped), mirroring M3's ci-autofix halt path.
+    id: "run-mr-rework",
+    repo_id: "repo-uzi",
+    issue_iid: null,
+    issue_title: "MR review watcher: auto-rework review comments until merge",
+    issue_description: "See prds/700-mr-review-watcher.md.",
+    kind: "mr_rework",
+    title: null,
+    resume_of_run_id: null,
+    pipeline_ref: "agent/issue-700",
+    pipeline_web_url: null,
+    fix_verdict: null,
+    status: "running",
+    requeue_count: 0,
+    iteration_count: 0,
+    auto_approve: true,
+    worker_id: "w-laptop",
+    branch: "agent/issue-700",
+    model: null,
+    override_subagent_model: false,
+    forge_type: "gitlab",
+    mr_web_url: "https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/57",
+    issue_web_url: null,
+    mr_iid: 57,
+    mr_state: "opened",
+    failure_reason: null,
+    stop_kind: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
+    plan_md: null,
+    repo_agents: null,
+    agent_source: null,
+    agent_exclusions: null,
+    own_agents: null,
+    anthropic_secret_id: "sec-personal",
+    anthropic_secret_label: "personal",
+    anthropic_select_reason: null,
+    anthropic_headroom_pct: null,
+    wait_on_limit: false,
+    limit_resets_at: null,
+    retry_not_before: null,
+    limit_wait_count: 0,
+    rate_limit_type: null,
+    claimed_at: minsAgo(2),
+    started_at: minsAgo(2),
+    finished_at: null,
+    created_at: minsAgo(2),
+    updated_at: minsAgo(1),
   },
   {
     // PRD #320 M6 demo: a DEMOTED background run — a self_improve sweep yielding to

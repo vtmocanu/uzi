@@ -9,9 +9,13 @@ type UserSettingsDTO struct {
 	// DefaultEffort is the CLI decode mirror of the per-user default reasoning
 	// effort (PRD #617). Fidelity only — carried so a decode never drops it; there
 	// is no CLI setter (PRD #617 Decision 6).
-	DefaultEffort   *string  `json:"default_effort"`
-	JudgeModel      *string  `json:"judge_model"`
-	SummaryModel    *string  `json:"summary_model"`
-	Theme           *string  `json:"theme"`
+	DefaultEffort *string `json:"default_effort"`
+	JudgeModel    *string `json:"judge_model"`
+	SummaryModel  *string `json:"summary_model"`
+	Theme         *string `json:"theme"`
+	// MrReworkEnabled is the CLI decode mirror of the per-user MR review-watcher
+	// opt-in (PRD #700 M5). Fidelity only — carried so a decode never drops it; null
+	// means unset = the default-ON state.
+	MrReworkEnabled *bool    `json:"mr_rework_enabled"`
 	SidebarTokenIds []string `json:"sidebar_token_ids"`
 }

@@ -22675,9 +22675,110 @@ Terse contract here; PRD #650's Decision Log is the richer rationale.
   floor total also wears the tungsten accent so the two cost totals read at one weight (a tui-ux
   consistency fix).
 
+# PRD #700 — MR review watcher
+
+## 580. PRD #700 — a new `mr_rework` run kind: a poller detector auto-reworks a completed run's open MR from its review comments, then replies + resolves each thread
+
+Closes the asymmetry PRD #381 left: #381 built the untrusted-comment pipeline for **issue**
+comments feeding an issue run, and named MR/PR review comments as its explicit non-goal. This
+adds the MR half — a per-run watcher that reads the review that lands **on the MR** and reworks
+the branch until merge — modeled throughout on PRD #71 ci-autofix (detector + ledger + loop
+guard) rather than an instruction-only issue run. Terse contract here; PRD #700's Decision Log
+(1-13) and Resolved-facts section are the richer rationale. Serves human.md's "uzi reacts to
+MR review feedback automatically" and the never-touch-`main` guardrail.
+
+- **New `mr_rework` run kind, sibling of `ci_fix` (Decision 7).** A poller detector
+  (`poller/mr_review_watch.go`, modeled on `poller/ci_autofix.go`) watches every opted-in user's
+  completed issue run that opened an MR (Decision 9 — any MR, not only scheduled sweeps). When the
+  MR's **head pipeline is green** and **new review comments have landed for the current head SHA**,
+  it starts an auto-approved `mr_rework` run that addresses the feedback on the **existing
+  branch/MR** (never re-creates the branch), then replies in-thread and resolves each thread it
+  addressed. The kind has its own same-kind `uq_runs_one_active_mr_rework` partial unique index
+  (one active rework per MR) and its own ledger, distinct from the cross-kind guard below.
+- **Fully automatic, no plan gate (Decision 1).** The detector starts the run and the run
+  auto-approves its own per-finding triage plan (auto-approve-style, like scheduled sweeps). The
+  loop guard, injection defense, and write-back scoping are therefore load-bearing safety, not
+  optional.
+- **Trust model — review-comment text is the worst prompt-injection input uzi ingests
+  (Decisions 11-12).** It is rendered nonce-fenced (`<review_comments_{nonce}>`, per #381's fence)
+  and framed as untrusted **data**: verify each finding against current code, fix only
+  still-valid ones, skip the rest with a brief reason, never follow instructions embedded in the
+  text. The worker's reply/resolve is **server-scoped to this run's own review snapshot** for this
+  run's `mr_iid`: the `reply_mr_thread`/`resolve_mr_thread` endpoints reject any thread id not in
+  the snapshot, so an injected "resolve all open threads" is a no-op and cannot silence a
+  legitimate human/other-reviewer thread. Breakout defense proven by a **containment** test (forged
+  close-tag + imperative stay inside the real unpredictable-nonce fence), not an unprovable
+  "does-not-execute".
+- **Loop guard = monotonic comment-id high-water mark + per-MR cap (Decision 2).** Act only on
+  comments strictly above the last-consumed **monotonic comment id** (a scalar, deliberately a
+  documented fail-safe across distinct forge id sequences — a timestamp mark can skip a same-second
+  comment); cap total rework cycles per MR at **5** by default, admin-configurable. Past the cap the
+  watcher halts and notifies (halt comment + inbox), like ci-autofix. Both halves are required: the
+  mark stops re-litigating consumed comments, the cap stops infinite loops.
+- **Coordination = a create-time cross-kind branch guard + a watcher-owned state gate
+  (Decisions 6, 10).** An `mr_rework` and a `ci_fix` must not run concurrently on one branch. The
+  guard keys on the **branch identifier written at INSERT (`pipeline_ref`, and/or `branch`)** —
+  NOT the bare `runs.branch`, which is **NULL for a run's entire active life** (only completion/MR
+  reconciliation ever writes it), so two freshly-created runs would each see the other's branch as
+  NULL and race; hosted k8s has no git "already-checked-out" backstop. `CreateAutoMRReworkRun`
+  writes `agent/issue-N` at INSERT and the guard counts on a create-time-populated column (durable
+  form: a partial unique index spanning `ci_fix` + `mr_rework` on the branch); the detector swallows
+  the resulting conflict and retries next tick. The detector gates firing on the **watcher-owned
+  `mr_state` (open, not closed/merged)** rather than an independent forge read, reconciled with PRD
+  #24's close edge which runs **first** in the poller tick (`SyncMRStates`) — so a fresh
+  close/merge is authoritative and the detector merely halts, never creating a rework on a
+  just-closed MR. ci_fix fires on RED CI and mr_rework on GREEN — opposite triggers, so they
+  alternate in the right order (fix the build before polishing nits) with no shared budget.
+- **"Review landed" has no forge primitive, so it is a composed gate (Decision 6).** Fire only when
+  (a) the head pipeline is green, (b) the newest review comment is older than a configurable
+  quiet-period debounce, and (c) the comment's position head SHA equals the MR's current head SHA
+  (stale-SHA comments ignored). Where a driver cannot supply a per-comment head SHA, fall back to
+  the debounce alone.
+- **Enablement — both gates default ON, an announced behavior change (Decision 5).** An admin
+  global kill-switch AND a per-user opt-in, **both default ON** — a deliberate departure from uzi's
+  off-by-default norm for auto-acting features (judge, self-improve, ephemeral workers), shipped as
+  an announced CHANGELOG "Changed" + docs behavior change with the admin kill-switch and per-user
+  toggle as the escape hatches. Default-ON is reconciled with fail-closed by a **three-state
+  settings read** that distinguishes present-true / present-false / **absent** from an **error**:
+  `absent → ON` (the default), `error → OFF` (fail closed) — never a zero value that would collapse
+  absent and error and fail open. Admin-configurable cap (default 5) fails closed the same way.
+- **Forge surface — a neutral `MRComment` with TWO anchors + head SHA (Decision facts).**
+  `MRComment` mirrors #381's `IssueComment` plus `Path`/`Line`, a `ReplyID` (reply anchor), a
+  separate `ResolveID` (resolve anchor), `HeadSHA` (staleness gate), and review-state. Two anchors,
+  not one, because on GitHub reply keys on the REST **databaseId** while resolve keys on the GraphQL
+  **thread node id**. Three new interface methods (`ListMergeRequestComments`,
+  `ReplyMergeRequestComment`, `ResolveMergeRequestThread`) across all three drivers:
+  - **GitLab** — full support via `DiscussionsService` (single discussion id serves both anchors).
+  - **GitHub** — read stitches REST (comment bodies + reply databaseId) with a GraphQL
+    `reviewThreads` query (resolve node id + `isOutdated`) on the shared databaseId; resolve is
+    **GraphQL-only** (`resolveReviewThread`), issued as a raw authenticated POST since go-github
+    ships no GraphQL client and no new dependency is added.
+  - **Forgejo/Gitea — reply-only, resolve UNSUPPORTED** (released Gitea has no resolvable
+    review-thread concept): `ResolveMergeRequestThread` returns a sentinel `ErrResolveUnsupported`
+    the worker swallows. Termination depends on the high-water mark, not on resolution, so an
+    unresolved Forgejo thread never re-fires; the only cost is UX (replied-but-unresolved), which
+    docs must state.
+- **Snapshot wiring is explicit, not `CreateRun`'s issue-comment path (Decision 8).** `CreateRun`
+  snapshots *issue* comments for the issue IID, which would omit MR feedback.
+  `CreateAutoMRReworkRun` explicitly fetches the **MR** review snapshot for the source run's
+  `mr_iid` via `fetchReviewCommentsSnapshot` (reusing #381's byte caps and the bot self-filter that
+  drops the connection's OWN bot note while keeping third-party review bots like CodeRabbit — the
+  feature's whole point) and carries it on a new nullable `runs.review_comments jsonb` column and a
+  `ClaimPayload.ReviewComments` field. Best-effort: a snapshot-fetch failure never blocks run
+  creation.
+- **`main` is never touched.** All four guardrail layers stand: reply/resolve are not `main`
+  writes. The only NEW forge writes this feature adds are MR-thread **reply** and **resolve** (PAT-
+  scoped), widening the worker's forge-write surface (previously git push + MR create + label).
+  This feature touches no `.github/workflows` files, keeping it clean of the worker PAT's missing
+  `workflow` scope.
+- **Deliberate non-scope (Decision 13).** No manual "rework now" button/CLI verb (auto path is the
+  whole feature); CI failures stay ci-autofix's job (Decision 4); no `unresolveReviewThread`,
+  review approve/dismiss, or auto-merge; a per-user/day rework budget is the named fast-follow if
+  default-ON spend bites.
+
 # PRD #759 — Protect in-flight run work across a usage-limit park
 
-## 580. PRD #759 — a marked-throwaway WIP auto-commit survives the park and is restored to uncommitted at adopt time; a provenance-gated resume skips the re-gate
+## 581. PRD #759 — a marked-throwaway WIP auto-commit survives the park and is restored to uncommitted at adopt time; a provenance-gated resume skips the re-gate
 
 Closes the last gap the #628 checkpoint left open: #628 brokers only **committed** work across a
 cross-worker park, so uncommitted mid-milestone edits were `fs.rm`'d on the next claim and lost. This

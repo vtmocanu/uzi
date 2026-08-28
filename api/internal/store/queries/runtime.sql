@@ -364,14 +364,19 @@ WHERE status = 'online'
 -- (D9) all store NULL — so an omitted Go struct field would compile green and
 -- silently ship NULL for every run. The fetch is centralized in createRun.
 --
+-- 🔴 review_comments (PRD #700 M2) is named here for the SAME reason: another
+-- silently-omittable snapshot param, sqlc.narg (nullable jsonb). Issue runs never
+-- carry MR comments (this createRun path always passes NULL); M3's
+-- CreateAutoMRReworkRun populates it explicitly for an mr_rework run.
+--
 -- 🔴 required_capabilities (PRD #84 M2) is NOT a Go struct param: it is copied
 -- atomically from the run's repo via a subquery, so the createRun path needs no
 -- extra Go read and cannot ship a stale hint. The repo's hint is already Filter-ed
 -- against the vocabulary at its write path, so no re-validation is needed here.
 -- Repo-less kinds (judge/chat/self_improve) INSERT elsewhere and keep the '{}'
 -- column default. Plan inference (M4) later union-merges via a separate UPDATE.
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, required_capabilities)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'))
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'))
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -481,6 +486,16 @@ ORDER BY r.created_at DESC
 -- (PRD #98 M4). A SQL literal is not importable, so the two are coupled by comment only —
 -- raise this without raising that and the badge counts start truncating silently.
 LIMIT 200;
+
+-- name: ListPlanRevisionStateForRuns :many
+-- The plan-ish message rows ({plan, plan_revising}) for a page of runs, so the
+-- "latest by seq is plan_revising ⇒ revising" fold happens in Go (planRevisingSet),
+-- mirroring web derivePlanRevision. Backed by run_messages UNIQUE (run_id, seq).
+SELECT run_id, seq, kind
+FROM run_messages
+WHERE run_id = ANY(@run_ids::uuid[])
+  AND kind IN ('plan', 'plan_revising')
+ORDER BY run_id, seq;
 
 -- name: ListActiveRunsAll :many
 -- Admin Agents-status: every non-terminal run across all users, with repo path,

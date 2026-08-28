@@ -327,6 +327,14 @@ type fakeStore struct {
 	ciFixRunErr    error
 	ciFixRunParams *store.CreateCIFixRunParams
 
+	// MR review-watcher rework (PRD #700 M3). mrReworkRunParams stays nil until the
+	// insert runs, so the cross-kind branch guard can be asserted to block before it.
+	// activeBranchRefRuns drives CountActiveBranchRunsForRef (the cross-kind guard).
+	mrReworkRunResult   store.Run
+	mrReworkRunErr      error
+	mrReworkRunParams   *store.CreateAutoMRReworkRunParams
+	activeBranchRefRuns int64
+
 	// Scheduled prompt (PRD #241). promptRunParams stays nil until CreatePromptRun's
 	// insert runs, so a #66 guardrail test can assert the gate blocked before the insert.
 	promptRunResult store.Run
@@ -973,6 +981,13 @@ func (f *fakeStore) CreateSelfImproveRun(_ context.Context, arg store.CreateSelf
 func (f *fakeStore) CreateCIFixRun(_ context.Context, arg store.CreateCIFixRunParams) (store.Run, error) {
 	f.ciFixRunParams = &arg
 	return f.ciFixRunResult, f.ciFixRunErr
+}
+func (f *fakeStore) CreateAutoMRReworkRun(_ context.Context, arg store.CreateAutoMRReworkRunParams) (store.Run, error) {
+	f.mrReworkRunParams = &arg
+	return f.mrReworkRunResult, f.mrReworkRunErr
+}
+func (f *fakeStore) CountActiveBranchRunsForRef(context.Context, store.CountActiveBranchRunsForRefParams) (int64, error) {
+	return f.activeBranchRefRuns, nil
 }
 func (f *fakeStore) CreatePromptRun(_ context.Context, arg store.CreatePromptRunParams) (store.Run, error) {
 	f.promptRunParams = &arg
