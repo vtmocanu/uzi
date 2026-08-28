@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   bucketTabCount,
   bucketTabLabel,
+  judgeBridgeLine,
   JUDGE_BUCKETS,
   verdictTrend,
   rollupLabel,
@@ -42,6 +43,23 @@ describe("judgeBacklog — evidence copy", () => {
   it("singularises 'seen in N runs'", () => {
     expect(seenInRunsLabel(1)).toBe("seen in 1 run");
     expect(seenInRunsLabel(3)).toBe("seen in 3 runs");
+  });
+});
+
+describe("judgeBacklog — judgeBridgeLine reconciles rows against groups", () => {
+  it("carries the per-bucket adjective (none for `all`) and pluralises BOTH nouns", () => {
+    // Both singular: the adjective sits between the count and the noun, no plural on either.
+    expect(judgeBridgeLine(1, 1, "todo")).toBe("1 to-do recommendation across 1 group");
+    // Both plural.
+    expect(judgeBridgeLine(42, 18, "todo")).toBe("42 to-do recommendations across 18 groups");
+    // A done case — different adjective, mixed plurality (plural recs, singular group).
+    expect(judgeBridgeLine(3, 1, "done")).toBe("3 done recommendations across 1 group");
+    // filed and dismissed adjectives.
+    expect(judgeBridgeLine(2, 5, "filed")).toBe("2 filed recommendations across 5 groups");
+    expect(judgeBridgeLine(1, 4, "dismissed")).toBe("1 dismissed recommendation across 4 groups");
+    // `all` carries NO bucket adjective — "recommendations", not "all recommendations".
+    expect(judgeBridgeLine(9, 5, "all")).toBe("9 recommendations across 5 groups");
+    expect(judgeBridgeLine(1, 1, "all")).toBe("1 recommendation across 1 group");
   });
 });
 

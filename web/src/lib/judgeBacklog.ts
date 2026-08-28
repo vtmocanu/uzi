@@ -105,6 +105,26 @@ export function seenInRunsLabel(runCount: number): string {
   return `seen in ${runCount} ${runCount === 1 ? "run" : "runs"}`;
 }
 
+// judgeBridgeLine reconciles the two count units the Judge page shows: the per-ROW
+// recommendation count for the active bucket (bucketTabCount) against the deduped GROUP
+// total for that same bucket. Pure so the wiring is unit-tested without the DOM. The caller
+// supplies groupTotal from a CANONICAL uncapped source (the category-stats matrix sum), never
+// backlog.groups.length (which is capped/filtered). "all" carries no bucket adjective.
+const BRIDGE_ADJECTIVE: Record<JudgeBacklogBucket, string> = {
+  todo: "to-do ",
+  filed: "filed ",
+  done: "done ",
+  dismissed: "dismissed ",
+  all: "",
+};
+
+export function judgeBridgeLine(recCount: number, groupTotal: number, bucket: JudgeBacklogBucket): string {
+  const adj = BRIDGE_ADJECTIVE[bucket];
+  const recNoun = recCount === 1 ? "recommendation" : "recommendations";
+  const groupNoun = groupTotal === 1 ? "group" : "groups";
+  return `${recCount} ${adj}${recNoun} across ${groupTotal} ${groupNoun}`;
+}
+
 // VerdictTrend is the zero-state's verdict summary: a per-verdict count over the DISTINCT
 // runs the caller has judged, ALL TIME. Distinct-by-run because a run carries one
 // verdict (its review's), while a group lists it once per occurrence — tallying raw

@@ -959,6 +959,99 @@ describe("Judge — per-category chip counts (PRD #270)", () => {
   });
 });
 
+// Issue #620 — the bridge line reconciling the page's two count units: the whole-backlog
+// recommendation-ROW count for the active bucket (the tab number) against the whole-backlog
+// deduped GROUP total for that bucket (the category-stats matrix slice SUM). It sits directly
+// above the "Showing N groups" line, and is deliberately suppressed whenever the rec half (a
+// whole-backlog count) could not honestly reconcile against the group half: a category filter
+// is active, the backlog is truncated, or the group total is 0.
+describe("Judge — the row-vs-group bridge line (#620)", () => {
+  // todo slice sums to 18, done slice to 4; triage.todo is 42 and triage.done is 7, so the two
+  // halves of the bridge line come from genuinely different sources and a wrong-bucket read
+  // would be visible.
+  const counts_by_bucket = {
+    todo: { improve_uzi: 10, install_worker_tool: 8 },
+    filed: {},
+    done: { improve_uzi: 3, install_worker_tool: 1 },
+    dismissed: {},
+    all: { improve_uzi: 13, install_worker_tool: 9 },
+  };
+  const triage = { total: 60, todo: 42, filed: 5, done: 7, dismissed: 6, false_positives: 0 };
+
+  it("renders both counts for the active tab, the group half from the category-stats sum", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog({ triage }));
+    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts_by_bucket });
+    renderJudge();
+
+    // triage.todo (42) is the rec half; the todo matrix slice (10+8) is the group half.
+    expect(await screen.findByText("42 to-do recommendations across 18 groups")).toBeTruthy();
+  });
+
+  it("re-scopes to the active bucket on a tab switch (Done → done count and done sum)", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog({ triage }));
+    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts_by_bucket });
+    renderJudge();
+
+    expect(await screen.findByText("42 to-do recommendations across 18 groups")).toBeTruthy();
+
+    // /Done/ addresses the Done tab only — "Dismissed" does not contain "Done".
+    fireEvent.click(screen.getByRole("tab", { name: /Done/ }));
+
+    // triage.done (7) against the done matrix slice (3+1).
+    expect(await screen.findByText("7 done recommendations across 4 groups")).toBeTruthy();
+  });
+
+  it("is suppressed when a category filter is active (the rec half is whole-backlog)", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog({ triage }));
+    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts_by_bucket });
+    renderJudge(["/judge?category=improve_uzi"]);
+
+    // The filtered "Showing N groups matching …" line still renders; the bridge does not.
+    await waitFor(() => expect(screen.getByText(/Showing/)).toBeTruthy());
+    expect(screen.queryByText(/recommendations across/)).toBeNull();
+  });
+
+  it("is suppressed when the backlog is truncated (the truncation Alert owns the caveat)", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog({ triage, truncated: true }));
+    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts_by_bucket });
+    renderJudge();
+
+    expect(await screen.findByText(/backlog is large and was truncated/i)).toBeTruthy();
+    expect(screen.queryByText(/recommendations across/)).toBeNull();
+  });
+
+  it("is suppressed when the category-stats sum is 0 (a failed/empty aggregate)", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog({ triage }));
+    mockApi.getJudgeCategoryStats.mockResolvedValue({
+      counts_by_bucket: { todo: {}, filed: {}, done: {}, dismissed: {}, all: {} },
+    });
+    renderJudge();
+
+    // The "Showing N groups" line still renders off the returned groups, so the page settled…
+    await waitFor(() => expect(screen.getByText(/Showing/)).toBeTruthy());
+    // …but the bridge would read "across 0 groups", so it is withheld entirely.
+    expect(screen.queryByText(/recommendations across/)).toBeNull();
+  });
+});
+
+describe("Judge — the subtitle and filter-panel caption copy (#620)", () => {
+  it("drops the 'deduped by target' clause from the page subtitle", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog());
+    renderJudge();
+
+    const subtitle = await screen.findByText(/Recommendations across all your runs/);
+    expect(subtitle.textContent).toBe("Recommendations across all your runs. Triage a whole group in one action.");
+    expect(subtitle.textContent).not.toContain("deduped by target");
+  });
+
+  it("explains the count unit on the filter panel with a distinct caption", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog());
+    renderJudge();
+
+    expect(await screen.findByText("counts are groups, deduped by target")).toBeTruthy();
+  });
+});
+
 // Issue #204: the fixed bulk-action bar used `inset-x-0`, spanning full width UNDER the
 // w-60 (240px) z-30 sidebar and clipping its "N groups selected" label at desktop widths.
 // jsdom has no layout engine, so this asserts the class contract rather than a measured

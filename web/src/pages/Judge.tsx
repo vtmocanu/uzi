@@ -32,6 +32,7 @@ import {
 import {
   bucketTabCount,
   bucketTabLabel,
+  judgeBridgeLine,
   JUDGE_BUCKETS,
   verdictTrend,
   rollupLabel,
@@ -211,6 +212,11 @@ export function Judge() {
   // dismissed/all — `all` is a real key, so indexing is uniform). A bucket with no groups is
   // {} in the matrix, so its chips read 0; LabelFilter is untouched and still takes {cat: n}.
   const categoryCounts = categoryStats[bucket] ?? {};
+  // The whole-backlog GROUP total for the active bucket, summed from the canonical
+  // category-stats matrix slice (uncapped, not category-filtered) — the honest denominator to
+  // reconcile against the whole-backlog recommendation count in the bridge line below. Never
+  // backlog.groups.length, which is capped/filtered.
+  const bridgeGroupTotal = Object.values(categoryCounts).reduce((s, n) => s + n, 0);
 
   // reloadAfterMutation refreshes BOTH the backlog and the chip matrix — the file-issue path
   // needs both (filing moves a group todo→filed), and it is passed as `onFiled` in place of a
@@ -448,7 +454,7 @@ export function Judge() {
             Judge
           </h1>
         }
-        description="Recommendations across all your runs, deduped by target. Triage a whole group in one action."
+        description="Recommendations across all your runs. Triage a whole group in one action."
       />
 
       {error && <Alert message={error} />}
@@ -521,6 +527,20 @@ export function Judge() {
           tone="warning"
           message="This backlog is large and was truncated — some groups' counts may be understated and a few groups may be missing. Dispose a smaller slice or narrow by bucket to see the whole picture."
         />
+      )}
+
+      {/* The bridge line reconciling the two count units on this page: the whole-backlog
+          recommendation-ROW count for the active bucket against the whole-backlog deduped
+          GROUP total. Suppressed when a category filter is active (the rec half is a
+          whole-backlog count and can only honestly reconcile against a whole-backlog group
+          total), when the backlog is truncated (the truncation Alert already flags the picture
+          as incomplete), and when the group total is 0 (a failed/empty category-stats fetch,
+          which would otherwise read "across 0 groups"). The "Showing N groups" line below stays
+          unchanged and covers the filtered/on-screen scope. */}
+      {!loading && backlog && !showZeroState && triage && categories.length === 0 && !backlog.truncated && bridgeGroupTotal > 0 && (
+        <p className="text-sm text-muted">
+          {judgeBridgeLine(bucketTabCount(triage, bucket), bridgeGroupTotal, bucket)}
+        </p>
       )}
 
       {/* A plain view hint reading the length of the RETURNED (filtered) groups — open
@@ -669,6 +689,7 @@ function LabelFilter({
           <XIcon /> Clear
         </button>
       </div>
+      <p className="mb-2 text-xs text-faint">counts are groups, deduped by target</p>
       <div role="group" aria-label="Recommendation labels" className="flex flex-wrap gap-2">
         {JUDGE_CATEGORIES.map((cat) => {
           const on = active.has(cat);
