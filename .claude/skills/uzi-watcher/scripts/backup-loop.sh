@@ -35,8 +35,11 @@ RUNS=("$@")
 for pair in "INTERVAL:$INTERVAL" "MAX_HOURS:$MAX_HOURS"; do
   name="${pair%%:*}"; val="${pair#*:}"
   case "$val" in ''|*[!0-9]*) echo "error: UZI_BACKUP_$name must be a positive integer (got '$val')" >&2; exit 2;; esac
-  [ "$val" -ge 1 ] || { echo "error: UZI_BACKUP_$name must be >= 1 (got '$val')" >&2; exit 2; }
+  # 10# forces base-10 so a leading-zero value (e.g. 08, 09) is not read as
+  # invalid octal here or in the arithmetic below.
+  [ "$((10#$val))" -ge 1 ] || { echo "error: UZI_BACKUP_$name must be >= 1 (got '$val')" >&2; exit 2; }
 done
+INTERVAL=$((10#$INTERVAL)); MAX_HOURS=$((10#$MAX_HOURS))
 
 mkdir -p "$ROOT"
 echo "$$" > "$ROOT/backup-loop.pid"
