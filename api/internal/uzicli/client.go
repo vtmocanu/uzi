@@ -90,6 +90,10 @@ type Client interface {
 	// PATCH /api/runs/{id}/priority (PRD #320 D6/D7), RequireUser so a CLI token can reach
 	// it. A non-queued run is a 409 → ExitConflict (5); a foreign/absent run is 404 → 4.
 	SetRunPriority(ctx context.Context, id string, expedite bool) (apitypes.RunDTO, error)
+	// ResumeRunNow manually resumes ONE run held in pool_wait (PRD #754 M5): POST
+	// /api/runs/{id}/resume-now, RequireUser so a CLI token can reach it. A non-held run
+	// is a 409 → ExitConflict (5); a foreign/absent run is 404 → 4. No request body.
+	ResumeRunNow(ctx context.Context, id string) (apitypes.RunDTO, error)
 	// SelfRateLimits returns the caller's OWN per-token rate-limit meters, each
 	// carrying the server-computed auto-selection status: GET /api/me/rate-limits.
 	//
@@ -896,6 +900,17 @@ func (c *HTTPClient) SetRunPriority(ctx context.Context, id string, expedite boo
 		Run apitypes.RunDTO `json:"run"`
 	}
 	if err := c.patch(ctx, "/api/runs/"+url.PathEscape(id)+"/priority", body, &env); err != nil {
+		return apitypes.RunDTO{}, err
+	}
+	return env.Run, nil
+}
+
+func (c *HTTPClient) ResumeRunNow(ctx context.Context, id string) (apitypes.RunDTO, error) {
+	var env struct {
+		Run apitypes.RunDTO `json:"run"`
+	}
+	// No request body — resume-now is a payload-less POST verb.
+	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(id)+"/resume-now", nil, &env); err != nil {
 		return apitypes.RunDTO{}, err
 	}
 	return env.Run, nil

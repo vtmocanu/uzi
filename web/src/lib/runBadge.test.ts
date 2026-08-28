@@ -179,6 +179,31 @@ describe("runBadge taxonomy", () => {
     expect(isHealthFlaggableStatus("limit_wait")).toBe(false);
     expect(shouldShowHealthFlag("stalled", "limit_wait")).toBe(false);
   });
+
+  // Issue #754. Like limit_wait, pool_wait would otherwise fall to the `default:` arm
+  // and render as a neutral grey "pool wait" pill — wrong for a non-terminal hold.
+  it("pool_wait → warn 'waiting for pool', with a title that explains the wait", () => {
+    const b = runBadge(run({ status: "pool_wait" }), NOW);
+    expect(b).toMatchObject({
+      kind: "badge",
+      label: "waiting for pool",
+      tone: "warning",
+      pulse: false,
+    });
+    // NOT a usage-limit park: the title must speak of a pooled token, not a reset window.
+    if (b.kind === "badge") {
+      expect(b.title).toMatch(/pooled/i);
+      expect(b.title).not.toMatch(/window reopens/i);
+    }
+  });
+
+  it("🔴 pool_wait's badge is STATIC — no countdown, no elapsed, on any input", () => {
+    // A pool hold has no reset window at all, so there is nothing to count down from.
+    const early = runBadge(run({ status: "pool_wait", created_at: "2026-07-04T11:00:00Z" }), NOW);
+    const late = runBadge(run({ status: "pool_wait", created_at: "2026-07-04T11:59:00Z" }), NOW);
+    expect(early).toEqual(late);
+    if (early.kind === "badge") expect(early.label).toBe("waiting for pool");
+  });
 });
 
 // issue #321 M3. The pre-approval PLANNING phase is wired onto every status surface via
@@ -370,6 +395,14 @@ describe("RUN_STATUS_TONES ↔ runStatusTone agreement", () => {
     // only one of the two.
     expect(RUN_STATUS_TONES["limit_wait"]).toEqual({ tone: "warning" });
     expect(runStatusTone("limit_wait", null)).toBe("warning");
+  });
+
+  it("covers pool_wait specifically, on both surfaces (issue #754)", () => {
+    // Same reasoning as limit_wait above: the loop iterates the pill map, so an absent
+    // key is an absent assertion — this pins pool_wait to warning on BOTH the pill map
+    // and the list-row tone so the two cannot drift.
+    expect(RUN_STATUS_TONES["pool_wait"]).toEqual({ tone: "warning" });
+    expect(runStatusTone("pool_wait", null)).toBe("warning");
   });
 
   it("leaves the unknown-status fallback alone", () => {

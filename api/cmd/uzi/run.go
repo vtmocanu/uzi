@@ -53,6 +53,16 @@ const (
 // terminal would make `--follow` exit on a run that is about to produce more messages.
 const statusLimitWait = "limit_wait"
 
+// statusPoolWait is the status an `auto` run carries while HELD because its token pool
+// is genuinely empty (PRD #754 M4). Named for the same reason as statusLimitWait: the
+// follow loop, the steer-queue delivery label and `uzi run get`'s detail block compare
+// against one literal.
+//
+// NON-TERMINAL, and non-locking (it does not lock the issue). A held run resumes when a
+// token is pooled (reactively, or manually) in M5. Like limit_wait, treating it as
+// terminal would make `--follow` exit on a run that is about to produce more messages.
+const statusPoolWait = "pool_wait"
+
 // effectiveRunStatus is the status a run should RENDER as: "revising" while a "revise"
 // replan is in flight (issue #750), "planning" while it is in its pre-approval planning
 // phase (issue #321), else its raw status. is_planning and is_revising are server-computed
@@ -94,9 +104,9 @@ var terminalRunStatuses = map[string]bool{
 	"cancelled": true,
 }
 
-// allRunStatusesOrder is the run status enum in wire/enum order (matching migration
-// 00146's runs_status_check — the current last rewrite, ten values), the ONE source of
-// truth both allRunStatuses (membership)
+// allRunStatusesOrder is the run status enum in wire/enum order (matching
+// runs_status_check — last rewritten by migration 00165, eleven values), the ONE source
+// of truth both allRunStatuses (membership)
 // and the `--until` validation-error's "valid: …" list derive from — so a status added
 // here can never be silently omitted from the human-readable enumeration.
 var allRunStatusesOrder = []string{
@@ -107,13 +117,14 @@ var allRunStatusesOrder = []string{
 	"awaiting_input",
 	"awaiting_followup",
 	statusLimitWait,
+	statusPoolWait,
 	"completed",
 	"failed",
 	"cancelled",
 }
 
 // allRunStatuses is the run status enum the skill documents and migration
-// 00146 constrains (runs_status_check). It is the source of truth `run wait`
+// 00165 constrains (runs_status_check). It is the source of truth `run wait`
 // validates `--until` against, so a typo'd target is a clean usage error rather than
 // a silent forever-wait. A status the SERVER reports that is NOT in this set is a
 // newer server than this binary (surfaced, treated non-terminal — never a target,
@@ -131,10 +142,11 @@ var allRunStatuses = func() map[string]bool {
 // set — every state that needs the caller or ends the run. It INCLUDES awaiting_followup
 // (PRD #517 D9): an interactive task parked awaiting the user's next follow-up needs the
 // caller and does NOT auto-resume, so a bare `uzi run wait <id>` must stop on it. It
-// deliberately OMITS queued/claimed/running (still working) and limit_wait (auto-resumes;
-// parking on it is legitimate), so a bare `uzi run wait <id>` returns at the plan gate, a
-// clarification park, a follow-up park, or a terminal — the common "wait for the gate OR
-// the end" case.
+// deliberately OMITS queued/claimed/running (still working), limit_wait (auto-resumes;
+// parking on it is legitimate) AND pool_wait (PRD #754: a held run resumes on its own
+// once a token is pooled, so it is legitimate to wait through, exactly like limit_wait),
+// so a bare `uzi run wait <id>` returns at the plan gate, a clarification park, a
+// follow-up park, or a terminal — the common "wait for the gate OR the end" case.
 var defaultWaitStates = []string{"awaiting_approval", "awaiting_input", "awaiting_followup", "completed", "failed", "cancelled"}
 
 // run wait poll cadence and transient-blip resilience knobs (PRD #264 D1/D9). Vars,
@@ -158,8 +170,8 @@ var (
 //   - running   → time since StartedAt (when the agent began), or CreatedAt if unstamped.
 //   - claimed   → time since ClaimedAt (when a worker took it), or CreatedAt if unstamped.
 //   - queued    → time since CreatedAt (how long it has waited to be claimed).
-//   - awaiting_approval / awaiting_input / awaiting_followup / limit_wait → time since
-//     UpdatedAt, i.e. how long it has been parked in that waiting state.
+//   - awaiting_approval / awaiting_input / awaiting_followup / limit_wait / pool_wait →
+//     time since UpdatedAt, i.e. how long it has been parked/held in that waiting state.
 //   - completed / failed / cancelled → the STATIC span FinishedAt−StartedAt, how long it
 //     actually ran, independent of now. A terminal run with no StartedAt (cancelled or
 //     failed before it ever started) never ran, so it renders "-".
@@ -186,7 +198,7 @@ func runAgeCell(r apitypes.RunDTO, now time.Time) string {
 		}
 	case "queued":
 		anchor = &r.CreatedAt
-	case "awaiting_approval", "awaiting_input", "awaiting_followup", statusLimitWait:
+	case "awaiting_approval", "awaiting_input", "awaiting_followup", statusLimitWait, statusPoolWait:
 		anchor = &r.UpdatedAt
 	case "completed", "failed", "cancelled":
 		// A static ran-span, not a live age: only meaningful when the run both started
@@ -331,18 +343,32 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 				// NDJSON there for an agent to parse line by line (renderMessage). A
 				// human-readable notice on that stream would corrupt the contract. This
 				// is the same split cobra's deprecation notice already uses here.
-				if run.Status == statusLimitWait {
+				if run.Status == statusLimitWait || run.Status == statusPoolWait {
 					if !parked {
 						parked = true
-						_, _ = fmt.Fprintf(env.Stderr, "run %s %s — still following; it resumes on its own\n",
-							args[0], limitWaitLine(run, time.Now()))
+						// pool_wait is the sibling silence limit_wait is (both are long,
+						// output-less holds that look like a hang from the outside), so it
+						// earns the same one-shot notice — but a DIFFERENT one, because it
+						// resumes on a different trigger: a pooled token, not a clock. A
+						// direct limit_wait⇄pool_wait transition would be missed by the bare
+						// `parked` bool, but it cannot happen — a held run is promoted to
+						// `queued` (a non-held status that clears `parked` via the else-if
+						// below) before it could hold again, so re-arming here is exact.
+						if run.Status == statusPoolWait {
+							_, _ = fmt.Fprintf(env.Stderr,
+								"run %s held — its token pool is empty; still following, it resumes when a token is pooled\n",
+								args[0])
+						} else {
+							_, _ = fmt.Fprintf(env.Stderr, "run %s %s — still following; it resumes on its own\n",
+								args[0], limitWaitLine(run, time.Now()))
+						}
 					}
 				} else if parked {
 					parked = false
 					// cellText, NOT sanitizeTTY, and the difference is the whole point:
 					// sanitizeTTY spares "\n", so a status carrying one would inject a
 					// line onto stderr. Unreachable today because runs_status_check
-					// constrains status to ten values (migration 00146) — which is precisely the argument
+					// constrains status to eleven values (migration 00165) — which is precisely the argument
 					// limitWaitLine's own comment REJECTS for rate_limit_type ("server-
 					// controlled today" is exactly the assumption that rots). Holding one
 					// line of this file to a weaker standard than the line beside it, on a
@@ -366,7 +392,8 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 		Long: "Poll a run until its status enters the `--until` set, then exit 0 (PRD #264).\n\n" +
 			"With no `--until`, it stops on any state that needs you or ends the run: " +
 			strings.Join(defaultWaitStates, ", ") + ". It does NOT stop " +
-			"on queued/claimed/running (still working) or limit_wait (auto-resumes), so a bare " +
+			"on queued/claimed/running (still working), limit_wait (auto-resumes), or pool_wait " +
+			"(an auto run held on an empty token pool; resumes when a token is pooled), so a bare " +
 			"`uzi run wait <id>` waits for the plan gate OR the end.\n\n" +
 			"Transitions print to stderr; `--json` prints the final run object (same shape as " +
 			"`run get --json`) to stdout. Exit codes: 0 a target state was reached (including if " +
@@ -785,7 +812,33 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 	expedite.Flags().Bool("clear", false, "clear the manual expedite (undo), returning the run to its kind default priority")
 
-	cmd.AddCommand(list, get, logs, wait, review, create, approve, reject, revise, cancel, stop, scope, followUp, answer, inputs, expedite)
+	resumeNow := &cobra.Command{
+		Use:   "resume-now <run-id>",
+		Short: "Resume a run held waiting for a pooled Anthropic token, without waiting for the sweeper",
+		Long: "Resume ONE run held in `pool_wait` — an `auto` run parked because its owner's Anthropic " +
+			"token pool was empty when it claimed (PRD #754). It flips the hold straight to `queued` " +
+			"instead of waiting up to a sweeper tick for the reactive pass to notice a token was pooled.\n\n" +
+			"A run that is NOT held is a 409 (exit 5); a foreign or unknown run is a 404 (exit 4). No " +
+			"token is spent and nothing is written to the forge — it only releases the hold.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			run, err := c.ResumeRunNow(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(run)
+			}
+			return renderRunDetail(p, run)
+		},
+	}
+
+	cmd.AddCommand(list, get, logs, wait, review, create, approve, reject, revise, cancel, stop, scope, followUp, answer, inputs, expedite, resumeNow)
 	return cmd
 }
 
@@ -1654,11 +1707,14 @@ func deltaGlyph(kind string) string {
 // compatibility path also creates a row labelled literally `default`, so the label is
 // not even a reliable hint at the mode.
 //
-// The three FALLBACK reasons are rendered as `default (auto: …)` rather than as their
-// own thing, because that is what actually happened: the worker is configured for
-// auto, the selector declined to pick, and the owner's default paid. A user reading
-// `default` alone on an auto worker would reasonably think their configuration had
-// been lost.
+// Since #754 the two live non-pick reasons name a POOLED token, not the default:
+// `pool_stale` renders `auto (pooled token, no fresh readings)` and `open_failed`
+// `auto (fell to another pooled token; …)` — the auto lane floors onto a pooled token
+// and never spends the out-of-pool default. Only the LEGACY `pool_empty` still renders
+// `default (auto: …)`, and only on pre-#754 rows where the default genuinely was spent
+// (an empty pool now HOLDS in pool_wait instead). The mode is spelled out rather than
+// left as a bare label because an auto pick and a legacy default can name the same
+// token, so the label alone cannot say which account paid or why.
 //
 // An UNRECOGNISED reason prints as itself. The CLI is versioned separately from the
 // API, so a newer server can ship a ninth reason this binary has never heard of, and
@@ -1719,11 +1775,23 @@ func selectReasonText(reason autoselect.Reason, headroom *int) string {
 		// the user's pool is nearly exhausted — a thing to know, not an error.
 		return "auto (best of pool)" + pct
 	case autoselect.ReasonPoolEmpty:
-		return "default (auto: no tokens in the pool)"
+		// LEGACY VALUE — no longer produced on new runs (#754). An auto worker with
+		// a genuinely empty pool now HOLDS the run in pool_wait and spends nothing,
+		// rather than falling back to the out-of-pool default. This string is kept
+		// only for PRE-#754 historical rows, where the default genuinely WAS spent;
+		// it is deliberately worded to stay true for those without implying that an
+		// empty pool spends the default today.
+		return "default (auto: pool was empty — legacy)"
 	case autoselect.ReasonPoolStale:
-		return "default (auto: no fresh usage readings)"
+		// The run FLOORED onto a POOLED token that had no fresh usage reading to rank
+		// on — it spent one of the user's OWN pooled tokens as a last resort, not the
+		// out-of-pool default (#754). A floored stale token carries no headroom, so no
+		// pct is appended here.
+		return "auto (pooled token, no fresh readings)"
 	case autoselect.ReasonOpenFailed:
-		return "default (auto: the chosen token would not open)"
+		// The selector's picked token would not decrypt, so the run FLOORED onto
+		// ANOTHER POOLED token — again not the default (#754).
+		return "auto (fell to another pooled token; the chosen one would not open)"
 	}
 	return string(reason)
 }
@@ -2019,16 +2087,22 @@ func steerState(kind string, consumedAt *time.Time, disposition *string, runStat
 			return *disposition
 		}
 	}
-	// A parked run is deliberately NOT terminal here, matching terminalRunStatuses:
+	// A parked/held run is deliberately NOT terminal here, matching terminalRunStatuses:
 	// its queue survives the park and drains when the run resumes, so "not delivered
 	// (run finished)" would be false.
 	const parkedSuffix = " (run paused on a usage limit)"
+	// PRD #754: a pool_wait run is HELD on an empty token pool, not a usage limit, so its
+	// suffix names the actual reason (distinct copy for a distinct hold).
+	const heldSuffix = " (run held on an empty token pool)"
 	if consumedAt == nil {
 		if terminalRunStatuses[runStatus] {
 			return "not delivered (run finished)"
 		}
 		if runStatus == statusLimitWait {
 			return "queued" + parkedSuffix
+		}
+		if runStatus == statusPoolWait {
+			return "queued" + heldSuffix
 		}
 		return "queued"
 	}
@@ -2050,6 +2124,9 @@ func steerState(kind string, consumedAt *time.Time, disposition *string, runStat
 	}
 	if runStatus == statusLimitWait {
 		return "delivered" + parkedSuffix
+	}
+	if runStatus == statusPoolWait {
+		return "delivered" + heldSuffix
 	}
 	return "delivered"
 }

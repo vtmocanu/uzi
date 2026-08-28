@@ -58,7 +58,7 @@ func TestCommandTree(t *testing.T) {
 	}
 
 	subWant := map[string][]string{
-		"run": {"list", "get", "logs", "wait", "review", "create", "approve", "reject", "revise", "cancel", "stop", "scope", "follow-up", "answer", "inputs", "expedite"},
+		"run": {"list", "get", "logs", "wait", "review", "create", "approve", "reject", "revise", "cancel", "stop", "scope", "follow-up", "answer", "inputs", "expedite", "resume-now"},
 		// backlog is the PRD #98 M7 read; `file` (PRD #365 M2) files a recommendation
 		// as a forge issue from the CLI, mirroring `findings file`.
 		"review": {"show", "backlog", "resolve", "dismiss", "undo", "stats", "file"},
@@ -1625,5 +1625,45 @@ func TestRunExpediteJSON(t *testing.T) {
 	}
 	if !strings.Contains(out, `"priority": "expedited"`) {
 		t.Errorf("--json output = %q, want priority expedited", out)
+	}
+}
+
+// PRD #754 M5: `uzi run resume-now <id>` releases a pool_wait hold and renders the
+// returned run (now queued).
+func TestRunResumeNow(t *testing.T) {
+	fc := &uzicli.FakeClient{ResumedRun: apitypes.RunDTO{ID: "r1", Status: "queued", Kind: "issue"}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "resume-now", "r1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc.LastResumeRunID != "r1" {
+		t.Errorf("targeted run %q, want r1", fc.LastResumeRunID)
+	}
+	if !strings.Contains(out, "r1") {
+		t.Errorf("output missing run id:\n%s", out)
+	}
+}
+
+// A run that is not held is a 409 → ExitConflict (5); the CLI must propagate it.
+func TestRunResumeNowConflict(t *testing.T) {
+	fc := &uzicli.FakeClient{ResumeRunNowErr: uzicli.Exitf(uzicli.ExitConflict, "run is not waiting for a pooled token")}
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "resume-now", "r1")
+	if code != uzicli.ExitConflict {
+		t.Fatalf("exit = %d, want %d (conflict)", code, uzicli.ExitConflict)
+	}
+	if fc.LastResumeRunID != "r1" {
+		t.Errorf("targeted run %q, want r1", fc.LastResumeRunID)
+	}
+}
+
+// --json emits the RunDTO for agents.
+func TestRunResumeNowJSON(t *testing.T) {
+	fc := &uzicli.FakeClient{ResumedRun: apitypes.RunDTO{ID: "r1", Status: "queued", Kind: "issue"}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "resume-now", "r1", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, `"status": "queued"`) {
+		t.Errorf("--json output = %q, want status queued", out)
 	}
 }

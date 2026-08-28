@@ -379,7 +379,42 @@ describe("Dashboard — parked runs are not 'agents at work' (PRD #35)", () => {
     renderDashboard();
     await flush();
     expect(screen.queryByText("agents at work")).toBeNull();
-    expect(screen.getByText("2 at work · 1 waiting on a usage limit")).toBeTruthy();
+    expect(screen.getByText("2 at work · 1 waiting to resume")).toBeTruthy();
+  });
+
+  // Issue #754: pool_wait is the same kind of self-resuming hold as limit_wait, so it
+  // must NOT be counted as "at work" either. A pool hold is blocked on a pooled token,
+  // not on a usage limit, which is why the generalized copy reads "waiting to resume"
+  // rather than the limit-specific wording.
+  it("🔴 counts a pool_wait run as waiting-to-resume, not as work", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({ status: "running" }),
+        aRun({ id: "r2", status: "queued" }),
+        aRun({ id: "r3", status: "pool_wait" }),
+      ],
+    });
+    renderDashboard();
+    await flush();
+    expect(screen.queryByText("agents at work")).toBeNull();
+    expect(screen.getByText("2 at work · 1 waiting to resume")).toBeTruthy();
+    // The pool hold is a resource wait, never a usage-limit wait — the old copy would
+    // have been a lie about WHY it is parked.
+    expect(screen.queryByText(/waiting on a usage limit/)).toBeNull();
+  });
+
+  it("🔴 counts both hold kinds together in the waiting bucket", async () => {
+    // Both self-resuming holds share one honest bucket; the working count drops by both.
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({ status: "running" }),
+        aRun({ id: "r2", status: "limit_wait" }),
+        aRun({ id: "r3", status: "pool_wait" }),
+      ],
+    });
+    renderDashboard();
+    await flush();
+    expect(screen.getByText("1 at work · 2 waiting to resume")).toBeTruthy();
   });
 
   it("🔴 still COUNTS the parked run — splitting the hint must not hide it", async () => {
@@ -392,7 +427,7 @@ describe("Dashboard — parked runs are not 'agents at work' (PRD #35)", () => {
     const { container } = renderDashboard();
     await flush();
     expect(screen.getByText("Active runs")).toBeTruthy();
-    expect(container.textContent).toContain("1 at work · 1 waiting on a usage limit");
+    expect(container.textContent).toContain("1 at work · 1 waiting to resume");
     // The tile's value is 2, not 1.
     const tile = screen.getByText("Active runs").closest("a") ?? screen.getByText("Active runs").parentElement;
     expect(tile?.textContent).toMatch(/2/);

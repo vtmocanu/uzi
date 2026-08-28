@@ -960,3 +960,57 @@ func TestCLIFilingRoutesStillEnforceCSRFLiveDB(t *testing.T) {
 		}
 	}
 }
+
+// TestCLIResumeNowAuthMountLiveDB proves the PRD #754 M5 resume-now route is mounted in
+// the RequireUser group (a uzc_ Bearer reaches it, not 401) and is owner-scoped: the
+// owner's uzc_ promotes their held run (200 → queued), while a DIFFERENT user's uzc_ gets
+// a 404 on the same run (the owner-scoped PromotePoolWaitRun yields 0 rows, then the
+// owner-scoped re-read 404s — never a 403 that would leak the run's existence).
+func TestCLIResumeNowAuthMountLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	owner := cliSeedUser(t, pool, false)
+	other := cliSeedUser(t, pool, false)
+	ownerUzc := cliMintToken(t, pool, owner, clitoken.ScopeUser)
+	otherUzc := cliMintToken(t, pool, other, clitoken.ScopeUser)
+
+	// A run held in pool_wait, owned by `owner`.
+	repoID := cliSeedOwnedRepo(t, pool, owner)
+	runID := uuid.New()
+	cliMustExec(t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind)
+		 VALUES ($1, $2, $3, 7541, 'held', 'desc', 'pool_wait', 'issue')`, runID, owner, repoID)
+
+	path := "/api/runs/" + runID.String() + "/resume-now"
+
+	// A cross-user uzc_ is owner-scoped out: the promote matches 0 rows and the re-read
+	// 404s. It must NOT resume the run.
+	if rec := bearerReq(router, http.MethodPost, path, otherUzc); rec.Code != http.StatusNotFound {
+		t.Fatalf("cross-user uzc_ POST %s = %d, want 404 (resume-now is owner-scoped)\nbody: %s", path, rec.Code, rec.Body.String())
+	}
+	var stillHeld string
+	if err := pool.QueryRow(context.Background(), `SELECT status FROM runs WHERE id = $1`, runID).Scan(&stillHeld); err != nil {
+		t.Fatalf("read run: %v", err)
+	}
+	if stillHeld != "pool_wait" {
+		t.Fatalf("a foreign uzc_ changed the run status to %q; it must remain held", stillHeld)
+	}
+
+	// The owner's uzc_ reaches the handler (not 401) and promotes the held run to queued.
+	rec := bearerReq(router, http.MethodPost, path, ownerUzc)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("owner uzc_ POST %s = %d, want 200 — RequireUser must let a CLI Bearer reach resume-now, and the held run must promote\nbody: %s", path, rec.Code, rec.Body.String())
+	}
+	var resumed string
+	if err := pool.QueryRow(context.Background(), `SELECT status FROM runs WHERE id = $1`, runID).Scan(&resumed); err != nil {
+		t.Fatalf("read run: %v", err)
+	}
+	if resumed != "queued" {
+		t.Fatalf("status = %q after resume-now, want queued", resumed)
+	}
+
+	// A second resume of the now-queued (non-held) run is a 409, not a 404: the run is
+	// the owner's and exists, it is simply no longer waiting for a pooled token.
+	if rec := bearerReq(router, http.MethodPost, path, ownerUzc); rec.Code != http.StatusConflict {
+		t.Fatalf("owner uzc_ POST %s on a non-held run = %d, want 409 (not waiting for a pooled token)\nbody: %s", path, rec.Code, rec.Body.String())
+	}
+}

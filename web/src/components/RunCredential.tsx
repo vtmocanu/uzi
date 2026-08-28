@@ -97,10 +97,11 @@ export function RunCredential({
     ) : (
       <Badge
         tone={tone === "warning" ? "warning" : tone === "info" ? "info" : "neutral"}
-        // web-ux F20: this badge carries sentence-length reasons —
+        // web-ux F20: this badge carries sentence-length reasons — the pre-#754
         // `default (auto: the chosen token would not open)` measured 389px against a
-        // 375px viewport and overflowed the document. The em dash is not the cause; a
-        // pill that cannot wrap is.
+        // 375px viewport and overflowed the document (#754 reworded that reason to
+        // `auto (fell to another pooled token)`, but the wrap invariant is unchanged).
+        // The em dash is not the cause; a pill that cannot wrap is.
         wrap
         // web-ux F21: the explanation is DESCRIBED, never the accessible NAME. An
         // aria-label here would replace the visible text, so a voice-control user saying

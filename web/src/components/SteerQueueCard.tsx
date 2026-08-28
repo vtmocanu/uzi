@@ -194,8 +194,18 @@ export function SteerQueueCard({
               It is deliberately NOT `parked`: unlike limit_wait (which self-resumes hours
               later, so its placeholder says "queued until the run resumes"), a follow-up
               here IS the next turn, so the default "resumes the agent" placeholder is the
-              honest one. Only limit_wait sets parked. */}
-          <FollowUpComposer busy={busy} onSend={onSend} parked={status === "limit_wait"} />
+              honest one.
+
+              Issue #754: pool_wait sets parked too. It is the same kind of self-resuming
+              hold as limit_wait — blocked on a pooled token, resuming on its own — so a
+              follow-up sent here will NOT un-park it; it is queued until the run resumes.
+              The "queued until the run resumes" placeholder is resource-agnostic and
+              stays honest for a pool hold. */}
+          <FollowUpComposer
+            busy={busy}
+            onSend={onSend}
+            parked={status === "limit_wait" || status === "pool_wait"}
+          />
           <Button variant="danger" disabled={busy} onClick={onStop}>
             Stop run
           </Button>

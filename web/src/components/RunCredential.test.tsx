@@ -151,14 +151,18 @@ describe("RunCredential mode rendering (PRD #111 M5, D20)", () => {
     expect(chipText(container)).toMatch(want);
   });
 
-  // The three fallbacks must not read as an ordinary default. The worker is set to
-  // auto and the run did not get it, which is a different situation with a different
-  // fix from a worker that was never auto in the first place.
+  // The three non-pick reasons must not read as an ordinary default. The worker is set
+  // to auto and the run did not get a normal pick, which is a different situation with a
+  // different fix from a worker that was never auto. After #754 pool_stale/open_failed
+  // FLOOR onto one of the user's own pooled tokens ("auto (…)"), while pool_empty is a
+  // LEGACY value carried only by pre-#754 rows ("default (auto: … legacy)"); each still
+  // names AUTO rather than reading as a plain default.
   it.each(["pool_empty", "pool_stale", "open_failed"])(
     "%s says the worker is on auto and why it did not get a pick",
     (reason) => {
       const { container } = render(<RunCredential run={cred({ reason })} />);
-      expect(chipText(container)).toMatch(/default \(auto:/);
+      expect(chipText(container)).toMatch(/\bauto\b/);
+      expect(chipText(container)).not.toMatch(/— default$/);
     },
   );
 
@@ -330,9 +334,11 @@ describe("RunCredential chip structure (web-ux F19/F20/F21)", () => {
     expect(chipText(container)).toMatch(/token “default” — default/);
   });
 
-  // F20. Measured at 375px: `token nearly-spent — default (auto: the chosen token
-  // would not open)` is 389px wide and overflows the document. The em dash is not the
-  // cause; a pill carrying a sentence-length reason and refusing to wrap is.
+  // F20. A pill carrying a sentence-length reason and refusing to wrap overflows the
+  // viewport — measured at 375px, the pre-#754 `token nearly-spent — default (auto: the
+  // chosen token would not open)` chip was 389px wide. #754 reworded open_failed to
+  // "auto (fell to another pooled token)", but the invariant is unchanged: the em dash
+  // is not the cause; a non-wrapping pill is, so the chip must be allowed to wrap.
   it("lets the chip wrap rather than overflowing the viewport", () => {
     const { container } = render(<RunCredential run={cred({ reason: "open_failed" })} />);
     const badge = container.querySelector("span");

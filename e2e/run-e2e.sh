@@ -5355,11 +5355,18 @@ AS_GOT="$(as_run_credential "$AS_RUN")"
 pass "an auto worker spent the emptiest pooled token (spare-key, auto, 95% headroom)"
 apipost "/api/runs/$AS_RUN/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
 
-# ── (b) R2: every reading aged out ⇒ fall back to the owner default, and RECORD WHY ─
-# D7 is that auto never fails a run. The assertion that matters is not merely that the
-# run survived — it is that the reason names WHICH fallback fired, because pool_stale
-# ("your poller is not reading them") and pool_empty ("you opted nothing in") send a
-# user to entirely different places.
+# ── (b) #754: a stale pool FLOORS onto the best pooled token, NEVER the out-of-pool default ─
+# Pre-#754 an auto run whose every reading had aged out fell back to the owner DEFAULT and
+# recorded pool_stale. #754 reshapes that ladder: the run floors onto the best POOLED token
+# (with NO headroom, since nothing measured it) and still records pool_stale — it never bills
+# the non-pooled default. To make that invariant a DETERMINISTIC test rather than an accident
+# of which token happens to rank first, opt the DEFAULT out of the pool (leaving only the
+# spare pooled), THEN age every reading stale. The sole pooled token is now the stale spare,
+# so the floor MUST land on it — a fallback that reached for the out-of-pool default would
+# surface as 'default' here and fail. (The default was pooled by (a); this opt-out runs after
+# (a) so its happy-path fixture is untouched.)
+apipatch "/api/me/secrets/anthropic_token/$AS_DEFAULT_SECRET/auto-eligible" '{"auto_eligible":false}' >/dev/null \
+  || fail "could not opt the default token out of the pool for the stale-floor case"
 db_psql "UPDATE anthropic_rate_limits SET synced_at = now() - interval '30 days'
          WHERE user_id = '$AS_ADMIN_ID'" >/dev/null
 AS_IID2="$(apipost "/api/repos/$REPO_ID/issues" \
@@ -5367,24 +5374,50 @@ AS_IID2="$(apipost "/api/repos/$REPO_ID/issues" \
 AS_RUN2="$(create_run "$REPO_ID" "$AS_IID2")" || fail "stale-pool run-create failed (non-transient; see stderr)"
 wait_status "$AS_RUN2" awaiting_approval
 AS_GOT2="$(as_run_credential "$AS_RUN2")"
-[ "$AS_GOT2" = "default|pool_stale|null" ] || fail \
-  "stale-pool run recorded '$AS_GOT2', want 'default|pool_stale|null'. Auto must fall back to the owner default (D7) and name the fallback (D20), with NO headroom — nothing measured the credential it actually spent"
-pass "an entirely stale pool falls back to the owner default and records pool_stale"
+[ "$AS_GOT2" = "spare-key|pool_stale|null" ] || fail \
+  "stale-pool run recorded '$AS_GOT2', want 'spare-key|pool_stale|null'. #754: a stale pool floors onto the pooled token (spare-key), reason pool_stale, with NO headroom — it must NEVER reach for the out-of-pool default"
+pass "an entirely stale pool floors onto the pooled token, never the out-of-pool default (spare-key, pool_stale, no headroom)"
 apipost "/api/runs/$AS_RUN2/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
 
-# ── (c) pool_empty is a DIFFERENT answer, not the same fallback wearing one name ────
+# ── (c) #754: a GENUINELY empty pool HOLDS in pool_wait and spends nothing, then RESUMES ──
+# Pre-#754 an empty pool fell through to the owner default at awaiting_approval and recorded
+# pool_empty. #754 refuses to bill the non-pooled default at all: the run parks in the new
+# non-locking pool_wait status, recording NO credential, until a token re-enters the pool
+# (a reactive sweeper pass, ~15s) or the owner calls resume-now. Opt BOTH tokens out (the
+# default is already out from (b); this also takes the spare) so the pool is genuinely empty.
 for sid in "$AS_DEFAULT_SECRET" "$AS_SPARE_SECRET"; do
   apipatch "/api/me/secrets/anthropic_token/$sid/auto-eligible" '{"auto_eligible":false}' >/dev/null \
-    || fail "could not opt token $sid back out of the pool"
+    || fail "could not opt token $sid out of the pool for the empty-pool hold"
 done
 AS_IID3="$(apipost "/api/repos/$REPO_ID/issues" \
   '{"title":"E2E autoselect empty","description":"implements prds/111-auto-select-anthropic-token.md"}' | jq -r '.card.iid')"
 AS_RUN3="$(create_run "$REPO_ID" "$AS_IID3")" || fail "empty-pool run-create failed (non-transient; see stderr)"
-wait_status "$AS_RUN3" awaiting_approval
+# It must HOLD in pool_wait, NOT fall through to awaiting_approval — the old empty-pool
+# fallback would hang here forever, because nothing ever reaches the gate.
+wait_status "$AS_RUN3" pool_wait
 AS_GOT3="$(as_run_credential "$AS_RUN3")"
-[ "$AS_GOT3" = "default|pool_empty|null" ] || fail \
-  "empty-pool run recorded '$AS_GOT3', want 'default|pool_empty|null'. pool_empty and pool_stale are different problems with different fixes and must not collapse onto one reason"
-pass "an empty pool falls back to the owner default and records pool_empty (distinct from pool_stale)"
+[ "$AS_GOT3" = "null|null|null" ] || fail \
+  "empty-pool hold recorded '$AS_GOT3', want 'null|null|null'. #754: an empty pool spends nothing and records NO credential (label/reason/headroom all null) while it waits — it must never bill the non-pooled default"
+pass "an empty pool holds the run in pool_wait and spends nothing (never the default)"
+
+# Now RESUME it: opt the spare back INTO the pool and expedite the hold with resume-now (the
+# DETERMINISTIC path — no wait on the ~15s reactive sweeper tick). resume-now flips pool_wait
+# → queued; the worker then claims the run and resolves the now-pooled spare. Its reading is
+# still aged (from (b)), so the auto lane floors onto it and records pool_stale; a fresh
+# reading would instead record auto. Either way the credential is the POOLED spare-key, and
+# NEVER the out-of-pool default.
+apipatch "/api/me/secrets/anthropic_token/$AS_SPARE_SECRET/auto-eligible" '{"auto_eligible":true}' >/dev/null \
+  || fail "could not opt the spare token back into the pool to resume the held run"
+apipost "/api/runs/$AS_RUN3/resume-now" '' >/dev/null \
+  || fail "resume-now did not accept the held pool_wait run"
+wait_status "$AS_RUN3" awaiting_approval
+AS_GOT3B="$(as_run_credential "$AS_RUN3")"
+case "$AS_GOT3B" in
+  "spare-key|auto|"*|"spare-key|pool_stale|null")
+    pass "a held pool_wait run resumes onto a pooled token once one is opted in, never the default ($AS_GOT3B)" ;;
+  *)
+    fail "resumed pool_wait run recorded '$AS_GOT3B', want the pooled 'spare-key' with reason auto or pool_stale — it must spend the re-pooled spare, NEVER the out-of-pool default" ;;
+esac
 apipost "/api/runs/$AS_RUN3/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
 
 # ── leave the stack exactly as this phase found it ──────────────────────────────
@@ -5410,11 +5443,14 @@ curl -fsS -b "$JAR" -X DELETE "$BASE/api/me/secrets/anthropic_token/$AS_SPARE_SE
 apiget /api/me/secrets \
   | jq -e '[.secrets[] | select(.kind == "anthropic_token")] | length == 1' >/dev/null \
   || fail "the auto-selection phase leaked a token into the rest of the suite"
-# The POOL FLAGS are restored by step (c) above — where pool_empty comes from — and
-# until this line that was an ACCIDENT rather than a restore: reorder or drop step (c)
-# and they leak, with nothing to catch it, at the same attribution distance that made
-# the token leak expensive. Symmetric with the count check above, and it is the check
-# that would notice.
+# The POOL FLAGS end correct without an explicit restore here, but only because of how (b)
+# and (c) leave them: (b) opted the DEFAULT out and it stays out, and (c) re-pooled the SPARE
+# to prove the resume — which the token delete just above removes entirely. So the one
+# surviving token (the default) is opted OUT, matching the empty pool this phase inherited.
+# This is CHECKED, not assumed: drop the default opt-out in (b), or the spare delete above,
+# and a pooled token leaks into every later phase with nothing to catch it, at the same
+# attribution distance that made the token leak expensive. Symmetric with the count check
+# above, and it is the check that would notice.
 apiget /api/me/secrets \
   | jq -e '[.secrets[] | select(.kind == "anthropic_token" and .auto_eligible)] | length == 0' >/dev/null \
   || fail "the auto-selection phase left a token in the pool; a later phase would inherit it"

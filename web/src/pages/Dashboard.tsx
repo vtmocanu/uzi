@@ -179,15 +179,22 @@ export function Dashboard() {
   // opposite failure. `!isTerminalRun` as a proxy for "actively working" is the actual
   // defect, and it is only visible now because limit_wait is the first non-terminal
   // status that lasts hours by design.
+  //
+  // Issue #754: pool_wait is the same KIND of hold — non-terminal, self-resuming,
+  // blocked on a resource (a pooled token) rather than actively working — so it joins
+  // the waiting bucket too. The copy is deliberately "waiting to resume" rather than the
+  // old "waiting on a usage limit": that older wording is TRUE only for limit_wait and
+  // false for a pool hold, so the honest generalization is the resource-agnostic phrase
+  // that holds for both.
   const active = data?.runs.filter((r) => !isTerminalRun(r.status)) ?? [];
-  const waiting = active.filter((r) => r.status === "limit_wait");
+  const waiting = active.filter((r) => r.status === "limit_wait" || r.status === "pool_wait");
   const working = active.length - waiting.length;
-  // "8 at work · 1 waiting" only when there is something to disambiguate; a factory
-  // with nothing parked keeps exactly the copy it had.
+  // "8 at work · 1 waiting to resume" only when there is something to disambiguate; a
+  // factory with nothing parked keeps exactly the copy it had.
   const activeHint = !active.length
     ? "nothing in flight"
     : waiting.length
-      ? `${working} at work · ${waiting.length} waiting on a usage limit`
+      ? `${working} at work · ${waiting.length} waiting to resume`
       : "agents at work";
   const recent = data?.runs.slice(0, 5) ?? [];
   const steps = data

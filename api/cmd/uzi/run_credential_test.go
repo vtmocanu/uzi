@@ -47,9 +47,11 @@ func TestCredentialCellNamesTheMode(t *testing.T) {
 // TestCredentialCellFallbacksSayWhy: an `auto` worker that did NOT get an auto pick
 // must not read as an ordinary default. The worker is configured for auto and the run
 // did not get it — a different situation, with a different fix, from a worker that was
-// never auto. Three fallbacks, three different problems: nothing in the pool (a
-// settings fix), nothing measurable (a poller fix), and the pick would not decrypt (a
-// credential fix).
+// never auto. Three fallbacks, three different problems: pool_stale and open_failed
+// both FLOORED onto one of the user's own POOLED tokens as a last resort (#754), so
+// they read as "auto (...)"; pool_empty is a LEGACY value carried only by pre-#754
+// rows (an empty pool now holds in pool_wait rather than spending the default). Each
+// still names AUTO and why the pick was not the ordinary one.
 //
 // MUTATION THIS CATCHES: rendering the three fallback reasons as bare "default" —
 // every case collapses onto the plain-default string asserted above.
@@ -63,7 +65,7 @@ func TestCredentialCellFallbacksSayWhy(t *testing.T) {
 			AnthropicSecretLabel:  sptr("default"),
 			AnthropicSelectReason: sptr(string(reason)),
 		})
-		if !strings.Contains(got, "default (auto:") {
+		if !strings.Contains(got, "auto") {
 			t.Errorf("%s rendered %q; a fallback must say the worker is on AUTO and why it "+
 				"did not get a pick, not read as an ordinary default", reason, got)
 		}

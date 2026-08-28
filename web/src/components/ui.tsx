@@ -400,6 +400,13 @@ export const RUN_STATUS_TONES: Record<
    *  retry_not_before, which only the run view has — the board's LatestRun
    *  projection does not carry it, so this pill is static everywhere it appears. */
   limit_wait: { tone: "warning" },
+  /** Issue #754: an `auto`-lane run parked because the owner's token pool is empty.
+   *  Warn-toned like the other holds (limit_wait / awaiting_*), and NOT pulsing —
+   *  a parked run does no work until a token is pooled or it is resumed. Distinct
+   *  from limit_wait: this is not a usage-limit park, so nothing here implies a
+   *  reset countdown. The label overrides to "waiting for pool" below so the pill
+   *  does not print the bare enum "pool wait". */
+  pool_wait: { tone: "warning" },
   completed: { tone: "ok" },
   failed: { tone: "danger" },
   cancelled: { tone: "neutral" },
@@ -420,6 +427,11 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   // turn-taking pause, not an unanswered question. Kept in step with runBadge's
   // "awaiting follow-up" label.
   awaiting_followup: "awaiting follow-up",
+  // Issue #754: "pool wait" de-underscored reads as machine jargon; "waiting for
+  // pool" says what the run is actually blocked on. Kept in step with runBadge's
+  // matching "waiting for pool" label (the ui.test.tsx label-agreement loop over
+  // RUN_STATUS_TONES asserts the two surfaces print one word).
+  pool_wait: "waiting for pool",
 };
 
 export function StatusPill({ status }: { status: string }) {

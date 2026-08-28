@@ -133,8 +133,10 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			"  --auto      let uzi pick per claim, from the tokens you opted into the\n" +
 			"              pool with `uzi token pool` — preferring the account with the\n" +
 			"              most rate-limit headroom\n\n" +
-			"With --auto and an empty or unreadable pool the worker simply uses your\n" +
-			"default token; auto never fails a run for want of a candidate.\n\n" +
+			"An --auto worker spends ONLY pooled tokens: if the pool has tokens it\n" +
+			"floors onto the best available one (never your out-of-pool default); if\n" +
+			"the pool is genuinely empty the run HOLDS, waiting for a token to be\n" +
+			"pooled, and can be resumed — it does not fall back to your default.\n\n" +
 			"Takes effect on the worker's next claim: no restart, no new join token.\n" +
 			"Chat runs still spend your default token whatever the mode.",
 		Args: cobra.RangeArgs(1, 2),

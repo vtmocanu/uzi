@@ -95,6 +95,11 @@ type fakeStore struct {
 	autoCandidates       []store.ListAutoSelectCandidatesRow
 	autoCandidatesErr    error
 	autoCandidateLookups []uuid.UUID
+	// autoCandidatesByUser overrides autoCandidates PER user when non-nil (PRD #754 M5's
+	// reactive-resume test needs one user's pool eligible and another's empty in a single
+	// Sweep). A user absent from the map returns an empty candidate slice; nil map falls
+	// back to the blanket autoCandidates so every existing fixture is unchanged.
+	autoCandidatesByUser map[uuid.UUID][]store.ListAutoSelectCandidatesRow
 	// judgeSecret is the user's judge-lane binding (PRD #104 M4); the zero value is
 	// "unbound", which is every user's state until they choose otherwise, so existing
 	// judge fixtures keep resolving the default with no change.
@@ -131,6 +136,14 @@ type fakeStore struct {
 	// requeuedRun records the run id reset to queued by the vault lock-race path
 	// (PRD #32 M3); nil unless RequeueClaimedRunToQueued was called.
 	requeuedRun *uuid.UUID
+	// poolWaitHeld records the args of the pool_wait hold (PRD #754 M4); nil unless
+	// SetRunPoolWait was called. A held run records NO credential and is NOT failed —
+	// tests assert on this to distinguish the hold from the old requeue and from a fail.
+	poolWaitHeld *store.SetRunPoolWaitParams
+	// hasActiveRunForIssue is what the CreateRun dedup pre-check returns (PRD #754 M4);
+	// hasActiveRunForIssueErr forces its error path.
+	hasActiveRunForIssue    bool
+	hasActiveRunForIssueErr error
 
 	// issue #297: the in-flight avoid-set source for a self_improve claim.
 	activeRunsAll    []store.ListActiveRunsAllRow
@@ -436,6 +449,18 @@ type fakeStore struct {
 	promoteLimitWaitErr error
 	promoteLimitWaitAt  []pgtype.Timestamptz
 
+	// PRD #754 M5 reactive-resume: poolWaitRuns is what ListPoolWaitRuns returns (the
+	// oldest-first pool_wait worklist) and poolWaitRunsErr fails that read. promotedPoolWait
+	// records every PromotePoolWaitRun arg in order (so a test can assert WHICH held run was
+	// resumed and that it was owner-scoped), promotePoolWaitRows overrides the rows-affected
+	// the promote reports (default 1; 0 models a run that moved out of pool_wait under the
+	// pass), and promotePoolWaitErr fails the promote.
+	poolWaitRuns        []store.ListPoolWaitRunsRow
+	poolWaitRunsErr     error
+	promotedPoolWait    []store.PromotePoolWaitRunParams
+	promotePoolWaitRows *int64
+	promotePoolWaitErr  error
+
 	// PRD #217 M1: the park-time gauge write. markedFiveHour / markedSevenDay record
 	// every user_secret_id MarkFiveHourExhausted / MarkSevenDayExhausted was called
 	// with, in order, so a test can assert WHICH window a park marked down (and that
@@ -622,6 +647,9 @@ func (f *fakeStore) ListAutoSelectCandidates(_ context.Context, userID uuid.UUID
 	if f.autoCandidatesErr != nil {
 		return nil, f.autoCandidatesErr
 	}
+	if f.autoCandidatesByUser != nil {
+		return f.autoCandidatesByUser[userID], nil
+	}
 	return f.autoCandidates, nil
 }
 
@@ -749,6 +777,37 @@ func (f *fakeStore) PromoteLimitWaitRuns(_ context.Context, now pgtype.Timestamp
 	f.promoteLimitWaitAt = append(f.promoteLimitWaitAt, now)
 	return f.promotedLimitWait, f.promoteLimitWaitErr
 }
+
+func (f *fakeStore) ListPoolWaitRuns(_ context.Context) ([]store.ListPoolWaitRunsRow, error) {
+	return f.poolWaitRuns, f.poolWaitRunsErr
+}
+
+// PromotePoolWaitRun records the arg and, by default, reports 1 row (a held run
+// resumed). promotePoolWaitRows overrides the count so a test can model the 0-row
+// no-op (the run moved out of pool_wait under the pass); promotePoolWaitErr fails it.
+// It also DROPS the promoted run from poolWaitRuns so a SECOND Sweep on the same fake
+// sees the remaining held run — which is how the one-per-user-per-tick cap is proven
+// across two calls.
+func (f *fakeStore) PromotePoolWaitRun(_ context.Context, arg store.PromotePoolWaitRunParams) (int64, error) {
+	f.promotedPoolWait = append(f.promotedPoolWait, arg)
+	if f.promotePoolWaitErr != nil {
+		return 0, f.promotePoolWaitErr
+	}
+	rows := int64(1)
+	if f.promotePoolWaitRows != nil {
+		rows = *f.promotePoolWaitRows
+	}
+	if rows > 0 {
+		remaining := f.poolWaitRuns[:0]
+		for _, r := range f.poolWaitRuns {
+			if r.ID != arg.ID {
+				remaining = append(remaining, r)
+			}
+		}
+		f.poolWaitRuns = remaining
+	}
+	return rows, nil
+}
 func (f *fakeStore) ConsumeRunInputs(context.Context, uuid.UUID) ([]store.ConsumeRunInputsRow, error) {
 	return f.consumeRows, nil
 }
@@ -783,6 +842,13 @@ func (f *fakeStore) SweepClaimedNeverStarted(_ context.Context, cutoff pgtype.Ti
 func (f *fakeStore) RequeueClaimedRunToQueued(_ context.Context, id uuid.UUID) (int64, error) {
 	f.requeuedRun = &id
 	return 1, nil
+}
+func (f *fakeStore) SetRunPoolWait(_ context.Context, arg store.SetRunPoolWaitParams) (int64, error) {
+	f.poolWaitHeld = &arg
+	return 1, nil
+}
+func (f *fakeStore) HasActiveRunForIssue(_ context.Context, _ store.HasActiveRunForIssueParams) (bool, error) {
+	return f.hasActiveRunForIssue, f.hasActiveRunForIssueErr
 }
 func (f *fakeStore) SweepRunningTimeout(_ context.Context, arg store.SweepRunningTimeoutParams) ([]store.SweepRunningTimeoutRow, error) {
 	f.runNow = arg.Now
@@ -3473,6 +3539,41 @@ func TestCreateRunMapsDuplicateToActiveRunExists(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", false, nil, nil); err != ErrActiveRunExists {
 		t.Fatalf("err = %v, want ErrActiveRunExists", err)
+	}
+}
+
+// TestCreateRunPreCheckBlocksDuplicateOnHeldIssue covers the #754 M4 dedup pre-check
+// that replaces the index guard for a held issue: uq_runs_one_active_per_issue now
+// EXCLUDES pool_wait, so a held run no longer raises 23505 on a fresh insert — the
+// HasActiveRunForIssue pre-check in createRun is the ONLY thing that still refuses a
+// duplicate. This exercises that branch (the 23505 test above cannot: with pool_wait
+// excluded the index would let the second run through).
+func TestCreateRunPreCheckBlocksDuplicateOnHeldIssue(t *testing.T) {
+	user, repo := uuid.New(), uuid.New()
+	fs := &fakeStore{
+		issueByID:            store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true},
+		hasActiveRunForIssue: true, // a pool_wait (or any non-terminal) run already exists
+		createRunResult:      store.Run{ID: uuid.New()},
+	}
+	svc := New(fs, newBox(t), testParams())
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", false, nil, nil); err != ErrActiveRunExists {
+		t.Fatalf("err = %v, want ErrActiveRunExists — the pre-check must refuse a second run on a held issue", err)
+	}
+}
+
+// TestCreateRunPreCheckErrorPropagates: a DB error from the pre-check fails the create
+// (it must not be swallowed into "no active run" and let a duplicate through).
+func TestCreateRunPreCheckErrorPropagates(t *testing.T) {
+	user, repo := uuid.New(), uuid.New()
+	sentinel := errors.New("pre-check boom")
+	fs := &fakeStore{
+		issueByID:               store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true},
+		hasActiveRunForIssueErr: sentinel,
+		createRunResult:         store.Run{ID: uuid.New()},
+	}
+	svc := New(fs, newBox(t), testParams())
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", false, nil, nil); !errors.Is(err, sentinel) {
+		t.Fatalf("err = %v, want the pre-check error to propagate", err)
 	}
 }
 
