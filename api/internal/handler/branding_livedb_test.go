@@ -181,6 +181,11 @@ func TestBrandingLogoUploadServeDeleteLiveDB(t *testing.T) {
 		if xcto := rec.Header().Get("X-Content-Type-Options"); xcto != "nosniff" {
 			t.Errorf("logo GET %s X-Content-Type-Options = %q, want nosniff", tc.slot, xcto)
 		}
+		// Route-local CSP sandboxes a directly-navigated SVG so its inline scripts/SMIL
+		// cannot execute in the app origin (nosniff does not cover that vector).
+		if csp := rec.Header().Get("Content-Security-Policy"); csp != "sandbox; default-src 'none'" {
+			t.Errorf("logo GET %s Content-Security-Policy = %q, want \"sandbox; default-src 'none'\"", tc.slot, csp)
+		}
 		if cd := rec.Header().Get("Content-Disposition"); cd != "inline" {
 			t.Errorf("logo GET %s Content-Disposition = %q, want inline", tc.slot, cd)
 		}

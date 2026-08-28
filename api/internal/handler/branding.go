@@ -132,12 +132,20 @@ func (h *Handler) GetBrandingLogo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", asset.ContentType)
-	// Defense-in-depth for admin-uploaded bytes (svg+xml is an allowed type). nosniff
-	// is the real control here: it stops content-type sniffing, so the route self-defends
-	// even if the nginx-inherited CSP/nosniff ever stops covering /api/. Content-Disposition
-	// inline is not a security control (it is the browser default) — it only states the
-	// intent that these are shown in an <img>, matching how the chrome loads them.
+	// Defense-in-depth for admin-uploaded bytes (svg+xml is an allowed type), and the
+	// route self-defends rather than trusting the nginx-inherited headers to keep covering
+	// /api/. Two independent controls:
+	//   - nosniff stops content-type sniffing (an uploaded file cannot be re-interpreted as
+	//     something other than the type it declares);
+	//   - a route-local CSP sandboxes the bytes when they are NAVIGATED TO DIRECTLY, which
+	//     nosniff does not address: a raw image/svg+xml document would otherwise execute its
+	//     inline scripts / SMIL in the app origin. `sandbox; default-src 'none'` forces a
+	//     unique origin and blocks every subresource load, neutering active SVG content,
+	//     while leaving the <img>-loaded path (how the chrome renders these) unaffected.
+	// Content-Disposition inline is not a security control (it is the browser default) — it
+	// only states the intent that these are shown in an <img>, matching how the chrome loads them.
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")
 	w.Header().Set("Content-Disposition", "inline")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(asset.Bytes)
