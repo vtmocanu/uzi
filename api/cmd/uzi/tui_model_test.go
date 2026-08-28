@@ -2198,4 +2198,68 @@ func TestTUIDetailCostAsciiSurvives(t *testing.T) {
 	}
 }
 
+// A detail load that resolves AFTER the user has left the run must be dropped, not applied:
+// exitToBoard resets m.detail to its zero value (nil `seen` map), so a late applyLoaded would
+// write the nil map and panic (observed in the field). The runID guard drops it.
+func TestTUIDetailLateLoadAfterExitIsDropped(t *testing.T) {
+	now := time.Now()
+	runID := "late-1"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	// Leave the run before its load resolves.
+	m = press(t, m, keyEsc)
+	if m.view != viewBoard {
+		t.Fatalf("esc should return to the board, got view %v", m.view)
+	}
+	// The in-flight load lands now, for the run just left. It must be dropped, and must not
+	// panic against the torn-down (nil-seen) detail.
+	next, _ := m.Update(detailLoadedMsg{
+		runID: runID,
+		run:   apitypes.RunDTO{ID: runID, Status: "running", Health: "ok"},
+		msgs:  []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "hello", now)},
+	})
+	m = next.(tuiModel)
+	if m.detail.loaded {
+		t.Error("a load for a run the user has left must not populate the detail")
+	}
+	if len(m.detail.frames) != 0 {
+		t.Errorf("stale load spliced %d frames into a torn-down detail", len(m.detail.frames))
+	}
+}
+
+// A load that resolves for a DIFFERENT run than the one now open must be dropped, so a slow
+// run-A load cannot overwrite the run-B transcript the user drilled into next.
+func TestTUIDetailStaleLoadForOtherRunIsDropped(t *testing.T) {
+	now := time.Now()
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "run-b")
+	next, _ := m.Update(detailLoadedMsg{
+		runID: "run-a",
+		run:   apitypes.RunDTO{ID: "run-a", Status: "running", Health: "ok"},
+		msgs:  []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "from A", now)},
+	})
+	m = next.(tuiModel)
+	if m.detail.run.ID == "run-a" {
+		t.Error("a load for run-a overwrote the open run-b detail")
+	}
+	if len(m.detail.frames) != 0 {
+		t.Errorf("run-a load spliced %d frames into run-b", len(m.detail.frames))
+	}
+}
+
+// addFrame must be total on a zero-value detailState: newDetailState seeds `seen`, but a
+// constructor-less detail (the zero value exitToBoard assigns) has a nil map, and the
+// field-observed crash was exactly a write to it. Lazy-init keeps it from panicking.
+func TestDetailAddFrameTotalOnZeroValue(t *testing.T) {
+	var d detailState // zero value: seen is nil
+	d.addFrame(laneFrame{Seq: 1})
+	if len(d.frames) != 1 {
+		t.Fatalf("addFrame on a zero-value detailState dropped the frame: got %d", len(d.frames))
+	}
+	// A second frame with the same seq is deduped, which only works if seen was initialized
+	// and written — so this also proves the lazy map is live, not just non-nil.
+	d.addFrame(laneFrame{Seq: 1})
+	if len(d.frames) != 1 {
+		t.Errorf("dedup did not hold; seen map not initialized: got %d frames", len(d.frames))
+	}
+}
+
 var _ tea.Model = tuiModel{}

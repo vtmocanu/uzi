@@ -101,9 +101,10 @@ type buildInfoMsg struct {
 }
 
 type detailLoadedMsg struct {
-	run  apitypes.RunDTO
-	msgs []apitypes.MessageDTO
-	err  error
+	runID string
+	run   apitypes.RunDTO
+	msgs  []apitypes.MessageDTO
+	err   error
 }
 
 type streamReadyMsg struct {
@@ -310,10 +311,10 @@ func (m tuiModel) loadDetailCmd(runID string) tea.Cmd {
 	return func() tea.Msg {
 		run, err := c.GetRun(ctx, runID)
 		if err != nil {
-			return detailLoadedMsg{err: err}
+			return detailLoadedMsg{runID: runID, err: err}
 		}
 		msgs, err := c.RunLogs(ctx, runID, 0)
-		return detailLoadedMsg{run: run, msgs: msgs, err: err}
+		return detailLoadedMsg{runID: runID, run: run, msgs: msgs, err: err}
 	}
 }
 
@@ -445,6 +446,21 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case detailLoadedMsg:
+		// Drop a load that resolved for a run the user has since navigated away from:
+		// esc/exitToBoard resets m.detail to its zero value (runID "", nil `seen` map), and
+		// drilling into another run swaps runID — a late applyLoaded from the previous run
+		// would splice the wrong transcript in, and against the zero value it would write the
+		// nil map and panic. Same runID guard every sibling detail message carries. runID is
+		// set by loadDetailCmd on both the success and error paths; run.ID is the fallback for
+		// a message that carries only the run (the error path leaves run zero, which is why the
+		// explicit field exists).
+		id := msg.runID
+		if id == "" {
+			id = msg.run.ID
+		}
+		if id != m.detail.runID {
+			return m, nil
+		}
 		m.detail.applyLoaded(msg)
 		// The ownership probe rides the same call the queue indicator needs.
 		return m, m.fetchInputsCmd(m.detail.runID)

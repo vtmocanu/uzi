@@ -141,6 +141,12 @@ func (d *detailState) applyEvents(evs []apitypes.RunEventDTO) bool {
 // a reconnect replays from the last seq seen and the live socket may deliver the same
 // frame, and a duplicate would double a lane's contribution.
 func (d *detailState) addFrame(f laneFrame) {
+	if d.seen == nil {
+		// Total on a zero-value detailState: newDetailState seeds this map, but the
+		// handler guard is the load-bearing fix — this keeps a nil map from panicking
+		// the program if any future path reaches addFrame without the constructor.
+		d.seen = map[int32]bool{}
+	}
 	if f.Seq > 0 {
 		if d.seen[f.Seq] {
 			return
