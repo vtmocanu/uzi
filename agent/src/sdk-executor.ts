@@ -967,8 +967,9 @@ export class SdkExecutor implements Executor {
       // was dropped from skipping planning (it must re-plan — D4 row 3), but a seeded run
       // never had a session, so "no session" is its normal state rather than a lost one.
       // The runner already encodes this: it sets ctx.planApproved only when
-      // plan_approved && (sessionId || seeded), so a dropped-transcript non-seeded run
-      // arrives here with planApproved=false and this branch is not taken.
+      // plan_approved && (sessionId || seeded || the PRD #759 M4 reviewedPlanResume path,
+      // see below), so a dropped-transcript non-seeded run that is NOT a provably-reviewed
+      // resume arrives here with planApproved=false and this branch is not taken.
       //
       // Skipping the gate is NOT a weakening of the approval guardrail. For a PRD #35
       // resume the approval already happened on this exact plan (a consumed approve_plan
