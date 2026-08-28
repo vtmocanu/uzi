@@ -1749,11 +1749,23 @@ func selectReasonText(reason autoselect.Reason, headroom *int) string {
 		// the user's pool is nearly exhausted — a thing to know, not an error.
 		return "auto (best of pool)" + pct
 	case autoselect.ReasonPoolEmpty:
-		return "default (auto: no tokens in the pool)"
+		// LEGACY VALUE — no longer produced on new runs (#754). An auto worker with
+		// a genuinely empty pool now HOLDS the run in pool_wait and spends nothing,
+		// rather than falling back to the out-of-pool default. This string is kept
+		// only for PRE-#754 historical rows, where the default genuinely WAS spent;
+		// it is deliberately worded to stay true for those without implying that an
+		// empty pool spends the default today.
+		return "default (auto: pool was empty — legacy)"
 	case autoselect.ReasonPoolStale:
-		return "default (auto: no fresh usage readings)"
+		// The run FLOORED onto a POOLED token that had no fresh usage reading to rank
+		// on — it spent one of the user's OWN pooled tokens as a last resort, not the
+		// out-of-pool default (#754). A floored stale token carries no headroom, so no
+		// pct is appended here.
+		return "auto (pooled token, no fresh readings)"
 	case autoselect.ReasonOpenFailed:
-		return "default (auto: the chosen token would not open)"
+		// The selector's picked token would not decrypt, so the run FLOORED onto
+		// ANOTHER POOLED token — again not the default (#754).
+		return "auto (fell to another pooled token; the chosen one would not open)"
 	}
 	return string(reason)
 }

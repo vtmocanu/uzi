@@ -42,21 +42,28 @@ const (
 	// has a best answer, and falling to the owner default instead could pick a
 	// MORE-throttled token that simply is not in the pool.
 	ReasonBestOfPool Reason = "best_of_pool"
-	// ReasonPoolEmpty: the user opted no token in. Select picks nothing and the
-	// caller resolves the worker's non-auto binding (D7 — auto never fails a run).
+	// ReasonPoolEmpty: the user opted no token in, so Select picks nothing. Since
+	// #754 this is a pure Select OUTCOME the caller never records as a spent
+	// credential: an empty pool holds the run in pool_wait rather than falling back
+	// to the out-of-pool default (PRD #111 D7's owner-default fallback was dropped
+	// for the auto lane). The value stays in the vocabulary for PRE-#754 historical
+	// rows where the default genuinely was spent.
 	ReasonPoolEmpty Reason = "pool_empty"
 	// ReasonPoolStale: tokens ARE pooled but not one of them is measurable — no
-	// gauge row, a NULL window, or a reading that aged out. This is also what a
-	// disabled poller produces for every token (R2), which is why it is a distinct
-	// reason from pool_empty: "you pooled nothing" and "your poller is not running"
-	// send a user to entirely different places.
+	// gauge row, a NULL window, or a reading that aged out (also what a disabled
+	// poller produces for every token, R2). Since #754 the caller RECORDS this on the
+	// FLOOR: it spends the best pooled token anyway (autoselect.Floor), never the
+	// out-of-pool default — so the credential it names is a POOLED token, with no
+	// headroom (nothing measured it). Distinct from pool_empty ("you pooled nothing"
+	// → a hold) vs "your poller is not running" → a floor onto a stale pooled token.
 	ReasonPoolStale Reason = "pool_stale"
 	// ReasonOpenFailed is produced by the CALLER, never by Select: the selector's
 	// pick was fine on paper and then would not decrypt (or vanished between the
-	// ranking query and the open), so the claim retried once on the non-auto binding
-	// (D14). It lives in this vocabulary rather than workersvc's because it can only
-	// ever arise on the auto lane — no other mode has a second credential to fall
-	// back to.
+	// ranking query and the open). Since #754 the claim floors onto ANOTHER pooled
+	// token (autoselect.Floor over the pool minus the failed pick), never the
+	// non-auto owner default (D14, reshaped). It lives in this vocabulary rather than
+	// workersvc's because it can only ever arise on the auto lane — no other mode has
+	// a pooled alternative to fall to.
 	ReasonOpenFailed Reason = "open_failed"
 )
 

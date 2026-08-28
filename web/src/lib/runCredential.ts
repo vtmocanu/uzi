@@ -21,7 +21,7 @@ export interface CredentialDescription {
    *  knows. */
   mode: string;
   /** The hover explanation. Always present, because the mode phrase is necessarily
-   *  terse and "default (auto: no fresh usage readings)" is not self-explaining. */
+   *  terse and "auto (pooled token, no fresh readings)" is not self-explaining. */
   hint: string;
   /** How much attention the state deserves, and the rule behind it is the one the
    *  settings page already uses (web-ux F4): AMBER where the selector SKIPPED the
@@ -51,10 +51,14 @@ export interface CredentialDescription {
 // a bare string — and it is also why the wire type is `SelectReason | string`: the
 // exhaustiveness must bind this map, not lie about what the API can send.
 //
-// The three FALLBACK reasons are phrased as `default (auto: …)` rather than as their
-// own mode, because that is what actually happened: the worker is configured for auto,
-// the selector declined, and the owner's default paid. A user reading a bare "default"
-// on a worker they set to auto would reasonably think the setting had been lost.
+// The three non-pick reasons describe what an `auto` worker actually spent when the
+// selector could not make an ordinary pick. After #754 an auto worker spends ONLY
+// pooled tokens: pool_stale and open_failed FLOOR onto one of the user's own pooled
+// tokens as a last resort (phrased "auto (…)", because a pooled token — not the
+// out-of-pool default — paid). pool_empty is LEGACY: it only appears on pre-#754 rows,
+// where an empty pool did fall back to the owner's default; today an empty pool HOLDS
+// the run in pool_wait and spends nothing, so its copy stays true for the old rows
+// without implying current behaviour.
 type Phrase = { mode: string; hint: string; tone?: "info" | "warning" };
 
 const REASON_PHRASES: Record<SelectReason, Phrase> = {
@@ -87,27 +91,33 @@ const REASON_PHRASES: Record<SelectReason, Phrase> = {
     tone: "info",
   },
   pool_empty: {
-    // Pure configuration, and fixed in one click on the page this links to.
-    mode: "default (auto: no tokens in the pool)",
-    hint: "This worker is set to auto, but no token is opted into the pool, so the run spent your default token. Opt one in on Settings → Anthropic tokens.",
+    // LEGACY (#754). This reason is no longer recorded on new runs: an auto worker
+    // with an empty pool now HOLDS the run in pool_wait and spends nothing, rather
+    // than falling back to the default. Only pre-#754 rows carry it, and on those the
+    // default genuinely was spent — so the hint stays true for the historical run
+    // while not implying an empty pool spends the default today.
+    mode: "default (auto: pool was empty — legacy)",
+    hint: "This is an older run: it was set to auto with an empty token pool, so at the time it fell back to your default token. Auto no longer does this — an empty pool now holds the run until you add a token to the pool.",
     tone: "warning",
   },
   pool_stale: {
-    // HEDGED, per F16. This can be the user's half (tokens uzi has never managed to
-    // poll) or the system's (the poller is disabled — R2), and the copy cannot tell
-    // which from here. The previous wording asserted the user's half by sending them
-    // to the eligibility chips, which is wrong advice half the time.
-    mode: "default (auto: no fresh usage readings)",
-    hint: "This worker is set to auto, but no pooled token had a current usage reading to rank on, so the run spent your default token. Either uzi has not managed to read those tokens — the eligibility chips on Settings → Anthropic tokens will say — or usage polling is switched off for this instance.",
+    // After #754 this FLOORS onto a POOLED token as a last resort: no pooled token had
+    // a fresh usage reading to rank on, so auto spent one of the user's OWN pooled
+    // tokens rather than the out-of-pool default. HEDGED, per F16: the missing reading
+    // can be the user's half (tokens uzi has never managed to poll) or the system's
+    // (the poller is disabled — R2), and the copy cannot tell which from here.
+    mode: "auto (pooled token, no fresh readings)",
+    hint: "This worker is set to auto, but no pooled token had a current usage reading to rank on, so the run floored onto one of your pooled tokens as a last resort — not your default. Either uzi has not managed to read those tokens — the eligibility chips on Settings → Anthropic tokens will say — or usage polling is switched off for this instance.",
     tone: "warning",
   },
   open_failed: {
-    // NOT a configuration problem (F16). A ciphertext would not decrypt, so the
-    // action is to ROTATE that credential — inspecting eligibility chips tells the
-    // user nothing, because the token was eligible; it was the OPEN that failed. The
-    // rotate form is on the same page, so the link target is unchanged.
-    mode: "default (auto: the chosen token would not open)",
-    hint: "Auto-selection picked a token and its stored value could not be decrypted, so the run spent your default token rather than failing. Re-paste that token on Settings → Anthropic tokens to fix it.",
+    // NOT a configuration problem (F16). Auto's pick would not decrypt, so after #754
+    // the run FLOORED onto ANOTHER POOLED token — not the default. The action is to
+    // ROTATE the broken credential; inspecting eligibility chips tells the user
+    // nothing, because the token was eligible; it was the OPEN that failed. The rotate
+    // form is on the same page, so the link target is unchanged.
+    mode: "auto (fell to another pooled token)",
+    hint: "Auto-selection picked a token whose stored value could not be decrypted, so the run floored onto another of your pooled tokens rather than failing — not your default. Re-paste the broken token on Settings → Anthropic tokens to fix it.",
     tone: "warning",
   },
 };
