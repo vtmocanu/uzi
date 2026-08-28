@@ -913,7 +913,7 @@ Serves human: "server/client; agents work an issue"; secret-at-rest (server hold
   `draining_since IS NULL`). It **falls open to peers IMMEDIATELY** the moment the prior
   worker goes heartbeat-stale or draining (a dead/draining owner never resumes it, so pinning
   is strictly worse than re-claiming), and a new run-lane ceiling `WORKER_AFFINITY_CEILING`
-  (default 30m) bounds the one live-but-wedged case (vault-locked / stuck-in-assembly yet
+  (default 2h; raised 30m→2h, PRD #759 M3) bounds the one live-but-wedged case (vault-locked / stuck-in-assembly yet
   still heartbeating). This **replaces** the old fixed `WORKER_AFFINITY_GRACE` (2m) window on
   the run lane, which was far too short for a `limit_wait` park (§432) that can last hours. The
   change is **universal** to the shared `ClaimRun` affinity leg — every requeue-with-`worker_id`
@@ -1111,7 +1111,7 @@ Server-side (defaults): `RUN_TIMEOUT` 2h, `RUN_IDLE_TIMEOUT` 10m (worker-enforce
 shipped in the claim), `RUN_MAX_ITERATIONS` 5 (worker-enforced), `RUN_MAX_REQUEUES`
 1 (`0` = never re-queue), `WORKER_HEARTBEAT_INTERVAL` 15s, `WORKER_HEARTBEAT_STALE`
 45s, `WORKER_POLL_INTERVAL` 3s, `WORKER_AFFINITY_GRACE` 2m (chat lane), `WORKER_AFFINITY_CEILING`
-30m (run lane, §573). Claimed-never-started
+2h (run lane, §573). Claimed-never-started
 grace is fixed at 5m in code, not an env var. Invalid numeric/duration values fall
 back to defaults (PRD #1/#2 convention). Worker-side: `UZI_API_URL`,
 `UZI_WORKER_TOKEN`, `UZI_DATA_DIR`, `UZI_WORKER_NAME`, and the interval knobs above

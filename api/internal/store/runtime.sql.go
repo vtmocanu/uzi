@@ -264,7 +264,7 @@ WHERE id = (
                  AND ow.last_heartbeat_at >= $3
                  AND ow.draining_since IS NULL)
            -- Generous ceiling bounding the live-but-can't-serve case; @affinity_cutoff is
-           -- now now() - WORKER_AFFINITY_CEILING (default 30m), NOT the 2-min grace.
+           -- now now() - WORKER_AFFINITY_CEILING (default 2h), NOT the 2-min grace.
            OR r.updated_at < $4)
       -- PRD #216 D5: claiming-worker eligibility via the shared expression.
       -- PRD #84 M2 extends it: the run's required_capabilities must be a subset of the

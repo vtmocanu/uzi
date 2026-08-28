@@ -763,7 +763,13 @@ func Load() (Config, error) {
 	// re-claims its own promoted run within one poll long before this fires) and much
 	// longer than the 2-min WorkerAffinityGrace, which stays the CHAT lane's grace
 	// (ClaimChatRun gets no liveness short-circuit in M1's scope).
-	cfg.WorkerAffinityCeiling = parseDuration("WORKER_AFFINITY_CEILING", 30*time.Minute)
+	// PRD #759 M3: raised 30m→2h so an alive-but-busy original worker holds its
+	// promoted (parked) run long enough to re-claim it with the intact SDK session
+	// before an idle peer takes it. The affinity clock is stamped at PROMOTION
+	// (PromoteLimitWaitRuns sets updated_at = now()), so this bounds post-promotion
+	// queue-dwell, NOT park duration; it stays FLAT, not park-duration-aware (D3a:
+	// no crisp claim-time signal isolates a park promotion).
+	cfg.WorkerAffinityCeiling = parseDuration("WORKER_AFFINITY_CEILING", 2*time.Hour)
 	// PRD #216: a queued run older than this grace is exempt from the fleet-aware
 	// spread (fail-open, D4). Tracks the poll interval so the two stay related.
 	cfg.WorkerSpreadGrace = parseDuration("WORKER_SPREAD_GRACE", 3*cfg.WorkerPollInterval)
