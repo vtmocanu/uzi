@@ -1481,6 +1481,13 @@ export type RunStatus =
   /** Parked until the owner's Anthropic usage window reopens (PRD #35).
    *  NON-terminal — deliberately absent from TERMINAL_RUN_STATUSES below. */
   | "limit_wait"
+  /** Issue #754: an `auto`-lane run parked because the owner's Anthropic token
+   *  pool is genuinely EMPTY. NON-terminal — deliberately absent from
+   *  TERMINAL_RUN_STATUSES below. Unlike limit_wait this is NOT a usage-limit park:
+   *  it carries no reset window and no countdown. It resumes automatically the
+   *  moment a token is opted into the pool, and can be resumed on demand via
+   *  `resumeRunNow` (POST /runs/{id}/resume-now). */
+  | "pool_wait"
   | "completed"
   | "failed"
   | "cancelled";
@@ -3407,6 +3414,22 @@ const realApi = {
    */
   setRunWaitOnLimit: (id: string, enabled: boolean) =>
     request<{ run: Run }>("PUT", `/runs/${id}/wait-on-limit`, { enabled }),
+
+  /**
+   * Issue #754: resume an `auto`-lane run parked at `pool_wait` (the owner's
+   * Anthropic token pool was empty) right now, without waiting for a token to be
+   * opted into the pool. No request body; returns the updated run, which moves to
+   * `queued` on success.
+   *
+   * Owner-scoped (404 when not owned/unknown) and pool_wait-ONLY: the server 409s
+   * (`run is not waiting for a pooled token`) when the run is not currently
+   * parked at pool_wait — including a run that has already been resumed to
+   * `queued`. Callers gate the control on `status === "pool_wait"`; the 409 is the
+   * backstop that lets the panel surface "this run is no longer waiting" when the
+   * WS/refetch has not yet caught up.
+   */
+  resumeRunNow: (id: string) =>
+    request<{ run: Run }>("POST", `/runs/${id}/resume-now`),
 
   /**
    * PRD #320 M6: bump THIS run to the front of the queue (`expedite: true`) or clear

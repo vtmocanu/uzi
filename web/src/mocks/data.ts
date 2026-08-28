@@ -1539,6 +1539,31 @@ const boardFixtures: Record<string, Board> = {
         pipeline: null,
       },
       {
+        // Issue #754: the board's only pool-empty parked card — what makes runBadge's
+        // `pool_wait` arm reachable in mock mode. STATIC like the limit_wait card:
+        // there is no reset window, so nothing counts down here or on the run view.
+        iid: 28,
+        title: "Backfill run credential history for the audit log",
+        state: "opened",
+        labels: ["PRD", "In progress"],
+        web_url: uziUrl(28),
+        author: "mira",
+        forge_type: "gitlab",
+        has_prd_link: true,
+        column: "In progress",
+        closed: false,
+        conflict: false,
+        forge_updated_at: minsAgo(52),
+        latest_run: latestRun({
+          id: "run-pool-wait",
+          status: "pool_wait",
+          worker_name: "ci",
+          created_at: minsAgo(52),
+          updated_at: minsAgo(9),
+        }),
+        pipeline: null,
+      },
+      {
         iid: 18,
         title: "Run view: fold tool results under their calls",
         state: "closed",
@@ -3799,6 +3824,72 @@ export const mockRuns: Run[] = [
     finished_at: null,
     created_at: minsAgo(301),
     updated_at: minsAgo(3),
+  },
+  {
+    // Issue #754: an `auto`-lane run parked because the owner's Anthropic token pool
+    // is genuinely EMPTY. It is NOT a usage-limit park, and the fixture asserts that
+    // difference deliberately:
+    //   * NO countdown timestamps — limit_resets_at AND retry_not_before are null,
+    //     because a pool hold has no reset window. The PoolWaitPanel shows an
+    //     elapsed-waiting only, never a "resumes in" clock.
+    //   * rate_limit_type is null and limit_wait_count is 0 — none of the
+    //     usage-limit vocabulary applies to this hold.
+    //   * anthropic_select_reason "auto" and anthropic_secret_id null — the run is
+    //     set to auto-select but the pool has nothing to hand it, which is the whole
+    //     reason it is waiting.
+    // It drives the "Resume now" control (POST /runs/{id}/resume-now); resuming it
+    // moves it to `queued` (mockApi.resumeRunNow).
+    id: "run-pool-wait",
+    repo_id: "repo-uzi",
+    issue_iid: 28,
+    issue_title: "Backfill run credential history for the audit log",
+    issue_description: "See prds/28-credential-audit-log.md.",
+    kind: "issue",
+    title: null,
+    resume_of_run_id: null,
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
+    status: "pool_wait",
+    requeue_count: 0,
+    iteration_count: 1,
+    auto_approve: false,
+    worker_id: "w-ci",
+    branch: "agent/issue-28",
+    model: null,
+    override_subagent_model: false,
+    forge_type: "gitlab",
+    mr_web_url: null,
+    issue_web_url: null,
+    mr_iid: null,
+    mr_state: null,
+    failure_reason: null,
+    stop_kind: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
+    plan_md: null,
+    repo_agents: null,
+    agent_source: null,
+    agent_exclusions: null,
+    own_agents: null,
+    // Auto-select with an empty pool: there is no credential to name, which is why
+    // the run is parked at all.
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
+    anthropic_select_reason: "auto",
+    anthropic_headroom_pct: null,
+    wait_on_limit: true,
+    // No reset window and no retry clock — this is not a usage-limit park.
+    limit_resets_at: null,
+    retry_not_before: null,
+    limit_wait_count: 0,
+    rate_limit_type: null,
+    claimed_at: minsAgo(50),
+    started_at: minsAgo(49),
+    finished_at: null,
+    created_at: minsAgo(52),
+    updated_at: minsAgo(9),
   },
 ];
 

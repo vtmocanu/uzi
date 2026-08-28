@@ -122,6 +122,10 @@ describe("StatusPill", () => {
     // RUN_STATUS_LABELS entry would leave StatusPill printing "awaiting followup" against
     // runBadge's "awaiting follow-up", which this loop then catches.
     expect(checked).toContain("awaiting_followup");
+    // Issue #754: pool_wait must print "waiting for pool" on BOTH surfaces — a missing
+    // RUN_STATUS_LABELS entry would leave StatusPill printing "pool wait" against
+    // runBadge's "waiting for pool", which this loop then catches.
+    expect(checked).toContain("pool_wait");
     expect(checked.length).toBeGreaterThanOrEqual(5);
   });
 });

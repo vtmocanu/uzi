@@ -37,7 +37,8 @@ function parseTs(iso: string | null | undefined): number | null {
  *   - awaiting_approval /
  *     awaiting_input /
  *     awaiting_followup /
- *     limit_wait           → `waiting <elapsed>` since updated_at (time parked in that state)
+ *     limit_wait /
+ *     pool_wait            → `waiting <elapsed>` since updated_at (time parked in that state)
  *   - completed / failed /
  *     cancelled (terminal) → `ran <elapsed>`, the STATIC span finished_at − started_at, i.e.
  *                            how long it actually ran, independent of nowMs
@@ -62,6 +63,10 @@ export function runDurationLabel(run: RunDurationInput, nowMs: number): string {
     case "awaiting_input":
     case "awaiting_followup":
     case "limit_wait":
+    // Issue #754: an auto-lane run parked on an empty token pool. It renders as a
+    // waiting elapsed since it entered the state (updated_at), NOT a countdown —
+    // there is no reset window to count down to.
+    case "pool_wait":
       return liveToken("waiting", run.updated_at, nowMs);
     case "completed":
     case "failed":

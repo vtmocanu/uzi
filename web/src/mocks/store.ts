@@ -97,6 +97,10 @@ function seed(): MockState {
   // a different feed.
   messages.set("run-limit-wait", [...mockLimitWaitMessages]);
   messages.set("run-limit-wait-due", mockLimitWaitMessages.map((m) => ({ ...m })));
+  // Issue #754: the pool-empty parked run. Empty log — a pool_wait hold carries no
+  // usage-limit feed rows (it is not a usage-limit park), and an empty log opens the
+  // run view without a 404 (getRunMessages 404s an unseeded id).
+  messages.set("run-pool-wait", []);
   messages.set("run-live", []);
   messages.set("run-cancelled", []);
   // The never-judged control fixture (PRD #119): a terminal run with no review AND no

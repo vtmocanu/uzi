@@ -587,6 +587,116 @@ export function LimitWaitPanel({
   );
 }
 
+/**
+ * Issue #754: the pool-empty hold panel + its Resume-now control — the analogue of
+ * LimitWaitPanel for `pool_wait`.
+ *
+ * An `auto`-lane run parks at `pool_wait` when the owner's Anthropic token pool is
+ * genuinely EMPTY. It is NOT a usage-limit park, so — unlike LimitWaitPanel — it
+ * shows NO reset countdown: there is no reset. It resumes automatically the instant
+ * a token is opted into the pool; "Resume now" (POST /runs/{id}/resume-now) skips
+ * that wait and moves the run to `queued`, after which the WS/refetch re-renders and
+ * this panel unmounts.
+ *
+ * Self-contained busy + inline message rather than RunView's shared act()/busy,
+ * because the 409 ("run is not waiting for a pooled token") case wants a gentle
+ * inline note on the panel, distinct from the page-level actionErr banner: a token
+ * pooled — or the run resumed elsewhere — between render and click is not a failure.
+ *
+ * Exported like LimitWaitPanel so the copy and the resume/409 handling are reachable
+ * without mounting the whole page.
+ */
+export function PoolWaitPanel({
+  run,
+  canSteer = true,
+  onResumed,
+}: {
+  run: Run;
+  // False for a NON-OWNER viewer (mirrors LimitWaitPanel): resume is owner-scoped
+  // (the server 404s a non-owner), so a non-owner admin who can open this run view
+  // sees inert text rather than a button that 404s.
+  canSteer?: boolean;
+  // Re-read the run after a resume so the view reflects `queued` even if no WS frame
+  // lands first (mirrors the expedite/wait-on-limit refetch pattern).
+  onResumed: () => void | Promise<void>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState("");
+
+  // Only for a run actually parked on the pool. Every other status (including
+  // terminal) renders nothing — there is no future-pool opt-in to offer.
+  if (run.status !== "pool_wait") return null;
+
+  const resume = async () => {
+    setNote("");
+    setBusy(true);
+    try {
+      await api.resumeRunNow(run.id);
+      await onResumed();
+    } catch (e) {
+      // 409: the run is no longer at pool_wait — already resumed to `queued`, or a
+      // token was pooled between render and click. Say so gently and re-sync rather
+      // than surfacing it as a failure.
+      if (e instanceof ApiError && e.status === 409) {
+        setNote("This run is no longer waiting.");
+        await onResumed();
+      } else {
+        setNote(e instanceof ApiError ? e.message : "Could not resume the run.");
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="rounded-xl border border-warn/40 bg-warn/10 p-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          {/* role="status" announces the hold when this panel mounts, mirroring
+              LimitWaitPanel's heading. RunView's page-level parkAnnounce region also
+              narrates pool_wait for a screen reader that arrives mid-stream. */}
+          <p role="status" className="text-sm font-semibold text-warn">
+            <span aria-hidden="true">⏸ </span>
+            Waiting for a pooled token
+          </p>
+          <p className="mt-0.5 text-xs text-muted">
+            This run is set to auto-select an Anthropic token, but the token pool is
+            empty, so it is waiting. Add a token to the pool and it resumes
+            automatically.
+          </p>
+          {/* No countdown, deliberately: a pool_wait hold has no reset window to
+              count down to — resumption is event-driven (a token is pooled), not
+              time-driven. */}
+          <p className="mt-1.5 text-xs text-muted">
+            Nothing is lost — the run keeps its branch and its history and picks up where it left off.
+          </p>
+          {/* Always mounted (sr-only when empty) so the 409 note is announced when it
+              arrives — a region created in the same tick as its first content is
+              typically silent to assistive tech (see RunView's parkAnnounce note). */}
+          <p
+            role="status"
+            aria-live="polite"
+            className={cx("text-xs font-medium text-warn", note ? "mt-1.5" : "sr-only")}
+          >
+            {note}
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          {/* Non-owner: no live control — inert text, never a greyed button that 404s
+              (mirrors LimitWaitPanel's non-owner Stop branch). */}
+          {canSteer ? (
+            <Button variant="secondary" size="sm" disabled={busy} onClick={resume}>
+              Resume now
+            </Button>
+          ) : (
+            <span className="text-xs text-muted">Only the run's owner can resume it.</span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function RunView() {
   const { id = "" } = useParams();
   const { run, messages, connected, error, submit, refreshRun, inputs, canSteer } = useRunStream(id);
@@ -669,8 +779,18 @@ export function RunView() {
   // NOTE this is PURELY the sr-only announcement; the QuestionPanel below stays
   // awaiting_input-only.
   const questionId = run?.status === "awaiting_input" ? (openQuestion?.question.questionId ?? "") : "";
+  // Issue #754: a pool_wait park announces too — it is a non-terminal hold a
+  // screen-reader user must be told about, exactly like the follow-up park. One
+  // stable key ("pool_wait"), since a pool hold has no per-instance identity to
+  // re-announce on the way awaiting_input keys on the question.
   const parkKey =
-    questionId !== "" ? `question:${questionId}` : run?.status === "awaiting_followup" ? "followup" : "";
+    questionId !== ""
+      ? `question:${questionId}`
+      : run?.status === "awaiting_followup"
+        ? "followup"
+        : run?.status === "pool_wait"
+          ? "pool_wait"
+          : "";
   useEffect(() => {
     if (parkKey === "") {
       setParkAnnounce("");
@@ -679,7 +799,9 @@ export function RunView() {
     setParkAnnounce(
       parkKey === "followup"
         ? "The run is waiting for your next follow-up."
-        : "The agent is asking you a question. The run is parked until you answer.",
+        : parkKey === "pool_wait"
+          ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
+          : "The agent is asking you a question. The run is parked until you answer.",
     );
   }, [parkKey]);
 
@@ -907,6 +1029,11 @@ export function RunView() {
           })
         }
       />
+
+      {/* Issue #754: the pool-empty hold + Resume-now. Sits directly under the
+          usage-limit strip because on a parked run it carries the one action the
+          user came for; it self-hides on every other status. */}
+      <PoolWaitPanel run={run} canSteer={canSteer} onResumed={refreshRun} />
 
       {/* PRD #362 M4: the plain-English run summary — intent, proposed/approved plan, and
           deltas from the original ask. Self-hides until a summary lands (the issue-title

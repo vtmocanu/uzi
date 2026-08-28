@@ -3629,6 +3629,21 @@ export const mockApi = {
     return delay({ run: { ...getRun(id)! } }, 80);
   },
 
+  // Issue #754: resume an auto-lane run parked at `pool_wait` right now. Mirrors the
+  // server: owner-scoped (the demo caller owns every non-other-user run) and
+  // pool_wait-ONLY — a 409 ("run is not waiting for a pooled token") on any other
+  // status, including a run already resumed to `queued` (so a second click 409s, the
+  // idempotent-ish contract the panel's inline "no longer waiting" note relies on).
+  // On success the run moves to `queued`, which is what un-parks it.
+  resumeRunNow: async (id: string) => {
+    const run = getRun(id);
+    if (!run) throw new ApiError(404, "run not found");
+    if (run.status !== "pool_wait")
+      throw new ApiError(409, "run is not waiting for a pooled token");
+    patchRun(id, { status: "queued", updated_at: new Date().toISOString() });
+    return delay({ run: { ...getRun(id)! } }, 80);
+  },
+
   // PRD #320 M6: bump this run to the front of the queue, or clear that override.
   // Mirrors the server: owner-scoped (the demo caller owns every non-other-user run)
   // and QUEUED-ONLY (409 on a non-queued run, exactly like the real endpoint). Clearing
