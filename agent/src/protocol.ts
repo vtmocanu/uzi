@@ -716,6 +716,12 @@ export interface ClaimResponse {
    *  the titles are issue/milestone text anyone who can file an issue can influence —
    *  rendered nonce-fenced by the worker, never as instructions. */
   inflight_targets?: string[];
+  /** PRD #686 M3: true only for a self_improve run whose repo opted into uzi dogfooding
+   *  (repos.fold_improve_uzi_backlog). The worker uses it to select the uzi-vs-generic
+   *  TRUSTED self-improve directive (m4 consumes it). self_improve-only; absent ⇒ generic
+   *  (false), the safe default so an older server or an unflagged repo never gets the uzi
+   *  directive. */
+  self_improve_dogfood?: boolean;
   /** The plan already captured for this run (PRD #35 Decision 6b). The server has
    *  always sent this (`ClaimPayload.PlanMd`); it was simply undeclared here while
    *  nothing read it. A resumed run whose plan was already approved replays THIS

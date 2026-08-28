@@ -2331,6 +2331,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// self_improve-only; every other kind's claim stays byte-identical to today's.
 	if run.Kind == RunKindSelfImprove {
 		payload.InflightTargets = s.inflightTargets(ctx, run)
+		// PRD #686 M3: true only for a repo that opted into uzi dogfooding
+		// (repos.fold_improve_uzi_backlog, read from the same GetRunClaimContextRow as
+		// RepoDevboxOptIn above); false ⇒ the worker runs the generic directive (m4).
+		payload.SelfImproveDogfood = rc.FoldImproveUziBacklog
 	}
 
 	return payload, nil

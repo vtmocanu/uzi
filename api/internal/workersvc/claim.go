@@ -232,6 +232,14 @@ type ClaimPayload struct {
 	// must not appear on the wire; an older worker ignores it.
 	InflightTargets []string `json:"inflight_targets,omitempty"`
 
+	// SelfImproveDogfood is true ONLY for a self_improve run whose repo opted into uzi
+	// dogfooding (repos.fold_improve_uzi_backlog, PRD #686 M1). The worker uses it to
+	// pick the uzi-vs-generic trusted self-improve directive (m4 consumes it). ABSENT/
+	// false ⇒ the worker runs the GENERIC self-improve directive — the safe default, so
+	// an older server or an unflagged repo never gets the uzi directive. self_improve-only
+	// like InflightTargets; omitempty keeps every other kind's claim byte-identical to today.
+	SelfImproveDogfood bool `json:"self_improve_dogfood,omitempty"`
+
 	// Pipeline is the failed-pipeline snapshot for a ci_fix run (PRD #6): the
 	// pipeline the agent diagnoses + fixes, with its failed jobs and log tails.
 	// Present only for kind=ci_fix (omitted for issue runs). Log tails are untrusted
