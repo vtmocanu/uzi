@@ -22684,7 +22684,7 @@ cross-worker park, so uncommitted mid-milestone edits were `fs.rm`'d on the next
 PRD makes uncommitted work durable too, and lets a provably-reviewed run resume without re-planning.
 Terse contract here; `adr/0759-protect-run-work-usage-limit-park.md` is the authoritative record
 (threat model, the ADR #456 / #218 / #209 reconciliations) and PRD #759's Decision Log is the richer
-rationale. The M3 affinity-ceiling raise (30m→2h) is recorded at §916/§1114, not here.
+rationale. The M3 affinity-ceiling raise (30m→2h) is recorded at §40/§49, not here.
 
 - **Marked WIP auto-commit on the park path (M1/M2).** On a `limit_wait` park with a dirty tree, the
   worker commits the working tree to a clearly-marked throwaway `wip(park):` commit

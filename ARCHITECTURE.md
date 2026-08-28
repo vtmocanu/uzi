@@ -622,8 +622,9 @@ chain in the diagram above, with no intervening `running`.
   **same-worker** resume (the tracking-ref leg carries no ancestry test); for
   a **cross-worker** resume it is **best-effort** — a clean `cherry-pick
   --no-commit` of the WIP tree onto the new floor recovers it, a diverged,
-  non-clean tree fails safely (`seededFrom` stays `default`, `wipRecovered`
-  false) rather than forcing it. `WORKER_AFFINITY_CEILING`
+  non-clean tree fails safely (`seededFrom` stays the fallback floor —
+  `default` for an in-flight park, `wipRecovered` false) rather than forcing
+  it. `WORKER_AFFINITY_CEILING`
   (raised 30m→2h) is what makes same-worker the common case: it bounds how
   long a *promoted, still-queued* run stays pinned to an alive-but-busy
   original worker before a peer may steal it — a queue-dwell ceiling, not a

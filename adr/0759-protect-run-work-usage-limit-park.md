@@ -3,7 +3,7 @@
 **Status**: Accepted (PRD #759 M1–M5 implemented on branch `agent/issue-759`; M6 lands the tests, docs, and this ADR)
 **Date**: 2026-08-28
 **Deciders**: Vlad (maintainer — explicitly requested revisiting #218 D6); agent team (architect, coders, reviewers); PRD #759 Decision Log (D1–D5)
-**PRD**: [prds/759-protect-run-work-usage-limit-park.md](../prds/759-protect-run-work-usage-limit-park.md) (GitHub issue [vtmocanu/uzi#759](https://github.com/vtmocanu/uzi/issues/759)) — the PRD carries the milestones, the #685 incident forensics, the two-axis root cause, and the Decision Log; this ADR records the durable invariants a future change would silently break.
+**PRD**: [prds/done/759-protect-run-work-usage-limit-park.md](../prds/done/759-protect-run-work-usage-limit-park.md) (GitHub issue [vtmocanu/uzi#759](https://github.com/vtmocanu/uzi/issues/759)) — the PRD carries the milestones, the #685 incident forensics, the two-axis root cause, and the Decision Log; this ADR records the durable invariants a future change would silently break.
 **Related**: extends [ADR-628](0628-cross-worker-resume-durability.md) (same incident class — M1 affinity liveness, M2 checkpoint-on-park; this PRD reuses that shipped machinery and raises the ceiling it introduced). Consumes the api-brokered checkpoint push of [ADR-122](0122-checkpoint-push-broker.md) (join token, no PAT). Bounded by [ADR-456](0456-rebase-before-finalize-push.md) (why the WIP marker is stripped at adopt, never at finalize). Narrows PRD #209 D4 row 3 via the `plan_source` provenance discriminator #209 D8 introduced.
 
 ## Decision (summary)
@@ -42,7 +42,7 @@ Three recovery legs, by how the adopted tip relates to the new floor:
 
 - **Same-worker** (tracking-ref leg): no ancestry test — the marker is recovered and `reset --soft` even when `main` advanced. Robust.
 - **Cross-worker strict-descendant** (checkpoint leg, marker strictly ahead of floor): recovered by `reset --soft`.
-- **Cross-worker diverged** (`main` advanced during the park, so the marker is not a descendant of the new floor and the strict-descendant guard rejects it): the marker's WIP delta is **cherry-picked `--no-commit`** onto the new floor **only when** the marker's parent is an ancestor of the floor (so no committed milestone is dropped) **and** the pick applies cleanly. Otherwise recovery **reports failure** — the checkpoint is set aside (`seededFrom` stays `default`), not force-applied and not silently dropped.
+- **Cross-worker diverged** (`main` advanced during the park, so the marker is not a descendant of the new floor and the strict-descendant guard rejects it): the marker's WIP delta is **cherry-picked `--no-commit`** onto the new floor **only when** the marker's parent is an ancestor of the floor (so no committed milestone is dropped) **and** the pick applies cleanly. Otherwise recovery **reports failure** — the checkpoint is set aside (`seededFrom` stays the fallback floor, `default` for an in-flight park), not force-applied and not silently dropped.
 
 **The two durable invariants: never silently drop committed work, and never force a conflicted tree.** A marker whose parent carries committed divergence below it, or whose delta does not apply cleanly, is left set aside for a human rather than partially applied. A failed recovery is a first-class outcome that M4 then handles safely, not an error to paper over.
 
@@ -84,4 +84,4 @@ A dropped-session cross-worker resume today re-plans and re-gates (#209 D4 row 3
 
 ## Linked from ARCHITECTURE.md
 
-To be discharged in the M6 docs change (owned by another agent), per the repo convention: add this ADR's link alongside the `limit_wait` / checkpoint / affinity references in ARCHITECTURE.md's Run lifecycle section.
+Linked from ARCHITECTURE.md's Run lifecycle section, alongside the `limit_wait` / checkpoint / affinity references, per the repo convention.
