@@ -123,12 +123,23 @@ func (r Reason) FellBackFromAuto() bool {
 //
 // So the field is gone rather than wired up. A struct member that exists to be
 // plausible is worse than one that is absent.
+// PoolNonEmpty reports whether the user has AT LEAST ONE auto-eligible token,
+// counted regardless of exclusion — a token that is AutoEligible but excluded
+// (the just-parked credential) still sets it true. It is a DISTINCT signal from
+// the `pooled` variable that drives ReasonPoolEmpty, which is set only AFTER the
+// exclude skip: excluding the user's sole pooled token yields ReasonPoolEmpty
+// (pooled stays false) while PoolNonEmpty stays true, letting the caller tell
+// "the user pooled nothing" from "the user pooled tokens but the only one is the
+// credential we must not re-pick" (#754). It is populated on every returned
+// Outcome, including the Picked and the early ReasonPoolEmpty/ReasonPoolStale
+// returns, so the caller can always read it.
 type Outcome struct {
-	Picked   bool
-	SecretID uuid.UUID
-	Headroom int
-	Ranked   int
-	Reason   Reason
+	Picked       bool
+	SecretID     uuid.UUID
+	Headroom     int
+	Ranked       int
+	Reason       Reason
+	PoolNonEmpty bool
 }
 
 // Select ranks a user's candidates and returns the pick (PRD #111 M4).
@@ -175,6 +186,7 @@ func Select(cands []Candidate, exclude uuid.UUID, p Policy, now time.Time) Outco
 	}
 
 	var pooled bool
+	var poolNonEmpty bool
 	var measured []scored
 	var anyEligible bool
 	for _, c := range cands {
@@ -185,6 +197,12 @@ func Select(cands []Candidate, exclude uuid.UUID, p Policy, now time.Time) Outco
 		if !c.AutoEligible {
 			continue
 		}
+		// poolNonEmpty is ORed here — after the pool-membership guard and BEFORE the
+		// exclude skip — so an AutoEligible token that is excluded still counts. This
+		// is the empty-vs-excluded split (#754): distinct from `pooled` below, which
+		// is set after the exclude skip and so answers "is there anything left to
+		// pick". The OR is order-independent by construction.
+		poolNonEmpty = true
 		// PRD #217 M2: the just-parked credential must not be re-picked by the run
 		// resuming from that park. Skipped BEFORE `pooled` is set, so excluding the
 		// user's only pooled token yields ReasonPoolEmpty and the caller resolves the
@@ -208,10 +226,10 @@ func Select(cands []Candidate, exclude uuid.UUID, p Policy, now time.Time) Outco
 		}
 	}
 	if !pooled {
-		return Outcome{Reason: ReasonPoolEmpty}
+		return Outcome{Reason: ReasonPoolEmpty, PoolNonEmpty: poolNonEmpty}
 	}
 	if len(measured) == 0 {
-		return Outcome{Reason: ReasonPoolStale}
+		return Outcome{Reason: ReasonPoolStale, PoolNonEmpty: poolNonEmpty}
 	}
 
 	// D10's best-of-pool. When nothing clears MinHeadroom the candidate set becomes
@@ -268,12 +286,54 @@ func Select(cands []Candidate, exclude uuid.UUID, p Policy, now time.Time) Outco
 
 	pick := set[best]
 	return Outcome{
-		Picked:   true,
-		SecretID: pick.c.SecretID,
-		Headroom: pick.e.Headroom,
-		Ranked:   pick.rank,
-		Reason:   reason,
+		Picked:       true,
+		SecretID:     pick.c.SecretID,
+		Headroom:     pick.e.Headroom,
+		Ranked:       pick.rank,
+		Reason:       reason,
+		PoolNonEmpty: poolNonEmpty,
 	}
+}
+
+// Floor is the LAST-RESORT pool pick (#754): the best pooled candidate even when
+// none is measurable, so a caller can spend a token the user opted in rather than
+// a non-pooled one. It never returns a token that is not AutoEligible.
+//
+// It differs from Select in two ways. Select ranks by headroom and returns nothing
+// when no token is measurable (ReasonPoolStale) or below MinHeadroom-with-no-best;
+// Floor ranks the WHOLE pooled set — including stale, unmeasured, and
+// below-threshold tokens — because a last resort has no headroom to rank on. There
+// being no headroom, the order is tieLess alone: soonest BINDING-window reset, then
+// lowest secret id. That order is total over the per-row-unique secret ids, so the
+// choice is deterministic and order-independent (running Floor over any permutation
+// of cands returns the same id). resetKey returns +∞ for an unmeasured or
+// NULL-reset token, so such tokens fall through to the secret-id leg rather than
+// panicking.
+//
+// exclude is honoured exactly as in Select: a candidate whose SecretID == exclude is
+// skipped, and uuid.Nil (which never equals a real id) excludes nothing. ok is false
+// ONLY when no pooled AutoEligible candidate remains after exclusion — the same
+// condition under which Select reports PoolNonEmpty == false for the same exclude.
+//
+// Floor records no Reason: the caller decides what the recorded reason is.
+func Floor(cands []Candidate, exclude uuid.UUID, now time.Time) (secretID uuid.UUID, ok bool) {
+	var best Candidate
+	for _, c := range cands {
+		if !c.AutoEligible {
+			continue
+		}
+		if exclude != uuid.Nil && c.SecretID == exclude {
+			continue
+		}
+		if !ok || tieLess(c, best) {
+			best = c
+			ok = true
+		}
+	}
+	if !ok {
+		return uuid.Nil, false
+	}
+	return best.SecretID, true
 }
 
 // tieLess is the within-cluster order: soonest reset of the BINDING window, then
