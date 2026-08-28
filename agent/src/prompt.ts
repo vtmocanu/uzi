@@ -470,9 +470,18 @@ function priorWorkNote(prior: PriorWork | undefined): string {
 
 /** The reseed warning: the working tree was rebuilt on this resume, so local-only prior
  *  work is gone and a later correction may reference work that is no longer here. Renders
- *  only when `resumed` is true; a fresh run (no prior tree to lose) adds nothing. */
-function reseedNote(resumed: boolean | undefined): string {
-  if (!resumed) return "";
+ *  only when `resumed` is true; a fresh run (no prior tree to lose) adds nothing.
+ *
+ *  PRD #759 M2/R1: SUPPRESSED when `wipRecovered` is true. This note asserts "any
+ *  UNCOMMITTED changes an earlier attempt made did not survive that rebuild" — FALSE on the
+ *  WIP-recovered path, where the reseed restored the pre-park uncommitted edits to the tree.
+ *  wipRecoveredNote supersedes it there, so the two never co-render and the prompt is never
+ *  self-contradictory. Every non-WIP reseed leg is byte-identical to before. */
+function reseedNote(
+  resumed: boolean | undefined,
+  wipRecovered: boolean | undefined,
+): string {
+  if (!resumed || wipRecovered) return "";
   // Worded to be TRUE on every reseed leg, so it never contradicts a co-rendered
   // priorWorkNote. Uncommitted edits are lost on ANY reseed; committed work survives ONLY
   // where the reseed recovered it (the tracking/checkpoint legs) — on the default-branch
@@ -485,6 +494,26 @@ function reseedNote(resumed: boolean | undefined): string {
     `commits you cannot find, do not assume they are still here — inspect the tree`,
     `(\`git status\`, \`git log\`) and treat its actual state as authoritative before acting`,
     `on it.`,
+  ].join("\n");
+}
+
+/** PRD #759 M2/R1: the WIP-recovery note. On a park the runtime auto-commits uncommitted
+ *  work to a throwaway `wip(park):` marker (M1); on resume the adopt-time `reset --soft`
+ *  restores that content to the working tree UNCOMMITTED (the marker never enters history).
+ *  A COLD resumed lead (its SDK session lost cross-worker) has no memory of which plan steps
+ *  it had done, so it must be told the dirty tree is an interrupted mid-edit to reconcile
+ *  against the plan — not finished, reviewed work. Supersedes reseedNote (which is suppressed
+ *  when wipRecovered is true), so the prompt never both claims the uncommitted changes were
+ *  lost AND that they were recovered. Renders only when `wipRecovered` is true. */
+function wipRecoveredNote(wipRecovered: boolean | undefined): string {
+  if (!wipRecovered) return "";
+  return [
+    `IMPORTANT — this run was picked up again after an interruption, and its working tree`,
+    `carries UNCOMMITTED changes recovered from an earlier attempt that was interrupted`,
+    `mid-edit. Do NOT assume those edits are complete or reviewed — they are a partial,`,
+    `unreviewed snapshot. Before continuing, inspect them (\`git status\`, \`git diff\`),`,
+    `reconcile them against the plan, and verify which plan steps are already done and which`,
+    `remain, so you neither redo finished work nor build on a half-applied change.`,
   ].join("\n");
 }
 
@@ -873,6 +902,14 @@ export interface ImplementPromptInput {
    *  against the destroyed tree cannot be acted on as if that work is still present.
    *  Absent/false ⇒ no note (a fresh run had no prior tree to lose). See reseedNote. */
   resumed?: boolean;
+  /** PRD #759 M2/R1: the reseed recovered an uncommitted WIP snapshot (a wip(park): marker
+   *  reset --soft back to the tree at adopt time), so the working tree carries UNCOMMITTED
+   *  mid-edit changes. FIRST TURN ONLY, like reseedNote. Drives the wip-recovery note so a
+   *  cold resumed lead inspects/reconciles the dirty tree against the plan instead of taking
+   *  the recovered edits as complete or reviewed — and it SUPERSEDES reseedNote, whose
+   *  "uncommitted changes did not survive" wording is false on this path. Absent/false ⇒ no
+   *  note (and reseedNote renders as before). See wipRecoveredNote / reseedNote. */
+  wipRecovered?: boolean;
   /** The current implement⇄review iteration (1-based). */
   iteration: number;
   /** PRD #209 (Decision A): this run's plan was supplied by the user at create time,
@@ -1002,7 +1039,13 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
   // together — "the tree was rebuilt at the start of this attempt" then "your branch was
   // created at <base>". A queued follow-up cannot land on turn 1 (it drains at iteration
   // end), so this is in context by the time one arrives. Empty on a fresh run ⇒ nothing added.
-  const reseed = input.first ? reseedNote(input.resumed) : "";
+  // PRD #759 M2/R1: on the WIP-recovered path the wip note supersedes reseedNote (the two
+  // are mutually exclusive — reseedNote returns "" when wipRecovered is true), telling a cold
+  // resumed lead to treat the recovered uncommitted edits as a mid-edit to reconcile, not
+  // finished work. First turn only, placed with reseedNote so it reads before baseNote.
+  const wipNote = input.first ? wipRecoveredNote(input.wipRecovered) : "";
+  if (wipNote) lines.push("", wipNote);
+  const reseed = input.first ? reseedNote(input.resumed, input.wipRecovered) : "";
   if (reseed) lines.push("", reseed);
   // The base commit, first turn only — this is the phase where the lead delegates a
   // "review the diff" task to a subagent, which is where the wrong diff spec was observed.

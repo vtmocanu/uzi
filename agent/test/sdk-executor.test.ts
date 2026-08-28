@@ -3105,6 +3105,31 @@ describe("embedSeededPlan — the seeded-plan-body gate (PRD #209 M2)", () => {
   it("refuses a NON-seeded session-less pre-approved run (pins the defense-in-depth term)", () => {
     assert.equal(embedSeededPlan({ preApproved: true, seeded: false, hasSession: false }), false);
   });
+
+  // PRD #759 M4 (R3 / the #209 M2 gap): a dropped-session cross-worker resume of a
+  // provably-reviewed approved run is NOT seeded, yet its plan body must still reach the
+  // first implement turn — otherwise seededPlanBody stays undefined and the model
+  // implements from the ISSUE, not the reviewed plan. The `reviewedResume` term carries it.
+  it("M4: embeds for a session-less reviewed-resume pre-approved run (plan body reaches the turn)", () => {
+    assert.equal(
+      embedSeededPlan({ preApproved: true, seeded: false, reviewedResume: true, hasSession: false }),
+      true,
+    );
+  });
+  it("M4: does NOT embed for a reviewed resume that still has a session (byte-identical to the seeded-resume behavior)", () => {
+    // The `!hasSession` guard is unchanged: a resume that kept its session already has the
+    // plan in it, exactly like a seeded RESUME (assert 'does NOT embed for a seeded RESUME').
+    assert.equal(
+      embedSeededPlan({ preApproved: true, seeded: false, reviewedResume: true, hasSession: true }),
+      false,
+    );
+  });
+  it("M4: reviewedResume:false, seeded:false leaves it unembedded (no regression on the row-3 re-plan case)", () => {
+    assert.equal(
+      embedSeededPlan({ preApproved: true, seeded: false, reviewedResume: false, hasSession: false }),
+      false,
+    );
+  });
 });
 
 // --- Plan-turn write-tool subtraction (#203) ----------------------------------

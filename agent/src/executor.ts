@@ -210,6 +210,24 @@ export interface RunContext {
    *  and the seeded implement-prompt opening (Decision A). Absent/false ⇒ today's
    *  behaviour, byte-for-byte. */
   seeded?: boolean;
+  /** PRD #759 M4: this is a dropped-session cross-worker resume of a PROVABLY-REVIEWED
+   *  approved run (plan_approved && plan_source==='agent' && plan_md, recovery succeeded),
+   *  so the executor skips the re-plan/re-gate and implements from the persisted plan —
+   *  narrowing #209 D4 row 3, which otherwise re-plans a dropped-session non-seeded run.
+   *  Set by the RUNNER (the only layer that knows sessionId was cleared and whether the
+   *  reseed recovered a tree). It both relaxes the preApproved session guard and, crucially,
+   *  extends the embedSeededPlan gate so the plan BODY reaches the first implement turn
+   *  (a bare planApproved flip leaves seededPlanBody undefined and the model falls back to
+   *  the issue — the #209 M2 gap). Absent/false ⇒ today's behaviour, byte-for-byte. */
+  reviewedPlanResume?: boolean;
+  /** PRD #759 M2: the reseed recovered an uncommitted WIP snapshot (a wip(park): marker
+   *  reset --soft back to the working tree at adopt time), so the tree carries uncommitted
+   *  mid-edit changes rather than a clean checkout. Set by the RUNNER from the runner clone.
+   *  Forwarded to the FIRST implement prompt so a cold resumed lead inspects and reconciles
+   *  the dirty tree against the plan instead of assuming the recovered edits are complete or
+   *  reviewed (R1), and it supersedes the reseedNote (whose "uncommitted changes did not
+   *  survive" wording is false on this path). Absent/false ⇒ no note. */
+  wipRecovered?: boolean;
   /** The already-approved plan text to seed the implement loop with (PRD #35). Only
    *  meaningful with `planApproved`; the executor refuses to skip the gate without
    *  it, because an empty plan would enter implement with no instructions. */

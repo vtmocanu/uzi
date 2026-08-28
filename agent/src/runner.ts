@@ -859,6 +859,27 @@ export class RunRunner {
       // human-approved. A fresh run's gate closure overwrites this precisely.
       let ciFixHumanApproved = (claim.auto_approve ?? false) !== true;
 
+      // PRD #759 M4: resume a provably-reviewed approved run without re-plan/re-gate on a
+      // dropped-session cross-worker resume. plan_source==='agent' is a POSITIVE allowlist
+      // (worker-authored-but-gated; #209 D8 makes plan_source track plan_md provenance) — do
+      // NOT write `!== "seeded"`, which fails OPEN on any future unreviewed provenance value.
+      // humanApproved is computed FRESH from claim.auto_approve here (NOT reused from the
+      // mutable ciFixHumanApproved, which the gate closure reassigns): the server clears
+      // auto_approve when a run parks at the plan gate, so auto_approve!==true ⟺ a human saw
+      // the gate. recoveryFailed ⟺ the reseed recovered no tree (empty clone). The re-gate
+      // fallback (FLAG D) needs BOTH: an autopilot recovery-failed resume has no human at the
+      // gate to protect, but a human-approved recovery-failed run RE-GATES so the human
+      // notices the lost tree — #209's loss-detection gate, kept exactly where #209 put it.
+      const humanApproved = (claim.auto_approve ?? false) !== true; // false ⟺ a human saw the gate
+      const recoveryFailed = runnerClone.seededFrom === "default"; // empty tree / recovery failed
+      const m4ResumeReviewedPlan =
+        (claim.plan_approved ?? false) &&
+        claim.plan_source === "agent" &&
+        !!claim.plan_md?.trim() &&
+        !sessionId &&
+        !seeded && // the D4-row-3 dropped-session case
+        !(humanApproved && recoveryFailed); // re-gate a human-approved run that lost its tree
+
       const ctx: RunContext = {
         runId,
         kind: claim.kind ?? "issue",
@@ -921,7 +942,17 @@ export class RunRunner {
         // run whose session is gone — the one case (D4 row 3) where it must re-plan. A
         // seeded run (D4 row 2) is approved with no session by construction, and that is
         // fine because there was never a session to lose.
-        planApproved: (claim.plan_approved ?? false) && (!!sessionId || seeded),
+        planApproved:
+          (claim.plan_approved ?? false) &&
+          (!!sessionId || seeded || m4ResumeReviewedPlan),
+        // PRD #759 M4: a provably-reviewed cross-worker resume skips the re-gate and
+        // embeds the persisted plan body on the implement turn. Drives the relaxed
+        // preApproved session guard and the embedSeededPlan reviewedResume term.
+        reviewedPlanResume: m4ResumeReviewedPlan,
+        // PRD #759 M2: the reseed recovered an uncommitted WIP snapshot (a wip(park):
+        // marker reset --soft back to the tree), so a cold resumed lead is told to treat
+        // the dirty tree as mid-edit and reconcile it against the plan (R1).
+        wipRecovered: runnerClone.wipRecovered,
         // PRD #209: the executor relaxes its own session guard for a seeded run and
         // emits the "plan supplied externally" feed line off this.
         seeded,

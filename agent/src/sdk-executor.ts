@@ -978,9 +978,17 @@ export class SdkExecutor implements Executor {
       // skipped is asking a human to approve a plan they already own; the alternative for
       // a seeded run is not "more oversight" but a run that parks unattended and can die
       // on REASON_NO_PLAN.
+      // PRD #759 M4: reviewedPlanResume relaxes the session guard the same way `seeded`
+      // does — a dropped-session cross-worker resume of a provably-reviewed approved run
+      // has no session by construction (the transcript lived on the original worker), so
+      // "no session" is its normal state, not a lost one. The runner sets it only when
+      // plan_approved && plan_source==='agent' && plan_md && recovery succeeded, so an
+      // unreviewed or recovery-failed human-approved run never reaches here true.
       const preApproved =
         ctx.planApproved === true &&
-        (!!ctx.sessionId || ctx.seeded === true) &&
+        (!!ctx.sessionId ||
+          ctx.seeded === true ||
+          ctx.reviewedPlanResume === true) &&
         !!ctx.approvedPlan?.trim();
 
       // Hoisted above the skip so the post-gate code (the ci_fix not_code check, the
@@ -1442,6 +1450,9 @@ export class SdkExecutor implements Executor {
       const seededPlanBody = embedSeededPlan({
         preApproved,
         seeded: ctx.seeded === true,
+        // PRD #759 M4: a provably-reviewed cross-worker resume has no session carrying the
+        // plan either, so the plan body must ride the implement prompt (FLAG C / R3).
+        reviewedResume: ctx.reviewedPlanResume === true,
         hasSession: !!ctx.sessionId,
       })
         ? approvedPlan
@@ -1580,6 +1591,10 @@ export class SdkExecutor implements Executor {
             // written against the old tree is not acted on as if that work survived. The
             // reseedNote gate is first-turn-only, so later turns are unchanged.
             resumed: ctx.resumed,
+            // PRD #759 M2/R1: the reseed recovered an uncommitted WIP snapshot, so the
+            // first implement turn tells a cold resumed lead to reconcile the dirty tree
+            // against the plan (and supersedes the now-false reseedNote). First turn only.
+            wipRecovered: ctx.wipRecovered,
             iteration,
             // PRD #209 (Decision A): a seeded run's first-turn opening says the user
             // supplied the plan, not that it was "approved". First turn only (gated
@@ -2538,20 +2553,33 @@ export function resolveLeadModel(
  * and a non-preApproved run never gets here.
  *
  * The `seeded` term is DEFENSE IN DEPTH and today REDUNDANT: `preApproved` already implies
- * `(session || seeded)`, so `preApproved && !session` implies `seeded`. It is kept — and
- * this predicate is EXTRACTED from run() — precisely so the currently-unreachable
- * `{preApproved, !seeded, !session}` combination is testable independently of how
- * `preApproved` is derived. No executor-driven test can observe the term's removal (that
- * state cannot occur through the real `preApproved`); a direct unit test on this function
- * can, so if a future change ever decoupled `preApproved` from `(session || seeded)` the
- * guard that refuses to hand a NON-seeded run an authoritative <plan> block stays pinned.
+ * `(session || seeded || reviewedResume)`, so `preApproved && !session` implies
+ * `(seeded || reviewedResume)`. It is kept — and this predicate is EXTRACTED from run() —
+ * precisely so the currently-unreachable `{preApproved, !seeded, !reviewedResume, !session}`
+ * combination is testable independently of how `preApproved` is derived. No executor-driven
+ * test can observe the terms' removal (that state cannot occur through the real
+ * `preApproved`); a direct unit test on this function can, so if a future change ever
+ * decoupled `preApproved` from `(session || seeded || reviewedResume)` the guard that
+ * refuses to hand an UNREVIEWED non-seeded run an authoritative <plan> block stays pinned.
+ *
+ * PRD #759 M4 adds `reviewedResume`: a dropped-session cross-worker resume of a
+ * provably-reviewed approved run (row-3 narrowing) likewise has no session carrying the
+ * plan, so its plan BODY must ride the first implement prompt too — without this the model
+ * silently falls back to the issue (the #209 M2 gap, FLAG C). The `!hasSession` guard is
+ * UNCHANGED: a seeded/reviewed RESUME that still has a session already has the plan in it.
+ * `reviewedResume` is optional (absent ⇒ false) so existing callers are byte-identical.
  */
 export function embedSeededPlan(args: {
   preApproved: boolean;
   seeded: boolean;
   hasSession: boolean;
+  reviewedResume?: boolean;
 }): boolean {
-  return args.preApproved && args.seeded && !args.hasSession;
+  return (
+    args.preApproved &&
+    (args.seeded || args.reviewedResume === true) &&
+    !args.hasSession
+  );
 }
 
 /**
