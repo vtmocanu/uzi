@@ -2049,6 +2049,19 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		}
 	}
 
+	// PRD #700 M2: replay the structured MR review-comments snapshot captured at
+	// mr_rework run creation. A malformed column degrades to nil-and-log rather than
+	// failing the claim, exactly like the issue-comments decode above.
+	var reviewComments *ReviewCommentsSnapshot
+	if len(run.ReviewComments) > 0 {
+		var snap ReviewCommentsSnapshot
+		if err := json.Unmarshal(run.ReviewComments, &snap); err != nil {
+			slog.Error("workersvc: decode run review comments", "run_id", run.ID, "error", err)
+		} else {
+			reviewComments = &snap
+		}
+	}
+
 	// Run-summary model resolution is user-value-wins (PRD #362 Decision 8), the same
 	// shape as the judge model in assembleJudgeClaim but delivered on this ISSUE-run
 	// claim: the run owner's per-user summary_model overrides the instance
@@ -2089,7 +2102,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		IssueDescription: run.IssueDescription,
 		// PRD #381: the structured comments snapshot, decoded above. omitempty keeps a
 		// comment-less run's claim byte-identical to today's.
-		IssueComments:  issueComments,
+		IssueComments: issueComments,
+		// PRD #700 M2: the MR review-comments snapshot, decoded above. omitempty keeps
+		// every non-mr_rework run's claim byte-identical to today's wire.
+		ReviewComments: reviewComments,
 		Status:         run.Status,
 		Pipeline:       pipeline,
 		Branch:         textPtr(run.Branch),
@@ -4671,6 +4687,10 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		// nil (→ NULL) for a non-issue kind, a comment-less issue, an unknown bot id
 		// (D9), or when no forge builder is wired (tests).
 		IssueComments: issueCommentsJSON,
+		// PRD #700 M2: issue runs never carry MR review comments — always NULL here.
+		// The mr_rework create path (M3's CreateAutoMRReworkRun) fetches the MR review
+		// snapshot via fetchReviewCommentsSnapshot and populates this itself.
+		ReviewComments: nil,
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

@@ -199,6 +199,11 @@ func TestGitHubListMergeRequestComments(t *testing.T) {
 	if comments[0].Body != "top-level note" || comments[0].ReviewState != ReviewCommentSummary {
 		t.Errorf("comment[0] should be the top-level note: %+v", comments[0])
 	}
+	// ID is populated from the REST databaseId of each source (PRD #700 (a) — the
+	// high-water anchor M3 keys on): top-level note 901, review summary 6001, inline 5001.
+	if comments[0].ID != 901 {
+		t.Errorf("top-level note ID = %d, want the REST databaseId 901", comments[0].ID)
+	}
 	if comments[0].ReplyID != "" || comments[0].ResolveID != "" {
 		t.Errorf("top-level note should carry no thread anchors: %+v", comments[0])
 	}
@@ -209,9 +214,15 @@ func TestGitHubListMergeRequestComments(t *testing.T) {
 	if summary.HeadSHA != "headsha999" {
 		t.Errorf("review summary HeadSHA = %q, want headsha999", summary.HeadSHA)
 	}
+	if summary.ID != 6001 {
+		t.Errorf("review summary ID = %d, want the REST databaseId 6001", summary.ID)
+	}
 	inline := comments[2]
 	if inline.Body != "guard nil here" || inline.ReviewState != ReviewCommentInline {
 		t.Fatalf("comment[2] should be the inline review comment: %+v", inline)
+	}
+	if inline.ID != 5001 {
+		t.Errorf("inline ID = %d, want the REST databaseId 5001", inline.ID)
 	}
 	// The two-anchor stitch — the whole point of the GitHub read.
 	if inline.ReplyID != "5001" {

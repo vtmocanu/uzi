@@ -885,7 +885,7 @@ func (f *forgejo) ListMergeRequestComments(ctx context.Context, projectID, mrIID
 			if cm == nil {
 				continue
 			}
-			mc := MRComment{Body: cm.Body, CreatedAt: cm.Created, ReviewState: ReviewCommentSummary}
+			mc := MRComment{ID: cm.ID, Body: cm.Body, CreatedAt: cm.Created, ReviewState: ReviewCommentSummary}
 			if cm.Poster != nil {
 				mc.AuthorForgeUserID = cm.Poster.ID
 				mc.AuthorUsername = cm.Poster.UserName
@@ -918,7 +918,7 @@ func (f *forgejo) ListMergeRequestComments(ctx context.Context, projectID, mrIID
 				continue
 			}
 			if r.Body != "" {
-				mc := MRComment{Body: r.Body, CreatedAt: r.Submitted, HeadSHA: r.CommitID, ReviewState: ReviewCommentSummary}
+				mc := MRComment{ID: r.ID, Body: r.Body, CreatedAt: r.Submitted, HeadSHA: r.CommitID, ReviewState: ReviewCommentSummary}
 				if r.Reviewer != nil {
 					mc.AuthorForgeUserID = r.Reviewer.ID
 					mc.AuthorUsername = r.Reviewer.UserName
@@ -934,6 +934,7 @@ func (f *forgejo) ListMergeRequestComments(ctx context.Context, projectID, mrIID
 					continue
 				}
 				mc := MRComment{
+					ID:          rc.ID,
 					Body:        rc.Body,
 					CreatedAt:   rc.Created,
 					HeadSHA:     rc.CommitID,

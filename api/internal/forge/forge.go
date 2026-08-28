@@ -315,6 +315,12 @@ const (
 // discussion id; on Forgejo ReplyID is the review-comment id and ResolveID is
 // empty (Forgejo cannot resolve — see ErrResolveUnsupported).
 type MRComment struct {
+	// ID is the forge's monotonic numeric comment/note id: monotonic within one
+	// MR's comment stream; the high-water mark (PRD #700 M3) keys on it. NOTE:
+	// GitHub sources inline-comment, issue-comment and review ids from distinct
+	// sequences, so cross-type ordering is best-effort — M3 must treat the id as an
+	// advance-only high-water, not a total order.
+	ID                int64     // monotonic forge comment/note id (see note above)
 	AuthorForgeUserID int64     // stable forge user id of the comment author
 	AuthorUsername    string    // author login, may be empty
 	Body              string    // comment body (untrusted)

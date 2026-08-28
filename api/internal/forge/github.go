@@ -781,6 +781,7 @@ func (g *github) ListMergeRequestComments(ctx context.Context, projectID, mrIID 
 				continue
 			}
 			mc := MRComment{
+				ID:          c.GetID(), // REST databaseId of the issue comment
 				Body:        c.GetBody(),
 				CreatedAt:   c.GetCreatedAt().Time,
 				ReviewState: ReviewCommentSummary,
@@ -818,6 +819,7 @@ func (g *github) ListMergeRequestComments(ctx context.Context, projectID, mrIID 
 				continue
 			}
 			mc := MRComment{
+				ID:          c.GetID(), // REST databaseId of the inline review comment
 				Body:        c.GetBody(),
 				CreatedAt:   c.GetCreatedAt().Time,
 				HeadSHA:     c.GetCommitID(),
@@ -867,6 +869,7 @@ func (g *github) ListMergeRequestComments(ctx context.Context, projectID, mrIID 
 				continue
 			}
 			mc := MRComment{
+				ID:          r.GetID(), // REST databaseId of the review summary
 				Body:        r.GetBody(),
 				CreatedAt:   r.GetSubmittedAt().Time,
 				HeadSHA:     r.GetCommitID(),

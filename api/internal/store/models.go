@@ -438,6 +438,7 @@ type Run struct {
 	PlanChangedFiles      []string           `json:"plan_changed_files"`
 	ScopeCeiling          pgtype.Int4        `json:"scope_ceiling"`
 	StatusSince           pgtype.Timestamptz `json:"status_since"`
+	ReviewComments        []byte             `json:"review_comments"`
 }
 
 type RunMessage struct {

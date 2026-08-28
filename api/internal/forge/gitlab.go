@@ -554,6 +554,7 @@ func (g *gitLab) ListMergeRequestComments(ctx context.Context, projectID, mrIID 
 					createdAt = *n.CreatedAt
 				}
 				c := MRComment{
+					ID:                n.ID,
 					AuthorForgeUserID: n.Author.ID,
 					AuthorUsername:    n.Author.Username,
 					Body:              n.Body,

@@ -51,6 +51,43 @@ test("claim wire contract: worker parses the server's skill shape", () => {
     },
   ]);
 
+  // PRD #700 M2: the bot-self-filtered snapshot of an MR's review comments rides an
+  // mr_rework claim. The golden carries one inline comment with truncated set, so the
+  // worker's parse of the whole snapshot (comment fields incl. the anchors + monotonic
+  // id, plus the truncated flag) is pinned across the language boundary; typing the
+  // parse as ClaimResponse also makes `npm run typecheck` fail if review_comments is
+  // dropped from protocol.ts.
+  assert.equal(claim.review_comments?.truncated, true);
+  assert.deepEqual(claim.review_comments?.comments, [
+    {
+      id: 5001,
+      author_username: "coderabbit",
+      author_forge_user_id: 43,
+      created_at: "2026-07-04T10:00:00Z",
+      body: "guard nil here",
+      path: "api/x.go",
+      line: 42,
+      reply_id: "5001",
+      resolve_id: "PRRT_thread1",
+      head_sha: "headsha999",
+      review_state: "inline",
+    },
+  ]);
+
+  // The omitempty contract: a claim WITHOUT the key leaves review_comments undefined
+  // (the Go side omits it when nil — the non-vacuous key-presence check the milestone
+  // requires, mirrored here on the parse side). Build a claim object without the key
+  // and confirm `"review_comments" in parsed` is false.
+  const withoutReview: Record<string, unknown> = {
+    ...(claim as unknown as Record<string, unknown>),
+  };
+  delete withoutReview.review_comments;
+  assert.equal("review_comments" in withoutReview, false);
+  assert.equal(
+    (withoutReview as Partial<ClaimResponse>).review_comments,
+    undefined,
+  );
+
   // PRD #19's autopilot flag rides the same claim shape (post-landing merge): the
   // worker must still parse the skills fields alongside it.
   assert.equal(claim.auto_approve, true);
