@@ -455,6 +455,12 @@ type Store interface {
 	// second park.
 	SetRunLimitWait(ctx context.Context, arg store.SetRunLimitWaitParams) (int64, error)
 	PromoteLimitWaitRuns(ctx context.Context, now pgtype.Timestamptz) ([]store.PromoteLimitWaitRunsRow, error)
+	// The reactive-resume pass (PRD #754 M5): ListPoolWaitRuns is the pool_wait worklist
+	// (oldest first), and PromotePoolWaitRun promotes ONE held run (pool_wait → queued),
+	// owner-scoped so the sweeper passes each run's own user_id and resume-now cannot
+	// promote a foreign run.
+	ListPoolWaitRuns(ctx context.Context) ([]store.ListPoolWaitRunsRow, error)
+	PromotePoolWaitRun(ctx context.Context, arg store.PromotePoolWaitRunParams) (int64, error)
 	MarkRunFailedByID(ctx context.Context, arg store.MarkRunFailedByIDParams) (int64, error)
 	CancelRunServerSide(ctx context.Context, arg store.CancelRunServerSideParams) (int64, error)
 	// CancelRunByWorker is the LIVE-worker cancel transition (PRD #503 M1). SetState's
@@ -5765,6 +5771,11 @@ type SweepResult struct {
 	// partial index this reads covers only parked runs, a set that is empty on a
 	// healthy instance.
 	LimitPromoted int64
+	// PoolResumed is the number of runs this pass reactively resumed from pool_wait to
+	// queued because their owner's token pool became non-empty (PRD #754 M5). At most
+	// ONE per distinct held-run owner per tick (the anti-stampede stagger), so on a
+	// busy resume it climbs one owner at a time across ticks. Normally 0.
+	PoolResumed int64
 }
 
 // Sweep enforces the liveness rules the workers cannot: stale workers go offline
@@ -5914,6 +5925,15 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		s.publishSwept(r.ID, r.Status)
 	}
 
+	// Reactive pool resume (PRD #754 M5): a pool_wait hold is released the moment its
+	// owner's Anthropic token pool becomes non-empty again. Scoped to pool_wait ONLY —
+	// never folded into PromoteLimitWaitRuns, whose clock-based predicate is a different
+	// hold. Placed here for the same reason the limit promote is: transitions first, a
+	// run resumed before the detector runs is health-visible in THIS tick.
+	if res.PoolResumed, err = s.resumePoolWaitRuns(ctx); err != nil {
+		return res, fmt.Errorf("resume pool-wait runs: %w", err)
+	}
+
 	// Bound the in-process persistence-failure tracker (PRD #108 M4). This is the
 	// memory bound for the one case no other eviction path reaches: a run whose
 	// worker vanished without the run ever reaching terminal. Pruned BEFORE the
@@ -5934,6 +5954,79 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// belt-and-braces rather than the mechanism.
 	res.AutoStopped = s.autoStopWedgedRuns(ctx, now)
 	return res, nil
+}
+
+// resumePoolWaitRuns is the reactive half of the pool_wait lifecycle (PRD #754 M5): it
+// promotes held runs back to 'queued' once their owner's Anthropic token pool is
+// non-empty again. Returns the number promoted this tick and fans each out through
+// publishSwept, exactly like the limit promote above.
+//
+// 🔴 AT MOST ONE HELD RUN PER OWNER PER TICK. The live case had three runs held on one
+// user's single token; promoting all of them the instant a token pools would thundering-
+// herd that one credential — every resumed run would re-claim, and all but one would find
+// the pool empty again and re-hold, a churn the hold exists to avoid. So the pass promotes
+// only the OLDEST held run for each user with a now-non-empty pool, and lets the next tick
+// (~15s later) take the next one once the first has actually claimed a token. ListPoolWaitRuns
+// returns oldest-first, so the FIRST run seen for a user is the one to promote.
+//
+// The candidate query is issued at most once per distinct held-run owner per tick (users
+// are deduped as the list is walked), bounding its cost regardless of how many runs a user
+// holds. A per-user candidate-query error is logged and skipped — one user's read fault must
+// not fail the whole sweep — mirroring how the sweep treats its other best-effort sub-steps.
+// A ListPoolWaitRuns error, by contrast, is returned to fail the pass, matching the limit
+// promote's own read.
+func (s *Service) resumePoolWaitRuns(ctx context.Context) (int64, error) {
+	held, err := s.q.ListPoolWaitRuns(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("list pool-wait runs: %w", err)
+	}
+	// seen records users already handled this tick: the first (oldest) held run for a user
+	// is the one considered, and no user's candidate pool is read twice.
+	seen := make(map[uuid.UUID]bool, len(held))
+	var resumed int64
+	for _, r := range held {
+		if seen[r.UserID] {
+			continue
+		}
+		seen[r.UserID] = true
+
+		rows, err := s.q.ListAutoSelectCandidates(ctx, r.UserID)
+		if err != nil {
+			// Best-effort: skip this user, keep sweeping the rest. The run stays held and
+			// the next tick retries it.
+			slog.Error("sweeper: pool-resume candidate read failed", "user", r.UserID, "error", err)
+			continue
+		}
+		// The pool is "non-empty / resumable" iff at least one candidate is AutoEligible —
+		// the same condition autoselect.Floor uses to decide it has a pooled token to spend.
+		poolNonEmpty := false
+		for _, row := range rows {
+			if autoselectrow.FromCandidateRow(row).AutoEligible {
+				poolNonEmpty = true
+				break
+			}
+		}
+		if !poolNonEmpty {
+			continue
+		}
+		promoted, err := s.q.PromotePoolWaitRun(ctx, store.PromotePoolWaitRunParams{ID: r.ID, UserID: r.UserID})
+		if err != nil {
+			// Same best-effort stance: a single promote fault does not sink the sweep.
+			slog.Error("sweeper: pool-resume promote failed", "run", r.ID, "user", r.UserID, "error", err)
+			continue
+		}
+		if promoted == 0 {
+			// The run moved out of pool_wait between the list and the promote (e.g. a
+			// concurrent cancel). Nothing to resume; do not broadcast a transition that
+			// did not happen.
+			continue
+		}
+		resumed++
+		// Same fan-out as the limit promote: broadcast the queued transition so live
+		// browsers and the board's In-Progress column follow the resume.
+		s.publishSwept(r.ID, "queued")
+	}
+	return resumed, nil
 }
 
 // publishSwept fans a sweeper-driven run transition out to the same seams a

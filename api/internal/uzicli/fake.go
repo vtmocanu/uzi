@@ -142,6 +142,14 @@ type FakeClient struct {
 	PriorityRun          apitypes.RunDTO
 	SetRunPriorityErr    error
 
+	// ResumeRunNow capture (PRD #754 M5): the run id `uzi run resume-now` targeted.
+	// ResumedRun is the canned success reply; ResumeRunNowErr wins over the blanket Err so
+	// a test can model the non-held 409 (ExitConflict) precisely while the capture still
+	// proves the write was reached.
+	LastResumeRunID string
+	ResumedRun      apitypes.RunDTO
+	ResumeRunNowErr error
+
 	// SelfMeters drives SelfRateLimits (PRD #111 D23): the caller's own per-token
 	// meters, each carrying the server-computed auto-selection status.
 	SelfMeters []apitypes.TokenRateLimitDTO
@@ -480,6 +488,20 @@ func (f *FakeClient) SetRunPriority(_ context.Context, id string, expedite bool)
 		return apitypes.RunDTO{}, f.Err
 	}
 	return f.PriorityRun, nil
+}
+
+// ResumeRunNow records the run id it was called with and returns the canned run.
+// ResumeRunNowErr wins over the blanket Err — mirroring SetRunPriorityErr — so a test can
+// model the non-held 409 on the write while the capture still proves it was REACHED.
+func (f *FakeClient) ResumeRunNow(_ context.Context, id string) (apitypes.RunDTO, error) {
+	f.LastResumeRunID = id
+	if f.ResumeRunNowErr != nil {
+		return apitypes.RunDTO{}, f.ResumeRunNowErr
+	}
+	if f.Err != nil {
+		return apitypes.RunDTO{}, f.Err
+	}
+	return f.ResumedRun, nil
 }
 
 func (f *FakeClient) SelfRateLimits(context.Context) ([]apitypes.TokenRateLimitDTO, error) {

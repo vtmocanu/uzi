@@ -791,7 +791,33 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 	expedite.Flags().Bool("clear", false, "clear the manual expedite (undo), returning the run to its kind default priority")
 
-	cmd.AddCommand(list, get, logs, wait, review, create, approve, reject, revise, cancel, stop, scope, followUp, answer, inputs, expedite)
+	resumeNow := &cobra.Command{
+		Use:   "resume-now <run-id>",
+		Short: "Resume a run held waiting for a pooled Anthropic token, without waiting for the sweeper",
+		Long: "Resume ONE run held in `pool_wait` — an `auto` run parked because its owner's Anthropic " +
+			"token pool was empty when it claimed (PRD #754). It flips the hold straight to `queued` " +
+			"instead of waiting up to a sweeper tick for the reactive pass to notice a token was pooled.\n\n" +
+			"A run that is NOT held is a 409 (exit 5); a foreign or unknown run is a 404 (exit 4). No " +
+			"token is spent and nothing is written to the forge — it only releases the hold.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			run, err := c.ResumeRunNow(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(run)
+			}
+			return renderRunDetail(p, run)
+		},
+	}
+
+	cmd.AddCommand(list, get, logs, wait, review, create, approve, reject, revise, cancel, stop, scope, followUp, answer, inputs, expedite, resumeNow)
 	return cmd
 }
 

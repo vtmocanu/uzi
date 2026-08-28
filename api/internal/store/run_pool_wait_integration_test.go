@@ -241,4 +241,164 @@ func TestRunPoolWaitQueriesLiveDB(t *testing.T) {
 			t.Fatalf("status = %q after cancel, want cancelled", got)
 		}
 	})
+
+	// ── PRD #754 M5 GUARD PARITY: a reordered `running` report must not un-hold a run ──
+	// The SetRunRunning guard gained `AND status <> 'pool_wait'` alongside limit_wait's.
+	// Executing it against a held run proves the guard holds (0-row no-op, status
+	// unchanged) — the changed query is exercised, not merely regenerated.
+	t.Run("SetRunRunning is a no-op on a held run", func(t *testing.T) {
+		id, _ := newClaimed(t)
+		if rows := hold(t, id, workerID); rows != 1 {
+			t.Fatalf("hold: rows = %d, want 1", rows)
+		}
+		rows, err := q.SetRunRunning(ctx, store.SetRunRunningParams{ID: id, WorkerID: workerID})
+		if err != nil {
+			t.Fatalf("SetRunRunning on a pool_wait run: %v", err)
+		}
+		if rows != 0 {
+			t.Fatalf("SetRunRunning rows = %d, want 0 — a reordered pre-hold `running` report "+
+				"must not un-hold a pool_wait run (guard parity with limit_wait)", rows)
+		}
+		if got := read(t, id).status; got != "pool_wait" {
+			t.Fatalf("status = %q after a `running` report, want pool_wait UNCHANGED", got)
+		}
+	})
+}
+
+// Live-DB coverage for PRD #754 M5's two new queries — PromotePoolWaitRun (the
+// owner-scoped resume used by both the reactive sweeper pass and `uzi run resume-now`)
+// and ListPoolWaitRuns (the oldest-first reactive worklist). EXECUTION is the point: a
+// green `sqlc generate` is not evidence either statement runs against Postgres.
+//
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres.
+func TestRunPoolWaitResumeQueriesLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via the store integration runner for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	userID, otherID, connID, repoID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		userID, fmt.Sprintf("poolresume-%s@e2e", userID))
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		otherID, fmt.Sprintf("poolresume-other-%s@e2e", otherID))
+	mustExec(ctx, t, pool,
+		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})
+	mustExec(ctx, t, pool,
+		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		 VALUES ($1, $2, 1, 'g/r', 'https://forge.e2e/g/r', 'main', true)`, repoID, connID)
+
+	var iid int64
+	// A held run for userID whose started_at/health are set to distinct values, so the
+	// promote's resets (started_at → NULL, health → ok) are not vacuously satisfied. The
+	// interval on status_since lets the ordering test control who is oldest.
+	newHeld := func(t *testing.T, owner uuid.UUID, sinceInterval string) uuid.UUID {
+		t.Helper()
+		iid++
+		id := uuid.New()
+		mustExec(ctx, t, pool,
+			`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status,
+			                   status_since, started_at, health, health_reason, health_since)
+			 VALUES ($1, $2, $3, $4, 't', 'd', 'pool_wait', now() - `+sinceInterval+`, now(), 'stalled', 'no output', now())`,
+			id, owner, repoID, iid)
+		return id
+	}
+	readStatus := func(t *testing.T, id uuid.UUID) (status string, startedAt pgtype.Timestamptz, health string) {
+		t.Helper()
+		if err := pool.QueryRow(ctx, `SELECT status, started_at, health FROM runs WHERE id = $1`, id).
+			Scan(&status, &startedAt, &health); err != nil {
+			t.Fatalf("read run %s: %v", id, err)
+		}
+		return
+	}
+
+	// ── PromotePoolWaitRun: pool_wait → queued, with started_at nulled + health reset ──
+	t.Run("promote resumes a held run and resets the wall + health", func(t *testing.T) {
+		id := newHeld(t, userID, "interval '1 minute'")
+		rows, err := q.PromotePoolWaitRun(ctx, store.PromotePoolWaitRunParams{ID: id, UserID: userID})
+		if err != nil {
+			t.Fatalf("PromotePoolWaitRun: %v", err)
+		}
+		if rows != 1 {
+			t.Fatalf("rows = %d, want 1", rows)
+		}
+		status, startedAt, health := readStatus(t, id)
+		if status != "queued" {
+			t.Fatalf("status = %q, want queued", status)
+		}
+		if startedAt.Valid {
+			t.Fatalf("started_at = %v, want NULL — the resume must get a FRESH RUN_TIMEOUT wall", startedAt)
+		}
+		if health != "ok" {
+			t.Fatalf("health = %q, want ok — the detector re-evaluates from the resume, so the "+
+				"held flag must be cleared", health)
+		}
+	})
+
+	// ── owner-scoping: a foreign user_id is a 0-row no-op (resume-now cannot cross users) ──
+	t.Run("promote is owner-scoped", func(t *testing.T) {
+		id := newHeld(t, userID, "interval '1 minute'")
+		rows, err := q.PromotePoolWaitRun(ctx, store.PromotePoolWaitRunParams{ID: id, UserID: otherID})
+		if err != nil {
+			t.Fatalf("PromotePoolWaitRun (foreign user): %v", err)
+		}
+		if rows != 0 {
+			t.Fatalf("foreign user_id: rows = %d, want 0 — resume-now must not promote a foreign run", rows)
+		}
+		if status, _, _ := readStatus(t, id); status != "pool_wait" {
+			t.Fatalf("status = %q after a foreign promote, want pool_wait UNCHANGED", status)
+		}
+	})
+
+	// ── the POSITIVE source guard: only a pool_wait run promotes ──────────────────────
+	t.Run("promote is a no-op on a non-held run", func(t *testing.T) {
+		iid++
+		id := uuid.New()
+		mustExec(ctx, t, pool,
+			`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status)
+			 VALUES ($1, $2, $3, $4, 't', 'd', 'queued')`, id, userID, repoID, iid)
+		rows, err := q.PromotePoolWaitRun(ctx, store.PromotePoolWaitRunParams{ID: id, UserID: userID})
+		if err != nil {
+			t.Fatalf("PromotePoolWaitRun (non-held): %v", err)
+		}
+		if rows != 0 {
+			t.Fatalf("non-held run: rows = %d, want 0 — the source guard is POSITIVE (status = 'pool_wait')", rows)
+		}
+	})
+
+	// ── ListPoolWaitRuns: returns only pool_wait runs, oldest first ───────────────────
+	t.Run("list returns only held runs, oldest first", func(t *testing.T) {
+		// Isolate: settle every existing pool_wait run so this assertion sees only its own.
+		mustExec(ctx, t, pool, `UPDATE runs SET status = 'completed' WHERE status = 'pool_wait'`)
+		older := newHeld(t, userID, "interval '10 minutes'")
+		newer := newHeld(t, userID, "interval '1 minute'")
+		// A non-held run that must NOT appear.
+		iid++
+		mustExec(ctx, t, pool,
+			`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status)
+			 VALUES ($1, $2, $3, $4, 't', 'd', 'running')`, uuid.New(), userID, repoID, iid)
+
+		got, err := q.ListPoolWaitRuns(ctx)
+		if err != nil {
+			t.Fatalf("ListPoolWaitRuns: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("ListPoolWaitRuns returned %d rows, want 2 (only the held runs)", len(got))
+		}
+		if got[0].ID != older || got[1].ID != newer {
+			t.Fatalf("order = [%s, %s], want oldest-first [%s, %s] — the reactive pass promotes "+
+				"the longest-waiting run of each owner first", got[0].ID, got[1].ID, older, newer)
+		}
+	})
 }

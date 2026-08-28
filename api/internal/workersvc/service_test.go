@@ -95,6 +95,11 @@ type fakeStore struct {
 	autoCandidates       []store.ListAutoSelectCandidatesRow
 	autoCandidatesErr    error
 	autoCandidateLookups []uuid.UUID
+	// autoCandidatesByUser overrides autoCandidates PER user when non-nil (PRD #754 M5's
+	// reactive-resume test needs one user's pool eligible and another's empty in a single
+	// Sweep). A user absent from the map returns an empty candidate slice; nil map falls
+	// back to the blanket autoCandidates so every existing fixture is unchanged.
+	autoCandidatesByUser map[uuid.UUID][]store.ListAutoSelectCandidatesRow
 	// judgeSecret is the user's judge-lane binding (PRD #104 M4); the zero value is
 	// "unbound", which is every user's state until they choose otherwise, so existing
 	// judge fixtures keep resolving the default with no change.
@@ -436,6 +441,18 @@ type fakeStore struct {
 	promoteLimitWaitErr error
 	promoteLimitWaitAt  []pgtype.Timestamptz
 
+	// PRD #754 M5 reactive-resume: poolWaitRuns is what ListPoolWaitRuns returns (the
+	// oldest-first pool_wait worklist) and poolWaitRunsErr fails that read. promotedPoolWait
+	// records every PromotePoolWaitRun arg in order (so a test can assert WHICH held run was
+	// resumed and that it was owner-scoped), promotePoolWaitRows overrides the rows-affected
+	// the promote reports (default 1; 0 models a run that moved out of pool_wait under the
+	// pass), and promotePoolWaitErr fails the promote.
+	poolWaitRuns        []store.ListPoolWaitRunsRow
+	poolWaitRunsErr     error
+	promotedPoolWait    []store.PromotePoolWaitRunParams
+	promotePoolWaitRows *int64
+	promotePoolWaitErr  error
+
 	// PRD #217 M1: the park-time gauge write. markedFiveHour / markedSevenDay record
 	// every user_secret_id MarkFiveHourExhausted / MarkSevenDayExhausted was called
 	// with, in order, so a test can assert WHICH window a park marked down (and that
@@ -622,6 +639,9 @@ func (f *fakeStore) ListAutoSelectCandidates(_ context.Context, userID uuid.UUID
 	if f.autoCandidatesErr != nil {
 		return nil, f.autoCandidatesErr
 	}
+	if f.autoCandidatesByUser != nil {
+		return f.autoCandidatesByUser[userID], nil
+	}
 	return f.autoCandidates, nil
 }
 
@@ -748,6 +768,37 @@ func (f *fakeStore) SetRunLimitWait(_ context.Context, arg store.SetRunLimitWait
 func (f *fakeStore) PromoteLimitWaitRuns(_ context.Context, now pgtype.Timestamptz) ([]store.PromoteLimitWaitRunsRow, error) {
 	f.promoteLimitWaitAt = append(f.promoteLimitWaitAt, now)
 	return f.promotedLimitWait, f.promoteLimitWaitErr
+}
+
+func (f *fakeStore) ListPoolWaitRuns(_ context.Context) ([]store.ListPoolWaitRunsRow, error) {
+	return f.poolWaitRuns, f.poolWaitRunsErr
+}
+
+// PromotePoolWaitRun records the arg and, by default, reports 1 row (a held run
+// resumed). promotePoolWaitRows overrides the count so a test can model the 0-row
+// no-op (the run moved out of pool_wait under the pass); promotePoolWaitErr fails it.
+// It also DROPS the promoted run from poolWaitRuns so a SECOND Sweep on the same fake
+// sees the remaining held run — which is how the one-per-user-per-tick cap is proven
+// across two calls.
+func (f *fakeStore) PromotePoolWaitRun(_ context.Context, arg store.PromotePoolWaitRunParams) (int64, error) {
+	f.promotedPoolWait = append(f.promotedPoolWait, arg)
+	if f.promotePoolWaitErr != nil {
+		return 0, f.promotePoolWaitErr
+	}
+	rows := int64(1)
+	if f.promotePoolWaitRows != nil {
+		rows = *f.promotePoolWaitRows
+	}
+	if rows > 0 {
+		remaining := f.poolWaitRuns[:0]
+		for _, r := range f.poolWaitRuns {
+			if r.ID != arg.ID {
+				remaining = append(remaining, r)
+			}
+		}
+		f.poolWaitRuns = remaining
+	}
+	return rows, nil
 }
 func (f *fakeStore) ConsumeRunInputs(context.Context, uuid.UUID) ([]store.ConsumeRunInputsRow, error) {
 	return f.consumeRows, nil

@@ -158,6 +158,7 @@ uzi run follow-up <run-id> [--message <text>]
 uzi run answer <run-id> [--message <text>]
 uzi run inputs <run-id>
 uzi run expedite <run-id> [--clear]
+uzi run resume-now <run-id>
 uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit]
 uzi schedule list
 uzi schedule get <schedule-id>
@@ -476,6 +477,13 @@ uzi version
   the bump: it removes the manual override and returns the run to its kind default
   priority (it does **not** demote it below normal). Prints the updated run; `--json`
   emits the run object, whose `priority` pill reads `expedited` after a bump.
+- `uzi run resume-now <run-id>` — resume a run held in `pool_wait`, an `auto` run
+  parked because its owner's Anthropic token pool was empty when it claimed (PRD
+  #754). It flips the hold straight to **queued** instead of waiting up to a sweeper
+  tick for the reactive pass to notice a token was pooled. A run that is **not** held
+  is a 409 (exit 5), and a foreign/unknown run is a 404 (exit 4). No token is spent
+  and nothing is written to the forge. Prints the updated run; `--json` emits the run
+  object.
 
 ### Schedules — time-driven runs
 

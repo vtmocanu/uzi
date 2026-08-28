@@ -1050,6 +1050,16 @@ func (f *autoStopSweepStore) SweepStuckConfirmingProposals(context.Context, pgty
 func (f *autoStopSweepStore) PromoteLimitWaitRuns(context.Context, pgtype.Timestamptz) ([]store.PromoteLimitWaitRunsRow, error) {
 	return nil, nil
 }
+
+// PRD #754 M5's reactive-resume pass. Empty for the same reason as PromoteLimitWaitRuns
+// above: this fixture's subject is the auto-stop streak, so the pool worklist is empty
+// and Sweep still runs end to end.
+func (f *autoStopSweepStore) ListPoolWaitRuns(context.Context) ([]store.ListPoolWaitRunsRow, error) {
+	return nil, nil
+}
+func (f *autoStopSweepStore) PromotePoolWaitRun(context.Context, store.PromotePoolWaitRunParams) (int64, error) {
+	return 0, nil
+}
 func (f *autoStopSweepStore) ListActiveRunsForHealth(context.Context) ([]store.ListActiveRunsForHealthRow, error) {
 	return f.active, nil
 }
