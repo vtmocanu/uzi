@@ -233,8 +233,11 @@ caught too, not just the checkpointed tracking ref):
   session-independent safety net; it is NOT a substitute for the pollers — keep those too.
 
 To recover from a snapshot: `tar xzf <ts>/issue-N.tgz -C r/`, then
-`git fetch r/issue-N.bundle 'agent/issue-N:refs/heads/recover/issue-N'`, worktree it,
-`git apply r/issue-N.uncommitted.patch` if present, `git rebase origin/main`, then gate +
+`git fetch r/issue-N.bundle 'agent/issue-N:refs/heads/recover/issue-N'` and
+`git worktree add DIR recover/issue-N`. In `DIR`, restore the uncommitted state the
+tracking ref never held: `git apply r/issue-N.uncommitted.patch` if that file is present,
+**and `tar xzf r/issue-N.untracked.tar.gz -C DIR` if that one is** (it carries new,
+not-yet-added files, which the patch does not). Then `git rebase origin/main` and gate +
 PR + admin-merge as above.
 
 ## Reviewing the diff

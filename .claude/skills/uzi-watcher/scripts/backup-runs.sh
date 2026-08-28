@@ -59,6 +59,9 @@ fi
 RUNS=("$@")
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 DEST="$OUTROOT/$TS"
+# Backups hold unpushed repo work + run transcripts; keep them owner-only (0700
+# dirs / 0600 files) rather than inheriting a lax 022 umask on a shared host.
+umask 077
 mkdir -p "$DEST"
 LOG="$DEST/backup.log"
 log(){ printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$LOG"; }
@@ -160,7 +163,14 @@ for RID in "${RUNS[@]}"; do
   f="$DEST/issue-$iid.tgz"
   if "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- sh -c "$CAPTURE" _ "$iid" > "$f" 2>>"$LOG"; then
     if [ -s "$f" ]; then
-      log "OK   $RID (#$iid) status=$st worker=$wid pod=$pod -> $f ($(du -h "$f" | cut -f1))"
+      # A nonempty archive is not enough: the git bundle carries the committed
+      # work, so if it is missing, say so (PARTIAL) rather than logging OK. The
+      # snapshot is still kept — its patch/untracked/status remain useful.
+      if tar tzf "$f" 2>/dev/null | grep -qF "issue-$iid.bundle"; then
+        log "OK   $RID (#$iid) status=$st worker=$wid pod=$pod -> $f ($(du -h "$f" | cut -f1))"
+      else
+        log "PART $RID (#$iid): snapshot saved WITHOUT a git bundle (uncommitted/status only) -> $f; see $LOG"
+      fi
     else
       log "FAIL $RID (#$iid): empty artifact (clone missing?); see $LOG"
       rm -f "$f"

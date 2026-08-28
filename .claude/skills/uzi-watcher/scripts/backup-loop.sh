@@ -30,6 +30,14 @@ if [ "$#" -eq 0 ]; then
 fi
 RUNS=("$@")
 
+# Reject a nonpositive/non-integer interval or window: sleep 0 would spin the
+# loop with no delay and flood the uzi + k8s APIs until MAX_HOURS.
+for pair in "INTERVAL:$INTERVAL" "MAX_HOURS:$MAX_HOURS"; do
+  name="${pair%%:*}"; val="${pair#*:}"
+  case "$val" in ''|*[!0-9]*) echo "error: UZI_BACKUP_$name must be a positive integer (got '$val')" >&2; exit 2;; esac
+  [ "$val" -ge 1 ] || { echo "error: UZI_BACKUP_$name must be >= 1 (got '$val')" >&2; exit 2; }
+done
+
 mkdir -p "$ROOT"
 echo "$$" > "$ROOT/backup-loop.pid"
 END=$(( $(date +%s) + MAX_HOURS * 3600 ))
