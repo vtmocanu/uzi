@@ -34,6 +34,19 @@ vi.mock("../lib/api", () => ({
     // SidebarRateLimits fetches the chosen sidebar-token set on mount.
     getMySettings: vi.fn().mockResolvedValue({ settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, theme: null } }),
     version: vi.fn().mockRejectedValue(new Error("500 from /api/version")),
+    // AppShell's useBranding() (PRD #685) polls GET /api/branding on mount. Give it a
+    // real unbranded response so this suite exercises the default chrome directly,
+    // not via useBranding's defensive fallback for an incomplete mock.
+    branding: vi.fn().mockResolvedValue({
+      app_logo_mode: "default",
+      app_logo_present: false,
+      app_logo_keep_name: true,
+      brand_mode: "none",
+      brand_company: "",
+      brand_placement: "below",
+      brand_plaque: false,
+      brand_logo_present: false,
+    }),
   },
 }));
 vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
