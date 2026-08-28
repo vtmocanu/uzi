@@ -194,6 +194,12 @@ jobs:
           push: true
           platforms: linux/amd64
           provenance: false
+          # Registry layer cache: a warm build reuses the `go mod download` layer instead
+          # of re-fetching from proxy.golang.org, shrinking the per-release network window
+          # (issue #739). First release has no :buildcache yet -- build-push-action
+          # tolerates the cache-from miss. GHCR (not type=gha) has no cache-size cap.
+          cache-from: type=registry,ref=ghcr.io/vtmocanu/uzi/api:buildcache
+          cache-to: type=registry,ref=ghcr.io/vtmocanu/uzi/api:buildcache,mode=max
           tags: |
             ghcr.io/vtmocanu/uzi/api:${{ needs.prep.outputs.version }}
             ghcr.io/vtmocanu/uzi/api:${{ needs.prep.outputs.short_sha }}
@@ -243,6 +249,12 @@ jobs:
           push: true
           platforms: linux/amd64
           provenance: false
+          # Registry layer cache: a warm build reuses the `npm ci` layer instead of
+          # re-fetching from the npm registry, shrinking the per-release network window
+          # (issue #739). First release has no :buildcache yet -- build-push-action
+          # tolerates the cache-from miss. GHCR (not type=gha) has no cache-size cap.
+          cache-from: type=registry,ref=ghcr.io/vtmocanu/uzi/web:buildcache
+          cache-to: type=registry,ref=ghcr.io/vtmocanu/uzi/web:buildcache,mode=max
           tags: |
             ghcr.io/vtmocanu/uzi/web:${{ needs.prep.outputs.version }}
             ghcr.io/vtmocanu/uzi/web:${{ needs.prep.outputs.short_sha }}
@@ -280,6 +292,12 @@ jobs:
           push: true
           platforms: linux/amd64
           provenance: false
+          # Registry layer cache: a warm build reuses the `go mod download` layer instead
+          # of re-fetching from proxy.golang.org, shrinking the per-release network window
+          # (issue #739). First release has no :buildcache yet -- build-push-action
+          # tolerates the cache-from miss. GHCR (not type=gha) has no cache-size cap.
+          cache-from: type=registry,ref=ghcr.io/vtmocanu/uzi/controller:buildcache
+          cache-to: type=registry,ref=ghcr.io/vtmocanu/uzi/controller:buildcache,mode=max
           tags: |
             ghcr.io/vtmocanu/uzi/controller:${{ needs.prep.outputs.version }}
             ghcr.io/vtmocanu/uzi/controller:${{ needs.prep.outputs.short_sha }}

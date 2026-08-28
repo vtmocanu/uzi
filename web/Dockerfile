@@ -28,7 +28,9 @@ COPY web/package.json web/package-lock.json ./
 # lockfile refresh, which is when nobody will be looking.
 # NOT to be copied to agent/templates/base/Dockerfile: that image WANTS its
 # postinstall, which is what bakes the agent-browser CLI into the worker.
-RUN npm ci --ignore-scripts
+# Retry the registry fetch on a transient npm-registry blip (issue #739): a single reset
+# should not redden a CI validation or release-publish build. 5 attempts, n*3s backoff.
+RUN n=0; until npm ci --ignore-scripts; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "npm ci: giving up after $n attempts" >&2; exit 1; }; echo "npm ci failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done
 
 COPY web/ ./
 COPY docs/ /app/docs/
