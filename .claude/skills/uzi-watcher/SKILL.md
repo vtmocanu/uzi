@@ -208,6 +208,35 @@ The remote `refs/uzi-checkpoints/agent/issue-N` ref is the other recovery source
 behind-on-workflows run leaves none (its checkpoint push hit the same rejection). The PVC
 tracking ref is the reliable source.
 
+### Proactive backups (before anything goes wrong)
+
+The recovery above is reactive — after a push rejection or a lost run. When you are
+driving runs through a shaky window (a rate-limited Anthropic token that keeps parking at
+`limit_wait`, an edge-case being hardened, anything where a resume might not come back
+cleanly), snapshot the in-flight work on a timer so a fallback always exists. Two bundled
+scripts do this, capturing from the **live runner working clone** (so uncommitted work is
+caught too, not just the checkpointed tracking ref):
+
+- **`scripts/backup-runs.sh <RUN_ID>...`** — one snapshot per run into
+  `$UZI_BACKUP_DIR` (default `/tmp/uzi-backups/<ts>/`): `issue-N.tgz` (git **bundle** of
+  commits not on `origin/main` + `uncommitted.patch` + `untracked.tar.gz` + `meta.txt`),
+  plus a self-describing status set (`run.json`, `plan.md`, `progress.txt` with milestones
+  DONE vs LEFT, `log-tail.ndjson`). It resolves worker→pod FRESH each call, so it follows a
+  worker roll or a cross-worker migration. Deployment coordinates come from env
+  (`UZI_CTX`, `UZI_WORKER_NS`, `UZI_REPO_SLUG` — the last derived from `origin` if unset),
+  never hard-coded.
+- **`scripts/backup-loop.sh <RUN_ID>...`** — runs `backup-runs.sh` every
+  `UZI_BACKUP_INTERVAL` (default 900s), **detached** so it outlives the session (`setsid`
+  on Linux, a `( nohup … & )` subshell on macOS). It self-terminates when every run is
+  terminal, after `UZI_BACKUP_MAX_HOURS` (default 12), or on `touch $UZI_BACKUP_DIR/STOP`.
+  It rides through `limit_wait` (keeps snapshotting while a run is parked). This is a
+  session-independent safety net; it is NOT a substitute for the pollers — keep those too.
+
+To recover from a snapshot: `tar xzf <ts>/issue-N.tgz -C r/`, then
+`git fetch r/issue-N.bundle 'agent/issue-N:refs/heads/recover/issue-N'`, worktree it,
+`git apply r/issue-N.uncommitted.patch` if present, `git rebase origin/main`, then gate +
+PR + admin-merge as above.
+
 ## Reviewing the diff
 
 The watcher's merge-gate review is a **third** pass, not a first: uzi already ran its own
@@ -463,7 +492,8 @@ die with its session. When you close, hand any still-in-flight run ids on the sa
 ## Keep this skill (and its scripts) current
 
 This skill and its `scripts/` (`watch-run.sh` for uzi runs, `watch-ci.sh` for GitHub
-Actions, `pr-findings.sh` to gather CodeRabbit findings across PRs) are living documents —
+Actions, `pr-findings.sh` to gather CodeRabbit findings across PRs, `backup-runs.sh` /
+`backup-loop.sh` to snapshot in-flight run work from worker PVCs) are living documents —
 **update them in the same session you find them wanting.**
 When a run surprises you with a new failure mode, a plan trap this list does not name,
 changed merge/ruleset behaviour, a CLI verb that moved, or a poller needs a new
