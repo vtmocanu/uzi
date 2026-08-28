@@ -362,6 +362,23 @@ for a trivial fix**, so `reviewDecision` can stay `CHANGES_REQUESTED` even after
 resolved; once (a) or (b) plus green CI confirm the current head is clean, `--admin` merges past
 that stale verdict rather than waiting for a flip that never comes.
 
+**(a) and (b) both fail on a CLEAN re-review, and that is the common case — so know signal
+(c), the one that ALWAYS fires.** Measured 2026-08-28 on PR#763: after a fix push, a poller
+keyed on (a) timed out and (b) never fired, because a **zero-actionable incremental review
+posts NO new review object and re-anchors no prior finding** — CodeRabbit had finished and
+found nothing, which is exactly the merge-ready state, yet both robust-looking checks above
+stayed silent. The signal that fires on *every* incremental pass is the **walkthrough
+comment's `recent_review` block**: CodeRabbit edits that one issue comment each pass to state
+either the new actionable count or `No actionable comments were generated in the recent
+review 🎉`, and — the load-bearing part — the exact range `Reviewing files that changed ...
+between BASE_SHA and HEAD_SHA` (two full commit SHAs). Read it from the **issue** comments, not the pulls comments:
+`gh api repos/OWNER/REPO/issues/PR/comments --jq '.[]|select(.user.login|test("coderabbit";"i"))|.body'`
+and confirm the range's second SHA is your latest push. So the reliable order is: **(c) the
+`recent_review` range covers your head SHA AND reports its actionable count** (0 → clean, merge
+on green CI; >0 → triage); (a)/(b) are corroborating detail only when actionable comments
+existed. A poller must key on (c), never on the `CodeRabbit` PR check nor on the presence of a
+new review object.
+
 **The shared `main` worktree is a multi-writer tree — never assert it is clean.** Other
 sessions leave modified files in it and advance `main` mid-review (measured 2026-08-20:
 two reviewers found unrelated `tui_*` edits and `main` moving `6fc6c5eb`→`2007cbf4` under
