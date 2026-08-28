@@ -115,6 +115,23 @@ describe("Schedules list", () => {
     expect(screen.getByText("paused")).toBeTruthy();
   });
 
+  it("suppresses the auto-approve chip for a self_improve row (PRD #590 follow-up 2)", async () => {
+    // A self_improve run is always server-forced to auto_approve, so the chip is not a
+    // user option: with wait_on_limit off, the row falls back to "defaults", not a chip.
+    only1({ target: "self_improve", origin: "user", auto_approve: true, wait_on_limit: false });
+    renderPage();
+    await waitFor(() => expect(screen.getByText("Self-improvement")).toBeTruthy());
+    expect(screen.queryByText("auto-approve")).toBeNull();
+    expect(screen.getByText("defaults")).toBeTruthy();
+  });
+
+  it("still shows the auto-approve chip for a non-self_improve row (control)", async () => {
+    only1({ target: "sweep", origin: "user", auto_approve: true, wait_on_limit: false });
+    renderPage();
+    await waitFor(() => expect(screen.getByText("Sweep eligible PRD issues")).toBeTruthy());
+    expect(screen.getByText("auto-approve")).toBeTruthy();
+  });
+
   it("the enable toggle PATCHes { enabled } and adopts the returned row", async () => {
     mockApi.updateSchedule.mockImplementation(async (id: string, input) =>
       sched({ id, enabled: input.enabled ?? true }),

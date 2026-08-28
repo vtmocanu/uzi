@@ -431,7 +431,9 @@ export function ScheduleModal({
   const buildDefaultInput = (): ScheduleInput => ({
     cron_expr: cron.trim(),
     timezone,
-    auto_approve: autoApprove,
+    // A self_improve run is always auto-approved (the server forces auto_approve=true on
+    // every path), so omit it here rather than send a client-chosen value the server ignores.
+    auto_approve: target === "self_improve" ? undefined : autoApprove,
     wait_on_limit: waitOnLimit,
     max_issues: target === "sweep" ? maxIssues : undefined,
     model: model.trim() === "" ? null : model,
@@ -458,7 +460,9 @@ export function ScheduleModal({
     cron_expr: timing === "recurring" ? cron.trim() : undefined,
     run_at: timing === "once" ? fromLocalInput(runAtLocal) : undefined,
     timezone,
-    auto_approve: autoApprove,
+    // A self_improve run is always auto-approved (the server forces auto_approve=true on
+    // every path), so omit it here rather than send a client-chosen value the server ignores.
+    auto_approve: target === "self_improve" ? undefined : autoApprove,
     wait_on_limit: waitOnLimit,
     // Model override on EVERY target (all-targets field, unlike guidance); an empty
     // control sends explicit null to clear-to-inherit (replace-semantics).
@@ -563,7 +567,7 @@ export function ScheduleModal({
     </Field>
   );
 
-  const footerSummary = [
+  const footerSummarySegments = [
     timing === "once" ? "One time" : "Recurring",
     target === "sweep"
       ? "sweep"
@@ -572,8 +576,13 @@ export function ScheduleModal({
         : target === "self_improve"
           ? "self-improve"
           : "issue",
-    autoApprove ? "auto-approve" : "manual approve",
-  ].join(" · ");
+  ];
+  // A self_improve run is always auto-approved (the server forces it), so drop the
+  // approve segment entirely there — it is a fixed value, not a user choice.
+  if (target !== "self_improve") {
+    footerSummarySegments.push(autoApprove ? "auto-approve" : "manual approve");
+  }
+  const footerSummary = footerSummarySegments.join(" · ");
 
   return (
     <div
@@ -956,15 +965,19 @@ export function ScheduleModal({
                 </span>
               </span>
             </div>
-            <div className="flex items-start gap-3">
-              <Toggle checked={autoApprove} onChange={setAutoApprove} label="Auto-approve the plan" />
-              <span className="text-[13px] text-fg">
-                Auto-approve the plan
-                <span className="block text-[11px] text-faint">
-                  Skip the approval gate so unattended runs proceed (like autopilot). Off = the run waits at the gate.
+            {/* A self_improve run is always auto-approved (the server forces auto_approve=true),
+                so hide the toggle rather than misrepresent a fixed value as a user choice. */}
+            {target !== "self_improve" && (
+              <div className="flex items-start gap-3">
+                <Toggle checked={autoApprove} onChange={setAutoApprove} label="Auto-approve the plan" />
+                <span className="text-[13px] text-fg">
+                  Auto-approve the plan
+                  <span className="block text-[11px] text-faint">
+                    Skip the approval gate so unattended runs proceed (like autopilot). Off = the run waits at the gate.
+                  </span>
                 </span>
-              </span>
-            </div>
+              </div>
+            )}
             {!isEdit && (
               <div className="flex items-start gap-3">
                 <Toggle checked={enabled} onChange={setEnabled} label="Enabled" />
