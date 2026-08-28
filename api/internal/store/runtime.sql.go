@@ -3226,13 +3226,12 @@ type ListPoolWaitRunsRow struct {
 // whose token pool is now non-empty, promotes exactly the first (oldest) held run it
 // sees for that user — the anti-stampede stagger lives in Go, not here.
 //
-// This is deliberately a FULL SCAN of the pool_wait subset rather than an indexed
-// lookup: the held set is expected to be small (a run only holds when an auto owner's
-// whole pool is genuinely empty, a transient condition M5 resumes out of), so the scan
-// reads a near-empty slice on a healthy instance. Unlike limit_wait's idx_runs_limit_wait_retry
-// there is NO dedicated partial index for pool_wait yet; if the held population ever grows
-// enough to matter, add one (a `WHERE status = 'pool_wait'` partial index) in a migration
-// and this comment is the place that says why it was not needed at M5.
+// Backed by the partial index idx_runs_pool_wait (`ON runs (status_since) WHERE
+// status = 'pool_wait'`, migration 00166), so this is an index scan of only the held
+// subset — never a sequential scan of the whole (unbounded) runs table — and the
+// oldest-first ORDER BY is index-ordered. The held set is expected to be tiny (a run
+// holds only while an auto owner's whole pool is genuinely empty, a transient state M5
+// resumes out of); the index mirrors limit_wait's idx_runs_limit_wait_retry.
 func (q *Queries) ListPoolWaitRuns(ctx context.Context) ([]ListPoolWaitRunsRow, error) {
 	rows, err := q.db.Query(ctx, listPoolWaitRuns)
 	if err != nil {

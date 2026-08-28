@@ -5997,8 +5997,18 @@ func (s *Service) resumePoolWaitRuns(ctx context.Context) (int64, error) {
 			slog.Error("sweeper: pool-resume candidate read failed", "user", r.UserID, "error", err)
 			continue
 		}
-		// The pool is "non-empty / resumable" iff at least one candidate is AutoEligible —
-		// the same condition autoselect.Floor uses to decide it has a pooled token to spend.
+		// The pool is "non-empty / resumable" iff at least one candidate is AutoEligible.
+		// This is Select's PoolNonEmpty (membership counted with NO exclude), whereas the
+		// re-claim decides with autoselect.Floor(cands, claimExclude(run)) — Floor.ok, counted
+		// AFTER the run's dead-credential exclude. They can only diverge when a run's SOLE
+		// AutoEligible token is its own still-excluded dead credential, i.e. claimExclude
+		// returns non-Nil. But claimExclude excludes only while retry_not_before is in the
+		// FUTURE, and a pool_wait run can never carry a future stamp: SetRunPoolWait does not
+		// set retry_not_before, and the claim it came from was itself claimable, so the run's
+		// stamp was already NULL (never parked) or in the past (promoted out of limit_wait at
+		// retry_not_before <= now). So claimExclude relaxes to Nil at every real resume, making
+		// PoolNonEmpty here exactly Floor.ok at re-claim — this trigger never resumes a run that
+		// would immediately re-hold.
 		poolNonEmpty := false
 		for _, row := range rows {
 			if autoselectrow.FromCandidateRow(row).AutoEligible {
