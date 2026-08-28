@@ -1728,7 +1728,7 @@ func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store
 		return staticChoice(id, selectReasonJudge), nil
 	}
 	if wkr.AnthropicBindMode == BindModeAuto {
-		return s.autoChoice(ctx, wkr, run)
+		return s.autoChoice(ctx, run)
 	}
 	return staticChoice(workerSecretID(wkr), selectReasonPinned), nil
 }
@@ -1811,7 +1811,7 @@ func (s *Service) claimExclude(run store.Run) uuid.UUID {
 // Floor.ok, not Select's PoolNonEmpty, decides floor-vs-hold: they diverge in the
 // excluded-sole-token case (PoolNonEmpty counts before the exclude skip, Floor.ok
 // after), and the credential we may actually spend NOW is Floor's question.
-func (s *Service) autoChoice(ctx context.Context, wkr store.Worker, run store.Run) (secretChoice, error) {
+func (s *Service) autoChoice(ctx context.Context, run store.Run) (secretChoice, error) {
 	userID := run.UserID
 	// exclude comes from claimExclude (window-aware): the just-parked dead credential
 	// while its window is still closed, uuid.Nil once retry_not_before has reopened it
