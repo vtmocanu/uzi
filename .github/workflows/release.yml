@@ -199,7 +199,9 @@ jobs:
           # (issue #739). First release has no :buildcache yet -- build-push-action
           # tolerates the cache-from miss. GHCR (not type=gha) has no cache-size cap.
           cache-from: type=registry,ref=ghcr.io/vtmocanu/uzi/api:buildcache
-          cache-to: type=registry,ref=ghcr.io/vtmocanu/uzi/api:buildcache,mode=max
+          # ignore-error: a cache EXPORT failure (GHCR blip) must not fail the release
+          # build or block signing -- the cache is an optimization, not a gate (#739).
+          cache-to: type=registry,ref=ghcr.io/vtmocanu/uzi/api:buildcache,mode=max,ignore-error=true
           tags: |
             ghcr.io/vtmocanu/uzi/api:${{ needs.prep.outputs.version }}
             ghcr.io/vtmocanu/uzi/api:${{ needs.prep.outputs.short_sha }}
@@ -254,7 +256,9 @@ jobs:
           # (issue #739). First release has no :buildcache yet -- build-push-action
           # tolerates the cache-from miss. GHCR (not type=gha) has no cache-size cap.
           cache-from: type=registry,ref=ghcr.io/vtmocanu/uzi/web:buildcache
-          cache-to: type=registry,ref=ghcr.io/vtmocanu/uzi/web:buildcache,mode=max
+          # ignore-error: a cache EXPORT failure (GHCR blip) must not fail the release
+          # build or block signing -- the cache is an optimization, not a gate (#739).
+          cache-to: type=registry,ref=ghcr.io/vtmocanu/uzi/web:buildcache,mode=max,ignore-error=true
           tags: |
             ghcr.io/vtmocanu/uzi/web:${{ needs.prep.outputs.version }}
             ghcr.io/vtmocanu/uzi/web:${{ needs.prep.outputs.short_sha }}
@@ -297,7 +301,9 @@ jobs:
           # (issue #739). First release has no :buildcache yet -- build-push-action
           # tolerates the cache-from miss. GHCR (not type=gha) has no cache-size cap.
           cache-from: type=registry,ref=ghcr.io/vtmocanu/uzi/controller:buildcache
-          cache-to: type=registry,ref=ghcr.io/vtmocanu/uzi/controller:buildcache,mode=max
+          # ignore-error: a cache EXPORT failure (GHCR blip) must not fail the release
+          # build or block signing -- the cache is an optimization, not a gate (#739).
+          cache-to: type=registry,ref=ghcr.io/vtmocanu/uzi/controller:buildcache,mode=max,ignore-error=true
           tags: |
             ghcr.io/vtmocanu/uzi/controller:${{ needs.prep.outputs.version }}
             ghcr.io/vtmocanu/uzi/controller:${{ needs.prep.outputs.short_sha }}
@@ -429,7 +435,9 @@ jobs:
           # Per-template cache ref; base/jvm never collide. First release has no
           # :buildcache yet -- build-push-action tolerates the cache-from miss.
           cache-from: type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache
-          cache-to: type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache,mode=max
+          # ignore-error: a cache EXPORT failure must not fail the release or block
+          # signing -- the cache is an optimization, not a gate (#739).
+          cache-to: type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache,mode=max,ignore-error=true
           tags: |
             ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:${{ needs.prep.outputs.version }}
             ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:${{ needs.prep.outputs.short_sha }}
