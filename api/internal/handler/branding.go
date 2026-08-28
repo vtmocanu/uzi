@@ -132,6 +132,11 @@ func (h *Handler) GetBrandingLogo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", asset.ContentType)
+	// Defense-in-depth for admin-uploaded bytes (svg+xml is an allowed type): stop
+	// content-type sniffing and force a passive rendering context, so the route
+	// self-defends even if the nginx-inherited CSP/nosniff ever stops covering /api/.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Disposition", "inline")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(asset.Bytes)
 }
