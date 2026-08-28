@@ -1,0 +1,210 @@
+// @vitest-environment jsdom
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { AppShell, __resetBrandingForTests } from "./AppShell";
+import { api, type Branding } from "../lib/api";
+import { useAuth } from "../auth/AuthContext";
+import { mockBuildInfo } from "../mocks/data";
+
+// Instance-branding chrome (PRD #685 M3a): the custom app mark across all four
+// surfaces (desktop aside, mobile drawer, signed-out PublicShell, mobile signed-in
+// top bar) and the durable MIT © Vlad Mocanu credit.
+//
+// The app mark is asserted on the HTML <img> handle (data-testid="app-logo-img" /
+// alt="app logo"), NEVER role="img": the inline FactoryIcon renders through an
+// <svg role="img">, so a role query would collide with it. Custom-mode tests read
+// img.getAttribute("src"); the default test asserts the SAME query returns nothing.
+//
+// The module-memoised branding fetch (`brandingPromise` in AppShell) is reset
+// between tests via the exported `__resetBrandingForTests` seam — unlike
+// buildInfoPromise, which its own test file leaves cold-per-file because it needs
+// only one value; here each test drives a DIFFERENT branding, so the memo must be
+// cleared or the first test's value would pin the whole file.
+
+vi.mock("../lib/api", () => ({
+  MOCK_MODE: false,
+  api: {
+    listRepos: vi.fn().mockResolvedValue({ repos: [] }),
+    listConnections: vi.fn().mockResolvedValue({ connections: [] }),
+    unreadNotificationCount: vi.fn().mockResolvedValue({ unread: 0 }),
+    workerUpgradeSummary: vi.fn().mockResolvedValue({ attention: 0, target_release: "0.4.2" }),
+    getJudgeStats: vi
+      .fn()
+      .mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 }),
+    runsInProgressCount: vi.fn().mockResolvedValue({ count: 0 }),
+    listSchedules: vi.fn().mockResolvedValue([]),
+    listFindings: vi
+      .fn()
+      .mockResolvedValue({ bucket: "to_file", repo: "", run: "", open_count: 0, findings: [] }),
+    listRuns: vi.fn().mockResolvedValue({ runs: [] }),
+    getMyRateLimits: vi.fn().mockResolvedValue({ status: "no_token" }),
+    getMySettings: vi.fn().mockResolvedValue({
+      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, theme: null },
+    }),
+    version: vi.fn(),
+    branding: vi.fn(),
+  },
+}));
+vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
+
+const mockApi = vi.mocked(api);
+
+const user = {
+  id: "u1",
+  email: "admin@uzi.local",
+  display_name: "Admin",
+  is_admin: false,
+  is_active: true,
+  autopilot_enabled: false,
+  judge_enabled: false,
+  judge_anthropic_secret_id: null,
+  judge_anthropic_secret_label: null,
+  created_at: "2026-01-01T00:00:00Z",
+  last_login: null,
+};
+
+const DEFAULT_BRANDING: Branding = {
+  app_logo_mode: "default",
+  app_logo_present: false,
+  app_logo_keep_name: true,
+  brand_mode: "none",
+  brand_company: "",
+  brand_placement: "below",
+  brand_plaque: false,
+  brand_logo_present: false,
+};
+
+function brandingWith(overrides: Partial<Branding>): Branding {
+  return { ...DEFAULT_BRANDING, ...overrides };
+}
+
+function signIn() {
+  vi.mocked(useAuth).mockReturnValue({ user, logout: vi.fn() } as never);
+}
+
+function signOut() {
+  vi.mocked(useAuth).mockReturnValue({ user: null, logout: vi.fn() } as never);
+}
+
+beforeEach(() => {
+  __resetBrandingForTests();
+  signIn();
+  mockApi.version.mockResolvedValue(mockBuildInfo);
+  mockApi.branding.mockResolvedValue(DEFAULT_BRANDING);
+});
+
+afterEach(() => {
+  cleanup();
+  window.localStorage.clear();
+});
+
+function renderShell(initial = "/dashboard") {
+  return render(
+    <MemoryRouter initialEntries={[initial]}>
+      <AppShell>
+        <div />
+      </AppShell>
+    </MemoryRouter>,
+  );
+}
+
+// The name/subtitle marker. Unique to the app mark's name span (the email
+// "admin@uzi.local" also contains "uzi", so match the subtitle instead), and a
+// substring regex because PublicShell/mobile render it as "· uzinele întunecate".
+const NAME_RE = /uzinele întunecate/;
+
+describe("AppShell branding — durable credit (D3)", () => {
+  // FIRST in the file, deliberately: buildInfoPromise has no reset seam, so this is
+  // the only test guaranteed a cold build memo. It leaves version pending to prove
+  // the credit renders while BOTH branding and build are unresolved.
+  it("renders the license credit while branding and build are still in flight", () => {
+    mockApi.branding.mockReturnValue(new Promise<Branding>(() => {}));
+    mockApi.version.mockReturnValue(new Promise(() => {}));
+    renderShell();
+    expect(screen.getAllByTestId("license-credit").length).toBeGreaterThan(0);
+    expect(screen.getAllByTestId("license-credit")[0].textContent).toBe("MIT © Vlad Mocanu");
+  });
+
+  it("still renders the credit under full white-label settings (signed-in)", async () => {
+    mockApi.branding.mockResolvedValue(
+      brandingWith({ app_logo_mode: "custom", app_logo_present: true, app_logo_keep_name: false }),
+    );
+    renderShell();
+    await screen.findAllByTestId("app-logo-img");
+    expect(screen.getAllByTestId("license-credit").length).toBeGreaterThan(0);
+  });
+
+  it("renders the credit on the signed-out shell too", async () => {
+    signOut();
+    renderShell("/");
+    expect((await screen.findByTestId("license-credit")).textContent).toBe("MIT © Vlad Mocanu");
+  });
+
+  it("hides the credit when the sidebar is collapsed", () => {
+    window.localStorage.setItem("uzi.sidebar.collapsed", "true");
+    renderShell();
+    expect(screen.queryAllByTestId("license-credit")).toHaveLength(0);
+  });
+});
+
+describe("AppShell branding — app mark", () => {
+  it("default mode: no app-logo <img> on any surface, FactoryIcon + literals render", async () => {
+    const { container } = renderShell();
+    fireEvent.click(screen.getByLabelText("Open navigation")); // co-mount the drawer
+    // Literals render on every mark (name kept in default mode).
+    expect((await screen.findAllByText(NAME_RE)).length).toBeGreaterThan(0);
+    await waitFor(() => expect(mockApi.branding).toHaveBeenCalled());
+    expect(screen.queryAllByTestId("app-logo-img")).toHaveLength(0);
+    // The trusted inline FactoryIcon SVG is what renders instead.
+    expect(container.querySelector("svg")).not.toBeNull();
+  });
+
+  it("custom + present: renders <img src='/api/branding/logo/app'>", async () => {
+    mockApi.branding.mockResolvedValue(brandingWith({ app_logo_mode: "custom", app_logo_present: true }));
+    renderShell();
+    const imgs = await screen.findAllByTestId("app-logo-img");
+    expect(imgs.length).toBeGreaterThan(0);
+    for (const img of imgs) expect(img.getAttribute("src")).toBe("/api/branding/logo/app");
+  });
+
+  it("custom + not present: falls back to <img src='/brand-default.svg'>", async () => {
+    mockApi.branding.mockResolvedValue(brandingWith({ app_logo_mode: "custom", app_logo_present: false }));
+    renderShell();
+    const imgs = await screen.findAllByTestId("app-logo-img");
+    expect(imgs.length).toBeGreaterThan(0);
+    for (const img of imgs) expect(img.getAttribute("src")).toBe("/brand-default.svg");
+  });
+});
+
+describe("AppShell branding — white-label hides the name on all four surfaces", () => {
+  it("signed-in: name absent on desktop aside, mobile drawer, and mobile top bar", async () => {
+    mockApi.branding.mockResolvedValue(
+      brandingWith({ app_logo_mode: "custom", app_logo_present: true, app_logo_keep_name: false }),
+    );
+    renderShell();
+    fireEvent.click(screen.getByLabelText("Open navigation")); // co-mount the drawer
+    // Wait for the custom fetch to settle (marks flip to <img>), then assert no name.
+    await screen.findAllByTestId("app-logo-img");
+    expect(screen.queryByText(NAME_RE)).toBeNull();
+  });
+
+  it("signed-out PublicShell: name absent", async () => {
+    signOut();
+    mockApi.branding.mockResolvedValue(
+      brandingWith({ app_logo_mode: "custom", app_logo_present: true, app_logo_keep_name: false }),
+    );
+    renderShell("/");
+    await screen.findByTestId("app-logo-img");
+    expect(screen.queryByText(NAME_RE)).toBeNull();
+  });
+
+  it("custom + keep_name: the name IS kept beside the custom mark", async () => {
+    mockApi.branding.mockResolvedValue(
+      brandingWith({ app_logo_mode: "custom", app_logo_present: true, app_logo_keep_name: true }),
+    );
+    renderShell();
+    await screen.findAllByTestId("app-logo-img");
+    expect(screen.getAllByText(NAME_RE).length).toBeGreaterThan(0);
+  });
+});

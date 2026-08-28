@@ -8,7 +8,7 @@
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useEffect, useState, type ReactNode } from "react";
 import { useAuth } from "../auth/AuthContext";
-import { api, MOCK_MODE, type BuildInfo, type Repo } from "../lib/api";
+import { api, MOCK_MODE, type Branding, type BuildInfo, type Repo } from "../lib/api";
 import { prefs } from "../lib/prefs";
 import { cx } from "./ui";
 import { VaultBadge, VaultLockedBanner } from "./VaultControls";
@@ -176,6 +176,114 @@ export function useAppVersion(): string | null {
   const s = useBuildInfoSnapshot();
   if (s === null) return null;
   return s.status === "ok" ? (s.info.version ?? "") : "";
+}
+
+// The instance branding config (GET /api/branding, PRD #685), fetched once and
+// shared across every chrome surface. Memoised at module scope exactly like
+// buildInfoPromise above, so the two SidebarContent mounts, the signed-out
+// PublicShell and the mobile signed-in top bar all ride ONE unauthenticated GET
+// rather than issuing a request each.
+//
+// A FAILED FETCH DEGRADES TO THE UNBRANDED DEFAULT, never throws: the shell must
+// render its stock uzi mark when /api/branding 500s exactly as it does before the
+// fetch settles, so the promise resolves to `null` on rejection and useBranding
+// hands that `null` (its pending value too) to the surfaces, which read it as the
+// default (app_logo_mode "default", keep_name true).
+let brandingPromise: Promise<Branding | null> | null = null;
+
+// Test-only reset of the module-memoised branding fetch. buildInfoPromise needs no
+// such seam because its tests resolve ONE value per file (vitest isolates per
+// file); the M3a chrome tests instead exercise DIFFERENT branding per test
+// (default / custom / white-label) within one file, so the memo must be cleared
+// between them or the first test's value would pin the whole file.
+export function __resetBrandingForTests(): void {
+  brandingPromise = null;
+}
+
+function useBranding(): Branding | null {
+  const [branding, setBranding] = useState<Branding | null>(null);
+  useEffect(() => {
+    if (!brandingPromise) {
+      // The swallow, both arms: a rejected fetch resolves to `null` (the unbranded
+      // default) via .catch, and a SYNCHRONOUS throw from the call itself is caught
+      // here too — either way the shell degrades to the default mark, it never
+      // rethrows.
+      try {
+        brandingPromise = api.branding().catch((): Branding | null => null);
+      } catch {
+        brandingPromise = Promise.resolve(null);
+      }
+    }
+    let live = true;
+    brandingPromise.then((b) => {
+      if (live) setBranding(b);
+    });
+    return () => {
+      live = false;
+    };
+  }, []);
+  return branding;
+}
+
+// The custom-mode app-logo <img> src, or null when the mark should render the
+// default inline FactoryIcon. Custom mode serves the uploaded logo when present,
+// else the shipped preset (/brand-default.svg lands in M3b; referencing it now is
+// fine — the branch lands atomically). NEVER inline SVG: a custom mark is always an
+// <img> so an uploaded SVG stays passive. `null`/pending branding is the default.
+function appMarkImgSrc(branding: Branding | null): string | null {
+  if (!branding || branding.app_logo_mode !== "custom") return null;
+  return branding.app_logo_present ? "/api/branding/logo/app" : "/brand-default.svg";
+}
+
+// Whether to render the "uzi" / "uzinele întunecate" name beside the mark. Hidden
+// only in full white-label (custom mode with keep_name=false); default mode and a
+// keep-name co-brand both keep it. `null`/pending branding is the default (shown).
+function appMarkShowName(branding: Branding | null): boolean {
+  if (!branding || branding.app_logo_mode !== "custom") return true;
+  return branding.app_logo_keep_name;
+}
+
+// The framed app mark, shared across all four chrome surfaces (PRD #685 M3a). Each
+// surface passes its own frame sizing via `className` (h-8 sidebar, h-7 top bars);
+// the frame carries the brand tint for the default FactoryIcon and a neutral bg for
+// a custom logo, and clips the <img> to the rounded frame.
+function AppMark({ branding, className }: { branding: Branding | null; className?: string }) {
+  const src = appMarkImgSrc(branding);
+  return (
+    <span
+      className={cx(
+        "flex shrink-0 items-center justify-center overflow-hidden",
+        src ? "bg-raised" : "bg-brand/15 text-brand",
+        className,
+      )}
+    >
+      {src ? (
+        <img
+          src={src}
+          alt="app logo"
+          data-testid="app-logo-img"
+          className="h-full w-full object-contain"
+        />
+      ) : (
+        <FactoryIcon />
+      )}
+    </span>
+  );
+}
+
+// The durable license/author credit (PRD #685 Decision D3). A build-time CONSTANT,
+// never a setting — a rebrand or full white-label cannot strip it. Rendered
+// independently of the build-info fetch so it shows during load and on fetch
+// failure, on both the signed-in sidebar footer and the signed-out shell. `©`
+// (U+00A9), not `·`.
+const LICENSE_CREDIT = "MIT © Vlad Mocanu";
+
+function LicenseCredit({ className }: { className?: string }) {
+  return (
+    <span data-testid="license-credit" className={cx("font-mono text-[10px] text-faint", className)}>
+      {LICENSE_CREDIT}
+    </span>
+  );
 }
 
 function isNavActive(pathname: string, href: string): boolean {
@@ -388,6 +496,8 @@ function SidebarContent({
   const navigate = useNavigate();
   const location = useLocation();
   const build = useBuildInfoSnapshot();
+  const branding = useBranding();
+  const showName = appMarkShowName(branding);
   const [repos, setRepos] = useState<Repo[]>([]);
   // connection_id → forge_type, joined web-side so board entries can show a forge
   // glyph (the Repo DTO has no forge_type). Kept separate from repos so a failed
@@ -434,23 +544,23 @@ function SidebarContent({
       <Link
         to="/dashboard"
         onClick={onNavigate}
-        title={collapsed ? "uzi · uzinele întunecate" : undefined}
+        title={collapsed ? (showName ? "uzi · uzinele întunecate" : "app logo") : undefined}
         className={cx(
           "flex items-center border-b border-edge py-4",
           collapsed ? "justify-center px-2" : "gap-2.5 px-4",
         )}
       >
-        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-brand/15 text-lg text-brand">
-          <FactoryIcon />
-        </span>
+        <AppMark branding={branding} className="h-8 w-8 rounded-lg text-lg" />
         {!collapsed && (
           <>
-            <span className="min-w-0">
-              <span className="block text-sm font-semibold leading-tight tracking-tight">uzi</span>
-              <span className="block truncate text-[11px] leading-tight text-faint">
-                uzinele întunecate
+            {showName && (
+              <span className="min-w-0">
+                <span className="block text-sm font-semibold leading-tight tracking-tight">uzi</span>
+                <span className="block truncate text-[11px] leading-tight text-faint">
+                  uzinele întunecate
+                </span>
               </span>
-            </span>
+            )}
             {MOCK_MODE && (
               <span
                 title="This build runs entirely in your browser on demo data — no backend."
@@ -686,6 +796,17 @@ function SidebarContent({
             onOpenChangelog={onOpenChangelog}
           />
         )}
+
+        {/* Durable license/author credit (PRD #685 D3). A SEPARATE element, NOT
+            inside the build-gated block above: it is a build-time constant, so it
+            must render during the /api/version load and on its failure alike — a
+            rebrand or full white-label cannot strip it. Hidden only when the rail
+            is collapsed (no room). */}
+        {!collapsed && (
+          <div className="px-3 pb-2 pt-1">
+            <LicenseCredit />
+          </div>
+        )}
       </div>
     </div>
   );
@@ -694,15 +815,18 @@ function SidebarContent({
 // Public (signed-out) chrome: a minimal top bar; the sidebar only exists for
 // signed-in sessions.
 function PublicShell({ children }: { children: ReactNode }) {
+  const branding = useBranding();
   return (
-    <div className="min-h-screen">
+    <div className="flex min-h-screen flex-col">
       <header className="border-b border-edge">
         <div className="mx-auto flex max-w-5xl items-center justify-between px-4 py-3">
           <Link to="/" className="flex items-center gap-2 text-sm font-semibold tracking-tight">
-            <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-brand/15 text-brand">
-              <FactoryIcon />
-            </span>
-            uzi <span className="font-normal text-faint">· uzinele întunecate</span>
+            <AppMark branding={branding} className="h-7 w-7 rounded-lg" />
+            {appMarkShowName(branding) && (
+              <span>
+                uzi <span className="font-normal text-faint">· uzinele întunecate</span>
+              </span>
+            )}
           </Link>
           <nav className="flex items-center gap-4 text-sm">
             <Link to="/docs" className="text-muted hover:text-fg">
@@ -720,7 +844,14 @@ function PublicShell({ children }: { children: ReactNode }) {
           </nav>
         </div>
       </header>
-      <main className="mx-auto max-w-5xl px-4 py-10">{children}</main>
+      <main className="mx-auto w-full max-w-5xl flex-1 px-4 py-10">{children}</main>
+      {/* Durable credit (PRD #685 D3) on the signed-out shell, which has no version
+          row: a footer carries it here. Constant, independent of any fetch. */}
+      <footer className="border-t border-edge">
+        <div className="mx-auto max-w-5xl px-4 py-4">
+          <LicenseCredit />
+        </div>
+      </footer>
     </div>
   );
 }
@@ -771,6 +902,9 @@ export function AppShell({ children }: { children: ReactNode }) {
   // issued, not a second request.
   const [changelogOpen, setChangelogOpen] = useState(false);
   const build = useBuildInfoSnapshot();
+  // Branding for the mobile signed-in top bar's app mark (PRD #685 M3a). Shares the
+  // one module-memoised GET with the two SidebarContent mounts.
+  const branding = useBranding();
 
   // Unread badge: poll on navigation (no WS — PRD #46 M2) and refresh on the
   // in-app change event (e.g. after marking one read on the inbox page). A failed
@@ -959,8 +1093,17 @@ export function AppShell({ children }: { children: ReactNode }) {
         >
           <MenuIcon />
         </button>
-        <Link to="/dashboard" className="text-sm font-semibold tracking-tight">
-          uzi <span className="font-normal text-faint">· dark factory</span>
+        {/* Reconciled to the same branded source as the other three surfaces
+            (PRD #685 M3a): was the divergent iconless `uzi · dark factory`; now the
+            shared app mark + the `uzi · uzinele întunecate` wording, honoring
+            custom/white-label like the sidebar. An intended default-mode diff. */}
+        <Link to="/dashboard" className="flex items-center gap-2 text-sm font-semibold tracking-tight">
+          <AppMark branding={branding} className="h-7 w-7 rounded-lg text-lg" />
+          {appMarkShowName(branding) && (
+            <span>
+              uzi <span className="font-normal text-faint">· uzinele întunecate</span>
+            </span>
+          )}
         </Link>
       </div>
       {mobileOpen && (
