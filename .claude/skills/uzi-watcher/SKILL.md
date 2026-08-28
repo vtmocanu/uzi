@@ -371,8 +371,14 @@ stayed silent. The signal that fires on *every* incremental pass is the **walkth
 comment's `recent_review` block**: CodeRabbit edits that one issue comment each pass to state
 either the new actionable count or `No actionable comments were generated in the recent
 review 🎉`, and — the load-bearing part — the exact range `Reviewing files that changed ...
-between BASE_SHA and HEAD_SHA` (two full commit SHAs). Read it from the **issue** comments, not the pulls comments:
-`gh api repos/OWNER/REPO/issues/PR/comments --jq '.[]|select(.user.login|test("coderabbit";"i"))|.body'`
+between BASE_SHA and HEAD_SHA` (two full commit SHAs). Read it from the **issue** comments, not
+the pulls comments — with `--paginate`, and select the ONE walkthrough comment CodeRabbit edits
+in place by its stable marker rather than trusting the first CodeRabbit body you find. Two
+reasons this must be deterministic: the issue-comments endpoint defaults to 30 per page (ascending
+by id), so on a PR with more than 30 comments the walkthrough can fall off the default first page;
+and CodeRabbit posts several issue comments (walkthrough, status, tips), so a bare login filter
+returns more than one body. The `<!-- walkthrough_start -->` marker uniquely identifies it:
+`gh api --paginate repos/OWNER/REPO/issues/PR/comments --jq '.[]|select(.user.login|test("coderabbit";"i"))|select(.body|contains("<!-- walkthrough_start -->"))|.body'`
 and confirm the range's second SHA is your latest push. So the reliable order is: **(c) the
 `recent_review` range covers your head SHA AND reports its actionable count** (0 → clean, merge
 on green CI; >0 → triage); (a)/(b) are corroborating detail only when actionable comments
