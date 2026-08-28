@@ -2144,9 +2144,14 @@ func TestTickSelfImproveVaultLockedSkipsAndAdvances(t *testing.T) {
 	if got := h.countKind("selfimprove_skipped"); got != 1 {
 		t.Fatalf("vault locked: selfimprove_skipped notifications = %d, want 1", got)
 	}
-	// Item 4 (PRD #590 follow-up): the reworded body no longer implies unlocking resumes the
-	// cycle soon — it must not carry the old "to resume" phrasing.
-	if body := selfImproveSkippedBody(t, h); strings.Contains(body, "to resume") {
+	// Item 4 (PRD #590 follow-up): the reworded body must state the next-scheduled-time retry
+	// and no longer imply unlocking resumes the cycle soon (no old "to resume" phrasing). Assert
+	// the positive wording too, so an empty or unrelated body cannot pass this check vacuously.
+	body := selfImproveSkippedBody(t, h)
+	if !strings.Contains(body, "It will try again at the next scheduled time") {
+		t.Fatalf("vault-lock body = %q, want next-scheduled-time retry wording", body)
+	}
+	if strings.Contains(body, "to resume") {
 		t.Fatalf("vault-lock body must not imply unlocking resumes it (no %q): %q", "to resume", body)
 	}
 	// The skip precedes any forge work.
