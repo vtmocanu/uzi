@@ -461,12 +461,12 @@ func classifyWithTarget(in UpgradeInput, p UpgradeParams) (status string, detail
 	// Valid-RolledTag only (the semver.IsValid guard): `settled` only proves the
 	// current-gen pod runs the tag the controller RENDERED FROM, which the classifier
 	// sees as RolledTag. When RolledTag is unparseable/absent the target falls back to
-	// CPVersion/pin (see the target-resolution block above, ~:410 and :415) and
-	// `settled` no longer confirms the worker is on that fallback coordinate, so we
-	// defer to the version-compare fail-safe (`outdated`) rather than assert a false
-	// `up_to_date` and hide real drift. Because R7.5 already requires signalFresh, a
-	// valid RolledTag means target == RolledTag (:415-417), so the guard fires exactly
-	// where "settled ⟹ on target" holds.
+	// CPVersion/pin (see the hosted target-resolution block above) and `settled` no
+	// longer confirms the worker is on that fallback coordinate, so we defer to the
+	// version-compare fail-safe (`outdated`) rather than assert a false `up_to_date`
+	// and hide real drift. Because R7.5 already requires signalFresh, a valid RolledTag
+	// means the target-resolution block above already set target == RolledTag, so the
+	// guard fires exactly where "settled ⟹ on target" holds.
 	if status == UpgradeStatusOutdated && hosted && signalFresh &&
 		s.Phase == PhaseSettled && semver.IsValid(normSemver(s.RolledTag)) {
 		return UpgradeStatusUpToDate,
