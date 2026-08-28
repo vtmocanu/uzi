@@ -19,6 +19,7 @@ import type {
   MessageKind,
   Milestone,
   MilestoneProgress,
+  ReviewCommentsSnapshot,
   RunKind,
 } from "./protocol.js";
 import type { AnswerVerdict, PlanVerdict } from "./steering.js";
@@ -93,6 +94,12 @@ export interface RunContext {
    *  it under a per-prompt nonce fence. Absent/null ⇒ nothing is rendered (comment-less
    *  issue, non-issue kind, or unknown bot id). */
   issueComments?: IssueCommentsSnapshot | null;
+  /** PRD #700 M4: the mr_rework run's bounded, bot-self-filtered snapshot of the MR's
+   *  review comments, snapshotted at run creation. UNTRUSTED, multi-author text; the SDK
+   *  executor threads it to buildPlanPrompt, which renders it under a per-prompt nonce
+   *  fence. Absent/null ⇒ nothing is rendered (every non-mr_rework kind, or unknown bot
+   *  id). Mirrors issueComments. */
+  reviewComments?: ReviewCommentsSnapshot | null;
   /** The failed-pipeline snapshot for a ci_fix run (PRD #6): what the agent
    *  diagnoses + fixes. Present only for kind="ci_fix". Log tails are UNTRUSTED. */
   pipeline?: ClaimPipeline | null;
