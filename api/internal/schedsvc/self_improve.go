@@ -50,6 +50,11 @@ const selfImproveTrackingBody = "Autonomous self-improvement tracking issue (PRD
 // oldest lead and the rest wait for the next cycle.
 const selfImproveBacklogCap = 50
 
+// genericSelfImproveDescription is the run description for a repo that has NOT opted
+// into uzi dogfooding (repos.fold_improve_uzi_backlog = false, PRD #686 D1): the run
+// reviews the enabling repo itself and folds no product-specific backlog.
+const genericSelfImproveDescription = "Review this project's codebase and pick one top improvement (a bug, a feature, or a refactor)."
+
 // fireSelfImprove fires one self_improve schedule: it resolves the owner's repo, skips
 // benignly if a run is already active for the repo or the vault is locked, files (or
 // reuses) the tracking issue, folds the owner's improve_uzi backlog into an auto-approved
@@ -107,15 +112,24 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 		return FireOutcome{}, err // transient
 	}
 
-	// 6. Load the OWNER's improve_uzi backlog and fold it into the run description.
-	recs, err := e.store.ListOpenImproveUziRecommendationsForUser(ctx, store.ListOpenImproveUziRecommendationsForUserParams{
-		UserID: sched.UserID,
-		Lim:    selfImproveBacklogCap,
-	})
-	if err != nil {
-		return FireOutcome{}, err // transient
+	// 6. Build the run description. A repo opted into uzi dogfooding
+	// (repos.fold_improve_uzi_backlog = true, PRD #686) folds the OWNER's improve_uzi
+	// backlog into the run; every other repo gets a generic "review this project" run and
+	// no product-specific backlog.
+	var recs []store.ListOpenImproveUziRecommendationsForUserRow
+	var description string
+	if repo.FoldImproveUziBacklog {
+		recs, err = e.store.ListOpenImproveUziRecommendationsForUser(ctx, store.ListOpenImproveUziRecommendationsForUserParams{
+			UserID: sched.UserID,
+			Lim:    selfImproveBacklogCap,
+		})
+		if err != nil {
+			return FireOutcome{}, err // transient
+		}
+		description = composeSelfImproveDescription(recs)
+	} else {
+		description = genericSelfImproveDescription
 	}
-	description := composeSelfImproveDescription(recs)
 
 	// 7. Create the run, threading the schedule's per-schedule model override (PRD #300/#305).
 	// A lost unique-index race (ErrActiveSelfImproveExists) is benign — the index did its job,
@@ -144,7 +158,7 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 	// 9. Started notification to the owner.
 	runID := run.ID
 	e.notifySelfImprove(ctx, sched.UserID, "selfimprove_started", "Self-improvement run started",
-		"A self-improvement run has started on the uzi repo. It will open or extend one merge request; review its plan in the run view.", &runID)
+		"A self-improvement run has started on "+repo.PathWithNamespace+". It will open a merge request; review its plan in the run view.", &runID)
 	e.logger.Info("scheduler: self_improve cycle started", "schedule", sched.ID.String(), "run", run.ID.String(), "recommendations", len(recs))
 	return FireOutcome{Matched: 1, Started: []Started{{RunID: run.ID, Title: selfImproveTrackingTitle}}}, nil
 }
