@@ -3076,6 +3076,29 @@ describe("SdkExecutor — seeded plan body reaches the implement turn (PRD #209 
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
     assert.doesNotMatch(turns[1]!.promptText ?? "", /<plan>/, "a gated run's implement prompt is unchanged");
   });
+
+  // PRD #759 M4 (R3, on the REAL path): a dropped-session cross-worker resume of a
+  // provably-reviewed approved run is NOT seeded (reviewedPlanResume=true, seeded=false,
+  // sessionId=null). The embedSeededPlan unit tests pin the gate logic; this pins the WIRING
+  // end-to-end through SdkExecutor.run — the gate is skipped AND the reviewed plan body
+  // actually reaches the first implement prompt (the stub harness cannot; the prompt TEXT the
+  // executor streamed is the only channel that proves it). A bare planApproved flip that left
+  // seededPlanBody undefined — the #209 M2 gap R3 warns of — would leave the plan absent here.
+  it("M4: embeds the reviewed plan body in the first implement prompt for a session-less reviewed resume", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = makeCtx({
+      planApproved: true,
+      seeded: false,
+      reviewedPlanResume: true,
+      sessionId: null,
+      approvedPlan: PLAN,
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepStrictEqual(probe.gated, [], "a provably-reviewed resume must not re-gate");
+    assert.strictEqual(turns.length, 1, "only the implement turn runs (no planning turn)");
+    assert.match(turns[0]!.promptText ?? "", /zqx42/, "the model must actually see the reviewed plan");
+    assert.match(turns[0]!.promptText ?? "", /<plan>/, "delimited as the plan to implement");
+  });
 });
 
 // ── PRD #209 (M2 validation, auditor-m2 delta): pin the DEFENSE-IN-DEPTH `seeded` term ──

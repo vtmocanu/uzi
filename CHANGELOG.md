@@ -18,6 +18,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **A gated run no longer loses in-progress work across an Anthropic usage-limit park ([#759](https://github.com/vtmocanu/uzi/issues/759)).**
+  On park, any uncommitted edits are auto-committed to a clearly-marked throwaway `wip(park):` commit before the tree is wiped, so the existing checkpoint machinery carries them off the worker; on resume the reseed restores that snapshot to uncommitted (never entering the branch history or the merge request), exactly for a same-worker resume and best-effort for a cross-worker one. `WORKER_AFFINITY_CEILING` is raised from 30 minutes to 2 hours so a long park stays pinned to its original, still-alive worker, where the SDK session and the recovery are both exact; a resumed run whose plan was provably human-reviewed and whose work recovered cleanly keeps implementing instead of re-planning from scratch, while a recovery failure still re-gates for human review; and the run feed now says whether it recovered an uncommitted snapshot or a committed milestone instead of leaving the loss to PVC forensics.
+
 ## [0.66.3] - 2026-08-27
 
 ### Changed

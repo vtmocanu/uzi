@@ -288,6 +288,27 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
     assert.strictEqual(rc.priorCommits, 0, "the marker is not counted as recovered committed work");
   });
 
+  it("commitWipMarker on a CLEAN tree makes no commit and returns false (PRD #759 M1)", async () => {
+    // The other half of M1's contract (the dirty→marker half is asserted throughout this
+    // file): a park whose clone has NOTHING uncommitted must NOT manufacture an empty
+    // wip(park) marker — commitWipMarker returns false and HEAD is byte-identical, so the
+    // reseed has no marker to reset --soft and the "recovered N commits" count is unperturbed.
+    const gitA = worker("workerA");
+    const bareA = await gitA.ensureClone(fx.originPath);
+    const seed = await gitA.createOrAttachRunnerClone(bareA, 766, "run-A");
+    const headBefore = gitIn(seed.path, ["rev-parse", "HEAD"]);
+    assert.strictEqual(gitIn(seed.path, ["status", "--porcelain"]), "", "precondition: the clone is clean");
+
+    const committed = await gitA.commitWipMarker(seed.path);
+
+    assert.strictEqual(committed, false, "a clean tree produces no marker commit");
+    assert.strictEqual(gitIn(seed.path, ["rev-parse", "HEAD"]), headBefore, "HEAD is unchanged (no empty commit)");
+    assert.ok(
+      !gitIn(seed.path, ["log", "-1", "--format=%s"]).startsWith(WIP_PARK_COMMIT_PREFIX),
+      "the tip is not a wip(park) marker",
+    );
+  });
+
   it("recovers a DIVERGED wip(park) checkpoint onto the advanced floor as an uncommitted change (cross-worker, PRD #759 M4 leg #4)", async () => {
     // Leg #4: `main` advanced DURING the park, so the mirrored checkpoint (a wip(park)
     // marker over the OLD floor) is not a strict descendant of the new floor and the
