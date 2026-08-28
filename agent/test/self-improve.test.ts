@@ -459,6 +459,9 @@ describe("buildSelfImprovePlanPrompt", () => {
     branch: SELF_IMPROVE_BRANCH,
     recommendations: "1. [worker] install jq\n2. improve the poller",
     subagentNames: ["reviewer", "auditor"],
+    // PRD #686 M4: these assertions check the uzi-specific dogfood directive; opt in
+    // so they keep asserting that wording (m5 owns the generic-mode cases).
+    selfImproveDogfood: true,
   });
 
   it("carries the trusted directive: pick ONE, guardrails, tests, guard-path flag", () => {

@@ -970,6 +970,8 @@ export class RunRunner {
         memory,
         // Issue #297: the self_improve in-flight avoid-set (best-effort; absent ⇒ empty).
         inflightTargets: claim.inflight_targets,
+        // PRD #686 M4: dogfood flag (absent ⇒ generic; older server never sets it).
+        selfImproveDogfood: claim.self_improve_dogfood,
         config: claim.config,
         // Preflighted above: the claim's id, or undefined when its transcript is not
         // on this worker (issue #105).
@@ -1550,7 +1552,13 @@ export class RunRunner {
       // gathered before the push so the MR opens with its evidence, and a suite that
       // can't run is reported "skipped", never failing the run.
       let selfImproveSection: string | undefined;
-      if (claim.kind === "self_improve") {
+      // PRD #686 M4: uzi's SELF_IMPROVE_CHECKS (go test ./..., web/agent npm test,
+      // web build) are hardcoded to uzi's OWN layout and are meaningless against an
+      // arbitrary target repo, so this evidence block runs ONLY in dogfood mode. In
+      // generic mode it is skipped: selfImproveSection stays unset and no uzi-shaped
+      // check/guard-path evidence is produced — the generic plan directive already
+      // told the agent to discover and run the target repo's own gates during the run.
+      if (claim.kind === "self_improve" && claim.self_improve_dogfood) {
         batcher.emit({
           kind: "status",
           agent: "worker",

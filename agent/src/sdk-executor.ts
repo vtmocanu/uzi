@@ -1172,6 +1172,8 @@ export class SdkExecutor implements Executor {
             memory: ctx.memory,
             // Issue #297: the in-flight avoid-set, rendered in its own untrusted fence.
             inflightTargets: ctx.inflightTargets,
+            // PRD #686 M4: uzi-vs-generic directive selection (absent ⇒ generic).
+            selfImproveDogfood: ctx.selfImproveDogfood,
             // Issue #105: see above — the fixed self_improve branch's prior cycles.
             priorWork: ctx.priorWork,
             // See above. The fixed self_improve branch is routinely seeded off a previous

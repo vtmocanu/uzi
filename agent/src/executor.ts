@@ -171,6 +171,10 @@ export interface RunContext {
    *  active run's work. Absent/empty ⇒ no block injected. UNTRUSTED-content advisory
    *  data — rendered nonce-fenced, never as instructions. */
   inflightTargets?: string[];
+  /** PRD #686 M4: self_improve-only. When true the run is dogfooding uzi's OWN repo,
+   *  so the plan prompt uses the uzi-specific directive and the post-agent checks run
+   *  uzi's fixed suite. Absent ⇒ generic (an arbitrary target repo). */
+  selfImproveDogfood?: boolean;
   /** Per-run caps (timeouts in SECONDS, iterations); converted at use sites. */
   config?: ClaimConfig | null;
   /** SDK session to resume; null/absent for a fresh run. The runner clears this when
