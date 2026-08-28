@@ -199,7 +199,7 @@ export function AdminBranding() {
                   factory icon for your own; keeping the name co-brands, dropping it
                   is a full white-label.
                 </p>
-                <Field label="Mode" htmlFor="app-logo-mode">
+                <Field label="App logo mode" htmlFor="app-logo-mode">
                   <Select
                     id="app-logo-mode"
                     value={appLogoMode}
@@ -240,14 +240,16 @@ export function AdminBranding() {
                         </Button>
                       )}
                     </div>
-                    <label className="flex items-center gap-3">
+                    <div className="flex items-center gap-3">
                       <Toggle
                         checked={appLogoKeepName}
                         onChange={setAppLogoKeepName}
                         label="Keep the app name next to the logo"
                       />
-                      <span className="text-sm text-fg">Keep the app name next to the logo</span>
-                    </label>
+                      <span aria-hidden="true" className="text-sm text-fg">
+                        Keep the app name next to the logo
+                      </span>
+                    </div>
                   </>
                 )}
               </Card>
@@ -259,7 +261,7 @@ export function AdminBranding() {
                   An optional co-brand in the sidebar — a company name or a logo,
                   placed under the wordmark or tucked top-right of the header.
                 </p>
-                <Field label="Mode" htmlFor="brand-mode">
+                <Field label="POWERED BY mode" htmlFor="brand-mode">
                   <Select
                     id="brand-mode"
                     value={brandMode}
@@ -322,16 +324,16 @@ export function AdminBranding() {
                         <option value="topright">Top-right of the header</option>
                       </Select>
                     </Field>
-                    <label className="flex items-center gap-3">
+                    <div className="flex items-center gap-3">
                       <Toggle
                         checked={brandPlaque}
                         onChange={setBrandPlaque}
-                        label="Show a light plaque behind the logo"
+                        label="Show a light plaque behind the logo (for dark-ink uploads)"
                       />
-                      <span className="text-sm text-fg">
+                      <span aria-hidden="true" className="text-sm text-fg">
                         Show a light plaque behind the logo (for dark-ink uploads)
                       </span>
-                    </label>
+                    </div>
                   </>
                 )}
               </Card>

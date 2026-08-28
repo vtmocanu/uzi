@@ -107,9 +107,9 @@ describe("AdminBranding", () => {
   it("renders the default (unbranded) state with no upload controls", async () => {
     renderPage();
     // Mode selects default to their saved values.
-    const appMode = await screen.findByLabelText("Mode", { selector: "#app-logo-mode" });
+    const appMode = await screen.findByLabelText("App logo mode", { selector: "#app-logo-mode" });
     expect((appMode as HTMLSelectElement).value).toBe("default");
-    const brandMode = screen.getByLabelText("Mode", { selector: "#brand-mode" });
+    const brandMode = screen.getByLabelText("POWERED BY mode", { selector: "#brand-mode" });
     expect((brandMode as HTMLSelectElement).value).toBe("none");
     // Default app mode hides the upload input; none brand mode hides its controls.
     expect(screen.queryByLabelText("Upload app logo")).toBeNull();
@@ -118,7 +118,7 @@ describe("AdminBranding", () => {
 
   it("reveals the custom app-logo controls when custom mode is selected", async () => {
     renderPage();
-    const appMode = await screen.findByLabelText("Mode", { selector: "#app-logo-mode" });
+    const appMode = await screen.findByLabelText("App logo mode", { selector: "#app-logo-mode" });
     fireEvent.change(appMode, { target: { value: "custom" } });
     expect(screen.getByLabelText("Upload app logo")).toBeTruthy();
     expect(
@@ -128,7 +128,7 @@ describe("AdminBranding", () => {
 
   it("reveals the company input in text brand mode and the logo controls in logo mode", async () => {
     renderPage();
-    const brandMode = await screen.findByLabelText("Mode", { selector: "#brand-mode" });
+    const brandMode = await screen.findByLabelText("POWERED BY mode", { selector: "#brand-mode" });
 
     fireEvent.change(brandMode, { target: { value: "text" } });
     expect(screen.getByLabelText("Company name")).toBeTruthy();
@@ -140,10 +140,10 @@ describe("AdminBranding", () => {
 
   it("saves only the six branding keys with the edited values", async () => {
     renderPage();
-    const appMode = await screen.findByLabelText("Mode", { selector: "#app-logo-mode" });
+    const appMode = await screen.findByLabelText("App logo mode", { selector: "#app-logo-mode" });
     fireEvent.change(appMode, { target: { value: "custom" } });
 
-    const brandMode = screen.getByLabelText("Mode", { selector: "#brand-mode" });
+    const brandMode = screen.getByLabelText("POWERED BY mode", { selector: "#brand-mode" });
     fireEvent.change(brandMode, { target: { value: "text" } });
     fireEvent.change(screen.getByLabelText("Company name"), {
       target: { value: "Acme, Inc." },
@@ -167,7 +167,7 @@ describe("AdminBranding", () => {
 
   it("uploads a valid file to the app slot", async () => {
     renderPage();
-    const appMode = await screen.findByLabelText("Mode", { selector: "#app-logo-mode" });
+    const appMode = await screen.findByLabelText("App logo mode", { selector: "#app-logo-mode" });
     fireEvent.change(appMode, { target: { value: "custom" } });
 
     const file = new File([new Uint8Array(1024)], "logo.png", { type: "image/png" });
@@ -186,7 +186,7 @@ describe("AdminBranding", () => {
 
   it("blocks an over-cap file client-side and never calls upload", async () => {
     renderPage();
-    const appMode = await screen.findByLabelText("Mode", { selector: "#app-logo-mode" });
+    const appMode = await screen.findByLabelText("App logo mode", { selector: "#app-logo-mode" });
     fireEvent.change(appMode, { target: { value: "custom" } });
 
     // 262145 bytes = cap + 1.
@@ -201,7 +201,7 @@ describe("AdminBranding", () => {
 
   it("rejects a non-image type client-side and never calls upload", async () => {
     renderPage();
-    const brandMode = await screen.findByLabelText("Mode", { selector: "#brand-mode" });
+    const brandMode = await screen.findByLabelText("POWERED BY mode", { selector: "#brand-mode" });
     fireEvent.change(brandMode, { target: { value: "logo" } });
 
     const gif = new File([new Uint8Array(16)], "x.gif", { type: "image/gif" });
@@ -219,7 +219,7 @@ describe("AdminBranding", () => {
     mockApi.branding.mockResolvedValue(branding({ app_logo_present: true, app_logo_mode: "custom" }));
     renderPage();
     // Custom mode is loaded from saved settings; make it custom to show the remove button.
-    const appMode = await screen.findByLabelText("Mode", { selector: "#app-logo-mode" });
+    const appMode = await screen.findByLabelText("App logo mode", { selector: "#app-logo-mode" });
     fireEvent.change(appMode, { target: { value: "custom" } });
 
     fireEvent.click(screen.getByRole("button", { name: "Remove logo" }));
@@ -229,7 +229,7 @@ describe("AdminBranding", () => {
   it("surfaces a server upload error", async () => {
     mockApi.uploadBrandingLogo.mockRejectedValue(new ApiError(400, "logo must be at most 262144 bytes"));
     renderPage();
-    const appMode = await screen.findByLabelText("Mode", { selector: "#app-logo-mode" });
+    const appMode = await screen.findByLabelText("App logo mode", { selector: "#app-logo-mode" });
     fireEvent.change(appMode, { target: { value: "custom" } });
 
     const file = new File([new Uint8Array(1024)], "logo.png", { type: "image/png" });
