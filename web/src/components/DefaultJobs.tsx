@@ -20,6 +20,7 @@ import type { CatalogEntry, Repo, Schedule, ScheduleCatalog } from "../lib/api";
 import { humanizeCron } from "../lib/schedulePresets";
 import { RepoMultiSelect } from "./RepoMultiSelect";
 import { ScheduleGroupRow, ScheduleSubRow } from "./ScheduleGroupRow";
+import { formatStamp } from "./LastRun";
 import { SweepLabelWarn } from "./SweepLabelWarn";
 import { Alert, Badge, Button, Toggle } from "./ui";
 import {
@@ -477,16 +478,4 @@ function Chip({ children }: { children: React.ReactNode }) {
       {children}
     </span>
   );
-}
-
-function formatStamp(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  return new Intl.DateTimeFormat(undefined, {
-    weekday: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-    month: "short",
-    day: "numeric",
-  }).format(d);
 }
