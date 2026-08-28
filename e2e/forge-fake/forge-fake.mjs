@@ -617,13 +617,23 @@ function handleGit(req, res, url) {
   });
 }
 
+// Extract the credential from an `Authorization: <scheme> <credential>` header.
+// Returns "" when the header is absent or does not match. The capture starts at a
+// non-space (\S) so `\s+` and the capture cannot both match whitespace, avoiding the
+// polynomial-backtracking shape CodeQL flags; results are identical for real headers.
+// `scheme` is always a caller-supplied literal, so the RegExp interpolation is safe.
+function authCredential(req, scheme) {
+  const m = new RegExp(`^${scheme}\\s+(\\S.*)$`, "i").exec(req.headers["authorization"] || "");
+  return m ? m[1] : "";
+}
+
 // The Authorization: Basic credential must decode to EXPECT_USER:EXPECT_PAT. This
 // is the regression guard: git-over-HTTPS must send Basic (the M6 auth fix), not
 // GitLab's REST-only PRIVATE-TOKEN.
 function basicAuthOk(req) {
-  const m = /^Basic\s+(.+)$/i.exec(req.headers["authorization"] || "");
-  if (!m) return false;
-  const decoded = Buffer.from(m[1], "base64").toString("utf8");
+  const cred = authCredential(req, "Basic");
+  if (!cred) return false;
+  const decoded = Buffer.from(cred, "base64").toString("utf8");
   const i = decoded.indexOf(":");
   const user = i >= 0 ? decoded.slice(0, i) : "";
   const pass = i >= 0 ? decoded.slice(i + 1) : "";
@@ -896,8 +906,7 @@ const server = https.createServer(
       // PAT the harness uses (M4's fail-safe fires on 0 or >1 matches). No expiry /
       // active field (Forgejo has none) -> the driver sets Active=true, ExpiresAt=0.
       // Scopes are REORDERED vs mint order to exercise D6b's set-compare.
-      const m = /^token\s+(.+)$/i.exec(req.headers["authorization"] || "");
-      const pat = m ? m[1] : "";
+      const pat = authCredential(req, "token");
       const last8 = pat.length >= 8 ? pat.slice(-8) : pat;
       // Over-privileged iff the PAT itself signals it ("overpriv"), so the harness
       // can drive both the compliant seed PAT and a rejected over-privileged one
@@ -1173,8 +1182,7 @@ const server = https.createServer(
       // NO fine-grained (github_pat_) prefix and a real X-OAuth-Scopes header, so the
       // driver treats the token as an introspectable classic PAT.
       if (method === "GET" && g === "/user") {
-        const m = /^Bearer\s+(.+)$/i.exec(req.headers["authorization"] || "");
-        const tok = m ? m[1] : "";
+        const tok = authCredential(req, "Bearer");
         const scopes = /overpriv|workflow/.test(tok) ? "repo, workflow" : "repo";
         res.writeHead(200, { "Content-Type": "application/json", "X-OAuth-Scopes": scopes });
         return res.end(JSON.stringify({ id: 1, login: "uzi-bot", site_admin: false }));
