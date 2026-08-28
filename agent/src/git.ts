@@ -607,41 +607,95 @@ export class GitCache {
       } else if (checkpointSetAside && checkpointExists && await this.isWipParkMarker(barePath, checkpointRef)) {
         // #4 — CROSS-WORKER DIVERGED. `main` advanced during the park, so the mirrored
         // checkpoint is not a strict descendant of the floor and the strict-descendant guard
-        // set it aside (baseSha = floor). When the checkpoint tip is a `wip(park):` marker,
-        // ATTEMPT to rebase just the WIP tree onto the new floor: `cherry-pick --no-commit`
-        // 3-way-merges the marker commit's diff-against-its-parent onto HEAD (the floor) and
-        // leaves it staged/uncommitted — "the WIP tree on the new floor", no commit. A
-        // checkpoint whose tip is a real committed divergence is NOT touched here (the guard
-        // above only reaches this on a marker tip): committed divergence needs a human, and
-        // cherry-picking only the tip would silently drop committed milestones.
-        try {
-          await this.runGitAsRunner(clonePath, ["cherry-pick", "--no-commit", checkpointRef]);
-          // SUCCESS — the WIP is recovered as uncommitted on the floor. It rides on top of
-          // the floor base (priorCommits stays 0 for this leg: no committed work recovered),
-          // so seededFrom stays the floor leg. It was recovered, not set aside.
-          wipRecovered = true;
-          checkpointSetAside = false;
-          this.log.info("runner clone: recovered diverged wip(park) checkpoint onto new floor (cherry-pick --no-commit)", {
+        // set it aside (baseSha = floor). When the checkpoint tip is a `wip(park):` marker we
+        // MAY recover just the WIP tree onto the new floor — but only when doing so drops NO
+        // committed work. Two things the naive `cherry-pick --no-commit <ref>` got wrong,
+        // both fixed here (PRD #759 M2):
+        //
+        //  (1) DOA — the ref never resolves in the clone. The runner clone is created below
+        //      with `git clone --shared --no-checkout`, which copies NONE of the bare's
+        //      custom refs, so `refs/uzi-checkpoints/*` is absent from the clone and a
+        //      cherry-pick BY REF NAME always `fatal: bad revision`d — this leg could never
+        //      recover. The OBJECTS are reachable via the `--shared` alternate; only the ref
+        //      NAME is missing. So resolve the marker to a 40-char SHA against the BARE
+        //      (mirroring the strict-descendant guard's rev-parse ~:483) and cherry-pick the
+        //      SHA, which the clone can name through its alternate.
+        //  (2) Silent milestone drop. `cherry-pick --no-commit <marker>` applies ONLY the
+        //      marker's diff against ITS OWN parent (the WIP delta). If the diverged
+        //      checkpoint carries committed-but-unpushed milestones between the fork point
+        //      and the marker (`fork → m1 → wip-marker`, the exact #628 shape), picking only
+        //      the tip DROPS m1's content — silently, when m1 touches files disjoint from the
+        //      WIP so the pick still applies clean — AND flips checkpointSetAside=false,
+        //      suppressing the loud set-aside notice. So gate the recovery on there being NO
+        //      committed work below the marker: the marker's PARENT must be an ancestor of the
+        //      floor (isAncestor is true at equality — the #685 zero-commit shape where the
+        //      marker sits directly on floor_at_park, itself an ancestor of the advanced
+        //      floor). If the parent is NOT an ancestor of the floor, committed divergence
+        //      lives below the marker: leave it set aside for a human, do NOT cherry-pick.
+        const checkpointMarkerSha = (
+          await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${checkpointRef}^{commit}`])
+        ).trim();
+        const checkpointMarkerParentSha = checkpointMarkerSha === ""
+          ? ""
+          : (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${checkpointMarkerSha}^^{commit}`])).trim();
+        if (checkpointMarkerParentSha === "") {
+          // A root-commit marker (no parent), or a failed tip/parent read: no fork point to
+          // test against the floor, so we cannot prove that no committed work would be
+          // dropped. Keep it set aside (the loud notice is preserved), do not cherry-pick.
+          this.log.warn("runner clone: diverged wip(park) checkpoint has no readable parent — left set aside (no recovery)", {
             branch,
             checkpoint: checkpointRef,
             floor: baseSha,
-            seeded_from: seededFrom,
           });
-        } catch (err) {
-          // FAILURE (merge conflict / any error) — recovery FAILED. Guarantee a pristine
-          // floor tree (abort the half-applied pick, hard-reset to the floor, clean
-          // untracked) and report failure: checkpointSetAside stays true, wipRecovered
-          // false, seededFrom unchanged. This is the required SAFE FAILURE (SC#1(b)): a
-          // diverged non-clean case reports failure rather than silently dropping OR
-          // force-applying work.
-          await this.runGitAsRunner(clonePath, ["cherry-pick", "--abort"]).catch(() => undefined);
-          await this.runGitAsRunner(clonePath, ["reset", "--hard", baseSha]).catch(() => undefined);
-          await this.runGitAsRunner(clonePath, ["clean", "-fd"]).catch(() => undefined);
-          this.log.warn("runner clone: diverged wip(park) checkpoint did NOT apply cleanly onto new floor — recovery failed (set aside)", {
+        } else if (await this.isAncestor(barePath, checkpointMarkerParentSha, baseSha)) {
+          // The marker sits directly on a floor-ancestor: no committed milestones live below
+          // it, so recovering just the WIP delta drops nothing. Cherry-pick the resolved SHA
+          // (NOT the ref name — see (1)) `--no-commit` so the WIP tree lands staged/uncommitted
+          // on the floor.
+          try {
+            await this.runGitAsRunner(clonePath, ["cherry-pick", "--no-commit", checkpointMarkerSha]);
+            // SUCCESS — the WIP is recovered as uncommitted on the floor. It rides on top of
+            // the floor base (priorCommits stays 0 for this leg: no committed work recovered),
+            // so seededFrom stays the floor leg. It was recovered, not set aside.
+            wipRecovered = true;
+            checkpointSetAside = false;
+            this.log.info("runner clone: recovered diverged wip(park) checkpoint onto new floor (cherry-pick --no-commit)", {
+              branch,
+              checkpoint: checkpointRef,
+              marker: checkpointMarkerSha,
+              floor: baseSha,
+              seeded_from: seededFrom,
+            });
+          } catch (err) {
+            // FAILURE (merge conflict) — a WIP that touches files main also moved conflicts
+            // even with a floor-ancestor parent; that is the genuine unclean case. Guarantee a
+            // pristine floor tree (abort the half-applied pick, hard-reset to the floor, clean
+            // untracked) and report failure: checkpointSetAside stays true, wipRecovered false,
+            // seededFrom unchanged. Required SAFE FAILURE (SC#1(b)): reports failure rather than
+            // silently dropping OR force-applying work.
+            await this.runGitAsRunner(clonePath, ["cherry-pick", "--abort"]).catch(() => undefined);
+            await this.runGitAsRunner(clonePath, ["reset", "--hard", baseSha]).catch(() => undefined);
+            await this.runGitAsRunner(clonePath, ["clean", "-fd"]).catch(() => undefined);
+            this.log.warn("runner clone: diverged wip(park) checkpoint did NOT apply cleanly onto new floor — recovery failed (set aside)", {
+              branch,
+              checkpoint: checkpointRef,
+              floor: baseSha,
+              error: gitErrorMessage(err),
+            });
+          }
+        } else {
+          // The marker's parent is NOT an ancestor of the floor: committed-but-unpushed work
+          // (m1…mN) lives between the fork point and the marker. Cherry-picking only the tip
+          // would silently drop it AND flip off the set-aside notice, reporting a partial
+          // recovery as full success. Leave it set aside (checkpointSetAside stays true,
+          // wipRecovered false, seededFrom unchanged) so the loud notice tells the human that
+          // committed work was left behind.
+          this.log.warn("runner clone: diverged wip(park) checkpoint carries committed divergence below the marker — left set aside for a human (no cherry-pick)", {
             branch,
             checkpoint: checkpointRef,
+            marker: checkpointMarkerSha,
+            markerParent: checkpointMarkerParentSha,
             floor: baseSha,
-            error: gitErrorMessage(err),
           });
         }
       }
