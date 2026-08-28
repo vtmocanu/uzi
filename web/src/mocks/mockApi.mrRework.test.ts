@@ -88,7 +88,7 @@ describe("mockApi honours the mr_rework_enabled opt-in (PRD #700 M6)", () => {
 
     // Seed: default-ON is the null/absent state, read as enabled by the UI.
     const seeded = await api.getMySettings();
-    expect(seeded.settings.mr_rework_enabled ?? null).toBeNull();
+    expect(seeded.settings.mr_rework_enabled).toBeNull();
 
     // Opt out: an explicit false persists as false.
     const off = await api.putMySettings({ mr_rework_enabled: false });
@@ -102,18 +102,22 @@ describe("mockApi honours the mr_rework_enabled opt-in (PRD #700 M6)", () => {
     api = await reload();
     expect((await api.getMySettings()).settings.mr_rework_enabled).toBe(false);
 
-    // A theme-only save leaves the opt-out untouched (PATCH semantics).
+    // A theme-only save leaves the opt-out untouched (PATCH semantics), and the
+    // opt-out must survive a reload after that unrelated write too (a PATCH that
+    // dropped the flag would only surface after the storage round-trip).
     await api.putMySettings({ theme: "mission" });
+    expect((await api.getMySettings()).settings.mr_rework_enabled).toBe(false);
+    api = await reload();
     expect((await api.getMySettings()).settings.mr_rework_enabled).toBe(false);
 
     // Clear back to the default-ON state with a null.
     const cleared = await api.putMySettings({ mr_rework_enabled: null });
-    expect(cleared.settings.mr_rework_enabled ?? null).toBeNull();
+    expect(cleared.settings.mr_rework_enabled).toBeNull();
 
     // Reload again: the cleared (default-ON null) state must also round-trip through
     // storage, so a subsequent session reads it back as the default rather than a
     // stale persisted false.
     api = await reload();
-    expect((await api.getMySettings()).settings.mr_rework_enabled ?? null).toBeNull();
+    expect((await api.getMySettings()).settings.mr_rework_enabled).toBeNull();
   });
 });
