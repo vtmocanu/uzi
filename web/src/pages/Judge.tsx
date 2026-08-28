@@ -535,9 +535,12 @@ export function Judge() {
           whole-backlog count and can only honestly reconcile against a whole-backlog group
           total), when the backlog is truncated (the truncation Alert already flags the picture
           as incomplete), and when the group total is 0 (a failed/empty category-stats fetch,
-          which would otherwise read "across 0 groups"). The "Showing N groups" line below stays
-          unchanged and covers the filtered/on-screen scope. */}
-      {!loading && backlog && !showZeroState && triage && categories.length === 0 && !backlog.truncated && bridgeGroupTotal > 0 && (
+          which would otherwise read "across 0 groups"). Also suppressed under a run anchor
+          (`?run=`): the recommendation half (`triage`) is whole-account, computed with no run
+          argument, while the group half is run-anchor scoped, so the two cannot honestly
+          reconcile there either. The "Showing N groups" line below stays unchanged and covers
+          the filtered/on-screen scope. */}
+      {!loading && backlog && !showZeroState && !runAnchor && triage && categories.length === 0 && !backlog.truncated && bridgeGroupTotal > 0 && (
         <p className="text-sm text-muted">
           {judgeBridgeLine(bucketTabCount(triage, bucket), bridgeGroupTotal, bucket)}
         </p>

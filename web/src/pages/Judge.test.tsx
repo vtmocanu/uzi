@@ -1032,6 +1032,23 @@ describe("Judge — the row-vs-group bridge line (#620)", () => {
     // …but the bridge would read "across 0 groups", so it is withheld entirely.
     expect(screen.queryByText(/recommendations across/)).toBeNull();
   });
+
+  it("is suppressed under a run anchor (the rec half is whole-account, the group half run-scoped)", async () => {
+    // Absent the fix the bridge WOULD render: triage is non-zero (whole-account, no run arg on
+    // the server) and the run-anchor category-stats sum is non-zero, so both guard terms pass.
+    // But `triage` is "across all your runs" while the group half is scoped to this one run, so
+    // the two cannot honestly reconcile under `?run=` and the bridge must be withheld.
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog({ bucket: "all", run: "run-1", triage }));
+    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts_by_bucket });
+    renderJudge(["/judge?run=run-1"]);
+
+    // The run-anchor filter banner renders, so the page settled under the anchor…
+    await waitFor(() => expect(screen.getByText(/Filtered to one run's recommendations/i)).toBeTruthy());
+    // …but the whole-account/run-scoped mismatch means the bridge is withheld. The lowercase
+    // regex deliberately does not match the capital-R "Recommendations across all your runs"
+    // subtitle.
+    expect(screen.queryByText(/recommendations across/)).toBeNull();
+  });
 });
 
 describe("Judge — the subtitle and filter-panel caption copy (#620)", () => {
