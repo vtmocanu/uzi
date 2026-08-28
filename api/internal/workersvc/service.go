@@ -1711,12 +1711,27 @@ func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store
 }
 
 // claimExclude is the credential this claim must NOT resolve onto: the run's
-// just-parked dead credential (PRD #217), but only WHILE its usage window is still
-// closed. Once retry_not_before has passed — which is what let PromoteLimitWaitRuns
-// return the run to queued — the window has reopened and the resume is free to
-// re-pick or floor onto that very token (#754 M3 exclude-relax), which is how a
-// single-pooled-token user "continues on cristi" instead of holding. A run with no
-// dead credential (every non-resume claim) excludes nothing.
+// just-parked dead credential (PRD #217), but only WHILE it is not yet due to retry.
+// retry_not_before is the run's retry CADENCE, not a proof the token's real Anthropic
+// window has reopened — decideLimitPark can set it below the true reset (Decision 6e
+// lowers it to a pooled alternative's availability; the report-less fallback is a
+// 15m-doubling guess, limitwait.go). So once retry_not_before has passed — which is
+// exactly what let PromoteLimitWaitRuns return the run to queued — the run is DUE for
+// another attempt, and #754 M3 relaxes the exclusion so the resume re-picks or floors
+// onto that very token instead of holding or switching accounts. That is how a
+// single-pooled-token user "continues on cristi": each cadence it re-floors onto the
+// token; if the window is genuinely still closed the worker re-parks with a fresh
+// real-reset report, and the thrash converges in ~one cycle (bounded overall by
+// RUN_LIMIT_MAX_WAITS, whose terminus is a failed run, not a mis-spend — the
+// deliberate #754 tradeoff). A run with no dead credential (every non-resume claim)
+// excludes nothing.
+//
+// The "still excluding" branch (a claimable run whose retry_not_before is still in the
+// future) is DEFENSIVE: limit_wait's only production exit is PromoteLimitWaitRuns at
+// retry_not_before <= now, so no normal resume reaches this function with a future
+// stamp. It is kept because excluding is the safe answer should any future transition
+// ever hand a not-yet-due run to the claim path, and the M2 exclusion tests inject a
+// future stamp to exercise it.
 func (s *Service) claimExclude(run store.Run) uuid.UUID {
 	if !run.LimitDeadSecretID.Valid {
 		return uuid.Nil
