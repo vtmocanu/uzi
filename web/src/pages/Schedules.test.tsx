@@ -600,6 +600,53 @@ describe("Schedules — sibling groups (PRD #636 M3)", () => {
   });
 });
 
+// ── issue #690: per-repo last-run parity on grouped sub-rows ───────────────────
+describe("Schedules — last-run parity on grouped sub-rows (issue #690)", () => {
+  it("a grouped sub-row with a last_fire shows the outcome badge and expands to the fire detail", async () => {
+    // Only the uzi sibling carries a fire; the atlas sibling never fired. That keeps the
+    // "Last fire" disclosure unambiguous (one sub-row has it) while proving both the
+    // outcome-badge and never-fired branches render per-repo.
+    mockApi.listSchedules.mockResolvedValue([
+      sched({
+        id: "g1",
+        target: "prompt",
+        prompt: "grouped job",
+        repo_id: "repo-uzi",
+        repo_path: "vtmocanu/uzi",
+        sibling_group_id: "grp-1",
+        last_fire: fire({
+          matched: 1,
+          started: [{ issue_iid: 8, run_id: "88888888-0000-0000-0000-000000000000", title: "grouped started" }],
+        }),
+      }),
+      sched({
+        id: "g2",
+        target: "prompt",
+        prompt: "grouped job",
+        repo_id: "repo-atlas",
+        repo_path: "vtmocanu/atlas",
+        sibling_group_id: "grp-1",
+        last_fire: null,
+        last_fired_at: null,
+      }),
+    ]);
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: /Show repos for Prompt: grouped job/ }));
+    await waitFor(() => expect(screen.getByRole("switch", { name: "Pause on vtmocanu/uzi" })).toBeTruthy());
+
+    // The uzi sub-row shows the enriched green outcome badge; the atlas sub-row never fired.
+    expect(screen.getByText("1 started")).toBeTruthy();
+    expect(screen.getByText("— never fired")).toBeTruthy();
+
+    // Only one sub-row carries a fire, so the disclosure is unambiguous. Expanding reveals
+    // the started run (LastFireDetail) below that sub-row's flex row.
+    expect(screen.queryByText("grouped started")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Last fire" }));
+    expect(screen.getByText("grouped started")).toBeTruthy();
+  });
+});
+
 // ── issue #638: issue schedules can't span repos + per-repo target badges ───────
 describe("Schedules — issue-target add-repo gating + sub-row badges (issue #638)", () => {
   const reason = "Issue schedules can't span repos - issue numbers are repo-relative";

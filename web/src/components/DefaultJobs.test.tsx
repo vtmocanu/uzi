@@ -11,8 +11,9 @@
 // lock marker is retained (it encodes a baked/read-only prompt).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { DefaultJobs } from "./DefaultJobs";
-import { api, type CatalogEntry, type Repo, type Schedule, type ScheduleCatalog } from "../lib/api";
+import { api, type CatalogEntry, type LastFire, type Repo, type Schedule, type ScheduleCatalog } from "../lib/api";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
@@ -103,22 +104,25 @@ function noop() {}
 const asyncNoop = async () => {};
 
 function renderTab(props: Partial<Parameters<typeof DefaultJobs>[0]> = {}) {
+  // Wrapped in a router: a sub-row's expanded LastFireDetail renders <Link> run chips.
   return render(
-    <DefaultJobs
-      catalog={props.catalog ?? catalog([entry()])}
-      schedules={props.schedules ?? []}
-      repos={props.repos ?? REPOS}
-      busyId=""
-      onEnable={props.onEnable ?? asyncNoop}
-      onTogglePause={noop}
-      onRunNow={noop}
-      onReset={noop}
-      onClone={noop}
-      onRemove={noop}
-      onEdit={noop}
-      notice=""
-      error=""
-    />,
+    <MemoryRouter>
+      <DefaultJobs
+        catalog={props.catalog ?? catalog([entry()])}
+        schedules={props.schedules ?? []}
+        repos={props.repos ?? REPOS}
+        busyId=""
+        onEnable={props.onEnable ?? asyncNoop}
+        onTogglePause={noop}
+        onRunNow={noop}
+        onReset={noop}
+        onClone={noop}
+        onRemove={noop}
+        onEdit={noop}
+        notice=""
+        error=""
+      />
+    </MemoryRouter>,
   );
 }
 
@@ -237,6 +241,59 @@ describe("DefaultJobs — Layout A (one summary row, per-repo sub-rows)", () => 
     // repo-atlas (not materialized) is offered; repo-uzi (materialized) is not.
     expect(within(picker).getByRole("option", { name: "vtmocanu/atlas-api" })).toBeTruthy();
     expect(within(picker).queryByRole("option", { name: "vtmocanu/uzi" })).toBeNull();
+  });
+});
+
+// ── issue #690: per-repo last-run parity on default sub-rows ────────────────────
+const NOW = new Date().toISOString();
+function fire(over: Partial<LastFire>): LastFire {
+  return { fired_at: NOW, matched: 0, capped: false, started: [], skips: [], ...over };
+}
+
+describe("DefaultJobs — last-run parity on sub-rows (issue #690)", () => {
+  it("an enabled default sub-row with a last_fire shows the outcome badge and expands to the fire detail", async () => {
+    const schedules = [
+      defRow({
+        id: "sch-uzi",
+        repo_id: "repo-uzi",
+        repo_path: "vtmocanu/uzi",
+        last_fire: fire({
+          matched: 1,
+          started: [{ issue_iid: 7, run_id: "77777777-0000-0000-0000-000000000000", title: "started thing" }],
+        }),
+      }),
+    ];
+    renderTab({ schedules });
+
+    // Expand the summary to reveal the single per-repo sub-row.
+    fireEvent.click(screen.getByRole("button", { name: /Show repos for Bug triage sweep/ }));
+    await waitFor(() => expect(screen.getByRole("switch", { name: "Pause on vtmocanu/uzi" })).toBeTruthy());
+
+    // Collapsed sub-row: the enriched green outcome badge, no detail panel yet (non-vacuous
+    // against the expanded assertion below).
+    expect(screen.getByText("1 started")).toBeTruthy();
+    expect(screen.queryByText("started thing")).toBeNull();
+
+    // One sub-row, so the "Last fire" disclosure is unambiguous. Expanding reveals the
+    // started run (LastFireDetail) below the flex row.
+    fireEvent.click(screen.getByRole("button", { name: "Last fire" }));
+    expect(screen.getByText("started thing")).toBeTruthy();
+  });
+
+  it("an enabled default sub-row that never fired shows the '— never fired' fallback and offers no disclosure", async () => {
+    const schedules = [
+      defRow({ id: "sch-uzi", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi", last_fire: null, last_fired_at: null }),
+    ];
+    renderTab({ schedules });
+
+    fireEvent.click(screen.getByRole("button", { name: /Show repos for Bug triage sweep/ }));
+    await waitFor(() => expect(screen.getByRole("switch", { name: "Pause on vtmocanu/uzi" })).toBeTruthy());
+
+    // Scope to the sub-row (the group summary's Last-run cell also shows "— never fired"
+    // when no member has fired). The never-fired fallback is present and offers no disclosure.
+    const subRow = screen.getByRole("switch", { name: "Pause on vtmocanu/uzi" }).closest<HTMLElement>("div.rounded-lg")!;
+    expect(within(subRow).getByText("— never fired")).toBeTruthy();
+    expect(within(subRow).queryByRole("button", { name: "Last fire" })).toBeNull();
   });
 });
 

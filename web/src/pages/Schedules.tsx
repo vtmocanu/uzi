@@ -823,12 +823,33 @@ function MyScheduleSubRow({
 }) {
   const repoLabel = s.repo_path || "repo unavailable";
   const nextFire = s.next_fires[0] ?? s.next_fire_at;
+  const [expanded, setExpanded] = useState(false);
+  const panelId = `last-fire-${s.id}`;
   return (
     <ScheduleSubRow
       repoLabel={repoLabel}
       enabled={s.enabled}
       cronExpr={s.cron_expr}
       nextFire={nextFire}
+      panelId={panelId}
+      // Per-repo last-run parity with the standalone ScheduleRow (issue #690): the same
+      // three-way fallback (outcome badge / bare stamp / never-fired), and the expandable
+      // detail rendered below the flex row only while expanded.
+      lastRun={
+        s.last_fire ? (
+          <LastRunOutcome
+            fire={s.last_fire}
+            expanded={expanded}
+            onToggle={() => setExpanded((v) => !v)}
+            panelId={panelId}
+          />
+        ) : s.last_fired_at ? (
+          <div className="text-[12.5px] text-muted">{formatStamp(s.last_fired_at)}</div>
+        ) : (
+          <span className="text-faint">— never fired</span>
+        )
+      }
+      lastRunDetail={s.last_fire && expanded ? <LastFireDetail s={s} fire={s.last_fire} /> : null}
       // Per-repo target pill: the group summary no longer carries the type (PRD #636 M3),
       // and a sibling can diverge (it is an independently editable row), so surface each
       // row's own target here rather than dropping it silently.
