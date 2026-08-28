@@ -29,7 +29,7 @@ func TestSelectPoolNonEmptyWhenSoleTokenExcluded(t *testing.T) {
 			"stays ReasonPoolEmpty", got.Reason, ReasonPoolEmpty)
 	}
 	if !got.PoolNonEmpty {
-		t.Fatalf("PoolNonEmpty = false, want true — an AutoEligible token exists even though it is "+
+		t.Fatalf("PoolNonEmpty = false, want true — an AutoEligible token exists even though it is " +
 			"excluded; PoolNonEmpty must be ORed BEFORE the exclude skip")
 	}
 }

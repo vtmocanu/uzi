@@ -113,7 +113,8 @@ func TestAutoChoiceFloorExcludesDeadDefaultWhenAnotherPooledTokenExists(t *testi
 // dead credential, there is nothing else pooled to spend — and the auto lane must NOT
 // fall to the non-pooled owner default (the #754 bug). Floor.ok is false (the sole
 // pooled candidate is excluded), so autoChoice signals errAutoPoolEmpty and the claim
-// HOLDS: it requeues, records nothing, and never spends the default.
+// HOLDS: it transitions to pool_wait (PRD #754 M4), records nothing, and never spends
+// the default.
 //
 // MUTATION THIS CATCHES: reinstating the owner-default fallback here → the dead
 // default (or the plain default) is re-spent instead of the run holding.
@@ -137,11 +138,15 @@ func TestAutoChoiceHoldsWhenTheOnlyPooledTokenIsTheDeadCredential(t *testing.T) 
 		t.Fatalf("recorded a credential when the only pooled token was dead: %+v — above all it must not be the default",
 			f.fs.recordedCreds)
 	}
-	if f.fs.requeuedRun == nil || *f.fs.requeuedRun != f.runID {
-		t.Fatalf("run not requeued: %v — an empty-pool hold is transient", f.fs.requeuedRun)
+	// PRD #754 M4: the empty-pool hold now transitions the run to pool_wait, not requeue.
+	if f.fs.poolWaitHeld == nil || f.fs.poolWaitHeld.ID != f.runID {
+		t.Fatalf("run not held in pool_wait: %v — an empty-pool hold holds the run", f.fs.poolWaitHeld)
+	}
+	if f.fs.requeuedRun != nil {
+		t.Fatalf("run was requeued (%v); M4 replaced the requeue with the pool_wait hold", f.fs.requeuedRun)
 	}
 	if f.fs.markedFailed != nil {
-		t.Fatalf("the run was failed terminally (%v); the empty-pool hold must not hard-fail (M2 interim)", f.fs.markedFailed)
+		t.Fatalf("the run was failed terminally (%v); the empty-pool hold must not hard-fail", f.fs.markedFailed)
 	}
 }
 

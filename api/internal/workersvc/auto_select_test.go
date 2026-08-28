@@ -97,9 +97,9 @@ func newAutoFixture(t *testing.T) autoFixture {
 		byIDLabels: map[uuid.UUID]string{emptyID: "spare-key", fullID: "console-key"},
 	}
 	// A default pool of ONE fresh, eligible, openable pooled token (#754 M2). An auto
-	// worker with a genuinely empty pool now HOLDS (errAutoPoolEmpty ⇒ requeue) rather
-	// than spending the non-pooled owner default, so a fixture with no pool would leave
-	// every claim idle. Tests that exercise the pool set autoCandidates themselves,
+	// worker with a genuinely empty pool now HOLDS (errAutoPoolEmpty ⇒ pool_wait, M4)
+	// rather than spending the non-pooled owner default, so a fixture with no pool would
+	// leave every claim idle. Tests that exercise the pool set autoCandidates themselves,
 	// overriding this default; tests that only need a working run-lane payload (the
 	// limit-park suite) inherit it and resolve to emptyID.
 	fs.autoCandidates = []store.ListAutoSelectCandidatesRow{
@@ -290,8 +290,9 @@ func TestSelfImproveIgnoresTheWorkerBindMode(t *testing.T) {
 //   - a pool with tokens but none measurable FLOORS onto the best pooled token,
 //     recorded as pool_stale with no headroom — the SPENT id is the pooled token, not
 //     f.fs.defaultCredID();
-//   - a GENUINELY empty pool holds: the claim requeues (errAutoPoolEmpty), records no
-//     credential at all, and above all never records the default.
+//   - a GENUINELY empty pool holds: the claim transitions the run to pool_wait
+//     (errAutoPoolEmpty ⇒ SetRunPoolWait, PRD #754 M4), records no credential at all,
+//     and above all never records the default.
 //
 // MUTATION THIS CATCHES: reinstating the owner-default fallback on either rung — the
 // stale case would record defaultCredID() (caught by the explicit != default assert),
@@ -343,7 +344,7 @@ func TestAutoFloorsOntoAPooledTokenNeverTheDefault(t *testing.T) {
 		}
 	})
 
-	t.Run("a genuinely empty pool holds — requeues, records nothing, never the default", func(t *testing.T) {
+	t.Run("a genuinely empty pool holds in pool_wait — records nothing, never the default, not failed", func(t *testing.T) {
 		for _, tc := range []struct {
 			name string
 			rows func(f autoFixture) []store.ListAutoSelectCandidatesRow
@@ -363,17 +364,22 @@ func TestAutoFloorsOntoAPooledTokenNeverTheDefault(t *testing.T) {
 				f := newAutoFixture(t)
 				f.fs.autoCandidates = tc.rows(f)
 				if payload := f.claim(t); payload != nil {
-					t.Fatal("a genuinely empty pool returned a payload; M2 holds (requeues) rather than spending the default")
+					t.Fatal("a genuinely empty pool returned a payload; the auto lane holds in pool_wait rather than spending the default")
 				}
 				if len(f.fs.recordedCreds) != 0 {
 					t.Fatalf("an empty-pool hold recorded a credential: %+v — it must spend nothing, above all not the default",
 						f.fs.recordedCreds)
 				}
-				if f.fs.requeuedRun == nil || *f.fs.requeuedRun != f.runID {
-					t.Fatalf("run not requeued: %v — the empty-pool hold is transient like a locked vault", f.fs.requeuedRun)
+				// PRD #754 M4: the empty-pool claim now HOLDS the run in pool_wait
+				// (SetRunPoolWait) instead of the M2 interim requeue-to-queued.
+				if f.fs.poolWaitHeld == nil || f.fs.poolWaitHeld.ID != f.runID {
+					t.Fatalf("run not held in pool_wait: %v — an empty pool holds the run, not requeues it", f.fs.poolWaitHeld)
+				}
+				if f.fs.requeuedRun != nil {
+					t.Fatalf("run was requeued (%v); M4 replaced the requeue with the pool_wait hold", f.fs.requeuedRun)
 				}
 				if f.fs.markedFailed != nil {
-					t.Fatalf("the run was failed terminally (%v); an empty pool must not hard-fail (M2 interim)", f.fs.markedFailed)
+					t.Fatalf("the run was failed terminally (%v); an empty pool must not hard-fail — it holds in pool_wait", f.fs.markedFailed)
 				}
 			})
 		}

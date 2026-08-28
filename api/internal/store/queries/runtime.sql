@@ -1791,6 +1791,53 @@ UPDATE runs SET status = 'queued', status_since = now(),
     updated_at = now()
 WHERE id = @id AND status = 'claimed';
 
+-- name: SetRunPoolWait :execrows
+-- Hold an `auto` run whose token pool is genuinely empty (PRD #754 M4). claimed →
+-- pool_wait, NON-TERMINAL and NON-LOCKING: the run keeps its worker_id affinity, and
+-- M5 resumes it (reactively when a token is pooled, or manually). This REPLACES M2's
+-- interim requeue (RequeueClaimedRunToQueued on errAutoPoolEmpty): the auto lane must
+-- never spend the non-pooled owner default and must not hard-fail a holdable run, so
+-- a distinct status is the hold rather than churning the queue.
+--
+-- 🔴 THE SOURCE GUARD IS POSITIVE (status = 'claimed'), like SetRunLimitWait's
+-- status='running' and unlike the negative sibling guards above. A held run only ever
+-- comes from a JUST-CLAIMED run in assembleClaim (recoverClaimAssembly runs on the
+-- claim path, before the worker starts), so 'claimed' is the only legitimate source.
+-- Every other transition is a 0-row no-op, so a re-delivered or out-of-order report
+-- cannot re-hold a run that a concurrent path already advanced. kind <> 'judge'
+-- mirrors SetRunLimitWait: a judge never holds (Decision 14).
+--
+-- 🔴 THIS IS NOT A USAGE PARK (PRD Decision 9). An empty pool is not a usage-limit
+-- event, so the limit-wait budget must be untouched: limit_wait_count is NOT bumped,
+-- and limit_resets_at / retry_not_before / rate_limit_type are NOT set. Folding an
+-- empty-pool hold into the usage-limit machinery would let a pooling gap consume the
+-- RUN_LIMIT_MAX_WAITS budget a genuine limit event needs.
+--
+-- limit_dead_secret_id is LEFT AS-IS (deliberately not cleared): M3's exclude-relax
+-- reads it on resume to know which just-parked credential's window is still closed, so
+-- clearing it here would lose the exclusion across the hold.
+--
+-- started_at = NULL so a later resume gets a FRESH RUN_TIMEOUT wall (Decision 6d, same
+-- as PromoteLimitWaitRuns): without it SweepRunningTimeout would measure the resumed
+-- run against a started_at from before a hold that may have lasted a long time.
+--
+-- Health reset (health='ok', health_reason=NULL, health_since=NULL) exactly as
+-- SetRunLimitWait does: ListActiveRunsForHealth is a POSITIVE allowlist that never
+-- revisits a held run, so whatever flag was live at hold time would freeze for the
+-- whole hold with nothing to clear it. The DISTINCT STATUS is the signal — do NOT
+-- write a human sentence into health_reason (that would break the detector's
+-- single-writer invariant; the UI/CLI render the "add a token to the pool" copy as
+-- fixed text keyed on the status). worker_id is kept for resume affinity.
+UPDATE runs SET
+    status       = 'pool_wait',
+    status_since = now(),
+    started_at   = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at   = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND status = 'claimed'
+  AND kind <> 'judge';
+
 -- name: SweepRunningTimeout :many
 -- running past RUN_TIMEOUT → failed (a hung agent is failed without a human).
 -- Stamps move_pending_since so the (forge-free) sweep leaves the isolated

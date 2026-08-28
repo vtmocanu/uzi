@@ -131,6 +131,14 @@ type fakeStore struct {
 	// requeuedRun records the run id reset to queued by the vault lock-race path
 	// (PRD #32 M3); nil unless RequeueClaimedRunToQueued was called.
 	requeuedRun *uuid.UUID
+	// poolWaitHeld records the args of the pool_wait hold (PRD #754 M4); nil unless
+	// SetRunPoolWait was called. A held run records NO credential and is NOT failed —
+	// tests assert on this to distinguish the hold from the old requeue and from a fail.
+	poolWaitHeld *store.SetRunPoolWaitParams
+	// hasActiveRunForIssue is what the CreateRun dedup pre-check returns (PRD #754 M4);
+	// hasActiveRunForIssueErr forces its error path.
+	hasActiveRunForIssue    bool
+	hasActiveRunForIssueErr error
 
 	// issue #297: the in-flight avoid-set source for a self_improve claim.
 	activeRunsAll    []store.ListActiveRunsAllRow
@@ -775,6 +783,13 @@ func (f *fakeStore) SweepClaimedNeverStarted(_ context.Context, cutoff pgtype.Ti
 func (f *fakeStore) RequeueClaimedRunToQueued(_ context.Context, id uuid.UUID) (int64, error) {
 	f.requeuedRun = &id
 	return 1, nil
+}
+func (f *fakeStore) SetRunPoolWait(_ context.Context, arg store.SetRunPoolWaitParams) (int64, error) {
+	f.poolWaitHeld = &arg
+	return 1, nil
+}
+func (f *fakeStore) HasActiveRunForIssue(_ context.Context, _ store.HasActiveRunForIssueParams) (bool, error) {
+	return f.hasActiveRunForIssue, f.hasActiveRunForIssueErr
 }
 func (f *fakeStore) SweepRunningTimeout(_ context.Context, arg store.SweepRunningTimeoutParams) ([]store.SweepRunningTimeoutRow, error) {
 	f.runNow = arg.Now

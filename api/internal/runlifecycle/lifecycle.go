@@ -195,7 +195,14 @@ func reconcilerDecision(status string, origin pgtype.Text) decision {
 	// and branch, resumes on its own follow-up, and routinely idles past 30 minutes —
 	// so the default {act:false} arm would leave its pending move marker UNHEALED and
 	// trip the give-up warn as the normal case.
-	case "queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "limit_wait":
+	//
+	// pool_wait (PRD #754) is the empty-token-pool hold and belongs here for the very
+	// same reasons: a held auto run keeps its issue and worker affinity, resumes when a
+	// token is pooled (M5), and routinely outlasts 30 minutes — so leaving it in the
+	// default arm would trip the give-up warn on every hold. It is In Progress (a held
+	// run is still working), and Notify's partial map is deliberately NOT extended: a
+	// hold moves no card, so there is nothing to notify about.
+	case "queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "limit_wait", "pool_wait":
 		return decision{act: true, target: board.ColumnInProgress}
 	case "completed":
 		return decision{act: true, target: board.ColumnHumanReview}

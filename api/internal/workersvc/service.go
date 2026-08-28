@@ -475,6 +475,18 @@ type Store interface {
 	// RequeueClaimedRunToQueued resets one just-claimed run to queued when its
 	// owner's vault locked between the claim gate and the token open (PRD #32 M3).
 	RequeueClaimedRunToQueued(ctx context.Context, id uuid.UUID) (int64, error)
+	// SetRunPoolWait holds one just-claimed `auto` run whose token pool is genuinely
+	// empty (PRD #754 M4). claimed → pool_wait, a non-locking hold; positive source
+	// guard (status='claimed'), keeps worker_id for affinity, and does NOT touch the
+	// usage-limit budget (an empty pool is not a usage park). M5 resumes it.
+	SetRunPoolWait(ctx context.Context, arg store.SetRunPoolWaitParams) (int64, error)
+	// HasActiveRunForIssue reports whether the issue already has a non-terminal run.
+	// CreateRun uses it as the manual-path dedup pre-check that replaces the
+	// uq_runs_one_active_per_issue index for pool_wait runs (PRD #754 M4 Decision 8):
+	// the index no longer counts a held run as active, so the structural backstop it
+	// gave the manual/board/Slack path is restored here (this SELECT still counts
+	// pool_wait as active).
+	HasActiveRunForIssue(ctx context.Context, arg store.HasActiveRunForIssueParams) (bool, error)
 	SweepRunningTimeout(ctx context.Context, arg store.SweepRunningTimeoutParams) ([]store.SweepRunningTimeoutRow, error)
 	FailRunsOfStaleWorkersOverCap(ctx context.Context, arg store.FailRunsOfStaleWorkersOverCapParams) ([]store.FailRunsOfStaleWorkersOverCapRow, error)
 	RequeueRunsOfStaleWorkers(ctx context.Context, arg store.RequeueRunsOfStaleWorkersParams) ([]store.RequeueRunsOfStaleWorkersRow, error)
@@ -1317,15 +1329,20 @@ func (s *Service) recoverClaimAssembly(ctx context.Context, run store.Run, err e
 		}
 		return nil // idle; the run is queued again, awaiting unlock
 	case errors.Is(err, errAutoPoolEmpty):
-		// M2 interim — an auto claim with a genuinely empty pool must not spend the
-		// non-pooled default nor hard-fail; requeue and wait. M4 replaces this with the
-		// non-locking pool_wait hold state. Handled exactly like the vault-locked
-		// transient: RequeueClaimedRunToQueued keeps worker_id for affinity and does not
-		// bump requeue_count, so a persistently empty pool can't trip the requeue cap.
-		if _, rerr := s.q.RequeueClaimedRunToQueued(ctx, run.ID); rerr != nil {
+		// An auto claim with a genuinely empty pool must not spend the non-pooled default
+		// nor hard-fail (PRD #754). It is HELD in the non-locking pool_wait status (M4,
+		// replacing M2's interim requeue): SetRunPoolWait keeps worker_id for affinity,
+		// does not touch the usage-limit budget, and — unlike the requeue — does not churn
+		// the queue. The run is idle (nil payload) exactly as before; M5 adds the reactive
+		// + manual resume off pool_wait. Still "never spends the default, never hard-fails".
+		// Positive source guard (status='claimed'), so a re-delivered claim is a no-op.
+		if _, rerr := s.q.SetRunPoolWait(ctx, store.SetRunPoolWaitParams{
+			ID:       run.ID,
+			WorkerID: run.WorkerID,
+		}); rerr != nil {
 			return rerr
 		}
-		return nil // idle; the run is queued again, awaiting a pooled token
+		return nil // idle; the run is held in pool_wait, awaiting a pooled token
 	case errors.Is(err, errCredentialUnavailable) || errors.Is(err, errToolPackagesRejected) || errors.Is(err, errGuardrailBlockedClaim):
 		// A guardrail block at claim (D1 layer 3) is TERMINAL — fail-closed even on a
 		// forge blip (R4; the user restarts after fixing protection), matching
@@ -1389,9 +1406,9 @@ var errVaultLocked = errors.New("vault locked during claim")
 // an empty pool, or a resuming run whose only pooled token is the excluded dead
 // credential (#754 M2). The auto lane must NEVER spend the non-pooled owner default,
 // and it must NOT hard-fail a run for a transient/holdable condition — so this is
-// TRANSIENT like errVaultLocked, and recoverClaimAssembly requeues the run rather
-// than failing it. (M4 replaces this interim requeue with a non-locking pool_wait
-// hold state.) Its message carries no secret bytes.
+// HOLDABLE like errVaultLocked, and recoverClaimAssembly HOLDS the run in the
+// non-locking pool_wait status (PRD #754 M4, via SetRunPoolWait) rather than failing
+// it — M5 resumes it reactively or manually. Its message carries no secret bytes.
 var errAutoPoolEmpty = errors.New("auto pool is empty")
 
 // claimCred is the concrete Anthropic credential ONE claim spends: the identity to
@@ -1780,11 +1797,10 @@ func (s *Service) claimExclude(run store.Run) uuid.UUID {
 //     included), recorded as pool_stale with no headroom. Floor honours `exclude`
 //     exactly as Select does, so the dead credential is never floored onto.
 //   - Empty-pool hold (Floor.ok == false): there is genuinely nothing pooled to spend
-//     — an empty pool, or the only pooled token is the excluded dead credential. M2
-//     interim: do NOT spend the non-pooled default and do NOT hard-fail; signal
-//     errAutoPoolEmpty, which recoverClaimAssembly requeues (like a locked vault) so
-//     the run waits rather than billing an account the user did not pool. (M4 replaces
-//     this hold with a non-locking pool_wait state.)
+//     — an empty pool, or the only pooled token is the excluded dead credential. Do NOT
+//     spend the non-pooled default and do NOT hard-fail; signal errAutoPoolEmpty, which
+//     recoverClaimAssembly holds in the non-locking pool_wait status (PRD #754 M4) so
+//     the run waits rather than billing an account the user did not pool.
 //
 // Floor.ok, not Select's PoolNonEmpty, decides floor-vs-hold: they diverge in the
 // excluded-sole-token case (PoolNonEmpty counts before the exclude skip, Floor.ok
@@ -1821,9 +1837,8 @@ func (s *Service) autoChoice(ctx context.Context, wkr store.Worker, run store.Ru
 		return secretChoice{secretID: &id, reason: string(autoselect.ReasonPoolStale)}, nil
 	}
 	// Genuinely nothing pooled to spend (empty pool, or the only pooled token is the
-	// excluded dead credential). M2 interim: do NOT spend the default and do NOT
-	// hard-fail — signal an empty-pool hold that recoverClaimAssembly requeues.
-	// (M4 will replace this with the pool_wait state.)
+	// excluded dead credential). Do NOT spend the default and do NOT hard-fail — signal
+	// an empty-pool hold that recoverClaimAssembly holds in pool_wait (PRD #754 M4).
 	return secretChoice{}, errAutoPoolEmpty
 }
 
@@ -4678,6 +4693,26 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	if fixing > 0 {
 		return store.Run{}, ErrBranchInUse
 	}
+	// Manual-path dedup pre-check (PRD #754 M4 Decision 8). The uq_runs_one_active_per_issue
+	// index — the ONLY dedup the manual/board/Slack path had (it relies solely on the index
+	// catching 23505 → ErrActiveRunExists below) — now EXCLUDES pool_wait so a held run is
+	// non-locking. That would let a second manual start slip past the index while a run is
+	// held, so the gate is restored HERE for the issue kind: HasActiveRunForIssue still
+	// counts pool_wait as active (it is a `status NOT IN terminal` SELECT), and mirrors the
+	// poller's own pre-check (same repo_id, issue_iid params). Scoped to the index's
+	// kind='issue' domain — createRun is the issue-kind path, so this gate matches it and
+	// leaves ci_fix/chat/etc. ungated. It returns the SAME sentinel the index path returns,
+	// so a caller cannot tell which layer caught the duplicate.
+	active, err := s.q.HasActiveRunForIssue(ctx, store.HasActiveRunForIssueParams{
+		RepoID:   repoID,
+		IssueIid: pgtype.Int8{Int64: issueIID, Valid: true},
+	})
+	if err != nil {
+		return store.Run{}, err
+	}
+	if active {
+		return store.Run{}, ErrActiveRunExists
+	}
 	// PRD #381: snapshot the issue's human comments alongside the description. One
 	// extra forge round-trip, centralized here so every issue-backed origin (manual,
 	// autopilot, scheduled) captures it (D6) without rippling the Create*Run seam.
@@ -5683,7 +5718,13 @@ func (s *Service) hasLivePoller(ctx context.Context, run store.Run) (bool, error
 	// for its OTHER runs, so both conditions above are false and the cancel would be
 	// enqueued for a poller that is not polling this run and never will again. It
 	// would then sit unconsumed until the promotion pass, i.e. potentially for days.
-	if run.Status == "queued" || run.Status == "limit_wait" || !run.WorkerID.Valid {
+	//
+	// PRD #754 M4: pool_wait is HELD for the identical reason and so rides the same arm.
+	// A held run keeps its worker_id for affinity and its worker keeps heartbeating for
+	// other runs, but it is never polling this held run, so a cancel routed to a poller
+	// would sit unconsumed (worse than limit_wait — there is no promotion pass in M4).
+	// It must go server-side, so it must read as "no live poller" here too.
+	if run.Status == "queued" || run.Status == "limit_wait" || run.Status == "pool_wait" || !run.WorkerID.Valid {
 		return false, nil
 	}
 	wkr, err := s.q.GetWorkerByID(ctx, uuid.UUID(run.WorkerID.Bytes))

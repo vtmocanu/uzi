@@ -111,8 +111,8 @@ func TestAutoChoiceRelaxFloorsOntoReopenedDeadToken(t *testing.T) {
 // TestAutoChoiceStillExcludesDeadTokenWhileWindowClosed is the mirror: same single-token
 // setup, but retry_not_before is still in the FUTURE, so the window is closed and the
 // dead credential stays excluded. With no other pooled token the claim HOLDS
-// (errAutoPoolEmpty ⇒ requeue), recording nothing — re-picking now would immediately
-// re-hit the limit.
+// (errAutoPoolEmpty ⇒ pool_wait, PRD #754 M4), recording nothing — re-picking now would
+// immediately re-hit the limit.
 //
 // MUTATION THIS CATCHES: claimExclude relaxing while the window is still closed →
 // the sole pooled token is spent and the run immediately re-limits.
@@ -131,10 +131,18 @@ func TestAutoChoiceStillExcludesDeadTokenWhileWindowClosed(t *testing.T) {
 	if len(f.fs.recordedCreds) != 0 {
 		t.Fatalf("recorded a credential while the sole pooled token's window was still closed: %+v", f.fs.recordedCreds)
 	}
-	if f.fs.requeuedRun == nil || *f.fs.requeuedRun != f.runID {
-		t.Fatalf("run not requeued: %v — a window-closed hold is transient", f.fs.requeuedRun)
+	// PRD #754 M4: a window-closed hold now transitions the run to pool_wait, not requeue.
+	if f.fs.poolWaitHeld == nil || f.fs.poolWaitHeld.ID != f.runID {
+		t.Fatalf("run not held in pool_wait: %v — a window-closed hold holds the run", f.fs.poolWaitHeld)
+	}
+	if f.fs.requeuedRun != nil {
+		t.Fatalf("run was requeued (%v); M4 replaced the requeue with the pool_wait hold", f.fs.requeuedRun)
 	}
 	if f.fs.markedFailed != nil {
 		t.Fatalf("the run was failed terminally (%v); a window-closed hold must not hard-fail", f.fs.markedFailed)
 	}
+	// M3's exclude-relax must still be able to read the dead credential on resume, so the
+	// hold must NOT clear limit_dead_secret_id — the query leaves it in place (asserted at
+	// the SQL layer by the live-DB test); here we simply confirm the hold, not a requeue,
+	// is what fired.
 }
