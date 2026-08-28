@@ -343,11 +343,25 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 				// NDJSON there for an agent to parse line by line (renderMessage). A
 				// human-readable notice on that stream would corrupt the contract. This
 				// is the same split cobra's deprecation notice already uses here.
-				if run.Status == statusLimitWait {
+				if run.Status == statusLimitWait || run.Status == statusPoolWait {
 					if !parked {
 						parked = true
-						_, _ = fmt.Fprintf(env.Stderr, "run %s %s — still following; it resumes on its own\n",
-							args[0], limitWaitLine(run, time.Now()))
+						// pool_wait is the sibling silence limit_wait is (both are long,
+						// output-less holds that look like a hang from the outside), so it
+						// earns the same one-shot notice — but a DIFFERENT one, because it
+						// resumes on a different trigger: a pooled token, not a clock. A
+						// direct limit_wait⇄pool_wait transition would be missed by the bare
+						// `parked` bool, but it cannot happen — a held run is promoted to
+						// `queued` (a non-held status that clears `parked` via the else-if
+						// below) before it could hold again, so re-arming here is exact.
+						if run.Status == statusPoolWait {
+							_, _ = fmt.Fprintf(env.Stderr,
+								"run %s held — its token pool is empty; still following, it resumes when a token is pooled\n",
+								args[0])
+						} else {
+							_, _ = fmt.Fprintf(env.Stderr, "run %s %s — still following; it resumes on its own\n",
+								args[0], limitWaitLine(run, time.Now()))
+						}
 					}
 				} else if parked {
 					parked = false

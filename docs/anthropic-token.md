@@ -113,7 +113,7 @@ each pooled token shows whether auto-selection could pick it *right now*:
 | chip | what it means |
 |---|---|
 | **in pool** | it can be picked |
-| **never polled** | uzi has never read a usage figure for it, so it cannot be ranked — it will never be picked |
+| **never polled** | uzi has never read a usage figure for it, so normal ranking cannot rank it and passes it over — though, if it is pooled and nothing pooled has a usable reading, the last-resort floor can still spend it |
 | **no usage data** | it was polled, but the reading carried no percentage |
 | **stale reading** | the last reading is too old to steer a choice |
 | **low headroom** | it is nearly exhausted, so it is picked only if every pooled token is |

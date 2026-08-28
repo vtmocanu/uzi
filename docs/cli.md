@@ -1014,7 +1014,9 @@ questions:
 `stale` / `below_threshold` when it cannot; `-` when the token is not pooled
 (the `POOL` column beside it already says so), and `?` when the eligibility
 read failed. **Check it after opting a token in**: a token uzi has never
-managed to poll stays unpickable while looking active.
+managed to poll reads as not eligible for normal ranking while looking active —
+though if it is pooled, the last-resort floor can still spend it when nothing
+pooled has a usable reading.
 
 Under `--json` the same answer is the `auto_status` field. It is always
 present and is **`null` when it is not known** — which is not the same as
