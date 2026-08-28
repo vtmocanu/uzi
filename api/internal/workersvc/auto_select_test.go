@@ -386,6 +386,67 @@ func TestAutoFloorsOntoAPooledTokenNeverTheDefault(t *testing.T) {
 	})
 }
 
+// TestAutoFloorIsIndependentOfWaitOnLimit is #754 M6 scenario 1: wait_on_limit is the
+// usage-PARK opt-in (PRD #35), read by decideLimitPark — it governs whether a run that
+// hit an Anthropic usage limit waits or is coerced to failure. It has NOTHING to say
+// about autoChoice: an all-stale pool FLOORS onto its best pooled token regardless of
+// the run's wait_on_limit, never the non-pooled default and never a hard-fail. autoChoice
+// does not read run.WaitOnLimit at all, and this pins that it stays that way.
+//
+// The variable flipped is wait_on_limit alone; the two arms are each other's positive
+// control. A mutation that coupled the floor to the flag — e.g. "wait_on_limit=false ⇒
+// fail fast / hold instead of floor" (a tempting but wrong reading of the opt-out) —
+// reddens the false arm (it expects the pooled floor, would get a hold or a failure);
+// the symmetric coupling reddens the true arm. Together they bound autoChoice's floor as
+// invariant to the flag in both directions.
+func TestAutoFloorIsIndependentOfWaitOnLimit(t *testing.T) {
+	for _, waitOnLimit := range []bool{false, true} {
+		name := "wait_on_limit=false"
+		if waitOnLimit {
+			name = "wait_on_limit=true"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newAutoFixture(t)
+			f.fs.claimRun.WaitOnLimit = waitOnLimit
+			// A single STALE pooled token ⇒ Select names no pick and the ladder falls to
+			// Floor. The floor must land on the pooled token whatever wait_on_limit says.
+			f.fs.autoCandidates = []store.ListAutoSelectCandidatesRow{
+				candRow(f.emptyID, "spare-key", true, 90, 99*time.Hour, 0),
+			}
+
+			if payload := f.claim(t); payload == nil {
+				t.Fatalf("wait_on_limit=%v: a floorable pool went idle; the floor does not depend on the flag", waitOnLimit)
+			}
+			rec := onlyRecord(t, f.fs)
+			if uuid.UUID(rec.AnthropicSecretID.Bytes) == f.fs.defaultCredID() {
+				t.Fatalf("wait_on_limit=%v: floored onto the owner default — the auto lane must NEVER spend the non-pooled default (#754)", waitOnLimit)
+			}
+			if uuid.UUID(rec.AnthropicSecretID.Bytes) != f.emptyID {
+				t.Fatalf("wait_on_limit=%v: floored onto %v, want the pooled token %v",
+					waitOnLimit, uuid.UUID(rec.AnthropicSecretID.Bytes), f.emptyID)
+			}
+			if rec.AnthropicSelectReason.String != string(autoselect.ReasonPoolStale) {
+				t.Fatalf("wait_on_limit=%v: reason = %q, want %q — a floor records pool_stale regardless of the flag",
+					waitOnLimit, rec.AnthropicSelectReason.String, autoselect.ReasonPoolStale)
+			}
+			if rec.AnthropicHeadroomPct.Valid {
+				t.Fatalf("wait_on_limit=%v: a floor recorded headroom %+v; nothing measured the credential it spent",
+					waitOnLimit, rec.AnthropicHeadroomPct)
+			}
+			// The floor must SPEND, never hold or hard-fail — the two non-floor outcomes a
+			// wait_on_limit coupling would most plausibly divert to.
+			if f.fs.poolWaitHeld != nil {
+				t.Fatalf("wait_on_limit=%v: a stale (floorable) pool was held in pool_wait (%v); it must floor, not hold",
+					waitOnLimit, f.fs.poolWaitHeld)
+			}
+			if f.fs.markedFailed != nil {
+				t.Fatalf("wait_on_limit=%v: the run was failed terminally (%v); a floorable pool never hard-fails",
+					waitOnLimit, f.fs.markedFailed)
+			}
+		})
+	}
+}
+
 // TestAutoBestOfPoolSpendsAPooledToken is D10 through the claim path: when every
 // pooled token is under the floor, the emptiest of THEM is spent — not the owner
 // default, which may itself be the most-throttled credential the user holds and is
