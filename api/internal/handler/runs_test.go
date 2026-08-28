@@ -908,12 +908,19 @@ func TestListRunsRejectsMalformedFilters(t *testing.T) {
 }
 
 func TestAdminListWorkersAndRuns(t *testing.T) {
+	revisingRun := uuid.New()
 	st := &runsStore{
 		allWorkers: []store.ListAllWorkersRow{
 			{Worker: store.Worker{ID: uuid.New(), Name: "w1", Status: "online"}, Busy: true, ActiveRuns: 1, OwnerEmail: "u@example.com"},
 		},
 		activeRuns: []store.ListActiveRunsAllRow{
-			{Run: store.Run{ID: uuid.New(), Status: "running"}, RepoPath: "grp/repo", OwnerEmail: "u@example.com"},
+			{Run: store.Run{ID: revisingRun, Status: "awaiting_approval"}, RepoPath: "grp/repo", OwnerEmail: "u@example.com"},
+		},
+		// The run is mid-replan: its latest plan-ish message is a plan_revising, so the admin
+		// list must enrich is_revising the same way ListRuns does (issue #750).
+		planRevisionRunRows: []store.ListPlanRevisionStateForRunsRow{
+			{RunID: revisingRun, Seq: 1, Kind: "plan"},
+			{RunID: revisingRun, Seq: 2, Kind: "plan_revising"},
 		},
 	}
 	h := newRunsHandler(t, st)
@@ -928,6 +935,14 @@ func TestAdminListWorkersAndRuns(t *testing.T) {
 	h.AdminListRuns(rec, httptest.NewRequest(http.MethodGet, "/api/admin/runs", nil))
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "grp/repo") {
 		t.Fatalf("AdminListRuns = %d %q", rec.Code, rec.Body.String())
+	}
+	// The admin overview must carry is_revising too, so `uzi admin runs` renders a mid-replan
+	// run as "revising" (via effectiveRunStatus) rather than as awaiting_approval.
+	if !strings.Contains(rec.Body.String(), `"is_revising":true`) {
+		t.Fatalf("AdminListRuns must enrich is_revising for a revising run: %q", rec.Body.String())
+	}
+	if got := st.planRevisionRunArg; len(got) != 1 || got[0] != revisingRun {
+		t.Fatalf("AdminListRuns plan-revising lookup arg = %v, want [%v]", got, revisingRun)
 	}
 }
 
