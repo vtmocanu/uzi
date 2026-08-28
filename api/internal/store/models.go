@@ -107,6 +107,14 @@ type BoardPref struct {
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
+type BrandingAsset struct {
+	Slot        string             `json:"slot"`
+	ContentType string             `json:"content_type"`
+	Bytes       []byte             `json:"bytes"`
+	UpdatedBy   pgtype.UUID        `json:"updated_by"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+}
+
 type CiAutofixAttempt struct {
 	RepoID         uuid.UUID          `json:"repo_id"`
 	Ref            string             `json:"ref"`

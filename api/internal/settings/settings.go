@@ -29,6 +29,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/termsafe"
 	"github.com/vtmocanu/uzi/api/internal/theme"
 )
 
@@ -207,6 +208,17 @@ const (
 	KeyAgentSourceLatestRef       = "agent_source_latest_ref"        // newest IsValid semver tag advertised by the source ("" if none)
 	KeyAgentSourceRemoteTipSHA    = "agent_source_remote_tip_sha"    // advertised tip SHA of the configured ref (or HEAD)
 	KeyAgentSourceUpdateCheckedAt = "agent_source_update_checked_at" // RFC3339 timestamp of the last update check
+	// Instance branding keys (PRD #685 M1). All NON-SECRET public config → they live
+	// in Defaults (never SecretKeys), round-trip through PUT /admin/settings, and are
+	// served — allowlisted, never via All/AdminView — through the public GET
+	// /api/branding. Logo BYTES are NOT keys: they live in the branding_assets table
+	// (Decision D7), so nothing here carries a blob and the settings cache stays small.
+	KeyAppLogoMode     = "app_logo_mode"      // "default" | "custom"
+	KeyAppLogoKeepName = "app_logo_keep_name" // "true" | "false"
+	KeyBrandMode       = "brand_mode"         // "none" | "text" | "logo"
+	KeyBrandCompany    = "brand_company"      // ≤64-rune company text (may be ""), rendered to every principal incl. signed-out
+	KeyBrandPlacement  = "brand_placement"    // "below" | "topright"
+	KeyBrandPlaque     = "brand_plaque"       // "true" | "false"
 )
 
 // Compiled-in defaults, used when a row is absent so a fresh or partially
@@ -307,6 +319,17 @@ const (
 	// sourceAgentsDir (".claude/agents"), so an install with no folder set reads
 	// role files from exactly the same subtree as before.
 	DefaultAgentSourceFolder = ".claude/agents"
+	// PRD #685 M1 instance-branding defaults. A fresh install is UNBRANDED (Decision
+	// D4): the app mark stays the uzi FactoryIcon + literals (app_logo_mode=default,
+	// keep-name on) and there is no POWERED BY brand (brand_mode=none). brand_company
+	// is empty and the plaque is off. Same no-seeded-row pattern as the judge keys —
+	// an absent row synthesizes to these defaults, so no migration seeds them.
+	DefaultAppLogoMode     = "default"
+	DefaultAppLogoKeepName = "true"
+	DefaultBrandMode       = "none"
+	DefaultBrandCompany    = ""
+	DefaultBrandPlacement  = "below"
+	DefaultBrandPlaque     = "false"
 )
 
 // healthSecondsMin / healthSecondsMax bound the integer health settings (Decision
@@ -428,6 +451,17 @@ var Defaults = map[string]string{
 	// synthesizes to DefaultAgentSourceFolder, so Known()/admin-writable with no
 	// migration and existing installs read the historical ".claude/agents" subtree.
 	KeyAgentSourceFolder: DefaultAgentSourceFolder,
+	// PRD #685 M1 instance-branding config keys. Same no-seeded-row pattern: an absent
+	// row synthesizes to these defaults, so a fresh install renders unbranded and the
+	// public GET /api/branding reports the default shape. NON-SECRET (here, not in
+	// SecretKeys) — they are served to everyone incl. signed-out. Logo bytes are NOT
+	// here (branding_assets table, D7).
+	KeyAppLogoMode:     DefaultAppLogoMode,
+	KeyAppLogoKeepName: DefaultAppLogoKeepName,
+	KeyBrandMode:       DefaultBrandMode,
+	KeyBrandCompany:    DefaultBrandCompany,
+	KeyBrandPlacement:  DefaultBrandPlacement,
+	KeyBrandPlaque:     DefaultBrandPlaque,
 }
 
 // SecretKeys is the set of settings whose values are secrets (PRD #25): sealed
@@ -684,6 +718,51 @@ func (c *Cache) SlackEnabled(ctx context.Context) (bool, error) {
 	default:
 		return DefaultSlackEnabled == "true", err
 	}
+}
+
+// BrandingConfig is the allowlisted instance-branding config (PRD #685 M1): EXACTLY
+// the six branding keys, coerced to their typed form. It is the only thing the public
+// GET /api/branding reads from settings — built key-by-key here rather than from
+// All/AdminView so that anonymous read cannot leak any other settings key (Risk R1).
+type BrandingConfig struct {
+	AppLogoMode     string
+	AppLogoKeepName bool
+	BrandMode       string
+	BrandCompany    string
+	BrandPlacement  string
+	BrandPlaque     bool
+}
+
+// Branding returns the effective branding config (PRD #685 M1), reading each of the
+// six keys individually through the same ENV-over-DB-over-default precedence every
+// other accessor uses. The two bools apply the PrdlessEnabled junk-tolerance: only
+// "true"/"false" are honored and any other stored value falls back to the compiled-in
+// default rather than silently reading false. A cold-refresh error is returned
+// alongside a defaults-filled struct so a best-effort caller can ignore err.
+//
+// It DELIBERATELY does not range over Defaults (as All/AdminView do): the public
+// endpoint that consumes this serves anonymous callers, so it must expose only these
+// six fields and never the rest of the non-secret settings surface (Risk R1).
+func (c *Cache) Branding(ctx context.Context) (BrandingConfig, error) {
+	m, err := c.snapshot(ctx)
+	boolOf := func(key string) bool {
+		switch c.effective(key, m) {
+		case "true":
+			return true
+		case "false":
+			return false
+		default:
+			return Defaults[key] == "true"
+		}
+	}
+	return BrandingConfig{
+		AppLogoMode:     c.effective(KeyAppLogoMode, m),
+		AppLogoKeepName: boolOf(KeyAppLogoKeepName),
+		BrandMode:       c.effective(KeyBrandMode, m),
+		BrandCompany:    c.effective(KeyBrandCompany, m),
+		BrandPlacement:  c.effective(KeyBrandPlacement, m),
+		BrandPlaque:     boolOf(KeyBrandPlaque),
+	}, err
 }
 
 // PublicBaseURL returns the base URL used to build webui deep links in Slack
@@ -1261,8 +1340,17 @@ func Validate(key, value string) error {
 		return theme.Validate(value)
 	case KeyPrdlessEnabled, KeySlackEnabled, KeyJudgeEnabled, KeyJudgeEnforceAll, KeyHealthEnabled,
 		KeyCapabilityAwareScheduling, KeyEligibleLabelWaivesPRDLink, KeyGithubProjectSyncEnabled,
-		KeyEphemeralWorkersEnabled, KeyAgentSourceEnabled:
+		KeyEphemeralWorkersEnabled, KeyAgentSourceEnabled,
+		KeyAppLogoKeepName, KeyBrandPlaque:
 		return validateBool(value)
+	case KeyAppLogoMode:
+		return validateEnum(value, "default", "custom")
+	case KeyBrandMode:
+		return validateEnum(value, "none", "text", "logo")
+	case KeyBrandPlacement:
+		return validateEnum(value, "below", "topright")
+	case KeyBrandCompany:
+		return validateBrandCompany(value)
 	case KeyJudgeModel, KeySummaryModel:
 		return validateModelAlias(value)
 	case KeyAgentSourceInterval:
@@ -1523,6 +1611,44 @@ func validateBool(value string) error {
 		return errors.New(`must be "true" or "false"`)
 	}
 	return nil
+}
+
+// validateEnum is the write-time gate for a closed-set string setting (PRD #685 M1:
+// the branding enums app_logo_mode / brand_mode / brand_placement). Like the int
+// validators, an explicit Validate case backed by this is load-bearing: Validate's
+// default branch falls through to ValidateLabel, which accepts ANY non-empty ≤64-char
+// string — so an enum key missing from the switch would accept "wat", and the reader
+// would then silently fall back to the compiled-in default. An enum must fail the
+// WRITE, the only moment a human is present to be told. The error names the allowed
+// set so the admin can fix it.
+func validateEnum(value string, allowed ...string) error {
+	for _, a := range allowed {
+		if value == a {
+			return nil
+		}
+	}
+	return fmt.Errorf("must be one of: %s", strings.Join(allowed, ", "))
+}
+
+// maxBrandCompanyLen caps the POWERED BY company text (PRD #685 M1). 64 runes, the
+// same visual cap as a label; unlike ValidateLabel this is measured in RUNES via
+// utf8.RuneCountInString so a multibyte name is not undercounted.
+const maxBrandCompanyLen = 64
+
+// validateBrandCompany is the DEDICATED write-time gate for brand_company (PRD #685
+// M1). It deliberately does NOT reuse ValidateLabel: the branding company text may be
+// empty (the default) and may contain commas ("Acme, Inc."), both of which
+// ValidateLabel rejects. It DOES enforce a 64-rune cap and — because this text is
+// admin-authored yet rendered into every user's chrome, including signed-out
+// (the "rendered to a principal other than the author" class .claude/rules/web.md
+// governs) — it rejects control and Unicode-format runes via termsafe.Validate, so an
+// RTL-override or zero-width rune cannot mangle the chrome for everyone. The empty
+// value passes termsafe.Validate (no runes to reject), so no special case is needed.
+func validateBrandCompany(value string) error {
+	if utf8.RuneCountInString(value) > maxBrandCompanyLen {
+		return fmt.Errorf("must be at most %d characters", maxBrandCompanyLen)
+	}
+	return termsafe.Validate("brand_company", value)
 }
 
 // validateHealthSeconds is the write-time gate for an integer run-health threshold

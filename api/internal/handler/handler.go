@@ -594,6 +594,12 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		// unauthenticated by design — see Version's doc comment before moving this
 		// line or wrapping this group in middleware.
 		r.Get("/version", h.Version)
+		// Instance branding (PRD #685 M1), unauthenticated by design like /version so
+		// the signed-out shell can brand itself. GetBranding returns an allowlisted
+		// struct (only the branding fields — Risk R1); the logo route serves cacheable
+		// bytes. Keep both OUTSIDE every RequireAuth group.
+		r.Get("/branding", h.GetBranding)
+		r.Get("/branding/logo/{slot}", h.GetBrandingLogo)
 
 		r.Route("/auth", func(r chi.Router) {
 			r.With(authLimiter.Middleware).Post("/register", h.Register)
@@ -1085,6 +1091,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// RequireAdmin, target from the path, never the body.
 				r.Put("/users/{id}/ci-autofix", h.SetUserCIAutofixEnabled)
 				r.Put("/settings", h.UpdateSettings)
+				// Instance branding logo bytes (PRD #685 M1): admin upload/clear of the
+				// app-mark and POWERED BY logos. Cookie-only admin write like the settings
+				// PUT beside it; the bytes ride a dedicated raw-body route (off the 1 MiB
+				// JSON PUT cap, Risk R4) with a 256 KiB cap and a type allowlist in the
+				// handler. No per-user limiter — same as the neighbouring admin writes.
+				r.Put("/branding/logo/{slot}", h.PutBrandingLogo)
+				r.Delete("/branding/logo/{slot}", h.DeleteBrandingLogo)
 				// Admin per-repo guardrail override (PRD #66 D8, M8): allow/revoke ONE named
 				// repo through the guardrail, with a reason, audited. Deliberately a dedicated
 				// admin-only route (NOT a branch in PatchRepo, which has a member path) using

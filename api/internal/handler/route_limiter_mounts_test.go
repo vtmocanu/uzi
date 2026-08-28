@@ -67,8 +67,12 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 165 as of this commit — but NOT because the API gained a route. The go-chi/chi
-// v5.3.2 bump (PR go-chi/chi#1148, "don't drop handlers that collide with a
+// 169 as of this commit (PRD #685 M1 added GET /api/branding, GET
+// /api/branding/logo/{slot}, PUT /api/admin/branding/logo/{slot} and DELETE
+// /api/admin/branding/logo/{slot} — the public instance-branding config + logo reads
+// and the admin logo upload/clear writes).
+// It was 165 until then — but that count was NOT because the API gained a route. The
+// go-chi/chi v5.3.2 bump (PR go-chi/chi#1148, "don't drop handlers that collide with a
 // Mount()/Route() pattern") made chi.Walk enumerate PUT /api/me/judge, an existing
 // route (SetJudgeEnabled, PRD #46) whose pattern collides with the Route("/me/judge")
 // read subrouter; Walk silently skipped the colliding handler through v5.3.1. The
@@ -172,6 +176,10 @@ type routeMount struct {
 // across `c309e8a0`, every SHA-BOUND claim here survived (the `ad6c63d9` figures at :27
 // and below) and every UNBOUND one rotted (three of three, each way).
 var wantRouteMounts = []routeMount{
+	// PRD #685 M1: admin clear of a branding logo — cookie-only admin DB delete, no
+	// forge call → noLimiter, like the settings PUT and guardrail-override it sits
+	// beside.
+	{"DELETE", "/api/admin/branding/logo/{slot}", noLimiter},
 	// PRD #66 M8 (D8): admin per-repo guardrail override revoke — an admin-only,
 	// unscoped-by-id DB write, no forge call → noLimiter.
 	{"DELETE", "/api/admin/repos/{id}/guardrail-override", noLimiter},
@@ -233,6 +241,11 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/auth/me", noLimiter},
 	{"GET", "/api/auth/oidc/callback", noLimiter},
 	{"GET", "/api/auth/oidc/login", noLimiter},
+	// PRD #685 M1: public branding config + logo bytes. Unauthenticated by design (like
+	// /api/version) so the signed-out shell can brand itself → noLimiter. GetBranding
+	// returns an allowlisted struct (Risk R1); the logo route serves cacheable bytes.
+	{"GET", "/api/branding", noLimiter},
+	{"GET", "/api/branding/logo/{slot}", noLimiter},
 	{"GET", "/api/chats/", noLimiter},
 	{"GET", "/api/controller/poll", noLimiter},
 	// PRD #333 M4: the Findings backlog read + the issue-draft read. Both are RequireUser
@@ -490,6 +503,10 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/summary/plan", noLimiter},
 	{"POST", "/api/workers/", noLimiter},
 	{"POST", "/api/workers/hosted", limHosted},
+	// PRD #685 M1: admin upload of a branding logo — cookie-only admin write, raw body
+	// off the JSON PUT cap (Risk R4), no forge call → noLimiter, like the settings PUT
+	// beside it.
+	{"PUT", "/api/admin/branding/logo/{slot}", noLimiter},
 	{"PUT", "/api/admin/settings", noLimiter},
 	{"PUT", "/api/admin/users/{id}/ci-autofix", noLimiter},
 	{"PUT", "/api/admin/users/{id}/judge", noLimiter},
