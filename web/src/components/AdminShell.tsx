@@ -15,6 +15,7 @@ const TABS = [
   { to: "/admin/tool-allowlist", label: "Tool allowlist" },
   { to: "/admin/blocked-repos", label: "Blocked repos" },
   { to: "/admin/settings", label: "Instance" },
+  { to: "/admin/branding", label: "Branding" },
 ];
 
 export function AdminShell({ description, children }: { description: ReactNode; children: ReactNode }) {

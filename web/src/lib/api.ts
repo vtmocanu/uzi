@@ -726,6 +726,40 @@ export interface AppSettings {
   run_eligible_labels: string;
   board_extra_labels: string;
   eligible_label_waives_prd_link: string;
+  // Instance branding config (PRD #685). All six round-trip through GET/PUT
+  // /admin/settings as raw strings like every other setting — the API serves the
+  // whole settings surface as strings, so app_logo_keep_name/brand_plaque are the
+  // text "true"/"false" HERE (string-space). The Admin → Branding page edits them
+  // through getSettings/updateSettings in this same string-space; the public
+  // /api/branding read below re-types them as bools for the chrome (bool-space).
+  // Logo BYTES are never settings keys (Decision D7) — they live in branding_assets
+  // and move through the dedicated upload/delete endpoints below.
+  app_logo_mode: string; // "default" | "custom"
+  app_logo_keep_name: string; // "true" | "false"
+  brand_mode: string; // "none" | "text" | "logo"
+  brand_company: string; // free text, ≤ 64 runes, may be ""
+  brand_placement: string; // "below" | "topright"
+  brand_plaque: string; // "true" | "false"
+}
+
+// Branding is the public GET /api/branding shape (PRD #685): the same six config
+// keys as AppSettings PLUS the two derived presence flags, but re-TYPED for the
+// chrome. This is the bool-space half of the string↔bool split: the admin page
+// works in string-space (AppSettings via getSettings/updateSettings), while the
+// chrome consumes THIS, where app_logo_keep_name/brand_plaque and the two
+// *_present flags are real booleans (the Go handler coerces "true"/"false" and
+// derives *_present from branding_assets row existence). Logo bytes are NOT here
+// (Decision D7) — presence is a bool; the image itself loads from
+// /api/branding/logo/{slot}.
+export interface Branding {
+  app_logo_mode: string; // "default" | "custom"
+  app_logo_present: boolean;
+  app_logo_keep_name: boolean;
+  brand_mode: string; // "none" | "text" | "logo"
+  brand_company: string;
+  brand_placement: string; // "below" | "topright"
+  brand_plaque: boolean;
+  brand_logo_present: boolean;
 }
 
 // SettingSource reports where a setting's effective value comes from (PRD #25):
@@ -2759,6 +2793,40 @@ async function request<T>(
   return payload as T;
 }
 
+// uploadBrandingLogo PUTs a RAW image body to the admin logo endpoint (PRD #685).
+// It cannot use request(), which force-sets Content-Type: application/json and
+// JSON.stringifies the body — the backend PutBrandingLogo reads the raw bytes with
+// io.ReadAll and parses the Content-Type header for the type allowlist. So this
+// sends the File directly with its own MIME type, mirroring request()'s CSRF-cookie
+// echo and its non-ok → ApiError handling.
+async function uploadBrandingLogo(slot: string, file: File): Promise<void> {
+  const headers: Record<string, string> = { "Content-Type": file.type };
+  const csrf = readCookie("uzi_csrf");
+  if (csrf) headers["X-CSRF-Token"] = csrf;
+  const res = await fetch(`/api/admin/branding/logo/${slot}`, {
+    method: "PUT",
+    headers,
+    credentials: "same-origin",
+    body: file,
+  });
+  if (!res.ok) {
+    let payload: unknown = null;
+    const text = await res.text();
+    if (text) {
+      try {
+        payload = JSON.parse(text);
+      } catch {
+        payload = null;
+      }
+    }
+    if (res.status === 401) unauthorizedHandler?.();
+    const message =
+      (payload as { error?: string } | null)?.error ??
+      `request failed (${res.status})`;
+    throw new ApiError(res.status, message, payload);
+  }
+}
+
 const realApi = {
   register: (email: string, password: string, displayName: string) =>
     request<SessionResponse>("POST", "/auth/register", {
@@ -2774,6 +2842,16 @@ const realApi = {
   // BuildInfo; the `version` key did not move, rename or nest, because it also
   // feeds PRD #113's worker upgrade classification.
   version: () => request<BuildInfo>("GET", "/version"),
+  // Public instance branding (PRD #685). Unauthenticated like /version — the chrome
+  // reads it (signed-in and out) to decide the app mark and POWERED BY block. Returns
+  // the typed (bool) shape; logo bytes load separately from /api/branding/logo/{slot}.
+  branding: () => request<Branding>("GET", "/branding"),
+  // Admin logo upload (raw image body) / delete for a slot ∈ {app, brand} (PRD #685).
+  // Upload bypasses request() for the raw-body reason documented on uploadBrandingLogo;
+  // delete is an ordinary admin DELETE.
+  uploadBrandingLogo: (slot: string, file: File) => uploadBrandingLogo(slot, file),
+  deleteBrandingLogo: (slot: string) =>
+    request<{ status: string }>("DELETE", `/admin/branding/logo/${slot}`),
   // The Workers nav badge's count (PRD #113 M6). Its own endpoint rather than a fold over
   // listWorkers: the Workers page's poll is page-local and visibility-gated, so a badge
   // fed from it would be stale or absent exactly when the operator is not on that page,
