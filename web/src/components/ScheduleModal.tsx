@@ -1005,8 +1005,8 @@ export function ScheduleModal({
 
         {/* Footer */}
         <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-t border-edge bg-ink/40 px-5 py-3.5">
-          <span className="hidden truncate text-[11px] text-faint sm:inline">{footerSummary}</span>
-          <div className="flex flex-1 items-center justify-end gap-2">
+          <span className="hidden min-w-0 flex-1 truncate text-[11px] text-faint sm:block">{footerSummary}</span>
+          <div className="ml-auto flex items-center justify-end gap-2">
             {isEdit && (
               <Button type="button" variant="danger" size="sm" onClick={remove} disabled={deleting || saving}>
                 <TrashIcon /> {deleting ? "Deleting…" : "Delete"}
