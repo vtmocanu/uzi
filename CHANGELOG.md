@@ -18,6 +18,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Instance branding (Admin → Branding, [#685](https://github.com/vtmocanu/uzi/issues/685)).**
+  Replace the app mark with a custom logo or full white-label, add an optional "POWERED BY" brand in the sidebar, and surface a fixed MIT/author credit that no branding setting can remove — all runtime admin settings, no redeploy; fresh installs stay unbranded.
+
 ## [0.66.3] - 2026-08-27
 
 ### Changed
