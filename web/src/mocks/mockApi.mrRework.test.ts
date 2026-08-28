@@ -84,7 +84,7 @@ describe("MR-review-watcher differential fixture (PRD #700 M6)", () => {
 describe("mockApi honours the mr_rework_enabled opt-in (PRD #700 M6)", () => {
   it("defaults ON (null), round-trips an explicit opt-out, and clears back to default", async () => {
     installStorage();
-    const api = await reload();
+    let api = await reload();
 
     // Seed: default-ON is the null/absent state, read as enabled by the UI.
     const seeded = await api.getMySettings();
@@ -95,6 +95,13 @@ describe("mockApi honours the mr_rework_enabled opt-in (PRD #700 M6)", () => {
     expect(off.settings.mr_rework_enabled).toBe(false);
     expect((await api.getMySettings()).settings.mr_rework_enabled).toBe(false);
 
+    // Reload the module (drops the in-memory settings map and re-runs loadSettings):
+    // the opt-out must survive the persistSettings()/loadSettings() STORAGE round-trip,
+    // not merely read back from the same in-memory value the write left behind. Fails
+    // if putMySettings stops write-through-ing the flag to storage.
+    api = await reload();
+    expect((await api.getMySettings()).settings.mr_rework_enabled).toBe(false);
+
     // A theme-only save leaves the opt-out untouched (PATCH semantics).
     await api.putMySettings({ theme: "mission" });
     expect((await api.getMySettings()).settings.mr_rework_enabled).toBe(false);
@@ -102,5 +109,11 @@ describe("mockApi honours the mr_rework_enabled opt-in (PRD #700 M6)", () => {
     // Clear back to the default-ON state with a null.
     const cleared = await api.putMySettings({ mr_rework_enabled: null });
     expect(cleared.settings.mr_rework_enabled ?? null).toBeNull();
+
+    // Reload again: the cleared (default-ON null) state must also round-trip through
+    // storage, so a subsequent session reads it back as the default rather than a
+    // stale persisted false.
+    api = await reload();
+    expect((await api.getMySettings()).settings.mr_rework_enabled ?? null).toBeNull();
   });
 });

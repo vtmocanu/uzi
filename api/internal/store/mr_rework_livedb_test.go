@@ -55,6 +55,13 @@ func TestMRReworkLiveDB(t *testing.T) {
 	// Give the opted-in owner one so it surfaces as a candidate.
 	exec(`INSERT INTO user_secrets (user_id, kind, label, is_default, ciphertext, sealed_with)
 	      VALUES ($1, 'anthropic_token', 'default', true, $2, 'master')`, inUser, []byte{0x2})
+	// Give the opted-OUT owner a token too. Without it, outUser would be excluded for
+	// TWO reasons (no token AND mr_rework_enabled=false), so its absence from cands
+	// would not prove the opt-out gate specifically. With a valid token present, the
+	// only remaining reason it is excluded is mr_rework_enabled=false — making the
+	// opt-out assertion below non-vacuous.
+	exec(`INSERT INTO user_secrets (user_id, kind, label, is_default, ciphertext, sealed_with)
+	      VALUES ($1, 'anthropic_token', 'default', true, $2, 'master')`, outUser, []byte{0x3})
 	exec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
 	      VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 777, $3)`, connID, inUser, []byte{0x1})
 	exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)

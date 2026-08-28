@@ -22,6 +22,22 @@ const fixture = join(
   "claim_skills_wire.json",
 );
 
+// A second golden that genuinely OMITS review_comments: the ci_fix claim wire, which
+// the Go producer (api/internal/workersvc/ci_fix_test.go) pins byte-for-byte to
+// json.MarshalIndent of a real ci_fix claim whose ReviewComments is nil. The nil +
+// `omitempty` tag drops the key entirely — so this file, not a hand-built copy, is
+// what carries the omitempty contract across the language boundary.
+const ciFixFixture = join(
+  import.meta.dirname,
+  "..",
+  "..",
+  "api",
+  "internal",
+  "workersvc",
+  "testdata",
+  "claim_ci_fix_wire.json",
+);
+
 test("claim wire contract: worker parses the server's skill shape", () => {
   const claim = JSON.parse(readFileSync(fixture, "utf8")) as ClaimResponse;
 
@@ -74,14 +90,17 @@ test("claim wire contract: worker parses the server's skill shape", () => {
     },
   ]);
 
-  // The omitempty contract: a claim WITHOUT the key leaves review_comments undefined
-  // (the Go side omits it when nil — the non-vacuous key-presence check the milestone
-  // requires, mirrored here on the parse side). Build a claim object without the key
-  // and confirm `"review_comments" in parsed` is false.
-  const withoutReview: Record<string, unknown> = {
-    ...(claim as unknown as Record<string, unknown>),
-  };
-  delete withoutReview.review_comments;
+  // The omitempty contract: a claim WITHOUT an mr_rework review snapshot omits the
+  // key entirely (the Go side tags review_comments `omitempty`). Assert against a
+  // GOLDEN that genuinely omits it — the ci_fix wire, byte-pinned to a real ci_fix
+  // claim (ReviewComments nil). This is the non-vacuous key-presence check on the
+  // parse side: if the Go side ever stopped omitting the field, that golden would
+  // gain a `review_comments` key and this assertion would break. (The prior version
+  // copied `claim` and `delete`d the key from the copy, which only exercised the JS
+  // `delete` operator and passed regardless of the Go contract.)
+  const withoutReview = JSON.parse(
+    readFileSync(ciFixFixture, "utf8"),
+  ) as Record<string, unknown>;
   assert.equal("review_comments" in withoutReview, false);
   assert.equal(
     (withoutReview as Partial<ClaimResponse>).review_comments,
