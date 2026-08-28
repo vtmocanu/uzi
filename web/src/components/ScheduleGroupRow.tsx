@@ -126,12 +126,23 @@ export function ScheduleGroupRow({
 // left block (repo label + badges + cron/next line) is shared; the variant supplies its
 // own badges, an optional leading action (default's prominent Reset), and its action
 // cluster (the ghost buttons + pause/resume toggle).
+//
+// Last-run parity (issue #690): a sub-row can also carry a per-repo last-run outcome
+// badge (`lastRun`, rendered inline after the info block) and an expandable "Last fire"
+// detail (`lastRunDetail`). A sub-row is a flex <div>, NOT a table row, so the detail
+// cannot be a sibling <tr> the way the standalone ScheduleRow does it — it renders as a
+// <div> BELOW the flex row, inside this component's own DOM. Its id (`panelId`) pairs
+// with the disclosure's aria-controls and, like the standalone's, exists only while the
+// detail is rendered — which is when aria-controls has anything to point at.
 export function ScheduleSubRow({
   repoLabel,
   enabled,
   badges,
   cronExpr,
   nextFire,
+  lastRun,
+  lastRunDetail,
+  panelId,
   leadingAction,
   actions,
 }: {
@@ -143,33 +154,51 @@ export function ScheduleSubRow({
   cronExpr: string;
   // The next fire instant for the enabled row; falsy hides the "next …" span.
   nextFire?: string | null;
+  // The per-repo last-run outcome badge + disclosure, rendered inline in the flex row
+  // between the info block and the leading action; omitted when absent.
+  lastRun?: ReactNode;
+  // The expandable "Last fire" detail, rendered as a <div> below the flex row; the caller
+  // passes it only while expanded, so the below-row region (and its id) exist only then.
+  lastRunDetail?: ReactNode;
+  // The id the lastRun disclosure's aria-controls points at; set on the detail region.
+  panelId?: string;
   // An action rendered between the info block and the action cluster (default: Reset).
   leadingAction?: ReactNode;
   // The right-aligned action cluster (run-now / edit / remove / toggle …).
   actions: ReactNode;
 }) {
   return (
-    <div
-      className={cx(
-        "flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-edge bg-surface px-3 py-2.5",
-        !enabled && "opacity-70",
-      )}
-    >
-      <div className="min-w-[160px] flex-1">
-        <div className="flex items-center gap-2">
-          <span className="font-mono text-[12.5px] text-fg">{repoLabel}</span>
-          {badges}
-          {!enabled && <Badge tone="neutral">paused</Badge>}
+    <div>
+      <div
+        className={cx(
+          "flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-edge bg-surface px-3 py-2.5",
+          !enabled && "opacity-70",
+        )}
+      >
+        <div className="min-w-[160px] flex-1">
+          <div className="flex items-center gap-2">
+            <span className="font-mono text-[12.5px] text-fg">{repoLabel}</span>
+            {badges}
+            {!enabled && <Badge tone="neutral">paused</Badge>}
+          </div>
+          <div className="mt-0.5 font-mono text-[11.5px] text-faint">
+            {cronExpr} · {humanizeCron(cronExpr)}
+            {enabled && nextFire && <span> · next {relativeFromNow(nextFire)}</span>}
+          </div>
         </div>
-        <div className="mt-0.5 font-mono text-[11.5px] text-faint">
-          {cronExpr} · {humanizeCron(cronExpr)}
-          {enabled && nextFire && <span> · next {relativeFromNow(nextFire)}</span>}
-        </div>
+
+        {lastRun}
+
+        {leadingAction}
+
+        <div className="flex items-center gap-1.5">{actions}</div>
       </div>
 
-      {leadingAction}
-
-      <div className="flex items-center gap-1.5">{actions}</div>
+      {lastRunDetail != null && (
+        <div id={panelId} className="mt-2">
+          {lastRunDetail}
+        </div>
+      )}
     </div>
   );
 }

@@ -20,6 +20,7 @@ import type { CatalogEntry, Repo, Schedule, ScheduleCatalog } from "../lib/api";
 import { humanizeCron } from "../lib/schedulePresets";
 import { RepoMultiSelect } from "./RepoMultiSelect";
 import { ScheduleGroupRow, ScheduleSubRow } from "./ScheduleGroupRow";
+import { LastRunOutcome, LastFireDetail, formatStamp } from "./LastRun";
 import { SweepLabelWarn } from "./SweepLabelWarn";
 import { Alert, Badge, Button, Toggle } from "./ui";
 import {
@@ -369,12 +370,33 @@ function SubRow({
   onEdit: () => void;
 }) {
   const nextFire = s.next_fires[0] ?? s.next_fire_at;
+  const [expanded, setExpanded] = useState(false);
+  const panelId = `last-fire-${s.id}`;
   return (
     <ScheduleSubRow
       repoLabel={s.repo_path || s.repo_id}
       enabled={s.enabled}
       cronExpr={s.cron_expr}
       nextFire={nextFire}
+      panelId={panelId}
+      // Per-repo last-run parity with the standalone row (issue #690): the same three-way
+      // fallback (outcome badge / bare stamp / never-fired), and the expandable detail
+      // rendered below the flex row only while expanded.
+      lastRun={
+        s.last_fire ? (
+          <LastRunOutcome
+            fire={s.last_fire}
+            expanded={expanded}
+            onToggle={() => setExpanded((v) => !v)}
+            panelId={panelId}
+          />
+        ) : s.last_fired_at ? (
+          <div className="text-[12.5px] text-muted">{formatStamp(s.last_fired_at)}</div>
+        ) : (
+          <span className="text-faint">— never fired</span>
+        )
+      }
+      lastRunDetail={s.last_fire && expanded ? <LastFireDetail s={s} fire={s.last_fire} /> : null}
       badges={s.customized ? <Badge tone="warning">customized</Badge> : null}
       leadingAction={
         // Reset is prominent for a customized row (restores the catalog cadence).
@@ -477,16 +499,4 @@ function Chip({ children }: { children: React.ReactNode }) {
       {children}
     </span>
   );
-}
-
-function formatStamp(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  return new Intl.DateTimeFormat(undefined, {
-    weekday: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-    month: "short",
-    day: "numeric",
-  }).format(d);
 }
