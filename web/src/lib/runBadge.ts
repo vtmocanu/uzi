@@ -372,11 +372,23 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
   if (isStoppedRun(run.status, run.stop_kind)) {
     return { kind: "badge", label: "stopped", tone: "neutral", pulse: false };
   }
+  const eff = effectiveRunStatus(run);
   // A health flag overrides the normal status label while the run is alive but looks
   // slow/stuck/looping (PRD #47). Only ever fires for a flaggable status.
+  //
+  // issue #750: EXCEPT while a run is revising. A run re-planning after a revise keeps
+  // raw status `awaiting_approval` (so it is still health-flaggable) even though
+  // is_revising is true — and the sharp flag is `approval_idle`, whose label is literally
+  // "needs approval". Letting that warn badge win would put "⚠ needs approval" back on a
+  // card that #750 deliberately calmed: the attention strip, card ring, and favicon all
+  // drop a revising run (it needs no human action during the ~90s replan), so the badge
+  // must not shout for approval either. Suppress ALL health flags while revising — the
+  // calm "revising" info badge is the more informative live-state, matching the strip/
+  // ring/favicon dropping the run entirely. Non-revising runs are byte-identical (the
+  // `eff !== "revising"` guard is a no-op unless the run is revising).
   const flagged = healthBadge(run, nowMs);
-  if (flagged) return flagged;
-  switch (effectiveRunStatus(run)) {
+  if (flagged && eff !== "revising") return flagged;
+  switch (eff) {
     case "queued":
       return { kind: "badge", label: "queued", tone: "queue", pulse: false };
     case "claimed":

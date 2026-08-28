@@ -282,6 +282,45 @@ describe("revising phase (issue #750)", () => {
     });
   });
 
+  it("runBadge: a revising run carrying a health flag still reads 'revising', NOT '⚠ needs approval'", () => {
+    // A run mid-revise keeps raw status `awaiting_approval` (so it stays health-flaggable)
+    // while is_revising is true. If it ALSO carries a non-ok health flag — the sharp case is
+    // `approval_idle`, whose label is literally "needs approval" — the health warn badge would
+    // win the short-circuit before the effective-status switch and put "⚠ needs approval" back
+    // on a card #750 deliberately calmed. Confirm healthBadge WOULD fire on this exact run
+    // (proving the case is real, not vacuous), then that runBadge suppresses it while revising.
+    const r = run({
+      status: "awaiting_approval",
+      is_revising: true,
+      health: "approval_idle",
+      health_since: "2026-07-04T12:03:00Z",
+    });
+    expect(healthBadge(r, NOW)).not.toBeNull(); // would fire without the #750 guard
+    expect(runBadge(r, NOW)).toEqual({
+      kind: "badge",
+      label: "revising",
+      tone: "info",
+      pulse: true,
+    });
+  });
+
+  it("runBadge: a NON-revising awaiting_approval run with the same health flag STILL shows the health warn", () => {
+    // The control: the #750 guard is surgical — it suppresses the health badge only while
+    // revising, never disabling health badges for an ordinary awaiting_approval run.
+    const r = run({
+      status: "awaiting_approval",
+      is_revising: false,
+      health: "approval_idle",
+      health_since: "2026-07-04T12:03:00Z",
+    });
+    expect(runBadge(r, NOW)).toMatchObject({
+      kind: "badge",
+      label: "⚠ needs approval · 1m",
+      tone: "warning",
+      pulse: true,
+    });
+  });
+
   it("runBadge: the SAME run without is_revising still reads as 'awaiting approval'", () => {
     // The revising wiring must not disturb an ordinary awaiting_approval run — is_revising
     // false OR absent both fall through to the existing warn-toned awaiting badge.
