@@ -6,7 +6,7 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger } from "./helpers.js";
-import { GitCache } from "../src/git.js";
+import { GitCache, WIP_PARK_COMMIT_PREFIX } from "../src/git.js";
 
 // PRD #628 M3 — the cross-worker checkpoint recovery regression test (SC#2).
 //
@@ -186,6 +186,61 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
     assert.strictEqual(rc.seededFrom, "default", "falls through to the default floor");
     assert.strictEqual(rc.priorCommits, 0);
     assert.notStrictEqual(rc.checkpointSetAside, true, "equality is not divergence");
+  });
+
+  it("recovers a wip(park) marker to UNCOMMITTED at adopt time via reset --soft (same-worker, PRD #759 M2)", async () => {
+    // The PRIMARY seam M2 adds: a same-worker resume whose adopted tracking-ref tip is a
+    // `wip(park):` marker (M1's throwaway auto-commit of the pre-park uncommitted tree) is
+    // reset --soft'd back so the WIP content returns as UNCOMMITTED changes and the marker
+    // never enters the branch history. Drives it with REAL git through the production
+    // commitWipMarker + fetchAgentBranch + reseed path.
+    const branch = "agent/issue-759";
+    const gitA = worker("workerA");
+    const bareA = await gitA.ensureClone(fx.originPath);
+
+    // Seed off the default branch, then leave a genuinely UNCOMMITTED edit in the clone —
+    // the single deviation from the committing park factories, mirroring the #685 incident
+    // (mid-milestone work never committed).
+    const seed = await gitA.createOrAttachRunnerClone(bareA, 759, "run-A");
+    const forkPoint = gitIn(seed.path, ["rev-parse", "HEAD"]); // the last REAL commit
+    fs.writeFileSync(path.join(seed.path, "WIP.txt"), "in-progress work\n");
+
+    // M1: auto-commit the uncommitted work to a wip(park) marker, then fetch it back to the
+    // worker-side tracking ref (stamped run-A → ownedHere on reseed).
+    const committed = await gitA.commitWipMarker(seed.path);
+    assert.strictEqual(committed, true, "commitWipMarker planted a marker for the dirty tree");
+    const markerSubject = gitIn(seed.path, ["log", "-1", "--format=%s"]);
+    assert.ok(markerSubject.startsWith(WIP_PARK_COMMIT_PREFIX), "the marker subject is prefixed wip(park):");
+    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+
+    // THE RESEED (same worker, same run): the tracking ref is owned here and its tip is the
+    // marker, so M2's reset --soft fires.
+    const rc = await gitA.createOrAttachRunnerClone(bareA, 759, "run-A");
+
+    // (a) the WIP content is present in the resumed clone as an UNCOMMITTED change.
+    assert.strictEqual(fs.existsSync(path.join(rc.path, "WIP.txt")), true, "recovered WIP file is in the working tree");
+    assert.strictEqual(
+      fs.readFileSync(path.join(rc.path, "WIP.txt"), "utf8"),
+      "in-progress work\n",
+      "…with its pre-park content",
+    );
+    const porcelain = gitIn(rc.path, ["status", "--porcelain"]);
+    assert.ok(/WIP\.txt/.test(porcelain), `WIP.txt shows as an uncommitted change, got: ${JSON.stringify(porcelain)}`);
+
+    // (b) the finalized branch history carries NO wip(park): subject — the marker was
+    // stripped by reset --soft, so it never reaches finalize / the MR.
+    const subjects = gitIn(rc.path, ["log", "--format=%s"]).split("\n");
+    assert.ok(
+      subjects.every((s) => !s.startsWith(WIP_PARK_COMMIT_PREFIX)),
+      `no wip(park): commit in the resumed branch history, got: ${JSON.stringify(subjects)}`,
+    );
+
+    // (c) the recovery is surfaced on the RunnerClone, and the base is the real fork point
+    // (the marker's parent), not the marker — so M5's recovered-commit count excludes it.
+    assert.strictEqual(rc.wipRecovered, true, "wipRecovered signals the WIP-snapshot recovery");
+    assert.strictEqual(rc.seededFrom, "tracking", "adopted the same-worker tracking ref");
+    assert.strictEqual(rc.baseCommit, forkPoint, "baseCommit is the marker's parent (the last real commit)");
+    assert.strictEqual(rc.priorCommits, 0, "the marker is not counted as recovered committed work");
   });
 
   it("without a published checkpoint, the reseed falls to the default branch (positive control: the test depends on the mirror link + publish)", async () => {
