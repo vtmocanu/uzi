@@ -63,7 +63,10 @@ export function LastRunOutcome({
         type="button"
         onClick={onToggle}
         aria-expanded={expanded}
-        aria-controls={panelId}
+        // Only reference the panel while it is mounted: the caller renders the detail
+        // (and its id={panelId} element) only when expanded, so a collapsed disclosure
+        // must not carry a dangling aria-controls to a non-existent id (issue #690 CR).
+        aria-controls={expanded ? panelId : undefined}
         className="inline-flex w-fit items-center gap-1 rounded text-[11px] font-medium text-muted transition-colors hover:text-fg"
       >
         Last fire

@@ -636,8 +636,19 @@ describe("Schedules — last-run parity on grouped sub-rows (issue #690)", () =>
     await waitFor(() => expect(screen.getByRole("switch", { name: "Pause on vtmocanu/uzi" })).toBeTruthy());
 
     // The uzi sub-row shows the enriched green outcome badge; the atlas sub-row never fired.
-    expect(screen.getByText("1 started")).toBeTruthy();
-    expect(screen.getByText("— never fired")).toBeTruthy();
+    // Scope each outcome to its own sub-row (anchored on the unique per-repo pause switch)
+    // so a Uzi/Atlas swap fails the test — a document-level getByText would pass either way,
+    // and "— never fired" also appears in the group summary cell (issue #690 CR).
+    const uziRow = screen
+      .getByRole("switch", { name: "Pause on vtmocanu/uzi" })
+      .closest<HTMLElement>("div.rounded-lg")!;
+    const atlasRow = screen
+      .getByRole("switch", { name: "Pause on vtmocanu/atlas" })
+      .closest<HTMLElement>("div.rounded-lg")!;
+    expect(within(uziRow).getByText("1 started")).toBeTruthy();
+    expect(within(uziRow).queryByText("— never fired")).toBeNull();
+    expect(within(atlasRow).getByText("— never fired")).toBeTruthy();
+    expect(within(atlasRow).queryByText("1 started")).toBeNull();
 
     // Only one sub-row carries a fire, so the disclosure is unambiguous. Expanding reveals
     // the started run (LastFireDetail) below that sub-row's flex row.
