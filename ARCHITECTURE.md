@@ -479,11 +479,25 @@ clock, which is what keeps the ranking testable without a database. It sits
 *behind* `claimSecretID` rather than beside it, so **the ranker runs in exactly
 one place**: `assembleClaim` never ranks and `openAnthropic` never learns of it
 at all — PRD #104's R4 is that three copies of credential resolution drift and
-a wrong fallback spends the wrong account silently. `assembleClaim` *does* know
+a wrong fallback spends the wrong account silently.
+
+Since PRD #754 there is one absolute invariant on top of that: **an `auto`
+worker never spends a token whose `auto_eligible = false`** — the owner's
+default, when it isn't itself pooled, is never a fallback on this lane.
+Liveness comes from a precedence ladder that stays inside the pool. If the
+selector can pick a usable pooled token, it does (unchanged). If nothing is
+rankable but the pool isn't empty, `autoChoice` floors onto the **best pooled
+token anyway** — stale or below-threshold, recorded `pool_stale` — rather
+than fail or reach for the non-pooled default. `assembleClaim` *does* know
 the choice came from the selector, because D14's retry lives where the open
-happens: it re-resolves once on the non-auto binding when a selector-named
-credential will not decrypt. Auto never fails a run: an empty, unmeasurable or
-undecryptable pool falls back to the owner's default and records why.
+happens: when a selector-named credential will not decrypt, it re-resolves
+once by flooring onto **another pooled token** (`reason = open_failed`),
+never onto the default. Only when the pool is genuinely **empty** does the
+run give up spending anything: it holds in a non-locking `pool_wait` status —
+excluded from the partial unique index that caps one non-terminal run per
+issue (below), so a held run never pins the issue — and resumes on its own
+the moment the owner opts a token into the pool, or on demand via `uzi run
+resume-now` / the run view's "Resume now" control.
 
 Every claim now also **records the credential it spent** on the run
 (`runs.anthropic_secret_id` + a `anthropic_secret_label` snapshot + the mode

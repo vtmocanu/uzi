@@ -1028,9 +1028,9 @@ whatever it happened to pick last.
 
 `uzi run get` names the credential a run spent **and the mode that chose
 it** — `console-key — auto, 62% headroom`, `console-key — pinned`,
-`default — default (auto: no fresh usage readings)`. See
+`console-key — auto (pooled token, no fresh readings)`. See
 [Anthropic tokens](./anthropic-token.md) for the full set and what each
-fallback means.
+reason means.
 
 ### Upgrade status
 

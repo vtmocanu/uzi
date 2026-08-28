@@ -142,20 +142,34 @@ just refused it back up. Its meter also reads 100% for the window it hit as
 soon as the pause happens, so every other run's claim ranks it as exhausted
 too — see [Paused on a usage limit](run-limit-wait.md).
 
-### 🔴 "Auto" does not mean "only my pool"
+### "Auto" means "only my pool"
 
-**Auto-selection never fails a run.** If it cannot pick — nothing is pooled,
-no pooled token has a reading it can rank, or the token it picked will not
-open — the run falls back to your **default token**, and your default is
-spent *whether or not it is in the pool*. The fallback does not consult the
-opt-in.
+**An `auto` worker never spends a token you have not opted into the pool** —
+not even your default, if you kept it out. If it can pick, it does. If it
+can't pick but the pool isn't empty — nothing pooled has a usable reading —
+it spends the **best pooled token anyway**, stale reading and all, rather
+than reach outside the pool. Only when the pool is genuinely **empty** does
+it stop spending anything: the run **holds**, waiting, until you opt a token
+in (or you resume it yourself).
 
-So a token you deliberately kept **out** of the pool can still pay for a run,
-if it happens to be your default. That is not a bug and there is no third
-option: refusing to run would be worse. If you want a credential never spent
-by ordinary runs, it must not be your default either.
+So a token you deliberately kept **out** of the pool is safe from ordinary
+auto runs, full stop — that's the whole point of the toggle. The one thing
+auto-selection does not do is fail a run outright: a thin pool still runs (on
+whatever is pooled, however stale), and an empty pool waits rather than
+errors.
 
 The run view says which of these happened — see below.
+
+### Waiting for a token
+
+When an `auto` worker's pool has nothing at all to spend, the run doesn't
+fail and doesn't reach for the default — it **holds**, showing "Waiting for
+a pooled token" on the run view and `pool_wait` as its status everywhere
+else. It resumes on its own the moment you opt a token into the pool, or you
+can skip the wait with `uzi run resume-now <run-id>` or the run view's
+**Resume now** button. This is a different wait than
+[a usage-limit pause](run-limit-wait.md): a `pool_wait` hold means there was
+nothing pooled to spend at all, not that a pooled token hit its rate limit.
 
 ### Reading it back
 
@@ -169,14 +183,15 @@ view and an `ANTHROPIC_TOKEN` row in `uzi run get`:
 | `console-key — pinned` | the worker is bound to this token |
 | `console-key — default` | nothing named a token, so your default paid |
 | `review-key — judge binding` | your judge setting chose it, not a worker's |
-| `default — default (auto: no tokens in the pool)` | the worker is on auto and you have pooled nothing |
-| `default — default (auto: no fresh usage readings)` | the worker is on auto and no pooled token had a reading it could rank — never polled, polled without percentages, or aged out |
-| `default — default (auto: the chosen token would not open)` | auto picked one, its stored value would not decrypt, so your default paid |
+| `console-key — auto (pooled token, no fresh readings)` | no pooled token had a usable reading to rank, so auto floored onto this pooled token as a last resort — still one of yours, never your default |
+| `console-key — auto (fell to another pooled token)` | auto's first pick would not decrypt, so it floored onto this other pooled token instead — never your default |
+| `default (auto: pool was empty — legacy)` | historical only, from a run claimed before this floor/hold behavior shipped, when an empty pool really did spend the default. A new run never shows this: an empty pool [holds instead](#waiting-for-a-token) |
 
-The last three are the fallbacks, shown in amber and linked to this page,
-because in each case the worker is set to auto and auto did not happen. They
-are different problems: pool one in, look at why the readings are
-missing or unusable, or re-paste the token that would not open.
+The two floor reasons are shown in amber and linked to this page, because
+the worker is set to auto and its pool needed to fall back to a weaker
+signal to keep the run going — worth knowing about, even though nothing
+outside your pool was spent. Pool in a fresher token, or look at why the
+readings are missing or unusable, to get back to an ordinary pick.
 
 A run whose token you later delete still names it, with **(deleted)** — the
 name is a snapshot taken when the run was claimed, so history stays readable.

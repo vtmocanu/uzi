@@ -13741,9 +13741,9 @@ five. The three most important omissions are the ones D20's own rationale is abo
 | `judge` | `<label> — judge binding` | the owner's judge setting, for judge + self_improve runs |
 | `auto` | `<label> — auto, N% headroom` | the selector, from the eligible set |
 | `best_of_pool` | `<label> — auto (best of pool), N% headroom` | every pooled token under the floor (D10) |
-| `pool_empty` | `<label> — default (auto: no tokens in the pool)` | nothing opted in |
-| `pool_stale` | `<label> — default (auto: no fresh usage readings)` | nothing measurable, incl. a disabled poller (R2) |
-| `open_failed` | `<label> — default (auto: the chosen token would not open)` | D14's retry |
+| `pool_empty` | `<label> — default (auto: pool was empty — legacy)` | LEGACY (pre-#754); auto now HOLDS in `pool_wait`, spends nothing |
+| `pool_stale` | `<label> — auto (pooled token, no fresh readings)` | nothing measurable → FLOORS onto a pooled token (#754), never the default |
+| `open_failed` | `<label> — auto (fell to another pooled token; the chosen one would not open)` | D14's retry → floors onto another pooled token (#754) |
 
 `judge` exists **because of** D20 and the draft had no slot for it: the judge lane borrowed `pinned`
 while the vocabulary held two values, and `pinned` sends a user to Settings → Workers looking for a
@@ -13800,7 +13800,11 @@ extension — the four `anthropic_*` fields already ride the list DTOs, so no se
 🔴 **The fallback spends the owner default, and the owner default NEVER consults `auto_eligible`.**
 So a token deliberately kept *out* of the pool can still pay for a run, if it happens to be the
 user's default. Not a regression, and there is no third option — D7 forbids failing the run — but
-"auto" does not mean "only my pool", and the docs say so.
+"auto" does not mean "only my pool", and the docs say so. **[Superseded by PRD #754, see §580: this
+limitation no longer holds for the auto lane. #754 makes "auto" mean exactly "only my pool" — the
+owner-default fallback was dropped, and liveness comes from a floor-then-hold ladder inside the pool
+(`pool_stale` floors onto a pooled token, `pool_wait` holds when the pool is empty). This paragraph
+records PRD #111's behaviour as shipped, now reversed.]**
 
 **D16 — `refused` is not a live state, and the set is SIX.** D11 promised a `refused` state and
 nothing can serve it: the poller's 15-minute refusal backoff is an unexported in-process map with no
@@ -13995,13 +13999,17 @@ rebuild re-derives wrongly by default, which is why they are recorded rather tha
 classifier states — `no_reading`, `unmeasured` and `stale` — so "nothing has a fresh reading" is
 loose for the `unmeasured` case, where a **current** reading exists and simply carries no
 percentages. The precise statement is *no pooled token has a reading it can RANK*. 🔴 **The chip
-text is deliberately NOT hedged to match**: `default (auto: no fresh usage readings)` is reviewed
+text is deliberately NOT hedged to match**: `auto (pooled token, no fresh readings)` (the #754
+wording — the run FLOORS onto a pooled token here, it no longer falls to the default) is reviewed
 shipped copy, and the doc and the chip saying the same thing **as each other** is what matters to a
 user, so only the prose around it carries the precision. A rebuild that reads the reason NAME as
 "aged out" ships a wrong explanation for two of its three causes.
 
 **The empty-pool guard counts POOLED tokens, not tokens.** A worker set to `auto` over an empty pool
-resolves `pool_empty` on every claim and spends the owner's default — so a worker surface that
+resolves `pool_empty` on every claim and spends the owner's default (**PRD #754 changed the outcome,
+see §580: an auto worker over an empty pool now HOLDS in the non-locking `pool_wait` state instead of
+spending the owner default; the pooled-vs-total counting rule below is unchanged**) — so a worker
+surface that
 announces it auto-selects from the pool is R7's silent no-op moved up one level: the TOKEN surface
 closed it, and the WORKER surface, where the choice is actually made, kept it open. The trap is the
 neighbouring precedent: the analogous guard beside it tests "the user has no tokens", and copying
@@ -19972,8 +19980,14 @@ mechanisms, at two layers, because neither covers the other's cases (D1/D2).
   successfully records — "at least one claim", not "exactly one", since a claim can still die after
   that clear point. This is what M1 structurally cannot reach: the `overage`/`unknown` limit types, the
   case where the dead credential is the sole measurable candidate and `best_of_pool` picks it anyway,
-  and the fallback path. The exclusion is CONDITIONAL, not absolute — a single-pooled-token user still
-  resumes on their only token, because D7 (auto never fails a run) outranks this feature.
+  and the fallback path. **[Superseded by PRD #754 — the WHY inverted, see §580.]** As #217 shipped,
+  the exclusion was CONDITIONAL, not absolute: a single-pooled-token user still resumed on their only
+  token because D7 (auto never fails a run) outranked this feature and let the run fall through to the
+  owner default. Under PRD #754 the reasoning REVERSED — the auto lane never spends a non-pooled token,
+  so a single-pooled-token user resumes on their only token because the auto lane now FLOORS onto that
+  pooled token and the #217 exclude is RELAXED once the credential's usage window reopens, NOT because
+  D7 outranks the exclusion. D7's owner-default fallback was dropped for the auto lane, so there is no
+  longer a default to fall through to.
 - **M3 — `source` gets a rendering, not just a value.** A **"Recorded at usage limit"** badge
   (`web/src/components/RateLimitMeters.tsx`, `AdminRateLimits.tsx`) fires only for
   `source === 'limit_report'`, so a 100% bar written mid-interval by a park doesn't read as a stale
@@ -22674,3 +22688,43 @@ Terse contract here; PRD #650's Decision Log is the richer rationale.
   cache %, budgeted whole-block-or-nothing against the rail height so it never half-draws. The
   floor total also wears the tungsten accent so the two cost totals read at one weight (a tui-ux
   consistency fix).
+
+## 580. PRD #754 — the auto lane is POOLED-ONLY: never spends a non-pooled token; liveness by a floor-then-hold ladder (`pool_stale` floors, `pool_wait` holds), reversing PRD #111 D7's owner-default fallback
+
+Reverses part of **PRD #111 Decision 7** ("auto never fails a run") for the AUTO lane. D7 bought
+liveness with an owner-default fallback that spends whatever token is the user's default — **including
+one deliberately kept OUT of the pool** (`auto_eligible = false`), the red limitation §427 flagged.
+#754 makes that trade unacceptable: the pool is an opt-in consent boundary, and an owner-default spend
+crosses it. Terse contract here; PRD #754's Decision Log is the richer rationale.
+
+- **The invariant: an `auto` worker NEVER spends a token whose `auto_eligible = false`, on ANY branch**
+  — not the initial claim, not D14's `open_failed` retry, not a #217/#35 limit-park resume. The
+  out-of-pool owner default is never charged by an auto worker. (The `pinned`/`judge`/explicit lanes
+  are unaffected — this is the AUTO lane only.)
+- **Liveness moves INSIDE the pool as a three-rung precedence ladder**, replacing the owner-default
+  fallback:
+  1. **Pick** a usable (rankable, above-floor) pooled token — the normal `auto`/`best_of_pool` path
+     (§426).
+  2. **FLOOR** onto the best pooled token even when none is rankable (all stale/unmeasured, or all
+     below `MinHeadroom`), recorded `pool_stale`. **`pool_stale` now names a FLOORED POOLED TOKEN, not
+     the owner default** — its meaning inverted from §426/§431, where it resolved to the default.
+  3. **HOLD** in a new **non-locking `pool_wait`** run state when the pool is genuinely empty (nothing
+     opted in). It locks no worker/credential and spends nothing; it resumes AUTOMATICALLY when a token
+     is pooled — a reactive sweeper pass — or on demand via **`uzi run resume-now`**. This replaces
+     `pool_empty`'s old owner-default resolution (§431).
+- **D14's `open_failed` retry also FLOORS onto another pooled token, never the default** — same rule,
+  applied on the reopen-failed path (§425).
+- **The #217 exclude-relax.** PRD #217 M2 (§506) excludes the just-parked credential from the resuming
+  claim so a run cannot re-grab the token that just refused it. Under #754 that exclusion is **RELAXED
+  once the credential's usage window reopens**, so a single-pooled-token user's resume continues on
+  their only token. This is the mechanism §506 previously (wrongly) attributed to D7 outranking the
+  exclusion — corrected there.
+- **What this drops.** PRD #111 D7's owner-default fallback is GONE for the auto lane; §427's red "the
+  fallback spends the owner default" limitation no longer holds (annotated there and in §431). The
+  auto lane can now legitimately WAIT (`pool_wait`) rather than always proceed — the behaviour #754
+  accepts in exchange for the consent guarantee that no non-pooled token is ever spent.
+
+Cross-refs: PRD #111 D7 / D14 / D20 (§425, §426, §427, §431), PRD #217 M2 (§506), PRD #35 (usage-limit
+park). Reason-chip wire strings for `pool_stale`/`pool_empty`/`open_failed` in §426's table describe
+the pre-#754 default-resolution outcomes; the rendering changes are M-scoped and recorded with those
+milestones, not duplicated here.

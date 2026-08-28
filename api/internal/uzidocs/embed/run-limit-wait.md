@@ -41,4 +41,8 @@ A run can pause and resume more than once if the limit keeps recurring, backing 
 
 A run that isn't set up to wait still fails the moment it hits a limit, the same as before — but the failure now says why, instead of a bare error: *"Anthropic usage limit (5-hour) reached; resets at 2026-07-28T02:00:00Z"*. Re-run it once that time passes, or turn on waiting so next time it doesn't have to.
 
-Related: [Claude rate limits](rate-limits.md) · [Run health](run-health.md) · [Configuration](configuration.md)
+## Not the same as waiting for a pooled token
+
+A **`limit_wait`** pause (this page) and a **`pool_wait`** hold are both non-terminal waits, but for different reasons with different resolutions. `limit_wait` means a token you were actually spending hit its Anthropic rate limit, and it clears when that window resets. `pool_wait` means an `auto`-lane worker's token pool was genuinely empty — there was nothing to spend at all — and it clears when you opt a token into the pool, or on demand with `uzi run resume-now`. See [Letting uzi pick the token (auto-selection)](anthropic-token.md#letting-uzi-pick-the-token-auto-selection) for the pooled-token wait.
+
+Related: [Claude rate limits](rate-limits.md) · [Anthropic tokens](anthropic-token.md) · [Run health](run-health.md) · [Configuration](configuration.md)
