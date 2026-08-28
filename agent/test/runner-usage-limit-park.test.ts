@@ -687,6 +687,295 @@ describe("RunRunner — durable park (PRD #218 M1/M2/M3)", () => {
   });
 });
 
+// ── PRD #759 M5 — the recovery feed distinguishes WIP from committed ──────────
+//
+// M5 makes an uncommitted-WIP recovery legible in the run feed, distinct from a
+// committed-milestone recovery, and — the ordering crux — keeps the #218 M3 loss
+// notice from FALSELY firing on a cross-worker DIVERGED WIP recovery (which leaves
+// seededFrom==='default' but wipRecovered===true). Driven on the REAL runner emission:
+//   (a)/(c) via a genuinely-dirty park + same-worker resume — the runner's own M1
+//     commitWipMarker plants the wip(park): marker, the reseed resets it back to
+//     uncommitted, and the emission reads the resulting RunnerClone end to end.
+//   (b) via a plain cross-worker resume (no recoverable ref → seededFrom 'default')
+//     with wipRecovered forced true on the reseed's return — exactly the shape the
+//     git-level diverged leg produces (proved end to end in
+//     git-cross-worker-recovery.test.ts). It is the direct A/B of the existing loss
+//     test above: same claim, plus wipRecovered, must flip the loss notice OFF and the
+//     WIP notice ON. That is the whole ordering fix.
+describe("RunRunner — WIP-vs-committed recovery feed (PRD #759 M5)", () => {
+  const WIP_MSG =
+    /uncommitted work-in-progress from this run's interrupted attempt — a partial snapshot/;
+  const LOSS_MSG = /no earlier work could be recovered/;
+
+  const feedTexts = (runId: string): string[] =>
+    api
+      .messages(runId)
+      .filter((m) => m.kind === "status")
+      .map((m) => String(m.payload.text));
+
+  /** A factory that leaves a genuinely UNCOMMITTED edit in the clone (no `git add` /
+   *  commit — the single deviation from commitThenParkFactory) then parks. The runner's
+   *  M1 commitWipMarker turns it into a wip(park): marker, fetched back to the tracking
+   *  ref; the same-worker resume's reseed resets it back to uncommitted (wipRecovered). */
+  function dirtyThenParkFactory(homeRoot: string, dirty: string): ExecutorFactory {
+    return (runId) => ({
+      homeDir: path.join(homeRoot, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          fs.writeFileSync(path.join(ctx.worktreePath, dirty), "in-progress, uncommitted\n");
+          fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
+          throw new LimitReachedError({
+            resetsAtMs: Date.now() + 5 * 3600_000,
+            rateLimitType: "five_hour",
+          });
+        },
+      },
+    });
+  }
+
+  /** Like above but ALSO commits `committed` first, so the resume recovers a committed
+   *  milestone AND the uncommitted WIP (the "plus your uncommitted work-in-progress"
+   *  wording, priorCommits > 0 && wipRecovered). */
+  function commitAndDirtyThenParkFactory(
+    homeRoot: string,
+    committed: string,
+    dirty: string,
+  ): ExecutorFactory {
+    return (runId) => ({
+      homeDir: path.join(homeRoot, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          commitInTree(ctx.worktreePath, committed, "committed milestone\n");
+          fs.writeFileSync(path.join(ctx.worktreePath, dirty), "in-progress, uncommitted\n");
+          fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
+          throw new LimitReachedError({
+            resetsAtMs: Date.now() + 5 * 3600_000,
+            rateLimitType: "five_hour",
+          });
+        },
+      },
+    });
+  }
+
+  /** A no-op resume executor that records whether `probe` was restored to the tree. */
+  function resumeProbeFactory(
+    homeRoot: string,
+    probe: string,
+    onSeen: (present: boolean) => void,
+  ): ExecutorFactory {
+    return (runId) => ({
+      homeDir: path.join(homeRoot, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          onSeen(fs.existsSync(path.join(ctx.worktreePath, probe)));
+          return { branch: ctx.branch };
+        },
+      },
+    });
+  }
+
+  it("(a) a PURE uncommitted-WIP recovery says 'partial snapshot' and NOT the loss notice", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-759-wip-pure-"));
+    try {
+      const iid = 759;
+      const runId = "75900000-0000-4000-8000-0000000759aa";
+      // Park with a genuinely dirty (never-committed) tree → wip(park): marker on the
+      // tracking ref (no committed work: priorCommits stays 0).
+      await runnerWith(dirtyThenParkFactory(homeRoot, "WIP.txt"), gitlab).execute(
+        gitlabClaim(iid, { run_id: runId, wait_on_limit: true }),
+      );
+      // Same-worker resume: the reseed reset --soft's the marker back to uncommitted.
+      let sawWip = false;
+      await runnerWith(
+        resumeProbeFactory(homeRoot, "WIP.txt", (p) => {
+          sawWip = p;
+        }),
+        gitlab,
+      ).execute(
+        gitlabClaim(iid, {
+          run_id: runId,
+          wait_on_limit: true,
+          session_id: SID,
+          last_seq: 1000,
+        }),
+      );
+      assert.strictEqual(sawWip, true, "the uncommitted WIP file is restored to the resumed tree");
+      const texts = feedTexts(runId);
+      assert.ok(
+        texts.some((t) => WIP_MSG.test(t)),
+        `expected the WIP-recovery notice, got ${JSON.stringify(texts)}`,
+      );
+      assert.strictEqual(
+        texts.some((t) => LOSS_MSG.test(t)),
+        false,
+        "the loss notice must NOT fire when uncommitted WIP was recovered",
+      );
+      assert.strictEqual(
+        texts.some((t) => /recovered \d+ commit/.test(t)),
+        false,
+        "a pure-WIP recovery must not claim any committed recovery",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(b) a DIVERGED WIP recovery (seededFrom 'default' + wipRecovered) fires the WIP notice, not the loss notice", async () => {
+    // The ordering crux. A cross-worker diverged recovery leaves seededFrom==='default'
+    // (the base is the advanced floor, not a checkpoint) with wipRecovered===true. This is
+    // the EXACT claim of the existing loss test ("a resume that recovers nothing"), so the
+    // ONLY delta is wipRecovered — and it must flip the loss notice OFF and the WIP notice
+    // ON. Force wipRecovered on the reseed's return, the git-level diverged leg being proved
+    // end to end in git-cross-worker-recovery.test.ts.
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-759-wip-diverged-"));
+    const origReseed = git.runnerCloneForBranch.bind(git);
+    (git as unknown as { runnerCloneForBranch: unknown }).runnerCloneForBranch = async (
+      ...args: unknown[]
+    ) => {
+      const rc = await (origReseed as unknown as (
+        ...a: unknown[]
+      ) => Promise<Record<string, unknown>>)(...args);
+      // A plain cross-worker resume already yields seededFrom 'default' / priorCommits 0;
+      // add the diverged leg's wipRecovered signal.
+      assert.strictEqual(rc.seededFrom, "default", "precondition: nothing recoverable → default floor");
+      return { ...rc, wipRecovered: true };
+    };
+    try {
+      const iid = 763;
+      const claim = gitlabClaim(iid, { wait_on_limit: true, session_id: SID });
+      await runnerWith(
+        (runId) => ({
+          homeDir: path.join(homeRoot, runId),
+          executor: { run: async (ctx: RunContext) => ({ branch: ctx.branch }) },
+        }),
+        gitlab,
+      ).execute(claim);
+      const texts = feedTexts(claim.run_id);
+      assert.ok(
+        texts.some((t) => WIP_MSG.test(t)),
+        `expected the WIP-recovery notice on the diverged recovery, got ${JSON.stringify(texts)}`,
+      );
+      assert.strictEqual(
+        texts.some((t) => LOSS_MSG.test(t)),
+        false,
+        "the loss notice must NOT fire on a diverged WIP recovery — the crux of the ordering fix",
+      );
+    } finally {
+      (git as unknown as { runnerCloneForBranch: unknown }).runnerCloneForBranch = origReseed;
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(c) a committed + WIP recovery mentions BOTH the commit count and the uncommitted work", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-759-wip-both-"));
+    try {
+      const iid = 764;
+      const runId = "76400000-0000-4000-8000-0000000764aa";
+      // Commit one milestone AND leave an uncommitted edit, then park: the marker sits on
+      // top of the committed work, so the resume recovers 1 commit + the WIP.
+      await runnerWith(
+        commitAndDirtyThenParkFactory(homeRoot, "M1.txt", "WIP.txt"),
+        gitlab,
+      ).execute(gitlabClaim(iid, { run_id: runId, wait_on_limit: true }));
+      let sawWip = false;
+      await runnerWith(
+        resumeProbeFactory(homeRoot, "WIP.txt", (p) => {
+          sawWip = p;
+        }),
+        gitlab,
+      ).execute(
+        gitlabClaim(iid, {
+          run_id: runId,
+          wait_on_limit: true,
+          session_id: SID,
+          last_seq: 1000,
+        }),
+      );
+      assert.strictEqual(sawWip, true, "the uncommitted WIP file is restored alongside the committed work");
+      const texts = feedTexts(runId);
+      assert.ok(
+        texts.some((t) =>
+          /recovered 1 commit\(s\) plus your uncommitted work-in-progress from this run's interrupted attempt/.test(
+            t,
+          )),
+        `expected the combined committed+WIP notice, got ${JSON.stringify(texts)}`,
+      );
+      assert.strictEqual(
+        texts.some((t) => LOSS_MSG.test(t)),
+        false,
+        "the loss notice must not fire when work was recovered",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(d) regression: a committed-only recovery keeps the byte-identical pre-M5 wording", async () => {
+    // The !wipRecovered branch must be untouched: a park that COMMITS its work (no dirty
+    // tree, so no marker) recovers exactly as before. (The pure-loss byte-identical case is
+    // covered by "a resume that recovers nothing admits the loss in the feed" above.)
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-759-committed-only-"));
+    try {
+      const iid = 765;
+      const runId = "76500000-0000-4000-8000-0000000765aa";
+      const { factory } = commitThenParkFactoryLocal(homeRoot, "WORK.txt");
+      await runnerWith(factory, gitlab).execute(
+        gitlabClaim(iid, { run_id: runId, wait_on_limit: true }),
+      );
+      await runnerWith(
+        resumeProbeFactory(homeRoot, "WORK.txt", () => {}),
+        gitlab,
+      ).execute(
+        gitlabClaim(iid, {
+          run_id: runId,
+          wait_on_limit: true,
+          session_id: SID,
+          last_seq: 1000,
+        }),
+      );
+      const texts = feedTexts(runId);
+      assert.ok(
+        texts.some(
+          (t) => t === "recovered 1 commit(s) of work from this run's interrupted attempt",
+        ),
+        `expected the byte-identical committed-only wording, got ${JSON.stringify(texts)}`,
+      );
+      assert.strictEqual(
+        texts.some((t) => WIP_MSG.test(t)),
+        false,
+        "a committed-only recovery must not mention uncommitted work-in-progress",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  /** A committing park factory local to this block (a duplicate of the durable-park
+   *  block's private helper), so (d) can commit real work without a dirty tree. */
+  function commitThenParkFactoryLocal(homeRoot: string, file: string): {
+    factory: ExecutorFactory;
+  } {
+    const factory: ExecutorFactory = (runId) => ({
+      homeDir: path.join(homeRoot, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          commitInTree(ctx.worktreePath, file, "work before the park\n");
+          fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
+          throw new LimitReachedError({
+            resetsAtMs: Date.now() + 5 * 3600_000,
+            rateLimitType: "five_hour",
+          });
+        },
+      },
+    });
+    return { factory };
+  }
+});
+
 // ── PRD #218 M2 — the reseed's per-leg base resolution (git level) ────────────
 //
 // The two legs a UNIFORM ancestor test gets wrong are the point: a first park with a

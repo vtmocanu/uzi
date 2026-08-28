@@ -612,7 +612,7 @@ export class GitCache {
         // committed work. Two things the naive `cherry-pick --no-commit <ref>` got wrong,
         // both fixed here (PRD #759 M2):
         //
-        //  (1) DOA — the ref never resolves in the clone. The runner clone is created below
+        //  (1) DOA — the ref never resolves in the clone. The runner clone is created above
         //      with `git clone --shared --no-checkout`, which copies NONE of the bare's
         //      custom refs, so `refs/uzi-checkpoints/*` is absent from the clone and a
         //      cherry-pick BY REF NAME always `fatal: bad revision`d — this leg could never
