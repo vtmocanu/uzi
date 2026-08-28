@@ -29,7 +29,9 @@ WORKDIR /app
 # ("cannot connect to the Docker daemon") rather than reaching for a host socket, and
 # the Bash guardrail denies docker outright until a daemon is wired. compose ships the
 # v2 subcommand plugin (`docker compose`), buildx the build plugin.
-RUN apk add --no-cache git bash tini curl xz tar setpriv docker-cli docker-cli-compose docker-cli-buildx \
+# Retry apk on a transient Alpine-mirror blip (issue #739). 5 attempts, n*3s backoff;
+# the setpriv assertion stays outside the loop (it is not a network step).
+RUN n=0; until apk add --no-cache git bash tini curl xz tar setpriv docker-cli docker-cli-compose docker-cli-buildx; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "apk add: giving up after $n attempts" >&2; exit 1; }; echo "apk add failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done \
     && /bin/setpriv --help 2>&1 | grep -q -- --reuid
 
 # Two runtime uids (PRD #51 A1). `worker` (uid 10001) holds the run credentials
@@ -87,7 +89,7 @@ ARG TARGETARCH
 # sandbox off (can't nest in a build), flakes on (devbox needs them).
 ARG NIX_INSTALLER_VERSION=3.21.5
 RUN NIX_ARCH="$(case "${TARGETARCH}" in amd64) echo x86_64 ;; arm64) echo aarch64 ;; *) echo "unsupported TARGETARCH ${TARGETARCH}" >&2; exit 1 ;; esac)" \
-    && curl -fsSL -o /tmp/nix-installer \
+    && curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 15 -o /tmp/nix-installer \
       "https://github.com/DeterminateSystems/nix-installer/releases/download/v${NIX_INSTALLER_VERSION}/nix-installer-${NIX_ARCH}-linux" \
     && chmod +x /tmp/nix-installer \
     && /tmp/nix-installer install linux --init none --no-confirm \
@@ -113,9 +115,9 @@ ARG DEVBOX_VERSION=0.17.5
 RUN set -o pipefail \
     && cd /tmp \
     && TARBALL="devbox_${DEVBOX_VERSION}_linux_${TARGETARCH}.tar.gz" \
-    && curl -fsSL -o "${TARBALL}" \
+    && curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 15 -o "${TARBALL}" \
       "https://github.com/jetify-com/devbox/releases/download/${DEVBOX_VERSION}/${TARBALL}" \
-    && curl -fsSL -o checksums.txt \
+    && curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 15 -o checksums.txt \
       "https://github.com/jetify-com/devbox/releases/download/${DEVBOX_VERSION}/checksums.txt" \
     && grep " ${TARBALL}\$" checksums.txt | sha256sum -c - \
     && mkdir -p devbox-extract \
@@ -189,7 +191,8 @@ RUN bash /tmp/assert-toolchain.sh /tmp/toolchain-guard.tsv \
 # files are under agent/ — the per-Dockerfile ignore (Dockerfile.dockerignore next
 # to this file) trims the context to source only.
 COPY agent/package.json agent/package-lock.json ./
-RUN npm ci --omit=dev
+# Retry the registry fetch on a transient npm-registry blip (issue #739). 5 attempts, n*3s backoff.
+RUN n=0; until npm ci --omit=dev; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "npm ci: giving up after $n attempts" >&2; exit 1; }; echo "npm ci failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done
 
 # --- PRD #87: prebaked browser (chromium + agent-browser) for the web-ux role -----------
 # The browser rides the SHARED devbox-global toolchain (chromium + fontconfig + dejavu_fonts

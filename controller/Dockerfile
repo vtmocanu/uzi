@@ -12,7 +12,9 @@ WORKDIR /src
 # previously deferred are now here — copied before the source so the dependency
 # layer caches independently of a code change (the same shape api/Dockerfile has).
 COPY go.mod go.sum ./
-RUN go mod download
+# Retry the module fetch on a transient proxy.golang.org blip (issue #739); see api/Dockerfile
+# for the rationale. 5 attempts, n*3s backoff, POSIX sh.
+RUN n=0; until go mod download; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "go mod download: giving up after $n attempts" >&2; exit 1; }; echo "go mod download failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done
 
 COPY . .
 # Static, VCS-stamp-free build, matching api/Dockerfile.

@@ -5,7 +5,10 @@ FROM golang:1.26@sha256:26326682769ca980f8f1d3b1f52be2dd1c1d25270e3de3fe0c97d6bb
 WORKDIR /src
 
 COPY go.mod go.sum ./
-RUN go mod download
+# Retry the module fetch: proxy.golang.org blips transiently and a single INTERNAL_ERROR
+# should not redden a whole CI validation or release-publish build (issue #739). 5 attempts,
+# n*3s backoff; POSIX sh so the same idiom works in the debian (golang) and alpine images.
+RUN n=0; until go mod download; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "go mod download: giving up after $n attempts" >&2; exit 1; }; echo "go mod download failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done
 
 COPY . .
 # UZI_VERSION stamps main.version so GET /api/version reports the release version.
