@@ -8,11 +8,12 @@
 // collapses to one summary row that expands into per-repo sub-rows (Layout A) — one
 // blueprint, many production lines.
 //
-// The guardrail: the per-entry Enable affordance is disabled until at least one repo is
-// picked in the shared RepoMultiSelect (success criterion 1). Enabling fans out one
-// enableCatalogSchedule call per selected repo (client-side, matching the CLI). A repo
-// already materialized for a slug is never offered a fresh enable — its sub-row carries
-// the pause/resume toggle instead (re-enabling a paused default is a server no-op).
+// The guardrail: the per-entry Enable affordance renders only when clicking it would do
+// something — i.e. at least one repo picked in the shared RepoMultiSelect is not already
+// enabled on that job (success criterion 1). Enabling fans out one enableCatalogSchedule
+// call per actionable repo (client-side, matching the CLI). A repo already materialized
+// for a slug is never offered a fresh enable — its sub-row carries the pause/resume toggle
+// instead (re-enabling a paused default is a server no-op).
 
 import { useState } from "react";
 import type { CatalogEntry, Repo, Schedule, ScheduleCatalog } from "../lib/api";
@@ -64,8 +65,8 @@ export function DefaultJobs({
   notice: string;
   error: string;
 }) {
-  // The shared repo selection driving every entry's Enable button (guardrail: Enable is
-  // disabled until this is non-empty).
+  // The shared repo selection driving every entry's Enable button (guardrail: a row's
+  // Enable renders only when at least one selected repo is not already enabled on it).
   const [selectedRepos, setSelectedRepos] = useState<string[]>([]);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   // Sweep-warn targets set after an enable, so a missing selector label surfaces once the
@@ -164,7 +165,7 @@ export function DefaultJobs({
                 expanded={expanded.has(entry.slug)}
                 busyId={busyId}
                 onToggleExpand={() => toggleExpand(entry.slug)}
-                onEnableSelected={() => enable(entry, selectedRepos)}
+                onEnableSelected={(ids) => enable(entry, ids)}
                 onEnableRepo={(repoId) => enable(entry, [repoId])}
                 onTogglePause={onTogglePause}
                 onRunNow={onRunNow}
@@ -205,7 +206,7 @@ function CatalogRow({
   expanded: boolean;
   busyId: string;
   onToggleExpand: () => void;
-  onEnableSelected: () => void;
+  onEnableSelected: (repoIds: string[]) => void;
   onEnableRepo: (repoId: string) => void;
   onTogglePause: (s: Schedule) => void;
   onRunNow: (s: Schedule) => void;
@@ -224,6 +225,10 @@ function CatalogRow({
   const lastFired = firedStamps.length > 0 ? firedStamps[firedStamps.length - 1] : undefined;
   // The materialized repo ids for this slug — never offered a fresh enable.
   const materialized = new Set(rows.map((r) => r.repo_id));
+  // The selected repos that would actually get a new enable — a repo already materialized
+  // for this slug is a no-op, so the row Enable button only appears (and only fans out) for
+  // this actionable subset.
+  const actionable = selectedRepos.filter((id) => !materialized.has(id));
 
   // The Default-jobs variant re-adds its default-only chrome through the neutral shell's
   // slots: the 🔒 lock + type pill + customized badge as targetBadges (name + lock + pill
@@ -303,18 +308,16 @@ function CatalogRow({
         </div>
       }
       leadingActions={
-        <Button
-          size="sm"
-          disabled={selectedRepos.length === 0 || busyId !== ""}
-          onClick={onEnableSelected}
-          title={
-            selectedRepos.length === 0
-              ? "Pick a repo first"
-              : `Enable on ${selectedRepos.length} repo${selectedRepos.length === 1 ? "" : "s"}`
-          }
-        >
-          <PlusIcon /> Enable
-        </Button>
+        actionable.length > 0 ? (
+          <Button
+            size="sm"
+            disabled={busyId !== ""}
+            onClick={() => onEnableSelected(actionable)}
+            title={`Enable on ${actionable.length} repo${actionable.length === 1 ? "" : "s"}`}
+          >
+            <PlusIcon /> Enable
+          </Button>
+        ) : undefined
       }
     >
       {rows.map((s) => (
