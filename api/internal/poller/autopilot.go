@@ -19,8 +19,9 @@ import (
 // RunStarter creates an autopilot run through workersvc's shared manual-start
 // path. *workersvc.Service satisfies it. Keeping run creation on the workersvc
 // side (rather than re-implementing it here) is what makes an autopilot run and a
-// manual run share one state machine and one set of gates (the single uzi_label
-// eligibility gate, PRD #764 M1).
+// manual run share one state machine and one set of gates (the single eligibility
+// gate: an issue is uzi's if it carries the uzi_label OR is assigned to the
+// uzi-bot account — PRD #764 M1, widened by PRD #767 M2).
 type RunStarter interface {
 	CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error)
 }
@@ -213,10 +214,12 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 		// A run appeared between the pre-check and here: swallow, same as an active run.
 		_ = a.record(ctx, r, iid, eventID)
 	case errors.Is(err, workersvc.ErrNotPRDIssue):
-		// The run gate says this issue is not uzi's (PRD #102 Decision 14). The
-		// candidate query already filters on the PRD label, so reaching here means the
-		// label was removed between that query and this create — rare, and permanent
-		// for THIS label application.
+		// The run gate says this issue is not uzi's: it carries neither the uzi_label
+		// nor a uzi-bot assignment (PRD #102 Decision 14; the gate is widened by PRD
+		// #767 M2 to accept assignment as a second eligibility signal). The candidate
+		// query still filters on the PRD label only (its assignment-awareness is PRD
+		// #767 M3), so reaching here means the label was removed between that query and
+		// this create — rare, and permanent for THIS label application.
 		//
 		// Record and stay silent. Recording is what stops the every-tick re-evaluation
 		// the default branch below would produce, one ListIssueLabelEvents call per
