@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import type { WorkerClient } from "./client.js";
+import { RequestError } from "./client.js";
 import type { GitCache } from "./git.js";
 import {
   gitBasicCredential,
@@ -1088,21 +1089,33 @@ export class RunRunner {
         // askUser's settle discipline; the ordering is satisfied by construction here.
         awaitFollowUp: async (idleMs) => {
           // issue #552 M1 (mid-turn wake-guard bug): report `awaiting_followup` — which stamps
-          // the open_followup_id watermark to MAX(consumed follow_up id) — ONLY when the run is
-          // genuinely going idle. If a follow-up (or stop/cancel) arrived mid-turn and is
-          // already buffered, reporting the park would fold that already-consumed-but-not-yet-
-          // applied follow-up INTO the watermark, so its own wake `running` report would then
-          // fail the server's `id > watermark` guard and strand a live run at awaiting_followup.
-          // Skip the park report in that case and service the buffered outcome directly (the run
-          // stays `running`, no spurious park). A follow-up arriving AFTER this point is consumed
+          // the open_followup_id watermark — ONLY when the run is genuinely going idle. If a
+          // follow-up (or stop/cancel) arrived mid-turn and is already buffered, reporting the
+          // park would fold that already-consumed-but-not-yet-applied follow-up INTO the
+          // watermark, so its own wake `running` report would then fail the server's
+          // `id > watermark` guard and strand a live run at awaiting_followup. Skip the park
+          // report in that case and service the buffered outcome directly (the run stays
+          // `running`, no spurious park). A follow-up arriving AFTER this point is consumed
           // after the stamp, so its id > watermark and it wakes normally.
+          //
+          // issue #559 M2: the park report now CARRIES the watermark it wants stamped —
+          // `open_followup_id` = the highest follow_up id the worker has already DELIVERED
+          // (steering.getLastDeliveredFollowUpId()). The server clamps/floors this instead of
+          // deriving MAX(consumed follow_up id) itself. This closes the residual race where a
+          // follow-up consumed by the poll loop DURING this report's DB round-trip would fold
+          // into a server-derived MAX(consumed) and strand the run: the last-DELIVERED id does
+          // NOT advance during the round-trip (the follow-up waiter is armed only AFTER this
+          // report returns, below), so the racing follow-up is excluded and its later wake wins.
           if (!steering.hasPendingFollowUpOutcome()) {
             // Read the ACK the same way askUser and the limit park do: the park TOOK only if
             // the server reports `awaiting_followup`. SetRunAwaitingFollowup (M2) matches
             // nothing when the run went terminal under us or is no longer ours (or is not an
             // interactive task) — without this check the worker would block on a follow-up no
             // surface can produce, since the status never changed. Fail loudly instead.
-            const ack = await reportState({ status: "awaiting_followup" });
+            const ack = await reportState({
+              status: "awaiting_followup",
+              open_followup_id: steering.getLastDeliveredFollowUpId(),
+            });
             const parked = (ack as { status?: string } | undefined)?.status;
             if (parked !== "awaiting_followup") {
               throw new Error(
@@ -1110,6 +1123,43 @@ export class RunRunner {
               );
             }
             runLog.info("interactive task: awaiting follow-up", { run_id: runId });
+          } else {
+            // issue #559 M3: the SKIP path. A follow-up (or stop/cancel) is already buffered,
+            // so we deliberately do NOT report awaiting_followup (that would fold the
+            // not-yet-applied follow-up into the watermark — the #558/#552 fix above) and
+            // service the buffered outcome directly. But skipping the park report ALSO skips
+            // the ACK that, on the non-skip path, caught a mid-turn reclaim or terminal
+            // transition (status != awaiting_followup → throw). Restore that ownership/
+            // terminality check cheaply with a read-only ownership probe.
+            //
+            // ONLY a DEFINITIVE answer throws: a terminal status, or a definitive NOT-OWNED
+            // (HTTP 404 → reclaimed by another worker). A TRANSIENT error (network / 5xx /
+            // anything that is neither a 404 nor a terminal status) logs a warning and
+            // PROCEEDS — the non-skip path's reportState has bounded retries and never fails
+            // the run on a transient blip, and the run self-heals anyway at the next
+            // ACK-checked park report plus the SetRunRunning worker_id pin. We must not
+            // introduce a new spurious-failure mode, so a transient probe error is not one.
+            let ownershipStatus: string | undefined;
+            try {
+              ownershipStatus = (await this.client.getRunOwnership(runId)).status;
+            } catch (err) {
+              if (err instanceof RequestError && err.status === 404) {
+                throw new Error(
+                  `${REASON_FOLLOWUP_NOT_PARKED} (server reports the run is not owned by this worker)`,
+                );
+              }
+              // Transient (network / 5xx / unreadable): proceed and let the next park
+              // report's ACK + the SetRunRunning worker_id pin be the backstop.
+              runLog.warn(
+                "interactive task: ownership probe failed transiently on the follow-up skip path; proceeding",
+                { run_id: runId, error: String(err) },
+              );
+            }
+            if (ownershipStatus !== undefined && FOLLOWUP_TERMINAL_STATUSES.has(ownershipStatus)) {
+              throw new Error(
+                `${REASON_FOLLOWUP_NOT_PARKED} (server reports ${ownershipStatus})`,
+              );
+            }
           }
           return steering.awaitFollowUp(idleMs);
         },
@@ -3176,6 +3226,16 @@ const REASON_QUESTION_NOT_PARKED =
  *  took. */
 export const REASON_FOLLOWUP_NOT_PARKED =
   "could not park the interactive task to await a follow-up";
+
+/** issue #559 M3: the run statuses that mean the interactive turn must NOT continue —
+ *  a run that went terminal under us on the follow-up park-SKIP path. Checked against the
+ *  read-only ownership probe's reported status; a terminal answer throws
+ *  REASON_FOLLOWUP_NOT_PARKED just as a non-awaiting_followup ACK does on the non-skip path. */
+const FOLLOWUP_TERMINAL_STATUSES: ReadonlySet<string> = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+]);
 
 /** PRD #84 M4: the additive `StateRequest` fields for a plan-time toolchain detection.
  *  Each array field is included ONLY when non-empty — mirroring the `milestones?.length ?
