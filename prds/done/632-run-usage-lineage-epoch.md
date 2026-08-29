@@ -159,6 +159,16 @@ correctly.
     be revisited there in the same change. The bump takes only `run_id`+`int` (no
     worker-controlled text), so it clears the audit — but M2 must record it as a
     cleared suspect, in the same change.
+  - **Failure contract is at-most-once, not durably exactly-once.** The message insert
+    and the bump are two separate non-transactional statements (the generated queries
+    take no `tx`; a shared transaction is the deferred Phase-2 change noted on the
+    `appendMessages` insert loop). So "exactly-once" here means **idempotent under
+    re-delivery** — a re-delivered break never double-bumps — NOT durable recovery: if
+    the `BumpRunLineageEpoch` statement fails *after* the break row has committed, the
+    committed break is seq-deduped out of `inserted` on retry and the bump is lost
+    permanently. `run_usage` is advisory telemetry (not billing), so the impact of that
+    irreducible window is advisory-only; see [ADR-632](../../adr/0632-run-usage-lineage-epoch.md)
+    "Idempotency and epoch visibility" for the full contract.
 
 - [x] **M3 — Fold: stamp the current epoch (and pin it on conflict).** `foldRunUsage`
   reads the run's `lineage_epoch` and passes it to `UpsertRunUsage`; the query gains a

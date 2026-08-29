@@ -123,6 +123,15 @@ func TestUpsertRunUsageMergeLiveDB(t *testing.T) {
 	// rows now exist for the model, carrying epochs 0 and 1.
 	fold("sess-2", 1, 2500, 800, 120, 1100, 0.033)
 
+	// A late re-fold of leg 1 carries the CURRENT epoch (1) — e.g. a crash-retry that
+	// re-delivers a leg-1 frame after the break already bumped the run. UpsertRunUsage
+	// pins lineage_epoch on first insert (omitted from DO UPDATE SET), so sess-1's
+	// stored epoch must stay 0. Without the pin this would rewrite sess-1 to epoch 1,
+	// and the view's MAX-within-epoch would re-collapse the two legs across the same
+	// epoch — the exact regression PRD #632 guards against. Same token/cost values, so
+	// GREATEST leaves sess-1's magnitudes untouched; only the epoch pin is under test.
+	fold("sess-1", 1, 1800, 500, 90, 700, 0.019)
+
 	// The (b) rollup is latest/MAX per (run_id, model) — NEVER a SUM across session
 	// rows, which would over-count the cumulative snapshots. This is the rule M3 must
 	// use for run/user/factory totals.

@@ -3083,7 +3083,6 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	// assignment is outside the rows>0 gate), the seq-deduped break is skipped, and
 	// UpdateRunLastSeq advances last_seq on the retry — so the only durable casualty
 	// is the same irreducible lost bump noted above, not a stuck watermark.
-	epochBumps := 0
 	for _, m := range inserted {
 		if m.Kind != "status" {
 			continue
@@ -3102,7 +3101,6 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 		if err := s.q.BumpRunLineageEpoch(ctx, runID); err != nil {
 			return obs, err
 		}
-		epochBumps++
 	}
 	// The high-water mark AS OBSERVED, whether or not the insert loop broke and
 	// whether or not the UpdateRunLastSeq below runs. This is what the streak's
@@ -3144,14 +3142,6 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	if insertErr != nil {
 		return obs, insertErr
 	}
-	// Mirror the committed DB bump into the in-memory run struct before the fold, so
-	// the fold stamps the correct epoch even if a break and the fresh leg's result
-	// frame ever arrive in the SAME batch. Temporal invariant: in the normal
-	// cross-batch case epochBumps == 0 for the batch carrying the result frames, and
-	// the run — re-fetched fresh at the top of the NEXT appendMessages call by
-	// runOwnedByWorker — already carries the committed epoch, so this mirror is a
-	// no-op there. It closes the same-batch window without a re-read query.
-	run.LineageEpoch += int32(epochBumps)
 	// Fold every DELIVERED result frame's usage into run_usage (PRD #40 Decision 2)
 	// — over `msgs`, NOT `inserted`: a seq-deduped re-delivery (crash retry) must
 	// still re-run the fold, which is exactly what makes at-least-once delivery plus
@@ -3258,6 +3248,33 @@ func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []Incomi
 	// for the 54000/2704-byte reasoning). session_id is capped once here; model is
 	// capped per-frame inside the loop, since each frame carries its own.
 	sessionID = truncateRunes(sessionID, maxUsageSessionRunes)
+	// Per-frame lineage epoch (PRD #632). A result frame belongs to the epoch in
+	// force WHEN IT WAS EMITTED — the run's committed epoch at batch start
+	// (run.LineageEpoch, fetched fresh in appendMessages and NOT mutated) plus the
+	// number of resume_lineage_break events preceding it in seq order within this
+	// batch. Applying one batch-final epoch to every frame would stamp a pre-break
+	// result (the old leg) with the post-break epoch; since UpsertRunUsage pins
+	// lineage_epoch on first insert (omitted from DO UPDATE SET), a later re-fold
+	// could not repair it, and the totals view would MAX-collapse two lineage legs.
+	// In the normal cross-batch case there are no breaks in the frame-carrying
+	// batch, so every frame gets baseEpoch unchanged. Counting breaks from `msgs`
+	// (not `inserted`) is safe under at-least-once re-delivery: the recomputed
+	// epoch on a seq-deduped replay is never written, precisely because the upsert
+	// pins the epoch.
+	baseEpoch := run.LineageEpoch
+	var breakSeqs []int32
+	for _, m := range msgs {
+		if m.Kind != "status" {
+			continue
+		}
+		var ev statusEventPayload
+		if err := json.Unmarshal(m.Payload, &ev); err != nil {
+			continue // malformed payload → not a break
+		}
+		if ev.Event == "resume_lineage_break" {
+			breakSeqs = append(breakSeqs, m.Seq)
+		}
+	}
 	for _, m := range msgs {
 		// Result frames are only ever kind status (success) or error; skip the
 		// rest without paying an unmarshal for every text/tool_use message.
@@ -3271,6 +3288,13 @@ func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []Incomi
 		if p.Event != "result" || len(p.ModelUsage) == 0 {
 			continue // not a result frame, or no per-model usage to fold
 		}
+		// Epoch for THIS frame = base + breaks that precede it in seq order.
+		frameEpoch := baseEpoch
+		for _, bs := range breakSeqs {
+			if bs < m.Seq {
+				frameEpoch++
+			}
+		}
 		for model, mu := range p.ModelUsage {
 			if model == "" {
 				continue
@@ -3280,7 +3304,7 @@ func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []Incomi
 				RunID:               run.ID,
 				SessionID:           sessionID,
 				Model:               model,
-				LineageEpoch:        run.LineageEpoch,
+				LineageEpoch:        frameEpoch,
 				InputTokens:         nonNegTokens(mu.InputTokens),
 				CacheReadTokens:     nonNegTokens(mu.CacheReadInputTokens),
 				CacheCreationTokens: nonNegTokens(mu.CacheCreationInputTokens),

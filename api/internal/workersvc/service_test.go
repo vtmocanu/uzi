@@ -2192,10 +2192,12 @@ func TestAppendMessagesFoldsOnRedeliveredBatch(t *testing.T) {
 }
 
 // PRD #632: appendMessages bumps runs.lineage_epoch once per newly-inserted
-// resume_lineage_break status event, mirrors that bump into the in-memory run
-// before folding, and foldRunUsage stamps the (possibly-bumped) epoch onto every
-// UpsertRunUsage. This exercises all three arms — stamp, same-batch bump+stamp,
-// and no-double-bump on re-delivery — against the fake store.
+// resume_lineage_break status event, and foldRunUsage stamps each result frame
+// with a PER-FRAME epoch — the run's committed epoch at batch start plus the
+// number of breaks preceding that frame in seq order. This exercises all four
+// arms — stamp, same-batch bump+stamp, no-double-bump on re-delivery, and the
+// intra-batch ordering that must not stamp a pre-break result with a later
+// epoch — against the fake store.
 func TestAppendMessagesStampsLineageEpochAndBumps(t *testing.T) {
 	// (a) Stamp: a run already at epoch 3 folds a normal result frame (no break).
 	// Every upserted row carries LineageEpoch == 3, and nothing bumps.
@@ -2223,8 +2225,8 @@ func TestAppendMessagesStampsLineageEpochAndBumps(t *testing.T) {
 	})
 
 	// (b) Same-batch bump + stamp: a run at epoch 0 receives ONE batch = [ break at
-	// seq 1, result frame at seq 2 ]. The bump commits (epoch → 1) and is mirrored
-	// into the in-memory run BEFORE the fold, so the folded row carries epoch 1.
+	// seq 1, result frame at seq 2 ]. The bump commits (epoch → 1) and the result,
+	// which follows the break in seq order, is stamped epoch 1 by the per-frame count.
 	t.Run("same-batch bump then stamp", func(t *testing.T) {
 		w := worker()
 		fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), SessionID: pgText("sess-b"), LineageEpoch: 0}}
@@ -2245,7 +2247,43 @@ func TestAppendMessagesStampsLineageEpochAndBumps(t *testing.T) {
 			t.Fatalf("expected 1 usage upsert (only the result frame folds), got %d", len(fs.upsertedUsage))
 		}
 		if fs.upsertedUsage[0].LineageEpoch != 1 {
-			t.Fatalf("the mirror must apply the bump before the fold: want epoch 1, got %d", fs.upsertedUsage[0].LineageEpoch)
+			t.Fatalf("a result after the break must be stamped the post-break epoch: want epoch 1, got %d", fs.upsertedUsage[0].LineageEpoch)
+		}
+	})
+
+	// (d) Intra-batch ordering (the [5] regression): a run at epoch 0 receives ONE
+	// batch = [ result A at seq 1, break at seq 2, result B at seq 3 ]. A belongs to
+	// the OLD leg (epoch 0) and B to the fresh leg (epoch 1). A batch-final uniform
+	// epoch would wrongly stamp A with epoch 1, and because UpsertRunUsage pins the
+	// epoch on first insert, the totals view would then MAX-collapse the two legs.
+	// The per-frame count must give A epoch 0 and B epoch 1.
+	t.Run("result before break keeps the earlier epoch", func(t *testing.T) {
+		w := worker()
+		fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), SessionID: pgText("sess-d"), LineageEpoch: 0}}
+		svc := New(fs, newBox(t), testParams())
+
+		msgs := []IncomingMessage{
+			{Seq: 1, Kind: "status", Agent: "lead", Payload: json.RawMessage(
+				`{"event":"result","modelUsage":{"claude-fable-5":{"inputTokens":100,"outputTokens":50,"costUSD":0.001}}}`)},
+			{Seq: 2, Kind: "status", Agent: "lead", Payload: json.RawMessage(`{"event":"resume_lineage_break"}`)},
+			{Seq: 3, Kind: "status", Agent: "lead", Payload: json.RawMessage(
+				`{"event":"result","modelUsage":{"claude-fable-5":{"inputTokens":300,"outputTokens":150,"costUSD":0.003}}}`)},
+		}
+		if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, msgs); err != nil {
+			t.Fatalf("AppendMessages: %v", err)
+		}
+		if fs.lineageEpochBumps != 1 {
+			t.Fatalf("one break event → exactly one bump, got %d", fs.lineageEpochBumps)
+		}
+		if len(fs.upsertedUsage) != 2 {
+			t.Fatalf("expected 2 usage upserts (both result frames fold), got %d", len(fs.upsertedUsage))
+		}
+		// Upserts fold in msgs order, so [0] is result A (seq 1) and [1] is result B (seq 3).
+		if got := fs.upsertedUsage[0].LineageEpoch; got != 0 {
+			t.Fatalf("result A precedes the break → epoch 0, got %d", got)
+		}
+		if got := fs.upsertedUsage[1].LineageEpoch; got != 1 {
+			t.Fatalf("result B follows the break → epoch 1, got %d", got)
 		}
 	})
 
