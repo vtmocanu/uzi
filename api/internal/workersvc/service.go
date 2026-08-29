@@ -2886,11 +2886,16 @@ func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID
 //   - UpdateRunLastSeq — takes the run id and an int32 seq. No worker text.
 //   - BumpRunLineageEpoch — takes only the run id (a uuid) and writes a
 //     server-computed `lineage_epoch + 1`. No worker-controlled text or value
-//     reaches the store through it, so it cannot produce the misattributed
-//     22P02/22021/54000/22003 codes the narrow classifier guards. A CLEARED
-//     suspect, written out for the same reason as foldRunUsage below: it is
-//     correctly returned raw (500), never wrapped, because a failure is a genuine
-//     server error the worker should retry, not a poisoned batch.
+//     reaches the store through it, so it cannot produce a WORKER-VALUE-DEPENDENT
+//     22P02/22021/54000/22003 code the way an unsanitized text/numeric column
+//     could — which is what makes returning its error raw correct. (It could in
+//     principle raise a state-dependent 22003 only if the counter ever reached
+//     INT_MAX — not worker-value-dependent, needs ~2^31 events, and the raw return
+//     still handles it: the worker retries, the seq-deduped break is skipped, and
+//     no poison loop forms.) A CLEARED suspect, written out for the same reason as
+//     foldRunUsage below: it is correctly returned raw (500), never wrapped,
+//     because a failure is a genuine server error the worker should retry, not a
+//     poisoned batch.
 //   - foldRunUsage → UpsertRunUsage — every column it writes, checked one by one
 //     because "I cannot think of a case" is not the same as "there is no case".
 //     Read this as a CLEARED suspect, not a live hazard: it is written out because
@@ -3053,6 +3058,45 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 			inserted = append(inserted, m)
 		}
 	}
+	// Bump the run's lineage epoch once per NEWLY-INSERTED resume_lineage_break
+	// status event (PRD #632, dropped-resume signal #334). Scan `inserted`, NOT
+	// `msgs`: a re-delivered break is seq-deduped (rows == 0 ⇒ absent from
+	// `inserted`), so a retry never double-bumps and the bump stays idempotent
+	// under at-least-once delivery. A malformed payload just isn't a break (skip).
+	//
+	// This runs HERE — right after the insert loop, before the high-water-mark
+	// update AND the insertErr guard — on purpose. The message inserts are not
+	// transactional (each commits on its own), so once a break's row is committed it
+	// is owed its bump: any later `return` before this loop (an unstorable message
+	// co-batched after the break, or an UpdateRunLastSeq failure) would lose the bump
+	// permanently, because on the worker's retry the committed break is seq-deduped
+	// (rows == 0 ⇒ absent from `inserted`) and never re-bumped. Bumping at the
+	// earliest point where `inserted` is complete shrinks that loss window to the
+	// irreducible one — the bump statement itself failing — which no reordering can
+	// close without a shared transaction (advisory-telemetry impact only). The
+	// `inserted` gate already makes the bump exactly-once regardless of position, so
+	// moving it up cannot double-bump.
+	epochBumps := 0
+	for _, m := range inserted {
+		if m.Kind != "status" {
+			continue
+		}
+		var ev statusEventPayload
+		if err := json.Unmarshal(m.Payload, &ev); err != nil {
+			continue // malformed payload → not a break
+		}
+		if ev.Event != "resume_lineage_break" {
+			continue
+		}
+		// Return the error RAW (500), never through classifyStoreError: this call
+		// writes only the run_id and a server-computed +1 — no worker-controlled
+		// value reaches the store — so a failure is a genuine server error the
+		// worker should retry, never a "batch poisoned" 400. See the 🔴 audit block.
+		if err := s.q.BumpRunLineageEpoch(ctx, runID); err != nil {
+			return obs, err
+		}
+		epochBumps++
+	}
 	// The high-water mark AS OBSERVED, whether or not the insert loop broke and
 	// whether or not the UpdateRunLastSeq below runs. This is what the streak's
 	// no-progress reset compares (PRD #108 M4).
@@ -3092,32 +3136,6 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	}
 	if insertErr != nil {
 		return obs, insertErr
-	}
-	// Bump the run's lineage epoch once per NEWLY-INSERTED resume_lineage_break
-	// status event (PRD #632, dropped-resume signal #334). Scan `inserted`, NOT
-	// `msgs`: a re-delivered break is seq-deduped (rows == 0 ⇒ absent from
-	// `inserted`), so a retry never double-bumps and the bump stays idempotent
-	// under at-least-once delivery. A malformed payload just isn't a break (skip).
-	epochBumps := 0
-	for _, m := range inserted {
-		if m.Kind != "status" {
-			continue
-		}
-		var ev statusEventPayload
-		if err := json.Unmarshal(m.Payload, &ev); err != nil {
-			continue // malformed payload → not a break
-		}
-		if ev.Event != "resume_lineage_break" {
-			continue
-		}
-		// Return the error RAW (500), never through classifyStoreError: this call
-		// writes only the run_id and a server-computed +1 — no worker-controlled
-		// value reaches the store — so a failure is a genuine server error the
-		// worker should retry, never a "batch poisoned" 400. See the 🔴 audit block.
-		if err := s.q.BumpRunLineageEpoch(ctx, runID); err != nil {
-			return obs, err
-		}
-		epochBumps++
 	}
 	// Mirror the committed DB bump into the in-memory run struct before the fold, so
 	// the fold stamps the correct epoch even if a break and the fresh leg's result
