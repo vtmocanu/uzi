@@ -45,8 +45,12 @@ cd <the repo>                              # your normal checkout; work happens 
    BUNDLE="$W/STEM.bundle"; FETCH_REF=BRANCH
 
    # Source B (live PVC): BUNDLE is the raw bundle you kubectl-cp'd out (created from REF,
-   # per "Recovering a failed run's work from the worker PVC"); no gzip layer to test.
-   #   BUNDLE=/path/to/r.bundle; FETCH_REF=REF
+   # per "Recovering a failed run's work from the worker PVC"); no gzip layer to test. A
+   # tracking-ref bundle carries COMMITTED work ONLY, so W stays empty and step 5 restores
+   # nothing — correct for a committed run. For a task run's UNCOMMITTED work, prefer a
+   # snapshot (source A); or first capture the pod's `git diff HEAD` + untracked files into
+   # a W of your own (the exact commands are backup-runs.sh's CAPTURE block).
+   #   BUNDLE=/path/to/r.bundle; FETCH_REF=REF; W=""
    ```
 2. **Prove the bundle is restorable** from INSIDE the real repo (it has the prerequisite
    base commit the bundle excludes) — this runs for either source:
@@ -98,13 +102,15 @@ cd <the repo>                              # your normal checkout; work happens 
 9. **Push + open a maintainer PR** that says it is a recovery and why:
    ```sh
    git push -u origin recover/STEM
-   gh pr create --repo OWNER/REPO --base main --title '…(recovered)' --body '…recovered from RUN…'
+   gh pr create --base main --title '…(recovered)' --body '…recovered from RUN…'   # --repo defaults to origin
    ```
 10. **Review, land, clean up** — wait for CodeRabbit, triage its findings (see *Reviewing
     the diff* / *Triaging CodeRabbit findings*), fix the real ones, admin-merge, watch
     post-merge CI (if a sibling PR must land first for migration ordering, merge it, then
-    `gh pr update-branch` this one and re-wait). Then `git worktree remove DIR`, `git branch
-    -D recover/STEM`, and delete the snapshot once the PR is merged and CI is green.
+    `gh pr update-branch` this one and re-wait). Then, **back in your normal checkout** —
+    `cd` out of `DIR` first, since you cannot remove the worktree you are standing in nor
+    delete its checked-out branch — `git worktree remove DIR`, `git branch -D recover/STEM`,
+    and delete the snapshot once the PR is merged and CI is green.
 
 ## Notes
 

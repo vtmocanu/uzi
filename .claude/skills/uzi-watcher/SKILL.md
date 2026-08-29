@@ -241,13 +241,14 @@ caught too, not just the checkpointed tracking ref):
 
 To recover from a snapshot: `tar xzf <ts>/issue-N.tgz -C r/`, then
 `git fetch r/issue-N.bundle 'agent/issue-N:refs/heads/recover/issue-N'` and
-`git worktree add DIR recover/issue-N`. In `DIR`, restore the uncommitted state the
-tracking ref never held: `git apply r/issue-N.uncommitted.patch` if that file is present,
-**and `tar xzf r/issue-N.untracked.tar.gz -C DIR` if that one is** (it carries new,
-not-yet-added files, which the patch does not). Then `git rebase origin/main` and gate +
-PR + admin-merge as above. **`resume-recipe.md`** in this skill dir is the full,
-run-kind-agnostic version of these last steps (issue AND task stems, integrity-verify the
-`.tgz` first, the workflow/migration pre-flight, through admin-merge + cleanup).
+`git worktree add DIR recover/issue-N`. In `DIR`, **`git rebase origin/main` FIRST** (it
+refuses a dirty tree), THEN restore the uncommitted state the tracking ref never held
+(`git apply r/issue-N.uncommitted.patch` if present, **and `tar xzf
+r/issue-N.untracked.tar.gz -C DIR` if present** — new, not-yet-added files the patch does
+not carry), **commit it**, then gate + PR + admin-merge as above. **`resume-recipe.md`** in
+this skill dir is the full, run-kind-agnostic version of these last steps (issue AND task
+stems, integrity-verify the `.tgz` first, rebase-before-restore, the workflow/migration
+pre-flight, through admin-merge + cleanup).
 
 ## Reviewing the diff
 
