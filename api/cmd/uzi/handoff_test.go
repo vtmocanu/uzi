@@ -59,7 +59,10 @@ func handoffEnv(fc *uzicli.FakeClient, rec *handoffRecorder) (Env, *handoffClien
 // taskRun builds a created/dispatched task-run DTO with a server-named branch.
 func taskRun(id, branch string) apitypes.RunDTO {
 	b := branch
-	return apitypes.RunDTO{ID: id, Kind: "task", Branch: &b}
+	// Status defaults to "completed" — a finished handoff, the natural rm fixture. rm now
+	// refuses a non-terminal status (issue #403 F6), and this is harmless to the
+	// create/dispatch tests, which do not assert status.
+	return apitypes.RunDTO{ID: id, Kind: "task", Branch: &b, Status: "completed"}
 }
 
 // TestHandoffHappyPath is the Decision-6 core: a --repo handoff creates the run, pushes
@@ -432,6 +435,62 @@ func TestHandoffRmMRExempt(t *testing.T) {
 	}
 }
 
+// issue #403 F1: rm on a review/fix CHILD id (own row carries no MrWebURL) whose BRANCH's
+// owning task opened an MR is refused branch-wide — the open MR's source branch must not be
+// deleted through a child that shares it. Keys on BranchHasOpenMr with MrWebURL nil.
+func TestHandoffRmBranchMRExempt(t *testing.T) {
+	run := taskRun("r7c", "uzi/task/r7c")
+	run.BranchHasOpenMr = true // branch's owning task opened an MR; this row's MrWebURL is nil
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r7c": run}}
+	rec := &handoffRecorder{}
+	env, _ := handoffEnv(fc, rec)
+
+	_, _, code := runCLI(t, env, "handoff", "rm", "r7c")
+	if code == uzicli.ExitOK {
+		t.Fatalf("rm of a branch whose owning task opened an MR must be refused, got exit 0")
+	}
+	if len(rec.gitCalls) != 0 {
+		t.Errorf("a branch-MR-exempt rm must not run git: %v", rec.gitCalls)
+	}
+}
+
+// issue #403 F6: rm on a run that is not yet finished (a still-running original) is refused
+// and runs no git — deleting under it would race the worker's push.
+func TestHandoffRmRefusesRunning(t *testing.T) {
+	run := taskRun("r7d", "uzi/task/r7d")
+	run.Status = "running"
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r7d": run}}
+	rec := &handoffRecorder{}
+	env, _ := handoffEnv(fc, rec)
+
+	_, _, code := runCLI(t, env, "handoff", "rm", "r7d")
+	if code == uzicli.ExitOK {
+		t.Fatalf("rm of a non-terminal run must be refused, got exit 0")
+	}
+	if len(rec.gitCalls) != 0 {
+		t.Errorf("an unfinished-run rm must not run git: %v", rec.gitCalls)
+	}
+}
+
+// issue #403 F6: rm on a finished original whose BRANCH still has a live review/fix child
+// (BranchHasActiveRun) is refused and runs no git — the in-flight child is still pushing.
+func TestHandoffRmRefusesActiveChild(t *testing.T) {
+	run := taskRun("r7e", "uzi/task/r7e")
+	run.Status = "completed"
+	run.BranchHasActiveRun = true
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r7e": run}}
+	rec := &handoffRecorder{}
+	env, _ := handoffEnv(fc, rec)
+
+	_, _, code := runCLI(t, env, "handoff", "rm", "r7e")
+	if code == uzicli.ExitOK {
+		t.Fatalf("rm while an active review/fix child runs on the branch must be refused, got exit 0")
+	}
+	if len(rec.gitCalls) != 0 {
+		t.Errorf("an active-child rm must not run git: %v", rec.gitCalls)
+	}
+}
+
 // A --base that starts with '-' is rejected (it would be misparsed by git push as an
 // option in the refspec argv element): usage error, and nothing is pushed or dispatched.
 func TestHandoffBaseLeadingDashRejected(t *testing.T) {
@@ -466,7 +525,10 @@ func TestHandoffBaseLeadingDashRejected(t *testing.T) {
 func TestHandoffRmRefusesNonNamespacedBranch(t *testing.T) {
 	rogue := "main"
 	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{
-		"r8b": {ID: "r8b", Kind: "task", Branch: &rogue},
+		// Status completed + no active/MR so the F1/F6 checks pass and the refusal is the
+		// namespace guard specifically (issue #403: without a terminal status this would
+		// short-circuit at the F6 status check and no longer exercise the guard under test).
+		"r8b": {ID: "r8b", Kind: "task", Branch: &rogue, Status: "completed"},
 	}}
 	rec := &handoffRecorder{}
 	env, _ := handoffEnv(fc, rec)

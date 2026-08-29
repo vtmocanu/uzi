@@ -103,6 +103,9 @@ var runDTOKeys = []string{
 	// non-task run and on a task run not yet dispatched). Always on the wire.
 	"dispatched_at",
 	"mr_iid", "mr_web_url", "mr_state", "failure_reason",
+	// issue #403 F1/F6: branch-wide `uzi handoff rm` preconditions, server-computed on the
+	// GetRun detail read for a task run (false elsewhere). Always on the wire (bool).
+	"branch_has_active_run", "branch_has_open_mr",
 	// PRD #411: the forge issue's web URL for the run's clickable #<iid> link. Null for
 	// issue-less runs and when the issue is no longer cached. Always on the wire.
 	"issue_web_url",

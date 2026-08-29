@@ -832,6 +832,38 @@ func (q *Queries) ListTaskReviewFindings(ctx context.Context, reviewID uuid.UUID
 	return items, nil
 }
 
+const taskBranchRmStats = `-- name: TaskBranchRmStats :one
+SELECT
+    COUNT(*) FILTER (WHERE status NOT IN ('completed', 'failed', 'cancelled')) AS active_count,
+    COUNT(*) FILTER (WHERE mr_web_url IS NOT NULL) AS mr_count
+FROM runs
+WHERE user_id = $1 AND kind = 'task' AND branch = $2
+`
+
+type TaskBranchRmStatsParams struct {
+	UserID uuid.UUID   `json:"user_id"`
+	Branch pgtype.Text `json:"branch"`
+}
+
+type TaskBranchRmStatsRow struct {
+	ActiveCount int64 `json:"active_count"`
+	MrCount     int64 `json:"mr_count"`
+}
+
+// Branch-scoped safety stats for `uzi handoff rm` (issue #403 F1/F6). A handoff's original
+// task, its auto-review and its --then-fix fix run are all kind='task' sharing the SAME
+// uzi/task/<orig> branch, so "is this branch safe to delete?" is branch-scoped, not
+// run-scoped: active_count > 0 means some run on the branch is still live (the original still
+// running, or an in-flight review/fix child pushing to it); mr_count > 0 means the branch's
+// owning task opened an MR (only an open_mr original ever sets mr_web_url), which exempts the
+// branch from rm. Owner-scoped (@user_id) so it never reports on a foreign branch.
+func (q *Queries) TaskBranchRmStats(ctx context.Context, arg TaskBranchRmStatsParams) (TaskBranchRmStatsRow, error) {
+	row := q.db.QueryRow(ctx, taskBranchRmStats, arg.UserID, arg.Branch)
+	var i TaskBranchRmStatsRow
+	err := row.Scan(&i.ActiveCount, &i.MrCount)
+	return i, err
+}
+
 const upsertTaskReviewWithFindings = `-- name: UpsertTaskReviewWithFindings :one
 WITH upserted AS (
     INSERT INTO task_reviews (target_run_id, review_run_id, user_id, status, summary_md)

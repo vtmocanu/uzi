@@ -137,6 +137,16 @@ type RunDTO struct {
 	// it directly through isHttpsUrl and only falls back to the legacy GitLab URL
 	// reconstruction for those null rows — it is the only correct link on Forgejo.
 	MrWebURL *string `json:"mr_web_url"`
+	// BranchHasActiveRun and BranchHasOpenMr are server-computed `uzi handoff rm` preconditions
+	// (issue #403 F1/F6), stamped ONLY on the owner/admin GetRun detail read for a kind='task'
+	// run — false on every non-task run, on the list/create/worker DTO paths, and on a
+	// pre-feature api pod. A handoff's original task, its auto-review and its --then-fix fix run
+	// all share one uzi/task/<id> branch, so the CLI keys `rm` on these BRANCH-wide facts, not
+	// the passed run's own row: BranchHasActiveRun is true while ANY run on the branch is
+	// non-terminal (rm would race a live push); BranchHasOpenMr is true when the branch's owning
+	// task opened an MR (rm exempt — the MR needs its source branch). Always on the wire (bool).
+	BranchHasActiveRun bool `json:"branch_has_active_run"`
+	BranchHasOpenMr    bool `json:"branch_has_open_mr"`
 	// IssueWebURL is the forge-supplied issue web URL (PRD #411), nil for issue-less
 	// runs or when the issue is no longer cached; rendered through isHttpsUrl on the web.
 	IssueWebURL *string `json:"issue_web_url"`

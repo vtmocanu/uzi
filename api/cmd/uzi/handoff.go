@@ -352,15 +352,26 @@ func runHandoffRm(env Env, gf *globalFlags, cmd *cobra.Command, id string) error
 	if run.Kind != "task" {
 		return uzicli.Exitf(uzicli.ExitUsage, "run %s is not a handoff task (kind=%s)", id, run.Kind)
 	}
-	// An open merge request needs its source branch, so a task that ACTUALLY opened one
-	// (MrWebURL set once the worker opens it) is exempt. Keying on MrWebURL, not the
-	// OpenMr *intent* flag: a --mr handoff that failed at push/dispatch before the worker
-	// ever opened an MR carries OpenMr=true but has no MR — its branch would otherwise be
-	// orphaned with no CLI path to delete it (and the create-time failure hints recommend
-	// exactly this command).
-	if run.MrWebURL != nil {
+	// issue #403 F1: an open merge request needs its source branch. The exemption is BRANCH-WIDE
+	// (branch_has_open_mr) because a handoff's original task, its auto-review and its --then-fix
+	// fix run all SHARE the uzi/task/<id> branch — running rm against a review/fix child (whose
+	// own row has no MR) must not delete the open MR's source branch. `|| MrWebURL != nil` keeps
+	// the per-run exemption working against a pre-feature api pod that omits the branch field.
+	if run.BranchHasOpenMr || run.MrWebURL != nil {
 		return uzicli.Exitf(uzicli.ExitGeneric,
-			"task %s opened a merge request; its branch is exempt from rm — delete it via the merge request", id)
+			"task %s's branch has an open merge request; it is exempt from rm — delete it via the merge request", id)
+	}
+	// issue #403 F6: refuse rm while the branch is still in use. The run's own status catches a
+	// still-running original (and is robust to a pre-feature api pod that omits branch_has_active_run);
+	// branch_has_active_run catches an in-flight review/fix child pushing to the same branch after
+	// the original completed. Deleting under either races the worker's push.
+	if !isTerminalRunStatus(run.Status) {
+		return uzicli.Exitf(uzicli.ExitGeneric,
+			"task %s is not finished yet (status %s); wait for it to complete before rm", id, run.Status)
+	}
+	if run.BranchHasActiveRun {
+		return uzicli.Exitf(uzicli.ExitGeneric,
+			"task %s still has an active review or fix run on its branch; wait for it to finish before rm", id)
 	}
 	if run.Branch == nil || strings.TrimSpace(*run.Branch) == "" {
 		return uzicli.Exitf(uzicli.ExitGeneric, "task %s has no branch to delete", id)
