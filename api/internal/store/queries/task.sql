@@ -19,8 +19,12 @@
 -- then_fix_requested rides from the caller (--then-fix, PRD #400 M5): set on this ORIGINAL
 -- task so that when its auto-spawned review run completes, maybeEnqueueThenFix composes the
 -- review findings into a fix run on the same branch; false for an ordinary handoff.
-INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, open_mr, interactive, review_requested, then_fix_requested, issue_title, issue_description, auto_approve, required_capabilities)
-VALUES (@run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'), @open_mr, @interactive, @review_requested, @then_fix_requested, @issue_title, @issue_description, true, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'))
+-- wait_on_limit (PRD #35) is stamped here from the OWNER's default, resolved in the
+-- service layer (resolveWaitOnLimit): a handoff has no per-request override today, so
+-- nil -> the owner's users.wait_on_limit is the whole behavior. Omitting it (as this
+-- query originally did) silently opts every task run OUT via the column DEFAULT false.
+INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, open_mr, interactive, review_requested, then_fix_requested, issue_title, issue_description, auto_approve, wait_on_limit, required_capabilities)
+VALUES (@run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'), @open_mr, @interactive, @review_requested, @then_fix_requested, @issue_title, @issue_description, true, @wait_on_limit, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'))
 RETURNING *;
 
 -- name: CreateThenFixRun :one
