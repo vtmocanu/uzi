@@ -165,23 +165,25 @@ func (q *Queries) CreateTaskReviewRun(ctx context.Context, arg CreateTaskReviewR
 
 const createTaskRun = `-- name: CreateTaskRun :one
 
-INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, open_mr, interactive, review_requested, then_fix_requested, issue_title, issue_description, auto_approve, required_capabilities)
-VALUES ($1, $2, $3::uuid, 'task', $4, $5, $6, $7, $8, $9, $10, $11, true, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $3::uuid), '{}'))
+INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, open_mr, interactive, review_requested, then_fix_requested, issue_title, issue_description, auto_approve, required_capabilities, budget_wall_seconds, budget_max_iterations)
+VALUES ($1, $2, $3::uuid, 'task', $4, $5, $6, $7, $8, $9, $10, $11, true, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $3::uuid), '{}'), $12, $13)
 RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds
 `
 
 type CreateTaskRunParams struct {
-	RunID            uuid.UUID   `json:"run_id"`
-	UserID           uuid.UUID   `json:"user_id"`
-	RepoID           uuid.UUID   `json:"repo_id"`
-	Branch           pgtype.Text `json:"branch"`
-	BaseBranch       pgtype.Text `json:"base_branch"`
-	OpenMr           bool        `json:"open_mr"`
-	Interactive      bool        `json:"interactive"`
-	ReviewRequested  bool        `json:"review_requested"`
-	ThenFixRequested bool        `json:"then_fix_requested"`
-	IssueTitle       string      `json:"issue_title"`
-	IssueDescription string      `json:"issue_description"`
+	RunID               uuid.UUID   `json:"run_id"`
+	UserID              uuid.UUID   `json:"user_id"`
+	RepoID              uuid.UUID   `json:"repo_id"`
+	Branch              pgtype.Text `json:"branch"`
+	BaseBranch          pgtype.Text `json:"base_branch"`
+	OpenMr              bool        `json:"open_mr"`
+	Interactive         bool        `json:"interactive"`
+	ReviewRequested     bool        `json:"review_requested"`
+	ThenFixRequested    bool        `json:"then_fix_requested"`
+	IssueTitle          string      `json:"issue_title"`
+	IssueDescription    string      `json:"issue_description"`
+	BudgetWallSeconds   pgtype.Int4 `json:"budget_wall_seconds"`
+	BudgetMaxIterations pgtype.Int4 `json:"budget_max_iterations"`
 }
 
 // Task runs (PRD #400: uzi handoff) ------------------------------------------
@@ -203,6 +205,10 @@ type CreateTaskRunParams struct {
 // then_fix_requested rides from the caller (--then-fix, PRD #400 M5): set on this ORIGINAL
 // task so that when its auto-spawned review run completes, maybeEnqueueThenFix composes the
 // review findings into a fix run on the same branch; false for an ordinary handoff.
+// budget_wall_seconds / budget_max_iterations (issue #785): for a NON-interactive handoff these
+// carry the dedicated HANDOFF_RUN_TIMEOUT / HANDOFF_RUN_MAX_ITERATIONS budget (already
+// 8h-ceiling-capped by the caller); NULL for an interactive handoff, which falls back to the
+// global default via the claim/sweeper COALESCE.
 func (q *Queries) CreateTaskRun(ctx context.Context, arg CreateTaskRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createTaskRun,
 		arg.RunID,
@@ -216,6 +222,8 @@ func (q *Queries) CreateTaskRun(ctx context.Context, arg CreateTaskRunParams) (R
 		arg.ThenFixRequested,
 		arg.IssueTitle,
 		arg.IssueDescription,
+		arg.BudgetWallSeconds,
+		arg.BudgetMaxIterations,
 	)
 	var i Run
 	err := row.Scan(

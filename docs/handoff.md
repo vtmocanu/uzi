@@ -106,6 +106,10 @@ uzi handoff -m "add input validation to the signup form" --interactive
   then `completed` — so a parked task never pins a worker slot indefinitely.
   Work is checkpoint-pushed at *every* park, not only at wind-down, so a
   worker dying mid-session never strands unpushed commits.
+- **A plain (non-interactive) handoff gets its own wall-clock budget.** It runs
+  under a dedicated default of 4h (`HANDOFF_RUN_TIMEOUT`), separate from the
+  global `RUN_TIMEOUT`, so a longer handoff does not require moving every run's
+  cap.
 - **`--review`/`--mr` compose at wind-down, not at every park.** The
   diff-review fires once — when the run finally reports `completed`, whether
   via `run stop` or the idle timeout — never on an intermediate park.

@@ -19,8 +19,12 @@
 -- then_fix_requested rides from the caller (--then-fix, PRD #400 M5): set on this ORIGINAL
 -- task so that when its auto-spawned review run completes, maybeEnqueueThenFix composes the
 -- review findings into a fix run on the same branch; false for an ordinary handoff.
-INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, open_mr, interactive, review_requested, then_fix_requested, issue_title, issue_description, auto_approve, required_capabilities)
-VALUES (@run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'), @open_mr, @interactive, @review_requested, @then_fix_requested, @issue_title, @issue_description, true, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'))
+-- budget_wall_seconds / budget_max_iterations (issue #785): for a NON-interactive handoff these
+-- carry the dedicated HANDOFF_RUN_TIMEOUT / HANDOFF_RUN_MAX_ITERATIONS budget (already
+-- 8h-ceiling-capped by the caller); NULL for an interactive handoff, which falls back to the
+-- global default via the claim/sweeper COALESCE.
+INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, open_mr, interactive, review_requested, then_fix_requested, issue_title, issue_description, auto_approve, required_capabilities, budget_wall_seconds, budget_max_iterations)
+VALUES (@run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'), @open_mr, @interactive, @review_requested, @then_fix_requested, @issue_title, @issue_description, true, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), sqlc.narg('budget_wall_seconds'), sqlc.narg('budget_max_iterations'))
 RETURNING *;
 
 -- name: CreateThenFixRun :one

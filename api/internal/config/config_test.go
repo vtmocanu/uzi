@@ -111,6 +111,8 @@ func TestLoadAgentRuntimeDefaults(t *testing.T) {
 		{"RunTimeout", cfg.RunTimeout, 2 * time.Hour},
 		{"RunIdleTimeout", cfg.RunIdleTimeout, 10 * time.Minute},
 		{"RunMaxIterations", cfg.RunMaxIterations, 5},
+		{"HandoffRunTimeout", cfg.HandoffRunTimeout, 4 * time.Hour},
+		{"HandoffRunMaxIterations", cfg.HandoffRunMaxIterations, 10},
 		{"RunMaxRequeues", cfg.RunMaxRequeues, 1},
 		{"WorkerHeartbeatInterval", cfg.WorkerHeartbeatInterval, 15 * time.Second},
 		{"WorkerHeartbeatStale", cfg.WorkerHeartbeatStale, 45 * time.Second},

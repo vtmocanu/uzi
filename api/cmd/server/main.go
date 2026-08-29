@@ -256,6 +256,8 @@ func run() error {
 		RunIdleTimeout:              cfg.RunIdleTimeout,
 		WorkerTaskIdleTimeout:       cfg.WorkerTaskIdleTimeout,
 		RunMaxIterations:            cfg.RunMaxIterations,
+		HandoffRunTimeout:           cfg.HandoffRunTimeout,
+		HandoffRunMaxIterations:     cfg.HandoffRunMaxIterations,
 		PlanMaxRevisions:            cfg.PlanMaxRevisions,
 		QuestionMax:                 cfg.QuestionMax,
 		QuestionTimeoutSeconds:      cfg.QuestionTimeoutSeconds,

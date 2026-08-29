@@ -691,6 +691,11 @@ type Params struct {
 	// (no drift). Delivered only on an interactive task claim; every other claim omits it.
 	WorkerTaskIdleTimeout time.Duration
 	RunMaxIterations      int
+	// HandoffRunTimeout / HandoffRunMaxIterations (issue #785) are the dedicated default
+	// wall-clock budget and iteration cap for a NON-interactive `uzi handoff` task run,
+	// mirrored from config. Persisted on the run at create; interactive handoffs get NULL.
+	HandoffRunTimeout       time.Duration
+	HandoffRunMaxIterations int
 	// PlanMaxRevisions caps how many times a run's plan may be revised at the
 	// approval gate (PRD #41, PLAN_MAX_REVISIONS). Enforced server-side in
 	// SubmitInput and shipped in the claim so the worker enforces the same limit.

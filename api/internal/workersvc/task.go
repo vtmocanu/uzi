@@ -98,18 +98,36 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 		return store.Run{}, ErrTaskBranchUnsafe
 	}
 
+	// issue #785: a NON-interactive handoff persists a dedicated wall-clock budget
+	// (HANDOFF_RUN_TIMEOUT) and iteration cap (HANDOFF_RUN_MAX_ITERATIONS) so it is
+	// decoupled from the global RUN_TIMEOUT / RUN_MAX_ITERATIONS. Both stay NULL for an
+	// interactive handoff (idle-bounded by WorkerTaskIdleTimeout) and for a non-positive
+	// knob, so the claim/sweeper COALESCE falls back to the global default. The wall is
+	// LEAST-capped to budgetWallCeilingSeconds (the repo invariant that every budget
+	// writer caps the wall to the 8h ceiling — see runtime.sql SweepRunningTimeout); the
+	// CHECK constraint is `NULL OR > 0`, and the `> 0` guards ensure we never persist 0.
+	var budgetWall, budgetIters pgtype.Int4
+	if !interactive && s.p.HandoffRunTimeout > 0 {
+		budgetWall = pgtype.Int4{Int32: int32(min(int(s.p.HandoffRunTimeout.Seconds()), budgetWallCeilingSeconds)), Valid: true}
+	}
+	if !interactive && s.p.HandoffRunMaxIterations > 0 {
+		budgetIters = pgtype.Int4{Int32: int32(s.p.HandoffRunMaxIterations), Valid: true}
+	}
+
 	run, err := s.q.CreateTaskRun(ctx, store.CreateTaskRunParams{
-		RunID:            id,
-		UserID:           userID,
-		RepoID:           repoID,
-		Branch:           pgText(branch),
-		BaseBranch:       pgTextTrimNarg(baseBranch),
-		OpenMr:           openMR,
-		Interactive:      interactive,
-		ReviewRequested:  reviewRequested,
-		ThenFixRequested: thenFixRequested,
-		IssueTitle:       deriveTaskTitle(inlineContext),
-		IssueDescription: inlineContext,
+		RunID:               id,
+		UserID:              userID,
+		RepoID:              repoID,
+		Branch:              pgText(branch),
+		BaseBranch:          pgTextTrimNarg(baseBranch),
+		OpenMr:              openMR,
+		Interactive:         interactive,
+		ReviewRequested:     reviewRequested,
+		ThenFixRequested:    thenFixRequested,
+		IssueTitle:          deriveTaskTitle(inlineContext),
+		IssueDescription:    inlineContext,
+		BudgetWallSeconds:   budgetWall,
+		BudgetMaxIterations: budgetIters,
 	})
 	if err != nil {
 		return store.Run{}, err
