@@ -51,12 +51,13 @@ var brandingContentTypes = map[string]struct{}{
 const brandingLogoMaxAge = 300
 
 // brandingResponse is the EXPLICIT, allowlisted shape of GET /api/branding: exactly the
-// six branding config keys (typed) plus the two derived presence flags. It is built
+// seven branding config keys (typed) plus the two derived presence flags. It is built
 // field-by-field from settings.Cache.Branding, NEVER from Cache.All / AdminView, so an
 // anonymous caller can read only these fields and never the rest of the non-secret
 // settings surface (Risk R1). TestBrandingPublicReadIsAllowlisted pins that closed.
 type brandingResponse struct {
 	AppLogoMode      string `json:"app_logo_mode"`
+	AppLogoPreset    string `json:"app_logo_preset"`
 	AppLogoPresent   bool   `json:"app_logo_present"`
 	AppLogoKeepName  bool   `json:"app_logo_keep_name"`
 	BrandMode        string `json:"brand_mode"`
@@ -81,6 +82,7 @@ func (h *Handler) GetBranding(w http.ResponseWriter, r *http.Request) {
 
 	resp := brandingResponse{
 		AppLogoMode:     cfg.AppLogoMode,
+		AppLogoPreset:   cfg.AppLogoPreset,
 		AppLogoKeepName: cfg.AppLogoKeepName,
 		BrandMode:       cfg.BrandMode,
 		BrandCompany:    cfg.BrandCompany,
