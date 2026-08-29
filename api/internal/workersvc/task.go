@@ -105,13 +105,17 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 	// knob, so the claim/sweeper COALESCE falls back to the global default. The wall is
 	// LEAST-capped to budgetWallCeilingSeconds (the repo invariant that every budget
 	// writer caps the wall to the 8h ceiling — see runtime.sql SweepRunningTimeout); the
-	// CHECK constraint is `NULL OR > 0`, and the `> 0` guards ensure we never persist 0.
+	// CHECK constraint is `NULL OR > 0`. The guards check the COMPUTED integer seconds /
+	// iterations (not the raw duration), so a sub-second HANDOFF_RUN_TIMEOUT that truncates
+	// to 0 falls back to the global default instead of persisting a 0 that trips the CHECK.
 	var budgetWall, budgetIters pgtype.Int4
-	if !interactive && s.p.HandoffRunTimeout > 0 {
-		budgetWall = pgtype.Int4{Int32: int32(min(int(s.p.HandoffRunTimeout.Seconds()), budgetWallCeilingSeconds)), Valid: true}
-	}
-	if !interactive && s.p.HandoffRunMaxIterations > 0 {
-		budgetIters = pgtype.Int4{Int32: int32(s.p.HandoffRunMaxIterations), Valid: true}
+	if !interactive {
+		if secs := int(s.p.HandoffRunTimeout.Seconds()); secs > 0 {
+			budgetWall = pgtype.Int4{Int32: int32(min(secs, budgetWallCeilingSeconds)), Valid: true}
+		}
+		if s.p.HandoffRunMaxIterations > 0 {
+			budgetIters = pgtype.Int4{Int32: int32(s.p.HandoffRunMaxIterations), Valid: true}
+		}
 	}
 
 	run, err := s.q.CreateTaskRun(ctx, store.CreateTaskRunParams{

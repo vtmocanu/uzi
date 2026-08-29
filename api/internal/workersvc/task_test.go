@@ -151,6 +151,26 @@ func TestCreateTaskRunPersistsHandoffBudget(t *testing.T) {
 			t.Errorf("budget_wall_seconds = %v, want valid %d (ceiling)", got.BudgetWallSeconds, budgetWallCeilingSeconds)
 		}
 	})
+
+	// A sub-second HANDOFF_RUN_TIMEOUT truncates to 0 integer seconds; the guard is on the
+	// COMPUTED seconds, so it persists NULL (global fallback) rather than a 0 that would
+	// trip the CHECK (budget_wall_seconds > 0) and fail every non-interactive handoff.
+	t.Run("sub-second wall truncates to NULL", func(t *testing.T) {
+		p := testParams()
+		p.HandoffRunTimeout = 500 * time.Millisecond
+		p.HandoffRunMaxIterations = 10
+		fs := &fakeStore{repoRow: aValidRepoRow()}
+		if _, err := newSvc(fs, p).CreateTaskRun(context.Background(), uuid.New(), uuid.New(), "do the thing", "", false, false, false, false); err != nil {
+			t.Fatalf("CreateTaskRun: %v", err)
+		}
+		got := fs.taskRunParams
+		if got == nil {
+			t.Fatal("insert did not run")
+		}
+		if got.BudgetWallSeconds.Valid {
+			t.Errorf("budget_wall_seconds = %v, want NULL for a sub-second timeout", got.BudgetWallSeconds)
+		}
+	})
 }
 
 // TestCreateTaskRunSanitizesAndCaps: NUL bytes are stripped from both context and
