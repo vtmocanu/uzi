@@ -5307,29 +5307,50 @@ UPDATE runs SET
     status     = 'awaiting_followup',
     status_since = now(),
     session_id = COALESCE($1, session_id),
-    -- Issue #552 M1: the park-scoped follow_up watermark. Stamp it, at EVERY park, to
-    -- the highest follow_up this run has ALREADY consumed. A later follow_up with a
-    -- higher id — the one the resuming worker will consume to wake THIS park — is what
-    -- SetRunRunning's Decision-7 guard requires to admit awaiting_followup → running,
-    -- so it discriminates "THIS park's follow_up" from "any follow_up ever consumed".
+    -- Issue #552 M1 / #559 M1: the park-scoped follow_up watermark. The value is now
+    -- WORKER-PROVIDED — the highest follow_up id the worker has ALREADY DELIVERED/applied
+    -- to a turn at the moment it parks — and CLAMPED here to the server-derived max
+    -- already-consumed follow_up as a safety ceiling (the LEAST(...) below). When the
+    -- worker OMITS it (an old worker, or the very first park before anything was
+    -- delivered) the COALESCE falls back to that same server-derived max-consumed, so an
+    -- absent param is byte-identical to the pre-#559 pure-server behavior.
     --
-    -- CONSUMED-only (consumed_at IS NOT NULL) is load-bearing: the follow_up that wakes
-    -- a park is UNCONSUMED until it wakes, so a consumed-only MAX never advances past
-    -- it. That makes recomputing the watermark at every re-park correct with NO claim
-    -- re-delivery, NO worker echo and NO clear-on-wake — the watermark simply names the
-    -- last follow_up already spent, and anything newer is a genuine new steer.
-    open_followup_id = (SELECT COALESCE(MAX(id), 0) FROM run_user_inputs
-                        WHERE run_id = $2 AND kind = 'follow_up' AND consumed_at IS NOT NULL),
+    -- Why worker-provided: deriving the watermark purely from the server's max-consumed
+    -- races a follow_up consumed DURING this park report's DB round-trip — it would fold a
+    -- not-yet-applied follow_up into the watermark and permanently strand the run (the
+    -- guard then never sees a follow_up NEWER than the watermark). The worker knows exactly
+    -- which follow_ups it has applied, so it reports that; a correct worker's last-delivered
+    -- id is ALWAYS ≤ max-consumed, so the clamp never bites it. The clamp exists only to
+    -- neutralize a buggy huge value that would otherwise strand the run forever.
+    --
+    -- A later follow_up with a higher id — the one the resuming worker will consume to wake
+    -- THIS park — is what SetRunRunning's Decision-7 guard requires to admit
+    -- awaiting_followup → running, so the watermark discriminates "THIS park's follow_up"
+    -- from "any follow_up ever consumed".
+    --
+    -- CONSUMED-only (consumed_at IS NOT NULL) remains load-bearing on the server ceiling:
+    -- the follow_up that wakes a park is UNCONSUMED until it wakes, so a consumed-only MAX
+    -- never advances past it. The watermark stays monotone across re-parks with NO claim
+    -- re-delivery and NO clear-on-wake — it simply names the last follow_up already spent
+    -- (or the worker's last-delivered id, whichever is lower), and anything newer is a
+    -- genuine new steer.
+    open_followup_id = LEAST(
+        COALESCE($2::bigint,
+                 (SELECT COALESCE(MAX(id), 0) FROM run_user_inputs
+                  WHERE run_user_inputs.run_id = $3 AND kind = 'follow_up' AND consumed_at IS NOT NULL)),
+        (SELECT COALESCE(MAX(id), 0) FROM run_user_inputs
+         WHERE run_user_inputs.run_id = $3 AND kind = 'follow_up' AND consumed_at IS NOT NULL)),
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE id = $2 AND worker_id = $3
+WHERE id = $3 AND worker_id = $4
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 
 type SetRunAwaitingFollowupParams struct {
-	SessionID pgtype.Text `json:"session_id"`
-	ID        uuid.UUID   `json:"id"`
-	WorkerID  pgtype.UUID `json:"worker_id"`
+	SessionID      pgtype.Text `json:"session_id"`
+	OpenFollowupID pgtype.Int8 `json:"open_followup_id"`
+	ID             uuid.UUID   `json:"id"`
+	WorkerID       pgtype.UUID `json:"worker_id"`
 }
 
 // PRD #517 M2/M3: the interactive-task park. On signal_done an interactive task run
@@ -5352,7 +5373,12 @@ type SetRunAwaitingFollowupParams struct {
 // status write like its siblings. status NOT IN (terminal) makes a report onto an
 // already-terminal run (a cancel raced in) a no-op → 0 rows → "already terminal".
 func (q *Queries) SetRunAwaitingFollowup(ctx context.Context, arg SetRunAwaitingFollowupParams) (int64, error) {
-	result, err := q.db.Exec(ctx, setRunAwaitingFollowup, arg.SessionID, arg.ID, arg.WorkerID)
+	result, err := q.db.Exec(ctx, setRunAwaitingFollowup,
+		arg.SessionID,
+		arg.OpenFollowupID,
+		arg.ID,
+		arg.WorkerID,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -6135,11 +6161,15 @@ WHERE runs.id = $16 AND worker_id = $17
   -- consumed follow_up genuinely IS new.
   --
   -- No clear-on-wake is needed, and a future reader must NOT "add the missing sibling
-  -- clear" the way open_question_id needs one. The watermark keys on CONSUMED-only rows
-  -- and is RECOMPUTED at each park (SetRunAwaitingFollowup) to the max already-consumed
-  -- follow_up: the follow_up that wakes a park is unconsumed until it wakes, so it never
-  -- counts toward the watermark that guards its own park, and the next park's recompute
-  -- rolls the watermark forward to include it. There is nothing to reset between parks.
+  -- clear" the way open_question_id needs one. As of issue #559 the watermark is
+  -- WORKER-PROVIDED at each park (SetRunAwaitingFollowup) — the max follow_up id the
+  -- worker has already DELIVERED — CLAMPED there to the server's max already-consumed
+  -- follow_up, with a server-derived fallback to that same max-consumed when the worker
+  -- omits it (old worker / first park). Either way it keys on CONSUMED-only rows for its
+  -- ceiling: the follow_up that wakes a park is unconsumed until it wakes, so it never
+  -- counts toward the watermark that guards its own park, and the next park rolls the
+  -- watermark forward to include it. There is nothing to reset between parks. The guard
+  -- predicate below (` + "`" + `id > COALESCE(open_followup_id, 0)` + "`" + `) is UNCHANGED by #559.
   AND (status <> 'awaiting_followup' OR EXISTS (
         SELECT 1 FROM run_user_inputs
         WHERE run_user_inputs.run_id = $16
