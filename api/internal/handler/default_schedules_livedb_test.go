@@ -7,10 +7,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/schedsvc"
 	"github.com/vtmocanu/uzi/api/internal/schedtmpl"
 )
 
@@ -22,6 +24,24 @@ import (
 func (f scheduleFixture) enableCatalog(t *testing.T, user, repoID uuid.UUID, slug string) (apitypes.ScheduleDTO, int) {
 	t.Helper()
 	req := userReq(http.MethodPost, "/api/repos/"+repoID.String()+"/schedule-catalog/"+slug, "",
+		user, map[string]string{"id": repoID.String(), "slug": slug})
+	rec := httptest.NewRecorder()
+	f.h.EnableCatalogSchedule(rec, req)
+	var dto apitypes.ScheduleDTO
+	if rec.Code == http.StatusCreated || rec.Code == http.StatusOK {
+		if err := json.Unmarshal(rec.Body.Bytes(), &dto); err != nil {
+			t.Fatalf("decode enable response: %v (body %s)", err, rec.Body.String())
+		}
+	}
+	return dto, rec.Code
+}
+
+// enableCatalogBody is enableCatalog with a caller-supplied request body (issue #660): it
+// POSTs `body` (e.g. a `{"timezone":...}` override) instead of the empty body enableCatalog
+// sends, and returns the decoded DTO plus the status code.
+func (f scheduleFixture) enableCatalogBody(t *testing.T, user, repoID uuid.UUID, slug, body string) (apitypes.ScheduleDTO, int) {
+	t.Helper()
+	req := userReq(http.MethodPost, "/api/repos/"+repoID.String()+"/schedule-catalog/"+slug, body,
 		user, map[string]string{"id": repoID.String(), "slug": slug})
 	rec := httptest.NewRecorder()
 	f.h.EnableCatalogSchedule(rec, req)
@@ -108,6 +128,64 @@ func TestEnableCatalogScheduleIdempotentLiveDB(t *testing.T) {
 	_, code = f.enableCatalog(t, f.owner.ID, f.repoID, "no-such-slug")
 	if code != http.StatusNotFound {
 		t.Fatalf("unknown slug enable status = %d, want 404", code)
+	}
+}
+
+// TestEnableCatalogScheduleTimezoneOverrideLiveDB (issue #660) pins the optional timezone
+// override on enable: a `{"timezone":...}` body makes the enabled default fire in that zone
+// from the first fire (both the stored Timezone and the computed next_fire_at), an
+// empty/absent body keeps the catalog zone (UTC), and an invalid IANA name is a 400.
+func TestEnableCatalogScheduleTimezoneOverrideLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	// A fixed clock so the handler's NextFire and the test's NextFire compute from the same
+	// instant (the fixture leaves h.now nil → time.Now, which two calls could straddle).
+	clock := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	f.h.now = func() time.Time { return clock }
+
+	job, _ := schedtmpl.BySlug("docs-hygiene") // cron "0 3 * * 1": a fixed wall-clock hour, so UTC vs Bucharest differ.
+
+	// A valid override zone is stored on the row and drives next_fire_at.
+	dto, code := f.enableCatalogBody(t, f.owner.ID, f.repoID, "docs-hygiene", `{"timezone":"Europe/Bucharest"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("enable with tz override status = %d, want 201", code)
+	}
+	if dto.Timezone != "Europe/Bucharest" {
+		t.Fatalf("override dto timezone = %q, want Europe/Bucharest", dto.Timezone)
+	}
+	wantNext, err := schedsvc.NextFire(job.Cron, "Europe/Bucharest", clock)
+	if err != nil {
+		t.Fatalf("compute expected Bucharest next fire: %v", err)
+	}
+	utcNext, err := schedsvc.NextFire(job.Cron, "UTC", clock)
+	if err != nil {
+		t.Fatalf("compute UTC next fire: %v", err)
+	}
+	if wantNext.Equal(utcNext) {
+		t.Fatal("Bucharest and UTC next fires are the same instant; pick a cron whose wall-clock hour differs per zone")
+	}
+	if dto.NextFireAt == nil || !dto.NextFireAt.Equal(wantNext) {
+		t.Fatalf("override next_fire_at = %v, want the Bucharest instant %v", dto.NextFireAt, wantNext)
+	}
+
+	// An empty body keeps the catalog zone (UTC) on a second repo (the first is now enabled).
+	repoB := f.insertRepo(ctx, t, f.owner, 2, "g/sched-tz-b")
+	base, code := f.enableCatalogBody(t, f.owner.ID, repoB, "docs-hygiene", "")
+	if code != http.StatusCreated {
+		t.Fatalf("enable with empty body status = %d, want 201", code)
+	}
+	if base.Timezone != schedtmpl.DefaultTimezone {
+		t.Fatalf("empty-body dto timezone = %q, want the catalog default %q", base.Timezone, schedtmpl.DefaultTimezone)
+	}
+	if base.NextFireAt == nil || !base.NextFireAt.Equal(utcNext) {
+		t.Fatalf("empty-body next_fire_at = %v, want the UTC instant %v", base.NextFireAt, utcNext)
+	}
+
+	// An invalid IANA name is a 400 (on a third repo so the check is independent of state).
+	repoC := f.insertRepo(ctx, t, f.owner, 3, "g/sched-tz-c")
+	if _, code := f.enableCatalogBody(t, f.owner.ID, repoC, "docs-hygiene", `{"timezone":"Not/AZone"}`); code != http.StatusBadRequest {
+		t.Fatalf("invalid timezone enable status = %d, want 400", code)
 	}
 }
 

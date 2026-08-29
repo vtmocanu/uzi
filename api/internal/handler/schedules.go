@@ -623,7 +623,23 @@ func (h *Handler) EnableCatalogSchedule(w http.ResponseWriter, r *http.Request) 
 		httpx.Error(w, http.StatusNotFound, "unknown catalog slug")
 		return
 	}
+	// Optional body: a timezone override (issue #660). An empty/absent body decodes to
+	// io.EOF and keeps the catalog zone (CLI/headless and older clients send none); a
+	// present, valid IANA name overrides it so the first fire lands in the caller's detected
+	// zone. Any other decode error is a malformed request (400).
+	var req apitypes.EnableCatalogRequest
+	if derr := httpx.DecodeJSONLimited(w, r, &req); derr != nil && !errors.Is(derr, io.EOF) {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
 	tz := catalogTimezone(job)
+	if override := strings.TrimSpace(req.Timezone); override != "" {
+		if _, lerr := time.LoadLocation(override); lerr != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid timezone")
+			return
+		}
+		tz = override
+	}
 	next, err := schedsvc.NextFire(job.Cron, tz, h.clock())
 	if err != nil {
 		slog.Error("enable default schedule: next fire", "slug", slug, "error", err)
