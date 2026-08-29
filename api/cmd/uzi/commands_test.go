@@ -196,9 +196,13 @@ func TestRunGetSurfacesStopKind(t *testing.T) {
 	// The SAME failure_reason on both, which is what the live half actually produces
 	// — the point being that the reason cannot be the discriminator.
 	reason := "run cancelled"
+	// The operator's OPTIONAL free-text cancel reason (issue #525): stamped on the user
+	// cancel, absent on the auto-stop (uzi stops carry no operator note) and on the plain
+	// failure. It rides beside stop_kind and must surface on its own STOP_REASON row.
+	cancelNote := "wrong branch, my mistake"
 	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{
 		"auto":  {ID: "auto", Status: "failed", FailureReason: &reason, StopKind: &autoStop},
-		"user":  {ID: "user", Status: "failed", FailureReason: &reason, StopKind: &cancelled},
+		"user":  {ID: "user", Status: "failed", FailureReason: &reason, StopKind: &cancelled, StopReason: &cancelNote},
 		"plain": {ID: "plain", Status: "failed", FailureReason: &reason},
 	}}
 
@@ -213,6 +217,11 @@ func TestRunGetSurfacesStopKind(t *testing.T) {
 	if !strings.Contains(userOut, "cancelled") {
 		t.Errorf("a user-cancelled run lost its stop kind:\n%s", userOut)
 	}
+	// issue #525: the operator's cancel reason surfaces on its own STOP_REASON row, so
+	// `uzi run get` shows WHY the run was cancelled, not just that it was.
+	if !strings.Contains(userOut, "STOP_REASON") || !strings.Contains(userOut, cancelNote) {
+		t.Errorf("a user-cancelled run with a reason did not surface its STOP_REASON:\n%s", userOut)
+	}
 	// The whole claim, stated as a comparison rather than as two substring checks:
 	// the two outputs must actually DIFFER. Without this the assertions above would
 	// pass on a build that printed the same constant for every run.
@@ -224,6 +233,15 @@ func TestRunGetSurfacesStopKind(t *testing.T) {
 	plainOut, _, _ := runCLI(t, fakeEnv(fc), "run", "get", "plain")
 	if strings.Contains(plainOut, "STOP_KIND") {
 		t.Errorf("a genuine failure (no stop_kind) printed an empty STOP_KIND row:\n%s", plainOut)
+	}
+	// Same shape for the reason: a run with no stop_reason carries no STOP_REASON row.
+	// The auto-stop (a stop_kind with no operator note) is the pointed case — it must
+	// show STOP_KIND but not STOP_REASON.
+	if strings.Contains(plainOut, "STOP_REASON") {
+		t.Errorf("a run with no stop_reason printed an empty STOP_REASON row:\n%s", plainOut)
+	}
+	if strings.Contains(autoOut, "STOP_REASON") {
+		t.Errorf("an auto-stop carries no operator reason, so it must show no STOP_REASON row:\n%s", autoOut)
 	}
 }
 
