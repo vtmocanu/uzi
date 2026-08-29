@@ -167,6 +167,11 @@ type RunDTO struct {
 	// own "run cancelled", so this field is the ONLY thing that distinguishes an
 	// auto-stop from a user cancel.
 	StopKind *string `json:"stop_kind"`
+	// StopReason is the operator's OPTIONAL free-text cancel reason (PRD #503 M3),
+	// captured beside StopKind on the cancel paths and surfaced here on the read path
+	// (issue #525). Null when no reason was given. Free text — treated like FailureReason,
+	// not like the StopKind enum.
+	StopReason *string `json:"stop_reason"`
 	// Run health (PRD #47). This DTO is owner-scoped (ListRuns owner-only,
 	// AdminListRuns admin-only, GetRun owner/admin), so health_reason rides
 	// unconditionally here, matching failure_reason — the owner-gating that the shared

@@ -388,6 +388,7 @@ func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
 		MrState:       textPtrValue(r.MrState.Valid, r.MrState.String),
 		FailureReason: textPtrValue(r.FailureReason.Valid, r.FailureReason.String),
 		StopKind:      textPtrValue(r.StopKind.Valid, r.StopKind.String),
+		StopReason:    textPtrValue(r.StopReason.Valid, r.StopReason.String),
 		Health:        r.Health,
 		HealthReason:  textPtrValue(r.HealthReason.Valid, r.HealthReason.String),
 		HealthSince:   timePtr(r.HealthSince.Valid, r.HealthSince.Time),
