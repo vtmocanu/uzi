@@ -549,6 +549,10 @@ type Store interface {
 	// UpsertRunUsage folds a delivered result frame's per-model usage into
 	// run_usage (PRD #40 M2), GREATEST-merged so re-delivery never regresses.
 	UpsertRunUsage(ctx context.Context, arg store.UpsertRunUsageParams) error
+	// BumpRunLineageEpoch increments a run's lineage-epoch counter by one (PRD
+	// #632), called once per newly-inserted resume_lineage_break status event so a
+	// fresh SDK leg's run_usage rows are stamped with a higher epoch than the prior.
+	BumpRunLineageEpoch(ctx context.Context, id uuid.UUID) error
 	// Usage read rollups (PRD #40 M3), all over the run_usage_totals view.
 	GetRunUsageTotal(ctx context.Context, runID uuid.UUID) (store.GetRunUsageTotalRow, error)
 	SelfUsage(ctx context.Context, userID uuid.UUID) (store.SelfUsageRow, error)
@@ -2880,6 +2884,13 @@ func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID
 // The audit as it stands, per non-insert call:
 //
 //   - UpdateRunLastSeq — takes the run id and an int32 seq. No worker text.
+//   - BumpRunLineageEpoch — takes only the run id (a uuid) and writes a
+//     server-computed `lineage_epoch + 1`. No worker-controlled text or value
+//     reaches the store through it, so it cannot produce the misattributed
+//     22P02/22021/54000/22003 codes the narrow classifier guards. A CLEARED
+//     suspect, written out for the same reason as foldRunUsage below: it is
+//     correctly returned raw (500), never wrapped, because a failure is a genuine
+//     server error the worker should retry, not a poisoned batch.
 //   - foldRunUsage → UpsertRunUsage — every column it writes, checked one by one
 //     because "I cannot think of a case" is not the same as "there is no case".
 //     Read this as a CLEARED suspect, not a live hazard: it is written out because
@@ -3082,6 +3093,40 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	if insertErr != nil {
 		return obs, insertErr
 	}
+	// Bump the run's lineage epoch once per NEWLY-INSERTED resume_lineage_break
+	// status event (PRD #632, dropped-resume signal #334). Scan `inserted`, NOT
+	// `msgs`: a re-delivered break is seq-deduped (rows == 0 ⇒ absent from
+	// `inserted`), so a retry never double-bumps and the bump stays idempotent
+	// under at-least-once delivery. A malformed payload just isn't a break (skip).
+	epochBumps := 0
+	for _, m := range inserted {
+		if m.Kind != "status" {
+			continue
+		}
+		var ev statusEventPayload
+		if err := json.Unmarshal(m.Payload, &ev); err != nil {
+			continue // malformed payload → not a break
+		}
+		if ev.Event != "resume_lineage_break" {
+			continue
+		}
+		// Return the error RAW (500), never through classifyStoreError: this call
+		// writes only the run_id and a server-computed +1 — no worker-controlled
+		// value reaches the store — so a failure is a genuine server error the
+		// worker should retry, never a "batch poisoned" 400. See the 🔴 audit block.
+		if err := s.q.BumpRunLineageEpoch(ctx, runID); err != nil {
+			return obs, err
+		}
+		epochBumps++
+	}
+	// Mirror the committed DB bump into the in-memory run struct before the fold, so
+	// the fold stamps the correct epoch even if a break and the fresh leg's result
+	// frame ever arrive in the SAME batch. Temporal invariant: in the normal
+	// cross-batch case epochBumps == 0 for the batch carrying the result frames, and
+	// the run — re-fetched fresh at the top of the NEXT appendMessages call by
+	// runOwnedByWorker — already carries the committed epoch, so this mirror is a
+	// no-op there. It closes the same-batch window without a re-read query.
+	run.LineageEpoch += int32(epochBumps)
 	// Fold every DELIVERED result frame's usage into run_usage (PRD #40 Decision 2)
 	// — over `msgs`, NOT `inserted`: a seq-deduped re-delivery (crash retry) must
 	// still re-run the fold, which is exactly what makes at-least-once delivery plus
@@ -3123,6 +3168,13 @@ type resultModelUsage struct {
 	CostUSD                  float64 `json:"costUSD"`
 }
 
+// statusEventPayload is the minimal shape appendMessages reads off a `status`
+// message to detect a resume_lineage_break (dropped-resume signal #334, PRD #632).
+// Only `event` is inspected; a malformed payload simply isn't a break.
+type statusEventPayload struct {
+	Event string `json:"event"`
+}
+
 // run_usage's PK is (run_id, session_id, model). run_id is a uuid (16 bytes in
 // the index); session_id and model are BOTH unbounded worker-controlled text
 // (00062_run_usage.sql). A btree index entry is capped at 2704 bytes on an 8 KiB
@@ -3154,6 +3206,10 @@ const (
 // GREATEST merge in UpsertRunUsage makes that idempotent. session_id is sourced
 // from the run row (the frame payload carries none); it is ” until the run has
 // reported one, which the monotonic merge + latest/MAX-per-model rollup tolerate.
+// It also stamps the run's current lineage epoch (PRD #632, sourced from the run
+// struct, which appendMessages keeps current via the same-batch mirror above and
+// the fresh per-call fetch by runOwnedByWorker) onto each row it inserts; the epoch
+// is pinned to first insert in UpsertRunUsage, never overwritten by a re-fold.
 // Malformed/absent usage is skipped (never fails the append); a DB error
 // propagates so the append fails and the worker re-delivers.
 func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []IncomingMessage) error {
@@ -3199,6 +3255,7 @@ func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []Incomi
 				RunID:               run.ID,
 				SessionID:           sessionID,
 				Model:               model,
+				LineageEpoch:        run.LineageEpoch,
 				InputTokens:         nonNegTokens(mu.InputTokens),
 				CacheReadTokens:     nonNegTokens(mu.CacheReadInputTokens),
 				CacheCreationTokens: nonNegTokens(mu.CacheCreationInputTokens),

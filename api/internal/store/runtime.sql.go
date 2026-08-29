@@ -137,6 +137,21 @@ func (q *Queries) AdminUsageTotals(ctx context.Context) (AdminUsageTotalsRow, er
 	return i, err
 }
 
+const bumpRunLineageEpoch = `-- name: BumpRunLineageEpoch :exec
+UPDATE runs SET lineage_epoch = lineage_epoch + 1, updated_at = now() WHERE id = $1
+`
+
+// PRD #632: increment a run's lineage-epoch counter by one. The API calls this once
+// per NEWLY-INSERTED resume_lineage_break status event (dropped-resume signal, #334)
+// so a fresh SDK leg's run_usage rows are stamped with a higher epoch than the prior
+// leg's; the run_usage_totals view then SUMs across epochs instead of MAX-masking the
+// smaller leg. Bumping only for events in `inserted` (never re-deliveries) keeps it
+// idempotent under at-least-once delivery.
+func (q *Queries) BumpRunLineageEpoch(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, bumpRunLineageEpoch, id)
+	return err
+}
+
 const cancelRunByWorker = `-- name: CancelRunByWorker :execrows
 UPDATE runs SET
     status             = 'cancelled',
@@ -6529,11 +6544,11 @@ func (q *Queries) UpdateRunLastSeq(ctx context.Context, arg UpdateRunLastSeqPara
 const upsertRunUsage = `-- name: UpsertRunUsage :exec
 
 INSERT INTO run_usage (
-    run_id, session_id, model,
+    run_id, session_id, model, lineage_epoch,
     input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, updated_at
 ) VALUES (
-    $1, $2, $3,
-    $4, $5, $6, $7, $8, now()
+    $1, $2, $3, $4,
+    $5, $6, $7, $8, $9, now()
 )
 ON CONFLICT (run_id, session_id, model) DO UPDATE SET
     input_tokens          = GREATEST(run_usage.input_tokens,          EXCLUDED.input_tokens),
@@ -6548,6 +6563,7 @@ type UpsertRunUsageParams struct {
 	RunID               uuid.UUID      `json:"run_id"`
 	SessionID           string         `json:"session_id"`
 	Model               string         `json:"model"`
+	LineageEpoch        int32          `json:"lineage_epoch"`
 	InputTokens         int64          `json:"input_tokens"`
 	CacheReadTokens     int64          `json:"cache_read_tokens"`
 	CacheCreationTokens int64          `json:"cache_creation_tokens"`
@@ -6566,11 +6582,15 @@ type UpsertRunUsageParams struct {
 // different cumulative snapshots hit the same key). The API calls this for every
 // delivered result frame incl. seq-deduped replays, so at-least-once delivery +
 // this idempotent monotonic merge = correct totals with no crash window.
+// lineage_epoch (PRD #632) is a stamped attribute pinned to first insert (omitted
+// from DO UPDATE SET) — the fresh dropped-resume leg's distinct session_id is the
+// row-splitter, and pinning prevents a late re-fold from re-collapsing legs.
 func (q *Queries) UpsertRunUsage(ctx context.Context, arg UpsertRunUsageParams) error {
 	_, err := q.db.Exec(ctx, upsertRunUsage,
 		arg.RunID,
 		arg.SessionID,
 		arg.Model,
+		arg.LineageEpoch,
 		arg.InputTokens,
 		arg.CacheReadTokens,
 		arg.CacheCreationTokens,
