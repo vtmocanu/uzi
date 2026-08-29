@@ -4282,6 +4282,9 @@ UPDATE runs SET
     status     = 'queued',
     status_since = now(),
     started_at = NULL,
+    -- Issue #783: the fresh wall discards started_at, so the pause banked against the
+    -- OLD baseline must be cleared too — otherwise it over-credits the new deadline.
+    budget_paused_seconds = 0,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE status = 'limit_wait' AND retry_not_before <= $1
@@ -4361,6 +4364,9 @@ UPDATE runs SET
     status       = 'queued',
     status_since = now(),
     started_at   = NULL,
+    -- Issue #783: the fresh wall discards started_at, so the pause banked against the
+    -- OLD baseline must be cleared too — otherwise it over-credits the new deadline.
+    budget_paused_seconds = 0,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at   = now()
 WHERE id = $1 AND user_id = $2
@@ -4743,7 +4749,7 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue
     -- SweepRunningTimeout entirely (interactive = false), so they have no wall deadline.
     budget_paused_seconds = budget_paused_seconds
         + CASE WHEN status IN ('awaiting_approval', 'awaiting_input')
-               THEN EXTRACT(EPOCH FROM (now() - status_since))::int
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
                ELSE 0 END,
     updated_at = now()
 WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
@@ -4798,7 +4804,7 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue
     -- SweepRunningTimeout entirely (interactive = false), so they have no wall deadline.
     budget_paused_seconds = budget_paused_seconds
         + CASE WHEN status IN ('awaiting_approval', 'awaiting_input')
-               THEN EXTRACT(EPOCH FROM (now() - status_since))::int
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
                ELSE 0 END,
     updated_at = now()
 WHERE worker_id = $1
@@ -5823,6 +5829,9 @@ UPDATE runs SET
     status       = 'pool_wait',
     status_since = now(),
     started_at   = NULL,
+    -- Issue #783: the fresh wall discards started_at, so the pause banked against the
+    -- OLD baseline must be cleared too — otherwise it over-credits the new deadline.
+    budget_paused_seconds = 0,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at   = now()
 WHERE id = $1 AND worker_id = $2
@@ -6042,7 +6051,7 @@ UPDATE runs SET
     -- approve_plan / question identity), so accumulation only happens on a real resume.
     budget_paused_seconds = budget_paused_seconds
         + CASE WHEN status IN ('awaiting_approval', 'awaiting_input')
-               THEN EXTRACT(EPOCH FROM (now() - status_since))::int
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
                ELSE 0 END,
     updated_at       = now()
 WHERE runs.id = $16 AND worker_id = $17

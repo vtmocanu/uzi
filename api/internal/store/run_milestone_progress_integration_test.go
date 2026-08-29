@@ -598,6 +598,44 @@ func TestRunMilestoneProgressLiveDB(t *testing.T) {
 			t.Fatalf("started_at moved by %v on requeue, want unchanged", d)
 		}
 	})
+
+	// ── Issue #783: PromoteLimitWaitRuns gives the resumed run a FRESH wall (started_at =
+	//    NULL), so the pause banked against the discarded baseline must be cleared too —
+	//    otherwise stale gate-wait credit inflates the new deadline (defeats RUN_TIMEOUT). ──
+	t.Run("limit_wait promotion clears the banked pause and nulls started_at", func(t *testing.T) {
+		run := newRun("claimed")
+		// Park it at limit_wait with a banked pause of 7200s and a started_at 1h in the past;
+		// retry_not_before in the past makes it eligible for promotion.
+		mustExec(ctx, t, pool,
+			`UPDATE runs SET status = 'limit_wait', budget_paused_seconds = 7200,
+			     started_at = now() - interval '1 hour', retry_not_before = now() - interval '1 minute'
+			 WHERE id = $1`, run)
+
+		promoted, err := q.PromoteLimitWaitRuns(ctx, pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true})
+		if err != nil {
+			t.Fatalf("PromoteLimitWaitRuns: %v", err)
+		}
+		found := false
+		for _, r := range promoted {
+			if r.ID == run {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("the parked limit_wait run must be promoted")
+		}
+		// The fresh wall discards started_at, so the banked pause must be cleared.
+		if got := readPaused(run); got != 0 {
+			t.Fatalf("budget_paused_seconds after limit_wait promotion = %d, want 0", got)
+		}
+		var startedAt pgtype.Timestamptz
+		if err := pool.QueryRow(ctx, `SELECT started_at FROM runs WHERE id = $1`, run).Scan(&startedAt); err != nil {
+			t.Fatalf("read started_at: %v", err)
+		}
+		if startedAt.Valid {
+			t.Fatalf("started_at after limit_wait promotion is %v, want NULL (fresh wall)", startedAt.Time)
+		}
+	})
 }
 
 // rawMilestoneCol returns a run's raw jsonb id-array column bytes, nil when SQL NULL. It
