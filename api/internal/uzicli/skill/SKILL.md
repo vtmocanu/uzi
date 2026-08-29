@@ -162,7 +162,7 @@ uzi run resume-now <run-id>
 uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit]
 uzi schedule list
 uzi schedule get <schedule-id>
-uzi schedule edit <schedule-id> [--repo <repo-id>] [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--create-missing-labels] [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--auto-approve[=false]] [--wait-on-limit[=false]]
+uzi schedule edit <schedule-id> [--repo <repo-id>] [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--create-missing-labels] [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--auto-approve[=false]] [--wait-on-limit[=false]] [--model <alias|id>] [--apply-model-to-agents]
 uzi schedule pause <schedule-id>
 uzi schedule resume <schedule-id>
 uzi schedule run-now <schedule-id>
@@ -565,10 +565,12 @@ nothing a manual start cannot.
   (enabled=false) schedule, which stays off until `resume`. Retime with `--cron` or `--at`
   (switching timing accordingly), adjust `--tz`, and — scoped to the target — `--prompt`,
   `--label`, `--guidance`/`--clear-guidance`, `--max-issues`/`--clear-max-issues`,
-  `--auto-approve`, `--wait-on-limit`, `--apply-model-to-agents` (toggle the subagent
-  model override). At least one field is required. `edit` does NOT change the model
-  itself, but it now preserves the stored `--model` and `--apply-model-to-agents` across
-  any partial edit (previously a plain retime silently wiped the stored model). Changing a
+  `--auto-approve`, `--wait-on-limit`, `--model <alias|id>` (change the run model in
+  place; an empty string clears it back to the Worker-model default; valid on every
+  target and origin), `--apply-model-to-agents` (toggle the subagent model override). At
+  least one field is required. `edit` preserves the stored `--model` and
+  `--apply-model-to-agents` across any partial edit that does not pass those flags
+  (previously a plain retime silently wiped the stored model). Changing a
   sweep schedule's `--label` selector runs the same advisory sweep-label guardrail as
   `create`/`catalog enable` (`WARNING` on a newly-set label missing on the repo, or
   `--create-missing-labels` to create it first); it never blocks the edit, and an edit that
@@ -604,9 +606,9 @@ nothing a manual start cannot.
   failed label check or create prints a `WARNING` and proceeds (the enable otherwise reads
   nothing from the forge).
 - `uzi schedule reset <schedule-id>` — restore a **default** schedule's edited fields (cron,
-  timezone, model, auto-approve, wait-on-limit, max-issues) to the builtin catalog values and
-  clear its customized flag. Only a default-origin schedule can be reset; a user-origin one is
-  a `409`.
+  timezone, model, apply-model-to-agents, auto-approve, wait-on-limit, max-issues) to the
+  builtin catalog values — `apply-model-to-agents` resets to `false` — and clear its
+  customized flag. Only a default-origin schedule can be reset; a user-origin one is a `409`.
 - `uzi schedule clone <schedule-id> [--repo <repo-id>]` — copy a schedule into a new, fully
   editable schedule you own. Cloning a **default** schedule lifts its catalog prompt lock (the
   baked prompt, or a sweep's labels/guidance, is copied into the new row, which becomes a

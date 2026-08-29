@@ -108,7 +108,7 @@ uzi schedule edit <id> [--cron <expr> | --at <rfc3339>] [--tz <iana>]
                    [--auto-approve[=false]] [--wait-on-limit[=false]]
                    [--guidance <text> | --clear-guidance]
                    [--max-issues <n> | --clear-max-issues]
-                   [--apply-model-to-agents] [--repo <id>]
+                   [--model <alias|id>] [--apply-model-to-agents] [--repo <id>]
 uzi schedule catalog list
 uzi schedule catalog enable <slug> --repo <id> [--repo <id> ...] [--create-missing-labels]
 uzi schedule reset <id>
@@ -292,18 +292,24 @@ A few worth knowing:
   (`--clear-guidance`)/`--max-issues` (`--clear-max-issues`)/`--auto-approve`/
   `--wait-on-limit`/`--apply-model-to-agents` (toggle the subagent model
   override) — without churning the id or
-  run history the way delete-and-recreate would; `edit` does not change the
-  model itself (there is no `--model` edit flag), but it now preserves the
-  stored `--model` and `--apply-model-to-agents` across a partial edit — a plain
-  retime previously wiped the stored model. On a **default-origin** schedule only
+  run history the way delete-and-recreate would; `edit` now accepts
+  `--model <alias|id>` to change the run model in place, valid on every
+  target and origin (an empty string clears it back to the Worker-model
+  default), and it preserves the stored `--model` and `--apply-model-to-agents`
+  across a partial edit that does not pass those flags — a plain retime no
+  longer wipes the stored model. On a **default-origin** schedule only
   the catalog-editable fields (`--cron`, `--tz`, `--auto-approve`,
-  `--wait-on-limit`, `--max-issues`, `--clear-max-issues`) may be edited, plus
+  `--wait-on-limit`, `--max-issues`, `--clear-max-issues`, `--model`,
+  `--apply-model-to-agents`) may be edited — no clone needed — plus
   `--guidance`/`--clear-guidance` on a **prompt-target or sweep-target default**
   (owner steering is editable there — a partial edit restates the stored guidance
   so it is not wiped; on a sweep default the guidance is an **overlay** composed
-  onto the read-only baked catalog guidance at fire time); the catalog-owned fields
-  (`--prompt`, `--label`, `--repo`, `--at`, and `--guidance` on an issue default)
-  require `uzi schedule clone` first. Changing a sweep schedule's `--label`
+  onto the read-only baked catalog guidance at fire time); a **Reset** restores
+  `--apply-model-to-agents` to its catalog baseline of `false` alongside the
+  other catalog fields. The catalog-owned fields (`--prompt`, `--label`,
+  `--repo`, `--at`, and `--guidance` on an issue default) still require
+  `uzi schedule clone` first — the subagent-model toggle is not among them.
+  Changing a sweep schedule's `--label`
   selector runs the same advisory sweep-label guardrail as `create`/`catalog
   enable`: it `WARNING`s (to stderr) on any newly-set label missing on the
   schedule's repo, or creates it first with `--create-missing-labels`, and never
@@ -351,8 +357,9 @@ A few worth knowing:
   an enable (which otherwise reads nothing from the forge, computing the next fire
   from the catalog cron).
 - **`schedule reset <id>`** restores a **default** schedule's edited fields (cron,
-  timezone, model, auto-approve, wait-on-limit, max-issues) to the builtin catalog
-  values and clears its customized flag. Only a default-origin schedule can be
+  timezone, model, apply-model-to-agents, auto-approve, wait-on-limit,
+  max-issues) to the builtin catalog values — `apply-model-to-agents` resets to
+  `false` — and clears its customized flag. Only a default-origin schedule can be
   reset; a user-origin one is a `409`.
 - **`schedule clone <id> [--repo <id>]`** copies a schedule into a new, fully
   editable schedule you own. Cloning a **default** schedule lifts its catalog
