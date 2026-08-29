@@ -249,28 +249,28 @@ describe("the demo board exercises the board's features (PRD #102, web-ux S7)", 
     // a fixture full of those would satisfy a naive "has labels" check while showing
     // no chip.
     //
-    // Scoped to PRD cards ON PURPOSE. The non-PRD fixtures added for M6 carry content
-    // labels too, so counting every card would let this pass while the DEFAULT board
-    // — toggle off — still showed no chip anywhere. That weaker version passed against
-    // the unfixed fixtures when it was first written.
-    const workflow = new Set(["PRD", "PRDLESS", "autopilot", "uzi-self-improve"]);
+    // Scoped to `uzi` (runnable) cards ON PURPOSE (PRD #764). The non-uzi fixtures carry
+    // content labels too, so counting every card would let this pass while the DEFAULT
+    // board — toggle off — still showed no chip anywhere. `uzi` is the runnable marker,
+    // shown as a highlighted chip, so it does not count as a genuine CONTENT label here.
+    const workflow = new Set(["uzi", "autopilot", "uzi-self-improve"]);
     const chipworthy = boards.flatMap(([, b]) => {
       const columns = new Set(b.columns.map((col) => col.label_name));
       return b.cards
-        .filter((c) => c.labels.includes("PRD"))
+        .filter((c) => c.labels.includes("uzi"))
         .flatMap((c) => c.labels.filter((l) => !workflow.has(l) && !columns.has(l)));
     });
     expect(chipworthy.length).toBeGreaterThan(0);
   });
 
-  it("ships open non-PRD cards, so the M6 toggle demonstrates something", () => {
-    // Default-off plus no non-PRD cards is a control that visibly does nothing.
-    const nonPRD = boards.flatMap(([, b]) =>
-      b.cards.filter((c) => !c.closed && !c.labels.includes("PRD") && !c.labels.includes("uzi-self-improve")),
+  it("ships open non-uzi cards, so the 'Show all issues' toggle demonstrates something", () => {
+    // Default-off plus no non-uzi cards is a control that visibly does nothing (PRD #764).
+    const nonUzi = boards.flatMap(([, b]) =>
+      b.cards.filter((c) => !c.closed && !c.labels.includes("uzi") && !c.labels.includes("uzi-self-improve")),
     );
-    expect(nonPRD.length).toBeGreaterThan(0);
+    expect(nonUzi.length).toBeGreaterThan(0);
     // At least one with NO labels at all: the ordinary shape of a freshly filed issue,
     // and the shape whose labels used to reach the wire as JSON null.
-    expect(nonPRD.some((c) => c.labels.length === 0)).toBe(true);
+    expect(nonUzi.some((c) => c.labels.length === 0)).toBe(true);
   });
 });

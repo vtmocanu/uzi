@@ -28,31 +28,35 @@ func parseDomain(t *testing.T, raw string) string {
 	return emailDomain(addr.Address)
 }
 
-// TestSessionPayloadCarriesEligibilityFields pins the PRD #196 M2 contract on the
-// session payload: the eligible label set (a JSON array of strings, primary first)
-// and the PRD-link waiver (a JSON bool) ride this response so the issue view and
-// the card Start affordance — which have no board payload — can read them.
-func TestSessionPayloadCarriesEligibilityFields(t *testing.T) {
+// TestSessionPayloadCarriesUziLabel pins the PRD #764 contract on the session
+// payload: the configured uzi_label rides this response so the issue view and the
+// card Start affordance — which have no board payload — can read it. Only the
+// uzi_label and autopilot_label of the label family are emitted; the retired
+// eligibility keys are gone (a positive guard: the only label-family keys present
+// are the two expected ones).
+func TestSessionPayloadCarriesUziLabel(t *testing.T) {
 	h := newSettingsHandler(
-		store.AppSetting{Key: settings.KeyPRDLabel, Value: "PRD"},
-		store.AppSetting{Key: settings.KeyRunEligibleLabels, Value: "PRD,bug,security"},
-		store.AppSetting{Key: settings.KeyEligibleLabelWaivesPRDLink, Value: "false"},
+		store.AppSetting{Key: settings.KeyUziLabel, Value: "runnable"},
+		store.AppSetting{Key: settings.KeyAutopilotLabel, Value: "hands-off"},
 	)
 	payload := h.sessionPayload(context.Background(), store.User{})
 
-	got, ok := payload["run_eligible_labels"].([]string)
-	if !ok {
-		t.Fatalf("run_eligible_labels = %T, want []string", payload["run_eligible_labels"])
+	if uzi, ok := payload["uzi_label"].(string); !ok || uzi != "runnable" {
+		t.Errorf("uzi_label = %v (%T), want \"runnable\"", payload["uzi_label"], payload["uzi_label"])
 	}
-	if len(got) != 3 || got[0] != "PRD" || got[1] != "bug" || got[2] != "security" {
-		t.Errorf("run_eligible_labels = %v, want [PRD bug security]", got)
+	if ap, ok := payload["autopilot_label"].(string); !ok || ap != "hands-off" {
+		t.Errorf("autopilot_label = %v (%T), want \"hands-off\"", payload["autopilot_label"], payload["autopilot_label"])
 	}
-	waiver, ok := payload["eligible_label_waives_prd_link"].(bool)
-	if !ok {
-		t.Fatalf("eligible_label_waives_prd_link = %T, want bool", payload["eligible_label_waives_prd_link"])
-	}
-	if waiver != false {
-		t.Errorf("eligible_label_waives_prd_link = %v, want false", waiver)
+
+	// No other key in the payload ends in "_label" (positive guard that the retired
+	// label-family keys are gone without naming them).
+	for k := range payload {
+		if k == "uzi_label" || k == "autopilot_label" {
+			continue
+		}
+		if strings.HasSuffix(k, "_label") {
+			t.Errorf("session payload emits an unexpected label-family key %q", k)
+		}
 	}
 }
 
@@ -101,25 +105,6 @@ func TestSessionPayloadJudgeConsentFields(t *testing.T) {
 	}
 	if m := payload3["effective_judge_model"]; m != settings.DefaultJudgeModel {
 		t.Errorf("effective_judge_model = %v, want %q (default)", m, settings.DefaultJudgeModel)
-	}
-}
-
-// TestBoardDTOMembershipField pins the PRD #196 M2 board-payload contract: the
-// board_extra_labels field serializes as a JSON array of strings under that key.
-func TestBoardDTOMembershipField(t *testing.T) {
-	b := boardDTO{BoardExtraLabels: []string{"bug", "documentation"}}
-	raw, err := json.Marshal(b)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	var decoded struct {
-		Extra []string `json:"board_extra_labels"`
-	}
-	if err := json.Unmarshal(raw, &decoded); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if len(decoded.Extra) != 2 || decoded.Extra[0] != "bug" || decoded.Extra[1] != "documentation" {
-		t.Errorf("board_extra_labels = %v, want [bug documentation]", decoded.Extra)
 	}
 }
 

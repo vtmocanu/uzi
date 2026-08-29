@@ -37,12 +37,12 @@ import (
 // Setting keys. These are the only keys the API recognizes; writes to any other
 // key are rejected (an admin cannot invent settings the code does not read).
 const (
-	KeyPRDLabel       = "prd_label"
 	KeyAutopilotLabel = "autopilot_label"
-	// PRDLESS gate-bypass keys (PRD #22). prdless_enabled stores the text
-	// "true"/"false"; prdless_label is the escape-hatch label name.
-	KeyPrdlessEnabled = "prdless_enabled"
-	KeyPrdlessLabel   = "prdless_label"
+	// KeyUziLabel is the single run-eligibility gate (PRD #764): an issue is
+	// uzi's to run iff it carries this label. Configurable, defaulting to "uzi".
+	// It follows the no-seeded-row pattern (like the judge/health keys):
+	// an absent row synthesizes from Defaults, so no migration seeds it.
+	KeyUziLabel = "uzi_label"
 	// KeyDefaultTheme is the instance-default UI theme (PRD #21). It tenants into
 	// this same table rather than a parallel settings store; its value is a theme
 	// id validated against the canonical theme registry, not a label.
@@ -124,29 +124,12 @@ const (
 	// gate binds at claim, and an empty value is FAIL-CLOSED (a docker worker then
 	// claims no repo-bearing run). Non-docker workers never consult it.
 	KeyDockerRepoAllowlist = "docker_repo_allowlist"
-	// Board membership / run-eligibility label lists (PRD #196). Each is stored as
-	// a comma-separated list of label names, following the KeyDockerRepoAllowlist
-	// precedent (Decision 8): safe because ValidateLabel rejects commas, so the
-	// separator can never collide with a legal label.
-	//
-	// KeyRunEligibleLabels is the ADMIN-only set of labels a human may point uzi at
-	// ("may uzi work this?"). The primary (prd_label) is always in it — the accessor
-	// unions it in — so the run gate can never make the primary non-runnable.
-	// KeyBoardExtraLabels is the admin DEFAULT for the per-user board membership
-	// extras ("which cards do I want to look at?"), applied while a user has no saved
-	// set. Board membership is primary ∪ extras (Decision 2), so extras carry no
-	// primary union — an extra must be removable.
-	// KeyEligibleLabelWaivesPRDLink is an instance-wide bool: an issue eligible by a
-	// NON-primary label does not require a prds/*.md link (Decision 7).
-	KeyRunEligibleLabels          = "run_eligible_labels"
-	KeyBoardExtraLabels           = "board_extra_labels"
-	KeyEligibleLabelWaivesPRDLink = "eligible_label_waives_prd_link"
 	// KeyFindingLabel is the server-mandated marker label attached to every forge
 	// issue filed from an incidental finding (PRD #333 D5). Config-overridable, it is
 	// EnsureLabels-ed to exist before the file write (Forgejo resolves label ids and
 	// errors on an unknown name) and unioned into the filed label set server-side, so a
 	// client can never supply a trigger label that bypasses it. A plain single label, it
-	// takes the Decision-8 label rules like prd_label (Validate's default branch).
+	// takes the Decision-8 label rules (Validate's default branch).
 	KeyFindingLabel = "finding_label"
 	// Agent-source repo sync keys (PRD #602 M2). The admin points uzi at a git
 	// repo of `.md` role files to layer over the embedded builtins. All four are
@@ -239,13 +222,10 @@ const (
 // migrated DB still yields a working label set. They mirror the values the
 // migration seeds and the hardcoded constants the pre-PRD-19 code used.
 const (
-	DefaultPRDLabel       = "PRD"
 	DefaultAutopilotLabel = "autopilot"
-	// PRD #22: on by default (Decision 1). An issue still bypasses the gate only
-	// when it carries the label, so default-on weakens nothing for unlabeled
-	// issues; admins wanting the strict PRD-only regime flip prdless_enabled off.
-	DefaultPrdlessEnabled = "true"
-	DefaultPrdlessLabel   = "PRDLESS"
+	// PRD #764: the single run-eligibility label defaults to "uzi". No-seeded-row
+	// pattern — an absent row synthesizes to this default and no migration adds it.
+	DefaultUziLabel = "uzi"
 	// PRD #25. Slack is off until an admin (or ENV) configures it, so the whole
 	// integration is a strict no-op on a fresh instance. The default deep-link base
 	// only resolves for the laptop's own user; a Tailscale/LAN URL overrides it.
@@ -308,17 +288,8 @@ const (
 	// is a security control: an unconfigured instance never lets a docker worker pick
 	// up an unvetted repo's run.
 	DefaultDockerRepoAllowlist = ""
-	// PRD #196 board membership / run-eligibility defaults (open question 1:
-	// opinionated, `bug` ships in both lists). run_eligible_labels ships PRD,bug so a
-	// bug is runnable out of the box; board_extra_labels ships bug so a board shows
-	// bugs by default. The waiver defaults ON so an admin declaring bug runnable does
-	// not then hit the PRD-link gate. On upgrade these apply to any instance that
-	// never set the key — a run-gate behaviour change called out in the changelog (M5).
-	DefaultRunEligibleLabels          = "PRD,bug"
-	DefaultBoardExtraLabels           = "bug"
-	DefaultEligibleLabelWaivesPRDLink = "true"
-	// PRD #333 D5: the incidental-finding marker defaults to "agent-found", mirroring
-	// prd_label's no-seeded-row pattern (an absent row synthesizes to this default).
+	// PRD #333 D5: the incidental-finding marker defaults to "agent-found", using
+	// the no-seeded-row pattern (an absent row synthesizes to this default).
 	DefaultFindingLabel = "agent-found"
 	// PRD #602 M2 agent-source repo sync. OFF and unconfigured on a fresh instance:
 	// the URL is EMPTY (no canonical product-agents repo is pre-filled — ADR-0602
@@ -387,32 +358,28 @@ const maxMrReworkCap = 100
 // maxLabelLen is Decision 8's length cap (runes, not bytes).
 const maxLabelLen = 64
 
-// maxLabelListLen caps the number of entries in a label list setting (PRD #196
-// run_eligible_labels / board_extra_labels). A generous bound that only catches a
-// runaway paste, enforced in ValidateMerged.
-const maxLabelListLen = 32
-
 // Defaults maps every known key to its compiled-in default. This is the single
 // Go source of the default values: the accessors fall back to it and the
 // migration (00036_app_settings) seeds the same literals. Keep the two in sync —
 // SQL cannot reference these constants, so a change here that should also change
-// the seeded rows needs a follow-up migration. The PRD #22 prdless keys are the
-// exception: they have NO seeded row (Cache.All/Effective synthesize them from
-// these defaults), so an absent row is expected and no migration adds them.
+// the seeded rows needs a follow-up migration. Many keys have NO seeded row
+// (Cache.All/Effective synthesize them from these defaults), so an absent row is
+// expected and no migration adds them.
 // Ranging over Defaults is the canonical way to enumerate the settings the API
 // understands.
 var Defaults = map[string]string{
-	KeyPRDLabel:       DefaultPRDLabel,
 	KeyAutopilotLabel: DefaultAutopilotLabel,
-	KeyPrdlessEnabled: DefaultPrdlessEnabled,
-	KeyPrdlessLabel:   DefaultPrdlessLabel,
+	// PRD #764 single run-eligibility label. No seeded row: an absent row
+	// synthesizes to DefaultUziLabel ("uzi"), so All/AdminView surface it on every
+	// instance and no migration adds it.
+	KeyUziLabel: DefaultUziLabel,
 	// The instance default theme falls back to the registry's Default ("ember"),
 	// so an instance with no seeded row renders exactly as before (PRD #21). No
 	// migration seed is needed — this fallback plus the stable GET shape follow
 	// automatically from the entry here.
 	KeyDefaultTheme: theme.Default,
-	// PRD #25 Slack non-secret keys. Like the prdless keys, they have NO seeded
-	// row: an absent row synthesizes to these defaults, and no migration adds them.
+	// PRD #25 Slack non-secret keys. They have NO seeded row: an absent row
+	// synthesizes to these defaults, and no migration adds them.
 	KeySlackEnabled:  DefaultSlackEnabled,
 	KeyPublicBaseURL: DefaultPublicBaseURL,
 	// PRD #46 admin-writable keys. No seeded row (an absent row synthesizes to these
@@ -456,12 +423,6 @@ var Defaults = map[string]string{
 	// row synthesizes to the empty (fail-closed) default, so All/AdminView surface it
 	// to the settings page on every instance and no migration seeds it.
 	KeyDockerRepoAllowlist: DefaultDockerRepoAllowlist,
-	// PRD #196 board membership / run-eligibility keys. Same no-seeded-row pattern:
-	// an absent row synthesizes to these defaults, so All/AdminView surface them to
-	// the settings page on every instance and no migration seeds them.
-	KeyRunEligibleLabels:          DefaultRunEligibleLabels,
-	KeyBoardExtraLabels:           DefaultBoardExtraLabels,
-	KeyEligibleLabelWaivesPRDLink: DefaultEligibleLabelWaivesPRDLink,
 	// PRD #333 D5 incidental-finding marker. Same no-seeded-row pattern: an absent row
 	// synthesizes to DefaultFindingLabel, so All/AdminView surface it on every instance
 	// and no migration seeds it. Validate's default branch applies the label rules.
@@ -685,48 +646,23 @@ func (c *Cache) IsEnvSourced(key string) bool {
 	return ok && v != ""
 }
 
-// PRDLabel returns the configured PRD label (Decision 1: the first settings
-// tenant). Falls back to DefaultPRDLabel.
-func (c *Cache) PRDLabel(ctx context.Context) (string, error) {
-	return c.get(ctx, KeyPRDLabel)
-}
-
 // AutopilotLabel returns the configured autopilot label. Falls back to
 // DefaultAutopilotLabel.
 func (c *Cache) AutopilotLabel(ctx context.Context) (string, error) {
 	return c.get(ctx, KeyAutopilotLabel)
 }
 
-// PrdlessLabel returns the configured PRDLESS escape-hatch label (PRD #22).
-// Falls back to DefaultPrdlessLabel.
-func (c *Cache) PrdlessLabel(ctx context.Context) (string, error) {
-	return c.get(ctx, KeyPrdlessLabel)
-}
-
-// PrdlessEnabled reports whether the PRDLESS gate-bypass feature is enabled
-// instance-wide (PRD #22, Decision 1). The value is stored as the text
-// "true"/"false"; only those two are honored. Any OTHER value falls back to the
-// compiled-in default (true) rather than silently reading as false — a deliberate
-// junk-tolerance so a malformed value never silently flips a default-on feature
-// off. A cold read error also returns the default (true) alongside the error, so
-// a best-effort caller can ignore err — an unlabeled issue is still gated, since
-// the bypass also requires the label on the fresh snapshot.
-func (c *Cache) PrdlessEnabled(ctx context.Context) (bool, error) {
-	v, err := c.get(ctx, KeyPrdlessEnabled)
-	switch v {
-	case "true":
-		return true, err
-	case "false":
-		return false, err
-	default:
-		return DefaultPrdlessEnabled == "true", err
-	}
+// UziLabel returns the configured run-eligibility label (PRD #764): the single
+// gate deciding whether an issue is uzi's to run. Falls back to DefaultUziLabel
+// ("uzi").
+func (c *Cache) UziLabel(ctx context.Context) (string, error) {
+	return c.get(ctx, KeyUziLabel)
 }
 
 // FindingLabel returns the configured incidental-finding marker label (PRD #333 D5),
 // the server-mandated tag every filed finding issue carries. Falls back to
 // DefaultFindingLabel ("agent-found"). A single label validated by the Decision-8
-// label rules, exactly like PRDLabel.
+// label rules, like the other single-label keys.
 func (c *Cache) FindingLabel(ctx context.Context) (string, error) {
 	return c.get(ctx, KeyFindingLabel)
 }
@@ -739,9 +675,9 @@ func (c *Cache) DefaultTheme(ctx context.Context) (string, error) {
 
 // SlackEnabled reports whether the Slack integration is enabled instance-wide
 // (PRD #25). Stored as the text "true"/"false"; any other value falls back to the
-// compiled-in default (false) rather than silently reading true — the same
-// junk-tolerance as PrdlessEnabled but defaulting OFF, so a malformed value never
-// silently turns the integration on.
+// compiled-in default (false) rather than silently reading true — a deliberate
+// junk-tolerance defaulting OFF, so a malformed value never silently turns the
+// integration on.
 func (c *Cache) SlackEnabled(ctx context.Context) (bool, error) {
 	v, err := c.get(ctx, KeySlackEnabled)
 	switch v {
@@ -771,7 +707,7 @@ type BrandingConfig struct {
 
 // Branding returns the effective branding config (PRD #685 M1), reading each of the
 // seven keys individually through the same ENV-over-DB-over-default precedence every
-// other accessor uses. The two bools apply the PrdlessEnabled junk-tolerance: only
+// other accessor uses. The two bools apply the same junk-tolerance: only
 // "true"/"false" are honored and any other stored value falls back to the compiled-in
 // default rather than silently reading false. A cold-refresh error is returned
 // alongside a defaults-filled struct so a best-effort caller can ignore err.
@@ -1128,7 +1064,7 @@ func (c *Cache) HealthNudgeCooldownSeconds(ctx context.Context) (int, error) {
 // 0 means self-service provisioning is disabled.
 //
 // Its caller (the provision handler) reads it STRICTLY — a non-nil error is a 500,
-// not a fallback — unlike the best-effort `v, _ :=` prdless reads. Those degrade
+// not a fallback — unlike the best-effort `v, _ :=` label reads. Those degrade
 // toward the safe side (an unlabeled issue stays gated); this one would degrade
 // toward provisioning against a number no admin chose, on a cold-cache blip. The
 // junk-tolerance inside intSetting still applies to a hand-edited row, which
@@ -1183,78 +1119,6 @@ func parseRepoAllowlist(v string) []uuid.UUID {
 			continue
 		}
 		out = append(out, id)
-	}
-	return out
-}
-
-// RunEligibleLabels returns the set of labels a human may point uzi at (PRD #196,
-// admin-only). The primary label (prd_label) is ALWAYS unioned in and placed
-// first, deduped — so even a hand-edited row that dropped the primary can never
-// make it non-runnable (fail-safe: the run gate must never refuse the primary).
-// Parsed from the comma-separated run_eligible_labels value; junk-tolerant like
-// the other list accessor. Always non-nil. A cold read error is returned so a
-// strict caller can surface it, alongside the compiled-in default set (the
-// default primary unioned with the default eligible list).
-func (c *Cache) RunEligibleLabels(ctx context.Context) ([]string, error) {
-	primary, err := c.PRDLabel(ctx)
-	v, verr := c.get(ctx, KeyRunEligibleLabels)
-	if err == nil {
-		err = verr
-	}
-	labels := parseLabelList(v)
-	// Union the primary in, first, deduped.
-	out := []string{primary}
-	seen := map[string]struct{}{primary: {}}
-	for _, l := range labels {
-		if _, dup := seen[l]; dup {
-			continue
-		}
-		seen[l] = struct{}{}
-		out = append(out, l)
-	}
-	return out, err
-}
-
-// BoardExtraLabels returns the admin default set of board membership extras (PRD
-// #196), the fallback a client uses while a user has no saved set (per-user
-// storage is M3). No primary union — extras are extras, and board membership is
-// primary ∪ extras (Decision 2), so an extra must be removable. Parsed from the
-// comma-separated board_extra_labels value; always non-nil.
-func (c *Cache) BoardExtraLabels(ctx context.Context) ([]string, error) {
-	v, err := c.get(ctx, KeyBoardExtraLabels)
-	return parseLabelList(v), err
-}
-
-// EligibleLabelWaivesPRDLink reports whether an issue eligible by a NON-primary
-// label may run without a prds/*.md link (PRD #196 Decision 7), instance-wide.
-// Stored as the text "true"/"false"; any other value falls back to the
-// compiled-in default (true) rather than silently reading false — the same
-// junk-tolerance as PrdlessEnabled, so a malformed value never silently flips a
-// default-on gate off.
-func (c *Cache) EligibleLabelWaivesPRDLink(ctx context.Context) (bool, error) {
-	v, err := c.get(ctx, KeyEligibleLabelWaivesPRDLink)
-	switch v {
-	case "true":
-		return true, err
-	case "false":
-		return false, err
-	default:
-		return DefaultEligibleLabelWaivesPRDLink == "true", err
-	}
-}
-
-// parseLabelList splits a comma-separated label list into trimmed, non-empty
-// tokens, preserving order. Always returns a non-nil slice (possibly empty). It
-// deliberately does NOT dedup — deduplication is a merged-validation concern
-// (ValidateMerged), not a parse concern. Mirrors parseRepoAllowlist.
-func parseLabelList(v string) []string {
-	out := []string{}
-	for _, tok := range strings.Split(v, ",") {
-		tok = strings.TrimSpace(tok)
-		if tok == "" {
-			continue
-		}
-		out = append(out, tok)
 	}
 	return out
 }
@@ -1422,8 +1286,8 @@ func Validate(key, value string) error {
 	switch key {
 	case KeyDefaultTheme:
 		return theme.Validate(value)
-	case KeyPrdlessEnabled, KeySlackEnabled, KeyJudgeEnabled, KeyJudgeEnforceAll, KeyHealthEnabled,
-		KeyCapabilityAwareScheduling, KeyEligibleLabelWaivesPRDLink, KeyGithubProjectSyncEnabled,
+	case KeySlackEnabled, KeyJudgeEnabled, KeyJudgeEnforceAll, KeyHealthEnabled,
+		KeyCapabilityAwareScheduling, KeyGithubProjectSyncEnabled,
 		KeyEphemeralWorkersEnabled, KeyAgentSourceEnabled, KeyMrReworkEnabled,
 		KeyAppLogoKeepName, KeyBrandPlaque:
 		return validateBool(value)
@@ -1463,8 +1327,6 @@ func Validate(key, value string) error {
 		return validateHostedWorkerQuota(value)
 	case KeyDockerRepoAllowlist:
 		return validateRepoAllowlist(value)
-	case KeyRunEligibleLabels, KeyBoardExtraLabels:
-		return validateLabelList(value)
 	case KeyPublicBaseURL:
 		return ValidatePublicBaseURL(value)
 	case KeySlackBotToken:
@@ -1477,7 +1339,7 @@ func Validate(key, value string) error {
 	case KeyAgentSourceCredential:
 		return validateAgentSourceCredential(value)
 	default:
-		// The label keys (prd_label, autopilot_label, prdless_label) all use the
+		// The label keys (uzi_label, autopilot_label, finding_label) all use the
 		// Decision 8 label rules; cross-key distinctness is ValidateMerged's job.
 		return ValidateLabel(value)
 	}
@@ -1691,9 +1553,9 @@ func ValidatePublicBaseURL(value string) error {
 	return nil
 }
 
-// validateBool is the strict on/off parse for a boolean setting (PRD #22): exactly
+// validateBool is the strict on/off parse for a boolean setting: exactly
 // "true" or "false", nothing else (no "1"/"yes"/case variants), so a stored
-// prdless_enabled is always one of the two values the typed accessor honors.
+// bool setting is always one of the two values the typed accessor honors.
 func validateBool(value string) error {
 	if value != "true" && value != "false" {
 		return errors.New(`must be "true" or "false"`)
@@ -1877,29 +1739,6 @@ func validateRepoAllowlist(value string) error {
 	return nil
 }
 
-// validateLabelList is the write-time gate for a comma-separated label list (PRD
-// #196 run_eligible_labels / board_extra_labels). Empty is allowed — it is the "no
-// extras" value, and the eligible-set's must-contain-primary rule is enforced in
-// ValidateMerged, not here. Each non-empty token must pass ValidateLabel; a
-// malformed token fails the WRITE, the only moment a human is present to be told.
-//
-// Like validateRepoAllowlist, this MUST have an explicit Validate case: the
-// default branch falls through to ValidateLabel, which REJECTS the comma that a
-// two-or-more label list requires — so without this case a valid multi-label list
-// could never be saved at all.
-func validateLabelList(value string) error {
-	for _, tok := range strings.Split(value, ",") {
-		tok = strings.TrimSpace(tok)
-		if tok == "" {
-			continue
-		}
-		if err := ValidateLabel(tok); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // ValidateLabel checks a single label value against Decision 8's per-value
 // rules: non-empty, at most 64 characters, and no comma (GitLab's label-list
 // separator). It does not trim: a value with surrounding whitespace would not
@@ -1919,23 +1758,16 @@ func ValidateLabel(value string) error {
 }
 
 // LabelChanged reports whether any submitted setting that affects which issues a
-// board shows actually changed value: a board-filtering label (prd_label or
+// board shows actually changed value: a board-filtering label (uzi_label or
 // autopilot_label) in updates whose value differs from committed. The settings PUT
 // uses it to decide whether to force a full repo resync. Only those two keys
 // re-filter a board, so the check is a whitelist — every other key
-// (default_theme presentation-only, the prdless gate keys, the PRD #25 slack keys)
-// is ignored, and a secret key's plaintext never participates. An idempotent write
-// (same value) returns false, matching the prior "only resync on a real change".
-//
-// The PRD #196 list keys (run_eligible_labels, board_extra_labels) are
-// DELIBERATELY omitted: the sync fetch (forgesvc) reads only the primary label,
-// with ANDed forge semantics, so a resync triggered by these keys would fetch
-// nothing new and is pointless — and adding them here is exactly how the
-// ANDed-fetch eviction defect gets re-opened from the other end (PRD #196
-// Decision 5). Their write path must never force a resync.
+// (default_theme presentation-only, the PRD #25 slack keys) is ignored, and a
+// secret key's plaintext never participates. An idempotent write (same value)
+// returns false, matching the prior "only resync on a real change".
 func LabelChanged(committed, updates map[string]string) bool {
 	for k, v := range updates {
-		if k != KeyPRDLabel && k != KeyAutopilotLabel {
+		if k != KeyUziLabel && k != KeyAutopilotLabel {
 			continue
 		}
 		if committed[k] != v {
@@ -1947,55 +1779,39 @@ func LabelChanged(committed, updates map[string]string) bool {
 
 // ValidateMerged enforces the cross-key label rules on the effective post-update
 // state (current values overlaid with the pending update), so a PUT touching one
-// key is still checked against the others' stored values. The label triple —
-// prd_label, autopilot_label, prdless_label — must be pairwise-distinct (Decision 8
-// + PRD #22 Decision 7): equal prd/autopilot would autopilot every PRD issue; a
-// prdless label equal to prd_label would exempt every issue from the gate, equal to
-// autopilot_label would conflate "hands-off" with "spec-less". prdless distinctness
-// is enforced REGARDLESS of prdless_enabled — this map carries no toggle state — so
-// a disabled-but-colliding label must be renamed before the colliding prd/autopilot
-// value can be saved, keeping a later re-enable always safe. Each error names the
+// key is still checked against the others' stored values. PRD #764: the
+// run-eligibility label (uzi_label) must be distinct from the autopilot label — an
+// equal pair would autopilot every runnable issue, conflating "uzi's to run" with
+// "skip the plan gate" — and from the finding label (see below). Each error names the
 // key to change.
+// reservedSelfImproveLabel is the self-improve tracker's label. Its canonical home is
+// schedsvc.SelfImproveTrackingLabel; settings cannot import schedsvc (schedsvc imports
+// settings), so the value is mirrored here and pinned to the canonical one by an external
+// test so the two cannot drift. See ValidateMerged.
+const reservedSelfImproveLabel = "uzi-self-improve"
+
 func ValidateMerged(merged map[string]string) error {
-	if merged[KeyPRDLabel] == merged[KeyAutopilotLabel] {
-		return errors.New("prd_label and autopilot_label must differ")
+	if merged[KeyUziLabel] == merged[KeyAutopilotLabel] {
+		return errors.New("uzi_label must differ from autopilot_label")
 	}
-	if merged[KeyPrdlessLabel] == merged[KeyPRDLabel] {
-		return errors.New("prdless_label must differ from prd_label")
+	// PRD #764 hardening: uzi_label must also differ from finding_label, the marker uzi
+	// stamps on issues it auto-files for incidental findings. If the two were equal, a
+	// uzi-filed finding issue would carry the eligibility label, and an empty-selector
+	// schedule (which defaults to [uzi_label]) could select and auto-run it. Before #764
+	// a run ALSO needed a PRD link / PRDLESS / waiver — which finding issues lack — so
+	// the collision was inert; #764 removed that backstop, so the distinctness that
+	// guards eligibility must be enforced here. (Defaults uzi/agent-found are distinct.)
+	if merged[KeyUziLabel] == merged[KeyFindingLabel] {
+		return errors.New("uzi_label must differ from finding_label")
 	}
-	if merged[KeyPrdlessLabel] == merged[KeyAutopilotLabel] {
-		return errors.New("prdless_label must differ from autopilot_label")
-	}
-
-	// PRD #196 list-key cross-checks on the effective post-update state. Parse both
-	// lists from the merged map (no dedup at parse time — dedup is checked here).
-	eligible := parseLabelList(merged[KeyRunEligibleLabels])
-	extras := parseLabelList(merged[KeyBoardExtraLabels])
-
-	// The primary is always eligible (Decision 1: the run gate must never make the
-	// primary non-runnable). We UNION it into the effective eligible set here rather
-	// than rejecting a set that omits it. A hard "must contain the primary" check
-	// wedges every settings PUT on an instance that renamed prd_label: the compiled-in
-	// default is the literal "PRD,bug", so on such an instance the effective eligible
-	// set never contains the renamed primary, and an unrelated change (e.g.
-	// default_theme) would be rejected because it re-validates the whole merged state.
-	// The accessor (RunEligibleLabels) unions the primary in for the same fail-safe
-	// reason, so a stored set missing it is harmless; the AdminSettings UI additionally
-	// pins the primary so a normal save always carries it. Union before the structural
-	// checks so the dedup/cap counts reflect what the accessor will actually return.
-	primary := merged[KeyPRDLabel]
-	if !containsLabel(eligible, primary) {
-		eligible = append([]string{primary}, eligible...)
-	}
-
-	// Each list: no duplicates, at most maxLabelListLen entries, and no entry equal
-	// to a workflow marker (autopilot_label / prdless_label) — those are never
-	// membership or eligibility content (mock §5).
-	if err := validateLabelListMerged(KeyRunEligibleLabels, eligible, merged); err != nil {
-		return err
-	}
-	if err := validateLabelListMerged(KeyBoardExtraLabels, extras, merged); err != nil {
-		return err
+	// Same class: uzi_label must not be the self-improve tracker's reserved label. The
+	// tracker is uzi's own bookkeeping issue, deliberately non-runnable; if the
+	// eligibility label equalled it, the board would offer "Start run" on the tracker and
+	// CreateRun (which checks only uzi_label) would accept it. reservedSelfImproveLabel
+	// mirrors schedsvc.SelfImproveTrackingLabel (settings cannot import schedsvc — a
+	// cycle), pinned to the canonical value by TestReservedSelfImproveLabelMatchesSchedsvc.
+	if merged[KeyUziLabel] == reservedSelfImproveLabel {
+		return errors.New(`uzi_label must not be "uzi-self-improve" (the self-improve tracker's reserved label, which must never be runnable)`)
 	}
 
 	// PRD #602 M2: an ENABLED agent source must carry both a URL and a ref. This is
@@ -2014,38 +1830,4 @@ func ValidateMerged(merged map[string]string) error {
 		}
 	}
 	return nil
-}
-
-// validateLabelListMerged enforces the cross-key structural rules on a parsed
-// label list (PRD #196): no duplicate entries, at most maxLabelListLen entries,
-// and no entry equal to autopilot_label or prdless_label (the workflow markers are
-// never membership/eligibility content). Errors name the key to change.
-func validateLabelListMerged(key string, list []string, merged map[string]string) error {
-	if len(list) > maxLabelListLen {
-		return fmt.Errorf("%s must have at most %d entries", key, maxLabelListLen)
-	}
-	seen := make(map[string]struct{}, len(list))
-	for _, l := range list {
-		if _, dup := seen[l]; dup {
-			return fmt.Errorf("%s must not contain duplicate entries (%q)", key, l)
-		}
-		seen[l] = struct{}{}
-		if l == merged[KeyAutopilotLabel] {
-			return fmt.Errorf("%s must not contain the autopilot label %q", key, l)
-		}
-		if l == merged[KeyPrdlessLabel] {
-			return fmt.Errorf("%s must not contain the prdless label %q", key, l)
-		}
-	}
-	return nil
-}
-
-// containsLabel reports whether list contains target.
-func containsLabel(list []string, target string) bool {
-	for _, l := range list {
-		if l == target {
-			return true
-		}
-	}
-	return false
 }

@@ -19,7 +19,6 @@ import { SCHEDULE_SKIP_REASON_LABELS, scheduleSkipReasonLabel } from "./schedule
 // web/src/lib/ directory and reads "../api/..." for exactly that reason, so "../api/..."
 // resolves to the repo-root api/ here too.
 const ALL_SCHEDULE_SKIP_REASONS: ScheduleSkipReason[] = [
-  "no_prd_link",
   "not_eligible",
   "already_running",
   "description_too_large",

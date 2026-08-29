@@ -135,10 +135,11 @@ func (s *Service) patchOnePRDLink(ctx context.Context, forgeProjectID int64, f f
 	// integrity, not security. Tightening it further is a design question rather
 	// than a fix: uzi has no notion of THE PRD when an issue links several.
 	//
-	// This gate ALSO makes Decision 12's PRDLESS no-op mechanical rather than
-	// prompt-level: a PRDLESS run's snapshot carries no PRD link, so `linked` is
-	// empty and no forge write can happen even if the lead declares a path anyway.
-	// It is therefore load-bearing for TWO independent decisions. Weakening it to
+	// This gate ALSO makes Decision 12's no-op for a link-less run mechanical rather
+	// than prompt-level: a run on an issue with no PRD link has a snapshot with no PRD
+	// link, so `linked` is empty and no forge write can happen even if the lead
+	// declares a path anyway (PRD #764 made a PRD link optional, so this is the common
+	// case now). It is therefore load-bearing for TWO independent decisions. Weakening it to
 	// "the path just has to look like a PRD path" would silently revert Decision 12
 	// to prompt-only enforcement while appearing to touch only the target choice.
 	//

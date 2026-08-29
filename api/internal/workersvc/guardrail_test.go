@@ -76,14 +76,14 @@ func TestCreateRunGuardrailBlocksBeforeInsert(t *testing.T) {
 	user, repo := uuid.New(), uuid.New()
 	fs := &fakeStore{
 		repoRow:         aValidRepoRow(),
-		issueByID:       store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true},
+		issueByID:       store.Issue{Title: "T", Labels: uziLabels(), HasPrdLink: true},
 		createRunResult: store.Run{ID: uuid.New()},
 	}
 	guard, wantMsgs := blockedGuard()
 	svc := New(fs, newBox(t), testParams())
 	svc.SetRepoGuard(guard)
 
-	_, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", false, nil, nil)
+	_, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil)
 	assertGuardrailBlocked(t, err, wantMsgs)
 	if guard.called != 1 {
 		t.Fatalf("guard called %d times, want 1", guard.called)
@@ -177,14 +177,14 @@ func TestCreateRunNotBlockedGuardProceeds(t *testing.T) {
 	user, repo := uuid.New(), uuid.New()
 	fs := &fakeStore{
 		repoRow:         aValidRepoRow(),
-		issueByID:       store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true},
+		issueByID:       store.Issue{Title: "T", Labels: uziLabels(), HasPrdLink: true},
 		createRunResult: store.Run{ID: uuid.New()},
 	}
 	guard := &fakeGuard{res: privcheck.GuardResult{Blocked: false}}
 	svc := New(fs, newBox(t), testParams())
 	svc.SetRepoGuard(guard)
 
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", false, nil, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil); err != nil {
 		t.Fatalf("CreateRun with a clearing guard: %v", err)
 	}
 	if guard.called != 1 {
@@ -322,14 +322,14 @@ func TestCreateRunThreadsOverriddenFromRow(t *testing.T) {
 			row.GuardrailOverrideReason = tc.reason
 			fs := &fakeStore{
 				repoRow:         row,
-				issueByID:       store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true},
+				issueByID:       store.Issue{Title: "T", Labels: uziLabels(), HasPrdLink: true},
 				createRunResult: store.Run{ID: uuid.New()},
 			}
 			guard := &fakeGuard{res: privcheck.GuardResult{Blocked: false}}
 			svc := New(fs, newBox(t), testParams())
 			svc.SetRepoGuard(guard)
 
-			if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", false, nil, nil); err != nil {
+			if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			if guard.lastInput.Overridden != tc.wantOverr {
@@ -375,12 +375,12 @@ func TestCreateRunNilGuardNotBlocked(t *testing.T) {
 	user, repo := uuid.New(), uuid.New()
 	fs := &fakeStore{
 		repoRow:         aValidRepoRow(),
-		issueByID:       store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true},
+		issueByID:       store.Issue{Title: "T", Labels: uziLabels(), HasPrdLink: true},
 		createRunResult: store.Run{ID: uuid.New()},
 	}
 	svc := New(fs, newBox(t), testParams()) // SetRepoGuard deliberately not called
 
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", false, nil, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil); err != nil {
 		t.Fatalf("CreateRun with a nil guard must not be guardrail-blocked: %v", err)
 	}
 	if fs.createRunParams == nil {

@@ -31,7 +31,7 @@ const forgejoMinVersion = "v16.0.0"
 const forgejoPerPage = 50
 
 // forgejoDefaultLabelColor is used when EnsureLabels is handed a label with no
-// color. uzi's callers always pin one (board columns, PrdlessLabelColor), but
+// color. uzi's callers always pin one (board columns, PromoteLabelColor), but
 // Forgejo's CreateLabel rejects an empty color outright (its client-side
 // validator requires a 6-hex value), where GitLab lets the server assign one —
 // so the driver supplies a neutral default rather than fail a label create.

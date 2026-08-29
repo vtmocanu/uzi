@@ -2,7 +2,7 @@
 
 **Issue**: #764
 **Priority**: Medium
-**Status**: Draft
+**Status**: Done (2026-08-29)
 
 ## Problem
 
@@ -119,7 +119,7 @@ drift found); re-derive line numbers at implementation time.
 
 ## Milestones
 
-- [ ] **M1 — `uzi` becomes the single eligibility gate (server).** Add a configurable `uzi_label`
+- [x] **M1 — `uzi` becomes the single eligibility gate (server).** Add a configurable `uzi_label`
   setting (default `uzi`), with distinctness validation against `autopilot_label` and a rule for
   whether `uzi` may appear in any remaining label list, shipped to the SPA bootstrap
   (`auth.go:400-413`). In `workersvc.createRun`, **Gate A becomes "carries `uzi_label`"** and
@@ -132,7 +132,7 @@ drift found); re-derive line numbers at implementation time.
   carrying only `uzi` (no PRD, no PRDLESS) starts a run on every path; an issue without `uzi` is
   refused with the new message; the four-path tests fail on the pre-change binary.
 
-- [ ] **M2 — PRD optional but still detected, implemented, and signalled.** Confirm `HasPRDLink`
+- [x] **M2 — PRD optional but still detected, implemented, and signalled.** Confirm `HasPRDLink`
   detection is unchanged and label-independent, so a linked PRD is still found; keep the agent's
   "implement/update the linked `prds/*.md`" behavior when a link is present (guard with a test) and
   confirm a run with no link proceeds cleanly. The board badge **reuses the existing
@@ -141,7 +141,7 @@ drift found); re-derive line numbers at implementation time.
   falsifiable surface here). *Success*: a `uzi` run with a PRD link opens/updates the PRD exactly
   as today; a `uzi` run without one completes; the runs DTO exposes PRD presence for the UI.
 
-- [ ] **M3 — Sweeps: `Planned`/`bug` are pure selectors, gated by `uzi`.** Leave the selector
+- [x] **M3 — Sweeps: `Planned`/`bug` are pure selectors, gated by `uzi`.** Leave the selector
   query unchanged; fireability inherits M1, so a candidate fires iff it carries `uzi`. `bug` keeps
   its selector role but loses any eligibility role (it is no longer in an eligible-set — that set
   is gone with M1). **Lead tests with the discriminating, fail-pre-change cases**: a `bug`+`uzi`
@@ -154,7 +154,7 @@ drift found); re-derive line numbers at implementation time.
   live sweeps (`bug`, `Planned`) fire a candidate only when it also carries `uzi`; the discriminating
   fire-cases fail on the pre-change binary; a bare selector issue skips without erroring the schedule.
 
-- [ ] **M4 — Web: `uzi` filter + PRD badge; remove PRDLESS UI.** Board keeps rendering all open
+- [x] **M4 — Web: `uzi` filter + PRD badge; remove PRDLESS UI.** Board keeps rendering all open
   issues (unchanged). The client toggle becomes `uzi`-only / all (was PRD / all), and each card
   shows a runnable marker = has `uzi`. Add a neutral **"PRD" presence badge** (from `has_prd_link`)
   on the board card **and** the runs view. **Remove** the PRDLESS toggle, the "no PRD link"
@@ -167,7 +167,7 @@ drift found); re-derive line numbers at implementation time.
   `run get`). *Success*: a user can filter the board to `uzi` issues and see at a glance which runs
   have a PRD; the PRDLESS/no-link UI is gone with no vacuous negative assertions left behind.
 
-- [ ] **M5 — Tear out the old model end-to-end, fix messaging, migrate our labels, close out.**
+- [x] **M5 — Tear out the old model end-to-end, fix messaging, migrate our labels, close out.**
   Delete the now-dead settings and their accessors/validation: `prdless_enabled`, `prdless_label`,
   `eligible_label_waives_prd_link`, `run_eligible_labels`, `board_extra_labels`, and the
   `PRD`-label special-casing (`prd_label`) — PRD-ness is detected purely from the body link, and

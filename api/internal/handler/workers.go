@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
@@ -363,10 +364,16 @@ func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
 		Kind:             r.Kind,
 		IssueTitle:       r.IssueTitle,
 		IssueDescription: r.IssueDescription,
-		Title:            textPtrValue(r.Title.Valid, r.Title.String),
-		Status:           r.Status,
-		RequeueCount:     r.RequeueCount,
-		IterationCount:   r.IterationCount,
+		// PRD #764 M2: server-computed PRD presence for the runs view, derived
+		// label-independently from the snapshotted issue description via the same
+		// detector the board card uses. Only issue-backed runs can link a PRD, so an
+		// issue-less run (chat / self-improve) whose description happens to mention a
+		// prds/*.md path never shows a spurious PRD badge.
+		HasPRDLink:     r.IssueIid.Valid && forgesvc.HasPRDLink(r.IssueDescription),
+		Title:          textPtrValue(r.Title.Valid, r.Title.String),
+		Status:         r.Status,
+		RequeueCount:   r.RequeueCount,
+		IterationCount: r.IterationCount,
 		IsPlanning: isPlanningPhase(r.Kind, r.Status, r.IterationCount,
 			r.PlanMd.Valid && strings.TrimSpace(r.PlanMd.String) != ""),
 		AutoApprove: r.AutoApprove,
@@ -911,8 +918,9 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The forge GetIssue snapshot, the PRDLESS gate and the description cap all live
-	// inside StartRunForUser (PRD #191 M1), shared with the Slack/web chat start-run card.
+	// The forge GetIssue snapshot, the uzi-label eligibility gate and the description
+	// cap all live inside StartRunForUser (PRD #191 M1), shared with the Slack/web chat
+	// start-run card.
 	run, err := h.wsvc.StartRunForUser(r.Context(), user.ID, repo.ID, req.IssueIID, req.WaitOnLimit, seed)
 	if err != nil {
 		h.writeStartRunError(w, r, err)
@@ -1047,21 +1055,12 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 	case errors.Is(err, workersvc.ErrInvalidSelection):
 		httpx.Error(w, http.StatusBadRequest, "invalid agent selection: "+err.Error())
 	case errors.Is(err, workersvc.ErrNotPRDIssue):
-		// PRD #102 Decision 14. Named separately from ErrNoPRDLink and BEFORE it: telling
-		// someone to add a prds/*.md link to an issue that is not uzi's work sends them to
-		// fix the wrong thing. Promote is the action this hint names.
-		prdLabel, _ := h.settings.PRDLabel(r.Context())
+		// PRD #764: the single run-eligibility gate. An issue without the uzi_label is
+		// not uzi's to run — tell the user to add it. A PRD link is no longer required,
+		// so this is the only eligibility refusal.
+		uziLabel, _ := h.settings.UziLabel(r.Context())
 		httpx.Error(w, http.StatusUnprocessableEntity,
-			fmt.Sprintf("this issue does not carry the %s label; promote it before starting a run", prdLabel))
-	case errors.Is(err, workersvc.ErrNoPRDLink):
-		// Extend the hint with the escape-hatch label only when the feature is enabled
-		// instance-wide, so a strict-regime instance never advertises it.
-		msg := "issue has no PRD link; add a prds/*.md link before starting a run"
-		if prdlessEnabled, _ := h.settings.PrdlessEnabled(r.Context()); prdlessEnabled {
-			prdlessLabel, _ := h.settings.PrdlessLabel(r.Context())
-			msg = fmt.Sprintf("issue has no PRD link; add a prds/*.md link (or the %s label) before starting a run", prdlessLabel)
-		}
-		httpx.Error(w, http.StatusUnprocessableEntity, msg)
+			fmt.Sprintf("this issue does not carry the %s label; add it before starting a run", uziLabel))
 	case errors.Is(err, workersvc.ErrTaskBaseBranchTooLong):
 		// PRD #400: the optional base_branch exceeded its dedicated cap. A caller error
 		// (a git ref cannot legitimately be this long) → 400.

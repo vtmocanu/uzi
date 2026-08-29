@@ -50,6 +50,11 @@ type RunDTO struct {
 	IssueIID         *int64 `json:"issue_iid"`
 	IssueTitle       string `json:"issue_title"`
 	IssueDescription string `json:"issue_description"`
+	// HasPRDLink is server-computed PRD presence for the runs view (PRD #764),
+	// derived label-independently from the run's snapshotted issue description via
+	// the same detector the board card uses (forgesvc.HasPRDLink). False for
+	// issue-less run kinds (chat/ci_fix/etc.) whose description carries no prds link.
+	HasPRDLink bool `json:"has_prd_link"`
 	// Title is the chat conversation's display title (PRD #39), null for
 	// issue/ci_fix runs. ResumeOfRunID points a Continue chat at the ended chat it
 	// resumes (Decision 11), null otherwise.

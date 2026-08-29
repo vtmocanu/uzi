@@ -9,7 +9,6 @@
 import type { ScheduleSkipReason } from "./api";
 
 export const SCHEDULE_SKIP_REASON_LABELS: Record<ScheduleSkipReason, string> = {
-  no_prd_link: "no PRD link",
   not_eligible: "not eligible",
   already_running: "already running",
   description_too_large: "description too large",

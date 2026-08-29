@@ -4,27 +4,29 @@
 -- manual board Refresh and must never spawn runs (review finding B3).
 
 -- name: ListAutopilotCandidateIssues :many
--- Open cached issues in a repo carrying BOTH the autopilot label and the PRD label
--- (Decision 8: an autopilot label without the PRD label is invisible to uzi).
+-- Open cached issues in a repo carrying BOTH the autopilot label and the uzi
+-- run-eligibility label (PRD #764: an autopilot label without the uzi label is
+-- invisible to uzi).
 --
--- The PRD predicate is explicit as of PRD #102 M6. This comment used to say the
--- cache holds only PRD-labelled issues, so a match on the autopilot label already
--- implied the PRD one — true while the sync filter was the only way into the cache,
--- and false the moment M6's additive fetch started caching every OPEN issue
--- regardless of label. Without the predicate a stranger's issue carrying the
--- autopilot label becomes a candidate here, and the detector then either starts an
--- unattended run on it or posts a comment on it.
+-- The uzi predicate is explicit as of PRD #102 M6 (keyed on the PRD label there,
+-- repointed to the uzi label by PRD #764 D7 when the PRD label lost its special
+-- meaning). This comment used to say the cache holds only labelled issues, so a
+-- match on the autopilot label already implied the eligibility one — true while the
+-- sync filter was the only way into the cache, and false the moment M6's additive
+-- fetch started caching every OPEN issue regardless of label. Without the predicate
+-- a stranger's issue carrying the autopilot label becomes a candidate here, and the
+-- detector then either starts an unattended run on it or posts a comment on it.
 --
 -- Closed issues are excluded — autopilot only drives forward progress on open work.
--- author rides along for the adder→author attribution fallback (Decision 3);
--- has_prd_link and the PRD label are BOTH re-checked by the shared run-create path,
--- which is the enforcement point. This predicate is what stops the detector doing
--- forge work (a label-events read, a comment) on issues that were never uzi's.
+-- author rides along for the adder→author attribution fallback (Decision 3); the
+-- uzi label is re-checked by the shared run-create path, which is the enforcement
+-- point. This predicate is what stops the detector doing forge work (a label-events
+-- read, a comment) on issues that were never uzi's.
 SELECT forge_issue_iid, author
 FROM issues
 WHERE repo_id = @repo_id AND state = 'opened'
   AND jsonb_exists(labels, @label)
-  AND jsonb_exists(labels, @prd_label)
+  AND jsonb_exists(labels, @uzi_label)
 ORDER BY forge_issue_iid ASC;
 
 -- name: GetAutopilotConnectionContext :one

@@ -50,7 +50,7 @@ Tracked as GitLab issue vtmocanu/uzi#2; PRD at `prds/done/2-forge-integration-ka
 - Repo list + picker in the UI.
 - Per-repo kanban board, columns = GitLab labels, kept in two-way sync between uzi and GitLab.
   - Reference: an internal board (label-as-column example); kan.bn (UI style).
-- Board/agents work only issues carrying the `PRD` label, sanity-checked to contain a link to the PRD file.
+- Board/agents work only issues carrying the `PRD` label, sanity-checked to contain a link to the PRD file. [superseded — see Feature #22: run-eligibility is now the single `uzi` label and the PRD link is optional (PRD #764) (AI-synced 2026-08-29)]
 
 ## Feature #3 — Agent templates & per-user Anthropic token
 
@@ -192,6 +192,7 @@ Tracked as GitLab issue vtmocanu/uzi#19; PRD at `prds/done/19-admin-settings-and
 - Generic admin-only instance-settings infrastructure; the PRD label and the autopilot label are its first two configurable keys.
 - Admins can change the PRD label and the autopilot label; the board reflects the new label set after a resync (no code fork).
 - Autopilot: adding the autopilot label (alongside the PRD label) to an issue in GitLab runs it end to end with zero uzi interaction.
+- (AI-synced 2026-08-29) PRD #764 removed the `prd_label` setting (and its special-casing) and added a configurable `uzi_label` (default `uzi`) as the single run-eligibility key; autopilot now rides alongside `uzi`, not `PRD`. The generic admin-settings infrastructure and the configurable `autopilot_label` are unchanged.
 - Progress is visible via the existing board label moves; the user need never open uzi.
 - Outcome returns as one GitLab issue comment: MR link on success; on failure, one comment with a run link.
 - Consent is per-user opt-in, default off — a third party must never be able to spend your Anthropic tokens without your opt-in.
@@ -209,15 +210,14 @@ Tracked as GitLab issue vtmocanu/uzi#21; PRD at `prds/done/21-mission-control-th
 - Theme settings tenant into PRD #19's `app_settings` — no parallel settings table. [user-approved 2026-07-05, "update 21, 19 is in flight"]
 - Mock demo persists settings across reload (settings-only). [user approved 2026-07-05]
 
-## Feature #22 — PRDLESS label: run an issue without a PRD link
+## Feature #22 — PRDLESS label (RETIRED by PRD #764)
 
 Tracked as GitLab issue vtmocanu/uzi#22; PRD at `prds/done/22-prdless-label.md`.
 
-- An escape-hatch label lets an issue run without a `prds/*.md` link.
-- Label name is configurable; the feature can be toggled on/off — both in admin settings.
-- Enabled by default (available out of the box).
-- Default label name: `PRDLESS`.
-- The label can be added/removed directly from the uzi web UI, not only in GitLab.
+- RETIRED: the `PRDLESS` escape-hatch label and the whole PRD-link requirement it bypassed were removed end-to-end by PRD #764. (AI-synced 2026-08-29)
+- New binding reality (PRD #764): run-eligibility is the single configurable `uzi` label (default `uzi`) — label an issue `uzi` and it is runnable. (AI-synced 2026-08-29)
+- A `prds/*.md` link is OPTIONAL — still auto-detected, implemented when present, and shown as a PRD-presence badge, but never required to start a run. (AI-synced 2026-08-29)
+- Also removed with `PRDLESS`: the `eligible_label_waives_prd_link` waiver, the `run_eligible_labels`/`board_extra_labels` sets, and the `prd_label` special-casing. `Planned`/`bug` stay sweep selectors that fire only when the issue also carries `uzi`; `autopilot` is unchanged. (AI-synced 2026-08-29)
 
 ## Feature #23 — Web UX polish: live dashboard, collapsible sidebar, hide empty board columns
 
@@ -347,9 +347,9 @@ Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/done/46-run-judge-self-imp
 - **File a recommendation as a forge issue** (vtmocanu/uzi#68): each recommendation
   gets a File-issue button; the human picks which one to file, reviews an
   API-templated editable draft (no extra LLM call, no Anthropic token), and files
-  it. The issue is labelled to land on the board (`PRD`+`PRDLESS`) but **never
-  auto-starts** (no `autopilot`) — filing an issue and spending tokens on a run
-  stay separate human decisions. [user 2026-07-17]
+  it. The issue is labelled to be runnable (the `uzi` label — was `PRD`+`PRDLESS`
+  before PRD #764) but **never auto-starts** (no `autopilot`) — filing an issue and
+  spending tokens on a run stay separate human decisions. [user 2026-07-17] (AI-synced 2026-08-29: PRDLESS retired by PRD #764)
 - **Admin may file** another user's recommendation (kept, not restricted to the
   owner), conditioned on **prominent provenance** showing whose worker produced
   the (attacker-influencable) text. [user 2026-07-17]
@@ -532,13 +532,13 @@ Tracked as GitLab issue vtmocanu/uzi#102; PRD at `prds/done/102-board-v2.md`.
 
 - The implicit no-label column is called `Backlog`, not `Open`. Display only; it is not a forge label. [user 2026-07-20]
 - The seeded `Upcoming` column label is renamed `Planned` and seeds first, before In Progress: Backlog | Planned | In Progress | Human Review | Later. Existing boards are not migrated automatically. [user 2026-07-20]
-- Cards show their other labels (e.g. `bug`) as chips. Workflow labels (`PRD`, `PRDLESS`, autopilot) and the card's own column label are not shown. [user 2026-07-20]
+- Cards show their other labels (e.g. `bug`) as chips. The autopilot label and the card's own column label are not shown; the `uzi` run-eligibility label IS shown, hoisted ahead of the other chips and highlighted as the runnable marker. [user 2026-07-20] (AI-synced 2026-08-29: PRD #764 makes `uzi` the run-eligibility marker, shown and highlighted rather than hidden; `PRDLESS` retired. Chip exclusions are autopilot + column labels only.)
 - Cards can be hand-ordered within a column. The order is shared between users, and is uzi's own, not stored on the forge. [user 2026-07-20]
 - A per-user toggle shows open issues that lack the `PRD` label, so the board can be used to see untriaged work. Off by default. [user 2026-07-20]
   - Non-PRD cards are visually distinct and cannot start runs.
   - They move between columns like any other card (including into In Progress).
   - A `Promote` action adds the `PRD` label, making the card a normal one.
-- Authorized behavior change: the board can also DISPLAY open issues without the `PRD` label (opt-in, off by default); agents still work only `PRD`-labeled issues. [user 2026-07-20, narrows the Feature #2 line "Board/agents work only issues carrying the `PRD` label"]
+- Authorized behavior change: the board can also DISPLAY open issues without the `PRD` label (opt-in, off by default); agents still work only `PRD`-labeled issues. [user 2026-07-20, narrows the Feature #2 line "Board/agents work only issues carrying the `PRD` label"] [superseded by PRD #764: agents work issues carrying the single `uzi` label; the board still shows all open issues and the toggle/Promote now key on `uzi` (AI-synced 2026-08-29)]
 
 ## Feature #113 — Worker upgrade & version health
 

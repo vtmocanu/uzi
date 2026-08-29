@@ -69,20 +69,20 @@ func apCandidateFixture(ctx context.Context, t *testing.T) (*store.Queries, uuid
 			 VALUES ($1, $2, 't', $3, $4::jsonb, 'https://x', true, now(), now())`,
 			repoID, iid, state, labels)
 	}
-	seed(10, "opened", `["PRD","autopilot"]`) // the only candidate
+	seed(10, "opened", `["uzi","autopilot"]`) // the only candidate
 	seed(20, "opened", `["autopilot"]`)       // Decision 11b's accident: not uzi's issue
-	seed(30, "opened", `["PRD"]`)             // uzi's, but not autopiloted
-	seed(40, "closed", `["PRD","autopilot"]`) // closed: autopilot drives open work only
-	seed(70, "opened", `["bug","autopilot"]`) // PRD #196: run-eligible by a NON-PRIMARY label, but NOT the primary
+	seed(30, "opened", `["uzi"]`)             // uzi's, but not autopiloted
+	seed(40, "closed", `["uzi","autopilot"]`) // closed: autopilot drives open work only
+	seed(70, "opened", `["bug","autopilot"]`) // a bug selector + autopilot, but NOT the uzi label
 	return store.New(pool), repoID
 }
 
-func candidateIIDs(t *testing.T, q *store.Queries, repoID uuid.UUID, autopilotLabel, prdLabel string) []int64 {
+func candidateIIDs(t *testing.T, q *store.Queries, repoID uuid.UUID, autopilotLabel, uziLabel string) []int64 {
 	t.Helper()
 	rows, err := q.ListAutopilotCandidateIssues(context.Background(), store.ListAutopilotCandidateIssuesParams{
 		RepoID:   repoID,
 		Label:    autopilotLabel,
-		PrdLabel: prdLabel,
+		UziLabel: uziLabel,
 	})
 	if err != nil {
 		t.Fatalf("ListAutopilotCandidateIssues: %v", err)
@@ -98,38 +98,36 @@ func TestAutopilotCandidatesRequireBothLabelsLiveDB(t *testing.T) {
 	ctx := context.Background()
 	q, repoID := apCandidateFixture(ctx, t)
 
-	got := candidateIIDs(t, q, repoID, "autopilot", "PRD")
+	got := candidateIIDs(t, q, repoID, "autopilot", "uzi")
 	if len(got) != 1 || got[0] != 10 {
 		t.Fatalf("candidates = %v, want [10] only; 20 is an autopilot-labelled issue that is NOT uzi's and must never reach the detector", got)
 	}
 }
 
-// TestAutopilotCandidacyIgnoresRunEligibleSetPrimaryOnlyLiveDB is PRD #196 M4 guard
-// test 2, live-DB half. PRD #196 widens the MANUAL run gate to accept any run-eligible
-// label (default {PRD, bug}), but autopilot candidacy must keep matching the PRIMARY
-// only (Decision 6): a bug-labelled issue carrying the autopilot label is run-eligible
-// for a human, yet must NOT become an unattended autopilot candidate.
+// TestAutopilotCandidacyRequiresUziLabelNotASelectorLiveDB is the PRD #764 form of the
+// PRD #196 guard: a bug-labelled issue carrying the autopilot label is a sweep selector
+// candidate for a human, yet must NOT become an unattended autopilot candidate unless it
+// also carries the uzi run-eligibility label (Decision 6/D7).
 //
-// The reason is in the name because the query is unchanged by design — this test
-// exists so a later cleanup that threads the eligible set into the SQL is caught. Row
-// 70 (bug+autopilot) is run-eligible by the non-primary "bug" but carries no primary,
-// so it must be absent from the candidate set exactly as it was before PRD #196.
-func TestAutopilotCandidacyIgnoresRunEligibleSetPrimaryOnlyLiveDB(t *testing.T) {
+// The query filters on the autopilot label AND the uzi label — never on a bare selector
+// like "bug". Row 70 (bug+autopilot) carries no uzi label, so it must be absent from the
+// candidate set.
+func TestAutopilotCandidacyRequiresUziLabelNotASelectorLiveDB(t *testing.T) {
 	ctx := context.Background()
 	q, repoID := apCandidateFixture(ctx, t)
 
-	got := candidateIIDs(t, q, repoID, "autopilot", "PRD")
+	got := candidateIIDs(t, q, repoID, "autopilot", "uzi")
 	if len(got) != 1 || got[0] != 10 {
-		t.Fatalf("candidates = %v, want [10] only; issue 70 (bug+autopilot) is run-eligible for a human but must NOT be an autopilot candidate — the query matches the PRIMARY, never the run-eligible set", got)
+		t.Fatalf("candidates = %v, want [10] only; issue 70 (bug+autopilot) is a selector candidate for a human but must NOT be an autopilot candidate — the query matches the uzi label, never a bare selector", got)
 	}
 }
 
-// TestAutopilotCandidatesHonourARenamedPRDLabelLiveDB: prd_label is
+// TestAutopilotCandidatesHonourARenamedUziLabelLiveDB: uzi_label is
 // operator-configurable, so the predicate has to be the PARAM and not a literal.
 // After a rename the issues carrying the old label stop being candidates and the
 // ones carrying the new label start — which also means this test discriminates a
-// hardcoded 'PRD' in the SQL, where the test above would not.
-func TestAutopilotCandidatesHonourARenamedPRDLabelLiveDB(t *testing.T) {
+// hardcoded 'uzi' in the SQL, where the test above would not.
+func TestAutopilotCandidatesHonourARenamedUziLabelLiveDB(t *testing.T) {
 	ctx := context.Background()
 	q, repoID := apCandidateFixture(ctx, t)
 
@@ -163,7 +161,7 @@ func TestAutopilotCandidatesExcludeALabelLessIssueLiveDB(t *testing.T) {
 		        ($1, 60, 't', 'opened', 'null'::jsonb, 'https://x', true, now(), now())`,
 		repoID)
 
-	got := candidateIIDs(t, q, repoID, "autopilot", "PRD")
+	got := candidateIIDs(t, q, repoID, "autopilot", "uzi")
 	if len(got) != 1 || got[0] != 10 {
 		t.Fatalf("candidates = %v, want [10]: neither an empty array nor a jsonb null may satisfy the predicate", got)
 	}

@@ -6,7 +6,7 @@ import { startRunGate } from "../lib/runStream";
 import { activeRunInHistory, effectiveRunStatus, isStoppedRun, mrChipState, runStatusTone } from "../lib/runBadge";
 import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
 import { chipLabels } from "../lib/labelChips";
-import { canPromote, isEligibleCard } from "../lib/boardCards";
+import { canPromote, isUziCard } from "../lib/boardCards";
 import { Markdown } from "../components/Markdown";
 import { MrChip } from "../components/MrChip";
 import { forgePlatform } from "../lib/forgeNoun";
@@ -38,8 +38,7 @@ export function IssueView() {
   const { repoId = "", iid = "" } = useParams();
   const iidNum = Number(iid);
   const navigate = useNavigate();
-  const { prdlessEnabled, prdlessLabel, prdLabel, autopilotLabel, runEligibleLabels, eligibleLabelWaivesPrdLink } =
-    useAuth();
+  const { uziLabel, autopilotLabel } = useAuth();
 
   const [issue, setIssue] = useState<IssueDetail | null>(null);
   const [runs, setRuns] = useState<RunListItem[]>([]);
@@ -48,7 +47,6 @@ export function IssueView() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [starting, setStarting] = useState(false);
-  const [prdlessBusy, setPrdlessBusy] = useState(false);
   const [promoting, setPromoting] = useState(false);
   // PRD #241: the "Schedule…" entry point, pre-pinned to this issue.
   const [scheduling, setScheduling] = useState(false);
@@ -91,45 +89,15 @@ export function IssueView() {
     }
   };
 
-  // PRDLESS toggle (PRD #22 M4): apply/remove the escape-hatch label directly.
-  // Forge-first — wait for the 200 and adopt the returned card's labels; no
-  // optimistic update, so a failed write leaves the issue's labels untouched.
-  const prdlessApplied = !!issue && issue.labels.includes(prdlessLabel);
-  // The bypass badge stands in for the "no PRD link" warning when the feature is on
-  // and the label is applied (its condition is inlined at the badge below). It used
-  // to also drive a conditional filter that kept the PRDLESS label from rendering
-  // twice (S1); since PRD #102 M4 the shared chipLabels predicate excludes PRDLESS
-  // unconditionally, so the double-render is impossible and the flag is gone.
-  const togglePrdless = async () => {
-    if (!issue) return;
-    setError("");
-    setPrdlessBusy(true);
-    try {
-      const { card } = await api.setIssuePrdless(repoId, issue.iid, !prdlessApplied);
-      setIssue({ ...issue, labels: card.labels });
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Could not update the label");
-    } finally {
-      setPrdlessBusy(false);
-    }
-  };
+  // PRD #764. The detail page drives its Start/Promote affordance off the single
+  // `uzi` label — the SAME predicate the board card uses, so a card's affordances and
+  // its detail page's cannot disagree. An issue carrying `uzi` is runnable and offers
+  // Start run; one without it offers Promote.
+  const isEligible = !!issue && isUziCard(issue, uziLabel);
+  const promotable = !!issue && canPromote(issue, uziLabel);
 
-  // PRD #196 M4. The detail page drives its Start/Promote affordance off RUN-ELIGIBILITY
-  // (the admin-configured eligible set), the SAME predicate the board card uses — two
-  // implementations is exactly how a card's affordances and its detail page's come to
-  // disagree. This widens the M6 predicate from the primary label alone to the eligible
-  // set, so a runnable `bug` issue offers Start run here, not Promote.
-  //
-  // The PRD-link waiver is scoped to NON-PRIMARY eligibility (Decision 7), mirroring the
-  // server: an issue eligible only via the primary still needs its prds/*.md link.
-  const isEligible = !!issue && isEligibleCard(issue, runEligibleLabels);
-  const promotable = !!issue && canPromote(issue, runEligibleLabels);
-  const eligibleByNonPrimary =
-    !!issue && issue.labels.some((l) => l !== prdLabel && runEligibleLabels.includes(l));
-  const prdLinkWaived = eligibleLabelWaivesPrdLink && eligibleByNonPrimary;
-
-  // Promote (Decision 15), the same forge-first, adopt-the-response shape as the
-  // PRDLESS toggle above.
+  // Promote (Decision 15; PRD #764): add the `uzi` label forge-first, then adopt the
+  // returned card's labels — no optimistic update.
   const promote = async () => {
     if (!issue) return;
     setError("");
@@ -146,9 +114,6 @@ export function IssueView() {
 
   const gate = issue
     ? startRunGate({
-        hasPrdLink: issue.has_prd_link,
-        prdlessBypass: prdlessEnabled && prdlessApplied,
-        prdLinkWaived,
         closed: issue.closed,
         hasWorker,
         hasToken,
@@ -202,24 +167,21 @@ export function IssueView() {
                     they agree; they agree on the ordinary case only, and the sentence
                     above names exactly why (review m-4 / fact-check R2).
 
-                    This is a behavior change here: PRD / autopilot / PRDLESS chips used
-                    to render on this page and no longer do. Where each one's state went:
-                    autopilot to the badge below, PRDLESS to the bypass badge or the
-                    Mark/Remove button. Both PRDLESS surfaces are gated on
-                    `prdlessEnabled && !issue.closed`, so on a CLOSED issue, or with the
-                    feature off, the label genuinely has no surface here. That is
-                    accepted rather than unnoticed — an earlier comment claimed nothing
-                    becomes unobservable, which is false in exactly those two cases
-                    (review m-5).
+                    The autopilot chip is excluded here and surfaced as the badge below
+                    instead, so one fact reads one way. The `uzi` runnable marker is
+                    excluded for the same reason (PRD #764): it is surfaced as the brand
+                    "runnable" badge below, so it must not ALSO render as a plain content
+                    chip here. (The board keeps `uzi` as a highlighted chip instead, so
+                    chipLabels itself does not exclude it — this view drops it locally.)
 
                     Issue #124: a label name is forge-supplied, so strip it for display
                     while the React key keeps the raw string. */}
                 {chipLabels(issue.labels, {
-                  prdLabel,
-                  prdlessLabel,
                   autopilotLabel,
                   columnLabels: [issue.column],
-                }).map((l) => (
+                })
+                  .filter((l) => l !== uziLabel)
+                  .map((l) => (
                   <span
                     key={l}
                     title={stripUnsafeChars(l)}
@@ -240,36 +202,26 @@ export function IssueView() {
                     {autopilotLabel}
                   </Badge>
                 )}
-                {/* The non-PRD indicator (PRD #102 M6). Consistent with the card's
-                    dashed treatment in MEANING, not in mechanism: a border style is a
-                    card-scale cue and does not transfer to a full-width detail page, so
-                    it becomes an explicit badge here — which is also the only form that
-                    reaches a screen reader, since the card's border does not.
-
-                    Neutral tone, deliberately. This is not a warning: an issue that is
-                    not uzi's work is the ordinary state of most issues in a repo. */}
-                {!isEligible && (
+                {/* The runnable marker (PRD #764): an issue carrying the `uzi` label is
+                    uzi's to run. It becomes an explicit badge here — the only form that
+                    reaches a screen reader — brand-toned like the card's highlighted
+                    `uzi` chip. An issue without it offers Promote instead (below). */}
+                {isEligible && (
                   <Badge
-                    tone="neutral"
-                    title={`This issue does not carry the ${prdLabel} label, so uzi will not work it. Promote it to change that.`}
+                    tone="brand"
+                    title={`This issue carries the ${uziLabel} label, so uzi will run it.`}
                   >
-                    not {prdLabel}
+                    {uziLabel}
                   </Badge>
                 )}
                 {issue.author && <span className="text-xs text-faint">{issue.author}</span>}
-                {!issue.has_prd_link &&
-                  (prdlessEnabled && prdlessApplied ? (
-                    <Badge tone="brand" title="PRD-link gate bypassed by label">
-                      {prdlessLabel}
-                    </Badge>
-                  ) : (
-                    <Badge
-                      tone="warning"
-                      title="Description has no link to a prds/*.md file; excluded from agent pickup"
-                    >
-                      no PRD link
-                    </Badge>
-                  ))}
+                {/* Neutral PRD-presence marker (PRD #764): a linked prds/*.md is optional
+                    but still detected, so an issue that has one shows a quiet "PRD" badge. */}
+                {issue.has_prd_link && (
+                  <Badge tone="neutral" title="This issue links a prds/*.md file">
+                    PRD
+                  </Badge>
+                )}
                 {issue.conflict && (
                   <Badge
                     tone="danger"
@@ -281,36 +233,16 @@ export function IssueView() {
               </div>
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              {/* Show the toggle when applying is meaningful (no PRD link) or the
-                  label is already applied (so it can be removed); hide the pure
-                  no-op case — an issue that already has a PRD link and no label (S2). */}
-              {/* Promote (Decision 15) sits where the action for a non-PRD issue
-                  belongs: beside the PRDLESS toggle it replaces. */}
+              {/* Promote (Decision 15; PRD #764) is the action for a non-runnable issue:
+                  it adds the `uzi` label, making the issue runnable. */}
               {promotable && (
                 <Button
                   variant="secondary"
                   disabled={promoting}
-                  title={`Add the ${prdLabel} label so uzi can work this issue`}
+                  title={`Add the ${uziLabel} label so uzi can work this issue`}
                   onClick={promote}
                 >
-                  {promoting ? "…" : `Promote to ${prdLabel}`}
-                </Button>
-              )}
-              {/* isEligible is Decision 16 (PRD #196 M4 widened it from isPRD), for the
-                  same reason it gates the card's button: the run gate refuses a
-                  non-eligible issue first, so the PRDLESS toggle grants nothing there. */}
-              {prdlessEnabled && isEligible && !issue.closed && (prdlessApplied || !issue.has_prd_link) && (
-                <Button
-                  variant={prdlessApplied ? "secondary" : "ghost"}
-                  disabled={prdlessBusy}
-                  title={
-                    prdlessApplied
-                      ? `Remove the ${prdlessLabel} label and re-apply the PRD-link requirement`
-                      : `Apply the ${prdlessLabel} label so a run can start without a PRD link`
-                  }
-                  onClick={togglePrdless}
-                >
-                  {prdlessBusy ? "…" : prdlessApplied ? `Remove ${prdlessLabel}` : `Mark ${prdlessLabel}`}
+                  {promoting ? "…" : `Promote to ${uziLabel}`}
                 </Button>
               )}
               {/* Schedule… (PRD #241 M5, mock §3): opens the schedule modal

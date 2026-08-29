@@ -1266,13 +1266,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				r.With(forgeLimiter.PerUserMiddleware).Get("/{id}/issues/{iid}", h.GetIssueDetail)
 				// move + sync write/read through to the forge → per-user budget.
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issues/{iid}/move", h.MoveIssue)
-				// Apply/remove the PRDLESS label from the UI (PRD #22 M4): a forge
-				// label write, so it rides the per-user budget like move.
-				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issues/{iid}/prdless", h.SetIssuePrdless)
-				// Promote (PRD #102 Decision 15): add the PRD label to a non-PRD card,
-				// forge-first. Same limiter as the other forge-writing issue routes — it is
-				// one EnsureLabels plus one UpdateIssueLabels, exactly like the prdless
-				// toggle beside it.
+				// Promote (PRD #102 Decision 15, PRD #764): add the uzi run-eligibility
+				// label to a non-uzi card, forge-first. Same limiter as the other
+				// forge-writing issue routes — it is one EnsureLabels plus one
+				// UpdateIssueLabels, like move beside it.
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issues/{iid}/promote", h.PromoteIssue)
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/sync", h.SyncRepo)
 				// Create a PRD issue on the forge (source of truth) → per-user budget.

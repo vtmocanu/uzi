@@ -26,7 +26,7 @@ type createIssueRequest struct {
 	Description string `json:"description"`
 }
 
-// CreateIssue opens a new PRD-labelled issue on the forge for the given repo and
+// CreateIssue opens a new uzi-labelled issue on the forge for the given repo and
 // caches it so the board reflects it immediately. The forge is the source of
 // truth (the next sync reconciles it); this never fabricates a local-only card —
 // the issue returned here is the real one the forge just created. The user must
@@ -57,10 +57,11 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	// The created issue carries the configured PRD label (PRD #19): best-effort —
-	// a cold settings read yields the compiled-in default, never an empty label.
-	prdLabel, _ := h.settings.PRDLabel(r.Context())
-	created, err := f.CreateIssue(r.Context(), repo.ForgeProjectID, title, req.Description, []string{prdLabel})
+	// The created issue carries the configured uzi run-eligibility label (PRD #764):
+	// best-effort — a cold settings read yields the compiled-in default ("uzi"),
+	// never an empty label.
+	uziLabel, _ := h.settings.UziLabel(r.Context())
+	created, err := f.CreateIssue(r.Context(), repo.ForgeProjectID, title, req.Description, []string{uziLabel})
 	if err != nil {
 		// err is already PAT-redacted by the driver.
 		httpx.Error(w, http.StatusBadGateway, "could not create the issue on the forge: "+err.Error())

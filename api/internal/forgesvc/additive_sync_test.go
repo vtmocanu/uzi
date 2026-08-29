@@ -24,7 +24,7 @@ import (
 // successful PRD fetch and a failed open fetch looks exactly like a legitimate
 // "there are no non-PRD issues" answer.
 
-const prdLabel = settings.DefaultPRDLabel
+const uziLabel = settings.DefaultUziLabel
 
 // labelled builds a forge issue carrying labels, at a given updated_at.
 func labelled(iid int64, updated time.Time, labels ...string) forge.Issue {
@@ -58,7 +58,7 @@ func TestFullSyncFetchesOpenIssuesAdditively(t *testing.T) {
 	st := &fakeStore{}
 	svc := newTestService(st)
 	f := &fakeForge{
-		issues:     []forge.Issue{labelled(1, time.Unix(100, 0), prdLabel)},
+		issues:     []forge.Issue{labelled(1, time.Unix(100, 0), uziLabel)},
 		openIssues: []forge.Issue{labelled(2, time.Unix(100, 0), "bug")},
 	}
 
@@ -72,8 +72,8 @@ func TestFullSyncFetchesOpenIssuesAdditively(t *testing.T) {
 	if prd.State != forge.StateAll {
 		t.Errorf("PRD fetch state = %q, want StateAll (closed PRD cards must still reach the Closed column)", prd.State)
 	}
-	if len(prd.Labels) != 1 || prd.Labels[0] != prdLabel {
-		t.Errorf("PRD fetch labels = %v, want [%s]", prd.Labels, prdLabel)
+	if len(prd.Labels) != 1 || prd.Labels[0] != uziLabel {
+		t.Errorf("PRD fetch labels = %v, want [%s]", prd.Labels, uziLabel)
 	}
 	if open.State != forge.StateOpened {
 		t.Errorf("additive fetch state = %q, want StateOpened", open.State)
@@ -100,7 +100,7 @@ func TestFullSyncDoesNotThreadTheRunEligibleSet(t *testing.T) {
 	st := &fakeStore{}
 	svc := newTestService(st)
 	f := &fakeForge{
-		issues:     []forge.Issue{labelled(1, time.Unix(100, 0), prdLabel)},
+		issues:     []forge.Issue{labelled(1, time.Unix(100, 0), uziLabel)},
 		openIssues: []forge.Issue{labelled(2, time.Unix(100, 0), "bug")},
 	}
 
@@ -111,8 +111,8 @@ func TestFullSyncDoesNotThreadTheRunEligibleSet(t *testing.T) {
 		t.Fatalf("expected 2 ListIssues calls, got %d: %+v", len(f.listCalls), f.listCalls)
 	}
 	prd := f.listCalls[0]
-	if len(prd.Labels) != 1 || prd.Labels[0] != prdLabel {
-		t.Fatalf("label-filtered fetch labels = %v, want exactly [%s] — the run-eligible SET must never reach the ANDed sync fetch", prd.Labels, prdLabel)
+	if len(prd.Labels) != 1 || prd.Labels[0] != uziLabel {
+		t.Fatalf("label-filtered fetch labels = %v, want exactly [%s] — the run-eligible SET must never reach the ANDed sync fetch", prd.Labels, uziLabel)
 	}
 }
 
@@ -123,7 +123,7 @@ func TestFullSyncKeepSetIsTheUnion(t *testing.T) {
 	st := &fakeStore{}
 	svc := newTestService(st)
 	f := &fakeForge{
-		issues:     []forge.Issue{labelled(1, time.Unix(100, 0), prdLabel), labelled(3, time.Unix(100, 0), prdLabel)},
+		issues:     []forge.Issue{labelled(1, time.Unix(100, 0), uziLabel), labelled(3, time.Unix(100, 0), uziLabel)},
 		openIssues: []forge.Issue{labelled(2, time.Unix(100, 0), "bug"), labelled(4, time.Unix(100, 0))},
 	}
 
@@ -142,7 +142,7 @@ func TestFullSyncKeepSetIsTheUnion(t *testing.T) {
 func TestFullSyncDiscardsPRDRowsFromTheOpenFetch(t *testing.T) {
 	st := &fakeStore{}
 	svc := newTestService(st)
-	shared := labelled(1, time.Unix(100, 0), prdLabel, "bug")
+	shared := labelled(1, time.Unix(100, 0), uziLabel, "bug")
 	f := &fakeForge{
 		issues:     []forge.Issue{shared},
 		openIssues: []forge.Issue{shared, labelled(2, time.Unix(100, 0), "bug")},
@@ -174,7 +174,7 @@ func TestFullSyncEvictsNothingWhenEitherFetchFails(t *testing.T) {
 			openIssues: []forge.Issue{labelled(2, time.Unix(100, 0), "bug")},
 		}},
 		{"additive open fetch fails", &fakeForge{
-			issues:  []forge.Issue{labelled(1, time.Unix(100, 0), prdLabel)},
+			issues:  []forge.Issue{labelled(1, time.Unix(100, 0), uziLabel)},
 			openErr: boom,
 		}},
 	}
@@ -227,7 +227,7 @@ func TestIncrementalSyncFailsClosedOnEitherFetch(t *testing.T) {
 			openIssues: []forge.Issue{labelled(2, time.Unix(9000, 0), "bug")},
 		}},
 		{"additive open fetch fails", &fakeForge{
-			issues:  []forge.Issue{labelled(1, time.Unix(9000, 0), prdLabel)},
+			issues:  []forge.Issue{labelled(1, time.Unix(9000, 0), uziLabel)},
 			openErr: boom,
 		}},
 	}
@@ -292,7 +292,7 @@ func TestPerPathMarksAdvanceIndependently(t *testing.T) {
 	openMax := time.Unix(5000, 0)
 	newFake := func() *fakeForge {
 		return &fakeForge{
-			issues:     []forge.Issue{labelled(1, prdMax, prdLabel)},
+			issues:     []forge.Issue{labelled(1, prdMax, uziLabel)},
 			openIssues: []forge.Issue{labelled(2, openMax, "bug")},
 		}
 	}
@@ -341,10 +341,10 @@ func TestSyncCountsDiscardedRowsTowardsTheOpenMark(t *testing.T) {
 	openMax := time.Unix(3000, 0)
 	newFake := func() *fakeForge {
 		return &fakeForge{
-			issues: []forge.Issue{labelled(1, prdMax, prdLabel)},
+			issues: []forge.Issue{labelled(1, prdMax, uziLabel)},
 			// Every row here is discarded by the PRD filter, so the FILTERED max is
 			// zero while the raw one is not.
-			openIssues: []forge.Issue{labelled(1, openMax, prdLabel)},
+			openIssues: []forge.Issue{labelled(1, openMax, uziLabel)},
 		}
 	}
 	assert := func(t *testing.T, got Marks) {
@@ -411,7 +411,7 @@ func TestPerPathMarksZeroCases(t *testing.T) {
 		},
 		{
 			name:  "an empty open fetch must not stall the PRD mark",
-			prd:   []forge.Issue{labelled(1, time.Unix(1000, 0), prdLabel)},
+			prd:   []forge.Issue{labelled(1, time.Unix(1000, 0), uziLabel)},
 			open:  nil,
 			start: Marks{PRD: time.Unix(500, 0), Open: time.Unix(900, 0)},
 			want:  Marks{PRD: time.Unix(1000, 0), Open: time.Unix(900, 0)},
@@ -442,14 +442,14 @@ func TestPerPathMarksZeroCases(t *testing.T) {
 // other label comparison in this package.
 func TestWithoutLabelMatchesExactly(t *testing.T) {
 	in := []forge.Issue{
-		labelled(1, time.Unix(1, 0), prdLabel),
+		labelled(1, time.Unix(1, 0), uziLabel),
 		labelled(2, time.Unix(1, 0), "bug"),
 		labelled(3, time.Unix(1, 0)),
 		labelled(4, time.Unix(1, 0), "prd"), // different case: a different label
-		labelled(5, time.Unix(1, 0), "bug", prdLabel),
+		labelled(5, time.Unix(1, 0), "bug", uziLabel),
 	}
 	var got []int64
-	for _, is := range withoutLabel(in, prdLabel) {
+	for _, is := range withoutLabel(in, uziLabel) {
 		got = append(got, is.IID)
 	}
 	if !slices.Equal(got, []int64{2, 3, 4}) {
@@ -478,8 +478,8 @@ func TestAClosedNonPRDIssueIsNeitherRefreshedNorKept(t *testing.T) {
 	// The forge's state AFTER the issue closed: the PRD fetch still returns the PRD
 	// issue, and the open fetch no longer returns issue 2.
 	f := &fakeForge{
-		issues:     []forge.Issue{labelled(1, time.Unix(100, 0), prdLabel)},
-		openIssues: []forge.Issue{labelled(1, time.Unix(100, 0), prdLabel)},
+		issues:     []forge.Issue{labelled(1, time.Unix(100, 0), uziLabel)},
+		openIssues: []forge.Issue{labelled(1, time.Unix(100, 0), uziLabel)},
 	}
 
 	if _, err := svc.FullSync(context.Background(), uuid.New(), 7, f); err != nil {

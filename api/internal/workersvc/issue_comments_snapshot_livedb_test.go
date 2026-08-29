@@ -96,8 +96,10 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 	exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
 	      VALUES ($1, $2, 2, 'g/zero', 'https://forge.e2e/g/zero', 'main', true)`, repoZero, connZero)
 	mkIssue := func(repoID uuid.UUID, iid int64) {
+		// Labelled uzi so the single run-eligibility gate (PRD #764 M1) passes; the
+		// snapshot behaviour under test is orthogonal to eligibility.
 		exec(`INSERT INTO issues (id, repo_id, forge_issue_iid, title, state, labels, web_url, has_prd_link, forge_updated_at, synced_at)
-		      VALUES ($1, $2, $3, 'Do X', 'opened', '["PRD"]', 'https://forge.e2e/i', true, now(), now())`,
+		      VALUES ($1, $2, $3, 'Do X', 'opened', '["PRD","uzi"]', 'https://forge.e2e/i', true, now(), now())`,
 			uuid.New(), repoID, iid)
 	}
 	mkIssue(repoKnown, 11)
@@ -114,7 +116,7 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 	}
 
 	// (1) Human + bot ⇒ stored JSONB carries the human comment and NOT the bot one.
-	run1, err := svc.CreateRun(ctx, userID, repoKnown, 11, "desc", false, &waitFalse, nil)
+	run1, err := svc.CreateRun(ctx, userID, repoKnown, 11, "desc", &waitFalse, nil)
 	if err != nil {
 		t.Fatalf("create run for issue 11: %v", err)
 	}
@@ -139,7 +141,7 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 	}
 
 	// (2) Only bot comments ⇒ stored NULL.
-	run2, err := svc.CreateRun(ctx, userID, repoKnown, 12, "desc", false, &waitFalse, nil)
+	run2, err := svc.CreateRun(ctx, userID, repoKnown, 12, "desc", &waitFalse, nil)
 	if err != nil {
 		t.Fatalf("create run for issue 12: %v", err)
 	}
@@ -148,7 +150,7 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 	}
 
 	// (3) Human comment but the connection's bot id is 0 ⇒ D9 stores NULL.
-	run3, err := svc.CreateRun(ctx, userID, repoZero, 13, "desc", false, &waitFalse, nil)
+	run3, err := svc.CreateRun(ctx, userID, repoZero, 13, "desc", &waitFalse, nil)
 	if err != nil {
 		t.Fatalf("create run for issue 13: %v", err)
 	}

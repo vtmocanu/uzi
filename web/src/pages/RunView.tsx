@@ -914,6 +914,14 @@ export function RunView() {
                   autopilot
                 </Badge>
               )}
+              {/* Neutral PRD-presence marker (PRD #764): a linked PRD file is optional
+                  but still detected and implemented when present, so a run whose issue
+                  has one shows a quiet "PRD" badge beside the autopilot badge. */}
+              {run.has_prd_link && (
+                <Badge tone="neutral" title="This run's issue links a PRD file">
+                  PRD
+                </Badge>
+              )}
               {/* ci_fix runs (PRD #6): the failing-pipeline link (isHttpsUrl-guarded)
                   and the verdict chip, extracted for isolated testing. */}
               <CIFixRunHeader run={run} terminal={terminal} />

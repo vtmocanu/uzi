@@ -8,17 +8,16 @@ import (
 )
 
 // TestSkipReasonEnumIsHonest pins the Go side of the SkipReason contract internally
-// consistent (PRD #308 M3; PRD #590 M1 added vault_locked): the closed set has exactly the
-// six expected members with no duplicates, every benign seam sentinel maps into that set, an
-// unrelated error maps to no reason, and the reasons the seam does not map (fetch_failed is
-// recorded at the sweep site, already_running also at the prompt site, vault_locked at the
-// self_improve site) are still enumerated. The
+// consistent (PRD #308 M3; PRD #590 M1 added vault_locked; PRD #764 retired the link-less skip):
+// the closed set has exactly the six expected members with no duplicates, every benign seam
+// sentinel maps into that set, an unrelated error maps to no reason, and the reasons the
+// seam does not map (fetch_failed is recorded at the sweep site, already_running also at the
+// prompt site, vault_locked at the self_improve site) are still enumerated. The
 // cross-language guard that the TS reason union has not drifted lives in
 // web/src/lib/scheduleSkipReasons.test.ts; this keeps the Go enum honest so that guard
 // has a trustworthy source to compare against.
 func TestSkipReasonEnumIsHonest(t *testing.T) {
 	want := map[SkipReason]bool{
-		SkipNoPRDLink:               true,
 		SkipNotEligible:             true,
 		SkipAlreadyRunning:          true,
 		SkipDescriptionTooLarge:     true,
@@ -63,7 +62,6 @@ func TestSkipReasonEnumIsHonest(t *testing.T) {
 		name string
 		err  error
 	}{
-		{"ErrNoPRDLink", workersvc.ErrNoPRDLink},
 		{"ErrNotPRDIssue", workersvc.ErrNotPRDIssue},
 		{"ErrActiveRunExists", workersvc.ErrActiveRunExists},
 		{"ErrDescriptionTooLarge", workersvc.ErrDescriptionTooLarge},

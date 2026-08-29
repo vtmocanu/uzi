@@ -142,7 +142,6 @@ describe("applyFrame", () => {
 
 describe("startRunGate", () => {
   const ok = {
-    hasPrdLink: true,
     closed: false,
     hasWorker: true,
     hasToken: true,
@@ -154,60 +153,17 @@ describe("startRunGate", () => {
   });
 
   it("blocks a closed issue before anything else", () => {
-    const g = startRunGate({ ...ok, closed: true, hasPrdLink: false, hasWorker: false });
+    const g = startRunGate({ ...ok, closed: true, hasWorker: false });
     expect(g.enabled).toBe(false);
     expect(g.reason).toMatch(/closed/i);
   });
 
-  it("requires a PRD link", () => {
-    const g = startRunGate({ ...ok, hasPrdLink: false });
-    expect(g.enabled).toBe(false);
-    expect(g.reason).toMatch(/prds/i);
-  });
-
-  // PRD #22: the prdless bypass short-circuits the PRD-link requirement — the full
-  // bypass × hasPrdLink matrix.
-  it("prdless bypass lets a no-PRD-link issue through the PRD-link gate", () => {
-    // no link + bypass → the PRD-link precondition is skipped (other preconditions met → enabled).
-    expect(startRunGate({ ...ok, hasPrdLink: false, prdlessBypass: true })).toEqual({
-      enabled: true,
-      reason: "",
-    });
-    // no link + no bypass → still blocked on the link.
-    expect(startRunGate({ ...ok, hasPrdLink: false, prdlessBypass: false }).reason).toMatch(/prds/i);
-    // link + bypass → enabled (bypass is a no-op when a link already satisfies the gate).
-    expect(startRunGate({ ...ok, hasPrdLink: true, prdlessBypass: true }).enabled).toBe(true);
-    // link + no bypass → enabled (the pre-prdless baseline).
-    expect(startRunGate({ ...ok, hasPrdLink: true, prdlessBypass: false }).enabled).toBe(true);
-  });
-
-  // PRD #196 M4: the PRD-link waiver mirrors the server's per-instance
-  // eligible_label_waives_prd_link, scoped to non-primary eligibility by the caller. To
-  // the gate it is a second short-circuit alongside prdlessBypass.
-  it("prdLinkWaived lets a no-PRD-link issue through the PRD-link gate", () => {
-    // no link + waiver + worker + token + open + no active run → enabled.
-    expect(startRunGate({ ...ok, hasPrdLink: false, prdlessBypass: false, prdLinkWaived: true })).toEqual({
-      enabled: true,
-      reason: "",
-    });
-    // no link + no waiver + no bypass → still blocked on the link.
-    expect(
-      startRunGate({ ...ok, hasPrdLink: false, prdlessBypass: false, prdLinkWaived: false }).reason,
-    ).toMatch(/prds/i);
-  });
-
-  it("prdLinkWaived does not skip the OTHER preconditions", () => {
-    // A waived no-PRD-link issue with no worker is still blocked on the worker.
-    expect(
-      startRunGate({ ...ok, hasPrdLink: false, prdLinkWaived: true, hasWorker: false }).reason,
-    ).toMatch(/worker/i);
-  });
-
-  it("prdless bypass does not skip the OTHER preconditions", () => {
-    // A bypassed no-PRD-link issue with no worker is still blocked on the worker.
-    expect(startRunGate({ ...ok, hasPrdLink: false, prdlessBypass: true, hasWorker: false }).reason).toMatch(
-      /worker/i,
-    );
+  // PRD #764 removed the PRD-link precondition entirely: a run no longer requires a
+  // linked prds/*.md file, so a no-link issue with a worker + token is startable.
+  it("does not require a PRD link (PRD #764)", () => {
+    expect(startRunGate(ok)).toEqual({ enabled: true, reason: "" });
+    // The reason string never mentions prds anymore, on any blocking precondition.
+    expect(startRunGate({ ...ok, hasWorker: false }).reason).not.toMatch(/prds/i);
   });
 
   it("requires a connected worker", () => {

@@ -97,10 +97,10 @@ func (h *Handler) GetIssueDraft(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Labels are assembled server-side from settings (Decision 3/6) — never the request
-	// body, and never autopilot. The draft only DISPLAYS them; M3 re-derives them the
-	// same way for the actual write.
-	prd, _ := h.settings.PRDLabel(ctx)
-	prdless, _ := h.settings.PrdlessLabel(ctx)
+	// body, and never autopilot. PRD #764: a filed issue carries the single uzi
+	// run-eligibility label. The draft only DISPLAYS them; M3 re-derives them the same
+	// way for the actual write.
+	uziLabel, _ := h.settings.UziLabel(ctx)
 
 	defaultRepoID, defaultNote := h.resolveDefaultRepo(ctx, user.ID, rec.Category, run.RepoID)
 
@@ -138,7 +138,7 @@ func (h *Handler) GetIssueDraft(w http.ResponseWriter, r *http.Request) {
 		DefaultRepoID: defaultRepoID,
 		Title:         draft.Title,
 		Description:   draft.Description,
-		Labels:        []string{prd, prdless},
+		Labels:        []string{uziLabel},
 		Provenance:    draft.Provenance,
 		DefaultNote:   defaultNote,
 	}})

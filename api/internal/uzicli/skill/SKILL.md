@@ -489,7 +489,7 @@ uzi version
 
 A **schedule** starts run(s) at future time(s) — the clock-driven origin alongside a
 manual `run create` and label-driven autopilot. It fires through the **same** shared
-run-creation seam a manual start uses, so PRDLESS gating, the fresh forge issue fetch,
+run-creation seam a manual start uses, so the `uzi`-label eligibility gate, the fresh forge issue fetch,
 active-run dedup and the usage-limit park all behave identically; a schedule can do
 nothing a manual start cannot.
 
@@ -503,16 +503,17 @@ nothing a manual start cannot.
   single-`--repo` create is standalone (no group). A mid-loop failure still reports the
   schedules that already landed before it exits non-zero. You pick exactly one **target** and
   exactly one **timing**, or it is a usage error (exit 2) before any request:
-  - **target** — one of `--issue <iid>` (a pinned issue), `--sweep` (every eligible open
+  - **target** — one of `--issue <iid>` (a pinned issue), `--sweep` (every open
     issue matching the `--label` selector; `--label` is repeatable and defaults to the
-    PRD label when omitted), or `--prompt <text>` (an issue-less repo→MR run that
-    bypasses the PRD-issue gate). `--label` is valid only with `--sweep`.
+    `uzi` label when omitted), or `--prompt <text>` (an issue-less repo→MR run that
+    bypasses the `uzi`-label gate). `--label` is valid only with `--sweep`.
     - **Sweep gotcha (bites a bug-hunter first):** a `--sweep` picks only
-      *candidates*; the same PRD-issue gate a manual start has still decides what
-      fires. Already-PRD'd candidates fire directly, but plain un-PRD'd issues
-      (e.g. everything tagged `bug`) fire only when they ALSO carry the `PRDLESS`
-      label. So `--sweep --label bug` over raw bug reports fires on nothing until
-      you add `PRDLESS` to the ones you want worked (or pair the sweep with it).
+      *candidates*; the same single `uzi`-label gate a manual start has still decides
+      what fires. Already-`uzi`-labelled candidates fire directly, but a plain
+      selector like `bug` is not itself an eligibility label — issues tagged only
+      `bug` (with no `uzi`) fire on nothing. So `--sweep --label bug` over raw bug
+      reports fires on nothing until you add `uzi` to the ones you want worked (or
+      pair the sweep with it).
   - **timing** — one of `--at <rfc3339>` (fires once, then goes terminal) or
     `--cron <expr>` (a recurring 5-field cron). `--tz <iana>` sets the timezone the cron
     is read in (default `UTC`).
@@ -526,7 +527,7 @@ nothing a manual start cannot.
   - `--max-issues <n>` caps how many runs one `--sweep` fire **starts**, oldest (lowest
     number) first; defaults to 10, ignored for non-sweep targets. `--max-issues 1` is
     "one run per fire". The cap counts runs *started*, not candidates matched: a
-    candidate that can't start (no PRD link, already running, transient fetch) is flagged
+    candidate that can't start (missing the `uzi` label, already running, transient fetch) is flagged
     and the fire walks on to the next eligible issue, bounded by a scan window (the cap
     plus a fixed headroom), so a stale issue at the head of the backlog no longer wastes a
     slot.
@@ -552,9 +553,9 @@ nothing a manual start cannot.
   When the schedule has fired at least once it also prints a **Last fire** block: a
   summary line (`fired <time> · examined N · started M · skipped K`), one line per started
   run (`#<iid> → run <run-id>  <title>`, or a `prompt` marker for a prompt schedule), one
-  line per skipped candidate with a human reason label (`no PRD link`, `already running`,
-  `not eligible`, `description too large`, `fetch failed`), and — when a capped fire
-  reached nobody — a hint to raise `--max-issues` or add `PRDLESS` / a PRD link. A
+  line per skipped candidate with a human reason label (`not eligible`, `already running`,
+  `description too large`, `fetch failed`), and — when a capped fire
+  reached nobody — a hint to raise `--max-issues` or add the `uzi` label. A
   never-fired schedule reads `Last fire: never fired`. `--json` carries the same detail
   under `.last_fire`.
 - `uzi schedule edit <schedule-id>` — change a schedule's mutable config in place, keeping
@@ -582,7 +583,7 @@ nothing a manual start cannot.
   Prints a per-candidate breakdown: a `Started N run(s)` header with the created run
   id(s), one line per started run, then — when candidates were skipped — a
   `Examined N candidate(s), skipped K:` tally with a human reason label per skip and, for a
-  missing PRD link, a `# add PRDLESS / a prds link, or raise --max-issues` hint. A fire
+  `not eligible` skip, a `# add the uzi label, or raise --max-issues` hint. A fire
   that started nothing AND skipped nothing (a benign dedup, a prior run still live) reports
   `no run started`. `--json` dumps the raw response (`created`, `run_ids`, `matched`,
   `capped`, `started`, `skips`).
@@ -833,11 +834,10 @@ enough to fit the default budget — or use the gated `uzi run create` (no
 the cost of one approval.
 
 **No `prds/*.md` file for this issue yet?** It still works — the plan you
-supply is what the file would have provided. The issue needs **both** the
-`PRD` label and the `PRDLESS` label: PRDLESS is the escape hatch for a PRD
-issue with no file yet, not a way to skip the PRD label itself. And if you
-just added the `PRD` label yourself, `run create` may still answer "issue
-does not carry the PRD label" until the next poller sync — going through
+supply is what the file would have provided. A PRD file is optional, never
+required; the issue needs only the `uzi` label. And if you
+just added the `uzi` label yourself, `run create` may still answer "issue
+does not carry the uzi label" until the next poller sync — going through
 the forge's own **Promote** action instead writes the label and updates
 uzi's cache in the same request, so a freshly-promoted issue is runnable
 immediately, with no wait.

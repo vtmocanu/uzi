@@ -259,31 +259,3 @@ func TestStartRunForUserRepoNotOwned(t *testing.T) {
 		t.Error("a repo the user does not own must not reach the forge")
 	}
 }
-
-// TestPrdlessAllows exercises the PRDLESS gate the lift reads off settings: on only
-// when the feature is enabled AND the issue carries the configured label.
-func TestPrdlessAllows(t *testing.T) {
-	cases := []struct {
-		name     string
-		settings *fakeSettings
-		labels   []string
-		want     bool
-	}{
-		{"nil settings → gated", nil, []string{"prdless"}, false},
-		{"disabled → gated", &fakeSettings{prdlessEnabled: false, prdlessLabel: "prdless"}, []string{"prdless"}, false},
-		{"enabled, label absent → gated", &fakeSettings{prdlessEnabled: true, prdlessLabel: "prdless"}, []string{"bug"}, false},
-		{"enabled, label present → bypass", &fakeSettings{prdlessEnabled: true, prdlessLabel: "prdless"}, []string{"bug", "prdless"}, true},
-		{"enabled, empty label → gated", &fakeSettings{prdlessEnabled: true, prdlessLabel: ""}, []string{""}, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			svc := New(&fakeStore{}, newBox(t), testParams())
-			if tc.settings != nil {
-				svc.SetSettings(*tc.settings)
-			}
-			if got := svc.prdlessAllows(context.Background(), tc.labels); got != tc.want {
-				t.Errorf("prdlessAllows = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}

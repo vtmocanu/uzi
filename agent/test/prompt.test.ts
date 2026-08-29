@@ -1642,8 +1642,9 @@ describe("PRD lifecycle clause (PRD #72 M3)", () => {
   });
 
   it("is CONDITIONAL in its own wording, not merely in intent (Decision 5)", () => {
-    // The load-bearing property: a PRDLESS run in a repo that HAS a prds/
-    // directory must not be invited to pick a file. So the clause has to open on
+    // The load-bearing property: a run whose issue links no prds/*.md (a PRD link
+    // is optional under the uzi model, PRD #764), in a repo that HAS a prds/
+    // directory, must not be invited to pick a file. So the clause has to open on
     // the condition and state the no-op, not just be omitted when uzi knows there
     // is no PRD — uzi does not know that here.
     assert.match(PRD_LIFECYCLE_APPEND, /If the issue description links a `prds\/\*\.md` file/);

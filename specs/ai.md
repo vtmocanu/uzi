@@ -3344,6 +3344,10 @@ milestone — each decision below flags the milestone that owns it.
 
 ## 119. prdless settings keys + on-by-default resolution
 
+> **SUPERSEDED by §584 (PRD #764):** the `PRDLESS` label, its `prdless_enabled`/`prdless_label`
+> settings, and the PRD-link requirement were removed end-to-end; run-eligibility is now the single
+> `uzi` label and a PRD link is optional. Retained as the historical design record.
+
 Serves human: "name configurable, feature toggleable on/off, both in admin settings";
 "enabled out of the box"; "default name PRDLESS".
 
@@ -8728,6 +8732,10 @@ admin-can-file** (not restrict to the owner), conditioned on prominent provenanc
     forge identity anywhere in uzi — a repo has one connection, one PAT, one bot author.
 
 ## 308. Labels `PRD` + `PRDLESS` assembled server-side; the omitted `autopilot` is the real guard (D3)
+
+> **SUPERSEDED by §584 (PRD #764):** `PRD`/`PRDLESS` no longer gate eligibility. Filing labels the
+> issue runnable via the single `uzi` label and omits `autopilot` so nothing auto-starts. Retained
+> as the historical design record; the "nothing auto-starts" invariant below still holds.
 
 Serves human: "nothing auto-starts" — filing an issue and spending tokens on a run stay separate
 human decisions.
@@ -22981,3 +22989,58 @@ splits the two apart: generic by default, uzi-dogfooding as an explicit per-repo
   it additionally skip *already-proposed-but-not-yet-merged* work (a completed run with an open MR
   is not an in-flight run, so #297 alone could not see it) and, via D9's fresh base, *already-landed*
   work (a stale-base agent cannot see a merge that happened after its branch point).
+
+## 584. PRD #764 — a single configurable `uzi` label is the sole run-eligibility gate; PRD becomes optional; hard cutover, no compat shim
+
+Serves human: the repurposed Feature #22 (eligibility model, PRD #764) — "run-eligibility is the
+single `uzi` label; a PRD link is optional." Collapses the old two-gate model — an eligible-label
+set AND (PRD-link OR `PRDLESS` OR admin waiver) — into one orthogonal opt-in, the documented cause
+of the "looks queued, never runs" gap the `issue-triage` skill exists to hunt.
+
+- **One eligibility gate (`uzi_label`, default `uzi`) — D1.** New `app_settings` key via the
+  no-seeded-row `Defaults`+`Cache` pattern (an absent row synthesizes from the Go defaults, so **no
+  goose migration**), distinctness-validated against `autopilot_label`, and emitted to the SPA
+  bootstrap. In `workersvc.createRun`, Gate A becomes "carries `uzi_label`" and the old Gate B (the
+  PRD-link requirement) is **deleted** — a run no longer needs a PRD link, `PRDLESS`, or a waiver.
+  All four create paths (interactive / scheduled / autopilot / scheduled-autopilot) refuse a
+  non-`uzi` issue with a clear "add the `uzi` label" message on every consumer (web Start, the
+  autopilot forge comment, the server exit map).
+- **PRD optional, still detected + implemented + badged — D2.** `forgesvc.HasPRDLink` detection is
+  unchanged and label-independent, so a linked `prds/*.md` is still found, opened, and updated by
+  the agent when present, and a run with no link proceeds cleanly. PRD presence surfaces as a
+  neutral badge reusing the existing `has_prd_link` DTO field on the board card, and is newly
+  exposed on the **runs** DTO for the runs view. No new card field.
+- **`Planned`/`bug` are pure sweep selectors gated by `uzi` — D4.** The selector query is unchanged;
+  fireability inherits the single gate, so a swept candidate fires iff it also carries `uzi`. `bug`
+  keeps its selector role and loses its former eligibility role (the eligible-set is gone). A bare
+  selector issue (no `uzi`) is a benign `not_eligible` skip that **advances** the schedule.
+  `autopilot` is unchanged (a separate opt-in that skips the plan-approval gate; it now rides
+  alongside `uzi`, not `PRD`).
+- **Board shows all; `uzi` is a runnable marker + filter, not a membership gate — D3.** The all-open
+  board is kept (the unfiltered open fetch already captured a `uzi`-only issue); the client toggle
+  flips from PRD/all to `uzi`-only/all; each card shows a runnable marker (has `uzi`) plus the
+  PRD-presence badge. The `PRDLESS` toggle, the "no PRD link" warning, and the PRDLESS badge are
+  removed, and the SPA's dependency on the retired bootstrap keys is unwound (retired-string sweep,
+  with a positive assertion on the new badge so "old badges gone" is not an unfalsifiable green).
+- **Hard cutover, no compat shim — we are the only user (D5).** The old model is removed end-to-end,
+  not deprecated-and-left-inert: deleted settings `prdless_enabled`, `prdless_label`,
+  `eligible_label_waives_prd_link`, `run_eligible_labels`, `board_extra_labels`, and the `prd_label`
+  special-casing (**D7** — PRD-ness is detected purely from the body link; `FullSync`'s any-state
+  fetch keys on `uzi_label` instead of `prd_label`; `PRD` may still be used as a plain
+  organizational label, but uzi no longer treats it specially). Dead gate helpers (`prdlessAllows`,
+  `eligibleByNonPrimary`, the waiver path) removed; the `no_prd_link` skip-reason retired from the
+  cross-language wire enum (kept `not_eligible`). The one-time migration is a local `gh` loop
+  adding `uzi` to our currently-runnable open issues — no product migration tool, admin endpoint, or
+  CLI verb. A shim (run if `uzi` OR old-rules) was rejected because it required a frozen legacy
+  `{PRD,bug}` constant decoupled from the mutable default; with no external users it is unnecessary
+  and is a future PRD if external users ever appear.
+- **Accepted (D6): unattended spec-light sweep runs.** Sweeps auto-approve, so a `uzi`+selector
+  issue with no PRD runs with no plan gate — already true today for `PRDLESS`+selector; the
+  PRD-presence badge makes it visible, and no new gate is added.
+- **Not a main-protection change.** The default-branch guardrail and the no-`.github/workflows`
+  push control are independent of both old gates; removing Gate B has no main-protection
+  implication (Gate B was a "no spec" nudge, never a security control).
+- Full rationale, code map, and Decision Log D1–D7: `prds/done/764-uzi-eligibility-label.md`. This
+  section **supersedes** the design recorded in §119 (PRDLESS settings) and §308 (`PRD`+`PRDLESS`
+  server-side assembly), and the run-eligibility narrative in §445; those remain as history of the
+  now-removed model.

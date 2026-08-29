@@ -22,23 +22,15 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// PrdlessLabelColor is the GitLab label color EnsureLabels pins when the PRDLESS
-// label is auto-created on first apply from the uzi UI (PRD #22 Decision 8:
-// EnsureLabels requires a color, the way board columns pin theirs). Amber, chosen
-// distinct from the DefaultColumns palette (blues/purple/grey) so the escape-hatch
-// label reads as an exception, not a column.
-const PrdlessLabelColor = "#ec9a29"
-
-// PrdLabelColor is the color EnsureLabels pins when Promote (PRD #102 Decision 15)
-// applies the PRD label to a repo that somehow lacks it. Green, distinct from both
-// the DefaultColumns palette (blues/purple/grey) and the PRDLESS amber: the PRD
-// label marks work uzi owns, which is neither a column nor an exception.
+// PromoteLabelColor is the color EnsureLabels pins when Promote (PRD #102 Decision
+// 15) applies the uzi run-eligibility label (PRD #764) to a repo that somehow lacks
+// it. Green, distinct from the DefaultColumns palette (blues/purple/grey): the uzi
+// label marks work uzi owns, which is not a column.
 //
 // It exists at all because Promote reuses SetIssueLabel, whose apply path
-// auto-creates the label. Passing PrdlessLabelColor there would create a missing
-// PRD label in the escape hatch's amber, which is the naive-reuse bug Decision 15
-// names.
-const PrdLabelColor = "#2da160"
+// auto-creates the label; without a pinned color EnsureLabels would fail (GitLab's
+// label-create API requires one).
+const PromoteLabelColor = "#2da160"
 
 // DefaultColumns are the kanban columns seeded on the forge (as labels) the
 // first time a repo's board is opened, in board order. Colors are required by
@@ -119,14 +111,15 @@ type IssueStore interface {
 	SettlePRDLinkPatch(ctx context.Context, id uuid.UUID) (int64, error)
 }
 
-// LabelConfig resolves the configured PRD label the sync filters query by
-// (PRD #19). *settings.Cache satisfies it; the sync depends on the behavior, not
-// the concrete cache, so its tests can supply a fixed label. Resolution is
-// best-effort: a nil resolver or an empty/errored read falls back to
-// settings.DefaultPRDLabel, so a transient settings-store blip degrades a sync to
-// the default label rather than filtering on an empty one.
+// LabelConfig resolves the configured uzi run-eligibility label the sync filters
+// query by (PRD #764 D7: the any-state sync fetch keys on uzi_label now that the
+// PRD label has lost its special meaning). *settings.Cache satisfies it; the sync
+// depends on the behavior, not the concrete cache, so its tests can supply a fixed
+// label. Resolution is best-effort: a nil resolver or an empty/errored read falls
+// back to settings.DefaultUziLabel, so a transient settings-store blip degrades a
+// sync to the default label rather than filtering on an empty one.
 type LabelConfig interface {
-	PRDLabel(ctx context.Context) (string, error)
+	UziLabel(ctx context.Context) (string, error)
 }
 
 // Service bundles the dependencies for building forge clients and syncing.
@@ -151,7 +144,7 @@ type LandedNotifier interface {
 }
 
 // New constructs a Service. box encrypts/decrypts stored PATs; timeout bounds
-// every forge HTTP call; labels resolves the configured PRD label the sync
+// every forge HTTP call; labels resolves the configured uzi label the sync
 // filters on (nil is tolerated and falls back to the compiled-in default).
 func New(q IssueStore, box *secretbox.Box, timeout time.Duration, labels LabelConfig) *Service {
 	return &Service{q: q, box: box, timeout: timeout, labels: labels}
@@ -162,17 +155,17 @@ func New(q IssueStore, box *secretbox.Box, timeout time.Duration, labels LabelCo
 // inbox row; the rest of the sync is unchanged.
 func (s *Service) SetNotifier(n LandedNotifier) { s.notifier = n }
 
-// prdLabel resolves the configured PRD label for the sync filters, falling back
-// to the compiled-in default when unconfigured or on a settings read error (the
-// accessor already returns the default alongside a cold error, so this is
-// best-effort by design).
-func (s *Service) prdLabel(ctx context.Context) string {
+// uziLabel resolves the configured uzi run-eligibility label for the sync filters,
+// falling back to the compiled-in default when unconfigured or on a settings read
+// error (the accessor already returns the default alongside a cold error, so this
+// is best-effort by design).
+func (s *Service) uziLabel(ctx context.Context) string {
 	if s.labels != nil {
-		if l, _ := s.labels.PRDLabel(ctx); l != "" {
+		if l, _ := s.labels.UziLabel(ctx); l != "" {
 			return l
 		}
 	}
-	return settings.DefaultPRDLabel
+	return settings.DefaultUziLabel
 }
 
 // EncryptToken seals a plaintext PAT for storage.
@@ -243,10 +236,10 @@ func (s *Service) AutoMove(ctx context.Context, f forge.Forge, forgeProjectID in
 }
 
 // SetIssueLabel adds or removes ONE named label on an issue forge-first, then
-// updates the cache incrementally — the mechanic behind the PRDLESS UI toggle
-// (PRD #22 Decision 10). Unlike AutoMove (which strips every other column label to
-// enforce single-column membership) it touches only the one label and preserves
-// everything else, so it must never be used for column moves.
+// updates the cache incrementally — the mechanic behind the Promote button (PRD
+// #102 Decision 15, PRD #764). Unlike AutoMove (which strips every other column
+// label to enforce single-column membership) it touches only the one label and
+// preserves everything else, so it must never be used for column moves.
 //
 // Idempotent by a cached-labels diff: when the desired state already holds (apply
 // and the label is already present, or remove and already absent) it is a local
@@ -255,9 +248,8 @@ func (s *Service) AutoMove(ctx context.Context, f forge.Forge, forgeProjectID in
 // issues one UpdateIssueLabels with a single-element add or remove set.
 //
 // color is the label color to pin when apply auto-creates the label, and is
-// ignored on remove. It is a PARAMETER rather than the PRDLESS constant it used to
-// be because Promote (PRD #102 Decision 15) reuses this path: hardcoding the
-// escape hatch's amber would create a missing PRD label in it. Only on forge success does it upsert the incrementally-updated
+// ignored on remove. It is a PARAMETER so the one caller (Promote) supplies the
+// color for the label it applies. Only on forge success does it upsert the incrementally-updated
 // label set — the one label added to / removed from the current cached set, never
 // a wholesale recompute from stale data — carrying HasPrdLink through verbatim
 // (this path never re-derives it). Returns the re-cached row; on a forge error the
@@ -407,12 +399,13 @@ func (m Marks) Advance(next Marks) Marks {
 	return m
 }
 
-// FullSync fetches the complete PRD-labeled set (state=all, no lower bound) and,
+// FullSync fetches the complete uzi-labeled set (state=all, no lower bound) and,
 // since PRD #102 M6, every OPEN issue regardless of label — an ADDITIVE second
 // fetch, not a widening of the first (Decision 9). It upserts both, then evicts
 // cache rows absent from the UNION of the two. This is the only path that
 // observes de-labeling and deletion, so it doubles as the reconcile pass and the
-// manual Refresh.
+// manual Refresh. (PRD #764 D7: the any-state fetch keys on the uzi label now that
+// the PRD label has lost its special meaning.)
 //
 // It takes NO marks (it is unbounded by design) and returns the pair it OBSERVED,
 // one mark per fetch, for the caller to fold into its own with Marks.Advance. On
@@ -421,13 +414,13 @@ func (m Marks) Advance(next Marks) Marks {
 //
 // BOTH fetches must succeed before anything is deleted (Decision 11). A union
 // missing one half is not authoritative, and treating it as one wipes whatever
-// the failed half owns — the entire non-PRD backlog, every poll, on a transient
+// the failed half owns — the entire non-uzi backlog, every poll, on a transient
 // forge error. There is deliberately no "the extra fetch is best-effort, log and
 // continue" path: a soft-fail would also report a mark for a window nobody read
 // (Decision 11a).
 func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge) (Marks, error) {
-	prdLabel := s.prdLabel(ctx)
-	issues, err := f.ListIssues(ctx, forgeProjectID, forge.ListIssuesOptions{Labels: []string{prdLabel}})
+	uziLabel := s.uziLabel(ctx)
+	issues, err := f.ListIssues(ctx, forgeProjectID, forge.ListIssuesOptions{Labels: []string{uziLabel}})
 	if err != nil {
 		// Abort BEFORE any eviction: a failed/partial fetch must never be
 		// treated as an authoritative empty set, or a transient forge error
@@ -439,7 +432,7 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 	if err != nil {
 		return Marks{}, err
 	}
-	extra := withoutLabel(openIssues, prdLabel)
+	extra := withoutLabel(openIssues, uziLabel)
 
 	if err := s.upsertIssues(ctx, repoID, issues); err != nil {
 		return Marks{}, err
@@ -463,7 +456,7 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 }
 
 // IncrementalSync fetches only the issues updated at/after each fetch's OWN mark
-// and upserts them — the PRD-labeled set (state=all) plus the additive open,
+// and upserts them — the uzi-labeled set (state=all) plus the additive open,
 // no-label set, the same pair FullSync takes. It cannot see de-labeling or
 // deletion (the filters structurally exclude them) — that is FullSync's job.
 // Returns m advanced field-wise, never lower than what it was given. The bound is
@@ -481,8 +474,8 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 // were written; advancing the successful path's mark would skip a window whose
 // rows never reached the cache.
 func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, m Marks) (Marks, error) {
-	prdLabel := s.prdLabel(ctx)
-	opts := forge.ListIssuesOptions{Labels: []string{prdLabel}}
+	uziLabel := s.uziLabel(ctx)
+	opts := forge.ListIssuesOptions{Labels: []string{uziLabel}}
 	if !m.PRD.IsZero() {
 		opts.UpdatedAfter = &m.PRD
 	}
@@ -501,7 +494,7 @@ func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgePr
 	if err := s.upsertIssues(ctx, repoID, issues); err != nil {
 		return m, err
 	}
-	if err := s.upsertIssues(ctx, repoID, withoutLabel(openIssues, prdLabel)); err != nil {
+	if err := s.upsertIssues(ctx, repoID, withoutLabel(openIssues, uziLabel)); err != nil {
 		return m, err
 	}
 	return m.Advance(Marks{PRD: maxUpdatedAt(issues), Open: maxUpdatedAt(openIssues)}), nil
@@ -514,7 +507,7 @@ func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgePr
 // eviction on de-labeling) are defined against ITS snapshot.
 //
 // Matching is exact, like every other label comparison in this package — board
-// column labels, the PRDLESS toggle — and, more to the point, like the filter the
+// column labels, the uzi label — and, more to the point, like the filter the
 // forge itself applied to the first fetch. A looser match here would classify an
 // issue differently from the way the forge classified it, and those two are the
 // one pair that must not disagree: an issue in both halves is written twice, an

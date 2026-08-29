@@ -128,10 +128,9 @@ func (f *fakeStore) MarkImproveUziRecommendationsAddressed(_ context.Context, ar
 }
 
 type autopilotCall struct {
-	userID, repoID  uuid.UUID
-	issueIID        int64
-	description     string
-	allowWithoutPRD bool
+	userID, repoID uuid.UUID
+	issueIID       int64
+	description    string
 	// waitOnLimit is nil for the poller-shaped CreateAutopilotRun (which drops the
 	// per-run choice and takes the owner default) and carries the schedule's captured
 	// value for CreateScheduledAutopilotRun (PRD #274 Decision 1a). A test proves the
@@ -148,10 +147,9 @@ type autopilotCall struct {
 }
 
 type runCall struct {
-	userID, repoID  uuid.UUID
-	issueIID        int64
-	allowWithoutPRD bool
-	waitOnLimit     *bool
+	userID, repoID uuid.UUID
+	issueIID       int64
+	waitOnLimit    *bool
 	// scheduled discriminates which seam the scheduler routed to: false = CreateRun
 	// (the interactive human seam, which carries PRD #196's PRD-link waiver), true =
 	// CreateScheduledRun (the non-interactive scheduled seam, no waiver). This pins the
@@ -188,7 +186,7 @@ type fakeRuns struct {
 	err            error
 	// errByIssue overrides err per candidate iid (issue #416 backfill tests): when non-nil
 	// and the iid is present, the scheduled create seams return that error (so one candidate
-	// can be a no_prd_link skip while its neighbours start); else they fall back to err.
+	// can be a not_eligible skip while its neighbours start); else they fall back to err.
 	errByIssue map[int64]error
 }
 
@@ -203,37 +201,37 @@ func (f *fakeRuns) effErr(issueIID int64) error {
 	return f.err
 }
 
-func (f *fakeRuns) CreateRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, allowWithoutPRD bool, waitOnLimit *bool, _ *workersvc.SeededPlan) (store.Run, error) {
+func (f *fakeRuns) CreateRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, _ *workersvc.SeededPlan) (store.Run, error) {
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
 	// nil model: the interactive CreateRun seam carries no per-schedule model (PRD #300).
 	// false overrideSubagentModel: no per-run opt-in on the interactive seam (PRD #305).
-	f.runs = append(f.runs, runCall{userID, repoID, issueIID, allowWithoutPRD, waitOnLimit, false, nil, false})
+	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, false, nil, false})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, allowWithoutPRD bool, waitOnLimit *bool, model *string, overrideSubagentModel bool, _ *workersvc.SeededPlan) (store.Run, error) {
-	// The non-auto-approve scheduled path (PRD #196): recorded in the same `runs`
-	// bucket as CreateRun so the existing wait-on-limit / path-selection count
-	// assertions still observe it, but tagged scheduled=true so a test can prove the
-	// scheduler routed here (waiver-free) rather than through CreateRun.
+func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, model *string, overrideSubagentModel bool, _ *workersvc.SeededPlan) (store.Run, error) {
+	// The non-auto-approve scheduled path: recorded in the same `runs` bucket as
+	// CreateRun so the existing wait-on-limit / path-selection count assertions still
+	// observe it, but tagged scheduled=true so a test can prove the scheduler routed
+	// here rather than through CreateRun.
 	if err := f.effErr(issueIID); err != nil {
 		return store.Run{}, err
 	}
-	f.runs = append(f.runs, runCall{userID, repoID, issueIID, allowWithoutPRD, waitOnLimit, true, model, overrideSubagentModel})
+	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, true, model, overrideSubagentModel})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool) (store.Run, error) {
+func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error) {
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
 	// nil waitOnLimit: the poller seam has no per-run choice (owner default). nil model:
 	// the poller seam has no per-run model (PRD #300). Kept so the interface stays
 	// satisfied even though the scheduler no longer calls it.
-	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, allowWithoutPRD, nil, nil, false})
+	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, nil, nil, false})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
+func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
 	// The auto-approve scheduled path (PRD #274 Decision 1a): recorded in the same
 	// `autopilot` bucket as CreateAutopilotRun so the existing count assertions still
 	// observe it, but it CAPTURES waitOnLimit (which CreateAutopilotRun drops) and the
@@ -241,7 +239,7 @@ func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID
 	if err := f.effErr(issueIID); err != nil {
 		return store.Run{}, err
 	}
-	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, allowWithoutPRD, waitOnLimit, model, overrideSubagentModel})
+	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, waitOnLimit, model, overrideSubagentModel})
 	return store.Run{ID: uuid.New()}, nil
 }
 func (f *fakeRuns) CreatePromptRun(_ context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, model *string, overrideSubagentModel bool) (store.Run, error) {
@@ -337,14 +335,10 @@ func (b *fakeBuilder) ForgeForConnection(string, string, []byte) (forge.Forge, e
 }
 
 type fakeSettings struct {
-	prdlessEnabled bool
-	prdlessLabel   string
-	prdLabel       string
+	uziLabel string
 }
 
-func (s *fakeSettings) PrdlessEnabled(context.Context) (bool, error) { return s.prdlessEnabled, nil }
-func (s *fakeSettings) PrdlessLabel(context.Context) (string, error) { return s.prdlessLabel, nil }
-func (s *fakeSettings) PRDLabel(context.Context) (string, error)     { return s.prdLabel, nil }
+func (s *fakeSettings) UziLabel(context.Context) (string, error) { return s.uziLabel, nil }
 
 type fakeNotifier struct{ notifications []notifysvc.Notification }
 
@@ -381,7 +375,7 @@ func newHarness() *harness {
 		st:     &fakeStore{repoRow: store.GetRepoForUserRow{ID: repoID, UserID: owner, ForgeProjectID: 42, ForgeType: "gitlab", PathWithNamespace: "vtmocanu/uzi", FoldImproveUziBacklog: true}},
 		runs:   &fakeRuns{},
 		fb:     &fakeBuilder{f: &fakeForge{issue: forge.Issue{IID: 7, Description: "body", Labels: []string{"PRD"}}, createdIID: 7}},
-		set:    &fakeSettings{prdLabel: "PRD"},
+		set:    &fakeSettings{uziLabel: "uzi"},
 		notif:  &fakeNotifier{},
 		vault:  &fakeVault{unlocked: true},
 		now:    time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC),
@@ -561,6 +555,98 @@ func TestTickSweepThreadsMaxIssues(t *testing.T) {
 	h2.sched.Boot(context.Background())
 	if h2.st.sweepMaxIssuesParam.Valid {
 		t.Fatalf("NULL max_issues must thread as an invalid (NULL) param, got %+v", h2.st.sweepMaxIssuesParam)
+	}
+}
+
+// TestFireSweepNonAutoCandidateStartsViaScheduledRun is the M3 sweep-selector positive
+// case at the fake seam: a swept candidate whose CreateScheduledRun (the non-auto-approve
+// scheduled seam) SUCCEEDS yields exactly one Started — a run fired — routed through
+// CreateScheduledRun (scheduled=true). Post-PRD #764 M1 that seam applies the single
+// uzi_label eligibility gate; fakeRuns stands in for that gate accepting the candidate,
+// so this proves the scheduler's handling of a fire that the gate allowed.
+func TestFireSweepNonAutoCandidateStartsViaScheduledRun(t *testing.T) {
+	h := newHarness()
+	s := h.sweepSchedule(pgtype.Int4{})
+	s.AutoApprove = false // non-auto: the fire routes through CreateScheduledRun
+	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 96}}
+	h.fb.f.issue.Title = "Swept and runnable"
+
+	out, err := h.sched.RunNow(context.Background(), s)
+	if err != nil {
+		t.Fatalf("a successful sweep fire must not surface an error, got %v", err)
+	}
+	if out.Matched != 1 || len(out.Started) != 1 || len(out.Skips) != 0 {
+		t.Fatalf("outcome = %+v, want Matched:1 Started:1 Skips:0", out)
+	}
+	if len(h.runs.runs) != 1 || !h.runs.runs[0].scheduled {
+		t.Fatalf("swept non-auto candidate must fire through CreateScheduledRun (scheduled=true), got runs=%+v", h.runs.runs)
+	}
+	if len(h.runs.autopilot) != 0 {
+		t.Fatalf("non-auto sweep must NOT use the autopilot seam, got %d", len(h.runs.autopilot))
+	}
+	if st := out.Started[0]; st.IssueIID == nil || *st.IssueIID != 96 || st.Title != "Swept and runnable" {
+		t.Fatalf("started = %+v, want iid 96 / fetched title", st)
+	}
+	assertBalances(t, out)
+}
+
+// TestTickSweepBareSelectorNotEligibleSkipsAndAdvances is the M3 discriminator at the
+// fake seam: a swept BARE-selector candidate (a selector such as `bug` WITHOUT `uzi`) is
+// refused by the single uzi_label gate with workersvc.ErrNotPRDIssue. The scheduler must
+// turn that into a benign not_eligible Skip AND STILL advance the schedule — the cadence
+// is preserved, no park, no tick-storm — mirroring TestTickDedupSkipStillAdvances and
+// TestFireIssueSentinelSkips. fakeRuns stands in for the gate returning ErrNotPRDIssue;
+// the skip reason is read back out of the persisted last_fire the advance wrote.
+func TestTickSweepBareSelectorNotEligibleSkipsAndAdvances(t *testing.T) {
+	h := newHarness()
+	s := h.sweepSchedule(pgtype.Int4{})
+	s.AutoApprove = false
+	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 96}}
+	h.fb.f.issue.Title = "bug but no uzi"
+	h.runs.err = workersvc.ErrNotPRDIssue // the single uzi_label gate refuses a bare-selector issue
+	h.st.due = []store.RunSchedule{s}
+
+	h.sched.Boot(context.Background())
+
+	// No run fired on either seam.
+	if len(h.runs.runs) != 0 || len(h.runs.autopilot) != 0 {
+		t.Fatalf("a not-eligible candidate must not fire the seam: runs=%d autopilot=%d", len(h.runs.runs), len(h.runs.autopilot))
+	}
+	// The benign skip STILL advances the schedule, active, with a bumped future next_fire_at.
+	if len(h.st.advanceCalls) != 1 {
+		t.Fatalf("not_eligible skip must STILL advance: advance calls = %d, want 1", len(h.st.advanceCalls))
+	}
+	adv := h.st.advanceCalls[0]
+	if adv.Status != "active" {
+		t.Fatalf("advance status = %q, want active (no park)", adv.Status)
+	}
+	if !adv.NextFireAt.Valid || !adv.NextFireAt.Time.After(h.now) {
+		t.Fatalf("next_fire_at = %+v, want a bumped future instant", adv.NextFireAt)
+	}
+	// It must NOT park (no status='error' write) — a not_eligible skip is benign, not fatal.
+	if len(h.st.statusCalls) != 0 {
+		t.Fatalf("a benign not_eligible skip must NOT park: status calls = %d, want 0", len(h.st.statusCalls))
+	}
+	// The persisted last_fire records the candidate as a single not_eligible skip.
+	var lf struct {
+		Matched int `json:"matched"`
+		Skips   []struct {
+			IssueIID *int64 `json:"issue_iid"`
+			Reason   string `json:"reason"`
+		} `json:"skips"`
+		Started []json.RawMessage `json:"started"`
+	}
+	if err := json.Unmarshal(adv.LastFire, &lf); err != nil {
+		t.Fatalf("decode persisted last_fire: %v (raw %s)", err, adv.LastFire)
+	}
+	if lf.Matched != 1 || len(lf.Skips) != 1 || len(lf.Started) != 0 {
+		t.Fatalf("last_fire = %+v, want matched:1 one skip no starts", lf)
+	}
+	if lf.Skips[0].Reason != string(SkipNotEligible) {
+		t.Fatalf("skip reason = %q, want %q (not_eligible)", lf.Skips[0].Reason, SkipNotEligible)
+	}
+	if lf.Skips[0].IssueIID == nil || *lf.Skips[0].IssueIID != 96 {
+		t.Fatalf("skip iid = %v, want 96", lf.Skips[0].IssueIID)
 	}
 }
 
@@ -751,7 +837,7 @@ func assertBalances(t *testing.T, o FireOutcome) {
 	}
 }
 
-// TestSkipReasonForErr pins the seam-sentinel → reason mapping directly: each of the four
+// TestSkipReasonForErr pins the seam-sentinel → reason mapping directly: each of the three
 // benign run-creation sentinels maps to its reason; ErrActivePromptExists and an unrelated
 // error are NOT mapped here (the prompt path records already_running at its own site, and
 // an unknown error is left to the caller to classify as transient/permanent).
@@ -761,7 +847,6 @@ func TestSkipReasonForErr(t *testing.T) {
 		want SkipReason
 		ok   bool
 	}{
-		{workersvc.ErrNoPRDLink, SkipNoPRDLink, true},
 		{workersvc.ErrNotPRDIssue, SkipNotEligible, true},
 		{workersvc.ErrActiveRunExists, SkipAlreadyRunning, true},
 		{workersvc.ErrDescriptionTooLarge, SkipDescriptionTooLarge, true},
@@ -776,9 +861,9 @@ func TestSkipReasonForErr(t *testing.T) {
 		}
 	}
 	// AllSkipReasons enumerates the full closed set (PRD #590 M1 added vault_locked;
-	// PRD #686 D10 added self_improve_mr_cap_reached).
-	if len(AllSkipReasons) != 7 {
-		t.Fatalf("AllSkipReasons has %d reasons, want 7", len(AllSkipReasons))
+	// PRD #686 D10 added self_improve_mr_cap_reached; PRD #764 retired not_eligible).
+	if len(AllSkipReasons) != 6 {
+		t.Fatalf("AllSkipReasons has %d reasons, want 6", len(AllSkipReasons))
 	}
 }
 
@@ -793,7 +878,6 @@ func TestFireIssueSentinelSkips(t *testing.T) {
 	}{
 		{"active_run", workersvc.ErrActiveRunExists, SkipAlreadyRunning},
 		{"not_eligible", workersvc.ErrNotPRDIssue, SkipNotEligible},
-		{"no_prd_link", workersvc.ErrNoPRDLink, SkipNoPRDLink},
 		{"too_large", workersvc.ErrDescriptionTooLarge, SkipDescriptionTooLarge},
 	}
 	for _, c := range cases {
@@ -1014,10 +1098,10 @@ func TestFireSweepPerCandidateBuckets(t *testing.T) {
 		h := newHarness()
 		h.st.sweepRows = oneRow
 		h.fb.f.issue.Title = "Broken login"
-		h.runs.err = workersvc.ErrNoPRDLink
+		h.runs.err = workersvc.ErrNotPRDIssue
 		out, _ := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{}))
-		if out.Matched != 1 || len(out.Skips) != 1 || out.Skips[0].Reason != SkipNoPRDLink {
-			t.Fatalf("outcome = %+v, want one no_prd_link skip", out)
+		if out.Matched != 1 || len(out.Skips) != 1 || out.Skips[0].Reason != SkipNotEligible {
+			t.Fatalf("outcome = %+v, want one not_eligible skip", out)
 		}
 		if out.Skips[0].Title != "Broken login" {
 			t.Fatalf("sweep skip Title = %q, want the fetched issue title", out.Skips[0].Title)
@@ -1204,7 +1288,7 @@ func eqInt64s(a, b []int64) bool {
 }
 
 // TestFireSweepBackfillFillsSlotPastSkip is the flagship case: a window whose 2nd candidate
-// is a no_prd_link skip still starts max_issues runs by walking past the skip to the next
+// is a not_eligible skip still starts max_issues runs by walking past the skip to the next
 // eligible candidate — AND stops at max_issues (the 5th, eligible, candidate is never
 // examined). The skipped candidate is still flagged, oldest-eligible ordering is preserved,
 // and Matched counts only the examined prefix (issue #416).
@@ -1216,7 +1300,7 @@ func TestFireSweepBackfillFillsSlotPastSkip(t *testing.T) {
 		{ForgeIssueIid: 10}, {ForgeIssueIid: 20}, {ForgeIssueIid: 30}, {ForgeIssueIid: 40}, {ForgeIssueIid: 50},
 	}
 	h.st.sweepCount = 5
-	h.runs.errByIssue = map[int64]error{20: workersvc.ErrNoPRDLink} // 20 cannot start
+	h.runs.errByIssue = map[int64]error{20: workersvc.ErrNotPRDIssue} // 20 cannot start
 	out, err := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{Int32: 3, Valid: true}))
 	if err != nil {
 		t.Fatalf("backfill fire must not error, got %v", err)
@@ -1226,8 +1310,8 @@ func TestFireSweepBackfillFillsSlotPastSkip(t *testing.T) {
 	if want := []int64{10, 30, 40}; !eqInt64s(startedIIDs(out), want) {
 		t.Fatalf("started iids = %v, want %v (oldest-eligible first, backfilled past 20, capped at 3)", startedIIDs(out), want)
 	}
-	if len(out.Skips) != 1 || out.Skips[0].Reason != SkipNoPRDLink || out.Skips[0].IssueIID == nil || *out.Skips[0].IssueIID != 20 {
-		t.Fatalf("skips = %+v, want exactly one no_prd_link skip for iid 20", out.Skips)
+	if len(out.Skips) != 1 || out.Skips[0].Reason != SkipNotEligible || out.Skips[0].IssueIID == nil || *out.Skips[0].IssueIID != 20 {
+		t.Fatalf("skips = %+v, want exactly one not_eligible skip for iid 20", out.Skips)
 	}
 	// Matched = examined prefix [10,20,30,40] = 4 (NOT 3, NOT 5): the skip is counted, 50 is not.
 	if out.Matched != 4 {
@@ -1240,26 +1324,26 @@ func TestFireSweepBackfillFillsSlotPastSkip(t *testing.T) {
 	assertBalances(t, out)
 }
 
-// TestFireSweepBackfillPastAlreadyRunningAndNoPRDLink proves backfill walks past BOTH a
-// pre-check already_running skip (no forge call) and a no_prd_link skip, filling the cap
+// TestFireSweepBackfillPastAlreadyRunningAndNotEligible proves backfill walks past BOTH a
+// pre-check already_running skip (no forge call) and a not_eligible skip, filling the cap
 // from the eligible candidates beyond them.
-func TestFireSweepBackfillPastAlreadyRunningAndNoPRDLink(t *testing.T) {
+func TestFireSweepBackfillPastAlreadyRunningAndNotEligible(t *testing.T) {
 	h := newHarness()
 	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{
 		{ForgeIssueIid: 10}, {ForgeIssueIid: 20}, {ForgeIssueIid: 30}, {ForgeIssueIid: 40}, {ForgeIssueIid: 50},
 	}
 	h.st.sweepCount = 5
-	h.st.activeByIssue = map[int64]bool{20: true}                   // 20 already running (pre-check skip)
-	h.runs.errByIssue = map[int64]error{30: workersvc.ErrNoPRDLink} // 30 has no PRD link
+	h.st.activeByIssue = map[int64]bool{20: true}                     // 20 already running (pre-check skip)
+	h.runs.errByIssue = map[int64]error{30: workersvc.ErrNotPRDIssue} // 30 has is not eligible
 	out, err := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{Int32: 3, Valid: true}))
 	if err != nil {
 		t.Fatalf("backfill fire must not error, got %v", err)
 	}
 	if want := []int64{10, 40, 50}; !eqInt64s(startedIIDs(out), want) {
-		t.Fatalf("started iids = %v, want %v (past already_running 20 and no_prd_link 30)", startedIIDs(out), want)
+		t.Fatalf("started iids = %v, want %v (past already_running 20 and not_eligible 30)", startedIIDs(out), want)
 	}
 	if len(out.Skips) != 2 {
-		t.Fatalf("skips = %+v, want two (already_running 20, no_prd_link 30)", out.Skips)
+		t.Fatalf("skips = %+v, want two (already_running 20, not_eligible 30)", out.Skips)
 	}
 	byIID := map[int64]SkipReason{}
 	for _, s := range out.Skips {
@@ -1267,8 +1351,8 @@ func TestFireSweepBackfillPastAlreadyRunningAndNoPRDLink(t *testing.T) {
 			byIID[*s.IssueIID] = s.Reason
 		}
 	}
-	if byIID[20] != SkipAlreadyRunning || byIID[30] != SkipNoPRDLink {
-		t.Fatalf("skip reasons = %v, want {20:already_running, 30:no_prd_link}", byIID)
+	if byIID[20] != SkipAlreadyRunning || byIID[30] != SkipNotEligible {
+		t.Fatalf("skip reasons = %v, want {20:already_running, 30:not_eligible}", byIID)
 	}
 	if out.Matched != 5 {
 		t.Fatalf("Matched = %d, want 5 (examined 10,20,30,40,50)", out.Matched)
@@ -1293,7 +1377,7 @@ func TestFireSweepBackfillScanBound(t *testing.T) {
 	for i := 0; i < window; i++ {
 		iid := int64(100 + i)
 		rows = append(rows, store.ListSweepCandidateIssuesRow{ForgeIssueIid: iid})
-		errs[iid] = workersvc.ErrNoPRDLink // the whole window is ineligible
+		errs[iid] = workersvc.ErrNotPRDIssue // the whole window is ineligible
 	}
 	h := newHarness()
 	h.st.sweepRows = rows
@@ -1332,7 +1416,7 @@ func TestFireSweepBackfillNullCapUnchanged(t *testing.T) {
 	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{
 		{ForgeIssueIid: 10}, {ForgeIssueIid: 20}, {ForgeIssueIid: 30},
 	}
-	h.runs.errByIssue = map[int64]error{20: workersvc.ErrNoPRDLink}
+	h.runs.errByIssue = map[int64]error{20: workersvc.ErrNotPRDIssue}
 	out, _ := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{})) // NULL cap
 	if h.st.sweepMaxIssuesParam.Valid {
 		t.Fatalf("NULL cap must thread an invalid (NULL, unlimited) param, not a widened window: got %+v", h.st.sweepMaxIssuesParam)

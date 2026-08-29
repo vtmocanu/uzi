@@ -49,7 +49,7 @@ function renderModal() {
 }
 
 beforeEach(() => {
-  vi.mocked(useAuth).mockReturnValue({ prdLabel: "PRD" } as unknown as ReturnType<typeof useAuth>);
+  vi.mocked(useAuth).mockReturnValue({ uziLabel: "uzi" } as unknown as ReturnType<typeof useAuth>);
   mockApi.previewSchedule.mockResolvedValue({ fires: [] });
   mockApi.listRepos.mockResolvedValue({ repos: [] });
   mockApi.checkRepoLabels.mockResolvedValue({ missing: [] });

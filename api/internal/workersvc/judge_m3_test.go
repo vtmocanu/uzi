@@ -14,15 +14,9 @@ import (
 )
 
 // fakeSettings is a SettingsReader stub for the judge gate/claim tests, and since
-// PRD #102 M6 for the run-eligibility label gate too. prdLabel is left zero by the
-// judge tests, which is the "unconfigured" case Service.prdLabel resolves to the
-// compiled-in default — the same thing a real Cache does.
-//
-// eligibleLabels is left nil by every test that only cares about the primary: the
-// Service's runEligibleLabels ALWAYS unions the primary in (mirroring the Cache
-// accessor), so fakeSettings{prdLabel:"Feature"} still makes "Feature" eligible.
-// waivesPRDLink is likewise zero (false) by default; a test that exercises the
-// PRD #196 waiver sets it explicitly.
+// PRD #764 M1 for the single-label run-eligibility gate too. uziLabel is left zero by
+// the judge tests, which is the "unconfigured" case Service.uziLabel resolves to the
+// compiled-in default ("uzi") — the same thing a real Cache does.
 type fakeSettings struct {
 	enabled         bool
 	enforceAll      bool
@@ -35,11 +29,7 @@ type fakeSettings struct {
 	// nil unless a test sets it. summaryModelErr models a settings read fault.
 	summaryModel    string
 	summaryModelErr error
-	prdLabel        string
-	eligibleLabels  []string
-	waivesPRDLink   bool
-	prdlessEnabled  bool
-	prdlessLabel    string
+	uziLabel        string
 	err             error
 }
 
@@ -55,15 +45,7 @@ func (f fakeSettings) JudgeModel(context.Context) (string, error) { return f.mod
 func (f fakeSettings) SummaryModel(context.Context) (string, error) {
 	return f.summaryModel, f.summaryModelErr
 }
-func (f fakeSettings) PRDLabel(context.Context) (string, error) { return f.prdLabel, f.err }
-func (f fakeSettings) RunEligibleLabels(context.Context) ([]string, error) {
-	return f.eligibleLabels, f.err
-}
-func (f fakeSettings) EligibleLabelWaivesPRDLink(context.Context) (bool, error) {
-	return f.waivesPRDLink, f.err
-}
-func (f fakeSettings) PrdlessEnabled(context.Context) (bool, error) { return f.prdlessEnabled, f.err }
-func (f fakeSettings) PrdlessLabel(context.Context) (string, error) { return f.prdlessLabel, f.err }
+func (f fakeSettings) UziLabel(context.Context) (string, error) { return f.uziLabel, f.err }
 
 // -------------------------------------------------------------------------
 // command-not-found scan (Decision 4)

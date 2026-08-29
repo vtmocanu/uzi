@@ -1,6 +1,6 @@
 ---
 name: issue-triage
-description: "Triages one GitHub issue on this repo end to end, prioritizing issues that are silently un-sweepable by uzi — they look queued but never fire because they are missing a sweep selector (bug/Planned) or the fireable half (a valid PRD link or PRDLESS), including a PRD label with no prds/*.md link. Hunts those gaps first, then the raw un-triaged backlog, then proposes revisiting parked (brainstorm/Later) issues. Explains in plain English what the issue proposes, recommends whether implementing makes sense, verifies the issue is not stale (premise still holds, file anchors current, any referenced PR or PRD actually merged), then on your confirmation applies the missing sweep labels and posts a freshness comment. Use when triaging the issue backlog, finding issues the nightly sweep will never touch, deciding what to send to uzi, or asked to triage the next issue, go through the open issues, or judge whether an issue is worth doing. Triggers include triage issue, triage the backlog, un-sweepable issues, issues not swept by uzi, next issue to implement, should we do this issue, queue an issue for uzi."
+description: "Triages one GitHub issue on this repo end to end, prioritizing issues that are silently un-sweepable by uzi — they look queued but never fire because they are missing a sweep selector (bug/Planned) or the `uzi` eligibility label. Hunts those gaps first, then the raw un-triaged backlog, then proposes revisiting parked (brainstorm/Later) issues. Explains in plain English what the issue proposes, recommends whether implementing makes sense, verifies the issue is not stale (premise still holds, file anchors current, any referenced PR or PRD actually merged), then on your confirmation applies the missing sweep labels and posts a freshness comment. Use when triaging the issue backlog, finding issues the nightly sweep will never touch, deciding what to send to uzi, or asked to triage the next issue, go through the open issues, or judge whether an issue is worth doing. Triggers include triage issue, triage the backlog, un-sweepable issues, issues not swept by uzi, next issue to implement, should we do this issue, queue an issue for uzi."
 ---
 
 # Issue triage
@@ -14,9 +14,9 @@ elsewhere:
 
 - **Sweep gating + this instance's sweep labels/schedules** live in `CLAUDE.local.md`
   → "uzi scheduled sweeps on this instance", plus `docs/scheduling.md` and
-  `docs/prdless.md`. **Read those for how a label makes an issue fire**; do not hardcode
-  the mechanics here (they are machine/instance-specific and drift). Live source of
-  truth for the schedules is `uzi schedule list`.
+  `docs/admin-settings.md#run-eligibility`. **Read those for how a label makes an issue
+  fire**; do not hardcode the mechanics here (they are machine/instance-specific and
+  drift). Live source of truth for the schedules is `uzi schedule list`.
 - **Sending an issue to uzi and driving it to a merged PR** is the **uzi-watcher**
   skill. This skill stops at "queued for the sweep" or "hand to uzi-watcher".
 
@@ -26,22 +26,18 @@ If the user named an issue (number/URL), use it. Otherwise hunt in **priority or
 picking the lowest-numbered issue in the highest non-empty tier.
 
 **Why the tiers.** A sweep fires an issue only when it has BOTH halves: (a) a
-**selector** label (`Planned`, or `bug` for a bug) AND (b) it is **fireable** — either
-a valid PRD (`PRD` label *and* the body links a `prds/*.md`) or the `PRDLESS` label.
+**selector** label (`Planned`, or `bug` for a bug) AND (b) the **`uzi` label** — the
+single run-eligibility gate; no PRD link and no admin waiver required, or relevant.
 (Authoritative mechanics, which drift: `CLAUDE.local.md` → "uzi scheduled sweeps",
-plus `docs/scheduling.md`, `docs/prdless.md`.) An issue missing **either** half looks
-queued but silently never runs, and nobody notices — so those are the highest-priority
-triage targets, ahead of the raw backlog.
+plus `docs/scheduling.md`, `docs/admin-settings.md#run-eligibility`.) An issue missing
+**either** half looks queued but silently never runs, and nobody notices — so those are
+the highest-priority triage targets, ahead of the raw backlog.
 
-- **Tier 1 — silently un-sweepable gaps** (not parked). Three shapes:
-  - **1A selector, no fire** — has `bug`/`Planned` but is not fireable (no `PRDLESS`,
-    no valid PRD). The `bug` sweep picks it as a candidate, then the gate drops it.
-    (This is #190's shape.)
-  - **1B fireable, no selector** — has `PRDLESS` or a valid PRD but no `bug`/`Planned`,
-    so it never even becomes a candidate. Common on a fully-PRD'd issue nobody labelled
-    `Planned`.
-  - **1C `PRD` label, no link** — carries `PRD` but the body links no `prds/*.md`, and
-    it has no `PRDLESS`. Inconsistent labelling: won't fire directly and isn't PRDLESS.
+- **Tier 1 — silently un-sweepable gaps** (not parked). Two shapes:
+  - **1A selector, no `uzi`** — has `bug`/`Planned` but not `uzi`. The `bug` sweep
+    picks it as a candidate, then the gate drops it. (This is #190's shape.)
+  - **1B `uzi`, no selector** — has `uzi` but no `bug`/`Planned`, so it never even
+    becomes a candidate. Common on a fully-specced issue nobody labelled `Planned`.
 - **Tier 2 — un-triaged backlog**: no sweep and no park label at all.
 - **Tier 3 — parked** (`brainstorm`/`Later`): propose *revisiting* only when tiers 1
   and 2 are empty — these need a human decision the sweep will never make.
@@ -53,14 +49,13 @@ gh issue list --repo vtmocanu/uzi --state open --json number,title,labels,body -
     def names: [.labels[].name];
     def has($l): (names | index($l)) != null;
     def selector: (has("bug") or has("Planned"));
-    def fireable: (has("PRDLESS") or (has("PRD") and (.body // "" | test("prds/[^\\s)]+\\.md"))));
+    def fireable: has("uzi");
     def parked: ((names) - park) != (names);
     [ .[]
       | (if parked and (has("brainstorm") or has("Later")) then "3:parked"
          elif parked then empty
-         elif (selector and (fireable|not)) then "1A:selector-no-fire"
-         elif (fireable and (selector|not)) then "1B:fireable-no-selector"
-         elif (has("PRD") and (fireable|not)) then "1C:PRDlabel-no-link"
+         elif (selector and (fireable|not)) then "1A:selector-no-uzi"
+         elif (fireable and (selector|not)) then "1B:uzi-no-selector"
          elif (selector and fireable) then empty
          else "2:untriaged" end) as $tier
       | select($tier != null)
@@ -68,12 +63,11 @@ gh issue list --repo vtmocanu/uzi --state open --json number,title,labels,body -
     | sort | .[]'
 ```
 
-The `prds/[^\s)]+\.md` test is the PRD-link detector — do not trust the `PRD` label
-alone (that is exactly gap 1C). Confirm the picked number with the user before spending
-effort on it. A picked gap issue still runs the full Step 2–4 flow: the gap tells you
-which label is *missing*, not that adding it is correct — the issue may be Already done,
-Not worth it, or genuinely `Later` (in which case the fix is to make that intent
-explicit, not to complete the sweep config).
+Confirm the picked number with the user before spending effort on it. A picked gap
+issue still runs the full Step 2–4 flow: the gap tells you which label is *missing*,
+not that adding it is correct — the issue may be Already done, Not worth it, or
+genuinely `Later` (in which case the fix is to make that intent explicit, not to
+complete the sweep config).
 
 ## Step 2 — Understand and explain
 
@@ -91,7 +85,7 @@ after the user confirms (Step 5):
 
 | Verdict | When | Action on confirm |
 |---|---|---|
-| **Send to sweep** | clear value, self-contained, premise holds, does NOT touch `.github/workflows` | sweep selector (`Planned`, or `bug` for a bug) + `PRDLESS` unless already PRD'd; post freshness comment |
+| **Send to sweep** | clear value, self-contained, premise holds, does NOT touch `.github/workflows` | sweep selector (`Planned`, or `bug` for a bug) + `uzi` unless already labelled; post freshness comment |
 | **Do locally** | tiny/mechanical, or it MUST touch `.github/workflows` (a sweep cannot), or the user wants it now | do it in-session or hand to **uzi-watcher**; no sweep labels |
 | **Needs design** | open question or competing approaches | add `brainstorm`; summarize the fork |
 | **Defer** | valid but not now | add `Later` |
@@ -99,14 +93,14 @@ after the user confirms (Step 5):
 | **Not worth it** | duplicate / invalid / out of scope | comment the rationale + `wontfix`/`duplicate`/`invalid` |
 
 Prefer the best-practice choice and say why. Do not author a `prds/*.md` when the issue
-body is already a complete spec — prefer `PRDLESS`.
+body is already a complete spec — a PRD file is optional, never required, so a
+spec-in-body issue runs fine with just the `uzi` label.
 
 **For a Tier-1 gap issue, the "Send to sweep" action is just completing the missing
 half** — add only what the gap lacks, don't blindly re-add both labels:
 
-- **1A** (selector, no fire): add `PRDLESS` (spec in body) or a valid PRD; the `bug`/`Planned` is already there.
-- **1B** (fireable, no selector): add the selector only (`Planned`, or `bug` for a bug) — `PRDLESS`/PRD already present.
-- **1C** (`PRD` label, no link): the label is wrong. Either the spec is in-body → drop to `PRDLESS`; or a `prds/*.md` exists but is unlinked → link it; or the PRD was never written → decide PRD-vs-PRDLESS per the body. Then add a selector if missing.
+- **1A** (selector, no `uzi`): add `uzi`; the `bug`/`Planned` is already there.
+- **1B** (`uzi`, no selector): add the selector only (`Planned`, or `bug` for a bug) — `uzi` already present.
 
 If a Tier-1 gap issue is actually deferred on purpose (that is *why* it lacks a
 selector), the fix is **Defer** — add `Later` to make the intent explicit so it stops
@@ -140,9 +134,9 @@ Labels and comments are public writes on the repo. **Always propose first and ap
 only after the user's OK.** Then:
 
 ```sh
-gh issue edit NNN --repo vtmocanu/uzi --add-label "SELECTOR" --add-label "PRDLESS"
+gh issue edit NNN --repo vtmocanu/uzi --add-label "SELECTOR" --add-label "uzi"
 gh issue comment NNN --repo vtmocanu/uzi --body "$(cat <<'EOF'
-Queued for the nightly SELECTOR sweep (SELECTOR + PRDLESS added; spec-in-body).
+Queued for the nightly SELECTOR sweep (SELECTOR + uzi added; spec-in-body).
 [anchor refresh + any pinned design direction from Step 4]
 EOF
 )"

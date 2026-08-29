@@ -2,10 +2,8 @@
 // Pure + unit-tested, the runBadge.ts / boardColumns.ts discipline; the callers own
 // the DOM.
 //
-// Four kinds of label are excluded, and all four are OPERATOR-CONFIGURABLE, so
-// every one of them arrives as a parameter and none is hardcoded here:
-//   - the PRD label       (settings.KeyPRDLabel)      — board membership, not content
-//   - the PRDLESS label   (settings.KeyPRDLESSLabel)  — an escape hatch, shown as a badge
+// Two kinds of label are excluded, both OPERATOR-CONFIGURABLE, so each arrives as a
+// parameter and none is hardcoded here:
 //   - the autopilot label (settings.KeyAutopilotLabel) — a workflow marker
 //   - the configured column labels — a card in Planned must not also wear a Planned chip
 //
@@ -17,8 +15,6 @@
 // user just added.
 
 export interface LabelChipExclusions {
-  prdLabel: string;
-  prdlessLabel: string;
   autopilotLabel: string;
   // Column labels to exclude. The board passes its saved columns; ColumnSettings
   // passes its in-flight edit state.
@@ -31,17 +27,10 @@ export interface LabelChipExclusions {
 // exclusion entry must never become an empty chip either).
 export function chipLabels(
   labels: readonly string[],
-  { prdLabel, prdlessLabel, autopilotLabel, columnLabels }: LabelChipExclusions,
+  { autopilotLabel, columnLabels }: LabelChipExclusions,
 ): string[] {
   const columns = new Set(columnLabels);
-  return labels.filter(
-    (l) =>
-      l !== "" &&
-      l !== prdLabel &&
-      l !== prdlessLabel &&
-      l !== autopilotLabel &&
-      !columns.has(l),
-  );
+  return labels.filter((l) => l !== "" && l !== autopilotLabel && !columns.has(l));
 }
 
 // hoistLabels reorders `labels` so every label that also appears in `hoist` comes

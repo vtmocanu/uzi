@@ -6,8 +6,8 @@ import { IssueView } from "./IssueView";
 import { api, type Card, type IssueDetail, type SecretMeta, type Worker } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
-// IssueView loads four endpoints and, for the PRDLESS toggle (PRD #22 M4), calls
-// setIssuePrdless. Mock the api and useAuth so the test stays offline.
+// IssueView loads four endpoints and, for Promote (PRD #764), calls promoteIssue.
+// Mock the api and useAuth so the test stays offline.
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
   return {
@@ -17,7 +17,6 @@ vi.mock("../lib/api", async (importOriginal) => {
       listRuns: vi.fn(),
       listWorkers: vi.fn(),
       listSecrets: vi.fn(),
-      setIssuePrdless: vi.fn(),
       promoteIssue: vi.fn(),
     },
   };
@@ -48,7 +47,7 @@ function anIssue(over: Partial<IssueDetail> = {}): IssueDetail {
     iid: 7,
     title: "A small typo fix",
     state: "opened",
-    labels: ["PRD"],
+    labels: ["uzi"],
     web_url: "https://gitlab.example.com/grp/proj/-/issues/7",
     forge_type: "gitlab",
     author: "alice",
@@ -80,24 +79,15 @@ function aCard(labels: string[]): Card {
   };
 }
 
-function setAuth(
-  prdlessEnabled: boolean,
-  opts: { runEligibleLabels?: string[]; eligibleLabelWaivesPrdLink?: boolean } = {},
-) {
+function setAuth() {
   vi.mocked(useAuth).mockReturnValue({
     user,
     loading: false,
-    prdLabel: "PRD",
+    uziLabel: "uzi",
     autopilotLabel: "autopilot",
     theme: "ember",
     themeOverride: null,
     defaultTheme: "ember",
-    prdlessLabel: "PRDLESS",
-    prdlessEnabled,
-    // PRD #196 M4 ships `bug` as run-eligible; tests that need a non-eligible label use
-    // `documentation`. The waiver defaults on, like the shipped default.
-    runEligibleLabels: opts.runEligibleLabels ?? ["PRD", "bug"],
-    eligibleLabelWaivesPrdLink: opts.eligibleLabelWaivesPrdLink ?? true,
     vaultUnlocked: true,
     vaultExists: true,
     hasPassword: true,
@@ -140,7 +130,7 @@ afterEach(() => {
 // escaped-JSX sink and still strips per-site.
 describe("IssueView — the forge title and description carry no format characters (#124)", () => {
   it("strips bidi/zero-width characters from both", async () => {
-    setAuth(false);
+    setAuth();
     mockApi.getIssue.mockResolvedValue({
       issue: anIssue({
         title: "Fix the \u202Eparser\u200B bug",
@@ -159,103 +149,54 @@ describe("IssueView — the forge title and description carry no format characte
   });
 });
 
-describe("IssueView PRDLESS toggle (PRD #22 M4)", () => {
-  it("hides the toggle when the feature is disabled", async () => {
-    setAuth(false);
-    mockApi.getIssue.mockResolvedValue({ issue: anIssue() });
-    renderIssueView();
-    await screen.findByText("A small typo fix");
-    expect(screen.queryByText(/PRDLESS/)).toBeNull();
-  });
+describe("IssueView PRD presence badge (PRD #764)", () => {
+  // A linked prds/*.md is optional but still detected: an issue that has one shows a
+  // neutral "PRD" badge; one that does not shows no badge (and no "no PRD link" warning,
+  // which the old PRD-required model rendered).
+  const BADGE_TITLE = "This issue links a prds/*.md file";
 
-  it("applies the label and adopts the returned card's labels", async () => {
-    setAuth(true);
-    mockApi.getIssue.mockResolvedValue({ issue: anIssue() });
-    mockApi.setIssuePrdless.mockResolvedValue({ card: aCard(["PRD", "PRDLESS"]) });
-    renderIssueView();
-
-    const applyBtn = await screen.findByText("Mark PRDLESS");
-    fireEvent.click(applyBtn);
-
-    await waitFor(() =>
-      expect(mockApi.setIssuePrdless).toHaveBeenCalledWith("repo-1", 7, true),
-    );
-    // After the 200, the label is present, so the affordance flips to "Remove".
-    await screen.findByText("Remove PRDLESS");
-  });
-
-  it("removes the label when it is already applied", async () => {
-    setAuth(true);
-    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["PRD", "PRDLESS"] }) });
-    mockApi.setIssuePrdless.mockResolvedValue({ card: aCard(["PRD"]) });
-    renderIssueView();
-
-    const removeBtn = await screen.findByText("Remove PRDLESS");
-    fireEvent.click(removeBtn);
-
-    await waitFor(() =>
-      expect(mockApi.setIssuePrdless).toHaveBeenCalledWith("repo-1", 7, false),
-    );
-    await screen.findByText("Mark PRDLESS");
-  });
-});
-
-describe("IssueView PRDLESS badge (PRD #22 M3)", () => {
-  // The badge is queried by its distinctive title rather than its text. That used to
-  // be necessary because the issue ALSO rendered a label chip named "PRDLESS" and the
-  // title was the only thing telling the two apart; since PRD #102 M4 the shared
-  // chipLabels predicate excludes PRDLESS unconditionally, so there is no chip to
-  // collide with. Kept as the query anyway: it is the assertion that does not move
-  // when the label is renamed in settings.
-  const BADGE_TITLE = "PRD-link gate bypassed by label";
-
-  it("shows the PRDLESS badge, not 'no PRD link', when enabled and labeled", async () => {
-    setAuth(true);
-    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["PRD", "PRDLESS"] }) });
+  it("shows the neutral PRD badge when the issue links a PRD", async () => {
+    setAuth();
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ has_prd_link: true }) });
     renderIssueView();
     await screen.findByText("A small typo fix");
     expect(screen.getByTitle(BADGE_TITLE)).toBeTruthy();
+  });
+
+  it("shows no PRD badge — and no 'no PRD link' warning — when the issue has no PRD", async () => {
+    setAuth();
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ has_prd_link: false }) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.queryByTitle(BADGE_TITLE)).toBeNull();
+    // The retired "no PRD link" warning must not render — a PRD is optional now.
     expect(screen.queryByText("no PRD link")).toBeNull();
-  });
-
-  it("shows 'no PRD link' when enabled but the label is absent", async () => {
-    setAuth(true);
-    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["PRD"] }) });
-    renderIssueView();
-    await screen.findByText("A small typo fix");
-    expect(screen.getByText("no PRD link")).toBeTruthy();
-    expect(screen.queryByTitle(BADGE_TITLE)).toBeNull();
-  });
-
-  it("shows 'no PRD link' when the feature is disabled even if labeled", async () => {
-    setAuth(false);
-    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["PRD", "PRDLESS"] }) });
-    renderIssueView();
-    await screen.findByText("A small typo fix");
-    expect(screen.getByText("no PRD link")).toBeTruthy();
-    expect(screen.queryByTitle(BADGE_TITLE)).toBeNull();
   });
 });
 
-// PRD #102 M4. The issue view had its own ad-hoc chip filter (column, plus PRDLESS only
-// while its badge showed), so PRD and autopilot chips rendered here. Not "and not on the
-// board", which is how this read until the fact-check: before a02e3184 the board
-// rendered no chips AT ALL, so there was no predicate divergence to describe — M4 gave
-// the board chips and gave both surfaces one predicate in the same change.
-describe("IssueView label chips (PRD #102 M4)", () => {
-  it("chips content labels and drops every workflow marker", async () => {
-    setAuth(true);
+// PRD #102 M4 gave the board and the issue view one shared chip predicate. PRD #764:
+// chipLabels still excludes only the autopilot marker and the column labels (so PRD and
+// other content labels chip normally), but IssueView additionally drops the `uzi`
+// runnable marker from its own chip row — it is surfaced as the brand "runnable" badge
+// instead, so it never renders both as a chip and as a badge.
+describe("IssueView label chips (PRD #102 M4, PRD #764)", () => {
+  it("chips content labels (incl. PRD) and drops the autopilot marker + columns", async () => {
+    setAuth();
     mockApi.getIssue.mockResolvedValue({
+      // A non-uzi issue (so the runnable badge does not render a second "uzi" element),
+      // and has_prd_link:false so the neutral PRD presence badge does not add a second
+      // "PRD" element beside the PRD chip under test.
       issue: anIssue({
-        labels: ["PRD", "autopilot", "PRDLESS", "In Progress", "bug"],
+        labels: ["PRD", "autopilot", "In Progress", "bug"],
         column: "In Progress",
-        has_prd_link: true,
+        has_prd_link: false,
       }),
     });
     renderIssueView();
     await screen.findByText("A small typo fix");
     expect(screen.getByText("bug")).toBeTruthy();
-    expect(screen.queryByText("PRD")).toBeNull();
+    // PRD #764: "PRD" is no longer special to chipLabels; it chips as an ordinary label.
+    expect(screen.getByText("PRD")).toBeTruthy();
     // autopilot is excluded from the CHIPS and always was. Since review M-1 it renders
     // as a BADGE instead, which is a different element with a different meaning — so
     // the assertion is that exactly one element carries the name and it is the badge,
@@ -271,7 +212,7 @@ describe("IssueView label chips (PRD #102 M4)", () => {
   // m-2. The strip on this page had NO test: folding stripUnsafeChars(l) to a raw {l}
   // left nine tests green, because nothing here rendered a label carrying one.
   it("strips format characters out of a chip (#124)", async () => {
-    setAuth(true);
+    setAuth();
     mockApi.getIssue.mockResolvedValue({
       issue: anIssue({ labels: ["PRD", "se\u202Ecurity"], has_prd_link: true }),
     });
@@ -284,7 +225,7 @@ describe("IssueView label chips (PRD #102 M4)", () => {
   // m-3. The ATTRIBUTE channel, on this surface too. container.textContent cannot see
   // a title=, so the strip there was ungated on both pages at once.
   it("strips the chip's title ATTRIBUTE, not only its text (#124)", async () => {
-    setAuth(true);
+    setAuth();
     mockApi.getIssue.mockResolvedValue({
       issue: anIssue({ labels: ["PRD", "se\u202Ecurity"], has_prd_link: true }),
     });
@@ -304,7 +245,7 @@ describe("IssueView label chips (PRD #102 M4)", () => {
 // label, and this says the distinct thing the chip never did.
 describe("IssueView autopilot badge (PRD #102 review M-1)", () => {
   it("shows an autopilot badge when the label is applied", async () => {
-    setAuth(true);
+    setAuth();
     mockApi.getIssue.mockResolvedValue({
       issue: anIssue({ labels: ["PRD", "autopilot"], has_prd_link: true }),
     });
@@ -315,7 +256,7 @@ describe("IssueView autopilot badge (PRD #102 review M-1)", () => {
   });
 
   it("shows nothing when the label is absent", async () => {
-    setAuth(true);
+    setAuth();
     mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["PRD"], has_prd_link: true }) });
     renderIssueView();
     await screen.findByText("A small typo fix");
@@ -340,7 +281,7 @@ describe("IssueView autopilot badge (PRD #102 review M-1)", () => {
   it("does NOT put autopilot back in the chip row (Decision 6 stays intact)", async () => {
     // The badge must not become a second route for a label the chip predicate excludes:
     // exactly one element carries the name, and it is the badge.
-    setAuth(true);
+    setAuth();
     mockApi.getIssue.mockResolvedValue({
       issue: anIssue({ labels: ["PRD", "autopilot"], has_prd_link: true }),
     });
@@ -351,7 +292,7 @@ describe("IssueView autopilot badge (PRD #102 review M-1)", () => {
   });
 });
 
-describe("IssueView Start gate honors the PRDLESS bypass (PRD #22 B1)", () => {
+describe("IssueView Start gate (PRD #764)", () => {
   const aWorker = (): Worker => ({
     id: "w1",
     name: "laptop",
@@ -391,143 +332,77 @@ describe("IssueView Start gate honors the PRDLESS bypass (PRD #22 B1)", () => {
     updated_at: "2026-01-01T00:00:00Z",
   });
 
-  it("enables Start once the PRDLESS label is applied on a no-PRD-link issue", async () => {
-    setAuth(true);
-    // Make the missing PRD link the ONLY blocker: give the user a worker + token.
+  it("enables Start on a uzi issue with NO PRD link once a worker + token exist (PRD #764)", async () => {
+    setAuth();
+    // A run no longer requires a PRD link (PRD #764), so a worker + token is all it takes.
     mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
     mockApi.listSecrets.mockResolvedValue({ secrets: [aToken()] });
-    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["PRD"] }) }); // no link, no label
-    mockApi.setIssuePrdless.mockResolvedValue({ card: aCard(["PRD", "PRDLESS"]) });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
     renderIssueView();
 
     const startBtn = () => screen.getByRole("button", { name: /start run/i }) as HTMLButtonElement;
     await screen.findByText("A small typo fix");
-    // Gated on the missing PRD link, despite the worker + token being present.
-    expect(startBtn().disabled).toBe(true);
-
-    fireEvent.click(screen.getByText("Mark PRDLESS"));
-    // Once the label lands, the bypass enables Start.
     await waitFor(() => expect(startBtn().disabled).toBe(false));
   });
 });
 
-// PRD #102 M6. M4 removed the PRD chip from this page — correctly, since every
-// cached issue carried the label by construction and the chip carried no
-// information. M6 is what gives it information again: without an indicator here, a
-// non-PRD issue opened from the board is indistinguishable from a PRD one on the
-// page where a user decides what to do with it, and which offers the run controls
-// the server-side gate now refuses.
-describe("IssueView — eligibility affordances (PRD #102 M6, widened by PRD #196 M4)", () => {
-  // Minimal worker + token so the missing PRD link is the ONLY thing a gate blocks on.
-  const withWorkerAndToken = () => {
-    mockApi.listWorkers.mockResolvedValue({ workers: [{ id: "w1" } as unknown as Worker] });
-    mockApi.listSecrets.mockResolvedValue({ secrets: [{ kind: "anthropic_token" } as unknown as SecretMeta] });
-  };
+// PRD #764. The runnable marker + Promote affordance key off the single `uzi` label: an
+// issue carrying it is uzi's to run (Start run + a runnable badge); one without it offers
+// Promote (which adds `uzi`).
+describe("IssueView — runnable marker + Promote (PRD #764)", () => {
+  // The runnable badge is queried by its distinctive title (its text "uzi" also appears
+  // as a chip), so this assertion does not move when the label is renamed in settings.
+  const RUNNABLE_TITLE = /uzi will run it/;
 
-  it("marks a NON-ELIGIBLE issue and offers Promote in place of Start run", async () => {
-    // `documentation` is not in the eligible set, so the issue is not runnable.
-    setAuth(false);
+  it("marks a NON-uzi issue and offers Promote in place of Start run", async () => {
+    setAuth();
     mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["documentation"] }) });
     renderIssueView();
     await screen.findByText("A small typo fix");
 
-    expect(screen.getByText("not PRD")).toBeTruthy();
-    expect(screen.getByRole("button", { name: /Promote to PRD/ })).toBeTruthy();
-    // Hidden, not disabled: the server refuses the run and Promote is the one-click
-    // answer, so a gated button explaining a resolvable rule would be noise.
+    // No runnable badge; Promote is offered instead of Start run.
+    expect(screen.queryByTitle(RUNNABLE_TITLE)).toBeNull();
+    expect(screen.getByRole("button", { name: /Promote to uzi/ })).toBeTruthy();
     expect(screen.queryByRole("button", { name: /start run/i })).toBeNull();
   });
 
-  it("offers Start run on an ELIGIBLE bug issue, not Promote or 'not PRD' (mock §4)", async () => {
-    // `bug` is in the shipped eligible set, so the issue is runnable: Start run shows,
-    // the non-eligible marker and Promote do not.
-    setAuth(false);
-    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["bug"] }) });
+  it("shows the runnable marker + Start run on a uzi issue, not Promote", async () => {
+    setAuth();
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"] }) });
     renderIssueView();
     await screen.findByText("A small typo fix");
 
-    expect(screen.queryByText("not PRD")).toBeNull();
-    expect(screen.queryByRole("button", { name: /Promote to PRD/ })).toBeNull();
+    // The runnable marker renders (the POSITIVE assertion for the new model)...
+    expect(screen.getByTitle(RUNNABLE_TITLE)).toBeTruthy();
+    // ...and Start run shows, not Promote.
+    expect(screen.queryByRole("button", { name: /Promote to uzi/ })).toBeNull();
     expect(screen.getByRole("button", { name: /start run/i })).toBeTruthy();
-  });
-
-  it("shows neither marker nor Promote on an ordinary PRD issue", async () => {
-    setAuth(false);
-    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["PRD"] }) });
-    renderIssueView();
-    await screen.findByText("A small typo fix");
-
-    expect(screen.queryByText("not PRD")).toBeNull();
-    expect(screen.queryByRole("button", { name: /Promote to PRD/ })).toBeNull();
-    expect(screen.getByRole("button", { name: /start run/i })).toBeTruthy();
-  });
-
-  it("enables Start on an eligible bug issue with no PRD link when the waiver is on (PRD #196 M4)", async () => {
-    // The waiver mirrors the server: an issue eligible via a NON-PRIMARY label does not
-    // need a prds/*.md link. With worker + token, the missing link is the only blocker.
-    setAuth(false);
-    withWorkerAndToken();
-    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["bug"] }) }); // has_prd_link:false
-    renderIssueView();
-    const startBtn = () => screen.getByRole("button", { name: /start run/i }) as HTMLButtonElement;
-    await screen.findByText("A small typo fix");
-    await waitFor(() => expect(startBtn().disabled).toBe(false));
-  });
-
-  it("GATES the same bug issue when eligibleLabelWaivesPrdLink is false (PRD #196 M4)", async () => {
-    // The scope proof: with the waiver off, the no-link bug issue is blocked on the link
-    // again, even though it is still eligible (Start run is shown, just disabled).
-    setAuth(false, { eligibleLabelWaivesPrdLink: false });
-    withWorkerAndToken();
-    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["bug"] }) });
-    renderIssueView();
-    const startBtn = () => screen.getByRole("button", { name: /start run/i }) as HTMLButtonElement;
-    await screen.findByText("A small typo fix");
-    await waitFor(() => expect(startBtn().disabled).toBe(true));
-  });
-
-  it("offers the PRDLESS toggle on an eligible bug issue, not on a non-eligible one (Decision 16, PRD #196 M4)", async () => {
-    // prdlessEnabled AND has_prd_link false. On an ELIGIBLE bug issue the toggle shows
-    // (the run gate lets it through, so PRDLESS can waive the link)...
-    setAuth(true);
-    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["bug"] }) });
-    const { unmount } = renderIssueView();
-    await screen.findByText("A small typo fix");
-    expect(screen.getByText("Mark PRDLESS")).toBeTruthy();
-    unmount();
-
-    // ...but on a NON-eligible documentation issue it grants nothing and is hidden.
-    setAuth(true);
-    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["documentation"] }) });
-    renderIssueView();
-    await screen.findByText("A small typo fix");
-    expect(screen.queryByText("Mark PRDLESS")).toBeNull();
   });
 
   it("promotes forge-first and adopts the returned labels", async () => {
-    setAuth(false);
+    setAuth();
     mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["documentation"] }) });
-    mockApi.promoteIssue.mockResolvedValue({ card: aCard(["PRD", "documentation"]) });
+    mockApi.promoteIssue.mockResolvedValue({ card: aCard(["uzi", "documentation"]) });
     renderIssueView();
     await screen.findByText("A small typo fix");
 
-    fireEvent.click(screen.getByRole("button", { name: /Promote to PRD/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Promote to uzi/ }));
     await waitFor(() => expect(mockApi.promoteIssue).toHaveBeenCalledWith("repo-1", 7));
-    // The page re-reads as an ordinary PRD issue: the marker goes, Start run appears.
-    await waitFor(() => expect(screen.queryByText("not PRD")).toBeNull());
+    // The page re-reads as a runnable issue: the runnable marker appears, Start run shows.
+    await waitFor(() => expect(screen.getByTitle(RUNNABLE_TITLE)).toBeTruthy());
     expect(screen.getByRole("button", { name: /start run/i })).toBeTruthy();
   });
 
   it("does not offer Promote on the self-improve tracker (Decision 13a)", async () => {
-    setAuth(false);
+    setAuth();
     mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi-self-improve"] }) });
     renderIssueView();
     await screen.findByText("A small typo fix");
 
-    // Still MARKED as not-PRD (it is not uzi's board work), but not promotable — the
-    // server refuses it too, so an offered button would be a 422 waiting to happen.
-    expect(screen.getByText("not PRD")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: /Promote to PRD/ })).toBeNull();
+    // Not runnable (no `uzi` label) and not promotable — the server refuses it too, so an
+    // offered button would be a 422 waiting to happen.
+    expect(screen.queryByTitle(RUNNABLE_TITLE)).toBeNull();
+    expect(screen.queryByRole("button", { name: /Promote to uzi/ })).toBeNull();
   });
 });
 
@@ -542,7 +417,7 @@ describe("IssueView — eligibility affordances (PRD #102 M6, widened by PRD #19
 // browser measurement that found it.
 describe("IssueView — a long column name does not overflow the page (web-ux S3)", () => {
   it("renders the column badge wrapping rather than nowrap", async () => {
-    setAuth(false);
+    setAuth();
     const long = "Waiting on the upstream vendor to confirm the migration window and sign off";
     mockApi.getIssue.mockResolvedValue({ issue: anIssue({ column: long }) });
     renderIssueView();
@@ -555,7 +430,7 @@ describe("IssueView — a long column name does not overflow the page (web-ux S3
   });
 
   it("still renders an ordinary column name", async () => {
-    setAuth(false);
+    setAuth();
     mockApi.getIssue.mockResolvedValue({ issue: anIssue({ column: "In Progress" }) });
     renderIssueView();
     await screen.findByText("A small typo fix");

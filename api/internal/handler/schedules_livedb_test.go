@@ -64,7 +64,7 @@ func newScheduleFixture(ctx context.Context, t *testing.T) scheduleFixture {
 	svc := forgesvc.New(q, box, 5*time.Second, nil)
 	wsvc := workersvc.New(q, box, workersvc.Params{})
 	set := settings.New(&settingsStore{rows: []store.AppSetting{
-		{Key: settings.KeyPRDLabel, Value: "PRD"},
+		{Key: settings.KeyUziLabel, Value: "uzi"},
 	}}, time.Minute)
 	f.h = &Handler{
 		pool:      pool,

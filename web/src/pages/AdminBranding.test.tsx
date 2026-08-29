@@ -26,11 +26,9 @@ const mockApi = vi.mocked(api);
 
 // A full AppSettings fixture; tests override the branding fields they exercise.
 const settings = (over: Partial<AppSettings> = {}): AppSettings => ({
-  prd_label: "PRD",
   autopilot_label: "autopilot",
+  uzi_label: "uzi",
   default_theme: "ember",
-  prdless_enabled: "true",
-  prdless_label: "PRDLESS",
   slack_enabled: "false",
   public_base_url: "http://127.0.0.1:8080",
   judge_enabled: "false",
@@ -49,9 +47,6 @@ const settings = (over: Partial<AppSettings> = {}): AppSettings => ({
   docker_repo_allowlist: "",
   capability_aware_scheduling: "true",
   github_project_sync_enabled: "false",
-  run_eligible_labels: "PRD,bug",
-  board_extra_labels: "bug",
-  eligible_label_waives_prd_link: "true",
   app_logo_mode: "default",
   app_logo_preset: "",
   app_logo_keep_name: "true",

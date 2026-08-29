@@ -31,11 +31,9 @@ const mockApi = vi.mocked(api);
 
 // A full AppSettings fixture; tests override the fields they exercise.
 const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
-  prd_label: "PRD",
   autopilot_label: "autopilot",
+  uzi_label: "uzi",
   default_theme: "ember",
-  prdless_enabled: "true",
-  prdless_label: "PRDLESS",
   slack_enabled: "false",
   public_base_url: "http://127.0.0.1:8080",
   judge_enabled: "false",
@@ -54,9 +52,6 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   docker_repo_allowlist: "",
   capability_aware_scheduling: "true",
   github_project_sync_enabled: "false",
-  run_eligible_labels: "PRD,bug",
-  board_extra_labels: "bug",
-  eligible_label_waives_prd_link: "true",
   // PRD #685 branding config keys (owned by the Branding tab; unbranded defaults).
   app_logo_mode: "default",
   app_logo_preset: "",
@@ -81,11 +76,9 @@ const response = (
   settings: settings(over),
   secrets: { slack_bot_token: false, slack_app_token: false, ...secrets },
   sources: {
-    prd_label: "db",
+    uzi_label: "db",
     autopilot_label: "default",
     default_theme: "default",
-    prdless_enabled: "default",
-    prdless_label: "default",
     slack_enabled: "default",
     public_base_url: "default",
     slack_bot_token: "default",
@@ -191,7 +184,7 @@ describe("AdminSettings — vault migration (PRD #32)", () => {
   it("hides the migration notice when nothing is master-sealed", async () => {
     mockApi.vaultMigration.mockResolvedValue({ master_sealed: 0 });
     renderPage();
-    await screen.findByLabelText("PRD label");
+    await screen.findByLabelText("uzi label");
     expect(screen.queryByText(/pre-vault encryption/i)).toBeNull();
   });
 
@@ -212,38 +205,27 @@ describe("AdminSettings", () => {
 
   it("loads the current labels into the fields", async () => {
     renderPage();
-    const prd = (await screen.findByLabelText("PRD label")) as HTMLInputElement;
-    expect(prd.value).toBe("PRD");
+    const uzi = (await screen.findByLabelText("uzi label")) as HTMLInputElement;
+    expect(uzi.value).toBe("uzi");
     expect(input("Autopilot label").value).toBe("autopilot");
     // Save is disabled until a field changes.
     expect(saveButton().disabled).toBe(true);
   });
 
-  it("saves edited labels and shows a success notice", async () => {
-    // The server re-pins the renamed primary into the eligible set, so the response
-    // carries run_eligible_labels updated to match — otherwise the recomputed value
-    // would leave the form dirty after save.
-    mockApi.updateSettings.mockResolvedValue(
-      response({ prd_label: "Feature", run_eligible_labels: "Feature,bug" }),
-    );
+  it("saves the edited uzi label and shows a success notice", async () => {
+    mockApi.updateSettings.mockResolvedValue(response({ uzi_label: "runnable" }));
     renderPage();
-    await screen.findByLabelText("PRD label");
-    fireEvent.change(input("PRD label"), { target: { value: "Feature" } });
+    await screen.findByLabelText("uzi label");
+    fireEvent.change(input("uzi label"), { target: { value: "runnable" } });
 
     expect(saveButton().disabled).toBe(false);
     fireEvent.click(saveButton());
 
     await waitFor(() =>
       expect(mockApi.updateSettings).toHaveBeenCalledWith({
-        prd_label: "Feature",
+        uzi_label: "runnable",
         autopilot_label: "autopilot",
         default_theme: "ember",
-        prdless_enabled: "true",
-        prdless_label: "PRDLESS",
-        // The pinned primary follows the renamed PRD label into the eligible set.
-        run_eligible_labels: "Feature,bug",
-        board_extra_labels: "bug",
-        eligible_label_waives_prd_link: "true",
       }),
     );
     // A changed label mentions the next-sync propagation (N1).
@@ -255,7 +237,7 @@ describe("AdminSettings", () => {
   it("saves the default theme selection (PRD #21)", async () => {
     mockApi.updateSettings.mockResolvedValue(response({ default_theme: "mission" }));
     renderPage();
-    await screen.findByLabelText("PRD label");
+    await screen.findByLabelText("uzi label");
     const theme = screen.getByLabelText("Default theme") as HTMLSelectElement;
     // Loads at the current instance default.
     expect(theme.value).toBe("ember");
@@ -266,14 +248,9 @@ describe("AdminSettings", () => {
 
     await waitFor(() =>
       expect(mockApi.updateSettings).toHaveBeenCalledWith({
-        prd_label: "PRD",
+        uzi_label: "uzi",
         autopilot_label: "autopilot",
         default_theme: "mission",
-        prdless_enabled: "true",
-        prdless_label: "PRDLESS",
-        run_eligible_labels: "PRD,bug",
-        board_extra_labels: "bug",
-        eligible_label_waives_prd_link: "true",
       }),
     );
     // A theme-only change is presentation-only: the notice must NOT claim a resync (N1).
@@ -282,43 +259,20 @@ describe("AdminSettings", () => {
     expect(saveButton().disabled).toBe(true);
   });
 
-  it("disables the PRDLESS name field while the toggle is off (PRD #22 M1)", async () => {
-    renderPage();
-    const name = (await screen.findByLabelText("PRDLESS label")) as HTMLInputElement;
-    const toggle = screen.getByLabelText(/Enable the PRDLESS escape hatch/i) as HTMLInputElement;
-    // Loads enabled → name editable.
-    expect(toggle.checked).toBe(true);
-    expect(name.disabled).toBe(false);
-    // Turning the feature off disables the name field.
-    fireEvent.click(toggle);
-    expect(name.disabled).toBe(true);
-  });
-
-  it("blocks a PRDLESS label colliding with the PRD label client-side", async () => {
-    renderPage();
-    await screen.findByLabelText("PRDLESS label");
-    fireEvent.change(input("PRDLESS label"), { target: { value: "PRD" } });
-    fireEvent.click(saveButton());
-
-    const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toMatch(/PRDLESS label must differ from the PRD label/i);
-    expect(mockApi.updateSettings).not.toHaveBeenCalled();
-  });
-
   it("surfaces a server validation error", async () => {
-    mockApi.updateSettings.mockRejectedValue(new ApiError(400, "prd_label already in use"));
+    mockApi.updateSettings.mockRejectedValue(new ApiError(400, "uzi_label already in use"));
     renderPage();
-    await screen.findByLabelText("PRD label");
-    fireEvent.change(input("PRD label"), { target: { value: "Backlog" } });
+    await screen.findByLabelText("uzi label");
+    fireEvent.change(input("uzi label"), { target: { value: "Backlog" } });
     fireEvent.click(saveButton());
 
-    expect(await screen.findByText("prd_label already in use")).toBeTruthy();
+    expect(await screen.findByText("uzi_label already in use")).toBeTruthy();
   });
 
   it("blocks equal labels client-side without calling the API", async () => {
     renderPage();
     await screen.findByLabelText("Autopilot label");
-    fireEvent.change(input("Autopilot label"), { target: { value: "PRD" } });
+    fireEvent.change(input("Autopilot label"), { target: { value: "uzi" } });
     fireEvent.click(saveButton());
 
     // The danger Alert carries role="alert"; assert on it so the match is not
@@ -759,119 +713,19 @@ describe("AdminSettings — GitHub Projects sync kill-switch (issue #534 M2)", (
   });
 });
 
-describe("AdminSettings — membership + eligible labels (PRD #196 M2)", () => {
-  const runEligibleAdd = () => screen.getByLabelText("Add to Run-eligible labels") as HTMLInputElement;
-  const boardExtrasAdd = () => screen.getByLabelText("Add to Also show on boards") as HTMLInputElement;
-
-  it("pins the primary in the eligible set with no remove control, and lists the extras", async () => {
-    // board_extra distinct from the eligible extra so "Remove bug" is unambiguous.
-    mockApi.getSettings.mockResolvedValue(
-      response({ run_eligible_labels: "PRD,bug", prd_label: "PRD", board_extra_labels: "documentation" }),
-    );
+describe("AdminSettings — forge labels (PRD #764)", () => {
+  it("renders the uzi and autopilot label fields, and the eligible-set label editors are gone", async () => {
     renderPage();
-    await screen.findByLabelText("PRD label");
-    // The primary renders as a "primary"-marked, non-removable tag. ("primary" also
-    // occurs in the hint copy, so assert on presence, not uniqueness.)
-    expect(screen.getAllByText("primary").length).toBeGreaterThanOrEqual(1);
-    expect(screen.queryByLabelText("Remove PRD")).toBeNull();
-    // The non-primary eligible label is removable.
-    expect(screen.getByLabelText("Remove bug")).toBeTruthy();
-  });
-
-  it("adds an eligible label and persists it comma-joined with the pinned primary", async () => {
-    mockApi.updateSettings.mockResolvedValue(response({ run_eligible_labels: "PRD,bug,security" }));
-    renderPage();
-    await screen.findByLabelText("PRD label");
-    fireEvent.change(runEligibleAdd(), { target: { value: "security" } });
-    fireEvent.keyDown(runEligibleAdd(), { key: "Enter" });
-    fireEvent.click(saveButton());
-    await waitFor(() =>
-      expect(mockApi.updateSettings).toHaveBeenCalledWith(
-        expect.objectContaining({ run_eligible_labels: "PRD,bug,security" }),
-      ),
-    );
-  });
-
-  it("removes a non-primary eligible label and persists the shrunk set", async () => {
-    mockApi.getSettings.mockResolvedValue(
-      response({ run_eligible_labels: "PRD,bug", board_extra_labels: "documentation" }),
-    );
-    mockApi.updateSettings.mockResolvedValue(response({ run_eligible_labels: "PRD" }));
-    renderPage();
-    await screen.findByLabelText("PRD label");
-    fireEvent.click(screen.getByLabelText("Remove bug"));
-    fireEvent.click(saveButton());
-    await waitFor(() =>
-      expect(mockApi.updateSettings).toHaveBeenCalledWith(
-        expect.objectContaining({ run_eligible_labels: "PRD" }),
-      ),
-    );
-  });
-
-  it("adds a board-extra label and persists board_extra_labels", async () => {
-    mockApi.getSettings.mockResolvedValue(response({ board_extra_labels: "bug" }));
-    mockApi.updateSettings.mockResolvedValue(response({ board_extra_labels: "bug,documentation" }));
-    renderPage();
-    await screen.findByLabelText("PRD label");
-    fireEvent.change(boardExtrasAdd(), { target: { value: "documentation" } });
-    fireEvent.click(screen.getAllByRole("button", { name: /^Add$/ })[1]);
-    fireEvent.click(saveButton());
-    await waitFor(() =>
-      expect(mockApi.updateSettings).toHaveBeenCalledWith(
-        expect.objectContaining({ board_extra_labels: "bug,documentation" }),
-      ),
-    );
-  });
-
-  it("saves the PRD-link waiver toggle as a strict bool", async () => {
-    mockApi.getSettings.mockResolvedValue(response({ eligible_label_waives_prd_link: "true" }));
-    mockApi.updateSettings.mockResolvedValue(response({ eligible_label_waives_prd_link: "false" }));
-    renderPage();
-    const waiver = (await screen.findByLabelText(/waives the PRD-link requirement/i)) as HTMLInputElement;
-    expect(waiver.checked).toBe(true);
-    fireEvent.click(waiver);
-    fireEvent.click(saveButton());
-    await waitFor(() =>
-      expect(mockApi.updateSettings).toHaveBeenCalledWith(
-        expect.objectContaining({ eligible_label_waives_prd_link: "false" }),
-      ),
-    );
-  });
-
-  it("greys the three keys when they are env-sourced and omits them from the save", async () => {
-    mockApi.getSettings.mockResolvedValue(
-      response({}, {}, {
-        run_eligible_labels: "env",
-        board_extra_labels: "env",
-        eligible_label_waives_prd_link: "env",
-      }),
-    );
-    mockApi.updateSettings.mockResolvedValue(response({ prd_label: "Feature", run_eligible_labels: "PRD,bug" }));
-    renderPage();
-    await screen.findByLabelText("PRD label");
-    // Env-fixed: the add inputs and the waiver checkbox are disabled.
-    expect(runEligibleAdd().disabled).toBe(true);
-    expect(boardExtrasAdd().disabled).toBe(true);
-    expect((screen.getByLabelText(/waives the PRD-link requirement/i) as HTMLInputElement).disabled).toBe(true);
-    // A non-env change still saves, without the env-fixed keys in the payload.
-    fireEvent.change(input("PRD label"), { target: { value: "Feature" } });
-    fireEvent.click(saveButton());
-    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalled());
-    const payload = mockApi.updateSettings.mock.calls[0][0];
-    expect(payload).not.toHaveProperty("run_eligible_labels");
-    expect(payload).not.toHaveProperty("board_extra_labels");
-    expect(payload).not.toHaveProperty("eligible_label_waives_prd_link");
-  });
-
-  it("blocks an eligible label colliding with the autopilot label client-side", async () => {
-    renderPage();
-    await screen.findByLabelText("PRD label");
-    fireEvent.change(runEligibleAdd(), { target: { value: "autopilot" } });
-    fireEvent.keyDown(runEligibleAdd(), { key: "Enter" });
-    fireEvent.click(saveButton());
-    const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toMatch(/must not include the autopilot label/i);
-    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+    // The single run-eligibility label field is present and loads the configured value.
+    const uzi = (await screen.findByLabelText("uzi label")) as HTMLInputElement;
+    expect(uzi.value).toBe("uzi");
+    expect((screen.getByLabelText("Autopilot label") as HTMLInputElement).value).toBe("autopilot");
+    // The old multi-value label editors (the TagInputs) are gone: the section renders no
+    // "add a label…" affordance. This pairs with the positive uzi assertion above, so it
+    // is not a vacuous never-rendered-string check.
+    expect(screen.queryByPlaceholderText("add a label…")).toBeNull();
+    // The retired waiver checkbox is gone too.
+    expect(screen.queryByLabelText(/waives the requirement/i)).toBeNull();
   });
 });
 

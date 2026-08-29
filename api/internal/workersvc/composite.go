@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -186,14 +185,14 @@ func (s *Service) DismissProposalForUser(ctx context.Context, userID, runID, pro
 }
 
 // StartRunForUser queues an agent run for an issue (PRD #191 M1): the forge
-// GetIssue + PRDLESS gate + CreateRun composite lifted out of the web CreateRun
-// handler so the Slack start-run card can start a run identically. The issue
-// description is snapshotted from the forge (the source of truth) at queue time.
+// GetIssue + CreateRun composite lifted out of the web CreateRun handler so the
+// Slack start-run card can start a run identically. The issue description is
+// snapshotted from the forge (the source of truth) at queue time.
 //
-// The PRDLESS bypass is computed from the FRESH forge snapshot's labels and the
-// instance prdless settings, so a just-added label works without waiting for a
-// poller cycle. It returns the CreateRun sentinels unchanged (ErrNotPRDIssue,
-// ErrNoPRDLink, ErrActiveRunExists, …) plus the forge sentinels above.
+// Eligibility is the single uzi_label gate CreateRun enforces (PRD #764 M1); this
+// composite no longer computes any PRD-link bypass. It returns the CreateRun
+// sentinels unchanged (ErrNotPRDIssue, ErrActiveRunExists, …) plus the forge
+// sentinels above.
 func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, waitOnLimit *bool, seed *SeededPlan) (store.Run, error) {
 	if s.forges == nil {
 		return store.Run{}, ErrForgesUnavailable
@@ -214,8 +213,7 @@ func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID,
 		// err is already PAT-redacted by the driver.
 		return store.Run{}, fmt.Errorf("%w: %v", ErrForgeIssueRead, err)
 	}
-	allowWithoutPRD := s.prdlessAllows(ctx, issue.Labels)
-	return s.CreateRun(ctx, userID, repo.ID, issueIID, issue.Description, allowWithoutPRD, waitOnLimit, seed)
+	return s.CreateRun(ctx, userID, repo.ID, issueIID, issue.Description, waitOnLimit, seed)
 }
 
 // StartRunForUserByPath is StartRunForUser keyed by the human repo PATH the chat
@@ -232,21 +230,4 @@ func (s *Service) StartRunForUserByPath(ctx context.Context, userID uuid.UUID, r
 		return store.Run{}, err
 	}
 	return s.StartRunForUser(ctx, userID, repoID, issueIID, waitOnLimit, seed)
-}
-
-// prdlessAllows reports whether the PRDLESS bypass applies to an issue carrying
-// these forge labels (PRD #22 Decision 3): the instance feature is on AND the issue
-// carries the prdless label. Settings reads are best-effort and nil-safe — a nil
-// reader or a cold cache falls back to disabled, so the issue stays gated
-// ("settings unavailable" must not mean "unguarded").
-func (s *Service) prdlessAllows(ctx context.Context, labels []string) bool {
-	if s.settings == nil {
-		return false
-	}
-	enabled, _ := s.settings.PrdlessEnabled(ctx)
-	if !enabled {
-		return false
-	}
-	label, _ := s.settings.PrdlessLabel(ctx)
-	return label != "" && slices.Contains(labels, label)
 }

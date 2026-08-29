@@ -196,7 +196,7 @@ func TestBrandingReadsStoredRows(t *testing.T) {
 }
 
 // A malformed bool row must not silently read as false: it falls back to the
-// compiled-in default (keep-name on), the PrdlessEnabled junk-tolerance.
+// compiled-in default (keep-name on), the same bool junk-tolerance.
 func TestBrandingBoolJunkFallsBackToDefault(t *testing.T) {
 	c := New(&fakeStore{rows: []store.AppSetting{
 		row(KeyAppLogoKeepName, "yes"),

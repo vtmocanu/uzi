@@ -787,7 +787,7 @@ var queryInventory = []queryPin{
 			"transaction, and no live test drives that route. The `FOR UPDATE` is the entire " +
 			"difference from ListAppSettings above: it row-locks so a concurrent PUT blocks and " +
 			"reads this writer's committed values, which is what closes PRD #19 M2's cross-key " +
-			"prd_label != autopilot_label TOCTOU. A lock that is never taken under contention is a " +
+			"uzi_label != autopilot_label TOCTOU. A lock that is never taken under contention is a " +
 			"lock nothing has tested — and like the vault's ON CONFLICT, it is a property no fake " +
 			"can exhibit, because a fake has no transactions"},
 

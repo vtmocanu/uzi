@@ -233,12 +233,12 @@ A few worth knowing:
   answered. Re-run `run get` if that happens; it isn't a sign anything went
   wrong with your first answer.
 - **`schedule` runs work on a clock.** A schedule starts run(s) at future
-  time(s) through the *same* shared seam a manual `run create` uses, so PRDLESS
-  gating, the forge issue fetch, active-run dedup and the usage-limit park all
+  time(s) through the *same* shared seam a manual `run create` uses, so the
+  `uzi`-label gate, the forge issue fetch, active-run dedup and the usage-limit park all
   behave identically — a schedule can do nothing a manual start can't. `schedule
   create` takes exactly one **target** (`--issue <iid>` a pinned issue; `--sweep`
-  every eligible issue matching the repeatable `--label` selector, defaulting to
-  the PRD label; or `--prompt <text>` an issue-less repo→MR run) and exactly one
+  every candidate issue matching the repeatable `--label` selector, defaulting to
+  the `uzi` label; or `--prompt <text>` an issue-less repo→MR run) and exactly one
   **timing** (`--at <rfc3339>` fires once, or `--cron <expr>` recurring in
   `--tz`); either constraint violated is a usage error before any request.
   Repeat `--repo` to create the same schedule on **several repos at once**: a
@@ -269,7 +269,7 @@ A few worth knowing:
   `WARNING` (to stderr) for any that is missing — the schedule is still created,
   but the sweep will not match until the label exists; pass
   `--create-missing-labels` to create them on the forge first (an empty
-  `--label`, which defaults server-side to the PRD label, is not checked). The
+  `--label`, which defaults server-side to the `uzi` label, is not checked). The
   guardrail is **purely advisory and never blocks the create — not even on its own
   forge errors**: a failed label check or a failed label create (with
   `--create-missing-labels`) prints a `WARNING` and proceeds, so a transient forge
@@ -316,16 +316,16 @@ A few worth knowing:
   `schedule get` also prints a **Last fire** block below the config: a summary
   line (`fired <time> · matched N · started M · skipped K`), one line per started
   run (`#<iid> → run <run-id>  <title>`, or a `prompt` marker for a prompt
-  schedule), one line per skipped candidate with a human reason label (`no PRD
-  link`, `already running`, `not eligible`, `description too large`, `fetch
+  schedule), one line per skipped candidate with a human reason label
+  (`not eligible`, `already running`, `description too large`, `fetch
   failed` — the raw wire reason for anything newer), and, when a capped fire
-  reached nobody, a hint to raise `--max-issues` or add `PRDLESS` / a PRD link; a
+  reached nobody, a hint to raise `--max-issues` or add the `uzi` label; a
   never-fired schedule reads `Last fire: never fired`, and `--json` carries the
   same detail under `.last_fire`. `run-now` prints the matching per-candidate
   breakdown inline — a `Started N run(s)` header with the created run id(s), a
   line per started run, then a `Matched N candidate(s), skipped K:` tally with a
-  reason label per skip (and a `# add PRDLESS / a prds link, or raise
-  --max-issues` hint for a missing PRD link) — or `no run started` when a benign
+  reason label per skip (and a `# add the uzi label, or raise
+  --max-issues` hint for `not eligible`) — or `no run started` when a benign
   dedup fired none; `--json` dumps the raw response (`created`, `run_ids`,
   `matched`, `capped`, `started`, `skips`).
 - **Default scheduled jobs (`schedule catalog`).** uzi ships a small catalog of
@@ -666,8 +666,9 @@ also the TUI's own fallback when the live channel is unreachable (below).
   it's a different shape**: active runs only (nothing completed), capped at
   500, no judge-verdict or usage columns (cost included), titled
   `▚▚ uzi · active runs` on screen so it never promises a row it can't show.
-  A milestone-structured run (one planned from a `PRD`-labelled issue) shows
-  a compact `▰▱` milestone micro-bar between AGE and TITLE (one `▰` per
+  A milestone-structured run (one planned from a gated issue run — `uzi run
+  create` with no `--plan-file`) shows a compact `▰▱` milestone micro-bar
+  between AGE and TITLE (one `▰` per
   reported-complete milestone, `▱` for the rest, or `–/N` text when nothing
   has been reported complete yet); the micro-bar is hidden on a narrow
   terminal, and the full breakdown is on the run detail view. On your own

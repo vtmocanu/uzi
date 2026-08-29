@@ -226,9 +226,9 @@ func TestUpdateSettingsPrecheckBeforeLiveValidation(t *testing.T) {
 	h := &Handler{settings: cache, slackValidator: fake}
 
 	rec := httptest.NewRecorder()
-	// autopilot_label == the default prd_label "PRD" collides; a valid-format token
+	// autopilot_label == the default uzi_label "uzi" collides; a valid-format token
 	// rides along. The label precheck must reject first.
-	h.UpdateSettings(rec, putSettings(&admin, `{"settings":{"autopilot_label":"PRD","slack_bot_token":"xoxb-x"}}`))
+	h.UpdateSettings(rec, putSettings(&admin, `{"settings":{"autopilot_label":"uzi","slack_bot_token":"xoxb-x"}}`))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (body %s)", rec.Code, rec.Body.String())
 	}

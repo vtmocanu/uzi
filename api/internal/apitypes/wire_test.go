@@ -70,6 +70,9 @@ func TestAgentSelectionTags(t *testing.T) {
 // the RunDTO pin and the RunListItemDTO embed pin.
 var runDTOKeys = []string{
 	"id", "repo_id", "forge_type", "kind", "issue_iid", "issue_title", "issue_description",
+	// PRD #764 M2: server-computed PRD presence for the runs view, always on the wire
+	// (bool, false for issue-less run kinds whose description carries no prds link).
+	"has_prd_link",
 	"title", "resume_of_run_id", "status", "requeue_count", "iteration_count",
 	// issue #321: server-computed planning-phase display flag, always on the wire (bool,
 	// false for every non-planning and pre-feature run). Derived, not stored.

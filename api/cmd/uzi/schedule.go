@@ -426,7 +426,7 @@ func newScheduleCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 		Short: "Create a one-time or recurring schedule on a repo",
 		Long: "Create a schedule that starts run(s) at future time(s). Pick exactly one\n" +
 			"TARGET — --issue <iid> (a pinned issue), --sweep (every eligible issue matching\n" +
-			"the --label selector, default the PRD label), or --prompt <text> (an issue-less\n" +
+			"the --label selector, default the uzi label), or --prompt <text> (an issue-less\n" +
 			"repo→MR run) — and exactly one TIMING — --at <RFC3339> (fires once) or --cron\n" +
 			"<expr> (recurring, interpreted in --tz). Repeat --repo to create the same schedule\n" +
 			"on N repos at once: a CLIENT-SIDE fan-out of one independent create per --repo.",
@@ -447,7 +447,7 @@ func newScheduleCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 			// Sweep-label guardrail (PRD #589 M4): for a --sweep target, warn on (or, with
 			// --create-missing-labels, create) any explicitly-named --label missing on a
 			// target repo BEFORE creating the schedule. Never blocks the create; an empty
-			// --label (server defaults to the PRD label) makes it a no-op.
+			// --label (server defaults to the uzi label) makes it a no-op.
 			if req.Target == schedTargetSweep {
 				createMissing, _ := cmd.Flags().GetBool("create-missing-labels")
 				runSweepLabelGuardrail(cmd, env, gf, c, repos, req.Labels, createMissing)
@@ -487,7 +487,7 @@ func newScheduleCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 	create.Flags().Int64("issue", 0, "pinned issue IID target (one of --issue/--sweep/--prompt)")
 	create.Flags().Bool("sweep", false, "label-sweep target: every eligible matching issue (one of --issue/--sweep/--prompt)")
 	create.Flags().String("prompt", "", "ad-hoc prompt target: an issue-less repo→MR run (one of --issue/--sweep/--prompt)")
-	create.Flags().StringArray("label", nil, "a label to select for --sweep (repeatable; empty defaults to the PRD label)")
+	create.Flags().StringArray("label", nil, "a label to select for --sweep (repeatable; empty defaults to the uzi label)")
 	create.Flags().Int("max-issues", 10, "for --sweep: cap on issues started per fire, oldest-first (default 10; ignored for non-sweep targets)")
 	create.Flags().String("guidance", "", "optional owner guidance injected into the run instruction (--issue/--sweep only)")
 	create.Flags().String("model", "", "model alias (opus/sonnet/haiku/fable) or a custom model ID for runs this schedule fires; empty inherits your Worker-model default (valid on all targets)")
@@ -1329,7 +1329,6 @@ func renderScheduleDetail(p *uzicli.Printer, s apitypes.ScheduleDTO) error {
 // reason falls back to the raw wire string in skipReasonLabel, so a new server-side reason
 // degrades gracefully rather than rendering blank.
 var skipReasonLabels = map[string]string{
-	"no_prd_link":           "no PRD link",
 	"not_eligible":          "not eligible",
 	"already_running":       "already running",
 	"description_too_large": "description too large",
@@ -1349,7 +1348,7 @@ func skipReasonLabel(reason string) string {
 // per-candidate breakdown. A reason with no actionable hint is absent (empty), and the
 // caller omits the trailing `# …` for it.
 var skipReasonHints = map[string]string{
-	"no_prd_link": "add PRDLESS / a prds link, or raise --max-issues",
+	"not_eligible": "add the uzi label, or raise --max-issues",
 }
 
 // skipReasonHint returns the remediation hint for a skip reason, or "" when none applies.
@@ -1357,7 +1356,7 @@ func skipReasonHint(reason string) string { return skipReasonHints[reason] }
 
 // lastFireCappedHint is the one-line steer shown when a capped fire started nothing and
 // every examined candidate was skipped — the newest issues were never reached.
-const lastFireCappedHint = "newer issues not reached — raise --max-issues or add PRDLESS / a PRD link"
+const lastFireCappedHint = "newer issues not reached — raise --max-issues or add the uzi label"
 
 // fireCandidateLabel renders a started/skipped candidate's identity: "#<iid>" for an
 // issue/sweep candidate, or "prompt" for a prompt schedule (which carries a nil iid).

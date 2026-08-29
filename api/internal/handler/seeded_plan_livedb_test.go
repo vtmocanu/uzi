@@ -49,8 +49,9 @@ type seededPlanFixture struct {
 }
 
 // newSeededPlanFixture stands up one owner with a forge connection, a repo, a cached
-// PRD issue (has_prd_link so every create-time gate passes), a default anthropic token,
-// and one worker whose heartbeat is NULL (so the D8 requeue path treats it as stale).
+// issue labelled uzi (so the single run-eligibility gate passes — PRD #764 M1 — with
+// has_prd_link set too), a default anthropic token, and one worker whose heartbeat is
+// NULL (so the D8 requeue path treats it as stale).
 // The PAT and the token are sealed with the fixture's own box so the claim can open both.
 func newSeededPlanFixture(ctx context.Context, t *testing.T) seededPlanFixture {
 	t.Helper()
@@ -100,7 +101,7 @@ func newSeededPlanFixture(ctx context.Context, t *testing.T) seededPlanFixture {
 	          VALUES ($1, $2, $3, 'g/seed', 'https://forge.example/g/seed', 'main', true)`,
 		f.repoID, connID, projectID)
 	mustExecT(ctx, t, pool, `INSERT INTO issues (repo_id, forge_issue_iid, title, state, labels, web_url, has_prd_link, forge_updated_at, synced_at)
-	          VALUES ($1, $2, 'seed issue', 'opened', '["PRD"]'::jsonb, 'https://x', true, now(), now())`,
+	          VALUES ($1, $2, 'seed issue', 'opened', '["PRD","uzi"]'::jsonb, 'https://x', true, now(), now())`,
 		f.repoID, f.iid)
 	mustExecT(ctx, t, pool, `INSERT INTO user_secrets (user_id, kind, label, is_default, ciphertext, sealed_with)
 	          VALUES ($1, $2, 'default', true, $3, 'master')`,
@@ -143,8 +144,7 @@ func TestSeededRunClaimCarriesApprovedPlanNoInputRowLiveDB(t *testing.T) {
 
 	const plan = "# Plan\n\nImplement the widget in widget.go. Done when the tests pass."
 	sel := workersvc.AgentSelection{Source: workersvc.AgentSourceRepo, Exclusions: []string{"reviewer"}}
-	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", false, nil,
-		&workersvc.SeededPlan{PlanMD: plan, Selection: &sel})
+	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", nil, &workersvc.SeededPlan{PlanMD: plan, Selection: &sel})
 	if err != nil {
 		t.Fatalf("CreateRun (seeded): %v", err)
 	}
@@ -206,8 +206,7 @@ func TestSeededRunFallThroughToGateDisarmsLiveDB(t *testing.T) {
 	f := newSeededPlanFixture(ctx, t)
 
 	sel := workersvc.AgentSelection{Source: workersvc.AgentSourceRepo, Exclusions: []string{"reviewer"}}
-	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", false, nil,
-		&workersvc.SeededPlan{PlanMD: "# Seeded plan\nImplement it.", Selection: &sel})
+	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", nil, &workersvc.SeededPlan{PlanMD: "# Seeded plan\nImplement it.", Selection: &sel})
 	if err != nil {
 		t.Fatalf("CreateRun (seeded): %v", err)
 	}
@@ -290,12 +289,11 @@ func TestSeededRunClaimCarriesPlannedBaseCommitLiveDB(t *testing.T) {
 	f := newSeededPlanFixture(ctx, t)
 
 	const plannedCommit = "abc123def4567890abc123def4567890abc12345"
-	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", false, nil,
-		&workersvc.SeededPlan{
-			PlanMD:        "# Plan\nImplement the widget.",
-			PlannedCommit: plannedCommit,
-			RequireBase:   true,
-		})
+	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", nil, &workersvc.SeededPlan{
+		PlanMD:        "# Plan\nImplement the widget.",
+		PlannedCommit: plannedCommit,
+		RequireBase:   true,
+	})
 	if err != nil {
 		t.Fatalf("CreateRun (seeded, --planned-commit --require-base): %v", err)
 	}
@@ -341,8 +339,7 @@ func TestSeededRunNoPlannedCommitClaimIsInertLiveDB(t *testing.T) {
 	ctx := context.Background()
 	f := newSeededPlanFixture(ctx, t)
 
-	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", false, nil,
-		&workersvc.SeededPlan{PlanMD: "# Plan\nImplement it."})
+	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", nil, &workersvc.SeededPlan{PlanMD: "# Plan\nImplement it."})
 	if err != nil {
 		t.Fatalf("CreateRun (seeded, no planned commit): %v", err)
 	}
