@@ -16,6 +16,7 @@ import { VaultBadge, VaultLockedBanner } from "./VaultControls";
 import { RateLimitAnnouncer, SidebarRateLimits } from "./RateLimitMeters";
 import { onNotificationsChanged } from "../lib/notifications";
 import { useFavicon } from "../lib/useFavicon";
+import { brandTabTitle } from "../lib/brandTitle";
 import { JudgeTodoContext, JudgeTodoValueContext } from "./JudgeTodoContext";
 import { BuildInfoPopover } from "./BuildInfoPopover";
 import { ChangelogDrawer } from "./ChangelogDrawer";
@@ -1167,8 +1168,20 @@ export function AppShell({ children }: { children: ReactNode }) {
   // guest and survives logout (enabled flips false → reset to the static mark).
   // Reuses the unread count above — no second unread poll — and owns its own
   // runs poll (which fires while the tab is hidden). Called before the guest
-  // early return so the hook order stays stable.
-  useFavicon({ unread, enabled: !!user });
+  // early return so the hook order stays stable. The base icon white-labels to the
+  // branded app logo (issue #688) — appMarkImgSrc reuses the module-memoised
+  // branding fetch, and applies signed-out too so a guest on a branded instance
+  // still gets the branded base (no status dot).
+  useFavicon({ unread, enabled: !!user, appLogoSrc: appMarkImgSrc(branding) });
+
+  // White-label the browser-tab title (issue #688): index.html carries the static
+  // default for pre-hydration/unbranded; this effect swaps it to brand_company for a
+  // full white-label. Placed before the guest early return so it applies to guests
+  // too and the hook order stays stable. No cleanup/restore needed — AppShell is the
+  // root shell, so the title it last set is always the correct one.
+  useEffect(() => {
+    document.title = brandTabTitle(branding);
+  }, [branding]);
 
   if (!user) return <PublicShell>{children}</PublicShell>;
 
