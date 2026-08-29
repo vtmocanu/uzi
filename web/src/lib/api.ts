@@ -1236,7 +1236,13 @@ export interface Schedule {
   // Optional owner guidance steering HOW a run approaches the task (the issue body
   // stays the task); null = none. Issue and sweep targets only (null for prompt,
   // which already carries its own prompt text). Capped at 8192 bytes server-side.
+  // For a default SWEEP row (issue #675) this is the owner OVERLAY (null until set);
+  // the resolved catalog guidance for that row travels separately in `baked_guidance`.
   guidance: string | null;
+  // Resolved catalog guidance for a default SWEEP row (issue #675), shown read-only in
+  // the modal. Null for prompt/self_improve/user rows. `guidance` carries the owner
+  // overlay appended at fire time. Mirrors apitypes.ScheduleDTO.baked_guidance.
+  baked_guidance: string | null;
   // Per-schedule model override; null = inherit the owner's per-user Worker model.
   // Applies to ALL targets (prompt/issue/sweep), unlike guidance which is issue/sweep-only.
   model: string | null;

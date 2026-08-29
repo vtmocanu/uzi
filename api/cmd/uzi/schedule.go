@@ -769,9 +769,9 @@ func newScheduleEditCmd(env Env, gf *globalFlags) *cobra.Command {
 	edit.Flags().StringArray("label", nil, "replace the sweep label selector (repeatable; sweep-target schedules only)")
 	edit.Flags().Bool("auto-approve", true, "set whether a fired run proceeds past the plan gate unattended")
 	edit.Flags().Bool("wait-on-limit", true, "set whether a fired run parks on the usage limit instead of failing")
-	edit.Flags().String("guidance", "", "change owner guidance injected into the run instruction (issue/sweep targets, or a prompt-target default)")
+	edit.Flags().String("guidance", "", "change owner guidance injected into the run instruction (issue/sweep targets, or a prompt-target or sweep-target default)")
 	edit.Flags().Int("max-issues", 10, "change the per-fire sweep cap, oldest-first (sweep target only)")
-	edit.Flags().Bool("clear-guidance", false, "clear stored guidance back to none (issue/sweep targets, or a prompt-target default)")
+	edit.Flags().Bool("clear-guidance", false, "clear stored guidance back to none (issue/sweep targets, or a prompt-target or sweep-target default)")
 	edit.Flags().Bool("clear-max-issues", false, "clear the sweep cap back to unlimited (sweep target only)")
 	edit.Flags().Bool("apply-model-to-agents", false, "set whether the schedule's model also overrides every subagent's model pin")
 	edit.Flags().String("repo", "", "repoint the schedule to another repo by id (sweep/prompt targets; an issue-target schedule cannot be repointed)")
@@ -957,33 +957,36 @@ func buildScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO) (apity
 // refused client-side rather than reporting a false "updated". They are still restated from
 // the fetched row so a value is never dropped should the server later honor them.
 //
-// Guidance is owner-editable on a PROMPT-target default (PRD #662 M1): --guidance sets it
-// and --clear-guidance blanks it, and the fetched value is RESTATED so a partial edit does
-// not wipe it under the server's replace-semantics. On an issue/sweep default guidance
-// stays catalog-owned, so those flags are rejected client-side. The remaining catalog-owned
-// flags (--prompt/--label/--repo/--at) are likewise rejected client-side with a usage error
-// pointing at `schedule clone`.
+// Guidance is owner-editable on a PROMPT-target default (PRD #662 M1) and a SWEEP-target
+// default (issue #675, where it is an overlay composed onto the baked catalog guidance at
+// fire time): --guidance sets it and --clear-guidance blanks it, and the fetched value is
+// RESTATED so a partial edit does not wipe it under the server's replace-semantics (for a
+// sweep default the restated value is the OVERLAY, never the baked catalog value). On an
+// issue/self_improve default guidance stays catalog-owned, so those flags are rejected
+// client-side. The remaining catalog-owned flags (--prompt/--label/--repo/--at) are likewise
+// rejected client-side with a usage error pointing at `schedule clone`.
 func buildDefaultScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO) (apitypes.ScheduleRequest, error) {
 	f := cmd.Flags()
 
 	// Catalog-owned fields cannot be edited on a default; fail fast client-side with a
 	// message naming clone, rather than forwarding to a server 400. Guidance is the one
-	// exception: on a PROMPT-target default the owner may edit it (PRD #662 M1 made the
-	// server accept an owner guidance change there), so it is handled below rather than in
-	// this blanket reject.
+	// exception: on a PROMPT-target default (PRD #662 M1) or a SWEEP-target default (issue
+	// #675) the owner may edit it, so it is handled below rather than in this blanket reject.
 	for _, flag := range []string{"prompt", "label", "repo", "at"} {
 		if f.Changed(flag) {
 			return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage,
 				"--%s is catalog-owned on a default schedule; clone it first with `uzi schedule clone`", flag)
 		}
 	}
-	// Guidance is owner-editable ONLY on a prompt-target default. On an issue/sweep default
-	// it stays catalog-owned (the server still 400s a guidance edit), so reject it here.
+	// Guidance is owner-editable on a prompt-target default (issue #662) and on a sweep-target
+	// default (issue #675: an owner overlay composed onto the baked catalog guidance at fire
+	// time). On an issue/self_improve default it stays catalog-owned (the server still 400s a
+	// guidance edit), so reject it here.
 	guidanceSet := f.Changed("guidance")
 	clearGuidance := f.Changed("clear-guidance")
-	if (guidanceSet || clearGuidance) && s.Target != schedTargetPrompt {
+	if (guidanceSet || clearGuidance) && s.Target != schedTargetPrompt && s.Target != schedTargetSweep {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage,
-			"--guidance/--clear-guidance are catalog-owned on an issue/sweep default schedule; clone it first with `uzi schedule clone`")
+			"--guidance/--clear-guidance are catalog-owned on this default schedule; clone it first with `uzi schedule clone`")
 	}
 	if guidanceSet && clearGuidance {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "--guidance and --clear-guidance are mutually exclusive")
@@ -1023,14 +1026,15 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO)
 	if s.Target == schedTargetSweep {
 		req.MaxIssues = s.MaxIssues
 	}
-	// Guidance on a PROMPT-target default is owner-editable and uses replace-semantics on
-	// the server, so RESTATE the fetched value — otherwise a partial edit (e.g. --cron
-	// alone) would send a nil guidance and wipe the stored value. The DTO usually surfaces a
-	// prompt default's Guidance as a non-nil pointer (possibly &""), and it is nil only in the
-	// gone-catalog-slug-with-no-stored-guidance edge; the M1 server guard accepts either for a
-	// prompt default (nil keeps NULL, no wipe). Issue/sweep defaults never reach here with a
-	// guidance flag, so they still send no guidance.
-	if s.Target == schedTargetPrompt {
+	// Guidance on a PROMPT-target (issue #662) or SWEEP-target (issue #675) default is
+	// owner-editable and uses replace-semantics on the server, so RESTATE the fetched value —
+	// otherwise a partial edit (e.g. --cron alone) would send a nil guidance and wipe the
+	// stored value. For a sweep default s.Guidance is the OVERLAY (nil when no overlay is set;
+	// the baked catalog value is in s.BakedGuidance and is NEVER restated), so this never
+	// echoes the baked value back into the column. The server guard accepts a nil guidance
+	// (keeps NULL, no wipe). Issue/self_improve defaults never reach here with a guidance flag,
+	// so they still send no guidance.
+	if s.Target == schedTargetPrompt || s.Target == schedTargetSweep {
 		req.Guidance = s.Guidance
 	}
 
@@ -1065,7 +1069,7 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO)
 		req.MaxIssues = nil
 		changed = true
 	}
-	// Guidance overlay (prompt-target default only; guarded above). Restating the fetched
+	// Guidance overlay (prompt- or sweep-target default; guarded above). Restating the fetched
 	// value does NOT by itself count as a change — only an explicit flag flips `changed`.
 	if guidanceSet {
 		v, _ := f.GetString("guidance")
@@ -1298,6 +1302,12 @@ func renderScheduleDetail(p *uzicli.Printer, s apitypes.ScheduleDTO) error {
 	}
 	if s.Target == schedTargetIssue || s.Target == schedTargetSweep {
 		rows = append(rows, []string{"GUIDANCE", strOr(s.Guidance, "-")})
+	}
+	// A sweep default surfaces the read-only baked catalog guidance separately from the owner
+	// overlay (issue #675); BakedGuidance is nil for every other row, so the row is emitted
+	// only when present.
+	if s.BakedGuidance != nil {
+		rows = append(rows, []string{"BAKED_GUIDANCE", strOr(s.BakedGuidance, "-")})
 	}
 	rows = append(rows,
 		[]string{"MODEL", strOr(s.Model, "-")},

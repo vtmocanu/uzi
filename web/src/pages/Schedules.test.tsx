@@ -60,6 +60,7 @@ function sched(over: Partial<Schedule>): Schedule {
     wait_on_limit: true,
     max_issues: 10,
     guidance: null,
+    baked_guidance: null,
     model: null,
     override_subagent_model: false,
     enabled: true,

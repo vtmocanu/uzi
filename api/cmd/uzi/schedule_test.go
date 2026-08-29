@@ -874,29 +874,33 @@ func TestScheduleEditNotFound(t *testing.T) {
 	}
 }
 
-// editDefaultSweepFixture seeds a DEFAULT-origin sweep schedule (PRD #589) under the given
-// id. A default sweep carries a resolved catalog prompt/labels and a max_issues cap; the
-// edit path may only touch the catalog-editable fields, so these tests assert the PATCH
-// carries ONLY those (Target/Labels/Prompt/Guidance/Timing left at zero for the server guard).
+// editDefaultSweepFixture seeds a DEFAULT-origin sweep schedule (PRD #589, extended by issue
+// #675) under the given id. A default sweep carries resolved catalog labels, a max_issues cap,
+// a read-only BakedGuidance (the catalog guidance) and an owner-editable Guidance OVERLAY. The
+// edit path may touch the catalog-editable fields AND the guidance overlay (issue #675), so
+// these tests assert the PATCH restates the overlay (never the baked value) while leaving
+// Target/Labels/Prompt/Timing at zero for the server guard.
 func editDefaultSweepFixture(id string) *uzicli.FakeClient {
 	cap3 := 3
 	return &uzicli.FakeClient{
 		ScheduleByID: map[string]apitypes.ScheduleDTO{
 			id: {
-				ID:          id,
-				RepoID:      "11111111-1111-1111-1111-111111111111",
-				Origin:      "default",
-				Target:      "sweep",
-				Labels:      []string{"bug"},
-				Timing:      "recurring",
-				CronExpr:    "0 9 * * 1",
-				Timezone:    "UTC",
-				AutoApprove: true,
-				WaitOnLimit: true,
-				Enabled:     true,
-				Status:      "active",
-				MaxIssues:   &cap3,
-				Model:       sptr("fable"),
+				ID:            id,
+				RepoID:        "11111111-1111-1111-1111-111111111111",
+				Origin:        "default",
+				Target:        "sweep",
+				Labels:        []string{"bug"},
+				Timing:        "recurring",
+				CronExpr:      "0 9 * * 1",
+				Timezone:      "UTC",
+				AutoApprove:   true,
+				WaitOnLimit:   true,
+				Enabled:       true,
+				Status:        "active",
+				MaxIssues:     &cap3,
+				Guidance:      sptr("sweep overlay"),
+				BakedGuidance: sptr("baked catalog steer"),
+				Model:         sptr("fable"),
 			},
 		},
 		PatchedSchedule: apitypes.ScheduleDTO{ID: id, Origin: "default", Target: "sweep", Timing: "recurring", CronExpr: "0 9 * * 1", Enabled: true},
@@ -932,10 +936,11 @@ func editDefaultPromptFixture(id string) *uzicli.FakeClient {
 	}
 }
 
-// TestScheduleEditDefaultSendsOnlyEditableFields (PRD #589): editing a default sweep sends a
-// FRESH minimal PATCH — only the catalog-editable fields — leaving the catalog-owned ones at
-// zero so the server's patchDefaultScheduleConfig guard passes, while restating the sweep cap
-// and model under replace-semantics.
+// TestScheduleEditDefaultSendsOnlyEditableFields (PRD #589, issue #675): editing a default
+// sweep sends a FRESH minimal PATCH — only the catalog-editable fields — leaving the
+// catalog-owned ones at zero so the server's patchDefaultScheduleConfig guard passes, while
+// restating the sweep cap, model and the owner guidance OVERLAY under replace-semantics. The
+// baked catalog guidance is NEVER restated (it stays in BakedGuidance, catalog-owned).
 func TestScheduleEditDefaultSendsOnlyEditableFields(t *testing.T) {
 	fc := editDefaultSweepFixture("sch_d")
 	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_d", "--tz", "Europe/Bucharest")
@@ -952,8 +957,8 @@ func TestScheduleEditDefaultSendsOnlyEditableFields(t *testing.T) {
 	if req.Prompt != "" {
 		t.Errorf("prompt = %q, want empty (catalog-owned, left at zero)", req.Prompt)
 	}
-	if req.Guidance != nil {
-		t.Errorf("guidance = %v, want nil (catalog-owned, left at zero)", req.Guidance)
+	if req.Guidance == nil || *req.Guidance != "sweep overlay" {
+		t.Errorf("guidance = %v, want the owner overlay restated (not the baked value, not nil)", req.Guidance)
 	}
 	if req.Timing != "" {
 		t.Errorf("timing = %q, want empty (server forces recurring)", req.Timing)
@@ -1047,8 +1052,6 @@ func TestScheduleEditDefaultCatalogOwnedFlagsRejected(t *testing.T) {
 	}{
 		{"label", false, []string{"edit", "sch_d", "--label", "bug"}},
 		{"prompt", true, []string{"edit", "sch_dp", "--prompt", "x"}},
-		{"guidance", false, []string{"edit", "sch_d", "--guidance", "x"}},
-		{"clear-guidance", false, []string{"edit", "sch_d", "--clear-guidance"}},
 		{"repo", false, []string{"edit", "sch_d", "--repo", "22222222-2222-2222-2222-222222222222"}},
 		{"at", false, []string{"edit", "sch_d", "--at", "2026-08-08T09:00:00Z"}},
 		{"apply-model-to-agents", false, []string{"edit", "sch_d", "--apply-model-to-agents=true"}},
@@ -1149,9 +1152,64 @@ func TestScheduleEditDefaultPromptCronRestatesGuidance(t *testing.T) {
 	}
 }
 
-// TestScheduleEditDefaultNonPromptGuidanceRejected (PRD #662 M2): --guidance on an issue or
-// sweep default stays catalog-owned and is rejected client-side with no PATCH sent, and
-// --guidance + --clear-guidance together on a prompt default is a usage error.
+// TestScheduleEditDefaultSweepGuidance (issue #675): --guidance on a sweep default is now
+// owner-editable and builds a PATCH carrying the new overlay, leaving every catalog-owned
+// field at zero (the baked value is never restated).
+func TestScheduleEditDefaultSweepGuidance(t *testing.T) {
+	fc := editDefaultSweepFixture("sch_d")
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_d", "--guidance", "steer the sweep")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	if fc.LastPatchSchedID != "sch_d" {
+		t.Fatalf("patch should have been sent for sch_d, got id %q", fc.LastPatchSchedID)
+	}
+	req := fc.LastPatchSchedReq
+	if req.Guidance == nil || *req.Guidance != "steer the sweep" {
+		t.Errorf("guidance = %v, want \"steer the sweep\"", req.Guidance)
+	}
+	if req.Target != "" || req.Prompt != "" || len(req.Labels) != 0 {
+		t.Errorf("catalog-owned fields set: target=%q prompt=%q labels=%v, want all zero", req.Target, req.Prompt, req.Labels)
+	}
+}
+
+// TestScheduleEditDefaultSweepCronRestatesOverlay (issue #675): a --tz-only edit of a sweep
+// default RESTATES the stored owner overlay (replace-semantics) rather than wiping it, and
+// never restates the read-only baked catalog guidance.
+func TestScheduleEditDefaultSweepCronRestatesOverlay(t *testing.T) {
+	fc := editDefaultSweepFixture("sch_d")
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_d", "--tz", "UTC")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	req := fc.LastPatchSchedReq
+	if req.Guidance == nil || *req.Guidance != "sweep overlay" {
+		t.Errorf("guidance = %v, want the stored overlay restated (not wiped)", req.Guidance)
+	}
+	if req.Guidance != nil && *req.Guidance == "baked catalog steer" {
+		t.Errorf("guidance = %q, must NOT be the baked catalog value", *req.Guidance)
+	}
+}
+
+// TestScheduleEditDefaultSweepClearGuidance (issue #675): --clear-guidance on a sweep default
+// sends a non-nil empty string (the server treats blank as NULL, and the default guard
+// requires a non-nil guidance).
+func TestScheduleEditDefaultSweepClearGuidance(t *testing.T) {
+	fc := editDefaultSweepFixture("sch_d")
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_d", "--clear-guidance")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	if req := fc.LastPatchSchedReq; req.Guidance == nil || *req.Guidance != "" {
+		t.Errorf("guidance = %v, want a non-nil empty string", req.Guidance)
+	}
+}
+
+// TestScheduleEditDefaultNonPromptGuidanceRejected (PRD #662 M2, issue #675): --guidance on an
+// issue default stays catalog-owned and is rejected client-side with no PATCH sent, and
+// --guidance + --clear-guidance together on a prompt default is a usage error. A SWEEP default
+// is NO LONGER here — issue #675 made its guidance an owner-editable overlay (covered by
+// TestScheduleEditDefaultSweepGuidance).
 func TestScheduleEditDefaultNonPromptGuidanceRejected(t *testing.T) {
 	cases := []struct {
 		name string
@@ -1159,7 +1217,6 @@ func TestScheduleEditDefaultNonPromptGuidanceRejected(t *testing.T) {
 		args []string
 	}{
 		{"issue default guidance", editDefaultIssueFixture("sch_di"), []string{"edit", "sch_di", "--guidance", "x"}},
-		{"sweep default guidance", editDefaultSweepFixture("sch_d"), []string{"edit", "sch_d", "--guidance", "x"}},
 		{"prompt default guidance+clear", editDefaultPromptFixture("sch_dp"), []string{"edit", "sch_dp", "--guidance", "y", "--clear-guidance"}},
 	}
 	for _, tc := range cases {

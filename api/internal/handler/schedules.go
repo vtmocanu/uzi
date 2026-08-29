@@ -791,6 +791,9 @@ func (h *Handler) CloneSchedule(w http.ResponseWriter, r *http.Request) {
 			prompt = pgtype.Text{String: job.Prompt, Valid: true}
 		case "sweep":
 			labels = marshalLabels(job.Labels)
+			// Baked-only clone (issue #675): the cloned user row carries the BAKED catalog
+			// guidance; the source row's stored owner OVERLAY (cur.Guidance, reset to empty
+			// above) is intentionally discarded, matching the prompt-clone in #662.
 			if strings.TrimSpace(job.Guidance) != "" {
 				guidance = pgtype.Text{String: job.Guidance, Valid: true}
 			}
@@ -998,18 +1001,22 @@ func cloneNextFire(cur store.RunSchedule, now time.Time) (pgtype.Timestamptz, er
 // M2). Only the catalog-inherited editable fields (cron_expr, timezone, model, auto_approve,
 // wait_on_limit, and — for a sweep — max_issues) may be edited; prompt/labels/target/repo/
 // timing are catalog-owned and a request touching them is a 400. Guidance is catalog-owned
-// for issue/sweep/self_improve defaults but owner-editable for a PROMPT default (issue #662:
-// it overlays the catalog prompt at fire time), where it takes replace-semantics under an
-// 8 KiB cap. It recomputes next_fire_at, recomputes the customized flag (any editable field
+// for issue/self_improve defaults but owner-editable for a PROMPT default (issue #662: it
+// overlays the catalog prompt at fire time) and for a SWEEP default (issue #675: an owner
+// OVERLAY composed onto the baked catalog guidance at fire time — the baked value stays
+// catalog-owned and is surfaced read-only as BakedGuidance). The editable overlay takes
+// replace-semantics under an 8 KiB cap. It recomputes next_fire_at, recomputes the customized flag (any editable field
 // diverging from the catalog default OR the row was already customized), and persists via
 // UpdateRunSchedule keeping the catalog-owned columns NULL. It writes the HTTP error itself
 // and returns done=false on any failure; on success it returns the updated row and done=true.
 func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Request, user store.User, id uuid.UUID, cur store.RunSchedule, req apitypes.ScheduleRequest) (store.RunSchedule, bool) {
-	// Owner-guidance overlay (issue #662): a DEFAULT PROMPT job carries owner-editable
-	// guidance appended to the catalog-resolved prompt at fire time, so guidance is NOT
-	// catalog-owned for a prompt default. Issue/sweep/self_improve defaults keep guidance
-	// catalog-owned (locked). All the other fields stay catalog-owned for every target.
-	guidanceEditable := cur.Target == "prompt"
+	// Owner-guidance overlay (issue #662, extended by issue #675): a DEFAULT PROMPT job
+	// carries owner-editable guidance appended to the catalog-resolved prompt at fire time,
+	// and a DEFAULT SWEEP job carries an owner OVERLAY composed onto the baked catalog
+	// guidance at fire time — so guidance is NOT catalog-owned for a prompt or sweep default.
+	// Issue/self_improve defaults keep guidance catalog-owned (locked). All the other fields
+	// stay catalog-owned for every target.
+	guidanceEditable := cur.Target == "prompt" || cur.Target == "sweep"
 	if req.Prompt != "" || req.Labels != nil || (!guidanceEditable && req.Guidance != nil) || req.Target != "" ||
 		req.RepoID != "" || req.IssueIID != nil || req.Timing != "" || req.RunAt != nil {
 		locked := "prompt, labels, guidance, target, timing and repo"
@@ -1099,10 +1106,12 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 		return store.RunSchedule{}, false
 	}
 
-	// Guidance replace-semantics (issue #662), scoped to a prompt default. A prompt catalog
-	// job carries no guidance, so any persisted non-empty owner guidance is a divergence.
-	// Empty/whitespace clears it back to NULL (an exact-restore un-customizes). For issue/
-	// sweep/self_improve defaults guidance stays NULL — catalog-owned.
+	// Guidance replace-semantics (issue #662, #675), scoped to a prompt or sweep default. The
+	// persisted column holds the owner OVERLAY (a prompt catalog job carries no guidance; a
+	// sweep default's baked guidance stays catalog-owned and is never stored here), so any
+	// persisted non-empty owner guidance is a divergence. Empty/whitespace clears it back to
+	// NULL (an exact-restore un-customizes). For issue/self_improve defaults guidance stays
+	// NULL — catalog-owned.
 	guidance := pgtype.Text{}
 	if guidanceEditable && req.Guidance != nil && strings.TrimSpace(*req.Guidance) != "" {
 		guidance = pgtype.Text{String: *req.Guidance, Valid: true}
@@ -1119,9 +1128,11 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 		customized = cur.Customized
 	}
 	// Owner guidance is not one of defaultEditableDiverges' inputs (its signature is
-	// unchanged); OR-in its divergence for a prompt default. Since the catalog prompt job
-	// carries empty guidance, any persisted non-empty guidance diverges — and clearing it
-	// back to empty leaves guidance.Valid false, so an exact-restore still un-customizes.
+	// unchanged); OR-in its divergence for a prompt or sweep default. The stored column holds
+	// only the owner overlay (the baked value is never compared), so any persisted non-empty
+	// overlay diverges — and clearing it back to empty leaves guidance.Valid false, so an
+	// exact-restore still un-customizes. A sweep default with a NULL overlay is therefore not
+	// falsely "customized".
 	if guidanceEditable {
 		customized = customized || guidance.Valid
 	}
@@ -1492,7 +1503,15 @@ func (h *Handler) scheduleDTO(s store.RunSchedule, repoPath string) apitypes.Sch
 			dto.Prompt = job.Prompt
 			dto.Labels = job.Labels
 			g := job.Guidance
-			dto.Guidance = &g
+			// Owner-guidance overlay (issue #675): for a SWEEP default the catalog guidance is
+			// the BAKED value shown read-only; Guidance is reserved for the owner overlay,
+			// populated below from the stored column. For a prompt/other default the baked value
+			// still travels through Guidance as before.
+			if s.Target == "sweep" {
+				dto.BakedGuidance = &g
+			} else {
+				dto.Guidance = &g
+			}
 		}
 	}
 	if s.IssueIid.Valid {
