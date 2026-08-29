@@ -3,11 +3,14 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -79,6 +82,137 @@ func TestCreateTaskRunMintsNamespacedBranch(t *testing.T) {
 	}
 }
 
+// TestCreateTaskRunPersistsHandoffBudget: issue #785. A non-interactive handoff persists
+// the dedicated HANDOFF_RUN_TIMEOUT / HANDOFF_RUN_MAX_ITERATIONS budget onto the run
+// (budget_wall_seconds / budget_max_iterations), LEAST-capped to the 8h wall ceiling; an
+// interactive handoff persists both as NULL so the claim/sweeper COALESCE falls back to the
+// global default.
+func TestCreateTaskRunPersistsHandoffBudget(t *testing.T) {
+	newSvc := func(fs *fakeStore, p Params) *Service {
+		svc := New(fs, newBox(t), p)
+		svc.SetRepoGuard(&fakeGuard{res: privcheck.GuardResult{Blocked: false}})
+		return svc
+	}
+
+	// Non-interactive: the dedicated 4h/10 budget lands on the run.
+	t.Run("non-interactive persists budget", func(t *testing.T) {
+		p := testParams()
+		p.HandoffRunTimeout = 4 * time.Hour
+		p.HandoffRunMaxIterations = 10
+		fs := &fakeStore{repoRow: aValidRepoRow()}
+		if _, err := newSvc(fs, p).CreateTaskRun(context.Background(), uuid.New(), uuid.New(), "do the thing", "", false, false, false, false); err != nil {
+			t.Fatalf("CreateTaskRun: %v", err)
+		}
+		got := fs.taskRunParams
+		if got == nil {
+			t.Fatal("insert did not run")
+		}
+		if !got.BudgetWallSeconds.Valid || got.BudgetWallSeconds.Int32 != 14400 {
+			t.Errorf("budget_wall_seconds = %v, want valid 14400", got.BudgetWallSeconds)
+		}
+		if !got.BudgetMaxIterations.Valid || got.BudgetMaxIterations.Int32 != 10 {
+			t.Errorf("budget_max_iterations = %v, want valid 10", got.BudgetMaxIterations)
+		}
+	})
+
+	// Interactive: both NULL, so the global default applies via COALESCE.
+	t.Run("interactive persists NULL", func(t *testing.T) {
+		p := testParams()
+		p.HandoffRunTimeout = 4 * time.Hour
+		p.HandoffRunMaxIterations = 10
+		fs := &fakeStore{repoRow: aValidRepoRow()}
+		if _, err := newSvc(fs, p).CreateTaskRun(context.Background(), uuid.New(), uuid.New(), "do the thing", "", false, false, false, true); err != nil {
+			t.Fatalf("CreateTaskRun: %v", err)
+		}
+		got := fs.taskRunParams
+		if got == nil {
+			t.Fatal("insert did not run")
+		}
+		if got.BudgetWallSeconds.Valid {
+			t.Errorf("budget_wall_seconds = %v, want NULL for an interactive handoff", got.BudgetWallSeconds)
+		}
+		if got.BudgetMaxIterations.Valid {
+			t.Errorf("budget_max_iterations = %v, want NULL for an interactive handoff", got.BudgetMaxIterations)
+		}
+	})
+
+	// A wall above the 8h ceiling is LEAST-capped to budgetWallCeilingSeconds (28800).
+	t.Run("non-interactive clamps to the wall ceiling", func(t *testing.T) {
+		p := testParams()
+		p.HandoffRunTimeout = 12 * time.Hour
+		p.HandoffRunMaxIterations = 10
+		fs := &fakeStore{repoRow: aValidRepoRow()}
+		if _, err := newSvc(fs, p).CreateTaskRun(context.Background(), uuid.New(), uuid.New(), "do the thing", "", false, false, false, false); err != nil {
+			t.Fatalf("CreateTaskRun: %v", err)
+		}
+		got := fs.taskRunParams
+		if got == nil {
+			t.Fatal("insert did not run")
+		}
+		if !got.BudgetWallSeconds.Valid || got.BudgetWallSeconds.Int32 != budgetWallCeilingSeconds {
+			t.Errorf("budget_wall_seconds = %v, want valid %d (ceiling)", got.BudgetWallSeconds, budgetWallCeilingSeconds)
+		}
+	})
+
+	// A sub-second HANDOFF_RUN_TIMEOUT truncates to 0 integer seconds; the guard is on the
+	// COMPUTED seconds, so it persists NULL (global fallback) rather than a 0 that would
+	// trip the CHECK (budget_wall_seconds > 0) and fail every non-interactive handoff.
+	t.Run("sub-second wall truncates to NULL", func(t *testing.T) {
+		p := testParams()
+		p.HandoffRunTimeout = 500 * time.Millisecond
+		p.HandoffRunMaxIterations = 10
+		fs := &fakeStore{repoRow: aValidRepoRow()}
+		if _, err := newSvc(fs, p).CreateTaskRun(context.Background(), uuid.New(), uuid.New(), "do the thing", "", false, false, false, false); err != nil {
+			t.Fatalf("CreateTaskRun: %v", err)
+		}
+		got := fs.taskRunParams
+		if got == nil {
+			t.Fatal("insert did not run")
+		}
+		if got.BudgetWallSeconds.Valid {
+			t.Errorf("budget_wall_seconds = %v, want NULL for a sub-second timeout", got.BudgetWallSeconds)
+		}
+	})
+
+	// An iteration cap ABOVE int32 max would narrow to a negative/wrong-positive int32; the
+	// guard bounds it, so it persists NULL (global fallback) rather than tripping the CHECK
+	// (budget_max_iterations > 0) or capping at a bogus value.
+	t.Run("iteration cap above int32 max truncates to NULL", func(t *testing.T) {
+		p := testParams()
+		p.HandoffRunTimeout = 4 * time.Hour
+		p.HandoffRunMaxIterations = int(math.MaxInt32) + 1
+		fs := &fakeStore{repoRow: aValidRepoRow()}
+		if _, err := newSvc(fs, p).CreateTaskRun(context.Background(), uuid.New(), uuid.New(), "do the thing", "", false, false, false, false); err != nil {
+			t.Fatalf("CreateTaskRun: %v", err)
+		}
+		got := fs.taskRunParams
+		if got == nil {
+			t.Fatal("insert did not run")
+		}
+		if got.BudgetMaxIterations.Valid {
+			t.Errorf("budget_max_iterations = %v, want NULL for an above-int32-max cap", got.BudgetMaxIterations)
+		}
+	})
+
+	// The int32 max boundary is in-range and persists as-is.
+	t.Run("iteration cap at int32 max persists", func(t *testing.T) {
+		p := testParams()
+		p.HandoffRunTimeout = 4 * time.Hour
+		p.HandoffRunMaxIterations = math.MaxInt32
+		fs := &fakeStore{repoRow: aValidRepoRow()}
+		if _, err := newSvc(fs, p).CreateTaskRun(context.Background(), uuid.New(), uuid.New(), "do the thing", "", false, false, false, false); err != nil {
+			t.Fatalf("CreateTaskRun: %v", err)
+		}
+		got := fs.taskRunParams
+		if got == nil {
+			t.Fatal("insert did not run")
+		}
+		if !got.BudgetMaxIterations.Valid || got.BudgetMaxIterations.Int32 != math.MaxInt32 {
+			t.Errorf("budget_max_iterations = %v, want valid %d", got.BudgetMaxIterations, int32(math.MaxInt32))
+		}
+	})
+}
+
 // TestCreateTaskRunStampsOwnerWaitOnLimit: a task/handoff run must inherit the
 // owner's users.wait_on_limit default, the same defaulting every other creation path
 // applies (resolveWaitOnLimit; PRD #35). handoff has no per-request override, so nil
@@ -136,6 +270,42 @@ func TestCreateTaskRunStampsOwnerWaitOnLimit(t *testing.T) {
 			t.Fatal("a failed user read resolved TRUE; false is today's behaviour and the safe direction")
 		}
 	})
+}
+
+// A then-fix run inherits the original task's PERSISTED budget verbatim (issue #785): the
+// fix phase of a long non-interactive handoff keeps the same allowance, and — because it
+// COPIES the stored value rather than recomputing from config — a change to the handoff
+// settings between the task and its auto-spawned fix cannot alter the fix's budget. The
+// config here is set DIFFERENT from the original's stored budget: a recompute would produce
+// 14400/10 from config, so persisting the passed-in 7200/7 proves the copy.
+func TestCreateThenFixRunCopiesOriginalBudget(t *testing.T) {
+	p := testParams()
+	p.HandoffRunTimeout = 4 * time.Hour // config: 14400 / 10 ...
+	p.HandoffRunMaxIterations = 10
+	owner := uuid.New()
+	// The owner opted into usage-limit parking: the fix run must inherit it (PRD #35), not
+	// fall to the column DEFAULT false and stop on a limit the original handoff would park on.
+	fs := &fakeStore{userByID: store.User{ID: owner, WaitOnLimit: true}}
+	svc := New(fs, newBox(t), p)
+	// ... but the original task was stored with 7200 / 7 (e.g. created under earlier config).
+	origWall := pgtype.Int4{Int32: 7200, Valid: true}
+	origIters := pgtype.Int4{Int32: 7, Valid: true}
+	if _, err := svc.CreateThenFixRun(context.Background(), owner, uuid.New(), uuid.New(), "uzi/task/abc", "main", "fix the findings", origWall, origIters); err != nil {
+		t.Fatalf("CreateThenFixRun: %v", err)
+	}
+	got := fs.thenFixRunParams
+	if got == nil {
+		t.Fatal("insert did not run")
+	}
+	if !got.BudgetWallSeconds.Valid || got.BudgetWallSeconds.Int32 != 7200 {
+		t.Errorf("budget_wall_seconds = %v, want the original's stored 7200 (copied, not config's 14400)", got.BudgetWallSeconds)
+	}
+	if !got.BudgetMaxIterations.Valid || got.BudgetMaxIterations.Int32 != 7 {
+		t.Errorf("budget_max_iterations = %v, want the original's stored 7 (copied, not config's 10)", got.BudgetMaxIterations)
+	}
+	if !got.WaitOnLimit {
+		t.Error("wait_on_limit = false for an opted-in owner — the fix run fell to the column default instead of resolveWaitOnLimit (PRD #35)")
+	}
 }
 
 // TestCreateTaskRunSanitizesAndCaps: NUL bytes are stripped from both context and

@@ -300,10 +300,16 @@ type Config struct {
 	// (they tune the run queue / worker liveness, not security). RunIdleTimeout
 	// and RunMaxIterations are enforced worker-side and shipped in the claim
 	// payload; the rest drive the server sweeper and claim affinity.
-	RunTimeout              time.Duration // wall clock before a running run is failed
-	RunIdleTimeout          time.Duration // worker-side no-message idle cap
-	WorkerTaskIdleTimeout   time.Duration // PRD #517 M5: interactive-task park idle cap (worker-side); rides the claim
-	RunMaxIterations        int           // implement⇄review loop cap (worker-side)
+	RunTimeout            time.Duration // wall clock before a running run is failed
+	RunIdleTimeout        time.Duration // worker-side no-message idle cap
+	WorkerTaskIdleTimeout time.Duration // PRD #517 M5: interactive-task park idle cap (worker-side); rides the claim
+	RunMaxIterations      int           // implement⇄review loop cap (worker-side)
+	// HandoffRunTimeout / HandoffRunMaxIterations (issue #785) are the dedicated default
+	// wall-clock budget and iteration cap for a NON-interactive `uzi handoff` task run.
+	// Decoupled from RunTimeout / RunMaxIterations so raising one does not move the other.
+	// Interactive handoffs are exempt (they are idle-bounded by WorkerTaskIdleTimeout).
+	HandoffRunTimeout       time.Duration // non-interactive handoff wall-clock budget
+	HandoffRunMaxIterations int           // non-interactive handoff implement⇄review loop cap
 	PlanMaxRevisions        int           // PRD #41 plan-revision cap at the approval gate (server + worker)
 	QuestionMax             int           // PRD #88 clarification-question cap per run (worker-enforced)
 	QuestionTimeoutSeconds  int           // PRD #88 answer deadline before a parked run fails (worker-enforced)
@@ -745,6 +751,10 @@ func Load() (Config, error) {
 	// TASK_IDLE_TIMEOUT completing a run the server cannot push.
 	cfg.WorkerTaskIdleTimeout = parseDuration("WORKER_TASK_IDLE_TIMEOUT", 30*time.Minute)
 	cfg.RunMaxIterations = parseInt("RUN_MAX_ITERATIONS", 5)
+	// issue #785: dedicated budget for a NON-interactive `uzi handoff` task run, decoupled
+	// from RUN_TIMEOUT / RUN_MAX_ITERATIONS.
+	cfg.HandoffRunTimeout = parseDuration("HANDOFF_RUN_TIMEOUT", 4*time.Hour)
+	cfg.HandoffRunMaxIterations = parseInt("HANDOFF_RUN_MAX_ITERATIONS", 10)
 	cfg.PlanMaxRevisions = parseInt("PLAN_MAX_REVISIONS", 3)
 	cfg.QuestionMax = parseInt("QUESTION_MAX", 5)
 	cfg.QuestionTimeoutSeconds = parseInt("QUESTION_TIMEOUT_SECONDS", 86400)
