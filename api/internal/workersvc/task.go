@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 
 	"github.com/google/uuid"
@@ -108,12 +109,15 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 	// CHECK constraint is `NULL OR > 0`. The guards check the COMPUTED integer seconds /
 	// iterations (not the raw duration), so a sub-second HANDOFF_RUN_TIMEOUT that truncates
 	// to 0 falls back to the global default instead of persisting a 0 that trips the CHECK.
+	// An iteration cap ABOVE int32 max is likewise treated as invalid and left NULL (global
+	// fallback), so an out-of-range HANDOFF_RUN_MAX_ITERATIONS cannot narrow to a negative or
+	// wrong-positive int32 that trips the CHECK / persists a bogus cap.
 	var budgetWall, budgetIters pgtype.Int4
 	if !interactive {
 		if secs := int(s.p.HandoffRunTimeout.Seconds()); secs > 0 {
 			budgetWall = pgtype.Int4{Int32: int32(min(secs, budgetWallCeilingSeconds)), Valid: true}
 		}
-		if s.p.HandoffRunMaxIterations > 0 {
+		if s.p.HandoffRunMaxIterations > 0 && s.p.HandoffRunMaxIterations <= math.MaxInt32 {
 			budgetIters = pgtype.Int4{Int32: int32(s.p.HandoffRunMaxIterations), Valid: true}
 		}
 	}

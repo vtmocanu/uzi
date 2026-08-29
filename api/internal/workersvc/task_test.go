@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -169,6 +170,44 @@ func TestCreateTaskRunPersistsHandoffBudget(t *testing.T) {
 		}
 		if got.BudgetWallSeconds.Valid {
 			t.Errorf("budget_wall_seconds = %v, want NULL for a sub-second timeout", got.BudgetWallSeconds)
+		}
+	})
+
+	// An iteration cap ABOVE int32 max would narrow to a negative/wrong-positive int32; the
+	// guard bounds it, so it persists NULL (global fallback) rather than tripping the CHECK
+	// (budget_max_iterations > 0) or capping at a bogus value.
+	t.Run("iteration cap above int32 max truncates to NULL", func(t *testing.T) {
+		p := testParams()
+		p.HandoffRunTimeout = 4 * time.Hour
+		p.HandoffRunMaxIterations = int(math.MaxInt32) + 1
+		fs := &fakeStore{repoRow: aValidRepoRow()}
+		if _, err := newSvc(fs, p).CreateTaskRun(context.Background(), uuid.New(), uuid.New(), "do the thing", "", false, false, false, false); err != nil {
+			t.Fatalf("CreateTaskRun: %v", err)
+		}
+		got := fs.taskRunParams
+		if got == nil {
+			t.Fatal("insert did not run")
+		}
+		if got.BudgetMaxIterations.Valid {
+			t.Errorf("budget_max_iterations = %v, want NULL for an above-int32-max cap", got.BudgetMaxIterations)
+		}
+	})
+
+	// The int32 max boundary is in-range and persists as-is.
+	t.Run("iteration cap at int32 max persists", func(t *testing.T) {
+		p := testParams()
+		p.HandoffRunTimeout = 4 * time.Hour
+		p.HandoffRunMaxIterations = math.MaxInt32
+		fs := &fakeStore{repoRow: aValidRepoRow()}
+		if _, err := newSvc(fs, p).CreateTaskRun(context.Background(), uuid.New(), uuid.New(), "do the thing", "", false, false, false, false); err != nil {
+			t.Fatalf("CreateTaskRun: %v", err)
+		}
+		got := fs.taskRunParams
+		if got == nil {
+			t.Fatal("insert did not run")
+		}
+		if !got.BudgetMaxIterations.Valid || got.BudgetMaxIterations.Int32 != math.MaxInt32 {
+			t.Errorf("budget_max_iterations = %v, want valid %d", got.BudgetMaxIterations, int32(math.MaxInt32))
 		}
 	})
 }
