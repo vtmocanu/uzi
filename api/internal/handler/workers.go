@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
@@ -363,10 +364,14 @@ func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
 		Kind:             r.Kind,
 		IssueTitle:       r.IssueTitle,
 		IssueDescription: r.IssueDescription,
-		Title:            textPtrValue(r.Title.Valid, r.Title.String),
-		Status:           r.Status,
-		RequeueCount:     r.RequeueCount,
-		IterationCount:   r.IterationCount,
+		// PRD #764 M2: server-computed PRD presence for the runs view, derived
+		// label-independently from the snapshotted issue description via the same
+		// detector the board card uses.
+		HasPRDLink:     forgesvc.HasPRDLink(r.IssueDescription),
+		Title:          textPtrValue(r.Title.Valid, r.Title.String),
+		Status:         r.Status,
+		RequeueCount:   r.RequeueCount,
+		IterationCount: r.IterationCount,
 		IsPlanning: isPlanningPhase(r.Kind, r.Status, r.IterationCount,
 			r.PlanMd.Valid && strings.TrimSpace(r.PlanMd.String) != ""),
 		AutoApprove: r.AutoApprove,

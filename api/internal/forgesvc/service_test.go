@@ -34,3 +34,15 @@ func TestHasPRDLink(t *testing.T) {
 		}
 	}
 }
+
+// TestHasPRDLinkLabelIndependent pins the PRD-optional intent (PRD #764 M2): PRD
+// detection is a pure function of the issue DESCRIPTION and depends on no label. The
+// detector takes only the description string, so a prds/*.md link is found regardless
+// of what labels (uzi, bug, Planned, or none) the issue carries — the runs/board
+// PRD-presence badge is therefore label-independent.
+func TestHasPRDLinkLabelIndependent(t *testing.T) {
+	const desc = "Implements the feature. Spec: prds/764-uzi-eligibility-label.md"
+	if !HasPRDLink(desc) {
+		t.Fatalf("HasPRDLink(%q) = false, want true — detection is on the description alone, no label involved", desc)
+	}
+}

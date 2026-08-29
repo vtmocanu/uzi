@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -39,6 +40,65 @@ func TestRunToDTOPrdLink(t *testing.T) {
 		}
 		if dto.PrdPatchSettledAt != nil {
 			t.Fatalf("prd_patch_settled_at = %v, want nil — an unsettled patch reads null", *dto.PrdPatchSettledAt)
+		}
+	})
+}
+
+// TestRunToDTOHasPRDLink pins that the runs DTO exposes server-computed PRD presence
+// (PRD #764 M2): a run whose snapshotted issue description links a prds/*.md serializes
+// has_prd_link:true, and one whose description has no such link serializes false. The
+// detection is label-independent — it is computed purely from IssueDescription via the
+// same forgesvc.HasPRDLink detector the board card uses. This asserts the JSON field
+// itself (present and correct); pre-M2 the field did not exist, so the true case fails
+// on pre-change code.
+func TestRunToDTOHasPRDLink(t *testing.T) {
+	t.Run("description with a prds link: has_prd_link true", func(t *testing.T) {
+		dto := runToDTO(store.Run{
+			ID:               uuid.New(),
+			IssueDescription: "Fixes the thing.\n\nSpec: prds/764-uzi-eligibility-label.md",
+		}, "normal")
+		if !dto.HasPRDLink {
+			t.Fatalf("HasPRDLink = false, want true for a description linking prds/764-uzi-eligibility-label.md")
+		}
+		b, err := json.Marshal(dto)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var got map[string]json.RawMessage
+		if err := json.Unmarshal(b, &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		raw, ok := got["has_prd_link"]
+		if !ok {
+			t.Fatalf("has_prd_link absent from runs DTO JSON, want present")
+		}
+		if string(raw) != "true" {
+			t.Fatalf("has_prd_link = %s, want true", raw)
+		}
+	})
+
+	t.Run("description with no prds link: has_prd_link false", func(t *testing.T) {
+		dto := runToDTO(store.Run{
+			ID:               uuid.New(),
+			IssueDescription: "A chat run with no issue and no prds reference at all.",
+		}, "normal")
+		if dto.HasPRDLink {
+			t.Fatalf("HasPRDLink = true, want false for a description with no prds link")
+		}
+		b, err := json.Marshal(dto)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var got map[string]json.RawMessage
+		if err := json.Unmarshal(b, &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		raw, ok := got["has_prd_link"]
+		if !ok {
+			t.Fatalf("has_prd_link absent from runs DTO JSON, want present")
+		}
+		if string(raw) != "false" {
+			t.Fatalf("has_prd_link = %s, want false", raw)
 		}
 	})
 }
