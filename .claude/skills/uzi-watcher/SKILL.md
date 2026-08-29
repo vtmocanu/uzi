@@ -67,9 +67,9 @@ Below, a run id is written `RUN` and a PR number `PR` in the example commands.
    result → diagnose (see *When a run fails*) and stop.
 6. **Get the MR and review the diff.** `uzi run get RUN --field mr_web_url`, then review
    (see *Reviewing the diff* below), plus `gh pr diff`. Verify the diff against the
-   approved plan. **Once CodeRabbit lands findings, uzi's own `mr_rework` usually fixes
-   them itself** — defer to it and review its fix before merging (see *uzi may fix the
-   CodeRabbit findings ITSELF*).
+   approved plan. **Once any review finding lands (CodeRabbit, a human reviewer, or another
+   review bot), uzi's own `mr_rework` usually fixes it itself** — defer to it and review its
+   fix before merging (see *uzi may fix the CodeRabbit findings ITSELF*).
 7. **Merge** (see *Merging past branch protection*).
 8. **Watch post-merge CI and fix** (see *Post-merge CI*).
 
@@ -266,12 +266,19 @@ by anything on the PR itself.
 
 **The coordination rule, folded into the flow:**
 
-1. **When CodeRabbit lands with actionable findings, check for an `mr_rework` run on this
-   MR before touching anything:**
+1. **When ANY review finding lands, check for an `mr_rework` run on this MR before touching
+   anything.** `mr_rework` consumes every unacted review comment — CodeRabbit, a **human
+   reviewer**, and any **third-party review bot** — not just CodeRabbit, so gate the check
+   on *any* finding, or a human/other-bot finding slips into the local-fix path while a
+   rework is being queued and recreates the double-push collision:
    ```
-   uzi run list --json | jq -r --argjson pr PR '.[]|select(.kind=="mr_rework" and .mr_iid==$pr)|{id,status}'
+   uzi run list --json | jq -r --arg repo REPO_ID --argjson pr PR \
+     '.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr)|{id,status}'
    ```
-   `mr_rework` runs carry **`mr_iid`, never `issue_iid`** (their `branch`/`mr_web_url`/
+   **Filter on `repo_id` too, not `mr_iid` alone:** `mr_iid` is a per-repo MR number, so
+   across the several repos this skill may drive, two repos can each have an MR with the
+   same number — an `mr_iid`-only match can point at another repo's rework. `mr_rework`
+   runs carry **`repo_id` and `mr_iid`, never `issue_iid`** (their `branch`/`mr_web_url`/
    `source_run_id` may read null while running — do not key on those). A non-terminal one
    means uzi is on it.
 2. **If uzi is (or is about to be) reworking, DEFER — do not fix locally, do not merge.**
@@ -282,12 +289,18 @@ by anything on the PR itself.
    uzi *acting* is not uzi being *right*: confirm the rework actually addressed the
    finding, added no regression, and did not "fix" a deliberate behavior. A bad rework is a
    `revise`/`follow-up` to that run or a local correction — never an automatic merge.
+   **A completed rework may push NO commit at all** — it can judge every finding invalid or
+   already handled and only reply/resolve threads, leaving the branch head unchanged. Then
+   there is nothing to `git show`: confirm the head SHA did not move (`git rev-parse
+   origin/<branch>` unchanged) and proceed on the re-review rather than hunting for a commit
+   that was never made.
 4. **Its push retriggers CodeRabbit.** Wait for the re-review on the **new head** (signal
    (c), the walkthrough `recent_review` range covering the new SHA — see *Triaging* below),
    confirm no active `mr_rework` remains and CI is green on that head, THEN merge.
 
 **When this session still fixes locally (mr_rework will not or cannot):**
-- the owner is **opted out**, or the admin **kill-switch** is off, so no rework fires;
+- the owner is **opted out**, or the admin **kill-switch** is engaged
+  (`mr_rework_enabled=false`), so no rework fires;
 - a **`.github/workflows` finding** — the worker lacks `workflow` scope, so uzi cannot
   touch it (nor can a re-run); that is yours, on a CI-only PR;
 - a **base-realignment inherited finding** (a workflow file already on `main`) — not the
