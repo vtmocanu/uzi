@@ -160,9 +160,9 @@ const SEED_USER_SETTINGS: UserSettings = {
 const SEED_APP_SETTINGS: AppSettings = {
   prd_label: "PRD",
   autopilot_label: "autopilot",
+  // PRD #764: the single run-eligibility label.
+  uzi_label: "uzi",
   default_theme: "ember",
-  prdless_enabled: "true",
-  prdless_label: "PRDLESS",
   slack_enabled: "false",
   public_base_url: "http://127.0.0.1:8080",
   judge_enabled: "false",
@@ -187,11 +187,6 @@ const SEED_APP_SETTINGS: AppSettings = {
   capability_aware_scheduling: "true",
   // Issue #534 M2: GitHub Projects v2 sync instance kill-switch, default OFF.
   github_project_sync_enabled: "false",
-  // PRD #196 M2: comma-separated label lists (run_eligible always contains the
-  // primary) and the PRD-link waiver bool, mirroring the server defaults.
-  run_eligible_labels: "PRD,bug",
-  board_extra_labels: "bug",
-  eligible_label_waives_prd_link: "true",
   // PRD #685: instance branding config, all string-space. Fresh installs are
   // unbranded (app_logo_mode "default", brand_mode "none").
   app_logo_mode: "default",
@@ -201,15 +196,6 @@ const SEED_APP_SETTINGS: AppSettings = {
   brand_placement: "below",
   brand_plaque: "false",
 };
-
-// parseLabels splits a comma-separated settings value into trimmed non-empty
-// tokens (PRD #196 M2), mirroring the server's parse.
-function parseLabels(value: string): string[] {
-  return value
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
 
 interface PersistedSettings {
   v: 1;
@@ -250,12 +236,13 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
   const okApp =
     typeof a.prd_label === "string" &&
     typeof a.autopilot_label === "string" &&
+    // PRD #764: accept legacy blobs that predate this field (undefined) — it is filled
+    // from the seed default ("uzi") on load — but reject a malformed non-string.
+    (a.uzi_label === undefined || typeof a.uzi_label === "string") &&
     typeof a.default_theme === "string" &&
     // PRD #649: accept legacy blobs that predate this field (undefined), but reject a
     // malformed non-string so a bad localStorage blob can't violate the AppSettings contract.
     (a.ephemeral_workers_enabled === undefined || typeof a.ephemeral_workers_enabled === "string") &&
-    typeof a.prdless_enabled === "string" &&
-    typeof a.prdless_label === "string" &&
     typeof a.slack_enabled === "string" &&
     typeof a.public_base_url === "string" &&
     typeof a.judge_enabled === "string" &&
@@ -272,10 +259,7 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     typeof a.health_queued_seconds === "string" &&
     typeof a.health_approval_seconds === "string" &&
     typeof a.health_nudge_cooldown_seconds === "string" &&
-    typeof a.docker_repo_allowlist === "string" &&
-    typeof a.run_eligible_labels === "string" &&
-    typeof a.board_extra_labels === "string" &&
-    typeof a.eligible_label_waives_prd_link === "string";
+    typeof a.docker_repo_allowlist === "string";
   return okUser && okApp;
 }
 
@@ -791,9 +775,9 @@ let nextFiledIssueIid = 90;
 
 // mockIssueDraft mirrors the server's deterministic templating (PRD #68 M2): the
 // category→repo default resolved against the connected repos (an empty default → mock
-// state D), the fenced body, server-side PRD+PRDLESS labels, and a provenance line.
-// Faithful enough for the preview to render every state, not a byte-for-byte copy of the
-// Go renderer (its fence/strip/scan is unit-tested there).
+// state D), the fenced body, the server-side `uzi` label (PRD #764), and a provenance
+// line. Faithful enough for the preview to render every state, not a byte-for-byte copy
+// of the Go renderer (its fence/strip/scan is unit-tested there).
 function mockIssueDraft(
   runId: string,
   rec: MockReview["recommendations"][number],
@@ -846,7 +830,7 @@ function mockIssueDraft(
     default_repo_id,
     title: rec.target ? `${label}: ${rec.target}` : label,
     description,
-    labels: ["PRD", "PRDLESS"],
+    labels: ["uzi"],
     provenance: `from vlad's worker, run ${runId.slice(0, 8)}`,
     default_note,
   };
@@ -1129,7 +1113,7 @@ const userSchedules: Omit<Schedule, "origin" | "catalog_slug" | "customized" | "
         {
           issue_iid: 96,
           title: "Mid-run worker restart discards all un-pushed commits on resume",
-          reason: "no_prd_link",
+          reason: "not_eligible",
           web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/96",
         },
       ],
@@ -1487,16 +1471,12 @@ function settingsResponse(): SettingsResponse {
   };
 }
 
-// boardResponse clones a board fixture for return, injecting the admin-configured
-// default board-extra labels (PRD #196 M2) the way the server resolves them onto the
-// board payload — so every board-returning handler ships a consistent membership
-// default. Cards are shallow-cloned so a caller mutating the response never touches
-// the stored fixture.
+// boardResponse clones a board fixture for return. Cards are shallow-cloned so a caller
+// mutating the response never touches the stored fixture.
 function boardResponse(b: Board): { board: Board } {
   return {
     board: {
       ...b,
-      board_extra_labels: parseLabels(appSettings.board_extra_labels),
       cards: b.cards.map((c) => ({ ...c })),
     },
   };
@@ -1661,25 +1641,17 @@ function notifDTO(n: MockNotification, includeOwner: boolean): Notification {
 }
 
 // sessionBody is the auth/session bootstrap payload: the signed-in user, the
-// current instance labels (PRD #19 M2), and the three resolved theme fields (PRD
-// #21), mirroring the real API so the mocked SPA resolves them the same way.
+// current instance labels (PRD #19 M2, PRD #764: the single `uzi` label and the
+// autopilot label), and the three resolved theme fields (PRD #21), mirroring the real
+// API so the mocked SPA resolves them the same way.
 function sessionBody() {
   return {
     user: requireSession(),
-    prd_label: appSettings.prd_label,
+    uzi_label: appSettings.uzi_label,
     autopilot_label: appSettings.autopilot_label,
     theme: resolveTheme(userSettings.theme, appSettings.default_theme),
     theme_override: userSettings.theme,
     default_theme: appSettings.default_theme,
-    prdless_label: appSettings.prdless_label,
-    prdless_enabled: appSettings.prdless_enabled === "true",
-    // PRD #196 M2: the eligible set (primary unioned in, as the server sends it) and
-    // the PRD-link waiver, delivered on the session so IssueView reads them via
-    // useAuth() with no board payload.
-    run_eligible_labels: [
-      ...new Set([appSettings.prd_label, ...parseLabels(appSettings.run_eligible_labels)]),
-    ],
-    eligible_label_waives_prd_link: appSettings.eligible_label_waives_prd_link === "true",
     // A passwordless (OIDC) demo user has no vault yet, so the SPA shows the
     // passphrase-create banner; a password demo user keeps the existing behavior.
     vault: oidcDemo().passwordless
@@ -2064,16 +2036,13 @@ export const mockApi = {
         nonSecret.default_theme = value;
         continue;
       }
-      // prdless_enabled / slack_enabled / judge_enabled / eligible_label_waives_prd_link
-      // are strict bools, not labels (PRD #196 M2 adds the waiver — without this arm it
-      // would fall through to the label rules and fail open on "yes"/"maybe").
+      // slack_enabled / judge_enabled / … are strict bools, not labels — without this
+      // arm they would fall through to the label rules and fail open on "yes"/"maybe".
       if (
-        key === "prdless_enabled" ||
         key === "slack_enabled" ||
         key === "judge_enabled" ||
         key === "judge_enforce_all" ||
-        key === "ephemeral_workers_enabled" ||
-        key === "eligible_label_waives_prd_link"
+        key === "ephemeral_workers_enabled"
       ) {
         if (value !== "true" && value !== "false") {
           throw new ApiError(400, `${key}: must be "true" or "false"`);
@@ -2099,23 +2068,6 @@ export const mockApi = {
           throw new ApiError(400, "judge_daily_budget: must be 0 (unlimited) or between 1 and 10000 judge runs");
         }
         nonSecret.judge_daily_budget = String(n);
-        continue;
-      }
-      // run_eligible_labels / board_extra_labels are comma-separated label lists (PRD
-      // #196 M2). Each token must be a valid label; the cross-key merged checks below
-      // enforce the primary's presence and collisions. An empty value means an empty
-      // list (board_extra_labels may be empty; the merged check rejects an eligible
-      // list that has lost the primary).
-      if (key === "run_eligible_labels" || key === "board_extra_labels") {
-        const tokens = value === "" ? [] : value.split(",").map((s) => s.trim());
-        const seen = new Set<string>();
-        for (const t of tokens) {
-          if (t === "") throw new ApiError(400, `${key}: labels must not be empty`);
-          if (t.length > 64) throw new ApiError(400, `${key}: each label must be at most 64 characters`);
-          if (seen.has(t)) throw new ApiError(400, `${key}: "${t}" is listed twice`);
-          seen.add(t);
-        }
-        (nonSecret as Record<string, string>)[key] = tokens.join(",");
         continue;
       }
       // judge_model (PRD #46) and summary_model (PRD #362) are model aliases: non-empty
@@ -2173,7 +2125,7 @@ export const mockApi = {
         nonSecret.brand_company = value;
         continue;
       }
-      if (key !== "prd_label" && key !== "autopilot_label" && key !== "prdless_label") {
+      if (key !== "prd_label" && key !== "autopilot_label" && key !== "uzi_label") {
         throw new ApiError(400, `unknown setting: ${key}`);
       }
       if (!value || value.trim() === "") throw new ApiError(400, `${key}: must not be empty`);
@@ -2182,36 +2134,10 @@ export const mockApi = {
       (nonSecret as Record<string, string>)[key] = value;
     }
     const merged = { ...appSettings, ...nonSecret };
-    // The label triple must be pairwise-distinct (Decision 8 + PRD #22 Decision 7).
-    if (merged.prd_label === merged.autopilot_label) {
-      throw new ApiError(400, "prd_label and autopilot_label must differ");
-    }
-    if (merged.prdless_label === merged.prd_label) {
-      throw new ApiError(400, "prdless_label must differ from prd_label");
-    }
-    if (merged.prdless_label === merged.autopilot_label) {
-      throw new ApiError(400, "prdless_label must differ from autopilot_label");
-    }
-    // PRD #196 M2 cross-key rules for the two label lists: the primary must remain in
-    // the eligible set, and neither list may collide with the autopilot or PRDLESS
-    // labels (the primary is allowed — it is required in the eligible set).
-    const eligibleLabels = parseLabels(merged.run_eligible_labels);
-    const extraLabels = parseLabels(merged.board_extra_labels);
-    if (!eligibleLabels.includes(merged.prd_label)) {
-      throw new ApiError(400, "run_eligible_labels must contain the primary (prd_label)");
-    }
-    for (const [field, list] of [
-      ["run_eligible_labels", eligibleLabels],
-      ["board_extra_labels", extraLabels],
-    ] as const) {
-      for (const l of list) {
-        if (l === merged.autopilot_label) {
-          throw new ApiError(400, `${field} must not contain the autopilot label`);
-        }
-        if (l === merged.prdless_label) {
-          throw new ApiError(400, `${field} must not contain the prdless label`);
-        }
-      }
+    // The `uzi` and autopilot labels must differ (PRD #764), mirroring the server's
+    // ValidateMerged.
+    if (merged.uzi_label === merged.autopilot_label) {
+      throw new ApiError(400, "uzi_label and autopilot_label must differ");
     }
     appSettings = merged;
     persistSettings();
@@ -3259,31 +3185,16 @@ export const mockApi = {
     if (!b || !card) throw new ApiError(404, "issue not found");
     const to = toColumn === "open" ? "" : toColumn;
     const columnNames = b.columns.map((c) => c.label_name);
-    const prd = appSettings.prd_label;
-    card.labels = [prd, ...card.labels.filter((l) => l !== prd && !columnNames.includes(l)), ...(to ? [to] : [])];
+    // Preserve every non-column label (incl. `uzi`) and set the new column label.
+    card.labels = [...card.labels.filter((l) => !columnNames.includes(l)), ...(to ? [to] : [])];
     card.column = to;
     card.conflict = false;
     return delay({ card: { ...card } }, 320);
   },
-  // PRDLESS label toggle (PRD #22 M4): 422 when disabled, else an idempotent
-  // add/remove of the one label (mirrors the server's forge-first helper —
-  // has_prd_link is untouched, every other label preserved).
-  setIssuePrdless: async (repoId: string, iid: number, apply: boolean) => {
-    const b = state.boards.get(repoId);
-    const card = b?.cards.find((c) => c.iid === iid);
-    if (!b || !card) throw new ApiError(404, "issue not found");
-    if (appSettings.prdless_enabled !== "true") {
-      throw new ApiError(422, "the PRDLESS label feature is disabled");
-    }
-    const label = appSettings.prdless_label;
-    if (card.labels.includes(label) !== apply) {
-      card.labels = apply ? [...card.labels, label] : card.labels.filter((l) => l !== label);
-    }
-    return delay({ card: { ...card } }, 320);
-  },
-  // Promote (PRD #102 M6, Decision 15): add the configured PRD label, apply-only and
-  // idempotent. Refuses uzi's own self-improvement tracker the way the server does
-  // (Decision 13a), so the demo build cannot show a promote the real API would 422.
+  // Promote (PRD #102 M6, Decision 15; PRD #764): add the configured `uzi` label,
+  // apply-only and idempotent. Refuses uzi's own self-improvement tracker the way the
+  // server does (Decision 13a), so the demo build cannot show a promote the real API
+  // would 422.
   promoteIssue: async (repoId: string, iid: number) => {
     const b = state.boards.get(repoId);
     const card = b?.cards.find((c) => c.iid === iid);
@@ -3291,7 +3202,7 @@ export const mockApi = {
     if (card.labels.includes("uzi-self-improve")) {
       throw new ApiError(422, "this issue is uzi's own self-improvement tracker and cannot be promoted");
     }
-    const label = appSettings.prd_label;
+    const label = appSettings.uzi_label;
     if (!card.labels.includes(label)) card.labels = [label, ...card.labels];
     return delay({ card: { ...card } }, 320);
   },
@@ -3300,12 +3211,12 @@ export const mockApi = {
     const card = b?.cards.find((c) => c.iid === iid);
     if (!b || !card) throw new ApiError(404, "issue not found");
     // IssueDetail is the card fields (minus latest_run) plus a live description.
-    // Synthesize one consistent with has_prd_link so the "no PRD link" gate lines
-    // up with what the description shows.
+    // Synthesize one consistent with has_prd_link so the PRD badge lines up with what
+    // the description shows (a linked PRD is optional — PRD #764).
     const { latest_run: _latestRun, ...rest } = card;
     const description = card.has_prd_link
       ? `## Summary\n\nImplement the change described in the linked PRD.\n\nSee \`prds/${iid}-feature.md\` for the full specification.`
-      : "This issue has no linked `prds/*.md` file yet, so an agent run cannot be started from it. Add a PRD link to the issue description on the forge to enable it.";
+      : "This issue has no linked `prds/*.md` file. A PRD is optional — label the issue `uzi` and a run can still be started from it.";
     return delay({ issue: { ...rest, description } });
   },
   syncRepo: async (repoId: string) => {
@@ -3321,7 +3232,7 @@ export const mockApi = {
       iid,
       title,
       state: "opened",
-      labels: [appSettings.prd_label],
+      labels: [appSettings.uzi_label],
       web_url: `${b.web_url}/-/issues/${iid}`,
       forge_type: "gitlab",
       author: requireSession().display_name?.toLowerCase() ?? "you",

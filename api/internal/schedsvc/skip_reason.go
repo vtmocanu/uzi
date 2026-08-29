@@ -15,11 +15,7 @@ import (
 type SkipReason string
 
 const (
-	// SkipNoPRDLink ← workersvc.ErrNoPRDLink: the issue has no PRD link and no PRDLESS
-	// waiver, so the waiver-free scheduled seam refused to start it.
-	SkipNoPRDLink SkipReason = "no_prd_link"
-
-	// SkipNotEligible ← workersvc.ErrNotPRDIssue: the issue does not carry the PRD label.
+	// SkipNotEligible ← workersvc.ErrNotPRDIssue: the issue does not carry the uzi label.
 	SkipNotEligible SkipReason = "not_eligible"
 
 	// SkipAlreadyRunning ← the active-run pre-check bool (HasActiveRunForIssue /
@@ -54,7 +50,6 @@ const (
 // AllSkipReasons lists every SkipReason in the closed set. The cross-language contract
 // test (a later milestone) reads this to enumerate the Go side.
 var AllSkipReasons = []SkipReason{
-	SkipNoPRDLink,
 	SkipNotEligible,
 	SkipAlreadyRunning,
 	SkipDescriptionTooLarge,
@@ -63,7 +58,7 @@ var AllSkipReasons = []SkipReason{
 	SkipSelfImproveMRCapReached,
 }
 
-// skipReasonForErr maps the four benign run-creation seam sentinels to their SkipReason.
+// skipReasonForErr maps the benign run-creation seam sentinels to their SkipReason.
 // It returns (reason, true) for a recognized benign sentinel and ("", false) for
 // anything else, so the caller decides whether an unrecognized error is transient or
 // permanent rather than this helper guessing. ErrActivePromptExists is intentionally NOT
@@ -71,8 +66,6 @@ var AllSkipReasons = []SkipReason{
 // ErrActiveRunExists is, since createIssueRun classifies it inline.
 func skipReasonForErr(err error) (SkipReason, bool) {
 	switch {
-	case errors.Is(err, workersvc.ErrNoPRDLink):
-		return SkipNoPRDLink, true
 	case errors.Is(err, workersvc.ErrNotPRDIssue):
 		return SkipNotEligible, true
 	case errors.Is(err, workersvc.ErrActiveRunExists):

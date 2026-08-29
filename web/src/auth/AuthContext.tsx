@@ -12,21 +12,24 @@ import {
   ApiError,
   setUnauthorizedHandler,
   setVaultLockedHandler,
-  DEFAULT_PRD_LABEL,
   DEFAULT_AUTOPILOT_LABEL,
-  DEFAULT_PRDLESS_LABEL,
   type SessionResponse,
   type User,
 } from "../lib/api";
 import { applyTheme, resolveTheme, DEFAULT_THEME, type Theme } from "../lib/theme";
 
+// Compiled-in default for the single run-eligibility label (PRD #764). The SPA
+// uses it until the session bootstrap resolves the configured `uzi_label`.
+export const DEFAULT_UZI_LABEL = "uzi";
+
 interface AuthState {
   user: User | null;
   loading: boolean;
-  // Instance forge labels delivered on the session bootstrap (PRD #19 M2). They
-  // hold the compiled-in defaults until the first session response resolves, so
-  // consumers (Board, issue creation) can read them unconditionally.
-  prdLabel: string;
+  // Instance forge labels delivered on the session bootstrap (PRD #19 M2, PRD #764).
+  // They hold the compiled-in defaults until the first session response resolves, so
+  // consumers (Board, issue creation) can read them unconditionally. uziLabel is the
+  // single run-eligibility label: an issue is runnable iff it carries it.
+  uziLabel: string;
   autopilotLabel: string;
   // Theme state from the session bootstrap (PRD #21). theme is the resolved
   // theme currently applied to <html>; themeOverride is the user's raw pick
@@ -36,19 +39,6 @@ interface AuthState {
   theme: Theme;
   themeOverride: string | null;
   defaultTheme: Theme;
-  // PRDLESS escape-hatch config (PRD #22). prdlessEnabled gates the label toggle's
-  // visibility; it defaults to false so a server that predates the bootstrap
-  // fields simply hides the toggle rather than showing one the backend 422s.
-  prdlessLabel: string;
-  prdlessEnabled: boolean;
-  // Run-eligibility config delivered on the session bootstrap (PRD #196 M2).
-  // runEligibleLabels is the admin-configured set a human may point uzi at; it
-  // always includes the primary (prdLabel), and an older server that omits the
-  // field falls back to [prdLabel]. eligibleLabelWaivesPrdLink is the per-instance
-  // waiver, defaulting on. Both are consumed by the Start/Promote gate in M4; they
-  // are delivered here now so M4 is a pure logic change.
-  runEligibleLabels: string[];
-  eligibleLabelWaivesPrdLink: boolean;
   // Vault status (PRD #32): true when the user's secret vault is unlocked in the
   // server process. Rides the session payload; drives the header badge, the locked
   // banner, and the "waiting for vault unlock" run state. Defaults to true (a
@@ -78,17 +68,11 @@ const AuthContext = createContext<AuthState | undefined>(undefined);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
-  const [prdLabel, setPrdLabel] = useState(DEFAULT_PRD_LABEL);
+  const [uziLabel, setUziLabel] = useState(DEFAULT_UZI_LABEL);
   const [autopilotLabel, setAutopilotLabel] = useState(DEFAULT_AUTOPILOT_LABEL);
   const [theme, setTheme] = useState<Theme>(DEFAULT_THEME);
   const [themeOverride, setThemeOverride] = useState<string | null>(null);
   const [defaultTheme, setDefaultTheme] = useState<Theme>(DEFAULT_THEME);
-  const [prdlessLabel, setPrdlessLabel] = useState(DEFAULT_PRDLESS_LABEL);
-  const [prdlessEnabled, setPrdlessEnabled] = useState(false);
-  // Default to [] until the first session resolves; applySession falls back to
-  // [prdLabel] when the field is absent so the primary is always eligible.
-  const [runEligibleLabels, setRunEligibleLabels] = useState<string[]>([]);
-  const [eligibleLabelWaivesPrdLink, setEligibleLabelWaivesPrdLink] = useState(true);
   const [vaultUnlocked, setVaultUnlocked] = useState(true);
   const [vaultExists, setVaultExists] = useState(true);
   const [hasPassword, setHasPassword] = useState(true);
@@ -100,26 +84,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // the label fields. It also resolves and applies the theme (PRD #21): the
   // server sends the resolved theme, but we re-resolve from the override +
   // default so a server that predates the theme fields still yields ember, then
-  // stamp <html data-theme> so a login/refresh restyles live. prdless_enabled is a
-  // bool, so `?? false` (not `||`) keeps an explicit false; an absent field (older
-  // server) also reads as off.
+  // stamp <html data-theme> so a login/refresh restyles live.
   const applySession = useCallback((session: SessionResponse) => {
     setUser(session.user);
-    const prd = session.prd_label || DEFAULT_PRD_LABEL;
-    setPrdLabel(prd);
+    setUziLabel(session.uzi_label || DEFAULT_UZI_LABEL);
     setAutopilotLabel(session.autopilot_label || DEFAULT_AUTOPILOT_LABEL);
     const resolved = resolveTheme(session.theme_override, session.default_theme);
     setThemeOverride(session.theme_override ?? null);
     setDefaultTheme(resolveTheme(session.default_theme, DEFAULT_THEME));
     setTheme(resolved);
     applyTheme(resolved);
-    setPrdlessLabel(session.prdless_label || DEFAULT_PRDLESS_LABEL);
-    setPrdlessEnabled(session.prdless_enabled ?? false);
-    // The eligible set always includes the primary; an older server that omits the
-    // field falls back to [primary] so the primary stays eligible. The waiver is a
-    // bool, so `?? true` (not `||`) preserves an explicit false.
-    setRunEligibleLabels(session.run_eligible_labels ?? [prd]);
-    setEligibleLabelWaivesPrdLink(session.eligible_label_waives_prd_link ?? true);
     // Absent field (older server) reads as unlocked, so no spurious banner.
     setVaultUnlocked(session.vault?.unlocked ?? true);
     // Absent → true so a password user / older server never sees the create dialog.
@@ -206,15 +180,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     () => ({
       user,
       loading,
-      prdLabel,
+      uziLabel,
       autopilotLabel,
       theme,
       themeOverride,
       defaultTheme,
-      prdlessLabel,
-      prdlessEnabled,
-      runEligibleLabels,
-      eligibleLabelWaivesPrdLink,
       vaultUnlocked,
       vaultExists,
       hasPassword,
@@ -228,15 +198,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [
       user,
       loading,
-      prdLabel,
+      uziLabel,
       autopilotLabel,
       theme,
       themeOverride,
       defaultTheme,
-      prdlessLabel,
-      prdlessEnabled,
-      runEligibleLabels,
-      eligibleLabelWaivesPrdLink,
       vaultUnlocked,
       vaultExists,
       hasPassword,

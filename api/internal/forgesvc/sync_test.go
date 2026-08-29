@@ -399,15 +399,15 @@ func (s *fakeStore) SettlePRDLinkPatch(_ context.Context, id uuid.UUID) (int64, 
 }
 
 // fakeLabels is a fixed LabelConfig for the sync tests.
-type fakeLabels struct{ prd string }
+type fakeLabels struct{ uzi string }
 
-func (f fakeLabels) PRDLabel(context.Context) (string, error) { return f.prd, nil }
+func (f fakeLabels) UziLabel(context.Context) (string, error) { return f.uzi, nil }
 
 func newTestService(st IssueStore) *Service {
 	// box is nil: FullSync/IncrementalSync operate on a passed-in Forge and
 	// never touch the encryption box. Labels resolve to the default so the
 	// existing filter assertions hold.
-	return New(st, nil, time.Second, fakeLabels{prd: settings.DefaultPRDLabel})
+	return New(st, nil, time.Second, fakeLabels{uzi: settings.DefaultUziLabel})
 }
 
 func issueAt(iid int64, updated time.Time) forge.Issue {
@@ -497,7 +497,7 @@ func TestIncrementalSyncAdvancesHWM(t *testing.T) {
 	if prd[0].State != forge.StateAll {
 		t.Fatalf("PRD fetch state = %q, want StateAll", prd[0].State)
 	}
-	if len(prd[0].Labels) != 1 || prd[0].Labels[0] != settings.DefaultPRDLabel {
+	if len(prd[0].Labels) != 1 || prd[0].Labels[0] != settings.DefaultUziLabel {
 		t.Fatalf("expected PRD label filter, got %v", prd[0].Labels)
 	}
 }
@@ -507,7 +507,7 @@ func TestIncrementalSyncAdvancesHWM(t *testing.T) {
 // with a custom label filters ListIssues on it in both sync paths.
 func TestSyncFiltersOnConfiguredLabel(t *testing.T) {
 	const custom = "Feature"
-	svc := New(&fakeStore{}, nil, time.Second, fakeLabels{prd: custom})
+	svc := New(&fakeStore{}, nil, time.Second, fakeLabels{uzi: custom})
 
 	full := &fakeForge{}
 	if _, err := svc.FullSync(context.Background(), uuid.New(), 7, full); err != nil {
@@ -534,8 +534,8 @@ func TestSyncFallsBackToDefaultLabel(t *testing.T) {
 	if _, err := svc.FullSync(context.Background(), uuid.New(), 7, f); err != nil {
 		t.Fatalf("FullSync: %v", err)
 	}
-	if fc := f.prdListCalls(); len(fc) != 1 || len(fc[0].Labels) != 1 || fc[0].Labels[0] != settings.DefaultPRDLabel {
-		t.Fatalf("nil resolver label filter = %+v, want one call with [%s]", fc, settings.DefaultPRDLabel)
+	if fc := f.prdListCalls(); len(fc) != 1 || len(fc[0].Labels) != 1 || fc[0].Labels[0] != settings.DefaultUziLabel {
+		t.Fatalf("nil resolver label filter = %+v, want one call with [%s]", fc, settings.DefaultUziLabel)
 	}
 }
 

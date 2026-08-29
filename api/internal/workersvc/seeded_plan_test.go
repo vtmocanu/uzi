@@ -23,7 +23,7 @@ import (
 // seededIssueStore returns a fakeStore configured so createRun's repo/issue/uzi-label
 // gate PASSES — a cached issue carrying the uzi label (PRD #764 M1) — so a test can
 // drive createRun to the CreateRun insert and inspect createRunParams. HasPrdLink is
-// irrelevant to eligibility now, so it is left false. Mirrors prd_label_gate_test.go.
+// irrelevant to eligibility now, so it is left false. Mirrors uzi_label_gate_test.go.
 func seededIssueStore() *fakeStore {
 	return &fakeStore{
 		issueByID:       store.Issue{Title: "T", Labels: []byte(`["uzi"]`)},

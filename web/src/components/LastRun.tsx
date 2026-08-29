@@ -14,11 +14,10 @@ import { scheduleSkipReasonLabel } from "../lib/scheduleSkipReasons";
 import type { LastFire, LastFireSkip, Schedule, ScheduleSkipReason } from "../lib/api";
 
 // Skip-reason badge tone, mirroring the mock's semantics: the actionable skips a
-// schedule owner can fix (no PRD link, not eligible, a transient fetch failure)
-// read amber; the benign, self-resolving ones (already running, body too large)
-// read neutral. Exhaustive so a new union member is a tsc error, not a default.
+// schedule owner can fix (not eligible, a transient fetch failure) read amber; the
+// benign, self-resolving ones (already running, body too large) read neutral.
+// Exhaustive so a new union member is a tsc error, not a default.
 const SKIP_REASON_TONES: Record<ScheduleSkipReason, BadgeTone> = {
-  no_prd_link: "warning",
   not_eligible: "warning",
   already_running: "neutral",
   description_too_large: "neutral",
@@ -189,8 +188,8 @@ export function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
             <span className="font-semibold text-fg">Nothing newer was reached.</span> max issues is{" "}
             <span className="font-semibold text-fg">{s.max_issues ?? "—"}</span>, so only the oldest
             candidate{fire.skips.length === 1 ? " was" : "s were"} tried. Raise the cap so the sweep
-            reaches the candidates behind them, or add <code className="rounded bg-raised px-1 text-fg">PRDLESS</code>{" "}
-            / a PRD link.
+            reaches the candidates behind them, or add the{" "}
+            <code className="rounded bg-raised px-1 text-fg">uzi</code> label so they become runnable.
           </div>
         </div>
       )}

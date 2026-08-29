@@ -126,12 +126,11 @@ func (h *Handler) FileIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Labels are assembled server-side (Decision 3/6): PRD (board visibility) + PRDLESS
-	// (PRD-link bypass), NEVER autopilot and NEVER from the request body — the API surface
-	// gives the client no way to attach a trigger label.
-	prd, _ := h.settings.PRDLabel(ctx)
-	prdless, _ := h.settings.PrdlessLabel(ctx)
-	labels := []string{prd, prdless}
+	// Labels are assembled server-side (Decision 3/6): the single uzi run-eligibility
+	// label (PRD #764), NEVER autopilot and NEVER from the request body — the API
+	// surface gives the client no way to attach a trigger label.
+	uziLabel, _ := h.settings.UziLabel(ctx)
+	labels := []string{uziLabel}
 
 	// Claim-first (Decision 7): atomic INSERT ... ON CONFLICT DO NOTHING on the coordinate
 	// BEFORE the forge write, so of two concurrent POSTs exactly one reaches CreateIssue.

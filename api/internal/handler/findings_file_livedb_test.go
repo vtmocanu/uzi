@@ -171,7 +171,7 @@ func fileFindingLiveDB(t *testing.T) (*Handler, *pgxpool.Pool, *store.Queries, *
 		// The marker is the DEFAULT (agent-found); no finding_label row is set, so this also
 		// proves the accessor's fallback drives the ensured + filed label.
 		settings: settings.New(&settingsStore{rows: []store.AppSetting{
-			{Key: settings.KeyPRDLabel, Value: "PRD"},
+			{Key: settings.KeyUziLabel, Value: "uzi"},
 		}}, time.Minute),
 		svc:  forgesvc.New(q, box, 5*time.Second, nil),
 		wsvc: workersvc.New(q, box, workersvc.Params{}),

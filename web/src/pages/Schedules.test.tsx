@@ -251,7 +251,7 @@ describe("Schedules — fire outcomes (PRD #308 M4)", () => {
           { issue_iid: 30, run_id: "30303030-0000-0000-0000-000000000000", title: "backfilled one" },
           { issue_iid: 40, run_id: "40404040-0000-0000-0000-000000000000", title: "backfilled two" },
         ],
-        skips: [{ issue_iid: 20, title: "no prd here", reason: "no_prd_link" }],
+        skips: [{ issue_iid: 20, title: "no prd here", reason: "not_eligible" }],
       }),
     });
     renderPage();
@@ -262,7 +262,7 @@ describe("Schedules — fire outcomes (PRD #308 M4)", () => {
     // Both a started run row and the skipped candidate row render together.
     expect(screen.getByText("backfilled two")).toBeTruthy();
     expect(screen.getByText("no prd here")).toBeTruthy();
-    expect(screen.getByText("no PRD link")).toBeTruthy();
+    expect(screen.getByText("not eligible")).toBeTruthy();
     // The tally label is "examined", not "matched" (and its value 4 exceeds max_issues 3).
     expect(screen.getByText("examined")).toBeTruthy();
     expect(screen.queryByText("matched")).toBeNull();
@@ -277,7 +277,7 @@ describe("Schedules — fire outcomes (PRD #308 M4)", () => {
       last_fire: fire({
         matched: 1,
         capped: false,
-        skips: [{ issue_iid: 96, title: "Worker restart drops commits", reason: "no_prd_link" }],
+        skips: [{ issue_iid: 96, title: "Worker restart drops commits", reason: "not_eligible" }],
       }),
     });
     renderPage();
@@ -286,8 +286,8 @@ describe("Schedules — fire outcomes (PRD #308 M4)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Last fire" }));
     expect(screen.getByText("Worker restart drops commits")).toBeTruthy();
     // The typed reason renders as its human label, never the raw sentinel.
-    expect(screen.getByText("no PRD link")).toBeTruthy();
-    expect(screen.queryByText("no_prd_link")).toBeNull();
+    expect(screen.getByText("not eligible")).toBeTruthy();
+    expect(screen.queryByText("not_eligible")).toBeNull();
   });
 
   it("empty-label: a matched-0 sweep reads as a neutral 'matched 0', not an error", async () => {
@@ -383,7 +383,7 @@ describe("Schedules — issue links on fire rows (PRD #411)", () => {
       max_issues: 5,
       last_fire: fire({
         matched: 1,
-        skips: [{ issue_iid: null, title: "pinned-issue candidate", reason: "no_prd_link", web_url: null }],
+        skips: [{ issue_iid: null, title: "pinned-issue candidate", reason: "not_eligible", web_url: null }],
       }),
     });
     renderPage();
@@ -405,7 +405,7 @@ describe("Schedules — the cap hint (PRD #308 M4, Goal 2)", () => {
       last_fire: fire({
         matched: 1,
         capped: true,
-        skips: [{ issue_iid: 96, title: "candidate", reason: "no_prd_link" }],
+        skips: [{ issue_iid: 96, title: "candidate", reason: "not_eligible" }],
       }),
     });
     renderPage();
@@ -421,7 +421,7 @@ describe("Schedules — the cap hint (PRD #308 M4, Goal 2)", () => {
         matched: 2,
         capped: true,
         started: [{ issue_iid: 90, run_id: "bbbb2222-0000-0000-0000-000000000000", title: "started one" }],
-        skips: [{ issue_iid: 96, title: "candidate", reason: "no_prd_link" }],
+        skips: [{ issue_iid: 96, title: "candidate", reason: "not_eligible" }],
       }),
     });
     renderPage();
@@ -436,7 +436,7 @@ describe("Schedules — the cap hint (PRD #308 M4, Goal 2)", () => {
       last_fire: fire({
         matched: 1,
         capped: false,
-        skips: [{ issue_iid: 96, title: "candidate", reason: "no_prd_link" }],
+        skips: [{ issue_iid: 96, title: "candidate", reason: "not_eligible" }],
       }),
     });
     renderPage();

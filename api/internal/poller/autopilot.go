@@ -26,18 +26,19 @@ type RunStarter interface {
 }
 
 // SettingsReader resolves the instance settings the autopilot detector needs: the
-// autopilot label it filters on and the PRD label it filters on alongside it (PRD
-// #102 M6 Decision 11b). *settings.Cache satisfies it; a nil reader or an
-// empty/errored read falls back to compiled-in defaults, so a settings blip degrades
-// gracefully rather than filtering on an empty label.
+// autopilot label it filters on and the uzi run-eligibility label it filters on
+// alongside it (PRD #102 M6 Decision 11b; PRD #764 D7 repointed the second filter
+// from the PRD label to the uzi label). *settings.Cache satisfies it; a nil reader
+// or an empty/errored read falls back to compiled-in defaults, so a settings blip
+// degrades gracefully rather than filtering on an empty label.
 //
-// For the PRD label specifically, "degrades gracefully" means degrading to the
-// DEFAULT label, never to no filter: an unresolvable prd_label leaves the
+// For the uzi label specifically, "degrades gracefully" means degrading to the
+// DEFAULT label, never to no filter: an unresolvable uzi_label leaves the
 // candidate query narrower than intended, which surfaces as autopilot not firing.
 // The other direction would be autopilot firing on issues that are not uzi's.
 type SettingsReader interface {
 	AutopilotLabel(ctx context.Context) (string, error)
-	PRDLabel(ctx context.Context) (string, error)
+	UziLabel(ctx context.Context) (string, error)
 }
 
 // autopilotStore is the subset of *store.Queries the detector reads and writes.
@@ -59,7 +60,7 @@ type Autopilot struct {
 }
 
 // NewAutopilot builds a detector. q is the store, runs creates the auto_approve
-// runs (workersvc), set resolves the autopilot label and PRDLESS bypass state
+// runs (workersvc), set resolves the autopilot and uzi run-eligibility labels
 // (settings).
 func NewAutopilot(q autopilotStore, runs RunStarter, set SettingsReader) *Autopilot {
 	return &Autopilot{q: q, runs: runs, set: set}
@@ -80,16 +81,16 @@ func NewAutopilot(q autopilotStore, runs RunStarter, set SettingsReader) *Autopi
 func (a *Autopilot) detect(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, f forge.Forge) {
 	label := a.autopilotLabel(ctx)
 
-	// BOTH labels (Decision 11b). Filtering on the autopilot label alone was safe
-	// only while the sync filter guaranteed every cached issue carried the PRD label;
-	// M6's additive fetch caches every open issue, so without the PRD predicate a
-	// stranger's issue carrying the autopilot label reaches detectOne — which reads
-	// its label events over the forge every tick, and either runs it or comments on
-	// it.
+	// BOTH labels (Decision 11b; PRD #764 D7). Filtering on the autopilot label alone
+	// was safe only while the sync filter guaranteed every cached issue carried the
+	// eligibility label; M6's additive fetch caches every open issue, so without the
+	// uzi predicate a stranger's issue carrying the autopilot label reaches detectOne
+	// — which reads its label events over the forge every tick, and either runs it or
+	// comments on it.
 	issues, err := a.q.ListAutopilotCandidateIssues(ctx, store.ListAutopilotCandidateIssuesParams{
 		RepoID:   r.ID,
 		Label:    label,
-		PrdLabel: a.prdLabel(ctx),
+		UziLabel: a.uziLabel(ctx),
 	})
 	if err != nil {
 		slog.Error("poller: list autopilot candidates", "repo", r.PathWithNamespace, "error", err)
@@ -276,24 +277,24 @@ func (a *Autopilot) autopilotLabel(ctx context.Context) string {
 	return settings.DefaultAutopilotLabel
 }
 
-// prdLabel resolves the configured PRD label the candidate query filters on
-// alongside the autopilot label (Decision 11b), falling back to the compiled-in
-// default when unconfigured or on a settings read error — the same shape as
-// autopilotLabel above and as workersvc.prdLabel, which gates the run this
-// detector goes on to create.
+// uziLabel resolves the configured uzi run-eligibility label the candidate query
+// filters on alongside the autopilot label (Decision 11b; PRD #764 D7 repointed it
+// from the PRD label to the uzi label), falling back to the compiled-in default
+// when unconfigured or on a settings read error — the same shape as autopilotLabel
+// above and as the uzi-label gate the shared run-create path enforces.
 //
 // The fallback direction matters more here than for autopilotLabel. Returning an
 // empty string would make the jsonb_exists predicate match nothing and quietly
 // disable autopilot; returning the default keeps the filter meaningful on the
 // overwhelmingly common configuration. Neither direction can widen the candidate
 // set, which is the property that makes this safe to get wrong.
-func (a *Autopilot) prdLabel(ctx context.Context) string {
+func (a *Autopilot) uziLabel(ctx context.Context) string {
 	if a.set != nil {
-		if l, _ := a.set.PRDLabel(ctx); l != "" {
+		if l, _ := a.set.UziLabel(ctx); l != "" {
 			return l
 		}
 	}
-	return settings.DefaultPRDLabel
+	return settings.DefaultUziLabel
 }
 
 // eligible reports whether the repo owner may run this issue under autopilot: they

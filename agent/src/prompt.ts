@@ -102,9 +102,10 @@ export const LEAD_GUARDRAIL_APPEND = [
  * every run's context with a playbook used in its last few minutes.
  *
  * THE CONDITIONAL IS IN THE WORDING, not merely in the intent. An unconditional
- * "update the linked PRD" handed to a PRDLESS run (docs/prdless.md) in a repo that
- * nonetheless HAS a `prds/` directory invites the model to pick one and edit it.
- * The no-op has to be written down, so it is: the clause opens on the condition.
+ * "update the linked PRD" handed to a run whose issue links no `prds/*.md` (a PRD
+ * link is optional under the `uzi` model, PRD #764) in a repo that nonetheless HAS
+ * a `prds/` directory invites the model to pick one and edit it. The no-op has to
+ * be written down, so it is: the clause opens on the condition.
  *
  * Consequence, stated so it is not mistaken for a bug: if the skill is missing or
  * unallocated the behaviour still happens, with less guidance. That is the

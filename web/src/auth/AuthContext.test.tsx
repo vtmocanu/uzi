@@ -23,7 +23,7 @@ const user = {
 
 const baseSession = (over: Partial<SessionResponse> = {}): SessionResponse => ({
   user,
-  prd_label: "PRD",
+  uzi_label: "uzi",
   autopilot_label: "autopilot",
   theme: "ember",
   theme_override: null,
@@ -31,14 +31,13 @@ const baseSession = (over: Partial<SessionResponse> = {}): SessionResponse => ({
   ...over,
 });
 
-// A tiny consumer that renders the two PRD #196 fields so the test can assert on
-// what the provider exposes.
+// A tiny consumer that renders the uzi label so the test can assert on what the
+// provider exposes (PRD #764).
 function Probe() {
-  const { runEligibleLabels, eligibleLabelWaivesPrdLink } = useAuth();
+  const { uziLabel } = useAuth();
   return (
     <div>
-      <span data-testid="eligible">{runEligibleLabels.join(",")}</span>
-      <span data-testid="waiver">{String(eligibleLabelWaivesPrdLink)}</span>
+      <span data-testid="uzi">{uziLabel}</span>
     </div>
   );
 }
@@ -60,24 +59,18 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe("AuthContext — run-eligibility fields (PRD #196 M2)", () => {
-  it("exposes the session-delivered eligible set and waiver", async () => {
-    mockApi.me.mockResolvedValue(
-      baseSession({
-        run_eligible_labels: ["PRD", "bug", "security"],
-        eligible_label_waives_prd_link: false,
-      }),
-    );
+describe("AuthContext — uzi label (PRD #764)", () => {
+  it("exposes the session-delivered uzi label", async () => {
+    mockApi.me.mockResolvedValue(baseSession({ uzi_label: "runnable" }));
     renderProbe();
-    await waitFor(() => expect(screen.getByTestId("eligible").textContent).toBe("PRD,bug,security"));
-    // A bool: `?? true` must preserve an explicit false, not coerce it back on.
-    expect(screen.getByTestId("waiver").textContent).toBe("false");
+    await waitFor(() => expect(screen.getByTestId("uzi").textContent).toBe("runnable"));
   });
 
-  it("falls back to [prdLabel] and waiver=true when an older server omits the fields", async () => {
-    mockApi.me.mockResolvedValue(baseSession({ prd_label: "Feature" }));
+  it("falls back to the compiled-in default when an older server omits the field", async () => {
+    // A server that predates uzi_label sends an empty value; the provider uses the
+    // compiled-in DEFAULT_UZI_LABEL ("uzi").
+    mockApi.me.mockResolvedValue(baseSession({ uzi_label: "" }));
     renderProbe();
-    await waitFor(() => expect(screen.getByTestId("eligible").textContent).toBe("Feature"));
-    expect(screen.getByTestId("waiver").textContent).toBe("true");
+    await waitFor(() => expect(screen.getByTestId("uzi").textContent).toBe("uzi"));
   });
 });

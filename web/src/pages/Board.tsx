@@ -37,13 +37,10 @@ import { lanePaging, visibleColumns } from "../lib/boardColumns";
 import { boundedChips, chipLabels, hoistLabels } from "../lib/labelChips";
 import {
   canPromote,
-  DEFAULT_BOARD_EXTRA_LABELS,
   highlightSegments,
-  isEligibleCard,
-  isPRDCard,
+  isUziCard,
   isSelfImproveTracker,
   matchesQuery,
-  SELF_IMPROVE_LABEL,
   visibleCards,
 } from "../lib/boardCards";
 import {
@@ -101,8 +98,7 @@ function columnLabel(card: CardData): string {
 export function Board() {
   const { id: repoId = "" } = useParams();
   const navigate = useNavigate();
-  const { prdlessEnabled, prdlessLabel, prdLabel, autopilotLabel, runEligibleLabels, eligibleLabelWaivesPrdLink } =
-    useAuth();
+  const { uziLabel, autopilotLabel } = useAuth();
   const [board, setBoard] = useState<BoardData | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -112,7 +108,6 @@ export function Board() {
   const [editingColumns, setEditingColumns] = useState(false);
   const [creatingIssue, setCreatingIssue] = useState(false);
   const [starting, setStarting] = useState<number | null>(null);
-  const [prdlessBusy, setPrdlessBusy] = useState<number | null>(null);
   const [promoting, setPromoting] = useState<number | null>(null);
 
   // Hide-empty-columns toggle, persisted per repo. Initialised lazily from prefs;
@@ -132,16 +127,11 @@ export function Board() {
     });
   };
 
-  // Board membership extras + "show all other issues" (PRD #196). The board renders
-  // `primary ∪ extras` (Decision 2); these are the extras half and the escape hatch.
-  // SERVER-BACKED per account, per repo since M3 — the single source of truth is the
-  // GET/PUT /board/prefs row, replacing the M1 per-browser localStorage keys.
-  //
-  // `storedExtras` is a SENTINEL (Decision 9): null means "never customised, use the
-  // admin default"; an array — EVEN AN EMPTY ONE — is the user's ABSOLUTE set, so
-  // "unticked everything" is durable and distinguishable from "never set". Resolving
-  // to the default happens at render (resolvedExtras below), so the sentinel survives
-  // round-trips.
+  // "Show all other issues" toggle, SERVER-BACKED per account, per repo via the
+  // GET/PUT /board/prefs row. Under PRD #764 membership is the single `uzi` label, so
+  // the row's `extra_labels` half is no longer consumed on the client — but it is still
+  // round-tripped through `storedExtras` (never mutated here) so the server row stays
+  // intact for any future consumer, and `show_all` continues to drive the toggle.
   const [storedExtras, setStoredExtras] = useState<string[] | null>(null);
   const [showAll, setShowAll] = useState(false);
 
@@ -666,30 +656,9 @@ export function Board() {
     }
   };
 
-  // PRDLESS toggle (PRD #22 M4): apply/remove the escape-hatch label on a card.
-  // Forge-first like move — replace the card with the server's authoritative copy
-  // on success, no optimistic update. The label change never moves a column, so
-  // unlike move() it needs no auto-move-toast suppression.
-  const togglePrdless = async (card: CardData) => {
-    setError("");
-    setPrdlessBusy(card.iid);
-    try {
-      const applying = !card.labels.includes(prdlessLabel);
-      const { card: updated } = await api.setIssuePrdless(repoId, card.iid, applying);
-      setBoard((prev) =>
-        prev ? { ...prev, cards: prev.cards.map((c) => (c.iid === updated.iid ? updated : c)) } : prev,
-      );
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Could not update the label");
-    } finally {
-      setPrdlessBusy(null);
-    }
-  };
-
-  // Promote (PRD #102 Decision 15): add the PRD label forge-first, then replace the
-  // one card with the authoritative response — the same no-optimistic-update shape as
-  // the PRDLESS toggle above. The promoted card keeps rendering whatever the toggle
-  // state is, because it is now a PRD card.
+  // Promote (PRD #102 Decision 15; PRD #764): add the `uzi` label forge-first, then
+  // replace the one card with the authoritative response — a no-optimistic-update shape
+  // like move(). The promoted card becomes runnable, so it renders Start run afterwards.
   const promote = async (card: CardData) => {
     if (promoting != null) return;
     setPromoting(card.iid);
@@ -723,12 +692,10 @@ export function Board() {
   // board columns; ColumnSettings' suggester builds its own from unsaved edit state.
   const chipExclusions = useMemo(
     () => ({
-      prdLabel,
-      prdlessLabel,
       autopilotLabel,
       columnLabels: (board?.columns ?? []).map((c) => c.label_name),
     }),
-    [board, prdLabel, prdlessLabel, autopilotLabel],
+    [board, autopilotLabel],
   );
 
   // TWO NAMED CARD SETS, kept distinct even though the filter is the identity today
@@ -747,29 +714,13 @@ export function Board() {
   // every card the viewer had hidden — which is what freeze-test 3 discriminates.
   const payloadCards = useMemo<CardData[]>(() => board?.cards ?? [], [board]);
 
-  // The admin-configured default extras delivered on the board payload (PRD #196
-  // M2). DEFAULT_BOARD_EXTRA_LABELS is the last-resort fallback for an older server
-  // or a board that has not loaded yet.
-  const serverDefaultExtras = useMemo<string[]>(
-    () => board?.board_extra_labels ?? [...DEFAULT_BOARD_EXTRA_LABELS],
-    [board],
-  );
-  // The extras in effect: the user's saved set if they have one (Decision 9,
-  // absolute once written), else the admin default. The saved set is the
-  // server-backed `storedExtras` row (PRD #196 M3).
-  const resolvedExtras = useMemo<string[]>(
-    () => storedExtras ?? serverDefaultExtras,
-    [storedExtras, serverDefaultExtras],
-  );
-  // Membership is primary ∪ extras (Decision 2), deduped, with the primary always
-  // present and never removable.
-  const membershipLabels = useMemo<string[]>(
-    () => Array.from(new Set([prdLabel, ...resolvedExtras])),
-    [prdLabel, resolvedExtras],
-  );
+  // Membership is now a single label (PRD #764, D3): a card is a board member when it
+  // carries the `uzi` run-eligibility label. The old per-user `extra_labels` dimension
+  // is retired on the client — the board_prefs row is still round-tripped (its
+  // `show_all` half drives the toggle below), but its `extra_labels` goes unused here.
   const renderCards = useMemo(
-    () => visibleCards(payloadCards, membershipLabels, showAll),
-    [payloadCards, membershipLabels, showAll],
+    () => visibleCards(payloadCards, uziLabel, showAll),
+    [payloadCards, uziLabel, showAll],
   );
 
   // Board search filter (PRD #304 M2, Decision 6): membership → SEARCH → sort → cap.
@@ -824,88 +775,17 @@ export function Board() {
     },
     [repoId],
   );
-  // Toggling an extra writes the ABSOLUTE set (Decision 9), even when empty. showAll
-  // is carried through unchanged.
-  const toggleExtra = useCallback(
-    (label: string) => {
-      const next = resolvedExtras.includes(label)
-        ? resolvedExtras.filter((l) => l !== label)
-        : [...resolvedExtras, label];
-      setStoredExtras(next);
-      persistPrefs(next, showAll);
-    },
-    [resolvedExtras, showAll, persistPrefs],
-  );
   const toggleShowAll = useCallback(() => {
     const next = !showAll;
     setShowAll(next);
     persistPrefs(storedExtras, next);
   }, [showAll, storedExtras, persistPrefs]);
-  // Reset re-adopts the admin default (Decision 9): PUT extra_labels: null, keeping
-  // the current showAll (a separate control).
-  const resetExtras = useCallback(() => {
-    setStoredExtras(null);
-    persistPrefs(null, showAll);
-  }, [showAll, persistPrefs]);
 
-  // Candidate extra labels for the picker: the distinct CONTENT labels present on the
-  // payload — the same `seen`-Set accumulation ColumnSettings' suggester uses —
-  // excluding the primary, the configured columns and the workflow labels.
-  //
-  // An ordinary payload label is offered ONLY when it would ADD at least one card
-  // (a card carrying it that is not already shown via the primary). The PRD's design
-  // note is "nothing offered that matches zero cards", and a label that lives only on
-  // PRD cards (e.g. an `enhancement` that is always PRD+enhancement) adds nothing, so
-  // it would otherwise render a confusing plain `0` row. Two labels are kept even at a
-  // zero add-count: a configured-default extra (shown greyed, so an inert default is
-  // visible — open question 8) and a label the user has already selected (so it stays
-  // untickable in place rather than only clearable via Reset once its last card leaves
-  // the payload).
-  const candidateExtras = useMemo<string[]>(() => {
-    const excluded = new Set<string>([
-      prdLabel,
-      prdlessLabel,
-      autopilotLabel,
-      SELF_IMPROVE_LABEL,
-      ...(board?.columns ?? []).map((c) => c.label_name),
-    ]);
-    const addCount = new Map<string, number>();
-    for (const c of payloadCards) {
-      if (isPRDCard(c, prdLabel)) continue;
-      for (const l of c.labels) addCount.set(l, (addCount.get(l) ?? 0) + 1);
-    }
-    const kept = (l: string) =>
-      l !== "" &&
-      !excluded.has(l) &&
-      ((addCount.get(l) ?? 0) > 0 || serverDefaultExtras.includes(l) || resolvedExtras.includes(l));
-    const seen = new Set<string>();
-    for (const c of payloadCards) for (const l of c.labels) seen.add(l);
-    const labels = [...seen].filter(kept);
-    // Union in configured defaults and selected extras that carry zero payload cards,
-    // so neither drops out of the picker (open question 8 / the untickable-selected fix).
-    for (const d of [...serverDefaultExtras, ...resolvedExtras]) {
-      if (!excluded.has(d) && d !== "" && !labels.includes(d)) labels.push(d);
-    }
-    return labels.sort();
-  }, [payloadCards, board, prdLabel, prdlessLabel, autopilotLabel, serverDefaultExtras, resolvedExtras]);
-
-  // Per-label count = cards carrying L that do NOT carry the primary — "how much
-  // bigger does the board get" (mock §3: bug 6, not 7). A label with no such card
-  // (an inert default) reads 0.
-  const extraCounts = useMemo<Map<string, number>>(() => {
-    const m = new Map<string, number>();
-    for (const c of payloadCards) {
-      if (isPRDCard(c, prdLabel)) continue;
-      for (const l of c.labels) m.set(l, (m.get(l) ?? 0) + 1);
-    }
-    return m;
-  }, [payloadCards, prdLabel]);
-
-  // The "Show all other issues" population: cards that are not members-by-primary and
-  // are not the self-improve tracker — exactly the old showNonPRD count.
+  // The "Show all other issues" population: cards that are not `uzi` members and are
+  // not the self-improve tracker — the non-runnable open issues the toggle reveals.
   const showAllCount = useMemo<number>(
-    () => payloadCards.filter((c) => !isPRDCard(c, prdLabel) && !isSelfImproveTracker(c)).length,
-    [payloadCards, prdLabel],
+    () => payloadCards.filter((c) => !isUziCard(c, uziLabel) && !isSelfImproveTracker(c)).length,
+    [payloadCards, uziLabel],
   );
 
   // columnKeys is the board's lane order for the freeze: the implicit Backlog column
@@ -1089,15 +969,14 @@ export function Board() {
   const hiddenCount = columns.length - visible.length;
 
   // The board's own description, hoisted out of the JSX so the reason it changed can
-  // be written down. Its last sentence read "Only PRD-labeled issues appear here."
-  // until M6, then referenced the "Show other issues" checkbox until PRD #196 M1
-  // renamed the control to "Issues" — this is the one sentence a user actually reads
-  // about what this board contains, rendered product copy invisible to any sweep of
-  // docs or code comments. It names the CONFIGURED label, since prd_label is renameable.
+  // be written down. This is the one sentence a user actually reads about what this
+  // board contains, rendered product copy invisible to any sweep of docs or code
+  // comments. It names the CONFIGURED `uzi` label, since uzi_label is renameable
+  // (PRD #764): runnable issues carry it, and "Issues" reveals the rest.
   const boardDescription =
     `Columns are ${forgePlatform(board?.forge_type)} labels. Cards move automatically as their runs progress; ` +
-    `you can still drag a card to change its label on the forge. ${prdLabel}-labeled issues always appear here; ` +
-    `use "Issues" to bring other labels onto the board alongside them.`;
+    `you can still drag a card to change its label on the forge. ${uziLabel}-labeled issues are uzi's to run; ` +
+    `use "Issues" to show all other open issues alongside them.`;
 
   return (
     <div className="space-y-5">
@@ -1201,27 +1080,19 @@ export function Board() {
                 ))}
               </Select>
             </label>
-            {/* The "Issues" popover (PRD #196 M1, mock §3). Replaces the old
-                "Show other issues" checkbox: the board renders `primary ∪ extras`, and
-                this control is how a user tunes the extras half. The button names the
-                CONFIGURED membership labels (prd_label is renameable) and borders in
-                the brand tint when any extra is selected. */}
+            {/* The "Issues" popover (PRD #764): a simple `uzi`-only / all toggle. The
+                board renders only `uzi`-labelled (runnable) issues until "Show all other
+                issues" is ticked. The button names the CONFIGURED `uzi` label (uzi_label
+                is renameable) and borders in the brand tint when all issues are shown. */}
             <IssuesFilter
               open={issuesOpen}
               onToggleOpen={() => setIssuesOpen((o) => !o)}
               popRef={issuesPopRef}
               triggerRef={issuesTriggerRef}
-              prdLabel={prdLabel}
-              membershipLabels={membershipLabels}
-              defaultExtras={serverDefaultExtras}
-              resolvedExtras={resolvedExtras}
-              candidateExtras={candidateExtras}
-              extraCounts={extraCounts}
-              onToggleExtra={toggleExtra}
+              uziLabel={uziLabel}
               showAll={showAll}
               showAllCount={showAllCount}
               onToggleShowAll={toggleShowAll}
-              onReset={resetExtras}
             />
             <label className="flex cursor-pointer select-none items-center gap-1.5 py-1.5 text-xs text-muted">
               <input
@@ -1440,30 +1311,20 @@ export function Board() {
                   controls; it just no longer gates a scroll box. */}
               <div className="flex flex-col gap-2">
                 {shown.map((card, i) => {
-                  // The extras this card carries are the "why this card is here"
-                  // chips (PRD #196): hoisted ahead of MAX_CARD_CHIPS (Decision 11) so
-                  // they cannot fall into the "+N" overflow, and highlighted (mock §4).
-                  const matchedExtras = resolvedExtras.filter((l) => card.labels.includes(l));
-                  // Run-eligibility (PRD #196 M4) drives the Start-vs-Promote affordance,
-                  // the solid-vs-quiet treatment and the PRDLESS toggle — NOT membership.
-                  // A `bug` card is eligible (mock §4) and runs; a visibility-only
-                  // `documentation` card is a member but not eligible (mock §7) and gets
-                  // Promote. The PRD-link waiver is scoped to NON-PRIMARY eligibility
-                  // (Decision 7): an issue eligible only via the primary still needs its
-                  // prds/*.md link, mirroring the server so the button matches the gate.
-                  const isEligible = isEligibleCard(card, runEligibleLabels);
-                  const eligibleByNonPrimary = card.labels.some(
-                    (l) => l !== prdLabel && runEligibleLabels.includes(l),
-                  );
-                  const prdLinkWaived = eligibleLabelWaivesPrdLink && eligibleByNonPrimary;
+                  // Runnability is the single `uzi` label (PRD #764): a card carrying it
+                  // is uzi's to run and renders solid with Start run; one without it is
+                  // quiet and gets Promote. The matched `uzi` chip is hoisted ahead of
+                  // MAX_CARD_CHIPS and highlighted so it reads as the runnable marker.
+                  const isEligible = isUziCard(card, uziLabel);
+                  const matchedUzi = isEligible ? [uziLabel] : [];
                   return (
                   <IssueCard
                     key={card.iid}
                     card={card}
                     repoId={repoId}
                     projectWebUrl={board?.web_url}
-                    chips={hoistLabels(chipLabels(card.labels, chipExclusions), matchedExtras)}
-                    highlightLabels={matchedExtras}
+                    chips={hoistLabels(chipLabels(card.labels, chipExclusions), matchedUzi)}
+                    highlightLabels={matchedUzi}
                     // The active query, so the card highlights the matched substring in
                     // its title and any matching chip (PRD #304 M2). "" when not searching.
                     query={q}
@@ -1523,9 +1384,6 @@ export function Board() {
                         : undefined
                     }
                     gate={startRunGate({
-                      hasPrdLink: card.has_prd_link,
-                      prdlessBypass: prdlessEnabled && card.labels.includes(prdlessLabel),
-                      prdLinkWaived,
                       closed: card.closed,
                       hasWorker,
                       hasToken,
@@ -1535,13 +1393,9 @@ export function Board() {
                     onStart={() => startRun(card)}
                     fixCiBusy={card.pipeline != null && fixingRef === card.pipeline.ref}
                     onFixCi={() => card.pipeline && fixCi(card.pipeline.ref)}
-                    prdlessEnabled={prdlessEnabled}
-                    prdlessLabel={prdlessLabel}
-                    prdlessBusy={prdlessBusy === card.iid}
-                    onTogglePrdless={() => togglePrdless(card)}
-                    prdLabel={prdLabel}
+                    uziLabel={uziLabel}
                     isEligible={isEligible}
-                    canPromote={canPromote(card, runEligibleLabels)}
+                    canPromote={canPromote(card, uziLabel)}
                     promoting={promoting === card.iid}
                     onPromote={() => promote(card)}
                     onDragStart={(e) => {
@@ -1709,11 +1563,7 @@ export function IssueCard({
   onStart,
   fixCiBusy,
   onFixCi,
-  prdlessEnabled,
-  prdlessLabel,
-  prdlessBusy,
-  onTogglePrdless,
-  prdLabel,
+  uziLabel,
   isEligible,
   canPromote: promotable,
   promoting,
@@ -1730,9 +1580,9 @@ export function IssueCard({
   // (columns + the configured workflow labels), and keeping it out of the card is
   // what lets this component mount in a test without an auth provider.
   chips: string[];
-  // The membership extras this card carries (PRD #196 M1, mock §4). A shown chip whose
-  // label is in this set gets the brand "hit" treatment — it is why the card is on the
-  // board. Defaults to none so the direct-render tests need not supply it.
+  // The labels this card carries that should get the brand "hit" treatment when shown
+  // (PRD #764: the matched `uzi` label, marking why the card is runnable). Defaults to
+  // none so the direct-render tests need not supply it.
   highlightLabels?: string[];
   // The active board search query (PRD #304 M2). When non-empty, the card highlights
   // every case-insensitive occurrence of it in the title and in any matching chip via
@@ -1769,18 +1619,12 @@ export function IssueCard({
   onStart: () => void;
   fixCiBusy: boolean;
   onFixCi: () => void;
-  prdlessEnabled: boolean;
-  prdlessLabel: string;
-  prdlessBusy: boolean;
-  onTogglePrdless: () => void;
-  // PRD #196 M4. isEligible drives the treatment and the affordances (was isPRD in M6):
-  // run-eligibility now keys off the admin-configured eligible SET, not the primary
-  // label alone, so a `bug` card is runnable and renders solid with Start run (mock §4).
-  // canPromote is the narrower question (open, not already eligible, not the self-improve
-  // tracker), so the two are separate props rather than one derived from the other on the
-  // card. prdLabel rides down for the button copy: the card names the CONFIGURED label,
-  // like the prdless button beside it, so an instance that renamed it reads right.
-  prdLabel: string;
+  // PRD #764. isEligible drives the treatment and the affordances: a card carrying the
+  // `uzi` label is runnable and renders solid with Start run; one without it is quiet
+  // and gets Promote. canPromote is the narrower question (open, not already `uzi`, not
+  // the self-improve tracker), so the two are separate props. uziLabel rides down for
+  // the Promote button copy so an instance that renamed the label reads right.
+  uziLabel: string;
   isEligible: boolean;
   canPromote: boolean;
   promoting: boolean;
@@ -1789,7 +1633,6 @@ export function IssueCard({
   onDragEnd: () => void;
   dimmed: boolean;
 }) {
-  const prdlessApplied = card.labels.includes(prdlessLabel);
   // Chips are bounded (PRD #102 M4): a lane is a fixed w-72, so an issue wearing a
   // dozen labels would push the card several rows taller than its neighbours and
   // bury the run badges. The remainder is not dropped — it rides the "+N" title.
@@ -2018,16 +1861,13 @@ export function IssueCard({
             {hint}
           </span>
         )}
-        {!card.has_prd_link &&
-          (prdlessEnabled && prdlessApplied ? (
-            <Badge tone="brand" title="PRD-link gate bypassed by label">
-              {prdlessLabel}
-            </Badge>
-          ) : (
-            <Badge tone="warning" title="Description has no link to a prds/*.md file; excluded from agent pickup">
-              no PRD link
-            </Badge>
-          ))}
+        {/* Neutral PRD-presence marker (PRD #764): a linked prds/*.md is optional but
+            still detected, so a card that has one shows a quiet "PRD" badge. */}
+        {card.has_prd_link && (
+          <Badge tone="neutral" title="This issue links a prds/*.md file">
+            PRD
+          </Badge>
+        )}
         {card.conflict && (
           <Badge tone="danger" title="Issue carries multiple column labels; shown in the highest column until the next move">
             conflict
@@ -2114,22 +1954,22 @@ export function IssueCard({
           {card.author && <span>{card.author}</span>}
         </div>
       )}
-      {/* D15: Promote stands IN PLACE OF Start run, never beside it. A non-PRD card
-          cannot start a run (the Decision 14 gate refuses it server-side), so showing
-          a gated Start run here would be a disabled button whose tooltip explains a
-          rule the user has a one-click answer to. Promote IS that answer, and once
-          taken the card becomes ordinary and Start run appears. */}
+      {/* D15: Promote stands IN PLACE OF Start run, never beside it. A non-`uzi` card
+          cannot start a run (the gate refuses it server-side), so showing a gated Start
+          run here would be a disabled button whose tooltip explains a rule the user has a
+          one-click answer to. Promote IS that answer — it adds the `uzi` label — and once
+          taken the card becomes runnable and Start run appears. */}
       {promotable ? (
         <div className="mt-2.5">
           <Button
             variant="secondary"
             size="sm"
             disabled={promoting}
-            title={`Add the ${prdLabel} label so uzi can work this issue`}
+            title={`Add the ${uziLabel} label so uzi can work this issue`}
             onClick={onPromote}
             className="w-full"
           >
-            {promoting ? "Promoting…" : `Promote to ${prdLabel}`}
+            {promoting ? "Promoting…" : `Promote to ${uziLabel}`}
           </Button>
         </div>
       ) : (
@@ -2149,37 +1989,13 @@ export function IssueCard({
           </div>
         )
       )}
-      {/* Show when applying is meaningful (no PRD link) or the label is already
-          applied (so it can be removed); hide the no-op case — has a PRD link and
-          no label (S2).
-
-          D16 keys on isEligible (PRD #196 M4 widened it from isPRD): on a non-eligible
-          card the PRDLESS label grants nothing, because run eligibility gates the run
-          first. A button that looks like it does something and does not is worse than no
-          button. */}
-      {prdlessEnabled && isEligible && !card.closed && (prdlessApplied || !card.has_prd_link) && (
-        <button
-          type="button"
-          draggable={false}
-          disabled={prdlessBusy}
-          onClick={onTogglePrdless}
-          title={
-            prdlessApplied
-              ? `Remove the ${prdlessLabel} label and re-apply the PRD-link requirement`
-              : `Apply the ${prdlessLabel} label so a run can start without a PRD link`
-          }
-          className="mt-1.5 w-full rounded-md border border-edge px-2 py-1 text-[11px] text-muted transition-colors hover:border-brand/60 hover:text-fg disabled:opacity-50"
-        >
-          {prdlessBusy ? "…" : prdlessApplied ? `Remove ${prdlessLabel}` : `Mark ${prdlessLabel}`}
-        </button>
-      )}
     </div>
   );
 }
 
-// CreateIssueForm opens a PRD-shaped issue on the forge. The description carries a
-// prds/*.md link slot so the server's has_prd_link check passes and the card is
-// immediately run-able.
+// CreateIssueForm opens a runnable issue on the forge: the server labels it with the
+// configured `uzi` label so uzi can work it (PRD #764). A prds/*.md link is optional
+// but still detected, so the description carries a link slot as a hint.
 function CreateIssueForm({
   repoId,
   forgeType,
@@ -2191,7 +2007,7 @@ function CreateIssueForm({
   onCreated: () => void;
   onError: (m: string) => void;
 }) {
-  const { prdLabel } = useAuth();
+  const { uziLabel } = useAuth();
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [saving, setSaving] = useState(false);
@@ -2212,11 +2028,12 @@ function CreateIssueForm({
 
   return (
     <Card className="max-w-2xl space-y-3">
-      <SectionTitle>Create a PRD issue</SectionTitle>
+      <SectionTitle>Create an issue</SectionTitle>
       <p className="text-xs text-faint">
-        Opened on {forgePlatform(forgeType)} with the <span className="font-medium text-muted">{prdLabel}</span> label.
-        Link a <code className="rounded bg-raised px-1 py-0.5 text-muted">prds/*.md</code> file in the
-        description so a run can be started from it.
+        Opened on {forgePlatform(forgeType)} with the <span className="font-medium text-muted">{uziLabel}</span> label,
+        so a run can be started from it. Optionally link a{" "}
+        <code className="rounded bg-raised px-1 py-0.5 text-muted">prds/*.md</code> file in the description — a linked
+        PRD is detected and shown with a badge.
       </p>
       <form onSubmit={submit} className="space-y-3">
         <Field label="Title">
@@ -2238,11 +2055,11 @@ function CreateIssueForm({
   );
 }
 
-// IssuesFilter is the board toolbar's "Issues" popover (PRD #196 M1, mock §3). It
-// replaces the old "Show other issues" checkbox: the board renders `primary ∪ extras`
-// and this is where a user tunes the extras. Kept inline in this file following the
-// ColumnSettings precedent below, since it is board-toolbar-only. All membership
-// state lives in Board(); this component is presentation plus the callbacks.
+// IssuesFilter is the board toolbar's "Issues" popover (PRD #764): a simple
+// `uzi`-only / all toggle. By default the board renders only `uzi`-labelled (runnable)
+// issues; ticking "Show all other issues" reveals every open issue alongside them.
+// Kept inline in this file following the ColumnSettings precedent below, since it is
+// board-toolbar-only. The `show_all` state is persisted per-user via board_prefs.
 //
 // Open/close, Escape and outside-click are owned by Board() (the `open`/`popRef`
 // props) so the same effect can also drive other toolbar state if needed and so the
@@ -2252,38 +2069,20 @@ function IssuesFilter({
   onToggleOpen,
   popRef,
   triggerRef,
-  prdLabel,
-  membershipLabels,
-  defaultExtras,
-  resolvedExtras,
-  candidateExtras,
-  extraCounts,
-  onToggleExtra,
+  uziLabel,
   showAll,
   showAllCount,
   onToggleShowAll,
-  onReset,
 }: {
   open: boolean;
   onToggleOpen: () => void;
   popRef: React.RefObject<HTMLDivElement | null>;
   triggerRef: React.RefObject<HTMLButtonElement | null>;
-  prdLabel: string;
-  membershipLabels: string[];
-  defaultExtras: string[];
-  resolvedExtras: string[];
-  candidateExtras: string[];
-  extraCounts: Map<string, number>;
-  onToggleExtra: (label: string) => void;
+  uziLabel: string;
   showAll: boolean;
   showAllCount: number;
   onToggleShowAll: () => void;
-  onReset: () => void;
 }) {
-  const hasExtras = resolvedExtras.length > 0;
-  // The inert-default row (mock §3): names what "Reset to default" re-adopts — the
-  // admin-configured default extras from the payload, not the compiled-in const.
-  const defaultLabel = [prdLabel, ...defaultExtras].join(", ");
   return (
     <div className="relative" ref={popRef}>
       <button
@@ -2292,17 +2091,17 @@ function IssuesFilter({
         onClick={onToggleOpen}
         aria-haspopup="true"
         aria-expanded={open}
-        // Brand border when any extra is selected (mock §3's `.btn.filter.on`), so the
-        // toolbar shows at a glance that the board is widened beyond the primary.
+        // Brand border when all issues are shown, so the toolbar shows at a glance that
+        // the board is widened beyond the runnable `uzi` set.
         className={cx(
           "inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs transition-colors",
-          hasExtras ? "border-brand/60 text-fg" : "border-edge text-muted hover:text-fg",
+          showAll ? "border-brand/60 text-fg" : "border-edge text-muted hover:text-fg",
         )}
       >
         <span className="text-muted">Issues:</span>
-        {/* Names the CONFIGURED membership labels — prd_label is renameable, so a
-            literal would be wrong on any instance that changed it. */}
-        <span className="font-medium text-fg">{membershipLabels.join(", ")}</span>
+        {/* Names the CONFIGURED `uzi` label — uzi_label is renameable, so a literal
+            would be wrong on any instance that changed it. */}
+        <span className="font-medium text-fg">{showAll ? "all" : uziLabel}</span>
         <span aria-hidden="true" className="text-[9px] text-faint">
           ▾
         </span>
@@ -2316,48 +2115,21 @@ function IssuesFilter({
           <div className="px-2 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-faint">
             Show issues labelled
           </div>
-          {/* The PRIMARY row: pinned, checked and disabled — always shown (Decision 2).
-              Only the primary is pinned; an eligible-but-not-extra label is not. */}
+          {/* The `uzi` row: pinned, checked and disabled — the runnable set is always
+              shown (PRD #764). */}
           <div className="flex items-center gap-2 rounded-md px-2 py-1 text-xs text-muted">
             <input
               type="checkbox"
               checked
               disabled
-              aria-label={`${prdLabel} (always shown)`}
+              aria-label={`${uziLabel} (always shown)`}
               className="h-3.5 w-3.5 rounded border-edge accent-brand"
             />
-            {prdLabel}
+            {uziLabel}
             <span className="ml-auto text-[11px] text-faint">always shown</span>
           </div>
-          {/* One row per candidate extra (content labels on the payload, plus any inert
-              configured default). Greyed when showAll subsumes them, or when the count
-              is 0 (an inert default; open question 8) — still toggleable either way. */}
-          {candidateExtras.map((label) => {
-            const count = extraCounts.get(label) ?? 0;
-            const checked = resolvedExtras.includes(label);
-            return (
-              <label
-                key={label}
-                className={cx(
-                  "flex cursor-pointer select-none items-center gap-2 rounded-md px-2 py-1 text-xs hover:bg-raised",
-                  showAll || count === 0 ? "text-faint" : "text-fg",
-                )}
-              >
-                <input
-                  type="checkbox"
-                  checked={checked}
-                  onChange={() => onToggleExtra(label)}
-                  className="h-3.5 w-3.5 rounded border-edge accent-brand"
-                />
-                {/* Forge-supplied label, stripped where DISPLAYED (Issue #124); the
-                    map key stays the raw string. */}
-                <span className="truncate">{stripUnsafeChars(label)}</span>
-                <span className="ml-auto font-mono text-[11px] text-faint">{count}</span>
-              </label>
-            );
-          })}
           <hr className="my-1.5 border-edge" />
-          {/* The old showNonPRD boolean, kept as the escape hatch (mock §3). */}
+          {/* The escape hatch: reveal every other open issue alongside the runnable set. */}
           <label className="flex cursor-pointer select-none items-center gap-2 rounded-md px-2 py-1 text-xs text-fg hover:bg-raised">
             <input
               type="checkbox"
@@ -2368,16 +2140,6 @@ function IssuesFilter({
             Show all other issues
             <span className="ml-auto font-mono text-[11px] text-faint">{showAllCount}</span>
           </label>
-          <div className="mt-1 flex items-center justify-between gap-2 border-t border-edge px-2 pb-1 pt-2 text-[11px] text-faint">
-            <span>Default: {defaultLabel}</span>
-            <button
-              type="button"
-              onClick={onReset}
-              className="text-brand transition-colors hover:text-brand-hover"
-            >
-              Reset to default
-            </button>
-          </div>
         </div>
       )}
     </div>
@@ -2393,7 +2155,7 @@ function ColumnSettings({
   onSaved: (b: BoardData) => void;
   onError: (m: string) => void;
 }) {
-  const { prdLabel, autopilotLabel, prdlessLabel } = useAuth();
+  const { autopilotLabel } = useAuth();
   const [names, setNames] = useState<string[]>(board.columns.map((c) => c.label_name));
   const [newName, setNewName] = useState("");
   const [saving, setSaving] = useState(false);
@@ -2403,21 +2165,18 @@ function ColumnSettings({
   const [dragName, setDragName] = useState<string | null>(null);
   const [insertion, setInsertion] = useState<{ name: string; edge: "top" | "bottom" } | null>(null);
 
-  // Suggest labels seen on cards that are not already columns and not the
-  // configured PRD/autopilot/PRDLESS labels (those are workflow markers, never
-  // columns). Same predicate the cards' chips use (PRD #102 M4), but excluding
-  // `names` — the UNSAVED edit state — rather than board.columns, so a label just
-  // added above stops being offered before Save.
+  // Suggest labels seen on cards that are not already columns and not the configured
+  // autopilot label (a workflow marker, never a column). Same predicate the cards'
+  // chips use (PRD #102 M4), but excluding `names` — the UNSAVED edit state — rather
+  // than board.columns, so a label just added above stops being offered before Save.
   const suggestions = useMemo(() => {
     const seen = new Set<string>();
     for (const c of board.cards) for (const l of c.labels) seen.add(l);
     return chipLabels([...seen], {
-      prdLabel,
-      prdlessLabel,
       autopilotLabel,
       columnLabels: names,
     }).sort();
-  }, [board.cards, names, prdLabel, autopilotLabel, prdlessLabel]);
+  }, [board.cards, names, autopilotLabel]);
 
   const add = (name: string) => {
     const n = name.trim();

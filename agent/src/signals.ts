@@ -133,7 +133,8 @@ export function buildSignalMcpServer(
   opts: SignalServerOptions = {},
 ): McpSdkServerConfigWithInstance {
   // PRD #72 M4. The describe text carries Decision 5's CONDITIONAL in its own
-  // wording: an unconditional instruction handed to a PRDLESS run in a repo that
+  // wording: an unconditional instruction handed to a run whose issue links no
+  // prds/*.md (a PRD link is optional under the uzi model, PRD #764) in a repo that
   // nonetheless has a prds/ directory invites the model to pick one and declare it.
   const doneShape: Record<string, z.ZodTypeAny> = {
     summary: z

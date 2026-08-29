@@ -118,22 +118,12 @@ export function applyFrame(
 }
 
 // StartRunPreconditions are the facts the board knows about an issue + the user.
+//
+// PRD #764 removed the PRD-link precondition: a run no longer requires a linked
+// prds/*.md file (the single `uzi` label is the eligibility gate, checked upstream by
+// whether the card is runnable at all). The worker/token/closed/active preconditions
+// stay.
 export interface StartRunPreconditions {
-  hasPrdLink: boolean;
-  // prdlessBypass short-circuits the PRD-link requirement (PRD #22): the issue
-  // carries the PRDLESS label and the feature is enabled, so the server creates
-  // the run with no prds/*.md link. When true, the missing-link precondition is
-  // skipped — mirroring the server's allowWithoutPRD gate. Optional: absent means
-  // no bypass (unchanged behavior for callers that don't compute it).
-  prdlessBypass?: boolean;
-  // prdLinkWaived short-circuits the PRD-link requirement the way prdlessBypass does,
-  // but for a whole CLASS of issue rather than one (PRD #196 M4): the issue is
-  // run-eligible via a NON-PRIMARY label and the instance waives the PRD-link
-  // requirement for such issues (eligible_label_waives_prd_link). Mirrors the server's
-  // waiver so the button state matches the gate — an eligible `bug` with no prds/*.md
-  // link is startable here exactly as it is server-side. Optional: absent means no
-  // waiver (unchanged behavior for callers that don't compute it).
-  prdLinkWaived?: boolean;
   closed: boolean;
   hasWorker: boolean;
   hasToken: boolean;
@@ -152,9 +142,6 @@ export interface StartRunGate {
 export function startRunGate(p: StartRunPreconditions): StartRunGate {
   if (p.closed) {
     return { enabled: false, reason: "This issue is closed." };
-  }
-  if (!p.hasPrdLink && !p.prdlessBypass && !p.prdLinkWaived) {
-    return { enabled: false, reason: "Add a link to a prds/*.md file in the description first." };
   }
   if (!p.hasWorker) {
     return { enabled: false, reason: "Connect a worker first (Settings → Workers)." };

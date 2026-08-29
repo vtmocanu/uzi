@@ -40,16 +40,12 @@ func TestPromotableExcludesTheSelfImproveTracker(t *testing.T) {
 	}
 }
 
-// TestPromoteDoesNotUseThePrdlessColor is the "naive reuse" trap Decision 15
-// names, pinned as a value rather than as prose. SetIssueLabel auto-creates the
-// label it applies, so promoting on a repo whose PRD label is somehow missing
-// would create it in the escape hatch's amber if the constant were shared.
-func TestPromoteDoesNotUseThePrdlessColor(t *testing.T) {
-	if forgesvc.PrdLabelColor == forgesvc.PrdlessLabelColor {
-		t.Fatalf("PrdLabelColor == PrdlessLabelColor (%s): a missing PRD label would be auto-created in the PRDLESS color",
-			forgesvc.PrdLabelColor)
-	}
-	if forgesvc.PrdLabelColor == "" {
-		t.Fatal("PrdLabelColor is empty; GitLab's label-create API requires a color")
+// TestPromoteLabelColorIsSet pins that Promote carries a non-empty color for the
+// uzi label it applies (PRD #764): SetIssueLabel auto-creates the label it applies,
+// and GitLab's label-create API requires a color, so an empty constant would fail
+// the promote on a repo whose uzi label is somehow missing.
+func TestPromoteLabelColorIsSet(t *testing.T) {
+	if forgesvc.PromoteLabelColor == "" {
+		t.Fatal("PromoteLabelColor is empty; GitLab's label-create API requires a color")
 	}
 }

@@ -10,11 +10,12 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// Autopilot's PRD-label predicate (PRD #102 M6, Decision 11b).
+// Autopilot's uzi-label predicate (PRD #102 M6, Decision 11b; PRD #764 D7 repointed
+// it from the PRD label to the uzi run-eligibility label).
 //
 // Before M6 the candidate query filtered on the autopilot label alone, and its own
 // comment recorded why that was enough: the sync filter meant every cached issue
-// carried the PRD label. The additive fetch deletes that invariant, and the
+// carried the eligibility label. The additive fetch deletes that invariant, and the
 // consequence is not cosmetic — a stranger's open issue carrying the autopilot
 // label would become a candidate, and the detector would then read its label
 // events over the forge every tick and either start an unattended run on it or
@@ -31,17 +32,17 @@ func TestDetectFiltersCandidatesOnBothLabels(t *testing.T) {
 		want string
 	}{
 		{
-			name: "the configured PRD label is passed to the query",
-			lab:  apLabeler{label: apLabel, prdLabel: "Feature"},
+			name: "the configured uzi label is passed to the query",
+			lab:  apLabeler{label: apLabel, uziLabel: "Feature"},
 			want: "Feature",
 		},
 		{
 			// Unconfigured settings must narrow to the default, never widen to no
 			// filter. Every other outcome of a settings blip is autopilot not firing;
 			// this one would be autopilot firing on issues that are not uzi's.
-			name: "an unconfigured PRD label falls back to the compiled-in default",
+			name: "an unconfigured uzi label falls back to the compiled-in default",
 			lab:  apLabeler{label: apLabel},
-			want: settings.DefaultPRDLabel,
+			want: settings.DefaultUziLabel,
 		},
 	}
 	for _, tc := range cases {
@@ -52,11 +53,11 @@ func TestDetectFiltersCandidatesOnBothLabels(t *testing.T) {
 			if len(st.candParams) != 1 {
 				t.Fatalf("expected one candidate query, got %d", len(st.candParams))
 			}
-			if got := st.candParams[0].PrdLabel; got != tc.want {
-				t.Fatalf("PrdLabel = %q, want %q", got, tc.want)
+			if got := st.candParams[0].UziLabel; got != tc.want {
+				t.Fatalf("UziLabel = %q, want %q", got, tc.want)
 			}
 			if got := st.candParams[0].Label; got != apLabel {
-				t.Fatalf("Label = %q, want the autopilot label %q — the PRD predicate is ADDITIONAL, not a replacement", got, apLabel)
+				t.Fatalf("Label = %q, want the autopilot label %q — the uzi predicate is ADDITIONAL, not a replacement", got, apLabel)
 			}
 		})
 	}
@@ -71,8 +72,8 @@ func TestDetectFallsBackWithoutASettingsReader(t *testing.T) {
 	if len(st.candParams) != 1 {
 		t.Fatalf("expected one candidate query, got %d", len(st.candParams))
 	}
-	if got := st.candParams[0].PrdLabel; got != settings.DefaultPRDLabel {
-		t.Fatalf("PrdLabel = %q, want %q", got, settings.DefaultPRDLabel)
+	if got := st.candParams[0].UziLabel; got != settings.DefaultUziLabel {
+		t.Fatalf("UziLabel = %q, want %q", got, settings.DefaultUziLabel)
 	}
 }
 

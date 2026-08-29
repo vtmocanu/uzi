@@ -621,11 +621,6 @@ export interface Board {
   forge_type: string;
   columns: BoardColumn[];
   cards: Card[];
-  // The admin-configured default board-extra labels (PRD #196 M2): the extras a
-  // board starts with until a user saves their own per-repo set. Membership is
-  // `primary ∪ extras` (Decision 2). Optional so an older server that predates the
-  // field falls back to DEFAULT_BOARD_EXTRA_LABELS client-side.
-  board_extra_labels?: string[];
   // Repo default-branch CI status (PRD #6, the board header badge), null when
   // there is no cached default-branch pipeline.
   pipeline: PipelineStatus | null;
@@ -635,11 +630,12 @@ export interface Board {
 // persisted server-side (per account, per repo) rather than per browser. It is the
 // stored row served by GET/PUT /repos/{id}/board/prefs.
 //
-// extra_labels is a SENTINEL (Decision 9): null means "not customised — fall back to
-// the admin default board.board_extra_labels"; an array (INCLUDING the empty one) is
-// the user's ABSOLUTE set, so "unticked everything" is durable and distinguishable
-// from "never set". show_all is the old per-browser "show all other issues" boolean,
-// now per-account. No row yet reads as { extra_labels: null, show_all: false }.
+// show_all is the per-account "show all other issues" boolean that drives the board's
+// uzi-only / all toggle (PRD #764). extra_labels is retained on the wire (a nullable
+// sentinel: null = not customised, an array = the user's absolute set) but is no longer
+// consumed by the client under the single-`uzi`-label membership model — it is only
+// round-tripped so the stored row stays intact. No row yet reads as
+// { extra_labels: null, show_all: false }.
 export interface BoardPrefs {
   extra_labels: string[] | null;
   show_all: boolean;
@@ -678,11 +674,10 @@ export interface ForgeConfig {
 export interface AppSettings {
   prd_label: string;
   autopilot_label: string;
+  // PRD #764: the single run-eligibility label (default "uzi"). An issue is runnable
+  // iff it carries this label; served as a raw string like every other setting.
+  uzi_label: string;
   default_theme: string;
-  // PRDLESS escape hatch (PRD #22). prdless_enabled is the text "true"/"false"
-  // (the API serves every setting as a string); prdless_label is the label name.
-  prdless_enabled: string;
-  prdless_label: string;
   // Slack integration non-secret keys (PRD #25). slack_enabled is the text
   // "true"/"false"; public_base_url is the http(s) base for deep links in Slack
   // messages. The two Slack TOKENS are secret and never returned here — see
@@ -737,15 +732,6 @@ export interface AppSettings {
   // labels to a linked GitHub Projects Status field — an instance-wide rate-limit /
   // cost lever. GitLab and Forgejo repos are unaffected either way.
   github_project_sync_enabled: string;
-  // Configurable board-membership + run-eligible labels (PRD #196 M2). All three
-  // are served as raw strings like every other setting. run_eligible_labels and
-  // board_extra_labels are COMMA-SEPARATED lists (safe because ValidateLabel rejects
-  // a comma in a label name); eligible_label_waives_prd_link is the text
-  // "true"/"false". run_eligible_labels always contains the primary (prd_label);
-  // board_extra_labels is the per-user default extras.
-  run_eligible_labels: string;
-  board_extra_labels: string;
-  eligible_label_waives_prd_link: string;
   // Instance branding config (PRD #685). All six round-trip through GET/PUT
   // /admin/settings as raw strings like every other setting — the API serves the
   // whole settings surface as strings, so app_logo_keep_name/brand_plaque are the
@@ -945,35 +931,24 @@ export interface AgentSourceApplyResult {
 
 // Compiled-in label defaults, mirroring the API's settings package. The SPA uses
 // them until the session bootstrap resolves the configured values (PRD #19 M2,
-// PRD #22 for prdless).
-export const DEFAULT_PRD_LABEL = "PRD";
+// PRD #764 for the `uzi` run-eligibility label).
 export const DEFAULT_AUTOPILOT_LABEL = "autopilot";
-export const DEFAULT_PRDLESS_LABEL = "PRDLESS";
 
 // SessionResponse is the auth/session bootstrap body (login, register, me). It
 // carries the user, the instance forge labels the board and issue-creation UI
-// need before their first call (PRD #19 M2), the three theme fields the
+// need before their first call (PRD #19 M2, PRD #764: the single `uzi`
+// run-eligibility label and the autopilot label), and the three theme fields the
 // Appearance picker needs (PRD #21: resolved theme, the user's raw override with
-// null = none, and the instance default), and the prdless fields (PRD #22,
-// optional: a server that predates them omits both and the SPA treats the feature
-// as off).
+// null = none, and the instance default).
 export interface SessionResponse {
   user: User;
-  prd_label: string;
+  // PRD #764: the single run-eligibility label. An issue is runnable iff it carries
+  // this label; the board renders it as a runnable marker + filter facet.
+  uzi_label: string;
   autopilot_label: string;
   theme: string;
   theme_override: string | null;
   default_theme: string;
-  prdless_label?: string;
-  prdless_enabled?: boolean;
-  // Run-eligible labels and the PRD-link waiver (PRD #196 M2). The eligible set
-  // rides the session (not just the board) because IssueView reads it from
-  // useAuth() with no board payload. Both optional and older-server-tolerant: an
-  // absent run_eligible_labels falls back to [prd_label] (the primary is always
-  // eligible), an absent waiver defaults true. run_eligible_labels already includes
-  // the primary — the server always sends it.
-  run_eligible_labels?: string[];
-  eligible_label_waives_prd_link?: boolean;
   // Vault status (PRD #32): whether the user's per-user secret vault is unlocked
   // in the server process. Optional so a server that predates the field reads as
   // unlocked (no banner, legacy behavior) rather than falsely locked. `exists`
@@ -1150,7 +1125,6 @@ export type ScheduleStatus = "active" | "fired" | "error";
 // The authoritative source is Go's schedsvc.SkipReason; scheduleSkipReasons.test.ts is a
 // cross-language drift guard that reddens if Go gains a reason this union lacks.
 export type ScheduleSkipReason =
-  | "no_prd_link"
   | "not_eligible"
   | "already_running"
   | "description_too_large"
@@ -1673,6 +1647,10 @@ export interface Run {
   /** Forge-supplied issue web URL (PRD #411), null for issue-less runs or when the
    *  issue is no longer cached. Rendered through isHttpsUrl into the #<iid> link. */
   issue_web_url: string | null;
+  /** PRD #764 M2: whether the run's issue links a `prds/*.md` file, so the run view can
+   *  show a neutral "PRD" presence badge. OPTIONAL for api/web rollout skew: a pre-#764
+   *  api pod omits the key, and an absent value reads as no PRD (the badge stays hidden). */
+  has_prd_link?: boolean;
   /** Last MR state the PRD #24 watcher observed for mr_iid
    *  (opened|closed|merged|locked), null when never observed. Display-only hint
    *  (PRD #33); frozen per run, so a superseded run's value can be stale. */
@@ -3344,16 +3322,9 @@ const realApi = {
     request<{ card: Card }>("POST", `/repos/${repoId}/issues/${iid}/move`, {
       to_column: toColumn,
     }),
-  // Apply/remove the PRDLESS label from the UI (PRD #22 M4). Forge-first, so the
-  // returned card is authoritative — the caller replaces its card with it (no
-  // optimistic update).
-  setIssuePrdless: (repoId: string, iid: number, apply: boolean) =>
-    request<{ card: Card }>("POST", `/repos/${repoId}/issues/${iid}/prdless`, {
-      apply,
-    }),
-  // Promote a non-PRD issue by adding the PRD label (PRD #102 M6, Decision 15).
-  // Forge-first and apply-only — there is no demote, so no boolean. The returned
-  // card is authoritative, like the prdless toggle above.
+  // Promote a non-runnable issue by adding the `uzi` label (PRD #102 M6, Decision 15;
+  // PRD #764). Forge-first and apply-only — there is no demote, so no boolean. The
+  // returned card is authoritative — the caller replaces its card with it.
   promoteIssue: (repoId: string, iid: number) =>
     request<{ card: Card }>("POST", `/repos/${repoId}/issues/${iid}/promote`),
   syncRepo: (repoId: string) =>

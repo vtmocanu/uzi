@@ -25,18 +25,16 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// PRD #196 M4 guard test 1: EVERY writer keeps writing the PRIMARY label, never the
-// run-eligible set. The compiler cannot help here — the primary and every member of
-// the set are the same `string` type — so each writer needs a behavioural assertion.
+// PRD #764 guard: EVERY writer applies the single configured uzi run-eligibility
+// label, never a bare sweep selector like "bug". The compiler cannot help here — a
+// selector and the uzi label are the same `string` type — so each writer needs a
+// behavioural assertion.
 //
-// The design of the guard: settings whose run-eligible set DIFFERS from the primary
-// (primary "PRD", eligible {PRD, bug}). A writer that had been handed the set would
-// start labelling issues "bug"; asserting it applies exactly "PRD" catches that. The
-// four writer call sites are Promote (board.go), the judge draft and the judge file
-// (review_issue_draft.go / review_issue_file.go), and board issue creation
+// The four writer call sites are Promote (board.go), the judge draft and the judge
+// file (review_issue_draft.go / review_issue_file.go), and board issue creation
 // (issues.go). The judge pair is covered here plus in review_issue_livedb_test.go,
-// whose harness now carries the same differing eligible set so its [PRD, PRDLESS]
-// assertions are writer guards too.
+// whose harness carries the same uzi_label setting so its [uzi] assertions are writer
+// guards too.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres;
 // ./e2e/run-store-it.sh provides one and sweeps this package for the LiveDB suffix.
@@ -183,10 +181,7 @@ func newBoardWriterFixture(ctx context.Context, t *testing.T, stub *boardWriterS
 		box:  box,
 		cfg:  config.Config{},
 		settings: settings.New(&settingsStore{rows: []store.AppSetting{
-			{Key: settings.KeyPRDLabel, Value: "PRD"},
-			{Key: settings.KeyPrdlessLabel, Value: "PRDLESS"},
-			{Key: settings.KeyRunEligibleLabels, Value: "PRD,bug"},
-			{Key: settings.KeyEligibleLabelWaivesPRDLink, Value: "true"},
+			{Key: settings.KeyUziLabel, Value: "uzi"},
 		}}, time.Minute),
 		svc:  forgesvc.New(q, box, 5*time.Second, nil),
 		wsvc: workersvc.New(q, box, workersvc.Params{}),
@@ -209,16 +204,16 @@ func boardWriterReq(user store.User, repoID uuid.UUID, iid string, body string) 
 	return r.WithContext(ctx)
 }
 
-// TestPromoteWritesPrimaryNotEligibleSetLiveDB: Promote must apply the PRIMARY label,
-// never a member of the run-eligible set. The seeded issue carries "bug" (eligible but
-// NOT the primary); promoting it must add exactly "PRD".
-func TestPromoteWritesPrimaryNotEligibleSetLiveDB(t *testing.T) {
+// TestPromoteWritesUziLabelLiveDB: Promote must apply the configured uzi label,
+// never a bare selector. The seeded issue carries "bug" (a selector, NOT the uzi
+// label); promoting it must add exactly "uzi".
+func TestPromoteWritesUziLabelLiveDB(t *testing.T) {
 	ctx := context.Background()
 	stub := &boardWriterStub{}
 	f := newBoardWriterFixture(ctx, t, stub)
 
-	// A cached non-primary issue: it is on the board (bug is a default extra) and
-	// promotable (not the self-improve tracker).
+	// A cached non-uzi issue: it is on the board and promotable (not the self-improve
+	// tracker).
 	mustExecT(ctx, t, f.pool,
 		`INSERT INTO issues (repo_id, forge_issue_iid, title, state, labels, web_url, has_prd_link, forge_updated_at, synced_at)
 		 VALUES ($1, 5, 't', 'opened', '["bug"]'::jsonb, 'https://x', false, now(), now())`, f.repoID)
@@ -230,17 +225,17 @@ func TestPromoteWritesPrimaryNotEligibleSetLiveDB(t *testing.T) {
 	}
 	stub.mu.Lock()
 	defer stub.mu.Unlock()
-	if len(stub.labelCreates) != 1 || stub.labelCreates[0] != "PRD" {
-		t.Fatalf("EnsureLabels created %v, want exactly [PRD] — Promote must write the PRIMARY, never the run-eligible set", stub.labelCreates)
+	if len(stub.labelCreates) != 1 || stub.labelCreates[0] != "uzi" {
+		t.Fatalf("EnsureLabels created %v, want exactly [uzi] — Promote must write the uzi label", stub.labelCreates)
 	}
-	if len(stub.issueUpdateAdds) != 1 || stub.issueUpdateAdds[0] != "PRD" {
-		t.Fatalf("UpdateIssue add_labels = %v, want exactly [PRD]", stub.issueUpdateAdds)
+	if len(stub.issueUpdateAdds) != 1 || stub.issueUpdateAdds[0] != "uzi" {
+		t.Fatalf("UpdateIssue add_labels = %v, want exactly [uzi]", stub.issueUpdateAdds)
 	}
 }
 
-// TestCreateIssueWritesPrimaryNotEligibleSetLiveDB: board issue creation must open the
-// issue with the PRIMARY label only, never the run-eligible set.
-func TestCreateIssueWritesPrimaryNotEligibleSetLiveDB(t *testing.T) {
+// TestCreateIssueWritesUziLabelLiveDB: board issue creation must open the issue with
+// the configured uzi label only.
+func TestCreateIssueWritesUziLabelLiveDB(t *testing.T) {
 	ctx := context.Background()
 	stub := &boardWriterStub{}
 	f := newBoardWriterFixture(ctx, t, stub)
@@ -252,15 +247,14 @@ func TestCreateIssueWritesPrimaryNotEligibleSetLiveDB(t *testing.T) {
 	}
 	stub.mu.Lock()
 	defer stub.mu.Unlock()
-	if len(stub.createLabels) != 1 || stub.createLabels[0] != "PRD" {
-		t.Fatalf("CreateIssue labels = %v, want exactly [PRD] — issue creation must write the PRIMARY, never the run-eligible set", stub.createLabels)
+	if len(stub.createLabels) != 1 || stub.createLabels[0] != "uzi" {
+		t.Fatalf("CreateIssue labels = %v, want exactly [uzi] — issue creation must write the uzi label", stub.createLabels)
 	}
 }
 
-// TestJudgeFileWritesPrimaryNotEligibleSetLiveDB is the explicitly-named M4 guard for
-// the judge FILE writer (review_issue_file.go). The harness's eligible set is {PRD,
-// bug}; the filed issue must carry exactly [PRD, PRDLESS] and never "bug".
-func TestJudgeFileWritesPrimaryNotEligibleSetLiveDB(t *testing.T) {
+// TestJudgeFileWritesUziLabelLiveDB is the guard for the judge FILE writer
+// (review_issue_file.go): the filed issue must carry exactly [uzi] (PRD #764).
+func TestJudgeFileWritesUziLabelLiveDB(t *testing.T) {
 	h, pool, _, box, fs := fileIssueLiveDB(t)
 	ctx := context.Background()
 	f := seedFileFixture(ctx, t, pool, store.New(pool), box, fs.server.URL)
@@ -274,20 +268,14 @@ func TestJudgeFileWritesPrimaryNotEligibleSetLiveDB(t *testing.T) {
 		t.Fatalf("forge creates = %d, want 1", fs.count())
 	}
 	got := fs.creates[0].Labels
-	if len(got) != 2 || got[0] != "PRD" || got[1] != "PRDLESS" {
-		t.Fatalf("filed labels = %v, want exactly [PRD PRDLESS] — the judge writer must use the PRIMARY, never the run-eligible set", got)
-	}
-	for _, l := range got {
-		if l == "bug" {
-			t.Fatalf("filed labels %v contain a run-eligible-set member; the writer must write the PRIMARY only", got)
-		}
+	if len(got) != 1 || got[0] != "uzi" {
+		t.Fatalf("filed labels = %v, want exactly [uzi] — the judge writer must use the uzi label", got)
 	}
 }
 
-// TestJudgeDraftWritesPrimaryNotEligibleSetLiveDB is the explicitly-named M4 guard for
-// the judge DRAFT writer (review_issue_draft.go): the draft it renders must display
-// the PRIMARY label set [PRD, PRDLESS], never a run-eligible-set member.
-func TestJudgeDraftWritesPrimaryNotEligibleSetLiveDB(t *testing.T) {
+// TestJudgeDraftWritesUziLabelLiveDB is the guard for the judge DRAFT writer
+// (review_issue_draft.go): the draft it renders must display exactly [uzi].
+func TestJudgeDraftWritesUziLabelLiveDB(t *testing.T) {
 	h, pool, _, box, fs := fileIssueLiveDB(t)
 	ctx := context.Background()
 	f := seedFileFixture(ctx, t, pool, store.New(pool), box, fs.server.URL)
@@ -302,7 +290,7 @@ func TestJudgeDraftWritesPrimaryNotEligibleSetLiveDB(t *testing.T) {
 		t.Fatalf("decode draft: %v", err)
 	}
 	got := resp.Draft.Labels
-	if len(got) != 2 || got[0] != "PRD" || got[1] != "PRDLESS" {
-		t.Fatalf("draft labels = %v, want exactly [PRD PRDLESS] — the draft must use the PRIMARY, never the run-eligible set", got)
+	if len(got) != 1 || got[0] != "uzi" {
+		t.Fatalf("draft labels = %v, want exactly [uzi] — the draft must use the uzi label", got)
 	}
 }

@@ -1188,7 +1188,7 @@ func TestScheduleGetLastFireBlock(t *testing.T) {
 			{IssueIID: ptrInt64(158), RunID: "run_c81a", Title: "Fix the thing"},
 		},
 		Skips: []apitypes.LastFireSkip{
-			{IssueIID: ptrInt64(96), Title: "A raw bug report", Reason: "no_prd_link"},
+			{IssueIID: ptrInt64(96), Title: "A raw bug report", Reason: "not_eligible"},
 			{IssueIID: ptrInt64(97), Title: "Already in flight", Reason: "already_running"},
 		},
 	}
@@ -1203,7 +1203,7 @@ func TestScheduleGetLastFireBlock(t *testing.T) {
 		"Last fire:",
 		"fired 2026-08-13T09:00:00Z · examined 3 · started 1 · skipped 2",
 		"#158 → run run_c81a  Fix the thing",
-		"#96  no PRD link  A raw bug report", // reason LABEL, not the raw wire string
+		"#96  not eligible  A raw bug report", // reason LABEL, not the raw wire string
 		"#97  already running  Already in flight",
 	} {
 		if !strings.Contains(out, want) {
@@ -1216,7 +1216,7 @@ func TestScheduleGetLastFireBlock(t *testing.T) {
 		t.Errorf("capped hint shown despite a started run\n%s", out)
 	}
 	// The raw wire strings must never reach the user in the human block.
-	if strings.Contains(out, "no_prd_link") || strings.Contains(out, "already_running") {
+	if strings.Contains(out, "not_eligible") || strings.Contains(out, "already_running") {
 		t.Errorf("raw wire reason leaked into human output\n%s", out)
 	}
 }
@@ -1230,8 +1230,8 @@ func TestScheduleGetLastFireCappedHint(t *testing.T) {
 		Capped:  true,
 		Started: []apitypes.LastFireStarted{},
 		Skips: []apitypes.LastFireSkip{
-			{IssueIID: ptrInt64(96), Title: "raw bug", Reason: "no_prd_link"},
-			{IssueIID: ptrInt64(97), Title: "another raw bug", Reason: "no_prd_link"},
+			{IssueIID: ptrInt64(96), Title: "raw bug", Reason: "not_eligible"},
+			{IssueIID: ptrInt64(97), Title: "another raw bug", Reason: "not_eligible"},
 		},
 	}
 	fc := &uzicli.FakeClient{ScheduleByID: map[string]apitypes.ScheduleDTO{
@@ -1241,7 +1241,7 @@ func TestScheduleGetLastFireCappedHint(t *testing.T) {
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
-	if !strings.Contains(out, "newer issues not reached — raise --max-issues or add PRDLESS / a PRD link") {
+	if !strings.Contains(out, "newer issues not reached — raise --max-issues or add the uzi label") {
 		t.Errorf("capped fire missing the raise-the-cap hint\n%s", out)
 	}
 }
@@ -1317,7 +1317,7 @@ func TestScheduleRunNowBreakdown(t *testing.T) {
 		Capped:  true,
 		Started: []apitypes.LastFireStarted{{IssueIID: ptrInt64(158), RunID: "run_c81a", Title: "Fix the thing"}},
 		Skips: []apitypes.LastFireSkip{
-			{IssueIID: ptrInt64(96), Title: "raw bug", Reason: "no_prd_link"},
+			{IssueIID: ptrInt64(96), Title: "raw bug", Reason: "not_eligible"},
 			{IssueIID: ptrInt64(97), Title: "in flight", Reason: "already_running"},
 		},
 	}}
@@ -1329,14 +1329,14 @@ func TestScheduleRunNowBreakdown(t *testing.T) {
 		"Started 1 run(s) from sch_rn: run_c81a",
 		"#158 → run run_c81a  Fix the thing",
 		"Examined 3 candidate(s), skipped 2:",
-		"#96  no PRD link   # add PRDLESS / a prds link, or raise --max-issues", // LABEL + hint
+		"#96  not eligible   # add the uzi label, or raise --max-issues", // LABEL + hint
 		"#97  already running",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("run-now breakdown missing %q\n%s", want, out)
 		}
 	}
-	if strings.Contains(out, "no_prd_link") || strings.Contains(out, "already_running") {
+	if strings.Contains(out, "not_eligible") || strings.Contains(out, "already_running") {
 		t.Errorf("raw wire reason leaked into run-now output\n%s", out)
 	}
 }
@@ -1351,7 +1351,7 @@ func TestScheduleRunNowStartedNothing(t *testing.T) {
 		Matched: 1,
 		Capped:  true,
 		Started: []apitypes.LastFireStarted{},
-		Skips:   []apitypes.LastFireSkip{{IssueIID: ptrInt64(96), Title: "raw bug", Reason: "no_prd_link"}},
+		Skips:   []apitypes.LastFireSkip{{IssueIID: ptrInt64(96), Title: "raw bug", Reason: "not_eligible"}},
 	}}
 	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "run-now", "sch_rn")
 	if code != uzicli.ExitOK {
@@ -1360,7 +1360,7 @@ func TestScheduleRunNowStartedNothing(t *testing.T) {
 	for _, want := range []string{
 		"Started 0 runs from sch_rn.",
 		"Examined 1 candidate(s), skipped 1:",
-		"#96  no PRD link   # add PRDLESS / a prds link, or raise --max-issues",
+		"#96  not eligible   # add the uzi label, or raise --max-issues",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("started-nothing run-now missing %q\n%s", want, out)
@@ -1369,7 +1369,7 @@ func TestScheduleRunNowStartedNothing(t *testing.T) {
 	if strings.Contains(out, "no run started") {
 		t.Errorf("a fire that skipped candidates must NOT report 'no run started'\n%s", out)
 	}
-	if strings.Contains(out, "no_prd_link") {
+	if strings.Contains(out, "not_eligible") {
 		t.Errorf("raw wire reason leaked\n%s", out)
 	}
 }
@@ -1381,7 +1381,7 @@ func TestScheduleRunNowBreakdownJSON(t *testing.T) {
 		RunIDs:  []string{"run_c81a"},
 		Matched: 2,
 		Started: []apitypes.LastFireStarted{{IssueIID: ptrInt64(158), RunID: "run_c81a", Title: "Fix the thing"}},
-		Skips:   []apitypes.LastFireSkip{{IssueIID: ptrInt64(96), Title: "raw bug", Reason: "no_prd_link"}},
+		Skips:   []apitypes.LastFireSkip{{IssueIID: ptrInt64(96), Title: "raw bug", Reason: "not_eligible"}},
 	}}
 	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "run-now", "sch_rn", "--json")
 	if code != uzicli.ExitOK {
@@ -1391,7 +1391,7 @@ func TestScheduleRunNowBreakdownJSON(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &res); err != nil {
 		t.Fatalf("not JSON: %v\n%s", err, out)
 	}
-	if res.Matched != 2 || len(res.Skips) != 1 || res.Skips[0].Reason != "no_prd_link" {
+	if res.Matched != 2 || len(res.Skips) != 1 || res.Skips[0].Reason != "not_eligible" {
 		t.Errorf("--json did not carry the widened response intact: %+v", res)
 	}
 }

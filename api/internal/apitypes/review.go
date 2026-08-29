@@ -21,7 +21,7 @@ type RecommendationDTO struct {
 // stripped + secret-scanned server-side, but this draft is NOT the security boundary —
 // M3 re-applies the write-boundary controls to the client's POST body. default_repo_id
 // is a pre-selection ("" when no default resolves, mock state D); labels are assembled
-// server-side (PRD + PRDLESS, never autopilot); provenance names whose worker produced
+// server-side (the single uzi run-eligibility label, never autopilot); provenance names whose worker produced
 // the (attacker-influencable) text so an admin filing another user's review sees it.
 type IssueDraftDTO struct {
 	DefaultRepoID string   `json:"default_repo_id"`

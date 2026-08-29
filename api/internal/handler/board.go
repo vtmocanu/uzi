@@ -67,7 +67,7 @@ type cardDTO struct {
 	// NOT NULL), for the board's "Last updated" sort mode (PRD #102 M5).
 	//
 	// It must be set by BOTH card builders — assembleCards AND issueToCard. Missing
-	// it in issueToCard (the single-card path, behind MoveIssue, SetIssuePrdless AND
+	// it in issueToCard (the single-card path, behind MoveIssue, PromoteIssue AND
 	// CreateIssue in handler/issues.go — three call sites, not the two this comment
 	// named until 2026-07-27) is silent: the card comes back with the zero time,
 	// marshals as "0001-01-01T00:00:00Z", and instantly sinks to the bottom in Last
@@ -194,8 +194,8 @@ func mapLatestRun(runID, ownerID uuid.UUID, status string, kind string, iteratio
 
 // setLatestRunRevising stamps issue #750's derived is_revising flag on a
 // single-card latest-run DTO. The board-wide path (assembleCards) uses the batch
-// PlanRevisingForRuns map; the single-card refresh responses (drag, prdless toggle,
-// promote) go through here so a revising run keeps the flag — otherwise the card
+// PlanRevisingForRuns map; the single-card refresh responses (drag, promote) go
+// through here so a revising run keeps the flag — otherwise the card
 // would blank it and pop the attention ring back until the next full board poll.
 // Best-effort like the batch path: the flag is decoration, so a query error just
 // leaves it false rather than failing the response.
@@ -224,10 +224,6 @@ type boardDTO struct {
 	// Pipeline is the repo's default-branch CI status (PRD #6, the board header
 	// badge), null when there is no cached default-branch pipeline.
 	Pipeline *apitypes.PipelineDTO `json:"pipeline"`
-	// BoardExtraLabels is the admin-configured default set of board membership
-	// extras (PRD #196). The client falls back to it while the user has no saved
-	// set (per-user storage is M3). Membership is primary ∪ extras (Decision 2).
-	BoardExtraLabels []string `json:"board_extra_labels"`
 }
 
 // ── Board ───────────────────────────────────────────────────────────────────
@@ -437,20 +433,14 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 	// per-card MR/PR noun (all cards on one board share the repo's connection).
 	cards := assembleCards(issues, runRows, cardPipelines, position, repo.UserID, repo.ForgeType, revising)
 
-	// Board membership extras default (PRD #196), best-effort like the other
-	// settings reads: the admin default the client falls back to when the user has
-	// no saved set (per-user storage is M3).
-	extra, _ := h.settings.BoardExtraLabels(r.Context())
-
 	return boardDTO{
-		RepoID:           repo.ID.String(),
-		Path:             repo.PathWithNamespace,
-		WebURL:           repo.WebUrl,
-		ForgeType:        repo.ForgeType,
-		Columns:          columns,
-		Cards:            cards,
-		Pipeline:         repoPipeline,
-		BoardExtraLabels: extra,
+		RepoID:    repo.ID.String(),
+		Path:      repo.PathWithNamespace,
+		WebURL:    repo.WebUrl,
+		ForgeType: repo.ForgeType,
+		Columns:   columns,
+		Cards:     cards,
+		Pipeline:  repoPipeline,
 	}, true
 }
 
@@ -903,108 +893,11 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"card": card})
 }
 
-// ── PRDLESS label toggle ──────────────────────────────────────────────────────
-
-type prdlessRequest struct {
-	Apply bool `json:"apply"`
-}
-
-// SetIssuePrdless applies or removes the configured PRDLESS label on an issue
-// directly from the uzi UI (PRD #22 M4, Decision 10). The label name is resolved
-// server-side from settings — the client never names it — so this endpoint only
-// ever touches the one escape-hatch label, never arbitrary labels. It is
-// forge-first (the label write lands on GitLab before the cache) and rides the
-// per-user forge limiter like move/sync. When the feature is disabled
-// instance-wide it 422s (the label could still be applied from GitLab's own UI,
-// but uzi will not). Returns the refreshed card with its latest_run re-hydrated,
-// exactly like MoveIssue, so a single-card replace never blanks the run badge.
-func (h *Handler) SetIssuePrdless(w http.ResponseWriter, r *http.Request) {
-	repo, ok := h.repoForRequest(w, r)
-	if !ok {
-		return
-	}
-	iid, err := parseInt64(chi.URLParam(r, "iid"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid issue id")
-		return
-	}
-	var req prdlessRequest
-	if err := httpx.DecodeJSON(r, &req); err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	// Feature gate: the label endpoint is inert when prdless is disabled
-	// instance-wide (Decision 10).
-	enabled, err := h.settings.PrdlessEnabled(r.Context())
-	if err != nil {
-		slog.Error("prdless: read settings", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-	if !enabled {
-		httpx.Error(w, http.StatusUnprocessableEntity, "the PRDLESS label feature is disabled")
-		return
-	}
-	// PrdlessLabel already falls back to the compiled-in default when unset, so
-	// label is never empty here.
-	label, _ := h.settings.PrdlessLabel(r.Context())
-
-	issue, err := h.q.GetIssueByIID(r.Context(), store.GetIssueByIIDParams{RepoID: repo.ID, ForgeIssueIid: iid})
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			httpx.Error(w, http.StatusNotFound, "issue not found")
-			return
-		}
-		slog.Error("prdless: get issue", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-
-	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
-	if err != nil {
-		slog.Error("build forge for connection", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-	// Forge-first single-label add/remove + incremental cache update
-	// (forgesvc.SetIssueLabel). On failure the cache is untouched and the client
-	// keeps showing the pre-toggle state (no optimistic update on the web side).
-	updated, err := h.svc.SetIssueLabel(r.Context(), f, repo.ForgeProjectID, issue, label, forgesvc.PrdlessLabelColor, req.Apply)
-	if err != nil {
-		httpx.Error(w, http.StatusBadGateway, "could not update the issue label on the forge: "+err.Error())
-		return
-	}
-
-	cols, err := h.q.ListBoardColumns(r.Context(), repo.ID)
-	if err != nil {
-		slog.Error("list board columns", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-	position := make(map[string]int, len(cols))
-	for _, c := range cols {
-		position[c.LabelName] = int(c.Position)
-	}
-	card := issueToCard(updated, position, repo.ForgeType)
-	// Carry the issue's latest run on the single-card response (like MoveIssue), so
-	// a toggle never blanks the run badge the board/issue view is showing.
-	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
-		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.Kind, lr.IterationCount, lr.HasPlanMd.Bool, lr.MrIid, lr.MrWebUrl,
-			lr.MrState, lr.FailureReason, lr.StopKind, lr.Health, lr.HealthReason, lr.HealthSince,
-			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
-		h.setLatestRunRevising(r.Context(), card.LatestRun, lr.ID) // issue #750
-	} else if !errors.Is(err, pgx.ErrNoRows) {
-		slog.Warn("latest run for prdless card", "error", err)
-	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"card": card})
-}
-
-// promotable reports whether an issue may be given the PRD label from the board
+// promotable reports whether an issue may be given the uzi label from the board
 // (PRD #102 Decision 13a). The one exclusion is uzi's own self-improvement
 // tracking issue, which carries schedsvc.SelfImproveTrackingLabel deliberately INSTEAD
-// of a PRD or autopilot label, is open on uzi's own repo, and is therefore cached and
-// rendered by M6's additive fetch like any other non-PRD card.
+// of a uzi or autopilot label, is open on uzi's own repo, and is therefore cached and
+// rendered by M6's additive fetch like any other non-uzi card.
 //
 // A pure predicate rather than an inline check because the handler cannot be unit
 // tested (h.q is a concrete *store.Queries) and this is the part worth testing.
@@ -1012,28 +905,23 @@ func promotable(labels []string) bool {
 	return !slices.Contains(labels, schedsvc.SelfImproveTrackingLabel)
 }
 
-// PromoteIssue applies the configured PRD label to a non-PRD issue, forge-first
-// (PRD #102 Decision 15). One click makes a card uzi's work: it becomes runnable
-// (the Decision 14 gate reads the same label), it stops depending on the toggle to
-// be visible, and it loses the dashed treatment.
+// PromoteIssue applies the configured uzi run-eligibility label (PRD #764) to a
+// non-uzi issue, forge-first (PRD #102 Decision 15). One click makes a card uzi's
+// work: it becomes runnable (the run gate reads the same label), it stops depending
+// on the toggle to be visible, and it loses the dashed treatment.
 //
-// Mechanically the PRDLESS toggle's shape, with three differences that are not
-// incidental:
-//
-//   - It is apply-only. There is no demote (Decision 15): removing a label in the
-//     forge's own UI is easy and nobody has asked for the button.
-//   - The auto-created label is pinned to PrdLabelColor, not the PRDLESS amber.
-//     Naive reuse of SetIssueLabel would create a missing PRD label in the escape
-//     hatch's color, which is the trap Decision 15 names.
-//   - It refuses the self-improvement tracking issue (Decision 13a). That issue is
-//     open on uzi's own repo, carries TrackingLabel deliberately INSTEAD of a PRD
-//     or autopilot label, and the additive fetch is what makes it visible on the
-//     board at all. Promoting it would slap the PRD label onto internal machinery
-//     and let a self-improve run be started by hand from a card.
+// It is apply-only. There is no demote (Decision 15): removing a label in the
+// forge's own UI is easy and nobody has asked for the button. The auto-created
+// label is pinned to a color (forgesvc.PromoteLabelColor) because SetIssueLabel's
+// apply path auto-creates a missing label and GitLab's label-create API requires
+// one. It refuses the self-improvement tracking issue (Decision 13a): that issue is
+// open on uzi's own repo, carries TrackingLabel deliberately INSTEAD of a uzi or
+// autopilot label, and the additive fetch is what makes it visible on the board at
+// all. Promoting it would slap the uzi label onto internal machinery and let a
+// self-improve run be started by hand from a card.
 //
 // Returns the refreshed card with its latest_run re-hydrated, exactly like
-// MoveIssue and SetIssuePrdless, so a single-card replace never blanks the run
-// badge.
+// MoveIssue, so a single-card replace never blanks the run badge.
 func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 	repo, ok := h.repoForRequest(w, r)
 	if !ok {
@@ -1045,9 +933,9 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// PRDLabel already falls back to the compiled-in default when unset, so label is
+	// UziLabel already falls back to the compiled-in default when unset, so label is
 	// never empty here.
-	label, _ := h.settings.PRDLabel(r.Context())
+	label, _ := h.settings.UziLabel(r.Context())
 
 	issue, err := h.q.GetIssueByIID(r.Context(), store.GetIssueByIIDParams{RepoID: repo.ID, ForgeIssueIid: iid})
 	if err != nil {
@@ -1078,7 +966,7 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 	// failure the cache is untouched and the client keeps showing the pre-promote
 	// state. Applying a label the issue already carries is a local no-op success
 	// with no forge call, so a double click costs nothing.
-	updated, err := h.svc.SetIssueLabel(r.Context(), f, repo.ForgeProjectID, issue, label, forgesvc.PrdLabelColor, true)
+	updated, err := h.svc.SetIssueLabel(r.Context(), f, repo.ForgeProjectID, issue, label, forgesvc.PromoteLabelColor, true)
 	if err != nil {
 		httpx.Error(w, http.StatusBadGateway, "could not update the issue label on the forge: "+err.Error())
 		return
@@ -1108,7 +996,7 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 
 // issueToCard resolves a cached issue row into a card DTO. forgeType stamps the
 // card's forge for the per-card MR/PR noun (PRD #65 D2), from the repo's connection.
-// Three production callers: MoveIssue, SetIssuePrdless and CreateIssue (issues.go).
+// Three production callers: MoveIssue, PromoteIssue and CreateIssue (issues.go).
 func issueToCard(is store.Issue, position map[string]int, forgeType string) cardDTO {
 	labels := decodeLabels(is.Labels)
 	col, closed, conflict := board.ResolveColumn(labels, is.State, position)
@@ -1124,7 +1012,7 @@ func issueToCard(is store.Issue, position map[string]int, forgeType string) card
 		Closed:     closed,
 		Conflict:   conflict,
 		// Sibling of assembleCards' — this is the single-card path (MoveIssue,
-		// SetIssuePrdless), and omitting it here is the silent half of the bug
+		// PromoteIssue), and omitting it here is the silent half of the bug
 		// cardDTO.ForgeUpdatedAt describes: only a just-dragged card would carry the
 		// zero time, so every other card looks right.
 		ForgeUpdatedAt: is.ForgeUpdatedAt.Time,
@@ -1139,8 +1027,8 @@ func issueToCard(is store.Issue, position map[string]int, forgeType string) card
 // ── Manual sync ─────────────────────────────────────────────────────────────
 
 // SyncRepo runs an on-demand full sync (the Refresh button): fetch the complete
-// PRD set, upsert, and evict anything gone forge-side. Returns the refreshed
-// board so the client updates in one round-trip.
+// uzi-labeled set, upsert, and evict anything gone forge-side. Returns the
+// refreshed board so the client updates in one round-trip.
 func (h *Handler) SyncRepo(w http.ResponseWriter, r *http.Request) {
 	repo, ok := h.repoForRequest(w, r)
 	if !ok {

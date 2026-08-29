@@ -92,7 +92,6 @@ var (
 	ErrRunNotOwned   = errors.New("run not owned by worker")
 	ErrRepoNotFound  = errors.New("repo not found")
 	ErrIssueNotFound = errors.New("issue not found")
-	ErrNoPRDLink     = errors.New("issue has no PRD link")
 	// ErrNotPRDIssue rejects a run on an issue that does not carry the configured
 	// run-eligibility label (PRD #764 M1: the uzi_label) → 422. This is now the SINGLE
 	// eligibility gate — an issue without the uzi_label is not uzi's to run, PRD link
@@ -4741,10 +4740,10 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		}
 		return store.Run{}, err
 	}
-	// The RUN-ELIGIBILITY gate (PRD #764 M1): an issue is uzi's to run iff it carries
-	// the configured uzi_label. This is now the SINGLE gate — a run no longer requires
-	// a PRD link, a PRDLESS escape-hatch, or an admin waiver (Gate B removed). A linked
-	// prds/*.md is still detected and implemented when present, but never required.
+	// The RUN-ELIGIBILITY gate (PRD #764): an issue is uzi's to run iff it carries the
+	// configured uzi_label. This is the SINGLE gate — a run no longer requires a PRD
+	// link or any escape-hatch/waiver label. A linked prds/*.md is still detected and
+	// implemented when present, but never required.
 	//
 	// Derived from the cached labels rather than a fresh forge read: the same jsonb the
 	// board renders the card from, so the button a user sees and the gate the server

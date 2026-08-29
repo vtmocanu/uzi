@@ -136,20 +136,20 @@ func TestPRDLinkPatchAcceptsTheIssuesOwnPRD(t *testing.T) {
 	}
 }
 
-// A PRDLESS run's snapshot carries no PRD link, so the binding makes Decision 12's
+// A link-less run's snapshot carries no PRD link, so the binding makes Decision 12's
 // no-op MECHANICAL rather than prompt-level — no forge write can happen even if the
 // lead declares a path anyway. Differs from the honest twin ONLY in the snapshot.
-func TestPRDLinkPatchIsAMechanicalNoOpForAPRDLESSRun(t *testing.T) {
+func TestPRDLinkPatchIsAMechanicalNoOpForALinklessRun(t *testing.T) {
 	s, st, f, _ := newPRDFixture(t, func(c *store.ListPRDLinkPatchCandidatesRow, _ *fakeStore, _ *fakeForge) {
-		c.IssueDescription = "A PRDLESS issue. No spec file for this one."
+		c.IssueDescription = "An issue with no spec file for this one."
 	})
 	runPRDPatch(t, s, f)
 	enumerated(t, st)
 	if len(f.descriptionUpdates) != 0 {
-		t.Fatalf("a PRDLESS run must never rewrite a description: %+v", f.descriptionUpdates)
+		t.Fatalf("a link-less run must never rewrite a description: %+v", f.descriptionUpdates)
 	}
 	if len(f.getIssueCalls) != 0 {
-		t.Errorf("no network access for a PRDLESS run; got %v", f.getIssueCalls)
+		t.Errorf("no network access for a link-less run; got %v", f.getIssueCalls)
 	}
 }
 

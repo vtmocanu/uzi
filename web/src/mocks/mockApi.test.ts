@@ -45,9 +45,8 @@ describe("mockApi settings persistence (demo survives reload)", () => {
         appSettings: {
           prd_label: "Feature",
           autopilot_label: "autopilot",
+          uzi_label: "runnable",
           default_theme: "mission",
-          prdless_enabled: "false",
-          prdless_label: "NOSPEC",
           slack_enabled: "true",
           public_base_url: "https://uzi.example",
           judge_enabled: "false",
@@ -62,9 +61,6 @@ describe("mockApi settings persistence (demo survives reload)", () => {
           health_approval_seconds: "3600",
           health_nudge_cooldown_seconds: "1800",
           docker_repo_allowlist: "",
-          run_eligible_labels: "Feature,bug",
-          board_extra_labels: "bug",
-          eligible_label_waives_prd_link: "true",
         },
       }),
     });
@@ -77,9 +73,8 @@ describe("mockApi settings persistence (demo survives reload)", () => {
     const app = (await api.getSettings()).settings;
     expect(app.default_theme).toBe("mission");
     expect(app.prd_label).toBe("Feature");
-    // The prdless keys round-trip too (PRD #22 M1 brought them into app_settings).
-    expect(app.prdless_enabled).toBe("false");
-    expect(app.prdless_label).toBe("NOSPEC");
+    // The uzi run-eligibility label round-trips too (PRD #764).
+    expect(app.uzi_label).toBe("runnable");
     // The Slack non-secret keys round-trip too (PRD #25 M1).
     expect(app.slack_enabled).toBe("true");
     expect(app.public_base_url).toBe("https://uzi.example");

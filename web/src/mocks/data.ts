@@ -1387,7 +1387,7 @@ const boardFixtures: Record<string, Board> = {
         iid: 31,
         title: "Add CSV export to the runs list",
         state: "opened",
-        labels: ["PRD"],
+        labels: ["uzi"],
         web_url: uziUrl(31),
         author: "mira",
         forge_type: "gitlab",
@@ -1403,7 +1403,7 @@ const boardFixtures: Record<string, Board> = {
         iid: 29,
         title: "Retry failed forge column moves with backoff",
         state: "opened",
-        labels: ["PRD"],
+        labels: ["uzi"],
         web_url: uziUrl(29),
         author: "vlad",
         forge_type: "gitlab",
@@ -1431,7 +1431,7 @@ const boardFixtures: Record<string, Board> = {
         // most people click (web-ux S7). "Ready" is this card's own column and is
         // correctly chipless — which is why a naive "the fixture has labels" check
         // would not have caught it.
-        labels: ["PRD", "Ready", "enhancement"],
+        labels: ["uzi", "Ready", "enhancement"],
         web_url: uziUrl(27),
         author: "vlad",
         forge_type: "gitlab",
@@ -1454,7 +1454,7 @@ const boardFixtures: Record<string, Board> = {
         iid: 26,
         title: "Board card badges for MR pipeline status",
         state: "opened",
-        labels: ["PRD", "Ready"],
+        labels: ["uzi", "Ready"],
         web_url: uziUrl(26),
         author: "andrei",
         forge_type: "gitlab",
@@ -1477,7 +1477,7 @@ const boardFixtures: Record<string, Board> = {
         iid: 24,
         title: "Worker heartbeat metrics endpoint",
         state: "opened",
-        labels: ["PRD", "In progress"],
+        labels: ["uzi", "In progress"],
         web_url: uziUrl(24),
         author: "vlad",
         forge_type: "gitlab",
@@ -1509,7 +1509,7 @@ const boardFixtures: Record<string, Board> = {
         iid: 22,
         title: "Per-run cost budget with hard stop",
         state: "opened",
-        labels: ["PRD", "In progress", "Review", "bug"],
+        labels: ["uzi", "In progress", "Review", "bug"],
         web_url: uziUrl(22),
         author: "mira",
         forge_type: "gitlab",
@@ -1537,7 +1537,7 @@ const boardFixtures: Record<string, Board> = {
         iid: 23,
         title: "Stream run logs to the CLI with backpressure",
         state: "opened",
-        labels: ["PRD", "In progress"],
+        labels: ["uzi", "In progress"],
         web_url: uziUrl(23),
         author: "mira",
         forge_type: "gitlab",
@@ -1564,7 +1564,7 @@ const boardFixtures: Record<string, Board> = {
         iid: 21,
         title: "Plan-approval notifications via email",
         state: "opened",
-        labels: ["PRD", "Review"],
+        labels: ["uzi", "Review"],
         web_url: uziUrl(21),
         author: "vlad",
         forge_type: "gitlab",
@@ -1590,7 +1590,7 @@ const boardFixtures: Record<string, Board> = {
         iid: 25,
         title: "Debounce the board poll while a drag is in flight",
         state: "opened",
-        labels: ["PRD", "Review"],
+        labels: ["uzi", "Review"],
         web_url: uziUrl(25),
         author: "mira",
         forge_type: "gitlab",
@@ -1615,7 +1615,7 @@ const boardFixtures: Record<string, Board> = {
         iid: 28,
         title: "Backfill run credential history for the audit log",
         state: "opened",
-        labels: ["PRD", "In progress"],
+        labels: ["uzi", "In progress"],
         web_url: uziUrl(28),
         author: "mira",
         forge_type: "gitlab",
@@ -1637,7 +1637,7 @@ const boardFixtures: Record<string, Board> = {
         iid: 18,
         title: "Run view: fold tool results under their calls",
         state: "closed",
-        labels: ["PRD"],
+        labels: ["uzi"],
         web_url: uziUrl(18),
         author: "vlad",
         forge_type: "gitlab",
@@ -1664,7 +1664,7 @@ const boardFixtures: Record<string, Board> = {
         iid: 12,
         title: "Retry the flaky worker heartbeat probe",
         state: "opened",
-        labels: ["PRD", "In progress"],
+        labels: ["uzi", "In progress"],
         web_url: uziUrl(12),
         author: "vlad",
         forge_type: "gitlab",
@@ -1688,7 +1688,7 @@ const boardFixtures: Record<string, Board> = {
         iid: 15,
         title: "Encrypt per-user Anthropic tokens at rest",
         state: "closed",
-        labels: ["PRD"],
+        labels: ["uzi"],
         web_url: uziUrl(15),
         author: "vlad",
         forge_type: "gitlab",
@@ -1713,20 +1713,15 @@ const boardFixtures: Record<string, Board> = {
         }),
         pipeline: null,
       },
-      // ── Non-PRD issues (PRD #102 M6) ────────────────────────────────────────
-      // The toggle is default-off, so without these the demo build ships a control
-      // that visibly does nothing. They are ordinary open issues of the kind any repo
-      // has: one carrying a content label, one carrying none at all — the shape a
-      // freshly filed issue takes, and the shape whose labels used to marshal as JSON
-      // null.
-      //
-      // PRD #196: a `bug`-only issue. `bug` ships in BOTH default lists, so this card
-      // is on the board out of the box (membership = primary ∪ extras) AND runnable
-      // (the run-eligible default is PRD,bug) — it offers Start run directly, no
-      // Promote and no PRDLESS, with no prds/*.md link (the non-primary waiver). Its
-      // `bug` chip is highlighted and hoisted ahead of the cap; `web` rides along
-      // plain. The `documentation` card just below is the contrast: visible-only, so
-      // it offers Promote instead. This is the §4/§7 headline of the mock.
+      // ── Non-uzi issues (PRD #764) ───────────────────────────────────────────
+      // The "Show all other issues" toggle is default-off, so without these the demo
+      // build ships a control that visibly does nothing. They are ordinary open issues
+      // of the kind any repo has, none carrying the `uzi` label — so they are hidden
+      // until "Show all" is ticked, and each offers Promote (add `uzi`) rather than
+      // Start run. One carries content labels, one carries a `bug` selector, one carries
+      // none at all (the shape a freshly filed issue takes, and the shape whose labels
+      // used to marshal as JSON null). The `documentation` card just below is the same
+      // shape. This is the show-all / Promote headline of the mock.
       {
         iid: 32,
         title: "Board drag drops the card on Safari 17",
@@ -1817,7 +1812,7 @@ const boardFixtures: Record<string, Board> = {
         iid: 9,
         title: "Rate-limit the public search endpoint",
         state: "opened",
-        labels: ["PRD"],
+        labels: ["uzi"],
         web_url: atlasUrl(9),
         author: "andrei",
         forge_type: "gitlab",
@@ -1833,7 +1828,7 @@ const boardFixtures: Record<string, Board> = {
         iid: 8,
         title: "OpenAPI spec drift check in CI",
         state: "opened",
-        labels: ["PRD", "Ready"],
+        labels: ["uzi", "Ready"],
         web_url: atlasUrl(8),
         author: "mira",
         forge_type: "gitlab",
@@ -1849,7 +1844,7 @@ const boardFixtures: Record<string, Board> = {
         iid: 7,
         title: "Postgres connection pool tuning",
         state: "opened",
-        labels: ["PRD", "Doing"],
+        labels: ["uzi", "Doing"],
         web_url: atlasUrl(7),
         author: "vlad",
         forge_type: "gitlab",
@@ -1873,7 +1868,7 @@ const boardFixtures: Record<string, Board> = {
         iid: 5,
         title: "Healthcheck should ping the DB pool",
         state: "closed",
-        labels: ["PRD"],
+        labels: ["uzi"],
         web_url: atlasUrl(5),
         author: "vlad",
         forge_type: "gitlab",
@@ -3160,7 +3155,7 @@ export const mockRuns: Run[] = [
     issue_iid: 34,
     issue_title: "Add a --since filter to `uzi run list`",
     issue_description:
-      "Filter the runs list by age. Started from a plan authored locally in Claude Code (PRDLESS + --plan-file).",
+      "Filter the runs list by age. Started from a plan authored locally in Claude Code (--plan-file).",
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -5140,7 +5135,7 @@ export const mockProposals: IssueProposal[] = [
     title: "Add a worker metrics dashboard",
     description:
       "Surface per-worker heartbeat freshness, active-run count, and template drift on one page, reading the existing /api/metrics/workers data. Idea sketched at https://example.com/metrics-notes — worth a quick spike first.",
-    labels: ["PRD", "enhancement"],
+    labels: ["uzi", "enhancement"],
     status: "pending",
     created_at: minsAgo(3),
   },

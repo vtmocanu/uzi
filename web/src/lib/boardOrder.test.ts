@@ -560,22 +560,22 @@ describe("dropIntent", () => {
 // column — on the same person's other browser, where the toggle happens to be on.
 describe("freeze-test 3: a freeze taken with cards hidden", () => {
   const columnKeys = [""];
-  // One lane, PRD and non-PRD interleaved. The interleaving is the point: with the
+  // One lane, uzi and non-uzi interleaved. The interleaving is the point: with the
   // hidden cards grouped at one end, an implementation that appended them instead of
   // preserving their positions would still pass.
   const payloadCards = [
-    aCard({ iid: 10, column: "", labels: ["PRD"] }),
+    aCard({ iid: 10, column: "", labels: ["uzi"] }),
     aCard({ iid: 20, column: "", labels: ["bug"] }),
-    aCard({ iid: 30, column: "", labels: ["PRD"] }),
+    aCard({ iid: 30, column: "", labels: ["uzi"] }),
     aCard({ iid: 40, column: "", labels: [] }),
-    aCard({ iid: 50, column: "", labels: ["PRD"] }),
+    aCard({ iid: 50, column: "", labels: ["uzi"] }),
   ];
   const hidden = [20, 40];
 
   it("leaves the hidden cards' relative order unchanged", () => {
-    // A viewer with show-all OFF and a PRD-only membership sees 10, 30, 50 and drags
-    // 50 to the top. (PRD #196 M1 generalised visibleCards to take a membership set.)
-    const seen = visibleCards(payloadCards, ["PRD"], false);
+    // A viewer with show-all OFF sees only the `uzi` cards 10, 30, 50 and drags 50 to
+    // the top (PRD #764: membership is the single `uzi` label).
+    const seen = visibleCards(payloadCards, "uzi", false);
     expect(seen.map((c) => c.iid)).toEqual([10, 30, 50]);
 
     const out = dropIntent({
@@ -601,7 +601,7 @@ describe("freeze-test 3: a freeze taken with cards hidden", () => {
     // The positive control. Without it "the hidden cards are in the list" is a claim
     // about a fixture, not about the implementation.
     const broken = dropIntent({
-      payloadCards: visibleCards(payloadCards, ["PRD"], false),
+      payloadCards: visibleCards(payloadCards, "uzi", false),
       columnKeys,
       sortMode: "manual",
       sortDir: "desc",

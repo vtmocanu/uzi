@@ -343,20 +343,17 @@ func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 // best-effort: a cold settings read yields the compiled-in defaults, never an
 // error, so a session response is never blocked on settings.
 //
-// The PRD #196 eligible set and PRD-link waiver ride this payload (not just the
+// The PRD #764 run-eligibility label (uzi_label) rides this payload (not just the
 // board payload) because the issue view is the board's second consumer of the
-// eligibility predicate and has no board payload — it reads these from useAuth().
-// They also feed the card's Start/Promote eligibility affordance, which has no
-// board payload of its own to carry them.
+// eligibility predicate and has no board payload — it reads it from useAuth(). It
+// also feeds the card's Start/Promote eligibility affordance, which has no board
+// payload of its own to carry it.
 func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[string]any {
-	prdLabel, _ := h.settings.PRDLabel(ctx)
 	autopilotLabel, _ := h.settings.AutopilotLabel(ctx)
-	// PRD #764 M1: the single run-eligibility label the SPA reads to render the "add
+	// PRD #764: the single run-eligibility label the SPA reads to render the "add
 	// the uzi label" runnable affordance. Best-effort like the other labels — a cold
 	// settings read yields the compiled-in default ("uzi"), never an error.
 	uziLabel, _ := h.settings.UziLabel(ctx)
-	runEligible, _ := h.settings.RunEligibleLabels(ctx)
-	waiver, _ := h.settings.EligibleLabelWaivesPRDLink(ctx)
 	// Theme resolution (PRD #21 Decision 2): the SPA needs three values, not just
 	// the resolved theme. With an override active, the Appearance picker also has
 	// to render "Use default (<name>)" and set its selected state, and the default
@@ -368,13 +365,6 @@ func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[strin
 	if user.Theme.Valid {
 		override = user.Theme.String
 	}
-	// PRDLESS bootstrap (PRD #22 M3): the SPA gates the label toggle and the
-	// PRDLESS badge on prdless_enabled and needs the label name. prdless_enabled is
-	// this payload's first bool field (the labels are strings); the typed accessor
-	// backs it. Best-effort like the rest: a cold settings read yields the
-	// compiled-in defaults (enabled, "PRDLESS"), never an error.
-	prdlessLabel, _ := h.settings.PrdlessLabel(ctx)
-	prdlessEnabled, _ := h.settings.PrdlessEnabled(ctx)
 	// Judge consent surface (PRD #69 M4): a non-admin cannot read
 	// /api/admin/settings, so the two facts the user needs to consent to their own
 	// token being spent ride the session payload. Both are resolved server-side and
@@ -403,20 +393,12 @@ func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[strin
 	}
 	return map[string]any{
 		"user":            toDTO(user),
-		"prd_label":       prdLabel,
 		"autopilot_label": autopilotLabel,
-		// PRD #764 M1: the single run-eligibility label.
-		"uzi_label":       uziLabel,
-		"theme":           theme.Resolve(override, defaultTheme),
-		"theme_override":  textPtrValue(override != "", override),
-		"default_theme":   defaultTheme,
-		"prdless_label":   prdlessLabel,
-		"prdless_enabled": prdlessEnabled,
-		// PRD #196: the admin-configured run-eligible label set and the PRD-link
-		// waiver bool. The SPA renders the card/issue-view Start affordance from the
-		// eligible set and the waiver.
-		"run_eligible_labels":            runEligible,
-		"eligible_label_waives_prd_link": waiver,
+		// PRD #764: the single run-eligibility label.
+		"uzi_label":      uziLabel,
+		"theme":          theme.Resolve(override, defaultTheme),
+		"theme_override": textPtrValue(override != "", override),
+		"default_theme":  defaultTheme,
 		// Vault status (PRD #32): the SPA shows a 🔒 badge + unlock banner and marks
 		// own queued runs "waiting for vault unlock" when locked. Delivered on the
 		// session payload so the shell needs no extra round-trip; the SPA refreshes

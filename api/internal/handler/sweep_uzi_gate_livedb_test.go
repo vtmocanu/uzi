@@ -24,7 +24,7 @@ import (
 //   - The `["bug","uzi"]` issue FIRES — a runs row is created for it — even though it has
 //     has_prd_link=false and NO prds link. That last part is the fail-pre-change
 //     discriminator: pre-PRD #764 M1 the removed PRD-link gate (Gate B) would have refused
-//     a link-less swept issue with ErrNoPRDLink, so no run row.
+//     a link-less swept issue with the old no-PRD-link sentinel, so no run row.
 //   - The `["bug"]`-only issue (bare selector, no `uzi`) is a benign not_eligible skip and
 //     produces NO run row — the real uzi_label gate refuses it with ErrNotPRDIssue.
 //   - The SCHEDULE ADVANCES: next_fire_at moves to a future instant and status stays
@@ -61,11 +61,11 @@ func (b sweepGateBuilder) ForgeForConnection(string, string, []byte) (forge.Forg
 }
 
 // sweepGateSettings satisfies schedsvc.SettingsReader. The sweep selector below is an
-// explicit ["bug"], so resolveSweepLabels never falls back to PRDLabel — this is here only
+// explicit ["bug"], so resolveSweepLabels never falls back to UziLabel — this is here only
 // to hand New a non-nil reader.
 type sweepGateSettings struct{}
 
-func (sweepGateSettings) PRDLabel(context.Context) (string, error) { return "PRD", nil }
+func (sweepGateSettings) UziLabel(context.Context) (string, error) { return "uzi", nil }
 
 func TestSweepFiresOnlyUziLabelledCandidateLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")

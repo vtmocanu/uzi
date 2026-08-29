@@ -164,7 +164,7 @@ export function ScheduleModal({
   // hands the read-only default off to the caller to clone into an editable user row.
   onCloneToEdit?: (s: Schedule) => void;
 }) {
-  const { prdLabel } = useAuth();
+  const { uziLabel } = useAuth();
   const isEdit = !!editing;
   // A catalog default (PRD #589) is catalog-owned: its target/prompt/labels/guidance are
   // read-only (shown as the baked, sealed values) and only the cadence, model, and run
@@ -755,8 +755,9 @@ export function ScheduleModal({
                     />
                   </div>
                   <p className="text-[11px] text-faint">
-                    Empty ⇒ the <span className="font-medium text-muted">{prdLabel}</span> label. A selector chooses
-                    candidates; the run-creation gate (PRD link, or PRDLESS) chooses what actually fires.
+                    Empty ⇒ the <span className="font-medium text-muted">{uziLabel}</span> label. A selector chooses
+                    candidates; a candidate fires only when it also carries the{" "}
+                    <span className="font-medium text-muted">{uziLabel}</span> label.
                   </p>
                   {/* Sweep-warn (success criterion 6): a selector label missing on a chosen
                       repo means the sweep matches nothing — advisory, never blocking. Edit

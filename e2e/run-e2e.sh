@@ -382,7 +382,7 @@ fresh_code() {
 apiput_code() { curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" -X PUT "$BASE$1" \
   -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)" -d "$2"; }
 # apipost_code — like apipost but never -f: echoes only the HTTP status, for
-# asserting a 422 (the PRDLESS run-create gate and the disabled label endpoint).
+# asserting a 422 (the uzi run-eligibility gate refusing a non-uzi issue).
 apipost_code() { curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" -X POST "$BASE$1" \
   -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)" -d "$2"; }
 
@@ -636,8 +636,10 @@ add_label_event() {
 # ADDER. Echoes the new issue iid.
 create_autopilot_issue() {
   local iid
+  # PRD #764 D7: autopilot candidacy requires BOTH the autopilot label AND the uzi
+  # run-eligibility label (the query repointed from the PRD label to uzi_label).
   iid="$(fake_post /_e2e/issues \
-    "$(jq -nc --arg t "$1" --arg d "$2" --arg a "$4" '{title:$t,description:$d,labels:["PRD","autopilot"],author:$a}')" \
+    "$(jq -nc --arg t "$1" --arg d "$2" --arg a "$4" '{title:$t,description:$d,labels:["uzi","autopilot"],author:$a}')" \
     | jq -r '.iid')"
   [ -n "$iid" ] && [ "$iid" != null ] || fail "could not stage autopilot issue on the fake"
   add_label_event "$iid" add "$3"
@@ -2993,22 +2995,26 @@ sleep 4   # 2 poll ticks (2s each): a duplicate would appear within a couple of 
 [ "$(note_count "$IID_FL")" = 1 ] || fail "failure path posted more than one comment"
 pass "exactly one failure comment (fixed template + run link), no failure_reason echoed"
 
-# --- autopilot #5: PRD-link gate ---------------------------------------------
-say "autopilot #5: PRD-link gate — autopilot label on an issue with no PRD link → comment, no run"
+# --- autopilot #5: no PRD link is no longer a gate (PRD #764) -----------------
+# Pre-change (Gate B), a uzi+autopilot issue with no prds/*.md link got a "no PRD
+# link" comment and NO run. Post-PRD #764 a PRD link is optional: the same issue now
+# starts an unattended autopilot run. This is the fail-pre-change discriminator on
+# the autopilot path.
+say "autopilot #5: no PRD link is no longer a gate — a uzi+autopilot issue with no link runs"
 IID_NP="$(create_autopilot_issue "E2E autopilot no-prd" \
   "This issue points at no plan file whatsoever." owner-alice owner-alice)"
-wait_notes "$IID_NP" 1 40
-notes_text "$IID_NP" | grep -qF "no PRD link" || fail "expected the no-PRD-link comment"
-assert_no_run_for_issue "$IID_NP" 4  # 2 poll ticks (2s each): act + confirm-stable (Decision 5, PRD #97 M5)
-pass "one 'no PRD link' comment, no run"
+RUN_NP="$(wait_run_for_issue "$IID_NP" 40)"
+[ -n "$RUN_NP" ] && [ "$RUN_NP" != null ] || fail "a uzi+autopilot issue with no PRD link must now start a run"
+wait_status "$RUN_NP" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+pass "a uzi+autopilot issue with no PRD link runs unattended to completion ($RUN_NP)"
 
 # --- autopilot #4: carry-item e2e (settings race + username collision) -------
 say "carry-item: concurrent cross-key settings PUT — the FOR UPDATE serialization rejects the equal-label race"
 # Two concurrent single-key PUTs that each pass the cache precheck but together would
-# land prd_label == autopilot_label. Exactly one commits; the other is rejected (400),
-# whether by the in-tx FOR UPDATE cross-key check (true race) or the cache precheck
-# (if it lost the race). Same admin session, two concurrent requests = two txns.
-( apiput_code /api/admin/settings '{"settings":{"prd_label":"SHARED"}}'       > "$RUNROOT/race.a" ) &
+# land uzi_label == autopilot_label (PRD #764). Exactly one commits; the other is
+# rejected (400), whether by the in-tx FOR UPDATE cross-key check (true race) or the
+# cache precheck (if it lost the race). Same admin session, two concurrent requests = two txns.
+( apiput_code /api/admin/settings '{"settings":{"uzi_label":"SHARED"}}'        > "$RUNROOT/race.a" ) &
 ( apiput_code /api/admin/settings '{"settings":{"autopilot_label":"SHARED"}}' > "$RUNROOT/race.b" ) &
 wait
 CA="$(cat "$RUNROOT/race.a")"; CB="$(cat "$RUNROOT/race.b")"
@@ -3020,7 +3026,7 @@ done
   || fail "concurrent cross-key PUT: expected one 200 + one 400, got $CA and $CB"
 pass "concurrent cross-key settings PUT: exactly one accepted, one rejected (got $CA / $CB)"
 # Restore the defaults so nothing downstream sees a half-applied label swap.
-apiput /api/admin/settings '{"settings":{"prd_label":"PRD","autopilot_label":"autopilot"}}' >/dev/null
+apiput /api/admin/settings '{"settings":{"uzi_label":"uzi","autopilot_label":"autopilot"}}' >/dev/null
 
 say "carry-item: human_username collision — a second user claiming the same forge username on the same host is 409"
 JAR2="$RUNROOT/u2.jar"
@@ -3144,71 +3150,55 @@ wait_verdict "$AFIX" verified 20
 pass "agent-branch fix pipeline passed -> run $AFIX stamped verified"
 
 # =============================================================================
-# PRD #22 — PRDLESS escape hatch: an issue carrying the PRDLESS label runs with no
-# prds/*.md link, gated by the admin toggle; the label is applied/removed from
-# uzi's own UI (forge-first) via POST .../prdless. Exercises the run-create gate
-# (422 when disabled, run when enabled) and the toggle endpoint (apply/remove on
-# the fake forge + 422 when the feature is off).
-say "PRD #22: PRDLESS escape hatch (gate bypass + UI label toggle)"
+# PRD #764 — `uzi` is the SINGLE run-eligibility gate. An issue carrying the `uzi`
+# label runs with no prds/*.md link; an issue WITHOUT `uzi` is refused (422). The
+# label is applied from uzi's own UI (forge-first) via POST .../promote, which makes
+# a previously non-runnable issue runnable.
+say "PRD #764: uzi run-eligibility gate (no PRD link required + Promote)"
 
-# Stage a PRD+PRDLESS issue with NO prds/*.md link (a human labelling it for the
-# escape hatch — uzi's own CreateIssue only stamps the PRD label), then FullSync so
-# uzi caches it (has_prd_link=false). The fresh GetIssue the run-create path reads
-# returns the PRDLESS label from the fake, which is what the bypass decides on.
-IID_PL="$(fake_post /_e2e/issues \
-  "$(jq -nc '{title:"E2E prdless run",description:"tiny fix, no plan file here",labels:["PRD","PRDLESS"]}')" | jq -r '.iid')"
-[ -n "$IID_PL" ] && [ "$IID_PL" != null ] || fail "could not stage the PRDLESS issue on the fake"
+# Stage a uzi-labelled issue with NO prds/*.md link, then FullSync so uzi caches it
+# (has_prd_link=false). The uzi gate reads the cached labels — a link is optional now.
+IID_UZ="$(fake_post /_e2e/issues \
+  "$(jq -nc '{title:"E2E uzi run",description:"tiny fix, no plan file here",labels:["uzi"]}')" | jq -r '.iid')"
+[ -n "$IID_UZ" ] && [ "$IID_UZ" != null ] || fail "could not stage the uzi issue on the fake"
 apipost "/api/repos/$REPO_ID/sync" '' >/dev/null
-apiget "/api/repos/$REPO_ID/board" | jq -e --argjson iid "$IID_PL" \
+apiget "/api/repos/$REPO_ID/board" | jq -e --argjson iid "$IID_UZ" \
   '.board.cards[] | select(.iid==$iid) | .has_prd_link==false' >/dev/null \
-  || fail "staged PRDLESS issue #$IID_PL not cached with has_prd_link=false"
-pass "staged PRD+PRDLESS issue #$IID_PL (no PRD link), cached"
+  || fail "staged uzi issue #$IID_UZ not cached with has_prd_link=false"
+pass "staged uzi issue #$IID_UZ (no PRD link), cached"
 
-# A uzi-created issue for the toggle path — starts with only the PRD label.
-IID_TG="$(apipost "/api/repos/$REPO_ID/issues" \
-  '{"title":"E2E prdless toggle","description":"no plan file here either"}' | jq -r '.card.iid')"
-[ -n "$IID_TG" ] && [ "$IID_TG" != null ] || fail "could not create the toggle issue"
+# Stage a NON-uzi issue (a bare selector) for the refusal + Promote path.
+IID_NU="$(fake_post /_e2e/issues \
+  "$(jq -nc '{title:"E2E non-uzi",description:"no plan file here either",labels:["bug"]}')" | jq -r '.iid')"
+[ -n "$IID_NU" ] && [ "$IID_NU" != null ] || fail "could not stage the non-uzi issue on the fake"
+apipost "/api/repos/$REPO_ID/sync" '' >/dev/null
 
-# --- feature OFF: the label bypasses nothing, and the endpoint refuses ---------
-apiput /api/admin/settings '{"settings":{"prdless_enabled":"false"}}' >/dev/null
-C="$(apipost_code "/api/repos/$REPO_ID/runs" "{\"issue_iid\":$IID_PL}")"
-[ "$C" = 422 ] || fail "prdless disabled: run-create on the labelled no-PRD issue should 422, got $C"
-pass "feature off: run-create on the PRDLESS-labelled no-PRD issue → 422"
+# --- a NON-uzi issue is refused ------------------------------------------------
+C="$(apipost_code "/api/repos/$REPO_ID/runs" "{\"issue_iid\":$IID_NU}")"
+[ "$C" = 422 ] || fail "non-uzi issue: run-create should 422, got $C"
+pass "a non-uzi issue is refused with 422 (add the uzi label to run it)"
 
-C="$(apipost_code "/api/repos/$REPO_ID/issues/$IID_TG/prdless" '{"apply":true}')"
-[ "$C" = 422 ] || fail "prdless disabled: the label endpoint should 422, got $C"
-pass "feature off: POST .../prdless → 422"
+# --- a uzi issue with no PRD link runs the normal lifecycle --------------------
+RUN_UZ="$(create_run "$REPO_ID" "$IID_UZ")" || fail "uzi run-create failed (non-transient; see stderr)"
+[ -n "$RUN_UZ" ] && [ "$RUN_UZ" != null ] || fail "uzi run was not created (gate failed)"
+wait_status "$RUN_UZ" awaiting_approval
+pass "run $RUN_UZ started with no PRD link and reached the plan gate"
+apipost "/api/runs/$RUN_UZ/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+wait_status "$RUN_UZ" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+[ "$(apiget "/api/runs/$RUN_UZ" | jq -r '.run.branch')" = "agent/issue-$IID_UZ" ] \
+  || fail "uzi run did not push agent/issue-$IID_UZ"
+MR_UZ="$(apiget "/api/runs/$RUN_UZ" | jq -r '.run.mr_iid')"
+{ [ "$MR_UZ" != null ] && [ "$MR_UZ" -gt 0 ]; } || fail "uzi run opened no MR (got $MR_UZ)"
+pass "uzi run completed the normal lifecycle (branch agent/issue-$IID_UZ, MR !$MR_UZ)"
 
-# --- feature ON: the label bypasses the gate; the endpoint applies/removes ------
-apiput /api/admin/settings '{"settings":{"prdless_enabled":"true"}}' >/dev/null
-
-RUN_PL="$(create_run "$REPO_ID" "$IID_PL")" || fail "prdless-enabled run-create failed (non-transient; see stderr)"
-[ -n "$RUN_PL" ] && [ "$RUN_PL" != null ] || fail "prdless-enabled run was not created (gate bypass failed)"
-wait_status "$RUN_PL" awaiting_approval
-pass "feature on: run $RUN_PL started with no PRD link and reached the plan gate"
-apipost "/api/runs/$RUN_PL/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
-wait_status "$RUN_PL" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
-[ "$(apiget "/api/runs/$RUN_PL" | jq -r '.run.branch')" = "agent/issue-$IID_PL" ] \
-  || fail "PRDLESS run did not push agent/issue-$IID_PL"
-MR_PL="$(apiget "/api/runs/$RUN_PL" | jq -r '.run.mr_iid')"
-{ [ "$MR_PL" != null ] && [ "$MR_PL" -gt 0 ]; } || fail "PRDLESS run opened no MR (got $MR_PL)"
-pass "PRDLESS run completed the normal lifecycle (branch agent/issue-$IID_PL, MR !$MR_PL)"
-
-# UI toggle apply: the label lands on the fake forge and the returned card reflects it.
-CARD="$(apipost "/api/repos/$REPO_ID/issues/$IID_TG/prdless" '{"apply":true}')"
-echo "$CARD" | jq -e '.card.labels | index("PRDLESS") != null' >/dev/null \
-  || fail "apply: returned card labels missing PRDLESS: $(echo "$CARD" | jq -c '.card.labels')"
-wait_eq yes 20 "apply: PRDLESS written to the fake forge issue #$IID_TG" \
-  fake_has_label "$IID_TG" PRDLESS
-pass "toggle apply: PRDLESS on the fake forge + reflected in the card"
-
-# UI toggle remove: the label is gone from the fake forge and the card.
-CARD="$(apipost "/api/repos/$REPO_ID/issues/$IID_TG/prdless" '{"apply":false}')"
-echo "$CARD" | jq -e '.card.labels | index("PRDLESS") == null' >/dev/null \
-  || fail "remove: returned card still carries PRDLESS"
-wait_eq no 20 "remove: PRDLESS gone from the fake forge issue #$IID_TG" \
-  fake_has_label "$IID_TG" PRDLESS
-pass "toggle remove: PRDLESS gone from the fake forge + the card"
+# UI Promote: the uzi label lands on the fake forge and the returned card reflects it,
+# making the previously non-uzi issue runnable.
+CARD="$(apipost "/api/repos/$REPO_ID/issues/$IID_NU/promote" '')"
+echo "$CARD" | jq -e '.card.labels | index("uzi") != null' >/dev/null \
+  || fail "promote: returned card labels missing uzi: $(echo "$CARD" | jq -c '.card.labels')"
+wait_eq yes 20 "promote: uzi written to the fake forge issue #$IID_NU" \
+  fake_has_label "$IID_NU" uzi
+pass "promote: uzi label on the fake forge + reflected in the card, issue now runnable"
 
 # =============================================================================
 # PRD #32 — per-user vault (password-wrapped secrets). Proves: the seeded token is
@@ -3407,7 +3397,7 @@ pass "persist-first: a judge_review inbox notification landed for the reviewed r
 
 # --- PRD #68: file a forge issue from a judge recommendation -------------------
 # Filing a recommendation templates + sanitizes a draft server-side, creates a REAL
-# issue on the fake forge labelled exactly PRD+PRDLESS (never autopilot), persists the
+# issue on the fake forge labelled exactly [uzi] (never autopilot; PRD #764), persists the
 # link, and enqueues NO run — filing an issue and spending tokens on a run stay
 # separate human decisions.
 #
@@ -3445,13 +3435,13 @@ F_REC="$F_REC_IDS"
 [ "$F_REC" != null ] || fail "PRD #68: the install_worker_tool/jq recommendation has a null id"
 
 # The draft GET is owner-scoped, templates the body, and carries the server-assembled
-# PRD+PRDLESS labels (never autopilot, never from the request body).
+# uzi label (never autopilot, never from the request body; PRD #764).
 F_DRAFT="$(apiget "/api/runs/$J_RUN/review/recommendations/$F_REC/issue-draft")"
-echo "$F_DRAFT" | jq -e '.draft.labels == ["PRD","PRDLESS"]' >/dev/null \
-  || fail "PRD #68: the issue-draft must carry server-side labels [PRD, PRDLESS] (got $(echo "$F_DRAFT" | jq -c '.draft.labels'))"
+echo "$F_DRAFT" | jq -e '.draft.labels == ["uzi"]' >/dev/null \
+  || fail "PRD #68: the issue-draft must carry server-side labels [uzi] (got $(echo "$F_DRAFT" | jq -c '.draft.labels'))"
 echo "$F_DRAFT" | jq -e '.draft.labels | index("autopilot") | not' >/dev/null \
   || fail "PRD #68: the draft must NEVER carry the autopilot label"
-pass "issue-draft templated with server-side labels PRD+PRDLESS (no autopilot)"
+pass "issue-draft templated with the server-side uzi label (no autopilot)"
 
 F_RUNS_BEFORE="$(db_psql "SELECT count(*) FROM runs")"
 
@@ -3462,12 +3452,12 @@ F_IID="$(echo "$F_RESP" | jq -r '.issue.iid')"
 { [ -n "$F_IID" ] && [ "$F_IID" != null ]; } || fail "PRD #68: filing did not return a created issue iid ($F_RESP)"
 pass "filed issue #$F_IID on the forge from the recommendation"
 
-# The FORGE truth: the bot-created issue carries exactly PRD+PRDLESS, never autopilot.
-fake_state | jq -e --argjson iid "$F_IID" '.issues[] | select(.iid==$iid) | (.labels | sort) == ["PRD","PRDLESS"]' >/dev/null \
-  || fail "PRD #68: the filed forge issue #$F_IID must be labelled exactly PRD+PRDLESS (got $(fake_state | jq -c --argjson iid "$F_IID" '.issues[] | select(.iid==$iid) | .labels'))"
+# The FORGE truth: the bot-created issue carries exactly [uzi], never autopilot.
+fake_state | jq -e --argjson iid "$F_IID" '.issues[] | select(.iid==$iid) | (.labels | sort) == ["uzi"]' >/dev/null \
+  || fail "PRD #68: the filed forge issue #$F_IID must be labelled exactly [uzi] (got $(fake_state | jq -c --argjson iid "$F_IID" '.issues[] | select(.iid==$iid) | .labels'))"
 fake_state | jq -e --argjson iid "$F_IID" '.issues[] | select(.iid==$iid) | (.labels | index("autopilot") | not)' >/dev/null \
   || fail "PRD #68: the filed forge issue #$F_IID must NOT carry autopilot"
-pass "the filed forge issue #$F_IID is labelled exactly PRD+PRDLESS (no autopilot)"
+pass "the filed forge issue #$F_IID is labelled exactly [uzi] (no autopilot)"
 
 # Nothing auto-starts: filing enqueues NO run. No run row was added, and none exists for
 # the filed issue — it is startable on the board, but only a human Start spends tokens.
@@ -3485,14 +3475,13 @@ F_DUP_CODE="$(apipost_code "/api/runs/$J_RUN/review/recommendations/$F_REC/issue
 [ "$F_DUP_CODE" = 409 ] || fail "PRD #68: re-filing the same coordinate must 409 (got $F_DUP_CODE)"
 pass "re-filing the same recommendation is a 409 — one issue per coordinate (persisted link)"
 
-# Headline success criterion: on an instance with prdless_enabled ON (the shipped
-# default, as the PRD #22 leg established), the filed PRD+PRDLESS issue is STARTABLE on
-# the FIRST Start click — the PRDLESS label bypasses the PRD-file-link requirement, so
-# createRun does NOT reject with ErrNoPRDLink (a 422 would make create_run return non-zero).
+# Headline success criterion (PRD #764): the filed issue carries the `uzi` label, so it
+# is STARTABLE on the FIRST Start click — the single uzi_label gate passes and no PRD-file
+# link is required, so createRun does NOT reject it (a 422 would make create_run return non-zero).
 F_START_RUN="$(create_run "$REPO_ID" "$F_IID")" \
-  || fail "PRD #68: the filed issue #$F_IID was NOT startable — createRun rejected it (ErrNoPRDLink?); a PRD+PRDLESS issue must start on the first click"
+  || fail "PRD #68: the filed issue #$F_IID was NOT startable — createRun rejected it; a uzi-labelled issue must start on the first click"
 { [ -n "$F_START_RUN" ] && [ "$F_START_RUN" != null ]; } || fail "PRD #68: no run id returned for the filed issue #$F_IID"
-pass "the filed PRD+PRDLESS issue #$F_IID started a run ($F_START_RUN) on the first Start — no PRD-file link needed (no ErrNoPRDLink)"
+pass "the filed uzi issue #$F_IID started a run ($F_START_RUN) on the first Start — no PRD-file link needed"
 
 # Clean up: cancel this run so it does not hold worker capacity in the later PRD #42
 # concurrency section (a normal issue run parks at the plan gate). Best-effort cancel +
@@ -6020,4 +6009,4 @@ apipost "/api/runs/$RUN_B/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 
 # who did not watch the output learns what was in it — so a phase that lands without
 # being named here is invisible in exactly the summary people quote. PRD #98 was missing:
 # its M8c printed-instruction phase landed at 4b94f714 without touching this line.
-printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #41 plan-revision + PRD #42 bounded concurrency + PRD #68 file-issue + PRD #98 judge menu + PRD #47 run-health + PRD #53 rate-limits + PRD #95 steer-queue + PRD #104 token binding + PRD #88 ask-user + PRD #35 usage-limit park + PRD #108 auto-stop%s; executor=%s)\n' "${DOCKER_PROFILE:+ + PRD #83 docker sidecar}" "$EXECUTOR"
+printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #764 uzi-eligibility + PRD #32 vault + PRD #39 chat + PRD #41 plan-revision + PRD #42 bounded concurrency + PRD #68 file-issue + PRD #98 judge menu + PRD #47 run-health + PRD #53 rate-limits + PRD #95 steer-queue + PRD #104 token binding + PRD #88 ask-user + PRD #35 usage-limit park + PRD #108 auto-stop%s; executor=%s)\n' "${DOCKER_PROFILE:+ + PRD #83 docker sidecar}" "$EXECUTOR"

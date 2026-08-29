@@ -40,7 +40,7 @@ function aCard(over: Partial<Card> = {}): Card {
     iid: 7,
     title: "Add a metrics dashboard",
     state: "opened",
-    labels: ["PRD"],
+    labels: ["uzi"],
     web_url: "https://gitlab.example.com/g/r/-/issues/7",
     forge_type: "gitlab",
     author: "someone",
@@ -82,11 +82,7 @@ function renderCard(
         onStart={vi.fn()}
         fixCiBusy={false}
         onFixCi={vi.fn()}
-        prdlessEnabled={false}
-        prdlessLabel="PRDLESS"
-        prdlessBusy={false}
-        onTogglePrdless={vi.fn()}
-        prdLabel="PRD"
+        uziLabel="uzi"
         isEligible={props.isEligible ?? true}
         canPromote={props.canPromote ?? false}
         promoting={props.promoting ?? false}
@@ -166,7 +162,7 @@ describe("IssueCard label chips (PRD #102 M4)", () => {
     // all eleven tests still passed (reviewer m-1). The row is queryable because it
     // carries role="group" aria-label="Labels", which is also what makes the label set
     // announceable rather than a bare div.
-    renderCard({ labels: ["PRD", "autopilot"] }, []);
+    renderCard({ labels: ["uzi", "autopilot"] }, []);
     expect(screen.queryByRole("group", { name: "Labels" })).toBeNull();
   });
 
@@ -238,6 +234,33 @@ describe("IssueCard label chips (PRD #102 M4)", () => {
     const { container } = renderCard({}, ["se\u202Ecurity"]);
     expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
     expect(screen.getByText("security")).toBeTruthy();
+  });
+});
+
+// PRD #764. The card carries a neutral "PRD" presence badge when its issue links a PRD,
+// and a runnable card (isEligible) offers Start run \u2014 the positive assertions that keep
+// the "old PRDLESS/no-PRD-link badges are gone" checks from being a vacuous green.
+describe("IssueCard \u2014 PRD presence badge + runnable marker (PRD #764)", () => {
+  it("renders the neutral PRD badge when the card links a PRD", () => {
+    renderCard({ has_prd_link: true });
+    expect(screen.getByTitle("This issue links a prds/*.md file")).toBeTruthy();
+  });
+
+  it("does not render the PRD badge when the card has no PRD link", () => {
+    // Paired with the positive above: the badge is keyed on has_prd_link, not always on.
+    renderCard({ has_prd_link: false });
+    expect(screen.queryByTitle("This issue links a prds/*.md file")).toBeNull();
+  });
+
+  it("offers Start run on a runnable (uzi) card \u2014 the runnable marker", () => {
+    renderCard({}, [], undefined, { isEligible: true });
+    expect(screen.getByRole("button", { name: /Start run/ })).toBeTruthy();
+  });
+
+  it("offers Promote instead of Start run on a non-runnable card", () => {
+    renderCard({}, [], undefined, { isEligible: false, canPromote: true });
+    expect(screen.getByRole("button", { name: /Promote to uzi/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Start run/ })).toBeNull();
   });
 });
 
@@ -324,7 +347,7 @@ describe("Board — the Backlog rename is display-only (PRD #102 Decision 14a)",
     // The card WEARS its column label as well as sitting in that column — without
     // that, the column-exclusion arm of the predicate is never exercised here and a
     // fold that drops it still passes.
-    cards: [aCard({ iid: 7, column: "In Progress", labels: ["PRD", "In Progress", "bug"] })],
+    cards: [aCard({ iid: 7, column: "In Progress", labels: ["uzi", "In Progress", "bug", "autopilot"] })],
     pipeline: null,
     ...over,
   });
@@ -343,12 +366,8 @@ describe("Board — the Backlog rename is display-only (PRD #102 Decision 14a)",
     vi.mocked(useAuth).mockReturnValue({
       user: null,
       loading: false,
-      prdLabel: "PRD",
+      uziLabel: "uzi",
       autopilotLabel: "autopilot",
-      prdlessLabel: "PRDLESS",
-      prdlessEnabled: false,
-      runEligibleLabels: ["PRD", "bug"],
-      eligibleLabelWaivesPrdLink: true,
       theme: "ember",
       themeOverride: null,
       defaultTheme: "ember",
@@ -402,16 +421,18 @@ describe("Board — the Backlog rename is display-only (PRD #102 Decision 14a)",
     expect(mockApi.moveIssue).toHaveBeenCalledWith("repo-1", 7, "Planned");
   });
 
-  it("chips a card's content labels and not its column or workflow labels", async () => {
-    // The board-level half of M4: the exclusion set is board.columns + the configured
-    // PRD/autopilot/PRDLESS names, both of which live here and not in the card.
+  it("chips a card's content labels and not its column or autopilot marker", async () => {
+    // The board-level half of M4 (PRD #764): the exclusion set is board.columns + the
+    // configured autopilot label. `uzi` is no longer special to chipLabels — it chips.
     renderBoard();
     await screen.findByText("Backlog");
     const lane = laneFor("In Progress");
     expect(within(lane).getByText("bug")).toBeTruthy();
-    // "PRD" is the configured membership label; "In Progress" is this card's own
-    // column and already names the lane it sits in.
-    expect(within(lane).queryByText("PRD")).toBeNull();
+    // `uzi` chips as an ordinary content label now.
+    expect(within(lane).getByText("uzi")).toBeTruthy();
+    // "autopilot" is the workflow marker (excluded from chips, no board-card badge), and
+    // "In Progress" is this card's own column and already names the lane it sits in.
+    expect(within(lane).queryByText("autopilot")).toBeNull();
     expect(within(lane).getAllByText("In Progress")).toHaveLength(1);
   });
 });
@@ -450,12 +471,12 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
   // genuinely differ, because where they coincide an implementation that falls back to
   // iid passes.
   const cards = () => [
-    aCard({ iid: 1, title: "issue one", column: "", labels: ["PRD"], forge_updated_at: "2026-01-01T00:00:00Z" }),
-    aCard({ iid: 2, title: "issue two", column: "", labels: ["PRD"], forge_updated_at: "2026-02-01T00:00:00Z" }),
-    aCard({ iid: 3, title: "issue three", column: "", labels: ["PRD"], forge_updated_at: "2026-03-01T00:00:00Z" }),
-    aCard({ iid: 4, title: "issue four", column: "", labels: ["PRD"], forge_updated_at: "2026-04-01T00:00:00Z" }),
-    aCard({ iid: 9, title: "issue nine", column: "Planned", labels: ["PRD"], forge_updated_at: "2026-05-01T00:00:00Z" }),
-    aCard({ iid: 99, title: "issue closed", column: "", labels: ["PRD"], closed: true, forge_updated_at: "2026-06-01T00:00:00Z" }),
+    aCard({ iid: 1, title: "issue one", column: "", labels: ["uzi"], forge_updated_at: "2026-01-01T00:00:00Z" }),
+    aCard({ iid: 2, title: "issue two", column: "", labels: ["uzi"], forge_updated_at: "2026-02-01T00:00:00Z" }),
+    aCard({ iid: 3, title: "issue three", column: "", labels: ["uzi"], forge_updated_at: "2026-03-01T00:00:00Z" }),
+    aCard({ iid: 4, title: "issue four", column: "", labels: ["uzi"], forge_updated_at: "2026-04-01T00:00:00Z" }),
+    aCard({ iid: 9, title: "issue nine", column: "Planned", labels: ["uzi"], forge_updated_at: "2026-05-01T00:00:00Z" }),
+    aCard({ iid: 99, title: "issue closed", column: "", labels: ["uzi"], closed: true, forge_updated_at: "2026-06-01T00:00:00Z" }),
   ];
 
   const aBoard = (over: Partial<BoardData> = {}): BoardData => ({
@@ -474,12 +495,8 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
     vi.mocked(useAuth).mockReturnValue({
       user: null,
       loading: false,
-      prdLabel: "PRD",
+      uziLabel: "uzi",
       autopilotLabel: "autopilot",
-      prdlessLabel: "PRDLESS",
-      prdlessEnabled: false,
-      runEligibleLabels: ["PRD", "bug"],
-      eligibleLabelWaivesPrdLink: true,
       theme: "ember",
       themeOverride: null,
       defaultTheme: "ember",
@@ -989,10 +1006,10 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
     // plus open cards 1,2 in Backlog so a keyboard reorder has a valid neighbour. No card
     // 99/9, so the Closed lane holds exactly [15,18] and the observation is unambiguous.
     const twoClosed = (): Card[] => [
-      aCard({ iid: 1, title: "issue one", column: "", labels: ["PRD"], forge_updated_at: "2026-01-01T00:00:00Z" }),
-      aCard({ iid: 2, title: "issue two", column: "", labels: ["PRD"], forge_updated_at: "2026-02-01T00:00:00Z" }),
-      aCard({ iid: 15, title: "issue fifteen", column: "", closed: true, labels: ["PRD"], forge_updated_at: "2026-09-01T00:00:00Z" }),
-      aCard({ iid: 18, title: "issue eighteen", column: "", closed: true, labels: ["PRD"], forge_updated_at: "2026-08-01T00:00:00Z" }),
+      aCard({ iid: 1, title: "issue one", column: "", labels: ["uzi"], forge_updated_at: "2026-01-01T00:00:00Z" }),
+      aCard({ iid: 2, title: "issue two", column: "", labels: ["uzi"], forge_updated_at: "2026-02-01T00:00:00Z" }),
+      aCard({ iid: 15, title: "issue fifteen", column: "", closed: true, labels: ["uzi"], forge_updated_at: "2026-09-01T00:00:00Z" }),
+      aCard({ iid: 18, title: "issue eighteen", column: "", closed: true, labels: ["uzi"], forge_updated_at: "2026-08-01T00:00:00Z" }),
     ];
 
     // 1. Toggle renders; DISABLED in Manual, ENABLED once a non-manual mode is chosen.
@@ -1120,7 +1137,7 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
 // hands the wrong array to either consumer — measured, not assumed: mutating
 // Board.tsx to freeze the RENDERED set left all 1316 tests green before this
 // describe existed.
-describe("Board — non-PRD issues (PRD #102 M6)", () => {
+describe("Board — non-uzi issues (PRD #764)", () => {
   function installStorage(): Map<string, string> {
     const m = new Map<string, string>();
     Object.defineProperty(window, "localStorage", {
@@ -1141,15 +1158,15 @@ describe("Board — non-PRD issues (PRD #102 M6)", () => {
 
   let store: Map<string, string>;
 
-  // PRD and non-PRD cards INTERLEAVED by iid in one lane. The interleaving is
-  // load-bearing for the freeze case: with the non-PRD cards grouped at one end, an
+  // uzi and non-uzi cards INTERLEAVED by iid in one lane. The interleaving is
+  // load-bearing for the freeze case: with the non-uzi cards grouped at one end, an
   // implementation that appended them rather than keeping their positions passes.
   const cards = () => [
-    aCard({ iid: 1, title: "issue one", column: "", labels: ["PRD"] }),
+    aCard({ iid: 1, title: "issue one", column: "", labels: ["uzi"] }),
     aCard({ iid: 2, title: "issue two", column: "", labels: ["bug"], has_prd_link: false }),
-    aCard({ iid: 3, title: "issue three", column: "", labels: ["PRD"] }),
+    aCard({ iid: 3, title: "issue three", column: "", labels: ["uzi"] }),
     aCard({ iid: 4, title: "issue four", column: "", labels: [] }),
-    aCard({ iid: 5, title: "issue five", column: "", labels: ["PRD"] }),
+    aCard({ iid: 5, title: "issue five", column: "", labels: ["uzi"] }),
     aCard({ iid: 6, title: "issue tracker", column: "", labels: ["uzi-self-improve"] }),
   ];
 
@@ -1169,12 +1186,8 @@ describe("Board — non-PRD issues (PRD #102 M6)", () => {
     vi.mocked(useAuth).mockReturnValue({
       user: null,
       loading: false,
-      prdLabel: "PRD",
+      uziLabel: "uzi",
       autopilotLabel: "autopilot",
-      prdlessLabel: "PRDLESS",
-      prdlessEnabled: true,
-      runEligibleLabels: ["PRD", "bug"],
-      eligibleLabelWaivesPrdLink: true,
       theme: "ember",
       themeOverride: null,
       defaultTheme: "ember",
@@ -1198,7 +1211,7 @@ describe("Board — non-PRD issues (PRD #102 M6)", () => {
     // is not "issue two". A response that silently renames the card would pass a
     // membership check on iids and fail the one that matters.
     mockApi.promoteIssue.mockResolvedValue({
-      card: aCard({ iid: 2, title: "issue two", column: "", labels: ["PRD", "bug"], has_prd_link: false }),
+      card: aCard({ iid: 2, title: "issue two", column: "", labels: ["uzi", "bug"], has_prd_link: false }),
     });
   });
 
@@ -1225,68 +1238,13 @@ describe("Board — non-PRD issues (PRD #102 M6)", () => {
     fireEvent.click(screen.getByLabelText(/Show all other issues/));
   };
 
-  it("shows PRD plus the default-extra (bug) cards by default (PRD #196 M1)", async () => {
-    // Membership is primary ∪ extras, and DEFAULT_BOARD_EXTRA_LABELS is ["bug"], so a
-    // fresh board shows the PRD cards AND the bug card — the M1 upgrade behaviour. The
-    // unlabelled issue four and the tracker stay off.
+  it("shows only the uzi (runnable) cards by default (PRD #764)", async () => {
+    // Membership is the single `uzi` label, so a fresh board shows only the uzi cards.
+    // The bug-only card, the unlabelled issue four and the tracker stay off until "Show
+    // all other issues" is ticked.
     renderBoard();
     await screen.findByText("Backlog");
-    expect(titles()).toEqual(["issue one", "issue two", "issue three", "issue five"]);
-  });
-
-  it("suppresses an ordinary label that adds zero cards, but keeps a selected one (PRD #196 M6)", async () => {
-    // `enhancement` lives only on a PRD card, so it adds nothing to the board — the
-    // PRD's "nothing offered that matches zero cards" rule, so it must not appear as a
-    // confusing plain 0 row. `bug` (a bug-only card) adds one, so it is offered. A
-    // previously-saved extra whose cards have all left the payload (`ghost`) is kept so
-    // it stays untickable in place rather than only clearable via Reset.
-    mockApi.getBoard.mockResolvedValue({
-      board: aBoard({
-        cards: [
-          aCard({ iid: 1, title: "issue one", column: "", labels: ["PRD", "enhancement"] }),
-          aCard({ iid: 2, title: "issue two", column: "", labels: ["bug"], has_prd_link: false }),
-        ],
-      }),
-    });
-    mockApi.getBoardPrefs.mockResolvedValue({ extra_labels: ["ghost"], show_all: false });
-    renderBoard();
-    await screen.findByText("Backlog");
-    openIssues();
-    expect(screen.queryByLabelText(/^bug/)).toBeTruthy();
-    expect(screen.queryByLabelText(/^enhancement/)).toBeNull();
-    expect(screen.queryByLabelText(/^ghost/)).toBeTruthy();
-  });
-
-  it("unticking the default extra narrows the board and PUTs the absolute empty set (PRD #196 M3)", async () => {
-    renderBoard();
-    await screen.findByText("Backlog");
-    openIssues();
-    // The `bug` row is checked by default; unticking it PUTs the absolute empty set to
-    // the server (Decision 9), not localStorage.
-    fireEvent.click(screen.getByLabelText(/bug/));
     expect(titles()).toEqual(["issue one", "issue three", "issue five"]);
-    await waitFor(() =>
-      expect(mockApi.setBoardPrefs).toHaveBeenCalledWith("repo-1", { extra_labels: [], show_all: false }),
-    );
-  });
-
-  it("uses the server-delivered admin default extras over the compiled-in fallback (PRD #196 M2)", async () => {
-    const cardsWithDocs = [
-      aCard({ iid: 1, title: "issue one", column: "", labels: ["PRD"] }),
-      aCard({ iid: 2, title: "issue two", column: "", labels: ["bug"], has_prd_link: false }),
-      aCard({ iid: 7, title: "issue seven", column: "", labels: ["documentation"] }),
-    ];
-    mockApi.getBoard.mockResolvedValue({
-      board: aBoard({ cards: cardsWithDocs, board_extra_labels: ["documentation"] }),
-    });
-    renderBoard();
-    await screen.findByText("Backlog");
-    // The admin default is now `documentation`, not the const `bug`: the doc card is a
-    // member, the bug card is not (the user has no saved override).
-    expect(titles()).toEqual(["issue one", "issue seven"]);
-    // The inert-default footer reflects the payload default, not DEFAULT_BOARD_EXTRA_LABELS.
-    openIssues();
-    expect(screen.getByText(/Default: PRD, documentation/)).toBeTruthy();
   });
 
   it("adds every other open issue with 'Show all other issues' ON", async () => {
@@ -1321,38 +1279,6 @@ describe("Board — non-PRD issues (PRD #102 M6)", () => {
     await waitFor(() => expect(titles()).toContain("issue four"));
   });
 
-  it("applies a server-saved customized extras set over the admin default (PRD #196 M3)", async () => {
-    const cardsWithDocs = [
-      aCard({ iid: 1, title: "issue one", column: "", labels: ["PRD"] }),
-      aCard({ iid: 2, title: "issue two", column: "", labels: ["bug"], has_prd_link: false }),
-      aCard({ iid: 7, title: "issue seven", column: "", labels: ["documentation"], has_prd_link: false }),
-    ];
-    // Admin default is `bug`, but this user has SAVED `documentation` — the absolute
-    // set wins (Decision 9), so the doc card is a member and the bug card is not.
-    mockApi.getBoard.mockResolvedValue({ board: aBoard({ cards: cardsWithDocs }) });
-    mockApi.getBoardPrefs.mockResolvedValue({ extra_labels: ["documentation"], show_all: false });
-    renderBoard();
-    await screen.findByText("Backlog");
-    await waitFor(() => expect(titles()).toEqual(["issue one", "issue seven"]));
-  });
-
-  it("Reset re-adopts the admin default by PUTting extra_labels: null (PRD #196 M3, Decision 9)", async () => {
-    // Start from a saved narrowed set so Reset has something to undo.
-    mockApi.getBoardPrefs.mockResolvedValue({ extra_labels: [], show_all: false });
-    renderBoard();
-    await screen.findByText("Backlog");
-    // With the empty absolute set, only PRD cards show.
-    await waitFor(() => expect(titles()).toEqual(["issue one", "issue three", "issue five"]));
-    openIssues();
-    fireEvent.click(screen.getByRole("button", { name: /Reset to default/ }));
-    // Reset PUTs the sentinel null (keeping show_all), so the admin default (bug) is
-    // re-adopted and the bug card returns.
-    await waitFor(() =>
-      expect(mockApi.setBoardPrefs).toHaveBeenCalledWith("repo-1", { extra_labels: null, show_all: false }),
-    );
-    await waitFor(() => expect(titles()).toContain("issue two"));
-  });
-
   it("migrates a legacy showNonPRD:true exactly once and retires the key (open question 4)", async () => {
     // A user who had deliberately widened their board (per-browser, pre-M3) must not be
     // silently narrowed. The server row is pristine, so the legacy key seeds it once.
@@ -1375,14 +1301,14 @@ describe("Board — non-PRD issues (PRD #102 M6)", () => {
   it("freezes the cards the viewer cannot see, in their existing relative order", async () => {
     renderBoard();
     await screen.findByText("Backlog");
-    // Show-all OFF: the viewer sees the members (1, 2, 3, 5 — bug is a default extra)
-    // and moves 5 up one place. The unlabelled #4 stays hidden but must still freeze.
-    expect(titles()).toEqual(["issue one", "issue two", "issue three", "issue five"]);
+    // Show-all OFF: the viewer sees the uzi cards (1, 3, 5) and moves 5 up one place.
+    // The hidden non-uzi cards #2 and #4 stay hidden but must still freeze.
+    expect(titles()).toEqual(["issue one", "issue three", "issue five"]);
     fireEvent.click(screen.getByRole("button", { name: /Move issue #5 up in/ }));
     await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
 
     const iids = mockApi.reorderBoard.mock.calls[0][1] as number[];
-    // The hidden non-PRD cards are IN the freeze — omit them and the server's
+    // The hidden non-uzi cards are IN the freeze — omit them and the server's
     // ClearBoardOrderExcept NULLs their positions, dropping them to the bottom of the
     // lane on this same person's other browser where the toggle is on.
     expect(iids).toContain(2);
@@ -1414,101 +1340,71 @@ describe("Board — non-PRD issues (PRD #102 M6)", () => {
   const cardOf = (title: string) =>
     screen.getByRole("link", { name: title }).closest("div[class*='rounded-lg']") as HTMLElement;
 
-  it("draws a non-eligible card quiet and an eligible bug card solid (Decision 17, PRD #196 M4)", async () => {
+  it("draws a non-uzi card quiet and a uzi card solid (Decision 17, PRD #764)", async () => {
     renderBoard();
     await screen.findByText("Backlog");
-    // Show all brings the unlabelled issue four (a non-eligible card) onto the board.
+    // Show all brings the non-uzi cards (the bug card #2 and the unlabelled #4) onto the board.
     clickShowAll();
 
     // classList, not className: these are TOKEN assertions, and a substring check
     // reports "border-edge" present on any card carrying hover:border-edge-strong,
     // which every draggable card does. That is not hypothetical — the first version
     // of this test failed for exactly that reason against correct markup.
-    const nonEligible = cardOf("issue four");
-    expect(nonEligible.classList.contains("border-dashed")).toBe(true);
-    expect(nonEligible.classList.contains("border-faint")).toBe(true);
-    expect(nonEligible.classList.contains("border-edge")).toBe(false);
+    const nonUziUnlabelled = cardOf("issue four");
+    expect(nonUziUnlabelled.classList.contains("border-dashed")).toBe(true);
+    expect(nonUziUnlabelled.classList.contains("border-faint")).toBe(true);
+    expect(nonUziUnlabelled.classList.contains("border-edge")).toBe(false);
 
-    // issue two (bug) is RUNNABLE now — the eligible set includes bug — so it renders
-    // SOLID like a PRD card (mock §4), not dashed.
+    // issue two (bug, no `uzi`) is NOT runnable now — a selector without `uzi` — so it
+    // renders quiet/dashed, not solid.
     const bug = cardOf("issue two");
-    expect(bug.classList.contains("border-edge")).toBe(true);
-    expect(bug.classList.contains("border-faint")).toBe(false);
-    expect(bug.classList.contains("border-dashed")).toBe(false);
+    expect(bug.classList.contains("border-dashed")).toBe(true);
+    expect(bug.classList.contains("border-faint")).toBe(true);
+    expect(bug.classList.contains("border-edge")).toBe(false);
 
-    // An ordinary PRD card is untouched: still solid, still border-edge.
-    const prd = cardOf("issue one");
-    expect(prd.classList.contains("border-edge")).toBe(true);
-    expect(prd.classList.contains("border-faint")).toBe(false);
-    expect(prd.classList.contains("border-dashed")).toBe(false);
+    // A uzi card is solid, border-edge.
+    const uzi = cardOf("issue one");
+    expect(uzi.classList.contains("border-edge")).toBe(true);
+    expect(uzi.classList.contains("border-faint")).toBe(false);
+    expect(uzi.classList.contains("border-dashed")).toBe(false);
   });
 
-  it("offers Start run on eligible cards and Promote on the non-eligible one (Decision 15, PRD #196 M4)", async () => {
+  it("offers Start run on uzi cards and Promote on the non-uzi ones (Decision 15, PRD #764)", async () => {
     renderBoard();
     await screen.findByText("Backlog");
     clickShowAll();
     const lane = screen.getByText("Backlog").parentElement!.parentElement!;
-    // Eligible cards (1,3,5 PRD + 2 bug) offer Start run; the unlabelled #4 is the only
-    // non-eligible card and offers Promote instead.
-    expect(within(lane).getAllByRole("button", { name: /Start run/ })).toHaveLength(4);
-    expect(within(lane).getAllByRole("button", { name: /Promote to PRD/ })).toHaveLength(1);
+    // uzi cards (1, 3, 5) offer Start run; the non-uzi cards (#2 bug and unlabelled #4)
+    // offer Promote instead.
+    expect(within(lane).getAllByRole("button", { name: /Start run/ })).toHaveLength(3);
+    expect(within(lane).getAllByRole("button", { name: /Promote to uzi/ })).toHaveLength(2);
   });
 
-  it("makes Start ENABLED on a bug card with no PRD link when the waiver is on (PRD #196 M4)", async () => {
-    // The waiver mirrors the server: an issue eligible via a NON-PRIMARY label does not
-    // need a prds/*.md link. With a worker + token, the missing link is the only thing
-    // that could block, and the waiver clears it.
+  it("makes Start ENABLED on a uzi card with no PRD link once a worker + token exist (PRD #764)", async () => {
+    // A run no longer requires a PRD link (PRD #764), so a worker + token is all it takes.
     withWorkerAndToken();
     renderBoard();
     await screen.findByText("Backlog");
-    // card 2 (bug, has_prd_link:false) is a default extra → on the board.
-    const start = within(cardOf("issue two")).getByRole("button", { name: /Start run/ }) as HTMLButtonElement;
+    // issue one is a uzi card with has_prd_link:false (default) → runnable.
+    const start = within(cardOf("issue one")).getByRole("button", { name: /Start run/ }) as HTMLButtonElement;
     await waitFor(() => expect(start.disabled).toBe(false));
   });
 
-  it("GATES the same bug card when eligibleLabelWaivesPrdLink is false (PRD #196 M4)", async () => {
-    // The scope proof: turn the waiver off and the no-link bug card is blocked again,
-    // while a PRD card with a link is unaffected.
-    vi.mocked(useAuth).mockReturnValue({
-      ...vi.mocked(useAuth)(),
-      eligibleLabelWaivesPrdLink: false,
-    } as unknown as ReturnType<typeof useAuth>);
-    withWorkerAndToken();
-    renderBoard();
-    await screen.findByText("Backlog");
-    const bugStart = within(cardOf("issue two")).getByRole("button", { name: /Start run/ }) as HTMLButtonElement;
-    await waitFor(() => expect(bugStart.disabled).toBe(true));
-    const prdStart = within(cardOf("issue one")).getByRole("button", { name: /Start run/ }) as HTMLButtonElement;
-    expect(prdStart.disabled).toBe(false);
-  });
-
-  it("offers the PRDLESS toggle on an eligible card, not on a non-eligible one (Decision 16, PRD #196 M4)", async () => {
-    // prdlessEnabled is true in this describe. card 2 (bug) is eligible and has no PRD
-    // link — the shape that shows the toggle. The unlabelled card 4 is not eligible, so
-    // the toggle grants nothing and is hidden even once show-all reveals the card.
-    renderBoard();
-    await screen.findByText("Backlog");
-    // card 2 (bug) is a default extra → on the board; eligible → toggle shown.
-    expect(screen.getByRole("button", { name: /Mark PRDLESS/ })).toBeTruthy();
-    clickShowAll();
-    // Still exactly one Mark PRDLESS (card 2's) — the non-eligible card 4 does not get one.
-    expect(screen.getAllByRole("button", { name: /Mark PRDLESS/ })).toHaveLength(1);
-  });
-
   it("promotes forge-first and adopts the returned card", async () => {
-    // Promote the only non-eligible card, the unlabelled #4.
+    // Promote a non-uzi card, the unlabelled #4.
     mockApi.promoteIssue.mockResolvedValue({
-      card: aCard({ iid: 4, title: "issue four", column: "", labels: ["PRD"] }),
+      card: aCard({ iid: 4, title: "issue four", column: "", labels: ["uzi"] }),
     });
     renderBoard();
     await screen.findByText("Backlog");
-    // Show all so the non-eligible card 4 is on the board with its Promote button.
+    // Show all so the non-uzi cards are on the board with their Promote buttons.
     clickShowAll();
-    fireEvent.click(screen.getByRole("button", { name: /Promote to PRD/ }));
+    // Two Promote buttons (the bug card and the unlabelled one); click the unlabelled #4's.
+    fireEvent.click(within(cardOf("issue four")).getByRole("button", { name: /Promote to uzi/ }));
     await waitFor(() => expect(mockApi.promoteIssue).toHaveBeenCalledWith("repo-1", 4));
-    // The promoted card is now an ordinary PRD card, so its Promote button is gone.
-    await waitFor(() => expect(screen.queryByRole("button", { name: /Promote to PRD/ })).toBeNull());
-    // …and it survives show-all going back off (it is a member by primary now).
+    // The promoted card is now a uzi card, so exactly one Promote button remains (#2's).
+    await waitFor(() => expect(screen.getAllByRole("button", { name: /Promote to uzi/ })).toHaveLength(1));
+    // …and it survives show-all going back off (it carries `uzi` now).
     clickShowAll();
     expect(titles()).toContain("issue four");
   });
@@ -1550,12 +1446,8 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
     vi.mocked(useAuth).mockReturnValue({
       user: null,
       loading: false,
-      prdLabel: "PRD",
+      uziLabel: "uzi",
       autopilotLabel: "autopilot",
-      prdlessLabel: "PRDLESS",
-      prdlessEnabled: false,
-      runEligibleLabels: ["PRD", "bug"],
-      eligibleLabelWaivesPrdLink: true,
       theme: "ember",
       themeOverride: null,
       defaultTheme: "ember",
@@ -1727,7 +1619,7 @@ describe("Board — search + per-lane paging (PRD #304)", () => {
     web_url: "https://gitlab.example.com/grp/proj",
     forge_type: "gitlab",
     columns: [{ label_name: "Planned" }] as BoardData["columns"],
-    cards: [aCard({ iid: 1, title: "issue one", column: "", labels: ["PRD"] })],
+    cards: [aCard({ iid: 1, title: "issue one", column: "", labels: ["uzi"] })],
     pipeline: null,
     ...over,
   });
@@ -1735,19 +1627,15 @@ describe("Board — search + per-lane paging (PRD #304)", () => {
   // n PRD cards in the Backlog lane, titled "issue 1".."issue n". A generator because
   // the cap tests need more cards than a lane fits without a wall of literals.
   const backlog = (n: number): Card[] =>
-    Array.from({ length: n }, (_, k) => aCard({ iid: k + 1, title: `issue ${k + 1}`, column: "", labels: ["PRD"] }));
+    Array.from({ length: n }, (_, k) => aCard({ iid: k + 1, title: `issue ${k + 1}`, column: "", labels: ["uzi"] }));
 
   beforeEach(() => {
     store = installStorage();
     vi.mocked(useAuth).mockReturnValue({
       user: null,
       loading: false,
-      prdLabel: "PRD",
+      uziLabel: "uzi",
       autopilotLabel: "autopilot",
-      prdlessLabel: "PRDLESS",
-      prdlessEnabled: false,
-      runEligibleLabels: ["PRD", "bug"],
-      eligibleLabelWaivesPrdLink: true,
       theme: "ember",
       themeOverride: null,
       defaultTheme: "ember",
@@ -1820,9 +1708,9 @@ describe("Board — search + per-lane paging (PRD #304)", () => {
   // --- M2/M6: search filters, drops empty lanes, board-level count, clearing restores ---
   it("filters lanes to matching cards, drops emptied lanes, and shows a result count", async () => {
     const cards = [
-      aCard({ iid: 1, title: "alpha one", column: "", labels: ["PRD"] }),
-      aCard({ iid: 2, title: "beta two", column: "", labels: ["PRD"] }),
-      aCard({ iid: 3, title: "beta three", column: "Planned", labels: ["PRD"] }),
+      aCard({ iid: 1, title: "alpha one", column: "", labels: ["uzi"] }),
+      aCard({ iid: 2, title: "beta two", column: "", labels: ["uzi"] }),
+      aCard({ iid: 3, title: "beta three", column: "Planned", labels: ["uzi"] }),
     ];
     mockApi.getBoard.mockResolvedValue({ board: aBoard({ cards }) });
     renderBoard();
@@ -1851,8 +1739,8 @@ describe("Board — search + per-lane paging (PRD #304)", () => {
 
   it("matches on #iid and pluralizes the result count", async () => {
     const cards = [
-      aCard({ iid: 42, title: "answer everything", column: "", labels: ["PRD"] }),
-      aCard({ iid: 7, title: "lucky", column: "", labels: ["PRD"] }),
+      aCard({ iid: 42, title: "answer everything", column: "", labels: ["uzi"] }),
+      aCard({ iid: 7, title: "lucky", column: "", labels: ["uzi"] }),
     ];
     mockApi.getBoard.mockResolvedValue({ board: aBoard({ cards }) });
     renderBoard();
@@ -1866,7 +1754,7 @@ describe("Board — search + per-lane paging (PRD #304)", () => {
 
   // --- M2/M6: highlight in both title and chip ---
   it("wraps the matched substring in a <mark> in both the title and a matching chip", async () => {
-    const cards = [aCard({ iid: 1, title: "find alpha here", column: "", labels: ["PRD", "alpha-tag"] })];
+    const cards = [aCard({ iid: 1, title: "find alpha here", column: "", labels: ["uzi", "alpha-tag"] })];
     mockApi.getBoard.mockResolvedValue({ board: aBoard({ cards }) });
     renderBoard();
     await screen.findByText("Backlog");
@@ -1936,9 +1824,9 @@ describe("Board — search + per-lane paging (PRD #304)", () => {
 
   it("freezes hidden-by-search cards: reorder submits iids the query filtered out", async () => {
     const cards = [
-      aCard({ iid: 1, title: "alpha one", column: "", labels: ["PRD"] }),
-      aCard({ iid: 2, title: "beta two", column: "", labels: ["PRD"] }),
-      aCard({ iid: 3, title: "alpha three", column: "", labels: ["PRD"] }),
+      aCard({ iid: 1, title: "alpha one", column: "", labels: ["uzi"] }),
+      aCard({ iid: 2, title: "beta two", column: "", labels: ["uzi"] }),
+      aCard({ iid: 3, title: "alpha three", column: "", labels: ["uzi"] }),
     ];
     mockApi.getBoard.mockResolvedValue({ board: aBoard({ cards }) });
     renderBoard();
@@ -1969,7 +1857,7 @@ describe("ColumnSettings reorder (PRD #318 M2)", () => {
       { label_name: "Planned" },
       { label_name: "In Progress" },
     ] as BoardData["columns"],
-    cards: [aCard({ iid: 7, column: "In Progress", labels: ["PRD", "In Progress", "bug"] })],
+    cards: [aCard({ iid: 7, column: "In Progress", labels: ["uzi", "In Progress", "bug"] })],
     pipeline: null,
     ...over,
   });
@@ -1978,12 +1866,8 @@ describe("ColumnSettings reorder (PRD #318 M2)", () => {
     vi.mocked(useAuth).mockReturnValue({
       user: null,
       loading: false,
-      prdLabel: "PRD",
+      uziLabel: "uzi",
       autopilotLabel: "autopilot",
-      prdlessLabel: "PRDLESS",
-      prdlessEnabled: false,
-      runEligibleLabels: ["PRD", "bug"],
-      eligibleLabelWaivesPrdLink: true,
       theme: "ember",
       themeOverride: null,
       defaultTheme: "ember",

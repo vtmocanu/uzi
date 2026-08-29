@@ -60,7 +60,7 @@ SELECT key, value, updated_by, updated_at FROM app_settings ORDER BY key FOR UPD
 
 // Row-locks the settings rows for the duration of the caller's transaction so a
 // concurrent settings PUT blocks here and reads this writer's committed values
-// (closes the cross-key prd_label != autopilot_label TOCTOU: PRD #19 M2).
+// (closes the cross-key uzi_label != autopilot_label TOCTOU: PRD #19 M2).
 func (q *Queries) ListAppSettingsForUpdate(ctx context.Context) ([]AppSetting, error) {
 	rows, err := q.db.Query(ctx, listAppSettingsForUpdate)
 	if err != nil {

@@ -46,7 +46,7 @@ func putSettings(user *store.User, body string) *http.Request {
 }
 
 func TestGetSettingsReturnsKnownKeysWithDefaults(t *testing.T) {
-	h := newSettingsHandler(store.AppSetting{Key: settings.KeyPRDLabel, Value: "Feature"})
+	h := newSettingsHandler(store.AppSetting{Key: settings.KeyUziLabel, Value: "Feature"})
 	rec := httptest.NewRecorder()
 	h.GetSettings(rec, httptest.NewRequest(http.MethodGet, "/api/admin/settings", nil))
 
@@ -59,8 +59,8 @@ func TestGetSettingsReturnsKnownKeysWithDefaults(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if resp.Settings[settings.KeyPRDLabel] != "Feature" {
-		t.Errorf("prd_label = %q, want Feature", resp.Settings[settings.KeyPRDLabel])
+	if resp.Settings[settings.KeyUziLabel] != "Feature" {
+		t.Errorf("uzi_label = %q, want Feature", resp.Settings[settings.KeyUziLabel])
 	}
 	// The unset key reads as its compiled-in default, not an absent field.
 	if resp.Settings[settings.KeyAutopilotLabel] != settings.DefaultAutopilotLabel {
@@ -133,7 +133,7 @@ func TestGetSettingsSurfacesCapabilityAwareScheduling(t *testing.T) {
 func TestUpdateSettingsRejectsUnauthenticated(t *testing.T) {
 	h := newSettingsHandler()
 	rec := httptest.NewRecorder()
-	h.UpdateSettings(rec, putSettings(nil, `{"settings":{"prd_label":"PRD"}}`))
+	h.UpdateSettings(rec, putSettings(nil, `{"settings":{"uzi_label":"uzi"}}`))
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", rec.Code)
 	}
@@ -146,23 +146,17 @@ func TestUpdateSettingsValidationRejections(t *testing.T) {
 	cases := map[string]string{
 		"empty body":       `{"settings":{}}`,
 		"unknown key":      `{"settings":{"bogus":"x"}}`,
-		"empty value":      `{"settings":{"prd_label":""}}`,
-		"whitespace value": `{"settings":{"prd_label":"   "}}`,
-		"comma value":      `{"settings":{"prd_label":"a,b"}}`,
-		"too long value":   `{"settings":{"prd_label":"` + strings.Repeat("x", 65) + `"}}`,
-		// Current autopilot_label is its default "autopilot"; setting prd_label to
-		// the same value must trip the cross-key rule.
-		"equal labels": `{"settings":{"prd_label":"autopilot"}}`,
-		// PRD #22 M1: prdless_enabled is a strict bool; a non-bool is rejected.
-		"non-bool prdless_enabled": `{"settings":{"prdless_enabled":"banana"}}`,
+		"empty value":      `{"settings":{"uzi_label":""}}`,
+		"whitespace value": `{"settings":{"uzi_label":"   "}}`,
+		"comma value":      `{"settings":{"uzi_label":"a,b"}}`,
+		"too long value":   `{"settings":{"uzi_label":"` + strings.Repeat("x", 65) + `"}}`,
+		// Current autopilot_label is its default "autopilot"; setting uzi_label to
+		// the same value must trip the cross-key rule (PRD #764).
+		"equal labels": `{"settings":{"uzi_label":"autopilot"}}`,
 		// PRD #69: judge_enforce_all is a strict bool. "yes" MUST be rejected — it is
 		// the documented pitfall: were the key to fall through to ValidateLabel it would
 		// accept "yes" and then read as false, silently disabling enforcement.
 		"non-bool judge_enforce_all": `{"settings":{"judge_enforce_all":"yes"}}`,
-		// prdless_label must be pairwise-distinct from the other two (defaults PRD /
-		// autopilot), even against their stored values on a single-key PUT.
-		"prdless equals prd default":       `{"settings":{"prdless_label":"PRD"}}`,
-		"prdless equals autopilot default": `{"settings":{"prdless_label":"autopilot"}}`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -176,20 +170,16 @@ func TestUpdateSettingsValidationRejections(t *testing.T) {
 	}
 }
 
-// A two-key swap is validated against the merged post-update state, so the swap
-// itself (prd↔autopilot) is accepted — the values stay distinct — and only
-// reaches the transaction. Here we assert it passes validation by confirming it
-// is NOT rejected with a 400 before the DB write (a nil pool would panic on the
-// write, so we stop at the pre-write boundary via a distinct value that keeps
-// them equal to force the 400, and its inverse that does not).
+// The cross-key rule is validated against the merged post-update state, so a
+// single-key PUT is still checked against the stored value of the other key.
 func TestUpdateSettingsCrossKeyUsesMergedState(t *testing.T) {
 	admin := adminUser()
-	// Only autopilot_label sent, set equal to the stored prd_label default "PRD":
-	// the cross-key rule must see the stored prd_label and reject.
+	// Only autopilot_label sent, set equal to the stored uzi_label default "uzi":
+	// the cross-key rule must see the stored uzi_label and reject (PRD #764).
 	h := newSettingsHandler()
 	rec := httptest.NewRecorder()
-	h.UpdateSettings(rec, putSettings(&admin, `{"settings":{"autopilot_label":"PRD"}}`))
+	h.UpdateSettings(rec, putSettings(&admin, `{"settings":{"autopilot_label":"uzi"}}`))
 	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 for autopilot_label==stored prd_label", rec.Code)
+		t.Fatalf("status = %d, want 400 for autopilot_label==stored uzi_label", rec.Code)
 	}
 }

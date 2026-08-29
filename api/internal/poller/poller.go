@@ -180,7 +180,7 @@ func (e *Engine) SetPipelineWatch(window time.Duration, maxRefs int) {
 func (e *Engine) SetForgeTimeout(d time.Duration) { e.forgeTimeout = d }
 
 // ForceReconcile requests that the next tick full-syncs every enabled repo,
-// dropping the incremental fast-path so a changed prd_label immediately re-filters
+// dropping the incremental fast-path so a changed uzi_label immediately re-filters
 // each board (PRD #19 M2). It is non-blocking: it drops the signal when one is
 // already pending (the Run loop will reconcile once regardless), so a caller — the
 // settings PUT handler — never blocks on the poller. A no-op if the poller is not

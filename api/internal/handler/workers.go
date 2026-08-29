@@ -916,8 +916,9 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The forge GetIssue snapshot, the PRDLESS gate and the description cap all live
-	// inside StartRunForUser (PRD #191 M1), shared with the Slack/web chat start-run card.
+	// The forge GetIssue snapshot, the uzi-label eligibility gate and the description
+	// cap all live inside StartRunForUser (PRD #191 M1), shared with the Slack/web chat
+	// start-run card.
 	run, err := h.wsvc.StartRunForUser(r.Context(), user.ID, repo.ID, req.IssueIID, req.WaitOnLimit, seed)
 	if err != nil {
 		h.writeStartRunError(w, r, err)
@@ -1052,9 +1053,9 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 	case errors.Is(err, workersvc.ErrInvalidSelection):
 		httpx.Error(w, http.StatusBadRequest, "invalid agent selection: "+err.Error())
 	case errors.Is(err, workersvc.ErrNotPRDIssue):
-		// PRD #764 M1: the single run-eligibility gate. An issue without the uzi_label
-		// is not uzi's to run — tell the user to add it. (A PRD link is no longer
-		// required, so there is no ErrNoPRDLink case to follow this.)
+		// PRD #764: the single run-eligibility gate. An issue without the uzi_label is
+		// not uzi's to run — tell the user to add it. A PRD link is no longer required,
+		// so this is the only eligibility refusal.
 		uziLabel, _ := h.settings.UziLabel(r.Context())
 		httpx.Error(w, http.StatusUnprocessableEntity,
 			fmt.Sprintf("this issue does not carry the %s label; add it before starting a run", uziLabel))

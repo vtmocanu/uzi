@@ -11,15 +11,14 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// The run-eligibility gate (PRD #764 M1): a single configurable `uzi` label is the ONE
+// The run-eligibility gate (PRD #764): a single configurable `uzi` label is the ONE
 // gate. An issue is uzi's to run iff its cached labels carry the configured uzi_label.
-// The old PRD-link gate (Gate B), PRDLESS bypass, and non-primary waiver are GONE — a
-// run no longer requires a prds/*.md link.
+// The old PRD-link gate (Gate B) and every escape-hatch/waiver label are GONE — a run
+// no longer requires a prds/*.md link.
 //
 // These cases are calibrated to FAIL against the pre-change binary: a `uzi`-only issue
-// with NO PRD link (HasPrdLink=false, no PRDLESS) was refused pre-change (Gate A's
-// eligible-set did not include "uzi", or Gate B's link requirement bit) and now RUNS on
-// every create path.
+// with NO PRD link (HasPrdLink=false) was refused pre-change (Gate A's eligible-set did
+// not include "uzi", or Gate B's link requirement bit) and now RUNS on every create path.
 
 func labelsJSON(t *testing.T, labels ...string) []byte {
 	t.Helper()
@@ -73,9 +72,9 @@ func runAllPaths(t *testing.T, wire func(*Service), labels []byte, hasPRDLink bo
 	return out
 }
 
-// TestUziLabelGate is the M1 headline: a `uzi`-only issue (no PRD link, no PRDLESS)
-// RUNS on every path, and an issue without `uzi` is refused with ErrNotPRDIssue on
-// every path. The first case is exactly the one that fails on the pre-change binary.
+// TestUziLabelGate is the M1 headline: a `uzi`-only issue (no PRD link) RUNS on every
+// path, and an issue without `uzi` is refused with ErrNotPRDIssue on every path. The
+// first case is exactly the one that fails on the pre-change binary.
 func TestUziLabelGate(t *testing.T) {
 	uziWired := func(s *Service) { s.SetSettings(fakeSettings{uziLabel: "uzi"}) }
 
@@ -87,8 +86,8 @@ func TestUziLabelGate(t *testing.T) {
 		wantErr    error // nil ⇒ the run must fire on every path
 	}{
 		{
-			// The headline reversal (fails pre-change): only `uzi`, no PRD link, no
-			// PRDLESS — refused pre-change, runs now on every path.
+			// The headline reversal (fails pre-change): only `uzi`, no PRD link —
+			// refused pre-change, runs now on every path.
 			name:   "a uzi-only issue with no PRD link runs on every path",
 			wire:   uziWired,
 			labels: labelsJSON(t, "uzi"),
@@ -116,11 +115,11 @@ func TestUziLabelGate(t *testing.T) {
 			wantErr: ErrNotPRDIssue,
 		},
 		{
-			// PRDLESS is no longer special — an issue carrying it but NOT `uzi` is
-			// refused, proving the old escape hatch is gone.
-			name:    "PRDLESS without uzi is refused",
+			// A formerly-special escape-hatch label is no longer special — an issue
+			// carrying it but NOT `uzi` is refused, proving the old escape hatch is gone.
+			name:    "a legacy escape-hatch label without uzi is refused",
 			wire:    uziWired,
-			labels:  labelsJSON(t, "PRDLESS"),
+			labels:  labelsJSON(t, "legacy-nospec"),
 			wantErr: ErrNotPRDIssue,
 		},
 		{

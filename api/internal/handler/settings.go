@@ -236,7 +236,7 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 		nonSecretUpdates[k] = v
 	}
 	// changed decides whether to force a full repo resync after commit. Only a
-	// LABEL change re-filters boards; every other key (theme, prdless, slack) is a
+	// LABEL change re-filters boards; every other key (theme, slack, judge) is a
 	// no-op here. Computed against the committed (FOR UPDATE-locked) rows.
 	changed := settings.LabelChanged(committed, nonSecretUpdates)
 	if err := settings.ValidateMerged(merged); err != nil {

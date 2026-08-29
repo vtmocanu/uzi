@@ -25,7 +25,7 @@ func testBox(t *testing.T) *secretbox.Box {
 }
 
 func TestSlackEnabledAccessor(t *testing.T) {
-	// Empty table → default OFF (unlike PrdlessEnabled, which defaults on).
+	// Empty table → default OFF.
 	c := New(&fakeStore{}, time.Minute)
 	if got, err := c.SlackEnabled(context.Background()); err != nil || got != false {
 		t.Fatalf("SlackEnabled default = %v, %v; want false", got, err)
@@ -156,7 +156,7 @@ func TestSourceReporting(t *testing.T) {
 	box := testBox(t)
 	sealed, _ := SealSecret(box, "xoxb-x")
 	fs := &fakeStore{rows: []store.AppSetting{
-		row(KeyPRDLabel, "Feature"),   // db
+		row(KeyUziLabel, "Feature"),   // db
 		row(KeySlackBotToken, sealed), // db (secret)
 	}}
 	c := New(fs, time.Minute)
@@ -167,7 +167,7 @@ func TestSourceReporting(t *testing.T) {
 		t.Fatalf("AdminView: %v", err)
 	}
 	want := map[string]string{
-		KeyPRDLabel:       "db",      // a stored non-secret
+		KeyUziLabel:       "db",      // a stored non-secret
 		KeyAutopilotLabel: "default", // never set
 		KeyPublicBaseURL:  "env",     // ENV overlay
 		KeySlackBotToken:  "db",      // stored secret
@@ -182,8 +182,8 @@ func TestSourceReporting(t *testing.T) {
 	if !c.IsEnvSourced(KeyPublicBaseURL) {
 		t.Error("IsEnvSourced(public_base_url) = false, want true")
 	}
-	if c.IsEnvSourced(KeyPRDLabel) {
-		t.Error("IsEnvSourced(prd_label) = true, want false")
+	if c.IsEnvSourced(KeyUziLabel) {
+		t.Error("IsEnvSourced(uzi_label) = true, want false")
 	}
 }
 
@@ -196,7 +196,7 @@ func TestKnownAndIsSecret(t *testing.T) {
 			t.Errorf("Known(%s) = false, want true (secret keys are writable)", k)
 		}
 	}
-	for _, k := range []string{KeySlackEnabled, KeyPublicBaseURL, KeyPRDLabel} {
+	for _, k := range []string{KeySlackEnabled, KeyPublicBaseURL, KeyUziLabel} {
 		if IsSecret(k) {
 			t.Errorf("IsSecret(%s) = true, want false", k)
 		}
@@ -314,7 +314,7 @@ func TestValueForStorage(t *testing.T) {
 	}
 
 	// Non-secret: stored verbatim (no sealing).
-	if stored, err := ValueForStorage(box, KeyPRDLabel, "Feature"); err != nil || stored != "Feature" {
+	if stored, err := ValueForStorage(box, KeyUziLabel, "Feature"); err != nil || stored != "Feature" {
 		t.Fatalf("ValueForStorage(non-secret) = %q, %v; want verbatim", stored, err)
 	}
 }
@@ -324,7 +324,7 @@ func TestValueForStorage(t *testing.T) {
 // non-label key) never do.
 func TestLabelChangedIgnoresNonBoardKeys(t *testing.T) {
 	committed := map[string]string{
-		KeyPRDLabel:       "PRD",
+		KeyUziLabel:       "PRD",
 		KeyAutopilotLabel: "autopilot",
 		KeySlackEnabled:   "false",
 		KeyPublicBaseURL:  DefaultPublicBaseURL,
@@ -340,8 +340,8 @@ func TestLabelChangedIgnoresNonBoardKeys(t *testing.T) {
 		}
 	}
 	// A real label change still triggers, alongside a Slack key.
-	if !LabelChanged(committed, map[string]string{KeyPRDLabel: "Feature", KeySlackEnabled: "true"}) {
-		t.Error("a prd_label change must still force a resync")
+	if !LabelChanged(committed, map[string]string{KeyUziLabel: "Feature", KeySlackEnabled: "true"}) {
+		t.Error("a uzi_label change must still force a resync")
 	}
 }
 
@@ -349,12 +349,10 @@ func TestLabelChangedIgnoresNonBoardKeys(t *testing.T) {
 // does not reach the Slack keys: a slack value equal to a label value is fine.
 func TestValidateMergedIgnoresSlackKeys(t *testing.T) {
 	if err := ValidateMerged(map[string]string{
-		KeyPRDLabel:          "PRD",
-		KeyAutopilotLabel:    "autopilot",
-		KeyPrdlessLabel:      "PRDLESS",
-		KeyRunEligibleLabels: "PRD",       // PRD #196: eligible set must contain the primary
-		KeySlackEnabled:      "PRD",       // colliding value, but not a label key
-		KeyPublicBaseURL:     "autopilot", // ditto
+		KeyUziLabel:       "uzi",
+		KeyAutopilotLabel: "autopilot",
+		KeySlackEnabled:   "uzi",       // colliding value, but not a label key
+		KeyPublicBaseURL:  "autopilot", // ditto
 	}); err != nil {
 		t.Errorf("ValidateMerged rejected on a non-label key collision: %v", err)
 	}

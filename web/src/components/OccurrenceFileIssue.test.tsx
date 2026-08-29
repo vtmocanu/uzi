@@ -70,7 +70,7 @@ function draftFixture(over: Partial<IssueDraft> = {}): IssueDraft {
     default_repo_id: "repo1",
     title: "Improve the poller: api/internal/poller",
     description: "## What the judge found\n\n````\nrationale\n````",
-    labels: ["PRD", "PRDLESS"],
+    labels: ["uzi"],
     provenance: "from vlad's worker, run 8f2c1d04",
     default_note: "Defaulted to the judged run's repo.",
     ...over,

@@ -3,17 +3,17 @@ import { boundedChips, chipLabels, hoistLabels, MAX_CARD_CHIPS, type LabelChipEx
 
 // The default settings values, so a case that renames one is visibly a rename.
 const defaults: LabelChipExclusions = {
-  prdLabel: "PRD",
-  prdlessLabel: "PRDLESS",
   autopilotLabel: "autopilot",
   columnLabels: ["Planned", "In Progress", "Human Review", "Later"],
 };
 
 describe("chipLabels", () => {
-  it("keeps content labels and drops all four excluded kinds", () => {
+  it("keeps content labels and drops the autopilot label + columns", () => {
+    // PRD #764: `uzi` and PRD are no longer special to chipLabels — they chip as
+    // ordinary labels. Only the autopilot marker and the column labels are excluded.
     expect(
-      chipLabels(["PRD", "bug", "In Progress", "autopilot", "security", "PRDLESS"], defaults),
-    ).toEqual(["bug", "security"]);
+      chipLabels(["uzi", "bug", "In Progress", "autopilot", "security", "PRD"], defaults),
+    ).toEqual(["uzi", "bug", "security", "PRD"]);
   });
 
   it("preserves input order rather than sorting", () => {
@@ -26,18 +26,16 @@ describe("chipLabels", () => {
     ]);
   });
 
-  it("reads the workflow labels from settings, never from a hardcoded name", () => {
-    // All four are operator-configurable. Under renamed settings the DEFAULT names
-    // become ordinary content labels and must chip; the configured ones must not.
+  it("reads the autopilot label from settings, never from a hardcoded name", () => {
+    // The autopilot label is operator-configurable. Under a renamed setting the DEFAULT
+    // name becomes an ordinary content label and must chip; the configured one must not.
     const renamed: LabelChipExclusions = {
-      prdLabel: "spec",
-      prdlessLabel: "no-spec-needed",
       autopilotLabel: "robot",
       columnLabels: ["Doing"],
     };
     expect(
-      chipLabels(["PRD", "autopilot", "PRDLESS", "In Progress", "spec", "robot", "no-spec-needed", "Doing", "bug"], renamed),
-    ).toEqual(["PRD", "autopilot", "PRDLESS", "In Progress", "bug"]);
+      chipLabels(["autopilot", "In Progress", "robot", "Doing", "bug"], renamed),
+    ).toEqual(["autopilot", "In Progress", "bug"]);
   });
 
   it("excludes whatever column set it is handed — the two callers pass different ones", () => {
@@ -56,8 +54,8 @@ describe("chipLabels", () => {
     expect(chipLabels(["", "bug"], { ...defaults, columnLabels: [""] })).toEqual(["bug"]);
   });
 
-  it("returns nothing when every label is a workflow marker", () => {
-    expect(chipLabels(["PRD", "autopilot"], defaults)).toEqual([]);
+  it("returns nothing when every label is the autopilot marker or a column", () => {
+    expect(chipLabels(["autopilot", "In Progress"], defaults)).toEqual([]);
   });
 });
 

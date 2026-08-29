@@ -20,7 +20,7 @@ const maxBoardExtraLabels = 64
 
 // boardPrefsDTO is the wire shape for both GET and PUT (PRD #196 M3). ExtraLabels
 // carries the "unset vs empty" sentinel across JSON: a nil slice marshals to `null`
-// (not customized — the client falls back to the admin default board_extra_labels),
+// (not customized — the client falls back to its own default),
 // an empty slice marshals to `[]` (the user's absolute empty set, Decision 9), and a
 // populated slice is the absolute set. show_all is the old per-browser "show all
 // other issues" boolean, now per-account.

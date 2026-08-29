@@ -140,7 +140,7 @@ func TestHTTPClientWhoami(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer uzc_test" {
 			t.Errorf("Authorization = %q", got)
 		}
-		_, _ = w.Write([]byte(`{"user":{"id":"u1","email":"a@b.c","is_admin":true},"prd_label":"PRD"}`))
+		_, _ = w.Write([]byte(`{"user":{"id":"u1","email":"a@b.c","is_admin":true},"uzi_label":"uzi"}`))
 	}))
 	defer srv.Close()
 	u, err := newTestClient(srv).Whoami(context.Background())

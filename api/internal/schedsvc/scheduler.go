@@ -126,9 +126,9 @@ type ForgeBuilder interface {
 }
 
 // SettingsReader is the typed settings surface the scheduler reads to default an
-// empty sweep selector to the configured PRD label. *settings.Cache satisfies it.
+// empty sweep selector to the configured uzi label. *settings.Cache satisfies it.
 type SettingsReader interface {
-	PRDLabel(ctx context.Context) (string, error)
+	UziLabel(ctx context.Context) (string, error)
 }
 
 // Notifier is the notifysvc write seam (persist-first, best-effort Slack).
@@ -508,8 +508,8 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (Fi
 // createIssueRun fires one issue through the shared seam. auto_approve schedules go
 // through CreateScheduledAutopilotRun; non-auto-approve ones through CreateScheduledRun,
 // both threading the schedule's wait_on_limit. Post-PRD #764 M1 every create path shares
-// the single uzi_label eligibility gate — there is no PRD-link requirement, PRDLESS
-// bypass, or interactive waiver left for the two branches to differ on — so they differ
+// the single uzi_label eligibility gate — there is no PRD-link requirement or escape-hatch
+// waiver left for the two branches to differ on — so they differ
 // only in auto-approve, not in what they will run. The benign per-fire seam rejects
 // (active run, not eligible, description too large) are swallowed so the schedule still
 // advances; ErrRepoNotFound is permanent; anything else is transient.
@@ -545,7 +545,7 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 	} else {
 		// CreateScheduledRun is the non-auto-approve scheduled seam. Post-PRD #764 M1 it
 		// and the interactive CreateRun apply the SAME single uzi_label eligibility gate —
-		// no PRD link, PRDLESS, or waiver enters into it — so a swept uzi-labelled issue
+		// no PRD link or escape-hatch waiver enters into it — so a swept uzi-labelled issue
 		// with no PRD link runs here. The only thing separating this branch from the
 		// CreateScheduledAutopilotRun branch above is auto-approve (the plan gate still
 		// needs a human here), not eligibility.
@@ -558,9 +558,8 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 	// Benign per-fire seam sentinel → a typed Skip; the schedule still advances (no
 	// tick-storm). skipReasonForErr maps the benign sentinels a scheduled fire can still
 	// return (ErrActiveRunExists → already_running, ErrNotPRDIssue → not_eligible,
-	// ErrDescriptionTooLarge → description_too_large). Its ErrNoPRDLink → no_prd_link arm
-	// is vestigial: no production path returns ErrNoPRDLink after PRD #764 M1, so that arm
-	// is dead until M5 retires the enum value.
+	// ErrDescriptionTooLarge → description_too_large). The old link-less skip reason was
+	// retired with the PRD-link gate (PRD #764).
 	if reason, ok := skipReasonForErr(err); ok {
 		e.logger.Info("scheduler: issue fire skipped", "schedule", sched.ID.String(), "issue", iid, "reason", err)
 		return FireOutcome{Matched: 1, Skips: []Skip{{IssueIID: &iidCopy, Title: title, Reason: reason, WebURL: webURL}}}, nil
@@ -697,7 +696,7 @@ func (e *Scheduler) park(ctx context.Context, sched store.RunSchedule, reason st
 
 // resolveSweepLabels turns the schedule's stored jsonb label selector into the jsonb
 // param ListSweepCandidateIssues expects. An empty/NULL/`[]` selector defaults to a
-// SINGLE-element [PRD label] — never an empty array, whose `@> '[]'` containment
+// SINGLE-element [uzi label] — never an empty array, whose `@> '[]'` containment
 // matches every open issue (Decisions 7/9). The non-empty invariant is enforced HERE.
 func (e *Scheduler) resolveSweepLabels(ctx context.Context, stored []byte) ([]byte, error) {
 	var sel []string
@@ -711,11 +710,11 @@ func (e *Scheduler) resolveSweepLabels(ctx context.Context, stored []byte) ([]by
 	// Drop blanks so a stored `[""]` does not defeat the non-empty invariant.
 	sel = nonBlank(sel)
 	if len(sel) == 0 {
-		prd, _ := e.settings.PRDLabel(ctx)
-		if strings.TrimSpace(prd) == "" {
-			prd = settings.DefaultPRDLabel
+		uzi, _ := e.settings.UziLabel(ctx)
+		if strings.TrimSpace(uzi) == "" {
+			uzi = settings.DefaultUziLabel
 		}
-		sel = []string{prd}
+		sel = []string{uzi}
 	}
 	out, err := json.Marshal(sel)
 	if err != nil {

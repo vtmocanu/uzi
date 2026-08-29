@@ -90,7 +90,7 @@ func newForgeStub(t *testing.T) *forgeStub {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
-			_, _ = fmt.Fprintf(w, `{"id":%d,"iid":%d,"project_id":1,"title":%q,"description":%q,"state":"opened","web_url":"https://forge.example/g/ra/-/issues/%d","labels":["PRD","PRDLESS"]}`,
+			_, _ = fmt.Fprintf(w, `{"id":%d,"iid":%d,"project_id":1,"title":%q,"description":%q,"state":"opened","web_url":"https://forge.example/g/ra/-/issues/%d","labels":["uzi"]}`,
 				iid, iid, title, desc, iid)
 			return
 		}
@@ -130,15 +130,11 @@ func fileIssueLiveDB(t *testing.T) (*Handler, *pgxpool.Pool, *store.Queries, *se
 		q:    q,
 		box:  box,
 		cfg:  config.Config{},
-		// run_eligible_labels deliberately DIFFERS from the primary (PRD #196 M4): the
-		// eligible set is {PRD, bug}, so every assertion below that the judge writes
-		// exactly [PRD, PRDLESS] — never "bug" — is a writer guard proving the writer
-		// reads the PRIMARY, not the run-eligible set.
+		// PRD #764: a judge-filed issue carries exactly the single uzi run-eligibility
+		// label. Every assertion below that the writer sends exactly [uzi] proves the
+		// writer reads the uzi_label setting server-side.
 		settings: settings.New(&settingsStore{rows: []store.AppSetting{
-			{Key: settings.KeyPRDLabel, Value: "PRD"},
-			{Key: settings.KeyPrdlessLabel, Value: "PRDLESS"},
-			{Key: settings.KeyRunEligibleLabels, Value: "PRD,bug"},
-			{Key: settings.KeyEligibleLabelWaivesPRDLink, Value: "true"},
+			{Key: settings.KeyUziLabel, Value: "uzi"},
 		}}, time.Minute),
 		svc:  forgesvc.New(q, box, 5*time.Second, nil),
 		wsvc: workersvc.New(q, box, workersvc.Params{}),
@@ -267,12 +263,12 @@ func TestFileIssueOwnerHappyPathLiveDB(t *testing.T) {
 	if resp.Issue.IID == 0 || resp.Warning != "" {
 		t.Fatalf("want a created issue with no warning, got %+v", resp)
 	}
-	// The forge saw exactly one create, labelled server-side PRD+PRDLESS (never from body).
+	// The forge saw exactly one create, labelled server-side [uzi] (never from body).
 	if fs.count() != 1 {
 		t.Fatalf("forge CreateIssue calls = %d, want 1", fs.count())
 	}
-	if got := fs.creates[0].Labels; len(got) != 2 || got[0] != "PRD" || got[1] != "PRDLESS" {
-		t.Fatalf("labels sent to forge = %v, want [PRD PRDLESS]", got)
+	if got := fs.creates[0].Labels; len(got) != 1 || got[0] != "uzi" {
+		t.Fatalf("labels sent to forge = %v, want [uzi]", got)
 	}
 	// The claim settled: one filed row with filed_at set + the issue iid/url.
 	var filedAt bool
@@ -460,7 +456,7 @@ func TestFileIssueSettleZeroRowsWarnsLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get repo: %v", err)
 	}
-	created := forge.Issue{IID: 999, WebURL: "https://forge.example/g/ra/-/issues/999", Title: "t", State: "opened", Labels: []string{"PRD", "PRDLESS"}}
+	created := forge.Issue{IID: 999, WebURL: "https://forge.example/g/ra/-/issues/999", Title: "t", State: "opened", Labels: []string{"uzi"}}
 
 	// A random claim id that does not exist → settle updates 0 rows → warnReclaimed.
 	if warn := h.settleFiledIssue(ctx, uuid.New(), repo, created, "body"); warn == "" {
@@ -482,7 +478,7 @@ func TestFileIssueSettleZeroRowsWarnsLiveDB(t *testing.T) {
 // ── Write-boundary: the sanitizer re-runs on the CLIENT body at the POST (Decision 10) ───
 // Every UNFENCED quick-action family (incl. a CRLF-hidden one) is stripped; a FENCED
 // quick-action + beacon survive as inert code (fence-aware, breakout-proof); a secret is
-// redacted; and the labels reaching the forge are server-side PRD+PRDLESS, never the body.
+// redacted; and the labels reaching the forge are server-side [uzi], never the body.
 func TestFileIssueWriteBoundarySanitizesClientBodyLiveDB(t *testing.T) {
 	h, pool, _, box, fs := fileIssueLiveDB(t)
 	ctx := context.Background()
@@ -539,8 +535,8 @@ func TestFileIssueWriteBoundarySanitizesClientBodyLiveDB(t *testing.T) {
 		t.Errorf("a secret in the client body reached the forge:\n%s", got)
 	}
 	// Labels are assembled server-side regardless of the body.
-	if l := fs.creates[0].Labels; len(l) != 2 || l[0] != "PRD" || l[1] != "PRDLESS" {
-		t.Errorf("labels to forge = %v, want [PRD PRDLESS]", l)
+	if l := fs.creates[0].Labels; len(l) != 1 || l[0] != "uzi" {
+		t.Errorf("labels to forge = %v, want [uzi]", l)
 	}
 }
 
@@ -628,8 +624,8 @@ func TestGetIssueDraftAuthzLiveDB(t *testing.T) {
 	if owner.Draft.DefaultRepoID != f.ownerRepo.String() {
 		t.Errorf("owner default_repo_id = %q, want the run's repo %s", owner.Draft.DefaultRepoID, f.ownerRepo)
 	}
-	if len(owner.Draft.Labels) != 2 || owner.Draft.Labels[0] != "PRD" {
-		t.Errorf("draft labels = %v, want [PRD PRDLESS]", owner.Draft.Labels)
+	if len(owner.Draft.Labels) != 1 || owner.Draft.Labels[0] != "uzi" {
+		t.Errorf("draft labels = %v, want [uzi]", owner.Draft.Labels)
 	}
 
 	// Admin reads another user's review: 200, but the run's repo is not the admin's, so the

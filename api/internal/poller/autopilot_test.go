@@ -114,15 +114,15 @@ func (r *apRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID,
 
 type apLabeler struct {
 	label string
-	// prdLabel is the PRD label the candidate query filters on alongside the
-	// autopilot one (PRD #102 M6 Decision 11b). Left zero by most cases, which is
-	// the "unconfigured" path Autopilot.prdLabel resolves to the compiled-in
-	// default.
-	prdLabel string
+	// uziLabel is the uzi run-eligibility label the candidate query filters on
+	// alongside the autopilot one (PRD #102 M6 Decision 11b; PRD #764 D7 repointed it
+	// from the PRD label to the uzi label). Left zero by most cases, which is the
+	// "unconfigured" path Autopilot.uziLabel resolves to the compiled-in default.
+	uziLabel string
 }
 
 func (l apLabeler) AutopilotLabel(context.Context) (string, error) { return l.label, nil }
-func (l apLabeler) PRDLabel(context.Context) (string, error)       { return l.prdLabel, nil }
+func (l apLabeler) UziLabel(context.Context) (string, error)       { return l.uziLabel, nil }
 
 type apNote struct {
 	iid  int64
@@ -449,8 +449,8 @@ func TestAutopilotConsentGatesComment(t *testing.T) {
 
 // TestAutopilotRunsWithoutPRDLink pins PRD #764 M1 on the autopilot path: an issue
 // with the autopilot label but NO prds/*.md link now runs unattended — the old
-// PRD-link gate is gone, so no ErrNoPRDLink comment is posted. Pre-change this issue
-// (no link, no PRDLESS) would have surfaced ErrNoPRDLink and a comment.
+// PRD-link gate is gone, so no "no PRD link" comment is posted. Pre-change this issue
+// (no link, no escape-hatch label) would have been refused with a comment.
 func TestAutopilotRunsWithoutPRDLink(t *testing.T) {
 	st := &apStore{
 		candidates: []store.ListAutopilotCandidateIssuesRow{candIssue(7, "alice")},

@@ -3338,8 +3338,8 @@ func TestSubmitInputRevisePlanRejectsTerminalRun(t *testing.T) {
 func TestCreateRunSnapshotsTitleAndRunsWithoutPRDLink(t *testing.T) {
 	user, repo := uuid.New(), uuid.New()
 
-	// uzi label present, NO PRD link → runs post-change (would hit ErrNoPRDLink
-	// pre-change). Title snapshotted from the cached issue, description from arg.
+	// uzi label present, NO PRD link → runs post-change (would have been refused for a
+	// missing PRD link pre-change). Title snapshotted from the cached issue, description from arg.
 	fs := &fakeStore{
 		issueByID:       store.Issue{Title: "Real Title", Labels: uziLabels(), HasPrdLink: false},
 		createRunResult: store.Run{ID: uuid.New()},

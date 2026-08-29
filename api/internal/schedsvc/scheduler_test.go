@@ -186,7 +186,7 @@ type fakeRuns struct {
 	err            error
 	// errByIssue overrides err per candidate iid (issue #416 backfill tests): when non-nil
 	// and the iid is present, the scheduled create seams return that error (so one candidate
-	// can be a no_prd_link skip while its neighbours start); else they fall back to err.
+	// can be a not_eligible skip while its neighbours start); else they fall back to err.
 	errByIssue map[int64]error
 }
 
@@ -335,10 +335,10 @@ func (b *fakeBuilder) ForgeForConnection(string, string, []byte) (forge.Forge, e
 }
 
 type fakeSettings struct {
-	prdLabel string
+	uziLabel string
 }
 
-func (s *fakeSettings) PRDLabel(context.Context) (string, error) { return s.prdLabel, nil }
+func (s *fakeSettings) UziLabel(context.Context) (string, error) { return s.uziLabel, nil }
 
 type fakeNotifier struct{ notifications []notifysvc.Notification }
 
@@ -375,7 +375,7 @@ func newHarness() *harness {
 		st:     &fakeStore{repoRow: store.GetRepoForUserRow{ID: repoID, UserID: owner, ForgeProjectID: 42, ForgeType: "gitlab", PathWithNamespace: "vtmocanu/uzi", FoldImproveUziBacklog: true}},
 		runs:   &fakeRuns{},
 		fb:     &fakeBuilder{f: &fakeForge{issue: forge.Issue{IID: 7, Description: "body", Labels: []string{"PRD"}}, createdIID: 7}},
-		set:    &fakeSettings{prdLabel: "PRD"},
+		set:    &fakeSettings{uziLabel: "uzi"},
 		notif:  &fakeNotifier{},
 		vault:  &fakeVault{unlocked: true},
 		now:    time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC),
@@ -837,7 +837,7 @@ func assertBalances(t *testing.T, o FireOutcome) {
 	}
 }
 
-// TestSkipReasonForErr pins the seam-sentinel → reason mapping directly: each of the four
+// TestSkipReasonForErr pins the seam-sentinel → reason mapping directly: each of the three
 // benign run-creation sentinels maps to its reason; ErrActivePromptExists and an unrelated
 // error are NOT mapped here (the prompt path records already_running at its own site, and
 // an unknown error is left to the caller to classify as transient/permanent).
@@ -847,7 +847,6 @@ func TestSkipReasonForErr(t *testing.T) {
 		want SkipReason
 		ok   bool
 	}{
-		{workersvc.ErrNoPRDLink, SkipNoPRDLink, true},
 		{workersvc.ErrNotPRDIssue, SkipNotEligible, true},
 		{workersvc.ErrActiveRunExists, SkipAlreadyRunning, true},
 		{workersvc.ErrDescriptionTooLarge, SkipDescriptionTooLarge, true},
@@ -862,9 +861,9 @@ func TestSkipReasonForErr(t *testing.T) {
 		}
 	}
 	// AllSkipReasons enumerates the full closed set (PRD #590 M1 added vault_locked;
-	// PRD #686 D10 added self_improve_mr_cap_reached).
-	if len(AllSkipReasons) != 7 {
-		t.Fatalf("AllSkipReasons has %d reasons, want 7", len(AllSkipReasons))
+	// PRD #686 D10 added self_improve_mr_cap_reached; PRD #764 retired not_eligible).
+	if len(AllSkipReasons) != 6 {
+		t.Fatalf("AllSkipReasons has %d reasons, want 6", len(AllSkipReasons))
 	}
 }
 
@@ -879,7 +878,6 @@ func TestFireIssueSentinelSkips(t *testing.T) {
 	}{
 		{"active_run", workersvc.ErrActiveRunExists, SkipAlreadyRunning},
 		{"not_eligible", workersvc.ErrNotPRDIssue, SkipNotEligible},
-		{"no_prd_link", workersvc.ErrNoPRDLink, SkipNoPRDLink},
 		{"too_large", workersvc.ErrDescriptionTooLarge, SkipDescriptionTooLarge},
 	}
 	for _, c := range cases {
@@ -1100,10 +1098,10 @@ func TestFireSweepPerCandidateBuckets(t *testing.T) {
 		h := newHarness()
 		h.st.sweepRows = oneRow
 		h.fb.f.issue.Title = "Broken login"
-		h.runs.err = workersvc.ErrNoPRDLink
+		h.runs.err = workersvc.ErrNotPRDIssue
 		out, _ := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{}))
-		if out.Matched != 1 || len(out.Skips) != 1 || out.Skips[0].Reason != SkipNoPRDLink {
-			t.Fatalf("outcome = %+v, want one no_prd_link skip", out)
+		if out.Matched != 1 || len(out.Skips) != 1 || out.Skips[0].Reason != SkipNotEligible {
+			t.Fatalf("outcome = %+v, want one not_eligible skip", out)
 		}
 		if out.Skips[0].Title != "Broken login" {
 			t.Fatalf("sweep skip Title = %q, want the fetched issue title", out.Skips[0].Title)
@@ -1290,7 +1288,7 @@ func eqInt64s(a, b []int64) bool {
 }
 
 // TestFireSweepBackfillFillsSlotPastSkip is the flagship case: a window whose 2nd candidate
-// is a no_prd_link skip still starts max_issues runs by walking past the skip to the next
+// is a not_eligible skip still starts max_issues runs by walking past the skip to the next
 // eligible candidate — AND stops at max_issues (the 5th, eligible, candidate is never
 // examined). The skipped candidate is still flagged, oldest-eligible ordering is preserved,
 // and Matched counts only the examined prefix (issue #416).
@@ -1302,7 +1300,7 @@ func TestFireSweepBackfillFillsSlotPastSkip(t *testing.T) {
 		{ForgeIssueIid: 10}, {ForgeIssueIid: 20}, {ForgeIssueIid: 30}, {ForgeIssueIid: 40}, {ForgeIssueIid: 50},
 	}
 	h.st.sweepCount = 5
-	h.runs.errByIssue = map[int64]error{20: workersvc.ErrNoPRDLink} // 20 cannot start
+	h.runs.errByIssue = map[int64]error{20: workersvc.ErrNotPRDIssue} // 20 cannot start
 	out, err := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{Int32: 3, Valid: true}))
 	if err != nil {
 		t.Fatalf("backfill fire must not error, got %v", err)
@@ -1312,8 +1310,8 @@ func TestFireSweepBackfillFillsSlotPastSkip(t *testing.T) {
 	if want := []int64{10, 30, 40}; !eqInt64s(startedIIDs(out), want) {
 		t.Fatalf("started iids = %v, want %v (oldest-eligible first, backfilled past 20, capped at 3)", startedIIDs(out), want)
 	}
-	if len(out.Skips) != 1 || out.Skips[0].Reason != SkipNoPRDLink || out.Skips[0].IssueIID == nil || *out.Skips[0].IssueIID != 20 {
-		t.Fatalf("skips = %+v, want exactly one no_prd_link skip for iid 20", out.Skips)
+	if len(out.Skips) != 1 || out.Skips[0].Reason != SkipNotEligible || out.Skips[0].IssueIID == nil || *out.Skips[0].IssueIID != 20 {
+		t.Fatalf("skips = %+v, want exactly one not_eligible skip for iid 20", out.Skips)
 	}
 	// Matched = examined prefix [10,20,30,40] = 4 (NOT 3, NOT 5): the skip is counted, 50 is not.
 	if out.Matched != 4 {
@@ -1326,26 +1324,26 @@ func TestFireSweepBackfillFillsSlotPastSkip(t *testing.T) {
 	assertBalances(t, out)
 }
 
-// TestFireSweepBackfillPastAlreadyRunningAndNoPRDLink proves backfill walks past BOTH a
-// pre-check already_running skip (no forge call) and a no_prd_link skip, filling the cap
+// TestFireSweepBackfillPastAlreadyRunningAndNotEligible proves backfill walks past BOTH a
+// pre-check already_running skip (no forge call) and a not_eligible skip, filling the cap
 // from the eligible candidates beyond them.
-func TestFireSweepBackfillPastAlreadyRunningAndNoPRDLink(t *testing.T) {
+func TestFireSweepBackfillPastAlreadyRunningAndNotEligible(t *testing.T) {
 	h := newHarness()
 	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{
 		{ForgeIssueIid: 10}, {ForgeIssueIid: 20}, {ForgeIssueIid: 30}, {ForgeIssueIid: 40}, {ForgeIssueIid: 50},
 	}
 	h.st.sweepCount = 5
-	h.st.activeByIssue = map[int64]bool{20: true}                   // 20 already running (pre-check skip)
-	h.runs.errByIssue = map[int64]error{30: workersvc.ErrNoPRDLink} // 30 has no PRD link
+	h.st.activeByIssue = map[int64]bool{20: true}                     // 20 already running (pre-check skip)
+	h.runs.errByIssue = map[int64]error{30: workersvc.ErrNotPRDIssue} // 30 has is not eligible
 	out, err := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{Int32: 3, Valid: true}))
 	if err != nil {
 		t.Fatalf("backfill fire must not error, got %v", err)
 	}
 	if want := []int64{10, 40, 50}; !eqInt64s(startedIIDs(out), want) {
-		t.Fatalf("started iids = %v, want %v (past already_running 20 and no_prd_link 30)", startedIIDs(out), want)
+		t.Fatalf("started iids = %v, want %v (past already_running 20 and not_eligible 30)", startedIIDs(out), want)
 	}
 	if len(out.Skips) != 2 {
-		t.Fatalf("skips = %+v, want two (already_running 20, no_prd_link 30)", out.Skips)
+		t.Fatalf("skips = %+v, want two (already_running 20, not_eligible 30)", out.Skips)
 	}
 	byIID := map[int64]SkipReason{}
 	for _, s := range out.Skips {
@@ -1353,8 +1351,8 @@ func TestFireSweepBackfillPastAlreadyRunningAndNoPRDLink(t *testing.T) {
 			byIID[*s.IssueIID] = s.Reason
 		}
 	}
-	if byIID[20] != SkipAlreadyRunning || byIID[30] != SkipNoPRDLink {
-		t.Fatalf("skip reasons = %v, want {20:already_running, 30:no_prd_link}", byIID)
+	if byIID[20] != SkipAlreadyRunning || byIID[30] != SkipNotEligible {
+		t.Fatalf("skip reasons = %v, want {20:already_running, 30:not_eligible}", byIID)
 	}
 	if out.Matched != 5 {
 		t.Fatalf("Matched = %d, want 5 (examined 10,20,30,40,50)", out.Matched)
@@ -1379,7 +1377,7 @@ func TestFireSweepBackfillScanBound(t *testing.T) {
 	for i := 0; i < window; i++ {
 		iid := int64(100 + i)
 		rows = append(rows, store.ListSweepCandidateIssuesRow{ForgeIssueIid: iid})
-		errs[iid] = workersvc.ErrNoPRDLink // the whole window is ineligible
+		errs[iid] = workersvc.ErrNotPRDIssue // the whole window is ineligible
 	}
 	h := newHarness()
 	h.st.sweepRows = rows
@@ -1418,7 +1416,7 @@ func TestFireSweepBackfillNullCapUnchanged(t *testing.T) {
 	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{
 		{ForgeIssueIid: 10}, {ForgeIssueIid: 20}, {ForgeIssueIid: 30},
 	}
-	h.runs.errByIssue = map[int64]error{20: workersvc.ErrNoPRDLink}
+	h.runs.errByIssue = map[int64]error{20: workersvc.ErrNotPRDIssue}
 	out, _ := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{})) // NULL cap
 	if h.st.sweepMaxIssuesParam.Valid {
 		t.Fatalf("NULL cap must thread an invalid (NULL, unlimited) param, not a widened window: got %+v", h.st.sweepMaxIssuesParam)

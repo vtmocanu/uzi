@@ -201,10 +201,8 @@ func TestAgentSourceFolderReader(t *testing.T) {
 func TestAgentSourceValidateMergedEnableRequiresURLAndRef(t *testing.T) {
 	base := func() map[string]string {
 		return map[string]string{
-			KeyPRDLabel:            "PRD",
+			KeyUziLabel:            "uzi",
 			KeyAutopilotLabel:      "autopilot",
-			KeyPrdlessLabel:        "PRDLESS",
-			KeyRunEligibleLabels:   "PRD",
 			KeyAgentSourceEnabled:  "false",
 			KeyAgentSourceRepoURL:  "",
 			KeyAgentSourceRef:      "",

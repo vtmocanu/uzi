@@ -2167,7 +2167,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
       default_repo_id: "repo1",
       title: "Improve the reviewer: reviewer",
       description: "## What the judge found\n\n````\nrationale\n````",
-      labels: ["PRD", "PRDLESS"],
+      labels: ["uzi"],
       provenance: "from vlad's worker, run 8f2c1d04",
       default_note: "Defaulted to the judged run's repo.",
       ...over,
@@ -2219,11 +2219,10 @@ describe("JudgePanel (PRD #46 M4)", () => {
     fireEvent.click(await screen.findByText("File issue"));
     expect(mockApi.getIssueDraft).toHaveBeenCalledWith("r1", "rc1");
     expect(await screen.findByText("Draft issue")).toBeTruthy();
-    // Provenance is prominent (Decision 8), labels are the server-assembled pair, and the
-    // title is an editable field seeded from the draft.
+    // Provenance is prominent (Decision 8), the label is the server-assembled `uzi`
+    // label (PRD #764), and the title is an editable field seeded from the draft.
     expect(screen.getByText(/from vlad's worker, run 8f2c1d04/)).toBeTruthy();
-    expect(screen.getByText("PRD")).toBeTruthy();
-    expect(screen.getByText("PRDLESS")).toBeTruthy();
+    expect(screen.getByText("uzi")).toBeTruthy();
     expect(
       (
         screen.getByDisplayValue(

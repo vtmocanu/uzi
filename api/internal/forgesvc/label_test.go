@@ -50,41 +50,41 @@ func TestSetIssueLabelApplyCreatesLabelAndCaches(t *testing.T) {
 	f := &fakeForge{}
 	issue := labeledIssue(4, false, "PRD", "In Progress")
 
-	got, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "PRDLESS", PrdlessLabelColor, true)
+	got, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "uzi", PromoteLabelColor, true)
 	if err != nil {
 		t.Fatalf("SetIssueLabel: %v", err)
 	}
 
-	// EnsureLabels auto-creates the label once, pinned to the prdless color.
+	// EnsureLabels auto-creates the label once, pinned to the promote color.
 	if len(f.ensureCalls) != 1 || len(f.ensureCalls[0]) != 1 {
 		t.Fatalf("EnsureLabels calls = %+v, want one call with one label", f.ensureCalls)
 	}
-	if l := f.ensureCalls[0][0]; l.Name != "PRDLESS" || l.Color != PrdlessLabelColor {
-		t.Fatalf("ensured label = %+v, want {PRDLESS %s}", l, PrdlessLabelColor)
+	if l := f.ensureCalls[0][0]; l.Name != "uzi" || l.Color != PromoteLabelColor {
+		t.Fatalf("ensured label = %+v, want {uzi %s}", l, PromoteLabelColor)
 	}
 	// Exactly one UpdateIssueLabels: add the one label, remove nothing.
-	if len(f.updateCalls) != 1 || !slices.Equal(f.updateCalls[0].add, []string{"PRDLESS"}) || len(f.updateCalls[0].remove) != 0 {
-		t.Fatalf("UpdateIssueLabels calls = %+v, want one add=[PRDLESS] remove=[]", f.updateCalls)
+	if len(f.updateCalls) != 1 || !slices.Equal(f.updateCalls[0].add, []string{"uzi"}) || len(f.updateCalls[0].remove) != 0 {
+		t.Fatalf("UpdateIssueLabels calls = %+v, want one add=[uzi] remove=[]", f.updateCalls)
 	}
 	// Cache: the one label appended to the existing set (order preserved), and
 	// has_prd_link carried through verbatim (NOT recomputed to true).
 	if len(st.upserts) != 1 {
 		t.Fatalf("upserts = %d, want 1", len(st.upserts))
 	}
-	assertLabels(t, st.upserts[0].Labels, []string{"PRD", "In Progress", "PRDLESS"})
+	assertLabels(t, st.upserts[0].Labels, []string{"PRD", "In Progress", "uzi"})
 	if st.upserts[0].HasPrdLink {
 		t.Fatal("has_prd_link must be preserved verbatim (false), never re-derived")
 	}
-	assertLabels(t, got.Labels, []string{"PRD", "In Progress", "PRDLESS"})
+	assertLabels(t, got.Labels, []string{"PRD", "In Progress", "uzi"})
 }
 
 func TestSetIssueLabelApplyIdempotentSkipsForge(t *testing.T) {
 	st := &fakeStore{}
 	svc := newLabelSvc(st)
 	f := &fakeForge{}
-	issue := labeledIssue(4, true, "PRD", "PRDLESS")
+	issue := labeledIssue(4, true, "PRD", "uzi")
 
-	got, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "PRDLESS", PrdlessLabelColor, true)
+	got, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "uzi", PromoteLabelColor, true)
 	if err != nil {
 		t.Fatalf("SetIssueLabel: %v", err)
 	}
@@ -95,24 +95,24 @@ func TestSetIssueLabelApplyIdempotentSkipsForge(t *testing.T) {
 	if len(st.upserts) != 0 {
 		t.Fatal("idempotent apply must not write the cache")
 	}
-	assertLabels(t, got.Labels, []string{"PRD", "PRDLESS"})
+	assertLabels(t, got.Labels, []string{"PRD", "uzi"})
 }
 
 func TestSetIssueLabelRemovePreservesOtherLabels(t *testing.T) {
 	st := &fakeStore{}
 	svc := newLabelSvc(st)
 	f := &fakeForge{}
-	issue := labeledIssue(4, true, "PRD", "PRDLESS", "In Progress")
+	issue := labeledIssue(4, true, "PRD", "uzi", "In Progress")
 
-	if _, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "PRDLESS", PrdlessLabelColor, false); err != nil {
+	if _, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "uzi", PromoteLabelColor, false); err != nil {
 		t.Fatalf("SetIssueLabel: %v", err)
 	}
 	// Remove never creates a label.
 	if len(f.ensureCalls) != 0 {
 		t.Fatalf("remove must not call EnsureLabels, got %+v", f.ensureCalls)
 	}
-	if len(f.updateCalls) != 1 || len(f.updateCalls[0].add) != 0 || !slices.Equal(f.updateCalls[0].remove, []string{"PRDLESS"}) {
-		t.Fatalf("UpdateIssueLabels calls = %+v, want one add=[] remove=[PRDLESS]", f.updateCalls)
+	if len(f.updateCalls) != 1 || len(f.updateCalls[0].add) != 0 || !slices.Equal(f.updateCalls[0].remove, []string{"uzi"}) {
+		t.Fatalf("UpdateIssueLabels calls = %+v, want one add=[] remove=[uzi]", f.updateCalls)
 	}
 	// Cache: only the one label dropped, everything else kept in order; has_prd_link
 	// preserved (true).
@@ -128,7 +128,7 @@ func TestSetIssueLabelRemoveIdempotentSkipsForge(t *testing.T) {
 	f := &fakeForge{}
 	issue := labeledIssue(4, false, "PRD")
 
-	if _, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "PRDLESS", PrdlessLabelColor, false); err != nil {
+	if _, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "uzi", PromoteLabelColor, false); err != nil {
 		t.Fatalf("SetIssueLabel: %v", err)
 	}
 	if len(f.updateCalls) != 0 || len(st.upserts) != 0 {
@@ -142,7 +142,7 @@ func TestSetIssueLabelForgeFailureLeavesCacheUntouched(t *testing.T) {
 	f := &fakeForge{updateErr: errors.New("forge down")}
 	issue := labeledIssue(4, false, "PRD")
 
-	if _, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "PRDLESS", PrdlessLabelColor, true); err == nil {
+	if _, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "uzi", PromoteLabelColor, true); err == nil {
 		t.Fatal("expected the forge error to propagate")
 	}
 	if len(st.upserts) != 0 {
@@ -156,7 +156,7 @@ func TestSetIssueLabelEnsureFailureAbortsBeforeUpdate(t *testing.T) {
 	f := &fakeForge{ensureErr: errors.New("cannot create label")}
 	issue := labeledIssue(4, false, "PRD")
 
-	if _, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "PRDLESS", PrdlessLabelColor, true); err == nil {
+	if _, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "uzi", PromoteLabelColor, true); err == nil {
 		t.Fatal("expected the EnsureLabels error to propagate")
 	}
 	if len(f.updateCalls) != 0 {
