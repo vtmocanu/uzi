@@ -510,6 +510,10 @@ new review object.
   HEAD" range was **absent** while `final_review_risk` was present. `watch-pr.sh` now confirms
   "reviewed this head" from EITHER the range's trailing SHA OR that `up to` short-sha marker; a poller you hand-roll must
   do the same, or a clean re-review reads as never-landed and you time out on a merge-ready PR.
+  Parse each SHA only **inside its own marker block**, and only when **exactly one** walkthrough
+  comment exists (fail closed on 0 or >1) — otherwise an unrelated `up to` / `and <sha>` phrase
+  elsewhere in the body can forge a `reviewed_head=1` and, with zero live findings, a false
+  auto-merge. That is the "exactly one match, fail closed" contract above, now enforced in the script.
 - **An ADDRESSED finding keeps `line != null`; it is NOT outdated — do not count it as live.**
   The `line: null`/`original_line` "outdated" signal in (b) above is only ONE of the two ways a
   finding stops being live. When CodeRabbit judges a finding FIXED by a later commit it leaves

@@ -110,17 +110,26 @@ while [ "$i" -lt "$MAX" ]; do
   # covers the zero-actionable incremental case (that posts no review object). TWO formats are
   # accepted because CodeRabbit is migrating between them (both observed 2026-08-29): the older
   # `recent_review` "... between BASE and HEAD" range, and the newer `final_review_risk` block
-  # "**Merge Risk:** ... · up to `<short-sha>`". Either one naming the current head confirms it
-  # was reviewed. The walkthrough body is fetched once and both markers are checked against it.
+  # "**Merge Risk:** ... · up to `<short-sha>`". Either one naming the current head confirms it.
+  #
+  # FAIL CLOSED, because reviewed_head=1 + live=0 is the auto-merge trigger: (1) exactly ONE
+  # walkthrough comment is expected (CodeRabbit edits it in place) — 0 or >1 means don't trust
+  # signal (c) at all, leave reviewed_head to signal (a); and (2) each SHA is parsed only inside
+  # its OWN marker block, so an unrelated "up to `<sha>`" or "and <sha>" phrase elsewhere in the
+  # body cannot forge a match. The exact bot login is matched so a crafted comment can't spoof it.
   if issue_c=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null); then
-    wt_body=$(printf '%s' "$issue_c" | jq -rs '.[][]|select(.user.login=="coderabbitai[bot]")|select(.body|contains("<!-- walkthrough_start -->"))|.body' 2>/dev/null || true)
-    # (c1) recent_review range: "... and <head>"
-    wt_head=$(printf '%s' "$wt_body" | grep -oE 'and [0-9a-f]{7,40}' | tail -1 | awk '{print $2}' || true)
-    if [ -n "$wt_head" ] && printf '%s' "$head" | grep -q "^$wt_head"; then reviewed_head=1; fi
-    # (c2) final_review_risk marker: "up to `<sha>`" (short or full)
-    # shellcheck disable=SC2016  # the backticks are LITERAL text in CodeRabbit's marker, not a subshell
-    fr_head=$(printf '%s' "$wt_body" | grep -oE 'up to `[0-9a-f]{5,40}`' | tail -1 | grep -oE '[0-9a-f]{5,40}' || true)
-    if [ -n "$fr_head" ] && printf '%s' "$head" | grep -q "^$fr_head"; then reviewed_head=1; fi
+    wt_count=$(printf '%s' "$issue_c" | jq -rs '[.[][]|select(.user.login=="coderabbitai[bot]")|select(.body|contains("<!-- walkthrough_start -->"))]|length' 2>/dev/null || echo 0)
+    if [ "${wt_count:-0}" -eq 1 ]; then
+      wt_body=$(printf '%s' "$issue_c" | jq -rs '.[][]|select(.user.login=="coderabbitai[bot]")|select(.body|contains("<!-- walkthrough_start -->"))|.body' 2>/dev/null || true)
+      # (c1) recent_review range: the "between BASE and HEAD" phrase only; HEAD is the 2nd SHA.
+      wt_head=$(printf '%s' "$wt_body" | grep -oiE 'between [0-9a-f]{7,40} and [0-9a-f]{7,40}' | tail -1 | grep -oE '[0-9a-f]{7,40}' | tail -1 || true)
+      if [ -n "$wt_head" ] && printf '%s' "$head" | grep -q "^$wt_head"; then reviewed_head=1; fi
+      # (c2) final_review_risk marker: "up to `<sha>`" parsed ONLY within the final_review_risk block.
+      fr_block=$(printf '%s' "$wt_body" | awk '/final_review_risk_start/{f=1} f{print} /final_review_risk_end/{f=0}')
+      # shellcheck disable=SC2016  # the backticks are LITERAL text in CodeRabbit's marker, not a subshell
+      fr_head=$(printf '%s' "$fr_block" | grep -oE 'up to `[0-9a-f]{5,40}`' | tail -1 | grep -oE '[0-9a-f]{5,40}' || true)
+      if [ -n "$fr_head" ] && printf '%s' "$head" | grep -q "^$fr_head"; then reviewed_head=1; fi
+    fi
   else
     unknown=1
   fi
