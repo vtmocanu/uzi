@@ -72,7 +72,7 @@ The allowlist governs *permission*; the baked toolchain (the shared devbox
 manifest at `agent/devbox-global/devbox.json`) governs *availability* — and
 the two are tied together by a **server-side gate**, not by egress: saving a
 tool profile or claiming a run rejects a permitted-but-unbaked package
-outright, so it would otherwise hang and fail at run time. (On a hosted
+outright — which would otherwise hang and fail at run time. (On a hosted
 kube-native worker the devbox resolver is reachable — see below — so egress
 no longer blocks resolving an unbaked package; the server-side gate is what
 still enforces baked-only.) Adding an unbaked package is rejected with a 400 naming it and stating it
