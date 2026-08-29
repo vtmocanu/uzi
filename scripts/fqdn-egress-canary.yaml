@@ -54,6 +54,13 @@ spec:
       ports:
         - protocol: TCP
           port: 443
+    - name: allow-devbox-nixpkgs-api
+      action: Allow
+      to:
+        - fqdn: "api.github.com"
+      ports:
+        - protocol: TCP
+          port: 443
     - name: allow-cnpg-oci-registry
       action: Allow
       to:

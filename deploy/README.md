@@ -456,9 +456,13 @@ is selected by the same ANNP `appliedTo` and is an equally valid target.
    kubectl -n uzi-workers exec <pod> -- curl --max-time 5 -sS -o /dev/null -w '%{http_code}\n' https://gitlab.example.com
    kubectl -n uzi-workers exec <pod> -- curl --max-time 5 -sS -o /dev/null -w '%{http_code}\n' https://api.anthropic.com
    kubectl -n uzi-workers exec <pod> -- curl --max-time 5 -sS -o /dev/null -w '%{http_code}\n' https://ghcr.io
+   kubectl -n uzi-workers exec <pod> -- curl --max-time 5 -sS -o /dev/null -w '%{http_code}\n' https://search.devbox.sh
+   kubectl -n uzi-workers exec <pod> -- curl --max-time 5 -sS -o /dev/null -w '%{http_code}\n' https://api.github.com
 
    # off-allowlist — expect a hang/timeout, not a response
-   kubectl -n uzi-workers exec <pod> -- curl --max-time 5 -sS -o /dev/null -w '%{http_code}\n' https://api.github.com
+   # (api.github.com and search.devbox.sh are ALLOWLISTED devbox/nixpkgs hosts, above;
+   #  codeload.github.com — the nixpkgs source tarball — is the off-allowlist example)
+   kubectl -n uzi-workers exec <pod> -- curl --max-time 5 -sS -o /dev/null -w '%{http_code}\n' https://codeload.github.com
    kubectl -n uzi-workers exec <pod> -- curl --max-time 5 -sS -o /dev/null -w '%{http_code}\n' https://example.com
    ```
 

@@ -23242,3 +23242,32 @@ hanging on the kube-native tier rather than a build-time failure.
 - Full rationale, verified facts, and Decision Log D1–D7: `prds/808-worker-egress-single-source.md`
   (stays under `prds/` as `Status: merged, blocked-on-maintainer` until an operator reconciles the
   private per-deployment values — not moved to `prds/done/` by this change).
+
+## 589. issue #818 — complete #808's kube-native worker egress: `api.github.com` is a required devbox/nixpkgs host, not a forge host
+
+Serves human: PRD #808's canonical worker-egress set omitted `api.github.com`, which the kube-native
+(FQDN-restricted) worker needs for devbox tool provisioning. `devbox install` resolves the floating
+`nixpkgs-unstable` ref for its generated dev-env flake (`print-dev-env`) via
+`api.github.com/repos/NixOS/nixpkgs/commits/nixpkgs-unstable`; with that host blocked, `devbox install`
+fails AFTER fetching the packages, so a fresh kube-native deployment using the shipped chart default
+cannot provision tools (it worked on the live cluster only via an interim per-cluster stopgap).
+
+- **Empirically verified (2026-08-29, live kube-native tier).** With `api.github.com` + `search.devbox.sh`
+  + `cache.nixos.org` reachable and `codeload.github.com` / `objects.githubusercontent.com` blocked, both
+  baked and non-baked `devbox install` succeed, substituting store paths from `cache.nixos.org`;
+  blackholing `api.github.com` reproduces the failure at the `nixpkgs-unstable` branch resolution.
+  `codeload`/`objects` are never needed.
+- **`api.github.com` is a devbox/nixpkgs host, forge-INDEPENDENT.** nixpkgs lives on GitHub regardless of
+  the deployment's own forge, so it belongs in the chart-default `allowFQDNs` devbox host group (beside
+  `search.devbox.sh`), NOT the forge-derived set. Added to `deploy/chart/values.yaml`,
+  `deploy/values/ci-render.yaml`, the guard's `STATIC_HOSTS` (`scripts/assert-chart-render.sh`), and the
+  guard canary; a deliberate widening (per #808 D6/R4) backstopped by the server-side tier-1 admin allowlist.
+  Note this re-adds a host that #285 removed for a DIFFERENT reason: #285 repointed the CNPG OCI fetch to
+  ghcr.io and dropped `api.github.com` because CNPG no longer needed it; #818 re-adds it because devbox
+  provisioning does — a distinct purpose, not a #285 regression.
+- **Pinning the nixpkgs rev on the worker does NOT remove this dependency.** Measured: a pinned rev trades
+  `api.github.com` (branch metadata) for the `github.com/NixOS/nixpkgs/archive/<rev>.tar.gz` → `codeload.github.com`
+  SOURCE tarball, which is also blocked (the baked eval cache is root-owned `0700`, so the worker uid cannot
+  reuse it). This is #123 Decision 2's "the source fetch remains" warning, confirmed. Fully removing both
+  `search.devbox.sh` and `api.github.com` requires server-side store-path resolution (the api resolves to nix
+  store paths, the worker substitutes by path from `cache.nixos.org` only) — a larger, deferred design (cross-ref #123).
