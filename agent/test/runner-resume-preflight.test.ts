@@ -92,6 +92,9 @@ describe("RunRunner — resume preflight (issue #105)", () => {
       assert.match(notice, /work may be repeated/);
       // The same dropped-resume path also carries a stable, low-cardinality tag so a
       // maintainer can aggregate lineage-break frequency from the run feed (issue #334).
+      // PRD #632's server-side epoch bump now parses exactly this shape (a `status`
+      // message with `event: "resume_lineage_break"`), so this assertion also guards
+      // that ingestion contract.
       const events = api
         .messages(claim.run_id)
         .filter((m) => m.kind === "status")

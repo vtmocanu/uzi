@@ -163,10 +163,14 @@ type fakeStore struct {
 	insertedMessages []store.InsertRunMessageParams
 	// upsertedUsage records every UpsertRunUsage call (PRD #40 fold); usageErr, if
 	// set, makes the fold's upsert fail (to prove a DB error propagates).
-	upsertedUsage    []store.UpsertRunUsageParams
-	usageErr         error
-	lastSeqUpdated   *int32
-	setRunningParams *store.SetRunRunningParams
+	upsertedUsage []store.UpsertRunUsageParams
+	usageErr      error
+	// lineageEpochBumps counts BumpRunLineageEpoch calls (PRD #632); bumpErr, if
+	// set, makes the bump fail (to prove a store error propagates raw).
+	lineageEpochBumps int
+	bumpErr           error
+	lastSeqUpdated    *int32
+	setRunningParams  *store.SetRunRunningParams
 	// PRD #628 M4: the milestones_completed clear recorder. clearMilestonesParams is nil
 	// until ClearRunMilestonesCompleted is called (so a test proves the clear did NOT fire
 	// when seeded_from_default is nil/false), and clearBeforeRunning records whether the
@@ -735,6 +739,13 @@ func (f *fakeStore) UpsertRunUsage(_ context.Context, arg store.UpsertRunUsagePa
 		return f.usageErr
 	}
 	f.upsertedUsage = append(f.upsertedUsage, arg)
+	return nil
+}
+func (f *fakeStore) BumpRunLineageEpoch(_ context.Context, _ uuid.UUID) error {
+	if f.bumpErr != nil {
+		return f.bumpErr
+	}
+	f.lineageEpochBumps++
 	return nil
 }
 func (f *fakeStore) SetRunRunning(_ context.Context, arg store.SetRunRunningParams) (int64, error) {
@@ -2178,6 +2189,88 @@ func TestAppendMessagesFoldsOnRedeliveredBatch(t *testing.T) {
 	if len(fs.upsertedUsage) != 2 {
 		t.Fatalf("fold must run on the re-delivered (deduped) batch too: got %d upserts, want 2", len(fs.upsertedUsage))
 	}
+}
+
+// PRD #632: appendMessages bumps runs.lineage_epoch once per newly-inserted
+// resume_lineage_break status event, mirrors that bump into the in-memory run
+// before folding, and foldRunUsage stamps the (possibly-bumped) epoch onto every
+// UpsertRunUsage. This exercises all three arms — stamp, same-batch bump+stamp,
+// and no-double-bump on re-delivery — against the fake store.
+func TestAppendMessagesStampsLineageEpochAndBumps(t *testing.T) {
+	// (a) Stamp: a run already at epoch 3 folds a normal result frame (no break).
+	// Every upserted row carries LineageEpoch == 3, and nothing bumps.
+	t.Run("stamps current epoch, no bump", func(t *testing.T) {
+		w := worker()
+		fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), SessionID: pgText("sess-1"), LineageEpoch: 3}}
+		svc := New(fs, newBox(t), testParams())
+
+		msgs := []IncomingMessage{{Seq: 1, Kind: "status", Agent: "lead", Payload: json.RawMessage(
+			`{"event":"result","modelUsage":{"claude-fable-5":{"inputTokens":100,"outputTokens":50,"costUSD":0.001}}}`)}}
+		if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, msgs); err != nil {
+			t.Fatalf("AppendMessages: %v", err)
+		}
+		if fs.lineageEpochBumps != 0 {
+			t.Fatalf("no break message → no bump, got %d", fs.lineageEpochBumps)
+		}
+		if len(fs.upsertedUsage) != 1 {
+			t.Fatalf("expected 1 usage upsert, got %d", len(fs.upsertedUsage))
+		}
+		for _, u := range fs.upsertedUsage {
+			if u.LineageEpoch != 3 {
+				t.Fatalf("fold must stamp the run's current epoch 3, got %d", u.LineageEpoch)
+			}
+		}
+	})
+
+	// (b) Same-batch bump + stamp: a run at epoch 0 receives ONE batch = [ break at
+	// seq 1, result frame at seq 2 ]. The bump commits (epoch → 1) and is mirrored
+	// into the in-memory run BEFORE the fold, so the folded row carries epoch 1.
+	t.Run("same-batch bump then stamp", func(t *testing.T) {
+		w := worker()
+		fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), SessionID: pgText("sess-b"), LineageEpoch: 0}}
+		svc := New(fs, newBox(t), testParams())
+
+		msgs := []IncomingMessage{
+			{Seq: 1, Kind: "status", Agent: "lead", Payload: json.RawMessage(`{"event":"resume_lineage_break"}`)},
+			{Seq: 2, Kind: "status", Agent: "lead", Payload: json.RawMessage(
+				`{"event":"result","modelUsage":{"claude-fable-5":{"inputTokens":100,"outputTokens":50,"costUSD":0.001}}}`)},
+		}
+		if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, msgs); err != nil {
+			t.Fatalf("AppendMessages: %v", err)
+		}
+		if fs.lineageEpochBumps != 1 {
+			t.Fatalf("one break event → exactly one bump, got %d", fs.lineageEpochBumps)
+		}
+		if len(fs.upsertedUsage) != 1 {
+			t.Fatalf("expected 1 usage upsert (only the result frame folds), got %d", len(fs.upsertedUsage))
+		}
+		if fs.upsertedUsage[0].LineageEpoch != 1 {
+			t.Fatalf("the mirror must apply the bump before the fold: want epoch 1, got %d", fs.upsertedUsage[0].LineageEpoch)
+		}
+	})
+
+	// (c) No double-bump on re-delivery: the same break-only batch delivered TWICE
+	// bumps exactly once — the seq-deduped re-delivery is absent from `inserted`. A
+	// break message alone folds no usage.
+	t.Run("no double bump on re-delivery", func(t *testing.T) {
+		w := worker()
+		fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), SessionID: pgText("sess-c"), LineageEpoch: 0}}
+		svc := New(fs, newBox(t), testParams())
+
+		batch := []IncomingMessage{{Seq: 1, Kind: "status", Agent: "lead", Payload: json.RawMessage(`{"event":"resume_lineage_break"}`)}}
+		if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, batch); err != nil {
+			t.Fatalf("first delivery: %v", err)
+		}
+		if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, batch); err != nil {
+			t.Fatalf("re-delivery: %v", err)
+		}
+		if fs.lineageEpochBumps != 1 {
+			t.Fatalf("re-delivered break is seq-deduped (absent from inserted) → no second bump: want 1, got %d", fs.lineageEpochBumps)
+		}
+		if len(fs.upsertedUsage) != 0 {
+			t.Fatalf("a break message alone folds no usage, got %d upserts", len(fs.upsertedUsage))
+		}
+	})
 }
 
 // Chat runs (PRD #39) are OUT of scope for usage accounting (PRD #40), but

@@ -59,10 +59,10 @@ func TestUpsertRunUsageMergeLiveDB(t *testing.T) {
 	numericFromMicros := func(usd float64) pgtype.Numeric {
 		return pgtype.Numeric{Int: big.NewInt(int64(usd*1e6 + 0.5)), Exp: -6, Valid: true}
 	}
-	fold := func(session string, in, cacheR, cacheC, out int64, cost float64) {
+	fold := func(session string, epoch int32, in, cacheR, cacheC, out int64, cost float64) {
 		t.Helper()
 		if err := q.UpsertRunUsage(ctx, store.UpsertRunUsageParams{
-			RunID: runID, SessionID: session, Model: model,
+			RunID: runID, SessionID: session, Model: model, LineageEpoch: epoch,
 			InputTokens: in, CacheReadTokens: cacheR, CacheCreationTokens: cacheC, OutputTokens: out,
 			CostUsd: numericFromMicros(cost),
 		}); err != nil {
@@ -90,7 +90,7 @@ func TestUpsertRunUsageMergeLiveDB(t *testing.T) {
 	}
 
 	// Phase 1 result frame (cumulative-to-phase-1).
-	fold("sess-1", 1000, 200, 50, 400, 0.010)
+	fold("sess-1", 0, 1000, 200, 50, 400, 0.010)
 	if in, out := tokensOf("sess-1"); in != 1000 || out != 400 {
 		t.Fatalf("phase-1 row wrong: in=%d out=%d", in, out)
 	}
@@ -100,7 +100,7 @@ func TestUpsertRunUsageMergeLiveDB(t *testing.T) {
 
 	// Phase 2 resumes sess-1: under verdict (b) the frame is cumulative, so a HIGHER
 	// snapshot lands on the SAME key. GREATEST advances the row.
-	fold("sess-1", 1800, 500, 90, 700, 0.019)
+	fold("sess-1", 0, 1800, 500, 90, 700, 0.019)
 	if in, out := tokensOf("sess-1"); in != 1800 || out != 700 {
 		t.Fatalf("phase-2 merge should advance to the higher cumulative: in=%d out=%d", in, out)
 	}
@@ -110,7 +110,7 @@ func TestUpsertRunUsageMergeLiveDB(t *testing.T) {
 
 	// Crash-retry re-delivers the phase-1 (LOWER) frame after phase-2. GREATEST must
 	// NOT regress the row — the "re-delivery changes nothing" guarantee.
-	fold("sess-1", 1000, 200, 50, 400, 0.010)
+	fold("sess-1", 0, 1000, 200, 50, 400, 0.010)
 	if in, out := tokensOf("sess-1"); in != 1800 || out != 700 {
 		t.Fatalf("re-delivered earlier frame must not regress the row: in=%d out=%d", in, out)
 	}
@@ -118,9 +118,10 @@ func TestUpsertRunUsageMergeLiveDB(t *testing.T) {
 		t.Fatal("re-delivered lower cost must not regress the row")
 	}
 
-	// A DISTINCT evolved session id carries the same model's cumulative forward (the
-	// SDK accumulator is restored on resume). Two session rows now exist for the model.
-	fold("sess-2", 2500, 800, 120, 1100, 0.033)
+	// A DISTINCT evolved session id, and a DISTINCT epoch (leg 2 of a broken lineage):
+	// the dropped-resume fresh leg lands under its own (run, session) row. Two session
+	// rows now exist for the model, carrying epochs 0 and 1.
+	fold("sess-2", 1, 2500, 800, 120, 1100, 0.033)
 
 	// The (b) rollup is latest/MAX per (run_id, model) — NEVER a SUM across session
 	// rows, which would over-count the cumulative snapshots. This is the rule M3 must
@@ -136,6 +137,43 @@ func TestUpsertRunUsageMergeLiveDB(t *testing.T) {
 	}
 	if sumIn <= maxIn {
 		t.Fatalf("test setup bug: SUM (%d) should exceed MAX (%d) so the over-count is demonstrable", sumIn, maxIn)
+	}
+
+	// Row-splitter precondition (PRD #632): the two legs MUST persist as SEPARATE
+	// run_usage rows under distinct session_ids — that separation comes from
+	// session_id (the conflict key is (run_id, session_id, model), NOT lineage_epoch),
+	// and it is what lets the view SUM the legs instead of GREATEST-collapsing them at
+	// the row level. Assert exactly two rows for this (run, model), keyed {sess-1,
+	// sess-2}, and that each carries its expected epoch (sess-1 → 0, sess-2 → 1). This
+	// guards the row-splitter, not merely the epoch stamp: a future change to the
+	// onSessionId latch or the SetRunRunning COALESCE that collapsed the legs onto one
+	// session_id would fail HERE even if the epoch stamp still worked.
+	epochBySession := map[string]int32{}
+	rows2, err := pool.Query(ctx,
+		`SELECT session_id, lineage_epoch FROM run_usage WHERE run_id=$1 AND model=$2`, runID, model)
+	if err != nil {
+		t.Fatalf("read legs: %v", err)
+	}
+	defer rows2.Close()
+	for rows2.Next() {
+		var sess string
+		var epoch int32
+		if err := rows2.Scan(&sess, &epoch); err != nil {
+			t.Fatalf("scan leg: %v", err)
+		}
+		epochBySession[sess] = epoch
+	}
+	if err := rows2.Err(); err != nil {
+		t.Fatalf("iterate legs: %v", err)
+	}
+	if len(epochBySession) != 2 {
+		t.Fatalf("the two legs must persist as 2 distinct-session rows, got %d: %+v", len(epochBySession), epochBySession)
+	}
+	if e, ok := epochBySession["sess-1"]; !ok || e != 0 {
+		t.Fatalf("leg 1 must be session sess-1 at epoch 0, got %+v", epochBySession)
+	}
+	if e, ok := epochBySession["sess-2"]; !ok || e != 1 {
+		t.Fatalf("leg 2 must be session sess-2 at epoch 1, got %+v", epochBySession)
 	}
 }
 
@@ -179,6 +217,9 @@ func TestUsageRollupsLiveDB(t *testing.T) {
 	}
 	userA, repoA := seedUserRepo("a")
 	userB, repoB := seedUserRepo("b")
+	// A third user isolates the broken-lineage run so it cannot perturb the absolute
+	// SelfUsage / AdminUsagePerUser assertions for userA/userB below (PRD #632 M5).
+	userC, repoC := seedUserRepo("c")
 
 	iid := int64(0)
 	seedRun := func(userID, repoID uuid.UUID, daysAgo int) uuid.UUID {
@@ -190,10 +231,16 @@ func TestUsageRollupsLiveDB(t *testing.T) {
 			id, userID, repoID, iid, daysAgo)
 		return id
 	}
-	insUsage := func(runID uuid.UUID, session, model string, in, out int64) {
+	// insUsageEpoch inserts a run_usage row including its lineage_epoch (PRD #632).
+	insUsageEpoch := func(runID uuid.UUID, session, model string, epoch int32, in, out int64) {
 		mustExec(ctx, t, pool,
-			`INSERT INTO run_usage (run_id, session_id, model, input_tokens, output_tokens, cost_usd)
-			 VALUES ($1, $2, $3, $4, $5, 0)`, runID, session, model, in, out)
+			`INSERT INTO run_usage (run_id, session_id, model, lineage_epoch, input_tokens, output_tokens, cost_usd)
+			 VALUES ($1, $2, $3, $4, $5, $6, 0)`, runID, session, model, epoch, in, out)
+	}
+	// insUsage keeps the epoch-0 call sites (and their exact totals) byte-identical —
+	// the no-restatement / byte-identity regression guard (Success Criterion 3).
+	insUsage := func(runID uuid.UUID, session, model string, in, out int64) {
+		insUsageEpoch(runID, session, model, 0, in, out)
 	}
 
 	// Run A1: model X across two sessions (cumulative snapshots 1000 → 1500; MAX=1500)
@@ -211,6 +258,15 @@ func TestUsageRollupsLiveDB(t *testing.T) {
 	b1 := seedRun(userB, repoB, 0)
 	insUsage(b1, "s1", "modelX", 300, 100)
 
+	// Run BL (userC): a genuine BROKEN lineage — a dropped resume latched a fresh SDK
+	// session, so leg 2 is a DISTINCT session_id AND a DISTINCT epoch, accumulating
+	// from 0 (its 500/200 sits BELOW leg 1's 2000/800). The rewritten view MAXes
+	// within (run, model, epoch) then SUMs across epochs, so the run total is the SUM
+	// of the two per-epoch maxima: 2000+500 = 2500 input, 800+200 = 1000 output.
+	bl := seedRun(userC, repoC, 0)
+	insUsageEpoch(bl, "s1", "modelX", 0, 2000, 800) // leg 1: earlier lineage, epoch 0
+	insUsageEpoch(bl, "s2", "modelX", 1, 500, 200)  // leg 2: dropped-resume fresh leg, epoch 1, below leg 1
+
 	// --- per-run total: MAX per model, summed across models (NOT a SUM of snapshots).
 	rt, err := q.GetRunUsageTotal(ctx, a1)
 	if err != nil {
@@ -222,6 +278,23 @@ func TestUsageRollupsLiveDB(t *testing.T) {
 	// A pre-feature run has no view row → ErrNoRows (the handler renders "no usage").
 	if _, err := q.GetRunUsageTotal(ctx, a3); err == nil {
 		t.Fatal("GetRunUsageTotal(a3) must return no row for a run with no usage")
+	}
+
+	// --- broken-lineage run total, read THROUGH the view (PRD #632, the fix proof).
+	// The rewritten view groups MAX within (run, model, epoch) then SUMs across
+	// epochs, so BL = (MAX epoch0=2000) + (MAX epoch1=500) = 2500 input, 800+200 =
+	// 1000 output. The OLD view (MAX per (run, model), no epoch) would have returned
+	// 2000/800 — MAX-masking the smaller leg 2 entirely — so this assertion is exactly
+	// what proves the epoch SUM landed.
+	blt, err := q.GetRunUsageTotal(ctx, bl)
+	if err != nil {
+		t.Fatalf("GetRunUsageTotal(bl): %v", err)
+	}
+	if blt.InputTokens != 2500 || blt.OutputTokens != 1000 {
+		t.Fatalf("broken-lineage BL total = in %d/out %d, want 2500/1000 (SUM of per-epoch maxima 2000+500, 800+200); the old MAX-masking view would have returned 2000/800", blt.InputTokens, blt.OutputTokens)
+	}
+	if blt.InputTokens == 2000 {
+		t.Fatal("BL input == 2000 means the view MAX-masked leg 2 — the epoch SUM did not land")
 	}
 
 	// --- SelfUsage: sums exactly the caller's runs, honours the window + run count.
