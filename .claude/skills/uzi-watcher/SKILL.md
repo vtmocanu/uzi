@@ -67,7 +67,9 @@ Below, a run id is written `RUN` and a PR number `PR` in the example commands.
    result → diagnose (see *When a run fails*) and stop.
 6. **Get the MR and review the diff.** `uzi run get RUN --field mr_web_url`, then review
    (see *Reviewing the diff* below), plus `gh pr diff`. Verify the diff against the
-   approved plan.
+   approved plan. **Once any review finding lands (CodeRabbit, a human reviewer, or another
+   review bot), uzi's own `mr_rework` usually fixes it itself** — defer to it and review its
+   fix before merging (see *uzi may fix the CodeRabbit findings ITSELF*).
 7. **Merge** (see *Merging past branch protection*).
 8. **Watch post-merge CI and fix** (see *Post-merge CI*).
 
@@ -240,6 +242,99 @@ tracking ref never held: `git apply r/issue-N.uncommitted.patch` if that file is
 not-yet-added files, which the patch does not). Then `git rebase origin/main` and gate +
 PR + admin-merge as above.
 
+## uzi may fix the CodeRabbit findings ITSELF (mr_rework) — coordinate, don't collide
+
+**Before you fix a finding locally or merge, check whether uzi is already reworking the
+MR.** The **MR review-watcher** (`mr_rework`, `docs/mr-review-watcher.md`) is **on by
+default** for every opted-in user (opt-in is itself the default), with a per-user opt-out
+and an admin `mr_rework_enabled` kill-switch. On the same poll tick that watches MRs, uzi
+checks every open MR of one of your **completed issue runs** and — when the head pipeline
+is **green**, the review has **settled** (newest comment a few minutes old, written against
+the current head), there is **≥1 review comment it has not acted on**, and the MR is under
+its per-MR rework cap — queues an **auto-approved `mr_rework` run**. That run reads the
+review comments (**CodeRabbit's included**; human reviewers too; uzi's own status notes
+filtered out), reworks the branch **in place** on the same `agent/issue-*` branch, replies
+in-thread and resolves threads, and **pushes a fix commit**. It **never merges** (the four
+guardrail layers still hold), so the merge stays THIS session's job.
+
+The hazard is a **double-fix collision**: if this session also amends the same branch, the
+two pushes race and conflict, and merging under an in-flight rework throws its work away
+(or fails it against a closed MR). **Measured 2026-08-29** on PR #792 (issue #676): an
+`mr_rework` run (`3374fbf4`, `mr_iid:792`) fixed a CodeRabbit test-scoping finding in place
+while this session was about to merge — caught only by listing `kind=mr_rework` runs, not
+by anything on the PR itself.
+
+**The coordination rule, folded into the flow:**
+
+1. **When ANY review finding lands, check for an `mr_rework` run on this MR before touching
+   anything.** `mr_rework` consumes every unacted review comment — CodeRabbit, a **human
+   reviewer**, and any **third-party review bot** — not just CodeRabbit, so gate the check
+   on *any* finding, or a human/other-bot finding slips into the local-fix path while a
+   rework is being queued and recreates the double-push collision:
+   ```sh
+   uzi run list --json | jq -r --arg repo REPO_ID --argjson pr PR \
+     '.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr)|{id,status}'
+   ```
+   **Filter on `repo_id` too, not `mr_iid` alone:** `mr_iid` is a per-repo MR number, so
+   across the several repos this skill may drive, two repos can each have an MR with the
+   same number — an `mr_iid`-only match can point at another repo's rework. `mr_rework`
+   runs carry **`repo_id` and `mr_iid`, never `issue_iid`** (their `branch`/`mr_web_url`/
+   `source_run_id` may read null while running — do not key on those). A non-terminal one
+   means uzi is on it.
+2. **If uzi is (or is about to be) reworking, DEFER — do not fix locally, do not merge.**
+   The trigger needs a green pipeline + settled review, so the run may not have spawned yet
+   even though it will; if the findings are uzi-fixable (below) and the owner is opted in,
+   give it a beat and re-check rather than racing in.
+3. **Let it finish, then decide from whether the head ACTUALLY moved — and read the ref
+   authoritatively at BOTH ends.** With `BR` the PR's `agent/issue-*` branch, **`git fetch
+   origin "$BR"` before recording** the pre-rework head (`before=$(git rev-parse
+   origin/"$BR")`) — the local remote-tracking ref can already be stale, so an unfetched
+   `before` is as unreliable as an unfetched `after`. Then, after the run reaches terminal,
+   **`git fetch origin "$BR"` AGAIN** and re-read the head: a rework-worker push does not
+   update your local remote-tracking ref on its own, so without the second fetch a real push
+   reads as "no commit". Then compare `before` to the new head:
+   - **Head advanced** → REVIEW the new commit like any other diff (`git show <sha>`). uzi
+     *acting* is not uzi being *right*: confirm it addressed the finding, added no
+     regression, and did not "fix" a deliberate behavior. A bad rework is a
+     `revise`/`follow-up` to that run or a local correction — never an automatic merge. Then
+     go to step 4 (its push retriggered CodeRabbit).
+   - **Head unchanged** → the rework pushed **no commit** (it judged every finding invalid
+     or already handled and only replied/resolved threads). There is no new head, so **no
+     re-review was triggered — do NOT wait for one** (step 4 does not apply). Instead read
+     the run's own outcome (its in-thread replies / `uzi run logs`) and confirm every
+     finding was *explicitly* skipped or resolved-without-code; if so, proceed to merge on
+     the existing green state, otherwise return it to triage or local handling.
+4. **When it pushed a commit, that push retriggers CodeRabbit.** Wait for the re-review on
+   the **new head** (signal (c), the walkthrough `recent_review` range covering the new SHA
+   — see *Triaging* below),
+   confirm no active `mr_rework` remains and CI is green on that head, THEN merge.
+
+   **`scripts/watch-pr.sh OWNER/REPO PR [interval] [max]` runs this whole readiness poll**
+   so you do not hand-roll it each time: it exits **0** merge-ready (CI green on the head,
+   CodeRabbit reviewed that exact head with zero live inline findings, no active
+   `mr_rework`), **1** on red CI, **3** when CodeRabbit reviewed the head but left live
+   findings to triage, **4** when an `mr_rework` run is active on the MR (defer, then re-run
+   it), and **2** on timeout — where **exit 0 is trustworthy but exit 2 means inspect
+   manually, never merge**. "Reviewed this head" is the union of a review whose `commit_id`
+   is the head SHA and the walkthrough range ending at it, because a zero-actionable
+   incremental posts no new review object.
+
+**When this session still fixes locally (mr_rework will not or cannot):**
+- the owner is **opted out**, or the admin **kill-switch** is engaged
+  (`mr_rework_enabled=false`), so no rework fires;
+- a **`.github/workflows` finding** — the worker lacks `workflow` scope, so uzi cannot
+  touch it (nor can a re-run); that is yours, on a CI-only PR;
+- a **base-realignment inherited finding** (a workflow file already on `main`) — not the
+  PR's to fix at all;
+- `mr_rework` **failed or hit its per-MR cap** with findings still open. Its pre-0.68.0
+  failure signature is `failure_reason: "issue run claim is missing issue_iid"` (the #784
+  branch-derivation bug, fixed in 0.68.0); on an older server every rework fails this way
+  and the old self-fix flow is the only path.
+
+This is the **first** fork of *Reviewing the diff* and *Triaging CodeRabbit findings*
+below: read those for how to verify and label a finding, but decide **who fixes** it here
+first.
+
 ## Reviewing the diff
 
 The watcher's merge-gate review is a **third** pass, not a first: uzi already ran its own
@@ -306,7 +401,11 @@ deliberate / mock-only** label, and a one-line recommendation. For each, the use
 
 - **Fix locally** — amend the PR's own `agent/issue-*` branch with your own credentials (an
   isolated worktree; `git add` only your files), re-run CI, then merge. Keeps it in the one
-  PR / review / CI cycle. The right default for small, localized findings.
+  PR / review / CI cycle. The right default for small, localized findings — **but first
+  confirm uzi's own `mr_rework` is not already fixing this MR** (see *uzi may fix the
+  CodeRabbit findings ITSELF* above); on a default-enabled instance it usually is, and a
+  local amend then collides with its push. Defer to it, review its fix, and reserve the
+  local amend for the cases it cannot handle.
 - **Skip** — record the reason (deliberate behavior, inherited code, not worth it). A skip is
   a legitimate outcome, not a failure.
 - **Send back to uzi** — as a follow-up **issue** (a full gated run → a *separate* PR to
@@ -521,10 +620,11 @@ die with its session. When you close, hand any still-in-flight run ids on the sa
 
 ## Keep this skill (and its scripts) current
 
-This skill and its `scripts/` (`watch-run.sh` for uzi runs, `watch-ci.sh` for GitHub
-Actions, `pr-findings.sh` to gather CodeRabbit findings across PRs, `backup-runs.sh` /
-`backup-loop.sh` to snapshot in-flight run work from worker PVCs) are living documents —
-**update them in the same session you find them wanting.**
+This skill and its `scripts/` (`watch-run.sh` for uzi runs, `watch-ci.sh` for post-merge
+GitHub Actions, `watch-pr.sh` for a PR's merge-readiness — CI + CodeRabbit-on-head +
+mr_rework coordination in one poll — `pr-findings.sh` to gather CodeRabbit findings across
+PRs, `backup-runs.sh` / `backup-loop.sh` to snapshot in-flight run work from worker PVCs)
+are living documents — **update them in the same session you find them wanting.**
 When a run surprises you with a new failure mode, a plan trap this list does not name,
 changed merge/ruleset behaviour, a CLI verb that moved, or a poller needs a new
 stop-state/flag/exit-code: edit `SKILL.md` and/or the relevant script right then, and say
