@@ -738,6 +738,22 @@ func TestValidateMergedUziLabelDistinctFromAutopilot(t *testing.T) {
 	if err := ValidateMerged(base()); err != nil {
 		t.Errorf("distinct default labels rejected: %v", err)
 	}
+
+	// PRD #764 hardening: uzi_label must also be distinct from finding_label.
+	m = base()
+	m[KeyFindingLabel] = "agent-found"
+	m[KeyUziLabel] = "agent-found"
+	if err := ValidateMerged(m); err == nil || !strings.Contains(err.Error(), "finding_label") {
+		t.Errorf("uzi_label==finding_label: err = %v, want a rejection naming finding_label", err)
+	}
+
+	// PRD #764 hardening: the self-improve tracker's reserved label is never runnable, so
+	// it is not a valid uzi_label (autopilot/finding here are distinct, so only this fires).
+	m = base()
+	m[KeyUziLabel] = "uzi-self-improve"
+	if err := ValidateMerged(m); err == nil || !strings.Contains(err.Error(), "self-improve") {
+		t.Errorf("uzi_label==uzi-self-improve: err = %v, want a rejection naming self-improve", err)
+	}
 }
 
 // TestUziLabelAccessorAndDefault pins PRD #764's no-seeded-row synthesis: with no

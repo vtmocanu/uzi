@@ -1751,6 +1751,12 @@ func LabelChanged(committed, updates map[string]string) bool {
 // equal pair would autopilot every runnable issue, conflating "uzi's to run" with
 // "skip the plan gate" — and from the finding label (see below). Each error names the
 // key to change.
+// reservedSelfImproveLabel is the self-improve tracker's label. Its canonical home is
+// schedsvc.SelfImproveTrackingLabel; settings cannot import schedsvc (schedsvc imports
+// settings), so the value is mirrored here and pinned to the canonical one by an external
+// test so the two cannot drift. See ValidateMerged.
+const reservedSelfImproveLabel = "uzi-self-improve"
+
 func ValidateMerged(merged map[string]string) error {
 	if merged[KeyUziLabel] == merged[KeyAutopilotLabel] {
 		return errors.New("uzi_label must differ from autopilot_label")
@@ -1764,6 +1770,15 @@ func ValidateMerged(merged map[string]string) error {
 	// guards eligibility must be enforced here. (Defaults uzi/agent-found are distinct.)
 	if merged[KeyUziLabel] == merged[KeyFindingLabel] {
 		return errors.New("uzi_label must differ from finding_label")
+	}
+	// Same class: uzi_label must not be the self-improve tracker's reserved label. The
+	// tracker is uzi's own bookkeeping issue, deliberately non-runnable; if the
+	// eligibility label equalled it, the board would offer "Start run" on the tracker and
+	// CreateRun (which checks only uzi_label) would accept it. reservedSelfImproveLabel
+	// mirrors schedsvc.SelfImproveTrackingLabel (settings cannot import schedsvc — a
+	// cycle), pinned to the canonical value by TestReservedSelfImproveLabelMatchesSchedsvc.
+	if merged[KeyUziLabel] == reservedSelfImproveLabel {
+		return errors.New(`uzi_label must not be "uzi-self-improve" (the self-improve tracker's reserved label, which must never be runnable)`)
 	}
 
 	// PRD #602 M2: an ENABLED agent source must carry both a URL and a ref. This is
