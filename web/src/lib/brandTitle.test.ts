@@ -64,6 +64,6 @@ describe("brandTabTitle", () => {
   });
 
   it("DEFAULT_TITLE uses the U+2014 em dash, not a hyphen", () => {
-    expect(DEFAULT_TITLE).toContain("—");
+    expect(DEFAULT_TITLE).toBe("Uzi — AI dark factory");
   });
 });

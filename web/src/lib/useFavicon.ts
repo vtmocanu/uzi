@@ -169,6 +169,15 @@ export function useFavicon({
       baseImgRef.current = img;
       applyFavicon(lastStateRef.current ?? "idle", img);
     };
+    // A failed replacement load must NOT leave the previous tenant's image in
+    // baseImgRef: clear it and re-apply the current state on the factory mark, so
+    // a branded src that 404s reverts to the fallback rather than pinning a stale
+    // logo. Symmetric with onload, which also applies unconditionally.
+    img.onerror = () => {
+      if (!alive) return;
+      baseImgRef.current = null;
+      applyFavicon(lastStateRef.current ?? "idle", null);
+    };
     img.src = appLogoSrc;
     return () => {
       alive = false;

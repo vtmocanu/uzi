@@ -123,4 +123,46 @@ describe("useFavicon", () => {
     await flush(); // immediate seed poll
     expect(listRuns).toHaveBeenCalledWith({ passive: true });
   });
+
+  it("#688: a failed REPLACEMENT logo load clears the stale base and reverts to the factory mark", async () => {
+    // Capture each new Image() so the test can drive its onload/onerror directly.
+    const images: TestImage[] = [];
+    class TestImage {
+      onload: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      src = "";
+      constructor() {
+        images.push(this);
+      }
+    }
+    const OriginalImage = globalThis.Image;
+    globalThis.Image = TestImage as unknown as typeof Image;
+    try {
+      const { rerender } = renderHook(
+        (props: { appLogoSrc: string | null }) =>
+          useFavicon({ unread: 0, enabled: true, appLogoSrc: props.appLogoSrc }),
+        { initialProps: { appLogoSrc: "/logo-a.png" } },
+      );
+
+      // First logo loads successfully: the branded base image is applied.
+      const first = images[0];
+      act(() => {
+        first.onload?.();
+      });
+      const lastCall = applyFavicon.mock.calls[applyFavicon.mock.calls.length - 1];
+      expect(lastCall[1]).toBe(first);
+      expect(lastCall[1]).not.toBeNull();
+
+      // Swap to a new src whose load FAILS. The base must revert to null (factory
+      // mark), not retain the previously loaded logo.
+      rerender({ appLogoSrc: "/logo-b.png" });
+      const second = images[1];
+      act(() => {
+        second.onerror?.();
+      });
+      expect(applyFavicon).toHaveBeenLastCalledWith("idle", null);
+    } finally {
+      globalThis.Image = OriginalImage;
+    }
+  });
 });
