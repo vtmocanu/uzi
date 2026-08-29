@@ -881,6 +881,41 @@ function idleParkingExecutor(log: { outcome?: FollowUpOutcome }): Executor {
   };
 }
 
+/** Parks in a loop, recording every outcome, until the park ENDS (a stop/idle/cancel). The
+ *  vehicle for the issue #559 watermark test: it parks once per delivered follow-up, so the
+ *  runner emits one awaiting_followup report per turn and we can read the open_followup_id it
+ *  stamped at each. Commits real work at the end so the run finalizes through the normal push. */
+function multiParkExecutor(log: { outcomes: FollowUpOutcome[] }): Executor {
+  return {
+    async run(ctx: RunContext): Promise<{ branch: string }> {
+      await ctx.checkpoint?.({ reap: true });
+      for (;;) {
+        const o = await ctx.awaitFollowUp!(60_000);
+        log.outcomes.push(o);
+        if (o.kind === "ended") break;
+      }
+      fs.writeFileSync(path.join(ctx.worktreePath, "UZI_RUN.md"), "# interactive multi-turn\n");
+      execFileSync("git", ["add", "UZI_RUN.md"], { cwd: ctx.worktreePath });
+      execFileSync(
+        "git",
+        [
+          "-c",
+          "user.name=uzi-agent",
+          "-c",
+          "user.email=uzi-agent@uzi.local",
+          "-c",
+          "commit.gpgsign=false",
+          "commit",
+          "-m",
+          "uzi test: interactive multi-turn handled",
+        ],
+        { cwd: ctx.worktreePath },
+      );
+      return { branch: ctx.branch };
+    },
+  };
+}
+
 function taskClaim(overrides: Partial<ClaimResponse> = {}): ClaimResponse {
   const runId = (overrides.run_id as string | undefined) ?? randomUUID();
   return makeClaim({
@@ -1053,5 +1088,45 @@ describe("RunRunner interactive follow-up park (PRD #517 M3)", () => {
     );
     // open_mr:false ⇒ a push, not an MR-open: no createMergeRequest POST reached the forge.
     assert.equal(calls.length, 0, "a no-MR idle finalize opens no merge request");
+  });
+
+  it("carries open_followup_id = the pre-round-trip last-delivered id on each park report (issue #559 M2)", async () => {
+    // The worker-provided wake-guard watermark. Each awaiting_followup report must carry the
+    // highest follow_up id ALREADY delivered before that report — a value stable across the
+    // report's DB round-trip because the next follow-up is consumed only AFTER the report
+    // returns. Three parks: nothing delivered yet (0), then after follow-up id 5 (5), then
+    // after follow-up id 8 (8); a final stop ends the loop. Mutation: drop `open_followup_id`
+    // from the reportState call in the awaitFollowUp callback → the field is undefined on
+    // every park report and the deepStrictEqual reddens.
+    const { gitlab } = fakeGitlab();
+    const log = { outcomes: [] as FollowUpOutcome[] };
+    const claim = taskClaim();
+
+    let park = 0;
+    api.onState(claim.run_id, (body) => {
+      if (body.status !== "awaiting_followup") return;
+      park++;
+      if (park === 1)
+        api.setInputs(claim.run_id, [{ id: 5, kind: "follow_up", body: "turn 2" }]);
+      else if (park === 2)
+        api.setInputs(claim.run_id, [{ id: 8, kind: "follow_up", body: "turn 3" }]);
+      else api.setInputs(claim.run_id, [{ id: 9, kind: "stop", body: "wind down" }]);
+    });
+
+    await runner(multiParkExecutor(log), gitlab).execute(claim);
+
+    const watermarks = api.states
+      .filter((s) => s.runId === claim.run_id && s.body.status === "awaiting_followup")
+      .map((s) => s.body.open_followup_id);
+    assert.deepStrictEqual(
+      watermarks,
+      [0, 5, 8],
+      `each park must report the pre-round-trip last-delivered id; got ${JSON.stringify(watermarks)}`,
+    );
+    assert.deepStrictEqual(log.outcomes, [
+      { kind: "followup", body: "turn 2" },
+      { kind: "followup", body: "turn 3" },
+      { kind: "ended", reason: "stopped" },
+    ]);
   });
 });

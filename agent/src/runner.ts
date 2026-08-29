@@ -1088,21 +1088,33 @@ export class RunRunner {
         // askUser's settle discipline; the ordering is satisfied by construction here.
         awaitFollowUp: async (idleMs) => {
           // issue #552 M1 (mid-turn wake-guard bug): report `awaiting_followup` — which stamps
-          // the open_followup_id watermark to MAX(consumed follow_up id) — ONLY when the run is
-          // genuinely going idle. If a follow-up (or stop/cancel) arrived mid-turn and is
-          // already buffered, reporting the park would fold that already-consumed-but-not-yet-
-          // applied follow-up INTO the watermark, so its own wake `running` report would then
-          // fail the server's `id > watermark` guard and strand a live run at awaiting_followup.
-          // Skip the park report in that case and service the buffered outcome directly (the run
-          // stays `running`, no spurious park). A follow-up arriving AFTER this point is consumed
+          // the open_followup_id watermark — ONLY when the run is genuinely going idle. If a
+          // follow-up (or stop/cancel) arrived mid-turn and is already buffered, reporting the
+          // park would fold that already-consumed-but-not-yet-applied follow-up INTO the
+          // watermark, so its own wake `running` report would then fail the server's
+          // `id > watermark` guard and strand a live run at awaiting_followup. Skip the park
+          // report in that case and service the buffered outcome directly (the run stays
+          // `running`, no spurious park). A follow-up arriving AFTER this point is consumed
           // after the stamp, so its id > watermark and it wakes normally.
+          //
+          // issue #559 M2: the park report now CARRIES the watermark it wants stamped —
+          // `open_followup_id` = the highest follow_up id the worker has already DELIVERED
+          // (steering.getLastDeliveredFollowUpId()). The server clamps/floors this instead of
+          // deriving MAX(consumed follow_up id) itself. This closes the residual race where a
+          // follow-up consumed by the poll loop DURING this report's DB round-trip would fold
+          // into a server-derived MAX(consumed) and strand the run: the last-DELIVERED id does
+          // NOT advance during the round-trip (the follow-up waiter is armed only AFTER this
+          // report returns, below), so the racing follow-up is excluded and its later wake wins.
           if (!steering.hasPendingFollowUpOutcome()) {
             // Read the ACK the same way askUser and the limit park do: the park TOOK only if
             // the server reports `awaiting_followup`. SetRunAwaitingFollowup (M2) matches
             // nothing when the run went terminal under us or is no longer ours (or is not an
             // interactive task) — without this check the worker would block on a follow-up no
             // surface can produce, since the status never changed. Fail loudly instead.
-            const ack = await reportState({ status: "awaiting_followup" });
+            const ack = await reportState({
+              status: "awaiting_followup",
+              open_followup_id: steering.getLastDeliveredFollowUpId(),
+            });
             const parked = (ack as { status?: string } | undefined)?.status;
             if (parked !== "awaiting_followup") {
               throw new Error(

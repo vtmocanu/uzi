@@ -1524,6 +1524,15 @@ export interface StateRequest {
    *  secret-scrubs and size-caps it (git.workflowScopeDiff + redactText), and the server
    *  clamps it again before storing. Absent on every other report. */
   preserved_patch?: string;
+  /** issue #559 M2: the worker-provided wake-guard watermark, sent ONLY on the
+   *  `awaiting_followup` report — the highest `follow_up` input id the worker has already
+   *  applied/delivered (SteeringChannel.getLastDeliveredFollowUpId). The server clamps and
+   *  floors it (`GREATEST(0, LEAST(@open_followup_id, MAX(consumed follow_up id)))`) and
+   *  falls back to its server-derived MAX(consumed) when this is absent. Reporting the
+   *  last-DELIVERED id (which does NOT advance during the park report's DB round-trip)
+   *  excludes a follow-up consumed mid-round-trip from the watermark, so its later wake
+   *  succeeds instead of stranding the run. Additive + optional. */
+  open_followup_id?: number;
 }
 
 /**
