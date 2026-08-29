@@ -391,6 +391,70 @@ func TestGitHubReviewThreadInnerFanOutRespectsGlobalItemCap(t *testing.T) {
 	}
 }
 
+// TestGitHubReviewThreadOuterPageCountsFetchedNodes pins that the OUTER per-page
+// item cap keys off the number of comment NODES actually fetched, not the size of
+// the deduplicated map. A SINGLE outer reviewThreads page carries two threads whose
+// comments DUPLICATE ids across the threads (T1: 101,102; T2: 101,102) plus a
+// databaseId==0 node — 5 fetched nodes — while the distinct map holds only {101,102}
+// (2 entries). With maxForgeItems=3 the fetched count (5) exceeds the cap but the
+// distinct map (2) does not, so the pre-fix `len(m) > maxForgeItems` check never
+// fires and no error is returned (the test would be vacuous against that code).
+// Only counting fetched nodes catches it, which is exactly the fix. No inner
+// fan-out: every thread advertises hasNextPage:false so this stays focused on the
+// outer per-page fetched-node accounting. Lowers maxForgeItems, restored in a defer.
+func TestGitHubReviewThreadOuterPageCountsFetchedNodes(t *testing.T) {
+	defer func(o int) { maxForgeItems = o }(maxForgeItems)
+	maxForgeItems = 3
+
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		graphqlRoute: func(w http.ResponseWriter, r *http.Request) {
+			req := readGQL(t, r)
+			switch {
+			case strings.Contains(req.Query, "reviewThreads"):
+				// One outer page, two threads with DUPLICATE ids across them plus a
+				// zero-id node: 5 fetched nodes, distinct map only {101,102}.
+				writeGQLData(w, map[string]any{
+					"repository": map[string]any{
+						"pullRequest": map[string]any{
+							"reviewThreads": map[string]any{
+								"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
+								"nodes": []map[string]any{
+									{"id": "T1", "comments": map[string]any{
+										"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
+										"nodes": []map[string]any{
+											{"databaseId": 101}, {"databaseId": 102}, {"databaseId": 0},
+										},
+									}},
+									{"id": "T2", "comments": map[string]any{
+										"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
+										"nodes": []map[string]any{
+											{"databaseId": 101}, {"databaseId": 102},
+										},
+									}},
+								},
+							},
+						},
+					},
+				})
+			default:
+				t.Fatalf("unexpected graphql request: query=%q vars=%+v", req.Query, req.Variables)
+			}
+		},
+	})
+	d := newGitHubRawDriver(t, m, "ghp_classicTokenValue1234567890")
+
+	got, err := d.reviewThreadIDsByDatabaseID(context.Background(), repoSlug{owner: "acme", repo: "widgets"}, 13)
+	if err == nil {
+		t.Fatalf("expected an item-cap error from the outer per-page fetched-node count, got nil (returned %d anchors)", len(got))
+	}
+	if got != nil {
+		t.Errorf("on backstop-exceed the driver must return a nil map, not a partial one (got %d)", len(got))
+	}
+	if !strings.Contains(err.Error(), "backstop") {
+		t.Errorf("error must name the backstop, got %q", err.Error())
+	}
+}
+
 // TestGitHubReplyMergeRequestComment pins the reply keyed on the REST databaseId
 // (the reply anchor): CreateCommentInReplyTo POSTs with in_reply_to set.
 func TestGitHubReplyMergeRequestComment(t *testing.T) {

@@ -939,6 +939,12 @@ func (g *github) reviewThreadIDsByDatabaseID(ctx context.Context, slug repoSlug,
 	m := map[int64]string{}
 	var threadCursor *string
 	page := 0
+	// fetched counts every comment NODE returned (including databaseId==0 and
+	// duplicate ids), accumulated across outer pages — not the deduplicated map
+	// size. The cap must key off nodes actually fetched, because a single outer
+	// page carrying duplicate or zero databaseIds can pull far more than
+	// maxForgeItems nodes while len(m) stays under the ceiling.
+	fetched := 0
 	for {
 		page++
 		var resp struct {
@@ -979,28 +985,34 @@ func (g *github) reviewThreadIDsByDatabaseID(ctx context.Context, slug repoSlug,
 				continue
 			}
 			for _, cn := range node.Comments.Nodes {
+				fetched++
 				if cn.DatabaseID != 0 {
 					m[cn.DatabaseID] = node.ID
 				}
 			}
-			// Enforce the item cap PER THREAD, not once per outer page: without this
-			// a single reviewThreads page of up to 100 threads could each fan out to
+			// Enforce the item cap PER THREAD, not once per outer page, and key it
+			// off FETCHED comment nodes (duplicate and zero databaseIds included),
+			// not the deduplicated map size: without this a single reviewThreads
+			// page of up to 100 threads could each fan out to
 			// reviewThreadCommentDBIDs and accumulate before the bound fired,
-			// amplifying the maxForgeItems ceiling by the page size.
-			if len(m) > maxForgeItems {
+			// amplifying the maxForgeItems ceiling by the page size, and duplicate
+			// or zero ids collapsing in the map could keep len(m) under the cap
+			// while far more nodes were actually fetched.
+			if fetched > maxForgeItems {
 				return nil, g.redact.error(forgePaginationCapErr("item", maxForgeItems))
 			}
 			if node.Comments.PageInfo.HasNextPage {
 				// Bound the inner fan-out by the GLOBAL remaining budget so one
 				// thread's overflow cannot exceed maxForgeItems either.
-				rest, err := g.reviewThreadCommentDBIDs(ctx, node.ID, node.Comments.PageInfo.EndCursor, maxForgeItems-len(m))
+				rest, restFetched, err := g.reviewThreadCommentDBIDs(ctx, node.ID, node.Comments.PageInfo.EndCursor, maxForgeItems-fetched)
 				if err != nil {
 					return nil, err
 				}
 				for _, dbID := range rest {
 					m[dbID] = node.ID
 				}
-				if len(m) > maxForgeItems {
+				fetched += restFetched
+				if fetched > maxForgeItems {
 					return nil, g.redact.error(forgePaginationCapErr("item", maxForgeItems))
 				}
 			}
@@ -1024,8 +1036,11 @@ func (g *github) reviewThreadIDsByDatabaseID(ctx context.Context, slug repoSlug,
 // outer page's comments.endCursor). It reuses graphqlDo and is backstopped by
 // maxForgePages exactly as the outer loop; budget is the caller's remaining global
 // item allowance, so one thread's comment fan-out cannot push the total past
-// maxForgeItems.
-func (g *github) reviewThreadCommentDBIDs(ctx context.Context, threadID, afterCursor string, budget int) ([]int64, error) {
+// maxForgeItems. It counts every comment NODE fetched (duplicate and zero
+// databaseIds included) against budget — not distinct ids — and returns that
+// fetched-node count as its second return so the caller can accumulate it into the
+// outer per-page fetched total.
+func (g *github) reviewThreadCommentDBIDs(ctx context.Context, threadID, afterCursor string, budget int) ([]int64, int, error) {
 	const query = `query($threadId: ID!, $commentCursor: String) {
   node(id: $threadId) {
     ... on PullRequestReviewThread {
@@ -1039,6 +1054,7 @@ func (g *github) reviewThreadCommentDBIDs(ctx context.Context, threadID, afterCu
 	var out []int64
 	cursor := afterCursor
 	page := 0
+	fetched := 0
 	for {
 		page++
 		var resp struct {
@@ -1056,25 +1072,26 @@ func (g *github) reviewThreadCommentDBIDs(ctx context.Context, threadID, afterCu
 		}
 		vars := map[string]any{"threadId": threadID, "commentCursor": cursor}
 		if err := g.graphqlDo(ctx, query, vars, &resp); err != nil {
-			return nil, err
+			return nil, fetched, err
 		}
 		for _, cn := range resp.Node.Comments.Nodes {
+			fetched++
 			if cn.DatabaseID != 0 {
 				out = append(out, cn.DatabaseID)
 			}
 		}
-		if len(out) > budget {
-			return nil, g.redact.error(forgePaginationCapErr("item", maxForgeItems))
+		if fetched > budget {
+			return nil, fetched, g.redact.error(forgePaginationCapErr("item", maxForgeItems))
 		}
 		if !resp.Node.Comments.PageInfo.HasNextPage || resp.Node.Comments.PageInfo.EndCursor == "" {
 			break
 		}
 		if page >= maxForgePages {
-			return nil, g.redact.error(forgePaginationCapErr("page", maxForgePages))
+			return nil, fetched, g.redact.error(forgePaginationCapErr("page", maxForgePages))
 		}
 		cursor = resp.Node.Comments.PageInfo.EndCursor
 	}
-	return out, nil
+	return out, fetched, nil
 }
 
 // ReplyMergeRequestComment posts an in-thread reply keyed on replyID, the REST
