@@ -1,0 +1,78 @@
+# CANARY: liveness fixture for the FQDN-egress completeness check in
+# scripts/assert-chart-render.sh (PRD #808 M2). This is a DELIBERATELY-INCOMPLETE
+# slice of a real chart render: the Antrea worker-egress policy below carries an
+# Allow entry for every canonical destination EXCEPT `cache.nixos.org`, which is
+# omitted ON PURPOSE. That single injected gap is what proves the detector still
+# fires -- assert-chart-render.sh runs the completeness check against this file
+# before checking the real render and requires it to report `cache.nixos.org`
+# missing; if the detector reads this known-incomplete render as complete, the
+# instrument is broken (exit 2, "an empty result must not read as green").
+#
+# The forge host `gitlab.example.com` IS present as an Allow (mirroring the
+# ConfigMap's FORGE_ALLOWED_BASE_URLS below) so the single static host is the only
+# gap -- the forge single-source tie is exercised as satisfied here.
+#
+# Do NOT "fix" this file by adding the cache.nixos.org Allow: that would silence
+# the canary and the gate would stop proving the detector works. This file holds
+# no secrets.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: uzi-api-config
+data:
+  FORGE_ALLOWED_BASE_URLS: "https://gitlab.example.com"
+---
+apiVersion: crd.antrea.io/v1beta1
+kind: NetworkPolicy
+metadata:
+  name: uzi-worker-egress
+  namespace: uzi-workers
+spec:
+  priority: 5
+  tier: application
+  appliedTo:
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: uzi-hosted-worker
+  egress:
+    - name: drop-cloud-metadata
+      action: Drop
+      to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+    - name: allow-anthropic
+      action: Allow
+      to:
+        - fqdn: "*.anthropic.com"
+      ports:
+        - protocol: TCP
+          port: 443
+    # cache.nixos.org is OMITTED ON PURPOSE -- see the CANARY header above.
+    - name: allow-devbox-resolver
+      action: Allow
+      to:
+        - fqdn: "search.devbox.sh"
+      ports:
+        - protocol: TCP
+          port: 443
+    - name: allow-cnpg-oci-registry
+      action: Allow
+      to:
+        - fqdn: "ghcr.io"
+      ports:
+        - protocol: TCP
+          port: 443
+    - name: allow-cnpg-oci-blobs
+      action: Allow
+      to:
+        - fqdn: "pkg-containers.githubusercontent.com"
+      ports:
+        - protocol: TCP
+          port: 443
+    - name: allow-forge-gitlab-example-com
+      action: Allow
+      to:
+        - fqdn: "gitlab.example.com"
+      ports:
+        - protocol: TCP
+          port: 443
