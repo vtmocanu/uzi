@@ -1154,6 +1154,8 @@ export const mockRepos: Repo[] = [
     // panel's sub-toggle independence is exercisable under VITE_UZI_MOCK=1.
     repo_claudemd_enabled: false,
     repo_devbox_opt_in: true,
+    // The uzi repo dogfoods self-improve (PRD #686), so the fold capability is on.
+    repo_fold_improve_uzi_backlog: true,
     pipeline: {
       status: "failed",
       web_url: "https://gitlab.example.com/myorg/uzi/-/pipelines/4242",
@@ -1182,6 +1184,7 @@ export const mockRepos: Repo[] = [
     repo_skills_enabled: false,
     repo_claudemd_enabled: false,
     repo_devbox_opt_in: false,
+    repo_fold_improve_uzi_backlog: false,
     pipeline: {
       status: "success",
       web_url: "https://gitlab.example.com/myorg/atlas-api/-/pipelines/3311",
@@ -1215,6 +1218,7 @@ export const mockRepos: Repo[] = [
     repo_skills_enabled: false,
     repo_claudemd_enabled: false,
     repo_devbox_opt_in: false,
+    repo_fold_improve_uzi_backlog: false,
     pipeline: null,
     guardrail_override: null,
     guardrail_blocked: true,
@@ -1234,6 +1238,7 @@ export const mockRepos: Repo[] = [
     repo_skills_enabled: false,
     repo_claudemd_enabled: false,
     repo_devbox_opt_in: false,
+    repo_fold_improve_uzi_backlog: false,
     pipeline: null,
     guardrail_override: null,
     guardrail_blocked: false,
@@ -1260,6 +1265,7 @@ export const mockRepos: Repo[] = [
     repo_skills_enabled: false,
     repo_claudemd_enabled: false,
     repo_devbox_opt_in: false,
+    repo_fold_improve_uzi_backlog: false,
     pipeline: null,
     guardrail_override: null,
     guardrail_blocked: true,

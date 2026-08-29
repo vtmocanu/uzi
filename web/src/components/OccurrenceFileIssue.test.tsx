@@ -57,6 +57,7 @@ function repoOpt(id: string, path: string): Repo {
     repo_skills_enabled: false,
     repo_claudemd_enabled: false,
     repo_devbox_opt_in: false,
+    repo_fold_improve_uzi_backlog: false,
     pipeline: null,
     guardrail_blocked: false,
     docker_allowlisted: false,

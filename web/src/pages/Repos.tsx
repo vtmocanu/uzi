@@ -586,6 +586,24 @@ export function Repos() {
     }
   };
 
+  // Per-repo self-improve dogfooding capability (PRD #686): fold the owner's
+  // improve_uzi judge backlog into the scheduled self-improvement run and select
+  // the uzi worker directive. Owner-or-admin (the server enforces it); applied
+  // immediately like the devbox toggle and reflected in repo state so the checkbox
+  // stays in sync.
+  const setRepoFoldImproveUziBacklog = async (repo: Repo, enabled: boolean) => {
+    setError("");
+    setToolsBusy(true);
+    try {
+      const { repo: updated } = await api.setRepoFoldImproveUziBacklog(repo.id, enabled);
+      setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Update failed");
+    } finally {
+      setToolsBusy(false);
+    }
+  };
+
   // Static per-repo capability hint (PRD #84 M2): route this repo's runs only to
   // workers that have the ticked capabilities. Applied immediately like the devbox
   // toggle; the server capability.Filters the list, so the response is authoritative
@@ -1285,6 +1303,25 @@ export function Repos() {
                     never run. Even so, a package it lists gets installed on your worker (bypassing the admin allowlist),
                     so enable this only for a repo whose review discipline you trust. Your tools above always win a version
                     conflict.
+                  </p>
+                </div>
+
+                {/* Per-repo self-improve dogfooding capability (PRD #686). */}
+                <div className="space-y-1.5 border-t border-edge pt-3">
+                  <label className="flex items-start gap-2 text-sm text-fg">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5"
+                      checked={toolsRepo.repo_fold_improve_uzi_backlog}
+                      disabled={toolsBusy}
+                      onChange={(e) => setRepoFoldImproveUziBacklog(toolsRepo, e.target.checked)}
+                    />
+                    <span>Fold improve-uzi backlog (uzi dogfooding)</span>
+                  </label>
+                  <p className="pl-6 text-xs text-muted">
+                    Folds this owner&rsquo;s <code className="font-mono">improve_uzi</code> judge backlog into the
+                    scheduled self-improvement run and gives the agent the uzi-specific directive. Leave off for a normal
+                    project (the default).
                   </p>
                 </div>
 
