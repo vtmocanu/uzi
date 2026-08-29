@@ -12,11 +12,11 @@
 
 We adopt **Option B**: a defaulted per-leg `lineage_epoch` marker.
 
-- **Schema (migration `00175_run_usage_lineage_epoch.sql`).** Two columns, both `integer NOT NULL DEFAULT 0`: `runs.lineage_epoch` (the per-run counter) and `run_usage.lineage_epoch` (the stamped snapshot). Existing rows default to 0.
+- **Schema (migration `00176_run_usage_lineage_epoch.sql`).** Two columns, both `integer NOT NULL DEFAULT 0`: `runs.lineage_epoch` (the per-run counter) and `run_usage.lineage_epoch` (the stamped snapshot). Existing rows default to 0.
 - **Bump (query `BumpRunLineageEpoch`, `runtime.sql`; call site `appendMessages`, `service.go`).** The API increments `runs.lineage_epoch` **once per newly-inserted `resume_lineage_break` status event** (#334, emitted at `agent/src/runner.ts`). No new endpoint, no new worker signal — Option B reuses the existing #334 emission. `UPDATE runs SET lineage_epoch = lineage_epoch + 1`.
 - **Stamp (`foldRunUsage`, `service.go`).** The fold stamps the run's current `LineageEpoch` onto each `UpsertRunUsage` (`LineageEpoch: run.LineageEpoch`).
 - **Pin-to-first-insert (`UpsertRunUsage`, `runtime.sql`).** `lineage_epoch` is in the INSERT column list but **omitted from the `ON CONFLICT DO UPDATE SET`** clause. The conflict key stays `(run_id, session_id, model)` and every token/cost column still merges with `GREATEST` — both unchanged.
-- **View (migration `00176_run_usage_totals_epoch.sql`).** A view cannot be `ALTER`ed, so this DROP + CREATE replaces 00063's rollup. The inner grouping is now `(run_id, model, lineage_epoch)` with `MAX`; the outer stays `SUM` per `run_id` across the per-`(model, epoch)` maxima. Output columns are byte-identical in name and type, so every dependent read query (`GetRunUsageTotal`, `ListRunsForUser`, `SelfUsage`, the admin usage queries, `judge.sql`'s LEFT JOIN) compiles unchanged.
+- **View (migration `00177_run_usage_totals_epoch.sql`).** A view cannot be `ALTER`ed, so this DROP + CREATE replaces 00063's rollup. The inner grouping is now `(run_id, model, lineage_epoch)` with `MAX`; the outer stays `SUM` per `run_id` across the per-`(model, epoch)` maxima. Output columns are byte-identical in name and type, so every dependent read query (`GetRunUsageTotal`, `ListRunsForUser`, `SelfUsage`, the admin usage queries, `judge.sql`'s LEFT JOIN) compiles unchanged.
 
 Historical result: every existing row is epoch 0, so a single-lineage run has one epoch group per model, the inner grouping collapses to `(run_id, model)`, and the output is value-identical to 00063 — **zero historical restatement**. Historical broken-lineage runs keep their (undercounted) numbers, forward-only and honest, since the marker was never recorded for them.
 

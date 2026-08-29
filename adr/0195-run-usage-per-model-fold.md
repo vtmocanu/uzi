@@ -34,13 +34,13 @@ The server's per-model value, composing the fold with the read:
 - `UpsertRunUsage` merges with `GREATEST` per `(run_id, session_id, model)`, over values
   already clamped by `nonNegTokens`.
 - `run_usage_totals` (migration `00063`) takes `MAX(...) GROUP BY run_id, model` in its
-  inner query, then `SUM(...) GROUP BY run_id`. (PRD #632, migration `00176`, refined the
+  inner query, then `SUM(...) GROUP BY run_id`. (PRD #632, migration `00177`, refined the
   inner grouping to `(run_id, model, lineage_epoch)`; single-lineage (epoch-0) output is
   unchanged, so this parity argument still holds for single-lineage runs but NOT for
   broken-lineage runs — see [ADR-632](0632-run-usage-lineage-epoch.md).)
 
 So, **for a single-lineage run** (the case this derivation covers — see the note above;
-for a broken-lineage run migration `00176` instead aggregates the per-epoch maxima and
+for a broken-lineage run migration `00177` instead aggregates the per-epoch maxima and
 SUMs them across epochs, so the server value is no longer a single `MAX` over all
 frames), the server value is `MAX over ALL frames and sessions of max(0, v)`, then summed
 across models. The client's fold telescopes to exactly that: with `mᵢ = max(mᵢ₋₁, vᵢ)`
