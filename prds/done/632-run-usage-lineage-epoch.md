@@ -1,7 +1,7 @@
 # PRD #632 — run_usage: fix broken-resume-lineage undercount via `lineage_epoch`
 
 **Issue**: #632 (supersedes #332, the design tracker)
-**Status**: Draft — ready for implementation
+**Status**: Implemented (M1–M6 landed; committed ADR is `adr/0632-run-usage-lineage-epoch.md`)
 **Priority**: Medium
 **Effort**: medium (5-6 milestones)
 **Design of record**: ADR 0332 (in #332's pinned comment). This PRD restates the
@@ -130,7 +130,7 @@ correctly.
 
 ## Milestones
 
-- [ ] **M1 — Schema: `lineage_epoch` columns + migration(s).** Add
+- [x] **M1 — Schema: `lineage_epoch` columns + migration(s).** Add
   `run_usage.lineage_epoch INT NOT NULL DEFAULT 0` and a per-run epoch source
   `runs.lineage_epoch INT NOT NULL DEFAULT 0` (a counter bumped on each break; a `runs`
   column avoids a per-fold subquery in the hot path). Draft `00159+`; **both this and
@@ -140,7 +140,7 @@ correctly.
   rewrite). Regenerate sqlc (`sqlc generate`, pinned v1.30.0). Existing rows default to
   0 → no historical restatement. `gate:repo` `check:migration-numbering` green.
 
-- [ ] **M2 — Server: bump the run epoch on the break signal (new ingestion code).**
+- [x] **M2 — Server: bump the run epoch on the break signal (new ingestion code).**
   Today `resume_lineage_break` is parsed **nowhere** server-side (the #334 counter is
   an offline SQL scan, not an ingestion hook), so this milestone adds **new
   parse-and-act logic in the `appendMessages` hot path**: scan for a status message
@@ -160,7 +160,7 @@ correctly.
     worker-controlled text), so it clears the audit — but M2 must record it as a
     cleared suspect, in the same change.
 
-- [ ] **M3 — Fold: stamp the current epoch (and pin it on conflict).** `foldRunUsage`
+- [x] **M3 — Fold: stamp the current epoch (and pin it on conflict).** `foldRunUsage`
   reads the run's `lineage_epoch` and passes it to `UpsertRunUsage`; the query gains a
   `lineage_epoch` column in the INSERT (regen). The `GREATEST` merge and the
   `(run_id, session_id, model)` conflict key are **unchanged** — the epoch is a stamped
@@ -180,7 +180,7 @@ correctly.
   alternative — re-read the run's epoch inside `foldRunUsage` — is acceptable if the
   implementer prefers not to rely on the batch-ordering invariant.)
 
-- [ ] **M4 — View rewrite: MAX-within-epoch then SUM-across-epochs.** New migration
+- [x] **M4 — View rewrite: MAX-within-epoch then SUM-across-epochs.** New migration
   (a view cannot be `ALTER`ed; DROP + CREATE — numbered *after* M1's column migration)
   rewriting `run_usage_totals` so the inner grouping is `(run_id, model,
   lineage_epoch)` with `MAX`, and the outer stays `SUM` per `run_id` across the
@@ -189,7 +189,7 @@ correctly.
   Regenerate sqlc and confirm every dependent read query still compiles against the
   recreated view (`validate:api` asserts regen is a no-op).
 
-- [ ] **M5 — Tests (live-DB + fake-store + worker).**
+- [x] **M5 — Tests (live-DB + fake-store + worker).**
   - **View-read broken-lineage assertion (the one that proves the fix) belongs in
     `TestUsageRollupsLiveDB`, which reads `run_usage_totals` via `GetRunUsageTotal` —
     NOT in `TestUpsertRunUsageMergeLiveDB`, which reads raw `run_usage` rows and
@@ -213,7 +213,7 @@ correctly.
     #334 emission still fires and carries `event: 'resume_lineage_break'` (guards the
     signal Option B now depends on).
 
-- [ ] **M6 — Read surfaces, ADR, docs.** Confirm **every** total read path goes
+- [x] **M6 — Read surfaces, ADR, docs.** Confirm **every** total read path goes
   through `run_usage_totals` — `ListRunsForUser`, `GetRunUsageTotal`, `SelfUsage`,
   `AdminUsagePerUser`/`AdminUsageTotals`, and `judge.sql`'s LEFT JOIN (needs no change:
   the view's output columns are unchanged) — so all consumers, incl. `api/cmd/uzi`
@@ -247,6 +247,17 @@ correctly.
 - **Marking #332's Option B "implemented"** is a forge write to another issue, not a
   repo-file change, so it is outside an offline sweep worker's branch diff — a
   maintainer follow-up once this lands, alongside the reseed-validation live run.
+- **The web client-side usage fold stays epoch-unaware (discovered during M6, deferred).**
+  `web/src/lib/runUsage.ts` (ADR-195) derives the run-page usage strip from the message
+  stream with a per-model running high-water max; the stream carries no `session_id`/
+  `lineage_epoch`, so on a broken-lineage run it still MAX-masks leg 2. Because #632 fixes
+  only the *server* rollup, the fixed server total (`GetRunUsageTotal`) now **diverges**
+  from that client strip on broken-lineage runs — a new inconsistency (the two agreed
+  before #632 because both undercounted), and ADR-195's "cannot diverge by mechanism"
+  invariant no longer holds for that case. Left as a maintainer follow-up (a feasible fix:
+  reset the client's per-model baseline on the `resume_lineage_break` event it already
+  sees, plus a broken-lineage contract fixture and a `runUsage.ts` comment fix). Recorded
+  as an incidental finding and documented as a known limitation in `adr/0632`.
 
 ## Success criteria
 

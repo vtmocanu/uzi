@@ -23,6 +23,11 @@ through `[0.52.0]`.)
 - **Default schedules gain model-parity with custom schedules ([#691](https://github.com/vtmocanu/uzi/issues/691)).**
   An owner can now set "Apply model also to agents" (`override_subagent_model`) on a default (catalog) schedule in place — via the web modal, the API, and `uzi schedule edit --apply-model-to-agents` — instead of having to clone it first; Reset restores it to the catalog baseline (off) alongside the other editable fields. `uzi schedule edit` also gains a `--model <alias|id>` flag (empty clears back to the Worker-model default) for both custom and default schedules, closing the gap where the CLI could not change a schedule's model that the web UI and API already could.
 
+### Fixed
+
+- **`run_usage` no longer undercounts a broken-resume run's cost ([#632](https://github.com/vtmocanu/uzi/issues/632)).**
+  When a worker restart failed to resume and started a fresh SDK session, that leg accumulated token/cost from zero under a new session row and the `run_usage_totals` rollup's MAX-per-model silently masked the smaller leg, so a run's recorded total could undercount by up to a full leg (measured live: one run recorded $64.74 against an actual $321.66). The server now stamps a defaulted `lineage_epoch` marker, bumped once when the worker signals a dropped resume (`resume_lineage_break`), and the totals view MAXes within each `(run, model, lineage_epoch)` then SUMs across epochs — recovering the masked leg. Advisory telemetry only (nothing is billed from it), and existing rows default to epoch 0 so no historical number is restated; the web run-page's own client-side usage strip stays epoch-unaware for now (tracked separately).
+
 ## [0.68.0] - 2026-08-29
 
 ### Changed
