@@ -239,15 +239,13 @@ caught too, not just the checkpointed tracking ref):
   It rides through `limit_wait` (keeps snapshotting while a run is parked). This is a
   session-independent safety net; it is NOT a substitute for the pollers — keep those too.
 
-To recover from a snapshot: extract `<ts>/<stem>.tgz` (`issue-N` for an issue run,
-`task-<runid>` for a task run), `git fetch` its bundle into a `recover/<stem>` branch + an
-ISOLATED worktree, then follow **`resume-recipe.md`** in this
-skill dir for the exact land-it steps. The one gotcha worth stating here so nobody trips on
-it: **`git fetch origin main` + `git rebase origin/main` FIRST** (rebase refuses a dirty
-tree), and only THEN restore the `uncommitted.patch` / `untracked.tar.gz` the tracking ref
-never held (paths inside the snapshot dir, applied from within the worktree), **commit**,
-and gate + PR + admin-merge. The recipe is the full, run-kind-agnostic version (issue AND
-task stems, integrity-verify the `.tgz` first, the workflow/migration pre-flight, cleanup).
+To recover from a snapshot, follow **`resume-recipe.md`** in this skill dir. It is the
+authoritative, run-kind-agnostic land-it recipe (issue AND task stems) and takes over where
+this two-step "get the work out" leaves off, carrying the snapshot through the whole path:
+integrity-verify the `.tgz`, fetch into an isolated `recover/<stem>` worktree, rebase,
+restore the uncommitted state, commit, the workflow/migration pre-flight, gate, PR,
+admin-merge, cleanup. Read the exact commands and ordering there rather than duplicating
+them here.
 
 ## Reviewing the diff
 
