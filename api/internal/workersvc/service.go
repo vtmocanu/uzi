@@ -3076,6 +3076,13 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	// close without a shared transaction (advisory-telemetry impact only). The
 	// `inserted` gate already makes the bump exactly-once regardless of position, so
 	// moving it up cannot double-bump.
+	//
+	// One consequence of sitting ahead of the high-water-mark update: a bump failure
+	// now returns before UpdateRunLastSeq, so last_seq is not advanced on that path.
+	// This is self-healing — the worker retries, maxStored is recomputed (its
+	// assignment is outside the rows>0 gate), the seq-deduped break is skipped, and
+	// UpdateRunLastSeq advances last_seq on the retry — so the only durable casualty
+	// is the same irreducible lost bump noted above, not a stuck watermark.
 	epochBumps := 0
 	for _, m := range inserted {
 		if m.Kind != "status" {
