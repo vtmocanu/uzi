@@ -187,21 +187,30 @@ for RID in "${RUNS[@]}"; do
   # full `tar tzf` listing) and RETRY the whole capture a few times, since the
   # truncation is transient — a re-exec usually succeeds within seconds.
   cap_rc=1
+  tmp="$f.part"
   for cap_try in 1 2 3; do
-    if ! "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- sh -c "$CAPTURE" _ "$STEM" > "$f" 2>>"$LOG"; then
+    # Write each attempt to a scratch path, NEVER straight to $f: a later attempt
+    # whose exec dies before emitting any stdout must not wipe a nonempty archive an
+    # earlier attempt already produced — a truncated archive is still the best
+    # forensic artifact we have. Promote to $f only when the attempt produced bytes.
+    rm -f "$tmp"
+    if ! "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- sh -c "$CAPTURE" _ "$STEM" > "$tmp" 2>>"$LOG"; then
       log "WARN $RID ($LBL): exec/capture attempt $cap_try failed; see $LOG"
       continue
     fi
-    if [ ! -s "$f" ]; then
-      # Empty is a missing clone, not a truncation; retrying will not help.
+    if [ ! -s "$tmp" ]; then
+      # Empty is a missing clone, not a truncation; retrying will not help. Leave any
+      # nonempty $f from a prior attempt in place (do not clobber it with nothing).
       break
     fi
+    mv -f "$tmp" "$f"
     if gzip -t "$f" 2>/dev/null && tar tzf "$f" >/dev/null 2>&1; then
       cap_rc=0
       break
     fi
     log "WARN $RID ($LBL): truncated .tgz on attempt $cap_try ($(du -h "$f" | cut -f1)); retrying"
   done
+  rm -f "$tmp"
   if [ "$cap_rc" -eq 0 ]; then
     # A verified-intact archive. The git bundle carries the committed work, so if
     # it is absent, say so (PART) rather than OK — the patch/untracked/status are
