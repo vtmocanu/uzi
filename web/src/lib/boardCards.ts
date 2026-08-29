@@ -82,7 +82,7 @@ export function isSelfImproveTracker(card: Pick<Card, "labels">): boolean {
 export function canPromote(
   card: Pick<Card, "labels" | "assignee_ids" | "closed">,
   uziLabel: string,
-  botForgeUserID: number,
+  botForgeUserID: number | undefined,
 ): boolean {
   return !card.closed && !isUziCard(card, uziLabel, botForgeUserID) && !isSelfImproveTracker(card);
 }

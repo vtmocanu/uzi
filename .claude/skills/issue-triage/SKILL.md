@@ -28,7 +28,8 @@ picking the lowest-numbered issue in the highest non-empty tier.
 **Why the tiers.** A sweep fires an issue only when it has BOTH halves: (a) a
 **selector** label (`Planned`, or `bug` for a bug) AND (b) eligibility — the **`uzi`
 label**, or the issue **assigned to the uzi-bot account** (a second, label-less way
-to be eligible, PRD #767); no PRD link and no admin waiver required, or relevant.
+to be eligible, PRD #767); assignment alone makes an issue eligible — no PRD link
+and no admin waiver required.
 (Authoritative mechanics, which drift: `CLAUDE.local.md` → "uzi scheduled sweeps",
 plus `docs/scheduling.md`, `docs/admin-settings.md#run-eligibility`.) An issue missing
 **either** half looks queued but silently never runs, and nobody notices — so those are
@@ -150,6 +151,11 @@ Before queuing, confirm the issue is not stale. Do NOT trust its line numbers.
 
 Labels and comments are public writes on the repo. **Always propose first and apply
 only after the user's OK.** Then:
+
+The snippet below demonstrates the **label-based** eligibility path. For a 1A gap
+whose fix is assignment instead, swap the `--add-label "uzi"` for
+`--add-assignee <uzi-bot>` (the concrete login is instance-specific, sourced from
+`CLAUDE.local.md` — don't invent one).
 
 ```sh
 gh issue edit NNN --repo vtmocanu/uzi --add-label "SELECTOR" --add-label "uzi"

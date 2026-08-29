@@ -7,7 +7,8 @@ audience: user
 # Autopilot
 
 With autopilot on, adding the **autopilot label** (default `autopilot`, see
-[Admin settings](./admin-settings.md)) alongside the **PRD label** to a
+[Admin settings](./admin-settings.md)) alongside the **run-eligibility label**
+(default `uzi`) — or assigning the issue to the uzi-bot account instead — to a
 GitLab issue starts a run for you, unattended: no plan-approval step,
 spending your own Anthropic token. The plan is still recorded in run
 history as an audit trail, and the merge request stays your human review

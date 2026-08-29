@@ -666,8 +666,11 @@ export interface IssueDetail {
   labels: string[];
   // Forge user ids assigned to the issue (PRD #767 M5), fresh from the live forge
   // fetch. The issue view evaluates the same "carries `uzi` OR assigned to the bot"
-  // runnable predicate the board does. Always present (server sends [] not null).
-  assignee_ids: number[];
+  // runnable predicate the board does. A current server always sends [] not null,
+  // but the field is optional (matching Card.assignee_ids) so a payload from an OLD
+  // api replica during a rollout skew that omits it does not throw in the consumer —
+  // a missing value is treated as "no assignees".
+  assignee_ids?: number[];
   web_url: string;
   author: string | null;
   has_prd_link: boolean;
@@ -680,7 +683,10 @@ export interface IssueDetail {
   forge_type: string;
   // The repo's connection's bot forge user id (PRD #767 M5), so the issue view can
   // evaluate assignment-eligibility with the same predicate as the board. Per-connection.
-  bot_forge_user_id: number;
+  // Optional (matching Board.bot_forge_user_id): an OLD api replica during a rollout
+  // skew may omit it entirely, which the consumer treats as "no bot" (0), the same as
+  // unresolved.
+  bot_forge_user_id?: number;
 }
 
 export interface ForgeConfig {
