@@ -1167,8 +1167,11 @@ export function AppShell({ children }: { children: ReactNode }) {
   // guest and survives logout (enabled flips false → reset to the static mark).
   // Reuses the unread count above — no second unread poll — and owns its own
   // runs poll (which fires while the tab is hidden). Called before the guest
-  // early return so the hook order stays stable.
-  useFavicon({ unread, enabled: !!user });
+  // early return so the hook order stays stable. The base icon white-labels to the
+  // branded app logo (issue #688) — appMarkImgSrc reuses the module-memoised
+  // branding fetch, and applies signed-out too so a guest on a branded instance
+  // still gets the branded base (no status dot).
+  useFavicon({ unread, enabled: !!user, appLogoSrc: appMarkImgSrc(branding) });
 
   if (!user) return <PublicShell>{children}</PublicShell>;
 
