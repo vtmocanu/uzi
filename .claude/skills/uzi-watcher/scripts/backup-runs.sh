@@ -194,15 +194,20 @@ for RID in "${RUNS[@]}"; do
     # earlier attempt already produced — a truncated archive is still the best
     # forensic artifact we have. Promote to $f only when the attempt produced bytes.
     rm -f "$tmp"
-    if ! "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- sh -c "$CAPTURE" _ "$STEM" > "$tmp" 2>>"$LOG"; then
-      log "WARN $RID ($LBL): exec/capture attempt $cap_try failed; see $LOG"
-      continue
+    "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- sh -c "$CAPTURE" _ "$STEM" > "$tmp" 2>>"$LOG"
+    kc_rc=$?
+    if [ "$kc_rc" -ne 0 ]; then
+      log "WARN $RID ($LBL): exec/capture attempt $cap_try exit=$kc_rc; see $LOG"
     fi
     if [ ! -s "$tmp" ]; then
-      # Empty is a missing clone, not a truncation; retrying will not help. Leave any
-      # nonempty $f from a prior attempt in place (do not clobber it with nothing).
+      # No bytes this attempt. A nonzero exit is a transient failure worth a retry;
+      # a clean exit with no output means the clone is missing (a retry won't help).
+      # Either way, leave any nonempty $f from a prior attempt in place.
+      [ "$kc_rc" -ne 0 ] && continue
       break
     fi
+    # Nonempty output — even on a nonzero exec exit, kubectl may have streamed a
+    # PARTIAL archive; keep it as the best-so-far and let the verify below decide.
     mv -f "$tmp" "$f"
     if gzip -t "$f" 2>/dev/null && tar tzf "$f" >/dev/null 2>&1; then
       cap_rc=0
