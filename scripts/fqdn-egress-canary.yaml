@@ -1,20 +1,19 @@
 # CANARY: liveness fixture for the FQDN-egress completeness check in
 # scripts/assert-chart-render.sh (PRD #808 M2). This is a DELIBERATELY-INCOMPLETE
-# slice of a real chart render: the Antrea worker-egress policy below carries an
-# Allow entry for every canonical destination EXCEPT `cache.nixos.org`, which is
-# omitted ON PURPOSE. That single injected gap is what proves the detector still
-# fires -- assert-chart-render.sh runs the completeness check against this file
-# before checking the real render and requires it to report `cache.nixos.org`
-# missing; if the detector reads this known-incomplete render as complete, the
-# instrument is broken (exit 2, "an empty result must not read as green").
+# slice of a real chart render, missing ONE host per detector half so BOTH halves
+# are exercised:
+#   - `cache.nixos.org` -- a STATIC_HOSTS entry, omitted from the Allow list below;
+#   - `gitlab.example.com` -- the FORGE host: the ConfigMap's FORGE_ALLOWED_BASE_URLS
+#     names it, but the policy below carries NO Allow for it, so the forge-derivation
+#     path must catch the gap.
+# assert-chart-render.sh runs the completeness check against this file before checking
+# the real render and requires it to report BOTH hosts missing; if the detector reads
+# this known-incomplete render as complete (or names only one), the instrument is
+# broken (exit 2, "an empty result must not read as green").
 #
-# The forge host `gitlab.example.com` IS present as an Allow (mirroring the
-# ConfigMap's FORGE_ALLOWED_BASE_URLS below) so the single static host is the only
-# gap -- the forge single-source tie is exercised as satisfied here.
-#
-# Do NOT "fix" this file by adding the cache.nixos.org Allow: that would silence
-# the canary and the gate would stop proving the detector works. This file holds
-# no secrets.
+# Do NOT "fix" this file by adding the cache.nixos.org or gitlab.example.com Allow:
+# that would silence the canary and the gate would stop proving the detector works.
+# This file holds no secrets.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -62,17 +61,13 @@ spec:
       ports:
         - protocol: TCP
           port: 443
+    # allow-forge-gitlab-example-com (gitlab.example.com) is OMITTED ON PURPOSE below
+    # -- the ConfigMap above names it in FORGE_ALLOWED_BASE_URLS, so the forge-derivation
+    # half of the detector must report it missing. See the CANARY header.
     - name: allow-cnpg-oci-blobs
       action: Allow
       to:
         - fqdn: "pkg-containers.githubusercontent.com"
-      ports:
-        - protocol: TCP
-          port: 443
-    - name: allow-forge-gitlab-example-com
-      action: Allow
-      to:
-        - fqdn: "gitlab.example.com"
       ports:
         - protocol: TCP
           port: 443

@@ -102,21 +102,36 @@ set -f
 # the forge configuration. Kept here as the single source of the STATIC expectation.
 STATIC_HOSTS="*.anthropic.com cache.nixos.org search.devbox.sh ghcr.io pkg-containers.githubusercontent.com"
 
-# has_antrea_policy <file> -- succeed iff the render contains a crd.antrea.io document.
-has_antrea_policy() {
-  awk '/^apiVersion:[[:space:]]*crd\.antrea\.io/ { f = 1 } END { exit !f }' "$1"
+# has_worker_egress_policy <file> -- succeed iff the render contains the crd.antrea.io
+# `-worker-egress` NetworkPolicy specifically. Keyed on that document's metadata name
+# (not merely on the crd.antrea.io apiVersion), so an unrelated Antrea policy in the
+# same render does not satisfy this check -- the completeness guard is about ONE policy.
+has_worker_egress_policy() {
+  awk '
+    /^---[[:space:]]*$/                       { antrea = 0; next }
+    /^apiVersion:[[:space:]]*crd\.antrea\.io/ { antrea = 1; next }
+    antrea && /^[[:space:]]+name:[[:space:]].*-worker-egress[[:space:]]*$/ { f = 1 }
+    END { exit !f }
+  ' "$1"
 }
 
 # collect_allow_fqdns <file> -- print, one per line, each `fqdn:` value that sits in
-# an egress entry whose `action:` is Allow, ONLY within a crd.antrea.io document.
-# Drop entries (the denyCIDRs belt) and ipBlock peers carry no fqdn and are skipped
-# by construction; the action gate makes that explicit rather than incidental.
+# an egress entry whose `action:` is Allow, ONLY within the crd.antrea.io
+# `-worker-egress` NetworkPolicy document. Scoping to that ONE document (via its
+# metadata name) is load-bearing: pooling Allow-fqdns across every Antrea policy in
+# the render would let a host absent from THIS policy but present in an unrelated one
+# read as covered -- a false green in the gate whose whole job is to prevent one. The
+# metadata `name:` line (2-space indent, no leading `- `) precedes `spec.egress`, so
+# the `we` flag is set before any fqdn is seen. Drop entries (the denyCIDRs belt) and
+# ipBlock peers carry no fqdn and are skipped by construction; the action gate makes
+# that explicit rather than incidental.
 collect_allow_fqdns() {
   awk '
-    /^---[[:space:]]*$/            { antrea = 0; action = ""; next }
+    /^---[[:space:]]*$/                       { antrea = 0; we = 0; action = ""; next }
     /^apiVersion:[[:space:]]*crd\.antrea\.io/ { antrea = 1; next }
-    antrea && /^[[:space:]]*action:[[:space:]]/ { action = $2; next }
-    antrea && action == "Allow" && /fqdn:/ {
+    antrea && /^[[:space:]]+name:[[:space:]].*-worker-egress[[:space:]]*$/ { we = 1; next }
+    antrea && we && /^[[:space:]]*action:[[:space:]]/ { action = $2; next }
+    antrea && we && action == "Allow" && /fqdn:/ {
       v = $0
       sub(/^.*fqdn:[[:space:]]*/, "", v)   # keep only the value after `fqdn:`
       gsub(/"/, "", v)                     # strip quotes
@@ -160,9 +175,9 @@ is_present() {
 # codes above. Prints to stdout so the canary self-test can inspect its output.
 check_completeness() {
   _file="$1"
-  if ! has_antrea_policy "$_file"; then
-    echo "BROKEN: no crd.antrea.io NetworkPolicy document in the render -- the worker" >&2
-    echo "        egress policy was supposed to render (workers.fqdnEgress.enabled: true)." >&2
+  if ! has_worker_egress_policy "$_file"; then
+    echo "BROKEN: no crd.antrea.io -worker-egress NetworkPolicy document in the render --" >&2
+    echo "        it was supposed to render (workers.fqdnEgress.enabled: true)." >&2
     return 2
   fi
 
@@ -194,15 +209,20 @@ check_completeness() {
 
 # --- canary self-test: prove the detector fires on a known-incomplete render --------
 # Run the completeness check against the committed, deliberately-incomplete canary
-# BEFORE trusting it on the real render. The canary omits exactly `cache.nixos.org`,
-# so a working detector must return a finding (1) that names it. Any other outcome --
-# it reports complete (0), or breaks (2) -- means the instrument cannot be trusted.
+# BEFORE trusting it on the real render. The canary omits TWO hosts, one per detector
+# half: `cache.nixos.org` (a STATIC_HOSTS entry) and the forge host `gitlab.example.com`
+# (which its ConfigMap names in FORGE_ALLOWED_BASE_URLS, exercising the forge-derivation
+# path). A working detector must return a finding (1) naming BOTH. Any other outcome --
+# complete (0), broken (2), or only one named -- means the instrument cannot be trusted
+# (a regression in EITHER the static or the forge half would be caught here).
 CANARY="$SCRIPT_DIR/fqdn-egress-canary.yaml"
 [ -f "$CANARY" ] || { echo "BROKEN: canary fixture missing at $CANARY" >&2; exit 2; }
 
 canary_out=$(check_completeness "$CANARY") && canary_rc=0 || canary_rc=$?
-if [ "$canary_rc" -eq 1 ] && printf '%s\n' "$canary_out" | is_present "FAIL: kube-native worker egress is missing canonical destination: cache.nixos.org"; then
-  echo "OK: canary self-test tripped the detector on its injected gap (cache.nixos.org)"
+if [ "$canary_rc" -eq 1 ] \
+   && printf '%s\n' "$canary_out" | is_present "FAIL: kube-native worker egress is missing canonical destination: cache.nixos.org" \
+   && printf '%s\n' "$canary_out" | is_present "FAIL: kube-native worker egress is missing canonical destination: gitlab.example.com"; then
+  echo "OK: canary self-test tripped both detector halves (static cache.nixos.org + forge gitlab.example.com)"
 else
   echo "BROKEN: canary self-test did not fire as expected (rc=$canary_rc) on a" >&2
   echo "        known-incomplete render -- the FQDN completeness detector is not" >&2
