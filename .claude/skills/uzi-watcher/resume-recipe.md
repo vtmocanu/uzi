@@ -36,30 +36,33 @@ the `uncommitted.patch` + `untracked.tar.gz` are what save it, not the bundle.
 cd <the repo>                              # your normal checkout; work happens in DIR, not here
 ```
 
-1. **Extract + VERIFY the snapshot** (source A). A truncated `.tgz` still lists its bundle
-   member's NAME, so check the bytes end-to-end before trusting it:
+1. **Point `BUNDLE` at the bundle and VERIFY the bytes — for BOTH sources.** A truncated
+   bundle still lists its ref by name, so check before trusting it:
    ```sh
-   gzip -t SNAP/STEM.tgz && tar tzf SNAP/STEM.tgz >/dev/null   # both must pass
+   # Source A (snapshot): the .tgz is gzip — test it end-to-end, then extract.
+   gzip -t SNAP/STEM.tgz && tar tzf SNAP/STEM.tgz >/dev/null       # both must pass
    W=$(mktemp -d); tar xzf SNAP/STEM.tgz -C "$W"
+   BUNDLE="$W/STEM.bundle"; FETCH_REF=BRANCH
+
+   # Source B (live PVC): BUNDLE is the raw bundle you kubectl-cp'd out (created from REF,
+   # per "Recovering a failed run's work from the worker PVC"); no gzip layer to test.
+   #   BUNDLE=/path/to/r.bundle; FETCH_REF=REF
    ```
 2. **Prove the bundle is restorable** from INSIDE the real repo (it has the prerequisite
-   base commit the bundle excludes):
+   base commit the bundle excludes) — this runs for either source:
    ```sh
-   git bundle verify "$W/STEM.bundle"        # "…is okay"; lists the ref + the required base
+   git bundle verify "$BUNDLE"                # "…is okay"; names the ref + the required base
    ```
 3. **Fetch into a recovery branch + an ISOLATED worktree** (never `main`):
    ```sh
-   git fetch "$W/STEM.bundle" 'BRANCH:refs/heads/recover/STEM'   # source B: fetch the kubectl-cp'd bundle
+   git fetch "$BUNDLE" "$FETCH_REF:refs/heads/recover/STEM"
    git worktree add DIR recover/STEM
    cd DIR
    ```
-4. **Restore uncommitted state** the tracking ref never held (source A; skip if absent —
-   a committed-only run has neither file):
-   ```sh
-   git apply "$W/STEM.uncommitted.patch"   2>/dev/null || true   # tracked edits
-   tar xzf   "$W/STEM.untracked.tar.gz" -C . 2>/dev/null || true  # new, not-yet-added files
-   ```
-5. **Rebase onto current main** (adopts main's workflow files → clears any base-staleness):
+4. **Rebase onto current main FIRST, while the tree is still clean.** Only the bundle's
+   COMMITTED work is present so far, and `git rebase` refuses a dirty tree — so the rebase
+   MUST precede any uncommitted restore (step 5). Adopts main's workflow files → clears any
+   base-staleness:
    ```sh
    git fetch origin main && git rebase origin/main
    ```
@@ -67,29 +70,41 @@ cd <the repo>                              # your normal checkout; work happens 
    incoming one); a new goose migration (rename to the next free number above the live head
    in `api/internal/store/migrations/`, sequenced after any sibling PR's migration); a
    hand-edited shared doc (keep both sides).
-6. **Pre-flight (both must be empty)** — confirms no `.github/workflows` surprise (the
-   worker PAT lacks `workflow` scope, but YOUR token has it, so a workflow edit is fine to
-   push here; an empty result just means a plain rebase already landed it):
+5. **Restore the uncommitted state** the tracking ref never held — the whole point for a
+   task run. Skip cleanly when the run had none, but do NOT mask a real apply failure (a
+   `|| true` would turn a corrupt archive or a patch conflict into silent data loss):
+   ```sh
+   [ -f "$W/STEM.uncommitted.patch" ] && git apply --3way "$W/STEM.uncommitted.patch"  # tracked edits
+   [ -f "$W/STEM.untracked.tar.gz" ]  && tar xzf "$W/STEM.untracked.tar.gz" -C .        # new files
+   git status --short && git diff --stat    # eyeball what was restored before committing it
+   ```
+6. **Commit the restored work.** `git push` sends only commits, and the step-7 pre-flight
+   diffs `origin/main..HEAD` — so anything left in the working tree is silently dropped:
+   ```sh
+   git add -A && git commit -m "chore: recover work from run RUN"   # skip if step 5 restored nothing
+   ```
+7. **Pre-flight (both `.github/workflows` checks must be empty)** — confirms no workflow
+   surprise (YOUR token has `workflow` scope, so an intended workflow edit is fine to push;
+   an empty result just means a plain rebase already landed main's copy):
    ```sh
    git diff --name-only origin/main..HEAD -- .github/workflows/
    git log  --name-only origin/main..HEAD -- .github/workflows/
    git diff --name-only origin/main..HEAD -- api/internal/store/migrations/   # renumber if non-empty
    ```
-7. **Gate the touched components** (only the ones the diff touches): `task gate:api`,
+8. **Gate the touched components** (only the ones the diff touches): `task gate:api`,
    `gate:web`, `gate:agent`, `gate:controller`, and `./e2e/run-store-it.sh` if a `*_livedb`
    test changed. Use the repo's pinned toolchains (`GOTOOLCHAIN`, node@24 for web — see the
    toolchain-skew memory).
-8. **Push + open a maintainer PR** that says it is a recovery and why:
+9. **Push + open a maintainer PR** that says it is a recovery and why:
    ```sh
    git push -u origin recover/STEM
    gh pr create --repo OWNER/REPO --base main --title '…(recovered)' --body '…recovered from RUN…'
    ```
-9. **Review + land** — wait for CodeRabbit, triage its findings (see *Reviewing the diff* /
-   *Triaging CodeRabbit findings*), fix the real ones, then admin-merge and watch post-merge
-   CI. If a sibling PR must land first (migration ordering), merge it, `gh pr update-branch`
-   this one, re-wait for CI.
-10. **Clean up** — `git worktree remove DIR`, `git branch -D recover/STEM`, and delete the
-    backup snapshot once the PR is merged and CI is green.
+10. **Review, land, clean up** — wait for CodeRabbit, triage its findings (see *Reviewing
+    the diff* / *Triaging CodeRabbit findings*), fix the real ones, admin-merge, watch
+    post-merge CI (if a sibling PR must land first for migration ordering, merge it, then
+    `gh pr update-branch` this one and re-wait). Then `git worktree remove DIR`, `git branch
+    -D recover/STEM`, and delete the snapshot once the PR is merged and CI is green.
 
 ## Notes
 
