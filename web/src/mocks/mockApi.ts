@@ -189,6 +189,7 @@ const SEED_APP_SETTINGS: AppSettings = {
   // PRD #685: instance branding config, all string-space. Fresh installs are
   // unbranded (app_logo_mode "default", brand_mode "none").
   app_logo_mode: "default",
+  app_logo_preset: "",
   app_logo_keep_name: "true",
   brand_mode: "none",
   brand_company: "",
@@ -1758,6 +1759,7 @@ export const mockApi = {
   branding: async () =>
     delay({
       app_logo_mode: appSettings.app_logo_mode,
+      app_logo_preset: appSettings.app_logo_preset,
       app_logo_present: brandingAssets.app,
       app_logo_keep_name: appSettings.app_logo_keep_name === "true",
       brand_mode: appSettings.brand_mode,
@@ -2089,10 +2091,21 @@ export const mockApi = {
       // contain commas — mirrors the server's dedicated termsafe validator), capped
       // at 64 runes.
       if (key === "app_logo_mode") {
-        if (value !== "default" && value !== "custom") {
-          throw new ApiError(400, 'app_logo_mode: must be "default" or "custom"');
+        if (value !== "default" && value !== "custom" && value !== "preset") {
+          throw new ApiError(400, 'app_logo_mode: must be "default", "custom" or "preset"');
         }
         nonSecret.app_logo_mode = value;
+        continue;
+      }
+      // app_logo_preset (PRD #780): a web-catalog slug. Mirrors the server's
+      // validateBrandingSlug SHAPE gate — empty is allowed ("no preset"), any other
+      // value must be a short lowercase slug. Membership against the catalog is NOT
+      // checked here (the web catalog is the source of truth; unknown slugs degrade).
+      if (key === "app_logo_preset") {
+        if (value !== "" && !/^[a-z][a-z0-9-]{0,31}$/.test(value)) {
+          throw new ApiError(400, "app_logo_preset: must be a short lowercase slug (a-z, 0-9, hyphen; 32 chars max)");
+        }
+        nonSecret.app_logo_preset = value;
         continue;
       }
       if (key === "brand_mode") {

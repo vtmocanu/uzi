@@ -457,6 +457,7 @@ type Run struct {
 	ScopeCeiling          pgtype.Int4        `json:"scope_ceiling"`
 	StatusSince           pgtype.Timestamptz `json:"status_since"`
 	ReviewComments        []byte             `json:"review_comments"`
+	BudgetPausedSeconds   int32              `json:"budget_paused_seconds"`
 }
 
 type RunMessage struct {

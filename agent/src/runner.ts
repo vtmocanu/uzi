@@ -2753,6 +2753,26 @@ export class RunRunner {
         runId,
       );
     }
+    if (claim.kind === "mr_rework") {
+      // PRD #700 / issue #778: an mr_rework run carries issue_iid = NULL and folds its
+      // work onto the MR's EXISTING branch rather than a worker-derived name. The server
+      // populates claim.branch from the run's pipeline_ref for this kind, so the MR branch
+      // (e.g. agent/issue-42) arrives here on claim.branch. runnerCloneForBranch seeds off
+      // `refs/remotes/origin/<branch>` when that branch already exists on origin — which it
+      // does for an MR under review — so the existing MR content is picked up automatically,
+      // the same mechanism the task case above relies on. A missing/empty branch is a
+      // create-time bug (an mr_rework run must carry its MR branch), so fail loudly rather
+      // than fall through to the issue path, which would throw on the NULL issue_iid.
+      const mrBranch = claim.branch?.trim();
+      if (!mrBranch)
+        throw new Error("mr_rework run claim is missing its MR branch (pipeline_ref)");
+      return this.git.runnerCloneForBranch(
+        barePath,
+        mrBranch,
+        mrBranch.replace(/\//g, "-"),
+        runId,
+      );
+    }
     if (claim.issue_iid == null)
       throw new Error("issue run claim is missing issue_iid");
     return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId);
@@ -3205,6 +3225,11 @@ function mrTitle(
   // inline context's first line, so the trimmed-title branch above almost always
   // wins; this is the empty-context fallback, never `Resolve issue #null`.
   if (claim.kind === "task") return "Handoff task";
+  // An mr_rework run (PRD #700 / issue #778) is ISSUE-LESS (issue_iid is NULL): its
+  // issue_title is derived from the reworked MR's title so the trimmed-title branch
+  // above almost always wins; this is the empty-title fallback, never `Resolve issue
+  // #null` on the off-nominal path where a new MR is created.
+  if (claim.kind === "mr_rework") return "MR rework";
   return `${prefix}Resolve issue #${claim.issue_iid}`;
 }
 
@@ -3287,6 +3312,22 @@ function mrDescription(
       "Handoff task (PRD #400). This run worked inline context on the server-named",
       `\`${branch}\` branch${base ? ` (branched from \`${base}\`)` : ""} and opened this merge request because it was created with \`--mr\`.`,
       "There is no tracking issue, so this MR closes nothing.",
+      ...repoMarker,
+      "",
+      "---",
+      footer,
+    ].join("\n");
+  }
+  if (claim.kind === "mr_rework") {
+    // An mr_rework run (PRD #700 / issue #778) FOLDS review-comment fixes onto an MR's
+    // EXISTING branch; createMergeRequest is idempotent, so in the designed flow it
+    // adopts the already-open MR and this body is discarded. Like the prompt/task/
+    // self_improve arms above it is ISSUE-LESS (issue_iid is NULL), so it references the
+    // MR branch and `Closes` nothing — the issue fallback below would render `#null` on
+    // the off-nominal path where the branch exists but no open MR is found.
+    return [
+      "Automated MR rework (PRD #700). This run addressed review feedback on the existing",
+      `\`${branch}\` branch. There is no tracking issue, so this MR closes nothing.`,
       ...repoMarker,
       "",
       "---",

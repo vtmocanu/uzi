@@ -966,6 +966,19 @@ UPDATE runs SET
     health        = CASE WHEN status = 'running' THEN health        ELSE 'ok'  END,
     health_reason = CASE WHEN status = 'running' THEN health_reason ELSE NULL END,
     health_since  = CASE WHEN status = 'running' THEN health_since  ELSE NULL END,
+    -- Issue #783: bank the wall-clock time this run spent parked at a HUMAN GATE so
+    -- SweepRunningTimeout's deadline can exclude it (started_at is left untouched, so
+    -- run-duration display and the health baselines are unchanged). Keyed on the OLD
+    -- row (Postgres evaluates SET RHS against the pre-update tuple, the same mechanism
+    -- the status_since/health arms above use): fires only on ENTRY from a park. On the
+    -- running->running heartbeat the old status is 'running', so the CASE is 0 and this
+    -- never double-counts; status_since is NOT NULL (migration 00163), so the subtraction
+    -- is never NULL. Both park->running transitions are guarded below (consumed
+    -- approve_plan / question identity), so accumulation only happens on a real resume.
+    budget_paused_seconds = budget_paused_seconds
+        + CASE WHEN status IN ('awaiting_approval', 'awaiting_input')
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
+               ELSE 0 END,
     updated_at       = now()
 WHERE runs.id = @id AND worker_id = @worker_id
   AND status NOT IN ('completed', 'failed', 'cancelled')
@@ -1389,6 +1402,9 @@ UPDATE runs SET
     status     = 'queued',
     status_since = now(),
     started_at = NULL,
+    -- Issue #783: the fresh wall discards started_at, so the pause banked against the
+    -- OLD baseline must be cleared too — otherwise it over-credits the new deadline.
+    budget_paused_seconds = 0,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE status = 'limit_wait' AND retry_not_before <= @now
@@ -1867,6 +1883,9 @@ UPDATE runs SET
     status       = 'pool_wait',
     status_since = now(),
     started_at   = NULL,
+    -- Issue #783: the fresh wall discards started_at, so the pause banked against the
+    -- OLD baseline must be cleared too — otherwise it over-credits the new deadline.
+    budget_paused_seconds = 0,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at   = now()
 WHERE id = @id AND worker_id = @worker_id
@@ -1914,6 +1933,9 @@ UPDATE runs SET
     status       = 'queued',
     status_since = now(),
     started_at   = NULL,
+    -- Issue #783: the fresh wall discards started_at, so the pause banked against the
+    -- OLD baseline must be cleared too — otherwise it over-credits the new deadline.
+    budget_paused_seconds = 0,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at   = now()
 WHERE id = @id AND user_id = @user_id
@@ -1964,7 +1986,13 @@ UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failu
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE status = 'running'
-  AND started_at < (sqlc.arg('now')::timestamptz - make_interval(secs => COALESCE(budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)))
+  -- Issue #783: the deadline EXCLUDES budget_paused_seconds (time this run spent parked
+  -- at a human gate), so gate-wait does not consume the implementation budget.
+  -- budget_paused_seconds is NOT NULL DEFAULT 0 (migration 00173), so it is a plain
+  -- additive term that is 0 for a run that never parked.
+  AND started_at < (sqlc.arg('now')::timestamptz
+        - make_interval(secs => COALESCE(budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
+                              + budget_paused_seconds))
   AND kind NOT IN ('chat', 'judge')
   AND interactive = false
 RETURNING id, user_id, status;
@@ -1997,6 +2025,14 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue
     -- Exit contract (PRD #47 Decision 3): reset on the way back to 'queued'; the
     -- detector re-evaluates the queued signal from this transition's status_since.
     health = 'ok', health_reason = NULL, health_since = NULL,
+    -- Issue #783: bank park time before a worker-death requeue -> queued, since started_at
+    -- survives the requeue and the later claimed->running resume would not see the park.
+    -- awaiting_followup is intentionally excluded: interactive runs are exempt from
+    -- SweepRunningTimeout entirely (interactive = false), so they have no wall deadline.
+    budget_paused_seconds = budget_paused_seconds
+        + CASE WHEN status IN ('awaiting_approval', 'awaiting_input')
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
+               ELSE 0 END,
     updated_at = now()
 WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND requeue_count < @max_requeues
@@ -2035,6 +2071,14 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue
     -- Exit contract (PRD #47 Decision 3): reset on the way back to 'queued'; the
     -- detector re-evaluates the queued signal from this transition's status_since.
     health = 'ok', health_reason = NULL, health_since = NULL,
+    -- Issue #783: bank park time before a worker-death requeue -> queued, since started_at
+    -- survives the requeue and the later claimed->running resume would not see the park.
+    -- awaiting_followup is intentionally excluded: interactive runs are exempt from
+    -- SweepRunningTimeout entirely (interactive = false), so they have no wall deadline.
+    budget_paused_seconds = budget_paused_seconds
+        + CASE WHEN status IN ('awaiting_approval', 'awaiting_input')
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
+               ELSE 0 END,
     updated_at = now()
 WHERE worker_id = @worker_id
   AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')

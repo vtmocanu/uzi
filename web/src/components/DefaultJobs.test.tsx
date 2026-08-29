@@ -191,6 +191,25 @@ describe("DefaultJobs — catalog row", () => {
     expect(screen.queryByRole("button", { name: /Enable/ })).toBeNull();
   });
 
+  it("the disclosure toggle shows no count text in the Default jobs tab (the green pill carries it)", () => {
+    // An enabled default row renders the disclosure toggle (repoCount > 0). The Default-jobs
+    // variant passes showDisclosureCount={false}, so the toggle degrades to a bare chevron —
+    // the "N repos" count lives only in the green Next-run pill.
+    renderTab({
+      schedules: [defRow({ id: "sch-uzi", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi" })],
+    });
+
+    const toggle = screen.getByRole("button", { name: /Show repos for/ });
+    // No visible count text inside the toggle button. (Scoped to the button: the green Badge
+    // in the Next-run cell also matches /repo/, so a bare queryByText would find the pill.)
+    expect(within(toggle).queryByText(/repo/)).toBeNull();
+    // ...but the count is still shown — in the green pill, not the toggle. Scope the
+    // assertion to the Next-run table cell so it fails if the badge (or its count) is
+    // removed and the text merely reappears elsewhere in the row.
+    const nextRunCell = screen.getByRole("cell", { name: /1 repo/ });
+    expect(within(nextRunCell).getByText("1 repo")).toBeTruthy();
+  });
+
   it("row Enable fans out only the actionable subset of the selection", async () => {
     // The job is already enabled on repo-uzi. Picking BOTH repos should enable only the
     // actionable one (repo-atlas), never re-enable the already-materialized repo-uzi.

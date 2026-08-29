@@ -76,13 +76,13 @@ func getBranding(t *testing.T, h *Handler) map[string]json.RawMessage {
 }
 
 // A fresh DB returns the unbranded default JSON AND — the R1 guard — contains ONLY the
-// eight branding fields, never public_base_url or any other settings key.
+// nine branding fields, never public_base_url or any other settings key.
 func TestBrandingPublicReadDefaultsAndAllowlistLiveDB(t *testing.T) {
 	h, _ := brandingHandler(t)
 	m := getBranding(t, h)
 
 	wantKeys := []string{
-		"app_logo_mode", "app_logo_present", "app_logo_keep_name",
+		"app_logo_mode", "app_logo_preset", "app_logo_present", "app_logo_keep_name",
 		"brand_mode", "brand_company", "brand_placement", "brand_plaque",
 		"brand_logo_present",
 	}

@@ -54,6 +54,7 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   github_project_sync_enabled: "false",
   // PRD #685 branding config keys (owned by the Branding tab; unbranded defaults).
   app_logo_mode: "default",
+  app_logo_preset: "",
   app_logo_keep_name: "true",
   brand_mode: "none",
   brand_company: "",

@@ -2092,6 +2092,15 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		pipeline = claimPipelineFromSnapshot(run.FailureSnapshot)
 	}
 
+	// PRD #700 / issue #778: for an mr_rework run runs.branch is NULL (the run
+	// carries no issue-run branch) and the MR's existing branch lives in
+	// pipeline_ref, so source the claim's Branch from pipeline_ref there. The
+	// worker still reads it off the already-wired Branch field; no new wire field.
+	branch := run.Branch
+	if run.Kind == RunKindMRRework {
+		branch = run.PipelineRef
+	}
+
 	// PRD #122 M1: replay the FROZEN milestone list on every claim. A malformed column
 	// degrades to nil-and-log rather than failing the claim, matching the repo_agents
 	// decode on the DTO path — the column is data a prior write left, not an invariant
@@ -2175,7 +2184,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		ReviewComments: reviewComments,
 		Status:         run.Status,
 		Pipeline:       pipeline,
-		Branch:         textPtr(run.Branch),
+		Branch:         textPtr(branch),
 		SessionID:      textPtr(run.SessionID),
 		LastSeq:        run.LastSeq,
 		IterationCount: run.IterationCount,
