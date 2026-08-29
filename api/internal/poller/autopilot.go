@@ -82,31 +82,43 @@ func NewAutopilot(q autopilotStore, runs RunStarter, set SettingsReader) *Autopi
 func (a *Autopilot) detect(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, f forge.Forge) {
 	label := a.autopilotLabel(ctx)
 
-	// BOTH labels (Decision 11b; PRD #764 D7). Filtering on the autopilot label alone
-	// was safe only while the sync filter guaranteed every cached issue carried the
-	// eligibility label; M6's additive fetch caches every open issue, so without the
-	// uzi predicate a stranger's issue carrying the autopilot label reaches detectOne
-	// — which reads its label events over the forge every tick, and either runs it or
-	// comments on it.
+	// The repo's owner is the only user who can satisfy the "repo connected by that
+	// user" consent gate (Decision 4), so the attribution collapses to this one
+	// human_username. Fetched once per repo, reused for every candidate. As of PRD
+	// #767 M3 it is fetched BEFORE the candidate list because the candidate query now
+	// needs the connection's bot_forge_user_id (for the assignment-eligibility half);
+	// the only cost of the reorder is one indexed row read per enabled repo per tick
+	// even when there are zero candidates, a negligible add against the per-tick forge
+	// sync.
+	cc, err := a.q.GetAutopilotConnectionContext(ctx, r.ConnectionID)
+	if err != nil {
+		slog.Error("poller: autopilot connection context", "repo", r.PathWithNamespace, "error", err)
+		return
+	}
+
+	// Autopilot label AND eligible. Eligibility is "carries the uzi label OR is
+	// assigned to the uzi-bot" (PRD #767 M3, mirroring the single gate PRD #764 built
+	// and M2 widened). Filtering on the autopilot label alone was safe only while the
+	// sync filter guaranteed every cached issue carried the eligibility label; M6's
+	// additive fetch caches every open issue, so without the eligibility predicate a
+	// stranger's issue carrying the autopilot label reaches detectOne — which reads its
+	// label events over the forge every tick, and either runs it or comments on it.
+	//
+	// The autopilot label is UNCHANGED and still required: it is the trigger. The M3
+	// widening is only the eligibility half — an assignment produces no LabelEvent and
+	// has no adder, so a bot-assigned issue is a candidate but still needs an autopilot-
+	// label add event to be attributed and run; assignment never bypasses consent.
 	issues, err := a.q.ListAutopilotCandidateIssues(ctx, store.ListAutopilotCandidateIssuesParams{
 		RepoID:   r.ID,
 		Label:    label,
 		UziLabel: a.uziLabel(ctx),
+		BotID:    cc.BotForgeUserID,
 	})
 	if err != nil {
 		slog.Error("poller: list autopilot candidates", "repo", r.PathWithNamespace, "error", err)
 		return
 	}
 	if len(issues) == 0 {
-		return
-	}
-
-	// The repo's owner is the only user who can satisfy the "repo connected by that
-	// user" consent gate (Decision 4), so the attribution collapses to this one
-	// human_username. Fetched once per repo, reused for every candidate.
-	cc, err := a.q.GetAutopilotConnectionContext(ctx, r.ConnectionID)
-	if err != nil {
-		slog.Error("poller: autopilot connection context", "repo", r.PathWithNamespace, "error", err)
 		return
 	}
 
