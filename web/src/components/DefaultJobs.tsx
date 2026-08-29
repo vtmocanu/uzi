@@ -244,6 +244,7 @@ function CatalogRow({
       disclosureId={`catalog-repos-${entry.slug}`}
       expandLabelName={entry.name}
       repoCount={enabledCount}
+      showDisclosureCount={false}
       description={entry.description}
       targetBadges={
         <>
@@ -411,7 +412,7 @@ function SubRow({
           <Button variant="ghost" size="sm" title="Run now" aria-label={`Run now on ${s.repo_path}`} disabled={busy} onClick={onRunNow}>
             <PlayIcon />
           </Button>
-          <Button variant="ghost" size="sm" title="Edit cadence" aria-label={`Edit ${entry.name} on ${s.repo_path}`} onClick={onEdit}>
+          <Button variant="ghost" size="sm" title="Edit settings" aria-label={`Edit ${entry.name} on ${s.repo_path}`} onClick={onEdit}>
             <PencilIcon />
           </Button>
           <Button variant="ghost" size="sm" title="Clone to an editable copy" aria-label={`Clone ${entry.name} on ${s.repo_path}`} disabled={busy} onClick={onClone}>

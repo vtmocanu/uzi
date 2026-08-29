@@ -34,6 +34,7 @@ export function ScheduleGroupRow({
   optionsCell,
   leadingActions,
   repoCount,
+  showDisclosureCount = true,
   expanded,
   onToggleExpand,
   disclosureId,
@@ -58,6 +59,10 @@ export function ScheduleGroupRow({
   leadingActions?: ReactNode;
   // The live member count; the expand toggle renders only when > 0.
   repoCount: number;
+  // Whether the expand toggle shows the "N repo(s)" count text. Off for callers that
+  // display the count elsewhere (Default jobs shows it in the green Next-run pill), so
+  // the toggle degrades to a bare chevron. Defaults to true.
+  showDisclosureCount?: boolean;
   expanded: boolean;
   onToggleExpand: () => void;
   // The id the expand toggle's aria-controls points at (unique per group).
@@ -101,7 +106,11 @@ export function ScheduleGroupRow({
                 aria-label={`${expanded ? "Hide" : "Show"} repos for ${expandLabelName}`}
                 className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[12px] font-medium text-muted transition-colors hover:text-fg"
               >
-                {repoCount} repo{repoCount === 1 ? "" : "s"}
+                {showDisclosureCount && (
+                  <>
+                    {repoCount} repo{repoCount === 1 ? "" : "s"}
+                  </>
+                )}
                 <ChevronDownIcon className={cx("h-3.5 w-3.5 transition-transform", expanded && "rotate-180")} />
               </button>
             )}
