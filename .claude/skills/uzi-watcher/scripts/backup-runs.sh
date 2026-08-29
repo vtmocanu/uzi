@@ -175,26 +175,47 @@ for RID in "${RUNS[@]}"; do
     continue
   fi
   if ! read -r ns pod < <(resolve_pod "$wid"); then
-    log "WARN $RID ($LBL):status saved, but no pod for worker $wid in [$NAMESPACES]"
+    log "WARN $RID ($LBL): status saved, but no pod for worker $wid in [$NAMESPACES]"
     continue
   fi
   f="$DEST/$STEM.tgz"
-  if "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- sh -c "$CAPTURE" _ "$STEM" > "$f" 2>>"$LOG"; then
-    if [ -s "$f" ]; then
-      # A nonempty archive is not enough: the git bundle carries the committed
-      # work, so if it is missing, say so (PARTIAL) rather than logging OK. The
-      # snapshot is still kept — its patch/untracked/status remain useful.
-      if tar tzf "$f" 2>/dev/null | grep -qF "$STEM.bundle"; then
-        log "OK   $RID ($LBL) status=$st worker=$wid pod=$pod -> $f ($(du -h "$f" | cut -f1))"
-      else
-        log "PART $RID ($LBL):snapshot saved WITHOUT a git bundle (uncommitted/status only) -> $f; see $LOG"
-      fi
-    else
-      log "FAIL $RID ($LBL):empty artifact (clone missing?); see $LOG"
-      rm -f "$f"
+  # The capture streams a ~10-20 MB gzip out of the pod over `kubectl exec`, and
+  # that stream can be TRUNCATED mid-transfer (observed once the bundle grows past
+  # ~13 MB). A truncated .tgz still carries the bundle member's NAME in an early
+  # tar header, so the old name-only `tar tzf | grep` logged a false OK on a file
+  # whose bundle DATA was cut off. So verify the gzip END-TO-END (`gzip -t` plus a
+  # full `tar tzf` listing) and RETRY the whole capture a few times, since the
+  # truncation is transient — a re-exec usually succeeds within seconds.
+  cap_rc=1
+  for cap_try in 1 2 3; do
+    if ! "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- sh -c "$CAPTURE" _ "$STEM" > "$f" 2>>"$LOG"; then
+      log "WARN $RID ($LBL): exec/capture attempt $cap_try failed; see $LOG"
+      continue
     fi
+    if [ ! -s "$f" ]; then
+      # Empty is a missing clone, not a truncation; retrying will not help.
+      break
+    fi
+    if gzip -t "$f" 2>/dev/null && tar tzf "$f" >/dev/null 2>&1; then
+      cap_rc=0
+      break
+    fi
+    log "WARN $RID ($LBL): truncated .tgz on attempt $cap_try ($(du -h "$f" | cut -f1)); retrying"
+  done
+  if [ "$cap_rc" -eq 0 ]; then
+    # A verified-intact archive. The git bundle carries the committed work, so if
+    # it is absent, say so (PART) rather than OK — the patch/untracked/status are
+    # still useful, but there are no committed commits to restore.
+    if tar tzf "$f" 2>/dev/null | grep -qF "$STEM.bundle"; then
+      log "OK   $RID ($LBL) status=$st worker=$wid pod=$pod -> $f ($(du -h "$f" | cut -f1))"
+    else
+      log "PART $RID ($LBL): verified .tgz but WITHOUT a git bundle (uncommitted/status only) -> $f"
+    fi
+  elif [ -s "$f" ]; then
+    log "FAIL $RID ($LBL): .tgz still truncated after retries -> $f kept for forensics; see $LOG"
   else
-    log "FAIL $RID ($LBL):exec/capture failed; see $LOG"
+    log "FAIL $RID ($LBL): empty artifact (clone missing?); see $LOG"
+    rm -f "$f"
   fi
 done
 
