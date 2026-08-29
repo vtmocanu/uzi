@@ -43,7 +43,6 @@ describe("mockApi settings persistence (demo survives reload)", () => {
         v: 1,
         userSettings: { default_model: "opus", judge_model: "haiku", theme: "mission" },
         appSettings: {
-          prd_label: "Feature",
           autopilot_label: "autopilot",
           uzi_label: "runnable",
           default_theme: "mission",
@@ -72,7 +71,6 @@ describe("mockApi settings persistence (demo survives reload)", () => {
 
     const app = (await api.getSettings()).settings;
     expect(app.default_theme).toBe("mission");
-    expect(app.prd_label).toBe("Feature");
     // The uzi run-eligibility label round-trips too (PRD #764).
     expect(app.uzi_label).toBe("runnable");
     // The Slack non-secret keys round-trip too (PRD #25 M1).
@@ -96,7 +94,7 @@ describe("mockApi settings persistence (demo survives reload)", () => {
       [KEY]: JSON.stringify({
         v: 99, // a different seed-schema version: must be discarded, not served
         userSettings: { default_model: null, theme: "mission" },
-        appSettings: { prd_label: "x", autopilot_label: "y", default_theme: "mission" },
+        appSettings: { autopilot_label: "y", default_theme: "mission" },
       }),
     });
     const api = await reload();

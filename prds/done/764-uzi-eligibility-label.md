@@ -2,7 +2,7 @@
 
 **Issue**: #764
 **Priority**: Medium
-**Status**: Draft
+**Status**: Done (2026-08-29)
 
 ## Problem
 

@@ -672,7 +672,6 @@ export interface ForgeConfig {
 // every field is always present. default_theme is the instance-default UI theme
 // (PRD #21).
 export interface AppSettings {
-  prd_label: string;
   autopilot_label: string;
   // PRD #764: the single run-eligibility label (default "uzi"). An issue is runnable
   // iff it carries this label; served as a raw string like every other setting.

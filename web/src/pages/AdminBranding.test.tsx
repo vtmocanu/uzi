@@ -26,7 +26,6 @@ const mockApi = vi.mocked(api);
 
 // A full AppSettings fixture; tests override the branding fields they exercise.
 const settings = (over: Partial<AppSettings> = {}): AppSettings => ({
-  prd_label: "PRD",
   autopilot_label: "autopilot",
   uzi_label: "uzi",
   default_theme: "ember",

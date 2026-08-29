@@ -23040,7 +23040,7 @@ of the "looks queued, never runs" gap the `issue-triage` skill exists to hunt.
 - **Not a main-protection change.** The default-branch guardrail and the no-`.github/workflows`
   push control are independent of both old gates; removing Gate B has no main-protection
   implication (Gate B was a "no spec" nudge, never a security control).
-- Full rationale, code map, and Decision Log D1–D7: `prds/764-uzi-eligibility-label.md`. This
+- Full rationale, code map, and Decision Log D1–D7: `prds/done/764-uzi-eligibility-label.md`. This
   section **supersedes** the design recorded in §119 (PRDLESS settings) and §308 (`PRD`+`PRDLESS`
   server-side assembly), and the run-eligibility narrative in §445; those remain as history of the
   now-removed model.

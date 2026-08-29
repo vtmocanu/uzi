@@ -31,7 +31,6 @@ const mockApi = vi.mocked(api);
 
 // A full AppSettings fixture; tests override the fields they exercise.
 const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
-  prd_label: "PRD",
   autopilot_label: "autopilot",
   uzi_label: "uzi",
   default_theme: "ember",

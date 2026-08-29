@@ -158,7 +158,6 @@ const SEED_USER_SETTINGS: UserSettings = {
   mr_rework_enabled: null,
 };
 const SEED_APP_SETTINGS: AppSettings = {
-  prd_label: "PRD",
   autopilot_label: "autopilot",
   // PRD #764: the single run-eligibility label.
   uzi_label: "uzi",
@@ -234,7 +233,6 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
       (Array.isArray(u.sidebar_token_ids) &&
         u.sidebar_token_ids.every((id) => typeof id === "string")));
   const okApp =
-    typeof a.prd_label === "string" &&
     typeof a.autopilot_label === "string" &&
     // PRD #764: accept legacy blobs that predate this field (undefined) — it is filled
     // from the seed default ("uzi") on load — but reject a malformed non-string.
@@ -2125,7 +2123,7 @@ export const mockApi = {
         nonSecret.brand_company = value;
         continue;
       }
-      if (key !== "prd_label" && key !== "autopilot_label" && key !== "uzi_label") {
+      if (key !== "autopilot_label" && key !== "uzi_label") {
         throw new ApiError(400, `unknown setting: ${key}`);
       }
       if (!value || value.trim() === "") throw new ApiError(400, `${key}: must not be empty`);
