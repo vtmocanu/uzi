@@ -59,6 +59,36 @@ func TestParseNonSweepAssignedSelectorRejected(t *testing.T) {
 	}
 }
 
+func TestParsePromptExplicitLabelSelectorRejected(t *testing.T) {
+	_, err := parse(mustFrontmatter("prompt", SelectorLabel, "", "do the thing"))
+	if err == nil {
+		t.Fatal("a prompt target explicitly setting selector: label must be rejected")
+	}
+	if !strings.Contains(err.Error(), "must not set a selector") {
+		t.Fatalf("error = %v, want a 'must not set a selector' message", err)
+	}
+}
+
+func TestParseSelfImproveExplicitLabelSelectorRejected(t *testing.T) {
+	_, err := parse(mustFrontmatter("self_improve", SelectorLabel, "", ""))
+	if err == nil {
+		t.Fatal("a self_improve target explicitly setting selector: label must be rejected")
+	}
+	if !strings.Contains(err.Error(), "must not set a selector") {
+		t.Fatalf("error = %v, want a 'must not set a selector' message", err)
+	}
+}
+
+func TestParsePromptNoSelectorAccepted(t *testing.T) {
+	j, err := parse(mustFrontmatter("prompt", "", "", "do the thing"))
+	if err != nil {
+		t.Fatalf("a prompt target with no selector must parse: %v", err)
+	}
+	if j.Prompt != "do the thing" {
+		t.Fatalf("prompt = %q, want %q", j.Prompt, "do the thing")
+	}
+}
+
 func TestParseSweepNoSelectorDefaultsToLabel(t *testing.T) {
 	j, err := parse(mustFrontmatter("sweep", "", "bug", "guidance"))
 	if err != nil {

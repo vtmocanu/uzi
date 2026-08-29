@@ -188,6 +188,7 @@ func parse(raw []byte) (DefaultJob, error) {
 	body := strings.TrimSpace(afterClose[len("\n"):])
 
 	j := DefaultJob{Timezone: DefaultTimezone}
+	selectorSet := false
 	for _, line := range strings.Split(frontmatter, "\n") {
 		key, val, ok := strings.Cut(line, ": ")
 		if !ok {
@@ -213,6 +214,7 @@ func parse(raw []byte) (DefaultJob, error) {
 			j.Model = val
 		case "selector":
 			j.SelectorKind = val
+			selectorSet = true
 		case "labels":
 			for _, l := range strings.Split(val, ",") {
 				if l = strings.TrimSpace(l); l != "" {
@@ -260,7 +262,7 @@ func parse(raw []byte) (DefaultJob, error) {
 		if body == "" {
 			return DefaultJob{}, fmt.Errorf("catalog %q (prompt) has an empty body", j.Slug)
 		}
-		if j.SelectorKind != SelectorLabel {
+		if selectorSet {
 			return DefaultJob{}, fmt.Errorf("catalog %q (prompt) must not set a selector", j.Slug)
 		}
 		j.Prompt = body
@@ -279,7 +281,7 @@ func parse(raw []byte) (DefaultJob, error) {
 		}
 		j.Guidance = body
 	case "self_improve":
-		if j.SelectorKind != SelectorLabel {
+		if selectorSet {
 			return DefaultJob{}, fmt.Errorf("catalog %q (self_improve) must not set a selector", j.Slug)
 		}
 		// Promptless and label-less: the whole directive is worker-side and the tracking

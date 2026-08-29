@@ -1258,7 +1258,7 @@ func startRunCardMessage(err error) string {
 	case errors.Is(err, workersvc.ErrIssueNotFound):
 		return "That issue isn't on this repo's board."
 	case errors.Is(err, workersvc.ErrNotPRDIssue):
-		return "This issue isn't marked as uzi's work; add the `uzi` label or assign it to uzi first."
+		return "This issue isn't marked as uzi's work; add the configured uzi label or assign it to uzi first."
 	case errors.Is(err, workersvc.ErrActiveRunExists):
 		return "A run is already in progress for this issue."
 	case errors.Is(err, workersvc.ErrBranchInUse):

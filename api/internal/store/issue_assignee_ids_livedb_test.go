@@ -103,7 +103,7 @@ func TestUpsertIssueRoundTripsAssigneeIdsLiveDB(t *testing.T) {
 	if err := json.Unmarshal(unassigned.AssigneeIds, &emptyIDs); err != nil {
 		t.Fatalf("unassigned assignee_ids not valid jsonb: %q (%v)", unassigned.AssigneeIds, err)
 	}
-	if len(emptyIDs) != 0 {
+	if emptyIDs == nil || len(emptyIDs) != 0 {
 		t.Fatalf("unassigned issue must round-trip an empty assignee set, got %v", emptyIDs)
 	}
 
