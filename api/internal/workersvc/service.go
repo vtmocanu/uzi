@@ -3221,10 +3221,11 @@ const (
 // GREATEST merge in UpsertRunUsage makes that idempotent. session_id is sourced
 // from the run row (the frame payload carries none); it is ” until the run has
 // reported one, which the monotonic merge + latest/MAX-per-model rollup tolerate.
-// It also stamps the run's current lineage epoch (PRD #632, sourced from the run
-// struct, which appendMessages keeps current via the same-batch mirror above and
-// the fresh per-call fetch by runOwnedByWorker) onto each row it inserts; the epoch
-// is pinned to first insert in UpsertRunUsage, never overwritten by a re-fold.
+// It also stamps a PER-FRAME lineage epoch (PRD #632): the run's committed epoch at
+// batch start — run.LineageEpoch, from runOwnedByWorker's fresh per-call fetch, left
+// UNMUTATED here — plus the number of resume_lineage_break events preceding that
+// frame in seq order within this batch (see the per-frame block below). The epoch is
+// pinned to first insert in UpsertRunUsage, never overwritten by a re-fold.
 // Malformed/absent usage is skipped (never fails the append); a DB error
 // propagates so the append fails and the worker re-delivers.
 func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []IncomingMessage) error {
@@ -3252,15 +3253,21 @@ func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []Incomi
 	// force WHEN IT WAS EMITTED — the run's committed epoch at batch start
 	// (run.LineageEpoch, fetched fresh in appendMessages and NOT mutated) plus the
 	// number of resume_lineage_break events preceding it in seq order within this
-	// batch. Applying one batch-final epoch to every frame would stamp a pre-break
-	// result (the old leg) with the post-break epoch; since UpsertRunUsage pins
-	// lineage_epoch on first insert (omitted from DO UPDATE SET), a later re-fold
-	// could not repair it, and the totals view would MAX-collapse two lineage legs.
-	// In the normal cross-batch case there are no breaks in the frame-carrying
-	// batch, so every frame gets baseEpoch unchanged. Counting breaks from `msgs`
-	// (not `inserted`) is safe under at-least-once re-delivery: the recomputed
-	// epoch on a seq-deduped replay is never written, precisely because the upsert
-	// pins the epoch.
+	// batch. The case this defends: the old leg's final result frame is co-batched
+	// with the break signal (result precedes break in seq order), while the fresh
+	// leg's result frames arrive in a LATER batch under a new session_id (the run is
+	// re-fetched with the bumped epoch by then). Applying one batch-final epoch to
+	// every frame would stamp that pre-break result with the post-break epoch; since
+	// UpsertRunUsage pins lineage_epoch on first insert (omitted from DO UPDATE SET),
+	// a later re-fold could not repair it, and the totals view would MAX-collapse the
+	// old leg into the new one's epoch group. (Two frames in ONE batch always share
+	// run.SessionID and so collapse by GREATEST regardless of epoch — session_id is
+	// the row-splitter, per ADR-632; the epoch only matters once the legs land under
+	// distinct session_ids, which happens across batches.) In the normal case there
+	// are no breaks in a frame-carrying batch, so every frame gets baseEpoch
+	// unchanged. Counting breaks from `msgs` (not `inserted`) is safe under
+	// at-least-once re-delivery: the recomputed epoch on a seq-deduped replay is
+	// never written, precisely because the upsert pins the epoch.
 	baseEpoch := run.LineageEpoch
 	var breakSeqs []int32
 	for _, m := range msgs {

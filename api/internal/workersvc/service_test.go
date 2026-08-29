@@ -2252,11 +2252,13 @@ func TestAppendMessagesStampsLineageEpochAndBumps(t *testing.T) {
 	})
 
 	// (d) Intra-batch ordering (the [5] regression): a run at epoch 0 receives ONE
-	// batch = [ result A at seq 1, break at seq 2, result B at seq 3 ]. A belongs to
-	// the OLD leg (epoch 0) and B to the fresh leg (epoch 1). A batch-final uniform
-	// epoch would wrongly stamp A with epoch 1, and because UpsertRunUsage pins the
-	// epoch on first insert, the totals view would then MAX-collapse the two legs.
-	// The per-frame count must give A epoch 0 and B epoch 1.
+	// batch = [ result A at seq 1, break at seq 2, result B at seq 3 ]. This gates the
+	// per-frame ARITHMETIC: A precedes the break → epoch 0, B follows it → epoch 1. A
+	// batch-final uniform epoch would wrongly stamp A with epoch 1. (In a real DB A
+	// and B share run.SessionID within the one batch and would collapse by GREATEST
+	// regardless of epoch — the fake store records params rather than merging, so it
+	// isolates the epoch computation. The realistic leg separation is cross-batch and
+	// is covered by the live-DB TestUpsertRunUsageMergeLiveDB.)
 	t.Run("result before break keeps the earlier epoch", func(t *testing.T) {
 		w := worker()
 		fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), SessionID: pgText("sess-d"), LineageEpoch: 0}}
