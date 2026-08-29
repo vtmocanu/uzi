@@ -22017,10 +22017,8 @@ rationale in the Decision Log of `prds/done/517-interactive-task-runs.md`. <!-- 
   admitted only when a CONSUMED `follow_up` input exists, as a third independent clause beside
   the `answer` gate — so a stale/duplicate pre-park `running` report cannot un-park an idle task
   and re-arm the wall clock. It is now keyed on a per-park identity (issue #552): `runs.open_followup_id`,
-  a watermark of the highest already-DELIVERED `follow_up` id (worker-provided, then server-clamped to max-consumed), stamped at each park by
-  `SetRunAwaitingFollowup` (originally recomputed purely server-side; **as of issue #559 the value is
-  worker-provided then server-clamped/floored — see §585**), so the wake requires a consumed
-  `follow_up` NEWER than the watermark —
+  a watermark of the highest already-CONSUMED `follow_up` id, recomputed at each park by
+  `SetRunAwaitingFollowup`, so the wake requires a consumed `follow_up` NEWER than the watermark —
   a stale pre-park `running` report on a run that has already iterated (cycle ≥2) can no longer un-park
   an idle run. The worker completes the identity: the `awaiting_followup` report (which stamps the
   watermark) is emitted ONLY when the run is genuinely going idle — `RunRunner.awaitFollowUp` first
@@ -23047,7 +23045,55 @@ of the "looks queued, never runs" gap the `issue-triage` skill exists to hunt.
   server-side assembly), and the run-eligibility narrative in §445; those remain as history of the
   now-removed model.
 
-## 585. issue #559 — close two #558-review residuals of the interactive wake-guard watermark: worker-PROVIDED (not server-derived) `open_followup_id`, and an ownership ACK on the park-SKIP path
+## 585. Issue #688 — white-label the favicon base icon and the browser-tab `<title>`, reusing #685's `/api/branding` (no new setting)
+
+Follow-up to the #685 instance-branding layer, extending it to the two chrome surfaces #685 left
+factory-branded. **`web/`-only: no api, agent, DB, or migration change** — every value both surfaces
+need is already in the public `GET /api/branding` response (`app_logo_mode`, `app_logo_preset`,
+`app_logo_present`, `app_logo_keep_name`, `brand_company`), so nothing server-side moves.
+
+- **Favicon base white-labels to the admin app logo, the PRD #70 status overlay unchanged (§276).**
+  `web/src/lib/favicon.ts`'s `renderFavicon`/`applyFavicon` take an optional preloaded
+  `HTMLImageElement`; when a drawable branded base is supplied it is drawn object-contain on the
+  near-black field **instead of** the stroked ember `FactoryIcon`, with the status dot still overlaid.
+  `web/src/lib/useFavicon.ts` gains an `appLogoSrc` param (fed `appMarkImgSrc(branding)` at the
+  AppShell call site) that preloads a **same-origin** `<img>` (`/api/branding/logo/app` or a preset
+  asset — no `crossOrigin`) and re-applies on decode. The base is the app logo whenever one is set
+  (custom-with-upload or preset), **independent of keep_name** — keep_name governs the wordmark, not
+  the logo image. Unbranded stays today's ember mark; idle+unbranded still restores the static
+  `/favicon.svg`.
+- **Applies signed-out.** The favicon base and the title both white-label for a guest on a branded
+  instance (the favicon carries no status dot signed-out). The `useFavicon` disabled/logged-out branch
+  keeps `baseImgRef` (branding is independent of auth); the `document.title` effect sits before
+  AppShell's guest early return.
+- **Canvas is not tainted.** A same-origin `<img>` keeps the canvas clean, so `toDataURL` does not
+  throw regardless of the `/api/branding/logo/app` route's `Content-Security-Policy: sandbox` +
+  `X-Content-Type-Options: nosniff` response headers (those govern documents/sniffing, not an
+  `<img>`-loaded same-origin resource). Verified in a real browser against the preset path; the
+  custom-upload path with those exact headers is the one live-stack residual.
+- **Accepted limitation: a dimensionless SVG base (viewBox only, no intrinsic `width`/`height`) falls
+  back to the factory mark in browsers that report `naturalWidth === 0`.** `isDrawableImage`'s
+  `naturalWidth > 0` guard doubles as the load-error detector, so it is deliberately NOT relaxed; a
+  browser (e.g. some Firefox/Safari versions) that gives a dimensionless SVG no intrinsic size simply
+  shows the unbranded mark — graceful, no error. Chromium derived a non-zero size for the shipped
+  preset, so it brands there. Fixing an admin's own dimensionless upload is out of scope.
+- **Tab `<title>` reuses `brand_company`, gated on the FULL white-label condition.**
+  `web/src/lib/brandTitle.ts#brandTabTitle` returns `brand_company` only when the instance is fully
+  white-labeled — the same white-label gate as `appMarkShowName` (§ #685), its logical inverse
+  selecting the identical instance set (no shared helper binds them): `app_logo_mode` is `custom` or
+  `preset` **and** `app_logo_keep_name === false` — and `brand_company` is non-empty after trim; else
+  the static default. Per the issue's 2026-08-29 triage steer this reuses the existing
+  `brand_company` field rather than adding a dedicated `brand_title` setting. Consequences, accepted:
+  a co-brand (keep_name=true) keeps the uzi title; a white-label with an empty `brand_company` falls
+  back to the default (no other text source exists — the admin sets `brand_company` to drive the tab).
+  `DEFAULT_TITLE` is kept byte-identical to `web/index.html:6` (`Uzi — AI dark factory`, U+2014 em
+  dash); `index.html` retains the static title as the correct pre-hydration/unbranded value and the
+  SPA overrides `document.title` at runtime once branding resolves.
+- **Inherited (not introduced here): branding is module-memoised**, so a live branding change in Admin
+  does not update the favicon or title without a full reload — the existing #685 chrome behavior,
+  which these surfaces correctly track.
+
+## 586. issue #559 — close two #558-review residuals of the interactive wake-guard watermark: worker-PROVIDED (not server-derived) `open_followup_id`, and an ownership ACK on the park-SKIP path
 
 Context: two residuals surfaced by the #558 merge-gate review of the interactive-run mid-turn
 wake-guard watermark (issue #552 M1 / PRD #517). The watermark is `runs.open_followup_id`, which

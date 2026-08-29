@@ -3849,8 +3849,16 @@ const realApi = {
   listScheduleCatalog: () => request<ScheduleCatalog>("GET", "/schedule-catalog"),
   // Enable a catalog default on one repo (idempotent: 201 new / 200 already-enabled,
   // including a paused row returned untouched). Client fans out one call per repo.
-  enableCatalogSchedule: (repoId: string, slug: string) =>
-    request<Schedule>("POST", `/repos/${repoId}/schedule-catalog/${slug}`),
+  // An optional detected browser timezone (issue #660) seeds the new schedule's zone; it
+  // is sent as the body ONLY when non-empty, so the no-tz path sends no body and stays
+  // byte-identical to before (the server keeps the catalog/UTC zone on an absent tz, and
+  // ignores the override on the idempotent re-enable path).
+  enableCatalogSchedule: (repoId: string, slug: string, timezone?: string) =>
+    request<Schedule>(
+      "POST",
+      `/repos/${repoId}/schedule-catalog/${slug}`,
+      timezone ? { timezone } : undefined,
+    ),
   // Restore a default row's editable fields to the catalog values and clear the
   // customized flag; a no-op-shaped 200 otherwise.
   resetSchedule: (id: string) => request<Schedule>("POST", `/schedules/${id}/reset`),
