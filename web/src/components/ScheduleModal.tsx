@@ -226,6 +226,9 @@ export function ScheduleModal({
   // a string in state ("" = none).
   // Steers HOW a run approaches the task — the issue body stays the task.
   const [guidance, setGuidance] = useState<string>(editing?.guidance ?? "");
+  // A sweep default's baked catalog guidance is read-only and travels in a SEPARATE
+  // DTO field (issue #675); the editable `guidance` state above is the owner overlay.
+  const bakedGuidance = editing?.baked_guidance ?? "";
   // Per-schedule model override; "" = inherit the owner's per-user Worker default.
   // Applies to ALL targets (unlike guidance). Injection-suspect custom IDs are gated
   // below (modelWarning) mirroring the server's ValidateModel reject.
@@ -422,10 +425,10 @@ export function ScheduleModal({
   // rejected. The catalog-owned set the server rejects is target/prompt/labels/repo_id/
   // issue_iid/timing/run_at — none of these appear below.
   //
-  // Guidance is the ONE exception, and only for a PROMPT default (issue #662): the owner
-  // can steer a prompt default's baked prompt via guidance, so it is owner-editable there
-  // and the server overlays it onto the catalog prompt at fire time. We send it with
-  // replace-semantics (value, or explicit null to clear) each time. For issue/sweep/
+  // Guidance is owner-editable for a PROMPT default (issue #662) and a SWEEP default
+  // (issue #675): the owner steers the baked prompt/guidance via an OVERLAY the server
+  // appends to the catalog value at fire time, so it is owner-editable there. We send it
+  // with replace-semantics (value, or explicit null to clear) each time. For issue/
   // self_improve defaults guidance stays catalog-owned and MUST be omitted (the server
   // 400s a default patch that carries it for those targets).
   const buildDefaultInput = (): ScheduleInput => ({
@@ -437,7 +440,12 @@ export function ScheduleModal({
     wait_on_limit: waitOnLimit,
     max_issues: target === "sweep" ? maxIssues : undefined,
     model: model.trim() === "" ? null : model,
-    guidance: target === "prompt" ? (guidance.trim() === "" ? null : guidance) : undefined,
+    guidance:
+      target === "prompt" || target === "sweep"
+        ? guidance.trim() === ""
+          ? null
+          : guidance
+        : undefined,
   });
 
   const buildInput = (): ScheduleInput => ({
@@ -541,18 +549,23 @@ export function ScheduleModal({
     }
   };
 
-  // Optional guidance textarea. Rendered for the issue and sweep targets, and
-  // for a prompt-target DEFAULT (issue #662: its baked prompt is catalog-owned,
-  // but owner guidance overlays it at fire time) — NOT for a user prompt
-  // schedule, which carries its own editable prompt text. Mirrors the prompt
-  // textarea's markup.
-  // A prompt-target default overlays this guidance on its baked catalog prompt, so the
-  // issue-centric wording ("every issue this schedule runs") does not apply there; give the
-  // prompt case its own help text stating the baked prompt stays the task.
+  // Optional guidance textarea. Rendered for the issue and sweep targets, and for a
+  // prompt-target DEFAULT (issue #662: its baked prompt is catalog-owned, but owner
+  // guidance overlays it at fire time) and a sweep-target DEFAULT (issue #675: its baked
+  // catalog guidance is read-only, but this owner OVERLAY is appended at fire time) — NOT
+  // for a user prompt schedule, which carries its own editable prompt text. Mirrors the
+  // prompt textarea's markup.
+  // A prompt-target default overlays this guidance on its baked catalog prompt, and a
+  // sweep-target default overlays it on its baked catalog guidance (issue #675), so the
+  // issue-centric wording ("every issue this schedule runs") does not apply to either;
+  // give each default case its own help text stating the baked value stays in effect. A
+  // user issue/sweep schedule keeps the issue-centric wording.
   const guidanceHelp =
     target === "prompt"
       ? "Steers how the run approaches the task. It's appended to the baked prompt each time this schedule fires; the baked prompt stays the task."
-      : "Steers how the run approaches the task, e.g. “always add a failing test first”. Applied to every issue this schedule runs; the issue itself stays the task.";
+      : isDefault && target === "sweep"
+        ? "Steers how the run approaches each swept issue. It's appended to the baked guidance each time this schedule fires; the baked guidance stays in effect."
+        : "Steers how the run approaches the task, e.g. “always add a failing test first”. Applied to every issue this schedule runs; the issue itself stays the task.";
   const guidanceField = (
     <Field label="Guidance (optional)" htmlFor="sched-guidance">
       <Textarea
@@ -686,12 +699,17 @@ export function ScheduleModal({
               editable segmented control + fields. */}
           {isDefault ? (
             <>
-              <BakedTargetDetail target={target} prompt={prompt} labels={labels} guidance={guidance} />
-              {/* A PROMPT default's guidance is owner-editable (issue #662): the baked prompt
-                  stays read-only above, but this guidance is appended to it at fire time. Only
-                  a prompt default gets this field — issue/sweep/self_improve defaults keep
-                  their guidance catalog-owned (baked, shown read-only in BakedTargetDetail). */}
-              {target === "prompt" && guidanceField}
+              <BakedTargetDetail
+                target={target}
+                prompt={prompt}
+                labels={labels}
+                bakedGuidance={bakedGuidance}
+              />
+              {/* A PROMPT default's guidance (issue #662) and a SWEEP default's guidance
+                  (issue #675) are owner-editable: the baked prompt/guidance stays read-only
+                  above, but this OVERLAY is appended to it at fire time. issue/self_improve
+                  defaults keep their guidance catalog-owned (baked, shown read-only). */}
+              {(target === "prompt" || target === "sweep") && guidanceField}
             </>
           ) : (
             <>
@@ -1058,12 +1076,12 @@ function BakedTargetDetail({
   target,
   prompt,
   labels,
-  guidance,
+  bakedGuidance,
 }: {
   target: ScheduleTarget;
   prompt: string;
   labels: string[];
-  guidance: string;
+  bakedGuidance: string;
 }) {
   return (
     <div className="space-y-3">
@@ -1117,7 +1135,7 @@ function BakedTargetDetail({
       {target !== "self_improve" && (
         <BakedBlock
           label={target === "sweep" ? "Baked guidance" : "Baked prompt"}
-          text={target === "sweep" ? guidance : prompt}
+          text={target === "sweep" ? bakedGuidance : prompt}
         />
       )}
     </div>

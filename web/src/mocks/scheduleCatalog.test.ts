@@ -70,8 +70,9 @@ describe("mock default-jobs catalog (PRD #589)", () => {
     // catalog-owned field (prompt/labels/target/timing/repo_id/issue_iid, plus guidance for a
     // non-prompt default). The mock must agree — the drift that let ScheduleModal ship a
     // `timing:"recurring"` default patch that passed CI but 400s the real backend. This test is
-    // the regression fence. The `def` picked here is a SWEEP default (first seeded), so guidance
-    // is still catalog-owned for it and its rejection holds (a prompt default is covered below).
+    // the regression fence. The `def` picked here is a SWEEP default (first seeded). Guidance
+    // is NO LONGER catalog-owned for a sweep default (issue #675: it is the owner overlay,
+    // owner-editable), so guidance is covered by its own accept test below, not here.
     const def = (await mockApi.listSchedules()).find(
       (s) => s.origin === "default" && !!s.catalog_slug && s.target === "sweep",
     );
@@ -82,7 +83,6 @@ describe("mock default-jobs catalog (PRD #589)", () => {
     await expect(mockApi.updateSchedule(def!.id, { prompt: "x" })).rejects.toMatchObject({ status: 400 });
     await expect(mockApi.updateSchedule(def!.id, { target: "prompt" })).rejects.toMatchObject({ status: 400 });
     await expect(mockApi.updateSchedule(def!.id, { labels: ["bug"] })).rejects.toMatchObject({ status: 400 });
-    await expect(mockApi.updateSchedule(def!.id, { guidance: "g" })).rejects.toMatchObject({ status: 400 });
     await expect(mockApi.updateSchedule(def!.id, { issue_iid: 5 })).rejects.toMatchObject({ status: 400 });
     await expect(mockApi.updateSchedule(def!.id, { repo_id: "repo-atlas" })).rejects.toMatchObject({ status: 400 });
 
@@ -136,14 +136,49 @@ describe("mock default-jobs catalog (PRD #589)", () => {
     expect(cleared.customized).toBe(false);
   });
 
-  it("updateSchedule still REJECTS guidance on an issue/sweep default (issue #662, mock == server 400)", async () => {
-    // Guidance stays catalog-owned for a non-prompt default: the server 400s a patch that
-    // carries it, so the mock must too. A sweep default is the first seeded catalog default.
-    const sweepDef = (await mockApi.listSchedules()).find(
-      (s) => s.origin === "default" && !!s.catalog_slug && s.target === "sweep",
-    );
-    expect(sweepDef).toBeTruthy();
-    await expect(mockApi.updateSchedule(sweepDef!.id, { guidance: "g" })).rejects.toMatchObject({ status: 400 });
+  it("updateSchedule ACCEPTS + persists an owner guidance OVERLAY on a SWEEP default and sets customized (issue #675)", async () => {
+    // Issue #675 splits a sweep default's guidance: the catalog value is the read-only
+    // baked_guidance, and `guidance` is an owner-editable OVERLAY the server appends at fire
+    // time (like the prompt-default overlay of #662). So a sweep-default patch carrying
+    // guidance is ACCEPTED, and the OVERLAY persists while baked_guidance stays the catalog
+    // value. Materialize a fresh planned-sweep default on a clean repo so it starts
+    // un-customized with a null overlay and the catalog guidance baked in.
+    const def = await mockApi.enableCatalogSchedule("repo-www", "planned-sweep");
+    expect(def.origin).toBe("default");
+    expect(def.target).toBe("sweep");
+    expect(def.customized).toBe(false);
+    expect(def.guidance).toBeNull(); // no owner overlay yet
+    expect(def.baked_guidance).toBeTruthy(); // catalog guidance baked in, read-only
+    const baked = def.baked_guidance;
+
+    const updated = await mockApi.updateSchedule(def.id, {
+      cron_expr: def.cron_expr,
+      timezone: def.timezone,
+      auto_approve: def.auto_approve,
+      wait_on_limit: def.wait_on_limit,
+      max_issues: def.max_issues,
+      model: null,
+      guidance: "prefer a failing test first, then the smallest fix",
+    });
+    expect(updated.guidance).toBe("prefer a failing test first, then the smallest fix");
+    // The baked catalog guidance is untouched by the overlay patch (the two are independent).
+    expect(updated.baked_guidance).toBe(baked);
+    expect(updated.customized).toBe(true);
+
+    // Clearing the overlay back to none (explicit null) restores it AND un-customizes, since
+    // every editable field is back at the catalog values, and baked_guidance stays intact.
+    const cleared = await mockApi.updateSchedule(def.id, {
+      cron_expr: def.cron_expr,
+      timezone: def.timezone,
+      auto_approve: def.auto_approve,
+      wait_on_limit: def.wait_on_limit,
+      max_issues: def.max_issues,
+      model: null,
+      guidance: null,
+    });
+    expect(cleared.guidance).toBeNull();
+    expect(cleared.baked_guidance).toBe(baked);
+    expect(cleared.customized).toBe(false);
   });
 
   it("REJECTS guidance over the 8 KiB cap by BYTES not chars, on both write paths (issue #662, mock == server 422)", async () => {

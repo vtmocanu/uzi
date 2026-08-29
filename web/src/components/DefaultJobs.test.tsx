@@ -84,7 +84,10 @@ function defRow(over: Partial<Schedule>): Schedule {
     auto_approve: true,
     wait_on_limit: true,
     max_issues: 3,
-    guidance: "Triage the bug.",
+    // A sweep default's baked catalog guidance is the read-only baked_guidance (issue #675);
+    // guidance is the owner overlay (null until set).
+    guidance: null,
+    baked_guidance: "Triage the bug.",
     model: null,
     override_subagent_model: false,
     enabled: true,
