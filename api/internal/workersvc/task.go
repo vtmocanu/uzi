@@ -88,6 +88,14 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 		return store.Run{}, ErrTaskBaseBranchTooLong
 	}
 
+	// --then-fix IMPLIES --review server-side (issue #403 F5): the CLI applies this
+	// (reviewRequested := review || thenFix), but a direct API caller — the second
+	// consumer of this API — could set then_fix without review, silently getting no
+	// auto-review and thus no fix run. Enforce the invariant at this shared choke point.
+	if thenFixRequested {
+		reviewRequested = true
+	}
+
 	// #66 D1 layer 2: the shared service-layer guardrail, same as the other PAT-bearing
 	// inserts. A refused repo never gets a run.
 	if err := s.guardDefaultBranch(ctx, row); err != nil {
@@ -240,6 +248,21 @@ func (s *Service) CreateThenFixRun(ctx context.Context, userID, repoID, original
 	// auto-spawned fix cannot alter the fix's budget, and the fix phase of a long
 	// non-interactive handoff keeps the same allowance instead of reverting to the global
 	// default. NULL (global fallback) exactly when the original's was NULL.
+	// issue #403 F4: the composed findings description is server-generated and can exceed
+	// MaxIssueDescriptionBytes (up to ~200 findings). Every other creator caps issue_description;
+	// mirror that here. TRUNCATE rather than error (as CreateTaskRun does): the caller
+	// (maybeEnqueueThenFix) is best-effort and swallows errors, so erroring would silently drop
+	// the entire fix — a truncated-but-present fix is the better outcome, and the prompt stays bounded.
+	description, _ = stripNUL(description)
+	if len(description) > MaxIssueDescriptionBytes {
+		const marker = "\n… findings truncated at the description cap …\n"
+		keep := MaxIssueDescriptionBytes - len(marker)
+		if keep < 0 {
+			keep = 0
+		}
+		description = strings.ToValidUTF8(description[:keep], "") + marker
+	}
+
 	run, err := s.q.CreateThenFixRun(ctx, store.CreateThenFixRunParams{
 		RunID:               id,
 		UserID:              userID,
@@ -296,8 +319,8 @@ const maxTaskTitleRunes = 120
 // deriveTaskTitle picks a short, human-readable title from the inline context: the
 // first non-empty line, trimmed and truncated to maxTaskTitleRunes runes. A blank
 // context falls back to a stable placeholder so the run view header is never empty.
-func deriveTaskTitle(context string) string {
-	for _, line := range strings.Split(context, "\n") {
+func deriveTaskTitle(text string) string {
+	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
