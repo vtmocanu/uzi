@@ -67,6 +67,25 @@ var DefaultColumns = []forge.Label{
 	{Name: "Later", Color: "#999999"},
 }
 
+// DefaultColumnColor is the grey a board column label falls back to when its
+// name is not one of the DefaultColumns (a user-added custom column). It is the
+// same color ConfigureColumns creates custom columns with, so ensuring a column
+// label at drag-time never changes a column's color out from under an operator.
+const DefaultColumnColor = "#8c8c8c"
+
+// ColumnColor resolves the forge label color for a board column by name: the
+// pinned DefaultColumns color for a known default column, else DefaultColumnColor.
+// This keeps the column palette a single source of truth (the constants), so
+// AutoMove can recreate a drifted/missing column label with its correct color.
+func ColumnColor(name string) string {
+	for _, c := range DefaultColumns {
+		if c.Name == name {
+			return c.Color
+		}
+	}
+	return DefaultColumnColor
+}
+
 // prdLinkRe matches a PRD reference in an issue description: a bare or
 // blob-URL-prefixed path to a prds/.../<file>.md, allowing subdirectories
 // (e.g. prds/done/1-foo.md). Computed at fetch time; the description itself is
@@ -210,6 +229,22 @@ func (s *Service) AutoMove(ctx context.Context, f forge.Forge, forgeProjectID in
 		columnSet[c.LabelName] = struct{}{}
 	}
 	add, remove, newLabels := board.PlanLabelMove(current, columnSet, target)
+
+	// Ensure the label we are about to add exists on the forge before writing it
+	// (mirrors SetIssueLabel). AutoMove is the manual-drag / run-automation path and
+	// must not assume the forge already carries the target column's label — it can
+	// be missing or drifted (e.g. the Upcoming→Planned rename, #176). add is the
+	// target column and has at most one element; an empty add (already in the target
+	// column, or a move to Open) ensures nothing and keeps the cheap no-forge-call path.
+	if len(add) > 0 {
+		labels := make([]forge.Label, 0, len(add))
+		for _, name := range add {
+			labels = append(labels, forge.Label{Name: name, Color: ColumnColor(name)})
+		}
+		if err := f.EnsureLabels(ctx, forgeProjectID, labels); err != nil {
+			return store.Issue{}, err
+		}
+	}
 
 	// Forge-first: apply the label change remotely before touching the cache. On
 	// failure the cache is untouched (UpdateIssueLabels no-ops on empty sets, so a
