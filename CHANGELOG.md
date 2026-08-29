@@ -18,10 +18,23 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.68.0] - 2026-08-29
+
 ### Changed
 
 - **Scheduled self-improve now targets the enabling repo, not just uzi ([#686](https://github.com/vtmocanu/uzi/issues/686)).**
   The `self-improve` default job reviews and improves whichever repo it's enabled on; folding your accumulated "improve uzi" recommendations and running uzi's own trusted directive is now an explicit, owner-set per-repo capability that existing self-improve schedules were switched on for automatically, so nothing changes for uzi's own instance. Each cycle also now opens a fresh merge request off current main instead of extending one long-lived branch, capped at 2 concurrently open self-improve merge requests per repo so further cycles skip (with a notification) until you merge or close one.
+
+### Fixed
+
+- **Automated MR-rework runs now actually run ([#778](https://github.com/vtmocanu/uzi/issues/778)).**
+  The mr_rework lane never worked: the worker had no branch-derivation case for it and the claim wire never carried the merge-request branch, so a rework run could not push. Rework changes now push to the existing MR branch even without an issue reference, and the run's title and description identify it as an automated rework.
+- **Worker no longer strands a run seeded off a stale, disjoint remote ref ([#781](https://github.com/vtmocanu/uzi/issues/781)).**
+  A worker could seed a run's clone off a stale remote-tracking ref whose history shares no commit with the default branch, leaving the branch impossible to base-align or push. The worker now prunes the fetch and rejects a base with no common history, so valid work is no longer lost to a disjoint seed.
+- **Worker run survives a transient network blip during the claim-time clone ([#775](https://github.com/vtmocanu/uzi/issues/775)).**
+  The claim-time bare clone had no retry on the clone/fetch path and the forge classifier closed a connect timeout as permanent, so a momentary network hiccup failed the run. Transient connection failures on clone and checkout now retry, cleaning up incomplete data before each attempt, and a connect timeout is treated as transient.
+- **web tests no longer fail under Node >=26 ([#340](https://github.com/vtmocanu/uzi/issues/340)).**
+  Node 26's built-in localStorage shadowed jsdom's, breaking the web test setup; a fallback for missing or incomplete browser storage keeps local and session storage working in the test environment.
 
 ## [0.67.0] - 2026-08-28
 
@@ -3434,7 +3447,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.67.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.68.0...HEAD
+[0.68.0]: https://github.com/vtmocanu/uzi/compare/v0.67.0...v0.68.0
 [0.67.0]: https://github.com/vtmocanu/uzi/compare/v0.66.3...v0.67.0
 [0.66.3]: https://github.com/vtmocanu/uzi/compare/v0.66.2...v0.66.3
 [0.66.2]: https://github.com/vtmocanu/uzi/compare/v0.66.1...v0.66.2
