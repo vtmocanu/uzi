@@ -101,14 +101,14 @@ uzi schedule create --repo <id> [--repo <id> ...] (--issue <iid> | --sweep [--la
                     (--at <rfc3339> | --cron <expr>) [--tz <iana>]
                     [--auto-approve[=false]] [--wait-on-limit[=false]]
                     [--max-issues <n>] [--guidance <text>]
-                    [--model <alias|id>] [--apply-model-to-agents]
+                    [--model <alias|id>] [--apply-model-to-agents[=false]]
 uzi schedule list | get <id> | pause <id> | resume <id> | run-now <id> | delete <id>
 uzi schedule edit <id> [--cron <expr> | --at <rfc3339>] [--tz <iana>]
                    [--prompt <text> | --label <l> ... [--create-missing-labels]]
                    [--auto-approve[=false]] [--wait-on-limit[=false]]
                    [--guidance <text> | --clear-guidance]
                    [--max-issues <n> | --clear-max-issues]
-                   [--model <alias|id>] [--apply-model-to-agents] [--repo <id>]
+                   [--model <alias|id>] [--apply-model-to-agents[=false]] [--repo <id>]
 uzi schedule catalog list
 uzi schedule catalog enable <slug> --repo <id> [--repo <id> ...] [--create-missing-labels]
 uzi schedule reset <id>
