@@ -210,6 +210,13 @@ The remote `refs/uzi-checkpoints/agent/issue-N` ref is the other recovery source
 behind-on-workflows run leaves none (its checkpoint push hit the same rejection). The PVC
 tracking ref is the reliable source.
 
+The steps above are the **issue-run** shape; a **task run** (`uzi handoff`) uses
+`uzi/task/<RUN>` / `refs/uzi-runner/uzi/task/<RUN>` and often has its work entirely
+uncommitted. Once you have the bundle out (from here or from a snapshot below), **`resume-recipe.md`**
+in this skill dir is the consolidated, run-kind-agnostic recipe for landing it: fetch →
+isolated worktree → restore uncommitted → rebase → pre-flight (workflow/migration) → gate →
+PR → admin-merge → cleanup.
+
 ### Proactive backups (before anything goes wrong)
 
 The recovery above is reactive — after a push rejection or a lost run. When you are
@@ -234,13 +241,13 @@ caught too, not just the checkpointed tracking ref):
   It rides through `limit_wait` (keeps snapshotting while a run is parked). This is a
   session-independent safety net; it is NOT a substitute for the pollers — keep those too.
 
-To recover from a snapshot: `tar xzf <ts>/issue-N.tgz -C r/`, then
-`git fetch r/issue-N.bundle 'agent/issue-N:refs/heads/recover/issue-N'` and
-`git worktree add DIR recover/issue-N`. In `DIR`, restore the uncommitted state the
-tracking ref never held: `git apply r/issue-N.uncommitted.patch` if that file is present,
-**and `tar xzf r/issue-N.untracked.tar.gz -C DIR` if that one is** (it carries new,
-not-yet-added files, which the patch does not). Then `git rebase origin/main` and gate +
-PR + admin-merge as above.
+To recover from a snapshot, follow **`resume-recipe.md`** in this skill dir. It is the
+authoritative, run-kind-agnostic land-it recipe (issue AND task stems) and takes over where
+this two-step "get the work out" leaves off, carrying the snapshot through the whole path:
+integrity-verify the `.tgz`, fetch into an isolated `recover/<stem>` worktree, rebase,
+restore the uncommitted state, commit, the workflow/migration pre-flight, gate, PR,
+admin-merge, cleanup. Read the exact commands and ordering there rather than duplicating
+them here.
 
 ## uzi may fix the CodeRabbit findings ITSELF (mr_rework) — coordinate, don't collide
 
