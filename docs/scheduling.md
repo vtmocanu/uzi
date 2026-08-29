@@ -235,12 +235,16 @@ worker rather than the catalog — its entry is cadence and model only (see
   from the shipped catalog every time the job fires, not copied onto your
   schedule, so a prompt improvement uzi ships later reaches every repo that
   already enabled the job, automatically, with nothing to re-enable. Cadence,
-  model, and the run options (auto-approve, wait-on-limit, max issues) are
-  yours to edit like any schedule — as is owner **guidance** on a prompt-target
-  or sweep-target default (on a sweep default it is an overlay composed onto the
-  read-only baked catalog guidance); a **Reset to default** action puts an edited
-  default back to the catalog's cadence/model/options in one step, and also clears
-  any owner guidance you added to a prompt or sweep default.
+  model, and the run options (auto-approve, wait-on-limit, max issues, and
+  whether the model is also applied to agents — the "apply model also to
+  agents" toggle, `override_subagent_model`) are yours to edit like any
+  schedule — as is owner **guidance** on a prompt-target or sweep-target
+  default (on a sweep default it is an overlay composed onto the read-only
+  baked catalog guidance); a **Reset to default** action puts an edited
+  default back to the catalog's cadence/model/options in one step — including
+  clearing `override_subagent_model` back to its catalog baseline of `false`
+  — and also clears any owner guidance you added to a prompt or sweep
+  default.
 - **Enable on several repos at once.** Enabling a default (or creating a
   custom schedule) against multiple repos creates one independent schedule
   per repo — each with its own cadence, its own pause/resume, its own run

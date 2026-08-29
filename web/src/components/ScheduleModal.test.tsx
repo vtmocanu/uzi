@@ -560,7 +560,7 @@ describe("editing a catalog default (PRD #589)", () => {
     expect(onCloneToEdit).toHaveBeenCalledWith(fixture);
   });
 
-  it("saving a default sends only the editable fields — not the catalog-owned prompt/target/subagent flag", async () => {
+  it("saving a default sends the editable fields including the subagent flag — not the catalog-owned prompt/target", async () => {
     mockApi.updateSchedule.mockResolvedValue(defaultFixture());
     render(
       <MemoryRouter>
@@ -585,7 +585,12 @@ describe("editing a catalog default (PRD #589)", () => {
     // (a blank textarea clears owner guidance back to none). Not omitted like the rest.
     expect(input && "guidance" in input).toBe(true);
     expect(input?.guidance).toBeNull();
-    expect(input?.override_subagent_model).toBeUndefined();
+    // override_subagent_model is NO LONGER catalog-owned (issue #691): the server now
+    // accepts it on a default patch, so buildDefaultInput sends it with replace-semantics.
+    // The fixture leaves the flag unset, so the toggle defaults to false — assert both that
+    // the value is false AND that the KEY is present (sent, not omitted like the fields below).
+    expect(input?.override_subagent_model).toBe(false);
+    expect(input && "override_subagent_model" in input).toBe(true);
     // timing is catalog-owned too: the server keeps timing="recurring" itself and 400s ANY
     // default patch that carries it, so buildDefaultInput must NOT send it. This is the field
     // that actually broke the real backend — assert its key is absent, not merely its value.
@@ -595,6 +600,27 @@ describe("editing a catalog default (PRD #589)", () => {
     expect(input?.repo_id).toBeUndefined();
     expect(input?.issue_iid).toBeUndefined();
     expect(input?.run_at).toBeUndefined();
+  });
+
+  it("renders the 'Apply model also to agents' toggle on a default, and submits override_subagent_model:true when turned on (issue #691)", async () => {
+    mockApi.updateSchedule.mockResolvedValue(defaultFixture({ override_subagent_model: true }));
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={defaultFixture()} onClose={vi.fn()} onSaved={vi.fn()} onCloneToEdit={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    // The toggle is now rendered for a DEFAULT (it was previously hidden on defaults). The
+    // fixture leaves the flag unset, so it starts off.
+    const toggle = screen.getByRole("switch", { name: "Apply model also to agents" });
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+
+    // Turn it on and save — the flag flows through buildDefaultInput.
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.override_subagent_model).toBe(true);
   });
 });
 

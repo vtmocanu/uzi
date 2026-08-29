@@ -60,8 +60,11 @@ WHERE user_id = @user_id AND repo_id = @repo_id AND catalog_slug = @catalog_slug
 -- row can never be reset through this path (the handler 409s that case before calling).
 -- The prompt/labels stay NULL (catalog-owned); guidance is explicitly cleared to NULL here
 -- because a prompt default can carry owner-editable guidance (issue #662) and a Reset must
--- drop it back to the catalog baseline. next_fire_at is recomputed in Go from the catalog
--- cron+timezone and passed in.
+-- drop it back to the catalog baseline. override_subagent_model is likewise reset to the
+-- catalog baseline (false) because a default now carries it as an owner-editable run option
+-- (issue #691). Both are written as SQL literals rather than left to the column's DB DEFAULT:
+-- a Reset is an UPDATE, so the DEFAULT never re-applies and the field must be set explicitly.
+-- next_fire_at is recomputed in Go from the catalog cron+timezone and passed in.
 UPDATE run_schedules
 SET cron_expr     = @cron_expr,
     timezone      = @timezone,
@@ -70,6 +73,7 @@ SET cron_expr     = @cron_expr,
     wait_on_limit = @wait_on_limit,
     max_issues    = sqlc.narg('max_issues'),
     guidance      = NULL,
+    override_subagent_model = false,
     next_fire_at  = @next_fire_at,
     customized    = false,
     status        = 'active',

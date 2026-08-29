@@ -1117,6 +1117,15 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 		guidance = pgtype.Text{String: *req.Guidance, Valid: true}
 	}
 
+	// override_subagent_model is a run option (not a catalog field), owner-editable on a
+	// default (issue #691). It takes replace-semantics from the request like the other run
+	// options — an omitted value keeps the stored one. Its catalog baseline is always false,
+	// so any toggled-on value OR-s into customized (see the recompute below).
+	ov := cur.OverrideSubagentModel
+	if req.OverrideSubagentModel != nil {
+		ov = *req.OverrideSubagentModel
+	}
+
 	// customized latches on divergence but the reset endpoint clears it; a patch that puts
 	// every editable field back to the catalog default also clears it (recomputed fresh, not
 	// OR-ed with a stale true — Reset and an exact-restore patch both un-customize).
@@ -1136,6 +1145,10 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 	if guidanceEditable {
 		customized = customized || guidance.Valid
 	}
+	// override_subagent_model is a run option (not a catalog field, so not in
+	// defaultEditableDiverges' inputs); its catalog baseline is always false, so any
+	// toggled-on value diverges (issue #691). Mirrors the guidance precedent above.
+	customized = customized || ov
 
 	final, err := h.q.UpdateRunSchedule(r.Context(), store.UpdateRunScheduleParams{
 		Target:                cur.Target,
@@ -1153,7 +1166,7 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 		MaxIssues:             maxIssues,
 		Guidance:              guidance,
 		Model:                 model,
-		OverrideSubagentModel: cur.OverrideSubagentModel,
+		OverrideSubagentModel: ov,
 		Customized:            customized,
 		ID:                    id,
 		UserID:                user.ID,
