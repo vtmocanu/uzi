@@ -278,8 +278,9 @@ func (e *Scheduler) fireOne(ctx context.Context, sched store.RunSchedule) (FireO
 }
 
 // fireIssue fires a single-issue schedule through the same seam a manual/autopilot
-// start uses, computing the PRDLESS bypass from a fresh GetIssue snapshot exactly
-// like the poller/handler.
+// start uses. Eligibility is the single uzi_label gate that seam applies (PRD #764 M1),
+// read from the cached issue labels; the fresh GetIssue snapshot here supplies the run's
+// title/description/web URL, not an eligibility decision.
 func (e *Scheduler) fireIssue(ctx context.Context, sched store.RunSchedule) (FireOutcome, error) {
 	repo, f, err := e.resolveRepoForge(ctx, sched)
 	if err != nil {
@@ -505,12 +506,13 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (Fi
 }
 
 // createIssueRun fires one issue through the shared seam. auto_approve schedules go
-// through CreateAutopilotRun; non-auto-approve ones through CreateScheduledRun (NOT
-// the interactive CreateRun — a timer/sweep has no human at fire time, so it must not
-// receive PRD #196's interactive PRD-link waiver) threading the schedule's
-// wait_on_limit. The benign per-fire seam rejects (active run, not eligible, no PRD
-// link, description too large) are swallowed so the schedule still advances;
-// ErrRepoNotFound is permanent; anything else is transient.
+// through CreateScheduledAutopilotRun; non-auto-approve ones through CreateScheduledRun,
+// both threading the schedule's wait_on_limit. Post-PRD #764 M1 every create path shares
+// the single uzi_label eligibility gate — there is no PRD-link requirement, PRDLESS
+// bypass, or interactive waiver left for the two branches to differ on — so they differ
+// only in auto-approve, not in what they will run. The benign per-fire seam rejects
+// (active run, not eligible, description too large) are swallowed so the schedule still
+// advances; ErrRepoNotFound is permanent; anything else is transient.
 //
 // Wait-on-limit (PRD #274 Decision 1a, revising PRD #241 Decision 2): BOTH branches now
 // thread the schedule's persisted wait_on_limit. The auto-approve branch fires through
@@ -541,10 +543,12 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		// guarantee that label-driven autopilot behaviour is unchanged.
 		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleModel(sched), scheduleOverrideSubagentModel(sched))
 	} else {
-		// CreateScheduledRun, NOT CreateRun: a timer-fired sweep is not the interactive
-		// human click PRD #196's PRD-link waiver is scoped to, so a link-less
-		// non-primary-eligible issue swept in here still needs a link or PRDLESS. Using
-		// CreateRun would silently widen the scheduler past the PRD's stated invariant.
+		// CreateScheduledRun is the non-auto-approve scheduled seam. Post-PRD #764 M1 it
+		// and the interactive CreateRun apply the SAME single uzi_label eligibility gate —
+		// no PRD link, PRDLESS, or waiver enters into it — so a swept uzi-labelled issue
+		// with no PRD link runs here. The only thing separating this branch from the
+		// CreateScheduledAutopilotRun branch above is auto-approve (the plan gate still
+		// needs a human here), not eligibility.
 		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil)
 	}
 
@@ -552,9 +556,11 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		return FireOutcome{Matched: 1, Started: []Started{{IssueIID: &iidCopy, RunID: run.ID, Title: title, WebURL: webURL}}}, nil
 	}
 	// Benign per-fire seam sentinel → a typed Skip; the schedule still advances (no
-	// tick-storm). skipReasonForErr maps the four benign sentinels (ErrActiveRunExists →
-	// already_running, ErrNotPRDIssue → not_eligible, ErrNoPRDLink → no_prd_link,
-	// ErrDescriptionTooLarge → description_too_large).
+	// tick-storm). skipReasonForErr maps the benign sentinels a scheduled fire can still
+	// return (ErrActiveRunExists → already_running, ErrNotPRDIssue → not_eligible,
+	// ErrDescriptionTooLarge → description_too_large). Its ErrNoPRDLink → no_prd_link arm
+	// is vestigial: no production path returns ErrNoPRDLink after PRD #764 M1, so that arm
+	// is dead until M5 retires the enum value.
 	if reason, ok := skipReasonForErr(err); ok {
 		e.logger.Info("scheduler: issue fire skipped", "schedule", sched.ID.String(), "issue", iid, "reason", err)
 		return FireOutcome{Matched: 1, Skips: []Skip{{IssueIID: &iidCopy, Title: title, Reason: reason, WebURL: webURL}}}, nil

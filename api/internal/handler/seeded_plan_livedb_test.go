@@ -49,8 +49,9 @@ type seededPlanFixture struct {
 }
 
 // newSeededPlanFixture stands up one owner with a forge connection, a repo, a cached
-// PRD issue (has_prd_link so every create-time gate passes), a default anthropic token,
-// and one worker whose heartbeat is NULL (so the D8 requeue path treats it as stale).
+// issue labelled uzi (so the single run-eligibility gate passes — PRD #764 M1 — with
+// has_prd_link set too), a default anthropic token, and one worker whose heartbeat is
+// NULL (so the D8 requeue path treats it as stale).
 // The PAT and the token are sealed with the fixture's own box so the claim can open both.
 func newSeededPlanFixture(ctx context.Context, t *testing.T) seededPlanFixture {
 	t.Helper()
@@ -100,7 +101,7 @@ func newSeededPlanFixture(ctx context.Context, t *testing.T) seededPlanFixture {
 	          VALUES ($1, $2, $3, 'g/seed', 'https://forge.example/g/seed', 'main', true)`,
 		f.repoID, connID, projectID)
 	mustExecT(ctx, t, pool, `INSERT INTO issues (repo_id, forge_issue_iid, title, state, labels, web_url, has_prd_link, forge_updated_at, synced_at)
-	          VALUES ($1, $2, 'seed issue', 'opened', '["PRD"]'::jsonb, 'https://x', true, now(), now())`,
+	          VALUES ($1, $2, 'seed issue', 'opened', '["PRD","uzi"]'::jsonb, 'https://x', true, now(), now())`,
 		f.repoID, f.iid)
 	mustExecT(ctx, t, pool, `INSERT INTO user_secrets (user_id, kind, label, is_default, ciphertext, sealed_with)
 	          VALUES ($1, $2, 'default', true, $3, 'master')`,

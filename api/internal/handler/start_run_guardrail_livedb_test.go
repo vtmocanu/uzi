@@ -156,9 +156,9 @@ func newStartRunGuardFixture(ctx context.Context, t *testing.T) startRunGuardFix
 }
 
 // seedEnabledRepoWithIssue inserts an ENABLED repo (the guard runs at run-start, not
-// enable) whose default-branch protection is served by mode, plus a cached PRD-labeled
-// issue with a PRD link so every OTHER create-time gate passes and the guard is the
-// only thing that can refuse.
+// enable) whose default-branch protection is served by mode, plus a cached issue
+// labelled uzi (so the single run-eligibility gate passes — PRD #764 M1) with a PRD link
+// so every OTHER create-time gate passes and the guard is the only thing that can refuse.
 func (f startRunGuardFixture) seedEnabledRepoWithIssue(ctx context.Context, t *testing.T, projectID int64, iid int64, mode protMode) uuid.UUID {
 	t.Helper()
 	repoID := uuid.New()
@@ -171,7 +171,7 @@ func (f startRunGuardFixture) seedEnabledRepoWithIssue(ctx context.Context, t *t
 		repoID, f.connID, projectID, fmt.Sprintf("g/sr-%d", projectID))
 	mustExecT(ctx, t, f.pool,
 		`INSERT INTO issues (repo_id, forge_issue_iid, title, state, labels, web_url, has_prd_link, forge_updated_at, synced_at)
-		 VALUES ($1, $2, 'sr issue', 'opened', '["PRD"]'::jsonb, 'https://x', true, now(), now())`,
+		 VALUES ($1, $2, 'sr issue', 'opened', '["PRD","uzi"]'::jsonb, 'https://x', true, now(), now())`,
 		repoID, iid)
 	return repoID
 }

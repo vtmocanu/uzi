@@ -558,6 +558,98 @@ func TestTickSweepThreadsMaxIssues(t *testing.T) {
 	}
 }
 
+// TestFireSweepNonAutoCandidateStartsViaScheduledRun is the M3 sweep-selector positive
+// case at the fake seam: a swept candidate whose CreateScheduledRun (the non-auto-approve
+// scheduled seam) SUCCEEDS yields exactly one Started — a run fired — routed through
+// CreateScheduledRun (scheduled=true). Post-PRD #764 M1 that seam applies the single
+// uzi_label eligibility gate; fakeRuns stands in for that gate accepting the candidate,
+// so this proves the scheduler's handling of a fire that the gate allowed.
+func TestFireSweepNonAutoCandidateStartsViaScheduledRun(t *testing.T) {
+	h := newHarness()
+	s := h.sweepSchedule(pgtype.Int4{})
+	s.AutoApprove = false // non-auto: the fire routes through CreateScheduledRun
+	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 96}}
+	h.fb.f.issue.Title = "Swept and runnable"
+
+	out, err := h.sched.RunNow(context.Background(), s)
+	if err != nil {
+		t.Fatalf("a successful sweep fire must not surface an error, got %v", err)
+	}
+	if out.Matched != 1 || len(out.Started) != 1 || len(out.Skips) != 0 {
+		t.Fatalf("outcome = %+v, want Matched:1 Started:1 Skips:0", out)
+	}
+	if len(h.runs.runs) != 1 || !h.runs.runs[0].scheduled {
+		t.Fatalf("swept non-auto candidate must fire through CreateScheduledRun (scheduled=true), got runs=%+v", h.runs.runs)
+	}
+	if len(h.runs.autopilot) != 0 {
+		t.Fatalf("non-auto sweep must NOT use the autopilot seam, got %d", len(h.runs.autopilot))
+	}
+	if st := out.Started[0]; st.IssueIID == nil || *st.IssueIID != 96 || st.Title != "Swept and runnable" {
+		t.Fatalf("started = %+v, want iid 96 / fetched title", st)
+	}
+	assertBalances(t, out)
+}
+
+// TestTickSweepBareSelectorNotEligibleSkipsAndAdvances is the M3 discriminator at the
+// fake seam: a swept BARE-selector candidate (a selector such as `bug` WITHOUT `uzi`) is
+// refused by the single uzi_label gate with workersvc.ErrNotPRDIssue. The scheduler must
+// turn that into a benign not_eligible Skip AND STILL advance the schedule — the cadence
+// is preserved, no park, no tick-storm — mirroring TestTickDedupSkipStillAdvances and
+// TestFireIssueSentinelSkips. fakeRuns stands in for the gate returning ErrNotPRDIssue;
+// the skip reason is read back out of the persisted last_fire the advance wrote.
+func TestTickSweepBareSelectorNotEligibleSkipsAndAdvances(t *testing.T) {
+	h := newHarness()
+	s := h.sweepSchedule(pgtype.Int4{})
+	s.AutoApprove = false
+	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 96}}
+	h.fb.f.issue.Title = "bug but no uzi"
+	h.runs.err = workersvc.ErrNotPRDIssue // the single uzi_label gate refuses a bare-selector issue
+	h.st.due = []store.RunSchedule{s}
+
+	h.sched.Boot(context.Background())
+
+	// No run fired on either seam.
+	if len(h.runs.runs) != 0 || len(h.runs.autopilot) != 0 {
+		t.Fatalf("a not-eligible candidate must not fire the seam: runs=%d autopilot=%d", len(h.runs.runs), len(h.runs.autopilot))
+	}
+	// The benign skip STILL advances the schedule, active, with a bumped future next_fire_at.
+	if len(h.st.advanceCalls) != 1 {
+		t.Fatalf("not_eligible skip must STILL advance: advance calls = %d, want 1", len(h.st.advanceCalls))
+	}
+	adv := h.st.advanceCalls[0]
+	if adv.Status != "active" {
+		t.Fatalf("advance status = %q, want active (no park)", adv.Status)
+	}
+	if !adv.NextFireAt.Valid || !adv.NextFireAt.Time.After(h.now) {
+		t.Fatalf("next_fire_at = %+v, want a bumped future instant", adv.NextFireAt)
+	}
+	// It must NOT park (no status='error' write) — a not_eligible skip is benign, not fatal.
+	if len(h.st.statusCalls) != 0 {
+		t.Fatalf("a benign not_eligible skip must NOT park: status calls = %d, want 0", len(h.st.statusCalls))
+	}
+	// The persisted last_fire records the candidate as a single not_eligible skip.
+	var lf struct {
+		Matched int `json:"matched"`
+		Skips   []struct {
+			IssueIID *int64 `json:"issue_iid"`
+			Reason   string `json:"reason"`
+		} `json:"skips"`
+		Started []json.RawMessage `json:"started"`
+	}
+	if err := json.Unmarshal(adv.LastFire, &lf); err != nil {
+		t.Fatalf("decode persisted last_fire: %v (raw %s)", err, adv.LastFire)
+	}
+	if lf.Matched != 1 || len(lf.Skips) != 1 || len(lf.Started) != 0 {
+		t.Fatalf("last_fire = %+v, want matched:1 one skip no starts", lf)
+	}
+	if lf.Skips[0].Reason != string(SkipNotEligible) {
+		t.Fatalf("skip reason = %q, want %q (not_eligible)", lf.Skips[0].Reason, SkipNotEligible)
+	}
+	if lf.Skips[0].IssueIID == nil || *lf.Skips[0].IssueIID != 96 {
+		t.Fatalf("skip iid = %v, want 96", lf.Skips[0].IssueIID)
+	}
+}
+
 func TestTickOnceScheduleFiresToStatus(t *testing.T) {
 	h := newHarness()
 	s := h.issueSchedule()
