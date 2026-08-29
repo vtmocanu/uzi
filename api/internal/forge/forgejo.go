@@ -734,10 +734,16 @@ func toForgejoIssue(i *gitea.Issue) Issue {
 		Description: i.Body,
 		WebURL:      i.HTMLURL,
 		UpdatedAt:   i.Updated,
+		Assignees:   []int64{},
 	}
 	for _, l := range i.Labels {
 		if l != nil {
 			issue.Labels = append(issue.Labels, l.Name)
+		}
+	}
+	for _, a := range i.Assignees {
+		if a != nil {
+			issue.Assignees = append(issue.Assignees, a.ID)
 		}
 	}
 	if i.Poster != nil {

@@ -293,7 +293,7 @@ func (q *Queries) GetForgeConnectionForUser(ctx context.Context, arg GetForgeCon
 }
 
 const getIssueByIID = `-- name: GetIssueByIID :one
-SELECT id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position FROM issues WHERE repo_id = $1 AND forge_issue_iid = $2
+SELECT id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids FROM issues WHERE repo_id = $1 AND forge_issue_iid = $2
 `
 
 type GetIssueByIIDParams struct {
@@ -317,6 +317,7 @@ func (q *Queries) GetIssueByIID(ctx context.Context, arg GetIssueByIIDParams) (I
 		&i.ForgeUpdatedAt,
 		&i.SyncedAt,
 		&i.BoardPosition,
+		&i.AssigneeIds,
 	)
 	return i, err
 }
@@ -791,7 +792,7 @@ func (q *Queries) ListForgeConnectionsByUser(ctx context.Context, userID uuid.UU
 }
 
 const listIssuesByRepo = `-- name: ListIssuesByRepo :many
-SELECT id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position FROM issues WHERE repo_id = $1
+SELECT id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids FROM issues WHERE repo_id = $1
 ORDER BY board_position ASC NULLS LAST, forge_issue_iid ASC
 `
 
@@ -836,6 +837,7 @@ func (q *Queries) ListIssuesByRepo(ctx context.Context, repoID uuid.UUID) ([]Iss
 			&i.ForgeUpdatedAt,
 			&i.SyncedAt,
 			&i.BoardPosition,
+			&i.AssigneeIds,
 		); err != nil {
 			return nil, err
 		}
@@ -1860,19 +1862,20 @@ func (q *Queries) UpsertForgeConnection(ctx context.Context, arg UpsertForgeConn
 const upsertIssue = `-- name: UpsertIssue :one
 
 INSERT INTO issues (
-    repo_id, forge_issue_iid, title, state, labels, web_url, author,
+    repo_id, forge_issue_iid, title, state, labels, assignee_ids, web_url, author,
     has_prd_link, forge_updated_at, synced_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
 ON CONFLICT (repo_id, forge_issue_iid) DO UPDATE
 SET title            = EXCLUDED.title,
     state            = EXCLUDED.state,
     labels           = EXCLUDED.labels,
+    assignee_ids     = EXCLUDED.assignee_ids,
     web_url          = EXCLUDED.web_url,
     author           = EXCLUDED.author,
     has_prd_link     = EXCLUDED.has_prd_link,
     forge_updated_at = EXCLUDED.forge_updated_at,
     synced_at        = now()
-RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids
 `
 
 type UpsertIssueParams struct {
@@ -1881,6 +1884,7 @@ type UpsertIssueParams struct {
 	Title          string             `json:"title"`
 	State          string             `json:"state"`
 	Labels         []byte             `json:"labels"`
+	AssigneeIds    []byte             `json:"assignee_ids"`
 	WebUrl         string             `json:"web_url"`
 	Author         pgtype.Text        `json:"author"`
 	HasPrdLink     bool               `json:"has_prd_link"`
@@ -1905,6 +1909,7 @@ func (q *Queries) UpsertIssue(ctx context.Context, arg UpsertIssueParams) (Issue
 		arg.Title,
 		arg.State,
 		arg.Labels,
+		arg.AssigneeIds,
 		arg.WebUrl,
 		arg.Author,
 		arg.HasPrdLink,
@@ -1924,6 +1929,7 @@ func (q *Queries) UpsertIssue(ctx context.Context, arg UpsertIssueParams) (Issue
 		&i.ForgeUpdatedAt,
 		&i.SyncedAt,
 		&i.BoardPosition,
+		&i.AssigneeIds,
 	)
 	return i, err
 }

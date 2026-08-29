@@ -77,6 +77,12 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	assigneeIDsJSON, err := json.Marshal(created.Assignees)
+	if err != nil {
+		slog.Error("marshal issue assignee ids", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
 	updated := created.UpdatedAt
 	if updated.IsZero() {
 		updated = time.Now()
@@ -87,6 +93,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		Title:          created.Title,
 		State:          created.State,
 		Labels:         labelsJSON,
+		AssigneeIds:    assigneeIDsJSON,
 		WebUrl:         created.WebURL,
 		Author:         pgtypeTextOrNull(created.Author),
 		HasPrdLink:     forgesvc.HasPRDLink(req.Description),

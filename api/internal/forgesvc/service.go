@@ -228,6 +228,7 @@ func (s *Service) AutoMove(ctx context.Context, f forge.Forge, forgeProjectID in
 		Title:          issue.Title,
 		State:          issue.State,
 		Labels:         labelsJSON,
+		AssigneeIds:    issue.AssigneeIds, // preserved verbatim; this path never re-derives it
 		WebUrl:         issue.WebUrl,
 		Author:         issue.Author,
 		HasPrdLink:     issue.HasPrdLink,
@@ -305,6 +306,7 @@ func (s *Service) SetIssueLabel(ctx context.Context, f forge.Forge, forgeProject
 		Title:          issue.Title,
 		State:          issue.State,
 		Labels:         labelsJSON,
+		AssigneeIds:    issue.AssigneeIds, // preserved verbatim; this path never re-derives it
 		WebUrl:         issue.WebUrl,
 		Author:         issue.Author,
 		HasPrdLink:     issue.HasPrdLink, // preserved verbatim; this path never re-derives it
@@ -559,6 +561,10 @@ func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []f
 		if err != nil {
 			return err
 		}
+		assigneeIDsJSON, err := json.Marshal(is.Assignees)
+		if err != nil {
+			return err
+		}
 		author := pgtype.Text{}
 		if is.Author != "" {
 			author = pgtype.Text{String: is.Author, Valid: true}
@@ -576,6 +582,7 @@ func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []f
 			Title:          is.Title,
 			State:          is.State,
 			Labels:         labelsJSON,
+			AssigneeIds:    assigneeIDsJSON,
 			WebUrl:         is.WebURL,
 			Author:         author,
 			HasPrdLink:     HasPRDLink(is.Description),

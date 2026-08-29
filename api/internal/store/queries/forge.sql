@@ -308,13 +308,14 @@ WHERE repo_id = @repo_id AND position >= @from_position;
 -- Do not add `board_position = EXCLUDED.board_position` here. Guarded behaviourally by
 -- TestUpsertIssuePreservesBoardPositionLiveDB, because a comment cannot catch an edit.
 INSERT INTO issues (
-    repo_id, forge_issue_iid, title, state, labels, web_url, author,
+    repo_id, forge_issue_iid, title, state, labels, assignee_ids, web_url, author,
     has_prd_link, forge_updated_at, synced_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
 ON CONFLICT (repo_id, forge_issue_iid) DO UPDATE
 SET title            = EXCLUDED.title,
     state            = EXCLUDED.state,
     labels           = EXCLUDED.labels,
+    assignee_ids     = EXCLUDED.assignee_ids,
     web_url          = EXCLUDED.web_url,
     author           = EXCLUDED.author,
     has_prd_link     = EXCLUDED.has_prd_link,
