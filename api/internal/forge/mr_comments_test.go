@@ -239,6 +239,88 @@ func TestGitHubListMergeRequestComments(t *testing.T) {
 	}
 }
 
+// TestGitHubReviewThreadPaginationSpansMultiplePages pins that
+// reviewThreadIDsByDatabaseID pages BOTH GraphQL connections: the outer
+// reviewThreads cursor AND, for a thread whose first comment page is not the last,
+// the inner comments cursor via the node(id:) re-fetch helper. The cursor-aware
+// mock serves outer page 1 (thread T1 with more comments to come), outer page 2
+// (thread T2), and inner page 2 for T1. Against the pre-fix single-page code — which
+// sends no threadCursor and never issues the node() query — 201 (outer page 2) and
+// 102 (inner page 2 of T1) never enter the map, so this fails; after the fix all
+// three anchors are present.
+func TestGitHubReviewThreadPaginationSpansMultiplePages(t *testing.T) {
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		graphqlRoute: func(w http.ResponseWriter, r *http.Request) {
+			req := readGQL(t, r)
+			threadCursor, _ := req.Variables["threadCursor"].(string)
+			switch {
+			case strings.Contains(req.Query, "reviewThreads") && threadCursor == "":
+				// Outer page 1: T1, whose comments have a next page.
+				writeGQLData(w, map[string]any{
+					"repository": map[string]any{
+						"pullRequest": map[string]any{
+							"reviewThreads": map[string]any{
+								"pageInfo": map[string]any{"hasNextPage": true, "endCursor": "TCUR1"},
+								"nodes": []map[string]any{
+									{"id": "T1", "comments": map[string]any{
+										"pageInfo": map[string]any{"hasNextPage": true, "endCursor": "CCUR1"},
+										"nodes":    []map[string]any{{"databaseId": 101}},
+									}},
+								},
+							},
+						},
+					},
+				})
+			case strings.Contains(req.Query, "reviewThreads") && threadCursor == "TCUR1":
+				// Outer page 2: T2, single comment page.
+				writeGQLData(w, map[string]any{
+					"repository": map[string]any{
+						"pullRequest": map[string]any{
+							"reviewThreads": map[string]any{
+								"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
+								"nodes": []map[string]any{
+									{"id": "T2", "comments": map[string]any{
+										"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
+										"nodes":    []map[string]any{{"databaseId": 201}},
+									}},
+								},
+							},
+						},
+					},
+				})
+			case strings.Contains(req.Query, "node(") &&
+				req.Variables["threadId"] == "T1" && req.Variables["commentCursor"] == "CCUR1":
+				// Inner page 2 for T1.
+				writeGQLData(w, map[string]any{
+					"node": map[string]any{
+						"comments": map[string]any{
+							"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
+							"nodes":    []map[string]any{{"databaseId": 102}},
+						},
+					},
+				})
+			default:
+				t.Fatalf("unexpected graphql request: query=%q vars=%+v", req.Query, req.Variables)
+			}
+		},
+	})
+	d := newGitHubRawDriver(t, m, "ghp_classicTokenValue1234567890")
+
+	got, err := d.reviewThreadIDsByDatabaseID(context.Background(), repoSlug{owner: "acme", repo: "widgets"}, 13)
+	if err != nil {
+		t.Fatalf("reviewThreadIDsByDatabaseID: %v", err)
+	}
+	if got[101] != "T1" {
+		t.Errorf("m[101] = %q, want T1 (outer page-1 comment)", got[101])
+	}
+	if got[201] != "T2" {
+		t.Errorf("m[201] = %q, want T2 (outer page-2 thread dropped without thread pagination)", got[201])
+	}
+	if got[102] != "T1" {
+		t.Errorf("m[102] = %q, want T1 (inner page-2 comment dropped without comment pagination)", got[102])
+	}
+}
+
 // TestGitHubReplyMergeRequestComment pins the reply keyed on the REST databaseId
 // (the reply anchor): CreateCommentInReplyTo POSTs with in_reply_to set.
 func TestGitHubReplyMergeRequestComment(t *testing.T) {

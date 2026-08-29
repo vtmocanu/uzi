@@ -914,56 +914,156 @@ func (g *github) ListMergeRequestComments(ctx context.Context, projectID, mrIID 
 // map from each thread comment's REST databaseId to the thread's node id — the
 // join key ListMergeRequestComments uses to attach a resolve anchor to a REST
 // inline comment (Resolved facts). It reuses the driver's graphqlDo helper (auth +
-// endpoint + redaction), never a hand-rolled POST.
+// endpoint + redaction), never a hand-rolled POST. It pages BOTH connections: the
+// outer reviewThreads cursor here, and — for any thread with more than one page of
+// comments — the inner comments cursor via reviewThreadCommentDBIDs, so neither a
+// PR with >100 review threads nor a thread with >100 comments silently drops a
+// ResolveID anchor. Both loops are backstopped by maxForgeItems/maxForgePages.
 func (g *github) reviewThreadIDsByDatabaseID(ctx context.Context, slug repoSlug, number int) (map[int64]string, error) {
-	const query = `query($owner: String!, $name: String!, $number: Int!) {
+	const query = `query($owner: String!, $name: String!, $number: Int!, $threadCursor: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $threadCursor) {
+        pageInfo { hasNextPage endCursor }
         nodes {
           id
-          isResolved
-          isOutdated
-          path
-          line
-          comments(first: 100) { nodes { databaseId } }
+          comments(first: 100) {
+            pageInfo { hasNextPage endCursor }
+            nodes { databaseId }
+          }
         }
       }
     }
   }
 }`
-	var out struct {
-		Repository struct {
-			PullRequest struct {
-				ReviewThreads struct {
-					Nodes []struct {
-						ID       string `json:"id"`
-						Comments struct {
-							Nodes []struct {
-								DatabaseID int64 `json:"databaseId"`
-							} `json:"nodes"`
-						} `json:"comments"`
-					} `json:"nodes"`
-				} `json:"reviewThreads"`
-			} `json:"pullRequest"`
-		} `json:"repository"`
-	}
-	vars := map[string]any{"owner": slug.owner, "name": slug.repo, "number": number}
-	if err := g.graphqlDo(ctx, query, vars, &out); err != nil {
-		return nil, err
-	}
 	m := map[int64]string{}
-	for _, node := range out.Repository.PullRequest.ReviewThreads.Nodes {
-		if node.ID == "" {
-			continue
+	var threadCursor *string
+	page := 0
+	for {
+		page++
+		var resp struct {
+			Repository struct {
+				PullRequest struct {
+					ReviewThreads struct {
+						PageInfo struct {
+							HasNextPage bool   `json:"hasNextPage"`
+							EndCursor   string `json:"endCursor"`
+						} `json:"pageInfo"`
+						Nodes []struct {
+							ID       string `json:"id"`
+							Comments struct {
+								PageInfo struct {
+									HasNextPage bool   `json:"hasNextPage"`
+									EndCursor   string `json:"endCursor"`
+								} `json:"pageInfo"`
+								Nodes []struct {
+									DatabaseID int64 `json:"databaseId"`
+								} `json:"nodes"`
+							} `json:"comments"`
+						} `json:"nodes"`
+					} `json:"reviewThreads"`
+				} `json:"pullRequest"`
+			} `json:"repository"`
 		}
-		for _, cn := range node.Comments.Nodes {
-			if cn.DatabaseID != 0 {
-				m[cn.DatabaseID] = node.ID
+		vars := map[string]any{"owner": slug.owner, "name": slug.repo, "number": number}
+		if threadCursor != nil {
+			vars["threadCursor"] = *threadCursor
+		} else {
+			vars["threadCursor"] = nil
+		}
+		if err := g.graphqlDo(ctx, query, vars, &resp); err != nil {
+			return nil, err
+		}
+		for _, node := range resp.Repository.PullRequest.ReviewThreads.Nodes {
+			if node.ID == "" {
+				continue
+			}
+			for _, cn := range node.Comments.Nodes {
+				if cn.DatabaseID != 0 {
+					m[cn.DatabaseID] = node.ID
+				}
+			}
+			if node.Comments.PageInfo.HasNextPage {
+				rest, err := g.reviewThreadCommentDBIDs(ctx, node.ID, node.Comments.PageInfo.EndCursor)
+				if err != nil {
+					return nil, err
+				}
+				for _, dbID := range rest {
+					if dbID != 0 {
+						m[dbID] = node.ID
+					}
+				}
 			}
 		}
+		if len(m) > maxForgeItems {
+			return nil, g.redact.error(forgePaginationCapErr("item", maxForgeItems))
+		}
+		if !resp.Repository.PullRequest.ReviewThreads.PageInfo.HasNextPage || resp.Repository.PullRequest.ReviewThreads.PageInfo.EndCursor == "" {
+			break
+		}
+		if page >= maxForgePages {
+			return nil, g.redact.error(forgePaginationCapErr("page", maxForgePages))
+		}
+		next := resp.Repository.PullRequest.ReviewThreads.PageInfo.EndCursor
+		threadCursor = &next
 	}
 	return m, nil
+}
+
+// reviewThreadCommentDBIDs pages the remaining comment databaseIds of one review
+// thread past the first page the outer reviewThreads query already returned. GitHub
+// cannot advance a nested connection cursor from the outer query, so it re-fetches
+// the thread node by id and walks its comments connection from afterCursor (the
+// outer page's comments.endCursor). It reuses graphqlDo and is backstopped by
+// maxForgePages exactly as the outer loop.
+func (g *github) reviewThreadCommentDBIDs(ctx context.Context, threadID, afterCursor string) ([]int64, error) {
+	const query = `query($threadId: ID!, $commentCursor: String) {
+  node(id: $threadId) {
+    ... on PullRequestReviewThread {
+      comments(first: 100, after: $commentCursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { databaseId }
+      }
+    }
+  }
+}`
+	var out []int64
+	cursor := afterCursor
+	page := 0
+	for {
+		page++
+		var resp struct {
+			Node struct {
+				Comments struct {
+					PageInfo struct {
+						HasNextPage bool   `json:"hasNextPage"`
+						EndCursor   string `json:"endCursor"`
+					} `json:"pageInfo"`
+					Nodes []struct {
+						DatabaseID int64 `json:"databaseId"`
+					} `json:"nodes"`
+				} `json:"comments"`
+			} `json:"node"`
+		}
+		vars := map[string]any{"threadId": threadID, "commentCursor": cursor}
+		if err := g.graphqlDo(ctx, query, vars, &resp); err != nil {
+			return nil, err
+		}
+		for _, cn := range resp.Node.Comments.Nodes {
+			out = append(out, cn.DatabaseID)
+		}
+		if len(out) > maxForgeItems {
+			return nil, g.redact.error(forgePaginationCapErr("item", maxForgeItems))
+		}
+		if !resp.Node.Comments.PageInfo.HasNextPage || resp.Node.Comments.PageInfo.EndCursor == "" {
+			break
+		}
+		if page >= maxForgePages {
+			return nil, g.redact.error(forgePaginationCapErr("page", maxForgePages))
+		}
+		cursor = resp.Node.Comments.PageInfo.EndCursor
+	}
+	return out, nil
 }
 
 // ReplyMergeRequestComment posts an in-thread reply keyed on replyID, the REST
