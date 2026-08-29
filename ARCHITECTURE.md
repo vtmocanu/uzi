@@ -1461,11 +1461,17 @@ on.
   **The two tiers' external egress is OPPOSITE, and a probe that does not name
   the tier is uninterpretable:** the **restricted** tier enforces the FQDN
   allowlist (`worker-fqdn-egress.yaml` over the `worker-networkpolicy.yaml`
-  default-deny floor — only `cache.nixos.org`, the forge, `*.anthropic.com`,
-  and, as of #285, the CNPG chart's OCI pair (`ghcr.io` +
-  `pkg-containers.githubusercontent.com`, replacing four GitHub-ish hosts —
-  `github.com` is **no longer allowlisted** on this tier); `api.github.com`
-  **TIMEOUT**, measured #123 §1),
+  default-deny floor — only `cache.nixos.org`, the forge (as of
+  [PRD #808](prds/808-worker-egress-single-source.md), derived from
+  `FORGE_ALLOWED_BASE_URLS` — one chart value, `forge.allowedBaseURLs`, feeds
+  both the api's SSRF allowlist and the restricted-tier FQDN list, so the two
+  can no longer drift apart), `*.anthropic.com`, `search.devbox.sh` (also
+  added by PRD #808 — a deliberate egress **widening** so the devbox package
+  resolver is reachable on this tier, backstopped by the server-side tier-1
+  admin allowlist rather than by egress being locked), and, as of #285, the
+  CNPG chart's OCI pair (`ghcr.io` + `pkg-containers.githubusercontent.com`,
+  replacing four GitHub-ish hosts — `github.com` is **no longer allowlisted**
+  on this tier); `api.github.com` **TIMEOUT**, measured #123 §1),
   while the **docker** tier reaches arbitrary internet hosts by design
   (`0.0.0.0/0`-except-in-cluster by CIDR, `worker-docker-networkpolicy.yaml`:
   `api.github.com` **200**, `search.devbox.sh` **404**) — [PRD #50](prds/50-llm-egress-proxy.md)'s
@@ -1473,7 +1479,12 @@ on.
   broken standard-tier allowlist; two false alarms have resulted (an operator
   during #123, and a closed #283 on 2026-08-09), so **check `uzi admin workers`
   → `docker:` (true = docker tier = broad egress) before concluding anything
-  about egress enforcement, and re-measure on the restricted tier.**
+  about egress enforcement, and re-measure on the restricted tier.** A
+  build-time completeness guard (`scripts/assert-chart-render.sh`, run inside
+  the `helm-chart` CI job) fails the render, naming the missing host, if any
+  canonical worker destination is absent from the rendered restricted-tier
+  allow-list — turning "the tight tier silently can't reach X" into a red gate
+  instead of a hung run.
   Both namespaces' Roles carry the same pinned-minimal verbs: Deployments/PVCs
   create/list/patch(Deployments only)/delete; Secrets **create/delete
   only** — no `get`/`list`, so the controller writes each worker's join

@@ -2,7 +2,7 @@
 
 **Issue**: #808
 **Priority**: Medium
-**Status**: Draft
+**Status**: merged, blocked-on-maintainer
 
 ## Problem
 
@@ -103,7 +103,7 @@ secure default that this PRD makes actually complete and self-maintaining.
 
 ## Milestones
 
-- [ ] **M1 — Single-source the forge egress from `FORGE_ALLOWED_BASE_URLS`.** Add a first-class chart
+- [x] **M1 — Single-source the forge egress from `FORGE_ALLOWED_BASE_URLS`.** Add a first-class chart
   value `forge.allowedBaseURLs` (a **list** of https base URLs). Render it into BOTH:
   (a) the api's `FORGE_ALLOWED_BASE_URLS` env as the **comma-joined** string — rendered **explicitly**
   (like `WORKER_HOSTING_ENABLED`), not through the freeform `.Values.api.config` map range; forbid or
@@ -119,7 +119,7 @@ secure default that this PRD makes actually complete and self-maintaining.
   forge **host** (no port) as an `Allow` entry; pre-change templates (which don't read the new value)
   render no forge FQDN, so the assertion fails against pre-change code.
 
-- [ ] **M2 — Completeness guard folded into `scripts/assert-chart-render.sh` (no workflow edit).**
+- [x] **M2 — Completeness guard folded into `scripts/assert-chart-render.sh` (no workflow edit).**
   Extend the **already-invoked** `assert-chart-render.sh` to parse the rendered FQDN `NetworkPolicy`
   (namespaced `crd.antrea.io/v1beta1`; collect `spec.egress[].to[].fqdn` where `action == Allow`,
   skipping `Drop`/`denyCIDRs`) and **fail (naming the missing host) if the rendered `allow-fqdn` set
@@ -133,7 +133,7 @@ secure default that this PRD makes actually complete and self-maintaining.
   `helm-chart` job with the host named; a malformed/empty render exits 2, not 0; **no
   `.github/workflows/**` file is touched** (the script is already called by the job).
 
-- [ ] **M3 — Correct the egress docs + record the model.** Update `docs/worker-setup.md` and
+- [x] **M3 — Correct the egress docs + record the model.** Update `docs/worker-setup.md` and
   `docs/worker-tools.md` so tool-provisioning egress names the **devbox resolver**
   (`search.devbox.sh`) alongside the nix substituter. **Be tier-explicit and honest about the change**
   (this is a known trap — a false claim here has been filed and retracted before): on the kube-native
