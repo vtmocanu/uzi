@@ -4641,8 +4641,18 @@ export const mockApi = {
     if (existing) return delay(scheduleDTO(existing));
     const s = materializeDefault(entry, repoId, nextScheduleId());
     // On the fresh-materialize path only, an optional detected browser timezone (issue
-    // #660) overrides the catalog zone; an empty/absent tz keeps the catalog zone.
-    if (timezone) s.timezone = timezone;
+    // #660) overrides the catalog zone; an empty/absent tz keeps the catalog zone. Mirror
+    // the production handler: trim, and reject an invalid IANA name (Intl throws a
+    // RangeError on both a bogus name and the "Local" sentinel) with a 400.
+    const tz = timezone?.trim();
+    if (tz) {
+      try {
+        Intl.DateTimeFormat(undefined, { timeZone: tz });
+      } catch {
+        throw new ApiError(400, "invalid timezone");
+      }
+      s.timezone = tz;
+    }
     schedules = [s, ...schedules];
     return delay(scheduleDTO(s), 200);
   },

@@ -46,11 +46,19 @@ describe("mock default-jobs catalog (PRD #589)", () => {
     const created = await mockApi.enableCatalogSchedule("repo-www", "bug-triage", "Europe/Bucharest");
     expect(created.timezone).toBe("Europe/Bucharest");
 
-    // A plain enable (no tz) keeps the catalog/default zone — the no-body path is byte-identical
-    // to before. bug-triage's catalog zone is UTC.
-    const plain = await mockApi.enableCatalogSchedule("repo-payments", "bug-triage");
-    const entry = (await mockApi.listScheduleCatalog()).entries.find((e) => e.slug === "bug-triage")!;
+    // A plain enable (no tz) on a GENUINELY FRESH (repo, slug) — not an already-materialized
+    // one, which would hit the idempotent re-enable branch and mask a wrong fresh default —
+    // keeps the catalog/default zone. (repo-atlas, docs-hygiene) is unmaterialized in seed and
+    // untouched by every other test here.
+    const plain = await mockApi.enableCatalogSchedule("repo-atlas", "docs-hygiene");
+    const entry = (await mockApi.listScheduleCatalog()).entries.find((e) => e.slug === "docs-hygiene")!;
     expect(plain.timezone).toBe(entry.timezone);
+
+    // An invalid IANA name on a fresh enable rejects with a 400, mirroring the production
+    // handler (before this the mock stored any string unchecked).
+    await expect(mockApi.enableCatalogSchedule("repo-atlas", "planned-sweep", "Not/AZone")).rejects.toMatchObject({
+      status: 400,
+    });
 
     // The idempotent re-enable with a DIFFERENT tz does NOT clobber the stored zone
     // (mirrors the server's ON CONFLICT DO NOTHING — the AC in commit 265313a4).

@@ -197,9 +197,17 @@ func TestEnableCatalogScheduleTimezoneOverrideLiveDB(t *testing.T) {
 	}
 
 	// An invalid IANA name is a 400 (on a third repo so the check is independent of state).
+	// A 400 short-circuits before CreateDefaultSchedule, so repoC stays unmaterialized and
+	// the "Local" check below can reuse it.
 	repoC := f.insertRepo(ctx, t, f.owner, 3, "g/sched-tz-c")
 	if _, code := f.enableCatalogBody(t, f.owner.ID, repoC, "docs-hygiene", `{"timezone":"Not/AZone"}`); code != http.StatusBadRequest {
 		t.Fatalf("invalid timezone enable status = %d, want 400", code)
+	}
+
+	// The "Local" sentinel is rejected too: time.LoadLocation("Local") would otherwise
+	// resolve to the server's local zone, making the schedule fire in the deployment's zone.
+	if _, code := f.enableCatalogBody(t, f.owner.ID, repoC, "docs-hygiene", `{"timezone":"Local"}`); code != http.StatusBadRequest {
+		t.Fatalf("\"Local\" timezone enable status = %d, want 400", code)
 	}
 }
 

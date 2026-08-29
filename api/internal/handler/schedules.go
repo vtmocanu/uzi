@@ -634,6 +634,13 @@ func (h *Handler) EnableCatalogSchedule(w http.ResponseWriter, r *http.Request) 
 	}
 	tz := catalogTimezone(job)
 	if override := strings.TrimSpace(req.Timezone); override != "" {
+		// Reject the "Local" sentinel: time.LoadLocation("Local") succeeds and resolves to
+		// the server's time.Local, which would make the schedule fire in the deployment's
+		// zone instead of a real IANA one. Any other invalid name fails LoadLocation below.
+		if override == "Local" {
+			httpx.Error(w, http.StatusBadRequest, "invalid timezone")
+			return
+		}
 		if _, lerr := time.LoadLocation(override); lerr != nil {
 			httpx.Error(w, http.StatusBadRequest, "invalid timezone")
 			return
