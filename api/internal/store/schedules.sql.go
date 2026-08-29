@@ -901,6 +901,7 @@ SET cron_expr     = $1,
     wait_on_limit = $5,
     max_issues    = $6,
     guidance      = NULL,
+    override_subagent_model = false,
     next_fire_at  = $7,
     customized    = false,
     status        = 'active',
@@ -926,8 +927,11 @@ type ResetDefaultScheduleParams struct {
 // row can never be reset through this path (the handler 409s that case before calling).
 // The prompt/labels stay NULL (catalog-owned); guidance is explicitly cleared to NULL here
 // because a prompt default can carry owner-editable guidance (issue #662) and a Reset must
-// drop it back to the catalog baseline. next_fire_at is recomputed in Go from the catalog
-// cron+timezone and passed in.
+// drop it back to the catalog baseline. override_subagent_model is likewise reset to the
+// catalog baseline (false) because a default now carries it as an owner-editable run option
+// (issue #691). Both are written as SQL literals rather than left to the column's DB DEFAULT:
+// a Reset is an UPDATE, so the DEFAULT never re-applies and the field must be set explicitly.
+// next_fire_at is recomputed in Go from the catalog cron+timezone and passed in.
 func (q *Queries) ResetDefaultSchedule(ctx context.Context, arg ResetDefaultScheduleParams) (RunSchedule, error) {
 	row := q.db.QueryRow(ctx, resetDefaultSchedule,
 		arg.CronExpr,
