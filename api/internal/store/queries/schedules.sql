@@ -232,9 +232,18 @@ RETURNING *;
 
 -- name: ListSweepCandidateIssues :many
 -- The sweep sibling of ListAutopilotCandidateIssues (autopilot.sql): open cached
--- issues in a repo that carry ALL of the selected labels. The caller passes a jsonb
--- array of labels (an empty selector is resolved to the uzi label in Go before
--- calling, PRD #764), and jsonb containment (@>) matches rows whose labels array is a superset.
+-- issues in a repo chosen by the schedule's selector kind (PRD #767 M4). @selector
+-- discriminates between the two kinds:
+--   - 'label': match issues carrying ALL of @labels (jsonb containment @> matches rows
+--     whose labels array is a superset). The caller passes a jsonb array of labels — an
+--     empty selector is resolved to the uzi label in Go before calling (PRD #764).
+--   - 'assigned': match issues assigned to the uzi-bot account, by NUMERIC membership of
+--     @bot_id in assignee_ids. Note the form is `assignee_ids @> to_jsonb(@bot_id::bigint)`
+--     (numeric containment) and NOT jsonb_exists, which is string-only and never matches a
+--     JSON number (PRD #767 R3, jsonb numeric-membership trap). The `@bot_id > 0` guard
+--     mirrors the autopilot path: an unresolved/zero bot id must never match every assigned
+--     issue. The assigned branch ignores @labels (the caller passes '[]' to keep the cast
+--     valid).
 -- author rides along for the same adder→author attribution fallback the autopilot
 -- path uses.
 --
@@ -246,7 +255,10 @@ RETURNING *;
 SELECT forge_issue_iid, author
 FROM issues
 WHERE repo_id = @repo_id AND state = 'opened'
-  AND labels @> @labels::jsonb
+  AND (
+    (@selector::text = 'label' AND labels @> @labels::jsonb)
+    OR (@selector::text = 'assigned' AND @bot_id::bigint > 0 AND assignee_ids @> to_jsonb(@bot_id::bigint))
+  )
 ORDER BY forge_issue_iid ASC
 LIMIT sqlc.narg('max_issues');
 
@@ -256,11 +268,17 @@ LIMIT sqlc.narg('max_issues');
 -- WITHOUT the max_issues LIMIT. fireSweep compares this against the (capped) candidate set
 -- it fetched to know the cap truncated newer eligible issues. It is called only when the
 -- schedule carries a set cap (a NULL cap can never truncate → Capped stays false), so the
--- extra count never runs on the unbounded path.
+-- extra count never runs on the unbounded path. @selector/@bot_id discriminate the label
+-- vs. assigned kinds exactly as in ListSweepCandidateIssues — the assigned branch uses the
+-- numeric-containment form `assignee_ids @> to_jsonb(@bot_id::bigint)` (NOT jsonb_exists,
+-- which is string-only), guarded by `@bot_id > 0` (PRD #767 M4/R3).
 SELECT count(*)
 FROM issues
 WHERE repo_id = @repo_id AND state = 'opened'
-  AND labels @> @labels::jsonb;
+  AND (
+    (@selector::text = 'label' AND labels @> @labels::jsonb)
+    OR (@selector::text = 'assigned' AND @bot_id::bigint > 0 AND assignee_ids @> to_jsonb(@bot_id::bigint))
+  );
 
 -- name: HasActiveRunForSchedule :one
 -- Whether a non-terminal prompt run already exists for this schedule. The pre-check

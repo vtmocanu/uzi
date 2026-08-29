@@ -11,14 +11,14 @@ import (
 )
 
 // catalogSlugs is the exact set of default scheduled jobs the product ships
-// (PRD #589 M1, extended by PRD #590 M1 with self-improve). Keep it sorted —
-// Catalog() returns its slice sorted by slug and TestCatalogSetIsExactlySeven
-// compares index-for-index.
+// (PRD #589 M1, extended by PRD #590 M1 with self-improve and PRD #767 M4 with
+// assigned-sweep). Keep it sorted — Catalog() returns its slice sorted by slug and
+// TestCatalogSetIsExactlyEight compares index-for-index.
 var catalogSlugs = []string{
-	"bug-hunt", "bug-triage", "docs-hygiene", "feature-bingo", "planned-sweep", "self-improve", "test-improvement",
+	"assigned-sweep", "bug-hunt", "bug-triage", "docs-hygiene", "feature-bingo", "planned-sweep", "self-improve", "test-improvement",
 }
 
-func TestCatalogSetIsExactlySeven(t *testing.T) {
+func TestCatalogSetIsExactlyEight(t *testing.T) {
 	got := schedtmpl.Catalog()
 	if len(got) != len(catalogSlugs) {
 		t.Fatalf("got %d catalog entries, want %d", len(got), len(catalogSlugs))
@@ -77,13 +77,28 @@ func TestCatalogParseAndValid(t *testing.T) {
 				t.Errorf("catalog %q (prompt) must not carry labels, got %v", j.Slug, j.Labels)
 			}
 		case "sweep":
-			if len(j.Labels) == 0 {
-				t.Errorf("catalog %q (sweep) has no labels", j.Slug)
-			}
-			for _, l := range j.Labels {
-				if l != strings.TrimSpace(l) || l == "" {
-					t.Errorf("catalog %q (sweep) has a blank or padded label %q", j.Slug, l)
+			// PRD #767 M4: a sweep is label-selected XOR assignment-selected. A label
+			// sweep must carry labels; an assigned sweep must carry NONE (it selects by
+			// the uzi-bot assignee at fire time).
+			switch j.SelectorKind {
+			case schedtmpl.SelectorAssigned:
+				if len(j.Labels) != 0 {
+					t.Errorf("catalog %q (assigned sweep) must not carry labels, got %v", j.Slug, j.Labels)
 				}
+				if strings.TrimSpace(j.Guidance) == "" {
+					t.Errorf("catalog %q (assigned sweep) has empty per-issue guidance", j.Slug)
+				}
+			case schedtmpl.SelectorLabel:
+				if len(j.Labels) == 0 {
+					t.Errorf("catalog %q (label sweep) has no labels", j.Slug)
+				}
+				for _, l := range j.Labels {
+					if l != strings.TrimSpace(l) || l == "" {
+						t.Errorf("catalog %q (sweep) has a blank or padded label %q", j.Slug, l)
+					}
+				}
+			default:
+				t.Errorf("catalog %q (sweep) has unexpected selector kind %q", j.Slug, j.SelectorKind)
 			}
 			if j.Prompt != "" {
 				t.Errorf("catalog %q (sweep) must not carry a prompt, got %q", j.Slug, j.Prompt)
@@ -106,6 +121,42 @@ func TestCatalogParseAndValid(t *testing.T) {
 			}
 		default:
 			t.Errorf("catalog %q has unknown target %q", j.Slug, j.Target)
+		}
+	}
+}
+
+// TestAssignedSweepCatalogEntry pins the PRD #767 M4 assigned-sweep default: it parses
+// as a sweep with SelectorKind "assigned", carries NO labels (it selects by the uzi-bot
+// assignee at fire time, not a label), and keeps a non-empty per-issue guidance body.
+func TestAssignedSweepCatalogEntry(t *testing.T) {
+	j, ok := schedtmpl.BySlug("assigned-sweep")
+	if !ok {
+		t.Fatal("assigned-sweep catalog entry missing")
+	}
+	if j.Target != "sweep" {
+		t.Fatalf("assigned-sweep target = %q, want sweep", j.Target)
+	}
+	if j.SelectorKind != schedtmpl.SelectorAssigned {
+		t.Fatalf("assigned-sweep selector kind = %q, want %q", j.SelectorKind, schedtmpl.SelectorAssigned)
+	}
+	if len(j.Labels) != 0 {
+		t.Fatalf("assigned-sweep must carry no labels, got %v", j.Labels)
+	}
+	if strings.TrimSpace(j.Guidance) == "" {
+		t.Fatal("assigned-sweep must carry non-empty per-issue guidance")
+	}
+}
+
+// TestSweepSelectorDefaultsToLabel pins that every label sweep (and every non-sweep entry)
+// resolves SelectorKind to "label", never "" — so callers can branch on the kind without a
+// blank third case.
+func TestSweepSelectorDefaultsToLabel(t *testing.T) {
+	for _, j := range schedtmpl.Catalog() {
+		if j.Slug == "assigned-sweep" {
+			continue
+		}
+		if j.SelectorKind != schedtmpl.SelectorLabel {
+			t.Errorf("catalog %q selector kind = %q, want %q (the default)", j.Slug, j.SelectorKind, schedtmpl.SelectorLabel)
 		}
 	}
 }

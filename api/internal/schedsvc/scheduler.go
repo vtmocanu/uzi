@@ -338,6 +338,12 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 	// and createIssueRun's composeRunDescription transparently use the catalog values. A gone
 	// catalog entry can never resolve → permanent park (errBadConfig), not a tick-storm. A
 	// user-origin row is byte-for-byte unchanged — the resolver engages ONLY for origin='default'.
+	// selectorKind decides how candidates are chosen (PRD #767 M4). It is catalog-owned:
+	// store.RunSchedule has no SelectorKind column (a default row resolves it from its
+	// catalog entry at fire time, like labels/guidance), and a user-origin sweep is always
+	// label-selected. So it lives in this LOCAL variable, defaulting to "label" and only
+	// overridden inside the default-origin overlay below.
+	selectorKind := schedtmpl.SelectorLabel
 	if sched.Origin == "default" {
 		job, ok := e.catalog(sched.CatalogSlug.String)
 		if !ok {
@@ -349,14 +355,35 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 		}
 		sched.Labels = labelsJSON
 		sched.Guidance = pgtype.Text{String: job.Guidance, Valid: job.Guidance != ""}
+		if job.SelectorKind != "" {
+			selectorKind = job.SelectorKind
+		}
 	}
 	repo, f, err := e.resolveRepoForge(ctx, sched)
 	if err != nil {
 		return FireOutcome{}, err
 	}
-	labelsJSON, err := e.resolveSweepLabels(ctx, sched.Labels)
-	if err != nil {
-		return FireOutcome{}, err
+
+	// Resolve the candidate-query selector params by kind. The assigned kind must NOT go
+	// through resolveSweepLabels — that defaults an empty selector to the uzi label (the
+	// empty→uzi bypass this milestone requires); assignment is selected purely by the
+	// connection's numeric bot_forge_user_id. The '[]' labels keep the @labels::jsonb cast
+	// valid even though the assigned branch of the query ignores it.
+	var (
+		querySelector = selectorKind
+		labelsJSON    []byte
+		botID         int64
+	)
+	switch selectorKind {
+	case schedtmpl.SelectorAssigned:
+		labelsJSON = []byte("[]")
+		botID = repo.BotForgeUserID
+	default: // schedtmpl.SelectorLabel
+		querySelector = schedtmpl.SelectorLabel
+		labelsJSON, err = e.resolveSweepLabels(ctx, sched.Labels)
+		if err != nil {
+			return FireOutcome{}, err
+		}
 	}
 	// Backfill scan window (issue #416): fetch max_issues + backfillHeadroom candidates so
 	// the loop below can walk past skipped slots and still start up to max_issues runs. The
@@ -367,7 +394,7 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 		scanLimit = pgtype.Int4{Int32: sched.MaxIssues.Int32 + backfillHeadroom, Valid: true}
 	}
 	candidates, err := e.store.ListSweepCandidateIssues(ctx, store.ListSweepCandidateIssuesParams{
-		RepoID: repo.ID, Labels: labelsJSON, MaxIssues: scanLimit,
+		RepoID: repo.ID, Selector: querySelector, Labels: labelsJSON, BotID: botID, MaxIssues: scanLimit,
 	})
 	if err != nil {
 		return FireOutcome{}, err // transient DB error
@@ -384,7 +411,7 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 	capped := false
 	if sched.MaxIssues.Valid {
 		total, err := e.store.CountSweepCandidateIssues(ctx, store.CountSweepCandidateIssuesParams{
-			RepoID: repo.ID, Labels: labelsJSON,
+			RepoID: repo.ID, Selector: querySelector, Labels: labelsJSON, BotID: botID,
 		})
 		if err != nil {
 			return FireOutcome{}, err // transient DB error
