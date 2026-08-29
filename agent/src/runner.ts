@@ -970,6 +970,9 @@ export class RunRunner {
         memory,
         // Issue #297: the self_improve in-flight avoid-set (best-effort; absent ⇒ empty).
         inflightTargets: claim.inflight_targets,
+        // PRD #686 D11: the open self-improve MRs' "what was proposed" text (best-effort;
+        // absent ⇒ empty, so the picker's non-overlap block is simply omitted).
+        openSelfImproveMRs: claim.self_improve_open_mrs,
         // PRD #686 M4: dogfood flag (absent ⇒ generic; older server never sets it).
         selfImproveDogfood: claim.self_improve_dogfood,
         config: claim.config,

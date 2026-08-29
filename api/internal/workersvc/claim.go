@@ -232,6 +232,17 @@ type ClaimPayload struct {
 	// must not appear on the wire; an older worker ignores it.
 	InflightTargets []string `json:"inflight_targets,omitempty"`
 
+	// SelfImproveOpenMRs is a best-effort list of the "what was proposed" text of the
+	// repo's currently-OPEN self-improve MRs (PRD #686 D11), attached only to a
+	// self_improve claim so the picker chooses a NON-OVERLAPPING improvement. Each entry
+	// is the first non-empty line of that run's proposed change (plan_md if present, else
+	// the run's issue_description), trimmed. UNTRUSTED CONTENT — model-authored run text —
+	// rendered nonce-fenced by the agent with a non-overlap instruction OUTSIDE the fence,
+	// never as instructions. omitempty: absent ⇒ none (no open self-improve MRs, or the
+	// forge could not be reached); an older worker ignores it, and every other kind's claim
+	// stays byte-identical to today's.
+	SelfImproveOpenMRs []string `json:"self_improve_open_mrs,omitempty"`
+
 	// SelfImproveDogfood is true ONLY for a self_improve run whose repo opted into uzi
 	// dogfooding (repos.fold_improve_uzi_backlog, PRD #686 M1). The worker uses it to
 	// pick the uzi-vs-generic trusted self-improve directive (m4 consumes it). ABSENT/

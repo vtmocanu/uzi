@@ -36,6 +36,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/autoselectrow"
 	"github.com/vtmocanu/uzi/api/internal/board"
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	"github.com/vtmocanu/uzi/api/internal/planpolicy"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
@@ -368,6 +369,10 @@ type Store interface {
 	// carried on a judge claim (issue #232): frequency-ranked, canonical-deduped, capped,
 	// so the judge reuses an exact coordinate instead of inventing new phrasing.
 	ListKnownImproveUziTargetsForUser(ctx context.Context, arg store.ListKnownImproveUziTargetsForUserParams) ([]string, error)
+	// RecentSelfImproveMRRunsForRepo is the repo's recent MR-bearing self_improve runs,
+	// bounded (PRD #686 D12). Feeds the self_improve claim's open-MR picker context (D11):
+	// each candidate's open-state is resolved LIVE from the forge, never from runs.mr_state.
+	RecentSelfImproveMRRunsForRepo(ctx context.Context, arg store.RecentSelfImproveMRRunsForRepoParams) ([]store.RecentSelfImproveMRRunsForRepoRow, error)
 	ListRunInputsForRun(ctx context.Context, arg store.ListRunInputsForRunParams) ([]store.RunUserInput, error)
 	UpsertRunReviewWithRecommendations(ctx context.Context, arg store.UpsertRunReviewWithRecommendationsParams) (uuid.UUID, error)
 	// Judge review read side (PRD #46 M4): the run-page verdict + recommendations panel.
@@ -2331,6 +2336,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// self_improve-only; every other kind's claim stays byte-identical to today's.
 	if run.Kind == RunKindSelfImprove {
 		payload.InflightTargets = s.inflightTargets(ctx, run)
+		// PRD #686 M10 (D11/D12): the repo's currently-OPEN self-improve MRs' "what was
+		// proposed" text, so the picker chooses a non-overlapping improvement. Best-effort
+		// and forge-sourced; empty ⇒ omitted so the wire stays byte-identical.
+		payload.SelfImproveOpenMRs = s.selfImproveOpenMRs(ctx, run, rc)
 		// PRD #686 M3: true only for a repo that opted into uzi dogfooding
 		// (repos.fold_improve_uzi_backlog, read from the same GetRunClaimContextRow as
 		// RepoDevboxOptIn above); false ⇒ the worker runs the generic directive (m4).
@@ -2427,6 +2436,98 @@ func formatInflightLine(r store.Run) string {
 		line = line[:cut]
 	}
 	return line
+}
+
+// maxOpenSelfImproveMRCandidates bounds how many recent MR-bearing self_improve runs
+// the open-MR picker context checks live against the forge (PRD #686 D11/D12). Cycles are
+// days apart and the concurrent-open cap is small, so a tiny window covers every
+// plausibly-open MR without an unbounded historical scan. Mirrors schedsvc's
+// selfImproveMRCandidateWindow.
+const maxOpenSelfImproveMRCandidates = 10
+
+// maxOpenSelfImproveMRs caps the open-MR "what was proposed" lines handed to the picker
+// (PRD #686 D11). At most 2 can be open per the concurrent-open cap (schedsvc), but this
+// stays generous so a transient over-cap window still renders every open MR.
+const maxOpenSelfImproveMRs = 5
+
+// selfImproveOpenMRs builds the self_improve open-MR picker context at claim time (PRD
+// #686 D11): the "what was proposed" text of the repo's currently-OPEN self-improve MRs,
+// so the picker chooses a non-overlapping improvement. Best-effort throughout — any
+// query/forge error yields nil (or skips the offending candidate) and NEVER fails the
+// claim, mirroring inflightTargets' posture. Unlike m9's fire-time cap (which must be
+// strict), this is advisory context, so a per-candidate GetMergeRequest error skips only
+// that candidate and the loop continues.
+//
+// Open-state is resolved LIVE from the forge per candidate (D12): runs.mr_state is
+// unreliable for this multi-MR-per-tracking-issue lane. The proposed text comes from the
+// RUN ROW (plan_md if present, else issue_description — plan_md is NULL for autopilot
+// self_improve runs today, so issue_description is the effective source), never from the
+// MR title/body: GetMergeRequest is used ONLY for the open-state check.
+func (s *Service) selfImproveOpenMRs(ctx context.Context, run store.Run, rc store.GetRunClaimContextRow) []string {
+	if s.forges == nil {
+		return nil
+	}
+	f, err := s.forges.ForgeForConnection(rc.ForgeType, rc.BaseUrl, rc.TokenCiphertext)
+	if err != nil {
+		slog.Warn("self_improve claim: build forge for open-MR set", "run", run.ID.String(), "error", err)
+		return nil
+	}
+	rows, err := s.q.RecentSelfImproveMRRunsForRepo(ctx, store.RecentSelfImproveMRRunsForRepoParams{
+		RepoID: uuid.UUID(run.RepoID.Bytes),
+		Lim:    maxOpenSelfImproveMRCandidates,
+	})
+	if err != nil {
+		slog.Warn("self_improve claim: list recent self-improve MR runs", "run", run.ID.String(), "error", err)
+		return nil
+	}
+	var out []string
+	for _, row := range rows {
+		if row.ID == run.ID || !row.MrIid.Valid {
+			continue // exclude self and any row without an MR iid
+		}
+		mr, err := f.GetMergeRequest(ctx, rc.ForgeProjectID, row.MrIid.Int64)
+		if err != nil {
+			// Best-effort: this is advisory context, not the strict fire-time cap, so a
+			// per-candidate forge error skips only this candidate and the loop continues.
+			slog.Warn("self_improve claim: check open-MR state", "run", run.ID.String(), "mr_iid", row.MrIid.Int64, "error", err)
+			continue
+		}
+		if mr.State != forge.MRStateOpened {
+			continue
+		}
+		proposed := row.IssueDescription
+		if row.PlanMd.Valid && strings.TrimSpace(row.PlanMd.String) != "" {
+			proposed = row.PlanMd.String
+		}
+		if line := firstNonEmptyLine(proposed); line != "" {
+			out = append(out, line)
+			if len(out) >= maxOpenSelfImproveMRs {
+				break
+			}
+		}
+	}
+	return out
+}
+
+// firstNonEmptyLine returns the first non-blank line of s, trimmed and bounded to
+// maxInflightLineLen on a rune boundary (the same untrusted-text bound the in-flight set
+// uses). Empty when s has no non-blank line.
+func firstNonEmptyLine(s string) string {
+	for _, raw := range strings.Split(s, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if len(line) > maxInflightLineLen {
+			cut := maxInflightLineLen
+			for cut > 0 && !utf8.RuneStart(line[cut]) {
+				cut--
+			}
+			line = strings.TrimSpace(line[:cut])
+		}
+		return line
+	}
+	return ""
 }
 
 // errToolPackagesRejected marks a claim whose grandfathered tool packages fell out
