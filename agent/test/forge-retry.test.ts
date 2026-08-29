@@ -94,6 +94,20 @@ describe("classifyForgeError", () => {
       ),
       want: "permanent",
     },
+    // (x) issue #775: the `could not connect to server` trailer, ISOLATED (no "Failed to
+    // connect"). Case (vii) carries BOTH phrases, so /could not connect to server/i is
+    // redundant there — dropping the matcher still passes via /failed to connect/i. This
+    // case has ONLY the trailer, so it independently pins /could not connect to server/i:
+    // remove that pattern and this falls through to the permanent default. Note "could not
+    // connect" does NOT match the pre-existing /couldn'?t connect/i (that needs "couldn't"/
+    // "couldnt"), so this matcher is the sole reason it classifies transient.
+    {
+      name: "isolated 'Could not connect to server' trailer (issue #775)",
+      err: new Error(
+        "fatal: unable to access 'https://github.com/vtmocanu/uzi.git/': Could not connect to server",
+      ),
+      want: "transient",
+    },
   ];
 
   const exercised = new Set<string>();
