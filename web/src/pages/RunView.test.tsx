@@ -20,6 +20,7 @@ import {
   RunHeading,
   RunCompletedLine,
   RunFailureReason,
+  RunStopReason,
   HealthFlag,
   LimitWaitPanel,
   RunView,
@@ -113,6 +114,7 @@ function run(over: Partial<Run>): Run {
     mr_state: null,
     failure_reason: null,
     stop_kind: null,
+    stop_reason: null,
     health: "ok",
     health_reason: null,
     health_since: null,
@@ -782,6 +784,33 @@ describe("RunFailureReason — the worker-supplied failure reason (#124, text ch
   it("renders nothing when there is no reason", () => {
     const { container } = render(
       <RunFailureReason run={run({ failure_reason: null })} />,
+    );
+    expect(container.textContent).toBe("");
+  });
+});
+
+// Issue #525: the operator's free-text cancel reason. It rides the owner-scoped run DTO
+// and is rendered in the stopped/failed hero beside failure_reason — the live-poller cancel
+// path leaves failure_reason the generic "run cancelled", so this is the line that says WHY.
+// Untrusted free text, same channel as failure_reason, so it must go through stripUnsafeChars.
+describe("RunStopReason — the operator's cancel reason (#525, text channel)", () => {
+  it("renders the reason (bidi/zero-width stripped) for a stopped run that carries one", () => {
+    const { container } = render(
+      <RunStopReason
+        run={run({
+          status: "cancelled",
+          stop_kind: "cancelled",
+          stop_reason: "wrong \u202Ebranch\u200B, restarting",
+        })}
+      />,
+    );
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(container.textContent).toBe("Reason: wrong branch, restarting");
+  });
+
+  it("renders nothing when there is no stop reason", () => {
+    const { container } = render(
+      <RunStopReason run={run({ status: "cancelled", stop_kind: "cancelled", stop_reason: null })} />,
     );
     expect(container.textContent).toBe("");
   });

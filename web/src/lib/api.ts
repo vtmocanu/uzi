@@ -556,6 +556,10 @@ export interface LatestRun {
   // non-stop run. Read by isStoppedRun, which renders the two HUMAN kinds as a calm
   // "stopped" and deliberately leaves "auto_stopped" looking like the breakage it is.
   stop_kind: StopKind | null;
+  // issue #525: the operator's OPTIONAL free-text cancel reason. Owner-gated on the
+  // shared board (the server sends it only to the run's owner, like failure_reason;
+  // a non-owner viewer gets null). Untrusted free text — render via stripUnsafeChars.
+  stop_reason: string | null;
   // issue #321: server-computed planning-phase display flag (true only while a run is
   // in its pre-approval PLANNING turn — running, iteration 0, no persisted plan yet).
   // OPTIONAL for the SAME api/web rollout skew as plan_source: a mid-deploy api pod that
@@ -1694,6 +1698,10 @@ export interface Run {
    *  "plan_rejected" (human), "auto_stopped" (server), null otherwise. isStoppedRun
    *  reads this, not failure_reason — and treats only the two human kinds as calm. */
   stop_kind: StopKind | null;
+  /** issue #525: the operator's OPTIONAL free-text cancel reason, stamped beside
+   *  stop_kind on the cancel paths. This DTO is owner/admin-scoped, so it rides
+   *  unconditionally (like failure_reason). Untrusted free text — via stripUnsafeChars. */
+  stop_reason: string | null;
   /** Run-health flag (PRD #47). This owner-scoped DTO carries health_reason
    *  unconditionally (the run view is owner/admin only); health_since drives the
    *  header's "stuck for Xm". */

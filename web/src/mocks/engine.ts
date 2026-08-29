@@ -595,6 +595,7 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
         // The server stamps the deliberate-stop signal (PRD #33), so a cancel that
         // lands as `failed` still renders the calm "stopped" badge, not "failed".
         stop_kind: "cancelled",
+        stop_reason: "wrong branch, restarting",
         finished_at: new Date().toISOString(),
       });
       return null;
