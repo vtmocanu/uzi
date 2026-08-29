@@ -24,7 +24,7 @@ func TestMapLatestRun(t *testing.T) {
 	updated := created.Add(5 * time.Minute)
 
 	t.Run("owner's run maps all fields and is mine", func(t *testing.T) {
-		dto := mapLatestRun(runID, viewer, "completed", "issue", 2, true, i8(7), txt("https://gl.example/x/-/merge_requests/7"), txt("merged"), txt("boom"), nullTxt(),
+		dto := mapLatestRun(runID, viewer, "completed", "issue", 2, true, i8(7), txt("https://gl.example/x/-/merge_requests/7"), txt("merged"), txt("boom"), nullTxt(), nullTxt(),
 			"ok", nullTxt(), pgtype.Timestamptz{},
 			txt("Vlad"), txt("laptop"), 3, tstamp(created), tstamp(updated), viewer)
 		if dto.IsPlanning {
@@ -70,7 +70,7 @@ func TestMapLatestRun(t *testing.T) {
 		// reject reason or a raw agent error). stop_kind (a non-sensitive enum) stays
 		// visible so the badge can still classify the run as stopped.
 		dto := mapLatestRun(runID, otherOwner, "failed", "issue", 3, false, pgtype.Int8{}, nullTxt(), nullTxt(),
-			txt("panic: raw agent internals"), txt("plan_rejected"),
+			txt("panic: raw agent internals"), txt("plan_rejected"), nullTxt(),
 			"ok", nullTxt(), pgtype.Timestamptz{},
 			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
 		if dto.IsMine {
@@ -96,8 +96,42 @@ func TestMapLatestRun(t *testing.T) {
 		}
 	})
 
+	t.Run("stop_reason is owner-gated free text; stop_kind stays exposed (issue #525)", func(t *testing.T) {
+		otherOwner := uuid.New()
+		// stop_reason is the operator's OPTIONAL free-text cancel reason. Like
+		// failure_reason it can carry verbatim typed text, so a shared board must gate
+		// it to the owner (Decision 5). stop_kind (a non-sensitive enum) stays visible.
+
+		// (a) The owner sees the reason.
+		mine := mapLatestRun(runID, viewer, "cancelled", "issue", 3, false, pgtype.Int8{}, nullTxt(), nullTxt(),
+			nullTxt(), txt("cancelled"), txt("wrong branch, my mistake"),
+			"ok", nullTxt(), pgtype.Timestamptz{},
+			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
+		if mine.StopReason == nil || *mine.StopReason != "wrong branch, my mistake" {
+			t.Fatalf("owner must see stop_reason, got %v", mine.StopReason)
+		}
+		if mine.StopKind == nil || *mine.StopKind != "cancelled" {
+			t.Fatalf("owner stop_kind should be carried, got %v", mine.StopKind)
+		}
+
+		// (b) A non-owner viewer does NOT see the reason, but stop_kind stays exposed.
+		theirs := mapLatestRun(runID, otherOwner, "cancelled", "issue", 3, false, pgtype.Int8{}, nullTxt(), nullTxt(),
+			nullTxt(), txt("cancelled"), txt("wrong branch, my mistake"),
+			"ok", nullTxt(), pgtype.Timestamptz{},
+			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
+		if theirs.IsMine {
+			t.Fatal("a run owned by someone else must not be is_mine")
+		}
+		if theirs.StopReason != nil {
+			t.Fatalf("stop_reason must be withheld from a non-owner viewer, got %q", *theirs.StopReason)
+		}
+		if theirs.StopKind == nil || *theirs.StopKind != "cancelled" {
+			t.Fatalf("stop_kind must stay exposed to a non-owner viewer, got %v", theirs.StopKind)
+		}
+	})
+
 	t.Run("blank display name leaves owner name empty", func(t *testing.T) {
-		dto := mapLatestRun(runID, viewer, "queued", "issue", 0, false, pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(),
+		dto := mapLatestRun(runID, viewer, "queued", "issue", 0, false, pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(), nullTxt(),
 			"ok", nullTxt(), pgtype.Timestamptz{},
 			txt(""), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
 		if dto.IsPlanning {
@@ -111,7 +145,7 @@ func TestMapLatestRun(t *testing.T) {
 	t.Run("health: enum + since unconditional, reason owner-gated (PRD #47)", func(t *testing.T) {
 		since := created.Add(2 * time.Minute)
 		// The owner of a flagged run sees the enum, the since, AND the reason.
-		mine := mapLatestRun(runID, viewer, "running", "issue", 0, false, pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(),
+		mine := mapLatestRun(runID, viewer, "running", "issue", 0, false, pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(), nullTxt(),
 			"waiting_worker", txt("your vault is locked"), tstamp(since),
 			txt("Vlad"), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
 		// This owner's run is running at iteration 0 with no persisted plan: the board card
@@ -132,7 +166,7 @@ func TestMapLatestRun(t *testing.T) {
 		// A non-owner viewer gets the enum and the since (non-sensitive, like stop_kind)
 		// but NOT the reason, which can name owner state (Decision 6).
 		other := uuid.New()
-		theirs := mapLatestRun(runID, other, "running", "issue", 0, false, pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(),
+		theirs := mapLatestRun(runID, other, "running", "issue", 0, false, pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(), nullTxt(),
 			"waiting_worker", txt("your vault is locked"), tstamp(since),
 			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
 		if theirs.Health != "waiting_worker" {

@@ -456,7 +456,7 @@ WHERE repo_id = @repo_id
 -- legitimately shows (only a count, no identity), not a per-viewer number. Only
 -- display fields — never session_id, plan_md, or any secret.
 SELECT DISTINCT ON (r.issue_iid)
-       r.issue_iid, r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_reason, r.stop_kind,
+       r.issue_iid, r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_reason, r.stop_kind, r.stop_reason,
        -- has_plan_md is the presence flag feeding is_planning (issue #321). It trims the
        -- FULL Unicode whitespace set — the code points for which Go's unicode.IsSpace is
        -- true (what strings.TrimSpace trims) — so it agrees with the Go path's TrimSpace in
@@ -483,7 +483,7 @@ ORDER BY r.issue_iid, r.created_at DESC;
 -- window count over the issue's runs, already scoped to one issue by the WHERE, and
 -- issue-scoped across all users by design — Decision 6) so the "×N" retry hint
 -- survives a drag. Returns no rows when the issue has never run.
-SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_reason, r.stop_kind,
+SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_reason, r.stop_kind, r.stop_reason,
        -- has_plan_md: full-Unicode-whitespace-trimmed presence flag matching runToDTO's
        -- strings.TrimSpace (Go's unicode.IsSpace set) so the board card and run read agree
        -- on is_planning for all whitespace, not just ASCII (issue #321, #342).
