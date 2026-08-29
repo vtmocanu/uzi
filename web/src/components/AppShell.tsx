@@ -285,7 +285,7 @@ function AppMark({ branding, className }: { branding: Branding | null; className
           className="h-full w-full object-contain"
         />
       ) : (
-        <FactoryIcon />
+        <FactoryIcon data-testid="app-mark-fallback" />
       )}
     </span>
   );
