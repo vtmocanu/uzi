@@ -40,6 +40,25 @@ describe("mock default-jobs catalog (PRD #589)", () => {
     expect(paused.enabled).toBe(false);
   });
 
+  it("enableCatalogSchedule seeds the timezone override on a fresh row, ignores it on re-enable (issue #660)", async () => {
+    // A fresh materialize with an explicit tz stores it on the created row (the browser
+    // zone parity the create modal already has).
+    const created = await mockApi.enableCatalogSchedule("repo-www", "bug-triage", "Europe/Bucharest");
+    expect(created.timezone).toBe("Europe/Bucharest");
+
+    // A plain enable (no tz) keeps the catalog/default zone — the no-body path is byte-identical
+    // to before. bug-triage's catalog zone is UTC.
+    const plain = await mockApi.enableCatalogSchedule("repo-payments", "bug-triage");
+    const entry = (await mockApi.listScheduleCatalog()).entries.find((e) => e.slug === "bug-triage")!;
+    expect(plain.timezone).toBe(entry.timezone);
+
+    // The idempotent re-enable with a DIFFERENT tz does NOT clobber the stored zone
+    // (mirrors the server's ON CONFLICT DO NOTHING — the AC in commit 265313a4).
+    const again = await mockApi.enableCatalogSchedule("repo-www", "bug-triage", "America/New_York");
+    expect(again.id).toBe(created.id);
+    expect(again.timezone).toBe("Europe/Bucharest");
+  });
+
   it("resetSchedule restores a customized default's cadence and clears customized", async () => {
     const before = (await mockApi.listSchedules()).find(
       (s) => s.origin === "default" && s.catalog_slug === "docs-hygiene" && s.repo_id === "repo-uzi",

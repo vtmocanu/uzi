@@ -15,6 +15,7 @@ import {
   type ScheduleCatalog,
 } from "../lib/api";
 import { relativeFromNow, ScheduleModal } from "../components/ScheduleModal";
+import { browserTimezone } from "../lib/timezone";
 import { DefaultJobs } from "../components/DefaultJobs";
 import { AddAnotherRepo, ScheduleGroupRow, ScheduleSubRow } from "../components/ScheduleGroupRow";
 import { LastRunOutcome, LastFireDetail, formatStamp } from "../components/LastRun";
@@ -171,9 +172,13 @@ export function Schedules() {
     setBusyId(entry.slug);
     setError("");
     setNotice("");
+    // Seed each new schedule's zone from the browser's detected IANA timezone (issue #660),
+    // parity with the create modal. Resolved once so every repo in the fan-out gets the
+    // same zone; an empty/UTC detection keeps the catalog zone server-side.
+    const tz = browserTimezone();
     try {
       const results = await Promise.allSettled(
-        repoIds.map((rid) => api.enableCatalogSchedule(rid, entry.slug)),
+        repoIds.map((rid) => api.enableCatalogSchedule(rid, entry.slug, tz)),
       );
       const ok = results.filter((r) => r.status === "fulfilled").length;
       const failed = results.length - ok;
