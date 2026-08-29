@@ -322,11 +322,16 @@ func TestGitHubReviewThreadPaginationSpansMultiplePages(t *testing.T) {
 }
 
 // TestGitHubReviewThreadInnerFanOutRespectsGlobalItemCap pins that a single
-// thread's comment fan-out cannot push the accumulated map past maxForgeItems: the
-// per-thread budget passed into reviewThreadCommentDBIDs trips the shared backstop
-// rather than letting the inner loop accumulate a fresh maxForgeItems on top of the
-// outer page. Without the budget, a hostile/buggy forge could amplify the ceiling by
-// the outer page size. Lowers maxForgeItems and restores it in a defer.
+// thread's comment fan-out cannot push the FETCHED item count past maxForgeItems:
+// the per-thread budget passed into reviewThreadCommentDBIDs trips the shared
+// backstop rather than letting the inner loop accumulate a fresh maxForgeItems on
+// top of the outer page. The inner page returns ids that DUPLICATE page-1 on
+// purpose: the distinct map stays at 3, so the outer per-thread `len(m) >
+// maxForgeItems` check does NOT fire — only the budget bound (which counts fetched
+// items) can catch this, which is exactly the mechanism this hardening adds. A
+// non-duplicate id here would also trip the distinct-map check and make the test
+// pass against the pre-hardening code (vacuous). Lowers maxForgeItems, restored in a
+// defer.
 func TestGitHubReviewThreadInnerFanOutRespectsGlobalItemCap(t *testing.T) {
 	defer func(o int) { maxForgeItems = o }(maxForgeItems)
 	maxForgeItems = 3
@@ -356,12 +361,14 @@ func TestGitHubReviewThreadInnerFanOutRespectsGlobalItemCap(t *testing.T) {
 					},
 				})
 			case strings.Contains(req.Query, "node("):
-				// Inner page: one more comment beyond the now-zero remaining budget.
+				// Inner page: comments beyond the now-zero remaining budget, but
+				// DUPLICATING page-1 ids so the distinct map never grows — only the
+				// fetched-count budget bound can catch this.
 				writeGQLData(w, map[string]any{
 					"node": map[string]any{
 						"comments": map[string]any{
 							"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
-							"nodes":    []map[string]any{{"databaseId": 104}},
+							"nodes":    []map[string]any{{"databaseId": 101}, {"databaseId": 102}},
 						},
 					},
 				})
