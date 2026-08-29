@@ -10,7 +10,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api, MOCK_MODE, type Branding, type BuildInfo, type Repo } from "../lib/api";
 import { prefs } from "../lib/prefs";
-import { presetAssetForSlug } from "../lib/brandPresets";
+import { presetAssetForSlug, presetForSlug } from "../lib/brandPresets";
 import { cx } from "./ui";
 import { VaultBadge, VaultLockedBanner } from "./VaultControls";
 import { RateLimitAnnouncer, SidebarRateLimits } from "./RateLimitMeters";
@@ -262,6 +262,13 @@ function appMarkShowName(branding: Branding | null): boolean {
 // a custom logo, and clips the <img> to the rounded frame.
 function AppMark({ branding, className }: { branding: Branding | null; className?: string }) {
   const src = appMarkImgSrc(branding);
+  // In preset mode the mark IS the brand identity (a full white-label hides the
+  // wordmark), so give the <img> the preset's label as its accessible name;
+  // custom-logo mode keeps the generic "app logo". (PRD #780 M4 / a11y from M2.)
+  const presetLabel =
+    branding?.app_logo_mode === "preset"
+      ? presetForSlug(branding.app_logo_preset)?.label
+      : undefined;
   return (
     <span
       className={cx(
@@ -273,7 +280,7 @@ function AppMark({ branding, className }: { branding: Branding | null; className
       {src ? (
         <img
           src={src}
-          alt="app logo"
+          alt={presetLabel ?? "app logo"}
           data-testid="app-logo-img"
           className="h-full w-full object-contain"
         />
@@ -314,8 +321,10 @@ function brandLogoImgSrc(branding: Branding): string {
 //
 // `slot` fixes where the block sits, and the component self-selects by
 // brand_placement so each mount renders only when its slot matches:
-//   "below"    — a separate row UNDER the header carrying a faint uppercase POWERED
-//                BY label + the company text or the logo (the default placement).
+//   "below"    — a single right-aligned line UNDER the header: a faint lowercase
+//                "powered by" label inline with the company text or the logo,
+//                tucked close under the wordmark, no separator (the default
+//                placement).
 //   "topright" — logo-only (~96px max, ~26px tall), NO label, sharing the header
 //                row. Top-right is a LOGO-only option (Decision D6), so text mode
 //                always renders below regardless of brand_placement — this keeps the
@@ -364,21 +373,14 @@ function PoweredBy({
   }
 
   return (
-    <div className="border-b border-edge px-4 py-3">
-      <span className="block text-[10px] font-medium uppercase tracking-wider text-faint">
-        POWERED BY
-      </span>
+    <div className="flex items-center justify-end gap-1.5 px-4 pt-1 pb-2 text-right">
+      <span className="text-[10px] font-medium tracking-wider text-faint">powered by</span>
       {isLogo ? (
-        <span
-          className={cx(
-            "mt-1 inline-block",
-            branding.brand_plaque && "rounded-md bg-[#f6f6f8] px-1.5 py-1",
-          )}
-        >
+        <span className={branding.brand_plaque ? "rounded-md bg-[#f6f6f8] px-1.5 py-1" : undefined}>
           {logoImg}
         </span>
       ) : (
-        <span className="mt-1 block text-sm text-fg">{branding.brand_company}</span>
+        <span className="text-sm text-fg">{branding.brand_company}</span>
       )}
     </div>
   );
@@ -888,28 +890,41 @@ function SidebarContent({
             </div>
           ))}
 
-        {/* Server build info (GET /api/version, PRD #175). The badge still reads
-            "v0.6.0" / "dev"; hovering, focusing or tapping it opens the rest of the
-            coordinate set. The native `title` is GONE deliberately — a browser
-            tooltip firing alongside a custom popover is two overlapping panels
-            saying different things. Renders nothing at all until the fetch resolves
-            with a version, exactly as the old badge did. */}
-        {build?.status === "ok" && build.info.version && (
-          <BuildInfoPopover
-            info={build.info}
-            collapsed={collapsed}
-            fetchedAtMs={build.fetchedAtMs}
-            onOpenChangelog={onOpenChangelog}
-          />
-        )}
+        {/* Footer row. Server build info (GET /api/version, PRD #175): the badge
+            reads "v0.6.0" / "dev"; hovering, focusing or tapping it opens the rest of
+            the coordinate set. The native `title` is GONE deliberately — a browser
+            tooltip firing alongside a custom popover is two overlapping panels saying
+            different things. It renders nothing until the fetch resolves with a
+            version, exactly as the old badge did.
 
-        {/* Durable license/author credit (PRD #685 D3). A SEPARATE element, NOT
-            inside the build-gated block above: it is a build-time constant, so it
-            must render during the /api/version load and on its failure alike — a
-            rebrand or full white-label cannot strip it. Hidden only when the rail
-            is collapsed (no room). */}
-        {!collapsed && (
-          <div className="px-3 pb-2 pt-1">
+            The durable license/author credit (PRD #685 D3) is the RIGHT-HAND item of
+            this one-row footer. It is a build-time constant, NOT gated on the build
+            fetch, so it must render during the /api/version load and on its failure
+            alike — a rebrand or full white-label cannot strip it. When the rail is
+            collapsed there is no room for it: the footer falls back to just the
+            build popover's collapsed variant. */}
+        {collapsed ? (
+          build?.status === "ok" &&
+          build.info.version && (
+            <BuildInfoPopover
+              info={build.info}
+              collapsed={true}
+              fetchedAtMs={build.fetchedAtMs}
+              onOpenChangelog={onOpenChangelog}
+            />
+          )
+        ) : (
+          <div className="flex items-center justify-between gap-2 px-3 pb-2 pt-1">
+            {build?.status === "ok" && build.info.version ? (
+              <BuildInfoPopover
+                info={build.info}
+                collapsed={false}
+                fetchedAtMs={build.fetchedAtMs}
+                onOpenChangelog={onOpenChangelog}
+              />
+            ) : (
+              <span aria-hidden="true" />
+            )}
             <LicenseCredit />
           </div>
         )}

@@ -578,20 +578,17 @@ function BrandingPreview({
         )}
       </div>
 
-      {/* Below-wordmark POWERED BY: a faint label + text or logo. */}
+      {/* Below-wordmark POWERED BY: a single right-aligned line, faint lowercase
+          "powered by" inline with the text or logo, no separator. */}
       {brandMode !== "none" && !topRight && (
-        <div className="mt-3 border-t border-edge pt-3">
-          <span className="block text-[10px] font-medium uppercase tracking-wider text-faint">
-            Powered by
-          </span>
+        <div className="mt-1 flex items-center justify-end gap-1.5 text-right">
+          <span className="text-[10px] font-medium tracking-wider text-faint">powered by</span>
           {brandMode === "text" ? (
-            <span className="mt-1 block text-sm text-fg">{brandCompany}</span>
+            <span className="text-sm text-fg">{brandCompany}</span>
           ) : (
             <span
               className={
-                brandPlaque
-                  ? "mt-1 inline-block rounded-md bg-[#f6f6f8] px-1.5 py-1"
-                  : "mt-1 inline-block"
+                brandPlaque ? "inline-block rounded-md bg-[#f6f6f8] px-1.5 py-1" : "inline-block"
               }
             >
               <img

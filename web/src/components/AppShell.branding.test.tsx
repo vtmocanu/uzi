@@ -250,7 +250,7 @@ describe("AppShell branding — white-label hides the name on all four surfaces"
 // the "POWERED BY" label text, the company string, and the brand <img> handle
 // (data-testid="brand-logo-img") with its `src` — never a pixel snapshot. Each case
 // drives a DIFFERENT branding through the reset memo (beforeEach clears it).
-const POWERED_BY_RE = /POWERED BY/;
+const POWERED_BY_RE = /powered by/;
 
 describe("AppShell branding — POWERED BY block", () => {
   it("text mode: renders the POWERED BY label and the company string", async () => {
@@ -348,5 +348,73 @@ describe("AppShell branding — POWERED BY block", () => {
     await waitFor(() => expect(mockApi.branding).toHaveBeenCalled());
     expect(screen.queryAllByTestId("brand-logo-img")).toHaveLength(0);
     expect(screen.queryByText(POWERED_BY_RE)).toBeNull();
+  });
+
+  // Layout via CLASS PROXIES (jsdom has no layout engine): the M4 below-block restyle
+  // (D6/D8) is a single right-aligned line with no separator. Each assertion pairs a
+  // NEGATIVE (the dropped `border-b`) with a POSITIVE (the one-row `justify-end`) so
+  // neither goes vacuous, scoped to the below block via the "powered by" label's
+  // container — NOT a component-wide border-b query (the header/mobile bars keep it).
+  it("text-mode below block: no border-b separator, one right-aligned row", async () => {
+    mockApi.branding.mockResolvedValue(brandingWith({ brand_mode: "text", brand_company: "Acme, Inc." }));
+    renderShell();
+    const label = (await screen.findAllByText(POWERED_BY_RE))[0];
+    const row = label.parentElement as HTMLElement;
+    expect(row.className).not.toMatch(/border-b/);
+    expect(row.className).toMatch(/justify-end|text-right/);
+  });
+
+  it("logo-mode below block: no border-b separator, one right-aligned row", async () => {
+    mockApi.branding.mockResolvedValue(
+      brandingWith({ brand_mode: "logo", brand_logo_present: true, brand_placement: "below" }),
+    );
+    renderShell();
+    const label = (await screen.findAllByText(POWERED_BY_RE))[0];
+    const row = label.parentElement as HTMLElement;
+    expect(row.className).not.toMatch(/border-b/);
+    expect(row.className).toMatch(/justify-end|text-right/);
+  });
+});
+
+// The M4 one-row footer (D-follow-up): the version badge (left) and the durable
+// license credit (right) share a single `justify-between` row when expanded, and the
+// credit is ungated — it renders during the /api/version load and on its failure.
+describe("AppShell branding — one-row footer", () => {
+  it("expanded: the license credit sits in a justify-between row with the version badge", async () => {
+    renderShell();
+    const credit = await screen.findByTestId("license-credit");
+    const row = credit.parentElement as HTMLElement;
+    expect(row.className).toMatch(/justify-between/);
+    // The version badge (BuildInfoPopover) is the left-hand sibling in the same row.
+    expect(row.textContent).toContain("MIT © Vlad Mocanu");
+  });
+
+  it("credit still renders (in the row) before the version resolves", async () => {
+    mockApi.version.mockReturnValue(new Promise(() => {}));
+    renderShell();
+    const credit = await screen.findByTestId("license-credit");
+    const row = credit.parentElement as HTMLElement;
+    expect(row.className).toMatch(/justify-between/);
+  });
+});
+
+// Preset-mark accessible name (a11y, carried from M2): in preset mode the mark is the
+// only brand identity in a full white-label, so the <img> alt is the preset LABEL;
+// custom mode keeps the generic "app logo".
+describe("AppShell branding — app-mark alt text", () => {
+  it("preset mode (metaminds): the app-logo <img> alt is the preset label", async () => {
+    mockApi.branding.mockResolvedValue(brandingWith({ app_logo_mode: "preset", app_logo_preset: "metaminds" }));
+    renderShell();
+    const imgs = await screen.findAllByTestId("app-logo-img");
+    expect(imgs.length).toBeGreaterThan(0);
+    for (const img of imgs) expect(img.getAttribute("alt")).toBe("Metaminds");
+  });
+
+  it("custom mode: the app-logo <img> keeps alt='app logo'", async () => {
+    mockApi.branding.mockResolvedValue(brandingWith({ app_logo_mode: "custom", app_logo_present: true }));
+    renderShell();
+    const imgs = await screen.findAllByTestId("app-logo-img");
+    expect(imgs.length).toBeGreaterThan(0);
+    for (const img of imgs) expect(img.getAttribute("alt")).toBe("app logo");
   });
 });
