@@ -215,7 +215,8 @@ repo-agnostic schedules covering the standing automations most projects want
 from day one: a weekly test-improvement pass, a weekly docs-hygiene sweep, a
 deep bug-hunt audit, a feature-brainstorm prompt, daily sweeps over the
 `bug` and `Planned` labels, and self-improvement — an autonomous audit of
-uzi's own codebase. Each has a baked cron cadence and, for the four prompt
+the enabled repo's own codebase that picks one top improvement. Each has a
+baked cron cadence and, for the four prompt
 jobs, a baked prompt; the two sweeps instead carry a baked label selector;
 self-improvement carries neither, since its directive is baked into the
 worker rather than the catalog — its entry is cadence and model only (see
