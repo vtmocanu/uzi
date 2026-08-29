@@ -15,6 +15,10 @@ import { MemoryRouter } from "react-router-dom";
 import { DefaultJobs } from "./DefaultJobs";
 import { api, type CatalogEntry, type LastFire, type Repo, type Schedule, type ScheduleCatalog } from "../lib/api";
 
+// An expanded LastFireDetail sub-row reads useAuth().uziLabel (PRD #764 follow-up); this
+// tree is not otherwise auth-aware, so a minimal stub keeps it out of an AuthProvider.
+vi.mock("../auth/AuthContext", () => ({ useAuth: () => ({ uziLabel: "uzi" }) }));
+
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
   return {

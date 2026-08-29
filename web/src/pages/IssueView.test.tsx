@@ -174,9 +174,11 @@ describe("IssueView PRD presence badge (PRD #764)", () => {
   });
 });
 
-// PRD #102 M4 gave the board and the issue view one shared chip predicate. PRD #764
-// simplified it further: chipLabels now excludes only the autopilot marker and the
-// column labels, so `uzi` and PRD chip as ordinary content labels.
+// PRD #102 M4 gave the board and the issue view one shared chip predicate. PRD #764:
+// chipLabels still excludes only the autopilot marker and the column labels (so PRD and
+// other content labels chip normally), but IssueView additionally drops the `uzi`
+// runnable marker from its own chip row — it is surfaced as the brand "runnable" badge
+// instead, so it never renders both as a chip and as a badge.
 describe("IssueView label chips (PRD #102 M4, PRD #764)", () => {
   it("chips content labels (incl. PRD) and drops the autopilot marker + columns", async () => {
     setAuth();

@@ -366,8 +366,10 @@ func runToDTO(r store.Run, priorityClass string) apitypes.RunDTO {
 		IssueDescription: r.IssueDescription,
 		// PRD #764 M2: server-computed PRD presence for the runs view, derived
 		// label-independently from the snapshotted issue description via the same
-		// detector the board card uses.
-		HasPRDLink:     forgesvc.HasPRDLink(r.IssueDescription),
+		// detector the board card uses. Only issue-backed runs can link a PRD, so an
+		// issue-less run (chat / self-improve) whose description happens to mention a
+		// prds/*.md path never shows a spurious PRD badge.
+		HasPRDLink:     r.IssueIid.Valid && forgesvc.HasPRDLink(r.IssueDescription),
 		Title:          textPtrValue(r.Title.Valid, r.Title.String),
 		Status:         r.Status,
 		RequeueCount:   r.RequeueCount,

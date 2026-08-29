@@ -39,6 +39,12 @@ import (
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres;
 // ./e2e/run-store-it.sh provides one and sweeps this package for the LiveDB suffix.
 
+// wantUziLabel is a NON-default configured uzi label (the DefaultUziLabel is "uzi").
+// Seeding a non-default sentinel is what makes these guards discriminating: a writer
+// that hardcoded "uzi" instead of reading settings.UziLabel would pass against the
+// default but FAILS here — which is the whole point of the guard.
+const wantUziLabel = "runnable"
+
 // boardWriterStub is an httptest GitLab that answers the forge calls the board writers
 // make and captures the labels crossing the wire: CreateIssue (POST .../issues),
 // EnsureLabels (GET/POST .../labels) and UpdateIssueLabels (PUT .../issues/:iid). Its
@@ -181,7 +187,7 @@ func newBoardWriterFixture(ctx context.Context, t *testing.T, stub *boardWriterS
 		box:  box,
 		cfg:  config.Config{},
 		settings: settings.New(&settingsStore{rows: []store.AppSetting{
-			{Key: settings.KeyUziLabel, Value: "uzi"},
+			{Key: settings.KeyUziLabel, Value: wantUziLabel},
 		}}, time.Minute),
 		svc:  forgesvc.New(q, box, 5*time.Second, nil),
 		wsvc: workersvc.New(q, box, workersvc.Params{}),
@@ -206,7 +212,7 @@ func boardWriterReq(user store.User, repoID uuid.UUID, iid string, body string) 
 
 // TestPromoteWritesUziLabelLiveDB: Promote must apply the configured uzi label,
 // never a bare selector. The seeded issue carries "bug" (a selector, NOT the uzi
-// label); promoting it must add exactly "uzi".
+// label); promoting it must add exactly the configured uzi label (wantUziLabel).
 func TestPromoteWritesUziLabelLiveDB(t *testing.T) {
 	ctx := context.Background()
 	stub := &boardWriterStub{}
@@ -225,11 +231,11 @@ func TestPromoteWritesUziLabelLiveDB(t *testing.T) {
 	}
 	stub.mu.Lock()
 	defer stub.mu.Unlock()
-	if len(stub.labelCreates) != 1 || stub.labelCreates[0] != "uzi" {
-		t.Fatalf("EnsureLabels created %v, want exactly [uzi] — Promote must write the uzi label", stub.labelCreates)
+	if len(stub.labelCreates) != 1 || stub.labelCreates[0] != wantUziLabel {
+		t.Fatalf("EnsureLabels created %v, want exactly the configured uzi label — Promote must write the uzi label", stub.labelCreates)
 	}
-	if len(stub.issueUpdateAdds) != 1 || stub.issueUpdateAdds[0] != "uzi" {
-		t.Fatalf("UpdateIssue add_labels = %v, want exactly [uzi]", stub.issueUpdateAdds)
+	if len(stub.issueUpdateAdds) != 1 || stub.issueUpdateAdds[0] != wantUziLabel {
+		t.Fatalf("UpdateIssue add_labels = %v, want exactly the configured uzi label", stub.issueUpdateAdds)
 	}
 }
 
@@ -247,8 +253,8 @@ func TestCreateIssueWritesUziLabelLiveDB(t *testing.T) {
 	}
 	stub.mu.Lock()
 	defer stub.mu.Unlock()
-	if len(stub.createLabels) != 1 || stub.createLabels[0] != "uzi" {
-		t.Fatalf("CreateIssue labels = %v, want exactly [uzi] — issue creation must write the uzi label", stub.createLabels)
+	if len(stub.createLabels) != 1 || stub.createLabels[0] != wantUziLabel {
+		t.Fatalf("CreateIssue labels = %v, want exactly the configured uzi label — issue creation must write the uzi label", stub.createLabels)
 	}
 }
 
@@ -268,6 +274,9 @@ func TestJudgeFileWritesUziLabelLiveDB(t *testing.T) {
 		t.Fatalf("forge creates = %d, want 1", fs.count())
 	}
 	got := fs.creates[0].Labels
+	// This test uses the fileIssueLiveDB harness (seeds the default "uzi"), so it asserts
+	// the default; the configured-label discrimination is covered by the boardWriterFixture
+	// tests above (Promote / CreateIssue) which seed wantUziLabel.
 	if len(got) != 1 || got[0] != "uzi" {
 		t.Fatalf("filed labels = %v, want exactly [uzi] — the judge writer must use the uzi label", got)
 	}
@@ -290,6 +299,7 @@ func TestJudgeDraftWritesUziLabelLiveDB(t *testing.T) {
 		t.Fatalf("decode draft: %v", err)
 	}
 	got := resp.Draft.Labels
+	// fileIssueLiveDB harness seeds the default "uzi" (see the file writer test above).
 	if len(got) != 1 || got[0] != "uzi" {
 		t.Fatalf("draft labels = %v, want exactly [uzi] — the draft must use the uzi label", got)
 	}

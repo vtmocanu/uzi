@@ -1749,10 +1749,21 @@ func LabelChanged(committed, updates map[string]string) bool {
 // key is still checked against the others' stored values. PRD #764: the
 // run-eligibility label (uzi_label) must be distinct from the autopilot label — an
 // equal pair would autopilot every runnable issue, conflating "uzi's to run" with
-// "skip the plan gate". Each error names the key to change.
+// "skip the plan gate" — and from the finding label (see below). Each error names the
+// key to change.
 func ValidateMerged(merged map[string]string) error {
 	if merged[KeyUziLabel] == merged[KeyAutopilotLabel] {
 		return errors.New("uzi_label must differ from autopilot_label")
+	}
+	// PRD #764 hardening: uzi_label must also differ from finding_label, the marker uzi
+	// stamps on issues it auto-files for incidental findings. If the two were equal, a
+	// uzi-filed finding issue would carry the eligibility label, and an empty-selector
+	// schedule (which defaults to [uzi_label]) could select and auto-run it. Before #764
+	// a run ALSO needed a PRD link / PRDLESS / waiver — which finding issues lack — so
+	// the collision was inert; #764 removed that backstop, so the distinctness that
+	// guards eligibility must be enforced here. (Defaults uzi/agent-found are distinct.)
+	if merged[KeyUziLabel] == merged[KeyFindingLabel] {
+		return errors.New("uzi_label must differ from finding_label")
 	}
 
 	// PRD #602 M2: an ENABLED agent source must carry both a URL and a ref. This is

@@ -233,8 +233,8 @@ RETURNING *;
 -- name: ListSweepCandidateIssues :many
 -- The sweep sibling of ListAutopilotCandidateIssues (autopilot.sql): open cached
 -- issues in a repo that carry ALL of the selected labels. The caller passes a jsonb
--- array of labels (an empty selector is resolved to the PRD label in Go before
--- calling), and jsonb containment (@>) matches rows whose labels array is a superset.
+-- array of labels (an empty selector is resolved to the uzi label in Go before
+-- calling, PRD #764), and jsonb containment (@>) matches rows whose labels array is a superset.
 -- author rides along for the same adder→author attribution fallback the autopilot
 -- path uses.
 --

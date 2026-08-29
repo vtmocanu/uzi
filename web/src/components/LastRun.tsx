@@ -12,6 +12,7 @@ import { ChevronDownIcon } from "./icons";
 import { ForgeIssueAnchor } from "./ForgeIssueAnchor";
 import { scheduleSkipReasonLabel } from "../lib/scheduleSkipReasons";
 import type { LastFire, LastFireSkip, Schedule, ScheduleSkipReason } from "../lib/api";
+import { useAuth } from "../auth/AuthContext";
 
 // Skip-reason badge tone, mirroring the mock's semantics: the actionable skips a
 // schedule owner can fix (not eligible, a transient fetch failure) read amber; the
@@ -108,6 +109,7 @@ function OutcomeBadge({ fire }: { fire: LastFire }) {
 // row per started run (linking to the run) and per skipped candidate (with its
 // typed reason), and the actionable cap hint when a capped fire started nothing.
 export function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
+  const { uziLabel } = useAuth();
   const good = fire.started.length > 0;
   const skippedOnly = fire.started.length === 0 && fire.skips.length > 0;
   // The hint that is the whole point of Goal 2: a capped fire that reached only the
@@ -189,7 +191,7 @@ export function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
             <span className="font-semibold text-fg">{s.max_issues ?? "—"}</span>, so only the oldest
             candidate{fire.skips.length === 1 ? " was" : "s were"} tried. Raise the cap so the sweep
             reaches the candidates behind them, or add the{" "}
-            <code className="rounded bg-raised px-1 text-fg">uzi</code> label so they become runnable.
+            <code className="rounded bg-raised px-1 text-fg">{uziLabel}</code> label so they become runnable.
           </div>
         </div>
       )}

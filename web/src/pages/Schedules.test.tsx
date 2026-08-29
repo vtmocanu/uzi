@@ -84,7 +84,7 @@ beforeEach(() => {
   mockApi.listRepos.mockResolvedValue({ repos: [] } as Awaited<ReturnType<typeof api.listRepos>>);
   mockApi.previewSchedule.mockResolvedValue({ fires: [] });
   mockApi.checkRepoLabels.mockResolvedValue({ missing: [] });
-  vi.mocked(useAuth).mockReturnValue({ prdLabel: "PRD" } as unknown as ReturnType<typeof useAuth>);
+  vi.mocked(useAuth).mockReturnValue({ prdLabel: "PRD", uziLabel: "uzi" } as unknown as ReturnType<typeof useAuth>);
 });
 afterEach(() => {
   cleanup();

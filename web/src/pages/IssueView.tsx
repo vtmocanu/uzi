@@ -168,14 +168,20 @@ export function IssueView() {
                     above names exactly why (review m-4 / fact-check R2).
 
                     The autopilot chip is excluded here and surfaced as the badge below
-                    instead, so one fact reads one way.
+                    instead, so one fact reads one way. The `uzi` runnable marker is
+                    excluded for the same reason (PRD #764): it is surfaced as the brand
+                    "runnable" badge below, so it must not ALSO render as a plain content
+                    chip here. (The board keeps `uzi` as a highlighted chip instead, so
+                    chipLabels itself does not exclude it — this view drops it locally.)
 
                     Issue #124: a label name is forge-supplied, so strip it for display
                     while the React key keeps the raw string. */}
                 {chipLabels(issue.labels, {
                   autopilotLabel,
                   columnLabels: [issue.column],
-                }).map((l) => (
+                })
+                  .filter((l) => l !== uziLabel)
+                  .map((l) => (
                   <span
                     key={l}
                     title={stripUnsafeChars(l)}

@@ -532,7 +532,7 @@ Tracked as GitLab issue vtmocanu/uzi#102; PRD at `prds/done/102-board-v2.md`.
 
 - The implicit no-label column is called `Backlog`, not `Open`. Display only; it is not a forge label. [user 2026-07-20]
 - The seeded `Upcoming` column label is renamed `Planned` and seeds first, before In Progress: Backlog | Planned | In Progress | Human Review | Later. Existing boards are not migrated automatically. [user 2026-07-20]
-- Cards show their other labels (e.g. `bug`) as chips. Workflow labels (`PRD`, `uzi`, autopilot) and the card's own column label are not shown. [user 2026-07-20] (AI-synced 2026-08-29: `PRDLESS` retired by PRD #764; `uzi` is the new run-eligibility workflow marker)
+- Cards show their other labels (e.g. `bug`) as chips. The autopilot label and the card's own column label are not shown; the `uzi` run-eligibility label IS shown, hoisted ahead of the other chips and highlighted as the runnable marker. [user 2026-07-20] (AI-synced 2026-08-29: PRD #764 makes `uzi` the run-eligibility marker, shown and highlighted rather than hidden; `PRDLESS` retired. Chip exclusions are autopilot + column labels only.)
 - Cards can be hand-ordered within a column. The order is shared between users, and is uzi's own, not stored on the forge. [user 2026-07-20]
 - A per-user toggle shows open issues that lack the `PRD` label, so the board can be used to see untriaged work. Off by default. [user 2026-07-20]
   - Non-PRD cards are visually distinct and cannot start runs.

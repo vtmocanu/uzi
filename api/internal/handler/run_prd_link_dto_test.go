@@ -45,16 +45,19 @@ func TestRunToDTOPrdLink(t *testing.T) {
 }
 
 // TestRunToDTOHasPRDLink pins that the runs DTO exposes server-computed PRD presence
-// (PRD #764 M2): a run whose snapshotted issue description links a prds/*.md serializes
-// has_prd_link:true, and one whose description has no such link serializes false. The
-// detection is label-independent — it is computed purely from IssueDescription via the
-// same forgesvc.HasPRDLink detector the board card uses. This asserts the JSON field
-// itself (present and correct); pre-M2 the field did not exist, so the true case fails
-// on pre-change code.
+// (PRD #764 M2): an ISSUE-BACKED run whose snapshotted issue description links a
+// prds/*.md serializes has_prd_link:true, and one whose description has no such link
+// serializes false. The label-independent detection is computed from IssueDescription
+// via the same forgesvc.HasPRDLink detector the board card uses — but only for
+// issue-backed runs (IssueIid set): the badge reads "this run's ISSUE links a PRD", so
+// an issue-less run (chat / self-improve) is always false even if its prompt happens to
+// mention a prds/*.md path. This asserts the JSON field itself (present and correct);
+// pre-M2 the field did not exist, so the true case fails on pre-change code.
 func TestRunToDTOHasPRDLink(t *testing.T) {
-	t.Run("description with a prds link: has_prd_link true", func(t *testing.T) {
+	t.Run("issue-backed description with a prds link: has_prd_link true", func(t *testing.T) {
 		dto := runToDTO(store.Run{
 			ID:               uuid.New(),
+			IssueIid:         pgtype.Int8{Int64: 764, Valid: true},
 			IssueDescription: "Fixes the thing.\n\nSpec: prds/764-uzi-eligibility-label.md",
 		}, "normal")
 		if !dto.HasPRDLink {
@@ -99,6 +102,19 @@ func TestRunToDTOHasPRDLink(t *testing.T) {
 		}
 		if string(raw) != "false" {
 			t.Fatalf("has_prd_link = %s, want false", raw)
+		}
+	})
+
+	t.Run("issue-less run whose prompt mentions a prds link: has_prd_link false", func(t *testing.T) {
+		// The #764 guard: a chat / self-improve run has no issue (IssueIid unset), so
+		// even a prompt that references prds/764-uzi-eligibility-label.md must NOT light
+		// the "this run's issue links a PRD" badge.
+		dto := runToDTO(store.Run{
+			ID:               uuid.New(),
+			IssueDescription: "Please review prds/764-uzi-eligibility-label.md and improve it.",
+		}, "normal")
+		if dto.HasPRDLink {
+			t.Fatalf("HasPRDLink = true, want false for an issue-less run even though its prompt links a prds/*.md")
 		}
 	})
 }

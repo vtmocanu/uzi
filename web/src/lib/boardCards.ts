@@ -75,18 +75,20 @@ export function canPromote(card: Pick<Card, "labels" | "closed">, uziLabel: stri
  * with a poll-cycle delay instead of an instant view preference.
  *
  * Membership is the single `uzi` label. With `showAll` off, only `uzi` cards render.
- * With `showAll` on, everything renders EXCEPT the self-improve tracker — unless the
- * tracker itself carries `uzi`, so a member is always shown. The tracker exclusion is
- * not the control being partial — "show all other issues" means "show me the repo's
- * other open issues", and uzi's own bookkeeping issue is not one of them.
+ * With `showAll` on, everything renders EXCEPT the self-improve tracker and CLOSED
+ * non-member cards — unless the tracker itself carries `uzi`, so a member is always
+ * shown. The tracker exclusion is not the control being partial — "show all other
+ * issues" means "show me the repo's other OPEN issues", and uzi's own bookkeeping
+ * issue is not one of them. The `!closed` guard matches `canPromote` above (which also
+ * offers Promote only on open cards) and the documented intent.
  */
-export function visibleCards<T extends Pick<Card, "labels">>(
+export function visibleCards<T extends Pick<Card, "labels" | "closed">>(
   cards: T[],
   uziLabel: string,
   showAll: boolean,
 ): T[] {
   if (!showAll) return cards.filter((c) => isUziCard(c, uziLabel));
-  return cards.filter((c) => isUziCard(c, uziLabel) || !isSelfImproveTracker(c));
+  return cards.filter((c) => isUziCard(c, uziLabel) || (!isSelfImproveTracker(c) && !c.closed));
 }
 
 /**

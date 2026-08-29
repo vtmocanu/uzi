@@ -781,10 +781,12 @@ export function Board() {
     persistPrefs(storedExtras, next);
   }, [showAll, storedExtras, persistPrefs]);
 
-  // The "Show all other issues" population: cards that are not `uzi` members and are
-  // not the self-improve tracker — the non-runnable open issues the toggle reveals.
+  // The "Show all other issues" population: cards that are not `uzi` members, not the
+  // self-improve tracker, and not closed — the non-runnable OPEN issues the toggle
+  // reveals. The `!closed` guard matches visibleCards so the count and the rendered set
+  // agree on which "other issues" exist.
   const showAllCount = useMemo<number>(
-    () => payloadCards.filter((c) => !isUziCard(c, uziLabel) && !isSelfImproveTracker(c)).length,
+    () => payloadCards.filter((c) => !isUziCard(c, uziLabel) && !isSelfImproveTracker(c) && !c.closed).length,
     [payloadCards, uziLabel],
   );
 
@@ -1713,18 +1715,17 @@ export function IssueCard({
         // — `loud` (the warn ring, reserved for a human-blocked run) nor opacity-40
         // (being dragged right now).
         //
-        // Second cue: the BUTTON below reads "Promote to PRD" where a runnable card
-        // reads "Start run". It is present on every non-eligible card the sync can
+        // Second cue: the BUTTON below reads "Promote to uzi" where a runnable card
+        // reads "Start run". It is present on every non-runnable card the sync can
         // produce, INCLUDING one that has closed on the forge and not yet been evicted.
-        // Under PRD #196 M4 "runnable" is the ELIGIBLE set, not the primary alone, so a
-        // `bug` card in an instance whose eligible set includes `bug` is runnable and
-        // reads "Start run"; the quiet/Promote treatment is for a MEMBER card that is
-        // not eligible (e.g. a visibility-only `documentation` card, mock §7).
+        // Under PRD #764 the single `uzi` label is what makes a card runnable ("Start
+        // run"); a card without it — a `bug` card, a visibility-only `documentation`
+        // card (mock §7) — is non-runnable and wears the quiet/Promote treatment.
         //
         // An earlier version of this comment claimed that window renders no button at
         // all — promotable false, isEligible false. That was WRONG, and measured wrong:
-        // canPromote({labels:["documentation"], closed:false}, eligibleLabels) is true
-        // when documentation is not eligible. During the window the row is never
+        // canPromote({labels:["documentation"], closed:false}, uziLabel) is true because
+        // a documentation card lacks the `uzi` label. During the window the row is never
         // re-upserted (the PRD fetch is label-filtered, the additive fetch is
         // StateOpened, so neither returns a closed non-eligible issue), so issues.state
         // stays 'opened', cardDTO.Closed derives false, and the card renders Promote

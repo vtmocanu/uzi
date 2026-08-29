@@ -1162,7 +1162,7 @@ describe("Board — non-uzi issues (PRD #764)", () => {
   // load-bearing for the freeze case: with the non-uzi cards grouped at one end, an
   // implementation that appended them rather than keeping their positions passes.
   const cards = () => [
-    aCard({ iid: 1, title: "issue one", column: "", labels: ["uzi"] }),
+    aCard({ iid: 1, title: "issue one", column: "", labels: ["uzi"], has_prd_link: false }),
     aCard({ iid: 2, title: "issue two", column: "", labels: ["bug"], has_prd_link: false }),
     aCard({ iid: 3, title: "issue three", column: "", labels: ["uzi"] }),
     aCard({ iid: 4, title: "issue four", column: "", labels: [] }),
@@ -1385,7 +1385,8 @@ describe("Board — non-uzi issues (PRD #764)", () => {
     withWorkerAndToken();
     renderBoard();
     await screen.findByText("Backlog");
-    // issue one is a uzi card with has_prd_link:false (default) → runnable.
+    // issue one is a uzi card with has_prd_link:false (explicit override) → runnable
+    // WITHOUT a PRD link, which is exactly the #764 guarantee this test asserts.
     const start = within(cardOf("issue one")).getByRole("button", { name: /Start run/ }) as HTMLButtonElement;
     await waitFor(() => expect(start.disabled).toBe(false));
   });
