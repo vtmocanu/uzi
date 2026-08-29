@@ -110,6 +110,10 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 		ThenFixRequested: thenFixRequested,
 		IssueTitle:       deriveTaskTitle(inlineContext),
 		IssueDescription: inlineContext,
+		// PRD #35: the OWNER's default. A handoff has no per-request wait_on_limit
+		// override today, so nil resolves to the user's users.wait_on_limit — the same
+		// defaulting every other creation path applies (ci_fix/mr_rework/CreateRun).
+		WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
 	})
 	if err != nil {
 		return store.Run{}, err
