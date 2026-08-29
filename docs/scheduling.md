@@ -20,8 +20,8 @@ Every schedule fires against exactly one target:
 - **Pinned issue** — one repo + issue, the same shape as clicking Start run
   on that issue yourself.
 - **Label sweep** — at fire time, every *open* issue on the repo matching a
-  label selector; an empty selector defaults to the PRD label, i.e. today's
-  ordinary PRD-issue sweep. A sweep also caps how many issues one fire
+  label selector; an empty selector defaults to the `uzi` label, i.e. every
+  runnable issue. A sweep also caps how many issues one fire
   starts, oldest issue first — see [Sweep cap](#sweep-cap) below.
 - **Ad-hoc prompt** — no issue at all. A stored prompt runs against the repo
   and opens a merge request directly, for standing "hunt for X and open an
@@ -36,16 +36,18 @@ catalog-owned, so owner guidance *is* offered to steer it.
 ## The same gates a manual start has, plus auto-approve
 
 Pinned-issue and label-sweep fires go through the **exact run-creation path**
-autopilot uses, so PRDLESS gating, a fresh forge fetch of the issue's labels,
-active-run dedup, and the usage-limit park all behave exactly as for a
-manual start — a schedule can't do anything a manual start couldn't. A label
-selector only picks *candidates*; the gate still decides what fires. A sweep
-over already-PRD'd issues fires directly, but a sweep over plain, un-PRD'd
-issues (e.g. everything tagged `bug`) fires only on the ones that also carry
-the [PRDLESS](./prdless.md) label — pair a raw-bug-report sweep with PRDLESS
-if you want it to run anything. The **ad-hoc prompt** target is the
-deliberate exception: with no issue to gate on, it bypasses the PRD-issue
-requirement by design.
+autopilot uses, so the `uzi`-label eligibility gate, a fresh forge fetch of
+the issue's labels, active-run dedup, and the usage-limit park all behave
+exactly as for a manual start — a schedule can't do anything a manual start
+couldn't. A label selector only picks *candidates*; the gate still decides
+what fires. `Planned` and `bug` are pure selectors, not eligibility labels in
+their own right, so a sweep over one of them (e.g. everything tagged `bug`)
+fires only on the candidates that also carry `uzi` — pair a raw-bug-report
+sweep with the `uzi` label if you want it to run anything. A bare selector
+issue with no `uzi` is a benign skip (see [Fire outcomes](#fire-outcomes))
+that advances the schedule like any other. The **ad-hoc prompt** target is
+the deliberate exception: with no issue to gate on, it bypasses the
+`uzi`-label requirement by design.
 
 Each schedule also has its own **auto-approve** toggle, **on by default** —
 the point of a 02:00 fire is that it actually proceeds instead of sitting at
@@ -68,8 +70,8 @@ create-time default, not a retroactive change.
 
 A label sweep also has a **max issues per fire**, applied oldest issue first
 (lowest issue number). The cap counts runs **started**, not candidates
-matched: when the oldest candidate can't start — no PRD link, already
-mid-run from a previous fire, or a transient fetch error — the fire flags it
+matched: when the oldest candidate can't start — missing the `uzi` label,
+already mid-run from a previous fire, or a transient fetch error — the fire flags it
 (see [Fire outcomes](#fire-outcomes)) and walks on to the next eligible
 issue, so a stale issue at the head of the backlog no longer wastes a slot or
 blocks newer work. That walk is bounded by a **scan window** — the cap plus a
@@ -156,9 +158,9 @@ reference](./cli.md#commands) for the full flag list.
 A schedule can fire right on time and still start **zero** runs — every
 candidate can be benign-skipped by the same gate a manual start goes
 through. The motivating case: a `bug` label sweep whose oldest candidates
-all lack a `prds/*.md` link and a `PRDLESS` label — [backfill](#sweep-cap)
-walks past them to start any eligible issue in reach, but when the whole
-scan window is ineligible the fire runs every night, `Last run` keeps
+all lack the `uzi` label — [backfill](#sweep-cap)
+walks past them to start any runnable issue in reach, but when the whole
+scan window is `uzi`-less the fire runs every night, `Last run` keeps
 advancing, and nothing ever starts. Without a fire outcome, that looks
 identical to a healthy schedule.
 
@@ -167,9 +169,10 @@ exceed `max_issues` once backfill walks past a skip), which ones
 **started** (paired with the run they produced), and which were
 **skipped**, each with a typed reason — never free text:
 
-- `no_prd_link` — the candidate issue has no `prds/*.md` link and no
-  [PRDLESS](./prdless.md) label.
-- `not_eligible` — the candidate isn't a run-eligible issue at all.
+- `not_eligible` — the candidate doesn't carry the `uzi` label, so the
+  single eligibility gate refuses it. A bare selector-only candidate (say,
+  `bug` with no `uzi`) skips here; it's benign, and the schedule advances
+  normally.
 - `already_running` — an active run already exists for that issue (or,
   for the schedule itself, a dedup at fire time).
 - `description_too_large` — the composed run instruction (issue body
@@ -194,9 +197,9 @@ the issue on the forge for the issues the fire actually fetched
 (started rows, and a sweep's post-fetch skip); a candidate skipped
 before it was fetched (e.g. `already_running`) shows a plain number
 instead — the CLI's `Last fire` block always prints a plain number. A
-sweep fire with more eligible-label issues than its [scan
+sweep fire with more `uzi`-labeled issues than its [scan
 window](#sweep-cap) reached that still started nothing also carries the
-actionable hint — raise `max_issues` or add PRDLESS / a PRD link to the
+actionable hint — raise `max_issues` or add `uzi` to the
 issues behind it.
 
 Only the **last** fire is kept, and only the last *scheduled* one:

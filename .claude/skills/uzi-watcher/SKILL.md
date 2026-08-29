@@ -321,9 +321,9 @@ deliberate / mock-only** label, and a one-line recommendation. For each, the use
   nightly sweep silently never fires it (the sweep table is in `CLAUDE.local.md`; the failure
   mode and the fix are the `issue-triage` skill's whole subject). Three requirements:
   1. **A sweep selector label** — `Planned` for feature/change work, `bug` for a defect.
-  2. **PRD-eligibility** — either a `prds/*.md` link **plus** the `PRD` label, or the
-     `PRDLESS` label for a spec-in-the-body run. A selector label alone does **not** fire a
-     plain un-PRD'd issue.
+  2. **The `uzi` eligibility label** — the single run-eligibility gate; no PRD link, no
+     PRD file, no waiver needed. A selector label alone does **not** fire an issue
+     missing `uzi`.
   3. **A cold-readable body** — a swept worker reads ONLY the issue text (no chat, no memory
      of this session), so name the exact files and `file:line` anchors, the precise change,
      and acceptance criteria (a failing-first test where sensible). CodeRabbit's own finding
@@ -331,7 +331,7 @@ deliberate / mock-only** label, and a one-line recommendation. For each, the use
      worker cannot see.
 
   **The inverse is just as deliberate:** an issue you intend a *human* to triage later must be
-  left **non-sweepable** — no `PRDLESS`, no `Planned`/`bug` — so an unattended 02:00 run cannot
+  left **non-sweepable** — no `uzi`, no `Planned`/`bug` — so an unattended 02:00 run cannot
   auto-implement a half-formed idea. Choose the labels for the outcome you want, every time.
 
 A finding on a **workflow file inherited from `main`** (base-realignment artifact) is not the

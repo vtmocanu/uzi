@@ -20,6 +20,8 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **Run-eligibility collapses to a single `uzi` label ([#764](https://github.com/vtmocanu/uzi/issues/764)).**
+  Labeling an issue `uzi` (configurable, `uzi_label`) is now the only thing that makes it runnable; the `PRD`/`PRDLESS`/waiver either-or, the `run_eligible_labels`/`board_extra_labels` admin sets, and the `prd_label` special-casing are removed end to end, along with the `no_prd_link` schedule skip-reason. `Planned` and `bug` remain pure sweep selectors that only fire a candidate once it also carries `uzi`. A linked `prds/*.md` file is now optional everywhere: still auto-detected and implemented when present, and shown as a neutral "PRD" presence badge on the board card and the runs view, but never required to start a run. The board still shows every open issue; its filter toggle switches from PRD-based to `uzi`-only / all. Existing runnable issues on this repo were migrated with a one-shot, idempotent `scripts/backfill-uzi-labels.sh` at cutover.
 - **Scheduled self-improve now targets the enabling repo, not just uzi ([#686](https://github.com/vtmocanu/uzi/issues/686)).**
   The `self-improve` default job reviews and improves whichever repo it's enabled on; folding your accumulated "improve uzi" recommendations and running uzi's own trusted directive is now an explicit, owner-set per-repo capability that existing self-improve schedules were switched on for automatically, so nothing changes for uzi's own instance. Each cycle also now opens a fresh merge request off current main instead of extending one long-lived branch, capped at 2 concurrently open self-improve merge requests per repo so further cycles skip (with a notification) until you merge or close one.
 

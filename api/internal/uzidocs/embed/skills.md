@@ -152,7 +152,8 @@ version of the same step on every issue run, so it does not depend on this
 skill being allocated; the skill supplies the judgment. Both are instructions
 to a model rather than enforcement: whether a PRD update is honest is checked
 by the human reading the merge request. An issue that links no PRD file is a
-no-op (see [PRDLESS label](./prdless.md)).
+no-op — a linked `prds/*.md` file is optional, never required to start a
+run (see [Admin settings](./admin-settings.md#run-eligibility)).
 
 Only issue runs are **told** to do it. A CI-fix or self-improvement run never
 carries the instruction, and the machinery that records a move is closed to

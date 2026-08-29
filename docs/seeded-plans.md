@@ -105,21 +105,19 @@ So for a large, multi-component change, pick deliberately:
 - **Use the gated `uzi run create`** (no `--plan-file`) so the lead proposes
   milestones and the budget scales to them — at the cost of one approval.
 
-## No PRD file? PRDLESS composes with this
+## No PRD file needed
 
-An issue with no `prds/*.md` file still works, since the plan you're
-supplying is what a PRD file would have provided anyway. It needs **both**
-the `PRD` label and the [`PRDLESS` label](./prdless.md) — PRDLESS is the
-escape hatch for a PRD issue with no file yet, not a way to opt out of the
-PRD label entirely.
+An issue with no `prds/*.md` file works fine, since the plan you're
+supplying is what a PRD file would have provided anyway. It needs only the
+`uzi` label — the single run-eligibility gate — nothing else.
 
-Adding the `PRD` label to a fresh issue doesn't take effect immediately:
+Adding the `uzi` label to a fresh issue doesn't take effect immediately:
 uzi checks against its own cached copy of the issue's labels, which only
 catches up once the poller syncs. Going through **Promote** instead writes
 the label to the forge first and updates the cache in the same request, so
 `uzi run create --plan-file` against a freshly-promoted issue works right
-away — label it and immediately create a run, and you'll get a "not a PRD
-issue" error until one of those two things happens.
+away — label it and immediately create a run, and you'll get a "does not
+carry the uzi label" error until one of those two things happens.
 
 Related: [uzi CLI](./cli.md#commands) · [Repo agents](./repo-agents.md) ·
-[PRDLESS label](./prdless.md) · [Run activity pane](./run-activity.md)
+[Admin settings](./admin-settings.md#run-eligibility) · [Run activity pane](./run-activity.md)

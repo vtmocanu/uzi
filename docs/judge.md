@@ -221,13 +221,10 @@ so every issue, note, and label it creates is authored by the same bot as
 everything else) and remembers the link so the same recommendation can't be
 filed twice.
 
-The filed issue carries the `PRD` and `PRDLESS` labels — it shows up on the
-board and can start a run in one click, with no separate PRD file — but
-**never** the autopilot label, so filing never starts a run by itself.
-Filing an issue and spending tokens on a run stay two separate decisions you
-make. Note the [PRDLESS bypass](./prdless.md) also needs the instance-wide
-PRDLESS toggle to be on; if your admin has turned it off, even a
-PRDLESS-labelled filed issue still can't start without a `prds/*.md` link.
+The filed issue carries the `uzi` label — it shows up on the board and can
+start a run in one click, with no PRD file needed — but **never** the
+autopilot label, so filing never starts a run by itself. Filing an issue and
+spending tokens on a run stay two separate decisions you make.
 
 If an admin files a recommendation from *your* review, the draft shows
 "from user X's worker, run \<id\>" so they can see whose text they're about

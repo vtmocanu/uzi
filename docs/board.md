@@ -7,14 +7,14 @@ audience: user
 # Board
 
 Each enabled repo gets a board in the sidebar: a kanban view of its GitLab
-issues, kept in sync with the forge in both directions. A board's cards are
-its **membership set**: the repo's `PRD`-labeled issues plus a configurable
-set of *extra* labels (`bug` by default) — see
+issues, kept in sync with the forge in both directions. Every open issue on
+the repo is synced, but by default a board **renders** only the ones marked
+runnable with the `uzi` label — see
 [Which issues show up](#which-issues-show-up). The toolbar's **Issues**
-control tunes the extras, per repo, per account. Cards also carry their
-latest agent run, so the board doubles as a run tracker: it moves issues
-automatically as a run progresses and refreshes itself, without a manual
-reload.
+control widens that to every open issue, per repo, per account. Cards also
+carry their latest agent run, so the board doubles as a run tracker: it
+moves issues automatically as a run progresses and refreshes itself, without
+a manual reload.
 
 ## Columns
 
@@ -152,9 +152,9 @@ results`** line appears above the columns. Clear the query and everything
 comes back.
 
 **Search only finds board members.** It filters the same set the board
-already renders — the `primary ∪ extras` membership described in
+already renders — the runnable-only-by-default set described in
 [Which issues show up](#which-issues-show-up) — so an issue that exists on
-GitLab but isn't a member of *this* board won't turn up, even searched by
+GitLab but isn't shown on *this* board won't turn up, even searched by
 its exact `#iid`. That's deliberate: search narrows what's already on the
 board, it doesn't widen membership. Use the **Issues** control to bring an
 issue onto the board first if you need it to be findable.
@@ -248,14 +248,15 @@ board before the state would ever go stale.
 
 ## Card labels
 
-Each card also shows its other GitLab labels as small chips, so `bug` or
-`security` is visible without opening the issue. Workflow markers are left
-off: the `PRD` label, the `PRDLESS` escape hatch and the `autopilot` label
-(whatever your admin has configured those to be), plus every configured
-column label, since a column already has its own lane. A card carrying many
-labels shows the first few and a **`+N`** count, with the rest available by
-hovering or by tabbing to the count, so one heavily-labelled issue can't
-stretch its column.
+Each card also shows its GitLab labels as small chips, so `bug`, `security`,
+or the runnable `uzi` label itself is visible without opening the issue. Only
+the autopilot label (whatever your admin has configured it to) and every
+configured column label are left off, since a column already has its own
+lane. When a card's `uzi` label is what made it runnable, that chip is
+hoisted to the front so it survives the cap below even on a heavily-labelled
+card. A card carrying many labels shows the first few and a **`+N`** count,
+with the rest available by hovering or by tabbing to the count, so one
+heavily-labelled issue can't stretch its column.
 
 ## Attention strip
 
@@ -285,90 +286,54 @@ announces each one. **Refresh** still triggers an immediate full sync if you
 don't want to wait.
 
 One exception, and it looks like a bug if you do not know about it. Issues
-without the `PRD` label are synced **open-only**, so closing one on the forge
+without the `uzi` label are synced **open-only**, so closing one on the forge
 is not something the frequent poll can see. The card keeps looking open until
 the next reconcile pass (about 10 minutes at the shipped defaults), and then
-it disappears rather than sliding into **Closed**. `PRD` cards are unaffected:
-they animate into **Closed** as they always have.
+it disappears rather than sliding into **Closed**. `uzi`-labeled cards are
+unaffected: they animate into **Closed** as they always have.
 
 ## Which issues show up
 
-A board's membership is **the primary label ∪ your extras**. The **primary**
-label (`PRD` by default — see [Admin settings](./admin-settings.md)) is the
-label uzi *writes* to mark an issue as its own work (Promote, a judge-filed
-issue, board issue creation) and the one it fetches boards with; every board
-shows it, always. **Extras** are the
-labels layered on top — `bug` by default — tuned per repo, per account, from
-the **Issues** control below.
+By default a board shows only its **runnable** issues: the repo's
+`uzi`-labeled cards (see [Admin settings](./admin-settings.md)) — the same
+single label that gates starting a run. Tick **Show all other issues** in
+the toolbar's **Issues** control to widen the board to every other open
+issue on the repo too; the `uzi` set is always included and can't be
+unticked, since a runnable card should never be one toggle away from
+disappearing.
 
-Membership and run-*eligibility* are different questions, and being one
-doesn't imply the other:
-
-- **Membership** decides what you see. It's `primary ∪ extras`, and the
-  Issues control (below) is the only thing that changes it.
-- **Eligibility** decides what can start a run. An admin configures the
-  run-eligible label set (`PRD` and `bug` by default) instance-wide,
-  separately from any board's extras — see
-  [Admin settings](./admin-settings.md).
-
-A card that's both a member and eligible offers **Start run** directly: a
-default-configuration `bug` card, for instance, is shown and runnable with no
-extra step. A card that's a member but *not* eligible — a label your admin
-put in "also show on boards" but left out of the run-eligible set — is drawn
-with a **dashed border** and offers **Promote to PRD** instead: one click
-adds the `PRD` label on the forge and the card becomes an ordinary, runnable
+A `uzi`-labeled card offers **Start run** directly. A card shown only because
+**Show all other issues** is on — one without the `uzi` label — is drawn with
+a **dashed border** and offers **Promote to `uzi`** instead: one click adds
+the configured label on the forge, and the card becomes an ordinary, runnable
 board citizen. There is no un-promote in uzi; remove the label in GitLab if
-you change your mind. The reverse combination also exists: a label can be
-made run-eligible without ever being added to a board's extras, in which
-case an issue carrying it is runnable the moment its card is on screen for
-some other reason (it carries a shown label too, or **Show all other
-issues** is on) but never earns a default slot on the board just for being
-eligible — visibility and eligibility are independently configured.
+you change your mind.
 
-A member card that's also eligible still needs its issue description to link
-a `prds/*.md` file to start a run, unless a non-primary eligible label waives
-that — see [PRDLESS label](./prdless.md#the-prd-link-waiver). A card missing
-a required link shows a warning badge and is excluded from agent pickup
-until the link is added. A card carrying more than one column label (edited
+Starting a run has never required a linked `prds/*.md` file. A run without
+one behaves exactly like a run with one, apart from having no PRD to
+implement; when a card's issue does link one, a neutral **PRD** badge shows
+on the card (and on the run in the runs view) so you can tell at a glance,
+but nothing gates on it. A card carrying more than one column label (edited
 outside uzi) shows a conflict badge and displays in its highest-positioned
 column until the next move normalizes it.
 
-Closed `PRD` issues keep appearing in the **Closed** column, since the
-primary's fetch keeps the closed backlog cached. A closed *extra*-label
-card never will: the fetch behind an extra label is open-issues-only, so
-that card simply drops off the board when the issue closes rather than
-sliding into Closed. Accepted, not a bug — see "Staying in sync" below for
-the general open-only behavior extras share.
+Closed `uzi`-labeled issues keep appearing in the **Closed** column, since
+that label's fetch keeps the closed backlog cached. A closed card shown only
+via **Show all other issues** never will: that fetch is open-issues-only, so
+it simply drops off the board when the issue closes rather than sliding into
+Closed. Accepted, not a bug — see "Staying in sync" below for the general
+open-only behavior non-`uzi` cards share.
 
-### The Issues popover
+### The Issues toggle
 
-The toolbar's **Issues** control replaces the old "Show other issues"
-checkbox. It lists the labels present on the repo's open issues, with a
-count of how many additional cards each one would add, and lets you tune
-your own extras:
+The toolbar's **Issues** control is a simple `uzi`-only / all switch, labeled
+with the configured `uzi` label's name so it's clear what it's currently
+narrowed to. Your choice is **per repo, per account** — stored server-side,
+so it follows you to any browser or device you sign in from, unlike **Hide
+empty** above, which stays per-browser. It changes only what you see: nobody
+else's board moves, and no label is written until you click **Promote**.
 
-- The primary label is a pinned row, always checked and un-removable — it's
-  on every board.
-- One row per label actually present on the board's issues, with a count of
-  how many more cards ticking it would add.
-- A configured admin default that has no matching issues on this repo still
-  gets a row — greyed, showing `0` — so you can see that it's inert rather
-  than wondering why it isn't there.
-- **Show all other issues** is the old escape hatch, still last in the list,
-  for "I don't know what label it has": it brings in everything else,
-  member or not.
-- **Reset to default** clears your override and re-adopts your admin's
-  configured extras.
-
-Your choice is **per repo, per account** — stored server-side, so it follows
-you to any browser or device you sign in from, unlike **Hide empty** above,
-which stays per-browser. It changes only what you see: nobody else's board
-moves, and no label is written. (A pre-existing per-browser "show other
-issues" preference from before this control existed is migrated into your
-account automatically, once, the first time you load a board after
-upgrading.)
-
-Issues carrying only extra labels are only ever synced while they are
+Issues without the `uzi` label are only ever synced while they are
 **open**, so they never reach the **Closed** column: one that closes on the
 forge keeps looking open until the reconcile pass removes it, as described
 above. uzi's own self-improvement tracking issue is always hidden.
