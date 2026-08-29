@@ -517,6 +517,43 @@ func TestRunMilestoneProgressLiveDB(t *testing.T) {
 		}
 	})
 
+	// ── Issue #783: the same exclusion holds on the COALESCE fallback branch — a run with
+	//    NULL budget_wall_seconds falls back to GlobalTimeoutSeconds, and banked park time
+	//    must still be added to THAT deadline (the seeded / non-gated run path). ──
+	t.Run("sweep excludes banked parked time on the global-timeout fallback", func(t *testing.T) {
+		base := time.Now().UTC()
+		// runTimeout=7200s (2h) global + 1h banked park = 3h deadline; NULL budget_wall_seconds.
+		// started 2h ago → 2h < 3h → NOT swept.
+		underGlobal := newRun("running")
+		mustExec(ctx, t, pool,
+			`UPDATE runs SET started_at = $2, budget_wall_seconds = NULL, budget_paused_seconds = 3600 WHERE id = $1`,
+			underGlobal, base.Add(-2*time.Hour))
+		// Same shape but started 4h ago → 4h > 3h → swept.
+		overGlobal := newRun("running")
+		mustExec(ctx, t, pool,
+			`UPDATE runs SET started_at = $2, budget_wall_seconds = NULL, budget_paused_seconds = 3600 WHERE id = $1`,
+			overGlobal, base.Add(-4*time.Hour))
+
+		swept, err := q.SweepRunningTimeout(ctx, store.SweepRunningTimeoutParams{
+			FailureReason:        pgtype.Text{String: "run exceeded RUN_TIMEOUT", Valid: true},
+			Now:                  pgtype.Timestamptz{Time: base, Valid: true},
+			GlobalTimeoutSeconds: runTimeout,
+		})
+		if err != nil {
+			t.Fatalf("SweepRunningTimeout: %v", err)
+		}
+		got := map[uuid.UUID]bool{}
+		for _, r := range swept {
+			got[r.ID] = true
+		}
+		if got[underGlobal] {
+			t.Fatalf("a NULL-budget run 2h into a 2h global + 1h banked park (3h deadline) must NOT be swept")
+		}
+		if !got[overGlobal] {
+			t.Fatalf("a NULL-budget run 4h into a 2h global + 1h banked park (3h deadline) MUST be swept")
+		}
+	})
+
 	// ── Issue #783: SetRunRunning banks the park duration on a real park→running resume,
 	//    and never double-counts on the running→running heartbeat. ──
 	t.Run("running resume from awaiting_approval banks the park duration once", func(t *testing.T) {
