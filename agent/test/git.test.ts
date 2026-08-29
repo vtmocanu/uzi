@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import type { Readable } from "node:stream";
@@ -50,6 +51,40 @@ describe("ensureClone", () => {
     const cfg = fs.readFileSync(path.join(bare, "config"), "utf8");
     assert.ok(!cfg.includes(secret));
     assert.ok(!cfg.includes("extraHeader"));
+  });
+
+  // Issue #775: a transient connect-timeout on the claim-time bare clone must be RETRIED
+  // (the classifier now reads git's "Failed to connect ..." as transient), and the widened
+  // cloneBare cleanup must leave no half-clone behind so each retry starts from a clean bare.
+  it("retries a failed-to-connect bare clone and cleans up the dest on give-up", async () => {
+    // A closed local TCP port: git-over-HTTP to it yields "Failed to connect to 127.0.0.1
+    // port <n> after N ms: Connection refused", which /failed to connect/i classifies transient.
+    const port = await new Promise<number>((resolve, reject) => {
+      const srv = net.createServer();
+      srv.on("error", reject);
+      srv.listen(0, "127.0.0.1", () => {
+        const addr = srv.address();
+        const p = typeof addr === "object" && addr ? addr.port : 0;
+        srv.close(() => resolve(p));
+      });
+    });
+    const url = `http://127.0.0.1:${port}/x.git`;
+
+    let sleeps = 0;
+    const schedule = [1, 1]; // schedule.length sleeps ⇒ schedule.length + 1 attempts
+    const retryingGit = new GitCache(fx.dataDir, nullLogger(), {
+      schedule,
+      sleep: async () => {
+        sleeps++;
+      },
+    });
+
+    await assert.rejects(retryingGit.ensureClone(url), /failed to connect/i);
+    // schedule.length sleeps happened ⇒ the clone was attempted schedule.length + 1 times.
+    // If this is 0, the message did not classify transient (no retry) and the target is wrong.
+    assert.strictEqual(sleeps, schedule.length);
+    // The widened cloneBare cleanup removed the half-populated bare on the final failure.
+    assert.strictEqual(fs.existsSync(retryingGit.barePathFor(url)), false);
   });
 });
 

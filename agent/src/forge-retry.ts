@@ -83,6 +83,15 @@ const TRANSIENT_PATTERNS: RegExp[] = [
   /\btimed? ?out\b/i,
   /TLS/i,
   /EOF/i,
+  // NETWORK-SCOPED PHRASES (mirroring the DEVBOX_TRANSIENT_PATTERNS note), not bare
+  // tokens: both describe a connect-reachability failure, so they only match a genuine
+  // network condition. `failed to connect` matches git's "Failed to connect to host:port
+  // after N ms"; `could not connect to server` matches the trailer git appends on the
+  // same failure. Permanent-first precedence (PERMANENT_PATTERNS above is matched FIRST)
+  // still lets an auth/404 message that happens to contain these substrings resolve
+  // permanent, so these cannot weaken a deterministic rejection.
+  /failed to connect/i,
+  /could not connect to server/i,
 ];
 
 /**

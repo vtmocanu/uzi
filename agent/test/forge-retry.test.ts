@@ -70,6 +70,44 @@ describe("classifyForgeError", () => {
     { name: "ForgeError(429)", err: new ForgeError(429, "rate limited"), want: "transient" },
     { name: "ForgeError(422)", err: new ForgeError(422, "validation failed"), want: "permanent" },
     { name: "ForgeError(403)", err: new ForgeError(403, "forbidden"), want: "permanent" },
+    // (vii) issue #775: the EXACT bare-clone connect-timeout from the real run ⇒ retry.
+    // Matches /failed to connect/i ("Failed to connect to ... after N ms") and the
+    // /could not connect to server/i trailer.
+    {
+      name: "bare-clone connect-timeout (issue #775)",
+      err: new Error(
+        "git clone --bare https://github.com/vtmocanu/uzi.git /data/repos/github.com+vtmocanu+uzi.git failed:\nCloning into bare repository '/data/repos/github.com+vtmocanu+uzi.git'...\nfatal: unable to access 'https://github.com/vtmocanu/uzi.git/': Failed to connect to github.com:443 after 129360 ms: Could not connect to server",
+      ),
+      want: "transient",
+    },
+    // (viii) negative control: an auth failure over the SAME URL ⇒ permanent (precedence).
+    {
+      name: "auth failure over the run URL",
+      err: new Error("fatal: Authentication failed for 'https://github.com/vtmocanu/uzi.git/'"),
+      want: "permanent",
+    },
+    // (ix) negative control: a 404 over the SAME URL ⇒ permanent (precedence).
+    {
+      name: "404 over the run URL",
+      err: new Error(
+        "fatal: unable to access 'https://github.com/vtmocanu/uzi.git/': The requested URL returned error: 404",
+      ),
+      want: "permanent",
+    },
+    // (x) issue #775: the `could not connect to server` trailer, ISOLATED (no "Failed to
+    // connect"). Case (vii) carries BOTH phrases, so /could not connect to server/i is
+    // redundant there — dropping the matcher still passes via /failed to connect/i. This
+    // case has ONLY the trailer, so it independently pins /could not connect to server/i:
+    // remove that pattern and this falls through to the permanent default. Note "could not
+    // connect" does NOT match the pre-existing /couldn'?t connect/i (that needs "couldn't"/
+    // "couldnt"), so this matcher is the sole reason it classifies transient.
+    {
+      name: "isolated 'Could not connect to server' trailer (issue #775)",
+      err: new Error(
+        "fatal: unable to access 'https://github.com/vtmocanu/uzi.git/': Could not connect to server",
+      ),
+      want: "transient",
+    },
   ];
 
   const exercised = new Set<string>();

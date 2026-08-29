@@ -5,6 +5,7 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 import type { Logger } from "./log.js";
 import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
+import { withForgeRetry } from "./forge-retry.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -294,7 +295,13 @@ export class GitCache {
   /** Per-bare-path serialization: git's lockfiles can't take parallel mutations. */
   private readonly locks = new Map<string, Promise<unknown>>();
 
-  constructor(dataDir: string, private readonly log: Logger) {
+  constructor(
+    dataDir: string,
+    private readonly log: Logger,
+    /** Test-only seam for the ensureClone network-op retry. Undefined in production,
+     *  so withForgeRetry falls back to its own FORGE_RETRY_SCHEDULE + real sleep. */
+    private readonly retry?: { schedule?: number[]; sleep?: (ms: number) => Promise<void> },
+  ) {
     this.reposRoot = path.join(dataDir, "repos");
     this.runnerRoot = path.join(dataDir, "runner");
   }
@@ -318,10 +325,18 @@ export class GitCache {
         // never receive these keys at all. That is the exact case the bare-repo reasoning
         // below is about, so writing it only in cloneBare left it applied to none of them.
         await this.disableAutoMaintenance(barePath);
-        await this.fetch(barePath, pat, scope, username);
+        await withForgeRetry(() => this.fetch(barePath, pat, scope, username), {
+          schedule: this.retry?.schedule,
+          sleep: this.retry?.sleep,
+          log: this.log,
+        });
       } else {
         this.log.info("repo cache: cloning bare", { url: repoUrl, bare: barePath });
-        await this.cloneBare(repoUrl, barePath, pat, scope, username);
+        await withForgeRetry(() => this.cloneBare(repoUrl, barePath, pat, scope, username), {
+          schedule: this.retry?.schedule,
+          sleep: this.retry?.sleep,
+          log: this.log,
+        });
       }
       return barePath;
     });
@@ -1407,27 +1422,32 @@ export class GitCache {
   }
 
   private async cloneBare(repoUrl: string, dest: string, pat?: string, scope?: string, username?: string): Promise<void> {
+    // Widen the cleanup over the WHOLE body: a transient blip on the post-clone
+    // authenticated fetch (or the config/disableAutoMaintenance steps) must also rm
+    // `dest` before rethrowing. Otherwise a retry would run `git clone --bare` into a
+    // non-empty dir → a deterministic "already exists" failure (permanent), converting a
+    // transient into a permanent one. This guarantees each retry starts from a clean bare.
     try {
       await this.runGit(undefined, ["clone", "--bare", repoUrl, dest], pat, scope, username);
+      // Convert the mirror refspec to remote-tracking so future fetches write to
+      // refs/remotes/origin/*. Under (b) the bare's refs/heads/* stay the
+      // stale mirror; the agent branch is resolved via refs/remotes/origin/* (resume)
+      // and lands back in refs/uzi-runner/* (fetchAgentBranch), never the bare's heads.
+      await this.runGit(dest, ["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
+      // Issue #134 — belt for a FRESH bare; the warm path in ensureClone is what covers the
+      // deployed fleet. The bare is LONG-LIVED and shared across runs, so auto-maintenance is
+      // arguably wanted here. Disabled anyway because a detached gc can run CONCURRENTLY with
+      // a claim's fetch — a race nobody chose. The cost is real and tracked: an unmaintained
+      // bare never repacks and never prunes, so `gc.autoPackLimit` (default 50) stops guarding
+      // pack growth against a fixed-size PVC. The clean fix is a DELIBERATE
+      // `git maintenance run --task=incremental-repack` taken inside `withLock(barePath)`,
+      // which already serializes every bare operation and so is race-free by construction.
+      await this.disableAutoMaintenance(dest);
+      await this.fetch(dest, pat, scope, username);
     } catch (err) {
       await fs.rm(dest, { recursive: true, force: true });
       throw err;
     }
-    // Convert the mirror refspec to remote-tracking so future fetches write to
-    // refs/remotes/origin/*. Under (b) the bare's refs/heads/* stay the
-    // stale mirror; the agent branch is resolved via refs/remotes/origin/* (resume)
-    // and lands back in refs/uzi-runner/* (fetchAgentBranch), never the bare's heads.
-    await this.runGit(dest, ["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
-    // Issue #134 — belt for a FRESH bare; the warm path in ensureClone is what covers the
-    // deployed fleet. The bare is LONG-LIVED and shared across runs, so auto-maintenance is
-    // arguably wanted here. Disabled anyway because a detached gc can run CONCURRENTLY with
-    // a claim's fetch — a race nobody chose. The cost is real and tracked: an unmaintained
-    // bare never repacks and never prunes, so `gc.autoPackLimit` (default 50) stops guarding
-    // pack growth against a fixed-size PVC. The clean fix is a DELIBERATE
-    // `git maintenance run --task=incremental-repack` taken inside `withLock(barePath)`,
-    // which already serializes every bare operation and so is race-free by construction.
-    await this.disableAutoMaintenance(dest);
-    await this.fetch(dest, pat, scope, username);
   }
 
   private async fetch(barePath: string, pat?: string, scope?: string, username?: string): Promise<void> {
