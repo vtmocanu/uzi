@@ -2311,6 +2311,45 @@ func TestAppendMessagesStampsLineageEpochAndBumps(t *testing.T) {
 			t.Fatalf("a break message alone folds no usage, got %d upserts", len(fs.upsertedUsage))
 		}
 	})
+
+	// (e) Phantom-epoch regression (CodeRabbit review on !809): a break already
+	// persisted AND bumped in a PRIOR batch is re-delivered co-batched with a
+	// genuinely NEW result frame (partial prior persistence under at-least-once
+	// delivery). The re-delivered break is seq-deduped (absent from `inserted`), so it
+	// does NOT re-bump and its bump is already in the run's committed epoch. The new
+	// frame must be stamped that committed epoch, NOT epoch+1: counting the
+	// re-delivered break again would pin a phantom epoch on a FIRST insert and split
+	// one lineage leg across two epoch groups. Guards that the per-frame count reads
+	// the newly-inserted breaks, never `msgs`.
+	t.Run("re-delivered break does not double-count a new frame's epoch", func(t *testing.T) {
+		w := worker()
+		fs := &fakeStore{
+			// The run's epoch already reflects the break's bump from the prior batch.
+			runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), SessionID: pgText("sess-e"), LineageEpoch: 1},
+			// seq 1 (the break) was delivered in that prior batch, so InsertRunMessage
+			// dedups it here (rows == 0, absent from `inserted`).
+			insertedSeqs: map[int32]bool{1: true},
+		}
+		svc := New(fs, newBox(t), testParams())
+
+		msgs := []IncomingMessage{
+			{Seq: 1, Kind: "status", Agent: "lead", Payload: json.RawMessage(`{"event":"resume_lineage_break"}`)},
+			{Seq: 2, Kind: "status", Agent: "lead", Payload: json.RawMessage(
+				`{"event":"result","modelUsage":{"claude-fable-5":{"inputTokens":100,"outputTokens":50,"costUSD":0.001}}}`)},
+		}
+		if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, msgs); err != nil {
+			t.Fatalf("AppendMessages: %v", err)
+		}
+		if fs.lineageEpochBumps != 0 {
+			t.Fatalf("re-delivered break is seq-deduped (absent from inserted) → no bump: want 0, got %d", fs.lineageEpochBumps)
+		}
+		if len(fs.upsertedUsage) != 1 {
+			t.Fatalf("expected 1 usage upsert (only the new result frame folds), got %d", len(fs.upsertedUsage))
+		}
+		if got := fs.upsertedUsage[0].LineageEpoch; got != 1 {
+			t.Fatalf("the new frame must carry the committed epoch 1, not the double-counted 2: got %d", got)
+		}
+	})
 }
 
 // Chat runs (PRD #39) are OUT of scope for usage accounting (PRD #40), but
