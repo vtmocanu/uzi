@@ -754,7 +754,8 @@ export interface AppSettings {
   // /api/branding read below re-types them as bools for the chrome (bool-space).
   // Logo BYTES are never settings keys (Decision D7) — they live in branding_assets
   // and move through the dedicated upload/delete endpoints below.
-  app_logo_mode: string; // "default" | "custom"
+  app_logo_mode: string; // "default" | "custom" | "preset"
+  app_logo_preset: string; // "" or a brandPresets slug
   app_logo_keep_name: string; // "true" | "false"
   brand_mode: string; // "none" | "text" | "logo"
   brand_company: string; // free text, ≤ 64 runes, may be ""
@@ -772,7 +773,8 @@ export interface AppSettings {
 // (Decision D7) — presence is a bool; the image itself loads from
 // /api/branding/logo/{slot}.
 export interface Branding {
-  app_logo_mode: string; // "default" | "custom"
+  app_logo_mode: string; // "default" | "custom" | "preset"
+  app_logo_preset: string; // "" or a brandPresets slug
   app_logo_present: boolean;
   app_logo_keep_name: boolean;
   brand_mode: string; // "none" | "text" | "logo"

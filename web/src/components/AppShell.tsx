@@ -10,6 +10,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api, MOCK_MODE, type Branding, type BuildInfo, type Repo } from "../lib/api";
 import { prefs } from "../lib/prefs";
+import { presetAssetForSlug, presetForSlug } from "../lib/brandPresets";
 import { cx } from "./ui";
 import { VaultBadge, VaultLockedBanner } from "./VaultControls";
 import { RateLimitAnnouncer, SidebarRateLimits } from "./RateLimitMeters";
@@ -225,22 +226,34 @@ function useBranding(): Branding | null {
   return branding;
 }
 
-// The custom-mode app-logo <img> src, or null when the mark should render the
-// default inline FactoryIcon. Custom mode serves the uploaded logo when present,
-// else the shipped preset (/brand-default.svg lands in M3b; referencing it now is
-// fine — the branch lands atomically). NEVER inline SVG: a custom mark is always an
-// <img> so an uploaded SVG stays passive. `null`/pending branding is the default.
+// The app-logo <img> src, or null when the mark should render the default inline
+// FactoryIcon. Three modes (PRD #780): `custom` serves the uploaded logo when
+// present and otherwise renders the FactoryIcon (no upload → no <img>); `preset`
+// resolves the shipped asset from the web-owned catalog by slug, degrading to the
+// FactoryIcon on an empty/unknown slug; `default` (and null/pending branding) is
+// the FactoryIcon. NEVER inline SVG: a resolved mark is always an <img> so an
+// uploaded/preset SVG stays passive.
 function appMarkImgSrc(branding: Branding | null): string | null {
-  if (!branding || branding.app_logo_mode !== "custom") return null;
-  return branding.app_logo_present ? "/api/branding/logo/app" : "/brand-default.svg";
+  if (!branding) return null;
+  if (branding.app_logo_mode === "custom") {
+    return branding.app_logo_present ? "/api/branding/logo/app" : null;
+  }
+  if (branding.app_logo_mode === "preset") {
+    return presetAssetForSlug(branding.app_logo_preset);
+  }
+  return null;
 }
 
 // Whether to render the "uzi" / "uzinele întunecate" name beside the mark. Hidden
-// only in full white-label (custom mode with keep_name=false); default mode and a
-// keep-name co-brand both keep it. `null`/pending branding is the default (shown).
+// only in a full white-label — a non-default mode (custom or preset) with
+// keep_name=false; default mode and any keep-name co-brand keep it. `null`/pending
+// branding is the default (shown). (PRD #780 D4.)
 function appMarkShowName(branding: Branding | null): boolean {
-  if (!branding || branding.app_logo_mode !== "custom") return true;
-  return branding.app_logo_keep_name;
+  if (!branding) return true;
+  if (branding.app_logo_mode === "custom" || branding.app_logo_mode === "preset") {
+    return branding.app_logo_keep_name;
+  }
+  return true;
 }
 
 // The framed app mark, shared across all four chrome surfaces (PRD #685 M3a). Each
@@ -249,6 +262,13 @@ function appMarkShowName(branding: Branding | null): boolean {
 // a custom logo, and clips the <img> to the rounded frame.
 function AppMark({ branding, className }: { branding: Branding | null; className?: string }) {
   const src = appMarkImgSrc(branding);
+  // In preset mode the mark IS the brand identity (a full white-label hides the
+  // wordmark), so give the <img> the preset's label as its accessible name;
+  // custom-logo mode keeps the generic "app logo". (PRD #780 M4 / a11y from M2.)
+  const presetLabel =
+    branding?.app_logo_mode === "preset"
+      ? presetForSlug(branding.app_logo_preset)?.label
+      : undefined;
   return (
     <span
       className={cx(
@@ -260,7 +280,7 @@ function AppMark({ branding, className }: { branding: Branding | null; className
       {src ? (
         <img
           src={src}
-          alt="app logo"
+          alt={presetLabel ?? "app logo"}
           data-testid="app-logo-img"
           className="h-full w-full object-contain"
         />
@@ -301,8 +321,10 @@ function brandLogoImgSrc(branding: Branding): string {
 //
 // `slot` fixes where the block sits, and the component self-selects by
 // brand_placement so each mount renders only when its slot matches:
-//   "below"    — a separate row UNDER the header carrying a faint uppercase POWERED
-//                BY label + the company text or the logo (the default placement).
+//   "below"    — a single right-aligned line UNDER the header: a faint lowercase
+//                "powered by" label inline with the company text or the logo,
+//                tucked close under the wordmark, no separator (the default
+//                placement).
 //   "topright" — logo-only (~96px max, ~26px tall), NO label, sharing the header
 //                row. Top-right is a LOGO-only option (Decision D6), so text mode
 //                always renders below regardless of brand_placement — this keeps the
@@ -351,21 +373,14 @@ function PoweredBy({
   }
 
   return (
-    <div className="border-b border-edge px-4 py-3">
-      <span className="block text-[10px] font-medium uppercase tracking-wider text-faint">
-        POWERED BY
-      </span>
+    <div className="flex items-center justify-end gap-1.5 px-4 pt-1 pb-2 text-right">
+      <span className="text-[10px] font-medium tracking-wider text-faint">powered by</span>
       {isLogo ? (
-        <span
-          className={cx(
-            "mt-1 inline-block",
-            branding.brand_plaque && "rounded-md bg-[#f6f6f8] px-1.5 py-1",
-          )}
-        >
+        <span className={branding.brand_plaque ? "rounded-md bg-[#f6f6f8] px-1.5 py-1" : undefined}>
           {logoImg}
         </span>
       ) : (
-        <span className="mt-1 block text-sm text-fg">{branding.brand_company}</span>
+        <span className="text-sm text-fg">{branding.brand_company}</span>
       )}
     </div>
   );
@@ -875,28 +890,41 @@ function SidebarContent({
             </div>
           ))}
 
-        {/* Server build info (GET /api/version, PRD #175). The badge still reads
-            "v0.6.0" / "dev"; hovering, focusing or tapping it opens the rest of the
-            coordinate set. The native `title` is GONE deliberately — a browser
-            tooltip firing alongside a custom popover is two overlapping panels
-            saying different things. Renders nothing at all until the fetch resolves
-            with a version, exactly as the old badge did. */}
-        {build?.status === "ok" && build.info.version && (
-          <BuildInfoPopover
-            info={build.info}
-            collapsed={collapsed}
-            fetchedAtMs={build.fetchedAtMs}
-            onOpenChangelog={onOpenChangelog}
-          />
-        )}
+        {/* Footer row. Server build info (GET /api/version, PRD #175): the badge
+            reads "v0.6.0" / "dev"; hovering, focusing or tapping it opens the rest of
+            the coordinate set. The native `title` is GONE deliberately — a browser
+            tooltip firing alongside a custom popover is two overlapping panels saying
+            different things. It renders nothing until the fetch resolves with a
+            version, exactly as the old badge did.
 
-        {/* Durable license/author credit (PRD #685 D3). A SEPARATE element, NOT
-            inside the build-gated block above: it is a build-time constant, so it
-            must render during the /api/version load and on its failure alike — a
-            rebrand or full white-label cannot strip it. Hidden only when the rail
-            is collapsed (no room). */}
-        {!collapsed && (
-          <div className="px-3 pb-2 pt-1">
+            The durable license/author credit (PRD #685 D3) is the RIGHT-HAND item of
+            this one-row footer. It is a build-time constant, NOT gated on the build
+            fetch, so it must render during the /api/version load and on its failure
+            alike — a rebrand or full white-label cannot strip it. When the rail is
+            collapsed there is no room for it: the footer falls back to just the
+            build popover's collapsed variant. */}
+        {collapsed ? (
+          build?.status === "ok" &&
+          build.info.version && (
+            <BuildInfoPopover
+              info={build.info}
+              collapsed={true}
+              fetchedAtMs={build.fetchedAtMs}
+              onOpenChangelog={onOpenChangelog}
+            />
+          )
+        ) : (
+          <div className="flex items-center justify-between gap-2 px-3 pb-2 pt-1">
+            {build?.status === "ok" && build.info.version ? (
+              <BuildInfoPopover
+                info={build.info}
+                collapsed={false}
+                fetchedAtMs={build.fetchedAtMs}
+                onOpenChangelog={onOpenChangelog}
+              />
+            ) : (
+              <span aria-hidden="true" />
+            )}
             <LicenseCredit />
           </div>
         )}
