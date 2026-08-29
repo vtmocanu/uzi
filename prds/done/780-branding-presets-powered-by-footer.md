@@ -2,7 +2,7 @@
 
 **Issue**: [#780](https://github.com/vtmocanu/uzi/issues/780)
 **Priority**: Medium
-**Status**: Planned
+**Status**: Done
 
 ## Problem
 
@@ -189,30 +189,30 @@ the preset. The **POWERED BY logo-slot** fallback to `brand-default.svg` is unch
 
 ## Milestones
 
-- [ ] **M1 — Backend: preset setting + mode enum + public field.** `app_logo_preset` key
+- [x] **M1 — Backend: preset setting + mode enum + public field.** `app_logo_preset` key
       with default + slug-format validation; `preset` added to the `app_logo_mode` enum;
       `AppLogoPreset` on `BrandingConfig` and in the public `/api/branding` response
       (update the LiveDB allowlist `wantKeys`). `task gate:api` green — note the allowlist
       guard is LiveDB-gated and runs in CI's store-it job, not the local gate.
-- [ ] **M2 — Web catalog + chrome mark resolution.** `brandPresets.ts` catalog +
+- [x] **M2 — Web catalog + chrome mark resolution.** `brandPresets.ts` catalog +
       `metaminds.svg` asset; `api.ts` types + stale-comment fixes; `AppShell.tsx` resolves
       `preset` mode via the catalog (unknown → uzi mark), widens keep-name to preset, and
       drops the app-slot implicit metaminds fallback (flip the `:171-177` test). Chrome
       renders the preset on all four surfaces (sidebar desktop + mobile, signed-out top bar,
       mobile signed-in top bar). **M2 and M5 ship in the same PR — never M2 alone**, or our
       live sidebar loses the M until the M5 flip.
-- [ ] **M3 — Admin picker + preview.** Replace the App-logo `<select>` with the tile
+- [x] **M3 — Admin picker + preview.** Replace the App-logo `<select>` with the tile
       picker wiring mode+preset; remove the confusing copy; keep upload + keep-name;
       `BrandingPreview` mirrors the new resolution.
-- [ ] **M4 — POWERED BY restyle + one-line footer.** Below placement: no separator, tight,
+- [x] **M4 — POWERED BY restyle + one-line footer.** Below placement: no separator, tight,
       one right-aligned `powered by` line (D8; chrome + preview), all modes/placement/plaque
       preserved (repoint the case-sensitive matcher); footer version + credit on one row,
       collapsed-rail behaviour intact. Layout asserted via class proxies (jsdom).
-- [ ] **M5 — Our-instance transition.** Idempotent two-statement `app_settings` migration
+- [x] **M5 — Our-instance transition.** Idempotent two-statement `app_settings` migration
       (`UPDATE` mode + `INSERT ... ON CONFLICT DO NOTHING` preset) with a `-- +goose Down`,
       flipping custom+no-app-asset → `preset=metaminds`; verify the live sidebar renders
       identically.
-- [ ] **M6 — Docs + full gate.** Update `docs/branding.md`; `task gate` (api + web) green,
+- [x] **M6 — Docs + full gate.** Update `docs/branding.md`; `task gate` (api + web) green,
       including the copy-retirement grep sweep.
 
 ## Success criteria
