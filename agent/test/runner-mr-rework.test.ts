@@ -114,6 +114,10 @@ describe("RunRunner — mr_rework kind (PRD #700 / issue #778)", () => {
     assert.equal(calls.length, 1, "the mr_rework finalize opened exactly one MR");
     const body = JSON.parse(calls[0]!.body ?? "{}");
     assert.equal(body.source_branch, "agent/issue-42");
+    // Pin the exact empty-title fallback mrTitle returns for an mr_rework claim; the
+    // negative `#null` checks below stay as supplementary guards but would pass for any
+    // wrong-but-not-`#null` title, so this equality is the load-bearing assertion.
+    assert.equal(body.title, "MR rework");
     assert.ok(!String(body.title).includes("#null"), "no #null in the MR title");
     assert.ok(!String(body.description).includes("#null"), "no #null in the MR body");
     assert.ok(
