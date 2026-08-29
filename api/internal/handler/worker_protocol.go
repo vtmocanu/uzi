@@ -630,6 +630,35 @@ func (h *Handler) WorkerRunInputs(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"inputs": inputs})
 }
 
+// WorkerRunOwnership returns the current status of a run this worker owns —
+// a lightweight, READ-ONLY ownership/terminality probe (#559). The interactive
+// park-SKIP path uses it to detect a mid-turn reclaim (404) or a terminal
+// transition (200 with a terminal status) early, restoring the ACK the skipped
+// awaiting_followup park report used to give.
+func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
+	wkr, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	runID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+		return
+	}
+	status, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
+	if err != nil {
+		if errors.Is(err, workersvc.ErrRunNotOwned) {
+			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+			return
+		}
+		slog.Error("worker run ownership", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"status": status})
+}
+
 // workerMemoryToDTO maps a stored entry to the worker-facing DTO. It carries run_id
 // (provenance) but OMITS repo_id/repo_name — the worker already knows the run's repo
 // and the write derives it server-side, so echoing it would be redundant surface.

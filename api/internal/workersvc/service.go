@@ -3352,6 +3352,19 @@ type StateRequest struct {
 	// answer guard, which asks "was THIS question answered" rather than "has this run
 	// ever been answered". Required for `awaiting_input`; ignored on every other state.
 	OpenQuestionID *string `json:"open_question_id"`
+	// OpenFollowupID is the park-scoped follow_up watermark reported by the worker on
+	// the `awaiting_followup` transition ONLY (issue #559 M1): the highest follow_up id
+	// the worker has already APPLIED to a turn at the moment it parks. The server CLAMPS
+	// it to the run's max already-consumed follow_up (SetRunAwaitingFollowup's LEAST) —
+	// a correct worker's last-delivered id is always ≤ max-consumed, so the clamp only
+	// neutralizes a buggy huge value; and absent (an old worker, or the first park before
+	// anything was delivered) → the server falls back to that server-derived max-consumed,
+	// byte-identical to the pre-#559 behavior. Deriving the watermark purely server-side
+	// races a follow_up consumed during this report's DB round-trip and would strand the
+	// run, which is why the worker provides it. Additive and OPTIONAL, but the field MUST
+	// exist because httpx.DecodeJSON sets DisallowUnknownFields — a new worker that sends
+	// it would 400 otherwise. Ignored on every state other than awaiting_followup.
+	OpenFollowupID *int64 `json:"open_followup_id"`
 	// LimitResetsAt is the epoch at which the exhausted Anthropic usage window
 	// reopens, as the worker read it off the SDK frame (PRD #35). The worker
 	// normalizes the SDK's unit-less number to MILLISECONDS before sending; the
@@ -3538,7 +3551,12 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			return store.Run{}, false, fmt.Errorf("%w: awaiting_followup requires an interactive task run", ErrInvalidState)
 		}
 		rows, err = s.q.SetRunAwaitingFollowup(ctx, store.SetRunAwaitingFollowupParams{
-			SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+			// int8Param maps nil → pgtype.Int8{} (Valid:false → SQL NULL), so an old
+			// worker that omits open_followup_id lands NULL and the query's COALESCE
+			// fallback recomputes the server-derived max-consumed watermark. A present
+			// value is clamped to ≤ max-consumed by the query's LEAST.
+			OpenFollowupID: int8Param(req.OpenFollowupID),
+			SessionID:      sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "completed":
 		// PRD #265 M1: reconcile the milestone tracker from the lead's signal_done
@@ -4128,6 +4146,18 @@ func (s *Service) ListMemoryForRun(ctx context.Context, wkr store.Worker, runID 
 		UserID: run.UserID,
 		RepoID: uuid.UUID(run.RepoID.Bytes),
 	})
+}
+
+// RunOwnership returns the current status of a run this worker owns, or
+// ErrRunNotOwned when it is not (reclaimed / never owned). Read-only; the
+// interactive park-skip path (#559) uses it to detect a mid-turn reclaim or
+// terminal transition early, restoring the ACK the skipped park report gave.
+func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid.UUID) (string, error) {
+	run, err := s.runOwnedByWorker(ctx, runID, wkr)
+	if err != nil {
+		return "", err
+	}
+	return run.Status, nil
 }
 
 func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr store.Worker) (store.Run, error) {
