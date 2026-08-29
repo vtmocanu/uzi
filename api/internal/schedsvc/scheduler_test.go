@@ -293,6 +293,15 @@ type fakeForge struct {
 	createdIID    int64
 	createCount   int
 	createdLabels []string
+
+	// self_improve open-MR cap (PRD #686 D10/D12): GetMergeRequest returns the forge
+	// state per mr_iid. mrStateByIID maps mr_iid → one of the forge.MRState* constants
+	// (a missing key scans as ""); mrErr forces a transient forge error; getMRIID records
+	// every mr_iid asked for, in order, so a test can prove the cap only inspects the
+	// candidate window.
+	mrStateByIID map[int64]string
+	mrErr        error
+	getMRIID     []int64
 }
 
 func (f *fakeForge) GetIssue(_ context.Context, _ int64, iid int64) (forge.Issue, error) {
@@ -306,6 +315,13 @@ func (f *fakeForge) CreateIssue(_ context.Context, _ int64, _, _ string, labels 
 	f.createCount++
 	f.createdLabels = labels
 	return forge.Issue{IID: f.createdIID}, f.createErr
+}
+func (f *fakeForge) GetMergeRequest(_ context.Context, _ int64, mrIID int64) (forge.MergeRequest, error) {
+	f.getMRIID = append(f.getMRIID, mrIID)
+	if f.mrErr != nil {
+		return forge.MergeRequest{}, f.mrErr
+	}
+	return forge.MergeRequest{IID: mrIID, State: f.mrStateByIID[mrIID]}, nil
 }
 
 type fakeBuilder struct {
@@ -2293,5 +2309,244 @@ func TestTickSelfImproveRaceSkips(t *testing.T) {
 	}
 	if len(h.st.statusCalls) != 0 {
 		t.Fatalf("race skip must not park: statusCalls = %+v", h.st.statusCalls)
+	}
+}
+
+// selfImproveStartedBody returns the body of the single selfimprove_started notification,
+// failing the test if there is not exactly one. It reads the Slack render body, mirroring
+// selfImproveSkippedBody so the "started" and "skipped" body assertions share a shape.
+func selfImproveStartedBody(t *testing.T, h *harness) string {
+	t.Helper()
+	var bodies []string
+	for _, notif := range h.notif.notifications {
+		if notif.Kind == "selfimprove_started" && notif.Slack != nil {
+			bodies = append(bodies, notif.Slack.Body)
+		}
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("selfimprove_started notifications = %d, want exactly 1", len(bodies))
+	}
+	return bodies[0]
+}
+
+// lastFireSkips unmarshals the single advance call's last_fire and returns its recorded
+// skips, failing the test if there is not exactly one advance.
+func lastFireSkips(t *testing.T, h *harness) []lastFireSkip {
+	t.Helper()
+	if len(h.st.advanceCalls) != 1 {
+		t.Fatalf("advance calls = %d, want exactly 1", len(h.st.advanceCalls))
+	}
+	var rec lastFireRecord
+	if err := json.Unmarshal(h.st.advanceCalls[0].LastFire, &rec); err != nil {
+		t.Fatalf("last_fire not valid JSON: %v", err)
+	}
+	return rec.Skips
+}
+
+// TestTickSelfImproveFoldEmptyBacklogUsesFoldString pins PRD #686 M5 case (a): with the
+// dogfood flag ON (the harness default) but an EMPTY improve_uzi backlog, the created run
+// carries the fold-mode empty-backlog description ("Review the uzi codebase …") — NOT the
+// generic const. This is the dogfood branch of the M2 generic-vs-fold split, exercised at
+// its empty edge, so a regression that dropped fold mode into the generic const would
+// redden here even though the non-empty fold test (…FiresFoldsAndAdvances) stays green.
+func TestTickSelfImproveFoldEmptyBacklogUsesFoldString(t *testing.T) {
+	h := newHarness()
+	// Dogfood flag on (default), backlog empty (default siRecs is nil).
+	if !h.st.repoRow.FoldImproveUziBacklog {
+		t.Fatal("precondition: the harness default repo must be dogfood (FoldImproveUziBacklog=true)")
+	}
+	h.st.due = []store.RunSchedule{h.selfImproveSchedule()}
+
+	h.sched.Boot(context.Background())
+
+	if len(h.runs.selfImprove) != 1 {
+		t.Fatalf("CreateSelfImproveRun calls = %d, want 1", len(h.runs.selfImprove))
+	}
+	desc := h.runs.selfImprove[0].description
+	// The fold path was taken (backlog scoped to the owner), even though it was empty.
+	if h.st.siRecsUserParam != h.owner {
+		t.Fatalf("fold mode must query the owner backlog: siRecsUserParam = %v, want %v", h.st.siRecsUserParam, h.owner)
+	}
+	if !strings.Contains(desc, "Review the uzi codebase") {
+		t.Fatalf("empty-fold description = %q, want the fold empty-backlog string", desc)
+	}
+	// It must be the fold string, not the generic const.
+	if desc == genericSelfImproveDescription {
+		t.Fatalf("empty-fold description must not be the generic const: %q", desc)
+	}
+	// Empty backlog ⇒ nothing to mark addressed.
+	if len(h.st.markedIDs) != 0 {
+		t.Fatalf("empty backlog: marked ids = %v, want none", h.st.markedIDs)
+	}
+}
+
+// TestTickSelfImproveGenericSkipsBacklog pins PRD #686 M5 case (b): a NON-dogfood repo
+// (FoldImproveUziBacklog=false) fires the GENERIC run — it never queries the improve_uzi
+// backlog, never marks any addressed, and its description is the generic const carrying
+// none of the uzi-specific wording. The negative assertions on the backlog query are the
+// load-bearing part: the generic path must not touch the owner-scoped backlog at all.
+func TestTickSelfImproveGenericSkipsBacklog(t *testing.T) {
+	h := newHarness()
+	h.st.repoRow.FoldImproveUziBacklog = false
+	// Stage a backlog so a regression that fetched it anyway would be observable via the
+	// description (it would fold "jq" in) rather than silently.
+	h.st.siRecs = []store.ListOpenImproveUziRecommendationsForUserRow{
+		{ID: uuid.New(), Target: "worker: jq", RationaleMd: "install jq"},
+	}
+	h.st.due = []store.RunSchedule{h.selfImproveSchedule()}
+
+	h.sched.Boot(context.Background())
+
+	if len(h.runs.selfImprove) != 1 {
+		t.Fatalf("CreateSelfImproveRun calls = %d, want 1", len(h.runs.selfImprove))
+	}
+	// The backlog query was NOT called: siRecsUserParam stays the zero uuid while the
+	// schedule's owner is non-zero (so a "== owner" regression is not masked by both
+	// being zero).
+	if h.owner == (uuid.UUID{}) {
+		t.Fatal("precondition: the schedule owner must be non-zero for the not-called assertion to bite")
+	}
+	if h.st.siRecsUserParam != (uuid.UUID{}) {
+		t.Fatalf("generic mode must NOT query the backlog: siRecsUserParam = %v, want the zero uuid", h.st.siRecsUserParam)
+	}
+	// MarkAddressed was not called.
+	if len(h.st.markedIDs) != 0 {
+		t.Fatalf("generic mode must not mark any backlog addressed: markedIDs = %v", h.st.markedIDs)
+	}
+	desc := h.runs.selfImprove[0].description
+	if desc != genericSelfImproveDescription {
+		t.Fatalf("generic description = %q, want the generic const %q", desc, genericSelfImproveDescription)
+	}
+	if strings.Contains(desc, "improve_uzi") || strings.Contains(desc, "uzi codebase") {
+		t.Fatalf("generic description must carry no uzi-specific wording: %q", desc)
+	}
+	if strings.Contains(desc, "jq") {
+		t.Fatalf("generic description leaked the staged backlog: %q", desc)
+	}
+}
+
+// TestTickSelfImproveStartedNotificationNamesRepo pins PRD #686 M5 case (c) / M2: the
+// started notification's BODY names the target repo (PathWithNamespace), in both modes.
+// Asserted on the body, not just the kind, because the repo-named notification is the
+// observable behavior the notifier-renderer test cannot reach (Risks §"Notification test
+// is NOT gate-forcing").
+func TestTickSelfImproveStartedNotificationNamesRepo(t *testing.T) {
+	h := newHarness() // default repo path_with_namespace = "vtmocanu/uzi"
+	h.st.due = []store.RunSchedule{h.selfImproveSchedule()}
+
+	h.sched.Boot(context.Background())
+
+	body := selfImproveStartedBody(t, h)
+	if !strings.Contains(body, "vtmocanu/uzi") {
+		t.Fatalf("started notification body = %q, want it to name the repo %q", body, "vtmocanu/uzi")
+	}
+}
+
+// siMRRow builds a candidate row for the open-MR cap with a valid mr_iid.
+func siMRRow(mrIID int64) store.RecentSelfImproveMRRunsForRepoRow {
+	return store.RecentSelfImproveMRRunsForRepoRow{
+		ID:    uuid.New(),
+		MrIid: pgtype.Int8{Int64: mrIID, Valid: true},
+	}
+}
+
+// TestTickSelfImproveOpenMRCapSkips pins PRD #686 M5 Part B / D10: with K (=2) candidate
+// self-improve MRs the forge reports as OPEN, the cycle is SKIPPED — no run, no forge
+// write (no tracking issue created), a selfimprove_skipped notification whose BODY says
+// "open-MR cap reached" (asserted on the body, not the shared kind — the vault skip reuses
+// the kind, N6), a benign advance, and a last_fire skip recording SkipSelfImproveMRCapReached.
+func TestTickSelfImproveOpenMRCapSkips(t *testing.T) {
+	h := newHarness()
+	h.st.siMRRuns = []store.RecentSelfImproveMRRunsForRepoRow{siMRRow(101), siMRRow(102)}
+	h.fb.f.mrStateByIID = map[int64]string{101: forge.MRStateOpened, 102: forge.MRStateOpened}
+	h.st.due = []store.RunSchedule{h.selfImproveSchedule()}
+
+	h.sched.Boot(context.Background())
+
+	if len(h.runs.selfImprove) != 0 {
+		t.Fatalf("cap reached: created %d runs, want 0", len(h.runs.selfImprove))
+	}
+	// The cap precedes any forge write.
+	if h.fb.f.createCount != 0 {
+		t.Fatalf("cap reached: tracking issue created %d, want 0 (cap precedes forge write)", h.fb.f.createCount)
+	}
+	// Both candidates were checked live against the forge.
+	if len(h.fb.f.getMRIID) != 2 {
+		t.Fatalf("cap: GetMergeRequest calls = %v, want both candidates checked", h.fb.f.getMRIID)
+	}
+	// The skip is announced on the BODY, not merely the kind (the vault skip shares the kind).
+	body := selfImproveSkippedBody(t, h)
+	if !strings.Contains(body, "open-MR cap reached") {
+		t.Fatalf("cap skip body = %q, want it to state the open-MR cap", body)
+	}
+	// Benign skip: advances, does not park, and records the cap skip reason.
+	skips := lastFireSkips(t, h)
+	if len(skips) != 1 || skips[0].Reason != string(SkipSelfImproveMRCapReached) {
+		t.Fatalf("last_fire skips = %+v, want exactly one %q", skips, SkipSelfImproveMRCapReached)
+	}
+	if len(h.st.statusCalls) != 0 {
+		t.Fatalf("cap skip must not park: statusCalls = %+v", h.st.statusCalls)
+	}
+}
+
+// TestTickSelfImproveBelowCapFires pins the K-1 edge: 1 OPEN self-improve MR plus one that
+// is MERGED and one that is CLOSED (below the cap of 2) → the cycle FIRES normally. The
+// merged/closed candidates prove non-open MRs are excluded from the count rather than
+// wedging the cap.
+func TestTickSelfImproveBelowCapFires(t *testing.T) {
+	h := newHarness()
+	h.st.siMRRuns = []store.RecentSelfImproveMRRunsForRepoRow{siMRRow(201), siMRRow(202), siMRRow(203)}
+	h.fb.f.mrStateByIID = map[int64]string{
+		201: forge.MRStateOpened,
+		202: forge.MRStateMerged,
+		203: forge.MRStateClosed,
+	}
+	h.st.due = []store.RunSchedule{h.selfImproveSchedule()}
+
+	h.sched.Boot(context.Background())
+
+	if len(h.runs.selfImprove) != 1 {
+		t.Fatalf("below cap (1 open, 1 merged, 1 closed): created %d runs, want 1", len(h.runs.selfImprove))
+	}
+	if got := h.countKind("selfimprove_skipped"); got != 0 {
+		t.Fatalf("below cap must not skip: selfimprove_skipped notifications = %d, want 0", got)
+	}
+	if got := h.countKind("selfimprove_started"); got != 1 {
+		t.Fatalf("below cap: selfimprove_started notifications = %d, want 1", got)
+	}
+}
+
+// TestTickSelfImproveCapForgeErrorRetriesTransiently pins PRD #686 M5 case (e): a
+// GetMergeRequest error while checking a candidate's open-state abandons the whole cycle
+// as TRANSIENT — fireSelfImprove returns a non-nil error, no run is created, and the tick
+// path neither advances nor parks (it retries next tick). RunNow is used to read the
+// returned error directly; a second harness confirms the tick-path (no advance / no park).
+func TestTickSelfImproveCapForgeErrorRetriesTransiently(t *testing.T) {
+	// Direct RunNow: the returned error is non-nil and transient (not a permanent sentinel).
+	h := newHarness()
+	h.st.siMRRuns = []store.RecentSelfImproveMRRunsForRepoRow{siMRRow(301)}
+	h.fb.f.mrErr = errors.New("forge 502")
+	out, err := h.sched.RunNow(context.Background(), h.selfImproveSchedule())
+	if err == nil {
+		t.Fatal("a GetMergeRequest error must surface as a non-nil (transient) fire error")
+	}
+	if errors.Is(err, workersvc.ErrRepoNotFound) || errors.Is(err, workersvc.ErrGuardrailBlocked) {
+		t.Fatalf("cap forge error must be transient, not a permanent park sentinel: %v", err)
+	}
+	if len(out.Started) != 0 || len(h.runs.selfImprove) != 0 {
+		t.Fatalf("cap forge error: created %d runs / %d started, want 0/0", len(h.runs.selfImprove), len(out.Started))
+	}
+
+	// Tick path: a transient fire error neither advances nor parks the schedule.
+	h2 := newHarness()
+	h2.st.siMRRuns = []store.RecentSelfImproveMRRunsForRepoRow{siMRRow(301)}
+	h2.fb.f.mrErr = errors.New("forge 502")
+	h2.st.due = []store.RunSchedule{h2.selfImproveSchedule()}
+	h2.sched.Boot(context.Background())
+	if len(h2.st.advanceCalls) != 0 {
+		t.Fatalf("transient cap error must NOT advance: advanceCalls = %+v", h2.st.advanceCalls)
+	}
+	if len(h2.st.statusCalls) != 0 {
+		t.Fatalf("transient cap error must NOT park: statusCalls = %+v", h2.st.statusCalls)
 	}
 }
