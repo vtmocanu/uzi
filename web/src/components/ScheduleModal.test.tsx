@@ -764,7 +764,8 @@ describe("owner guidance overlay on a sweep default (issue #675)", () => {
     // A cleared overlay is sent as an EXPLICIT null, not undefined, so the server drops it.
     expect(input?.guidance).toBeNull();
     // The read-only baked catalog guidance is never round-tripped through the overlay patch.
-    expect(input?.baked_guidance).toBeUndefined();
+    // (ScheduleInput has no baked_guidance field; assert the emitted patch carries no such key.)
+    expect(Object.keys(input ?? {})).not.toContain("baked_guidance");
   });
 });
 
