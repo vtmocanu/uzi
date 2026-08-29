@@ -89,12 +89,13 @@ export function IssueView() {
     }
   };
 
-  // PRD #764. The detail page drives its Start/Promote affordance off the single
-  // `uzi` label — the SAME predicate the board card uses, so a card's affordances and
-  // its detail page's cannot disagree. An issue carrying `uzi` is runnable and offers
-  // Start run; one without it offers Promote.
-  const isEligible = !!issue && isUziCard(issue, uziLabel);
-  const promotable = !!issue && canPromote(issue, uziLabel);
+  // PRD #764, #767 M5. The detail page drives its Start/Promote affordance off the
+  // SAME predicate the board card uses, so a card's affordances and its detail page's
+  // cannot disagree: an issue is runnable if it carries `uzi` OR is assigned to the
+  // repo's bot. The bot id rides the issue-detail payload (per-connection), not the
+  // session. A runnable issue offers Start run; a non-runnable one offers Promote.
+  const isEligible = !!issue && isUziCard(issue, uziLabel, issue.bot_forge_user_id);
+  const promotable = !!issue && canPromote(issue, uziLabel, issue.bot_forge_user_id);
 
   // Promote (Decision 15; PRD #764): add the `uzi` label forge-first, then adopt the
   // returned card's labels — no optimistic update.
@@ -202,18 +203,29 @@ export function IssueView() {
                     {autopilotLabel}
                   </Badge>
                 )}
-                {/* The runnable marker (PRD #764): an issue carrying the `uzi` label is
-                    uzi's to run. It becomes an explicit badge here — the only form that
-                    reaches a screen reader — brand-toned like the card's highlighted
-                    `uzi` chip. An issue without it offers Promote instead (below). */}
-                {isEligible && (
-                  <Badge
-                    tone="brand"
-                    title={`This issue carries the ${uziLabel} label, so uzi will run it.`}
-                  >
-                    {uziLabel}
-                  </Badge>
-                )}
+                {/* The runnable marker (PRD #764, widened by #767 M5): an issue is uzi's
+                    to run if it carries the `uzi` label OR is assigned to the repo's bot.
+                    It becomes an explicit badge here — the only form that reaches a screen
+                    reader — brand-toned like the card's highlighted `uzi` chip. The two
+                    paths get DISTINCT copy so the marker never claims a label an
+                    assignment-only issue does not carry. An issue with neither offers
+                    Promote instead (below). */}
+                {isEligible &&
+                  (issue.labels.includes(uziLabel) ? (
+                    <Badge
+                      tone="brand"
+                      title={`This issue carries the ${uziLabel} label, so uzi will run it.`}
+                    >
+                      {uziLabel}
+                    </Badge>
+                  ) : (
+                    <Badge
+                      tone="brand"
+                      title="This issue is assigned to the uzi bot, so it's eligible for a uzi run — start it, or let autopilot or an enabled sweep pick it up."
+                    >
+                      assigned
+                    </Badge>
+                  ))}
                 {issue.author && <span className="text-xs text-faint">{issue.author}</span>}
                 {/* Neutral PRD-presence marker (PRD #764): a linked prds/*.md is optional
                     but still detected, so an issue that has one shows a quiet "PRD" badge. */}

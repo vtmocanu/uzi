@@ -86,6 +86,81 @@ describe("SteeringChannel", () => {
   });
 });
 
+// issue #559 M2: the channel tracks the highest follow_up input id it has already DELIVERED
+// to the executor (getLastDeliveredFollowUpId) — the wake-guard watermark the runner reports
+// as open_followup_id at the interactive park. Buffering a follow-up does NOT advance it; only
+// delivery (the takeFollowUp shift) does, which is what keeps it stable across the park
+// report's DB round-trip.
+describe("SteeringChannel — last-delivered follow-up watermark (issue #559)", () => {
+  const inpId = (kind: UserInput["kind"], id: number, body?: string): UserInput => ({
+    id,
+    kind,
+    body: body ?? null,
+  });
+
+  it("threads the input id through route/follow_up; pullFollowUp advances the watermark to the delivered id", async () => {
+    // Mutation: drop the `id` param on route() (or store body only) → the queue loses the id
+    // and the watermark can never advance past 0.
+    const { ch } = makeChannel([
+      [inpId("follow_up", 3, "a"), inpId("follow_up", 7, "b")],
+    ]);
+    ch.start();
+    await tick(); // poll consumes + buffers both — buffering must NOT advance the watermark
+    assert.strictEqual(ch.getLastDeliveredFollowUpId(), 0, "buffered, not delivered");
+    assert.strictEqual(ch.pullFollowUp(), "a");
+    assert.strictEqual(ch.getLastDeliveredFollowUpId(), 3, "advanced to the first delivered id");
+    assert.strictEqual(ch.pullFollowUp(), "b");
+    assert.strictEqual(ch.getLastDeliveredFollowUpId(), 7, "advanced to the second delivered id");
+    assert.strictEqual(ch.pullFollowUp(), undefined);
+    assert.strictEqual(ch.getLastDeliveredFollowUpId(), 7, "an empty pull leaves it unchanged");
+    await ch.stop();
+  });
+
+  it("awaitFollowUp's drain-after-arm advances the watermark; buffering alone does NOT (the race property)", async () => {
+    // The race the whole feature closes: a follow-up merely BUFFERED (consumed by the poll loop
+    // while no waiter is armed) must not move the watermark, so a report in flight cannot fold
+    // it in. Only arming + delivering it advances the watermark. Mutation: make pullFollowUp/
+    // awaitFollowUp shift `this.followUps` directly instead of via takeFollowUp → delivery no
+    // longer advances the watermark and the final assert reddens.
+    const { ch } = makeChannel([[inpId("follow_up", 12, "task")]]);
+    ch.start();
+    await tick(); // buffered, no waiter armed yet
+    assert.strictEqual(ch.getLastDeliveredFollowUpId(), 0, "a buffered follow-up does not advance it");
+    const outcome = await ch.awaitFollowUp(60_000); // immediate-return branch drains the buffer
+    assert.deepStrictEqual(outcome, { kind: "followup", body: "task" });
+    assert.strictEqual(ch.getLastDeliveredFollowUpId(), 12, "delivery advanced it");
+    await ch.stop();
+  });
+
+  it("serviceFollowUp (poll-loop delivery to a parked waiter) advances the watermark", async () => {
+    // The third delivery site: the waiter is armed BEFORE the first poll routes, so the follow-up
+    // is delivered from serviceFollowUp (post-route), not the immediate-return branch. Mutation:
+    // leave serviceFollowUp shifting `this.followUps` directly → the watermark stays 0.
+    const { ch } = makeChannel([[inpId("follow_up", 9, "y")]]);
+    ch.start();
+    const parked = ch.awaitFollowUp(60_000); // arm before the first poll routes anything
+    const outcome = await parked;
+    assert.deepStrictEqual(outcome, { kind: "followup", body: "y" });
+    assert.strictEqual(ch.getLastDeliveredFollowUpId(), 9, "serviceFollowUp advanced it");
+    await ch.stop();
+  });
+
+  it("the watermark is monotone (Math.max) across out-of-order delivered ids", async () => {
+    // A lower id delivered after a higher one must NOT regress the watermark. Mutation: replace
+    // Math.max(...) with a plain assignment in takeFollowUp → the second pull drops it to 4.
+    const { ch } = makeChannel([
+      [inpId("follow_up", 10, "hi"), inpId("follow_up", 4, "lo")],
+    ]);
+    ch.start();
+    await tick();
+    assert.strictEqual(ch.pullFollowUp(), "hi");
+    assert.strictEqual(ch.getLastDeliveredFollowUpId(), 10);
+    assert.strictEqual(ch.pullFollowUp(), "lo");
+    assert.strictEqual(ch.getLastDeliveredFollowUpId(), 10, "a lower delivered id never regresses it");
+    await ch.stop();
+  });
+});
+
 // PRD #41: plan revision at the gate. The channel epoch-stamps every verdict/revise so
 // one written against a stale plan version is discardable, and a revise both enqueues
 // (FIFO) and wakes the gate.

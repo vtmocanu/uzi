@@ -189,7 +189,7 @@ func TestListSweepCandidateIssuesMaxIssuesLiveDB(t *testing.T) {
 
 	sweepIIDs := func(max pgtype.Int4) []int64 {
 		rows, err := q.ListSweepCandidateIssues(ctx, store.ListSweepCandidateIssuesParams{
-			RepoID: repoID, Labels: labels, MaxIssues: max,
+			RepoID: repoID, Selector: "label", Labels: labels, MaxIssues: max,
 		})
 		if err != nil {
 			t.Fatalf("ListSweepCandidateIssues: %v", err)
@@ -246,7 +246,7 @@ func TestListSweepCandidateIssuesScanWindowLiveDB(t *testing.T) {
 	}
 
 	rows, err := q.ListSweepCandidateIssues(ctx, store.ListSweepCandidateIssuesParams{
-		RepoID: repoID, Labels: []byte(`["bug"]`), MaxIssues: pgtype.Int4{Int32: window, Valid: true},
+		RepoID: repoID, Selector: "label", Labels: []byte(`["bug"]`), MaxIssues: pgtype.Int4{Int32: window, Valid: true},
 	})
 	if err != nil {
 		t.Fatalf("ListSweepCandidateIssues: %v", err)

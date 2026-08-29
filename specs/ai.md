@@ -23044,3 +23044,157 @@ of the "looks queued, never runs" gap the `issue-triage` skill exists to hunt.
   section **supersedes** the design recorded in §119 (PRDLESS settings) and §308 (`PRD`+`PRDLESS`
   server-side assembly), and the run-eligibility narrative in §445; those remain as history of the
   now-removed model.
+
+## 585. Issue #688 — white-label the favicon base icon and the browser-tab `<title>`, reusing #685's `/api/branding` (no new setting)
+
+Follow-up to the #685 instance-branding layer, extending it to the two chrome surfaces #685 left
+factory-branded. **`web/`-only: no api, agent, DB, or migration change** — every value both surfaces
+need is already in the public `GET /api/branding` response (`app_logo_mode`, `app_logo_preset`,
+`app_logo_present`, `app_logo_keep_name`, `brand_company`), so nothing server-side moves.
+
+- **Favicon base white-labels to the admin app logo, the PRD #70 status overlay unchanged (§276).**
+  `web/src/lib/favicon.ts`'s `renderFavicon`/`applyFavicon` take an optional preloaded
+  `HTMLImageElement`; when a drawable branded base is supplied it is drawn object-contain on the
+  near-black field **instead of** the stroked ember `FactoryIcon`, with the status dot still overlaid.
+  `web/src/lib/useFavicon.ts` gains an `appLogoSrc` param (fed `appMarkImgSrc(branding)` at the
+  AppShell call site) that preloads a **same-origin** `<img>` (`/api/branding/logo/app` or a preset
+  asset — no `crossOrigin`) and re-applies on decode. The base is the app logo whenever one is set
+  (custom-with-upload or preset), **independent of keep_name** — keep_name governs the wordmark, not
+  the logo image. Unbranded stays today's ember mark; idle+unbranded still restores the static
+  `/favicon.svg`.
+- **Applies signed-out.** The favicon base and the title both white-label for a guest on a branded
+  instance (the favicon carries no status dot signed-out). The `useFavicon` disabled/logged-out branch
+  keeps `baseImgRef` (branding is independent of auth); the `document.title` effect sits before
+  AppShell's guest early return.
+- **Canvas is not tainted.** A same-origin `<img>` keeps the canvas clean, so `toDataURL` does not
+  throw regardless of the `/api/branding/logo/app` route's `Content-Security-Policy: sandbox` +
+  `X-Content-Type-Options: nosniff` response headers (those govern documents/sniffing, not an
+  `<img>`-loaded same-origin resource). Verified in a real browser against the preset path; the
+  custom-upload path with those exact headers is the one live-stack residual.
+- **Accepted limitation: a dimensionless SVG base (viewBox only, no intrinsic `width`/`height`) falls
+  back to the factory mark in browsers that report `naturalWidth === 0`.** `isDrawableImage`'s
+  `naturalWidth > 0` guard doubles as the load-error detector, so it is deliberately NOT relaxed; a
+  browser (e.g. some Firefox/Safari versions) that gives a dimensionless SVG no intrinsic size simply
+  shows the unbranded mark — graceful, no error. Chromium derived a non-zero size for the shipped
+  preset, so it brands there. Fixing an admin's own dimensionless upload is out of scope.
+- **Tab `<title>` reuses `brand_company`, gated on the FULL white-label condition.**
+  `web/src/lib/brandTitle.ts#brandTabTitle` returns `brand_company` only when the instance is fully
+  white-labeled — the same white-label gate as `appMarkShowName` (§ #685), its logical inverse
+  selecting the identical instance set (no shared helper binds them): `app_logo_mode` is `custom` or
+  `preset` **and** `app_logo_keep_name === false` — and `brand_company` is non-empty after trim; else
+  the static default. Per the issue's 2026-08-29 triage steer this reuses the existing
+  `brand_company` field rather than adding a dedicated `brand_title` setting. Consequences, accepted:
+  a co-brand (keep_name=true) keeps the uzi title; a white-label with an empty `brand_company` falls
+  back to the default (no other text source exists — the admin sets `brand_company` to drive the tab).
+  `DEFAULT_TITLE` is kept byte-identical to `web/index.html:6` (`Uzi — AI dark factory`, U+2014 em
+  dash); `index.html` retains the static title as the correct pre-hydration/unbranded value and the
+  SPA overrides `document.title` at runtime once branding resolves.
+- **Inherited (not introduced here): branding is module-memoised**, so a live branding change in Admin
+  does not update the favicon or title without a full reload — the existing #685 chrome behavior,
+  which these surfaces correctly track.
+
+## 586. issue #559 — close two #558-review residuals of the interactive wake-guard watermark: worker-PROVIDED (not server-derived) `open_followup_id`, and an ownership ACK on the park-SKIP path
+
+Context: two residuals surfaced by the #558 merge-gate review of the interactive-run mid-turn
+wake-guard watermark (issue #552 M1 / PRD #517). The watermark is `runs.open_followup_id`, which
+`SetRunRunning`'s Decision-7 guard compares (`id > COALESCE(open_followup_id, 0)`,
+`api/internal/store/queries/runtime.sql`) to admit `awaiting_followup → running`.
+
+- **Residual 1 — the watermark is now WORKER-PROVIDED, reversing #552 M1's server-derived design.**
+  `SetRunAwaitingFollowup` previously stamped `open_followup_id` from a server-derived
+  `MAX(consumed follow_up id)` subquery. That races a follow-up consumed by the poll loop DURING
+  the park report's DB round-trip: it folds a not-yet-applied follow-up into the watermark, so that
+  follow-up's own wake report fails `id > watermark` and strands the run at `awaiting_followup`
+  until the ~30m idle sweeper. Fix: the worker reports the highest follow_up id it has already
+  DELIVERED as `open_followup_id` on the `awaiting_followup` `StateRequest`
+  (`agent/src/protocol.ts`, `api/internal/workersvc/service.go` `StateRequest.OpenFollowupID
+  *int64`), and the server stamps `GREATEST(0, LEAST(COALESCE(@open_followup_id, <server
+  max-consumed>), <server max-consumed>))`. Worker-owned because only the worker knows what it
+  applied: buffering a follow-up during the round-trip does NOT advance the worker's last-delivered
+  id — `agent/src/steering.ts` `takeFollowUp` is the SINGLE shift+advance site (route→push only
+  buffers), and the follow-up waiter is armed only AFTER the report returns
+  (`agent/src/runner.ts`) — so the racing follow-up is excluded and its later wake succeeds.
+  The `LEAST(..., max-consumed)` ceiling and `GREATEST(0, ...)` floor bound a buggy worker value
+  (a huge value would strand forever; a negative value would fail-open `id > -1` and reopen #558)
+  to the range a correct worker could send — self-harm only, no cross-run reach. Absent field (old
+  worker / first park before anything delivered) → `int8Param(nil)` → NULL → COALESCE falls back to
+  the pre-#559 server-derived value, byte-identical and backward compatible. The value is
+  additive-optional: the request SCHEMA must DECLARE `open_followup_id` so `httpx.DecodeJSON`
+  (which sets `DisallowUnknownFields`) accepts it when a new worker sends it, but an old worker may
+  OMIT the wire field — an absent field decodes to NULL and preserves the server-derived fallback. This
+  **reverses** the SOURCE half of §566's #552 M1 decision (the `awaiting_followup`/wake-guard design
+  under PRD #517): its server-derived, no-worker-echo watermark is retired for the
+  worker-provided-then-clamped value. Only the source changes — the watermark is still stamped at
+  every park, there is still no clear-on-wake, and the guard predicate itself is UNCHANGED.
+- **Residual 2 — restore the ownership/terminality ACK on the park-SKIP path.** When a follow-up is
+  already buffered, the worker deliberately SKIPS the `awaiting_followup` park report (the #558 fix,
+  so it doesn't fold the not-yet-applied follow-up into the watermark) and services the buffered
+  outcome directly — but that skipped report's ACK doubled as the ownership check that throws
+  `REASON_FOLLOWUP_NOT_PARKED` when the run went terminal or was reclaimed by another worker.
+  Restored via a new read-only worker endpoint `GET /api/worker/runs/{id}/ownership`
+  (`WorkerRunOwnership` → `workersvc.RunOwnership`, reusing `GetRunOwnedByWorker` — no new SQL) that
+  the runner probes on the skip path. Only a DEFINITIVE answer throws early: a terminal status
+  (`completed`/`failed`/`cancelled`, `FOLLOWUP_TERMINAL_STATUSES`) or a definitive 404 (reclaimed).
+  A TRANSIENT error (network / 5xx) logs a warning and PROCEEDS — no new spurious-failure mode; the
+  `SetRunRunning` worker_id pin and the next ACK-checked park report remain the backstop.
+- Commits `aace2d0b`/`fc072247` (M1, server clamp+floor), `d8625495` (M2, worker threads the
+  last-delivered id through `SteeringChannel`), `ab774e05` (M3, park-skip ownership probe).
+
+## 587. PRD #767 — assignment to the uzi-bot is a second, equivalent expression of the single run-eligibility gate
+
+Serves human: Feature #22 (eligibility model) — extends §584's single `uzi`-label gate. An issue
+is uzi's to run if it carries the `uzi` label **OR** is assigned to the uzi-bot account. Additive:
+one eligibility concept, now two natural expressions (label a card, or assign it to the bot), so a
+teammate who says "this is yours" by assigning gets the same result as labelling.
+
+- **One gate, OR'd — not a second gate.** The change is a single OR at the one existing eligibility
+  check in `workersvc.createRun` (`service.go`): `isEligibleIssue(labels, {uzi_label})` **OR**
+  `isAssignedToBot(assignee_ids, bot_forge_user_id)`. All four create paths (interactive /
+  scheduled / autopilot / scheduled-autopilot) inherit it because they share that one gate; no path
+  grew its own assignment logic. The refusal sentinel stays `ErrNotPRDIssue` / the `not_eligible`
+  wire reason — no new skip-reason. Eligibility is derived from the **cached** `labels`/`assignee_ids`
+  jsonb (the same rows the board renders), so the button a user sees and the gate the server applies
+  cannot disagree.
+- **D1 — assignment grants eligibility ONLY; it never auto-runs.** An assigned issue becomes
+  *runnable*, exactly like a `uzi`-labelled one; unattended execution still requires the `autopilot`
+  label or an enabled sweep. Assignment is not a trigger. Because assignment has no "adder" to
+  resolve, it does NOT bypass autopilot's existing label-add consent/attribution gate: the poller
+  still attributes the run to whoever added the `autopilot` label (issue author as fallback) and
+  still requires that owner to have opted in (forge identity + Anthropic token). Assignment only
+  widens the candidate set for the `autopilot` label and the enabled `assigned-sweep`; it never
+  grants unattended execution without one of those mechanisms.
+- **D2 — match on the numeric `bot_forge_user_id`, not the bot username.** `isAssignedToBot`
+  decodes the `assignee_ids` set and tests membership of the connection's numeric
+  `bot_forge_user_id` (carried on `forge_connections`, surfaced on the board/issue/repo DTOs as
+  `bot_forge_user_id` for the web runnable-marker in M5). Numeric id is rename-safe: renaming the
+  bot account does not silently drop eligibility. Guards: a non-positive bot id, an assignee id of
+  0, a human-only co-assignee, and undecodable `assignee_ids` all yield *not eligible*; the bot
+  among multiple (human) assignees is a match (set membership).
+- **Assignees synced end to end (M1).** The forge drivers read issue assignees and persist them as
+  the `assignee_ids` jsonb on the cached issue (preserved verbatim on the paths that must not
+  re-derive it), so the poller (M3) and sweeps (M4) evaluate assignment from cache like every other
+  eligibility input.
+- **`assigned-sweep` non-label selector + D3.** New default-catalog schedule
+  (`schedtmpl/catalog/assigned-sweep.md`, slug `assigned-sweep`, `selector: assigned`, daily
+  `0 2 * * *` UTC, `max_issues: 3`) whose candidate query selects open issues **assigned to the
+  bot** rather than by label — a selector kind orthogonal to `Planned`/`bug`. Per §570's model it
+  is materialized on enable and prompt-by-reference. D3: it ships `auto_approve` ON — like every
+  default job (the shared `schedtmpl.AutoApprove = true` constant, matching bug-triage /
+  planned-sweep), because *enabling the sweep* is the deliberate opt-in to unattended runs; the
+  prompt tells the worker to treat the issue description + any linked spec as the spec and deliver
+  with tests behind the project gate.
+- **D5 — read-only.** uzi only READS assignees to evaluate eligibility; it never auto-assigns the
+  bot to an issue. There is no write path that sets an assignee.
+- **D6 — trust-equivalence (verified this run): assignment is NOT a weaker gate than the label.**
+  On all three forges, assigning an issue requires the same permission tier as applying a label:
+  GitHub **Triage**; GitLab **Reporter** (a Guest/author may set issue metadata only at *creation*
+  time, and that creation-time exception applies equally to labels AND assignees, so there is no
+  split that would make assignment the softer gate); Forgejo/Gitea **Write** on the Issues unit. So
+  OR-ing assignment into the eligibility gate does not lower the bar a `uzi` label already set — the
+  safety equivalence holds. **Caveat:** GitLab bundles assignee + label under one "edit issue
+  metadata" permission and this is version-dependent — re-verify on a major GitLab upgrade.
+- **Not a main-protection change.** Same as §584: the default-branch and no-`.github/workflows`
+  guardrails are independent of the eligibility gate; adding the OR has no main-protection
+  implication.
+- Full rationale, milestone map (M1 sync → M2 gate → M3 poller → M4 sweeps → M5 web), and Decision
+  Log: `prds/767-*.md`. This section extends §584; it does not supersede it.

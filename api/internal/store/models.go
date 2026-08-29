@@ -241,6 +241,7 @@ type Issue struct {
 	ForgeUpdatedAt pgtype.Timestamptz `json:"forge_updated_at"`
 	SyncedAt       pgtype.Timestamptz `json:"synced_at"`
 	BoardPosition  pgtype.Int8        `json:"board_position"`
+	AssigneeIds    []byte             `json:"assignee_ids"`
 }
 
 type IssueProposal struct {

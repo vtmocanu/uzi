@@ -46,6 +46,14 @@ export class FakeApi {
     { status: number; body: string }
   >();
   private readonly refuseAllStates = new Set<string>();
+  // issue #559 M3: the read-only ownership probe (GET /runs/{id}/ownership). A run
+  // with no override answers 200 {status:"running"} — the "still ours, keep going"
+  // default the skip path proceeds on. An override expresses a terminal status, a
+  // 404 not-owned, or a transient 5xx.
+  private readonly ownershipByRun = new Map<
+    string,
+    { httpStatus: number; status?: string }
+  >();
 
   // --- records -------------------------------------------------------------
   readonly registers: RecordedRegister[] = [];
@@ -164,6 +172,24 @@ export class FakeApi {
 
   setInputs(runId: string, inputs: UserInput[]): void {
     this.inputsByRun.set(runId, inputs);
+  }
+
+  /** issue #559 M3: answer the ownership probe for this run with 200 {status}. Use a
+   *  terminal status (completed/failed/cancelled) to drive the skip-path terminal throw. */
+  setOwnershipStatus(runId: string, status: string): void {
+    this.ownershipByRun.set(runId, { httpStatus: 200, status });
+  }
+
+  /** issue #559 M3: answer the ownership probe with 404 — the DEFINITIVE not-owned
+   *  (reclaimed) signal that makes the skip path throw REASON_FOLLOWUP_NOT_PARKED. */
+  setOwnershipNotOwned(runId: string): void {
+    this.ownershipByRun.set(runId, { httpStatus: 404 });
+  }
+
+  /** issue #559 M3: answer the ownership probe with a TRANSIENT error (default 503) —
+   *  neither a 404 nor a terminal status, so the skip path logs and PROCEEDS. */
+  failOwnership(runId: string, httpStatus = 503): void {
+    this.ownershipByRun.set(runId, { httpStatus });
   }
 
   /** Observe each /state report as it lands, so a test can react to a value the
@@ -287,6 +313,20 @@ export class FakeApi {
         return send(res, 200, { inputs: pending });
       }
     }
+
+    // issue #559 M3: the read-only ownership probe. Not part of the runMatch
+    // alternation above (it is a GET-only read of a distinct segment), so it is
+    // routed here. No override ⇒ 200 {status:"running"} (still ours, keep going).
+    const ownMatch = /^\/api\/worker\/runs\/([^/]+)\/ownership$/.exec(p);
+    if (req.method === "GET" && ownMatch) {
+      const runId = ownMatch[1] as string;
+      const o = this.ownershipByRun.get(runId);
+      if (!o) return send(res, 200, { status: "running" });
+      if (o.httpStatus !== 200)
+        return send(res, o.httpStatus, { error: "run not found for this worker" });
+      return send(res, 200, { status: o.status ?? "running" });
+    }
+
     return send(res, 404, { error: "not found", path: p });
   }
 

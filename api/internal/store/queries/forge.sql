@@ -308,6 +308,37 @@ WHERE repo_id = @repo_id AND position >= @from_position;
 -- Do not add `board_position = EXCLUDED.board_position` here. Guarded behaviourally by
 -- TestUpsertIssuePreservesBoardPositionLiveDB, because a comment cannot catch an edit.
 INSERT INTO issues (
+    repo_id, forge_issue_iid, title, state, labels, assignee_ids, web_url, author,
+    has_prd_link, forge_updated_at, synced_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+ON CONFLICT (repo_id, forge_issue_iid) DO UPDATE
+SET title            = EXCLUDED.title,
+    state            = EXCLUDED.state,
+    labels           = EXCLUDED.labels,
+    assignee_ids     = EXCLUDED.assignee_ids,
+    web_url          = EXCLUDED.web_url,
+    author           = EXCLUDED.author,
+    has_prd_link     = EXCLUDED.has_prd_link,
+    forge_updated_at = EXCLUDED.forge_updated_at,
+    synced_at        = now()
+RETURNING *;
+
+-- name: UpsertIssueLabels :one
+-- The label-only cache-write variant for the AutoMove and SetIssueLabel paths (PRD
+-- #767). It extends UpsertIssue's board_position preservation (above) to assignee_ids:
+-- BOTH column lists here DELIBERATELY OMIT assignee_ids (and keep board_position
+-- omitted too), so a label mutation that races a concurrent forge sync can never
+-- overwrite the DB's freshly-synced assignee_ids with the caller's STALE in-memory
+-- snapshot. assignee_ids is forge-owned — the sync re-derives and re-writes it every
+-- poll via UpsertIssue — so a path that only changes labels must leave it exactly as
+-- the last sync stored it, or it momentarily drops "assigned-to-bot" run-eligibility
+-- until the next poll. On the normal existing-row conflict path the DB's assignee_ids
+-- is preserved atomically. A brand-new row would take the column default '[]'
+-- (migration 00175, assignee_ids NOT NULL DEFAULT '[]'), which is harmless — these
+-- paths only ever operate on already-cached rows. Do not add assignee_ids (or
+-- board_position) to either list here. Guarded behaviourally by
+-- TestUpsertIssueLabelsPreservesAssigneesLiveDB, because a comment cannot catch an edit.
+INSERT INTO issues (
     repo_id, forge_issue_iid, title, state, labels, web_url, author,
     has_prd_link, forge_updated_at, synced_at
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())

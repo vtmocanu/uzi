@@ -2491,6 +2491,51 @@ func TestSetStateAwaitingFollowupAcceptsInteractiveTask(t *testing.T) {
 	}
 }
 
+// Issue #559 M1: the worker-provided follow_up watermark threads from the StateRequest
+// into SetRunAwaitingFollowupParams.OpenFollowupID. A present *int64 lands Valid with the
+// exact value; an omitted (nil) field lands NULL (Valid:false) so the query's COALESCE
+// fallback recomputes the server-derived watermark (old-worker parity). The store-level
+// clamp is proven by the LiveDB tests; here we prove the SERVICE hands the value across.
+func TestSetStateAwaitingFollowupThreadsOpenFollowupID(t *testing.T) {
+	w := worker()
+	owned := store.Run{WorkerID: pgUUID(w.ID), Status: "running", Kind: RunKindTask, Interactive: true}
+
+	t.Run("present value threads as Valid", func(t *testing.T) {
+		owned.ID = uuid.New()
+		fs := &fakeStore{runOwned: owned, setFollowupRows: 1}
+		svc := New(fs, newBox(t), testParams())
+		want := int64(4242)
+		if _, _, err := svc.SetState(context.Background(), w, owned.ID, StateRequest{
+			State: "awaiting_followup", OpenFollowupID: &want,
+		}); err != nil {
+			t.Fatalf("SetState: %v", err)
+		}
+		if fs.setFollowup == nil {
+			t.Fatal("SetRunAwaitingFollowup was never called")
+		}
+		if !fs.setFollowup.OpenFollowupID.Valid || fs.setFollowup.OpenFollowupID.Int64 != want {
+			t.Fatalf("OpenFollowupID = %+v, want Valid with Int64=%d — the worker-provided watermark did not thread through",
+				fs.setFollowup.OpenFollowupID, want)
+		}
+	})
+
+	t.Run("omitted value lands NULL for the COALESCE fallback", func(t *testing.T) {
+		owned.ID = uuid.New()
+		fs := &fakeStore{runOwned: owned, setFollowupRows: 1}
+		svc := New(fs, newBox(t), testParams())
+		if _, _, err := svc.SetState(context.Background(), w, owned.ID, StateRequest{State: "awaiting_followup"}); err != nil {
+			t.Fatalf("SetState: %v", err)
+		}
+		if fs.setFollowup == nil {
+			t.Fatal("SetRunAwaitingFollowup was never called")
+		}
+		if fs.setFollowup.OpenFollowupID.Valid {
+			t.Fatalf("OpenFollowupID = %+v, want NULL (Valid:false) for an old worker so the server-derived fallback fires",
+				fs.setFollowup.OpenFollowupID)
+		}
+	})
+}
+
 // Each fixture flips exactly ONE of the two guard conditions, so a test that dropped
 // either half of `kind == RunKindTask && interactive` would let one of these through;
 // a run holding both would satisfy the guard and could not observe the guard at all.

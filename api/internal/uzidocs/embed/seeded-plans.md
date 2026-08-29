@@ -108,8 +108,9 @@ So for a large, multi-component change, pick deliberately:
 ## No PRD file needed
 
 An issue with no `prds/*.md` file works fine, since the plan you're
-supplying is what a PRD file would have provided anyway. It needs only the
-`uzi` label — the single run-eligibility gate — nothing else.
+supplying is what a PRD file would have provided anyway. It needs only to
+be eligible — the `uzi` label, or the issue assigned to the uzi-bot
+account — nothing else.
 
 Adding the `uzi` label to a fresh issue doesn't take effect immediately:
 uzi checks against its own cached copy of the issue's labels, which only

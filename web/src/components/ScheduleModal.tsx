@@ -35,6 +35,7 @@ import { LockIcon } from "./icons";
 import { XIcon, TrashIcon, CopyIcon } from "./icons";
 import { ModelSelect } from "./ModelSelect";
 import { modelFieldWarning } from "../lib/agentTemplates";
+import { browserTimezone } from "../lib/timezone";
 import {
   cronFromPreset,
   DEFAULT_PRESET_STATE,
@@ -67,14 +68,6 @@ const TIMING_OPTIONS: { value: ScheduleTiming; title: string; desc: string }[] =
 ];
 
 const COMMON_TIMEZONES = ["UTC", "Europe/Bucharest", "America/New_York", "Europe/London"];
-
-function browserTimezone(): string {
-  try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-  } catch {
-    return "UTC";
-  }
-}
 
 // toLocalInput / fromLocalInput bridge an ISO instant and a <input type="datetime-local">
 // value (which is a wall-clock string with no zone). We treat the picker as the

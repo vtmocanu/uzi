@@ -1055,12 +1055,14 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 	case errors.Is(err, workersvc.ErrInvalidSelection):
 		httpx.Error(w, http.StatusBadRequest, "invalid agent selection: "+err.Error())
 	case errors.Is(err, workersvc.ErrNotPRDIssue):
-		// PRD #764: the single run-eligibility gate. An issue without the uzi_label is
-		// not uzi's to run — tell the user to add it. A PRD link is no longer required,
-		// so this is the only eligibility refusal.
+		// PRD #764, widened by PRD #767: the single run-eligibility gate. An issue is
+		// uzi's to run if it carries the uzi_label OR is assigned to the uzi-bot account
+		// (assignment is the second eligibility signal). Tell the user either way to make
+		// it eligible. A PRD link is no longer required, so this is the only eligibility
+		// refusal.
 		uziLabel, _ := h.settings.UziLabel(r.Context())
 		httpx.Error(w, http.StatusUnprocessableEntity,
-			fmt.Sprintf("this issue does not carry the %s label; add it before starting a run", uziLabel))
+			fmt.Sprintf("this issue is not marked as uzi's work; add the %s label or assign it to uzi, then start the run", uziLabel))
 	case errors.Is(err, workersvc.ErrTaskBaseBranchTooLong):
 		// PRD #400: the optional base_branch exceeded its dedicated cap. A caller error
 		// (a git ref cannot legitimately be this long) → 400.

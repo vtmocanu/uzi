@@ -203,6 +203,11 @@ func (h *Handler) settleFiledIssue(ctx context.Context, claimID uuid.UUID, repo 
 		slog.Warn("file issue: marshal labels", "error", err)
 		return warnUnlinked
 	}
+	assigneeIDsJSON, err := json.Marshal(created.Assignees)
+	if err != nil {
+		slog.Warn("file issue: marshal assignee ids", "error", err)
+		return warnUnlinked
+	}
 	updated := created.UpdatedAt
 	if updated.IsZero() {
 		updated = time.Now()
@@ -234,6 +239,7 @@ func (h *Handler) settleFiledIssue(ctx context.Context, claimID uuid.UUID, repo 
 		Title:          created.Title,
 		State:          created.State,
 		Labels:         labelsJSON,
+		AssigneeIds:    assigneeIDsJSON,
 		WebUrl:         created.WebURL,
 		Author:         pgtypeTextOrNull(created.Author),
 		HasPrdLink:     forgesvc.HasPRDLink(description),

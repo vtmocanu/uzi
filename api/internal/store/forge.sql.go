@@ -293,7 +293,7 @@ func (q *Queries) GetForgeConnectionForUser(ctx context.Context, arg GetForgeCon
 }
 
 const getIssueByIID = `-- name: GetIssueByIID :one
-SELECT id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position FROM issues WHERE repo_id = $1 AND forge_issue_iid = $2
+SELECT id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids FROM issues WHERE repo_id = $1 AND forge_issue_iid = $2
 `
 
 type GetIssueByIIDParams struct {
@@ -317,6 +317,7 @@ func (q *Queries) GetIssueByIID(ctx context.Context, arg GetIssueByIIDParams) (I
 		&i.ForgeUpdatedAt,
 		&i.SyncedAt,
 		&i.BoardPosition,
+		&i.AssigneeIds,
 	)
 	return i, err
 }
@@ -791,7 +792,7 @@ func (q *Queries) ListForgeConnectionsByUser(ctx context.Context, userID uuid.UU
 }
 
 const listIssuesByRepo = `-- name: ListIssuesByRepo :many
-SELECT id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position FROM issues WHERE repo_id = $1
+SELECT id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids FROM issues WHERE repo_id = $1
 ORDER BY board_position ASC NULLS LAST, forge_issue_iid ASC
 `
 
@@ -836,6 +837,7 @@ func (q *Queries) ListIssuesByRepo(ctx context.Context, repoID uuid.UUID) ([]Iss
 			&i.ForgeUpdatedAt,
 			&i.SyncedAt,
 			&i.BoardPosition,
+			&i.AssigneeIds,
 		); err != nil {
 			return nil, err
 		}
@@ -1860,19 +1862,20 @@ func (q *Queries) UpsertForgeConnection(ctx context.Context, arg UpsertForgeConn
 const upsertIssue = `-- name: UpsertIssue :one
 
 INSERT INTO issues (
-    repo_id, forge_issue_iid, title, state, labels, web_url, author,
+    repo_id, forge_issue_iid, title, state, labels, assignee_ids, web_url, author,
     has_prd_link, forge_updated_at, synced_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
 ON CONFLICT (repo_id, forge_issue_iid) DO UPDATE
 SET title            = EXCLUDED.title,
     state            = EXCLUDED.state,
     labels           = EXCLUDED.labels,
+    assignee_ids     = EXCLUDED.assignee_ids,
     web_url          = EXCLUDED.web_url,
     author           = EXCLUDED.author,
     has_prd_link     = EXCLUDED.has_prd_link,
     forge_updated_at = EXCLUDED.forge_updated_at,
     synced_at        = now()
-RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids
 `
 
 type UpsertIssueParams struct {
@@ -1881,6 +1884,7 @@ type UpsertIssueParams struct {
 	Title          string             `json:"title"`
 	State          string             `json:"state"`
 	Labels         []byte             `json:"labels"`
+	AssigneeIds    []byte             `json:"assignee_ids"`
 	WebUrl         string             `json:"web_url"`
 	Author         pgtype.Text        `json:"author"`
 	HasPrdLink     bool               `json:"has_prd_link"`
@@ -1905,6 +1909,7 @@ func (q *Queries) UpsertIssue(ctx context.Context, arg UpsertIssueParams) (Issue
 		arg.Title,
 		arg.State,
 		arg.Labels,
+		arg.AssigneeIds,
 		arg.WebUrl,
 		arg.Author,
 		arg.HasPrdLink,
@@ -1924,6 +1929,81 @@ func (q *Queries) UpsertIssue(ctx context.Context, arg UpsertIssueParams) (Issue
 		&i.ForgeUpdatedAt,
 		&i.SyncedAt,
 		&i.BoardPosition,
+		&i.AssigneeIds,
+	)
+	return i, err
+}
+
+const upsertIssueLabels = `-- name: UpsertIssueLabels :one
+INSERT INTO issues (
+    repo_id, forge_issue_iid, title, state, labels, web_url, author,
+    has_prd_link, forge_updated_at, synced_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+ON CONFLICT (repo_id, forge_issue_iid) DO UPDATE
+SET title            = EXCLUDED.title,
+    state            = EXCLUDED.state,
+    labels           = EXCLUDED.labels,
+    web_url          = EXCLUDED.web_url,
+    author           = EXCLUDED.author,
+    has_prd_link     = EXCLUDED.has_prd_link,
+    forge_updated_at = EXCLUDED.forge_updated_at,
+    synced_at        = now()
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids
+`
+
+type UpsertIssueLabelsParams struct {
+	RepoID         uuid.UUID          `json:"repo_id"`
+	ForgeIssueIid  int64              `json:"forge_issue_iid"`
+	Title          string             `json:"title"`
+	State          string             `json:"state"`
+	Labels         []byte             `json:"labels"`
+	WebUrl         string             `json:"web_url"`
+	Author         pgtype.Text        `json:"author"`
+	HasPrdLink     bool               `json:"has_prd_link"`
+	ForgeUpdatedAt pgtype.Timestamptz `json:"forge_updated_at"`
+}
+
+// The label-only cache-write variant for the AutoMove and SetIssueLabel paths (PRD
+// #767). It extends UpsertIssue's board_position preservation (above) to assignee_ids:
+// BOTH column lists here DELIBERATELY OMIT assignee_ids (and keep board_position
+// omitted too), so a label mutation that races a concurrent forge sync can never
+// overwrite the DB's freshly-synced assignee_ids with the caller's STALE in-memory
+// snapshot. assignee_ids is forge-owned — the sync re-derives and re-writes it every
+// poll via UpsertIssue — so a path that only changes labels must leave it exactly as
+// the last sync stored it, or it momentarily drops "assigned-to-bot" run-eligibility
+// until the next poll. On the normal existing-row conflict path the DB's assignee_ids
+// is preserved atomically. A brand-new row would take the column default '[]'
+// (migration 00175, assignee_ids NOT NULL DEFAULT '[]'), which is harmless — these
+// paths only ever operate on already-cached rows. Do not add assignee_ids (or
+// board_position) to either list here. Guarded behaviourally by
+// TestUpsertIssueLabelsPreservesAssigneesLiveDB, because a comment cannot catch an edit.
+func (q *Queries) UpsertIssueLabels(ctx context.Context, arg UpsertIssueLabelsParams) (Issue, error) {
+	row := q.db.QueryRow(ctx, upsertIssueLabels,
+		arg.RepoID,
+		arg.ForgeIssueIid,
+		arg.Title,
+		arg.State,
+		arg.Labels,
+		arg.WebUrl,
+		arg.Author,
+		arg.HasPrdLink,
+		arg.ForgeUpdatedAt,
+	)
+	var i Issue
+	err := row.Scan(
+		&i.ID,
+		&i.RepoID,
+		&i.ForgeIssueIid,
+		&i.Title,
+		&i.State,
+		&i.Labels,
+		&i.WebUrl,
+		&i.Author,
+		&i.HasPrdLink,
+		&i.ForgeUpdatedAt,
+		&i.SyncedAt,
+		&i.BoardPosition,
+		&i.AssigneeIds,
 	)
 	return i, err
 }

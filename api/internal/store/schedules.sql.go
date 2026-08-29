@@ -213,12 +213,17 @@ const countSweepCandidateIssues = `-- name: CountSweepCandidateIssues :one
 SELECT count(*)
 FROM issues
 WHERE repo_id = $1 AND state = 'opened'
-  AND labels @> $2::jsonb
+  AND (
+    ($2::text = 'label' AND labels @> $3::jsonb)
+    OR ($2::text = 'assigned' AND $4::bigint > 0 AND assignee_ids @> to_jsonb($4::bigint))
+  )
 `
 
 type CountSweepCandidateIssuesParams struct {
-	RepoID uuid.UUID `json:"repo_id"`
-	Labels []byte    `json:"labels"`
+	RepoID   uuid.UUID `json:"repo_id"`
+	Selector string    `json:"selector"`
+	Labels   []byte    `json:"labels"`
+	BotID    int64     `json:"bot_id"`
 }
 
 // The truncation probe for the sweep fire outcome's Capped flag (PRD #308 M1): the total
@@ -226,9 +231,17 @@ type CountSweepCandidateIssuesParams struct {
 // WITHOUT the max_issues LIMIT. fireSweep compares this against the (capped) candidate set
 // it fetched to know the cap truncated newer eligible issues. It is called only when the
 // schedule carries a set cap (a NULL cap can never truncate → Capped stays false), so the
-// extra count never runs on the unbounded path.
+// extra count never runs on the unbounded path. @selector/@bot_id discriminate the label
+// vs. assigned kinds exactly as in ListSweepCandidateIssues — the assigned branch uses the
+// numeric-containment form `assignee_ids @> to_jsonb(@bot_id::bigint)` (NOT jsonb_exists,
+// which is string-only), guarded by `@bot_id > 0` (PRD #767 M4/R3).
 func (q *Queries) CountSweepCandidateIssues(ctx context.Context, arg CountSweepCandidateIssuesParams) (int64, error) {
-	row := q.db.QueryRow(ctx, countSweepCandidateIssues, arg.RepoID, arg.Labels)
+	row := q.db.QueryRow(ctx, countSweepCandidateIssues,
+		arg.RepoID,
+		arg.Selector,
+		arg.Labels,
+		arg.BotID,
+	)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -845,14 +858,19 @@ const listSweepCandidateIssues = `-- name: ListSweepCandidateIssues :many
 SELECT forge_issue_iid, author
 FROM issues
 WHERE repo_id = $1 AND state = 'opened'
-  AND labels @> $2::jsonb
+  AND (
+    ($2::text = 'label' AND labels @> $3::jsonb)
+    OR ($2::text = 'assigned' AND $4::bigint > 0 AND assignee_ids @> to_jsonb($4::bigint))
+  )
 ORDER BY forge_issue_iid ASC
-LIMIT $3
+LIMIT $5
 `
 
 type ListSweepCandidateIssuesParams struct {
 	RepoID    uuid.UUID   `json:"repo_id"`
+	Selector  string      `json:"selector"`
 	Labels    []byte      `json:"labels"`
+	BotID     int64       `json:"bot_id"`
 	MaxIssues pgtype.Int4 `json:"max_issues"`
 }
 
@@ -862,9 +880,19 @@ type ListSweepCandidateIssuesRow struct {
 }
 
 // The sweep sibling of ListAutopilotCandidateIssues (autopilot.sql): open cached
-// issues in a repo that carry ALL of the selected labels. The caller passes a jsonb
-// array of labels (an empty selector is resolved to the uzi label in Go before
-// calling, PRD #764), and jsonb containment (@>) matches rows whose labels array is a superset.
+// issues in a repo chosen by the schedule's selector kind (PRD #767 M4). @selector
+// discriminates between the two kinds:
+//   - 'label': match issues carrying ALL of @labels (jsonb containment @> matches rows
+//     whose labels array is a superset). The caller passes a jsonb array of labels — an
+//     empty selector is resolved to the uzi label in Go before calling (PRD #764).
+//   - 'assigned': match issues assigned to the uzi-bot account, by NUMERIC membership of
+//     @bot_id in assignee_ids. Note the form is `assignee_ids @> to_jsonb(@bot_id::bigint)`
+//     (numeric containment) and NOT jsonb_exists, which is string-only and never matches a
+//     JSON number (PRD #767 R3, jsonb numeric-membership trap). The `@bot_id > 0` guard
+//     mirrors the autopilot path: an unresolved/zero bot id must never match every assigned
+//     issue. The assigned branch ignores @labels (the caller passes '[]' to keep the cast
+//     valid).
+//
 // author rides along for the same adder→author attribution fallback the autopilot
 // path uses.
 //
@@ -874,7 +902,13 @@ type ListSweepCandidateIssuesRow struct {
 // a deterministic oldest-first batch. The narg FUNCTION form (not @max_issues) is
 // deliberate — see .claude/rules/go.md on the runtime-comment byte-offset gotcha.
 func (q *Queries) ListSweepCandidateIssues(ctx context.Context, arg ListSweepCandidateIssuesParams) ([]ListSweepCandidateIssuesRow, error) {
-	rows, err := q.db.Query(ctx, listSweepCandidateIssues, arg.RepoID, arg.Labels, arg.MaxIssues)
+	rows, err := q.db.Query(ctx, listSweepCandidateIssues,
+		arg.RepoID,
+		arg.Selector,
+		arg.Labels,
+		arg.BotID,
+		arg.MaxIssues,
+	)
 	if err != nil {
 		return nil, err
 	}
