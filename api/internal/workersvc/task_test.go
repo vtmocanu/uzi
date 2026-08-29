@@ -213,6 +213,65 @@ func TestCreateTaskRunPersistsHandoffBudget(t *testing.T) {
 	})
 }
 
+// TestCreateTaskRunStampsOwnerWaitOnLimit: a task/handoff run must inherit the
+// owner's users.wait_on_limit default, the same defaulting every other creation path
+// applies (resolveWaitOnLimit; PRD #35). handoff has no per-request override, so nil
+// resolves straight to the owner default. This is the ONLY guard — sqlc emits a params
+// STRUCT, so a call site that omits WaitOnLimit compiles fine and silently opts every
+// task run OUT via the column DEFAULT false (the exact bug this fixes).
+func TestCreateTaskRunStampsOwnerWaitOnLimit(t *testing.T) {
+	repo := uuid.New()
+
+	t.Run("opted-in owner => wait_on_limit true", func(t *testing.T) {
+		owner := uuid.New()
+		fs := &fakeStore{repoRow: aValidRepoRow(), userByID: store.User{ID: owner, WaitOnLimit: true}}
+		svc := New(fs, newBox(t), testParams())
+		svc.SetRepoGuard(&fakeGuard{res: privcheck.GuardResult{Blocked: false}})
+		if _, err := svc.CreateTaskRun(context.Background(), owner, repo, "do it", "", false, false, false, false); err != nil {
+			t.Fatalf("CreateTaskRun: %v", err)
+		}
+		if fs.taskRunParams == nil {
+			t.Fatal("insert did not run")
+		}
+		if !fs.taskRunParams.WaitOnLimit {
+			t.Fatal("a task run for an opted-in owner was stamped wait_on_limit=false — " +
+				"the handoff path fell to the column default instead of resolveWaitOnLimit")
+		}
+	})
+
+	t.Run("default-off owner => wait_on_limit false", func(t *testing.T) {
+		owner := uuid.New()
+		fs := &fakeStore{repoRow: aValidRepoRow(), userByID: store.User{ID: owner}} // WaitOnLimit false
+		svc := New(fs, newBox(t), testParams())
+		svc.SetRepoGuard(&fakeGuard{res: privcheck.GuardResult{Blocked: false}})
+		if _, err := svc.CreateTaskRun(context.Background(), owner, repo, "do it", "", false, false, false, false); err != nil {
+			t.Fatalf("CreateTaskRun: %v", err)
+		}
+		if fs.taskRunParams == nil {
+			t.Fatal("insert did not run")
+		}
+		if fs.taskRunParams.WaitOnLimit {
+			t.Fatal("a task run for a default-off owner was stamped wait_on_limit=true")
+		}
+	})
+
+	t.Run("torn user read resolves false rather than failing the creation", func(t *testing.T) {
+		owner := uuid.New()
+		fs := &fakeStore{repoRow: aValidRepoRow(), userByIDErr: errors.New("boom")}
+		svc := New(fs, newBox(t), testParams())
+		svc.SetRepoGuard(&fakeGuard{res: privcheck.GuardResult{Blocked: false}})
+		if _, err := svc.CreateTaskRun(context.Background(), owner, repo, "do it", "", false, false, false, false); err != nil {
+			t.Fatalf("a preference lookup failure must not fail the creation: %v", err)
+		}
+		if fs.taskRunParams == nil {
+			t.Fatal("insert did not run")
+		}
+		if fs.taskRunParams.WaitOnLimit {
+			t.Fatal("a failed user read resolved TRUE; false is today's behaviour and the safe direction")
+		}
+	})
+}
+
 // A then-fix run inherits the original task's PERSISTED budget verbatim (issue #785): the
 // fix phase of a long non-interactive handoff keeps the same allowance, and — because it
 // COPIES the stored value rather than recomputing from config — a change to the handoff

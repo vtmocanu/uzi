@@ -26,6 +26,12 @@ set -eu
 
 RENDER="${1:?usage: assert-chart-render.sh <rendered.yaml>}"
 
+# Resolve this script's own directory so the committed canary fixture can be found
+# regardless of the caller's cwd. Clear CDPATH first so `cd` cannot resolve via it
+# and echo an unexpected directory (the convention assert-drain-knobs-render.sh sets).
+CDPATH=''
+SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+
 # The glued separator itself first, because it names the exact line and the fix.
 # Written without a negated bracket expression on purpose: `grep -E "[^-]---$"`
 # does NOT match `foo---` under ugrep (verified 2026-07-27), which is what `grep`
@@ -56,3 +62,175 @@ awk '
 ' "$RENDER"
 
 echo "OK: $(grep -c '^---$' "$RENDER") documents, one kind per document, no glued separators"
+
+# ---------------------------------------------------------------------------------
+# FQDN-egress completeness (PRD #808 M2).
+#
+# WHY THIS EXISTS. M1 single-sourced the worker's kube-native egress allow-list: the
+# Antrea `-worker-egress` NetworkPolicy is the ONLY thing standing between a hosted
+# worker and the open internet, so a canonical destination silently dropped from it
+# (an editor removes an Allow entry, a values refactor loses one, the api SSRF
+# allowlist gains a forge the policy never learns about) does not fail any render --
+# `helm template` still exits 0 and the manifest is still well-formed. The worker
+# just cannot reach that host at runtime, days later, with nothing red.
+#
+# So this check ties the two rendered artifacts together: it collects the set of
+# Allow-fqdn hosts from the Antrea policy and asserts it covers BOTH a hardcoded set
+# of canonical infra hosts AND every forge the api ConfigMap's FORGE_ALLOWED_BASE_URLS
+# names (comma-split, host derived from each URL). The forge half is dynamic on
+# purpose: it proves the egress policy tracks the api's own SSRF allowlist rather
+# than a second hand-maintained copy that can drift.
+#
+# PARSED WITH awk, NEVER A BARE grep PATTERN. This host's `grep` is ugrep, whose
+# POSIX modes mishandle negated classes and brace intervals (the well-formedness
+# note above records the same trap), so the YAML is walked with awk; host membership
+# is an exact string equality in awk too, so a host containing `*` (e.g.
+# `*.anthropic.com`) cannot be misread as a glob.
+#
+# EXIT CODES (the convention assert-drain-knobs-render.sh sets):
+#     2 = the instrument is broken (no crd.antrea.io policy in the render that was
+#         supposed to contain one, or the committed canary did not trip the detector)
+#     1 = a finding (a canonical destination is missing from the Allow-fqdn set)
+#     0 = every canonical destination is covered
+# `task` flattens any non-zero to its own 201.
+
+# Disable pathname expansion: the canonical host set includes `*.anthropic.com`, and
+# an unquoted `*.anthropic.com` in a `for` word list would otherwise glob against cwd.
+set -f
+
+# The canonical infra hosts every worker egress render must Allow, independent of
+# the forge configuration. Kept here as the single source of the STATIC expectation.
+STATIC_HOSTS="*.anthropic.com cache.nixos.org search.devbox.sh ghcr.io pkg-containers.githubusercontent.com"
+
+# has_worker_egress_policy <file> -- succeed iff the render contains the crd.antrea.io
+# `-worker-egress` NetworkPolicy specifically. Keyed on that document's metadata name
+# (not merely on the crd.antrea.io apiVersion), so an unrelated Antrea policy in the
+# same render does not satisfy this check -- the completeness guard is about ONE policy.
+has_worker_egress_policy() {
+  awk '
+    /^---[[:space:]]*$/                       { antrea = 0; next }
+    /^apiVersion:[[:space:]]*crd\.antrea\.io/ { antrea = 1; next }
+    antrea && /^[[:space:]]+name:[[:space:]].*-worker-egress[[:space:]]*$/ { f = 1 }
+    END { exit !f }
+  ' "$1"
+}
+
+# collect_allow_fqdns <file> -- print, one per line, each `fqdn:` value that sits in
+# an egress entry whose `action:` is Allow, ONLY within the crd.antrea.io
+# `-worker-egress` NetworkPolicy document. Scoping to that ONE document (via its
+# metadata name) is load-bearing: pooling Allow-fqdns across every Antrea policy in
+# the render would let a host absent from THIS policy but present in an unrelated one
+# read as covered -- a false green in the gate whose whole job is to prevent one. The
+# metadata `name:` line (2-space indent, no leading `- `) precedes `spec.egress`, so
+# the `we` flag is set before any fqdn is seen. Drop entries (the denyCIDRs belt) and
+# ipBlock peers carry no fqdn and are skipped by construction; the action gate makes
+# that explicit rather than incidental.
+collect_allow_fqdns() {
+  awk '
+    /^---[[:space:]]*$/                       { antrea = 0; we = 0; action = ""; next }
+    /^apiVersion:[[:space:]]*crd\.antrea\.io/ { antrea = 1; next }
+    antrea && /^[[:space:]]+name:[[:space:]].*-worker-egress[[:space:]]*$/ { we = 1; next }
+    antrea && we && /^[[:space:]]*action:[[:space:]]/ { action = $2; next }
+    antrea && we && action == "Allow" && /fqdn:/ {
+      v = $0
+      sub(/^.*fqdn:[[:space:]]*/, "", v)   # keep only the value after `fqdn:`
+      gsub(/"/, "", v)                     # strip quotes
+      gsub(/[[:space:]]/, "", v)           # strip any stray whitespace
+      if (v != "") print v
+    }
+  ' "$1"
+}
+
+# expected_forge_hosts <file> -- read FORGE_ALLOWED_BASE_URLS from the api ConfigMap
+# in the SAME render, comma-split it, and print the bare host of each URL (scheme and
+# :port stripped). Absent FORGE_ALLOWED_BASE_URLS prints nothing (forge set is empty).
+expected_forge_hosts() {
+  awk '
+    /^[[:space:]]*FORGE_ALLOWED_BASE_URLS:[[:space:]]/ {
+      v = $0
+      sub(/^.*FORGE_ALLOWED_BASE_URLS:[[:space:]]*/, "", v)
+      gsub(/"/, "", v)
+      n = split(v, urls, ",")
+      for (i = 1; i <= n; i++) {
+        h = urls[i]
+        gsub(/[[:space:]]/, "", h)
+        sub(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "", h)  # strip scheme://
+        sub(/\/.*$/, "", h)                          # strip /path
+        sub(/[?#].*$/, "", h)                        # strip query/fragment
+        sub(/:[0-9]+$/, "", h)                       # strip :port
+        if (h != "") print h
+      }
+    }
+  ' "$1"
+}
+
+# is_present <host> -- read a newline list of hosts on stdin, succeed iff one is an
+# EXACT match for <host> (string equality, so `*` in a host is not a glob).
+is_present() {
+  awk -v h="$1" '$0 == h { f = 1 } END { exit !f }'
+}
+
+# check_completeness <file> -- assert every expected canonical host (STATIC_HOSTS plus
+# each forge host derived from the render's own FORGE_ALLOWED_BASE_URLS) appears in the
+# Allow-fqdn set. Prints a FAIL line naming EACH missing host; returns per the exit
+# codes above. Prints to stdout so the canary self-test can inspect its output.
+check_completeness() {
+  _file="$1"
+  if ! has_worker_egress_policy "$_file"; then
+    echo "BROKEN: no crd.antrea.io -worker-egress NetworkPolicy document in the render --" >&2
+    echo "        it was supposed to render (workers.fqdnEgress.enabled: true)." >&2
+    return 2
+  fi
+
+  _allowed=$(collect_allow_fqdns "$_file")
+  _forge=$(expected_forge_hosts "$_file")
+  _expected="$STATIC_HOSTS $_forge"
+
+  _missing=""
+  _count=0
+  for _h in $_expected; do
+    _count=$((_count + 1))
+    if printf '%s\n' "$_allowed" | is_present "$_h"; then
+      :
+    else
+      _missing="$_missing $_h"
+    fi
+  done
+
+  if [ -n "$_missing" ]; then
+    for _h in $_missing; do
+      echo "FAIL: kube-native worker egress is missing canonical destination: $_h"
+    done
+    return 1
+  fi
+
+  echo "OK: kube-native worker egress covers all $_count canonical destinations (static + forge)"
+  return 0
+}
+
+# --- canary self-test: prove the detector fires on a known-incomplete render --------
+# Run the completeness check against the committed, deliberately-incomplete canary
+# BEFORE trusting it on the real render. The canary omits TWO hosts, one per detector
+# half: `cache.nixos.org` (a STATIC_HOSTS entry) and the forge host `gitlab.example.com`
+# (which its ConfigMap names in FORGE_ALLOWED_BASE_URLS, exercising the forge-derivation
+# path). A working detector must return a finding (1) naming BOTH. Any other outcome --
+# complete (0), broken (2), or only one named -- means the instrument cannot be trusted
+# (a regression in EITHER the static or the forge half would be caught here).
+CANARY="$SCRIPT_DIR/fqdn-egress-canary.yaml"
+[ -f "$CANARY" ] || { echo "BROKEN: canary fixture missing at $CANARY" >&2; exit 2; }
+
+canary_out=$(check_completeness "$CANARY") && canary_rc=0 || canary_rc=$?
+if [ "$canary_rc" -eq 1 ] \
+   && printf '%s\n' "$canary_out" | is_present "FAIL: kube-native worker egress is missing canonical destination: cache.nixos.org" \
+   && printf '%s\n' "$canary_out" | is_present "FAIL: kube-native worker egress is missing canonical destination: gitlab.example.com"; then
+  echo "OK: canary self-test tripped both detector halves (static cache.nixos.org + forge gitlab.example.com)"
+else
+  echo "BROKEN: canary self-test did not fire as expected (rc=$canary_rc) on a" >&2
+  echo "        known-incomplete render -- the FQDN completeness detector is not" >&2
+  echo "        working, so a real gap would read as green. Output was:" >&2
+  printf '%s\n' "$canary_out" | sed 's/^/          /' >&2
+  exit 2
+fi
+
+# --- the real check on the render under test ----------------------------------------
+check_completeness "$RENDER" || exit $?

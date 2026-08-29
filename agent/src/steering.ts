@@ -111,7 +111,15 @@ function parseAnswerBody(
 export class SteeringChannel {
   private stopped = false;
   private loop: Promise<void> | undefined;
-  private readonly followUps: string[] = [];
+  private readonly followUps: { id: number; body: string }[] = [];
+  /** issue #559 M2: the highest `follow_up` input id this channel has already handed to the
+   *  executor — via pullFollowUp or awaitFollowUp/serviceFollowUp. This is the wake-guard
+   *  watermark the runner reports at the interactive park (open_followup_id). Buffering a
+   *  follow-up (route → push) does NOT advance it; only DELIVERY (takeFollowUp shift) does,
+   *  which is what makes it race-free across the park report's DB round-trip: the value is
+   *  stable while the report is in flight because the follow-up waiter is armed only AFTER
+   *  the report returns. Monotone (Math.max). */
+  private lastDeliveredFollowUpIdValue = 0;
   /** The current gate epoch (PRD #41): bumped at each awaiting_approval (re-)report.
    *  Every buffered verdict / queued revise is stamped with the epoch it arrived at, so
    *  a verdict written against a superseded plan version is detectable. Starts at 0 so a
@@ -298,9 +306,30 @@ export class SteeringChannel {
     w.resolve(v);
   }
 
+  /** Shift the oldest buffered follow-up and advance the last-delivered watermark to its id
+   *  (issue #559 M2). The SINGLE delivery site: every place that hands a follow-up to the
+   *  executor routes through here so none can forget to advance the watermark — the same
+   *  sibling-clear hazard the SQL wake-guard comments guard against. Monotone via Math.max. */
+  private takeFollowUp(): { id: number; body: string } | undefined {
+    const f = this.followUps.shift();
+    if (f)
+      this.lastDeliveredFollowUpIdValue = Math.max(
+        this.lastDeliveredFollowUpIdValue,
+        f.id,
+      );
+    return f;
+  }
+
+  /** issue #559 M2: the highest `follow_up` input id already delivered to the executor —
+   *  the wake-guard watermark the runner reports as `open_followup_id` on the interactive
+   *  park. Named to avoid colliding with the `lastDeliveredFollowUpIdValue` field. */
+  getLastDeliveredFollowUpId(): number {
+    return this.lastDeliveredFollowUpIdValue;
+  }
+
   /** Dequeue the oldest un-consumed follow-up, or undefined if none. */
   pullFollowUp(): string | undefined {
-    return this.followUps.shift();
+    return this.takeFollowUp()?.body;
   }
 
   /**
@@ -360,11 +389,13 @@ export class SteeringChannel {
         kind: "ended",
         reason: "stopped",
       });
-    if (this.followUps.length)
+    if (this.followUps.length) {
+      const f = this.takeFollowUp()!;
       return Promise.resolve<FollowUpOutcome>({
         kind: "followup",
-        body: this.followUps.shift()!,
+        body: f.body,
       });
+    }
     return new Promise<FollowUpOutcome>((resolve) => {
       this.followUpWaiter = { resolve, idleMs, parkedAt: this.now() };
     });
@@ -393,8 +424,9 @@ export class SteeringChannel {
       return;
     }
     if (this.followUps.length) {
+      const f = this.takeFollowUp()!;
       this.followUpWaiter = undefined;
-      w.resolve({ kind: "followup", body: this.followUps.shift()! });
+      w.resolve({ kind: "followup", body: f.body });
       return;
     }
     if (this.now() - w.parkedAt >= w.idleMs) {
@@ -442,7 +474,7 @@ export class SteeringChannel {
     w.resolve(v);
   }
 
-  private route(kind: string, body: string | null | undefined): void {
+  private route(kind: string, body: string | null | undefined, id: number): void {
     switch (kind) {
       case "approve_plan":
         // The body carries the JSON-encoded agent selection (PRD #37). Parse it
@@ -484,7 +516,10 @@ export class SteeringChannel {
         this.stopRequested = true;
         break;
       case "follow_up":
-        if (body && body.trim()) this.followUps.push(body.trim());
+        // issue #559 M2: carry the input id alongside the body so a delivery (takeFollowUp)
+        // can advance the wake-guard watermark. The other kinds ignore the id.
+        if (body && body.trim())
+          this.followUps.push({ id, body: body.trim() });
         break;
       case "answer": {
         // PRD #88. Reaching the default arm instead would DESTROY the answer: /inputs
@@ -515,7 +550,8 @@ export class SteeringChannel {
     while (!this.stopped) {
       try {
         const inputs = await this.client.getInputs(this.runId);
-        for (const inp of inputs) this.route(inp.kind, inp.body ?? undefined);
+        for (const inp of inputs)
+          this.route(inp.kind, inp.body ?? undefined, inp.id);
       } catch (err) {
         // The loop continues on a getInputs failure (HTTP >=400 / timeout) — but only the
         // FETCH is skipped, not the service step below. PRD #517 M5: serviceFollowUp()

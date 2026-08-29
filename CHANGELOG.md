@@ -23,6 +23,13 @@ through `[0.52.0]`.)
 - **Default schedules gain model-parity with custom schedules ([#691](https://github.com/vtmocanu/uzi/issues/691)).**
   An owner can now set "Apply model also to agents" (`override_subagent_model`) on a default (catalog) schedule in place — via the web modal, the API, and `uzi schedule edit --apply-model-to-agents` — instead of having to clone it first; Reset restores it to the catalog baseline (off) alongside the other editable fields. `uzi schedule edit` also gains a `--model <alias|id>` flag (empty clears back to the Worker-model default) for both custom and default schedules, closing the gap where the CLI could not change a schedule's model that the web UI and API already could.
 
+### Changed
+
+- **Kube-native worker egress is now single-sourced and self-checking ([#808](https://github.com/vtmocanu/uzi/issues/808)).**
+  The restricted-tier FQDN allow-list's forge entry is now derived from `FORGE_ALLOWED_BASE_URLS` instead of a second hand-kept copy, so the api's SSRF allowlist and the worker egress can no longer diverge, and `search.devbox.sh` (the devbox package resolver) is added to the shipped default allow-list; a build-time completeness guard fails the `helm-chart` CI job, naming the host, if a canonical worker destination is ever missing from the rendered list.
+- **Assigning an issue to the uzi-bot is now a run-eligibility signal too ([#767](https://github.com/vtmocanu/uzi/issues/767)).**
+  An issue carrying the `uzi` label OR assigned to the uzi-bot account is runnable through the single eligibility gate, so the manual Start button, autopilot's poller, and every sweep's per-issue gate recognize either signal. Existing label sweeps still pick their candidates by label (`bug`/`Planned`, unchanged) — a candidate that is bot-assigned rather than `uzi`-labelled now fires where it was skipped before — while a new opt-in `assigned-sweep` catalog default picks bot-assigned issues that carry no selector label (`auto_approve` on, matching the existing sweeps). The board marks a bot-assigned card runnable with no label needed. Assignment alone never starts a run: unattended execution still needs the `autopilot` label or an enabled sweep, exactly like a `uzi`-labelled issue.
+
 ## [0.68.0] - 2026-08-29
 
 ### Changed

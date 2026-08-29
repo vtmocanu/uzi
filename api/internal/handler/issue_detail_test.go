@@ -15,13 +15,23 @@ func TestBuildIssueDetail(t *testing.T) {
 			Title:       "ship it",
 			State:       "opened",
 			Labels:      []string{"PRD", "In Progress"},
+			Assignees:   []int64{4021, 99},
 			WebURL:      "https://gitlab.example.com/x/-/issues/42",
 			Description: "Do the thing. See prds/12-board.md",
 			Author:      "vlad",
-		}, position, "forgejo")
+		}, position, "forgejo", 4021)
 
 		if dto.ForgeType != "forgejo" {
 			t.Fatalf("forge_type should be carried onto the issue detail, got %q", dto.ForgeType)
+		}
+
+		// PRD #767 M5: the issue detail carries the forge assignees and the connection's
+		// bot id so the issue view evaluates the same "uzi OR assigned-to-bot" predicate.
+		if len(dto.AssigneeIds) != 2 || dto.AssigneeIds[0] != 4021 || dto.AssigneeIds[1] != 99 {
+			t.Fatalf("assignee_ids should map through from issue.Assignees, got %v", dto.AssigneeIds)
+		}
+		if dto.BotForgeUserID != 4021 {
+			t.Fatalf("bot_forge_user_id should be carried onto the issue detail, got %d", dto.BotForgeUserID)
 		}
 
 		if dto.IID != 42 || dto.Title != "ship it" || dto.State != "opened" {
@@ -46,7 +56,7 @@ func TestBuildIssueDetail(t *testing.T) {
 			IID:    7,
 			State:  "closed",
 			Labels: []string{"In Progress"},
-		}, position, "gitlab")
+		}, position, "gitlab", 4021)
 		if !dto.Closed || dto.Column != "" {
 			t.Fatalf("closed issue should be Closed with empty column, got closed=%v col=%q", dto.Closed, dto.Column)
 		}
@@ -57,7 +67,7 @@ func TestBuildIssueDetail(t *testing.T) {
 			IID:    9,
 			State:  "opened",
 			Labels: []string{"In Progress", "Later"},
-		}, position, "gitlab")
+		}, position, "gitlab", 4021)
 		if !dto.Conflict {
 			t.Fatal("two column labels must flag conflict")
 		}
@@ -72,7 +82,8 @@ func TestBuildIssueDetail(t *testing.T) {
 			State:       "opened",
 			Description: "just a note, no link",
 			Labels:      nil,
-		}, position, "gitlab")
+			Assignees:   nil,
+		}, position, "gitlab", 0)
 		if dto.HasPRDLink {
 			t.Fatal("a description with no prds/*.md link must not set has_prd_link")
 		}
@@ -84,6 +95,12 @@ func TestBuildIssueDetail(t *testing.T) {
 		}
 		if len(dto.Labels) != 0 {
 			t.Fatalf("expected empty labels, got %v", dto.Labels)
+		}
+		if dto.AssigneeIds == nil {
+			t.Fatal("nil assignees must normalize to a non-nil empty slice (JSON [] not null)")
+		}
+		if len(dto.AssigneeIds) != 0 {
+			t.Fatalf("expected empty assignee_ids, got %v", dto.AssigneeIds)
 		}
 		if dto.Column != "" || dto.Closed || dto.Conflict {
 			t.Fatalf("an unlabeled open issue is Open, got col=%q closed=%v conflict=%v", dto.Column, dto.Closed, dto.Conflict)

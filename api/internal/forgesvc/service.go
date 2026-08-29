@@ -103,6 +103,10 @@ func HasPRDLink(description string) bool {
 // database. *store.Queries satisfies it.
 type IssueStore interface {
 	UpsertIssue(ctx context.Context, arg store.UpsertIssueParams) (store.Issue, error)
+	// UpsertIssueLabels is the label-only cache-write variant used by AutoMove and
+	// SetIssueLabel: it omits assignee_ids so a racing label mutation cannot clobber
+	// the forge-synced assignees with a stale in-memory snapshot (PRD #767).
+	UpsertIssueLabels(ctx context.Context, arg store.UpsertIssueLabelsParams) (store.Issue, error)
 	DeleteIssuesNotIn(ctx context.Context, arg store.DeleteIssuesNotInParams) (int64, error)
 	// Used by the MR-close watcher (mr_watch.go).
 	ListMRWatchCandidates(ctx context.Context, repoID uuid.UUID) ([]store.ListMRWatchCandidatesRow, error)
@@ -257,7 +261,10 @@ func (s *Service) AutoMove(ctx context.Context, f forge.Forge, forgeProjectID in
 	if err != nil {
 		return store.Issue{}, err
 	}
-	return s.q.UpsertIssue(ctx, store.UpsertIssueParams{
+	// UpsertIssueLabels omits assignee_ids from both its INSERT and its ON CONFLICT
+	// SET, so the DB's forge-synced assignees are preserved from the existing row
+	// rather than re-written from this caller's possibly-stale snapshot (PRD #767).
+	return s.q.UpsertIssueLabels(ctx, store.UpsertIssueLabelsParams{
 		RepoID:         issue.RepoID,
 		ForgeIssueIid:  issue.ForgeIssueIid,
 		Title:          issue.Title,
@@ -334,7 +341,11 @@ func (s *Service) SetIssueLabel(ctx context.Context, f forge.Forge, forgeProject
 	if err != nil {
 		return store.Issue{}, err
 	}
-	return s.q.UpsertIssue(ctx, store.UpsertIssueParams{
+	// UpsertIssueLabels omits assignee_ids from both its INSERT and its ON CONFLICT
+	// SET, so the DB's forge-synced assignees are preserved from the existing row and
+	// never re-written from this caller's possibly-stale snapshot (PRD #767).
+	// has_prd_link is still carried through verbatim (this path never re-derives it).
+	return s.q.UpsertIssueLabels(ctx, store.UpsertIssueLabelsParams{
 		RepoID:         issue.RepoID,
 		ForgeIssueIid:  issue.ForgeIssueIid,
 		Title:          issue.Title,
@@ -594,6 +605,10 @@ func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []f
 		if err != nil {
 			return err
 		}
+		assigneeIDsJSON, err := json.Marshal(is.Assignees)
+		if err != nil {
+			return err
+		}
 		author := pgtype.Text{}
 		if is.Author != "" {
 			author = pgtype.Text{String: is.Author, Valid: true}
@@ -611,6 +626,7 @@ func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []f
 			Title:          is.Title,
 			State:          is.State,
 			Labels:         labelsJSON,
+			AssigneeIds:    assigneeIDsJSON,
 			WebUrl:         is.WebURL,
 			Author:         author,
 			HasPrdLink:     HasPRDLink(is.Description),

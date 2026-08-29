@@ -23,8 +23,12 @@
 -- carry the dedicated HANDOFF_RUN_TIMEOUT / HANDOFF_RUN_MAX_ITERATIONS budget (already
 -- 8h-ceiling-capped by the caller); NULL for an interactive handoff, which falls back to the
 -- global default via the claim/sweeper COALESCE.
-INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, open_mr, interactive, review_requested, then_fix_requested, issue_title, issue_description, auto_approve, required_capabilities, budget_wall_seconds, budget_max_iterations)
-VALUES (@run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'), @open_mr, @interactive, @review_requested, @then_fix_requested, @issue_title, @issue_description, true, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), sqlc.narg('budget_wall_seconds'), sqlc.narg('budget_max_iterations'))
+-- wait_on_limit (PRD #35) is stamped here from the OWNER's default, resolved in the
+-- service layer (resolveWaitOnLimit): a handoff has no per-request override today, so
+-- nil -> the owner's users.wait_on_limit is the whole behavior. Omitting it (as this
+-- query originally did) silently opts every task run OUT via the column DEFAULT false.
+INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, open_mr, interactive, review_requested, then_fix_requested, issue_title, issue_description, auto_approve, wait_on_limit, required_capabilities, budget_wall_seconds, budget_max_iterations)
+VALUES (@run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'), @open_mr, @interactive, @review_requested, @then_fix_requested, @issue_title, @issue_description, true, @wait_on_limit, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), sqlc.narg('budget_wall_seconds'), sqlc.narg('budget_max_iterations'))
 RETURNING *;
 
 -- name: CreateThenFixRun :one

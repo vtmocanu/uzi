@@ -19,13 +19,16 @@
 secrets:
   mode: infisical
 
+forge:
+  allowedBaseURLs:
+    - https://gitlab.example.com
+
 api:
   config:
     FRONTEND_ORIGIN: https://uzi.example.com
     UZI_PUBLIC_BASE_URL: https://uzi.example.com
     # Dummy pod CIDR — trusted-proxy value; any valid CIDR renders identically.
     TRUSTED_PROXIES: "10.244.0.0/16"
-    FORGE_ALLOWED_BASE_URLS: https://gitlab.example.com
     UZI_OIDC_ISSUER_URL: https://keycloak.example.com/realms/example
     UZI_OIDC_CLIENT_ID: uzi
     UZI_OIDC_PROVIDER_NAME: Keycloak
@@ -75,14 +78,14 @@ workers:
       - name: drop-node-cidr
         cidr: 10.0.0.0/24
     allowFQDNs:
-      - name: allow-forge
-        fqdn: "gitlab.example.com"
-        ports: [443]
       - name: allow-anthropic
         fqdn: "*.anthropic.com"
         ports: [443]
       - name: allow-nix-substituters
         fqdn: "cache.nixos.org"
+        ports: [443]
+      - name: allow-devbox-resolver
+        fqdn: "search.devbox.sh"
         ports: [443]
       - name: allow-cnpg-oci-registry
         fqdn: "ghcr.io"

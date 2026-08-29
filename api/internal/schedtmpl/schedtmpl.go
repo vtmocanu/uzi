@@ -22,7 +22,8 @@
 //	cron: 0 8 * * 1           # 5-field standard cron
 //	timezone: UTC             # optional, defaults to UTC
 //	model: fable              # optional, empty => inherit the owner default
-//	labels: bug, Planned      # sweep only, comma-separated
+//	selector: label           # sweep only, "label" (default) | "assigned"
+//	labels: bug, Planned      # sweep only, comma-separated (label selector)
 //	max_issues: 3             # sweep only, 0/absent => unset
 //	---
 //
@@ -31,6 +32,11 @@
 // For a prompt target the body is the run prompt; for a sweep target the body is
 // the per-issue guidance. auto_approve and wait_on_limit are NOT per-file: every
 // default job is created with both true (see AutoApprove / WaitOnLimit).
+//
+// A sweep's selector kind (PRD #767 M4) decides how its candidate issues are
+// chosen: "label" (the default) matches issues carrying ALL of `labels`, while
+// "assigned" matches issues assigned to the uzi-bot account (no labels, resolved
+// against the connection's bot_forge_user_id at fire time).
 package schedtmpl
 
 import (
@@ -56,6 +62,15 @@ const (
 // timezone key.
 const DefaultTimezone = "UTC"
 
+// SelectorLabel and SelectorAssigned are the two sweep selector kinds (PRD #767
+// M4). A "label" sweep selects issues carrying ALL of its Labels; an "assigned"
+// sweep selects issues assigned to the uzi-bot account and carries no labels. A
+// sweep whose frontmatter omits `selector` defaults to SelectorLabel.
+const (
+	SelectorLabel    = "label"
+	SelectorAssigned = "assigned"
+)
+
 // DefaultJob is one entry of the builtin default-schedule catalog.
 type DefaultJob struct {
 	Slug        string
@@ -69,6 +84,13 @@ type DefaultJob struct {
 	// Prompt is the run prompt for a "prompt" target (the file body). Empty for
 	// a "sweep" target.
 	Prompt string
+
+	// SelectorKind is a "sweep" target's selector kind (PRD #767 M4):
+	// SelectorLabel (the default) selects by Labels, SelectorAssigned selects
+	// issues assigned to the uzi-bot account (and carries no Labels). parse
+	// normalizes an empty/absent selector to SelectorLabel, so callers never see
+	// "". Empty for a non-sweep target.
+	SelectorKind string
 
 	// Labels and Guidance carry a "sweep" target's selector and per-issue
 	// guidance (the file body). Empty for a "prompt" target.
@@ -166,6 +188,7 @@ func parse(raw []byte) (DefaultJob, error) {
 	body := strings.TrimSpace(afterClose[len("\n"):])
 
 	j := DefaultJob{Timezone: DefaultTimezone}
+	selectorSet := false
 	for _, line := range strings.Split(frontmatter, "\n") {
 		key, val, ok := strings.Cut(line, ": ")
 		if !ok {
@@ -189,6 +212,9 @@ func parse(raw []byte) (DefaultJob, error) {
 			}
 		case "model":
 			j.Model = val
+		case "selector":
+			j.SelectorKind = val
+			selectorSet = true
 		case "labels":
 			for _, l := range strings.Split(val, ",") {
 				if l = strings.TrimSpace(l); l != "" {
@@ -218,18 +244,46 @@ func parse(raw []byte) (DefaultJob, error) {
 	if j.Cron == "" {
 		return DefaultJob{}, fmt.Errorf("catalog %q missing cron", j.Slug)
 	}
+	// Selector applies only to a sweep. Normalize an empty/absent value to
+	// SelectorLabel so callers never see "", reject an unknown kind, and forbid a
+	// non-default selector on a non-sweep target (a nonsensical `assigned` on a
+	// prompt/self_improve job) below.
+	switch j.SelectorKind {
+	case "", SelectorLabel:
+		j.SelectorKind = SelectorLabel
+	case SelectorAssigned:
+		// validated per-target below
+	default:
+		return DefaultJob{}, fmt.Errorf("catalog %q has unknown selector %q (want %q or %q)", j.Slug, j.SelectorKind, SelectorLabel, SelectorAssigned)
+	}
+
 	switch j.Target {
 	case "prompt":
 		if body == "" {
 			return DefaultJob{}, fmt.Errorf("catalog %q (prompt) has an empty body", j.Slug)
 		}
+		if selectorSet {
+			return DefaultJob{}, fmt.Errorf("catalog %q (prompt) must not set a selector", j.Slug)
+		}
 		j.Prompt = body
 	case "sweep":
-		if len(j.Labels) == 0 {
-			return DefaultJob{}, fmt.Errorf("catalog %q (sweep) has no labels", j.Slug)
+		switch j.SelectorKind {
+		case SelectorAssigned:
+			// An assigned sweep is assignment-selected, never label-selected: labels
+			// are mutually exclusive with the assigned kind.
+			if len(j.Labels) != 0 {
+				return DefaultJob{}, fmt.Errorf("catalog %q (assigned sweep) must not carry labels, got %v", j.Slug, j.Labels)
+			}
+		default: // SelectorLabel
+			if len(j.Labels) == 0 {
+				return DefaultJob{}, fmt.Errorf("catalog %q (sweep) has no labels", j.Slug)
+			}
 		}
 		j.Guidance = body
 	case "self_improve":
+		if selectorSet {
+			return DefaultJob{}, fmt.Errorf("catalog %q (self_improve) must not set a selector", j.Slug)
+		}
 		// Promptless and label-less: the whole directive is worker-side and the tracking
 		// issue is resolved at fire time (PRD #590 M1). A self_improve entry carries neither
 		// a body prompt nor labels, so nothing off the body is stored.

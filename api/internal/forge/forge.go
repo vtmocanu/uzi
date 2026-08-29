@@ -232,6 +232,7 @@ type Issue struct {
 	Author      string // username, may be empty
 	WebURL      string
 	UpdatedAt   time.Time
+	Assignees   []int64 // forge user ids of the issue's assignees (may be empty, never nil after mapping)
 }
 
 // LabelEvent is one resource label event on an issue: a record that a user added

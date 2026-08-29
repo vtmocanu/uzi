@@ -1010,3 +1010,46 @@ func TestErrorsAreRedacted(t *testing.T) {
 		t.Fatalf("error leaked the PAT: %q", err.Error())
 	}
 }
+
+// TestListIssuesMapsAssignees pins PRD #767 M1: GitLab's inline `assignees`
+// array (client-go IssueAssignee.ID int64) round-trips into forge.Issue.Assignees,
+// and an unassigned issue yields a non-nil empty slice (never nil, mirroring
+// how Labels is normalized).
+func TestListIssuesMapsAssignees(t *testing.T) {
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/issues": func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("X-Next-Page", "")
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{
+					"id": 1001, "iid": 11, "title": "assigned", "state": "opened",
+					"labels": []string{}, "web_url": "https://gl/x/-/issues/11",
+					"assignees": []map[string]any{{"id": 42, "username": "bot"}, {"id": 99}},
+				},
+				{
+					"id": 1002, "iid": 12, "title": "unassigned", "state": "opened",
+					"labels": []string{}, "web_url": "https://gl/x/-/issues/12",
+				},
+			})
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	issues, err := d.ListIssues(context.Background(), 7, ListIssuesOptions{})
+	if err != nil {
+		t.Fatalf("ListIssues: %v", err)
+	}
+	if len(issues) != 2 {
+		t.Fatalf("expected 2 issues, got %d", len(issues))
+	}
+	assigned := issues[0]
+	if len(assigned.Assignees) != 2 || assigned.Assignees[0] != 42 || assigned.Assignees[1] != 99 {
+		t.Fatalf("assignee ids not mapped: %v", assigned.Assignees)
+	}
+	unassigned := issues[1]
+	if unassigned.Assignees == nil {
+		t.Fatal("unassigned issue must yield a non-nil empty Assignees slice")
+	}
+	if len(unassigned.Assignees) != 0 {
+		t.Fatalf("unassigned issue must have no assignees, got %v", unassigned.Assignees)
+	}
+}

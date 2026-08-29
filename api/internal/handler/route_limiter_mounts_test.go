@@ -67,7 +67,9 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 169 as of this commit (PRD #685 M1 added GET /api/branding, GET
+// 170 as of this commit (issue #559 added GET /api/worker/runs/{id}/ownership —
+// the interactive park-skip ownership/terminality probe).
+// It was 169 until then (PRD #685 M1 added GET /api/branding, GET
 // /api/branding/logo/{slot}, PUT /api/admin/branding/logo/{slot} and DELETE
 // /api/admin/branding/logo/{slot} — the public instance-branding config + logo reads
 // and the admin logo upload/clear writes).
@@ -323,6 +325,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/worker/runs/{id}/forge/pipelines/{pipeline_id}/jobs", noLimiter},
 	{"GET", "/api/worker/runs/{id}/inputs", noLimiter},
 	{"GET", "/api/worker/runs/{id}/memory", noLimiter},
+	{"GET", "/api/worker/runs/{id}/ownership", noLimiter},
 	{"GET", "/api/worker/runs/{id}/trace", noLimiter},
 	{"GET", "/api/workers/", noLimiter},
 	{"GET", "/api/workers/hosted/config", noLimiter},

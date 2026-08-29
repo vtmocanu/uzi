@@ -3251,7 +3251,10 @@ export const mockApi = {
     const description = card.has_prd_link
       ? `## Summary\n\nImplement the change described in the linked PRD.\n\nSee \`prds/${iid}-feature.md\` for the full specification.`
       : "This issue has no linked `prds/*.md` file. A PRD is optional — label the issue `uzi` and a run can still be started from it.";
-    return delay({ issue: { ...rest, description } });
+    // bot_forge_user_id rides the issue detail (PRD #767 M5), from the board's single
+    // connection, so the issue view evaluates the same "uzi OR assigned-to-bot" predicate
+    // as the board card — assignee_ids comes through on ...rest.
+    return delay({ issue: { ...rest, assignee_ids: rest.assignee_ids ?? [], description, bot_forge_user_id: b.bot_forge_user_id ?? 0 } });
   },
   syncRepo: async (repoId: string) => {
     const b = state.boards.get(repoId);
@@ -3267,6 +3270,7 @@ export const mockApi = {
       title,
       state: "opened",
       labels: [appSettings.uzi_label],
+      assignee_ids: [] as number[],
       web_url: `${b.web_url}/-/issues/${iid}`,
       forge_type: "gitlab",
       author: requireSession().display_name?.toLowerCase() ?? "you",
@@ -4626,19 +4630,33 @@ export const mockApi = {
       }));
     return delay({ entries: scheduleCatalog.map((e) => ({ ...e, labels: [...e.labels] })), enablements });
   },
-  enableCatalogSchedule: async (repoId: string, slug: string) => {
+  enableCatalogSchedule: async (repoId: string, slug: string, timezone?: string) => {
     requireSession();
     const repo = repos.find((r) => r.id === repoId);
     if (!repo) throw new ApiError(404, "repo not found");
     const entry = catalogBySlug(slug);
     if (!entry) throw new ApiError(404, "catalog entry not found");
     // Idempotent (server 200): an already-materialized (repo, slug) — even paused —
-    // returns its existing row untouched, never a fresh enable.
+    // returns its existing row untouched, never a fresh enable. Mirroring the server's
+    // ON CONFLICT DO NOTHING, a re-enable ignores any timezone override (issue #660).
     const existing = schedules.find(
       (s) => s.origin === "default" && s.catalog_slug === slug && s.repo_id === repoId,
     );
     if (existing) return delay(scheduleDTO(existing));
     const s = materializeDefault(entry, repoId, nextScheduleId());
+    // On the fresh-materialize path only, an optional detected browser timezone (issue
+    // #660) overrides the catalog zone; an empty/absent tz keeps the catalog zone. Mirror
+    // the production handler: trim, and reject an invalid IANA name (Intl throws a
+    // RangeError on both a bogus name and the "Local" sentinel) with a 400.
+    const tz = timezone?.trim();
+    if (tz) {
+      try {
+        Intl.DateTimeFormat(undefined, { timeZone: tz });
+      } catch {
+        throw new ApiError(400, "invalid timezone");
+      }
+      s.timezone = tz;
+    }
     schedules = [s, ...schedules];
     return delay(scheduleDTO(s), 200);
   },

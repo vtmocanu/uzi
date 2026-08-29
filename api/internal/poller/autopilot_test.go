@@ -626,3 +626,154 @@ func TestAutopilotNoCandidatesNoOps(t *testing.T) {
 		t.Fatalf("empty candidate set must be a no-op")
 	}
 }
+
+// ── PRD #767 M3: assignment-eligibility candidacy + label-keyed consent ────────
+//
+// Candidacy itself (the "OR bot-assigned" widening of ListAutopilotCandidateIssues)
+// is a SQL predicate, so it is proven under a live DB in
+// store.TestListAutopilotCandidateIssuesAssignmentEligibilityLiveDB. These fake-store
+// tests own the POLLER half: that the poller threads the connection's
+// bot_forge_user_id into the candidate query, and that consent/attribution stays keyed
+// on the autopilot-label add event no matter how the issue became a candidate — an
+// assignment produces no LabelEvent, so it must never start a run or mint a trigger on
+// its own. Each case sets the fake's candidate set explicitly (simulating what the SQL
+// selected), then asserts the label-keyed path fires (or holds) as designed.
+
+const botForgeUserID int64 = 55
+
+func ccOwnerWithBot(username string, opted, hasToken bool, botID int64) store.GetAutopilotConnectionContextRow {
+	cc := ccOwner(username, opted, hasToken)
+	cc.BotForgeUserID = botID
+	return cc
+}
+
+// TestAutopilotThreadsBotIDToCandidateQuery proves the poller feeds the connection's
+// bot_forge_user_id into ListAutopilotCandidateIssues (so the SQL can evaluate the
+// assignment-eligibility half). Pre-change the params struct had no BotID field, so
+// this is net-new plumbing. It also pins the M3 reorder: cc is fetched before the
+// candidate list, so its bot id is available to the query.
+func TestAutopilotThreadsBotIDToCandidateQuery(t *testing.T) {
+	st := &apStore{
+		candidates: []store.ListAutopilotCandidateIssuesRow{candIssue(7, "alice")},
+		cc:         ccOwnerWithBot("alice", true, true, botForgeUserID),
+	}
+	runs := &apRuns{}
+	f := &apForge{events: map[int64][]forge.LabelEvent{7: {addEvt(100, "alice")}}}
+
+	detectWith(st, runs, f)
+
+	if len(st.candParams) != 1 {
+		t.Fatalf("expected exactly one candidate query, got %d", len(st.candParams))
+	}
+	if st.candParams[0].BotID != botForgeUserID {
+		t.Fatalf("candidate query BotID = %d, want the connection bot id %d", st.candParams[0].BotID, botForgeUserID)
+	}
+}
+
+// TestAutopilotStartsRunOnAssignedUnlabelledCandidate is the M3 positive: a
+// bot-assigned issue with the autopilot label but NO uzi label reaches the run-start
+// path. The SQL selected it via the assignment branch (proven live in test A); here
+// the candidate is set explicitly and the autopilot-label add event by the owner drives
+// the run. This proves an assigned-but-uzi-unlabelled issue can auto-start — impossible
+// pre-change, where such an issue would never be a candidate (the query required the uzi
+// label). Consent is still label-keyed: the run is attributed to the label adder.
+func TestAutopilotStartsRunOnAssignedUnlabelledCandidate(t *testing.T) {
+	st := &apStore{
+		// Selected by the SQL's assignment branch: autopilot + bot-assigned, no uzi label.
+		candidates: []store.ListAutopilotCandidateIssuesRow{candIssue(7, "someone-else")},
+		cc:         ccOwnerWithBot("alice", true, true, botForgeUserID),
+	}
+	runs := &apRuns{}
+	// The autopilot label was added by the owner "alice" — the consent/attribution key.
+	f := &apForge{events: map[int64][]forge.LabelEvent{7: {addEvt(100, "alice")}}}
+
+	detectWith(st, runs, f)
+
+	if len(runs.calls) != 1 {
+		t.Fatalf("expected a run on the assigned+autopilot candidate, got %d", len(runs.calls))
+	}
+	// Attributed to the owner via the label-add event, not to any assignee.
+	if runs.calls[0].userID != apUserID {
+		t.Fatalf("run attributed to %v, want the connection owner %v", runs.calls[0].userID, apUserID)
+	}
+	if got := lastUpsert(t, st); got.LastEventID != 100 {
+		t.Fatalf("recorded event id = %d, want the autopilot-label add event 100", got.LastEventID)
+	}
+	if len(f.notes) != 0 {
+		t.Fatalf("expected no comment on a started run, got %+v", f.notes)
+	}
+}
+
+// TestAutopilotAssignmentAloneHeldWhenAutopilotRemoved is the M3 negative (D1 / R2):
+// the SAME assigned issue with the autopilot label REMOVED is NOT a candidate, so no
+// run. Removing the autopilot label drops it from ListAutopilotCandidateIssues (the
+// autopilot label is still required — the trigger is unchanged), which the fake models
+// with an empty candidate set. Assignment alone must never start a run. Mutation note:
+// were the SQL to drop the @label predicate, this bot-assigned issue would wrongly be
+// admitted (proven red in test A); at the poller level, a candidate with no
+// autopilot-label add event is separately held by TestAutopilotAssignedButNoAddEventHeld.
+func TestAutopilotAssignmentAloneHeldWhenAutopilotRemoved(t *testing.T) {
+	st := &apStore{
+		// Autopilot label removed → the candidate query excludes it entirely.
+		candidates: nil,
+		cc:         ccOwnerWithBot("alice", true, true, botForgeUserID),
+	}
+	runs := &apRuns{}
+	f := &apForge{}
+
+	detectWith(st, runs, f)
+
+	if len(runs.calls) != 0 || len(f.notes) != 0 || len(st.upserts) != 0 {
+		t.Fatalf("assignment without the autopilot label must be held: runs=%d notes=%d upserts=%d",
+			len(runs.calls), len(f.notes), len(st.upserts))
+	}
+}
+
+// TestAutopilotAssignedButNoAddEventHeld pins the poller-level guarantee behind D1: even
+// if a bot-assigned issue reaches detectOne as a candidate, an assignment produces NO
+// LabelEvent, so with no autopilot-label ADD event (only a removal in the events' latest
+// state) lastLabelAdd is nil and nothing fires — no run, no comment, no trigger row. An
+// assignment therefore never mints or advances a trigger on its own.
+func TestAutopilotAssignedButNoAddEventHeld(t *testing.T) {
+	st := &apStore{
+		candidates: []store.ListAutopilotCandidateIssuesRow{candIssue(7, "someone-else")},
+		cc:         ccOwnerWithBot("alice", true, true, botForgeUserID),
+	}
+	runs := &apRuns{}
+	// Latest state of the autopilot label is a removal: assignment is the only reason it
+	// is a candidate, and assignment has no add event.
+	f := &apForge{events: map[int64][]forge.LabelEvent{7: {addEvt(100, "alice"), remEvt(105, "alice")}}}
+
+	detectWith(st, runs, f)
+
+	if len(runs.calls) != 0 || len(f.notes) != 0 || len(st.upserts) != 0 {
+		t.Fatalf("a bot-assigned candidate with no live autopilot-label add must be held: runs=%d notes=%d upserts=%d",
+			len(runs.calls), len(f.notes), len(st.upserts))
+	}
+}
+
+// TestAutopilotBotAssignedAfterLabelNotDoubleFired is the "autopilot present, bot
+// assigned afterwards" case (M3): the issue was already run once on its autopilot-label
+// add (trigger recorded at event 100), then the bot was assigned. Assignment produces no
+// new LabelEvent, so a second tick — the issue still a candidate (now via the assignment
+// branch as well) with the same latest add event 100 — must NOT double-fire: it is
+// swallowed by the transition-once dedup, not treated as a fresh trigger.
+func TestAutopilotBotAssignedAfterLabelNotDoubleFired(t *testing.T) {
+	st := &apStore{
+		candidates: []store.ListAutopilotCandidateIssuesRow{candIssue(7, "alice")},
+		cc:         ccOwnerWithBot("alice", true, true, botForgeUserID),
+		triggers:   map[int64]store.AutopilotTrigger{7: {IssueIid: 7, LastEventID: 100}},
+	}
+	runs := &apRuns{}
+	// Same latest add event as the recorded trigger: assignment minted no new event id.
+	f := &apForge{events: map[int64][]forge.LabelEvent{7: {addEvt(100, "alice")}}}
+
+	detectWith(st, runs, f)
+
+	if len(runs.calls) != 0 {
+		t.Fatalf("assignment after an already-handled label add must not double-fire, got %d runs", len(runs.calls))
+	}
+	if len(st.upserts) != 0 {
+		t.Fatalf("no new trigger should be written for a stale event, got %+v", st.upserts)
+	}
+}

@@ -633,3 +633,36 @@ func boolStr(b bool) string {
 	}
 	return "false"
 }
+
+// TestGitHubListIssuesMapsAssignees pins PRD #767 M1: GitHub's inline
+// `assignees` array (go-github User.GetID() int64, nil-guarded) round-trips into
+// forge.Issue.Assignees, and an unassigned issue yields a non-nil empty slice.
+func TestGitHubListIssuesMapsAssignees(t *testing.T) {
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/issues": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"number": 1, "title": "assigned", "state": "open",
+					"assignees": []map[string]any{{"id": 42, "login": "bot"}, {"id": 99}}},
+				{"number": 2, "title": "unassigned", "state": "open"},
+			})
+		},
+	})
+	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+
+	issues, err := d.ListIssues(context.Background(), 7, ListIssuesOptions{})
+	if err != nil {
+		t.Fatalf("ListIssues: %v", err)
+	}
+	if len(issues) != 2 {
+		t.Fatalf("expected 2 issues, got %d", len(issues))
+	}
+	if got := issues[0].Assignees; len(got) != 2 || got[0] != 42 || got[1] != 99 {
+		t.Fatalf("assignee ids not mapped: %v", got)
+	}
+	if issues[1].Assignees == nil {
+		t.Fatal("unassigned issue must yield a non-nil empty Assignees slice")
+	}
+	if len(issues[1].Assignees) != 0 {
+		t.Fatalf("unassigned issue must have no assignees, got %v", issues[1].Assignees)
+	}
+}

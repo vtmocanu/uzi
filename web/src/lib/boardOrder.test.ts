@@ -44,6 +44,7 @@ function aCard(over: Partial<Card> & { iid: number }): Card {
     title: `issue ${over.iid}`,
     state: "opened",
     labels: ["PRD"],
+    assignee_ids: [],
     web_url: `https://forge/x/-/issues/${over.iid}`,
     forge_type: "gitlab",
     author: null,
@@ -575,7 +576,7 @@ describe("freeze-test 3: a freeze taken with cards hidden", () => {
   it("leaves the hidden cards' relative order unchanged", () => {
     // A viewer with show-all OFF sees only the `uzi` cards 10, 30, 50 and drags 50 to
     // the top (PRD #764: membership is the single `uzi` label).
-    const seen = visibleCards(payloadCards, "uzi", false);
+    const seen = visibleCards(payloadCards, "uzi", 0, false);
     expect(seen.map((c) => c.iid)).toEqual([10, 30, 50]);
 
     const out = dropIntent({
@@ -601,7 +602,7 @@ describe("freeze-test 3: a freeze taken with cards hidden", () => {
     // The positive control. Without it "the hidden cards are in the list" is a claim
     // about a fixture, not about the implementation.
     const broken = dropIntent({
-      payloadCards: visibleCards(payloadCards, "uzi", false),
+      payloadCards: visibleCards(payloadCards, "uzi", 0, false),
       columnKeys,
       sortMode: "manual",
       sortDir: "desc",

@@ -41,6 +41,12 @@ type fakeStore struct {
 	sweepRows           []store.ListSweepCandidateIssuesRow
 	sweepLabelParam     []byte
 	sweepMaxIssuesParam pgtype.Int4
+	// sweepSelectorParam / sweepBotIDParam capture the PRD #767 M4 selector discriminator
+	// the list query was called with, so a test can prove an assigned sweep threaded
+	// Selector="assigned" + the repo bot id (bypassing resolveSweepLabels), and a label
+	// sweep threaded Selector="label" + the resolved labels.
+	sweepSelectorParam string
+	sweepBotIDParam    int64
 
 	// sweepCount is the total returned by CountSweepCandidateIssues (the Capped probe);
 	// sweepCountErr forces a transient DB error on it. countLabelParam records the label
@@ -79,6 +85,8 @@ func (f *fakeStore) SetRunScheduleStatus(_ context.Context, arg store.SetRunSche
 func (f *fakeStore) ListSweepCandidateIssues(_ context.Context, arg store.ListSweepCandidateIssuesParams) ([]store.ListSweepCandidateIssuesRow, error) {
 	f.sweepLabelParam = arg.Labels
 	f.sweepMaxIssuesParam = arg.MaxIssues
+	f.sweepSelectorParam = arg.Selector
+	f.sweepBotIDParam = arg.BotID
 	return f.sweepRows, nil
 }
 func (f *fakeStore) CountSweepCandidateIssues(_ context.Context, arg store.CountSweepCandidateIssuesParams) (int64, error) {
@@ -2006,6 +2014,94 @@ func TestFireSweepDefaultResolvesFromCatalog(t *testing.T) {
 	}
 	if strings.Index(desc, want.Guidance) > strings.Index(desc, overlay) {
 		t.Fatalf("baked guidance must precede the overlay; got %q", desc)
+	}
+}
+
+// TestFireSweepAssignedDefaultThreadsSelectorAndBotID is the PRD #767 M4 positive at the
+// fake seam: an enabled default assigned-sweep resolves selector kind "assigned" from its
+// catalog entry and drives the candidate query by the repo's bot_forge_user_id — NOT by a
+// label. It proves resolveSweepLabels' empty→uzi default was BYPASSED: the list query
+// received Selector="assigned" + BotID=<repo bot id> and Labels="[]" (the passthrough cast
+// filler), never Labels=["uzi"]. The single candidate the fake returns starts one run.
+//
+// It fails against pre-change code, where fireSweep always called resolveSweepLabels and
+// passed Labels=<uzi> with no Selector/BotID param — an assigned sweep would have selected
+// by the uzi label, and the ListSweepCandidateIssuesParams had no Selector/BotID fields.
+func TestFireSweepAssignedDefaultThreadsSelectorAndBotID(t *testing.T) {
+	const botID int64 = 5150
+	h := newHarness()
+	h.st.repoRow.BotForgeUserID = botID
+	want, ok := schedtmpl.BySlug("assigned-sweep")
+	if !ok {
+		t.Fatal("assigned-sweep catalog entry missing")
+	}
+	if want.SelectorKind != schedtmpl.SelectorAssigned {
+		t.Fatalf("assigned-sweep selector kind = %q, want assigned", want.SelectorKind)
+	}
+	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 7}}
+	sched := store.RunSchedule{
+		ID:          uuid.New(),
+		UserID:      h.owner,
+		RepoID:      h.repoID,
+		Target:      "sweep",
+		Origin:      "default",
+		CatalogSlug: pgtype.Text{String: "assigned-sweep", Valid: true},
+		Timing:      "recurring",
+		CronExpr:    pgtype.Text{String: "0 * * * *", Valid: true},
+		Timezone:    "UTC",
+		AutoApprove: true,
+		Status:      "active",
+		Enabled:     true,
+	}
+
+	out, err := h.sched.fireSweep(context.Background(), sched)
+	if err != nil {
+		t.Fatalf("fireSweep: %v", err)
+	}
+	if len(out.Started) != 1 {
+		t.Fatalf("started = %d, want 1", len(out.Started))
+	}
+	// The candidate query must be driven by the ASSIGNED selector + the repo bot id.
+	if h.st.sweepSelectorParam != schedtmpl.SelectorAssigned {
+		t.Fatalf("sweep selector param = %q, want %q (assigned kind must not be label-selected)", h.st.sweepSelectorParam, schedtmpl.SelectorAssigned)
+	}
+	if h.st.sweepBotIDParam != botID {
+		t.Fatalf("sweep bot id param = %d, want the repo bot id %d", h.st.sweepBotIDParam, botID)
+	}
+	// resolveSweepLabels' uzi default must have been BYPASSED: labels are the "[]" filler,
+	// never the uzi label.
+	if string(h.st.sweepLabelParam) != "[]" {
+		t.Fatalf("sweep label param = %s, want [] (assigned sweep bypasses resolveSweepLabels)", h.st.sweepLabelParam)
+	}
+	if strings.Contains(string(h.st.sweepLabelParam), "uzi") {
+		t.Fatalf("assigned sweep leaked the uzi label into the selector: %s", h.st.sweepLabelParam)
+	}
+}
+
+// TestFireSweepLabelSweepThreadsLabelSelector is the regression guard paired with the
+// assigned case: a label sweep (a user-origin row here) still resolves Selector="label",
+// threads its resolved labels, and passes BotID=0 (the assigned branch stays off).
+func TestFireSweepLabelSweepThreadsLabelSelector(t *testing.T) {
+	h := newHarness()
+	h.st.repoRow.BotForgeUserID = 9999  // present but must NOT be threaded for a label sweep
+	s := h.sweepSchedule(pgtype.Int4{}) // user-origin, Labels ["PRD"]
+	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 7}}
+
+	out, err := h.sched.fireSweep(context.Background(), s)
+	if err != nil {
+		t.Fatalf("fireSweep: %v", err)
+	}
+	if len(out.Started) != 1 {
+		t.Fatalf("started = %d, want 1", len(out.Started))
+	}
+	if h.st.sweepSelectorParam != schedtmpl.SelectorLabel {
+		t.Fatalf("sweep selector param = %q, want %q", h.st.sweepSelectorParam, schedtmpl.SelectorLabel)
+	}
+	if string(h.st.sweepLabelParam) != `["PRD"]` {
+		t.Fatalf("sweep label param = %s, want the resolved [\"PRD\"] selector", h.st.sweepLabelParam)
+	}
+	if h.st.sweepBotIDParam != 0 {
+		t.Fatalf("sweep bot id param = %d, want 0 (the assigned branch is off for a label sweep)", h.st.sweepBotIDParam)
 	}
 }
 
