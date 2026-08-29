@@ -549,6 +549,10 @@ type Store interface {
 	// UpsertRunUsage folds a delivered result frame's per-model usage into
 	// run_usage (PRD #40 M2), GREATEST-merged so re-delivery never regresses.
 	UpsertRunUsage(ctx context.Context, arg store.UpsertRunUsageParams) error
+	// BumpRunLineageEpoch increments a run's lineage-epoch counter by one (PRD
+	// #632), called once per newly-inserted resume_lineage_break status event so a
+	// fresh SDK leg's run_usage rows are stamped with a higher epoch than the prior.
+	BumpRunLineageEpoch(ctx context.Context, id uuid.UUID) error
 	// Usage read rollups (PRD #40 M3), all over the run_usage_totals view.
 	GetRunUsageTotal(ctx context.Context, runID uuid.UUID) (store.GetRunUsageTotalRow, error)
 	SelfUsage(ctx context.Context, userID uuid.UUID) (store.SelfUsageRow, error)
@@ -2880,6 +2884,18 @@ func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID
 // The audit as it stands, per non-insert call:
 //
 //   - UpdateRunLastSeq — takes the run id and an int32 seq. No worker text.
+//   - BumpRunLineageEpoch — takes only the run id (a uuid) and writes a
+//     server-computed `lineage_epoch + 1`. No worker-controlled text or value
+//     reaches the store through it, so it cannot produce a WORKER-VALUE-DEPENDENT
+//     22P02/22021/54000/22003 code the way an unsanitized text/numeric column
+//     could — which is what makes returning its error raw correct. (It could in
+//     principle raise a state-dependent 22003 only if the counter ever reached
+//     INT_MAX — not worker-value-dependent, needs ~2^31 events, and the raw return
+//     still handles it: the worker retries, the seq-deduped break is skipped, and
+//     no poison loop forms.) A CLEARED suspect, written out for the same reason as
+//     foldRunUsage below: it is correctly returned raw (500), never wrapped,
+//     because a failure is a genuine server error the worker should retry, not a
+//     poisoned batch.
 //   - foldRunUsage → UpsertRunUsage — every column it writes, checked one by one
 //     because "I cannot think of a case" is not the same as "there is no case".
 //     Read this as a CLEARED suspect, not a live hazard: it is written out because
@@ -3042,6 +3058,56 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 			inserted = append(inserted, m)
 		}
 	}
+	// Bump the run's lineage epoch once per NEWLY-INSERTED resume_lineage_break
+	// status event (PRD #632, dropped-resume signal #334). Scan `inserted`, NOT
+	// `msgs`: a re-delivered break is seq-deduped (rows == 0 ⇒ absent from
+	// `inserted`), so a retry never double-bumps and the bump stays idempotent
+	// under at-least-once delivery. A malformed payload just isn't a break (skip).
+	//
+	// This runs HERE — right after the insert loop, before the high-water-mark
+	// update AND the insertErr guard — on purpose. The message inserts are not
+	// transactional (each commits on its own), so once a break's row is committed it
+	// is owed its bump: any later `return` before this loop (an unstorable message
+	// co-batched after the break, or an UpdateRunLastSeq failure) would lose the bump
+	// permanently, because on the worker's retry the committed break is seq-deduped
+	// (rows == 0 ⇒ absent from `inserted`) and never re-bumped. Bumping at the
+	// earliest point where `inserted` is complete shrinks that loss window to the
+	// irreducible one — the bump statement itself failing — which no reordering can
+	// close without a shared transaction (advisory-telemetry impact only). The
+	// `inserted` gate already makes the bump exactly-once regardless of position, so
+	// moving it up cannot double-bump.
+	//
+	// One consequence of sitting ahead of the high-water-mark update: a bump failure
+	// now returns before UpdateRunLastSeq, so last_seq is not advanced on that path.
+	// This is self-healing — the worker retries, maxStored is recomputed (its
+	// assignment is outside the rows>0 gate), the seq-deduped break is skipped, and
+	// UpdateRunLastSeq advances last_seq on the retry — so the only durable casualty
+	// is the same irreducible lost bump noted above, not a stuck watermark.
+	// The seqs of the breaks NEWLY inserted in this batch (those actually bumped),
+	// handed to foldRunUsage so it stamps per-frame epochs off the SAME set the bump
+	// used — never off `msgs`, which also carries seq-deduped re-deliveries whose bump
+	// already landed in a prior batch (and is therefore already in run.LineageEpoch).
+	var insertedBreakSeqs []int32
+	for _, m := range inserted {
+		if m.Kind != "status" {
+			continue
+		}
+		var ev statusEventPayload
+		if err := json.Unmarshal(m.Payload, &ev); err != nil {
+			continue // malformed payload → not a break
+		}
+		if ev.Event != "resume_lineage_break" {
+			continue
+		}
+		// Return the error RAW (500), never through classifyStoreError: this call
+		// writes only the run_id and a server-computed +1 — no worker-controlled
+		// value reaches the store — so a failure is a genuine server error the
+		// worker should retry, never a "batch poisoned" 400. See the 🔴 audit block.
+		if err := s.q.BumpRunLineageEpoch(ctx, runID); err != nil {
+			return obs, err
+		}
+		insertedBreakSeqs = append(insertedBreakSeqs, m.Seq)
+	}
 	// The high-water mark AS OBSERVED, whether or not the insert loop broke and
 	// whether or not the UpdateRunLastSeq below runs. This is what the streak's
 	// no-progress reset compares (PRD #108 M4).
@@ -3090,7 +3156,7 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	// re-delivers and the fold retries. No terminal-status guard — a result frame
 	// that lands after a mid-flight cancel still folds (pre-cancel spend is real
 	// spend, Decision 4).
-	if err := s.foldRunUsage(ctx, run, msgs); err != nil {
+	if err := s.foldRunUsage(ctx, run, msgs, insertedBreakSeqs); err != nil {
 		return obs, err
 	}
 	// Fan out after the log + high-water mark are durably advanced, so a browser
@@ -3123,6 +3189,13 @@ type resultModelUsage struct {
 	CostUSD                  float64 `json:"costUSD"`
 }
 
+// statusEventPayload is the minimal shape appendMessages reads off a `status`
+// message to detect a resume_lineage_break (dropped-resume signal #334, PRD #632).
+// Only `event` is inspected; a malformed payload simply isn't a break.
+type statusEventPayload struct {
+	Event string `json:"event"`
+}
+
 // run_usage's PK is (run_id, session_id, model). run_id is a uuid (16 bytes in
 // the index); session_id and model are BOTH unbounded worker-controlled text
 // (00062_run_usage.sql). A btree index entry is capped at 2704 bytes on an 8 KiB
@@ -3151,12 +3224,20 @@ const (
 // foldRunUsage upserts run_usage for every delivered result frame in the batch
 // (PRD #40 Decision 2). It is called with ALL delivered messages, not just the
 // newly-inserted ones, so a seq-deduped re-delivery re-runs the fold — the
-// GREATEST merge in UpsertRunUsage makes that idempotent. session_id is sourced
+// GREATEST merge in UpsertRunUsage makes that idempotent. `insertedBreakSeqs` is
+// the seqs of the resume_lineage_break events NEWLY inserted in this batch (the
+// set the caller's bump loop incremented); the per-frame epoch is counted off it,
+// never off `msgs` (see the per-frame block for why). session_id is sourced
 // from the run row (the frame payload carries none); it is ” until the run has
 // reported one, which the monotonic merge + latest/MAX-per-model rollup tolerate.
+// It also stamps a PER-FRAME lineage epoch (PRD #632): the run's committed epoch at
+// batch start — run.LineageEpoch, from runOwnedByWorker's fresh per-call fetch, left
+// UNMUTATED here — plus the number of resume_lineage_break events preceding that
+// frame in seq order within this batch (see the per-frame block below). The epoch is
+// pinned to first insert in UpsertRunUsage, never overwritten by a re-fold.
 // Malformed/absent usage is skipped (never fails the append); a DB error
 // propagates so the append fails and the worker re-delivers.
-func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []IncomingMessage) error {
+func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []IncomingMessage, insertedBreakSeqs []int32) error {
 	// Fold work runs — issue AND ci_fix both spend the user's tokens working a card
 	// or a pipeline end to end — and exclude ONLY chat. Chat-run spend is explicitly
 	// OUT of scope for PRD #40 ("Counting tokens spent outside runs, e.g. the PRD #39
@@ -3177,6 +3258,33 @@ func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []Incomi
 	// for the 54000/2704-byte reasoning). session_id is capped once here; model is
 	// capped per-frame inside the loop, since each frame carries its own.
 	sessionID = truncateRunes(sessionID, maxUsageSessionRunes)
+	// Per-frame lineage epoch (PRD #632). A result frame belongs to the epoch in
+	// force WHEN IT WAS EMITTED — the run's committed epoch at batch start
+	// (run.LineageEpoch, fetched fresh in appendMessages and NOT mutated) plus the
+	// number of resume_lineage_break events preceding it in seq order within this
+	// batch. The case this defends: the old leg's final result frame is co-batched
+	// with the break signal (result precedes break in seq order), while the fresh
+	// leg's result frames arrive in a LATER batch under a new session_id (the run is
+	// re-fetched with the bumped epoch by then). Applying one batch-final epoch to
+	// every frame would stamp that pre-break result with the post-break epoch; since
+	// UpsertRunUsage pins lineage_epoch on first insert (omitted from DO UPDATE SET),
+	// a later re-fold could not repair it, and the totals view would MAX-collapse the
+	// old leg into the new one's epoch group. (Two frames in ONE batch always share
+	// run.SessionID and so collapse by GREATEST regardless of epoch — session_id is
+	// the row-splitter, per ADR-632; the epoch only matters once the legs land under
+	// distinct session_ids, which happens across batches.) In the normal case there
+	// are no breaks in a frame-carrying batch, so every frame gets baseEpoch unchanged.
+	//
+	// Count breaks off `insertedBreakSeqs` — the breaks NEWLY inserted in THIS batch,
+	// the exact set the bump loop incremented — NOT off `msgs`. `msgs` also carries
+	// seq-deduped re-deliveries under at-least-once delivery, and a re-delivered
+	// break's bump already landed in a prior batch and is therefore ALREADY in
+	// baseEpoch. Recounting it here would add it twice: harmless for a re-folded frame
+	// (the upsert pins the epoch, so the recomputed value is discarded), but WRONG for
+	// a genuinely NEW result frame co-batched with that re-delivered break (partial
+	// prior persistence) — that frame is a first insert, so the double-counted phantom
+	// epoch would be pinned and split one lineage leg across two epoch groups.
+	baseEpoch := run.LineageEpoch
 	for _, m := range msgs {
 		// Result frames are only ever kind status (success) or error; skip the
 		// rest without paying an unmarshal for every text/tool_use message.
@@ -3190,6 +3298,13 @@ func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []Incomi
 		if p.Event != "result" || len(p.ModelUsage) == 0 {
 			continue // not a result frame, or no per-model usage to fold
 		}
+		// Epoch for THIS frame = base + newly-inserted breaks that precede it in seq order.
+		frameEpoch := baseEpoch
+		for _, bs := range insertedBreakSeqs {
+			if bs < m.Seq {
+				frameEpoch++
+			}
+		}
 		for model, mu := range p.ModelUsage {
 			if model == "" {
 				continue
@@ -3199,6 +3314,7 @@ func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []Incomi
 				RunID:               run.ID,
 				SessionID:           sessionID,
 				Model:               model,
+				LineageEpoch:        frameEpoch,
 				InputTokens:         nonNegTokens(mu.InputTokens),
 				CacheReadTokens:     nonNegTokens(mu.CacheReadInputTokens),
 				CacheCreationTokens: nonNegTokens(mu.CacheCreationInputTokens),
