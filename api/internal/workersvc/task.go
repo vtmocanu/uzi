@@ -251,6 +251,10 @@ func (s *Service) CreateThenFixRun(ctx context.Context, userID, repoID, original
 		IssueDescription:    description,
 		BudgetWallSeconds:   budgetWall,
 		BudgetMaxIterations: budgetIters,
+		// PRD #35: stamp the owner's usage-limit-parking default, same as CreateTaskRun —
+		// otherwise a fix run falls to the column DEFAULT false and stops on a limit even
+		// when the owner (and the original handoff) opted into parking.
+		WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError

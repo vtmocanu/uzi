@@ -282,12 +282,15 @@ func TestCreateThenFixRunCopiesOriginalBudget(t *testing.T) {
 	p := testParams()
 	p.HandoffRunTimeout = 4 * time.Hour // config: 14400 / 10 ...
 	p.HandoffRunMaxIterations = 10
-	fs := &fakeStore{}
+	owner := uuid.New()
+	// The owner opted into usage-limit parking: the fix run must inherit it (PRD #35), not
+	// fall to the column DEFAULT false and stop on a limit the original handoff would park on.
+	fs := &fakeStore{userByID: store.User{ID: owner, WaitOnLimit: true}}
 	svc := New(fs, newBox(t), p)
 	// ... but the original task was stored with 7200 / 7 (e.g. created under earlier config).
 	origWall := pgtype.Int4{Int32: 7200, Valid: true}
 	origIters := pgtype.Int4{Int32: 7, Valid: true}
-	if _, err := svc.CreateThenFixRun(context.Background(), uuid.New(), uuid.New(), uuid.New(), "uzi/task/abc", "main", "fix the findings", origWall, origIters); err != nil {
+	if _, err := svc.CreateThenFixRun(context.Background(), owner, uuid.New(), uuid.New(), "uzi/task/abc", "main", "fix the findings", origWall, origIters); err != nil {
 		t.Fatalf("CreateThenFixRun: %v", err)
 	}
 	got := fs.thenFixRunParams
@@ -299,6 +302,9 @@ func TestCreateThenFixRunCopiesOriginalBudget(t *testing.T) {
 	}
 	if !got.BudgetMaxIterations.Valid || got.BudgetMaxIterations.Int32 != 7 {
 		t.Errorf("budget_max_iterations = %v, want the original's stored 7 (copied, not config's 10)", got.BudgetMaxIterations)
+	}
+	if !got.WaitOnLimit {
+		t.Error("wait_on_limit = false for an opted-in owner — the fix run fell to the column default instead of resolveWaitOnLimit (PRD #35)")
 	}
 }
 

@@ -50,17 +50,21 @@ RETURNING *;
 -- rather than reverting to the global default — otherwise the fix phase of a long handoff
 -- would silently cap at RUN_TIMEOUT / RUN_MAX_ITERATIONS, the exact regression #785 exists to
 -- prevent. NULL (global fallback) only for a non-positive/out-of-range knob.
+-- wait_on_limit (PRD #35): stamped from the OWNER's default like every other creation
+-- path, so a then-fix parks/stops on an Anthropic usage limit the same way the original
+-- handoff would — omitting it silently opts every fix run OUT via the column DEFAULT false,
+-- so an owner who enabled parking could see the initial handoff park but its fix stop.
 INSERT INTO runs (
     id, user_id, repo_id, kind, branch, base_branch,
     then_fix_of_run_id, review_target_run_id, dispatched_at,
-    auto_approve, open_mr, review_requested, then_fix_requested,
+    auto_approve, open_mr, review_requested, then_fix_requested, wait_on_limit,
     issue_title, issue_description, required_capabilities,
     budget_wall_seconds, budget_max_iterations
 )
 VALUES (
     @run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'),
     @then_fix_of_run_id, NULL, now(),
-    true, false, false, false,
+    true, false, false, false, @wait_on_limit,
     @issue_title, @issue_description,
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'),
     sqlc.narg('budget_wall_seconds'), sqlc.narg('budget_max_iterations')
