@@ -28,7 +28,7 @@ import (
 
 // defaultColumnColor is used when a user adds a brand-new column whose label
 // does not yet exist on the forge.
-const defaultColumnColor = "#8c8c8c"
+const defaultColumnColor = forgesvc.DefaultColumnColor
 
 // maxBoardColumns caps how many columns a board may have. Each column is an
 // EnsureLabels call on the forge and a rendered lane; the cap bounds both the

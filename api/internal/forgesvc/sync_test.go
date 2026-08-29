@@ -2,6 +2,7 @@ package forgesvc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -596,6 +597,107 @@ func TestIncrementalSyncZeroHWMSendsNoLowerBound(t *testing.T) {
 			assertBound(t, "open", open[0].UpdatedAfter, tc.wantOpn)
 		})
 	}
+}
+
+// boardColumns builds the []store.BoardColumn AutoMove reads (only LabelName is
+// consulted) from the default column names plus any extra custom names a case
+// needs. AutoMove's columnSet is what makes a label a "column label", so a target
+// must appear here to be planned as a column move.
+func boardColumns(extra ...string) []store.BoardColumn {
+	names := append([]string{"Planned", "In Progress", "Human Review", "Later"}, extra...)
+	cols := make([]store.BoardColumn, 0, len(names))
+	for _, n := range names {
+		cols = append(cols, store.BoardColumn{LabelName: n})
+	}
+	return cols
+}
+
+// autoMoveIssue builds a cached issue whose Labels JSON is exactly labels, so a
+// case controls whether the target column is already present.
+func autoMoveIssue(t *testing.T, labels ...string) store.Issue {
+	t.Helper()
+	raw, err := json.Marshal(labels)
+	if err != nil {
+		t.Fatalf("marshal labels: %v", err)
+	}
+	return store.Issue{RepoID: uuid.New(), ForgeIssueIid: 42, Title: "t", State: "opened", Labels: raw}
+}
+
+// TestAutoMoveEnsuresTargetColumnLabel proves AutoMove now EnsureLabels the
+// target column before writing it (mirroring SetIssueLabel), so a manual drag to
+// a column whose forge label is missing or drifted recreates it — with the right
+// color — instead of failing the UpdateIssueLabels write. It also pins the cheap
+// path: an empty add (already in the target column) ensures nothing.
+func TestAutoMoveEnsuresTargetColumnLabel(t *testing.T) {
+	t.Run("recreates a default column with its pinned color", func(t *testing.T) {
+		st := &fakeStore{}
+		svc := newTestService(st)
+		f := &fakeForge{}
+		issue := autoMoveIssue(t) // no cached labels: the target is absent
+
+		if _, err := svc.AutoMove(context.Background(), f, 7, issue, boardColumns(), "Planned"); err != nil {
+			t.Fatalf("AutoMove: %v", err)
+		}
+		if len(f.ensureCalls) != 1 {
+			t.Fatalf("expected exactly one EnsureLabels call, got %d: %+v", len(f.ensureCalls), f.ensureCalls)
+		}
+		got := f.ensureCalls[0]
+		if len(got) != 1 || got[0].Name != "Planned" || got[0].Color != "#6699cc" {
+			t.Fatalf("ensured label = %+v, want [{Planned #6699cc}]", got)
+		}
+		if len(f.updateCalls) != 1 || len(f.updateCalls[0].add) != 1 || f.updateCalls[0].add[0] != "Planned" {
+			t.Fatalf("update add = %+v, want [Planned]", f.updateCalls)
+		}
+	})
+
+	t.Run("custom column falls back to grey", func(t *testing.T) {
+		st := &fakeStore{}
+		svc := newTestService(st)
+		f := &fakeForge{}
+		issue := autoMoveIssue(t) // Triage not cached
+
+		if _, err := svc.AutoMove(context.Background(), f, 7, issue, boardColumns("Triage"), "Triage"); err != nil {
+			t.Fatalf("AutoMove: %v", err)
+		}
+		if len(f.ensureCalls) != 1 {
+			t.Fatalf("expected exactly one EnsureLabels call, got %d: %+v", len(f.ensureCalls), f.ensureCalls)
+		}
+		got := f.ensureCalls[0]
+		if len(got) != 1 || got[0].Name != "Triage" || got[0].Color != DefaultColumnColor {
+			t.Fatalf("ensured label = %+v, want [{Triage %s}]", got, DefaultColumnColor)
+		}
+	})
+
+	t.Run("an EnsureLabels error blocks the move", func(t *testing.T) {
+		st := &fakeStore{}
+		svc := newTestService(st)
+		f := &fakeForge{ensureErr: errors.New("forge down")}
+		issue := autoMoveIssue(t) // target absent, so EnsureLabels runs
+
+		if _, err := svc.AutoMove(context.Background(), f, 7, issue, boardColumns(), "Planned"); err == nil {
+			t.Fatal("expected AutoMove to propagate the EnsureLabels error")
+		}
+		if len(f.updateCalls) != 0 {
+			t.Fatalf("UpdateIssueLabels ran despite the ensure error: %+v", f.updateCalls)
+		}
+		if len(st.upserts) != 0 {
+			t.Fatalf("cache upsert ran despite the ensure error: %+v", st.upserts)
+		}
+	})
+
+	t.Run("no ensure when already in the target column", func(t *testing.T) {
+		st := &fakeStore{}
+		svc := newTestService(st)
+		f := &fakeForge{}
+		issue := autoMoveIssue(t, "Planned") // already in target: add is empty
+
+		if _, err := svc.AutoMove(context.Background(), f, 7, issue, boardColumns(), "Planned"); err != nil {
+			t.Fatalf("AutoMove: %v", err)
+		}
+		if len(f.ensureCalls) != 0 {
+			t.Fatalf("expected no EnsureLabels call (empty add), got %+v", f.ensureCalls)
+		}
+	})
 }
 
 // assertBound compares one fetch's UpdatedAfter against a want, where nil means
