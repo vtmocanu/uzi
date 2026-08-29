@@ -180,15 +180,21 @@ correctly.
   Leg-1 frames are not re-delivered across a break (that leg's worker/batcher is gone),
   so pin-to-first is safe and cannot migrate a row's epoch back into a colliding group;
   `lineage_epoch = EXCLUDED.lineage_epoch` is the wrong choice (a late re-fold could
-  re-collapse two legs). **Epoch visibility:** `foldRunUsage` receives the `run` struct
-  fetched once at `appendMessages` top (`service.go:2673`), so a bump made *within the
-  same call* is invisible to that fold. This is safe **only** because the break message
-  arrives in an *earlier* append batch than the fresh leg's result frames (break
-  emitted at `run()` start; result frames only at phase boundaries), so the later batch
-  re-fetches `run` with the epoch already committed. State this temporal invariant in
-  the code; do not describe a same-pass interleaving that does not exist. (A defensive
-  alternative — re-read the run's epoch inside `foldRunUsage` — is acceptable if the
-  implementer prefers not to rely on the batch-ordering invariant.)
+  re-collapse two legs). **Epoch visibility (per-frame, as shipped):** `foldRunUsage`
+  receives the `run` struct fetched once at `appendMessages` top and stamps each result
+  frame with a PER-FRAME epoch — the run's committed epoch at batch start plus the count of
+  NEWLY-INSERTED `resume_lineage_break` events preceding that frame in seq order. That set
+  is the one the bump loop actually incremented (`insertedBreakSeqs`, threaded into
+  `foldRunUsage`), NOT recomputed from `msgs`: `msgs` also carries seq-deduped re-deliveries
+  whose bump already landed in a prior batch (and is already in the committed epoch), so
+  counting them would double-count. This handles in-batch break/result interleaving directly
+  (`[result A, break, result B]` stamps A at the base epoch and B at base+1), so it does not
+  depend on the break and the fresh leg's frames landing in separate batches. It is also what
+  keeps a re-delivered break from double-counting a genuinely NEW co-batched frame's epoch —
+  that frame is a first insert, so a double count would pin a phantom epoch and split one
+  lineage leg across two epoch groups. (Superseding the earlier design note here, which
+  asserted the break always arrives in an earlier batch than the fresh leg's frames and told
+  the implementer not to model same-pass interleaving; the shipped code models it per-frame.)
 
 - [x] **M4 — View rewrite: MAX-within-epoch then SUM-across-epochs.** New migration
   (a view cannot be `ALTER`ed; DROP + CREATE — numbered *after* M1's column migration)
