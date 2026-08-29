@@ -91,8 +91,15 @@ type ScheduleDTO struct {
 	MaxIssues *int `json:"max_issues"`
 	// Guidance is optional owner-authored steering (PRD #274 M3, issue/sweep targets only):
 	// injected into the run instruction as a delineated "how" section. nil means none (NULL
-	// or empty in the DB).
+	// or empty in the DB). For a default SWEEP row (issue #675) Guidance is the owner OVERLAY
+	// composed onto the baked catalog guidance at fire time (the baked value is in
+	// BakedGuidance), not the catalog value itself.
 	Guidance *string `json:"guidance"`
+	// BakedGuidance carries the RESOLVED catalog guidance for a default SWEEP row
+	// (issue #675), shown read-only in the modal. It is nil for prompt/self_improve/user
+	// rows (a prompt default's baked content is Prompt). Guidance is reserved for the
+	// owner overlay appended at fire time.
+	BakedGuidance *string `json:"baked_guidance"`
 	// Model is the per-schedule model override (PRD #300, all targets): nil means inherit
 	// the owner's per-user Worker model (NULL or empty in the DB), a value is the model a
 	// schedule fires its runs on. Validated via agenttmpl.ValidateModel; replace-semantics

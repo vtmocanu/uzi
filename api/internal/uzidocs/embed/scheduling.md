@@ -99,6 +99,9 @@ prompt text already is the instruction. The exception is a prompt-target
 **default**: its prompt is catalog-owned (and auto-tracks catalog updates), so
 owner guidance *is* offered and is overlaid onto the catalog prompt at fire
 time, the same "generic base + owner overlay" split the issue/sweep targets use.
+A **sweep default** likewise offers owner guidance as an **overlay**: its baked
+guidance stays catalog-owned (shown read-only and auto-tracking catalog updates)
+and your overlay is composed onto it at fire time, under a single guidance header.
 
 ## Managing schedules
 
@@ -234,9 +237,10 @@ worker rather than the catalog — its entry is cadence and model only (see
   already enabled the job, automatically, with nothing to re-enable. Cadence,
   model, and the run options (auto-approve, wait-on-limit, max issues) are
   yours to edit like any schedule — as is owner **guidance** on a prompt-target
-  default; a **Reset to default** action puts an edited default back to the
-  catalog's cadence/model/options in one step, and also clears any owner
-  guidance you added to a prompt default.
+  or sweep-target default (on a sweep default it is an overlay composed onto the
+  read-only baked catalog guidance); a **Reset to default** action puts an edited
+  default back to the catalog's cadence/model/options in one step, and also clears
+  any owner guidance you added to a prompt or sweep default.
 - **Enable on several repos at once.** Enabling a default (or creating a
   custom schedule) against multiple repos creates one independent schedule
   per repo — each with its own cadence, its own pause/resume, its own run
@@ -245,8 +249,10 @@ worker rather than the catalog — its entry is cadence and model only (see
   a fully editable copy. Cloning a default **unlocks the prompt**: the baked
   text is copied onto the new schedule as ordinary, editable content, and it
   stops tracking the catalog (a later catalog update no longer reaches it).
-  Cloning into a different repo than the source is how you replicate a
-  schedule across repos.
+  Cloning a **sweep** default instead copies the read-only baked catalog
+  guidance into the new row's editable guidance, without carrying over any
+  owner guidance overlay you had added. Cloning into a different repo than
+  the source is how you replicate a schedule across repos.
 - **Auto-approve, on by default.** Like any new schedule, a default is
   created with auto-approve and wait-on-limit both on — the point of a
   default is that it runs unattended off-hours. Every default job only opens

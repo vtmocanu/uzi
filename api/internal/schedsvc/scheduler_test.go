@@ -1942,9 +1942,10 @@ func TestFirePromptDefaultUnknownSlugParks(t *testing.T) {
 }
 
 // TestFireSweepDefaultResolvesFromCatalog is the sweep analogue of the discriminating
-// prompt test: a default-origin sweep row is POISONED with bogus labels and guidance
-// columns, and the fire MUST use the catalog labels (into the candidate query) and the
-// catalog guidance (into the composed run description), never the columns.
+// prompt test. Labels stay catalog-owned: a POISON label column MUST be ignored in favour
+// of the catalog labels driving the candidate query. Guidance is now the owner OVERLAY
+// (issue #675): the catalog guidance is the BAKED value and the guidance column is the
+// overlay, and BOTH are composed into the run description under a SINGLE guidance header.
 func TestFireSweepDefaultResolvesFromCatalog(t *testing.T) {
 	h := newHarness()
 	want, ok := schedtmpl.BySlug("bug-triage")
@@ -1954,6 +1955,7 @@ func TestFireSweepDefaultResolvesFromCatalog(t *testing.T) {
 	if want.Guidance == "" {
 		t.Fatal("bug-triage catalog entry has no guidance to discriminate on")
 	}
+	const overlay = "prefer table-driven tests"
 	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 7}}
 	sched := store.RunSchedule{
 		ID:          uuid.New(),
@@ -1963,7 +1965,7 @@ func TestFireSweepDefaultResolvesFromCatalog(t *testing.T) {
 		Origin:      "default",
 		CatalogSlug: pgtype.Text{String: "bug-triage", Valid: true},
 		Labels:      []byte(`["POISON-LABEL"]`),
-		Guidance:    pgtype.Text{String: "POISON-GUIDANCE-DO-NOT-USE", Valid: true},
+		Guidance:    pgtype.Text{String: overlay, Valid: true},
 		Timing:      "recurring",
 		CronExpr:    pgtype.Text{String: "0 * * * *", Valid: true},
 		Timezone:    "UTC",
@@ -1987,16 +1989,23 @@ func TestFireSweepDefaultResolvesFromCatalog(t *testing.T) {
 	if strings.Contains(string(h.st.sweepLabelParam), "POISON") {
 		t.Fatalf("labels were read from the row column, not the catalog: %s", h.st.sweepLabelParam)
 	}
-	// The per-issue description must carry the CATALOG guidance, not the poison column.
+	// The per-issue description must carry the BAKED catalog guidance AND the owner overlay,
+	// composed under exactly ONE guidance header (baked before overlay).
 	if len(h.runs.autopilot) != 1 {
 		t.Fatalf("autopilot calls = %d, want 1", len(h.runs.autopilot))
 	}
 	desc := h.runs.autopilot[0].description
 	if !strings.Contains(desc, want.Guidance) {
-		t.Fatalf("run description missing catalog guidance; got %q", desc)
+		t.Fatalf("run description missing BAKED catalog guidance; got %q", desc)
 	}
-	if strings.Contains(desc, "POISON") {
-		t.Fatalf("guidance was read from the row column, not the catalog: %q", desc)
+	if !strings.Contains(desc, overlay) {
+		t.Fatalf("run description missing the owner overlay; got %q", desc)
+	}
+	if n := strings.Count(desc, "The guidance below was provided by the schedule owner"); n != 1 {
+		t.Fatalf("guidance header count = %d, want exactly 1: %q", n, desc)
+	}
+	if strings.Index(desc, want.Guidance) > strings.Index(desc, overlay) {
+		t.Fatalf("baked guidance must precede the overlay; got %q", desc)
 	}
 }
 
@@ -2134,6 +2143,133 @@ func TestFirePromptUserRowNoGuidanceOverlay(t *testing.T) {
 	}
 	if got := h.runs.prompts[0].prompt; got != "the user's own prompt" {
 		t.Fatalf("user-row instruction = %q, want the column verbatim (no overlay)", got)
+	}
+}
+
+// ── issue #675: owner-guidance overlay for default sweep jobs ───────────────────
+
+// newSweepDefault builds a default-origin sweep row on the bug-triage catalog slug with the
+// given owner overlay in the guidance column (empty ⇒ NULL).
+func newSweepDefault(h *harness, overlay string) store.RunSchedule {
+	s := store.RunSchedule{
+		ID:          uuid.New(),
+		UserID:      h.owner,
+		RepoID:      h.repoID,
+		Target:      "sweep",
+		Origin:      "default",
+		CatalogSlug: pgtype.Text{String: "bug-triage", Valid: true},
+		Timing:      "recurring",
+		CronExpr:    pgtype.Text{String: "0 * * * *", Valid: true},
+		Timezone:    "UTC",
+		AutoApprove: true,
+		Status:      "active",
+		Enabled:     true,
+	}
+	if overlay != "" {
+		s.Guidance = pgtype.Text{String: overlay, Valid: true}
+	}
+	return s
+}
+
+// TestFireSweepDefaultComposesBakedAndOverlay proves a default sweep with a non-empty owner
+// overlay composes the BAKED catalog guidance and the overlay into the run description under
+// a single guidance header, baked first, with a non-vacuous guard that overlay != baked.
+func TestFireSweepDefaultComposesBakedAndOverlay(t *testing.T) {
+	h := newHarness()
+	want, ok := schedtmpl.BySlug("bug-triage")
+	if !ok {
+		t.Fatal("bug-triage catalog entry missing")
+	}
+	const overlay = "prefer table-driven tests"
+	if overlay == want.Guidance {
+		t.Fatal("test is vacuous: the overlay equals the baked catalog guidance")
+	}
+	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 7}}
+
+	if _, err := h.sched.fireSweep(context.Background(), newSweepDefault(h, overlay)); err != nil {
+		t.Fatalf("fireSweep: %v", err)
+	}
+	if len(h.runs.autopilot) != 1 {
+		t.Fatalf("autopilot calls = %d, want 1", len(h.runs.autopilot))
+	}
+	desc := h.runs.autopilot[0].description
+	if !strings.Contains(desc, want.Guidance) {
+		t.Fatalf("description missing baked guidance: %q", desc)
+	}
+	if !strings.Contains(desc, overlay) {
+		t.Fatalf("description missing overlay: %q", desc)
+	}
+	if n := strings.Count(desc, "The guidance below was provided by the schedule owner"); n != 1 {
+		t.Fatalf("guidance header count = %d, want exactly 1: %q", n, desc)
+	}
+	if strings.Index(desc, want.Guidance) > strings.Index(desc, overlay) {
+		t.Fatalf("baked guidance must precede the overlay: %q", desc)
+	}
+}
+
+// TestFireSweepDefaultEmptyOverlayEqualsBakedOnly proves an empty overlay yields a run
+// description byte-for-byte identical to composing the same issue body with the baked
+// catalog guidance alone — no second header, no extra bytes (effective == baked path).
+func TestFireSweepDefaultEmptyOverlayEqualsBakedOnly(t *testing.T) {
+	h := newHarness()
+	want, ok := schedtmpl.BySlug("bug-triage")
+	if !ok {
+		t.Fatal("bug-triage catalog entry missing")
+	}
+	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 7}}
+
+	if _, err := h.sched.fireSweep(context.Background(), newSweepDefault(h, "")); err != nil {
+		t.Fatalf("fireSweep: %v", err)
+	}
+	if len(h.runs.autopilot) != 1 {
+		t.Fatalf("autopilot calls = %d, want 1", len(h.runs.autopilot))
+	}
+	// The harness's fake issue body is "body"; the baked-only description is exactly what
+	// composeRunDescription produces from that body and the catalog guidance.
+	wantDesc := composeRunDescription("body", want.Guidance)
+	if got := h.runs.autopilot[0].description; got != wantDesc {
+		t.Fatalf("empty-overlay description = %q, want baked-only %q", got, wantDesc)
+	}
+}
+
+// TestFireSweepUserRowUsesColumnVerbatim proves a USER-origin sweep row is unchanged by the
+// overlay work: its guidance column is the whole instruction (composed once, no baked catalog
+// composition), mirroring TestFirePromptUserRowUnchanged.
+func TestFireSweepUserRowUsesColumnVerbatim(t *testing.T) {
+	h := newHarness()
+	const columnGuidance = "the user's own sweep guidance"
+	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 7}}
+	sched := store.RunSchedule{
+		ID:          uuid.New(),
+		UserID:      h.owner,
+		RepoID:      h.repoID,
+		Target:      "sweep",
+		Origin:      "user",
+		Labels:      []byte(`["bug"]`),
+		Guidance:    pgtype.Text{String: columnGuidance, Valid: true},
+		Timing:      "recurring",
+		CronExpr:    pgtype.Text{String: "0 * * * *", Valid: true},
+		Timezone:    "UTC",
+		AutoApprove: true,
+		Status:      "active",
+		Enabled:     true,
+	}
+
+	if _, err := h.sched.fireSweep(context.Background(), sched); err != nil {
+		t.Fatalf("fireSweep: %v", err)
+	}
+	if len(h.runs.autopilot) != 1 {
+		t.Fatalf("autopilot calls = %d, want 1", len(h.runs.autopilot))
+	}
+	desc := h.runs.autopilot[0].description
+	// The column is composed once as the sole guidance; no catalog composition engages for a
+	// user row, so the description equals the body composed with the column verbatim.
+	wantDesc := composeRunDescription("body", columnGuidance)
+	if desc != wantDesc {
+		t.Fatalf("user-row sweep description = %q, want the column composed verbatim %q", desc, wantDesc)
+	}
+	if n := strings.Count(desc, "The guidance below was provided by the schedule owner"); n != 1 {
+		t.Fatalf("guidance header count = %d, want exactly 1: %q", n, desc)
 	}
 }
 

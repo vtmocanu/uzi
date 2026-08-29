@@ -546,9 +546,13 @@ func TestPatchDefaultPromptGuidanceLiveDB(t *testing.T) {
 	}
 }
 
-// TestPatchDefaultSweepGuidanceRejectedLiveDB (issue #662): guidance stays catalog-owned for
-// a SWEEP default — a guidance PATCH is a 400.
-func TestPatchDefaultSweepGuidanceRejectedLiveDB(t *testing.T) {
+// TestPatchDefaultSweepGuidanceOverlayLiveDB (issue #675) is the sweep analogue of the prompt
+// overlay flagship: a SWEEP default surfaces the catalog guidance as read-only BakedGuidance
+// with a NULL overlay (Guidance nil, not customized); accepts an owner guidance OVERLAY PATCH
+// that persists (round-trips through the DTO's Guidance while BakedGuidance stays the catalog
+// value), sets customized; rejects an oversized overlay with a 422; and a Reset clears the
+// overlay back to NULL and un-customizes, leaving BakedGuidance intact.
+func TestPatchDefaultSweepGuidanceOverlayLiveDB(t *testing.T) {
 	ctx := context.Background()
 	f := newScheduleFixture(ctx, t)
 
@@ -556,8 +560,71 @@ func TestPatchDefaultSweepGuidanceRejectedLiveDB(t *testing.T) {
 	if code != http.StatusCreated {
 		t.Fatalf("enable status = %d, want 201", code)
 	}
-	if got := f.patchStatus(t, f.owner.ID, dto.ID, `{"guidance":"owner tweak"}`); got != http.StatusBadRequest {
-		t.Fatalf("sweep guidance patch status = %d, want 400", got)
+	job, _ := schedtmpl.BySlug("bug-triage")
+	if job.Guidance == "" {
+		t.Fatal("bug-triage catalog entry has no guidance to discriminate on")
+	}
+	// A freshly enabled sweep default: the catalog guidance is the read-only BAKED value; the
+	// owner overlay column is NULL (Guidance nil), and the row is not customized.
+	if dto.BakedGuidance == nil || *dto.BakedGuidance != job.Guidance {
+		t.Fatalf("fresh sweep default baked_guidance = %v, want the catalog guidance %q", dto.BakedGuidance, job.Guidance)
+	}
+	if dto.Guidance != nil {
+		t.Fatalf("fresh sweep default overlay guidance = %v, want nil (NULL overlay)", dto.Guidance)
+	}
+	if dto.Customized {
+		t.Fatal("fresh sweep default with a NULL overlay is customized, want false")
+	}
+
+	const overlay = "prefer table-driven tests"
+	patched := f.patchDefault(t, f.owner.ID, dto.ID, `{"guidance":`+jsonString(overlay)+`}`)
+	if patched.Guidance == nil || *patched.Guidance != overlay {
+		t.Fatalf("patched overlay = %v, want the owner overlay persisted", patched.Guidance)
+	}
+	if patched.BakedGuidance == nil || *patched.BakedGuidance != job.Guidance {
+		t.Fatalf("patched baked_guidance = %v, want the catalog guidance unchanged", patched.BakedGuidance)
+	}
+	if !patched.Customized {
+		t.Fatal("overlay divergence: customized = false, want true")
+	}
+
+	// It really persisted: re-read via GET surfaces the stored overlay and the baked value.
+	got, gcode := f.getSchedule(t, f.owner.ID, dto.ID)
+	if gcode != http.StatusOK {
+		t.Fatalf("re-read status = %d, want 200", gcode)
+	}
+	if got.Guidance == nil || *got.Guidance != overlay {
+		t.Fatalf("re-read overlay = %v, want the persisted owner overlay", got.Guidance)
+	}
+	if got.BakedGuidance == nil || *got.BakedGuidance != job.Guidance {
+		t.Fatalf("re-read baked_guidance = %v, want the catalog guidance", got.BakedGuidance)
+	}
+
+	// Oversized overlay → 422.
+	huge := strings.Repeat("x", MaxGuidanceBytes+1)
+	if code := f.patchStatus(t, f.owner.ID, dto.ID, `{"guidance":`+jsonString(huge)+`}`); code != http.StatusUnprocessableEntity {
+		t.Fatalf("oversized overlay patch status = %d, want 422", code)
+	}
+
+	// Reset clears the overlay back to NULL and un-customizes; the baked value survives.
+	resetReq := userReq(http.MethodPost, "/api/schedules/"+dto.ID+"/reset", "", f.owner.ID, map[string]string{"id": dto.ID})
+	resetRec := httptest.NewRecorder()
+	f.h.ResetSchedule(resetRec, resetReq)
+	if resetRec.Code != http.StatusOK {
+		t.Fatalf("reset status = %d, want 200 (body %s)", resetRec.Code, resetRec.Body.String())
+	}
+	var reset apitypes.ScheduleDTO
+	if err := json.Unmarshal(resetRec.Body.Bytes(), &reset); err != nil {
+		t.Fatalf("decode reset: %v", err)
+	}
+	if reset.Guidance != nil {
+		t.Fatalf("reset overlay = %v, want nil (cleared back to NULL)", reset.Guidance)
+	}
+	if reset.BakedGuidance == nil || *reset.BakedGuidance != job.Guidance {
+		t.Fatalf("reset baked_guidance = %v, want the catalog guidance intact", reset.BakedGuidance)
+	}
+	if reset.Customized {
+		t.Fatal("reset customized = true, want false")
 	}
 }
 

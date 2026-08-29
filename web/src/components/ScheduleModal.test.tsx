@@ -142,6 +142,7 @@ function schedFixture(over: Partial<Schedule> = {}): Schedule {
     wait_on_limit: true,
     max_issues: 10,
     guidance: null,
+    baked_guidance: null,
     model: "fable",
     override_subagent_model: false,
     enabled: true,
@@ -665,31 +666,106 @@ describe("owner guidance on a prompt default (issue #662)", () => {
     expect(input?.target).toBeUndefined();
   });
 
-  it("does NOT show an editable guidance field for an issue/sweep default", () => {
-    // A sweep default: its guidance is catalog-owned (baked, read-only), so the editable
-    // guidance textarea must not appear. The sweep default's baked guidance shows read-only.
+});
+
+// ── issue #675 M2: a sweep DEFAULT gets an editable owner-guidance OVERLAY, shown
+// ── alongside its read-only baked catalog guidance (the two are separate DTO fields) ──
+describe("owner guidance overlay on a sweep default (issue #675)", () => {
+  // The baked catalog guidance (read-only) and the owner overlay (editable) MUST be
+  // DIFFERENT values here: with the old single-field shape both the read-only panel and
+  // the editable textarea were fed the same `guidance`, so equal values would let this
+  // test pass vacuously and hide that exact collision. Keeping them distinct is essential.
+  const BAKED = "Triage the bug: reproduce, root-cause, and fix if small.";
+  const OVERLAY = "prefer a failing test first, then the smallest fix";
+
+  function sweepDefault(over: Partial<Schedule> = {}): Schedule {
+    return schedFixture({
+      id: "sch-def-sweep",
+      origin: "default",
+      catalog_slug: "bug-triage",
+      target: "sweep",
+      labels: ["bug"],
+      prompt: "",
+      baked_guidance: BAKED,
+      guidance: OVERLAY,
+      model: "",
+      customized: true,
+      ...over,
+    });
+  }
+
+  it("shows the baked catalog guidance read-only (never the overlay) in the Baked guidance panel", () => {
     render(
       <MemoryRouter>
-        <ScheduleModal
-          editing={schedFixture({
-            id: "sch-def-sweep",
-            origin: "default",
-            catalog_slug: "bug-triage",
-            target: "sweep",
-            labels: ["bug"],
-            prompt: "",
-            guidance: "keep the diff small",
-          })}
-          onClose={vi.fn()}
-          onSaved={vi.fn()}
-          onCloneToEdit={vi.fn()}
-        />
+        <ScheduleModal editing={sweepDefault()} onClose={vi.fn()} onSaved={vi.fn()} onCloneToEdit={vi.fn()} />
       </MemoryRouter>,
     );
-    // No editable guidance textarea (the placeholder is unique to the editable control).
-    expect(screen.queryByPlaceholderText("always add a failing test first")).toBeNull();
-    // The catalog-owned guidance is shown read-only instead.
     expect(screen.getByText(/Baked guidance/)).toBeTruthy();
+    // The read-only panel shows the BAKED text (as static text, not a textarea), never
+    // the owner overlay — the collision the old single-field shape would have produced.
+    const bakedEl = screen.getByText(BAKED);
+    expect(bakedEl.tagName).not.toBe("TEXTAREA");
+    // The overlay does appear on screen, but ONLY in the editable textarea (not the panel).
+    const overlayEl = screen.getByText(OVERLAY);
+    expect(overlayEl.tagName).toBe("TEXTAREA");
+    expect(overlayEl).not.toBe(bakedEl);
+  });
+
+  it("shows an EDITABLE guidance textarea seeded from the owner overlay (not the baked value)", () => {
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={sweepDefault()} onClose={vi.fn()} onSaved={vi.fn()} onCloneToEdit={vi.fn()} />
+      </MemoryRouter>,
+    );
+    const guidance = screen.getByPlaceholderText("always add a failing test first") as HTMLTextAreaElement;
+    expect(guidance.hasAttribute("readonly")).toBe(false);
+    expect(guidance.hasAttribute("disabled")).toBe(false);
+    // Seeded from the OVERLAY, never the baked catalog guidance.
+    expect(guidance.value).toBe(OVERLAY);
+    expect(guidance.value).not.toBe(BAKED);
+  });
+
+  it("submitting sends the edited overlay in the patch input, never the baked value", async () => {
+    mockApi.updateSchedule.mockResolvedValue(sweepDefault());
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={sweepDefault()} onClose={vi.fn()} onSaved={vi.fn()} onCloneToEdit={vi.fn()} />
+      </MemoryRouter>,
+    );
+    fireEvent.change(screen.getByPlaceholderText("always add a failing test first"), {
+      target: { value: "keep the change tiny and reversible" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    const input = mockApi.updateSchedule.mock.calls[0]?.[1];
+    expect(input?.guidance).toBe("keep the change tiny and reversible");
+    // The baked catalog guidance is never round-tripped through the overlay patch.
+    expect(input?.guidance).not.toBe(BAKED);
+    // Labels/target stay catalog-owned and are never sent.
+    expect(input?.labels).toBeUndefined();
+    expect(input?.target).toBeUndefined();
+  });
+
+  it("clearing the guidance textarea sends guidance:null (explicit clear), never baked_guidance", async () => {
+    mockApi.updateSchedule.mockResolvedValue(sweepDefault({ guidance: null, customized: false }));
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={sweepDefault()} onClose={vi.fn()} onSaved={vi.fn()} onCloneToEdit={vi.fn()} />
+      </MemoryRouter>,
+    );
+    fireEvent.change(screen.getByPlaceholderText("always add a failing test first"), {
+      target: { value: "" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    const input = mockApi.updateSchedule.mock.calls[0]?.[1];
+    // A cleared overlay is sent as an EXPLICIT null, not undefined, so the server drops it.
+    expect(input?.guidance).toBeNull();
+    // The read-only baked catalog guidance is never round-tripped through the overlay patch.
+    // (ScheduleInput has no baked_guidance field; assert the emitted patch carries no such key.)
+    expect(Object.keys(input ?? {})).not.toContain("baked_guidance");
   });
 });
 

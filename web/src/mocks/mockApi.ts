@@ -1089,7 +1089,10 @@ const daysFromNow = (d: number, h: number, m = 0): string => {
 // (origin='default') are appended below from the catalog fixture; keeping the two
 // lists separate lets the user rows stay free of the three origin fields, which the
 // map injects uniformly.
-const userSchedules: Omit<Schedule, "origin" | "catalog_slug" | "customized" | "sibling_group_id">[] = [
+const userSchedules: Omit<
+  Schedule,
+  "origin" | "catalog_slug" | "customized" | "sibling_group_id" | "baked_guidance"
+>[] = [
   {
     id: "sch-7kd2", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi",
     target: "sweep", issue_iid: null, labels: null, prompt: "",
@@ -1315,7 +1318,10 @@ function materializeDefault(
     auto_approve: entry.auto_approve,
     wait_on_limit: entry.wait_on_limit,
     max_issues: entry.target === "sweep" ? entry.max_issues : null,
-    guidance: entry.target === "sweep" ? entry.guidance || null : null,
+    // Owner OVERLAY (issue #675): null by default; a seed sets it via `...over`.
+    guidance: null,
+    // Resolved catalog guidance for a sweep default, shown read-only (issue #675).
+    baked_guidance: entry.target === "sweep" ? entry.guidance || null : null,
     model: entry.model || null,
     override_subagent_model: false,
     enabled: true,
@@ -1363,11 +1369,28 @@ const seededDefaults: Schedule[] = [
     cron_expr: "0 6 * * 1",
     customized: true,
   }),
+  // A sweep default carrying an owner GUIDANCE OVERLAY (issue #675): its baked_guidance
+  // is the catalog planned-sweep text while `guidance` is a distinct, owner-set overlay,
+  // so the modal must show the two independently. The two values MUST differ so a test
+  // cannot pass vacuously against the old single-field shape. planned-sweep on repo-ledger
+  // is used by no other seed/test, so this adds no enablement collision.
+  materializeDefault(catalogBySlug("planned-sweep")!, "repo-ledger", "sch-def-ps-overlay", {
+    guidance: "prefer a failing test first, then the smallest fix",
+    customized: true,
+  }),
 ];
 
 let schedules: Schedule[] = [
   ...userSchedules.map(
-    (s): Schedule => ({ ...s, origin: "user", catalog_slug: null, customized: false, sibling_group_id: null }),
+    (s): Schedule => ({
+      ...s,
+      origin: "user",
+      catalog_slug: null,
+      customized: false,
+      sibling_group_id: null,
+      // Baked catalog guidance is default-sweep-only (issue #675); a user row never has it.
+      baked_guidance: null,
+    }),
   ),
   ...seededDefaults,
 ];
@@ -4414,6 +4437,8 @@ export const mockApi = {
       max_issues: target === "sweep" ? (input.max_issues ?? 10) : null,
       // Guidance on issue/sweep only; null (none) for prompt (re-nulled per target).
       guidance: target === "issue" || target === "sweep" ? (input.guidance ?? null) : null,
+      // Baked catalog guidance is a default-sweep-only field (issue #675); null for a user row.
+      baked_guidance: null,
       // Model applies to ALL targets (unlike guidance); null = inherit.
       model: input.model ?? null,
       // PRD #305: omitted ≡ false (replace-semantics), default off.
@@ -4449,13 +4474,14 @@ export const mockApi = {
     // 400s ANY default patch whose body carries a catalog-owned field. Mirror that here so
     // the mock and the server agree — the drift that hid the buildDefaultInput `timing` bug.
     // The rejected set is target/prompt/labels/timing/repo_id/issue_iid (run_at too, but the
-    // modal never sends it on a default). Guidance is the ONE exception, and only for a PROMPT
-    // default (issue #662): it is owner-editable there (overlaid on the catalog prompt at fire
-    // time), so allow it for a prompt default and keep rejecting it for issue/sweep/
-    // self_improve defaults. The 400 message mirrors the server's per-target locked-set string.
-    // Only cron/tz/model/flags/max_issues (+prompt-default guidance) edit.
+    // modal never sends it on a default). Guidance is the exception for a PROMPT default
+    // (issue #662) and a SWEEP default (issue #675): it is owner-editable there (overlaid on
+    // the catalog prompt/guidance at fire time), so allow it for prompt+sweep defaults and
+    // keep rejecting it for issue/self_improve defaults. The 400 message mirrors the server's
+    // per-target locked-set string. Only cron/tz/model/flags/max_issues (+prompt/sweep-default
+    // guidance) edit.
     if (cur.origin === "default") {
-      const guidanceEditable = cur.target === "prompt";
+      const guidanceEditable = cur.target === "prompt" || cur.target === "sweep";
       if (
         input.target !== undefined ||
         input.prompt !== undefined ||
@@ -4534,9 +4560,11 @@ export const mockApi = {
           m.auto_approve !== entry.auto_approve ||
           m.wait_on_limit !== entry.wait_on_limit ||
           (m.target === "sweep" && (m.max_issues ?? 0) !== entry.max_issues) ||
-          // Owner guidance divergence for a prompt default (issue #662): a prompt catalog
-          // entry carries empty guidance, so any non-empty stored guidance is customized.
-          (m.target === "prompt" && (m.guidance ?? "") !== "");
+          // Owner guidance-overlay divergence for a prompt default (issue #662) or a sweep
+          // default (issue #675): the OVERLAY (m.guidance) is null until the owner sets one,
+          // so any non-empty overlay flips customized. The baked catalog guidance is NOT
+          // compared (only the overlay's presence matters), matching the server.
+          ((m.target === "prompt" || m.target === "sweep") && (m.guidance ?? "") !== "");
       }
     }
     m.updated_at = new Date().toISOString();
@@ -4659,6 +4687,12 @@ export const mockApi = {
       created_at: now,
       updated_at: now,
       next_fires: [],
+      // A clone is always a user row, which never carries the read-only baked catalog
+      // guidance (issue #675). For a SWEEP default, fold the baked catalog guidance into
+      // the editable guidance and discard the owner overlay, mirroring the server clone.
+      guidance:
+        src.origin === "default" && src.target === "sweep" ? src.baked_guidance : src.guidance,
+      baked_guidance: null,
     };
     schedules = [clone, ...schedules];
     return delay(scheduleDTO(clone), 200);
