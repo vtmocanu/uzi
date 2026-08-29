@@ -14,8 +14,10 @@ export const DEFAULT_TITLE = "Uzi — AI dark factory";
 // brandTabTitle picks the tab title from branding. It reuses brand_company (already
 // in the /api/branding response) as the title source per the issue's 2026-08-29
 // triage steer — no new setting. Only a FULL white-label overrides the default:
-// a byte-exact mirror of the appMarkShowName gate in AppShell.tsx, that is a
-// non-default logo mode (custom or preset) with keep-name OFF. A co-brand
+// the same gate as appMarkShowName in AppShell.tsx (this is its logical inverse —
+// appMarkShowName returns whether to KEEP the wordmark — selecting the identical
+// instance set; no shared helper binds the two, so keep them in step by hand), that
+// is a non-default logo mode (custom or preset) with keep-name OFF. A co-brand
 // (keep_name=true) keeps the uzi title; a white-label with an empty brand_company
 // falls back to DEFAULT_TITLE (no other text source exists); `null`/pending branding
 // is the default too.

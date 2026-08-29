@@ -23079,7 +23079,8 @@ need is already in the public `GET /api/branding` response (`app_logo_mode`, `ap
   preset, so it brands there. Fixing an admin's own dimensionless upload is out of scope.
 - **Tab `<title>` reuses `brand_company`, gated on the FULL white-label condition.**
   `web/src/lib/brandTitle.ts#brandTabTitle` returns `brand_company` only when the instance is fully
-  white-labeled — a byte-exact mirror of `appMarkShowName` (§ #685): `app_logo_mode` is `custom` or
+  white-labeled — the same white-label gate as `appMarkShowName` (§ #685), its logical inverse
+  selecting the identical instance set (no shared helper binds them): `app_logo_mode` is `custom` or
   `preset` **and** `app_logo_keep_name === false` — and `brand_company` is non-empty after trim; else
   the static default. Per the issue's 2026-08-29 triage steer this reuses the existing
   `brand_company` field rather than adding a dedicated `brand_title` setting. Consequences, accepted:
