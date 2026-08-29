@@ -96,3 +96,49 @@ func TestCreateAutoMRReworkRunRepoNotFound(t *testing.T) {
 		t.Fatalf("err = %v, want ErrRepoNotFound", err)
 	}
 }
+
+// TestMRReworkClaimBranchFromPipelineRef proves the real Claim path sources the
+// claim's Branch from pipeline_ref for an mr_rework run (PRD #700 / issue #778):
+// runs.branch is NULL for such a run and the MR branch lives in pipeline_ref, so
+// the worker gets the MR branch off the already-wired Branch field. Modeled on
+// ciFixClaimPayload / TestCIFixClaimWireContract in ci_fix_test.go.
+func TestMRReworkClaimBranchFromPipelineRef(t *testing.T) {
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("FORGE-PAT-PLACEHOLDER"))
+	sealedTok, _ := box.Seal([]byte("ANTHROPIC-OAUTH-PLACEHOLDER"))
+
+	fs := &fakeStore{
+		claimRun: store.Run{
+			ID:               uuid.MustParse("44444444-4444-4444-4444-444444444444"),
+			RepoID:           pgUUID(uuid.MustParse("22222222-2222-2222-2222-222222222222")),
+			Kind:             RunKindMRRework,
+			IssueTitle:       "Rework MR: address review comments",
+			IssueDescription: "Fold the MR review-comment fixes onto the existing branch.",
+			Status:           "claimed",
+			PlanSource:       planSourceAgent,
+			// mr_rework: no issue iid; the MR branch lives in pipeline_ref, not branch.
+			PipelineRef: pgText("agent/issue-42"),
+		},
+		claimCtx: store.GetRunClaimContextRow{
+			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
+			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
+		},
+		anthropic: sealedTok,
+	}
+	svc := New(fs, box, testParams())
+	payload, err := svc.Claim(context.Background(), worker())
+	if err != nil || payload == nil {
+		t.Fatalf("Claim: %v (payload=%v)", err, payload)
+	}
+
+	if payload.Kind != RunKindMRRework {
+		t.Fatalf("kind = %q, want mr_rework", payload.Kind)
+	}
+	if payload.IssueIID != nil {
+		t.Fatalf("an mr_rework claim must carry null issue_iid, got %v", *payload.IssueIID)
+	}
+	if payload.Branch == nil || *payload.Branch != "agent/issue-42" {
+		t.Fatalf("mr_rework claim must carry the MR branch from pipeline_ref, got %v", payload.Branch)
+	}
+}
