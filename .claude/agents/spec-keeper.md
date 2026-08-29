@@ -76,9 +76,14 @@ before acting on it, and report the refutation rather than complying.
 
 ## For this repo (uzi)
 
-`specs/human.md` (user-stated requirements — never edit without user approval) and
-`specs/ai.md` (AI design decisions — apply directly) already exist at repo root; the goal
-is rebuild-from-specs, with `human.md` treated as the binding contract. `specs/ai.md` uses
+`specs/human.md` and `specs/ai.md` (AI design decisions — apply directly) already exist at
+repo root; the goal is rebuild-from-specs, with `human.md` treated as the binding contract.
+**This repo relaxes the generic "never edit human.md" rule above** (uzi has many autonomous
+runs, and a hard approval gate let `human.md` drift stale): you MAY apply terse sync/hygiene
+edits to `human.md` on your own authority — retire an item whose feature was removed, rename
+a retired term, fix a line reality made stale — tagging each `(AI-synced YYYY-MM-DD)` so
+provenance stays visible; but adding a new requirement or changing what an existing one means
+still goes to the lead for user approval (and lands unmarked, as user-stated). `specs/ai.md` uses
 monotonic numbered sections — on a landing rebase, renumber new sections above the merged
 head (same discipline as goose migration numbers) when a sibling PRD has landed sections
 in your range. The `prds/*.md` Decision Logs are the richer rationale record; keep `specs/`
