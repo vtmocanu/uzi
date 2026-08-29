@@ -1472,7 +1472,7 @@ on.
   the tier is uninterpretable:** the **restricted** tier enforces the FQDN
   allowlist (`worker-fqdn-egress.yaml` over the `worker-networkpolicy.yaml`
   default-deny floor — only `cache.nixos.org`, the forge (as of
-  [PRD #808](prds/808-worker-egress-single-source.md), derived from
+  [PRD #808](prds/done/808-worker-egress-single-source.md), derived from
   `FORGE_ALLOWED_BASE_URLS` — one chart value, `forge.allowedBaseURLs`, feeds
   both the api's SSRF allowlist and the restricted-tier FQDN list, so the two
   can no longer drift apart), `*.anthropic.com`, `search.devbox.sh` (also

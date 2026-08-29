@@ -23239,9 +23239,10 @@ hanging on the kube-native tier rather than a build-time failure.
   docker-in-docker sidecar can `docker run --network=host` around any pod NetworkPolicy — so this
   PRD single-sources the *destination model* and guards its completeness, without unifying the two
   enforcement mechanisms.
-- Full rationale, verified facts, and Decision Log D1–D7: `prds/808-worker-egress-single-source.md`
-  (stays under `prds/` as `Status: merged, blocked-on-maintainer` until an operator reconciles the
-  private per-deployment values — not moved to `prds/done/` by this change).
+- Full rationale, verified facts, and Decision Log D1–D7: `prds/done/808-worker-egress-single-source.md`
+  (reconciled on meta-dev-02 and moved to `prds/done/` 2026-08-30; the interim `api.github.com`
+  allowance was KEPT, not removed — issue #818 proved it a required devbox/nixpkgs host, now also in
+  the chart default).
 
 ## 589. issue #818 — complete #808's kube-native worker egress: `api.github.com` is a required devbox/nixpkgs host, not a forge host
 

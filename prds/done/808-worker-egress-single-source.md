@@ -2,7 +2,7 @@
 
 **Issue**: #808
 **Priority**: Medium
-**Status**: merged, blocked-on-maintainer
+**Status**: COMPLETE (2026-08-30) — merged in v0.69.0; the operator per-deployment values were reconciled on meta-dev-02 and verified live (see the completion note under *Post-merge operator action*). Moved to `prds/done/`.
 
 ## Problem
 
@@ -171,6 +171,17 @@ attempt to finish or re-run it:
   added to the per-deployment egress list during the incident that motivated this PRD.
 - Confirm the completeness guard (M2) passes against the reconciled values and that a worker on the
   kube-native tier reaches the forge and the devbox resolver.
+
+**✅ DONE (2026-08-30).** Reconciled on meta-dev-02: `apps/uzi/values/meta-dev-02.yaml`
+(meta-manager-argo, commit `cb557b6`) now sets top-level `forge.allowedBaseURLs`
+[gitlab.metaminds.com, github.com], drops the `api.config.FORGE_ALLOWED_BASE_URLS` key, and
+drops the two hand-listed forge egress entries (now derived). ArgoCD synced the v0.69.0 chart
+plus these values; verified live — the api ConfigMap carries `FORGE_ALLOWED_BASE_URLS` and the
+`uzi-worker-egress` ANP lists all 8 canonical hosts, identical to before. **Correction to the
+plan above:** the interim `api.github.com` allowance was KEPT, not removed — issue #818 proved
+(live) it is a required devbox/nixpkgs host (`devbox install` resolves `nixpkgs-unstable`
+through it), not a forge host, so it is a permanent egress entry (now in the chart default too);
+only the forge-host stopgaps (`github.com`) and the freeform config key were retired.
 
 **When the code merges, set this PRD's `Status:` to `merged, blocked-on-maintainer`** so an automated
 run does not read it as unfinished work to pick up. Only after the reconciliation is confirmed does it
