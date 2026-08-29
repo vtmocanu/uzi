@@ -208,6 +208,13 @@ The remote `refs/uzi-checkpoints/agent/issue-N` ref is the other recovery source
 behind-on-workflows run leaves none (its checkpoint push hit the same rejection). The PVC
 tracking ref is the reliable source.
 
+The steps above are the **issue-run** shape; a **task run** (`uzi handoff`) uses
+`uzi/task/<RUN>` / `refs/uzi-runner/uzi/task/<RUN>` and often has its work entirely
+uncommitted. Once you have the bundle out (from here or from a snapshot below), **`resume-recipe.md`**
+in this skill dir is the consolidated, run-kind-agnostic recipe for landing it: fetch →
+isolated worktree → restore uncommitted → rebase → pre-flight (workflow/migration) → gate →
+PR → admin-merge → cleanup.
+
 ### Proactive backups (before anything goes wrong)
 
 The recovery above is reactive — after a push rejection or a lost run. When you are
@@ -238,7 +245,9 @@ To recover from a snapshot: `tar xzf <ts>/issue-N.tgz -C r/`, then
 tracking ref never held: `git apply r/issue-N.uncommitted.patch` if that file is present,
 **and `tar xzf r/issue-N.untracked.tar.gz -C DIR` if that one is** (it carries new,
 not-yet-added files, which the patch does not). Then `git rebase origin/main` and gate +
-PR + admin-merge as above.
+PR + admin-merge as above. **`resume-recipe.md`** in this skill dir is the full,
+run-kind-agnostic version of these last steps (issue AND task stems, integrity-verify the
+`.tgz` first, the workflow/migration pre-flight, through admin-merge + cleanup).
 
 ## Reviewing the diff
 
