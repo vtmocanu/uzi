@@ -29,7 +29,12 @@ import {
   Toggle,
 } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
-import { FactoryIcon } from "../components/icons";
+import { FactoryIcon, PlusIcon } from "../components/icons";
+import {
+  BRAND_PRESETS,
+  presetAssetForSlug,
+  presetForSlug,
+} from "../lib/brandPresets";
 
 // The server's raw-image cap (256 KiB); the upload handler rejects anything above
 // it. We block over-cap files here too so the admin gets an instant, clear message
@@ -45,6 +50,7 @@ export function AdminBranding() {
   // The last-saved snapshot, for dirty tracking and revert-on-load.
   const [saved, setSaved] = useState<AppSettings | null>(null);
   const [appLogoMode, setAppLogoMode] = useState("default");
+  const [appLogoPreset, setAppLogoPreset] = useState("");
   const [appLogoKeepName, setAppLogoKeepName] = useState(true);
   const [brandMode, setBrandMode] = useState("none");
   const [brandCompany, setBrandCompany] = useState("");
@@ -64,6 +70,7 @@ export function AdminBranding() {
   const applySettings = useCallback((settings: AppSettings) => {
     setSaved(settings);
     setAppLogoMode(settings.app_logo_mode);
+    setAppLogoPreset(settings.app_logo_preset);
     setAppLogoKeepName(settings.app_logo_keep_name === "true");
     setBrandMode(settings.brand_mode);
     setBrandCompany(settings.brand_company);
@@ -91,6 +98,7 @@ export function AdminBranding() {
   const dirty =
     saved !== null &&
     (appLogoMode !== saved.app_logo_mode ||
+      appLogoPreset !== saved.app_logo_preset ||
       (appLogoKeepName ? "true" : "false") !== saved.app_logo_keep_name ||
       brandMode !== saved.brand_mode ||
       brandCompany !== saved.brand_company ||
@@ -107,6 +115,7 @@ export function AdminBranding() {
       // by the Instance tab and untouched here.
       const payload: UpdateSettingsPayload = {
         app_logo_mode: appLogoMode,
+        app_logo_preset: appLogoPreset,
         app_logo_keep_name: appLogoKeepName ? "true" : "false",
         brand_mode: brandMode,
         brand_company: brandCompany,
@@ -168,15 +177,63 @@ export function AdminBranding() {
     }
   };
 
-  // Preview asset URLs. An uploaded asset loads from its slot route (cache-busted
-  // by logoRev); a custom app mark with no upload falls back to the shipped preset,
-  // matching the chrome's "enable-with-one-click" behavior.
-  const appLogoSrc = appPresent
-    ? `/api/branding/logo/app?v=${logoRev}`
-    : "/brand-default.svg";
+  // App-mark preview source, mirroring AppShell.appMarkImgSrc's three-mode logic so
+  // the preview never diverges from the chrome: `preset` resolves the slug through
+  // the shared brandPresets registry (unknown/empty → FactoryIcon); `custom` serves
+  // the uploaded asset (cache-busted by logoRev) or the FactoryIcon when none is
+  // uploaded — there is NO /brand-default.svg fallback for the app slot; `default`
+  // is the FactoryIcon. A null src means "render the FactoryIcon".
+  const appMarkSrc: string | null =
+    appLogoMode === "preset"
+      ? presetAssetForSlug(appLogoPreset)
+      : appLogoMode === "custom"
+        ? appPresent
+          ? `/api/branding/logo/app?v=${logoRev}`
+          : null
+        : null;
+  // The POWERED BY brand slot keeps its shipped-preset fallback (unchanged).
   const brandLogoSrc = brandPresent
     ? `/api/branding/logo/brand?v=${logoRev}`
     : "/brand-default.svg";
+
+  // App-logo tile picker (M3): a radiogroup of "uzi" (default), one tile per catalog
+  // preset, then "Custom". Selecting a tile sets mode + preset atomically. The
+  // selected key is derived from state so it stays in sync with load/revert and the
+  // preview; an unknown preset slug leaves nothing selected (degrades visually).
+  type AppLogoTile = {
+    key: string;
+    label: string;
+    mode: "default" | "preset" | "custom";
+    slug: string;
+  };
+  const appLogoTiles: AppLogoTile[] = [
+    { key: "default", label: "uzi", mode: "default", slug: "" },
+    ...BRAND_PRESETS.map((p) => ({
+      key: p.slug,
+      label: p.label,
+      mode: "preset" as const,
+      slug: p.slug,
+    })),
+    { key: "custom", label: "Custom", mode: "custom", slug: "" },
+  ];
+  const selectedTileKey =
+    appLogoMode === "custom"
+      ? "custom"
+      : appLogoMode === "preset"
+        ? (presetForSlug(appLogoPreset)?.slug ?? "")
+        : "default";
+  const selectAppLogoTile = (tile: AppLogoTile) => {
+    if (tile.mode === "preset") {
+      setAppLogoMode("preset");
+      setAppLogoPreset(tile.slug);
+    } else if (tile.mode === "custom") {
+      setAppLogoMode("custom");
+      setAppLogoPreset("");
+    } else {
+      setAppLogoMode("default");
+      setAppLogoPreset("");
+    }
+  };
 
   return (
     <AdminShell description="Replace the app mark and add a POWERED BY brand. Fresh installs are unbranded; the license/author credit in the chrome is fixed and cannot be removed here.">
@@ -195,20 +252,54 @@ export function AdminBranding() {
               <Card className="space-y-4">
                 <SectionTitle>App logo</SectionTitle>
                 <p className="text-sm text-muted">
-                  The mark in the top-left of the sidebar. Custom mode swaps the uzi
-                  factory icon for your own; keeping the name co-brands, dropping it
+                  The mark in the top-left of the sidebar. Pick a built-in mark, or
+                  Custom to upload your own; keeping the name co-brands, dropping it
                   is a full white-label.
                 </p>
-                <Field label="App logo mode" htmlFor="app-logo-mode">
-                  <Select
-                    id="app-logo-mode"
-                    value={appLogoMode}
-                    onChange={(e) => setAppLogoMode(e.target.value)}
-                  >
-                    <option value="default">Default (uzi factory icon)</option>
-                    <option value="custom">Custom logo</option>
-                  </Select>
-                </Field>
+                <div
+                  role="radiogroup"
+                  aria-label="App logo"
+                  className="flex flex-wrap gap-3"
+                >
+                  {appLogoTiles.map((tile) => {
+                    const selected = tile.key === selectedTileKey;
+                    const presetSrc =
+                      tile.mode === "preset" ? presetAssetForSlug(tile.slug) : null;
+                    return (
+                      <button
+                        key={tile.key}
+                        type="button"
+                        role="radio"
+                        aria-checked={selected}
+                        aria-label={tile.label}
+                        onClick={() => selectAppLogoTile(tile)}
+                        className={
+                          "flex w-24 flex-col items-center gap-2 rounded-lg border p-3 text-center transition " +
+                          (selected
+                            ? "border-brand ring-2 ring-brand"
+                            : "border-edge hover:border-brand/50")
+                        }
+                      >
+                        <span className="flex h-[38px] w-[38px] items-center justify-center rounded-lg bg-raised">
+                          {tile.mode === "default" ? (
+                            <FactoryIcon className="h-[22px] w-[22px] text-brand" />
+                          ) : tile.mode === "preset" && presetSrc ? (
+                            <img
+                              src={presetSrc}
+                              alt=""
+                              className="h-[26px] w-[26px] object-contain"
+                            />
+                          ) : (
+                            <PlusIcon className="h-[20px] w-[20px] text-muted" />
+                          )}
+                        </span>
+                        <span className="text-xs font-medium text-fg">
+                          {tile.label}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
                 {appLogoMode === "custom" && (
                   <>
                     <Field label="Logo image (PNG, WebP or SVG, max 256 KiB)" htmlFor="app-logo-file">
@@ -224,11 +315,11 @@ export function AdminBranding() {
                         }}
                       />
                     </Field>
-                    <div className="flex items-center gap-3">
-                      <span className="text-sm text-muted">
-                        {appPresent ? "Custom logo uploaded." : "No logo uploaded — the preset is shown."}
-                      </span>
-                      {appPresent && (
+                    {appPresent && (
+                      <div className="flex items-center gap-3">
+                        <span className="text-sm text-muted">
+                          Custom logo uploaded.
+                        </span>
                         <Button
                           type="button"
                           variant="danger"
@@ -238,19 +329,21 @@ export function AdminBranding() {
                         >
                           Remove logo
                         </Button>
-                      )}
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <Toggle
-                        checked={appLogoKeepName}
-                        onChange={setAppLogoKeepName}
-                        label="Keep the app name next to the logo"
-                      />
-                      <span aria-hidden="true" className="text-sm text-fg">
-                        Keep the app name next to the logo
-                      </span>
-                    </div>
+                      </div>
+                    )}
                   </>
+                )}
+                {(appLogoMode === "custom" || appLogoMode === "preset") && (
+                  <div className="flex items-center gap-3">
+                    <Toggle
+                      checked={appLogoKeepName}
+                      onChange={setAppLogoKeepName}
+                      label="Keep the app name next to the logo"
+                    />
+                    <span aria-hidden="true" className="text-sm text-fg">
+                      Keep the app name next to the logo
+                    </span>
+                  </div>
                 )}
               </Card>
 
@@ -345,7 +438,7 @@ export function AdminBranding() {
               <BrandingPreview
                 appLogoMode={appLogoMode}
                 appLogoKeepName={appLogoKeepName}
-                appLogoSrc={appLogoSrc}
+                appMarkSrc={appMarkSrc}
                 brandMode={brandMode}
                 brandCompany={brandCompany}
                 brandPlacement={brandPlacement}
@@ -372,11 +465,14 @@ export function AdminBranding() {
 // needs to show the mark, the name, and the POWERED BY block the way the mock spells
 // them out (logo via <img>, 0.8 dim on the POWERED BY logo, ~24/26px heights, an
 // optional light plaque). The chrome itself (M3a/M3b) is the source of truth for the
-// real rendering; this is the operator's in-app equivalent of the design mock.
+// real rendering; this is the operator's in-app equivalent of the design mock. The
+// app mark is resolved upstream (appMarkSrc) exactly as AppShell.appMarkImgSrc does,
+// so the preview cannot diverge from the chrome: a non-null src renders an <img>,
+// null renders the FactoryIcon.
 function BrandingPreview({
   appLogoMode,
   appLogoKeepName,
-  appLogoSrc,
+  appMarkSrc,
   brandMode,
   brandCompany,
   brandPlacement,
@@ -385,15 +481,17 @@ function BrandingPreview({
 }: {
   appLogoMode: string;
   appLogoKeepName: boolean;
-  appLogoSrc: string;
+  appMarkSrc: string | null;
   brandMode: string;
   brandCompany: string;
   brandPlacement: string;
   brandPlaque: boolean;
   brandLogoSrc: string;
 }) {
-  const custom = appLogoMode === "custom";
-  const showName = !custom || appLogoKeepName;
+  // Mirror appMarkShowName: the name is hidden only in a full white-label — a
+  // custom or preset mark with keep-name off.
+  const whiteLabelable = appLogoMode === "custom" || appLogoMode === "preset";
+  const showName = !whiteLabelable || appLogoKeepName;
   const brandLogo = brandMode === "logo";
   const topRight = brandLogo && brandPlacement === "topright";
 
@@ -402,9 +500,9 @@ function BrandingPreview({
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <span className="flex h-[38px] w-[38px] items-center justify-center rounded-lg bg-raised">
-            {custom ? (
+            {appMarkSrc ? (
               <img
-                src={appLogoSrc}
+                src={appMarkSrc}
                 alt="app logo"
                 className="h-[26px] w-[26px] object-contain"
               />

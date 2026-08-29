@@ -19,11 +19,9 @@ export interface BrandPreset {
 
 // Ordered catalog. The picker renders these tiles in order (M3). Currently one
 // entry; future presets are appended here with their shipped asset. The catalog is
-// D1's public surface for the admin picker (M3); the M2 chrome consumes it only
-// through `presetAssetForSlug`, so knip's error-tier unused-exports gate would flag
-// it until M3 imports it. The @public tag suppresses that, not a de-export: the
-// array IS the single source of truth this module exists to expose.
-/** @public */
+// D1's public surface for the admin picker (M3), which imports it to build the tile
+// row; the M2 chrome consumes it only through `presetAssetForSlug`. The array IS the
+// single source of truth this module exists to expose.
 export const BRAND_PRESETS: readonly BrandPreset[] = [
   { slug: "metaminds", label: "Metaminds", asset: "/brand-presets/metaminds.svg" },
 ];
@@ -36,9 +34,7 @@ const PRESET_BY_SLUG: Map<string, BrandPreset> = new Map(
 
 // The preset for a slug, or null when the slug is empty/unknown. Exposed for the
 // admin picker (M3), which resolves the selected tile through this; M2 reaches it
-// only via `presetAssetForSlug`, so the @public tag keeps knip's unused-exports
-// gate off it before M3 lands.
-/** @public */
+// only via `presetAssetForSlug`.
 export function presetForSlug(slug: string | null | undefined): BrandPreset | null {
   if (!slug) return null;
   return PRESET_BY_SLUG.get(slug) ?? null;

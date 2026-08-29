@@ -106,11 +106,12 @@ afterEach(() => {
 });
 
 describe("AdminBranding", () => {
-  it("renders the default (unbranded) state with no upload controls", async () => {
+  it("renders the default (unbranded) state with the uzi tile selected and no upload controls", async () => {
     renderPage();
-    // Mode selects default to their saved values.
-    const appMode = await screen.findByLabelText("App logo mode", { selector: "#app-logo-mode" });
-    expect((appMode as HTMLSelectElement).value).toBe("default");
+    // The App-logo tile picker defaults to the "uzi" tile (mode=default).
+    const uziTile = await screen.findByRole("radio", { name: "uzi" });
+    expect(uziTile.getAttribute("aria-checked")).toBe("true");
+    expect(screen.getByRole("radio", { name: "Custom" }).getAttribute("aria-checked")).toBe("false");
     const brandMode = screen.getByLabelText("POWERED BY mode", { selector: "#brand-mode" });
     expect((brandMode as HTMLSelectElement).value).toBe("none");
     // Default app mode hides the upload input; none brand mode hides its controls.
@@ -118,14 +119,42 @@ describe("AdminBranding", () => {
     expect(screen.queryByLabelText("Upload brand logo")).toBeNull();
   });
 
-  it("reveals the custom app-logo controls when custom mode is selected", async () => {
+  it("reveals the custom app-logo controls when the Custom tile is picked", async () => {
     renderPage();
-    const appMode = await screen.findByLabelText("App logo mode", { selector: "#app-logo-mode" });
-    fireEvent.change(appMode, { target: { value: "custom" } });
+    const customTile = await screen.findByRole("radio", { name: "Custom" });
+    fireEvent.click(customTile);
+    expect(customTile.getAttribute("aria-checked")).toBe("true");
     expect(screen.getByLabelText("Upload app logo")).toBeTruthy();
     expect(
       screen.getByLabelText("Keep the app name next to the logo", { selector: "[role=switch]" }),
     ).toBeTruthy();
+  });
+
+  it("selecting the Metaminds preset tile shows the keep-name toggle and no upload", async () => {
+    renderPage();
+    const presetTile = await screen.findByRole("radio", { name: "Metaminds" });
+    fireEvent.click(presetTile);
+    expect(presetTile.getAttribute("aria-checked")).toBe("true");
+    // Preset mode reveals the keep-name toggle (D4) but not the upload field.
+    expect(
+      screen.getByLabelText("Keep the app name next to the logo", { selector: "[role=switch]" }),
+    ).toBeTruthy();
+    expect(screen.queryByLabelText("Upload app logo")).toBeNull();
+    // The preview resolves the preset asset through the shared registry.
+    const img = screen.getByAltText("app logo") as HTMLImageElement;
+    expect(img.getAttribute("src")).toContain("metaminds");
+  });
+
+  it("custom mode with no upload previews the FactoryIcon, not brand-default.svg", async () => {
+    renderPage();
+    fireEvent.click(await screen.findByRole("radio", { name: "Custom" }));
+    // No uploaded asset → the app mark falls through to the FactoryIcon (no <img>),
+    // never the /brand-default.svg app-slot fallback M2 wrongly used.
+    expect(screen.queryByAltText("app logo")).toBeNull();
+    const brandDefault = screen
+      .queryAllByRole("img")
+      .some((el) => (el.getAttribute("src") ?? "").includes("brand-default"));
+    expect(brandDefault).toBe(false);
   });
 
   it("reveals the company input in text brand mode and the logo controls in logo mode", async () => {
@@ -140,10 +169,9 @@ describe("AdminBranding", () => {
     expect(screen.getByLabelText("Placement")).toBeTruthy();
   });
 
-  it("saves only the six branding keys with the edited values", async () => {
+  it("saves only the seven branding keys with the edited values", async () => {
     renderPage();
-    const appMode = await screen.findByLabelText("App logo mode", { selector: "#app-logo-mode" });
-    fireEvent.change(appMode, { target: { value: "custom" } });
+    fireEvent.click(await screen.findByRole("radio", { name: "Custom" }));
 
     const brandMode = screen.getByLabelText("POWERED BY mode", { selector: "#brand-mode" });
     fireEvent.change(brandMode, { target: { value: "text" } });
@@ -157,6 +185,7 @@ describe("AdminBranding", () => {
     const payload = mockApi.updateSettings.mock.calls[0][0];
     expect(payload).toEqual({
       app_logo_mode: "custom",
+      app_logo_preset: "",
       app_logo_keep_name: "true",
       brand_mode: "text",
       brand_company: "Acme, Inc.",
@@ -164,13 +193,24 @@ describe("AdminBranding", () => {
       brand_plaque: "false",
     });
     // No non-branding setting key leaks into the payload.
-    expect(Object.keys(payload as object)).toHaveLength(6);
+    expect(Object.keys(payload as object)).toHaveLength(7);
+  });
+
+  it("picking the Metaminds tile saves mode=preset and app_logo_preset=metaminds", async () => {
+    renderPage();
+    fireEvent.click(await screen.findByRole("radio", { name: "Metaminds" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Save branding" }));
+
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledTimes(1));
+    const payload = mockApi.updateSettings.mock.calls[0][0] as Partial<AppSettings>;
+    expect(payload.app_logo_mode).toBe("preset");
+    expect(payload.app_logo_preset).toBe("metaminds");
   });
 
   it("uploads a valid file to the app slot", async () => {
     renderPage();
-    const appMode = await screen.findByLabelText("App logo mode", { selector: "#app-logo-mode" });
-    fireEvent.change(appMode, { target: { value: "custom" } });
+    fireEvent.click(await screen.findByRole("radio", { name: "Custom" }));
 
     const file = new File([new Uint8Array(1024)], "logo.png", { type: "image/png" });
     fireEvent.change(screen.getByLabelText("Upload app logo"), {
@@ -188,8 +228,7 @@ describe("AdminBranding", () => {
 
   it("blocks an over-cap file client-side and never calls upload", async () => {
     renderPage();
-    const appMode = await screen.findByLabelText("App logo mode", { selector: "#app-logo-mode" });
-    fireEvent.change(appMode, { target: { value: "custom" } });
+    fireEvent.click(await screen.findByRole("radio", { name: "Custom" }));
 
     // 262145 bytes = cap + 1.
     const big = new File([new Uint8Array(262145)], "big.png", { type: "image/png" });
@@ -218,21 +257,19 @@ describe("AdminBranding", () => {
   });
 
   it("removes an uploaded logo via the delete endpoint", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ app_logo_mode: "custom" }));
     mockApi.branding.mockResolvedValue(branding({ app_logo_present: true, app_logo_mode: "custom" }));
     renderPage();
-    // Custom mode is loaded from saved settings; make it custom to show the remove button.
-    const appMode = await screen.findByLabelText("App logo mode", { selector: "#app-logo-mode" });
-    fireEvent.change(appMode, { target: { value: "custom" } });
-
-    fireEvent.click(screen.getByRole("button", { name: "Remove logo" }));
+    // Custom mode + an uploaded asset are loaded from saved settings, so the remove
+    // button is present without re-picking the tile.
+    fireEvent.click(await screen.findByRole("button", { name: "Remove logo" }));
     await waitFor(() => expect(mockApi.deleteBrandingLogo).toHaveBeenCalledWith("app"));
   });
 
   it("surfaces a server upload error", async () => {
     mockApi.uploadBrandingLogo.mockRejectedValue(new ApiError(400, "logo must be at most 262144 bytes"));
     renderPage();
-    const appMode = await screen.findByLabelText("App logo mode", { selector: "#app-logo-mode" });
-    fireEvent.change(appMode, { target: { value: "custom" } });
+    fireEvent.click(await screen.findByRole("radio", { name: "Custom" }));
 
     const file = new File([new Uint8Array(1024)], "logo.png", { type: "image/png" });
     fireEvent.change(screen.getByLabelText("Upload app logo"), {
