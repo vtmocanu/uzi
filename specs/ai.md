@@ -23055,8 +23055,9 @@ hanging on the kube-native tier rather than a build-time failure.
 - **Forge egress derives from `FORGE_ALLOWED_BASE_URLS`, not a second hand-kept list.** A new
   first-class chart value, `forge.allowedBaseURLs` (a list of https base URLs), renders explicitly
   into both the api's `FORGE_ALLOWED_BASE_URLS` env (comma-joined) and the kube-native FQDN
-  allow-list (one `Allow` entry per host, via Sprig's `urlParse … .hostname` to strip the port —
-  `.host` includes it). A forge is now declared once; the SSRF allowlist and the worker egress can
+  allow-list (one `Allow` entry per host: the FQDN comes from Sprig's `urlParse … .hostname`
+  (`.host` includes any `:port`), while the forge's port is derived separately and preserved in the
+  rule's `ports` — default 443, so a non-default forge port is honored, not discarded). A forge is now declared once; the SSRF allowlist and the worker egress can
   no longer disagree. The render fails on a non-https or hostless entry, and fails if a legacy
   freeform `api.config.FORGE_ALLOWED_BASE_URLS` key is still set alongside the new value, so the
   rendered ConfigMap can never carry a duplicate key.
@@ -23077,7 +23078,9 @@ hanging on the kube-native tier rather than a build-time failure.
   naming the missing host, if the rendered allow-list omits any canonical worker destination: each
   forge host, `*.anthropic.com`, `cache.nixos.org`, `search.devbox.sh`, `ghcr.io`,
   `pkg-containers.githubusercontent.com`. A committed canary proves the detector fires on a
-  render missing one host; a malformed/empty render exits 2 (broken instrument), not 0.
+  render intentionally missing two hosts — `cache.nixos.org` (the static half) and the forge host
+  `gitlab.example.com` (the derivation half), exercising both detector paths; a malformed/empty
+  render exits 2 (broken instrument), not 0.
 - **The docker tier stays broad by design.** It cannot be FQDN-filtered — a privileged
   docker-in-docker sidecar can `docker run --network=host` around any pod NetworkPolicy — so this
   PRD single-sources the *destination model* and guards its completeness, without unifying the two

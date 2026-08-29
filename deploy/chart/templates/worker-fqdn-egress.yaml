@@ -22,6 +22,9 @@
   everything except DNS and the api — so a worker on a cluster without Antrea fails
   CLOSED (it cannot reach its forge) rather than open.
 */ -}}
+{{- if not .Values.forge.allowedBaseURLs }}
+{{- fail "workers.fqdnEgress.enabled is true but forge.allowedBaseURLs is empty. The api falls back to its built-in default forge (https://github.com), which this egress policy would NOT allow, silently blocking git clone/fetch on the kube-native worker tier. Set forge.allowedBaseURLs to your forge base URL(s) — it single-sources both FORGE_ALLOWED_BASE_URLS and this egress list." }}
+{{- end }}
 apiVersion: crd.antrea.io/v1beta1
 kind: NetworkPolicy
 metadata:
@@ -92,6 +95,9 @@ spec:
     {{- $host := $u.hostname }}
     {{- if or (not $host) (ne $u.scheme "https") }}
     {{- fail (printf "forge.allowedBaseURLs entry %q must be an absolute https URL with a host, e.g. https://github.com (it feeds both FORGE_ALLOWED_BASE_URLS and the worker egress FQDN list; the api's NormalizeForgeBaseURL rejects the same input at boot)." .) }}
+    {{- end }}
+    {{- if or (contains ":" $host) (regexMatch "^[0-9]+(\\.[0-9]+)+$" $host) }}
+    {{- fail (printf "forge.allowedBaseURLs entry %q resolves to an IP-literal host (%s). Antrea FQDN egress rules cannot express an IP address, and the derived port parsing breaks on a bracketed IPv6 literal (splitting the host on ':' yields an invalid port). Configure a DNS hostname, or express an IP-literal forge with an ipBlock-based egress policy instead." . $host) }}
     {{- end }}
     {{- /* urlParse has no .port field; .host carries host[:port], so split it out (default 443). */}}
     {{- $port := "443" }}

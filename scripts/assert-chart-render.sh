@@ -156,6 +156,7 @@ expected_forge_hosts() {
         gsub(/[[:space:]]/, "", h)
         sub(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "", h)  # strip scheme://
         sub(/\/.*$/, "", h)                          # strip /path
+        sub(/[?#].*$/, "", h)                        # strip query/fragment
         sub(/:[0-9]+$/, "", h)                       # strip :port
         if (h != "") print h
       }
