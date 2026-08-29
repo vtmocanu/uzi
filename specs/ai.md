@@ -22017,7 +22017,7 @@ rationale in the Decision Log of `prds/done/517-interactive-task-runs.md`. <!-- 
   admitted only when a CONSUMED `follow_up` input exists, as a third independent clause beside
   the `answer` gate — so a stale/duplicate pre-park `running` report cannot un-park an idle task
   and re-arm the wall clock. It is now keyed on a per-park identity (issue #552): `runs.open_followup_id`,
-  a watermark of the highest already-CONSUMED `follow_up` id, stamped at each park by
+  a watermark of the highest already-DELIVERED `follow_up` id (worker-provided, then server-clamped to max-consumed), stamped at each park by
   `SetRunAwaitingFollowup` (originally recomputed purely server-side; **as of issue #559 the value is
   worker-provided then server-clamped/floored — see §585**), so the wake requires a consumed
   `follow_up` NEWER than the watermark —
@@ -23072,8 +23072,10 @@ wake-guard watermark (issue #552 M1 / PRD #517). The watermark is `runs.open_fol
   (a huge value would strand forever; a negative value would fail-open `id > -1` and reopen #558)
   to the range a correct worker could send — self-harm only, no cross-run reach. Absent field (old
   worker / first park before anything delivered) → `int8Param(nil)` → NULL → COALESCE falls back to
-  the pre-#559 server-derived value, byte-identical and backward compatible (additive-optional, but
-  the JSON field MUST exist because `httpx.DecodeJSON` sets `DisallowUnknownFields`). This
+  the pre-#559 server-derived value, byte-identical and backward compatible. The value is
+  additive-optional: the request SCHEMA must DECLARE `open_followup_id` so `httpx.DecodeJSON`
+  (which sets `DisallowUnknownFields`) accepts it when a new worker sends it, but an old worker may
+  OMIT the wire field — an absent field decodes to NULL and preserves the server-derived fallback. This
   **reverses** the SOURCE half of §566's #552 M1 decision (the `awaiting_followup`/wake-guard design
   under PRD #517): its server-derived, no-worker-echo watermark is retired for the
   worker-provided-then-clamped value. Only the source changes — the watermark is still stamped at
