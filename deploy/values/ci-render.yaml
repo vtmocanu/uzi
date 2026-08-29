@@ -87,6 +87,9 @@ workers:
       - name: allow-devbox-resolver
         fqdn: "search.devbox.sh"
         ports: [443]
+      - name: allow-devbox-nixpkgs-api
+        fqdn: "api.github.com"
+        ports: [443]
       - name: allow-cnpg-oci-registry
         fqdn: "ghcr.io"
         ports: [443]

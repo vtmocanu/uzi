@@ -869,6 +869,20 @@ workers:
       - name: allow-devbox-resolver
         fqdn: "search.devbox.sh"
         ports: [443]
+      # The GitHub API host, needed by `devbox install` to resolve the floating
+      # `nixpkgs-unstable` ref for the generated dev-env flake — `print-dev-env` hits
+      # api.github.com/repos/NixOS/nixpkgs/commits/nixpkgs-unstable. Without it, `devbox
+      # install` fails AFTER fetching the packages, so tool provisioning breaks on the
+      # kube-native tier (verified live 2026-08-29; PRD #808's canonical set omitted it —
+      # issue #818). Forge-INDEPENDENT: nixpkgs lives on GitHub regardless of this
+      # deployment's own forge, so this is a devbox/nixpkgs host, not a forge host. A
+      # deliberate widening backstopped by the server-side tier-1 admin allowlist; removing
+      # it (and search.devbox.sh) needs server-side store-path resolution — deferred, and
+      # pinning the nixpkgs rev on the worker does NOT achieve it (it trades this host for
+      # the codeload.github.com source tarball, also blocked; measured, see #123 D2).
+      - name: allow-devbox-nixpkgs-api
+        fqdn: "api.github.com"
+        ports: [443]
       # `helm dependency build` for THIS chart's CNPG `cluster` subchart, so an agent
       # editing deploy/chart/ can render it in-worker instead of committing blind and
       # learning from CI's helm_chart job minutes later. This IS the "expand from a REAL

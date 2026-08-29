@@ -100,7 +100,7 @@ set -f
 
 # The canonical infra hosts every worker egress render must Allow, independent of
 # the forge configuration. Kept here as the single source of the STATIC expectation.
-STATIC_HOSTS="*.anthropic.com cache.nixos.org search.devbox.sh ghcr.io pkg-containers.githubusercontent.com"
+STATIC_HOSTS="*.anthropic.com cache.nixos.org search.devbox.sh api.github.com ghcr.io pkg-containers.githubusercontent.com"
 
 # has_worker_egress_policy <file> -- succeed iff the render contains the crd.antrea.io
 # `-worker-egress` NetworkPolicy specifically. Keyed on that document's metadata name
