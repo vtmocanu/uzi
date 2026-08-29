@@ -322,7 +322,7 @@ deliberate / mock-only** label, and a one-line recommendation. For each, the use
   mode and the fix are the `issue-triage` skill's whole subject). Three requirements:
   1. **A sweep selector label** — `Planned` for feature/change work, `bug` for a defect.
   2. **Eligibility** — the `uzi` label, or the issue **assigned to the uzi-bot account**
-     (a third, label-less way to be eligible, PRD #767); no PRD link, no PRD file, no
+     (a second, label-less way to be eligible, PRD #767); no PRD link, no PRD file, no
      waiver needed. A selector label alone does **not** fire an issue that is neither
      `uzi`-labelled nor bot-assigned. For an issue you're filing fresh here, the `uzi`
      label is simpler than assigning the bot account — assignment matters mainly for an
