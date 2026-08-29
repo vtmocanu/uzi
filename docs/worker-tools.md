@@ -70,9 +70,13 @@ bound it.
 **An admin can only allowlist a package the worker image actually bakes.**
 The allowlist governs *permission*; the baked toolchain (the shared devbox
 manifest at `agent/devbox-global/devbox.json`) governs *availability* — and
-a permitted-but-unbaked package can't be fetched behind the worker's
-locked-down egress, so it would otherwise hang and fail at run time.
-Adding an unbaked package is rejected with a 400 naming it and stating it
+the two are tied together by a **server-side gate**, not by egress: saving a
+tool profile or claiming a run rejects a permitted-but-unbaked package
+outright (with two documented exceptions, `kubectl` and `nodejs`, below) —
+which would otherwise hang and fail at run time. (On a hosted
+kube-native worker the devbox resolver is reachable — see below — so egress
+no longer blocks resolving an unbaked package; the server-side gate is what
+still enforces baked-only.) Adding an unbaked package is rejected with a 400 naming it and stating it
 must be added to the image and the image rolled before it can be
 allowlisted; the same gate applies when saving a tool profile and at claim
 time, so a grandfathered allowlist row that isn't baked fails the run's
@@ -86,11 +90,14 @@ the admin's own responsibility to match what the image actually bakes.
 
 ## Storage and egress
 
-- **New outbound egress.** Installing tools fetches them from **nix
-  substituters** (`https://cache.nixos.org` plus any you add). This is the
-  one *new* egress this feature adds; a worker's full outbound set is `api`,
-  the forge (for git clone/fetch/push), and now the substituters. Allow the
-  substituters through an egress firewall if you run one.
+- **New outbound egress.** Installing tools first resolves the package
+  through the **devbox resolver** (`search.devbox.sh`), then fetches it from
+  **nix substituters** (`https://cache.nixos.org` plus any you add). This is
+  the *new* egress this feature adds; a worker's full outbound set is `api`,
+  the forge (for git clone/fetch/push), `*.anthropic.com` (the Claude API),
+  the container-registry pair `ghcr.io` + `pkg-containers.githubusercontent.com`,
+  and now the resolver and the substituters. Allow both through an egress firewall if you run one; a
+  hosted kube-native worker already has both on its shipped FQDN allow-list.
 - **First-run-only.** The nix store lives on its own named volume
   (`agentnix` at `/nix`); the first run downloads, later runs on the same
   worker warm-start from it. It survives `docker compose down`/`up`.

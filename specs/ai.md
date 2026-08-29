@@ -23198,3 +23198,47 @@ teammate who says "this is yours" by assigning gets the same result as labelling
   implication.
 - Full rationale, milestone map (M1 sync → M2 gate → M3 poller → M4 sweeps → M5 web), and Decision
   Log: `prds/767-*.md`. This section extends §584; it does not supersede it.
+
+## 588. PRD #808 — single-source the kube-native worker egress FQDN list from `FORGE_ALLOWED_BASE_URLS`; widen the tier to the devbox resolver; a build-time completeness guard
+
+Serves human: the hosted-worker egress tiers (docker: broad; kube-native: default-deny + an Antrea
+FQDN allow-list) had a hand-kept forge entry that could silently drift from the api's SSRF
+allowlist, and the allow-list itself was missing the devbox resolver host — both surfaced as a run
+hanging on the kube-native tier rather than a build-time failure.
+
+- **Forge egress derives from `FORGE_ALLOWED_BASE_URLS`, not a second hand-kept list.** A new
+  first-class chart value, `forge.allowedBaseURLs` (a list of https base URLs), renders explicitly
+  into both the api's `FORGE_ALLOWED_BASE_URLS` env (comma-joined) and the kube-native FQDN
+  allow-list (one `Allow` entry per host: the FQDN comes from Sprig's `urlParse … .hostname`
+  (`.host` includes any `:port`), while the forge's port is derived separately and preserved in the
+  rule's `ports` — default 443, so a non-default forge port is honored, not discarded). A forge is now declared once; the SSRF allowlist and the worker egress can
+  no longer disagree. The render fails on a non-https or hostless entry, and fails if a legacy
+  freeform `api.config.FORGE_ALLOWED_BASE_URLS` key is still set alongside the new value, so the
+  rendered ConfigMap can never carry a duplicate key.
+- **`search.devbox.sh` added to the shipped-default kube-native allow-list — a deliberate
+  widening.** The devbox resolver (hit by `devbox install` to turn `name@version` into a nix ref,
+  before the substituter fetch) was unreachable on the kube-native tier; it is now allow-listed
+  alongside `cache.nixos.org`, `*.anthropic.com`, and the CNPG chart's OCI pair. This is backstopped
+  by the server-side tier-1 admin allowlist (rejects an unbaked package at profile-save/claim time
+  with a 400, regardless of what a worker can reach), not by egress being locked — so the widening
+  is a defense-in-depth reduction, not a hole. Server-side devbox resolution (resolving
+  `name@version` in the api so a worker never needs the resolver host at all) is deferred to a
+  follow-up issue.
+- **A completeness guard folded into `scripts/assert-chart-render.sh`, no workflow edit.** The
+  script (already invoked by the `helm-chart` CI job, which runs on `ubuntu-latest` with
+  `azure/setup-helm` — full GNU tooling, unlike the helm-less `lint-repo`/`gate:repo` job) now
+  parses the rendered FQDN `NetworkPolicy` (namespaced `crd.antrea.io/v1beta1`, collecting
+  `spec.egress[].to[].fqdn` where `action == Allow` and skipping `Drop`/`denyCIDRs`) and fails,
+  naming the missing host, if the rendered allow-list omits any canonical worker destination: each
+  forge host, `*.anthropic.com`, `cache.nixos.org`, `search.devbox.sh`, `ghcr.io`,
+  `pkg-containers.githubusercontent.com`. A committed canary proves the detector fires on a
+  render intentionally missing two hosts — `cache.nixos.org` (the static half) and the forge host
+  `gitlab.example.com` (the derivation half), exercising both detector paths; a malformed/empty
+  render exits 2 (broken instrument), not 0.
+- **The docker tier stays broad by design.** It cannot be FQDN-filtered — a privileged
+  docker-in-docker sidecar can `docker run --network=host` around any pod NetworkPolicy — so this
+  PRD single-sources the *destination model* and guards its completeness, without unifying the two
+  enforcement mechanisms.
+- Full rationale, verified facts, and Decision Log D1–D7: `prds/808-worker-egress-single-source.md`
+  (stays under `prds/` as `Status: merged, blocked-on-maintainer` until an operator reconciles the
+  private per-deployment values — not moved to `prds/done/` by this change).

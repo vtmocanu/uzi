@@ -22,6 +22,9 @@
   everything except DNS and the api — so a worker on a cluster without Antrea fails
   CLOSED (it cannot reach its forge) rather than open.
 */ -}}
+{{- if not .Values.forge.allowedBaseURLs }}
+{{- fail "workers.fqdnEgress.enabled is true but forge.allowedBaseURLs is empty. The api falls back to its built-in default forge (https://github.com), which this egress policy would NOT allow, silently blocking git clone/fetch on the kube-native worker tier. Set forge.allowedBaseURLs to your forge base URL(s) — it single-sources both FORGE_ALLOWED_BASE_URLS and this egress list." }}
+{{- end }}
 apiVersion: crd.antrea.io/v1beta1
 kind: NetworkPolicy
 metadata:
@@ -74,5 +77,37 @@ spec:
         - protocol: TCP
           port: {{ . }}
         {{- end }}
+    {{- end }}
+    {{- /*
+      DERIVED forge egress (PRD #808): one Allow per host from the SAME forge.allowedBaseURLs
+      list that feeds the api SSRF allowlist, so a forge host is declared once and the two
+      consumers share one source. urlParse .hostname gives the bare host (no :port); the port
+      is derived from the URL too (default 443) so a non-standard forge port does NOT diverge
+      from the api, which preserves the port in NormalizeForgeBaseURL.
+
+      Validated fail-CLOSED to mirror the api: NormalizeForgeBaseURL refuses to boot on a
+      scheme-less / hostless entry, so a render that would emit an empty fqdn (match-nothing at
+      best, match-anything at worst on some CNIs) is a hard render failure here rather than a
+      silently malformed egress rule.
+    */ -}}
+    {{- range .Values.forge.allowedBaseURLs }}
+    {{- $u := urlParse . }}
+    {{- $host := $u.hostname }}
+    {{- if or (not $host) (ne $u.scheme "https") }}
+    {{- fail (printf "forge.allowedBaseURLs entry %q must be an absolute https URL with a host, e.g. https://github.com (it feeds both FORGE_ALLOWED_BASE_URLS and the worker egress FQDN list; the api's NormalizeForgeBaseURL rejects the same input at boot)." .) }}
+    {{- end }}
+    {{- if or (contains ":" $host) (regexMatch "^[0-9]+(\\.[0-9]+)+$" $host) }}
+    {{- fail (printf "forge.allowedBaseURLs entry %q resolves to an IP-literal host (%s). Antrea FQDN egress rules cannot express an IP address, and the derived port parsing breaks on a bracketed IPv6 literal (splitting the host on ':' yields an invalid port). Configure a DNS hostname, or express an IP-literal forge with an ipBlock-based egress policy instead." . $host) }}
+    {{- end }}
+    {{- /* urlParse has no .port field; .host carries host[:port], so split it out (default 443). */}}
+    {{- $port := "443" }}
+    {{- if contains ":" $u.host }}{{- $port = last (splitList ":" $u.host) }}{{- end }}
+    - name: allow-forge-{{ $host | replace "." "-" | replace "*" "wildcard" }}
+      action: Allow
+      to:
+        - fqdn: {{ $host | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ $port }}
     {{- end }}
 {{- end }}
