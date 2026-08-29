@@ -239,16 +239,14 @@ caught too, not just the checkpointed tracking ref):
   It rides through `limit_wait` (keeps snapshotting while a run is parked). This is a
   session-independent safety net; it is NOT a substitute for the pollers — keep those too.
 
-To recover from a snapshot: `tar xzf <ts>/issue-N.tgz -C r/`, then
-`git fetch r/issue-N.bundle 'agent/issue-N:refs/heads/recover/issue-N'` and
-`git worktree add DIR recover/issue-N`. In `DIR`, **`git rebase origin/main` FIRST** (it
-refuses a dirty tree), THEN restore the uncommitted state the tracking ref never held
-(`git apply r/issue-N.uncommitted.patch` if present, **and `tar xzf
-r/issue-N.untracked.tar.gz -C DIR` if present** — new, not-yet-added files the patch does
-not carry), **commit it**, then gate + PR + admin-merge as above. **`resume-recipe.md`** in
-this skill dir is the full, run-kind-agnostic version of these last steps (issue AND task
-stems, integrity-verify the `.tgz` first, rebase-before-restore, the workflow/migration
-pre-flight, through admin-merge + cleanup).
+To recover from a snapshot: extract `<ts>/issue-N.tgz`, `git fetch` its bundle into a
+`recover/issue-N` branch + an ISOLATED worktree, then follow **`resume-recipe.md`** in this
+skill dir for the exact land-it steps. The one gotcha worth stating here so nobody trips on
+it: **`git fetch origin main` + `git rebase origin/main` FIRST** (rebase refuses a dirty
+tree), and only THEN restore the `uncommitted.patch` / `untracked.tar.gz` the tracking ref
+never held (paths inside the snapshot dir, applied from within the worktree), **commit**,
+and gate + PR + admin-merge. The recipe is the full, run-kind-agnostic version (issue AND
+task stems, integrity-verify the `.tgz` first, the workflow/migration pre-flight, cleanup).
 
 ## Reviewing the diff
 
