@@ -1601,3 +1601,10 @@ export interface UserInput {
 export interface InputsResponse {
   inputs: UserInput[];
 }
+
+/** Response of the interactive park-skip ownership probe (issue #559): the current
+ *  status of a run this worker owns. A 404 (not owned / reclaimed) is signalled by a
+ *  thrown RequestError, not by this shape. */
+export interface RunOwnershipResponse {
+  status: string;
+}

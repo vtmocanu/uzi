@@ -1515,6 +1515,13 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Post("/runs/{id}/state", h.WorkerRunState)
 		r.Get("/runs/{id}/inputs", h.WorkerRunInputs)
 
+		// Ownership/terminality probe (#559): worker-authenticated, run-scoped,
+		// READ ONLY. The interactive park-SKIP path polls it to detect a mid-turn
+		// reclaim (404) or terminal transition early — restoring the ACK the
+		// skipped awaiting_followup park report used to give. Reuses
+		// GetRunOwnedByWorker; no new query.
+		r.Get("/runs/{id}/ownership", h.WorkerRunOwnership)
+
 		// Checkpoint publish (PRD #122 M8): the worker POSTs a raw delta packfile +
 		// tip OID; the api derives repo/branch/PAT from the run row and pushes it
 		// NON-FORCED to refs/uzi-checkpoints/<branch>. Inherits RequireWorker; feeds

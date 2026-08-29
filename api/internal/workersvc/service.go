@@ -4148,6 +4148,18 @@ func (s *Service) ListMemoryForRun(ctx context.Context, wkr store.Worker, runID 
 	})
 }
 
+// RunOwnership returns the current status of a run this worker owns, or
+// ErrRunNotOwned when it is not (reclaimed / never owned). Read-only; the
+// interactive park-skip path (#559) uses it to detect a mid-turn reclaim or
+// terminal transition early, restoring the ACK the skipped park report gave.
+func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid.UUID) (string, error) {
+	run, err := s.runOwnedByWorker(ctx, runID, wkr)
+	if err != nil {
+		return "", err
+	}
+	return run.Status, nil
+}
+
 func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr store.Worker) (store.Run, error) {
 	run, err := s.q.GetRunOwnedByWorker(ctx, store.GetRunOwnedByWorkerParams{ID: runID, WorkerID: pgUUID(wkr.ID)})
 	if err != nil {
