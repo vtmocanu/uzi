@@ -498,6 +498,38 @@ on green CI; >0 → triage); (a)/(b) are corroborating detail only when actionab
 existed. A poller must key on (c), never on the `CodeRabbit` PR check nor on the presence of a
 new review object.
 
+**Two updates to signal (c) and the live-findings count, both measured 2026-08-29 driving a
+6-PR batch, both now fixed in `scripts/watch-pr.sh`:**
+
+- **The `recent_review` range is GONE; signal (c) now keys on the `final_review_risk` block.**
+  The long treatment above describes the `recent_review` "between BASE and HEAD" range as the
+  signal that "ALWAYS fires" — that format is **retired**: 0 occurrences across PRs #807 / #809 /
+  #812 on 2026-08-29, all of which carry a `final_review_risk` block instead. That block reads
+  `**Merge Risk:** _🟡 Moderate_ · up to` then the head short-sha in backticks (e.g. `up to
+  280ac`), sits between `<!-- final_review_risk_start -->` / `<!-- final_review_risk_end -->`,
+  and states a merge-readiness verdict in prose ("no actionable merge-blocking risk remaining;
+  it is merge-ready" on a clean pass). `watch-pr.sh` confirms "reviewed this head" from that `up
+  to` short-sha marker (**parsed only inside the `final_review_risk` block**, and only when
+  **exactly one** walkthrough comment exists — fail closed on 0 or >1), plus signal (a), a review
+  object whose `commit_id` is the head. It no longer parses `recent_review`, which is a retired
+  format. Parsing the `final_review_risk` SHA over the whole body could false-match an unrelated
+  "up to `<sha>`" phrase and, with zero live findings, forge a merge; the parser therefore scopes
+  that SHA to its marker block and fails closed unless exactly one walkthrough comment exists (the
+  "exactly one match, fail closed" contract above). A poller you hand-roll must key on `final_review_risk` (block-scoped)
+  + signal (a); if `recent_review` ever returns, signal (a) still covers a real review, so the
+  loss is fail-closed (a timeout, never a false ready).
+- **An ADDRESSED finding keeps `line != null`; it is NOT outdated — do not count it as live.**
+  The `line: null`/`original_line` "outdated" signal in (b) above is only ONE of the two ways a
+  finding stops being live. When CodeRabbit judges a finding FIXED by a later commit it leaves
+  the inline comment anchored to live code (`line != null`) and instead appends a
+  `✅ Addressed in commit <sha>` line to the comment **body**. A live-findings count that filters
+  only on `line != null` therefore counts a resolved finding as open: measured on PR #807, where
+  two addressed findings produced a false "2 live findings" (`watch-pr.sh` exit 3) after a clean
+  rework, stalling a merge-ready PR. Exclude any comment whose body `contains("Addressed in
+  commit")` — the fix now in `watch-pr.sh`'s `live` count. This is also why, when you read
+  findings by hand (e.g. via `pr-findings.sh`), a finding tagged `Addressed in commit` is done;
+  verify against the body marker, not the line anchor.
+
 **The shared `main` worktree is a multi-writer tree — never assert it is clean.** Other
 sessions leave modified files in it and advance `main` mid-review (measured 2026-08-20:
 two reviewers found unrelated `tui_*` edits and `main` moving `6fc6c5eb`→`2007cbf4` under
