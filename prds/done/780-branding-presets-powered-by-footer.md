@@ -132,8 +132,8 @@ the preset. The **POWERED BY logo-slot** fallback to `brand-default.svg` is unch
   local pre-push gate and only runs in CI's `test:api-store-it` job; do not read a green
   local gate as proof this passed. (`TestBrandingPublicReadIsAllowlisted` is only a prose
   reference in a code comment, not a test.)
-- `api/internal/store/migrations/00172_app_logo_preset.sql` *(number assigned at merge;
-  head is 00171)* — the D7 idempotent flip against `app_settings`.
+- `api/internal/store/migrations/00174_app_logo_preset.sql` *(number assigned at merge;
+  head is 00172)* — the D7 idempotent flip against `app_settings`.
 
 **Frontend (web):**
 - `web/src/lib/api.ts` — add `app_logo_preset` to `AppSettings` (:673), `Branding` (:769),

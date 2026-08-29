@@ -171,11 +171,11 @@ describe("AppShell branding — app mark", () => {
 
   it("custom + not present: renders the inline FactoryIcon, no app-logo <img>", async () => {
     mockApi.branding.mockResolvedValue(brandingWith({ app_logo_mode: "custom", app_logo_present: false }));
-    const { container } = renderShell();
+    renderShell();
     await waitFor(() => expect(mockApi.branding).toHaveBeenCalled());
     expect(screen.queryAllByTestId("app-logo-img")).toHaveLength(0);
-    // The trusted inline FactoryIcon SVG renders instead of a /brand-default.svg <img>.
-    expect(container.querySelector("svg")).not.toBeNull();
+    // The trusted inline FactoryIcon fallback renders instead of a /brand-default.svg <img>.
+    expect(screen.queryAllByTestId("app-mark-fallback").length).toBeGreaterThan(0);
   });
 
   it("preset mode (metaminds): renders <img src='/brand-presets/metaminds.svg'>", async () => {
@@ -188,10 +188,10 @@ describe("AppShell branding — app mark", () => {
 
   it("preset mode, unknown slug: renders the inline FactoryIcon, no app-logo <img>", async () => {
     mockApi.branding.mockResolvedValue(brandingWith({ app_logo_mode: "preset", app_logo_preset: "nope" }));
-    const { container } = renderShell();
+    renderShell();
     await waitFor(() => expect(mockApi.branding).toHaveBeenCalled());
     expect(screen.queryAllByTestId("app-logo-img")).toHaveLength(0);
-    expect(container.querySelector("svg")).not.toBeNull();
+    expect(screen.queryAllByTestId("app-mark-fallback").length).toBeGreaterThan(0);
   });
 });
 

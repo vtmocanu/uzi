@@ -29,7 +29,9 @@ anywhere). The default `uzi` tile always shows the name.
 
 The app mark renders everywhere uzi shows its identity: the signed-in
 sidebar (desktop and the mobile drawer), the signed-out top bar, and the
-mobile signed-in top bar.
+mobile signed-in top bar. That's the full scope: the browser favicon and
+the signed-out landing page's hero stay the uzi factory icon regardless
+of branding settings.
 
 ## POWERED BY brand
 
@@ -69,6 +71,9 @@ its own tile.
 **A fresh install is fully unbranded by default** — the app mark starts
 on `uzi` and POWERED BY starts off, so nobody sees a preset or a
 co-brand unless an admin deliberately turns branding on.
+
+An unrecognised or empty preset slug never breaks the mark: it falls
+back to the stock uzi factory icon, the same as the default `uzi` tile.
 
 ## The license credit is fixed
 

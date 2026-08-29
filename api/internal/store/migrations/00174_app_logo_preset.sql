@@ -20,14 +20,18 @@ UPDATE app_settings
    AND value = 'custom'
    AND NOT EXISTS (SELECT 1 FROM branding_assets WHERE slot = 'app');
 
--- Statement 2 — record the chosen preset slug. app_logo_preset has no default row (its
--- compiled-in default is ""), so a plain INSERT is required; ON CONFLICT (key) DO NOTHING
--- is what makes the claimed idempotency real — a re-run (or an admin who already picked a
--- preset) is left untouched rather than violating the PK. Written unconditionally: on a
--- default-mode instance the slug is inert (default mode ignores the preset), so this is
--- harmless there and correct once such an instance later selects the preset tile.
+-- Statement 2 — record the chosen preset slug, but ONLY for an instance statement 1
+-- actually converted. After statement 1 an app_logo_mode='preset' row exists exactly for
+-- the instances that were flipped (a default-mode instance has no such row and stays
+-- absent; a genuine custom-upload instance stays 'custom'), so gating the insert on that
+-- row via WHERE EXISTS keeps the slug off default-mode and real-custom instances — which
+-- would otherwise inherit 'metaminds' on a later switch to preset mode. app_logo_preset
+-- has no default row (its compiled-in default is ""), so an INSERT is required; ON CONFLICT
+-- (key) DO NOTHING keeps idempotency real — a re-run (or an admin who already picked a
+-- preset) is left untouched rather than violating the PK.
 INSERT INTO app_settings (key, value)
-VALUES ('app_logo_preset', 'metaminds')
+SELECT 'app_logo_preset', 'metaminds'
+ WHERE EXISTS (SELECT 1 FROM app_settings WHERE key = 'app_logo_mode' AND value = 'preset')
 ON CONFLICT (key) DO NOTHING;
 
 -- +goose Down

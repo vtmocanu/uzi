@@ -107,6 +107,7 @@ func TestBrandingPublicReadDefaultsAndAllowlistLiveDB(t *testing.T) {
 
 	// Default (unbranded) values.
 	assertJSON(t, m, "app_logo_mode", `"default"`)
+	assertJSON(t, m, "app_logo_preset", `""`)
 	assertJSON(t, m, "app_logo_keep_name", `true`)
 	assertJSON(t, m, "brand_mode", `"none"`)
 	assertJSON(t, m, "brand_company", `""`)

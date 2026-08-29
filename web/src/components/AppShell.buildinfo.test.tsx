@@ -120,6 +120,22 @@ describe("AppShell build info wiring", () => {
     expect(pop.textContent).toContain("366a282");
     expect(pop.textContent).toContain("2,105 commits");
   });
+
+  it("keeps the version badge and the license credit in the same M4 one-row footer", async () => {
+    renderShell();
+    // The sidebar mounts twice (desktop aside + mobile), so grab all badges and
+    // walk up from the first to its footer row. AppShell.tsx's footer wrapper is
+    // `flex items-center justify-between …`, so `justify-between` selects the row
+    // that holds the badge and the credit side by side.
+    const badges = await screen.findAllByRole("button", { name: "v0.4.2" });
+    const badge = badges[0];
+    const row = badge.closest("div.justify-between") as HTMLElement | null;
+    expect(row).not.toBeNull();
+    const credit = row!.querySelector('[data-testid="license-credit"]');
+    expect(credit).not.toBeNull();
+    expect(row!.contains(badge)).toBe(true);
+    expect(credit!.textContent).toBe("MIT © Vlad Mocanu");
+  });
 });
 
 // The failure case lives in AppShell.buildinfo.failure.test.tsx, NOT here — and it
