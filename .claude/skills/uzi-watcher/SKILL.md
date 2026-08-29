@@ -511,12 +511,13 @@ new review object.
   it is merge-ready" on a clean pass). `watch-pr.sh` confirms "reviewed this head" from that `up
   to` short-sha marker (**parsed only inside the `final_review_risk` block**, and only when
   **exactly one** walkthrough comment exists — fail closed on 0 or >1), plus signal (a), a review
-  object whose `commit_id` is the head. It no longer parses `recent_review`: matching a retired
-  format over the whole body could false-match an unrelated "up to `<sha>`" phrase and, with zero
-  live findings, forge a merge — the "exactly one match, fail closed" contract above. A poller you
-  hand-roll must key on `final_review_risk` (block-scoped) + signal (a); if `recent_review` ever
-  returns, signal (a) still covers a real review, so the loss is fail-closed (a timeout, never a
-  false ready).
+  object whose `commit_id` is the head. It no longer parses `recent_review`, which is a retired
+  format. Parsing the `final_review_risk` SHA over the whole body could false-match an unrelated
+  "up to `<sha>`" phrase and, with zero live findings, forge a merge; the parser therefore scopes
+  that SHA to its marker block and fails closed unless exactly one walkthrough comment exists (the
+  "exactly one match, fail closed" contract above). A poller you hand-roll must key on `final_review_risk` (block-scoped)
+  + signal (a); if `recent_review` ever returns, signal (a) still covers a real review, so the
+  loss is fail-closed (a timeout, never a false ready).
 - **An ADDRESSED finding keeps `line != null`; it is NOT outdated — do not count it as live.**
   The `line: null`/`original_line` "outdated" signal in (b) above is only ONE of the two ways a
   finding stops being live. When CodeRabbit judges a finding FIXED by a later commit it leaves
