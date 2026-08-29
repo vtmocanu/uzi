@@ -13,7 +13,8 @@ data:
   {{- /*
     FORGE_ALLOWED_BASE_URLS rendered EXPLICITLY from the first-class forge.allowedBaseURLs
     value (PRD #808), NOT left to the api.config freeform map — so the SSRF allowlist and
-    the worker egress FQDNs (worker-fqdn-egress.yaml) share ONE source and cannot diverge.
+    the worker egress FQDNs (worker-fqdn-egress.yaml) derive from ONE source list and the
+    forge host set cannot diverge.
     Rendered like WORKER_HOSTING_ENABLED below, for the same anti-drift reason.
 
     Setting BOTH forge.allowedBaseURLs AND api.config.FORGE_ALLOWED_BASE_URLS would emit a
