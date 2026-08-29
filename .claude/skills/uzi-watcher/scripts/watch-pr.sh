@@ -106,21 +106,35 @@ while [ "$i" -lt "$MAX" ]; do
   else
     unknown=1
   fi
-  # Signal (c): the walkthrough recent_review range ending at this head — covers the
-  # zero-actionable incremental case, which posts no review object.
+  # Signal (c): the walkthrough comment, which CodeRabbit edits in place each pass and which
+  # covers the zero-actionable incremental case (that posts no review object). TWO formats are
+  # accepted because CodeRabbit is migrating between them (both observed 2026-08-29): the older
+  # `recent_review` "... between BASE and HEAD" range, and the newer `final_review_risk` block
+  # "**Merge Risk:** ... · up to `<short-sha>`". Either one naming the current head confirms it
+  # was reviewed. The walkthrough body is fetched once and both markers are checked against it.
   if issue_c=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null); then
-    wt_head=$(printf '%s' "$issue_c" | jq -rs '.[][]|select(.user.login=="coderabbitai[bot]")|select(.body|contains("<!-- walkthrough_start -->"))|.body' 2>/dev/null \
-      | grep -oE 'and [0-9a-f]{7,40}' | tail -1 | awk '{print $2}' || true)
+    wt_body=$(printf '%s' "$issue_c" | jq -rs '.[][]|select(.user.login=="coderabbitai[bot]")|select(.body|contains("<!-- walkthrough_start -->"))|.body' 2>/dev/null || true)
+    # (c1) recent_review range: "... and <head>"
+    wt_head=$(printf '%s' "$wt_body" | grep -oE 'and [0-9a-f]{7,40}' | tail -1 | awk '{print $2}' || true)
     if [ -n "$wt_head" ] && printf '%s' "$head" | grep -q "^$wt_head"; then reviewed_head=1; fi
+    # (c2) final_review_risk marker: "up to `<sha>`" (short or full)
+    # shellcheck disable=SC2016  # the backticks are LITERAL text in CodeRabbit's marker, not a subshell
+    fr_head=$(printf '%s' "$wt_body" | grep -oE 'up to `[0-9a-f]{5,40}`' | tail -1 | grep -oE '[0-9a-f]{5,40}' || true)
+    if [ -n "$fr_head" ] && printf '%s' "$head" | grep -q "^$fr_head"; then reviewed_head=1; fi
   else
     unknown=1
   fi
 
-  # Live inline findings: CodeRabbit comments still anchored to current code (line != null);
-  # an addressed finding re-anchors to line == null (outdated).
+  # Live inline findings: CodeRabbit comments still anchored to current code (line != null)
+  # AND not self-marked resolved. Two ways a finding stops being live, and only the first was
+  # handled before: an outdated finding re-anchors to line == null; but a finding CodeRabbit
+  # judged FIXED by a later commit keeps line != null and instead appends a "✅ Addressed in
+  # commit <sha>" line to its body (measured 2026-08-29 on PR #807, where two such addressed
+  # findings were mis-counted as live=2 and produced a false exit-3 after a clean rework).
+  # Exclude both, so an addressed finding does not read as a live one.
   live=0
   if pull_c=$(gh api --paginate "repos/$REPO/pulls/$PR/comments" 2>/dev/null); then
-    live=$(printf '%s' "$pull_c" | jq -rs '[.[][]|select(.user.login=="coderabbitai[bot]" and .line!=null)]|length' 2>/dev/null || echo 0)
+    live=$(printf '%s' "$pull_c" | jq -rs '[.[][]|select(.user.login=="coderabbitai[bot]" and .line!=null and ((.body|contains("Addressed in commit"))|not))]|length' 2>/dev/null || echo 0)
   else
     unknown=1
   fi
