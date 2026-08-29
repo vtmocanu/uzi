@@ -111,20 +111,22 @@ func contextTone(pal palette, pct float64) color.Color {
 // row; under cool the tone is faintC, so the whole bar reads faint (no accent). No used/window
 // token counts — this is a bare pct meter.
 func (m tuiModel) contextMeterCell(bg color.Color, fill contextFill, barW int) string {
-	r := int(math.Round(fill.pct))
-	// The DISPLAYED label is clamped to [0,999] so it never exceeds the 4-col ("999%") budget
-	// laneRow reserves for the meter tail; the bar and tone stay on the TRUE unclamped pct
-	// (rateBarParts clamps the bar to [0,100], contextTone intentionally uses the raw pct).
-	label := r
-	if label < 0 {
-		label = 0
+	// Clamp pct in the FLOAT domain to the DISPLAYED-label budget [0,999] BEFORE converting to
+	// int: Go leaves out-of-range float→int conversions implementation-defined, so an
+	// extreme-but-finite pct (e.g. math.MaxFloat64, which passes finite()) would otherwise yield
+	// a platform-dependent label and bar. The 4-col ("999%") budget is what laneRow reserves for
+	// the meter tail. The bar still clamps to [0,100] in rateBarParts, and the tone still rides
+	// the TRUE unclamped pct via contextTone (no int conversion there).
+	p := fill.pct
+	if p < 0 {
+		p = 0
+	} else if p > 999 {
+		p = 999
 	}
-	if label > 999 {
-		label = 999
-	}
+	r := int(math.Round(p))
 	filled, empty := rateBarParts(r, barW)
 	return paintSeg(m.pal.faintC, bg, false, " ") +
 		paintSeg(contextTone(m.pal, fill.pct), bg, false, filled) +
 		paintSeg(m.pal.faintC, bg, false, empty) +
-		paintSeg(m.pal.faintC, bg, false, " "+fmt.Sprintf("%4s", strconv.Itoa(label)+"%"))
+		paintSeg(m.pal.faintC, bg, false, " "+fmt.Sprintf("%4s", strconv.Itoa(r)+"%"))
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
 	"testing"
@@ -175,6 +176,34 @@ func TestContextMeterCellLabelClamped(t *testing.T) {
 	}
 	if !strings.Contains(row, "999%") {
 		t.Errorf("the clamped label must read 999%% for an over-999 pct:\n%q", row)
+	}
+}
+
+// TestContextMeterCellExtremePctClampedInFloatDomain — a finite-but-out-of-int-range pct passes
+// finite() and reaches contextMeterCell, so the clamp MUST happen in the float domain before the
+// int conversion (Go leaves out-of-range float→int implementation-defined). math.MaxFloat64 →
+// "999%" + a full ▰ bar; a large-negative pct → "0%". This guards the pre-fix path where the
+// conversion happened before any clamp.
+func TestContextMeterCellExtremePctClampedInFloatDomain(t *testing.T) {
+	m := tuiTestModel(t, nil, "")
+
+	huge := stripANSI(m.contextMeterCell(nil, contextFill{pct: math.MaxFloat64}, 13))
+	if !strings.Contains(huge, "999%") {
+		t.Errorf("math.MaxFloat64 pct must clamp the label to 999%%:\n%q", huge)
+	}
+	if !strings.Contains(huge, "▰▰▰▰▰▰") {
+		t.Errorf("math.MaxFloat64 pct must clamp the bar to full ▰▰▰▰▰▰:\n%q", huge)
+	}
+	if strings.Contains(huge, "/") {
+		t.Errorf("meter must NOT carry a used/window token count (no `/`):\n%q", huge)
+	}
+
+	neg := stripANSI(m.contextMeterCell(nil, contextFill{pct: -math.MaxFloat64}, 13))
+	if !strings.Contains(neg, "0%") {
+		t.Errorf("a large-negative pct must clamp the label to 0%%:\n%q", neg)
+	}
+	if strings.Contains(neg, "▰") {
+		t.Errorf("a large-negative pct must render an empty bar (no ▰):\n%q", neg)
 	}
 }
 
