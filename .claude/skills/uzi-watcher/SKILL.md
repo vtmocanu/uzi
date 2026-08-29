@@ -286,11 +286,13 @@ by anything on the PR itself.
    even though it will; if the findings are uzi-fixable (below) and the owner is opted in,
    give it a beat and re-check rather than racing in.
 3. **Let it finish, then decide from whether the head ACTUALLY moved — and read the ref
-   authoritatively.** With `BR` the PR's `agent/issue-*` branch, record its head *before*
-   the rework (`before=$(git rev-parse origin/"$BR")`), and after the run reaches terminal
-   **`git fetch origin "$BR"` FIRST** — a rework-worker push does not update your local
-   remote-tracking ref, so a bare `git rev-parse origin/"$BR"` reads the stale pre-rework
-   SHA and would call a real push "no commit". Then compare:
+   authoritatively at BOTH ends.** With `BR` the PR's `agent/issue-*` branch, **`git fetch
+   origin "$BR"` before recording** the pre-rework head (`before=$(git rev-parse
+   origin/"$BR")`) — the local remote-tracking ref can already be stale, so an unfetched
+   `before` is as unreliable as an unfetched `after`. Then, after the run reaches terminal,
+   **`git fetch origin "$BR"` AGAIN** and re-read the head: a rework-worker push does not
+   update your local remote-tracking ref on its own, so without the second fetch a real push
+   reads as "no commit". Then compare `before` to the new head:
    - **Head advanced** → REVIEW the new commit like any other diff (`git show <sha>`). uzi
      *acting* is not uzi being *right*: confirm it addressed the finding, added no
      regression, and did not "fix" a deliberate behavior. A bad rework is a
@@ -306,6 +308,16 @@ by anything on the PR itself.
    the **new head** (signal (c), the walkthrough `recent_review` range covering the new SHA
    — see *Triaging* below),
    confirm no active `mr_rework` remains and CI is green on that head, THEN merge.
+
+   **`scripts/watch-pr.sh OWNER/REPO PR [interval] [max]` runs this whole readiness poll**
+   so you do not hand-roll it each time: it exits **0** merge-ready (CI green on the head,
+   CodeRabbit reviewed that exact head with zero live inline findings, no active
+   `mr_rework`), **1** on red CI, **3** when CodeRabbit reviewed the head but left live
+   findings to triage, **4** when an `mr_rework` run is active on the MR (defer, then re-run
+   it), and **2** on timeout — where **exit 0 is trustworthy but exit 2 means inspect
+   manually, never merge**. "Reviewed this head" is the union of a review whose `commit_id`
+   is the head SHA and the walkthrough range ending at it, because a zero-actionable
+   incremental posts no new review object.
 
 **When this session still fixes locally (mr_rework will not or cannot):**
 - the owner is **opted out**, or the admin **kill-switch** is engaged
@@ -608,10 +620,11 @@ die with its session. When you close, hand any still-in-flight run ids on the sa
 
 ## Keep this skill (and its scripts) current
 
-This skill and its `scripts/` (`watch-run.sh` for uzi runs, `watch-ci.sh` for GitHub
-Actions, `pr-findings.sh` to gather CodeRabbit findings across PRs, `backup-runs.sh` /
-`backup-loop.sh` to snapshot in-flight run work from worker PVCs) are living documents —
-**update them in the same session you find them wanting.**
+This skill and its `scripts/` (`watch-run.sh` for uzi runs, `watch-ci.sh` for post-merge
+GitHub Actions, `watch-pr.sh` for a PR's merge-readiness — CI + CodeRabbit-on-head +
+mr_rework coordination in one poll — `pr-findings.sh` to gather CodeRabbit findings across
+PRs, `backup-runs.sh` / `backup-loop.sh` to snapshot in-flight run work from worker PVCs)
+are living documents — **update them in the same session you find them wanting.**
 When a run surprises you with a new failure mode, a plan trap this list does not name,
 changed merge/ruleset behaviour, a CLI verb that moved, or a poller needs a new
 stop-state/flag/exit-code: edit `SKILL.md` and/or the relevant script right then, and say
