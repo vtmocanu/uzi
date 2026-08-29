@@ -609,10 +609,13 @@ func TestRunMilestoneProgressLiveDB(t *testing.T) {
 		// A sibling parked at awaiting_input on the same stale worker: the requeue banks
 		// BOTH statuses (its CASE keys on status IN ('awaiting_approval','awaiting_input')),
 		// so covering only awaiting_approval would miss a regression that drops awaiting_input.
+		// It also starts with a NON-zero prior bank (120s): the requeue ADDS the new park
+		// (budget_paused_seconds = budget_paused_seconds + …), so asserting the accumulated
+		// ~720s catches a regression that overwrote the bank instead of adding to it.
 		runAI := newRun("claimed")
 		mustExec(ctx, t, pool,
 			`UPDATE runs SET status = 'awaiting_input', status_since = now() - interval '600 seconds',
-			     started_at = $2, worker_id = $3 WHERE id = $1`, runAI, startedAt, w2.ID)
+			     started_at = $2, worker_id = $3, budget_paused_seconds = 120 WHERE id = $1`, runAI, startedAt, w2.ID)
 		// Make the worker's heartbeat stale so the requeue picks it up.
 		mustExec(ctx, t, pool,
 			`UPDATE workers SET last_heartbeat_at = now() - interval '1 hour' WHERE id = $1`, w2.ID)
@@ -639,17 +642,25 @@ func TestRunMilestoneProgressLiveDB(t *testing.T) {
 		if got := readPaused(run); got < 595 || got > 610 {
 			t.Fatalf("awaiting_approval park time on requeue = %ds, want ~600 (595..610)", got)
 		}
-		if got := readPaused(runAI); got < 595 || got > 610 {
-			t.Fatalf("awaiting_input park time on requeue = %ds, want ~600 (595..610)", got)
+		// runAI seeded a 120s prior bank, so the accumulated value is ~720 (120 + ~600):
+		// a range that a bank-overwrite regression (~600) would fail.
+		if got := readPaused(runAI); got < 715 || got > 730 {
+			t.Fatalf("awaiting_input accumulated park time on requeue = %ds, want ~720 (715..730)", got)
 		}
-		// started_at must be untouched by the requeue.
-		var gotStarted time.Time
-		if err := pool.QueryRow(ctx, `SELECT started_at FROM runs WHERE id = $1`, run).Scan(&gotStarted); err != nil {
-			t.Fatalf("read started_at: %v", err)
+		// started_at must be untouched by the requeue — assert for BOTH parked runs, since a
+		// regression could reset it for only one status.
+		assertStartedUnchanged := func(id uuid.UUID, label string) {
+			t.Helper()
+			var gotStarted time.Time
+			if err := pool.QueryRow(ctx, `SELECT started_at FROM runs WHERE id = $1`, id).Scan(&gotStarted); err != nil {
+				t.Fatalf("read started_at (%s): %v", label, err)
+			}
+			if d := gotStarted.Sub(startedAt); d < -2*time.Second || d > 2*time.Second {
+				t.Fatalf("started_at (%s) moved by %v on requeue, want unchanged", label, d)
+			}
 		}
-		if d := gotStarted.Sub(startedAt); d < -2*time.Second || d > 2*time.Second {
-			t.Fatalf("started_at moved by %v on requeue, want unchanged", d)
-		}
+		assertStartedUnchanged(run, "awaiting_approval")
+		assertStartedUnchanged(runAI, "awaiting_input")
 	})
 
 	// ── Issue #783: PromoteLimitWaitRuns gives the resumed run a FRESH wall (started_at =
