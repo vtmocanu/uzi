@@ -81,7 +81,9 @@ export function IssueView() {
     setStarting(true);
     try {
       const { run } = await api.createRun(repoId, issue.iid);
-      navigate(`/runs/${run.id}`);
+      // encodeURIComponent the id: per-call-site open-redirect hardening (see
+      // safeNextPath in Login.tsx). A no-op for today's UUID ids.
+      navigate(`/runs/${encodeURIComponent(run.id)}`);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not start run");
       setStarting(false);
