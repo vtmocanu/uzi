@@ -167,9 +167,9 @@ export function ScheduleModal({
   const { uziLabel } = useAuth();
   const isEdit = !!editing;
   // A catalog default (PRD #589) is catalog-owned: its target/prompt/labels/guidance are
-  // read-only (shown as the baked, sealed values) and only the cadence, model, and run
-  // flags are editable. override_subagent_model is non-editable on a default too. To get
-  // the full editable set, the owner clones it to a user row (origin='user').
+  // read-only (shown as the baked, sealed values) and the cadence, model, run flags, and
+  // override_subagent_model (issue #691) are editable. To get the full editable set
+  // (including target/prompt/labels/guidance), the owner clones it to a user row (origin='user').
   const isDefault = editing?.origin === "default";
 
   const [repos, setRepos] = useState<Repo[]>([]);
@@ -440,6 +440,9 @@ export function ScheduleModal({
     wait_on_limit: waitOnLimit,
     max_issues: target === "sweep" ? maxIssues : undefined,
     model: model.trim() === "" ? null : model,
+    // PRD #305: apply the run model to every subagent. Editable on a default too
+    // (issue #691) — always sent with replace-semantics.
+    override_subagent_model: overrideSubagentModel,
     guidance:
       target === "prompt" || target === "sweep"
         ? guidance.trim() === ""
@@ -954,23 +957,22 @@ export function ScheduleModal({
           {modelWarning && <Alert message={modelWarning} tone="warning" />}
 
           {/* PRD #305: apply the run model to every subagent. Always enabled — first-class
-              on Inherit (the applied model is the same one the lead resolves). Hidden on a
-              catalog default (PRD #589): the server treats it as non-editable there. */}
-          {!isDefault && (
-            <div className="flex items-start gap-3">
-              <Toggle
-                checked={overrideSubagentModel}
-                onChange={setOverrideSubagentModel}
-                label="Apply model also to agents"
-              />
-              <span className="text-[13px] text-fg">
-                Apply model also to agents
-                <span className="block text-[11px] text-faint">
-                  Subagents run on the same model as the lead — overrides each agent's own model.
-                </span>
+              on Inherit (the applied model is the same one the lead resolves). Editable on a
+              catalog default too (issue #691): the server now accepts it on a default patch,
+              so it is a first-class run option on every schedule. */}
+          <div className="flex items-start gap-3">
+            <Toggle
+              checked={overrideSubagentModel}
+              onChange={setOverrideSubagentModel}
+              label="Apply model also to agents"
+            />
+            <span className="text-[13px] text-fg">
+              Apply model also to agents
+              <span className="block text-[11px] text-faint">
+                Subagents run on the same model as the lead — overrides each agent's own model.
               </span>
-            </div>
-          )}
+            </span>
+          </div>
 
           {/* Options */}
           <div className="space-y-3">
