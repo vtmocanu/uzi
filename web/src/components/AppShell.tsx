@@ -10,6 +10,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api, MOCK_MODE, type Branding, type BuildInfo, type Repo } from "../lib/api";
 import { prefs } from "../lib/prefs";
+import { presetAssetForSlug } from "../lib/brandPresets";
 import { cx } from "./ui";
 import { VaultBadge, VaultLockedBanner } from "./VaultControls";
 import { RateLimitAnnouncer, SidebarRateLimits } from "./RateLimitMeters";
@@ -225,22 +226,34 @@ function useBranding(): Branding | null {
   return branding;
 }
 
-// The custom-mode app-logo <img> src, or null when the mark should render the
-// default inline FactoryIcon. Custom mode serves the uploaded logo when present,
-// else the shipped preset (/brand-default.svg lands in M3b; referencing it now is
-// fine — the branch lands atomically). NEVER inline SVG: a custom mark is always an
-// <img> so an uploaded SVG stays passive. `null`/pending branding is the default.
+// The app-logo <img> src, or null when the mark should render the default inline
+// FactoryIcon. Three modes (PRD #780): `custom` serves the uploaded logo when
+// present and otherwise renders the FactoryIcon (no upload → no <img>); `preset`
+// resolves the shipped asset from the web-owned catalog by slug, degrading to the
+// FactoryIcon on an empty/unknown slug; `default` (and null/pending branding) is
+// the FactoryIcon. NEVER inline SVG: a resolved mark is always an <img> so an
+// uploaded/preset SVG stays passive.
 function appMarkImgSrc(branding: Branding | null): string | null {
-  if (!branding || branding.app_logo_mode !== "custom") return null;
-  return branding.app_logo_present ? "/api/branding/logo/app" : "/brand-default.svg";
+  if (!branding) return null;
+  if (branding.app_logo_mode === "custom") {
+    return branding.app_logo_present ? "/api/branding/logo/app" : null;
+  }
+  if (branding.app_logo_mode === "preset") {
+    return presetAssetForSlug(branding.app_logo_preset);
+  }
+  return null;
 }
 
 // Whether to render the "uzi" / "uzinele întunecate" name beside the mark. Hidden
-// only in full white-label (custom mode with keep_name=false); default mode and a
-// keep-name co-brand both keep it. `null`/pending branding is the default (shown).
+// only in a full white-label — a non-default mode (custom or preset) with
+// keep_name=false; default mode and any keep-name co-brand keep it. `null`/pending
+// branding is the default (shown). (PRD #780 D4.)
 function appMarkShowName(branding: Branding | null): boolean {
-  if (!branding || branding.app_logo_mode !== "custom") return true;
-  return branding.app_logo_keep_name;
+  if (!branding) return true;
+  if (branding.app_logo_mode === "custom" || branding.app_logo_mode === "preset") {
+    return branding.app_logo_keep_name;
+  }
+  return true;
 }
 
 // The framed app mark, shared across all four chrome surfaces (PRD #685 M3a). Each

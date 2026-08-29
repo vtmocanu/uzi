@@ -66,6 +66,7 @@ const user = {
 
 const DEFAULT_BRANDING: Branding = {
   app_logo_mode: "default",
+  app_logo_preset: "",
   app_logo_present: false,
   app_logo_keep_name: true,
   brand_mode: "none",
@@ -168,12 +169,29 @@ describe("AppShell branding — app mark", () => {
     for (const img of imgs) expect(img.getAttribute("src")).toBe("/api/branding/logo/app");
   });
 
-  it("custom + not present: falls back to <img src='/brand-default.svg'>", async () => {
+  it("custom + not present: renders the inline FactoryIcon, no app-logo <img>", async () => {
     mockApi.branding.mockResolvedValue(brandingWith({ app_logo_mode: "custom", app_logo_present: false }));
+    const { container } = renderShell();
+    await waitFor(() => expect(mockApi.branding).toHaveBeenCalled());
+    expect(screen.queryAllByTestId("app-logo-img")).toHaveLength(0);
+    // The trusted inline FactoryIcon SVG renders instead of a /brand-default.svg <img>.
+    expect(container.querySelector("svg")).not.toBeNull();
+  });
+
+  it("preset mode (metaminds): renders <img src='/brand-presets/metaminds.svg'>", async () => {
+    mockApi.branding.mockResolvedValue(brandingWith({ app_logo_mode: "preset", app_logo_preset: "metaminds" }));
     renderShell();
     const imgs = await screen.findAllByTestId("app-logo-img");
     expect(imgs.length).toBeGreaterThan(0);
-    for (const img of imgs) expect(img.getAttribute("src")).toBe("/brand-default.svg");
+    for (const img of imgs) expect(img.getAttribute("src")).toBe("/brand-presets/metaminds.svg");
+  });
+
+  it("preset mode, unknown slug: renders the inline FactoryIcon, no app-logo <img>", async () => {
+    mockApi.branding.mockResolvedValue(brandingWith({ app_logo_mode: "preset", app_logo_preset: "nope" }));
+    const { container } = renderShell();
+    await waitFor(() => expect(mockApi.branding).toHaveBeenCalled());
+    expect(screen.queryAllByTestId("app-logo-img")).toHaveLength(0);
+    expect(container.querySelector("svg")).not.toBeNull();
   });
 });
 
@@ -202,6 +220,25 @@ describe("AppShell branding — white-label hides the name on all four surfaces"
   it("custom + keep_name: the name IS kept beside the custom mark", async () => {
     mockApi.branding.mockResolvedValue(
       brandingWith({ app_logo_mode: "custom", app_logo_present: true, app_logo_keep_name: true }),
+    );
+    renderShell();
+    await screen.findAllByTestId("app-logo-img");
+    expect(screen.getAllByText(NAME_RE).length).toBeGreaterThan(0);
+  });
+
+  it("preset + keep_name off: full white-label, the name is hidden (D4)", async () => {
+    mockApi.branding.mockResolvedValue(
+      brandingWith({ app_logo_mode: "preset", app_logo_preset: "metaminds", app_logo_keep_name: false }),
+    );
+    renderShell();
+    fireEvent.click(screen.getByLabelText("Open navigation")); // co-mount the drawer
+    await screen.findAllByTestId("app-logo-img");
+    expect(screen.queryByText(NAME_RE)).toBeNull();
+  });
+
+  it("preset + keep_name on: co-brand, the name IS kept (D4)", async () => {
+    mockApi.branding.mockResolvedValue(
+      brandingWith({ app_logo_mode: "preset", app_logo_preset: "metaminds", app_logo_keep_name: true }),
     );
     renderShell();
     await screen.findAllByTestId("app-logo-img");

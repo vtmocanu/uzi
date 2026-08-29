@@ -53,6 +53,7 @@ const settings = (over: Partial<AppSettings> = {}): AppSettings => ({
   board_extra_labels: "bug",
   eligible_label_waives_prd_link: "true",
   app_logo_mode: "default",
+  app_logo_preset: "",
   app_logo_keep_name: "true",
   brand_mode: "none",
   brand_company: "",
@@ -70,6 +71,7 @@ const response = (over: Partial<AppSettings> = {}): SettingsResponse => ({
 
 const branding = (over: Partial<Branding> = {}): Branding => ({
   app_logo_mode: "default",
+  app_logo_preset: "",
   app_logo_present: false,
   app_logo_keep_name: true,
   brand_mode: "none",

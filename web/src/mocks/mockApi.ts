@@ -195,6 +195,7 @@ const SEED_APP_SETTINGS: AppSettings = {
   // PRD #685: instance branding config, all string-space. Fresh installs are
   // unbranded (app_logo_mode "default", brand_mode "none").
   app_logo_mode: "default",
+  app_logo_preset: "",
   app_logo_keep_name: "true",
   brand_mode: "none",
   brand_company: "",
@@ -1788,6 +1789,7 @@ export const mockApi = {
   branding: async () =>
     delay({
       app_logo_mode: appSettings.app_logo_mode,
+      app_logo_preset: appSettings.app_logo_preset,
       app_logo_present: brandingAssets.app,
       app_logo_keep_name: appSettings.app_logo_keep_name === "true",
       brand_mode: appSettings.brand_mode,
