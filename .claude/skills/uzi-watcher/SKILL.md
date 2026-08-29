@@ -239,8 +239,9 @@ caught too, not just the checkpointed tracking ref):
   It rides through `limit_wait` (keeps snapshotting while a run is parked). This is a
   session-independent safety net; it is NOT a substitute for the pollers — keep those too.
 
-To recover from a snapshot: extract `<ts>/issue-N.tgz`, `git fetch` its bundle into a
-`recover/issue-N` branch + an ISOLATED worktree, then follow **`resume-recipe.md`** in this
+To recover from a snapshot: extract `<ts>/<stem>.tgz` (`issue-N` for an issue run,
+`task-<runid>` for a task run), `git fetch` its bundle into a `recover/<stem>` branch + an
+ISOLATED worktree, then follow **`resume-recipe.md`** in this
 skill dir for the exact land-it steps. The one gotcha worth stating here so nobody trips on
 it: **`git fetch origin main` + `git rebase origin/main` FIRST** (rebase refuses a dirty
 tree), and only THEN restore the `uncommitted.patch` / `untracked.tar.gz` the tracking ref
