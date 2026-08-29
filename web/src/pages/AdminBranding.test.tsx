@@ -208,6 +208,38 @@ describe("AdminBranding", () => {
     expect(payload.app_logo_preset).toBe("metaminds");
   });
 
+  it("ArrowRight moves tile selection (and focus) to the next tile", async () => {
+    renderPage();
+    const uziTile = await screen.findByRole("radio", { name: "uzi" });
+    // Default: the uzi tile is selected; arrow-right should advance to Metaminds.
+    fireEvent.keyDown(uziTile, { key: "ArrowRight" });
+
+    const metaminds = screen.getByRole("radio", { name: "Metaminds" });
+    expect(metaminds.getAttribute("aria-checked")).toBe("true");
+    expect(uziTile.getAttribute("aria-checked")).toBe("false");
+    // Roving tabindex + focus follow selection to the destination tile.
+    expect(document.activeElement).toBe(metaminds);
+  });
+
+  it("ArrowLeft from the first tile wraps to the last (Custom)", async () => {
+    renderPage();
+    const uziTile = await screen.findByRole("radio", { name: "uzi" });
+    fireEvent.keyDown(uziTile, { key: "ArrowLeft" });
+
+    const custom = screen.getByRole("radio", { name: "Custom" });
+    expect(custom.getAttribute("aria-checked")).toBe("true");
+    expect(document.activeElement).toBe(custom);
+  });
+
+  it("uses a roving tabindex: the selected tile is 0, an unselected tile is -1", async () => {
+    renderPage();
+    const uziTile = await screen.findByRole("radio", { name: "uzi" });
+    // Default: uzi is selected, so it is the sole Tab stop.
+    expect(uziTile.getAttribute("tabindex")).toBe("0");
+    expect(screen.getByRole("radio", { name: "Metaminds" }).getAttribute("tabindex")).toBe("-1");
+    expect(screen.getByRole("radio", { name: "Custom" }).getAttribute("tabindex")).toBe("-1");
+  });
+
   it("uploads a valid file to the app slot", async () => {
     renderPage();
     fireEvent.click(await screen.findByRole("radio", { name: "Custom" }));

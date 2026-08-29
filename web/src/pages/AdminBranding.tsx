@@ -10,7 +10,14 @@
 // the public branding() endpoint's *_present flags. See the string↔bool split note
 // on AppSettings / Branding in lib/api.ts.
 
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+  type KeyboardEvent,
+} from "react";
 import {
   api,
   ApiError,
@@ -234,6 +241,40 @@ export function AdminBranding() {
       setAppLogoPreset("");
     }
   };
+  // Roving-tabindex radiogroup (WAI-ARIA APG radio pattern): exactly one tile is a Tab
+  // stop (the selected one; the first tile when nothing is selected, e.g. mode=preset
+  // with an unknown/empty slug), and arrow/Home/End keys move selection AND DOM focus
+  // between tiles without leaving the group. Refs let a key-move focus the destination.
+  const tileRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const selectedTileIndex = appLogoTiles.findIndex(
+    (t) => t.key === selectedTileKey,
+  );
+  const rovingTabIndex = selectedTileIndex < 0 ? 0 : selectedTileIndex;
+  const onTileKeyDown = (e: KeyboardEvent<HTMLButtonElement>, index: number) => {
+    const last = appLogoTiles.length - 1;
+    let next: number | null = null;
+    switch (e.key) {
+      case "ArrowRight":
+      case "ArrowDown":
+        next = index === last ? 0 : index + 1;
+        break;
+      case "ArrowLeft":
+      case "ArrowUp":
+        next = index === 0 ? last : index - 1;
+        break;
+      case "Home":
+        next = 0;
+        break;
+      case "End":
+        next = last;
+        break;
+      default:
+        return;
+    }
+    e.preventDefault();
+    selectAppLogoTile(appLogoTiles[next]);
+    tileRefs.current[next]?.focus();
+  };
 
   return (
     <AdminShell description="Replace the app mark and add a POWERED BY brand. Fresh installs are unbranded; the license/author credit in the chrome is fixed and cannot be removed here.">
@@ -261,18 +302,23 @@ export function AdminBranding() {
                   aria-label="App logo"
                   className="flex flex-wrap gap-3"
                 >
-                  {appLogoTiles.map((tile) => {
+                  {appLogoTiles.map((tile, index) => {
                     const selected = tile.key === selectedTileKey;
                     const presetSrc =
                       tile.mode === "preset" ? presetAssetForSlug(tile.slug) : null;
                     return (
                       <button
                         key={tile.key}
+                        ref={(el) => {
+                          tileRefs.current[index] = el;
+                        }}
                         type="button"
                         role="radio"
                         aria-checked={selected}
                         aria-label={tile.label}
+                        tabIndex={index === rovingTabIndex ? 0 : -1}
                         onClick={() => selectAppLogoTile(tile)}
+                        onKeyDown={(e) => onTileKeyDown(e, index)}
                         className={
                           "flex w-24 flex-col items-center gap-2 rounded-lg border p-3 text-center transition " +
                           (selected
