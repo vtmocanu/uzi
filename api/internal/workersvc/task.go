@@ -137,8 +137,9 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 // knob. The guards check the COMPUTED integer seconds/iterations (not the raw duration): a
 // sub-second HANDOFF_RUN_TIMEOUT truncating to 0, or an iteration cap above int32 max, is
 // invalid and left NULL rather than persisting a 0 / negative / wrapped value that trips the
-// `NULL OR > 0` CHECK. Shared by CreateTaskRun and CreateThenFixRun so a then-fix keeps the
-// same non-interactive budget as its original task rather than reverting to the global default.
+// `NULL OR > 0` CHECK. Used by CreateTaskRun at create; a then-fix run instead COPIES its
+// original task's already-computed persisted budget (see CreateThenFixRun), so it is not
+// recomputed and cannot drift if config changes between the task and its fix.
 func (s *Service) handoffBudget(interactive bool) (budgetWall, budgetIters pgtype.Int4) {
 	if interactive {
 		return
@@ -226,12 +227,15 @@ var ErrThenFixAlreadyActive = errors.New("a fix run is already active for this t
 // or kind. A concurrent duplicate trips the partial unique index (23505 →
 // ErrThenFixAlreadyActive). The id is minted here for the same server-named-provenance
 // reason CreateTaskRun/CreateTaskReviewRun mint theirs.
-func (s *Service) CreateThenFixRun(ctx context.Context, userID, repoID, originalRunID uuid.UUID, branch, baseBranch, description string) (store.Run, error) {
+func (s *Service) CreateThenFixRun(ctx context.Context, userID, repoID, originalRunID uuid.UUID, branch, baseBranch, description string, budgetWall, budgetIters pgtype.Int4) (store.Run, error) {
 	id := uuid.New()
-	// A then-fix is part of the same NON-interactive handoff flow as its original task
-	// (--interactive --then-fix is rejected at the CLI), so it carries the SAME dedicated
-	// handoff budget rather than reverting to the global default for its fix phase (issue #785).
-	budgetWall, budgetIters := s.handoffBudget(false)
+	// A then-fix INHERITS the original task's persisted budget verbatim (issue #785):
+	// budgetWall / budgetIters are the original run's stored budget_wall_seconds /
+	// budget_max_iterations. Copying rather than recomputing from config means a change to
+	// HANDOFF_RUN_TIMEOUT / HANDOFF_RUN_MAX_ITERATIONS between the original task and its
+	// auto-spawned fix cannot alter the fix's budget, and the fix phase of a long
+	// non-interactive handoff keeps the same allowance instead of reverting to the global
+	// default. NULL (global fallback) exactly when the original's was NULL.
 	run, err := s.q.CreateThenFixRun(ctx, store.CreateThenFixRunParams{
 		RunID:               id,
 		UserID:              userID,

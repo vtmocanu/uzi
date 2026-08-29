@@ -116,7 +116,9 @@ uzi handoff -m "add input validation to the signup form" --interactive
   capped at the global default. An `--interactive` handoff persists neither
   dedicated budget: its iteration count falls back to the global
   `RUN_MAX_ITERATIONS`, and it is excluded from the wall-clock sweep entirely (no
-  `RUN_TIMEOUT` deadline applies), bounded instead by `WORKER_TASK_IDLE_TIMEOUT`.
+  `RUN_TIMEOUT` deadline applies) — its backstop is instead `WORKER_TASK_IDLE_TIMEOUT`,
+  which finalizes it only after it sits parked without a follow-up for that long
+  (continued follow-ups keep the session alive), not a fixed task-wide ceiling.
   See the [configuration reference](configuration.md#server-api) for the fallback
   rules.
 - **`--review`/`--mr` compose at wind-down, not at every park.** The

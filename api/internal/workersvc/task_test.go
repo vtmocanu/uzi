@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -212,28 +213,33 @@ func TestCreateTaskRunPersistsHandoffBudget(t *testing.T) {
 	})
 }
 
-// A then-fix run inherits the SAME dedicated handoff budget as its original task (issue
-// #785): the fix phase of a long non-interactive handoff must not silently revert to the
-// global RUN_TIMEOUT / RUN_MAX_ITERATIONS. CreateThenFixRun is always non-interactive
-// (--interactive --then-fix is rejected at the CLI), so it always persists the budget.
-func TestCreateThenFixRunPersistsHandoffBudget(t *testing.T) {
+// A then-fix run inherits the original task's PERSISTED budget verbatim (issue #785): the
+// fix phase of a long non-interactive handoff keeps the same allowance, and — because it
+// COPIES the stored value rather than recomputing from config — a change to the handoff
+// settings between the task and its auto-spawned fix cannot alter the fix's budget. The
+// config here is set DIFFERENT from the original's stored budget: a recompute would produce
+// 14400/10 from config, so persisting the passed-in 7200/7 proves the copy.
+func TestCreateThenFixRunCopiesOriginalBudget(t *testing.T) {
 	p := testParams()
-	p.HandoffRunTimeout = 4 * time.Hour
+	p.HandoffRunTimeout = 4 * time.Hour // config: 14400 / 10 ...
 	p.HandoffRunMaxIterations = 10
 	fs := &fakeStore{}
 	svc := New(fs, newBox(t), p)
-	if _, err := svc.CreateThenFixRun(context.Background(), uuid.New(), uuid.New(), uuid.New(), "uzi/task/abc", "main", "fix the findings"); err != nil {
+	// ... but the original task was stored with 7200 / 7 (e.g. created under earlier config).
+	origWall := pgtype.Int4{Int32: 7200, Valid: true}
+	origIters := pgtype.Int4{Int32: 7, Valid: true}
+	if _, err := svc.CreateThenFixRun(context.Background(), uuid.New(), uuid.New(), uuid.New(), "uzi/task/abc", "main", "fix the findings", origWall, origIters); err != nil {
 		t.Fatalf("CreateThenFixRun: %v", err)
 	}
 	got := fs.thenFixRunParams
 	if got == nil {
 		t.Fatal("insert did not run")
 	}
-	if !got.BudgetWallSeconds.Valid || got.BudgetWallSeconds.Int32 != 14400 {
-		t.Errorf("budget_wall_seconds = %v, want valid 14400 (same as the original task)", got.BudgetWallSeconds)
+	if !got.BudgetWallSeconds.Valid || got.BudgetWallSeconds.Int32 != 7200 {
+		t.Errorf("budget_wall_seconds = %v, want the original's stored 7200 (copied, not config's 14400)", got.BudgetWallSeconds)
 	}
-	if !got.BudgetMaxIterations.Valid || got.BudgetMaxIterations.Int32 != 10 {
-		t.Errorf("budget_max_iterations = %v, want valid 10 (same as the original task)", got.BudgetMaxIterations)
+	if !got.BudgetMaxIterations.Valid || got.BudgetMaxIterations.Int32 != 7 {
+		t.Errorf("budget_max_iterations = %v, want the original's stored 7 (copied, not config's 10)", got.BudgetMaxIterations)
 	}
 }
 

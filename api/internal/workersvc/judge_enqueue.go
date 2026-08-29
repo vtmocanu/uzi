@@ -268,7 +268,8 @@ func (s *Service) maybeEnqueueThenFix(ctx context.Context, reviewRun store.Run) 
 	}
 	desc := composeThenFixDescription(findings)
 	if _, err := s.CreateThenFixRun(ctx, original.UserID, uuid.UUID(original.RepoID.Bytes),
-		original.ID, original.Branch.String, original.BaseBranch.String, desc); err != nil {
+		original.ID, original.Branch.String, original.BaseBranch.String, desc,
+		original.BudgetWallSeconds, original.BudgetMaxIterations); err != nil {
 		if errors.Is(err, ErrThenFixAlreadyActive) {
 			return // a fix run is already active for this original — expected, not an error
 		}
