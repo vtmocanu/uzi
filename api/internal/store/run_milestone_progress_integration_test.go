@@ -606,6 +606,13 @@ func TestRunMilestoneProgressLiveDB(t *testing.T) {
 		mustExec(ctx, t, pool,
 			`UPDATE runs SET status = 'awaiting_approval', status_since = now() - interval '600 seconds',
 			     started_at = $2, worker_id = $3 WHERE id = $1`, run, startedAt, w2.ID)
+		// A sibling parked at awaiting_input on the same stale worker: the requeue banks
+		// BOTH statuses (its CASE keys on status IN ('awaiting_approval','awaiting_input')),
+		// so covering only awaiting_approval would miss a regression that drops awaiting_input.
+		runAI := newRun("claimed")
+		mustExec(ctx, t, pool,
+			`UPDATE runs SET status = 'awaiting_input', status_since = now() - interval '600 seconds',
+			     started_at = $2, worker_id = $3 WHERE id = $1`, runAI, startedAt, w2.ID)
 		// Make the worker's heartbeat stale so the requeue picks it up.
 		mustExec(ctx, t, pool,
 			`UPDATE workers SET last_heartbeat_at = now() - interval '1 hour' WHERE id = $1`, w2.ID)
@@ -617,17 +624,23 @@ func TestRunMilestoneProgressLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatalf("RequeueRunsOfStaleWorkers: %v", err)
 		}
-		found := false
+		foundApproval, foundInput := false, false
 		for _, r := range requeued {
-			if r.ID == run {
-				found = true
+			switch r.ID {
+			case run:
+				foundApproval = true
+			case runAI:
+				foundInput = true
 			}
 		}
-		if !found {
-			t.Fatalf("the stale worker's parked run must be requeued")
+		if !foundApproval || !foundInput {
+			t.Fatalf("both parked runs must be requeued (awaiting_approval=%v awaiting_input=%v)", foundApproval, foundInput)
 		}
 		if got := readPaused(run); got < 595 || got > 610 {
-			t.Fatalf("banked park time on requeue = %ds, want ~600 (595..610)", got)
+			t.Fatalf("awaiting_approval park time on requeue = %ds, want ~600 (595..610)", got)
+		}
+		if got := readPaused(runAI); got < 595 || got > 610 {
+			t.Fatalf("awaiting_input park time on requeue = %ds, want ~600 (595..610)", got)
 		}
 		// started_at must be untouched by the requeue.
 		var gotStarted time.Time
