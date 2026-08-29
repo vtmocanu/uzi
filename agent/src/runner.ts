@@ -2753,6 +2753,26 @@ export class RunRunner {
         runId,
       );
     }
+    if (claim.kind === "mr_rework") {
+      // PRD #700 / issue #778: an mr_rework run carries issue_iid = NULL and folds its
+      // work onto the MR's EXISTING branch rather than a worker-derived name. The server
+      // populates claim.branch from the run's pipeline_ref for this kind, so the MR branch
+      // (e.g. agent/issue-42) arrives here on claim.branch. runnerCloneForBranch seeds off
+      // `refs/remotes/origin/<branch>` when that branch already exists on origin — which it
+      // does for an MR under review — so the existing MR content is picked up automatically,
+      // the same mechanism the task case above relies on. A missing/empty branch is a
+      // create-time bug (an mr_rework run must carry its MR branch), so fail loudly rather
+      // than fall through to the issue path, which would throw on the NULL issue_iid.
+      const mrBranch = claim.branch?.trim();
+      if (!mrBranch)
+        throw new Error("mr_rework run claim is missing its MR branch (pipeline_ref)");
+      return this.git.runnerCloneForBranch(
+        barePath,
+        mrBranch,
+        mrBranch.replace(/\//g, "-"),
+        runId,
+      );
+    }
     if (claim.issue_iid == null)
       throw new Error("issue run claim is missing issue_iid");
     return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId);
