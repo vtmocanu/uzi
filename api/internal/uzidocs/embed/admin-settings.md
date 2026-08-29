@@ -15,7 +15,7 @@ default theme, and the run judge.
 | Setting | Default | Controls |
 |---|---|---|
 | `uzi` label | `uzi` | A run-eligibility signal: which GitLab label marks an issue as uzi's own work and makes it runnable. Assigning the issue to the uzi-bot account is the other, equivalent signal. It's the label uzi *writes* to mark an issue as its own work (Promote, a judge-filed issue, board issue creation); every board fetches its full history (any state), alongside every other open issue. See [Run eligibility](#run-eligibility). |
-| Autopilot label | `autopilot` | Which GitLab label, added alongside the `uzi` label, triggers an unattended run for an opted-in user. See [Autopilot](./autopilot.md). |
+| Autopilot label | `autopilot` | Which GitLab label, added to a run-eligible issue (one carrying the `uzi` label **or** assigned to the uzi-bot account), triggers an unattended run for an opted-in user. See [Autopilot](./autopilot.md). |
 
 ## Run eligibility
 

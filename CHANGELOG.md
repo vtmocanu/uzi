@@ -21,7 +21,7 @@ through `[0.52.0]`.)
 ### Changed
 
 - **Assigning an issue to the uzi-bot is now a run-eligibility signal too ([#767](https://github.com/vtmocanu/uzi/issues/767)).**
-  An issue carrying the `uzi` label OR assigned to the uzi-bot account is runnable; the manual Start button, autopilot's poller, and label sweeps all recognize either. A new opt-in `assigned-sweep` catalog default sweeps issues assigned to the bot on a daily cadence (`auto_approve` on, matching the existing sweeps), and the board marks a bot-assigned card runnable with no label needed. Assignment alone never starts a run: unattended execution still needs the `autopilot` label or an enabled sweep, exactly like a `uzi`-labelled issue.
+  An issue carrying the `uzi` label OR assigned to the uzi-bot account is runnable; the manual Start button and autopilot's poller recognize either signal. Existing label sweeps still match only the `uzi` label; a new opt-in `assigned-sweep` catalog default is what sweeps issues assigned to the bot on a daily cadence (`auto_approve` on, matching the existing sweeps), and the board marks a bot-assigned card runnable with no label needed. Assignment alone never starts a run: unattended execution still needs the `autopilot` label or an enabled sweep, exactly like a `uzi`-labelled issue.
 
 ## [0.68.0] - 2026-08-29
 

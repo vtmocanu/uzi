@@ -39,11 +39,12 @@ catalog-owned, so owner guidance *is* offered to steer it.
 
 ## The same gates a manual start has, plus auto-approve
 
-Pinned-issue and label-sweep fires go through the **exact run-creation path**
-autopilot uses, so the eligibility gate — an issue carrying the `uzi` label
-**or** assigned to the uzi-bot account, see [Run
+Pinned-issue, label-sweep, and assigned-sweep fires go through the **exact
+run-creation path** autopilot uses, so the eligibility gate — an issue
+carrying the `uzi` label **or** assigned to the uzi-bot account, see [Run
 eligibility](./admin-settings.md#run-eligibility) — a fresh forge fetch of
-the issue's labels, active-run dedup, and the usage-limit park all behave
+the issue's labels and assignees, active-run dedup, and the usage-limit park
+all behave
 exactly as for a manual start — a schedule can't do anything a manual start
 couldn't. A label selector only picks *candidates*; the gate still decides
 what fires. `Planned` and `bug` are pure selectors, not eligibility signals in

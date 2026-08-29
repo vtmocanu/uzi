@@ -39,8 +39,11 @@ your default unless you pointed that worker somewhere else (see
 
 ## 3. Add the label in GitLab
 
-Add the autopilot label to any issue that already carries the PRD label.
-uzi resolves *who added it*: the label adder if mapped and opted in, else
+Add the autopilot label to any issue that already carries the
+run-eligibility (`uzi`) label **or** is assigned to the uzi-bot account —
+bot assignment satisfies only the run-eligibility condition, so the
+autopilot label is still required for an unattended run. uzi resolves *who
+added it*: the label adder if mapped and opted in, else
 the issue's author, else neither — and it stops there. A run only ever
 starts for someone who has both set their forge identity and opted in, with
 the repo connected under their own account. Closed issues are never
@@ -69,7 +72,6 @@ candidates once the autopilot label lands.
   assumption it made in the run feed rather than parking.
 - **No eligible user**: one comment explaining why, and no run — never
   repeats on later polls, even across a full resync.
-- **No PRD link in the issue description**: one comment, no run.
 - **Failed run**: one comment with a link to the run, not the failure
   reason itself — the run may contain agent-supplied free text, so the
   comment points at the access-controlled run page for detail rather than
