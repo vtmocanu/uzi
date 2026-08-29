@@ -286,11 +286,11 @@ by anything on the PR itself.
    even though it will; if the findings are uzi-fixable (below) and the owner is opted in,
    give it a beat and re-check rather than racing in.
 3. **Let it finish, then decide from whether the head ACTUALLY moved — and read the ref
-   authoritatively.** Record the branch head *before* the rework (`before=$(git rev-parse
-   origin/<branch>)`), and after the run reaches terminal **`git fetch origin <branch>`
-   FIRST** — a rework-worker push does not update your local remote-tracking ref, so a bare
-   `git rev-parse origin/<branch>` reads the stale pre-rework SHA and would call a real push
-   "no commit". Then compare:
+   authoritatively.** With `BR` the PR's `agent/issue-*` branch, record its head *before*
+   the rework (`before=$(git rev-parse origin/"$BR")`), and after the run reaches terminal
+   **`git fetch origin "$BR"` FIRST** — a rework-worker push does not update your local
+   remote-tracking ref, so a bare `git rev-parse origin/"$BR"` reads the stale pre-rework
+   SHA and would call a real push "no commit". Then compare:
    - **Head advanced** → REVIEW the new commit like any other diff (`git show <sha>`). uzi
      *acting* is not uzi being *right*: confirm it addressed the finding, added no
      regression, and did not "fix" a deliberate behavior. A bad rework is a
