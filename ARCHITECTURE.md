@@ -1478,13 +1478,17 @@ on.
   can no longer drift apart), `*.anthropic.com`, `search.devbox.sh` (also
   added by PRD #808 — a deliberate egress **widening** so the devbox package
   resolver is reachable on this tier, backstopped by the server-side tier-1
-  admin allowlist rather than by egress being locked), and, as of #285, the
-  CNPG chart's OCI pair (`ghcr.io` + `pkg-containers.githubusercontent.com`,
-  replacing four GitHub-ish hosts — `github.com` is **no longer allowlisted**
-  on this tier); `api.github.com` **TIMEOUT**, measured #123 §1),
-  while the **docker** tier reaches arbitrary internet hosts by design
-  (`0.0.0.0/0`-except-in-cluster by CIDR, `worker-docker-networkpolicy.yaml`:
-  `api.github.com` **200**, `search.devbox.sh` **404**) — [PRD #50](prds/50-llm-egress-proxy.md)'s
+  admin allowlist rather than by egress being locked), `api.github.com`
+  (re-added by #818 as a devbox/nixpkgs host — `devbox install` resolves the
+  floating `nixpkgs-unstable` ref through it, forge-independent — distinct from
+  the CNPG use #285 removed), and, as of #285, the CNPG chart's OCI pair
+  (`ghcr.io` + `pkg-containers.githubusercontent.com`, replacing four
+  GitHub-ish hosts as the CNPG-fetch route). A host that stays **off**-allowlist
+  on this tier is `codeload.github.com` (the nixpkgs source tarball —
+  **TIMEOUT**, measured #818), while the **docker** tier reaches arbitrary
+  internet hosts by design (`0.0.0.0/0`-except-in-cluster by CIDR,
+  `worker-docker-networkpolicy.yaml`: `codeload.github.com` **301** completes
+  there) — [PRD #50](prds/50-llm-egress-proxy.md)'s
   residual, not a broken control. A docker-tier reading looks exactly like a
   broken standard-tier allowlist; two false alarms have resulted (an operator
   during #123, and a closed #283 on 2026-08-09), so **check `uzi admin workers`
