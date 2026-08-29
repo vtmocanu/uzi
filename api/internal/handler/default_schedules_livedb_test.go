@@ -169,6 +169,20 @@ func TestEnableCatalogScheduleTimezoneOverrideLiveDB(t *testing.T) {
 		t.Fatalf("override next_fire_at = %v, want the Bucharest instant %v", dto.NextFireAt, wantNext)
 	}
 
+	// Idempotent re-enable of the SAME repo with a DIFFERENT tz must not clobber the stored
+	// zone (issue #660 AC: no regression to idempotent re-enable). The override feeds only the
+	// initial insert; ON CONFLICT DO NOTHING returns the existing row untouched with 200.
+	reenabled, code := f.enableCatalogBody(t, f.owner.ID, f.repoID, "docs-hygiene", `{"timezone":"America/New_York"}`)
+	if code != http.StatusOK {
+		t.Fatalf("re-enable status = %d, want 200 (idempotent)", code)
+	}
+	if reenabled.ID != dto.ID {
+		t.Fatalf("re-enable returned a different schedule: %s vs %s", reenabled.ID, dto.ID)
+	}
+	if reenabled.Timezone != "Europe/Bucharest" {
+		t.Fatalf("re-enable clobbered the stored tz = %q, want the original Europe/Bucharest", reenabled.Timezone)
+	}
+
 	// An empty body keeps the catalog zone (UTC) on a second repo (the first is now enabled).
 	repoB := f.insertRepo(ctx, t, f.owner, 2, "g/sched-tz-b")
 	base, code := f.enableCatalogBody(t, f.owner.ID, repoB, "docs-hygiene", "")
