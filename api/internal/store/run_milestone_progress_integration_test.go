@@ -101,6 +101,17 @@ func TestRunMilestoneProgressLiveDB(t *testing.T) {
 		return
 	}
 
+	// readPaused returns a run's budget_paused_seconds (issue #783), which is NOT NULL.
+	readPaused := func(id uuid.UUID) int32 {
+		t.Helper()
+		var p int32
+		if err := pool.QueryRow(ctx,
+			`SELECT budget_paused_seconds FROM runs WHERE id = $1`, id).Scan(&p); err != nil {
+			t.Fatalf("read budget_paused_seconds of %s: %v", id, err)
+		}
+		return p
+	}
+
 	// readIDs decodes a jsonb id-array column into a sorted []string (nil when NULL), so
 	// set assertions are order-independent (jsonb_agg order is not guaranteed).
 	readIDs := func(id uuid.UUID, col string) []string {
@@ -468,6 +479,123 @@ func TestRunMilestoneProgressLiveDB(t *testing.T) {
 		}
 		if !got[globalOver] {
 			t.Fatalf("a NULL-budget run 3h in MUST be swept at the global 2h")
+		}
+	})
+
+	// ── Issue #783: SweepRunningTimeout EXCLUDES budget_paused_seconds (time parked at a
+	//    human gate) from the deadline, so gate-wait does not consume the wall budget. ──
+	t.Run("sweep excludes banked parked time from the wall deadline", func(t *testing.T) {
+		base := time.Now().UTC()
+		// 8h budget + 2h banked park = 10h deadline; started 9h ago → 9h < 10h → NOT swept.
+		underParked := newRun("running")
+		mustExec(ctx, t, pool,
+			`UPDATE runs SET started_at = $2, budget_wall_seconds = 28800, budget_paused_seconds = 7200 WHERE id = $1`,
+			underParked, base.Add(-9*time.Hour))
+		// Same shape but started 11h ago → 11h > 10h → swept.
+		overParked := newRun("running")
+		mustExec(ctx, t, pool,
+			`UPDATE runs SET started_at = $2, budget_wall_seconds = 28800, budget_paused_seconds = 7200 WHERE id = $1`,
+			overParked, base.Add(-11*time.Hour))
+
+		swept, err := q.SweepRunningTimeout(ctx, store.SweepRunningTimeoutParams{
+			FailureReason:        pgtype.Text{String: "run exceeded RUN_TIMEOUT", Valid: true},
+			Now:                  pgtype.Timestamptz{Time: base, Valid: true},
+			GlobalTimeoutSeconds: runTimeout,
+		})
+		if err != nil {
+			t.Fatalf("SweepRunningTimeout: %v", err)
+		}
+		got := map[uuid.UUID]bool{}
+		for _, r := range swept {
+			got[r.ID] = true
+		}
+		if got[underParked] {
+			t.Fatalf("a run 9h into an 8h budget + 2h banked park (10h deadline) must NOT be swept")
+		}
+		if !got[overParked] {
+			t.Fatalf("a run 11h into an 8h budget + 2h banked park (10h deadline) MUST be swept")
+		}
+	})
+
+	// ── Issue #783: SetRunRunning banks the park duration on a real park→running resume,
+	//    and never double-counts on the running→running heartbeat. ──
+	t.Run("running resume from awaiting_approval banks the park duration once", func(t *testing.T) {
+		run := newRun("claimed")
+		// Park it at awaiting_approval with status_since (and started_at) 600s in the past.
+		mustExec(ctx, t, pool,
+			`UPDATE runs SET status = 'awaiting_approval', status_since = now() - interval '600 seconds',
+			     started_at = now() - interval '600 seconds' WHERE id = $1`, run)
+		// Satisfy SetRunRunning's awaiting_approval resume guard with a CONSUMED approve_plan.
+		mustExec(ctx, t, pool,
+			`INSERT INTO run_user_inputs (run_id, kind, body, consumed_at) VALUES ($1, 'approve_plan', '{}', now())`, run)
+
+		setRunning := func(what string) {
+			t.Helper()
+			if _, err := q.SetRunRunning(ctx, store.SetRunRunningParams{
+				ID: run, WorkerID: workerID,
+				RunMaxIterations: runMaxIter, RunTimeoutSeconds: runTimeout,
+				MilestoneBudgetCap: budgetCap, BudgetWallCeilingSeconds: wallCeiling,
+			}); err != nil {
+				t.Fatalf("SetRunRunning (%s): %v", what, err)
+			}
+		}
+
+		setRunning("resume")
+		if got := readPaused(run); got < 595 || got > 610 {
+			t.Fatalf("banked park time after resume = %ds, want ~600 (595..610)", got)
+		}
+		// A running→running heartbeat must NOT double-count (old status is 'running' → 0).
+		setRunning("heartbeat")
+		if got := readPaused(run); got < 595 || got > 610 {
+			t.Fatalf("banked park time changed on heartbeat = %ds, want an unchanged ~600", got)
+		}
+	})
+
+	// ── Issue #783: RequeueRunsOfStaleWorkers banks park time before the worker-death
+	//    requeue → queued, and leaves started_at untouched. ──
+	t.Run("requeue of a stale worker's parked run banks the park duration", func(t *testing.T) {
+		w2, err := q.CreateWorker(ctx, store.CreateWorkerParams{
+			UserID: userID, Name: "stale", TokenHash: append([]byte("mprog-stale-"), userID[:]...),
+			AnthropicBindMode: "default",
+		})
+		if err != nil {
+			t.Fatalf("CreateWorker: %v", err)
+		}
+		run := newRun("claimed")
+		startedAt := time.Now().UTC().Add(-30 * time.Minute)
+		mustExec(ctx, t, pool,
+			`UPDATE runs SET status = 'awaiting_approval', status_since = now() - interval '600 seconds',
+			     started_at = $2, worker_id = $3 WHERE id = $1`, run, startedAt, w2.ID)
+		// Make the worker's heartbeat stale so the requeue picks it up.
+		mustExec(ctx, t, pool,
+			`UPDATE workers SET last_heartbeat_at = now() - interval '1 hour' WHERE id = $1`, w2.ID)
+
+		requeued, err := q.RequeueRunsOfStaleWorkers(ctx, store.RequeueRunsOfStaleWorkersParams{
+			MaxRequeues: 5,
+			Cutoff:      pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true},
+		})
+		if err != nil {
+			t.Fatalf("RequeueRunsOfStaleWorkers: %v", err)
+		}
+		found := false
+		for _, r := range requeued {
+			if r.ID == run {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("the stale worker's parked run must be requeued")
+		}
+		if got := readPaused(run); got < 595 || got > 610 {
+			t.Fatalf("banked park time on requeue = %ds, want ~600 (595..610)", got)
+		}
+		// started_at must be untouched by the requeue.
+		var gotStarted time.Time
+		if err := pool.QueryRow(ctx, `SELECT started_at FROM runs WHERE id = $1`, run).Scan(&gotStarted); err != nil {
+			t.Fatalf("read started_at: %v", err)
+		}
+		if d := gotStarted.Sub(startedAt); d < -2*time.Second || d > 2*time.Second {
+			t.Fatalf("started_at moved by %v on requeue, want unchanged", d)
 		}
 	})
 }
