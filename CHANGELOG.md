@@ -18,10 +18,20 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.69.0] - 2026-08-29
+
 ### Added
 
 - **Default schedules gain model-parity with custom schedules ([#691](https://github.com/vtmocanu/uzi/issues/691)).**
   An owner can now set "Apply model also to agents" (`override_subagent_model`) on a default (catalog) schedule in place — via the web modal, the API, and `uzi schedule edit --apply-model-to-agents` — instead of having to clone it first; Reset restores it to the catalog baseline (off) alongside the other editable fields. `uzi schedule edit` also gains a `--model <alias|id>` flag (empty clears back to the Worker-model default) for both custom and default schedules, closing the gap where the CLI could not change a schedule's model that the web UI and API already could.
+- **Instance branding gains named logo presets ([#780](https://github.com/vtmocanu/uzi/issues/780), [#797](https://github.com/vtmocanu/uzi/issues/797)).**
+  The admin App-logo picker replaces the default/custom dropdown with a tile radiogroup (uzi, Metaminds, or a custom upload), backed by a new `app_logo_preset` setting and a web-side preset catalog that is the single source of truth, so an unknown preset slug degrades gracefully to the stock uzi mark; the app-mark fallback element is now tagged for a non-vacuous test.
+- **Branded favicon and browser-tab title ([#688](https://github.com/vtmocanu/uzi/issues/688)).**
+  When a branded app logo is set, the browser-tab favicon becomes that logo (the run-status overlay dot still drawing on top) and the tab title follows the white-label, applied for signed-out visitors too; an unbranded instance keeps the ember factory mark.
+- **Enabling a default schedule adopts your detected timezone ([#660](https://github.com/vtmocanu/uzi/issues/660)).**
+  Enabling a catalog default job now sends the browser-detected IANA timezone so it fires in your local zone from the first run instead of the catalog's baked UTC; an idempotent re-enable never clobbers the stored zone.
+- **Owner-guidance overlay now works on sweep default schedules too ([#675](https://github.com/vtmocanu/uzi/issues/675)).**
+  The small owner-guidance overlay shipped for prompt defaults ([#662](https://github.com/vtmocanu/uzi/issues/662)) now extends to sweep-target defaults: the catalog guidance stays baked and read-only while your overlay is appended at fire time (8 KiB cap), editable from the web modal, the API, and `uzi schedule edit --guidance`.
 
 ### Changed
 
@@ -31,11 +41,27 @@ through `[0.52.0]`.)
   Completes #808's egress model by adding `api.github.com` to the shipped default FQDN allow-list and the completeness guard: `devbox install` resolves the floating `nixpkgs-unstable` ref for its generated dev-env flake via `api.github.com`, which #808 omitted, so a fresh kube-native deployment could not provision tools until now; the host is forge-independent (nixpkgs lives on GitHub) and a deliberate widening backstopped by the server-side tier-1 admin allowlist.
 - **Assigning an issue to the uzi-bot is now a run-eligibility signal too ([#767](https://github.com/vtmocanu/uzi/issues/767)).**
   An issue carrying the `uzi` label OR assigned to the uzi-bot account is runnable through the single eligibility gate, so the manual Start button, autopilot's poller, and every sweep's per-issue gate recognize either signal. Existing label sweeps still pick their candidates by label (`bug`/`Planned`, unchanged) — a candidate that is bot-assigned rather than `uzi`-labelled now fires where it was skipped before — while a new opt-in `assigned-sweep` catalog default picks bot-assigned issues that carry no selector label (`auto_approve` on, matching the existing sweeps). The board marks a bot-assigned card runnable with no label needed. Assignment alone never starts a run: unattended execution still needs the `autopilot` label or an enabled sweep, exactly like a `uzi`-labelled issue.
+- **Non-interactive handoff task runs get a dedicated 4h budget ([#785](https://github.com/vtmocanu/uzi/issues/785)).**
+  A `uzi handoff` task run is issue-less and not milestone-structured, so it never received the milestone-scaled budget and fell back to the ~2h global `RUN_TIMEOUT`, often too short; non-interactive handoffs now persist a dedicated budget from new `HANDOFF_RUN_TIMEOUT` (default 4h) and `HANDOFF_RUN_MAX_ITERATIONS` (default 10) server settings, capped at the 8h wall ceiling, while interactive handoffs keep today's idle-bounded behavior.
+- **Task and handoff runs now inherit the owner's wait-on-limit default ([#815](https://github.com/vtmocanu/uzi/issues/815)).**
+  `uzi handoff` (kind `task`) runs were the only run-creation path that ignored the owner's `wait_on_limit` default, so a user who had it on got task runs that failed on an Anthropic usage limit instead of pausing; they now resolve the owner default like every other run kind.
+- **Docker-allowlist "waiting for worker" queued reason is documented, plus an internal refactor ([#509](https://github.com/vtmocanu/uzi/issues/509)).**
+  The docker-worker allowlist queued reason is now described under the run-health docs so the cross-link from admin settings resolves to real content, and the duplicated docker allow/blocked-set computation behind the project and repo listings is consolidated into one shared helper with no behavior change.
+- **Default jobs row copy fixes ([#676](https://github.com/vtmocanu/uzi/issues/676)).**
+  The Default jobs tab no longer shows the enabled-repo count twice (the disclosure toggle is now a bare chevron; the count still reads from the green Next-run pill), and the pencil action's tooltip is relabeled from "Edit cadence" to "Edit settings" since the modal edits timezone, model, auto-approve, wait-on-limit, sweep max-issues and guidance, not only cadence.
+- **Dependency updates.**
+  The Claude Agent SDK to 0.3.240 ([#802](https://github.com/vtmocanu/uzi/pull/802)).
 
 ### Fixed
 
 - **`run_usage` no longer undercounts a broken-resume run's cost ([#632](https://github.com/vtmocanu/uzi/issues/632)).**
   When a worker restart failed to resume and started a fresh SDK session, that leg accumulated token/cost from zero under a new session row and the `run_usage_totals` rollup's MAX-per-model silently masked the smaller leg, so a run's recorded total could undercount by up to a full leg (measured live: one run recorded $64.74 against an actual $321.66). The server now stamps a defaulted `lineage_epoch` marker, bumped once when the worker signals a dropped resume (`resume_lineage_break`), and the totals view MAXes within each `(run, model, lineage_epoch)` then SUMs across epochs — recovering the masked leg. Advisory telemetry only (nothing is billed from it), and existing rows default to epoch 0 so no historical number is restated; the web run-page's own client-side usage strip stays epoch-unaware for now (tracked separately).
+- **Board auto-move now ensures the target column's label before writing it ([#800](https://github.com/vtmocanu/uzi/issues/800)).**
+  `AutoMove` was the only board column-write path that wrote forge labels without first ensuring the target column's label exists, so a missing or drifted column label (for example after the Upcoming to Planned rename) could produce a wrong color or a failed move; it now ensures the label, with the correct pinned color for a default column and the standard grey for a custom one.
+- **Milestone budget no longer counts time spent waiting at the approval gate ([#783](https://github.com/vtmocanu/uzi/issues/783)).**
+  A gated run's wall-clock budget was measured purely from `started_at`, so time parked at `awaiting_approval` or `awaiting_input` consumed the implementation budget and a slowly-approved plan (overnight, busy approver) could false-fail with `RUN_TIMEOUT` and discard its remaining milestones; each park's duration is now banked (new `budget_paused_seconds`) and added back to the timeout deadline, leaving run-duration display and health baselines unchanged.
+- **Interactive wake-guard watermark no longer strands a run on a peek/stamp race ([#559](https://github.com/vtmocanu/uzi/issues/559)).**
+  The awaiting-followup watermark was server-derived, which raced a follow-up consumed during the park report's DB round-trip and could strand a run at `awaiting_followup` until the ~30-minute sweeper; the watermark is now worker-provided and clamped server-side (floored at 0, ceilinged at the max-consumed id, with a fallback for older workers), closing the race and restoring the park-skip ownership ACK.
 
 ## [0.68.0] - 2026-08-29
 
@@ -3470,7 +3496,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.68.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.69.0...HEAD
+[0.69.0]: https://github.com/vtmocanu/uzi/compare/v0.68.0...v0.69.0
 [0.68.0]: https://github.com/vtmocanu/uzi/compare/v0.67.0...v0.68.0
 [0.67.0]: https://github.com/vtmocanu/uzi/compare/v0.66.3...v0.67.0
 [0.66.3]: https://github.com/vtmocanu/uzi/compare/v0.66.2...v0.66.3
