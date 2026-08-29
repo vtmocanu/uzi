@@ -23271,4 +23271,13 @@ cannot provision tools (it worked on the live cluster only via an interim per-cl
   SOURCE tarball, which is also blocked (the baked eval cache is root-owned `0700`, so the worker uid cannot
   reuse it). This is #123 Decision 2's "the source fetch remains" warning, confirmed. Fully removing both
   `search.devbox.sh` and `api.github.com` requires server-side store-path resolution (the api resolves to nix
-  store paths, the worker substitutes by path from `cache.nixos.org` only) — a larger, deferred design (cross-ref #123).
+  store paths, the worker substitutes by path from `cache.nixos.org` only).
+- **WON'T-DO (2026-08-30): server-side store-path resolution is not pursued.** Ruled out as a speculative
+  build: it is large and externally-coupled (the api would need to genuinely evaluate nixpkgs), while the gain
+  is only a defense-in-depth egress *tightening* — the current posture already works and is backstopped by the
+  server-side tier-1 admin allowlist regardless of worker egress. #123 already deprioritized it, and the cheap
+  alternatives were measured dead (rev-pinning trades `api.github.com` for the blocked `codeload` tarball; the
+  baked eval cache is root-`0700`). `api.github.com` and `search.devbox.sh` are low-risk read-only public hosts,
+  and credential exfil is already handled by the scrubbed provisioning env. No follow-up issue was filed.
+  **Revisit only if egress-tightening becomes a hard requirement** (e.g. a compliance mandate to drop all
+  GitHub/devbox hosts from worker egress).
