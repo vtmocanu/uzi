@@ -1054,7 +1054,6 @@ func TestScheduleEditDefaultCatalogOwnedFlagsRejected(t *testing.T) {
 		{"prompt", true, []string{"edit", "sch_dp", "--prompt", "x"}},
 		{"repo", false, []string{"edit", "sch_d", "--repo", "22222222-2222-2222-2222-222222222222"}},
 		{"at", false, []string{"edit", "sch_d", "--at", "2026-08-08T09:00:00Z"}},
-		{"apply-model-to-agents", false, []string{"edit", "sch_d", "--apply-model-to-agents=true"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1075,6 +1074,62 @@ func TestScheduleEditDefaultCatalogOwnedFlagsRejected(t *testing.T) {
 				t.Errorf("stderr = %q, want it to mention clone", errOut)
 			}
 		})
+	}
+}
+
+// TestScheduleEditDefaultApplyModelToAgents (issue #691): --apply-model-to-agents=true on a
+// default is now ACCEPTED (patchDefaultScheduleConfig reads req.OverrideSubagentModel) — the
+// positive inversion of the deleted rejection case. It exits 0, a PATCH is sent, and the
+// override lands as a non-nil true.
+func TestScheduleEditDefaultApplyModelToAgents(t *testing.T) {
+	fc := editDefaultSweepFixture("sch_d")
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_d", "--apply-model-to-agents=true")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	if fc.LastPatchSchedID == "" {
+		t.Fatal("patch should have been called, got empty id")
+	}
+	if req := fc.LastPatchSchedReq; req.OverrideSubagentModel == nil || !*req.OverrideSubagentModel {
+		t.Errorf("override_subagent_model = %v, want a non-nil true", req.OverrideSubagentModel)
+	}
+}
+
+// TestScheduleEditDefaultModel (issue #691): --model on a default is owner-editable
+// (patchDefaultScheduleConfig reads req.Model). It exits 0, a PATCH is sent, and the new
+// model lands as a non-nil "opus".
+func TestScheduleEditDefaultModel(t *testing.T) {
+	fc := editDefaultSweepFixture("sch_d")
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_d", "--model", "opus")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	if fc.LastPatchSchedID == "" {
+		t.Fatal("patch should have been called, got empty id")
+	}
+	if req := fc.LastPatchSchedReq; req.Model == nil || *req.Model != "opus" {
+		t.Errorf("model = %v, want a non-nil \"opus\"", req.Model)
+	}
+}
+
+// TestScheduleEditUserModel (issue #691, Scope B): --model on a USER schedule wires the same
+// way as the default path. It exits 0, a PATCH is sent with the new model, and the untouched
+// OverrideSubagentModel stays RESTATED from the fetch (a model edit must not disturb it).
+func TestScheduleEditUserModel(t *testing.T) {
+	fc := editModelFixture("sch_em")
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_em", "--model", "sonnet")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	if fc.LastPatchSchedID == "" {
+		t.Fatal("patch should have been called, got empty id")
+	}
+	req := fc.LastPatchSchedReq
+	if req.Model == nil || *req.Model != "sonnet" {
+		t.Errorf("model = %v, want a non-nil \"sonnet\"", req.Model)
+	}
+	if req.OverrideSubagentModel == nil || !*req.OverrideSubagentModel {
+		t.Errorf("override_subagent_model = %v, want the fetched true restated, not disturbed", req.OverrideSubagentModel)
 	}
 }
 

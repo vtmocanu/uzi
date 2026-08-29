@@ -194,6 +194,77 @@ func TestPatchDefaultScheduleCustomizedLiveDB(t *testing.T) {
 	}
 }
 
+// TestPatchDefaultOverrideSubagentModelLiveDB (issue #691): override_subagent_model is a run
+// option owner-editable on a default. A config PATCH toggling it persists AND flips
+// customized (its catalog baseline is always false, so any toggled-on value diverges); an
+// exact-restore back to false un-customizes; and Reset restores the catalog baseline (false)
+// and clears customized.
+func TestPatchDefaultOverrideSubagentModelLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	dto, code := f.enableCatalog(t, f.owner.ID, f.repoID, "docs-hygiene")
+	if code != http.StatusCreated {
+		t.Fatalf("enable status = %d, want 201", code)
+	}
+	// Fresh default: the override is at the catalog baseline (false) and the row is not customized.
+	if dto.OverrideSubagentModel == nil || *dto.OverrideSubagentModel {
+		t.Fatalf("fresh default override = %v, want a non-nil false (catalog baseline)", dto.OverrideSubagentModel)
+	}
+	if dto.Customized {
+		t.Fatal("fresh default customized = true, want false")
+	}
+
+	// Toggling override on persists and flips customized.
+	on := f.patchDefault(t, f.owner.ID, dto.ID, `{"override_subagent_model":true}`)
+	if on.OverrideSubagentModel == nil || !*on.OverrideSubagentModel {
+		t.Fatalf("patched override = %v, want a non-nil true (persisted)", on.OverrideSubagentModel)
+	}
+	if !on.Customized {
+		t.Fatal("override-on divergence: customized = false, want true")
+	}
+
+	// It really persisted: re-read via GET surfaces the toggled-on override.
+	got, gcode := f.getSchedule(t, f.owner.ID, dto.ID)
+	if gcode != http.StatusOK {
+		t.Fatalf("re-read status = %d, want 200", gcode)
+	}
+	if got.OverrideSubagentModel == nil || !*got.OverrideSubagentModel {
+		t.Fatalf("re-read override = %v, want the persisted true", got.OverrideSubagentModel)
+	}
+
+	// Toggling it back off is an exact-restore: override false AND customized cleared.
+	off := f.patchDefault(t, f.owner.ID, dto.ID, `{"override_subagent_model":false}`)
+	if off.OverrideSubagentModel == nil || *off.OverrideSubagentModel {
+		t.Fatalf("restored override = %v, want a non-nil false", off.OverrideSubagentModel)
+	}
+	if off.Customized {
+		t.Fatal("exact-restore: customized = true, want false (un-customizes)")
+	}
+
+	// Toggle on again, then Reset drops it back to the catalog baseline and un-customizes.
+	reon := f.patchDefault(t, f.owner.ID, dto.ID, `{"override_subagent_model":true}`)
+	if reon.OverrideSubagentModel == nil || !*reon.OverrideSubagentModel {
+		t.Fatalf("re-toggled override = %v, want a non-nil true", reon.OverrideSubagentModel)
+	}
+	resetReq := userReq(http.MethodPost, "/api/schedules/"+dto.ID+"/reset", "", f.owner.ID, map[string]string{"id": dto.ID})
+	resetRec := httptest.NewRecorder()
+	f.h.ResetSchedule(resetRec, resetReq)
+	if resetRec.Code != http.StatusOK {
+		t.Fatalf("reset status = %d, want 200 (body %s)", resetRec.Code, resetRec.Body.String())
+	}
+	var reset apitypes.ScheduleDTO
+	if err := json.Unmarshal(resetRec.Body.Bytes(), &reset); err != nil {
+		t.Fatalf("decode reset: %v", err)
+	}
+	if reset.OverrideSubagentModel == nil || *reset.OverrideSubagentModel {
+		t.Fatalf("reset override = %v, want the catalog baseline false restored", reset.OverrideSubagentModel)
+	}
+	if reset.Customized {
+		t.Fatal("reset customized = true, want false")
+	}
+}
+
 // cloneSchedule POSTs to /api/schedules/{id}/clone with the given (possibly empty) body and
 // returns the decoded DTO plus the status code.
 func (f scheduleFixture) cloneSchedule(t *testing.T, user uuid.UUID, id, body string) (apitypes.ScheduleDTO, int) {
