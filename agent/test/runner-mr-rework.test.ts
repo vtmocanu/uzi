@@ -98,4 +98,25 @@ describe("RunRunner — mr_rework kind (PRD #700 / issue #778)", () => {
     assert.ok(failed, "a branchless mr_rework run failed");
     assert.match(failed!.body.failure_reason ?? "", /missing its MR branch/);
   });
+
+  it("opens the MR from the rework branch with no #null in title or body", async () => {
+    // openMr is true for a non-task kind, so the finalize path runs createMergeRequest.
+    // The fake returns a fresh 201 (not the 409-adopt path production usually takes), so
+    // this exercises the description builder directly — the exact path where a missing
+    // mr_rework arm would render `Implements issue #null` / `Closes #null`.
+    const { gitlab, calls } = fakeGitlab();
+    const claim = mrReworkClaim();
+    await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
+
+    assert.equal(calls.length, 1, "the mr_rework finalize opened exactly one MR");
+    const body = JSON.parse(calls[0]!.body ?? "{}");
+    assert.equal(body.source_branch, "agent/issue-42");
+    assert.ok(!String(body.title).includes("#null"), "no #null in the MR title");
+    assert.ok(!String(body.description).includes("#null"), "no #null in the MR body");
+    assert.ok(
+      !/Closes #/.test(String(body.description)),
+      "an mr_rework MR closes no issue",
+    );
+    assert.match(String(body.description), /rework/i);
+  });
 });

@@ -3313,6 +3313,22 @@ function mrDescription(
       footer,
     ].join("\n");
   }
+  if (claim.kind === "mr_rework") {
+    // An mr_rework run (PRD #700 / issue #778) FOLDS review-comment fixes onto an MR's
+    // EXISTING branch; createMergeRequest is idempotent, so in the designed flow it
+    // adopts the already-open MR and this body is discarded. Like the prompt/task/
+    // self_improve arms above it is ISSUE-LESS (issue_iid is NULL), so it references the
+    // MR branch and `Closes` nothing — the issue fallback below would render `#null` on
+    // the off-nominal path where the branch exists but no open MR is found.
+    return [
+      "Automated MR rework (PRD #700). This run addressed review feedback on the existing",
+      `\`${branch}\` branch. There is no tracking issue, so this MR closes nothing.`,
+      ...repoMarker,
+      "",
+      "---",
+      footer,
+    ].join("\n");
+  }
   // PRD #634 M3: a partial delivery from an operator scope directive does NOT close the
   // issue — it delivered only the approved slice of milestones — so the closing line is
   // replaced with a partial-delivery statement and a scope-note blockquote is inserted.
