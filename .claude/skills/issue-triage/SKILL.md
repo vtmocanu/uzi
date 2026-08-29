@@ -27,42 +27,53 @@ picking the lowest-numbered issue in the highest non-empty tier.
 
 **Why the tiers.** A sweep fires an issue only when it has BOTH halves: (a) a
 **selector** label (`Planned`, or `bug` for a bug) AND (b) eligibility — the **`uzi`
-label**, or the issue **assigned to the uzi-bot account** (a third, label-less way
+label**, or the issue **assigned to the uzi-bot account** (a second, label-less way
 to be eligible, PRD #767); no PRD link and no admin waiver required, or relevant.
 (Authoritative mechanics, which drift: `CLAUDE.local.md` → "uzi scheduled sweeps",
 plus `docs/scheduling.md`, `docs/admin-settings.md#run-eligibility`.) An issue missing
 **either** half looks queued but silently never runs, and nobody notices — so those are
 the highest-priority triage targets, ahead of the raw backlog.
 
-The gap query below only sees GitHub **labels** (`gh issue list --json ...,labels,...`),
-not assignees — so a Tier-1A hit here (selector, no `uzi`) can be a false positive if the
-issue is already bot-assigned and genuinely eligible. A quick check before applying labels:
-`gh issue view NNN --json assignees` for the account name; if it's already assigned to the
-bot, the issue is not actually a gap.
+The gap query below reads **assignees too** when `BOT_LOGIN` is set (`gh issue list --json
+...,labels,assignees,...`), so eligibility = `uzi` label OR bot assignment: a Tier-1A hit
+already excludes bot-assigned issues, and a bot-assigned issue with no selector correctly
+surfaces as Tier-1B rather than Tier-2. When `BOT_LOGIN` is left empty the query degrades to
+label-only (today's behavior), and THEN a Tier-1A hit (selector, no `uzi`) can be a false
+positive if the issue is already bot-assigned and genuinely eligible — in that case the manual
+check still applies: `gh issue view NNN --json assignees` for the account name; if it's already
+assigned to the bot, the issue is not actually a gap.
 
-- **Tier 1 — silently un-sweepable gaps** (not parked). Two shapes:
-  - **1A selector, no `uzi`** — has `bug`/`Planned` but not `uzi`. The `bug` sweep
-    picks it as a candidate, then the gate drops it. (This is #190's shape.)
-  - **1B `uzi`, no selector** — has `uzi` but no `bug`/`Planned`, so it never even
-    becomes a candidate. Common on a fully-specced issue nobody labelled `Planned`.
+- **Tier 1 — silently un-sweepable gaps** (not parked). Two shapes (eligibility =
+  `uzi` label OR bot assignment):
+  - **1A selector, not eligible** — has `bug`/`Planned` but is neither `uzi`-labelled
+    nor bot-assigned. The `bug` sweep picks it as a candidate, then the gate drops it.
+    (This is #190's shape.)
+  - **1B eligible, no selector** — is eligible (`uzi` label OR bot-assigned) but has no
+    `bug`/`Planned`, so it never even becomes a candidate. Common on a fully-specced
+    issue nobody labelled `Planned`.
 - **Tier 2 — un-triaged backlog**: no sweep and no park label at all.
 - **Tier 3 — parked** (`brainstorm`/`Later`): propose *revisiting* only when tiers 1
   and 2 are empty — these need a human decision the sweep will never make.
 
 ```sh
-gh issue list --repo vtmocanu/uzi --state open --json number,title,labels,body --limit 400 \
-  | jq -r '
+# BOT_LOGIN is this instance's uzi-bot account login (source of truth: CLAUDE.local.md →
+# "uzi scheduled sweeps"). Leaving it empty degrades the query to label-only (today's
+# behavior) rather than erroring — a 1A hit may then be a bot-assigned false positive.
+BOT_LOGIN="${BOT_LOGIN:-}"
+gh issue list --repo vtmocanu/uzi --state open --json number,title,labels,assignees,body --limit 400 \
+  | jq -r --arg bot "$BOT_LOGIN" '
     def park: ["brainstorm","Later","In Progress","Human Review","wontfix","duplicate","invalid"];
     def names: [.labels[].name];
     def has($l): (names | index($l)) != null;
     def selector: (has("bug") or has("Planned"));
-    def fireable: has("uzi");
+    def assigned_to_bot: ($bot != "" and ([.assignees[].login] | index($bot)) != null);
+    def fireable: (has("uzi") or assigned_to_bot);
     def parked: ((names) - park) != (names);
     [ .[]
       | (if parked and (has("brainstorm") or has("Later")) then "3:parked"
          elif parked then empty
-         elif (selector and (fireable|not)) then "1A:selector-no-uzi"
-         elif (fireable and (selector|not)) then "1B:uzi-no-selector"
+         elif (selector and (fireable|not)) then "1A:selector-not-eligible"
+         elif (fireable and (selector|not)) then "1B:eligible-no-selector"
          elif (selector and fireable) then empty
          else "2:untriaged" end) as $tier
       | select($tier != null)
@@ -106,8 +117,8 @@ spec-in-body issue runs fine with just the `uzi` label.
 **For a Tier-1 gap issue, the "Send to sweep" action is just completing the missing
 half** — add only what the gap lacks, don't blindly re-add both labels:
 
-- **1A** (selector, no `uzi`): add `uzi`; the `bug`/`Planned` is already there.
-- **1B** (`uzi`, no selector): add the selector only (`Planned`, or `bug` for a bug) — `uzi` already present.
+- **1A** (selector, not eligible): add `uzi` (or assign the issue to the uzi-bot); the `bug`/`Planned` is already there.
+- **1B** (eligible, no selector): add the selector only (`Planned`, or `bug` for a bug) — eligibility (`uzi` label or bot assignment) is already satisfied.
 
 If a Tier-1 gap issue is actually deferred on purpose (that is *why* it lacks a
 selector), the fix is **Defer** — add `Later` to make the intent explicit so it stops

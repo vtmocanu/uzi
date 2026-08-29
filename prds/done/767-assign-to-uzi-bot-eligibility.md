@@ -152,7 +152,7 @@ uzi's," and the same deliberate opt-ins gate unattended execution.
   `assigned-sweep` entry); `ARCHITECTURE.md` (eligibility + forge assignee sync), `specs/ai.md`
   (decision record incl. the trust-equivalence check D6), the CHANGELOG, and the in-repo
   `.claude/skills/issue-triage` + `.claude/skills/uzi-watcher` gating mechanics (assignment is now a
-  third way to be eligible). `task gate:api`, `gate:web`, `gate:repo` green (+ store-it for
+  second way to be eligible). `task gate:api`, `gate:web`, `gate:repo` green (+ store-it for
   M1/M3/M4). Move this PRD to `prds/done/`. *Success*: docs, CLI, and skills describe assignment as
   an eligibility signal and the assigned-sweep default; gates green.
 

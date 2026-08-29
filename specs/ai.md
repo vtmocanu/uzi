@@ -23062,7 +23062,12 @@ teammate who says "this is yours" by assigning gets the same result as labelling
   cannot disagree.
 - **D1 — assignment grants eligibility ONLY; it never auto-runs.** An assigned issue becomes
   *runnable*, exactly like a `uzi`-labelled one; unattended execution still requires the `autopilot`
-  label or an enabled sweep. Assignment is not a trigger.
+  label or an enabled sweep. Assignment is not a trigger. Because assignment has no "adder" to
+  resolve, it does NOT bypass autopilot's existing label-add consent/attribution gate: the poller
+  still attributes the run to whoever added the `autopilot` label (issue author as fallback) and
+  still requires that owner to have opted in (forge identity + Anthropic token). Assignment only
+  widens which issues become candidates once the `autopilot` label lands; it never grants
+  unattended execution on its own.
 - **D2 — match on the numeric `bot_forge_user_id`, not the bot username.** `isAssignedToBot`
   decodes the `assignee_ids` set and tests membership of the connection's numeric
   `bot_forge_user_id` (carried on `forge_connections`, surfaced on the board/issue/repo DTOs as
