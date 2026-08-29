@@ -56,7 +56,7 @@ func TestContextTone(t *testing.T) {
 func TestContextMeterCell(t *testing.T) {
 	m := tuiTestModel(t, nil, "")
 
-	over := stripANSI(m.contextMeterCell(nil, contextFill{used: 224000, window: 200000, pct: 112}, 13))
+	over := stripANSI(m.contextMeterCell(nil, contextFill{pct: 112}, 13))
 	if !strings.Contains(over, "▰▰▰▰▰▰") {
 		t.Errorf("pct 112 must clamp the bar to full ▰▰▰▰▰▰:\n%q", over)
 	}
@@ -67,7 +67,7 @@ func TestContextMeterCell(t *testing.T) {
 		t.Errorf("meter must NOT carry a used/window token count (no `/`):\n%q", over)
 	}
 
-	partial := stripANSI(m.contextMeterCell(nil, contextFill{used: 124000, window: 200000, pct: 62}, 13))
+	partial := stripANSI(m.contextMeterCell(nil, contextFill{pct: 62}, 13))
 	if !strings.Contains(partial, "62%") {
 		t.Errorf("pct 62 label missing:\n%q", partial)
 	}
@@ -105,6 +105,76 @@ func TestLeadContextFillGuards(t *testing.T) {
 	}
 	if fill.pct != 50 {
 		t.Errorf("newest-VALID wins: want pct 50, got %v", fill.pct)
+	}
+}
+
+// leadFrame builds a lead-lane usage frame from a raw payload JSON, so a test can exercise the
+// exact usage/context bytes leadContextFill decodes (mirrors leadCtxMsg but with hand-written
+// payloads for the usage-gate cases).
+func leadFrame(seq int32, payload string, at time.Time) apitypes.MessageDTO {
+	agent := "lead"
+	return apitypes.MessageDTO{Seq: seq, Kind: "usage", CreatedAt: at, Agent: &agent,
+		Payload: json.RawMessage(payload)}
+}
+
+// TestLeadContextFillUsageGate — web reads `context` ONLY inside the `if (u)` branch (runUsage.ts:674),
+// so a valid context is used only when the same frame ALSO carries a valid usage OBJECT. readUsage
+// accepts any non-null object/array (empty {} counts), and rejects null/scalar/absent.
+func TestLeadContextFillUsageGate(t *testing.T) {
+	now := time.Now()
+
+	// A newer frame with valid context but NO usage key is IGNORED; an earlier frame carrying
+	// BOTH a valid usage object and context wins.
+	lanes := buildLanes([]laneFrame{
+		laneFrameFromMessage(leadFrame(1, `{"usage":{"input_tokens":1},"context":{"used":100000,"window":200000,"pct":50}}`, now.Add(-time.Minute))),
+		laneFrameFromMessage(leadFrame(2, `{"context":{"used":180000,"window":200000,"pct":90}}`, now)),
+	})
+	fill, ok := leadContextFill(lanes)
+	if !ok {
+		t.Fatal("a context-only newer frame must be skipped, letting the earlier usage+context frame win")
+	}
+	if fill.pct != 50 {
+		t.Errorf("usage-gated: want the earlier usage+context frame's pct 50, got %v", fill.pct)
+	}
+
+	// A frame with "usage":null + valid context is IGNORED (null is not a usage object).
+	lanes = buildLanes([]laneFrame{
+		laneFrameFromMessage(leadFrame(1, `{"usage":null,"context":{"used":100000,"window":200000,"pct":50}}`, now)),
+	})
+	if _, ok := leadContextFill(lanes); ok {
+		t.Error(`a frame with "usage":null must be ignored (web's readUsage rejects null)`)
+	}
+
+	// A frame with "usage":{} (empty object) + valid context IS accepted — web's rec() accepts
+	// any non-null object, the token values being irrelevant.
+	lanes = buildLanes([]laneFrame{
+		laneFrameFromMessage(leadFrame(1, `{"usage":{},"context":{"used":124000,"window":200000,"pct":62}}`, now)),
+	})
+	fill, ok = leadContextFill(lanes)
+	if !ok {
+		t.Fatal(`a frame with "usage":{} (empty object) + valid context must be accepted`)
+	}
+	if fill.pct != 62 {
+		t.Errorf(`empty-usage-object frame: want pct 62, got %v`, fill.pct)
+	}
+}
+
+// TestContextMeterCellLabelClamped — the DISPLAYED label is bounded to 4 cols ("999%") even for an
+// absurd pct, so a lead row never overflows the rail; the bar/tone still ride the true pct.
+func TestContextMeterCellLabelClamped(t *testing.T) {
+	m := tuiTestModel(t, nil, "")
+
+	row := strings.SplitN(stripANSI(
+		m.laneRow(agentLane{Key: laneLead, Role: "lead"}, false, crewIdle, "", contextFill{pct: 1e9}, true)),
+		"\n", 2)[0]
+	if w := visualWidth(row); w != laneRailWidth {
+		t.Errorf("an absurd pct must keep the row at laneRailWidth %d, got %d:\n%q", laneRailWidth, w, row)
+	}
+	if strings.Contains(row, "1000000000%") {
+		t.Errorf("the label must be clamped, not show the raw 1e9 pct:\n%q", row)
+	}
+	if !strings.Contains(row, "999%") {
+		t.Errorf("the clamped label must read 999%% for an over-999 pct:\n%q", row)
 	}
 }
 
@@ -147,7 +217,7 @@ func TestContextMeterCellToneColour(t *testing.T) {
 		// The FILLED run is the tone SGR code immediately followed by a ▰ glyph; asserting the
 		// code sits directly on ▰ (not merely somewhere in the string) pins the colour to the
 		// filled portion, distinct from the faint leading space / empty run / label.
-		raw := m.contextMeterCell(nil, contextFill{used: 1, window: 2, pct: c.pct}, 13)
+		raw := m.contextMeterCell(nil, contextFill{pct: c.pct}, 13)
 		wantFilled := "\x1b[" + c.want + "m▰"
 		if !strings.Contains(raw, wantFilled) {
 			t.Errorf("%s (pct=%v): filled run must carry tone %s directly on ▰:\n%q",
@@ -157,7 +227,7 @@ func TestContextMeterCellToneColour(t *testing.T) {
 
 	// Non-vacuity guard: the cool meter must carry NEITHER the amber NOR the alarm colour, so the
 	// test would fail if contextMeterCell ever painted one fixed accent regardless of pct.
-	cool := m.contextMeterCell(nil, contextFill{used: 1, window: 2, pct: 50}, 13)
+	cool := m.contextMeterCell(nil, contextFill{pct: 50}, 13)
 	if strings.Contains(cool, amberCode) {
 		t.Errorf("cool meter must not carry the amber (molten) colour %s:\n%q", amberCode, cool)
 	}
@@ -298,7 +368,7 @@ func TestDetailLeadContextMeterFillsRail(t *testing.T) {
 // a ·N suffix yields a shorter one, both padded to exactly 26.
 func TestContextMeterCellShrinksWithPrefix(t *testing.T) {
 	m := tuiTestModel(t, nil, "")
-	fill := contextFill{used: 124000, window: 200000, pct: 62}
+	fill := contextFill{pct: 62}
 
 	firstLine := func(s string) string {
 		return strings.SplitN(stripANSI(s), "\n", 2)[0]
