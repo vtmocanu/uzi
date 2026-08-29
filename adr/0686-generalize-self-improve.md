@@ -3,7 +3,7 @@
 **Status**: Accepted (PRD #686 M1–M5, M8–M10 implemented on branch `agent/issue-686`; M6 lands the tests-adjacent docs and this ADR, M7 lands the web toggle)
 **Date**: 2026-08-29
 **Deciders**: Vlad (maintainer) + agent team (a three-reviewer pass found the server-only fix was insufficient — see "The blocker" below); PRD #686 Decision Log (D1–D12)
-**PRD**: [prds/686-generalize-self-improve.md](../prds/686-generalize-self-improve.md) (GitHub issue [vtmocanu/uzi#686](https://github.com/vtmocanu/uzi/issues/686)) — the PRD carries the full milestone breakdown, the phasing table, and every decision's rationale in depth; this ADR records the durable invariants a future change would silently break.
+**PRD**: [prds/done/686-generalize-self-improve.md](../prds/done/686-generalize-self-improve.md) (GitHub issue [vtmocanu/uzi#686](https://github.com/vtmocanu/uzi/issues/686)) — the PRD carries the full milestone breakdown, the phasing table, and every decision's rationale in depth; this ADR records the durable invariants a future change would silently break.
 **Related**: folds in the drift fix for the #699 stale-duplicate (Part B); reuses #297's claim-time untrusted-fence in-flight mechanism (`agent/src/executor.ts` `inflightTargets`), extended to open self-improve MRs (D11).
 
 ## Decision (summary)

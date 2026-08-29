@@ -22893,7 +22893,7 @@ rationale. The M3 affinity-ceiling raise (30m→2h) is recorded at §40/§49, no
 
 ## 583. PRD #686 — Generalize `self_improve` to any repo behind a per-repo dogfood flag, and retire the long-lived self-improve branch for fresh-per-cycle branches with an open-MR cap
 
-Design record `prds/686-generalize-self-improve.md`, decision log detail in
+Design record `prds/done/686-generalize-self-improve.md`, decision log detail in
 [ADR-686](../adr/0686-generalize-self-improve.md). The scheduled `self_improve` job's content —
 server-composed description **and** the worker's trusted planning directive — was hardcoded to
 uzi even though the schedule mechanism was already generic (any user, any owned repo). This PRD
