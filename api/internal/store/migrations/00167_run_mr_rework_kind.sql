@@ -40,12 +40,15 @@ CREATE UNIQUE INDEX uq_runs_one_active_mr_rework
 -- CROSS-KIND create-time branch guard (Decision 6, the most severe review finding).
 -- ci_fix fires on RED CI and mr_rework on GREEN, so they must never share one branch
 -- (agent/issue-N) worktree concurrently — on hosted k8s there is no git "already
--- checked out" backstop. The required guard is CountActiveBranchRunsForRef (a create-
--- time count on pipeline_ref, populated AT INSERT for both kinds); this partial unique
--- index is the durable belt behind it. It subsumes uq_runs_one_active_ci_fix's
--- (repo_id, pipeline_ref) key over the ci_fix half, so existing active ci_fix rows —
--- already unique per (repo_id, pipeline_ref) by that index — cannot violate it, and no
--- mr_rework rows exist yet.
+-- checked out" backstop. The guard is now the single atomic INSERT … WHERE NOT EXISTS
+-- in CreateAutoMRReworkRun (its predicate matches an active ci_fix/mr_rework on the same
+-- pipeline_ref, populated AT INSERT for both kinds); this partial unique index is that
+-- guard's durable backstop and ALSO supplies the typed ErrBranchInUse on the
+-- concurrent-window loser — the insert whose snapshot could not see a racing sibling
+-- slips past WHERE NOT EXISTS and is arbitrated here, raising 23505 on this constraint.
+-- It subsumes uq_runs_one_active_ci_fix's (repo_id, pipeline_ref) key over the ci_fix
+-- half, so existing active ci_fix rows — already unique per (repo_id, pipeline_ref) by
+-- that index — cannot violate it, and no mr_rework rows exist yet.
 CREATE UNIQUE INDEX uq_runs_one_active_branch_ref
     ON runs (repo_id, pipeline_ref)
     WHERE kind IN ('ci_fix', 'mr_rework') AND status NOT IN ('completed', 'failed', 'cancelled');

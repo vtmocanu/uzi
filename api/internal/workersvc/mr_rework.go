@@ -38,15 +38,21 @@ var ErrActiveMRReworkExists = errors.New("an active MR-rework run already exists
 // explicitly (Decision 8), NOT via CreateRun's issue-comment fetch — and may be nil
 // (stored NULL).
 //
-// Two guards run before the insert:
-//   - the create-time CROSS-KIND branch guard (CountActiveBranchRunsForRef counts
-//     active ci_fix OR mr_rework runs on the same pipeline_ref) → ErrBranchInUse, so a
-//     ci_fix and an mr_rework never share one worktree (they fire on opposite CI
-//     states, so this only bites a genuine race);
-//   - the one-active-mr_rework-per-MR unique index (a second rework on the same MR →
-//     ErrActiveMRReworkExists).
+// A single atomic guard runs AS the insert: CreateAutoMRReworkRun is an
+// INSERT … WHERE NOT EXISTS whose predicate matches an active ci_fix OR mr_rework run
+// on the same pipeline_ref (Decision 6, the create-time CROSS-KIND branch guard), so a
+// ci_fix and an mr_rework never share one worktree (they fire on opposite CI states, so
+// this only bites a genuine race). It reports the branch is occupied two ways:
+//   - a committed sibling → zero rows inserted → pgx.ErrNoRows → ErrBranchInUse (the
+//     sequential path);
+//   - a concurrent-window sibling the INSERT's snapshot could not see → the durable
+//     uq_runs_one_active_branch_ref spanning index arbitrates and the losing insert
+//     raises 23505 on it → ErrBranchInUse.
 //
-// The detector swallows both and retries next tick, exactly as ci-autofix does.
+// A second active rework on the SAME MR is a distinct constraint: the
+// uq_runs_one_active_mr_rework unique index (23505 → ErrActiveMRReworkExists).
+//
+// The detector swallows all of these and retries next tick, exactly as ci-autofix does.
 func (s *Service) CreateAutoMRReworkRun(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, snapshot *ReviewCommentsSnapshot) (store.Run, error) {
 	// Repo-ownership / existence check, mirroring createCIFixRun so an unknown repo is
 	// a clean ErrRepoNotFound rather than an FK error at INSERT.
@@ -55,21 +61,6 @@ func (s *Service) CreateAutoMRReworkRun(ctx context.Context, userID, repoID uuid
 			return store.Run{}, ErrRepoNotFound
 		}
 		return store.Run{}, err
-	}
-
-	// Cross-kind create-time branch guard (Decision 6). pipeline_ref is populated AT
-	// INSERT for both ci_fix and mr_rework, so this count sees a freshly-created
-	// sibling — unlike the legacy runs.branch count, which is NULL for a run's whole
-	// active life.
-	active, err := s.q.CountActiveBranchRunsForRef(ctx, store.CountActiveBranchRunsForRefParams{
-		RepoID:      repoID,
-		PipelineRef: pgtype.Text{String: ref, Valid: true},
-	})
-	if err != nil {
-		return store.Run{}, err
-	}
-	if active > 0 {
-		return store.Run{}, ErrBranchInUse
 	}
 
 	// The MR review snapshot rides the create path explicitly (Decision 8). A nil
@@ -99,7 +90,18 @@ func (s *Service) CreateAutoMRReworkRun(ctx context.Context, userID, repoID uuid
 		WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
 	})
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// WHERE NOT EXISTS matched an active ci_fix/mr_rework sibling on this pipeline_ref:
+			// the branch is occupied. (Sequential path — a committed sibling is visible.)
+			return store.Run{}, ErrBranchInUse
+		}
+		if uniqueViolationOn(err, "uq_runs_one_active_branch_ref") {
+			// Concurrent-window race: the durable cross-kind spanning index arbitrated and
+			// this insert lost. A ci_fix (or another mr_rework) holds the branch → ErrBranchInUse.
+			return store.Run{}, ErrBranchInUse
+		}
 		if isUniqueViolation(err) {
+			// uq_runs_one_active_mr_rework: a second active rework on the same MR.
 			return store.Run{}, ErrActiveMRReworkExists
 		}
 		return store.Run{}, err

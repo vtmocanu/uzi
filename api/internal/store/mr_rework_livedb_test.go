@@ -2,11 +2,13 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -107,21 +109,29 @@ func TestMRReworkLiveDB(t *testing.T) {
 		t.Fatalf("green head pipeline not joined: %+v", c)
 	}
 
-	// SC4 — the create-time CROSS-KIND branch guard keys on the pipeline_ref COLUMN. An
-	// active ci_fix run created with pipeline_ref=agent/issue-7 (populated AT INSERT,
-	// NOT back-filled onto runs.branch) must be seen by CountActiveBranchRunsForRef.
+	// SC4 — the create-time CROSS-KIND branch guard is the create query's own atomic
+	// INSERT … WHERE NOT EXISTS, keyed on the pipeline_ref COLUMN. An active ci_fix run
+	// created with pipeline_ref=agent/issue-7 (populated AT INSERT, NOT back-filled onto
+	// runs.branch) occupies the branch, so a CreateAutoMRReworkRun for that SAME
+	// occupied ref matches zero rows (WHERE NOT EXISTS) and the generated :one returns
+	// pgx.ErrNoRows — the caller maps that to ErrBranchInUse. mr_iid=700 is distinct from
+	// every active mr_rework here, so the ONLY thing blocking the insert is the occupied
+	// branch, not the same-MR unique index.
 	exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_title, issue_description, pipeline_id, pipeline_ref, status)
 	      VALUES ($1, $2, $3, 'ci_fix', 't', 'd', 4242, 'agent/issue-7', 'running')`,
 		uuid.New(), inUser, repoID)
-	n, err := q.CountActiveBranchRunsForRef(ctx, store.CountActiveBranchRunsForRefParams{
-		RepoID:      repoID,
-		PipelineRef: pgtype.Text{String: "agent/issue-7", Valid: true},
-	})
-	if err != nil {
-		t.Fatalf("CountActiveBranchRunsForRef: %v", err)
-	}
-	if n != 1 {
-		t.Fatalf("cross-kind guard must see the active ci_fix on pipeline_ref, got count %d", n)
+	if _, err := q.CreateAutoMRReworkRun(ctx, store.CreateAutoMRReworkRunParams{
+		UserID:           inUser,
+		RepoID:           repoID,
+		IssueTitle:       "Rework MR review (occupied)",
+		IssueDescription: "d",
+		PipelineRef:      pgtype.Text{String: "agent/issue-7", Valid: true},
+		MrIid:            pgtype.Int8{Int64: 700, Valid: true},
+		TargetRunID:      pgtype.UUID{Bytes: src7, Valid: true},
+		ReviewComments:   []byte(`{"comments":[{"id":120}],"truncated":false}`),
+		WaitOnLimit:      false,
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("CreateAutoMRReworkRun on an occupied branch: err = %v, want pgx.ErrNoRows (WHERE NOT EXISTS → 0 rows)", err)
 	}
 
 	// The runs_kind_shape CHECK accepts a valid mr_rework row (repo_id, pipeline_ref,

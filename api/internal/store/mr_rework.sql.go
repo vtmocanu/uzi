@@ -12,41 +12,21 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const countActiveBranchRunsForRef = `-- name: CountActiveBranchRunsForRef :one
-SELECT count(*) FROM runs
-WHERE repo_id = $1::uuid
-  AND kind IN ('ci_fix', 'mr_rework')
-  AND pipeline_ref = $2
-  AND status NOT IN ('completed', 'failed', 'cancelled')
-`
-
-type CountActiveBranchRunsForRefParams struct {
-	RepoID      uuid.UUID   `json:"repo_id"`
-	PipelineRef pgtype.Text `json:"pipeline_ref"`
-}
-
-// The create-time CROSS-KIND branch guard (Decision 6, the most severe review
-// finding): count active ci_fix OR mr_rework runs whose pipeline_ref equals the
-// branch (agent/issue-N). BOTH kinds write pipeline_ref AT INSERT, so — unlike the
-// old CountActiveRunsWithBranch, which keys on runs.branch (NULL for a run's whole
-// active life) — this sees a freshly-created sibling. CreateAutoMRReworkRun calls it
-// BEFORE insert and returns ErrBranchInUse on > 0; the detector swallows and retries
-// next tick. The uq_runs_one_active_branch_ref partial index is the durable backstop.
-func (q *Queries) CountActiveBranchRunsForRef(ctx context.Context, arg CountActiveBranchRunsForRefParams) (int64, error) {
-	row := q.db.QueryRow(ctx, countActiveBranchRunsForRef, arg.RepoID, arg.PipelineRef)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
-}
-
 const createAutoMRReworkRun = `-- name: CreateAutoMRReworkRun :one
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities
-) VALUES (
+)
+SELECT
     $1, $2::uuid, 'mr_rework', $3, $4,
     $5, $6, $7, $8::jsonb, true, $9,
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $2::uuid), '{}')
+WHERE NOT EXISTS (
+    SELECT 1 FROM runs
+    WHERE repo_id = $2::uuid
+      AND kind IN ('ci_fix', 'mr_rework')
+      AND pipeline_ref = $5
+      AND status NOT IN ('completed', 'failed', 'cancelled')
 )
 RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, lineage_epoch
 `
@@ -74,6 +54,18 @@ type CreateAutoMRReworkRunParams struct {
 // is true (Decision 1 — the run resolves its own plan gate). The
 // uq_runs_one_active_mr_rework index rejects a second active rework for the same MR
 // (23505 → ErrActiveMRReworkExists). wait_on_limit is the owner's default (PRD #35).
+//
+// The create-time CROSS-KIND branch guard (Decision 6, the most severe review finding)
+// is this query's own single atomic INSERT … WHERE NOT EXISTS: the WHERE NOT EXISTS
+// predicate is byte-identical to the removed CountActiveBranchRunsForRef count — an
+// active ci_fix OR mr_rework run whose pipeline_ref equals the branch (agent/issue-N)
+// means the branch is occupied. BOTH kinds write pipeline_ref AT INSERT, so — unlike
+// the old runs.branch count (NULL for a run's whole active life) — a freshly-created
+// sibling is seen. A committed sibling → zero rows inserted → pgx.ErrNoRows, which the
+// caller maps to ErrBranchInUse. A concurrent-window sibling not yet visible to this
+// statement's snapshot slips past WHERE NOT EXISTS, and the durable spanning
+// uq_runs_one_active_branch_ref partial index arbitrates: the losing insert raises
+// 23505 on that constraint, which the caller likewise maps to ErrBranchInUse.
 func (q *Queries) CreateAutoMRReworkRun(ctx context.Context, arg CreateAutoMRReworkRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createAutoMRReworkRun,
 		arg.UserID,
@@ -296,10 +288,10 @@ type ListMRReworkCandidatesRow struct {
 
 // MR review watcher (PRD #700 M3) ---------------------------------------------
 // The candidate enumeration + loop-guard ledger the poller detector
-// (poller/mr_review_watch.go) consumes, plus the create-time cross-kind branch
-// guard and the mr_rework create path. Detection lives in the poller, never in
-// forgesvc — forgesvc's sync methods are shared with the manual board Refresh and
-// must never spawn runs.
+// (poller/mr_review_watch.go) consumes, plus the mr_rework create path whose
+// single atomic INSERT … WHERE NOT EXISTS is itself the create-time cross-kind
+// branch guard. Detection lives in the poller, never in forgesvc — forgesvc's
+// sync methods are shared with the manual board Refresh and must never spawn runs.
 // The completed issue runs in a repo whose OPEN MR is eligible for an automatic
 // mr_rework, one row per branch. Gates (Decision 9/10):
 //  1. Only issue runs open an MR review loop (chat/judge/self_improve are out of

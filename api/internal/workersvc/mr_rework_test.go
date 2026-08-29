@@ -69,20 +69,34 @@ func TestCreateAutoMRReworkRunNilSnapshotStoresNull(t *testing.T) {
 }
 
 func TestCreateAutoMRReworkRunRefusesBranchInUse(t *testing.T) {
-	// The create-time CROSS-KIND branch guard: an active ci_fix OR mr_rework run on the
-	// ref's pipeline_ref blocks the create with ErrBranchInUse (the detector swallows it).
-	fs := &fakeStore{repoRow: aValidRepoRow(), activeBranchRefRuns: 1}
+	// The create-time CROSS-KIND branch guard is now the create query's own atomic
+	// INSERT … WHERE NOT EXISTS. When a committed active ci_fix OR mr_rework sibling
+	// occupies the ref's pipeline_ref, the insert matches zero rows and the generated
+	// :one returns pgx.ErrNoRows, which the service maps to ErrBranchInUse (the detector
+	// swallows it). The insert now RUNS (the old "block before the insert" no longer holds).
+	fs := &fakeStore{repoRow: aValidRepoRow(), mrReworkRunErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())
 	if _, err := svc.CreateAutoMRReworkRun(context.Background(), uuid.New(), uuid.New(), "agent/issue-9", 9, uuid.New(), "t", "d", sampleReviewSnapshot()); err != ErrBranchInUse {
 		t.Fatalf("err = %v, want ErrBranchInUse", err)
 	}
-	if fs.mrReworkRunParams != nil {
-		t.Fatal("the branch guard must block BEFORE the insert")
+}
+
+func TestCreateAutoMRReworkRunBranchRefConflictIsBranchInUse(t *testing.T) {
+	// Concurrent-window race: the atomic INSERT's snapshot could not see a racing sibling,
+	// so it slipped past WHERE NOT EXISTS and the durable spanning index arbitrated —
+	// raising 23505 on uq_runs_one_active_branch_ref. That maps to ErrBranchInUse, NOT
+	// ErrActiveMRReworkExists (the pre-fix generic mapping got this wrong).
+	fs := &fakeStore{repoRow: aValidRepoRow(), mrReworkRunErr: &pgconn.PgError{Code: "23505", ConstraintName: "uq_runs_one_active_branch_ref"}}
+	svc := New(fs, newBox(t), testParams())
+	if _, err := svc.CreateAutoMRReworkRun(context.Background(), uuid.New(), uuid.New(), "agent/issue-9", 9, uuid.New(), "t", "d", sampleReviewSnapshot()); err != ErrBranchInUse {
+		t.Fatalf("err = %v, want ErrBranchInUse", err)
 	}
 }
 
 func TestCreateAutoMRReworkRunMapsDuplicate(t *testing.T) {
-	fs := &fakeStore{repoRow: aValidRepoRow(), mrReworkRunErr: &pgconn.PgError{Code: "23505"}}
+	// A 23505 on uq_runs_one_active_mr_rework — a second active rework on the same MR —
+	// maps to ErrActiveMRReworkExists.
+	fs := &fakeStore{repoRow: aValidRepoRow(), mrReworkRunErr: &pgconn.PgError{Code: "23505", ConstraintName: "uq_runs_one_active_mr_rework"}}
 	svc := New(fs, newBox(t), testParams())
 	if _, err := svc.CreateAutoMRReworkRun(context.Background(), uuid.New(), uuid.New(), "agent/issue-7", 55, uuid.New(), "t", "d", sampleReviewSnapshot()); err != ErrActiveMRReworkExists {
 		t.Fatalf("err = %v, want ErrActiveMRReworkExists", err)
