@@ -400,6 +400,11 @@ export interface Repo {
   // Tier-2 opt-in (PRD #18 M5): when true, a run on this repo also unions the
   // packages from the repo's own devbox.json (packages-only). Default false.
   repo_devbox_opt_in: boolean;
+  // Per-repo self-improve dogfooding capability (PRD #686): when true, a
+  // scheduled self-improvement run on this repo folds the owner's improve_uzi
+  // judge backlog into the cycle and selects the uzi-specific worker directive.
+  // Default false (a normal project gets the generic "improve this project" run).
+  repo_fold_improve_uzi_backlog: boolean;
   // Static per-repo capability hint (PRD #84 M2): a server-owned subset of the
   // capability vocabulary ({docker, jvm}). A run on this repo inherits these as its
   // required_capabilities, so the scheduler routes it only to a worker that has them.
@@ -1150,7 +1155,8 @@ export type ScheduleSkipReason =
   | "already_running"
   | "description_too_large"
   | "fetch_failed"
-  | "vault_locked";
+  | "vault_locked"
+  | "self_improve_mr_cap_reached";
 
 // One run a persisted fire actually created; issue_iid is null for a prompt schedule.
 export interface LastFireStarted {
@@ -3206,6 +3212,13 @@ const realApi = {
   setRepoDevboxOptIn: (id: string, enabled: boolean) =>
     request<{ repo: Repo }>("PATCH", `/repos/${id}`, {
       repo_devbox_opt_in: enabled,
+    }),
+  // Per-repo self-improve dogfooding capability (PRD #686). Owner or admin.
+  // Mutually exclusive in one request with the devbox/trust/caps groups, so it
+  // is sent alone.
+  setRepoFoldImproveUziBacklog: (id: string, enabled: boolean) =>
+    request<{ repo: Repo }>("PATCH", `/repos/${id}`, {
+      repo_fold_improve_uzi_backlog: enabled,
     }),
   // Static per-repo capability hint (PRD #84 M2). Owner or admin. Mutually
   // exclusive in one request with repo_devbox_opt_in and the trust flags, so it is

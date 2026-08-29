@@ -190,6 +190,85 @@ func TestPatchRepoDevboxAloneLiveDB(t *testing.T) {
 	}
 }
 
+// PRD #686 M1/M5: repo_fold_improve_uzi_backlog is its own exclusive group, mirroring
+// devbox. The owner sets it on, it round-trips in the DTO, and a follow-up patch flips it
+// back off — proving the setter writes the column both directions.
+func TestPatchRepoFoldImproveUziBacklogAloneLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newPatchRepoFixture(ctx, t)
+
+	w := f.patch(t, f.owner, f.repoID, `{"repo_fold_improve_uzi_backlog":true}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", w.Code, w.Body.String())
+	}
+	if dto := decodeRepoDTO(t, w); !dto.RepoFoldImproveUziBacklog {
+		t.Errorf("repo_fold_improve_uzi_backlog = false, want true")
+	}
+	// Flip back off — the default is false, so this proves the setter is not write-once.
+	w2 := f.patch(t, f.owner, f.repoID, `{"repo_fold_improve_uzi_backlog":false}`)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("second patch status = %d, want 200 (body %s)", w2.Code, w2.Body.String())
+	}
+	if dto := decodeRepoDTO(t, w2); dto.RepoFoldImproveUziBacklog {
+		t.Errorf("repo_fold_improve_uzi_backlog = true, want false after the follow-up patch")
+	}
+}
+
+// The admin path is unscoped for the fold flag too: an admin sets it on a repo it does
+// not own (the owner's repo, via SetRepoFoldImproveUziBacklog) and the flag lands.
+func TestPatchRepoFoldImproveUziBacklogAdminUnscopedLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newPatchRepoFixture(ctx, t)
+
+	w := f.patch(t, f.admin, f.repoID, `{"repo_fold_improve_uzi_backlog":true}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("admin status = %d, want 200 (body %s)", w.Code, w.Body.String())
+	}
+	if dto := decodeRepoDTO(t, w); !dto.RepoFoldImproveUziBacklog {
+		t.Errorf("admin patch should set the fold flag on a repo it does not own")
+	}
+}
+
+// The fold flag is mutually exclusive with the other groups (devbox and the trust flags):
+// combining it with either is a 400 and neither writes.
+func TestPatchRepoFoldExclusivity400LiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newPatchRepoFixture(ctx, t)
+
+	if w := f.patch(t, f.owner, f.repoID, `{"repo_fold_improve_uzi_backlog":true,"repo_skills_enabled":true}`); w.Code != http.StatusBadRequest {
+		t.Errorf("fold+skills status = %d, want 400", w.Code)
+	}
+	if w := f.patch(t, f.owner, f.repoID, `{"repo_fold_improve_uzi_backlog":true,"repo_devbox_opt_in":true}`); w.Code != http.StatusBadRequest {
+		t.Errorf("fold+devbox status = %d, want 400", w.Code)
+	}
+	// None of the rejected requests may have written the fold flag or its neighbours.
+	w := f.patch(t, f.owner, f.repoID, `{"repo_fold_improve_uzi_backlog":false}`)
+	dto := decodeRepoDTO(t, w)
+	if dto.RepoFoldImproveUziBacklog || dto.RepoSkillsEnabled || dto.RepoDevboxOptIn {
+		t.Errorf("a rejected combined patch must not write: got fold=%v skills=%v devbox=%v",
+			dto.RepoFoldImproveUziBacklog, dto.RepoSkillsEnabled, dto.RepoDevboxOptIn)
+	}
+}
+
+// Owner-scoping for the fold setter: the owner cannot flip the flag on the stranger's
+// repo (the *ForUser join matches nothing → 404), and nothing lands on it.
+func TestPatchRepoFoldForeignRepoIs404LiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newPatchRepoFixture(ctx, t)
+
+	if w := f.patch(t, f.owner, f.strangerRepoID, `{"repo_fold_improve_uzi_backlog":true}`); w.Code != http.StatusNotFound {
+		t.Errorf("foreign repo fold patch status = %d, want 404", w.Code)
+	}
+	// The stranger flipping their own repo works, proving the 404 was authorization.
+	w := f.patch(t, f.stranger, f.strangerRepoID, `{"repo_fold_improve_uzi_backlog":true}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("stranger patching own repo status = %d, want 200 (body %s)", w.Code, w.Body.String())
+	}
+	if dto := decodeRepoDTO(t, w); !dto.RepoFoldImproveUziBacklog {
+		t.Errorf("stranger repo_fold_improve_uzi_backlog = false, want true")
+	}
+}
+
 // Combining devbox with a trust flag is a 400 (the two paths are disjoint), and an
 // empty request is a 400 (at least one field required). Neither writes.
 func TestPatchRepoConstraint400LiveDB(t *testing.T) {

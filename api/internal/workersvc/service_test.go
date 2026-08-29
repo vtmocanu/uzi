@@ -471,6 +471,19 @@ type fakeStore struct {
 	markedSevenDay    []uuid.UUID
 	markExhaustedRows *int64
 	markExhaustedErr  error
+
+	// self_improve open-MR picker context (PRD #686 D11/D12): recentSIMRRuns is what
+	// RecentSelfImproveMRRunsForRepo returns (the recent MR-bearing self_improve candidate
+	// window); recentSIMRRunsErr fails it; recentSIMRRepos records the repo ids asked for,
+	// which proves the query is scoped to the run's repo.
+	recentSIMRRuns    []store.RecentSelfImproveMRRunsForRepoRow
+	recentSIMRRunsErr error
+	recentSIMRRepos   []uuid.UUID
+}
+
+func (f *fakeStore) RecentSelfImproveMRRunsForRepo(_ context.Context, arg store.RecentSelfImproveMRRunsForRepoParams) ([]store.RecentSelfImproveMRRunsForRepoRow, error) {
+	f.recentSIMRRepos = append(f.recentSIMRRepos, arg.RepoID)
+	return f.recentSIMRRuns, f.recentSIMRRunsErr
 }
 
 // PRD #217 M1. The park path marks the dead credential's exhausted window down to

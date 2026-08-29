@@ -2,7 +2,19 @@
 
 **Issue**: [#686](https://github.com/vtmocanu/uzi/issues/686)
 **Priority**: Medium
-**Status**: Planned
+**Status**: Done (2026-08-29)
+
+> **Implementation note (2026-08-29):** All milestones M1–M10 landed on branch
+> `agent/issue-686`. Parts A (generalize) and B (retire the long-lived branch, cap,
+> open-MR-aware pick) are both complete. `task gate:api`, `gate:agent` and `gate:web`
+> are green; the migration + amended queries are exercised by CI's `test:api-store-it`
+> live-DB job. **N3 resolved (correcting D7/Risks):** a new `ClaimResponse` field does
+> **not** cross the controller poll-wire contract — that golden carries only fleet
+> desired-state, and the existing `auto_approve`/`inflight_targets` claim fields live
+> only in the worker claim types. So `self_improve_dogfood` and `self_improve_open_mrs`
+> shipped as claim-only fields with **no controller change** and no
+> `protocol_contract_test.go` bump; the controller toolchain was out of scope. See
+> `adr/0686-generalize-self-improve.md`. Live migration head renumbered to `00172`.
 
 > **Scope note (post-review):** A three-reviewer pass found that the uzi-specific *directive*
 > is worker-side and selected by run **kind**, not by any flag — so generalizing the server

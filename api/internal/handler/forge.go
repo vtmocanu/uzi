@@ -165,6 +165,9 @@ func repoToDTO(r store.Repo) apitypes.RepoDTO {
 		RepoSkillsEnabled:   r.RepoSkillsEnabled,
 		RepoClaudemdEnabled: r.RepoClaudemdEnabled,
 		RepoDevboxOptIn:     r.RepoDevboxOptIn,
+		// PRD #686 D1: the per-repo self-improve dogfooding capability (folds the
+		// owner's improve_uzi backlog + selects the uzi worker directive). Default false.
+		RepoFoldImproveUziBacklog: r.FoldImproveUziBacklog,
 		// PRD #84 M2: the static per-repo capability hint. Filter-ed at the write path,
 		// so what the DTO surfaces is always a vocabulary-legal set. Normalized to a
 		// non-nil empty slice ([] over null) so the JSON shape is stable for the web.
@@ -924,6 +927,10 @@ type patchRepoRequest struct {
 	// server-owned vocabulary before storage, so an unknown/spoofed name is dropped and
 	// never persisted (enqueue-time validation, Decision 4).
 	RepoRequiredCapabilities *[]string `json:"required_capabilities"`
+	// RepoFoldImproveUziBacklog is the per-repo capability flag (PRD #686 M1). Pointer
+	// so an omitted field is a no-op; a present value replaces the stored flag. Its own
+	// exclusive path — cannot be combined with the devbox, trust or capability paths.
+	RepoFoldImproveUziBacklog *bool `json:"repo_fold_improve_uzi_backlog"`
 }
 
 // optBoolToPgtype maps an optional request bool to a pgtype.Bool: a nil pointer is
@@ -963,6 +970,7 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 	devboxSet := req.RepoDevboxOptIn != nil
 	trustSet := req.RepoSkillsEnabled != nil || req.RepoClaudemdEnabled != nil
 	capsSet := req.RepoRequiredCapabilities != nil
+	foldSet := req.RepoFoldImproveUziBacklog != nil
 	// Each of the three settings groups is its own exclusive path — at most one per
 	// request. b2i counts how many are present so a combined request is rejected
 	// uniformly rather than pairwise.
@@ -972,12 +980,12 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 		}
 		return 0
 	}
-	if b2i(devboxSet)+b2i(trustSet)+b2i(capsSet) > 1 {
-		httpx.Error(w, http.StatusBadRequest, "repo_devbox_opt_in, required_capabilities, and the trust flags cannot be combined in one request")
+	if b2i(devboxSet)+b2i(trustSet)+b2i(capsSet)+b2i(foldSet) > 1 {
+		httpx.Error(w, http.StatusBadRequest, "repo_devbox_opt_in, required_capabilities, repo_fold_improve_uzi_backlog, and the trust flags cannot be combined in one request")
 		return
 	}
-	if !devboxSet && !trustSet && !capsSet {
-		httpx.Error(w, http.StatusBadRequest, "provide repo_devbox_opt_in, required_capabilities, or at least one of repo_skills_enabled or repo_claudemd_enabled")
+	if !devboxSet && !trustSet && !capsSet && !foldSet {
+		httpx.Error(w, http.StatusBadRequest, "provide repo_devbox_opt_in, required_capabilities, repo_fold_improve_uzi_backlog, or at least one of repo_skills_enabled or repo_claudemd_enabled")
 		return
 	}
 
@@ -1009,6 +1017,12 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 			repo, err = h.q.SetRepoRequiredCapabilities(r.Context(), store.SetRepoRequiredCapabilitiesParams{ID: id, RequiredCapabilities: caps})
 		} else {
 			repo, err = h.q.SetRepoRequiredCapabilitiesForUser(r.Context(), store.SetRepoRequiredCapabilitiesForUserParams{ID: id, RequiredCapabilities: caps, UserID: user.ID})
+		}
+	case foldSet:
+		if user.IsAdmin {
+			repo, err = h.q.SetRepoFoldImproveUziBacklog(r.Context(), store.SetRepoFoldImproveUziBacklogParams{ID: id, FoldImproveUziBacklog: *req.RepoFoldImproveUziBacklog})
+		} else {
+			repo, err = h.q.SetRepoFoldImproveUziBacklogForUser(r.Context(), store.SetRepoFoldImproveUziBacklogForUserParams{ID: id, FoldImproveUziBacklog: *req.RepoFoldImproveUziBacklog, UserID: user.ID})
 		}
 	}
 	if err != nil {

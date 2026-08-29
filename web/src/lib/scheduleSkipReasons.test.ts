@@ -25,6 +25,7 @@ const ALL_SCHEDULE_SKIP_REASONS: ScheduleSkipReason[] = [
   "description_too_large",
   "fetch_failed",
   "vault_locked",
+  "self_improve_mr_cap_reached",
 ];
 
 function reasonsFromGo(): string[] {
@@ -37,7 +38,7 @@ function reasonsFromGo(): string[] {
     .filter((line) => !line.trimStart().startsWith("//"))
     .join("\n");
   // Anchor on the DECLARATION form `SkipXxx SkipReason = "..."` so a naive /"([a-z_]+)"/g
-  // cannot falsely capture the imported "errors" package path — only the five reason
+  // cannot falsely capture the imported "errors" package path — only the reason
   // literals match.
   return [...src.matchAll(/SkipReason\s*=\s*"([a-z_]+)"/g)].map((m) => m[1]).sort();
 }

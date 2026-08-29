@@ -578,6 +578,15 @@ var queryInventory = []queryPin{
 			"judge_issue_close_livedb_test.go. NOT pinned by any of these: the `rv.user_id = @user_id` " +
 			"owner scope itself — every fixture uses one user, so a fold that dropped the JOIN would " +
 			"still pass"},
+	{"RecentSelfImproveMRRunsForRepo", "selfimprove.sql", "TestRecentSelfImproveMRRunsForRepoLiveDB",
+		"PRD #686 D12/M9 — the bounded candidate query feeding the forge-sourced open-MR cap " +
+			"(D10) and the picker's open-MR context (D11/M10). " +
+			"TestRecentSelfImproveMRRunsForRepoLiveDB (recent_self_improve_mr_runs_livedb_test.go) " +
+			"seeds discriminating rows — a NULL-mr_iid self_improve run, an issue-kind run carrying " +
+			"an MR, and a self_improve+MR run on a DIFFERENT repo — and asserts the result is EXACTLY " +
+			"the target repo's self_improve runs with mr_iid IS NOT NULL, ordered created_at DESC and " +
+			"bounded by the LIMIT. A fold that dropped the kind, repo_id, mr_iid-not-null, ordering, " +
+			"or LIMIT clause reddens it"},
 	{"CreateSelfImproveRun", "selfimprove.sql", unpinnedPin,
 		"No live test executes it. Every caller path is faked: schedsvc/scheduler_test.go drives " +
 			"fireSelfImprove against a fakeRuns, and workersvc.Service.CreateSelfImproveRun " +

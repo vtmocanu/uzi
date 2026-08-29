@@ -3009,6 +3009,14 @@ export const mockApi = {
     r.repo_devbox_opt_in = enabled;
     return delay({ repo: { ...r } });
   },
+  // PRD #686: per-repo self-improve dogfooding capability. Owner-or-admin on the
+  // server; the mock just flips the flag and echoes the repo.
+  setRepoFoldImproveUziBacklog: async (id: string, enabled: boolean) => {
+    const r = repos.find((x) => x.id === id);
+    if (!r) throw new ApiError(404, "repo not found");
+    r.repo_fold_improve_uzi_backlog = enabled;
+    return delay({ repo: { ...r } });
+  },
   // PRD #84 M2: static per-repo capability hint. Mirrors the server's
   // capability.Filter to the {docker, jvm} vocabulary so only valid names persist.
   setRepoRequiredCapabilities: async (id: string, caps: string[]) => {

@@ -12,8 +12,8 @@ import {
   guardCriticalMrSection,
   missingDeclaredDeps,
   runSelfImproveChecks,
+  selfImproveBranch,
   selfImproveMrSection,
-  SELF_IMPROVE_BRANCH,
   SELF_IMPROVE_CHECKS,
   type CheckResult,
   type CheckRunner,
@@ -453,10 +453,15 @@ describe("selfImproveMrSection skip disclosure (M8)", () => {
 });
 
 describe("buildSelfImprovePlanPrompt", () => {
+  // Fresh-per-cycle branch (#686 M8): derived from the run id, no longer a fixed const.
+  const SELF_IMPROVE_BRANCH = selfImproveBranch("run-123");
   const prompt = buildSelfImprovePlanPrompt({
     branch: SELF_IMPROVE_BRANCH,
     recommendations: "1. [worker] install jq\n2. improve the poller",
     subagentNames: ["reviewer", "auditor"],
+    // PRD #686 M4: these assertions check the uzi-specific dogfood directive; opt in
+    // so they keep asserting that wording (m5 owns the generic-mode cases).
+    selfImproveDogfood: true,
   });
 
   it("carries the trusted directive: pick ONE, guardrails, tests, guard-path flag", () => {
@@ -508,5 +513,68 @@ describe("buildSelfImprovePlanPrompt", () => {
       buildSelfImprovePlanPrompt({ branch: SELF_IMPROVE_BRANCH, recommendations: "x", subagentNames: [] })
         .match(/<untrusted_recommendations_([0-9a-f]+)>/)![1];
     assert.notEqual(mk(), mk());
+  });
+});
+
+// PRD #686 M4/M5: the generic-vs-dogfood directive split. dogfood ⇒ uzi's own repo (the
+// historical wording); generic (the default, absent ⇒ generic per D7) ⇒ a repo-agnostic
+// directive. The load-bearing property is that a NON-dogfood run never receives ANY
+// uzi-literal instruction — no "uzi's own repository", no uzi standing rules, no
+// `go test ./...` — so an operator's arbitrary repo is never told to improve uzi.
+describe("buildSelfImprovePlanPrompt — generic vs dogfood directive (PRD #686 M4/M5)", () => {
+  const BRANCH = selfImproveBranch("run-abc");
+  const base = { branch: BRANCH, recommendations: "1. install jq", subagentNames: ["coder"] };
+  // Every uzi-literal string that must NOT leak into a generic run.
+  const UZI_LITERALS = [
+    "uzi's own repository",
+    "uzi's own standing rules",
+    "Never weaken uzi's guardrails",
+    "go test ./...",
+    "npm test` in web/ and agent/",
+  ];
+
+  it("generic (dogfood false) omits every uzi-literal directive", () => {
+    const p = buildSelfImprovePlanPrompt({ ...base, selfImproveDogfood: false });
+    for (const lit of UZI_LITERALS) {
+      assert.ok(!p.includes(lit), `generic prompt must not contain the uzi-literal ${JSON.stringify(lit)}`);
+    }
+    // And it carries the generic, repo-agnostic wording instead.
+    assert.ok(p.includes("self-improvement task on this repository."), "generic intro names 'this repository'");
+    assert.ok(p.includes("Never weaken this repository's guardrails"), "generic standing rules are repo-agnostic");
+    assert.ok(
+      p.includes("Discover and run this repository's own test and build gates"),
+      "generic run must discover the target repo's own gates, not uzi's fixed suite",
+    );
+  });
+
+  it("absent dogfood defaults to generic (D7: an older server / unflagged repo never gets uzi wording)", () => {
+    const p = buildSelfImprovePlanPrompt({ ...base }); // selfImproveDogfood undefined
+    for (const lit of UZI_LITERALS) {
+      assert.ok(!p.includes(lit), `absent-dogfood prompt must not contain the uzi-literal ${JSON.stringify(lit)}`);
+    }
+    assert.ok(p.includes("self-improvement task on this repository."));
+  });
+
+  it("dogfood (true) still carries the uzi directive (regression pin, mirrors api case 1)", () => {
+    const p = buildSelfImprovePlanPrompt({ ...base, selfImproveDogfood: true });
+    assert.ok(p.includes("uzi's own repository"));
+    assert.ok(p.includes("Never weaken uzi's guardrails"));
+    assert.ok(p.includes("go test ./..."));
+    // The generic-only wording must NOT appear in the dogfood variant.
+    assert.ok(!p.includes("self-improvement task on this repository."), "dogfood intro must not use the generic phrasing");
+  });
+
+  it("keeps the untrusted-recommendations fence invariant in BOTH variants", () => {
+    for (const dogfood of [true, false]) {
+      const p = buildSelfImprovePlanPrompt({ ...base, recommendations: "1. sensitive backlog", selfImproveDogfood: dogfood });
+      const open = p.match(/<untrusted_recommendations_([0-9a-f]+)>/);
+      assert.ok(open, `dogfood=${dogfood}: recommendations are fenced with a nonce`);
+      assert.match(p, new RegExp(`</untrusted_recommendations_${open![1]}>`), `dogfood=${dogfood}: close tag reuses the nonce`);
+      // The backlog is INSIDE the fence; the "pick exactly ONE" trusted directive is OUTSIDE it.
+      assert.ok(p.indexOf("exactly ONE") < p.indexOf(open![0]), `dogfood=${dogfood}: the trusted directive precedes the fence`);
+      const body = new RegExp(`${open![0]}\\n([\\s\\S]*?)\\n</untrusted_recommendations_${open![1]}>`).exec(p)?.[1] ?? "";
+      assert.ok(body.includes("sensitive backlog"), `dogfood=${dogfood}: the backlog sits inside the fence body`);
+      assert.ok(!body.includes("exactly ONE"), `dogfood=${dogfood}: no trusted directive leaked inside the fence`);
+    }
   });
 });

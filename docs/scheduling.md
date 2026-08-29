@@ -215,7 +215,8 @@ repo-agnostic schedules covering the standing automations most projects want
 from day one: a weekly test-improvement pass, a weekly docs-hygiene sweep, a
 deep bug-hunt audit, a feature-brainstorm prompt, daily sweeps over the
 `bug` and `Planned` labels, and self-improvement — an autonomous audit of
-uzi's own codebase. Each has a baked cron cadence and, for the four prompt
+the enabled repo's own codebase that picks one top improvement. Each has a
+baked cron cadence and, for the four prompt
 jobs, a baked prompt; the two sweeps instead carry a baked label selector;
 self-improvement carries neither, since its directive is baked into the
 worker rather than the catalog — its entry is cadence and model only (see
@@ -278,23 +279,50 @@ worker rather than the catalog — its entry is cadence and model only (see
 ### Self-improvement
 
 The `self-improve` job is a **promptless** catalog entry: rather than a baked
-prompt or label selector, its directive ("review uzi's own codebase and open
-or extend one improvement MR") is baked into the worker, so the catalog only
-carries a cadence (every two days by default) and a model. Any user can
-enable it on a repo they own — no admin gate. Each cycle:
+prompt or label selector, its directive is baked into the worker, so the
+catalog only carries a cadence (every two days by default) and a model. Any
+user can enable it on a repo they own — no admin gate. By default it is
+**generic**: "review this project's codebase and pick one top improvement."
+Each cycle:
 
-- Audits the target repo, folding in the *enabling user's own* open ["improve
-  uzi"](./judge.md) recommendations from the run judge — a recommendation
-  picked up by a cycle is marked addressed, and a user with none still gets a
-  plain codebase review.
-- Files or reuses a `uzi-self-improve`-labelled tracking issue on the repo,
-  and runs against it.
-- Opens or extends **one** merge request per cycle on a fixed branch — an
-  already-open self-improvement MR is extended rather than replaced, so
-  everything from every cycle is tested together in one MR.
+- Audits the target repo. Files or reuses a `uzi-self-improve`-labelled
+  tracking issue on the repo, and runs against it.
+- Branches **fresh off current main** for that cycle
+  (`uzi/self-improve/<run-id>`) rather than reusing one long-lived branch, so
+  the agent always plans against the current tree instead of an
+  ever-more-stale base, and opens its own merge request for the cycle.
+- If the repo already has other open self-improvement merge requests, the
+  run sees what they propose and is instructed to pick a non-overlapping
+  improvement, so concurrent cycles don't duplicate or race each other.
+
+**Concurrent-open-MR cap.** At most **2** self-improvement merge requests can
+be open on a repo at once (a fixed default, not per-schedule configurable).
+Once that many are open, further cycles are skipped — with a notification —
+until you merge or close one; nothing piles onto an existing branch and
+nothing is silently dropped.
+
+**uzi dogfooding is an explicit, per-repo capability**, not automatic
+behavior tied to any particular repo. An owner can flag a repo to fold their
+own accumulated ["improve uzi"](./judge.md) recommendations from the run
+judge into the cycle (a recommendation picked up this way is marked
+addressed, and an owner with none still gets a plain codebase review) and to
+run uzi's own trusted directive and test-suite checks instead of the generic
+ones. This is off by default for a new repo; if you already had a
+self-improve schedule before this capability existed, it was turned on for
+you automatically so nothing changed for you on upgrade. Because the
+"improve uzi" backlog belongs to you, the owner, and not to a specific
+repo, flag **exactly one** repo for it — flagging two would have them share
+(and race to mark addressed) the same backlog.
+
+**Upgrading from the old fixed-branch model?** If your repo has a
+pre-existing, long-lived `uzi/self-improve` merge request from before this
+change, close it once its work has been superseded by later cycles — an
+old, still-open MR occupies one of your two cap slots until you do.
 
 Same guardrails as any other run: `main` is never written, and a human
-always reviews and merges the MR.
+always reviews and merges the MR. See
+[ADR-686](../adr/0686-generalize-self-improve.md) for the design rationale
+behind the capability flag and the branch/cap model.
 
 ### Sweep-label guardrail
 

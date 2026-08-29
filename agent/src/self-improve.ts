@@ -1,6 +1,7 @@
 // Self-improvement run support (PRD #46 Decision 10, M5). A self_improve run is
-// the ordinary issue runner with three deltas: it works a FIXED branch so the
-// worker's idempotent createMergeRequest reuses one open MR across cycles; its MR
+// the ordinary issue runner with three deltas: it works a FRESH-PER-CYCLE branch
+// (`uzi/self-improve/<runId>`, see selfImproveBranch) so each cycle opens its own
+// merge request rather than accreting onto one long-lived branch; its MR
 // description carries its OWN test-suite evidence (the worker's own proof,
 // alongside uzi's CI which independently verifies it since PRD #52); and it flags
 // changes to guard-critical paths for extra-careful human review. The check
@@ -19,11 +20,17 @@ import { buildCheckEnv } from "./sdk-env.js";
 // the self-improve check vocabulary; sdk-env.ts is the definition.
 export { buildCheckEnv };
 
-// SELF_IMPROVE_BRANCH is the fixed branch every self_improve cycle pushes to.
-// Reusing one branch is what lets an open self-improvement MR be extended (the
-// worker's createMergeRequest is idempotent per branch, git.ts pushBranch never
-// forces), so successive cycles are tested together (Decision 10).
-export const SELF_IMPROVE_BRANCH = "uzi/self-improve";
+// selfImproveBranch derives the branch a self_improve cycle pushes to. It is
+// FRESH PER CYCLE, keyed on the run id (`uzi/self-improve/<runId>`) — the same
+// runId-derived shape the prompt runs use (`uzi/prompt-<runId>`). Each cycle branches
+// off current main and opens its OWN merge request; there is no long-lived fixed
+// branch accreting across cycles. Because the name derives from runId (and the reseed
+// keys the tracking ref on runId too), a RESUMED cycle reuses its own branch, while a
+// new cycle — a distinct run with a distinct runId — gets a distinct, collision-free
+// branch, so the worker's idempotent createMergeRequest opens exactly one MR per cycle.
+export function selfImproveBranch(runId: string): string {
+  return `uzi/self-improve/${runId}`;
+}
 
 // GUARD_CRITICAL_PATTERNS match the paths whose change most needs careful human
 // review (Decision 10, audit C1): a self_improve MR touching any of them is flagged

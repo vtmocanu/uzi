@@ -126,7 +126,7 @@ SET guardrail_override_reason = NULL,
     guardrail_override_by     = NULL,
     guardrail_override_at     = NULL
 WHERE id = $1
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog
 `
 
 // PRD #66 M8 (D8): revoke the admin per-repo override, re-arming the guardrail
@@ -151,6 +151,7 @@ func (q *Queries) ClearRepoGuardrailOverride(ctx context.Context, id uuid.UUID) 
 		&i.GuardrailOverrideBy,
 		&i.GuardrailOverrideAt,
 		&i.RequiredCapabilities,
+		&i.FoldImproveUziBacklog,
 	)
 	return i, err
 }
@@ -454,7 +455,7 @@ func (q *Queries) GetRepoByID(ctx context.Context, id uuid.UUID) (GetRepoByIDRow
 
 const getRepoForUser = `-- name: GetRepoForUser :one
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
-       r.default_branch, r.enabled,
+       r.default_branch, r.enabled, r.fold_improve_uzi_backlog,
        r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id, c.bot_forge_user_id
 FROM repos r
@@ -475,6 +476,7 @@ type GetRepoForUserRow struct {
 	WebUrl                  string             `json:"web_url"`
 	DefaultBranch           pgtype.Text        `json:"default_branch"`
 	Enabled                 bool               `json:"enabled"`
+	FoldImproveUziBacklog   bool               `json:"fold_improve_uzi_backlog"`
 	GuardrailOverrideReason pgtype.Text        `json:"guardrail_override_reason"`
 	GuardrailOverrideBy     pgtype.UUID        `json:"guardrail_override_by"`
 	GuardrailOverrideAt     pgtype.Timestamptz `json:"guardrail_override_at"`
@@ -501,6 +503,7 @@ func (q *Queries) GetRepoForUser(ctx context.Context, arg GetRepoForUserParams) 
 		&i.WebUrl,
 		&i.DefaultBranch,
 		&i.Enabled,
+		&i.FoldImproveUziBacklog,
 		&i.GuardrailOverrideReason,
 		&i.GuardrailOverrideBy,
 		&i.GuardrailOverrideAt,
@@ -605,7 +608,7 @@ func (q *Queries) ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]Boa
 }
 
 const listEnabledReposByConnection = `-- name: ListEnabledReposByConnection :many
-SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities FROM repos WHERE connection_id = $1 AND enabled = true
+SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog FROM repos WHERE connection_id = $1 AND enabled = true
 ORDER BY path_with_namespace ASC
 `
 
@@ -636,6 +639,7 @@ func (q *Queries) ListEnabledReposByConnection(ctx context.Context, connectionID
 			&i.GuardrailOverrideBy,
 			&i.GuardrailOverrideAt,
 			&i.RequiredCapabilities,
+			&i.FoldImproveUziBacklog,
 		); err != nil {
 			return nil, err
 		}
@@ -648,7 +652,7 @@ func (q *Queries) ListEnabledReposByConnection(ctx context.Context, connectionID
 }
 
 const listEnabledReposForUser = `-- name: ListEnabledReposForUser :many
-SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities FROM repos r
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities, r.fold_improve_uzi_backlog FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE c.user_id = $1 AND r.enabled = true
 ORDER BY r.path_with_namespace ASC
@@ -679,6 +683,7 @@ func (q *Queries) ListEnabledReposForUser(ctx context.Context, userID uuid.UUID)
 			&i.GuardrailOverrideBy,
 			&i.GuardrailOverrideAt,
 			&i.RequiredCapabilities,
+			&i.FoldImproveUziBacklog,
 		); err != nil {
 			return nil, err
 		}
@@ -1175,7 +1180,7 @@ func (q *Queries) ListPRDLinkPatchCandidates(ctx context.Context, arg ListPRDLin
 }
 
 const listReposByConnectionForUser = `-- name: ListReposByConnectionForUser :many
-SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities FROM repos r
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities, r.fold_improve_uzi_backlog FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE r.connection_id = $1 AND c.user_id = $2
 ORDER BY r.path_with_namespace ASC
@@ -1211,6 +1216,7 @@ func (q *Queries) ListReposByConnectionForUser(ctx context.Context, arg ListRepo
 			&i.GuardrailOverrideBy,
 			&i.GuardrailOverrideAt,
 			&i.RequiredCapabilities,
+			&i.FoldImproveUziBacklog,
 		); err != nil {
 			return nil, err
 		}
@@ -1309,7 +1315,7 @@ func (q *Queries) SetForgeConnectionHumanUsername(ctx context.Context, arg SetFo
 }
 
 const setRepoDevboxOptIn = `-- name: SetRepoDevboxOptIn :one
-UPDATE repos SET repo_devbox_opt_in = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities
+UPDATE repos SET repo_devbox_opt_in = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog
 `
 
 type SetRepoDevboxOptInParams struct {
@@ -1337,6 +1343,7 @@ func (q *Queries) SetRepoDevboxOptIn(ctx context.Context, arg SetRepoDevboxOptIn
 		&i.GuardrailOverrideBy,
 		&i.GuardrailOverrideAt,
 		&i.RequiredCapabilities,
+		&i.FoldImproveUziBacklog,
 	)
 	return i, err
 }
@@ -1345,7 +1352,7 @@ const setRepoDevboxOptInForUser = `-- name: SetRepoDevboxOptInForUser :one
 UPDATE repos SET repo_devbox_opt_in = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog
 `
 
 type SetRepoDevboxOptInForUserParams struct {
@@ -1374,6 +1381,7 @@ func (q *Queries) SetRepoDevboxOptInForUser(ctx context.Context, arg SetRepoDevb
 		&i.GuardrailOverrideBy,
 		&i.GuardrailOverrideAt,
 		&i.RequiredCapabilities,
+		&i.FoldImproveUziBacklog,
 	)
 	return i, err
 }
@@ -1382,7 +1390,7 @@ const setRepoEnabledForUser = `-- name: SetRepoEnabledForUser :one
 UPDATE repos SET enabled = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog
 `
 
 type SetRepoEnabledForUserParams struct {
@@ -1409,6 +1417,80 @@ func (q *Queries) SetRepoEnabledForUser(ctx context.Context, arg SetRepoEnabledF
 		&i.GuardrailOverrideBy,
 		&i.GuardrailOverrideAt,
 		&i.RequiredCapabilities,
+		&i.FoldImproveUziBacklog,
+	)
+	return i, err
+}
+
+const setRepoFoldImproveUziBacklog = `-- name: SetRepoFoldImproveUziBacklog :one
+UPDATE repos SET fold_improve_uzi_backlog = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog
+`
+
+type SetRepoFoldImproveUziBacklogParams struct {
+	ID                    uuid.UUID `json:"id"`
+	FoldImproveUziBacklog bool      `json:"fold_improve_uzi_backlog"`
+}
+
+// Admin path for the per-repo capability flag (PRD #686 M1): not scoped to the owning
+// user; gated on the caller being an admin in the handler.
+func (q *Queries) SetRepoFoldImproveUziBacklog(ctx context.Context, arg SetRepoFoldImproveUziBacklogParams) (Repo, error) {
+	row := q.db.QueryRow(ctx, setRepoFoldImproveUziBacklog, arg.ID, arg.FoldImproveUziBacklog)
+	var i Repo
+	err := row.Scan(
+		&i.ID,
+		&i.ConnectionID,
+		&i.ForgeProjectID,
+		&i.PathWithNamespace,
+		&i.WebUrl,
+		&i.DefaultBranch,
+		&i.Enabled,
+		&i.RepoSkillsEnabled,
+		&i.RepoDevboxOptIn,
+		&i.RepoClaudemdEnabled,
+		&i.GuardrailOverrideReason,
+		&i.GuardrailOverrideBy,
+		&i.GuardrailOverrideAt,
+		&i.RequiredCapabilities,
+		&i.FoldImproveUziBacklog,
+	)
+	return i, err
+}
+
+const setRepoFoldImproveUziBacklogForUser = `-- name: SetRepoFoldImproveUziBacklogForUser :one
+UPDATE repos SET fold_improve_uzi_backlog = $2
+WHERE repos.id = $1
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog
+`
+
+type SetRepoFoldImproveUziBacklogForUserParams struct {
+	ID                    uuid.UUID `json:"id"`
+	FoldImproveUziBacklog bool      `json:"fold_improve_uzi_backlog"`
+	UserID                uuid.UUID `json:"user_id"`
+}
+
+// Per-repo capability flag (PRD #686 M1) toggle, authorized through the repo's owning
+// connection. A non-owned or unknown id returns no rows (404). Mirrors
+// SetRepoDevboxOptInForUser's owner scoping.
+func (q *Queries) SetRepoFoldImproveUziBacklogForUser(ctx context.Context, arg SetRepoFoldImproveUziBacklogForUserParams) (Repo, error) {
+	row := q.db.QueryRow(ctx, setRepoFoldImproveUziBacklogForUser, arg.ID, arg.FoldImproveUziBacklog, arg.UserID)
+	var i Repo
+	err := row.Scan(
+		&i.ID,
+		&i.ConnectionID,
+		&i.ForgeProjectID,
+		&i.PathWithNamespace,
+		&i.WebUrl,
+		&i.DefaultBranch,
+		&i.Enabled,
+		&i.RepoSkillsEnabled,
+		&i.RepoDevboxOptIn,
+		&i.RepoClaudemdEnabled,
+		&i.GuardrailOverrideReason,
+		&i.GuardrailOverrideBy,
+		&i.GuardrailOverrideAt,
+		&i.RequiredCapabilities,
+		&i.FoldImproveUziBacklog,
 	)
 	return i, err
 }
@@ -1419,7 +1501,7 @@ SET guardrail_override_reason = $2,
     guardrail_override_by     = $3,
     guardrail_override_at     = $4
 WHERE id = $1
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog
 `
 
 type SetRepoGuardrailOverrideParams struct {
@@ -1458,12 +1540,13 @@ func (q *Queries) SetRepoGuardrailOverride(ctx context.Context, arg SetRepoGuard
 		&i.GuardrailOverrideBy,
 		&i.GuardrailOverrideAt,
 		&i.RequiredCapabilities,
+		&i.FoldImproveUziBacklog,
 	)
 	return i, err
 }
 
 const setRepoRequiredCapabilities = `-- name: SetRepoRequiredCapabilities :one
-UPDATE repos SET required_capabilities = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities
+UPDATE repos SET required_capabilities = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog
 `
 
 type SetRepoRequiredCapabilitiesParams struct {
@@ -1492,6 +1575,7 @@ func (q *Queries) SetRepoRequiredCapabilities(ctx context.Context, arg SetRepoRe
 		&i.GuardrailOverrideBy,
 		&i.GuardrailOverrideAt,
 		&i.RequiredCapabilities,
+		&i.FoldImproveUziBacklog,
 	)
 	return i, err
 }
@@ -1500,7 +1584,7 @@ const setRepoRequiredCapabilitiesForUser = `-- name: SetRepoRequiredCapabilities
 UPDATE repos SET required_capabilities = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog
 `
 
 type SetRepoRequiredCapabilitiesForUserParams struct {
@@ -1531,6 +1615,7 @@ func (q *Queries) SetRepoRequiredCapabilitiesForUser(ctx context.Context, arg Se
 		&i.GuardrailOverrideBy,
 		&i.GuardrailOverrideAt,
 		&i.RequiredCapabilities,
+		&i.FoldImproveUziBacklog,
 	)
 	return i, err
 }
@@ -1540,7 +1625,7 @@ UPDATE repos SET
   repo_skills_enabled   = COALESCE($1, repo_skills_enabled),
   repo_claudemd_enabled = COALESCE($2, repo_claudemd_enabled)
 WHERE repos.id = $3
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog
 `
 
 type SetRepoTrustFlagsParams struct {
@@ -1571,6 +1656,7 @@ func (q *Queries) SetRepoTrustFlags(ctx context.Context, arg SetRepoTrustFlagsPa
 		&i.GuardrailOverrideBy,
 		&i.GuardrailOverrideAt,
 		&i.RequiredCapabilities,
+		&i.FoldImproveUziBacklog,
 	)
 	return i, err
 }
@@ -1581,7 +1667,7 @@ UPDATE repos SET
   repo_claudemd_enabled = COALESCE($2, repo_claudemd_enabled)
 WHERE repos.id = $3
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $4)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog
 `
 
 type SetRepoTrustFlagsForUserParams struct {
@@ -1616,6 +1702,7 @@ func (q *Queries) SetRepoTrustFlagsForUser(ctx context.Context, arg SetRepoTrust
 		&i.GuardrailOverrideBy,
 		&i.GuardrailOverrideAt,
 		&i.RequiredCapabilities,
+		&i.FoldImproveUziBacklog,
 	)
 	return i, err
 }
@@ -1849,7 +1936,7 @@ ON CONFLICT (connection_id, forge_project_id) DO UPDATE
 SET path_with_namespace = EXCLUDED.path_with_namespace,
     web_url             = EXCLUDED.web_url,
     default_branch      = EXCLUDED.default_branch
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog
 `
 
 type UpsertRepoParams struct {
@@ -1887,6 +1974,7 @@ func (q *Queries) UpsertRepo(ctx context.Context, arg UpsertRepoParams) (Repo, e
 		&i.GuardrailOverrideBy,
 		&i.GuardrailOverrideAt,
 		&i.RequiredCapabilities,
+		&i.FoldImproveUziBacklog,
 	)
 	return i, err
 }

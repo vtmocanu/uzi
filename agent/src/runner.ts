@@ -50,8 +50,8 @@ import {
   flagGuardPaths,
   guardCriticalMrSection,
   runSelfImproveChecks,
+  selfImproveBranch,
   selfImproveMrSection,
-  SELF_IMPROVE_BRANCH,
   type CheckRunner,
 } from "./self-improve.js";
 import { installJsDeps } from "./js-deps.js";
@@ -970,6 +970,11 @@ export class RunRunner {
         memory,
         // Issue #297: the self_improve in-flight avoid-set (best-effort; absent ⇒ empty).
         inflightTargets: claim.inflight_targets,
+        // PRD #686 D11: the open self-improve MRs' "what was proposed" text (best-effort;
+        // absent ⇒ empty, so the picker's non-overlap block is simply omitted).
+        openSelfImproveMRs: claim.self_improve_open_mrs,
+        // PRD #686 M4: dogfood flag (absent ⇒ generic; older server never sets it).
+        selfImproveDogfood: claim.self_improve_dogfood,
         config: claim.config,
         // Preflighted above: the claim's id, or undefined when its transcript is not
         // on this worker (issue #105).
@@ -1550,7 +1555,13 @@ export class RunRunner {
       // gathered before the push so the MR opens with its evidence, and a suite that
       // can't run is reported "skipped", never failing the run.
       let selfImproveSection: string | undefined;
-      if (claim.kind === "self_improve") {
+      // PRD #686 M4: uzi's SELF_IMPROVE_CHECKS (go test ./..., web/agent npm test,
+      // web build) are hardcoded to uzi's OWN layout and are meaningless against an
+      // arbitrary target repo, so this evidence block runs ONLY in dogfood mode. In
+      // generic mode it is skipped: selfImproveSection stays unset and no uzi-shaped
+      // check/guard-path evidence is produced — the generic plan directive already
+      // told the agent to discover and run the target repo's own gates during the run.
+      if (claim.kind === "self_improve" && claim.self_improve_dogfood) {
         batcher.emit({
           kind: "status",
           agent: "worker",
@@ -2690,25 +2701,30 @@ export class RunRunner {
       );
     }
     if (claim.kind === "self_improve") {
-      // The FIXED branch (PRD #46 Decision 10): reused every cycle so the worker's
-      // idempotent createMergeRequest extends one open MR rather than opening a new
-      // one, and successive cycles are tested together.
+      // A FRESH-PER-CYCLE branch (PRD #46 Decision 10, #686 M8): each cycle branches
+      // off current main and derives a distinct `uzi/self-improve/<runId>` name, so the
+      // worker's idempotent createMergeRequest opens a NEW merge request each cycle —
+      // no long-lived fixed branch accreting across cycles. This mirrors the prompt
+      // block below: the run_id makes the branch unique and collision-free, and it also
+      // seeds the tracking-ref ownership anchor, so a RESUMED cycle reuses its own
+      // branch while a new cycle gets its own.
+      const selfImproveBranchName = selfImproveBranch(runId);
       return this.git.runnerCloneForBranch(
         barePath,
-        SELF_IMPROVE_BRANCH,
-        SELF_IMPROVE_BRANCH.replace(/\//g, "-"),
+        selfImproveBranchName,
+        selfImproveBranchName.replace(/\//g, "-"),
         runId,
       );
     }
     if (claim.kind === "prompt") {
       // An ad-hoc SCHEDULED prompt run (PRD #241 Decision 10) is repo-ful and
       // ISSUE-LESS — the ci_fix shape, not self_improve (which carries a tracking
-      // issue and reuses a FIXED branch across cycles). With no issue_iid there is
-      // no agent/issue-{iid} branch to key on, so derive a stable branch from the
-      // run id. Each fired prompt run is a distinct run, so `uzi/prompt-{runId}` is
-      // unique and collision-free — the worker's idempotent createMergeRequest opens
-      // exactly one MR for it (no fixed-branch reuse, unlike self_improve). The
-      // run_id also seeds the tracking-ref ownership anchor above.
+      // issue, though both now derive a fresh-per-cycle branch from the run id). With
+      // no issue_iid there is no agent/issue-{iid} branch to key on, so derive a stable
+      // branch from the run id. Each fired prompt run is a distinct run, so
+      // `uzi/prompt-{runId}` is unique and collision-free — the worker's idempotent
+      // createMergeRequest opens exactly one MR for it. The run_id also seeds the
+      // tracking-ref ownership anchor above.
       const promptBranch = `uzi/prompt-${runId}`;
       return this.git.runnerCloneForBranch(
         barePath,
