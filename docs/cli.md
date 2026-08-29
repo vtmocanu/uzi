@@ -302,7 +302,7 @@ A few worth knowing:
   (owner steering is editable there — a partial edit restates the stored guidance
   so it is not wiped; on a sweep default the guidance is an **overlay** composed
   onto the read-only baked catalog guidance at fire time); the catalog-owned fields
-  (`--prompt`, `--label`, `--repo`, timing, and `--guidance` on an issue default)
+  (`--prompt`, `--label`, `--repo`, `--at`, and `--guidance` on an issue default)
   require `uzi schedule clone` first. Changing a sweep schedule's `--label`
   selector runs the same advisory sweep-label guardrail as `create`/`catalog
   enable`: it `WARNING`s (to stderr) on any newly-set label missing on the

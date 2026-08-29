@@ -249,8 +249,10 @@ worker rather than the catalog — its entry is cadence and model only (see
   a fully editable copy. Cloning a default **unlocks the prompt**: the baked
   text is copied onto the new schedule as ordinary, editable content, and it
   stops tracking the catalog (a later catalog update no longer reaches it).
-  Cloning into a different repo than the source is how you replicate a
-  schedule across repos.
+  Cloning a **sweep** default instead copies the read-only baked catalog
+  guidance into the new row's editable guidance, without carrying over any
+  owner guidance overlay you had added. Cloning into a different repo than
+  the source is how you replicate a schedule across repos.
 - **Auto-approve, on by default.** Like any new schedule, a default is
   created with auto-approve and wait-on-limit both on — the point of a
   default is that it runs unattended off-hours. Every default job only opens
