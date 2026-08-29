@@ -151,10 +151,15 @@ export function useFavicon({
   // IMAGE changed under the same state, which the guard would otherwise swallow.
   useEffect(() => {
     if (!appLogoSrc) {
-      // Unbranded: clear the ref so the base reverts to the factory mark and, on the
-      // next re-apply, idle restores the static /favicon.svg. No forced re-apply — the
-      // poll/unread effects re-apply naturally, and branding rarely changes live.
+      // Unbranded: clear the ref so the base reverts to the factory mark and idle
+      // restores the static /favicon.svg. Force a re-apply ONLY when we are actually
+      // CLEARING a previously-set branded base (had === true): the poll/unread guard
+      // (next === lastStateRef.current) would otherwise suppress a same-state redraw
+      // and leave a stale branded PNG on the tab. Skip it on the initial null pass so
+      // we don't flash idle over the enabled effect's own first apply.
+      const had = baseImgRef.current !== null;
       baseImgRef.current = null;
+      if (had) applyFavicon(lastStateRef.current ?? "idle", null);
       return;
     }
     let alive = true;
