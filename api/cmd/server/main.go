@@ -1238,7 +1238,7 @@ func steerRunCardMessage(err error) string {
 func isInternalStartRunErr(err error) bool {
 	switch {
 	case errors.Is(err, workersvc.ErrRepoNotFound), errors.Is(err, workersvc.ErrIssueNotFound),
-		errors.Is(err, workersvc.ErrNotPRDIssue), errors.Is(err, workersvc.ErrNoPRDLink),
+		errors.Is(err, workersvc.ErrNotPRDIssue),
 		errors.Is(err, workersvc.ErrActiveRunExists), errors.Is(err, workersvc.ErrBranchInUse),
 		errors.Is(err, workersvc.ErrDescriptionTooLarge), errors.Is(err, workersvc.ErrForgeIssueRead):
 		return false
@@ -1257,9 +1257,7 @@ func startRunCardMessage(err error) string {
 	case errors.Is(err, workersvc.ErrIssueNotFound):
 		return "That issue isn't on this repo's board."
 	case errors.Is(err, workersvc.ErrNotPRDIssue):
-		return "This issue isn't marked as uzi's work — promote it (add the PRD label) in uzi first."
-	case errors.Is(err, workersvc.ErrNoPRDLink):
-		return "This issue has no PRD link — add a prds/*.md link (or the PRD-less label) before starting a run."
+		return "This issue isn't marked as uzi's work — add the `uzi` label in uzi first."
 	case errors.Is(err, workersvc.ErrActiveRunExists):
 		return "A run is already in progress for this issue."
 	case errors.Is(err, workersvc.ErrBranchInUse):

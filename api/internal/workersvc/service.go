@@ -94,14 +94,11 @@ var (
 	ErrIssueNotFound = errors.New("issue not found")
 	ErrNoPRDLink     = errors.New("issue has no PRD link")
 	// ErrNotPRDIssue rejects a run on an issue that does not carry the configured
-	// PRD label (PRD #102 Decision 14) → 422.
-	//
-	// Before M6 every cached issue carried it by construction — the sync filter was
-	// the gate — so the PRD-LINK check above was sufficient on its own. The additive
-	// non-PRD fetch ends that: a stranger's issue that happens to mention a
-	// prds/*.md path would otherwise satisfy HasPrdLink and become runnable by
-	// accident, from the board or unattended from autopilot.
-	ErrNotPRDIssue         = errors.New("issue does not carry the PRD label")
+	// run-eligibility label (PRD #764 M1: the uzi_label) → 422. This is now the SINGLE
+	// eligibility gate — an issue without the uzi_label is not uzi's to run, PRD link
+	// or no. (The name is retained for the sentinel's existing consumers; the message
+	// surfaces reworded to tell the user to add the uzi label.)
+	ErrNotPRDIssue         = errors.New("issue does not carry the uzi label")
 	ErrDescriptionTooLarge = errors.New("issue description is too large to run")
 	// ErrPlanTooLarge rejects a create-time seeded plan over MaxSeededPlanBytes (PRD
 	// #209 D5) → 422. Mirrors ErrDescriptionTooLarge; checked on the raw input.
@@ -883,38 +880,17 @@ type SettingsReader interface {
 	// runs on (PRD #362 Decision 8), the fallback when the run owner has no per-user
 	// summary_model override. Falls back to the compiled-in default ("haiku").
 	SummaryModel(ctx context.Context) (string, error)
-	// PRDLabel is the label an issue must carry to be runnable (PRD #102 Decision
-	// 14). It is read here rather than passed in by each caller because the gate is
-	// shared: the board handler and the poller's autopilot must be answering the same
-	// question, and an operator renaming prd_label must move both at once.
+	// UziLabel is the single run-eligibility label an issue must carry to be runnable
+	// (PRD #764 M1). It is read here rather than passed in by each caller because the
+	// gate is shared: the board handler, the scheduler, and the poller's autopilot must
+	// all be answering the same question, and an operator renaming uzi_label must move
+	// them all at once.
 	//
 	// It rides this interface rather than a new one despite the judge scope of its
-	// two siblings, because a deployment that wires settings at all wires *Cache,
-	// which serves all three. A nil reader falls back to the compiled-in default and
+	// siblings, because a deployment that wires settings at all wires *Cache, which
+	// serves them all. A nil reader falls back to the compiled-in default ("uzi") and
 	// the gate still runs — "settings unavailable" must not mean "unguarded".
-	PRDLabel(ctx context.Context) (string, error)
-	// RunEligibleLabels is the ADMIN-configured set of labels a human may point uzi
-	// at (PRD #196). It generalises the run gate from "carries the primary" to
-	// "carries any run-eligible label"; the accessor always unions the primary in,
-	// so an issue carrying the primary is runnable regardless of the configured set.
-	// Autopilot candidacy and the sync fetch deliberately DO NOT read this — they
-	// stay on the primary only (PRD #196 Decisions 3/5/6).
-	RunEligibleLabels(ctx context.Context) ([]string, error)
-	// EligibleLabelWaivesPRDLink reports whether an issue eligible by a NON-primary
-	// label may run without a prds/*.md link (PRD #196 Decision 7), instance-wide,
-	// default on. It waives only a HUMAN's second click: the run gate applies it
-	// solely to a manual run eligible via a non-primary label, never to autopilot.
-	EligibleLabelWaivesPRDLink(ctx context.Context) (bool, error)
-	// PrdlessEnabled / PrdlessLabel drive the PRDLESS bypass to that gate (PRD #22
-	// Decision 3): when the feature is on instance-wide and an issue carries the
-	// prdless label, a run may start without a prds/*.md link. They ride SettingsReader
-	// for the same reason PRDLabel does — the same *settings.Cache serves them — and
-	// are read here (not passed in by each caller) so StartRunForUser answers the gate
-	// identically for the web start button and the Slack start-run card (PRD #191 M1).
-	// Best-effort like the siblings: a cold cache returns the default (enabled=false),
-	// which keeps an unlabeled issue gated.
-	PrdlessEnabled(ctx context.Context) (bool, error)
-	PrdlessLabel(ctx context.Context) (string, error)
+	UziLabel(ctx context.Context) (string, error)
 }
 
 // DockerAllowlistReader is the narrow settings view the claim gate reads for the
@@ -4575,14 +4551,12 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 }
 
 // CreateRun queues a manually-started run from a board card. The issue must be a
-// cached PRD issue (with a PRD link, unless allowWithoutPRD) in a repo the user
-// owns; its title is snapshotted from the cache and its description from the
-// request, so the run is self-contained even if the issue cache is later
-// evicted. allowWithoutPRD is the caller-computed PRDLESS bypass (PRD #22
-// Decision 3): the handler sets it from the fresh forge snapshot's labels + the
-// prdless settings, and it exempts this run from the HasPrdLink gate. The
-// one-non-terminal-run-per-issue index rejects a duplicate active run.
-func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, seed *SeededPlan) (store.Run, error) {
+// cached issue carrying the uzi_label (PRD #764 M1) in a repo the user owns; its
+// title is snapshotted from the cache and its description from the request, so the
+// run is self-contained even if the issue cache is later evicted. A PRD link is no
+// longer required. The one-non-terminal-run-per-issue index rejects a duplicate
+// active run.
+func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, seed *SeededPlan) (store.Run, error) {
 	// waitOnLimit nil ⇒ inherit the owner's default. It is a *bool rather than a bool
 	// because "the caller said false" and "the caller said nothing" are different
 	// requests, and collapsing them would make every API client that omits the field
@@ -4592,54 +4566,41 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// 'agent' and the run behaves byte-identically to a pre-#209 run (Success Criterion
 	// 2). Non-nil ⇒ a seeded-plan run that skips Phase 1 and the gate.
 	//
-	// allowLinkWaiver=true: this is THE interactive, human-initiated path (the board /
-	// issue-view Start button, and `uzi run start` through the same HTTP endpoint). It
-	// is the one path PRD #196's non-primary PRD-link waiver applies to — the human is
-	// present and clicking Start on a card an admin made run-eligible. Autopilot and the
-	// scheduler use their own methods below and pass false.
+	// This is THE interactive, human-initiated path (the board / issue-view Start
+	// button, and `uzi run start` through the same HTTP endpoint).
 	// nil model: a non-scheduled human run inherits the owner's per-user Worker default
 	// (PRD #300) — the per-schedule override applies only to runs a schedule fires.
 	// false overrideSubagentModel (PRD #305): an interactive run is not a schedule fire,
 	// so it stays in the default lane where subagent pins win.
-	return s.createRun(ctx, userID, repoID, issueIID, description, false, allowWithoutPRD, true, waitOnLimit, nil, false, seed)
+	return s.createRun(ctx, userID, repoID, issueIID, description, false, waitOnLimit, nil, false, seed)
 }
 
 // CreateScheduledRun queues a NON-auto-approve scheduled issue run (PRD #241: a timer
 // or label-sweep schedule firing an issue with the plan gate still requiring a human).
-// It is IDENTICAL to CreateRun EXCEPT it never applies PRD #196's PRD-link waiver
-// (allowLinkWaiver=false): the waiver removes a HUMAN's second click, and a timer-fired
-// run has no human in the loop at creation, so a link-less non-primary-eligible issue
-// (e.g. a `bug` swept in) is NOT waived here — it still needs a prds/*.md link or
-// PRDLESS, exactly as before M4. This keeps PRD #196's invariant that the only path the
-// eligibility change widened is a human click; a scheduled sweep is not that click.
-func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, model *string, overrideSubagentModel bool, seed *SeededPlan) (store.Run, error) {
-	return s.createRun(ctx, userID, repoID, issueIID, description, false, allowWithoutPRD, false, waitOnLimit, model, overrideSubagentModel, seed)
+// It is IDENTICAL to CreateRun — same single uzi_label eligibility gate (PRD #764 M1) —
+// and, like every create path, no longer requires a PRD link.
+func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, model *string, overrideSubagentModel bool, seed *SeededPlan) (store.Run, error) {
+	return s.createRun(ctx, userID, repoID, issueIID, description, false, waitOnLimit, model, overrideSubagentModel, seed)
 }
 
 // CreateAutopilotRun queues a run the poller's autopilot detection started on a
-// user's behalf (PRD #19 M4). It is IDENTICAL to CreateRun — same ownership,
-// cached-PRD-issue, PRD-link, and one-active-run gates, same state machine, same
-// queued→In Progress column notify — except it sets auto_approve, which the worker
-// reads (M5) to resolve the plan gate without a human. allowWithoutPRD threads the
-// PRDLESS bypass the same way the manual path does (PRD #22 Decision 3): the poller
-// computes it from its fresh GetIssue snapshot, so an autopilot issue carrying the
-// prdless label runs with no PRD link (the PRD+autopilot+PRDLESS composition, all
-// three explicit opt-ins). Sharing one createRun body is the whole point: the
-// invariant that an autopilot run and a manual run are born through the same path is
-// enforced structurally, not by two implementations that could drift.
-func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool) (store.Run, error) {
+// user's behalf (PRD #19 M4). It is IDENTICAL to CreateRun — same ownership, single
+// uzi_label eligibility gate (PRD #764 M1), and one-active-run gate, same state
+// machine, same queued→In Progress column notify — except it sets auto_approve, which
+// the worker reads (M5) to resolve the plan gate without a human. Sharing one createRun
+// body is the whole point: the invariant that an autopilot run and a manual run are
+// born through the same path is enforced structurally, not by two implementations that
+// could drift.
+func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error) {
 	// nil waitOnLimit: an autopilot run has no human in the loop to express a per-run
 	// choice, so it takes the owner's default (PRD #35 Decision 7 / design brief 7.3).
 	// nil model: the label poller's autopilot has no per-run model (PRD #300) — a
 	// label-driven run inherits the owner's per-user Worker default. The final nil is the
 	// seeded plan: autopilot NEVER seeds — it derives its plan in Phase 1 exactly as
 	// before (PRD #209 D3 keeps auto_approve and plan_source orthogonal).
-	// allowLinkWaiver=false: autopilot is unattended, so PRD #196's PRD-link waiver
-	// never applies — a link-less autopilot run is still refused unless PRDLESS
-	// (allowWithoutPRD) exempts it, exactly as before M4.
 	// false overrideSubagentModel (PRD #305): label-poller autopilot is not a schedule
 	// fire and carries no per-run opt-in, so subagent pins win (default lane).
-	return s.createRun(ctx, userID, repoID, issueIID, description, true, allowWithoutPRD, false, nil, nil, false, nil)
+	return s.createRun(ctx, userID, repoID, issueIID, description, true, nil, nil, false, nil)
 }
 
 // CreateScheduledAutopilotRun queues an auto-approve run for a schedule while honouring
@@ -4649,11 +4610,10 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 // the owner default), a scheduled run carries a persisted per-schedule wait_on_limit that
 // must take effect. Kept as a SEPARATE method on purpose — the poller's CreateAutopilotRun
 // seam (its interface, fake, and call site) stays byte-identical, so widening the
-// scheduler seam cannot change label-driven autopilot. allowLinkWaiver=false and seed=nil
-// for the same reasons as CreateAutopilotRun: a scheduled sweep is unattended, so PRD
-// #196's PRD-link waiver never applies, and autopilot never seeds its plan.
-func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
-	return s.createRun(ctx, userID, repoID, issueIID, description, true /*autoApprove*/, allowWithoutPRD, false /*allowLinkWaiver*/, waitOnLimit, model, overrideSubagentModel, nil /*seed*/)
+// scheduler seam cannot change label-driven autopilot. seed=nil for the same reason as
+// CreateAutopilotRun: autopilot never seeds its plan.
+func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
+	return s.createRun(ctx, userID, repoID, issueIID, description, true /*autoApprove*/, waitOnLimit, model, overrideSubagentModel, nil /*seed*/)
 }
 
 // SeededPlan carries a create-time externally-authored plan and its optional agent
@@ -4682,7 +4642,7 @@ type SeededPlan struct {
 	RequireBase bool
 }
 
-func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, autoApprove, allowWithoutPRD, allowLinkWaiver bool, waitOnLimit *bool, model *string, overrideSubagentModel bool, seed *SeededPlan) (store.Run, error) {
+func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, autoApprove bool, waitOnLimit *bool, model *string, overrideSubagentModel bool, seed *SeededPlan) (store.Run, error) {
 	// The description cap is enforced HERE, once, so the manual (handler → 422) and
 	// autopilot (poller → too-large comment) paths cannot drift (PRD #19 M5). Checked
 	// first: it is pure input validation, independent of the repo/issue gates below.
@@ -4781,57 +4741,18 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		}
 		return store.Run{}, err
 	}
-	// The RUN-ELIGIBILITY gate (PRD #102 Decision 14, generalised by PRD #196
-	// Decision 1). Checked BEFORE the PRD-link gate because it is the coarser
-	// question — "is this issue uzi's work at all" comes before "is this issue ready
-	// to run" — and because its rejection must not be reported as a missing PRD
-	// link, which would send a user off to add one.
+	// The RUN-ELIGIBILITY gate (PRD #764 M1): an issue is uzi's to run iff it carries
+	// the configured uzi_label. This is now the SINGLE gate — a run no longer requires
+	// a PRD link, a PRDLESS escape-hatch, or an admin waiver (Gate B removed). A linked
+	// prds/*.md is still detected and implemented when present, but never required.
 	//
-	// PRD #196 widens this from "carries the primary label" to "carries ANY
-	// run-eligible label" (an admin-configured set that always includes the primary,
-	// default {PRD, bug}). The anti-accident property survives: an issue carrying
-	// none of those labels is exactly as unrunnable as before, PRD link or no. Only
-	// a human clicking Start on a card an admin deliberately made eligible gets in.
-	//
-	// PRDLESS does NOT bypass this. It is the escape hatch for an eligible issue with
-	// no prds/*.md file yet (PRD #22 Decision 3); it was never a claim about issues
-	// that are not uzi's, and letting it through here would restore exactly the
-	// accident this gate exists to stop.
-	//
-	// Derived from the cached labels rather than a fresh forge read (Decision 12):
-	// the same jsonb the board renders the card from, so the button a user sees and
-	// the gate the server applies cannot disagree. Promote (Decision 15) writes the
-	// PRIMARY label forge-first AND updates this cache row in the same request, so
-	// the promote-then-run sequence is not racing the poller.
-	primary := s.prdLabel(ctx)
-	eligible := s.runEligibleLabels(ctx)
-	if !isEligibleIssue(issue.Labels, eligible) {
+	// Derived from the cached labels rather than a fresh forge read: the same jsonb the
+	// board renders the card from, so the button a user sees and the gate the server
+	// applies cannot disagree. Promote writes the label forge-first AND updates this
+	// cache row in the same request, so the promote-then-run sequence is not racing the
+	// poller.
+	if !isEligibleIssue(issue.Labels, []string{s.uziLabel(ctx)}) {
 		return store.Run{}, ErrNotPRDIssue
-	}
-	// The PRD-link gate (PRD invariant) with the PRDLESS exception (PRD #22) and the
-	// PRD #196 waiver: allowWithoutPRD is the caller's PRDLESS bypass, computed from
-	// the fresh forge snapshot's labels and the prdless settings. This is the single
-	// enforcement point; both the manual and autopilot callers pass the bool in.
-	//
-	// The PRD-link waiver (PRD #196 Decision 7): an issue eligible via a NON-PRIMARY
-	// label does not require a prds/*.md link. It is scoped THREE ways, and all three
-	// are safety properties rather than phrasing:
-	//   1. allowLinkWaiver: the waiver removes a HUMAN's SECOND CLICK, so it applies
-	//      ONLY to a genuinely interactive human-initiated run — the CreateRun endpoint.
-	//      Every non-interactive creator passes false: CreateAutopilotRun (autonomous)
-	//      AND CreateScheduledRun (timer-fired sweep). !autoApprove alone is NOT a
-	//      sufficient proxy for "a human is here" — a NON-auto-approve scheduled sweep
-	//      is autoApprove=false yet has no per-run human click, so relying on
-	//      !autoApprove would newly widen the scheduler (PRD invariant: "the only
-	//      widened path requires a human click"). This explicit flag is that invariant.
-	//   2. NON-PRIMARY: a primary-only issue with no link is still refused (add a
-	//      link or PRDLESS). So an autopilot-labelled PRD issue with no link stays
-	//      refused, exactly as today.
-	//   3. !autoApprove: retained as defense-in-depth so a future autoApprove path that
-	//      forgot to pass allowLinkWaiver=false still cannot start unattended.
-	linkWaived := allowLinkWaiver && !autoApprove && s.eligibleWaivesPRDLink(ctx) && eligibleByNonPrimary(issue.Labels, eligible, primary)
-	if !issue.HasPrdLink && !allowWithoutPRD && !linkWaived {
-		return store.Run{}, ErrNoPRDLink
 	}
 	// Cross-kind same-branch exclusion (PRD #6): this issue run will use the
 	// worktree agent/issue-<iid>; refuse if an active ci_fix run is already fixing
@@ -4954,106 +4875,33 @@ func (s *Service) fetchIssueCommentsSnapshot(ctx context.Context, row store.GetR
 	return buildIssueCommentsSnapshot(comments, row.BotForgeUserID)
 }
 
-// prdLabel resolves the configured PRD label for the run-eligibility gate,
-// falling back to the compiled-in default when settings are unwired or a read
-// fails. Same shape as forgesvc.prdLabel, and deliberately so: the label the sync
-// filters on and the label a run is gated by must be the same string, or an
-// operator's rename would make the board and the gate disagree about which cards
-// are runnable.
-//
-// Note the fallback direction. An unavailable settings read degrades to enforcing
-// the gate on "PRD", never to skipping it — the accessor already returns the
-// default alongside a cold error, so this stays best-effort by design without
-// ever failing open.
-func (s *Service) prdLabel(ctx context.Context) string {
+// uziLabel resolves the configured run-eligibility label (PRD #764 M1), falling back
+// to the compiled-in default when settings are unwired or a read fails. Same shape as
+// the old prdLabel helper it replaces: an unavailable settings read degrades to
+// enforcing the gate on "uzi", never to skipping it — the accessor already returns the
+// default alongside a cold error, so this stays best-effort by design without ever
+// failing open.
+func (s *Service) uziLabel(ctx context.Context) string {
 	if s.settings != nil {
-		if l, _ := s.settings.PRDLabel(ctx); l != "" {
+		if l, _ := s.settings.UziLabel(ctx); l != "" {
 			return l
 		}
 	}
-	return settings.DefaultPRDLabel
-}
-
-// runEligibleLabels resolves the ADMIN-configured set of run-eligible labels (PRD
-// #196), nil-safe like prdLabel. The primary is ALWAYS unioned in, first, deduped —
-// mirroring the Cache accessor — so the gate is fail-safe: an issue carrying the
-// primary is runnable even if a hand-edited settings row dropped it from the
-// configured set, and a fake reader that returns only its eligible extras still
-// makes the primary eligible. Never returns empty.
-//
-// An unwired service falls back to the compiled-in default set (the default primary
-// unioned with DefaultRunEligibleLabels), so "settings unavailable" still enforces
-// on the default eligible set rather than degrading to unguarded.
-func (s *Service) runEligibleLabels(ctx context.Context) []string {
-	primary := s.prdLabel(ctx)
-	var raw []string
-	if s.settings != nil {
-		raw, _ = s.settings.RunEligibleLabels(ctx)
-	} else {
-		raw = strings.Split(settings.DefaultRunEligibleLabels, ",")
-	}
-	out := []string{primary}
-	seen := map[string]struct{}{primary: {}}
-	for _, l := range raw {
-		l = strings.TrimSpace(l)
-		if l == "" {
-			continue
-		}
-		if _, dup := seen[l]; dup {
-			continue
-		}
-		seen[l] = struct{}{}
-		out = append(out, l)
-	}
-	return out
-}
-
-// eligibleWaivesPRDLink reports whether an issue eligible by a NON-primary label may
-// run without a prds/*.md link (PRD #196 Decision 7), nil-safe. An unavailable read
-// degrades to the compiled-in default (on), the same fail-toward-the-default
-// direction as the Cache accessor — the waiver is a convenience gate, and its
-// remaining scope (non-primary + manual) is what keeps that safe.
-func (s *Service) eligibleWaivesPRDLink(ctx context.Context) bool {
-	if s.settings != nil {
-		waives, _ := s.settings.EligibleLabelWaivesPRDLink(ctx)
-		return waives
-	}
-	return settings.DefaultEligibleLabelWaivesPRDLink == "true"
+	return settings.DefaultUziLabel
 }
 
 // isEligibleIssue reports whether a cached issue's labels jsonb carries ANY of the
-// run-eligible labels (PRD #196), generalising the old single-primary-label gate. A
-// row whose labels cannot be decoded is NOT eligible: the gate has no basis for
-// letting it through, and a corrupt or absent value must not read as consent.
-// Matching is exact, like the forge-side label filter the sync applies and like every
-// other label comparison in this codebase.
+// given eligible labels (PRD #764 M1: the single-element uzi_label set). A row whose
+// labels cannot be decoded is NOT eligible: the gate has no basis for letting it
+// through, and a corrupt or absent value must not read as consent. Matching is exact,
+// like the forge-side label filter the sync applies and like every other label
+// comparison in this codebase.
 func isEligibleIssue(labelsJSON []byte, eligible []string) bool {
 	var labels []string
 	if err := json.Unmarshal(labelsJSON, &labels); err != nil {
 		return false
 	}
 	for _, e := range eligible {
-		if slices.Contains(labels, e) {
-			return true
-		}
-	}
-	return false
-}
-
-// eligibleByNonPrimary reports whether a cached issue is eligible via at least one
-// run-eligible label that is NOT the primary (PRD #196). This is the qualifier that
-// scopes the PRD-link waiver: an issue eligible ONLY by the primary does not get the
-// waiver, so an autopilot-labelled PRD issue with no link stays refused. Decode
-// failure → false, like the other label helpers.
-func eligibleByNonPrimary(labelsJSON []byte, eligible []string, primary string) bool {
-	var labels []string
-	if err := json.Unmarshal(labelsJSON, &labels); err != nil {
-		return false
-	}
-	for _, e := range eligible {
-		if e == primary {
-			continue
-		}
 		if slices.Contains(labels, e) {
 			return true
 		}

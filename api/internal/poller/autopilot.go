@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -20,19 +19,17 @@ import (
 // RunStarter creates an autopilot run through workersvc's shared manual-start
 // path. *workersvc.Service satisfies it. Keeping run creation on the workersvc
 // side (rather than re-implementing it here) is what makes an autopilot run and a
-// manual run share one state machine and one set of gates. allowWithoutPRD is the
-// caller-computed PRDLESS bypass (PRD #22 Decision 3), threaded through exactly as
-// the manual handler threads it.
+// manual run share one state machine and one set of gates (the single uzi_label
+// eligibility gate, PRD #764 M1).
 type RunStarter interface {
-	CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool) (store.Run, error)
+	CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error)
 }
 
 // SettingsReader resolves the instance settings the autopilot detector needs: the
-// autopilot label it filters on, the PRD label it filters on alongside it (PRD
-// #102 M6 Decision 11b), and the PRDLESS gate-bypass state (PRD #22).
-// *settings.Cache satisfies it; a nil reader or an empty/errored read falls back
-// to compiled-in defaults, so a settings blip degrades gracefully rather than
-// filtering on an empty label or mis-resolving the bypass.
+// autopilot label it filters on and the PRD label it filters on alongside it (PRD
+// #102 M6 Decision 11b). *settings.Cache satisfies it; a nil reader or an
+// empty/errored read falls back to compiled-in defaults, so a settings blip degrades
+// gracefully rather than filtering on an empty label.
 //
 // For the PRD label specifically, "degrades gracefully" means degrading to the
 // DEFAULT label, never to no filter: an unresolvable prd_label leaves the
@@ -41,8 +38,6 @@ type RunStarter interface {
 type SettingsReader interface {
 	AutopilotLabel(ctx context.Context) (string, error)
 	PRDLabel(ctx context.Context) (string, error)
-	PrdlessEnabled(ctx context.Context) (bool, error)
-	PrdlessLabel(ctx context.Context) (string, error)
 }
 
 // autopilotStore is the subset of *store.Queries the detector reads and writes.
@@ -202,12 +197,7 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 		return
 	}
 
-	// PRDLESS bypass (PRD #22 Decision 3): computed from THIS fresh GetIssue
-	// snapshot, exactly like the manual handler — so the PRD+autopilot+PRDLESS
-	// composition runs unattended with no PRD link (all three explicit opt-ins).
-	allowWithoutPRD := a.allowWithoutPRD(ctx, issue.Labels)
-
-	_, err = a.runs.CreateAutopilotRun(ctx, cc.UserID, r.ID, iid, issue.Description, allowWithoutPRD)
+	_, err = a.runs.CreateAutopilotRun(ctx, cc.UserID, r.ID, iid, issue.Description)
 	switch {
 	case err == nil:
 		// Create-then-record: a crash before recording leaves the created run active,
@@ -218,10 +208,6 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 		// The shared createRun cap (unified in M5): the description is too large to
 		// snapshot onto an unattended run — explain it instead of running.
 		a.recordThenComment(ctx, r, f, iid, eventID, tooLargeComment())
-	case errors.Is(err, workersvc.ErrNoPRDLink):
-		// The same gate the manual path enforces: an autopilot issue with no prds/*.md
-		// link never runs; it gets the explanatory comment instead (PRD invariant).
-		a.recordThenComment(ctx, r, f, iid, eventID, noPRDLinkComment(label))
 	case errors.Is(err, workersvc.ErrActiveRunExists):
 		// A run appeared between the pre-check and here: swallow, same as an active run.
 		_ = a.record(ctx, r, iid, eventID)
@@ -310,27 +296,6 @@ func (a *Autopilot) prdLabel(ctx context.Context) string {
 	return settings.DefaultPRDLabel
 }
 
-// allowWithoutPRD reports whether the PRDLESS gate bypass applies to this fresh
-// issue snapshot (PRD #22 Decision 3): the feature is enabled instance-wide and
-// the issue carries the configured prdless label (exact match, like the manual
-// path). Conservative when settings are unknowable: a nil reader means no bypass,
-// so a misconfigured detector never silently weakens the PRD gate. An empty label
-// read falls back to the compiled-in default.
-func (a *Autopilot) allowWithoutPRD(ctx context.Context, labels []string) bool {
-	if a.set == nil {
-		return false
-	}
-	enabled, _ := a.set.PrdlessEnabled(ctx)
-	if !enabled {
-		return false
-	}
-	label, _ := a.set.PrdlessLabel(ctx)
-	if label == "" {
-		label = settings.DefaultPrdlessLabel
-	}
-	return slices.Contains(labels, label)
-}
-
 // eligible reports whether the repo owner may run this issue under autopilot: they
 // opted in, they have an Anthropic token, and their declared human_username is the
 // label adder or (fallback) the issue author. The adder is preferred per Decision 3,
@@ -377,13 +342,6 @@ func noEligibleUserComment(label string) string {
 			"No uzi user with autopilot enabled is mapped to the person who added the `%s` label or to the issue author. "+
 			"To run this issue with autopilot, connect your forge in uzi, set your forge username on that connection, and enable autopilot in your settings, then remove and re-add the `%s` label.",
 		label, label)
-}
-
-func noPRDLinkComment(label string) string {
-	return fmt.Sprintf(
-		"**Autopilot did not start a run.**\n\n"+
-			"This issue has no PRD link. Add a link to a `prds/*.md` file in the description, then remove and re-add the `%s` label to retry.",
-		label)
 }
 
 func tooLargeComment() string {

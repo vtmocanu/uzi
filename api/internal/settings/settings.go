@@ -38,6 +38,11 @@ import (
 const (
 	KeyPRDLabel       = "prd_label"
 	KeyAutopilotLabel = "autopilot_label"
+	// KeyUziLabel is the single run-eligibility gate (PRD #764 M1): an issue is
+	// uzi's to run iff it carries this label. Configurable, defaulting to "uzi".
+	// It follows the no-seeded-row pattern (like the prdless/judge/health keys):
+	// an absent row synthesizes from Defaults, so no migration seeds it.
+	KeyUziLabel = "uzi_label"
 	// PRDLESS gate-bypass keys (PRD #22). prdless_enabled stores the text
 	// "true"/"false"; prdless_label is the escape-hatch label name.
 	KeyPrdlessEnabled = "prdless_enabled"
@@ -239,6 +244,10 @@ const (
 const (
 	DefaultPRDLabel       = "PRD"
 	DefaultAutopilotLabel = "autopilot"
+	// PRD #764 M1: the single run-eligibility label defaults to "uzi". Same
+	// no-seeded-row pattern as the prdless keys — an absent row synthesizes to
+	// this default and no migration adds it.
+	DefaultUziLabel = "uzi"
 	// PRD #22: on by default (Decision 1). An issue still bypasses the gate only
 	// when it carries the label, so default-on weakens nothing for unlabeled
 	// issues; admins wanting the strict PRD-only regime flip prdless_enabled off.
@@ -401,6 +410,10 @@ const maxLabelListLen = 32
 var Defaults = map[string]string{
 	KeyPRDLabel:       DefaultPRDLabel,
 	KeyAutopilotLabel: DefaultAutopilotLabel,
+	// PRD #764 M1 single run-eligibility label. No seeded row: an absent row
+	// synthesizes to DefaultUziLabel ("uzi"), so All/AdminView surface it on every
+	// instance and no migration adds it.
+	KeyUziLabel:       DefaultUziLabel,
 	KeyPrdlessEnabled: DefaultPrdlessEnabled,
 	KeyPrdlessLabel:   DefaultPrdlessLabel,
 	// The instance default theme falls back to the registry's Default ("ember"),
@@ -691,6 +704,13 @@ func (c *Cache) PRDLabel(ctx context.Context) (string, error) {
 // DefaultAutopilotLabel.
 func (c *Cache) AutopilotLabel(ctx context.Context) (string, error) {
 	return c.get(ctx, KeyAutopilotLabel)
+}
+
+// UziLabel returns the configured run-eligibility label (PRD #764 M1): the single
+// gate deciding whether an issue is uzi's to run. Falls back to DefaultUziLabel
+// ("uzi"), modeled exactly on PRDLabel.
+func (c *Cache) UziLabel(ctx context.Context) (string, error) {
+	return c.get(ctx, KeyUziLabel)
 }
 
 // PrdlessLabel returns the configured PRDLESS escape-hatch label (PRD #22).
@@ -1932,6 +1952,14 @@ func ValidateMerged(merged map[string]string) error {
 	}
 	if merged[KeyPrdlessLabel] == merged[KeyAutopilotLabel] {
 		return errors.New("prdless_label must differ from autopilot_label")
+	}
+	// PRD #764 M1: the run-eligibility label must be distinct from the autopilot
+	// label — an equal pair would autopilot every runnable issue, conflating "uzi's
+	// to run" with "skip the plan gate". (Distinctness from prd_label/prdless_label
+	// is not required: those keys are removed in a later milestone, and uzi may
+	// legitimately co-exist with a plain organizational PRD label.)
+	if merged[KeyUziLabel] == merged[KeyAutopilotLabel] {
+		return errors.New("uzi_label must differ from autopilot_label")
 	}
 
 	// PRD #196 list-key cross-checks on the effective post-update state. Parse both

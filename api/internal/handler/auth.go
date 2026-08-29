@@ -351,6 +351,10 @@ func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[string]any {
 	prdLabel, _ := h.settings.PRDLabel(ctx)
 	autopilotLabel, _ := h.settings.AutopilotLabel(ctx)
+	// PRD #764 M1: the single run-eligibility label the SPA reads to render the "add
+	// the uzi label" runnable affordance. Best-effort like the other labels — a cold
+	// settings read yields the compiled-in default ("uzi"), never an error.
+	uziLabel, _ := h.settings.UziLabel(ctx)
 	runEligible, _ := h.settings.RunEligibleLabels(ctx)
 	waiver, _ := h.settings.EligibleLabelWaivesPRDLink(ctx)
 	// Theme resolution (PRD #21 Decision 2): the SPA needs three values, not just
@@ -401,6 +405,8 @@ func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[strin
 		"user":            toDTO(user),
 		"prd_label":       prdLabel,
 		"autopilot_label": autopilotLabel,
+		// PRD #764 M1: the single run-eligibility label.
+		"uzi_label":       uziLabel,
 		"theme":           theme.Resolve(override, defaultTheme),
 		"theme_override":  textPtrValue(override != "", override),
 		"default_theme":   defaultTheme,

@@ -1047,21 +1047,12 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 	case errors.Is(err, workersvc.ErrInvalidSelection):
 		httpx.Error(w, http.StatusBadRequest, "invalid agent selection: "+err.Error())
 	case errors.Is(err, workersvc.ErrNotPRDIssue):
-		// PRD #102 Decision 14. Named separately from ErrNoPRDLink and BEFORE it: telling
-		// someone to add a prds/*.md link to an issue that is not uzi's work sends them to
-		// fix the wrong thing. Promote is the action this hint names.
-		prdLabel, _ := h.settings.PRDLabel(r.Context())
+		// PRD #764 M1: the single run-eligibility gate. An issue without the uzi_label
+		// is not uzi's to run — tell the user to add it. (A PRD link is no longer
+		// required, so there is no ErrNoPRDLink case to follow this.)
+		uziLabel, _ := h.settings.UziLabel(r.Context())
 		httpx.Error(w, http.StatusUnprocessableEntity,
-			fmt.Sprintf("this issue does not carry the %s label; promote it before starting a run", prdLabel))
-	case errors.Is(err, workersvc.ErrNoPRDLink):
-		// Extend the hint with the escape-hatch label only when the feature is enabled
-		// instance-wide, so a strict-regime instance never advertises it.
-		msg := "issue has no PRD link; add a prds/*.md link before starting a run"
-		if prdlessEnabled, _ := h.settings.PrdlessEnabled(r.Context()); prdlessEnabled {
-			prdlessLabel, _ := h.settings.PrdlessLabel(r.Context())
-			msg = fmt.Sprintf("issue has no PRD link; add a prds/*.md link (or the %s label) before starting a run", prdlessLabel)
-		}
-		httpx.Error(w, http.StatusUnprocessableEntity, msg)
+			fmt.Sprintf("this issue does not carry the %s label; add it before starting a run", uziLabel))
 	case errors.Is(err, workersvc.ErrTaskBaseBranchTooLong):
 		// PRD #400: the optional base_branch exceeded its dedicated cap. A caller error
 		// (a git ref cannot legitimately be this long) → 400.

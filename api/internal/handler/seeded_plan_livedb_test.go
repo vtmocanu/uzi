@@ -143,8 +143,7 @@ func TestSeededRunClaimCarriesApprovedPlanNoInputRowLiveDB(t *testing.T) {
 
 	const plan = "# Plan\n\nImplement the widget in widget.go. Done when the tests pass."
 	sel := workersvc.AgentSelection{Source: workersvc.AgentSourceRepo, Exclusions: []string{"reviewer"}}
-	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", false, nil,
-		&workersvc.SeededPlan{PlanMD: plan, Selection: &sel})
+	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", nil, &workersvc.SeededPlan{PlanMD: plan, Selection: &sel})
 	if err != nil {
 		t.Fatalf("CreateRun (seeded): %v", err)
 	}
@@ -206,8 +205,7 @@ func TestSeededRunFallThroughToGateDisarmsLiveDB(t *testing.T) {
 	f := newSeededPlanFixture(ctx, t)
 
 	sel := workersvc.AgentSelection{Source: workersvc.AgentSourceRepo, Exclusions: []string{"reviewer"}}
-	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", false, nil,
-		&workersvc.SeededPlan{PlanMD: "# Seeded plan\nImplement it.", Selection: &sel})
+	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", nil, &workersvc.SeededPlan{PlanMD: "# Seeded plan\nImplement it.", Selection: &sel})
 	if err != nil {
 		t.Fatalf("CreateRun (seeded): %v", err)
 	}
@@ -290,12 +288,11 @@ func TestSeededRunClaimCarriesPlannedBaseCommitLiveDB(t *testing.T) {
 	f := newSeededPlanFixture(ctx, t)
 
 	const plannedCommit = "abc123def4567890abc123def4567890abc12345"
-	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", false, nil,
-		&workersvc.SeededPlan{
-			PlanMD:        "# Plan\nImplement the widget.",
-			PlannedCommit: plannedCommit,
-			RequireBase:   true,
-		})
+	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", nil, &workersvc.SeededPlan{
+		PlanMD:        "# Plan\nImplement the widget.",
+		PlannedCommit: plannedCommit,
+		RequireBase:   true,
+	})
 	if err != nil {
 		t.Fatalf("CreateRun (seeded, --planned-commit --require-base): %v", err)
 	}
@@ -341,8 +338,7 @@ func TestSeededRunNoPlannedCommitClaimIsInertLiveDB(t *testing.T) {
 	ctx := context.Background()
 	f := newSeededPlanFixture(ctx, t)
 
-	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", false, nil,
-		&workersvc.SeededPlan{PlanMD: "# Plan\nImplement it."})
+	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", nil, &workersvc.SeededPlan{PlanMD: "# Plan\nImplement it."})
 	if err != nil {
 		t.Fatalf("CreateRun (seeded, no planned commit): %v", err)
 	}

@@ -859,6 +859,63 @@ func TestValidateMergedThreeWayDistinct(t *testing.T) {
 	}
 }
 
+// TestValidateMergedUziLabelDistinctFromAutopilot covers PRD #764 M1: the
+// run-eligibility label must differ from the autopilot label (an equal pair would
+// autopilot every runnable issue). The rejection names uzi_label. Distinctness from
+// prd_label/prdless_label is deliberately NOT required.
+func TestValidateMergedUziLabelDistinctFromAutopilot(t *testing.T) {
+	base := func() map[string]string {
+		return map[string]string{
+			KeyPRDLabel:          "PRD",
+			KeyAutopilotLabel:    "autopilot",
+			KeyUziLabel:          "uzi",
+			KeyRunEligibleLabels: "PRD",
+		}
+	}
+
+	m := base()
+	m[KeyUziLabel] = "autopilot"
+	if err := ValidateMerged(m); err == nil || !strings.Contains(err.Error(), "uzi_label") {
+		t.Errorf("uzi_label==autopilot_label: err = %v, want a rejection naming uzi_label", err)
+	}
+
+	// uzi_label sharing prd_label is allowed — those keys are decoupled.
+	m = base()
+	m[KeyUziLabel] = "PRD"
+	if err := ValidateMerged(m); err != nil {
+		t.Errorf("uzi_label sharing prd_label must be allowed: %v", err)
+	}
+
+	// The shipped defaults are mutually distinct and pass.
+	if err := ValidateMerged(base()); err != nil {
+		t.Errorf("distinct default labels rejected: %v", err)
+	}
+}
+
+// TestUziLabelAccessorAndDefault pins PRD #764 M1's no-seeded-row synthesis: with no
+// row present the accessor returns the compiled-in default, and a stored row overrides
+// it. Mirrors the PRDLabel accessor.
+func TestUziLabelAccessorAndDefault(t *testing.T) {
+	if DefaultUziLabel != "uzi" {
+		t.Fatalf("DefaultUziLabel = %q, want \"uzi\"", DefaultUziLabel)
+	}
+	if Defaults[KeyUziLabel] != DefaultUziLabel {
+		t.Fatalf("Defaults[uzi_label] = %q, want %q (no-seeded-row synthesis)", Defaults[KeyUziLabel], DefaultUziLabel)
+	}
+
+	// Empty store → default.
+	c := New(&fakeStore{}, time.Minute)
+	if got, err := c.UziLabel(context.Background()); err != nil || got != DefaultUziLabel {
+		t.Fatalf("UziLabel() empty = (%q, %v), want (%q, nil)", got, err, DefaultUziLabel)
+	}
+
+	// Stored row wins.
+	c2 := New(&fakeStore{rows: []store.AppSetting{{Key: KeyUziLabel, Value: "runnable"}}}, time.Minute)
+	if got, err := c2.UziLabel(context.Background()); err != nil || got != "runnable" {
+		t.Fatalf("UziLabel() stored = (%q, %v), want (\"runnable\", nil)", got, err)
+	}
+}
+
 func eq(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

@@ -100,17 +100,17 @@ type Store interface {
 // RunCreator is the shared run-creation seam the scheduler fires through — the SAME
 // seam autopilot and the manual board use. *workersvc.Service satisfies it.
 type RunCreator interface {
-	CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, seed *workersvc.SeededPlan) (store.Run, error)
-	// CreateScheduledRun is the non-auto-approve scheduled path: like CreateRun but
-	// without PRD #196's interactive PRD-link waiver, so a timer-fired sweep never
-	// starts a link-less non-primary-eligible run (see workersvc.CreateScheduledRun).
-	CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, model *string, overrideSubagentModel bool, seed *workersvc.SeededPlan) (store.Run, error)
-	CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool) (store.Run, error)
+	CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, seed *workersvc.SeededPlan) (store.Run, error)
+	// CreateScheduledRun is the non-auto-approve scheduled path: like CreateRun but the
+	// plan gate still requires a human (see workersvc.CreateScheduledRun). Eligibility is
+	// the single uzi_label gate (PRD #764 M1); a PRD link is no longer required.
+	CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, model *string, overrideSubagentModel bool, seed *workersvc.SeededPlan) (store.Run, error)
+	CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error)
 	// CreateScheduledAutopilotRun is the auto-approve scheduled path (PRD #274 Decision
 	// 1a): like CreateAutopilotRun but it HONOURS the schedule's persisted wait_on_limit
 	// instead of the owner default. It is a distinct method so the poller's
 	// CreateAutopilotRun seam stays untouched (see workersvc.CreateScheduledAutopilotRun).
-	CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, model *string, overrideSubagentModel bool) (store.Run, error)
+	CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, model *string, overrideSubagentModel bool) (store.Run, error)
 	CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, model *string, overrideSubagentModel bool) (store.Run, error)
 	// CreateSelfImproveRun is the self-improvement fire path's insert (PRD #590 M1): a
 	// dedicated issue-shaped, auto_approve, kind='self_improve' run against the tracking
@@ -125,12 +125,9 @@ type ForgeBuilder interface {
 	ForgeForConnection(forgeType, baseURL string, tokenCiphertext []byte) (forge.Forge, error)
 }
 
-// SettingsReader is the typed settings surface the scheduler reads to compute the
-// PRDLESS bypass (mirroring the poller/handler) and to default an empty sweep
-// selector to the configured PRD label. *settings.Cache satisfies it.
+// SettingsReader is the typed settings surface the scheduler reads to default an
+// empty sweep selector to the configured PRD label. *settings.Cache satisfies it.
 type SettingsReader interface {
-	PrdlessEnabled(ctx context.Context) (bool, error)
-	PrdlessLabel(ctx context.Context) (string, error)
 	PRDLabel(ctx context.Context) (string, error)
 }
 
@@ -314,7 +311,7 @@ func (e *Scheduler) fireIssue(ctx context.Context, sched store.RunSchedule) (Fir
 		// zero outcome so nothing is recorded for this fire.
 		return FireOutcome{}, fmt.Errorf("get issue %d: %w", iid, err) // transient forge error
 	}
-	return e.createIssueRun(ctx, sched, repo.ID, iid, issue.Title, issue.Description, issue.Labels, issue.WebURL)
+	return e.createIssueRun(ctx, sched, repo.ID, iid, issue.Title, issue.Description, issue.WebURL)
 }
 
 // fireSweep resolves the label selector (an empty/NULL selector defaults to the PRD
@@ -423,7 +420,7 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Reason: SkipFetchFailed})
 			continue
 		}
-		res, err := e.createIssueRun(ctx, sched, repo.ID, iid, issue.Title, issue.Description, issue.Labels, issue.WebURL)
+		res, err := e.createIssueRun(ctx, sched, repo.ID, iid, issue.Title, issue.Description, issue.WebURL)
 		if err != nil {
 			// A permanent/transient repo error mid-sweep is unexpected (the repo just
 			// resolved); record it as fetch_failed and keep going rather than aborting the
@@ -527,11 +524,10 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (Fi
 // — a clearly delineated "how" section after the body (the untrusted forge task).
 // composeRunDescription truncates the guidance rather than let the composed total exceed
 // MaxIssueDescriptionBytes, so guidance never turns a runnable issue into a silent
-// ErrDescriptionTooLarge skip. It is purely additive: allowWithoutPRD is computed from
-// the raw labels and no eligibility gate sees the composed text.
-func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule, repoID uuid.UUID, iid int64, title, description string, labels []string, webURL string) (FireOutcome, error) {
+// ErrDescriptionTooLarge skip. It is purely additive: the eligibility gate reads the
+// cached issue's uzi_label (PRD #764 M1) and never sees the composed text.
+func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule, repoID uuid.UUID, iid int64, title, description string, webURL string) (FireOutcome, error) {
 	iidCopy := iid
-	allowWithoutPRD := e.allowWithoutPRD(ctx, labels)
 
 	desc := composeRunDescription(description, guidanceOf(sched))
 
@@ -543,13 +539,13 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		// auto-approve run carries a persisted per-schedule wait_on_limit that must take
 		// effect (PRD #274 Decision 1a). Leaving the poller seam untouched is a structural
 		// guarantee that label-driven autopilot behaviour is unchanged.
-		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, allowWithoutPRD, &waitOnLimit, scheduleModel(sched), scheduleOverrideSubagentModel(sched))
+		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleModel(sched), scheduleOverrideSubagentModel(sched))
 	} else {
 		// CreateScheduledRun, NOT CreateRun: a timer-fired sweep is not the interactive
 		// human click PRD #196's PRD-link waiver is scoped to, so a link-less
 		// non-primary-eligible issue swept in here still needs a link or PRDLESS. Using
 		// CreateRun would silently widen the scheduler past the PRD's stated invariant.
-		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, allowWithoutPRD, &waitOnLimit, scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil)
+		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil)
 	}
 
 	if err == nil {
@@ -691,21 +687,6 @@ func (e *Scheduler) park(ctx context.Context, sched store.RunSchedule, reason st
 			e.logger.Warn("scheduler: notify schedule error", "schedule", sched.ID.String(), "error", err)
 		}
 	}
-}
-
-// allowWithoutPRD computes the PRDLESS bypass from a fresh label snapshot, mirroring
-// the poller/handler exactly (PRD #22 Decision 3): enabled AND the issue carries the
-// configured PRDLESS label.
-func (e *Scheduler) allowWithoutPRD(ctx context.Context, labels []string) bool {
-	enabled, _ := e.settings.PrdlessEnabled(ctx)
-	if !enabled {
-		return false
-	}
-	label, _ := e.settings.PrdlessLabel(ctx)
-	if label == "" {
-		label = settings.DefaultPrdlessLabel
-	}
-	return contains(labels, label)
 }
 
 // resolveSweepLabels turns the schedule's stored jsonb label selector into the jsonb
@@ -872,15 +853,6 @@ func nonBlank(in []string) []string {
 		}
 	}
 	return out
-}
-
-func contains(hay []string, needle string) bool {
-	for _, s := range hay {
-		if s == needle {
-			return true
-		}
-	}
-	return false
 }
 
 // isNoRows reports whether err signals "no such row" from the store — the marker

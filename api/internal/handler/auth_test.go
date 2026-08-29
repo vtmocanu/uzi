@@ -37,8 +37,15 @@ func TestSessionPayloadCarriesEligibilityFields(t *testing.T) {
 		store.AppSetting{Key: settings.KeyPRDLabel, Value: "PRD"},
 		store.AppSetting{Key: settings.KeyRunEligibleLabels, Value: "PRD,bug,security"},
 		store.AppSetting{Key: settings.KeyEligibleLabelWaivesPRDLink, Value: "false"},
+		store.AppSetting{Key: settings.KeyUziLabel, Value: "runnable"},
 	)
 	payload := h.sessionPayload(context.Background(), store.User{})
+
+	// PRD #764 M1: the configured uzi_label rides the bootstrap payload so the SPA can
+	// render the runnable affordance. Absent pre-change, present post-change.
+	if uzi, ok := payload["uzi_label"].(string); !ok || uzi != "runnable" {
+		t.Errorf("uzi_label = %v (%T), want \"runnable\"", payload["uzi_label"], payload["uzi_label"])
+	}
 
 	got, ok := payload["run_eligible_labels"].([]string)
 	if !ok {

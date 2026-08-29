@@ -861,12 +861,12 @@ func TestEveryCreationPathStampsWaitOnLimit(t *testing.T) {
 
 	t.Run("CreateRun inherits the owner default", func(t *testing.T) {
 		fs := &fakeStore{
-			issueByID:       store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true},
+			issueByID:       store.Issue{Title: "T", Labels: uziLabels(), HasPrdLink: true},
 			createRunResult: store.Run{ID: uuid.New()},
 			userByID:        optedIn,
 		}
 		svc := New(fs, newBox(t), testParams())
-		if _, err := svc.CreateRun(context.Background(), optedIn.ID, uuid.New(), 4, "d", false, nil, nil); err != nil {
+		if _, err := svc.CreateRun(context.Background(), optedIn.ID, uuid.New(), 4, "d", nil, nil); err != nil {
 			t.Fatalf("CreateRun: %v", err)
 		}
 		if !fs.createRunParams.WaitOnLimit {
@@ -879,12 +879,12 @@ func TestEveryCreationPathStampsWaitOnLimit(t *testing.T) {
 	t.Run("CreateRun honours an explicit false over an opted-in default", func(t *testing.T) {
 		no := false
 		fs := &fakeStore{
-			issueByID:       store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true},
+			issueByID:       store.Issue{Title: "T", Labels: uziLabels(), HasPrdLink: true},
 			createRunResult: store.Run{ID: uuid.New()},
 			userByID:        optedIn,
 		}
 		svc := New(fs, newBox(t), testParams())
-		if _, err := svc.CreateRun(context.Background(), optedIn.ID, uuid.New(), 4, "d", false, &no, nil); err != nil {
+		if _, err := svc.CreateRun(context.Background(), optedIn.ID, uuid.New(), 4, "d", &no, nil); err != nil {
 			t.Fatalf("CreateRun: %v", err)
 		}
 		if fs.createRunParams.WaitOnLimit {
@@ -896,12 +896,12 @@ func TestEveryCreationPathStampsWaitOnLimit(t *testing.T) {
 	t.Run("CreateRun honours an explicit true over an opted-out default", func(t *testing.T) {
 		yes := true
 		fs := &fakeStore{
-			issueByID:       store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true},
+			issueByID:       store.Issue{Title: "T", Labels: uziLabels(), HasPrdLink: true},
 			createRunResult: store.Run{ID: uuid.New()},
 			userByID:        store.User{ID: optedIn.ID}, // default false
 		}
 		svc := New(fs, newBox(t), testParams())
-		if _, err := svc.CreateRun(context.Background(), optedIn.ID, uuid.New(), 4, "d", false, &yes, nil); err != nil {
+		if _, err := svc.CreateRun(context.Background(), optedIn.ID, uuid.New(), 4, "d", &yes, nil); err != nil {
 			t.Fatalf("CreateRun: %v", err)
 		}
 		if !fs.createRunParams.WaitOnLimit {
@@ -913,12 +913,12 @@ func TestEveryCreationPathStampsWaitOnLimit(t *testing.T) {
 		// The path the dropped start-run modal could never have reached: no human is in
 		// the loop, so the default is the ONLY thing that can opt it in.
 		fs := &fakeStore{
-			issueByID:       store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true},
+			issueByID:       store.Issue{Title: "T", Labels: uziLabels(), HasPrdLink: true},
 			createRunResult: store.Run{ID: uuid.New()},
 			userByID:        optedIn,
 		}
 		svc := New(fs, newBox(t), testParams())
-		if _, err := svc.CreateAutopilotRun(context.Background(), optedIn.ID, uuid.New(), 4, "d", false); err != nil {
+		if _, err := svc.CreateAutopilotRun(context.Background(), optedIn.ID, uuid.New(), 4, "d"); err != nil {
 			t.Fatalf("CreateAutopilotRun: %v", err)
 		}
 		if !fs.createRunParams.WaitOnLimit {
@@ -928,12 +928,12 @@ func TestEveryCreationPathStampsWaitOnLimit(t *testing.T) {
 
 	t.Run("a torn user read resolves false rather than failing the creation", func(t *testing.T) {
 		fs := &fakeStore{
-			issueByID:       store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true},
+			issueByID:       store.Issue{Title: "T", Labels: uziLabels(), HasPrdLink: true},
 			createRunResult: store.Run{ID: uuid.New()},
 			userByIDErr:     errors.New("boom"),
 		}
 		svc := New(fs, newBox(t), testParams())
-		if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "d", false, nil, nil); err != nil {
+		if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "d", nil, nil); err != nil {
 			t.Fatalf("a preference lookup failure must not fail the creation: %v", err)
 		}
 		if fs.createRunParams.WaitOnLimit {

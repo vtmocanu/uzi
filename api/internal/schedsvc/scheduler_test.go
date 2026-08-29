@@ -128,10 +128,9 @@ func (f *fakeStore) MarkImproveUziRecommendationsAddressed(_ context.Context, ar
 }
 
 type autopilotCall struct {
-	userID, repoID  uuid.UUID
-	issueIID        int64
-	description     string
-	allowWithoutPRD bool
+	userID, repoID uuid.UUID
+	issueIID       int64
+	description    string
 	// waitOnLimit is nil for the poller-shaped CreateAutopilotRun (which drops the
 	// per-run choice and takes the owner default) and carries the schedule's captured
 	// value for CreateScheduledAutopilotRun (PRD #274 Decision 1a). A test proves the
@@ -148,10 +147,9 @@ type autopilotCall struct {
 }
 
 type runCall struct {
-	userID, repoID  uuid.UUID
-	issueIID        int64
-	allowWithoutPRD bool
-	waitOnLimit     *bool
+	userID, repoID uuid.UUID
+	issueIID       int64
+	waitOnLimit    *bool
 	// scheduled discriminates which seam the scheduler routed to: false = CreateRun
 	// (the interactive human seam, which carries PRD #196's PRD-link waiver), true =
 	// CreateScheduledRun (the non-interactive scheduled seam, no waiver). This pins the
@@ -203,37 +201,37 @@ func (f *fakeRuns) effErr(issueIID int64) error {
 	return f.err
 }
 
-func (f *fakeRuns) CreateRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, allowWithoutPRD bool, waitOnLimit *bool, _ *workersvc.SeededPlan) (store.Run, error) {
+func (f *fakeRuns) CreateRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, _ *workersvc.SeededPlan) (store.Run, error) {
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
 	// nil model: the interactive CreateRun seam carries no per-schedule model (PRD #300).
 	// false overrideSubagentModel: no per-run opt-in on the interactive seam (PRD #305).
-	f.runs = append(f.runs, runCall{userID, repoID, issueIID, allowWithoutPRD, waitOnLimit, false, nil, false})
+	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, false, nil, false})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, allowWithoutPRD bool, waitOnLimit *bool, model *string, overrideSubagentModel bool, _ *workersvc.SeededPlan) (store.Run, error) {
-	// The non-auto-approve scheduled path (PRD #196): recorded in the same `runs`
-	// bucket as CreateRun so the existing wait-on-limit / path-selection count
-	// assertions still observe it, but tagged scheduled=true so a test can prove the
-	// scheduler routed here (waiver-free) rather than through CreateRun.
+func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, model *string, overrideSubagentModel bool, _ *workersvc.SeededPlan) (store.Run, error) {
+	// The non-auto-approve scheduled path: recorded in the same `runs` bucket as
+	// CreateRun so the existing wait-on-limit / path-selection count assertions still
+	// observe it, but tagged scheduled=true so a test can prove the scheduler routed
+	// here rather than through CreateRun.
 	if err := f.effErr(issueIID); err != nil {
 		return store.Run{}, err
 	}
-	f.runs = append(f.runs, runCall{userID, repoID, issueIID, allowWithoutPRD, waitOnLimit, true, model, overrideSubagentModel})
+	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, true, model, overrideSubagentModel})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool) (store.Run, error) {
+func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error) {
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
 	// nil waitOnLimit: the poller seam has no per-run choice (owner default). nil model:
 	// the poller seam has no per-run model (PRD #300). Kept so the interface stays
 	// satisfied even though the scheduler no longer calls it.
-	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, allowWithoutPRD, nil, nil, false})
+	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, nil, nil, false})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
+func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
 	// The auto-approve scheduled path (PRD #274 Decision 1a): recorded in the same
 	// `autopilot` bucket as CreateAutopilotRun so the existing count assertions still
 	// observe it, but it CAPTURES waitOnLimit (which CreateAutopilotRun drops) and the
@@ -241,7 +239,7 @@ func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID
 	if err := f.effErr(issueIID); err != nil {
 		return store.Run{}, err
 	}
-	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, allowWithoutPRD, waitOnLimit, model, overrideSubagentModel})
+	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, waitOnLimit, model, overrideSubagentModel})
 	return store.Run{ID: uuid.New()}, nil
 }
 func (f *fakeRuns) CreatePromptRun(_ context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, model *string, overrideSubagentModel bool) (store.Run, error) {
@@ -337,14 +335,10 @@ func (b *fakeBuilder) ForgeForConnection(string, string, []byte) (forge.Forge, e
 }
 
 type fakeSettings struct {
-	prdlessEnabled bool
-	prdlessLabel   string
-	prdLabel       string
+	prdLabel string
 }
 
-func (s *fakeSettings) PrdlessEnabled(context.Context) (bool, error) { return s.prdlessEnabled, nil }
-func (s *fakeSettings) PrdlessLabel(context.Context) (string, error) { return s.prdlessLabel, nil }
-func (s *fakeSettings) PRDLabel(context.Context) (string, error)     { return s.prdLabel, nil }
+func (s *fakeSettings) PRDLabel(context.Context) (string, error) { return s.prdLabel, nil }
 
 type fakeNotifier struct{ notifications []notifysvc.Notification }
 
