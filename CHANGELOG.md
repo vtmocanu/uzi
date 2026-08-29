@@ -30,6 +30,11 @@ through `[0.52.0]`.)
 - **Assigning an issue to the uzi-bot is now a run-eligibility signal too ([#767](https://github.com/vtmocanu/uzi/issues/767)).**
   An issue carrying the `uzi` label OR assigned to the uzi-bot account is runnable through the single eligibility gate, so the manual Start button, autopilot's poller, and every sweep's per-issue gate recognize either signal. Existing label sweeps still pick their candidates by label (`bug`/`Planned`, unchanged) — a candidate that is bot-assigned rather than `uzi`-labelled now fires where it was skipped before — while a new opt-in `assigned-sweep` catalog default picks bot-assigned issues that carry no selector label (`auto_approve` on, matching the existing sweeps). The board marks a bot-assigned card runnable with no label needed. Assignment alone never starts a run: unattended execution still needs the `autopilot` label or an enabled sweep, exactly like a `uzi`-labelled issue.
 
+### Fixed
+
+- **`run_usage` no longer undercounts a broken-resume run's cost ([#632](https://github.com/vtmocanu/uzi/issues/632)).**
+  When a worker restart failed to resume and started a fresh SDK session, that leg accumulated token/cost from zero under a new session row and the `run_usage_totals` rollup's MAX-per-model silently masked the smaller leg, so a run's recorded total could undercount by up to a full leg (measured live: one run recorded $64.74 against an actual $321.66). The server now stamps a defaulted `lineage_epoch` marker, bumped once when the worker signals a dropped resume (`resume_lineage_break`), and the totals view MAXes within each `(run, model, lineage_epoch)` then SUMs across epochs — recovering the masked leg. Advisory telemetry only (nothing is billed from it), and existing rows default to epoch 0 so no historical number is restated; the web run-page's own client-side usage strip stays epoch-unaware for now (tracked separately).
+
 ## [0.68.0] - 2026-08-29
 
 ### Changed

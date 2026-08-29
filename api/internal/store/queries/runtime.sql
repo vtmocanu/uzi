@@ -2167,11 +2167,14 @@ LIMIT @lim;
 -- different cumulative snapshots hit the same key). The API calls this for every
 -- delivered result frame incl. seq-deduped replays, so at-least-once delivery +
 -- this idempotent monotonic merge = correct totals with no crash window.
+-- lineage_epoch (PRD #632) is a stamped attribute pinned to first insert (omitted
+-- from DO UPDATE SET) — the fresh dropped-resume leg's distinct session_id is the
+-- row-splitter, and pinning prevents a late re-fold from re-collapsing legs.
 INSERT INTO run_usage (
-    run_id, session_id, model,
+    run_id, session_id, model, lineage_epoch,
     input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, updated_at
 ) VALUES (
-    @run_id, @session_id, @model,
+    @run_id, @session_id, @model, @lineage_epoch,
     @input_tokens, @cache_read_tokens, @cache_creation_tokens, @output_tokens, @cost_usd, now()
 )
 ON CONFLICT (run_id, session_id, model) DO UPDATE SET
@@ -2181,6 +2184,15 @@ ON CONFLICT (run_id, session_id, model) DO UPDATE SET
     output_tokens         = GREATEST(run_usage.output_tokens,         EXCLUDED.output_tokens),
     cost_usd              = GREATEST(run_usage.cost_usd,              EXCLUDED.cost_usd),
     updated_at            = now();
+
+-- name: BumpRunLineageEpoch :exec
+-- PRD #632: increment a run's lineage-epoch counter by one. The API calls this once
+-- per NEWLY-INSERTED resume_lineage_break status event (dropped-resume signal, #334)
+-- so a fresh SDK leg's run_usage rows are stamped with a higher epoch than the prior
+-- leg's; the run_usage_totals view then SUMs across epochs instead of MAX-masking the
+-- smaller leg. Bumping only for events in `inserted` (never re-deliveries) keeps it
+-- idempotent under at-least-once delivery.
+UPDATE runs SET lineage_epoch = lineage_epoch + 1, updated_at = now() WHERE id = @id;
 
 -- name: GetRunUsageTotal :one
 -- One run's rollup totals (PRD #40 M3), for the run-detail usage strip. Reads the

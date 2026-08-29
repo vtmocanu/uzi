@@ -459,6 +459,7 @@ type Run struct {
 	StatusSince           pgtype.Timestamptz `json:"status_since"`
 	ReviewComments        []byte             `json:"review_comments"`
 	BudgetPausedSeconds   int32              `json:"budget_paused_seconds"`
+	LineageEpoch          int32              `json:"lineage_epoch"`
 }
 
 type RunMessage struct {
@@ -527,6 +528,7 @@ type RunUsage struct {
 	OutputTokens        int64              `json:"output_tokens"`
 	CostUsd             pgtype.Numeric     `json:"cost_usd"`
 	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+	LineageEpoch        int32              `json:"lineage_epoch"`
 }
 
 type RunUsageTotal struct {
