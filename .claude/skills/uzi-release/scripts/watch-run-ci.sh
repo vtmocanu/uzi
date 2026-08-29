@@ -80,9 +80,17 @@ resolve_run() {
 
 # Classify one run's jobs (jq TSV on stdin: status<TAB>conclusion<TAB>name<TAB>url).
 # Prints FAIL / PENDING / GREEN, then the failing rows (name<TAB>url) when FAIL.
+# $1 == "1" selects branch mode, where a `cancelled` run means it was superseded by a
+# newer push (ci.yml concurrency), NOT a failure — the loop's run-level guard re-resolves
+# it, so cancelled is excluded from isfail here. In explicit run-id mode a cancelled run
+# IS a failure (you asked to watch that specific run).
 classify() {
-  awk -F'\t' '
-    function isfail(c){ return c=="failure"||c=="cancelled"||c=="timed_out"||c=="action_required"||c=="startup_failure" }
+  awk -F'\t' -v bmode="${1:-0}" '
+    function isfail(c){
+      if (c=="failure"||c=="timed_out"||c=="action_required"||c=="startup_failure") return 1
+      if (c=="cancelled" && bmode!="1") return 1
+      return 0
+    }
     {
       status=$1; concl=$2; name=$3; url=$4
       if (status!="completed") { pend++; next }        # non-terminal job
@@ -95,13 +103,17 @@ classify() {
     }'
 }
 
-# Dump one run as jq TSV; empty output signals a gh/run-not-found error to the caller.
+# Dump one run's jobs as jq TSV into DUMP_OUT; RETURN gh's exit status so the caller
+# can tell a real gh failure (bad run id, auth, API down) from an empty-but-successful
+# read. stderr is folded into DUMP_OUT (empty on success), so on failure DUMP_OUT
+# carries the gh error text for the log. Do NOT call inside a $(...) subshell — that
+# would discard the rc this function exists to return.
 dump() {
-  gh run view "$1" --json jobs \
-    --jq '.jobs[] | [.status, (.conclusion // ""), .name, .url] | @tsv' 2>/dev/null
+  DUMP_OUT="$(gh run view "$1" --json jobs \
+    --jq '.jobs[] | [.status, (.conclusion // ""), .name, .url] | @tsv' 2>&1)"
 }
 
-tick=0
+tick=0; gh_errs=0
 while [ "$tick" -lt "$MAX_TICKS" ]; do
   # With --branch and no fixed run id, re-resolve each tick (a concurrent push mints a
   # newer run; a rerun keeps the same id). With an explicit run id, keep it.
@@ -111,20 +123,46 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
   fi
   if [ -z "$cur" ]; then echo "[tick $tick] no run found for branch=$BRANCH workflow=$WORKFLOW; retrying"; sleep "$INTERVAL"; tick=$((tick+1)); continue; fi
 
-  out="$(dump "$cur")"
-  if [ -z "$out" ]; then echo "[tick $tick] gh returned no jobs for run $cur (transient?); retrying"; sleep "$INTERVAL"; tick=$((tick+1)); continue; fi
+  # A nonzero gh rc is a real error (bad run id, auth, API down), NOT empty jobs.
+  # Tolerate one transient blip, then honor the documented exit 3 rather than silently
+  # waiting out every tick and exiting 2.
+  if ! dump "$cur"; then
+    gh_errs=$((gh_errs+1))
+    echo "[tick $tick] gh run view failed for run $cur (consecutive failure $gh_errs): $DUMP_OUT" >&2
+    if [ "$gh_errs" -ge 2 ]; then echo "gh keeps failing on run $cur; giving up (exit 3)" >&2; exit 3; fi
+    sleep "$INTERVAL"; tick=$((tick+1)); continue
+  fi
+  gh_errs=0
+  out="$DUMP_OUT"
+  if [ -z "$out" ]; then echo "[tick $tick] run $cur reported no jobs yet (transient?); retrying"; sleep "$INTERVAL"; tick=$((tick+1)); continue; fi
 
-  verdict="$(printf '%s\n' "$out" | classify)"
+  # Branch mode only: a run cancelled by ci.yml concurrency was superseded by a newer
+  # push — re-resolve to the newer run next tick instead of reporting a red. (In
+  # explicit run-id mode a cancelled run is a genuine failure and falls through.)
+  if [ -n "$BRANCH" ]; then
+    concl="$(gh run view "$cur" --json conclusion --jq '.conclusion // ""' 2>/dev/null)"
+    if [ "$concl" = "cancelled" ]; then
+      echo "[tick $tick] run $cur cancelled (superseded by a newer push); re-resolving next tick"
+      sleep "$INTERVAL"; tick=$((tick+1)); continue
+    fi
+  fi
+
+  bmode=0; [ -n "$BRANCH" ] && bmode=1
+  verdict="$(printf '%s\n' "$out" | classify "$bmode")"
   case "$(printf '%s\n' "$verdict" | head -1)" in
     FAIL)
-      # Confirm with one immediate re-query to shake off a stale first-tick read.
-      out2="$(dump "$cur")"; verdict2="$(printf '%s\n' "$out2" | classify)"
-      if [ "$(printf '%s\n' "$verdict2" | head -1)" = "FAIL" ]; then
-        echo "=== run $cur: FAILED JOB(S) after $((tick*INTERVAL))s — react now (read the log: gh run view --job <id> --log-failed) ==="
-        printf '%s\n' "$verdict2" | tail -n +2 | awk -F'\t' '{printf "  FAIL  %-28s %s\n",$1,$2}'
-        exit 1
+      # Confirm with one immediate re-query to shake off a stale first-tick read. If the
+      # re-query itself gh-errors, skip confirmation this tick rather than exit 1 on a
+      # fail we could not reconfirm.
+      if dump "$cur"; then
+        verdict2="$(printf '%s\n' "$DUMP_OUT" | classify "$bmode")"
+        if [ "$(printf '%s\n' "$verdict2" | head -1)" = "FAIL" ]; then
+          echo "=== run $cur: FAILED JOB(S) after $((tick*INTERVAL))s — react now (read the log: gh run view --job <id> --log-failed) ==="
+          printf '%s\n' "$verdict2" | tail -n +2 | awk -F'\t' '{printf "  FAIL  %-28s %s\n",$1,$2}'
+          exit 1
+        fi
+        echo "[tick $tick] a fail cleared on re-query (stale read); continuing"
       fi
-      echo "[tick $tick] a fail cleared on re-query (stale read); continuing"
       ;;
     GREEN)
       echo "=== run $cur: all jobs terminal, none failed after $((tick*INTERVAL))s ==="
