@@ -439,18 +439,65 @@ export class GitCache {
       // necessarily carry the default branch), so the resolution happens here.
       const originRef = `refs/remotes/origin/${branch}`;
       const trackingRef = runnerTrackingRef(branch);
-      const originExists = await this.refExists(barePath, originRef);
+      // issue #781 — disjoint-history guard. Resolve the default ref ONCE up front, then
+      // qualify EACH candidate base ref: it counts as existing only if it also shares
+      // history with the default branch. A candidate that exists but is disjoint from
+      // default (a stale ref whose remote counterpart was rebuilt from an orphan root, or
+      // a leftover from an unrelated branch reused) is treated as ABSENT, so the seed falls
+      // back cleanly to the default tip instead of seeding off unrelated history. The guard
+      // qualifies up front (not a post-override): each candidate's downstream logic below is
+      // unchanged for a candidate that DOES share history.
+      // Best-effort: if the default cannot be resolved we cannot prove disjointness, so
+      // every candidate is kept (byte-identical to pre-#781 behaviour on this leg). The
+      // not-ownedHere/no-origin else leg still resolves the default authoritatively for its
+      // floor below, and throws there if truly unresolvable — unchanged.
+      let defaultRef: string | undefined;
+      try {
+        defaultRef = await this.defaultBranchRef(barePath);
+      } catch {
+        defaultRef = undefined;
+      }
+      const originExistsRaw = await this.refExists(barePath, originRef);
+      const originDisjoint = originExistsRaw && defaultRef !== undefined
+        && !(await this.sharesHistory(barePath, originRef, defaultRef));
+      if (originDisjoint) {
+        this.log.warn(
+          "runner clone: origin branch ref is disjoint from default — ignoring, seeding off default tip",
+          { branch, originRef },
+        );
+      }
+      const originExists = originExistsRaw && !originDisjoint;
       // The tracking ref is consulted ONLY when its stamp says THIS run wrote it — the
-      // run-identity anchor that gates the whole consideration (see the doc comment).
-      const trackingExists = await this.refExists(barePath, trackingRef);
+      // run-identity anchor that gates the whole consideration (see the doc comment). A
+      // disjoint tracking ref is treated as absent so it cannot make `ownedHere` true.
+      const trackingExistsRaw = await this.refExists(barePath, trackingRef);
+      const trackingDisjoint = trackingExistsRaw && defaultRef !== undefined
+        && !(await this.sharesHistory(barePath, trackingRef, defaultRef));
+      if (trackingDisjoint) {
+        this.log.warn(
+          "runner clone: tracking ref is disjoint from default — ignoring, seeding off default tip",
+          { branch, trackingRef },
+        );
+      }
+      const trackingExists = trackingExistsRaw && !trackingDisjoint;
       const owner = trackingExists
         ? await this.tryGitStdout(barePath, ["config", "--get", runnerTrackingOwnerKey(branch)])
         : "";
       const ownedHere = trackingExists && runId !== undefined && owner === runId;
       // PRD #122 M8 cross-worker candidate: origin's checkpoint ref, mirrored into the bare
-      // by fetch(). Consulted ONLY on the not-ownedHere legs (see the doc comment).
+      // by fetch(). Consulted ONLY on the not-ownedHere legs (see the doc comment). A
+      // disjoint checkpoint is treated as absent (so no checkpointSetAside is emitted for it).
       const checkpointRef = `refs/uzi-checkpoints/${branch}`;
-      const checkpointExists = await this.refExists(barePath, checkpointRef);
+      const checkpointExistsRaw = await this.refExists(barePath, checkpointRef);
+      const checkpointDisjoint = checkpointExistsRaw && defaultRef !== undefined
+        && !(await this.sharesHistory(barePath, checkpointRef, defaultRef));
+      if (checkpointDisjoint) {
+        this.log.warn(
+          "runner clone: checkpoint ref is disjoint from default — ignoring, seeding off default tip",
+          { branch, checkpointRef },
+        );
+      }
+      const checkpointExists = checkpointExistsRaw && !checkpointDisjoint;
 
       let baseRef: string;
       let seededFrom: RunnerClone["seededFrom"];
@@ -1431,7 +1478,15 @@ export class GitCache {
   }
 
   private async fetch(barePath: string, pat?: string, scope?: string, username?: string): Promise<void> {
-    await this.runGit(barePath, ["fetch", "origin"], pat, scope, username);
+    // issue #781 — the `--prune` FLAG (NOT the config form `fetch.prune` /
+    // `remote.origin.prune`) prunes only the ref namespace of this fetch's configured
+    // refspec `+refs/heads/*:refs/remotes/origin/*` — i.e. `refs/remotes/origin/*` — so a
+    // remote branch deleted upstream stops seeding stale disjoint bases while
+    // `refs/uzi-runner/*` and the separate checkpoint mirror fetch's `refs/uzi-checkpoints/*`
+    // stay intact. The config form would additionally prune the locally-mirrored checkpoint
+    // refs on the separate mirror fetch just below (whose origin has no `refs/uzi-checkpoints/*`
+    // to match), degrading PRD #122 M8 cross-worker recovery.
+    await this.runGit(barePath, ["fetch", "--prune", "origin"], pat, scope, username);
     // Refresh origin/HEAD so a remote default-branch change takes effect. Best
     // effort: defaultBranchRef has fallbacks if this symref is absent.
     await this.tryGit(barePath, ["remote", "set-head", "origin", "--auto"]);
@@ -1492,6 +1547,16 @@ export class GitCache {
    *  wins the "strictly descends" branch. */
   private async isAncestor(barePath: string, ancestorRef: string, descendantRef: string): Promise<boolean> {
     return (await this.tryGit(barePath, ["merge-base", "--is-ancestor", ancestorRef, descendantRef])) === 0;
+  }
+
+  /** issue #781 — true when `ref` shares any history with the default branch, i.e.
+   *  plain `git merge-base <ref> <default>` prints a commit (exit 0). Distinct from
+   *  isAncestor (merge-base --is-ancestor), which returns non-zero for BOTH a disjoint
+   *  AND a merely-diverged base — so it cannot be reused here without false-rejecting a
+   *  legitimately far-ahead resume/first-park base. Only plain merge-base discriminates
+   *  disjoint (empty, exit 1) from diverged (a common ancestor exists, exit 0). */
+  private async sharesHistory(barePath: string, ref: string, defaultRef: string): Promise<boolean> {
+    return (await this.tryGit(barePath, ["merge-base", ref, defaultRef])) === 0;
   }
 
   /** PRD #759 M2 — is the commit `sha` a `wip(park):` marker (WIP_PARK_COMMIT_PREFIX)?
