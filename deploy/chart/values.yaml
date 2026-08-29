@@ -72,6 +72,17 @@ imageVerification:
     identityRegexp: '^https://github\.com/vtmocanu/uzi/\.github/workflows/release\.yml@refs/tags/.*$'
     issuer: "https://token.actions.githubusercontent.com"
 
+# --- forge: the single source of truth for which forge base URLs are reachable ----
+#
+# One list, two consumers, so they can never diverge (PRD #808): it renders into the
+# api's FORGE_ALLOWED_BASE_URLS env (the SSRF allowlist) AND into the kube-native
+# worker FQDN egress allow-list (worker-fqdn-egress.yaml derives one Allow per host).
+# https base URLs only. Empty (the default) leaves the api on its own built-in default
+# and emits no forge egress FQDN. Set this per-cluster instead of api.config.FORGE_ALLOWED_BASE_URLS
+# (setting BOTH fails the render — see api-configmap.yaml).
+forge:
+  allowedBaseURLs: []
+
 # --- api: the Go backend (sole holder of secrets/keys, the DB client) -----------
 api:
   enabled: true
@@ -849,6 +860,14 @@ workers:
         ports: [443]
       - name: allow-nix-substituters
         fqdn: "cache.nixos.org"
+        ports: [443]
+      # The devbox package RESOLVER (search.devbox.sh), hit by `devbox install` to turn a
+      # `name@version` into a nix ref BEFORE the substituter fetch. Without it, tier-1/tier-2
+      # repo tool provisioning i/o-times-out on the kube-native tier (PRD #808, D6). This is a
+      # deliberate egress widening; the server-side tier-1 admin allowlist is the backstop.
+      # Server-side resolution (removing this host again) is a deferred follow-up.
+      - name: allow-devbox-resolver
+        fqdn: "search.devbox.sh"
         ports: [443]
       # `helm dependency build` for THIS chart's CNPG `cluster` subchart, so an agent
       # editing deploy/chart/ can render it in-worker instead of committing blind and

@@ -1,4 +1,4 @@
-{{- if and .Values.api.enabled (or .Values.api.config (include "uzi.apiHostingEnabled" .)) }}
+{{- if and .Values.api.enabled (or .Values.api.config .Values.forge.allowedBaseURLs (include "uzi.apiHostingEnabled" .)) }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -9,6 +9,22 @@ metadata:
 data:
   {{- range $k, $v := .Values.api.config }}
   {{ $k }}: {{ $v | quote }}
+  {{- end }}
+  {{- /*
+    FORGE_ALLOWED_BASE_URLS rendered EXPLICITLY from the first-class forge.allowedBaseURLs
+    value (PRD #808), NOT left to the api.config freeform map — so the SSRF allowlist and
+    the worker egress FQDNs (worker-fqdn-egress.yaml) share ONE source and cannot diverge.
+    Rendered like WORKER_HOSTING_ENABLED below, for the same anti-drift reason.
+
+    Setting BOTH forge.allowedBaseURLs AND api.config.FORGE_ALLOWED_BASE_URLS would emit a
+    DUPLICATE ConfigMap key (the range above already emitted the api.config one), so that
+    combination is a hard render failure rather than a last-wins silent pick.
+  */ -}}
+  {{- if .Values.forge.allowedBaseURLs }}
+  {{- if hasKey .Values.api.config "FORGE_ALLOWED_BASE_URLS" }}
+  {{- fail "Set the forge allowlist in EITHER forge.allowedBaseURLs OR api.config.FORGE_ALLOWED_BASE_URLS, not both: both set would emit a duplicate FORGE_ALLOWED_BASE_URLS ConfigMap key. Prefer forge.allowedBaseURLs (it also drives the worker egress FQDN list)." }}
+  {{- end }}
+  FORGE_ALLOWED_BASE_URLS: {{ join "," .Values.forge.allowedBaseURLs | quote }}
   {{- end }}
   {{- if include "uzi.apiHostingEnabled" . }}
   # Hosted workers (PRD #58 Decision 12). Rendered from the chart rather than left to

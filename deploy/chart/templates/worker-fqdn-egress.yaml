@@ -75,4 +75,19 @@ spec:
           port: {{ . }}
         {{- end }}
     {{- end }}
+    {{- /*
+      DERIVED forge egress (PRD #808): one Allow per host from the SAME forge.allowedBaseURLs
+      that feeds the api SSRF allowlist, so a forge is declared once and the two lists cannot
+      diverge. urlParse .hostname strips any :port (the port is carried separately as 443).
+    */ -}}
+    {{- range .Values.forge.allowedBaseURLs }}
+    {{- $host := (urlParse .).hostname }}
+    - name: allow-forge-{{ $host | replace "." "-" | replace "*" "wildcard" }}
+      action: Allow
+      to:
+        - fqdn: {{ $host | quote }}
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}
 {{- end }}
