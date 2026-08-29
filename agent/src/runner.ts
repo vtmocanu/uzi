@@ -3225,6 +3225,11 @@ function mrTitle(
   // inline context's first line, so the trimmed-title branch above almost always
   // wins; this is the empty-context fallback, never `Resolve issue #null`.
   if (claim.kind === "task") return "Handoff task";
+  // An mr_rework run (PRD #700 / issue #778) is ISSUE-LESS (issue_iid is NULL): its
+  // issue_title is derived from the reworked MR's title so the trimmed-title branch
+  // above almost always wins; this is the empty-title fallback, never `Resolve issue
+  // #null` on the off-nominal path where a new MR is created.
+  if (claim.kind === "mr_rework") return "MR rework";
   return `${prefix}Resolve issue #${claim.issue_iid}`;
 }
 

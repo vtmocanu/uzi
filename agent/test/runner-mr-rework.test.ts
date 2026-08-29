@@ -105,7 +105,10 @@ describe("RunRunner — mr_rework kind (PRD #700 / issue #778)", () => {
     // this exercises the description builder directly — the exact path where a missing
     // mr_rework arm would render `Implements issue #null` / `Closes #null`.
     const { gitlab, calls } = fakeGitlab();
-    const claim = mrReworkClaim();
+    // Empty issue_title forces mrTitle past its trimmed-title branch to the empty-title
+    // fallback, so the "#null" title assertion below actually exercises the mr_rework arm
+    // rather than returning the fixture's non-empty title (which made it vacuous).
+    const claim = mrReworkClaim({ issue_title: "" });
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
 
     assert.equal(calls.length, 1, "the mr_rework finalize opened exactly one MR");
