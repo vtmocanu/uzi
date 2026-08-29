@@ -14,18 +14,27 @@ default theme, and the run judge.
 
 | Setting | Default | Controls |
 |---|---|---|
-| `uzi` label | `uzi` | The single run-eligibility gate: which GitLab label marks an issue as uzi's own work and makes it runnable. It's the label uzi *writes* to mark an issue as its own work (Promote, a judge-filed issue, board issue creation); every board fetches its full history (any state), alongside every other open issue. See [Run eligibility](#run-eligibility). |
-| Autopilot label | `autopilot` | Which GitLab label, added alongside the `uzi` label, triggers an unattended run for an opted-in user. See [Autopilot](./autopilot.md). |
+| `uzi` label | `uzi` | A run-eligibility signal: which GitLab label marks an issue as uzi's own work and makes it runnable. Assigning the issue to the uzi-bot account is the other, equivalent signal. It's the label uzi *writes* to mark an issue as its own work (Promote, a judge-filed issue, board issue creation); every board fetches its full history (any state), alongside every other open issue. See [Run eligibility](#run-eligibility). |
+| Autopilot label | `autopilot` | Which GitLab label, added to a run-eligible issue (one carrying the `uzi` label **or** assigned to the uzi-bot account), triggers an unattended run for an opted-in user. See [Autopilot](./autopilot.md). |
 
 ## Run eligibility
 
-Run-eligibility is one label, one gate: an issue carrying the configured
-`uzi` label is runnable, full stop. There's no PRD link, no escape-hatch
-label, and no admin waiver to reason about — a prior model tangled
-those together, and it's gone. `Planned` and `bug` are unaffected **sweep
-selectors** (see [Scheduling](./scheduling.md)): they decide which open
-issues a sweep even considers, but a picked candidate only actually fires
-once it also carries `uzi`.
+Run-eligibility is one gate, expressed two ways: an issue carrying the
+configured `uzi` label **or** assigned to the uzi-bot account is runnable,
+full stop. There's no PRD link, no escape-hatch label, and no admin waiver
+to reason about — a prior model tangled those together, and it's gone.
+`Planned` and `bug` are unaffected **sweep selectors** (see
+[Scheduling](./scheduling.md)): they decide which open issues a sweep even
+considers, but a picked candidate only actually fires once it's also
+eligible — labelled `uzi` or assigned to the bot.
+
+Assignment grants **eligibility only** — it never starts a run by itself.
+An issue merely assigned to the bot sits exactly like a `uzi`-labelled one
+until a human clicks **Start run**, or until it also carries the autopilot
+label or is picked up by an enabled sweep (the built-in `assigned-sweep`
+default sweeps bot-assigned issues directly — see [Default
+jobs](./scheduling.md#default-jobs)) — the same two deliberate opt-ins
+that gate unattended execution for a label-eligible issue.
 
 A linked `prds/*.md` file is now **optional**. uzi still detects it
 automatically — no label or setting controls that — and the agent still

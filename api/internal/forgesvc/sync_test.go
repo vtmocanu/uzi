@@ -247,8 +247,9 @@ func (f *fakeForge) JobLogTail(context.Context, int64, int64, int) (string, erro
 // MR-close watcher fields (candidates/issue/columns/mrStateWrites) are exercised
 // by mr_watch_test.go; the sync tests leave them zero.
 type fakeStore struct {
-	upserts     []store.UpsertIssueParams
-	deleteCalls []store.DeleteIssuesNotInParams
+	upserts      []store.UpsertIssueParams
+	labelUpserts []store.UpsertIssueLabelsParams // AutoMove / SetIssueLabel writes (PRD #767)
+	deleteCalls  []store.DeleteIssuesNotInParams
 
 	// MR-close watcher (PRD #24) scripting + capture.
 	candidates    []store.ListMRWatchCandidatesRow
@@ -305,7 +306,12 @@ type fakeStore struct {
 
 func (s *fakeStore) UpsertIssue(_ context.Context, arg store.UpsertIssueParams) (store.Issue, error) {
 	s.upserts = append(s.upserts, arg)
-	// Echo the labels back so AutoMove's re-cache returns the moved row.
+	// Echo the labels back so the full-sync re-cache returns the synced row.
+	return store.Issue{RepoID: arg.RepoID, ForgeIssueIid: arg.ForgeIssueIid, State: arg.State, Labels: arg.Labels}, nil
+}
+func (s *fakeStore) UpsertIssueLabels(_ context.Context, arg store.UpsertIssueLabelsParams) (store.Issue, error) {
+	s.labelUpserts = append(s.labelUpserts, arg)
+	// Echo the labels back so AutoMove / SetIssueLabel's re-cache returns the moved row.
 	return store.Issue{RepoID: arg.RepoID, ForgeIssueIid: arg.ForgeIssueIid, State: arg.State, Labels: arg.Labels}, nil
 }
 func (s *fakeStore) DeleteIssuesNotIn(_ context.Context, arg store.DeleteIssuesNotInParams) (int64, error) {
@@ -680,8 +686,8 @@ func TestAutoMoveEnsuresTargetColumnLabel(t *testing.T) {
 		if len(f.updateCalls) != 0 {
 			t.Fatalf("UpdateIssueLabels ran despite the ensure error: %+v", f.updateCalls)
 		}
-		if len(st.upserts) != 0 {
-			t.Fatalf("cache upsert ran despite the ensure error: %+v", st.upserts)
+		if len(st.labelUpserts) != 0 {
+			t.Fatalf("cache upsert ran despite the ensure error: %+v", st.labelUpserts)
 		}
 	})
 

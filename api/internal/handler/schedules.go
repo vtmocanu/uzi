@@ -1627,19 +1627,20 @@ func marshalLabels(labels []string) []byte {
 // and wait_on_limit are the fixed schedtmpl run flags, not per-entry.
 func catalogEntryDTO(j schedtmpl.DefaultJob) apitypes.CatalogEntryDTO {
 	return apitypes.CatalogEntryDTO{
-		Slug:        j.Slug,
-		Name:        j.Name,
-		Description: j.Description,
-		Target:      j.Target,
-		Cron:        j.Cron,
-		Timezone:    catalogTimezone(j),
-		Model:       j.Model,
-		Prompt:      j.Prompt,
-		Labels:      j.Labels,
-		Guidance:    j.Guidance,
-		MaxIssues:   j.MaxIssues,
-		AutoApprove: schedtmpl.AutoApprove,
-		WaitOnLimit: schedtmpl.WaitOnLimit,
+		Slug:         j.Slug,
+		Name:         j.Name,
+		Description:  j.Description,
+		Target:       j.Target,
+		Cron:         j.Cron,
+		Timezone:     catalogTimezone(j),
+		Model:        j.Model,
+		Prompt:       j.Prompt,
+		SelectorKind: j.SelectorKind,
+		Labels:       j.Labels,
+		Guidance:     j.Guidance,
+		MaxIssues:    j.MaxIssues,
+		AutoApprove:  schedtmpl.AutoApprove,
+		WaitOnLimit:  schedtmpl.WaitOnLimit,
 	}
 }
 

@@ -1066,10 +1066,16 @@ func toGitHubIssue(i *gh.Issue) Issue {
 		Description: i.GetBody(),
 		WebURL:      i.GetHTMLURL(),
 		UpdatedAt:   i.GetUpdatedAt().Time,
+		Assignees:   []int64{},
 	}
 	for _, l := range i.Labels {
 		if l != nil {
 			issue.Labels = append(issue.Labels, l.Name)
+		}
+	}
+	for _, a := range i.Assignees {
+		if a != nil {
+			issue.Assignees = append(issue.Assignees, a.GetID())
 		}
 	}
 	if u := i.GetUser(); u != nil {

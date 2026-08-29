@@ -4779,17 +4779,21 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		}
 		return store.Run{}, err
 	}
-	// The RUN-ELIGIBILITY gate (PRD #764): an issue is uzi's to run iff it carries the
-	// configured uzi_label. This is the SINGLE gate — a run no longer requires a PRD
-	// link or any escape-hatch/waiver label. A linked prds/*.md is still detected and
-	// implemented when present, but never required.
+	// The RUN-ELIGIBILITY gate (PRD #764, widened by PRD #767): an issue is uzi's to
+	// run iff it carries the configured uzi_label OR is assigned to the uzi-bot account
+	// (row.BotForgeUserID). Assignment is an ADDITIVE second signal, the same single
+	// concept expressed two natural ways; it grants eligibility only — unattended
+	// execution still needs autopilot or an enabled sweep (PRD #767 D1). A run no longer
+	// requires a PRD link or any escape-hatch/waiver label. A linked prds/*.md is still
+	// detected and implemented when present, but never required.
 	//
-	// Derived from the cached labels rather than a fresh forge read: the same jsonb the
-	// board renders the card from, so the button a user sees and the gate the server
-	// applies cannot disagree. Promote writes the label forge-first AND updates this
-	// cache row in the same request, so the promote-then-run sequence is not racing the
-	// poller.
-	if !isEligibleIssue(issue.Labels, []string{s.uziLabel(ctx)}) {
+	// Derived from the cached labels/assignees rather than a fresh forge read: the same
+	// jsonb the board renders the card from, so the button a user sees and the gate the
+	// server applies cannot disagree. Promote writes the label forge-first AND updates
+	// this cache row in the same request, so the promote-then-run sequence is not racing
+	// the poller.
+	if !isEligibleIssue(issue.Labels, []string{s.uziLabel(ctx)}) &&
+		!isAssignedToBot(issue.AssigneeIds, row.BotForgeUserID) {
 		return store.Run{}, ErrNotPRDIssue
 	}
 	// Cross-kind same-branch exclusion (PRD #6): this issue run will use the
@@ -4945,6 +4949,22 @@ func isEligibleIssue(labelsJSON []byte, eligible []string) bool {
 		}
 	}
 	return false
+}
+
+// isAssignedToBot reports whether the cached issue's assignee_ids jsonb (a set of
+// numeric forge user ids) contains the connection's bot forge user id. Like
+// isEligibleIssue, an undecodable value is NOT a match: the gate has no basis for
+// consent. botID <= 0 (an unset/absent bot id) never matches, so a connection
+// without a resolved bot never grants assignment-eligibility by accident.
+func isAssignedToBot(assigneeIDsJSON []byte, botID int64) bool {
+	if botID <= 0 {
+		return false
+	}
+	var ids []int64
+	if err := json.Unmarshal(assigneeIDsJSON, &ids); err != nil {
+		return false
+	}
+	return slices.Contains(ids, botID)
 }
 
 // originColumn resolves the issue's current column to snapshot onto the run, so a

@@ -3251,7 +3251,10 @@ export const mockApi = {
     const description = card.has_prd_link
       ? `## Summary\n\nImplement the change described in the linked PRD.\n\nSee \`prds/${iid}-feature.md\` for the full specification.`
       : "This issue has no linked `prds/*.md` file. A PRD is optional — label the issue `uzi` and a run can still be started from it.";
-    return delay({ issue: { ...rest, description } });
+    // bot_forge_user_id rides the issue detail (PRD #767 M5), from the board's single
+    // connection, so the issue view evaluates the same "uzi OR assigned-to-bot" predicate
+    // as the board card — assignee_ids comes through on ...rest.
+    return delay({ issue: { ...rest, assignee_ids: rest.assignee_ids ?? [], description, bot_forge_user_id: b.bot_forge_user_id ?? 0 } });
   },
   syncRepo: async (repoId: string) => {
     const b = state.boards.get(repoId);
@@ -3267,6 +3270,7 @@ export const mockApi = {
       title,
       state: "opened",
       labels: [appSettings.uzi_label],
+      assignee_ids: [] as number[],
       web_url: `${b.web_url}/-/issues/${iid}`,
       forge_type: "gitlab",
       author: requireSession().display_name?.toLowerCase() ?? "you",

@@ -1373,7 +1373,7 @@ func skipReasonLabel(reason string) string {
 // per-candidate breakdown. A reason with no actionable hint is absent (empty), and the
 // caller omits the trailing `# …` for it.
 var skipReasonHints = map[string]string{
-	"not_eligible": "add the uzi label, or raise --max-issues",
+	"not_eligible": "add the configured uzi label or assign the issue to uzi, or raise --max-issues",
 }
 
 // skipReasonHint returns the remediation hint for a skip reason, or "" when none applies.
@@ -1381,7 +1381,7 @@ func skipReasonHint(reason string) string { return skipReasonHints[reason] }
 
 // lastFireCappedHint is the one-line steer shown when a capped fire started nothing and
 // every examined candidate was skipped — the newest issues were never reached.
-const lastFireCappedHint = "newer issues not reached — raise --max-issues or add the uzi label"
+const lastFireCappedHint = "newer issues not reached — raise --max-issues, or add the configured uzi label / assign the issue to uzi"
 
 // fireCandidateLabel renders a started/skipped candidate's identity: "#<iid>" for an
 // issue/sweep candidate, or "prompt" for a prompt schedule (which carries a nil iid).

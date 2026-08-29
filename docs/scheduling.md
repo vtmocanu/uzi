@@ -22,7 +22,11 @@ Every schedule fires against exactly one target:
 - **Label sweep** — at fire time, every *open* issue on the repo matching a
   label selector; an empty selector defaults to the `uzi` label, i.e. every
   runnable issue. A sweep also caps how many issues one fire
-  starts, oldest issue first — see [Sweep cap](#sweep-cap) below.
+  starts, oldest issue first — see [Sweep cap](#sweep-cap) below. A sweep's
+  selector doesn't have to be a label: the built-in `assigned-sweep` default
+  (see [Default jobs](#default-jobs)) matches on a different, non-label
+  selector kind instead — issues **assigned to the uzi-bot account** — and
+  carries no labels at all; this kind isn't offered on a custom sweep today.
 - **Ad-hoc prompt** — no issue at all. A stored prompt runs against the repo
   and opens a merge request directly, for standing "hunt for X and open an
   MR" work with no throwaway tracking issue.
@@ -35,19 +39,25 @@ catalog-owned, so owner guidance *is* offered to steer it.
 
 ## The same gates a manual start has, plus auto-approve
 
-Pinned-issue and label-sweep fires go through the **exact run-creation path**
-autopilot uses, so the `uzi`-label eligibility gate, a fresh forge fetch of
-the issue's labels, active-run dedup, and the usage-limit park all behave
+Pinned-issue, label-sweep, and assigned-sweep fires go through the **exact
+run-creation path** autopilot uses, so the eligibility gate — an issue
+carrying the `uzi` label **or** assigned to the uzi-bot account, see [Run
+eligibility](./admin-settings.md#run-eligibility) — a fresh forge fetch of
+the issue's labels and assignees, active-run dedup, and the usage-limit park
+all behave
 exactly as for a manual start — a schedule can't do anything a manual start
 couldn't. A label selector only picks *candidates*; the gate still decides
-what fires. `Planned` and `bug` are pure selectors, not eligibility labels in
+what fires. `Planned` and `bug` are pure selectors, not eligibility signals in
 their own right, so a sweep over one of them (e.g. everything tagged `bug`)
-fires only on the candidates that also carry `uzi` — pair a raw-bug-report
-sweep with the `uzi` label if you want it to run anything. A bare selector
-issue with no `uzi` is a benign skip (see [Fire outcomes](#fire-outcomes))
-that advances the schedule like any other. The **ad-hoc prompt** target is
-the deliberate exception: with no issue to gate on, it bypasses the
-`uzi`-label requirement by design.
+fires only on the candidates that are also eligible — pair a raw-bug-report
+sweep with the `uzi` label (or bot assignment) if you want it to run
+anything. A bare selector issue that's neither `uzi`-labelled nor
+bot-assigned is a benign skip (see [Fire outcomes](#fire-outcomes)) that
+advances the schedule like any other. The `assigned-sweep` default sidesteps
+this pairing by construction: its selector *is* the eligibility signal, so
+every candidate it matches is already eligible. The **ad-hoc prompt** target
+is the deliberate exception: with no issue to gate on, it bypasses the
+eligibility requirement by design.
 
 Each schedule also has its own **auto-approve** toggle, **on by default** —
 the point of a 02:00 fire is that it actually proceeds instead of sitting at
@@ -172,10 +182,10 @@ exceed `max_issues` once backfill walks past a skip), which ones
 **started** (paired with the run they produced), and which were
 **skipped**, each with a typed reason — never free text:
 
-- `not_eligible` — the candidate doesn't carry the `uzi` label, so the
-  single eligibility gate refuses it. A bare selector-only candidate (say,
-  `bug` with no `uzi`) skips here; it's benign, and the schedule advances
-  normally.
+- `not_eligible` — the candidate carries neither the `uzi` label nor a
+  bot assignment, so the eligibility gate refuses it. A bare selector-only
+  candidate (say, `bug` with no `uzi` and not assigned to the uzi-bot)
+  skips here; it's benign, and the schedule advances normally.
 - `already_running` — an active run already exists for that issue (or,
   for the schedule itself, a dedup at fire time).
 - `description_too_large` — the composed run instruction (issue body
@@ -216,16 +226,19 @@ cadence. A schedule that has never fired reads `last_fire: null`.
 
 ## Default jobs
 
-uzi ships a small **catalog of built-in default jobs** — seven generic,
+uzi ships a small **catalog of built-in default jobs** — eight generic,
 repo-agnostic schedules covering the standing automations most projects want
 from day one: a weekly test-improvement pass, a weekly docs-hygiene sweep, a
 deep bug-hunt audit, a feature-brainstorm prompt, daily sweeps over the
-`bug` and `Planned` labels, and self-improvement — an autonomous audit of
+`bug` and `Planned` labels and over issues **assigned to the uzi-bot
+account** (`assigned-sweep`), and self-improvement — an autonomous audit of
 the enabled repo's own codebase that picks one top improvement. Each has a
 baked cron cadence and, for the four prompt
-jobs, a baked prompt; the two sweeps instead carry a baked label selector;
-self-improvement carries neither, since its directive is baked into the
-worker rather than the catalog — its entry is cadence and model only (see
+jobs, a baked prompt; two of the three sweeps instead carry a baked label
+selector, and the third (`assigned-sweep`) carries the non-label "assigned"
+selector kind instead (see [Targets](#targets) above); self-improvement
+carries neither, since its directive is baked into the worker rather than
+the catalog — its entry is cadence and model only (see
 [Self-improvement](#self-improvement) below). You don't write these — you
 **enable** them.
 
@@ -270,11 +283,13 @@ worker rather than the catalog — its entry is cadence and model only (see
   MR titled `bingo: <feature>`). A run that commits nothing opens no branch or
   empty MR either (issue #341), so a quiet week produces no off-hours MR noise,
   and every job falls back to a plain report when it has nothing worth landing.
-- **Sweep-label guardrail.** Enabling one of the two sweep defaults (or
-  creating or editing any sweep schedule) checks whether its selector label
-  actually exists on the target repo, and offers to create it if not — see
-  [the sweep-label guardrail below](#sweep-label-guardrail). It's advisory:
-  it warns, never blocks.
+- **Sweep-label guardrail.** Enabling one of the two label-selector sweep
+  defaults (or creating or editing a label-selector sweep schedule) checks
+  whether its selector label actually exists on the target repo, and offers
+  to create it if not — see [the sweep-label guardrail
+  below](#sweep-label-guardrail). It's advisory: it warns, never blocks. The
+  `assigned-sweep` default has no label to check — its selector is bot
+  assignment — so this guardrail doesn't apply to it.
 - **Where to manage them.** **Web**: the Schedules page has a **Default
   jobs** tab alongside **My schedules** — default rows carry a lock marker
   on the baked prompt, with Reset and Clone actions (no separate `DEFAULT`

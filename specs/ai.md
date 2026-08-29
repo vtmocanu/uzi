@@ -23139,3 +23139,62 @@ wake-guard watermark (issue #552 M1 / PRD #517). The watermark is `runs.open_fol
   `SetRunRunning` worker_id pin and the next ACK-checked park report remain the backstop.
 - Commits `aace2d0b`/`fc072247` (M1, server clamp+floor), `d8625495` (M2, worker threads the
   last-delivered id through `SteeringChannel`), `ab774e05` (M3, park-skip ownership probe).
+
+## 587. PRD #767 — assignment to the uzi-bot is a second, equivalent expression of the single run-eligibility gate
+
+Serves human: Feature #22 (eligibility model) — extends §584's single `uzi`-label gate. An issue
+is uzi's to run if it carries the `uzi` label **OR** is assigned to the uzi-bot account. Additive:
+one eligibility concept, now two natural expressions (label a card, or assign it to the bot), so a
+teammate who says "this is yours" by assigning gets the same result as labelling.
+
+- **One gate, OR'd — not a second gate.** The change is a single OR at the one existing eligibility
+  check in `workersvc.createRun` (`service.go`): `isEligibleIssue(labels, {uzi_label})` **OR**
+  `isAssignedToBot(assignee_ids, bot_forge_user_id)`. All four create paths (interactive /
+  scheduled / autopilot / scheduled-autopilot) inherit it because they share that one gate; no path
+  grew its own assignment logic. The refusal sentinel stays `ErrNotPRDIssue` / the `not_eligible`
+  wire reason — no new skip-reason. Eligibility is derived from the **cached** `labels`/`assignee_ids`
+  jsonb (the same rows the board renders), so the button a user sees and the gate the server applies
+  cannot disagree.
+- **D1 — assignment grants eligibility ONLY; it never auto-runs.** An assigned issue becomes
+  *runnable*, exactly like a `uzi`-labelled one; unattended execution still requires the `autopilot`
+  label or an enabled sweep. Assignment is not a trigger. Because assignment has no "adder" to
+  resolve, it does NOT bypass autopilot's existing label-add consent/attribution gate: the poller
+  still attributes the run to whoever added the `autopilot` label (issue author as fallback) and
+  still requires that owner to have opted in (forge identity + Anthropic token). Assignment only
+  widens the candidate set for the `autopilot` label and the enabled `assigned-sweep`; it never
+  grants unattended execution without one of those mechanisms.
+- **D2 — match on the numeric `bot_forge_user_id`, not the bot username.** `isAssignedToBot`
+  decodes the `assignee_ids` set and tests membership of the connection's numeric
+  `bot_forge_user_id` (carried on `forge_connections`, surfaced on the board/issue/repo DTOs as
+  `bot_forge_user_id` for the web runnable-marker in M5). Numeric id is rename-safe: renaming the
+  bot account does not silently drop eligibility. Guards: a non-positive bot id, an assignee id of
+  0, a human-only co-assignee, and undecodable `assignee_ids` all yield *not eligible*; the bot
+  among multiple (human) assignees is a match (set membership).
+- **Assignees synced end to end (M1).** The forge drivers read issue assignees and persist them as
+  the `assignee_ids` jsonb on the cached issue (preserved verbatim on the paths that must not
+  re-derive it), so the poller (M3) and sweeps (M4) evaluate assignment from cache like every other
+  eligibility input.
+- **`assigned-sweep` non-label selector + D3.** New default-catalog schedule
+  (`schedtmpl/catalog/assigned-sweep.md`, slug `assigned-sweep`, `selector: assigned`, daily
+  `0 2 * * *` UTC, `max_issues: 3`) whose candidate query selects open issues **assigned to the
+  bot** rather than by label — a selector kind orthogonal to `Planned`/`bug`. Per §570's model it
+  is materialized on enable and prompt-by-reference. D3: it ships `auto_approve` ON — like every
+  default job (the shared `schedtmpl.AutoApprove = true` constant, matching bug-triage /
+  planned-sweep), because *enabling the sweep* is the deliberate opt-in to unattended runs; the
+  prompt tells the worker to treat the issue description + any linked spec as the spec and deliver
+  with tests behind the project gate.
+- **D5 — read-only.** uzi only READS assignees to evaluate eligibility; it never auto-assigns the
+  bot to an issue. There is no write path that sets an assignee.
+- **D6 — trust-equivalence (verified this run): assignment is NOT a weaker gate than the label.**
+  On all three forges, assigning an issue requires the same permission tier as applying a label:
+  GitHub **Triage**; GitLab **Reporter** (a Guest/author may set issue metadata only at *creation*
+  time, and that creation-time exception applies equally to labels AND assignees, so there is no
+  split that would make assignment the softer gate); Forgejo/Gitea **Write** on the Issues unit. So
+  OR-ing assignment into the eligibility gate does not lower the bar a `uzi` label already set — the
+  safety equivalence holds. **Caveat:** GitLab bundles assignee + label under one "edit issue
+  metadata" permission and this is version-dependent — re-verify on a major GitLab upgrade.
+- **Not a main-protection change.** Same as §584: the default-branch and no-`.github/workflows`
+  guardrails are independent of the eligibility gate; adding the OR has no main-protection
+  implication.
+- Full rationale, milestone map (M1 sync → M2 gate → M3 poller → M4 sweeps → M5 web), and Decision
+  Log: `prds/767-*.md`. This section extends §584; it does not supersede it.
