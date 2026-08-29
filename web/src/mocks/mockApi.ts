@@ -3231,7 +3231,7 @@ export const mockApi = {
     // bot_forge_user_id rides the issue detail (PRD #767 M5), from the board's single
     // connection, so the issue view evaluates the same "uzi OR assigned-to-bot" predicate
     // as the board card — assignee_ids comes through on ...rest.
-    return delay({ issue: { ...rest, description, bot_forge_user_id: b.bot_forge_user_id } });
+    return delay({ issue: { ...rest, assignee_ids: rest.assignee_ids ?? [], description, bot_forge_user_id: b.bot_forge_user_id ?? 0 } });
   },
   syncRepo: async (repoId: string) => {
     const b = state.boards.get(repoId);

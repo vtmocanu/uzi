@@ -591,8 +591,11 @@ export interface Card {
   labels: string[];
   // Forge user ids assigned to the issue (PRD #767 M5). The board widens "is this card
   // uzi's to run" to "carries the `uzi` label OR the board's bot is one of these ids",
-  // so this rides the card alongside labels. Always present (server sends [] not null).
-  assignee_ids: number[];
+  // so this rides the card alongside labels. A current server always sends [] not null,
+  // but the field is optional so a payload from an OLD api replica during a rollout skew
+  // (a new web bootstrap reading an old card DTO that predates this field) does not throw
+  // in the consumer — a missing value is treated as "no assignees".
+  assignee_ids?: number[];
   web_url: string;
   // The card's forge ("gitlab"|"forgejo"|"github"), so the UI picks the per-card MR/PR noun
   // (PRD #65 D2). A cross-repo view mixes forges, so it rides each card.
@@ -632,7 +635,9 @@ export interface Board {
   // runnable when it carries the `uzi` label OR this id is one of its assignee_ids.
   // Per-connection (a user may have several connections with different bot ids), so it
   // rides the board, not the user session. 0 when unresolved (never marks a card).
-  bot_forge_user_id: number;
+  // Optional: an OLD api replica during a rollout skew may omit it entirely, which the
+  // consumer treats as "no bot" (0), the same as unresolved.
+  bot_forge_user_id?: number;
 }
 
 // BoardPrefs is the current user's per-repo board view preferences (PRD #196 M3),

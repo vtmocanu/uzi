@@ -221,7 +221,7 @@ export function IssueView() {
                   ) : (
                     <Badge
                       tone="brand"
-                      title="This issue is assigned to the uzi bot, so uzi will run it."
+                      title="This issue is assigned to the uzi bot, so it's eligible for a uzi run — start it, or let autopilot or an enabled sweep pick it up."
                     >
                       assigned
                     </Badge>

@@ -59,6 +59,29 @@ describe("isUziCard", () => {
     expect(isUziCard(card([], false, [BOT]), "uzi", 0)).toBe(false);
     expect(isUziCard(card([], false, [0]), "uzi", 0)).toBe(false);
   });
+
+  // Rolling-deploy version skew: a NEW web bootstrap can carry a positive bot id while an
+  // OLD api replica serves a card DTO that predates `assignee_ids`, so the field arrives
+  // undefined. The consumer must treat it as `[]` and fall back to label-only, never throw
+  // on `undefined.includes`.
+  it("does not throw and classifies by label when assignee_ids is undefined (rollout skew)", () => {
+    // Card DTO from an old api: no assignee_ids field at all.
+    const labelled = { labels: ["uzi"] };
+    const unlabelled = { labels: ["documentation"] };
+    expect(() => isUziCard(labelled, "uzi", BOT)).not.toThrow();
+    // Label path still works with assignee_ids missing.
+    expect(isUziCard(labelled, "uzi", BOT)).toBe(true);
+    // With only the bot-assignment signal available (no label) and no assignee_ids, the
+    // card is not runnable — the only-bot-eligibility source is absent.
+    expect(isUziCard(unlabelled, "uzi", BOT)).toBe(false);
+  });
+
+  it("does not throw and falls back to label-only when the bot id is undefined (rollout skew)", () => {
+    // Old bootstrap: Board.bot_forge_user_id absent, so botForgeUserID arrives undefined.
+    expect(() => isUziCard(card([], false, [BOT]), "uzi", undefined)).not.toThrow();
+    expect(isUziCard(card([], false, [BOT]), "uzi", undefined)).toBe(false);
+    expect(isUziCard(card(["uzi"], false, []), "uzi", undefined)).toBe(true);
+  });
 });
 
 describe("visibleCards", () => {

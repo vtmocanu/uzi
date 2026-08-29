@@ -44,13 +44,20 @@ export const SELF_IMPROVE_LABEL = "uzi-self-improve";
  *
  * `botForgeUserID > 0` guards an unresolved bot id (mirrors the server's `@bot_id>0` /
  * M2's `botID<=0` guard): a 0/absent id must never mark every assigned card runnable.
+ *
+ * Both `assignee_ids` and `botForgeUserID` are guarded for a rolling-deploy version
+ * skew: a NEW web bootstrap can carry a positive bot id while an OLD api replica serves
+ * a card payload WITHOUT `assignee_ids` (and vice versa, an old bootstrap omitting the
+ * bot id). A missing `assignee_ids` is treated as `[]` and a missing bot id as 0, so the
+ * predicate falls back to label-only rather than throwing on `undefined.includes`.
  */
 export function isUziCard(
   card: Pick<Card, "labels" | "assignee_ids">,
   uziLabel: string,
-  botForgeUserID: number,
+  botForgeUserID: number | undefined,
 ): boolean {
-  return card.labels.includes(uziLabel) || (botForgeUserID > 0 && card.assignee_ids.includes(botForgeUserID));
+  const botId = botForgeUserID ?? 0;
+  return card.labels.includes(uziLabel) || (botId > 0 && (card.assignee_ids ?? []).includes(botId));
 }
 
 /**

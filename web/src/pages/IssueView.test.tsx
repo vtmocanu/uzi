@@ -395,7 +395,7 @@ describe("IssueView — runnable marker + Promote (PRD #764)", () => {
     expect(screen.getByRole("button", { name: /start run/i })).toBeTruthy();
     expect(screen.queryByRole("button", { name: /Promote to uzi/ })).toBeNull();
     // The marker is the assignment badge with honest copy...
-    const marker = screen.getByTitle(/assigned to the uzi bot, so uzi will run it/i);
+    const marker = screen.getByTitle(/assigned to the uzi bot, so it's eligible for a uzi run/i);
     expect(marker.textContent).toBe("assigned");
     // ...and it must NOT claim the uzi label (the false-copy bug this fixes).
     expect(screen.queryByTitle(/carries the uzi label/i)).toBeNull();
