@@ -5334,12 +5334,20 @@ UPDATE runs SET
     -- re-delivery and NO clear-on-wake — it simply names the last follow_up already spent
     -- (or the worker's last-delivered id, whichever is lower), and anything newer is a
     -- genuine new steer.
-    open_followup_id = LEAST(
+    -- The GREATEST(0, ...) floor is the LOWER bound the LEAST ceiling does not give:
+    -- LEAST only bounds a huge value from above, so a nonsensical NEGATIVE worker value
+    -- (e.g. -1) would otherwise pass through and fail-open THIS run's own wake guard
+    -- (` + "`" + `id > COALESCE(open_followup_id, 0)` + "`" + ` is ` + "`" + `id > -1` + "`" + `, true for every positive
+    -- bigserial id, so any consumed follow_up wakes it — reopening #558 for that run).
+    -- Flooring to 0 maps it to "nothing applied" (the first-park value), matching the
+    -- stated "neutralize a buggy value" intent. GREATEST(0, ...) never affects a correct
+    -- worker: its last-delivered id is always ≥ 0.
+    open_followup_id = GREATEST(0, LEAST(
         COALESCE($2::bigint,
                  (SELECT COALESCE(MAX(id), 0) FROM run_user_inputs
                   WHERE run_user_inputs.run_id = $3 AND kind = 'follow_up' AND consumed_at IS NOT NULL)),
         (SELECT COALESCE(MAX(id), 0) FROM run_user_inputs
-         WHERE run_user_inputs.run_id = $3 AND kind = 'follow_up' AND consumed_at IS NOT NULL)),
+         WHERE run_user_inputs.run_id = $3 AND kind = 'follow_up' AND consumed_at IS NOT NULL))),
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = $3 AND worker_id = $4

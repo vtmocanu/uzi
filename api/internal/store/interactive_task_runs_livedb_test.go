@@ -313,3 +313,44 @@ func TestInteractiveTaskRunsFollowupWatermarkFallbackLiveDB(t *testing.T) {
 			"the NULL-param fallback is not byte-identical to the pre-#559 behavior", got, id2)
 	}
 }
+
+// Issue #559 M1: the LOWER floor. LEAST only bounds a huge value from above; a nonsensical
+// NEGATIVE worker value (e.g. -1) would otherwise be stamped verbatim and fail-open THIS
+// run's own wake guard (`id > COALESCE(open_followup_id, 0)` becomes `id > -1`, true for
+// every positive bigserial id, so any consumed follow_up wakes it — reopening #558 for that
+// run). GREATEST(0, ...) floors it to 0 ("nothing applied", the first-park value). A
+// consumed follow_up then still admits the wake (0 is not a strand), matching first-park
+// semantics rather than the fail-open a raw -1 would give.
+func TestInteractiveTaskRunsFollowupWatermarkNegativeFloorLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	w, done := newFollowupWatermarkFixture(ctx, t, dsn)
+	defer done()
+
+	// A consumed follow_up exists (max-consumed > 0), so the LEAST ceiling is positive and
+	// cannot itself account for a 0 result — only the GREATEST(0, ...) floor can.
+	id := w.createConsumedFollowup(t)
+	if id <= 0 {
+		t.Fatalf("run_user_inputs.id not positive: %d", id)
+	}
+	w.park(t, ptrInt64(-1))
+	if got := w.watermark(t); got != 0 {
+		t.Fatalf("open_followup_id = %d, want 0 — a negative worker value must floor to 0, not "+
+			"be stamped verbatim (a stored -1 fail-opens the run's own wake guard)", got)
+	}
+	// The consumed follow_up (> 0 == watermark) still admits the wake: floored-to-0 is
+	// first-park semantics, not a strand.
+	rows, err := w.f.q.SetRunRunning(ctx, store.SetRunRunningParams{
+		ID: w.run, WorkerID: pgU(w.wkr), IterationCount: 1,
+	})
+	if err != nil {
+		t.Fatalf("SetRunRunning: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("SetRunRunning matched %d rows, want 1 — a consumed follow_up (id=%d > watermark 0) "+
+			"should admit the wake", rows, id)
+	}
+}
