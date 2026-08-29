@@ -41,6 +41,7 @@ function aCard(over: Partial<Card> = {}): Card {
     title: "Add a metrics dashboard",
     state: "opened",
     labels: ["uzi"],
+    assignee_ids: [],
     web_url: "https://gitlab.example.com/g/r/-/issues/7",
     forge_type: "gitlab",
     author: "someone",
@@ -349,6 +350,7 @@ describe("Board — the Backlog rename is display-only (PRD #102 Decision 14a)",
     // fold that drops it still passes.
     cards: [aCard({ iid: 7, column: "In Progress", labels: ["uzi", "In Progress", "bug", "autopilot"] })],
     pipeline: null,
+    bot_forge_user_id: 0,
     ...over,
   });
 
@@ -487,6 +489,7 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
     columns: [{ label_name: "Planned" }] as BoardData["columns"],
     cards: cards(),
     pipeline: null,
+    bot_forge_user_id: 0,
     ...over,
   });
 
@@ -1178,6 +1181,7 @@ describe("Board — non-uzi issues (PRD #764)", () => {
     columns: [{ label_name: "Planned" }] as BoardData["columns"],
     cards: cards(),
     pipeline: null,
+    bot_forge_user_id: 0,
     ...over,
   });
 
@@ -1622,6 +1626,7 @@ describe("Board — search + per-lane paging (PRD #304)", () => {
     columns: [{ label_name: "Planned" }] as BoardData["columns"],
     cards: [aCard({ iid: 1, title: "issue one", column: "", labels: ["uzi"] })],
     pipeline: null,
+    bot_forge_user_id: 0,
     ...over,
   });
 
@@ -1860,6 +1865,7 @@ describe("ColumnSettings reorder (PRD #318 M2)", () => {
     ] as BoardData["columns"],
     cards: [aCard({ iid: 7, column: "In Progress", labels: ["uzi", "In Progress", "bug"] })],
     pipeline: null,
+    bot_forge_user_id: 0,
     ...over,
   });
 

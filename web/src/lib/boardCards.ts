@@ -35,14 +35,22 @@ import type { Card } from "./api";
 export const SELF_IMPROVE_LABEL = "uzi-self-improve";
 
 /**
- * Whether a card is uzi's to run (PRD #764): it carries the configured `uzi` label,
- * matched exactly. This is the single membership + runnable predicate — the same
- * comparison the sync filter and the server-side run gate use. It drives the render
- * filter, the runnable marker, the solid-vs-quiet treatment and the Start-vs-Promote
- * affordance, so the button state matches what a Start would actually do.
+ * Whether a card is uzi's to run: it carries the configured `uzi` label (PRD #764) OR
+ * the board's bot is one of its assignees (PRD #767 M5). Assignment is additive to the
+ * label — the same single eligibility concept expressed two natural ways, matching the
+ * server's OR gate. This is the single membership + runnable predicate, driving the
+ * render filter, the runnable marker, the solid-vs-quiet treatment and the
+ * Start-vs-Promote affordance, so the button state matches what a Start would do.
+ *
+ * `botForgeUserID > 0` guards an unresolved bot id (mirrors the server's `@bot_id>0` /
+ * M2's `botID<=0` guard): a 0/absent id must never mark every assigned card runnable.
  */
-export function isUziCard(card: Pick<Card, "labels">, uziLabel: string): boolean {
-  return card.labels.includes(uziLabel);
+export function isUziCard(
+  card: Pick<Card, "labels" | "assignee_ids">,
+  uziLabel: string,
+  botForgeUserID: number,
+): boolean {
+  return card.labels.includes(uziLabel) || (botForgeUserID > 0 && card.assignee_ids.includes(botForgeUserID));
 }
 
 /**
@@ -58,13 +66,18 @@ export function isSelfImproveTracker(card: Pick<Card, "labels">): boolean {
 }
 
 /**
- * Whether Promote should be offered on a card (PRD #764). Promote is offered when a
- * card is NOT runnable — it is open, does not already carry the `uzi` label, and is not
- * the self-improve tracker. Promote adds the `uzi` label server-side, which makes the
- * card runnable, so offering it on an already-runnable card would be a no-op button.
+ * Whether Promote should be offered on a card (PRD #764, #767 M5). Promote is offered
+ * when a card is NOT runnable — it is open, does not already carry the `uzi` label, is
+ * not assigned to the bot, and is not the self-improve tracker. Promote adds the `uzi`
+ * label server-side, which makes the card runnable, so offering it on an
+ * already-runnable card (labelled OR assigned to the bot) would be a no-op button.
  */
-export function canPromote(card: Pick<Card, "labels" | "closed">, uziLabel: string): boolean {
-  return !card.closed && !isUziCard(card, uziLabel) && !isSelfImproveTracker(card);
+export function canPromote(
+  card: Pick<Card, "labels" | "assignee_ids" | "closed">,
+  uziLabel: string,
+  botForgeUserID: number,
+): boolean {
+  return !card.closed && !isUziCard(card, uziLabel, botForgeUserID) && !isSelfImproveTracker(card);
 }
 
 /**
@@ -74,21 +87,23 @@ export function canPromote(card: Pick<Card, "labels" | "closed">, uziLabel: stri
  * the cache either way, and a fetch-time filter would make the control a sync setting
  * with a poll-cycle delay instead of an instant view preference.
  *
- * Membership is the single `uzi` label. With `showAll` off, only `uzi` cards render.
- * With `showAll` on, everything renders EXCEPT the self-improve tracker and CLOSED
- * non-member cards — unless the tracker itself carries `uzi`, so a member is always
- * shown. The tracker exclusion is not the control being partial — "show all other
- * issues" means "show me the repo's other OPEN issues", and uzi's own bookkeeping
- * issue is not one of them. The `!closed` guard matches `canPromote` above (which also
- * offers Promote only on open cards) and the documented intent.
+ * Membership is "carries `uzi` OR assigned to the bot" (PRD #764, #767 M5). With
+ * `showAll` off, only those uzi's cards render. With `showAll` on, everything renders
+ * EXCEPT the self-improve tracker and CLOSED non-member cards — unless the tracker
+ * itself is a member, so a member is always shown. The tracker exclusion is not the
+ * control being partial — "show all other issues" means "show me the repo's other OPEN
+ * issues", and uzi's own bookkeeping issue is not one of them. The `!closed` guard
+ * matches `canPromote` above (which also offers Promote only on open cards) and the
+ * documented intent.
  */
-export function visibleCards<T extends Pick<Card, "labels" | "closed">>(
+export function visibleCards<T extends Pick<Card, "labels" | "assignee_ids" | "closed">>(
   cards: T[],
   uziLabel: string,
+  botForgeUserID: number,
   showAll: boolean,
 ): T[] {
-  if (!showAll) return cards.filter((c) => isUziCard(c, uziLabel));
-  return cards.filter((c) => isUziCard(c, uziLabel) || (!isSelfImproveTracker(c) && !c.closed));
+  if (!showAll) return cards.filter((c) => isUziCard(c, uziLabel, botForgeUserID));
+  return cards.filter((c) => isUziCard(c, uziLabel, botForgeUserID) || (!isSelfImproveTracker(c) && !c.closed));
 }
 
 /**

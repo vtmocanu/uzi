@@ -107,7 +107,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 			// nonNilLabels, not created.Labels: this is the THIRD card builder (the two
 			// in board.go go through decodeLabels) and it hands the forge's slice
 			// straight to the DTO, where a nil marshals as JSON null.
-			"card": cardDTO{IID: created.IID, Title: created.Title, State: created.State, Labels: nonNilLabels(created.Labels), WebURL: created.WebURL, ForgeType: repo.ForgeType, HasPRDLink: forgesvc.HasPRDLink(req.Description)},
+			"card": cardDTO{IID: created.IID, Title: created.Title, State: created.State, Labels: nonNilLabels(created.Labels), AssigneeIds: nonNilAssigneeIDs(created.Assignees), WebURL: created.WebURL, ForgeType: repo.ForgeType, HasPRDLink: forgesvc.HasPRDLink(req.Description)},
 		})
 		return
 	}
@@ -130,21 +130,29 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 // forge and never cached (it carries the PRD link and is the basis for deciding
 // to run); the SPA renders it as markdown.
 type issueDetailDTO struct {
-	IID         int64    `json:"iid"`
-	Title       string   `json:"title"`
-	State       string   `json:"state"`
-	Labels      []string `json:"labels"`
-	WebURL      string   `json:"web_url"`
-	Author      *string  `json:"author"`
-	HasPRDLink  bool     `json:"has_prd_link"`
-	Column      string   `json:"column"`
-	Closed      bool     `json:"closed"`
-	Conflict    bool     `json:"conflict"`
-	Description string   `json:"description"`
+	IID    int64    `json:"iid"`
+	Title  string   `json:"title"`
+	State  string   `json:"state"`
+	Labels []string `json:"labels"`
+	// AssigneeIds are the forge user ids assigned to the issue (PRD #767 M5), fresh from
+	// the live forge fetch. The issue view widens "runnable" to "carries `uzi` OR the
+	// repo's bot is one of these assignees", mirroring the board card.
+	AssigneeIds []int64 `json:"assignee_ids"`
+	WebURL      string  `json:"web_url"`
+	Author      *string `json:"author"`
+	HasPRDLink  bool    `json:"has_prd_link"`
+	Column      string  `json:"column"`
+	Closed      bool    `json:"closed"`
+	Conflict    bool    `json:"conflict"`
+	Description string  `json:"description"`
 	// ForgeType is the issue's forge ("gitlab"|"forgejo"|"github"), so the issue view's
 	// "Open on <forge>" button names the right platform (PRD #65 D2). From
 	// repo.ForgeType (the issue's repo has one connection), not the live forge fetch.
 	ForgeType string `json:"forge_type"`
+	// BotForgeUserID is the repo's connection's bot forge user id (PRD #767 M5), so the
+	// issue view can evaluate assignment-eligibility with the SAME predicate the board
+	// uses. Per-connection, carried at issue-detail level, not the user session.
+	BotForgeUserID int64 `json:"bot_forge_user_id"`
 }
 
 // buildIssueDetail assembles the issue-view payload from a freshly-fetched forge
@@ -152,7 +160,7 @@ type issueDetailDTO struct {
 // computing has_prd_link the same way the board and sync paths do. Pure (no DB or
 // forge I/O) so the resolution is unit-tested directly — the handler itself can't
 // be, since h.q is a concrete *store.Queries.
-func buildIssueDetail(issue forge.Issue, position map[string]int, forgeType string) issueDetailDTO {
+func buildIssueDetail(issue forge.Issue, position map[string]int, forgeType string, botForgeUserID int64) issueDetailDTO {
 	col, closed, conflict := board.ResolveColumn(issue.Labels, issue.State, position)
 	// nonNilLabels, not a local nil check: this is the same JSON-null guarantee the
 	// two card builders make, and three hand-rolled copies is how one of them ends up
@@ -164,6 +172,7 @@ func buildIssueDetail(issue forge.Issue, position map[string]int, forgeType stri
 		Title:       issue.Title,
 		State:       issue.State,
 		Labels:      labels,
+		AssigneeIds: nonNilAssigneeIDs(issue.Assignees),
 		WebURL:      issue.WebURL,
 		HasPRDLink:  forgesvc.HasPRDLink(issue.Description),
 		Column:      col,
@@ -171,6 +180,9 @@ func buildIssueDetail(issue forge.Issue, position map[string]int, forgeType stri
 		Conflict:    conflict,
 		Description: issue.Description,
 		ForgeType:   forgeType,
+		// Fresh from the forge fetch (issue.Assignees) plus the connection's bot id, so
+		// the issue view evaluates the same "uzi OR assigned-to-bot" predicate as the board.
+		BotForgeUserID: botForgeUserID,
 	}
 	if issue.Author != "" {
 		a := issue.Author
@@ -216,5 +228,5 @@ func (h *Handler) GetIssueDetail(w http.ResponseWriter, r *http.Request) {
 	for _, c := range cols {
 		position[c.LabelName] = int(c.Position)
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"issue": buildIssueDetail(issue, position, repo.ForgeType)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"issue": buildIssueDetail(issue, position, repo.ForgeType, repo.BotForgeUserID)})
 }

@@ -589,6 +589,10 @@ export interface Card {
   title: string;
   state: string;
   labels: string[];
+  // Forge user ids assigned to the issue (PRD #767 M5). The board widens "is this card
+  // uzi's to run" to "carries the `uzi` label OR the board's bot is one of these ids",
+  // so this rides the card alongside labels. Always present (server sends [] not null).
+  assignee_ids: number[];
   web_url: string;
   // The card's forge ("gitlab"|"forgejo"|"github"), so the UI picks the per-card MR/PR noun
   // (PRD #65 D2). A cross-repo view mixes forges, so it rides each card.
@@ -624,6 +628,11 @@ export interface Board {
   // Repo default-branch CI status (PRD #6, the board header badge), null when
   // there is no cached default-branch pipeline.
   pipeline: PipelineStatus | null;
+  // The board's single connection's bot forge user id (PRD #767 M5). A card is
+  // runnable when it carries the `uzi` label OR this id is one of its assignee_ids.
+  // Per-connection (a user may have several connections with different bot ids), so it
+  // rides the board, not the user session. 0 when unresolved (never marks a card).
+  bot_forge_user_id: number;
 }
 
 // BoardPrefs is the current user's per-repo board view preferences (PRD #196 M3),
@@ -650,6 +659,10 @@ export interface IssueDetail {
   title: string;
   state: string;
   labels: string[];
+  // Forge user ids assigned to the issue (PRD #767 M5), fresh from the live forge
+  // fetch. The issue view evaluates the same "carries `uzi` OR assigned to the bot"
+  // runnable predicate the board does. Always present (server sends [] not null).
+  assignee_ids: number[];
   web_url: string;
   author: string | null;
   has_prd_link: boolean;
@@ -660,6 +673,9 @@ export interface IssueDetail {
   // The issue's forge ("gitlab"|"forgejo"|"github"), so the "Open on <forge>" button names
   // the right platform (PRD #65 D2).
   forge_type: string;
+  // The repo's connection's bot forge user id (PRD #767 M5), so the issue view can
+  // evaluate assignment-eligibility with the same predicate as the board. Per-connection.
+  bot_forge_user_id: number;
 }
 
 export interface ForgeConfig {

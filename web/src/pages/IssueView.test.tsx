@@ -48,6 +48,7 @@ function anIssue(over: Partial<IssueDetail> = {}): IssueDetail {
     title: "A small typo fix",
     state: "opened",
     labels: ["uzi"],
+    assignee_ids: [],
     web_url: "https://gitlab.example.com/grp/proj/-/issues/7",
     forge_type: "gitlab",
     author: "alice",
@@ -56,6 +57,7 @@ function anIssue(over: Partial<IssueDetail> = {}): IssueDetail {
     closed: false,
     conflict: false,
     description: "no PRD here",
+    bot_forge_user_id: 4021,
     ...over,
   };
 }
@@ -66,6 +68,7 @@ function aCard(labels: string[]): Card {
     title: "A small typo fix",
     state: "opened",
     labels,
+    assignee_ids: [],
     web_url: "https://gitlab.example.com/grp/proj/-/issues/7",
     forge_type: "gitlab",
     author: "alice",
@@ -377,6 +380,25 @@ describe("IssueView — runnable marker + Promote (PRD #764)", () => {
     // ...and Start run shows, not Promote.
     expect(screen.queryByRole("button", { name: /Promote to uzi/ })).toBeNull();
     expect(screen.getByRole("button", { name: /start run/i })).toBeTruthy();
+  });
+
+  it("marks an ASSIGNED-but-unlabelled issue runnable with honest copy, not the uzi pill (PRD #767 M5)", async () => {
+    setAuth();
+    // No `uzi` label, but assigned to the repo's bot (bot_forge_user_id 4021).
+    mockApi.getIssue.mockResolvedValue({
+      issue: anIssue({ labels: ["documentation"], assignee_ids: [4021] }),
+    });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+
+    // Runnable + Start run, not Promote.
+    expect(screen.getByRole("button", { name: /start run/i })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Promote to uzi/ })).toBeNull();
+    // The marker is the assignment badge with honest copy...
+    const marker = screen.getByTitle(/assigned to the uzi bot, so uzi will run it/i);
+    expect(marker.textContent).toBe("assigned");
+    // ...and it must NOT claim the uzi label (the false-copy bug this fixes).
+    expect(screen.queryByTitle(/carries the uzi label/i)).toBeNull();
   });
 
   it("promotes forge-first and adopts the returned labels", async () => {

@@ -47,7 +47,12 @@ type cardDTO struct {
 	Title  string   `json:"title"`
 	State  string   `json:"state"`
 	Labels []string `json:"labels"`
-	WebURL string   `json:"web_url"`
+	// AssigneeIds are the forge user ids assigned to the issue (PRD #767 M5). The web
+	// widens "is this card uzi's to run" to "carries the `uzi` label OR the repo's bot
+	// is one of these assignees", so this must ride the card alongside Labels. Non-nil
+	// (serializes as [] not null) via decodeAssigneeIDs, mirroring Labels.
+	AssigneeIds []int64 `json:"assignee_ids"`
+	WebURL      string  `json:"web_url"`
 	// ForgeType is the card's forge ("gitlab"|"forgejo"|"github"), so the web picks the
 	// per-card MR/PR noun (PRD #65 D2). Every card on one board shares the repo's
 	// connection, but a cross-repo view (dashboard) mixes forges, so it rides the
@@ -221,6 +226,12 @@ type boardDTO struct {
 	ForgeType string      `json:"forge_type"`
 	Columns   []columnDTO `json:"columns"`
 	Cards     []cardDTO   `json:"cards"`
+	// BotForgeUserID is this board's single connection's bot forge user id (PRD #767
+	// M5), from forge_connections.bot_forge_user_id. The web marks a card runnable when
+	// it carries the `uzi` label OR this id is one of the card's assignee_ids. It is
+	// PER-CONNECTION (a user may have several connections with different bot ids), so it
+	// rides the board, not the user session.
+	BotForgeUserID int64 `json:"bot_forge_user_id"`
 	// Pipeline is the repo's default-branch CI status (PRD #6, the board header
 	// badge), null when there is no cached default-branch pipeline.
 	Pipeline *apitypes.PipelineDTO `json:"pipeline"`
@@ -434,13 +445,14 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 	cards := assembleCards(issues, runRows, cardPipelines, position, repo.UserID, repo.ForgeType, revising)
 
 	return boardDTO{
-		RepoID:    repo.ID.String(),
-		Path:      repo.PathWithNamespace,
-		WebURL:    repo.WebUrl,
-		ForgeType: repo.ForgeType,
-		Columns:   columns,
-		Cards:     cards,
-		Pipeline:  repoPipeline,
+		RepoID:         repo.ID.String(),
+		Path:           repo.PathWithNamespace,
+		WebURL:         repo.WebUrl,
+		ForgeType:      repo.ForgeType,
+		Columns:        columns,
+		Cards:          cards,
+		Pipeline:       repoPipeline,
+		BotForgeUserID: repo.BotForgeUserID,
 	}, true
 }
 
@@ -517,6 +529,31 @@ func nonNilLabels(labels []string) []string {
 	return labels
 }
 
+// decodeAssigneeIDs turns a cached issue's assignee_ids jsonb into the []int64 the
+// card DTO ships (PRD #767 M5), mirroring decodeLabels. It GUARANTEES a non-nil
+// result for the same reason: the column is `jsonb NOT NULL DEFAULT '[]'`, but the
+// jsonb scalar `null` decodes into a nil slice with no error, which marshals back as
+// JSON `null` — and the web calls .includes on it. Return an empty (non-nil) slice on
+// nil or a decode error so it always serializes as `[]`.
+func decodeAssigneeIDs(raw []byte) []int64 {
+	var ids []int64
+	if err := json.Unmarshal(raw, &ids); err != nil {
+		return []int64{}
+	}
+	return nonNilAssigneeIDs(ids)
+}
+
+// nonNilAssigneeIDs is decodeAssigneeIDs' guarantee on its own, for the builders that
+// take assignee ids straight from a forge response rather than from the cache (the
+// create path and the live issue-detail fetch). Same reason as nonNilLabels: a nil
+// []int64 marshals as JSON null and the web calls .includes on it.
+func nonNilAssigneeIDs(ids []int64) []int64 {
+	if ids == nil {
+		return []int64{}
+	}
+	return ids
+}
+
 // assembleCards builds the board's cards from the cached issues, the newest run
 // per issue (runRows, one row per issue that has run), the column position map,
 // and the board viewer. It is the pure, DB-free core of the board payload: it
@@ -539,16 +576,17 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 		labels := decodeLabels(is.Labels)
 		col, closed, conflict := board.ResolveColumn(labels, is.State, position)
 		card := cardDTO{
-			IID:        is.ForgeIssueIid,
-			Title:      is.Title,
-			State:      is.State,
-			Labels:     labels,
-			WebURL:     is.WebUrl,
-			ForgeType:  forgeType,
-			HasPRDLink: is.HasPrdLink,
-			Column:     col,
-			Closed:     closed,
-			Conflict:   conflict,
+			IID:         is.ForgeIssueIid,
+			Title:       is.Title,
+			State:       is.State,
+			Labels:      labels,
+			AssigneeIds: decodeAssigneeIDs(is.AssigneeIds),
+			WebURL:      is.WebUrl,
+			ForgeType:   forgeType,
+			HasPRDLink:  is.HasPrdLink,
+			Column:      col,
+			Closed:      closed,
+			Conflict:    conflict,
 			// Sibling of issueToCard's — keep the two in step (see cardDTO.ForgeUpdatedAt).
 			ForgeUpdatedAt: is.ForgeUpdatedAt.Time,
 			LatestRun:      latestByIID[is.ForgeIssueIid],
@@ -1001,16 +1039,17 @@ func issueToCard(is store.Issue, position map[string]int, forgeType string) card
 	labels := decodeLabels(is.Labels)
 	col, closed, conflict := board.ResolveColumn(labels, is.State, position)
 	card := cardDTO{
-		IID:        is.ForgeIssueIid,
-		Title:      is.Title,
-		State:      is.State,
-		Labels:     labels,
-		WebURL:     is.WebUrl,
-		ForgeType:  forgeType,
-		HasPRDLink: is.HasPrdLink,
-		Column:     col,
-		Closed:     closed,
-		Conflict:   conflict,
+		IID:         is.ForgeIssueIid,
+		Title:       is.Title,
+		State:       is.State,
+		Labels:      labels,
+		AssigneeIds: decodeAssigneeIDs(is.AssigneeIds),
+		WebURL:      is.WebUrl,
+		ForgeType:   forgeType,
+		HasPRDLink:  is.HasPrdLink,
+		Column:      col,
+		Closed:      closed,
+		Conflict:    conflict,
 		// Sibling of assembleCards' — this is the single-card path (MoveIssue,
 		// PromoteIssue), and omitting it here is the silent half of the bug
 		// cardDTO.ForgeUpdatedAt describes: only a just-dragged card would carry the
