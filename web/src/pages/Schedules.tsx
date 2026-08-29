@@ -173,8 +173,10 @@ export function Schedules() {
     setError("");
     setNotice("");
     // Seed each new schedule's zone from the browser's detected IANA timezone (issue #660),
-    // parity with the create modal. Resolved once so every repo in the fan-out gets the
-    // same zone; an empty/UTC detection keeps the catalog zone server-side.
+    // parity with the create modal. Resolved once so every repo in the fan-out gets the same
+    // zone. browserTimezone() always returns a valid IANA name (falling back to "UTC"), so
+    // the web always sends a body; the catalog zone is kept only on the no-body path used by
+    // CLI/headless enable.
     const tz = browserTimezone();
     try {
       const results = await Promise.allSettled(
