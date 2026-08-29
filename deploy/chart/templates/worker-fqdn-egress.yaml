@@ -90,8 +90,8 @@ spec:
     {{- range .Values.forge.allowedBaseURLs }}
     {{- $u := urlParse . }}
     {{- $host := $u.hostname }}
-    {{- if not $host }}
-    {{- fail (printf "forge.allowedBaseURLs entry %q has no host: it must be an absolute https URL like https://github.com (this feeds both FORGE_ALLOWED_BASE_URLS and the worker egress FQDN list)." .) }}
+    {{- if or (not $host) (ne $u.scheme "https") }}
+    {{- fail (printf "forge.allowedBaseURLs entry %q must be an absolute https URL with a host, e.g. https://github.com (it feeds both FORGE_ALLOWED_BASE_URLS and the worker egress FQDN list; the api's NormalizeForgeBaseURL rejects the same input at boot)." .) }}
     {{- end }}
     {{- /* urlParse has no .port field; .host carries host[:port], so split it out (default 443). */}}
     {{- $port := "443" }}
