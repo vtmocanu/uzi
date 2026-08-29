@@ -3352,6 +3352,19 @@ type StateRequest struct {
 	// answer guard, which asks "was THIS question answered" rather than "has this run
 	// ever been answered". Required for `awaiting_input`; ignored on every other state.
 	OpenQuestionID *string `json:"open_question_id"`
+	// OpenFollowupID is the park-scoped follow_up watermark reported by the worker on
+	// the `awaiting_followup` transition ONLY (issue #559 M1): the highest follow_up id
+	// the worker has already APPLIED to a turn at the moment it parks. The server CLAMPS
+	// it to the run's max already-consumed follow_up (SetRunAwaitingFollowup's LEAST) —
+	// a correct worker's last-delivered id is always ≤ max-consumed, so the clamp only
+	// neutralizes a buggy huge value; and absent (an old worker, or the first park before
+	// anything was delivered) → the server falls back to that server-derived max-consumed,
+	// byte-identical to the pre-#559 behavior. Deriving the watermark purely server-side
+	// races a follow_up consumed during this report's DB round-trip and would strand the
+	// run, which is why the worker provides it. Additive and OPTIONAL, but the field MUST
+	// exist because httpx.DecodeJSON sets DisallowUnknownFields — a new worker that sends
+	// it would 400 otherwise. Ignored on every state other than awaiting_followup.
+	OpenFollowupID *int64 `json:"open_followup_id"`
 	// LimitResetsAt is the epoch at which the exhausted Anthropic usage window
 	// reopens, as the worker read it off the SDK frame (PRD #35). The worker
 	// normalizes the SDK's unit-less number to MILLISECONDS before sending; the
@@ -3538,7 +3551,12 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			return store.Run{}, false, fmt.Errorf("%w: awaiting_followup requires an interactive task run", ErrInvalidState)
 		}
 		rows, err = s.q.SetRunAwaitingFollowup(ctx, store.SetRunAwaitingFollowupParams{
-			SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+			// int8Param maps nil → pgtype.Int8{} (Valid:false → SQL NULL), so an old
+			// worker that omits open_followup_id lands NULL and the query's COALESCE
+			// fallback recomputes the server-derived max-consumed watermark. A present
+			// value is clamped to ≤ max-consumed by the query's LEAST.
+			OpenFollowupID: int8Param(req.OpenFollowupID),
+			SessionID:      sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "completed":
 		// PRD #265 M1: reconcile the milestone tracker from the lead's signal_done
@@ -4128,6 +4146,18 @@ func (s *Service) ListMemoryForRun(ctx context.Context, wkr store.Worker, runID 
 		UserID: run.UserID,
 		RepoID: uuid.UUID(run.RepoID.Bytes),
 	})
+}
+
+// RunOwnership returns the current status of a run this worker owns, or
+// ErrRunNotOwned when it is not (reclaimed / never owned). Read-only; the
+// interactive park-skip path (#559) uses it to detect a mid-turn reclaim or
+// terminal transition early, restoring the ACK the skipped park report gave.
+func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid.UUID) (string, error) {
+	run, err := s.runOwnedByWorker(ctx, runID, wkr)
+	if err != nil {
+		return "", err
+	}
+	return run.Status, nil
 }
 
 func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr store.Worker) (store.Run, error) {
@@ -4749,17 +4779,21 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		}
 		return store.Run{}, err
 	}
-	// The RUN-ELIGIBILITY gate (PRD #764): an issue is uzi's to run iff it carries the
-	// configured uzi_label. This is the SINGLE gate — a run no longer requires a PRD
-	// link or any escape-hatch/waiver label. A linked prds/*.md is still detected and
-	// implemented when present, but never required.
+	// The RUN-ELIGIBILITY gate (PRD #764, widened by PRD #767): an issue is uzi's to
+	// run iff it carries the configured uzi_label OR is assigned to the uzi-bot account
+	// (row.BotForgeUserID). Assignment is an ADDITIVE second signal, the same single
+	// concept expressed two natural ways; it grants eligibility only — unattended
+	// execution still needs autopilot or an enabled sweep (PRD #767 D1). A run no longer
+	// requires a PRD link or any escape-hatch/waiver label. A linked prds/*.md is still
+	// detected and implemented when present, but never required.
 	//
-	// Derived from the cached labels rather than a fresh forge read: the same jsonb the
-	// board renders the card from, so the button a user sees and the gate the server
-	// applies cannot disagree. Promote writes the label forge-first AND updates this
-	// cache row in the same request, so the promote-then-run sequence is not racing the
-	// poller.
-	if !isEligibleIssue(issue.Labels, []string{s.uziLabel(ctx)}) {
+	// Derived from the cached labels/assignees rather than a fresh forge read: the same
+	// jsonb the board renders the card from, so the button a user sees and the gate the
+	// server applies cannot disagree. Promote writes the label forge-first AND updates
+	// this cache row in the same request, so the promote-then-run sequence is not racing
+	// the poller.
+	if !isEligibleIssue(issue.Labels, []string{s.uziLabel(ctx)}) &&
+		!isAssignedToBot(issue.AssigneeIds, row.BotForgeUserID) {
 		return store.Run{}, ErrNotPRDIssue
 	}
 	// Cross-kind same-branch exclusion (PRD #6): this issue run will use the
@@ -4915,6 +4949,22 @@ func isEligibleIssue(labelsJSON []byte, eligible []string) bool {
 		}
 	}
 	return false
+}
+
+// isAssignedToBot reports whether the cached issue's assignee_ids jsonb (a set of
+// numeric forge user ids) contains the connection's bot forge user id. Like
+// isEligibleIssue, an undecodable value is NOT a match: the gate has no basis for
+// consent. botID <= 0 (an unset/absent bot id) never matches, so a connection
+// without a resolved bot never grants assignment-eligibility by accident.
+func isAssignedToBot(assigneeIDsJSON []byte, botID int64) bool {
+	if botID <= 0 {
+		return false
+	}
+	var ids []int64
+	if err := json.Unmarshal(assigneeIDsJSON, &ids); err != nil {
+		return false
+	}
+	return slices.Contains(ids, botID)
 }
 
 // originColumn resolves the issue's current column to snapshot onto the run, so a

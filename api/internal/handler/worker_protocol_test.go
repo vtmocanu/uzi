@@ -616,6 +616,63 @@ func TestWorkerMessagesForeignRunReturns404(t *testing.T) {
 	}
 }
 
+// TestWorkerRunOwnershipOwnedRunning pins the happy path of the interactive
+// park-skip ownership probe (#559): an owned, still-running run returns 200 with
+// the live status, which the worker reads as "keep going".
+func TestWorkerRunOwnershipOwnedRunning(t *testing.T) {
+	runID := uuid.New()
+	h := newProtocolHandler(t, &protocolStore{ownedRun: store.Run{ID: runID, Status: "running"}})
+	rec := httptest.NewRecorder()
+	h.WorkerRunOwnership(rec, workerReq(http.MethodGet, "", runID))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (owned+running)", rec.Code)
+	}
+	var got struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if got.Status != "running" {
+		t.Fatalf("status = %q, want %q", got.Status, "running")
+	}
+}
+
+// TestWorkerRunOwnershipReclaimedReturns404 pins the reclaim signal: a run no
+// longer owned by this worker (GetRunOwnedByWorker → ErrNoRows) is a definitive
+// 404, which the worker treats as a NOT-OWNED reclaim and fails the turn early.
+func TestWorkerRunOwnershipReclaimedReturns404(t *testing.T) {
+	runID := uuid.New()
+	h := newProtocolHandler(t, &protocolStore{ownedErr: pgx.ErrNoRows})
+	rec := httptest.NewRecorder()
+	h.WorkerRunOwnership(rec, workerReq(http.MethodGet, "", runID))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (run not owned by this worker)", rec.Code)
+	}
+}
+
+// TestWorkerRunOwnershipTerminalReturnsStatus pins that a still-owned but
+// terminal run returns 200 with the terminal status — the worker, not the
+// server, interprets terminality and fails the turn.
+func TestWorkerRunOwnershipTerminalReturnsStatus(t *testing.T) {
+	runID := uuid.New()
+	h := newProtocolHandler(t, &protocolStore{ownedRun: store.Run{ID: runID, Status: "completed"}})
+	rec := httptest.NewRecorder()
+	h.WorkerRunOwnership(rec, workerReq(http.MethodGet, "", runID))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (owned+terminal)", rec.Code)
+	}
+	var got struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if got.Status != "completed" {
+		t.Fatalf("status = %q, want %q", got.Status, "completed")
+	}
+}
+
 // TestNormalizeMemoryBasis pins the READ-side default for writer-declared
 // provenance (PRD #266). normalizeMemoryBasis is a pure function that had ZERO
 // tests, so a mutation flipping its default to "observed" left the suite green.

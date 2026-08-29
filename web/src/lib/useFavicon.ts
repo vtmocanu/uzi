@@ -33,10 +33,24 @@ import { onNotificationsChanged } from "./notifications";
 // favicon stays live.
 const POLL_MS = 20_000;
 
-export function useFavicon({ unread, enabled }: { unread: number; enabled: boolean }): void {
+export function useFavicon({
+  unread,
+  enabled,
+  appLogoSrc,
+}: {
+  unread: number;
+  enabled: boolean;
+  appLogoSrc: string | null;
+}): void {
   // Latest runs, in a ref (not state): the icon is a side effect, so no component
   // renders from this and a poll tick must not trigger React work.
   const runsRef = useRef<FaviconRun[]>([]);
+  // The preloaded branded base image (issue #688). Held in a ref because, like the
+  // runs, nothing renders from it: it is passed straight into applyFavicon as the
+  // base to draw under the status dot. null means "unbranded" — the base reverts to
+  // the factory mark (and idle restores the static /favicon.svg). Independent of
+  // auth, so it survives the disabled branch's reset.
+  const baseImgRef = useRef<HTMLImageElement | null>(null);
   // Latest unread, mirrored into a ref every render so the stable deriveAndApply
   // callback always reads the current count.
   const unreadRef = useRef(unread);
@@ -69,7 +83,7 @@ export function useFavicon({ unread, enabled }: { unread: number; enabled: boole
     }
     if (next === lastStateRef.current) return;
     lastStateRef.current = next;
-    applyFavicon(next);
+    applyFavicon(next, baseImgRef.current);
   }, []);
 
   // The poll lifecycle is keyed ONLY on `enabled` (deriveAndApply is stable) — never
@@ -79,11 +93,13 @@ export function useFavicon({ unread, enabled }: { unread: number; enabled: boole
   useEffect(() => {
     if (!enabled) {
       // Logged out / disabled: no fetch, drop the baseline so a later sign-in
-      // re-seeds it, clear the cached runs, and restore the plain static brand mark.
+      // re-seeds it, clear the cached runs, and restore the plain base mark. We do
+      // NOT null out baseImgRef — branding is independent of auth, so a signed-out
+      // visitor to a branded instance still gets the branded idle base (no dot).
       baselineRef.current = null;
       lastStateRef.current = null;
       runsRef.current = [];
-      applyFavicon("idle");
+      applyFavicon("idle", baseImgRef.current);
       return;
     }
 
@@ -122,6 +138,51 @@ export function useFavicon({ unread, enabled }: { unread: number; enabled: boole
       offNotif();
     };
   }, [enabled, deriveAndApply]);
+
+  // Preload the branded app logo (issue #688) into an <img> held in baseImgRef, so
+  // renderFavicon can draw it synchronously as the base under the status dot. Keyed
+  // on appLogoSrc: null clears the ref (base reverts to the factory mark, idle to the
+  // static /favicon.svg); a URL creates a new Image() and, once it decodes, re-applies
+  // the CURRENT tab state so the branded base appears without waiting for the next
+  // poll. Same-origin src (/api/branding/logo/app or a preset asset), so no crossOrigin.
+  //
+  // The load handler bypasses the lastStateRef equality guard on purpose: that guard
+  // only suppresses re-applies when the derived STATE is unchanged, but here the base
+  // IMAGE changed under the same state, which the guard would otherwise swallow.
+  useEffect(() => {
+    if (!appLogoSrc) {
+      // Unbranded: clear the ref so the base reverts to the factory mark and idle
+      // restores the static /favicon.svg. Force a re-apply ONLY when we are actually
+      // CLEARING a previously-set branded base (had === true): the poll/unread guard
+      // (next === lastStateRef.current) would otherwise suppress a same-state redraw
+      // and leave a stale branded PNG on the tab. Skip it on the initial null pass so
+      // we don't flash idle over the enabled effect's own first apply.
+      const had = baseImgRef.current !== null;
+      baseImgRef.current = null;
+      if (had) applyFavicon(lastStateRef.current ?? "idle", null);
+      return;
+    }
+    let alive = true;
+    const img = new Image();
+    img.onload = () => {
+      if (!alive) return;
+      baseImgRef.current = img;
+      applyFavicon(lastStateRef.current ?? "idle", img);
+    };
+    // A failed replacement load must NOT leave the previous tenant's image in
+    // baseImgRef: clear it and re-apply the current state on the factory mark, so
+    // a branded src that 404s reverts to the fallback rather than pinning a stale
+    // logo. Symmetric with onload, which also applies unconditionally.
+    img.onerror = () => {
+      if (!alive) return;
+      baseImgRef.current = null;
+      applyFavicon(lastStateRef.current ?? "idle", null);
+    };
+    img.src = appLogoSrc;
+    return () => {
+      alive = false;
+    };
+  }, [appLogoSrc]);
 
   // Re-derive from the ref'd latest runs whenever `unread` changes, so a pure-unread
   // `attention` shows both before and after the baseline is seeded (Fix 3).

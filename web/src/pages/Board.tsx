@@ -714,13 +714,19 @@ export function Board() {
   // every card the viewer had hidden — which is what freeze-test 3 discriminates.
   const payloadCards = useMemo<CardData[]>(() => board?.cards ?? [], [board]);
 
+  // The board's single connection's bot forge user id (PRD #767 M5). A card is uzi's to
+  // run when it carries the `uzi` label OR this id is one of its assignees. It is
+  // per-connection (unlike uziLabel, which is a session setting), so it comes off the
+  // board payload, not useAuth(); 0 (unresolved) never marks a card runnable.
+  const botForgeUserID = board?.bot_forge_user_id ?? 0;
+
   // Membership is now a single label (PRD #764, D3): a card is a board member when it
   // carries the `uzi` run-eligibility label. The old per-user `extra_labels` dimension
   // is retired on the client — the board_prefs row is still round-tripped (its
   // `show_all` half drives the toggle below), but its `extra_labels` goes unused here.
   const renderCards = useMemo(
-    () => visibleCards(payloadCards, uziLabel, showAll),
-    [payloadCards, uziLabel, showAll],
+    () => visibleCards(payloadCards, uziLabel, botForgeUserID, showAll),
+    [payloadCards, uziLabel, botForgeUserID, showAll],
   );
 
   // Board search filter (PRD #304 M2, Decision 6): membership → SEARCH → sort → cap.
@@ -786,8 +792,8 @@ export function Board() {
   // reveals. The `!closed` guard matches visibleCards so the count and the rendered set
   // agree on which "other issues" exist.
   const showAllCount = useMemo<number>(
-    () => payloadCards.filter((c) => !isUziCard(c, uziLabel) && !isSelfImproveTracker(c) && !c.closed).length,
-    [payloadCards, uziLabel],
+    () => payloadCards.filter((c) => !isUziCard(c, uziLabel, botForgeUserID) && !isSelfImproveTracker(c) && !c.closed).length,
+    [payloadCards, uziLabel, botForgeUserID],
   );
 
   // columnKeys is the board's lane order for the freeze: the implicit Backlog column
@@ -1317,7 +1323,7 @@ export function Board() {
                   // is uzi's to run and renders solid with Start run; one without it is
                   // quiet and gets Promote. The matched `uzi` chip is hoisted ahead of
                   // MAX_CARD_CHIPS and highlighted so it reads as the runnable marker.
-                  const isEligible = isUziCard(card, uziLabel);
+                  const isEligible = isUziCard(card, uziLabel, botForgeUserID);
                   const matchedUzi = isEligible ? [uziLabel] : [];
                   return (
                   <IssueCard
@@ -1397,7 +1403,7 @@ export function Board() {
                     onFixCi={() => card.pipeline && fixCi(card.pipeline.ref)}
                     uziLabel={uziLabel}
                     isEligible={isEligible}
-                    canPromote={canPromote(card, uziLabel)}
+                    canPromote={canPromote(card, uziLabel, botForgeUserID)}
                     promoting={promoting === card.iid}
                     onPromote={() => promote(card)}
                     onDragStart={(e) => {
@@ -1724,8 +1730,8 @@ export function IssueCard({
         //
         // An earlier version of this comment claimed that window renders no button at
         // all — promotable false, isEligible false. That was WRONG, and measured wrong:
-        // canPromote({labels:["documentation"], closed:false}, uziLabel) is true because
-        // a documentation card lacks the `uzi` label. During the window the row is never
+        // canPromote({labels:["documentation"], assignee_ids:[], closed:false}, uziLabel, botForgeUserID)
+        // is true because a documentation card lacks the `uzi` label and is not assigned to the bot. During the window the row is never
         // re-upserted (the PRD fetch is label-filtered, the additive fetch is
         // StateOpened, so neither returns a closed non-eligible issue), so issues.state
         // stays 'opened', cardDTO.Closed derives false, and the card renders Promote

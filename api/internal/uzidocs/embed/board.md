@@ -295,19 +295,21 @@ unaffected: they animate into **Closed** as they always have.
 ## Which issues show up
 
 By default a board shows only its **runnable** issues: the repo's
-`uzi`-labeled cards (see [Admin settings](./admin-settings.md)) — the same
-single label that gates starting a run. Tick **Show all other issues** in
-the toolbar's **Issues** control to widen the board to every other open
-issue on the repo too; the `uzi` set is always included and can't be
-unticked, since a runnable card should never be one toggle away from
-disappearing.
+`uzi`-labeled cards, plus any card **assigned to the uzi-bot account** even
+without the label (see [Admin settings](./admin-settings.md#run-eligibility))
+— the same single eligibility gate that decides whether starting a run is
+allowed. Tick **Show all other issues** in the toolbar's **Issues** control
+to widen the board to every other open issue on the repo too; the runnable
+set is always included and can't be unticked, since a runnable card should
+never be one toggle away from disappearing.
 
-A `uzi`-labeled card offers **Start run** directly. A card shown only because
-**Show all other issues** is on — one without the `uzi` label — is drawn with
-a **dashed border** and offers **Promote to `uzi`** instead: one click adds
+A runnable card — `uzi`-labeled or bot-assigned — offers **Start run**
+directly. A card shown only because **Show all other issues** is on — one
+that's neither labeled `uzi` nor assigned to the bot — is drawn with a
+**dashed border** and offers **Promote to `uzi`** instead: one click adds
 the configured label on the forge, and the card becomes an ordinary, runnable
-board citizen. There is no un-promote in uzi; remove the label in GitLab if
-you change your mind.
+board citizen. There is no un-promote in uzi; remove the label (or the
+assignment) in GitLab if you change your mind.
 
 Starting a run has never required a linked `prds/*.md` file. A run without
 one behaves exactly like a run with one, apart from having no PRD to

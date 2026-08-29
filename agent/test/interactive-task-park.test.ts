@@ -17,9 +17,11 @@ import type { PlanVerdict } from "../src/steering.js";
 import { SteeringChannel } from "../src/steering.js";
 import type { ClaimResponse, UserInput } from "../src/protocol.js";
 import type { WorkerClient } from "../src/client.js";
+import { RequestError } from "../src/client.js";
 import { makeClaim, nullLogger } from "./helpers.js";
 import {
   api,
+  client,
   fx,
   fakeGitlab,
   installHarness,
@@ -881,6 +883,41 @@ function idleParkingExecutor(log: { outcome?: FollowUpOutcome }): Executor {
   };
 }
 
+/** Parks in a loop, recording every outcome, until the park ENDS (a stop/idle/cancel). The
+ *  vehicle for the issue #559 watermark test: it parks once per delivered follow-up, so the
+ *  runner emits one awaiting_followup report per turn and we can read the open_followup_id it
+ *  stamped at each. Commits real work at the end so the run finalizes through the normal push. */
+function multiParkExecutor(log: { outcomes: FollowUpOutcome[] }): Executor {
+  return {
+    async run(ctx: RunContext): Promise<{ branch: string }> {
+      await ctx.checkpoint?.({ reap: true });
+      for (;;) {
+        const o = await ctx.awaitFollowUp!(60_000);
+        log.outcomes.push(o);
+        if (o.kind === "ended") break;
+      }
+      fs.writeFileSync(path.join(ctx.worktreePath, "UZI_RUN.md"), "# interactive multi-turn\n");
+      execFileSync("git", ["add", "UZI_RUN.md"], { cwd: ctx.worktreePath });
+      execFileSync(
+        "git",
+        [
+          "-c",
+          "user.name=uzi-agent",
+          "-c",
+          "user.email=uzi-agent@uzi.local",
+          "-c",
+          "commit.gpgsign=false",
+          "commit",
+          "-m",
+          "uzi test: interactive multi-turn handled",
+        ],
+        { cwd: ctx.worktreePath },
+      );
+      return { branch: ctx.branch };
+    },
+  };
+}
+
 function taskClaim(overrides: Partial<ClaimResponse> = {}): ClaimResponse {
   const runId = (overrides.run_id as string | undefined) ?? randomUUID();
   return makeClaim({
@@ -1053,5 +1090,175 @@ describe("RunRunner interactive follow-up park (PRD #517 M3)", () => {
     );
     // open_mr:false ⇒ a push, not an MR-open: no createMergeRequest POST reached the forge.
     assert.equal(calls.length, 0, "a no-MR idle finalize opens no merge request");
+  });
+
+  it("carries open_followup_id = the pre-round-trip last-delivered id on each park report (issue #559 M2)", async () => {
+    // The worker-provided wake-guard watermark. Each awaiting_followup report must carry the
+    // highest follow_up id ALREADY delivered before that report — a value stable across the
+    // report's DB round-trip because the next follow-up is consumed only AFTER the report
+    // returns. Three parks: nothing delivered yet (0), then after follow-up id 5 (5), then
+    // after follow-up id 8 (8); a final stop ends the loop. Mutation: drop `open_followup_id`
+    // from the reportState call in the awaitFollowUp callback → the field is undefined on
+    // every park report and the deepStrictEqual reddens.
+    const { gitlab } = fakeGitlab();
+    const log = { outcomes: [] as FollowUpOutcome[] };
+    const claim = taskClaim();
+
+    let park = 0;
+    api.onState(claim.run_id, (body) => {
+      if (body.status !== "awaiting_followup") return;
+      park++;
+      if (park === 1)
+        api.setInputs(claim.run_id, [{ id: 5, kind: "follow_up", body: "turn 2" }]);
+      else if (park === 2)
+        api.setInputs(claim.run_id, [{ id: 8, kind: "follow_up", body: "turn 3" }]);
+      else api.setInputs(claim.run_id, [{ id: 9, kind: "stop", body: "wind down" }]);
+    });
+
+    await runner(multiParkExecutor(log), gitlab).execute(claim);
+
+    const watermarks = api.states
+      .filter((s) => s.runId === claim.run_id && s.body.status === "awaiting_followup")
+      .map((s) => s.body.open_followup_id);
+    assert.deepStrictEqual(
+      watermarks,
+      [0, 5, 8],
+      `each park must report the pre-round-trip last-delivered id; got ${JSON.stringify(watermarks)}`,
+    );
+    assert.deepStrictEqual(log.outcomes, [
+      { kind: "followup", body: "turn 2" },
+      { kind: "followup", body: "turn 3" },
+      { kind: "ended", reason: "stopped" },
+    ]);
+  });
+
+  it("skip path: a reclaimed run (ownership probe 404) fails the turn with REASON_FOLLOWUP_NOT_PARKED (issue #559 M3)", async () => {
+    // The skip path (a follow-up already buffered mid-turn) does NOT report awaiting_followup,
+    // so it loses that report's ACK — the ownership/terminality check. M3 restores it with the
+    // read-only ownership probe: a DEFINITIVE not-owned (HTTP 404 → reclaimed by another worker)
+    // must fail the turn early, exactly as a non-awaiting_followup ACK does on the non-skip path.
+    // Mutation: drop the `err.status === 404 → throw` arm on the skip path → a reclaimed run runs
+    // one extra full turn before the SetRunRunning worker_id pin catches it, and this assert reddens.
+    const { gitlab } = fakeGitlab();
+    const log = { outcomes: [] as FollowUpOutcome[], checkpointed: false };
+    const claim = taskClaim();
+    // Buffer a follow-up before the run starts → the park callback takes the SKIP path.
+    api.setInputs(claim.run_id, [{ id: 1, kind: "follow_up", body: "keep going" }]);
+    api.setOwnershipNotOwned(claim.run_id);
+
+    await runner(parkingExecutor(log), gitlab).execute(claim);
+
+    const failed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "failed",
+    );
+    assert.ok(failed, "a reclaimed run must fail early on the skip path, not run another turn");
+    assert.match(failed!.body.failure_reason ?? "", new RegExp(REASON_FOLLOWUP_NOT_PARKED));
+    assert.deepStrictEqual(log.outcomes, [], "the executor never received the buffered follow-up");
+  });
+
+  it("skip path: a terminal ownership status fails the turn with REASON_FOLLOWUP_NOT_PARKED (issue #559 M3)", async () => {
+    // The other DEFINITIVE answer: the run went terminal under us (completed/failed/cancelled).
+    // The probe returns 200 with a terminal status, which the WORKER interprets and throws.
+    // Mutation: drop the FOLLOWUP_TERMINAL_STATUSES check on the skip path → a terminal run runs
+    // an extra turn and this assert reddens.
+    const { gitlab } = fakeGitlab();
+    const log = { outcomes: [] as FollowUpOutcome[], checkpointed: false };
+    const claim = taskClaim();
+    api.setInputs(claim.run_id, [{ id: 1, kind: "follow_up", body: "keep going" }]);
+    api.setOwnershipStatus(claim.run_id, "completed");
+
+    await runner(parkingExecutor(log), gitlab).execute(claim);
+
+    const failed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "failed",
+    );
+    assert.ok(failed, "a terminal run must fail the turn on the skip path");
+    assert.match(failed!.body.failure_reason ?? "", new RegExp(REASON_FOLLOWUP_NOT_PARKED));
+    assert.match(failed!.body.failure_reason ?? "", /completed/, "the failure names the terminal status");
+    assert.deepStrictEqual(log.outcomes, [], "the executor never received the buffered follow-up");
+  });
+
+  it("skip path: a TRANSIENT ownership probe error is swallowed and the run PROCEEDS (issue #559 M3)", async () => {
+    // The must-not-regress property: a transient probe failure (network / 5xx / anything that is
+    // neither a 404 nor a terminal status) must NOT fail the run. The non-skip path's reportState
+    // never fails on a transient blip either, and the run self-heals at the next ACK-checked park
+    // report + the SetRunRunning worker_id pin. Mutation: make the catch re-throw on any error →
+    // the buffered follow-up is never serviced, the run reports `failed`, and the completed assert
+    // reddens.
+    const { gitlab } = fakeGitlab();
+    const log = { outcomes: [] as FollowUpOutcome[], checkpointed: false };
+    const claim = taskClaim();
+    api.setInputs(claim.run_id, [{ id: 1, kind: "follow_up", body: "keep going" }]);
+    api.failOwnership(claim.run_id, 503);
+
+    await runner(parkingExecutor(log), gitlab).execute(claim);
+
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
+    assert.ok(
+      !statuses.includes("failed"),
+      `a transient probe error must NOT fail the run; statuses were ${JSON.stringify(statuses)}`,
+    );
+    assert.deepStrictEqual(
+      log.outcomes,
+      [{ kind: "followup", body: "keep going" }],
+      "the buffered follow-up was serviced despite the transient probe error",
+    );
+    assert.strictEqual(statuses.at(-1), "completed", "the run proceeded past the probe and finalized");
+  });
+
+  it("skip path: an owned+running ownership status proceeds normally (issue #559 M3)", async () => {
+    // The happy skip path: still ours, still running → service the buffered follow-up directly,
+    // no awaiting_followup park (the #558/#552 property) and no throw.
+    const { gitlab } = fakeGitlab();
+    const log = { outcomes: [] as FollowUpOutcome[], checkpointed: false };
+    const claim = taskClaim();
+    api.setInputs(claim.run_id, [{ id: 1, kind: "follow_up", body: "keep going" }]);
+    api.setOwnershipStatus(claim.run_id, "running");
+
+    await runner(parkingExecutor(log), gitlab).execute(claim);
+
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
+    assert.ok(
+      !statuses.includes("awaiting_followup"),
+      `a mid-turn-buffered follow-up must NOT trigger a park; statuses were ${JSON.stringify(statuses)}`,
+    );
+    assert.deepStrictEqual(
+      log.outcomes,
+      [{ kind: "followup", body: "keep going" }],
+      "the buffered follow-up was serviced directly after the owned+running probe",
+    );
+    assert.strictEqual(statuses.at(-1), "completed", "the run resumed past the skipped park and finalized");
+  });
+});
+
+describe("WorkerClient.getRunOwnership (issue #559 M3)", () => {
+  it("returns { status } on a 200 ownership response", async () => {
+    const runId = randomUUID();
+    api.setOwnershipStatus(runId, "running");
+    assert.deepStrictEqual(await client.getRunOwnership(runId), { status: "running" });
+  });
+
+  it("throws a RequestError carrying status 404 when the run is not owned", async () => {
+    const runId = randomUUID();
+    api.setOwnershipNotOwned(runId);
+    await assert.rejects(
+      () => client.getRunOwnership(runId),
+      (err: unknown) => err instanceof RequestError && err.status === 404,
+      "a 404 must surface as a RequestError whose status the caller can read",
+    );
+  });
+
+  it("throws a RequestError carrying the 5xx status on a transient error", async () => {
+    const runId = randomUUID();
+    api.failOwnership(runId, 503);
+    await assert.rejects(
+      () => client.getRunOwnership(runId),
+      (err: unknown) => err instanceof RequestError && err.status === 503,
+      "a 5xx must surface as a RequestError whose status the caller can distinguish from 404",
+    );
   });
 });

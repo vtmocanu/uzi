@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { MemoryRouter } from "react-router-dom";
 import { AppShell, __resetBrandingForTests } from "./AppShell";
 import { api, type Branding } from "../lib/api";
+import { DEFAULT_TITLE } from "../lib/brandTitle";
 import { useAuth } from "../auth/AuthContext";
 import { mockBuildInfo } from "../mocks/data";
 
@@ -397,6 +398,48 @@ describe("AppShell branding — one-row footer", () => {
     const credit = await screen.findByTestId("license-credit");
     const row = credit.parentElement as HTMLElement;
     expect(row.className).toMatch(/justify-between/);
+  });
+});
+
+// White-label browser-tab <title> (issue #688 M2): AppShell drives document.title
+// from brandTabTitle(branding) in an effect placed before the guest early return, so
+// it applies signed-out too. Reset the title between cases so one test's white-label
+// company cannot leak into the next.
+describe("AppShell branding — browser-tab title (issue #688)", () => {
+  afterEach(() => {
+    document.title = DEFAULT_TITLE;
+  });
+
+  it("default branding, signed in: title is the static default", async () => {
+    renderShell();
+    await waitFor(() => expect(document.title).toBe(DEFAULT_TITLE));
+  });
+
+  it("full white-label, signed in: title becomes the brand company", async () => {
+    mockApi.branding.mockResolvedValue(
+      brandingWith({
+        app_logo_mode: "custom",
+        app_logo_present: true,
+        app_logo_keep_name: false,
+        brand_company: "Acme, Inc.",
+      }),
+    );
+    renderShell();
+    await waitFor(() => expect(document.title).toBe("Acme, Inc."));
+  });
+
+  it("full white-label, SIGNED OUT: title still becomes the brand company (applies to guests)", async () => {
+    signOut();
+    mockApi.branding.mockResolvedValue(
+      brandingWith({
+        app_logo_mode: "custom",
+        app_logo_present: true,
+        app_logo_keep_name: false,
+        brand_company: "Acme, Inc.",
+      }),
+    );
+    renderShell("/");
+    await waitFor(() => expect(document.title).toBe("Acme, Inc."));
   });
 });
 

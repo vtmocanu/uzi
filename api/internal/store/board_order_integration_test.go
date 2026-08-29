@@ -335,6 +335,7 @@ func TestUpsertIssuePreservesBoardPositionLiveDB(t *testing.T) {
 		Title:          "retitled on the forge",
 		State:          "opened",
 		Labels:         []byte(`["PRD","In Progress"]`),
+		AssigneeIds:    []byte("[]"),
 		WebUrl:         "https://x",
 		Author:         pgtype.Text{String: "alice", Valid: true},
 		HasPrdLink:     true,

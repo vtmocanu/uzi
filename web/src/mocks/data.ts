@@ -1395,6 +1395,7 @@ const boardFixtures: Record<string, Board> = {
         column: "",
         closed: false,
         conflict: false,
+        assignee_ids: [],
         forge_updated_at: minsAgo(5),
         latest_run: null,
         pipeline: null,
@@ -1411,6 +1412,7 @@ const boardFixtures: Record<string, Board> = {
         column: "",
         closed: false,
         conflict: false,
+        assignee_ids: [],
         forge_updated_at: minsAgo(90),
         latest_run: null,
         // "canceled" → the neutral tone (also covers skipped / no-CI).
@@ -1439,6 +1441,7 @@ const boardFixtures: Record<string, Board> = {
         column: "Ready",
         closed: false,
         conflict: false,
+        assignee_ids: [],
         forge_updated_at: minsAgo(20),
         latest_run: null,
         // "manual" → the attention tone (a human must click play in GitLab).
@@ -1464,6 +1467,7 @@ const boardFixtures: Record<string, Board> = {
         conflict: false,
         // Freshly queued, not yet claimed by a worker: renders the "queued" badge
         // (violet under the mission theme, gray under ember) on the board card.
+        assignee_ids: [],
         forge_updated_at: minsAgo(240),
         latest_run: latestRun({
           id: "run-queued",
@@ -1485,6 +1489,7 @@ const boardFixtures: Record<string, Board> = {
         column: "In progress",
         closed: false,
         conflict: false,
+        assignee_ids: [],
         forge_updated_at: minsAgo(45),
         latest_run: latestRun({
           id: LIVE_RUN_ID,
@@ -1517,6 +1522,7 @@ const boardFixtures: Record<string, Board> = {
         column: "Review",
         closed: false,
         conflict: true,
+        assignee_ids: [],
         forge_updated_at: minsAgo(1500),
         latest_run: null,
         // A red per-card pipeline: the Fix CI affordance (M6) will hang off this.
@@ -1550,6 +1556,7 @@ const boardFixtures: Record<string, Board> = {
         // it up, so a fresh timestamp here would put a parked card at the top of the
         // Updated sort and misrepresent a stalled run as the liveliest thing on the
         // board.
+        assignee_ids: [],
         forge_updated_at: minsAgo(141),
         latest_run: latestRun({
           id: "run-limit-wait",
@@ -1572,6 +1579,7 @@ const boardFixtures: Record<string, Board> = {
         column: "Review",
         closed: false,
         conflict: false,
+        assignee_ids: [],
         forge_updated_at: minsAgo(8),
         latest_run: latestRun({
           id: "run-awaiting",
@@ -1598,6 +1606,7 @@ const boardFixtures: Record<string, Board> = {
         column: "Review",
         closed: false,
         conflict: false,
+        assignee_ids: [],
         forge_updated_at: minsAgo(19),
         latest_run: latestRun({
           id: "run-awaiting-followup",
@@ -1623,6 +1632,7 @@ const boardFixtures: Record<string, Board> = {
         column: "In progress",
         closed: false,
         conflict: false,
+        assignee_ids: [],
         forge_updated_at: minsAgo(52),
         latest_run: latestRun({
           id: "run-pool-wait",
@@ -1645,6 +1655,7 @@ const boardFixtures: Record<string, Board> = {
         column: "",
         closed: true,
         conflict: false,
+        assignee_ids: [],
         forge_updated_at: minsAgo(3000),
         latest_run: latestRun({
           id: "run-done",
@@ -1672,6 +1683,7 @@ const boardFixtures: Record<string, Board> = {
         column: "In progress",
         closed: false,
         conflict: false,
+        assignee_ids: [],
         forge_updated_at: minsAgo(130),
         latest_run: latestRun({
           id: "run-closed",
@@ -1696,6 +1708,7 @@ const boardFixtures: Record<string, Board> = {
         column: "",
         closed: true,
         conflict: false,
+        assignee_ids: [],
         forge_updated_at: minsAgo(4200),
         // run-unjudged works this issue, so the card carries its snapshot — every other
         // card whose issue has a run in mockRuns does, and a card claiming no run for an
@@ -1713,15 +1726,15 @@ const boardFixtures: Record<string, Board> = {
         }),
         pipeline: null,
       },
-      // ── Non-uzi issues (PRD #764) ───────────────────────────────────────────
+      // ── Non-uzi issues (PRD #764, #767) ─────────────────────────────────────
       // The "Show all other issues" toggle is default-off, so without these the demo
-      // build ships a control that visibly does nothing. They are ordinary open issues
-      // of the kind any repo has, none carrying the `uzi` label — so they are hidden
-      // until "Show all" is ticked, and each offers Promote (add `uzi`) rather than
-      // Start run. One carries content labels, one carries a `bug` selector, one carries
-      // none at all (the shape a freshly filed issue takes, and the shape whose labels
-      // used to marshal as JSON null). The `documentation` card just below is the same
-      // shape. This is the show-all / Promote headline of the mock.
+      // build ships a control that visibly does nothing. These two (iid 32, 33) are
+      // ordinary open issues of the kind any repo has, neither carrying the `uzi` label
+      // nor assigned to the bot — so they are hidden until "Show all" is ticked, and each
+      // offers Promote (add `uzi`) rather than Start run. iid 32 carries content labels
+      // and iid 33 a `documentation` label. iid 34 (just below) is the CONTRAST case
+      // added by PRD #767 M5: no label at all, but assigned to the bot, so it IS runnable
+      // and hides Promote — the runnable-by-assignment headline of the mock.
       {
         iid: 32,
         title: "Board drag drops the card on Safari 17",
@@ -1734,6 +1747,7 @@ const boardFixtures: Record<string, Board> = {
         column: "",
         closed: false,
         conflict: false,
+        assignee_ids: [],
         forge_updated_at: minsAgo(30),
         latest_run: null,
         pipeline: null,
@@ -1750,15 +1764,21 @@ const boardFixtures: Record<string, Board> = {
         column: "",
         closed: false,
         conflict: false,
+        assignee_ids: [],
         forge_updated_at: minsAgo(20),
         latest_run: null,
         pipeline: null,
       },
+      // PRD #767 M5: assigned to the uzi-bot (4021) with NO `uzi` label. Assignment alone
+      // makes it uzi's to run — it shows the runnable marker, passes the "uzi's" filter, and
+      // hides Promote, exactly as a labelled card does. This is the runnable-by-assignment
+      // headline of the mock; the two cards above stay non-runnable Promote demos.
       {
         iid: 34,
         title: "Sidebar scrolls twice on a narrow window",
         state: "opened",
         labels: [],
+        assignee_ids: [4021],
         web_url: uziUrl(34),
         author: "vlad",
         forge_type: "gitlab",
@@ -1785,6 +1805,7 @@ const boardFixtures: Record<string, Board> = {
         column: "",
         closed: false,
         conflict: false,
+        assignee_ids: [],
         forge_updated_at: minsAgo(45),
         latest_run: null,
         pipeline: null,
@@ -1797,6 +1818,10 @@ const boardFixtures: Record<string, Board> = {
       pipeline_id: 4242,
       synced_at: minsAgo(1),
     },
+    // The board's single connection's bot forge user id (PRD #767 M5), matching the
+    // ForgeConnection mock (bot_forge_user_id: 4021) so the demo is coherent. Card iid 34
+    // is assigned to this id with NO `uzi` label, exercising the runnable-by-assignment path.
+    bot_forge_user_id: 4021,
   },
   "repo-atlas": {
     repo_id: "repo-atlas",
@@ -1820,6 +1845,7 @@ const boardFixtures: Record<string, Board> = {
         column: "",
         closed: false,
         conflict: false,
+        assignee_ids: [],
         forge_updated_at: minsAgo(60),
         latest_run: null,
         pipeline: null,
@@ -1836,6 +1862,7 @@ const boardFixtures: Record<string, Board> = {
         column: "Ready",
         closed: false,
         conflict: false,
+        assignee_ids: [],
         forge_updated_at: minsAgo(12),
         latest_run: null,
         pipeline: null,
@@ -1852,6 +1879,7 @@ const boardFixtures: Record<string, Board> = {
         column: "Doing",
         closed: false,
         conflict: false,
+        assignee_ids: [],
         forge_updated_at: minsAgo(700),
         latest_run: latestRun({
           id: "run-failed",
@@ -1876,6 +1904,7 @@ const boardFixtures: Record<string, Board> = {
         column: "",
         closed: true,
         conflict: false,
+        assignee_ids: [],
         forge_updated_at: minsAgo(5400),
         latest_run: latestRun({
           id: "run-cancelled",
@@ -1887,6 +1916,9 @@ const boardFixtures: Record<string, Board> = {
       },
     ],
     pipeline: null,
+    // A distinct connection's bot id (PRD #767 M5); no atlas card is bot-assigned, so this
+    // only proves the field rides every board, not just repo-uzi.
+    bot_forge_user_id: 5107,
   },
 };
 

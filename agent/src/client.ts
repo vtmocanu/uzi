@@ -16,6 +16,7 @@ import {
   type StateRequest,
   type UserInput,
   type InputsResponse,
+  type RunOwnershipResponse,
   type WorkerProposal,
   type WorkerRunDetail,
   type WorkerRunListItem,
@@ -276,6 +277,14 @@ export class WorkerClient {
   async getInputs(runId: string): Promise<UserInput[]> {
     const res = (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/inputs`)) as InputsResponse;
     return res.inputs ?? [];
+  }
+
+  /** issue #559: lightweight read-only ownership/terminality probe for the interactive
+   *  park-SKIP path. Returns the run's current status. Throws a RequestError on 4xx/5xx —
+   *  the caller distinguishes a DEFINITIVE 404 (run not owned / reclaimed) from a transient
+   *  error via `err.status`. Reuses GetRunOwnedByWorker server-side; no new query. */
+  async getRunOwnership(runId: string): Promise<RunOwnershipResponse> {
+    return (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/ownership`)) as RunOwnershipResponse;
   }
 
   // ── Chat agent read surface (PRD #39 M3) ───────────────────────────────────

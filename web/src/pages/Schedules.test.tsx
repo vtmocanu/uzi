@@ -204,6 +204,70 @@ describe("Schedules — two tabs (PRD #589 M6)", () => {
   });
 });
 
+// ── issue #660: enabling a default sends the browser-detected timezone ─────────
+describe("Schedules — enable-default sends the browser timezone (issue #660)", () => {
+  const CATALOG = {
+    entries: [
+      {
+        slug: "bug-triage",
+        name: "Bug triage sweep",
+        description: "Daily bug sweep",
+        target: "sweep" as const,
+        cron: "0 2 * * *",
+        timezone: "UTC",
+        model: "",
+        prompt: "",
+        labels: ["bug"],
+        guidance: "Triage the bug.",
+        max_issues: 3,
+        auto_approve: true,
+        wait_on_limit: true,
+      },
+    ],
+    enablements: [],
+  };
+
+  it("the fan-out passes the detected zone as enableCatalogSchedule's third arg", async () => {
+    // Pin the detected browser zone so the expected third arg is deterministic (the util
+    // reads Intl.DateTimeFormat().resolvedOptions().timeZone). Restore in finally so the
+    // spy never leaks into a sibling test.
+    const dtfSpy = vi.spyOn(Intl, "DateTimeFormat").mockImplementation(
+      () => ({ resolvedOptions: () => ({ timeZone: "Europe/Bucharest" }) }) as unknown as Intl.DateTimeFormat,
+    );
+    try {
+      mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
+      mockApi.listSchedules.mockResolvedValue([]);
+      mockApi.listRepos.mockResolvedValue({
+        repos: [{ id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" }],
+      } as Awaited<ReturnType<typeof api.listRepos>>);
+      mockApi.enableCatalogSchedule.mockResolvedValue(
+        sched({ id: "new1", origin: "default", catalog_slug: "bug-triage", timezone: "Europe/Bucharest" }),
+      );
+
+      // The page opens on the Default jobs tab, where the enable fan-out lives.
+      render(
+        <MemoryRouter>
+          <Schedules />
+        </MemoryRouter>,
+      );
+      await waitFor(() => expect(screen.getByText("Bug triage sweep")).toBeTruthy());
+
+      // Pick the repo in the shared RepoMultiSelect (its checkbox lives inside a collapsed
+      // <details>, so query it including hidden elements). Selecting it reveals the Enable
+      // button on the catalog row.
+      fireEvent.click(screen.getByRole("checkbox", { name: "vtmocanu/uzi", hidden: true }));
+      fireEvent.click(screen.getByRole("button", { name: /Enable/ }));
+
+      // The single real call site fans out one call per repo, now carrying the detected zone.
+      await waitFor(() =>
+        expect(mockApi.enableCatalogSchedule).toHaveBeenCalledWith("repo-uzi", "bug-triage", "Europe/Bucharest"),
+      );
+    } finally {
+      dtfSpy.mockRestore();
+    }
+  });
+});
+
 // ── PRD #308 M4: the enriched "Last run" cell + "Last fire" detail row ─────────
 const NOW = new Date().toISOString();
 

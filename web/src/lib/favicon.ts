@@ -3,8 +3,10 @@
 // failed / needs you / is working". Split into a pure M2 state-derivation half
 // (deriveFaviconState / failedRunIds — unit-tested here) and an M3 DOM half
 // (renderFavicon / applyFavicon — canvas + <link> swap, exercised in the browser,
-// not unit-tested). The favicon is ALWAYS the ember brand mark, theme-independent:
-// a tab has no theme context, so it must read on any browser chrome.
+// not unit-tested). The base mark is theme-independent — a tab has no theme context,
+// so it must read on any browser chrome — and defaults to the ember factory mark,
+// but white-labels to the branded app logo when one is set (issue #688), with the
+// PRD #70 status dot still overlaid on top.
 
 import { effectiveRunStatus, isStoppedRun, needsHumanAttention } from "./runBadge";
 import type { StopKind } from "./api";
@@ -99,10 +101,24 @@ const MARK_TICKS = "M17 18h1M12 18h1M7 18h1";
 
 const SIZE = 64; // 64×64 backing store; the browser shrinks it to ~16px.
 
-// renderFavicon draws the mark (and, for non-idle states, a top-right status dot)
-// on a 64×64 canvas and returns a PNG data URL. It throws if 2D context is
-// unavailable — applyFavicon wraps it so a render failure never reaches React.
-function renderFavicon(state: FaviconState): string {
+// The inset margin (in backing-store px) kept clear on every edge when a branded
+// base logo is drawn, so the fitted image never touches the rounded field corners.
+const BASE_INSET = 6;
+
+// isDrawableImage reports whether a preloaded <img> is safe to draw: it must have
+// finished decoding (complete) and carry real pixels (naturalWidth > 0). A pending
+// or errored image draws nothing, so we fall back to the factory mark instead.
+function isDrawableImage(img: HTMLImageElement | null | undefined): img is HTMLImageElement {
+  return !!img && img.complete && img.naturalWidth > 0;
+}
+
+// renderFavicon draws the base mark (and, for non-idle states, a top-right status
+// dot) on a 64×64 canvas and returns a PNG data URL. The base is the branded app
+// logo when a drawable `baseImg` is supplied — fitted object-contain inside an
+// inset field — and otherwise today's stroked ember factory mark. It throws if 2D
+// context is unavailable — applyFavicon wraps it so a render failure never reaches
+// React.
+function renderFavicon(state: FaviconState, baseImg?: HTMLImageElement | null): string {
   const canvas = document.createElement("canvas");
   canvas.width = SIZE;
   canvas.height = SIZE;
@@ -121,18 +137,29 @@ function renderFavicon(state: FaviconState): string {
   ctx.fillStyle = FIELD;
   ctx.fill();
 
-  // Factory mark, stroked ember under a 24→64 transform. lineWidth is bumped so the
-  // strokes still read once the browser shrinks the icon to ~16px; round caps/joins
-  // keep it soft.
-  ctx.save();
-  ctx.scale(SIZE / 24, SIZE / 24);
-  ctx.strokeStyle = EMBER;
-  ctx.lineWidth = 2;
-  ctx.lineCap = "round";
-  ctx.lineJoin = "round";
-  ctx.stroke(new Path2D(MARK_OUTLINE));
-  ctx.stroke(new Path2D(MARK_TICKS));
-  ctx.restore();
+  if (isDrawableImage(baseImg)) {
+    // Branded base: draw the app logo fitted object-contain (aspect ratio
+    // preserved, centered) inside the inset field, so it reads as the tab identity
+    // instead of the factory mark. The status dot below still overlays it.
+    const box = SIZE - BASE_INSET * 2;
+    const scale = Math.min(box / baseImg.naturalWidth, box / baseImg.naturalHeight);
+    const w = baseImg.naturalWidth * scale;
+    const h = baseImg.naturalHeight * scale;
+    ctx.drawImage(baseImg, (SIZE - w) / 2, (SIZE - h) / 2, w, h);
+  } else {
+    // Factory mark, stroked ember under a 24→64 transform. lineWidth is bumped so
+    // the strokes still read once the browser shrinks the icon to ~16px; round
+    // caps/joins keep it soft.
+    ctx.save();
+    ctx.scale(SIZE / 24, SIZE / 24);
+    ctx.strokeStyle = EMBER;
+    ctx.lineWidth = 2;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.stroke(new Path2D(MARK_OUTLINE));
+    ctx.stroke(new Path2D(MARK_TICKS));
+    ctx.restore();
+  }
 
   // Status dot, top-right, with a thin near-black ring so it reads on any tab
   // background. Idle draws no dot (the plain mark).
@@ -162,21 +189,38 @@ function findIconLink(): HTMLLinkElement | null {
 }
 
 // applyFavicon points the icon <link> at the right image for the state, keeping its
-// `type` in step: idle restores the static /favicon.svg (type image/svg+xml); any
-// other state swaps in a freshly-rendered PNG data URL (type image/png). It is
-// defensive on purpose: a missing link is a no-op, and any render failure
-// (canvas/toDataURL unsupported, e.g. some Safari configs) is swallowed so the icon
-// and its type simply stay the static mark rather than throwing into React.
-export function applyFavicon(state: FaviconState): void {
+// `type` in step. Non-idle states swap in a freshly-rendered PNG data URL (type
+// image/png) with a corner status dot. Idle restores a base with NO dot: the static
+// /favicon.svg (type image/svg+xml) when unbranded, or a rendered PNG of the branded
+// app logo when a drawable `baseImg` is supplied. It is defensive on purpose: a
+// missing link is a no-op, and any render failure (canvas/toDataURL unsupported,
+// e.g. some Safari configs) is swallowed so the icon and its type simply fall back
+// to the static mark rather than throwing into React.
+export function applyFavicon(state: FaviconState, baseImg?: HTMLImageElement | null): void {
   const link = findIconLink();
   if (!link) return;
   if (state === "idle") {
-    link.type = "image/svg+xml";
-    link.href = "/favicon.svg";
+    if (!isDrawableImage(baseImg)) {
+      // Unbranded (or the branded base has not decoded yet): today's static mark.
+      link.type = "image/svg+xml";
+      link.href = "/favicon.svg";
+      return;
+    }
+    try {
+      // Branded idle base: the app logo, no status dot, as a PNG data URL.
+      const url = renderFavicon(state, baseImg);
+      link.type = "image/png";
+      link.href = url;
+    } catch {
+      // Fall back to the static mark on any render failure.
+      link.type = "image/svg+xml";
+      link.href = "/favicon.svg";
+    }
     return;
   }
   try {
-    const url = renderFavicon(state);
+    // Non-idle: the status dot overlays whatever base was drawn (branded or factory).
+    const url = renderFavicon(state, baseImg);
     link.type = "image/png";
     link.href = url;
   } catch {

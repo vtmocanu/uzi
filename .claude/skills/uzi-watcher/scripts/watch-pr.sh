@@ -106,21 +106,44 @@ while [ "$i" -lt "$MAX" ]; do
   else
     unknown=1
   fi
-  # Signal (c): the walkthrough recent_review range ending at this head — covers the
-  # zero-actionable incremental case, which posts no review object.
+  # Signal (c): the walkthrough comment, which CodeRabbit edits in place each pass and which
+  # covers the zero-actionable incremental case (that posts no review object). It keys on the
+  # `final_review_risk` block — "**Merge Risk:** ... · up to `<short-sha>`" between
+  # `<!-- final_review_risk_start -->` / `<!-- final_review_risk_end -->`. (The older
+  # `recent_review` "between BASE and HEAD" range is gone: 0 occurrences across PRs #807/#809/
+  # #812 on 2026-08-29 — CodeRabbit migrated to final_review_risk. Parsing it was dead-format
+  # matching over the whole body, which could false-match an unrelated "between … and <sha>"
+  # phrase and forge a ready; removed. If it ever returns, signal (a) still covers a real review.)
+  #
+  # FAIL CLOSED, because reviewed_head=1 + live=0 is the auto-merge trigger: (1) exactly ONE
+  # walkthrough comment is expected (CodeRabbit edits it in place) — 0 or >1 means don't trust
+  # signal (c) at all, leave reviewed_head to signal (a); and (2) the SHA is parsed only INSIDE
+  # the final_review_risk block, so an unrelated "up to `<sha>`" phrase elsewhere in the body
+  # cannot forge a match. The exact bot login is matched so a crafted comment can't spoof it.
   if issue_c=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null); then
-    wt_head=$(printf '%s' "$issue_c" | jq -rs '.[][]|select(.user.login=="coderabbitai[bot]")|select(.body|contains("<!-- walkthrough_start -->"))|.body' 2>/dev/null \
-      | grep -oE 'and [0-9a-f]{7,40}' | tail -1 | awk '{print $2}' || true)
-    if [ -n "$wt_head" ] && printf '%s' "$head" | grep -q "^$wt_head"; then reviewed_head=1; fi
+    wt_count=$(printf '%s' "$issue_c" | jq -rs '[.[][]|select(.user.login=="coderabbitai[bot]")|select(.body|contains("<!-- walkthrough_start -->"))]|length' 2>/dev/null || echo 0)
+    if [ "${wt_count:-0}" -eq 1 ]; then
+      wt_body=$(printf '%s' "$issue_c" | jq -rs '.[][]|select(.user.login=="coderabbitai[bot]")|select(.body|contains("<!-- walkthrough_start -->"))|.body' 2>/dev/null || true)
+      # final_review_risk marker: "up to `<sha>`" parsed ONLY within its own block.
+      fr_block=$(printf '%s' "$wt_body" | awk '/final_review_risk_start/{f=1} f{print} /final_review_risk_end/{f=0}')
+      # shellcheck disable=SC2016  # the backticks are LITERAL text in CodeRabbit's marker, not a subshell
+      fr_head=$(printf '%s' "$fr_block" | grep -oE 'up to `[0-9a-f]{5,40}`' | tail -1 | grep -oE '[0-9a-f]{5,40}' || true)
+      if [ -n "$fr_head" ] && printf '%s' "$head" | grep -q "^$fr_head"; then reviewed_head=1; fi
+    fi
   else
     unknown=1
   fi
 
-  # Live inline findings: CodeRabbit comments still anchored to current code (line != null);
-  # an addressed finding re-anchors to line == null (outdated).
+  # Live inline findings: CodeRabbit comments still anchored to current code (line != null)
+  # AND not self-marked resolved. Two ways a finding stops being live, and only the first was
+  # handled before: an outdated finding re-anchors to line == null; but a finding CodeRabbit
+  # judged FIXED by a later commit keeps line != null and instead appends a "✅ Addressed in
+  # commit <sha>" line to its body (measured 2026-08-29 on PR #807, where two such addressed
+  # findings were mis-counted as live=2 and produced a false exit-3 after a clean rework).
+  # Exclude both, so an addressed finding does not read as a live one.
   live=0
   if pull_c=$(gh api --paginate "repos/$REPO/pulls/$PR/comments" 2>/dev/null); then
-    live=$(printf '%s' "$pull_c" | jq -rs '[.[][]|select(.user.login=="coderabbitai[bot]" and .line!=null)]|length' 2>/dev/null || echo 0)
+    live=$(printf '%s' "$pull_c" | jq -rs '[.[][]|select(.user.login=="coderabbitai[bot]" and .line!=null and ((.body|contains("Addressed in commit"))|not))]|length' 2>/dev/null || echo 0)
   else
     unknown=1
   fi

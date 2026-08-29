@@ -829,6 +829,12 @@ func toIssue(i *gitlab.Issue) Issue {
 		Labels:      labels,
 		Description: i.Description,
 		WebURL:      i.WebURL,
+		Assignees:   []int64{},
+	}
+	for _, a := range i.Assignees {
+		if a != nil {
+			issue.Assignees = append(issue.Assignees, a.ID)
+		}
 	}
 	if i.Author != nil {
 		issue.Author = i.Author.Username

@@ -185,19 +185,25 @@ type LastFire struct {
 // seeded with (schedtmpl.AutoApprove / WaitOnLimit), not per-entry. For a prompt entry
 // Guidance/Labels/MaxIssues are empty; for a sweep entry Prompt is empty.
 type CatalogEntryDTO struct {
-	Slug        string   `json:"slug"`
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	Target      string   `json:"target"`
-	Cron        string   `json:"cron"`
-	Timezone    string   `json:"timezone"`
-	Model       string   `json:"model"`
-	Prompt      string   `json:"prompt"`
-	Labels      []string `json:"labels"`
-	Guidance    string   `json:"guidance"`
-	MaxIssues   int      `json:"max_issues"`
-	AutoApprove bool     `json:"auto_approve"`
-	WaitOnLimit bool     `json:"wait_on_limit"`
+	Slug        string `json:"slug"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Target      string `json:"target"`
+	Cron        string `json:"cron"`
+	Timezone    string `json:"timezone"`
+	Model       string `json:"model"`
+	Prompt      string `json:"prompt"`
+	// SelectorKind is a sweep entry's selector kind (PRD #767 M4): "label" (the
+	// default) selects by Labels, "assigned" selects issues assigned to the
+	// uzi-bot account (and carries no Labels). Empty/"label" for every non-assigned
+	// entry, so the enable-UI/CLI can describe an assigned sweep honestly rather
+	// than rendering its empty Labels as a label selector.
+	SelectorKind string   `json:"selector_kind"`
+	Labels       []string `json:"labels"`
+	Guidance     string   `json:"guidance"`
+	MaxIssues    int      `json:"max_issues"`
+	AutoApprove  bool     `json:"auto_approve"`
+	WaitOnLimit  bool     `json:"wait_on_limit"`
 }
 
 // CatalogEnablementDTO records, for one (repo_id, slug) pair, that the owner already has a
@@ -225,6 +231,14 @@ type ScheduleCatalogResponse struct {
 // from an explicit one, though the two collapse to the same "source repo" behaviour.
 type ScheduleCloneRequest struct {
 	RepoID *string `json:"repo_id"`
+}
+
+// EnableCatalogRequest is the OPTIONAL body for POST /api/repos/{id}/schedule-catalog/{slug}
+// (issue #660). Timezone, when present and a valid IANA name, overrides the catalog's baked
+// zone so an enabled default fires in the caller's detected zone from the first fire; an
+// absent/empty body keeps the catalog zone (UTC) — CLI/headless and older clients send none.
+type EnableCatalogRequest struct {
+	Timezone string `json:"timezone"`
 }
 
 // AddScheduleRepoRequest is the body for POST /api/schedules/{id}/add-repo (PRD #636 M1,

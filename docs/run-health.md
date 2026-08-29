@@ -21,6 +21,14 @@ from when the flag was raised, not from when the run started.
 | ⚠ waiting for worker | Queued longer than expected with no worker claiming it. | The reason names why, if you own the run: no worker online, your vault is locked, or just a wait — start a worker or unlock your vault as needed. A judge or self-improve run instead reads **deprioritized** (yielding to interactive work on purpose, not stuck) or, once it's waited past the grace window, **priority restored** — see [Queue priority](#queue-priority). |
 | ⚠ needs approval | Sitting at `awaiting_approval` longer than expected (never shown for autopilot runs, which approve themselves). | Approve, reject, or request changes to the plan — see [Plan approval gate](./run-activity.md#plan-approval-gate). |
 
+One **waiting for worker** reason worth calling out is the Docker-worker
+allowlist. When every online worker is a Docker worker and the run's repo
+isn't on the Docker-worker allowlist, no worker is eligible to claim it, so
+the run stays `queued` and the owner's reason names it specifically — _"this
+repo isn't on the Docker worker allowlist, so no Docker worker can run it"_ —
+distinct from "no worker online" or "all workers busy". The fix is to add the
+repo to the allowlist, not to start another worker.
+
 Only the run's owner (and admins) see the reason text behind a flag; everyone
 else viewing a shared board sees just the ⚠ badge.
 

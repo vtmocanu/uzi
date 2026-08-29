@@ -589,6 +589,13 @@ export interface Card {
   title: string;
   state: string;
   labels: string[];
+  // Forge user ids assigned to the issue (PRD #767 M5). The board widens "is this card
+  // uzi's to run" to "carries the `uzi` label OR the board's bot is one of these ids",
+  // so this rides the card alongside labels. A current server always sends [] not null,
+  // but the field is optional so a payload from an OLD api replica during a rollout skew
+  // (a new web bootstrap reading an old card DTO that predates this field) does not throw
+  // in the consumer — a missing value is treated as "no assignees".
+  assignee_ids?: number[];
   web_url: string;
   // The card's forge ("gitlab"|"forgejo"|"github"), so the UI picks the per-card MR/PR noun
   // (PRD #65 D2). A cross-repo view mixes forges, so it rides each card.
@@ -624,6 +631,13 @@ export interface Board {
   // Repo default-branch CI status (PRD #6, the board header badge), null when
   // there is no cached default-branch pipeline.
   pipeline: PipelineStatus | null;
+  // The board's single connection's bot forge user id (PRD #767 M5). A card is
+  // runnable when it carries the `uzi` label OR this id is one of its assignee_ids.
+  // Per-connection (a user may have several connections with different bot ids), so it
+  // rides the board, not the user session. 0 when unresolved (never marks a card).
+  // Optional: an OLD api replica during a rollout skew may omit it entirely, which the
+  // consumer treats as "no bot" (0), the same as unresolved.
+  bot_forge_user_id?: number;
 }
 
 // BoardPrefs is the current user's per-repo board view preferences (PRD #196 M3),
@@ -650,6 +664,13 @@ export interface IssueDetail {
   title: string;
   state: string;
   labels: string[];
+  // Forge user ids assigned to the issue (PRD #767 M5), fresh from the live forge
+  // fetch. The issue view evaluates the same "carries `uzi` OR assigned to the bot"
+  // runnable predicate the board does. A current server always sends [] not null,
+  // but the field is optional (matching Card.assignee_ids) so a payload from an OLD
+  // api replica during a rollout skew that omits it does not throw in the consumer —
+  // a missing value is treated as "no assignees".
+  assignee_ids?: number[];
   web_url: string;
   author: string | null;
   has_prd_link: boolean;
@@ -660,6 +681,12 @@ export interface IssueDetail {
   // The issue's forge ("gitlab"|"forgejo"|"github"), so the "Open on <forge>" button names
   // the right platform (PRD #65 D2).
   forge_type: string;
+  // The repo's connection's bot forge user id (PRD #767 M5), so the issue view can
+  // evaluate assignment-eligibility with the same predicate as the board. Per-connection.
+  // Optional (matching Board.bot_forge_user_id): an OLD api replica during a rollout
+  // skew may omit it entirely, which the consumer treats as "no bot" (0), the same as
+  // unresolved.
+  bot_forge_user_id?: number;
 }
 
 export interface ForgeConfig {
@@ -3849,8 +3876,16 @@ const realApi = {
   listScheduleCatalog: () => request<ScheduleCatalog>("GET", "/schedule-catalog"),
   // Enable a catalog default on one repo (idempotent: 201 new / 200 already-enabled,
   // including a paused row returned untouched). Client fans out one call per repo.
-  enableCatalogSchedule: (repoId: string, slug: string) =>
-    request<Schedule>("POST", `/repos/${repoId}/schedule-catalog/${slug}`),
+  // An optional detected browser timezone (issue #660) seeds the new schedule's zone; it
+  // is sent as the body ONLY when non-empty, so the no-tz path sends no body and stays
+  // byte-identical to before (the server keeps the catalog/UTC zone on an absent tz, and
+  // ignores the override on the idempotent re-enable path).
+  enableCatalogSchedule: (repoId: string, slug: string, timezone?: string) =>
+    request<Schedule>(
+      "POST",
+      `/repos/${repoId}/schedule-catalog/${slug}`,
+      timezone ? { timezone } : undefined,
+    ),
   // Restore a default row's editable fields to the catalog values and clear the
   // customized flag; a no-op-shaped 200 otherwise.
   resetSchedule: (id: string) => request<Schedule>("POST", `/schedules/${id}/reset`),
