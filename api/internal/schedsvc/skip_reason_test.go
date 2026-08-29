@@ -18,12 +18,13 @@ import (
 // has a trustworthy source to compare against.
 func TestSkipReasonEnumIsHonest(t *testing.T) {
 	want := map[SkipReason]bool{
-		SkipNoPRDLink:           true,
-		SkipNotEligible:         true,
-		SkipAlreadyRunning:      true,
-		SkipDescriptionTooLarge: true,
-		SkipFetchFailed:         true,
-		SkipVaultLocked:         true,
+		SkipNoPRDLink:               true,
+		SkipNotEligible:             true,
+		SkipAlreadyRunning:          true,
+		SkipDescriptionTooLarge:     true,
+		SkipFetchFailed:             true,
+		SkipVaultLocked:             true,
+		SkipSelfImproveMRCapReached: true,
 	}
 
 	if len(AllSkipReasons) != len(want) {

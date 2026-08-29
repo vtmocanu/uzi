@@ -332,6 +332,7 @@ type Repo struct {
 	GuardrailOverrideBy     pgtype.UUID        `json:"guardrail_override_by"`
 	GuardrailOverrideAt     pgtype.Timestamptz `json:"guardrail_override_at"`
 	RequiredCapabilities    []string           `json:"required_capabilities"`
+	FoldImproveUziBacklog   bool               `json:"fold_improve_uzi_backlog"`
 }
 
 type RepoToolProfile struct {

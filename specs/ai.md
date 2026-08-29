@@ -5961,7 +5961,8 @@ with the review/audit findings folded in.
   the poller would enqueue a second `kind='issue'` autopilot run the kind-scoped index would not dedupe, ↳review N1).
   Auto-approved (no plan gate), but `plan_md` is stored so the plan is inspectable and linked from the notification.
   MR reuse is free: a fixed branch `uzi/self-improve` + the worker's idempotent `createMergeRequest` (never force-push)
-  extends an open self-improvement MR so every cycle is tested together.
+  extends an open self-improvement MR so every cycle is tested together. **[Superseded by PRD #686, see §583:
+  the fixed branch was the drift source — every cycle now branches fresh off current main instead.]**
 - **Merge/self-modification fences (audit C1) gate the merge and fence the input, preserving the autonomous run**:
   recommendations enter the planning prompt only inside the nonce fence (§216) with the trusted directive outside; the
   bot **structurally cannot merge** (Developer-only role + protected `main`, verified by the privilege-check sweep for
@@ -13597,8 +13598,12 @@ deletion" and was wrong in the very topology measured above.
 **Two commits are carried, because on a resume they answer different questions.** The seed
 OID is the branch's own previously-pushed tip (what THIS run added) while the default
 branch's tip is the fork point (the whole branch). Carrying only one makes the note wrong on
-precisely the runs that carry prior work, which is the population it exists for — and on the
-fixed `self_improve` branch that resume shape is the normal case, not the exception.
+precisely the runs that carry prior work, which is the population it exists for — and (at the
+time of writing) on the then-fixed `self_improve` branch that resume shape was the normal case,
+not the exception. **Corrected by PRD #686 (§583):** the fixed, ever-accreting `self_improve`
+branch no longer exists — each cycle now branches fresh off current main
+(`uzi/self-improve/<runId>`) — but the "carries prior work" case this note protects still holds
+for a resume **within** one cycle's own branch, keyed on that cycle's `runId`.
 
 **Best-effort, and silence beats a false commit.** An unresolvable default branch yields no
 second OID and the note makes the narrower claim; an absent or malformed base yields no note
@@ -22885,3 +22890,94 @@ rationale. The M3 affinity-ceiling raise (30m→2h) is recorded at §40/§49, no
   supersedes the #218 M3 reseed note whose "uncommitted changes did not survive" wording is false on
   this path). The #218 M3 loss notice fires **only when nothing — committed or WIP — was recovered**,
   so a partial WIP recovery no longer reads as total loss.
+
+## 583. PRD #686 — Generalize `self_improve` to any repo behind a per-repo dogfood flag, and retire the long-lived self-improve branch for fresh-per-cycle branches with an open-MR cap
+
+Design record `prds/done/686-generalize-self-improve.md`, decision log detail in
+[ADR-686](../adr/0686-generalize-self-improve.md). The scheduled `self_improve` job's content —
+server-composed description **and** the worker's trusted planning directive — was hardcoded to
+uzi even though the schedule mechanism was already generic (any user, any owned repo). This PRD
+splits the two apart: generic by default, uzi-dogfooding as an explicit per-repo capability
+(Part A), plus an independent fix to the branch model that had been silently accreting drift
+(Part B).
+
+- **Part A — `repos.fold_improve_uzi_backlog` (D1), a new `NOT NULL DEFAULT false` boolean, not a
+  `run_schedules` flag.** A per-schedule flag would be lost across `POST /schedules/{id}/reset`'s
+  sibling delete+re-enable path (a brand-new schedule row); the catalog itself carrying it would
+  fold-for-everyone. A per-repo flag is a durable repo fact, mirroring the existing single-bool
+  precedent (`repo_skills_enabled`, `repo_devbox_opt_in`), excluded from `UpsertRepo`'s SET list so
+  it survives membership re-sync. **No repo-identity/URL sniffing** (D2) — dogfooding is granted,
+  never inferred, so it works correctly for forks and self-hosters. Migration `00172` **backfills
+  `true`** for every repo with a pre-existing `self_improve` schedule (D3) — the only coherent
+  preservation path given D2's identity-sniffing rejection — so uzi's own instance upgrades with
+  zero manual steps. Owner (and admin) setter `SetRepoFoldImproveUziBacklogForUser` mirrors
+  `SetRepoDevboxOptInForUser`, PATCH-wired into the existing mutual-exclusivity group in
+  `forge.go`, so the capability survives a repo delete+reconnect (`UpsertRepo` does not set trust
+  flags on its own).
+- **`fireSelfImprove` branches on the flag, not the description alone.** Flag OFF (the default):
+  `genericSelfImproveDescription` — "review this project's codebase and pick one top improvement" —
+  no backlog fetch, `MarkImproveUziRecommendationsAddressed` naturally skipped (already guarded on
+  `len(ids)>0`). Flag ON: `composeSelfImproveDescription` runs **verbatim** as before, folding the
+  owner's `improve_uzi` judge backlog. The started notification now names the target repo in both
+  modes. **The `improve_uzi` judge category itself is untouched** — product-scoped, `CHECK`-
+  constrained, wired through 5 files + 3 store queries; renaming it was explicitly out of scope.
+- **D7, CORRECTED — the uzi-vs-generic mode crosses the worker CLAIM wire, not the controller
+  poll-wire contract.** `self_improve_dogfood?: boolean` on `ClaimResponse`
+  (`api/internal/workersvc/claim.go`, `agent/src/protocol.ts`), populated at claim assembly from
+  `repo.fold_improve_uzi_backlog`, absent/false ⇒ generic (safe default: an older server or an
+  unflagged repo can never accidentally produce the uzi directive). **The PRD's original text
+  asserted this field "crosses the controller poll-wire contract" and required updating
+  `controller_poll_wire.json` + `controller/internal/protocol/protocol.go` + the `-count=1` golden
+  `protocol_contract_test.go`. That was wrong.** Verified against the shipped code: the controller's
+  `PollResponse` carries only fleet desired-state (workers/templates/join_token); the existing
+  sibling claim fields `auto_approve`/`inflight_targets` never touched the controller protocol
+  either. `self_improve_dogfood` (and the sibling `self_improve_open_mrs` field below) shipped with
+  **no controller change and no golden bump**, api/agent/controller gates green throughout — record
+  this as the corrected finding, not a restatement of the PRD's original (wrong) D7 text.
+- **The worker's trusted directive and checks now fork on the flag too**
+  (`buildSelfImprovePlanPrompt`, `SELF_IMPROVE_CHECKS`). Dogfood variant is byte-identical to
+  before except the branch sentence (see Part B); generic variant drops the uzi standing-rules
+  block and the hardcoded `go test ./... in api/` commands, instead instructing the agent to
+  discover and run the target repo's own gates. Both variants keep the untrusted-fence invariant
+  (recommendations fenced, trusted directive outside).
+- **Part B — D9: the long-lived `uzi/self-improve` branch is retired for fresh-per-cycle
+  `uzi/self-improve/<runId>`.** The fixed branch (`SELF_IMPROVE_BRANCH`, PRD #46) was reused every
+  cycle and never rebased onto main between cycles — measured 2026-08-25 at ~152 commits / 3 days
+  of drift — which let a cycle re-solve already-merged work: PR #699 duplicated the already-merged
+  #695 because its stale base hid it. The fix mirrors the shipped `uzi/prompt-<runId>` pattern
+  (`selfImproveBranch(runId)`); each cycle clones current main as its base, so it structurally
+  cannot re-propose merged work the way #699 did. Label (`uzi-self-improve`) and title (`uzi
+  self-improvement`) are unchanged — `boardCards` keys on the label, not the branch — and the
+  tracking-issue body is reworded from "opens or extends one merge request on the `uzi/self-improve`
+  branch" to "opens a fresh merge request against this repo each cycle" (new issues only; an
+  existing instance's issue keeps its old body, cosmetic). A resumed cycle keys on `runId`, so it
+  reattaches to its own branch rather than a sibling's.
+- **D10/D12 — a concurrent-open-MR cap, resolved LIVE from the forge, never from `runs.mr_state`.**
+  With per-cycle branches, nothing bounded how many open self-improve MRs could accumulate if a
+  human never merged (the old one-branch model bounded this implicitly at exactly one).
+  `runs.mr_state` is fed from `ListMRWatchCandidates`'s `DISTINCT ON (issue_iid)`, which watches
+  only the **latest** run per tracking issue — Part B keeps one tracking issue but now opens N MRs
+  against it, so an older cycle's `mr_state` **freezes** once a newer cycle wins the DISTINCT ON,
+  wedging the cap at K forever (or worse, never bootstrapping at all against a permanently-open
+  tracking issue, silently defeating the cap). Instead: a new store query
+  (`RecentSelfImproveMRRunsForRepo`, bounded window, e.g. 10 recent completed self_improve runs
+  with `mr_iid IS NOT NULL` for the repo) feeds live `Forge.GetMergeRequest` calls (no new `Forge`
+  interface method) counting those still `opened`. At or above `selfImproveMaxOpenMRs` (default
+  **2**), the fire is skipped — no forge write, a "open-MR cap reached" notification
+  (`SkipSelfImproveMRCapReached`, mirrored into the web skip-reason union) — before
+  `ensureTrackingIssue` even runs. A `GetMergeRequest` error is transient (retry next tick): never
+  fail-closed (would wedge the cap) and never fail-open (would breach it).
+- **D11 — the picker sees the currently-open self-improve MRs, in the same untrusted-nonce-fence
+  pattern #297 already ships.** For each still-open candidate from D12's forge-sourced set, its
+  run's own `plan_md` (falling back to `issue_description` when `plan_md` is NULL, e.g. an
+  autopilot fire) is carried on the claim as `self_improve_open_mrs` and rendered by the worker in
+  the same fence shape as #297's `inflightTargets`/`inflightFrame` block
+  (`agent/src/prompt.ts`), with a non-overlap instruction outside the fence. Best-effort and
+  advisory — unlike D12's strict fire-time cap, any forge/DB error here yields nil and never fails
+  the claim, and independence in *intent* does not guarantee no git conflict; a conflict between
+  two genuinely-independent open MRs remains the human's merge-order call.
+- **Extends, does not duplicate, #297.** #297's claim-time in-flight list (§511,
+  `executor.ts:162 inflightTargets`) makes the picker skip *in-flight runs*; this PRD's D11 makes
+  it additionally skip *already-proposed-but-not-yet-merged* work (a completed run with an open MR
+  is not an in-flight run, so #297 alone could not see it) and, via D9's fresh base, *already-landed*
+  work (a stale-base agent cannot see a merge that happened after its branch point).

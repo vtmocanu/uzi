@@ -27,6 +27,9 @@ const SKIP_REASON_TONES: Record<ScheduleSkipReason, BadgeTone> = {
   // cycle re-fires on schedule once the vault is unlocked, so it reads neutral like the
   // other self-resolving skips.
   vault_locked: "neutral",
+  // The concurrent-open-MR cap (self_improve, PRD #686 D10) is benign and self-resolving:
+  // the cycle re-fires next cadence once a human merges or closes an outstanding MR.
+  self_improve_mr_cap_reached: "neutral",
 };
 
 // LastRunOutcome is the enriched "Last run" cell for a schedule that has a

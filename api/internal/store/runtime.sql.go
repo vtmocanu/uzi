@@ -2006,6 +2006,7 @@ SELECT rp.web_url             AS repo_web_url,
        rp.repo_skills_enabled,
        rp.repo_claudemd_enabled,
        rp.repo_devbox_opt_in,
+       rp.fold_improve_uzi_backlog,
        -- #66 M8 (D8): the admin per-repo guardrail override discriminator for the
        -- claim backstop (M6, layer 3). A non-NULL reason means Overridden=true, so
        -- the shared evaluator downgrades the waivable "bot is too strong" findings —
@@ -2033,6 +2034,7 @@ type GetRunClaimContextRow struct {
 	RepoSkillsEnabled       bool        `json:"repo_skills_enabled"`
 	RepoClaudemdEnabled     bool        `json:"repo_claudemd_enabled"`
 	RepoDevboxOptIn         bool        `json:"repo_devbox_opt_in"`
+	FoldImproveUziBacklog   bool        `json:"fold_improve_uzi_backlog"`
 	GuardrailOverrideReason pgtype.Text `json:"guardrail_override_reason"`
 	ForgeType               string      `json:"forge_type"`
 	BaseUrl                 string      `json:"base_url"`
@@ -2101,6 +2103,7 @@ func (q *Queries) GetRunClaimContext(ctx context.Context, runID uuid.UUID) (GetR
 		&i.RepoSkillsEnabled,
 		&i.RepoClaudemdEnabled,
 		&i.RepoDevboxOptIn,
+		&i.FoldImproveUziBacklog,
 		&i.GuardrailOverrideReason,
 		&i.ForgeType,
 		&i.BaseUrl,

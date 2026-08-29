@@ -41,7 +41,7 @@ const SelfImproveTrackingLabel = "uzi-self-improve"
 const selfImproveTrackingTitle = "uzi self-improvement"
 
 const selfImproveTrackingBody = "Autonomous self-improvement tracking issue (PRD #46). Each cycle, " +
-	"uzi opens or extends one merge request on the `uzi/self-improve` branch against this " +
+	"uzi opens a fresh merge request against this " +
 	"repo, picking one top improvement. The bot never merges to `main` — a human reviews and merges. " +
 	"This issue is a container; see its linked runs and MR for each cycle's plan and changes."
 
@@ -49,6 +49,23 @@ const selfImproveTrackingBody = "Autonomous self-improvement tracking issue (PRD
 // cycle folds into the run. A large backlog can't blow the planning prompt budget; the
 // oldest lead and the rest wait for the next cycle.
 const selfImproveBacklogCap = 50
+
+// selfImproveMaxOpenMRs caps concurrent OPEN self-improve MRs per repo (PRD #686 D10):
+// at or above this many OPEN self-improve MRs on the repo, a cycle skips (does NO forge
+// write); below it, the cycle fires. "Open" is sourced LIVE from the forge per candidate,
+// never from runs.mr_state (unreliable for this multi-MR-per-tracking-issue lane — D12).
+const selfImproveMaxOpenMRs = 2
+
+// selfImproveMRCandidateWindow bounds how many recent MR-bearing self_improve runs the cap
+// checks live against the forge (PRD #686 D12). Cycles are ~2 days apart and the cap is
+// small, so a tiny window covers every plausibly-open MR without an unbounded historical
+// scan.
+const selfImproveMRCandidateWindow = 10
+
+// genericSelfImproveDescription is the run description for a repo that has NOT opted
+// into uzi dogfooding (repos.fold_improve_uzi_backlog = false, PRD #686 D1): the run
+// reviews the enabling repo itself and folds no product-specific backlog.
+const genericSelfImproveDescription = "Review this project's codebase and pick one top improvement (a bug, a feature, or a refactor)."
 
 // fireSelfImprove fires one self_improve schedule: it resolves the owner's repo, skips
 // benignly if a run is already active for the repo or the vault is locked, files (or
@@ -101,21 +118,68 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 		return FireOutcome{}, fmt.Errorf("build forge driver: %w", err) // transient
 	}
 
+	// 4b. Cap concurrent OPEN self-improve MRs per repo (PRD #686 D10/D12). This runs BEFORE
+	// ensureTrackingIssue so a capped cycle does NO forge write. Open-state is resolved LIVE
+	// from the forge per candidate (D12): runs.mr_state is unreliable for this
+	// multi-MR-per-tracking-issue lane, so we do NOT trust it. We inspect only a small window
+	// of recent MR-bearing runs — the cap is small and cycles are days apart, so a tiny window
+	// covers every plausibly-open MR (selfImproveMRCandidateWindow).
+	candidates, err := e.store.RecentSelfImproveMRRunsForRepo(ctx, store.RecentSelfImproveMRRunsForRepoParams{
+		RepoID: sched.RepoID,
+		Lim:    selfImproveMRCandidateWindow,
+	})
+	if err != nil {
+		return FireOutcome{}, err // transient DB error: retry next tick
+	}
+	openMRs := 0
+	for _, c := range candidates {
+		// The WHERE guarantees mr_iid IS NOT NULL, but sqlc still types it nullable; skip a row
+		// that somehow scanned NULL rather than dereferencing an invalid pgtype.Int8.
+		if !c.MrIid.Valid {
+			continue
+		}
+		mr, err := f.GetMergeRequest(ctx, repo.ForgeProjectID, c.MrIid.Int64)
+		if err != nil {
+			// TRANSIENT — retry next tick. We neither fail-closed (counting an errored MR as
+			// open would wedge the cap forever) nor fail-open (skipping the check would breach
+			// the cap), so on any error we abandon the whole cycle and let the next tick retry.
+			return FireOutcome{}, fmt.Errorf("check self-improve MR open-state: %w", err)
+		}
+		if mr.State == forge.MRStateOpened {
+			openMRs++
+		}
+	}
+	if openMRs >= selfImproveMaxOpenMRs {
+		e.notifySelfImprove(ctx, sched.UserID, "selfimprove_skipped", "Self-improvement cycle skipped",
+			"This self-improvement cycle was skipped: the open-MR cap reached its limit for this repo. Review and merge or close an outstanding self-improvement merge request, and the next scheduled cycle will fire.", nil)
+		e.logger.Info("scheduler: self_improve open-MR cap reached, skipping fire", "schedule", sched.ID.String(), "open_mrs", openMRs)
+		return FireOutcome{Matched: 1, Skips: []Skip{{Reason: SkipSelfImproveMRCapReached}}}, nil
+	}
+
 	// 5. File (or reuse) the tracking issue. A forge error here is transient.
 	issueIID, err := ensureTrackingIssue(ctx, f, repo.ForgeProjectID)
 	if err != nil {
 		return FireOutcome{}, err // transient
 	}
 
-	// 6. Load the OWNER's improve_uzi backlog and fold it into the run description.
-	recs, err := e.store.ListOpenImproveUziRecommendationsForUser(ctx, store.ListOpenImproveUziRecommendationsForUserParams{
-		UserID: sched.UserID,
-		Lim:    selfImproveBacklogCap,
-	})
-	if err != nil {
-		return FireOutcome{}, err // transient
+	// 6. Build the run description. A repo opted into uzi dogfooding
+	// (repos.fold_improve_uzi_backlog = true, PRD #686) folds the OWNER's improve_uzi
+	// backlog into the run; every other repo gets a generic "review this project" run and
+	// no product-specific backlog.
+	var recs []store.ListOpenImproveUziRecommendationsForUserRow
+	var description string
+	if repo.FoldImproveUziBacklog {
+		recs, err = e.store.ListOpenImproveUziRecommendationsForUser(ctx, store.ListOpenImproveUziRecommendationsForUserParams{
+			UserID: sched.UserID,
+			Lim:    selfImproveBacklogCap,
+		})
+		if err != nil {
+			return FireOutcome{}, err // transient
+		}
+		description = composeSelfImproveDescription(recs)
+	} else {
+		description = genericSelfImproveDescription
 	}
-	description := composeSelfImproveDescription(recs)
 
 	// 7. Create the run, threading the schedule's per-schedule model override (PRD #300/#305).
 	// A lost unique-index race (ErrActiveSelfImproveExists) is benign — the index did its job,
@@ -144,7 +208,7 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 	// 9. Started notification to the owner.
 	runID := run.ID
 	e.notifySelfImprove(ctx, sched.UserID, "selfimprove_started", "Self-improvement run started",
-		"A self-improvement run has started on the uzi repo. It will open or extend one merge request; review its plan in the run view.", &runID)
+		"A self-improvement run has started on "+repo.PathWithNamespace+". It will open a merge request; review its plan in the run view.", &runID)
 	e.logger.Info("scheduler: self_improve cycle started", "schedule", sched.ID.String(), "run", run.ID.String(), "recommendations", len(recs))
 	return FireOutcome{Matched: 1, Started: []Started{{RunID: run.ID, Title: selfImproveTrackingTitle}}}, nil
 }

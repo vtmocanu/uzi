@@ -716,6 +716,20 @@ export interface ClaimResponse {
    *  the titles are issue/milestone text anyone who can file an issue can influence —
    *  rendered nonce-fenced by the worker, never as instructions. */
   inflight_targets?: string[];
+  /** PRD #686 D11: the "what was proposed" text of the repo's currently-OPEN self-improve
+   *  MRs, delivered ONLY on a self_improve claim so the picker chooses a NON-OVERLAPPING
+   *  improvement. Each entry is the first non-empty line of that run's proposed change
+   *  (plan_md if present, else its issue_description). Absent ⇒ none (no open self-improve
+   *  MRs, or the forge was unreachable). UNTRUSTED CONTENT — model-authored run text —
+   *  rendered nonce-fenced by the worker with the non-overlap instruction OUTSIDE the
+   *  fence, never as instructions. */
+  self_improve_open_mrs?: string[];
+  /** PRD #686 M3: true only for a self_improve run whose repo opted into uzi dogfooding
+   *  (repos.fold_improve_uzi_backlog). The worker uses it to select the uzi-vs-generic
+   *  TRUSTED self-improve directive (m4 consumes it). self_improve-only; absent ⇒ generic
+   *  (false), the safe default so an older server or an unflagged repo never gets the uzi
+   *  directive. */
+  self_improve_dogfood?: boolean;
   /** The plan already captured for this run (PRD #35 Decision 6b). The server has
    *  always sent this (`ClaimPayload.PlanMd`); it was simply undeclared here while
    *  nothing read it. A resumed run whose plan was already approved replays THIS

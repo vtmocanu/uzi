@@ -88,6 +88,17 @@ WHERE rr.category = 'improve_uzi' AND rr.addressed_by_run_id IS NULL
 ORDER BY rr.created_at ASC
 LIMIT @lim;
 
+-- name: RecentSelfImproveMRRunsForRepo :many
+-- The repo's most-recent self_improve runs that opened an MR (mr_iid set),
+-- bounded (PRD #686 D12). Feeds the forge-sourced open-MR cap (D10) and the picker's
+-- open-MR context (D11/M10). "Open" is resolved LIVE from the forge per row, NOT from
+-- runs.mr_state (unreliable for this multi-MR-per-tracking-issue lane — see D12).
+SELECT id, mr_iid, branch, plan_md, issue_description
+FROM runs
+WHERE kind = 'self_improve' AND repo_id = @repo_id::uuid AND mr_iid IS NOT NULL
+ORDER BY created_at DESC
+LIMIT @lim;
+
 -- name: MarkImproveUziRecommendationsAddressed :execrows
 -- Stamp the exact backlog rows the engine folded into a run as addressed by that
 -- run (Decision 11). Marks by the precise id set the engine listed (not "all open")

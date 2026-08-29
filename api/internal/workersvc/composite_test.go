@@ -22,6 +22,15 @@ type fakeForge struct {
 	created        forge.Issue
 	getIssueResult forge.Issue
 	getIssueErr    error
+
+	// self_improve open-MR picker context (PRD #686 D11/D12): GetMergeRequest returns the
+	// forge state per mr_iid. mrStateByIID maps mr_iid → one of forge.MRState* (a missing
+	// key scans as ""); mrErrByIID forces a per-candidate error (best-effort skip), and
+	// mrErr forces an error for every call. getMRIID records each mr_iid asked for, in order.
+	mrStateByIID map[int64]string
+	mrErrByIID   map[int64]error
+	mrErr        error
+	getMRIID     []int64
 }
 
 func (f *fakeForge) CreateIssue(_ context.Context, _ int64, title, _ string, _ []string) (forge.Issue, error) {
@@ -36,6 +45,19 @@ func (f *fakeForge) CreateIssue(_ context.Context, _ int64, title, _ string, _ [
 
 func (f *fakeForge) GetIssue(context.Context, int64, int64) (forge.Issue, error) {
 	return f.getIssueResult, f.getIssueErr
+}
+
+func (f *fakeForge) GetMergeRequest(_ context.Context, _ int64, mrIID int64) (forge.MergeRequest, error) {
+	f.getMRIID = append(f.getMRIID, mrIID)
+	if f.mrErr != nil {
+		return forge.MergeRequest{}, f.mrErr
+	}
+	if f.mrErrByIID != nil {
+		if err := f.mrErrByIID[mrIID]; err != nil {
+			return forge.MergeRequest{}, err
+		}
+	}
+	return forge.MergeRequest{IID: mrIID, State: f.mrStateByIID[mrIID]}, nil
 }
 
 // fakeForges is a ForgeBuilder stub. buildErr fails the build; otherwise it hands

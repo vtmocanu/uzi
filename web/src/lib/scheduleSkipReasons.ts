@@ -15,6 +15,7 @@ export const SCHEDULE_SKIP_REASON_LABELS: Record<ScheduleSkipReason, string> = {
   description_too_large: "description too large",
   fetch_failed: "fetch failed",
   vault_locked: "vault locked",
+  self_improve_mr_cap_reached: "self-improve MR cap reached",
 };
 
 export function scheduleSkipReasonLabel(reason: ScheduleSkipReason): string {

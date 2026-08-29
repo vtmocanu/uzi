@@ -22,6 +22,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       listToolAllowlist: vi.fn(),
       setRepoToolProfile: vi.fn(),
       setRepoDevboxOptIn: vi.fn(),
+      setRepoFoldImproveUziBacklog: vi.fn(),
       setRepoRequiredCapabilities: vi.fn(),
       setRepoGuardrailOverride: vi.fn(),
       clearRepoGuardrailOverride: vi.fn(),
@@ -74,6 +75,7 @@ function repo(over: Partial<Repo> & Pick<Repo, "id" | "path_with_namespace">): R
     repo_skills_enabled: false,
     repo_claudemd_enabled: false,
     repo_devbox_opt_in: false,
+    repo_fold_improve_uzi_backlog: false,
     pipeline: null,
     guardrail_blocked: false,
     docker_allowlisted: false,
@@ -392,6 +394,26 @@ describe("Repos — tier-2 devbox opt-in (PRD #18 M5)", () => {
     fireEvent.click(toggle);
 
     await waitFor(() => expect(mockApi.setRepoDevboxOptIn).toHaveBeenCalledWith("repo-uzi", true));
+  });
+});
+
+describe("Repos — fold improve-uzi backlog capability (PRD #686)", () => {
+  it("opens the Tools panel and toggles the fold-improve-uzi-backlog capability", async () => {
+    mockApi.setRepoFoldImproveUziBacklog.mockResolvedValue({
+      repo: { ...REPOS[0], repo_fold_improve_uzi_backlog: true },
+    });
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+
+    // Open the per-repo Tools panel, then flip the fold-improve-uzi-backlog toggle.
+    fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: "Tools" }));
+    const toggle = await screen.findByRole("checkbox", { name: /Fold improve-uzi backlog/i });
+    expect((toggle as HTMLInputElement).checked).toBe(false);
+    fireEvent.click(toggle);
+
+    await waitFor(() =>
+      expect(mockApi.setRepoFoldImproveUziBacklog).toHaveBeenCalledWith("repo-uzi", true),
+    );
   });
 });
 

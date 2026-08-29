@@ -84,7 +84,7 @@ ORDER BY r.path_with_namespace ASC;
 -- gate passes Overridden=true and the shared evaluator downgrades the waivable
 -- "bot is too strong" findings (never protection_unreadable — D8/D3).
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
-       r.default_branch, r.enabled,
+       r.default_branch, r.enabled, r.fold_improve_uzi_backlog,
        r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id, c.bot_forge_user_id
 FROM repos r
@@ -204,6 +204,20 @@ RETURNING *;
 -- Admin path for the tier-2 opt-in toggle: not scoped to the owning user; gated on
 -- the caller being an admin in the handler.
 UPDATE repos SET repo_devbox_opt_in = $2 WHERE repos.id = $1 RETURNING *;
+
+-- name: SetRepoFoldImproveUziBacklogForUser :one
+-- Per-repo capability flag (PRD #686 M1) toggle, authorized through the repo's owning
+-- connection. A non-owned or unknown id returns no rows (404). Mirrors
+-- SetRepoDevboxOptInForUser's owner scoping.
+UPDATE repos SET fold_improve_uzi_backlog = $2
+WHERE repos.id = $1
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
+RETURNING *;
+
+-- name: SetRepoFoldImproveUziBacklog :one
+-- Admin path for the per-repo capability flag (PRD #686 M1): not scoped to the owning
+-- user; gated on the caller being an admin in the handler.
+UPDATE repos SET fold_improve_uzi_backlog = $2 WHERE repos.id = $1 RETURNING *;
 
 -- name: SetRepoRequiredCapabilitiesForUser :one
 -- Static per-repo capability hint (PRD #84 M2), authorized through the repo's owning

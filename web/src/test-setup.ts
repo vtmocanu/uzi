@@ -22,3 +22,56 @@ import { configure } from "@testing-library/dom";
 // trains everyone to re-run instead of read — which is the actual damage, and which lands in
 // CI where nobody has the context to tell it from a real regression.
 configure({ asyncUtilTimeout: 5000 });
+
+// jsdom Web Storage polyfill (issue #340).
+//
+// Node >=26 ships an EXPERIMENTAL built-in Web Storage `localStorage` global that is
+// `undefined` unless the process was started with `--localstorage-file`. Under the vitest
+// jsdom environment on Node 26, jsdom installs no Storage of its own, so BOTH the bare
+// `localStorage` global and `window.localStorage` come back `undefined` — and a bare
+// `localStorage.clear()` (e.g. AuthContext.test.tsx's beforeEach) throws
+// "TypeError: Cannot read properties of undefined (reading 'clear')".
+//
+// This repo pins Node 24 (.nvmrc), where jsdom DOES provide a working `localStorage`, so the
+// guard below is a strict no-op there: it only installs a store when one is missing or broken.
+// Several test files carry their own per-`beforeEach` `makeStorage()` shim for the same reason;
+// they redefine the (configurable) property with a fresh Map for isolation and keep working.
+function makeMemoryStorage(): Storage {
+  const m = new Map<string, string>();
+  return {
+    getItem: (k: string) => (m.has(k) ? m.get(k)! : null),
+    setItem: (k: string, v: string) => void m.set(k, String(v)),
+    removeItem: (k: string) => void m.delete(k),
+    clear: () => m.clear(),
+    key: (i: number) => [...m.keys()][i] ?? null,
+    get length() {
+      return m.size;
+    },
+  } as Storage;
+}
+
+function isWorkingStorage(s: unknown): s is Storage {
+  return (
+    !!s &&
+    typeof (s as Storage).clear === "function" &&
+    typeof (s as Storage).getItem === "function"
+  );
+}
+
+// Idempotent: install an in-memory Storage on `globalThis` only when the built-in one is
+// missing/broken. Exported so the regression test can force the "no Storage" condition and
+// re-run the guard without depending on the Node version. In jsdom `globalThis` IS `window`,
+// so this also satisfies `window.localStorage` accessors (e.g. lib/prefs.ts).
+export function ensureWebStorage(): void {
+  for (const name of ["localStorage", "sessionStorage"] as const) {
+    if (!isWorkingStorage((globalThis as Record<string, unknown>)[name])) {
+      Object.defineProperty(globalThis, name, {
+        value: makeMemoryStorage(),
+        configurable: true,
+        writable: true,
+      });
+    }
+  }
+}
+
+ensureWebStorage();

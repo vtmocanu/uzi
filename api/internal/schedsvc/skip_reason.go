@@ -42,6 +42,13 @@ const (
 	// cycle. Benign: the schedule advances normally (the cadence re-fires on schedule once
 	// the vault is unlocked), and the owner gets a selfimprove_skipped notification.
 	SkipVaultLocked SkipReason = "vault_locked"
+
+	// SkipSelfImproveMRCapReached ← the self_improve fire path (PRD #686 D10) when the repo
+	// already has selfImproveMaxOpenMRs OPEN self-improve MRs (open-state resolved LIVE from
+	// the forge per candidate, not from runs.mr_state — D12). Benign: the schedule advances
+	// normally and re-fires next cadence once a human merges or closes an outstanding MR, and
+	// the owner gets a selfimprove_skipped notification.
+	SkipSelfImproveMRCapReached SkipReason = "self_improve_mr_cap_reached"
 )
 
 // AllSkipReasons lists every SkipReason in the closed set. The cross-language contract
@@ -53,6 +60,7 @@ var AllSkipReasons = []SkipReason{
 	SkipDescriptionTooLarge,
 	SkipFetchFailed,
 	SkipVaultLocked,
+	SkipSelfImproveMRCapReached,
 }
 
 // skipReasonForErr maps the four benign run-creation seam sentinels to their SkipReason.
