@@ -746,6 +746,26 @@ describe("owner guidance overlay on a sweep default (issue #675)", () => {
     expect(input?.labels).toBeUndefined();
     expect(input?.target).toBeUndefined();
   });
+
+  it("clearing the guidance textarea sends guidance:null (explicit clear), never baked_guidance", async () => {
+    mockApi.updateSchedule.mockResolvedValue(sweepDefault({ guidance: null, customized: false }));
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={sweepDefault()} onClose={vi.fn()} onSaved={vi.fn()} onCloneToEdit={vi.fn()} />
+      </MemoryRouter>,
+    );
+    fireEvent.change(screen.getByPlaceholderText("always add a failing test first"), {
+      target: { value: "" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    const input = mockApi.updateSchedule.mock.calls[0]?.[1];
+    // A cleared overlay is sent as an EXPLICIT null, not undefined, so the server drops it.
+    expect(input?.guidance).toBeNull();
+    // The read-only baked catalog guidance is never round-tripped through the overlay patch.
+    expect(input?.baked_guidance).toBeUndefined();
+  });
 });
 
 describe("a cloned/user schedule keeps its prompt editable (PRD #589)", () => {

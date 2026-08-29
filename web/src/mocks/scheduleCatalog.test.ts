@@ -181,6 +181,39 @@ describe("mock default-jobs catalog (PRD #589)", () => {
     expect(cleared.customized).toBe(false);
   });
 
+  it("resetSchedule clears a SWEEP default's owner overlay, keeps baked_guidance, and un-customizes (issue #675)", async () => {
+    // The RESET path (distinct from update-clear): resetSchedule re-materializes the default
+    // from the catalog, so it drops the owner overlay (guidance -> null) while keeping the
+    // read-only baked catalog guidance, and clears customized. Materialize a fresh
+    // planned-sweep default on a clean repo (repo-www already carries one from the sweep-overlay
+    // test above, so use a different owned repo) so it starts un-customized with a null overlay.
+    const def = await mockApi.enableCatalogSchedule("repo-payments", "planned-sweep");
+    expect(def.origin).toBe("default");
+    expect(def.target).toBe("sweep");
+    expect(def.customized).toBe(false);
+    expect(def.guidance).toBeNull(); // no owner overlay yet
+    expect(def.baked_guidance).toBeTruthy(); // catalog guidance baked in, read-only
+    const baked = def.baked_guidance;
+
+    const updated = await mockApi.updateSchedule(def.id, {
+      cron_expr: def.cron_expr,
+      timezone: def.timezone,
+      auto_approve: def.auto_approve,
+      wait_on_limit: def.wait_on_limit,
+      max_issues: def.max_issues,
+      model: null,
+      guidance: "prefer a failing test first, then the smallest fix",
+    });
+    expect(updated.customized).toBe(true);
+
+    // Resetting re-materializes from the catalog: the overlay is cleared, the baked catalog
+    // guidance is unchanged, and the row is no longer customized.
+    const reset = await mockApi.resetSchedule(def.id);
+    expect(reset.guidance).toBeNull();
+    expect(reset.baked_guidance).toBe(baked);
+    expect(reset.customized).toBe(false);
+  });
+
   it("REJECTS guidance over the 8 KiB cap by BYTES not chars, on both write paths (issue #662, mock == server 422)", async () => {
     // The server caps guidance at 8 KiB (MaxGuidanceBytes) and 422s an oversize value on EVERY
     // write path; the mock must reproduce that so mock-mode users hit the same error rather than
